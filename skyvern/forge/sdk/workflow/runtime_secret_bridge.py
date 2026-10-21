@@ -14,7 +14,8 @@ import structlog
 from skyvern.forge import app
 from skyvern.forge.sdk.encrypt import encryptor
 from skyvern.forge.sdk.encrypt.base import EncryptMethod
-from skyvern.utils.secret_redaction import collect_redactable_secret_values
+from skyvern.forge.sdk.workflow.context_manager import RANDOM_SECRET_ID_PREFIX
+from skyvern.utils.secret_redaction import collect_secret_values_at_any_length
 
 LOG = structlog.get_logger()
 
@@ -62,10 +63,16 @@ async def publish_copilot_runtime_secret_values(
     workflow_run_context: Any,
 ) -> bool:
     """Publish exact terminal values; shared caches receive ciphertext only."""
-    # Static credential values are already bound to the origin-run registry before dispatch.
-    # Bridge only values minted at runtime: ``secrets`` also contains routing metadata such as
-    # ``totp_identifier``, which is a capability reference and must never become a scrub value.
-    values = collect_redactable_secret_values({}, otp_values=workflow_run_context.runtime_otp_values)
+    # The worker resolves some secrets itself (an aws_secret, a vault credential), so the API never
+    # held them. Only values filed under a random secret id are resolved secrets; a credential's TOTP
+    # identifier and the rest of ``secrets`` (a Bitwarden URL, say) are routing metadata, not scrub values.
+    resolved_secrets = {
+        key: value
+        for key, value in workflow_run_context.secrets.items()
+        if isinstance(key, str) and key.startswith(RANDOM_SECRET_ID_PREFIX) and not key.endswith("_totp_identifier")
+    }
+    # Copilot scrubs the values the API holds at any length, so the ones only the worker holds get no floor either.
+    values = collect_secret_values_at_any_length(resolved_secrets, workflow_run_context.runtime_otp_values)
     payload = json.dumps(
         {
             "organization_id": organization_id,

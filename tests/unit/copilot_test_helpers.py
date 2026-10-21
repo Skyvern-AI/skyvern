@@ -3,10 +3,11 @@
 from __future__ import annotations
 
 import asyncio
+import base64
+import io
 import json
 from collections.abc import AsyncIterator, Awaitable, Callable, Mapping, Sequence
 from contextlib import asynccontextmanager, suppress
-from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from functools import cache
 from itertools import count
@@ -17,6 +18,19 @@ from unittest.mock import AsyncMock, MagicMock
 from urllib.parse import urlparse
 
 import pytest
+from agents import Agent, FunctionTool, OutputGuardrail, RunConfig, SQLiteSession
+from agents.items import ModelResponse, TResponseInputItem
+from agents.models.interface import Model, ModelProvider
+from agents.result import RunResultStreaming
+from openai.types.responses import (
+    ResponseCompletedEvent,
+    ResponseOutputItemDoneEvent,
+    ResponseOutputMessage,
+    ResponseOutputText,
+)
+from openai.types.responses.response import Response
+from openai.types.responses.response_function_tool_call import ResponseFunctionToolCall
+from PIL import Image
 from playwright.async_api import Page, Route, async_playwright
 from playwright.sync_api import sync_playwright
 
@@ -26,9 +40,10 @@ from skyvern.forge.sdk.artifact.models import ArtifactType
 from skyvern.forge.sdk.copilot import agent as copilot_agent
 from skyvern.forge.sdk.copilot import runtime as copilot_runtime
 from skyvern.forge.sdk.copilot.active_run_session import ActiveRunSessionAssociation
-from skyvern.forge.sdk.copilot.agent import run_copilot_agent
+from skyvern.forge.sdk.copilot.agent import _run_agent_loop_with_surface, run_copilot_agent
 from skyvern.forge.sdk.copilot.browser_ablation import CopilotEvalMode
 from skyvern.forge.sdk.copilot.build_test_outcome import RecordedBuildTestOutcome
+from skyvern.forge.sdk.copilot.config import CopilotConfig
 from skyvern.forge.sdk.copilot.context import AgentResult, CopilotContext
 from skyvern.forge.sdk.copilot.diagnosis_repair_contract import (
     DiagnosisInput,
@@ -38,24 +53,47 @@ from skyvern.forge.sdk.copilot.diagnosis_repair_contract import (
     RepairNextAction,
     VerificationResult,
 )
-from skyvern.forge.sdk.copilot.enforcement import CopilotTotalTimeoutError, _mark_copilot_total_timeout
+from skyvern.forge.sdk.copilot.enforcement import (
+    CopilotTotalTimeoutError,
+    _mark_copilot_total_timeout,
+    run_with_enforcement,
+)
+from skyvern.forge.sdk.copilot.hooks import CopilotRunHooks
 from skyvern.forge.sdk.copilot.repair_origin_run import RepairOriginBinding
 from skyvern.forge.sdk.copilot.request_policy import CompletionCriterion
+from skyvern.forge.sdk.copilot.review_gate import build_review_projection, workflow_block_fingerprints
 from skyvern.forge.sdk.copilot.runtime import (
     AgentContext,
-    record_sensitive_origin_run_taint,
-    register_sensitive_origin_run_lease,
+    OriginRunRedactionRegistry,
 )
+from skyvern.forge.sdk.copilot.screenshot_utils import (
+    ScreenshotActionRelation,
+    ScreenshotEntry,
+    ScreenshotProvenance,
+    resize_screenshot_b64,
+)
+from skyvern.forge.sdk.copilot.session_factory import (
+    copilot_call_model_input_filter,
+    copilot_session_input_callback,
+)
+from skyvern.forge.sdk.copilot.tools import reply_ends_turn, reply_tool
 from skyvern.forge.sdk.copilot.tools import run_execution as run_execution_module
 from skyvern.forge.sdk.copilot.tools import scouting as scouting_module
 from skyvern.forge.sdk.copilot.turn_origin import TurnOrigin
 from skyvern.forge.sdk.copilot.workflow_yaml import _process_workflow_yaml as process_workflow_yaml
 from skyvern.forge.sdk.core.skyvern_context import SkyvernContext
 from skyvern.forge.sdk.db.enums import WorkflowRunTriggerType
+from skyvern.forge.sdk.routes.workflow_copilot import _assistant_execution_receipts
 from skyvern.forge.sdk.schemas.credentials import Credential, CredentialType, CredentialVaultType, PasswordCredential
 from skyvern.forge.sdk.schemas.organizations import Organization
 from skyvern.forge.sdk.schemas.persistent_browser_sessions import PersistentBrowserSession
-from skyvern.forge.sdk.schemas.workflow_copilot import WorkflowCopilotChatRequest, WorkflowCopilotTitleUpdate
+from skyvern.forge.sdk.schemas.workflow_copilot import (
+    WorkflowCopilotChatMessage,
+    WorkflowCopilotChatRequest,
+    WorkflowCopilotChatSender,
+    WorkflowCopilotStreamMessageType,
+    WorkflowCopilotTitleUpdate,
+)
 from skyvern.forge.sdk.schemas.workflow_runs import WorkflowRunBlock
 from skyvern.forge.sdk.workflow.models.block import CodeBlock
 from skyvern.forge.sdk.workflow.models.parameter import OutputParameter, WorkflowParameter, WorkflowParameterType
@@ -526,6 +564,7 @@ async def install_run_blocks_harness(
     database.workflow_params.get_workflow_output_parameters = AsyncMock(return_value=persisted_output_params)
     database.observer.get_workflow_run_blocks = AsyncMock(return_value=terminal_blocks or [])
     database.tasks.get_recent_actions_for_tasks = AsyncMock(return_value=list(recent_actions or []))
+    database.self_heal.get_heal_episodes_for_run = AsyncMock(return_value=[])
     database.workflow_runs.get_workflow_run = AsyncMock(return_value=_fake_workflow_run(status=polled_status))
     database.workflow_runs.get_workflow_run_output_parameters = AsyncMock(return_value=[])
     database.workflow_runs.get_workflow_runs_for_workflow_permanent_id = AsyncMock(return_value=[])
@@ -624,6 +663,99 @@ async def install_run_blocks_harness(
             run_execution_module, "_attach_registered_output_parameter_values", AsyncMock(return_value={})
         )
     return captured
+
+
+_REAL_CANCEL_RUN_TASK_IF_NOT_FINAL = run_execution_module._cancel_run_task_if_not_final
+_REAL_COOPERATIVE_CANCEL_DISPATCHED_RUN = run_execution_module._cooperative_cancel_dispatched_run
+_REAL_DELETE_DISPATCH_DRAFT_IF_RUN_FINAL = run_execution_module._delete_dispatch_draft_if_run_final
+
+OWNED_RUN_ID = "wr_build_test"
+
+
+class OwnedRunRow:
+    """One run row shared by the build tool's poll, the real conditional cancel and draft-retire paths and its
+    worker, installed over ``install_run_blocks_harness`` so a write lands on the row a later read reports."""
+
+    def __init__(
+        self, monkeypatch: pytest.MonkeyPatch, *, block_first_read: bool = False, block_first_cancel: bool = False
+    ) -> None:
+        self.row = _fake_workflow_run(status="running").model_copy(update={"workflow_run_id": OWNED_RUN_ID})
+        self.cancel_writes: list[str] = []
+        self.draft_deletes = AsyncMock()
+        self.polled = asyncio.Event()
+        self.cancel_started = asyncio.Event()
+        self._block_first_read = block_first_read
+        self._block_first_cancel = block_first_cancel
+        monkeypatch.setattr(workflow_service_module, "prepare_workflow", AsyncMock(return_value=self.row.model_copy()))
+        monkeypatch.setattr(run_execution_module, "_cancel_run_task_if_not_final", _REAL_CANCEL_RUN_TASK_IF_NOT_FINAL)
+        monkeypatch.setattr(
+            run_execution_module, "_cooperative_cancel_dispatched_run", _REAL_COOPERATIVE_CANCEL_DISPATCHED_RUN
+        )
+        monkeypatch.setattr(
+            run_execution_module, "_delete_dispatch_draft_if_run_final", _REAL_DELETE_DISPATCH_DRAFT_IF_RUN_FINAL
+        )
+        monkeypatch.setattr(
+            forge_app.WORKFLOW_SERVICE, "mark_workflow_run_as_canceled_if_not_final", self._cancel_if_not_final
+        )
+        monkeypatch.setattr(forge_app.DATABASE.workflow_runs, "get_workflow_run", self._get_workflow_run)
+        monkeypatch.setattr(forge_app.DATABASE.workflows, "soft_delete_workflow_by_id", self.draft_deletes)
+        monkeypatch.setattr(run_execution_module, "_read_progress_sources", self._read_progress_sources)
+
+    def finish(self, status: str) -> None:
+        if not self.row.status.is_final():
+            self.row.status = WorkflowRunStatus(status)
+
+    async def _cancel_if_not_final(self, workflow_run_id: str) -> None:
+        self.cancel_started.set()
+        if self._block_first_cancel:
+            self._block_first_cancel = False
+            await asyncio.Event().wait()
+        if not self.row.status.is_final():
+            self.cancel_writes.append(workflow_run_id)
+            self.finish("canceled")
+
+    async def _get_workflow_run(self, **_kwargs: object) -> WorkflowRun:
+        return self.row
+
+    async def _read_progress_sources(self, _ctx: CopilotContext, _run_id: str) -> tuple[WorkflowRun, datetime]:
+        self.polled.set()
+        if self._block_first_read:
+            await asyncio.Event().wait()
+        return self.row, datetime.now(UTC)
+
+
+def make_build_test_ctx(
+    harness: dict[str, Any], monkeypatch: pytest.MonkeyPatch, *, on_chat_browser: bool = False, **overrides: object
+) -> CopilotContext:
+    ctx = make_copilot_ctx(browser_session_id="pbs_chat", **overrides)
+    ctx.staged_workflow = harness["workflow"]
+    ctx.frontier_resume_session_id = "pbs_chat" if on_chat_browser else "pbs_run"
+    if on_chat_browser:
+        monkeypatch.setattr(run_execution_module, "acquire_build_test_browser_session", AsyncMock(return_value=None))
+    return ctx
+
+
+def install_secret_carrying_run_registry(monkeypatch: pytest.MonkeyPatch, *, all_registered: bool = False) -> None:
+    async def _secret_carrying_registry(
+        _ctx: CopilotContext, *, workflow_run_id: str, **_kwargs: object
+    ) -> OriginRunRedactionRegistry:
+        return OriginRunRedactionRegistry(
+            workflow_run_id=workflow_run_id,
+            parameters={},
+            contains_sensitive_values=True,
+            contains_all_sensitive_values=all_registered,
+        )
+
+    monkeypatch.setattr(run_execution_module, "_bind_origin_run_redaction_registry", _secret_carrying_registry)
+
+
+def adopted_detached_tasks(before: set[asyncio.Task]) -> list[asyncio.Task]:
+    return [task for task in run_execution_module._DETACHED_CLEANUP_TASKS if task not in before]
+
+
+async def settle_cancelled_tools() -> None:
+    for _ in range(10):
+        await asyncio.sleep(0.01)
 
 
 HANDBACK_WORKFLOW_YAML = """
@@ -955,13 +1087,6 @@ def redact_parameter_values(monkeypatch: pytest.MonkeyPatch, ctx: AgentContext, 
     monkeypatch.setattr(forge_app.AGENT_FUNCTION, "redact_codeblock_parameter_values", redact)
 
 
-def patch_browser_tab_count(monkeypatch: pytest.MonkeyPatch, open_tabs: int | None) -> None:
-    patch_browser_tabs(
-        monkeypatch,
-        None if open_tabs is None else FakeTabbedBrowserState(*(["https://tab.example.test/"] * open_tabs)),
-    )
-
-
 def origin_run_input(
     key: str,
     value: bool | float | str | dict | list,
@@ -1204,27 +1329,11 @@ def two_page_login_yaml(*, submit_selector: str = "Login") -> str:
     """
 
 
-def straight_line_login_yaml() -> str:
-    """One always-executed code block with no branching: executing it reaches every call in it."""
-    return """
-    title: Sign in and read the metric
-    workflow_definition:
-      blocks:
-      - block_type: code
-        label: sign_in_and_read
-        code: |
-          await page.fill("#user", "demo")
-          await page.get_by_role("button", name="Login", exact=True).click()
-          return {"visitors": "9.42K"}
-    """
-
-
 def failed_second_factor_run(run_id: str) -> RecordedBuildTestOutcome:
     return RecordedBuildTestOutcome(
         phase="persisted_block_run",
         attempted_tool="update_and_run_blocks",
         attempted_block_label="sign_in_and_read",
-        attempted_call_ref="role:button:Login",
         verdict="repairable_failure",
         reason_code="runtime_block_failure",
         workflow_run_id=run_id,
@@ -1255,6 +1364,33 @@ def carried_interaction(**fields: InteractionFieldValue) -> dict[str, Any]:
     The record is plain interaction dicts, so this only spares tests the brace noise.
     """
     return dict(fields)
+
+
+def captured_frame_entry(width: int = 1920, height: int = 947) -> ScreenshotEntry:
+    """A frame staged from a real PNG; each call is a new capture event."""
+    buf = io.BytesIO()
+    Image.new("RGB", (width, height), (40, 90, 160)).save(buf, format="PNG")
+    return resize_screenshot_b64(
+        base64.b64encode(buf.getvalue()).decode("ascii"),
+        provenance=ScreenshotProvenance(
+            source_tool="get_browser_screenshot",
+            captured_url="https://example.com/page",
+            observation_step=None,
+            browser_session_id="pbs_123",
+            workflow_run_id=None,
+            action_relation=ScreenshotActionRelation.TOOL_RESULT,
+            viewport_css_px=(width, height),
+        ),
+    )
+
+
+def sent_image_px(message: Any) -> list[tuple[int, int]]:
+    content = message.get("content") if isinstance(message, dict) else None
+    return [
+        Image.open(io.BytesIO(base64.b64decode(part["image_url"].partition(";base64,")[2]))).size
+        for part in (content if isinstance(content, list) else [])
+        if part.get("type") == "input_image"
+    ]
 
 
 def make_model_input_data(items: list[Any], *, instructions: str | None = None, context: Any = None) -> Any:
@@ -1295,54 +1431,6 @@ def stub_copilot_agent_loop(
     monkeypatch.setattr("skyvern.forge.sdk.copilot.model_resolver.resolve_model_config", fake_resolve_model_config)
     monkeypatch.setattr("skyvern.forge.sdk.copilot.enforcement.run_with_enforcement", run_with_enforcement)
     monkeypatch.setattr(copilot_agent, "schedule_agent_naming", lambda *_args: None)
-
-
-SENSITIVE_DISCLOSURE_WITHHOLDING_ARMS = [
-    "registry_missing",
-    "registry_incomplete",
-    "registry_other_run",
-    "run_still_active",
-    "run_id_unclaimed",
-    "second_browser_run_replaced_registry",
-    "same_session_earlier_run_unbound",
-]
-
-
-def taint_by_terminal_run(ctx: Any, *, workflow_run_id: str, session_id: str) -> None:
-    """Mark ``session_id`` as the page a finished credential run left, attributed to that run."""
-    record_sensitive_origin_run_taint(ctx, workflow_run_id=workflow_run_id, session_id=session_id)
-
-
-def remove_sensitive_disclosure_prerequisite(ctx: Any, arm: str) -> None:
-    """Drop exactly one prerequisite of the terminal-matching-registry disclosure route."""
-    registry = ctx.origin_run_redaction_registry
-    if arm == "registry_missing":
-        ctx.origin_run_redaction_registry = None
-    elif arm == "registry_incomplete":
-        ctx.origin_run_redaction_registry = replace(registry, contains_all_sensitive_values=False)
-    elif arm == "registry_other_run":
-        ctx.origin_run_redaction_registry = replace(registry, workflow_run_id="wr_unrelated")
-    elif arm == "run_still_active":
-        register_sensitive_origin_run_lease(
-            ctx, workflow_run_id=registry.workflow_run_id, session_id=ctx.browser_session_id
-        )
-    elif arm == "run_id_unclaimed":
-        ctx.last_run_blocks_workflow_run_id = None
-    elif arm == "second_browser_run_replaced_registry":
-        # A later run on another browser finished with a complete registry and is the run the
-        # model now claims; the page under inspection was tainted by the earlier run, whose
-        # values were never bound. The complete registry must not unlock that page.
-        record_sensitive_origin_run_taint(ctx, workflow_run_id="wr_second", session_id="pbs_second_browser")
-        ctx.last_run_blocks_workflow_run_id = "wr_second"
-        ctx.origin_run_redaction_registry = replace(
-            registry, workflow_run_id="wr_second", contains_all_sensitive_values=True
-        )
-    elif arm == "same_session_earlier_run_unbound":
-        # An earlier run on this same page ended without completing its registry, so a value
-        # it entered may be on the page while the claimed run's complete registry knows nothing of it.
-        record_sensitive_origin_run_taint(ctx, workflow_run_id="wr_earlier", session_id=ctx.browser_session_id)
-    else:
-        raise AssertionError(f"unknown arm {arm}")
 
 
 TURN_EXIT_PATHS = ("normal", "model_error", "deadline", "cancel")
@@ -1595,3 +1683,206 @@ class FakeCopilotStream:
 
     def titles(self) -> list[str]:
         return [event.title for event in self.sent if isinstance(event, WorkflowCopilotTitleUpdate)]
+
+
+def _scripted_response() -> Response:
+    return Response(
+        id="resp_1",
+        created_at=0.0,
+        model="gpt-4o",
+        object="response",
+        output=[],
+        parallel_tool_calls=True,
+        tool_choice="auto",
+        tools=[],
+    )
+
+
+ScriptedOutput = list[ResponseFunctionToolCall | ResponseOutputMessage]
+
+
+def scripted_call(name: str, arguments: dict[str, Any], call_id: str = "call_held") -> ResponseFunctionToolCall:
+    return ResponseFunctionToolCall(
+        id=f"fc_{call_id}", call_id=call_id, name=name, arguments=json.dumps(arguments), type="function_call"
+    )
+
+
+def scripted_text(text: str) -> ResponseOutputMessage:
+    return ResponseOutputMessage(
+        id="msg_done",
+        role="assistant",
+        status="completed",
+        type="message",
+        content=[ResponseOutputText(type="output_text", text=text, annotations=[])],
+    )
+
+
+class ScriptedModel(Model):
+    """Deterministic SDK input source: one scripted output per model call, None for a stream that never completes."""
+
+    def __init__(self, script: list[ScriptedOutput | None]) -> None:
+        self.script = script
+        self.inputs: list[list[Any]] = []
+        self.served_instructions: str | None = None
+        self.served_tools: list[Any] = []
+        self.served_tool_names_by_call: list[set[str]] = []
+
+    async def get_response(self, *args: Any, **kwargs: Any) -> ModelResponse:
+        raise AssertionError("streamed execution required")
+
+    async def stream_response(
+        self,
+        system_instructions: str | None,
+        input: Any,
+        model_settings: Any,
+        tools: list[Any],
+        *args: Any,
+        **kwargs: Any,
+    ):
+        self.served_instructions = system_instructions
+        self.served_tools = tools
+        self.served_tool_names_by_call.append({tool.name for tool in tools})
+        self.inputs.append(list(input))
+        output = self.script[len(self.inputs) - 1]
+        if output is None:
+            return
+        for index, item in enumerate(output):
+            yield ResponseOutputItemDoneEvent(
+                item=item, output_index=index, sequence_number=index + 1, type="response.output_item.done"
+            )
+        response = _scripted_response().model_copy(update={"output": output, "status": "completed"})
+        yield ResponseCompletedEvent(response=response, sequence_number=len(output) + 1, type="response.completed")
+
+
+REPLY_ARGUMENTS = {"user_response": "Use a `for_loop` block.", "global_llm_context": {"user_goal": "loop over URLs"}}
+
+
+async def run_scripted_turn(
+    model: ScriptedModel,
+    *,
+    tools: list[FunctionTool] | None = None,
+    max_turns: int = 10,
+    output_guardrails: list[OutputGuardrail[CopilotContext]] | None = None,
+    saved_items: list[TResponseInputItem] | None = None,
+    ctx: CopilotContext | None = None,
+) -> tuple[RunResultStreaming, CopilotContext, FakeCopilotStream]:
+    ctx = ctx or make_copilot_ctx(
+        organization_id="org_test", workflow_permanent_id="wpid_test", workflow_id=None, workflow_yaml=None, stream=None
+    )
+    stream = FakeCopilotStream()
+    ctx.stream = stream
+    session = SQLiteSession("scripted-turn")
+    try:
+        result = await run_with_enforcement(
+            agent=Agent(
+                name="controlled",
+                model=model,
+                tools=[*(tools or []), reply_tool],
+                tool_use_behavior=reply_ends_turn,
+                output_guardrails=output_guardrails or [],
+            ),
+            initial_input="How do I loop over a list of URLs?",
+            ctx=ctx,
+            stream=stream,
+            session=session,
+            max_turns=max_turns,
+            hooks=CopilotRunHooks(ctx),
+            run_config=RunConfig(
+                tracing_disabled=True,
+                session_input_callback=copilot_session_input_callback,
+                call_model_input_filter=copilot_call_model_input_filter,
+            ),
+        )
+    finally:
+        if saved_items is not None:
+            saved_items.extend(await session.get_items())
+        session.close()
+    return result, ctx, stream
+
+
+def tool_outputs_for(model_input: list[Any], call_id: str) -> list[str]:
+    return [
+        item["output"]
+        for item in model_input
+        if isinstance(item, dict) and item.get("type") == "function_call_output" and item.get("call_id") == call_id
+    ]
+
+
+def tool_frame_types(stream: FakeCopilotStream) -> list[WorkflowCopilotStreamMessageType]:
+    return [
+        frame.type
+        for frame in stream.sent
+        if frame.type in (WorkflowCopilotStreamMessageType.TOOL_CALL, WorkflowCopilotStreamMessageType.TOOL_RESULT)
+    ]
+
+
+class ScriptedProvider(ModelProvider):
+    def __init__(self, model: Model) -> None:
+        self.model = model
+
+    def get_model(self, model_name: str | None) -> Model:
+        return self.model
+
+
+async def run_production_loop(
+    model: ScriptedModel,
+    *,
+    final_reply: bool = False,
+    output_guardrails: list[OutputGuardrail[CopilotContext]] | None = None,
+    native_tools: list[FunctionTool] | None = None,
+) -> tuple[RunResultStreaming, CopilotContext, FakeCopilotStream]:
+    ctx = make_copilot_ctx(
+        organization_id="org_test", workflow_permanent_id="wpid_test", workflow_id=None, workflow_yaml=None, stream=None
+    )
+    ctx.api_key = "test-in-process-key"
+    stream = FakeCopilotStream()
+    ctx.stream = stream
+    result = await _run_agent_loop_with_surface(
+        ctx=ctx,
+        stream=stream,
+        chat_id="chat-1",
+        initial_input="How do I loop over a list of URLs?",
+        system_prompt="system prompt",
+        model_name="scripted",
+        run_config=RunConfig(tracing_disabled=True, model_provider=ScriptedProvider(model)),
+        llm_key="PRIMARY",
+        copilot_config=CopilotConfig(),
+        native_tools=native_tools or [reply_tool],
+        alias_map={},
+        overlays={},
+        output_guardrails=output_guardrails or [],
+        final_reply=final_reply,
+    )
+    return result, ctx, stream
+
+
+RECEIPT_WORKFLOW_YAML = """
+title: Metric
+workflow_definition:
+  parameters: []
+  blocks:
+    - block_type: task
+      label: sign_in
+      prompt: Sign in
+    - block_type: task
+      label: read_metric
+      prompt: Read the metric
+"""
+
+
+def receipt_message(narrative_payload: dict[str, Any]) -> MagicMock:
+    return MagicMock(sender=WorkflowCopilotChatSender.AI, narrative_payload=narrative_payload)
+
+
+def all_blocks_tested_message() -> MagicMock:
+    current = workflow_block_fingerprints(RECEIPT_WORKFLOW_YAML)
+    return receipt_message({"testedBlockFingerprints": {label: sorted(fps) for label, fps in current.items()}})
+
+
+def receipt_coverage_after(
+    messages: Sequence[WorkflowCopilotChatMessage], proposal: dict[str, Any] | None = None
+) -> dict[str, str]:
+    seed = _assistant_execution_receipts(list(messages), proposal)
+    projection = build_review_projection(RECEIPT_WORKFLOW_YAML, RECEIPT_WORKFLOW_YAML, seed)
+    assert projection is not None
+    return {block["label"]: block["coverage"] for block in projection["blocks"]}

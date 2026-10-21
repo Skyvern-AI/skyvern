@@ -107,6 +107,16 @@ def collect_redactable_secret_values(
     return values
 
 
+def collect_secret_values_at_any_length(secrets: Mapping[str, Any], otp_values: Iterable[Any] = ()) -> set[str]:
+    """For a consumer that replaces exact values and applies no floor of its own. Placeholder ids and
+    TOTP routing markers are not secret values, so they stay out."""
+    return {
+        value
+        for value in [*secrets.values(), *otp_values]
+        if isinstance(value, str) and value and value not in secrets and value not in _TOTP_SENTINEL_VALUES
+    }
+
+
 def expand_secret_encodings(value: str) -> set[str]:
     return {
         value,

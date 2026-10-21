@@ -4,6 +4,7 @@ import asyncio
 import inspect
 import os
 import re
+import weakref
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Callable
@@ -65,6 +66,7 @@ from skyvern.webeye.actions.actions import (
 )
 from skyvern.webeye.actions.handler import (
     ActionHandler,
+    _register_runtime_otp_value_best_effort,
     generate_totp_value,
     get_actual_value_of_parameter_if_secret,
     handle_complete_action,
@@ -75,11 +77,22 @@ from skyvern.webeye.browser_engine import BrowserEngineSelection
 from skyvern.webeye.browser_state import BrowserState
 from skyvern.webeye.navigation import default_navigation_settle, navigate_with_retry, redact_url_secrets
 from skyvern.webeye.scraper.scraped_page import ScrapedPage
+from skyvern.webeye.utils.challenge_solve_record import calling_solve_client
 from skyvern.webeye.utils.page import SkyvernFrame
 
 LOG = structlog.get_logger()
 
 action_wrap = SkyvernPage.action_wrap
+
+_SCRIPT_SCRAPED_PAGES: weakref.WeakKeyDictionary[object, ScrapedPage] = weakref.WeakKeyDictionary()
+
+
+def _get_scraped_page(page: object) -> ScrapedPage:
+    return _SCRIPT_SCRAPED_PAGES[page]
+
+
+def _set_scraped_page(page: object, scraped_page: ScrapedPage) -> None:
+    _SCRIPT_SCRAPED_PAGES[page] = scraped_page
 
 
 def _redact_termination_payload(
@@ -129,6 +142,7 @@ class ScriptSkyvernPage(SkyvernPage):
     ) -> None:
         super().__init__(page=page, ai=ai, engine_selection=engine_selection)
         self.scraped_page = scraped_page
+        _set_scraped_page(self, scraped_page)
         self._record = recorder or (lambda ac: None)
 
     @classmethod
@@ -625,7 +639,11 @@ class ScriptSkyvernPage(SkyvernPage):
                     )
                     action = Action(**common_fields)
 
-            created_action = await app.DATABASE.workflow_params.create_action(action)
+            created_action = await app.DATABASE.workflow_params.create_action(
+                skyvern_context.action_for_multi_field_totp_persistence(
+                    action, app.WORKFLOW_CONTEXT_MANAGER.get_one_time_codes_for_run(action.workflow_run_id)
+                )
+            )
             # Skip LLM reasoning in script mode — use static string instead.
             # Build a descriptive label from the selector for the timeline.
             if action_type == ActionType.TERMINATE and isinstance(call_error, ScriptTerminationException):
@@ -941,6 +959,8 @@ class ScriptSkyvernPage(SkyvernPage):
                 if totp_value:
                     # use the totp verification code
                     value = totp_value.value
+                    context.register_secret_value(value)
+                    _register_runtime_otp_value_best_effort(workflow_run_id, value)
 
         return value
 
@@ -1093,9 +1113,11 @@ class ScriptSkyvernPage(SkyvernPage):
 
         # Retry logic matching agent mode (real_browser_state.navigate_to_url)
         last_error: Exception | None = None
+        _get_scraped_page(self)._browser_state.begin_navigation()
         for attempt in range(max_retries):
             try:
                 await self.page.goto(url, timeout=timeout, **kwargs)
+                await _get_scraped_page(self)._browser_state.record_navigation_result(None, url=url)
                 if is_script_mode:
                     LOG.debug("Page loaded")
                 return
@@ -1114,6 +1136,7 @@ class ScriptSkyvernPage(SkyvernPage):
 
         if last_error is None:
             raise RuntimeError("Navigation failed but no error was captured")
+        await _get_scraped_page(self)._browser_state.record_navigation_result(last_error)
         raise last_error
 
     async def magic_link(
@@ -1175,8 +1198,14 @@ class ScriptSkyvernPage(SkyvernPage):
         if not context or not context.organization_id or not context.task_id or not context.step_id:
             # Fallback: solve directly without DB context. Arm the vendor solver lifecycle around the
             # solve so a factory-created (solver-off) session is armed on this path too.
-            async with app.AGENT_FUNCTION.captcha_solver_lifecycle_scope(self.page):
-                await app.AGENT_FUNCTION.auto_solve_captchas(self.page)
+            with app.AGENT_FUNCTION.challenge_solve_recording(
+                "cached_script",
+                page=self.page,
+                organization_id=context.organization_id if context else None,
+                workflow_run_id=context.workflow_run_id if context else None,
+            ) as record:
+                async with app.AGENT_FUNCTION.captcha_solver_lifecycle_scope(self.page):
+                    record.extension_solved = await app.AGENT_FUNCTION.auto_solve_captchas(self.page)
             return None
 
         task = await app.DATABASE.tasks.get_task(context.task_id, context.organization_id)
@@ -1188,7 +1217,12 @@ class ScriptSkyvernPage(SkyvernPage):
                 task_id=context.task_id,
                 step_id=context.step_id,
             )
-            await solve_captcha_handler(action, self.page, self.scraped_page, task, step)
+            # The v1 handler records the call after its own fast-fail guards; this names the cached script as client.
+            client = calling_solve_client.set("cached_script")
+            try:
+                await solve_captcha_handler(action, self.page, self.scraped_page, task, step)
+            finally:
+                calling_solve_client.reset(client)
         else:
             await asyncio.sleep(30)
 

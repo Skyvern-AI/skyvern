@@ -13,6 +13,7 @@ from unittest.mock import AsyncMock, MagicMock
 import pytest
 import pytest_asyncio
 from sqlalchemy import event, select, text
+from sqlalchemy.exc import OperationalError
 from sqlalchemy.ext.asyncio import AsyncEngine, async_sessionmaker
 from structlog.testing import capture_logs
 from structlog.types import EventDict
@@ -29,6 +30,7 @@ from skyvern.forge.sdk.artifact.models import ArtifactType
 from skyvern.forge.sdk.db.agent_db import AgentDB, _build_engine
 from skyvern.forge.sdk.db.datetime_utils import naive_utc_now
 from skyvern.forge.sdk.db.enums import BrowserSeedSource
+from skyvern.forge.sdk.db.exceptions import RunsListSearchCanceled
 from skyvern.forge.sdk.db.models import (
     ArtifactModel,
     Base,
@@ -46,6 +48,7 @@ from skyvern.forge.sdk.db.models import (
     WorkflowRunModel,
 )
 from skyvern.forge.sdk.db.repositories import workflow_run_attempts as attempts_repository_module
+from skyvern.forge.sdk.db.repositories import workflow_runs as workflow_runs_repository
 from skyvern.forge.sdk.db.repositories.workflow_run_attempts import TerminalSideEffectCheckpoint
 from skyvern.forge.sdk.db.repositories.workflow_runs import WorkflowRunsRepository
 from skyvern.forge.sdk.schemas.persistent_browser_sessions import FORCED_WORKFLOW_SESSION_RUNNABLE_TYPE
@@ -53,11 +56,16 @@ from skyvern.forge.sdk.schemas.tasks import TaskStatus
 from skyvern.forge.sdk.workflow import service as workflow_service_module
 from skyvern.forge.sdk.workflow.models.parameter import CredentialParameter
 from skyvern.forge.sdk.workflow.models.workflow import WorkflowDefinition, WorkflowRunStatus
-from skyvern.forge.sdk.workflow.retry_policy import LEASE_TAKEOVER_SECONDS, is_retry_eligible_run
+from skyvern.forge.sdk.workflow.retry_policy import (
+    LEASE_TAKEOVER_SECONDS,
+    WEBHOOK_FALLBACK_GRACE_SECONDS,
+    is_retry_eligible_run,
+)
 from skyvern.forge.taskv3.loop import LoopOutcome
 from skyvern.schemas.run_enums import RunType
 from skyvern.schemas.runs import MAX_SEARCH_FETCH_LIMIT
 from skyvern.schemas.workflows import WorkflowRetryPolicy
+from tests.unit.statement_timeout_fakes import FakeQueryCanceled
 
 
 class _SessionContext:
@@ -4425,3 +4433,456 @@ async def test_metadata_route_reads_real_rows_with_no_reconcile_write_or_provide
         assert statements
     finally:
         event.remove(sqlite_engine.sync_engine, "before_cursor_execute", forbid_write)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(("search_seconds", "expected_fallback_seconds"), [(12, 18), (30, 0.25)])
+async def test_get_all_runs_v2_splits_one_timeout_budget_across_both_search_statements(
+    monkeypatch: pytest.MonkeyPatch,
+    search_seconds: int,
+    expected_fallback_seconds: float,
+) -> None:
+    # A search runs the primary query and then the workflow_runs fallback. PostgreSQL applies
+    # statement_timeout per statement, so re-applying the full ceiling before the second one would let
+    # the request hold its connection for twice the intended budget.
+    applied: list[float] = []
+    clock = [0.0]
+
+    async def _checkout() -> None:
+        clock[0] += 50  # Pool wait is outside the connection-hold budget.
+
+    async def _record(_session: Any, seconds: float) -> None:
+        applied.append(seconds)
+
+    execute_count = 0
+
+    async def _execute(_query: Any) -> _EmptyExecuteResult:
+        nonlocal execute_count
+        execute_count += 1
+        if execute_count == 1:
+            clock[0] += search_seconds
+        return _EmptyExecuteResult()
+
+    monkeypatch.setattr(workflow_runs_repository, "apply_statement_timeout", _record)
+    monkeypatch.setattr(workflow_runs_repository, "time", SimpleNamespace(monotonic=lambda: clock[0]))
+
+    session = MagicMock()
+    session.bind.dialect.name = "postgresql"
+    session.connection = AsyncMock(side_effect=_checkout)
+    session.execute = AsyncMock(side_effect=_execute)
+    repo = WorkflowRunsRepository(session_factory=lambda: _SessionContext(session), debug_enabled=False)
+
+    await repo.get_all_runs_v2(organization_id="o_test", page=1, page_size=10, search_key="no-such-term")
+
+    assert len(applied) == 2
+    ceiling = workflow_runs_repository.RUNS_LIST_STATEMENT_TIMEOUT_SECONDS
+    assert applied[0] == ceiling
+    # The fallback gets what is left, never a fresh ceiling, and never a non-positive value that
+    # PostgreSQL would read as "no timeout".
+    assert applied == [ceiling, expected_fallback_seconds]
+    session.connection.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_get_all_runs_v2_does_not_cap_unmeasured_or_indexed_query_shapes(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    applied: list[float] = []
+
+    async def _record(_session: Any, seconds: float) -> None:
+        applied.append(seconds)
+
+    monkeypatch.setattr(workflow_runs_repository, "apply_statement_timeout", _record)
+    session = MagicMock()
+    session.bind.dialect.name = "postgresql"
+    session.connection = AsyncMock()
+    session.execute = AsyncMock(return_value=_EmptyExecuteResult())
+    repo = WorkflowRunsRepository(session_factory=lambda: _SessionContext(session), debug_enabled=False)
+
+    await repo.get_all_runs_v2(
+        organization_id="o_test",
+        status=["failed"],
+        workflow_permanent_ids=["wpid_123"],
+        failure_category="LOGIN_FAILURE",
+    )
+    await repo.get_all_runs_v2(organization_id="o_test", search_key="bp_123")
+
+    assert applied == []
+    session.connection.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_workflow_runs_search_caps_only_the_unindexed_free_text_read(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # The per-workflow runs list runs the same unindexed substring arms as the global list, so its
+    # free-text search has to hand the connection back instead of running to the statement timeout
+    # the connection itself carries.
+    applied: list[float] = []
+
+    async def _record(_session: Any, seconds: float) -> None:
+        applied.append(seconds)
+
+    monkeypatch.setattr(workflow_runs_repository, "apply_statement_timeout", _record)
+    session = MagicMock()
+    session.bind.dialect.name = "postgresql"
+    session.connection = AsyncMock()
+    session.execute = AsyncMock(return_value=_EmptyExecuteResult())
+    repo = WorkflowRunsRepository(session_factory=lambda: _SessionContext(session), debug_enabled=False)
+
+    await repo.get_workflow_runs_for_workflow_permanent_id(
+        workflow_permanent_id="wpid_test",
+        organization_id="o_test",
+        search_key="no-such-term",
+    )
+
+    assert applied == [workflow_runs_repository.RUNS_LIST_STATEMENT_TIMEOUT_SECONDS]
+
+    # An exact browser identifier resolves through indexed equality, and the other filter shapes have
+    # unmeasured plans; neither takes the cap.
+    await repo.get_workflow_runs_for_workflow_permanent_id(
+        workflow_permanent_id="wpid_test",
+        organization_id="o_test",
+        search_key="pbs_123",
+    )
+    await repo.get_workflow_runs_for_workflow_permanent_id(
+        workflow_permanent_id="wpid_test",
+        organization_id="o_test",
+        status=[WorkflowRunStatus.failed],
+        error_code="LOGIN_FAILED",
+    )
+
+    assert applied == [workflow_runs_repository.RUNS_LIST_STATEMENT_TIMEOUT_SECONDS]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("search_key", "expected_indexed", "expected_budget"),
+    [
+        ("customer-private-search", False, workflow_runs_repository.RUNS_LIST_STATEMENT_TIMEOUT_SECONDS),
+        # Never capped, so it ran under the connection's own timeout rather than this budget.
+        ("pbs_123", True, None),
+    ],
+)
+async def test_cancelled_workflow_runs_search_is_typed_and_keeps_the_term_out_of_logs(
+    search_key: str,
+    expected_indexed: bool,
+    expected_budget: float | None,
+) -> None:
+    # The route reports this cancellation, so it is raised as its own type: logging it as a
+    # SQLAlchemyError would both double-report it and put the search term in reach of the log.
+    failure = OperationalError(
+        "SELECT ... WHERE workflow_run_parameters.value ILIKE :search_key",
+        {"search_key": search_key},
+        FakeQueryCanceled("canceling statement due to statement timeout"),
+    )
+
+    async def _execute(statement: Any, *_args: Any) -> _EmptyExecuteResult:
+        # Only the search statement is cancelled; the budget's own set_config has to succeed.
+        if "set_config" in str(statement):
+            return _EmptyExecuteResult()
+        raise failure
+
+    session = MagicMock()
+    session.bind.dialect.name = "postgresql"
+    session.connection = AsyncMock()
+    session.execute = AsyncMock(side_effect=_execute)
+    repo = WorkflowRunsRepository(session_factory=lambda: _SessionContext(session), debug_enabled=False)
+
+    with capture_logs() as logs:
+        with pytest.raises(RunsListSearchCanceled) as exc_info:
+            await repo.get_workflow_runs_for_workflow_permanent_id(
+                workflow_permanent_id="wpid_test",
+                organization_id="o_test",
+                search_key=search_key,
+            )
+
+    assert exc_info.value.indexed_search is expected_indexed
+    assert exc_info.value.statement_timeout_seconds == expected_budget
+    assert failure.hide_parameters is True
+    assert search_key not in repr(logs)
+    assert not any(log.get("event") == "SQLAlchemyError" for log in logs)
+
+
+@pytest.mark.asyncio
+async def test_cancelled_workflow_runs_read_without_a_search_stays_a_logged_server_error() -> None:
+    # Only the search statement is capped and reported to the caller. Any other filter's
+    # cancellation keeps the operation-tagged error line that production triage queries.
+    failure = OperationalError(
+        "SELECT ... WHERE tasks.errors @> :error_code",
+        {"error_code": "LOGIN_FAILED"},
+        FakeQueryCanceled("canceling statement due to statement timeout"),
+    )
+    session = MagicMock()
+    session.bind.dialect.name = "postgresql"
+    session.connection = AsyncMock()
+    session.execute = AsyncMock(side_effect=failure)
+    repo = WorkflowRunsRepository(session_factory=lambda: _SessionContext(session), debug_enabled=False)
+
+    with capture_logs() as logs:
+        with pytest.raises(OperationalError):
+            await repo.get_workflow_runs_for_workflow_permanent_id(
+                workflow_permanent_id="wpid_test",
+                organization_id="o_test",
+                error_code="LOGIN_FAILED",
+            )
+
+    assert [log["operation"] for log in logs if log.get("event") == "SQLAlchemyError"] == [
+        "get_workflow_runs_for_workflow_permanent_id"
+    ]
+
+
+@pytest.mark.asyncio
+async def test_get_all_runs_v2_hides_search_parameters_on_timeout_before_retry_logging() -> None:
+    search_key = "customer-private-search"
+    failure = OperationalError(
+        "SELECT ... WHERE searchable_text ILIKE :search_key",
+        {"search_key": search_key},
+        FakeQueryCanceled("canceling statement due to statement timeout"),
+    )
+    session = MagicMock()
+    session.bind.dialect.name = "postgresql"
+    session.connection = AsyncMock()
+    session.execute = AsyncMock(side_effect=[_EmptyExecuteResult(), failure])
+    repo = WorkflowRunsRepository(session_factory=lambda: _SessionContext(session), debug_enabled=False)
+
+    with capture_logs() as logs:
+        with pytest.raises(OperationalError) as exc_info:
+            await repo.get_all_runs_v2(organization_id="o_test", search_key=search_key)
+
+    assert exc_info.value.hide_parameters is True
+    assert search_key not in repr(logs)
+    assert not any(log.get("event") == "SQLAlchemyError" for log in logs)
+
+
+def _final_webhook_claim_stale_before() -> datetime:
+    return naive_utc_now() - timedelta(seconds=WEBHOOK_FALLBACK_GRACE_SECONDS)
+
+
+async def _seed_canceled_runs(db: AgentDB, organization_id: str, finished_at: datetime, **runs: dict[str, Any]) -> None:
+    async with db.Session() as session:
+        for workflow_run_id, columns in runs.items():
+            run = _workflow_run_model(
+                workflow_run_id=workflow_run_id,
+                queued_at=finished_at,
+                status=WorkflowRunStatus.canceled.value,
+                organization_id=organization_id,
+            )
+            run.finished_at = finished_at
+            for column, value in columns.items():
+                setattr(run, column, value)
+            session.add(run)
+        await session.commit()
+
+
+@pytest.mark.asyncio
+async def test_final_webhook_claim_has_one_winner_per_terminal_execution(
+    org_scoped_db: tuple[AgentDB, AsyncEngine, str],
+) -> None:
+    db, _engine, organization_id = org_scoped_db
+    finished_at = datetime(2026, 1, 1, 12, 0, 0)
+    await _seed_canceled_runs(db, organization_id, finished_at, wr_claim_race={}, wr_claim_refinished={})
+
+    claims = await asyncio.gather(
+        *(
+            db.workflow_runs.claim_final_webhook_delivery(
+                "wr_claim_race",
+                expected_status=WorkflowRunStatus.canceled,
+                expected_finished_at=finished_at,
+                stale_before=_final_webhook_claim_stale_before(),
+            )
+            for _ in range(5)
+        )
+    )
+    stale_claim = await db.workflow_runs.claim_final_webhook_delivery(
+        "wr_claim_refinished",
+        expected_status=WorkflowRunStatus.canceled,
+        expected_finished_at=finished_at - timedelta(seconds=1),
+        stale_before=_final_webhook_claim_stale_before(),
+    )
+    other_status_claim = await db.workflow_runs.claim_final_webhook_delivery(
+        "wr_claim_refinished",
+        expected_status=WorkflowRunStatus.completed,
+        expected_finished_at=finished_at,
+        stale_before=_final_webhook_claim_stale_before(),
+    )
+
+    assert len([claim for claim in claims if claim is not None]) == 1
+    assert stale_claim is None
+    assert other_status_claim is None
+
+
+@pytest.mark.asyncio
+async def test_final_webhook_claim_takes_over_only_an_unrecorded_claim_past_the_delivery_bound(
+    org_scoped_db: tuple[AgentDB, AsyncEngine, str],
+) -> None:
+    # A sender that died mid-delivery leaves a claim with no outcome; once it outlives any bounded delivery,
+    # the next sender takes it rather than leaving the run's final webhook unsent forever.
+    db, _engine, organization_id = org_scoped_db
+    finished_at = datetime(2026, 1, 1, 12, 0, 0)
+    abandoned_at = naive_utc_now() - timedelta(seconds=WEBHOOK_FALLBACK_GRACE_SECONDS + 1)
+    await _seed_canceled_runs(
+        db,
+        organization_id,
+        finished_at,
+        wr_claim_abandoned={"webhook_delivery_finalized_at": abandoned_at},
+        wr_claim_in_flight={"webhook_delivery_finalized_at": naive_utc_now()},
+        wr_claim_recorded={"webhook_delivery_finalized_at": abandoned_at, "webhook_delivery_status": "delivered"},
+    )
+
+    async def claim(workflow_run_id: str) -> datetime | None:
+        return await db.workflow_runs.claim_final_webhook_delivery(
+            workflow_run_id,
+            expected_status=WorkflowRunStatus.canceled,
+            expected_finished_at=finished_at,
+            stale_before=_final_webhook_claim_stale_before(),
+        )
+
+    taken_over = await claim("wr_claim_abandoned")
+    # The abandoned sender's late release names its own claim, so it cannot free the claim that replaced it.
+    await db.workflow_runs.release_final_webhook_delivery_claim("wr_claim_abandoned", claimed_at=abandoned_at)
+
+    assert taken_over is not None
+    assert await claim("wr_claim_abandoned") is None
+    assert await claim("wr_claim_in_flight") is None
+    assert await claim("wr_claim_recorded") is None
+
+
+_WINDOW_START = datetime(2026, 7, 20, 12, 0, 0)
+_WINDOW_END = datetime(2026, 7, 30, 12, 0, 0)
+
+
+def _window_run_names(runs: list[Any], organization_id: str) -> list[str]:
+    return [run.workflow_run_id.removesuffix(f"_{organization_id}") for run in runs]
+
+
+async def _seed_created_at_window_runs(db: AgentDB, organization_id: str) -> None:
+    # The PostgreSQL leg shares one scratch schema across tests, so primary keys are scoped to the organization.
+    workflow_id = f"wf_window_{organization_id}"
+    workflow_permanent_id = f"wpid_window_{organization_id}"
+    created = {
+        "wr_window_before": _WINDOW_START - timedelta(seconds=1),
+        "wr_window_at_start": _WINDOW_START,
+        "wr_window_inside": datetime(2026, 7, 25, 8, 0, 0),
+        "wr_window_inside_other": datetime(2026, 7, 26, 8, 0, 0),
+        "wr_window_at_end": _WINDOW_END,
+        "wr_window_after": _WINDOW_END + timedelta(seconds=1),
+    }
+    async with db.Session() as session:
+        session.add(
+            WorkflowModel(
+                workflow_id=workflow_id,
+                organization_id=organization_id,
+                workflow_permanent_id=workflow_permanent_id,
+                title="created_at window fixture",
+                workflow_definition={},
+                version=1,
+            )
+        )
+        await session.flush()
+        for workflow_run_id, created_at in created.items():
+            session.add(
+                _workflow_run_model(
+                    workflow_run_id=f"{workflow_run_id}_{organization_id}",
+                    queued_at=created_at,
+                    workflow_id=workflow_id,
+                    workflow_permanent_id=workflow_permanent_id,
+                    organization_id=organization_id,
+                    status=(
+                        WorkflowRunStatus.failed.value
+                        if workflow_run_id == "wr_window_inside_other"
+                        else WorkflowRunStatus.completed.value
+                    ),
+                    webhook_callback_url=(
+                        None
+                        if workflow_run_id == "wr_window_inside_other"
+                        else "https://hooks.example.test/window-term"
+                    ),
+                )
+            )
+        await session.commit()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("created_at_start", "created_at_end", "expected_run_ids"),
+    [
+        # Inclusive start, exclusive end, on the naive UTC column.
+        (_WINDOW_START, _WINDOW_END, ["wr_window_inside_other", "wr_window_inside", "wr_window_at_start"]),
+        (
+            _WINDOW_START,
+            None,
+            [
+                "wr_window_after",
+                "wr_window_at_end",
+                "wr_window_inside_other",
+                "wr_window_inside",
+                "wr_window_at_start",
+            ],
+        ),
+        (None, _WINDOW_END, ["wr_window_inside_other", "wr_window_inside", "wr_window_at_start", "wr_window_before"]),
+        # Aware bounds name the same instants in other offsets and must be normalized to naive UTC.
+        (
+            datetime(2026, 7, 20, 14, 0, 0, tzinfo=timezone(timedelta(hours=2))),
+            datetime(2026, 7, 30, 7, 0, 0, tzinfo=timezone(timedelta(hours=-5))),
+            ["wr_window_inside_other", "wr_window_inside", "wr_window_at_start"],
+        ),
+        (
+            datetime(2026, 7, 20, 12, 0, 0, tzinfo=UTC),
+            datetime(2026, 7, 30, 12, 0, 0, tzinfo=UTC),
+            ["wr_window_inside_other", "wr_window_inside", "wr_window_at_start"],
+        ),
+    ],
+)
+async def test_get_workflow_runs_filters_by_explicit_created_at_bounds(
+    org_scoped_db: tuple[AgentDB, AsyncEngine, str],
+    created_at_start: datetime | None,
+    created_at_end: datetime | None,
+    expected_run_ids: list[str],
+) -> None:
+    db, _engine, organization_id = org_scoped_db
+    await _seed_created_at_window_runs(db, organization_id)
+
+    runs = await db.workflow_runs.get_workflow_runs(
+        organization_id=organization_id,
+        page_size=20,
+        created_at_start=created_at_start,
+        created_at_end=created_at_end,
+    )
+
+    assert _window_run_names(runs, organization_id) == expected_run_ids
+
+
+@pytest.mark.asyncio
+async def test_get_workflow_runs_never_defaults_a_window_and_combines_bounds_with_other_filters(
+    org_scoped_db: tuple[AgentDB, AsyncEngine, str],
+) -> None:
+    db, _engine, organization_id = org_scoped_db
+    await _seed_created_at_window_runs(db, organization_id)
+
+    # The repository applies only the bounds it is given; the default window is the route's policy.
+    unbounded = await db.workflow_runs.get_workflow_runs(
+        organization_id=organization_id, page_size=20, search_key="window-term"
+    )
+    windowed_page = await db.workflow_runs.get_workflow_runs(
+        organization_id=organization_id,
+        page=2,
+        page_size=1,
+        status=[WorkflowRunStatus.completed],
+        search_key="window-term",
+        created_at_start=_WINDOW_START,
+        created_at_end=_WINDOW_END,
+    )
+    other_org = await db.workflow_runs.get_workflow_runs(
+        organization_id="o_someone_else", page_size=20, created_at_start=_WINDOW_START
+    )
+
+    assert set(_window_run_names(unbounded, organization_id)) == {
+        "wr_window_before",
+        "wr_window_at_start",
+        "wr_window_inside",
+        "wr_window_at_end",
+        "wr_window_after",
+    }
+    assert _window_run_names(windowed_page, organization_id) == ["wr_window_at_start"]
+    assert other_org == []

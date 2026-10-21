@@ -48,7 +48,7 @@ def detect_tool_loop(
             f"{LOOP_DETECTED_MARKER} '{tool_name}' has been called "
             f"{threshold} times consecutively. "
             "This tool will not run again. Use a DIFFERENT tool "
-            "to continue, or produce your final JSON response."
+            "to continue, or call `reply` with your final response."
         )
 
     if len(tracker) >= 2 and tracker[-1] != tracker[-2]:
@@ -162,7 +162,7 @@ def detect_failed_tool_step_loop(
         f"{LOOP_DETECTED_MARKER} '{tool_name}' has already failed "
         f"{failure_count} times with {category}; blocking attempt #{next_attempt}. "
         "This failure is not tied to the draft arguments. Fix the credential/configuration, "
-        "ask the user, or produce your final JSON response."
+        "ask the user, or call `reply` with your final response."
     )
 
 

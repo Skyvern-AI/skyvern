@@ -8,12 +8,18 @@ def test_single_copilot_runtime_imports_without_cloud_package() -> None:
         """
         import importlib.abc
         import asyncio
+        import gc
         import json
+        import os
         import sys
         from types import SimpleNamespace
         from unittest.mock import AsyncMock, MagicMock
 
         import pytest
+
+        # This child is almost all import work, and cyclic GC passes plus interpreter teardown are about
+        # a third of its CPU while the assertions need neither.
+        gc.disable()
 
         class BlockCloud(importlib.abc.MetaPathFinder):
             def find_spec(self, fullname, path, target=None):
@@ -110,6 +116,10 @@ def test_single_copilot_runtime_imports_without_cloud_package() -> None:
             monkeypatch.undo()
 
         asyncio.run(serve_turns())
+        sys.stdout.flush()
+        sys.stderr.flush()
+        # A failed assertion above never gets here, so it still exits nonzero with its traceback.
+        os._exit(0)
         """
     )
 

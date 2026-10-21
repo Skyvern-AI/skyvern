@@ -59,6 +59,7 @@ const {
   modalEditingCredentialId,
   modalDefaultTotpType,
   toastFn,
+  realPopover,
 } = vi.hoisted(() => {
   const calls: StreamCall[] = [];
   const streaming = vi.fn(
@@ -139,6 +140,7 @@ const {
     modalEditingCredentialId: { current: undefined as string | undefined },
     modalDefaultTotpType: { current: undefined as string | undefined },
     toastFn: vi.fn(),
+    realPopover: { current: false },
   };
 });
 
@@ -160,35 +162,43 @@ vi.mock("@/components/ui/use-toast", () => ({ toast: toastFn }));
 // Unlike the card unit test's always-render stub, this one honors `open` and wires the trigger —
 // WorkflowCopilotHistory also renders a Popover whose (closed) content pulls react-query, so an
 // unconditional PopoverContent would force-mount it and crash with "No QueryClient".
-vi.mock("@/components/ui/popover", async () => {
+// `realPopover` swaps in the Radix popover for a test that needs its Escape handling.
+vi.mock("@/components/ui/popover", async (importOriginal) => {
   const React = await import("react");
+  const actual =
+    await importOriginal<typeof import("@/components/ui/popover")>();
   const OpenCtx = React.createContext<{
     open: boolean;
     setOpen: (value: boolean) => void;
   }>({ open: false, setOpen: () => {} });
   return {
-    Popover: ({
-      open,
-      onOpenChange,
-      children,
-    }: {
-      open?: boolean;
-      onOpenChange?: (value: boolean) => void;
-      children?: ReactNode;
-    }) => (
-      <OpenCtx.Provider
-        value={{ open: Boolean(open), setOpen: onOpenChange ?? (() => {}) }}
-      >
-        {children}
-      </OpenCtx.Provider>
-    ),
-    PopoverTrigger: ({ children }: { children?: ReactNode }) => {
+    Popover: (props: ComponentProps<typeof actual.Popover>) =>
+      realPopover.current ? (
+        <actual.Popover {...props} />
+      ) : (
+        <OpenCtx.Provider
+          value={{
+            open: Boolean(props.open),
+            setOpen: props.onOpenChange ?? (() => {}),
+          }}
+        >
+          {props.children}
+        </OpenCtx.Provider>
+      ),
+    PopoverTrigger: (props: ComponentProps<typeof actual.PopoverTrigger>) => {
       const { open, setOpen } = React.useContext(OpenCtx);
-      return <div onClick={() => setOpen(!open)}>{children}</div>;
+      return realPopover.current ? (
+        <actual.PopoverTrigger {...props} />
+      ) : (
+        <div onClick={() => setOpen(!open)}>{props.children}</div>
+      );
     },
-    PopoverContent: ({ children }: { children?: ReactNode }) => {
+    PopoverContent: (props: ComponentProps<typeof actual.PopoverContent>) => {
       const { open } = React.useContext(OpenCtx);
-      return open ? <div>{children}</div> : null;
+      if (realPopover.current) {
+        return <actual.PopoverContent {...props} />;
+      }
+      return open ? <div>{props.children}</div> : null;
     },
   };
 });
@@ -528,6 +538,7 @@ beforeEach(() => {
   toastFn.mockClear();
   credentialsData.current = [];
   credsFail.current = false;
+  realPopover.current = false;
   modalOverrideType.current = undefined;
   modalDefaultTestUrl.current = undefined;
   modalEditingCredentialId.current = undefined;
@@ -774,6 +785,170 @@ describe("WorkflowCopilotChat — credential receipt placement", () => {
     expect(screen.getAllByText("Credential 'HN Login' added")).toHaveLength(1);
     expect(precedes(row("tc-1"), unfolded)).toBe(true);
     expect(precedes(unfolded, row("tc-2"))).toBe(true);
+  });
+
+  it("keeps every card's receipt when the model asks again in the same turn, live and once the turn ends", async () => {
+    credentialsData.current = [
+      { credential_id: "cred-hn", name: "HN Login", tested_url: null },
+    ];
+    await streamScoutTurn();
+    const test = {
+      tool_name: "run_blocks_and_collect_debug",
+      display_label: "Testing",
+      iteration: 1,
+      tool_call_id: "tc-2",
+    };
+    const resolved = (resume_token: string, outcome: string) => ({
+      type: "credential_pause_resolved",
+      turn_id: "turn-1",
+      workflow_copilot_chat_id: "chat-1",
+      resume_token,
+      outcome,
+      credential_id: outcome === "connected" ? "cred-hn" : null,
+      name: outcome === "connected" ? "HN Login" : null,
+      timestamp: new Date().toISOString(),
+    });
+    await act(async () => {
+      streamCalls[0]!.onMessage(
+        credentialFrame({ anchor_tool_call_id: "tc-1" }),
+      );
+      streamCalls[0]!.onMessage(resolved("rt-abc", "connected"));
+      streamCalls[0]!.onMessage({ type: "tool_call", tool_input: {}, ...test });
+      streamCalls[0]!.onMessage({
+        type: "tool_result",
+        success: false,
+        summary: "The test stopped on the sign-in page",
+        ...test,
+      });
+      streamCalls[0]!.onMessage(
+        credentialFrame({
+          anchor_tool_call_id: "tc-2",
+          resume_token: "rt-def",
+        }),
+      );
+      streamCalls[0]!.onMessage(resolved("rt-def", "skipped"));
+    });
+    const row = (id: string) =>
+      document.querySelector(`[data-activity-row-id="${id}"]`)!;
+    const precedes = (a: Node, b: Node) =>
+      Boolean(a.compareDocumentPosition(b) & Node.DOCUMENT_POSITION_FOLLOWING);
+    const liveConnected = await screen.findByText(
+      "Credential 'HN Login' added",
+    );
+    const liveSkipped = screen.getByText("Sign-in skipped");
+    expect(precedes(row("tc-1"), liveConnected)).toBe(true);
+    expect(precedes(liveConnected, row("tc-2"))).toBe(true);
+    expect(precedes(row("tc-2"), liveSkipped)).toBe(true);
+
+    await act(async () => {
+      streamCalls[0]!.onMessage({
+        type: "response",
+        workflow_copilot_chat_id: "chat-1",
+        message: "The test still stops at the sign-in page.",
+        updated_workflow: null,
+        response_time: "2026-07-13T00:00:06Z",
+        proposal_disposition: "no_proposal",
+        turn_id: "turn-1",
+        narrative_payload: {
+          turnId: "turn-1",
+          turnIndex: 0,
+          designStarted: true,
+          designEnded: true,
+          draft: { blockCount: 1, blockLabels: ["sign_in"] },
+          terminal: "response",
+          terminalMessage: "The test still stops at the sign-in page.",
+          narrativeSummary: "The test still stops at the sign-in page.",
+          startedAt: "2026-07-13T00:00:00Z",
+          endedAt: "2026-07-13T00:00:06Z",
+          designActivity: [
+            {
+              ...scoutResult(),
+              kind: "tool_result",
+              id: "tr-tc-1",
+              text: "Opened the sign-in page",
+              toolName: "navigate_browser",
+            },
+            {
+              kind: "tool_result",
+              id: "tr-tc-2",
+              text: "The test stopped on the sign-in page",
+              toolName: "run_blocks_and_collect_debug",
+              iteration: 1,
+              success: false,
+            },
+          ],
+          credentialPause: { outcome: "skipped", anchorToolCallId: "tc-2" },
+          credentialPauses: [
+            {
+              outcome: "connected",
+              credentialId: "cred-hn",
+              anchorToolCallId: "tc-1",
+            },
+            { outcome: "skipped", anchorToolCallId: "tc-2" },
+          ],
+        },
+      });
+      streamCalls[0]!.resolve();
+    });
+    await screen.findByText("The test still stops at the sign-in page.");
+    expect(screen.getAllByText("Credential 'HN Login' added")).toHaveLength(1);
+    expect(screen.getAllByText("Sign-in skipped")).toHaveLength(1);
+    fireEvent.click(
+      document.querySelector<HTMLButtonElement>("[data-activity-fold]")!,
+    );
+    const savedConnected = screen.getByText("Credential 'HN Login' added");
+    const savedSkipped = screen.getByText("Sign-in skipped");
+    expect(precedes(row("tc-1"), savedConnected)).toBe(true);
+    expect(precedes(savedConnected, row("tc-2"))).toBe(true);
+    expect(precedes(row("tc-2"), savedSkipped)).toBe(true);
+  });
+
+  it("keeps an earlier card's saved receipt when the turn's last card was never shown", async () => {
+    credentialsData.current = [
+      { credential_id: "cred-hn", name: "HN Login", tested_url: null },
+    ];
+    await streamScoutTurn();
+    await act(async () => {
+      streamCalls[0]!.onMessage({
+        type: "response",
+        workflow_copilot_chat_id: "chat-1",
+        message: "The second sign-in request could not be shown.",
+        updated_workflow: null,
+        response_time: "2026-07-13T00:00:06Z",
+        proposal_disposition: "no_proposal",
+        turn_id: "turn-1",
+        narrative_payload: {
+          turnId: "turn-1",
+          turnIndex: 0,
+          terminal: "response",
+          terminalMessage: "The second sign-in request could not be shown.",
+          startedAt: "2026-07-13T00:00:00Z",
+          endedAt: "2026-07-13T00:00:06Z",
+          designActivity: [
+            {
+              ...scoutResult(),
+              kind: "tool_result",
+              id: "tr-tc-1",
+              text: "Opened the sign-in page",
+              toolName: "navigate_browser",
+            },
+          ],
+          credentialPause: { outcome: "declined" },
+          credentialPauses: [
+            {
+              outcome: "connected",
+              credentialId: "cred-hn",
+              anchorToolCallId: "tc-1",
+            },
+            { outcome: "declined" },
+          ],
+        },
+      });
+      streamCalls[0]!.resolve();
+    });
+    await screen.findByText("The second sign-in request could not be shown.");
+    // A saved receipt carries no name; only a tab that saw the live answer can name it.
+    expect(screen.getAllByText("Credential added")).toHaveLength(1);
   });
 });
 
@@ -1278,7 +1453,7 @@ describe("WorkflowCopilotChat — credential card wiring", () => {
       if (pause === "credential") {
         await act(async () => fireEvent.click(screen.getByRole("combobox")));
         await act(async () =>
-          fireEvent.click(screen.getByRole("button", { name: "Test login" })),
+          fireEvent.click(screen.getByRole("button", { name: /^Test login/ })),
         );
         expect(credentialResponsePosts()).toHaveLength(1);
         historyResponse.data.pending_credential_requests = [];
@@ -1451,7 +1626,7 @@ describe("WorkflowCopilotChat — credential card wiring", () => {
     expect(resolveLookup).toBeDefined();
     await act(async () => fireEvent.click(screen.getByRole("combobox")));
     await act(async () =>
-      fireEvent.click(screen.getByRole("button", { name: "Test login" })),
+      fireEvent.click(screen.getByRole("button", { name: /^Test login/ })),
     );
     expect(credentialResponsePosts()).toHaveLength(1);
     historyResponse.data.pending_credential_requests = [];
@@ -1619,7 +1794,7 @@ describe("WorkflowCopilotChat — credential card wiring", () => {
     await submit("start a different turn");
     expect(postStreaming).not.toHaveBeenCalled();
     fireEvent.click(recoveredCredentialPicker);
-    fireEvent.click(await screen.findByRole("button", { name: "HN Login" }));
+    fireEvent.click(await screen.findByRole("button", { name: /^HN Login/ }));
     await waitFor(() => expect(credentialResponsePosts()).toHaveLength(1));
     expect(credentialResponsePosts()[0]![1]).toMatchObject({
       turn_id: "turn-1",
@@ -1766,7 +1941,7 @@ describe("WorkflowCopilotChat — credential card wiring", () => {
       });
       await act(async () => {
         fireEvent.click(
-          await screen.findByRole("button", { name: "HN Login" }),
+          await screen.findByRole("button", { name: /^HN Login/ }),
         );
       });
       await waitFor(() => expect(credentialResponsePosts()).toHaveLength(1));
@@ -2112,7 +2287,7 @@ describe("WorkflowCopilotChat — credential card wiring", () => {
     await act(async () => {
       fireEvent.click(await screen.findByRole("combobox"));
     });
-    const useButton = await screen.findByRole("button", { name: "HN Login" });
+    const useButton = await screen.findByRole("button", { name: /^HN Login/ });
     await act(async () => {
       fireEvent.click(useButton);
     });
@@ -2183,7 +2358,7 @@ describe("WorkflowCopilotChat — credential card wiring", () => {
       fireEvent.click(await screen.findByRole("combobox"));
     });
     await act(async () => {
-      fireEvent.click(await screen.findByRole("button", { name: "HN Login" }));
+      fireEvent.click(await screen.findByRole("button", { name: /^HN Login/ }));
     });
     await waitFor(() => expect(credentialResponsePosts()).toHaveLength(1));
     expect(await screen.findByText(/Credential 'HN Login' added/)).toBeTruthy();
@@ -2215,7 +2390,7 @@ describe("WorkflowCopilotChat — credential card wiring", () => {
       });
       await act(async () => {
         fireEvent.click(
-          await screen.findByRole("button", { name: "HN Login" }),
+          await screen.findByRole("button", { name: /^HN Login/ }),
         );
       });
       await waitFor(() => expect(credentialResponsePosts()).toHaveLength(1));
@@ -2279,6 +2454,38 @@ describe("WorkflowCopilotChat — credential card wiring", () => {
     expect(postStreaming).toHaveBeenCalledTimes(1);
   });
 
+  it("Escape closes the open login picker without stopping the turn", async () => {
+    realPopover.current = true;
+    credentialsData.current = [
+      { credential_id: "cred-hn", name: "HN Login", tested_url: null },
+    ];
+    await renderChat();
+    await submit("build me a workflow");
+    await waitFor(() => expect(postStreaming).toHaveBeenCalledTimes(1));
+    await act(async () => {
+      streamCalls[0]!.onMessage(turnStart());
+      streamCalls[0]!.onMessage(credentialFrame());
+    });
+    await act(async () => {
+      fireEvent.click(await screen.findByRole("combobox"));
+    });
+
+    await act(async () => {
+      fireEvent.keyDown(screen.getByPlaceholderText("Search credentials..."), {
+        key: "Escape",
+      });
+    });
+
+    await waitFor(() =>
+      expect(screen.queryByPlaceholderText("Search credentials...")).toBeNull(),
+    );
+    expect(sansApiPost).not.toHaveBeenCalledWith(
+      "/workflow/copilot/cancel",
+      expect.anything(),
+      expect.anything(),
+    );
+  });
+
   it("shows the full org credential list on a pause ask (not just the frame's candidates) and answers via the typed POST", async () => {
     credentialsData.current = [
       { credential_id: "cred-abc", name: "abc", tested_url: null },
@@ -2301,11 +2508,11 @@ describe("WorkflowCopilotChat — credential card wiring", () => {
     // including the credential NOT in credential_refs — stays below to override.
     expect(await screen.findByText("Suggested")).toBeTruthy();
     expect(screen.getByText("All credentials")).toBeTruthy();
-    expect(screen.getByRole("button", { name: "abc" })).toBeTruthy();
-    expect(screen.getByRole("button", { name: "spare-portal" })).toBeTruthy();
-    expect(screen.getByRole("button", { name: "unrelated" })).toBeTruthy();
+    expect(screen.getByRole("button", { name: /^abc/ })).toBeTruthy();
+    expect(screen.getByRole("button", { name: /^spare-portal/ })).toBeTruthy();
+    expect(screen.getByRole("button", { name: /^unrelated/ })).toBeTruthy();
     await act(async () => {
-      fireEvent.click(screen.getByRole("button", { name: "spare-portal" }));
+      fireEvent.click(screen.getByRole("button", { name: /^spare-portal/ }));
     });
     // The pick answers through the typed resume POST (which origin-binds), not a chat message.
     await waitFor(() => expect(credentialResponsePosts()).toHaveLength(1));
@@ -2339,13 +2546,13 @@ describe("WorkflowCopilotChat — credential card wiring", () => {
       fireEvent.click(await screen.findByRole("combobox"));
     });
     await act(async () => {
-      fireEvent.click(await screen.findByRole("button", { name: "first" }));
+      fireEvent.click(await screen.findByRole("button", { name: /^first/ }));
     });
     await act(async () => {
       fireEvent.click(await screen.findByRole("combobox"));
     });
     await act(async () => {
-      fireEvent.click(await screen.findByRole("button", { name: "second" }));
+      fireEvent.click(await screen.findByRole("button", { name: /^second/ }));
     });
     expect(credentialResponsePosts()).toHaveLength(1);
     expect(credentialResponsePosts()[0]![1]).toMatchObject({
@@ -2556,7 +2763,7 @@ describe("WorkflowCopilotChat — credential card wiring", () => {
       fireEvent.click(await screen.findByRole("combobox"));
     });
     await act(async () => {
-      fireEvent.click(await screen.findByRole("button", { name: "HN login" }));
+      fireEvent.click(await screen.findByRole("button", { name: /^HN login/ }));
     });
 
     // The fence blocked the continuation, so the card must not show a success-shaped receipt
@@ -2585,7 +2792,7 @@ describe("WorkflowCopilotChat — credential card wiring", () => {
       fireEvent.click(await screen.findByRole("combobox"));
     });
     await act(async () => {
-      fireEvent.click(await screen.findByRole("button", { name: "HN login" }));
+      fireEvent.click(await screen.findByRole("button", { name: /^HN login/ }));
     });
     await waitFor(() => expect(postStreaming).toHaveBeenCalledTimes(2));
     expect(await screen.findByText("Continuing with 'HN login'…")).toBeTruthy();
@@ -2605,7 +2812,7 @@ describe("WorkflowCopilotChat — credential card wiring", () => {
       fireEvent.click(await screen.findByRole("combobox"));
     });
     await act(async () => {
-      fireEvent.click(await screen.findByRole("button", { name: "HN login" }));
+      fireEvent.click(await screen.findByRole("button", { name: /^HN login/ }));
     });
     await waitFor(() => expect(postStreaming).toHaveBeenCalledTimes(3));
   });
@@ -2626,7 +2833,7 @@ describe("WorkflowCopilotChat — credential card wiring", () => {
       fireEvent.click(await screen.findByRole("combobox"));
     });
     await act(async () => {
-      fireEvent.click(await screen.findByRole("button", { name: "HN login" }));
+      fireEvent.click(await screen.findByRole("button", { name: /^HN login/ }));
     });
     await waitFor(() => expect(postStreaming).toHaveBeenCalledTimes(2));
     expect(await screen.findByText("Continuing with 'HN login'…")).toBeTruthy();
@@ -2768,7 +2975,7 @@ describe("WorkflowCopilotChat — credential card wiring", () => {
     });
     await act(async () => {
       fireEvent.click(
-        await screen.findByRole("button", { name: "Personal login" }),
+        await screen.findByRole("button", { name: /^Personal login/ }),
       );
     });
     // A fresh turn fires referencing the picked credential by id (the deterministic continue path),

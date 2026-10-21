@@ -10,6 +10,7 @@ import os
 import shutil
 import sys
 import threading
+import uuid
 from collections.abc import AsyncGenerator, AsyncIterator, Awaitable, Callable, Coroutine, Iterator
 from contextlib import AbstractAsyncContextManager, asynccontextmanager
 from dataclasses import dataclass, field
@@ -28,17 +29,27 @@ from opentelemetry.sdk.trace.export import SimpleSpanProcessor
 from opentelemetry.sdk.trace.export.in_memory_span_exporter import InMemorySpanExporter
 from playwright.async_api import Download
 from playwright.async_api import Error as PlaywrightError
-from sqlalchemy import create_engine, func, select
+from sqlalchemy import Engine, create_engine, func, select
+from sqlalchemy.engine import URL, make_url
 from sqlalchemy.ext.asyncio import AsyncEngine, create_async_engine
 
 import skyvern._cli_bootstrap as cli_bootstrap
+from skyvern.config import settings
 from skyvern.forge import app
 from skyvern.forge.agent_functions import AgentFunction
 from skyvern.forge.prompts import prompt_engine
 from skyvern.forge.sdk.api import files
-from skyvern.forge.sdk.copilot.context import CopilotContext
+from skyvern.forge.sdk.artifact.models import Artifact
+from skyvern.forge.sdk.artifact.storage.base import BaseStorage
+from skyvern.forge.sdk.copilot.context import (
+    CopilotContext,
+    model_written_context_fields,
+    tool_recorded_context_fields,
+)
 from skyvern.forge.sdk.db.agent_db import AgentDB
 from skyvern.forge.sdk.db.models import Base, CredentialModel, WorkflowModel
+from skyvern.forge.sdk.db.utils import _custom_json_serializer
+from skyvern.forge.sdk.executor.async_executor import AsyncExecutor
 from skyvern.forge.sdk.executor.factory import AsyncExecutorFactory
 from skyvern.forge.sdk.schemas.files import FileInfo
 from skyvern.forge.sdk.schemas.organizations import Organization
@@ -60,6 +71,38 @@ from tests.unit.litellm_model_registry import registered_gpt56_litellm_models
 
 # Four distinct ways to leave the legacy downloads root; each defeats a different weak check.
 LEGACY_DOWNLOAD_ESCAPE_CASES = ("parent_traversal", "encoded_dot_dot", "sibling_prefix", "symlink_escape")
+
+LOOPBACK_POSTGRES_HOSTS = frozenset({"localhost", "127.0.0.1", "::1"})
+# The schema fixture only adds and drops a schema, so it also accepts the compose service name.
+LOCAL_POSTGRES_HOSTS = LOOPBACK_POSTGRES_HOSTS | {"postgres"}
+# Any other query key (host, hostaddr, service, dbname, port, user, options, ...) can change which server or database
+# libpq reaches, so unknown keys are rejected instead of listing the bad ones.
+POSTGRES_NON_ROUTING_QUERY_KEYS = frozenset({"connect_timeout", "application_name", "sslmode"})
+# These env vars redirect a connection even when the URL names its host; PGPORT does so only when the URL has no port.
+POSTGRES_HOST_OVERRIDE_ENV_VARS = ("PGHOSTADDR", "PGSERVICE")
+
+
+def skip_unless_local_postgres(url: URL, hosts: frozenset[str] = LOCAL_POSTGRES_HOSTS) -> None:
+    if url.get_backend_name() != "postgresql" or url.host not in hosts:
+        pytest.skip(f"needs a PostgreSQL on one of: {', '.join(sorted(hosts))}")
+    overrides = sorted(set(url.query) - POSTGRES_NON_ROUTING_QUERY_KEYS)
+    overrides += [name for name in POSTGRES_HOST_OVERRIDE_ENV_VARS if os.environ.get(name)]
+    if url.port is None and os.environ.get("PGPORT"):
+        overrides.append("PGPORT")
+    if overrides:
+        pytest.skip(f"{', '.join(overrides)} could redirect the connection away from the intended local PostgreSQL")
+
+
+def fake_download_registration_app(
+    register: Callable[..., Awaitable[None]], rows: list[Artifact], storage: BaseStorage | None = None
+) -> SimpleNamespace:
+    return SimpleNamespace(
+        STORAGE=storage,
+        ARTIFACT_MANAGER=SimpleNamespace(create_download_artifact=register),
+        DATABASE=SimpleNamespace(
+            artifacts=SimpleNamespace(list_artifacts_for_run_by_type=AsyncMock(side_effect=lambda **kwargs: list(rows)))
+        ),
+    )
 
 
 class FakeWorkflowRunAttemptsRepository:
@@ -223,14 +266,18 @@ def restore_interpreter_traceback_hooks() -> Iterator[None]:
 def reset_cli_runtime_entry() -> Iterator[None]:
     """A CliRunner invocation marks the whole process as CLI-entered and loads a backend env file.
 
+    A CLI command also labels the process's API client as the CLI, which must not leak into a later MCP test.
+
     Both outlive the test, and the pair trips the CLI-only guard that refuses an API key
     against the default production URL in any later test that builds a cloud client. The env
     load also records SKYVERN_ENV_INTENT unconditionally, which config reads for env precedence.
     """
     entered = cli_bootstrap._CLI_RUNTIME_PREPARED
+    command_running = cli_bootstrap._CLI_COMMAND_RUNNING
     loaded = {name: os.environ.get(name) for name in ("SKYVERN_API_KEY", "SKYVERN_BASE_URL", "SKYVERN_ENV_INTENT")}
     yield
     cli_bootstrap._CLI_RUNTIME_PREPARED = entered
+    cli_bootstrap._CLI_COMMAND_RUNNING = command_running
     for name, value in loaded.items():
         if value is None:
             os.environ.pop(name, None)
@@ -255,6 +302,8 @@ _AGENT_TEMPLATE_DEFAULTS = dict(
     current_datetime="2026-01-01T00:00:00Z",
     tool_usage_guide="",
     security_rules="",
+    model_written_context_fields=model_written_context_fields(),
+    tool_recorded_context_fields=tool_recorded_context_fields(),
 )
 
 
@@ -379,7 +428,7 @@ async def sqlite_engine_factory(
     def _make() -> AsyncEngine:
         db_path = tmp_path / f"db_{next(counter)}.db"
         shutil.copyfile(sqlite_schema_template, db_path)
-        engine = create_async_engine(f"sqlite+aiosqlite:///{db_path}")
+        engine = create_async_engine(f"sqlite+aiosqlite:///{db_path}", json_serializer=_custom_json_serializer)
         engines.append(engine)
         return engine
 
@@ -392,6 +441,34 @@ async def sqlite_engine_factory(
 @pytest_asyncio.fixture
 async def sqlite_engine(sqlite_engine_factory: Callable[[], AsyncEngine]) -> AsyncEngine:
     return sqlite_engine_factory()
+
+
+@pytest.fixture
+def postgres_scratch_database() -> Iterator[Engine]:
+    url = make_url(str(settings.DATABASE_STRING))
+    # Loopback only: a generic name like postgres could resolve to a shared server, and this drops a database.
+    skip_unless_local_postgres(url, LOOPBACK_POSTGRES_HOSTS)
+    url = url.set(drivername="postgresql+psycopg")
+    # A database, not a schema: CREATE INDEX CONCURRENTLY waits for every older snapshot in its database, so a
+    # transaction another test leaves open in the shared one would stall the build until statement_timeout.
+    database = f"test_scratch_{uuid.uuid4().hex}"
+    admin = create_engine(url, isolation_level="AUTOCOMMIT")
+    try:
+        with admin.connect() as connection:
+            if not connection.exec_driver_sql(
+                "SELECT rolcreatedb OR rolsuper FROM pg_roles WHERE rolname = current_user"
+            ).scalar_one():
+                pytest.skip("needs a PostgreSQL role that can create databases")
+            connection.exec_driver_sql(f'CREATE DATABASE "{database}"')
+        engine = create_engine(url.set(database=database))
+        try:
+            yield engine
+        finally:
+            engine.dispose()
+            with admin.connect() as connection:
+                connection.exec_driver_sql(f'DROP DATABASE "{database}" WITH (FORCE)')
+    finally:
+        admin.dispose()
 
 
 def make_input_element_mock(*, element_id: str = "AADC", attrs: dict[str, object] | None = None) -> MagicMock:
@@ -942,6 +1019,45 @@ async def settle_or_fail(coro: Awaitable[_T], wait_seconds: float = 2.0) -> tupl
     return task, elapsed
 
 
+class DriverReplyProbe:
+    """A driver call that keeps its protocol reply the way playwright and patchright do.
+
+    The pending reply is abandoned from a done-callback on the task that issued the call, and only if
+    that task ends cancelled (``_impl/_connection.py::ProtocolCallback``). A caller that is cancelled
+    without its task ending therefore leaves the reply live, and the driver's late error lands on it
+    with nobody left to retrieve it."""
+
+    def __init__(self, error: BaseException, answers_after_seconds: float = 0.05) -> None:
+        self._error = error
+        self._answers_after_seconds = answers_after_seconds
+        self.called = asyncio.Event()
+        self.reply: asyncio.Future[Any] | None = None
+
+    async def __call__(self, *args: object, **kwargs: object) -> Any:
+        loop = asyncio.get_running_loop()
+        reply: asyncio.Future[Any] = loop.create_future()
+        self.reply = reply
+        self.called.set()
+        issuing_task = asyncio.current_task()
+        assert issuing_task is not None
+
+        def abandon_reply(task: asyncio.Task[Any]) -> None:
+            if task.cancelled():
+                reply.cancel()
+
+        issuing_task.add_done_callback(abandon_reply)
+        loop.call_later(self._answers_after_seconds, lambda: reply.done() or reply.set_exception(self._error))
+        # The driver abandons an unanswered reply on the line after this await, which cancellation skips.
+        await asyncio.wait({reply}, return_when=asyncio.FIRST_COMPLETED)
+        return reply.result()
+
+    async def orphaned_reply(self, wait_seconds: float = 2.0) -> bool:
+        """Whether the late reply carries an error nobody retrieved -- asyncio's never-retrieved line."""
+        assert self.reply is not None, "the driver was never called"
+        await asyncio.wait({self.reply}, timeout=wait_seconds)
+        return self.reply.done() and not self.reply.cancelled() and self.reply.exception() is not None
+
+
 def stalled_scrolling_capture(entered: asyncio.Event, timeout_ms: float) -> AsyncMock:
     """A ``take_fullpage_screenshot`` stand-in that drives the real ``take_scrolling_screenshot`` with a stalled
     stitched-capture helper, so a caller test exercises the primitive's own deadline."""
@@ -971,11 +1087,20 @@ RUN_GROUP_WPID = "wpid_test"
 
 
 @dataclass
-class FakeExecutor:
+class FakeExecutor(AsyncExecutor):
     database: AgentDB
     executed: list[str] = field(default_factory=list)
     submitted: list[str] = field(default_factory=list)
     before_queue: Callable[[str], Awaitable[None]] | None = None
+
+    async def execute_task(self, *_: object, **__: object) -> None:
+        raise NotImplementedError
+
+    async def execute_task_v2(self, *_: object, **__: object) -> None:
+        raise NotImplementedError
+
+    async def execute_script(self, *_: object, **__: object) -> None:
+        raise NotImplementedError
 
     async def execute_workflow(self, *, workflow_run_id: str, **_: object) -> None:
         self.executed.append(workflow_run_id)

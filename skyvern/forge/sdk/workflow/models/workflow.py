@@ -17,7 +17,12 @@ from pydantic import (
 )
 from typing_extensions import Self, deprecated
 
-from skyvern.forge.sdk.db.enums import BrowserSeedSource, WorkflowRunStatus, WorkflowRunTriggerType
+from skyvern.forge.sdk.db.enums import (
+    BrowserSeedSource,
+    WorkflowBuildSource,
+    WorkflowRunStatus,
+    WorkflowRunTriggerType,
+)
 from skyvern.forge.sdk.schemas.files import FileInfo
 from skyvern.forge.sdk.schemas.task_v2 import TaskV2
 from skyvern.forge.sdk.workflow.exceptions import (
@@ -276,6 +281,12 @@ class Workflow(BaseModel):
     import_error: str | None = None
     created_by: str | None = None
     edited_by: str | None = None
+    # Kept out of the API: a Copilot rollback writes it back, so a restored version answers to its original person.
+    edited_for: str | None = Field(default=None, exclude=True)
+    build_source: WorkflowBuildSource | None = Field(
+        default=None,
+        description="Which surface wrote this version: ui, copilot, mcp, cli, api, or internal. Null before tracking began.",
+    )
     # Lineage-derived (any version copilot-stamped); populated by the detail GET route only —
     # user saves re-stamp created_by/edited_by, so the current version alone is not durable.
     copilot_authored: bool = False
@@ -348,6 +359,7 @@ class WorkflowRun(BaseModel):
     reuse_bound_key: str | None = Field(default=None, exclude=True)
     # Internal routing: the worker queue the run was dispatched to. Never an API field.
     task_queue: str | None = Field(default=None, exclude=True)
+    setup_completed: bool = Field(default=True, exclude=True)
     # Digest of the definition the run was created against; the saved row can be overwritten in place later.
     workflow_definition_sha256: str | None = Field(default=None, exclude=True)
     debug_session_id: str | None = None
@@ -515,6 +527,11 @@ class WorkflowRunOutputParameter(BaseModel):
     output_parameter_id: str
     value: dict[str, Any] | list | str | None
     created_at: datetime
+    # The extracted information collected from the whole value at write time, itself capped.
+    # Only a capping read may use it, since that read holds the capped copy in `value` and can
+    # no longer walk every iteration; an uncapped reader has the whole value and must collect
+    # from it. None means nothing was recorded, so every reader collects from `value`.
+    precomputed_extracted_information: list[Any] | None = None
 
 
 class WorkflowRunResponseBase(BaseModel):

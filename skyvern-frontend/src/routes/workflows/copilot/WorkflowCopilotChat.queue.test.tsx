@@ -324,7 +324,7 @@ async function dropAttachments(...files: File[]) {
 
 function oversizeFile(filename: string) {
   const file = new File(["x"], filename);
-  Object.defineProperty(file, "size", { value: 11 * 1024 * 1024 });
+  Object.defineProperty(file, "size", { value: 30 * 1024 * 1024 + 1 });
   return file;
 }
 
@@ -544,7 +544,7 @@ describe("WorkflowCopilotChat — keep the chat live during a turn", () => {
     }
 
     await dropAttachments(
-      new File([new Uint8Array(10 * 1024 * 1024 + 1)], "oversized.csv"),
+      oversizeFile("oversized.csv"),
       new File(["row_id,url\n"], "accepted.csv"),
     );
 
@@ -559,6 +559,53 @@ describe("WorkflowCopilotChat — keep the chat live during a turn", () => {
     expect(vi.mocked(toast)).not.toHaveBeenCalledWith(
       expect.objectContaining({ title: "Too many files" }),
     );
+  });
+
+  it("opens a closed chat for a file staged from the canvas and leaves the draft unsent", async () => {
+    function ClosedChat() {
+      const [isOpen, setIsOpen] = useState(false);
+      return (
+        <WorkflowCopilotChat
+          isOpen={isOpen}
+          onRequestOpen={() => setIsOpen(true)}
+        />
+      );
+    }
+    render(<ClosedChat />);
+    await waitFor(() =>
+      expect(useCopilotActionStore.getState().stageAttachment).not.toBeNull(),
+    );
+    expect(screen.queryByRole("textbox")).toBeNull();
+    const draft = "Add the steps from the attached SOP after the login block.";
+
+    await act(async () => {
+      useCopilotActionStore.getState().stageAttachment!(
+        new File(["%PDF"], "procedure.pdf"),
+        draft,
+      );
+    });
+    await waitFor(() =>
+      expect(
+        screen.getByRole("button", { name: "Remove procedure.pdf" }),
+      ).toBeTruthy(),
+    );
+    expect(textarea().value).toBe(draft);
+    expect(document.activeElement).toBe(textarea());
+
+    fireEvent.change(textarea(), { target: { value: "Use the new SOP" } });
+    await act(async () => {
+      useCopilotActionStore.getState().stageAttachment!(
+        new File(["%PDF"], "appendix.pdf"),
+        draft,
+      );
+    });
+    await waitFor(() =>
+      expect(
+        screen.getByRole("button", { name: "Remove appendix.pdf" }),
+      ).toBeTruthy(),
+    );
+    expect(textarea().value).toBe("Use the new SOP");
+    expect(postStreaming).not.toHaveBeenCalled();
   });
 
   it("keeps the plus-button picker available for attachment uploads", async () => {
@@ -1077,7 +1124,7 @@ describe("WorkflowCopilotChat — keep the chat live during a turn", () => {
     await attachSpreadsheet("scan.png", big);
 
     expect(screen.getByText("scan.png")).toBeTruthy();
-    expect(screen.getByText("over 10MB")).toBeTruthy();
+    expect(screen.getByText("over 30MB")).toBeTruthy();
     expect(
       screen.getByRole("button", { name: "Remove scan.png" }),
     ).toBeTruthy();
@@ -1088,7 +1135,7 @@ describe("WorkflowCopilotChat — keep the chat live during a turn", () => {
 
     await submit("read the scan");
     await waitFor(() => expect(postStreaming).toHaveBeenCalledTimes(1));
-    expect(screen.queryByText("over 10MB")).toBeNull();
+    expect(screen.queryByText("over 30MB")).toBeNull();
   });
 
   it("drops a failed chip when its message is queued", async () => {
@@ -1103,7 +1150,7 @@ describe("WorkflowCopilotChat — keep the chat live during a turn", () => {
     expect(
       screen.getByRole("button", { name: "Edit queued message" }),
     ).toBeTruthy();
-    expect(screen.queryByText("over 10MB")).toBeNull();
+    expect(screen.queryByText("over 30MB")).toBeNull();
   });
 
   it("drops a failed chip when it adds to a queued message", async () => {
@@ -1118,7 +1165,7 @@ describe("WorkflowCopilotChat — keep the chat live during a turn", () => {
 
     expect(postStreaming).toHaveBeenCalledTimes(1);
     expect(queuedStrip().getByText(/read the scan instead/)).toBeTruthy();
-    expect(screen.queryByText("over 10MB")).toBeNull();
+    expect(screen.queryByText("over 30MB")).toBeNull();
   });
 
   it("says a file staged before a question will not go with the answer", async () => {

@@ -13,6 +13,7 @@ from playwright.async_api import Page
 from typing_extensions import TypedDict
 
 from skyvern.cli.core.js_dispatch import outer_cap_seconds
+from skyvern.cli.core.session_manager import ensure_browser_hooks, get_current_session
 from skyvern.forge import app
 from skyvern.forge.sdk.copilot.blocker_signal import CopilotToolBlockerSignal, stash_blocker_signal
 from skyvern.forge.sdk.copilot.composition_browser_expressions import (
@@ -47,21 +48,17 @@ from skyvern.forge.sdk.copilot.mcp_adapter import (
 )
 from skyvern.forge.sdk.copilot.nav_attribution import proxy_owns_nav_codes
 from skyvern.forge.sdk.copilot.runtime import (
-    SENSITIVE_ORIGIN_ACTIVE_RUN_PAGE_ERROR,
-    SENSITIVE_ORIGIN_PAGE_ERROR,
     AgentContext,
     BrowserProbeOutcome,
     CopilotBrowserGenerationRetired,
     CopilotBrowserSessionUnavailable,
     _browser_context_attachability,
     browser_evidence_commit_lock,
-    browser_page_custody_lock,
+    browser_session_turn,
     effective_browser_session_id,
     live_working_page,
     mcp_browser_context,
     resolve_browser_state_for_context,
-    sensitive_origin_page_has_active_run,
-    sensitive_origin_page_is_tainted,
 )
 from skyvern.forge.sdk.copilot.secret_redaction import redact_raw_secrets_for_prompt
 from skyvern.forge.sdk.copilot.task_output_envelope import (
@@ -286,22 +283,6 @@ def _has_meaningful_registered_output_payload(data: Mapping[str, Any]) -> bool:
         _is_meaningful_extracted_data(_registered_output_payload_view(item.get("value"), item.get("block_type")))
         for item in _registered_output_parameter_payloads(data)
     )
-
-
-EDIT_BLOCK_TOOL_NAME = "edit_block"
-EDIT_BLOCK_AND_RUN_TOOL_NAME = "edit_block_and_run"
-UPDATE_AND_RUN_BLOCKS_TOOL_NAME = "update_and_run_blocks"
-UPDATE_WORKFLOW_TOOL_NAME = "update_workflow"
-RUN_BLOCKS_TOOL_NAME = "run_blocks_and_collect_debug"
-BLANK_BROWSER_TEST_TOOL_NAME = "test_workflow_from_blank_browser"
-
-BLOCK_RUNNING_TOOLS = frozenset(
-    {RUN_BLOCKS_TOOL_NAME, UPDATE_AND_RUN_BLOCKS_TOOL_NAME, EDIT_BLOCK_AND_RUN_TOOL_NAME, BLANK_BROWSER_TEST_TOOL_NAME}
-)
-
-WORKFLOW_MUTATION_TOOLS = frozenset(
-    {UPDATE_WORKFLOW_TOOL_NAME, UPDATE_AND_RUN_BLOCKS_TOOL_NAME, EDIT_BLOCK_AND_RUN_TOOL_NAME}
-)
 
 
 CREDENTIAL_METADATA_TOOLS = frozenset({"list_credentials"})
@@ -1087,11 +1068,7 @@ async def on_working_page(
     no_page_error: str,
     act: Callable[[Page], Awaitable[dict[str, Any]]],
 ) -> dict[str, Any]:
-    async with browser_page_custody_lock(ctx), browser_evidence_commit_lock(ctx):
-        if sensitive_origin_page_has_active_run(ctx):
-            return {"ok": False, "error": SENSITIVE_ORIGIN_ACTIVE_RUN_PAGE_ERROR}
-        if sensitive_origin_page_is_tainted(ctx):
-            return {"ok": False, "error": SENSITIVE_ORIGIN_PAGE_ERROR}
+    async with browser_session_turn(ctx), browser_evidence_commit_lock(ctx):
         entered_browser = False
         try:
             async with mcp_browser_context(ctx):
@@ -1099,6 +1076,9 @@ async def on_working_page(
                 page = await live_working_page(ctx)
                 if page is None:
                     return {"ok": False, "error": no_page_error}
+                # An MCP call attaches this turn's inspection listeners in get_page, which a native action skips.
+                if (browser := get_current_session().browser) is not None:
+                    ensure_browser_hooks(browser)
                 return await act(page)
         except (CopilotBrowserGenerationRetired, CopilotBrowserSessionUnavailable) as exc:
             disposition = await _browser_session_error_disposition(ctx, exc, tool_name=tool_name, call_path="model")

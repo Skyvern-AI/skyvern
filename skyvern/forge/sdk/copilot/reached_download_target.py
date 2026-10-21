@@ -201,6 +201,13 @@ def generated_file_artifact_ids(outputs: Iterable[Any]) -> frozenset[str]:
     )
 
 
+def without_generated_file_stamp(output: Any) -> Any:
+    """``output`` without the worker-owned key, for a code block row whose output the secure worker did not write."""
+    if not isinstance(output, dict) or GENERATED_FILE_ARTIFACT_IDS_KEY not in output:
+        return output
+    return {key: value for key, value in output.items() if key != GENERATED_FILE_ARTIFACT_IDS_KEY}
+
+
 def registered_download_proof_view(output: Any, generated: frozenset[str]) -> Any:
     """``output`` with the rows of ``generated`` removed from its registration keys."""
     if not isinstance(output, dict) or not generated:
@@ -323,17 +330,36 @@ class DownloadClaimHelperContract:
     # The secure runner also accepts its locator facade, but the inline engine accepts strings.
     # This model-facing contract advertises only the shape executable by both engines.
     selector_types: tuple[str, ...] = ("selector_string",)
+    selector_scope: str = (
+        "Resolved as page.locator(selector) in the top-level page document. It does not enter iframes: any "
+        "selector that places the control under an iframe element, whether by a space or by >>, matches nothing "
+        "and the click times out."
+    )
     return_type: str = "string"
     return_value: str = "sanitized_suggested_filename"
+    expect_download_call: str = (
+        "async with page.expect_download() as download_info:\n"
+        "    await page.frame_locator(iframe_selector).locator(selector).click()\n"
+        "download = await download_info.value"
+    )
+    expect_download_registration: str = (
+        "A saved block can use page.expect_download, although run_browser_code cannot. It captures the download "
+        "its body fires on this page, whether from a control inside an iframe, several steps, or a script. Both "
+        "saved-block engines register that file; download.suggested_filename is its name."
+    )
 
     def to_tool_data(self) -> dict[str, Any]:
         return {
             "call": self.call,
             "parameters": {
                 "page": {"accepted_type": self.page_type},
-                "selector": {"accepted_types": list(self.selector_types)},
+                "selector": {"accepted_types": list(self.selector_types), "scope": self.selector_scope},
             },
             "returns": {"type": self.return_type, "value": self.return_value},
+            "expect_download": {
+                "call": self.expect_download_call,
+                "registration": self.expect_download_registration,
+            },
         }
 
 
@@ -382,11 +408,8 @@ def _dict_literal_keys(node: ast.expr) -> set[str]:
 def code_uses_download_claim(code: str) -> bool:
     """True when the code calls the worker-owned download claim, the registering terminal for a
     fired-download affordance on both engines."""
-    if not code.strip():
-        return False
-    try:
-        tree = ast.parse(textwrap.dedent(code).strip() or "pass")
-    except SyntaxError:
+    tree = _parse_code(code)
+    if tree is None:
         return False
     return any(_call_is_download_claim(node) for node in ast.walk(tree) if isinstance(node, (ast.Call, ast.Await)))
 
@@ -397,6 +420,29 @@ def _call_is_download_claim(node: ast.expr) -> bool:
     return isinstance(node, ast.Call) and isinstance(node.func, ast.Name) and node.func.id == DOWNLOAD_CLAIM_HELPER_NAME
 
 
+def _parse_code(code: str) -> ast.Module | None:
+    if not code.strip():
+        return None
+    try:
+        return ast.parse(textwrap.dedent(code).strip() or "pass")
+    except SyntaxError:
+        return None
+
+
+def _tree_captures_download(tree: ast.Module) -> bool:
+    return any(
+        _call_is_expect_download(item.context_expr) or _call_is_download_event_capture(item.context_expr)
+        for node in ast.walk(tree)
+        if isinstance(node, (ast.AsyncWith, ast.With))
+        for item in node.items
+    )
+
+
+def code_captures_download(code: str) -> bool:
+    tree = _parse_code(code)
+    return tree is not None and _tree_captures_download(tree)
+
+
 def code_is_download_intent(code: str) -> bool:
     """True when a code block authors a download: it uses the `page.expect_download` context-manager
     idiom, any event-based `"download"` capture (`wait_for_event`/`expect_event`/`on`/`once`/
@@ -405,17 +451,12 @@ def code_is_download_intent(code: str) -> bool:
     every download idiom counts, whether or not the runner accepts it — because
     its consumer is the unregistered-download telemetry in workflow/models/block.py, which measures
     authorship rather than validity."""
-    if not code.strip():
+    tree = _parse_code(code)
+    if tree is None:
         return False
-    try:
-        tree = ast.parse(textwrap.dedent(code).strip() or "pass")
-    except SyntaxError:
-        return False
+    if _tree_captures_download(tree):
+        return True
     for node in ast.walk(tree):
-        if isinstance(node, (ast.AsyncWith, ast.With)):
-            for item in node.items:
-                if _call_is_expect_download(item.context_expr) or _call_is_download_event_capture(item.context_expr):
-                    return True
         if isinstance(node, (ast.Call, ast.Await)) and (
             _call_is_download_event_capture(node) or _call_is_download_claim(node)
         ):

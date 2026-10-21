@@ -49,6 +49,7 @@ _EXISTING_BROWSER_ALIASES = (
     "console_messages",
     "select_option",
     "press_key",
+    "drag",
     "wait_for_either_state",
     "skyvern_frame_list",
     "skyvern_frame_switch",
@@ -276,11 +277,11 @@ async def test_the_advertised_tab_contract_is_closed_around_the_fields_it_offers
     tab_new = (await _advertised_schemas(ablation, registered))["skyvern_tab_new"]
 
     assert set(tab_new["properties"]) == {"url", BROWSER_TARGET_PARAM_NAME, "user_facing_reason"}
-    assert "user_facing_reason" not in tab_new.get("required", [])
+    assert tab_new["required"] == ["user_facing_reason"]
     assert tab_new["additionalProperties"] is False
     validator = Draft202012Validator(tab_new)
-    assert validator.is_valid({"url": "https://example.com"})
-    assert not validator.is_valid({"url": "https://example.com", "settle_seconds": 30})
+    assert validator.is_valid({"url": "https://example.com", "user_facing_reason": None})
+    assert not validator.is_valid({"url": "https://example.com", "user_facing_reason": None, "settle_seconds": 30})
 
 
 @pytest.mark.asyncio

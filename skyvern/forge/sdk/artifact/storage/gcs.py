@@ -1008,6 +1008,12 @@ class GcsStorage(BaseStorage):
         self.assert_managed_file_access(uri, organization_id)
         return await self.async_client.download_file(uri, log_exception=False)
 
+    async def managed_file_size(self, uri: str, organization_id: str) -> int | None:
+        self.assert_managed_file_access(uri, organization_id)
+        info = await self.async_client.get_object_info(uri)
+        size = info.get("ContentLength") if info else None
+        return size if isinstance(size, int) else None
+
     async def file_exists(self, uri: str) -> bool:
         """Check if a file exists at the given GCS URI."""
         try:

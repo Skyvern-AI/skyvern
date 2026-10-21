@@ -20,6 +20,7 @@ from skyvern.forge.sdk.schemas.microsoft_oauth import (
 from skyvern.forge.sdk.schemas.organizations import Organization
 from skyvern.forge.sdk.services import microsoft_oauth_service, org_auth_service
 from skyvern.forge.sdk.services.microsoft_oauth_service import InvalidAppOriginError
+from skyvern.forge.sdk.services.route_authorization import require_request_actions
 from skyvern.services.email import outlook
 from skyvern.utils.email_validation import normalize_email_address
 
@@ -112,6 +113,7 @@ async def microsoft_oauth_authorize(
     request: CreateMicrosoftOAuthAuthorizeRequest,
     current_org: Annotated[Organization, Depends(org_auth_service.get_current_org_for_credential_routes)],
     current_user_id: Annotated[str | None, Depends(org_auth_service.get_current_user_id_or_none)],
+    _request_authorization: None = Depends(require_request_actions(frozenset({"microsoft_oauth.authorize"}))),
 ) -> MicrosoftOAuthAuthorizeResponse:
     try:
         start = await microsoft_oauth_service.start_authorization(
@@ -141,6 +143,7 @@ async def microsoft_oauth_callback(
     request: CreateMicrosoftOAuthCallbackRequest,
     current_org: Annotated[Organization, Depends(org_auth_service.get_current_org_for_credential_routes)],
     current_user_id: Annotated[str | None, Depends(org_auth_service.get_current_user_id_or_none)],
+    _request_authorization: None = Depends(require_request_actions(frozenset({"microsoft_oauth.callback"}))),
 ) -> MicrosoftOAuthCredentialResponse:
     context = await microsoft_oauth_service.load_pending_consent_context(
         organization_id=current_org.organization_id,
@@ -207,6 +210,7 @@ async def microsoft_oauth_callback(
             credential_id=context.credential_id,
             exc_info=True,
         )
+    tenant_id, object_id = microsoft_oauth_service.identity_from_id_token(token_data.get("id_token"))
     try:
         credential = await microsoft_oauth_service.promote_pending_credential(
             organization_id=current_org.organization_id,
@@ -214,6 +218,8 @@ async def microsoft_oauth_callback(
             initiator_id=current_user_id,
             refresh_token=refresh_token,
             scopes_granted=scopes_granted,
+            tenant_id=tenant_id,
+            object_id=object_id,
         )
     except microsoft_oauth_service.InvalidConsentNonceError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
@@ -333,6 +339,7 @@ async def rename_microsoft_oauth_credential(
     credential_id: str,
     request: UpdateMicrosoftOAuthCredentialRequest,
     current_org: Annotated[Organization, Depends(org_auth_service.get_current_org_for_credential_routes)],
+    _request_authorization: None = Depends(require_request_actions(frozenset({"microsoft_oauth.update"}))),
 ) -> MicrosoftOAuthCredentialResponse:
     updated = await microsoft_oauth_service.rename_credential(
         organization_id=current_org.organization_id,
@@ -358,6 +365,7 @@ async def rename_microsoft_oauth_credential(
 async def delete_microsoft_oauth_credential(
     credential_id: str,
     current_org: Annotated[Organization, Depends(org_auth_service.get_current_org_for_credential_routes)],
+    _request_authorization: None = Depends(require_request_actions(frozenset({"microsoft_oauth.delete"}))),
 ) -> None:
     revoked = await microsoft_oauth_service.revoke_credential(
         organization_id=current_org.organization_id,

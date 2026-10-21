@@ -4,7 +4,7 @@ import { useRef, useState } from "react";
 import { useWorkflowPermanentId } from "@/routes/workflows/WorkflowPermanentIdContext";
 
 import { useProcessRecordingMutation } from "@/routes/browserSessions/hooks/useProcessRecordingMutation";
-import { useSopToBlocksMutation } from "@/routes/workflows/hooks/useSopToBlocksMutation";
+import { useCopilotActionStore } from "@/store/useCopilotActionStore";
 import { useDebugStore } from "@/store/useDebugStore";
 import {
   BranchContext,
@@ -13,15 +13,14 @@ import {
 import { useWorkflowSettingsStore } from "@/store/WorkflowSettingsStore";
 import { useRecordedBlocksStore } from "@/store/RecordedBlocksStore";
 import { useRecordingStore } from "@/store/useRecordingStore";
+import { useRecordingLauncherStore } from "@/store/useRecordingLauncherStore";
+import { useFeatureFlag } from "@/hooks/useFeatureFlag";
+import { WORKFLOW_COPILOT_DEMONSTRATION_FLAG } from "@/util/featureFlags";
 import {
   requestRecordingStart,
   useIsMountedRef,
 } from "@/routes/workflows/editor/recording/pendingRecordingStartGate";
-import {
-  runWorkflowAuthoringAction,
-  refuseMutationDuringYamlCommit,
-  refuseMutationDuringAuthoring,
-} from "@/store/WorkflowYamlEditorStore";
+import { runWorkflowAuthoringAction } from "@/store/WorkflowYamlEditorStore";
 import { useSettingsStore } from "@/store/SettingsStore";
 import { cn } from "@/util/utils";
 import {
@@ -38,6 +37,12 @@ import { WorkflowAdderBusy } from "../../WorkflowAdderBusy";
 import { SELECTED_RING_CLASSES } from "../../selection/selectedRingClasses";
 import { useWorkflowScopeReadOnly } from "../../WorkflowScopeContext";
 import { findBranchContextForInsertion } from "../../workflowInsertion";
+import {
+  blockLabelFor,
+  demonstrationInsertionFromNodes,
+  sopAttachmentDraft,
+  stageSopFile,
+} from "../../workspaceAuthoringActions";
 
 function NodeAdderNode({ id, parentId }: NodeProps<NodeAdderNode>) {
   const workflowPermanentId = useWorkflowPermanentId();
@@ -45,6 +50,14 @@ function NodeAdderNode({ id, parentId }: NodeProps<NodeAdderNode>) {
   const nodes = useNodes();
   const debugStore = useDebugStore();
   const recordingStore = useRecordingStore();
+  const startDemonstration = useRecordingLauncherStore(
+    (state) => state.startDemonstration,
+  );
+  const stageAttachment = useCopilotActionStore(
+    (state) => state.stageAttachment,
+  );
+  const demonstrationEnabled =
+    useFeatureFlag(WORKFLOW_COPILOT_DEMONSTRATION_FLAG) === true;
   const settingsStore = useSettingsStore();
   const workflowSettingsStore = useWorkflowSettingsStore();
   const setWorkflowPanelState = useWorkflowPanelStore(
@@ -111,24 +124,6 @@ function NodeAdderNode({ id, parentId }: NodeProps<NodeAdderNode>) {
     },
   });
 
-  const sopToBlocksMutation = useSopToBlocksMutation({
-    onSuccess: (result, owner) => {
-      setRecordedBlocks(
-        result,
-        {
-          previous: previous ?? null,
-          next: id,
-          parent: parentId,
-          connectingEdgeType: "default",
-        },
-        owner,
-      );
-    },
-  });
-
-  // Derive upload state directly from mutation to avoid race conditions
-  const isUploadingSOP = sopToBlocksMutation.isPending;
-
   const isProcessing =
     processRecordingMutation.isPending ||
     recordingStore.finishRequested ||
@@ -188,6 +183,21 @@ function NodeAdderNode({ id, parentId }: NodeProps<NodeAdderNode>) {
 
   const mountedRef = useIsMountedRef();
   const onRecord = () => {
+    if (demonstrationEnabled) {
+      const insertion = demonstrationInsertionFromNodes(nodes, {
+        previous: previous ?? null,
+        next: id,
+        parent: parentId,
+      });
+      if (!insertion) {
+        toast({
+          title: "Recording inside a loop or branch isn't supported yet",
+        });
+        return;
+      }
+      startDemonstration?.({ insertion });
+      return;
+    }
     if (recordingStore.isRecording) {
       recordingStore.setIsRecording(false);
     } else {
@@ -228,29 +238,26 @@ function NodeAdderNode({ id, parentId }: NodeProps<NodeAdderNode>) {
   };
 
   const onUploadSOP = () => {
-    if (refuseMutationDuringYamlCommit() || refuseMutationDuringAuthoring())
-      return;
     fileInputRef.current?.click();
   };
 
   const handleSOPFileChange = (e: React.ChangeEvent<HTMLInputElement>) => {
     const file = e.target.files?.[0];
+    e.target.value = "";
     if (!file) {
       return;
     }
-    if (!file.name.toLowerCase().endsWith(".pdf")) {
-      toast({
-        variant: "destructive",
-        title: "Invalid file type",
-        description: "Please select a PDF file",
-      });
-      e.target.value = "";
-      return;
-    }
-    void runWorkflowAuthoringAction(() =>
-      sopToBlocksMutation.mutateAsync(file),
+    stageSopFile(
+      file,
+      sopAttachmentDraft(
+        demonstrationInsertionFromNodes(nodes, {
+          previous: previous ?? null,
+          next: id,
+          parent: parentId,
+        }),
+        blockLabelFor(nodes, parentId),
+      ),
     );
-    e.target.value = "";
   };
 
   // Highlight the + CTA the same way withSelectableBlock highlights a selected
@@ -307,27 +314,13 @@ function NodeAdderNode({ id, parentId }: NodeProps<NodeAdderNode>) {
     </WorkflowAdderBusy>
   );
 
-  const handleCancelUpload = () => {
-    sopToBlocksMutation.cancel();
-  };
-
-  const sopUploadBusy = (
-    <WorkflowAdderBusy
-      color="#3b82f6"
-      operation="uploading"
-      onComplete={() => {}}
-      onCancel={handleCancelUpload}
-    >
-      {adder}
-    </WorkflowAdderBusy>
-  );
-
   const menu = (
     <WorkflowAddMenu
       onAdd={onAdd}
       onRecord={onRecord}
       onUploadSOP={onUploadSOP}
-      isUploadingSOP={isUploadingSOP}
+      canUploadSOP={stageAttachment !== null}
+      canRecordTask={!demonstrationEnabled || startDemonstration !== null}
       onPinnedChange={setMenuPinned}
     >
       {adder}
@@ -355,13 +348,7 @@ function NodeAdderNode({ id, parentId }: NodeProps<NodeAdderNode>) {
         id="b"
         className="opacity-0"
       />
-      {isUploadingSOP
-        ? sopUploadBusy
-        : isBusy
-          ? busy
-          : isDisabled
-            ? adder
-            : menu}
+      {isBusy ? busy : isDisabled ? adder : menu}
     </div>
   );
 }

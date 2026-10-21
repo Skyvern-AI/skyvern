@@ -77,6 +77,8 @@ CATALOG_WITHOUT_THIS_TOOL = [
     "start_fresh_browser",
     "extend_browser_session",
     "upload_attached_file",
+    "read_attached_pdf",
+    "reply",
 ]
 
 

@@ -50,6 +50,7 @@ _SENSITIVE_ENDPOINTS = {
     "POST /v1/google/oauth/callback",
     "POST /api/v1/google/oauth/callback",
     "POST /v1/recipes/jobs/apply",
+    "POST /v1/browser_sessions/external",
     # Copilot messages may contain credentials before the route's semantic
     # safety screen runs. The request audit keeps endpoint metadata while the
     # body stays opaque; the route persists only its canonical redacted form.
@@ -57,10 +58,12 @@ _SENSITIVE_ENDPOINTS = {
     "POST /v1/workflow/copilot/question-response",
     "POST /v1/workflow/copilot/steer",
     "POST /v1/workflow/copilot/credential-response",
+    "POST /v1/workflow/copilot/demonstration/control",
     "POST /v1/workflow/copilot/convert-yaml-to-blocks",
     # Payment-provider events carry customer billing details (name, email, address, card metadata).
     "POST /api/v1/stripe_webhook",
 }
+_SIGNED_TRIGGER_RECEIVER_ENDPOINT = re.compile(r"^POST /(?:api/)?v1/triggers/[^/]+/events$")
 _SENSITIVE_ENDPOINT_PATTERNS = (
     re.compile(r"^(?:POST|PUT) /(?:api/)?v1/credentials(?:/.*)?$"),
     # Twilio credentials and inbound SMS codes must stay opaque even with malformed bodies.
@@ -71,6 +74,10 @@ _SENSITIVE_ENDPOINT_PATTERNS = (
     re.compile(r"^POST /oauth/(?:token|consent|callback)$"),
     # Marketplace service routes return freshly minted client secrets.
     re.compile(r"^POST /(?:api/)?v1/marketplace(?:/.*)?$"),
+    # Signed trigger events contain arbitrary caller-provided payloads.
+    _SIGNED_TRIGGER_RECEIVER_ENDPOINT,
+    # Skyplane authority calls carry runtime capabilities, tool arguments, agent feedback text and delivered files.
+    re.compile(r"^[^ ]+ /api/v1/skyplane(?:/.*)?$"),
 )
 _MAX_BODY_LENGTH = 1000
 _READ_METHODS = frozenset({"GET", "HEAD", "OPTIONS"})
@@ -80,7 +87,7 @@ _ROUTINE_CLIENT_ERROR_STATUSES = frozenset({404, 405})
 _MAX_RESPONSE_READ_BYTES = 1024 * 1024  # 1 MB — skip logging bodies larger than this
 _BINARY_PLACEHOLDER = "<binary>"
 _LOGGABLE_CONTENT_TYPES = {"text/", "application/json"}
-_STREAMING_CONTENT_TYPE = "text/event-stream"
+_STREAMING_CONTENT_TYPES = ("text/event-stream", "application/x-ndjson")
 _ACTION_LOG_ENDPOINT_RE = re.compile(r"^/v1/browser_sessions/[^/]+/action_logs/?$")
 _raw_request_exception_logger: ContextVar[typing.Callable[[int], None] | None] = ContextVar(
     "raw_request_exception_logger", default=None
@@ -95,6 +102,7 @@ class _RequestIdentity:
     organization_id: str | None = None
     organization_name: str | None = None
     org_age: int | None = None
+    integration_platform: str | None = None
     principal: RequestPrincipal | None = None
     principal_resolution_key: tuple[str, bytes | None] | None = None
     principal_resolution_conflict: bool = False
@@ -150,7 +158,12 @@ def set_request_principal(
     identity = _request_identity.get()
     if identity is None:
         return
-    if identity.principal is None:
+    # The bound member key takes precedence over any bearer principal observed earlier in this request.
+    if principal.auth_kind == "member_api_key":
+        identity.principal = principal
+        identity.principal_resolution_key = resolution_key
+        identity.bearer_identity_status = bearer_identity_status
+    elif identity.principal is None:
         identity.principal = principal
         identity.principal_resolution_key = resolution_key
         identity.bearer_identity_status = bearer_identity_status
@@ -169,6 +182,8 @@ def _identity_log_fields() -> dict[str, str | int | bool | None]:
         fields["organization_name"] = identity.organization_name
     if identity.org_age is not None:
         fields["org_age"] = identity.org_age
+    if identity.integration_platform is not None:
+        fields["integration_platform"] = identity.integration_platform
     if identity.principal is not None:
         # Explicit nulls: "resolved, no user" must stay distinguishable from an unauthenticated request.
         fields["auth_kind"] = identity.principal.auth_kind.value
@@ -179,6 +194,22 @@ def _identity_log_fields() -> dict[str, str | int | bool | None]:
         fields["bearer_identity_status"] = identity.bearer_identity_status
         fields["principal_resolution_conflict"] = identity.principal_resolution_conflict
     return fields
+
+
+def integration_platform_from_user_agent(user_agent: str | None) -> str | None:
+    if not isinstance(user_agent, str) or not user_agent.strip():
+        return None
+
+    value = user_agent.casefold()
+    if "zapier" in value:
+        return "zapier"
+    if "n8n" in value:
+        return "n8n"
+    if value.startswith("make/") or re.search(r"\bmake\.com\b", value) or "integromat" in value:
+        return "make"
+    if "workato" in value:
+        return "workato"
+    return "other"
 
 
 def _sanitize_headers(headers: typing.Mapping[str, str]) -> dict[str, str]:
@@ -363,11 +394,13 @@ def log_raw_request_exception(status_code: int) -> None:
 
 
 async def log_raw_request_middleware(request: Request, call_next: Callable[[Request], Awaitable[Response]]) -> Response:
-    _request_identity.set(_RequestIdentity())
+    integration_platform = integration_platform_from_user_agent(request.headers.get("user-agent"))
+    _request_identity.set(_RequestIdentity(integration_platform=integration_platform))
     if not settings.LOG_RAW_API_REQUESTS:
         return await call_next(request)
 
     start_time = time.monotonic()
+    body_buffered = True
     try:
         if _is_fixture_endpoint(request):
             bounded = bytearray()
@@ -377,6 +410,10 @@ async def log_raw_request_middleware(request: Request, call_next: Callable[[Requ
                         return Response(status_code=413)
                     bounded.extend(chunk)
             body_bytes = bytes(bounded)
+        elif _SIGNED_TRIGGER_RECEIVER_ENDPOINT.fullmatch(f"{request.method.upper()} {request.url.path.rstrip('/')}"):
+            # The receiver's route-level size limit must see the unconsumed request stream.
+            body_bytes = b""
+            body_buffered = False
         else:
             body_bytes = await request.body()
     except TimeoutError:
@@ -389,10 +426,11 @@ async def log_raw_request_middleware(request: Request, call_next: Callable[[Requ
         LOG.info("api.client_disconnect", method=request.method, path=request.url.path)
         return Response(status_code=499)
     # ensure downstream handlers can access body again
-    try:
-        request._body = body_bytes  # type: ignore[attr-defined]
-    except Exception:
-        pass
+    if body_buffered:
+        try:
+            request._body = body_bytes  # type: ignore[attr-defined]
+        except Exception:
+            pass
 
     url_path = request.url.path
     http_method = request.method
@@ -413,7 +451,7 @@ async def log_raw_request_middleware(request: Request, call_next: Callable[[Requ
 
     response = await call_next(request)
     resp_content_type = response.headers.get("content-type", "")
-    is_streaming_response = _STREAMING_CONTENT_TYPE in resp_content_type
+    is_streaming_response = any(content_type in resp_content_type for content_type in _STREAMING_CONTENT_TYPES)
 
     # Skip successful reads before buffering the response body; 4xx/5xx and
     # mutating paths keep logging, and sensitive endpoints always keep

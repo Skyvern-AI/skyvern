@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import io
 import json
 import time
 from collections.abc import AsyncIterator, Callable
@@ -15,9 +16,12 @@ from unittest.mock import AsyncMock, MagicMock, call
 
 import pytest
 import yaml
+from PIL import Image
 from structlog.testing import capture_logs
 
+from skyvern.cli.core.browser_ops import ScreenshotResult
 from skyvern.config import settings
+from skyvern.forge import app
 from skyvern.forge.sdk.copilot import tools as tools_module
 from skyvern.forge.sdk.copilot.build_test_connect_failure import SUPERSEDED_BY_NEWER_TEST_REASON
 from skyvern.forge.sdk.copilot.code_block_synthesis import synthesize_code_block
@@ -27,16 +31,14 @@ from skyvern.forge.sdk.copilot.hooks import CopilotRunHooks
 from skyvern.forge.sdk.copilot.output_utils import MCP_RESULT_PROVENANCE_KEY, MCP_RESULT_PROVENANCE_VALUE
 from skyvern.forge.sdk.copilot.result_evidence import EVALUATE_TOOL_NAME
 from skyvern.forge.sdk.copilot.runtime import (
-    SENSITIVE_ORIGIN_PAGE_ERROR,
     AgentContext,
     OriginRunRedactionRegistry,
-    bound_call_browser_session,
-    register_sensitive_origin_run_lease,
 )
 from skyvern.forge.sdk.copilot.secret_scrub import (
     REDACTED_SECRET_PLACEHOLDER,
     clear_session_scrub_values,
     register_secret_scrub_value,
+    register_secret_scrub_values_from_structure,
 )
 from skyvern.forge.sdk.copilot.tools import (
     _capture_scout_pre_action,
@@ -60,17 +62,11 @@ from skyvern.forge.sdk.copilot.tools.scouting import (
     _summary_disclosure_control,
     _summary_entry,
 )
+from skyvern.forge.sdk.copilot.tools.workflow_update import proposal_workflow_fingerprint
 from skyvern.forge.sdk.copilot.turn_halt import CopilotTurnHalt, TurnHaltKind
 from skyvern.webeye.persistent_sessions_manager import BrowserOperation, BrowserRetirement
 from skyvern.webeye.utils import challenge_signature as challenge_signature_module
-from tests.unit.copilot_test_helpers import (
-    SENSITIVE_DISCLOSURE_WITHHOLDING_ARMS,
-    FakeTabbedBrowserState,
-    make_copilot_ctx,
-    patch_browser_tabs,
-    remove_sensitive_disclosure_prerequisite,
-    taint_by_terminal_run,
-)
+from tests.unit.copilot_test_helpers import make_copilot_ctx
 from tests.unit.scoped_asyncio import ScopedAsyncio
 
 READBACK_OUTCOME_CASES = yaml.safe_load((Path(__file__).parent / "credential_readback_outcome_cases.yaml").read_text())[
@@ -826,7 +822,9 @@ class TestMCPFailedStepLoopDetection:
             observed_session_ids.append(current.context.session_id if current.context else None)
             observed_localhost_access.append(current.context.can_access_localhost if current.context else None)
             assert current.api_key_hash == session_manager._api_key_hash("sk-copilot-org")
-            return SimpleNamespace(data=b"fake-png")
+            png = io.BytesIO()
+            Image.new("RGB", (1920, 947)).save(png, format="PNG")
+            return ScreenshotResult(data=png.getvalue(), viewport_css_px=(1920, 947))
 
         monkeypatch.setattr(browser_tools, "do_screenshot", fake_do_screenshot)
 
@@ -865,6 +863,7 @@ class TestMCPFailedStepLoopDetection:
         assert result.isError is False
         assert parsed["ok"] is True
         assert parsed["data"]["screenshot_base64"]
+        assert [entry.provenance.viewport_css_px for entry in ctx.pending_screenshots] == [(1920, 947)]
         assert observed_session_ids == ["pbs_copilot"]
         assert observed_localhost_access == [True]
         fallback_skyvern.connect_to_cloud_browser_session.assert_not_awaited()
@@ -900,6 +899,7 @@ class TestMCPToolOverlayCompleteness:
             "console_messages",
             "select_option",
             "press_key",
+            "drag",
             "wait_for_either_state",
             "skyvern_frame_list",
             "skyvern_frame_switch",
@@ -967,7 +967,6 @@ class TestMCPToolOverlayCompleteness:
         # Both states are required by the tool itself, so a single-selector call — the shape that
         # spends the whole ceiling on a wrong guess — is not expressible here at all.
         assert not overlay.hide_params & {"selector_a", "selector_b"}
-        assert overlay.pre_hook is mcp_hooks._sensitive_origin_page_action_pre_hook
 
     def test_intent_hidden_on_element_action_tools(self) -> None:
         """An `intent` runs a second LLM agent to pick the element, duplicating reasoning the
@@ -1001,30 +1000,14 @@ class TestNewToolOverlayConfigs:
         overlay = _build_skyvern_mcp_overlays()["console_messages"]
         assert overlay.hide_params == frozenset({"session_id", "cdp_url"})
         assert overlay.requires_browser is True
-        assert overlay.pre_hook is mcp_hooks._sensitive_origin_page_pre_hook
-        assert overlay.post_hook is mcp_hooks._sensitive_origin_page_post_hook
 
-    def test_frame_and_tab_control_overlays_refuse_sensitive_origin_pages(self) -> None:
+    def test_tab_control_overlays_wire_their_pre_hooks(self) -> None:
         from skyvern.forge.sdk.copilot.tools import _build_skyvern_mcp_overlays
 
         overlays = _build_skyvern_mcp_overlays()
 
-        for name in (
-            "skyvern_frame_list",
-            "skyvern_frame_switch",
-            "skyvern_frame_main",
-            "skyvern_tab_list",
-        ):
-            overlay = overlays[name]
-            assert overlay.pre_hook is mcp_hooks._sensitive_origin_page_pre_hook
-            assert overlay.post_hook is mcp_hooks._sensitive_origin_page_post_hook
         assert overlays["skyvern_tab_switch"].pre_hook is mcp_hooks._tab_switch_pre_hook
-        assert overlays["skyvern_tab_switch"].post_hook is mcp_hooks._sensitive_origin_page_post_hook
         assert overlays["skyvern_tab_new"].pre_hook is mcp_hooks._tab_new_pre_hook
-        assert overlays["skyvern_tab_new"].post_hook is mcp_hooks._sensitive_origin_page_post_hook
-        # Closing a tab returns no page fact and is how a withheld multi-tab browser gets back to one tab.
-        assert overlays["skyvern_tab_close"].pre_hook is mcp_hooks._tab_close_pre_hook
-        assert overlays["skyvern_tab_close"].post_hook is None
         assert "skyvern_tab_wait_for_new" not in overlays
 
     def test_select_option_overlay(self) -> None:
@@ -1054,7 +1037,7 @@ class TestNewToolOverlayConfigs:
         overlays = _build_skyvern_mcp_overlays()
         for name in ("click", "type_text"):
             desc = overlays[name].description or ""
-            assert "CSS selector" in desc, f"{name} should name the selector contract"
+            assert "selector" in desc, f"{name} should name the selector contract"
             assert "intent" not in desc, f"{name} description must not reference intent"
             assert "inspect the page again" in desc, f"{name} should steer to re-observation on failure"
             assert "intent" in overlays[name].hide_params
@@ -1272,7 +1255,6 @@ class TestBrowserInteractionObservationHooks:
             scouted_interactions=[],
             scout_trajectory=[],
             pending_scout_source_url=None,
-            pending_taint_sources={},
             last_run_blocks_workflow_run_id=None,
             browser_session_id=None,
             request_policy=None,
@@ -1329,7 +1311,6 @@ class TestBrowserInteractionObservationHooks:
             scouted_interactions=[],
             scout_trajectory=[],
             pending_scout_source_url=None,
-            pending_taint_sources={},
             last_run_blocks_workflow_run_id=None,
             browser_session_id=None,
             codeblock_redaction_parameters={},
@@ -1363,7 +1344,6 @@ class TestBrowserInteractionObservationHooks:
             scouted_interactions=[],
             scout_trajectory=[],
             pending_scout_source_url=None,
-            pending_taint_sources={},
             last_run_blocks_workflow_run_id=None,
             browser_session_id=None,
             codeblock_redaction_parameters={},
@@ -1448,7 +1428,6 @@ class TestScoutedInteractionCapture:
             completion_criteria_turn_state=None,
             observed_browser_urls=[],
             pending_scout_source_url=source_url,
-            pending_taint_sources={},
             prior_carried_trajectory=[],
             carried_trajectory_rebound_done=False,
             request_policy=None,
@@ -1728,166 +1707,6 @@ class TestScoutedInteractionCapture:
 
         capture.assert_awaited_once()
         assert "next_step" not in result
-
-    @pytest.mark.asyncio
-    async def test_sensitive_origin_page_refuses_screenshot_before_dispatch(self) -> None:
-        ctx = self._ctx()
-        ctx.browser_session_id = "pbs-debug"
-        ctx.sensitive_origin_browser_session_ids = {"pbs-run"}
-        ctx.codeblock_redaction_parameters = {}
-
-        assert await mcp_hooks._screenshot_pre_hook({}, ctx) is None
-        with bound_call_browser_session("pbs-run"):
-            result = await mcp_hooks._screenshot_pre_hook({}, ctx)
-
-        assert result is not None
-        assert result["ok"] is False
-        assert "specific named URL" in result["error"]
-
-    @pytest.mark.asyncio
-    async def test_sensitive_origin_page_refuses_evaluate_without_stashing_expression(self) -> None:
-        ctx = self._ctx()
-        ctx.browser_session_id = "pbs-debug"
-        ctx.sensitive_origin_browser_session_ids = {"pbs-run"}
-        ctx.pending_scout_read_expression = "stale"
-        ctx.pending_scout_read_output_path = "output.stale"
-
-        with bound_call_browser_session("pbs-run"):
-            result = await mcp_hooks._evaluate_pre_hook(
-                {"expression": "document.body.innerText", "output_path": "output.private"},
-                ctx,
-            )
-
-        assert result is not None
-        assert result["ok"] is False
-        assert ctx.pending_scout_read_expression is None
-        assert ctx.pending_scout_read_output_path is None
-
-    @pytest.mark.asyncio
-    async def test_sensitive_origin_page_suppresses_an_in_flight_evaluate_result(self) -> None:
-        ctx = self._ctx()
-        ctx.browser_session_id = "pbs-debug"
-        ctx.sensitive_origin_browser_session_ids = {"pbs-run"}
-        ctx.pending_scout_read_expression = "document.body.innerText"
-        ctx.pending_scout_read_output_path = "output.private"
-        ctx.scout_observation_contract = {"kind": "stale"}
-
-        with bound_call_browser_session("pbs-run"):
-            result = await mcp_hooks._evaluate_post_hook(
-                {
-                    "ok": True,
-                    "data": {
-                        "result": "private page contents",
-                        "url": "https://private.example.test/account",
-                    },
-                },
-                {},
-                ctx,
-            )
-
-        assert result["ok"] is False
-        assert "data" not in result
-        assert ctx.pending_scout_read_expression is None
-        assert ctx.pending_scout_read_output_path is None
-        assert ctx.scout_observation_contract is None
-
-    @pytest.mark.asyncio
-    async def test_sensitive_origin_successful_navigation_clears_taint_and_permits_inspection(
-        self, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
-        capture = AsyncMock(return_value=True)
-        monkeypatch.setattr(mcp_hooks, "_bind_login_credential_for_observed_url", AsyncMock())
-        monkeypatch.setattr(mcp_hooks, "_capture_post_interaction_screenshot", capture)
-        browser = FakeTabbedBrowserState("https://private.example.test/account")
-        patch_browser_tabs(monkeypatch, browser)
-        ctx = self._ctx(source_url="https://private.example.test/account")
-        ctx.browser_session_id = "pbs-debug"
-        ctx.sensitive_origin_browser_session_ids = {"pbs-debug", "pbs-run"}
-        ctx.codeblock_redaction_parameters = {}
-
-        with bound_call_browser_session("pbs-run"):
-            assert await mcp_hooks._navigate_pre_hook({"url": "https://safe.example.test/start"}, ctx) is None
-            browser.tabs[0].url = "https://safe.example.test/start"
-            result = await mcp_hooks._navigate_post_hook(
-                {"ok": True, "data": {"url": "https://safe.example.test/start"}},
-                {},
-                ctx,
-            )
-
-        assert result["ok"] is True
-        assert ctx.sensitive_origin_browser_session_ids == {"pbs-debug"}
-        assert "source_url" not in ctx.scout_trajectory[0]
-        capture.assert_awaited_once()
-        assert await mcp_hooks._screenshot_pre_hook({}, ctx) is not None
-        with bound_call_browser_session("pbs-run"):
-            assert await mcp_hooks._evaluate_pre_hook({"expression": "document.title"}, ctx) is None
-
-    @pytest.mark.asyncio
-    async def test_sensitive_origin_navigation_with_other_tabs_open_keeps_the_browser_withheld(
-        self, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
-        monkeypatch.setattr(mcp_hooks, "_bind_login_credential_for_observed_url", AsyncMock())
-        monkeypatch.setattr(mcp_hooks, "_capture_post_interaction_screenshot", AsyncMock(return_value=True))
-        browser = FakeTabbedBrowserState(
-            "https://private.example.test/help", "https://private.example.test/account", "about:blank", active=1
-        )
-        patch_browser_tabs(monkeypatch, browser)
-        ctx = self._ctx(source_url="https://private.example.test/account")
-        ctx.browser_session_id = "pbs-run"
-        ctx.sensitive_origin_browser_session_ids = {"pbs-run"}
-        ctx.codeblock_redaction_parameters = {}
-
-        with bound_call_browser_session("pbs-run"):
-            assert await mcp_hooks._navigate_pre_hook({"url": "https://safe.example.test/start"}, ctx) is None
-            browser.tabs[1].url = "https://safe.example.test/start"
-            result = await mcp_hooks._navigate_post_hook(
-                {"ok": True, "data": {"url": "https://safe.example.test/start"}},
-                {},
-                ctx,
-            )
-
-        assert result["ok"] is False
-        # The other tabs are named by the index skyvern_tab_close takes, never by url or title.
-        assert (
-            "3 tabs" in result["error"] and "skyvern_tab_close" in result["error"] and "(index 2, 0)" in result["error"]
-        )
-        assert "example.test" not in result["error"]
-        assert ctx.sensitive_origin_browser_session_ids == {"pbs-run"}
-        with bound_call_browser_session("pbs-run"):
-            assert await mcp_hooks._evaluate_pre_hook({"expression": "document.title"}, ctx) is not None
-
-        # The route the error names: close the other tabs, then navigate to the same URL again.
-        with bound_call_browser_session("pbs-run"):
-            assert await mcp_hooks._tab_close_pre_hook({}, ctx) is None
-        browser.close(browser.tabs[0])
-        browser.close(browser.tabs[2])
-        with bound_call_browser_session("pbs-run"):
-            assert await mcp_hooks._navigate_pre_hook({"url": "https://safe.example.test/start"}, ctx) is None
-            again = await mcp_hooks._navigate_post_hook(
-                {"ok": True, "data": {"url": "https://safe.example.test/start"}},
-                {},
-                ctx,
-            )
-
-        assert again["ok"] is True
-        assert ctx.sensitive_origin_browser_session_ids == set()
-        assert ctx.pending_taint_sources == {}
-
-    @pytest.mark.asyncio
-    async def test_tab_close_is_refused_only_while_a_sensitive_run_is_active(self) -> None:
-        ctx = self._ctx()
-        ctx.browser_session_id = "pbs-run"
-        ctx.sensitive_origin_browser_session_ids = {"pbs-run"}
-        ctx.active_sensitive_origin_browser_session_ids = set()
-        ctx.active_sensitive_origin_run_sessions = {}
-
-        assert await mcp_hooks._tab_close_pre_hook({}, ctx) is None
-
-        register_sensitive_origin_run_lease(ctx, workflow_run_id="wr-paused", session_id="pbs-run")
-
-        refused = await mcp_hooks._tab_close_pre_hook({}, ctx)
-        assert refused is not None and refused["ok"] is False
-        assert "run with sensitive inputs is active" in refused["error"]
 
     @pytest.mark.asyncio
     async def _click_with_attached_evidence(
@@ -2469,7 +2288,6 @@ class TestScoutedInteractionCapture:
         # Agent blocks only, so the challenge listener is the only one this click arms.
         ctx.authoring_capability = AGENT_BLOCKS_ONLY
         ctx.browser_session_id = "pbs-debug"
-        ctx.sensitive_origin_browser_session_ids = set()
         ctx.codeblock_redaction_parameters = {}
         monkeypatch.setattr(
             scouting_module,
@@ -2575,7 +2393,6 @@ class TestScoutedInteractionCapture:
         monkeypatch.setattr(scouting_module, "time", _ScopedClock(now=0.1))
         ctx = self._ctx(source_url="https://records.example.test/search")
         ctx.browser_session_id = "pbs-debug"
-        ctx.sensitive_origin_browser_session_ids = set()
         ctx.codeblock_redaction_parameters = {}
         sleeps: list[float] = []
 
@@ -2800,7 +2617,6 @@ class TestScoutedInteractionCapture:
     ) -> tuple[dict[str, Any], list[float]]:
         ctx = self._ctx(source_url="https://records.example.test/start")
         ctx.browser_session_id = "pbs-debug"
-        ctx.sensitive_origin_browser_session_ids = set()
         page.url = "https://records.example.test/search"
         monkeypatch.setattr(
             scouting_module,
@@ -2884,24 +2700,6 @@ class TestScoutedInteractionCapture:
         assert "qv-5521" not in json.dumps(result["page_state"])
 
     @pytest.mark.asyncio
-    async def test_a_sensitive_run_that_takes_the_page_mid_navigation_is_reported_unread_without_a_read(
-        self, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
-        page = _ListenerPage()
-        page.title = AsyncMock(side_effect=AssertionError("read the page an active run holds"))
-
-        result, _sleeps = await self._navigate(
-            monkeypatch,
-            page,
-            after_pre_hook=lambda ctx: register_sensitive_origin_run_lease(
-                ctx, workflow_run_id="wr-sensitive", session_id="pbs-debug"
-            ),
-        )
-
-        assert result["page_state"] == {"read": "failed", "challenge_vendor": None}
-        page.title.assert_not_awaited()
-
-    @pytest.mark.asyncio
     async def test_a_challenge_frame_the_listener_saw_mount_late_is_named_after_the_settle(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
@@ -2935,7 +2733,6 @@ class TestScoutedInteractionCapture:
         page = _ListenerPage()
         ctx = self._ctx(source_url="https://records.example.test/search")
         ctx.browser_session_id = "pbs-debug"
-        ctx.sensitive_origin_browser_session_ids = set()
         ctx.codeblock_redaction_parameters = {}
         monkeypatch.setattr(
             scouting_module,
@@ -3208,7 +3005,6 @@ class TestScoutedInteractionCapture:
         """A previous click's arm time must not make this click look armed, or already settled."""
         ctx = self._ctx(source_url="https://records.example.test/search")
         ctx.browser_session_id = "pbs-debug"
-        ctx.sensitive_origin_browser_session_ids = set()
         ctx.codeblock_redaction_parameters = {}
         ctx.pending_scout_challenge_armed_at = 123.0
         ctx.pending_scout_challenge_frames = [object()]
@@ -3274,7 +3070,6 @@ class TestScoutedInteractionCapture:
         # Agent blocks only, so the challenge listener is the only one this click arms.
         ctx.authoring_capability = AGENT_BLOCKS_ONLY
         ctx.browser_session_id = "pbs-debug"
-        ctx.sensitive_origin_browser_session_ids = set()
         ctx.codeblock_redaction_parameters = {}
         page = _ListenerPage()
         monkeypatch.setattr(
@@ -3292,12 +3087,9 @@ class TestScoutedInteractionCapture:
         *,
         frame_url: str,
         child_frame: bool,
-        sensitive_origin: bool = False,
         click_ok: bool = True,
     ) -> tuple[dict[str, Any], _ListenerPage, SimpleNamespace]:
         page, ctx = await self._armed_click(monkeypatch, frame_url=frame_url, child_frame=child_frame)
-        if sensitive_origin:
-            ctx.sensitive_origin_browser_session_ids = {"pbs-debug"}
         tool_result: dict[str, Any] = (
             {"ok": True, "data": {"selector": "#submit-search"}}
             if click_ok
@@ -3352,22 +3144,6 @@ class TestScoutedInteractionCapture:
         for collection in (ctx.scout_trajectory, ctx.scouted_interactions):
             assert "challenge_vendor" not in collection[-1]
         assert page.removed == ["framenavigated"]
-
-    @pytest.mark.asyncio
-    async def test_sensitive_origin_refusal_releases_the_challenge_listener(
-        self, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
-        result, page, ctx = await self._click_cycle_with_frame_navigation(
-            monkeypatch,
-            frame_url="https://challenge.vendor.test/turnstile/v0/api.html",
-            child_frame=True,
-            sensitive_origin=True,
-        )
-
-        assert result["ok"] is False
-        assert result["error"] == SENSITIVE_ORIGIN_PAGE_ERROR
-        assert page.removed == ["framenavigated"]
-        assert ctx.pending_scout_challenge_frames == []
 
     @pytest.mark.asyncio
     async def test_failed_click_releases_the_challenge_listener(self, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -3920,7 +3696,9 @@ class TestScoutPageSummary:
         def element(selector: str, **facts: Any) -> dict[str, Any]:
             return {
                 **facts,
-                "selector_candidates": [{"selector": selector, "source": "test_fixture", "match_count": 1}],
+                "selector_candidates": [
+                    {"selector": selector, "source": "test_fixture", "match_count": 2, "visible_match_count": 1}
+                ],
             }
 
         return {
@@ -4133,6 +3911,7 @@ def test_browser_overlays_are_covered_by_session_classification() -> None:
 async def test_lifecycle_hooks_count_model_calls_and_enforcement_passes() -> None:
     ctx = make_copilot_ctx()
     hooks = CopilotRunHooks(ctx)
+    ctx.open_step_run_ids.append("wr_saved_with_its_step")
 
     await hooks.on_agent_start(MagicMock(), MagicMock())
     await hooks.on_llm_start(MagicMock(), MagicMock(), None, [])
@@ -4140,6 +3919,8 @@ async def test_lifecycle_hooks_count_model_calls_and_enforcement_passes() -> Non
 
     assert ctx.enforcement_pass_count == 1
     assert ctx.model_calls_this_turn == 2
+    # The SDK saves a step before it starts the next model call, so that step's runs are in the session.
+    assert ctx.open_step_run_ids == []
 
 
 @pytest.mark.asyncio
@@ -4251,22 +4032,6 @@ async def test_a_superseded_run_still_drains_after_its_reason_is_overwritten(
     was_superseded.assert_awaited_once()
 
 
-ACTION_SEAM_PRE_HOOKS = [
-    "_click_pre_hook",
-    "_type_text_pre_hook",
-    "_select_option_pre_hook",
-    "_press_key_pre_hook",
-    "_scroll_pre_hook",
-    "_sensitive_origin_page_action_pre_hook",
-]
-ACTION_SEAM_POST_HOOKS = [
-    "_click_post_hook",
-    "_type_text_post_hook",
-    "_select_option_post_hook",
-    "_press_key_post_hook",
-    "_scroll_post_hook",
-    "_wait_for_either_state_post_hook",
-]
 CONTINUATION_RUN_OTP = "424242"
 CONTINUATION_RUN_PASSWORD = "Sp1r!t-Level-2026"
 
@@ -4276,13 +4041,13 @@ def _terminal_credential_run_ctx() -> AgentContext:
     clear_session_scrub_values("pbs_run")
     ctx.last_run_blocks_browser_session_id = "pbs_run"
     ctx.last_run_blocks_workflow_run_id = "wr_credential"
-    taint_by_terminal_run(ctx, workflow_run_id="wr_credential", session_id="pbs_run")
     ctx.origin_run_redaction_registry = OriginRunRedactionRegistry(
         workflow_run_id="wr_credential",
         parameters={"password": CONTINUATION_RUN_PASSWORD, "totp": CONTINUATION_RUN_OTP},
         contains_sensitive_values=True,
         contains_all_sensitive_values=True,
     )
+    register_secret_scrub_values_from_structure(ctx, ctx.origin_run_redaction_registry.parameters)
     return ctx
 
 
@@ -4363,60 +4128,51 @@ class TestSensitiveOriginActionContinuation:
         assert recorded["source_url"] == f"http://pathfold.test/app?code={REDACTED_SECRET_PLACEHOLDER}"
         assert CONTINUATION_RUN_OTP not in json.dumps(ctx.scout_trajectory)
 
-    @pytest.mark.asyncio
-    @pytest.mark.parametrize("arm", SENSITIVE_DISCLOSURE_WITHHOLDING_ARMS)
-    async def test_evaluate_post_hook_stays_withheld_when_a_disclosure_prerequisite_is_absent(self, arm: str) -> None:
-        ctx = _terminal_credential_run_ctx()
-        remove_sensitive_disclosure_prerequisite(ctx, arm)
-
-        result = await mcp_hooks._evaluate_post_hook(
-            {"ok": True, "data": {"result": f"code {CONTINUATION_RUN_OTP}", "url": "http://pathfold.test/app"}},
-            {},
+        scouting_module._record_scouted_interaction(
             ctx,
+            tool_name="drag",
+            selector="#card",
+            destination={"selector": f"#lane-{CONTINUATION_RUN_OTP}", "role": "list"},
         )
 
-        assert result == {"ok": False, "error": SENSITIVE_ORIGIN_PAGE_ERROR}
+        dragged = ctx.scouted_interactions[-1]
+        assert not set(dragged) & set(scouting_module._RETAINED_LOCATOR_IDENTITY_FIELDS)
+        assert CONTINUATION_RUN_OTP not in json.dumps(ctx.scout_trajectory)
 
-    @pytest.mark.asyncio
-    @pytest.mark.parametrize("arm", SENSITIVE_DISCLOSURE_WITHHOLDING_ARMS)
-    async def test_click_stays_withheld_when_a_disclosure_prerequisite_is_absent(self, arm: str) -> None:
-        ctx = _terminal_credential_run_ctx()
-        remove_sensitive_disclosure_prerequisite(ctx, arm)
 
-        refusal = await mcp_hooks._click_pre_hook({"selector": "a.nav--analytics"}, ctx)
+@pytest.mark.asyncio
+async def test_schedule_pre_hook_only_blocks_chat_history_visible_proposals(monkeypatch: pytest.MonkeyPatch) -> None:
+    canonical = SimpleNamespace(model_dump=lambda **_: {"title": "Saved workflow"})
+    current_fingerprint = proposal_workflow_fingerprint(canonical)
+    monkeypatch.setattr(mcp_hooks, "_schedule_parameters_credential_pre_hook", AsyncMock(return_value=None))
+    ctx = make_copilot_ctx(workflow_copilot_chat_id="chat-test")
 
-        assert refusal == {"ok": False, "error": SENSITIVE_ORIGIN_PAGE_ERROR}
-
-    @pytest.mark.asyncio
-    @pytest.mark.parametrize("arm", SENSITIVE_DISCLOSURE_WITHHOLDING_ARMS)
-    async def test_type_text_stays_withheld_when_a_disclosure_prerequisite_is_absent(self, arm: str) -> None:
-        ctx = _terminal_credential_run_ctx()
-        remove_sensitive_disclosure_prerequisite(ctx, arm)
-
-        refusal = await mcp_hooks._type_text_pre_hook({"selector": "#token", "text": "hello"}, ctx)
-
-        assert refusal == {"ok": False, "error": SENSITIVE_ORIGIN_PAGE_ERROR}
-
-    @pytest.mark.asyncio
-    @pytest.mark.parametrize("hook_name", ACTION_SEAM_PRE_HOOKS)
-    async def test_every_action_pre_hook_stays_withheld_without_a_matching_registry(self, hook_name: str) -> None:
-        ctx = _terminal_credential_run_ctx()
-        remove_sensitive_disclosure_prerequisite(ctx, "registry_missing")
-
-        refusal = await getattr(mcp_hooks, hook_name)({"selector": "#token", "text": "hello", "key": "Enter"}, ctx)
-
-        assert refusal == {"ok": False, "error": SENSITIVE_ORIGIN_PAGE_ERROR}
-
-    @pytest.mark.asyncio
-    @pytest.mark.parametrize("hook_name", ACTION_SEAM_POST_HOOKS)
-    async def test_every_action_post_hook_stays_withheld_without_a_matching_registry(self, hook_name: str) -> None:
-        ctx = _terminal_credential_run_ctx()
-        remove_sensitive_disclosure_prerequisite(ctx, "registry_missing")
-
-        refusal = await getattr(mcp_hooks, hook_name)(
-            {"ok": True, "data": {"selector": "#token", "text_content": CONTINUATION_RUN_OTP}},
-            {"browser_context": {"url": "http://pathfold.test/app"}},
-            ctx,
+    for fingerprint, disposition, expected_pending in (
+        ("", "accepting", False),
+        ("stale", "review_untested", False),
+        (None, None, True),
+        (current_fingerprint, "accepting", True),
+    ):
+        proposal: dict[str, Any] = {"_copilot_yaml": "title: Draft\n"}
+        if fingerprint is not None:
+            proposal["_copilot_proposal"] = {
+                "owner_turn_id": "turn-test",
+                "revision": 1,
+                "canonical_fingerprint": fingerprint,
+                "disposition": disposition,
+            }
+        chat = SimpleNamespace(proposed_workflow=proposal, workflow_permanent_id="wfp-test")
+        monkeypatch.setattr(
+            app.DATABASE.workflow_params,
+            "get_workflow_copilot_chat_by_id",
+            AsyncMock(return_value=chat),
+        )
+        monkeypatch.setattr(
+            app.DATABASE.workflows,
+            "get_workflow_by_permanent_id",
+            AsyncMock(return_value=canonical),
         )
 
-        assert refusal == {"ok": False, "error": SENSITIVE_ORIGIN_PAGE_ERROR}
+        result = await mcp_hooks._create_workflow_schedule_pre_hook({}, ctx)
+
+        assert (result is not None) is expected_pending

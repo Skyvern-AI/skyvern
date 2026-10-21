@@ -9,14 +9,15 @@ from fastapi import HTTPException, status
 from skyvern.config import settings
 from skyvern.exceptions import OrganizationNotFound, TaskNotFound, WorkflowRunNotFound
 from skyvern.forge import app
-from skyvern.forge.sdk.db.datetime_utils import naive_utc_now
+from skyvern.forge.sdk.db.datetime_utils import naive_utc_now, to_naive_utc
+from skyvern.forge.sdk.executor.factory import AsyncExecutorFactory
 from skyvern.forge.sdk.schemas.tasks import TaskStatus
-from skyvern.forge.sdk.workflow.models.workflow import WorkflowRunStatus
-from skyvern.forge.sdk.workflow.retry_policy import LEASE_TAKEOVER_SECONDS, RetryDecision, get_recorded_decision
-from skyvern.forge.sdk.workflow.service import (
+from skyvern.forge.sdk.workflow.models.workflow import WorkflowRun, WorkflowRunStatus
+from skyvern.forge.sdk.workflow.response_value_caps import (
     truncate_oversized_response_text,
     truncate_oversized_response_value,
 )
+from skyvern.forge.sdk.workflow.retry_policy import LEASE_TAKEOVER_SECONDS, RetryDecision, get_recorded_decision
 from skyvern.schemas.runs import (
     BulkCancelRunsResponse,
     RunEngine,
@@ -35,6 +36,9 @@ from skyvern.services import (
 )
 
 LOG = structlog.get_logger()
+
+# A cancel of a run live longer than this sends its final webhook at once rather than leaving it to the run's finalizer.
+CANCEL_SENDS_FINAL_WEBHOOK_AFTER_RUNNING = timedelta(hours=4)
 
 T = TypeVar("T")
 Ts = TypeVarTuple("Ts")
@@ -183,6 +187,24 @@ async def cancel_task_v2(task_id: str, organization_id: str | None = None) -> No
         await uploaded_file_service.delete_files_attached_to_run(run_id=task_v2.workflow_run_id)
 
 
+async def _live_execution_sends_final_webhook(before_cancel: WorkflowRun, after_cancel: WorkflowRun) -> bool:
+    # A retried cancel reads the row its first request already canceled, while the run it stopped may still be live.
+    retried_cancel_of_started_run = (
+        before_cancel.status == WorkflowRunStatus.canceled and before_cancel.started_at is not None
+    )
+    if (
+        before_cancel.status not in (WorkflowRunStatus.running, WorkflowRunStatus.paused)
+        and not retried_cancel_of_started_run
+    ):
+        return False
+    if after_cancel.status != WorkflowRunStatus.canceled:
+        return False
+    live_since = to_naive_utc(before_cancel.started_at or before_cancel.created_at)
+    if live_since is None or naive_utc_now() - live_since > CANCEL_SENDS_FINAL_WEBHOOK_AFTER_RUNNING:
+        return False
+    return await AsyncExecutorFactory.get_executor().sends_final_webhook_after_cancel(before_cancel)
+
+
 async def cancel_workflow_run(
     workflow_run_id: str, organization_id: str | None = None, api_key: str | None = None
 ) -> None:
@@ -192,6 +214,7 @@ async def cancel_workflow_run(
     )
     if not workflow_run:
         raise WorkflowRunNotFound(workflow_run_id=workflow_run_id)
+    before_cancel = workflow_run
 
     # get all the child workflow runs and cancel them
     child_workflow_runs = await app.DATABASE.workflow_runs.get_workflow_runs_by_parent_workflow_run_id(
@@ -250,7 +273,15 @@ async def cancel_workflow_run(
             )
     else:
         await uploaded_file_service.delete_files_attached_to_run(run_id=workflow_run_id)
-        await app.WORKFLOW_SERVICE.execute_workflow_webhook(workflow_run, api_key=api_key)
+        # The execution's own webhook after teardown carries the run's downloaded files and recording.
+        if await _live_execution_sends_final_webhook(before_cancel, workflow_run):
+            LOG.info(
+                "Leaving the canceled run's final webhook to its execution",
+                workflow_run_id=workflow_run_id,
+                status_before_cancel=before_cancel.status,
+            )
+            return
+        await app.WORKFLOW_SERVICE.execute_workflow_webhook(workflow_run, api_key=api_key, finalizer="api_cancel")
 
 
 async def cancel_run(run_id: str, organization_id: str | None = None, api_key: str | None = None) -> None:

@@ -43,6 +43,7 @@ describe("terminalNarrativeText — budget expiry", () => {
         reportProduced: true,
         stagedDraftId: "wf_draft",
         drainFingerprint: "drain-1",
+        leftRunIds: [],
       },
     };
     expect(terminalNarrativeText(turn)).toBe("I saved the useful draft.");
@@ -78,6 +79,7 @@ describe("terminalNarrativeText — budget expiry", () => {
           reportProduced: false,
           stagedDraftId,
           drainFingerprint: "drain-2",
+          leftRunIds: [],
         },
       };
       expect(terminalNarrativeText(turn)).toBe(expected);

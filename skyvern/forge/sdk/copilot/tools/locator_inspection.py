@@ -12,11 +12,13 @@ visible. It reports; it does not rank, score, generate a selector, or name a can
 from __future__ import annotations
 
 import asyncio
+import contextlib
 from typing import Any
 
 from playwright.async_api import Error as PlaywrightError
-from playwright.async_api import Page
+from playwright.async_api import Locator, Page
 
+from skyvern.forge.sdk.copilot.browser_target import BrowserTarget
 from skyvern.webeye.utils.page import OTP_INPUT_PRIVACY_JS
 
 TOOL_NAME = "inspect_locator_matches"
@@ -29,9 +31,10 @@ OUTER_HTML_CHARS = 1200
 
 TOOL_DESCRIPTION = (
     "Inspect Playwright locators being considered for a repair. Pass the failed authored locator "
-    "and concrete alternatives before editing. Returns match counts and bounded DOM facts for each "
-    "match, including descendants, so container elements can be distinguished from controls or "
-    "value-bearing nodes. It reports facts only and does not rank or choose a locator."
+    "and concrete alternatives before editing. Returns match counts and, for each match, whether "
+    "Playwright considers it visible and bounded DOM facts including descendants, so container "
+    "elements can be distinguished from controls or value-bearing nodes. It reports facts only and "
+    "does not rank or choose a locator."
 )
 
 TOOL_SCHEMA: dict[str, Any] = {
@@ -39,7 +42,7 @@ TOOL_SCHEMA: dict[str, Any] = {
     "properties": {
         "target": {
             "type": "string",
-            "enum": ["debug", "last_run"],
+            "enum": [target.value for target in BrowserTarget],
             "description": "Which browser to inspect in.",
         },
         "selectors": {
@@ -86,6 +89,21 @@ _MATCH_FACTS = (
 SELECTOR_BUDGET_SECONDS = 8.0
 
 
+async def _match_facts(match: Locator, expression: str, index: int) -> dict[str, Any]:
+    # One handle for both reads: a Locator finds its element again on each call, so after a navigation its
+    # evaluate would read the new page beside an is_visible() that Playwright 1.46 answers False for the old one.
+    handle = await match.element_handle()
+    try:
+        visible = await handle.is_visible()
+        facts = await handle.evaluate(expression)
+    finally:
+        with contextlib.suppress(PlaywrightError):
+            await handle.dispose()
+    facts["index"] = index
+    facts["visible"] = visible
+    return facts
+
+
 async def inspect_locator_matches(page: Page, selectors: list[str]) -> dict[str, Any]:
     """Bounded facts for each selector's matches on this page. Read-only: it never navigates."""
     expression = _MATCH_FACTS % {
@@ -111,11 +129,12 @@ async def inspect_locator_matches(page: Page, selectors: list[str]) -> dict[str,
         matches: list[dict[str, Any]] = []
         for index in range(min(count, MAX_MATCHES)):
             try:
-                facts = await asyncio.wait_for(locator.nth(index).evaluate(expression), timeout=SELECTOR_BUDGET_SECONDS)
+                facts = await asyncio.wait_for(
+                    _match_facts(locator.nth(index), expression, index), SELECTOR_BUDGET_SECONDS
+                )
             except (PlaywrightError, TimeoutError) as exc:
                 matches.append({"index": index, "error": f"{type(exc).__name__}: {exc}"})
                 continue
-            facts["index"] = index
             matches.append(facts)
         entry["matches"] = matches
         results.append(entry)

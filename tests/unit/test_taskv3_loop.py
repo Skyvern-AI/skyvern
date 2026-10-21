@@ -11,6 +11,7 @@ from __future__ import annotations
 import asyncio
 import copy
 import dataclasses
+import functools
 import hashlib
 import json
 import random
@@ -18,24 +19,24 @@ import re
 import subprocess
 import sys
 import time
-from datetime import UTC, datetime
 from types import SimpleNamespace
 from typing import Any, Awaitable, Callable, Collection
 
 import pytest
 from structlog.testing import capture_logs
 
-from skyvern.exceptions import SkyvernContextWindowExceededError
-from skyvern.forge.sdk.api.llm.exceptions import LLMProviderErrorRetryableTask
+from skyvern.exceptions import CompletionGateTerminationError, SkyvernContextWindowExceededError, StepTerminationError
+from skyvern.forge.sdk.api.llm.exceptions import LLMContentFilteredError, LLMProviderErrorRetryableTask
 from skyvern.forge.sdk.core import skyvern_context
 from skyvern.forge.sdk.core.skyvern_context import SkyvernContext
 from skyvern.forge.taskv3 import loop as loop_module
 from skyvern.forge.taskv3 import tools as taskv3_tools_module
-from skyvern.forge.taskv3.auth_tools import _COMPLETION_BLOCKED, VerificationFailure, VerificationState
+from skyvern.forge.taskv3.auth_tools import VerificationFailure, VerificationState
 from skyvern.forge.taskv3.engine import MAX_TOKENS_CEILING, MAX_TOKENS_PER_ACTION_STEP, taskv3_runaway_backstops
 from skyvern.forge.taskv3.goal_check import GoalVerdict, ToolTrail, run_goal_check
 from skyvern.forge.taskv3.handoff_redaction import ELIDED_URL_PATH, caller_known_published_urls
 from skyvern.forge.taskv3.loop import (
+    ACTION_BLOCK_TARGET_ACTION_RESERVE,
     ACTION_BUDGET_EXTENDED_EVENT,
     ACTION_BUDGET_EXTENSION_MAX_FACTOR,
     ACTION_BUDGET_EXTENSION_REFUSED_EVENT,
@@ -43,7 +44,11 @@ from skyvern.forge.taskv3.loop import (
     ACTION_LOOP_NUDGE_AFTER,
     ACTION_LOOP_TERMINATE_AFTER,
     ACTION_OUTCOME_DATA_KEY,
+    CLICK_DISPATCHED_DATA_KEY,
     CODE_TOOL_NAME,
+    COMPLETION_GATE_REFUSAL,
+    DOWNLOAD_FAILURE_MAX_LINES,
+    DOWNLOAD_NO_FILE_FACT,
     FAILURE_EVIDENCE_MIN_TOOL_CALLS,
     FAILURE_EVIDENCE_MIN_TURNS,
     FINAL_TURN_GRANTED_EVENT,
@@ -65,11 +70,14 @@ from skyvern.forge.taskv3.loop import (
     PERCEPTION_STALL_TERMINATE_AFTER,
     PROGRESS_LEDGER_SHADOW_EVENT,
     PROGRESS_LEDGER_WINDOW,
+    STALE_READ_MAX_HOLDS,
+    TARGET_ACTION_ROUND_EVENT,
     TOKEN_BUDGET_EXTENDED_EVENT,
     TOKEN_BUDGET_EXTENSION_REFUSED_EVENT,
     UNCHARGED_REFUSAL_GRACE,
     VERDICT_URL_MAX_CHARS,
     ActivityRecency,
+    DownloadFailureFacts,
     LoopOutcome,
     RoundAction,
     SemanticCommitStats,
@@ -78,6 +86,7 @@ from skyvern.forge.taskv3.loop import (
     ToolRefusal,
     ToolResult,
     ToolSpec,
+    UnseenPageText,
     _arms_failure_evidence,
     _budget_extension_gate,
     _canonical_perception_content,
@@ -90,6 +99,7 @@ from skyvern.forge.taskv3.loop import (
     _RevisitMemory,
     current_tool_call_seq,
     make_finish_tool,
+    record_click_dispatched,
     record_covered_layer,
     record_hit_class,
     record_resolve_seconds,
@@ -98,7 +108,6 @@ from skyvern.forge.taskv3.loop import (
 from skyvern.forge.taskv3.opaque_refs import mask_opaque_urls
 from skyvern.forge.taskv3.tools import build_browser_tools
 from skyvern.utils.url_validators import validate_fetch_url
-from tests.unit.helpers import make_organization, make_task
 
 
 class _ScriptedCaller:
@@ -635,6 +644,74 @@ async def test_initial_navigation_dead_end_yields_canceled_when_cancelling() -> 
     assert caller.calls == 0
 
 
+_PORTAL = "https://jobs.example.test/portal.action"
+
+
+@pytest.mark.parametrize(
+    ("targets", "requested", "landed", "revisit", "expected"),
+    [
+        ({_PORTAL + "?page=apply&id=42"}, _PORTAL + "?page=apply&id=42", None, False, (True, False)),
+        # A redirect: the task named the URL asked for, not the one the 404 came back on.
+        ({_PORTAL + "?page=apply&id=42"}, _PORTAL + "?page=apply&id=42", _PORTAL + "?gone=1", False, (True, False)),
+        (set(), _PORTAL, None, True, (False, True)),
+        # Both hold: the logged provenance prefers the task's own URL, the flags stay independent.
+        ({_PORTAL}, _PORTAL, None, True, (True, True)),
+        # Same page, different query: on query-routed sites that is a different page, not the task's.
+        ({_PORTAL + "?page=intro&id=42"}, _PORTAL + "?page=apply&id=42", None, False, (False, False)),
+    ],
+)
+@pytest.mark.asyncio
+async def test_navigate_dead_end_logs_its_provenance_without_a_url(
+    targets: set[str], requested: str, landed: str | None, revisit: bool, expected: tuple[bool, bool]
+) -> None:
+    async def handler(args: dict[str, Any]) -> ToolResult:
+        data = {
+            "page_state_changed": True,
+            "navigation_dead_end": 404,
+            "navigation_dead_end_url": landed or args["url"],
+        }
+        return ToolResult.ok("navigated", data={**data, "nav_revisit": True} if revisit else data)
+
+    tools = [ToolSpec(name="navigate", description="n", parameters={}, handler=handler), make_finish_tool()]
+    script = [[("navigate", {"url": requested})], [("finish", {"status": "completed", "reason": "never"})]]
+    with capture_logs() as logs:
+        outcome, _ = await _run(script, tools, task_target_urls=caller_known_published_urls(*targets, keep_query=True))
+
+    assert (outcome.status, outcome.guard) == ("terminated", NAV_DEAD_END_GUARD)
+    (line,) = (entry for entry in logs if entry["event"] == "taskv3 loop navigation dead end")
+    assert (line["task_supplied"], line["previously_visited"]) == expected
+    assert line["provenance"] == (
+        "task_supplied" if expected[0] else "previously_visited" if expected[1] else "undecided"
+    )
+    assert not any("http" in str(value) for value in line.values())
+
+
+@pytest.mark.parametrize(
+    ("requested", "landed"),
+    [
+        ("http://jobs.example.test/acme/42", "https://jobs.example.test/acme/42"),
+        ("https://jobs.example.test/acme/42", "https://jobs.example.test/acme/expired"),
+    ],
+)
+@pytest.mark.asyncio
+async def test_initial_navigation_dead_end_after_a_redirect_is_logged_task_supplied(
+    requested: str, landed: str
+) -> None:
+    with capture_logs() as logs:
+        outcome, _ = await _run(
+            [[("finish", {"status": "completed", "reason": "never"})]],
+            [make_finish_tool()],
+            initial_navigation_status=404,
+            initial_navigation_url=landed,
+            initial_navigation_requested_url=requested,
+            task_target_urls=caller_known_published_urls(requested, keep_query=True),
+        )
+
+    assert (outcome.status, outcome.guard) == ("terminated", NAV_DEAD_END_GUARD)
+    (line,) = (entry for entry in logs if entry["event"] == "taskv3 loop initial navigation dead end")
+    assert (line["task_supplied"], line["previously_visited"], line["provenance"]) == (True, False, "task_supplied")
+
+
 @pytest.mark.asyncio
 async def test_verification_blocker_refuses_completed_but_not_failed() -> None:
     async def _blocked(status: str) -> str | None:
@@ -1055,21 +1132,96 @@ async def test_single_action_block_completes_when_its_step_cap_refuses_a_follow_
         assert outcome.status == "budget_exhausted"
 
 
+class _EffectPage:
+    """The tick-masked fingerprint the loop samples around a single-action block's call; a tool bumps it to act."""
+
+    def __init__(self) -> None:
+        self.state = 0
+
+    async def fingerprint(self) -> str:
+        return f"fp-{self.state}"
+
+
+def _acting_tool(
+    name: str,
+    page: _EffectPage,
+    *,
+    acts: Callable[[int], bool],
+    fails: bool = False,
+    data: dict[str, Any] | None = None,
+) -> ToolSpec:
+    # Production-shaped: an in-page click reports no page-change flag; only the page itself shows what it did.
+    calls: list[int] = []
+
+    async def handler(args: dict[str, Any]) -> ToolResult:
+        calls.append(len(calls) + 1)
+        if acts(len(calls)):
+            page.state += 1
+        return ToolResult.error("tool_error: boom") if fails else ToolResult.ok(f"{name} done", data=data)
+
+    return ToolSpec(name=name, description=name, parameters={"type": "object"}, handler=handler, billable=True)
+
+
+_MOVED_URL = {
+    "click": {"page_transitioned": True},
+    "navigate": {ACTION_OUTCOME_DATA_KEY: {"url": "https://example.com/b", "page_transitioned": True}},
+}
+
+
 @pytest.mark.asyncio
-@pytest.mark.parametrize("url_changed", [False, True], ids=["url_unchanged", "url_changed"])
-@pytest.mark.parametrize("reported_by", ["click", "navigate"])
-async def test_single_action_block_completes_on_the_step_cap_only_when_its_action_moved_the_page(
-    url_changed: bool, reported_by: str
+@pytest.mark.parametrize("effect", ["click_moved_url", "navigate_moved_url", "changed_the_page", "changed_nothing"])
+@pytest.mark.parametrize("verdict", ["achieved", "not_achieved"])
+async def test_single_action_block_completes_on_the_step_cap_only_when_its_action_had_an_effect_the_judge_accepts(
+    effect: str, verdict: str
 ) -> None:
-    # A click that succeeds without moving the page (a no-op control, a typed username before the login submits)
-    # is no sign the block is done. Navigate reports the move inside its action outcome.
-    data = (
-        {"page_transitioned": url_changed}
-        if reported_by == "click"
-        else {ACTION_OUTCOME_DATA_KEY: {"url": "https://example.com/b", "page_transitioned": url_changed}}
+    # An in-page action (a toggle, a filter) can finish the block without moving the URL; one that changed nothing (a
+    # no-op click, a tab click that never reached its tab) is no sign it is done, whatever the judge says.
+    async def check() -> GoalVerdict:
+        return GoalVerdict(verdict, "", "", None, 0.1)
+
+    page = _EffectPage()
+    data = _MOVED_URL.get(effect.split("_")[0]) if effect.endswith("moved_url") else {"page_transitioned": False}
+    click = _acting_tool("click", page, acts=lambda n: n == 1 and effect == "changed_the_page", data=data)
+    script = [[("click", {})], [("click", {})], [("click", {})]]
+    outcome, _ = await _run(
+        script,
+        [click, make_finish_tool()],
+        single_action_block=True,
+        block_completion_check=check,
+        max_action_steps=1,
+        action_effect_fingerprint=page.fingerprint,
     )
-    click_calls: list[tuple[str, dict[str, Any]]] = []
-    click = _recording_tool("click", click_calls, billable=True, ok_data=data)
+
+    completes = verdict == "achieved" and effect != "changed_nothing"
+    assert outcome.status == ("completed" if completes else "budget_exhausted")
+
+
+@pytest.mark.asyncio
+async def test_a_call_that_reports_an_http_error_page_is_no_evidence_for_the_step_cap_completion() -> None:
+    # The error page differs from the one before, but landing on it is not the block's action happening. Today only
+    # the recordable navigate reports a status; this pins the success flag to the URL-move rule for any billable call.
+    page = _EffectPage()
+    error_page = {ACTION_OUTCOME_DATA_KEY: {"url": "https://example.com/b", "http_status": 500}}
+    navigate = _acting_tool("navigate", page, acts=lambda n: True, data=error_page)
+    script = [[("navigate", {"url": "https://example.com/b"})], [("navigate", {})], [("navigate", {})]]
+    check, asked = _scripted_block_check(_ACHIEVED)
+    outcome, _ = await _run(
+        script,
+        [navigate, make_finish_tool()],
+        single_action_block=True,
+        block_completion_check=check,
+        max_action_steps=1,
+        action_effect_fingerprint=page.fingerprint,
+    )
+
+    assert outcome.status == "budget_exhausted"
+    assert asked == []
+
+
+@pytest.mark.asyncio
+async def test_a_changed_page_without_a_fingerprint_sample_is_no_evidence_for_the_step_cap_completion() -> None:
+    page = _EffectPage()
+    click = _acting_tool("click", page, acts=lambda n: True, data={"page_transitioned": False})
     script = [[("click", {})], [("click", {})], [("click", {})]]
     outcome, _ = await _run(
         script,
@@ -1079,9 +1231,148 @@ async def test_single_action_block_completes_on_the_step_cap_only_when_its_actio
         max_action_steps=1,
     )
 
-    assert outcome.status == ("completed" if url_changed else "budget_exhausted")
-    if not url_changed:
-        assert outcome.cap_trip == "Reached the maximum steps (1)"
+    assert outcome.status == "budget_exhausted"
+
+
+@pytest.mark.asyncio
+async def test_a_missing_after_sample_is_no_evidence_for_the_step_cap_completion() -> None:
+    samples = iter(["fp-0", None, "fp-0", None, "fp-0", None])
+
+    async def sampler() -> str | None:
+        return next(samples, None)
+
+    click = _recording_tool("click", [], billable=True, ok_data={"page_transitioned": False})
+    script = [[("click", {})], [("click", {})], [("click", {})]]
+    outcome, _ = await _run(
+        script,
+        [click, make_finish_tool()],
+        single_action_block=True,
+        block_completion_check=_achieved_block_check,
+        max_action_steps=1,
+        action_effect_fingerprint=sampler,
+    )
+
+    assert outcome.status == "budget_exhausted"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("tool_name", ["type", "select_option"])
+async def test_an_entry_that_changed_the_page_is_no_evidence_for_the_step_cap_completion(tool_name: str) -> None:
+    # Frameworks write a typed value into markup, so the page changes; a username typed before the login submits is
+    # still not the block done, whatever the judge says.
+    page = _EffectPage()
+    entry = _acting_tool(tool_name, page, acts=lambda n: True)
+    check, _asked = _scripted_block_check(_ACHIEVED)
+    script = [[(tool_name, {"selector": "#q", "text": "a"})], [(tool_name, {})], [(tool_name, {})]]
+    outcome, _ = await _run(
+        script,
+        [entry, make_finish_tool()],
+        single_action_block=True,
+        block_completion_check=check,
+        max_action_steps=1,
+        target_action_reserve=ACTION_BLOCK_TARGET_ACTION_RESERVE,
+        action_effect_fingerprint=page.fingerprint,
+    )
+
+    assert outcome.status == "budget_exhausted"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("same_batch", [True, False], ids=["same_batch", "next_batch"])
+async def test_a_page_change_from_another_call_is_no_evidence_for_the_successful_action(same_batch: bool) -> None:
+    # The successful click changed nothing; a failed call that changed the page says nothing about it.
+    page = _EffectPage()
+    noop = _acting_tool("click", page, acts=lambda n: False, data={"page_transitioned": False})
+    failing = _acting_tool("press_key", page, acts=lambda n: True, fails=True)
+    first = [("click", {}), ("press_key", {"key": "a"})] if same_batch else [("click", {})]
+    script = [first, [("press_key", {"key": "a"})], [("click", {})], [("click", {})]]
+    outcome, _ = await _run(
+        script,
+        [noop, failing, make_finish_tool()],
+        single_action_block=True,
+        block_completion_check=_achieved_block_check,
+        max_action_steps=1,
+        action_effect_fingerprint=page.fingerprint,
+    )
+
+    assert outcome.status == "budget_exhausted"
+
+
+@pytest.mark.asyncio
+async def test_the_completion_offer_never_reuses_a_verdict_from_an_earlier_cap_trip() -> None:
+    # The reserve judged the typed page "not done" and granted a round; the click in that round may have submitted,
+    # so the next trip's reserve does not judge, and the offer must ask about the page the click left.
+    page = _EffectPage()
+
+    async def typed(args: dict[str, Any]) -> ToolResult:
+        page.state += 1
+        return ToolResult.ok("typed")
+
+    tool = ToolSpec(name="type", description="type", parameters={"type": "object"}, handler=typed, billable=True)
+    click = _acting_tool("click", page, acts=lambda n: True, data={"page_transitioned": False})
+    check, asked = _scripted_block_check(_NOT_ACHIEVED, _ACHIEVED)
+    script = [[("type", {"selector": "#q", "text": "a"})], [("click", {})], [("click", {})], [("click", {})]]
+    outcome, _ = await _run(
+        script,
+        [tool, click, make_finish_tool()],
+        single_action_block=True,
+        block_completion_check=check,
+        max_action_steps=1,
+        target_action_reserve=ACTION_BLOCK_TARGET_ACTION_RESERVE,
+        action_effect_fingerprint=page.fingerprint,
+    )
+
+    assert asked == [_NOT_ACHIEVED, _ACHIEVED]
+    assert outcome.status == "completed"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("cap", [1, 2])
+@pytest.mark.parametrize("follow_up", ["refused", "none"])
+@pytest.mark.parametrize("action_ok", [True, False], ids=["action_ok", "action_failed"])
+async def test_single_action_block_step_cap_outcome_matrix(cap: int, follow_up: str, action_ok: bool) -> None:
+    # Only a block whose action succeeded, and whose further action the cap refused, is completed for it; a block
+    # that never landed its action, or that finished on its own, keeps the verdict it reached.
+    page = _EffectPage()
+    click = _acting_tool("click", page, acts=lambda n: n == 1, fails=not action_ok, data={"page_transitioned": False})
+    clicks = [[("click", {})] for _ in range(cap)]
+    tail = (
+        [[("click", {})], [("click", {})]]
+        if follow_up == "refused"
+        else [[("finish", {"status": "failed", "reason": "the block's control was not there"})]]
+    )
+    outcome, _ = await _run(
+        clicks + tail,
+        [click, make_finish_tool()],
+        single_action_block=True,
+        block_completion_check=_achieved_block_check,
+        max_action_steps=cap,
+        action_effect_fingerprint=page.fingerprint,
+    )
+
+    if follow_up == "none":
+        assert outcome.status == "failed"
+    elif action_ok:
+        assert outcome.status == "completed"
+    else:
+        assert outcome.status == "budget_exhausted"
+
+
+@pytest.mark.asyncio
+async def test_a_hover_alone_is_no_evidence_for_the_step_cap_completion() -> None:
+    page = _EffectPage()
+    hover = _acting_tool("hover", page, acts=lambda n: True)
+    script = [[("hover", {})], [("hover", {})], [("hover", {})], [("hover", {})]]
+    outcome, _ = await _run(
+        script,
+        [hover, make_finish_tool()],
+        single_action_block=True,
+        block_completion_check=_achieved_block_check,
+        max_action_steps=1,
+        action_effect_fingerprint=page.fingerprint,
+    )
+
+    assert outcome.status == "budget_exhausted"
 
 
 @pytest.mark.asyncio
@@ -1252,6 +1543,287 @@ async def test_step_cap_block_completion_evidence_log_carries_the_verdict_not_th
     [evidence] = [entry for entry in logs if entry["event"] == "taskv3 block completion evidence"]
     assert evidence["judge_verdict"] == "not_achieved"
     assert "482913" not in repr(evidence)
+
+
+def _flaky_click(sink: list[dict[str, Any]], fail_first: int, landed: dict[str, Any] | None = None) -> ToolSpec:
+    async def handler(args: dict[str, Any]) -> ToolResult:
+        sink.append(args)
+        if len(sink) <= fail_first:
+            return ToolResult.error("click timed out: element is not stable")
+        return ToolResult.ok("clicked button 'Next'", data=landed if landed is not None else _REACHED_TARGET)
+
+    return ToolSpec(name="click", description="click", parameters={"type": "object"}, handler=handler, billable=True)
+
+
+def _scripted_block_check(*verdicts: GoalVerdict) -> tuple[Callable[[], Awaitable[GoalVerdict]], list[GoalVerdict]]:
+    asked: list[GoalVerdict] = []
+
+    async def check() -> GoalVerdict:
+        verdict = verdicts[min(len(asked), len(verdicts) - 1)]
+        asked.append(verdict)
+        return verdict
+
+    return check, asked
+
+
+_NOT_ACHIEVED = GoalVerdict("not_achieved", "Next", "the next page", None, 0.1)
+_ACHIEVED = GoalVerdict("achieved", "", "", None, 0.1)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("reserve", [0, ACTION_BLOCK_TARGET_ACTION_RESERVE], ids=["no_reserve", "reserve"])
+async def test_a_one_click_block_lands_its_click_after_a_hover_and_a_failed_click(reserve: int) -> None:
+    # Cap 1 is the action block's default. The hover and the click that failed without moving the page did not
+    # do the block's action, so they must not leave the click it asked for unspent (the step engine retries a
+    # failed step and completes on the one that succeeds).
+    hovers: list[tuple[str, dict[str, Any]]] = []
+    clicks: list[dict[str, Any]] = []
+    script = [[("hover", {})], [("click", {})], [("click", {})], [("click", {})]]
+    outcome, _ = await _run(
+        script,
+        [_recording_tool("hover", hovers, billable=True), _flaky_click(clicks, fail_first=1), make_finish_tool()],
+        single_action_block=True,
+        block_completion_check=_achieved_block_check,
+        max_action_steps=1,
+        target_action_reserve=reserve,
+    )
+
+    if reserve:
+        assert outcome.status == "completed"
+        assert "(click)" in outcome.reason
+        assert len(clicks) == 2  # the failed click and the one that landed; the follow-up got the completion
+    else:
+        assert outcome.status == "budget_exhausted"
+        assert clicks == []
+
+
+@pytest.mark.asyncio
+async def test_a_menu_opening_click_is_a_precursor_like_a_hover() -> None:
+    clicks: list[dict[str, Any]] = []
+    opener = {"menu_note": "listed"}
+
+    async def handler(args: dict[str, Any]) -> ToolResult:
+        clicks.append(args)
+        return ToolResult.ok("clicked", data=opener if len(clicks) == 1 else _REACHED_TARGET)
+
+    click = ToolSpec(name="click", description="click", parameters={"type": "object"}, handler=handler, billable=True)
+    check, asked = _scripted_block_check(_ACHIEVED)
+    script = [[("click", {})], [("click", {})], [("click", {})]]
+    outcome, _ = await _run(
+        script,
+        [click, make_finish_tool()],
+        single_action_block=True,
+        block_completion_check=check,
+        max_action_steps=1,
+        target_action_reserve=ACTION_BLOCK_TARGET_ACTION_RESERVE,
+    )
+
+    assert outcome.status == "completed"
+    assert len(clicks) == 2
+    assert len(asked) == 1  # only the completion offer after the landed click; the menu open needed no judge
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("verdict", "granted"),
+    [
+        (_NOT_ACHIEVED, True),
+        (_ACHIEVED, False),
+        (GoalVerdict("impossible", "", "", None, 0.1), False),
+        (GoalVerdict("achieved", "", "", "secret_entered", 0.0), False),
+        (None, False),
+    ],
+    ids=["not_achieved", "achieved", "impossible", "judge_skipped", "judge_raises"],
+)
+@pytest.mark.parametrize("entry", ["typed", "type_failed"])
+async def test_a_precursor_that_committed_needs_the_judges_not_achieved_for_another_round(
+    verdict: GoalVerdict | None, granted: bool, entry: str
+) -> None:
+    # A typed value can be the block's whole action, and a type that errored may still have written part of it (a
+    # partial credential); only the block judge saying it is not done yet earns a round.
+    types: list[tuple[str, dict[str, Any]]] = []
+    clicks: list[dict[str, Any]] = []
+
+    async def check() -> GoalVerdict:
+        if verdict is None:
+            raise RuntimeError("judge down")
+        return verdict
+
+    script = [[("type", {})], [("click", {})], [("click", {})]]
+    outcome, _ = await _run(
+        script,
+        [
+            _recording_tool("type", types, billable=True)
+            if entry == "typed"
+            else _erroring_tool("type", types, billable=True),
+            _flaky_click(clicks, fail_first=0),
+            make_finish_tool(),
+        ],
+        single_action_block=True,
+        block_completion_check=check,
+        max_action_steps=1,
+        target_action_reserve=ACTION_BLOCK_TARGET_ACTION_RESERVE,
+    )
+
+    assert len(clicks) == (1 if granted else 0)
+    if not granted:
+        assert outcome.status == "budget_exhausted"
+        assert outcome.cap_trip == "Reached the maximum steps (1)"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "landed", ["ok_url_unchanged", "failed_page_moved", "failed_select_moved_url", "failed_enter", "click_unverified"]
+)
+async def test_no_round_is_reserved_after_a_call_that_may_have_submitted_or_left_the_page(landed: str) -> None:
+    # A click that did not move the URL may have submitted, and a failed call that moved the page left it; another
+    # round could submit twice or act on the next page, so the judge is not even asked.
+    clicks: list[tuple[str, dict[str, Any]]] = []
+    tool_name = {"failed_select_moved_url": "select_option", "failed_enter": "press_key"}.get(landed, "click")
+    call_args = {"key": "Enter"} if landed == "failed_enter" else {}
+    if landed == "ok_url_unchanged":
+        click = _recording_tool("click", clicks, billable=True, ok_data={"page_transitioned": False})
+    elif landed == "failed_page_moved":
+        click = _erroring_tool("click", clicks, billable=True, error_data={"page_state_changed": True})
+    elif landed == "click_unverified":
+        click = _erroring_tool("click", clicks, billable=True, error_data={CLICK_DISPATCHED_DATA_KEY: True})
+    elif landed == "failed_select_moved_url":
+        click = _erroring_tool("select_option", clicks, billable=True, error_data={"page_transitioned": True})
+    else:
+        click = _erroring_tool("press_key", clicks, billable=True)
+    check, asked = _scripted_block_check(_NOT_ACHIEVED)
+    script = [[(tool_name, call_args)], [(tool_name, call_args)], [(tool_name, call_args)]]
+    with capture_logs() as logs:
+        outcome, _ = await _run(
+            script,
+            [click, make_finish_tool()],
+            single_action_block=True,
+            block_completion_check=check,
+            max_action_steps=1,
+            target_action_reserve=ACTION_BLOCK_TARGET_ACTION_RESERVE,
+        )
+
+    assert outcome.status == "budget_exhausted"
+    assert len(clicks) == 1
+    assert asked == []
+    [decision] = [entry for entry in logs if entry["event"] == TARGET_ACTION_ROUND_EVENT]
+    assert decision["granted"] is False and decision["reason"] == "may_have_landed"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("entry", ["typed", "type_failed"])
+async def test_no_reserve_round_follows_a_typed_secret_even_on_a_not_done_verdict(entry: str) -> None:
+    # A partial or full credential is on the page; a second round could submit it and spend a lockout attempt.
+    types: list[tuple[str, dict[str, Any]]] = []
+    clicks: list[dict[str, Any]] = []
+    secret = {"selector": "#password", "text": "placeholder_TlK9_password"}
+    typer = (
+        _recording_tool("type", types, billable=True)
+        if entry == "typed"
+        else _erroring_tool("type", types, billable=True)
+    )
+    check, asked = _scripted_block_check(_NOT_ACHIEVED)
+    script = [[("type", secret)], [("click", {})], [("click", {})]]
+    with capture_logs() as logs:
+        outcome, _ = await _run(
+            script,
+            [typer, _flaky_click(clicks, fail_first=0), make_finish_tool()],
+            single_action_block=True,
+            block_completion_check=check,
+            max_action_steps=1,
+            target_action_reserve=ACTION_BLOCK_TARGET_ACTION_RESERVE,
+        )
+
+    assert outcome.status == "budget_exhausted"
+    assert clicks == [] and asked == []
+    [decision] = [log for log in logs if log["event"] == TARGET_ACTION_ROUND_EVENT]
+    assert decision["reason"] == "may_have_landed"
+
+
+@pytest.mark.asyncio
+async def test_an_action_that_moved_the_page_goes_to_the_completion_offer_not_the_reserve() -> None:
+    # A select that navigated landed the block's action; a not-done verdict fails the block as before rather than
+    # granting a round on the page it moved to.
+    selects: list[tuple[str, dict[str, Any]]] = []
+    select = _recording_tool("select_option", selects, billable=True, ok_data=_REACHED_TARGET)
+    check, asked = _scripted_block_check(_NOT_ACHIEVED)
+    script = [[("select_option", {})], [("select_option", {})], [("select_option", {})]]
+    outcome, _ = await _run(
+        script,
+        [select, make_finish_tool()],
+        single_action_block=True,
+        block_completion_check=check,
+        max_action_steps=1,
+        target_action_reserve=ACTION_BLOCK_TARGET_ACTION_RESERVE,
+    )
+
+    assert outcome.status == "budget_exhausted"
+    assert len(selects) == 1
+    assert len(asked) == 1  # the completion offer's judge only
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("dispatched", [True, False], ids=["page_received_it", "never_dispatched"])
+async def test_a_click_that_raised_after_the_page_received_it_gets_no_reserve_round(dispatched: bool) -> None:
+    # A slow submit: the click raised while its navigation had not committed, so the probe reads the same page. A
+    # second click could post the form twice; a click that never reached the page is the retry v1 also makes.
+    clicks: list[dict[str, Any]] = []
+
+    async def handler(args: dict[str, Any]) -> ToolResult:
+        clicks.append(args)
+        if dispatched:
+            record_click_dispatched()
+        raise TimeoutError("click timed out")
+
+    click = ToolSpec(name="click", description="click", parameters={"type": "object"}, handler=handler, billable=True)
+    script = [[("click", {})], [("click", {})], [("click", {})]]
+    with capture_logs() as logs:
+        outcome, _ = await _run(
+            script,
+            [click, make_finish_tool()],
+            single_action_block=True,
+            block_completion_check=_achieved_block_check,
+            max_action_steps=1,
+            target_action_reserve=ACTION_BLOCK_TARGET_ACTION_RESERVE,
+        )
+
+    assert outcome.status == "budget_exhausted"
+    [first] = [entry for entry in logs if entry["event"] == TARGET_ACTION_ROUND_EVENT][:1]
+    assert first["granted"] is (not dispatched)
+    assert len(clicks) == (1 if dispatched else 3)
+
+
+@pytest.mark.asyncio
+async def test_the_target_action_reserve_is_bounded() -> None:
+    clicks: list[dict[str, Any]] = []
+    script = [[("click", {})] for _ in range(8)]
+    outcome, _ = await _run(
+        script,
+        [_flaky_click(clicks, fail_first=99), make_finish_tool()],
+        single_action_block=True,
+        block_completion_check=_achieved_block_check,
+        max_action_steps=1,
+        target_action_reserve=ACTION_BLOCK_TARGET_ACTION_RESERVE,
+    )
+
+    assert outcome.status == "budget_exhausted"
+    assert len(clicks) == 1 + ACTION_BLOCK_TARGET_ACTION_RESERVE
+
+
+@pytest.mark.asyncio
+async def test_a_multi_action_block_gets_no_target_action_reserve() -> None:
+    hovers: list[tuple[str, dict[str, Any]]] = []
+    clicks: list[dict[str, Any]] = []
+    script = [[("hover", {})], [("click", {})], [("click", {})]]
+    outcome, _ = await _run(
+        script,
+        [_recording_tool("hover", hovers, billable=True), _flaky_click(clicks, fail_first=0), make_finish_tool()],
+        max_action_steps=1,
+        target_action_reserve=ACTION_BLOCK_TARGET_ACTION_RESERVE,
+    )
+
+    assert outcome.status == "budget_exhausted"
+    assert clicks == []
 
 
 @pytest.mark.asyncio
@@ -1454,6 +2026,45 @@ async def test_tool_error_stops_batch_and_skips_remaining() -> None:
     turn1_tool_msgs = [m for m in outcome.messages if m.get("role") == "tool"]
     assert any(m.get("name") == "type" and "skipped" in m["content"] for m in turn1_tool_msgs)
     assert any(m.get("name") == "boom" and "boom failed" in m["content"] for m in turn1_tool_msgs)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("unconfirmed", [True, False], ids=["unconfirmed", "confirmed"])
+async def test_a_field_entry_that_could_not_confirm_its_value_holds_back_a_submit_in_the_batch(
+    unconfirmed: bool,
+) -> None:
+    # The value is not known to be in the field, so a click queued behind it must not submit the form; an ordinary
+    # entry, and a later entry into another field, still run.
+    type_calls: list[tuple[str, dict[str, Any]]] = []
+    click_calls: list[tuple[str, dict[str, Any]]] = []
+    later_calls: list[tuple[str, dict[str, Any]]] = []
+
+    async def type_handler(args: dict[str, Any]) -> ToolResult:
+        type_calls.append(("type", args))
+        return ToolResult("ok", "typed into #a", entry_unconfirmed=unconfirmed)
+
+    typer = ToolSpec(
+        name="type", description="type", parameters={"type": "object"}, handler=type_handler, billable=True
+    )
+    tools = [typer, _recording_tool("click", click_calls, billable=True), _recording_tool("select_option", later_calls)]
+    script = [
+        [
+            ("type", {"selector": "#a"}),
+            ("select_option", {"selector": "#b"}),
+            ("click", {"selector": "#submit"}),
+            ("finish", {"status": "completed", "reason": "submitted"}),
+        ],
+        [("finish", {"status": "completed", "reason": "checked first"})],
+    ]
+    outcome, _ = await _run(script, [*tools, make_finish_tool()])
+
+    assert len(type_calls) == 1 and len(later_calls) == 1
+    assert len(click_calls) == (0 if unconfirmed else 1)
+    # A verdict queued behind the unconfirmed field was written before the model saw it.
+    assert outcome.reason == ("checked first" if unconfirmed else "submitted")
+    if unconfirmed:
+        [skip] = [m for m in outcome.messages if m.get("role") == "tool" and m.get("name") == "click"]
+        assert "could not confirm" in skip["content"]
 
 
 @pytest.mark.asyncio
@@ -2836,7 +3447,7 @@ async def _atomic_block_run(
     clicks: list[tuple[str, dict[str, Any]]] = []
     rounds: list[list[RoundAction]] = []
 
-    async def _on_round(round_actions: list[RoundAction], _text: str | None) -> None:
+    async def _on_round(round_actions: list[RoundAction], _text: str | None, *, round_done: bool) -> None:
         rounds.append(list(round_actions))
 
     script = [
@@ -4122,39 +4733,44 @@ def test_budget_extension_gate_credits_the_headroom_the_grant_itself_creates() -
 
 
 @pytest.mark.asyncio
-async def test_on_action_round_fires_once_per_action_round() -> None:
-    # The callback fires once per action ROUND (a turn with >=1 successful billable action), not per
-    # tool and not on perception-only turns, and receives that round's (name, args) list plus the
-    # assistant text the SAME turn produced.
-    rounds: list[list[tuple[str, dict[str, Any]]]] = []
+async def test_on_action_round_hands_each_action_over_before_the_next_one_dispatches() -> None:
+    # A batch's actions reach the caller as they are dispatched, so rows land while the batch is
+    # still running: handing the whole batch over at the end left a run's five actions executing over
+    # ~16s and then published all five rows at once, hiding the progress (SKY-18164). Perception-only
+    # turns still hand over nothing, and every call carries the SAME turn's assistant text.
+    log: list[Any] = []
     round_texts: list[str | None] = []
 
-    async def _on_round(actions: list[tuple[str, dict[str, Any]]], turn_text: str | None) -> None:
-        rounds.append(actions)
+    async def _on_round(actions: list[RoundAction], turn_text: str | None, *, round_done: bool) -> None:
+        log.append(("handed", [action.tool for action in actions], round_done))
         round_texts.append(turn_text)
 
-    obs, clk, typ = [], [], []
-    observe = _recording_tool("observe", obs)  # perception, not billable
-    click = _recording_tool("click", clk)
+    observe = _recording_tool("observe", log)  # perception, not billable
+    click = _recording_tool("click", log)
     click.billable = True
-    type_ = _recording_tool("type", typ)
+    type_ = _recording_tool("type", log)
     type_.billable = True
     script = [
         [("observe", {})],  # perception-only -> no callback
-        [("click", {"selector": "#a"}), ("type", {"selector": "#b", "text": "x"})],  # 1 round, 2 tools -> 1 call
+        [("click", {"selector": "#a"}), ("type", {"selector": "#b", "text": "x"})],
         [("finish", {"status": "completed", "reason": "ok"})],
     ]
     texts = ["looking around", "clicking the field and typing into it", "done"]
     outcome, _ = await _run(script, [observe, click, type_, make_finish_tool()], on_action_round=_on_round, texts=texts)
     assert outcome.status == "completed"
-    assert len(rounds) == 1
-    assert rounds[0] == [
-        RoundAction("click", {"selector": "#a"}, True, billable=True),
-        RoundAction("type", {"selector": "#b", "text": "x"}, True, billable=True),
+    assert log == [
+        ("observe", {}),
+        ("click", {"selector": "#a"}),
+        # The click is published BEFORE the type below runs — the page still shows what the click
+        # did, which is the frame a caller's post-action screenshot needs.
+        ("handed", ["click"], False),
+        ("type", {"selector": "#b", "text": "x"}),
+        # Closing the round flushes the batch's last action and advances the caller's round index once.
+        ("handed", ["type"], True),
     ]
-    # The action round's text is the SECOND turn's ("clicking the field..."), not the first
-    # (perception-only) or third (finish) turn's text.
-    assert round_texts == [texts[1]]
+    # Both hand-offs carry the SECOND turn's text, not the first (perception-only) or third
+    # (finish) turn's.
+    assert round_texts == [texts[1], texts[1]]
 
 
 @pytest.mark.asyncio
@@ -4163,7 +4779,9 @@ async def test_on_action_round_falls_back_to_reasoning_summary_when_text_empty()
     # reasoning summary (message.reasoning_content) is the only readable turn text available.
     round_texts: list[str | None] = []
 
-    async def _on_round(_actions: list[tuple[str, dict[str, Any], bool]], turn_text: str | None) -> None:
+    async def _on_round(
+        _actions: list[tuple[str, dict[str, Any], bool]], turn_text: str | None, *, round_done: bool
+    ) -> None:
         round_texts.append(turn_text)
 
     clk = []
@@ -4188,7 +4806,9 @@ async def test_on_action_round_falls_back_to_reasoning_summary_when_text_empty()
 async def test_on_action_round_prefers_content_over_reasoning_summary() -> None:
     round_texts: list[str | None] = []
 
-    async def _on_round(_actions: list[tuple[str, dict[str, Any], bool]], turn_text: str | None) -> None:
+    async def _on_round(
+        _actions: list[tuple[str, dict[str, Any], bool]], turn_text: str | None, *, round_done: bool
+    ) -> None:
         round_texts.append(turn_text)
 
     clk = []
@@ -4237,7 +4857,7 @@ async def test_on_action_round_fires_for_all_failed_round_with_failure_flag() ->
     # callback (flagged unsuccessful) so the round persists into the workflow-run step budget.
     rounds: list[list[RoundAction]] = []
 
-    async def _on_round(actions: list[RoundAction], _turn_text: str | None) -> None:
+    async def _on_round(actions: list[RoundAction], _turn_text: str | None, *, round_done: bool) -> None:
         rounds.append(actions)
 
     clk: list[tuple[str, dict[str, Any]]] = []
@@ -4252,7 +4872,7 @@ async def test_on_action_round_fires_for_all_failed_round_with_failure_flag() ->
 
 @pytest.mark.asyncio
 async def test_on_action_round_failure_does_not_abort_run() -> None:
-    async def _boom(actions: list[tuple[str, dict[str, Any]]], _turn_text: str | None) -> None:
+    async def _boom(actions: list[tuple[str, dict[str, Any]]], _turn_text: str | None, *, round_done: bool) -> None:
         raise RuntimeError("persist boom")
 
     clk: list[tuple[str, dict[str, Any]]] = []
@@ -4429,6 +5049,75 @@ async def test_finish_completed_defers_until_page_settles() -> None:
     assert len(deferral_messages) == 1
 
 
+def _unseen(reports: list[str]) -> UnseenPageText:
+    queue = iter(reports)
+
+    async def unreported() -> str:
+        return next(queue, "")
+
+    return UnseenPageText(unreported=unreported)
+
+
+_ROWS_SECTION = '\nbefore this call ran, the page newly showed (since your previous tool call): "Cart A" | "Cart B"'
+
+
+@pytest.mark.asyncio
+async def test_finish_completed_is_held_once_on_page_text_no_result_carried() -> None:
+    unseen = _unseen([_ROWS_SECTION])
+    finish = make_finish_tool(settle_wait_seconds=0.0, unseen_text=unseen)
+    script = [
+        [("finish", {"status": "completed", "reason": "the list is empty"})],
+        [("finish", {"status": "completed", "reason": "deleted the listed item"})],
+    ]
+    outcome, _ = await _run(script, [finish], unseen_text=unseen)
+    assert (outcome.status, outcome.reason) == ("completed", "deleted the listed item")
+    assert any('"Cart A"' in str(m.get("content")) for m in outcome.messages if m.get("name") == "finish")
+
+
+@pytest.mark.asyncio
+async def test_finish_completed_is_held_on_text_a_result_in_its_own_batch_reported() -> None:
+    # Results reach the model on its next turn, so a finish batched behind them was judged without them.
+    async def wait(_args: dict[str, Any]) -> ToolResult:
+        data = {"delta_at": 6, "delta_end": 6 + len(_ROWS_SECTION)}
+        return ToolResult(status="ok", content="waited" + _ROWS_SECTION, data=data)
+
+    wait_spec = ToolSpec(name="wait", description="wait", parameters={"type": "object", "properties": {}}, handler=wait)
+    unseen = _unseen([])
+    finish = make_finish_tool(settle_wait_seconds=0.0, unseen_text=unseen)
+    script = [
+        [
+            ("wait", {}),
+            ("finish", {"status": "completed", "reason": "the list is empty"}),
+            ("finish", {"status": "completed", "reason": "still empty"}),
+            ("finish", {"status": "completed", "reason": "empty, third try"}),
+        ],
+        [("finish", {"status": "completed", "reason": "deleted the listed item"})],
+    ]
+    outcome, _ = await _run(script, [wait_spec, finish], unseen_text=unseen)
+    assert (outcome.status, outcome.reason) == ("completed", "deleted the listed item")
+
+
+@pytest.mark.asyncio
+async def test_finish_held_on_unseen_text_has_its_own_budget_even_with_settle_deferrals_off() -> None:
+    # Bare tasks run with settle deferrals off; the hold still applies there, and still ends.
+    unseen = _unseen([f'\npage newly shows: "Rotating banner {i}"' for i in range(20)])
+    finish = make_finish_tool(settle_wait_seconds=0.0, max_settle_deferrals=0, unseen_text=unseen)
+    script = [[("finish", {"status": "completed", "reason": f"try {i}"})] for i in range(5)]
+    outcome, _ = await _run(script, [finish], unseen_text=unseen)
+    assert (outcome.status, outcome.reason) == ("completed", f"try {STALE_READ_MAX_HOLDS}")
+
+
+@pytest.mark.asyncio
+async def test_finish_completed_is_not_held_on_unseen_text_without_an_action_step_left() -> None:
+    # The step cap's own completion runs here; a hold it cannot act on would turn it into budget_exhausted.
+    activity = ActivityRecency()
+    activity.action_steps_remaining = 0
+    unseen = _unseen([_ROWS_SECTION])
+    finish = make_finish_tool(settle_wait_seconds=0.0, unseen_text=unseen, activity=activity)
+    outcome, _ = await _run([[("finish", {"status": "completed", "reason": "capped"})]], [finish], unseen_text=unseen)
+    assert (outcome.status, outcome.reason) == ("completed", "capped")
+
+
 @pytest.mark.asyncio
 async def test_finish_settle_deferrals_are_bounded_and_scoped_to_completed() -> None:
     # A permanently-unsettled page cannot livelock the run: after the deferral cap the verdict is
@@ -4542,15 +5231,25 @@ async def test_no_tool_call_turn_is_counted_and_nudged() -> None:
 
 
 @pytest.mark.asyncio
-async def test_loop_does_not_blame_an_optional_call_param_for_a_context_window_overflow() -> None:
-    # Dropping a parameter cannot shrink a transcript, so re-issuing would burn a second oversized
-    # request and mislabel the failure.
-    class _OverflowingCaller(_ScriptedCaller):
+@pytest.mark.parametrize(
+    ("exc", "reason_fragment"),
+    [
+        (SkyvernContextWindowExceededError(model="test-model"), "context window exceeded"),
+        (LLMContentFilteredError("TEST_KEY", ["primary", "fallback"]), "refused"),
+    ],
+    ids=["context_window", "refusal"],
+)
+async def test_loop_does_not_blame_an_optional_call_param_for_an_unfixable_call_failure(
+    exc: Exception, reason_fragment: str
+) -> None:
+    # Dropping a parameter cannot shrink a transcript or change a refusal, so re-issuing would burn
+    # a second request and mislabel the failure.
+    class _FailingCaller(_ScriptedCaller):
         async def call(self, **kwargs: Any) -> dict[str, Any]:
             self.calls += 1
-            raise SkyvernContextWindowExceededError(model="test-model")
+            raise exc
 
-    caller = _OverflowingCaller([])
+    caller = _FailingCaller([])
     outcome = await run_agent_tool_loop(
         llm_caller=caller,
         system_prompt="sys",
@@ -4559,10 +5258,13 @@ async def test_loop_does_not_blame_an_optional_call_param_for_a_context_window_o
         max_turns=5,
         max_tool_calls=10,
         call_kwargs={"reasoning_effort": {"effort": "high", "summary": "auto"}},
+        retryable_call_exceptions=(LLMProviderErrorRetryableTask,),
+        call_retry_base_delay=0.0,
     )
 
     assert outcome.status == "loop_error"
     assert caller.calls == 1
+    assert reason_fragment in outcome.reason
 
 
 @pytest.mark.asyncio
@@ -4913,6 +5615,36 @@ async def test_action_loop_terminates_with_bounded_verdict_on_resubmit_signature
     assert "#submit" not in outcome.reason
     assert len(clicks) < 12  # bounded well below the live 12-resubmit runaway
     assert caller.calls <= 15
+
+
+@pytest.mark.parametrize(
+    ("fingerprint_mode", "says_unchanged"),
+    [("never_moves", True), ("moves", False), ("not_sampled", False)],
+)
+@pytest.mark.asyncio
+async def test_action_loop_verdict_says_the_page_did_not_change_only_when_its_fingerprint_never_moved(
+    fingerprint_mode: str, says_unchanged: bool
+) -> None:
+    clicks: list[tuple[str, dict[str, Any]]] = []
+    tools = [_billable_tool("click", clicks), _perception_tool("observe", _REJECTION_OBSERVE), make_finish_tool()]
+    samples = {"n": 0}
+
+    async def fingerprint() -> str:
+        samples["n"] += 1
+        return f"dom-{samples['n']}" if fingerprint_mode == "moves" else "rejected"
+
+    outcome, _ = await _run(
+        _resubmit_script(12),
+        tools,
+        max_turns=200,
+        max_tool_calls=500,
+        page_fingerprint=None if fingerprint_mode == "not_sampled" else fingerprint,
+    )
+
+    assert outcome.guard == ACTION_LOOP_GUARD
+    assert outcome.reason.startswith("The run repeated the same action")
+    assert ("did not change" in outcome.reason) is says_unchanged
+    assert ("without making progress" in outcome.reason) is not says_unchanged
 
 
 @pytest.mark.asyncio
@@ -5688,7 +6420,7 @@ _NAV_URL = "https://forms.example.test/contact-us"
 
 def _recordable_navigate(sink: list[tuple[str, dict[str, Any]]], *, outcome: dict[str, Any] | None = None) -> ToolSpec:
     """The production navigate shape (SKY-16374): recordable so the navigation persists as an action
-    row with the round's screenshot, never billable, and carrying the outcome the caller writes onto
+    row with its own screenshot, never billable, and carrying the outcome the caller writes onto
     that row."""
 
     async def handler(args: dict[str, Any]) -> ToolResult:
@@ -5718,7 +6450,7 @@ async def test_a_navigation_reaches_the_round_with_its_outcome_and_costs_no_budg
     # a navigation is not a page-mutating step, and a recorded row must never start metering.
     rounds: list[list[RoundAction]] = []
 
-    async def _on_round(actions: list[RoundAction], _turn_text: str | None) -> None:
+    async def _on_round(actions: list[RoundAction], _turn_text: str | None, *, round_done: bool) -> None:
         rounds.append(actions)
 
     navs: list[tuple[str, dict[str, Any]]] = []
@@ -5740,7 +6472,7 @@ async def test_a_navigation_that_answered_an_http_error_is_recorded_as_a_failed_
     # to read as a failed one there, or a run that died on a 404 shows a terminate out of nowhere.
     rounds: list[list[RoundAction]] = []
 
-    async def _on_round(actions: list[RoundAction], _turn_text: str | None) -> None:
+    async def _on_round(actions: list[RoundAction], _turn_text: str | None, *, round_done: bool) -> None:
         rounds.append(actions)
 
     navs: list[tuple[str, dict[str, Any]]] = []
@@ -5765,7 +6497,7 @@ async def test_a_recorded_call_that_failed_carries_its_error_text_to_the_round()
     # nothing reads as a navigation that broke for no reason.
     rounds: list[list[RoundAction]] = []
 
-    async def _on_round(actions: list[RoundAction], _turn_text: str | None) -> None:
+    async def _on_round(actions: list[RoundAction], _turn_text: str | None, *, round_done: bool) -> None:
         rounds.append(actions)
 
     navs: list[tuple[str, dict[str, Any]]] = []
@@ -5790,7 +6522,7 @@ async def test_repeated_navigations_to_one_url_are_recorded_without_arming_the_a
     # Recording a row must not change what ends a run.
     rounds: list[list[RoundAction]] = []
 
-    async def _on_round(actions: list[RoundAction], _turn_text: str | None) -> None:
+    async def _on_round(actions: list[RoundAction], _turn_text: str | None, *, round_done: bool) -> None:
         rounds.append(actions)
 
     navs: list[tuple[str, dict[str, Any]]] = []
@@ -6022,10 +6754,9 @@ async def test_dead_posting_real_trace_shape_gains_at_most_one_observe() -> None
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("status", ["failed", "terminated"])
-async def test_finish_without_recent_trigger_is_not_gated(status: str) -> None:
-    # A non-completed verdict with no recent submit-class or captcha activity (missing input data,
-    # dead page never interacted with) needs no page evidence: accepted immediately, page never sampled.
+async def test_finish_failed_without_recent_trigger_is_not_gated() -> None:
+    # A failure with no recent submit-class or captcha activity (missing input data, dead page
+    # never interacted with) needs no page evidence: accepted immediately, page never sampled.
     activity = ActivityRecency()
     fingerprint, fp_calls = _fingerprint_seq(["fp"])
     tools = [
@@ -6034,10 +6765,10 @@ async def test_finish_without_recent_trigger_is_not_gated(status: str) -> None:
     ]
     script = [
         [("observe", {})],
-        [("finish", {"status": status, "reason": "the posting does not exist"})],
+        [("finish", {"status": "failed", "reason": "the posting does not exist"})],
     ]
     outcome, _ = await _run(script, tools, activity=activity)
-    assert outcome.status == status
+    assert outcome.status == "failed"
     assert outcome.turns == 2
     assert fp_calls["n"] == 0
 
@@ -6182,9 +6913,9 @@ async def test_failure_settle_wait_is_bounded_on_a_never_quiet_page() -> None:
 
 
 @pytest.mark.asyncio
-async def test_finish_terminated_after_submit_click_defers_for_evidence_then_stands() -> None:
-    # A terminated verdict after a submit-shaped click uses the same one-turn evidence check as a
-    # failed verdict: a re-observe is required before the page-blocked reason can stand.
+async def test_finish_terminated_after_submit_click_stands_without_a_relook() -> None:
+    # terminate_criterion verdicts stay cheap: terminated never consults the page, even with
+    # submit activity in the window.
     activity = ActivityRecency()
     fingerprint, fp_calls = _fingerprint_seq(["fp"])
     clicks: list[tuple[str, dict[str, Any]]] = []
@@ -6201,75 +6932,9 @@ async def test_finish_terminated_after_submit_click_defers_for_evidence_then_sta
     ]
     outcome, _ = await _run(script, tools, activity=activity)
     assert outcome.status == "terminated"
-    assert outcome.reason == "submission still rejected after re-observe"
-    deferrals = [
-        m
-        for m in outcome.messages
-        if m.get("role") == "tool" and "held for one evidence check" in str(m.get("content"))
-    ]
-    assert len(deferrals) == 1
-    assert fp_calls["n"] == 1
-
-
-@pytest.mark.asyncio
-async def test_held_terminated_verdict_can_complete_after_confirmation_is_observed() -> None:
-    activity = ActivityRecency()
-    fingerprint, fp_calls = _fingerprint_seq(["before-confirmation", "confirmation", "confirmation"])
-    clicks: list[tuple[str, dict[str, Any]]] = []
-    tools = [
-        _billable_tool("click", clicks),
-        _perception_tool("observe", "url=x text: 'Submission confirmation received.'"),
-        make_finish_tool(page_fingerprint=fingerprint, activity=activity, settle_wait_seconds=0.0),
-    ]
-    script = [
-        [("click", {"selector": "#btn-submit"})],
-        [("finish", {"status": "terminated", "reason": "submission still processing"})],
-        [("observe", {})],
-        [("finish", {"status": "completed", "reason": "confirmation visible"})],
-    ]
-
-    with capture_logs() as logs:
-        outcome, _ = await _run(script, tools, activity=activity)
-
-    assert outcome.status == "completed"
-    assert outcome.reason == "confirmation visible"
-    assert fp_calls["n"] == 3
-    held = next(log for log in logs if log["event"] == "taskv3 finish failure deferred for evidence")
-    assert held["status"] == "terminated"
-
-
-@pytest.mark.asyncio
-async def test_failure_evidence_budget_rearms_after_new_submit_activity() -> None:
-    # A previous held verdict must not spend the evidence check for a later submit attempt.
-    activity = ActivityRecency()
-    fingerprint, fp_calls = _fingerprint_seq(["fp"])
-    clicks: list[tuple[str, dict[str, Any]]] = []
-    tools = [
-        _billable_tool("click", clicks),
-        _perception_tool("observe", _REJECTION_OBSERVE),
-        make_finish_tool(page_fingerprint=fingerprint, activity=activity, settle_wait_seconds=0.0),
-    ]
-    script = [
-        [("click", {"selector": "#first-submit"})],
-        [("finish", {"status": "failed", "reason": "first submission rejected"})],
-        [("observe", {})],
-        [("click", {"selector": "#retry-submit"})],
-        [("finish", {"status": "terminated", "reason": "retry still processing"})],
-        [("observe", {})],
-        [("finish", {"status": "terminated", "reason": "retry rejected after re-observe"})],
-    ]
-
-    outcome, _ = await _run(script, tools, activity=activity)
-
-    assert outcome.status == "terminated"
-    assert outcome.reason == "retry rejected after re-observe"
-    deferrals = [
-        m
-        for m in outcome.messages
-        if m.get("role") == "tool" and "held for one evidence check" in str(m.get("content"))
-    ]
-    assert len(deferrals) == 2
-    assert fp_calls["n"] == 2
+    assert outcome.reason == "submission rejected"
+    assert outcome.turns == 2
+    assert fp_calls["n"] == 0
 
 
 @pytest.mark.asyncio
@@ -6917,6 +7582,25 @@ async def test_the_loop_records_the_clicked_control_for_the_pending_gate() -> No
     outcome, _ = await _run(script, tools, submit_watch=watch)
     assert outcome.status == "completed"
     assert asked == ["#submit"]
+
+
+@pytest.mark.asyncio
+async def test_the_loop_records_a_drags_drop_target_for_the_pending_gate() -> None:
+    # A drop handler can start a save, so the gate watches the drop target the drag reports, not its source.
+    probe, asked = _pending_probe(None)
+    watch = SubmitWatch()
+    drags: list[tuple[str, dict[str, Any]]] = []
+    tools = [
+        _billable_tool("drag", drags, data={"drop_target": "#done"}),
+        make_finish_tool(pending_marker=probe, submit_watch=watch),
+    ]
+    script = [
+        [("drag", {"selector": "#card", "target": "ref=4"})],
+        [("finish", {"status": "completed", "reason": "moved the card"})],
+    ]
+    outcome, _ = await _run(script, tools, submit_watch=watch)
+    assert outcome.status == "completed"
+    assert asked == ["#done"]
 
 
 @pytest.mark.asyncio
@@ -7890,248 +8574,268 @@ def test_canonicalization_covers_a_marker_fragment_left_open_at_the_tail() -> No
 
 
 @pytest.mark.asyncio
-async def test_completion_probe_ends_loop_mid_batch_without_finish() -> None:
-    # A billable action's own result can carry the download-completion signal; the probe ends the
-    # run right there, no finish tool call needed, and the rest of the batch never dispatches.
-    clicks: list[tuple[str, dict[str, Any]]] = []
+@pytest.mark.parametrize("settle_outcome", ["no_file", "landed", "raises_once", "canceled"])
+async def test_download_settle_accepts_a_completed_finish_it_could_record(settle_outcome: str) -> None:
+    canceled = False
+    raised = False
 
-    async def probe(_staged: frozenset[str]) -> str | None:
-        return "a file finished downloading"
+    async def settle(_staged: frozenset[str]) -> str | None:
+        nonlocal canceled, raised
+        if settle_outcome == "raises_once" and not raised:
+            raised = True
+            raise RuntimeError("storage unavailable")
+        canceled = settle_outcome == "canceled"
+        return "Downloaded report.csv" if settle_outcome == "landed" else None
 
-    tools = [_billable_tool("click", clicks), make_finish_tool()]
-    script = [[("click", {"selector": "#a"}), ("click", {"selector": "#b"})]]
-    recorded_rounds: list[list[RoundAction]] = []
+    async def should_cancel() -> bool:
+        return canceled
 
-    async def on_action_round(round_actions: list[RoundAction], _turn_text: str | None) -> None:
-        recorded_rounds.append(round_actions)
-
-    outcome, _ = await _run(script, tools, completion_probe=probe, on_action_round=on_action_round)
-
-    assert outcome.status == "completed"
-    assert outcome.reason == "a file finished downloading"
-    assert len(clicks) == 1  # the second batched click never ran
-    assert outcome.tool_calls == 1
-    # The click that produced the download must be billed and persisted, not lost because the
-    # probe fired before the recording step that appends it.
-    assert outcome.billable_actions == ["click"]
-    assert recorded_rounds == [[RoundAction("click", {"selector": "#a"}, True, billable=True)]]
-
-
-@pytest.mark.asyncio
-async def test_completion_probe_is_refused_while_verification_never_delivered() -> None:
-    # The probe is a second path to `completed` that never reaches the finish tool, so it needs the
-    # same verification gate: a file landing after the code source gave up must not read as success.
-    now = datetime.now(UTC)
-    task = make_task(now, make_organization(now), totp_verification_url="https://example.com/otp")
-
-    async def probe(_staged: frozenset[str]) -> str | None:
-        return "a file finished downloading"
-
-    gave_up = VerificationState(task=task)
-    gave_up.arm(VerificationFailure.BUDGET_EXHAUSTED, "get_verification_code")
-    outcome, caller = await _run(
-        [
-            [("click", {"selector": "#a"})],
-            [("finish", {"status": "failed", "reason": "the verification step never completed"})],
-        ],
-        [_billable_tool("click", []), make_finish_tool()],
-        completion_probe=probe,
-        verification_blocker=gave_up.block_finish,
-    )
-    assert outcome.status == "failed", outcome.reason
-    # The refusal has to REACH the model. DOWNLOAD_COMPLETION_GUIDANCE tells it the run ends on its
-    # own and not to call finish(completed), so a silent refusal would leave it acting until a stall
-    # guard terminated the run instead of finishing failed with the verification reason.
-    assert _COMPLETION_BLOCKED in json.dumps(caller.message_history, default=str)
-
-    # Control: the identical landed download still completes when the source never failed, so the
-    # refusal above is the gate firing and not the probe being disabled.
-    healthy = VerificationState(task=task)
-    ok_outcome, _ = await _run(
-        [[("click", {"selector": "#a"})]],
-        [_billable_tool("click", []), make_finish_tool()],
-        completion_probe=probe,
-        verification_blocker=healthy.block_finish,
-    )
-    assert ok_outcome.status == "completed"
-    assert ok_outcome.reason == "a file finished downloading"
-
-
-@pytest.mark.asyncio
-async def test_completion_probe_ignores_staged_download_unless_download_notice_too() -> None:
-    # file_upload stages an http(s) source file into the same downloads dir and marks it via
-    # staged_download; that must not read as the run's own landed download.
-    probe_calls = 0
-
-    async def probe(_staged: frozenset[str]) -> str | None:
-        nonlocal probe_calls
-        probe_calls += 1
-        return "a file finished downloading"
-
-    async def staged_only_handler(_args: dict[str, Any]) -> ToolResult:
-        return ToolResult.ok("uploaded", data={"staged_download": "x.pdf"})
-
-    staged_only_tool = ToolSpec(
-        name="file_upload",
-        description="file_upload",
-        parameters={"type": "object", "properties": {}},
-        handler=staged_only_handler,
-        billable=True,
-    )
+    facts = DownloadFailureFacts()
+    facts.add("Request failed: POST /api/collect returned HTTP 404", repeat=True)
+    finish = ("finish", {"status": "completed", "reason": "the account shows 0 records"})
     outcome, _ = await _run(
-        [[("file_upload", {})], [("finish", {"status": "completed", "reason": "done"})]],
-        [staged_only_tool, make_finish_tool()],
-        completion_probe=probe,
+        [[finish], [finish]],
+        [make_finish_tool(download_settle=settle, should_cancel=should_cancel, download_facts=facts)],
+        should_cancel=should_cancel,
     )
-    assert outcome.status == "completed"
-    assert outcome.reason == "done"  # not the probe's reason -- it was never consulted
-    assert probe_calls == 0
 
-    async def staged_and_landed_handler(_args: dict[str, Any]) -> ToolResult:
-        return ToolResult.ok("uploaded", data={"staged_download": "x.pdf", "download_notice": True})
-
-    staged_and_landed_tool = ToolSpec(
-        name="file_upload",
-        description="file_upload",
-        parameters={"type": "object", "properties": {}},
-        handler=staged_and_landed_handler,
-        billable=True,
-    )
-    outcome2, _ = await _run(
-        [[("file_upload", {})]],
-        [staged_and_landed_tool, make_finish_tool()],
-        completion_probe=probe,
-    )
-    assert outcome2.status == "completed"
-    assert outcome2.reason == "a file finished downloading"
-    assert probe_calls == 1
+    if settle_outcome == "canceled":
+        assert outcome.status == "canceled"
+        return
+    assert (outcome.status, outcome.reason) == ("completed", "the account shows 0 records")
+    finishes = [m["content"] for m in outcome.messages if m.get("role") == "tool" and m.get("name") == "finish"]
+    # A settle that raised could not record the block's files, so that finish is refused and the retry ends it.
+    assert len(finishes) == (2 if settle_outcome == "raises_once" else 1), finishes
+    assert "POST /api/collect returned HTTP 404" in finishes[-1]
+    assert (DOWNLOAD_NO_FILE_FACT in finishes[-1]) is (settle_outcome != "landed"), finishes
 
 
 @pytest.mark.asyncio
-async def test_completion_probe_gated_on_billable_or_download_notice() -> None:
-    probe_calls = 0
+async def test_a_held_finish_leaves_download_failures_and_files_for_the_accepted_finish() -> None:
+    facts = DownloadFailureFacts()
+    facts.add("Request failed: POST /api/export returned HTTP 503", repeat=True)
+    holds = iter(["the verification code never arrived"])
+    landed = ["guide.txt"]
+    recorded: list[list[str]] = []
 
-    async def probe(_staged: frozenset[str]) -> str | None:
-        nonlocal probe_calls
-        probe_calls += 1
-        return None
+    async def verification_blocker(_status: str) -> str | None:
+        return next(holds, None)
 
-    async def observe_handler(_args: dict[str, Any]) -> ToolResult:
-        return ToolResult.ok("observed")
+    async def settle(_staged: frozenset[str]) -> str | None:
+        recorded.append(list(landed))
+        return f"download completed ({len(landed)} new file(s))"
 
-    observe_tool = ToolSpec(
-        name="observe", description="observe", parameters={"type": "object", "properties": {}}, handler=observe_handler
+    async def click(_args: dict[str, Any]) -> ToolResult:
+        landed.append("invoice.txt")
+        return ToolResult.ok("clicked")
+
+    click_tool = ToolSpec(
+        name="click", description="click", parameters={"type": "object", "properties": {}}, handler=click
+    )
+    finish = ("finish", {"status": "completed", "reason": "done"})
+    outcome, _ = await _run(
+        [[finish], [("click", {})], [finish]],
+        [
+            click_tool,
+            make_finish_tool(verification_blocker=verification_blocker, download_facts=facts, download_settle=settle),
+        ],
     )
 
-    async def check_download_handler(_args: dict[str, Any]) -> ToolResult:
-        return ToolResult.ok("download seen", data={"download_notice": True})
+    finishes = [m["content"] for m in outcome.messages if m.get("role") == "tool" and m.get("name") == "finish"]
+    assert len(finishes) == 2
+    assert "HTTP 503" not in finishes[0] and "HTTP 503" in finishes[1]
+    # The settle finalizes the block's files, so it runs once, for the finish that ends the block.
+    assert recorded == [["guide.txt", "invoice.txt"]]
 
-    download_tool = ToolSpec(
-        name="check_download",
-        description="check_download",
-        parameters={"type": "object", "properties": {}},
-        handler=check_download_handler,
+
+@pytest.mark.asyncio
+async def test_finish_shows_at_most_the_capped_download_failures() -> None:
+    facts = DownloadFailureFacts()
+
+    async def click(args: dict[str, Any]) -> ToolResult:
+        # The last failure past the cap repeats; it is still one failure.
+        for i in [*range(DOWNLOAD_FAILURE_MAX_LINES + 2), DOWNLOAD_FAILURE_MAX_LINES + 1]:
+            facts.add(f"Request failed: GET /api/{args['batch']}{i} returned HTTP 503", repeat=True)
+        return ToolResult.ok("clicked")
+
+    click_tool = ToolSpec(
+        name="click", description="click", parameters={"type": "object", "properties": {}}, handler=click
     )
-
     script = [
-        [("observe", {})],  # non-billable, no download_notice -> probe not consulted
-        [("check_download", {})],  # non-billable but download_notice -> probe consulted
+        [("click", {"batch": "a"})],
         [("finish", {"status": "completed", "reason": "done"})],
     ]
-    outcome, _ = await _run(script, [observe_tool, download_tool, make_finish_tool()], completion_probe=probe)
+    outcome, _ = await _run(script, [click_tool, make_finish_tool(download_facts=facts)])
 
-    assert outcome.status == "completed"
-    assert probe_calls == 1
+    assert (outcome.status, outcome.reason) == ("completed", "done")
+    [finished] = [m["content"] for m in outcome.messages if m.get("role") == "tool" and m.get("name") == "finish"]
+    assert finished.count("Request failed:") == DOWNLOAD_FAILURE_MAX_LINES and "+2 more failures" in finished
+    assert not facts.undelivered
+
+
+def _gate_refusals(outcome: LoopOutcome) -> int:
+    return sum(
+        1 for m in outcome.messages if m.get("role") == "tool" and COMPLETION_GATE_REFUSAL in m.get("content", "")
+    )
+
+
+async def _async_value(value: Any) -> Any:
+    return value
+
+
+class _CountingGate:
+    """A completion gate that answers `verdict` and counts the vetoes it handed out."""
+
+    def __init__(self, verdict: bool = False) -> None:
+        self.verdict = verdict
+        self.calls = 0
+
+    async def __call__(self) -> bool:
+        self.calls += 1
+        return self.verdict
 
 
 @pytest.mark.asyncio
-async def test_completion_probe_exception_is_logged_and_treated_as_none() -> None:
-    async def probe(_staged: frozenset[str]) -> str | None:
-        raise RuntimeError("boom")
+async def test_completion_gate_veto_refuses_the_finish_and_a_later_approved_finish_completes() -> None:
+    verdicts = iter([False, True])
 
-    clicks: list[tuple[str, dict[str, Any]]] = []
-    tools = [_billable_tool("click", clicks), make_finish_tool()]
-    script = [[("click", {"selector": "#a"})], [("finish", {"status": "completed", "reason": "done normally"})]]
-    with capture_logs() as logs:
-        outcome, _ = await _run(script, tools, completion_probe=probe)
+    async def gate() -> bool:
+        return next(verdicts)
 
-    assert outcome.status == "completed"
-    assert outcome.reason == "done normally"
-    assert any(log["log_level"] == "warning" for log in logs)
-
-
-@pytest.mark.asyncio
-async def test_completion_blocker_gates_completed_status_only() -> None:
-    # completed: blocked once, then allowed once the blocker clears.
-    responses = iter(["wait: the download has not started yet", None])
-
-    async def blocker(_staged: frozenset[str]) -> str | None:
-        return next(responses)
-
-    tools = [make_finish_tool(completion_blocker=blocker)]
+    activity = ActivityRecency()
+    click_calls: list[tuple[str, dict[str, Any]]] = []
+    tools = [_billable_tool("click", click_calls), make_finish_tool(completion_gate=gate, activity=activity)]
     script = [
-        [("finish", {"status": "completed", "reason": "first attempt"})],
-        [("finish", {"status": "completed", "reason": "second attempt"})],
+        [("finish", {"status": "completed", "reason": "looks done"})],
+        [("click", {"selector": "#submit"})],
+        [("finish", {"status": "completed", "reason": "submitted"})],
     ]
-    outcome, caller = await _run(script, tools)
-    assert outcome.status == "completed"
-    assert outcome.reason == "second attempt"
-    assert caller.calls == 2  # the first finish was rejected, forcing a second turn
+    outcome, _ = await _run(script, tools, activity=activity, max_action_steps=5)
 
-    # failed: the blocker is never consulted, even though it would block if asked.
-    async def always_blocks(_staged: frozenset[str]) -> str | None:
-        return "should never be read"
-
-    tools2 = [make_finish_tool(completion_blocker=always_blocks)]
-    outcome2, _ = await _run([[("finish", {"status": "failed", "reason": "blocked reason"})]], tools2)
-    assert outcome2.status == "failed"
-    assert outcome2.reason == "blocked reason"
+    assert (outcome.status, outcome.reason, outcome.gate_passed) == ("completed", "submitted", True)
+    assert click_calls == [("click", {"selector": "#submit"})]
+    assert _gate_refusals(outcome) == 1
 
 
 @pytest.mark.asyncio
-async def test_completion_blocker_exception_fails_closed() -> None:
-    # A transient storage error checking for a landed download is evidence of nothing -- it must
-    # not let a download-gated task complete with no file. finish(failed) is unaffected.
-    calls = 0
+@pytest.mark.parametrize(
+    "raised, status, reason",
+    [
+        (StepTerminationError("vetoed too often", step_id="stp_1"), "failed", "vetoed too often"),
+        (CompletionGateTerminationError("an earlier entry exists"), "terminated", "an earlier entry exists"),
+    ],
+    ids=["veto_budget_spent", "already_applied"],
+)
+async def test_completion_gate_raise_ends_the_run_with_the_gates_reason(
+    raised: Exception, status: str, reason: str
+) -> None:
+    async def gate() -> bool:
+        raise raised
 
-    async def blocker(_staged: frozenset[str]) -> str | None:
-        nonlocal calls
-        calls += 1
-        raise RuntimeError("boom")
+    outcome, caller = await _run(
+        [[("finish", {"status": "completed", "reason": "done"})]], [make_finish_tool(completion_gate=gate)]
+    )
 
-    tools = [make_finish_tool(completion_blocker=blocker)]
+    assert outcome.status == status
+    assert reason in outcome.reason
+    assert not outcome.gate_passed
+    assert caller.calls == 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("budget", [{"max_turns": 2}, {"max_action_steps": 1}], ids=["no_turns_left", "no_steps_left"])
+async def test_completion_gate_without_headroom_leaves_the_verdict_to_the_caller(budget: dict[str, int]) -> None:
+    activity = ActivityRecency()
+    click_calls: list[tuple[str, dict[str, Any]]] = []
+    tools = [_billable_tool("click", click_calls), make_finish_tool(completion_gate=_CountingGate(), activity=activity)]
     script = [
-        [("finish", {"status": "completed", "reason": "first attempt"})],
-        [("finish", {"status": "failed", "reason": "give up"})],
+        [("click", {"selector": "#submit"})],
+        [("finish", {"status": "completed", "reason": "submitted"})],
     ]
-    with capture_logs() as logs:
-        outcome, caller = await _run(script, tools)
+    outcome, _ = await _run(script, tools, activity=activity, **budget)
 
-    assert outcome.status == "failed"
-    assert outcome.reason == "give up"
-    assert caller.calls == 2  # the completed attempt was rejected, forcing a second turn
-    assert calls == 1  # a failed verdict never consults the blocker
-    assert any(log["log_level"] == "warning" for log in logs)
-    rejected_tool_messages = [
-        m for m in outcome.messages if m.get("role") == "tool" and "Could not verify" in m.get("content", "")
-    ]
-    assert len(rejected_tool_messages) == 1
+    assert (outcome.status, outcome.gate_passed) == ("completed", False)
+    assert _gate_refusals(outcome) == 0
+
+
+@pytest.mark.asyncio
+async def test_completion_gate_is_skipped_when_a_click_earlier_in_the_turn_spent_the_last_action_step() -> None:
+    gate = _CountingGate()
+    activity = ActivityRecency()
+    click_calls: list[tuple[str, dict[str, Any]]] = []
+    tools = [_billable_tool("click", click_calls), make_finish_tool(completion_gate=gate, activity=activity)]
+    script = [[("click", {"selector": "#submit"}), ("finish", {"status": "completed", "reason": "submitted"})]]
+    outcome, _ = await _run(script, tools, activity=activity, max_action_steps=1)
+
+    assert (outcome.status, outcome.reason, outcome.gate_passed) == ("completed", "submitted", False)
+    assert gate.calls == 0
+
+
+async def _never_answers() -> bool:
+    await asyncio.Event().wait()
+    return True
+
+
+async def _errors() -> bool:
+    raise RuntimeError("gate bug")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("gate", [_errors, _never_answers], ids=["gate_errors", "gate_outlives_the_deadline"])
+async def test_a_gate_that_cannot_answer_lets_the_finish_through_for_the_caller_to_decide(
+    monkeypatch: pytest.MonkeyPatch, gate: Callable[[], Awaitable[bool]]
+) -> None:
+    # The headroom floor is a minute; drop it so a sub-second deadline still lets the gate run.
+    monkeypatch.setattr(
+        loop_module,
+        "_has_hold_headroom",
+        functools.partial(loop_module._has_hold_headroom, min_deadline_headroom_seconds=0.0),
+    )
+    finish = make_finish_tool(completion_gate=gate, deadline_at=time.monotonic() + 0.3)
+    started = time.monotonic()
+    async with asyncio.timeout(5):
+        outcome, caller = await _run([[("finish", {"status": "completed", "reason": "done"})]], [finish])
+
+    assert (outcome.status, outcome.reason, outcome.gate_passed) == ("completed", "done", False)
+    assert caller.calls == 1
+    assert time.monotonic() - started < 2
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("status", ["failed", "terminated"])
+async def test_completion_gate_never_holds_a_non_completed_finish(status: str) -> None:
+    gate = _CountingGate()
+    outcome, _ = await _run(
+        [[("finish", {"status": status, "reason": "the site offers no way on"})]],
+        [make_finish_tool(completion_gate=gate)],
+    )
+
+    assert (outcome.status, outcome.reason) == (status, "the site offers no way on")
+    assert gate.calls == 0
+
+
+@pytest.mark.asyncio
+async def test_an_earlier_completed_side_hold_answers_before_the_completion_gate_is_spent() -> None:
+    gate = _CountingGate()
+    finish = make_finish_tool(
+        completion_gate=gate, page_fingerprint=lambda: _async_value(str(time.monotonic_ns())), settle_wait_seconds=0
+    )
+    outcome, _ = await _run([[("finish", {"status": "completed", "reason": "done"})]], [finish])
+
+    first_finish_result = next(m["content"] for m in outcome.messages if m.get("role") == "tool")
+    assert "still rendering" in first_finish_result
+    assert gate.calls == 0
 
 
 @pytest.mark.asyncio
 async def test_staged_download_stays_excluded_for_the_rest_of_the_run() -> None:
-    # file_upload's staged http(s) source fetch must not be treated as a landed download by any
-    # LATER probe/blocker call this run -- not just skipped for the tool call that staged it.
+    # file_upload's staged http(s) source fetch must not be treated as a landed download by a
+    # LATER settle this run -- not just skipped for the tool call that staged it.
     staged_downloads: set[str] = set()
-    probe_seen: list[frozenset[str]] = []
-    blocker_seen: list[frozenset[str]] = []
+    settle_seen: list[frozenset[str]] = []
 
-    async def probe(staged: frozenset[str]) -> str | None:
-        probe_seen.append(staged)
-        return None
-
-    async def blocker(staged: frozenset[str]) -> str | None:
-        blocker_seen.append(staged)
+    async def settle(staged: frozenset[str]) -> str | None:
+        settle_seen.append(staged)
         return None
 
     async def stage_handler(_args: dict[str, Any]) -> ToolResult:
@@ -8148,20 +8852,17 @@ async def test_staged_download_stays_excluded_for_the_rest_of_the_run() -> None:
     tools = [
         stage_tool,
         _billable_tool("click", click_calls),
-        make_finish_tool(completion_blocker=blocker, staged_downloads=staged_downloads),
+        make_finish_tool(download_settle=settle, staged_downloads=staged_downloads),
     ]
     script = [
         [("file_upload", {})],
         [("click", {"selector": "#a"})],
         [("finish", {"status": "completed", "reason": "done"})],
     ]
-    outcome, _ = await _run(script, tools, completion_probe=probe, staged_downloads=staged_downloads)
+    outcome, _ = await _run(script, tools, staged_downloads=staged_downloads)
 
     assert outcome.status == "completed"
-    # The staging call itself never consults the probe (no download_notice); the next billable
-    # call's probe already carries the name it staged.
-    assert probe_seen == [frozenset({"in.pdf"})]
-    assert blocker_seen == [frozenset({"in.pdf"})]
+    assert settle_seen == [frozenset({"in.pdf"})]
 
 
 # --- SKY-15020 Lever C: net-progress _ProgressLedger (additive shadow) ---
@@ -9342,7 +10043,7 @@ async def test_refresh_reload_is_recorded_in_the_action_round() -> None:
 
     rounds: list[list[RoundAction]] = []
 
-    async def on_round(actions: list[RoundAction], _turn_text: str | None) -> None:
+    async def on_round(actions: list[RoundAction], _turn_text: str | None, *, round_done: bool) -> None:
         rounds.append(list(actions))
 
     click_calls: list[tuple[str, dict[str, Any]]] = []
@@ -9659,42 +10360,51 @@ async def test_model_observe_repeated_identical_snapshots_arms_perception_stall_
     assert activity.perception_stall_imminent is True
 
 
-class _ReasoningDictSensitiveCaller(_ScriptedCaller):
-    """Rejects any call carrying a dict reasoning_effort, as a provider without the responses
-    bridge would."""
+class _ParamRejectingCaller(_ScriptedCaller):
+    """Rejects any call carrying `param`, as a provider that does not accept it would."""
 
-    def __init__(self, script: list[list[tuple[str, dict[str, Any]]]]) -> None:
+    def __init__(self, script: list[list[tuple[str, dict[str, Any]]]], param: str) -> None:
         super().__init__(script)
-        self.reasoning_per_call: list[Any] = []
+        self.param = param
+        self.sent_param: list[bool] = []
 
     async def call(self, **kwargs: Any) -> dict[str, Any]:
-        self.reasoning_per_call.append(kwargs.get("reasoning_effort"))
-        if isinstance(kwargs.get("reasoning_effort"), dict):
+        self.sent_param.append(self.param in kwargs)
+        if self.param in kwargs:
             raise LLMProviderErrorRetryableTask("TEST_KEY")
         return await super().call(**kwargs)
 
 
 @pytest.mark.asyncio
-async def test_loop_drops_reasoning_dict_and_retries_the_turn_after_a_call_failure() -> None:
-    # A bridge-gate false positive must degrade to the config's own reasoning_effort, not end the
-    # run on turn 1.
-    caller = _ReasoningDictSensitiveCaller([[("finish", {"status": "completed", "reason": "ok"})]])
+@pytest.mark.parametrize(
+    ("param", "loop_kwargs"),
+    [
+        ("reasoning_effort", {"call_kwargs": {"reasoning_effort": {"effort": "high", "summary": "auto"}}}),
+        ("cache_control_injection_points", {"anthropic_cache_markers": True}),
+    ],
+)
+async def test_loop_drops_a_rejected_optional_param_for_the_rest_of_the_run(
+    param: str, loop_kwargs: dict[str, Any]
+) -> None:
+    # A bridge-gate false positive, or a provider refusing Claude cache marks, must cost one retry and leave the
+    # run going without the param, not end it on turn 1.
+    caller = _ParamRejectingCaller([[("observe", {})], [("finish", {"status": "completed", "reason": "ok"})]], param)
     outcome = await run_agent_tool_loop(
         llm_caller=caller,
         system_prompt="sys",
         user_prompt="goal",
-        tools=[make_finish_tool()],
+        tools=[_recording_tool("observe", []), make_finish_tool()],
         max_turns=5,
         max_tool_calls=10,
-        call_kwargs={"reasoning_effort": {"effort": "high", "summary": "auto"}},
         retryable_call_exceptions=(LLMProviderErrorRetryableTask,),
         max_call_retries=2,
         call_retry_base_delay=0.0,
+        **loop_kwargs,
     )
 
     assert outcome.status == "completed"
-    dict_calls = [r for r in caller.reasoning_per_call if isinstance(r, dict)]
-    assert dict_calls and caller.reasoning_per_call[-1] is None
+    first_without = caller.sent_param.index(False)
+    assert first_without > 0 and not any(caller.sent_param[first_without:])
 
 
 def test_canonical_progress_tracker_counts_targets_and_clears_on_progress() -> None:
@@ -10003,45 +10713,6 @@ async def test_canonical_loop_not_masked_by_replayed_download_notice() -> None:
 
 
 @pytest.mark.asyncio
-async def test_canonical_loop_suppressed_when_completion_probe_fires_on_the_rung_touch() -> None:
-    # complete_on_download: the file can land while the probe waits, AFTER the tool result returned
-    # without download_new. The probe's outcome skips the end-of-batch detector, but the pending
-    # rung minted by that same touch must not be emitted — the run completed on real progress.
-    from skyvern.forge.taskv3.loop import CANONICAL_LOOP_EVENT
-
-    calls = {"n": 0}
-
-    async def handler(args: dict[str, Any]) -> ToolResult:
-        calls["n"] += 1
-        return ToolResult.error("click refused") if calls["n"] < 3 else ToolResult.ok("clicked")
-
-    click = ToolSpec(
-        name="click",
-        description="click",
-        parameters={"type": "object", "properties": {}},
-        handler=handler,
-        billable=True,
-    )
-
-    async def probe(_staged: frozenset[str]) -> str | None:
-        return "a file finished downloading" if calls["n"] >= 3 else None
-
-    script = [
-        [("click", {"selector": "#dl", "note": "a"})],
-        [("click", {"selector": "#dl", "note": "b"})],
-        [("click", {"selector": "#dl", "note": "c"})],
-        [("finish", {"status": "failed", "reason": "unreached"})],
-    ]
-    with capture_logs() as logs:
-        outcome, _ = await _run(
-            script, [click, make_finish_tool()], completion_probe=probe, max_turns=50, max_tool_calls=100
-        )
-    assert outcome.status == "completed"
-    assert outcome.reason == "a file finished downloading"
-    assert [e for e in logs if e.get("event") == CANONICAL_LOOP_EVENT] == []
-
-
-@pytest.mark.asyncio
 async def test_canonical_loop_not_masked_by_missing_probe_samples() -> None:
     # A missing probe sample around a failed dispatch is not evidence of a page change: intermittent
     # probe timeouts must not keep clearing the ring and permanently mask a genuine loop.
@@ -10242,41 +10913,6 @@ async def test_canonical_loop_clears_on_new_low_even_under_a_replayed_notice() -
     assert outcome.status == "failed"
     assert len(touches) == 4
     assert [e for e in logs if e.get("event") == CANONICAL_LOOP_EVENT] == []
-
-
-@pytest.mark.asyncio
-async def test_completion_probe_spares_a_sibling_targets_rung() -> None:
-    # Blocker 2 (AronPerez round 10): the probe firing is progress for the COMPLETING touch only.
-    # A five-error streak on one selector minted a genuine rung 6 the same batch a download on a
-    # DIFFERENT selector completed the run — that sibling rung is real data and must survive.
-    from skyvern.forge.taskv3.loop import CANONICAL_LOOP_EVENT
-
-    touches: list[tuple[str, dict[str, Any]]] = []
-    fetched = {"done": False}
-
-    async def fetch_handler(_args: dict[str, Any]) -> ToolResult:
-        fetched["done"] = True
-        return ToolResult.ok("fetch dispatched")
-
-    fetch = ToolSpec(
-        name="fetch",
-        description="fetch",
-        parameters={"type": "object", "properties": {}},
-        handler=fetch_handler,
-        billable=True,
-    )
-
-    async def probe(_staged: frozenset[str]) -> str | None:
-        return "a file finished downloading" if fetched["done"] else None
-
-    script = [[("click", {"selector": "#stuck", "note": str(i)})] for i in range(5)]
-    script.append([("click", {"selector": "#stuck", "note": "sixth"}), ("fetch", {"selector": "#other"})])
-    tools = [_error_billable_tool("click", touches), fetch, make_finish_tool()]
-    with capture_logs() as logs:
-        outcome, _ = await _run(script, tools, completion_probe=probe, max_turns=50, max_tool_calls=100)
-    assert outcome.status == "completed"
-    fires = [e for e in logs if e.get("event") == CANONICAL_LOOP_EVENT]
-    assert [e["repeat_count"] for e in fires] == [3, 4, 6]
 
 
 @pytest.mark.asyncio
@@ -10506,7 +11142,6 @@ async def test_a_renumbered_mark_does_not_alias_with_its_pre_renumber_history() 
 def _awaiting_verification_state(*, spent: float = 120.0, budget: float = 900.0) -> Any:
     """A VerificationState in the exact shape the bug produces: a healthy source that answered "not
     yet" one 120s slice ago, with most of the 900s budget still unspent."""
-    from skyvern.forge.taskv3.auth_tools import VerificationState
 
     state = VerificationState(
         task=SimpleNamespace(task_id="tsk_1", organization_id="o_1", workflow_run_id=None)  # type: ignore[arg-type]
@@ -10654,7 +11289,6 @@ async def test_a_completion_blocked_run_still_escapes_via_failed_at_production_w
     # terminally-failed source returns None from `block_giveup` by construction: giving up IS the
     # correct answer once the source has been judged. Asserted against the real VerificationState,
     # not a mock that cannot disagree with the gate it is standing in for.
-    from skyvern.forge.taskv3.auth_tools import VerificationFailure, VerificationState
 
     state = VerificationState(
         task=SimpleNamespace(task_id="tsk_1", organization_id="o_1", workflow_run_id=None)  # type: ignore[arg-type]
@@ -10904,7 +11538,7 @@ def test_tools_error_sites_without_a_class_only_go_down() -> None:
             and len(node.args) < 5
         ):
             unlabelled.append(node.lineno)
-    assert len(unlabelled) == 31, sorted(unlabelled)
+    assert len(unlabelled) == 29, sorted(unlabelled)
 
 
 @pytest.mark.parametrize(
@@ -11213,7 +11847,7 @@ async def test_a_round_carries_billability_from_the_spec_not_from_a_name_list() 
     """
     rounds: list[list[RoundAction]] = []
 
-    async def _on_round(actions: list[RoundAction], reasoning: str | None) -> None:
+    async def _on_round(actions: list[RoundAction], reasoning: str | None, *, round_done: bool) -> None:
         rounds.append(actions)
 
     async def handler(args: dict[str, Any]) -> ToolResult:
@@ -11401,9 +12035,11 @@ class _RequestRecordingCaller(_ScriptedCaller):
     def __init__(self, script: list[list[tuple[str, dict[str, Any]]]]) -> None:
         super().__init__(script)
         self.requests: list[list[str]] = []
+        self.cache_points: list[list[int]] = []
 
     async def call(self, **kwargs: Any) -> dict[str, Any]:
         self.requests.append([json.dumps(m, sort_keys=True, default=str) for m in self.message_history])
+        self.cache_points.append([p["index"] for p in kwargs.pop("cache_control_injection_points", None) or []])
         return await super().call(**kwargs)
 
 
@@ -11581,6 +12217,44 @@ async def test_loop_keeps_one_observe_across_tabs() -> None:
     assert len(observes) == 3
     assert [o for o in observes if not o.startswith("[superseded ")] == [observes[2]]
     assert observes[2].startswith("OBSERVE[a]")
+
+
+@pytest.mark.asyncio
+async def test_loop_claude_cache_marks_let_a_call_after_a_rewrite_read_what_an_earlier_call_wrote() -> None:
+    # Claude reads cache only at a message an earlier call marked with the same prefix. After an observe is
+    # elided, the longest prefix still intact ends just before it, so an earlier call must have marked there.
+    look = _look_tool([])
+    look.issues_handles = True
+    script = [
+        [("observe", {})],
+        [("click", {"selector": "b"})],
+        [("click", {"selector": "c"}), ("observe", {})],
+        [("get_html", {"selector": "#total"})],
+        [("look", {})],
+        [("observe", {})],
+        [("finish", {"status": "completed", "reason": "ok"})],
+    ]
+    outcome, caller = await _run_recording(script, [*_tabbed_page_tools(), look], anthropic_cache_markers=True)
+    assert outcome.status == "completed"
+
+    rewrites = 0
+    for k, (request, points) in enumerate(zip(caller.requests, caller.cache_points)):
+        roles = [json.loads(m)["role"] for m in request]
+        # The last transcript message, not -1: a look image is appended after it for one call only.
+        assert len(points) <= 4 and {0, len(request) - 1} <= set(points), (k, points)
+        assert all(0 <= i < len(request) and roles[i] != "assistant" for i in points), (k, points)
+        previous = caller.requests[k - 1] if k else []
+        changed = next((i for i, m in enumerate(previous) if request[i] != m), None)
+        if changed is None:
+            continue
+        rewrites += 1
+        read_at = max(i for i in range(changed) if roles[i] != "assistant")
+        assert read_at in points, (k, read_at, points)
+        assert any(
+            read_at in caller.cache_points[j] and caller.requests[j][: read_at + 1] == request[: read_at + 1]
+            for j in range(k)
+        ), (k, read_at)
+    assert rewrites == 2
 
 
 @pytest.mark.asyncio
@@ -11920,6 +12594,26 @@ async def test_loop_reads_that_differ_only_in_their_delta_get_the_marker_and_kee
     assert reads[0].startswith("[superseded get_html(selector=#a)")
 
 
+@pytest.mark.asyncio
+async def test_a_re_read_that_differs_only_by_a_download_failure_gets_the_marker_and_keeps_the_failure() -> None:
+    body = "<form #a>" + "y" * 2_000
+    failure = "Request failed: POST /api/export returned HTTP 503"
+    results = [ToolResult.ok(body), ToolResult.ok(f"{body}\n{failure}", data={"download_failure_at": len(body)})]
+
+    async def get_html(_args: dict[str, Any]) -> ToolResult:
+        return results.pop(0)
+
+    reader = _get_html_tool()
+    reader.handler = get_html
+    script = [[("get_html", {"selector": "#a"})], [("get_html", {"selector": "#a"})]]
+    script.append([("finish", {"status": "completed", "reason": "ok"})])
+    outcome, _ = await _run(script, [reader, make_finish_tool()])
+
+    reread = _tool_contents(outcome, "get_html")[1]
+    assert reread.startswith("[get_html(selector=#a) returned the same "), reread[:120]
+    assert reread.endswith(f"\n{failure}")
+
+
 def test_perception_store_does_not_charge_the_unread_round() -> None:
     # SKY-16330. The prompt asks the model to batch, so one turn routinely lands several large reads.
     # Charging that unread round against the budget would let one batch evict every earlier read — and
@@ -12162,6 +12856,65 @@ async def test_extraction_entry_guard_refuses_every_fill_tool_but_not_click(fill
     else:
         assert dispatched == [fill_tool, "click"]
         assert refusals == []
+
+
+def _url_changing_tool(name: str, sink: list[tuple[str, dict[str, Any]]]) -> ToolSpec:
+    # As built in production: neither is billable, navigate records an action row, and the link tool engages the page.
+    async def handler(args: dict[str, Any]) -> ToolResult:
+        sink.append((name, args))
+        return ToolResult.ok(f"{name} done")
+
+    return ToolSpec(
+        name=name,
+        description=name,
+        parameters={"type": "object", "properties": {}},
+        handler=handler,
+        recordable=name == "navigate",
+        engages_page=name == "open_verification_link",
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("refuse", [True, False])
+@pytest.mark.parametrize("url_tool", sorted(loop_module.URL_CHANGING_TOOLS))
+async def test_navigation_guard_refuses_url_changing_tools_but_not_click(url_tool: str, refuse: bool) -> None:
+    assert {"navigate", "open_verification_link"} == loop_module.URL_CHANGING_TOOLS
+    calls: list[tuple[str, dict[str, Any]]] = []
+    tools = [_url_changing_tool(url_tool, calls), _billable_tool("click", calls), make_finish_tool()]
+    script = [
+        [(url_tool, {"url": "https://example.com/case"}), ("finish", {"status": "completed", "reason": "early"})],
+        [("click", {"selector": "#details"})],
+        [("finish", {"status": "completed", "reason": "read"})],
+    ]
+    with capture_logs() as logs:
+        outcome, caller = await _run(script, tools, refuse_navigation=refuse)
+
+    dispatched = [name for name, _ in calls]
+    refusals = [e for e in logs if e["event"] == loop_module.VALIDATION_NAVIGATION_REFUSED_EVENT]
+    results = [m["content"].split(":")[0] for m in caller.message_history if m.get("role") == "tool"]
+    if refuse:
+        assert dispatched == ["click"]
+        assert [e["tool"] for e in refusals] == [url_tool]
+        # The verdict batched behind the refused call was written as if it had landed.
+        assert results[:2] == ["refused", "skipped"]
+        assert outcome.reason == "read"
+    else:
+        assert dispatched == [url_tool]
+        assert refusals == []
+        assert outcome.reason == "early"
+
+
+@pytest.mark.asyncio
+async def test_a_validation_block_that_keeps_navigating_still_ends_on_its_tool_call_cap() -> None:
+    calls: list[tuple[str, dict[str, Any]]] = []
+    script = [[("navigate", {"url": f"https://example.com/case/{i}"})] for i in range(30)]
+    outcome, _ = await _run(
+        script, [_url_changing_tool("navigate", calls), make_finish_tool()], refuse_navigation=True, max_tool_calls=5
+    )
+
+    assert calls == []
+    assert outcome.status == "budget_exhausted"
+    assert "tool-call budget" in outcome.reason
 
 
 @pytest.mark.asyncio
@@ -13034,17 +13787,17 @@ async def test_a_mutation_batched_behind_an_accepted_verdict_never_dispatches() 
 
 @pytest.mark.asyncio
 async def test_hold_gate_snapshot_records_the_verdict_after_a_refused_completion() -> None:
-    # A zero-action finish(completed) refused by a gate above -- here the completion blocker -- is
+    # A zero-action finish(completed) refused by a gate above -- here the verification blocker -- is
     # followed by finish(failed); the snapshot records that failed verdict, not the refused completion.
     activity = ActivityRecency()
     fingerprint, _ = _fingerprint_seq(["fp"])
 
-    async def blocker(_staged: frozenset[str]) -> str | None:
-        return "wait: the download has not started yet"
+    async def verification_blocker(status: str) -> str | None:
+        return "the verification code was never entered" if status == "completed" else None
 
     tools = [
         _perception_tool("observe", _REJECTION_OBSERVE),
-        make_finish_tool(page_fingerprint=fingerprint, activity=activity, completion_blocker=blocker),
+        make_finish_tool(page_fingerprint=fingerprint, activity=activity, verification_blocker=verification_blocker),
     ]
     script = [
         [("observe", {})],

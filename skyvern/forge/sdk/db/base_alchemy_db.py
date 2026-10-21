@@ -10,6 +10,7 @@ from sqlalchemy.exc import DBAPIError, SQLAlchemyError
 from sqlalchemy.ext.asyncio import AsyncConnection, AsyncEngine, AsyncSession, async_sessionmaker
 
 from skyvern.forge.sdk.db.exceptions import DatabaseConnectionUnavailableError
+from skyvern.forge.sdk.db.statement_timeout import is_statement_timeout
 from skyvern.utils.contained_effects import contained_effect
 
 LOG = structlog.get_logger()
@@ -26,11 +27,13 @@ _READ_RECOVERY_BACKOFF_SECONDS = 0.2
 _READ_RECOVERY_CLOSE_SECONDS = 5.0
 
 
-def read_retry(retries: int = 3) -> Callable:
+def read_retry(retries: int = 3, *, log_statement_timeouts: bool = True) -> Callable:
     """Decorator to retry async database operations on transient failures.
 
     Args:
         retries: Maximum number of retry attempts (default: 3)
+        log_statement_timeouts: Whether to log statement cancellations here; disable when an outer
+            layer owns timeout reporting.
     """
 
     def decorator(fn: Callable[..., Any]) -> Callable[..., Any]:
@@ -45,10 +48,12 @@ def read_retry(retries: int = 3) -> Callable:
                     return await fn(base_db, *args, **kwargs)
                 except SQLAlchemyError as e:
                     if not base_db.is_retryable_error(e):
-                        LOG.error("SQLAlchemyError", exc_info=True, attempt=attempt)
+                        if log_statement_timeouts or not is_statement_timeout(e):
+                            LOG.error("SQLAlchemyError", exc_info=True, attempt=attempt)
                         raise
                     if attempt >= retries - 1:
-                        LOG.error("SQLAlchemyError after all retries", exc_info=True, attempt=attempt)
+                        if log_statement_timeouts or not is_statement_timeout(e):
+                            LOG.error("SQLAlchemyError after all retries", exc_info=True, attempt=attempt)
                         raise
 
                     backoff_time = 0.2 * (2**attempt)

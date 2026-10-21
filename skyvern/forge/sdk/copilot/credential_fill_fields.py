@@ -13,4 +13,5 @@ from typing import Literal, get_args
 #   and narrows the other, changing enforcement and persistence behavior.
 CredentialFillField = Literal["username", "password", "totp"]
 CREDENTIAL_FILL_FIELDS: frozenset[str] = frozenset(get_args(CredentialFillField))
+CREDENTIAL_FILL_FIELD_NAMES: tuple[str, ...] = get_args(CredentialFillField)
 LIVE_SCOUT_CREDENTIAL_FIELDS: frozenset[str] = CREDENTIAL_FILL_FIELDS - {"totp"}

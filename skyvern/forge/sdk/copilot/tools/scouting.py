@@ -6,13 +6,14 @@ import json
 import re
 import time
 from collections.abc import AsyncIterator, Mapping, Sequence
-from contextlib import AsyncExitStack, asynccontextmanager, nullcontext
+from contextlib import AbstractAsyncContextManager, AsyncExitStack, asynccontextmanager, nullcontext
 from typing import Any, Literal, NamedTuple, NotRequired, TypedDict, cast
 from urllib.parse import parse_qs, urlparse, urlsplit
 
 import structlog
 from playwright.async_api import BrowserContext, Download, Frame, Page, Response
 
+from skyvern.cli.core.browser_ops import do_screenshot
 from skyvern.config import settings
 from skyvern.forge import app
 from skyvern.forge.sdk.copilot.browser_code_contract import BROWSER_SESSION_UNAVAILABLE_ERROR_CODE
@@ -42,6 +43,7 @@ from skyvern.forge.sdk.copilot.composition_browser_expressions import (
     selector_match_count_expression as _selector_match_count_expression,
 )
 from skyvern.forge.sdk.copilot.composition_evidence import (
+    CANDIDATE_COUNT_KEYS,
     SCOUT_INTERACTION_EVIDENCE_TOOL,
     has_actionable_steer_content,
     has_bounded_page_schema,
@@ -49,6 +51,7 @@ from skyvern.forge.sdk.copilot.composition_evidence import (
     parse_composition_structured,
     post_run_evidence_source_refused,
     stamp_page_evidence_provenance,
+    without_authoring_facts,
 )
 from skyvern.forge.sdk.copilot.context import SIGNED_OUT_PAGE_SUMMARY_CHAR_CAP, SignedOutPageObservation
 from skyvern.forge.sdk.copilot.enforcement import (
@@ -58,6 +61,7 @@ from skyvern.forge.sdk.copilot.enforcement import (
 )
 from skyvern.forge.sdk.copilot.mcp_adapter import (
     BROWSER_SESSION_LOSS_ERROR_CODES,
+    is_redaction_withheld,
     scrub_model_facing_tool_result,
     service_worker_blocked_context,
 )
@@ -70,24 +74,25 @@ from skyvern.forge.sdk.copilot.page_identity import (
 from skyvern.forge.sdk.copilot.runtime import (
     AgentContext,
     PendingBrowserInteractionObservation,
+    ScoutedDragDestination,
     ScoutedInteraction,
     ScoutedSelectorCandidate,
     current_call_browser_session_override,
+    current_demonstrated_action,
     effective_browser_session_id,
     live_working_page,
     raw_secret_browser_denied,
     resolve_browser_state_for_context,
-    sensitive_origin_page_facts_withheld,
-    sensitive_origin_page_has_active_run,
-    sensitive_origin_page_is_tainted,
 )
 from skyvern.forge.sdk.copilot.screenshot_utils import (
+    ProvenanceBinding,
     ScreenshotActionRelation,
     ScreenshotProvenance,
     ViewportFrame,
     consume_screenshot_artifact,
     enqueue_screenshot,
     screenshot_result_facts,
+    screenshot_viewport_css_px,
 )
 from skyvern.forge.sdk.copilot.secret_scrub import (
     REDACTED_SECRET_PLACEHOLDER,
@@ -178,6 +183,10 @@ async def _live_working_page_url(ctx: AgentContext) -> str | None:
 
 async def _capture_scout_source_url(ctx: AgentContext) -> None:
     # Pre-action: a navigating click/Enter would leave only the destination URL, not the page the selector acted on.
+    demonstrated_action = current_demonstrated_action()
+    if demonstrated_action is not None:
+        ctx.pending_scout_source_url = demonstrated_action.source_url
+        return
     source_url = await _live_working_page_url(ctx)
     ctx.pending_scout_source_url = source_url
 
@@ -393,6 +402,11 @@ async def _capture_scout_pre_action(ctx: AgentContext, selector: str | None) -> 
     selector = _selector_text(selector)
     if not selector:
         return
+    demonstrated_action = current_demonstrated_action()
+    if demonstrated_action is not None and selector == demonstrated_action.selector:
+        if demonstrated_action.packet is not None:
+            _apply_scout_pre_action_packet(ctx, selector, demonstrated_action.packet, source="demonstration")
+        return
     parsed = _role_name_from_selector(selector)
     source = "selector" if parsed is not None else "page_read"
     parsed_role, parsed_name = (parsed[0].strip(), parsed[1].strip()) if parsed is not None else ("", "")
@@ -541,44 +555,65 @@ async def _capture_post_interaction_screenshot(
     """
     if ctx.codeblock_redaction_parameters:
         return False
-    if sensitive_origin_page_is_tainted(ctx):
-        return False
     if not ctx.supports_vision:
         return False
     if frame is None:
         frame = await _take_viewport_frame(ctx, timeout_seconds=timeout_seconds)
         if frame is None:
             return False
+    # The provenance reaches the model as text, so its URLs pass the same scrub as a tool result's.
+    urls = scrub_model_facing_tool_result(
+        ctx, {"captured_url": frame.producer_url, "dispatch_url": captured_url}, tool_name=source_tool
+    )
+    if is_redaction_withheld(urls):
+        urls = {}
     return enqueue_screenshot(
         ctx,
         base64.b64encode(frame.png).decode("ascii"),
         provenance=ScreenshotProvenance(
             source_tool=source_tool,
-            captured_url=frame.producer_url,
+            captured_url=urls.get("captured_url"),
             observation_step=observation_step,
             browser_session_id=frame.producer_session_id,
             workflow_run_id=None,
             action_relation=ScreenshotActionRelation.AFTER_SOURCE_ACTION,
-            dispatch_url=captured_url,
+            dispatch_url=urls.get("dispatch_url"),
             dispatch_browser_session_id=frame.dispatch_session_id,
             producer_browser_session_id=frame.producer_session_id,
             session_binding=frame.session_binding,
+            viewport_css_px=frame.viewport_css_px,
         ),
         captured_at=frame.started_at,
     )
 
 
-async def _take_viewport_frame(ctx: AgentContext, *, timeout_seconds: float) -> ViewportFrame | None:
-    """Read the viewport without staging it; withheld during self-heal or on a sensitive-origin page."""
+async def _take_viewport_frame(
+    ctx: AgentContext, *, timeout_seconds: float, page: Page | None = None
+) -> ViewportFrame | None:
+    """Read the viewport without staging it; withheld during self-heal. A given `page` is shot directly,
+    because the broker's current tab does not follow a worker's `switch_tab`."""
     if ctx.codeblock_redaction_parameters:
-        return None
-    if sensitive_origin_page_is_tainted(ctx):
-        return None
-    server = ctx.discovery_mcp_server
-    if server is None:
         return None
     started_at = time.monotonic()
     dispatch_session_id = effective_browser_session_id(ctx)
+    if page is not None:
+        try:
+            shot = await asyncio.wait_for(do_screenshot(page), timeout=timeout_seconds)
+        except Exception as exc:
+            LOG.debug("Copilot viewport frame of the given page failed", error_type=type(exc).__name__)
+            return None
+        return ViewportFrame(
+            png=shot.data,
+            dispatch_session_id=dispatch_session_id,
+            producer_url=page.url,
+            producer_session_id=dispatch_session_id,
+            session_binding=ProvenanceBinding.AGREE,
+            started_at=started_at,
+            viewport_css_px=shot.viewport_css_px,
+        )
+    server = ctx.discovery_mcp_server
+    if server is None:
+        return None
     screenshot_arguments = {"session_id": dispatch_session_id} if dispatch_session_id else {}
     try:
         result = await asyncio.wait_for(
@@ -590,7 +625,7 @@ async def _take_viewport_frame(ctx: AgentContext, *, timeout_seconds: float) -> 
     if not isinstance(result, dict) or not result.get("ok"):
         return None
     png = consume_screenshot_artifact(result)
-    if png is None or sensitive_origin_page_is_tainted(ctx):
+    if png is None:
         return None
     producer_url, producer_session_id, session_binding = screenshot_result_facts(
         result, dispatch_url=None, dispatch_browser_session_id=dispatch_session_id
@@ -602,6 +637,7 @@ async def _take_viewport_frame(ctx: AgentContext, *, timeout_seconds: float) -> 
         producer_session_id=producer_session_id,
         session_binding=session_binding,
         started_at=started_at,
+        viewport_css_px=screenshot_viewport_css_px(result),
     )
 
 
@@ -609,7 +645,7 @@ def _model_visible_selector_candidates(value: Any) -> list[Any]:
     if not isinstance(value, list):
         return []
     return [
-        {key: item for key, item in candidate.items() if key != "match_count"}
+        {key: item for key, item in candidate.items() if key not in CANDIDATE_COUNT_KEYS}
         if isinstance(candidate, dict)
         else candidate
         for candidate in value
@@ -705,6 +741,45 @@ def _record_scout_trajectory_fact(ctx: AgentContext, artifact: ScoutedInteractio
     return recorded
 
 
+def record_scouted_interaction_fact(ctx: AgentContext, artifact: ScoutedInteraction) -> None:
+    redacted_artifact = _scrub_retained_interaction(ctx, _redact_codeblock_value(ctx, artifact))
+    if not isinstance(redacted_artifact, dict) or "tool_name" not in redacted_artifact:
+        return
+    artifact = cast(ScoutedInteraction, redacted_artifact)
+    interactions = [
+        item
+        for item in ctx.scouted_interactions
+        if not (
+            item.get("tool_name") == artifact["tool_name"]
+            and item.get("selector") == artifact.get("selector")
+            and item.get("source_url") == artifact.get("source_url")
+            and item.get("credential_field") == artifact.get("credential_field")
+        )
+    ]
+    interactions.append(artifact)
+    ctx.scouted_interactions = _capped_with_eviction_accounting(interactions, collection="scouted_interactions")
+
+    recorded = _record_scout_trajectory_fact(ctx, artifact)
+    if artifact["tool_name"] == "click":
+        click_records: list[ScoutedInteraction] = [artifact]
+        if recorded is not None:
+            click_records.append(recorded)
+        ctx.pending_scout_click_records = click_records
+
+    LOG.info(
+        "copilot_scout_interaction_captured",
+        tool_name=artifact["tool_name"],
+        selector=artifact.get("selector"),
+        source_url=artifact.get("source_url"),
+        role=artifact.get("role"),
+        credential_field=artifact.get("credential_field"),
+        credential_id=artifact.get("credential_id"),
+        total_scouted_interactions=len(ctx.scouted_interactions),
+        total_scout_trajectory=len(ctx.scout_trajectory),
+    )
+    record_reached_terminal_action_observation(ctx)
+
+
 def _observed_control_readiness(ctx: AgentContext, selector: str, source_url: str) -> tuple[bool, bool]:
     """Return (hidden, disabled) when bounded same-page evidence observed this exact selector unready."""
     packets: list[dict[str, Any]] = []
@@ -760,6 +835,7 @@ _RETAINED_LOCATOR_IDENTITY_FIELDS = (
     "element_fingerprint_test_id",
     "element_fingerprint_tag",
     "element_fingerprint_probed",
+    "destination",
 )
 
 
@@ -799,6 +875,7 @@ def _record_scouted_interaction(
     observation_step: int | None = None,
     key: str = "",
     typed_length: int = 0,
+    destination: ScoutedDragDestination | None = None,
     role: str = "",
     accessible_name: str = "",
     role_name_match_count: int | None = None,
@@ -883,6 +960,8 @@ def _record_scouted_interaction(
         artifact["key"] = key
     if typed_length:
         artifact["typed_length"] = typed_length
+    if destination:
+        artifact["destination"] = destination
     if role:
         artifact["role"] = role
     if accessible_name:
@@ -920,44 +999,7 @@ def _record_scouted_interaction(
         artifact["element_fingerprint_probed"] = element_fingerprint_probed
     if ambiguous:
         artifact["ambiguous"] = True
-    redacted_artifact = _scrub_retained_interaction(ctx, _redact_codeblock_value(ctx, artifact))
-    if not isinstance(redacted_artifact, dict) or "tool_name" not in redacted_artifact:
-        return
-    artifact = cast(ScoutedInteraction, redacted_artifact)
-    interactions = [
-        item
-        for item in ctx.scouted_interactions
-        if not (
-            item.get("tool_name") == artifact["tool_name"]
-            and item.get("selector") == artifact.get("selector")
-            and item.get("source_url") == artifact.get("source_url")
-            and item.get("credential_field") == artifact.get("credential_field")
-        )
-    ]
-    interactions.append(artifact)
-    ctx.scouted_interactions = _capped_with_eviction_accounting(interactions, collection="scouted_interactions")
-
-    recorded = _record_scout_trajectory_fact(ctx, artifact)
-    if artifact["tool_name"] == "click":
-        # Both collections hold their own object for this click, and an effect observed after the
-        # fact updates these rather than re-finding them by an identity the scrub may have removed.
-        click_records: list[ScoutedInteraction] = [artifact]
-        if recorded is not None:
-            click_records.append(recorded)
-        ctx.pending_scout_click_records = click_records
-
-    LOG.info(
-        "copilot_scout_interaction_captured",
-        tool_name=artifact["tool_name"],
-        selector=artifact.get("selector"),
-        source_url=artifact.get("source_url"),
-        role=artifact.get("role"),
-        credential_field=artifact.get("credential_field"),
-        credential_id=artifact.get("credential_id"),
-        total_scouted_interactions=len(ctx.scouted_interactions),
-        total_scout_trajectory=len(ctx.scout_trajectory),
-    )
-    record_reached_terminal_action_observation(ctx)
+    record_scouted_interaction_fact(ctx, artifact)
 
 
 def _attach_scout_observation_step(
@@ -1069,7 +1111,9 @@ _PAGE_EVIDENCE_STATE_KEYS = (
 
 
 def _page_evidence_state(packet: dict[str, Any]) -> dict[str, Any]:
-    """Return DOM-observed structure without visual augmentation or transport metadata."""
+    """Return DOM-observed structure without visual augmentation, transport metadata or authoring facts:
+    pointer states change with scroll, and can tip the capture over its bound, which drops the visible counts."""
+    packet = without_authoring_facts(packet)
     state = {key: packet.get(key) for key in _PAGE_EVIDENCE_STATE_KEYS}
     page_obstructions = packet.get("page_obstructions")
     state["page_obstructions"] = (
@@ -1258,9 +1302,6 @@ async def _register_scout_interaction_observation(
     # A successful scout interaction reaches the post-action page; record it as an
     # interaction-reached observation so a click-reached block can be authored
     # against it without a separate inspect_page_for_composition.
-    origin_run_id = getattr(ctx, "last_run_blocks_workflow_run_id", None)
-    if sensitive_origin_page_facts_withheld(ctx, origin_run_id):
-        return None, None
     selector = _selector_text(selector)
     if not selector or not url:
         return None, None
@@ -1297,10 +1338,6 @@ async def _register_scout_interaction_observation(
             observed_after_interaction=True,
             prior_page_evidence=prior_page_evidence,
         )
-        if sensitive_origin_page_facts_withheld(ctx, origin_run_id):
-            ctx.last_scout_act_observe_outcome = None
-            ctx.last_scout_act_observe_packet = None
-            return None, None
         if parsed is not None:
             scrubbed_parsed = scrub_secrets_from_structure(ctx, parsed)
             parsed = scrubbed_parsed if isinstance(scrubbed_parsed, dict) else None
@@ -2273,13 +2310,7 @@ class PageState(TypedDict):
 
 
 def unread_page_state(ctx: AgentContext) -> PageState:
-    if _page_location_withheld(ctx):
-        return {"read": "failed", "challenge_vendor": None}
     return {"read": "failed", "url": None, "title": None, "challenge_vendor": None}
-
-
-def _page_location_withheld(ctx: AgentContext) -> bool:
-    return sensitive_origin_page_is_tainted(ctx) or sensitive_origin_page_has_active_run(ctx)
 
 
 _PAGE_UNREADABLE_ERROR_CODES = BROWSER_SESSION_LOSS_ERROR_CODES | {BROWSER_SESSION_UNAVAILABLE_ERROR_CODE}
@@ -2292,11 +2323,10 @@ def page_state_probe_allowed(
         (binding is not None and binding.unavailable_reason)
         or raw_secret_browser_denied(ctx)
         or result.get("error_code") in _PAGE_UNREADABLE_ERROR_CODES
-        or sensitive_origin_page_has_active_run(ctx)
     )
 
 
-async def read_page_state(
+async def read_page_state_on_page(
     ctx: AgentContext,
     *,
     tool_name: str,
@@ -2304,13 +2334,12 @@ async def read_page_state(
     binding: BrowserSessionBinding | None,
     probe: bool = True,
     settle: bool = False,
-    custody_lock: asyncio.Lock | None = None,
-) -> PageState:
-    """What the call's browser shows now, scrubbed for the model, or the unread state without touching a browser
-    the call may not probe. A vendor frame that could not be measured makes the read fail rather than report no
-    challenge."""
+    custody_lock: AbstractAsyncContextManager[None] | None = None,
+) -> tuple[PageState, Page | None]:
+    """What the call's browser shows now, scrubbed for the model, and the page read, or the unread state and None
+    without touching a browser the call may not probe. An unmeasured vendor frame fails the read, not "no challenge"."""
     if not (probe and page_state_probe_allowed(ctx, result, binding=binding)):
-        return unread_page_state(ctx)
+        return unread_page_state(ctx), None
     deadline = _PAGE_STATE_READ_TIMEOUT_SECONDS
     if settle:
         deadline += settings.COPILOT_SCOUT_ACT_OBSERVE_RECAPTURE_DELAY_SECONDS
@@ -2326,8 +2355,6 @@ async def read_page_state(
     else:
         if isinstance(reading, str):
             failure = reading
-        elif _page_location_withheld(ctx):
-            return {"read": "ok", "challenge_vendor": reading.vendor}
         else:
             url = screened_recorded_url(reading.url)[0]
             state: PageState = {
@@ -2339,7 +2366,7 @@ async def read_page_state(
             }
             scrubbed = scrub_model_facing_tool_result(ctx, {"page_state": state}).get("page_state")
             if isinstance(scrubbed, dict):
-                return cast(PageState, scrubbed)
+                return cast(PageState, scrubbed), reading.page
             failure = "scrubbed_away"
     LOG.info(
         "copilot_page_state_read_failed",
@@ -2348,13 +2375,14 @@ async def read_page_state(
         reason=failure,
         duration_ms=round((time.monotonic() - started) * 1000),
     )
-    return unread_page_state(ctx)
+    return unread_page_state(ctx), None
 
 
 class _LivePageReading(NamedTuple):
     url: str
     title: str
     vendor: str | None
+    page: Page
 
 
 _PageStateReadFailure = Literal["no_page", "vendor_frame_unmeasured", "unreadable_location", "navigated_during_read"]
@@ -2383,7 +2411,7 @@ async def _read_live_page_state(ctx: AgentContext, *, settle: bool) -> _LivePage
     # A navigation between the vendor probe and the title read would pair one document's vendor with another's.
     if url != url_before:
         return "navigated_during_read"
-    return _LivePageReading(url, title, vendor)
+    return _LivePageReading(url, title, vendor, page)
 
 
 def _child_frames(page: Page) -> list[Frame]:

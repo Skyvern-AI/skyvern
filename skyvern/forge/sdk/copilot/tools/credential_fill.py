@@ -3,7 +3,6 @@ from __future__ import annotations
 import asyncio
 import time
 from collections.abc import Awaitable, Callable
-from copy import deepcopy
 from dataclasses import dataclass
 from dataclasses import field as dataclass_field
 from dataclasses import replace
@@ -25,7 +24,7 @@ from skyvern.forge.sdk.copilot.blocker_signal import (
 from skyvern.forge.sdk.copilot.code_block_synthesis import CREDENTIAL_FILL_TOOL_NAME
 from skyvern.forge.sdk.copilot.config import CopilotConfig
 from skyvern.forge.sdk.copilot.context import CopilotContext, advertises
-from skyvern.forge.sdk.copilot.credential_fill_fields import CREDENTIAL_FILL_FIELDS
+from skyvern.forge.sdk.copilot.credential_fill_fields import CREDENTIAL_FILL_FIELD_NAMES, CREDENTIAL_FILL_FIELDS
 from skyvern.forge.sdk.copilot.credential_generation import (
     REGISTRATION_PASSWORD_MAX_LENGTH,
     REGISTRATION_PASSWORD_MIN_LENGTH,
@@ -37,11 +36,13 @@ from skyvern.forge.sdk.copilot.credential_pause import (
     defang_card_text,
     raw_secret_card_origin,
     request_credential_pause,
+    signed_in_facts,
 )
 from skyvern.forge.sdk.copilot.credential_resolution import is_resolved_page_url, load_credentials, url_parts
 from skyvern.forge.sdk.copilot.loop_detection import record_tool_step_result_for_ctx
 from skyvern.forge.sdk.copilot.page_identity import safe_page_origin
 from skyvern.forge.sdk.copilot.request_policy import (
+    DemonstrationNavigationSiteURLSource,
     QuestionResponseSiteURLSource,
     RequestPolicy,
     SiteURLSource,
@@ -51,17 +52,15 @@ from skyvern.forge.sdk.copilot.request_policy import (
     loggable_origin,
 )
 from skyvern.forge.sdk.copilot.runtime import (
-    SENSITIVE_ORIGIN_PAGE_ERROR,
     AgentContext,
     CredentialOriginDeclineStatus,
     CredentialOriginRecovery,
     ScoutedSelectorCandidate,
     browser_evidence_commit_lock,
-    browser_page_custody_lock,
+    browser_session_turn,
     effective_browser_session_id,
     ensure_browser_session,
     mcp_browser_context,
-    sensitive_origin_page_facts_withheld,
 )
 from skyvern.forge.sdk.copilot.secret_scrub import (
     REDACTED_SECRET_PLACEHOLDER,
@@ -84,6 +83,7 @@ from skyvern.forge.sdk.schemas.credentials import (
 )
 from skyvern.forge.sdk.schemas.workflow_copilot import CredentialRegistration, WorkflowCopilotCredentialRegistration
 from skyvern.forge.sdk.services.credentials import generate_totp_code, normalize_totp_config
+from skyvern.forge.sdk.services.request_principal import get_request_principal
 from skyvern.webeye.utils.dom import is_post_dispatch_click_timeout
 
 from ._shared import _emit_tool_blocker_signal
@@ -124,31 +124,6 @@ _CREDENTIAL_FILL_FIELDS = CREDENTIAL_FILL_FIELDS
 _CREDENTIAL_FILL_TIMEOUT_MS = 15000
 _CREDENTIAL_FILL_READBACK_TIMEOUT_SECONDS = 3.0
 _CREDENTIAL_SUBMIT_TIMEOUT_MS = 5000
-
-_CREDENTIAL_FILL_ROLLBACK_FIELDS = (
-    "flow_evidence",
-    "composition_page_evidence",
-    "workflow_verification_evidence",
-    "pending_browser_interaction_observation",
-    "scouted_interactions",
-    "scout_trajectory",
-    "pending_scout_source_url",
-    "post_run_page_observation_tool",
-    "post_run_page_observation_url",
-    "post_run_page_observation_workflow_run_id",
-    "post_run_page_observation_after_failed_test",
-    "post_run_page_observation_generation",
-    "latest_recorded_build_test_outcome",
-    "recorded_build_test_outcome_history",
-    "recorded_persisted_block_run_workflow_run_id",
-    "last_scout_observation_trajectory_index",
-    "last_scout_observation_has_password_control",
-    "scouted_output_covered_paths",
-    "scout_observed_terminal_criterion_ids",
-    "scout_observation_contract",
-    "last_scout_act_observe_outcome",
-    "last_scout_act_observe_packet",
-)
 
 
 @dataclass(frozen=True)
@@ -250,6 +225,7 @@ def _credential_origin_recovery_error(recovery: CredentialOriginRecovery) -> str
 
 
 def _start_credential_origin_recovery(copilot_ctx: AgentContext, origin: str, credential_id: str) -> dict[str, Any]:
+    copilot_ctx.credential_origin_refusals.add((origin, credential_id))
     current = copilot_ctx.credential_origin_recovery
     if current is not None and (current.state != "pending" or current.origin != origin):
         return {"ok": False, "error": _credential_origin_recovery_error(current)}
@@ -308,10 +284,19 @@ def _decline_credential_origin_recovery(
 async def _credential_evidence_admits_origin(
     copilot_ctx: AgentContext, recovery: CredentialOriginRecovery, credential: Credential
 ) -> bool:
-    """Whether the credential itself places it on the recovery origin, and nowhere else."""
-    if credential.credential_id == recovery.refused_credential_id:
+    """Whether the credential itself places it on the recovery origin, and nowhere else, and no fill on that site
+    refused it this turn."""
+    refused_on_site = {recovery.refused_credential_id} | {
+        refused_id
+        for origin, refused_id in copilot_ctx.credential_origin_refusals
+        if same_release_scope(origin, recovery.origin)
+    }
+    if credential.credential_id in refused_on_site:
         return False
-    vault_sites = await _read_vault_named_sites(copilot_ctx, credential.credential_id)
+    try:
+        vault_sites = await _read_vault_named_sites(copilot_ctx, credential.credential_id)
+    except PermissionError:
+        return False
     if vault_sites is None:
         return False
     evidence = ([credential.tested_url] if credential.tested_url else []) + vault_sites
@@ -425,6 +410,11 @@ async def _vault_named_sites(copilot_ctx: AgentContext, credential_id: str) -> l
 
 async def _read_vault_named_sites(copilot_ctx: AgentContext, credential_id: str) -> list[str] | None:
     """Sites the credential's own vault entry names (only Bitwarden items carry any), or None when the read failed."""
+    await app.AGENT_FUNCTION.enforce_credential_use(
+        copilot_ctx.organization_id,
+        credential_id,
+        principal=get_request_principal(),
+    )
     cached = copilot_ctx.vault_login_uris_by_credential_id.get(credential_id)
     if cached is not None:
         return cached
@@ -446,9 +436,17 @@ async def _read_vault_named_sites(copilot_ctx: AgentContext, credential_id: str)
     return uris
 
 
-def _missing_credential_origin_error(credential_id: str, page_url: str | None) -> str:
+def _missing_credential_origin_error(credential_id: str, page_url: str | None, *, user_named: bool = False) -> str:
     if page_url:
         origin = loggable_origin(page_url)
+        if user_named:
+            return (
+                f"Credential `{credential_id}` has no established login origin for {origin}. "
+                f"The user already named this login; they have not yet confirmed it for {origin}. "
+                f"Call `request_credential` with the sign-in page URL on {origin} and without `credential_id`; "
+                "the card offers this login for the user to confirm for that site. Unless that call says the "
+                "card is unavailable, do not ask the user to select or add a login again."
+            )
         return (
             f"Credential `{credential_id}` has no established login origin for {origin}. "
             f"Call `request_credential` with the sign-in page URL on {origin} so the user can "
@@ -473,6 +471,8 @@ def _log_fill_grant(
         source_fields = {"source_kind": source.kind, "source_interaction_id": source.interaction_id}
     elif isinstance(source, SteerMessageSiteURLSource):
         source_fields = {"source_kind": source.kind, "source_steer_id": source.steer_id}
+    elif isinstance(source, DemonstrationNavigationSiteURLSource):
+        source_fields = {"source_kind": source.kind}
     LOG.info(
         "copilot credential fill grant",
         route=route,
@@ -552,6 +552,9 @@ def _password_totp_method(credential: PasswordCredential) -> Literal["authentica
     return "none"
 
 
+_HAS_CODE_METHOD_DETAIL = "This credential already has a one-time-code method, so no update card was shown."
+
+
 def _rejected_credential_card_fallback(credential_name: str) -> str:
     return (
         f"Ask the user in prose to update the saved credential {defang_card_text(credential_name)} on the "
@@ -586,7 +589,12 @@ async def _update_ask_target(
         return credential_item.name, None
     method = _password_totp_method(credential)
     if method == "authenticator":
-        result: dict[str, Any] = {"ok": True, "status": "has_code_method", "method": "authenticator"}
+        result: dict[str, Any] = {
+            "ok": True,
+            "status": "has_code_method",
+            "method": "authenticator",
+            "detail": _HAS_CODE_METHOD_DETAIL,
+        }
         if advertises(copilot_ctx, CREDENTIAL_FILL_TOOL_NAME):
             result["next"] = (
                 f"Fill the code with `{CREDENTIAL_FILL_TOOL_NAME}` field=totp for `{credential_id}`, passing the "
@@ -598,6 +606,7 @@ async def _update_ask_target(
             "ok": True,
             "status": "has_code_method",
             "method": "email_or_text",
+            "detail": _HAS_CODE_METHOD_DETAIL,
             "next": _runtime_otp_steering_error(credential_id),
         }
     return credential_item.name, None
@@ -676,23 +685,43 @@ async def _request_credential(
             return {
                 "ok": False,
                 "error": (
-                    "This turn has a redacted secret, so the credential card opens only for a sign-in site the "
-                    "user gave. Ask the user for the site's sign-in URL, then call `request_credential` with it."
+                    "This turn withheld a value that may be a secret, so the credential card opens only for a "
+                    "sign-in site the user gave. Ask the user for the site's sign-in URL, then call "
+                    "`request_credential` with it."
                 ),
             }
 
     recovery_open = copilot_ctx.credential_origin_recovery
     # The authenticator update card grants no origin, so it has its own latch and never spends the recovery's.
-    recovery = (
-        recovery_open
-        if not credential_id
-        and recovery_open is not None
-        and recovery_open.state == "pending"
-        and ask_origin.canonical == recovery_open.origin
-        else None
+    # Any pick ask on a site where a fill was refused this turn gets a recovery card, so a plain card cannot bind a
+    # refused login there.
+    on_recovery_site = (
+        None
+        if credential_id
+        else next(
+            (
+                earlier
+                for earlier in (
+                    recovery_open,
+                    *(
+                        CredentialOriginRecovery(origin, "declined", refused_id)
+                        for origin, refused_id in sorted(copilot_ctx.credential_origin_refusals)
+                    ),
+                )
+                if earlier is not None and same_release_scope(login_page_url, earlier.origin)
+            ),
+            None,
+        )
     )
-    # The spent card, if any, asked for a different site; this ask has a refused fill behind it.
-    handback = recovery is not None and recovery.origin not in copilot_ctx.credential_origin_recovery_carded
+    recovery: CredentialOriginRecovery | None = None
+    if on_recovery_site is not None:
+        if recovery_open is not None and recovery_open.state == "pending" and on_recovery_site is not recovery_open:
+            return {"ok": False, "error": _credential_origin_recovery_error(recovery_open)}
+        recovery = (
+            on_recovery_site
+            if on_recovery_site.state == "pending" and on_recovery_site.origin == ask_origin.canonical
+            else CredentialOriginRecovery(ask_origin.canonical, "pending", on_recovery_site.refused_credential_id)
+        )
 
     update_name: str | None = None
     site_rejected = bool(credential_id) and rejected_by_site
@@ -703,26 +732,17 @@ async def _request_credential(
     update_ask = update_name is not None
 
     # The update ask awaits the vault above, so a card raised meanwhile by a parallel call must still win.
-    already_asked = copilot_ctx.credential_ask_in_flight or (
-        copilot_ctx.credential_totp_update_asked if update_ask else copilot_ctx.credential_pause_used and not handback
-    )
-    if already_asked and (recovery is None or copilot_ctx.credential_ask_in_flight):
-        already: dict[str, Any] = {
+    if copilot_ctx.credential_ask_in_flight:
+        return {
             "ok": True,
             "status": "already_asked",
-            "next": "Continue without re-asking this turn.",
+            "next": "A credential card is already open; its answer returns on the call that opened it.",
         }
-        # The outcome belongs to the pick card; the update card keeps none.
-        if update_name is None:
-            already["outcome"] = copilot_ctx.credential_pause_outcome or "unanswered"
-        return already
+    if update_ask and copilot_ctx.credential_totp_update_asked:
+        return {"ok": True, "status": "already_asked", "next": "Continue without re-asking this turn."}
 
     config = copilot_ctx.copilot_config
-    if config is None or not credential_pause_transport_ready(
-        copilot_ctx, config, allow_second_ask=update_ask or handback
-    ):
-        if recovery is not None and not handback:
-            return _decline_credential_origin_recovery(copilot_ctx, recovery, "already_asked")
+    if config is None or not credential_pause_transport_ready(copilot_ctx, config):
         _log_credential_card_unavailable(copilot_ctx, config)
         if recovery is not None:
             return _decline_credential_origin_recovery(copilot_ctx, recovery, "unavailable")
@@ -743,7 +763,7 @@ async def _request_credential(
     if recovery is not None:
         login_page_url = urlunsplit(urlsplit(login_page_url)._replace(query="", fragment=""))
         copilot_ctx.credential_origin_recovery = replace(recovery, state="asked")
-        copilot_ctx.credential_origin_recovery_carded.add(recovery.origin)
+        copilot_ctx.credential_origin_refusals.add((recovery.origin, recovery.refused_credential_id))
         admit_connected = partial(_credential_evidence_admits_origin, copilot_ctx, recovery)
     named_before_ask = set(policy.current_turn_named_credential_ids)
     if update_name is None:
@@ -758,7 +778,6 @@ async def _request_credential(
             update_credential_id=credential_id if update_name is not None else None,
             update_reason="credential_rejected_by_site" if site_rejected else "credential_missing_totp",
             admit_connected=admit_connected,
-            allow_second_ask=handback,
             anchor_tool_call_id=anchor_tool_call_id,
             registration=card_registration,
         )
@@ -791,7 +810,10 @@ async def _request_credential(
         copilot_ctx.credential_origin_recovery = None
         policy.origin_recovery_kept_named_credential_ids |= named_before_ask & {recovery.refused_credential_id}
         clear_tool_blocker_signals_for_reason_codes(
-            copilot_ctx, frozenset({CREDENTIAL_ORIGIN_RECOVERY_PENDING_REASON_CODE})
+            copilot_ctx,
+            frozenset(
+                {CREDENTIAL_ORIGIN_RECOVERY_PENDING_REASON_CODE, CREDENTIAL_ORIGIN_RECOVERY_DECLINED_REASON_CODE}
+            ),
         )
     registration_outcome = copilot_ctx.credential_registration_outcome if card_registration is not None else None
     registration_note = _REGISTRATION_OUTCOME_NOTES[registration_outcome] if registration_outcome is not None else {}
@@ -804,8 +826,8 @@ async def _request_credential(
         }
         if card_registration is None:
             unanswered["next"] = (
-                "The user did not answer the card. Continue without the credential: keep the credential "
-                "parameter placeholder in the draft and do not ask again this turn."
+                "The user did not answer the card, so no credential was connected. Keep the credential parameter "
+                "placeholder in the draft."
             )
         return unanswered
     if resolution.signed_in is not None:
@@ -817,22 +839,23 @@ async def _request_credential(
             "browser_profile_name": defang_card_text(resolution.signed_in.profile_name),
             "cookie_count": resolution.signed_in.cookie_count,
             "credential_provided": False,
+            "detail": signed_in_facts(resolution.signed_in),
         }
     if resolution.action == "connected" and credential is None:
         return {
             "ok": True,
             "status": "connected_unresolved",
             "next": (
-                "The credential the user connected could not be loaded. Continue without it: keep the credential "
-                "parameter placeholder in the draft and do not ask again this turn."
+                "The credential the user connected could not be loaded, so none was connected. Keep the credential "
+                "parameter placeholder in the draft."
             ),
         }
     if credential is None:
         skipped: dict[str, Any] = {"ok": True, "status": "skipped", **registration_note}
         if card_registration is None:
             skipped["next"] = (
-                "The user chose not to connect a credential now. Keep the credential parameter placeholder "
-                "in the draft, do not ask again this turn, and say a test run may stop at the login step."
+                "The user chose not to connect a credential on this card. Keep the credential parameter placeholder "
+                "in the draft, and say a test run may stop at the login step."
             )
         return skipped
     connected: dict[str, Any] = {
@@ -884,6 +907,7 @@ async def _missing_totp_ask_outcome(
     return {
         **rechecked,
         "status": "authenticator_added",
+        "detail": "The saved credential now has a one-time-code method.",
         "credential_id": credential.credential_id,
         "credential_name": credential.name,
     }
@@ -1015,7 +1039,11 @@ async def _credential_fill_origin_grant(
                     )
                     return _CredentialFillOriginGrant(page_url, whole_site=site_level), None
                 return None, _ambiguous_unbound_credential_steer(credential_id, page_url)
-        return None, _missing_credential_origin_error(credential_id, page_url or None)
+        return None, _missing_credential_origin_error(
+            credential_id,
+            page_url or None,
+            user_named=policy.current_turn_named_credential_ids == {credential_id},
+        )
 
     if not isinstance(policy, RequestPolicy):
         return None, authority_error
@@ -1038,6 +1066,14 @@ async def _credential_fill_origin_grant(
 async def _load_vault_credential_item(
     copilot_ctx: AgentContext, credential_id: str
 ) -> tuple[CredentialItem | None, str]:
+    try:
+        await app.AGENT_FUNCTION.enforce_credential_use(
+            copilot_ctx.organization_id,
+            credential_id,
+            principal=get_request_principal(),
+        )
+    except PermissionError:
+        return None, "Credential not accessible."
     try:
         db_credential = await app.DATABASE.credentials.get_credential(
             credential_id, organization_id=copilot_ctx.organization_id
@@ -1329,7 +1365,7 @@ async def _submit_after_credential_fill(
     )
 
 
-async def _fill_credential_field_impl(
+async def fill_credential_field(
     copilot_ctx: AgentContext,
     selector: str,
     credential_id: str,
@@ -1340,7 +1376,7 @@ async def _fill_credential_field_impl(
     if not isinstance(lock, asyncio.Lock):
         lock = asyncio.Lock()
         copilot_ctx.credential_fill_lock = lock
-    async with lock, browser_page_custody_lock(copilot_ctx), browser_evidence_commit_lock(copilot_ctx):
+    async with lock, browser_session_turn(copilot_ctx), browser_evidence_commit_lock(copilot_ctx):
         return await _fill_credential_field_impl_serial(copilot_ctx, selector, credential_id, field, submit_selector)
 
 
@@ -1354,29 +1390,14 @@ async def _fill_credential_field_impl_serial(
     arguments: dict[str, Any] = {"selector": selector, "credential_id": credential_id, "field": field}
     if submit_selector:
         arguments["submit_selector"] = submit_selector
-    context_values = vars(copilot_ctx)
-    rollback_snapshot = {
-        field_name: deepcopy(context_values[field_name])
-        for field_name in _CREDENTIAL_FILL_ROLLBACK_FIELDS
-        if field_name in context_values
-    }
-    origin_run_id = copilot_ctx.last_run_blocks_workflow_run_id
 
     def finish(result: dict[str, Any]) -> dict[str, Any]:
-        if sensitive_origin_page_facts_withheld(copilot_ctx, origin_run_id):
-            # The custody lock excludes every other model browser evidence commit while this call
-            # runs, so restoring this transaction cannot remove facts owned by a parallel tool.
-            for field_name, value in rollback_snapshot.items():
-                setattr(copilot_ctx, field_name, deepcopy(value))
-            result = {"ok": False, "error": SENSITIVE_ORIGIN_PAGE_ERROR}
         record_tool_step_result_for_ctx(copilot_ctx, "fill_credential_field", arguments, result)
         return result
 
     authority_error = _authority_tool_error(copilot_ctx, "fill_credential_field")
     if authority_error:
         return finish({"ok": False, "error": authority_error})
-    if sensitive_origin_page_facts_withheld(copilot_ctx, origin_run_id):
-        return finish({"ok": False, "error": SENSITIVE_ORIGIN_PAGE_ERROR})
 
     selector = (selector or "").strip()
     submit_selector = (submit_selector or "").strip()
@@ -1385,8 +1406,16 @@ async def _fill_credential_field_impl_serial(
     if not selector:
         return finish({"ok": False, "error": "fill_credential_field requires a CSS selector for the input field."})
     if field not in _CREDENTIAL_FILL_FIELDS:
-        return finish({"ok": False, "error": "fill_credential_field `field` must be one of: username, password, totp."})
-    origin_grant, policy_error = await _credential_fill_origin_grant(copilot_ctx, credential_id)
+        return finish(
+            {
+                "ok": False,
+                "error": f"fill_credential_field `field` must be one of: {', '.join(CREDENTIAL_FILL_FIELD_NAMES)}.",
+            }
+        )
+    try:
+        origin_grant, policy_error = await _credential_fill_origin_grant(copilot_ctx, credential_id)
+    except PermissionError:
+        return finish({"ok": False, "error": "Credential not accessible."})
     if policy_error or origin_grant is None:
         LOG.info(
             "copilot fill_credential_field rejected tool-side",
@@ -1401,11 +1430,7 @@ async def _fill_credential_field_impl_serial(
         session_error = await ensure_browser_session(copilot_ctx)
         if session_error:
             return finish(session_error)
-    if sensitive_origin_page_facts_withheld(copilot_ctx, origin_run_id):
-        return finish({"ok": False, "error": SENSITIVE_ORIGIN_PAGE_ERROR})
     await _capture_scout_source_url(copilot_ctx)
-    if sensitive_origin_page_facts_withheld(copilot_ctx, origin_run_id):
-        return finish({"ok": False, "error": SENSITIVE_ORIGIN_PAGE_ERROR})
     # Capture each target's factual identity before the secret-bearing action; a fill can change
     # attributes, trigger framework replacement, or navigate, so a later read describes a different
     # element. These facts never include the credential value.
@@ -1413,13 +1438,9 @@ async def _fill_credential_field_impl_serial(
     submit_probe = (
         await _probe_scout_target(copilot_ctx, submit_selector, fingerprint=False) if submit_selector else None
     )
-    if sensitive_origin_page_facts_withheld(copilot_ctx, origin_run_id):
-        return finish({"ok": False, "error": SENSITIVE_ORIGIN_PAGE_ERROR})
     fingerprint = fill_probe.fingerprint
 
     value, credential_name, resolve_error = await _resolve_credential_fill_value(copilot_ctx, credential_id, field)
-    if sensitive_origin_page_facts_withheld(copilot_ctx, origin_run_id):
-        return finish({"ok": False, "error": SENSITIVE_ORIGIN_PAGE_ERROR})
     # Started here rather than before the resolver, whose credential read and enterprise-secret
     # normalization precede the generation and would be counted as code age they are not. Nothing
     # between the generation and this line touches the network. From here only the fill's own readback
@@ -1479,8 +1500,6 @@ async def _fill_credential_field_impl_serial(
         )
 
     assert fill_outcome is not None
-    if sensitive_origin_page_facts_withheld(copilot_ctx, origin_run_id):
-        return finish({"ok": False, "error": SENSITIVE_ORIGIN_PAGE_ERROR})
 
     _clear_pending_browser_interaction_observation(copilot_ctx)
     source_url = _consume_scout_source_url(copilot_ctx)
@@ -1496,8 +1515,6 @@ async def _fill_credential_field_impl_serial(
         # one the fill acted on distinguishes the two, and it is read here rather than up front
         # because every other path reaches this point having already landed.
         landed_url = await _live_working_page_url(copilot_ctx) or ""
-        if sensitive_origin_page_facts_withheld(copilot_ctx, origin_run_id):
-            return finish({"ok": False, "error": SENSITIVE_ORIGIN_PAGE_ERROR})
         # Compared at origin+path, not as raw strings: a rejected code re-renders the same page at
         # ?error=..., and reading that as a navigation would report a fill nobody saw land.
         landed_parts = url_parts(landed_url) if landed_url else None
@@ -1532,8 +1549,6 @@ async def _fill_credential_field_impl_serial(
         }
         return finish(landing_failure)
     url = await _live_working_page_url(copilot_ctx) or ""
-    if sensitive_origin_page_facts_withheld(copilot_ctx, origin_run_id):
-        return finish({"ok": False, "error": SENSITIVE_ORIGIN_PAGE_ERROR})
     _record_scouted_interaction(
         copilot_ctx,
         tool_name="fill_credential_field",
@@ -1600,8 +1615,6 @@ async def _fill_credential_field_impl_serial(
             mint_started=mint_started,
             secret_value=value,
         )
-        if sensitive_origin_page_facts_withheld(copilot_ctx, origin_run_id):
-            return finish({"ok": False, "error": SENSITIVE_ORIGIN_PAGE_ERROR})
         if submit.clicked:
             data["submitted"] = True
             data["submit_selector"] = submit_probe.selector
@@ -1648,8 +1661,6 @@ async def _fill_credential_field_impl_serial(
             source_url=source_url,
             url=url,
         )
-        if sensitive_origin_page_facts_withheld(copilot_ctx, origin_run_id):
-            return finish({"ok": False, "error": SENSITIVE_ORIGIN_PAGE_ERROR})
     _mark_pending_browser_interaction_observation(copilot_ctx, tool_name=observed_tool, url=observed_url)
     # An act-observe that cannot reach the discovery server leaves the previous click's outcome in
     # place, which would be stamped onto this submit's evidence as though it described this page.
@@ -1662,8 +1673,6 @@ async def _fill_credential_field_impl_serial(
         source_url=observed_source_url,
         url=observed_url,
     )
-    if sensitive_origin_page_facts_withheld(copilot_ctx, origin_run_id):
-        return finish({"ok": False, "error": SENSITIVE_ORIGIN_PAGE_ERROR})
     _attach_scout_observation_step(
         copilot_ctx,
         tool_name=observed_tool,
@@ -1680,8 +1689,6 @@ async def _fill_credential_field_impl_serial(
             _attach_scout_page_summary(copilot_ctx, result, page_evidence)
     else:
         form_submits = await _capture_enclosing_form_submits(copilot_ctx, selector)
-        if sensitive_origin_page_facts_withheld(copilot_ctx, origin_run_id):
-            return finish({"ok": False, "error": SENSITIVE_ORIGIN_PAGE_ERROR})
         if form_submits:
             data["form_submit_controls"] = form_submits
     await _capture_post_interaction_screenshot(
@@ -1690,8 +1697,6 @@ async def _fill_credential_field_impl_serial(
         captured_url=observed_url,
         observation_step=observation_step,
     )
-    if sensitive_origin_page_facts_withheld(copilot_ctx, origin_run_id):
-        return finish({"ok": False, "error": SENSITIVE_ORIGIN_PAGE_ERROR})
     LOG.info(
         "copilot fill_credential_field filled a saved credential field",
         selector=selector,

@@ -5,7 +5,7 @@ import functools
 import os
 import time
 from collections.abc import AsyncIterator, Iterable
-from contextlib import asynccontextmanager
+from contextlib import asynccontextmanager, suppress
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime
 from typing import TYPE_CHECKING, TypedDict
@@ -25,7 +25,11 @@ from skyvern.forge import app
 from skyvern.forge.sdk.api.files import resolve_run_download_id
 from skyvern.forge.sdk.core import skyvern_context
 from skyvern.forge.sdk.db.id import WORKFLOW_RUN_PREFIX
-from skyvern.forge.sdk.schemas.persistent_browser_sessions import PersistentBrowserSession
+from skyvern.forge.sdk.schemas.persistent_browser_sessions import (
+    PersistentBrowserSession,
+    is_external_cdp_session,
+    lost_external_browser_error,
+)
 from skyvern.forge.sdk.schemas.tasks import Task
 from skyvern.forge.sdk.streaming.registries import (
     complete_stream_teardown,
@@ -78,7 +82,7 @@ from skyvern.webeye.display_recorder import (
     stop_display_recorders_for_owner,
 )
 from skyvern.webeye.persistent_sessions_manager import PBS_TASK_RUNNABLE_TYPE
-from skyvern.webeye.real_browser_state import RealBrowserState
+from skyvern.webeye.real_browser_state import RealBrowserState, is_external_browser_state
 from skyvern.webeye.session_cookies import persist_session_cookies
 from skyvern.webeye.video_utils import prepare_recording_for_upload
 
@@ -452,8 +456,16 @@ class RealBrowserManager(BrowserManager):
         # ``_start_frame_publisher`` so concurrent attaches for one stream key
         # cannot orphan a publisher loop.
         self._publisher_lock = asyncio.Lock()
-        # Started at the first lease: no event loop runs when the process-wide manager is built.
+        # Started when the first session becomes renewable; manager construction may be synchronous.
         self._session_activity_renewer: asyncio.Task[None] | None = None
+        # Set whenever a session becomes renewable, so one that attaches while the renewer is waiting
+        # out its interval is stamped on the next loop turn rather than up to an interval later.
+        self._session_activity_wakeup: asyncio.Event | None = None
+        self._session_activity_loop: asyncio.AbstractEventLoop | None = None
+        self._session_activity_last_stamped_at: dict[str, float] = {}
+        # Sessions driven by a caller that holds no cleanup lease — an SDK inline action reads a
+        # session another runnable owns. Refcounted by session id: concurrent actions share one.
+        self._driven_session_refcounts: dict[str, int] = {}
         # A failed release retains its lease for cleanup attribution but must stop renewing: the
         # stamp outlives this process and would hold a browser past every deadline that reclaims it.
         self._released_session_ids: set[str] = set()
@@ -473,27 +485,31 @@ class RealBrowserManager(BrowserManager):
         session_id: str,
         organization_id: str,
         lease: _PersistentSessionLease | None,
+        run_id: str,
     ) -> bool:
-        self._released_session_ids.add(session_id)
+        """True once nothing of this run's lease is left: released, or never held because its begin_session lost."""
         owner = self._matching_session_lease(lease, session_id, organization_id)
         context = skyvern_context.current()
-        expected_runnable_id: str | None = context.browser_session_runnable_id if context else None
+        # A run whose begin_session lost never recorded an owner; releasing without one would free the holder's lease.
+        expected_runnable_id: str | None = (context.browser_session_runnable_id if context else None) or run_id
         expected_runnable_generation_id: str | None = None
         expected_browser_state: BrowserState | None = owner.browser_state if owner else None
 
         if owner is not None:
+            self._released_session_ids.add(session_id)
             expected_runnable_id = owner.runnable_id
             expected_runnable_generation_id = owner.runnable_generation_id
         elif context and context.browser_session_runnable_generation_id is not None:
             expected_runnable_generation_id = context.browser_session_runnable_generation_id
 
-        return await app.PERSISTENT_SESSIONS_MANAGER.release_browser_session(
+        released = await app.PERSISTENT_SESSIONS_MANAGER.release_browser_session(
             session_id=session_id,
             organization_id=organization_id,
             expected_runnable_id=expected_runnable_id,
             expected_runnable_generation_id=expected_runnable_generation_id,
             expected_browser_state=expected_browser_state,
         )
+        return released or (owner is None and expected_runnable_generation_id is None)
 
     def _discard_session_lease(self, run_id: str, lease: _PersistentSessionLease | None) -> None:
         if lease is not None and self._persistent_session_leases.get(run_id) is lease:
@@ -520,23 +536,79 @@ class RealBrowserManager(BrowserManager):
     def _store_session_lease(self, run_id: str, lease: _PersistentSessionLease) -> None:
         self._persistent_session_leases[run_id] = lease
         self._released_session_ids.discard(lease.session_id)
+        self._start_session_activity_renewal()
+
+    async def begin_session_activity_renewal(self, session_id: str | None) -> None:
+        """Renew a session's liveness for a caller that drives it without holding a cleanup lease.
+
+        An SDK inline action reads a session owned by another runnable, so it can create no lease and
+        nothing else stamps ``last_activity_at`` while it runs. The awaited initial stamp closes the
+        attach-time gap; the caller's lifetime bounds subsequent renewals.
+        """
+        if session_id is None:
+            return
+        self._prepare_session_activity_loop()
+        self._driven_session_refcounts[session_id] = self._driven_session_refcounts.get(session_id, 0) + 1
+        await app.DATABASE.browser_sessions.touch_last_activity(session_id)
+        self._session_activity_last_stamped_at[session_id] = asyncio.get_running_loop().time()
+        self._start_session_activity_renewal()
+
+    def end_session_activity_renewal(self, session_id: str | None) -> None:
+        if session_id is None:
+            return
+        remaining = self._driven_session_refcounts.get(session_id, 0) - 1
+        if remaining > 0:
+            self._driven_session_refcounts[session_id] = remaining
+        else:
+            self._driven_session_refcounts.pop(session_id, None)
+        if self._session_activity_wakeup is not None:
+            self._session_activity_wakeup.set()
+
+    def _prepare_session_activity_loop(self) -> asyncio.AbstractEventLoop:
+        loop = asyncio.get_running_loop()
+        if self._session_activity_loop is not loop:
+            self._session_activity_last_stamped_at.clear()
+            self._session_activity_loop = loop
+        return loop
+
+    def _start_session_activity_renewal(self) -> None:
+        loop = self._prepare_session_activity_loop()
         if self._session_activity_renewer is None or self._session_activity_renewer.done():
-            self._session_activity_renewer = asyncio.create_task(
+            self._session_activity_wakeup = asyncio.Event()
+            self._session_activity_renewer = loop.create_task(
                 self._renew_session_activity_leases(), name="persistent_session_activity_renewal"
             )
+        if self._session_activity_wakeup is not None:
+            self._session_activity_wakeup.set()
 
     def _renewable_session_ids(self) -> set[str]:
-        held = {lease.session_id for lease in self._persistent_session_leases.values()}
-        return held - self._released_session_ids
+        held = {lease.session_id for lease in self._persistent_session_leases.values()} - self._released_session_ids
+        # Driven sessions are not subtracted by a failed release: their renewal ends with the request
+        # that registered them, so unlike a retained lease they cannot stamp a browser nobody is using.
+        driven = {session_id for session_id, count in self._driven_session_refcounts.items() if count > 0}
+        return held | driven
 
     async def _renew_session_activity_leases(self) -> None:
-        # The session Pod ends a session on last_activity_at alone, and only the CDP proxy wrote it, so
-        # a run driving a browser it did not reach through the proxy was closed mid-step (SKY-15568).
-        # Sleeps before the first stamp: the base budget covers a fresh attach, and a run shorter than
-        # the interval never writes. Exits once nothing is renewable; the next lease starts a fresh task.
-        while self._renewable_session_ids():
-            await asyncio.sleep(SESSION_ACTIVITY_RENEWAL_INTERVAL_SECONDS)
-            for session_id in self._renewable_session_ids():
+        # The session Pod ends a session on last_activity_at alone; proxy-only writes left off-proxy
+        # runs with no liveness stamp (SKY-15568).
+        # Stamps before waiting: waiting first left work shorter than the interval never writing at all,
+        # and an attach can land on a session already at the end of its base budget (SKY-16256).
+        # Exits once nothing is renewable; the next attach starts a fresh task.
+        wakeup = self._session_activity_wakeup
+        if wakeup is None:
+            return
+        while True:
+            # Clear before taking the snapshot so attaches during a renewal round still wake the next one.
+            wakeup.clear()
+            session_ids = self._renewable_session_ids()
+            if not session_ids:
+                return
+            now = asyncio.get_running_loop().time()
+            for session_id in session_ids:
+                # The per-session throttle is intentionally shared by leases and SDK-driven actions.
+                last_stamped_at = self._session_activity_last_stamped_at.get(session_id)
+                if last_stamped_at is not None and now - last_stamped_at < SESSION_ACTIVITY_RENEWAL_INTERVAL_SECONDS:
+                    continue
                 try:
                     await app.DATABASE.browser_sessions.touch_last_activity(session_id)
                 except Exception:
@@ -545,6 +617,22 @@ class RealBrowserManager(BrowserManager):
                         browser_session_id=session_id,
                         exc_info=True,
                     )
+                self._session_activity_last_stamped_at[session_id] = asyncio.get_running_loop().time()
+
+            session_ids = self._renewable_session_ids()
+            for stale_id in self._session_activity_last_stamped_at.keys() - session_ids:
+                self._session_activity_last_stamped_at.pop(stale_id, None)
+            if not session_ids:
+                return
+            now = asyncio.get_running_loop().time()
+            next_due = min(
+                self._session_activity_last_stamped_at.get(session_id, now)
+                + SESSION_ACTIVITY_RENEWAL_INTERVAL_SECONDS
+                - now
+                for session_id in session_ids
+            )
+            with suppress(TimeoutError):
+                await asyncio.wait_for(wakeup.wait(), timeout=max(0.0, next_due))
 
     def live_session_runnable_ids(self) -> set[str]:
         lease_runnable_ids = {lease.runnable_id for lease in self._persistent_session_leases.values()}
@@ -918,6 +1006,7 @@ class RealBrowserManager(BrowserManager):
                 # An application-level retry across engines: the eventual success is not a first-try one.
                 note_fallback_target(FALLBACK_TARGET_CLASSICAL_ENGINE)
                 self._repin_engine_selection(run_key, boot_fallback)
+                app.AGENT_FUNCTION.note_browser_relaunch(None, "engine_fallback")
                 return await _start(boot_fallback)
             if boot_fallback is not None:
                 # Commit-strip: re-pin the same engine with its boot fallback removed so a later same-run
@@ -949,9 +1038,19 @@ class RealBrowserManager(BrowserManager):
         task: Task,
         browser_session_id: str | None = None,
     ) -> BrowserState:
+        if task.workflow_run_id:
+            await app.AGENT_FUNCTION.enforce_workflow_run_credential_use(
+                None,
+                task.workflow_run_id,
+                organization_id=task.organization_id,
+                browser_session_id=browser_session_id,
+            )
+
         browser_state = self.get_for_task(task_id=task.task_id, workflow_run_id=task.workflow_run_id)
+        lost_external_browser = False
         if browser_state is not None:
             if browser_session_id and not browser_state.is_connected():
+                lost_external_browser = is_external_browser_state(browser_state)
                 LOG.warning(
                     "Cached persistent-session browser state for task is disconnected; reconnecting",
                     task_id=task.task_id,
@@ -983,11 +1082,16 @@ class RealBrowserManager(BrowserManager):
             async with self.acquiring_session_runnable(expected_runnable_id):
                 expected_runnable_generation_id: str | None
                 if task.workflow_run_id is None:
+                    # A later step re-begins under the lease it already holds, so cleanup's release still matches.
+                    held = self._matching_session_lease(
+                        self._persistent_session_leases.get(task.task_id), browser_session_id, task.organization_id
+                    )
                     expected_runnable_generation_id = await app.PERSISTENT_SESSIONS_MANAGER.begin_session(
                         browser_session_id=browser_session_id,
                         runnable_type=PBS_TASK_RUNNABLE_TYPE,
                         runnable_id=task.task_id,
                         organization_id=task.organization_id,
+                        expected_runnable_generation_id=held.runnable_generation_id if held else None,
                     )
                     if context is not None:
                         context.browser_session_runnable_id = expected_runnable_id
@@ -1069,6 +1173,9 @@ class RealBrowserManager(BrowserManager):
             session_timezone_id: str | None = None
             if browser_session_id and task.organization_id:
                 session = await app.PERSISTENT_SESSIONS_MANAGER.get_session(browser_session_id, task.organization_id)
+                # A registered external browser is only ever attached; there is no local one to launch in its place.
+                if lost_external_browser or is_external_cdp_session(session):
+                    raise lost_external_browser_error(session)
                 if session:
                     if session.proxy_location is not None:
                         proxy_location = session.proxy_location
@@ -1115,6 +1222,8 @@ class RealBrowserManager(BrowserManager):
             extra_http_headers=extra_http_headers,
             cdp_connect_headers=task.cdp_connect_headers,
             browser_address=task.browser_address,
+            # Keep quarantine deduplication on the workflow run without changing browser-context scoping.
+            navigation_run_id=task.workflow_run_id or task.task_id,
             browser_session_id=browser_session_id,
         )
         await self._start_frame_publisher(
@@ -1160,6 +1269,15 @@ class RealBrowserManager(BrowserManager):
         if browser_profile_id is None:
             browser_profile_id = workflow_run.browser_profile_id
 
+        # Shared run/task/SDK attachment boundary; route guards remain early 403s.
+        await app.AGENT_FUNCTION.enforce_workflow_run_credential_use(
+            None,
+            workflow_run_id,
+            organization_id=workflow_run.organization_id,
+            browser_profile_id=browser_profile_id,
+            browser_session_id=browser_session_id,
+        )
+
         context = skyvern_context.current()
         # A synthetic run never begins the session; only an explicit runnable can acquire it.
         owner_fallback_id = None if context is not None and context.workflow_run_is_synthetic else workflow_run_id
@@ -1174,8 +1292,10 @@ class RealBrowserManager(BrowserManager):
         # Don't pass parent_workflow_run_id here — that lookup is deferred to the block
         # below so PBS runs don't accidentally inherit the parent's browser.
         browser_state = self.get_for_workflow_run(workflow_run_id=workflow_run_id)
+        lost_external_browser = False
         if browser_state:
             if browser_session_id and not browser_state.is_connected():
+                lost_external_browser = is_external_browser_state(browser_state)
                 LOG.warning(
                     "Cached persistent-session browser state for workflow run is disconnected; reconnecting",
                     workflow_run_id=workflow_run_id,
@@ -1420,6 +1540,8 @@ class RealBrowserManager(BrowserManager):
                 session = await app.PERSISTENT_SESSIONS_MANAGER.get_session(
                     browser_session_id, workflow_run.organization_id
                 )
+                if lost_external_browser or is_external_cdp_session(session):
+                    raise lost_external_browser_error(session)
                 if session:
                     if session.proxy_location is not None:
                         proxy_location = session.proxy_location
@@ -1668,9 +1790,18 @@ class RealBrowserManager(BrowserManager):
 
     async def close(self) -> None:
         LOG.info("Closing BrowserManager")
-        if self._session_activity_renewer is not None:
-            self._session_activity_renewer.cancel()
+        renewer = self._session_activity_renewer
+        if renewer is not None:
             self._session_activity_renewer = None
+            renewer.cancel()
+            # Awaited, not just cancelled: an unawaited stamp can still be mid-write and would land
+            # after teardown, holding a browser this process has stopped driving.
+            try:
+                await renewer
+            except asyncio.CancelledError:
+                current_task = asyncio.current_task()
+                if current_task is not None and current_task.cancelling():
+                    raise
         # Stop all streaming frame publishers before closing browsers so CDP
         # sessions detach cleanly. Cancellation here is best-effort and must
         # not block manager shutdown.
@@ -1735,6 +1866,7 @@ class RealBrowserManager(BrowserManager):
                     browser_session_id,
                     organization_id,
                     session_lease,
+                    task_id,
                 )
                 if released:
                     self._discard_session_lease(task_id, session_lease)
@@ -1983,10 +2115,20 @@ class RealBrowserManager(BrowserManager):
         release_complete = True
         if browser_session_id and not streams_active:
             if organization_id:
+                # Child runs skip their own cleanup, so a lease a nested run took would otherwise keep renewing.
+                for child_id in child_workflow_run_ids or ():
+                    child_lease = self._matching_session_lease(
+                        self._persistent_session_leases.get(child_id), browser_session_id, organization_id
+                    )
+                    if child_lease not in (None, session_lease) and await self._release_persistent_session(
+                        browser_session_id, organization_id, child_lease, child_id
+                    ):
+                        self._discard_session_lease(child_id, child_lease)
                 release_complete = await self._release_persistent_session(
                     browser_session_id,
                     organization_id,
                     session_lease,
+                    workflow_run_id,
                 )
                 if release_complete:
                     self._discard_session_lease(workflow_run_id, session_lease)
@@ -2197,6 +2339,7 @@ class RealBrowserManager(BrowserManager):
                         browser_session_id,
                         organization_id,
                         session_lease,
+                        script_id,
                     )
                     LOG.info("Released browser session", browser_session_id=browser_session_id)
                 except Exception:

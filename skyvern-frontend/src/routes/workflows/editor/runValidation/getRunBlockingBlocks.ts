@@ -1,9 +1,6 @@
 import { isLoginNode } from "../nodes/LoginNode/types";
 import type { AppNode } from "../nodes";
-import {
-  isLoginBlockMissingCredentials,
-  type CredentialKeyPredicate,
-} from "../../runValidation";
+import { isLoginBlockMissingCredentials } from "../../runValidation";
 import {
   resolveBlockLocation,
   type RunBlockingPathSegment,
@@ -27,20 +24,17 @@ export type RunBlockingBlock = {
 // single scan already counts them; resolveBlockLocation recovers where each lives.
 export function getRunBlockingBlocks(
   nodes: Array<AppNode>,
-  isCredentialKey: CredentialKeyPredicate,
 ): Array<RunBlockingBlock> {
   const byId = new Map(nodes.map((node) => [node.id, node]));
   return nodes
     .filter(isLoginNode)
     .filter((node) =>
-      isLoginBlockMissingCredentials(
-        {
-          block_type: "login",
-          label: node.data.label,
-          parameter_keys: node.data.parameterKeys,
-        },
-        isCredentialKey,
-      ),
+      isLoginBlockMissingCredentials({
+        block_type: "login",
+        label: node.data.label,
+        url: node.data.url,
+        parameter_keys: node.data.parameterKeys,
+      }),
     )
     .map((node) => {
       const { ancestorIds, path } = resolveBlockLocation(byId, node.id);

@@ -78,6 +78,8 @@ export interface CredentialRequiredFrame {
   message?: string;
   login_page_urls?: string[];
   credential_refs?: string[];
+  // Set by the server only when the user named exactly one login this turn.
+  named_credential_id?: string | null;
   timeout_seconds?: number;
   expires_at?: string;
   signing_in?: boolean;
@@ -144,6 +146,7 @@ export interface CredentialCardProps {
   signIn?: ManualSignInOffer;
   // Registration cards only: saves a server-generated password under the frame's username and name.
   onGenerate?: () => void;
+  offerCredentials?: boolean;
 }
 
 export interface ManualSignInOffer {
@@ -220,7 +223,7 @@ const UPDATE_SKIP_OUTCOME = {
   detail: "Credential not updated — the workflow keeps its saved sign-in.",
 };
 const SIGNED_IN_DETAIL =
-  "No password stored · your sign-in is saved as browser cookies in this profile";
+  "For this test · later runs usually won't stay signed in · no password stored";
 const TIMEOUT_OUTCOME = {
   title: "Sign-in request timed out",
   meta: "test may stop at login",
@@ -343,7 +346,7 @@ function CredentialPicker({
   const renderItem = (credential: PickerCredential) => (
     <CommandItem
       key={credential.credentialId}
-      // cmdk filters on value; append username + id so identical names stay findable.
+      // cmdk tracks the highlighted row by value, so it carries the id to stay unique per row.
       value={`${credential.name} ${credential.secondary ?? ""} ${credential.credentialId}`}
       onSelect={() => {
         // A pick after the pause expires would submit an already-rejected resume token; the popover
@@ -360,6 +363,9 @@ function CredentialPicker({
             {credential.secondary}
           </span>
         ) : null}
+        <span className="truncate text-[11px] text-muted-foreground">
+          {credential.credentialId}
+        </span>
       </div>
     </CommandItem>
   );
@@ -390,7 +396,12 @@ function CredentialPicker({
           <ChevronDownIcon className="size-4 shrink-0 opacity-60" />
         </Button>
       </PopoverTrigger>
-      <PopoverContent className={`${contentClassName} p-0`} align="start">
+      <PopoverContent
+        className={`${contentClassName} p-0`}
+        align="start"
+        // The chat stops the running turn on any Escape that reaches the window.
+        onEscapeKeyDown={(event) => event.stopPropagation()}
+      >
         <Command shouldFilter={false}>
           <CommandInput
             placeholder="Search credentials..."
@@ -637,6 +648,7 @@ function AskChrome({
           onCollapsedChange={tray.onCollapsedChange}
           minimizeLabel="Minimize sign-in request"
           upNext={tray.upNext}
+          embedded={tray.embedded}
         >
           <div className="flex min-h-0 flex-col gap-1 overflow-y-auto px-3 pb-2.5 pt-1">
             {lines.map((line, index) => (
@@ -780,12 +792,14 @@ function CredentialAskCard({
   tray,
   signIn,
   onGenerate,
+  offerCredentials = true,
 }: Readonly<CredentialCardProps>) {
   // Terminal mode never expires by design: its signal carries no timeout/expiry
   // semantics at all, so there is nothing to compare "now" against. Only a
   // richer, timed pause signal has real expiry data, hence gating disablement
   // on inline-pause exclusively.
-  const countdownActive = mode === "inline-pause" && !resolvedOutcome;
+  const countdownActive =
+    mode === "inline-pause" && !resolvedOutcome && Boolean(frame.expires_at);
   const { remainingMs, expired } = useCountdown(
     frame.expires_at ?? "",
     countdownActive,
@@ -824,7 +838,8 @@ function CredentialAskCard({
   const isAsk = !resolvedOutcome;
   // An auto-bound receipt only needs the org list when its Change affordance is live; a read-only
   // scrollback receipt must not each fire its own 100-credential fetch.
-  const needsCredentialList = isAsk && (mode !== "auto-bound" || canChange);
+  const needsCredentialList =
+    offerCredentials && isAsk && (mode !== "auto-bound" || canChange);
   useEffect(() => {
     if (!needsCredentialList) return;
     // Generation guard: a fetch superseded by a reloadKey change (or a slow one) must not set state
@@ -875,6 +890,47 @@ function CredentialAskCard({
       }
     })();
   }, [needsCredentialList, reloadKey, retryKey, searchTerm, credentialGetter]);
+
+  // Fetched by id rather than read from the list above: that list is one page narrowed by the
+  // search box, so either can drop the one login the ask is about.
+  const namedCredentialId =
+    offerCredentials && isAsk && mode !== "auto-bound"
+      ? (frame.named_credential_id ?? undefined)
+      : undefined;
+  const [namedCredential, setNamedCredential] =
+    useState<PickerCredential | null>(null);
+  // Holds the Use button's slot while the lookup runs, so a successful lookup does not move the
+  // buttons beside it under a click.
+  const [namedLookupPending, setNamedLookupPending] = useState(
+    Boolean(namedCredentialId),
+  );
+  useEffect(() => {
+    setNamedCredential(null);
+    setNamedLookupPending(Boolean(namedCredentialId));
+    if (!namedCredentialId) return;
+    let stale = false;
+    void (async () => {
+      try {
+        const client = await getClient(credentialGetter);
+        const res = await client.get<CredentialApiResponse>(
+          `/credentials/${encodeURIComponent(namedCredentialId)}`,
+        );
+        if (stale) return;
+        if (res.data?.credential_type === "password") {
+          setNamedCredential({
+            credentialId: namedCredentialId,
+            name: res.data.name,
+          });
+        }
+      } catch {
+        // The picker still offers every saved login, so a failed lookup leaves a plain ask.
+      }
+      if (!stale) setNamedLookupPending(false);
+    })();
+    return () => {
+      stale = true;
+    };
+  }, [namedCredentialId, reloadKey, retryKey, credentialGetter]);
 
   const retryCredentialList = () => {
     setOrgCredentials({ status: "loading" });
@@ -944,10 +1000,11 @@ function CredentialAskCard({
         return (
           <ResolvedCredentialCard
             tone="done"
-            title={
+            title="Signed in for this test only"
+            meta={
               resolvedOutcome.name
-                ? `Signed in, saved as '${resolvedOutcome.name}'`
-                : "Signed in, saved as a browser profile"
+                ? `saved as '${resolvedOutcome.name}'`
+                : "saved as a browser profile"
             }
             detail={SIGNED_IN_DETAIL}
           />
@@ -1096,7 +1153,12 @@ function CredentialAskCard({
       type="button"
       size="sm"
       variant={
-        (signIn && frame.signing_in) || offerGenerate ? "outline" : "default"
+        (signIn && frame.signing_in) ||
+        offerGenerate ||
+        namedCredential ||
+        namedLookupPending
+          ? "outline"
+          : "default"
       }
       disabled={disabled}
       onClick={() => onConnect(undefined)}
@@ -1125,9 +1187,9 @@ function CredentialAskCard({
             key="how"
             className="text-[11px] leading-relaxed text-muted-foreground"
           >
-            Use the browser to sign in, including any verification code, then
-            click Done. Skyvern saves the sign-in as a browser profile; no
-            password is stored.
+            {
+              "Use the browser to sign in, including any verification code, then click Done. This sign-in is for this test; later runs usually won't stay signed in. No password is stored."
+            }
           </span>,
           ...(notFound
             ? [
@@ -1147,7 +1209,7 @@ function CredentialAskCard({
             >
               {signIn.busy ? "Saving sign-in…" : "Done"}
             </Button>
-            {connectButton}
+            {offerCredentials ? connectButton : null}
             <div className="ml-auto">
               <Button
                 type="button"
@@ -1195,6 +1257,30 @@ function CredentialAskCard({
           {CREDENTIAL_WHY_LINE_BY_REASON[frame.reason] ?? SIGN_IN_WHY_LINE}
         </span>,
         ...registrationLines,
+        ...(namedCredential
+          ? [
+              <span
+                key="named"
+                className="break-words text-[11px] font-medium leading-relaxed"
+              >
+                You named this login ({namedCredential.credentialId}). Copilot
+                wants to use it on {site}. Check that is the right site before
+                you confirm.
+              </span>,
+            ]
+          : []),
+        ...(signIn
+          ? [
+              <span
+                key="sign-in-scope"
+                className="text-[11px] leading-relaxed text-muted-foreground"
+              >
+                {
+                  "Signing in yourself works for this test. Later runs usually won't stay signed in — connect a credential so every run can sign in."
+                }
+              </span>,
+            ]
+          : []),
         ...(mode === "terminal"
           ? [
               <span
@@ -1218,19 +1304,27 @@ function CredentialAskCard({
               Generate and save
             </Button>
           ) : null}
-          {connectButton}
-          {signIn ? (
+          {offerCredentials && namedCredential ? (
             <Button
               type="button"
               size="sm"
-              variant="outline"
-              disabled={disabled || signIn.busy}
-              onClick={signIn.onStart}
+              disabled={disabled}
+              // Wraps rather than truncates: the site is what the click agrees to.
+              className="h-auto max-w-full whitespace-normal break-words py-1 text-left"
+              onClick={() =>
+                onConnect(namedCredential.credentialId, namedCredential.name)
+              }
             >
-              Sign in myself
+              Use &apos;{namedCredential.name}&apos; on {site}
+            </Button>
+          ) : offerCredentials && namedLookupPending ? (
+            <Button type="button" size="sm" disabled>
+              Use saved login
             </Button>
           ) : null}
-          {orgCredentials.status === "ready" &&
+          {offerCredentials ? connectButton : null}
+          {offerCredentials &&
+          orgCredentials.status === "ready" &&
           (pickable.length > 0 || pickerEngaged) ? (
             <CredentialPicker
               credentials={pickable}
@@ -1245,18 +1339,30 @@ function CredentialAskCard({
               onRetrySearch={retrySearch}
             />
           ) : null}
-          {orgCredentials.status === "loading" ? (
+          {offerCredentials && orgCredentials.status === "loading" ? (
             <span className="text-xs text-muted-foreground">
               Loading saved logins…
             </span>
           ) : null}
-          {orgCredentials.status === "error" ? (
+          {offerCredentials && orgCredentials.status === "error" ? (
             <>
               <span className="text-xs text-muted-foreground">
                 Couldn&apos;t load your saved logins.
               </span>
               {retryButton}
             </>
+          ) : null}
+          {signIn ? (
+            <Button
+              type="button"
+              size="sm"
+              variant="link"
+              className="text-blue-600 dark:text-blue-400"
+              disabled={disabled || signIn.busy}
+              onClick={signIn.onStart}
+            >
+              Sign in myself (this test only)
+            </Button>
           ) : null}
           <div className="ml-auto">
             <SkipButton onSkip={onSkip} disabled={disabled} />
@@ -1272,13 +1378,13 @@ function CredentialAskCard({
           className="sr-only"
           role={insideLiveRegion ? undefined : "status"}
         >
-          {searchFailed
+          {offerCredentials && searchFailed
             ? SEARCH_FAILED_ANNOUNCEMENT
             : insideLiveRegion
               ? ""
-              : orgCredentials.status === "loading"
+              : offerCredentials && orgCredentials.status === "loading"
                 ? "Loading saved logins…"
-                : orgCredentials.status === "error"
+                : offerCredentials && orgCredentials.status === "error"
                   ? "Couldn't load your saved logins."
                   : ""}
         </span>

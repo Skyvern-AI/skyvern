@@ -24,6 +24,7 @@ import {
   isYamlCommitOwnerCurrent,
   runWorkflowAuthoringAction,
   refuseMutationDuringYamlCommit,
+  selectSaveLockReason,
   type YamlCommitOwner,
 } from "@/store/WorkflowYamlEditorStore";
 import { apiWorkflowToSettings } from "@/routes/workflows/editor/apiWorkflowToSettings";
@@ -92,7 +93,6 @@ import { useBlockScriptStore } from "@/store/BlockScriptStore";
 import { useBlockSidebarWidthStore } from "@/store/BlockSidebarWidthStore";
 import { useCacheKeyValueStore } from "@/store/CacheKeyValueStore";
 import { useRecordingStore } from "@/store/useRecordingStore";
-import { useRecordedBlocksStore } from "@/store/RecordedBlocksStore";
 import { useWorkflowSettingsStore } from "@/store/WorkflowSettingsStore";
 import { useStudioPaneDefaults } from "../studio/StudioPaneDefaultsContext";
 import { useCopilotActionStore } from "@/store/useCopilotActionStore";
@@ -243,19 +243,25 @@ import {
   type WorkflowUpdateOptions,
 } from "../copilot/WorkflowCopilotChat";
 import { useStudioRunId } from "../studio/useStudioRunId";
+import { SYSTEM_RUN_FOCUS_PARAM } from "../studio/panes";
 import { copilotRunId } from "./copilotRunId";
 import {
   shouldOpenCopilotPaneForHandoff,
   useDiscoverCopilotPromptRecovery,
   withoutDiscoverViaParam,
 } from "../discoverCopilotHandoff";
+import {
+  initialEditorAutoOpenState,
+  shouldAutoOpenEditor,
+} from "./editorAutoOpen";
 import { useStudioShellContext } from "../studio/StudioShellContext";
 import { StudioShellPanelPortal } from "../studio/StudioShellPanelPortal";
 import { useRecordingLauncherStore } from "@/store/useRecordingLauncherStore";
+import { useFeatureFlag } from "@/hooks/useFeatureFlag";
+import { WORKFLOW_COPILOT_DEMONSTRATION_FLAG } from "@/util/featureFlags";
 import type { CopilotAttachedFile } from "@/routes/workflows/copilot/workflowCopilotTypes";
-import { useSopToBlocksMutation } from "../hooks/useSopToBlocksMutation";
 import {
-  applySopResultAtCurrentAppend,
+  demonstrationInsertionFromNodes,
   resolveAppendInsertionPoint,
   resolveWorkspaceAuthoringActionAvailability,
 } from "./workspaceAuthoringActions";
@@ -461,13 +467,29 @@ function CopyText({ className, text }: { className?: string; text: string }) {
 // eslint-disable-next-line react-refresh/only-export-components -- Exercise the production apply callback without mounting the entire workspace.
 export function useWorkspaceCopilotUpdate({
   applyWorkflowUpdate,
+  embedded = false,
+  initialBlockCount = 0,
 }: {
   applyWorkflowUpdate: (
     workflow: WorkflowVersion,
     options: WorkflowUpdateOptions & { userDriven: boolean },
   ) => boolean | void;
+  embedded?: boolean;
+  initialBlockCount?: number;
 }) {
   const logging = useLogging();
+  const { reopenEditor } = useStudioPaneDefaults();
+  // The studio shell remounts Workspace per workflow, so this arms only for an
+  // agent that had no blocks when it opened.
+  const editorAutoOpenStateRef = useRef(
+    initialEditorAutoOpenState(initialBlockCount),
+  );
+  // A run the user opened owns the stage; Copilot's own run focus does not.
+  const [searchParams] = useSearchParams();
+  const studioRunId = useStudioRunId();
+  const inspectingUserRunRef = useRef(false);
+  inspectingUserRunRef.current =
+    Boolean(studioRunId) && !searchParams.has(SYSTEM_RUN_FOCUS_PARAM);
   return (workflowData: WorkflowVersion, options?: WorkflowUpdateOptions) => {
     try {
       // All Copilot-driven applies are user edits (mid-turn draft, accept,
@@ -478,6 +500,17 @@ export function useWorkspaceCopilotUpdate({
         false
       )
         throw new Error("The editor refused the Copilot update");
+      const { fire, nextState } = shouldAutoOpenEditor(
+        editorAutoOpenStateRef.current,
+        {
+          embedded,
+          applied: options?.applied,
+          midTurnDraft: options?.midTurnDraft,
+          blockCount: workflowData.workflow_definition.blocks.length,
+        },
+      );
+      editorAutoOpenStateRef.current = nextState;
+      if (fire && !inspectingUserRunRef.current) reopenEditor();
     } catch (error) {
       console.error("Failed to parse and apply agent", error, workflowData);
       logging.error("Copilot agent apply failed", {
@@ -647,6 +680,7 @@ function Workspace({
   );
   const handleOnSave = useSaveWorkflow();
   const saveWorkflow = useWorkflowSave({ status: "published" });
+  const saveLockReason = useWorkflowYamlEditorStore(selectSaveLockReason);
   const yamlCommitOwnerRef = useRef<YamlCommitOwner | null>(null);
   const mountedWorkflowRef = useRef(workflow);
   useLayoutEffect(() => {
@@ -829,6 +863,11 @@ function Workspace({
       setIsCopilotOpen(true);
     }
   }, [initialCopilotAction]);
+  // Opening an already-open studio pane still restores a maximized pane, which would otherwise hide Copilot.
+  const openCopilot = useCallback(() => {
+    if (!embedded) setIsCopilotOpen(true);
+    else openStudioPane("copilot", { state: location.state });
+  }, [embedded, openStudioPane, location.state]);
   const [copilotMessageCount, setCopilotMessageCount] = useState(0);
   const copilotButtonRef = useRef<HTMLButtonElement>(null);
   const [readyBrowserSessionId, setReadyBrowserSessionId] = useState<
@@ -1104,6 +1143,8 @@ function Workspace({
   const preferVncStream = streamTransport !== "cdp";
 
   const workflowChangesStore = useWorkflowHasChangesStore();
+  const cacheDeletionSaveReason =
+    workflowChangesStore.saveBlockedReason || saveLockReason;
 
   useLayoutEffect(() => {
     const hydrateSavedSettings = (
@@ -1750,27 +1791,20 @@ function Workspace({
   const setStartRecordingAtEnd = useRecordingLauncherStore(
     (s) => s.setStartRecordingAtEnd,
   );
+  const startDemonstration = useRecordingLauncherStore(
+    (s) => s.startDemonstration,
+  );
+  const demonstrationEnabled =
+    useFeatureFlag(WORKFLOW_COPILOT_DEMONSTRATION_FLAG) === true;
   // Stable action ref (vs the whole-store `recordingStore` object, which gets a
   // new reference on every store write and would re-register the launcher).
   const setIsRecording = useRecordingStore((s) => s.setIsRecording);
-  const setRecordedBlocks = useRecordedBlocksStore((s) => s.setRecordedBlocks);
   const getAppendInsertionPoint = useCallback(() => {
     return resolveAppendInsertionPoint(
       getNodes() as Array<AppNode>,
       getEdges(),
     );
   }, [getEdges, getNodes]);
-  const sopToBlocksMutation = useSopToBlocksMutation({
-    onSuccess: (result, owner) => {
-      applySopResultAtCurrentAppend({
-        result,
-        getNodes: () => getNodes() as Array<AppNode>,
-        getEdges,
-        setRecordedBlocks: (blocks, insertionPoint) =>
-          setRecordedBlocks(blocks, insertionPoint, owner),
-      });
-    },
-  });
   const authoringActionAvailability =
     resolveWorkspaceAuthoringActionAvailability({
       browserReady: copilotLiveBrowserReady,
@@ -1784,7 +1818,6 @@ function Workspace({
         recordingStore.isRecording ||
         recordingStore.finishRequested ||
         recordingStore.isCommitting,
-      isUploadingSOP: sopToBlocksMutation.isPending,
     });
   // A deferred start runs after a save; the browser may have stopped being ready.
   const canRecordTaskRef = useRef(authoringActionAvailability.canRecordTask);
@@ -1801,6 +1834,26 @@ function Workspace({
   );
   const startRecordingAtEnd = useCallback(() => {
     if (!authoringActionAvailability.canRecordTask) return;
+    if (demonstrationEnabled) {
+      if (!startDemonstration) return;
+      const insertion = demonstrationInsertionFromNodes(
+        getNodes() as Array<AppNode>,
+        getAppendInsertionPoint(),
+      );
+      if (!insertion) return;
+      startDemonstration({ insertion });
+      if (autoRecordRequested) {
+        setRecordSearchParams(
+          (current) => {
+            const next = new URLSearchParams(current);
+            next.delete("record");
+            return next;
+          },
+          { replace: true },
+        );
+      }
+      return;
+    }
     // Consume ?record=1 up front so a dismissed prompt does not re-fire auto-record.
     if (autoRecordRequested) {
       setRecordSearchParams(
@@ -1843,17 +1896,11 @@ function Workspace({
     authoringActionAvailability.canRecordTask,
     autoRecordRequested,
     setRecordSearchParams,
+    demonstrationEnabled,
+    startDemonstration,
+    getNodes,
   ]);
-  const uploadSOPAtEnd = useCallback(
-    (file: File) => {
-      if (!authoringActionAvailability.canUploadSOP) return;
-      void runWorkflowAuthoringAction(() =>
-        sopToBlocksMutation.mutateAsync(file),
-      );
-    },
-    [authoringActionAvailability.canUploadSOP, sopToBlocksMutation],
-  );
-  // `/discover`'s "Record task" lands here with ?record=1; start once the browser is ready.
+  // `/discover`'s "Demonstrate task" lands here with ?record=1; start once the browser is ready.
   useEffect(() => {
     if (
       !autoRecordRequested ||
@@ -1874,7 +1921,10 @@ function Workspace({
       return;
     }
     setStartRecordingAtEnd(
-      authoringActionAvailability.canRecordTask ? startRecordingAtEnd : null,
+      authoringActionAvailability.canRecordTask &&
+        (!demonstrationEnabled || startDemonstration)
+        ? startRecordingAtEnd
+        : null,
     );
     return () => setStartRecordingAtEnd(null);
   }, [
@@ -1882,6 +1932,8 @@ function Workspace({
     embedded,
     startRecordingAtEnd,
     setStartRecordingAtEnd,
+    demonstrationEnabled,
+    startDemonstration,
   ]);
 
   // Listen for conditional branch changes to trigger re-layout
@@ -2213,6 +2265,8 @@ function Workspace({
 
   const handleCopilotWorkflowUpdate = useWorkspaceCopilotUpdate({
     applyWorkflowUpdate,
+    embedded,
+    initialBlockCount: workflow.workflow_definition.blocks.length,
   });
   const reportStudioPaneCrash = (
     pane: string,
@@ -2690,12 +2744,10 @@ function Workspace({
         <DialogContent>
           <DialogHeader>
             <DialogTitle>
-              {workflowChangesStore.saveBlockedReason
-                ? "Save is paused"
-                : "Are you sure?"}
+              {cacheDeletionSaveReason ? "Save is paused" : "Are you sure?"}
             </DialogTitle>
             <DialogDescription>
-              {workflowChangesStore.saveBlockedReason ||
+              {cacheDeletionSaveReason ||
                 "Saving will delete cached code, and Skyvern will re-generate it in the next run. Proceed?"}
             </DialogDescription>
           </DialogHeader>
@@ -2705,7 +2757,7 @@ function Workspace({
             </DialogClose>
             <Button
               variant="default"
-              disabled={Boolean(workflowChangesStore.saveBlockedReason)}
+              disabled={Boolean(cacheDeletionSaveReason)}
               onClick={async () => {
                 await confirmCodeCacheDeletion(handleOnSave);
               }}
@@ -3529,9 +3581,7 @@ function Workspace({
           initialAttachments={routeInitialCopilotAttachments}
           initialAction={initialCopilotAction ?? undefined}
           onInitialMessageConsumed={handleInitialCopilotMessageConsumed}
-          onUploadSOP={uploadSOPAtEnd}
-          canUploadSOP={authoringActionAvailability.canUploadSOP}
-          isUploadingSOP={sopToBlocksMutation.isPending}
+          onRequestOpen={openCopilot}
           onRecordTask={startRecordingAtEnd}
           canRecordTask={authoringActionAvailability.canRecordTask}
           authoringUnavailableReason={

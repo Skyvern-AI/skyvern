@@ -7,6 +7,7 @@ import pytest
 from skyvern.forge import app
 from skyvern.forge.agent_functions import AgentFunction, CodeBlockExecutionLimits
 from skyvern.forge.sdk.copilot.config import BlockAuthoringPolicy
+from skyvern.forge.sdk.copilot.reached_download_target import DownloadClaimHelperContract
 from skyvern.forge.sdk.copilot.tools.mcp_hooks import _get_block_schema_post_hook, _type_text_pre_hook
 
 
@@ -17,7 +18,6 @@ async def test_type_text_uses_exact_registered_secret_fact_and_stashes_ordinary_
         browser_session_id=None,
         last_run_blocks_workflow_run_id=None,
         pending_scout_source_url=None,
-        pending_taint_sources={},
         pending_scout_input_value=None,
         discovery_mcp_server=None,
         block_authoring_policy=BlockAuthoringPolicy.CODE_ONLY_BROWSER,
@@ -45,7 +45,6 @@ async def test_type_text_pre_hook_does_not_infer_secret_status_from_text_selecto
         browser_session_id=None,
         last_run_blocks_workflow_run_id=None,
         pending_scout_source_url=None,
-        pending_taint_sources={},
         pending_scout_input_value=None,
         discovery_mcp_server=None,
         block_authoring_policy=BlockAuthoringPolicy.CODE_ONLY_BROWSER,
@@ -201,13 +200,18 @@ async def test_code_block_schema_exposes_download_claim_helper_before_scouting()
 
     assert "code_block_runtime_helpers" not in result["data"]
     helper = result["data"]["download_claim_helper_contract"]["click_and_claim_download"]
+    contract = DownloadClaimHelperContract()
     assert helper == {
         "call": "await click_and_claim_download(page, selector)",
         "parameters": {
             "page": {"accepted_type": "current_code_block_page"},
-            "selector": {"accepted_types": ["selector_string"]},
+            "selector": {"accepted_types": ["selector_string"], "scope": contract.selector_scope},
         },
         "returns": {"type": "string", "value": "sanitized_suggested_filename"},
+        "expect_download": {
+            "call": contract.expect_download_call,
+            "registration": contract.expect_download_registration,
+        },
     }
     assert ctx.reached_download_target is None
     assert ctx.scout_trajectory == []

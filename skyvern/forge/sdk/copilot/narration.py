@@ -18,7 +18,12 @@ from skyvern.forge.sdk.copilot.ask_user import (
     CREDENTIAL_DELETE_TOOL_NAME,
 )
 from skyvern.forge.sdk.copilot.code_write_diff import CodeWriteDiff
-from skyvern.forge.sdk.copilot.context import ActivityBucket, NarrativeBlockAttempt, upsert_narrative_block_attempt
+from skyvern.forge.sdk.copilot.context import (
+    REPLY_TOOL_NAME,
+    ActivityBucket,
+    NarrativeBlockAttempt,
+    upsert_narrative_block_attempt,
+)
 from skyvern.forge.sdk.copilot.output_utils import sanitize_block_label_for_display
 from skyvern.forge.sdk.schemas.workflow_copilot import (
     WorkflowCopilotBlockProgressUpdate,
@@ -33,7 +38,7 @@ LOG = structlog.get_logger()
 MIN_BLOCK_STATUS_POLL_GAP_SECONDS = 1.0
 MAX_BLOCK_ACTIVITY_ENTRIES = 30
 MAX_DESIGN_ACTIVITY_ENTRIES = 50
-ACTIVITY_TOOL_DENYLIST = frozenset({"get_run_results", "get_browser_screenshot"})
+ACTIVITY_TOOL_DENYLIST = frozenset({"get_run_results", "get_browser_screenshot", REPLY_TOOL_NAME})
 CODE_REPAIR_PROGRESS_SURFACE_KIND = "code_repair_progress"
 CODE_REPAIR_PROGRESS_TEXT = "Refining the workflow's code"
 
@@ -50,10 +55,13 @@ _TOOL_ACTIVITY_DISPLAY_LABELS = {
     "scroll": "Interacting with page",
     "select_option": "Selecting option",
     "press_key": "Interacting with page",
+    "drag": "Interacting with page",
     "navigate_browser": "Opening page",
     "get_block_schema": "Checking workflow block options",
     "get_workflow_knowledge": "Looking up workflow guidance",
     "list_integrations": "Checking connected integrations",
+    "request_google_connection": "Preparing a Google connection",
+    "offer_demonstration": "Offering a demonstration",
     "read_google_sheet": "Reading the Google Sheet",
     "get_organization_usage_quota": "Checking account usage",
     "inspect_current_workflow": "Inspecting workflow",
@@ -91,6 +99,7 @@ _TOOL_ACTIVITY_DISPLAY_LABELS = {
     "start_fresh_browser": "Starting a fresh browser",
     "extend_browser_session": "Extending the browser session",
     "upload_attached_file": "Attaching your file to the page",
+    "read_attached_pdf": "Reading your attached PDF",
     "run_browser_code": "Working in the browser",
     "edit_block": "Editing block",
     "add_block": "Adding block",

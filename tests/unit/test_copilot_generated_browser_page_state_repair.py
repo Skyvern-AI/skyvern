@@ -26,11 +26,13 @@ from skyvern.forge.sdk.copilot.build_test_outcome import (
 from skyvern.forge.sdk.copilot.composition_evidence import model_visible_composition_evidence, parse_composition_html
 from skyvern.forge.sdk.copilot.config import BlockAuthoringPolicy
 from skyvern.forge.sdk.copilot.context import CodeAuthoringRepairContext, CopilotContext
+from skyvern.forge.sdk.copilot.enforcement import _summarize_tool_output
 from skyvern.forge.sdk.copilot.output_contracts import code_block_available_contracts_by_label
 from skyvern.forge.sdk.copilot.output_utils import (
     _compact_packet_for_aggregate_limit,
     project_build_test_packet_for_llm,
     project_direct_test_handoff_packet_for_llm,
+    sanitize_tool_result_for_llm,
 )
 from skyvern.forge.sdk.copilot.runtime_authoring_repair import (
     REPAIR_INSTRUCTION_MAX_CHARS,
@@ -43,6 +45,7 @@ from skyvern.forge.sdk.copilot.runtime_authoring_repair import (
 )
 from skyvern.forge.sdk.copilot.tools.run_execution import (
     CopilotExecutionSnapshot,
+    _attach_run_session_facts,
     _build_recorded_build_test_outcome,
     _ExecutionResult,
     _failure_action_trace_summary,
@@ -50,6 +53,7 @@ from skyvern.forge.sdk.copilot.tools.run_execution import (
     _record_run_blocks_result,
     _RunExecution,
     build_test_evidence_packet,
+    finalize_build_test_result,
 )
 from skyvern.forge.sdk.workflow.models.code_block_recorder import CODE_BLOCK_FILENAME, user_code_line_from_exception
 from skyvern.forge.sdk.workflow.models.workflow import Workflow
@@ -1045,3 +1049,74 @@ def test_hidden_control_crowded_page_keeps_text_labeled_summaries_first() -> Non
     assert summaries[0] == "Export CSV"
     for _, selector in _HIDDEN_CONTROL_EXPANDERS.values():
         assert any(summary.startswith(selector) for summary in summaries[1:]), summaries
+
+
+_SIGNED_OUT_READ_LABEL = "read_visitors"
+_SIGNED_OUT_WRITE_LABEL = "write_report_cell"
+_SIGNED_OUT_TITLE = "Sign in"
+
+
+def _signed_out_focused_result() -> dict[str, Any]:
+    """A read and a native write that completed on the sign-in page, in the chat's browser."""
+    data: dict[str, Any] = {
+        "workflow_run_id": "wr_signed_out_focused",
+        "browser_session_id": "pbs_chat",
+        "overall_status": "completed",
+        "requested_block_labels": [_SIGNED_OUT_READ_LABEL, _SIGNED_OUT_WRITE_LABEL],
+        "executed_block_labels": [_SIGNED_OUT_READ_LABEL, _SIGNED_OUT_WRITE_LABEL],
+        "current_url": "https://metrics.fixture.test/dashboard",
+        "page_title": _SIGNED_OUT_TITLE,
+        "blocks": [
+            {
+                "workflow_run_block_id": "wrb_read_visitors",
+                "label": _SIGNED_OUT_READ_LABEL,
+                "block_type": "EXTRACTION",
+                "status": "completed",
+                "output": {"status": "completed", "extracted_information": {"visitors": None}},
+            },
+            {
+                "workflow_run_block_id": "wrb_write_report_cell",
+                "label": _SIGNED_OUT_WRITE_LABEL,
+                "block_type": "HTTP_REQUEST",
+                "status": "completed",
+                "output": {"status_code": 200, "request_body": {"cell": "A1", "value": "None"}},
+            },
+        ],
+    }
+    _attach_run_session_facts(
+        data,
+        used_fresh_run_session=False,
+        run_detached_from_chat=False,
+        chat_browser_opened_for_run=False,
+        continued_earlier_test=False,
+        run_ok=True,
+        page_evidence=None,
+    )
+    return {"ok": True, "data": data}
+
+
+def test_a_signed_out_focused_run_reaches_the_model_as_facts_and_keeps_its_browser_as_an_older_result() -> None:
+    ctx = _copilot_context()
+    result = _signed_out_focused_result()
+    _record_run_blocks_result(ctx, copy.deepcopy(result))
+
+    model_facing = sanitize_tool_result_for_llm(
+        "run_blocks_and_collect_debug",
+        finalize_build_test_result(ctx, source_tool="run_blocks_and_collect_debug", result=result),
+    )
+
+    assert model_facing["ok"] is True and "error" not in model_facing
+    packet = model_facing["data"]["build_test_packet"]
+    assert packet["page_state"]["title"] == _SIGNED_OUT_TITLE
+    outputs = {entry["label"]: entry["output"] for entry in packet["registered_outputs"]}
+    assert outputs[_SIGNED_OUT_READ_LABEL]["extracted_information"] == {"visitors": None}
+    assert outputs[_SIGNED_OUT_WRITE_LABEL]["request_body"] == {"cell": "A1", "value": "None"}
+    assert packet["run"]["browser_start"]["kind"] == "chat_browser_context"
+    outcome = ctx.latest_recorded_build_test_outcome
+    assert outcome is not None and outcome.verdict == "not_authoritative"
+
+    older = _summarize_tool_output(json.dumps(model_facing))
+    kept = json.loads(older)["build_test_packet"]["run"]
+    for key in ("workflow_run_id", "status", "browser", "browser_start"):
+        assert kept[key] == packet["run"][key], key
+    assert _summarize_tool_output(older) == older

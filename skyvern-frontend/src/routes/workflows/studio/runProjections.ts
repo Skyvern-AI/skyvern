@@ -178,6 +178,24 @@ export function runErrorRows(
   return rows;
 }
 
+export type RunErrorCode = { code: string; message: string | null };
+
+// The Overview's failure line names each code once, keeping the first message
+// that carried it as the hover. Built on runErrorRows so the line and
+// Outputs → Errors can't disagree on which codes a run has.
+export function runErrorCodes(
+  errors: Array<Record<string, unknown>>,
+): RunErrorCode[] {
+  const byCode = new Map<string, string | null>();
+  for (const row of runErrorRows(errors)) {
+    if (!row.code || byCode.has(row.code)) {
+      continue;
+    }
+    byCode.set(row.code, row.message);
+  }
+  return Array.from(byCode, ([code, message]) => ({ code, message }));
+}
+
 function nonEmptyString(value: unknown): boolean {
   return typeof value === "string" && value.trim() !== "";
 }

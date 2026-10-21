@@ -13,7 +13,8 @@ type WorkflowAddMenuProps = {
   radius?: string;
   rotateText?: boolean;
   startAt?: number;
-  isUploadingSOP?: boolean;
+  canUploadSOP?: boolean;
+  canRecordTask?: boolean;
   //   --
   onAdd: () => void;
   onRecord: () => void;
@@ -28,7 +29,8 @@ function WorkflowAddMenu({
   radius = "80px",
   rotateText = true,
   startAt = 90,
-  isUploadingSOP = false,
+  canUploadSOP = true,
+  canRecordTask = true,
   //   --
   onAdd,
   onRecord,
@@ -51,27 +53,29 @@ function WorkflowAddMenu({
       },
     ];
 
-    // Show Record Task whenever a browser session exists (ready or still
+    // Show Demonstrate task whenever a browser session exists (ready or still
     // connecting). Disable it until the browser is actually ready so users
     // can see the action will be available without it popping in mid-load.
     if (settingsStore.isUsingABrowser || settingsStore.isLoadingABrowser) {
       menuItems.push({
         id: "2",
         icon: <SquareIcon className={buttonSize ? "h-3 w-3" : undefined} />,
-        enabled: settingsStore.isUsingABrowser && !recordingStore.isRecording,
-        text: "Record Task",
+        enabled:
+          canRecordTask &&
+          settingsStore.isUsingABrowser &&
+          !recordingStore.isRecording,
+        text: "Demonstrate task",
         onClick: () => {
           onRecord();
         },
       });
     }
 
-    // Always show Upload SOP option
     menuItems.push({
       id: "3",
       icon: <UploadIcon className={buttonSize ? "h-3 w-3" : undefined} />,
       text: "Upload SOP",
-      enabled: !isUploadingSOP,
+      enabled: canUploadSOP,
       onClick: () => {
         onUploadSOP();
       },
@@ -80,13 +84,14 @@ function WorkflowAddMenu({
     return menuItems;
   }, [
     buttonSize,
+    canRecordTask,
     onAdd,
     onRecord,
     onUploadSOP,
     recordingStore.isRecording,
     settingsStore.isUsingABrowser,
     settingsStore.isLoadingABrowser,
-    isUploadingSOP,
+    canUploadSOP,
   ]);
 
   // The studio editor (/studio, blockRunsEnabled) surfaces these actions too;

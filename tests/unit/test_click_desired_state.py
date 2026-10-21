@@ -24,8 +24,13 @@ from playwright.async_api import Page, async_playwright
 from skyvern.webeye.actions import handler
 from skyvern.webeye.actions.actions import ActionStatus, ClickAction, ClickContext
 from skyvern.webeye.actions.responses import ActionAbort, ActionFailure, ActionResult, ActionSuccess, StaleActionAbort
+from skyvern.webeye.dom_inspection import (
+    _READ_STATIC_LISTBOX_OPTION_SNAPSHOT,
+    is_static_listbox_option_snapshot,
+)
 from skyvern.webeye.utils import dom as dom_utils
 from skyvern.webeye.utils.dom import SkyvernElement
+from tests.unit._workflow_block_engine_fakes import FakeExperimentationProvider
 from tests.unit.scoped_asyncio import ScopedAsyncio
 
 
@@ -290,6 +295,7 @@ class FakeAncestorLocator:
 
 
 _GRID_SNAPSHOT_DEFAULT = object()
+_STATIC_LISTBOX_SNAPSHOT_DEFAULT = object()
 
 
 def _non_grid_row_snapshot() -> dict[str, object]:
@@ -317,16 +323,23 @@ class FakeElementLocator:
         multiselectable_ancestor: str | None,
         grid_snapshot: object = _GRID_SNAPSHOT_DEFAULT,
         grid_snapshot_error: Exception | None = None,
+        static_listbox_snapshot: object = _STATIC_LISTBOX_SNAPSHOT_DEFAULT,
     ) -> None:
         self._multiselectable_ancestor = multiselectable_ancestor
         self._grid_snapshot = grid_snapshot
         self._grid_snapshot_error = grid_snapshot_error
+        self._static_listbox_snapshot = static_listbox_snapshot
 
     def locator(self, selector: str) -> FakeAncestorLocator:
         assert selector == "xpath=ancestor-or-self::*[@aria-multiselectable][1]"
         return FakeAncestorLocator(self._multiselectable_ancestor)
 
-    async def evaluate(self, expression: str, *args: object) -> object:
+    async def evaluate(self, expression: str, *args: object, **kwargs: object) -> object:
+        if expression == _READ_STATIC_LISTBOX_OPTION_SNAPSHOT:
+            if self._static_listbox_snapshot is _STATIC_LISTBOX_SNAPSHOT_DEFAULT:
+                raise AssertionError("unexpected static-listbox snapshot read")
+            return self._static_listbox_snapshot
+        assert expression == handler._GRID_ROW_SNAPSHOT_JS
         if self._grid_snapshot_error is not None:
             raise self._grid_snapshot_error
         if self._grid_snapshot is _GRID_SNAPSHOT_DEFAULT:
@@ -353,6 +366,7 @@ class FakeToggleElement:
         multiselectable_ancestor: str | None = None,
         grid_snapshot: object = _GRID_SNAPSHOT_DEFAULT,
         grid_snapshot_error: Exception | None = None,
+        static_listbox_snapshot: object = _STATIC_LISTBOX_SNAPSHOT_DEFAULT,
     ) -> None:
         self._tag_name = tag_name
         self._attributes = attributes or {}
@@ -361,7 +375,12 @@ class FakeToggleElement:
         self._type_results = list(type_results) if type_results is not None else None
         self.type_read_count = 0
         self._attr_error = attr_error
-        self._locator = FakeElementLocator(multiselectable_ancestor, grid_snapshot, grid_snapshot_error)
+        self._locator = FakeElementLocator(
+            multiselectable_ancestor,
+            grid_snapshot,
+            grid_snapshot_error,
+            static_listbox_snapshot,
+        )
 
     def get_tag_name(self) -> str:
         return self._tag_name
@@ -400,8 +419,8 @@ class FakeToggleElement:
     async def has_attr(self, attr_name: str, mode: str = "auto") -> bool:
         return False
 
-    def get_frame(self) -> MagicMock:
-        return MagicMock()
+    def get_frame(self) -> FakeElementLocator:
+        return self._locator
 
     async def is_explicit_submit(self) -> bool:
         return False
@@ -522,6 +541,21 @@ async def test_apply_single_select_option_aria_selected_false_desired_false_supp
     element = FakeToggleElement("div", {"role": "option", "aria-selected": "false"})
     result = await handler._apply_desired_click_state(_click_action(), element, False, MagicMock())
     assert result is not None and len(result) == 1 and isinstance(result[0], ActionAbort)
+
+
+@pytest.mark.asyncio
+async def test_apply_static_single_select_option_suppresses_only_when_trusted() -> None:
+    element = FakeToggleElement(
+        "div",
+        {"role": "option", "aria-selected": "true"},
+        static_listbox_snapshot=_static_listbox_snapshot(),
+    )
+
+    trusted = await handler._apply_desired_click_state(
+        _click_action(), element, True, MagicMock(), trust_static_listbox=True
+    )
+    assert trusted is not None and len(trusted) == 1 and isinstance(trusted[0], ActionAbort)
+    assert await handler._apply_desired_click_state(_click_action(), element, True, MagicMock()) is None
 
 
 @pytest.mark.asyncio
@@ -1299,6 +1333,327 @@ def _grid_snapshot(**overrides: object) -> dict[str, object]:
     return snapshot
 
 
+def _static_listbox_snapshot(**overrides: object) -> dict[str, object]:
+    snapshot: dict[str, object] = {
+        "isOption": True,
+        "inListbox": True,
+        "popupSemanticsNearby": False,
+        "ownedByTrigger": False,
+        "activeDescendantRef": False,
+        "layered": False,
+        "textEntrySibling": False,
+        "openPopupOnPage": False,
+    }
+    snapshot.update(overrides)
+    return snapshot
+
+
+@pytest.mark.parametrize(
+    ("snapshot", "expected"),
+    [
+        pytest.param(_static_listbox_snapshot(), True, id="all-clear"),
+        *[
+            pytest.param(_static_listbox_snapshot(**{key: True}), False, id=key)
+            for key in (
+                "popupSemanticsNearby",
+                "ownedByTrigger",
+                "activeDescendantRef",
+                "layered",
+                "textEntrySibling",
+                "openPopupOnPage",
+            )
+        ],
+        pytest.param(["not", "a", "snapshot"], False, id="non-dict"),
+        pytest.param(
+            {key: value for key, value in _static_listbox_snapshot().items() if key != "layered"},
+            False,
+            id="missing-key",
+        ),
+        pytest.param(_static_listbox_snapshot(layered=0), False, id="non-bool-value"),
+    ],
+)
+def test_static_listbox_option_snapshot_classification(snapshot: object, expected: bool) -> None:
+    assert is_static_listbox_option_snapshot(snapshot) is expected
+
+
+@pytest.mark.parametrize(
+    ("html", "expected"),
+    [
+        pytest.param(
+            '<label aria-owns="choices">Choice X</label>'
+            '<div role="listbox" id="choices"><a role="option" id="option-a">Option A</a></div>',
+            True,
+            id="static-label-owned-tile",
+        ),
+        pytest.param(
+            '<dialog open role="dialog"><label aria-owns="choices">Choice X</label>'
+            '<div role="listbox" id="choices"><a role="option" id="option-a">Option A</a></div></dialog>',
+            True,
+            id="static-tile-in-dialog",
+        ),
+        pytest.param(
+            '<input role="combobox" aria-expanded="true" aria-controls="choices">'
+            '<div role="listbox" id="choices"><div role="option" id="option-a">Option A</div></div>',
+            False,
+            id="combobox-controls-listbox",
+        ),
+        pytest.param(
+            '<div role="listbox" aria-activedescendant="option-a">'
+            '<div role="option" id="option-a" aria-selected="true">Option A</div></div>',
+            False,
+            id="listbox-active-descendant-highlight",
+        ),
+        pytest.param(
+            '<button aria-expanded="true" aria-controls="popup">Choice X</button>'
+            '<div id="popup"><div role="listbox">'
+            '<div role="option" id="option-a">Option A</div></div></div>',
+            False,
+            id="trigger-controls-wrapper",
+        ),
+        pytest.param(
+            '<div style="position: absolute"><div style="display: contents"><div style="display: contents">'
+            '<div style="display: contents"><div role="listbox">'
+            '<div role="option" id="option-a">Option A</div></div></div></div></div></div>',
+            False,
+            id="aria-less-positioned-popup",
+        ),
+        pytest.param(
+            '<x-picker aria-haspopup="listbox"></x-picker>'
+            "<script>"
+            "const root = document.querySelector('x-picker').attachShadow({mode: 'open'});"
+            'root.innerHTML = \'<div role="listbox"><div role="option" id="option-a">Option A</div></div>\';'
+            "</script>",
+            False,
+            id="shadow-host-popup-semantics",
+        ),
+        pytest.param(
+            "<x-picker></x-picker>"
+            "<script>"
+            "const root = document.querySelector('x-picker').attachShadow({mode: 'open'});"
+            'root.innerHTML = \'<div role="listbox"><div role="option" id="option-a">Option A</div></div>\';'
+            "</script>",
+            True,
+            id="static-shadow-root-tile",
+        ),
+    ],
+)
+@_skip_no_browser
+@pytest.mark.asyncio
+async def test_static_listbox_option_real_dom_matrix(html: str, expected: bool) -> None:
+    async with _grid_fixture_page(html) as page:
+        static = {"id": "option-a", "tagName": "div", "attributes": {"role": "option", "id": "option-a"}}
+        element = SkyvernElement(page.locator("#option-a"), page, static)
+        assert await handler._is_static_listbox_option(element) is expected
+
+
+@pytest.mark.parametrize(
+    ("frame_html", "expected"),
+    [
+        pytest.param('<div role="listbox"><div role="option" id="option-a">A</div></div>', True, id="static"),
+        pytest.param(
+            '<button aria-haspopup="listbox" aria-controls="choices">Open</button>'
+            '<div role="listbox" id="choices"><div role="option" id="option-a">A</div></div>',
+            False,
+            id="popup",
+        ),
+    ],
+)
+@_skip_no_browser
+@pytest.mark.asyncio
+async def test_static_listbox_option_classified_inside_iframe(frame_html: str, expected: bool) -> None:
+    async with _grid_fixture_page(f"<iframe id='child' srcdoc='{frame_html}'></iframe>") as page:
+        frame = await (await page.wait_for_selector("#child")).content_frame()
+        assert frame is not None
+        await frame.wait_for_selector("#option-a")
+        static = {"id": "option-a", "tagName": "div", "attributes": {"role": "option", "id": "option-a"}}
+        element = SkyvernElement(frame.locator("#option-a"), frame, static)
+        assert await handler._is_static_listbox_option(element) is expected
+
+
+@pytest.mark.parametrize(
+    (
+        "target",
+        "selected",
+        "desired_state",
+        "context",
+        "expected_selected",
+        "expected_failure",
+        "option_count",
+        "repeat",
+    ),
+    [
+        pytest.param("option-a", True, None, "static", True, True, 2, 1, id="ambiguous-selected-option"),
+        pytest.param("option-a", True, None, "static", True, False, 2, 2, id="explicit-double-click-selected-option"),
+        pytest.param(
+            "option-a", True, True, "static", True, False, 2, 2, id="explicit-double-click-selected-desired-true"
+        ),
+        pytest.param("choices", False, None, "static", False, True, 2, 1, id="ambiguous-container"),
+        pytest.param("choices", False, None, "static", True, False, 1, 1, id="unique-option-container"),
+        pytest.param("choices", True, None, "static", True, True, 1, 1, id="unique-selected-container"),
+        pytest.param("choices", True, False, "static", False, False, 1, 1, id="unique-container-deselect"),
+        pytest.param("unmapped-option", False, None, "static", False, True, 1, 1, id="stale-container-option"),
+        pytest.param("wrapper", True, None, "static", True, True, 2, 1, id="disabled-wrapper-retarget"),
+        pytest.param("choices", False, None, "trigger", False, False, 2, 1, id="popup-container"),
+        pytest.param("option-a", True, False, "static", False, False, 2, 1, id="intentional-deselect"),
+        pytest.param("option-a", False, None, "static", True, False, 2, 1, id="first-selection"),
+        pytest.param("option-a", True, True, "static", True, False, 2, 1, id="explicit-selected-state"),
+        pytest.param("option-a", True, True, "trigger", False, False, 2, 1, id="popup-highlight-needs-click"),
+        pytest.param("option-a", True, None, "trigger", False, False, 2, 1, id="popup-option-reclick-legacy"),
+        pytest.param("option-a", True, None, "focus", False, False, 2, 1, id="focus-only-reclick-legacy"),
+        pytest.param("outside", False, None, "static", False, False, 2, 1, id="unrelated-click-legacy"),
+        pytest.param("choices", False, None, "display-none", False, False, 1, 1, id="hidden-unique-container-expands"),
+        pytest.param("choices", False, None, "display-none", False, False, 2, 1, id="hidden-container-expands"),
+        pytest.param("choices", False, None, "visibility-hidden", False, False, 2, 1, id="invisible-container-expands"),
+        pytest.param("choices", False, None, "partly-hidden", False, False, 2, 1, id="partly-hidden-container-expands"),
+    ],
+)
+@_skip_no_browser
+@pytest.mark.asyncio
+async def test_static_listbox_click_preserves_field_state(
+    monkeypatch: pytest.MonkeyPatch,
+    target: str,
+    selected: bool,
+    desired_state: bool | None,
+    context: str,
+    expected_selected: bool,
+    expected_failure: bool,
+    option_count: int,
+    repeat: int,
+) -> None:
+    trigger = '<button aria-haspopup="listbox" aria-controls="choices">Open</button>' if context == "trigger" else ""
+    active_descendant = ' aria-activedescendant="option-a"' if context == "focus" else ""
+    collapsed = context in ("display-none", "visibility-hidden", "partly-hidden")
+    hidden_style = "visibility:hidden" if context == "visibility-hidden" else "display:none"
+    option_a_style = hidden_style if context in ("display-none", "visibility-hidden") else ""
+    option_b_style = hidden_style if collapsed else ""
+    placeholder = '<div id="placeholder" style="height:60px">Choose an answer</div>' if collapsed else ""
+    html = (
+        trigger
+        + '<button id="outside">Outside</button>'
+        + f'<div role="listbox" id="choices" style="width:200px"{active_descendant}>'
+        + placeholder
+        + f'<div role="option" id="option-a" aria-selected="{str(selected).lower()}" style="{option_a_style}">'
+        + "Option A</div>"
+        + f'<div role="option" id="option-b" aria-selected="false" style="{option_b_style}">Option B</div></div>'
+        + '<div role="listbox"><div role="option" id="next-answer" aria-selected="false">Next answer</div></div>'
+        + "<script>document.querySelectorAll('[role=option]').forEach(el => el.onclick = () => "
+        + "el.setAttribute('aria-selected', el.getAttribute('aria-selected') !== 'true'));"
+        + "document.querySelectorAll('[role=option]').forEach(el => el.ondblclick = () => "
+        + "el.setAttribute('data-activated', 'true'));"
+        + "const placeholder = document.getElementById('placeholder');"
+        + "if (placeholder) placeholder.onclick = () => document.querySelectorAll('#choices [role=option]')"
+        + ".forEach(el => el.removeAttribute('style'));</script>"
+    )
+    async with _grid_fixture_page(html) as page:
+        if option_count == 1:
+            await page.locator("#option-b").evaluate("el => el.remove()")
+        if target == "wrapper":
+            await page.locator("#option-a").evaluate(
+                "el => { const wrapper = document.createElement('div'); wrapper.id = 'wrapper';"
+                " wrapper.setAttribute('aria-disabled', 'true'); el.replaceWith(wrapper); wrapper.append(el); }"
+            )
+        elements = {}
+        for element_id, tag, attributes in (
+            ("choices", "div", {"role": "listbox"}),
+            ("option-a", "div", {"role": "option"}),
+            ("option-b", "div", {"role": "option"}),
+            ("outside", "button", {}),
+        ):
+            if element_id == "option-b" and option_count == 1:
+                continue
+            await page.locator(f"#{element_id}").evaluate("(el) => el.setAttribute('unique_id', el.id)")
+            elements[element_id] = SkyvernElement(
+                page.locator(f"#{element_id}"),
+                page,
+                {
+                    "id": element_id,
+                    "tagName": tag,
+                    "attributes": attributes,
+                    "interactable": True,
+                    "xpath": f"//*[@id='{element_id}']",
+                },
+            )
+        if target == "wrapper":
+            elements["wrapper"] = SkyvernElement(
+                page.locator("#wrapper"),
+                page,
+                {"id": "wrapper", "tagName": "div", "children": [elements["option-a"].get_element_dict()]},
+            )
+        retarget_expected = target == "choices" and option_count == 1 and context == "static"
+        if target == "unmapped-option":
+            await page.locator("#option-a").evaluate("el => el.setAttribute('unique_id', 'missing')")
+            target = "choices"
+        dom = MagicMock()
+        dom.get_skyvern_element_by_id = AsyncMock(side_effect=lambda element_id: elements[element_id])
+        dom.safe_get_skyvern_element_by_id = AsyncMock(side_effect=lambda element_id: elements.get(element_id))
+        dom.scraped_page = SimpleNamespace(id_to_element_hash={eid: f"hash-{eid}" for eid in elements})
+        incremental = MagicMock()
+        incremental.start_listen_dom_increment = AsyncMock()
+        incremental.stop_listen_dom_increment = AsyncMock()
+        frame = MagicMock()
+        frame.get_disabled_from_style = AsyncMock(return_value=False)
+        frame.scroll_element_into_view = AsyncMock()
+
+        async def physical_click(*args: object, **kwargs: object) -> list[ActionResult]:
+            click_action, element = args[3], args[4]
+            assert isinstance(click_action, ClickAction) and isinstance(element, SkyvernElement)
+            await handler._locator_click(element.get_locator(), handler._get_click_count(click_action))
+            return [ActionSuccess()]
+
+        async def legacy_followup(**kwargs: object) -> None:
+            await page.locator("#next-answer").click()
+
+        provider = FakeExperimentationProvider()
+        task = MagicMock(task_id="tsk_1", workflow_run_id="wr_1", organization_id="o_1", workflow_permanent_id="wpid_1")
+        monkeypatch.setattr(handler, "asyncio", ScopedAsyncio(sleep=AsyncMock()))
+        monkeypatch.setattr(handler.app, "EXPERIMENTATION_PROVIDER", provider)
+        with (
+            patch.object(handler, "DomUtil", return_value=dom),
+            patch.object(handler, "get_or_create_wait_config", new=AsyncMock(return_value=None)),
+            patch.object(handler, "chain_click", new=physical_click),
+            patch.object(handler, "resolve_engine_selection_for_task", return_value=None),
+            patch.object(handler.SkyvernFrame, "create_instance", new=AsyncMock(return_value=frame)),
+            patch.object(handler, "IncrementalScrapePage", return_value=incremental),
+            patch.object(handler, "handle_sequential_click_with_submit_bypass", new=legacy_followup),
+        ):
+            planned = elements[target].get_element_dict() if target in elements else {}
+            action = ClickAction(
+                element_id=target,
+                repeat=repeat,
+                click_context=ClickContext(desired_state=desired_state),
+                skyvern_element_data={**planned, "page_url": "http://fixture.test/"} if planned else None,
+                skyvern_element_hash=f"hash-{target}",
+                xpath=planned.get("xpath") if target == "choices" else None,
+            )
+            results = await handler.handle_click_action(action, page, MagicMock(), task, MagicMock())
+
+        assert (await page.locator("#option-a").get_attribute("aria-selected") == "true") is expected_selected
+        assert any(isinstance(result, ActionFailure) for result in results) is expected_failure
+        legacy_path = not expected_failure and (context != "static" or target == "outside")
+        assert (await page.locator("#next-answer").get_attribute("aria-selected") == "true") is legacy_path
+        assert all(call[0] != "FIX_STATIC_LISTBOX_OPTION_CLICK" for call in provider.calls)
+        activated = await page.locator("#option-a").get_attribute("data-activated") == "true"
+        assert activated is (repeat == 2 and not expected_failure)
+        if target == "choices":
+            final_id = "option-a" if retarget_expected else "choices"
+            assert action.element_id == final_id
+            assert action.get_xpath() == f"//*[@id='{final_id}']"
+            assert await page.locator(f"xpath={action.get_xpath()}").get_attribute("id") == final_id
+            assert action.skyvern_element_data is not None
+            assert action.skyvern_element_data["attributes"]["role"] == ("option" if retarget_expected else "listbox")
+            assert action.skyvern_element_data["page_url"] == "http://fixture.test/"
+            assert action.skyvern_element_hash == f"hash-{final_id}"
+        if collapsed:
+            assert await page.locator("#option-a").is_visible()
+            if option_count == 2:
+                assert await page.locator("#option-b").is_visible()
+                assert await page.locator("#option-b").get_attribute("aria-selected") == "false"
+        if expected_failure:
+            assert results[-1].skip_remaining_actions is True
+            if option_count == 2:
+                assert await page.locator("#option-b").get_attribute("aria-selected") == "false"
+
+
 # --- _classify_grid_row_selection — pure classifier, no browser --------------
 
 
@@ -1916,7 +2271,7 @@ def _real_checkbox_element(page: Page, css_id: str) -> SkyvernElement:
 
 
 @contextlib.asynccontextmanager
-async def _grid_fixture_page() -> AsyncIterator[Page]:
+async def _grid_fixture_page(html: str = _GRID_FIXTURE_HTML) -> AsyncIterator[Page]:
     async with async_playwright() as pw:
         browser = await pw.chromium.launch(headless=True, args=["--use-mock-keychain", "--password-store=basic"])
         try:
@@ -1924,7 +2279,7 @@ async def _grid_fixture_page() -> AsyncIterator[Page]:
             # visible region; per-element clip tests rely on their own `.clip-window`, not the viewport.
             context = await browser.new_context(viewport={"width": 1280, "height": 2400})
             page = await context.new_page()
-            await page.set_content(_GRID_FIXTURE_HTML)
+            await page.set_content(html)
             yield page
         finally:
             await browser.close()

@@ -27,6 +27,7 @@ from skyvern.forge.sdk.schemas.custom_llms import (
 )
 from skyvern.forge.sdk.schemas.organizations import ClearOrganizationAuthTokenResponse, Organization
 from skyvern.forge.sdk.services import org_auth_service
+from skyvern.forge.sdk.services.route_authorization import require_request_actions
 from skyvern.forge.sdk.settings_manager import SettingsManager
 from skyvern.utils.url_validators import validate_fetch_url
 
@@ -110,6 +111,7 @@ async def list_custom_llms(
 async def create_custom_llm(
     request: CustomLLMCreateRequest,
     current_org: Organization = Depends(org_auth_service.get_current_org_for_credential_routes),
+    _request_authorization: None = Depends(require_request_actions(frozenset({"custom_model.create"}))),
 ) -> CustomLLMResponse:
     await _validate_custom_llm_api_base(request.config)
     token = await app.DATABASE.organizations.create_org_auth_token(
@@ -145,6 +147,7 @@ async def update_custom_llm(
     request: CustomLLMUpdateRequest,
     custom_llm_id: str = Path(..., description="The custom LLM id."),
     current_org: Organization = Depends(org_auth_service.get_current_org_for_credential_routes),
+    _request_authorization: None = Depends(require_request_actions(frozenset({"custom_model.update"}))),
 ) -> CustomLLMResponse:
     try:
         existing_custom_llm = await _get_custom_llm(current_org.organization_id, custom_llm_id)
@@ -195,6 +198,7 @@ async def update_custom_llm(
 async def delete_custom_llm(
     custom_llm_id: str = Path(..., description="The custom LLM id."),
     current_org: Organization = Depends(org_auth_service.get_current_org_for_credential_routes),
+    _request_authorization: None = Depends(require_request_actions(frozenset({"custom_model.delete"}))),
 ) -> ClearOrganizationAuthTokenResponse:
     try:
         await app.DATABASE.organizations.invalidate_org_auth_token(

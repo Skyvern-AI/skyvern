@@ -45,6 +45,7 @@ from .banned_blocks import CREDENTIAL_CODE_ACCESSORS, ONE_TIME_CODE_TOTP_TYPES, 
 LOG = structlog.get_logger()
 
 
+LIST_CREDENTIALS_MAX_PAGE_SIZE = 50
 _CREDENTIAL_ID_RE = re.compile(r"\bcred_[A-Za-z0-9][A-Za-z0-9_-]*\b")
 
 
@@ -181,6 +182,22 @@ def _google_sheet_connection_bindings_from_workflow_definition(
 
 
 _GOOGLE_SHEETS_BLOCK_TYPES = {"google_sheets_read", "google_sheets_write"}
+_UNRESOLVED_GOOGLE_SLOT_NOTE = (
+    "The slot was left as written, and a slot still holding an unresolved reference cannot run."
+)
+_UNRESOLVED_GOOGLE_CONNECTION_TEXT = {
+    "ambiguous": "More than one of the organization's Google connections matches this reference.",
+    "not_found": "None of the organization's Google connections matches this reference.",
+    "ineligible": (
+        "This reference matches one Google connection, but that connection is not an active one with Google "
+        "Sheets access."
+    ),
+    "not_cited": "The user's message for this turn does not name this reference on its own, so it was not resolved.",
+    "lookup_failed": (
+        "The organization's Google connections could not be read, so this is not evidence that the connection "
+        "is missing."
+    ),
+}
 _GOOGLE_CONNECTION_PREFIX = "goac_"
 _UNAPPROVED_GOOGLE_CONNECTION_REASON_CODE = "unapproved_google_connection_reference"
 
@@ -355,6 +372,8 @@ async def canonicalize_named_google_sheet_bindings(
                     fact["status"] = "ineligible"
         if not fact["canonicalized"]:
             fact["eligible_connections"] = [_connection_row_facts(candidate) for candidate in eligible]
+            text = _UNRESOLVED_GOOGLE_CONNECTION_TEXT.get(fact["status"])
+            fact["detail"] = f"{text} {_UNRESOLVED_GOOGLE_SLOT_NOTE}" if text else _UNRESOLVED_GOOGLE_SLOT_NOTE
         facts.append(fact)
 
     if changed:
@@ -861,10 +880,7 @@ async def _credential_ids_validation_error(credential_ids: list[str], ctx: Agent
     ]
     try:
         existing_credentials = (
-            await app.DATABASE.credentials.get_credentials_by_ids(
-                password_credential_ids,
-                organization_id=ctx.organization_id,
-            )
+            await load_credentials(ctx.organization_id, credential_ids=password_credential_ids)
             if password_credential_ids
             else []
         )
@@ -966,8 +982,9 @@ def _typed_resume_arm(reference: str, policy: RequestPolicy, matches: list[Crede
         # resolve exactly one leaves the not-found and ambiguous answers below to report themselves.
         return len(matches) != 1 or matches[0].credential_id == credential.credential_id
 
+    named_this_turn = policy.current_turn_named_credential_ids | policy.credential_pause_connected_credential_ids
     if any(
-        credential.credential_id in policy.current_turn_named_credential_ids
+        credential.credential_id in named_this_turn
         and reference in {credential.credential_id, credential.name}
         and keyed(credential)
         for credential in policy.resolved_credentials
@@ -1032,15 +1049,17 @@ async def _resolve_exact_credential(reference: str, ctx: AgentContext) -> dict[s
             },
         }
     if len(matches) != 1:
-        status = "not_found" if not matches else "ambiguous"
-        return {
-            "ok": False,
-            "data": {
-                "status": status,
-                "reference": reference,
-                "candidates": [_serialize_credential(credential) for credential in matches],
-            },
+        data: dict[str, Any] = {
+            "status": "ambiguous" if matches else "not_found",
+            "reference": reference,
+            "candidates": [_serialize_credential(credential) for credential in matches],
         }
+        if not matches:
+            withdrawn = policy.record_named_login_not_found()
+            data["page_login_binding"] = "off_for_this_turn"
+            data["withdrawn_credential_ids"] = withdrawn
+            LOG.info("copilot_named_login_not_found", withdrawn_credential_ids=withdrawn)
+        return {"ok": False, "data": data}
 
     credential = matches[0]
     policy.resolved_credentials = [
@@ -1085,12 +1104,8 @@ async def _list_credentials(params: dict[str, Any], ctx: AgentContext) -> dict[s
         return await _resolve_exact_credential(exact_reference, ctx)
 
     page = max(1, params.get("page", 1))
-    page_size = min(max(1, params.get("page_size") or 10), 50)
-    credentials = await app.DATABASE.credentials.get_credentials(
-        organization_id=ctx.organization_id,
-        page=page,
-        page_size=page_size,
-    )
+    page_size = min(max(1, params.get("page_size") or 10), LIST_CREDENTIALS_MAX_PAGE_SIZE)
+    credentials = await load_credentials(ctx.organization_id, page=page, page_size=page_size)
     serialized = [_serialize_credential(credential) for credential in credentials]
     _record_discovered_credentials_on_policy(ctx, credentials)
     return {

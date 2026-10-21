@@ -1,11 +1,9 @@
 """The multi-viewport LITE stitch must release its decoded images eagerly.
 
 ``SkyvernFrame.take_scrolling_screenshot`` decodes one ``PIL.Image`` per viewport,
-stitches them, and PNG-encodes the result. Those objects land in reference cycles that
-generation-0 GC defers, so plain refcount drop leaves ~100 MB/event resident until a full
-collection runs (which can exhaust worker memory). These tests pin the fix: explicit close of the decoded
-images, the stitched image, and the PNG buffer, followed by a full ``gc.collect()`` scoped
-to the multi-viewport stitch — without changing the returned bytes or scroll restoration.
+stitches them, and PNG-encodes the result. These tests pin explicit close of the decoded
+images, the stitched image, and the PNG buffer, followed by a rate-limited full ``gc.collect()``
+after a multi-viewport stitch, without changing the returned bytes or scroll restoration.
 
 Viewport CDP recovery contracts live in ``webeye/test_screenshot_cdp_fallback.py``.
 """
@@ -145,6 +143,11 @@ async def _invoke_take_scrolling_screenshot(
         )
 
 
+@pytest.fixture(autouse=True)
+def _fresh_stitch_gc_interval(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(page_module, "_last_stitch_gc_at", float("-inf"))
+
+
 @pytest.mark.asyncio
 async def test_multi_viewport_stitch_closes_resources_and_collects() -> None:
     screenshots = [
@@ -206,6 +209,33 @@ async def test_multi_viewport_stitch_closes_resources_and_collects() -> None:
     assert gc_state.get("all_closed_at_gc") is True, "gc.collect() must run AFTER explicit cleanup"
 
     assert fake_frame.scroll_restore_calls == [(11, 22)], "scroll position must be restored"
+
+
+@pytest.mark.asyncio
+async def test_multi_viewport_stitch_collects_at_most_once_per_interval() -> None:
+    screenshots = [_png_bytes(120, 100, (10, 20, 30)), _png_bytes(120, 100, (40, 50, 60))]
+    fake_gc = MagicMock()
+
+    async def _stitch_once() -> None:
+        await _invoke_take_scrolling_screenshot(
+            screenshots=screenshots,
+            positions=[0, 80],
+            scrolling_number=2,
+            merge_impl=page_module._merge_images_by_position,
+            fake_gc=fake_gc,
+            bytesio_instances=[],
+            fake_frame=_FakeSkyvernFrame(),
+        )
+
+    await _stitch_once()
+    await _stitch_once()
+    assert fake_gc.collect.call_count == 1, "a second stitch inside the interval must not pause the loop again"
+
+    page_module._last_stitch_gc_at -= (
+        page_module.SettingsManager.get_settings().SCREENSHOT_STITCH_GC_MIN_INTERVAL_SECONDS
+    )
+    await _stitch_once()
+    assert fake_gc.collect.call_count == 2, "the first stitch after the interval must collect"
 
 
 @pytest.mark.asyncio

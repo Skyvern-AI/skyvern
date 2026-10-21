@@ -1,21 +1,29 @@
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 from enum import StrEnum
+from typing import Literal, TypeGuard
 
-from pydantic import BaseModel, ConfigDict, field_validator
+import structlog
+from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 from skyvern.exceptions import (
     BrowserSessionClosed,
     BrowserSessionExpired,
+    BrowserSessionOwnershipConflict,
     BrowserSessionStartupTimeout,
+    ExternalBrowserUnavailable,
     SkyvernHTTPException,
+    get_user_facing_exception_message,
 )
 from skyvern.forge.sdk.db.utils import deserialize_proxy_location
 from skyvern.schemas.browser_session_close import BrowserSessionCloseReason
-from skyvern.schemas.browser_session_timeouts import lived_full_lifetime
+from skyvern.schemas.browser_session_timeouts import DEFAULT_TIMEOUT, lived_full_lifetime
 from skyvern.schemas.browser_settings import BrowserSettings, BrowserSettingsReceipt
+from skyvern.schemas.external_cdp import EXTERNAL_CDP_BROWSER_VENDOR
 from skyvern.schemas.proxy_pinning import validate_proxy_session_id
 from skyvern.schemas.runs import GeoTarget, ProxyLocation, ProxyLocationInput
+
+LOG = structlog.get_logger(__name__)
 
 
 class PersistentBrowserSessionStatus(StrEnum):
@@ -97,7 +105,7 @@ class PersistentBrowserSession(BaseModel):
     # Server-side only: the upstream CDP endpoint and the adapter that dials it. browser_address
     # remains the client-facing proxy URL. These must never reach a client or a log —
     # BrowserSessionResponse.from_browser_session is the allowlist that enforces the former.
-    upstream_cdp_url: str | None = None
+    upstream_cdp_url: str | None = Field(default=None, repr=False)
     browser_vendor: str | None = None
     # The upstream provider's own id for this browser. Server-side only, under the same allowlist
     # as the two fields above. It is the sole handle for terminating a session out of band, so the
@@ -132,6 +140,8 @@ class PersistentBrowserSession(BaseModel):
     browser_settings_receipt: BrowserSettingsReceipt | None = None
     # The workflow run whose own setup created this session; never set for a session a caller attaches.
     created_for_workflow_run_id: str | None = None
+    # The workflow a Copilot chat provisioned this browser for.
+    created_for_workflow_permanent_id: str | None = None
     # False once a requested browser_profile_id failed to load at launch (fell back to a fresh profile),
     # so teardown exported under the session id rather than the bp_ id.
     browser_profile_loaded: bool = True
@@ -172,29 +182,82 @@ class PersistentBrowserSession(BaseModel):
         return not self.profile_read_only and bool(self.generate_browser_profile or self.browser_profile_id)
 
 
+def is_external_cdp_session(browser_session: PersistentBrowserSession | None) -> TypeGuard[PersistentBrowserSession]:
+    return browser_session is not None and browser_session.browser_vendor == EXTERNAL_CDP_BROWSER_VENDOR
+
+
+def seconds_until_external_deadline(browser_session: PersistentBrowserSession) -> float:
+    """The deadline is fixed at registration: activity never extends it."""
+    started_at = browser_session.started_at or browser_session.created_at
+    if started_at.tzinfo is None:
+        started_at = started_at.replace(tzinfo=timezone.utc)
+    deadline = started_at + timedelta(minutes=browser_session.timeout_minutes or DEFAULT_TIMEOUT)
+    return (deadline - datetime.now(timezone.utc)).total_seconds()
+
+
+def is_external_cdp_session_expired(browser_session: PersistentBrowserSession) -> bool:
+    return seconds_until_external_deadline(browser_session) <= 0
+
+
+def is_external_cdp_session_open(browser_session: PersistentBrowserSession) -> bool:
+    return (
+        browser_session.completed_at is None
+        and not is_final_status(browser_session.status)
+        and bool(browser_session.upstream_cdp_url)
+    )
+
+
+def assert_runnable_owner(
+    browser_session: PersistentBrowserSession,
+    expected_runnable_id: str | None,
+    expected_runnable_generation_id: str | None,
+) -> None:
+    if expected_runnable_id is not None and (
+        browser_session.runnable_id != expected_runnable_id
+        or (
+            expected_runnable_generation_id is not None
+            and browser_session.runnable_generation_id != expected_runnable_generation_id
+        )
+    ):
+        raise BrowserSessionOwnershipConflict(browser_session.persistent_browser_session_id)
+
+
 def unusable_browser_session_error(
-    session: PersistentBrowserSession, *, refused_at_submission: bool = False
+    session: PersistentBrowserSession,
+    *,
+    refused_at_submission: bool = False,
+    submission_path: Literal["workflow_run", "task_v1", "task_v2"] | None = None,
 ) -> SkyvernHTTPException | None:
     """The error a run sent to this session fails (or, at submission, is refused) with, or None while it is usable.
 
     The single source for both run submission and the session managers' lease, so the two cannot disagree."""
-    if not (
+    ended = (
         is_final_status(session.status) or session.completed_at is not None or session.close_requested_at is not None
-    ):
+    )
+    # A registration past its fixed deadline is expired before the deadline watcher closes its row.
+    expired_open_registration = (
+        not ended and is_external_cdp_session(session) and is_external_cdp_session_expired(session)
+    )
+    if not ended and not expired_open_registration:
         return None
     session_id = session.persistent_browser_session_id
     timed_out = session.status == PersistentBrowserSessionStatus.timeout
+    error: SkyvernHTTPException
     if timed_out and session.started_at is None:
-        return BrowserSessionStartupTimeout(session_id)
+        error = BrowserSessionStartupTimeout(session_id)
     # A session that reaches its lifetime ends with status timeout, or is closed as completed with close reason
     # expired, a reason a retirement can also stamp before the lifetime is up.
-    if timed_out or (
-        session.close_reason == BrowserSessionCloseReason.expired
-        and lived_full_lifetime(
-            started_at=session.started_at, ended_at=session.completed_at, timeout_minutes=session.timeout_minutes
+    elif (
+        timed_out
+        or expired_open_registration
+        or (
+            session.close_reason == BrowserSessionCloseReason.expired
+            and lived_full_lifetime(
+                started_at=session.started_at, ended_at=session.completed_at, timeout_minutes=session.timeout_minutes
+            )
         )
     ):
-        return BrowserSessionExpired(
+        error = BrowserSessionExpired(
             session_id,
             started_at=session.started_at,
             ended_at=session.completed_at,
@@ -202,8 +265,37 @@ def unusable_browser_session_error(
             created_by=session.created_by,
             bound=session.bound_key is not None or session.bound_workflow_permanent_id is not None,
             refused_at_submission=refused_at_submission,
+            registered=is_external_cdp_session(session),
         )
-    return BrowserSessionClosed(session_id, reason=f"is no longer usable (status: {session.status})")
+    else:
+        error = BrowserSessionClosed(
+            session_id,
+            reason=f"is no longer usable (status: {session.status})",
+            registered=is_external_cdp_session(session),
+        )
+    if refused_at_submission:
+        LOG.warning(
+            "browser_session_run_refused",
+            error_code=error.error_code,
+            browser_session_id=session_id,
+            submission_path=submission_path,
+        )
+    return error
+
+
+def lost_external_browser_error(session: PersistentBrowserSession | None) -> SkyvernHTTPException:
+    """Why a run lost a registered external browser: the registration's own end if it has one, else the browser."""
+    ended = unusable_browser_session_error(session) if session is not None else None
+    return ended or ExternalBrowserUnavailable.lost()
+
+
+def external_browser_failure_reason(session: PersistentBrowserSession | None, *, browser_connected: bool) -> str | None:
+    """The failure reason a run on a registered external browser records; None for any other session or while usable."""
+    if not is_external_cdp_session(session):
+        return None
+    if browser_connected and unusable_browser_session_error(session) is None:
+        return None
+    return get_user_facing_exception_message(lost_external_browser_error(session))
 
 
 class FreshExitOutcome(StrEnum):

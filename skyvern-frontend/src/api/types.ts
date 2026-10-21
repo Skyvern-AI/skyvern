@@ -271,6 +271,7 @@ export type OnePasswordItemApiResponse = {
   vault_id: string;
   vault_name: string;
   category: string;
+  importable?: boolean;
   url?: string | null;
 };
 
@@ -278,6 +279,38 @@ export type OnePasswordItemsApiResponse = {
   configured: boolean;
   source: OnePasswordTokenSource | null;
   items: Array<OnePasswordItemApiResponse>;
+};
+
+export const ONEPASSWORD_CREDENTIALS_REQUEST_LIMIT = 500;
+
+export type OnePasswordCredentialImportRequest = {
+  folder_id?: string;
+  items: Array<{ vault_id: string; item_id: string }>;
+};
+
+export type OnePasswordCredentialImportResult = {
+  vault_id: string;
+  item_id: string;
+  status: "imported" | "updated" | "skipped";
+  reason?: string | null;
+};
+
+export type OnePasswordCredentialImportResponse = {
+  results: Array<OnePasswordCredentialImportResult>;
+};
+
+export type OnePasswordCredentialRefreshResult = {
+  vault_id: string;
+  item_id: string;
+  status: "refreshed" | "stale" | "skipped";
+  reason?: string | null;
+};
+
+export type OnePasswordCredentialRefreshResponse = {
+  refreshed: number;
+  stale: number;
+  skipped: number;
+  results: Array<OnePasswordCredentialRefreshResult>;
 };
 
 export type BitwardenItemApiResponse = {
@@ -386,6 +419,8 @@ export interface GoogleOAuthCredential {
   scopes_granted?: string[] | string | null;
   scopes?: string[] | string | null;
   valid?: boolean | null;
+  // Decided by the server: active, send permission granted, and a verified account identity on record.
+  gmail_send_ready?: boolean;
   created_at: string;
   modified_at: string;
 }
@@ -420,10 +455,17 @@ export interface UpdateGoogleOAuthClientConfigRequest {
   app_origins: string[];
 }
 
+export type GoogleOAuthScopeProfile =
+  | "google_sheets"
+  | "gmail"
+  | "google_drive"
+  | "gmail_send"
+  | "gmail_read_send";
+
 export interface CreateGoogleOAuthAuthorizeRequest {
   redirect_uri: string;
   credential_name?: string;
-  scope_profile?: string;
+  scope_profile?: GoogleOAuthScopeProfile;
   app_origin?: string;
   // Existing credential to re-authenticate in place, preserving its id so
   // workflows referencing it keep working without edits.
@@ -1116,6 +1158,17 @@ export type CredentialApiResponse = {
     | SecretCredentialResponse;
   credential_type: "password" | "credit_card" | "secret";
   name: string;
+  vault_type?:
+    | "skyvern"
+    | "bitwarden"
+    | "azure_vault"
+    | "gcp"
+    | "custom"
+    | "onepassword"
+    | null;
+  vault_id?: string | null;
+  item_id?: string | null;
+  upstream_missing_at?: string | null;
   browser_profile_id?: string | null;
   auto_profile_disabled?: boolean | null;
   pin_saved_session_ip?: boolean | null;

@@ -8,14 +8,17 @@ token truncation, and error handling for DOCX files.
 from __future__ import annotations
 
 import asyncio
+import gzip
 import json
 import os
 import re
+import struct
 import tempfile
 import time
 import zipfile
-from collections.abc import Awaitable
-from contextlib import suppress
+import zlib
+from collections.abc import Awaitable, Iterator
+from contextlib import contextmanager, suppress
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, get_args
@@ -26,12 +29,16 @@ import libcst as cst
 import pandas as pd
 import pytest
 import structlog
+from pypdf import PdfReader, apply_configuration
+from pypdf.errors import LimitReachedError, PdfReadError
 
 import skyvern.forge.sdk.workflow.models.block as block_module
 from skyvern.core.script_generations.generate_script import _build_file_url_parser_statement
+from skyvern.exceptions import PDFParsingError
 from skyvern.forge import app
 from skyvern.forge.forge_app_initializer import start_forge_app
 from skyvern.forge.sdk.api.llm.exceptions import InvalidLLMResponseFormat
+from skyvern.forge.sdk.utils.pdf_parser import extract_pdf_file, scrambled_text_layer_reason, validate_pdf_file
 from skyvern.forge.sdk.workflow.context_manager import WorkflowRunContext
 from skyvern.forge.sdk.workflow.exceptions import FileParseTimeout, InvalidFileType, WorksheetNotFound
 from skyvern.forge.sdk.workflow.models.block import BlockType, FileParserBlock, PDFParserBlock
@@ -778,6 +785,25 @@ class TestPDFParserSchemaValidation:
         assert "expected type object, got array" in prompts[1]
         record_output_parameter_value.assert_awaited_once()
 
+    async def test_stalled_model_fails_the_block_at_the_deadline(self) -> None:
+        block = _make_pdf_parser_block("https://example.com/resume.pdf")
+
+        async def stalled_handler(**kwargs: Any) -> Any:
+            await asyncio.Event().wait()
+
+        with pytest.MonkeyPatch.context() as mp:
+            self._patch_execute_dependencies(mp, block, AsyncMock(side_effect=stalled_handler))
+            mp.setattr("skyvern.forge.sdk.workflow.models.block.FILE_PARSER_LLM_CALL_TIMEOUT_SECONDS", 0.05)
+
+            # The outer bound turns a missing deadline into a failure rather than a hung test run.
+            result = await asyncio.wait_for(
+                block.execute("workflow-run", "workflow-run-block", organization_id="org-1"), timeout=10
+            )
+
+        assert result.success is False
+        assert result.status == BlockStatus.failed
+        assert "did not answer within" in (result.failure_reason or "")
+
 
 @pytest.mark.asyncio
 class TestOcrPdfPages:
@@ -903,6 +929,31 @@ class TestOcrPdfPages:
             with pytest.raises(RuntimeError, match="vision model outage"):
                 await block._ocr_pdf_pages([b"p1", b"p2", b"p3"])
 
+    @pytest.mark.parametrize(
+        ("call_timeout", "pass_timeout", "expected_reason"),
+        [(0.05, 10, "did not answer within"), (10, 0.05, "did not transcribe")],
+        ids=["page_deadline", "whole_pass_deadline"],
+    )
+    async def test_stalled_page_fails_the_pass_instead_of_being_skipped(
+        self, call_timeout: float, pass_timeout: float, expected_reason: str
+    ) -> None:
+        """Skipping a page the model never answered would hand extraction a document with that page missing."""
+        block = _make_file_parser_block("https://example.com/scan.pdf", FileType.PDF)
+
+        async def fake_handler(**kwargs: Any) -> dict[str, str]:
+            (image,) = kwargs["screenshots"]
+            if image == b"stalled":
+                await asyncio.Event().wait()
+            return {"extracted_text": f"text for {image.decode()}"}
+
+        with pytest.MonkeyPatch.context() as mp:
+            self._patch_handler(mp, AsyncMock(side_effect=fake_handler))
+            mp.setattr("skyvern.forge.sdk.workflow.models.block.FILE_PARSER_LLM_CALL_TIMEOUT_SECONDS", call_timeout)
+            mp.setattr("skyvern.forge.sdk.workflow.models.block.PDF_OCR_TOTAL_TIMEOUT_SECONDS", pass_timeout)
+
+            with pytest.raises(TimeoutError, match=expected_reason):
+                await asyncio.wait_for(block._ocr_pdf_pages([b"good-1", b"stalled", b"good-3"]), timeout=5)
+
     async def test_empty_pages_contribute_nothing(self) -> None:
         """Pages that OCR to empty text add neither a marker nor content."""
         block = _make_file_parser_block("https://example.com/scan.pdf", FileType.PDF)
@@ -1007,6 +1058,500 @@ class TestOcrPdfPages:
         assert "page A" in result and "page B" in result
 
 
+# digit d -> U+0111 + d, ':' -> U+0146, '.' -> U+0144
+_DIGIT_REMAP = {ord(str(digit)): 0x0111 + digit for digit in range(10)} | {ord(":"): 0x0146, ord("."): 0x0144}
+
+_INVOICE_LINES = (
+    "Mobile Manager Invoice",
+    "Account Number: 7249163085",
+    "Date: 17 Aug 26",
+    "Invoice Total: 1234.56 GBP",
+    "Billing Period: 01 Jul 26 to 31 Jul 26",
+    "Please remit payment using the reference above.",
+)
+
+# An itemised page is mostly digits, so the scrambled glyphs outnumber the English labels.
+_ITEMISED_INVOICE_LINES = _INVOICE_LINES + tuple(
+    f"07700 9000{index % 10:02d}  17 Aug 26  09:1{index % 10}  00:0{index % 6}:12  0.0{index % 9} GBP"
+    for index in range(40)
+)
+
+
+def _lzw_literals(data: bytes) -> bytes:
+    """LZW-encode ``data`` as bare 9-bit literals, clearing the table often enough that the code width never grows."""
+    codes = [code for index, byte in enumerate(data) for code in ((256, byte) if index % 100 == 0 else (byte,))]
+    bits = "".join(f"{code:09b}" for code in (*codes, 257))
+    bits += "0" * (-len(bits) % 8)
+    return int(bits, 2).to_bytes(len(bits) // 8, "big")
+
+
+def _run_length_literals(data: bytes) -> bytes:
+    """Run-length-encode ``data`` as literal runs only."""
+    runs = (data[start : start + 128] for start in range(0, len(data), 128))
+    return b"".join(bytes([len(run) - 1]) + run for run in runs) + b"\x80"
+
+
+def _build_pdf(
+    lines: tuple[str, ...],
+    remap: dict[int, int] | None = None,
+    font_entries: bytes = b"",
+    flate_content: bool = False,
+    lzw_content: bool = False,
+    run_length_content: bool = False,
+    gzip_content: bool = False,
+    jbig2_content: bool = False,
+    png_predictor: tuple[int, int] | None = None,
+    flate_xref_stream: bool = False,
+    content_copies: int = 1,
+    cid_widths: bytes | None = None,
+    cid_to_unicode_range: str | None = None,
+    cid_to_unicode_char: str | None = None,
+    content_length: int | None = None,
+) -> bytes:
+    """Build a one-page PDF that always draws plain ASCII codes, so ``remap`` alone makes the ToUnicode map lie.
+
+    The other options each shape one structure a limit test needs: Flate, LZW, run-length, gzip-wrapped Flate or JBIG2
+    content (at most one; gzip reaches pypdf's recovery loop, JBIG2 stays undecoded), a PNG predictor as
+    (Colors, Columns) on Flate content, a Flate xref stream, repeated /Contents, a CID font with its /W array and
+    ToUnicode bfrange or bfchar, and a replaced content /Length. Options that would silently override or ignore each
+    other raise ValueError.
+    """
+    if sum([flate_content, lzw_content, run_length_content, gzip_content, jbig2_content]) > 1:
+        raise ValueError("the content encodings are mutually exclusive")
+    if png_predictor is not None and not flate_content:
+        raise ValueError("png_predictor needs flate_content")
+    if cid_widths is not None and (remap or font_entries):
+        raise ValueError("remap and font_entries are ignored by a CID font, which defines its own ToUnicode")
+    if cid_widths is None and (cid_to_unicode_range is not None or cid_to_unicode_char is not None):
+        raise ValueError("cid_to_unicode_range and cid_to_unicode_char need cid_widths")
+    if cid_widths is None:
+        shown = "".join(f"({line}) Tj T*\n" for line in lines)
+    else:
+        shown = "".join("<" + "".join(f"{ord(char):04X}" for char in line) + "> Tj T*\n" for line in lines)
+    content = ("BT /F1 12 Tf 72 720 Td 16 TL\n" + shown + "ET").encode()
+    content_filter = b""
+    if flate_content:
+        if png_predictor is not None:
+            colors, columns = png_predictor
+            row_length = colors * columns
+            content += b" " * (-len(content) % row_length)
+            content = b"".join(
+                b"\x00" + content[start : start + row_length] for start in range(0, len(content), row_length)
+            )
+            content_filter = b" /DecodeParms << /Predictor 12 /Colors %d /Columns %d >>" % (colors, columns)
+        content = zlib.compress(content)
+        content_filter += b" /Filter /FlateDecode"
+    elif gzip_content:
+        content = gzip.compress(content)
+        content_filter = b" /Filter /FlateDecode"
+    elif lzw_content:
+        content = _lzw_literals(content)
+        content_filter = b" /Filter /LZWDecode"
+    elif run_length_content:
+        content = _run_length_literals(content)
+        content_filter = b" /Filter /RunLengthDecode"
+    elif jbig2_content:
+        content_filter = b" /Filter /JBIG2Decode"
+    to_unicode: str | None = None
+    if remap:
+        entries = "\n".join(f"<{code:02X}> <{unicode_point:04X}>" for code, unicode_point in sorted(remap.items()))
+        to_unicode = (
+            f"1 begincodespacerange\n<00> <FF>\nendcodespacerange\n{len(remap)} beginbfchar\n{entries}\nendbfchar\n"
+        )
+    if cid_widths is None:
+        font = b"<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica" + font_entries
+    else:
+        to_unicode = (
+            "1 begincodespacerange\n<0000> <FFFF>\nendcodespacerange\n"
+            f"1 beginbfrange\n{cid_to_unicode_range or '<0000> <00FF> <0000>'}\nendbfrange\n"
+        )
+        if cid_to_unicode_char:
+            to_unicode += f"1 beginbfchar\n{cid_to_unicode_char}\nendbfchar\n"
+        font = (
+            b"<< /Type /Font /Subtype /Type0 /BaseFont /Helvetica /Encoding /Identity-H /DescendantFonts "
+            b"[<< /Type /Font /Subtype /CIDFontType2 /BaseFont /Helvetica "
+            b"/CIDSystemInfo << /Registry (Adobe) /Ordering (Identity) /Supplement 0 >> /W %s >>]" % cid_widths
+        )
+    contents = b"5 0 R" if content_copies == 1 else b"[%s]" % b" ".join([b"5 0 R"] * content_copies)
+    objects = [
+        b"<< /Type /Catalog /Pages 2 0 R >>",
+        b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>",
+        b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] "
+        b"/Resources << /Font << /F1 4 0 R >> >> /Contents %s >>" % contents,
+        font + (b" /ToUnicode 6 0 R >>" if to_unicode else b" >>"),
+        b"<< /Length %d%s >>\nstream\n" % (len(content) if content_length is None else content_length, content_filter)
+        + content
+        + b"\nendstream",
+    ]
+    if to_unicode:
+        cmap = (
+            "/CIDInit /ProcSet findresource begin\n12 dict begin\nbegincmap\n/CMapName /Broken def\n"
+            f"/CMapType 2 def\n{to_unicode}endcmap\n"
+            "CMapName currentdict /CMap defineresource pop\nend\nend"
+        ).encode()
+        objects.append(b"<< /Length %d >>\nstream\n" % len(cmap) + cmap + b"\nendstream")
+
+    out = bytearray(b"%PDF-1.4\n")
+    offsets = []
+    for number, payload in enumerate(objects, start=1):
+        offsets.append(len(out))
+        out += b"%d 0 obj\n" % number + payload + b"\nendobj\n"
+    xref_at = len(out)
+    if flate_xref_stream:
+        rows = struct.pack(">BIH", 0, 0, 65535)
+        rows += b"".join(struct.pack(">BIH", 1, offset, 0) for offset in (*offsets, xref_at))
+        xref_data = zlib.compress(rows)
+        out += b"%d 0 obj\n<< /Type /XRef /Size %d /W [1 4 2] /Root 1 0 R /Filter /FlateDecode /Length %d >>\n" % (
+            len(objects) + 1,
+            len(objects) + 2,
+            len(xref_data),
+        )
+        out += b"stream\n" + xref_data + b"\nendstream\nendobj\n"
+    else:
+        out += b"xref\n0 %d\n" % (len(objects) + 1) + b"0000000000 65535 f \n"
+        out += b"".join(b"%010d 00000 n \n" % offset for offset in offsets)
+        out += b"trailer\n<< /Size %d /Root 1 0 R >>\n" % (len(objects) + 1)
+    out += b"startxref\n%d\n%%%%EOF\n" % xref_at
+    return bytes(out)
+
+
+@pytest.mark.asyncio
+class TestScrambledTextLayerFallback:
+    """A text layer the embedded font has scrambled must reach OCR, not the extraction LLM.
+
+    Without this, every digit in the document arrives as an unrelated glyph and the
+    extraction LLM invents plausible values for dates and account numbers.
+    """
+
+    @staticmethod
+    def _patch_ocr(mp: pytest.MonkeyPatch, handler: AsyncMock) -> None:
+        mp.setattr(
+            "skyvern.forge.sdk.workflow.models.block.LLMAPIHandlerFactory.get_override_llm_api_handler",
+            lambda *a, **kw: handler,
+        )
+        mp.setattr(
+            "skyvern.forge.sdk.workflow.models.block.prompt_engine.load_prompt",
+            MagicMock(return_value="prompt"),
+        )
+        mp.setattr(
+            "skyvern.forge.sdk.workflow.models.block.render_pdf_pages_as_images",
+            lambda *a, **kw: [b"page-1"],
+        )
+
+    async def test_remapped_digits_route_to_ocr(self, tmp_path: Path) -> None:
+        pdf_path = tmp_path / "invoice.pdf"
+        pdf_path.write_bytes(_build_pdf(_ITEMISED_INVOICE_LINES, remap=_DIGIT_REMAP))
+        # The real extractors run against the real broken font: no digit survives them.
+        text_layer = extract_pdf_file(str(pdf_path))
+        assert "17 Aug 26" not in text_layer and "7249163085" not in text_layer
+
+        block = _make_file_parser_block("https://example.com/invoice.pdf", FileType.PDF)
+        handler = AsyncMock(return_value={"extracted_text": "Date: 17 Aug 26"})
+
+        with pytest.MonkeyPatch.context() as mp:
+            self._patch_ocr(mp, handler)
+            result = await block._parse_pdf_file(str(pdf_path))
+
+        assert handler.await_count == 1
+        assert "17 Aug 26" in result
+
+    async def test_readable_text_layer_is_returned_without_ocr(self, tmp_path: Path) -> None:
+        pdf_path = tmp_path / "invoice.pdf"
+        pdf_path.write_bytes(_build_pdf(_INVOICE_LINES))
+        block = _make_file_parser_block("https://example.com/invoice.pdf", FileType.PDF)
+        handler = AsyncMock(return_value={"extracted_text": "transcribed"})
+
+        with pytest.MonkeyPatch.context() as mp:
+            self._patch_ocr(mp, handler)
+            result = await block._parse_pdf_file(str(pdf_path))
+
+        handler.assert_not_awaited()
+        assert "17 Aug 26" in result
+
+    async def test_force_ocr_skips_the_text_layer(self, tmp_path: Path) -> None:
+        pdf_path = tmp_path / "invoice.pdf"
+        pdf_path.write_bytes(_build_pdf(_INVOICE_LINES))
+        block = _make_file_parser_block("https://example.com/invoice.pdf", FileType.PDF)
+        block.force_ocr = True
+        handler = AsyncMock(return_value={"extracted_text": "Date: 17 Aug 26"})
+        extract = MagicMock(return_value="text layer that must not be read")
+
+        with pytest.MonkeyPatch.context() as mp:
+            self._patch_ocr(mp, handler)
+            mp.setattr("skyvern.forge.sdk.workflow.models.block.extract_pdf_file", extract)
+            result = await block._parse_pdf_file(str(pdf_path))
+
+        extract.assert_not_called()
+        assert result == "--- Page 1 ---\nDate: 17 Aug 26"
+
+
+class TestScrambledTextLayerDetection:
+    """Text layers that must stay trusted, so a real document is never re-read by OCR."""
+
+    @pytest.mark.parametrize(
+        "text",
+        [
+            pytest.param(
+                "Dear Sir or Madam,\nThank you for your continued business. Please find enclosed the "
+                "statement for your account.\nShould you have any questions, contact our support team.",
+                id="english_prose_without_digits",
+            ),
+            pytest.param(
+                "Faktura VAT nr 12/2026\nNabywca: Zakład Usług Łącznościowych\nKwota brutto: 1234,56 zł\n"
+                "Termin płatności: 17 sierpnia 2026\nDziękujemy za współpracę. Życzymy miłego dnia.",
+                id="polish_invoice",
+            ),
+            pytest.param(
+                "Zakład Usług Łącznościowych\nDziękujemy za współpracę i życzymy miłego dnia.\n"
+                "Prosimy o zapłatę należności w terminie wskazanym w umowie.\nPozdrawiamy serdecznie.",
+                id="polish_prose_without_digits",
+            ),
+            pytest.param(
+                "Děkujeme za vaši důvěru. Přejeme příjemný den.\nVáš účet byl úspěšně aktivován.\n"
+                "V případě dotazů se obraťte na naši zákaznickou linku.",
+                id="czech_prose_without_digits",
+            ),
+            pytest.param(
+                "Sayın müşterimiz, faturanız hazırlanmıştır. İlginiz için teşekkür ederiz.\n"
+                "Sorularınız için müşteri hizmetlerimize başvurabilirsiniz.",
+                id="turkish_prose_without_digits",
+            ),
+            pytest.param(
+                "Kính gửi quý khách hàng, hóa đơn của quý khách đã được lập và đã gửi tới địa chỉ đăng ký.\n"
+                "Để thanh toán, quý khách vui lòng chuyển khoản tới số tài khoản được ghi ở dưới.\n"
+                "Nếu quý khách đã thanh toán rồi thì xin vui lòng bỏ qua thông báo này.",
+                id="vietnamese_prose",
+            ),
+            pytest.param(
+                "Application for Service\n I confirm the details above are correct\n"
+                " I agree to the terms and conditions of supply\n"
+                " Please send my statements by email\n I am over 18 years of age\n"
+                " I would like marketing updates\n I have read the privacy notice\n"
+                " Direct debit\n Card payment\nSignature: ______  Date: 17 Aug 26",
+                id="icon_font_checkboxes",
+            ),
+            pytest.param("尊敬的客户，您的账单已经生成。请在到期日前付款。感谢您的支持。", id="chinese_prose"),
+            pytest.param("Уважаемый клиент, ваш счет сформирован. Оплатите до указанной даты.", id="russian_prose"),
+            pytest.param("Date: 17 Aug 26", id="too_short_to_judge"),
+        ],
+    )
+    def test_trustworthy_text_layers_are_not_flagged(self, text: str) -> None:
+        assert scrambled_text_layer_reason(text) is None
+
+    @pytest.mark.parametrize(
+        "lines",
+        [
+            pytest.param(_INVOICE_LINES, id="label_heavy_header"),
+            # The real document is an itemised invoice. Its scrambled digits are Latin letters
+            # to str.isalpha, so counting them as the document's own script sank the ASCII share
+            # below the Latin-script floor and the page escaped every check.
+            pytest.param(_ITEMISED_INVOICE_LINES, id="page_of_call_rows"),
+        ],
+    )
+    def test_remapped_digits_are_flagged(self, lines: tuple[str, ...]) -> None:
+        scrambled = "\n".join(line.translate(_DIGIT_REMAP) for line in lines)
+        assert scrambled_text_layer_reason(scrambled) is not None
+
+
+@contextmanager
+def _fails_at_a_pypdf_limit() -> Iterator[None]:
+    """Expect the no-fallback error, raised from the pypdf error; a failed pdfplumber fallback raises with no cause."""
+    with pytest.raises(PDFParsingError) as excinfo:
+        yield
+    assert excinfo.value.__cause__ is not None
+
+
+class TestPypdfLimitFallback:
+    """Only pypdf's structural limits may fall back to pdfplumber, whose pdfminer has no decompressed-size limit."""
+
+    def test_decompression_limit_fails_without_falling_back(self, tmp_path: Path) -> None:
+        pdf_path = tmp_path / "invoice.pdf"
+        pdf_path.write_bytes(_build_pdf(_INVOICE_LINES, flate_content=True))
+
+        with apply_configuration(zlib_maximum_output_length=64), _fails_at_a_pypdf_limit():
+            extract_pdf_file(str(pdf_path))
+
+    def test_lzw_limit_fails_without_falling_back(self, tmp_path: Path) -> None:
+        pdf_path = tmp_path / "invoice.pdf"
+        pdf_path.write_bytes(_build_pdf(_INVOICE_LINES, lzw_content=True))
+        assert "17 Aug 26" in PdfReader(str(pdf_path)).pages[0].extract_text()
+
+        with apply_configuration(lzw_maximum_output_length=64), _fails_at_a_pypdf_limit():
+            extract_pdf_file(str(pdf_path))
+
+    def test_validation_fails_without_falling_back_when_the_xref_stream_hits_the_limit(self, tmp_path: Path) -> None:
+        pdf_path = tmp_path / "invoice.pdf"
+        pdf_path.write_bytes(_build_pdf(_INVOICE_LINES, flate_xref_stream=True))
+
+        with apply_configuration(zlib_maximum_output_length=16), _fails_at_a_pypdf_limit():
+            validate_pdf_file(str(pdf_path))
+
+    def test_content_array_over_the_cap_fails_without_falling_back(self, tmp_path: Path) -> None:
+        pdf_path = tmp_path / "invoice.pdf"
+        pdf_path.write_bytes(_build_pdf(_INVOICE_LINES, content_copies=2))
+
+        # Each copy is under the cap; only the array's total is over it.
+        with apply_configuration(array_based_stream_maximum_output_length=400), _fails_at_a_pypdf_limit():
+            extract_pdf_file(str(pdf_path))
+
+    @pytest.mark.parametrize(
+        "pdf_options",
+        [
+            pytest.param({"cid_widths": b"[0 65536 500]"}, id="cid_width_range"),
+            pytest.param(
+                {"cid_widths": b"[0 [500]]", "cid_to_unicode_range": "<000000> <0186A0> <000000>"},
+                id="to_unicode_range",
+            ),
+        ],
+    )
+    def test_range_pdfminer_would_expand_fails_without_falling_back(
+        self, tmp_path: Path, pdf_options: dict[str, Any]
+    ) -> None:
+        pdf_path = tmp_path / "invoice.pdf"
+        pdf_path.write_bytes(_build_pdf(_INVOICE_LINES, **pdf_options))
+
+        with _fails_at_a_pypdf_limit():
+            extract_pdf_file(str(pdf_path))
+
+    @pytest.mark.parametrize(
+        ("pdf_options", "limits"),
+        [
+            pytest.param({}, {"maximum_declared_stream_length": 100}, id="declared_stream_length"),
+            pytest.param(
+                {"content_length": -1}, {"maximum_declared_stream_length": 100}, id="stream_read_to_endstream"
+            ),
+            pytest.param(
+                {"content_length": 5}, {"maximum_declared_stream_length": 100}, id="stream_length_understated"
+            ),
+            pytest.param({}, {"page_tree_maximum_entries": 0}, id="page_tree_entries"),
+            pytest.param({"cid_widths": b"[0 65535 500 65536 131071 500]"}, {}, id="cid_width_entries"),
+            pytest.param({"gzip_content": True}, {"zlib_maximum_output_length": 64}, id="flate_recovery_output"),
+            pytest.param(
+                {"run_length_content": True}, {"run_length_maximum_output_length": 64}, id="run_length_output"
+            ),
+            # pdfminer sizes a buffer by Columns without any limit.
+            pytest.param(
+                {"flate_content": True, "png_predictor": (1, 17)}, {"flate_maximum_columns": 16}, id="predictor_columns"
+            ),
+            pytest.param(
+                {"flate_content": True, "png_predictor": (17, 1)},
+                {"flate_maximum_row_length": 16},
+                id="predictor_colors_over_row_limit",
+            ),
+            pytest.param(
+                {
+                    "cid_widths": b"[0 [500]]",
+                    "cid_to_unicode_range": "<000000000000000041> <000000000000000042> <0041>",
+                },
+                {},
+                id="to_unicode_code_length",
+            ),
+        ],
+    )
+    def test_other_size_cap_pdfminer_lacks_fails_without_falling_back(
+        self, tmp_path: Path, pdf_options: dict[str, Any], limits: dict[str, Any]
+    ) -> None:
+        pdf_path = tmp_path / "invoice.pdf"
+        pdf_path.write_bytes(_build_pdf(_INVOICE_LINES, **pdf_options))
+
+        with apply_configuration(**limits), _fails_at_a_pypdf_limit():
+            extract_pdf_file(str(pdf_path))
+
+    @pytest.mark.parametrize(
+        ("pdf_options", "limits"),
+        [
+            pytest.param(
+                {"font_entries": b" /FirstChar 0 /LastChar 299 /Widths [%s]" % b" ".join([b"500"] * 300)},
+                {},
+                id="simple_font_with_300_widths",
+            ),
+            pytest.param({"cid_widths": b"[40 30 500]"}, {}, id="inverted_cid_width_range"),
+            pytest.param({"font_entries": b" /Extra " + b"0" * 100}, {}, id="oversized_number_token"),
+            pytest.param(
+                {"cid_widths": b"[0 [500]]", "cid_to_unicode_char": "<000000000000000041> <0041>"},
+                {},
+                id="oversized_bfchar_code",
+            ),
+            pytest.param(
+                {"cid_widths": b"[0 [500]]", "cid_to_unicode_char": "<0100> <" + "0041" * 300 + ">"},
+                {},
+                id="oversized_bfchar_string",
+            ),
+            pytest.param({}, {"page_tree_maximum_depth": 0}, id="page_tree_depth"),
+            pytest.param({"flate_content": True, "png_predictor": (17, 1)}, {}, id="predictor_colors"),
+            pytest.param(
+                {"flate_content": True, "png_predictor": (1, 17)},
+                {"flate_maximum_row_length": 16},
+                id="predictor_row_length",
+            ),
+        ],
+    )
+    def test_structural_limit_still_falls_back_to_pdfplumber(
+        self, tmp_path: Path, pdf_options: dict[str, Any], limits: dict[str, Any]
+    ) -> None:
+        pdf_path = tmp_path / "invoice.pdf"
+        pdf_path.write_bytes(_build_pdf(_INVOICE_LINES, **pdf_options))
+
+        with apply_configuration(**limits):
+            # pypdf re-raises a limit hit while reading a dictionary value as PdfReadError.
+            with pytest.raises((LimitReachedError, PdfReadError)):
+                PdfReader(str(pdf_path)).pages[0].extract_text()
+
+            assert "17 Aug 26" in extract_pdf_file(str(pdf_path))
+
+    def test_jbig2_buffer_limit_still_falls_back_to_pdfplumber(self, tmp_path: Path) -> None:
+        # pdfminer passes a JBIG2 stream through undecoded, so only pypdf's jbig2dec call can hit the limit.
+        jbig2dec = tmp_path / "jbig2dec"
+        jbig2dec.write_text("#!/bin/sh\necho 'FATAL ERROR failed to allocate image data buffer' >&2\nexit 1\n")
+        jbig2dec.chmod(0o755)
+        pdf_path = tmp_path / "invoice.pdf"
+        pdf_path.write_bytes(_build_pdf(_INVOICE_LINES, jbig2_content=True))
+
+        with apply_configuration(jbig2dec_binary=str(jbig2dec)):
+            with pytest.raises((LimitReachedError, PdfReadError)):
+                PdfReader(str(pdf_path)).pages[0].extract_text()
+
+            assert "17 Aug 26" in extract_pdf_file(str(pdf_path))
+
+
+class TestForceOcrOnTheCachedScriptPath:
+    """A cached run must honor force OCR, or the fix only holds while the block runs via the agent."""
+
+    @pytest.mark.asyncio
+    async def test_cached_script_path_carries_force_ocr(self) -> None:
+        built: list[FileParserBlock] = []
+
+        async def capture(self: FileParserBlock, **kwargs: str | None) -> None:
+            built.append(self)
+
+        with (
+            patch.object(
+                script_service, "_validate_and_get_output_parameter", AsyncMock(return_value=_script_output())
+            ),
+            patch.object(script_service, "_render_template_with_label", lambda template, label=None: template),
+            patch.object(FileParserBlock, "execute_safe", capture),
+        ):
+            await script_service.parse_file(
+                file_url="https://example.com/invoice.pdf",
+                file_type=FileType.PDF,
+                label="parse_invoice",
+                force_ocr=True,
+            )
+
+        (block,) = built
+        assert block.force_ocr is True
+
+    def test_generated_script_carries_force_ocr(self) -> None:
+        base = {"file_url": "https://example.com/invoice.pdf", "file_type": "pdf", "label": "parse_invoice"}
+        module = cst.Module([])
+
+        with_force_ocr = module.code_for_node(_build_file_url_parser_statement({**base, "force_ocr": True}))
+        without_force_ocr = module.code_for_node(_build_file_url_parser_statement(base))
+
+        assert "force_ocr = True" in with_force_ocr
+        assert "force_ocr" not in without_force_ocr
+
+
 BLOCKING_PARSE_SECONDS = 0.3
 TICK_INTERVAL_SECONDS = 0.01
 
@@ -1097,6 +1642,20 @@ class TestParsingDoesNotBlockEventLoop:
             text, ticks = await _count_event_loop_ticks_during(block._parse_pdf_file("/tmp/large.pdf"))
 
         assert text == "extracted text"
+        assert ticks > 0
+
+    async def test_text_layer_scramble_check_yields_to_event_loop(self) -> None:
+        """The check walks every character of a text layer that can reach a million of them."""
+        block = _make_file_parser_block("https://example.com/large.pdf", FileType.PDF)
+        text_layer = "Account Number: 7249163085 Date: 17 Aug 26 Please remit payment.\n" * 20_000
+
+        with pytest.MonkeyPatch.context() as mp:
+            mp.setattr(
+                "skyvern.forge.sdk.workflow.models.block.extract_pdf_file",
+                lambda *a, **kw: text_layer,
+            )
+            _, ticks = await _count_event_loop_ticks_during(block._parse_pdf_file("/tmp/large.pdf"))
+
         assert ticks > 0
 
     async def test_docx_parse_yields_to_event_loop(self) -> None:
@@ -1253,6 +1812,62 @@ class TestParseStepTimeout:
         assert result.success is False
         assert captured["error_codes"] == ["FILE_PARSER_ERROR"]
         assert "timed out" in captured["failure_reason"].lower()
+
+    @pytest.mark.parametrize(
+        ("handler_error", "expected_reason"),
+        [
+            (None, "did not answer within"),
+            (TimeoutError("gateway gave up on the request"), "gateway gave up on the request"),
+        ],
+        ids=["stalled_model_hits_the_deadline", "handler_timeout_keeps_its_own_cause"],
+    )
+    async def test_stalled_extraction_model_fails_the_block_at_the_deadline(
+        self, handler_error: Exception | None, expected_reason: str
+    ) -> None:
+        """A provider that never answers fails the block at the deadline instead of holding the run's slot."""
+        block = _make_file_parser_block("https://example.com/resume.pdf", FileType.PDF)
+        block.json_schema = {"type": "object", "properties": {"name": {"type": "string"}}}
+        mock_ctx = _mock_workflow_run_context()
+
+        async def stalled_handler(**kwargs: Any) -> Any:
+            if handler_error is not None:
+                raise handler_error
+            await asyncio.Event().wait()
+
+        with pytest.MonkeyPatch.context() as mp:
+            mp.setattr(FileParserBlock, "get_workflow_run_context", lambda *a, **kw: mock_ctx)
+            mp.setattr(FileParserBlock, "format_potential_template_parameters", lambda *a, **kw: None)
+            mp.setattr(
+                "skyvern.forge.sdk.workflow.models.block.resolve_local_or_download_file",
+                AsyncMock(return_value="/tmp/resume.pdf"),
+            )
+            mp.setattr(FileParserBlock, "validate_file_type", lambda *a, **kw: None)
+            mp.setattr(
+                "skyvern.forge.sdk.workflow.models.block.extract_pdf_file", lambda *a, **kw: "Jane Doe, engineer"
+            )
+            mp.setattr(
+                "skyvern.forge.sdk.workflow.models.block.LLMAPIHandlerFactory.get_override_llm_api_handler",
+                lambda *a, **kw: stalled_handler,
+            )
+            mp.setattr("skyvern.forge.sdk.workflow.models.block.FILE_PARSER_LLM_CALL_TIMEOUT_SECONDS", 0.05)
+            mp.setattr(FileParserBlock, "record_output_parameter_value", AsyncMock())
+
+            captured: dict[str, Any] = {}
+
+            async def fake_build_block_result(*args: Any, **kwargs: Any) -> Any:
+                captured.update(kwargs)
+                return MagicMock(success=kwargs.get("success"))
+
+            mp.setattr(FileParserBlock, "build_block_result", fake_build_block_result)
+
+            # The outer bound turns a missing deadline into a failure rather than a hung test run.
+            result = await asyncio.wait_for(
+                block.execute(workflow_run_id="wr_test", workflow_run_block_id="wrb_test", organization_id="org_test"),
+                timeout=10,
+            )
+
+        assert result.success is False
+        assert expected_reason in captured["failure_reason"]
 
     async def test_validation_timeout_fails_the_block(self) -> None:
         block = _make_file_parser_block("https://example.com/huge.pdf", FileType.PDF)

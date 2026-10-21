@@ -5,6 +5,7 @@ import { useWorkflowParametersStore } from "./WorkflowParametersStore";
 import { getInitialParameters } from "@/routes/workflows/editor/utils";
 import {
   selectEditorMutationLocked,
+  AUTHORING_SAVE_MESSAGE,
   SAVE_STALE_MESSAGE,
   beginSaveTransaction,
   canInitializeWorkflow,
@@ -125,10 +126,7 @@ function assertWorkflowSaveAllowed(
   }
   const state = useWorkflowYamlEditorStore.getState();
   if (state.authoringInProgress) {
-    throw new YamlCommitError(
-      "workflow",
-      "Finish the current authoring action before saving",
-    );
+    throw new SaveRefusedError(AUTHORING_SAVE_MESSAGE);
   }
   const owner = state.lockKind === "save" ? saveOwner : yamlCommit?.owner;
   if (

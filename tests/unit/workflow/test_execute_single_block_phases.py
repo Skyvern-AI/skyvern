@@ -19,6 +19,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 from structlog.testing import capture_logs
 
+from skyvern.exceptions import StepTerminationError
 from skyvern.forge import app
 from skyvern.forge.sdk.db.enums import BrowserSeedSource
 from skyvern.forge.sdk.workflow.context_manager import BlockOutcome, WorkflowRunContext
@@ -721,6 +722,34 @@ async def test_ai_fallback_disabled_keeps_script_failure(monkeypatch: pytest.Mon
         workflow_run_id="wr_test",
         failure_reason="Script error (ZeroDivisionError): division by zero",
     )
+    assert workflow_run is failed_run
+    assert should_stop is True
+
+
+@pytest.mark.asyncio
+async def test_refused_script_step_fails_the_run_without_ai_fallback(monkeypatch: pytest.MonkeyPatch) -> None:
+    service = WorkflowService()
+    block = _navigation_block("cached_nav")
+    execute_safe = AsyncMock()
+    monkeypatch.setattr(NavigationBlock, "execute_safe", execute_safe)
+    monkeypatch.setattr(NavigationBlock, "_apply_workflow_system_prompt", lambda self, ctx: None)
+    failed_run = MagicMock()
+    mark_failed = AsyncMock(return_value=failed_run)
+    monkeypatch.setattr(WorkflowService, "mark_workflow_run_as_failed_if_not_final", mark_failed)
+
+    async def run_cached_task() -> None:
+        raise StepTerminationError(step_id="stp_1", reason="Not enough credit balance.")
+
+    workflow_run, _, _, should_stop, _ = await _run_single_block(
+        service,
+        block,
+        is_script_run=True,
+        script_blocks_by_label={"cached_nav": _script_block("cached_nav", "await run_cached_task()")},
+        loaded_script_module=SimpleNamespace(run_cached_task=run_cached_task),
+    )
+
+    execute_safe.assert_not_awaited()
+    assert "Not enough credit balance." in mark_failed.await_args.kwargs["failure_reason"]
     assert workflow_run is failed_run
     assert should_stop is True
 

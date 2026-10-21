@@ -9,7 +9,6 @@ These cover three regressions observed in trace 019d7b5c884dff0ff648680b9f31f715
 from __future__ import annotations
 
 import json
-import time
 from copy import deepcopy
 from types import SimpleNamespace
 from typing import Any
@@ -33,7 +32,6 @@ from skyvern.forge.sdk.copilot.enforcement import (
     NUDGE_SENTINEL,
     TOTAL_TIMEOUT_SECONDS,
     _mark_copilot_total_timeout,
-    _mark_copilot_total_timeout_if_elapsed,
     _prune_input_list,
     _recover_from_context_overflow,
     _summarize_tool_output,
@@ -826,7 +824,7 @@ def test_copilot_config_qa_budget_defaults_off(monkeypatch: pytest.MonkeyPatch) 
     monkeypatch.setattr(settings, "ENV", "local")
     monkeypatch.setattr(settings, "WORKFLOW_COPILOT_QA_TOKEN_BUDGET", None)
 
-    assert CopilotConfig().token_budget == 90_000
+    assert CopilotConfig().token_budget is None
 
 
 def test_copilot_config_uses_typed_qa_budget_locally(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -842,7 +840,7 @@ def test_copilot_config_ignores_qa_budget_in_cloud(monkeypatch: pytest.MonkeyPat
     monkeypatch.setattr(settings, "ENV", "production")
     monkeypatch.setattr(settings, "WORKFLOW_COPILOT_QA_TOKEN_BUDGET", 3_000)
 
-    assert CopilotConfig().token_budget == 90_000
+    assert CopilotConfig().token_budget is None
 
 
 @pytest.mark.asyncio
@@ -1098,7 +1096,7 @@ def test_an_evicted_browser_result_keeps_a_bounded_page_state(
     assert json.loads(pruned[0]["output"])["page_state"] == expected
 
 
-def test_page_state_alone_does_not_push_a_short_result_into_compaction() -> None:
+def test_page_facts_alone_do_not_push_a_short_result_into_compaction() -> None:
     solved = {
         "ok": True,
         "outcome": "solved",
@@ -1113,7 +1111,8 @@ def test_page_state_alone_does_not_push_a_short_result_into_compaction() -> None
         "title": "Northfield Parts - Catalog",
         "challenge_vendor": None,
     }
-    old_output = json.dumps({"page_state": page_state, **solved})
+    failures = [{"method": "POST", "resource_type": "xhr", "failure_text": "net::ERR_EMPTY_RESPONSE", "url": "/r"}]
+    old_output = json.dumps({"page_state": page_state, "page_request_failures": failures, **solved})
     assert len(json.dumps(solved)) <= 300 < len(old_output)
     items = [_fco("c_old", old_output), _reasoning()] + [
         _fco(f"c{i}", '{"ok":true}') for i in range(KEEP_RECENT_TOOL_OUTPUTS)
@@ -1400,30 +1399,6 @@ def test_deadline_flag_still_written_when_fingerprint_is_suppressed() -> None:
     assert ctx.copilot_total_timeout_exceeded is True
 
 
-@pytest.mark.parametrize("iteration", [0, 5, 11])
-def test_cancel_site_helper_threads_iteration_into_the_fingerprint(iteration: int) -> None:
-    ctx = _deadline_ctx()
-    start_time = time.monotonic() - (TOTAL_TIMEOUT_SECONDS + 5.0)
-
-    with capture_logs() as logs:
-        _mark_copilot_total_timeout_if_elapsed(ctx, start_time, iteration)
-
-    events = _deadline_events(logs)
-    assert len(events) == 1
-    assert events[0]["iteration"] == iteration
-    assert events[0]["elapsed_seconds"] >= TOTAL_TIMEOUT_SECONDS
-
-
-def test_cancel_site_helper_is_silent_before_the_deadline() -> None:
-    ctx = _deadline_ctx()
-
-    with capture_logs() as logs:
-        _mark_copilot_total_timeout_if_elapsed(ctx, time.monotonic(), 2)
-
-    assert _deadline_events(logs) == []
-    assert ctx.copilot_total_timeout_exceeded is False
-
-
 def test_total_timeout_override_binds_on_settings_and_defaults_unset() -> None:
     unset = Settings(_env_file=None, WORKFLOW_COPILOT_TOTAL_TIMEOUT_SECONDS=None)
     overridden = Settings(_env_file=None, WORKFLOW_COPILOT_TOTAL_TIMEOUT_SECONDS=300)
@@ -1531,12 +1506,16 @@ class TestPageEvidenceCompaction:
             }
         )
 
-    def _signed_out(self) -> str:
-        return self._packet(
-            session="pbs_cold",
-            forms=[{"fields": [{"id": "email", "label": "Email"}, {"id": "password", "label": "Password"}]}],
-            nav=[],
-        )
+    def _signed_out(self, authoring_facts: bool = False) -> str:
+        email: dict[str, Any] = {"id": "email", "label": "Email"}
+        form: dict[str, Any] = {"fields": [email, {"id": "password", "label": "Password"}]}
+        candidate: dict[str, Any] = {"selector": "input.field", "source": "class"}
+        email["selector_candidates"] = [candidate]
+        if authoring_facts:
+            email["pointer_at_center"] = "reaches_other_element"
+            email["element_at_center"] = {"tag": "div", "role": "dialog", "label_context": "Cookie preferences"}
+            candidate.update(match_count=2, visible_match_count=1)
+        return self._packet(session="pbs_cold", forms=[form], nav=[])
 
     def _signed_in(self) -> str:
         return self._packet(session="pbs_warm", forms=[], nav=[{"id": "navWebAnalytics", "text": "Web analytics"}])
@@ -1555,6 +1534,7 @@ class TestPageEvidenceCompaction:
         assert warm["source_browser_session_id"] == "pbs_warm"
         assert cold["current_url"] == warm["current_url"], "same URL — only the browser state differs"
         assert "email" in json.dumps(cold["forms"]), "the sign-in fields are what the cold state carries"
+        assert json.loads(_summarize_tool_output(self._signed_out(authoring_facts=True)))["page_evidence"] == cold
         assert not warm.get("forms")
         assert "navWebAnalytics" in json.dumps(warm["navigation_targets"])
 

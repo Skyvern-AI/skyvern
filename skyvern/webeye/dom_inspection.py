@@ -53,6 +53,132 @@ _READ_LOCATOR_SELECTED_STATE = """
 }
 """
 
+_READ_STATIC_LISTBOX_OPTION_SNAPSHOT = r"""
+(el) => {
+  const empty = {
+    isOption: false,
+    inListbox: false,
+    popupSemanticsNearby: false,
+    ownedByTrigger: false,
+    activeDescendantRef: false,
+    layered: false,
+    textEntrySibling: false,
+    openPopupOnPage: false,
+  };
+  try {
+    const parentOf = (n) => n.parentElement || (n.getRootNode() instanceof ShadowRoot ? n.getRootNode().host : null);
+    const roots = [];
+    for (let r = el.getRootNode(); r; r = (r instanceof ShadowRoot ? r.host.getRootNode() : null)) roots.push(r);
+    const isOption = (el.getAttribute('role') || '').trim().toLowerCase() === 'option';
+    const listbox = el.closest('[role="listbox"]');
+    if (listbox === null) { return Object.assign({}, empty, { isOption: isOption }); }
+
+    const hasPopupSelector = '[aria-haspopup]:not([aria-haspopup="false"]):not([aria-haspopup=""])';
+    const popupSelector = '[role="combobox"], [aria-expanded], ' + hasPopupSelector;
+    let popupSemanticsNearby = false;
+    for (let node = el; node !== null; node = parentOf(node)) {
+      if (node.matches(popupSelector)) { popupSemanticsNearby = true; break; }
+      if (node === listbox) {
+        let ancestor = parentOf(listbox);
+        for (let i = 0; i < 3 && ancestor !== null; i++, ancestor = parentOf(ancestor)) {
+          if (ancestor.matches(popupSelector)) { popupSemanticsNearby = true; break; }
+        }
+        break;
+      }
+    }
+
+    const optionId = el.id;
+    const triggerSelector = popupSelector
+      + ', button, input, select, textarea, [role="button"], [role="textbox"], [role="searchbox"]';
+    const ownedByTrigger = roots.some((root) =>
+      Array.from(root.querySelectorAll('[aria-controls], [aria-owns]')).some((owner) =>
+        owner.matches(triggerSelector)
+        && ['aria-controls', 'aria-owns'].some((attribute) =>
+          (owner.getAttribute(attribute) || '').trim().split(/\s+/).filter(Boolean).some((token) => {
+            const node = root.getElementById(token);
+            return node === listbox
+              || node === el
+              || (node !== null && node.contains(listbox) && owner.matches(popupSelector));
+          })
+        )
+      )
+    );
+
+    const activeDescendantRef = optionId !== '' && roots.some((root) =>
+      Array.from(root.querySelectorAll('[aria-activedescendant]')).some((owner) =>
+        owner.getAttribute('aria-activedescendant') === optionId
+      )
+    );
+
+    const dialogSelector = 'dialog, [role="dialog"], [role="alertdialog"], [aria-modal="true"]';
+    const hasPopoverBeforeDialog = function (node) {
+      for (let ancestor = node; ancestor !== null; ancestor = parentOf(ancestor)) {
+        if (ancestor.matches(dialogSelector)) { return false; }
+        if (ancestor.matches('[popover]')) { return true; }
+      }
+      return false;
+    };
+    let layered = false;
+    let layerNode = listbox;
+    let inspectedNodes = 0;
+    // Keep the window short: page-level positioning would disable the fix; stop at dialogs so modal forms stay static.
+    for (; inspectedNodes < 4 && layerNode !== null; layerNode = parentOf(layerNode)) {
+      if (layerNode.matches(dialogSelector)) { break; }
+      const view = layerNode.ownerDocument.defaultView;
+      const style = view ? view.getComputedStyle(layerNode) : null;
+      if (style && style.display === 'contents') { continue; }
+      inspectedNodes++;
+      const position = style ? style.position : '';
+      if (position === 'fixed' || position === 'absolute' || hasPopoverBeforeDialog(layerNode)) {
+        layered = true;
+        break;
+      }
+    }
+
+    const parent = listbox.parentElement;
+    const textEntrySibling = parent !== null && Array.from(parent.querySelectorAll(
+      'input:not([type=hidden]):not([type=checkbox]):not([type=radio]):not([type=button])'
+        + ':not([type=submit]):not([type=reset]), textarea, [role="textbox"], [role="searchbox"], '
+        + '[contenteditable="true"]'
+    )).some((textEntry) => !listbox.contains(textEntry));
+
+    const openPopupSelector = '[aria-expanded="true"][role="combobox"], [aria-expanded="true"]'
+      + hasPopupSelector;
+    const openPopupOnPage = roots.some((root) => root.querySelector(openPopupSelector) !== null);
+    return {
+      isOption: isOption,
+      inListbox: true,
+      popupSemanticsNearby: popupSemanticsNearby,
+      ownedByTrigger: ownedByTrigger,
+      activeDescendantRef: activeDescendantRef,
+      layered: layered,
+      textEntrySibling: textEntrySibling,
+      openPopupOnPage: openPopupOnPage,
+    };
+  } catch (error) {
+    return empty;
+  }
+}
+"""
+
+_MUST_BE_TRUE = ("isOption", "inListbox")
+_MUST_BE_FALSE = (
+    "popupSemanticsNearby",
+    "ownedByTrigger",
+    "activeDescendantRef",
+    "layered",
+    "textEntrySibling",
+    "openPopupOnPage",
+)
+
+
+def is_static_listbox_option_snapshot(snapshot: object) -> bool:
+    return (
+        isinstance(snapshot, dict)
+        and all(snapshot.get(key) is True for key in _MUST_BE_TRUE)
+        and all(snapshot.get(key) is False for key in _MUST_BE_FALSE)
+    )
+
 
 async def read_current_url(frame: Page | Frame) -> str | None:
     value = await SkyvernFrame.evaluate(frame=frame, expression=_READ_CURRENT_URL)
@@ -67,6 +193,10 @@ async def read_locator_tag_name(locator: Locator, *, timeout: float | None = Non
 async def read_locator_selected_state(locator: Locator, *, timeout: float | None = None) -> bool | None:
     value = await locator.evaluate(_READ_LOCATOR_SELECTED_STATE, timeout=timeout)
     return value if isinstance(value, bool) else None
+
+
+async def read_static_listbox_option_snapshot(frame: Page | Frame, element: ElementHandle) -> object:
+    return await SkyvernFrame.evaluate(frame=frame, expression=_READ_STATIC_LISTBOX_OPTION_SNAPSHOT, arg=element)
 
 
 async def read_locator_is_content_editable(locator: Locator, *, timeout: float | None = None) -> bool | None:

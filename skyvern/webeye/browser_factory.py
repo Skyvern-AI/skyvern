@@ -658,6 +658,10 @@ async def rebind_download_dir(browser: Browser | None, run_id: str | None, *, pa
                     raise
 
     setdownloadbehavior_applied = False
+    if any(getattr(context, "_skyvern_external_browser", False) is True for context in rebind_contexts):
+        # Browser-wide and on the caller's machine: it would redirect their own downloads to a worker path.
+        LOG.info("setDownloadBehavior skipped: registered external browser", run_id=run_id)
+        return
     if monitor_owns_binding:
         # The download monitor holds {behavior:deny, eventsEnabled:True} and saves files over HTTP
         # (remote CDP has no valid downloadPath). Re-sending allow/downloadPath would disable it, so
@@ -1206,6 +1210,7 @@ async def _create_headless_chromium(
     except BaseException:
         discard_temp_working_dir(read_only_copy)
         raise
+    browser_artifacts.note_requested_launch_args(browser_args.get("args"))
     return browser_context, browser_artifacts, _read_only_copy_cleanup(read_only_copy)
 
 
@@ -1339,6 +1344,7 @@ async def _create_headful_chromium(
         discard_temp_working_dir(read_only_copy)
         await release_started_display_recording(browser_artifacts)
         raise
+    browser_artifacts.note_requested_launch_args(browser_args.get("args"))
     return browser_context, browser_artifacts, _read_only_copy_cleanup(read_only_copy)
 
 
@@ -1399,6 +1405,7 @@ async def _create_cdp_connection_browser(
     note_resolved_acquire_mode(ACQUIRE_MODE_ATTACH)
     browser_type = settings.BROWSER_TYPE
     browser_path = settings.CHROME_EXECUTABLE_PATH
+    spawn_args: list[str] | None = None
 
     if browser_type == "cdp-connect" and browser_path:
         LOG.info("Local browser path is given. Connecting to local browser with CDP", browser_path=browser_path)
@@ -1428,15 +1435,16 @@ async def _create_cdp_connection_browser(
             # This invocation launches a new Chrome process, so it is a genuine create — recorded
             # before the launch so a launch failure inherits create rather than the default attach.
             note_resolved_acquire_mode(ACQUIRE_MODE_CREATE)
+            spawn_args = [
+                browser_path,
+                "--remote-debugging-port=9222",
+                "--no-first-run",
+                "--no-default-browser-check",
+                "--user-data-dir=./tmp/user_data_dir",
+                "--remote-debugging-address=0.0.0.0",
+            ]
             browser_process = subprocess.Popen(
-                [
-                    browser_path,
-                    "--remote-debugging-port=9222",
-                    "--no-first-run",
-                    "--no-default-browser-check",
-                    "--user-data-dir=./tmp/user_data_dir",
-                    "--remote-debugging-address=0.0.0.0",
-                ],
+                spawn_args,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
             )
@@ -1447,13 +1455,29 @@ async def _create_cdp_connection_browser(
         else:
             LOG.info("Port 9222 is in use, using existing browser")
 
-    return await _connect_to_cdp_browser(
+    result = await _connect_to_cdp_browser(
         playwright,
         settings.BROWSER_REMOTE_DEBUGGING_URL,
         extra_http_headers=extra_http_headers,
         cdp_connect_headers=cdp_connect_headers,
         validate_browser_address=False,
     )
+    # Only a Chrome started here and dialed at its own debugging endpoint is this invocation's browser.
+    if spawn_args is not None and _dials_spawned_chrome(settings.BROWSER_REMOTE_DEBUGGING_URL):
+        result[1].note_spawned_local_browser()
+        result[1].note_requested_launch_args(spawn_args)
+    return result
+
+
+def _dials_spawned_chrome(endpoint: str) -> bool:
+    # The port check and the spawn are IPv4 only, so ::1, a resolved name, or another or missing port may reach a
+    # different browser.
+    parsed = urlparse(endpoint)
+    try:
+        port = parsed.port
+    except ValueError:
+        return False
+    return parsed.hostname == "127.0.0.1" and port == 9222
 
 
 async def _connect_to_cdp_browser(

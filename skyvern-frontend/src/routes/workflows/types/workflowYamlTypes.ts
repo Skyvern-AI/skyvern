@@ -5,6 +5,7 @@ import {
   CredentialFallbackTrigger,
   CredentialSelectionStrategy,
   EmailBodyFormat,
+  EmailTransport,
   WorkflowBlockType,
   WorkflowModel,
   WorkflowRetryPolicy,
@@ -461,6 +462,10 @@ export type SendEmailBlockYAML = BlockYAMLBase & {
   body: string;
   body_format?: EmailBodyFormat;
   file_attachments?: Array<string> | null;
+  transport?: EmailTransport | null;
+  credential_id?: string | null;
+  cc?: Array<string>;
+  bcc?: Array<string>;
 };
 
 export type FileUrlParserBlockYAML = BlockYAMLBase & {
@@ -469,6 +474,7 @@ export type FileUrlParserBlockYAML = BlockYAMLBase & {
   file_type: "auto_detect" | "csv" | "excel" | "pdf" | "image" | "docx" | "zip";
   json_schema?: Record<string, unknown> | null;
   worksheet?: string | null;
+  force_ocr?: boolean;
 };
 
 export type ForLoopBlockYAML = BlockYAMLBase & {
@@ -576,6 +582,7 @@ export type EmailInboxBlockYAML = BlockYAMLBase & {
   newer_than_days: number | null;
   max_results: number;
   include_body: boolean;
+  download_attachments: boolean;
   parameter_keys?: Array<string> | null;
 };
 

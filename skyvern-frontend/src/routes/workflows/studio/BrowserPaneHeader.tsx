@@ -12,6 +12,7 @@ import { useRef, useState } from "react";
 import { useWorkflowPermanentId } from "@/routes/workflows/WorkflowPermanentIdContext";
 import { runIsRetryWaiting } from "@/routes/workflows/workflowRun/runRetryState";
 import type { StreamState } from "@/routes/streaming/streamState";
+import { EXTERNAL_BROWSER_DIAGNOSTIC } from "@/routes/streaming/StreamDiagnostics";
 
 import { getClient } from "@/api/AxiosClient";
 import { DebugSessionApiResponse } from "@/api/types";
@@ -35,8 +36,7 @@ import {
 } from "@/components/ui/dropdown-menu";
 import { toast } from "@/components/ui/use-toast";
 import { useCredentialGetter } from "@/hooks/useCredentialGetter";
-import { useRecordingLauncherStore } from "@/store/useRecordingLauncherStore";
-import { useRecordingStore } from "@/store/useRecordingStore";
+import { useStreamTransport } from "@/hooks/useRuntimeConfig";
 import { useSettingsStore } from "@/store/SettingsStore";
 import { useStudioBrowserStore } from "@/store/useStudioBrowserStore";
 import { cn } from "@/util/utils";
@@ -58,9 +58,11 @@ const FINISHED_RUN_BROWSER_LABEL =
 function BrowserLiveStatus({
   state,
   stoppedHint,
+  stoppedLabel = "Browser stopped",
 }: {
   state: "starting" | "live" | "stopped";
   stoppedHint?: string;
+  stoppedLabel?: string;
 }) {
   return (
     <span
@@ -86,7 +88,7 @@ function BrowserLiveStatus({
         ? "Starting browser…"
         : state === "live"
           ? "Live"
-          : "Browser stopped"}
+          : stoppedLabel}
     </span>
   );
 }
@@ -116,6 +118,9 @@ export function BrowserPaneViewPills() {
   // alone stays true after the browser is up.
   const debugStream = useStudioBrowserStore((s) => s.debugStream);
   const runStream = useStudioBrowserStore((s) => s.runStream);
+  const { isExternal: runBrowserExternal } = useStreamTransport(
+    liveSurface === "run" ? visuals.workflowRun?.browser_session_id : null,
+  );
 
   // Recording and Screenshots only ever replay a workflow run; with none open
   // they would point at an old run or at nothing, and Live alone is no switch.
@@ -146,7 +151,13 @@ export function BrowserPaneViewPills() {
           </span>
           <BrowserLiveStatus
             state={runState}
-            stoppedHint="The run's browser stream ended"
+            stoppedHint={
+              runBrowserExternal
+                ? EXTERNAL_BROWSER_DIAGNOSTIC.title
+                : "The run's browser stream ended"
+            }
+            // External runs never stream, so "stopped" here is not a dead browser.
+            stoppedLabel={runBrowserExternal ? "No live view" : undefined}
           />
         </>
       );
@@ -234,21 +245,14 @@ export function BrowserPaneViewPills() {
 
 export function BrowserPaneActions() {
   const workflowPermanentId = useWorkflowPermanentId();
-  const compact = useStudioPaneCompact();
   const credentialGetter = useCredentialGetter();
   const queryClient = useQueryClient();
   const { debugBrowserSessionId: browserSessionId, liveSurface } =
     useBrowserPaneView();
-  const isRecording = useRecordingStore((s) => s.isRecording);
-  const startRecordingAtEnd = useRecordingLauncherStore(
-    (s) => s.startRecordingAtEnd,
-  );
   // These act on the debug browser; while the pane streams the run's own
-  // browser instead, they'd hit an invisible session. Record explains itself
-  // with a disabled tooltip; the ⋯ menu's session actions are hidden.
+  // browser instead, they'd hit an invisible session, so the ⋯ menu's session
+  // actions are hidden.
   const debugHidden = liveSurface === "run";
-  const blockedTitle =
-    "Showing the run's browser — debug browser controls come back after the run";
   const reload = useStudioBrowserStore((s) => s.reload);
   const [confirmRestart, setConfirmRestart] = useState(false);
   const moreActionsRef = useRef<HTMLButtonElement>(null);
@@ -298,35 +302,6 @@ export function BrowserPaneActions() {
 
   return (
     <>
-      {!isRecording
-        ? (() => {
-            const disabled =
-              !browserSessionId || debugHidden || !startRecordingAtEnd;
-            const tooltip = debugHidden
-              ? blockedTitle
-              : startRecordingAtEnd
-                ? "Complete the task in the browser. Skyvern captures the browser view and your clicks, typing, and navigation, then turns them into workflow steps."
-                : "Recording is available when the editor is ready";
-            return (
-              <ControlTooltip
-                content={<span className="block max-w-[260px]">{tooltip}</span>}
-                blocked={disabled}
-              >
-                <Button
-                  variant="ghost"
-                  size="sm"
-                  className="h-7 shrink-0 gap-1.5 px-1.5 text-red-500"
-                  aria-label="Record task"
-                  disabled={disabled}
-                  onClick={() => startRecordingAtEnd?.()}
-                >
-                  <span className="h-2 w-2 rounded-full bg-red-500" />
-                  {compact ? null : "Record task"}
-                </Button>
-              </ControlTooltip>
-            );
-          })()
-        : null}
       {browserSessionId && !debugHidden ? (
         <DropdownMenu>
           <ControlTooltip content="More browser actions">

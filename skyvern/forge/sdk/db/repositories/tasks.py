@@ -7,7 +7,7 @@ from decimal import Decimal
 from typing import Any
 
 import structlog
-from sqlalchemy import and_, delete, func, or_, select, update
+from sqlalchemy import and_, delete, func, or_, select, tuple_, update
 
 from skyvern.forge.sdk.db._error_handling import db_operation
 from skyvern.forge.sdk.db.base_alchemy_db import read_retry
@@ -24,6 +24,7 @@ from skyvern.forge.sdk.db.models import (
     WorkflowRunBlockModel,
     WorkflowRunModel,
 )
+from skyvern.forge.sdk.db.repositories.workflow_runs import _folder_access_filter
 from skyvern.forge.sdk.db.utils import (
     as_stored_json,
     convert_to_step,
@@ -603,6 +604,8 @@ class TasksRepository(BaseRepository):
         max_steps_per_run: int | None = None,
         organization_id: str | None = None,
         failure_category: list[dict[str, Any]] | None = None,
+        *,
+        keep_final_status: bool = False,
     ) -> Task:
         updated_task, _ = await self._update_task_with_finish_claim(
             task_id,
@@ -614,6 +617,7 @@ class TasksRepository(BaseRepository):
             max_steps_per_run=max_steps_per_run,
             organization_id=organization_id,
             failure_category=failure_category,
+            keep_final_status=keep_final_status,
         )
         return updated_task
 
@@ -630,6 +634,8 @@ class TasksRepository(BaseRepository):
         max_steps_per_run: int | None = None,
         organization_id: str | None = None,
         failure_category: list[dict[str, Any]] | None = None,
+        *,
+        keep_final_status: bool = False,
     ) -> tuple[Task, bool]:
         """``update_task``, plus whether THIS write flipped ``finished_at`` from NULL.
 
@@ -648,6 +654,7 @@ class TasksRepository(BaseRepository):
             max_steps_per_run=max_steps_per_run,
             organization_id=organization_id,
             failure_category=failure_category,
+            keep_final_status=keep_final_status,
         )
 
     async def _update_task_with_finish_claim(
@@ -661,6 +668,8 @@ class TasksRepository(BaseRepository):
         max_steps_per_run: int | None = None,
         organization_id: str | None = None,
         failure_category: list[dict[str, Any]] | None = None,
+        *,
+        keep_final_status: bool = False,
     ) -> tuple[Task, bool]:
         if (
             status is None
@@ -687,6 +696,8 @@ class TasksRepository(BaseRepository):
                     .with_for_update()
                 )
             ).first():
+                if keep_final_status and TaskStatus(task.status).is_final():
+                    return convert_to_task(task, debug_enabled=self.debug_enabled), False
                 if status is not None:
                     task.status = status
                     if status == TaskStatus.queued and task.queued_at is None:
@@ -755,6 +766,7 @@ class TasksRepository(BaseRepository):
                 task.queued_at = None
                 task.started_at = None
                 task.finished_at = None
+                task.task_queue = None
                 await session.commit()
                 await session.refresh(task)
                 reset_task = convert_to_task(task, debug_enabled=self.debug_enabled)
@@ -767,6 +779,17 @@ class TasksRepository(BaseRepository):
             status=TaskStatus.created.value,
         )
         return reset_task
+
+    @db_operation("update_task_routing")
+    async def update_task_routing(self, task_id: str, task_queue: str) -> None:
+        """Record the latest selected Temporal queue without refreshing the task's lifecycle or reaper clocks."""
+        async with self.Session() as session:
+            await session.execute(
+                update(TaskModel)
+                .where(TaskModel.task_id == task_id)
+                .values(task_queue=task_queue, modified_at=TaskModel.modified_at)
+            )
+            await session.commit()
 
     @db_operation("update_task_2fa_state")
     async def update_task_2fa_state(
@@ -909,6 +932,30 @@ class TasksRepository(BaseRepository):
             await session.commit()
             return result.rowcount or 0
 
+    @db_operation("bulk_update_steps_by_task_ids")
+    async def bulk_update_steps_by_task_ids(
+        self,
+        task_ids: list[str],
+        new_status: StepStatus,
+        only_if_status_in: list[StepStatus],
+    ) -> int:
+        if not task_ids or not only_if_status_in:
+            return 0
+
+        update_values: dict[str, Any] = {"status": new_status.value}
+        if new_status.is_terminal():
+            update_values["finished_at"] = func.coalesce(StepModel.finished_at, naive_utc_now())
+        async with self.Session() as session:
+            stmt = (
+                update(StepModel)
+                .where(StepModel.task_id.in_(task_ids))
+                .where(StepModel.status.in_([s.value for s in only_if_status_in]))
+                .values(**update_values)
+            )
+            result = await session.execute(stmt)
+            await session.commit()
+            return result.rowcount or 0
+
     @db_operation("get_tasks")
     async def get_tasks(
         self,
@@ -921,21 +968,28 @@ class TasksRepository(BaseRepository):
         application: str | None = None,
         order_by_column: OrderBy = OrderBy.created_at,
         order: SortDirection = SortDirection.desc,
+        keyset: bool = False,
+        after: tuple[datetime, str] | None = None,
     ) -> list[Task]:
         """
         Get all tasks.
-        :param page: Starts at 1
+        :param page: Starts at 1; ignored when keyset is set
         :param page_size:
         :param task_status:
         :param workflow_run_id:
         :param only_standalone_tasks:
         :param order_by_column:
         :param order:
+        :param keyset: order by (order_by_column, task_id) and return the rows strictly after `after`
+        :param after: the (sort timestamp, task_id) of the last row already read, or None to start
         :return:
         """
         if page < 1:
             raise ValueError(f"Page must be greater than 0, got {page}")
 
+        folder_access_filter = None
+        if organization_id is not None:
+            folder_access_filter = await _folder_access_filter(organization_id, WorkflowRunModel.workflow_permanent_id)
         async with self.Session() as session:
             db_page = page - 1  # offset logic is 0 based
             query = (
@@ -943,6 +997,8 @@ class TasksRepository(BaseRepository):
                 .join(WorkflowRunModel, TaskModel.workflow_run_id == WorkflowRunModel.workflow_run_id, isouter=True)
                 .filter(TaskModel.organization_id == organization_id)
             )
+            if folder_access_filter is not None:
+                query = query.filter(folder_access_filter)
             if task_status:
                 query = query.filter(TaskModel.status.in_(task_status))
             if workflow_run_id:
@@ -952,18 +1008,37 @@ class TasksRepository(BaseRepository):
             if application:
                 query = query.filter(TaskModel.application == application)
             order_by_col = getattr(TaskModel, order_by_column)
-            query = (
-                query.order_by(order_by_col.desc() if order == SortDirection.desc else order_by_col.asc())
-                .limit(page_size)
-                .offset(db_page * page_size)
-            )
+            descending = order == SortDirection.desc
+            if keyset:
+                if after is not None:
+                    after_ts, after_task_id = after
+                    row = tuple_(order_by_col, TaskModel.task_id)
+                    # The single-column bound lets the (organization_id, created_at) index range-scan;
+                    # the row comparison alone is not always used as an index condition.
+                    query = query.filter(
+                        order_by_col <= after_ts if descending else order_by_col >= after_ts,
+                        row < tuple_(after_ts, after_task_id) if descending else row > tuple_(after_ts, after_task_id),
+                    )
+                query = query.order_by(
+                    *(col.desc() if descending else col.asc() for col in (order_by_col, TaskModel.task_id))
+                ).limit(page_size)
+            else:
+                query = (
+                    query.order_by(order_by_col.desc() if descending else order_by_col.asc())
+                    .limit(page_size)
+                    .offset(db_page * page_size)
+                )
 
             results = (await session.execute(query)).all()
 
-            return [
+        # A large page is seconds of pure-Python model building; on the event loop it stalls every other request.
+        # The query loads every column, so the thread only reads loaded attributes and never uses the session.
+        return await asyncio.to_thread(
+            lambda: [
                 convert_to_task(task, debug_enabled=self.debug_enabled, workflow_permanent_id=workflow_permanent_id)
                 for task, workflow_permanent_id in results
             ]
+        )
 
     @db_operation("get_tasks_count")
     async def get_tasks_count(

@@ -10,6 +10,7 @@ import {
 } from "@/components/ui/select";
 import { Skeleton } from "@/components/ui/skeleton";
 import { WorkflowBlockInputTextarea } from "@/components/WorkflowBlockInputTextarea";
+import { useHasCapability } from "@/store/PageSlots";
 import {
   getDefaultGoogleOAuthCredentialId,
   hasGoogleOAuthCredentialScopes,
@@ -25,6 +26,8 @@ type Props = {
   onChange: (value: string) => void;
   requiredScopes: readonly string[];
   optional?: boolean;
+  // Offer only accounts the server reports as able to send mail, and never pick one for the user.
+  gmailSendOnly?: boolean;
 };
 
 const ADVANCED_OPTION = "__advanced__";
@@ -37,22 +40,25 @@ function GoogleOAuthCredentialSelector({
   onChange,
   requiredScopes,
   optional = false,
+  gmailSendOnly = false,
 }: Readonly<Props>) {
   const {
     credentials: allCredentials,
     isLoading,
     isFetching,
   } = useGoogleOAuthCredentials();
+  const canAuthorize = useHasCapability("google_oauth.authorize");
   const [showAdvanced, setShowAdvanced] = useState(false);
   const credentials = allCredentials.filter(
     (credential) =>
       isGoogleOAuthCredentialActive(credential) &&
-      hasGoogleOAuthCredentialScopes(credential, requiredScopes),
+      hasGoogleOAuthCredentialScopes(credential, requiredScopes) &&
+      (!gmailSendOnly || credential.gmail_send_ready === true),
   );
 
   // If the value looks like a Jinja template, default to advanced mode
   const isTemplateValue = value.includes("{{") || value.includes("{%");
-  const useAdvanced = showAdvanced || isTemplateValue;
+  const useAdvanced = !gmailSendOnly && (showAdvanced || isTemplateValue);
 
   const hasCredentials = credentials.length > 0;
   const isKnownCredential = credentials.some((c) => c.id === value);
@@ -65,8 +71,15 @@ function GoogleOAuthCredentialSelector({
     allCredentials.some(
       (c) => c.id === value && !isGoogleOAuthCredentialActive(c),
     );
+  const savedCredentialCannotSend =
+    gmailSendOnly &&
+    !!value &&
+    !isKnownCredential &&
+    allCredentials.some(
+      (c) => c.id === value && isGoogleOAuthCredentialActive(c),
+    );
   const firstValidId = getDefaultGoogleOAuthCredentialId(credentials);
-  const needsAutoFill = !optional && !value;
+  const needsAutoFill = !optional && !gmailSendOnly && !value;
 
   useOAuthCredentialAutoFill({
     nodeId,
@@ -132,7 +145,21 @@ function GoogleOAuthCredentialSelector({
         </>
       ) : (
         <>
-          {savedCredentialNeedsReconnect ? (
+          {savedCredentialCannotSend ? (
+            <p className="rounded-md border border-amber-300 bg-amber-100 px-2 py-1 text-[0.7rem] text-amber-700 dark:border-amber-600/40 dark:bg-amber-900/20 dark:text-amber-200">
+              Saved Google account cannot send email. Enable sending for it on
+              the{" "}
+              <a
+                href="/integrations"
+                target="_blank"
+                rel="noreferrer"
+                className="underline"
+              >
+                Integrations
+              </a>{" "}
+              page, or pick another account.
+            </p>
+          ) : savedCredentialNeedsReconnect ? (
             <p className="rounded-md border border-amber-300 bg-amber-100 px-2 py-1 text-[0.7rem] text-amber-700 dark:border-amber-600/40 dark:bg-amber-900/20 dark:text-amber-200">
               Saved Google account needs to be reconnected. Reconnect it on the{" "}
               <a
@@ -156,7 +183,7 @@ function GoogleOAuthCredentialSelector({
               <SelectValue placeholder="Select a Google account" />
             </SelectTrigger>
             <SelectContent>
-              {optional ? (
+              {optional || gmailSendOnly ? (
                 <SelectItem value={NONE_OPTION}>No Google account</SelectItem>
               ) : null}
 
@@ -171,19 +198,25 @@ function GoogleOAuthCredentialSelector({
                 </CustomSelectItem>
               ))}
 
-              <SelectItem value={SETTINGS_OPTION}>
+              <SelectItem value={SETTINGS_OPTION} disabled={!canAuthorize}>
                 <div className="flex items-center gap-2">
                   <PlusIcon className="size-4" />
-                  <span>Connect new account</span>
+                  <span>
+                    {canAuthorize
+                      ? "Connect new account"
+                      : "Connect new account (admin required)"}
+                  </span>
                 </div>
               </SelectItem>
 
-              <SelectItem value={ADVANCED_OPTION}>
-                <div className="flex items-center gap-2">
-                  <span className="font-mono text-xs">{"{{}}"}</span>
-                  <span>Use template expression</span>
-                </div>
-              </SelectItem>
+              {gmailSendOnly ? null : (
+                <SelectItem value={ADVANCED_OPTION}>
+                  <div className="flex items-center gap-2">
+                    <span className="font-mono text-xs">{"{{}}"}</span>
+                    <span>Use template expression</span>
+                  </div>
+                </SelectItem>
+              )}
             </SelectContent>
           </Select>
         </>

@@ -1,0 +1,538 @@
+---
+title: "Browser sessions"
+description: "Create and manage persistent cloud browser sessions."
+slug: sdk-reference/browser-sessions
+keywords:
+  - "browser session"
+  - "persistent browser"
+---
+
+{/* Generated from the Skyvern SDK source (signatures and docstrings). Do not edit by hand; change the SDK docstrings. */}
+
+A browser session is a cloud browser that stays open between runs, so tasks and agents can share cookies and page state. Pass its `browser_session_id` (`pbs_…`) to `run_task` or `run_workflow`.
+
+Every method here also accepts `request_options` (Python) or a final `requestOptions` argument (TypeScript) to override the timeout, retries or headers for one call; see [request options](/sdk-reference/overview#request-options).
+
+---
+
+## create_browser_session
+
+Create a browser session that persists across multiple runs
+
+<CodeGroup>
+```python Python
+await skyvern.create_browser_session(
+    *,
+    url: str | None = ...,
+    timeout: int | None = ...,
+    proxy_location: CreateBrowserSessionRequestProxyLocation | None = ...,
+    proxy_session_id: str | None = ...,
+    extensions: Sequence[Extensions] | None = ...,
+    browser_type: PersistentBrowserType | None = ...,
+    browser_profile_id: str | None = ...,
+    generate_browser_profile: bool | None = ...,
+) -> BrowserSessionResponse
+```
+
+```typescript TypeScript
+skyvern.createBrowserSession(request?: CreateBrowserSessionRequest): Promise<BrowserSessionResponse>
+```
+</CodeGroup>
+
+**Parameters**
+
+<ParamField path={"url"} type={"str | None"}>
+Optional URL to open when the standalone browser session starts.
+
+Sent only when you pass it
+</ParamField>
+
+<ParamField path={"timeout"} type={"int | None"}>
+Timeout in minutes for the session. Timeout is applied after the session is started. Must be between 5 and 240. Defaults to 60.
+
+Sent only when you pass it
+</ParamField>
+
+<ParamField path={"proxy_location"} type={"CreateBrowserSessionRequestProxyLocation | None"}>
+Geographic Proxy location to route the browser traffic through. This is only available in Skyvern Cloud.
+
+Sent only when you pass it
+</ParamField>
+
+<ParamField path={"proxy_session_id"} type={"str | None"}>
+Opaque Skyvern-managed proxy sticky-session id for pinned Residential ISP sessions.
+
+Sent only when you pass it
+</ParamField>
+
+<ParamField path={"extensions"} type={"Sequence[Extensions] | None"}>
+A list of extensions to install in the browser session.
+
+Sent only when you pass it
+</ParamField>
+
+<ParamField path={"browser_type"} type={"PersistentBrowserType | None"}>
+The type of browser to use for the session.
+
+Sent only when you pass it
+</ParamField>
+
+<ParamField path={"browser_profile_id"} type={"str | None"}>
+ID of a browser profile to load into this session (restores cookies, localStorage, etc.). browser_profile_id starts with `bp_`.
+
+Sent only when you pass it
+</ParamField>
+
+<ParamField path={"generate_browser_profile"} type={"bool | None"}>
+When true, the session's browser profile (cookies, localStorage, etc.) is saved to storage when the session ends so it can be turned into a reusable browser profile. Defaults to false to avoid storing profiles for sessions that never need them. Sessions started with a browser_profile_id always persist their profile regardless of this flag.
+
+Sent only when you pass it
+</ParamField>
+
+**Returns** `BrowserSessionResponse` · TypeScript `Promise<BrowserSessionResponse>`
+
+<Accordion title="BrowserSessionResponse fields">
+
+| Field | Type | Description |
+|---|---|---|
+| `browser_session_id` | `str` | Unique identifier for the browser session. browser_session_id starts with `pbs_`. |
+| `organization_id` | `str` | ID of the organization that owns this session |
+| `status` | `str \| None` | Current status of the browser session |
+| `runnable_type` | `str \| None` | Type of the current runnable associated with this session (workflow, task etc) |
+| `runnable_id` | `str \| None` | ID of the current runnable |
+| `timeout` | `int \| None` | Timeout in minutes for the session. Timeout is applied after the session is started. Defaults to 60 minutes. |
+| `browser_address` | `str \| None` | Url for connecting to the browser |
+| `app_url` | `str \| None` | Url for the browser session page |
+| `extensions` | `list["ad-blocker" \| "captcha-solver" \| Any] \| None` | A list of extensions installed in the browser session. |
+| `browser_type` | `"msedge" \| "chrome" \| "stealth-chromium" \| None` | The type of browser used for the session. |
+| `browser_profile_id` | `str \| None` | ID of the browser profile loaded into this session, if any. browser_profile_id starts with `bp_`. |
+| `generate_browser_profile` | `bool \| None` | Whether this session's browser profile will be saved when it ends so it can become a reusable browser profile. |
+| `vnc_streaming_supported` | `bool \| None` | Whether the browser session supports VNC streaming |
+| `download_path` | `str \| None` | The path where the browser session downloads files |
+| `downloaded_files` | `list[FileInfo] \| None` | The list of files downloaded by the browser session |
+| `recordings` | `list[FileInfo] \| None` | The list of video recordings from the browser session |
+| `started_at` | `datetime \| None` | Timestamp when the session was started |
+| `completed_at` | `datetime \| None` | Timestamp when the session was completed |
+| `created_at` | `datetime` | Timestamp when the session was created (the timestamp for the initial request) |
+| `modified_at` | `datetime` | Timestamp when the session was last modified |
+| `deleted_at` | `datetime \| None` | Timestamp when the session was deleted, if applicable |
+
+</Accordion>
+
+**Example**
+
+<CodeGroup>
+```python Python
+import asyncio
+
+from skyvern import Skyvern
+
+
+async def main() -> None:
+    skyvern = Skyvern(api_key="YOUR_API_KEY")
+    result = await skyvern.create_browser_session()
+    print(result)
+
+
+asyncio.run(main())
+```
+
+```typescript TypeScript
+import { Skyvern } from "@skyvern/client";
+
+const skyvern = new Skyvern({ apiKey: "YOUR_API_KEY" });
+const result = await skyvern.createBrowserSession();
+console.log(result);
+```
+</CodeGroup>
+
+---
+
+## get_browser_session
+
+Get details about a specific browser session, including the browser address for cdp connection.
+
+<CodeGroup>
+```python Python
+await skyvern.get_browser_session(browser_session_id: str) -> BrowserSessionResponse
+```
+
+```typescript TypeScript
+skyvern.getBrowserSession(browserSessionId: string): Promise<BrowserSessionResponse>
+```
+</CodeGroup>
+
+**Parameters**
+
+<ParamField path={"browser_session_id"} type={"str"} required>
+The ID of the browser session. browser_session_id starts with `pbs_`
+
+TypeScript: `browserSessionId`
+</ParamField>
+
+**Returns** `BrowserSessionResponse` · TypeScript `Promise<BrowserSessionResponse>`
+
+<Accordion title="BrowserSessionResponse fields">
+
+| Field | Type | Description |
+|---|---|---|
+| `browser_session_id` | `str` | Unique identifier for the browser session. browser_session_id starts with `pbs_`. |
+| `organization_id` | `str` | ID of the organization that owns this session |
+| `status` | `str \| None` | Current status of the browser session |
+| `runnable_type` | `str \| None` | Type of the current runnable associated with this session (workflow, task etc) |
+| `runnable_id` | `str \| None` | ID of the current runnable |
+| `timeout` | `int \| None` | Timeout in minutes for the session. Timeout is applied after the session is started. Defaults to 60 minutes. |
+| `browser_address` | `str \| None` | Url for connecting to the browser |
+| `app_url` | `str \| None` | Url for the browser session page |
+| `extensions` | `list["ad-blocker" \| "captcha-solver" \| Any] \| None` | A list of extensions installed in the browser session. |
+| `browser_type` | `"msedge" \| "chrome" \| "stealth-chromium" \| None` | The type of browser used for the session. |
+| `browser_profile_id` | `str \| None` | ID of the browser profile loaded into this session, if any. browser_profile_id starts with `bp_`. |
+| `generate_browser_profile` | `bool \| None` | Whether this session's browser profile will be saved when it ends so it can become a reusable browser profile. |
+| `vnc_streaming_supported` | `bool \| None` | Whether the browser session supports VNC streaming |
+| `download_path` | `str \| None` | The path where the browser session downloads files |
+| `downloaded_files` | `list[FileInfo] \| None` | The list of files downloaded by the browser session |
+| `recordings` | `list[FileInfo] \| None` | The list of video recordings from the browser session |
+| `started_at` | `datetime \| None` | Timestamp when the session was started |
+| `completed_at` | `datetime \| None` | Timestamp when the session was completed |
+| `created_at` | `datetime` | Timestamp when the session was created (the timestamp for the initial request) |
+| `modified_at` | `datetime` | Timestamp when the session was last modified |
+| `deleted_at` | `datetime \| None` | Timestamp when the session was deleted, if applicable |
+
+</Accordion>
+
+**Example**
+
+<CodeGroup>
+```python Python
+import asyncio
+
+from skyvern import Skyvern
+
+
+async def main() -> None:
+    skyvern = Skyvern(api_key="YOUR_API_KEY")
+    result = await skyvern.get_browser_session(browser_session_id="pbs_123")
+    print(result)
+
+
+asyncio.run(main())
+```
+
+```typescript TypeScript
+import { Skyvern } from "@skyvern/client";
+
+const skyvern = new Skyvern({ apiKey: "YOUR_API_KEY" });
+const result = await skyvern.getBrowserSession("pbs_123");
+console.log(result);
+```
+</CodeGroup>
+
+---
+
+## get_browser_sessions
+
+Get all active browser sessions for the organization
+
+<CodeGroup>
+```python Python
+await skyvern.get_browser_sessions() -> list[BrowserSessionResponse]
+```
+
+```typescript TypeScript
+skyvern.getBrowserSessions(): Promise<BrowserSessionResponse[]>
+```
+</CodeGroup>
+
+**Returns** `list[BrowserSessionResponse]` · TypeScript `Promise<BrowserSessionResponse[]>`
+
+<Accordion title="BrowserSessionResponse fields">
+
+| Field | Type | Description |
+|---|---|---|
+| `browser_session_id` | `str` | Unique identifier for the browser session. browser_session_id starts with `pbs_`. |
+| `organization_id` | `str` | ID of the organization that owns this session |
+| `status` | `str \| None` | Current status of the browser session |
+| `runnable_type` | `str \| None` | Type of the current runnable associated with this session (workflow, task etc) |
+| `runnable_id` | `str \| None` | ID of the current runnable |
+| `timeout` | `int \| None` | Timeout in minutes for the session. Timeout is applied after the session is started. Defaults to 60 minutes. |
+| `browser_address` | `str \| None` | Url for connecting to the browser |
+| `app_url` | `str \| None` | Url for the browser session page |
+| `extensions` | `list["ad-blocker" \| "captcha-solver" \| Any] \| None` | A list of extensions installed in the browser session. |
+| `browser_type` | `"msedge" \| "chrome" \| "stealth-chromium" \| None` | The type of browser used for the session. |
+| `browser_profile_id` | `str \| None` | ID of the browser profile loaded into this session, if any. browser_profile_id starts with `bp_`. |
+| `generate_browser_profile` | `bool \| None` | Whether this session's browser profile will be saved when it ends so it can become a reusable browser profile. |
+| `vnc_streaming_supported` | `bool \| None` | Whether the browser session supports VNC streaming |
+| `download_path` | `str \| None` | The path where the browser session downloads files |
+| `downloaded_files` | `list[FileInfo] \| None` | The list of files downloaded by the browser session |
+| `recordings` | `list[FileInfo] \| None` | The list of video recordings from the browser session |
+| `started_at` | `datetime \| None` | Timestamp when the session was started |
+| `completed_at` | `datetime \| None` | Timestamp when the session was completed |
+| `created_at` | `datetime` | Timestamp when the session was created (the timestamp for the initial request) |
+| `modified_at` | `datetime` | Timestamp when the session was last modified |
+| `deleted_at` | `datetime \| None` | Timestamp when the session was deleted, if applicable |
+
+</Accordion>
+
+**Example**
+
+<CodeGroup>
+```python Python
+import asyncio
+
+from skyvern import Skyvern
+
+
+async def main() -> None:
+    skyvern = Skyvern(api_key="YOUR_API_KEY")
+    result = await skyvern.get_browser_sessions()
+    print(result)
+
+
+asyncio.run(main())
+```
+
+```typescript TypeScript
+import { Skyvern } from "@skyvern/client";
+
+const skyvern = new Skyvern({ apiKey: "YOUR_API_KEY" });
+const result = await skyvern.getBrowserSessions();
+console.log(result);
+```
+</CodeGroup>
+
+---
+
+## update_browser_session
+
+Update a live browser session. Currently supports toggling generate_browser_profile, which is read when the session ends to decide whether to save its browser profile.
+
+<CodeGroup>
+```python Python
+await skyvern.update_browser_session(
+    browser_session_id: str,
+    *,
+    generate_browser_profile: bool,
+) -> BrowserSessionResponse
+```
+
+```typescript TypeScript
+skyvern.updateBrowserSession(browserSessionId: string, request: UpdateBrowserSessionRequest): Promise<BrowserSessionResponse>
+```
+</CodeGroup>
+
+**Parameters**
+
+<ParamField path={"browser_session_id"} type={"str"} required>
+The ID of the browser session. browser_session_id starts with `pbs_`
+
+TypeScript: `browserSessionId`
+</ParamField>
+
+<ParamField path={"generate_browser_profile"} type={"bool"} required>
+Enable or disable saving this session's browser profile when it ends. Can be toggled while the session is still alive; the value is read at session teardown.
+</ParamField>
+
+**Returns** `BrowserSessionResponse` · TypeScript `Promise<BrowserSessionResponse>`
+
+<Accordion title="BrowserSessionResponse fields">
+
+| Field | Type | Description |
+|---|---|---|
+| `browser_session_id` | `str` | Unique identifier for the browser session. browser_session_id starts with `pbs_`. |
+| `organization_id` | `str` | ID of the organization that owns this session |
+| `status` | `str \| None` | Current status of the browser session |
+| `runnable_type` | `str \| None` | Type of the current runnable associated with this session (workflow, task etc) |
+| `runnable_id` | `str \| None` | ID of the current runnable |
+| `timeout` | `int \| None` | Timeout in minutes for the session. Timeout is applied after the session is started. Defaults to 60 minutes. |
+| `browser_address` | `str \| None` | Url for connecting to the browser |
+| `app_url` | `str \| None` | Url for the browser session page |
+| `extensions` | `list["ad-blocker" \| "captcha-solver" \| Any] \| None` | A list of extensions installed in the browser session. |
+| `browser_type` | `"msedge" \| "chrome" \| "stealth-chromium" \| None` | The type of browser used for the session. |
+| `browser_profile_id` | `str \| None` | ID of the browser profile loaded into this session, if any. browser_profile_id starts with `bp_`. |
+| `generate_browser_profile` | `bool \| None` | Whether this session's browser profile will be saved when it ends so it can become a reusable browser profile. |
+| `vnc_streaming_supported` | `bool \| None` | Whether the browser session supports VNC streaming |
+| `download_path` | `str \| None` | The path where the browser session downloads files |
+| `downloaded_files` | `list[FileInfo] \| None` | The list of files downloaded by the browser session |
+| `recordings` | `list[FileInfo] \| None` | The list of video recordings from the browser session |
+| `started_at` | `datetime \| None` | Timestamp when the session was started |
+| `completed_at` | `datetime \| None` | Timestamp when the session was completed |
+| `created_at` | `datetime` | Timestamp when the session was created (the timestamp for the initial request) |
+| `modified_at` | `datetime` | Timestamp when the session was last modified |
+| `deleted_at` | `datetime \| None` | Timestamp when the session was deleted, if applicable |
+
+</Accordion>
+
+**Example**
+
+<CodeGroup>
+```python Python
+import asyncio
+
+from skyvern import Skyvern
+
+
+async def main() -> None:
+    skyvern = Skyvern(api_key="YOUR_API_KEY")
+    result = await skyvern.update_browser_session(
+        browser_session_id="pbs_123",
+        generate_browser_profile=True,
+    )
+    print(result)
+
+
+asyncio.run(main())
+```
+
+```typescript TypeScript
+import { Skyvern } from "@skyvern/client";
+
+const skyvern = new Skyvern({ apiKey: "YOUR_API_KEY" });
+const result = await skyvern.updateBrowserSession("pbs_123", { generate_browser_profile: true });
+console.log(result);
+```
+</CodeGroup>
+
+---
+
+## extend_browser_session
+
+Extend a live browser session by a number of minutes. Sessions are created with a timeout of at most 240 minutes and can be extended, one or more times, up to a total lifetime of 360 minutes (6 hours). The minutes are added to the session's current deadline. A request for more than the remaining headroom is granted the remainder, and the response carries a warning. The response's `timeout` is the session's new total budget in minutes, counted from when the session started.
+
+<CodeGroup>
+```python Python
+await skyvern.extend_browser_session(
+    browser_session_id: str,
+    *,
+    additional_minutes: int,
+) -> BrowserSessionResponse
+```
+
+```typescript TypeScript
+skyvern.extendBrowserSession(browserSessionId: string, request: ExtendBrowserSessionRequest): Promise<BrowserSessionResponse>
+```
+</CodeGroup>
+
+**Parameters**
+
+<ParamField path={"browser_session_id"} type={"str"} required>
+The ID of the browser session. browser_session_id starts with `pbs_`
+
+TypeScript: `browserSessionId`
+</ParamField>
+
+<ParamField path={"additional_minutes"} type={"int"} required>
+Minutes to add to the session's current deadline. A session can be extended, one or more times, up to a total lifetime of 360 minutes (6 hours) counted from when it started; a request for more than the remaining headroom is granted the remainder and the response carries a warning.
+</ParamField>
+
+**Returns** `BrowserSessionResponse` · TypeScript `Promise<BrowserSessionResponse>`
+
+<Accordion title="BrowserSessionResponse fields">
+
+| Field | Type | Description |
+|---|---|---|
+| `browser_session_id` | `str` | Unique identifier for the browser session. browser_session_id starts with `pbs_`. |
+| `organization_id` | `str` | ID of the organization that owns this session |
+| `status` | `str \| None` | Current status of the browser session |
+| `runnable_type` | `str \| None` | Type of the current runnable associated with this session (workflow, task etc) |
+| `runnable_id` | `str \| None` | ID of the current runnable |
+| `timeout` | `int \| None` | Timeout in minutes for the session. Timeout is applied after the session is started. Defaults to 60 minutes. |
+| `browser_address` | `str \| None` | Url for connecting to the browser |
+| `app_url` | `str \| None` | Url for the browser session page |
+| `extensions` | `list["ad-blocker" \| "captcha-solver" \| Any] \| None` | A list of extensions installed in the browser session. |
+| `browser_type` | `"msedge" \| "chrome" \| "stealth-chromium" \| None` | The type of browser used for the session. |
+| `browser_profile_id` | `str \| None` | ID of the browser profile loaded into this session, if any. browser_profile_id starts with `bp_`. |
+| `generate_browser_profile` | `bool \| None` | Whether this session's browser profile will be saved when it ends so it can become a reusable browser profile. |
+| `vnc_streaming_supported` | `bool \| None` | Whether the browser session supports VNC streaming |
+| `download_path` | `str \| None` | The path where the browser session downloads files |
+| `downloaded_files` | `list[FileInfo] \| None` | The list of files downloaded by the browser session |
+| `recordings` | `list[FileInfo] \| None` | The list of video recordings from the browser session |
+| `started_at` | `datetime \| None` | Timestamp when the session was started |
+| `completed_at` | `datetime \| None` | Timestamp when the session was completed |
+| `created_at` | `datetime` | Timestamp when the session was created (the timestamp for the initial request) |
+| `modified_at` | `datetime` | Timestamp when the session was last modified |
+| `deleted_at` | `datetime \| None` | Timestamp when the session was deleted, if applicable |
+
+</Accordion>
+
+**Example**
+
+<CodeGroup>
+```python Python
+import asyncio
+
+from skyvern import Skyvern
+
+
+async def main() -> None:
+    skyvern = Skyvern(api_key="YOUR_API_KEY")
+    result = await skyvern.extend_browser_session(
+        browser_session_id="pbs_123",
+        additional_minutes=60,
+    )
+    print(result)
+
+
+asyncio.run(main())
+```
+
+```typescript TypeScript
+import { Skyvern } from "@skyvern/client";
+
+const skyvern = new Skyvern({ apiKey: "YOUR_API_KEY" });
+const result = await skyvern.extendBrowserSession("pbs_123", { additional_minutes: 60 });
+console.log(result);
+```
+</CodeGroup>
+
+---
+
+## close_browser_session
+
+Close a session. Once closed, the session cannot be used again.
+
+<CodeGroup>
+```python Python
+await skyvern.close_browser_session(browser_session_id: str) -> Any | None
+```
+
+```typescript TypeScript
+skyvern.closeBrowserSession(browserSessionId: string): Promise<unknown>
+```
+</CodeGroup>
+
+**Parameters**
+
+<ParamField path={"browser_session_id"} type={"str"} required>
+The ID of the browser session to close. completed_at will be set when the browser session is closed. browser_session_id starts with `pbs_`
+
+TypeScript: `browserSessionId`
+</ParamField>
+
+**Returns** `Any | None` · TypeScript `Promise<unknown>`
+
+**Example**
+
+<CodeGroup>
+```python Python
+import asyncio
+
+from skyvern import Skyvern
+
+
+async def main() -> None:
+    skyvern = Skyvern(api_key="YOUR_API_KEY")
+    result = await skyvern.close_browser_session(browser_session_id="pbs_123")
+    print(result)
+
+
+asyncio.run(main())
+```
+
+```typescript TypeScript
+import { Skyvern } from "@skyvern/client";
+
+const skyvern = new Skyvern({ apiKey: "YOUR_API_KEY" });
+const result = await skyvern.closeBrowserSession("pbs_123");
+console.log(result);
+```
+</CodeGroup>

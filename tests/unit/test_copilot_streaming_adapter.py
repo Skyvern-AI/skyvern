@@ -13,22 +13,23 @@ from unittest.mock import AsyncMock, MagicMock
 from urllib.parse import quote
 
 import pytest
-from agents import Agent, RunConfig, Runner, function_tool
-from agents.items import ModelResponse, RunItem
+from agents import (
+    Agent,
+    RunConfig,
+    Runner,
+    function_tool,
+)
+from agents.items import RunItem
 from agents.mcp.util import MCPUtil
-from agents.models.interface import Model
 from agents.stream_events import RawResponsesStreamEvent, RunItemStreamEvent
 from agents.tool_context import ToolContext
 from fastmcp import FastMCP
 from openai.types.responses import (
-    ResponseCompletedEvent,
     ResponseCreatedEvent,
     ResponseFunctionCallArgumentsDeltaEvent,
     ResponseFunctionCallArgumentsDoneEvent,
     ResponseOutputItemAddedEvent,
     ResponseOutputItemDoneEvent,
-    ResponseOutputMessage,
-    ResponseOutputText,
 )
 from openai.types.responses.response import Response
 from openai.types.responses.response_function_tool_call import ResponseFunctionToolCall
@@ -40,8 +41,15 @@ from skyvern.forge.sdk.artifact.manager import ArtifactManager
 from skyvern.forge.sdk.artifact.models import Artifact, ArtifactType
 from skyvern.forge.sdk.artifact.storage.local import LocalStorage
 from skyvern.forge.sdk.copilot import streaming_adapter as streaming_adapter_module
-from skyvern.forge.sdk.copilot.agent import _build_narrative_payload, _build_system_prompt
-from skyvern.forge.sdk.copilot.context import USER_FACING_REASON_SCHEMA, CopilotContext, InFlightStreamToolCall
+from skyvern.forge.sdk.copilot.agent import (
+    _build_narrative_payload,
+    _build_system_prompt,
+)
+from skyvern.forge.sdk.copilot.context import (
+    USER_FACING_REASON_SCHEMA,
+    CopilotContext,
+    InFlightStreamToolCall,
+)
 from skyvern.forge.sdk.copilot.hooks import CopilotRunHooks
 from skyvern.forge.sdk.copilot.mcp_adapter import SchemaOverlay, SkyvernOverlayMCPServer
 from skyvern.forge.sdk.copilot.model_input_capture import serialize_tool_surface
@@ -65,7 +73,8 @@ from skyvern.forge.sdk.schemas.workflow_copilot import (
     WorkflowCopilotChatSender,
     WorkflowCopilotStreamMessageType,
 )
-from tests.unit.copilot_test_helpers import FakeCopilotStream
+from tests.unit.copilot_test_helpers import FakeCopilotStream, ScriptedModel, scripted_call, scripted_text
+from tests.unit.scoped_asyncio import ScopedAsyncio
 
 
 @pytest.mark.parametrize(
@@ -1929,7 +1938,7 @@ async def test_actor_reason_native_dispatch_preserves_ordinary_validation() -> N
     )
     schema = tool.params_json_schema
     assert "user_facing_reason" in schema["properties"]
-    assert "user_facing_reason" not in schema.get("required", [])
+    assert "user_facing_reason" in schema["required"]
     assert tool.strict_json_schema is False
     tc = ToolContext(context=ctx, tool_name=tool.name, tool_call_id="plan-call", tool_arguments="{}")
     for reason in ("I will plan the booking steps.", None, "", "   ", 17, {"bad": True}):
@@ -1937,56 +1946,23 @@ async def test_actor_reason_native_dispatch_preserves_ordinary_validation() -> N
         result = json.loads(await tool.on_invoke_tool(tc, json.dumps(raw)))
         assert result["ok"] is True
         assert ctx.work_plan == ["Inspect availability"]
+    omitted = json.loads(await tool.on_invoke_tool(tc, json.dumps({"items": ["Read the page"]})))
+    assert omitted["ok"] is True
+    assert ctx.work_plan == ["Read the page"]
     result = await tool.on_invoke_tool(tc, json.dumps({"user_facing_reason": "Explain", "items": 17}))
     assert "error" in result.lower()
 
 
-class _ActorCallModel(Model):
-    """Deterministic SDK input source; no live actor or adapter replacement."""
-
-    def __init__(self, name: str, arguments: dict[str, Any]) -> None:
-        self.name = name
-        self.arguments = arguments
-        self.called = False
-        self.served_instructions: str | None = None
-        self.served_tools: list[Any] = []
-
-    async def get_response(self, *args: Any, **kwargs: Any) -> ModelResponse:
-        raise AssertionError("streamed execution required")
-
-    async def stream_response(
-        self,
-        system_instructions: str | None,
-        input: Any,
-        model_settings: Any,
-        tools: list[Any],
-        *args: Any,
-        **kwargs: Any,
-    ):
-        self.served_instructions = system_instructions
-        self.served_tools = tools
-        if self.called:
-            item = ResponseOutputMessage(
-                id="msg_done",
-                role="assistant",
-                status="completed",
-                type="message",
-                content=[ResponseOutputText(type="output_text", text="Done", annotations=[])],
-            )
-        else:
-            self.called = True
-            item = ResponseFunctionToolCall(
-                id="fc_held",
-                call_id="call_held",
-                name=self.name,
-                arguments=json.dumps(self.arguments),
-                type="function_call",
-            )
-        yield ResponseOutputItemDoneEvent(
-            item=item, output_index=0, sequence_number=1, type="response.output_item.done"
-        )
-        response = _minimal_response().model_copy(update={"output": [item], "status": "completed"})
-        yield ResponseCompletedEvent(response=response, sequence_number=2, type="response.completed")
+def test_every_native_tool_but_reply_requires_a_nullable_reason() -> None:
+    tools = copilot_native_tools(supports_question_tool=False, browser_code_available=False, run_tools_available=False)
+    by_name = {tool.name: tool.params_json_schema for tool in tools}
+    reply_schema = by_name.pop("reply")
+    assert "user_facing_reason" not in reply_schema["properties"]
+    assert reply_schema["required"] == ["user_response", "global_llm_context"]
+    assert by_name
+    for name, schema in by_name.items():
+        assert "user_facing_reason" in schema["required"], name
+        assert schema["properties"]["user_facing_reason"]["type"] == ["string", "null"], name
 
 
 @pytest.mark.asyncio
@@ -2045,10 +2021,11 @@ async def test_real_runner_streams_actor_reason_before_held_action_returns(
         tool = MCPUtil.to_function_tool(advertised[0], server, convert_schemas_to_strict=False)
     reason = "I will check this value before booking."
     assert tool.params_json_schema["properties"]["user_facing_reason"]["type"] == ["string", "null"]
-    assert "user_facing_reason" not in tool.params_json_schema.get("required", [])
+    assert "user_facing_reason" in tool.params_json_schema["required"]
     dump = serialize_tool_surface([tool])
     assert dump.payload["tools"][0]["params_json_schema"] == tool.params_json_schema
-    model = _ActorCallModel(tool.name, {"value": "ordinary", "user_facing_reason": reason})
+    arguments = {"value": "ordinary", "user_facing_reason": reason}
+    model = ScriptedModel([[scripted_call(tool.name, arguments)], [scripted_text("Done")]])
     result = Runner.run_streamed(
         Agent(name="controlled", model=model, tools=[tool], instructions=_build_system_prompt(tool_usage_guide="")),
         input="controlled",
@@ -2066,7 +2043,8 @@ async def test_real_runner_streams_actor_reason_before_held_action_returns(
         assert "Describe intent, not an outcome before results" in model.served_instructions
         served_reason = model.served_tools[0].params_json_schema["properties"]["user_facing_reason"]
         assert "displayed above this action while it runs" in served_reason["description"]
-        assert "Null or absence is accepted" in served_reason["description"]
+        assert "absence" not in served_reason["description"]
+        assert "absence" not in model.served_instructions
         for _ in range(100):
             calls = [frame for frame in stream.sent if frame.type == WorkflowCopilotStreamMessageType.TOOL_CALL]
             if calls:
@@ -2096,7 +2074,7 @@ async def test_real_runner_streams_actor_reason_before_held_action_returns(
         assert capture["arguments_shape"] == {"value": "str", "user_facing_reason": "str"}
         assert (
             capture["arguments_sha256"]
-            == hashlib.sha256(json.dumps(model.arguments, ensure_ascii=False).encode()).hexdigest()
+            == hashlib.sha256(json.dumps(arguments, ensure_ascii=False).encode()).hexdigest()
         )
         assert capture["activity_bucket"] == calls[0].activity_bucket
         assert capture["commit"]
@@ -2359,16 +2337,26 @@ async def test_a_failed_screenshot_upload_leaves_the_tool_result_as_it_was(
     dictation_upload = asyncio.create_task(asyncio.Event().wait())
     app.ARTIFACT_MANAGER.upload_aiotasks_map["wcc_1"].append(dictation_upload)
     dictation_waits: list[asyncio.Task[None]] = []
+    save_budgets: list[asyncio.Timeout] = []
+    save_budget_delays: list[float | None] = []
+
+    def save_budget(delay: float | None) -> asyncio.Timeout:
+        save_budget_delays.append(delay)
+        save_budgets.append(asyncio.timeout(delay))
+        return save_budgets[-1]
 
     async def refuse(artifact: Artifact, data: bytes) -> None:
         # A dictation request for the same chat starts waiting while this upload is in flight.
         dictation_waits.append(asyncio.create_task(app.ARTIFACT_MANAGER.wait_for_upload_aiotasks(["wcc_1"])))
         if storage_fault == "stalls":
+            # Expire the save budget only once the upload is in flight; a short real budget let a slow
+            # runner expire it before the upload started.
+            save_budgets[-1].reschedule(asyncio.get_running_loop().time())
             await asyncio.Event().wait()
         raise RuntimeError("storage unavailable")
 
     monkeypatch.setattr(app.STORAGE, "store_artifact", refuse)
-    monkeypatch.setattr(streaming_adapter_module, "_CHAT_SCREENSHOT_SAVE_TIMEOUT_SECONDS", 0.05)
+    monkeypatch.setattr(streaming_adapter_module, "asyncio", ScopedAsyncio(timeout=save_budget))
 
     def tool_results(sent: list[Any]) -> list[dict[str, Any]]:
         return [
@@ -2381,10 +2369,16 @@ async def test_a_failed_screenshot_upload_leaves_the_tool_result_as_it_was(
     ctx = _test_copilot_context(workflow_copilot_chat_id="wcc_1")
     assert _stage_frame(ctx)
 
+    # Count only the saves made by the drive under test, not by the undisturbed drive above.
+    save_budgets.clear()
+    save_budget_delays.clear()
     try:
         sent = await _drive(_click_round_trip(), ctx)
         await asyncio.sleep(0)
 
+        # Pins the production save budget, not just the constant's name.
+        assert save_budget_delays == [5]
+        assert [budget.expired() for budget in save_budgets] == [storage_fault == "stalls"]
         assert "screenshot" not in [p.type for p in sent]
         assert _saved_screenshots(ctx) is None
         assert len(tool_results(sent)) == 1

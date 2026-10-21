@@ -304,9 +304,7 @@ def parse_execution_receipts(raw: object) -> dict[str, set[str]]:
     for label, fingerprints in raw.items():
         if not isinstance(label, str) or not label or not isinstance(fingerprints, list):
             continue
-        parsed = {fingerprint for fingerprint in fingerprints if isinstance(fingerprint, str) and fingerprint}
-        if parsed:
-            receipts[label] = parsed
+        receipts[label] = {fingerprint for fingerprint in fingerprints if isinstance(fingerprint, str) and fingerprint}
     return receipts
 
 

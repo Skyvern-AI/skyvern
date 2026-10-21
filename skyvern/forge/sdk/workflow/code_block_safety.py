@@ -66,6 +66,9 @@ BLOCKED_ATTRS: frozenset[str] = frozenset(
         "co_consts",
         "co_names",
         "co_varnames",
+        "CodeType",
+        "FunctionType",
+        "LambdaType",
         "gi_frame",
         "gi_code",
         "cr_frame",
@@ -98,10 +101,13 @@ BLOCKED_ATTRS: frozenset[str] = frozenset(
         "get_type_hints",
     }
 )
+# The names module_shims binds; importing one binds its shim and loads nothing.
+SANDBOX_IMPORTABLE_MODULES: frozenset[str] = frozenset({"asyncio", "datetime", "html", "json", "re"})
+SANDBOX_MODULES_GLOBAL = "__codeblock_modules__"
 ALLOWED_SCRIPT_ATTRS: frozenset[str] = frozenset(
     {"format", "listdir", "makedirs", "rmdir", "stderr", "stdin", "stdout"}
 )
-BLOCKED_SCRIPT_ATTRS: frozenset[str] = (BLOCKED_ATTRS - ALLOWED_SCRIPT_ATTRS) | {"config", "read_pickle"}
+BLOCKED_SCRIPT_ATTRS: frozenset[str] = (BLOCKED_ATTRS - ALLOWED_SCRIPT_ATTRS) | {"config", "read_pickle", "sys"}
 BLOCKED_SCRIPT_IMPORTS: frozenset[str] = frozenset(
     {
         "antigravity",
@@ -132,9 +138,11 @@ BLOCKED_SCRIPT_IMPORTS: frozenset[str] = frozenset(
         "site",
         "socket",
         "subprocess",
+        "sys",
         "thread",
         "timeit",
         "trace",
+        "types",
         "webbrowser",
         "zipfile",
         "zipimport",
@@ -211,6 +219,14 @@ SANDBOX_ONLY_BUILTINS: frozenset[str] = frozenset(
         "property",
     }
 )
+
+
+def json_safe_default(item: object) -> str:
+    # isinstance falls back to reading item.__class__, which runs a block-defined __getattribute__.
+    # A datetime is a date subclass and keeps the placeholder rather than losing its time.
+    if issubclass(type(item), datetime.date) and not issubclass(type(item), datetime.datetime):
+        return datetime.date.isoformat(item)  # type: ignore[arg-type]
+    return f"Object '{type(item)}' is not JSON serializable"
 
 
 def safe_builtins() -> dict[str, Any]:
@@ -371,6 +387,56 @@ def _import_paths(node: ast.Import | ast.ImportFrom) -> tuple[str, ...]:
 
 def _normalized_import_root(module_name: str) -> str:
     return module_name.lstrip("_")
+
+
+def sandbox_import_error(node: ast.Import | ast.ImportFrom) -> str | None:
+    """Why a CodeBlock may not run this import, or None when it names a module the sandbox already provides."""
+    if isinstance(node, ast.Import):
+        modules = [alias.name for alias in node.names]
+    else:
+        modules = ["." * node.level + (node.module or "")]
+    for module in modules:
+        if module not in SANDBOX_IMPORTABLE_MODULES:
+            importable = ", ".join(sorted(SANDBOX_IMPORTABLE_MODULES))
+            return f"Not allowed to import module '{module}'; code blocks can import only {importable}"
+    for alias in node.names:
+        if isinstance(node, ast.ImportFrom) and (
+            alias.name == "*" or alias.name.startswith("_") or alias.name in BLOCKED_ATTRS
+        ):
+            return f"Not allowed to import '{alias.name}'"
+        if alias.asname is not None and alias.asname.startswith("__"):
+            return "Not allowed to access private methods or attributes"
+    return None
+
+
+class BindSandboxModuleImports(ast.NodeTransformer):
+    """Rewrites each import sandbox_import_error admits into an assignment from SANDBOX_MODULES_GLOBAL, recording
+    the names those imports bind."""
+
+    def __init__(self) -> None:
+        self.bound_names: set[str] = set()
+
+    def visit_Import(self, node: ast.Import) -> list[ast.stmt]:
+        self.bound_names.update(alias.asname or alias.name for alias in node.names)
+        return [
+            _bind_sandbox_name(alias.asname or alias.name, _sandbox_module(alias.name), node) for alias in node.names
+        ]
+
+    def visit_ImportFrom(self, node: ast.ImportFrom) -> list[ast.stmt]:
+        self.bound_names.update(alias.asname or alias.name for alias in node.names)
+        module = _sandbox_module(node.module or "")
+        return [
+            _bind_sandbox_name(alias.asname or alias.name, ast.Attribute(module, alias.name, ast.Load()), node)
+            for alias in node.names
+        ]
+
+
+def _sandbox_module(name: str) -> ast.expr:
+    return ast.Subscript(ast.Name(SANDBOX_MODULES_GLOBAL, ast.Load()), ast.Constant(name), ast.Load())
+
+
+def _bind_sandbox_name(name: str, value: ast.expr, node: ast.stmt) -> ast.stmt:
+    return ast.copy_location(ast.Assign([ast.Name(name, ast.Store())], value), node)
 
 
 def _is_self_or_super(node: ast.expr) -> bool:
@@ -663,13 +729,15 @@ def _validate_tree(
             if isinstance(node, ast.ImportFrom) and any(alias.name == "*" for alias in node.names):
                 raise error_factory("Wildcard imports are not allowed")
             if blocked_imports is None:
-                raise error_factory("Not allowed to import modules")
-            for module_name in _import_roots(node):
-                if _normalized_import_root(module_name) in blocked_imports:
-                    raise error_factory(f"Not allowed to import module '{module_name}'")
-            for module_path in _import_paths(node):
-                if module_path in blocked_import_paths:
-                    raise error_factory(f"Not allowed to import module '{module_path}'")
+                if (reason := sandbox_import_error(node)) is not None:
+                    raise error_factory(reason)
+            else:
+                for module_name in _import_roots(node):
+                    if _normalized_import_root(module_name) in blocked_imports:
+                        raise error_factory(f"Not allowed to import module '{module_name}'")
+                for module_path in _import_paths(node):
+                    if module_path in blocked_import_paths:
+                        raise error_factory(f"Not allowed to import module '{module_path}'")
             if isinstance(node, ast.ImportFrom):
                 for alias in node.names:
                     if (
@@ -741,7 +809,7 @@ def is_safe_code(
     *,
     error_factory: Callable[[str], Exception] = InsecureCodeDetected,
 ) -> None:
-    """Reject imports, private members, and known escape hatches.
+    """Reject imports of anything but the sandbox's own modules, private members, and known escape hatches.
 
     Leaves bare builtin names like `globals`/`locals` unblocked here; the caller decides
     whether and how those (and any other) builtins are bound in the dict it execs the

@@ -10,10 +10,10 @@ from skyvern.schemas.browser_session_timeouts import DEFAULT_TIMEOUT, MAX_EXTEND
 from skyvern.schemas.browser_settings import BrowserSettings, require_known_timezone
 from skyvern.schemas.docs.doc_strings import PROXY_LOCATION_DOC_STRING
 from skyvern.schemas.proxy_pinning import validate_proxy_session_id
-from skyvern.schemas.runs import GeoTarget, ProxyLocationInput
+from skyvern.schemas.runs import GeoTarget, ProxyLocationInput, _validate_browser_address
 from skyvern.services.browser_recording.evidence import RecordingEvidencePacket
 from skyvern.services.browser_recording.types import RecordingDraftStep
-from skyvern.utils.url_validators import validate_url
+from skyvern.utils.url_validators import is_tls_or_local_browser_address, validate_url
 
 
 class CreateBrowserSessionRequest(BaseModel):
@@ -106,6 +106,31 @@ class CreateBrowserSessionRequest(BaseModel):
         "unattended automation; the Skyvern app sets it because a session opened in the UI is watched. It requests "
         "a capability, not a particular browser, and cannot be used to select where the session runs.",
     )
+
+
+class RegisterExternalBrowserSessionRequest(BaseModel):
+    cdp_url: str = Field(
+        min_length=1,
+        repr=False,
+        description="CDP address of a browser the caller already runs. It is stored server-side and never returned.",
+    )
+    timeout: int = Field(
+        default=DEFAULT_TIMEOUT,
+        ge=MIN_TIMEOUT,
+        le=MAX_TIMEOUT,
+        description=(
+            f"Minutes the registration stays attachable, counted from registration. "
+            f"Between {MIN_TIMEOUT} and {MAX_TIMEOUT}."
+        ),
+    )
+
+    @field_validator("cdp_url")
+    @classmethod
+    def validate_cdp_url(cls, value: str) -> str:
+        _validate_browser_address(value, field_name="cdp_url")
+        if not is_tls_or_local_browser_address(value):
+            raise ValueError("cdp_url must use https:// or wss:// outside local development")
+        return value
 
 
 class UpdateBrowserSessionRequest(BaseModel):

@@ -12,9 +12,7 @@ import tempfile
 import textwrap
 import unicodedata
 from dataclasses import dataclass
-from functools import cache
 from pathlib import Path
-from types import SimpleNamespace
 from typing import Callable, Iterable, Iterator, Mapping
 
 from jinja2 import StrictUndefined, TemplateSyntaxError, UndefinedError
@@ -24,7 +22,7 @@ from jinja2.sandbox import SandboxedEnvironment
 from skyvern.forge.sdk.copilot.code_block_security import CodeBlockSecurityError, author_time_code_security_errors
 from skyvern.forge.sdk.copilot.code_block_synthesis import is_root_locator_selector
 from skyvern.forge.sdk.workflow.models._jinja import _json_finalize, _json_type_filter
-from skyvern.forge.sdk.workflow.models.block import CodeBlock
+from skyvern.utils.strings import join_phrases
 from skyvern.utils.templating import get_missing_variables
 
 RENDER_TEMPLATE_SYNTAX_REASON_CODE = "RENDER_TEMPLATE_SYNTAX"
@@ -104,12 +102,13 @@ class WrapperScopeFacts:
 _render_check_env = SandboxedEnvironment(undefined=StrictUndefined, finalize=_json_finalize)
 _render_check_env.filters["json"] = _json_type_filter
 
+_CURRENT_DATE_BINDING = "current_date"
 _RENDER_SYSTEM_BINDING_NAMES = (
     "workflow_title",
     "workflow_id",
     "workflow_permanent_id",
     "workflow_run_id",
-    "current_date",
+    _CURRENT_DATE_BINDING,
     "browser_session_id",
     "workflow_run_outputs",
     "workflow_run_summary",
@@ -208,7 +207,7 @@ def code_block_render_diagnostic(code: str, bound_names: Iterable[str]) -> CodeB
             if suggestion
             else (
                 " Only declared parameter keys, block labels, `<label>_output` values, and workflow "
-                "system names (e.g. `current_date`) are available as top-level template names."
+                f"system names (e.g. `{_CURRENT_DATE_BINDING}`) are available as top-level template names."
             )
         )
         return CodeBlockRenderDiagnostic(
@@ -245,7 +244,7 @@ _BROAD_BODY_TEXT_WAIT_NEEDLES = (
     "document.documentelement.textcontent",
 )
 _BROAD_TABLE_RECORD_KEYS = frozenset(("items", "locations", "records", "rows"))
-_BROAD_TABLE_SCAN_SELECTORS = frozenset({"article", "section", ".card", "li"})
+_BROAD_TABLE_SCAN_SELECTORS = ("section", ".card", "article", "li")
 _BROAD_TABLE_SELECTOR_METHODS = frozenset(("locator", "query_selector", "query_selector_all"))
 _LONE_LIST_ITEM_SELECTOR_EXEMPTION = frozenset({"li"})
 _GET_BY_TEXT_NARROWING_ATTRIBUTES = frozenset({"first", "last"})
@@ -278,137 +277,6 @@ _WRAPPER_FUNCTION_NAME = "__code_block__"
 _WHOLE_PAGE_READ_METHODS = frozenset({"inner_text", "text_content", "all_inner_texts", "all_text_contents"})
 _TABLE_ROW_TAG_SELECTOR_RE = re.compile(r"(?<![a-z0-9_-])tr(?![a-z0-9_-])")
 _TABLE_ROW_ROLE_SELECTOR_RE = re.compile(r"\[role\s*=\s*(['\"]?)row\1\]")
-
-
-@cache
-def _sandbox_shim_surface() -> dict[str, frozenset[str]]:
-    return {
-        name: frozenset(vars(value))
-        for name, value in CodeBlock.build_safe_vars().items()
-        if isinstance(value, SimpleNamespace)
-    }
-
-
-def strip_redundant_sandbox_imports(code: str) -> tuple[str, list[str]]:
-    """Remove top-level imports the runtime sandbox already injects.
-
-    A module import is removed only when the runtime sandbox provides the same
-    name as a ``SimpleNamespace`` helper and every attribute the code reads on
-    that name is present on the injected helper. Aliased imports, submodule
-    imports, from-imports, compound-line imports, non-sandbox modules, imports
-    whose used surface exceeds the injected helper, and bare uses of the name as
-    a value are all left in place so ``CodeBlock.is_safe_code`` still rejects
-    them with immediate author-time feedback.
-    """
-
-    try:
-        tree = ast.parse(code)
-    except SyntaxError:
-        return code, []
-
-    shim_surface = _sandbox_shim_surface()
-    attribute_use = _module_attribute_use(tree)
-    bare_use = _module_bare_use(tree)
-
-    removable_spans: list[tuple[int, int]] = []
-    stripped_modules: list[str] = []
-    occupied_lines = _occupied_line_numbers(tree)
-    for node in tree.body:
-        if not isinstance(node, ast.Import):
-            continue
-        candidate_modules = _strippable_module_names(node, shim_surface, attribute_use, bare_use)
-        if candidate_modules is None:
-            continue
-        if node.end_lineno is None:
-            continue
-        if _line_span_shares_other_statement(node, occupied_lines):
-            continue
-        removable_spans.append((node.lineno, node.end_lineno))
-        stripped_modules.extend(candidate_modules)
-
-    if not removable_spans:
-        return code, []
-
-    sanitized = _remove_line_spans(code, removable_spans)
-    try:
-        ast.parse(sanitized)
-    except SyntaxError:
-        return code, []
-    return sanitized, stripped_modules
-
-
-def _strippable_module_names(
-    node: ast.Import,
-    shim_surface: dict[str, frozenset[str]],
-    attribute_use: dict[str, set[str]],
-    bare_use: set[str],
-) -> list[str] | None:
-    modules: list[str] = []
-    for alias in node.names:
-        if alias.asname is not None or "." in alias.name:
-            return None
-        if alias.name not in shim_surface:
-            return None
-        if alias.name in bare_use:
-            return None
-        if not attribute_use.get(alias.name, set()).issubset(shim_surface[alias.name]):
-            return None
-        modules.append(alias.name)
-    return modules or None
-
-
-def _module_attribute_use(tree: ast.AST) -> dict[str, set[str]]:
-    usage: dict[str, set[str]] = {}
-    for node in ast.walk(tree):
-        if (
-            isinstance(node, ast.Attribute)
-            and isinstance(node.value, ast.Name)
-            and isinstance(node.value.ctx, ast.Load)
-        ):
-            usage.setdefault(node.value.id, set()).add(node.attr)
-    return usage
-
-
-def _module_bare_use(tree: ast.AST) -> set[str]:
-    # id() of each ast.Attribute value Name is stable across both walks of the same parsed tree.
-    attribute_base_names: set[int] = set()
-    for node in ast.walk(tree):
-        if isinstance(node, ast.Attribute) and isinstance(node.value, ast.Name):
-            attribute_base_names.add(id(node.value))
-    bare: set[str] = set()
-    for node in ast.walk(tree):
-        if isinstance(node, ast.Name) and isinstance(node.ctx, ast.Load) and id(node) not in attribute_base_names:
-            bare.add(node.id)
-    return bare
-
-
-def _occupied_line_numbers(tree: ast.AST) -> dict[int, set[int]]:
-    lines: dict[int, set[int]] = {}
-    for node in ast.iter_child_nodes(tree):
-        if not isinstance(node, ast.stmt):
-            continue
-        if node.lineno is None or node.end_lineno is None:
-            continue
-        for line in range(node.lineno, node.end_lineno + 1):
-            lines.setdefault(line, set()).add(id(node))
-    return lines
-
-
-def _line_span_shares_other_statement(node: ast.Import, occupied_lines: dict[int, set[int]]) -> bool:
-    if node.end_lineno is None:
-        return True
-    for line in range(node.lineno, node.end_lineno + 1):
-        if any(owner != id(node) for owner in occupied_lines.get(line, set())):
-            return True
-    return False
-
-
-def _remove_line_spans(code: str, spans: list[tuple[int, int]]) -> str:
-    drop_lines: set[int] = set()
-    for start, end in spans:
-        drop_lines.update(range(start, end + 1))
-    kept = [line for index, line in enumerate(code.splitlines(keepends=True), start=1) if index not in drop_lines]
-    return "".join(kept)
 
 
 def preflight_code_block(
@@ -555,6 +423,7 @@ def _static_ast_diagnostics(code: str) -> list[CodeBlockPreflightDiagnostic]:
             if diagnostic.code not in _ADVISORY_DIAGNOSTIC_CODES
         ),
     ]
+    re_modules, re_functions = _re_bindings(tree)
     for node in ast.walk(tree):
         if not isinstance(node, ast.Call):
             continue
@@ -562,7 +431,7 @@ def _static_ast_diagnostics(code: str) -> list[CodeBlockPreflightDiagnostic]:
         if evaluate_diagnostic is not None:
             diagnostics.append(evaluate_diagnostic)
             continue
-        regex_diagnostic = _regex_literal_diagnostic(node)
+        regex_diagnostic = _regex_literal_diagnostic(node, re_modules, re_functions)
         if regex_diagnostic is not None:
             diagnostics.append(regex_diagnostic)
 
@@ -1023,8 +892,9 @@ def _broad_table_record_scan_diagnostic(tree: ast.AST) -> CodeBlockPreflightDiag
     return CodeBlockPreflightDiagnostic(
         code="BROAD_TABLE_RECORD_SCAN",
         message=(
-            "Code block appears to extract row-like records by scanning broad containers such as `section`, "
-            "`.card`, `article`, or `li`. For table-like or list-like records, iterate the actual row/item "
+            "Code block appears to extract row-like records by scanning broad containers such as "
+            f"{join_phrases([f'`{selector}`' for selector in _BROAD_TABLE_SCAN_SELECTORS], 'or')}. "
+            "For table-like or list-like records, iterate the actual row/item "
             'elements (`tr`, `[role="row"]`, or equivalent repeated item containers) and read fields from '
             "the same row so fields from separate records cannot be mixed."
         ),
@@ -1100,15 +970,29 @@ _RE_LITERAL_FUNCTIONS = frozenset(
 )
 
 
-def _regex_literal_diagnostic(node: ast.Call) -> CodeBlockPreflightDiagnostic | None:
+def _re_bindings(tree: ast.AST) -> tuple[frozenset[str], dict[str, str]]:
+    """Names bound to the `re` module, and names a from-import bound to one of its functions."""
+    modules = {"re"}
+    functions: dict[str, str] = {}
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            modules.update(alias.asname or alias.name for alias in node.names if alias.name == "re")
+        elif isinstance(node, ast.ImportFrom) and node.module == "re" and not node.level:
+            functions.update({alias.asname or alias.name: alias.name for alias in node.names})
+    return frozenset(modules), functions
+
+
+def _regex_literal_diagnostic(
+    node: ast.Call, re_modules: frozenset[str], re_functions: dict[str, str]
+) -> CodeBlockPreflightDiagnostic | None:
     func = node.func
-    if (
-        not isinstance(func, ast.Attribute)
-        or func.attr not in _RE_LITERAL_FUNCTIONS
-        or not isinstance(func.value, ast.Name)
-        or func.value.id != "re"
-        or not node.args
-    ):
+    if isinstance(func, ast.Attribute) and isinstance(func.value, ast.Name) and func.value.id in re_modules:
+        function_name = func.attr
+    elif isinstance(func, ast.Name) and func.id in re_functions:
+        function_name = re_functions[func.id]
+    else:
+        return None
+    if function_name not in _RE_LITERAL_FUNCTIONS or not node.args:
         return None
 
     pattern = node.args[0]
@@ -1121,7 +1005,7 @@ def _regex_literal_diagnostic(node: ast.Call) -> CodeBlockPreflightDiagnostic | 
         return CodeBlockPreflightDiagnostic(
             code="INVALID_REGEX_LITERAL",
             message=(
-                f"Code block contains an invalid regex literal for `re.{func.attr}`: {exc}. "
+                f"Code block contains an invalid regex literal for `re.{function_name}`: {exc}. "
                 "Fix the pattern or avoid regex when simple string checks are enough."
             ),
         )

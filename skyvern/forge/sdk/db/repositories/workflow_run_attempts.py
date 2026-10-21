@@ -846,7 +846,8 @@ class WorkflowRunAttemptsRepository(BaseRepository):
         final_exhausted_projection: WebhookDeliveryStatus | None = None,
         expected_status: str | None = None,
         expected_finished_at: datetime | None = None,
-    ) -> int | None:
+    ) -> tuple[int | None, bool]:
+        """Return the reservation and whether it wrote a final run projection."""
         if kind == "interim":
             completion_column = WorkflowRunAttemptModel.interim_webhook_sent_at
             progress_column = WorkflowRunAttemptModel.interim_side_effects_progress
@@ -887,11 +888,12 @@ class WorkflowRunAttemptsRepository(BaseRepository):
                 .with_for_update()
             )
             if attempt is None:
-                return None
+                return None, False
             progress = dict(getattr(attempt, progress_column.key) or {})
             delivery_attempts = progress.get("webhook_delivery_attempts", 0)
             now = naive_utc_now()
             values: dict[str, Any] = {"modified_at": now}
+            projection_written = False
             if delivery_attempts >= max_attempts:
                 # A process can stop after reserving its last call, before recording exhaustion.
                 progress["webhook_delivery_exhausted_at"] = now.isoformat()
@@ -906,13 +908,14 @@ class WorkflowRunAttemptsRepository(BaseRepository):
                     if resolved != run.webhook_delivery_status:
                         run.webhook_delivery_status = resolved
                         run.webhook_delivery_finalized_at = now
+                        projection_written = True
             else:
                 reserved_attempt = delivery_attempts + 1
                 progress["webhook_delivery_attempts"] = reserved_attempt
             values[progress_column.key] = merge_attempt_progress(progress_column, progress, session.bind.dialect.name)
             await session.execute(update(WorkflowRunAttemptModel).where(*conditions).values(**values))
             await session.commit()
-            return reserved_attempt
+            return reserved_attempt, projection_written
 
     @db_operation("claim_attempt_webhook")
     async def claim_attempt_webhook(

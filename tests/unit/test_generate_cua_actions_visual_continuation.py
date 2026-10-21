@@ -19,6 +19,7 @@ import pytest
 
 from skyvern.forge import agent as agent_module
 from skyvern.forge.agent import ForgeAgent
+from skyvern.forge.sdk.core.skyvern_context import SkyvernContext
 from skyvern.forge.sdk.models import StepStatus
 from tests.unit.helpers import make_organization, make_step, make_task
 
@@ -89,7 +90,7 @@ async def _invoke_no_call_continuation(
     )
 
     monkeypatch.setattr(agent_module, "load_prompt_with_elements", MagicMock(return_value="prompt"))
-    context = SimpleNamespace(totp_codes={task.task_id: totp_code} if totp_code else {})
+    context = SkyvernContext(totp_codes={task.task_id: totp_code} if totp_code else {})
     monkeypatch.setattr(agent_module.skyvern_context, "ensure_context", lambda: context)
     monkeypatch.setattr(
         agent_module,

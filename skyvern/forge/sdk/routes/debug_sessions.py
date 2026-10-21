@@ -36,6 +36,7 @@ from skyvern.forge.sdk.workflow.service import (
 )
 from skyvern.schemas.browser_session_kind import BrowserSessionKind
 from skyvern.schemas.proxy_location import runtime_proxy_location
+from skyvern.webeye.persistent_session_errors import BrowserSessionCreditAdmissionRefusal
 
 LOG = structlog.get_logger()
 BROWSER_SESSION_PREWARM_FLAG = "BROWSER_SESSION_PREWARM"
@@ -645,6 +646,14 @@ async def new_debug_session(
             created_by=current_user_id,
             session_kind=BrowserSessionKind.editor,
         )
+    except BrowserSessionCreditAdmissionRefusal:
+        # Expected: the caller gets the 402 and the org's credits decide the outcome, so there is no defect to page on.
+        LOG.warning(
+            "Debug session browser startup refused: credits exhausted",
+            organization_id=current_org.organization_id,
+            workflow_permanent_id=workflow_permanent_id,
+        )
+        raise
     except Exception:
         LOG.exception(
             "Debug session browser startup failed",

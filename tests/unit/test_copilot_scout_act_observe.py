@@ -820,6 +820,31 @@ def test_page_evidence_freshness_includes_dom_obstruction_candidates(candidate_o
     assert _page_evidence_is_unchanged(prior, current) is False
 
 
+def test_page_evidence_freshness_ignores_pointer_states_and_visible_counts() -> None:
+    prior = parse_composition_structured(
+        _bounded_extractor_payload(), inspected_url=_SOURCE_URL, current_url=_SOURCE_URL
+    )
+    current = parse_composition_structured(
+        _bounded_extractor_payload(), inspected_url=_LANDING_URL, current_url=_LANDING_URL
+    )
+    assert prior is not None and current is not None
+    scrolled_form = current["forms"][0]
+    for control in (scrolled_form["fields"][0], scrolled_form["submit_controls"][0]):
+        control["pointer_at_center"] = "reaches_other_element"
+        control["element_at_center"] = {"tag": "header", "role": "", "label_context": "Catalogue"}
+    prior["forms"][0]["fields"][0]["pointer_at_center"] = "not_measured"
+
+    assert _page_evidence_is_unchanged(prior, current) is True
+
+    # A capture over its bound drops the visible counts, and scrolling alone can tip it over.
+    dismiss_candidate = current["modal_overlays"][0]["dismiss_controls"][0]["selector_candidates"][0]
+    dismiss_candidate["visible_match_count"] = 1
+    assert _page_evidence_is_unchanged(prior, current) is True
+
+    dismiss_candidate["match_count"] = 2
+    assert _page_evidence_is_unchanged(prior, current) is False
+
+
 def test_page_evidence_freshness_includes_reveal_truncation_state() -> None:
     prior = parse_composition_structured(
         _bounded_extractor_payload(), inspected_url=_SOURCE_URL, current_url=_SOURCE_URL
@@ -3172,9 +3197,7 @@ async def test_visible_effect_on_a_near_cap_page_summary_keeps_the_result_under_
     _assert_only_the_enum_reaches_the_model(projected, tmp_path)
 
 
-@pytest.mark.parametrize(
-    "withheld", ["failed_capture", "tainted_during_capture", "other_session", "producer_changed", "dispatch_changed"]
-)
+@pytest.mark.parametrize("withheld", ["failed_capture", "other_session", "producer_changed", "dispatch_changed"])
 @pytest.mark.asyncio
 async def test_visible_effect_is_unknown_when_the_frames_cannot_be_compared(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path, withheld: str
@@ -3207,21 +3230,12 @@ async def test_visible_effect_is_unknown_when_the_frames_cannot_be_compared(
             return response
 
         ctx.discovery_mcp_server.call_internal_tool.side_effect = switch_session_after_pre_frame
-    if withheld == "tainted_during_capture":
-        router = ctx.discovery_mcp_server.call_internal_tool.side_effect
-
-        async def taint_on_post_frame(tool: str, arguments: dict[str, Any]) -> dict[str, Any]:
-            if tool == "skyvern_screenshot" and len(screenshots) == 1:
-                ctx.sensitive_origin_browser_session_ids = {_VISIBLE_EFFECT_SESSION_ID}
-            return await router(tool, arguments)
-
-        ctx.discovery_mcp_server.call_internal_tool.side_effect = taint_on_post_frame
 
     projected, _ = await _call_click_through_overlay(ctx, copy.deepcopy(_OK_CLICK), {"selector": "#banner-accept"})
 
     assert projected["data"]["visible_effect"] == "unknown"
     _assert_only_the_enum_reaches_the_model(projected, tmp_path)
-    assert len(ctx.pending_screenshots) == (0 if withheld in {"failed_capture", "tainted_during_capture"} else 1)
+    assert len(ctx.pending_screenshots) == (0 if withheld == "failed_capture" else 1)
 
 
 @pytest.mark.asyncio

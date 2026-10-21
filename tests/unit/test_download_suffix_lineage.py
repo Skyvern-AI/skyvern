@@ -37,6 +37,7 @@ from tests.unit._fingerprint_expectations import (
 from tests.unit.fake_workflow_run_context import FakeWorkflowRunContext
 
 SUFFIX_TEMPLATE = "AllDataExport_UsageDetail_{{current_value.account_number}}"
+PREFIX_TEMPLATE = "{{current_value.account_number}}_{{ original_filename }}"
 # Synthetic, obviously-fake account numbers (never real customer values).
 ACCOUNTS = ["ACCT_AAA_1001", "ACCT_BBB_2002", "ACCT_CCC_3003"]
 SITE_FILENAME = "detail_report.csv"
@@ -215,6 +216,36 @@ def test_render_boundary_emits_lineage_per_iteration_and_leaves_template_untouch
     assert block.download_suffix == SUFFIX_TEMPLATE
 
 
+@pytest.mark.parametrize(
+    "suffix",
+    [
+        "{{ original_filename | upper }}",
+        "{{ original_filename | replace('Q', 'R') }}",
+        "{{ original_filename.upper() }}",
+        "{{ original_filename.replace('_', '-') }}",
+        "{{ original_filename[:4] }}",
+        "{{ 'prefix_' ~ original_filename }}",
+    ],
+)
+def test_render_boundary_rejects_transformations_on_original_filename(suffix: str) -> None:
+    block = _make_download_block()
+    block.download_suffix = suffix
+
+    with pytest.raises(ValueError, match="must be used without Jinja transformations"):
+        block.format_potential_template_parameters(_loop_context(block.label, 0, ACCOUNTS[0]))
+
+
+def test_render_boundary_allows_filters_on_workflow_owned_original_filename() -> None:
+    block = _make_download_block()
+    block.download_suffix = "{{ original_filename | upper }}"
+    context = _loop_context(block.label, 0, ACCOUNTS[0])
+    context.values["original_filename"] = "custom.pdf"
+
+    block.format_potential_template_parameters(context)
+
+    assert block.download_suffix == "CUSTOM.PDF"
+
+
 # --------------------------------------------------------------------------------------------------
 # 4-case reproduction harness (real render/copy + real finalize + real contextvar naming)
 # --------------------------------------------------------------------------------------------------
@@ -257,6 +288,44 @@ async def test_harness_case1_finalize_names_per_iteration_no_freeze(tmp_path: Pa
     names = {p.name for p in download_dir.iterdir()}
     assert names == {f"{_rendered_suffix(a)}.csv" for a in ACCOUNTS}, names  # 3 distinct -> NO freeze
     assert len({r["passed_download_suffix_fp"] for r in records}) == len(ACCOUNTS)
+
+
+@pytest.mark.asyncio
+async def test_original_filename_prefix_distinguishes_identically_named_site_files(tmp_path: Path) -> None:
+    """SKY-17905: a portal serving every document under one name, prefixed per loop iteration.
+
+    Drives the same real render + real finalize as case1, so it covers the whole chain the prefix
+    has to survive: the Jinja render, the percent-encoding after it, and the rename. Finalizing a
+    second time over the same baseline must not prefix an already-prefixed file.
+    """
+    agent = ForgeAgent()
+    block = _make_download_block()
+    block.download_suffix = PREFIX_TEMPLATE
+    download_dir = tmp_path / "downloads"
+    download_dir.mkdir()
+
+    for index, account in enumerate(ACCOUNTS):
+        ctx = _loop_context(block.label, index, account)
+        copy = block.model_copy(deep=True)
+        copy.format_potential_template_parameters(ctx)
+        before = sorted(str(p) for p in download_dir.iterdir())
+        download_context = SkyvernContext(download_suffix=copy.download_suffix)
+        with skyvern_context.scoped(download_context):
+            target = _download_target_path(download_dir, SITE_FILENAME)
+        target.write_text(f"bytes-{account}")  # every account exports this name
+        with patch("skyvern.forge.agent.get_path_for_workflow_download_directory", return_value=download_dir):
+            with skyvern_context.scoped(download_context):
+                for _ in range(2):  # the second pass must be a no-op, not a second prefix
+                    await agent._finalize_downloaded_files_for_task(
+                        _make_task(task_id=f"task-{index}"),
+                        organization_id="org-harness",
+                        download_suffix=copy.download_suffix,
+                        list_files_before=before,
+                        randomize_if_missing=False,
+                    )
+
+    names = {p.name for p in download_dir.iterdir()}
+    assert names == {f"{account}_detail_report.csv" for account in ACCOUNTS}, names
 
 
 @pytest.mark.asyncio

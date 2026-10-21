@@ -15,19 +15,18 @@ import {
 } from "@/store/WorkflowPanelStore";
 import { useWorkflowScopeReadOnly } from "../WorkflowScopeContext";
 import { useProcessRecordingMutation } from "@/routes/browserSessions/hooks/useProcessRecordingMutation";
-import { useSopToBlocksMutation } from "@/routes/workflows/hooks/useSopToBlocksMutation";
+import { useCopilotActionStore } from "@/store/useCopilotActionStore";
 import { useDebugStore } from "@/store/useDebugStore";
 import { useRecordedBlocksStore } from "@/store/RecordedBlocksStore";
 import { useRecordingStore } from "@/store/useRecordingStore";
+import { useRecordingLauncherStore } from "@/store/useRecordingLauncherStore";
+import { useFeatureFlag } from "@/hooks/useFeatureFlag";
+import { WORKFLOW_COPILOT_DEMONSTRATION_FLAG } from "@/util/featureFlags";
 import {
   requestRecordingStart,
   useIsMountedRef,
 } from "@/routes/workflows/editor/recording/pendingRecordingStartGate";
-import {
-  runWorkflowAuthoringAction,
-  refuseMutationDuringYamlCommit,
-  refuseMutationDuringAuthoring,
-} from "@/store/WorkflowYamlEditorStore";
+import { runWorkflowAuthoringAction } from "@/store/WorkflowYamlEditorStore";
 import { useSettingsStore } from "@/store/SettingsStore";
 import { cn } from "@/util/utils";
 import { toast } from "@/components/ui/use-toast";
@@ -40,6 +39,12 @@ import { SELECTED_RING_CLASSES } from "../selection/selectedRingClasses";
 import { WorkflowAddMenu } from "../WorkflowAddMenu";
 import { WorkflowAdderBusy } from "../WorkflowAdderBusy";
 import { findBranchContextForInsertion } from "../workflowInsertion";
+import {
+  blockLabelFor,
+  demonstrationInsertionFromNodes,
+  sopAttachmentDraft,
+  stageSopFile,
+} from "../workspaceAuthoringActions";
 
 function EdgeWithAddButton({
   source,
@@ -66,6 +71,14 @@ function EdgeWithAddButton({
   });
   const debugStore = useDebugStore();
   const recordingStore = useRecordingStore();
+  const startDemonstration = useRecordingLauncherStore(
+    (state) => state.startDemonstration,
+  );
+  const stageAttachment = useCopilotActionStore(
+    (state) => state.stageAttachment,
+  );
+  const demonstrationEnabled =
+    useFeatureFlag(WORKFLOW_COPILOT_DEMONSTRATION_FLAG) === true;
   const settingsStore = useSettingsStore();
   const workflowStatePanel = useWorkflowPanelStore();
   const setRecordedBlocks = useRecordedBlocksStore(
@@ -94,24 +107,6 @@ function EdgeWithAddButton({
       );
     },
   });
-
-  const sopToBlocksMutation = useSopToBlocksMutation({
-    onSuccess: (result, owner) => {
-      setRecordedBlocks(
-        result,
-        {
-          previous: source,
-          next: target,
-          parent: sourceNode?.parentId,
-          connectingEdgeType: "edgeWithAddButton",
-        },
-        owner,
-      );
-    },
-  });
-
-  // Derive upload state directly from mutation to avoid race conditions
-  const isUploadingSOP = sopToBlocksMutation.isPending;
 
   const isProcessing =
     processRecordingMutation.isPending ||
@@ -159,6 +154,21 @@ function EdgeWithAddButton({
 
   const mountedRef = useIsMountedRef();
   const onRecord = () => {
+    if (demonstrationEnabled) {
+      const insertion = demonstrationInsertionFromNodes(nodes, {
+        previous: source,
+        next: target,
+        parent: sourceNode?.parentId,
+      });
+      if (!insertion) {
+        toast({
+          title: "Recording inside a loop or branch isn't supported yet",
+        });
+        return;
+      }
+      startDemonstration?.({ insertion });
+      return;
+    }
     if (recordingStore.isRecording) {
       recordingStore.setIsRecording(false);
     } else {
@@ -199,29 +209,26 @@ function EdgeWithAddButton({
   };
 
   const onUploadSOP = () => {
-    if (refuseMutationDuringYamlCommit() || refuseMutationDuringAuthoring())
-      return;
     fileInputRef.current?.click();
   };
 
   const handleSOPFileChange = (e: React.ChangeEvent<HTMLInputElement>) => {
     const file = e.target.files?.[0];
+    e.target.value = "";
     if (!file) {
       return;
     }
-    if (!file.name.toLowerCase().endsWith(".pdf")) {
-      toast({
-        variant: "destructive",
-        title: "Invalid file type",
-        description: "Please select a PDF file",
-      });
-      e.target.value = "";
-      return;
-    }
-    void runWorkflowAuthoringAction(() =>
-      sopToBlocksMutation.mutateAsync(file),
+    stageSopFile(
+      file,
+      sopAttachmentDraft(
+        demonstrationInsertionFromNodes(nodes, {
+          previous: source,
+          next: target,
+          parent: sourceNode?.parentId,
+        }),
+        blockLabelFor(nodes, sourceNode?.parentId),
+      ),
     );
-    e.target.value = "";
   };
 
   // Mirror NodeAdderNode's selection treatment so the two + CTAs feel like one affordance.
@@ -267,7 +274,8 @@ function EdgeWithAddButton({
       onAdd={onAdd}
       onRecord={onRecord}
       onUploadSOP={onUploadSOP}
-      isUploadingSOP={isUploadingSOP}
+      canUploadSOP={stageAttachment !== null}
+      canRecordTask={!demonstrationEnabled || startDemonstration !== null}
     >
       {adder}
     </WorkflowAddMenu>
@@ -281,22 +289,6 @@ function EdgeWithAddButton({
       onComplete={() => {
         onEndRecord();
       }}
-    >
-      {adder}
-    </WorkflowAdderBusy>
-  );
-
-  const handleCancelUpload = () => {
-    sopToBlocksMutation.cancel();
-  };
-
-  const sopUploadBusy = (
-    <WorkflowAdderBusy
-      color="#3b82f6"
-      operation="uploading"
-      size="small"
-      onComplete={() => {}}
-      onCancel={handleCancelUpload}
     >
       {adder}
     </WorkflowAdderBusy>
@@ -333,13 +325,7 @@ function EdgeWithAddButton({
             className="hidden"
             onChange={handleSOPFileChange}
           />
-          {isUploadingSOP
-            ? sopUploadBusy
-            : isBusy
-              ? busy
-              : isDisabled
-                ? adder
-                : menu}
+          {isBusy ? busy : isDisabled ? adder : menu}
         </div>
       </EdgeLabelRenderer>
     </>

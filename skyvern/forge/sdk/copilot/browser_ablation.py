@@ -78,6 +78,7 @@ BROWSER_ABLATION_NATIVE_TOOLS = (
     "inspect_locator_matches",
     "fill_credential_field",
     "request_credential",
+    "reply",
 )
 # Browser ablation keeps the production Copilot browser aliases, then projects the missing
 # multi-page capabilities from the app registry. This avoids both a second handwritten browser
@@ -90,7 +91,7 @@ BROWSER_ABLATION_MCP_TOOL_EXCLUSIONS = frozenset({"skyvern_open_tabs"})
 
 
 # The browser-bound aliases that survive when mutations must go through code: page and console reads, observe-only
-# waits, frame and tab enumeration, and tab close (no page fact; the multi-tab hold's route out). Every alias that
+# waits, frame and tab enumeration, and tab close (no page fact). Every alias that
 # needs no browser survives too, so a later tool is withdrawn only if it acts on the page.
 REQUIRED_CODE_BROWSER_ALIASES = frozenset(
     {
@@ -169,6 +170,7 @@ def _overlay_fingerprint(overlay: Any) -> dict[str, Any]:
         "arg_transforms": getattr(overlay, "arg_transforms", {}),
         "forced_args": getattr(overlay, "forced_args", {}),
         "copilot_params": getattr(overlay, "copilot_params", {}),
+        "param_patches": getattr(overlay, "param_patches", {}),
         "requires_browser": getattr(overlay, "requires_browser", False),
         "timeout": getattr(overlay, "timeout", None),
         "pre_hook": _callable_identity(getattr(overlay, "pre_hook", None)),

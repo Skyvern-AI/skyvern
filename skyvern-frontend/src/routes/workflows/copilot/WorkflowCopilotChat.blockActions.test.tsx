@@ -118,11 +118,33 @@ vi.mock("react-router-dom", async (importOriginal) => {
   };
 });
 
-// Unrelated to this file's tests; the real hook needs a QueryClientProvider
-// this harness doesn't set up.
-vi.mock("../hooks/useWorkflowRunQuery", () => ({
-  useWorkflowRunQuery: () => ({ data: undefined }),
+// The real hook needs a QueryClientProvider this harness doesn't set up.
+const { focusedRun, reopenEditor } = vi.hoisted(() => ({
+  focusedRun: { current: undefined as Record<string, unknown> | undefined },
+  reopenEditor: vi.fn(),
 }));
+vi.mock("../hooks/useWorkflowRunQuery", () => ({
+  useWorkflowRunQuery: ({ workflowRunId }: { workflowRunId?: string }) => ({
+    data: workflowRunId ? focusedRun.current : undefined,
+  }),
+}));
+
+vi.mock(
+  "@/routes/workflows/studio/StudioPaneDefaultsContext",
+  async (importOriginal) => {
+    const actual =
+      await importOriginal<
+        typeof import("@/routes/workflows/studio/StudioPaneDefaultsContext")
+      >();
+    return {
+      ...actual,
+      useStudioPaneDefaults: () => ({
+        ...actual.useStudioPaneDefaults(),
+        reopenEditor,
+      }),
+    };
+  },
+);
 
 vi.mock("@/routes/workflows/editor/recording/RecordingPanel", () => ({
   RecordingPanel: () => <div data-testid="recording-chapter" />,
@@ -176,7 +198,11 @@ const BOOLEAN_FLAGS: Record<string, boolean> = {
   CODE_BLOCK_ACCESS: false,
 };
 
-type ChatProps = { docked?: boolean; portalTarget?: HTMLElement | null };
+type ChatProps = {
+  docked?: boolean;
+  portalTarget?: HTMLElement | null;
+  workflowRunId?: string | null;
+};
 
 function chatUi(props: ChatProps = {}) {
   return (
@@ -239,6 +265,8 @@ const runStartedFrame = (overrides: Partial<Record<string, unknown>> = {}) => ({
 beforeEach(() => {
   useRecordingStore.getState().reset();
   switchStudioRun.mockClear();
+  reopenEditor.mockClear();
+  focusedRun.current = undefined;
   HTMLElement.prototype.scrollIntoView = vi.fn();
   HTMLElement.prototype.scrollTo = vi.fn();
   streamCalls.length = 0;
@@ -624,6 +652,69 @@ describe("WorkflowCopilotChat — studio run focus", () => {
     streamCalls[0]!.onMessage(blockProgressFrame({ workflow_run_id: "wr_1" }));
     await waitFor(() => expect(timelineGet).toHaveBeenCalledTimes(1));
     expect(switchStudioRun).toHaveBeenCalledTimes(1);
+  });
+});
+
+describe("WorkflowCopilotChat — Editor returns after the turn's run", () => {
+  it("reopens Editor once when the focused run's terminal outcome lands", async () => {
+    await renderChat({ ...makeDockedProps(), workflowRunId: "wr_1" });
+    await submit("build a workflow");
+    streamCalls[0]!.onMessage(runStartedFrame());
+    streamCalls[0]!.onMessage(runOutcomeFrame());
+    expect(reopenEditor).not.toHaveBeenCalled();
+
+    streamCalls[0]!.onMessage(runOutcomeFrame({ verdict: "demonstrated" }));
+    streamCalls[0]!.onMessage(runOutcomeFrame({ verdict: "demonstrated" }));
+    expect(reopenEditor).toHaveBeenCalledTimes(1);
+  });
+
+  it("reopens Editor once the focus lands when the run ended before it did", async () => {
+    const props = makeDockedProps();
+    const view = await renderChat(props);
+    await submit("build a workflow");
+    streamCalls[0]!.onMessage(runStartedFrame());
+    streamCalls[0]!.onMessage(runOutcomeFrame({ verdict: "demonstrated" }));
+    expect(reopenEditor).not.toHaveBeenCalled();
+    view.rerender(chatUi({ ...props, workflowRunId: "wr_1" }));
+    expect(reopenEditor).toHaveBeenCalledTimes(1);
+  });
+
+  it("leaves the panes alone when the user has switched to another run", async () => {
+    const props = { ...makeDockedProps(), workflowRunId: "wr_1" };
+    const view = await renderChat(props);
+    await submit("build a workflow");
+    streamCalls[0]!.onMessage(runStartedFrame());
+    view.rerender(chatUi({ ...props, workflowRunId: "wr_2" }));
+    streamCalls[0]!.onMessage(runOutcomeFrame({ verdict: "demonstrated" }));
+    focusedRun.current = { workflow_run_id: "wr_1", status: "completed" };
+    view.rerender(chatUi({ ...props, workflowRunId: "wr_1" }));
+    expect(reopenEditor).not.toHaveBeenCalled();
+  });
+
+  it("does not reopen Editor when the user returns to a run that ended while they were away", async () => {
+    const props = { ...makeDockedProps(), workflowRunId: "wr_1" };
+    const view = await renderChat(props);
+    await submit("build a workflow");
+    streamCalls[0]!.onMessage(runStartedFrame());
+    view.rerender(chatUi({ ...props, workflowRunId: "wr_2" }));
+    await act(async () => {
+      streamCalls[0]!.reject(new Error("network"));
+    });
+    focusedRun.current = { workflow_run_id: "wr_1", status: "completed" };
+    view.rerender(chatUi({ ...props, workflowRunId: "wr_1" }));
+    await act(async () => {});
+    expect(reopenEditor).not.toHaveBeenCalled();
+  });
+
+  it("reopens Editor from the run status when the stream is severed first", async () => {
+    await renderChat({ ...makeDockedProps(), workflowRunId: "wr_1" });
+    await submit("build a workflow");
+    streamCalls[0]!.onMessage(runStartedFrame());
+    focusedRun.current = { workflow_run_id: "wr_1", status: "completed" };
+    await act(async () => {
+      streamCalls[0]!.reject(new Error("network"));
+    });
+    await waitFor(() => expect(reopenEditor).toHaveBeenCalledTimes(1));
   });
 });
 

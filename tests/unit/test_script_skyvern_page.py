@@ -103,7 +103,7 @@ def _selected_engine():
 
 class _ScrapedPageStub:
     def __init__(self) -> None:
-        self._browser_state = SimpleNamespace()
+        self._browser_state = SimpleNamespace(begin_navigation=MagicMock(), record_navigation_result=AsyncMock())
 
 
 @pytest.fixture(autouse=True)
@@ -156,6 +156,24 @@ async def test_page_navigation_accepts_public_destination(page_type, mock_scrape
     await page.goto("https://93.184.216.34/path")
 
     raw_page.goto.assert_awaited_once()
+    if page_type is ScriptSkyvernPage:
+        mock_scraped_page._browser_state.record_navigation_result.assert_awaited_once_with(
+            None,
+            url="https://93.184.216.34/path",
+        )
+
+
+@pytest.mark.asyncio
+async def test_script_page_reports_deferred_navigation_failure(mock_scraped_page, mock_ai):
+    page, raw_page = _build_navigation_page(ScriptSkyvernPage, mock_scraped_page, mock_ai)
+    error = RuntimeError("net::ERR_INVALID_AUTH_CREDENTIALS")
+    raw_page.goto = AsyncMock(side_effect=error)
+
+    with pytest.raises(RuntimeError, match="ERR_INVALID_AUTH_CREDENTIALS"):
+        await page.goto("https://93.184.216.34/path", max_retries=1)
+
+    mock_scraped_page._browser_state.begin_navigation.assert_called_once_with()
+    mock_scraped_page._browser_state.record_navigation_result.assert_awaited_once_with(error)
 
 
 @pytest.mark.asyncio
@@ -3956,7 +3974,6 @@ async def test_library_page_reads_response_snapshot_with_trusted_organization(
     transport: httpx.AsyncBaseTransport = httpx.MockTransport(authenticate)
     if organization_source == "embedded":
         monkeypatch.setattr(settings, "OTEL_ENABLED", False)
-        monkeypatch.delenv("LMNR_PROJECT_API_KEY", raising=False)
         monkeypatch.setattr(api_app_module, "start_forge_app", lambda: SimpleNamespace(setup_api_app=None))
         api = api_app_module.create_api_app()
 
@@ -4113,3 +4130,30 @@ async def test_click_progress_ignores_retained_partial_rename(tmp_path, mock_scr
     assert record.await_args.kwargs["download_triggered"] is (attempt != 2)
     assert record.await_args.kwargs["downloaded_files"] == (None if attempt == 2 else ["previous.pdf"])
     assert (tmp_path / "previous.pdf").stat().st_mtime == 100
+
+
+@pytest.mark.asyncio
+async def test_polled_script_code_is_registered_so_its_saved_row_is_marked(monkeypatch: pytest.MonkeyPatch) -> None:
+    import skyvern.core.script_generations.script_skyvern_page as module
+    from skyvern.forge import app
+    from skyvern.forge.sdk.schemas.totp_codes import OTPType
+    from skyvern.forge.sdk.workflow.context_manager import WorkflowContextManager, WorkflowRunContext
+    from skyvern.services.otp_service import OTPValue
+    from skyvern.webeye.actions.actions import InputTextAction
+
+    manager = WorkflowContextManager()
+    manager.workflow_run_contexts["wr_1"] = WorkflowRunContext("title", "workflow-id", "permanent-id", "wr_1", None)
+    monkeypatch.setattr(app, "WORKFLOW_CONTEXT_MANAGER", manager, raising=False)
+    monkeypatch.setattr(module, "get_actual_value_of_parameter_if_secret", lambda _workflow_run_id, value: value)
+    monkeypatch.setattr(module, "render_template", lambda value: value)
+    monkeypatch.setattr(module, "poll_otp_value", AsyncMock(return_value=OTPValue(value="482913", type=OTPType.TOTP)))
+    script_page = ScriptSkyvernPage.__new__(ScriptSkyvernPage)
+    script_page.page = SimpleNamespace()
+
+    with skyvern_context.scoped(SkyvernContext(organization_id="org_1", workflow_run_id="wr_1", task_id="tsk_1")):
+        value = await script_page.get_actual_value("", totp_identifier="inbox@example.com")
+        codes = manager.get_one_time_codes_for_run("wr_1")
+
+    typed = InputTextAction(element_id="otp", text=value, workflow_run_id="wr_1")
+    assert value == "482913"
+    assert skyvern_context.action_for_multi_field_totp_persistence(typed, codes).totp_code_required

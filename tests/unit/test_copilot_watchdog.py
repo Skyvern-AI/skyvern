@@ -21,9 +21,12 @@ from skyvern.forge.sdk.copilot.context import CopilotContext
 from skyvern.forge.sdk.copilot.repair_origin_run import (
     OriginBlockOutput,
     OriginExecutionSettings,
+    OriginOutputRefusal,
+    OriginOutputRefusalDetail,
     OriginOutputSnapshot,
     SelectedOutputSource,
 )
+from skyvern.forge.sdk.copilot.runtime import OriginRunRedactionRegistry
 from skyvern.forge.sdk.copilot.tools import (
     RUN_BLOCKS_SAFETY_CEILING_SECONDS,
     WatchdogExitReason,
@@ -42,7 +45,7 @@ from skyvern.forge.sdk.schemas.workflow_runs import WorkflowRunBlock
 from skyvern.schemas.workflows import BlockStatus, BlockType
 from skyvern.webeye.actions.action_types import ActionType
 from skyvern.webeye.actions.actions import ActionStatus
-from tests.unit.copilot_test_helpers import SEARCH_THEN_SELECT_WORKFLOW_YAML
+from tests.unit.copilot_test_helpers import SEARCH_THEN_SELECT_WORKFLOW_YAML, adopted_detached_tasks
 from tests.unit.copilot_test_helpers import install_run_blocks_harness as _install_run_harness
 from tests.unit.copilot_test_helpers import make_copilot_ctx, run_result_action_row, terminal_extraction_block
 
@@ -263,6 +266,29 @@ async def test_ceiling_error_message_advises_splitting() -> None:
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(("handoff_arrived", "url_reported"), [(False, False), (True, True)])
+async def test_a_non_terminal_exit_reports_the_live_url_only_once_the_runs_secrets_are_registered(
+    monkeypatch: pytest.MonkeyPatch, handoff_arrived: bool, url_reported: bool
+) -> None:
+    registry = OriginRunRedactionRegistry(
+        workflow_run_id="wr_test",
+        parameters={"password": "hunter2-password"},
+        contains_sensitive_values=True,
+        contains_all_sensitive_values=handoff_arrived,
+        awaiting_runtime_secret_values=not handoff_arrived,
+    )
+    monkeypatch.setattr(
+        run_execution,
+        "_fallback_page_info",
+        AsyncMock(return_value=("https://portal.fixture.test/verify?code=424242", "")),
+    )
+
+    msg = await _watchdog_error_message("ceiling", _ErrorCtx(), "wr_test", _fake_run(), 240, origin_registry=registry)
+
+    assert ("Browser was on: https://portal.fixture.test/verify?code=424242" in msg) is url_reported
+
+
+@pytest.mark.asyncio
 async def test_task_exit_unfinalized_message_reports_last_observed_status() -> None:
     """When ``execute_workflow`` naturally exits but the row isn't terminal,
     the error must name the last-observed status so the LLM has a concrete
@@ -403,10 +429,6 @@ workflow_definition:
 """
 
 
-def _adopted_detached_tasks(before: set[Any]) -> list[Any]:
-    return [task for task in run_execution._DETACHED_CLEANUP_TASKS if task not in before]
-
-
 def _install_advancing_clock(monkeypatch: pytest.MonkeyPatch, step_seconds: float = 600.0) -> Callable[[], float]:
     elapsed = 0.0
 
@@ -467,8 +489,9 @@ async def test_paused_run_is_reported_as_a_pause_and_left_running(monkeypatch: p
     harness["cooperative_cancel"].assert_not_awaited()
     harness["clear"].assert_not_awaited()
     harness["publish"].assert_awaited_once()
+    assert ctx.budget_expiry_state.leavable_run_ids == []
 
-    adopted = _adopted_detached_tasks(before)
+    adopted = adopted_detached_tasks(before)
     assert len(adopted) == 1
     await asyncio.sleep(0)
     assert harness["executor_cancelled"] is False
@@ -504,7 +527,7 @@ async def test_tool_cancelled_while_paused_leaves_the_run_alive(monkeypatch: pyt
     harness["cancel_run_task"].assert_not_awaited()
     harness["cooperative_cancel"].assert_not_awaited()
 
-    adopted = _adopted_detached_tasks(before)
+    adopted = adopted_detached_tasks(before)
     assert len(adopted) == 1
     await asyncio.sleep(0)
     assert harness["executor_cancelled"] is False
@@ -578,9 +601,10 @@ async def test_non_paused_watchdog_exit_still_cancels_and_clears(monkeypatch: py
     result = await _run_blocks_and_collect_debug({"block_labels": ["extract_heading"], "parameters": {}}, ctx)
 
     assert result["data"]["control_signal"]["kind"] == "watchdog_ceiling"
+    assert result["data"]["browser_start"]["kind"] == "separate_context_continued_from_earlier_test"
     harness["cancel_run_task"].assert_awaited_once()
     harness["clear"].assert_awaited_once()
-    assert _adopted_detached_tasks(before) == []
+    assert adopted_detached_tasks(before) == []
 
     for relayed in (
         result["data"]["failure_reason"],
@@ -591,6 +615,96 @@ async def test_non_paused_watchdog_exit_still_cancels_and_clears(monkeypatch: py
         assert contains_internal_machinery_leak(relayed) is False
         assert_clean_user_facing_text(relayed)
     assert "Run ID:" in result["error"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("chat_session_id", "resume_session_id", "acquired_session_id", "kind", "inherited_browser_state"),
+    [
+        ("pbs_chat", None, "pbs_chat", "chat_browser_context", True),
+        ("pbs_chat", "pbs_chat", "pbs_chat", "chat_browser_context_continued_from_earlier_test", True),
+        (None, None, "pbs_chat", "chat_browser_context_opened_for_this_run", False),
+        ("pbs_chat", "pbs_chat", "pbs_chat_replacement", "chat_browser_context_opened_for_this_run", False),
+    ],
+)
+async def test_a_chat_browser_run_at_the_ceiling_says_which_browser_it_started_in(
+    monkeypatch: pytest.MonkeyPatch,
+    chat_session_id: str | None,
+    resume_session_id: str | None,
+    acquired_session_id: str,
+    kind: str,
+    inherited_browser_state: bool,
+) -> None:
+    harness = await _install_run_harness(
+        monkeypatch, workflow_yaml=SEARCH_THEN_SELECT_WORKFLOW_YAML, polled_status="running"
+    )
+    _install_advancing_clock(monkeypatch)
+
+    async def _acquire(ctx: CopilotContext, **_kwargs: object) -> None:
+        ctx.browser_session_id = acquired_session_id
+
+    monkeypatch.setattr(run_execution, "acquire_build_test_browser_session", _acquire)
+    ctx = make_copilot_ctx(browser_session_id=chat_session_id)
+    ctx.staged_workflow = harness["workflow"]
+    ctx.frontier_resume_session_id = resume_session_id
+
+    result = await _run_blocks_and_collect_debug({"block_labels": ["select_first_result"], "parameters": {}}, ctx)
+
+    assert result["data"]["control_signal"]["kind"] == "watchdog_ceiling"
+    assert result["data"]["browser_start"] == {
+        "kind": kind,
+        "restored_saved_profile": False,
+        "inherited_browser_state": inherited_browser_state,
+    }
+
+
+@pytest.mark.asyncio
+async def test_a_retry_after_a_refused_earlier_output_keeps_the_chat_browser_it_opened_as_blank(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    harness = await _install_run_harness(
+        monkeypatch, workflow_yaml=SEARCH_THEN_SELECT_WORKFLOW_YAML, polled_status="running"
+    )
+    _install_advancing_clock(monkeypatch)
+
+    async def _acquire(ctx: CopilotContext, **_kwargs: object) -> None:
+        ctx.browser_session_id = ctx.browser_session_id or "pbs_chat"
+
+    refusals = [
+        OriginOutputRefusalDetail(
+            reason=OriginOutputRefusal.CHANGED_PRODUCER, block_label="run_search", origin_workflow_run_id="wr_origin"
+        )
+    ]
+
+    def _refuse_once_after_persistence(*_args: object, check_settings: bool = True, **_kwargs: object) -> object:
+        return refusals.pop() if check_settings and refusals else None
+
+    monkeypatch.setattr(run_execution, "acquire_build_test_browser_session", _acquire)
+    monkeypatch.setattr(run_execution, "selected_output_run_refusal", _refuse_once_after_persistence)
+    ctx = make_copilot_ctx(browser_session_id=None)
+    ctx.staged_workflow = harness["workflow"]
+    origin = OriginOutputSnapshot(
+        definition=harness["workflow"].workflow_definition,
+        outputs={
+            "run_search": OriginBlockOutput(
+                status=BlockStatus.completed, has_value=True, created_at=datetime.now(UTC), value={"results": []}
+            )
+        },
+        settings=OriginExecutionSettings.of(harness["workflow"]),
+    )
+    ctx.repair_origin_outputs = origin
+    ctx.frontier_selected_output_sources = {
+        "run_search": SelectedOutputSource("run_search", "wr_origin", "origin", origin)
+    }
+
+    result = await _run_blocks_and_collect_debug({"block_labels": ["select_first_result"], "parameters": {}}, ctx)
+
+    assert refusals == []
+    assert result["data"]["browser_start"] == {
+        "kind": "chat_browser_context_opened_for_this_run",
+        "restored_saved_profile": False,
+        "inherited_browser_state": False,
+    }
 
 
 @pytest.mark.asyncio
@@ -884,6 +998,73 @@ async def test_externally_cancelled_worker_run_still_cooperatively_cancels(
         await run
 
     harness["cooperative_cancel"].assert_awaited_once_with("wr_paused")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("dispatch_to_worker", [True, False], ids=["worker_run", "inline_run"])
+async def test_the_turn_deadline_ends_the_wait_and_leaves_the_run_with_its_executor(
+    monkeypatch: pytest.MonkeyPatch, dispatch_to_worker: bool
+) -> None:
+    """ADR-0025: the turn cap never cancels a run. The turn's hard deadline cancels this call's wait;
+    the run keeps executing, and the turn still knows the cut step started it."""
+    harness = await _install_run_harness(
+        monkeypatch,
+        workflow_yaml=_EXTRACTION_WORKFLOW_YAML,
+        polled_status="running",
+        dispatch_to_worker=dispatch_to_worker,
+    )
+    polling = asyncio.Event()
+
+    async def _read_progress(_ctx: CopilotContext, _run_id: str) -> tuple[Any, datetime]:
+        polling.set()
+        return _fake_run(status="running"), datetime(2026, 4, 21, 12, 0, 0, tzinfo=UTC)
+
+    monkeypatch.setattr(run_execution, "_read_progress_sources", _read_progress)
+    monkeypatch.setattr(run_execution, "RUN_BLOCKS_POLL_INTERVAL_SECONDS", 3600)
+    ctx = make_copilot_ctx(browser_session_id="pbs_chat")
+    ctx.staged_workflow = harness["workflow"]
+    ctx.frontier_resume_session_id = "pbs_run"
+    before = set(run_execution._DETACHED_CLEANUP_TASKS)
+    tool_calls: list[asyncio.Task[Any]] = []
+
+    async def _turn_stream() -> None:
+        # Shaped like _run_streamed_with_deadline over the SDK: the tool runs in its own task, the
+        # stream's immediate cancel does not await it, and the deadline is cleared on the way out.
+        try:
+            async with asyncio.timeout(None) as deadline:
+                ctx.model_stream_deadline = deadline
+                tool_calls.append(
+                    asyncio.create_task(
+                        _run_blocks_and_collect_debug({"block_labels": ["extract_heading"], "parameters": {}}, ctx)
+                    )
+                )
+                try:
+                    await asyncio.Event().wait()
+                except asyncio.CancelledError:
+                    tool_calls[0].cancel()
+                    raise
+        finally:
+            ctx.model_stream_deadline = None
+
+    turn = asyncio.create_task(_turn_stream())
+    await asyncio.wait_for(polling.wait(), timeout=5)
+    assert ctx.model_stream_deadline is not None
+    ctx.model_stream_deadline.reschedule(asyncio.get_running_loop().time())
+    with pytest.raises(TimeoutError):
+        await turn
+    with pytest.raises(asyncio.CancelledError):
+        await tool_calls[0]
+
+    harness["cooperative_cancel"].assert_not_awaited()
+    harness["cancel_run_task"].assert_not_awaited()
+    harness["clear"].assert_not_awaited()
+    assert harness["executor_cancelled"] is False
+    assert ctx.open_step_run_ids == ["wr_paused"]
+
+    adopted = adopted_detached_tasks(before)
+    for task in adopted:
+        task.cancel()
+    await asyncio.gather(*adopted, return_exceptions=True)
 
 
 def test_paused_result_records_last_test_ok_as_none() -> None:

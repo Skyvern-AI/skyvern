@@ -13,6 +13,7 @@ import { useFirstParam } from "@/hooks/useFirstParam";
 import { useMountEffect } from "@/hooks/useMountEffect";
 import { useStudioFirstRunStore } from "@/store/StudioFirstRunStore";
 import { useManualSignInStore } from "@/store/useManualSignInStore";
+import { useRecordingStore } from "@/store/useRecordingStore";
 import { sanitizePaneWidth, type PaneWidths } from "@/store/paneWidths";
 
 import {
@@ -35,6 +36,15 @@ import {
   type PanesCutFrom,
 } from "./StudioPaneDefaultsContext";
 import { useStudioWorkflowDeletedAt } from "./StudioShellContext";
+
+// Which panes a reopened Editor keeps on a narrow stage once no run holds the
+// Browser, first to last; Editor leads so a one-pane stage still shows it.
+const REOPEN_EDITOR_PANE_RANK: Record<StudioPaneId, number> = {
+  editor: 0,
+  copilot: 1,
+  overview: 2,
+  browser: 3,
+};
 
 // Create markers nothing reads after mount; discover, template and record are
 // stripped later by the flows that consume them.
@@ -82,6 +92,9 @@ export function StudioPaneDefaultsProvider({
   const locationKeyRef = useRef(location.key);
   const measuredEntryRef = useRef<number | null>(null);
   const wroteEntryRef = useRef<number | null>(null);
+  // The user closed Editor themselves during this visit; run switches and
+  // other new entries keep it.
+  const editorClosedByUserRef = useRef(false);
 
   const keyForSearch = useCallback(
     (search: string) => {
@@ -162,6 +175,7 @@ export function StudioPaneDefaultsProvider({
         paneWidths: {},
         entryId: state.entryId + 1,
       };
+      if (panes.includes("editor")) editorClosedByUserRef.current = false;
     }
     setState(current);
   }
@@ -182,6 +196,7 @@ export function StudioPaneDefaultsProvider({
         slots: readonly StudioPaneId[],
         stageWidth: number,
       ) => StudioPaneId[] | PanesCutFrom,
+      options?: { byUser?: boolean; layout?: boolean },
     ) => {
       const previous = latestRef.current;
       const result = compute(
@@ -197,6 +212,14 @@ export function StudioPaneDefaultsProvider({
         ? panesWithoutDeletedBlocked(computed)
         : computed;
       wroteEntryRef.current = previous.entryId;
+      if (panes.includes("editor")) {
+        editorClosedByUserRef.current = false;
+      } else if (
+        options?.byUser &&
+        (options.layout || previous.panes.includes("editor"))
+      ) {
+        editorClosedByUserRef.current = true;
+      }
       if (!panesListEqual(previous.panes, panes)) {
         latestRef.current = withPanes(previous, panes, arrangement);
         setState(latestRef.current);
@@ -219,6 +242,27 @@ export function StudioPaneDefaultsProvider({
     },
     [workflowDeleted],
   );
+  const reopenEditor = useCallback(() => {
+    // Capture takes Editor away on purpose (recordingPaneLifecycle).
+    if (
+      editorClosedByUserRef.current ||
+      useRecordingStore.getState().isRecording
+    )
+      return;
+    updatePanes((panes, slots, stageWidth) => {
+      if (panes.includes("editor")) return panes;
+      const opened = withPaneOpen(panes, "editor", slots);
+      if (stageWidth <= 0 || panesFitWidth(opened, stageWidth)) return opened;
+      const priority = [...opened].sort(
+        (a, b) => REOPEN_EDITOR_PANE_RANK[a] - REOPEN_EDITOR_PANE_RANK[b],
+      );
+      const kept = fitPanesToWidth(priority, stageWidth);
+      return {
+        panes: opened.filter((id) => kept.includes(id)),
+        arrangement: opened,
+      };
+    });
+  }, [updatePanes]);
   // A layout effect subscribes before the Copilot chat's passive effects write
   // the store, and before a previous agent's chat clears it on unmount.
   useLayoutEffect(
@@ -289,6 +333,7 @@ export function StudioPaneDefaultsProvider({
       entryId: current.entryId,
       getPanes,
       updatePanes,
+      reopenEditor,
       registerStageElement,
       setPaneWidths,
       resetPaneWidths,
@@ -300,6 +345,7 @@ export function StudioPaneDefaultsProvider({
       current.entryId,
       getPanes,
       updatePanes,
+      reopenEditor,
       registerStageElement,
       setPaneWidths,
       resetPaneWidths,

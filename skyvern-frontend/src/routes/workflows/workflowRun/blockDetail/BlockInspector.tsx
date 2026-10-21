@@ -22,9 +22,11 @@ import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { cn } from "@/util/utils";
 import {
   getBlockOutputDisplayValue,
+  readGmailSendOutput,
   shouldShowExtractedInformation,
   type WorkflowRunBlock,
 } from "../../types/workflowRunTypes";
+import { GmailSendOutcome } from "../blockInfo/SendEmailBlockInfo";
 import { jsonClipboardText } from "./formatValue";
 import { BlockDetailFailure } from "./shared";
 
@@ -582,13 +584,16 @@ function BlockInspector({
   const outputTabLabel = showsExtractedInformation
     ? "Extracted Information"
     : "Outputs";
+  const gmailSendOutput = action ? null : readGmailSendOutput(block.output);
   // A failed block/action opens on Summary so its failure reason (the only
-  // place it now renders) is visible without hunting through tabs.
-  const defaultTab = block.failure_reason
-    ? "summary"
-    : hasOutput
-      ? "outputs"
-      : "summary";
+  // place it now renders) is visible without hunting through tabs. A Gmail
+  // send opens there too: Summary is where its outcome is stated.
+  const defaultTab =
+    block.failure_reason || gmailSendOutput
+      ? "summary"
+      : hasOutput
+        ? "outputs"
+        : "summary";
   const [activeTab, setActiveTab] = useState(defaultTab);
   const diagnosticsTaskId = action?.task_id ?? block.task_id;
   const diagnosticsStepIndex = action
@@ -647,11 +652,18 @@ function BlockInspector({
           )}
         </TabsList>
         <TabsContent value="summary" className="m-0 space-y-3">
-          <BlockDetailFailure
-            block={block}
-            onViewScreenshot={onViewScreenshot}
-            statedFailureHeadline={statedFailureHeadline}
-          />
+          {gmailSendOutput ? (
+            <GmailSendOutcome
+              output={gmailSendOutput}
+              failureReason={block.failure_reason}
+            />
+          ) : (
+            <BlockDetailFailure
+              block={block}
+              onViewScreenshot={onViewScreenshot}
+              statedFailureHeadline={statedFailureHeadline}
+            />
+          )}
           <FieldList
             fields={summaryFields}
             emptyText="No additional summary data."

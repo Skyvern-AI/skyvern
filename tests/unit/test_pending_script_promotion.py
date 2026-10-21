@@ -14,6 +14,7 @@ import ast
 import asyncio
 from datetime import UTC, datetime
 from types import SimpleNamespace
+from typing import Any
 from unittest.mock import AsyncMock, MagicMock
 
 import libcst as cst
@@ -23,12 +24,17 @@ from skyvern.core.script_generations.generate_script import _build_block_stateme
 from skyvern.forge import app
 from skyvern.forge.sdk.core import skyvern_context
 from skyvern.forge.sdk.core.skyvern_context import SkyvernContext
-from skyvern.forge.sdk.workflow.models.block import ExtractionBlock
+from skyvern.forge.sdk.experimentation.providers import BaseExperimentationProvider
+from skyvern.forge.sdk.workflow.models.block import ExtractionBlock, TaskBlock
 from skyvern.forge.sdk.workflow.models.parameter import OutputParameter
 from skyvern.forge.sdk.workflow.service import WorkflowService
+from skyvern.schemas.run_enums import RunEngine
 from skyvern.schemas.scripts import ScriptStatus
 from skyvern.schemas.workflows import BlockStatus, BlockType
 from skyvern.services import workflow_script_service
+from skyvern.services import workflow_service as workflow_service_module
+from skyvern.webeye.actions.actions import ClickAction
+from tests.unit.test_agent_task_v3 import _make_block, _run_execute_step_gate
 
 
 def make_workflow(block_types: list[BlockType]) -> SimpleNamespace:
@@ -378,9 +384,41 @@ class TestPendingMintUsesOriginalRevision:
         scripts.create_workflow_script.assert_not_awaited()
 
 
+def run_blocks_db(*engines: RunEngine | None) -> SimpleNamespace:
+    async def has_block_on_engine(*, workflow_run_id: str, engine: RunEngine, organization_id: str) -> bool:
+        return engine in engines
+
+    return SimpleNamespace(workflow_run_has_block_on_engine=has_block_on_engine)
+
+
+class BlockRowsByTask:
+    """Block-row engines keyed by task, written by the dispatch fallback and read by the mint guard."""
+
+    def __init__(self, **engines: RunEngine) -> None:
+        self.engines = dict(engines)
+
+    async def set_workflow_run_block_engine_by_task_id(
+        self, task_id: str, engine: RunEngine, organization_id: str | None = None
+    ) -> bool:
+        self.engines[task_id] = engine
+        return True
+
+    async def workflow_run_has_block_on_engine(
+        self, *, workflow_run_id: str, engine: RunEngine, organization_id: str | None
+    ) -> bool:
+        return engine in self.engines.values()
+
+
 class TestFinalizeReusesPendingScript:
-    def _patch_common(self, monkeypatch: pytest.MonkeyPatch, scripts: MagicMock) -> AsyncMock:
-        monkeypatch.setattr(app, "DATABASE", SimpleNamespace(scripts=scripts), raising=False)
+    def _patch_common(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        scripts: MagicMock,
+        *engines: RunEngine | None,
+        observer: BlockRowsByTask | None = None,
+    ) -> AsyncMock:
+        database = SimpleNamespace(scripts=scripts, observer=observer or run_blocks_db(*engines))
+        monkeypatch.setattr(app, "DATABASE", database, raising=False)
         monkeypatch.setattr(app, "ARTIFACT_MANAGER", SimpleNamespace(upload_aiotasks_map={}), raising=False)
         monkeypatch.setattr(
             workflow_script_service,
@@ -457,3 +495,191 @@ class TestFinalizeReusesPendingScript:
 
         scripts.create_script.assert_awaited_once()
         assert generate_mock.await_args.kwargs["script"].script_id == "s_new"
+
+
+class TestNoScriptFromATaskV3Run:
+    """Task V3 actions carry no element data, so a script minted from them has dead selectors, and the
+    workflow's later code-mode runs would load it. Both mint paths must refuse such a run."""
+
+    @pytest.mark.parametrize(
+        ("engines", "mints"),
+        [
+            ((RunEngine.skyvern_v1, RunEngine.skyvern_v1), True),
+            ((RunEngine.skyvern_v1, RunEngine.skyvern_v3), False),
+            ((RunEngine.skyvern_v3,), False),
+        ],
+    )
+    @pytest.mark.asyncio
+    async def test_finalize_mints_only_from_a_run_with_no_v3_block(
+        self, monkeypatch: pytest.MonkeyPatch, engines: tuple[RunEngine, ...], mints: bool
+    ) -> None:
+        scripts = make_scripts_db(pending_row=None)
+        generate_mock = TestFinalizeReusesPendingScript()._patch_common(monkeypatch, scripts, *engines)
+
+        await WorkflowService().generate_script_if_needed(
+            workflow=make_workflow([BlockType.GOTO_URL, BlockType.TASK]),
+            workflow_run=make_workflow_run(),
+            finalize=True,
+        )
+
+        assert scripts.create_script.await_count == int(mints)
+        assert generate_mock.await_count == int(mints)
+
+    @pytest.mark.parametrize(("engine", "mints"), [(RunEngine.skyvern_v1, True), (RunEngine.skyvern_v3, False)])
+    @pytest.mark.asyncio
+    async def test_pending_mint_skips_a_run_with_a_v3_block(
+        self, monkeypatch: pytest.MonkeyPatch, engine: RunEngine, mints: bool
+    ) -> None:
+        monkeypatch.setattr(app, "DATABASE", SimpleNamespace(observer=run_blocks_db(engine)), raising=False)
+        pending_mint = AsyncMock()
+        monkeypatch.setattr(workflow_script_service, "generate_or_update_pending_workflow_script", pending_mint)
+
+        await WorkflowService()._do_generate_pending_script(make_workflow([BlockType.TASK]), make_workflow_run())
+
+        assert pending_mint.await_count == int(mints)
+
+    @pytest.mark.parametrize(("kill_switch_on", "mints"), [(True, True), (False, False)])
+    @pytest.mark.asyncio
+    async def test_a_v3_pinned_block_the_kill_switch_ran_on_v1_still_gets_its_requested_script(
+        self, monkeypatch: pytest.MonkeyPatch, kill_switch_on: bool, mints: bool
+    ) -> None:
+        workflow_run = make_workflow_run()
+        workflow_run.code_gen = True
+        # execute_safe labels the row with the resolved engine before dispatch.
+        rows = BlockRowsByTask(**{"task-123": RunEngine.skyvern_v3})
+        provider = MagicMock(spec=BaseExperimentationProvider)
+        provider.resolve_feature_flag_strict = AsyncMock(return_value=kill_switch_on)
+
+        await _run_execute_step_gate(
+            engine=RunEngine.skyvern_v3,
+            task_block=_make_block(TaskBlock, label="pinned", engine=RunEngine.skyvern_v3),
+            experimentation_provider=provider,
+            observer=rows,
+            workflow_run_id=workflow_run.workflow_run_id,
+        )
+        scripts = make_scripts_db(pending_row=None)
+        generate_mock = TestFinalizeReusesPendingScript()._patch_common(monkeypatch, scripts, observer=rows)
+
+        await WorkflowService().generate_script_if_needed(
+            workflow=make_workflow([BlockType.GOTO_URL, BlockType.TASK]),
+            workflow_run=workflow_run,
+        )
+
+        assert generate_mock.await_count == int(mints)
+
+    @pytest.mark.asyncio
+    async def test_a_non_v3_dispatch_keeps_its_row_and_engine(self) -> None:
+        rows = BlockRowsByTask(**{"task-123": RunEngine.openai_cua})
+
+        _v3_mock, step_engine_mock = await _run_execute_step_gate(
+            engine=RunEngine.openai_cua,
+            task_block=_make_block(TaskBlock, label="cua", engine=RunEngine.openai_cua),
+            observer=rows,
+            workflow_run_id=make_workflow_run().workflow_run_id,
+        )
+
+        assert rows.engines == {"task-123": RunEngine.openai_cua}
+        assert step_engine_mock.await_args.kwargs["engine"] == RunEngine.openai_cua
+
+    @pytest.mark.parametrize(
+        ("engine_at_block_read", "engine_after_action_read", "engine_read_fails", "mints"),
+        [
+            (None, RunEngine.skyvern_v1, False, True),
+            # The cached-script fallback stamps the row after the block read, as its v3 actions land.
+            (None, RunEngine.skyvern_v3, False, False),
+            # A retry moves the v3 row to a new task and the kill switch relabels it v1 before the re-read.
+            (RunEngine.skyvern_v3, RunEngine.skyvern_v1, False, False),
+            (None, RunEngine.skyvern_v1, True, False),
+        ],
+        ids=["stays_v1", "stamped_v3_after_block_read", "relabeled_v1_after_block_read", "engine_read_fails_closed"],
+    )
+    @pytest.mark.asyncio
+    async def test_an_in_flight_pending_mint_never_writes_a_v3_tasks_actions(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        engine_at_block_read: RunEngine | None,
+        engine_after_action_read: RunEngine,
+        engine_read_fails: bool,
+        mints: bool,
+    ) -> None:
+        # The mint passed its v3 check before the second block ran; the row changes between its two reads.
+        def run_block(label: str, task_id: str, engine: RunEngine | None, created_at: int) -> SimpleNamespace:
+            return SimpleNamespace(
+                workflow_run_block_id=f"wrb_{label}",
+                parent_workflow_run_block_id=None,
+                block_type=BlockType.TASK,
+                label=label,
+                task_id=task_id,
+                status="completed",
+                output={},
+                created_at=created_at,
+                engine=engine,
+            )
+
+        definition_blocks = [
+            SimpleNamespace(label=label, block_type=BlockType.TASK, model_dump=lambda label=label: {"label": label})
+            for label in ("cached", "pinned")
+        ]
+        workflow = SimpleNamespace(
+            workflow_id="w_1",
+            workflow_permanent_id="wpid_1",
+            organization_id="o_1",
+            title="wf",
+            workflow_definition=SimpleNamespace(blocks=definition_blocks),
+            model_dump=lambda: {"workflow_id": "w_1"},
+        )
+        run_request = SimpleNamespace(workflow_id="wpid_1", model_dump=lambda: {"workflow_id": "wpid_1"})
+        tasks = [
+            SimpleNamespace(task_id=t, model_dump=lambda t=t: {"task_id": t}) for t in ("tsk_cached", "tsk_pinned")
+        ]
+        actions = [
+            ClickAction(action_id=f"a_{t}", task_id=t, element_id=f"el_{t}") for t in ("tsk_pinned", "tsk_cached")
+        ]
+        rows = [
+            run_block("cached", "tsk_cached", RunEngine.skyvern_v1, 1),
+            run_block("pinned", "tsk_pinned", engine_at_block_read, 2),
+        ]
+
+        async def read_blocks(**_: Any) -> list[SimpleNamespace]:
+            return [SimpleNamespace(**vars(row)) for row in rows]
+
+        async def read_actions(**_: Any) -> list[ClickAction]:
+            rows[1].engine = engine_after_action_read
+            return list(actions)
+
+        async def has_block_on_engine(*, workflow_run_id: str, engine: RunEngine, organization_id: str) -> bool:
+            if engine_read_fails:
+                raise RuntimeError("database unavailable")
+            return any(row.engine == engine for row in rows)
+
+        database = SimpleNamespace(
+            observer=SimpleNamespace(
+                get_workflow_run_blocks=read_blocks, workflow_run_has_block_on_engine=has_block_on_engine
+            ),
+            tasks=SimpleNamespace(get_tasks_by_ids=AsyncMock(return_value=tasks), get_tasks_actions=read_actions),
+        )
+        monkeypatch.setattr(app, "DATABASE", database, raising=False)
+        monkeypatch.setattr(
+            app,
+            "WORKFLOW_SERVICE",
+            SimpleNamespace(get_workflow_by_permanent_id=AsyncMock(return_value=workflow)),
+            raising=False,
+        )
+        monkeypatch.setattr(
+            workflow_service_module,
+            "get_workflow_run_response",
+            AsyncMock(return_value=SimpleNamespace(run_request=run_request)),
+        )
+        monkeypatch.setattr(workflow_script_service, "is_adaptive_caching", lambda *_: False)
+        codegen = AsyncMock(side_effect=RuntimeError("stop after the generation input is accepted"))
+        monkeypatch.setattr(workflow_script_service, "generate_workflow_script_python_code", codegen)
+
+        await workflow_script_service.generate_workflow_script(
+            workflow_run=make_workflow_run(),
+            workflow=workflow,
+            script=SimpleNamespace(script_id="s_1", script_revision_id="sr_1", version=1),
+            rendered_cache_key_value="default:site",
+            pending=True,
+        )
+
+        assert codegen.await_count == int(mints)

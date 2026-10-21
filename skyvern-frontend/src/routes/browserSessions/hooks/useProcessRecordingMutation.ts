@@ -268,7 +268,7 @@ const useProcessRecordingMutation = ({
         variant: "warning",
         title: "No workflow steps created",
         description:
-          "Skyvern couldn't turn this task recording into workflow steps.",
+          "Skyvern couldn't turn your demonstration into workflow steps.",
       });
     },
     onError: (error, { owner }) => {

@@ -11,6 +11,7 @@ from collections.abc import Iterator
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from email.utils import parsedate_to_datetime
+from typing import Literal
 from urllib.parse import urlparse
 
 import httpx
@@ -39,6 +40,19 @@ _LOCAL_RESOURCE_ERRNOS: frozenset[int] = frozenset({errno.EMFILE, errno.ENFILE, 
 WEBHOOK_DELIVERY_MAX_ATTEMPTS = 3
 WEBHOOK_DELIVERY_RETRY_BASE_DELAY_SECONDS = 1.0
 WEBHOOK_DELIVERY_MAX_RETRY_AFTER_SECONDS = 30.0
+
+
+# The paths that send a run's final webhook without an attempt claim; a skipped send logs which one it was.
+FinalWebhookFinalizer = Literal[
+    "api_cancel",
+    "worker_cleanup",
+    "webhook_activity",
+    "timeout_sweep",
+    "orphan_reaper",
+    "terminal_side_effects",
+    "failed_before_execution",
+    "sequential_credential_rejection",
+]
 
 
 @dataclass(frozen=True)

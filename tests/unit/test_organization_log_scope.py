@@ -22,6 +22,9 @@ from tests.unit.forge_log_capture import capture_runtime_logs
 
 _ORGANIZATION_ID = "o_100000000000000002"
 _SCOPED_ORGANIZATION_ID = "o_100000000000000010"
+_BUDGET_ORGANIZATION_ID = "o_100000000000000011"
+# Only bounds a hang: a full GC pause late in a CI shard can outlast a tighter guard while nothing is wrong.
+_HANG_GUARD_SECONDS = 30
 
 
 @pytest.mark.asyncio
@@ -57,6 +60,33 @@ async def test_scope_adds_log_fields_without_touching_the_run_log_artifact(monke
     get_organization.assert_awaited_once_with(_SCOPED_ORGANIZATION_ID)
 
 
+@pytest.mark.asyncio
+async def test_both_reads_pass_the_production_bound(monkeypatch: pytest.MonkeyPatch) -> None:
+    # The database fixture raises the bound for the tests that use it, so this one pins the value production passes.
+    now = datetime.now(UTC)
+    organization = Organization(
+        organization_id=_BUDGET_ORGANIZATION_ID, organization_name="Budget", created_at=now, modified_at=now
+    )
+    monkeypatch.setattr(
+        organization_log_scope.app,
+        "DATABASE",
+        SimpleNamespace(organizations=SimpleNamespace(get_organization=AsyncMock(return_value=organization))),
+    )
+    budgets: list[float | None] = []
+    real_timeout = asyncio.timeout
+
+    def recording_timeout(delay: float | None) -> asyncio.Timeout:
+        budgets.append(delay)
+        return real_timeout(delay)
+
+    monkeypatch.setattr(organization_log_scope.asyncio, "timeout", recording_timeout)
+    async with scope_organization_logs(_BUDGET_ORGANIZATION_ID):
+        pass
+    await warm_organization_age(_BUDGET_ORGANIZATION_ID)
+
+    assert budgets == [2, 2]
+
+
 @pytest_asyncio.fixture
 async def database(monkeypatch: pytest.MonkeyPatch) -> AsyncIterator[AgentDB]:
     engine = _build_engine("sqlite+aiosqlite:///:memory:")
@@ -73,6 +103,9 @@ async def database(monkeypatch: pytest.MonkeyPatch) -> AsyncIterator[AgentDB]:
         )
         await session.commit()
     monkeypatch.setattr(organization_log_scope.app, "DATABASE", database)
+    # The 2 s production bound is shorter than a full GC pause late in a CI shard, which times out a read a test
+    # then asserts. Tests of the bound set their own.
+    monkeypatch.setattr(organization_log_scope, "_ORGANIZATION_READ_TIMEOUT_SECONDS", 60)
     try:
         yield database
     finally:
@@ -124,7 +157,7 @@ async def test_hung_lookup_still_runs_the_wrapped_work_within_the_bound(monkeypa
         async with scope_organization_logs(_SCOPED_ORGANIZATION_ID):
             stamped_while_running.append(has_log_organization_fields())
 
-    await asyncio.wait_for(wrapped_work(), timeout=2)
+    await asyncio.wait_for(wrapped_work(), timeout=_HANG_GUARD_SECONDS)
 
     assert stamped_while_running == [False]
 
@@ -172,12 +205,12 @@ async def test_hung_read_releases_the_caller_and_backs_off(database: AgentDB, mo
 
     monkeypatch.setattr(database.organizations, "get_organization", hung_get_organization)
 
-    await asyncio.wait_for(warm_organization_age(_ORGANIZATION_ID), timeout=2)
+    await asyncio.wait_for(warm_organization_age(_ORGANIZATION_ID), timeout=_HANG_GUARD_SECONDS)
     clock[0] += organization_log_scope._FAILED_READ_BACKOFF_SECONDS - 1
-    await asyncio.wait_for(warm_organization_age(_ORGANIZATION_ID), timeout=2)
+    await asyncio.wait_for(warm_organization_age(_ORGANIZATION_ID), timeout=_HANG_GUARD_SECONDS)
     reads_within_backoff = list(reads)
     clock[0] += 2
-    await asyncio.wait_for(warm_organization_age(_ORGANIZATION_ID), timeout=2)
+    await asyncio.wait_for(warm_organization_age(_ORGANIZATION_ID), timeout=_HANG_GUARD_SECONDS)
 
     assert reads_within_backoff == [_ORGANIZATION_ID]
     assert reads == [_ORGANIZATION_ID, _ORGANIZATION_ID]

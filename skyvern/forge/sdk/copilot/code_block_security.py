@@ -19,6 +19,7 @@ _RUNTIME_ATTR_REASONS = {
     "request": "RUNTIME_PAGE_REQUEST",
     "context": "RUNTIME_PAGE_CONTEXT",
 }
+DENIED_PAGE_MEMBERS = tuple(_AUTHOR_ATTR_REASONS)
 _DYNAMIC_ATTRIBUTE_BUILTINS = frozenset({"getattr", "setattr", "delattr", "vars", "globals", "locals"})
 _AUTHOR_DYNAMIC_ATTRIBUTE_REASON = "AUTHOR_DYNAMIC_ATTRIBUTE"
 _RUNTIME_DYNAMIC_ATTRIBUTE_REASON = "RUNTIME_DYNAMIC_ATTRIBUTE"
@@ -267,8 +268,6 @@ def _surface_for_reason(reason_code: str) -> str:
         return "page.request"
     if reason_code.endswith("PAGE_CONTEXT"):
         return "page.context"
-    if reason_code.endswith("PAGE_EVALUATE"):
-        return "page.evaluate"
     if reason_code.endswith("DYNAMIC_ATTRIBUTE"):
         return f"dynamic attribute access ({'/'.join(sorted(_DYNAMIC_ATTRIBUTE_BUILTINS))})"
     if reason_code == _PARAMETER_CODE_REASON:

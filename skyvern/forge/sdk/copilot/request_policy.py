@@ -14,7 +14,6 @@ import structlog
 from pydantic import BaseModel, ConfigDict, ValidationError
 
 from skyvern.config import settings
-from skyvern.forge import app
 from skyvern.forge.log_redaction import redact_sensitive_fields
 from skyvern.forge.prompts import prompt_engine
 from skyvern.forge.sdk.api.llm.api_handler import LLMAPIHandler
@@ -82,6 +81,9 @@ def _parse_final_response(raw: str) -> dict[str, Any]:
 
 
 _TESTING_INTENTS = {"require_test", "skip_test", "unspecified"}
+_SELECTABLE_GOOGLE_DATA_SCOPES = frozenset(
+    {google_oauth_service.GOOGLE_SHEETS_DATA_SCOPE, google_oauth_service.GOOGLE_GMAIL_READONLY_SCOPE}
+)
 _AUTHORING_INTENTS = {"author_now", "defer_authoring"}
 DEFER_AUTHORING_DURABLE_FILL_CRITERION_ID = "defer_authoring_durable_fill"
 _KINDS = {"none", "raw_secret", "credential_id", "credential_name", "website_stored_credential", "placeholder"}
@@ -214,10 +216,7 @@ async def _saved_credential_ids(citations: list[str], organization_id: str) -> s
     connection_ids = {citation for citation in citations if citation.startswith("goac_")}
     verified_ids: set[str] = set()
     if credential_ids:
-        credentials = await app.DATABASE.credentials.get_credentials_by_ids(
-            credential_ids,
-            organization_id=organization_id,
-        )
+        credentials = await _load_credentials(organization_id, credential_ids=credential_ids)
         verified_ids.update(credential.credential_id for credential in credentials)
     if connection_ids:
         connections = await google_oauth_service.get_visible_credentials_for_org(organization_id)
@@ -250,6 +249,11 @@ _RAW_SECRET_EVIDENCE_BEFORE_URI_VALUE_BOUNDARIES = "=?&#"
 _RAW_SECRET_EVIDENCE_AFTER_URI_VALUE_BOUNDARIES = "&#"
 _RAW_SECRET_EVIDENCE_SENTENCE_PUNCTUATION = ".,;:!?"
 _RAW_SECRET_EVIDENCE_CLOSING_BOUNDARIES = ")]\"}'"
+_RAW_SECRET_EVIDENCE_OPENING_BOUNDARIES = "([{\"'"
+# Only for redacting copies of a citation already verified at the boundaries above: a curly quote or colon can sit
+# inside a secret (Hunter2’Portal!, Hunter2:Portal!), but a verified value's “quoted” or PIN:1234 copy must still go.
+_RAW_SECRET_REDACTION_OPENING_BOUNDARIES = _RAW_SECRET_EVIDENCE_OPENING_BOUNDARIES + "“‘:"
+_RAW_SECRET_REDACTION_CLOSING_BOUNDARIES = _RAW_SECRET_EVIDENCE_CLOSING_BOUNDARIES + "”’"
 
 
 def _redact_raw_secrets_outside_url_candidates(message: str) -> str:
@@ -316,20 +320,30 @@ def _raw_secret_evidence_is_url_userinfo_password(
     return False
 
 
-def _raw_secret_evidence_after_is_boundary(evidence: str, message: str, end: int) -> bool:
+def _raw_secret_evidence_after_is_boundary(
+    evidence: str,
+    message: str,
+    end: int,
+    closing_boundaries: str = _RAW_SECRET_EVIDENCE_CLOSING_BOUNDARIES,
+) -> bool:
     if end >= len(message):
         return True
     after = message[end]
-    if after.isspace() or after in _RAW_SECRET_EVIDENCE_CLOSING_BOUNDARIES:
+    if after.isspace() or after in closing_boundaries:
         return True
     if after in _RAW_SECRET_EVIDENCE_SENTENCE_PUNCTUATION:
         following = message[end + 1] if end + 1 < len(message) else ""
-        if not following or following.isspace() or following in _RAW_SECRET_EVIDENCE_CLOSING_BOUNDARIES:
+        if not following or following.isspace() or following in closing_boundaries:
             return True
     return not evidence[-1].isalnum() and after in ".,;:?"
 
 
-def _raw_secret_evidence_spans(evidence: str | None, user_message: str) -> list[tuple[int, int]]:
+def _raw_secret_evidence_spans(
+    evidence: str | None,
+    user_message: str,
+    opening_boundaries: str = _RAW_SECRET_EVIDENCE_OPENING_BOUNDARIES,
+    closing_boundaries: str = _RAW_SECRET_EVIDENCE_CLOSING_BOUNDARIES,
+) -> list[tuple[int, int]]:
     if not evidence or len(evidence) < _MIN_RAW_SECRET_EVIDENCE_CHARS:
         return []
     message = user_message or ""
@@ -354,7 +368,7 @@ def _raw_secret_evidence_spans(evidence: str | None, user_message: str) -> list[
         before_is_boundary = (
             not before
             or before.isspace()
-            or before in "([{\"'"
+            or before in opening_boundaries
             or uri_candidate_end is not None
             or is_userinfo_password
         )
@@ -362,17 +376,30 @@ def _raw_secret_evidence_spans(evidence: str | None, user_message: str) -> list[
             uri_candidate_end is not None
             and (end == uri_candidate_end or message[end] in _RAW_SECRET_EVIDENCE_AFTER_URI_VALUE_BOUNDARIES)
         )
-        after_is_boundary = after_is_uri_boundary or _raw_secret_evidence_after_is_boundary(evidence, message, end)
+        after_is_boundary = after_is_uri_boundary or _raw_secret_evidence_after_is_boundary(
+            evidence, message, end, closing_boundaries
+        )
         if before_is_boundary and after_is_boundary:
             spans.append((index, end))
         start = index + 1
 
 
 def _redact_cited_secrets(message: str, citations: list[str]) -> str:
-    spans = sorted(
-        (span for citation in citations for span in _raw_secret_evidence_spans(citation, message)),
-        key=lambda span: (span[0], span[1]),
-    )
+    spans: list[tuple[int, int]] = []
+    for citation in citations:
+        strict = set(_raw_secret_evidence_spans(citation, message))
+        for start, end in _raw_secret_evidence_spans(
+            citation, message, _RAW_SECRET_REDACTION_OPENING_BOUNDARIES, _RAW_SECRET_REDACTION_CLOSING_BOUNDARIES
+        ):
+            if (start, end) not in strict:
+                # Matched only beside a curly quote or colon, so it may be the end of a longer secret
+                # (Hunter2:Portal!); redacting the whole space-delimited token leaves no part of either.
+                while start > 0 and not message[start - 1].isspace():
+                    start -= 1
+                while end < len(message) and not message[end].isspace():
+                    end += 1
+            spans.append((start, end))
+    spans.sort()
     merged: list[tuple[int, int]] = []
     for start, end in spans:
         if merged and start <= merged[-1][1]:
@@ -389,7 +416,7 @@ def _redact_cited_secrets(message: str, citations: list[str]) -> str:
     return "".join(pieces)
 
 
-async def _screen_raw_secret_safety(
+async def screen_raw_secret_safety(
     user_message: str,
     handler: LLMAPIHandler | None,
     *,
@@ -893,7 +920,17 @@ class SteerMessageSiteURLSource:
     kind: Literal["steer_message"] = field(default="steer_message", init=False)
 
 
-SiteURLSource = UserMessageSiteURLSource | QuestionResponseSiteURLSource | SteerMessageSiteURLSource
+@dataclass(frozen=True)
+class DemonstrationNavigationSiteURLSource:
+    kind: Literal["demonstration_navigation"] = field(default="demonstration_navigation", init=False)
+
+
+SiteURLSource = (
+    UserMessageSiteURLSource
+    | QuestionResponseSiteURLSource
+    | SteerMessageSiteURLSource
+    | DemonstrationNavigationSiteURLSource
+)
 
 
 @dataclass(frozen=True)
@@ -958,11 +995,18 @@ class RequestPolicy:
     # cred_ id — as distinct from approvals carried in from earlier turns. Naming a credential
     # answers which one to use, which is what lets the login page answer where it may be typed.
     current_turn_named_credential_ids: set[str] = field(default_factory=set)
+    # The model looked up a reference the user wrote and no saved login carries it, so the card settles
+    # the login rather than a page's URL. Sticky for the turn: clearing it on a later match would let a
+    # second site's page bind an unnamed login.
+    named_login_not_found: bool = False
     # A credential the user named before a refused cross-site fill connected a provider login in its place.
     # Kept apart so the fill seam's which-credential check still sees only the provider login as named.
     origin_recovery_kept_named_credential_ids: set[str] = field(default_factory=set)
     # Explicit user approvals hydrated from the existing trusted structured chat context.
     prior_approved_credential_ids: set[str] = field(default_factory=set)
+    # The site each approval or proposal carried in from an earlier turn recorded. Naming the credential
+    # again drops it from live_page_admitted_urls, so the pick card reads it here.
+    carried_credential_urls: dict[str, str] = field(default_factory=dict)
     # Sites the user themselves provided anywhere in this chat, one URL per origin. A credential may
     # only be released onto one of these (or a vault/tested match); a site only a model produced is
     # never eligible.
@@ -981,6 +1025,9 @@ class RequestPolicy:
     # seed this turn's test runs before Accept saves it as the workflow's pick.
     credential_pause_signed_in_profile_id: str | None = None
     credential_pause_signed_in_site: str | None = None
+    # Every login a credential card or a demonstrated fill connected on this turn; each stays the user's own pick
+    # after a later one.
+    credential_pause_connected_credential_ids: set[str] = field(default_factory=set)
     # Active Google OAuth connections admitted only for workflow execution. These never enter
     # resolved_credentials, which remains the password-fill authority plane from ADR 0002.
     run_approved_google_connection_ids: list[str] = field(default_factory=list)
@@ -989,6 +1036,10 @@ class RequestPolicy:
     # seam may separately admit a selected native Sheets citation for that dispatch only when it
     # is backed by this turn's server-owned list_integrations result.
     selected_connected_account_id: str | None = None
+    # Any validated Google pick, reported to the model as a fact. Only a Sheets pick also becomes
+    # selected_connected_account_id; a Gmail pick never widens run authority.
+    picked_connected_account_id: str | None = None
+    picked_connected_account_scopes: list[str] = field(default_factory=list)
     # Sorted at the trace/JSON boundary; YAML traversal uses sets.
     existing_workflow_credential_origins: dict[str, list[str]] = field(default_factory=dict)
     classifier_status: str = "not_run"
@@ -1014,9 +1065,37 @@ class RequestPolicy:
             return
         _project_user_provided_sites(self, _steer_message_url_texts(steer), reset=False)
 
+    def project_demonstration_navigation(self, url: str) -> None:
+        _project_user_provided_sites(
+            self,
+            [_SiteURLText(text=url, source=DemonstrationNavigationSiteURLSource())],
+            reset=False,
+        )
+
     @property
     def raw_secret_redacted_draft(self) -> bool:
         return self.raw_secret_detected and self.raw_secret_handling == "redacted_draft"
+
+    def record_named_login_not_found(self) -> list[str]:
+        """Returns the ids of logins the server bound without the user naming them, which are withdrawn."""
+        self.named_login_not_found = True
+        # A page, this turn or the one before, may have bound its own login before the model looked the
+        # name up. One the user named, approved earlier or saved in the workflow stays; a carry the model
+        # only cited does not, because naming a different login declines it.
+        settled = (
+            self.current_turn_named_credential_ids
+            | self.credential_pause_connected_credential_ids
+            | self.prior_approved_credential_ids
+            | set(self.persisted_workflow_credential_ids)
+        )
+        withdrawn = sorted({credential.credential_id for credential in self.auto_bound_credentials} - settled)
+        self.resolved_credentials = [c for c in self.resolved_credentials if c.credential_id not in withdrawn]
+        self.auto_bound_credentials = [c for c in self.auto_bound_credentials if c.credential_id not in withdrawn]
+        # Leaving the carry's id here would renew the withdrawn proposal for the next turn.
+        self.seeded_proposal_credential_ids.difference_update(withdrawn)
+        for credential_id in withdrawn:
+            self.live_page_admitted_urls.pop(credential_id, None)
+        return withdrawn
 
     def apply_raw_secret_redacted_draft(self) -> None:
         self.raw_secret_detected = True
@@ -1062,6 +1141,7 @@ class RequestPolicy:
             "raw_secret_safety_failure_kind": self.raw_secret_safety_failure_kind,
             "raw_secret_safety_citation_count": self.raw_secret_safety_citation_count,
             "raw_secret_safety_exonerated_citation_count": self.raw_secret_safety_exonerated_citation_count,
+            "named_login_not_found": self.named_login_not_found,
             "raw_secret_safety_latency_ms": round(self.raw_secret_safety_latency_ms, 3),
             "classifier_status": self.classifier_status,
             "classifier_failure_kind": self.classifier_failure_kind,
@@ -4313,14 +4393,12 @@ async def _seed_prior_approved_credentials(
     for record in StructuredContext.from_json_str(global_llm_context).approved_credentials:
         if record.credential_id in approved_ids and record.admitted_url:
             policy.live_page_admitted_urls.setdefault(record.credential_id, record.admitted_url)
+            policy.carried_credential_urls.setdefault(record.credential_id, record.admitted_url)
             policy.seeded_proposal_credential_ids.add(record.credential_id)
     missing_ids = sorted(approved_ids - {credential.credential_id for credential in policy.resolved_credentials})
     if not missing_ids:
         return
-    credentials = await app.DATABASE.credentials.get_credentials_by_ids(
-        missing_ids,
-        organization_id=organization_id,
-    )
+    credentials = await _load_credentials(organization_id, credential_ids=missing_ids)
     policy.resolved_credentials = _deduplicate_credentials(
         [
             *policy.resolved_credentials,
@@ -4345,10 +4423,7 @@ async def _seed_proposed_credential(
     seed = _proposed_credential_seed(global_llm_context)
     if seed is None:
         return
-    credentials = await app.DATABASE.credentials.get_credentials_by_ids(
-        [seed.credential_id],
-        organization_id=organization_id,
-    )
+    credentials = await _load_credentials(organization_id, credential_ids=[seed.credential_id])
     credential = next((item for item in credentials if item.credential_id == seed.credential_id), None)
     if credential is None:
         return
@@ -4356,6 +4431,7 @@ async def _seed_proposed_credential(
     # Restoring the recorded origin keeps the hydrated id page-vouched, so the turn-end recorder
     # still skips it rather than promoting a one-turn carry to durable approval.
     policy.live_page_admitted_urls.setdefault(seed.credential_id, seed.admitted_url)
+    policy.carried_credential_urls.setdefault(seed.credential_id, seed.admitted_url)
     policy.seeded_proposal_credential_ids.add(seed.credential_id)
     # The server bound this and the user did not name it, so it enters through the auto-bound record:
     # a write to current_turn_named_credential_ids would refuse the user's own later answer.
@@ -4400,7 +4476,7 @@ def live_page_credentials_admissible(policy: RequestPolicy) -> bool:
     Callers that must pay for evidence — a browser read, a credential load — check this first so a
     turn that could never admit does not buy the evidence to decide it.
     """
-    return not policy.raw_secret_detected
+    return not policy.raw_secret_detected and not policy.named_login_not_found
 
 
 def _live_page_url_abstains(
@@ -4444,8 +4520,13 @@ async def _resolve_live_page_credentials(
     """Ask the live page which saved credentials it vouches for, or None when a precondition declines."""
     if not live_page_credentials_admissible(policy) or not page_url:
         return None
+    credentials = await (load_org_credentials() if load_org_credentials else _load_credentials(organization_id))
+    # Tool calls in one model response run concurrently, so a lookup can close page binding while this
+    # load is awaited. Callers record the admission without another await, so re-read it here.
+    if not live_page_credentials_admissible(policy):
+        return None
     return resolve_by_url(
-        await (load_org_credentials() if load_org_credentials else _load_credentials(organization_id)),
+        credentials,
         [page_url],
         # The scout reached this page, so its own path is the evidence; a bare host match would let
         # any other page on that host — a profile, an upload, a user-content route — claim the login.
@@ -4746,6 +4827,8 @@ async def _build_request_policy_bootstrap(
     }
     google_connection_candidates |= _prior_approved_connection_ids(global_llm_context)
     policy.selected_connected_account_id = None
+    policy.picked_connected_account_id = None
+    policy.picked_connected_account_scopes = []
     if google_connection_candidates or selected_connected_account_id is not None:
         try:
             active_connections = await google_oauth_service.get_credentials_for_org(organization_id)
@@ -4766,13 +4849,16 @@ async def _build_request_policy_bootstrap(
                     if connection.id == selected_connected_account_id
                     and connection.organization_id == organization_id
                     and connection.state == STATE_ACTIVE
-                    and google_oauth_service.GOOGLE_SHEETS_DATA_SCOPE in connection.scopes_granted
+                    and not _SELECTABLE_GOOGLE_DATA_SCOPES.isdisjoint(connection.scopes_granted)
                 ),
                 None,
             )
             if selected is not None:
-                policy.selected_connected_account_id = selected.id
-                google_connection_candidates.add(selected.id)
+                policy.picked_connected_account_id = selected.id
+                policy.picked_connected_account_scopes = list(selected.scopes_granted)
+                if google_oauth_service.GOOGLE_SHEETS_DATA_SCOPE in selected.scopes_granted:
+                    policy.selected_connected_account_id = selected.id
+                    google_connection_candidates.add(selected.id)
             policy.run_approved_google_connection_ids = sorted(google_connection_candidates & active_ids)
     _ground_user_provided_sites(policy, user_message, prior_user_messages or chat_history)
     try:
@@ -4862,7 +4948,7 @@ async def build_request_policy_trust_floor(
     selected_connected_account_id: str | None = None,
 ) -> RequestPolicy:
     del config
-    safety = await _screen_raw_secret_safety(user_message, handler, organization_id=organization_id)
+    safety = await screen_raw_secret_safety(user_message, handler, organization_id=organization_id)
     credential_ids = _credential_ids(user_message)
     raw_secret_present = safety.status == "detected"
     # Only an unavailable screen withholds the turn. A screen that ran and cited redacts what it

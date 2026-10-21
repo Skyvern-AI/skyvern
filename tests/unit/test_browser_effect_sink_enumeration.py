@@ -22,16 +22,16 @@ _DISCOVERED_BROWSER_API_CALLS = {
         {
             "bring_to_front": 2,
             "check": 2,
-            # 26 = 25 prior + the download-recovery retry's bounded actionability wait before its bounded real click.
-            "click": 26,
+            "click": 24,
             "clear": 6,
             # 6 = 5 prior + the bounded v4 FileDownloadBlock synchronous popup close (SKY-15371).
             "close": 6,
             "dblclick": 2,
-            # 16 = 15 prior + the held-autocomplete declared-list rows read after input_text (SKY-17867).
-            "evaluate": 16,
+            # 18 = 16 prior + the read-only Flutter text-field probe and two-frame wait around a credential write.
+            "evaluate": 18,
             "fill": 2,
-            "focus": 4,
+            # 5 = 4 prior + the focus that lets a Flutter text field start editing before a credential write.
+            "focus": 5,
             "go_back": 1,
             "go_forward": 1,
             "goto": 2,
@@ -55,7 +55,7 @@ _DISCOVERED_BROWSER_API_CALLS = {
         {"dispatch_event": 1, "down": 3, "evaluate": 1, "fill": 3, "press": 1, "up": 3}
     ),
     "skyvern/webeye/dialog_handler.py": Counter({"accept": 3, "dismiss": 1}),
-    "skyvern/webeye/dom_inspection.py": Counter({"evaluate": 6}),
+    "skyvern/webeye/dom_inspection.py": Counter({"evaluate": 7}),
     "skyvern/webeye/utils/dom.py": Counter(
         {
             "check": 2,
@@ -80,6 +80,7 @@ _DISCOVERED_BROWSER_API_CALLS = {
             "click": 4,
             # A grid cell whose editor opens on a double-click (SKY-17868): one by selector, one by locator.
             "dblclick": 2,
+            "drag_and_drop": 1,
             "evaluate": 1,
             "fill": 3,
             "focus": 2,
@@ -129,6 +130,9 @@ _EVALUATE_CALLERS = {
             "_inner": 1,
             # read-only declared-list rows probe after input_text into a held autocomplete (SKY-17867)
             "_held_value_lost_to_unmatched_text": 1,
+            # read-only Flutter text-field probe and two-frame wait around a credential write and its read-back
+            "_is_flutter_text_field": 1,
+            "_two_frames_passed": 1,
             "_normal_select_readback_contradicts": 1,
             "_probe_tel_browser_validity": 1,
             "handle_click_action": 2,
@@ -140,6 +144,8 @@ _EVALUATE_CALLERS = {
             "read_current_url": 1,
             # locator-scoped live selected/checked read for the cached click guard (SKY-14051)
             "read_locator_selected_state": 1,
+            # read-only static-listbox option snapshot read (pre-click classification)
+            "read_static_listbox_option_snapshot": 1,
             # locator-scoped live isContentEditable read; routes blocks nested in an editing host to the atomic fill
             "read_locator_is_content_editable": 1,
             "read_locator_tag_name": 1,
@@ -265,21 +271,21 @@ def test_discovered_browser_api_lower_bound_is_stable() -> None:
     }
 
     assert observed == _DISCOVERED_BROWSER_API_CALLS
-    assert sum(sum(methods.values()) for methods in observed.values()) == 210
+    assert sum(sum(methods.values()) for methods in observed.values()) == 213
     handler_candidates = _candidate_signatures("skyvern/webeye/actions/handler.py", _CANDIDATE_METHODS)
     classified_non_browser = Counter(
         {signature: count for signature, count in handler_candidates.items() if signature in _NON_BROWSER_CANDIDATES}
     )
     assert classified_non_browser == _NON_BROWSER_CANDIDATES
     assert sum(_NON_BROWSER_CANDIDATES.values()) == 7
-    assert sum(sum(methods.values()) for methods in observed.values()) - sum(_NON_BROWSER_CANDIDATES.values()) == 203
+    assert sum(sum(methods.values()) for methods in observed.values()) - sum(_NON_BROWSER_CANDIDATES.values()) == 206
 
 
 def test_every_raw_evaluate_call_is_classified() -> None:
     observed = {path: callers for path in _owned_source_paths() if (callers := _callers_for_method(path, "evaluate"))}
 
     assert observed == _EVALUATE_CALLERS
-    assert sum(sum(callers.values()) for callers in observed.values()) == 39
+    assert sum(sum(callers.values()) for callers in observed.values()) == 42
 
 
 def test_every_cdp_dispatch_is_classified_by_exact_command() -> None:

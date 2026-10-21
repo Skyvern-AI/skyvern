@@ -5,11 +5,14 @@ from __future__ import annotations
 import time
 from collections.abc import Iterator
 from contextlib import contextmanager
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Literal
 
 if TYPE_CHECKING:
     from skyvern.forge.sdk.copilot.context import CopilotContext
+
+# A charged wait can spend the turn; the backstop then waits this long so the tool returns and the turn winds down.
+CHARGED_WAIT_BACKSTOP_GRACE_SECONDS = 30.0
 
 
 @dataclass
@@ -18,34 +21,61 @@ class HumanInputWait:
     started_at: float = 0.0
     deadline_when: float | None = None
     owner: Literal["question", "credential"] = "question"
+    # When each wait a person answered or worked on was open, in the current overlapping union.
+    attended_spans: list[tuple[float, float]] = field(default_factory=list)
+    # Set once the backstop needed its grace: the turn is past its budget, so later waits no longer pause it.
+    grace_used: bool = False
+
+
+@dataclass
+class HumanInputWaiter:
+    started_at: float
+    # Set by a card that ended with nobody answering it or signing in on it; such a wait counts against the turn.
+    unattended: bool = False
+
+
+def _covered_seconds(spans: list[tuple[float, float]]) -> float:
+    covered, reach = 0.0, float("-inf")
+    for start, end in sorted(spans):
+        if end > reach:
+            covered += end - max(start, reach)
+            reach = end
+    return covered
 
 
 @contextmanager
-def pause_human_input(ctx: CopilotContext, kind: Literal["question", "credential"]) -> Iterator[None]:
-    """Pause the deadline until the last overlapping wait ends; credit their union once."""
+def pause_human_input(ctx: CopilotContext, kind: Literal["question", "credential"]) -> Iterator[HumanInputWaiter]:
+    """Pause the deadline until the last overlapping wait ends, then credit only the time a person was attending."""
     wait = ctx.human_input_wait
+    waiter = HumanInputWaiter(started_at=time.monotonic())
     if wait.count == 0:
-        wait.started_at = time.monotonic()
+        wait.started_at = waiter.started_at
         wait.owner = kind
+        wait.attended_spans = []
         deadline = ctx.model_stream_deadline
-        wait.deadline_when = deadline.when() if deadline is not None else None
+        wait.deadline_when = deadline.when() if deadline is not None and not wait.grace_used else None
         if deadline is not None and wait.deadline_when is not None:
             deadline.reschedule(None)
     wait.count += 1
     try:
-        yield
+        yield waiter
     finally:
+        now = time.monotonic()
+        if not waiter.unattended:
+            wait.attended_spans.append((waiter.started_at, now))
         wait.count -= 1
         if wait.count == 0:
-            elapsed = time.monotonic() - wait.started_at
+            elapsed = _covered_seconds(wait.attended_spans)
             if wait.owner == "question":
                 ctx.copilot_question_pause_seconds += elapsed
-            else:
+            elif wait.owner == "credential":
                 ctx.copilot_credential_pause_seconds += elapsed
             deadline = ctx.model_stream_deadline
             if deadline is not None and wait.deadline_when is not None and not deadline.expired():
+                resumed_at = wait.deadline_when + elapsed
+                wait.grace_used = resumed_at < now + CHARGED_WAIT_BACKSTOP_GRACE_SECONDS
                 try:
-                    deadline.reschedule(wait.deadline_when + elapsed)
+                    deadline.reschedule(max(resumed_at, now + CHARGED_WAIT_BACKSTOP_GRACE_SECONDS))
                 except RuntimeError:
                     # The owning timeout may already have exited during cancellation.
                     pass

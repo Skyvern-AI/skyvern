@@ -39,6 +39,7 @@ _BROWSER_SESSION_TOOL_NAMES = frozenset(
         "console_messages",
         "select_option",
         "press_key",
+        "drag",
         "wait_for_either_state",
         "skyvern_frame_list",
         "skyvern_frame_switch",
@@ -76,9 +77,13 @@ def _result_text_values(value: Any) -> list[str]:
     return []
 
 
-def _result_text_without_page_state(output: dict[str, Any]) -> str:
-    # The top-level page_state carries the page's own title, and a page can title itself anything.
-    return " ".join(_result_text_values({key: item for key, item in output.items() if key != "page_state"}))
+PAGE_REQUEST_FAILURES_KEY = "page_request_failures"
+PAGE_FACT_KEYS = frozenset({"page_state", PAGE_REQUEST_FAILURES_KEY})
+
+
+def _result_text_without_page_facts(output: dict[str, Any]) -> str:
+    # These top-level keys carry the page's own title and request URLs, and a page can name them anything.
+    return " ".join(_result_text_values({key: item for key, item in output.items() if key not in PAGE_FACT_KEYS}))
 
 
 def _unrecoverable_tool_error_reason(output: dict[str, Any]) -> str:
@@ -87,7 +92,7 @@ def _unrecoverable_tool_error_reason(output: dict[str, Any]) -> str:
         data = output.get("data")
         raw_reason = data.get("failure_reason") if isinstance(data, dict) else None
     if not isinstance(raw_reason, str) or not raw_reason.strip():
-        raw_reason = _result_text_without_page_state(output)
+        raw_reason = _result_text_without_page_facts(output)
     reason = " ".join(str(raw_reason or "Browser session was no longer reachable.").split())
     reason = redact_browser_session_references(reason)
     return reason[:240].rstrip()
@@ -100,7 +105,7 @@ def _is_unrecoverable_browser_session_error(tool_name: str, output: dict[str, An
     # neither "not found" nor a status, and the same dead browser must count whichever tool met it.
     if output.get("error_code") == BROWSER_SESSION_UNAVAILABLE_ERROR_CODE:
         return True
-    lowered = _result_text_without_page_state(output).lower()
+    lowered = _result_text_without_page_facts(output).lower()
     if "no browser context" in lowered:
         return True
     has_session_signal = "browser session" in lowered or "browser context" in lowered

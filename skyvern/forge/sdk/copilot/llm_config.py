@@ -6,6 +6,7 @@ import structlog
 
 from skyvern.forge import app
 from skyvern.forge.sdk.api.llm.api_handler import LLMAPIHandler
+from skyvern.forge.sdk.copilot.eval_llm_overrides import eval_llm_override_handler
 from skyvern.forge.sdk.experimentation.llm_prompt_config import get_llm_handler_for_prompt_type
 
 LOG = structlog.get_logger()
@@ -59,6 +60,9 @@ def get_raw_secret_safety_handler() -> LLMAPIHandler | None:
 
 
 async def resolve_main_copilot_handler(workflow_permanent_id: str | None, organization_id: str | None) -> Any | None:
+    override = eval_llm_override_handler(WORKFLOW_COPILOT_PROMPT_TYPE, workflow_permanent_id, organization_id)
+    if override is not None:
+        return override
     if workflow_permanent_id and organization_id:
         try:
             posthog_handler = await get_llm_handler_for_prompt_type(
@@ -75,6 +79,9 @@ async def resolve_main_copilot_handler(workflow_permanent_id: str | None, organi
 async def resolve_workflow_copilot_handler(
     workflow_permanent_id: str | None, organization_id: str | None
 ) -> Any | None:
+    override = eval_llm_override_handler(WORKFLOW_COPILOT_PROMPT_TYPE, workflow_permanent_id, organization_id)
+    if override is not None:
+        return override
     if workflow_permanent_id and organization_id:
         try:
             posthog_handler = await get_llm_handler_for_prompt_type(
@@ -89,6 +96,9 @@ async def resolve_workflow_copilot_handler(
 
 
 async def resolve_fast_copilot_handler(workflow_permanent_id: str | None, organization_id: str | None) -> Any | None:
+    override = eval_llm_override_handler(WORKFLOW_COPILOT_FAST_PROMPT_TYPE, workflow_permanent_id, organization_id)
+    if override is not None:
+        return override
     if workflow_permanent_id and organization_id:
         try:
             posthog_handler = await get_llm_handler_for_prompt_type(
@@ -106,6 +116,11 @@ async def resolve_raw_secret_safety_handler(
     workflow_permanent_id: str | None,
     organization_id: str | None,
 ) -> LLMAPIHandler | None:
+    override = eval_llm_override_handler(
+        WORKFLOW_COPILOT_RAW_SECRET_SAFETY_PROMPT_TYPE, workflow_permanent_id, organization_id
+    )
+    if override is not None:
+        return override
     if workflow_permanent_id and organization_id:
         try:
             posthog_handler = await get_llm_handler_for_prompt_type(

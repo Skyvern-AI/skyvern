@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import sys
 import time
 from collections.abc import AsyncIterator, Callable, Sequence
 from dataclasses import dataclass
@@ -35,6 +36,7 @@ from agents import (
 from agents.exceptions import (
     InputGuardrailTripwireTriggered,
     MaxTurnsExceeded,
+    ModelBehaviorError,
     OutputGuardrailTripwireTriggered,
 )
 from agents.items import ToolCallItem
@@ -96,7 +98,13 @@ from skyvern.forge.sdk.copilot.composition_evidence import (
     parse_composition_structured,
 )
 from skyvern.forge.sdk.copilot.config import BlockAuthoringPolicy, CopilotConfig
-from skyvern.forge.sdk.copilot.context import AgentResult, CodeAuthoringRepairContext, CopilotContext
+from skyvern.forge.sdk.copilot.context import (
+    EDIT_BLOCK_TOOL_NAME,
+    UPDATE_AND_RUN_BLOCKS_TOOL_NAME,
+    AgentResult,
+    CodeAuthoringRepairContext,
+    CopilotContext,
+)
 from skyvern.forge.sdk.copilot.diagnosis_repair_contract import (
     DiagnosisFailureType,
     DiagnosisInput,
@@ -146,10 +154,6 @@ from skyvern.forge.sdk.copilot.runtime_authoring_repair import REPAIR_INSTRUCTIO
 from skyvern.forge.sdk.copilot.tools import _record_run_blocks_result, _run_blocks_and_collect_debug
 from skyvern.forge.sdk.copilot.tools import credentials as credentials_module
 from skyvern.forge.sdk.copilot.tools import run_execution as run_execution_module
-from skyvern.forge.sdk.copilot.tools._shared import (
-    EDIT_BLOCK_TOOL_NAME,
-    UPDATE_AND_RUN_BLOCKS_TOOL_NAME,
-)
 from skyvern.forge.sdk.copilot.tools.completion import (
     _authored_output_contract_criteria,
     _completion_verification_criteria,
@@ -194,10 +198,9 @@ from skyvern.webeye.actions.action_types import ActionType
 from skyvern.webeye.actions.actions import Action, ActionStatus
 from tests.unit._copilot_workflow_fakes import fake_workflow
 from tests.unit.copilot_route_test_support import narrative_payload_with_run
-from tests.unit.copilot_test_helpers import failed_second_factor_run
 from tests.unit.copilot_test_helpers import make_copilot_ctx as _ctx
 from tests.unit.copilot_test_helpers import make_verified_goal_contract as _verified_goal_contract
-from tests.unit.copilot_test_helpers import origin_run_input, passing_run, stub_copilot_agent_loop, two_page_login_yaml
+from tests.unit.copilot_test_helpers import origin_run_input, passing_run, stub_copilot_agent_loop
 
 
 def test_build_user_context_preserves_structured_evidence_after_redacting_secret() -> None:
@@ -577,6 +580,30 @@ async def test_interrupted_draft_turn_restoration_and_run_hydration_stay_coheren
 
 
 @pytest.mark.asyncio
+async def test_a_turn_without_the_agents_sdk_keeps_the_prior_receipts(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setitem(sys.modules, "agents", None)
+
+    result = await agent_module.run_copilot_agent(
+        stream=MagicMock(),
+        organization_id="org-1",
+        chat_request=WorkflowCopilotChatRequest(
+            message="continue",
+            workflow_id="wf-1",
+            workflow_permanent_id="wfp-1",
+            workflow_copilot_chat_id="chat-1",
+            workflow_yaml="title: Canonical\n",
+        ),
+        chat_history=[],
+        global_llm_context=None,
+        llm_api_handler=None,
+        prior_executed_block_fingerprints={"sign_in": {"version_a"}},
+    )
+
+    assert "OpenAI Agents SDK" in result.user_response
+    assert result.executed_block_fingerprints == {"sign_in": {"version_a"}}
+
+
+@pytest.mark.asyncio
 async def test_a_plain_continuation_names_reusable_origin_inputs_before_any_run(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -624,6 +651,43 @@ async def test_a_plain_continuation_names_reusable_origin_inputs_before_any_run(
     assert build_context.call_args.kwargs["debug_run_info_text"] == (
         '{"reusable_origin_inputs":{"workflow_run_id":"wr_recorded","input_keys":["resume"]}}'
     )
+
+
+@pytest.mark.asyncio
+async def test_demonstrate_product_action_triggers_replay(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(agent_module, "restore_pending_workflow_proposal", AsyncMock(return_value=None))
+    monkeypatch.setattr(agent_module, "seed_repair_origin_run", AsyncMock(return_value=SimpleNamespace(finished=True)))
+    monkeypatch.setattr(agent_module, "hydrate_prior_run_packet", AsyncMock(return_value=None))
+    replay = AsyncMock(return_value=[])
+    monkeypatch.setattr(agent_module, "replay_demonstration", replay)
+    stub_copilot_agent_loop(
+        monkeypatch, AsyncMock(return_value=_fake_run_result({"type": "REPLY", "user_response": "ok"}))
+    )
+
+    result = await agent_module.run_copilot_agent(
+        stream=MagicMock(),
+        organization_id="org-1",
+        chat_request=WorkflowCopilotChatRequest(
+            message="I've shown you the task in the browser. Build a workflow that does it.",
+            workflow_id="wf-1",
+            workflow_permanent_id="wfp-1",
+            workflow_copilot_chat_id="chat-1",
+            workflow_yaml="",
+            product_action="demonstrate",
+            demonstration_id="demo-1",
+        ),
+        chat_history=[],
+        global_llm_context=None,
+        llm_api_handler=SimpleNamespace(llm_key="PRIMARY"),
+        raw_secret_safety_handler=AsyncMock(
+            return_value={"version": "1", "state": "clean", "handling": "none", "citations": []}
+        ),
+        api_key="sk-test",
+        config=CopilotConfig(),
+    )
+
+    assert result.user_response == "ok"
+    replay.assert_awaited_once()
 
 
 class TestFailedTestResponseNormalization:
@@ -971,8 +1035,8 @@ workflow_definition:
 
         rewritten = _rewrite_failed_test_response("Done.", ctx)
 
-        assert "pasted secret redacted" in rewritten
-        assert "Store the secret as a saved credential" in rewritten
+        assert "pasted" not in rewritten
+        assert "saved credential" in rewritten
         assert "not been verified end-to-end" in rewritten
 
     def test_rewrite_names_the_card_connected_credential_on_a_redacted_secret_draft(self) -> None:
@@ -2366,6 +2430,11 @@ def _fake_run_result(payload: dict) -> SimpleNamespace:
     return SimpleNamespace(final_output=json.dumps(payload), new_items=[])
 
 
+def _tool_call_item() -> ToolCallItem:
+    call = ResponseFunctionToolCall(type="function_call", name="navigate_browser", call_id="call_1", arguments="{}")
+    return ToolCallItem(agent=MagicMock(), raw_item=call)
+
+
 def _stage_proposal(staged_workflow: MagicMock) -> Callable[[CopilotContext], None]:
     staged_yaml = "workflow_definition:\n  parameters: []\n  blocks: []"
 
@@ -2436,9 +2505,7 @@ async def _run_tool_bearing_empty_completion_turn(
             during_attempt(ctx)
         if attempt.error is not None:
             raise attempt.error
-        return SimpleNamespace(
-            final_output="", new_items=[MagicMock(spec=ToolCallItem)] if attempt.returns_tool_call else []
-        )
+        return SimpleNamespace(final_output="", new_items=[_tool_call_item()] if attempt.returns_tool_call else [])
 
     real_run_streamed_with_deadline = enforcement_module._run_streamed_with_deadline
 
@@ -2451,6 +2518,8 @@ async def _run_tool_bearing_empty_completion_turn(
         runner_kwargs: dict[str, Any],
         start_time: float,
         iteration: int,
+        *,
+        min_remaining_seconds: float | None = None,
     ) -> RunResultStreaming | SimpleNamespace:
         drain_calls.append(
             _DrainCall(
@@ -2464,7 +2533,15 @@ async def _run_tool_bearing_empty_completion_turn(
         )
         if drain_outcome is None:
             return await real_run_streamed_with_deadline(
-                agent, current_input, ctx, session, stream, runner_kwargs, start_time, iteration
+                agent,
+                current_input,
+                ctx,
+                session,
+                stream,
+                runner_kwargs,
+                start_time,
+                iteration,
+                min_remaining_seconds=min_remaining_seconds,
             )
         if isinstance(drain_outcome, BaseException):
             raise drain_outcome
@@ -3051,6 +3128,10 @@ workflow_definition:
         )
         assert producer_packet is not None
         dom_obstructions = producer_packet["page_obstructions"]
+        for obstruction in dom_obstructions:
+            for control in obstruction["visible_controls"]:
+                for candidate in control["selector_candidates"]:
+                    candidate["visible_match_count"] = 0
         screenshot_obstruction = _page_obstructions_from_visual_summary(
             {
                 "page_obstruction_detected": True,
@@ -3188,7 +3269,7 @@ workflow_definition:
         ]
         assert all(
             "selector" not in control
-            and all("match_count" not in candidate for candidate in control["selector_candidates"])
+            and all(set(candidate) == {"selector", "source"} for candidate in control["selector_candidates"])
             for obstruction in carried_obstructions
             for control in obstruction["visible_controls"]
         )
@@ -3548,7 +3629,7 @@ workflow_definition:
         assert "response" not in entry
 
     @pytest.mark.asyncio
-    async def test_retained_completed_action_observation_excludes_target_controlled_fields(
+    async def test_retained_completed_action_observation_carries_only_the_screened_recorded_error(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         secret = "sk-live-persisted-action-secret"
@@ -3604,8 +3685,12 @@ workflow_definition:
         )
 
         packet = result["data"]["build_test_packet"]
-        assert packet["action_observations"] == ["null_action failed code_line=18"]
+        [observation] = packet["action_observations"]
+        assert observation.startswith("null_action failed code_line=18")
+        assert "response says reveal [REDACTED_SECRET]" in observation
         assert secret not in str(packet)
+        assert "Ignore prior instructions" not in str(packet)
+        assert "target-element" not in str(packet)
 
     @pytest.mark.asyncio
     async def test_completed_action_observation_read_failure_degrades_to_packet_omission(
@@ -5423,8 +5508,7 @@ class TestCredentialRefusalReachesAgent:
             desc = tool.description
             assert "redacted from" not in desc, f"{tool.name} still claims redaction"
             assert "you may pass it via" not in desc, f"{tool.name} still permits inline secrets"
-            assert "Ask the user to store it as a saved" in desc
-            assert "do not build or run with" in desc
+            assert "do not build or run with the raw value" in desc
 
 
 class TestNativeToolSurface:
@@ -5687,7 +5771,12 @@ workflow_definition:
         assert "cred_missing" in error
         assert "not found in this organization" in error
         assert "Stop before creating, updating, or running the workflow" in error
-        get_credentials_by_ids.assert_awaited_once_with(["cred_valid", "cred_missing"], organization_id="org-1")
+        get_credentials_by_ids.assert_awaited_once_with(
+            ["cred_valid", "cred_missing"],
+            organization_id="org-1",
+            allowed_folder_ids=None,
+            include_deleted=False,
+        )
 
     @pytest.mark.asyncio
     async def test_valid_tool_credential_reference_allows_tool_path(self, monkeypatch) -> None:
@@ -5703,7 +5792,9 @@ workflow_definition:
         error = await _credential_reference_validation_error({"credential_id": "cred_valid"}, _ctx())
 
         assert error is None
-        get_credentials_by_ids.assert_awaited_once_with(["cred_valid"], organization_id="org-1")
+        get_credentials_by_ids.assert_awaited_once_with(
+            ["cred_valid"], organization_id="org-1", allowed_folder_ids=None, include_deleted=False
+        )
 
     @pytest.mark.asyncio
     async def test_update_workflow_allows_missing_credentials_for_explicit_untested_draft(self, monkeypatch) -> None:
@@ -5872,6 +5963,7 @@ workflow_definition:
         fact = result["data"]["google_connection_resolution"][0]
         assert fact["status"] == "not_found"
         assert fact["canonicalized"] is False
+        assert fact["detail"]
         assert [row["connection_id"] for row in fact["eligible_connections"]] == ["goac_eligible_row"]
         assert "Quarterly Revenue Connection" in process_workflow_yaml.await_args.kwargs["workflow_yaml"]
         assert "Quarterly Revenue Connection" in ctx.staged_workflow_yaml
@@ -6351,7 +6443,9 @@ class TestRunBlocksCredentialApproval:
 
         assert result["ok"] is False
         assert result["error"] == "Organization not found"
-        database.credentials.get_credentials_by_ids.assert_awaited_once_with(["cred_resolved"], organization_id="org-1")
+        database.credentials.get_credentials_by_ids.assert_awaited_once_with(
+            ["cred_resolved"], organization_id="org-1", allowed_folder_ids=None, include_deleted=False
+        )
         database.organizations.get_organization.assert_awaited_once_with(organization_id="org-1")
 
     @pytest.mark.asyncio
@@ -6944,7 +7038,7 @@ class TestRunBlocksCredentialApprovalFrontierScope:
         assert "unapproved_credential_reference" not in (result.get("error") or "")
         assert result["error"] == "Organization not found"
         database.credentials.get_credentials_by_ids.assert_awaited_once_with(
-            [self.CREDENTIAL_ID], organization_id="org-1"
+            [self.CREDENTIAL_ID], organization_id="org-1", allowed_folder_ids=None, include_deleted=False
         )
 
     @pytest.mark.asyncio
@@ -7086,7 +7180,7 @@ class TestRunBlocksCredentialApprovalFrontierScope:
         assert "not found in this organization" in result["error"]
         assert self.CREDENTIAL_ID in result["error"]
         database.credentials.get_credentials_by_ids.assert_awaited_once_with(
-            [self.CREDENTIAL_ID], organization_id="org-1"
+            [self.CREDENTIAL_ID], organization_id="org-1", allowed_folder_ids=None, include_deleted=False
         )
 
 
@@ -7258,7 +7352,7 @@ class TestCopilotConfig:
             stop_metadata=agent_module.CopilotModelStopMetadata.unknown(),
         )
         tool_bearing = agent_module._empty_completion_error(
-            SimpleNamespace(final_output="", new_items=[MagicMock(spec=ToolCallItem)]),
+            SimpleNamespace(final_output="", new_items=[_tool_call_item()]),
             ctx=ctx,
             tool_call_count_start=0,
             llm_key="PRIMARY",
@@ -7381,7 +7475,7 @@ class TestCopilotConfig:
             ("SECONDARY", "SECONDARY", _EnforcementAttempt(runs_tool=False, returns_tool_call=True)),
         ],
     )
-    async def test_tool_bearing_empty_completion_gets_one_tool_less_final_reply(
+    async def test_tool_bearing_empty_completion_gets_one_final_reply_call(
         self,
         monkeypatch: pytest.MonkeyPatch,
         fallback_llm_key: str | None,
@@ -7402,7 +7496,7 @@ class TestCopilotConfig:
         assert isinstance(call.current_input, str)
         assert call.current_input.startswith(NUDGE_SENTINEL)
         assert call.max_turns == 1
-        assert call.model_settings.tool_choice == "none"
+        assert call.model_settings.tool_choice is None
         assert call.model_settings.temperature == 0.1
         assert len(call.agent.tools) > 0
         assert isinstance(call.hooks, FinalReplyRunHooks)
@@ -7469,7 +7563,7 @@ class TestCopilotConfig:
         [
             pytest.param(SimpleNamespace(final_output="", new_items=[]), id="empty"),
             pytest.param(_fake_run_result({"type": "REPLY", "user_response": "  "}), id="blank_user_response"),
-            pytest.param(RuntimeError("provider rejected tool_choice"), id="failed"),
+            pytest.param(RuntimeError("provider rejected the request"), id="failed"),
             pytest.param(FinalReplyToolRefusedError("navigate_browser"), id="tool_refused"),
         ],
     )
@@ -7527,6 +7621,167 @@ class TestCopilotConfig:
         assert blocked.result is blocked_result
 
     @staticmethod
+    def _hit_hard_backstop(ctx: CopilotContext) -> None:
+        ctx.tool_activity.append({"tool": "update_and_run_blocks", "summary": "run still going"})
+        ctx.run_outcome_trace.append(interim_run_start_outcome("wr_left"))
+        ctx.open_step_run_ids.append("wr_left")
+        ctx.budget_expiry_state.hard_backstop_reached = True
+        enforcement_module._mark_copilot_total_timeout(ctx, elapsed_seconds=990.0, iteration=3)
+
+    @staticmethod
+    def _exhaust_budget_drain(ctx: CopilotContext) -> None:
+        ctx.tool_activity.append({"tool": "click", "summary": "clicked"})
+        enforcement_module._mark_budget_expiry(ctx, "deadline")
+        ctx.budget_expiry_state.begin_drain()
+        ctx.budget_expiry_state.drain_active = False
+
+    @staticmethod
+    def _record_run_still_going(monkeypatch: pytest.MonkeyPatch) -> None:
+        now = datetime.now(timezone.utc)
+        monkeypatch.setattr(
+            forge_app.DATABASE.workflow_runs,
+            "get_workflow_run",
+            AsyncMock(return_value=SimpleNamespace(status="running", failure_reason=None)),
+        )
+        monkeypatch.setattr(
+            forge_app.DATABASE.observer,
+            "get_workflow_run_blocks",
+            AsyncMock(
+                return_value=[
+                    WorkflowRunBlock(
+                        workflow_run_block_id=f"wrb_{label}",
+                        workflow_run_id="wr_left",
+                        organization_id="org-1",
+                        label=label,
+                        block_type=BlockType.CODE,
+                        status=status,
+                        created_at=now,
+                        modified_at=now,
+                    )
+                    # The repository returns rows newest first.
+                    for label, status in (("download_invoice", "running"), ("sign_in", "completed"))
+                ]
+            ),
+        )
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ("error", "expire", "stopped_waiting", "runs_not_in_history"),
+        [
+            pytest.param(
+                CopilotTotalTimeoutError(),
+                _hit_hard_backstop,
+                True,
+                [
+                    {
+                        "workflow_run_id": "wr_left",
+                        "status": "running",
+                        "failure_reason": None,
+                        "blocks": [
+                            {"label": "sign_in", "status": "completed", "failure_reason": None},
+                            {"label": "download_invoice", "status": "running", "failure_reason": None},
+                        ],
+                        "earlier_blocks_not_shown": 0,
+                        "left_running": False,
+                    }
+                ],
+                id="hard_backstop",
+            ),
+            pytest.param(MaxTurnsExceeded("drain"), _exhaust_budget_drain, False, [], id="drain_exhausted"),
+        ],
+    )
+    async def test_budget_expiry_without_a_report_gets_one_final_reply_from_the_recorded_runs(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        error: BaseException,
+        expire: Callable[[CopilotContext], None],
+        stopped_waiting: bool,
+        runs_not_in_history: list[dict[str, Any]],
+    ) -> None:
+        report = "I saved the login draft. Its test run signed in and is still downloading the invoice."
+        staged_workflow = MagicMock(workflow_id="w_draft")
+        stage = _stage_proposal(staged_workflow)
+        self._record_run_still_going(monkeypatch)
+
+        def stage_then_expire(ctx: CopilotContext) -> None:
+            stage(ctx)
+            expire(ctx)
+
+        run = await _run_tool_bearing_empty_completion_turn(
+            monkeypatch,
+            _fake_run_result({"type": "REPLY", "user_response": report}),
+            attempts=(_EnforcementAttempt(error=error),),
+            during_attempt=stage_then_expire,
+        )
+
+        [call] = run.drain_calls
+        assert isinstance(call.current_input, str)
+        observation = json.loads(call.current_input.removeprefix(NUDGE_SENTINEL))
+        assert observation["budget_expired"] is True
+        assert observation["staged_draft"] == "w_draft"
+        assert observation["stopped_waiting"] is stopped_waiting
+        assert observation["runs_not_in_history"] == runs_not_in_history
+        assert call.model_settings.tool_choice is None
+        assert call.max_turns == 1
+        assert run.result.user_response == report
+        assert run.result.staged_workflow is staged_workflow
+        outcome = run.result.turn_outcome
+        assert outcome is not None
+        assert outcome.terminal_reason == "timeout"
+        assert outcome.budget_expired is True
+        assert outcome.budget_expiry_report_produced is True
+        assert run.result.narrative_payload is not None
+        assert run.result.narrative_payload["budgetExpiry"]["reportProduced"] is True
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "reply_outcome",
+        [
+            pytest.param(SimpleNamespace(final_output="", new_items=[]), id="empty"),
+            pytest.param(RuntimeError("provider unavailable"), id="failed"),
+            pytest.param(CopilotTotalTimeoutError(), id="reply_timed_out"),
+        ],
+    )
+    async def test_budget_expiry_reply_that_fails_keeps_the_typed_no_report_fact(
+        self, monkeypatch: pytest.MonkeyPatch, reply_outcome: SimpleNamespace | BaseException
+    ) -> None:
+        self._record_run_still_going(monkeypatch)
+        run = await _run_tool_bearing_empty_completion_turn(
+            monkeypatch,
+            reply_outcome,
+            attempts=(_EnforcementAttempt(error=CopilotTotalTimeoutError()),),
+            during_attempt=self._hit_hard_backstop,
+        )
+
+        assert len(run.drain_calls) == 1
+        assert run.result.user_response == ""
+        outcome = run.result.turn_outcome
+        assert outcome is not None
+        assert outcome.terminal_reason == "timeout"
+        assert outcome.budget_expiry_report_produced is False
+        assert outcome.tool_calls == ["update_and_run_blocks"]
+
+    @pytest.mark.asyncio
+    async def test_stop_during_the_budget_expiry_reply_is_saved_as_a_stop(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        self._record_run_still_going(monkeypatch)
+        run = await _run_tool_bearing_empty_completion_turn(
+            monkeypatch,
+            asyncio.CancelledError(),
+            attempts=(_EnforcementAttempt(error=CopilotTotalTimeoutError()),),
+            during_attempt=self._hit_hard_backstop,
+        )
+
+        assert run.result.cancelled is True
+        assert run.result.user_response == ""
+        outcome = run.result.turn_outcome
+        assert outcome is not None
+        assert outcome.terminal_reason == "timeout"
+        assert outcome.budget_expired is True
+        assert outcome.budget_expiry_report_produced is None
+
+    @staticmethod
     def _withheld_reply(*reason_codes: OutputPolicyReason, user_response: str = "") -> OutputGuardrailTripwireTriggered:
         guardrail_result = MagicMock()
         guardrail_result.agent_output = json.dumps({"type": "REPLY", "user_response": user_response})
@@ -7534,9 +7789,7 @@ class TestCopilotConfig:
         return OutputGuardrailTripwireTriggered(guardrail_result)
 
     @pytest.mark.asyncio
-    async def test_reply_withheld_for_a_raw_secret_shape_gets_one_tool_less_reask(
-        self, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
+    async def test_reply_withheld_for_a_raw_secret_shape_gets_one_reask(self, monkeypatch: pytest.MonkeyPatch) -> None:
         lead_in = "The run signed in and opened the billing page for card 4111111111111111. " * 5 + "Use "
         withheld = lead_in + "password: Hunter2Secret! next time. Trailing note after the secret."
         run = await _run_tool_bearing_empty_completion_turn(
@@ -7556,7 +7809,7 @@ class TestCopilotConfig:
         assert "Hunter2Secret" not in call.current_input
         assert "Trailing note" not in call.current_input
         assert "billing page" not in call.current_input
-        assert call.model_settings.tool_choice == "none"
+        assert call.model_settings.tool_choice is None
         assert call.max_turns == 1
         assert run.result.user_response == "The page shows receipt FV-0F9080EE."
 
@@ -7658,7 +7911,7 @@ class TestCopilotConfig:
         assert run.result.proposal_disposition == "review_untested"
 
     @pytest.mark.asyncio
-    async def test_empty_completion_final_reply_refuses_returned_tool_call(
+    async def test_empty_completion_final_reply_never_runs_a_returned_tool_call(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         ctx = _ctx()
@@ -7702,7 +7955,7 @@ class TestCopilotConfig:
                         )
                     ],
                     parallel_tool_calls=True,
-                    tool_choice="none",
+                    tool_choice="auto",
                     tools=[],
                     status="completed",
                 )
@@ -7714,7 +7967,7 @@ class TestCopilotConfig:
 
         monkeypatch.setattr("skyvern.forge.sdk.copilot.streaming_adapter.stream_to_sse", consume_sdk_stream)
 
-        with pytest.raises(FinalReplyToolRefusedError):
+        with pytest.raises(ModelBehaviorError):
             await run_final_reply_drain(
                 Agent(name="final-reply-test", model=ToolCallingModel(), tools=[navigate_browser]),
                 ctx,
@@ -7727,8 +7980,8 @@ class TestCopilotConfig:
         assert not tool_ran
         assert ctx.tool_calls_this_turn == 7
         assert len(model_calls) == 1
-        assert model_calls[0]["model_settings"].tool_choice == "none"
-        assert [tool.name for tool in model_calls[0]["tools"]] == ["navigate_browser"]
+        assert model_calls[0]["model_settings"].tool_choice is None
+        assert model_calls[0]["tools"] == []
 
     @pytest.mark.asyncio
     async def test_preexisting_tool_count_allows_current_empty_attempt_fallback(
@@ -9343,7 +9596,7 @@ class TestToolFactOwnership:
             ("console_messages", "read-only"),
             ("inspect_page_for_composition", "navigates the targeted browser there"),
             ("get_block_schema", "task_v2"),
-            ("evaluate", "record a scouted interaction"),
+            ("evaluate", "records no scouted interaction"),
             ("inspect_page_for_composition", "bounded read of known or current page state"),
             ("update_and_run_blocks", "higher latency than a bounded page read"),
         ],
@@ -9464,25 +9717,49 @@ workflow_definition:
         assert rendered["facts"]["runCompleted"] is False
         assert rendered["disposition"] == "review_untested"
 
-    def test_a_block_failure_no_later_run_re_exercised_drops_the_tested_pill(self) -> None:
-        staged = two_page_login_yaml()
-        ctx = _ctx(
-            persisted_workflow_yaml=staged,
-            workflow_yaml=staged,
-            last_run_outcome=_clean_recorded_run(),
-        )
-        record_build_test_outcome(ctx, failed_second_factor_run("wr_1"))
-        record_build_test_outcome(ctx, passing_run("wr_2", ["sign_in_and_read"]))
-        ctx.executed_block_fingerprints = {
-            label: set(fingerprints) for label, fingerprints in workflow_block_fingerprints(staged).items()
-        }
-        ctx.executed_block_labels = {"sign_in_and_read"}
+    def test_the_tested_pill_follows_what_the_run_recorder_saw_each_block_do(self) -> None:
+        staged = self._two_block_yaml()
+        ctx = _ctx(persisted_workflow_yaml=staged, workflow_yaml=staged)
 
-        rendered = self._render(ctx, staged)
+        def run(run_id: str, label: str, *statuses: str) -> dict[str, Any]:
+            run_execution_module._commit_run_blocks_record(
+                ctx,
+                {
+                    "ok": statuses[-1] == "completed",
+                    "data": {
+                        "workflow_run_id": run_id,
+                        "overall_status": statuses[-1],
+                        "requested_block_labels": [label],
+                        "blocks": [{"label": label, "block_type": "TASK", "status": status} for status in statuses],
+                    },
+                },
+            )
+            return self._render(ctx, staged)
 
-        assert rendered["facts"]["matchingSourceBlockCount"] == rendered["facts"]["authoredBlockCount"]
-        assert rendered["facts"]["runCompleted"] is True
-        assert rendered["disposition"] == "review_untested"
+        run("wr_1", "sign_in", "failed")
+        sibling_passed_after_failure = run("wr_2", "read_metric", "completed")
+        failed_block_then_passed = run("wr_3", "sign_in", "completed")
+        run("wr_4", "sign_in", "failed")
+        sibling_passed_after_refailure = run("wr_5", "read_metric", "completed")
+        run("wr_6", "sign_in", "completed")
+        passed_then_failed_in_one_run = run("wr_7", "sign_in", "completed", "failed")
+        run("wr_8", "sign_in", "completed")
+        canceled_after_pass = run("wr_9", "sign_in", "canceled")
+
+        for untested in (sibling_passed_after_failure, sibling_passed_after_refailure):
+            assert untested["facts"]["runCompleted"] is True
+        for untested in (
+            sibling_passed_after_failure,
+            sibling_passed_after_refailure,
+            passed_then_failed_in_one_run,
+            canceled_after_pass,
+        ):
+            assert untested["facts"]["matchingSourceBlockCount"] == 1
+            assert untested["facts"]["ranCleanOnCurrentSource"] is False
+            assert untested["disposition"] == "review_untested"
+        assert failed_block_then_passed["facts"]["matchingSourceBlockCount"] == 2
+        assert failed_block_then_passed["facts"]["ranCleanOnCurrentSource"] is True
+        assert failed_block_then_passed["disposition"] == "review_tested"
 
     @staticmethod
     def _code_yaml(body: str) -> str:
@@ -9510,61 +9787,29 @@ workflow_definition:
             }
         )
 
-    def _proposed_after_code_failure(
-        self,
-        failure_reason: str,
-        proposal: str,
-        *,
-        persisted: str = "workflow_definition:\n  blocks: []\n",
-        raised: str | None = None,
-    ) -> dict[str, Any]:
-        """A code block fails mid-turn, then the turn proposes ``proposal``.
-
-        ``persisted_workflow_yaml`` stays at the turn-start snapshot because nothing writes it
-        mid-turn; a test that hand-sets it to the proposal cannot see either failure direction.
-        """
-        raised = raised or self._code_yaml("total = fare * pax")
+    def test_a_repaired_and_passing_code_failure_keeps_the_tested_pill(self) -> None:
+        """The block raised, the model rewrote it, and the re-run passed, so the turn is tested."""
+        proposal = self._code_yaml("total = float(await page.locator('#fare').inner_text())")
         ctx = _ctx(
-            persisted_workflow_yaml=persisted,
-            workflow_yaml=raised,
+            persisted_workflow_yaml="workflow_definition:\n  blocks: []\n",
+            workflow_yaml=self._code_yaml("total = fare * pax"),
             last_run_outcome=_clean_recorded_run(),
         )
-        record_build_test_outcome(ctx, self._raised_run("wr_raised", failure_reason))
+        record_build_test_outcome(
+            ctx,
+            self._raised_run("wr_raised", "CodeBlock failed with NameError at line 1: name 'fare' is not defined."),
+        )
         ctx.workflow_yaml = proposal
         record_build_test_outcome(ctx, passing_run("wr_later", ["price"]))
         ctx.executed_block_fingerprints = {
             label: set(fingerprints) for label, fingerprints in workflow_block_fingerprints(proposal).items()
         }
         ctx.executed_block_labels = {"price"}
-        return self._render(ctx, proposal)
 
-    def test_a_repaired_and_passing_code_failure_keeps_the_tested_pill(self) -> None:
-        """The block raised, the model rewrote it, and the re-run passed, so the turn is tested."""
-        rendered = self._proposed_after_code_failure(
-            "CodeBlock failed with NameError at line 1: name 'fare' is not defined.",
-            self._code_yaml("total = float(await page.locator('#fare').inner_text())"),
-        )
+        rendered = self._render(ctx, proposal)
 
         assert rendered["facts"]["ranCleanOnCurrentSource"] is True
         assert rendered["disposition"] == "review_tested"
-
-    def test_a_proposal_still_carrying_the_failing_call_never_reads_as_tested(self) -> None:
-        """The pill claims the proposal ran clean, so a later passing run cannot launder a draft
-        that still carries the call the failure named.
-
-        The turn-start workflow does carry the block but not that call, so reading persistence here
-        would report the call as already removed and hand the draft a tested pill it never earned.
-        """
-        failing_call = 'await page.locator("#pay-now").click()'
-        rendered = self._proposed_after_code_failure(
-            'Timeout 30000ms exceeded. Call log: waiting for locator("#pay-now") to be visible',
-            self._code_yaml(failing_call),
-            persisted=self._code_yaml('await page.goto("https://shop.test/cart")'),
-            raised=self._code_yaml(failing_call),
-        )
-
-        assert rendered["facts"]["ranCleanOnCurrentSource"] is False
-        assert rendered["disposition"] == "review_untested"
 
     def test_full_coverage_over_an_unconfirmed_outcome_drops_the_tested_pill(self) -> None:
         staged = self._two_block_yaml()
@@ -9583,6 +9828,7 @@ workflow_definition:
 
         assert rendered["facts"]["matchingSourceBlockCount"] == 2
         assert rendered["facts"]["evaluationState"] == "not_demonstrated"
+        assert rendered["facts"]["ranCleanOnCurrentSource"] is False
         assert rendered["disposition"] == "review_untested"
 
     def test_an_unresolved_run_start_over_full_coverage_drops_the_tested_pill(self) -> None:

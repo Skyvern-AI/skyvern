@@ -13,9 +13,7 @@ from skyvern.exceptions import BlockedHost, InvalidUrl, SkyvernHTTPException, Un
 from skyvern.utils.pinned_transport import PinnedIPTransport, is_blocked_ip, normalize_ip
 
 SAFE_REDIRECT_STATUS_CODES = {301, 302, 303, 307, 308}
-BLOCKED_HOST_ALLOWLIST_HINT = (
-    "The host is blocked by SSRF protection. Self-hosted deployments can add the host to ALLOWED_HOSTS."
-)
+BLOCKED_HOST_ALLOWLIST_HINT = "The host is blocked by SSRF protection. Self-hosted deployments can add the host to ALLOWED_HOSTS or set ENABLE_URL_VALIDATION=false."
 MAX_SAFE_REDIRECTS = 10
 
 # getaddrinfo codes that mean the resolver answered "this name has no address", as opposed to
@@ -204,12 +202,20 @@ def is_allowed_local_browser_host(host: str) -> bool:
         return normalized in _LOCAL_BROWSER_HOSTNAMES
 
 
+def is_tls_or_local_browser_address(address: str) -> bool:
+    parts = urlsplit(address)
+    return parts.scheme in ("https", "wss") or is_allowed_local_browser_host(parts.hostname or "")
+
+
 def validate_browser_host(host: str, *, resolve_dns: bool = False) -> None:
     if not is_allowed_local_browser_host(host) and is_blocked_host(host, resolve_dns=resolve_dns):
         raise BlockedHost(host=host)
 
 
 def _is_allowed_host(host: str) -> bool:
+    # Kill switch: every host-blocking check, including the DNS-pinning path in resolve_fetch_host_ips, starts here.
+    if not settings.ENABLE_URL_VALIDATION:
+        return True
     normalized = _normalize_host(host)
     ip: ipaddress.IPv4Address | ipaddress.IPv6Address | None
     try:

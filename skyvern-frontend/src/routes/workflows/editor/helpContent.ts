@@ -14,7 +14,7 @@ export const baseHelpTooltipContent = {
   completeOnDownload:
     "Allow Skyvern to auto-complete the block when it downloads a file.",
   fileSuffix:
-    "The complete filename (without extension) for downloaded files. This replaces the entire filename instead of being appended to a random name.",
+    "The complete filename (without extension) for downloaded files. This replaces the entire filename instead of being appended to a random name. Use {{ original_filename }} to keep the name the site gave the file, e.g. {{ fund }}_{{ original_filename }} to prefix it.",
   errorCodeMapping:
     "Knowing about why a block terminated can be important, specify error messages here.",
   totpVerificationUrl:
@@ -39,7 +39,8 @@ export const basePlaceholderContent = {
   dataExtractionGoal: "What data do you need to extract?",
   maxRetries: "Default: 3",
   maxStepsOverride: "Default: 10",
-  downloadSuffix: "Enter the complete filename (without extension)",
+  downloadSuffix:
+    "Enter the complete filename (without extension), or prefix the site's own name with {{ original_filename }}",
   totpVerificationUrl: "Provide your 2FA endpoint",
   totpIdentifier: "Add an ID that links your TOTP to the block",
 };
@@ -136,6 +137,8 @@ export const helpTooltips = {
     newerThanDays: "Only include emails newer than this many days.",
     maxResults: "Maximum number of emails to return.",
     includeBody: "Include email body text in matching results.",
+    downloadAttachments:
+      "Download non-inline attachments from matched emails for downstream blocks.",
   },
   google_sheets_write: {
     ...baseHelpTooltipContent,
@@ -217,6 +220,8 @@ export const helpTooltips = {
       "The format of the file to parse. Auto-detected from the URL extension when possible. ZIP archives are always unzipped, and the block outputs the extracted files as file_name, file_path, and file_size. Data Schema is ignored for ZIPs. To parse contained files, loop over the output and pass each file_path to another File Parser block.",
     worksheet:
       "Excel only: the exact name of the worksheet to read. Leave empty to read the first worksheet. The run fails if the named worksheet is not in the workbook.",
+    forceOcr:
+      "PDF only: ignore the PDF's embedded text layer and read the pages with vision OCR instead. Skyvern already does this when the text layer is empty or its characters are scrambled; turn this on when a PDF's text layer is unreadable in some other way. OCR is slower, costs more than reading the text layer, and reads at most the first 50 pages, so a longer PDF loses the rest.",
   },
   terminate: {
     ...baseHelpTooltipContent,

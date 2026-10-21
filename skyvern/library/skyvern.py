@@ -63,6 +63,19 @@ async def _hand_downloads_back_to_browser(browser: Browser, browser_session_id: 
         )
 
 
+async def _drop_cdp_connection(browser: Browser) -> None:
+    """Drop our CDP connection to a browser we attached to but could not finish setting up.
+
+    Only closes this connection; the remote browser and its cloud session keep running. An
+    abandoned CDP client stays attached and keeps buffering the browser's events, which makes
+    every later attach to it slower.
+    """
+    try:
+        await browser.close()
+    except Exception:
+        LOG.warning("Could not drop the CDP connection for a failed browser attach", exc_info=True)
+
+
 def _get_browser_session_url(browser_session: BrowserSessionResponse) -> str:
     """Return the app URL for a browser session, using the server-provided URL when available."""
     if browser_session.app_url:
@@ -603,7 +616,11 @@ class Skyvern(AsyncSkyvern):
 
         playwright = await self._get_playwright()
         browser = await playwright.chromium.connect_over_cdp(cdp_url)
-        browser_context = browser.contexts[0] if browser.contexts else await browser.new_context()
+        try:
+            browser_context = browser.contexts[0] if browser.contexts else await browser.new_context()
+        except BaseException:
+            await _drop_cdp_connection(browser)
+            raise
         return SkyvernBrowser(self, browser_context, browser_address=cdp_url)
 
     async def connect_to_browser_extension(self, runtime: BrowserExtensionRuntime) -> SkyvernBrowser:
@@ -611,7 +628,11 @@ class Skyvern(AsyncSkyvern):
 
         playwright = await self._get_playwright()
         browser = await playwright.chromium.connect_over_cdp(runtime.cdp_ws_url)
-        browser_context = browser.contexts[0] if browser.contexts else await browser.new_context()
+        try:
+            browser_context = browser.contexts[0] if browser.contexts else await browser.new_context()
+        except BaseException:
+            await _drop_cdp_connection(browser)
+            raise
         return SkyvernBrowser(self, browser_context)
 
     async def connect_to_cloud_browser_session(self, browser_session_id: str) -> SkyvernBrowser:
@@ -751,8 +772,12 @@ class Skyvern(AsyncSkyvern):
         browser = await playwright.chromium.connect_over_cdp(
             browser_session.browser_address, headers={"x-api-key": self._api_key}
         )
-        await _hand_downloads_back_to_browser(browser, browser_session.browser_session_id)
-        browser_context = browser.contexts[0] if browser.contexts else await browser.new_context()
+        try:
+            await _hand_downloads_back_to_browser(browser, browser_session.browser_session_id)
+            browser_context = browser.contexts[0] if browser.contexts else await browser.new_context()
+        except BaseException:
+            await _drop_cdp_connection(browser)
+            raise
         return SkyvernBrowser(
             self,
             browser_context,

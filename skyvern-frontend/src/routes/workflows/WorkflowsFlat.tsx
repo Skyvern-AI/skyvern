@@ -1,3 +1,7 @@
+import {
+  WorkflowFindingsBoundary,
+  WorkflowFindingsButton,
+} from "@/components/WorkflowFindingsSlot";
 import { getClient } from "@/api/AxiosClient";
 import { Button } from "@/components/ui/button";
 import {
@@ -650,7 +654,7 @@ function WorkflowsFlat() {
     }
   }
 
-  return (
+  const content = (
     <div className="space-y-10">
       <div className="flex flex-col justify-between gap-6 xl:h-32 xl:flex-row">
         <div className="space-y-5">
@@ -1079,6 +1083,13 @@ function WorkflowsFlat() {
                                         ]
                                       }
                                     />
+                                    <WorkflowFindingsButton
+                                      workflowPermanentId={
+                                        workflow.workflow_permanent_id
+                                      }
+                                      title={workflow.title}
+                                      surface="list"
+                                    />
                                   </div>
                                   {taggingEnabled &&
                                   workflowTags &&
@@ -1389,6 +1400,11 @@ function WorkflowsFlat() {
         <WorkflowTemplates folderId={selectedFolderId} />
       </div>
     </div>
+  );
+  return (
+    <WorkflowFindingsBoundary workflowPermanentIds={workflowIds}>
+      {content}
+    </WorkflowFindingsBoundary>
   );
 }
 

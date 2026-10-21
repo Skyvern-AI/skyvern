@@ -197,6 +197,7 @@ async def test_default_agent_is_renamed_and_the_client_told(
     assert row.created_by is None
     assert ctx.stream.titles() == [DERIVED_TITLE]
     assert GOAL in title_llm.await_args.kwargs["prompt"]
+    assert f"{agent_naming._TITLE_MAX_CHARS} characters" in title_llm.await_args.kwargs["prompt"]
     assert [log["stream_not_closed"] for log in logs if log["event"] == "copilot_agent_named"] == [stream_open]
 
 

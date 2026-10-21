@@ -12,8 +12,6 @@ from playwright.async_api import Page, async_playwright
 from skyvern.forge import app
 from skyvern.forge.agent_functions import AgentFunction
 from skyvern.forge.sdk.copilot.runtime import (
-    SENSITIVE_ORIGIN_ACTIVE_RUN_PAGE_ERROR,
-    SENSITIVE_ORIGIN_PAGE_ERROR,
     AgentContext,
     CopilotBrowserSessionUnavailable,
 )
@@ -169,28 +167,6 @@ async def test_unsolved_attempts_are_counted_per_browser_and_a_new_browser_start
     assert after_replacement["fresh_browser_tried_for_this_request"] is True
     assert "untried_in_this_request" not in after_replacement
     assert ladder.await_count == 3
-
-
-@pytest.mark.asyncio
-@pytest.mark.parametrize(
-    ("taint_field", "expected_error"),
-    [
-        ("active_sensitive_origin_browser_session_ids", SENSITIVE_ORIGIN_ACTIVE_RUN_PAGE_ERROR),
-        ("sensitive_origin_browser_session_ids", SENSITIVE_ORIGIN_PAGE_ERROR),
-    ],
-    ids=["active_sensitive_run", "tainted_page"],
-)
-async def test_a_sensitive_page_is_never_sent_to_the_solver(
-    monkeypatch: pytest.MonkeyPatch, taint_field: str, expected_error: str
-) -> None:
-    ladder = AsyncMock(return_value=_SOLVED)
-    ctx = _chat(monkeypatch, _Page(), ladder)
-    setattr(ctx, taint_field, {"pbs_chat"})
-
-    result = await page_challenge.solve_page_challenge(ctx)
-
-    assert result == {"ok": False, "error": expected_error}
-    ladder.assert_not_awaited()
 
 
 _IMAGE_FORM = '<svg id="captcha" width="120" height="40"><text x="10" y="28">K7QPX</text></svg><input id="answer">'

@@ -4,14 +4,18 @@ Utility functions for PDF parsing with fallback support.
 This module provides robust PDF parsing that tries pypdf first and falls back
 to pdfplumber if pypdf fails, ensuring maximum compatibility with various PDF formats.
 For image-based/scanned PDFs where text extraction yields no content, pages can be
-rendered as images via render_pdf_pages_as_images for vision-LLM OCR.
+rendered as images via render_pdf_pages_as_images for vision-LLM OCR. A text layer that
+is non-empty but glyph-scrambled needs the same OCR fallback; scrambled_text_layer_reason
+identifies it.
 """
 
 import io
+from types import FrameType
 
 import pdfplumber
 import structlog
-from pypdf import PdfReader
+from pypdf import PdfReader, get_configuration
+from pypdf.errors import LimitReachedError
 
 from skyvern.constants import MAX_FILE_PARSE_INPUT_TOKENS, MAX_PDF_OCR_PAGES
 from skyvern.exceptions import PDFParsingError
@@ -19,6 +23,174 @@ from skyvern.forge.sdk.utils.sanitization import sanitize_postgres_text
 from skyvern.utils.token_counter import count_tokens
 
 LOG = structlog.get_logger(__name__)
+
+# A font whose ToUnicode map is wrong substitutes its glyphs out of an unrelated Unicode
+# block. Latin Extended-A/B and the private-use area are where those substitutions land;
+# a Latin-script document's own characters only appear there as in-word diacritics.
+_REMAPPED_GLYPH_RANGES: tuple[tuple[int, int], ...] = ((0x0100, 0x024F), (0xE000, 0xF8FF), (0xFFFD, 0xFFFD))
+# Below these floors the shares computed from the text layer are too noisy to act on.
+_MIN_TEXT_LAYER_CHARS = 40
+_MIN_TEXT_LAYER_WORDS = 10
+_MIN_REMAPPED_GLYPHS = 8
+_MIN_ISOLATED_WORDS = 3
+# A remapped number is a run of glyphs; a checkbox or bullet drawn from an icon font is a
+# single glyph standing alone. Only runs count, so an ordinary form keeps its text layer.
+_MIN_ISOLATED_WORD_LENGTH = 2
+# Diacritics sit inside words next to ASCII letters, so a legitimately accented language
+# keeps this share low (measured ~0.3 for Vietnamese, 0.0 for Polish/Czech/Turkish) while a
+# scrambled digit run is a whole word of nothing else (~0.9).
+_MIN_ISOLATED_GLYPH_SHARE = 0.6
+# Non-Latin scripts are read as-is: their characters fall outside the ranges above, so the
+# shares would be measuring the wrong thing.
+_MIN_ASCII_LETTER_SHARE = 0.5
+# pypdf raises one LimitReachedError class for every limit, sometimes re-raised as PdfReadError, so only the raising
+# frame tells a size cap from a structural limit pdfminer reads safely. Any limit in the filter modules is a size cap
+# unless carved out below, so one a later pypdf adds fails closed; the frames after the carve-outs are the other caps
+# pdfminer lacks: a content array, a ToUnicode range, CID widths and an eager page tree.
+_PYPDF_DECOMPRESSION_LIMIT_MODULES = frozenset({"pypdf.filters", "pypdf._codecs._codecs"})
+# A predictor row length pdfminer never allocates, and JBIG2, which pdfminer passes through undecoded.
+_PYPDF_STRUCTURAL_FILTER_FRAMES = frozenset(
+    {("pypdf.filters", "FlateDecode.decode"), ("pypdf.filters", "JBIG2Decode.decode")}
+)
+_PYPDF_SIZE_LIMIT_FRAMES = frozenset(
+    {
+        ("pypdf.generic._data_structures", "ContentStream.__init__"),
+        ("pypdf.generic._data_structures", "DictionaryObject.read_from_stream"),
+        ("pypdf.generic._data_structures", "DictionaryObject._read_unsized_from_stream"),
+        ("pypdf._cmap", "_check_mapping_size"),
+        ("pypdf._doc_common", "PdfDocCommon._flatten_page_tree_node"),
+    }
+)
+# These frames also enforce structural limits (token lengths, simple-font widths), so the caller tells them apart.
+_PYPDF_SIZE_LIMIT_CALLS = frozenset(
+    {
+        (
+            ("pypdf._cmap", "_check_token_length"),
+            ("pypdf._cmap", "parse_bfrange"),
+        ),
+        (
+            ("pypdf._utils", "read_until_regex"),
+            ("pypdf.generic._data_structures", "DictionaryObject.read_from_stream"),
+        ),
+        (
+            ("pypdf._font", "Font.__check_entry_count"),
+            ("pypdf._font", "Font._collect_cid_character_widths"),
+        ),
+    }
+)
+_PYPDF_CID_WIDTH_RANGE_FRAME = ("pypdf._font", "Font.__check_range_length")
+_PYPDF_PREDICTOR_PARAMETERS_FRAME = ("pypdf.filters", "FlateDecode._get_parameters")
+
+
+def _is_remapped_glyph(char: str) -> bool:
+    code_point = ord(char)
+    return any(start <= code_point <= end for start, end in _REMAPPED_GLYPH_RANGES)
+
+
+def _is_isolated_word(word: str) -> bool:
+    return (
+        len(word) >= _MIN_ISOLATED_WORD_LENGTH
+        and any(_is_remapped_glyph(char) for char in word)
+        and not any(char.isascii() and char.isalnum() for char in word)
+    )
+
+
+def scrambled_text_layer_reason(text: str) -> str | None:
+    """Return why a PDF text layer looks glyph-scrambled, or None if it can be trusted.
+
+    A subset font with a broken ToUnicode map keeps the document's layout and its ASCII
+    words but replaces whole runs — typically every digit — with characters from an
+    unrelated Unicode block, so the extracted text is plausible-looking and wrong.
+    """
+    words = text.split()
+    if len(words) < _MIN_TEXT_LAYER_WORDS:
+        return None
+    if sum(1 for char in text if not char.isspace()) < _MIN_TEXT_LAYER_CHARS:
+        return None
+
+    # Remapped glyphs are Latin letters to str.isalpha, so counting them here would let the
+    # corruption vote on which script the document is written in — and a page of scrambled
+    # numbers would read as non-Latin and escape every check below.
+    letters = [char for char in text if char.isalpha() and not _is_remapped_glyph(char)]
+    if letters and sum(1 for char in letters if char.isascii()) / len(letters) < _MIN_ASCII_LETTER_SHARE:
+        return None
+
+    remapped_glyphs = sum(1 for char in text if _is_remapped_glyph(char))
+    if remapped_glyphs < _MIN_REMAPPED_GLYPHS:
+        return None
+
+    isolated_words = [word for word in words if _is_isolated_word(word)]
+    if len(isolated_words) < _MIN_ISOLATED_WORDS:
+        return None
+
+    isolated_glyphs = sum(1 for word in isolated_words for char in word if _is_remapped_glyph(char))
+    isolated_share = isolated_glyphs / remapped_glyphs
+    if isolated_share < _MIN_ISOLATED_GLYPH_SHARE:
+        return None
+
+    return (
+        f"{len(isolated_words)} of {len(words)} words in the PDF text layer are built only from characters "
+        f"outside the document's script ({isolated_share:.0%} of the {remapped_glyphs} such characters found), "
+        "which means the embedded font maps its glyphs to the wrong code points"
+    )
+
+
+def _frame_site(frame: FrameType) -> tuple[str | None, str]:
+    return frame.f_globals.get("__name__"), frame.f_code.co_qualname
+
+
+def _is_size_limit_frame(frame: FrameType) -> bool:
+    site = _frame_site(frame)
+    if site == _PYPDF_PREDICTOR_PARAMETERS_FRAME:
+        # The same frame rejects a small Colors over 16, which pdfminer reads, but a huge Columns or row it would hold
+        # as Python ints without any limit. The row is sized at 8 bits per component, the most pdfminer decodes,
+        # because pypdf reads BitsPerComponent after this check.
+        columns, colors = frame.f_locals.get("columns"), frame.f_locals.get("colors")
+        configuration = get_configuration()
+        return isinstance(columns, int) and (
+            columns > configuration.flate_maximum_columns
+            or (isinstance(colors, int) and columns * colors + 1 > configuration.flate_maximum_row_length)
+        )
+    if site in _PYPDF_STRUCTURAL_FILTER_FRAMES:
+        return False
+    if site[0] in _PYPDF_DECOMPRESSION_LIMIT_MODULES or site in _PYPDF_SIZE_LIMIT_FRAMES:
+        return True
+    if frame.f_back is not None and (site, _frame_site(frame.f_back)) in _PYPDF_SIZE_LIMIT_CALLS:
+        return True
+    if site == _PYPDF_CID_WIDTH_RANGE_FRAME:
+        # The same frame rejects an inverted range, which expands to nothing in pdfminer.
+        start, end = frame.f_locals.get("start"), frame.f_locals.get("end")
+        return isinstance(start, int) and isinstance(end, int) and end >= start
+    return False
+
+
+def _hit_pypdf_size_limit(error: BaseException) -> bool:
+    seen: set[int] = set()
+    current: BaseException | None = error
+    while current is not None and id(current) not in seen:
+        seen.add(id(current))
+        if isinstance(current, LimitReachedError) and current.__traceback__ is not None:
+            innermost = current.__traceback__
+            while innermost.tb_next is not None:
+                innermost = innermost.tb_next
+            if _is_size_limit_frame(innermost.tb_frame):
+                return True
+        current = current.__cause__ or current.__context__
+    return False
+
+
+def _size_limit_failure(identifier: str, pypdf_error: Exception) -> PDFParsingError:
+    LOG.warning(
+        "PDF exceeds a pypdf size limit that pdfplumber lacks, not falling back to pdfplumber",
+        file_identifier=identifier.partition("?")[0],
+        error=str(pypdf_error),
+        error_type=type(pypdf_error).__name__,
+    )
+    return PDFParsingError(
+        file_identifier=identifier,
+        pypdf_error=str(pypdf_error),
+        pdfplumber_error="not attempted: the PDF exceeds a size limit",
+    )
 
 
 def extract_pdf_file(
@@ -43,13 +215,15 @@ def extract_pdf_file(
         Extracted text from all pages of the PDF
 
     Raises:
-        PDFParsingError: When both pypdf and pdfplumber fail to parse the PDF
+        PDFParsingError: When both pypdf and pdfplumber fail to parse the PDF, or when the PDF
+                         exceeds a pypdf size limit that pdfplumber lacks (pdfplumber is not tried then)
 
     Example:
         >>> text = extract_pdf_file("/path/to/file.pdf", "document.pdf")
         >>> print(f"Extracted {len(text)} characters")
     """
     identifier = file_identifier or file_path
+    log_identifier = identifier.partition("?")[0]
 
     # Try pypdf first
     try:
@@ -65,7 +239,7 @@ def extract_pdf_file(
                 if current_tokens + page_tokens > max_tokens:
                     LOG.warning(
                         "PDF text exceeds token limit, truncating at page boundary",
-                        file_identifier=identifier,
+                        file_identifier=log_identifier,
                         pages_included=i,
                         total_pages=page_count,
                         max_tokens=max_tokens,
@@ -79,16 +253,18 @@ def extract_pdf_file(
 
         LOG.info(
             "Successfully parsed PDF with pypdf",
-            file_identifier=identifier,
+            file_identifier=log_identifier,
             page_count=page_count,
             text_length=len(extracted_text),
         )
         return extracted_text
 
     except Exception as pypdf_error:
+        if _hit_pypdf_size_limit(pypdf_error):
+            raise _size_limit_failure(identifier, pypdf_error) from pypdf_error
         LOG.warning(
             "Failed to parse PDF with pypdf, trying pdfplumber",
-            file_identifier=identifier,
+            file_identifier=log_identifier,
             error=str(pypdf_error),
             error_type=type(pypdf_error).__name__,
         )
@@ -101,14 +277,17 @@ def extract_pdf_file(
                 page_count = len(pdf.pages)
 
                 for i, page in enumerate(pdf.pages):
-                    page_text = page.extract_text()
+                    try:
+                        page_text = page.extract_text()
+                    finally:
+                        page.close()
                     if page_text:
                         if max_tokens:
                             page_tokens = count_tokens(page_text)
                             if current_tokens + page_tokens > max_tokens:
                                 LOG.warning(
                                     "PDF text exceeds token limit, truncating at page boundary",
-                                    file_identifier=identifier,
+                                    file_identifier=log_identifier,
                                     pages_included=i,
                                     total_pages=page_count,
                                     max_tokens=max_tokens,
@@ -122,7 +301,7 @@ def extract_pdf_file(
 
                 LOG.info(
                     "Successfully parsed PDF with pdfplumber",
-                    file_identifier=identifier,
+                    file_identifier=log_identifier,
                     page_count=page_count,
                     text_length=len(extracted_text),
                 )
@@ -131,7 +310,7 @@ def extract_pdf_file(
         except Exception as pdfplumber_error:
             LOG.error(
                 "Failed to parse PDF with both pypdf and pdfplumber",
-                file_identifier=identifier,
+                file_identifier=log_identifier,
                 pypdf_error=str(pypdf_error),
                 pdfplumber_error=str(pdfplumber_error),
             )
@@ -161,13 +340,15 @@ def validate_pdf_file(
         True if the PDF can be opened and read by at least one parser
 
     Raises:
-        PDFParsingError: When both pypdf and pdfplumber fail to validate the PDF
+        PDFParsingError: When both pypdf and pdfplumber fail to validate the PDF, or when the PDF
+                         exceeds a pypdf size limit that pdfplumber lacks (pdfplumber is not tried then)
 
     Example:
         >>> if validate_pdf_file("/path/to/file.pdf"):
         ...     print("Valid PDF file")
     """
     identifier = file_identifier or file_path
+    log_identifier = identifier.partition("?")[0]
 
     # Try pypdf first
     try:
@@ -176,14 +357,16 @@ def validate_pdf_file(
         _ = len(reader.pages)
         LOG.debug(
             "PDF validation successful with pypdf",
-            file_identifier=identifier,
+            file_identifier=log_identifier,
         )
         return True
 
     except Exception as pypdf_error:
+        if _hit_pypdf_size_limit(pypdf_error):
+            raise _size_limit_failure(identifier, pypdf_error) from pypdf_error
         LOG.debug(
             "PDF validation with pypdf failed, trying pdfplumber",
-            file_identifier=identifier,
+            file_identifier=log_identifier,
             error=str(pypdf_error),
         )
 
@@ -194,7 +377,7 @@ def validate_pdf_file(
 
             LOG.info(
                 "PDF validation: pypdf failed but pdfplumber succeeded",
-                file_identifier=identifier,
+                file_identifier=log_identifier,
                 pypdf_error=str(pypdf_error),
             )
             return True
@@ -202,7 +385,7 @@ def validate_pdf_file(
         except Exception as pdfplumber_error:
             LOG.error(
                 "PDF validation failed with both pypdf and pdfplumber",
-                file_identifier=identifier,
+                file_identifier=log_identifier,
                 pypdf_error=str(pypdf_error),
                 pdfplumber_error=str(pdfplumber_error),
             )
@@ -227,6 +410,7 @@ def render_pdf_pages_as_images(
     image-based PDFs).
     """
     identifier = file_identifier or file_path
+    log_identifier = identifier.partition("?")[0]
     page_images: list[bytes] = []
 
     with pdfplumber.open(file_path) as pdf:
@@ -234,7 +418,7 @@ def render_pdf_pages_as_images(
         if pages_to_render < len(pdf.pages):
             LOG.warning(
                 "PDF has more pages than max_pages for image rendering, truncating",
-                file_identifier=identifier,
+                file_identifier=log_identifier,
                 total_pages=len(pdf.pages),
                 max_pages=max_pages,
             )
@@ -247,7 +431,7 @@ def render_pdf_pages_as_images(
 
     LOG.info(
         "Rendered PDF pages as images for vision-LLM fallback",
-        file_identifier=identifier,
+        file_identifier=log_identifier,
         pages_rendered=len(page_images),
     )
     return page_images

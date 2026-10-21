@@ -37,9 +37,11 @@ from skyvern.forge.sdk.copilot.tools.run_execution import (
 from skyvern.forge.sdk.copilot.tools.scouting import _capture_post_interaction_screenshot
 from skyvern.forge.sdk.copilot.verification_evidence import WorkflowVerificationEvidence
 from tests.unit.copilot_test_helpers import (
+    captured_frame_entry,
     install_get_run_results_harness,
     make_model_input_data,
     run_result_block_row,
+    sent_image_px,
 )
 
 
@@ -363,6 +365,21 @@ class TestCapturePostInteractionScreenshot:
         assert width <= COPILOT_SCREENSHOT_MAX_WIDTH
         assert height <= COPILOT_SCREENSHOT_MAX_HEIGHT
 
+    @pytest.mark.asyncio
+    async def test_delivered_frame_states_its_image_size_and_the_measured_viewport(self, tmp_path: Path) -> None:
+        frame = tmp_path / "frame.png"
+        Image.new("RGB", (1920, 947), (10, 120, 200)).save(frame, format="PNG")
+        ctx = self._ctx({"ok": True, "data": {"path": str(frame), "viewport": {"width": 1920, "height": 947}}})
+
+        assert await _capture_post_interaction_screenshot(ctx, source_tool="click", captured_url=None) is True
+        result = copilot_call_model_input_filter(
+            make_model_input_data([{"role": "user", "content": "go"}], context=ctx)
+        )
+
+        message = result.input[-1]
+        assert sent_image_px(message) == [(1600, 789)]
+        assert "image_px=1600x789; viewport_css_px=1920x947" in message["content"][0]["text"]
+
     @pytest.mark.parametrize(
         "data",
         [
@@ -474,6 +491,18 @@ class TestNudgeDrainAndFilterExclusivity:
         result = copilot_call_model_input_filter(make_model_input_data(items, context=ctx))
 
         assert result.input == items
+
+    def test_a_frame_sent_sharp_is_saved_small_with_a_nudge(self) -> None:
+        ctx = SimpleNamespace(pending_screenshots=[captured_frame_entry()], supports_vision=True)
+        items = [{"role": "user", "content": "read the reference code"}]
+        seen = copilot_call_model_input_filter(make_model_input_data(items, context=ctx))
+        saved = _consume_pending_screenshots(ctx)
+        history = [*items, {"role": "assistant", "content": "done"}, saved]
+
+        after = copilot_call_model_input_filter(make_model_input_data(history, context=ctx))
+
+        assert sent_image_px(seen.input[-1]) == [(1600, 789)]
+        assert sent_image_px(after.input[-1]) == [(1024, 505)]
 
     def test_the_nudge_path_also_withholds_the_frame_from_a_non_vision_model(self) -> None:
         # The vision check lives in the shared builder so every delivery path inherits it;

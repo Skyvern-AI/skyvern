@@ -1,3 +1,4 @@
+import { WorkflowFindingsButton } from "@/components/WorkflowFindingsSlot";
 import {
   SaveRefusedError,
   SaveStaleError,
@@ -13,6 +14,7 @@ import { AxiosError } from "axios";
 import {
   CalendarIcon,
   InputIcon,
+  LightningBoltIcon,
   Pencil1Icon,
   PlayIcon,
   ReloadIcon,
@@ -22,6 +24,7 @@ import { useMutation, useQueryClient } from "@tanstack/react-query";
 import { Link, useNavigate, useSearchParams } from "react-router-dom";
 import { usePostHog } from "posthog-js/react";
 import { useWorkflowPermanentId } from "@/routes/workflows/WorkflowPermanentIdContext";
+import { usePageSlots } from "@/store/PageSlots";
 
 import { getClient } from "@/api/AxiosClient";
 import { SaveIcon } from "@/components/icons/SaveIcon";
@@ -44,6 +47,10 @@ import { useWorkflowPanelStore } from "@/store/WorkflowPanelStore";
 import { useWorkflowParametersStore } from "@/store/WorkflowParametersStore";
 import { useWorkflowSnapshotStore } from "@/store/WorkflowSnapshotStore";
 import { useWorkflowTitleStore } from "@/store/WorkflowTitleStore";
+import {
+  selectSaveLockReason,
+  useWorkflowYamlEditorStore,
+} from "@/store/WorkflowYamlEditorStore";
 
 import { basicLocalTimeFormat, basicTimeFormat } from "@/util/timeFormat";
 import { cn } from "@/util/utils";
@@ -136,6 +143,8 @@ export function SaveButton() {
   const contentDirty = useWorkflowSnapshotStore((s) => s.contentDirty);
   const snapshot = useWorkflowSnapshotStore((s) => s.snapshot);
   const isRecording = useRecordingStore((s) => s.isRecording);
+  const saveLockReason = useWorkflowYamlEditorStore(selectSaveLockReason);
+  const saveUnavailable = isRecording || saveLockReason !== null;
   const onSave = useSaveWorkflow();
   const [confirmOpen, setConfirmOpen] = useState(false);
   const pendingGoalChangeCount = useCopilotActionStore(
@@ -195,14 +204,14 @@ export function SaveButton() {
     <>
       <ControlTooltip
         content="Save workflow"
-        reason={saveBlockedReason}
-        blocked={isRecording}
+        reason={saveBlockedReason ?? saveLockReason}
+        blocked={saveUnavailable}
       >
         <Button
           variant="ghost"
           size="icon"
-          className="relative h-8 w-8 text-muted-foreground"
-          disabled={isRecording}
+          className="relative h-8 w-8 text-muted-foreground disabled:pointer-events-none"
+          disabled={saveUnavailable}
           onClick={() => {
             if (pendingGoalChangeCount > 0) {
               setGoalDialogOpen(true);
@@ -257,7 +266,7 @@ export function SaveButton() {
               </Button>
             ) : (
               <Button
-                disabled={saving}
+                disabled={saving || saveLockReason !== null}
                 onClick={() => {
                   // Close only on success; a failed save (already toasted by
                   // onSave's onError) keeps the list open for retry, so swallow
@@ -294,7 +303,7 @@ function PanelToggle({
   label,
   icon,
 }: {
-  content: "parameters" | "schedules";
+  content: "parameters" | "schedules" | "triggers";
   label: string;
   icon: ReactNode;
 }) {
@@ -429,9 +438,6 @@ export function RunStopButton({ stopOnly = false }: { stopOnly?: boolean }) {
         });
       }
       queryClient.invalidateQueries({ queryKey: ["workflowRun", activeRunId] });
-      queryClient.invalidateQueries({
-        queryKey: ["workflowRun", workflowPermanentId, activeRunId],
-      });
       queryClient.invalidateQueries({ queryKey: ["workflowRuns"] });
       if (activeRunId) {
         claimRunCompletionNotice(activeRunId, () => {
@@ -571,6 +577,9 @@ export function RunStopButton({ stopOnly = false }: { stopOnly?: boolean }) {
 }
 
 export function StudioTopBar() {
+  const workflowPermanentId = useWorkflowPermanentId();
+  const workflowTitle = useWorkflowTitleStore((state) => state.title);
+  const { workflowTriggersPanel } = usePageSlots();
   const isGlobalWorkflow = useIsGlobalWorkflow();
   const workflowDeletedAt = useStudioWorkflowDeletedAt();
   const { panes, setOpenPanes } = useStudioPanes();
@@ -588,12 +597,19 @@ export function StudioTopBar() {
   // editor-only layout on entry (an explicit override, like the full-run
   // reset). Exiting doesn't restore the previous set — reopen as needed.
   const openVersionHistory = () => {
-    setOpenPanes(["editor"]);
+    setOpenPanes(["editor"], { byUser: true });
     toggleHistoryPanel();
   };
   return (
     <div className="flex h-14 shrink-0 items-center gap-3 border-b border-border bg-slate-elevation2 px-4">
       <TitleSection editable={!isGlobalWorkflow && !workflowDeletedAt} />
+      {!isGlobalWorkflow && !workflowDeletedAt && workflowPermanentId ? (
+        <WorkflowFindingsButton
+          workflowPermanentId={workflowPermanentId}
+          title={workflowTitle}
+          surface="editor"
+        />
+      ) : null}
       <PaneHeaderDivider />
       <StudioPaneToggles />
       <div className="min-w-3 flex-1" />
@@ -625,6 +641,13 @@ export function StudioTopBar() {
                       label="Schedule"
                       icon={<CalendarIcon className="size-4" />}
                     />
+                    {workflowTriggersPanel ? (
+                      <PanelToggle
+                        content="triggers"
+                        label="Triggers"
+                        icon={<LightningBoltIcon className="size-4" />}
+                      />
+                    ) : null}
                     <EditorOverflowMenu
                       triggerClassName="h-8 w-8 rounded-md border-0 bg-transparent text-muted-foreground hover:bg-accent hover:text-accent-foreground"
                       onVersionHistory={openVersionHistory}

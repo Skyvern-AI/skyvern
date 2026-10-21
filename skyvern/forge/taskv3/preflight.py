@@ -24,6 +24,7 @@ from skyvern.forge.sdk.browser_action_preflight import policy_observation_enable
 from skyvern.webeye.actions.actions import (
     Action,
     ClickAction,
+    DragAction,
     GotoUrlAction,
     HoverAction,
     InputTextAction,
@@ -39,7 +40,7 @@ LOG = structlog.get_logger()
 # `_build_action` maps. This is the single source of truth for which tool handlers get wrapped;
 # `build_browser_tools` imports it rather than keeping a second list that can drift.
 PREFLIGHT_TOOL_NAMES = frozenset(
-    {"click", "hover", "type", "select_combobox", "select_option", "press_key", "file_upload", "navigate"}
+    {"click", "hover", "drag", "type", "select_combobox", "select_option", "press_key", "file_upload", "navigate"}
 )
 
 
@@ -49,6 +50,8 @@ def _build_action(tool_name: str, args: dict[str, Any]) -> Action | None:
         return ClickAction(element_id=selector)
     if tool_name == "hover":
         return HoverAction(element_id=selector)
+    if tool_name == "drag":
+        return DragAction(element_id=selector)
     if tool_name == "type":
         return InputTextAction(element_id=selector, text=str(args.get("text", "")))
     if tool_name == "select_combobox":

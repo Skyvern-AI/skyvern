@@ -11,6 +11,10 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import { useWorkflowHasChangesStore } from "@/store/WorkflowHasChangesStore";
 import { useWorkflowParametersStore } from "@/store/WorkflowParametersStore";
+import {
+  AUTHORING_SAVE_MESSAGE,
+  useWorkflowYamlEditorStore,
+} from "@/store/WorkflowYamlEditorStore";
 import type { ParametersState } from "../../editor/types";
 import { TemplateInputsCard } from "./TemplateInputsCard";
 
@@ -47,6 +51,7 @@ describe("TemplateInputsCard", () => {
     useWorkflowHasChangesStore.setState(
       useWorkflowHasChangesStore.getInitialState(),
     );
+    useWorkflowYamlEditorStore.setState({ authoringInProgress: false });
   });
 
   it("blocks an invalid number and saves a cleared number as null", async () => {
@@ -120,35 +125,54 @@ describe("TemplateInputsCard", () => {
     expect(await screen.findByText("Not saved")).toBeTruthy();
   });
 
-  it("holds Save inputs under a save hold and keeps its reason reachable", () => {
-    const reason = "Copilot is saving your accepted changes.";
-    useWorkflowHasChangesStore.getState().setSaveBlockedReason(reason);
-    seed([
-      {
-        key: "url",
-        parameterType: "workflow",
-        dataType: "string",
-        defaultValue: "",
-      },
-    ]);
-    render(<TemplateInputsCard />);
-    fireEvent.change(screen.getByLabelText("url"), {
-      target: { value: "https://example.com" },
-    });
+  it.each([
+    {
+      hold: "a save hold",
+      reason: "Copilot is saving your accepted changes.",
+      set: (on: boolean) =>
+        useWorkflowHasChangesStore
+          .getState()
+          .setSaveBlockedReason(
+            on ? "Copilot is saving your accepted changes." : null,
+          ),
+    },
+    {
+      hold: "an authoring action",
+      reason: AUTHORING_SAVE_MESSAGE,
+      set: (on: boolean) =>
+        useWorkflowYamlEditorStore.setState({ authoringInProgress: on }),
+    },
+  ])(
+    "holds Save inputs under $hold and keeps its reason reachable",
+    ({ reason, set }) => {
+      set(true);
+      seed([
+        {
+          key: "url",
+          parameterType: "workflow",
+          dataType: "string",
+          defaultValue: "",
+        },
+      ]);
+      render(<TemplateInputsCard />);
+      fireEvent.change(screen.getByLabelText("url"), {
+        target: { value: "https://example.com" },
+      });
 
-    // The name stays the action; the reason is the description, not part of the name.
-    const held = screen.getByRole("button", {
-      name: "Save inputs (paused)",
-      description: reason,
-    }) as HTMLButtonElement;
-    expect(held.disabled).toBe(true);
-    // A disabled button swallows its own tooltip trigger's events.
-    const wrapper = held.closest<HTMLElement>("[tabindex='0']");
-    expect(wrapper?.getAttribute("aria-describedby")).toBe(
-      held.getAttribute("aria-describedby"),
-    );
+      // The name stays the action; the reason is the description, not part of the name.
+      const held = screen.getByRole("button", {
+        name: "Save inputs (paused)",
+        description: reason,
+      }) as HTMLButtonElement;
+      expect(held.disabled).toBe(true);
+      // A disabled button swallows its own tooltip trigger's events.
+      const wrapper = held.closest<HTMLElement>("[tabindex='0']");
+      expect(wrapper?.getAttribute("aria-describedby")).toBe(
+        held.getAttribute("aria-describedby"),
+      );
 
-    act(() => useWorkflowHasChangesStore.getState().setSaveBlockedReason(null));
-    expect(saveButton().disabled).toBe(false);
-  });
+      act(() => set(false));
+      expect(saveButton().disabled).toBe(false);
+    },
+  );
 });

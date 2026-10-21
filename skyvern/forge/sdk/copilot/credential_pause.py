@@ -40,10 +40,16 @@ from skyvern.forge import app
 from skyvern.forge.sdk.browser_action_policy import canonicalize_origin
 from skyvern.forge.sdk.cache.base import BaseCache
 from skyvern.forge.sdk.copilot.config import CopilotConfig
-from skyvern.forge.sdk.copilot.credential_resolution import loggable_origin, safe_admitted_url, url_parts
+from skyvern.forge.sdk.copilot.credential_resolution import (
+    load_credentials,
+    loggable_origin,
+    safe_admitted_url,
+    url_parts,
+)
 from skyvern.forge.sdk.copilot.diagnosis_repair_contract import DiagnosisFailureType, RepairNextAction
 from skyvern.forge.sdk.copilot.human_input_wait import pause_human_input
 from skyvern.forge.sdk.copilot.request_policy import RequestPolicy
+from skyvern.forge.sdk.credential_site_policy import same_site
 from skyvern.forge.sdk.schemas.credentials import Credential
 from skyvern.forge.sdk.schemas.workflow_copilot import (
     CredentialPauseResolvedOutcome,
@@ -750,8 +756,8 @@ def credential_pause_reason(ctx: Any) -> str | None:
 
 
 RAW_SECRET_CONNECTED_NEXT = (
-    "Bind this credential as the workflow's credential parameter in the draft. This turn contains a "
-    "redacted secret, so do not run, test, or use the browser; the draft stays untested until a later "
+    "Bind this credential as the workflow's credential parameter in the draft. This turn withheld a value "
+    "that may be a secret, so do not run, test, or use the browser; the draft stays untested until a later "
     "message asks to test it."
 )
 
@@ -766,9 +772,7 @@ def raw_secret_card_origin(user_url: str) -> str:
     return f"{scheme}{separator}{rest.split('/', 1)[0]}" if separator else ""
 
 
-def credential_pause_transport_ready(
-    ctx: CopilotContext, copilot_config: CopilotConfig | None, *, allow_second_ask: bool = False
-) -> bool:
+def credential_pause_transport_ready(ctx: CopilotContext, copilot_config: CopilotConfig | None) -> bool:
     """Whether a card can be shown at all this turn, independent of what is asking for one.
 
     Excludes the async-only checks (stream disconnect).
@@ -777,7 +781,6 @@ def credential_pause_transport_ready(
         copilot_config is not None
         and copilot_config.credential_pause_enabled
         and ctx.client_supports_credential_pause
-        and (allow_second_ask or not ctx.credential_pause_used)
         # A same-process-only cache (LocalCache) can't coordinate the poller with a
         # /credential-response POST that may land on a different worker -- gate on a
         # cache that's explicitly known to be shared (Redis) rather than merely non-None.
@@ -810,11 +813,12 @@ def _bind_connected_credential_origin(policy: RequestPolicy, credential: Credent
     return admitted_url
 
 
-def _apply_connected_credential_to_policy(ctx: Any, policy: RequestPolicy, credential: Credential) -> None:
+def apply_connected_credential_to_policy(ctx: CopilotContext, policy: RequestPolicy, credential: Credential) -> None:
     """Record ``credential`` as the explicit answer to the product-owned pause, reopening the run gate
     (and un-latching ``test_after_update_done``) so the resumed run does not re-skip and re-ask; a
     raw-secret turn keeps its run gate closed and its draft untested for a later secret-free turn."""
     ctx.credential_pause_connected_credential_id = credential.credential_id
+    policy.credential_pause_connected_credential_ids.add(credential.credential_id)
     admitted_url = _bind_connected_credential_origin(policy, credential)
     LOG.info(
         "copilot_credential_pause_connected",
@@ -857,11 +861,30 @@ def _apply_signed_in_profile_to_policy(ctx: Any, policy: RequestPolicy, signed_i
     )
 
 
+def credential_pause_receipt(ctx: CopilotContext) -> dict[str, str] | None:
+    outcome = ctx.credential_pause_outcome
+    if not outcome:
+        return None
+    receipt = {"outcome": outcome}
+    if outcome == "connected" and ctx.credential_pause_connected_credential_id:
+        receipt["credentialId"] = ctx.credential_pause_connected_credential_id
+    signed_in_profile_id = ctx.request_policy.credential_pause_signed_in_profile_id if ctx.request_policy else None
+    if outcome == "signed_in" and signed_in_profile_id:
+        receipt["browserProfileId"] = signed_in_profile_id
+    if ctx.credential_pause_anchor_tool_call_id:
+        receipt["anchorToolCallId"] = ctx.credential_pause_anchor_tool_call_id
+    return receipt
+
+
 def signed_in_facts(signed_in: SignedInProfile) -> str:
     return (
-        f"The user signed in to {signed_in.site} themselves in the live browser via the credential card. "
-        f"Skyvern saved that sign-in as browser profile {defang_card_text(signed_in.profile_name)} "
-        f"({signed_in.browser_profile_id}) with {signed_in.cookie_count} cookies. No credential was provided."
+        f"The user pressed Done on the credential card after using the live browser on {signed_in.site}. "
+        f"Skyvern saved that browser state as browser profile {defang_card_text(signed_in.profile_name)} "
+        f"({signed_in.browser_profile_id}) with {signed_in.cookie_count} cookies. Skyvern did not check whether "
+        "this browser state is signed in. No credential was provided. "
+        "This profile seeds this turn's tests only. Later turns and saved runs start from it only if it is set as "
+        "the workflow's browser profile and the user accepts. Sites often end cookie-only sign-ins within minutes "
+        "or hours, so saved runs may start signed out."
     )
 
 
@@ -884,9 +907,8 @@ def _connected_resume_text(credential: Credential) -> str:
 
 
 _SKIP_RESUME_TEXT = (
-    "The user chose not to connect a credential now. Continue without it: keep the credential parameter "
-    "placeholder in the draft, do not ask for the credential again this turn, and finish. If you run a test, "
-    "it may stop at the login step."
+    "The user chose not to connect a credential on this card. Keep the credential parameter placeholder in the "
+    "draft. If you run a test, it may stop at the login step."
 )
 
 
@@ -910,7 +932,7 @@ async def _try_resolve_credential_response(
         return CredentialPauseResolution(action="signed_in", signed_in=signed_in) if signed_in else None
     if not credential_id:
         return None
-    existing = await app.DATABASE.credentials.get_credentials_by_ids([credential_id], organization_id=organization_id)
+    existing = await load_credentials(organization_id, credential_ids=[credential_id])
     if not existing:
         return None
     return CredentialPauseResolution(action="connected", credential=existing[0])
@@ -963,7 +985,8 @@ def _manual_sign_in_offer(ctx: CopilotContext, login_page_urls: list[str]) -> Ma
     if (
         not ctx.browser_session_id
         or not site
-        or ctx.credential_origin_recovery is not None
+        # Only the recovery's own card is "asked"; a card for another site after a declined recovery still offers it.
+        or (ctx.credential_origin_recovery is not None and ctx.credential_origin_recovery.state == "asked")
         or (isinstance(policy, RequestPolicy) and policy.raw_secret_detected)
     ):
         return None
@@ -985,34 +1008,36 @@ async def _run_credential_pause(
     login_page_urls: list[str],
     update_credential_id: str | None = None,
     admit_connected: Callable[[Credential], Awaitable[bool]] | None = None,
-    allow_second_ask: bool = False,
     anchor_tool_call_id: str | None = None,
     registration: WorkflowCopilotCredentialRegistration | None = None,
 ) -> CredentialPauseResolution | None:
     """Send the credential card and wait for the user's decision.
 
     Returns the resolution, or None to let the caller proceed without one
-    (kill-switch off, client can't render the frame, already paused once this
-    turn, no shared cache, unrecoverable client disconnect, or timeout).
+    (kill-switch off, client can't render the frame, no shared cache,
+    unrecoverable client disconnect, or timeout).
     Recovery-capable clients restore the same active card through chat history.
     """
     update_ask = update_credential_id is not None
     ctx.credential_registration_outcome = None
-    if not credential_pause_transport_ready(ctx, copilot_config, allow_second_ask=update_ask or allow_second_ask):
+    if not credential_pause_transport_ready(ctx, copilot_config):
         return None
-    # Latch before async checks so a declined transport cannot trigger another pause. Only the pick ask
-    # spends credential_pause_used; request_credential_pause latches the update ask.
     # A pause no tool call raised (the end-of-turn ask) renders after the newest row instead.
     if anchor_tool_call_id is None and ctx.narrator_state is not None:
         anchor_tool_call_id = ctx.narrator_state.last_tool_call_id
+    # Latched before the async checks, so a declined transport cannot set off the run-derived ask.
     if not update_ask:
         ctx.credential_pause_used = True
-        ctx.credential_pause_anchor_tool_call_id = anchor_tool_call_id
 
     def settle(outcome: str) -> None:
         # An update card asks to fix a credential already chosen, so the turn keeps its pick card's state.
+        # Outcome and anchor change together, so a card cancelled mid-wait leaves the earlier card's receipt intact.
         if not update_ask:
             ctx.credential_pause_outcome = outcome
+            ctx.credential_pause_anchor_tool_call_id = anchor_tool_call_id
+            receipt = credential_pause_receipt(ctx)
+            if receipt is not None:
+                ctx.credential_pause_receipts.append(receipt)
 
     cache = getattr(app, "CACHE", None)
     if cache is None:
@@ -1031,7 +1056,40 @@ async def _run_credential_pause(
         if isinstance(policy, RequestPolicy):
             # Bind an answer to the URLs on this card, never an earlier unanswered ask.
             policy.credential_ask_login_page_urls = list(login_page_urls)
-        credential_refs = list(policy.credential_refs) if isinstance(policy, RequestPolicy) else []
+        # A recovery card pins nothing: its ask follows a refusal of the credential already in hand.
+        credential_refs = (
+            list(policy.credential_refs) if isinstance(policy, RequestPolicy) and admit_connected is None else []
+        )
+    # The same record the missing-origin fill refusal reads, so the card offers what that refusal promised.
+    named = policy.current_turn_named_credential_ids if isinstance(policy, RequestPolicy) else set()
+    plain_pick_ask = update_credential_id is None and registration is None and admit_connected is None
+    # One origin, as `_bind_connected_credential_origin` requires: the card names the site the click binds.
+    # Every URL must parse: the card reads the site from the first one with a more lenient parser.
+    ask_origins = [parts[-1] if (parts := url_parts(url)) is not None else None for url in login_page_urls]
+    one_site = None not in ask_origins and len(set(ask_origins)) == 1
+    named_credential_id = next(iter(named)) if len(named) == 1 and plain_pick_ask and one_site else None
+    if named_credential_id is not None and isinstance(policy, RequestPolicy):
+        # A login already saved or confirmed for another site is left to the picker, so one click never rebinds it.
+        known_urls = [
+            policy.live_page_admitted_urls.get(named_credential_id),
+            policy.carried_credential_urls.get(named_credential_id),
+        ] + [
+            credential.tested_url
+            for credential in policy.resolved_credentials
+            if credential.credential_id == named_credential_id
+        ]
+        if any(url and (parts := url_parts(url)) is not None and parts[-1] != ask_origins[0] for url in known_urls):
+            named_credential_id = None
+    if named_credential_id is not None:
+        from skyvern.forge.sdk.copilot.tools.credential_fill import _read_vault_named_sites  # circular import
+
+        # The vault entry's sites grant whole-site, so they are compared by site; an unreadable entry offers nothing.
+        try:
+            vault_sites = await _read_vault_named_sites(ctx, named_credential_id)
+        except PermissionError:
+            vault_sites = None
+        if vault_sites is None or (vault_sites and not any(same_site(login_page_urls[0], uri) for uri in vault_sites)):
+            named_credential_id = None
     timeout_seconds = copilot_config.credential_pause_timeout_seconds
     now = datetime.now(timezone.utc)
 
@@ -1058,6 +1116,7 @@ async def _run_credential_pause(
         message=message,
         login_page_urls=login_page_urls,
         credential_refs=credential_refs,
+        named_credential_id=named_credential_id,
         timeout_seconds=timeout_seconds,
         expires_at=expires_at,
         anchor_tool_call_id=anchor_tool_call_id,
@@ -1080,10 +1139,12 @@ async def _run_credential_pause(
         else _credential_pause_record_ttl(timeout_seconds),
     )
     await stream.send(card)
+    sign_in_started = False
 
     async def _invalidate_active_pause_record(
         *, keep_live: bool = False
     ) -> CredentialPauseResolution | None | Literal["live"]:
+        nonlocal sign_in_started
         # The waiter can exit (disconnect, genuine timeout, cancellation, or an
         # unexpected error) well before expires_at -- invalidate the record so a
         # late POST (e.g. the tab reconnects) gets a clear 409 instead of silently
@@ -1099,6 +1160,8 @@ async def _run_credential_pause(
                 return raced_in
             active_key = credential_pause_active_key(organization_id, chat_id, turn_id)
             record = _decode_active_pause(await cache.get(active_key))
+            if record is not None and record.resume_token == resume_token and record.manual_sign_in is not None:
+                sign_in_started = sign_in_started or record.manual_sign_in.started
             live_until = record.live_until() if record is not None and record.resume_token == resume_token else None
             if keep_live and live_until is not None and datetime.now(timezone.utc) < live_until:
                 return "live"
@@ -1149,7 +1212,7 @@ async def _run_credential_pause(
         return None
 
     try:
-        with pause_human_input(ctx, "credential"):
+        with pause_human_input(ctx, "credential") as human_wait:
             wait_seconds: float = timeout_seconds
             while True:
                 waited = await _wait_for_credential_response(
@@ -1167,6 +1230,7 @@ async def _run_credential_pause(
                 resolution = settled
                 invalidated = True
                 break
+            human_wait.unattended = resolution is None and not sign_in_started
     except BaseException:
         # Covers CancelledError (a direct BaseException subclass, not Exception)
         # alongside any unexpected failure in the wait loop itself -- the frame's
@@ -1216,7 +1280,7 @@ async def _run_credential_pause(
             return None
         if isinstance(policy, RequestPolicy):
             _apply_signed_in_profile_to_policy(ctx, policy, resolution.signed_in)
-        ctx.credential_pause_outcome = "signed_in"
+        settle("signed_in")
         await answered("signed_in", signed_in=resolution.signed_in)
         return resolution
 
@@ -1235,12 +1299,12 @@ async def _run_credential_pause(
     # A credential this card just generated has no saved site yet; the card's own origin is its only placement.
     is_generated = credential.credential_id == generated_credential_id
     if admit_connected is not None and not is_generated and not await admit_connected(credential):
-        ctx.credential_pause_outcome = "not_admitted"
+        settle("not_admitted")
         await answered("not_admitted")
         return resolution
     if isinstance(policy, RequestPolicy):
-        _apply_connected_credential_to_policy(ctx, policy, credential)
-    ctx.credential_pause_outcome = "connected"
+        apply_connected_credential_to_policy(ctx, policy, credential)
+    settle("connected")
     await answered("connected", credential)
     return replace(resolution, generated=True) if is_generated else resolution
 
@@ -1272,7 +1336,6 @@ async def request_credential_pause(
     update_credential_id: str | None = None,
     update_reason: Literal["credential_missing_totp", "credential_rejected_by_site"] = "credential_missing_totp",
     admit_connected: Callable[[Credential], Awaitable[bool]] | None = None,
-    allow_second_ask: bool = False,
     anchor_tool_call_id: str | None = None,
     registration: WorkflowCopilotCredentialRegistration | None = None,
 ) -> CredentialPauseResolution | None:
@@ -1284,7 +1347,7 @@ async def request_credential_pause(
     if update_ask:
         ctx.credential_totp_update_asked = True
     try:
-        resolution = await _run_credential_pause(
+        return await _run_credential_pause(
             ctx,
             message,
             stream,
@@ -1297,13 +1360,9 @@ async def request_credential_pause(
             login_page_urls=[login_page_url],
             update_credential_id=update_credential_id,
             admit_connected=admit_connected,
-            allow_second_ask=allow_second_ask,
             anchor_tool_call_id=anchor_tool_call_id,
             registration=None if update_ask else registration,
         )
-        if not update_ask:
-            ctx.credential_pause_reaskable_by_run = resolution is None or resolution.action == "skip"
-        return resolution
     finally:
         ctx.credential_ask_in_flight = False
         release_credential_pause_gate(ctx)
@@ -1342,14 +1401,8 @@ async def maybe_credential_pause(
     # A refused cross-site fill owns the card: it asks for its own origin, and a declined one is not asked again.
     if reason is None or ctx.credential_origin_recovery is not None:
         return None
-    # Exactly True, not merely truthy: a partial stand-in returns a truthy
-    # object for any attribute, which would hand the budget back on every turn.
-    if ctx.credential_pause_reaskable_by_run is True:
-        # The spent card was a guess the user never answered; this ask has a run behind it. Hand the
-        # budget back once, so an unanswered guess cannot silently cost the turn its real card.
-        ctx.credential_pause_reaskable_by_run = False
-        ctx.credential_pause_used = False
-    if not credential_pause_transport_ready(ctx, copilot_config):
+    # The run-derived ask never reopens a card the turn raised; the model's own request_credential can.
+    if ctx.credential_pause_used or not credential_pause_transport_ready(ctx, copilot_config):
         return None
     # Local import: same module-load-cycle reason as _assemble_resume_messages.
     from skyvern.forge.sdk.copilot.enforcement import _parse_normalized_final_response

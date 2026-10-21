@@ -7,7 +7,6 @@ in any ``copilot/`` business logic — derivation lives in
 
 from __future__ import annotations
 
-import re
 from enum import StrEnum
 from typing import Literal
 
@@ -31,26 +30,6 @@ class OutputPolicyReason(StrEnum):
     OUTPUT_POLICY_CONTEXT_MISSING = "output_policy_context_missing"
 
 
-_UNSAFE_IDENTIFIER_RE = re.compile(r"[^A-Za-z0-9_\- ]")
-
-
-class UnresolvedRuntimeFailure(BaseModel):
-    """A failure a successful turn could not clear, recorded so the outcome is gradeable after the
-    fact; the reply text derives independently, and nothing keys success or verification on this."""
-
-    model_config = ConfigDict(extra="ignore", frozen=True)
-
-    workflow_run_id: str
-    block_label: str
-
-    @field_validator("workflow_run_id", "block_label")
-    @classmethod
-    def _bare_identifier(cls, value: str) -> str:
-        # Both fields are model-authored and reach the chat reply and the history API, so they are
-        # reduced to bounded identifiers here rather than at each surface that renders them.
-        return _UNSAFE_IDENTIFIER_RE.sub("", value)[:80].strip()
-
-
 class ConnectedAccountChoice(BaseModel):
     model_config = ConfigDict(extra="ignore", frozen=True)
 
@@ -58,6 +37,16 @@ class ConnectedAccountChoice(BaseModel):
     name: str
     state: str
     email_address: str | None = None
+
+
+GoogleSetupScopeProfile = Literal["gmail", "google_sheets"]
+
+
+class GoogleSetupOffer(BaseModel):
+    model_config = ConfigDict(extra="ignore", frozen=True)
+
+    scope_profile: GoogleSetupScopeProfile
+    connection_id: str | None = None
 
 
 class DeliveredOutputFile(BaseModel):
@@ -117,8 +106,8 @@ class TurnOutcome(BaseModel):
     # interrupted row this way; False only reaches a client from a backend that still replaced rows.
     interrupted_row_final: bool = False
     idempotency_digest: str | None = None
-    unresolved_runtime_failure: UnresolvedRuntimeFailure | None = None
     connected_account_choices: list[ConnectedAccountChoice] | None = None
+    google_setup_offers: list[GoogleSetupOffer] | None = None
     output_files: list[DeliveredOutputFile] | None = None
 
     @field_validator("output_policy_reasons", mode="before")

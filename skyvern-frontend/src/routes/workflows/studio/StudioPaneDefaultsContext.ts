@@ -22,7 +22,12 @@ export type StudioPaneDefaultsValue = {
       slots: readonly StudioPaneId[],
       stageWidth: number,
     ) => StudioPaneId[] | PanesCutFrom,
+    // layout: the user picked the whole pane set, so leaving Editor out of it
+    // counts as closing Editor even when it was already closed.
+    options?: { byUser?: boolean; layout?: boolean },
   ) => void;
+  // Opens Editor unless the user closed it during this visit.
+  reopenEditor: () => void;
   setPaneWidths: (widths: PaneWidths) => void;
   resetPaneWidths: () => void;
   preserveNextEntry: (
@@ -42,6 +47,7 @@ export const StudioPaneDefaultsContext = createContext<StudioPaneDefaultsValue>(
     entryId: 0,
     getPanes: () => DEFAULT_STUDIO_PANES,
     updatePanes: noop,
+    reopenEditor: noop,
     setPaneWidths: noop,
     resetPaneWidths: noop,
     preserveNextEntry: noop,

@@ -1,0 +1,170 @@
+---
+title: Event triggers
+description: Start a Skyvern workflow from an external event using a signed HTTP request, field mapping, and delivery history.
+keywords:
+  - event trigger
+  - signed HTTP
+  - HMAC-SHA256
+  - JSON Pointer
+  - delivery log
+  - replay
+---
+
+An event trigger starts a workflow when an external system sends a signed HTTP request to a trigger-specific endpoint. Skyvern verifies the signature, maps values from the JSON body to workflow inputs, records the delivery, and dispatches the run asynchronously.
+
+## Create a trigger in Studio
+
+1. Open the workflow in Studio and select **Triggers** in the top bar.
+2. Select **Add**, then map any workflow inputs to fields in the request body.
+3. Save the endpoint URL and signing secret. The URL stays available in the trigger's **Setup** tab; the secret is shown only when the trigger is created or its secret is rotated.
+
+Only organization admins can create or manage triggers, rotate secrets, and replay deliveries. Trigger management is available in Studio; there are no public SDK management methods yet.
+
+## Map the event body
+
+Mappings use [JSON Pointer (RFC 6901)](https://www.rfc-editor.org/rfc/rfc6901). Each workflow input maps to a pointer into the incoming JSON object. For example, for this body:
+
+```json
+{
+  "order": {
+    "id": "ord_123",
+    "customer": { "email": "buyer@example.com" }
+  }
+}
+```
+
+map `order_id` to `/order/id` and `customer_email` to `/order/customer/email`. Pointers must start with `/`; in a key name, encode `~` as `~0` and `/` as `~1`.
+
+## Send a signed request
+
+Send a `POST` to the endpoint URL from Studio with these headers:
+
+| Header | Value |
+|---|---|
+| `X-Skyvern-Timestamp` | Unix epoch seconds, 1–12 digits. The timestamp must be within 300 seconds of Skyvern's clock. |
+| `X-Skyvern-Event-Id` | A unique ID for the source event matching `[A-Za-z0-9._-]{1,128}`. Colons are not allowed. |
+| `X-Skyvern-Signature` | `v1=` followed by the lowercase hexadecimal HMAC-SHA256 digest. |
+
+Calculate the HMAC with the UTF-8 bytes of the trigger secret as the key. Sign the exact raw request body bytes, prefixed with the UTF-8 bytes of `v1:{timestamp}:{event_id}:`:
+
+```text
+HMAC-SHA256(secret, UTF8("v1:{timestamp}:{event_id}:") || raw_body_bytes)
+```
+
+The body must be a JSON object no larger than 256 KB. Do not parse and re-serialize a body after signing it; send the same bytes that were signed.
+
+These are **inbound event-trigger signatures**. They differ from Skyvern's [outbound webhook signature](/developers/production#verify-the-signature), which uses a different header convention and key. Do not use the outbound webhook verifier for event triggers.
+
+Set the endpoint URL and secret from Studio in your environment. Keep the secret out of source control and logs.
+
+```bash
+export SKYVERN_TRIGGER_URL='https://api.skyvern.com/api/v1/triggers/etr_123456789/events'
+export SKYVERN_TRIGGER_SECRET='your-trigger-secret'
+```
+
+Each example below creates a new event ID. For retries of the same source event, persist and reuse its event ID and body; generate a fresh timestamp and signature for each attempt.
+
+<CodeGroup>
+```bash cURL
+URL="${SKYVERN_TRIGGER_URL:?Set SKYVERN_TRIGGER_URL to the endpoint URL from Studio}"
+BODY='{"order":{"id":"ord_123","customer":{"email":"buyer@example.com"}}}'
+TS="$(date +%s)"
+EVENT_ID="evt_${TS}_$RANDOM"
+SIG="$(
+  printf 'v1:%s:%s:%s' "$TS" "$EVENT_ID" "$BODY" |
+    python3 -c 'import hashlib, hmac, os, sys
+print(hmac.new(os.environ["SKYVERN_TRIGGER_SECRET"].encode("utf-8"),
+               sys.stdin.buffer.read(), hashlib.sha256).hexdigest())'
+)"
+
+curl -sS -X POST "$URL" \
+  -H 'Content-Type: application/json' \
+  -H "X-Skyvern-Timestamp: $TS" \
+  -H "X-Skyvern-Event-Id: $EVENT_ID" \
+  -H "X-Skyvern-Signature: v1=$SIG" \
+  --data-binary "$BODY"
+```
+
+```python Python
+import hashlib, hmac, json, os, time, urllib.request, uuid
+
+url = os.environ["SKYVERN_TRIGGER_URL"]
+body = json.dumps(
+    {"order": {"id": "ord_123", "customer": {"email": "buyer@example.com"}}},
+    separators=(",", ":"),
+).encode("utf-8")
+timestamp = str(int(time.time()))
+event_id = f"evt_{uuid.uuid4()}"
+signature = hmac.new(
+    os.environ["SKYVERN_TRIGGER_SECRET"].encode("utf-8"),
+    f"v1:{timestamp}:{event_id}:".encode("utf-8") + body,
+    hashlib.sha256,
+).hexdigest()
+
+request = urllib.request.Request(url, data=body, method="POST", headers={
+    "Content-Type": "application/json",
+    "X-Skyvern-Timestamp": timestamp,
+    "X-Skyvern-Event-Id": event_id,
+    "X-Skyvern-Signature": f"v1={signature}",
+})
+with urllib.request.urlopen(request) as response:
+    print(response.status, response.read().decode())
+```
+
+```javascript Node.js 18+
+import crypto from "node:crypto";
+
+const url = process.env.SKYVERN_TRIGGER_URL;
+const secret = process.env.SKYVERN_TRIGGER_SECRET;
+if (!url || !secret) throw new Error("Set SKYVERN_TRIGGER_URL and SKYVERN_TRIGGER_SECRET");
+
+const body = Buffer.from(JSON.stringify({
+  order: { id: "ord_123", customer: { email: "buyer@example.com" } },
+}), "utf8");
+const timestamp = Math.floor(Date.now() / 1000).toString();
+const eventId = `evt_${crypto.randomUUID()}`;
+const signature = crypto
+  .createHmac("sha256", Buffer.from(secret, "utf8"))
+  .update(Buffer.from(`v1:${timestamp}:${eventId}:`, "utf8"))
+  .update(body)
+  .digest("hex");
+
+const response = await fetch(url, {
+  method: "POST",
+  headers: {
+    "Content-Type": "application/json",
+    "X-Skyvern-Timestamp": timestamp,
+    "X-Skyvern-Event-Id": eventId,
+    "X-Skyvern-Signature": `v1=${signature}`,
+  },
+  body,
+});
+console.log(response.status, await response.text());
+```
+</CodeGroup>
+
+## Responses and retries
+
+| Status | Meaning | What to do |
+|---|---|---|
+| `202` | New event accepted and queued for asynchronous dispatch. The response includes `delivery_id` and `status`; it does not include a run ID. | Check the delivery log for dispatch status and the run link. |
+| `200` | This event ID and body were already received. The response has the current delivery status and `run_id` (null until a run starts). | Treat as an idempotent duplicate; check the delivery log. |
+| `409` | The event ID was previously used with a different body. | Do not blindly retry with a new ID; verify the source event and its ID. |
+| `422` | The payload was rejected by the current mapping. A rejected delivery is recorded. | Fix the mapping in Studio, then have an admin replay the delivery. |
+| `401` | The signature is invalid, the timestamp is malformed, or it is outside the 300-second window. | Check the secret and system clock, then sign again. |
+| `400` | The event ID is invalid or the body is not a JSON object. | Correct the ID or body before retrying. |
+| `413` | The raw body exceeds 256 KB. | Send a smaller JSON object. |
+| `404` | The trigger is unknown or disabled. | Check the endpoint URL and enable the trigger in Studio. |
+| `503` | The receiver is temporarily unable to accept the event. | Retry with the same event ID and body, and a fresh timestamp and signature. |
+
+If a request times out or you do not receive a response, retry with the **same event ID and exact same body**. This lets Skyvern return the existing delivery instead of creating a second one. Refresh the timestamp and signature on every attempt. Do not retry a `422` unchanged; use Studio replay after correcting the mapping.
+
+## Delivery log and replay
+
+In Studio, open the trigger and select **Deliveries** to see the delivery status, reason, payload size and SHA-256, and any linked run. The event body is not shown. Organization members can read delivery metadata; only admins can replay a rejected delivery. Replay uses the stored payload and applies the trigger's current mapping. If the stored payload has expired, it cannot be replayed.
+
+## Retention and secret rotation
+
+The request payload is encrypted at rest. It is retained for 30 days by default. For organizations with a configured data-retention period, that period applies with a 7-day minimum; it may be shorter or longer than 30 days. Retention applies to the stored trigger payload; values copied into workflow run inputs follow the normal run-data retention policy.
+
+Rotating a trigger secret is an immediate cut-over: the old secret stops working as soon as rotation completes, with no overlap period. Update every sender with the new secret shown in Studio when you rotate it.

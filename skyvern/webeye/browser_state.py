@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from typing import TYPE_CHECKING, Awaitable, Callable, Literal, Protocol
+from urllib.parse import urlparse
 
 from playwright.async_api import BrowserContext, Page, Playwright
 
@@ -19,6 +20,11 @@ if TYPE_CHECKING:
 # URLs a tab reports when it holds no document — including ":" , which Chrome reports for a tab
 # whose only navigation turned into a download.
 BLANK_PAGE_URLS = {"about:blank", ":"}
+
+
+def is_selectable_page_url(url: str) -> bool:
+    """Whether the working-page lookup can pick a tab at `url`; others (an Edge download hub) are skipped."""
+    return url in BLANK_PAGE_URLS or url == "chrome-error://chromewebdata/" or urlparse(url).scheme in ("http", "https")
 
 
 class BrowserState(Protocol):
@@ -112,6 +118,10 @@ class BrowserState(Protocol):
         wait_until: Literal["load", "domcontentloaded", "commit"] = "load",
     ) -> None: ...
 
+    def begin_navigation(self) -> None: ...
+
+    async def record_navigation_result(self, error: BaseException | None, url: str | None = None) -> None: ...
+
     async def get_or_create_page(
         self,
         url: str | None = None,
@@ -126,6 +136,7 @@ class BrowserState(Protocol):
         browser_address: str | None = None,
         browser_profile_id: str | None = None,
         browser_session_id: str | None = None,
+        navigation_run_id: str | None = None,
     ) -> Page: ...
 
     async def list_valid_pages(self, max_pages: int = settings.BROWSER_MAX_PAGES_NUMBER) -> list[Page]: ...
@@ -139,6 +150,10 @@ class BrowserState(Protocol):
     async def new_page(self) -> Page: ...
 
     async def reload_page(self, degradation: bool = False, page: Page | None = None) -> None: ...
+
+    async def wait_for_main_frame_navigation(self, page: Page, deadline: float) -> None:
+        """Wait, until at most the monotonic ``deadline``, for ``page``'s in-flight main-frame navigation to settle."""
+        ...
 
     async def close(self, close_browser_on_completion: bool = True, release_driver: bool | None = None) -> bool: ...
 
@@ -168,6 +183,7 @@ class BrowserState(Protocol):
         wait_seconds: float = 0,
         must_included_tags: list[str] | None = None,
         allow_transient_ui_suppression: bool = False,
+        navigation_deadline: float | None = None,
     ) -> ScrapedPage: ...
 
 

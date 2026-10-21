@@ -192,6 +192,8 @@ describe("Google connection notice hydration", () => {
       connectionId: null,
       displayName: null,
       condition: "unbound",
+      scopeProfile: "google_sheets",
+      origin: "workflow",
       choices: [
         {
           connection_id: "goac_active",
@@ -233,12 +235,50 @@ describe("Google connection notice hydration", () => {
         connectionId: "goac_error",
         displayName: "Work Sheets",
         condition: "unusable",
+        scopeProfile: "google_sheets",
+        origin: "workflow",
       },
     ]);
     expect(
       hydrateNarrativeFromPayload(basePayload({ googleConnectionNotices: raw }))
         ?.googleConnectionNotices,
     ).toEqual(parseGoogleConnectionNotices(raw));
+  });
+
+  it("keys notices by profile so unbound Gmail and Sheets setup cards both survive", () => {
+    const unbound = (scopeProfile?: string) => ({
+      provider: "google",
+      connectionId: null,
+      displayName: null,
+      condition: "unbound",
+      ...(scopeProfile ? { scopeProfile, origin: "setup" } : {}),
+      choices: [],
+    });
+
+    const parsed = parseGoogleConnectionNotices([
+      unbound("gmail"),
+      unbound("google_sheets"),
+      unbound(),
+      unbound("gmail_send"),
+    ]);
+
+    expect(
+      parsed.map((notice) => [notice.scopeProfile, notice.origin]),
+    ).toEqual([
+      ["gmail", "setup"],
+      ["google_sheets", "setup"],
+    ]);
+    expect(parseGoogleConnectionNotices([unbound()])).toEqual([
+      {
+        provider: "google",
+        connectionId: null,
+        displayName: null,
+        condition: "unbound",
+        scopeProfile: "google_sheets",
+        origin: "workflow",
+        choices: [],
+      },
+    ]);
   });
 
   it("defaults absent and malformed notice payloads to an empty list", () => {

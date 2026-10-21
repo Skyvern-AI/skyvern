@@ -402,9 +402,48 @@ describe("SaveButton confirmation gating", () => {
       active: false,
       draft: "",
       entrySnapshot: "",
+      authoringInProgress: false,
+      copilotAcceptance: null,
     });
     useRecordingStore.setState({ isRecording: false });
   });
+
+  test.each([
+    {
+      lock: { authoringInProgress: true },
+      reason: "Finish the current authoring action before saving",
+    },
+    {
+      lock: { copilotAcceptance: Symbol("acceptance") },
+      reason: "Wait for the Copilot change to finish",
+    },
+  ])(
+    "disables Save while the editor is locked: $reason",
+    ({ lock, reason }) => {
+      const clean = saveData([block("a", { url: "x" })]);
+      useWorkflowHasChangesStore.setState({
+        getSaveData: () => clean,
+        hasChanges: true,
+        saveIsPending: false,
+      });
+      useWorkflowYamlEditorStore.setState(lock);
+
+      renderSaveButton();
+      const save = screen.getByRole("button", {
+        name: "Save workflow",
+        description: reason,
+      });
+      expect(save.matches(":disabled")).toBe(true);
+
+      act(() =>
+        useWorkflowYamlEditorStore.setState({
+          authoringInProgress: false,
+          copilotAcceptance: null,
+        }),
+      );
+      expect(save.matches(":disabled")).toBe(false);
+    },
+  );
 
   test("confirms a dirty draft even when contentDirty is stale-false", () => {
     const clean = saveData([block("a", { url: "x" })]);

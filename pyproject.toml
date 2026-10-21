@@ -1,6 +1,6 @@
 [project]
 name = "skyvern"
-version = "1.0.55"
+version = "1.0.56"
 description = ""
 authors = [{ name = "Skyvern AI", email = "info@skyvern.com" }]
 requires-python = ">=3.11,<3.15"
@@ -189,6 +189,7 @@ cloud = [
     "redis>=5.0.3,<6",
     "pyrate-limiter>=3.7.0,<4",
     "opentelemetry-exporter-otlp-proto-grpc>=1.41.1,<2",
+    "opentelemetry-exporter-otlp-proto-http>=1.41.1,<2",
     "kr8s>=0.20.14,<1",
     # OpenTelemetry instrumentation
     "opentelemetry-distro>=0.60b1,<1",

@@ -15,7 +15,7 @@ from skyvern.config import settings
 from skyvern.constants import BROWSER_DOWNLOADING_SUFFIX, DOWNLOAD_FILE_PREFIX
 from skyvern.exceptions import DownloadSaveIncompleteError
 from skyvern.forge import app
-from skyvern.forge.sdk.api.aws import AsyncAWSClient, S3StorageClass, S3Uri, _recording_content_type
+from skyvern.forge.sdk.api.aws import AsyncAWSClient, S3ObjectStream, S3StorageClass, S3Uri, _recording_content_type
 from skyvern.forge.sdk.api.files import (
     calculate_sha256_for_file,
     create_named_temporary_file,
@@ -30,6 +30,9 @@ from skyvern.forge.sdk.artifact.signing import SENSITIVE_ARTIFACT_URL_EXPIRY_SEC
 from skyvern.forge.sdk.artifact.storage.base import (
     FILE_EXTENTSION_MAP,
     BaseStorage,
+    StoredObjectChangedError,
+    StoredObjectVersion,
+    StreamingArtifactStorage,
     _file_infos_from_artifacts,
     _file_infos_from_download_artifacts,
     dedupe_run_scoped_download_artifacts,
@@ -97,7 +100,7 @@ def empty_read_decision(
     }
 
 
-class S3Storage(BaseStorage):
+class S3Storage(BaseStorage, StreamingArtifactStorage):
     _PATH_VERSION = "v1"
     # Caps concurrent head_object calls from S3 listing reads. /browser_sessions/history fans out over up to 100
     # sessions at once, so the semaphore lives on the instance and every listing call on it shares one cap.
@@ -235,6 +238,29 @@ class S3Storage(BaseStorage):
         object_size_bytes: int | None = None,
     ) -> S3StorageClass:
         return S3StorageClass.STANDARD
+
+    def can_stream_artifact(self, artifact: Artifact) -> bool:
+        # retrieve_artifact decompresses a zstd HAR and extracts a bundle member from its archive after the read.
+        return not artifact.bundle_key and not artifact.uri.endswith(S3_ZSTD_COMPRESSED_SUFFIX)
+
+    async def stat_artifact(self, artifact: Artifact) -> StoredObjectVersion | None:
+        try:
+            info = await self.async_client.get_object_info(artifact.uri)
+        except Exception as e:
+            self.async_client.log_download_failure(e, artifact.uri)
+            return None
+        return StoredObjectVersion(size=info["ContentLength"], etag=info.get("ETag"))
+
+    async def open_artifact_stream(
+        self, artifact: Artifact, *, byte_range: tuple[int, int] | None = None, etag: str | None = None
+    ) -> S3ObjectStream | None:
+        try:
+            return await self.async_client.open_download_stream(artifact.uri, byte_range=byte_range, if_match=etag)
+        except Exception as e:
+            if etag is not None and self.async_client._error_code(e) == "PreconditionFailed":
+                raise StoredObjectChangedError(artifact.uri) from e
+            self.async_client.log_download_failure(e, artifact.uri)
+            return None
 
     async def retrieve_artifact(self, artifact: Artifact) -> bytes | None:
         data = await self.async_client.download_file(artifact.uri)
@@ -1318,6 +1344,12 @@ class S3Storage(BaseStorage):
         """Download a managed org-scoped file from S3."""
         self.assert_managed_file_access(uri, organization_id)
         return await self.async_client.download_file(uri, log_exception=False)
+
+    async def managed_file_size(self, uri: str, organization_id: str) -> int | None:
+        self.assert_managed_file_access(uri, organization_id)
+        info = await self.async_client.get_object_info(uri)
+        size = info.get("ContentLength") if info else None
+        return size if isinstance(size, int) else None
 
     async def file_exists(self, uri: str) -> bool:
         """Check if a file exists at the given S3 URI."""

@@ -6,6 +6,7 @@ import {
 import { NodeBaseData } from "../types";
 import {
   type EmailBodyFormat,
+  type EmailTransport,
   debuggableWorkflowBlockTypes,
 } from "@/routes/workflows/types/workflowTypes";
 
@@ -24,6 +25,10 @@ export type SendEmailNodeData = NodeBaseData & {
   customSmtpPort: string | null;
   customSmtpUsername: string | null;
   customSmtpPassword: string | null;
+  transport: EmailTransport;
+  credentialId: string;
+  cc: string;
+  bcc: string;
 };
 
 export type SendEmailNode = Node<SendEmailNodeData, "sendEmail">;
@@ -42,6 +47,10 @@ export const sendEmailNodeDefaultData: SendEmailNodeData = {
   customSmtpPort: null,
   customSmtpUsername: null,
   customSmtpPassword: null,
+  transport: "smtp",
+  credentialId: "",
+  cc: "",
+  bcc: "",
   continueOnFailure: false,
   model: null,
 } as const;

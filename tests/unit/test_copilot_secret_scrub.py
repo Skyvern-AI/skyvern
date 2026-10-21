@@ -23,7 +23,7 @@ from skyvern.forge.sdk.copilot.output_utils import (
     MCP_RESULT_PROVENANCE_KEY,
     MCP_RESULT_PROVENANCE_VALUE,
 )
-from skyvern.forge.sdk.copilot.runtime import AgentContext, OriginRunRedactionRegistry
+from skyvern.forge.sdk.copilot.runtime import AgentContext
 from skyvern.forge.sdk.copilot.secret_scrub import (
     MIN_PERSISTED_REDACTION_LENGTH,
     REDACTED_SECRET_PLACEHOLDER,
@@ -498,37 +498,37 @@ class TestPersistenceSeam:
             assert form not in scrubbed
         assert REDACTED_SECRET_PLACEHOLDER in scrubbed
 
-    def test_browser_style_url_encoding_is_a_registered_form(self) -> None:
-        """encodeURIComponent leaves `!*'()` literal where Python's quote does not."""
+    @pytest.mark.parametrize(
+        ("password", "browser_encoded"),
+        [
+            ("Sp1r!t&Level<2026>", "Sp1r!t%26Level%3C2026%3E"),
+            ("p@ss word", "p@ss%20word"),
+            ('a"b:c', "a%22b:c"),
+            ("Tr0ub4dor&3 x", "Tr0ub4dor&3%20x"),
+            ("50%off now", "50%off%20now"),
+            ("foo\\bar x", "foo/bar%20x"),
+            ("tab\tline\nbreak", "tablinebreak"),
+        ],
+        ids=[
+            "encodeURIComponent-query",
+            "chromium-path-space",
+            "chromium-path-quote",
+            "chromium-path-ampersand",
+            "chromium-path-percent",
+            "chromium-path-backslash",
+            "chromium-path-tab-newline",
+        ],
+    )
+    def test_browser_style_url_encoding_is_a_registered_form(self, password: str, browser_encoded: str) -> None:
+        """encodeURIComponent leaves `!*'()` literal in a query, and Chromium leaves `@&:` literal in a path."""
         ctx = _agent_ctx()
-        password = "Sp1r!t&Level<2026>"
         register_secret_scrub_value(ctx, password)
-        browser_encoded = "Sp1r!t%26Level%3C2026%3E"
 
         assert browser_encoded in registered_scrub_values(ctx)
         assert scrub_secrets_from_text(ctx, f"?next={browser_encoded}") == f"?next={REDACTED_SECRET_PLACEHOLDER}"
 
 
 class TestOriginRunBinding:
-    def test_binding_a_complete_registry_marks_the_run_bound(self) -> None:
-        ctx = _agent_ctx()
-        ctx.origin_run_redaction_registry = OriginRunRedactionRegistry(
-            "wr_1", {"password": _FAKE_PASSWORD}, contains_sensitive_values=True, contains_all_sensitive_values=True
-        )
-
-        assert secret_scrub.register_matching_origin_run_redaction_values(ctx, "wr_1") is True
-        assert secret_scrub.origin_runs_bound_to_scrubber(ctx) == {"wr_1"}
-        assert _FAKE_PASSWORD in registered_scrub_values(ctx)
-
-    def test_an_incomplete_registry_binds_nothing(self) -> None:
-        ctx = _agent_ctx()
-        ctx.origin_run_redaction_registry = OriginRunRedactionRegistry(
-            "wr_1", {"password": _FAKE_PASSWORD}, contains_sensitive_values=True, contains_all_sensitive_values=False
-        )
-
-        assert secret_scrub.register_matching_origin_run_redaction_values(ctx, "wr_1") is False
-        assert secret_scrub.origin_runs_bound_to_scrubber(ctx) == set()
-
     def test_importing_this_module_stays_cheap(self) -> None:
         """This module sits on the logging and span-exception paths.
 

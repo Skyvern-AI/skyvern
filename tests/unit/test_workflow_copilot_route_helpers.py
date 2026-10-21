@@ -20,9 +20,10 @@ import pytest
 from pydantic import ValidationError
 
 from skyvern.forge import app
-from skyvern.forge.sdk.copilot.agent import _build_timeout_exit_result
+from skyvern.forge.sdk.copilot.agent import _build_narrative_payload, _build_timeout_exit_result
 from skyvern.forge.sdk.copilot.context import AgentResult, CopilotContext, ProposedCredential, StructuredContext
 from skyvern.forge.sdk.copilot.interruption import UNTESTED_DRAFT_PRESERVED, cancel_notice
+from skyvern.forge.sdk.copilot.tools.run_execution import _record_executed_block_labels
 from skyvern.forge.sdk.copilot.workflow_credential_utils import workflow_credential_ids
 from skyvern.forge.sdk.routes.workflow_copilot import (
     _assistant_execution_receipts,
@@ -46,6 +47,7 @@ from skyvern.forge.sdk.routes.workflow_copilot import (
     _should_restore_persisted_workflow,
     _turn_attachment_ids,
     _workflow_copilot_ingress_log_fields,
+    convert_to_history_messages,
 )
 from skyvern.forge.sdk.schemas.workflow_copilot import (
     CopilotAttachedFile,
@@ -63,7 +65,12 @@ from skyvern.forge.sdk.workflow.models.parameter import (
 )
 from skyvern.forge.sdk.workflow.models.workflow import Workflow, WorkflowDefinition
 from skyvern.schemas.runs import ProxyLocation
-from tests.unit.copilot_test_helpers import make_copilot_ctx
+from tests.unit.copilot_test_helpers import (
+    RECEIPT_WORKFLOW_YAML,
+    make_copilot_ctx,
+    receipt_coverage_after,
+    receipt_message,
+)
 
 
 def test_workflow_copilot_ingress_log_fields_are_content_free() -> None:
@@ -100,10 +107,66 @@ def test_assistant_history_retains_execution_receipts_after_proposal_clear() -> 
         sender=WorkflowCopilotChatSender.AI,
         narrative_payload={"testedBlockFingerprints": {"step": ["version_b"], "other": ["version_c"]}},
     )
+    crashed = MagicMock(sender=WorkflowCopilotChatSender.AI, narrative_payload={"terminal": "error"})
 
-    assert _assistant_execution_receipts([first, second]) == {
-        "step": {"version_a", "version_b"},
+    assert _assistant_execution_receipts([first, second, crashed], None) == {
+        "step": {"version_b"},
         "other": {"version_c"},
+    }
+    assert _assistant_execution_receipts([], {"_copilot_tested_block_fingerprints": {"step": ["version_a"]}}) == {
+        "step": {"version_a"}
+    }
+
+
+def _receipt_turn(seed: dict[str, set[str]], statuses: dict[str, str]) -> tuple[CopilotContext, MagicMock]:
+    ctx = make_copilot_ctx(workflow_yaml=RECEIPT_WORKFLOW_YAML, executed_block_fingerprints=seed)
+    _record_executed_block_labels(
+        ctx,
+        {"ok": True, "data": {"blocks": [{"label": label, "status": status} for label, status in statuses.items()]}},
+    )
+    payload = _build_narrative_payload(ctx, terminal="response", terminal_message="done", narrative_summary=None)
+    return ctx, receipt_message(payload)
+
+
+@pytest.mark.parametrize(
+    ("turn_1", "turn_2", "tested_in_turn_3"),
+    [
+        (
+            {"sign_in": "completed", "read_metric": "completed"},
+            {"sign_in": "failed", "read_metric": "completed"},
+            {"read_metric"},
+        ),
+        ({"sign_in": "completed"}, {"read_metric": "completed"}, {"sign_in", "read_metric"}),
+        (
+            {"sign_in": "completed", "read_metric": "completed"},
+            {"sign_in": "failed", "read_metric": "failed"},
+            set(),
+        ),
+    ],
+    ids=["latest_failure_stays_untested", "earlier_pass_carries_forward", "all_retracted_stays_untested"],
+)
+def test_turn_start_receipts_follow_each_block_latest_run(
+    turn_1: dict[str, str], turn_2: dict[str, str], tested_in_turn_3: set[str]
+) -> None:
+    workflow = MagicMock()
+    workflow.title = "Metric"
+    workflow.model_dump.return_value = {"workflow_id": "w_test"}
+    ctx_1, message_1 = _receipt_turn({}, turn_1)
+    stale_proposal = _build_proposed_workflow_data(
+        workflow,
+        AgentResult(
+            user_response="done",
+            updated_workflow=None,
+            global_llm_context=None,
+            workflow_yaml=RECEIPT_WORKFLOW_YAML,
+            executed_block_fingerprints=ctx_1.executed_block_fingerprints,
+        ),
+    )
+    _, message_2 = _receipt_turn(_assistant_execution_receipts([message_1], stale_proposal), turn_2)
+
+    assert receipt_coverage_after([message_1, message_2], stale_proposal) == {
+        label: "current_source" if label in tested_in_turn_3 else "different_source"
+        for label in ("sign_in", "read_metric")
     }
 
 
@@ -596,6 +659,21 @@ def _persisted_message(narrative_payload: dict[str, Any]) -> WorkflowCopilotChat
         created_at=now,
         modified_at=now,
     )
+
+
+def test_chat_history_keeps_demonstration_items_in_the_narrative_payload_only() -> None:
+    message = _persisted_message(
+        {
+            **_non_error_narrative_payload(),
+            "demonstrationItems": ["Navigate to example.com", "Click Submit"],
+        }
+    )
+
+    history = convert_to_history_messages([message])
+
+    assert history[0].narrative_payload is not None
+    assert history[0].narrative_payload["demonstrationItems"] == ["Navigate to example.com", "Click Submit"]
+    assert "demonstration_items" not in history[0].model_dump()
 
 
 def _non_error_narrative_payload() -> dict[str, Any]:

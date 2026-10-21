@@ -312,6 +312,7 @@ async def test_question_source_reaches_fill_boundary_without_weakening_origin_gu
         request_policy=policy,
         block_authoring_policy=BlockAuthoringPolicy.CODE_ONLY_BROWSER,
         org_credentials_for_turn=None,
+        credential_pause_used=False,
         vault_login_uris_by_credential_id={},
         persisted_workflow_yaml="",
     )

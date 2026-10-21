@@ -89,6 +89,7 @@ import {
   ELAPSED_NEVER_STARTED,
   formatElapsed,
   resolveLandingSelectionId,
+  runErrorCodes,
   runHasOutputs,
   runOutcomeFromStatus,
 } from "../runProjections";
@@ -796,6 +797,10 @@ export function RunView({
   const runErrors = useMemo<RunOutputError[]>(() => {
     return normalizeRunOutputErrors(workflowRun?.errors);
   }, [workflowRun]);
+  const failureErrorCodes = useMemo(
+    () => runErrorCodes(runErrors),
+    [runErrors],
+  );
 
   const runInputs = useMemo(() => {
     const definitionParameters =
@@ -1026,6 +1031,7 @@ export function RunView({
             <RunFailureLine
               workflowRun={workflowRun}
               blockLabel={failedBlock?.label ?? null}
+              errorCodes={failureErrorCodes}
               headline={failureHeadline}
               detail={failureDetail}
               onJump={jumpToFailedBlock}
@@ -1080,7 +1086,7 @@ export function RunView({
                   onThoughtSelect={(thought) => pinFrame(thought.thought_id)}
                   onViewScreenshot={(workflowRunBlockId) => {
                     if (embedded) {
-                      setOpenPanes(["browser"]);
+                      setOpenPanes(["browser"], { byUser: true });
                     } else {
                       openPane("browser");
                     }

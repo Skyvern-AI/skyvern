@@ -10,9 +10,10 @@ from zoneinfo import ZoneInfo
 
 import pytest
 
-from skyvern.exceptions import NoTOTPVerificationCodeFound, ScrapingFailedBlankPage
+from skyvern.exceptions import FailedToReloadPage, NoTOTPVerificationCodeFound, ScrapingFailedBlankPage
 from skyvern.forge import app
 from skyvern.forge.agent import ForgeAgent, StepPromptResult
+from skyvern.forge.sdk.api.llm.exceptions import LLMResponseMissingActionsError
 from skyvern.forge.sdk.core import skyvern_context
 from skyvern.forge.sdk.core.skyvern_context import SkyvernContext
 from skyvern.forge.sdk.models import Step, StepStatus
@@ -436,6 +437,30 @@ async def test_unexpected_exception_returns_failed_step_instead_of_raising(monke
 
     assert step.status == StepStatus.failed
     assert output.step_exception == "RuntimeError"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("raised", "expected_log_method"),
+    [
+        (FailedToReloadPage("https://example.test", "Page.reload: Timeout 60000ms exceeded."), "warning"),
+        (LLMResponseMissingActionsError(["page_info"]), "warning"),
+        (RuntimeError("browser exploded"), "exception"),
+    ],
+)
+async def test_expected_step_failures_log_at_warning_and_other_exceptions_at_error(
+    monkeypatch: pytest.MonkeyPatch, raised: Exception, expected_log_method: str
+) -> None:
+    log = MagicMock()
+    monkeypatch.setattr("skyvern.forge.agent.LOG", log)
+    rig = make_agent_step_rig(monkeypatch, action_handler=AsyncMock(side_effect=raised))
+
+    step, output = await rig.run()
+
+    assert step.status == StepStatus.failed
+    assert output.step_exception == type(raised).__name__
+    leveled = [call[0] for call in log.method_calls if call[0] in ("warning", "error", "exception")]
+    assert leveled == [expected_log_method]
 
 
 @pytest.mark.asyncio

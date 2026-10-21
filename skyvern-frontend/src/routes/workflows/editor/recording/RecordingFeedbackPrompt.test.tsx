@@ -152,7 +152,7 @@ describe("RecordingFeedbackPrompt", () => {
       }),
     ]);
 
-    await click("Dismiss recording feedback");
+    await click("Dismiss demonstration feedback");
     expect(screen.queryByTestId("recording-feedback-prompt")).toBeNull();
 
     act(() =>

@@ -20,8 +20,11 @@ on the tool-call record; ``tool_status`` alone cannot tell a working detector fr
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import functools
 import re
+from collections.abc import Callable
+from contextlib import AbstractContextManager
 from typing import Any
 from urllib.parse import urlsplit
 
@@ -41,8 +44,11 @@ from skyvern.webeye.utils.captcha_solver import (
     solve_challenge,
 )
 from skyvern.webeye.utils.challenge_signature import CHALLENGE_VENDOR_FRAME_URL
+from skyvern.webeye.utils.challenge_solve_record import ChallengeSolveRecord
 
 LOG = structlog.get_logger()
+
+_EnterRecording = Callable[[AbstractContextManager[ChallengeSolveRecord]], ChallengeSolveRecord]
 
 # The ladder clamps its bounded arms to _LADDER_BUDGET_SECONDS (110s), but its DOM-checkbox arm relies on
 # Playwright's own click timeouts rather than that budget; this ceiling is the hard stop above both, well
@@ -130,7 +136,7 @@ def build_captcha_tools(
             error_class="ambiguous_selector",
         )
 
-    async def _read_image_text(page: Any, selector: str) -> ToolResult:
+    async def _read_image_text(page: Any, selector: str, recording: _EnterRecording) -> ToolResult:
         nonlocal next_image_token
         if listed := _LISTED_IMAGE_RE.match(selector):
             entry = listed_images.get(int(listed.group(1)))
@@ -160,7 +166,7 @@ def build_captcha_tools(
                     f"{selector!r} is a <{tag}>, not an image; pick the captcha image from the listing.",
                     error_class="other",
                 )
-            return await _read_target(page, handle)
+            return await _read_target(page, handle, recording)
         if REF_SELECTOR_RE.match(selector):
             return ToolResult.error(
                 "image_selector takes a CSS selector or a listed image=N; an observe ref names a control, not an "
@@ -215,9 +221,9 @@ def build_captcha_tools(
                 "captcha image itself.",
                 error_class="other",
             )
-        return await _read_target(page, target)
+        return await _read_target(page, target, recording)
 
-    async def _read_target(page: Any, target: Any) -> ToolResult:
+    async def _read_target(page: Any, target: Any, recording: _EnterRecording) -> ToolResult:
         nonlocal image_failures, image_reads
         if not await app.AGENT_FUNCTION.image_captcha_ocr_enabled(organization_id=organization_id, url=page.url):
             return ToolResult.error(
@@ -232,12 +238,17 @@ def build_captcha_tools(
                 ok_class="attempts_exhausted",
             )
         image_reads += 1
+        record = recording(
+            app.AGENT_FUNCTION.challenge_solve_recording("v3", page=page, task=task, organization_id=organization_id)
+        )
         # Named in the result so a read of the wrong image (the only img before a form opens is often a logo) is
         # visible to the model rather than silently typed.
         described = await _describe_element(target)
         png = await target.screenshot(timeout=settings.BROWSER_SCREENSHOT_TIMEOUT_MS)
         text = await app.AGENT_FUNCTION.read_image_captcha_text(png, organization_id=organization_id, url=page.url)
+        record.image_text_read = bool(text)
         if not text:
+            record.unsolved = True
             image_failures += 1
             return ToolResult.error(
                 "the solver could not read the captcha image; read it yourself from a screenshot, or load a new "
@@ -265,8 +276,11 @@ def build_captcha_tools(
         if page is None:
             return ToolResult.error(_PAGE_UNAVAILABLE, error_class="page_unavailable")
         try:
-            async with asyncio.timeout(_SOLVE_CAPTCHA_CEILING_SECONDS):
-                return await _read_image_text(page, image_selector)
+            # The read's record is opened past the guards but closed out here, after the ceiling has turned its
+            # cancellation into TimeoutError, so the record sees the same timeout or cancellation the caller does.
+            with contextlib.ExitStack() as recording:
+                async with asyncio.timeout(_SOLVE_CAPTCHA_CEILING_SECONDS):
+                    return await _read_image_text(page, image_selector, recording.enter_context)
         except TimeoutError:
             image_failures += 1
             return ToolResult.error(
@@ -321,16 +335,20 @@ def build_captcha_tools(
             )
 
         try:
-            async with asyncio.timeout(_SOLVE_CAPTCHA_CEILING_SECONDS):
-                outcome = await solve_challenge(
-                    page,
-                    organization_id=organization_id,
-                    workflow_run_id=task.workflow_run_id,
-                    browser_session_id=task.browser_session_id,
-                    probe_child_frames=True,
-                    click=functools.partial(input_dispatch.click, page),
-                    click_handle=functools.partial(input_dispatch.click_handle, page),
-                )
+            with app.AGENT_FUNCTION.challenge_solve_recording(
+                "v3", page=page, task=task, organization_id=organization_id
+            ) as solve_record:
+                async with asyncio.timeout(_SOLVE_CAPTCHA_CEILING_SECONDS):
+                    outcome = await solve_challenge(
+                        page,
+                        organization_id=organization_id,
+                        workflow_run_id=task.workflow_run_id,
+                        browser_session_id=task.browser_session_id,
+                        probe_child_frames=True,
+                        click=functools.partial(input_dispatch.click, page),
+                        click_handle=functools.partial(input_dispatch.click_handle, page),
+                    )
+                solve_record.challenge = outcome
         except TimeoutError:
             failed_attempts += 1
             record({"status": "timed_out"})

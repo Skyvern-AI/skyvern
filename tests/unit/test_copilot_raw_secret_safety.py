@@ -342,6 +342,49 @@ async def test_multiple_semantic_secret_citations_are_each_redacted() -> None:
 
 
 @pytest.mark.asyncio
+async def test_every_copy_of_a_cited_secret_is_redacted_including_curly_quoted_and_colon_prefixed() -> None:
+    secret = "Zq8!vL3#pR2w"
+    policy, _ = await _build(
+        f"Use backup code {secret} first.\nIf asked again, type “{secret}” or enter PIN:{secret} and press Enter.",
+        {"version": "1", "state": "detected", "citations": [secret]},
+    )
+
+    assert secret not in policy.canonical_user_message
+    assert policy.canonical_user_message.count("[REDACTED_SECRET]") == 3
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("secret", "citation"),
+    [("Hunter2:Portal!", "Portal!"), ("Hunter2‘Portal!", "Portal!"), ("Hunter2’Portal!", "Hunter2")],
+    ids=["after-colon", "after-curly-quote", "before-curly-quote"],
+)
+async def test_citing_part_of_a_secret_split_by_a_colon_or_curly_quote_fails_closed(secret: str, citation: str) -> None:
+    policy, _ = await _build(
+        f"My portal login is {secret}",
+        {"version": "1", "state": "detected", "citations": [citation]},
+    )
+
+    assert policy.raw_secret_safety_status == "blocked"
+    assert policy.raw_secret_safety_failure_kind == "invalid_citation"
+    assert "Hunter2" not in policy.canonical_user_message
+    assert "Portal" not in policy.canonical_user_message
+
+
+@pytest.mark.asyncio
+async def test_a_cited_value_that_also_ends_a_longer_secret_leaves_no_part_of_it() -> None:
+    policy, _ = await _build(
+        "Use Portal! at the kiosk. The admin login is Hunter2:Portal! and the backup is “Portal!”.",
+        {"version": "1", "state": "detected", "citations": ["Portal!"]},
+    )
+
+    assert policy.raw_secret_safety_status == "detected"
+    assert "Portal!" not in policy.canonical_user_message
+    assert "Hunter2" not in policy.canonical_user_message
+    assert "Use [REDACTED_SECRET] at the kiosk." in policy.canonical_user_message
+
+
+@pytest.mark.asyncio
 async def test_citation_containing_another_citation_leaves_no_tail() -> None:
     outer = "Hunter2Portal-8391"
     inner = "8391"

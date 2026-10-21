@@ -59,13 +59,13 @@ import {
   type WorkflowSaveData,
 } from "@/store/WorkflowHasChangesStore";
 import { useRecordedBlocksStore } from "@/store/RecordedBlocksStore";
-import { applySopResultAtCurrentAppend } from "./workspaceAuthoringActions";
 import { useRecordingStore } from "@/store/useRecordingStore";
 import { useRecordingLauncherStore } from "@/store/useRecordingLauncherStore";
 import { useWorkflowPanelStore } from "@/store/WorkflowPanelStore";
 
 import { useWorkflowTitleStore } from "@/store/WorkflowTitleStore";
 import {
+  AUTHORING_SAVE_MESSAGE,
   commitYamlDraft,
   beginCopilotAcceptance,
   finishCopilotAcceptance,
@@ -2910,7 +2910,7 @@ describe("Discover recording handoff", () => {
   );
 });
 
-describe("Record Browser pending-change prompt", () => {
+describe("Demonstration pending-change prompt", () => {
   const del = vi.fn();
 
   beforeEach(() => {
@@ -3008,11 +3008,11 @@ describe("Record Browser pending-change prompt", () => {
     act(() => useRecordingLauncherStore.getState().startRecordingAtEnd!());
   }
 
-  test("the Browser pane Record button asks first, and Save and record saves before recording", async () => {
+  test("the demonstration action asks first, and Save and demonstrate saves before recording", async () => {
     renderPendingWorkspace();
     await clickBrowserPaneRecord();
     expect(
-      screen.getByText("Save or discard changes before recording"),
+      screen.getByText("Save or discard changes before demonstrating"),
     ).toBeTruthy();
     expect(useRecordingStore.getState().isRecording).toBe(false);
 
@@ -3020,7 +3020,9 @@ describe("Record Browser pending-change prompt", () => {
       data: { ...(liveWorkflow as object), version: 2 },
     });
     await act(async () =>
-      fireEvent.click(screen.getByRole("button", { name: "Save and record" })),
+      fireEvent.click(
+        screen.getByRole("button", { name: "Save and demonstrate" }),
+      ),
     );
     await waitFor(() =>
       expect(useRecordingStore.getState().isRecording).toBe(true),
@@ -3029,7 +3031,7 @@ describe("Record Browser pending-change prompt", () => {
     expect(useWorkflowHasChangesStore.getState().pendingRecordingId).toBe(null);
   });
 
-  test("Save and record does not record if the browser stopped being ready during the save", async () => {
+  test("Save and demonstrate does not record if the browser stopped being ready during the save", async () => {
     renderPendingWorkspace();
     await clickBrowserPaneRecord();
     put.mockImplementation(async () => {
@@ -3037,7 +3039,9 @@ describe("Record Browser pending-change prompt", () => {
       return { data: { ...(liveWorkflow as object), version: 2 } };
     });
     await act(async () =>
-      fireEvent.click(screen.getByRole("button", { name: "Save and record" })),
+      fireEvent.click(
+        screen.getByRole("button", { name: "Save and demonstrate" }),
+      ),
     );
     await waitFor(() =>
       expect(useWorkflowHasChangesStore.getState().pendingRecordingId).toBe(
@@ -3048,12 +3052,12 @@ describe("Record Browser pending-change prompt", () => {
     expect(useRecordingStore.getState().isRecording).toBe(false);
   });
 
-  test("Discard and record reloads the saved workflow, deletes the old recording, then records", async () => {
+  test("Discard and demonstrate reloads the saved workflow, deletes the old recording, then records", async () => {
     renderPendingWorkspace();
     await clickBrowserPaneRecord();
     await act(async () =>
       fireEvent.click(
-        screen.getByRole("button", { name: "Discard and record" }),
+        screen.getByRole("button", { name: "Discard and demonstrate" }),
       ),
     );
     await waitFor(() =>
@@ -3074,7 +3078,9 @@ describe("Record Browser pending-change prompt", () => {
       }),
     );
     await clickBrowserPaneRecord();
-    const discard = screen.getByRole("button", { name: "Discard and record" });
+    const discard = screen.getByRole("button", {
+      name: "Discard and demonstrate",
+    });
     expect((discard as HTMLButtonElement).disabled).toBe(true);
     fireEvent.click(discard);
     await new Promise((resolve) => setTimeout(resolve, 0));
@@ -3093,7 +3099,7 @@ describe("Record Browser pending-change prompt", () => {
     });
     await waitFor(() =>
       expect(
-        screen.getByText("Save or discard changes before recording"),
+        screen.getByText("Save or discard changes before demonstrating"),
       ).toBeTruthy(),
     );
     expect(
@@ -3102,7 +3108,7 @@ describe("Record Browser pending-change prompt", () => {
     fireEvent.click(screen.getByRole("button", { name: "Cancel" }));
     await waitFor(() =>
       expect(
-        screen.queryByText("Save or discard changes before recording"),
+        screen.queryByText("Save or discard changes before demonstrating"),
       ).toBeNull(),
     );
     expect(useRecordingStore.getState().isRecording).toBe(false);
@@ -4537,68 +4543,52 @@ describe("A49 metadata authorship through editor actions", () => {
     },
   );
 
-  test.each(["recording", "SOP conversion"])(
-    "keeps generated blocks unsaved after accepting a proposal following %s",
-    async (source) => {
-      integration.canvas = true;
-      const staged = stageGraphProposal();
-      mountEditor({ ...staged, workflow_id: workflow.workflow_id, version: 1 });
-      await screen.findByRole("button", { name: "Accept" });
-      const generated = {
-        blocks: [
-          { ...staged.workflow_definition.blocks[0]!, label: "generated" },
-        ],
-        parameters: [],
-      };
-      act(() => {
-        const owner = useWorkflowYamlEditorStore.getState().editorOwner!;
-        if (source === "SOP conversion") {
-          applySopResultAtCurrentAppend({
-            result: generated,
-            getNodes: () => canvas.current!.nodes,
-            getEdges: () => canvas.current!.edges,
-            setRecordedBlocks: (result, insertionPoint) =>
-              useRecordedBlocksStore
-                .getState()
-                .setRecordedBlocks(result, insertionPoint, owner),
-          });
-        } else {
-          useRecordedBlocksStore
-            .getState()
-            .setRecordedBlocks(
-              generated,
-              { previous: null, next: null, connectingEdgeType: "default" },
-              owner,
-            );
-        }
-      });
-      await waitFor(() =>
-        expect(
-          useWorkflowHasChangesStore
-            .getState()
-            .getSaveData()!
-            .blocks.map((block) => block.label),
-        ).toEqual(["pause", "generated"]),
-      );
-      expect(useWorkflowHasChangesStore.getState().hasChanges).toBe(true);
-      await accept();
-      fireEvent.click(
-        await screen.findByRole("button", { name: "Keep my edits" }),
-      );
-      await waitFor(() =>
-        expect(
-          useWorkflowYamlEditorStore.getState().copilotAcceptance,
-        ).toBeNull(),
-      );
-      const saved = useWorkflowHasChangesStore.getState().getSaveData()!;
-      expect(saved.blocks.map((block) => block.label)).toEqual([
-        "pause",
-        "generated",
-      ]);
-      expect(saved.workflow.workflow_id).toBe(staged.workflow_id);
-      expect(useWorkflowHasChangesStore.getState().hasChanges).toBe(true);
-    },
-  );
+  test("keeps generated blocks unsaved after accepting a proposal following recording", async () => {
+    integration.canvas = true;
+    const staged = stageGraphProposal();
+    mountEditor({ ...staged, workflow_id: workflow.workflow_id, version: 1 });
+    await screen.findByRole("button", { name: "Accept" });
+    const generated = {
+      blocks: [
+        { ...staged.workflow_definition.blocks[0]!, label: "generated" },
+      ],
+      parameters: [],
+    };
+    act(() => {
+      useRecordedBlocksStore
+        .getState()
+        .setRecordedBlocks(
+          generated,
+          { previous: null, next: null, connectingEdgeType: "default" },
+          useWorkflowYamlEditorStore.getState().editorOwner!,
+        );
+    });
+    await waitFor(() =>
+      expect(
+        useWorkflowHasChangesStore
+          .getState()
+          .getSaveData()!
+          .blocks.map((block) => block.label),
+      ).toEqual(["pause", "generated"]),
+    );
+    expect(useWorkflowHasChangesStore.getState().hasChanges).toBe(true);
+    await accept();
+    fireEvent.click(
+      await screen.findByRole("button", { name: "Keep my edits" }),
+    );
+    await waitFor(() =>
+      expect(
+        useWorkflowYamlEditorStore.getState().copilotAcceptance,
+      ).toBeNull(),
+    );
+    const saved = useWorkflowHasChangesStore.getState().getSaveData()!;
+    expect(saved.blocks.map((block) => block.label)).toEqual([
+      "pause",
+      "generated",
+    ]);
+    expect(saved.workflow.workflow_id).toBe(staged.workflow_id);
+    expect(useWorkflowHasChangesStore.getState().hasChanges).toBe(true);
+  });
 
   test.each([
     { label: "Disable parallel runs", setting: "runSequentially" as const },
@@ -5129,6 +5119,28 @@ describe("A49 metadata authorship through editor actions", () => {
       useWorkflowTitleStore.getState().copilotMetadataEdits["wpid_live"],
     ).not.toMatchObject({ graphEdited: true });
     expect(useWorkflowHasChangesStore.getState().hasChanges).toBe(false);
+  });
+
+  test("the leave dialog holds Save changes while authoring owns the editor", async () => {
+    integration.canvas = true;
+    mountEditor();
+    const leave = await screen.findByRole("link", { name: "Leave editor" });
+    await act(async () => {});
+    act(() => {
+      useWorkflowHasChangesStore.getState().setHasChanges(true);
+      useWorkflowYamlEditorStore.setState({ authoringInProgress: true });
+    });
+    fireEvent.click(leave);
+    const save = (await screen.findByRole("button", {
+      name: "Save changes",
+    })) as HTMLButtonElement;
+    expect(save.disabled).toBe(true);
+    expect(screen.getByText(AUTHORING_SAVE_MESSAGE)).toBeTruthy();
+
+    act(() =>
+      useWorkflowYamlEditorStore.setState({ authoringInProgress: false }),
+    );
+    expect(save.disabled).toBe(false);
   });
 
   test.each([false, true])(

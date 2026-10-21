@@ -36,6 +36,8 @@ export interface BudgetExpiryState {
   reportProduced: boolean | null;
   stagedDraftId: string | null;
   drainFingerprint: string | null;
+  // Test runs the turn's hard time limit left to their worker; the backend saves only their blocks as unfinished.
+  leftRunIds: string[];
 }
 
 function parseBudgetExpiry(raw: unknown): BudgetExpiryState | null {
@@ -58,6 +60,9 @@ function parseBudgetExpiry(raw: unknown): BudgetExpiryState | null {
       typeof value.drainFingerprint === "string"
         ? value.drainFingerprint
         : null,
+    leftRunIds: Array.isArray(value.leftRunIds)
+      ? value.leftRunIds.filter((id): id is string => typeof id === "string")
+      : [],
   };
 }
 
@@ -77,6 +82,7 @@ function budgetExpiryFromOutcome(
     reportProduced: outcome.budget_expiry_report_produced ?? null,
     stagedDraftId: outcome.budget_expiry_staged_draft_id ?? null,
     drainFingerprint: outcome.drain_fingerprint ?? null,
+    leftRunIds: [],
   };
 }
 
@@ -131,7 +137,8 @@ export type NarrativeEvent =
 // failed-style states (failed, terminated, timed_out) under one chip and
 // treats `skipped` and `stopped` as separate neutral states. `stopped` is a
 // user cancel: it ran and was interrupted, which is not a failure and must
-// never be rendered as one.
+// never be rendered as one. `unfinished` is a block still running when a turn
+// limit ended the turn; its run may still be going, so it is neither.
 export type BlockUIState =
   | "queued"
   | "drafted"
@@ -139,6 +146,7 @@ export type BlockUIState =
   | "completed"
   | "failed"
   | "stopped"
+  | "unfinished"
   | "skipped";
 
 // Recorded per-run outcome verdict, distinct from lifecycle state: a row can
@@ -451,6 +459,8 @@ export interface TurnNarrativeState {
     // turns recorded before it was stamped.
     anchorToolCallId?: string;
   } | null;
+  // Every pick card's credentialPause, oldest first; the backend sends it only when more than one settled.
+  credentialPauses: NonNullable<TurnNarrativeState["credentialPause"]>[];
   // Silently auto-bound credential, from the credentialAutoBound narrative signal — rendered as a
   // receipt with a Change affordance so a confident-but-wrong pick can be corrected after the fact.
   credentialAutoBound: { credentialId: string; name: string } | null;
@@ -460,6 +470,7 @@ export interface TurnNarrativeState {
   connectedAccountChoices: ConnectedAccountChoice[];
   outputFiles: DeliveredOutputFile[];
   googleConnectionNotices: GoogleConnectionNotice[];
+  demonstrationOffer: boolean;
   review: ReviewProjection | null;
   turnFacts: TurnFacts | null;
   budgetExpiry: BudgetExpiryState | null;
@@ -476,12 +487,22 @@ export interface TurnScreenshot {
   toolCallId: string | null;
 }
 
+export type GoogleSetupScopeProfile = "gmail" | "google_sheets";
+
 export interface GoogleConnectionNotice {
   provider: "google";
   connectionId: string | null;
   displayName: string | null;
   condition: "missing" | "unusable" | "unbound";
+  scopeProfile: GoogleSetupScopeProfile;
+  origin: "setup" | "workflow";
   choices?: ConnectedAccountChoice[];
+}
+
+export function googleConnectionNoticeKey(
+  notice: GoogleConnectionNotice,
+): string {
+  return `${notice.scopeProfile}:${notice.connectionId ?? "unbound"}`;
 }
 
 export const EMPTY_NARRATIVE: TurnNarrativeState = Object.freeze({
@@ -507,10 +528,12 @@ export const EMPTY_NARRATIVE: TurnNarrativeState = Object.freeze({
   lastRunOutcome: null,
   credentialPrompt: null,
   credentialPause: null,
+  credentialPauses: [],
   credentialAutoBound: null,
   connectedAccountChoices: [],
   outputFiles: [],
   googleConnectionNotices: [],
+  demonstrationOffer: false,
   review: null,
   turnFacts: null,
   budgetExpiry: null,
@@ -595,6 +618,18 @@ export function parseCredentialPause(
     credentialId: typeof o.credentialId === "string" ? o.credentialId : null,
     anchorToolCallId,
   };
+}
+
+export function parseCredentialPauses(
+  value: unknown,
+): TurnNarrativeState["credentialPauses"] {
+  if (!Array.isArray(value)) return [];
+  return value
+    .map(parseCredentialPause)
+    .filter(
+      (pause): pause is NonNullable<TurnNarrativeState["credentialPause"]> =>
+        pause !== null,
+    );
 }
 
 export interface TurnWorkPlan {
@@ -699,7 +734,7 @@ export function parseGoogleConnectionNotices(
 ): GoogleConnectionNotice[] {
   if (!Array.isArray(value)) return [];
   const notices: GoogleConnectionNotice[] = [];
-  const seen = new Set<string | null>();
+  const seen = new Set<string>();
   for (const item of value) {
     if (!item || typeof item !== "object") continue;
     const row = item as Record<string, unknown>;
@@ -711,26 +746,32 @@ export function parseGoogleConnectionNotices(
           row.connectionId.length === 0) ||
       (row.condition !== "missing" &&
         row.condition !== "unusable" &&
-        row.condition !== "unbound")
+        row.condition !== "unbound") ||
+      (row.scopeProfile !== undefined &&
+        row.scopeProfile !== "gmail" &&
+        row.scopeProfile !== "google_sheets")
     ) {
       continue;
     }
-    const connectionId =
-      row.condition === "unbound" ? null : (row.connectionId as string);
-    if (seen.has(connectionId)) continue;
-    seen.add(connectionId);
-    notices.push({
+    const notice: GoogleConnectionNotice = {
       provider: "google",
-      connectionId,
+      connectionId:
+        row.condition === "unbound" ? null : (row.connectionId as string),
       displayName:
         typeof row.displayName === "string" && row.displayName.length > 0
           ? row.displayName
           : null,
       condition: row.condition,
+      scopeProfile: row.scopeProfile === "gmail" ? "gmail" : "google_sheets",
+      origin: row.origin === "setup" ? "setup" : "workflow",
       ...(row.condition === "unbound"
         ? { choices: parseConnectedAccountChoices(row.choices) }
         : {}),
-    });
+    };
+    const key = googleConnectionNoticeKey(notice);
+    if (seen.has(key)) continue;
+    seen.add(key);
+    notices.push(notice);
   }
   return notices;
 }
@@ -772,6 +813,7 @@ const ACTIVITY_TOOL_DISPLAY_LABELS: Record<string, string> = {
   scroll: "Interacting with page",
   select_option: "Selecting option",
   press_key: "Interacting with page",
+  drag: "Interacting with page",
   navigate_browser: "Opening page",
   wait_for_either_state: "Waiting for the page",
   skyvern_frame_list: "Finding embedded pages",
@@ -845,7 +887,10 @@ const TOOL_CALL_KINDS: Record<string, ToolCallKind> = {
   validate_block: "other",
   inspect_current_workflow: "other",
   list_integrations: "other",
+  request_google_connection: "other",
+  offer_demonstration: "other",
   read_google_sheet: "other",
+  read_attached_pdf: "other",
   get_organization_usage_quota: "other",
   extend_browser_session: "other",
   search_web: "other",
@@ -1945,6 +1990,7 @@ export function hydrateNarrativeFromPayload(
             s === "completed" ||
             s === "failed" ||
             s === "stopped" ||
+            s === "unfinished" ||
             s === "skipped"
           )
             return s;
@@ -1973,23 +2019,21 @@ export function hydrateNarrativeFromPayload(
     typeof payload.endedAt === "string" ? (payload.endedAt as string) : null;
   const cancelled = payload.cancelled === true;
   const turnFacts = parseTurnFacts(payload.turnFacts);
-  // A deadline cuts a running block off; that is a stop, so it must not be swept
-  // to failed and then read back as the turn having failed.
+  // The backend saves a left run's blocks as unfinished; any other block
+  // cut off by a turn limit is a stop, never a failure.
   const budgetExpiry = parseBudgetExpiry(payload.budgetExpiry);
-  const halted =
-    cancelled ||
-    turnFacts?.terminalCause === "deadline_expired" ||
-    budgetExpiry !== null;
+  const halted = budgetHalted({ turnFacts, budgetExpiry });
   const sweptBlocks: BlockState[] = terminal
     ? blocks.map((b) =>
         b.state === "running"
           ? {
               ...b,
-              state: halted
-                ? "stopped"
-                : terminal === "error"
-                  ? "failed"
-                  : "completed",
+              state:
+                cancelled || halted
+                  ? "stopped"
+                  : terminal === "error"
+                    ? "failed"
+                    : "completed",
               endedAt: b.endedAt ?? endedAtIso,
             }
           : b,
@@ -2046,6 +2090,7 @@ export function hydrateNarrativeFromPayload(
       typeof payload.endedAt === "string" ? (payload.endedAt as string) : null,
     credentialPrompt: parseCredentialPrompt(payload.credentialPrompt),
     credentialPause: parseCredentialPause(payload.credentialPause),
+    credentialPauses: parseCredentialPauses(payload.credentialPauses),
     credentialAutoBound: parseCredentialAutoBound(payload.credentialAutoBound),
     workPlan: parseTurnWorkPlan(payload.workPlan),
     connectedAccountChoices: parseConnectedAccountChoices(
@@ -2055,6 +2100,7 @@ export function hydrateNarrativeFromPayload(
     googleConnectionNotices: parseGoogleConnectionNotices(
       payload.googleConnectionNotices,
     ),
+    demonstrationOffer: payload.demonstrationOffer === true,
     review: parseReviewProjection(payload.review),
     turnFacts,
     budgetExpiry,
@@ -2211,8 +2257,16 @@ export function notConfirmedOutcome(
 // not a block failure, so no surface may give it failure's treatment.
 export function isDeadlineHalt(turn: TurnNarrativeState): boolean {
   return (
-    (turn.turnFacts?.terminalCause === "deadline_expired" ||
-      turn.budgetExpiry !== null) &&
+    budgetHalted(turn) &&
     !latestBlocksByLabel(turn.blocks).some((b) => b.state === "failed")
+  );
+}
+
+type TurnLimitFacts = Pick<TurnNarrativeState, "turnFacts" | "budgetExpiry">;
+
+function budgetHalted(turn: TurnLimitFacts): boolean {
+  return (
+    turn.turnFacts?.terminalCause === "deadline_expired" ||
+    turn.budgetExpiry !== null
   );
 }

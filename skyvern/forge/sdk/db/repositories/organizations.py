@@ -494,6 +494,8 @@ class OrganizationsRepository(BaseRepository):
                 query = query.filter_by(token=token)
             if valid is not None:
                 query = query.filter_by(valid=valid)
+            # Twin rows can share a token; a fixed order keeps every pod resolving the same row ID.
+            query = query.order_by(OrganizationAuthTokenModel.created_at.desc(), OrganizationAuthTokenModel.id)
             if token_obj := (await session.scalars(query)).first():
                 return await convert_to_organization_auth_token(token_obj, token_type)
             else:

@@ -2,8 +2,9 @@ import asyncio
 import base64
 import datetime
 import json
+from collections.abc import Awaitable, Callable
 from types import SimpleNamespace
-from typing import Any, Awaitable, Callable
+from typing import Any
 from unittest.mock import AsyncMock, MagicMock
 from urllib.parse import parse_qs, urlparse
 
@@ -11,7 +12,9 @@ import httpx
 import pytest
 from fastapi import HTTPException
 
-from skyvern.forge.sdk.db.repositories.microsoft_oauth import PendingConsentContext
+from skyvern.forge.sdk.db.repositories.microsoft_oauth import ActiveCredentialCiphertext, PendingConsentContext
+from skyvern.forge.sdk.encrypt import Encryptor
+from skyvern.forge.sdk.encrypt.aes import AES
 from skyvern.forge.sdk.routes import microsoft_oauth as microsoft_oauth_routes
 from skyvern.forge.sdk.schemas.microsoft_oauth import (
     CreateMicrosoftOAuthCallbackRequest,
@@ -280,9 +283,62 @@ async def test_refresh_access_token_posts_form_and_ignores_rotation(
 
 
 @pytest.mark.asyncio
+async def test_promote_pending_credential_stores_refresh_token_as_gcm(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(microsoft_oauth_service.settings, "ENABLE_ENCRYPTION", True, raising=False)
+    monkeypatch.setattr(microsoft_oauth_service.settings, "ENCRYPTOR_AES_SECRET_KEY", "gcm-test-key", raising=False)
+    monkeypatch.setattr(microsoft_oauth_service.settings, "ENCRYPTOR_AES_SALT", "gcm-test-salt", raising=False)
+    promote_pending_to_active = AsyncMock()
+    repository = SimpleNamespace(promote_pending_to_active=promote_pending_to_active)
+    monkeypatch.setattr(microsoft_oauth_service.app, "DATABASE", SimpleNamespace(microsoft_oauth=repository))
+
+    await microsoft_oauth_service.promote_pending_credential(
+        organization_id="org-1",
+        state="state",
+        initiator_id="user-1",
+        refresh_token="rt-new",
+        scopes_granted=["Mail.Read"],
+    )
+
+    persisted = promote_pending_to_active.await_args.kwargs
+    assert persisted["encrypted_refresh_token"].startswith("skyvern_enc:aesgcm-v1:")
+    assert persisted["encrypted_method"] == microsoft_oauth_service.EncryptMethod.AES
+    assert (
+        await microsoft_oauth_service.secret_encryption.decrypt_secret_field_value(
+            persisted["encrypted_refresh_token"],
+            organization_id="org-1",
+            field_name="microsoft_oauth_credentials.encrypted_refresh_token",
+        )
+        == "rt-new"
+    )
+
+
+@pytest.mark.asyncio
+async def test_promote_pending_credential_fails_closed_without_gcm_key(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(microsoft_oauth_service.settings, "ENABLE_ENCRYPTION", True, raising=False)
+    monkeypatch.setattr(microsoft_oauth_service.settings, "ENCRYPTOR_AES_SECRET_KEY", "", raising=False)
+    promote_pending_to_active = AsyncMock()
+    repository = SimpleNamespace(promote_pending_to_active=promote_pending_to_active)
+    monkeypatch.setattr(microsoft_oauth_service.app, "DATABASE", SimpleNamespace(microsoft_oauth=repository))
+
+    with pytest.raises(microsoft_oauth_service.EncryptionNotConfiguredError):
+        await microsoft_oauth_service.promote_pending_credential(
+            organization_id="org-1",
+            state="state",
+            initiator_id="user-1",
+            refresh_token="rt-new",
+            scopes_granted=["Mail.Read"],
+        )
+
+    promote_pending_to_active.assert_not_awaited()
+
+
+@pytest.mark.asyncio
 async def test_refresh_and_rotate_persists_rotated_refresh_token(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(microsoft_oauth_service.settings, "MICROSOFT_OAUTH_CLIENT_ID", "cid", raising=False)
     monkeypatch.setattr(microsoft_oauth_service.settings, "MICROSOFT_OAUTH_CLIENT_SECRET", "secret", raising=False)
+    monkeypatch.setattr(microsoft_oauth_service.settings, "ENABLE_ENCRYPTION", True, raising=False)
+    monkeypatch.setattr(microsoft_oauth_service.settings, "ENCRYPTOR_AES_SECRET_KEY", "gcm-test-key", raising=False)
+    monkeypatch.setattr(microsoft_oauth_service.settings, "ENCRYPTOR_AES_SALT", "gcm-test-salt", raising=False)
 
     def handler(_request: httpx.Request) -> httpx.Response:
         return httpx.Response(
@@ -299,8 +355,6 @@ async def test_refresh_and_rotate_persists_rotated_refresh_token(monkeypatch: py
     update_active_refresh_token = AsyncMock()
     repository = SimpleNamespace(update_active_refresh_token=update_active_refresh_token)
     monkeypatch.setattr(microsoft_oauth_service.app, "DATABASE", SimpleNamespace(microsoft_oauth=repository))
-    encrypt = AsyncMock(return_value="encrypted-rt-rotated")
-    monkeypatch.setattr(microsoft_oauth_service, "encryptor", SimpleNamespace(encrypt=encrypt))
 
     access_token = await microsoft_oauth_service.refresh_and_rotate(
         organization_id="org-1",
@@ -308,17 +362,25 @@ async def test_refresh_and_rotate_persists_rotated_refresh_token(monkeypatch: py
         credential_secrets=microsoft_oauth_service.MicrosoftCredentialSecrets(
             refresh_token="rt-original",
             scopes=["Mail.Read"],
+            encrypted_refresh_token="stored-ciphertext",
         ),
     )
 
     assert access_token == "at-refreshed"
-    encrypt.assert_awaited_once_with("rt-rotated", microsoft_oauth_service.EncryptMethod.AES)
     update_active_refresh_token.assert_awaited_once()
     assert update_active_refresh_token.await_args is not None
     kwargs = update_active_refresh_token.await_args.kwargs
     assert kwargs["organization_id"] == "org-1"
     assert kwargs["credential_id"] == "cred-1"
-    assert kwargs["encrypted_refresh_token"] == "encrypted-rt-rotated"
+    assert kwargs["encrypted_refresh_token"].startswith("skyvern_enc:aesgcm-v1:")
+    assert (
+        await microsoft_oauth_service.secret_encryption.decrypt_secret_field_value(
+            kwargs["encrypted_refresh_token"],
+            organization_id="org-1",
+            field_name="microsoft_oauth_credentials.encrypted_refresh_token",
+        )
+        == "rt-rotated"
+    )
     assert kwargs["encrypted_method"] == microsoft_oauth_service.EncryptMethod.AES
     assert isinstance(kwargs["now"], datetime.datetime)
 
@@ -327,6 +389,9 @@ async def test_refresh_and_rotate_persists_rotated_refresh_token(monkeypatch: py
 async def test_refresh_and_rotate_propagates_rotated_token_persist_failure(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    monkeypatch.setattr(microsoft_oauth_service.settings, "ENABLE_ENCRYPTION", True, raising=False)
+    monkeypatch.setattr(microsoft_oauth_service.settings, "ENCRYPTOR_AES_SECRET_KEY", "gcm-test-key", raising=False)
+    monkeypatch.setattr(microsoft_oauth_service.settings, "ENCRYPTOR_AES_SALT", "gcm-test-salt", raising=False)
     monkeypatch.setattr(
         microsoft_oauth_service,
         "refresh_access_token",
@@ -336,13 +401,8 @@ async def test_refresh_and_rotate_propagates_rotated_token_persist_failure(
         update_active_refresh_token=AsyncMock(side_effect=RuntimeError("database unavailable"))
     )
     monkeypatch.setattr(microsoft_oauth_service.app, "DATABASE", SimpleNamespace(microsoft_oauth=repository))
-    monkeypatch.setattr(
-        microsoft_oauth_service,
-        "encryptor",
-        SimpleNamespace(encrypt=AsyncMock(return_value="encrypted-rt-rotated")),
-    )
 
-    message = "Failed to persist rotated Microsoft refresh token; reconnect the Microsoft account"
+    message = "Failed to persist Microsoft credential refresh; reconnect the Microsoft account"
     with pytest.raises(microsoft_oauth_service.MicrosoftOAuthError, match=message):
         await microsoft_oauth_service.refresh_and_rotate(
             organization_id="org-1",
@@ -350,18 +410,22 @@ async def test_refresh_and_rotate_propagates_rotated_token_persist_failure(
             credential_secrets=microsoft_oauth_service.MicrosoftCredentialSecrets(
                 refresh_token="rt-original",
                 scopes=["Mail.Read"],
+                encrypted_refresh_token="stored-ciphertext",
             ),
         )
 
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("refresh_token", ["rt-original", None])
-async def test_refresh_and_rotate_skips_persist_without_new_refresh_token(
+async def test_refresh_and_rotate_reencrypts_without_new_refresh_token(
     monkeypatch: pytest.MonkeyPatch,
     refresh_token: str | None,
 ) -> None:
     monkeypatch.setattr(microsoft_oauth_service.settings, "MICROSOFT_OAUTH_CLIENT_ID", "cid", raising=False)
     monkeypatch.setattr(microsoft_oauth_service.settings, "MICROSOFT_OAUTH_CLIENT_SECRET", "secret", raising=False)
+    monkeypatch.setattr(microsoft_oauth_service.settings, "ENABLE_ENCRYPTION", True, raising=False)
+    monkeypatch.setattr(microsoft_oauth_service.settings, "ENCRYPTOR_AES_SECRET_KEY", "gcm-test-key", raising=False)
+    monkeypatch.setattr(microsoft_oauth_service.settings, "ENCRYPTOR_AES_SALT", "gcm-test-salt", raising=False)
     response_json: dict[str, str | int] = {
         "access_token": "at-refreshed",
         "expires_in": 3600,
@@ -377,8 +441,6 @@ async def test_refresh_and_rotate_skips_persist_without_new_refresh_token(
     update_active_refresh_token = AsyncMock()
     repository = SimpleNamespace(update_active_refresh_token=update_active_refresh_token)
     monkeypatch.setattr(microsoft_oauth_service.app, "DATABASE", SimpleNamespace(microsoft_oauth=repository))
-    encrypt = AsyncMock(return_value="encrypted-rt-rotated")
-    monkeypatch.setattr(microsoft_oauth_service, "encryptor", SimpleNamespace(encrypt=encrypt))
 
     access_token = await microsoft_oauth_service.refresh_and_rotate(
         organization_id="org-1",
@@ -386,12 +448,358 @@ async def test_refresh_and_rotate_skips_persist_without_new_refresh_token(
         credential_secrets=microsoft_oauth_service.MicrosoftCredentialSecrets(
             refresh_token="rt-original",
             scopes=["Mail.Read"],
+            encrypted_refresh_token="stored-ciphertext",
         ),
     )
 
     assert access_token == "at-refreshed"
-    encrypt.assert_not_awaited()
+    update_active_refresh_token.assert_awaited_once()
+    persisted = update_active_refresh_token.await_args.kwargs["encrypted_refresh_token"]
+    assert persisted.startswith("skyvern_enc:aesgcm-v1:")
+    assert (
+        await microsoft_oauth_service.secret_encryption.decrypt_secret_field_value(
+            persisted,
+            organization_id="org-1",
+            field_name="microsoft_oauth_credentials.encrypted_refresh_token",
+        )
+        == "rt-original"
+    )
+
+
+@pytest.mark.asyncio
+async def test_no_rotation_response_cannot_overwrite_concurrent_refresh_rotation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(microsoft_oauth_service.settings, "ENABLE_ENCRYPTION", True, raising=False)
+    monkeypatch.setattr(microsoft_oauth_service.settings, "ENCRYPTOR_AES_SECRET_KEY", "gcm-test-key", raising=False)
+    monkeypatch.setattr(microsoft_oauth_service.settings, "ENCRYPTOR_AES_SALT", "gcm-test-salt", raising=False)
+    stored_ciphertext = "stored-ciphertext-before-refresh"
+    first_refresh_started = asyncio.Event()
+    rotated_token_persisted = asyncio.Event()
+    calls = 0
+
+    async def refresh_access_token(*_: Any, **__: Any) -> dict[str, str]:
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            first_refresh_started.set()
+            await rotated_token_persisted.wait()
+            return {"access_token": "at-after-rotation"}
+        return {"access_token": "at-rotated", "refresh_token": "rt-rotated"}
+
+    async def update_active_refresh_token(**kwargs: Any) -> bool:
+        nonlocal stored_ciphertext
+        if kwargs["expected_encrypted_refresh_token"] != stored_ciphertext:
+            return False
+        stored_ciphertext = kwargs["encrypted_refresh_token"]
+        rotated_token_persisted.set()
+        return True
+
+    monkeypatch.setattr(microsoft_oauth_service, "refresh_access_token", refresh_access_token)
+    monkeypatch.setattr(
+        microsoft_oauth_service.app,
+        "DATABASE",
+        SimpleNamespace(microsoft_oauth=SimpleNamespace(update_active_refresh_token=update_active_refresh_token)),
+    )
+    secrets = microsoft_oauth_service.MicrosoftCredentialSecrets(
+        refresh_token="rt-original",
+        scopes=["Mail.Read"],
+        encrypted_refresh_token="stored-ciphertext-before-refresh",
+    )
+    no_rotation_refresh = asyncio.create_task(
+        microsoft_oauth_service.refresh_and_rotate(
+            organization_id="org-1",
+            credential_id="cred-1",
+            credential_secrets=secrets,
+        )
+    )
+    await first_refresh_started.wait()
+    rotated_refresh = asyncio.create_task(
+        microsoft_oauth_service.refresh_and_rotate(
+            organization_id="org-1",
+            credential_id="cred-1",
+            credential_secrets=secrets,
+        )
+    )
+
+    assert await asyncio.gather(no_rotation_refresh, rotated_refresh) == ["at-after-rotation", "at-rotated"]
+    assert (
+        await microsoft_oauth_service.secret_encryption.decrypt_secret_field_value(
+            stored_ciphertext,
+            organization_id="org-1",
+            field_name="microsoft_oauth_credentials.encrypted_refresh_token",
+        )
+        == "rt-rotated"
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("losing_refresh_token", ["rt-original", "rt-losing-rotation"])
+async def test_refresh_returns_access_token_after_losing_token_cas(
+    monkeypatch: pytest.MonkeyPatch,
+    losing_refresh_token: str,
+) -> None:
+    monkeypatch.setattr(microsoft_oauth_service.settings, "ENABLE_ENCRYPTION", True, raising=False)
+    monkeypatch.setattr(microsoft_oauth_service.settings, "ENCRYPTOR_AES_SECRET_KEY", "gcm-test-key", raising=False)
+    monkeypatch.setattr(microsoft_oauth_service.settings, "ENCRYPTOR_AES_SALT", "gcm-test-salt", raising=False)
+    stored_ciphertext = "stored-ciphertext-before-refresh"
+    winner_persisted = asyncio.Event()
+    calls = 0
+
+    async def refresh_access_token(*_: Any, **__: Any) -> dict[str, str]:
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            return {"access_token": "at-winner", "refresh_token": "rt-rotated"}
+        await winner_persisted.wait()
+        return {"access_token": "at-loser", "refresh_token": losing_refresh_token}
+
+    async def update_active_refresh_token(**kwargs: Any) -> bool:
+        nonlocal stored_ciphertext
+        if kwargs["expected_encrypted_refresh_token"] != stored_ciphertext:
+            return False
+        stored_ciphertext = kwargs["encrypted_refresh_token"]
+        winner_persisted.set()
+        return True
+
+    monkeypatch.setattr(microsoft_oauth_service, "refresh_access_token", refresh_access_token)
+    monkeypatch.setattr(
+        microsoft_oauth_service.app,
+        "DATABASE",
+        SimpleNamespace(microsoft_oauth=SimpleNamespace(update_active_refresh_token=update_active_refresh_token)),
+    )
+    secrets = microsoft_oauth_service.MicrosoftCredentialSecrets(
+        refresh_token="rt-original",
+        scopes=["Mail.Read"],
+        encrypted_refresh_token="stored-ciphertext-before-refresh",
+    )
+    winner = asyncio.create_task(
+        microsoft_oauth_service.refresh_and_rotate(
+            organization_id="org-1",
+            credential_id="cred-1",
+            credential_secrets=secrets,
+        )
+    )
+    await winner_persisted.wait()
+    loser = asyncio.create_task(
+        microsoft_oauth_service.refresh_and_rotate(
+            organization_id="org-1",
+            credential_id="cred-1",
+            credential_secrets=secrets,
+        )
+    )
+
+    assert await asyncio.gather(winner, loser) == ["at-winner", "at-loser"]
+    assert (
+        await microsoft_oauth_service.secret_encryption.decrypt_secret_field_value(
+            stored_ciphertext,
+            organization_id="org-1",
+            field_name="microsoft_oauth_credentials.encrypted_refresh_token",
+        )
+        == "rt-rotated"
+    )
+
+
+@pytest.mark.asyncio
+async def test_legacy_cbc_credential_refreshes_and_is_rewritten_as_gcm(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(microsoft_oauth_service.settings, "ENABLE_ENCRYPTION", True, raising=False)
+    monkeypatch.setattr(microsoft_oauth_service.settings, "ENCRYPTOR_AES_SECRET_KEY", "gcm-test-key", raising=False)
+    monkeypatch.setattr(microsoft_oauth_service.settings, "ENCRYPTOR_AES_SALT", "gcm-test-salt", raising=False)
+    legacy_aes = AES(secret_key="legacy-test-key", salt="legacy-salt", iv="legacy-iv")
+    legacy_encryptor = Encryptor()
+    legacy_encryptor.add_encrypt_method(legacy_aes)
+    ciphertext = await legacy_encryptor.encrypt("rt-legacy", microsoft_oauth_service.EncryptMethod.AES)
+    update_active_refresh_token = AsyncMock()
+    repository = SimpleNamespace(
+        load_active_ciphertext=AsyncMock(
+            return_value=ActiveCredentialCiphertext(
+                encrypted_refresh_token=ciphertext,
+                encrypted_method="aes",
+                scopes_granted=["Mail.Read"],
+            )
+        ),
+        update_active_refresh_token=update_active_refresh_token,
+    )
+    monkeypatch.setattr(microsoft_oauth_service.app, "DATABASE", SimpleNamespace(microsoft_oauth=repository))
+    monkeypatch.setattr(microsoft_oauth_service, "encryptor", legacy_encryptor)
+    refresh = AsyncMock(return_value={"access_token": "at-fresh", "refresh_token": "rt-rotated"})
+    monkeypatch.setattr(
+        microsoft_oauth_service,
+        "refresh_access_token",
+        refresh,
+    )
+
+    secrets = await microsoft_oauth_service.load_credential_secrets("org-1", "cred-1")
+    access_token = await microsoft_oauth_service.refresh_and_rotate(
+        organization_id="org-1",
+        credential_id="cred-1",
+        credential_secrets=secrets,
+        connection_id="cred-1",
+        initiating_user_id="user-1",
+        custody_mode="cloud_held",
+    )
+
+    assert secrets.refresh_token == "rt-legacy"
+    assert access_token == "at-fresh"
+    refresh.assert_awaited_once_with("rt-legacy", ["Mail.Read"])
+    update_active_refresh_token.assert_awaited_once()
+    persisted = update_active_refresh_token.await_args.kwargs
+    assert persisted["encrypted_method"] == microsoft_oauth_service.EncryptMethod.AES
+    assert persisted["encrypted_refresh_token"].startswith("skyvern_enc:aesgcm-v1:")
+    assert persisted["connection_id"] == "cred-1"
+    assert persisted["initiating_user_id"] == "user-1"
+    assert persisted["custody_mode"] == "cloud_held"
+
+    repository.load_active_ciphertext.return_value = ActiveCredentialCiphertext(
+        encrypted_refresh_token=persisted["encrypted_refresh_token"],
+        encrypted_method="aes",
+        scopes_granted=["Mail.Read"],
+    )
+    reloaded = await microsoft_oauth_service.load_credential_secrets("org-1", "cred-1")
+    assert reloaded.refresh_token == "rt-rotated"
+
+
+@pytest.mark.asyncio
+async def test_gcm_credential_refresh_remains_readable_as_gcm(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(microsoft_oauth_service.settings, "ENABLE_ENCRYPTION", True, raising=False)
+    monkeypatch.setattr(microsoft_oauth_service.settings, "ENCRYPTOR_AES_SECRET_KEY", "gcm-test-key", raising=False)
+    monkeypatch.setattr(microsoft_oauth_service.settings, "ENCRYPTOR_AES_SALT", "gcm-test-salt", raising=False)
+    ciphertext = await microsoft_oauth_service.secret_encryption.encrypt_secret_field_value(
+        "rt-gcm",
+        organization_id="org-1",
+        field_name="microsoft_oauth_credentials.encrypted_refresh_token",
+    )
+    repository = SimpleNamespace(
+        load_active_ciphertext=AsyncMock(
+            return_value=ActiveCredentialCiphertext(
+                encrypted_refresh_token=ciphertext,
+                encrypted_method="aes",
+                scopes_granted=["Mail.Read"],
+            )
+        ),
+        update_active_refresh_token=AsyncMock(),
+    )
+    monkeypatch.setattr(microsoft_oauth_service.app, "DATABASE", SimpleNamespace(microsoft_oauth=repository))
+    monkeypatch.setattr(
+        microsoft_oauth_service,
+        "refresh_access_token",
+        AsyncMock(return_value={"access_token": "at-fresh", "refresh_token": "rt-gcm-rotated"}),
+    )
+
+    secrets = await microsoft_oauth_service.load_credential_secrets("org-1", "cred-1")
+    await microsoft_oauth_service.refresh_and_rotate(
+        organization_id="org-1",
+        credential_id="cred-1",
+        credential_secrets=secrets,
+    )
+
+    persisted = repository.update_active_refresh_token.await_args.kwargs["encrypted_refresh_token"]
+    assert persisted.startswith("skyvern_enc:aesgcm-v1:")
+    repository.load_active_ciphertext.return_value = ActiveCredentialCiphertext(
+        encrypted_refresh_token=persisted,
+        encrypted_method="aes",
+        scopes_granted=["Mail.Read"],
+    )
+    reloaded = await microsoft_oauth_service.load_credential_secrets("org-1", "cred-1")
+    assert reloaded.refresh_token == "rt-gcm-rotated"
+
+
+@pytest.mark.asyncio
+async def test_legacy_cbc_credential_remains_readable_without_refresh(monkeypatch: pytest.MonkeyPatch) -> None:
+    legacy_aes = AES(secret_key="legacy-test-key", salt="legacy-salt", iv="legacy-iv")
+    legacy_encryptor = Encryptor()
+    legacy_encryptor.add_encrypt_method(legacy_aes)
+    ciphertext = await legacy_encryptor.encrypt("rt-legacy", microsoft_oauth_service.EncryptMethod.AES)
+    repository = SimpleNamespace(
+        load_active_ciphertext=AsyncMock(
+            return_value=ActiveCredentialCiphertext(
+                encrypted_refresh_token=ciphertext,
+                encrypted_method="aes",
+                scopes_granted=["Mail.Read"],
+            )
+        )
+    )
+    monkeypatch.setattr(microsoft_oauth_service.app, "DATABASE", SimpleNamespace(microsoft_oauth=repository))
+    monkeypatch.setattr(microsoft_oauth_service, "encryptor", legacy_encryptor)
+
+    secrets = await microsoft_oauth_service.load_credential_secrets("org-1", "cred-1")
+
+    assert secrets.refresh_token == "rt-legacy"
+
+
+@pytest.mark.asyncio
+async def test_refresh_fails_closed_without_gcm_key_and_leaves_legacy_row_untouched(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    legacy_aes = AES(secret_key="legacy-test-key", salt="legacy-salt", iv="legacy-iv")
+    legacy_encryptor = Encryptor()
+    legacy_encryptor.add_encrypt_method(legacy_aes)
+    old_ciphertext = await legacy_encryptor.encrypt("rt-legacy", microsoft_oauth_service.EncryptMethod.AES)
+    update_active_refresh_token = AsyncMock()
+    repository = SimpleNamespace(
+        load_active_ciphertext=AsyncMock(
+            return_value=ActiveCredentialCiphertext(
+                encrypted_refresh_token=old_ciphertext,
+                encrypted_method="aes",
+                scopes_granted=["Mail.Read"],
+            )
+        ),
+        update_active_refresh_token=update_active_refresh_token,
+    )
+    refresh = AsyncMock(return_value={"access_token": "at-fresh", "refresh_token": "rt-rotated"})
+    monkeypatch.setattr(microsoft_oauth_service.app, "DATABASE", SimpleNamespace(microsoft_oauth=repository))
+    monkeypatch.setattr(microsoft_oauth_service, "encryptor", legacy_encryptor)
+    monkeypatch.setattr(microsoft_oauth_service, "refresh_access_token", refresh)
+    monkeypatch.setattr(microsoft_oauth_service.secret_encryption, "encryption_available", lambda: False)
+
+    secrets = await microsoft_oauth_service.load_credential_secrets("org-1", "cred-1")
+    with pytest.raises(microsoft_oauth_service.EncryptionNotConfiguredError):
+        await microsoft_oauth_service.refresh_and_rotate(
+            organization_id="org-1",
+            credential_id="cred-1",
+            credential_secrets=secrets,
+        )
+
+    refresh.assert_not_awaited()
     update_active_refresh_token.assert_not_awaited()
+    assert repository.load_active_ciphertext.return_value.encrypted_refresh_token == old_ciphertext
+
+
+@pytest.mark.asyncio
+async def test_gcm_credentials_are_dual_read_and_missing_key_fails_closed(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    ciphertext = "skyvern_enc:aesgcm-v1:not-used"
+    repository = SimpleNamespace(
+        load_active_ciphertext=AsyncMock(
+            return_value=ActiveCredentialCiphertext(
+                encrypted_refresh_token=ciphertext,
+                encrypted_method="aes",
+                scopes_granted=["Mail.Read"],
+            )
+        )
+    )
+    monkeypatch.setattr(microsoft_oauth_service.app, "DATABASE", SimpleNamespace(microsoft_oauth=repository))
+    decrypt = AsyncMock(return_value="rt-gcm")
+    monkeypatch.setattr(microsoft_oauth_service.secret_encryption, "encryption_available", lambda: True)
+    monkeypatch.setattr(microsoft_oauth_service.secret_encryption, "decrypt_secret_field_value", decrypt)
+
+    secrets = await microsoft_oauth_service.load_credential_secrets("org-1", "cred-1")
+
+    assert secrets.refresh_token == "rt-gcm"
+    decrypt.assert_awaited_once_with(
+        ciphertext,
+        organization_id="org-1",
+        field_name="microsoft_oauth_credentials.encrypted_refresh_token",
+    )
+
+    monkeypatch.setattr(microsoft_oauth_service.secret_encryption, "encryption_available", lambda: False)
+    decrypt.reset_mock()
+    with pytest.raises(microsoft_oauth_service.EncryptionNotConfiguredError):
+        await microsoft_oauth_service.load_credential_secrets("org-1", "cred-1")
+    decrypt.assert_not_awaited()
 
 
 @pytest.mark.asyncio

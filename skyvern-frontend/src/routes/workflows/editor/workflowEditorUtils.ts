@@ -46,6 +46,7 @@ import {
   type ConditionalBlock,
   type ForLoopBlock,
   type WhileLoopBlock,
+  type WorkflowModel,
   isNestedLoopWorkflowBlock,
 } from "../types/workflowTypes";
 import {
@@ -86,7 +87,11 @@ import {
   PdfFillBlockYAML,
   SplitPdfBlockYAML,
 } from "../types/workflowYamlTypes";
-import { EMAIL_BLOCK_SENDER, REACT_FLOW_EDGE_Z_INDEX } from "./constants";
+import {
+  EMAIL_BLOCK_SENDER,
+  REACT_FLOW_EDGE_Z_INDEX,
+  SKYVERN_DOWNLOAD_DIRECTORY,
+} from "./constants";
 import { ParametersState } from "./types";
 import { AppNode, isWorkflowBlockNode, WorkflowBlockNode } from "./nodes";
 import {
@@ -682,6 +687,13 @@ function layout(
   };
 }
 
+// A comma inside {{ }} or {% %} belongs to the template, as in {{ addresses | join(",") }}.
+function splitEmailList(value: string): Array<string> {
+  return (value.match(/(?:\{\{.*?\}\}|\{%.*?%\}|[^,])+/gs) ?? [])
+    .map((entry) => entry.trim())
+    .filter(Boolean);
+}
+
 // Keep this sentinel aligned with skyvern/forge/sdk/workflow/models/parameter.py.
 const UNUSED_CUSTOM_SMTP_PLACEHOLDER_AWS_KEY = "UNUSED_CUSTOM_SMTP_PLACEHOLDER";
 
@@ -1151,6 +1163,10 @@ function convertToNode(
               : null,
           customSmtpUsername: block.custom_smtp_username ?? null,
           customSmtpPassword: block.custom_smtp_password ?? null,
+          transport: block.transport ?? "smtp",
+          credentialId: block.credential_id ?? "",
+          cc: (block.cc ?? []).join(", "),
+          bcc: (block.bcc ?? []).join(", "),
         },
       };
     }
@@ -1244,6 +1260,7 @@ function convertToNode(
           fileType: block.file_type ?? "auto_detect",
           jsonSchema: JSON.stringify(block.json_schema, null, 2),
           worksheet: block.worksheet ?? "",
+          forceOcr: block.force_ocr ?? false,
           model: block.model,
         },
       };
@@ -1453,6 +1470,7 @@ function convertToNode(
           newerThanDays: block.newer_than_days ?? null,
           maxResults: block.max_results ?? 25,
           includeBody: block.include_body ?? true,
+          downloadAttachments: block.download_attachments ?? false,
           parameterKeys: (block.parameters ?? []).map((p) => p.key),
         },
       };
@@ -3308,6 +3326,13 @@ function findNextBlockLabel(
   return null;
 }
 
+// Navigation blocks used to default to `{ model_name: "" }`, which is not an override.
+function blockModelOverride(
+  model: WorkflowModel | null | undefined,
+): WorkflowModel | null {
+  return model?.model_name ? model : null;
+}
+
 function getWorkflowBlock(
   node: WorkflowBlockNode,
   nodes: Array<AppNode>,
@@ -3320,7 +3345,7 @@ function getWorkflowBlock(
     label: node.data.label,
     continue_on_failure: node.data.continueOnFailure,
     next_loop_on_failure: node.data.nextLoopOnFailure,
-    model: node.data.model,
+    model: blockModelOverride(node.data.model),
     next_block_label: nextBlockLabel,
     ignore_workflow_system_prompt:
       node.data.ignoreWorkflowSystemPrompt ?? false,
@@ -3596,6 +3621,26 @@ function getWorkflowBlock(
       };
     }
     case "sendEmail": {
+      if (node.data.transport === "gmail") {
+        // Gmail sends from the connected account and never carries a sender,
+        // SMTP settings or the download-directory attachment default.
+        return {
+          ...base,
+          block_type: "send_email",
+          transport: "gmail",
+          credential_id: node.data.credentialId || null,
+          sender: "",
+          recipients: splitEmailList(node.data.recipients),
+          cc: splitEmailList(node.data.cc),
+          bcc: splitEmailList(node.data.bcc),
+          subject: node.data.subject,
+          body: node.data.body,
+          body_format: node.data.bodyFormat,
+          file_attachments: splitEmailList(node.data.fileAttachments).filter(
+            (attachment) => attachment !== SKYVERN_DOWNLOAD_DIRECTORY,
+          ),
+        };
+      }
       return {
         ...base,
         block_type: "send_email",
@@ -3706,6 +3751,7 @@ function getWorkflowBlock(
         file_type: node.data.fileType,
         json_schema: JSONParseSafe(node.data.jsonSchema),
         worksheet: node.data.worksheet || null,
+        force_ocr: node.data.forceOcr ?? false,
       };
     }
     case "textPrompt": {
@@ -3848,6 +3894,7 @@ function getWorkflowBlock(
         newer_than_days: node.data.newerThanDays,
         max_results: node.data.maxResults,
         include_body: node.data.includeBody,
+        download_attachments: node.data.downloadAttachments,
         parameter_keys: node.data.parameterKeys,
       };
     }
@@ -5043,7 +5090,7 @@ function convertBlocksToBlockYAML(
           url: block.url,
           title: block.title,
           ...blockEngineYAML(block, effectiveDefaultEngine),
-          model: block.model,
+          model: blockModelOverride(block.model),
           navigation_goal: block.navigation_goal,
           error_code_mapping: block.error_code_mapping,
           max_retries: block.max_retries,
@@ -5297,6 +5344,7 @@ function convertBlocksToBlockYAML(
           file_type: block.file_type,
           json_schema: block.json_schema,
           worksheet: block.worksheet,
+          force_ocr: block.force_ocr,
         };
         return blockYaml;
       }
@@ -5335,6 +5383,14 @@ function convertBlocksToBlockYAML(
           body: block.body,
           body_format: block.body_format,
           file_attachments: block.file_attachments,
+          ...(block.transport === "gmail"
+            ? {
+                transport: block.transport,
+                credential_id: block.credential_id ?? null,
+                cc: block.cc ?? [],
+                bcc: block.bcc ?? [],
+              }
+            : {}),
         };
         return blockYaml;
       }
@@ -5350,7 +5406,7 @@ function convertBlocksToBlockYAML(
         const blockYaml: WebSearchBlockYAML = {
           ...base,
           block_type: "web_search",
-          model: block.model,
+          model: blockModelOverride(block.model),
           query: block.query,
           provider: block.provider,
           num_results: block.num_results,
@@ -5444,6 +5500,7 @@ function convertBlocksToBlockYAML(
           newer_than_days: block.newer_than_days,
           max_results: block.max_results,
           include_body: block.include_body,
+          download_attachments: block.download_attachments,
           parameter_keys: (block.parameters ?? []).map((p) => p.key),
         };
         return blockYaml;

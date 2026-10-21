@@ -453,6 +453,33 @@ def test_validate_fetch_url_allows_localhost_in_allowed_hosts(monkeypatch: pytes
     assert validate_fetch_url(url) == url
 
 
+@pytest.mark.parametrize("url", ["http://10.0.0.5/", "http://169.254.169.254/", "http://localhost:8000/"])
+def test_disabling_url_validation_lifts_the_ssrf_guard_for_every_host(
+    monkeypatch: pytest.MonkeyPatch, url: str
+) -> None:
+    monkeypatch.setattr(settings, "ALLOWED_HOSTS", [])
+    with pytest.raises(BlockedHost):
+        validate_fetch_url(url)
+
+    monkeypatch.setattr(settings, "ENABLE_URL_VALIDATION", False)
+    assert validate_fetch_url(url) == url
+
+
+def test_disabling_url_validation_allows_hostname_resolving_to_private_address(monkeypatch: pytest.MonkeyPatch) -> None:
+    def resolves_to_private(host: str, port: int | None, *args: object, **kwargs: object) -> list[object]:
+        return [(socket.AF_INET, socket.SOCK_STREAM, 0, "", ("10.0.1.128", port or 0))]
+
+    monkeypatch.setattr(settings, "ALLOWED_HOSTS", [])
+    monkeypatch.setattr("skyvern.utils.url_validators.socket.getaddrinfo", resolves_to_private)
+    url = "https://intranet.example.test/login"
+    with pytest.raises(BlockedHost):
+        validate_fetch_url(url)
+
+    monkeypatch.setattr(settings, "ENABLE_URL_VALIDATION", False)
+    assert validate_fetch_url(url) == url
+    assert is_blocked_host("intranet.example.test", resolve_dns=True) is False
+
+
 @pytest.mark.parametrize("url", ["http://169.254.169.254/", "http://10.0.0.5/"])
 def test_validate_fetch_url_blocks_metadata_and_private_hosts(url: str) -> None:
     with pytest.raises(BlockedHost):

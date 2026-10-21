@@ -38,6 +38,7 @@ from skyvern.forge.sdk.api.llm.exceptions import (
     LLMProviderError,
     LLMProviderErrorRetryableTask,
 )
+from skyvern.forge.sdk.copilot.cost_telemetry import copilot_cost_scope
 from skyvern.forge.sdk.core.skyvern_context import SkyvernContext
 from skyvern.forge.sdk.models import Step, StepStatus
 from skyvern.schemas.llm import LLMConfig, LLMRouterConfig, LLMRouterModelConfig
@@ -427,11 +428,13 @@ async def _run_router(
 
 @pytest.mark.asyncio
 async def test_happy_path_parses_and_records_identically(span_exporter: InMemorySpanExporter) -> None:
-    direct = await _run_direct(span_exporter, responses=[ParityResponse("gpt-4")], step=_make_step(), parameters={})
-    router = await _run_router(span_exporter, responses=[ParityResponse("gpt-4")], step=_make_step(), parameters={})
+    response = ParityResponse("gpt-4", cache_creation_tokens=404)
+    direct = await _run_direct(span_exporter, responses=[response], step=_make_step(), parameters={})
+    router = await _run_router(span_exporter, responses=[response], step=_make_step(), parameters={})
 
     assert direct.error is None and router.error is None
     assert direct.parsed == router.parsed == {"actions": []}
+    assert [outcome.metrics_events[0]["cache_creation_tokens"] for outcome in (direct, router)] == [404, 404]
 
     assert len(direct.completion_calls) == 1 and not direct.router_calls
     assert len(router.router_calls) == 1 and not router.completion_calls
@@ -570,20 +573,21 @@ async def test_copilot_model_usage_is_emitted_once_by_router_and_single_handler(
             provider="openai",
         )
 
-    direct = await _run_direct(
-        span_exporter,
-        responses=[response()],
-        model_name="gpt-4",
-        prompt_name="workflow-copilot-narration",
-        parameters={},
-    )
-    router = await _run_router(
-        span_exporter,
-        responses=[response()],
-        main_model_group="gpt-4",
-        prompt_name="workflow-copilot-narration",
-        parameters={},
-    )
+    with copilot_cost_scope() as ledger:
+        direct = await _run_direct(
+            span_exporter,
+            responses=[response()],
+            model_name="gpt-4",
+            prompt_name="workflow-copilot-narration",
+            parameters={},
+        )
+        router = await _run_router(
+            span_exporter,
+            responses=[response()],
+            main_model_group="gpt-4",
+            prompt_name="workflow-copilot-narration",
+            parameters={},
+        )
 
     expected = {
         "log_code": "copilot_model_usage",
@@ -600,6 +604,9 @@ async def test_copilot_model_usage_is_emitted_once_by_router_and_single_handler(
     }
     assert direct.error is None and router.error is None
     assert direct.usage_events == router.usage_events == [expected]
+    assert ledger.snapshot()["known_cost_usd"] == pytest.approx(LLM_COST * 2)
+    assert ledger.snapshot()["observed_call_count"] == 2
+    assert ledger.snapshot()["pricing_sources"] == ["litellm_estimate"]
 
 
 @pytest.mark.asyncio

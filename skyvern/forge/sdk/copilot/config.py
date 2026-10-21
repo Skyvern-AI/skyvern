@@ -103,18 +103,19 @@ def _default_credential_pause_timeout_seconds() -> int:
     return settings.WORKFLOW_COPILOT_CREDENTIAL_PAUSE_TIMEOUT_SECONDS
 
 
-def _default_token_budget() -> int:
+def _default_token_budget() -> int | None:
     qa_token_budget = settings.WORKFLOW_COPILOT_QA_TOKEN_BUDGET
     if not settings.is_cloud_environment() and qa_token_budget is not None:
         return qa_token_budget
-    return DEFAULT_TOKEN_BUDGET
+    return None
 
 
 @dataclass(slots=True)
 class CopilotConfig:
     prompt_template: str = DEFAULT_PROMPT_TEMPLATE
     max_turns: int = DEFAULT_MAX_TURNS
-    token_budget: int = field(default_factory=_default_token_budget)
+    # None takes the budget from the model's pricing table (model_resolver.copilot_token_budget).
+    token_budget: int | None = field(default_factory=_default_token_budget)
     security_rules: str = ""
     # Rendered after the user's message on every turn: from there it holds even when earlier turns or the
     # saved workflow went along with an out-of-scope request, which the same text in the system prompt does not.

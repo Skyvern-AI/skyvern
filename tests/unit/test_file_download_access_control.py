@@ -8,12 +8,15 @@ from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
+from aiohttp import web
+from aiohttp.test_utils import TestServer
 
 from skyvern.config import settings
 from skyvern.constants import DOWNLOAD_FILE_PREFIX
 from skyvern.exceptions import BlockedHost, SkyvernHTTPException
 from skyvern.forge.sdk.api import files
 from skyvern.forge.sdk.artifact.storage.local import LocalStorage
+from skyvern.forge.sdk.core.http_request_authorization import RunScopedRedirectHopAuthorizer
 from skyvern.utils.url_validators import MAX_SAFE_REDIRECTS
 from tests.unit.conftest import LEGACY_DOWNLOAD_ESCAPE_CASES
 
@@ -459,14 +462,78 @@ async def test_download_file_strips_credentials_on_cross_origin_redirect(
 
     result = await files.download_file(
         "https://example.com/start.pdf",
-        headers={"Authorization": "Bearer secret", "Cookie": "sid=abc", "X-Keep": "1"},
+        headers={
+            "Authorization": "Bearer secret",
+            "Cookie": "sid=abc",
+            "Accept": "application/pdf",
+            "X-Keep": "1",
+        },
         output_dir=str(tmp_path),
     )
 
     assert Path(result).read_bytes() == b"file-bytes"
     assert requested_headers[0]["Authorization"] == "Bearer secret"
     assert requested_headers[0]["Cookie"] == "sid=abc"
-    assert requested_headers[1] == {"X-Keep": "1"}
+    assert requested_headers[1] == {"Accept": "application/pdf"}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("download_path", ["fetch_file_bytes", "download_file"])
+async def test_file_redirect_paths_clear_cookie_jar_on_cross_origin_hops(
+    download_path: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    async def pin_local_url(url: str, resolver: files.SSRFGuardedResolver) -> str:
+        resolver.pin_url_ips(url, ("127.0.0.1",))
+        return url
+
+    async def pin_local_redirect(_url: str, location: str, resolver: files.SSRFGuardedResolver) -> str:
+        resolver.pin_url_ips(location, ("127.0.0.1",))
+        return location
+
+    monkeypatch.setattr(files, "validate_and_pin_fetch_url", pin_local_url)
+    monkeypatch.setattr(files, "validate_and_pin_redirect_url", pin_local_redirect)
+
+    redirect_target = ""
+    received_cookies: dict[str, str] = {}
+
+    async def redirect(_request: web.Request) -> web.Response:
+        response = web.Response(status=302, headers={"Location": redirect_target})
+        response.set_cookie("server-cookie", "synthetic")
+        return response
+
+    async def final(request: web.Request) -> web.Response:
+        received_cookies.update(request.cookies)
+        return web.Response(body=b"file-bytes", content_type="application/octet-stream")
+
+    source_app = web.Application()
+    source_app.router.add_get("/start", redirect)
+    source_server = TestServer(source_app, host="localhost")
+    target_app = web.Application()
+    target_app.router.add_get("/final.pdf", final)
+    target_server = TestServer(target_app, host="localhost")
+    await source_server.start_server()
+    await target_server.start_server()
+    source_url = str(source_server.make_url("/start"))
+    redirect_target = str(target_server.make_url("/final.pdf"))
+
+    try:
+        if download_path == "fetch_file_bytes":
+            scope = "test-download-scope"
+            response = await files.fetch_file_bytes(
+                source_url,
+                authorize_request_hop=RunScopedRedirectHopAuthorizer(download_scope=scope),
+                download_scope=scope,
+                approved_initial_url=source_url,
+            )
+            assert response.body == b"file-bytes"
+        else:
+            result = await files.download_file(source_url, output_dir=str(tmp_path))
+            assert Path(result).read_bytes() == b"file-bytes"
+    finally:
+        await target_server.close()
+        await source_server.close()
+
+    assert received_cookies == {}
 
 
 @pytest.mark.asyncio

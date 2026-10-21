@@ -95,6 +95,7 @@ async def test_skyvern_element_click_classifies_permanently_disabled_control() -
 async def test_click_handler_classifies_control_that_stays_disabled() -> None:
     element = MagicMock()
     element.get_id.return_value = "control"
+    element.get_attr = AsyncMock(return_value=None)
     element.is_disabled = AsyncMock(return_value=True)
     dom = MagicMock()
     dom.get_skyvern_element_by_id = AsyncMock(return_value=element)

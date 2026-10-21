@@ -21,6 +21,7 @@ class ChallengeVendor(StrEnum):
 
     DATADOME = "datadome"
     PERIMETERX = "perimeterx"
+    BOTSHIELD = "botshield"
 
 
 # A managed widget preloads small (a bordered 1x1 iframe measures 25) and grows when it challenges, so an area at or

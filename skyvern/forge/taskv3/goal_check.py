@@ -34,6 +34,7 @@ INSTRUCTIONS_MAX_CHARS = 4000
 TRUNCATION_MARKER = "…[truncated]…"
 SCREENSHOT_QUOTE_PREFIX = "SCREENSHOT:"
 UNLISTED_REASK_PROMPT_NAME = "taskv3-unlisted-outcome-check"
+TERMINATE_PREMISE_PROMPT_NAME = "taskv3-terminate-premise-check"
 REASON_MAX_CHARS = 2000
 CONVERTED_REASON_MAX_CHARS = 300
 # Shorter values ("Yes", "1", a state code) occur on any page, so they cannot show that this block's action landed.
@@ -141,10 +142,10 @@ class GoalVerdict:
     latency_s: float
 
 
-def goal_check_eligible(*, page_free: bool, completion_blocker_present: bool, extraction_requested: bool) -> bool:
-    """Blocks that verify their own completion (page-free validation, a download gate, the
-    missing-extraction veto) are left to that verifier."""
-    return not page_free and not completion_blocker_present and not extraction_requested
+def goal_check_eligible(*, page_free: bool, download_gated: bool, extraction_requested: bool) -> bool:
+    """Blocks with their own completion check (page-free validation, the missing-extraction veto) and download
+    blocks, whose outcome is a file the page-reading judges cannot see, get no goal judge."""
+    return not page_free and not download_gated and not extraction_requested
 
 
 def _truncate_result(text: str) -> str:
@@ -238,8 +239,10 @@ def render_unlisted_reask_prompt(
     redact: Redactor | None = None,
     criteria_untrusted: bool = False,
     instructions_untrusted: bool = False,
+    prompt_name: str = UNLISTED_REASK_PROMPT_NAME,
 ) -> tuple[str, tuple[str, ...]]:
-    """The re-ask prompt for a failed or terminated finish, and the post-action evidence its quote must come from.
+    """A stop check's prompt (the re-ask's by default) for a failed or terminated finish, and the post-action evidence
+    its quote must come from.
     Pure: the offline gate rebuilds the production request from archived inputs through this function."""
     if redact is None:
         redact = str
@@ -247,7 +250,7 @@ def render_unlisted_reask_prompt(
     criterion = _untrusted if criteria_untrusted else str
     instruction = _untrusted if instructions_untrusted else str
     prompt = prompt_engine.load_prompt(
-        UNLISTED_REASK_PROMPT_NAME,
+        prompt_name,
         # Always fenced: the goal carries no provenance here, so a page value rendered into it reads as data.
         goal=_untrusted(redact(goal)),
         complete_criterion=criterion(redact(complete_criterion)),
@@ -489,4 +492,108 @@ async def run_unlisted_reask(
             f"{_collapse(str(response.get('evidence') or ''))}"
         )
         result.reason = (redact or str)(converted_reason)[:CONVERTED_REASON_MAX_CHARS]
+    return result
+
+
+# Stops a handed-back turn could make worse: continuing past them pays, deletes, submits or attests.
+NEVER_OVERTURN_KINDS = frozenset({"designed", "consent", "legal", "credential", "payment", "deletion", "irreversible"})
+
+
+@dataclass
+class TerminatePremise:
+    """Whether a terminated finish rests on a condition the page does not meet, so that one turn would be handed
+    back. Shadow only: nothing reads `would_overturn` but the log. Holds only validated values, never page text."""
+
+    would_overturn: bool = False
+    never_overturn: str | None = None
+    skipped_reason: str | None = None
+    latency_s: float = 0.0
+    condition: str | None = None
+    stop_kind: str | None = None
+    cited: str | None = None
+    unmet_kind: str | None = None
+    quote_chars: int = 0
+
+    @property
+    def why(self) -> str:
+        if self.never_overturn is not None:
+            return f"never_overturn:{self.never_overturn}"
+        if self.skipped_reason is not None:
+            return f"skipped:{self.skipped_reason}"
+        return "unmet_on_page" if self.would_overturn else f"condition_{self.condition}"
+
+
+async def run_terminate_premise(
+    *,
+    goal: str,
+    complete_criterion: str,
+    terminate_criterion: str | None,
+    reason: str,
+    trail: ToolTrail,
+    judge: GoalJudge,
+    timeout_seconds: float,
+    prior_checks: int,
+    instructions: str = "",
+    redact: Redactor | None = None,
+    criteria_untrusted: bool = False,
+    instructions_untrusted: bool = False,
+) -> TerminatePremise:
+    """Fails closed: anything short of a grounded "unmet" on a stop off the never-overturn list keeps the stop."""
+    started = time.monotonic()
+    result = TerminatePremise()
+    if prior_checks:
+        result.never_overturn = "second_terminate"
+        return result
+    try:
+        prompt, current = render_unlisted_reask_prompt(
+            goal=goal,
+            complete_criterion=complete_criterion,
+            terminate_criterion=terminate_criterion,
+            status="terminated",
+            reason=reason,
+            trail=trail,
+            instructions=instructions,
+            redact=redact,
+            criteria_untrusted=criteria_untrusted,
+            instructions_untrusted=instructions_untrusted,
+            prompt_name=TERMINATE_PREMISE_PROMPT_NAME,
+        )
+        # A quote must come from the page the agent stopped on; with no page change on the trail, all of it is.
+        if trail.last_page_change is None:
+            current = (_render_evidence(trail, redact or str)[3],)
+    except Exception:
+        LOG.warning("taskv3 terminate premise render failed", exc_info=True)
+        result.skipped_reason = "judge_error"
+        return result
+    response, result.skipped_reason = await _ask(
+        prompt, judge, timeout_seconds, "taskv3 terminate premise judge failed"
+    )
+    result.latency_s = time.monotonic() - started
+    if response is None:
+        return result
+    condition, kind, cited, quote = (response.get(key) for key in ("condition", "stop_kind", "cited", "quote"))
+    if (
+        condition not in ("met", "unmet", "unclear")
+        or not isinstance(kind, str)
+        or kind not in NEVER_OVERTURN_KINDS | {"none"}
+        or cited not in ("termination_criterion", "instruction", "goal", "none")
+    ):
+        result.skipped_reason = "unparseable"
+        return result
+    result.condition, result.stop_kind, result.cited = condition, kind, cited
+    if response.get("unmet_kind") in ("equivalent", "premise_absent"):
+        result.unmet_kind = response["unmet_kind"]
+    result.quote_chars = len(quote) if isinstance(quote, str) else 0
+    if kind != "none":
+        result.never_overturn = kind
+    elif condition == "unmet":
+        if cited == "none":
+            result.skipped_reason = "no_cited_condition"
+        elif not isinstance(quote, str) or not quote.strip() or quote.startswith(SCREENSHOT_QUOTE_PREFIX):
+            result.skipped_reason = "no_text_quote"
+        # Short text such as "Pay" is on any page, so it cannot show the condition is unmet.
+        elif len(_collapse(quote)) < ENTERED_VALUE_MIN_CHARS or not any(_grounded(quote, text) for text in current):
+            result.skipped_reason = "quote_not_in_evidence"
+        else:
+            result.would_overturn = True
     return result

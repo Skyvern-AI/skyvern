@@ -76,10 +76,14 @@ def _owned_scrub_values(context: object) -> set[str]:
 
 # encodeURIComponent leaves these literal where Python's quote does not.
 _ENCODE_URI_COMPONENT_SAFE = "-_.!~*'()"
+# Chromium leaves these literal when it serializes a URL path, so a value in a path segment keeps them.
+_CHROMIUM_URL_PATH_SAFE = "!$%&'()*+,/:;=@[]"
+# Before serializing a path, Chromium turns a backslash into a slash and drops tabs and newlines.
+_CHROMIUM_URL_PATH_REWRITES = str.maketrans({"\\": "/", "\t": None, "\n": None, "\r": None})
 
 
 def encoded_secret_variants(value: str) -> list[str]:
-    """The forms a page can echo a value in: a URL query, escaped markup, a JSON or Python literal."""
+    """The forms a page can echo a value in: a URL query or path, escaped markup, a JSON or Python literal."""
     try:
         forms = [
             value,
@@ -88,6 +92,7 @@ def encoded_secret_variants(value: str) -> list[str]:
             quote(value),
             quote(value, safe=""),
             quote(value, safe=_ENCODE_URI_COMPONENT_SAFE),
+            quote(value.translate(_CHROMIUM_URL_PATH_REWRITES), safe=_CHROMIUM_URL_PATH_SAFE),
             quote_plus(value, safe=""),
             json.dumps(value, ensure_ascii=True)[1:-1],
             repr(value)[1:-1],
@@ -161,28 +166,6 @@ def matching_origin_run_redaction_parameters(ctx: AgentContext, run_id: str | No
         return value
 
     return mutable(registry.parameters)
-
-
-def register_matching_origin_run_redaction_values(ctx: AgentContext, run_id: str | None = None) -> bool:
-    """Bind the terminal origin run's known values to the existing exact-value scrubber."""
-    parameters = matching_origin_run_redaction_parameters(ctx, run_id)
-    if parameters is None:
-        return False
-    register_secret_scrub_values_from_structure(ctx, parameters)
-    bound_run_id = run_id or getattr(ctx, "last_run_blocks_workflow_run_id", None)
-    if isinstance(bound_run_id, str) and bound_run_id:
-        bound_run_ids = getattr(ctx, "origin_runs_bound_to_scrubber", None)
-        if not isinstance(bound_run_ids, set):
-            bound_run_ids = set()
-            ctx.origin_runs_bound_to_scrubber = bound_run_ids
-        bound_run_ids.add(bound_run_id)
-    return True
-
-
-def origin_runs_bound_to_scrubber(ctx: AgentContext) -> set[str]:
-    """Runs whose complete registry has been registered with this context's scrubber."""
-    bound_run_ids = getattr(ctx, "origin_runs_bound_to_scrubber", None)
-    return bound_run_ids if isinstance(bound_run_ids, set) else set()
 
 
 def clear_session_scrub_values(session_id: str | None) -> None:

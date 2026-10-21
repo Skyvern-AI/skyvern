@@ -2,9 +2,11 @@ import { fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
 import { GoogleReconnectCard } from "./GoogleReconnectCard";
+import type { GoogleConnectionNotice } from "../narrativeState";
+import { PageSlotsProvider, type PermissionsState } from "@/store/PageSlots";
 
-const { hookState, startAuthorize, storeIntegration, toast } = vi.hoisted(
-  () => ({
+const { hookState, refetchCredentials, startAuthorize, storeIntegration } =
+  vi.hoisted(() => ({
     hookState: {
       current: {
         credentials: [] as Array<{
@@ -12,21 +14,22 @@ const { hookState, startAuthorize, storeIntegration, toast } = vi.hoisted(
           state: string;
           scopes_granted?: string[];
           credential_name?: string;
+          email_address?: string | null;
         }>,
         isLoading: false,
         isFetching: false,
         error: null as Error | null,
       },
     },
+    refetchCredentials: vi.fn(),
     startAuthorize: vi.fn(),
     storeIntegration: vi.fn(),
-    toast: vi.fn(),
-  }),
-);
+  }));
 
 vi.mock("@/hooks/useGoogleOAuthCredentials", () => ({
   useGoogleOAuthCredentials: () => ({
     ...hookState.current,
+    refetchCredentials,
     startAuthorize,
   }),
   isGoogleOAuthCredentialActive: (credential: { state: string }) =>
@@ -38,7 +41,6 @@ vi.mock("@/hooks/useGoogleOAuthCredentials", () => ({
     requiredScopes.every((scope) => credential.scopes_granted?.includes(scope)),
 }));
 
-vi.mock("@/components/ui/use-toast", () => ({ toast }));
 vi.mock("@/routes/integrations/googleOAuth", async (importOriginal) => ({
   ...(await importOriginal()),
   storeGoogleOAuthIntegrationIdForState: storeIntegration,
@@ -49,6 +51,48 @@ const notice = {
   connectionId: "goac_error",
   displayName: "Work Sheets",
   condition: "unusable" as const,
+  scopeProfile: "google_sheets" as const,
+  origin: "workflow" as const,
+};
+
+const SHEETS_SCOPE = "https://www.googleapis.com/auth/spreadsheets";
+const GMAIL_READ_SCOPE = "https://www.googleapis.com/auth/gmail.readonly";
+
+function setupNotice(
+  overrides: Partial<GoogleConnectionNotice> = {},
+): GoogleConnectionNotice {
+  return {
+    provider: "google",
+    connectionId: null,
+    displayName: null,
+    condition: "unbound",
+    scopeProfile: "gmail",
+    origin: "setup",
+    choices: [],
+    ...overrides,
+  };
+}
+
+function openablePopup() {
+  return {
+    location: { assign: vi.fn() },
+    close: vi.fn(),
+    closed: false,
+    opener: window as Window | null,
+    sessionStorage: { setItem: vi.fn() },
+  };
+}
+
+const memberPermissions: PermissionsState = {
+  status: "ready",
+  data: {
+    organization_id: "org_1",
+    user_id: "user_1",
+    auth_kind: "bearer",
+    org_role: "org:member",
+    role: "member",
+    capabilities: [],
+  },
 };
 
 describe("GoogleReconnectCard", () => {
@@ -59,10 +103,25 @@ describe("GoogleReconnectCard", () => {
       isFetching: false,
       error: null,
     };
+    refetchCredentials.mockReset().mockResolvedValue({});
     startAuthorize.mockReset();
     storeIntegration.mockReset();
-    toast.mockReset();
     vi.unstubAllEnvs();
+  });
+
+  it("disables OAuth reconnect for Members", () => {
+    render(
+      <PageSlotsProvider value={{ permissions: memberPermissions }}>
+        <GoogleReconnectCard notice={notice} />
+      </PageSlotsProvider>,
+    );
+
+    const reconnectButton = screen.getByRole("button", {
+      name: "Admin required",
+    });
+    expect(reconnectButton.hasAttribute("disabled")).toBe(true);
+    fireEvent.click(reconnectButton);
+    expect(startAuthorize).not.toHaveBeenCalled();
   });
 
   it("shows success only when a fresh lookup says the exact connection is active", () => {
@@ -133,6 +192,8 @@ describe("GoogleReconnectCard", () => {
           connectionId: "goac_missing",
           displayName: null,
           condition: "missing",
+          scopeProfile: "google_sheets",
+          origin: "workflow",
         }}
       />,
     );
@@ -172,7 +233,7 @@ describe("GoogleReconnectCard", () => {
 
     expect(open).toHaveBeenCalledWith(
       "",
-      "skyvern-google-oauth",
+      "skyvern-google-oauth-google_sheets:goac_error",
       expect.stringContaining("popup"),
     );
     expect(popup.opener).toBeNull();
@@ -201,12 +262,23 @@ describe("GoogleReconnectCard", () => {
     open.mockRestore();
   });
 
-  it("does not leave the studio when the browser blocks the new tab", () => {
+  it("shows a blocked popup on the card and retries from the same card", async () => {
     const open = vi.spyOn(window, "open").mockReturnValue(null);
     render(<GoogleReconnectCard notice={notice} />);
     fireEvent.click(screen.getByRole("button", { name: "Reconnect" }));
     expect(startAuthorize).not.toHaveBeenCalled();
-    expect(toast).toHaveBeenCalled();
+    expect(screen.getByRole("alert").textContent).toContain("Allow pop-ups");
+    expect(screen.queryByRole("status")).toBeNull();
+
+    const popup = openablePopup();
+    open.mockReturnValue(popup as unknown as Window);
+    startAuthorize.mockResolvedValue({
+      authorize_url: "https://accounts.google.com/oauth",
+      state: "retry",
+    });
+    fireEvent.click(screen.getByRole("button", { name: "Reconnect again" }));
+    await waitFor(() => expect(popup.location.assign).toHaveBeenCalled());
+    expect(screen.queryByRole("alert")).toBeNull();
     open.mockRestore();
   });
 
@@ -230,6 +302,8 @@ describe("GoogleReconnectCard", () => {
       connectionId: null,
       displayName: null,
       condition: "unbound" as const,
+      scopeProfile: "google_sheets" as const,
+      origin: "workflow" as const,
       choices: [],
     };
     const { rerender } = render(
@@ -271,6 +345,37 @@ describe("GoogleReconnectCard", () => {
     expect(onSelect).not.toHaveBeenCalled();
     open.mockRestore();
   });
+
+  it("lets Members choose a saved account for an unbound Sheets block", () => {
+    hookState.current.credentials = [
+      {
+        id: "goac_saved",
+        credential_name: "Saved Sheets",
+        state: "active",
+        scopes_granted: ["https://www.googleapis.com/auth/spreadsheets"],
+      },
+    ];
+    const onSelect = vi.fn();
+    const unbound = {
+      provider: "google" as const,
+      connectionId: null,
+      displayName: null,
+      condition: "unbound" as const,
+      scopeProfile: "google_sheets" as const,
+      origin: "workflow" as const,
+      choices: [],
+    };
+
+    render(
+      <PageSlotsProvider value={{ permissions: memberPermissions }}>
+        <GoogleReconnectCard notice={unbound} onSelect={onSelect} />
+      </PageSlotsProvider>,
+    );
+
+    fireEvent.click(screen.getByRole("button", { name: /Saved Sheets/ }));
+    expect(onSelect).toHaveBeenCalledWith("goac_saved");
+  });
+
   it("allows saved choices during a list-fetch error but keeps historical choices disabled", () => {
     hookState.current.error = new Error("offline");
     const onSelect = vi.fn();
@@ -279,6 +384,8 @@ describe("GoogleReconnectCard", () => {
       connectionId: null,
       displayName: null,
       condition: "unbound" as const,
+      scopeProfile: "google_sheets" as const,
+      origin: "workflow" as const,
       choices: [
         {
           connection_id: "goac_saved",
@@ -299,5 +406,151 @@ describe("GoogleReconnectCard", () => {
     );
     fireEvent.click(screen.getByRole("button", { name: /Saved Sheets/ }));
     expect(onSelect).not.toHaveBeenCalled();
+  });
+
+  it("asks Google for exactly the read-only Gmail profile on a Gmail setup card", async () => {
+    const popup = openablePopup();
+    const open = vi
+      .spyOn(window, "open")
+      .mockReturnValue(popup as unknown as Window);
+    startAuthorize.mockResolvedValue({
+      authorize_url: "https://accounts.google.com/oauth",
+      state: "gmail-state",
+    });
+    hookState.current.credentials = [
+      {
+        id: "goac_sheets",
+        credential_name: "Sheets only",
+        state: "active",
+        scopes_granted: [SHEETS_SCOPE],
+      },
+    ];
+
+    render(<GoogleReconnectCard notice={setupNotice()} onSelect={vi.fn()} />);
+    expect(screen.queryByText("Sheets only")).toBeNull();
+    expect(screen.getByText("Connect Gmail (read only)")).not.toBeNull();
+    fireEvent.click(screen.getByRole("button", { name: "Connect" }));
+
+    await waitFor(() => expect(popup.location.assign).toHaveBeenCalled());
+    const body = startAuthorize.mock.calls[0]?.[0];
+    expect(body.scope_profile).toBe("gmail");
+    expect(body).not.toHaveProperty("credential_id");
+    expect(JSON.stringify(body)).not.toContain("send");
+    expect(storeIntegration).toHaveBeenCalledWith("gmail-state", "gmail");
+    open.mockRestore();
+  });
+
+  it("gives Gmail and Sheets setup cards separate consent popups", async () => {
+    const gmailPopup = openablePopup();
+    const sheetsPopup = openablePopup();
+    const open = vi
+      .spyOn(window, "open")
+      .mockReturnValueOnce(gmailPopup as unknown as Window)
+      .mockReturnValueOnce(sheetsPopup as unknown as Window);
+    startAuthorize.mockResolvedValue({
+      authorize_url: "https://accounts.google.com/oauth",
+      state: "state_1",
+    });
+
+    render(
+      <>
+        <GoogleReconnectCard notice={setupNotice()} onSelect={vi.fn()} />
+        <GoogleReconnectCard
+          notice={setupNotice({ scopeProfile: "google_sheets" })}
+          onSelect={vi.fn()}
+        />
+      </>,
+    );
+    for (const button of screen.getAllByRole("button", { name: "Connect" })) {
+      fireEvent.click(button);
+    }
+
+    await waitFor(() => expect(sheetsPopup.location.assign).toHaveBeenCalled());
+    const names = open.mock.calls.map((call) => call[1]);
+    expect(names).toEqual([
+      "skyvern-google-oauth-gmail:unbound",
+      "skyvern-google-oauth-google_sheets:unbound",
+    ]);
+    expect(gmailPopup.location.assign).toHaveBeenCalled();
+    open.mockRestore();
+  });
+
+  it("shows a role denial from the server on the card without a connected claim", async () => {
+    const popup = openablePopup();
+    const open = vi
+      .spyOn(window, "open")
+      .mockReturnValue(popup as unknown as Window);
+    startAuthorize.mockRejectedValue({ response: { status: 403 } });
+
+    render(<GoogleReconnectCard notice={setupNotice()} />);
+    fireEvent.click(screen.getByRole("button", { name: "Connect" }));
+
+    expect((await screen.findByRole("alert")).textContent).toContain(
+      "admin access",
+    );
+    expect(popup.close).toHaveBeenCalled();
+    expect(
+      screen.getByRole("button", { name: "Connect again" }),
+    ).not.toBeNull();
+    expect(screen.queryByRole("status")).toBeNull();
+    open.mockRestore();
+  });
+
+  it("reports a popup closed without a new connection as not completed and binds nothing", async () => {
+    const onSelect = vi.fn();
+    const popup = openablePopup();
+    const open = vi
+      .spyOn(window, "open")
+      .mockReturnValue(popup as unknown as Window);
+    startAuthorize.mockResolvedValue({
+      authorize_url: "https://accounts.google.com/oauth",
+      state: "cancelled",
+    });
+
+    render(<GoogleReconnectCard notice={setupNotice()} onSelect={onSelect} />);
+    fireEvent.click(screen.getByRole("button", { name: "Connect" }));
+    await waitFor(() => expect(popup.location.assign).toHaveBeenCalled());
+    expect(screen.getByRole("button", { name: "Waiting for Google…" }));
+    expect(screen.queryByRole("alert")).toBeNull();
+
+    popup.closed = true;
+    expect(
+      (await screen.findByRole("alert", {}, { timeout: 2000 })).textContent,
+    ).toContain("not completed");
+    expect(refetchCredentials).toHaveBeenCalled();
+    expect(
+      screen.getByRole("button", { name: "Connect again" }),
+    ).not.toBeNull();
+    expect(onSelect).not.toHaveBeenCalled();
+    open.mockRestore();
+  });
+
+  it("makes a successful setup reconnect a one-row choice that waits for a click", () => {
+    const onSelect = vi.fn();
+    hookState.current.credentials = [
+      {
+        id: "goac_mail",
+        credential_name: "Inbox",
+        state: "active",
+        scopes_granted: [GMAIL_READ_SCOPE],
+      },
+    ];
+
+    render(
+      <GoogleReconnectCard
+        notice={setupNotice({
+          connectionId: "goac_mail",
+          displayName: "Inbox",
+          condition: "unusable",
+          choices: undefined,
+        })}
+        onSelect={onSelect}
+      />,
+    );
+
+    expect(screen.queryByRole("status")).toBeNull();
+    expect(onSelect).not.toHaveBeenCalled();
+    fireEvent.click(screen.getByRole("button", { name: /Inbox/ }));
+    expect(onSelect).toHaveBeenCalledWith("goac_mail");
   });
 });

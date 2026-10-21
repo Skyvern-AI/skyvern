@@ -708,6 +708,7 @@ async def test_in_process_retry_continues_after_interim_delivery_exhaustion(
         *,
         delivered_projection: WebhookDeliveryStatus | None = None,
         exhausted_projection: WebhookDeliveryStatus | None = None,
+        **_claim: object,
     ) -> bool:
         attempts = await database.workflow_run_attempts.get_attempts("wr_retry")
         number = attempts[-1].attempt_number
@@ -3152,7 +3153,9 @@ async def test_no_policy_initializer_failure_fails_the_run_durably(
         assert run.failure_reason == reason
         fail_run.assert_awaited_once_with(workflow_run_id="wr_retry", failure_reason=reason, cascade_children=False)
         if need_call_webhook:
-            webhook.assert_awaited_once_with(run, api_key="test-dispatch-key", claim_kind=None)
+            webhook.assert_awaited_once_with(
+                run, api_key="test-dispatch-key", claim_kind=None, finalizer="failed_before_execution"
+            )
         else:
             webhook.assert_not_awaited()
         assert not attempts
@@ -3168,6 +3171,8 @@ async def test_no_policy_initializer_failure_fails_the_run_durably(
         assert deliver.await_args.kwargs == {
             "delivered_projection": WebhookDeliveryStatus.delivered,
             "exhausted_projection": WebhookDeliveryStatus.exhausted_unattributed,
+            "finalizer": "failed_before_execution",
+            "attempt_claimed": False,
         }
     else:
         deliver.assert_not_awaited()
@@ -3244,7 +3249,7 @@ async def test_fail_run_without_attempt_row_finalization_outcomes(
     else:
         reread.assert_awaited_once_with("wr_test")
     if scenario in {"terminal_reread", "delivery_failure"}:
-        webhook.assert_awaited_once_with(run, api_key=None, claim_kind=None)
+        webhook.assert_awaited_once_with(run, api_key=None, claim_kind=None, finalizer="failed_before_execution")
     else:
         webhook.assert_not_awaited()
     if scenario == "reread_failure":
@@ -3944,7 +3949,14 @@ async def test_execute_workflow_fails_closed_for_stamped_sequential_credential(
         if delivery_case in {"lookup_failure_twice", "helper_lookup_failure_already_final"}:
             webhook.assert_not_awaited()
         else:
-            webhook.assert_awaited_once_with(terminal_run, api_key="test-api-key", claim_kind=None)
+            webhook.assert_awaited_once_with(
+                terminal_run,
+                api_key="test-api-key",
+                claim_kind=None,
+                finalizer="sequential_credential_rejection"
+                if delivery_case == "helper_lookup_failure"
+                else "failed_before_execution",
+            )
         release.assert_not_awaited()
         finalize.assert_not_awaited()
     if delivery_case in {"lookup_failure_twice", "helper_lookup_failure", "helper_lookup_failure_already_final"}:

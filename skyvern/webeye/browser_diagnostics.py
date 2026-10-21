@@ -40,6 +40,9 @@ from typing import Any
 
 import structlog
 
+from skyvern.webeye.browser_object_predicates import is_page_like
+from skyvern.webeye.main_world_eval import evaluate_in_main_world, get_main_world_prefix
+
 LOG = structlog.get_logger()
 
 PROBE_TIMEOUT_SECONDS = 2.0
@@ -49,11 +52,38 @@ PROBE_TIMEOUT_SECONDS = 2.0
 BROWSER_PROBE_METHOD = "Target.getTargets"
 RENDERER_PROBE_METHOD = "Runtime.evaluate"
 METRICS_PROBE_METHOD = "Performance.getMetrics"
-PROBE_METHODS = (BROWSER_PROBE_METHOD, RENDERER_PROBE_METHOD, METRICS_PROBE_METHOD)
+# getMetrics answers an empty list on a session that has not enabled the domain.
+METRICS_ENABLE_METHOD = "Performance.enable"
+METRICS_DISABLE_METHOD = "Performance.disable"
+PROBE_METHODS = (
+    BROWSER_PROBE_METHOD,
+    RENDERER_PROBE_METHOD,
+    METRICS_ENABLE_METHOD,
+    METRICS_PROBE_METHOD,
+    METRICS_DISABLE_METHOD,
+)
 
 _METRICS_OF_INTEREST = frozenset(
-    {"Documents", "Frames", "JSHeapUsedSize", "JSHeapTotalSize", "LayoutCount", "Nodes", "TaskDuration"}
+    {
+        "Documents",
+        "Frames",
+        "JSEventListeners",
+        "JSHeapUsedSize",
+        "JSHeapTotalSize",
+        "LayoutCount",
+        "Nodes",
+        "TaskDuration",
+    }
 )
+
+# Reads the optional observer-stats helper only when the page already exposes it; nothing is injected,
+# since injecting under memory pressure would add to it. A missing helper reports observer_probe=absent
+# with no observer fields; a helper missing any stat reports "partial" and omits the unreported stats.
+OBSERVER_STATS_EXPRESSION = (
+    "() => typeof globalThis.readIncrementalObserverStats === 'function'"
+    " ? globalThis.readIncrementalObserverStats() : null"
+)
+_OBSERVER_STATS_KEYS = ("listening", "jobs", "pending", "depth_buckets", "retained_nodes", "parsed", "version")
 
 # Fire-and-forget tasks are strongly referenced until they finish; the event loop
 # only holds weak references and would otherwise collect them mid-flight.
@@ -124,12 +154,17 @@ async def collect_control_endpoint_diagnostics(page: Any, *, timeout: float = PR
         metrics: dict[str, Any] = {}
 
         async def _metrics() -> None:
+            await session.send(METRICS_ENABLE_METHOD)
             result = await session.send(METRICS_PROBE_METHOD)
             for metric in result.get("metrics", []):
                 if metric.get("name") in _METRICS_OF_INTEREST:
                     metrics[f"probe_metric_{metric['name']}"] = metric.get("value")
 
-        outcome, elapsed = await _timed(_metrics(), timeout)
+        try:
+            outcome, elapsed = await _timed(_metrics(), timeout)
+        finally:
+            with contextlib.suppress(Exception):
+                await asyncio.wait_for(session.send(METRICS_DISABLE_METHOD), timeout=timeout)
         fields["probe_metrics"] = outcome
         fields["probe_metrics_ms"] = round(elapsed, 1)
         fields.update(metrics)
@@ -137,6 +172,43 @@ async def collect_control_endpoint_diagnostics(page: Any, *, timeout: float = PR
         with contextlib.suppress(Exception):
             await asyncio.wait_for(session.detach(), timeout=timeout)
 
+    return fields
+
+
+async def collect_page_memory_diagnostics(
+    page: Any, observed_frame: Any, *, timeout: float = PROBE_TIMEOUT_SECONDS
+) -> dict[str, Any]:
+    """Control-endpoint probe plus the incremental observer's scalar counters. Never raises."""
+    fields: dict[str, Any] = {}
+    if page is not None:
+        fields.update(await collect_control_endpoint_diagnostics(page, timeout=timeout))
+
+    target = observed_frame if observed_frame is not None else page
+    if target is None:
+        fields["observer_probe"] = "no_target"
+        return fields
+    stats: Any = None
+
+    async def _read() -> None:
+        nonlocal stats
+        # Prefix-configured contexts install the helpers in the main world, which a plain evaluate cannot see.
+        if is_page_like(target) and target.context is not None and get_main_world_prefix(target.context) is not None:
+            stats = await evaluate_in_main_world(target, OBSERVER_STATS_EXPRESSION)
+        else:
+            stats = await target.evaluate(OBSERVER_STATS_EXPRESSION)
+
+    outcome, elapsed = await _timed(_read(), timeout)
+    fields["observer_probe_ms"] = round(elapsed, 1)
+    if outcome == "ok" and not isinstance(stats, dict):
+        outcome = "absent"
+    if isinstance(stats, dict):
+        for key in _OBSERVER_STATS_KEYS:
+            value = stats.get(key)
+            if key in stats and (value is None or isinstance(value, (bool, int, float))):
+                fields[f"observer_{key}"] = value
+            elif outcome == "ok":
+                outcome = "partial"
+    fields["observer_probe"] = outcome
     return fields
 
 

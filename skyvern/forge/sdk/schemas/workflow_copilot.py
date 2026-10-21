@@ -392,6 +392,11 @@ class WorkflowCopilotChatMessage(BaseModel):
     modified_at: datetime = Field(..., description="When the message was last modified")
 
 
+class WorkflowCopilotDemonstrationInsertion(BaseModel):
+    after_label: str | None = Field(default=None, max_length=200)
+    before_label: str | None = Field(default=None, max_length=200)
+
+
 class WorkflowCopilotChatRequest(BaseModel):
     workflow_permanent_id: str = Field(..., description="Workflow permanent ID for the chat")
     workflow_id: str = Field(..., description="Workflow ID (mutable version ID)")
@@ -467,6 +472,12 @@ class WorkflowCopilotChatRequest(BaseModel):
     supports_credential_delete_card: bool = Field(
         False, description="The client can display the credential deletion card and post its confirmation."
     )
+    supports_google_setup_card: bool = Field(
+        False, description="The client can display Gmail and Google Sheets connection cards with a scope profile."
+    )
+    supports_demonstration_offer: bool = Field(
+        False, description="The client can display the demonstration offer card and start a demonstration from it."
+    )
     credential_recovery_token: SecretStr | None = Field(
         None,
         repr=False,
@@ -494,14 +505,20 @@ class WorkflowCopilotChatRequest(BaseModel):
             "a new proposal, so the client can keep rendering an actionable review gate."
         ),
     )
-    product_action: Literal["test_end_to_end", "diagnose_run", "refine_recording"] | None = Field(
+    product_action: Literal["test_end_to_end", "diagnose_run", "refine_recording", "demonstrate"] | None = Field(
         None,
         description=(
             "Structured product action for this turn, dispatched by the server instead of the agent. "
             "'test_end_to_end' runs every block of the pending proposal in a browser session minted "
             "for that run. 'diagnose_run' opens repair on the finished run named by workflow_run_id. "
-            "'refine_recording' infers a reusable workflow from recording_evidence."
+            "'refine_recording' infers a reusable workflow from recording_evidence. "
+            "'demonstrate' replays a completed browser demonstration before the first model call."
         ),
+    )
+    demonstration_id: str | None = Field(default=None, max_length=64)
+    demonstration_insertion: WorkflowCopilotDemonstrationInsertion | None = Field(
+        None,
+        description="Optional placement bounds for blocks authored after a demonstration.",
     )
     recording_evidence: RecordingEvidencePacket | None = Field(
         None,
@@ -580,6 +597,40 @@ class WorkflowCopilotCredentialResponseRequest(BaseModel):
     credential_id: str | None = Field(None, description="Saved credential ID; required when action is 'connected'")
 
 
+class WorkflowCopilotDemonstrationControlRequest(BaseModel):
+    demonstration_id: str = Field(max_length=64)
+    action: Literal["navigate", "fill_credential", "upload_file", "stop", "cancel"]
+    url: str | None = Field(default=None, max_length=2048)
+    selector: str | None = Field(default=None, max_length=2000)
+    credential_id: str | None = Field(default=None, max_length=128)
+    field: Literal["password", "totp"] | None = None
+    # A stop the user did not ask for, e.g. a browser restart, so replay reports the recording as interrupted.
+    stop_reason: Literal["browser_gone"] | None = None
+
+
+class WorkflowCopilotDemonstrationControlResult(BaseModel):
+    seq: int
+    action_count: int | None = None
+    file_id: str | None = None
+
+
+class WorkflowCopilotDemonstrationRecordRequest(BaseModel):
+    workflow_permanent_id: str = Field(max_length=128)
+    browser_session_id: str = Field(max_length=128)
+    demonstration_id: str | None = Field(default=None, max_length=64)
+    insertion: WorkflowCopilotDemonstrationInsertion | None = None
+
+
+class WorkflowCopilotDemonstrationActiveResult(BaseModel):
+    demonstration_id: str
+    status: Literal["recording", "stopping", "stopped"]
+    action_count: int
+    action_labels: list[str]
+    can_fill_credentials: bool
+    can_resume: bool
+    insertion: WorkflowCopilotDemonstrationInsertion | None = None
+
+
 class WorkflowCopilotCredentialGenerateRequest(BaseModel):
     turn_id: str = Field(..., description="turn_id from the matching credential_required frame")
     workflow_copilot_chat_id: str = Field(..., description="chat ID from the matching credential_required frame")
@@ -626,7 +677,9 @@ class WorkflowCopilotApplyProposedWorkflowRequest(BaseModel):
         False,
         description="If true, flip the chat to auto-accept mode so future turns persist directly without review",
     )
-    owner_turn_id: str | None = Field(None, description="Owner token returned with a typed proposal")
+    owner_turn_id: str | None = Field(
+        None, description="Owner turn for the proposal; used to match typed proposals and record tokenless Accepts"
+    )
     revision: int | None = Field(None, ge=1, description="Revision token returned with a typed proposal")
 
 
@@ -724,6 +777,9 @@ class WorkflowCopilotStreamResponseUpdate(BaseModel):
             "None when unknown."
         ),
     )
+    eval_llm_config_overrides: dict[str, str] | None = None
+    eval_llm_config_overrides_sha256: str | None = None
+    llm_cost: dict[str, Any] | None = None
     proposal_disposition: ProposalDisposition = Field(
         "auto_applicable",
         description="Whether this proposal may auto-apply or must be reviewed explicitly.",
@@ -1067,6 +1123,9 @@ class WorkflowCopilotCredentialRequiredUpdate(BaseModel):
     message: str = Field(..., description="The agent's explanatory text at the moment of pausing")
     login_page_urls: list[str] = Field(default_factory=list, description="Candidate login page URLs, if known")
     credential_refs: list[str] = Field(default_factory=list, description="Credential IDs or names referenced")
+    named_credential_id: str | None = Field(
+        None, description="The one credential the user named this turn, offered for a one-click confirmation"
+    )
     timeout_seconds: int = Field(..., description="How long the backend will wait before degrading to terminal")
     expires_at: datetime = Field(..., description="Server time after which the pause degrades to terminal")
     anchor_tool_call_id: str | None = Field(

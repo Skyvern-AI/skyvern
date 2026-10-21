@@ -217,6 +217,7 @@ def test_tool_activity_display_label_covers_discovery_tools() -> None:
 
 def test_build_narrative_payload_serializes_block_and_design_activity() -> None:
     ctx = _ctx()
+    ctx.demonstration_items = ["Navigate to example.com", "Click Submit"]
     ctx.staged_workflow = _staged("step_1", "step_2")  # type: ignore[assignment]
     ctx.has_staged_proposal = True
     for workflow_run_block_id, label, status in (
@@ -252,6 +253,7 @@ def test_build_narrative_payload_serializes_block_and_design_activity() -> None:
     payload = _build_narrative_payload(ctx, terminal="response", terminal_message="done", narrative_summary="summary")
 
     assert payload["workPlan"] == {"toolCallId": "p1", "items": ["Open the admin page"]}
+    assert payload["demonstrationItems"] == ["Navigate to example.com", "Click Submit"]
 
     assert payload["designActivity"] == [
         {
@@ -276,6 +278,33 @@ def test_build_narrative_payload_serializes_block_and_design_activity() -> None:
         }
     ]
     assert blocks_by_label["step_2"]["activity"] == []
+
+
+def test_build_narrative_payload_marks_only_the_left_runs_blocks_unfinished() -> None:
+    ctx = _ctx()
+    for workflow_run_block_id, workflow_run_id in (("wrb_left", "wr_left"), ("wrb_cancelled", "wr_cancelled")):
+        upsert_narrative_block_attempt(
+            ctx.narrative_block_attempts,
+            workflow_run_block_id=workflow_run_block_id,
+            workflow_run_id=workflow_run_id,
+            label=workflow_run_block_id,
+            block_type="task",
+            status="running",
+            iteration=1,
+            started_at=_TS.isoformat(),
+            ended_at=None,
+        )
+    ctx.budget_expiry_state.source = "deadline"
+    ctx.budget_expiry_state.hard_backstop_reached = True
+    ctx.budget_expiry_state.leavable_run_ids.append("wr_left")
+
+    payload = _build_narrative_payload(ctx, terminal="response", terminal_message="done", narrative_summary="done")
+
+    assert {block["label"]: block["state"] for block in payload["blocks"]} == {
+        "wrb_left": "unfinished",
+        "wrb_cancelled": "running",
+    }
+    assert payload["budgetExpiry"]["leftRunIds"] == ["wr_left"]
 
 
 def test_build_narrative_payload_serializes_only_observed_attempts() -> None:

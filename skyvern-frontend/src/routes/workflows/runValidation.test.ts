@@ -3,7 +3,7 @@ import { describe, expect, it } from "vitest";
 import { getLoginBlocksWithoutCredentials } from "./runValidation";
 
 describe("getLoginBlocksWithoutCredentials", () => {
-  it("finds persisted login blocks without credential parameters", () => {
+  it("flags persisted login blocks with no non-URL parameters", () => {
     expect(
       getLoginBlocksWithoutCredentials([
         { block_type: "login", label: "block_1", parameters: [] },
@@ -16,33 +16,23 @@ describe("getLoginBlocksWithoutCredentials", () => {
     ).toEqual([{ label: "block_1" }]);
   });
 
-  it("finds editor login blocks without credential parameter keys", () => {
-    expect(
-      getLoginBlocksWithoutCredentials(
-        [
-          { block_type: "login", label: "block_1", parameter_keys: [] },
-          {
-            block_type: "login",
-            label: "block_2",
-            parameter_keys: ["cred_param"],
-          },
-        ],
-        (key) => key === "cred_param",
-      ),
-    ).toEqual([{ label: "block_1" }]);
-  });
-
-  it("accepts a workflow input carrying a credential id", () => {
+  it("accepts bound non-URL workflow parameters", () => {
     expect(
       getLoginBlocksWithoutCredentials([
         {
           block_type: "login",
           label: "block_1",
+          url: "https://example.com/login",
           parameters: [
             {
-              key: "cred",
+              key: "username",
               parameter_type: "workflow",
-              data_type: "credential_id",
+              workflow_parameter_type: "string",
+            },
+            {
+              key: "password",
+              parameter_type: "workflow",
+              workflow_parameter_type: "string",
             },
           ],
         },
@@ -50,36 +40,16 @@ describe("getLoginBlocksWithoutCredentials", () => {
     ).toEqual([]);
   });
 
-  it("accepts the persisted workflow_parameter_type spelling the run form sees", () => {
-    // The run form validates persisted blocks, where the field is
-    // `workflow_parameter_type`; only the editor renames it to `dataType`.
-    // Reading just the editor spelling disabled Run on a valid workflow.
+  it("does not count a URL parameter as a non-URL binding", () => {
     expect(
       getLoginBlocksWithoutCredentials([
         {
           block_type: "login",
           label: "block_1",
+          url: "login_url",
           parameters: [
             {
-              key: "cred",
-              parameter_type: "workflow",
-              workflow_parameter_type: "credential_id",
-            },
-          ],
-        },
-      ]),
-    ).toEqual([]);
-  });
-
-  it("still flags a workflow input that is not a credential id", () => {
-    expect(
-      getLoginBlocksWithoutCredentials([
-        {
-          block_type: "login",
-          label: "block_1",
-          parameters: [
-            {
-              key: "plain",
+              key: "login_url",
               parameter_type: "workflow",
               workflow_parameter_type: "string",
             },
@@ -89,9 +59,16 @@ describe("getLoginBlocksWithoutCredentials", () => {
     ).toEqual([{ label: "block_1" }]);
   });
 
-  it("flags a login block whose remaining parameter is not a credential", () => {
-    // Removing the credential via Advanced > Parameters can leave an ordinary
-    // parameter behind, so a non-empty list does not mean a credential is set.
+  it("flags an unbound editor login but accepts a plain workflow parameter", () => {
+    expect(
+      getLoginBlocksWithoutCredentials([
+        { block_type: "login", label: "block_1", parameter_keys: [] },
+        { block_type: "login", label: "block_2", parameter_keys: ["username"] },
+      ]),
+    ).toEqual([{ label: "block_1" }]);
+  });
+
+  it("accepts a bound non-URL block parameter", () => {
     expect(
       getLoginBlocksWithoutCredentials([
         {
@@ -99,30 +76,8 @@ describe("getLoginBlocksWithoutCredentials", () => {
           label: "block_1",
           parameters: [{ key: "some_output", parameter_type: "output" }],
         },
-        {
-          block_type: "login",
-          label: "block_2",
-          parameters: [{ key: "cred", parameter_type: "credential" }],
-        },
       ]),
-    ).toEqual([{ label: "block_1" }]);
-  });
-
-  it("flags an editor login block whose remaining key is not a credential", () => {
-    const isCredentialKey = (key: string) => key === "cred";
-    expect(
-      getLoginBlocksWithoutCredentials(
-        [
-          {
-            block_type: "login",
-            label: "block_1",
-            parameter_keys: ["leftover"],
-          },
-          { block_type: "login", label: "block_2", parameter_keys: ["cred"] },
-        ],
-        isCredentialKey,
-      ),
-    ).toEqual([{ label: "block_1" }]);
+    ).toEqual([]);
   });
 
   it("walks nested loop blocks", () => {

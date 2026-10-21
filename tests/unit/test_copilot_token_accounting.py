@@ -2,11 +2,14 @@
 
 from __future__ import annotations
 
+import base64
+import io
 from unittest.mock import MagicMock
 
 import pytest
 from agents.run_context import RunContextWrapper
 from agents.usage import InputTokensDetails, OutputTokensDetails, Usage
+from PIL import Image
 
 from skyvern.forge.sdk.copilot.context import CopilotContext
 from skyvern.forge.sdk.copilot.enforcement import (
@@ -87,6 +90,20 @@ class TestEstimateTokens:
         # so text tokens should be well under 100.
         assert text_portion < 100
 
+    @pytest.mark.parametrize(("width", "height", "billed"), [(1024, 576, 692), (1600, 900, 1741)])
+    def test_image_estimate_follows_pixel_size(self, width: int, height: int, billed: int) -> None:
+        buf = io.BytesIO()
+        Image.new("RGB", (width, height)).save(buf, format="JPEG")
+        item = {
+            "type": "input_image",
+            "image_url": "data:image/jpeg;base64," + base64.b64encode(buf.getvalue()).decode(),
+            "detail": "high",
+        }
+
+        _, image_tokens = _sanitize_for_token_estimation(item)
+
+        assert image_tokens == billed
+
     def test_image_metadata_preserved(self):
         """type and detail fields should be included, only image_url replaced."""
         item = {
@@ -94,8 +111,8 @@ class TestEstimateTokens:
             "image_url": "data:image/png;base64," + "X" * 1000,
             "detail": "high",
         }
-        sanitized, count = _sanitize_for_token_estimation(item)
-        assert count == 1
+        sanitized, image_tokens = _sanitize_for_token_estimation(item)
+        assert image_tokens == TOKENS_PER_RESIZED_IMAGE
         assert sanitized["type"] == "input_image"
         assert sanitized["detail"] == "high"
         assert sanitized["image_url"] == "[image]"

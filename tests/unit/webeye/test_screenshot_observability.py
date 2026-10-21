@@ -1,4 +1,4 @@
-"""Structured, low-cardinality screenshot telemetry: arm/primitive/stage/outcome must be truthful.
+"""Structured, low-cardinality screenshot telemetry: primitive/stage/outcome must be truthful.
 
 These tests fix the observability contract; they must not constrain capture selection or retry, which
 ``test_screenshot_cdp_fallback.py`` owns.
@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import contextlib
 from io import BytesIO
 from pathlib import Path
 from types import SimpleNamespace
@@ -21,10 +22,9 @@ from playwright.async_api import Page
 from playwright.async_api import TimeoutError as PlaywrightTimeoutError
 
 from skyvern.forge.sdk.settings_manager import SettingsManager
-from skyvern.webeye.browser_engine import SKYCDP_ENGINE_NAME
+from skyvern.webeye.browser_engine import SKYCDP_ENGINE_NAME, BrowserEngineMetadata, BrowserEngineSelection
 from skyvern.webeye.utils import page as page_module
 from skyvern.webeye.utils.page import (
-    ScreenshotArm,
     ScreenshotEligibility,
     ScreenshotOutcome,
     ScreenshotPrimitive,
@@ -32,6 +32,12 @@ from skyvern.webeye.utils.page import (
     _current_viewpoint_screenshot_helper,
     _screenshot_observation_fields,
 )
+from tests.unit.scoped_asyncio import ScopedAsyncio
+
+# Read before the autouse fixture shrinks it, so a test can run detach under its real budget.
+_PRODUCTION_DETACH_TIMEOUT_SECONDS = page_module.CDP_RESCUE_DETACH_TIMEOUT_SECONDS
+# Long enough that no runner pause expires it, and distinct from the other stages' test budgets.
+_TEST_DETACH_TIMEOUT_SECONDS = 45
 
 
 def _page() -> MagicMock:
@@ -81,7 +87,6 @@ def _observations(log: MagicMock) -> list[dict[str, Any]]:
 
 def test_observation_fields_are_bounded_and_truthful() -> None:
     fields = _screenshot_observation_fields(
-        arm=ScreenshotArm.CONTROL,
         primitive=ScreenshotPrimitive.CDP_RESCUE,
         stage=ScreenshotStage.CAPTURE,
         outcome=ScreenshotOutcome.SUCCESS,
@@ -102,7 +107,6 @@ def test_observation_fields_are_bounded_and_truthful() -> None:
 
 def test_observation_fields_omit_optional_measures_when_absent() -> None:
     fields = _screenshot_observation_fields(
-        arm=ScreenshotArm.CONTROL,
         primitive=ScreenshotPrimitive.PLAYWRIGHT,
         stage=ScreenshotStage.TERMINAL,
         outcome=ScreenshotOutcome.ERROR,
@@ -132,6 +136,8 @@ async def test_cdp_rescue_success_reports_validation_after_file_write(
     assert [(o["screenshot.arm"], o["screenshot.stage"], o["screenshot.outcome"]) for o in cdp] == [
         ("control", "validation", "success")
     ]
+    # A rescue only follows a Playwright timeout, so its success stays on the indexed INFO tier.
+    assert [c.args[0] for c in log.info.call_args_list].count("Raw CDP rescue screenshot captured") == 1
 
 
 @pytest.mark.asyncio
@@ -199,6 +205,19 @@ async def test_detach_failure_is_observable_without_changing_capture_or_cancella
 ) -> None:
     log = MagicMock()
     monkeypatch.setattr(page_module, "LOG", log)
+    # Budgets long enough that no runner pause expires them; the test expires the detach budget itself.
+    # Detach gets its own value so a detach bounded by another stage's constant is caught.
+    for name in ("SESSION", "CAPTURE"):
+        monkeypatch.setattr(page_module, f"CDP_RESCUE_{name}_TIMEOUT_SECONDS", 30)
+    monkeypatch.setattr(page_module, "CDP_RESCUE_DETACH_TIMEOUT_SECONDS", _TEST_DETACH_TIMEOUT_SECONDS)
+    wait_budgets: list[tuple[float | None, asyncio.Timeout]] = []
+
+    async def wait_for(awaitable: Any, timeout: float | None) -> Any:
+        async with asyncio.timeout(timeout) as budget:
+            wait_budgets.append((timeout, budget))
+            return await awaitable
+
+    monkeypatch.setattr(page_module, "asyncio", ScopedAsyncio(wait_for=wait_for))
     page = _page()
     session = page.context.new_cdp_session.return_value
     capture_entered = asyncio.Event()
@@ -228,18 +247,23 @@ async def test_detach_failure_is_observable_without_changing_capture_or_cancella
     task = asyncio.create_task(_current_viewpoint_screenshot_helper(page))
     try:
         if cancel_stage == "capture":
-            await asyncio.wait_for(capture_entered.wait(), timeout=0.5)
+            await asyncio.wait_for(capture_entered.wait(), timeout=5)
             task.cancel()
-        await asyncio.wait_for(detach_entered.wait(), timeout=0.5)
+        await asyncio.wait_for(detach_entered.wait(), timeout=5)
         if cancel_stage == "detach":
             task.cancel()
         release_detach.set()
+        detach_delay, detach_budget = wait_budgets[-1]
+        assert detach_delay == _TEST_DETACH_TIMEOUT_SECONDS
+        if failure == "timeout":
+            detach_budget.reschedule(asyncio.get_running_loop().time())
         if cancel_stage is not None:
             with pytest.raises(asyncio.CancelledError):
-                await asyncio.wait_for(task, timeout=0.5)
+                await asyncio.wait_for(task, timeout=5)
         else:
-            assert (await asyncio.wait_for(task, timeout=0.5)).startswith(page_module._PNG_SIGNATURE)
+            assert (await asyncio.wait_for(task, timeout=5)).startswith(page_module._PNG_SIGNATURE)
         assert detach_finished.is_set()
+        assert detach_budget.expired() == (failure == "timeout")
         assert not (asyncio.all_tasks() - existing_tasks)
         detach_observations = [o for o in _observations(log) if o.get("screenshot.stage") == "detach"]
         assert len(detach_observations) == 1
@@ -247,13 +271,104 @@ async def test_detach_failure_is_observable_without_changing_capture_or_cancella
         assert observation["screenshot.arm"] == "control"
         assert observation["screenshot.primitive"] == "cdp_rescue"
         assert observation["screenshot.outcome"] == failure
-        assert observation["screenshot.timeout_budget_ms"] == 50
+        assert observation["screenshot.timeout_budget_ms"] == _TEST_DETACH_TIMEOUT_SECONDS * 1000
         assert observation["screenshot.elapsed_ms"] >= 0
     finally:
+        # Expire any budget still running and bound the drain, so a failed assertion or an unbounded
+        # detach fails fast instead of waiting out (or hanging on) the stalled detach.
         release_detach.set()
+        for _, budget in wait_budgets:
+            with contextlib.suppress(RuntimeError):  # Only a budget still entered can be expired.
+                budget.reschedule(asyncio.get_running_loop().time())
         if not task.done():
             task.cancel()
-        await asyncio.gather(task, return_exceptions=True)
+        await asyncio.wait_for(asyncio.gather(task, return_exceptions=True), timeout=5)
+
+
+@pytest.mark.asyncio
+async def test_detach_runs_under_its_production_budget(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(page_module, "CDP_RESCUE_DETACH_TIMEOUT_SECONDS", _PRODUCTION_DETACH_TIMEOUT_SECONDS)
+    wait_timeouts: list[float | None] = []
+
+    async def wait_for(awaitable: Any, timeout: float | None) -> Any:
+        wait_timeouts.append(timeout)
+        return await asyncio.wait_for(awaitable, timeout=timeout)
+
+    monkeypatch.setattr(page_module, "asyncio", ScopedAsyncio(wait_for=wait_for))
+    page = _page()
+    assert (await _current_viewpoint_screenshot_helper(page)).startswith(page_module._PNG_SIGNATURE)
+    page.context.new_cdp_session.return_value.detach.assert_awaited_once_with()
+    # Attach, then detach; the literal pins the production detach budget, not just the constant's name.
+    assert wait_timeouts == [page_module.CDP_RESCUE_SESSION_TIMEOUT_SECONDS, 2]
+
+
+class _NativeError(Exception):
+    pass
+
+
+class _NativeTimeout(_NativeError):
+    pass
+
+
+class _NativeTargetClosed(_NativeError):
+    pass
+
+
+async def _never_start() -> None:
+    raise AssertionError("driver startup is outside this test")
+
+
+def _pinned_engine() -> BrowserEngineSelection:
+    return BrowserEngineSelection(
+        name="pinned",
+        start_driver=_never_start,
+        error_type=_NativeError,
+        timeout_error_type=_NativeTimeout,
+        metadata=BrowserEngineMetadata(name="pinned", version="test"),
+        selection_reason="test",
+        target_closed_error_types=(_NativeTargetClosed,),
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("stage", ["capture", "detach"])
+@pytest.mark.parametrize(
+    "failure,expected_outcome",
+    [(_NativeTargetClosed("Target was disposed"), "target_closed"), (_NativeTimeout("native deadline"), "timeout")],
+)
+async def test_cdp_rescue_classifies_pinned_engine_failures(
+    stage: str, failure: Exception, expected_outcome: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # A pinned engine's native errors are neither builtin nor Playwright-family, so only the run's own
+    # selection can classify them; without it they would be reported as a generic error.
+    log = MagicMock()
+    monkeypatch.setattr(page_module, "LOG", log)
+    page = _page()
+    original_timeout = _NativeTimeout("waiting for fonts to load")
+    page.screenshot.side_effect = original_timeout
+    session = page.context.new_cdp_session.return_value
+    if stage == "capture":
+
+        async def fail(method: str, params: dict) -> dict:
+            if method == "Page.captureScreenshot":
+                raise failure
+            return {"result": {"value": {"deviceScaleFactor": 1, "viewportScale": 1}}}
+
+        session.send.side_effect = fail
+        with pytest.raises(page_module.FailedToTakeScreenshot) as raised:
+            await _current_viewpoint_screenshot_helper(page, engine_selection=_pinned_engine())
+        assert raised.value.__cause__ is original_timeout
+    else:
+        session.detach.side_effect = failure
+        result = await _current_viewpoint_screenshot_helper(page, engine_selection=_pinned_engine())
+        assert result.startswith(page_module._PNG_SIGNATURE)
+    session.detach.assert_awaited_once()
+    cdp_failures = [
+        o
+        for o in _observations(log)
+        if o.get("screenshot.primitive") == "cdp_rescue" and o["screenshot.outcome"] != "success"
+    ]
+    assert [(o["screenshot.stage"], o["screenshot.outcome"]) for o in cdp_failures] == [(stage, expected_outcome)]
 
 
 @pytest.mark.asyncio
@@ -268,6 +383,7 @@ async def test_scaled_viewport_decline_emits_declined_outcome(monkeypatch: pytes
     assert await _current_viewpoint_screenshot_helper(page) == b"animation-retry-bytes"
     cdp = [o for o in _observations(log) if o.get("screenshot.primitive") == "cdp_rescue"]
     assert any(o["screenshot.outcome"] == "declined" and o["screenshot.stage"] == "geometry" for o in cdp)
+    assert "Raw CDP rescue screenshot declined scaled viewport" in [c.args[0] for c in log.info.call_args_list]
 
 
 # --- eligibility ----------------------------------------------------------------------------------
@@ -302,6 +418,25 @@ async def test_ineligible_paths_emit_decline_reason(kind: str, reason: str, monk
     )
     eligibilities = {o.get("screenshot.eligibility") for o in _observations(log)}
     assert reason in eligibilities
+
+
+@pytest.mark.asyncio
+async def test_missing_page_context_is_ineligible_and_keeps_the_animation_retry(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    log = MagicMock()
+    monkeypatch.setattr(page_module, "LOG", log)
+    page = _page()
+    page.context = None
+    page.screenshot.side_effect = [PlaywrightTimeoutError("first capture timed out"), b"control-retry"]
+    assert await _current_viewpoint_screenshot_helper(page, timeout=137) == b"control-retry"
+    assert [c.kwargs["animations"] for c in page.screenshot.await_args_list] == ["disabled", "allow"]
+    observations = _observations(log)
+    assert {o["screenshot.arm"] for o in observations} == {"control"}
+    timed_out = [o for o in observations if o["screenshot.outcome"] == "timeout"]
+    assert [o["screenshot.eligibility"] for o in timed_out] == ["ineligible_browser"]
+    terminal = [o for o in observations if o["screenshot.stage"] == "terminal"]
+    assert [(o["screenshot.primitive"], o["screenshot.outcome"]) for o in terminal] == [("playwright", "success")]
 
 
 @pytest.mark.asyncio

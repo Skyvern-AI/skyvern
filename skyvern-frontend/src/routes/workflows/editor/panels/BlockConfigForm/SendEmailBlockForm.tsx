@@ -37,6 +37,10 @@ function SendEmailBlockFormBody({
     customSmtpPort,
     customSmtpUsername,
     customSmtpPassword,
+    transport,
+    credentialId,
+    cc,
+    bcc,
   } = node.data;
 
   const value = useMemo(
@@ -51,6 +55,10 @@ function SendEmailBlockFormBody({
       customSmtpPort,
       customSmtpUsername,
       customSmtpPassword,
+      transport,
+      credentialId,
+      cc,
+      bcc,
     }),
     [
       recipients,
@@ -63,6 +71,10 @@ function SendEmailBlockFormBody({
       customSmtpPort,
       customSmtpUsername,
       customSmtpPassword,
+      transport,
+      credentialId,
+      cc,
+      bcc,
     ],
   );
   const { commit } = useDebouncedSidebarSave({

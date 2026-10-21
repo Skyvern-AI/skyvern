@@ -212,6 +212,14 @@ class CodeBlockTemplateSyntaxError(WorkflowDefinitionValidationException):
         )
 
 
+class CodeBlockInsecureCodeError(WorkflowDefinitionValidationException):
+    def __init__(self, block_label: str, reason: str) -> None:
+        super().__init__(
+            f"Code block '{block_label}' can't run: {reason}",
+            status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
+        )
+
+
 class InvalidWaitBlockTime(WorkflowDefinitionValidationException):
     def __init__(self, block_label: str, wait_sec: int, max_sec: int) -> None:
         super().__init__(

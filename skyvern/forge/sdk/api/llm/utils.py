@@ -20,6 +20,7 @@ from skyvern.forge.sdk.api.llm.exceptions import (
     InvalidLLMResponseType,
     LLMOutputTruncatedError,
 )
+from skyvern.schemas.llm import LLMConfig, LLMRouterConfig
 
 LOG = structlog.get_logger()
 
@@ -27,6 +28,20 @@ _PASS_THROUGH_IMAGE_MEDIA_TYPES = frozenset({"image/png", "image/jpeg", "image/w
 # A file under the upload cap can still decode to hundreds of megapixels, which RGBA conversion
 # would expand to gigabytes in the worker process.
 _MAX_DECODED_IMAGE_PIXELS = 25_000_000
+
+
+def is_anthropic_model(model: str) -> bool:
+    try:
+        provider_model, provider, _, _ = litellm.get_llm_provider(model)
+    except litellm.exceptions.BadRequestError:
+        return False
+    return provider == "anthropic" or (provider == "bedrock" and "anthropic." in provider_model)
+
+
+def uses_only_anthropic_models(llm_config: LLMConfig | LLMRouterConfig) -> bool:
+    if isinstance(llm_config, LLMConfig):
+        return is_anthropic_model(llm_config.model_name)
+    return all(is_anthropic_model(deployment.litellm_params["model"]) for deployment in llm_config.model_list)
 
 
 def is_image_message(message: dict[str, Any]) -> bool:

@@ -626,7 +626,7 @@ describe("RunView legacy run-page parity", () => {
 });
 
 describe("RunView view toggles", () => {
-  test("keeps status notification controls for an active run", () => {
+  test("keeps status notification controls for an active run", async () => {
     seedRunningRun();
     renderRunView(
       {},
@@ -637,7 +637,30 @@ describe("RunView view toggles", () => {
       </TooltipProvider>,
     );
 
-    expect(screen.getByRole("button", { name: /Notify/ })).toBeTruthy();
+    fireEvent.pointerDown(screen.getByRole("button", { name: "Notify" }), {
+      button: 0,
+      ctrlKey: false,
+    });
+    // Picking statuses is a multi-select, so the menu has to survive a toggle.
+    fireEvent.click(
+      await screen.findByRole("menuitemcheckbox", { name: "Running" }),
+    );
+    fireEvent.click(
+      screen.getByRole("menuitemcheckbox", { name: "Finished (any outcome)" }),
+    );
+
+    expect(
+      screen.getByRole("menuitemcheckbox", { name: "Running", checked: true }),
+    ).toBeTruthy();
+
+    // The open menu hides the rest of the tree, so read the armed trigger back
+    // once it closes.
+    fireEvent.keyDown(document.body, { key: "Escape" });
+    expect(
+      await screen.findByRole("button", {
+        name: "Notify, 6 statuses selected",
+      }),
+    ).toBeTruthy();
   });
 
   test("links to the runs before and after a retry", () => {
@@ -1521,6 +1544,53 @@ describe("RunView failure presentation", () => {
     expect(headline.getAttribute("title")).not.toContain("\\n");
     expect(headline.getAttribute("title")).not.toContain("\\t");
     expect(line.queryByText(/Exception: boom/)).toBeNull();
+  });
+
+  test("names the run's error code on the Overview, with its message on hover", () => {
+    seedCompletedRun({
+      status: Status.Failed,
+      failure_reason:
+        "login block failed. failure reason: The site is down for maintenance.",
+      errors: [
+        {
+          error_code: "WEBSITE_DOWN",
+          reasoning: "The site returned a maintenance page.",
+        },
+      ],
+    });
+    const { getByTestId } = renderRunView();
+    const line = within(getByTestId("run-failure-line"));
+
+    // No Outputs click: triage reads the code off the Overview itself.
+    expect(line.getByText("WEBSITE_DOWN").getAttribute("title")).toBe(
+      "The site returned a maintenance page.",
+    );
+    expect(line.getByText("The site is down for maintenance.")).not.toBeNull();
+  });
+
+  test("names each error code once and holds a long list to three", () => {
+    seedCompletedRun({
+      status: Status.Failed,
+      failure_reason: "The run failed",
+      errors: [
+        { error_code: "WEBSITE_DOWN", reasoning: "First iteration." },
+        { error_code: "WEBSITE_DOWN", reasoning: "Second iteration." },
+        { error_code: "REACH_MAX_RETRIES" },
+        { error_code: "NAVIGATION_FAILED" },
+        { error_code: "DATA_UNAVAILABLE" },
+      ],
+    });
+    const { getByTestId } = renderRunView();
+    const line = within(getByTestId("run-failure-line"));
+
+    expect(line.getAllByText("WEBSITE_DOWN")).toHaveLength(1);
+    expect(line.getByText("WEBSITE_DOWN").getAttribute("title")).toBe(
+      "First iteration.",
+    );
+    expect(line.getByText("REACH_MAX_RETRIES")).not.toBeNull();
+    expect(line.getByText("NAVIGATION_FAILED")).not.toBeNull();
+    expect(line.queryByText("DATA_UNAVAILABLE")).toBeNull();
+    expect(line.getByText("+1 more")).not.toBeNull();
   });
 
   test("shows no failure line for a user-canceled run", () => {

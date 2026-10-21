@@ -26,6 +26,7 @@ from skyvern.forge.sdk.copilot.ask_user import (
     wait_for_interaction,
 )
 from skyvern.forge.sdk.copilot.context import CopilotContext
+from skyvern.forge.sdk.copilot.credential_resolution import load_credentials
 from skyvern.forge.sdk.copilot.secret_redaction import redact_raw_secrets_for_prompt
 from skyvern.forge.sdk.copilot.secret_scrub import scrub_secrets_from_structure, scrub_secrets_from_text
 from skyvern.forge.sdk.copilot.tools.credentials import (
@@ -308,9 +309,7 @@ async def _latest_outcomes(
 async def _resolve_credentials(ctx: CopilotContext, credential_ids: list[str]) -> dict[str, Credential]:
     found = {
         credential.credential_id: credential
-        for credential in await app.DATABASE.credentials.get_credentials_by_ids(
-            credential_ids, organization_id=ctx.organization_id
-        )
+        for credential in await load_credentials(ctx.organization_id, credential_ids=credential_ids)
     }
     missing = [credential_id for credential_id in credential_ids if credential_id not in found]
     if missing:
@@ -453,6 +452,7 @@ def _rows(group: WorkflowRunGroupResponse, labels: dict[str, str]) -> list[Accou
             outcome=item.outcome,
         )
         for item in group.items
+        if item.key in labels
     ]
 
 
@@ -558,8 +558,8 @@ async def _group_for_this_workflow(ctx: CopilotContext, workflow_run_group_id: s
 
 
 async def _labels(ctx: CopilotContext, group: WorkflowRunGroupResponse) -> dict[str, str]:
-    credentials = await app.DATABASE.credentials.get_credentials_by_ids(
-        [item.key for item in group.items], organization_id=ctx.organization_id
+    credentials = await load_credentials(
+        ctx.organization_id, credential_ids=[item.key for item in group.items], include_deleted=True
     )
     return {credential.credential_id: _label(credential) for credential in credentials}
 

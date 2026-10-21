@@ -68,6 +68,14 @@ class BrowserManager(Protocol):
         still running here. An implementation that tracks none reports none and is never protected."""
         return set()
 
+    async def begin_session_activity_renewal(self, session_id: str | None) -> None:
+        """Keep a session's ``last_activity_at`` fresh for a caller that holds no cleanup lease.
+
+        Balanced by ``end_session_activity_renewal``. An implementation without a persistent-session
+        lifecycle has nothing to renew."""
+
+    def end_session_activity_renewal(self, session_id: str | None) -> None: ...
+
     async def cleanup_for_script(
         self,
         script_id: str,

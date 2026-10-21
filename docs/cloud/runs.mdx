@@ -1,0 +1,221 @@
+---
+title: Runs and schedules
+description: Run a Skyvern agent from the app, watch it live and take control of the browser, read its timeline and outputs, download recordings and files, find past runs, and schedule recurring runs.
+keywords:
+  - run
+  - run agent
+  - live browser
+  - take control
+  - timeline
+  - outputs
+  - run history
+  - artifacts
+  - recording
+  - download
+  - status
+  - schedule
+  - cron
+  - timezone
+---
+
+A **run** is one execution of an agent. Every run gets an ID starting with `wr_`, opens in Studio at `/runs/<run id>`, and is kept in **Runs** with its recording, screenshots and outputs.
+
+## Run an agent
+
+<Steps>
+  <Step title="Open the run form">
+    In Studio, click **Run** in the top bar. From **Agents** → **All Agents**, click the play button (**Create New Run**) on the agent's row. Both open the run form at `/agents/<agent id>/run`.
+  </Step>
+  <Step title="Fill in the inputs">
+    Enter a value for each of the agent's inputs. Inputs with a default are prefilled. If the agent has a **Login** block, a **Login credentials** section asks which saved credential to use.
+  </Step>
+  <Step title="Click Run agent">
+    The run starts and Studio opens on it, with the **Browser** and **Run** panes.
+  </Step>
+</Steps>
+
+<img src="/images/cloud/cloud-run-agent-form.png" alt="Run form with Inputs, Settings (Webhook Callback URL, Proxy Location, Run With, AI Fallback), Advanced Settings, Copy API Command and Run agent" />
+
+The defaults work for most runs. The settings you are most likely to change:
+
+| Setting | What it does |
+|---|---|
+| **Webhook Callback URL** | Skyvern posts the run's result to this URL when it finishes. **Test Webhook** sends a sample. |
+| **Proxy Location** | The country the browser's traffic comes from. Defaults to a US residential proxy. |
+| **Run With** | **Skyvern Agent** runs every step with AI. **Code** runs the agent's generated code (once it has been generated). |
+| **AI Fallback (cached scripts)** | When a code run fails, AI tries to fix the step and regenerate the code. On by default. |
+
+**Advanced Settings** holds browser options: **Browser Type**, **Browser Session ID** (run in an open session), **Reuse browser session**, **Browser Profile** (start with saved cookies and logins), **Browser Address** (connect to your own browser over CDP), **Extra HTTP Headers**, **CDP Connect Headers** and **Max Screenshot Scrolls**. [Browsers](/browsers) explains sessions and profiles.
+
+**Copy API Command** copies the same run as a cURL or PowerShell command, with your inputs and settings filled in. Use it to trigger the agent from a script. The [code quickstart](/developers/getting-started/quickstart) covers the SDKs.
+
+<Note>
+**Run** is disabled while the agent has no blocks. Add one, or ask Copilot to build the agent first.
+</Note>
+
+## Watch a run live
+
+The **Browser** pane shows the browser the agent drives. Its header switches between three views:
+
+- **Live**: the browser right now, while the run is in progress.
+- **Recording**: the video of the run, available once it has recorded.
+- **Screenshots**: the screenshots Skyvern took at each step.
+
+<img src="/images/cloud/cloud-run-live.png" alt="Run pane on Timeline while the run is Running, with the Stop button in the top bar" />
+
+### Take control of the browser
+
+Click **Take control** in the live view to use the mouse and keyboard in the browser yourself. A **You're in control** bar shows while you have it. Use it to solve a CAPTCHA, get past an unusual login, or close a pop-up the agent is stuck on. Click **Stop controlling** to hand the browser back.
+
+### Stop a run
+
+Click **Stop** in the top bar, then **Stop run** to confirm. The run ends with status `canceled`.
+
+## Read a run
+
+The **Run** pane has three views, plus more under **⋯**:
+
+| View | What it shows |
+|---|---|
+| **Timeline** | Each block in order with its status, and the actions inside it. Click a block to see its details. |
+| **Inputs** | The input values and settings this run used, such as browser session, profile and **Run with** |
+| **Outputs** | **Extracted information**, **Run outputs**, **Errors**, **Webhook failure reason** and **Downloaded files** |
+| **⋯** → **Code** | The code generated for this run |
+
+<img src="/images/cloud/cloud-run-timeline.png" alt="A completed run with the Browser pane on Screenshots and the Run pane Timeline showing the block and its action" />
+
+**API & Webhooks** in the Run pane header copies this run as a cURL or PowerShell command and offers **Test Webhook**.
+
+When a run fails, the top of the Run pane names the failing block, the run's error codes and the reason. Each code is listed once; hover a code to read its message. Past three codes the line ends with **+N more**, and **Outputs** → **Errors** lists every code. **Fix with Copilot** sends the failure to Copilot, which proposes a fix in the Copilot pane. **Retry** opens the run form to run it again.
+
+### Re-run
+
+After a run ends, the top bar's **Run** button reads **Re-run**. It opens the run form prefilled with that run's inputs, so you can change a value and run again.
+
+### Run statuses
+
+| Status | Meaning |
+|---|---|
+| `created` | The run was created and hasn't started |
+| `queued` | Waiting for a browser |
+| `running` | In progress |
+| `paused` | Waiting for a person at a **Human Interaction** block. Approve or reject it to continue. |
+| `completed` | Finished successfully |
+| `failed` | Stopped by an error |
+| `terminated` | The agent decided it couldn't complete the goal, or a **Terminate** block ended it |
+| `timed_out` | Ran past its time limit |
+| `canceled` | Stopped by a person or the API |
+
+A block that never ran because an earlier branch or condition skipped it shows `skipped`.
+
+## Download recordings, screenshots and files
+
+| What | Where |
+|---|---|
+| Video of the run | **Browser** pane → **Recording** |
+| Screenshots | **Browser** pane → **Screenshots** |
+| Extracted data (JSON) | **Run** pane → **Outputs** → **Extracted information** or **Run outputs** |
+| Files the agent downloaded | **Run** pane → **Outputs** → **Downloaded files**. Click a file to download it. |
+| Generated code | **Run** pane → **⋯** → **Code** |
+
+To pull artifacts from code, call `GET /v1/runs/{run_id}/artifacts`. Each artifact comes with a `signed_url` you can download from. Filter with `artifact_type`, for example `recording` or `screenshot_final`:
+
+```bash
+curl "https://api.skyvern.com/v1/runs/wr_123/artifacts?artifact_type=recording" \
+  -H "x-api-key: $SKYVERN_API_KEY"
+```
+
+Signed URLs expire. Request a fresh one each time instead of storing it. The [API reference](/api-reference) lists every artifact type.
+
+## Find past runs
+
+Click **Runs** in the sidebar to open **Run History**, every run in your organization, newest first.
+
+<img src="/images/cloud/cloud-run-history.png" alt="Run History with the search box, Filter by Agent, Filter by Type and Filter by Status, and the runs table" />
+
+- **Search** by run ID, input value or credential ("Search by run ID, input, credential...").
+- **Filter** by agent, by run type (**Task**, **Workflow**, **Agent (CUA)**) and by status.
+- Columns are **Run ID**, **Detail**, **Status**, **Created At** and **Duration** (some organizations also see **Created By**). Runs started by a schedule carry a badge next to the ID, and runs that used generated code show a lightning icon.
+- Click a run to open it in Studio.
+
+To see only one agent's runs while you work on it, open the **Past Runs** list from the Studio top bar.
+
+## Schedule an agent
+
+A schedule runs an agent automatically on a repeating timetable. New schedules are **Active** and fire at the next scheduled time.
+
+<Tabs>
+  <Tab title="From the Schedules page">
+    <Steps>
+      <Step title="Open Schedules">
+        Click **Agents** → **Schedules** in the sidebar, then **Create Schedule**.
+        <Frame>
+          <img src="/images/cloud/create-schedule-button.png" alt="Schedules page with the search bar, Filter by Status, and the Create Schedule button in the top right corner" />
+        </Frame>
+      </Step>
+      <Step title="Pick the agent">
+        Search for it in **Agent**. Only saved agents appear.
+      </Step>
+      <Step title="Set the timetable">
+        Fill in the fields below, and check **Next Scheduled Runs** to confirm the times.
+      </Step>
+      <Step title="Create">
+        Click **Create Schedule**.
+      </Step>
+    </Steps>
+  </Tab>
+  <Tab title="From Studio">
+    <Steps>
+      <Step title="Open the schedule panel">
+        In the agent's Studio top bar, click **Schedule** (calendar icon). The panel lists this agent's schedules.
+      </Step>
+      <Step title="Add a schedule">
+        Click **Add**. The agent is already selected. Fill in the fields below.
+      </Step>
+      <Step title="Create">
+        Click **Create Schedule**.
+      </Step>
+    </Steps>
+  </Tab>
+</Tabs>
+
+<Frame>
+  <img src="/images/cloud/create-sched-form.png" alt="Create Schedule form with Agent, Name, Description, Repeat, At, Timezone, Advanced (cron expression), and Next Scheduled Runs" width="300" />
+</Frame>
+
+| Field | What to enter |
+|---|---|
+| **Name (optional)** | A label for the schedule. Generated if empty. |
+| **Description (optional)** | Notes for your team |
+| Agent inputs | Shown when the agent has inputs. Required inputs must have a value or a default. |
+| **Repeat** | **Hourly**, **Daily**, **Weekly**, **Monthly** or **Fixed interval** |
+| **At**, **On these days**, **On day of month**, **Minute past the hour** | The time and days, depending on **Repeat** |
+| **Every**, **First run (optional)** | The interval and start time, for **Fixed interval** |
+| **Timezone** | The timezone the times are in. Defaults to your browser's. Search by city. |
+| **Advanced (cron expression)** | A standard 5-field cron expression instead of the builder, for example `0 9 * * 1-5` for 9:00 every weekday |
+
+<Warning>
+Runs must be at least 5 minutes apart. Shorter intervals are rejected.
+</Warning>
+
+### Manage schedules
+
+**Schedules** lists every schedule in your organization with **Agent**, **Name**, **Schedule**, **Next Run** and **Status** (**Active** or **Paused**). Search by agent or schedule name, or use **Filter by Status**. Each row's menu can **Pause**, **Activate**, **Duplicate** or **Delete** the schedule.
+
+Click a schedule to open its page at `/schedules/<agent id>/<schedule id>`:
+
+- The switch in the page header pauses or resumes the schedule, and the trash icon deletes it.
+- **Schedule Configuration**: frequency, timezone and cron. Click **Edit** to change the timetable, name or description.
+- **Agent Inputs**: the values the schedule passes, or the defaults it falls back on.
+- **Details**: **Created** and **Last Modified**.
+- **Upcoming Runs**: the next times it will fire.
+
+Paused schedules keep their settings and start no runs. Deleting a schedule is permanent and leaves its past runs in place. To point a schedule at a different agent, create a new schedule.
+
+Scheduled runs appear in **Run History** with a scheduled badge.
+
+## Next
+
+- [Build in Studio](/cloud/studio): change the agent between runs.
+- [Browsers](/browsers): run inside a persistent session or with a saved profile.
+- [Going to production](/developers/production): webhooks, retries and running agents at volume.

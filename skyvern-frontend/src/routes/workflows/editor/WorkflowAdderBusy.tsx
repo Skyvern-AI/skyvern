@@ -1,15 +1,6 @@
 import { StopIcon } from "@radix-ui/react-icons";
 import { ReactNode, useEffect, useRef, useState } from "react";
 
-import { Button } from "@/components/ui/button";
-import {
-  Dialog,
-  DialogContent,
-  DialogDescription,
-  DialogFooter,
-  DialogHeader,
-  DialogTitle,
-} from "@/components/ui/dialog";
 import {
   Tooltip,
   TooltipContent,
@@ -21,7 +12,7 @@ import { cn } from "@/util/utils";
 
 import "./WorkflowAdderBusy.css";
 
-type Operation = "recording" | "processing" | "uploading";
+type Operation = "recording" | "processing";
 
 type Size = "small" | "large";
 
@@ -43,10 +34,6 @@ type Props = {
    * Callback for when the operation completes (recording/processing).
    */
   onComplete: () => void;
-  /**
-   * Callback for when the user cancels an upload operation.
-   */
-  onCancel?: () => void;
 };
 
 function WorkflowAdderBusy({
@@ -55,12 +42,10 @@ function WorkflowAdderBusy({
   size,
   color = "red",
   onComplete,
-  onCancel,
 }: Props) {
   const recordingStore = useRecordingStore();
   const [isHovered, setIsHovered] = useState(false);
   const [shouldBump, setShouldBump] = useState(false);
-  const [showCancelDialog, setShowCancelDialog] = useState(false);
   const bumpTimeoutRef = useRef<NodeJS.Timeout | null>(null);
   const prevCountRef = useRef(0);
   const eventCount = recordingStore.exposedEventCount;
@@ -91,19 +76,8 @@ function WorkflowAdderBusy({
   const handleClick = (e: React.MouseEvent) => {
     e.stopPropagation();
     e.preventDefault();
-
-    if (operation === "uploading" && onCancel) {
-      setShowCancelDialog(true);
-    } else {
-      onComplete();
-    }
-
+    onComplete();
     return false;
-  };
-
-  const handleConfirmCancel = () => {
-    setShowCancelDialog(false);
-    onCancel?.();
   };
 
   return (
@@ -202,9 +176,7 @@ function WorkflowAdderBusy({
             <p>
               {operation === "recording"
                 ? "Stop & generate workflow steps"
-                : operation === "uploading"
-                  ? "Converting SOP... (click to cancel)"
-                  : "Processing..."}
+                : "Processing..."}
             </p>
           </TooltipContent>
         </Tooltip>
@@ -238,28 +210,6 @@ function WorkflowAdderBusy({
           </Tooltip>
         )}
       </div>
-      <Dialog open={showCancelDialog} onOpenChange={setShowCancelDialog}>
-        <DialogContent>
-          <DialogHeader>
-            <DialogTitle>Cancel SOP Conversion?</DialogTitle>
-            <DialogDescription>
-              The SOP is currently being converted to workflow blocks. Are you
-              sure you want to cancel this operation?
-            </DialogDescription>
-          </DialogHeader>
-          <DialogFooter>
-            <Button
-              variant="outline"
-              onClick={() => setShowCancelDialog(false)}
-            >
-              Continue
-            </Button>
-            <Button variant="destructive" onClick={handleConfirmCancel}>
-              Cancel Upload
-            </Button>
-          </DialogFooter>
-        </DialogContent>
-      </Dialog>
     </TooltipProvider>
   );
 }

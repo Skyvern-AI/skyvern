@@ -749,6 +749,18 @@ if settings.ENABLE_ANTHROPIC:
             temperature=1,
         ),
     )
+    # Dot-free key names: PostHog variant keys (TASK_V3_LLM_NAME) reject '.'.
+    _register_builtin_config(
+        "ANTHROPIC_CLAUDE5_5_HAIKU",
+        LLMConfig(
+            "anthropic/claude-haiku-5-5",
+            ["ANTHROPIC_API_KEY"],
+            supports_vision=True,
+            add_assistant_prefix=False,
+            max_completion_tokens=128000,
+            temperature=1,
+        ),
+    )
 if settings.ENABLE_BEDROCK:
     # Supported through AWS IAM authentication
     _register_builtin_config(
@@ -905,6 +917,17 @@ if settings.ENABLE_BEDROCK:
         "BEDROCK_ANTHROPIC_CLAUDE5.5_SONNET_INFERENCE_PROFILE",
         LLMConfig(
             "bedrock/global.anthropic.claude-sonnet-5-5",
+            ["AWS_REGION"],
+            supports_vision=True,
+            add_assistant_prefix=False,
+            max_completion_tokens=128000,
+            temperature=1,
+        ),
+    )
+    _register_builtin_config(
+        "BEDROCK_ANTHROPIC_CLAUDE5_5_HAIKU_INFERENCE_PROFILE",
+        LLMConfig(
+            "bedrock/us.anthropic.claude-haiku-5-5",
             ["AWS_REGION"],
             supports_vision=True,
             add_assistant_prefix=False,

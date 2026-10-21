@@ -26,6 +26,7 @@ def _state(recorder: object, working_page: object) -> RealBrowserState:
     st._disconnect_listener_contexts = weakref.WeakSet()  # constructor invariant the browser_context setter reads
     st.browser_context = MagicMock()  # non-None -> creation branch skipped
     st.browser_context.pages = []
+    st.external_browser = False
     st.browser_artifacts = SimpleNamespace(_display_recorder=recorder, remote_browser_session_id=None)
     st.get_working_page = AsyncMock(return_value=working_page)
     st.set_working_page = AsyncMock()

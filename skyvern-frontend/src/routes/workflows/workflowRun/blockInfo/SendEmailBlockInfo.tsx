@@ -1,5 +1,9 @@
 import { AutoResizingTextarea } from "@/components/AutoResizingTextarea/AutoResizingTextarea";
 import { Input } from "@/components/ui/input";
+import {
+  gmailOutcomeTitles,
+  type GmailSendOutput,
+} from "@/routes/workflows/types/workflowRunTypes";
 
 type Props = {
   recipients: Array<string>;
@@ -32,4 +36,33 @@ function SendEmailBlockParameters({ recipients, body, subject }: Props) {
   );
 }
 
-export { SendEmailBlockParameters };
+function GmailSendOutcome({
+  output,
+  failureReason,
+}: {
+  output: GmailSendOutput;
+  failureReason: string | null;
+}) {
+  return (
+    <div className="space-y-2" data-testid="gmail-send-outcome">
+      <h1 className="text-sm font-bold">
+        {gmailOutcomeTitles[output.outcome]}
+      </h1>
+      {output.outcome === "accepted" ? (
+        <p className="text-sm text-muted-foreground">
+          Gmail message ID: {output.provider_message_id}
+        </p>
+      ) : (
+        <p className="text-sm text-muted-foreground">{failureReason}</p>
+      )}
+      {output.replayed ? (
+        <p className="text-xs text-muted-foreground">
+          This is the result recorded by an earlier attempt of the same step;
+          the message was not sent again.
+        </p>
+      ) : null}
+    </div>
+  );
+}
+
+export { GmailSendOutcome, SendEmailBlockParameters };

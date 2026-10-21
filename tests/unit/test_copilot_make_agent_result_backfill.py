@@ -12,7 +12,7 @@ from skyvern.forge.sdk.copilot.agent import (
     _make_agent_result,
     _terminal_failed_operation,
 )
-from skyvern.forge.sdk.copilot.blocker_signal import CopilotToolBlockerSignal, contains_internal_machinery_leak
+from skyvern.forge.sdk.copilot.blocker_signal import CopilotToolBlockerSignal
 from skyvern.forge.sdk.copilot.build_test_connect_failure import BuildTestConnectFailure
 from skyvern.forge.sdk.copilot.build_test_outcome import (
     BuildTestFailedOperation,
@@ -85,8 +85,11 @@ def test_backfill_tolerates_turn_outcome_none() -> None:
     assert "responseKind" not in result.narrative_payload
 
 
-def test_backfill_adds_google_connection_notices_to_terminal_payload() -> None:
+def test_backfill_adds_setup_and_binding_google_connection_notices_to_terminal_payload() -> None:
     ctx = _ctx()
+    ctx.google_setup_notices = [
+        GoogleConnectionNotice(connectionId=None, condition="unbound", scopeProfile="gmail", origin="setup")
+    ]
     ctx.google_connection_notices = [
         GoogleConnectionNotice(
             connectionId="goac_needs_reconnect",
@@ -101,10 +104,21 @@ def test_backfill_adds_google_connection_notices_to_terminal_payload() -> None:
     assert result.narrative_payload["googleConnectionNotices"] == [
         {
             "provider": "google",
+            "connectionId": None,
+            "displayName": None,
+            "condition": "unbound",
+            "scopeProfile": "gmail",
+            "origin": "setup",
+            "choices": [],
+        },
+        {
+            "provider": "google",
             "connectionId": "goac_needs_reconnect",
             "displayName": "Sheets account",
             "condition": "unusable",
-        }
+            "scopeProfile": "google_sheets",
+            "origin": "workflow",
+        },
     ]
 
 
@@ -528,210 +542,23 @@ def test_make_agent_result_records_resolved_credentials_as_durable_approval() ->
     assert [record.credential_id for record in approved] == ["cred_portal"]
 
 
-def _ctx_with_open_second_factor_failure(
-    *, later_run_labels: list[str], final_selector: str = "Login"
-) -> CopilotContext:
+def test_a_pass_after_a_recorded_failure_leaves_the_supplied_reply_untouched() -> None:
     ctx = _ctx(workflow_yaml=two_page_login_yaml())
     record_build_test_outcome(ctx, failed_second_factor_run("wr_1"))
-    record_build_test_outcome(ctx, passing_run("wr_2", later_run_labels))
-    ctx.workflow_yaml = two_page_login_yaml(submit_selector=final_selector)
-    return ctx
-
-
-def test_build_turn_reports_the_failure_no_later_run_re_exercised() -> None:
-    ctx = _ctx_with_open_second_factor_failure(later_run_labels=["read_metric"])
-
-    result = _result(
-        ctx,
-        user_response="Built it. The workflow reads the visitor count.",
-        updated_workflow=object(),
-        turn_outcome=_outcome(ResponseKind.BUILD),
-        narrative_payload=_payload(),
-    )
-
-    assert result.turn_outcome is not None
-    unresolved = result.turn_outcome.unresolved_runtime_failure
-    assert unresolved is not None
-    assert unresolved.workflow_run_id == "wr_1"
-    assert unresolved.block_label == "sign_in_and_read"
-    assert "wr_1" not in result.user_response
-    assert contains_internal_machinery_leak(result.user_response) is False
-    assert "sign_in_and_read" in result.user_response
-    assert "Built it. The workflow reads the visitor count." in result.user_response
-
-
-def test_the_qualified_turn_is_still_a_success() -> None:
-    ctx = _ctx_with_open_second_factor_failure(later_run_labels=["read_metric"])
-
-    result = _result(
-        ctx,
-        user_response="Built it.",
-        updated_workflow=object(),
-        turn_outcome=_outcome(ResponseKind.BUILD),
-        narrative_payload=_payload(),
-    )
-
-    assert result.turn_outcome is not None
-    assert result.turn_outcome.unresolved_runtime_failure is not None
-    assert result.turn_outcome.response_kind == ResponseKind.BUILD
-    assert result.turn_outcome.terminal_reason is None
-
-
-def test_a_staged_repair_does_not_clear_before_the_route_applies_it() -> None:
-    """A proposal is not yet what anyone can run: this terminal is assembled before the route commits.
-
-    Showing, testing, or intending to auto-apply a repaired candidate does not make it the workflow
-    the user has, so it cannot retire a failure in the workflow they do have.
-    """
-    repaired = two_page_login_yaml(submit_selector="Continue")
-    ctx = _ctx_with_open_second_factor_failure(later_run_labels=["sign_in_and_read"], final_selector="Continue")
-    ctx.persisted_workflow_yaml = two_page_login_yaml()
-    _ran_blocks(ctx)
-
-    result = _result(
-        ctx,
-        user_response="Built it.",
-        updated_workflow=object(),
-        workflow_yaml=repaired,
-        turn_outcome=_outcome(ResponseKind.BUILD),
-        narrative_payload=_payload(),
-    )
-
-    assert result.turn_outcome is not None
-    assert result.turn_outcome.unresolved_runtime_failure is not None
-
-
-def test_a_mid_turn_persist_flag_does_not_prove_the_repair_was_applied() -> None:
-    """`workflow_was_persisted` records a canonical write the route can still roll back."""
-    ctx = _ran_blocks(_ctx_with_open_second_factor_failure(later_run_labels=["sign_in_and_read"]))
-    ctx.persisted_workflow_yaml = two_page_login_yaml()
-
-    result = _result(
-        ctx,
-        user_response="Built it.",
-        updated_workflow=object(),
-        workflow_yaml=two_page_login_yaml(submit_selector="Continue"),
-        workflow_was_persisted=True,
-        turn_outcome=_outcome(ResponseKind.BUILD),
-        narrative_payload=_payload(),
-    )
-
-    assert result.turn_outcome is not None
-    assert result.turn_outcome.unresolved_runtime_failure is not None
-
-
-def test_a_clarifying_turn_is_never_qualified() -> None:
-    ctx = _ctx_with_open_second_factor_failure(later_run_labels=["read_metric"])
-
-    result = _result(
-        ctx,
-        user_response="Which metric did you want?",
-        turn_outcome=_outcome(ResponseKind.CLARIFY),
-        narrative_payload=_payload(),
-    )
-
-    assert result.turn_outcome is not None
-    assert result.turn_outcome.unresolved_runtime_failure is None
-    assert result.user_response == "Which metric did you want?"
-
-
-def test_classifier_build_does_not_qualify_plain_reply_without_concrete_attempt() -> None:
-    ctx = _ctx_with_open_second_factor_failure(later_run_labels=["read_metric"])
-
-    result = _result(
-        ctx,
-        user_response="Here is the information you requested.",
-        turn_outcome=_outcome(ResponseKind.BUILD),
-        narrative_payload=_payload(),
-    )
-
-    assert result.turn_outcome is not None
-    assert result.turn_outcome.unresolved_runtime_failure is None
-    assert result.user_response == "Here is the information you requested."
-
-
-def test_the_qualification_also_rides_the_narrative_terminal_message() -> None:
-    """The chat panel renders the narrative card, not the raw reply, so both carry the note."""
-    ctx = _ctx_with_open_second_factor_failure(later_run_labels=["read_metric"])
-
-    result = _result(
-        ctx,
-        user_response="Built it.",
-        updated_workflow=object(),
-        turn_outcome=_outcome(ResponseKind.BUILD),
-        narrative_payload=_payload(terminalMessage="All done.", narrativeSummary="All done."),
-    )
-
-    assert result.narrative_payload is not None
-    for key in ("terminalMessage", "narrativeSummary"):
-        assert "wr_1" not in result.narrative_payload[key], key
-        assert contains_internal_machinery_leak(result.narrative_payload[key]) is False, key
-        assert "sign_in_and_read" in result.narrative_payload[key], key
-
-
-def _ran_blocks(ctx: CopilotContext) -> CopilotContext:
-    """The turn executed the candidate, which is what makes the note eligible at all."""
+    record_build_test_outcome(ctx, passing_run("wr_2", ["sign_in_and_read"]))
     ctx.last_run_blocks_workflow_run_id = "wr_2"
     ctx.dispatched_run_ids_this_turn.add("wr_2")
-    return ctx
-
-
-def test_success_over_an_unresolved_failure_is_qualified_on_every_surface() -> None:
-    """A later passing run on unchanged bytes does not license an unqualified success claim."""
-    ctx = _ran_blocks(_ctx_with_open_second_factor_failure(later_run_labels=["sign_in_and_read"]))
-    success = "Workflow updated and successfully tested in a fresh browser session."
+    reply = "Updated the workflow and the retest passed. The first run failed at sign-in, so that step is unproven."
 
     result = _result(
         ctx,
-        user_response=success,
+        user_response=reply,
         turn_outcome=_outcome(ResponseKind.BUILD),
-        narrative_payload=_payload(terminalMessage=success, narrativeSummary=success),
+        narrative_payload=_payload(terminalMessage=reply, narrativeSummary=reply),
     )
 
-    assert result.turn_outcome is not None
-    assert result.turn_outcome.unresolved_runtime_failure is not None
-    surfaces = [
-        result.user_response,
-        result.narrative_payload["terminalMessage"],
-        result.narrative_payload["narrativeSummary"],
-    ]
-    for surface in surfaces:
-        assert surface != success, "an unqualified success survived on one surface"
-        assert "remains unproven" in surface
-
-
-def test_a_trailing_failure_is_not_given_a_second_note() -> None:
-    """With no later run, the failure is the turn's own headline and needs no qualification."""
-    ctx = _ctx(workflow_yaml=two_page_login_yaml())
-    record_build_test_outcome(ctx, failed_second_factor_run("wr_1"))
-    _ran_blocks(ctx)
-    headline = "The sign-in block timed out waiting for a login field."
-
-    result = _result(
-        ctx,
-        user_response=headline,
-        turn_outcome=_outcome(ResponseKind.BUILD),
-        narrative_payload=_payload(terminalMessage=headline, narrativeSummary=headline),
-    )
-
-    assert result.user_response == headline
-    assert result.turn_outcome is not None
-    assert result.turn_outcome.unresolved_runtime_failure is None
-
-
-def test_a_durably_applied_repair_clears_the_failure() -> None:
-    """The pass path: the workflow the user can run no longer contains the implicated call."""
-    ctx = _ran_blocks(_ctx_with_open_second_factor_failure(later_run_labels=["sign_in_and_read"]))
-    ctx.persisted_workflow_yaml = two_page_login_yaml(submit_selector="Continue")
-
-    result = _result(
-        ctx,
-        user_response="Built it.",
-        updated_workflow=object(),
-        turn_outcome=_outcome(ResponseKind.BUILD),
-        narrative_payload=_payload(),
-    )
-
-    assert result.turn_outcome is not None
-    assert result.turn_outcome.unresolved_runtime_failure is None
-    assert result.user_response == "Built it."
+    assert result.user_response == reply
+    assert result.narrative_payload is not None
+    assert result.narrative_payload["terminalMessage"] == reply
+    assert result.narrative_payload["narrativeSummary"] == reply
+    assert [entry["workflow_run_id"] for entry in ctx.recorded_build_test_outcome_history] == ["wr_1", "wr_2"]

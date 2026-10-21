@@ -28,10 +28,11 @@ import unicodedata
 import uuid
 import zipfile
 from collections import defaultdict, deque
-from collections.abc import Iterator, Mapping, Sequence
+from collections.abc import AsyncIterator, Iterator, Mapping, Sequence
 from dataclasses import dataclass, replace
 from datetime import UTC, date, datetime, time
 from email.message import EmailMessage
+from email.policy import SMTP as SMTP_EMAIL_POLICY
 from enum import StrEnum
 from functools import partial
 from pathlib import Path, PurePosixPath
@@ -80,12 +81,14 @@ from skyvern.constants import (
     AZURE_BLOB_STORAGE_MAX_UPLOAD_FILE_COUNT,
     BROWSER_DOWNLOADING_SUFFIX,
     FILE_PARSE_STEP_TIMEOUT_SECONDS,
+    FILE_PARSER_LLM_CALL_TIMEOUT_SECONDS,
     GET_DOWNLOADED_FILES_TIMEOUT,
     MAX_FILE_PARSE_INPUT_TOKENS,
     MAX_PDF_OCR_PAGES,
     MAX_UPLOAD_FILE_COUNT,
     NAVIGATION_MAX_RETRY_TIME,
     PDF_OCR_PAGE_CONCURRENCY,
+    PDF_OCR_TOTAL_TIMEOUT_SECONDS,
     PROXY_TRANSPORT_NAV_ERRORS,
     SAVE_DOWNLOADED_FILES_TIMEOUT,
 )
@@ -94,6 +97,7 @@ from skyvern.exceptions import (
     AzureConfigurationError,
     BlockedHost,
     BlockedNavigationDestination,
+    BlockTerminationError,
     BranchEvaluationContextTooLargeError,
     CodeBlockRunnerSelectionError,
     ConditionalBranchEvaluationError,
@@ -130,7 +134,9 @@ from skyvern.forge.sdk.api.files import (
     download_file,
     get_download_dir,
     get_path_for_workflow_download_directory,
+    get_run_temp_dir,
     is_remote_url,
+    is_uploaded_file_id,
     observe_download_dir,
     parse_uri_to_path,
     resolve_local_or_download_file,
@@ -165,6 +171,7 @@ from skyvern.forge.sdk.copilot.reached_download_target import (
     REGISTERED_DOWNLOAD_OUTPUT_KEYS,
     block_output_has_registered_download,
     code_is_download_intent,
+    without_generated_file_stamp,
 )
 from skyvern.forge.sdk.copilot.turn_origin import TurnOrigin
 from skyvern.forge.sdk.core import skyvern_context
@@ -176,6 +183,8 @@ from skyvern.forge.sdk.db.datetime_utils import naive_utc_now
 from skyvern.forge.sdk.db.enums import TaskType
 from skyvern.forge.sdk.db.exceptions import NotFoundError
 from skyvern.forge.sdk.db.id import generate_action_id, generate_workflow_run_id
+from skyvern.forge.sdk.db.repositories.google_oauth import DISPATCH_ACCEPTED, DISPATCH_FAILED, GmailSendDispatch
+from skyvern.forge.sdk.executor.run_liveness import run_lease_lost, run_lease_tasks_enabled
 from skyvern.forge.sdk.experimentation.code_block_ai_fallback import code_block_ai_fallback_flag_enabled
 from skyvern.forge.sdk.experimentation.llm_prompt_config import get_llm_handler_for_prompt_type
 from skyvern.forge.sdk.experimentation.workflow_block_engine import (
@@ -193,7 +202,12 @@ from skyvern.forge.sdk.services.bitwarden import BitwardenConstants
 from skyvern.forge.sdk.services.credentials import AzureVaultConstants, OnePasswordConstants, generate_totp_code
 from skyvern.forge.sdk.settings_manager import SettingsManager
 from skyvern.forge.sdk.trace import traced
-from skyvern.forge.sdk.utils.pdf_parser import extract_pdf_file, render_pdf_pages_as_images, validate_pdf_file
+from skyvern.forge.sdk.utils.pdf_parser import (
+    extract_pdf_file,
+    render_pdf_pages_as_images,
+    scrambled_text_layer_reason,
+    validate_pdf_file,
+)
 from skyvern.forge.sdk.utils.sanitization import sanitize_postgres_text
 from skyvern.forge.sdk.workflow import web_search
 from skyvern.forge.sdk.workflow.code_block_authorized_files import (
@@ -212,8 +226,9 @@ from skyvern.forge.sdk.workflow.code_block_authorized_files import (
     unbound_attach_authorized_file,
 )
 from skyvern.forge.sdk.workflow.code_block_safety import BLOCKED_ATTRS as CODE_BLOCK_BLOCKED_ATTRS
+from skyvern.forge.sdk.workflow.code_block_safety import SANDBOX_MODULES_GLOBAL, BindSandboxModuleImports
 from skyvern.forge.sdk.workflow.code_block_safety import is_safe_code as _shared_is_safe_code
-from skyvern.forge.sdk.workflow.code_block_safety import module_shims, safe_builtins
+from skyvern.forge.sdk.workflow.code_block_safety import json_safe_default, module_shims, safe_builtins
 from skyvern.forge.sdk.workflow.constants import OUTPUT_PARAMETER_MAX_VALUE_BYTES
 from skyvern.forge.sdk.workflow.context_manager import (
     NON_SECRET_CREDENTIAL_FIELDS,
@@ -297,7 +312,7 @@ from skyvern.forge.taskv3.handoff_redaction import pin_caller_authored_block_url
 from skyvern.schemas.browser_session_close import BrowserSessionCloseReason
 from skyvern.schemas.browser_session_kind import BrowserSessionKind
 from skyvern.schemas.browser_settings import requested_timezone_id
-from skyvern.schemas.emails import EmailBodyFormat
+from skyvern.schemas.emails import EmailBodyFormat, EmailTransport, GmailSendErrorCode, GmailSendOutcome
 from skyvern.schemas.runs import RunEngine, read_browser_type
 from skyvern.schemas.self_heal import HealClassification, HealSkipReason, HealStatus, OutputObligation
 from skyvern.schemas.workflows import (
@@ -305,6 +320,7 @@ from skyvern.schemas.workflows import (
     ERROR_CODE_MAPPING_MAX_UTF8_BYTES,
     ERROR_CODE_MAX_LENGTH,
     ERROR_CODE_REASONING_MAX_LENGTH,
+    FORCE_OCR_DESCRIPTION,
     AIFallbackMode,
     BlockResult,
     BlockStatus,
@@ -321,6 +337,7 @@ from skyvern.schemas.workflows import (
     normalize_error_code_description,
 )
 from skyvern.services import otp_email, otp_service, planner_levers
+from skyvern.services.email.gmail import GMAIL_MAX_MESSAGE_BYTES, GmailSendResult, send_raw_message
 from skyvern.services.error_detection_service import detect_user_defined_errors_for_task
 from skyvern.utils.contained_effects import contained_effect
 from skyvern.utils.parquet_export import ParquetExportError, export_parquet_records
@@ -331,7 +348,7 @@ from skyvern.utils.secret_redaction import (
     redact_secrets_from_text,
 )
 from skyvern.utils.strings import generate_random_string
-from skyvern.utils.templating import get_available_keys, get_missing_variables
+from skyvern.utils.templating import get_available_keys, get_missing_variables, reject_jinja_transformations_on_variable
 from skyvern.utils.token_counter import count_tokens, decode_tokens, encode_tokens
 from skyvern.utils.url_validators import (
     prepend_scheme_and_validate_url,
@@ -346,7 +363,12 @@ from skyvern.webeye.browser_engine import is_any_engine_error
 from skyvern.webeye.browser_factory import rebind_download_dir
 from skyvern.webeye.browser_object_predicates import is_page_like
 from skyvern.webeye.browser_state import BrowserState, get_browser_state_diagnostic
-from skyvern.webeye.cdp_download_interceptor import normalize_download_filename, settle_browser_downloads_for_context
+from skyvern.webeye.cdp_download_interceptor import (
+    ORIGINAL_FILENAME_MARKER,
+    ORIGINAL_FILENAME_TEMPLATE_VARIABLE,
+    normalize_download_filename,
+    settle_browser_downloads_for_context,
+)
 from skyvern.webeye.navigation import (
     default_navigation_settle,
     driver_nav_error_code,
@@ -356,13 +378,14 @@ from skyvern.webeye.navigation import (
     redact_url_secrets,
 )
 from skyvern.webeye.playwright_input import playwright_input_defaults_for_page
-from skyvern.webeye.real_browser_state import RealBrowserState
+from skyvern.webeye.real_browser_state import RealBrowserState, is_external_browser_state
 from skyvern.webeye.utils.captcha_solver import (
     MAX_IMAGE_CAPTCHA_READS,
     ChallengeStatus,
     resolve_captcha_image,
     solve_challenge,
 )
+from skyvern.webeye.utils.challenge_solve_record import ChallengeSolveRecord
 from skyvern.webeye.utils.page import ScreenshotMode, SkyvernFrame
 
 if TYPE_CHECKING:
@@ -635,8 +658,52 @@ def extract_file_url_from_block_output(value: Any) -> str | None:
 
 
 def sanitize_filename(filename: str, default: str = "document") -> str:
-    sanitized = re.sub(r'[<>:"/\\|?*]', "_", filename).strip(". ")
+    sanitized = re.sub(r'[<>:"/\\|?*\x00-\x1f\ud800-\udfff]', "_", filename).strip(". ")
     return sanitized[:200] if sanitized else default
+
+
+async def register_workflow_downloads(
+    *,
+    organization_id: str | None,
+    run_download_id: str | None,
+    workflow_run_id: str,
+    workflow_run_block_id: str,
+) -> list[FileInfo]:
+    if not organization_id:
+        return []
+    try:
+        async with asyncio.timeout(SAVE_DOWNLOADED_FILES_TIMEOUT):
+            await app.STORAGE.save_downloaded_files(organization_id=organization_id, run_id=run_download_id)
+    except TimeoutError:
+        LOG.warning(
+            "Timeout saving workflow downloads; workflow finalization will retry",
+            workflow_run_id=workflow_run_id,
+            workflow_run_block_id=workflow_run_block_id,
+        )
+        return []
+    except DownloadSaveIncompleteError:
+        pass
+    except Exception:
+        LOG.warning(
+            "Failed to register workflow downloads; workflow finalization will retry",
+            workflow_run_id=workflow_run_id,
+            workflow_run_block_id=workflow_run_block_id,
+            exc_info=True,
+        )
+        return []
+    try:
+        async with asyncio.timeout(GET_DOWNLOADED_FILES_TIMEOUT):
+            return await app.STORAGE.get_current_attempt_downloaded_files(
+                organization_id=organization_id, run_id=run_download_id
+            )
+    except Exception:
+        LOG.warning(
+            "Failed to read registered workflow downloads",
+            workflow_run_id=workflow_run_id,
+            workflow_run_block_id=workflow_run_block_id,
+            exc_info=True,
+        )
+        return []
 
 
 class ParquetExportMixin:
@@ -664,50 +731,6 @@ class ParquetExportMixin:
         if isinstance(current_index, int) and not isinstance(current_index, bool):
             stem = f"{stem}-{current_index + 1:04d}"
         return f"{stem}.parquet"
-
-    async def _register_export_download(
-        self,
-        *,
-        organization_id: str | None,
-        run_download_id: str | None,
-        workflow_run_id: str,
-        workflow_run_block_id: str,
-    ) -> list[FileInfo]:
-        if not organization_id:
-            return []
-        try:
-            async with asyncio.timeout(SAVE_DOWNLOADED_FILES_TIMEOUT):
-                await app.STORAGE.save_downloaded_files(organization_id=organization_id, run_id=run_download_id)
-        except asyncio.TimeoutError:
-            LOG.warning(
-                "Timeout saving Parquet export; workflow finalization will retry",
-                workflow_run_id=workflow_run_id,
-                workflow_run_block_id=workflow_run_block_id,
-            )
-            return []
-        except DownloadSaveIncompleteError:
-            pass
-        except Exception:
-            LOG.warning(
-                "Failed to register Parquet export; workflow finalization will retry",
-                workflow_run_id=workflow_run_id,
-                workflow_run_block_id=workflow_run_block_id,
-                exc_info=True,
-            )
-            return []
-        try:
-            async with asyncio.timeout(GET_DOWNLOADED_FILES_TIMEOUT):
-                return await app.STORAGE.get_current_attempt_downloaded_files(
-                    organization_id=organization_id, run_id=run_download_id
-                )
-        except Exception:
-            LOG.warning(
-                "Failed to read registered Parquet exports",
-                workflow_run_id=workflow_run_id,
-                workflow_run_block_id=workflow_run_block_id,
-                exc_info=True,
-            )
-            return []
 
     async def write_parquet_export(
         self,
@@ -753,7 +776,7 @@ class ParquetExportMixin:
             raise ParquetExportError(f"failed to write {filename}: {exc}") from exc
 
         filename = path.name
-        downloaded_files = await self._register_export_download(
+        downloaded_files = await register_workflow_downloads(
             organization_id=organization_id,
             run_download_id=run_download_id,
             workflow_run_id=workflow_run_id,
@@ -944,6 +967,7 @@ class Block(BaseModel, abc.ABC):
         env: SandboxedEnvironment | None = None,
         skip_missing_variable_preflight: bool = False,
         page_derived_capture: PageDerivedCapture | None = None,
+        extra_template_data: dict[str, Any] | None = None,
     ) -> str:
         if field not in type(self).model_fields:
             raise ValueError(f"{type(self).__name__} has no field named {field!r}")
@@ -959,6 +983,7 @@ class Block(BaseModel, abc.ABC):
                 env=env,
                 skip_missing_variable_preflight=skip_missing_variable_preflight,
                 page_derived_capture=page_derived_capture,
+                extra_template_data=extra_template_data,
             )
         except Exception as exc:
             if field not in ("totp_identifier", "totp_verification_url"):
@@ -1127,6 +1152,8 @@ class Block(BaseModel, abc.ABC):
             value=value,
         )
         self._output_recorded_this_execution = True
+        if run_lease_tasks_enabled() and await run_lease_lost(workflow_run_id):
+            return
         await app.DATABASE.workflow_runs.create_or_update_workflow_run_output_parameter(
             workflow_run_id=workflow_run_id,
             output_parameter_id=self.output_parameter.output_parameter_id,
@@ -1198,22 +1225,7 @@ class Block(BaseModel, abc.ABC):
         # Every arm that reports a block failure lands here -- the raise path and the ones that
         # return an unsuccessful result -- so this is where the reason is scrubbed. It is persisted
         # to workflow_run_blocks.failure_reason and lifted onto the run, neither redacted downstream.
-        if failure_reason:
-            # Best-effort: this builder runs for every block result, including on paths that never
-            # start a ForgeApp, and a secret lookup must never be what turns a block result into a
-            # failure. Degrades to the unredacted reason, which is the pre-existing behaviour.
-            try:
-                context = skyvern_context.current()
-                block_run_id = context.workflow_run_id if context is not None else None
-                block_run_secrets = (
-                    app.WORKFLOW_CONTEXT_MANAGER.get_secret_values_for_run(block_run_id)
-                    if app.WORKFLOW_CONTEXT_MANAGER.artifact_redaction_enabled(block_run_id)
-                    else app.WORKFLOW_CONTEXT_MANAGER.runtime_secret_values_for_artifacts()
-                )
-                if block_run_secrets:
-                    failure_reason = redact_secrets_from_text(failure_reason, block_run_secrets)
-            except Exception:
-                LOG.warning("failed to redact a block failure reason", exc_info=True)
+        failure_reason = _redact_run_secrets(failure_reason)
 
         # TODO: update workflow run block status and failure reason
         if isinstance(output_parameter_value, str):
@@ -1406,6 +1418,7 @@ class Block(BaseModel, abc.ABC):
         env: SandboxedEnvironment | None = None,
         skip_missing_variable_preflight: bool = False,
         page_derived_capture: PageDerivedCapture | None = None,
+        extra_template_data: dict[str, Any] | None = None,
     ) -> str:
         """
         Format a template string using the workflow run context.
@@ -1425,6 +1438,10 @@ class Block(BaseModel, abc.ABC):
         template_data = self._build_block_parameter_template_data(
             workflow_run_context, force_include_secrets=force_include_secrets
         )
+        if extra_template_data:
+            # A field-specific binding only fills a gap: a workflow that already has a parameter
+            # under the same key keeps rendering its own value.
+            template_data = {**extra_template_data, **template_data}
 
         # A caller whose environment decides for itself what an absent binding means renders instead of
         # failing here, so `| default(...)` still reaches an undefined the preflight would reject.
@@ -1591,6 +1608,9 @@ class Block(BaseModel, abc.ABC):
         self, workflow_run_block_id: str, organization_id: str | None = None
     ) -> None:
         if self.block_type in {BlockType.CODE, BlockType.FOR_LOOP, BlockType.WHILE_LOOP, BlockType.WEB_SEARCH}:
+            return
+        # The description prompt carries the block's recipients, subject and body to an LLM and into its logs.
+        if isinstance(self, SendEmailBlock) and self.transport == EmailTransport.GMAIL:
             return
         description = None
         try:
@@ -2058,11 +2078,11 @@ class BaseTaskBlock(Block):
     def resolve_engine(self, workflow_run_id: str | None) -> RunEngine:
         """The engine this block dispatches to, after the per-run A/B.
 
-        Both the persisted workflow_run_blocks.engine and the execute_step dispatch read this, so
-        the recorded engine cannot disagree with the one that ran. A block pinned to a non-default
-        engine is honored as-authored, and a block the eligibility check never saw is left alone;
-        neither is ever rerouted. An unset engine routes like skyvern_v1, except in a run that honors the
-        chosen engine or on a block whose skyvern_v1 a person pinned.
+        Both the persisted workflow_run_blocks.engine and the execute_step dispatch read this; when the
+        dispatch falls back to the step engine, execute_step corrects the row to the engine that ran. A
+        block pinned to a non-default engine is honored as-authored, and a block the eligibility check
+        never saw is left alone; neither is ever rerouted. An unset engine routes like skyvern_v1, except
+        in a run that honors the chosen engine or on a block whose skyvern_v1 a person pinned.
         """
         declared = self.engine or RunEngine.skyvern_v1
         if (
@@ -2122,8 +2142,17 @@ class BaseTaskBlock(Block):
             )
 
         if self.download_suffix:
+            if ORIGINAL_FILENAME_TEMPLATE_VARIABLE not in workflow_run_context.values:
+                reject_jinja_transformations_on_variable(
+                    self.download_suffix,
+                    ORIGINAL_FILENAME_TEMPLATE_VARIABLE,
+                    jinja_sandbox_env,
+                )
             self.download_suffix = self.render_templatable_field(
-                "download_suffix", self.download_suffix, workflow_run_context
+                "download_suffix",
+                self.download_suffix,
+                workflow_run_context,
+                extra_template_data={ORIGINAL_FILENAME_TEMPLATE_VARIABLE: ORIGINAL_FILENAME_MARKER},
             )
             # encode the suffix to prevent invalid path style
             self.download_suffix = quote(string=self.download_suffix, safe="")
@@ -2433,6 +2462,8 @@ class BaseTaskBlock(Block):
                 workflow_run_block_id=workflow_run_block_id,
                 task_id=task.task_id,
                 organization_id=organization_id,
+                # A retry reuses this row, which a step-engine fallback on the previous attempt relabeled.
+                engine=self.resolve_engine(workflow_run_id).value,
             )
             current_running_task = task
             organization = await app.DATABASE.organizations.get_organization(
@@ -2582,6 +2613,14 @@ class BaseTaskBlock(Block):
                         workflow_run_id=workflow_run_id,
                         detected_at=datetime.now(UTC),
                         failure_reason="browser_state_registry_lookup_miss",
+                    )
+                if browser_session_id and is_external_browser_state(browser_state) and not browser_state.is_connected():
+                    # Re-acquiring a lost registered browser fails the run with the registration's own reason.
+                    browser_state = await app.BROWSER_MANAGER.get_or_create_for_workflow_run(
+                        workflow_run=workflow_run,
+                        url=None,
+                        browser_session_id=browser_session_id,
+                        browser_profile_id=workflow_run.browser_profile_id,
                     )
 
                 working_page = await browser_state.must_get_working_page()
@@ -3693,6 +3732,8 @@ class ForLoopBlock(Block):
         cancellation) always persist since they are terminal."""
         if not self.output_parameter:
             return
+        if run_lease_tasks_enabled() and await run_lease_lost(workflow_run_id):
+            return
         _maybe_truncate_loop_outputs(
             outputs_with_loop_values,
             workflow_run_id=workflow_run_id,
@@ -4404,6 +4445,8 @@ class WhileLoopBlock(Block):
         """
         if not self.output_parameter:
             return
+        if run_lease_tasks_enabled() and await run_lease_lost(workflow_run_id):
+            return
         _maybe_truncate_loop_outputs(
             outputs_with_loop_values,
             workflow_run_id=workflow_run_id,
@@ -5027,11 +5070,12 @@ class _StagedFrame(NamedTuple):
 
 @dataclass
 class _HealAttemptTrace:
-    """Carries the recovery task id and pinned credential key back to the episode writer, which runs
-    after the attempt returns."""
+    """Carries the recovery task id, pinned credential key and the recovery's own failure sentence back to
+    the episode writer, which runs after the attempt returns."""
 
     escalation_task_id: str | None = None
     credential_parameter_key: str | None = None
+    recovery_failure_reason: str | None = None
 
 
 CODE_BLOCK_GENERIC_FAILURE_REASON = "Failed to execute code block."
@@ -5192,22 +5236,53 @@ async def _code_block_solve_captcha_builtin(
 
     async def solve() -> bool:
         if image is not None and input is not None:
-            return await _fill_image_captcha_text(page, image, input, organization_id=organization_id)
-        outcome = await solve_challenge(
-            page,
-            organization_id=organization_id,
-            workflow_run_id=workflow_run_id,
-            browser_session_id=browser_session_id,
-            probe_child_frames=True,
-        )
-        recorded_output["challenge"] = outcome.receipt()
-        if outcome.status in (ChallengeStatus.UNSOLVED, ChallengeStatus.UNSUPPORTED):
-            raise CodeBlockCaptchaError("CAPTCHA could not be solved.")
-        return outcome.status is ChallengeStatus.SOLVED
+            return await _fill_image_captcha_text(
+                page,
+                image,
+                input,
+                organization_id=organization_id,
+                workflow_run_id=workflow_run_id,
+                browser_session_id=browser_session_id,
+            )
+        with _code_block_solve_record(page, organization_id, workflow_run_id, browser_session_id) as record:
+            outcome = await solve_challenge(
+                page,
+                organization_id=organization_id,
+                workflow_run_id=workflow_run_id,
+                browser_session_id=browser_session_id,
+                probe_child_frames=True,
+            )
+            record.challenge = outcome
+            recorded_output["challenge"] = outcome.receipt()
+            if outcome.status in (ChallengeStatus.UNSOLVED, ChallengeStatus.UNSUPPORTED):
+                raise CodeBlockCaptchaError("CAPTCHA could not be solved.")
+            return outcome.status is ChallengeStatus.SOLVED
 
     if isinstance(page, RecordingPage):
         return await page._record_solve_captcha(solve, workflow_run_id=workflow_run_id, extra_output=recorded_output)
     return await solve()
+
+
+@contextlib.contextmanager
+def _code_block_solve_record(
+    page: Page | RecordingPage,
+    organization_id: str | None,
+    workflow_run_id: str | None,
+    browser_session_id: str | None,
+) -> Iterator[ChallengeSolveRecord]:
+    with app.AGENT_FUNCTION.challenge_solve_recording(
+        "code_block",
+        page=page,
+        organization_id=organization_id,
+        workflow_run_id=workflow_run_id,
+        browser_session_id=browser_session_id,
+    ) as record:
+        try:
+            yield record
+        except CodeBlockCaptchaError:
+            # The builtin reports an unsolved or unreadable CAPTCHA by raising; the call itself completed.
+            record.unsolved = True
+            raise
 
 
 async def _fill_image_captcha_text(
@@ -5216,22 +5291,27 @@ async def _fill_image_captcha_text(
     input_selector: str,
     *,
     organization_id: str | None,
+    workflow_run_id: str | None = None,
+    browser_session_id: str | None = None,
 ) -> bool:
     # Checked before the screenshot so an organization with OCR turned off never captures the element.
     if not await app.AGENT_FUNCTION.image_captcha_ocr_enabled(organization_id=organization_id, url=page.url):
         raise CodeBlockCaptchaError("CAPTCHA could not be solved.")
-    try:
-        # Any other element would ship an arbitrary region of the page to the OCR vendor.
-        image = await resolve_captcha_image(page.locator(image_selector))
-        if image is None:
-            raise CodeBlockCaptchaError("CAPTCHA could not be solved.")
-        png = await image.screenshot(timeout=settings.BROWSER_SCREENSHOT_TIMEOUT_MS)
-        text = await app.AGENT_FUNCTION.read_image_captcha_text(png, organization_id=organization_id, url=page.url)
-        if not text or not text.strip():
-            raise CodeBlockCaptchaError("CAPTCHA could not be solved.")
-        await page.locator(input_selector).fill(text.strip(), timeout=settings.BROWSER_ACTION_TIMEOUT_MS)
-    except PlaywrightError as exc:
-        raise CodeBlockCaptchaError("CAPTCHA could not be solved.") from exc
+    with _code_block_solve_record(page, organization_id, workflow_run_id, browser_session_id) as record:
+        try:
+            # Any other element would ship an arbitrary region of the page to the OCR vendor.
+            image = await resolve_captcha_image(page.locator(image_selector))
+            if image is None:
+                raise CodeBlockCaptchaError("CAPTCHA could not be solved.")
+            png = await image.screenshot(timeout=settings.BROWSER_SCREENSHOT_TIMEOUT_MS)
+            text = await app.AGENT_FUNCTION.read_image_captcha_text(png, organization_id=organization_id, url=page.url)
+            if not text or not text.strip():
+                raise CodeBlockCaptchaError("CAPTCHA could not be solved.")
+            record.image_text_read = True
+            await page.locator(input_selector).fill(text.strip(), timeout=settings.BROWSER_ACTION_TIMEOUT_MS)
+            record.image_text_delivered = True
+        except PlaywrightError as exc:
+            raise CodeBlockCaptchaError("CAPTCHA could not be solved.") from exc
     return True
 
 
@@ -5256,6 +5336,7 @@ class CodeBlockSolveCaptcha(Protocol):
 def _bind_code_block_solve_captcha(
     organization_id: str | None,
     workflow_run_id: str | None,
+    browser_session_id: str | None = None,
 ) -> CodeBlockSolveCaptcha:
     image_reads = 0
 
@@ -5274,6 +5355,7 @@ def _bind_code_block_solve_captcha(
             page,
             organization_id=organization_id,
             workflow_run_id=workflow_run_id,
+            browser_session_id=browser_session_id,
             image=image,
             input=input,
         )
@@ -5352,6 +5434,26 @@ def _context_navigation_output(
         return {}
     context = replace(receipt, relation="context")
     return {"associated_navigation": associated_navigation_output(context, workflow_run_context, parameters)}
+
+
+def _redact_run_secrets(text: str | None) -> str | None:
+    if not text:
+        return text
+    # Best-effort: every block result passes through here, including on paths that never start a ForgeApp,
+    # and a secret lookup must never be what turns a block result into a failure. Degrades to the
+    # unredacted text, which is the pre-existing behaviour.
+    try:
+        context = skyvern_context.current()
+        run_id = context.workflow_run_id if context is not None else None
+        run_secrets = (
+            app.WORKFLOW_CONTEXT_MANAGER.get_secret_values_for_run(run_id)
+            if app.WORKFLOW_CONTEXT_MANAGER.artifact_redaction_enabled(run_id)
+            else app.WORKFLOW_CONTEXT_MANAGER.runtime_secret_values_for_artifacts()
+        )
+        return redact_secrets_from_text(text, run_secrets) if run_secrets else text
+    except Exception:
+        LOG.warning("failed to redact a block failure reason", exc_info=True)
+        return text
 
 
 def _redact_codeblock_failure_text(
@@ -6738,6 +6840,7 @@ class CodeBlock(Block):
     def build_safe_vars() -> dict[str, Any]:
         # Builtins live under __builtins__ rather than as globals so a workflow parameter can shadow
         # a builtin name by normal scoping, matching codeblock_runtime.build_safe_vars.
+        shims = module_shims()
         return {
             "__builtins__": {
                 **safe_builtins(),
@@ -6747,7 +6850,8 @@ class CodeBlock(Block):
             },
             "print": print,
             "sleep": asyncio.sleep,
-            **module_shims(),
+            **shims,
+            SANDBOX_MODULES_GLOBAL: shims,
             "ErrorCode": ErrorCode,
             "otp": _code_block_otp_builtin,
             "solve_captcha": _bind_code_block_solve_captcha(None, None),
@@ -6782,6 +6886,7 @@ class CodeBlock(Block):
         registered_downloads: RegisteredDownloadSource | None = None,
         opened_pages: list[Page | RecordingPage] | None = None,
         browser_state: BrowserState | None = None,
+        browser_session_id: str | None = None,
     ) -> Callable[[], Awaitable[dict[str, Any]]]:
         # SECURITY: validate before exec(). The AST check must run on the raw
         # user code so it can block dunder identifiers like __capture_locals.
@@ -6812,7 +6917,9 @@ class CodeBlock(Block):
             parameters=app.AGENT_FUNCTION.serialize_codeblock_parameters(parameters or {}),
         )
         safe_vars["__builtins__"]["print"] = safe_vars["print"]
-        safe_vars["solve_captcha"] = _bind_code_block_solve_captcha(organization_id, workflow_run_id)
+        safe_vars["solve_captcha"] = _bind_code_block_solve_captcha(
+            organization_id, workflow_run_id, browser_session_id
+        )
         safe_vars["otp"] = partial(
             _code_block_otp_builtin,
             organization_id=organization_id,
@@ -6892,12 +6999,25 @@ class CodeBlock(Block):
         full_code = f"""
 async def wrapper({default_args}):
 {code}
-    return {{key: value for key, value in __capture_locals().items() if key not in __param_defaults}}
+    return {{
+        key: value
+        for key, value in __capture_locals().items()
+        if key not in __param_defaults and not __codeblock_sandbox_binding(key, value)
+    }}
 """
         safe_vars["__capture_locals"] = locals
         safe_vars["__param_defaults"] = parameter_defaults
+        # A name an import bound would otherwise reach the output as an unserializable placeholder.
+        sandbox_binding_ids = {
+            id(member) for shim in safe_vars[SANDBOX_MODULES_GLOBAL].values() for member in (shim, *vars(shim).values())
+        }
+        import_binder = BindSandboxModuleImports()
+        safe_vars["__codeblock_sandbox_binding"] = lambda key, value: (
+            key in import_binder.bound_names and id(value) in sandbox_binding_ids
+        )
         # Compile under a recognizable filename so tracebacks map back to user code lines.
-        compiled_code = compile(full_code, CODE_BLOCK_FILENAME, "exec")
+        tree = import_binder.visit(ast.parse(full_code, filename=CODE_BLOCK_FILENAME))
+        compiled_code = compile(ast.fix_missing_locations(tree), CODE_BLOCK_FILENAME, "exec")
         inline_exec_context = skyvern_context.current()
         LOG.info(
             "codeblock.inline_exec_entered",
@@ -7825,7 +7945,23 @@ async def wrapper({default_args}):
 
     async def _ai_fallback_enabled(self, workflow_run_context: WorkflowRunContext) -> bool:
         workflow = workflow_run_context.workflow
-        return workflow is not None and await code_block_ai_fallback_flag_enabled(workflow.organization_id)
+        if workflow is None or not await code_block_ai_fallback_flag_enabled(workflow.organization_id):
+            return False
+        try:
+            workflow_run = await app.DATABASE.workflow_runs.get_workflow_run(
+                workflow_run_id=workflow_run_context.workflow_run_id,
+                organization_id=workflow.organization_id,
+            )
+        except Exception:  # noqa: BLE001 - preserve the block failure if run settings are unavailable.
+            LOG.warning(
+                "AI fallback run-configuration lookup failed; failing closed",
+                workflow_run_id=workflow_run_context.workflow_run_id,
+            )
+            return False
+        ai_fallback = workflow_run.ai_fallback if workflow_run is not None else None
+        if ai_fallback is None:
+            ai_fallback = workflow.ai_fallback
+        return ai_fallback is not False
 
     async def _is_authoring_run(self, workflow_run_id: str, organization_id: str) -> bool | None:
         """Whether this run or an ancestor run is a Copilot build test or an editor block run; None when the
@@ -7949,11 +8085,21 @@ async def wrapper({default_args}):
         trace: _HealAttemptTrace | None = None,
         failed_nav_error_code: str | None = None,
         authored_code: str | None,
+        code_failure_reason: str | None,
     ) -> BlockResult | None:
         """Run one bounded agent mini-run on the same workflow-run browser to finish the block's goal
         (narrowed to the failing step when one is confidently matched). Returns a BlockResult when a
         heal was attempted, or None to fall through to the caller's fail-closed path."""
         resolved_redaction_parameters = redaction_parameters or {}
+
+        def block_failure_reason(recovery_reason: str | None) -> str | None:
+            if trace is not None:
+                trace.recovery_failure_reason = recovery_reason
+            if not code_failure_reason:
+                return recovery_reason
+            code_reason = workflow_run_context.mask_secrets_in_data(code_failure_reason)
+            return f"{code_reason}\nAI fallback: {recovery_reason}" if recovery_reason else code_reason
+
         if not await self._ai_fallback_enabled(workflow_run_context):
             return None
         effective_classification = classification
@@ -8133,11 +8279,16 @@ async def wrapper({default_args}):
                 await record_task_nav_error_code(escalation_task.task_id, escalation_nav_error, escalation_url)
             elif failed_nav_error_code and not escalation_navigated:
                 skyvern_context.ensure_context().task_nav_error_codes[escalation_task.task_id] = failed_nav_error_code
-            escalation_task = await app.DATABASE.tasks.update_task(
-                task_id=escalation_task.task_id,
-                organization_id=organization_id,
-                status=TaskStatus.running,
-            )
+            if await run_lease_lost(workflow_run_id):
+                escalation_task = (
+                    await app.DATABASE.tasks.get_task(escalation_task.task_id, organization_id) or escalation_task
+                )
+            else:
+                escalation_task = await app.DATABASE.tasks.update_task(
+                    task_id=escalation_task.task_id,
+                    organization_id=organization_id,
+                    status=TaskStatus.running,
+                )
             escalation_step = await app.DATABASE.tasks.create_step(
                 escalation_task.task_id,
                 order=0,
@@ -8155,6 +8306,8 @@ async def wrapper({default_args}):
                 attempt_number=workflow_run_context.attempt_number,
                 label="Self-heal recovery",
                 block_type=BlockType.TASK,
+                # Dispatched on v3 below; script generation reads this column to keep v3 actions out.
+                engine=RunEngine.skyvern_v3,
             )
             recovery_block_id = recovery_block.workflow_run_block_id
 
@@ -8201,9 +8354,11 @@ async def wrapper({default_args}):
                 )
                 return await self.build_block_result(
                     success=False,
-                    failure_reason=_redact_codeblock_failure_text(
-                        f"Self-heal escalation did not reach a final status for block {self.label}",
-                        resolved_redaction_parameters,
+                    failure_reason=block_failure_reason(
+                        _redact_codeblock_failure_text(
+                            f"Self-heal escalation did not reach a final status for block {self.label}",
+                            resolved_redaction_parameters,
+                        )
                     ),
                     output_parameter_value=None,
                     status=BlockStatus.failed,
@@ -8235,7 +8390,7 @@ async def wrapper({default_args}):
                 )
                 return await self.build_block_result(
                     success=False,
-                    failure_reason=unsatisfied_reason,
+                    failure_reason=block_failure_reason(unsatisfied_reason),
                     output_parameter_value=None,
                     status=BlockStatus.failed,
                     workflow_run_block_id=workflow_run_block_id,
@@ -8246,7 +8401,9 @@ async def wrapper({default_args}):
             if updated_task.status == TaskStatus.completed:
                 # The block's value is what its own return would have been; downloads are bound by
                 # the recorder (_finalize_heal_result), the same as the inline success exit.
-                output_parameter_value = workflow_run_context.mask_secrets_in_data(updated_task.extracted_information)
+                output_parameter_value = without_generated_file_stamp(
+                    workflow_run_context.mask_secrets_in_data(updated_task.extracted_information)
+                )
                 if record_output_parameter:
                     await self.record_output_parameter_value(
                         workflow_run_context, workflow_run_id, output_parameter_value
@@ -8261,9 +8418,13 @@ async def wrapper({default_args}):
                     organization_id=organization_id,
                 )
             recovery_status = TASK_TO_BLOCK_STATUS.get(updated_task.status, BlockStatus.failed)
-            recovery_failure_reason = _redact_codeblock_failure_text(
-                updated_task.failure_reason or f"Self-heal escalation finished with status {updated_task.status}",
-                resolved_redaction_parameters,
+            # Redacted here, not only by build_block_result, because the child row and the heal episode
+            # also persist this sentence.
+            recovery_failure_reason = _redact_run_secrets(
+                _redact_codeblock_failure_text(
+                    updated_task.failure_reason or f"Self-heal escalation finished with status {updated_task.status}",
+                    resolved_redaction_parameters,
+                )
             )
             # Driver codes ride behind the recovery's own codes because its sentence cannot name them. The
             # recovery block repeats this failure_reason and is newer, so readers attribute codes from it.
@@ -8276,7 +8437,7 @@ async def wrapper({default_args}):
             )
             return await self.build_block_result(
                 success=False,
-                failure_reason=recovery_failure_reason,
+                failure_reason=block_failure_reason(recovery_failure_reason),
                 output_parameter_value=None,
                 status=recovery_status,
                 workflow_run_block_id=workflow_run_block_id,
@@ -8880,6 +9041,7 @@ async def wrapper({default_args}):
         # Read by the caller before this runs, since AI fallback can navigate away from the failing tab.
         sign_in_form_visible: bool = False,
         authored_code: str | None,
+        code_failure_reason: str | None,
     ) -> BlockResult:
         resolved_redaction_parameters = redaction_parameters or {}
         staged_frame: _StagedFrame | None = None
@@ -9133,6 +9295,7 @@ async def wrapper({default_args}):
                 trace=trace,
                 failed_nav_error_code=failed_nav_error_code,
                 authored_code=authored_code,
+                code_failure_reason=code_failure_reason,
             )
             recovery_wall_clock_ms = int((monotonic() - recovery_started_at) * 1000)
             await self._write_heal_episode_safe(
@@ -9150,7 +9313,9 @@ async def wrapper({default_args}):
                 failing_line=failing_line,
                 matched_step_index=matched_step_index,
                 failure_message=scrub_failure_value(
-                    recovery_result.failure_reason if recovery_result is not None else "floor_no_result"
+                    "floor_no_result"
+                    if recovery_result is None
+                    else trace.recovery_failure_reason or recovery_result.failure_reason
                 ),
                 wall_clock_ms=recovery_wall_clock_ms,
                 action_count=await _recovery_action_count(trace.escalation_task_id),
@@ -9246,6 +9411,23 @@ async def wrapper({default_args}):
         **kwargs: dict,
     ) -> BlockResult:
         await app.AGENT_FUNCTION.validate_code_block(organization_id=organization_id)
+        try:
+            await app.AGENT_FUNCTION.validate_block_execution(
+                block=self,
+                workflow_run_id=workflow_run_id,
+                workflow_run_block_id=workflow_run_block_id,
+                organization_id=organization_id,
+            )
+        except BlockTerminationError as e:
+            # Returned, not raised: execute() rewrites a raised error into a generic machinery failure.
+            return await self.build_block_result(
+                success=False,
+                failure_reason=get_user_facing_exception_message(e),
+                status=BlockStatus.failed,
+                workflow_run_block_id=workflow_run_block_id,
+                organization_id=organization_id,
+                can_continue_after_failure=False,
+            )
 
         block_context = skyvern_context.current()
         workflow_run_context = self.get_workflow_run_context(workflow_run_id)
@@ -9652,6 +9834,12 @@ async def wrapper({default_args}):
                         if recovery_nav_code and is_registered_secret(recovery_nav_code, workflow_run_context):
                             recovery_nav_code = None
 
+                        # The runner already scrubbed this text against the same serialized
+                        # parameters and guarded the fail-closed case, so re-scrubbing can only
+                        # no-op or empty it; fall back to what the runner reported.
+                        runner_reason = secure_failure.failure_reason or "Code block failed in the secure runner"
+                        secure_failure_reason = scrub_failure_reason(runner_reason, fallback=runner_reason) or ""
+
                         async def build_secure_failure_result() -> BlockResult:
                             engine_block_result = secure_code_block_result.block_result
                             if engine_block_result is not None:
@@ -9676,11 +9864,6 @@ async def wrapper({default_args}):
                                     organization_id=organization_id,
                                 )
                                 return engine_block_result
-                            # The runner already scrubbed this text against the same serialized
-                            # parameters and guarded the fail-closed case, so re-scrubbing can only
-                            # no-op or empty it; fall back to what the runner reported.
-                            runner_reason = secure_failure.failure_reason or "Code block failed in the secure runner"
-                            secure_failure_reason = scrub_failure_reason(runner_reason, fallback=runner_reason) or ""
                             secure_error_code = scrub_failure_reason(secure_failure.error_code, fallback="")
                             secure_error_codes = [secure_error_code] if secure_error_code else []
                             if secure_failure.nav_error_code and not is_registered_secret(
@@ -9728,6 +9911,7 @@ async def wrapper({default_args}):
                             secure_sign_in_form_visible = await page_shows_sign_in_form(page)
                         return await self._resolve_failure_with_heal(
                             authored_code=authored_code,
+                            code_failure_reason=secure_failure_reason,
                             exception=None,
                             failing_line=secure_failure.failing_line,
                             build_failure_result=build_secure_failure_result,
@@ -9945,6 +10129,7 @@ async def wrapper({default_args}):
                     registered_downloads=registered_downloads,
                     opened_pages=opened_pages,
                     browser_state=browser_state,
+                    browser_session_id=browser_session_id,
                 )
             except BaseException:
                 download_log.close()
@@ -10116,6 +10301,7 @@ async def wrapper({default_args}):
 
                 return await self._resolve_failure_with_heal(
                     authored_code=authored_code,
+                    code_failure_reason=None,
                     exception=e,
                     failing_line=failing_line,
                     build_failure_result=build_declared_failure_result,
@@ -10311,6 +10497,7 @@ async def wrapper({default_args}):
 
             return await self._resolve_failure_with_heal(
                 authored_code=authored_code,
+                code_failure_reason=failure_reason,
                 exception=e,
                 failing_line=failing_line,
                 build_failure_result=build_legacy_failure_result,
@@ -10338,13 +10525,11 @@ async def wrapper({default_args}):
             # would either crash registration or, via the default= fallback, replace the value with a
             # useless placeholder — normalize the wrapper family to its selector/marker first.
             result = json_safe_recorder_output(result)
-            result = json.loads(
-                json.dumps(result, default=lambda value: f"Object '{type(value)}' is not JSON serializable")
-            )
+            result = json.loads(json.dumps(result, default=json_safe_default))
             # Mask resolved secrets (OTP codes, passwords) a user assigned to a local before they
             # reach captured locals, the persisted output, or the logged value. Mirrors
             # HttpRequestBlock and is stronger than the name-based excluded_parameter_keys filter.
-            result = workflow_run_context.mask_secrets_in_data(result)
+            result = without_generated_file_stamp(workflow_run_context.mask_secrets_in_data(result))
 
             try:
                 downloaded_files, skipped_file_names = await self._register_downloaded_files(
@@ -11381,14 +11566,16 @@ class UploadToS3Block(Block):
                     if attempt_started_at is None
                     or is_file_from_retry_attempt(os.path.join(resolved_path, name), attempt_started_at)
                 ]
-                if len(files) > MAX_UPLOAD_FILE_COUNT:
-                    raise ValueError("Too many files in the directory, not uploading")
+                file_paths = []
                 for file in files:
-                    # if the file is a directory, we will not upload it
-                    if os.path.isdir(os.path.join(resolved_path, file)):
+                    file_path = os.path.join(resolved_path, file)
+                    if os.path.isdir(file_path):
                         LOG.warning("UploadToS3Block Skipping directory", file=file)
                         continue
-                    file_path = os.path.join(resolved_path, file)
+                    file_paths.append(file_path)
+                if len(file_paths) > MAX_UPLOAD_FILE_COUNT:
+                    raise ValueError("Too many files in the directory, not uploading")
+                for file_path in file_paths:
                     s3_uri = self._get_s3_uri(uploads_organization_id, workflow_run_id, file_path)
                     s3_uris.append(s3_uri)
                     await client.upload_file_from_path(uri=s3_uri, file_path=file_path)
@@ -12051,13 +12238,13 @@ class FileDestinationBlock(Block):
                 if attempt_started_at is None
                 or is_file_from_retry_attempt(os.path.join(download_files_path, name), attempt_started_at)
             ]
-            if len(files) > max_file_count:
-                raise ValueError(f"Too many files in the directory, not uploading. Max: {max_file_count}")
             for file in files:
                 if os.path.isdir(os.path.join(download_files_path, file)):
                     LOG.warning("FileUploadBlock Skipping directory", file=file)
                     continue
                 files_to_upload.append(os.path.join(download_files_path, file))
+            if len(files_to_upload) > max_file_count:
+                raise ValueError(f"Too many files in the directory, not uploading. Max: {max_file_count}")
         return files_to_upload
 
     async def _select_files_to_upload_with_prompt(
@@ -12679,6 +12866,149 @@ def _send_via_custom_smtp(
                 LOG.warning("SendEmailBlock Failed to close custom SMTP connection", exc_info=True)
 
 
+GMAIL_MAX_ATTACHMENT_TOTAL_MB = 25
+_GMAIL_EXECUTION_PATH_MAX_DEPTH = 32
+_GMAIL_RETRY_CHAIN_MAX_DEPTH = 32
+
+GMAIL_SEND_FAILURE_MESSAGES: dict[GmailSendErrorCode, str] = {
+    GmailSendErrorCode.CONFIGURATION: (
+        "No Gmail account is selected for this block, or the selected account no longer exists. "
+        "Choose a connected Gmail account that can send."
+    ),
+    GmailSendErrorCode.MISSING_SCOPE: (
+        "The selected Google account has not granted permission to send email. "
+        "Enable sending for it on the Integrations page."
+    ),
+    GmailSendErrorCode.RECONNECT: (
+        "The selected Google account must be reconnected on the Integrations page before it can send email."
+    ),
+    GmailSendErrorCode.NO_RECIPIENTS: "The email has no recipients. Add at least one To, Cc or Bcc address.",
+    GmailSendErrorCode.INVALID_RECIPIENT: "A recipient is not a valid email address.",
+    GmailSendErrorCode.INVALID_HEADER: (
+        "The subject or a recipient contains characters that are not allowed in an email header."
+    ),
+    GmailSendErrorCode.ATTACHMENT_INVALID: (
+        "An attachment could not be used. With Gmail each attachment must be one file from this run or one file "
+        "URL; folders and the download directory are not attached."
+    ),
+    GmailSendErrorCode.ATTACHMENT_TOO_LARGE: (
+        f"The attachments are larger than the {GMAIL_MAX_ATTACHMENT_TOTAL_MB} MB limit for Gmail."
+    ),
+    GmailSendErrorCode.TEMPLATE_ERROR: (
+        "A template in the email could not be rendered. Check the parameter names used in the recipients, "
+        "subject, body and attachments."
+    ),
+    GmailSendErrorCode.PROVIDER_REJECTED: "Gmail rejected the message. Nothing was sent.",
+    GmailSendErrorCode.RATE_LIMITED: (
+        "Gmail refused the message because the account reached a sending limit. Nothing was sent."
+    ),
+    GmailSendErrorCode.OUTCOME_UNKNOWN: (
+        "Gmail did not confirm whether the message was sent, and it was not retried. "
+        "Check the account's Sent folder before running this again."
+    ),
+    GmailSendErrorCode.INTERNAL_ERROR: "The email could not be prepared. Nothing was sent.",
+}
+
+_GMAIL_AUTHORIZATION_ERROR_CODES: dict[google_oauth_service.GmailSendAuthorizationStatus, GmailSendErrorCode] = {
+    google_oauth_service.GmailSendAuthorizationStatus.CONFIGURATION: GmailSendErrorCode.CONFIGURATION,
+    google_oauth_service.GmailSendAuthorizationStatus.MISSING_SCOPE: GmailSendErrorCode.MISSING_SCOPE,
+    google_oauth_service.GmailSendAuthorizationStatus.RECONNECT: GmailSendErrorCode.RECONNECT,
+    google_oauth_service.GmailSendAuthorizationStatus.UNAVAILABLE: GmailSendErrorCode.INTERNAL_ERROR,
+}
+
+
+class _GmailSendRefused(Exception):
+    def __init__(self, error_code: GmailSendErrorCode) -> None:
+        super().__init__(error_code.value)
+        self.error_code = error_code
+
+
+class _GmailSendStateUnreadable(Exception):
+    pass
+
+
+_GmailSendStateT = TypeVar("_GmailSendStateT")
+
+
+async def _gmail_send_state(operation: Awaitable[_GmailSendStateT]) -> _GmailSendStateT:
+    """Run one read or write of the send-once row; a failure leaves it unknown whether a message went out."""
+    try:
+        return await operation
+    except Exception as exc:
+        LOG.warning("SendEmailBlock could not read or write the Gmail send record", error_type=type(exc).__name__)
+        raise _GmailSendStateUnreadable from None
+
+
+def _add_file_attachment(msg: EmailMessage, path: str) -> None:
+    kind = filetype.guess(path)
+    if kind:
+        ctype = kind.mime
+        extension = kind.extension
+    else:
+        ctype = "application/octet-stream"
+        extension = None
+
+    maintype, subtype = ctype.split("/", 1)
+    attachment_path = Path(path)
+    attachment_filename = attachment_path.name
+    if not attachment_path.suffix and extension:
+        attachment_filename += f".{extension}"
+
+    LOG.info(
+        "SendEmailBlock Adding attachment",
+        filename=attachment_filename,
+        maintype=maintype,
+        subtype=subtype,
+    )
+    with open(path, "rb") as fp:
+        msg.add_attachment(
+            fp.read(),
+            maintype=maintype,
+            subtype=subtype,
+            filename=attachment_filename,
+        )
+
+
+def _build_gmail_message_bytes(
+    *,
+    from_address: str,
+    to: list[str],
+    cc: list[str],
+    bcc: list[str],
+    subject: str,
+    body: str,
+    body_format: EmailBodyFormat,
+    attachment_paths: list[str],
+) -> bytes:
+    msg = EmailMessage()
+    msg["From"] = from_address
+    for header, addresses in (("To", to), ("Cc", cc), ("Bcc", bcc)):
+        if addresses:
+            msg[header] = ", ".join(addresses)
+    msg["Subject"] = subject
+    email.set_body(msg, body, body_format)
+    for path in attachment_paths:
+        try:
+            _add_file_attachment(msg, path)
+        except (OSError, ValueError):
+            raise _GmailSendRefused(GmailSendErrorCode.ATTACHMENT_INVALID) from None
+    return msg.as_bytes(policy=SMTP_EMAIL_POLICY)
+
+
+def _gmail_result_from_dispatch(dispatch: GmailSendDispatch) -> GmailSendResult:
+    if dispatch.status == DISPATCH_ACCEPTED:
+        return GmailSendResult(GmailSendOutcome.ACCEPTED, provider_message_id=dispatch.provider_message_id)
+    if dispatch.status == DISPATCH_FAILED:
+        return GmailSendResult(
+            GmailSendOutcome.FAILED,
+            error_code=dispatch.error_code or GmailSendErrorCode.PROVIDER_REJECTED,
+            provider_status=dispatch.provider_status,
+            provider_reason=dispatch.provider_reason,
+        )
+    # A claim with no recorded outcome means an earlier attempt may have reached Gmail.
+    return GmailSendResult(GmailSendOutcome.UNKNOWN, error_code=GmailSendErrorCode.OUTCOME_UNKNOWN)
+
+
 class SendEmailBlock(Block):
     # There is a mypy bug with Literal. Without the type: ignore, mypy will raise an error:
     # Parameter 1 of Literal[...] cannot be of type "Any"
@@ -12703,10 +13033,18 @@ class SendEmailBlock(Block):
     # Encrypted at rest in the workflow definition (see secret_encryption.py); may also
     # reference a workflow secret parameter.
     custom_smtp_password: str | None = None
+    # Absent means SMTP. With gmail the message is sent from the connected Google account named by
+    # credential_id; sender and the smtp_* settings are not used.
+    transport: EmailTransport | None = None
+    credential_id: str | None = None
+    cc: list[str] = []
+    bcc: list[str] = []
 
     TEMPLATABLE_FIELDS: ClassVar[frozenset[str]] = frozenset(
         {
+            "bcc",
             "body",
+            "cc",
             "custom_smtp_host",
             "custom_smtp_username",
             "file_attachments",
@@ -12749,7 +13087,8 @@ class SendEmailBlock(Block):
         return parameters
 
     def format_potential_template_parameters(self, workflow_run_context: WorkflowRunContext) -> None:
-        self.sender = self.render_templatable_field("sender", self.sender, workflow_run_context)
+        if self.transport != EmailTransport.GMAIL:
+            self.sender = self.render_templatable_field("sender", self.sender, workflow_run_context)
         self.subject = self.render_templatable_field("subject", self.subject, workflow_run_context)
         self.body = self.render_templatable_field("body", self.body, workflow_run_context)
 
@@ -12759,6 +13098,8 @@ class SendEmailBlock(Block):
             formatted_recipient = self.render_templatable_field("recipients", recipient, workflow_run_context)
             formatted_recipients.append(formatted_recipient)
         self.recipients = formatted_recipients
+        self.cc = [self.render_templatable_field("cc", entry, workflow_run_context) for entry in self.cc]
+        self.bcc = [self.render_templatable_field("bcc", entry, workflow_run_context) for entry in self.bcc]
 
         if self.custom_smtp_host:
             self.custom_smtp_host = self.render_templatable_field(
@@ -12923,15 +13264,18 @@ class SendEmailBlock(Block):
 
         return file_paths
 
-    def get_real_email_recipients(self, workflow_run_context: WorkflowRunContext) -> list[str]:
+    @staticmethod
+    def _resolve_recipient_entries(entries: list[str], workflow_run_context: WorkflowRunContext) -> list[str]:
         resolved: list[str] = []
-        for recipient in self.recipients:
+        for recipient in entries:
             if workflow_run_context.has_parameter(recipient):
                 resolved.append(str(workflow_run_context.get_value(recipient)))
             else:
                 resolved.append(recipient)
+        return email.normalize_recipients(resolved)
 
-        recipients = email.normalize_recipients(resolved)
+    def get_real_email_recipients(self, workflow_run_context: WorkflowRunContext) -> list[str]:
+        recipients = self._resolve_recipient_entries(self.recipients, workflow_run_context)
         if not recipients:
             raise NoValidEmailRecipient()
         # An invalid entry fails the block: dropping it would deliver to a subset of the intended
@@ -12981,44 +13325,9 @@ class SendEmailBlock(Block):
             if not path:
                 raise FileNotFoundError(f"File not found: {filename}")
 
-            # Guess the content type based on the file's extension.  Encoding
-            # will be ignored, although we should check for simple things like
-            # gzip'd or compressed files.
-            kind = filetype.guess(path)
-            if kind:
-                ctype = kind.mime
-                extension = kind.extension
-            else:
-                # No guess could be made, or the file is encoded (compressed), so
-                # use a generic bag-of-bits type.
-                ctype = "application/octet-stream"
-                extension = None
-
-            maintype, subtype = ctype.split("/", 1)
-            attachment_path = Path(path)
-            attachment_filename = attachment_path.name
-
-            # Check if the filename has an extension
-            if not attachment_path.suffix:
-                # If no extension, guess it based on the MIME type
-                if extension:
-                    attachment_filename += f".{extension}"
-
-            LOG.info(
-                "SendEmailBlock Adding attachment",
-                filename=attachment_filename,
-                maintype=maintype,
-                subtype=subtype,
-            )
-            with open(path, "rb") as fp:
-                msg.add_attachment(
-                    fp.read(),
-                    maintype=maintype,
-                    subtype=subtype,
-                    filename=attachment_filename,
-                )
-                file_hash = calculate_sha256_for_file(path)
-                file_names_by_hash[file_hash].append(path)
+            _add_file_attachment(msg, path)
+            file_hash = calculate_sha256_for_file(path)
+            file_names_by_hash[file_hash].append(path)
 
         # Calculate file stats based on content hashes
         total_files = sum(len(files) for files in file_names_by_hash.values())
@@ -13035,6 +13344,285 @@ class SendEmailBlock(Block):
 
         return msg
 
+    async def _gmail_execution_key(self, workflow_run_block_id: str, organization_id: str) -> str:
+        """Identify this logical execution by its label and the iteration of every enclosing loop."""
+        # Only loop rows count: the engine nests a branch target under its conditional's row and cached code does not.
+        loop_path: list[tuple[str | None, int | None]] = []
+        child_index: int | None = None
+        block_id: str | None = workflow_run_block_id
+        for depth in range(_GMAIL_EXECUTION_PATH_MAX_DEPTH):
+            if block_id is None:
+                break
+            row = await app.DATABASE.observer.get_workflow_run_block(block_id, organization_id=organization_id)
+            if depth and row.block_type in (BlockType.FOR_LOOP, BlockType.WHILE_LOOP):
+                loop_path.append((row.label, child_index))
+            child_index = row.current_index
+            block_id = row.parent_workflow_run_block_id
+        if block_id is not None:
+            raise RuntimeError("workflow run block nesting is deeper than the supported limit")
+        return hashlib.sha256(json.dumps([self.label, loop_path]).encode()).hexdigest()
+
+    @staticmethod
+    async def _gmail_root_run_id(workflow_run_id: str, organization_id: str) -> str | None:
+        """The first run of this run's credential-fallback retry chain, or None when the chain is too long."""
+        run_id = workflow_run_id
+        for _ in range(_GMAIL_RETRY_CHAIN_MAX_DEPTH):
+            run = await app.DATABASE.workflow_runs.get_workflow_run(run_id, organization_id=organization_id)
+            if run is None:
+                raise RuntimeError("a workflow run in the retry chain was not found")
+            if not run.retried_from_workflow_run_id:
+                return run_id
+            run_id = run.retried_from_workflow_run_id
+        return None
+
+    async def _resolve_gmail_attachments(
+        self,
+        workflow_run_context: WorkflowRunContext,
+        workflow_run_id: str,
+        organization_id: str,
+        staging_dir: str,
+    ) -> list[str]:
+        """Resolve each listed entry to exactly one local file, checking sizes before any bytes are read."""
+        context = skyvern_context.current()
+        run_id = context.run_id if context and context.run_id else workflow_run_id
+        max_total_bytes = GMAIL_MAX_ATTACHMENT_TOTAL_MB * 1024 * 1024
+        total_bytes = 0
+        paths: list[str] = []
+        for entry in self.file_attachments:
+            if not entry.strip():
+                continue
+            if workflow_run_context.has_parameter(entry):
+                value = workflow_run_context.get_value(entry)
+                value = workflow_run_context.get_original_secret_value_or_none(value) or value
+                if not isinstance(value, str):
+                    raise _GmailSendRefused(GmailSendErrorCode.ATTACHMENT_INVALID)
+                entry = value
+            try:
+                entry = self.render_templatable_field("file_attachments", entry, workflow_run_context)
+            except Exception:
+                raise _GmailSendRefused(GmailSendErrorCode.TEMPLATE_ERROR) from None
+            if not entry.strip() or entry == settings.WORKFLOW_DOWNLOAD_DIRECTORY_PARAMETER_KEY:
+                raise _GmailSendRefused(GmailSendErrorCode.ATTACHMENT_INVALID)
+            try:
+                if is_remote_url(entry) or is_uploaded_file_id(entry):
+                    # Its own folder, so two entries with one file name both keep that name.
+                    entry_dir = tempfile.mkdtemp(dir=staging_dir)
+                    path = await download_file(
+                        entry,
+                        max_size_mb=GMAIL_MAX_ATTACHMENT_TOTAL_MB,
+                        output_dir=entry_dir,
+                        organization_id=organization_id,
+                        preserve_existing_files=True,
+                        staging_dir=entry_dir,
+                        limit_managed_file_size=True,
+                    )
+                else:
+                    path = validate_local_file_path(entry, run_id)
+            except DownloadFileMaxSizeExceeded:
+                raise _GmailSendRefused(GmailSendErrorCode.ATTACHMENT_TOO_LARGE) from None
+            except Exception:
+                raise _GmailSendRefused(GmailSendErrorCode.ATTACHMENT_INVALID) from None
+            if not os.path.isfile(path):
+                raise _GmailSendRefused(GmailSendErrorCode.ATTACHMENT_INVALID)
+            total_bytes += os.path.getsize(path)
+            if total_bytes > max_total_bytes:
+                raise _GmailSendRefused(GmailSendErrorCode.ATTACHMENT_TOO_LARGE)
+            paths.append(path)
+        return paths
+
+    async def _send_via_gmail(
+        self,
+        workflow_run_context: WorkflowRunContext,
+        workflow_run_id: str,
+        workflow_run_block_id: str,
+        organization_id: str,
+    ) -> tuple[GmailSendResult, bool]:
+        # Read first, before anything that can fail differently on a re-run, so a replay always reports what happened.
+        # The record is kept under the retry chain's first run: a credential-fallback retry is a new run that
+        # repeats the same logical sends.
+        record_run_id = await _gmail_send_state(self._gmail_root_run_id(workflow_run_id, organization_id))
+        if record_run_id is None:
+            raise _GmailSendRefused(GmailSendErrorCode.INTERNAL_ERROR)
+        execution_key = await _gmail_send_state(self._gmail_execution_key(workflow_run_block_id, organization_id))
+        existing = await _gmail_send_state(
+            app.DATABASE.google_oauth.get_gmail_send_dispatch(record_run_id, execution_key)
+        )
+        # Gmail rejected a failed row's message outright, so only that state may be attempted again.
+        if existing is not None and existing.status != DISPATCH_FAILED:
+            return _gmail_result_from_dispatch(existing), True
+
+        try:
+            self.format_potential_template_parameters(workflow_run_context)
+        except Exception:
+            raise _GmailSendRefused(GmailSendErrorCode.TEMPLATE_ERROR) from None
+
+        credential_id = (self.credential_id or "").strip()
+        if not credential_id:
+            raise _GmailSendRefused(GmailSendErrorCode.CONFIGURATION)
+        to = self._resolve_recipient_entries(self.recipients, workflow_run_context)
+        cc = self._resolve_recipient_entries(self.cc, workflow_run_context)
+        bcc = self._resolve_recipient_entries(self.bcc, workflow_run_context)
+        if not (to or cc or bcc):
+            raise _GmailSendRefused(GmailSendErrorCode.NO_RECIPIENTS)
+        try:
+            email.validate_recipients([*to, *cc, *bcc])
+        except ValueError:
+            raise _GmailSendRefused(GmailSendErrorCode.INVALID_RECIPIENT) from None
+        # The header encoder would split a non-ASCII address into an encoded word that is no longer an address.
+        if not all(address.isascii() for address in (*to, *cc, *bcc)):
+            raise _GmailSendRefused(GmailSendErrorCode.INVALID_RECIPIENT)
+        # Downloaded attachments are staged where only this send writes: the shared temp folder names a file by
+        # its base name alone, so another entry or another run could replace it before it is read.
+        with tempfile.TemporaryDirectory(
+            prefix="gmail_send_",
+            dir=get_run_temp_dir(organization_id, workflow_run_id),
+            ignore_cleanup_errors=True,
+        ) as staging_dir:
+            attachment_paths = await self._resolve_gmail_attachments(
+                workflow_run_context, workflow_run_id, organization_id, staging_dir
+            )
+
+            authorization = await google_oauth_service.resolve_gmail_send_authorization(organization_id, credential_id)
+            if (
+                authorization.status != google_oauth_service.GmailSendAuthorizationStatus.READY
+                or not authorization.access_token
+                or not authorization.from_address
+            ):
+                raise _GmailSendRefused(
+                    _GMAIL_AUTHORIZATION_ERROR_CODES.get(authorization.status, GmailSendErrorCode.INTERNAL_ERROR)
+                )
+
+            body = self.body
+            if body and workflow_run_context.has_parameter(body) and workflow_run_context.has_value(body):
+                body = str(workflow_run_context.get_value(body))
+            try:
+                mime_bytes = await asyncio.to_thread(
+                    _build_gmail_message_bytes,
+                    from_address=authorization.from_address,
+                    to=to,
+                    cc=cc,
+                    bcc=bcc,
+                    subject=self.subject.strip().replace("\n", "").replace("\r", ""),
+                    body=body,
+                    body_format=self.body_format,
+                    attachment_paths=attachment_paths,
+                )
+            except ValueError:
+                raise _GmailSendRefused(GmailSendErrorCode.INVALID_HEADER) from None
+        if len(mime_bytes) > GMAIL_MAX_MESSAGE_BYTES:
+            raise _GmailSendRefused(GmailSendErrorCode.ATTACHMENT_TOO_LARGE)
+
+        if existing is None:
+            claim = await _gmail_send_state(
+                app.DATABASE.google_oauth.claim_gmail_send_dispatch(
+                    organization_id=organization_id,
+                    workflow_run_id=record_run_id,
+                    execution_key=execution_key,
+                    block_label=self.label,
+                    credential_id=credential_id,
+                )
+            )
+            dispatch_id = claim.gmail_send_dispatch_id if claim else None
+        else:
+            reclaimed = await _gmail_send_state(
+                app.DATABASE.google_oauth.reclaim_failed_gmail_send_dispatch(
+                    gmail_send_dispatch_id=existing.gmail_send_dispatch_id,
+                    observed_modified_at=existing.modified_at,
+                    credential_id=credential_id,
+                )
+            )
+            dispatch_id = existing.gmail_send_dispatch_id if reclaimed else None
+        if dispatch_id is None:
+            winner = await _gmail_send_state(
+                app.DATABASE.google_oauth.get_gmail_send_dispatch(record_run_id, execution_key)
+            )
+            if winner is None:
+                return GmailSendResult(GmailSendOutcome.UNKNOWN, error_code=GmailSendErrorCode.OUTCOME_UNKNOWN), True
+            return _gmail_result_from_dispatch(winner), True
+
+        # From here the claim row is the record: a cancellation or crash leaves it unresolved, which reads as unknown.
+        try:
+            result = await send_raw_message(authorization.access_token, mime_bytes)
+        except Exception:
+            result = GmailSendResult(GmailSendOutcome.UNKNOWN, error_code=GmailSendErrorCode.OUTCOME_UNKNOWN)
+        try:
+            await app.DATABASE.google_oauth.finalize_gmail_send_dispatch(
+                gmail_send_dispatch_id=dispatch_id,
+                status=result.outcome.value,
+                provider_message_id=result.provider_message_id,
+                error_code=result.error_code,
+                provider_status=result.provider_status,
+                provider_reason=result.provider_reason,
+            )
+        except Exception as exc:
+            LOG.warning(
+                "SendEmailBlock failed to record the Gmail send outcome",
+                workflow_run_id=workflow_run_id,
+                block_label=self.label,
+                outcome=result.outcome.value,
+                error_type=type(exc).__name__,
+            )
+        return result, False
+
+    async def _execute_gmail(
+        self,
+        workflow_run_context: WorkflowRunContext,
+        workflow_run_id: str,
+        workflow_run_block_id: str,
+        organization_id: str | None,
+    ) -> BlockResult:
+        replayed = False
+        try:
+            if not organization_id:
+                raise _GmailSendRefused(GmailSendErrorCode.CONFIGURATION)
+            result, replayed = await self._send_via_gmail(
+                workflow_run_context, workflow_run_id, workflow_run_block_id, organization_id
+            )
+        except _GmailSendRefused as refusal:
+            result = GmailSendResult(GmailSendOutcome.FAILED, error_code=refusal.error_code)
+        except _GmailSendStateUnreadable:
+            result = GmailSendResult(GmailSendOutcome.UNKNOWN, error_code=GmailSendErrorCode.OUTCOME_UNKNOWN)
+        except Exception as exc:
+            # No exception text or traceback: both can carry recipients, message text or provider responses.
+            LOG.warning(
+                "SendEmailBlock Gmail send could not be prepared",
+                workflow_run_id=workflow_run_id,
+                block_label=self.label,
+                error_type=type(exc).__name__,
+            )
+            result = GmailSendResult(GmailSendOutcome.FAILED, error_code=GmailSendErrorCode.INTERNAL_ERROR)
+
+        accepted = result.outcome == GmailSendOutcome.ACCEPTED
+        LOG.info(
+            "SendEmailBlock Gmail send finished",
+            workflow_run_id=workflow_run_id,
+            block_label=self.label,
+            outcome=result.outcome.value,
+            error_code=result.error_code.value if result.error_code else None,
+            provider_status=result.provider_status,
+            provider_reason=result.provider_reason,
+            replayed=replayed,
+        )
+        result_dict = {
+            "success": accepted,
+            "transport": EmailTransport.GMAIL.value,
+            "outcome": result.outcome.value,
+            "provider_message_id": result.provider_message_id,
+            "error_code": result.error_code.value if result.error_code else None,
+            "replayed": replayed,
+        }
+        await self.record_output_parameter_value(workflow_run_context, workflow_run_id, result_dict)
+        return await self.build_block_result(
+            success=accepted,
+            failure_reason=None
+            if accepted
+            else GMAIL_SEND_FAILURE_MESSAGES[result.error_code or GmailSendErrorCode.INTERNAL_ERROR],
+            output_parameter_value=result_dict,
+            status=BlockStatus.completed if accepted else BlockStatus.failed,
+            workflow_run_block_id=workflow_run_block_id,
+            organization_id=organization_id,
+        )
+
     async def execute(
         self,
         workflow_run_id: str,
@@ -13044,6 +13632,10 @@ class SendEmailBlock(Block):
         **kwargs: dict,
     ) -> BlockResult:
         workflow_run_context = self.get_workflow_run_context(workflow_run_id)
+        if self.transport == EmailTransport.GMAIL:
+            return await self._execute_gmail(
+                workflow_run_context, workflow_run_id, workflow_run_block_id, organization_id
+            )
         await app.DATABASE.observer.update_workflow_run_block(
             workflow_run_block_id=workflow_run_block_id,
             organization_id=organization_id,
@@ -13166,6 +13758,32 @@ async def _run_blocking_parse_step(
         raise FileParseTimeout(file_url=file_url, step=step, timeout_seconds=FILE_PARSE_STEP_TIMEOUT_SECONDS)
 
 
+class _FileParserLLMTimeout(TimeoutError):
+    pass
+
+
+@contextlib.asynccontextmanager
+async def _file_parser_llm_deadline(step: str, file_url: str, llm_key: str | None) -> AsyncIterator[None]:
+    """Bound one file-parser LLM call by wall-clock time, so a stalled provider fails the block."""
+    try:
+        async with asyncio.timeout(FILE_PARSER_LLM_CALL_TIMEOUT_SECONDS) as deadline:
+            yield
+    except TimeoutError:
+        # A TimeoutError this scope did not raise came from inside the handler; relabelling it would bury its cause.
+        if not deadline.expired():
+            raise
+        LOG.warning(
+            "File parser LLM call exceeded its time budget",
+            step=step,
+            timeout_seconds=FILE_PARSER_LLM_CALL_TIMEOUT_SECONDS,
+            file_url=_log_safe_url(file_url),
+            llm_key=llm_key,
+        )
+        raise _FileParserLLMTimeout(
+            f"The model did not answer within {FILE_PARSER_LLM_CALL_TIMEOUT_SECONDS} seconds during {step}."
+        ) from None
+
+
 # csv.field_size_limit is process-global. Raising it once at import (rather than
 # set/restore around each parse) avoids a race between concurrent CSV parses on
 # separate worker threads stepping on each other's limit.
@@ -13263,6 +13881,7 @@ class FileParserBlock(Block):
     file_type: FileType = FileType.AUTO_DETECT
     json_schema: dict[str, Any] | None = None
     worksheet: str | None = None
+    force_ocr: bool = Field(default=False, description=FORCE_OCR_DESCRIPTION)
     schema_validation_max_attempts: ClassVar[int] = SCHEMA_VALIDATION_MAX_ATTEMPTS
     ocr_validation_max_attempts: ClassVar[int] = SCHEMA_VALIDATION_MAX_ATTEMPTS
     _telemetry: FileParserTelemetry = PrivateAttr(default_factory=FileParserTelemetry)
@@ -13643,32 +14262,52 @@ class FileParserBlock(Block):
     ) -> str:
         """Parse PDF file and return extracted text.
 
-        Uses the shared PDF parsing utility that tries pypdf first,
-        then falls back to pdfplumber if pypdf fails. If text extraction
-        yields empty/minimal content (e.g. scanned or image-based PDFs),
-        renders pages as images and sends them to a vision LLM for OCR.
+        Uses the shared PDF parsing utility that tries pypdf first, then falls back to
+        pdfplumber if pypdf fails. When the text layer cannot be trusted — it is empty
+        (scanned or image-based PDF), its glyphs are scrambled by a broken embedded font,
+        or the block asks for OCR outright — renders pages as images and sends them to a
+        vision LLM for OCR instead.
         """
-        try:
-            extracted_text = await _run_blocking_parse_step(
-                "PDF text extraction",
-                self.file_url,
-                extract_pdf_file,
-                file_path,
-                file_identifier=self.file_url,
-            )
-        except PDFParsingError as e:
-            raise InvalidFileType(file_url=self.file_url, file_type=self.file_type, error=str(e))
+        extracted_text = ""
+        ocr_reason: str | None = None
+        if self.force_ocr:
+            ocr_reason = "the block is configured to always OCR PDFs"
+        else:
+            try:
+                extracted_text = await _run_blocking_parse_step(
+                    "PDF text extraction",
+                    self.file_url,
+                    extract_pdf_file,
+                    file_path,
+                    file_identifier=self.file_url,
+                )
+            except PDFParsingError as e:
+                raise InvalidFileType(file_url=self.file_url, file_type=self.file_type, error=str(e))
 
-        # If text extraction returned meaningful content, use it directly
-        if extracted_text.strip():
-            return extracted_text
+            if not extracted_text.strip():
+                ocr_reason = "PDF text extraction returned empty content"
+            else:
+                # A scrambled text layer is worse than an empty one: it reaches the extraction
+                # LLM as plausible text, which then invents values for the characters it cannot
+                # read. Only OCR recovers the real ones. The scan is per-character over a text
+                # layer that can reach a million characters, so it stays off the event loop.
+                ocr_reason = await _run_blocking_parse_step(
+                    "PDF text layer check",
+                    self.file_url,
+                    scrambled_text_layer_reason,
+                    extracted_text,
+                )
 
-        # Scanned / image-based PDF — render pages as images and OCR each page in
-        # its own vision-LLM call. A single call covering every page collapses a
-        # multi-page document down to the first page or two.
+            if ocr_reason is None:
+                return extracted_text
+
+        # Render pages as images and OCR each page in its own vision-LLM call. A single
+        # call covering every page collapses a multi-page document down to the first page
+        # or two.
         LOG.info(
-            "PDF text extraction returned empty content, falling back to vision LLM OCR",
+            "Falling back to vision LLM OCR for the PDF text layer",
             file_url=self.file_url,
+            ocr_reason=ocr_reason,
         )
         try:
             page_images = await _run_blocking_parse_step(
@@ -13731,6 +14370,7 @@ class FileParserBlock(Block):
         llm_api_handler = LLMAPIHandlerFactory.get_override_llm_api_handler(
             self.override_llm_key_for_organization(organization_id), default=default_handler
         )
+        llm_key = _handler_llm_key(llm_api_handler)
         semaphore = asyncio.Semaphore(PDF_OCR_PAGE_CONCURRENCY)
 
         async def _ocr_page(page_image: bytes) -> str:
@@ -13740,15 +14380,16 @@ class FileParserBlock(Block):
                     try:
                         # OCR transcription intentionally skips system_prompt; it still applies
                         # to the downstream extract-information-from-file-text call.
-                        llm_response = await llm_api_handler(
-                            prompt=prompt_for_attempt,
-                            prompt_name="extract-text-from-image",
-                            screenshots=[page_image],
-                            # Schema validation must inspect the raw parsed root; dict coercion can hide bad OCR JSON.
-                            force_dict=False,
-                            workflow_run_block_id=workflow_run_block_id,
-                            organization_id=organization_id,
-                        )
+                        async with _file_parser_llm_deadline("PDF page OCR", self.file_url, llm_key=llm_key):
+                            llm_response = await llm_api_handler(
+                                prompt=prompt_for_attempt,
+                                prompt_name="extract-text-from-image",
+                                screenshots=[page_image],
+                                # Schema validation must inspect the raw parsed root; dict coercion can hide bad OCR JSON.
+                                force_dict=False,
+                                workflow_run_block_id=workflow_run_block_id,
+                                organization_id=organization_id,
+                            )
                     except (InvalidLLMResponseFormat, InvalidLLMResponseType) as e:
                         failure_reason = _llm_response_format_failure_reason(e)
                         will_retry = attempt + 1 < self.ocr_validation_max_attempts
@@ -13783,11 +14424,31 @@ class FileParserBlock(Block):
                     prompt_for_attempt = self._build_ocr_validation_retry_prompt(llm_prompt, ocr_failure_reason)
                 raise RuntimeError("OCR retry loop exhausted without returning or raising.")
 
-        page_results = await asyncio.gather(
-            *(_ocr_page(page_image) for page_image in page_images),
-            return_exceptions=True,
-        )
+        try:
+            async with asyncio.timeout(PDF_OCR_TOTAL_TIMEOUT_SECONDS) as ocr_deadline:
+                page_results = await asyncio.gather(
+                    *(_ocr_page(page_image) for page_image in page_images),
+                    return_exceptions=True,
+                )
+        except TimeoutError:
+            if not ocr_deadline.expired():
+                raise
+            LOG.warning(
+                "File parser PDF OCR exceeded its time budget",
+                timeout_seconds=PDF_OCR_TOTAL_TIMEOUT_SECONDS,
+                pages=len(page_images),
+                file_url=_log_safe_url(self.file_url),
+                llm_key=llm_key,
+            )
+            raise _FileParserLLMTimeout(
+                f"The model did not transcribe the PDF's {len(page_images)} pages within "
+                f"{PDF_OCR_TOTAL_TIMEOUT_SECONDS} seconds."
+            ) from None
 
+        # A page the model never answered would silently drop its text from the extraction, so it fails the block.
+        stalled_pages = [r for r in page_results if isinstance(r, _FileParserLLMTimeout)]
+        if stalled_pages:
+            raise stalled_pages[0]
         # A total OCR outage must fail the block, not record an empty success — match the
         # prior single-call path, which propagated OCR errors. Partial failures are skipped below.
         errors = [r for r in page_results if isinstance(r, BaseException)]
@@ -13856,20 +14517,22 @@ class FileParserBlock(Block):
             llm_api_handler = LLMAPIHandlerFactory.get_override_llm_api_handler(
                 self.override_llm_key_for_organization(organization_id), default=default_handler
             )
+            llm_key = _handler_llm_key(llm_api_handler)
             # OCR transcription intentionally skips system_prompt — see
             # _parse_pdf_file_with_vision_ocr for rationale.
             prompt_for_attempt = llm_prompt
             for attempt in range(self.ocr_validation_max_attempts):
                 try:
-                    llm_response = await llm_api_handler(
-                        prompt=prompt_for_attempt,
-                        prompt_name="extract-text-from-image",
-                        screenshots=[image_bytes],
-                        # Schema validation must inspect the raw parsed root; dict coercion can hide bad OCR JSON.
-                        force_dict=False,
-                        workflow_run_block_id=workflow_run_block_id,
-                        organization_id=organization_id,
-                    )
+                    async with _file_parser_llm_deadline("image OCR", self.file_url, llm_key=llm_key):
+                        llm_response = await llm_api_handler(
+                            prompt=prompt_for_attempt,
+                            prompt_name="extract-text-from-image",
+                            screenshots=[image_bytes],
+                            # Schema validation must inspect the raw parsed root; dict coercion can hide bad OCR JSON.
+                            force_dict=False,
+                            workflow_run_block_id=workflow_run_block_id,
+                            organization_id=organization_id,
+                        )
                 except (InvalidLLMResponseFormat, InvalidLLMResponseType) as e:
                     failure_reason = _llm_response_format_failure_reason(e)
                     will_retry = attempt + 1 < self.ocr_validation_max_attempts
@@ -14224,15 +14887,16 @@ class FileParserBlock(Block):
         for attempt in range(self.schema_validation_max_attempts):
             telemetry.extraction_attempts = attempt + 1
             try:
-                llm_response = await llm_api_handler(
-                    prompt=prompt_for_attempt,
-                    prompt_name="extract-information-from-file-text",
-                    # Schema validation must inspect the raw parsed root; dict coercion can hide wrong-root responses.
-                    force_dict=False,
-                    system_prompt=self.workflow_system_prompt,
-                    workflow_run_block_id=workflow_run_block_id,
-                    organization_id=organization_id,
-                )
+                async with _file_parser_llm_deadline("AI extraction", self.file_url, llm_key=telemetry.llm_key):
+                    llm_response = await llm_api_handler(
+                        prompt=prompt_for_attempt,
+                        prompt_name="extract-information-from-file-text",
+                        # Schema validation must inspect the raw parsed root; dict coercion can hide wrong-root responses.
+                        force_dict=False,
+                        system_prompt=self.workflow_system_prompt,
+                        workflow_run_block_id=workflow_run_block_id,
+                        organization_id=organization_id,
+                    )
             except (InvalidLLMResponseFormat, InvalidLLMResponseType) as e:
                 failure_reason = _llm_response_format_failure_reason(e)
                 will_retry = attempt + 1 < self.schema_validation_max_attempts
@@ -14724,15 +15388,27 @@ class PDFParserBlock(Block):
         )
 
         llm_response: dict[str, Any] | list | str | None = None
+        llm_api_handler = get_org_aware_primary_llm_api_handler(default=app.LLM_API_HANDLER)
+        llm_key = _handler_llm_key(llm_api_handler)
         prompt_for_attempt = llm_prompt
         for attempt in range(self.schema_validation_max_attempts):
             try:
-                llm_response = await get_org_aware_primary_llm_api_handler(default=app.LLM_API_HANDLER)(
-                    prompt=prompt_for_attempt,
-                    prompt_name="extract-information-from-file-text",
-                    # Schema validation must inspect the raw parsed root; dict coercion can hide wrong-root responses.
-                    force_dict=False,
-                    system_prompt=self.workflow_system_prompt,
+                async with _file_parser_llm_deadline("AI extraction", self.file_url, llm_key=llm_key):
+                    llm_response = await llm_api_handler(
+                        prompt=prompt_for_attempt,
+                        prompt_name="extract-information-from-file-text",
+                        # Schema validation must inspect the raw parsed root; dict coercion can hide wrong-root responses.
+                        force_dict=False,
+                        system_prompt=self.workflow_system_prompt,
+                        workflow_run_block_id=workflow_run_block_id,
+                        organization_id=organization_id,
+                    )
+            except _FileParserLLMTimeout as e:
+                return await self.build_block_result(
+                    success=False,
+                    failure_reason=str(e),
+                    output_parameter_value=None,
+                    status=BlockStatus.failed,
                     workflow_run_block_id=workflow_run_block_id,
                     organization_id=organization_id,
                 )
@@ -14982,6 +15658,15 @@ class HumanInteractionBlock(BaseTaskBlock):
             browser_session_id=browser_session_id,
         )
 
+        if await run_lease_lost(workflow_run_id):
+            return await self.build_block_result(
+                success=False,
+                failure_reason="Another server already finalized this run",
+                output_parameter_value=None,
+                status=BlockStatus.failed,
+                workflow_run_block_id=workflow_run_block_id,
+                organization_id=organization_id,
+            )
         await app.DATABASE.workflow_runs.update_workflow_run(
             workflow_run_id=workflow_run_id,
             status=WorkflowRunStatus.paused,
@@ -15071,7 +15756,69 @@ class HumanInteractionBlock(BaseTaskBlock):
                 )
                 log_that_we_are_waiting = False
 
-            # Check if timeout_seconds has elapsed
+            # Run status is read before the session because cancel paths also close the session.
+            workflow_run = await app.DATABASE.workflow_runs.get_workflow_run(
+                workflow_run_id=workflow_run_id,
+                organization_id=organization_id,
+            )
+
+            if workflow_run and workflow_run.status != WorkflowRunStatus.paused:
+                LOG.info(
+                    "Workflow run status changed from paused",
+                    workflow_run_id=workflow_run_id,
+                    new_status=workflow_run.status,
+                    browser_session_id=browser_session_id,
+                )
+
+                if workflow_run.status == WorkflowRunStatus.running:
+                    success, status = True, BlockStatus.completed
+                elif workflow_run.status == WorkflowRunStatus.canceled:
+                    success, status = False, BlockStatus.canceled
+                elif workflow_run.status == WorkflowRunStatus.terminated:
+                    success, status = False, BlockStatus.terminated
+                else:
+                    success, status = False, BlockStatus.failed
+                reason = f"status_changed:{workflow_run.status}"
+                workflow_run_context = self.get_workflow_run_context(workflow_run_id)
+                result_dict = {"success": success, "reason": reason}
+
+                await self.record_output_parameter_value(workflow_run_context, workflow_run_id, result_dict)
+
+                return await self.build_block_result(
+                    success=success,
+                    failure_reason=None if success else reason,
+                    output_parameter_value=result_dict,
+                    status=status,
+                    workflow_run_block_id=workflow_run_block_id,
+                    organization_id=organization_id,
+                )
+
+            if browser_session_id and organization_id:
+                browser_session = await app.DATABASE.browser_sessions.get_persistent_browser_session(
+                    browser_session_id, organization_id
+                )
+                if browser_session and browser_session.completed_at:
+                    LOG.info(
+                        "Browser session closed while waiting for human interaction",
+                        workflow_run_id=workflow_run_id,
+                        browser_session_id=browser_session_id,
+                    )
+
+                    workflow_run_context = self.get_workflow_run_context(workflow_run_id)
+                    reason = "Browser session was closed while waiting for human interaction"
+                    result_dict = {"success": False, "reason": reason}
+
+                    await self.record_output_parameter_value(workflow_run_context, workflow_run_id, result_dict)
+
+                    return await self.build_block_result(
+                        success=False,
+                        failure_reason=reason,
+                        output_parameter_value=result_dict,
+                        status=BlockStatus.failed,
+                        workflow_run_block_id=workflow_run_block_id,
+                        organization_id=organization_id,
+                    )
+
             if elapsed_time_seconds >= self.timeout_seconds:
                 LOG.info(
                     "Human Interaction block timeout_seconds reached",
@@ -15092,33 +15839,6 @@ class HumanInteractionBlock(BaseTaskBlock):
                     failure_reason=reason,
                     output_parameter_value=result_dict,
                     status=BlockStatus.timed_out,
-                    workflow_run_block_id=workflow_run_block_id,
-                    organization_id=organization_id,
-                )
-
-            workflow_run = await app.DATABASE.workflow_runs.get_workflow_run(
-                workflow_run_id=workflow_run_id,
-                organization_id=organization_id,
-            )
-
-            if workflow_run and workflow_run.status != WorkflowRunStatus.paused:
-                LOG.info(
-                    "Workflow run status changed from paused",
-                    workflow_run_id=workflow_run_id,
-                    new_status=workflow_run.status,
-                    browser_session_id=browser_session_id,
-                )
-
-                workflow_run_context = self.get_workflow_run_context(workflow_run_id)
-                result_dict = {"success": True, "reason": f"status_changed:{workflow_run.status}"}
-
-                await self.record_output_parameter_value(workflow_run_context, workflow_run_id, result_dict)
-
-                return await self.build_block_result(
-                    success=True,
-                    failure_reason=None,
-                    output_parameter_value=result_dict,
-                    status=BlockStatus.completed,
                     workflow_run_block_id=workflow_run_block_id,
                     organization_id=organization_id,
                 )
@@ -19390,13 +20110,14 @@ class V3AbIneligibleReason(StrEnum):
     eligible" but not "why not."
     """
 
-    script_run = "script_run"
     pinned_engine = "pinned_engine"
+    # An explicit request to generate code from this run; v3 actions cannot produce a usable script.
+    code_generation_requested = "code_generation_requested"
     unsupported_block = "unsupported_block"
     no_reroutable_blocks = "no_reroutable_blocks"
 
 
-def v3_ab_ineligibility_reason(blocks: list[BlockTypeVar], *, is_script_run: bool) -> V3AbIneligibleReason | None:
+def v3_ab_ineligibility_reason(blocks: list[BlockTypeVar]) -> V3AbIneligibleReason | None:
     """Why a whole workflow run may not be rerouted onto v3 by the A/B, or None if it may.
 
     Eligibility is a property of the RUN, not of a block: a run whose blocks disagreed about the
@@ -19413,12 +20134,9 @@ def v3_ab_ineligibility_reason(blocks: list[BlockTypeVar], *, is_script_run: boo
     mixed-arm run this predicate exists to prevent -- and a partial re-run is not comparable to a
     full run in the cohort anyway.
 
-    Script runs are excluded: their blocks execute as cached code and never reach engine dispatch,
-    so treatment would land only on the ai_fallback subset -- the blocks that already failed cached
-    execution.
+    A run headed for a cached script is eligible: treatment runs it as a v3 agent without the script
+    (see ``code_mode_displaced``), so the arm covers every block rather than only the ai_fallback ones.
     """
-    if is_script_run:
-        return V3AbIneligibleReason.script_run
     reroutable_blocks = 0
     for block in blocks:
         if isinstance(block, ConditionalBlock):
@@ -19485,9 +20203,9 @@ def takes_default_engine(blocks: list[BlockTypeVar]) -> bool | None:
     return False if has_engine_block else None
 
 
-def run_is_eligible_for_v3_ab(blocks: list[BlockTypeVar], *, is_script_run: bool) -> bool:
+def run_is_eligible_for_v3_ab(blocks: list[BlockTypeVar]) -> bool:
     """Whether a whole workflow run may be rerouted onto v3 by the A/B; see v3_ab_ineligibility_reason."""
-    return v3_ab_ineligibility_reason(blocks, is_script_run=is_script_run) is None
+    return v3_ab_ineligibility_reason(blocks) is None
 
 
 def get_all_blocks(blocks: list[BlockTypeVar]) -> list[BlockTypeVar]:

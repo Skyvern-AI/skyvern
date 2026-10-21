@@ -10,6 +10,7 @@ from skyvern.forge.sdk.copilot.active_run_session import ActiveRunSessionAssocia
 from skyvern.forge.sdk.routes import debug_sessions as debug_sessions_mod
 from skyvern.schemas.browser_session_kind import BrowserSessionKind
 from skyvern.schemas.runs import ProxyLocation
+from skyvern.webeye.persistent_session_errors import BrowserSessionCreditAdmissionRefusal
 
 
 @pytest.mark.asyncio
@@ -591,6 +592,46 @@ async def test_new_debug_session_records_no_vnc_when_the_infrastructure_cannot_s
         )
 
     assert app_mock.DATABASE.debug.create_debug_session.await_args.kwargs["vnc_streaming_supported"] is False
+
+
+@pytest.mark.parametrize(
+    ("create_error", "expected_level"),
+    [
+        (BrowserSessionCreditAdmissionRefusal(), "warning"),
+        (RuntimeError("infra unavailable"), "error"),
+    ],
+)
+@pytest.mark.asyncio
+async def test_new_debug_session_logs_a_credit_refusal_below_error_and_a_real_failure_at_error(
+    create_error: Exception, expected_level: str
+) -> None:
+    """A 402 credit refusal is the caller's answer, not a defect; any other startup failure stays loud."""
+    app_mock = MagicMock()
+    app_mock.DATABASE.debug.get_debug_session = AsyncMock(return_value=None)
+    app_mock.DATABASE.debug.complete_debug_sessions = AsyncMock(return_value=[])
+    app_mock.DATABASE.debug.create_debug_session = AsyncMock()
+    app_mock.WORKFLOW_SERVICE.get_workflow_by_permanent_id = AsyncMock(
+        return_value=SimpleNamespace(proxy_location=None)
+    )
+    app_mock.PERSISTENT_SESSIONS_MANAGER.create_session = AsyncMock(side_effect=create_error)
+
+    with (
+        patch.object(debug_sessions_mod, "app", app_mock),
+        patch.object(debug_sessions_mod.settings, "ENV", "local"),
+        capture_logs() as logs,
+        pytest.raises(type(create_error)) as raised,
+    ):
+        await debug_sessions_mod.new_debug_session(
+            "wpid_test",
+            current_org=SimpleNamespace(organization_id="org_123"),
+            current_user_id="user_123",
+        )
+
+    assert raised.value is create_error
+    startup_logs = [entry for entry in logs if str(entry["event"]).startswith("Debug session browser startup")]
+    assert [entry["log_level"] for entry in startup_logs] == [expected_level]
+    assert startup_logs[0]["organization_id"] == "org_123"
+    app_mock.DATABASE.debug.create_debug_session.assert_not_awaited()
 
 
 @pytest.mark.asyncio

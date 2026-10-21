@@ -1,3 +1,4 @@
+import { WorkflowFindingsButton } from "@/components/WorkflowFindingsSlot";
 import React from "react";
 import {
   BookmarkFilledIcon,
@@ -221,6 +222,11 @@ function WorkflowRow({ workflow, depth = 0 }: WorkflowRowProps) {
                     reliability={
                       workflowReliabilityMap[workflow.workflow_permanent_id]
                     }
+                  />
+                  <WorkflowFindingsButton
+                    workflowPermanentId={workflow.workflow_permanent_id}
+                    title={workflow.title}
+                    surface="list"
                   />
                 </div>
                 {taggingEnabled && workflowTags && workflowTags.length > 0 ? (

@@ -10,14 +10,18 @@ import orjson
 import pytest
 import pytest_asyncio
 from fastapi import BackgroundTasks, FastAPI, HTTPException, Request, Response
+from sqlalchemy.exc import OperationalError
 from sqlalchemy.ext.asyncio import AsyncEngine
+from structlog.testing import capture_logs
 
 from skyvern.constants import SKYVERN_MCP_USER_AGENT, SKYVERN_UI_USER_AGENT
 from skyvern.exceptions import WorkflowNotFound
+from skyvern.forge.api_app import register_agent_route_aliases
 from skyvern.forge.sdk.core import skyvern_context
 from skyvern.forge.sdk.core.skyvern_context import SkyvernContext
 from skyvern.forge.sdk.db.agent_db import AgentDB
 from skyvern.forge.sdk.db.enums import WorkflowRunTriggerType
+from skyvern.forge.sdk.db.exceptions import RunsListSearchCanceled
 from skyvern.forge.sdk.db.models import WorkflowModel, WorkflowRunAttemptModel
 from skyvern.forge.sdk.executor.factory import AsyncExecutorFactory
 from skyvern.forge.sdk.routes import agent_protocol
@@ -31,6 +35,7 @@ from skyvern.forge.sdk.workflow.service import WorkflowService
 from skyvern.schemas.run_enums import RunEngine, RunType
 from skyvern.schemas.runs import MAX_SEARCH_FETCH_LIMIT, TaskRunRequest
 from tests.unit.force_stub_app import make_workflow_run_attempts_fake
+from tests.unit.statement_timeout_fakes import statement_timeout_error
 
 
 def _caller(org_id: str = "org_123") -> SimpleNamespace:
@@ -342,6 +347,98 @@ async def test_get_runs_v2_rejects_workflow_filter_page_beyond_fetch_cap(monkeyp
 
 
 @pytest.mark.asyncio
+async def test_get_runs_v2_reports_a_search_timeout_as_an_actionable_400(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # A timeout on the unindexed substring search is returned as a client-actionable 400.
+    mock_workflow_runs = SimpleNamespace(get_all_runs_v2=AsyncMock(side_effect=statement_timeout_error()))
+    mock_database = SimpleNamespace(
+        workflow_runs=mock_workflow_runs,
+        workflow_run_attempts=make_workflow_run_attempts_fake(),
+    )
+    monkeypatch.setattr(agent_protocol.app, "DATABASE", mock_database)
+
+    with pytest.raises(HTTPException) as exc_info:
+        await agent_protocol.get_runs_v2(
+            current_org=SimpleNamespace(organization_id="org_123"),
+            page=1,
+            page_size=10,
+            search_key="no-such-term",
+        )
+
+    assert exc_info.value.status_code == 400
+    assert "exact browser profile or session ID" in exc_info.value.detail
+
+
+@pytest.mark.asyncio
+async def test_get_runs_v2_does_not_relabel_unmeasured_non_search_timeouts(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # No-search filters have unmeasured query plans; preserve the server error rather than suggesting
+    # a retry that may repeat a deterministic full-organization scan.
+    mock_workflow_runs = SimpleNamespace(get_all_runs_v2=AsyncMock(side_effect=statement_timeout_error()))
+    mock_database = SimpleNamespace(
+        workflow_runs=mock_workflow_runs,
+        workflow_run_attempts=make_workflow_run_attempts_fake(),
+    )
+    monkeypatch.setattr(agent_protocol.app, "DATABASE", mock_database)
+
+    with pytest.raises(OperationalError):
+        await agent_protocol.get_runs_v2(
+            current_org=SimpleNamespace(organization_id="org_123"),
+            page=1,
+            page_size=10,
+            search_key=None,
+        )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("search_key", ["bp_123", "pbs_123"])
+async def test_get_runs_v2_keeps_indexed_identifier_timeouts_retryable(
+    monkeypatch: pytest.MonkeyPatch,
+    search_key: str,
+) -> None:
+    mock_workflow_runs = SimpleNamespace(get_all_runs_v2=AsyncMock(side_effect=statement_timeout_error()))
+    mock_database = SimpleNamespace(
+        workflow_runs=mock_workflow_runs,
+        workflow_run_attempts=make_workflow_run_attempts_fake(),
+    )
+    monkeypatch.setattr(agent_protocol.app, "DATABASE", mock_database)
+
+    with pytest.raises(HTTPException) as exc_info:
+        await agent_protocol.get_runs_v2(
+            current_org=SimpleNamespace(organization_id="org_123"),
+            page=1,
+            page_size=10,
+            search_key=search_key,
+        )
+
+    assert exc_info.value.status_code == 503
+    assert exc_info.value.headers["Retry-After"]
+
+
+@pytest.mark.asyncio
+async def test_get_runs_v2_does_not_mask_other_database_errors(monkeypatch: pytest.MonkeyPatch) -> None:
+    # Only a cancelled statement is the caller's to act on; anything else is still a server fault and
+    # must keep reaching the error handlers rather than being reported as a bad request.
+    failure = OperationalError("SELECT 1", {}, Exception("connection reset"))
+    mock_workflow_runs = SimpleNamespace(get_all_runs_v2=AsyncMock(side_effect=failure))
+    mock_database = SimpleNamespace(
+        workflow_runs=mock_workflow_runs,
+        workflow_run_attempts=make_workflow_run_attempts_fake(),
+    )
+    monkeypatch.setattr(agent_protocol.app, "DATABASE", mock_database)
+
+    with pytest.raises(OperationalError):
+        await agent_protocol.get_runs_v2(
+            current_org=SimpleNamespace(organization_id="org_123"),
+            page=1,
+            page_size=10,
+            search_key=None,
+        )
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize(
     ("handler", "extra_kwargs", "expected_exclude_child_runs"),
     [
@@ -387,6 +484,239 @@ async def test_get_workflow_runs_by_id_child_filter_depends_on_route(
         created_at_end=None,
         run_tags=None,
     )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("indexed_search", "expected_status", "expected_detail_fragment"),
+    [
+        (False, 400, "created_at_start"),
+        (True, 503, "retry shortly"),
+    ],
+)
+async def test_get_workflow_runs_by_id_reports_a_cancelled_search_as_a_typed_error(
+    monkeypatch: pytest.MonkeyPatch,
+    indexed_search: bool,
+    expected_status: int,
+    expected_detail_fragment: str,
+) -> None:
+    # A workflow's own runs list carries the same unindexed search arms as the global list, so its
+    # cancelled search is the caller's to narrow rather than a 500 on an interactive list.
+    cancelled = RunsListSearchCanceled(indexed_search=indexed_search, statement_timeout_seconds=30)
+    mock_service = SimpleNamespace(
+        get_workflow_runs_for_workflow_permanent_id=AsyncMock(side_effect=cancelled),
+    )
+    monkeypatch.setattr(agent_protocol.app, "WORKFLOW_SERVICE", mock_service)
+    monkeypatch.setattr(agent_protocol.analytics, "capture", lambda *args, **kwargs: None)
+
+    with pytest.raises(HTTPException) as exc_info:
+        await agent_protocol.get_workflow_runs_by_id(
+            workflow_id="wpid_123",
+            page=1,
+            page_size=10,
+            search_key="a-search-term",
+            current_org=SimpleNamespace(organization_id="org_123"),
+        )
+
+    assert exc_info.value.status_code == expected_status
+    assert expected_detail_fragment in exc_info.value.detail
+
+
+@pytest.mark.asyncio
+async def test_get_workflow_runs_by_id_does_not_blame_the_search_for_another_query_timeout(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # The service attaches attempt views with a second, uncapped query after the search read
+    # returns. Its cancellation is not the search's, so it must stay a server error even though the
+    # request carried a search term.
+    mock_service = SimpleNamespace(
+        get_workflow_runs_for_workflow_permanent_id=AsyncMock(side_effect=statement_timeout_error()),
+    )
+    monkeypatch.setattr(agent_protocol.app, "WORKFLOW_SERVICE", mock_service)
+    monkeypatch.setattr(agent_protocol.analytics, "capture", lambda *args, **kwargs: None)
+
+    with pytest.raises(OperationalError):
+        await agent_protocol.get_workflow_runs_by_id(
+            workflow_id="wpid_123",
+            page=1,
+            page_size=10,
+            search_key="a-search-term",
+            current_org=SimpleNamespace(organization_id="org_123"),
+        )
+
+
+_ORG_RUNS_NOW = datetime(2026, 10, 19, 12, 0, 0)
+_ORG_RUNS_DEFAULT_START = datetime(2026, 9, 19, 12, 0, 0)
+_EXPLICIT_START = datetime(2026, 1, 1, tzinfo=UTC)
+_EXPLICIT_END = datetime(2026, 2, 1, tzinfo=UTC)
+_EXPLICIT_END_PLUS_TWO = datetime(2026, 2, 1, 2, 0, tzinfo=timezone(timedelta(hours=2)))
+_END_ONLY_DEFAULT_START = datetime(2026, 1, 2, 0, 0, 0)
+
+
+def _org_runs_service(monkeypatch: pytest.MonkeyPatch, **service_kwargs: Any) -> SimpleNamespace:
+    mock_service = SimpleNamespace(get_workflow_runs=AsyncMock(**service_kwargs))
+    monkeypatch.setattr(agent_protocol.app, "WORKFLOW_SERVICE", mock_service)
+    monkeypatch.setattr(agent_protocol.analytics, "capture", lambda *args, **kwargs: None)
+    monkeypatch.setattr(agent_protocol, "naive_utc_now", lambda: _ORG_RUNS_NOW, raising=False)
+    return mock_service
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("search_key", "created_at_start", "created_at_end", "expected_start", "expected_end"),
+    [
+        # Unindexed free text without a date range is bounded to the last 30 days.
+        ("login", None, None, _ORG_RUNS_DEFAULT_START, None),
+        ("wr_123456789012345678", None, None, _ORG_RUNS_DEFAULT_START, None),
+        ("cred_123456789", None, None, _ORG_RUNS_DEFAULT_START, None),
+        # Complete browser identifiers resolve through an indexed lookup and keep the full history.
+        ("bp_123456789", None, None, None, None),
+        ("pbs_123456789", None, None, None, None),
+        # A listing without a search term is unchanged.
+        (None, None, None, None, None),
+        ("", None, None, None, None),
+        # A caller-supplied start replaces the default, unclamped.
+        ("login", _EXPLICIT_START, None, _EXPLICIT_START, None),
+        ("login", _EXPLICIT_START, _EXPLICIT_END, _EXPLICIT_START, _EXPLICIT_END),
+        # Without a start, the default window ends at the caller's end, normalized to naive UTC.
+        ("login", None, _EXPLICIT_END, _END_ONLY_DEFAULT_START, _EXPLICIT_END),
+        ("login", None, _EXPLICIT_END_PLUS_TWO, _END_ONLY_DEFAULT_START, _EXPLICIT_END_PLUS_TWO),
+        # An end too early to subtract the window from floors the start instead of overflowing.
+        ("login", None, datetime(1, 1, 1), datetime.min, datetime(1, 1, 1)),
+        # Explicit bounds also narrow listings and indexed searches.
+        (None, _EXPLICIT_START, _EXPLICIT_END, _EXPLICIT_START, _EXPLICIT_END),
+        ("bp_123456789", None, _EXPLICIT_END, None, _EXPLICIT_END),
+    ],
+)
+async def test_get_workflow_runs_bounds_free_text_search_without_a_start_to_a_default_window(
+    monkeypatch: pytest.MonkeyPatch,
+    search_key: str | None,
+    created_at_start: datetime | None,
+    created_at_end: datetime | None,
+    expected_start: datetime | None,
+    expected_end: datetime | None,
+) -> None:
+    mock_service = _org_runs_service(monkeypatch, return_value=[])
+
+    response = await agent_protocol.get_workflow_runs(
+        page=2,
+        page_size=5,
+        status=[WorkflowRunStatus.failed],
+        search_key=search_key,
+        error_code="LOGIN_FAILED",
+        created_at_start=created_at_start,
+        created_at_end=created_at_end,
+        current_org=SimpleNamespace(organization_id="org_123"),
+    )
+
+    assert response == []
+    mock_service.get_workflow_runs.assert_awaited_once_with(
+        organization_id="org_123",
+        page=2,
+        page_size=5,
+        status=[WorkflowRunStatus.failed],
+        search_key=search_key,
+        error_code="LOGIN_FAILED",
+        created_at_start=expected_start,
+        created_at_end=expected_end,
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("created_at_start", "created_at_end", "expected_filters", "expected_default_window_applied"),
+    [
+        (None, None, ["search_key"], True),
+        (None, _EXPLICIT_END, ["created_at_end", "search_key"], True),
+        (_EXPLICIT_START, None, ["created_at_start", "search_key"], False),
+    ],
+)
+async def test_get_workflow_runs_timeout_advises_a_narrower_date_range(
+    monkeypatch: pytest.MonkeyPatch,
+    created_at_start: datetime | None,
+    created_at_end: datetime | None,
+    expected_filters: list[str],
+    expected_default_window_applied: bool,
+) -> None:
+    cancelled = RunsListSearchCanceled(indexed_search=False, statement_timeout_seconds=30)
+    _org_runs_service(monkeypatch, side_effect=cancelled)
+
+    with capture_logs() as logs, pytest.raises(HTTPException) as exc_info:
+        await agent_protocol.get_workflow_runs(
+            page=1,
+            page_size=5,
+            status=None,
+            search_key="a-search-term",
+            error_code=None,
+            created_at_start=created_at_start,
+            created_at_end=created_at_end,
+            current_org=SimpleNamespace(organization_id="org_123"),
+        )
+
+    assert exc_info.value.status_code == 400
+    assert "created_at_start" in exc_info.value.detail
+    assert "30 days" in exc_info.value.detail
+    timeout_logs = [log for log in logs if log["event"] == "runs_list_statement_timeout"]
+    assert len(timeout_logs) == 1
+    # Filter names only: the default window is reported separately so it is not mistaken for a caller filter.
+    assert timeout_logs[0]["filters"] == expected_filters
+    assert timeout_logs[0]["default_window_applied"] is expected_default_window_applied
+    assert "a-search-term" not in str(timeout_logs[0])
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("path", ["/v1/workflows/runs", "/v1/agents/runs", "/api/v1/workflows/runs"])
+async def test_org_runs_routes_parse_created_at_bounds(monkeypatch: pytest.MonkeyPatch, path: str) -> None:
+    mock_service = _org_runs_service(monkeypatch, return_value=[])
+    fastapi_app = FastAPI()
+    fastapi_app.include_router(base_router, prefix="/v1")
+    fastapi_app.include_router(legacy_base_router, prefix="/api/v1")
+    register_agent_route_aliases(fastapi_app)
+    fastapi_app.dependency_overrides[org_auth_service.get_current_org] = lambda: SimpleNamespace(
+        organization_id="org_123"
+    )
+
+    async with httpx.AsyncClient(transport=httpx.ASGITransport(app=fastapi_app), base_url="http://test") as client:
+        response = await client.get(
+            path,
+            params={
+                "search_key": "login",
+                "created_at_start": "2026-01-01T02:00:00+02:00",
+                "created_at_end": "2026-02-01T00:00:00Z",
+            },
+        )
+
+    assert response.status_code == 200, response.text
+    kwargs = mock_service.get_workflow_runs.await_args.kwargs
+    assert kwargs["created_at_start"] == datetime(2026, 1, 1, tzinfo=UTC)
+    assert kwargs["created_at_end"] == datetime(2026, 2, 1, tzinfo=UTC)
+
+
+def test_org_runs_openapi_documents_the_default_search_window() -> None:
+    fastapi_app = FastAPI()
+    fastapi_app.include_router(base_router, prefix="/v1")
+    register_agent_route_aliases(fastapi_app)
+    operation = fastapi_app.openapi()["paths"]["/v1/agents/runs"]["get"]
+
+    assert {"created_at_start", "created_at_end"} <= {parameter["name"] for parameter in operation["parameters"]}
+    assert "30 days" in operation["description"]
+    assert "created_at_end" in operation["description"]
+
+
+@pytest.mark.asyncio
+async def test_workflow_service_forwards_created_at_bounds_to_the_repository(monkeypatch: pytest.MonkeyPatch) -> None:
+    repository = SimpleNamespace(get_workflow_runs=AsyncMock(return_value=[]))
+    monkeypatch.setattr(agent_protocol.app, "DATABASE", SimpleNamespace(workflow_runs=repository), raising=False)
+
+    await WorkflowService().get_workflow_runs(
+        organization_id="org_123",
+        search_key="login",
+        created_at_start=_EXPLICIT_START,
+        created_at_end=_EXPLICIT_END,
+    )
+
+    assert repository.get_workflow_runs.await_args.kwargs["created_at_start"] == _EXPLICIT_START
+    assert repository.get_workflow_runs.await_args.kwargs["created_at_end"] == _EXPLICIT_END
 
 
 @pytest.mark.parametrize(

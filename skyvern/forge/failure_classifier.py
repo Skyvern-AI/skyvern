@@ -8,7 +8,11 @@ from typing import Any
 import structlog
 
 from skyvern.constants import PROXY_TRANSPORT_NAV_ERRORS
-from skyvern.exceptions import NO_ADDRESS_RECORD_NAV_ERROR_MARKER, CaptchaSolveError, FailedToNavigateToUrl
+from skyvern.exceptions import (
+    NO_ADDRESS_RECORD_NAV_ERROR_MARKER,
+    CaptchaSolveError,
+    FailedToNavigateToUrl,
+)
 
 LOG = structlog.get_logger(__name__)
 
@@ -603,6 +607,45 @@ _MIN_ATTRIBUTION_CONFIDENCE = 0.7
 # Shared with typed run emitters; dynamic/user-defined categories remain excluded.
 _FAILURE_CATEGORY_LITERALS = frozenset(category.value for category in FailureCategory)
 
+
+def partition_failure_categories(value: Any) -> tuple[list[dict], list[str]]:
+    """Keep exact taxonomy values; map any non-empty invalid-only response to UNKNOWN."""
+    kept: list[dict] = []
+    rejected: list[str] = []
+    for entry in value if isinstance(value, list) else ():
+        if not isinstance(entry, dict):
+            continue
+        name = entry.get("category")
+        if not isinstance(name, str):
+            continue
+        if name not in _FAILURE_CATEGORY_LITERALS:
+            rejected.append(name)
+            continue
+        kept.append(entry)
+    if isinstance(value, list) and value and not kept:
+        kept = [
+            {
+                "category": FailureCategory.UNKNOWN.value,
+                "confidence_float": 0.5,
+                "reasoning": "Model returned no recognized failure category",
+            }
+        ]
+    return kept, rejected
+
+
+def bounded_failure_categories(value: Any) -> list[dict]:
+    """``value``'s entries narrowed to this taxonomy; see partition_failure_categories."""
+    kept, rejected = partition_failure_categories(value)
+    if rejected:
+        LOG.warning(
+            "Dropped model-written failure categories outside the known taxonomy",
+            rejected_category_count=len(rejected),
+            kept_category_count=len(kept),
+        )
+    return kept
+
+
+# Persisted failure_category reason codes are separate from HTTP error codes, even where their values match.
 # Bounded reason codes emitted by out-of-module terminal producers. Defined here as the single
 # source of truth so a producer and this allowlist cannot drift: the browser-lease seam
 # (skyvern/forge/sdk/workflow/service.py::_browser_lease_failure_category) imports these.

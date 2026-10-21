@@ -1,11 +1,12 @@
-from collections.abc import AsyncIterator, Mapping
+from collections.abc import AsyncIterator, Awaitable, Callable, Mapping
+from typing import Any
 
 import structlog
 from fastapi import Depends
 from starlette.requests import HTTPConnection
 
 from skyvern.forge import app
-from skyvern.forge.sdk.services.request_principal import get_request_principal
+from skyvern.forge.sdk.services.request_principal import get_request_principal, pending_route_action
 
 LOG = structlog.get_logger()
 
@@ -23,7 +24,6 @@ ROUTE_ACTIONS: Mapping[str, str] = {
     "skyvern.forge.sdk.routes.agent_protocol.cancel_workflow_run": "workflow.cancel",
     "skyvern.forge.sdk.routes.agent_protocol.continue_workflow_run": "workflow.continue",
     "skyvern.forge.sdk.routes.agent_protocol.convert_curl_to_http": "utility.convert",
-    "skyvern.forge.sdk.routes.agent_protocol.convert_sop_to_blocks": "workflow.convert",
     "skyvern.forge.sdk.routes.agent_protocol.create_folder": "workflow_folder.create",
     "skyvern.forge.sdk.routes.agent_protocol.create_tag_value": "tag.create",
     "skyvern.forge.sdk.routes.agent_protocol.create_workflow": "workflow.create",
@@ -60,6 +60,7 @@ ROUTE_ACTIONS: Mapping[str, str] = {
     "skyvern.forge.sdk.routes.agent_protocol.get_steps": "task.list",
     "skyvern.forge.sdk.routes.agent_protocol.get_task_v1": "task.read",
     "skyvern.forge.sdk.routes.agent_protocol.get_task_v2": "task.read",
+    "skyvern.forge.sdk.routes.agent_protocol.export_tasks": "task.list",
     "skyvern.forge.sdk.routes.agent_protocol.get_tasks": "task.list",
     "skyvern.forge.sdk.routes.agent_protocol.get_version": "version.read",
     "skyvern.forge.sdk.routes.agent_protocol.get_workflow": "workflow.read",
@@ -121,27 +122,32 @@ ROUTE_ACTIONS: Mapping[str, str] = {
     "skyvern.forge.sdk.routes.browser_sessions.get_workflow_runs_for_browser_session": "browser_session.read",
     "skyvern.forge.sdk.routes.browser_sessions.get_workflow_version_recording": "browser_session.read",
     "skyvern.forge.sdk.routes.browser_sessions.process_recording": "browser_session.execute",
+    "skyvern.forge.sdk.routes.browser_sessions.register_external_browser_session": "browser_session.create",
     "skyvern.forge.sdk.routes.browser_sessions.update_browser_session": "browser_session.update",
     "skyvern.forge.sdk.routes.credentials.cancel_credential_test": "credential.cancel",
     "skyvern.forge.sdk.routes.credentials.clear_org_auth_credential": "vault_provider.delete",
     "skyvern.forge.sdk.routes.credentials.create_credential": "credential.create",
     "skyvern.forge.sdk.routes.credentials.create_credential_folder": "credential_folder.create",
     "skyvern.forge.sdk.routes.credentials.delete_credential": "credential.delete",
+    "skyvern.forge.sdk.routes.credentials.delete_temporary_credential": "credential.temporary.delete",
     "skyvern.forge.sdk.routes.credentials.delete_credential_folder": "credential_folder.delete",
     "skyvern.forge.sdk.routes.credentials.get_azure_client_secret_credential": "vault_provider.read",
-    "skyvern.forge.sdk.routes.credentials.get_bitwarden_credential": "vault_provider.read",
+    "skyvern.forge.sdk.routes.credentials.get_bitwarden_credential": "vault_provider.status",
     "skyvern.forge.sdk.routes.credentials.get_credential": "credential.read",
     "skyvern.forge.sdk.routes.credentials.get_credential_folder": "credential_folder.read",
     "skyvern.forge.sdk.routes.credentials.get_credential_folders": "credential_folder.list",
-    "skyvern.forge.sdk.routes.credentials.get_credential_totp_code": "credential.read",
+    "skyvern.forge.sdk.routes.credentials.get_credential_totp_code": "credential.use",
     "skyvern.forge.sdk.routes.credentials.get_credentials": "credential.list",
     "skyvern.forge.sdk.routes.credentials.get_custom_credential_service_config": "vault_provider.read",
+    "skyvern.forge.sdk.routes.credentials.get_custom_credential_service_status": "vault_provider.status",
     "skyvern.forge.sdk.routes.credentials.get_onepassword_token": "vault_provider.read",
-    "skyvern.forge.sdk.routes.credentials.get_onepassword_token_status": "vault_provider.read",
+    "skyvern.forge.sdk.routes.credentials.get_onepassword_token_status": "vault_provider.status",
     "skyvern.forge.sdk.routes.credentials.get_test_credential_status": "credential.list",
     "skyvern.forge.sdk.routes.credentials.get_totp_codes": "credential.list",
+    "skyvern.forge.sdk.routes.credentials.import_onepassword_credentials": "credential.create",
     "skyvern.forge.sdk.routes.credentials.list_bitwarden_items": "vault_provider.list",
     "skyvern.forge.sdk.routes.credentials.list_onepassword_items": "vault_provider.list",
+    "skyvern.forge.sdk.routes.credentials.refresh_onepassword_credentials": "credential.update",
     "skyvern.forge.sdk.routes.credentials.rename_credential": "credential.update",
     "skyvern.forge.sdk.routes.credentials.send_totp_code": "credential.send",
     "skyvern.forge.sdk.routes.credentials.test_credential": "credential.test",
@@ -151,7 +157,7 @@ ROUTE_ACTIONS: Mapping[str, str] = {
     "skyvern.forge.sdk.routes.credentials.update_bitwarden_credential": "vault_provider.update",
     "skyvern.forge.sdk.routes.credentials.update_credential": "credential.update",
     "skyvern.forge.sdk.routes.credentials.update_credential_folder": "credential_folder.update",
-    "skyvern.forge.sdk.routes.credentials.update_credential_folder_assignment": "credential_folder.update",
+    "skyvern.forge.sdk.routes.credentials.update_credential_folder_assignment": "credential.move",
     "skyvern.forge.sdk.routes.credentials.update_custom_credential_service_config": "vault_provider.update",
     "skyvern.forge.sdk.routes.credentials.update_onepassword_token": "vault_provider.update",
     "skyvern.forge.sdk.routes.custom_llms.create_custom_llm": "custom_model.create",
@@ -162,7 +168,7 @@ ROUTE_ACTIONS: Mapping[str, str] = {
     "skyvern.forge.sdk.routes.debug_sessions.get_debug_session_runs": "debug_session.list",
     "skyvern.forge.sdk.routes.debug_sessions.get_debug_session_viewer_state": "debug_session.read",
     "skyvern.forge.sdk.routes.debug_sessions.get_login_block_compatibility": "debug_session.read",
-    "skyvern.forge.sdk.routes.debug_sessions.get_or_create_debug_session_by_user_and_workflow_permanent_id": "debug_session.read",
+    "skyvern.forge.sdk.routes.debug_sessions.get_or_create_debug_session_by_user_and_workflow_permanent_id": "debug_session.execute",
     "skyvern.forge.sdk.routes.debug_sessions.new_debug_session": "debug_session.execute",
     "skyvern.forge.sdk.routes.debug_sessions.prewarm_debug_session": "debug_session.execute",
     "skyvern.forge.sdk.routes.feedback.get_run_feedback": "feedback.read",
@@ -192,7 +198,7 @@ ROUTE_ACTIONS: Mapping[str, str] = {
     "skyvern.forge.sdk.routes.prompts.generate_workflow_title": "prompt.execute",
     "skyvern.forge.sdk.routes.prompts.improve_prompt": "prompt.execute",
     "skyvern.forge.sdk.routes.prompts.summarize_output": "prompt.execute",
-    "skyvern.forge.sdk.routes.run_blocks.download_files": "workflow_run.read",
+    "skyvern.forge.sdk.routes.run_blocks.download_files": "workflow_run.execute",
     "skyvern.forge.sdk.routes.run_blocks.login": "workflow_run.execute",
     "skyvern.forge.sdk.routes.runtime_config.get_runtime_config": "runtime_config.read",
     "skyvern.forge.sdk.routes.scripts.clear_workflow_cache": "script.delete",
@@ -259,6 +265,10 @@ ROUTE_ACTIONS: Mapping[str, str] = {
     "skyvern.forge.sdk.routes.workflow_copilot.workflow_copilot_credential_deletion": "credential.delete",
     "skyvern.forge.sdk.routes.workflow_copilot.workflow_copilot_credential_generate": "credential.create",
     "skyvern.forge.sdk.routes.workflow_copilot.workflow_copilot_credential_response": "workflow_copilot.manage",
+    "skyvern.forge.sdk.routes.workflow_copilot.workflow_copilot_demonstration_active": "workflow_copilot.manage",
+    "skyvern.forge.sdk.routes.workflow_copilot.workflow_copilot_demonstration_control": "workflow_copilot.manage",
+    "skyvern.forge.sdk.routes.workflow_copilot.workflow_copilot_demonstration_record": "workflow_copilot.manage",
+    "skyvern.forge.sdk.routes.workflow_copilot.workflow_copilot_demonstration_upload": "workflow_copilot.manage",
     "skyvern.forge.sdk.routes.workflow_copilot.workflow_copilot_disable_auto_accept": "workflow_copilot.manage",
     "skyvern.forge.sdk.routes.workflow_copilot.workflow_copilot_message_feedback": "workflow_copilot.manage",
     "skyvern.forge.sdk.routes.workflow_copilot.workflow_copilot_question_response": "workflow_copilot.manage",
@@ -284,16 +294,32 @@ def register_route_actions(route_actions: Mapping[str, str]) -> None:
     _REGISTERED_ROUTE_ACTIONS.update(route_actions)
 
 
+def endpoint_action(endpoint: Any) -> str | None:
+    handler = f"{endpoint.__module__}.{endpoint.__name__}" if endpoint else ""
+    return _REGISTERED_ROUTE_ACTIONS.get(handler) or ROUTE_ACTIONS.get(handler)
+
+
 def _route_action(connection: HTTPConnection) -> tuple[str | None, dict[str, object]]:
     route = connection.scope.get("route")
     route_path = getattr(route, "path", connection.url.path)
-    endpoint = getattr(route, "endpoint", None)
-    handler = f"{endpoint.__module__}.{endpoint.__name__}" if endpoint else ""
-    action = _REGISTERED_ROUTE_ACTIONS.get(handler)
-    if action is None:
-        action = ROUTE_ACTIONS.get(handler)
+    action = endpoint_action(getattr(route, "endpoint", None))
     resource = {"$route": route_path, **connection.path_params}
     return action, resource
+
+
+def require_request_actions(actions: frozenset[str], *, always_enforce: bool = False) -> Callable[[], Awaitable[None]]:
+    if not actions:
+        raise ValueError("require_request_actions needs at least one action")
+
+    async def enforce_request_action() -> None:
+        principal = get_request_principal()
+        for action in actions:
+            if always_enforce:
+                await app.AGENT_FUNCTION.enforce_request_authorization(principal, action, always_enforce=True)
+            else:
+                await app.AGENT_FUNCTION.enforce_request_authorization(principal, action)
+
+    return enforce_request_action
 
 
 async def _authorize_connection(connection: HTTPConnection) -> None:
@@ -313,8 +339,14 @@ async def _authorize_connection(connection: HTTPConnection) -> None:
 
 async def observe_request_authorization(connection: HTTPConnection) -> AsyncIterator[None]:
     try:
+        action, _ = _route_action(connection)
+    except Exception:  # noqa: BLE001 - observation failures are logged after the handler, never raised here.
+        action = None
+    token = pending_route_action.set(action)
+    try:
         yield
     finally:
+        pending_route_action.reset(token)
         await _authorize_connection(connection)
 
 

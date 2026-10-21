@@ -113,10 +113,11 @@ class Settings(BaseSettings):
     BROWSER_REMOTE_DEBUGGING_HOST_HEADER: str | None = None
     BROWSER_REMOTE_DEBUGGING_CONNECT_HEADERS: str | None = None
     BROWSER_CDP_CONNECT_TIMEOUT_MS: int = 120000
-    # Configurable safety caps. The defaults are rollout candidates, not capacity-calibrated policy.
+    # Uncalibrated rollout defaults: the byte limits bound worker disk and memory per run, and the file limit bounds
+    # per-file save cost within the 180 s save timeout.
     BROWSER_DOWNLOAD_MAX_FILE_SIZE_BYTES: int = Field(default=100 * 1024 * 1024, gt=0)
     BROWSER_DOWNLOAD_MAX_RUN_SIZE_BYTES: int = Field(default=512 * 1024 * 1024, gt=0)
-    BROWSER_DOWNLOAD_MAX_FILES_PER_RUN: int = Field(default=64, gt=0)
+    BROWSER_DOWNLOAD_MAX_FILES_PER_RUN: int = Field(default=300, gt=0)
     # connect_over_cdp_with_retry budget. The defaults give ~15s of total backoff
     # (1+2+3+4+5) across attempts so a browser that is slow to bind its local CDP
     # port (e.g. a cold-starting stealth Chromium on 127.0.0.1:9222) is reconnected
@@ -154,6 +155,9 @@ class Settings(BaseSettings):
     PAGE_READY_DOM_STABLE_MS: float = 300  # Time with no DOM mutations to consider stable
     PAGE_READY_DOM_STABILITY_TIMEOUT_MS: float = 3000  # Max time to wait for DOM stability
     BROWSER_SCREENSHOT_TIMEOUT_MS: int = 20000
+    # Minimum seconds between the full gc.collect() runs after multi-viewport screenshot stitches, per
+    # process. Each run pauses every browser session on the event loop; 0 collects after every stitch.
+    SCREENSHOT_STITCH_GC_MIN_INTERVAL_SECONDS: float = 60.0
     # Consecutive unanswered browser-protocol operations (spanning more than one kind) after which
     # a run stops starting new steps against that browser. Sized so a healthy run — which lands
     # hundreds of successful operations per step, any one of which resets the count — cannot reach
@@ -284,6 +288,7 @@ class Settings(BaseSettings):
     # so this is a guaranteed no-op behind app.CACHE.is_shared regardless of this flag.
     WORKFLOW_COPILOT_CREDENTIAL_PAUSE_ENABLED: bool = True
     WORKFLOW_COPILOT_CREDENTIAL_PAUSE_TIMEOUT_SECONDS: int = 300
+    WORKFLOW_COPILOT_DEMONSTRATION_ENABLED: bool = False
     # Replaces the pause countdown once when the user chooses to sign in themselves in the live browser.
     WORKFLOW_COPILOT_MANUAL_SIGN_IN_TIMEOUT_SECONDS: int = 900
     # Kill switch for the live codegen-progress SSE frame (drafted block labels while an authoring
@@ -295,12 +300,17 @@ class Settings(BaseSettings):
     # The caller-supplied header is not an authorization: on a shared deployment only API
     # credentials belonging to these explicitly configured eval organizations may seed an entry point.
     WORKFLOW_COPILOT_ODYSSEYS_EVAL_ORGANIZATION_IDS: list[str] = []
+    WORKFLOW_COPILOT_EVAL_LLM_OVERRIDES_ENABLED: bool = False
+    WORKFLOW_COPILOT_EVAL_LLM_OVERRIDES_ORGANIZATION_IDS: list[str] = []
+    WORKFLOW_COPILOT_EVAL_COST_ENABLED: bool = False
+    WORKFLOW_COPILOT_EVAL_COST_ORGANIZATION_IDS: list[str] = []
     # Local-development escape hatch: run a copilot block test run in the API process when sandbox
     # dispatch is unavailable, instead of failing closed. Grants nothing on its own -- see
     # AgentFunction.allow_copilot_inline_code_execution for the conditions it is ANDed with.
     COPILOT_ALLOW_INLINE_CODE_EXECUTION: bool = False
     # Default code_only for MCP block/workflow tools. Off = permissive.
     MCP_CODE_ONLY_MODE: bool = False
+    RUN_HEARTBEAT_TIMEOUT_MINUTES: int = 30
     PORT: int = 8000
     # uvicorn answers 503 without dispatching to ASGI once *either* open connections or in-flight
     # requests reach this. Open connections is the binding term -- idle keep-alives and long-lived
@@ -321,6 +331,9 @@ class Settings(BaseSettings):
     ALLOWED_ORIGIN_REGEX: str | None = None
     BLOCKED_HOSTS: list[str] = ["localhost"]
     ALLOWED_HOSTS: list[str] = []
+    # Off by default on purpose, so self-hosted and open-source installs reach internal hosts without setup; set true to refuse
+    # loopback, private-network and metadata addresses. Skyvern's staging and production deployments set it to true.
+    ENABLE_URL_VALIDATION: bool = False
     # SFTP uploads connect directly from the worker, so private/internal hosts are
     # blocked by default; self-hosted deployments with internal SFTP targets can enable.
     ALLOW_SFTP_INTERNAL_HOSTS: bool = False
@@ -459,6 +472,10 @@ class Settings(BaseSettings):
     # Bitwarden Configs #
     #####################
     BITWARDEN_TIMEOUT_SECONDS: int = 60
+    # A cold `bw login` downloads and decrypts the whole vault, so it is categorically slower than the
+    # reads behind it and needs its own budget. Runs arriving as a batch each start on their own pod and
+    # pay that login concurrently, which pushes it well past a budget sized for a read.
+    BITWARDEN_LOGIN_TIMEOUT_SECONDS: int = 180
     BITWARDEN_MAX_RETRIES: int = 3
     BITWARDEN_MAX_JITTER_SECONDS: float = 2.0
     # A logged-in CLI session is kept per vault identity and reused across runs, so a batch of
@@ -553,6 +570,9 @@ class Settings(BaseSettings):
     # Kill switch for the tier-1 semantic commit read (SKY-15322): decisive-accept-only ARIA/value
     # probe consulted before the shape heuristics, which remain the fallback either way.
     TASK_V3_SEMANTIC_COMMIT_VERIFY: bool = True
+    # Kill switch for committing a list row that names the value without being it exactly (its main label, a
+    # singular/plural, a unique word prefix on a click-opened list) (SKY-18017). Off: typeaheads commit exact rows only.
+    TASK_V3_CHOICE_NONEXACT_COMMIT: bool = True
     # Press a sub-pixel date segment through the layer painted over it, and route month/year and
     # year-only segment groups to the segment path (SKY-17013). Force-on term only: runs are randomized per
     # run by the flag of the same name, read through run_arm_enabled(DATE_SEGMENT_AIM_FLAG, ...).
@@ -575,12 +595,13 @@ class Settings(BaseSettings):
     # bypassing WORKFLOW_TASK_V3_AB. None disables the rule (the OSS default), as does having no flag
     # provider; DISABLE_TASK_V3 still wins over it. A naive value is read as UTC. Per-call platform
     # workflows are excluded twice over -- by an auto_generated executing version, which covers the
-    # login, download_files, credential test-login and SDK endpoints, and by a per-call trigger kind,
-    # which covers the job recipe endpoints because those build a published definition. Enrolled runs
+    # login, download_files, credential test-login, SDK and job recipe endpoints, and by a per-call trigger
+    # kind, which also covers older job recipe workflows created as published. Enrolled runs
     # are not randomized, so every per-arm read must exclude them by route_reason.
     TASK_V3_DEFAULT_ENGINE_WORKFLOW_CUTOFF: datetime | None = None
     # Workflows whose permanent id was born at or after this instant, in every billing tier, honor each
-    # task block's chosen engine and run a block with no engine on Task V3, outside WORKFLOW_TASK_V3_AB.
+    # task block's chosen engine and run a block with no engine on Task V3 (or on the per-run split of
+    # WORKFLOW_TASK_V3_AB_NEW_WORKFLOWS for a listed org or workflow), outside WORKFLOW_TASK_V3_AB.
     # Excludes the same per-call platform workflows as the cutoff above. None disables the rule, as does
     # having no flag provider; DISABLE_TASK_V3 still wins. A naive value is read as UTC.
     TASK_V3_CHOSEN_ENGINE_CUTOFF: datetime | None = None
@@ -976,6 +997,10 @@ class Settings(BaseSettings):
     """Interval in minutes for the cleanup cron job."""
     CLEANUP_STALE_TASK_THRESHOLD_HOURS: int = 24
     """Tasks/workflows not updated for this many hours are considered stale (stuck)."""
+    HOSTED_MCP_DRIVER_IDLE_SECONDS: float = 600.0
+    """Stop a hosted MCP API key's shared Playwright driver after no tool call has used it this long; <=0 disables."""
+    HOSTED_MCP_DRIVER_SWEEP_INTERVAL_SECONDS: float = 300.0
+    """How often the API checks hosted MCP drivers for idleness; <=0 disables the sweep."""
 
     TEMP_ARTIFACT_SWEEP_MAX_AGE_HOURS: float = 48.0
     """Age gate (hours) for the always-on sweep of per-run LOG_PATH/DOWNLOAD_PATH dirs left behind on
@@ -1069,6 +1094,13 @@ class Settings(BaseSettings):
                 )
 
         return self
+
+    @field_validator("RUN_HEARTBEAT_TIMEOUT_MINUTES")
+    @classmethod
+    def _run_heartbeat_timeout_minutes_bounds(cls, value: int) -> int:
+        if value != 0 and not 2 <= value <= 1440:
+            raise ValueError("RUN_HEARTBEAT_TIMEOUT_MINUTES must be 0 (off) or between 2 and 1440 minutes")
+        return value
 
     @field_validator("API_LIMIT_CONCURRENCY", mode="before")
     @classmethod

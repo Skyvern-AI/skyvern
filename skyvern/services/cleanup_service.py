@@ -17,6 +17,8 @@ from pathlib import Path
 import psutil
 import structlog
 
+from skyvern.cli.core.client import shutdown_hosted_drivers, sweep_idle_hosted_drivers
+from skyvern.cli.core.session_manager import is_stateless_http_mode
 from skyvern.config import settings
 from skyvern.forge import app
 from skyvern.forge.sdk.api.files import RUN_TEMP_NAMESPACE
@@ -132,8 +134,8 @@ def sweep_stale_temp_artifacts(max_age_hours: float | None = None) -> int:
     TEMP_PATH is intentionally excluded, with one exception: the run-scoped namespace
     (TEMP_PATH/runs/<org>/<run>) IS swept, because it is single-tenant and keyed by run
     identity — an aged run dir is a crash-path orphan. The rest of TEMP_PATH stays out:
-    mtime is not a safe liveness signal there — reused generated-script caches
-    (TEMP_PATH/<script_id>) are overwritten in place without bumping the dir mtime, and
+    mtime is not a safe liveness signal there — revision-scoped generated-script caches
+    (TEMP_PATH/<script_id>/<script_revision_id>) are written without bumping the parent dir mtime, and
     browser-session profile dirs are written only at open/close — both read as stale while
     actively in use. LOG_PATH/DOWNLOAD_PATH are single-tenant and keyed per run, so an aged
     top-level entry there is genuinely finished.
@@ -307,6 +309,61 @@ async def stop_temp_artifact_sweep() -> None:
         except asyncio.CancelledError:
             pass
     _temp_sweep_task = None
+
+
+async def _hosted_driver_sweep_loop() -> None:
+    while True:
+        await asyncio.sleep(settings.HOSTED_MCP_DRIVER_SWEEP_INTERVAL_SECONDS)
+        try:
+            await sweep_idle_hosted_drivers()
+        except Exception:
+            LOG.exception("Hosted MCP driver sweep failed")
+
+
+_hosted_driver_sweep_task: asyncio.Task | None = None
+
+
+def start_hosted_driver_sweep() -> asyncio.Task | None:
+    """Start the idle sweep of hosted MCP drivers (idempotent; only where the API serves stateless hosted MCP).
+
+    It stops drivers by owner, never by process name or age, so it runs without the cleanup cron's
+    "no active runs anywhere" gate, which would keep it from ever running in a busy deployment.
+    """
+    global _hosted_driver_sweep_task
+
+    if not is_stateless_http_mode():
+        return None
+    if settings.HOSTED_MCP_DRIVER_SWEEP_INTERVAL_SECONDS <= 0 or settings.HOSTED_MCP_DRIVER_IDLE_SECONDS <= 0:
+        LOG.info(
+            "Hosted MCP driver sweep disabled",
+            interval_seconds=settings.HOSTED_MCP_DRIVER_SWEEP_INTERVAL_SECONDS,
+            idle_seconds=settings.HOSTED_MCP_DRIVER_IDLE_SECONDS,
+        )
+        return None
+    if _hosted_driver_sweep_task is not None and not _hosted_driver_sweep_task.done():
+        return _hosted_driver_sweep_task
+
+    _hosted_driver_sweep_task = asyncio.create_task(_hosted_driver_sweep_loop())
+    LOG.info(
+        "Started hosted MCP driver sweep",
+        interval_seconds=settings.HOSTED_MCP_DRIVER_SWEEP_INTERVAL_SECONDS,
+        idle_seconds=settings.HOSTED_MCP_DRIVER_IDLE_SECONDS,
+    )
+    return _hosted_driver_sweep_task
+
+
+async def stop_hosted_driver_sweep() -> None:
+    """Stop the sweep, then every hosted MCP driver, as the API shuts down."""
+    global _hosted_driver_sweep_task
+
+    task, _hosted_driver_sweep_task = _hosted_driver_sweep_task, None
+    try:
+        if task is not None and not task.done():
+            task.cancel()
+            # asyncio.wait, unlike awaiting the task, lets the caller's own cancellation propagate.
+            await asyncio.wait({task})
+    finally:
+        await shutdown_hosted_drivers()
 
 
 def get_stale_browser_processes(max_age_minutes: int = 60) -> list[psutil.Process]:

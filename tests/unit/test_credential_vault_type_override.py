@@ -285,6 +285,16 @@ class TestGetCredentialVaultServiceRouting:
             assert result is mock_gcp
 
     @pytest.mark.asyncio
+    async def test_override_onepassword_uses_registered_service(self) -> None:
+        mock_onepassword = MagicMock(spec=CredentialVaultService)
+        with patch("skyvern.forge.sdk.routes.credentials.app") as mock_app:
+            mock_app.ONEPASSWORD_CREDENTIAL_VAULT_SERVICE = mock_onepassword
+            result = await _get_credential_vault_service(
+                vault_type_override=CredentialVaultType.ONEPASSWORD,
+            )
+            assert result is mock_onepassword
+
+    @pytest.mark.asyncio
     async def test_override_gcp_raises_when_not_configured(self) -> None:
         with patch("skyvern.forge.sdk.routes.credentials.app") as mock_app:
             mock_app.GCP_CREDENTIAL_VAULT_SERVICE = None
@@ -473,6 +483,48 @@ class TestCustomVaultOrganizationPreflight:
         assert exc_info.value.status_code == 400
         create_credential.assert_not_awaited()
         api_client.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_update_onepassword_credential_rejects_before_agent_validation() -> None:
+    existing_credential = SimpleNamespace(
+        credential_id="cred_test",
+        organization_id="org_test",
+        item_id="item_test",
+        vault_type=CredentialVaultType.ONEPASSWORD,
+    )
+    credentials_repository = SimpleNamespace(get_credential=AsyncMock(return_value=existing_credential))
+    agent_functions = SimpleNamespace(
+        should_lock_credential_write=AsyncMock(return_value=False),
+        validate_credential_write=AsyncMock(),
+        prepare_credential_update=AsyncMock(),
+    )
+    data = CreateCredentialRequest(
+        name="Test",
+        credential_type=CredentialType.PASSWORD,
+        credential=NonEmptyPasswordCredential(username="user", password="pass"),
+    )
+    credential_service = SimpleNamespace(
+        update_credential=AsyncMock(side_effect=HTTPException(status_code=405, detail="unsupported"))
+    )
+
+    with patch("skyvern.forge.sdk.routes.credentials.app") as mock_app:
+        mock_app.DATABASE = SimpleNamespace(credentials=credentials_repository)
+        mock_app.AGENT_FUNCTION = agent_functions
+        mock_app.CREDENTIAL_VAULT_SERVICES = {CredentialVaultType.ONEPASSWORD: credential_service}
+        with pytest.raises(HTTPException) as exc_info:
+            await credentials_routes.update_credential(
+                background_tasks=BackgroundTasks(),
+                credential_id="cred_test",
+                data=data,
+                current_org=SimpleNamespace(organization_id="org_test"),
+            )
+
+    assert exc_info.value.status_code == 405
+    agent_functions.should_lock_credential_write.assert_not_awaited()
+    agent_functions.validate_credential_write.assert_not_awaited()
+    agent_functions.prepare_credential_update.assert_not_awaited()
+    credential_service.update_credential.assert_not_awaited()
 
 
 class TestTemporaryTestLoginCredentialCleanup:

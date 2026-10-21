@@ -1,8 +1,10 @@
 from __future__ import annotations
 
+import asyncio
 import contextlib
 import contextvars
 import json
+import math
 import re
 import time
 from collections.abc import AsyncIterator, Callable, Iterator
@@ -31,6 +33,7 @@ from litellm.litellm_core_utils.core_helpers import safe_deep_copy
 from litellm.types.llms.openai import ResponsesAPIResponse
 from litellm.types.utils import ModelResponse as LiteLLMModelResponse
 from litellm.types.utils import Usage as LiteLLMUsage
+from litellm.utils import CustomStreamWrapper
 from openai import AsyncStream, omit
 from openai.types.chat import ChatCompletionChunk
 from openai.types.completion_usage import CompletionUsage
@@ -42,8 +45,10 @@ from openai.types.responses.response_function_call_output_item_list_param import
 from skyvern.forge.sdk.api.llm.copilot_model_usage import (
     CopilotModelUsageEvent,
     _emit_copilot_model_usage,
+    _observe_copilot_model_usage,
     normalize_gen_ai_provider,
 )
+from skyvern.forge.sdk.api.llm.litellm_pricing import long_prompt_cost_multiplier
 from skyvern.forge.sdk.copilot.cache_envelope import (
     CacheableSystemInstructions,
     ExplicitCacheEnvelope,
@@ -58,6 +63,9 @@ from skyvern.forge.sdk.copilot.pending_operation import pending_operation
 
 LOG = structlog.get_logger()
 _DATED_MODEL_SUFFIX = re.compile(r"-\d{4}-\d{2}-\d{2}$")
+# Anthropic sends each tool argument in one piece after a silence as long as its generation, so this must stay
+# above the time to write the largest argument (~29k tokens at the slowest observed Sonnet rate).
+_STREAM_PROGRESS_TIMEOUT_SECONDS = 300.0
 
 
 @dataclass(frozen=True, slots=True)
@@ -112,6 +120,7 @@ class CopilotModelCallTelemetry:
     model_call_index: int
     response_model: str | None = None
     served_provider: str | None = None
+    served_model: str | None = None
     cache_mode: Literal["implicit", "explicit"] = "implicit"
     cache_breakpoint_count: int = 0
     cache_stable_prefix_chars: int | None = None
@@ -120,6 +129,8 @@ class CopilotModelCallTelemetry:
     output_tokens: int | None = None
     cache_read_tokens: int | None = None
     cache_write_tokens: int | None = None
+    reported_cost: float | None = None
+    service_tier: str | None = None
     finish_reason: str | None = None
     incomplete_details: dict[str, str] | None = None
     refusal: bool | None = None
@@ -128,6 +139,9 @@ class CopilotModelCallTelemetry:
     def capture(self, usage: Any | None) -> None:
         if usage is None:
             return
+        cost = _usage_field(usage, "cost")
+        if type(cost) in {int, float} and math.isfinite(cost) and cost >= 0:
+            self.reported_cost = float(cost)
         input_tokens = _usage_field(usage, "prompt_tokens", "input_tokens")
         output_tokens = _usage_field(usage, "completion_tokens", "output_tokens")
         if isinstance(input_tokens, int) and not isinstance(input_tokens, bool):
@@ -188,9 +202,34 @@ def model_attempt_telemetry_scope() -> Iterator[CopilotModelAttemptTelemetry]:
 
 
 def _model_call_cost(telemetry: CopilotModelCallTelemetry, model: str) -> float | None:
+    if telemetry.reported_cost is not None:
+        return telemetry.reported_cost
     if telemetry.input_tokens is None or telemetry.output_tokens is None:
         return None
     pricing_model = _DATED_MODEL_SUFFIX.sub("", model)
+    provider = normalize_gen_ai_provider(telemetry.served_provider, pricing_model)
+    pricing_provider: dict[str, Any] = {}
+    if provider == "aws.bedrock":
+        # Bedrock's response can strip the regional inference profile. Price the actual served hop,
+        # or leave it unknown rather than selecting a bare Claude name's direct Anthropic rate.
+        if pricing_model.startswith("claude-"):
+            pricing_model = _DATED_MODEL_SUFFIX.sub("", telemetry.served_model or pricing_model)
+        if pricing_model.startswith("claude-"):
+            return None
+        pricing_provider["custom_llm_provider"] = "bedrock"
+    tier = telemetry.service_tier
+    if provider in {"openai", "azure.ai.openai", "gcp.vertex_ai", "gcp.gemini"} and tier not in {
+        "default",
+        "standard",
+        "flex",
+        "priority",
+    }:
+        return None
+    # The shared handler also treats these as pricing-library gaps; absent billed cost stays unknown here.
+    if tier == "flex" and (
+        provider in {"gcp.vertex_ai", "gcp.gemini"} or (provider == "openai" and telemetry.input_tokens > 272_000)
+    ):
+        return None
     try:
         input_cost, output_cost = litellm.cost_per_token(
             model=pricing_model,
@@ -199,10 +238,12 @@ def _model_call_cost(telemetry: CopilotModelCallTelemetry, model: str) -> float 
             cache_read_input_tokens=telemetry.cache_read_tokens,
             cache_creation_input_tokens=telemetry.cache_write_tokens,
             call_type="aresponses",
+            service_tier=tier,
+            **pricing_provider,
         )
     except Exception:
         return None
-    return float(input_cost + output_cost)
+    return float(input_cost + output_cost) * long_prompt_cost_multiplier(pricing_model, telemetry.input_tokens)
 
 
 def _is_azure_openai_host(base_url: str) -> bool:
@@ -230,7 +271,8 @@ def _log_model_call_usage(
 ) -> None:
     """Emit one Datadog-searchable usage event after provider usage arrives."""
 
-    if telemetry.input_tokens is None and telemetry.output_tokens is None:
+    if telemetry.input_tokens is None and telemetry.output_tokens is None and telemetry.reported_cost is None:
+        _observe_copilot_model_usage(CopilotModelUsageEvent(request_model=model))
         return
 
     billing_model = telemetry.response_model or model
@@ -250,6 +292,7 @@ def _log_model_call_usage(
             cache_read_tokens=telemetry.cache_read_tokens,
             cache_creation_tokens=telemetry.cache_write_tokens,
             cost=_model_call_cost(telemetry, billing_model),
+            cost_source="provider_reported" if telemetry.reported_cost is not None else "litellm_estimate",
             model_call_index=telemetry.model_call_index,
             cache_mode=telemetry.cache_mode,
             cache_breakpoint_count=telemetry.cache_breakpoint_count,
@@ -290,6 +333,14 @@ def _capture_served_provider(telemetry: CopilotModelCallTelemetry, response: obj
     provider = hidden_params.get("custom_llm_provider") if isinstance(hidden_params, dict) else None
     if isinstance(provider, str) and provider:
         telemetry.served_provider = provider
+    served_model = hidden_params.get("litellm_model_name") if isinstance(hidden_params, dict) else None
+    if isinstance(served_model, str) and served_model:
+        telemetry.served_model = served_model
+    tier = getattr(response, "service_tier", None)
+    if not isinstance(tier, str) and isinstance(hidden_params, dict):
+        tier = hidden_params.get("skyvern_served_service_tier")
+    if isinstance(tier, str):
+        telemetry.service_tier = tier
 
 
 def _capture_chat_stop_metadata(telemetry: CopilotModelCallTelemetry, response: object) -> None:
@@ -342,10 +393,73 @@ def _capture_responses_stop_metadata(telemetry: CopilotModelCallTelemetry, respo
         telemetry.content_filter = False
 
 
-class _UsageCapturingStream:
+def _is_stream_progress(chunk: ChatCompletionChunk) -> bool:
+    for choice in chunk.choices:
+        delta = choice.delta
+        if choice.finish_reason or delta.content or delta.tool_calls:
+            return True
+        # Keep-alives arrive as empty deltas, and an empty thinking delta is not output. LiteLLM deletes unset
+        # reasoning fields from its Delta, so they are read with getattr.
+        if getattr(delta, "reasoning_content", None):
+            return True
+        for block in getattr(delta, "thinking_blocks", None) or ():
+            if block.get("thinking") or block.get("signature") or block.get("data"):
+                return True
+    return False
+
+
+class _ProgressGuardedStream:
     def __init__(
         self,
         stream: AsyncStream[ChatCompletionChunk],
+        model: str,
+        telemetry: CopilotModelCallTelemetry | None,
+    ) -> None:
+        self._stream = stream
+        self._iterator = stream.__aiter__()
+        self._model = model
+        self._telemetry = telemetry
+        self._last_progress = asyncio.get_running_loop().time()
+        self._made_progress = False
+        self._chunks_seen = 0
+
+    def __aiter__(self) -> _ProgressGuardedStream:
+        return self
+
+    async def __anext__(self) -> ChatCompletionChunk:
+        timeout = asyncio.timeout_at(self._last_progress + _STREAM_PROGRESS_TIMEOUT_SECONDS)
+        try:
+            async with timeout:
+                chunk = await self._iterator.__anext__()
+        except TimeoutError:
+            if not timeout.expired():
+                raise
+            served_provider = self._telemetry.served_provider if self._telemetry is not None else None
+            if served_provider is None and isinstance(self._stream, CustomStreamWrapper):
+                served_provider = self._stream.custom_llm_provider
+            LOG.warning(
+                "Copilot model stream made no progress",
+                model=self._model,
+                served_provider=served_provider,
+                made_progress=self._made_progress,
+                chunks_seen=self._chunks_seen,
+            )
+            raise litellm.Timeout(
+                f"Copilot model stream made no progress for {_STREAM_PROGRESS_TIMEOUT_SECONDS:g} s",
+                model=self._model,
+                llm_provider=served_provider or "",
+            ) from None
+        self._chunks_seen += 1
+        if _is_stream_progress(chunk):
+            self._made_progress = True
+            self._last_progress = asyncio.get_running_loop().time()
+        return chunk
+
+
+class _UsageCapturingStream:
+    def __init__(
+        self,
+        stream: AsyncIterator[ChatCompletionChunk],
         telemetry: CopilotModelCallTelemetry,
     ) -> None:
         self._stream = stream
@@ -389,6 +503,7 @@ class _ResponsesUsageCapturingStream:
         if usage is not None:
             _capture_usage(self._telemetry, usage)
         if response is not None:
+            _capture_served_provider(self._telemetry, response)
             _capture_responses_stop_metadata(self._telemetry, response)
         if _usage_field(event, "type") in {"response.refusal.delta", "response.refusal.done"}:
             self._telemetry.refusal = True
@@ -710,9 +825,13 @@ class CopilotLitellmModel(LitellmModel):
             return result
 
         response, response_stream = result
+        if telemetry is not None and isinstance(response_stream, CustomStreamWrapper):
+            telemetry.served_provider = response_stream.custom_llm_provider
+            telemetry.served_model = response_stream.model
+        guarded_stream = _ProgressGuardedStream(response_stream, self.model, telemetry)
         if telemetry is None:
-            return result
-        capturing_stream = _UsageCapturingStream(response_stream, telemetry)
+            return response, cast(AsyncStream[ChatCompletionChunk], guarded_stream)
+        capturing_stream = _UsageCapturingStream(guarded_stream, telemetry)
         return response, cast(AsyncStream[ChatCompletionChunk], capturing_stream)
 
     async def _fetch_explicit_responses(
@@ -838,6 +957,7 @@ class CopilotLitellmModel(LitellmModel):
         telemetry = current_model_call_telemetry()
         if telemetry is not None:
             telemetry.served_provider = served_provider
+            telemetry.served_model = served_model
 
         if stream:
             raw_stream = _typed_stream_errors(cast(AsyncIterator[Any], raw_response), served_model, served_provider)
@@ -868,6 +988,7 @@ class CopilotLitellmModel(LitellmModel):
         if telemetry is not None:
             if isinstance(raw_response.model, str):
                 telemetry.response_model = raw_response.model
+            _capture_served_provider(telemetry, raw_response)
             _capture_usage(telemetry, raw_response.usage)
             _capture_responses_stop_metadata(telemetry, raw_response)
         model_response = responses_api_bridge.transformation_handler.transform_response(

@@ -1504,9 +1504,7 @@ def _projected_run_result(block_label: str, end_url: str) -> dict[str, Any]:
         created_at=datetime(2026, 1, 1, tzinfo=UTC),
         modified_at=datetime(2026, 1, 1, tzinfo=UTC),
     )
-    _attach_block_fact_projection(
-        result["data"], [row], {}, unreported_predecessor_labels=[], sensitive_origin_run=False
-    )
+    _attach_block_fact_projection(result["data"], [row], {}, unreported_predecessor_labels=[])
     return result
 
 
@@ -1576,7 +1574,6 @@ def test_projection_writer_emits_exactly_the_keys_the_envelope_scan_skips() -> N
         [row],
         {"submit_demo": ["clicked submit"]},
         unreported_predecessor_labels=["earlier_block"],
-        sensitive_origin_run=False,
     )
 
     assert set(data) == _PROJECTED_BLOCK_FACT_KEYS

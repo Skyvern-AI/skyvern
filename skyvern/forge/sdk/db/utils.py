@@ -5,7 +5,7 @@ from typing import TYPE_CHECKING, Any
 import pydantic
 import pydantic.json
 import structlog
-from sqlalchemy import Column, ColumnElement, or_
+from sqlalchemy import Column, ColumnElement, Table, func, inspect, or_
 
 from skyvern.constants import SCRUBBED_VALUE
 from skyvern.forge.sdk.artifact.models import Artifact, ArtifactType
@@ -56,6 +56,7 @@ from skyvern.forge.sdk.schemas.workflow_copilot import WorkflowCopilotChatMessag
 from skyvern.forge.sdk.schemas.workflow_copilot import WorkflowCopilotMessageFeedback
 from skyvern.forge.sdk.schemas.workflow_runs import WorkflowRunBlock
 from skyvern.forge.sdk.schemas.workflow_schedules import WorkflowSchedule
+from skyvern.forge.sdk.workflow import response_value_caps
 from skyvern.forge.sdk.workflow.constants import OUTPUT_PARAMETER_MAX_VALUE_BYTES
 from skyvern.forge.sdk.workflow.models.parameter import (
     AWSSecretParameter,
@@ -73,6 +74,11 @@ from skyvern.forge.sdk.workflow.models.workflow import (
     WorkflowRunParameter,
     WorkflowRunStatus,
     WorkflowStatus,
+)
+from skyvern.forge.sdk.workflow.response_value_caps import (
+    capped_extracted_information,
+    collect_extracted_information,
+    precomputed_capped_value,
 )
 from skyvern.schemas.browser_settings import BrowserSettingsReceipt, BrowserSettingsStatus
 from skyvern.schemas.proxy_pinning import redact_proxy_location
@@ -208,13 +214,7 @@ def deserialize_proxy_location(
                     subdivision=redact_proxy_location(subdivision),
                 )
                 data["subdivision"] = None
-            result = GeoTarget.model_validate(data)
-            LOG.info(
-                "Deserialized proxy_location as GeoTarget",
-                db_value=redact_proxy_location(value),
-                result=redact_proxy_location(result),
-            )
-            return result
+            return GeoTarget.model_validate(data)
         except (json.JSONDecodeError, ValueError) as e:
             if raise_on_invalid_geo_target:
                 raise
@@ -326,14 +326,20 @@ def as_stored_json(value: typing.Any) -> typing.Any:
     return _scrub_nul_chars(json.loads(_custom_json_serializer(value)))
 
 
-def truncate_oversized_jsonb_value(value: typing.Any, *, context: dict | None = None) -> typing.Any:
-    """Fail-open size guard for jsonb-column writes (SKY-9779)."""
+class _GuardedJsonbValue(typing.NamedTuple):
+    value: Any
+    # None when the size was never taken: a scalar fast path, or a failed serialization.
+    size_bytes: int | None
+    serialized: str | None = None
+
+
+def _guard_jsonb_size(value: Any, *, context: dict | None = None) -> _GuardedJsonbValue:
     # Fast-path: None and scalars can't approach the cap; skip the full re-serialization
     # that 99.9% of writes would pay for nothing.
     if value is None or isinstance(value, (bool, int, float)):
-        return value
+        return _GuardedJsonbValue(value, None)
     if isinstance(value, str) and len(value) <= OUTPUT_PARAMETER_MAX_VALUE_BYTES:
-        return value
+        return _GuardedJsonbValue(value, None)
 
     try:
         serialized = _custom_json_serializer(value)
@@ -343,11 +349,11 @@ def truncate_oversized_jsonb_value(value: typing.Any, *, context: dict | None = 
             exc_info=True,
             context=context or {},
         )
-        return value
+        return _GuardedJsonbValue(value, None)
 
     size_bytes = len(serialized.encode("utf-8"))
     if size_bytes <= OUTPUT_PARAMETER_MAX_VALUE_BYTES:
-        return value
+        return _GuardedJsonbValue(value, size_bytes, serialized)
 
     LOG.warning(
         "Truncating oversized jsonb value",
@@ -355,12 +361,83 @@ def truncate_oversized_jsonb_value(value: typing.Any, *, context: dict | None = 
         limit_bytes=OUTPUT_PARAMETER_MAX_VALUE_BYTES,
         **(context or {}),
     )
-    return {
-        "truncated": True,
-        "reason": "exceeded_max_jsonb_value_size",
-        "original_size_bytes": size_bytes,
-        "limit_bytes": OUTPUT_PARAMETER_MAX_VALUE_BYTES,
-    }
+    return _GuardedJsonbValue(
+        {
+            "truncated": True,
+            "reason": "exceeded_max_jsonb_value_size",
+            "original_size_bytes": size_bytes,
+            "limit_bytes": OUTPUT_PARAMETER_MAX_VALUE_BYTES,
+        },
+        size_bytes,
+    )
+
+
+def truncate_oversized_jsonb_value(value: typing.Any, *, context: dict | None = None) -> typing.Any:
+    """Fail-open size guard for jsonb-column writes (SKY-9779)."""
+    return _guard_jsonb_size(value, context=context).value
+
+
+class CappedJsonbWrite(typing.NamedTuple):
+    """The raw value and any response-sized cache to persist."""
+
+    value: Any
+    capped_value: Any | None
+    extracted_information: list[Any] | None = None
+
+
+def capped_jsonb_write(
+    value: Any, *, context: dict | None = None, with_extracted_information: bool = False
+) -> CappedJsonbWrite:
+    """Apply the storage guard and precompute the capped copy run-detail reads need.
+
+    Capping costs a pass over the value, so pay it here — once, on the worker — instead of on
+    the API event loop on every view of the run. An ordinary write skips it on the size the
+    storage guard already measured, without serializing again: ``_custom_json_serializer``
+    escapes non-ASCII and pads its separators, so its byte count is never below the compact
+    wire size the response cap measures.
+    """
+    guarded = _guard_jsonb_size(value, context=context)
+    if guarded.value is not value:
+        # The storage guard replaced the value with a marker, which is already tiny.
+        return CappedJsonbWrite(guarded.value, None)
+    if value is None or isinstance(value, (bool, int, float)):
+        return CappedJsonbWrite(value, None)
+    # Through the module, not a local binding: the cap has one runtime source of truth.
+    if guarded.size_bytes is not None and guarded.size_bytes <= response_value_caps.RUN_RESPONSE_MAX_VALUE_BYTES:
+        return CappedJsonbWrite(value, None)
+
+    try:
+        stored_value = json.loads(guarded.serialized) if guarded.serialized is not None else as_stored_json(value)
+    except Exception:
+        LOG.warning("Failed to normalize jsonb value for response capping; leaving it uncached", exc_info=True)
+        return CappedJsonbWrite(value, None)
+
+    capped = precomputed_capped_value(stored_value, **(context or {}))
+    if capped is None:
+        return CappedJsonbWrite(value, None)
+    extracted_information = None
+    if with_extracted_information:
+        extracted_information = capped_extracted_information(
+            collect_extracted_information(stored_value), **(context or {})
+        )
+    return CappedJsonbWrite(value, capped, extracted_information)
+
+
+def prefer_capped_columns(table: Table, *, raw: str, capped: str) -> list[ColumnElement[Any]]:
+    """``table``'s columns with ``raw`` replaced by ``COALESCE(capped, raw)`` under its own name.
+
+    Postgres COALESCE stops at its first non-null argument, so a row that has a capped copy
+    never dereferences the raw column's TOAST pointer: the multi-megabyte value is neither
+    decompressed nor sent. Rows written before the capped column existed fall through to the
+    raw value and the reader trims it on the fly.
+    """
+    return [
+        func.coalesce(table.c[capped], table.c[raw], type_=table.c[raw].type).label(raw)
+        if column.name == raw
+        else column
+        for column in table.c
+        if column.name != capped
+    ]
 
 
 def convert_to_task(task_obj: TaskModel, debug_enabled: bool = False, workflow_permanent_id: str | None = None) -> Task:
@@ -691,6 +768,8 @@ def convert_to_workflow(
         import_error=workflow_model.import_error,
         created_by=workflow_model.created_by,
         edited_by=workflow_model.edited_by,
+        edited_for=workflow_model.edited_for,
+        build_source=workflow_model.build_source,
     )
 
 
@@ -740,6 +819,7 @@ def convert_to_workflow_run(
         cdp_connect_headers=workflow_run_model.cdp_connect_headers,
         browser_address=workflow_run_model.browser_address,
         job_id=workflow_run_model.job_id,
+        setup_completed=workflow_run_model.setup_completed,
         depends_on_workflow_run_id=workflow_run_model.depends_on_workflow_run_id,
         sequential_key=workflow_run_model.sequential_key,
         sequential_credential_id=workflow_run_model.sequential_credential_id,
@@ -900,6 +980,11 @@ def convert_to_workflow_run_output_parameter(
         output_parameter_id=workflow_run_output_parameter_model.output_parameter_id,
         value=workflow_run_output_parameter_model.value,
         created_at=workflow_run_output_parameter_model.created_at,
+        precomputed_extracted_information=(
+            None
+            if "capped_extracted_information" in inspect(workflow_run_output_parameter_model).unloaded
+            else workflow_run_output_parameter_model.capped_extracted_information
+        ),
     )
 
 
