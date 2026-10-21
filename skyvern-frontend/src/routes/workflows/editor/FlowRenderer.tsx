@@ -29,6 +29,7 @@ import {
   selectEditorMutationLocked,
   commitYamlDraft,
   refuseMutationDuringYamlCommit,
+  selectSaveLockReason,
   filterWorkflowChanges,
   isWorkflowMutation,
   isLockedByOther,
@@ -779,6 +780,9 @@ function FlowRenderer({
   const setGetSaveDataRef = useRef(workflowChangesStore.setGetSaveData);
   setGetSaveDataRef.current = workflowChangesStore.setGetSaveData;
   const saveWorkflow = useWorkflowSave({ status: "published" });
+  const saveLockReason = useWorkflowYamlEditorStore(selectSaveLockReason);
+  const leaveSaveReason =
+    workflowChangesStore.saveBlockedReason || saveLockReason;
   useShouldNotifyWhenClosingTab(!readOnly && workflowChangesStore.hasChanges);
   const pendingGoalChanges = useCopilotActionStore(
     (state) => state.pendingGoalChanges,
@@ -2579,7 +2583,7 @@ function FlowRenderer({
                         ? "has a new Goal it doesn't follow yet. Apply it"
                         : "have new Goals they don't follow yet. Apply them"
                     } first, or continue with the last saved version.`
-                  : workflowChangesStore.saveBlockedReason ||
+                  : leaveSaveReason ||
                     "Your workflow has unsaved changes. Do you want to save them before leaving?"}
               </DialogDescription>
             </DialogHeader>
@@ -2621,7 +2625,7 @@ function FlowRenderer({
                   }}
                   disabled={
                     workflowChangesStore.saveIsPending ||
-                    Boolean(workflowChangesStore.saveBlockedReason)
+                    Boolean(leaveSaveReason)
                   }
                 >
                   {workflowChangesStore.saveIsPending && (
