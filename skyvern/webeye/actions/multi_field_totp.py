@@ -15,13 +15,14 @@ import structlog
 from playwright.async_api import Locator, Page
 
 from skyvern.constants import SKYVERN_ID_ATTR
+from skyvern.exceptions import SkyvernPageAnalysisTimeout
 from skyvern.forge.sdk.core import skyvern_context
 from skyvern.forge.sdk.core.skyvern_context import MultiFieldTotpAttempt
 from skyvern.utils.contained_effects import contained_effect
 from skyvern.webeye.scraper.scraped_page import ScrapedPage
 from skyvern.webeye.scraper.scraper import structural_identity
 from skyvern.webeye.utils.document import get_main_document_loader_id
-from skyvern.webeye.utils.dom import resolve_locator
+from skyvern.webeye.utils.dom import bounded_lookup_call, resolve_locator
 from skyvern.webeye.utils.page import SkyvernFrame
 
 LOG = structlog.get_logger()
@@ -499,7 +500,7 @@ async def _refresh_multi_field_totp_group_binding(
                 if not css or not frame:
                     return classified("box_locator_metadata_missing", MultiFieldTotpBindingFailure.UNCONFIRMED)
                 locator, _ = await resolve_locator(scraped_page, page, frame, css)
-                count = await locator.count()
+                count = await bounded_lookup_call(locator.count)
                 if count not in (0, 1):
                     return classified("original_box_count_ambiguous", MultiFieldTotpBindingFailure.UNCONFIRMED)
                 live_boxes.append(count == 1)
@@ -523,7 +524,7 @@ async def _refresh_multi_field_totp_group_binding(
             if not container_css or not container_frame or container_frame != original_group.frame:
                 return classified("container_locator_metadata_missing", MultiFieldTotpBindingFailure.UNCONFIRMED)
             locator, _ = await resolve_locator(scraped_page, page, container_frame, container_css)
-            container_count = await locator.count()
+            container_count = await bounded_lookup_call(locator.count)
             if container_count not in (0, 1):
                 return classified("original_container_count_ambiguous", MultiFieldTotpBindingFailure.UNCONFIRMED)
             container_live = container_count == 1
@@ -585,6 +586,8 @@ async def _refresh_multi_field_totp_group_binding(
         if not loader_id_known:
             return classified("loader_id_unknown", MultiFieldTotpBindingFailure.UNCONFIRMED)
         return fresh, group.box_element_ids
+    except SkyvernPageAnalysisTimeout:
+        raise
     except Exception:
         return classified("observation_failed", MultiFieldTotpBindingFailure.UNCONFIRMED)
 
@@ -712,7 +715,7 @@ class MultiFieldTotpFillObserver:
 
     async def refresh(self, boxes: list[Locator]) -> None:
         try:
-            if not boxes or await boxes[0].count() != 1:
+            if not boxes or await bounded_lookup_call(boxes[0].count) != 1:
                 return
             count = await boxes[0].evaluate(
                 "(box, prefix) => box.ownerDocument.__skyvernOtpFillObserver?.prefix === prefix ? Number(box.ownerDocument.documentElement.getAttribute('data-skyvern-otp-max-filled')) : 0",
@@ -721,6 +724,8 @@ class MultiFieldTotpFillObserver:
             )
             if isinstance(count, int) and not isinstance(count, bool) and 0 <= count <= self.attempt.expected_digits:
                 self.attempt.observed_max_filled = max(self.attempt.observed_max_filled, count)
+        except SkyvernPageAnalysisTimeout:
+            raise
         except Exception:
             # The console count survives destruction of the document that held the attribute.
             pass
@@ -782,13 +787,15 @@ async def _multi_field_totp_widget_scopes(boxes: list[Locator], *, include_ances
     if not boxes:
         return []
     form = boxes[0].locator("xpath=ancestor::form[1]")
-    if await form.count() == 1 and all([await form.filter(has=box).count() == 1 for box in boxes]):
+    if await bounded_lookup_call(form.count) == 1 and all(
+        [await bounded_lookup_call(form.filter(has=box).count) == 1 for box in boxes]
+    ):
         return [form]
     scopes = []
     ancestors = boxes[0].locator("xpath=ancestor::*[not(self::body or self::html)]")
-    for index in reversed(range(await ancestors.count())):
+    for index in reversed(range(await bounded_lookup_call(ancestors.count))):
         ancestor = ancestors.nth(index)
-        if all([await ancestor.filter(has=box).count() == 1 for box in boxes]):
+        if all([await bounded_lookup_call(ancestor.filter(has=box).count) == 1 for box in boxes]):
             scopes.append(ancestor)
             if not include_ancestors or len(scopes) == 3:
                 break
@@ -992,7 +999,7 @@ async def multi_field_totp_submission_evidence(
     boxes: list[Locator] = []
     try:
         boxes = await _retry_box_locators(page, scraped_page, attempt.box_element_ids)
-        counts = [await box.count() for box in boxes]
+        counts = [await bounded_lookup_call(box.count) for box in boxes]
         if not all(count == 1 for count in counts):
             binding = await _refresh_multi_field_totp_group_binding(scraped_page, page, attempt)
             if isinstance(binding, MultiFieldTotpBindingFailure):
@@ -1034,7 +1041,9 @@ async def _multi_field_totp_document_changed(page: Page, original_url: str, old_
 
 async def _multi_field_totp_boxes_disappeared(boxes: list[Locator]) -> bool:
     try:
-        return bool(boxes) and all([await box.count() == 0 for box in boxes])
+        return bool(boxes) and all([await bounded_lookup_call(box.count) == 0 for box in boxes])
+    except SkyvernPageAnalysisTimeout:
+        raise
     except Exception:
         return False
 
@@ -1155,7 +1164,7 @@ async def submit_multi_field_totp_retry(
             candidates_considered += 1
             control, fields = candidate.locator, candidate.log_fields
             try:
-                if await control.count() != 1:
+                if await bounded_lookup_call(control.count) != 1:
                     record("trial", "failed", fields, reason="submit_control_not_actionable")
                     continue
                 await dispatch(control, "trial", fields)
@@ -1164,9 +1173,11 @@ async def submit_multi_field_totp_retry(
                 with timed("pre_evidence_ms"):
                     if await multi_field_totp_submission_evidence(page, scraped_page, attempt):
                         return True
-                if await control.count() != 1:
+                if await bounded_lookup_call(control.count) != 1:
                     record("click", "failed", fields, reason="submit_control_not_actionable")
                     continue
+            except SkyvernPageAnalysisTimeout:
+                raise
             except Exception as exc:
                 last_trial_error = exc
                 continue
@@ -1174,7 +1185,7 @@ async def submit_multi_field_totp_retry(
             break
         phase = "click" if chosen is not None else "enter"
         if chosen is None:
-            if not boxes or await boxes[-1].count() != 1:
+            if not boxes or await bounded_lookup_call(boxes[-1].count) != 1:
                 record("enter", "failed", {}, reason="submit_control_not_actionable")
                 raise MultiFieldTotpSubmitControlNotActionable() from last_trial_error
             chosen = boxes[-1]
@@ -1184,7 +1195,7 @@ async def submit_multi_field_totp_retry(
             with timed("pre_evidence_ms"):
                 if await multi_field_totp_submission_evidence(page, scraped_page, attempt):
                     return True
-            if await chosen.count() != 1:
+            if await bounded_lookup_call(chosen.count) != 1:
                 record("enter", "failed", fields, reason="submit_control_not_actionable")
                 raise MultiFieldTotpSubmitControlNotActionable() from last_trial_error
         try:

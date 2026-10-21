@@ -36,6 +36,7 @@ from skyvern.forge.sdk.trace import apply_context_attrs, traced, traced_span
 from skyvern.utils.image_resizer import Resolution
 from skyvern.utils.token_counter import approx_count_tokens
 from skyvern.utils.url_validators import strip_query_params
+from skyvern.webeye.action_deadline import bounded_lookup_call
 from skyvern.webeye.browser_state import BLANK_PAGE_URLS, BrowserState
 from skyvern.webeye.scraper.scraped_page import (
     CleanupElementTreeFunc,
@@ -1154,7 +1155,7 @@ class IncrementalScrapePage(ElementTreeBuilder):
             if is_match:
                 if child_locator:
                     return child_locator, True
-                if interactable and parent_locator and await parent_locator.count() > 0:
+                if interactable and parent_locator and await bounded_lookup_call(parent_locator.count) > 0:
                     return parent_locator, True
                 return None, True
 
@@ -1165,7 +1166,7 @@ class IncrementalScrapePage(ElementTreeBuilder):
         if text != value:
             return None, False
 
-        if await parent_locator.count() == 0:
+        if await bounded_lookup_call(parent_locator.count) == 0:
             return None, False
 
         if not interactable:
