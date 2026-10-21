@@ -65,6 +65,7 @@ import { useWorkflowPanelStore } from "@/store/WorkflowPanelStore";
 
 import { useWorkflowTitleStore } from "@/store/WorkflowTitleStore";
 import {
+  AUTHORING_SAVE_MESSAGE,
   commitYamlDraft,
   beginCopilotAcceptance,
   finishCopilotAcceptance,
@@ -5118,6 +5119,28 @@ describe("A49 metadata authorship through editor actions", () => {
       useWorkflowTitleStore.getState().copilotMetadataEdits["wpid_live"],
     ).not.toMatchObject({ graphEdited: true });
     expect(useWorkflowHasChangesStore.getState().hasChanges).toBe(false);
+  });
+
+  test("the leave dialog holds Save changes while authoring owns the editor", async () => {
+    integration.canvas = true;
+    mountEditor();
+    const leave = await screen.findByRole("link", { name: "Leave editor" });
+    await act(async () => {});
+    act(() => {
+      useWorkflowHasChangesStore.getState().setHasChanges(true);
+      useWorkflowYamlEditorStore.setState({ authoringInProgress: true });
+    });
+    fireEvent.click(leave);
+    const save = (await screen.findByRole("button", {
+      name: "Save changes",
+    })) as HTMLButtonElement;
+    expect(save.disabled).toBe(true);
+    expect(screen.getByText(AUTHORING_SAVE_MESSAGE)).toBeTruthy();
+
+    act(() =>
+      useWorkflowYamlEditorStore.setState({ authoringInProgress: false }),
+    );
+    expect(save.disabled).toBe(false);
   });
 
   test.each([false, true])(

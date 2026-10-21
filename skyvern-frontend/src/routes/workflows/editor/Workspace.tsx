@@ -24,6 +24,7 @@ import {
   isYamlCommitOwnerCurrent,
   runWorkflowAuthoringAction,
   refuseMutationDuringYamlCommit,
+  selectSaveLockReason,
   type YamlCommitOwner,
 } from "@/store/WorkflowYamlEditorStore";
 import { apiWorkflowToSettings } from "@/routes/workflows/editor/apiWorkflowToSettings";
@@ -679,6 +680,7 @@ function Workspace({
   );
   const handleOnSave = useSaveWorkflow();
   const saveWorkflow = useWorkflowSave({ status: "published" });
+  const saveLockReason = useWorkflowYamlEditorStore(selectSaveLockReason);
   const yamlCommitOwnerRef = useRef<YamlCommitOwner | null>(null);
   const mountedWorkflowRef = useRef(workflow);
   useLayoutEffect(() => {
@@ -1141,6 +1143,8 @@ function Workspace({
   const preferVncStream = streamTransport !== "cdp";
 
   const workflowChangesStore = useWorkflowHasChangesStore();
+  const cacheDeletionSaveReason =
+    workflowChangesStore.saveBlockedReason || saveLockReason;
 
   useLayoutEffect(() => {
     const hydrateSavedSettings = (
@@ -2740,12 +2744,10 @@ function Workspace({
         <DialogContent>
           <DialogHeader>
             <DialogTitle>
-              {workflowChangesStore.saveBlockedReason
-                ? "Save is paused"
-                : "Are you sure?"}
+              {cacheDeletionSaveReason ? "Save is paused" : "Are you sure?"}
             </DialogTitle>
             <DialogDescription>
-              {workflowChangesStore.saveBlockedReason ||
+              {cacheDeletionSaveReason ||
                 "Saving will delete cached code, and Skyvern will re-generate it in the next run. Proceed?"}
             </DialogDescription>
           </DialogHeader>
@@ -2755,7 +2757,7 @@ function Workspace({
             </DialogClose>
             <Button
               variant="default"
-              disabled={Boolean(workflowChangesStore.saveBlockedReason)}
+              disabled={Boolean(cacheDeletionSaveReason)}
               onClick={async () => {
                 await confirmCodeCacheDeletion(handleOnSave);
               }}
