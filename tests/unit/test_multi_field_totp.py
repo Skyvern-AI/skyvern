@@ -23,6 +23,7 @@ from playwright.async_api import TimeoutError as PlaywrightTimeoutError
 from pydantic import TypeAdapter
 
 from skyvern.config import settings
+from skyvern.exceptions import SkyvernPageAnalysisTimeout
 from skyvern.forge import agent as agent_module
 from skyvern.forge.agent import (
     ForgeAgent,
@@ -4500,6 +4501,44 @@ async def test_submission_evidence_filters_volatile_nodes_and_rebinds_scopes(
         assert rebound.evaluate.await_args is not None
 
 
+@pytest.mark.asyncio
+async def test_group_binding_propagates_page_analysis_timeout(monkeypatch: pytest.MonkeyPatch) -> None:
+    attempt = _attempt()
+    group = SimpleNamespace(
+        box_element_ids=attempt.box_element_ids,
+        frame="main.frame",
+        container={"id": "otp-container"},
+    )
+    fresh = SimpleNamespace(
+        url="same",
+        _document_loader_id="loader",
+        id_to_frame_dict={element_id: "main.frame" for element_id in attempt.box_element_ids},
+    )
+    original = SimpleNamespace(
+        url="same",
+        _document_loader_id="loader",
+        id_to_frame_dict={element_id: "main.frame" for element_id in attempt.box_element_ids},
+        id_to_css_dict={element_id: f"#{element_id}" for element_id in attempt.box_element_ids},
+        generate_scraped_page_without_screenshots=AsyncMock(return_value=fresh),
+    )
+    page = SimpleNamespace(url="same")
+    timeout = SkyvernPageAnalysisTimeout("lookup timed out")
+    lookup = AsyncMock(side_effect=timeout)
+    locator = SimpleNamespace(count=AsyncMock(return_value=1))
+
+    monkeypatch.setattr(multi_field_totp_module, "_document_continuity", AsyncMock(return_value=True))
+    monkeypatch.setattr(multi_field_totp_module, "_multi_field_totp_box_groups", lambda *_: [group])
+    monkeypatch.setattr(multi_field_totp_module, "_multi_field_totp_container_identity", lambda *_: "same-widget")
+    monkeypatch.setattr(multi_field_totp_module, "_multi_field_totp_matching_scopes", lambda *_: [object()])
+    monkeypatch.setattr(multi_field_totp_module, "resolve_locator", AsyncMock(return_value=(locator, None)))
+    monkeypatch.setattr(multi_field_totp_module, "bounded_lookup_call", lookup)
+
+    with pytest.raises(SkyvernPageAnalysisTimeout, match="lookup timed out"):
+        await multi_field_totp_module._refresh_multi_field_totp_group_binding(original, page, attempt)
+
+    lookup.assert_awaited_once()
+
+
 def test_widget_probe_hashes_own_nodes_without_secret_values_or_descendant_churn() -> None:
     node = shutil.which("node")
     if node is None:
@@ -4718,6 +4757,16 @@ async def test_fill_observer_preserves_only_counts_across_document_teardown() ->
     replacement = await multi_field_totp_module.install_multi_field_totp_fill_observer(page, [box], state)
     assert replacement is None
     assert state.observed_max_filled == 0
+
+
+@pytest.mark.asyncio
+async def test_fill_observer_refresh_propagates_page_analysis_timeout(monkeypatch: pytest.MonkeyPatch) -> None:
+    timeout = SkyvernPageAnalysisTimeout("lookup timed out")
+    monkeypatch.setattr(multi_field_totp_module, "bounded_lookup_call", AsyncMock(side_effect=timeout))
+    observer = multi_field_totp_module.MultiFieldTotpFillObserver(SimpleNamespace(), _attempt(), "test:")
+
+    with pytest.raises(SkyvernPageAnalysisTimeout, match="lookup timed out"):
+        await observer.refresh([SimpleNamespace(count=AsyncMock())])
 
 
 def test_input_observer_measures_peak_fullness_before_site_clear() -> None:

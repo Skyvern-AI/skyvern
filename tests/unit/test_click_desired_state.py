@@ -21,6 +21,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 from playwright.async_api import Page, async_playwright
 
+from skyvern.exceptions import SkyvernPageAnalysisTimeout
 from skyvern.webeye.actions import handler
 from skyvern.webeye.actions.actions import ActionStatus, ClickAction, ClickContext
 from skyvern.webeye.actions.responses import ActionAbort, ActionFailure, ActionResult, ActionSuccess, StaleActionAbort
@@ -497,6 +498,15 @@ async def test_resolve_malformed_aria_returns_none(aria_value: str) -> None:
 async def test_resolve_read_exception_returns_none() -> None:
     element = FakeToggleElement("div", {"role": "option"}, attr_error=RuntimeError("detached"))
     assert await handler._resolve_live_selected_state(element) is None
+
+
+@pytest.mark.asyncio
+async def test_apply_desired_state_propagates_selected_option_lookup_timeout() -> None:
+    element = FakeToggleElement("div", {"role": "option", "aria-selected": "true"})
+    timeout = SkyvernPageAnalysisTimeout("lookup timed out")
+    with patch.object(handler, "bounded_lookup_call", AsyncMock(side_effect=timeout)):
+        with pytest.raises(SkyvernPageAnalysisTimeout, match="lookup timed out"):
+            await handler._apply_desired_click_state(_click_action(), element, True, MagicMock())
 
 
 @pytest.mark.parametrize("attributes", [{}, {"role": "button"}, {"href": "https://example.test/next"}])
@@ -1348,6 +1358,29 @@ def _static_listbox_snapshot(**overrides: object) -> dict[str, object]:
     return snapshot
 
 
+@pytest.mark.asyncio
+async def test_static_listbox_resolution_propagates_lookup_timeout() -> None:
+    timeout = SkyvernPageAnalysisTimeout("lookup timed out")
+    option = MagicMock()
+    option.is_visible = AsyncMock(return_value=True)
+    option.element_handle = AsyncMock(return_value=MagicMock())
+    option.get_attribute = AsyncMock(return_value="option-id")
+    element = MagicMock()
+    element.get_locator.return_value.locator.return_value.all = AsyncMock(return_value=[option])
+    element.get_frame.return_value = MagicMock()
+    element.get_id.return_value = "listbox"
+    dom = MagicMock()
+    dom.safe_get_skyvern_element_by_id = AsyncMock(side_effect=timeout)
+
+    with patch.object(
+        handler, "read_static_listbox_option_snapshot", new=AsyncMock(return_value=_static_listbox_snapshot())
+    ):
+        with pytest.raises(SkyvernPageAnalysisTimeout, match="lookup timed out"):
+            await handler._resolve_static_listbox_container_target(_click_action(), element, dom)
+
+    dom.safe_get_skyvern_element_by_id.assert_awaited_once_with("option-id")
+
+
 @pytest.mark.parametrize(
     ("snapshot", "expected"),
     [
@@ -1976,6 +2009,17 @@ async def test_apply_grid_row_driver_failure_falls_open() -> None:
         result = await handler._apply_desired_click_state(_click_action(), element, True, MagicMock())
     assert result is None
     drive.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_grid_row_driver_propagates_page_analysis_timeout() -> None:
+    element = MagicMock()
+    cell_locator = MagicMock()
+    cell_locator.count = AsyncMock(side_effect=SkyvernPageAnalysisTimeout("lookup timed out"))
+    element.get_locator.return_value.locator.return_value.first = cell_locator
+
+    with pytest.raises(SkyvernPageAnalysisTimeout):
+        await handler._drive_grid_row_selection(_click_action(), element, True)
 
 
 @pytest.mark.asyncio
