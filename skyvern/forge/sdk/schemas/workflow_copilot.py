@@ -475,6 +475,9 @@ class WorkflowCopilotChatRequest(BaseModel):
     supports_google_setup_card: bool = Field(
         False, description="The client can display Gmail and Google Sheets connection cards with a scope profile."
     )
+    supports_demonstration_offer: bool = Field(
+        False, description="The client can display the demonstration offer card and start a demonstration from it."
+    )
     credential_recovery_token: SecretStr | None = Field(
         None,
         repr=False,

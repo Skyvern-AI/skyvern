@@ -1713,6 +1713,7 @@ def test_preflight_tool_set_matches_builder() -> None:
     assert PREFLIGHT_TOOL_NAMES == {
         "click",
         "hover",
+        "drag",
         "type",
         "select_combobox",
         "select_option",
@@ -1723,6 +1724,7 @@ def test_preflight_tool_set_matches_builder() -> None:
     rep = {
         "click": {"selector": "#x"},
         "hover": {"selector": "#x"},
+        "drag": {"selector": "#x", "target": "#y"},
         "type": {"selector": "#x", "text": "y"},
         "select_combobox": {"selector": "#x", "value": "v"},
         "select_option": {"selector": "#x", "value": "v"},
@@ -3475,6 +3477,81 @@ async def test_hover_tool_dispatches_and_is_billable() -> None:
     assert result.status == "ok"
     assert ("hover", {"selector": "#menu"}) in page.calls
     assert spec.billable is True
+
+
+_DRAG_LIST_HTML = """<!doctype html><html><body>
+  <ul id="list">
+    <li role="button" draggable="true" style="height:30px">Alpha</li>
+    <li role="button" draggable="true" style="height:30px">Beta</li>
+    <li role="button" draggable="true" style="height:30px">Gamma</li>
+  </ul>
+  <script>
+    let dragged = null;
+    for (const item of document.querySelectorAll('#list li')) {
+      item.addEventListener('dragstart', (e) => { dragged = item; e.dataTransfer.setData('text/plain', ''); });
+      item.addEventListener('dragover', (e) => e.preventDefault());
+      item.addEventListener('drop', (e) => { e.preventDefault(); item.before(dragged); });
+    }
+  </script>
+</body></html>"""
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+async def test_drag_tool_moves_an_element_onto_its_target() -> None:
+    # Copilot authors an agent block for a demonstrated drag when the org cannot author code blocks; with
+    # no drag tool the block cannot repeat it. Both ends are observe refs, so each resolves server-side.
+    async with _content_page(_DRAG_LIST_HTML) as page:
+        tools = build_browser_tools(_fixed_page_provider(page))
+        observed = await _tool(tools, "observe").handler({})
+        spec = _tool(tools, "drag")
+        result = await spec.handler(
+            {"selector": _ref_line(observed.content, "Gamma"), "target": _ref_line(observed.content, "Alpha")}
+        )
+        assert result.status == "ok", result.content
+        order = await page.evaluate("[...document.querySelectorAll('#list li')].map((li) => li.textContent)")
+    assert order == ["Gamma", "Alpha", "Beta"]
+    assert spec.billable is True
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+async def test_drag_tool_drags_within_a_frame_and_refuses_a_target_in_another() -> None:
+    # Playwright drags inside one document, so a pair inside one iframe must work and a drop target in
+    # the parent document must be refused before anything is dispatched, by ref and by CSS selector.
+    srcdoc = html.escape(_DRAG_LIST_HTML, quote=True)
+    page_html = f'<!doctype html><html><body><button id="outside">Outside</button><iframe srcdoc="{srcdoc}" style="width:400px;height:300px"></iframe></body></html>'
+    async with _content_page(page_html) as page:
+        await page.wait_for_function(
+            "document.querySelector('iframe').contentDocument?.querySelectorAll('li').length === 3"
+        )
+        tools = build_browser_tools(_fixed_page_provider(page))
+        observed = await _tool(tools, "observe").handler({})
+        drag = _tool(tools, "drag").handler
+        gamma, alpha = _ref_line(observed.content, "Gamma"), _ref_line(observed.content, "Alpha")
+        frame = page.frames[1]
+        # A drop handler can start a save: the drop target inside the frame must then read as still in flight.
+        await frame.evaluate(
+            "[...document.querySelectorAll('li')][0].addEventListener('drop', (e) => { e.target.textContent = 'Processing'; })"
+        )
+        result = await drag({"selector": gamma, "target": alpha})
+        assert result.status == "ok", result.content
+        assert await pending_marker(page, result.data["drop_target"]) == "Processing"
+        assert set(taskv3_tools._frame_work(page)["submitted"]) == {result.data["drop_target"]}
+        assert await frame.evaluate("[...document.querySelectorAll('li')].map((li) => li.textContent)") == [
+            "Gamma",
+            "Processing",
+            "Beta",
+        ]
+        observed = await _tool(tools, "observe").handler({})
+        source = _ref_line(observed.content, "Beta")
+        for target in (_ref_line(observed.content, "Outside"), "#outside"):
+            refused = await drag({"selector": source, "target": target})
+            assert refused.status == "error" and refused.error_class == "unreachable", (target, refused.content)
+        missing = await drag({"selector": source, "target": "#nowhere"})
+        assert missing.error_class == "stale_selector", missing.content
+        invalid = await drag({"selector": source, "target": "li[data-x"})
+        assert invalid.error_class == "invalid_selector" and "li[data-x" in invalid.content
 
 
 def test_perception_tools_are_compactable_and_actions_are_not() -> None:
@@ -39654,6 +39731,7 @@ _SURFACE_OFF_TOOL_NAMES = frozenset(
         "look",
         "click",
         "hover",
+        "drag",
         "type",
         "select_option",
         "select_combobox",

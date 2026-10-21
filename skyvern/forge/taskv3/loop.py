@@ -321,6 +321,8 @@ PICKED_OPTION_DATA_KEY = "picked_option"
 # A list the control opened but could not settle a row in: the list stays open for a pick.
 OPENED_LIST_ERROR_CLASSES = frozenset({"list_no_match", "list_unread", "list_ambiguous", "identical_rows"})
 TARGET_KIND_DATA_KEY = "target_kind"
+# The durable selector of the element a `drag` dropped onto, for the pending-submit watch.
+DROP_TARGET_DATA_KEY = "drop_target"
 # The tool-result `data` key a recorded action's outcome rides on: the machine facts about what the
 # call achieved (`requested_url`, `url`, `http_status`, `page_transitioned`, `navigation_dead_end`),
 # carried verbatim to `RoundAction.outcome` for the caller to persist on the action row. Internal to
@@ -1539,12 +1541,12 @@ CODE_TOOL_NAME = "execute_python"
 
 
 def _may_submit(tool_name: str, args: dict[str, Any]) -> bool:
-    """A click, an Enter press, or a type or select_combobox that pressed Enter: the loop cannot tell a submit from any of them.
+    """A click or drag, an Enter press, or a type or select_combobox that pressed Enter: the loop cannot tell a submit from any of them.
 
     The code tool counts too: its body is opaque to the loop, so it is treated as possibly having
     submitted rather than as certainly not having.
     """
-    return tool_name in ("click", CODE_TOOL_NAME) or _is_enter_submit(tool_name, args)
+    return tool_name in ("click", "drag", CODE_TOOL_NAME) or _is_enter_submit(tool_name, args)
 
 
 # Secret values reach the model only as `placeholder_...` tokens, so the guard below keys on the
@@ -1699,16 +1701,18 @@ class ActivityRecency:
         return self.last_trigger_turn is not None and (self.turn - self.last_trigger_turn) <= window
 
 
-def _names_submit_control(tool_name: str, args: dict[str, Any], ok: bool) -> str | None:
+def _names_submit_control(tool_name: str, args: dict[str, Any], ok: bool, data: dict[str, Any]) -> str | None:
     """The selector of a control a successful action acted on directly, or None.
 
-    Only `click`. An Enter press and a type-that-pressed-Enter submit through a control they do not
+    A `click`'s control, or the drop target a `drag` reports, since a drop handler can submit.
+
+    An Enter press and a type-that-pressed-Enter submit through a control they do not
     name, and a captcha dispatch names none at all, so for all three "is that control still in
     flight" has no subject — and the selector they do carry is a text field, whose value is the
     model's own typed text."""
-    if not ok or tool_name != "click":
+    if not ok or tool_name not in ("click", "drag"):
         return None
-    selector = args.get("selector")
+    selector = data.get(DROP_TARGET_DATA_KEY) if tool_name == "drag" else args.get("selector")
     return selector if isinstance(selector, str) and selector else None
 
 
@@ -5281,7 +5285,7 @@ async def run_agent_tool_loop(
                 if activity is not None and _arms_failure_evidence(tool_name, args, result.status == "ok"):
                     activity.last_trigger_turn = st.turns
                 if submit_watch is not None:
-                    submit_selector = _names_submit_control(tool_name, args, result.status == "ok")
+                    submit_selector = _names_submit_control(tool_name, args, result.status == "ok", result_data)
                     if submit_selector is not None:
                         submit_watch.record(submit_selector)
 

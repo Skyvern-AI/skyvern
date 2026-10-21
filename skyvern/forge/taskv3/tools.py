@@ -85,6 +85,7 @@ from skyvern.forge.taskv3.loop import (
     ACTION_OUTCOME_DATA_KEY,
     CLICK_DISPATCHED_DATA_KEY,
     DOWNLOAD_FAILURE_MAX_LINES,
+    DROP_TARGET_DATA_KEY,
     FILL_TOOLS,
     NAVIGATION_DEAD_END_STATUSES,
     OPENED_LIST_ERROR_CLASSES,
@@ -474,6 +475,7 @@ _SELECTOR_GUARD_TOOL_NAMES = frozenset(
         "get_html",
         "click",
         "hover",
+        "drag",
         "type",
         "select_option",
         "select_combobox",
@@ -4685,7 +4687,9 @@ _TARGET_NAME_JS = (
 
 # Actions whose target has a name worth reading back. press_key and navigate are excluded: neither is
 # about an element a reader would recognize by name.
-_TARGET_LABEL_TOOL_NAMES = frozenset({"click", "hover", "type", "select_option", "select_combobox", "file_upload"})
+_TARGET_LABEL_TOOL_NAMES = frozenset(
+    {"click", "hover", "drag", "type", "select_option", "select_combobox", "file_upload"}
+)
 
 
 _REACH_PROBE_NEEDED_JS = (
@@ -11269,6 +11273,7 @@ _TEXT_DELTA_TOOL_NAMES = frozenset(
         "select_combobox",
         "press_key",
         "hover",
+        "drag",
         "file_upload",
         "observe",
         "scroll",
@@ -15534,6 +15539,54 @@ def build_browser_tools(
         await _require_single_target(page, selector)
         await input_dispatch.hover(page, selector, timeout=_ACTION_TIMEOUT_MS)
         return ToolResult.ok(f"hovered {selector}")
+
+    async def drag(args: dict[str, Any]) -> ToolResult:
+        realm, error = await _resolve_page()
+        if error is not None:
+            return error
+        selector = args["selector"]
+        target = _normalize_selector(str(args["target"]))
+        # The address wrappers only see `selector`, so the drop target is resolved and checked here.
+        match = REF_SELECTOR_RE.match(target)
+        if match is not None:
+            ref = int(match.group(1))
+            resolved, target_error = await _resolve_ref(_current_page(), ref)
+            entry = _observe_manifest.get(ref) or {}
+            target_realm = entry.get("owner") or _current_page()
+            target = resolved or target
+            # The act token can leave with a node the page replaces, so the watch gets an address that re-resolves.
+            durable_target = str(entry.get("selector") or "") or target
+        else:
+            try:
+                await realm.locator(target).count()
+            except Exception as exc:
+                invalid = _invalid_selector_result(args["target"], exc)
+                if invalid is None:
+                    raise
+                return invalid
+            target_realm, target_error = await _realm_for_typed_selector(_current_page(), target)
+            durable_target = target
+            if target_error is None and not await _holders(target_realm, target):
+                raise ToolRefusal(
+                    f"{args['target']} matches nothing on the page. Re-observe and drop onto a ref from the observation.",
+                    error_class="stale_selector",
+                )
+        if target_error is not None:
+            raise ToolRefusal.of(target_error)
+        # Playwright drags within one frame; a drop target in another document is unreachable.
+        if target_realm is not realm:
+            raise ToolRefusal(
+                f"The drop target {args['target']} is in a different frame than the dragged element; drag only "
+                "moves an element onto a target in the same frame.",
+                error_class="unreachable",
+            )
+        await _require_single_target(realm, selector)
+        await _require_single_target(realm, target)
+        await input_dispatch.drag(realm, selector, target, timeout=_ACTION_TIMEOUT_MS)
+        # A drop handler can submit, so the drop target is what the pending-submit gate watches.
+        result = ToolResult.ok(f"dragged {selector} onto {args['target']}", data={DROP_TARGET_DATA_KEY: durable_target})
+        await _note_frame_work("drop", realm, durable_target, result)
+        return result
 
     async def _annotate_challenge_frame(realm: Any, top_page: Any, occluder: dict[str, Any] | None) -> None:
         # A clipped reading names no layer, so the cover marker this scan looks for was never
@@ -21922,7 +21975,8 @@ def build_browser_tools(
 
     # Which tools leave work a reload would discard, and which leave something that may still be in
     # flight. The loop decides what counts as a submit; this only records WHERE the click landed.
-    _LEDGER_SUBMIT_TOOLS = frozenset({"click", "press_key"})
+    # "drop" is the drag handler's own record of its drop target; the address wrapper only sees a drag's source.
+    _LEDGER_SUBMIT_TOOLS = frozenset({"click", "drop", "press_key"})
 
     async def _note_frame_work(tool_name: str, realm: Any, selector: Any, result: ToolResult) -> None:
         """Record realm-attributed work an action left in a child frame.
@@ -22262,6 +22316,14 @@ def build_browser_tools(
             hover,
         ),
         _spec(
+            "drag",
+            "Drag an element onto another element (reorder a list, move a card to a column, drop into a "
+            "dropzone). `selector` is the element to pick up and `target` is where to drop it; each is an "
+            "observe ref (e.g. ref=12) or a CSS selector.",
+            _obj({"selector": {"type": "string"}, "target": {"type": "string"}}, ["selector", "target"]),
+            drag,
+        ),
+        _spec(
             "type",
             "Type text into an input/textarea by its observe ref (e.g. ref=12), a CSS selector, or mark=N from the last look(); "
             "clears first by default.",
@@ -22378,6 +22440,7 @@ def build_browser_tools(
         if _tool_spec.name in (
             "click",
             "hover",
+            "drag",
             "type",
             "select_option",
             "select_combobox",

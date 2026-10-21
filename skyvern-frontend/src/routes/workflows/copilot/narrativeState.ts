@@ -470,6 +470,7 @@ export interface TurnNarrativeState {
   connectedAccountChoices: ConnectedAccountChoice[];
   outputFiles: DeliveredOutputFile[];
   googleConnectionNotices: GoogleConnectionNotice[];
+  demonstrationOffer: boolean;
   review: ReviewProjection | null;
   turnFacts: TurnFacts | null;
   budgetExpiry: BudgetExpiryState | null;
@@ -532,6 +533,7 @@ export const EMPTY_NARRATIVE: TurnNarrativeState = Object.freeze({
   connectedAccountChoices: [],
   outputFiles: [],
   googleConnectionNotices: [],
+  demonstrationOffer: false,
   review: null,
   turnFacts: null,
   budgetExpiry: null,
@@ -886,6 +888,7 @@ const TOOL_CALL_KINDS: Record<string, ToolCallKind> = {
   inspect_current_workflow: "other",
   list_integrations: "other",
   request_google_connection: "other",
+  offer_demonstration: "other",
   read_google_sheet: "other",
   read_attached_pdf: "other",
   get_organization_usage_quota: "other",
@@ -2097,6 +2100,7 @@ export function hydrateNarrativeFromPayload(
     googleConnectionNotices: parseGoogleConnectionNotices(
       payload.googleConnectionNotices,
     ),
+    demonstrationOffer: payload.demonstrationOffer === true,
     review: parseReviewProjection(payload.review),
     turnFacts,
     budgetExpiry,

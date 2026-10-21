@@ -280,6 +280,56 @@ afterEach(() => {
 });
 
 describe("WorkflowCopilotChat demonstration", () => {
+  it("renders a persisted demonstration offer and starts recording from it", async () => {
+    const onRecordTask = vi.fn();
+    historyResponse.data.chat_history = [
+      {
+        sender: "ai",
+        content: "Show me how you do it.",
+        narrative_payload: {
+          turnId: "turn-offer",
+          terminal: "response",
+          demonstrationOffer: true,
+        },
+        created_at: "2026-10-14T12:00:00Z",
+      },
+    ];
+
+    await renderChat({ onRecordTask, canRecordTask: true });
+
+    fireEvent.click(
+      await screen.findByRole("button", { name: "Start demonstration" }),
+    );
+    expect(onRecordTask).toHaveBeenCalledTimes(1);
+  });
+
+  it("disables a demonstration offer once a later message follows it", async () => {
+    historyResponse.data.chat_history = [
+      {
+        sender: "ai",
+        content: "Show me how you do it.",
+        narrative_payload: {
+          turnId: "turn-offer",
+          terminal: "response",
+          demonstrationOffer: true,
+        },
+        created_at: "2026-10-14T12:00:00Z",
+      },
+      {
+        sender: "user",
+        content: "Actually, just build it.",
+        created_at: "2026-10-14T12:01:00Z",
+      },
+    ];
+
+    await renderChat({ onRecordTask: vi.fn(), canRecordTask: true });
+
+    const offer = (await screen.findByRole("button", {
+      name: "Start demonstration",
+    })) as HTMLButtonElement;
+    expect(offer.disabled).toBe(true);
+  });
+
   it("never looks for an active demonstration when the feature is off", async () => {
     demonstrationFlag.value = false;
     await renderChat({ liveBrowserSessionId: "browser-1" });
@@ -453,9 +503,7 @@ describe("WorkflowCopilotChat demonstration", () => {
       useRecordingLauncherStore.getState()
         .demonstrationRecordingBrowserSessionId,
     ).toBeNull();
-    expect(
-      screen.getByText("I'll show you the task in the browser."),
-    ).toBeTruthy();
+    expect(screen.getByText("Showing you in the browser now.")).toBeTruthy();
     expect(screen.getByRole("button", { name: "Attach a file" }).title).toBe(
       "Use Build before attaching a file",
     );
@@ -534,13 +582,11 @@ describe("WorkflowCopilotChat demonstration", () => {
       useRecordingLauncherStore.getState().startDemonstration?.();
     });
     expect(
-      await screen.findByText("I'll show you the task in the browser."),
+      await screen.findByText("Showing you in the browser now."),
     ).toBeTruthy();
     act(() => rejectStart?.(new Error("Already recording elsewhere")));
     await waitFor(() =>
-      expect(
-        screen.queryByText("I'll show you the task in the browser."),
-      ).toBeNull(),
+      expect(screen.queryByText("Showing you in the browser now.")).toBeNull(),
     );
     streamCalls.length = 0;
 

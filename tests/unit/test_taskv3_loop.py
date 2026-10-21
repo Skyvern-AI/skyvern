@@ -7585,6 +7585,25 @@ async def test_the_loop_records_the_clicked_control_for_the_pending_gate() -> No
 
 
 @pytest.mark.asyncio
+async def test_the_loop_records_a_drags_drop_target_for_the_pending_gate() -> None:
+    # A drop handler can start a save, so the gate watches the drop target the drag reports, not its source.
+    probe, asked = _pending_probe(None)
+    watch = SubmitWatch()
+    drags: list[tuple[str, dict[str, Any]]] = []
+    tools = [
+        _billable_tool("drag", drags, data={"drop_target": "#done"}),
+        make_finish_tool(pending_marker=probe, submit_watch=watch),
+    ]
+    script = [
+        [("drag", {"selector": "#card", "target": "ref=4"})],
+        [("finish", {"status": "completed", "reason": "moved the card"})],
+    ]
+    outcome, _ = await _run(script, tools, submit_watch=watch)
+    assert outcome.status == "completed"
+    assert asked == ["#done"]
+
+
+@pytest.mark.asyncio
 async def test_the_pending_gate_survives_a_long_wait_after_the_click() -> None:
     # Waiting for a slow submission is exactly what the gate asks the model to do, so a turn window
     # would expire precisely on the runs that obeyed it. The probe is the arbiter: however many

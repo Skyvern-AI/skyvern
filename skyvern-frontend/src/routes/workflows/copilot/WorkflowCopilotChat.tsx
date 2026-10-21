@@ -452,7 +452,7 @@ const RECOVERY_POLL_SUPERSEDE_READS = 4;
 const RECOVERY_IN_PROGRESS_MESSAGE =
   "The connection dropped, so Copilot is checking whether this turn finished.";
 const TEST_END_TO_END_PROMPT = "Test this workflow end to end.";
-const DEMONSTRATION_START_MESSAGE = "I'll show you the task in the browser.";
+const DEMONSTRATION_START_MESSAGE = "Showing you in the browser now.";
 const DEMONSTRATION_DONE_MESSAGE =
   "I've shown you the task in the browser. Build a workflow that does it.";
 const diagnoseRunReceipt = (runId: string) =>
@@ -1708,6 +1708,51 @@ const constrainPosition = (
     y: Math.min(Math.max(0, y), maxY),
   };
 };
+
+function DemonstrateTaskButton({
+  label = "Demonstrate task",
+  disabled,
+  disabledReason,
+  onClick,
+}: {
+  label?: string;
+  disabled: boolean;
+  disabledReason: string;
+  onClick: () => void;
+}) {
+  return (
+    <TooltipProvider>
+      <ControlTooltip
+        content={
+          disabled
+            ? disabledReason
+            : "Skyvern records your clicks, typing, and navigation, then turns them into workflow steps"
+        }
+        blocked={disabled}
+        side="top"
+        wrapperClassName="min-w-0 w-full"
+      >
+        <button
+          type="button"
+          aria-label={label}
+          className="flex w-full min-w-0 items-center gap-3 rounded-lg border border-border bg-slate-elevation3 p-3 text-left transition-colors hover:bg-accent focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring disabled:pointer-events-none disabled:cursor-not-allowed disabled:opacity-50"
+          disabled={disabled}
+          onClick={onClick}
+        >
+          <span className="flex h-8 w-8 shrink-0 items-center justify-center rounded-md border border-border bg-slate-elevation2">
+            <span className="h-2.5 w-2.5 rounded-full bg-red-500" />
+          </span>
+          <span className="min-w-0">
+            <span className="block font-medium text-foreground">{label}</span>
+            <span className="mt-0.5 block text-xs leading-snug text-muted-foreground">
+              Show Copilot how in the browser
+            </span>
+          </span>
+        </button>
+      </ControlTooltip>
+    </TooltipProvider>
+  );
+}
 
 export function WorkflowCopilotChat({
   organizationId,
@@ -9313,6 +9358,10 @@ export function WorkflowCopilotChat({
             supports_account_group_card: true,
             supports_credential_delete_card: true,
             supports_google_setup_card: true,
+            supports_demonstration_offer:
+              demonstrationEnabled &&
+              Boolean(onRecordTask) &&
+              !authoringUnavailableReason,
           } as WorkflowCopilotChatRequest,
           (payload) => {
             if (
@@ -9741,7 +9790,10 @@ export function WorkflowCopilotChat({
       restoreSteersToComposer,
       captureCopilotEvent,
       createCanonicalRecovery,
+      demonstrationEnabled,
       onWorkflowPersisted,
+      onRecordTask,
+      authoringUnavailableReason,
       reserveCopilotTurn,
       isCopilotTurnCurrent,
       isCopilotOwnerCurrent,
@@ -11020,6 +11072,13 @@ export function WorkflowCopilotChat({
   };
 
   const recordTaskDisabled = !onRecordTask || !canRecordTask;
+  const recordTaskUnavailableReason =
+    authoringUnavailableReason ??
+    "Demonstrate task is available when the browser is ready";
+  const startRecordTask = () => {
+    if (refuseMutationDuringYamlCommit()) return;
+    onRecordTask?.();
+  };
   const recordingChapterController = recordingAuthoringActive ? (
     <RecordingPanel
       key="live-recording-chapter"
@@ -11216,42 +11275,11 @@ export function WorkflowCopilotChat({
                         </button>
                       </ControlTooltip>
                     </TooltipProvider>
-                    <TooltipProvider>
-                      <ControlTooltip
-                        content={
-                          recordTaskDisabled
-                            ? (authoringUnavailableReason ??
-                              "Demonstrate task is available when the browser is ready")
-                            : "Skyvern records your clicks, typing, and navigation, then turns them into workflow steps"
-                        }
-                        blocked={recordTaskDisabled}
-                        side="top"
-                        wrapperClassName="min-w-0 w-full"
-                      >
-                        <button
-                          type="button"
-                          aria-label="Demonstrate task"
-                          className="flex w-full min-w-0 items-center gap-3 rounded-lg border border-border bg-slate-elevation3 p-3 text-left transition-colors hover:bg-accent focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring disabled:pointer-events-none disabled:cursor-not-allowed disabled:opacity-50"
-                          disabled={recordTaskDisabled}
-                          onClick={() => {
-                            if (refuseMutationDuringYamlCommit()) return;
-                            onRecordTask?.();
-                          }}
-                        >
-                          <span className="flex h-8 w-8 shrink-0 items-center justify-center rounded-md border border-border bg-slate-elevation2">
-                            <span className="h-2.5 w-2.5 rounded-full bg-red-500" />
-                          </span>
-                          <span className="min-w-0">
-                            <span className="block font-medium text-foreground">
-                              Demonstrate task
-                            </span>
-                            <span className="mt-0.5 block text-xs leading-snug text-muted-foreground">
-                              Show Copilot how in the browser
-                            </span>
-                          </span>
-                        </button>
-                      </ControlTooltip>
-                    </TooltipProvider>
+                    <DemonstrateTaskButton
+                      disabled={recordTaskDisabled}
+                      disabledReason={recordTaskUnavailableReason}
+                      onClick={startRecordTask}
+                    />
                   </div>
                 </div>
               </div>
@@ -11594,6 +11622,29 @@ export function WorkflowCopilotChat({
                           />
                         ),
                       )}
+                      {demonstrationEnabled &&
+                      message.narrative.demonstrationOffer ? (
+                        <div className="max-w-sm">
+                          <DemonstrateTaskButton
+                            label="Start demonstration"
+                            disabled={
+                              !isLastMessage ||
+                              isLoading ||
+                              hasPendingQuestion ||
+                              isDemonstrating ||
+                              recordTaskDisabled
+                            }
+                            disabledReason={
+                              recordTaskDisabled
+                                ? recordTaskUnavailableReason
+                                : !isLastMessage
+                                  ? "Only the latest message can start a demonstration"
+                                  : "Demonstrate task is unavailable right now"
+                            }
+                            onClick={startRecordTask}
+                          />
+                        </div>
+                      ) : null}
                       {showReviewGate ? (
                         <div className="space-y-2">
                           {index === gateIndex && pendingProposalRun ? (
