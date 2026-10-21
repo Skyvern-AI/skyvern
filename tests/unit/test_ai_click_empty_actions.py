@@ -380,3 +380,49 @@ class TestAiSelectOptionHandlerFailures:
 
         handle_select.assert_awaited_once()
         mock_page.locator.assert_not_called()
+
+
+class TestAiClickHandlerRefusal:
+    """A click the handler refuses with skip_remaining_actions must not be retried as a raw selector click."""
+
+    async def _ai_click(self, mock_page, mock_scraped_page, mock_context, mock_app, handler_result):
+        from skyvern.webeye.actions.actions import ClickAction
+
+        action = ClickAction(element_id="opt")
+        page_ai = RealSkyvernPageAi(mock_scraped_page, mock_page)
+        result = handler_result(action) if callable(handler_result) else handler_result
+        with (
+            patch.object(page_ai, "_refresh_scraped_page", new_callable=AsyncMock),
+            patch(f"{MODULE}.skyvern_context.ensure_context", return_value=mock_context),
+            patch(f"{MODULE}.app", mock_app),
+            patch(f"{MODULE}.prompt_engine.load_prompt", return_value="mock_prompt"),
+            patch(f"{MODULE}._resolve_assist_llm_handler", new_callable=AsyncMock) as resolve,
+            patch(f"{MODULE}.parse_actions", return_value=[action]),
+            patch(f"{MODULE}.ActionHandler.get_setup_for_action_type", return_value=None),
+            patch(f"{MODULE}.handle_click_action", new=AsyncMock(return_value=[result])),
+        ):
+            resolve.return_value = AsyncMock(return_value={"actions": [{"action_type": "CLICK"}]})
+            return await page_ai.ai_click(selector="xpath=//div[@id='opt']", intention="Pick the answer")
+
+    @pytest.mark.asyncio
+    async def test_refusal_with_skip_remaining_actions_is_not_retried_with_selector(
+        self, mock_page, mock_scraped_page, mock_context, mock_app
+    ):
+        from skyvern.webeye.actions import handler as click_handler
+
+        def refusal(action):
+            return click_handler._static_listbox_replan_failure(action, "This option is already selected.")
+
+        with pytest.raises(SkyvernActionFailed):
+            await self._ai_click(mock_page, mock_scraped_page, mock_context, mock_app, refusal)
+        mock_page.locator.return_value.click.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_recoverable_click_failure_still_falls_back_to_selector(
+        self, mock_page, mock_scraped_page, mock_context, mock_app
+    ):
+        failure = ActionFailure(Exception("element moved"))
+        assert not failure.skip_remaining_actions and not failure.setup_performed
+        result = await self._ai_click(mock_page, mock_scraped_page, mock_context, mock_app, failure)
+        assert result == "xpath=//div[@id='opt']"
+        mock_page.locator.return_value.click.assert_awaited_once()
