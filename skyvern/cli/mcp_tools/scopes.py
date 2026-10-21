@@ -11,15 +11,15 @@ MCPScope = Literal["all", "operate", "build", "browser", "lean"]
 # exist. `state` lives with `build` rather than here because both its tools are Save/Load
 # *Browser* State and return no_browser_error() without a live page — in a scope with no way
 # to open one they are dead surface.
-OPERATE_SCOPE = {"workflow", "schedule", "folder", "script"}
+OPERATE_SCOPE = {"workflow", "schedule", "folder", "script", "feedback"}
 SCOPES: dict[MCPScope, set[str]] = {
     "operate": OPERATE_SCOPE,
     # `session` is required, not cosmetic: without it build's inspection and state tools have no
     # way to obtain a browser and dead-end on NO_ACTIVE_BROWSER. `browser_primitive` stays out —
-    # it would grow build to 85 tools and collapse the boundary with the browser scope.
+    # it would collapse the boundary with the browser scope.
     "build": OPERATE_SCOPE | {"block_discovery", "inspection", "ai_powered", "session", "state"},
-    "browser": {"browser_primitive", "tab_management", "session", "browser_profile", "inspection"},
-    "lean": {"lean"},
+    "browser": {"browser_primitive", "tab_management", "session", "browser_profile", "inspection", "feedback"},
+    "lean": {"lean", "feedback"},
 }
 
 

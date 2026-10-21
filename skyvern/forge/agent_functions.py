@@ -17,6 +17,7 @@ from cachetools import TTLCache
 from google.oauth2.credentials import Credentials
 from playwright.async_api import Frame, Page
 
+from skyvern import analytics
 from skyvern.config import CodeBlockMode, settings
 from skyvern.constants import CUSTOMER_STORAGE_UPLOAD_MAX_BYTES, SKYVERN_ID_ATTR
 from skyvern.core.script_generations.fuzzy_matcher import match_option_exact_or_stem_with_tier
@@ -61,7 +62,7 @@ from skyvern.forge.sdk.schemas.credentials import (
     NonEmptyPasswordCredential,
     SecretCredential,
 )
-from skyvern.forge.sdk.schemas.feedback import FeedbackEvent
+from skyvern.forge.sdk.schemas.feedback import AgentFeedback, FeedbackEvent
 from skyvern.forge.sdk.schemas.files import FileInfo
 from skyvern.forge.sdk.schemas.organizations import Organization
 from skyvern.forge.sdk.schemas.tasks import Task, TaskRequest, TaskStatus
@@ -3386,3 +3387,20 @@ class AgentFunction:
     # cloud overrides to fan the event out (Slack, product analytics).
     async def on_feedback_submitted(self, *, organization: Organization, event: FeedbackEvent) -> None:
         return None
+
+    async def on_agent_feedback_submitted(
+        self, *, organization: Organization, feedback: AgentFeedback, redacted: bool
+    ) -> None:
+        analytics.capture(
+            "mcp_agent_feedback_submitted",
+            data={
+                "agent_feedback_id": feedback.agent_feedback_id,
+                "category": feedback.category,
+                "severity": feedback.severity or "unspecified",
+                "has_tool_name": bool(feedback.tool_name),
+                "has_details": bool(feedback.details),
+                "redacted": redacted,
+            },
+            api_key=settings.MCP_POSTHOG_PROJECT_API_KEY,
+            host=settings.MCP_POSTHOG_PROJECT_HOST,
+        )

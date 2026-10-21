@@ -36,6 +36,8 @@ if typing.TYPE_CHECKING:  # pragma: no cover - import only for type hints
 LOG = structlog.get_logger()
 
 _SENSITIVE_ENDPOINTS = {
+    # Agent reports can contain credentials before route redaction.
+    "POST /v1/agent_feedback",
     "GET /api/v1/users/me/onboarding",
     "POST /api/v1/users/me/onboarding",
     "POST /api/v1/credentials",

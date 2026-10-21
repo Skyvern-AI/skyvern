@@ -422,6 +422,7 @@ class Settings(BaseSettings):
     POSTHOG_PROJECT_HOST: str = "https://app.posthog.com"
     MCP_POSTHOG_PROJECT_API_KEY: str | None = "phc_m4epBbGS1Hf4NPRFNpR4WQ9Ob6yGy6SLbQckBxp3n0P"
     MCP_POSTHOG_PROJECT_HOST: str = "https://app.posthog.com"
+    AGENT_FEEDBACK_HOURLY_LIMIT: int = 20
 
     # email settings
     SMTP_HOST: str = "localhost"
