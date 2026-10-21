@@ -580,6 +580,7 @@ export interface WorkflowCopilotDemonstrationActionUpdate {
     | "type_text"
     | "select_option"
     | "press_key"
+    | "drag"
     | "navigate_browser"
     | "upload_attached_file"
     | "fill_credential_field";
