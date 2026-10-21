@@ -5346,7 +5346,7 @@ _OBSERVE_SUMMARY_FIELDS = (
     "hidden_listed",
     "iframes_in_component_roots",
     "undiscovered_roots",
-    "omitted_unnameable",
+    "listed_by_handle_only",
     "invalid_fields",
     "markers_minted",
     "markers_reused",

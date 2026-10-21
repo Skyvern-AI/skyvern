@@ -176,8 +176,8 @@ _OBSERVE_DESCRIPTION_BASE = (
     "Snapshot the page's visible interactive elements (raw DOM) with a handle, label, type, value, and "
     "options for each. Each element line starts with its address, `ref=N`; pass that exact string (e.g. "
     "ref=12, no brackets) as the selector argument of click/hover/type/select_option/etc to act on it. A "
-    "ref names the element this reading described and keeps working while that element is on the page, "
-    "including across a re-render that replaces it. If it becomes ambiguous or is gone, the tool errors "
+    "ref names the element this reading described and keeps working while that element is on the page. "
+    "If it becomes ambiguous or is gone, the tool errors "
     "instead of acting on something else — re-observe and use a ref from the new reading. "
 )
 _OBSERVE_DESCRIPTION_FRAME_REACH = (
@@ -9355,6 +9355,24 @@ async (__tv3TextArgs) => {
     const t = String(el.tagName || '').toLowerCase();
     return /^[a-z][a-z0-9_-]*$/.test(t) ? t : null;
   };
+  // A handle-only record's line-to-handle binding: its child position at every step up to the document,
+  // crossing each shadow root at its host. Playwright's engine reads it at act time outside the page's
+  // realm, as it does a named record's selector, so a page that swaps the elements behind two lines is refused.
+  const positionPath = (el) => {
+    const steps = [];
+    try {
+      for (let n = el; n && n.nodeType === 1; ) {
+        const t = safeTag(n);
+        if (!t) return '';
+        let k = 1;
+        for (let s = n.previousElementSibling; s; s = s.previousElementSibling) k++;
+        steps.push(t + ':nth-child(' + k + ')');
+        const p = n.parentNode;
+        n = p && p.nodeType === 11 ? p.host : p;
+      }
+    } catch (e) { return ''; }
+    return steps.reverse().join(' > ');
+  };
   // Where the page itself puts a control, for a renderer that has found two element lines rendering
   // the same bytes. Nearest first: the control's own identity, then each enclosing element carrying
   // one, then the heading the page files it under. Attributes are read off Element.prototype and
@@ -9690,26 +9708,22 @@ async (__tv3TextArgs) => {
   // Naming a host is paid once per walk: the same anchor serves every control under it, and a
   // marker written for the first is reused, not re-minted, for the rest.
   const anchorByHost = new Map();
-  // Anchoring is bounded per walk. A control that cannot be named does not spend the element
-  // budget, so without this a page of thousands of unnameable component controls would spend the
-  // evaluate's whole time bound on tails that all fail.
+  // Anchoring is bounded per walk. An unnamed pointer-styled control does not spend the element
+  // budget, so without this a page of thousands of them would spend the evaluate's whole time bound
+  // on tails that all fail.
   let anchorAttempts = 0;
   const _ANCHOR_ATTEMPTS = 3000;
   const _ANCHORED_MAX_LEN = 400;
-  // Set when the LAST refusal was ours (a budget) rather than the page's, so the omission is
-  // reported as such and not as a claim about the control.
-  let anchorRefusedByBudget = false;
   // The host and tail of the last selector hostAnchored composed, kept so the record can be
   // re-resolved under its host later (a composed selector straddles a root; only scoped counting sees it).
   let lastAnchor = null;
   const hostAnchored = (el, host, depth) => {
     depth = depth || 0;
-    if (depth === 0) anchorRefusedByBudget = false;
     if (!host) return null;
-    if (depth > 8) { anchorRefusedByBudget = true; return null; }
+    if (depth > 8) return null;
     // A host already named this walk costs a lookup, not an attempt; the budget is charged for
     // naming a host, which is the part that walks the page.
-    if (!anchorByHost.has(host) && ++anchorAttempts > _ANCHOR_ATTEMPTS) { anchorRefusedByBudget = true; return null; }
+    if (!anchorByHost.has(host) && ++anchorAttempts > _ANCHOR_ATTEMPTS) return null;
     let tails = [];
     if (el.id) {
       const raw = String(el.id);
@@ -9728,9 +9742,7 @@ async (__tv3TextArgs) => {
       const cached = anchorByHost.get(host);
       hostSel = cached.sel;
       hostTrail = cached.trail;
-      if (!hostSel && cached.budget) anchorRefusedByBudget = true;
     } else {
-      const budgetBefore = anchorRefusedByBudget;
       // naturalSelector reports its cause through shared state; the control's own cause is already
       // settled by the time we get here and must survive naming the host.
       const why = naturalWhy;
@@ -9774,9 +9786,8 @@ async (__tv3TextArgs) => {
       naturalWhy = why;
       checkInconclusive = inconclusive;
       // A refusal reached through the recursion may be the depth bound, which a control whose own
-      // host this is would not hit; only a top-level or successful answer is worth remembering. A
-      // refusal that was a budget stays a budget on every later hit.
-      if (hostSel || depth === 0) anchorByHost.set(host, { sel: hostSel, trail: hostTrail, budget: !hostSel && anchorRefusedByBudget && !budgetBefore });
+      // host this is would not hit; only a top-level or successful answer is worth remembering.
+      if (hostSel || depth === 0) anchorByHost.set(host, { sel: hostSel, trail: hostTrail });
     }
     if (!hostSel) return null;
     // Naming the host may have written to it, and a component can re-render its root on any
@@ -9784,7 +9795,7 @@ async (__tv3TextArgs) => {
     // or a replacement control would inherit this one's label and state.
     if (!scopedResolvesTo(host, ctrl, el)) return null;
     const sel = hostSel + ' ' + ctrl;
-    if (sel.length > _ANCHORED_MAX_LEN) { anchorRefusedByBudget = true; return null; }
+    if (sel.length > _ANCHORED_MAX_LEN) return null;
     // The whole chain that produced the selector, each link verified where it was taken, so the
     // record can be re-validated link by link: the tail under its host, and the host by its own name.
     lastAnchor = { sel: sel, trail: [{ scope: host, ctrl: ctrl, target: el }].concat(hostTrail) };
@@ -9817,8 +9828,7 @@ async (__tv3TextArgs) => {
     if (!textOnly) return '';
     return String(host.innerText || '').replace(/\s+/g, ' ').trim().slice(0, _RETAIN_WIDTH);
   };
-  // Controls inside a component that we could not name, split by CAUSE: these need different
-  // fixes, and one merged tally would send the follow-up after the wrong one.
+  // Why naturalSelector could not name a control inside a component:
   //   anonymous    -- no id/name/data-testid at all
   //   duplicated   -- has one, but shadow encapsulation lets every instance reuse it, so the
   //                   cross-root count is >1 and no unscoped selector can single this one out
@@ -9854,11 +9864,6 @@ async (__tv3TextArgs) => {
   // the host's marker after the walk drops each of those controls, not the host.
   const anchorsMinted = [];
   const anchorRecords = [];
-  let unnamedAnonymous = 0;
-  let unnamedBudget = 0;
-  let unnamedDuplicated = 0;
-  let unnamedUnverifiable = 0;
-  let unnamedUnsafe = 0;
   let i = 0;
   let dropped = 0;
   // Two counters, deliberately: hiddenKept bounds the retention work and is spent the moment a
@@ -10149,19 +10154,13 @@ async (__tv3TextArgs) => {
     }
     if (pointerRoot && pointerListed + (_pointerState.held.has(el) ? pointerReserved : 0) >= _POINTER_ROOT_CAP) { pointerCapped++; continue; }
     let selector = naturalSelector(el);
+    let bind = '';
     if (!selector) {
-      // We do not write inside a shadow root. Setting a marker there is a mutation of the
-      // component's own subtree, and every mechanism that wrote one and then tried to manage the
-      // consequences failed: the mark provokes the re-render that destroys it, and because the mark
-      // IS the handle we hand out it cannot move off-DOM. Verifying it needed a wait, every clock
-      // belongs to the page, and a fixed wait was accurate under 50 ms and silently wrong past it.
-      // Worse, a marker that churns every observe makes the payload differ every turn, which
-      // defeats the loop's perception-stall terminator -- so the page burned the whole budget where
-      // the base engine terminated cleanly. Not writing restores that behavior exactly. A control
-      // with an id, name or data-testid of its own is unaffected, which is the ordinary case.
+      // Observe never writes inside a shadow root: a mark there provokes the re-render that destroys
+      // it. A control no verified selector names is listed by its live handle alone, so a replaced
+      // node goes stale instead of being re-found.
       if (host) {
         anchorsMinted.length = 0;
-        anchorRefusedByBudget = false;
         lastAnchor = null;
         if (naturalWhy === 'duplicated' || naturalWhy === 'anonymous') selector = hostAnchored(el, host);
         // A host marked during this attempt is accounted for whether or not the attempt produced a
@@ -10171,12 +10170,9 @@ async (__tv3TextArgs) => {
           for (const a of anchorRecords) { if (selector.indexOf(attr('data-tv3', a.m)) === 0) { a.ctrls.push({ el: el, rec: null }); anchorRecs.push(a); } }
         } else {
           if (pointerRoot) { pointerDropped++; continue; }
-          if (anchorRefusedByBudget) unnamedBudget++;
-          else if (naturalWhy === 'duplicated') unnamedDuplicated++;
-          else if (naturalWhy === 'unverifiable') unnamedUnverifiable++;
-          else if (naturalWhy === 'unsafe') unnamedUnsafe++;
-          else unnamedAnonymous++;
-          continue;
+          selector = '';
+          bind = positionPath(el);
+          if (!bind) { dropped++; continue; }
         }
       } else {
         const writtenBefore = markersWritten;
@@ -10206,6 +10202,7 @@ async (__tv3TextArgs) => {
     // provenance before the display cap lands. A tighter cap here would truncate the URL past
     // recognition and leak its signing tail.
     const rec = { i, tag: el.tagName.toLowerCase(), type: (_typed && el.type) || null, selector, label: label.slice(0, _RETAIN_WIDTH) };
+    if (bind) rec.bind = bind;
     if (pointerRoot) rec.pointerRoot = true;
     if (iconRoot) rec.icon = true;
     if (pointerRoot && _pointerState.held.has(el)) rec.pointerHeld = true;
@@ -10451,7 +10448,7 @@ async (__tv3TextArgs) => {
           if (link.ctrl) { if (!scopedResolvesTo(link.scope, link.ctrl, link.target)) { ok = false; break; } }
           else { checkInconclusive = false; if (!resolvesTo(link.sel, link.target) && !checkInconclusive) { ok = false; break; } }
         }
-      } else { checkInconclusive = false; ok = resolvesTo(rec.selector, el) || checkInconclusive; }
+      } else if (rec.selector) { checkInconclusive = false; ok = resolvesTo(rec.selector, el) || checkInconclusive; }
     }
     if (!ok) {
       // Dropped from the digest, but the control can still BE there -- a page that changes a second
@@ -10982,7 +10979,7 @@ async (__tv3TextArgs) => {
   } catch (e) { /* a count the page broke is not worth the reading */ }
   let readyState = '';
   try { readyState = String(_getter(Document.prototype, 'readyState').call(document)); } catch (e) { readyState = ''; }
-  const payload = _ownStringify({ textDelta: textDelta, refsFresh: refsFresh, flutter: __OBSERVE_FLUTTER__, url: location.href, title: document.title, text: texts, textFull: texts.map((t) => { const f = fullText.get(t); return f && f !== t ? f : null; }), textTruncated: textFull, textDropped: textDropped, iframes: iframeInfo, frameCensus: frameCensus, dropped: dropped, truncated: truncated, iconsTruncated: iconsTruncated, truncatedInComponents: truncatedInComponents, pointerCapped: pointerCapped, pointerTruncated: pointerTruncated, pointerDropped: pointerDropped, pointerListed: pointerListed, pointerScanStopped: _pointerState.scanStopped ? 1 : 0, pointerScanFailed: _pointerState.scanFailed ? 1 : 0, unnamedAnonymous: unnamedAnonymous, unnamedBudget: unnamedBudget, unnamedDuplicated: unnamedDuplicated, unnamedUnverifiable: unnamedUnverifiable, unnamedUnsafe: unnamedUnsafe, unreadableRoot: sawUnreadableRoot, undiscoveredRoots: undiscoveredRoots, rootCount: allRoots.length - 1, hiddenListed: hiddenListed, hiddenDropped: hiddenDropped, hiddenDroppedOffCanvas: hiddenDroppedOffCanvas, hiddenDroppedVisibility: hiddenDroppedVisibility, hiddenDroppedZeroRect: hiddenDroppedZeroRect, hiddenDroppedOffViewport: hiddenDroppedOffViewport, offViewportUnreachableUnnamed: offViewportUnreachableUnnamed, offViewportUnnamedHostExempt: offViewportUnnamedHostExempt, phantomDropped: phantomDropped, markersMinted: markersWritten, markersReused: markersReused, pageMutated: mutated, modalOpen: modalOpen, modalListed: modalListed, modalTruncated: modalTruncated, readyState: readyState, elements: out });
+  const payload = _ownStringify({ textDelta: textDelta, refsFresh: refsFresh, flutter: __OBSERVE_FLUTTER__, url: location.href, title: document.title, text: texts, textFull: texts.map((t) => { const f = fullText.get(t); return f && f !== t ? f : null; }), textTruncated: textFull, textDropped: textDropped, iframes: iframeInfo, frameCensus: frameCensus, dropped: dropped, truncated: truncated, iconsTruncated: iconsTruncated, truncatedInComponents: truncatedInComponents, pointerCapped: pointerCapped, pointerTruncated: pointerTruncated, pointerDropped: pointerDropped, pointerListed: pointerListed, pointerScanStopped: _pointerState.scanStopped ? 1 : 0, pointerScanFailed: _pointerState.scanFailed ? 1 : 0, unreadableRoot: sawUnreadableRoot, undiscoveredRoots: undiscoveredRoots, rootCount: allRoots.length - 1, hiddenListed: hiddenListed, hiddenDropped: hiddenDropped, hiddenDroppedOffCanvas: hiddenDroppedOffCanvas, hiddenDroppedVisibility: hiddenDroppedVisibility, hiddenDroppedZeroRect: hiddenDroppedZeroRect, hiddenDroppedOffViewport: hiddenDroppedOffViewport, offViewportUnreachableUnnamed: offViewportUnreachableUnnamed, offViewportUnnamedHostExempt: offViewportUnnamedHostExempt, phantomDropped: phantomDropped, markersMinted: markersWritten, markersReused: markersReused, pageMutated: mutated, modalOpen: modalOpen, modalListed: modalListed, modalTruncated: modalTruncated, readyState: readyState, elements: out });
   return __OBSERVE_RETURN__;
 }
 """
@@ -12336,11 +12333,6 @@ _OBSERVE_SUMMED_KEYS = (
     "pointerListed",
     "pointerScanStopped",
     "pointerScanFailed",
-    "unnamedAnonymous",
-    "unnamedBudget",
-    "unnamedDuplicated",
-    "unnamedUnverifiable",
-    "unnamedUnsafe",
     "undiscoveredRoots",
     "rootCount",
     "hiddenListed",
@@ -13131,6 +13123,7 @@ def build_browser_tools(
                 "handle": handles[_idx],
                 "tag": _tag,
                 "selector": e.get("selector") or "",
+                "binding": "" if e.get("selector") else str(e.get("bind") or ""),
                 # The frame this element was read from, and the document that frame was showing. Both
                 # server-held: nothing frame-shaped is ever put in a selector, so the model has nothing
                 # frame-shaped to mistranscribe.
@@ -13141,30 +13134,6 @@ def build_browser_tools(
                 "option": _mask_refs(str(e.get("label") or "")),
                 "choice": next((c for c in (e.get("role"), e.get("type")) if c in ("radio", "checkbox")), ""),
             }
-        omitted_anonymous = data.get("unnamedAnonymous") or 0
-        omitted_duplicated = data.get("unnamedDuplicated") or 0
-        omitted_unverifiable = data.get("unnamedUnverifiable") or 0
-        omitted_unsafe = data.get("unnamedUnsafe") or 0
-        omitted_budget = data.get("unnamedBudget") or 0
-        omitted_in_components = (
-            omitted_anonymous + omitted_duplicated + omitted_unverifiable + omitted_unsafe + omitted_budget
-        )
-        if omitted_in_components:
-            # Sizes the capability this deliberately gives up, split by cause because the causes have
-            # different fixes: `duplicated` is answered by host-anchored selectors with executor-side
-            # verification (the SKY-14710 family), `anonymous` only by that same path, and neither by
-            # another in-root identity mechanism. Merging them would over-report one and under-report
-            # the other, and the follow-up would be chosen off the wrong number.
-            LOG.info(
-                "taskv3 observe omitted component controls it could not name",
-                omitted_in_components=omitted_in_components,
-                omitted_anonymous=omitted_anonymous,
-                omitted_duplicated=omitted_duplicated,
-                omitted_unverifiable=omitted_unverifiable,
-                omitted_unsafe=omitted_unsafe,
-                omitted_budget=omitted_budget,
-                listed=len(elements),
-            )
         # Compact rendering keeps the persistent-conversation prefix small (cost is ~linear in it).
         raw_url = _mask_refs(str(data.get("url") or ""))
         # Stripping forgery chars is not truncation: only the cap changes what the URL points at, so
@@ -13313,12 +13282,10 @@ def build_browser_tools(
             # a page that genuinely has no controls.
             lines.append(f"note: {dropped} element(s) could not be described and are not listed below")
         if data.get("unreadableRoot"):
-            # The condition itself, not just its consequences: a root that throws makes uniqueness
-            # unverifiable everywhere, so unnamed elements are dropped rather than given a name we
-            # could not check. Left unsaid, that reads as a page with fewer controls than it has.
+            # The condition itself, not just its consequences: a root that throws makes selector
+            # uniqueness unverifiable everywhere on the page.
             lines.append(
-                "note: part of this page could not be queried, so selector uniqueness could not be "
-                "verified here; elements we could not name are not listed"
+                "note: part of this page could not be queried, so selector uniqueness could not be verified here"
             )
         if data.get("textTruncated"):
             # Every other cap in this payload names itself. This one binds far more often now that
@@ -13354,31 +13321,6 @@ def build_browser_tools(
             count = f"{unlisted}{'+' if pointer_scan_stopped else ''} " if unlisted else ""
             lines.append(
                 f"note: {count}more pointer-styled element(s) without a control role are not listed: {'; '.join(why)}"
-            )
-        if omitted_in_components:
-            # A statement about OUR limitation, not about the page: naming these would mean writing
-            # into the component's own root, which provokes the re-render that destroys the mark. No
-            # remedy is offered because there is none the model can perform — re-observing returns
-            # the same omission. Split by cause: saying "no id of their own" about a control that has
-            # one, and whose id is merely reused by a sibling instance, tells the model something
-            # false about the page to describe a limitation of ours.
-            why = []
-            if omitted_anonymous:
-                why.append(f"{omitted_anonymous} have no id, name or data-testid of their own")
-            if omitted_duplicated:
-                why.append(
-                    f"{omitted_duplicated} have one that is reused by another instance of the same "
-                    "component, so it does not identify a single element"
-                )
-            if omitted_unverifiable:
-                why.append(f"{omitted_unverifiable} could not be verified because a component root was unreadable")
-            if omitted_unsafe:
-                why.append(f"{omitted_unsafe} carry an identifier we cannot render safely")
-            if omitted_budget:
-                why.append(f"{omitted_budget} exceeded the naming budget for this page")
-            lines.append(
-                f"note: {omitted_in_components} control(s) inside components are not listed because we "
-                f"have no selector that identifies them: {'; '.join(why)}"
             )
 
         bodies: list[str] = []
@@ -13556,7 +13498,7 @@ def build_browser_tools(
             "phantom_dropped": phantom_dropped,
             "iframes_in_component_roots": iframe_info.get("inComponents") or 0,
             "undiscovered_roots": data.get("undiscoveredRoots") or 0,
-            "omitted_unnameable": omitted_in_components,
+            "listed_by_handle_only": sum(1 for e in elements if not e.get("selector")),
             "invalid_fields": sum(1 for e in elements if e.get("invalid")),
             "markers_minted": data.get("markersMinted") or 0,
             "markers_reused": data.get("markersReused") or 0,
@@ -21816,16 +21758,20 @@ def build_browser_tools(
             # act time on count()==1 with no comparison of the resolved node to what the model was
             # shown -- the same class, with none of the three checks here. Pinned by
             # test_a_coupled_transposition_is_the_one_form_still_open_and_this_pins_it.
-            if not remembered:
+            #
+            # A ref listed by its handle alone is held to its child-position path instead. That path is
+            # never used to find a node to act on, so a replaced node still goes stale.
+            binding = remembered or str(entry.get("binding") or "")
+            if not binding:
                 return True
             try:
-                if await _holders(realm, f"{remembered}{act_selector}") == 1:
+                if await _holders(realm, f"{binding}{act_selector}") == 1:
                     return True
                 # A remembered selector that names NOTHING is simply stale -- a marker the page moved
                 # or rolled back, an id it dropped. It is not evidence about the handle, which is live
                 # and alone, so the handle stands. Only a selector naming something that is NOT this
                 # handle is evidence of a swap.
-                return await _holders(realm, remembered) == 0
+                return await _holders(realm, binding) == 0
             except Exception:
                 return False
 
@@ -22103,7 +22049,9 @@ def build_browser_tools(
                 # In place, for the same reason act-by-mark does it: the persisted action's element_id,
                 # the submit watch, the repeat guard's key and the nudge all read this dict AFTER dispatch.
                 args["selector"] = resolved
-                durable = str((_observe_manifest.get(ref) or {}).get("selector") or "")
+                _entry = _observe_manifest.get(ref) or {}
+                # A handle-only ref hands back its child-position path; nothing that reads it acts on it.
+                durable = str(_entry.get("selector") or "") or str(_entry.get("binding") or "")
                 # Handed on for the same reason the typed-selector branch does it: the ref was validated
                 # against THIS page, and letting preflight resolve again lets a popup that became the working
                 # page in between become the one acted on. Cleared in the finally, so it cannot outlive the
