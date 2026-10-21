@@ -14,6 +14,7 @@ from skyvern.forge import app
 from skyvern.forge.sdk.cache.base import NoopLock
 from skyvern.forge.sdk.copilot import demonstration_recorder as recorder_module
 from skyvern.forge.sdk.copilot import demonstration_replay as replay_module
+from skyvern.forge.sdk.copilot.code_block_synthesis import synthesize_code_block
 from skyvern.forge.sdk.copilot.demonstration_recorder import (
     DemonstrationClaim,
     DemonstrationRecord,
@@ -442,6 +443,66 @@ async def test_replay_values_fail_closed_when_secret_screen_is_unavailable(
     assert "<value not recorded>" in json.dumps(history)
     outage_facts = [item for item in history if item.get("role") == "user" and "unavailable" in item.get("content", "")]
     assert len(outage_facts) == 1
+
+
+@pytest.mark.asyncio
+async def test_demonstrated_drag_replays_through_the_drag_tool_into_a_drag_to_block(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    cache = _SharedCache()
+    monkeypatch.setattr(app, "CACHE", cache)
+    monkeypatch.setattr(replay_module, "resolve_raw_secret_safety_handler", AsyncMock(return_value=None))
+    frame = {"is_main": True, "name": ""}
+    events = [
+        {
+            "kind": "drag",
+            "selector": "#card",
+            "target_selector": "#done",
+            "source_url": "https://example.test/board",
+            "frame": frame,
+            "packet": {"role_name": {"role": "listitem", "accessible_name": "Invoice 42"}},
+            "target_packet": {"role_name": {"role": "list", "accessible_name": "Done"}},
+        },
+        {"kind": "gap", "reason": "freeform_drag", "source_url": "https://example.test/board", "frame": frame},
+    ]
+    cache.store[demonstration_record_key("org-1", "demo-1")] = encode_demonstration_record(
+        DemonstrationRecord(
+            workflow_permanent_id="wfp-1",
+            browser_session_id="pbs-1",
+            status="stopped",
+            event_count=len(events),
+            owner=None,
+            owner_seen_at=None,
+            final_url="https://example.test/board",
+        )
+    )
+    for seq, event in enumerate(events, 1):
+        cache.store[demonstration_event_key("org-1", "demo-1", seq)] = json.dumps({"seq": seq, **event})
+    ctx = make_copilot_ctx(organization_id="org-1", workflow_permanent_id="wfp-1", browser_session_id="pbs-1")
+    ctx.demonstration_id = "demo-1"
+    aliases = get_skyvern_mcp_alias_map()
+    overlays = _build_skyvern_mcp_overlays()
+    server = SkyvernOverlayMCPServer(
+        transport=MagicMock(),
+        overlays={"drag": overlays["drag"]},
+        alias_map={"drag": aliases["drag"]},
+        allowlist=frozenset({aliases["drag"]}),
+        context_provider=lambda: ctx,
+    )
+    server._client = _NoDispatchClient()
+    ctx.discovery_mcp_server = server
+
+    history = await replay_demonstration(ctx, server)
+
+    calls = [item for item in history if item.get("type") == "function_call"]
+    assert [(item["name"], json.loads(item["arguments"])) for item in calls] == [
+        ("drag", {"source_selector": "#card", "target_selector": "#done"})
+    ]
+    assert any("freeform drag" in str(item.get("content")) for item in history if item.get("role") == "user")
+    assert recorder_module._event_label(events[0]) == 'Drag "Invoice 42" to "Done"'
+    synthesized = synthesize_code_block(ctx.scout_trajectory)
+    assert synthesized is not None
+    assert '.drag_to(page.locator("#done"))' in synthesized.code
 
 
 @pytest.mark.asyncio
@@ -1634,6 +1695,7 @@ async def test_recorder_persists_each_capture_gap_kind() -> None:
         side_effect=[
             [{"name": "outer"}, {"owner_selector": "#inner"}],
             [{"name": "child"}],
+            [{"name": "child"}],
         ]
     )
     events = [
@@ -1654,16 +1716,25 @@ async def test_recorder_persists_each_capture_gap_kind() -> None:
             "",
             {"kind": "unsupported_input", "ts": 3, "url": page.url, "selector": "#range", "value": "7"},
         ),
+        TapEvent(
+            page,
+            "tap",
+            "child",
+            False,
+            "child",
+            {"kind": "drag", "ts": 4, "selector": "#card", "target_selector": "#done"},
+        ),
     ]
 
     for event in events:
         await recorder._record_tap_event(event)
 
-    stored = [json.loads(cache.store[demonstration_event_key("org-1", "demo-1", seq)]) for seq in range(1, 4)]
+    stored = [json.loads(cache.store[demonstration_event_key("org-1", "demo-1", seq)]) for seq in range(1, 5)]
     assert [event["reason"] for event in stored] == [
         "nested_frame",
         "frame_navigation",
         "unsupported_event:unsupported_input",
+        "freeform_drag",
     ]
 
 

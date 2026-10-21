@@ -101,6 +101,7 @@ _OBSERVATION_TOOLS = {
     "console_messages",
     "select_option",
     "press_key",
+    "drag",
     "wait_for_either_state",
     "skyvern_frame_list",
     "skyvern_frame_switch",

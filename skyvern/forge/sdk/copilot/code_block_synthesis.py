@@ -297,7 +297,7 @@ def credential_scout_gap(
 
 
 _ENTRY_TARGET_TOOLS = frozenset(
-    {"click", "type_text", CREDENTIAL_FILL_TOOL_NAME, "select_option", "upload_file", "press_key"}
+    {"click", "type_text", CREDENTIAL_FILL_TOOL_NAME, "select_option", "upload_file", "press_key", "drag"}
 )
 _DURABLE_FALLBACK_ENTRY_TARGET_TOOLS = frozenset(
     {"type_text", CREDENTIAL_FILL_TOOL_NAME, "select_option", "upload_file"}

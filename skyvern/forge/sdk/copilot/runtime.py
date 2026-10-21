@@ -348,6 +348,12 @@ class ScoutedSelectorCandidate(TypedDict):
     first_match_visible: NotRequired[bool]
 
 
+class ScoutedDragDestination(TypedDict):
+    selector: str
+    role: NotRequired[str]
+    accessible_name: NotRequired[str]
+
+
 class ScoutedInteraction(TypedDict):
     # Every field here crosses the turn boundary into persisted, model-visible context except
     # those named in context._TURN_EPHEMERAL_INTERACTION_FIELDS. A field added here that holds a
@@ -377,6 +383,7 @@ class ScoutedInteraction(TypedDict):
     dynamic_row_evidence: NotRequired[ScoutedDynamicRowEvidence]
     key: NotRequired[str]
     typed_length: NotRequired[int]
+    destination: NotRequired[ScoutedDragDestination]
     role: NotRequired[str]
     accessible_name: NotRequired[str]
     role_name_match_count: NotRequired[int]
@@ -954,6 +961,7 @@ class DemonstratedAction:
     packet: dict[str, Any] | None
     synthesized_result: dict[str, Any]
     readback: str | None = None
+    target_packet: dict[str, Any] | None = None
 
 
 _DEMONSTRATED_ACTION: ContextVar[DemonstratedAction | None] = ContextVar("copilot_demonstrated_action", default=None)

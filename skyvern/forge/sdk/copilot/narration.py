@@ -55,6 +55,7 @@ _TOOL_ACTIVITY_DISPLAY_LABELS = {
     "scroll": "Interacting with page",
     "select_option": "Selecting option",
     "press_key": "Interacting with page",
+    "drag": "Interacting with page",
     "navigate_browser": "Opening page",
     "get_block_schema": "Checking workflow block options",
     "get_workflow_knowledge": "Looking up workflow guidance",

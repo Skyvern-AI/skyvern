@@ -899,6 +899,7 @@ class TestMCPToolOverlayCompleteness:
             "console_messages",
             "select_option",
             "press_key",
+            "drag",
             "wait_for_either_state",
             "skyvern_frame_list",
             "skyvern_frame_switch",
@@ -4125,6 +4126,17 @@ class TestSensitiveOriginActionContinuation:
         recorded = ctx.scouted_interactions[-1]
         assert not set(recorded) & set(scouting_module._RETAINED_LOCATOR_IDENTITY_FIELDS)
         assert recorded["source_url"] == f"http://pathfold.test/app?code={REDACTED_SECRET_PLACEHOLDER}"
+        assert CONTINUATION_RUN_OTP not in json.dumps(ctx.scout_trajectory)
+
+        scouting_module._record_scouted_interaction(
+            ctx,
+            tool_name="drag",
+            selector="#card",
+            destination={"selector": f"#lane-{CONTINUATION_RUN_OTP}", "role": "list"},
+        )
+
+        dragged = ctx.scouted_interactions[-1]
+        assert not set(dragged) & set(scouting_module._RETAINED_LOCATOR_IDENTITY_FIELDS)
         assert CONTINUATION_RUN_OTP not in json.dumps(ctx.scout_trajectory)
 
 

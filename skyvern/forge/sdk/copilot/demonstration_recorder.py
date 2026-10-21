@@ -774,7 +774,11 @@ class DemonstrationRecorder:
             )
             return
         event_kind = "secret" if kind in {"secret", "secret_select"} else kind
-        if event_kind not in {"click", "type", "select", "key", "navigate", "secret"}:
+        # skyvern_drag acts in page space on the top document, so a drag inside a frame cannot be replayed.
+        if kind == "freeform_drag" or (kind == "drag" and not event.is_main_frame):
+            await self._record_gap_event(event, frame, "freeform_drag", label="Drag not recorded")
+            return
+        if event_kind not in {"click", "type", "select", "key", "navigate", "secret", "drag"}:
             await self._record_gap_event(event, frame, f"unsupported_event:{kind or 'unknown'}")
             return
         source_url = str(payload.get("url") or "") if event.is_main_frame else str(event.page.url or "")
@@ -789,7 +793,18 @@ class DemonstrationRecorder:
             "source_url": source_url,
             "frame": frame,
         }
-        for key in ("selector", "packet", "value", "key", "url", "field", "field_label", "label"):
+        for key in (
+            "selector",
+            "packet",
+            "target_selector",
+            "target_packet",
+            "value",
+            "key",
+            "url",
+            "field",
+            "field_label",
+            "label",
+        ):
             value = payload.get(key)
             if value is not None and not (event_kind == "secret" and key == "value"):
                 stored[key] = value
@@ -831,6 +846,7 @@ class DemonstrationRecorder:
                         "select": "select_option",
                         "key": "press_key",
                         "navigate": "navigate_browser",
+                        "drag": "drag",
                     }[event_kind],
                 }
             )
@@ -850,14 +866,16 @@ class DemonstrationRecorder:
         if len(self.file_requests) == 1:
             await self.stream.send({"type": "demonstration_file_requested", "label": field_label})
 
-    async def _record_gap_event(self, event: TapEvent, frame: dict[str, Any], reason: str) -> None:
+    async def _record_gap_event(
+        self, event: TapEvent, frame: dict[str, Any], reason: str, label: str = "Step not recorded"
+    ) -> None:
         stored = {
             "ts": event.payload.get("ts"),
             "kind": "gap",
             "reason": reason,
             "source_url": (str(event.payload.get("url") or "") if event.is_main_frame else str(event.page.url or "")),
             "frame": frame,
-            "label": "Step not recorded",
+            "label": label,
         }
         seq = await self._append_event(stored)
         if seq is not None:
@@ -1179,13 +1197,24 @@ def safe_label(value: str | None) -> str:
     return " ".join(redact_raw_secrets_for_prompt(value).replace('"', "").split())[:200]
 
 
+def _target_label(packet: Any, max_name: int = 200) -> str:
+    role_name = packet.get("role_name") if isinstance(packet, dict) else None
+    if not isinstance(role_name, dict):
+        role_name = {}
+    name = safe_label(role_name.get("accessible_name"))[:max_name].rstrip()
+    if name:
+        return f'"{name}"'
+    return f"an unlabeled {safe_label(role_name.get('role')) or 'item'}"
+
+
 def _event_label(event: dict[str, Any]) -> str:
     kind = event.get("kind")
-    packet = event.get("packet")
-    role_name = packet.get("role_name") if isinstance(packet, dict) else None
-    accessible_name = role_name.get("accessible_name") if isinstance(role_name, dict) else None
     if kind == "click":
-        return f'Click "{safe_label(accessible_name) or "element"}"'[:60]
+        return f"Click {_target_label(event.get('packet'))}"[:60]
+    if kind == "drag":
+        source = _target_label(event.get("packet"), max_name=20)
+        target = _target_label(event.get("target_packet"), max_name=20)
+        return f"Drag {source} to {target}"[:60]
     if kind == "type":
         value = event.get("value")
         text = redact_raw_secrets_for_prompt(value) if isinstance(value, str) else ""
