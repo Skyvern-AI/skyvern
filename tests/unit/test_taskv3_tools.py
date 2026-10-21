@@ -3657,7 +3657,7 @@ async def test_observe_result_carries_count_only_summary_for_the_call_record() -
         "phantom_dropped",
         "iframes_in_component_roots",
         "undiscovered_roots",
-        "omitted_unnameable",
+        "listed_by_handle_only",
         "invalid_fields",
         "markers_minted",
         "markers_reused",
@@ -3695,7 +3695,7 @@ async def test_observe_result_carries_count_only_summary_for_the_call_record() -
     assert summary["hidden_listed"] == 1
     assert summary["iframes_in_component_roots"] == 1
     assert summary["text_dropped"] > 0
-    assert summary["omitted_unnameable"] == 1
+    assert summary["listed_by_handle_only"] == 1
     assert summary["markers_minted"] == 1 and summary["markers_reused"] == 0
     # The census rides this same record, so it is pinned to values here rather than to key names:
     # `set_content` leaves the page on about:blank, where `location.origin` is "null" and the
@@ -13940,10 +13940,9 @@ class _AliasTypeaheadPage(_FakeAliasPage):
 
 @_skip_no_browser
 @pytest.mark.asyncio
-async def test_observe_reports_a_control_past_the_anchoring_depth_as_our_budget() -> None:
+async def test_a_control_past_the_anchoring_depth_is_listed_and_clickable() -> None:
     # Ten anonymous hosts deep, each inside the previous one's root: the chain to a markable host
-    # exceeds the recursion bound. That is our limit, not a fact about the control, and the note
-    # says so instead of claiming the control has no identity.
+    # exceeds the recursion bound, so no selector names the control and only its handle reaches it.
     async with _live_page(
         """<x-l0></x-l0>
         <script>
@@ -13953,15 +13952,16 @@ async def test_observe_reports_a_control_past_the_anchoring_depth_as_our_budget(
           r.innerHTML = '<x-l' + d + '></x-l' + d + '>';
           host = r.querySelector('x-l' + d);
         }
-        host.attachShadow({mode: 'open'}).innerHTML = '<button type="button" style="width:80px;height:20px">Deep</button>';
+        host.attachShadow({mode: 'open'}).innerHTML =
+          '<button type="button" onclick="window.deepHit = true" style="width:80px;height:20px">Deep</button>';
         </script>"""
     ) as page:
         tools = build_browser_tools(_fixed_page_provider(page))
         r = await _tool(tools, "observe").handler({})
         assert r.status == "ok"
-        assert "Deep" not in r.content, r.content
-        assert "1 exceeded the naming budget for this page" in r.content, r.content
-        assert "have no id, name or data-testid" not in r.content, r.content
+        clicked = await _tool(tools, "click").handler({"selector": _ref_line(r.content, "'Deep'")})
+        assert clicked.status == "ok", clicked.content
+        assert await page.evaluate("() => window.deepHit") is True
 
 
 @_skip_no_browser
@@ -14239,33 +14239,33 @@ async def test_observe_lists_skinned_checkbox_with_visible_label() -> None:
 
 @_skip_no_browser
 @pytest.mark.asyncio
-async def test_observe_reports_a_reused_component_id_as_reused_not_as_anonymous() -> None:
+async def test_a_reused_component_id_is_listed_and_typed_per_instance() -> None:
     # A design system hard-codes the same internal id in every instance, because shadow encapsulation
     # scopes ids to their own root, so both instances resolve to a cross-root count of 2. Anchoring on
     # the host recovers that whenever something under the host singles the control out; here each
-    # instance slots a light-DOM twin of its own control beside it, so nothing does, which is what
-    # leaves the controls unnamed and keeps this the case the note has to describe correctly. The
-    # note must say "reused", not "no id of their own", because saying the latter about a control
-    # that DOES have an id misdescribes the page.
+    # instance slots a light-DOM twin of its own control beside it, so nothing does, and each inner
+    # control is reachable only through its own handle.
     async with _live_page(
         """<ds-form-field><input id="first-name" name="firstName" style="width:80px;height:20px"></ds-form-field>
         <ds-form-field><input id="first-name" name="firstName" style="width:80px;height:20px"></ds-form-field>
         <script>
-        for (const h of document.querySelectorAll('ds-form-field')) {
-          h.attachShadow({mode: 'open'}).innerHTML =
-            '<slot></slot><input id="first-name" name="firstName" style="width:80px;height:20px">';
-        }
+        document.querySelectorAll('ds-form-field').forEach((h, i) => {
+          h.attachShadow({mode: 'open'}).innerHTML = '<slot></slot><input id="first-name" name="firstName"'
+            + ' placeholder="Inner ' + (i + 1) + '" style="width:80px;height:20px">';
+        });
         </script>"""
     ) as page:
         tools = build_browser_tools(_fixed_page_provider(page))
         r = await _tool(tools, "observe").handler({})
         assert "#first-name" not in r.content, "a reused in-component id must not be listed as a selector"
-        assert (
-            "note: 2 control(s) inside components are not listed because we have no selector that "
-            "identifies them: 2 have one that is reused by another instance of the same component, "
-            "so it does not identify a single element"
-        ) in r.content
-        assert "have no id, name or data-testid of their own" not in r.content, r.content
+        assert _ref_line(r.content, "'Inner 1'")
+        typed = await _tool(tools, "type").handler({"selector": _ref_line(r.content, "'Inner 2'"), "text": "SECOND"})
+        assert typed.status == "ok", typed.content
+        values = await page.evaluate(
+            "() => Array.from(document.querySelectorAll('ds-form-field'))"
+            ".flatMap((h) => [h.querySelector('input').value, h.shadowRoot.querySelector('input').value])"
+        )
+        assert values == ["", "", "", "SECOND"]
 
 
 # No <label> anywhere, deliberately: an earlier version of this fix keyed on "does the field have a
@@ -19109,8 +19109,9 @@ async def test_a_root_only_the_marker_gather_reaches_is_still_disclosed() -> Non
         r = await _tool(tools, "observe").handler({})
         # Armed only on the no-mint route: a minted marker re-checks uniqueness after the write and
         # would reach the throwing root by that path instead, disclosing it for the wrong reason.
-        assert "[data-tv3=" not in r.content, r.content
-        assert "2 have one that is reused by another instance" in r.content, r.content
+        assert r.data["summary"]["listed_by_handle_only"] == 2, r.data["summary"]
+        assert r.data["summary"]["markers_minted"] == 0, r.data["summary"]
+        assert len(re.findall(r"^ref=\d+ .*'Go'$", r.content, re.M)) == 2, r.content
         assert "part of this page could not be queried" in r.content, r.content
 
 
@@ -19569,8 +19570,9 @@ async def test_a_duplicated_identity_is_detected_however_deeply_it_is_nested() -
           }
           host.attachShadow({mode: 'open'}).innerHTML =
             '<style>button{display:block;width:120px;height:22px}</style>'
-            + '<button id="ctrl">' + text + '</button>';
+            + '<button id="ctrl" onclick="window.hits.push(this.textContent)">' + text + '</button>';
         }
+        window.hits = [];
         nest('deep', 12, 'DECOY');
         nest('shallow', 2, 'INTENDED');
         </script>"""
@@ -19584,9 +19586,11 @@ async def test_a_duplicated_identity_is_detected_however_deeply_it_is_nested() -
             assert await page.locator(sel).count() == 1, (
                 f"{sel!r} denotes {await page.locator(sel).count()}:\n{r.content}"
             )
-        # Named would be the wrong-element click; counted as a duplicate is the honest answer.
+        # Named would be the wrong-element click; each is reached through its own handle instead.
         assert "#ctrl" not in r.content, r.content
-        assert "2 have one that is reused by another instance" in r.content, r.content
+        clicked = await _tool(tools, "click").handler({"selector": _ref_line(r.content, "'INTENDED'")})
+        assert clicked.status == "ok", clicked.content
+        assert await page.evaluate("() => window.hits") == ["INTENDED"]
 
 
 @_skip_no_browser
@@ -20070,42 +20074,39 @@ async def test_heading_digest_is_not_fed_by_a_named_getter_host() -> None:
 
 @_skip_no_browser
 @pytest.mark.asyncio
-async def test_observe_discloses_controls_it_cannot_name_inside_components() -> None:
+async def test_observe_lists_a_component_control_no_selector_names_by_its_handle() -> None:
     # We do not write a marker inside a shadow root, so a component's control with no id or name of
     # its own is named through its host -- unless nothing under the host singles it out: here the
-    # host slots a light-DOM twin beside its own button, so every host-anchored tail matches both.
-    # The omission is disclosed rather than letting the component read as empty — and the note
-    # states OUR limitation, not a claim about the page, and offers no remedy, because re-observing
-    # returns the same omission.
+    # host slots a light-DOM twin beside its own button, so every host-anchored tail matches both,
+    # and the inner button is listed by its live handle alone.
     async with _live_page(
         """<button id="light-ok">Light Button</button>
-        <x-anon id="a"><button id="twin" type="button" style="width:80px;height:20px">Twin</button></x-anon>
+        <x-anon id="a"><button id="twin" type="button" onclick="window.hits.push('Twin')"
+          style="width:80px;height:20px">Twin</button></x-anon>
         <script>
-        document.getElementById('a').attachShadow({mode:'open'}).innerHTML =
-          '<slot></slot><button type="button" style="width:80px;height:20px">Inner Go</button>';
+        window.hits = [];
+        document.getElementById('a').attachShadow({mode:'open'}).innerHTML = '<slot></slot><button type="button"'
+          + ' onclick="window.hits.push(this.textContent)" style="width:80px;height:20px">Inner Go</button>';
         </script>"""
     ) as page:
         tools = build_browser_tools(_fixed_page_provider(page))
         first = await _tool(tools, "observe").handler({})
         assert first.status == "ok"
         assert _ref_line(first.content, "Light Button")
-        assert "Inner Go" not in first.content
         # "no marker may be written inside a component" is a property of the internal selector mint,
         # no longer anything the digest shows the model; read the raw per-element selectors.
         assert not any(e["selector"].startswith('[data-tv3="') for e in (await _observe_data(page))["elements"]), (
             "no marker may be written inside a component"
         )
-        assert (
-            "1 control(s) inside components are not listed because we have no selector that "
-            "identifies them: 1 have no id, name or data-testid of their own"
-        ) in first.content
-        assert "re-observe" not in first.content, "no remedy is offered because none exists"
         # Byte-identical across turns: the loop's perception-stall terminator compares whole
         # payloads, and a churning marker is what previously disabled it on exactly this page.
         again = await _tool(tools, "observe").handler({})
         assert first.content == again.content
+        clicked = await _tool(tools, "click").handler({"selector": _ref_line(again.content, "Inner Go")})
+        assert clicked.status == "ok", clicked.content
+        assert await page.evaluate("() => window.hits") == ["Inner Go"]
 
-    # And a component whose control HAS an id is listed as normal, with no note at all.
+    # And a component whose control HAS an id is named by it, not listed by handle.
     async with _live_page(
         """<x-named id="n"></x-named>
         <script>
@@ -20116,43 +20117,86 @@ async def test_observe_discloses_controls_it_cannot_name_inside_components() -> 
         tools = build_browser_tools(_fixed_page_provider(page))
         r = await _tool(tools, "observe").handler({})
         assert _ref_line(r.content, "Named")
-        assert "not listed because we have no selector" not in r.content
+        assert r.data["summary"]["listed_by_handle_only"] == 0
+
+
+_ANONYMOUS_MENU_VIEWER_HTML = """<x-viewer id="viewer"></x-viewer>
+<script>
+window.__clicked = [];
+const root = document.getElementById('viewer').attachShadow({mode: 'open'});
+root.innerHTML = '<div class="panel"></div><div class="toolbar">' +
+  ['Zoom out', 'Zoom in', 'Print', 'Menu'].map((n) =>
+    '<div><button type="button" class="btn ui" aria-label="' + n + '" style="width:40px;height:24px"></button></div>'
+  ).join('') + '</div>';
+const panel = root.querySelector('.panel');
+const menu = root.querySelector('button[aria-label="Menu"]');
+menu.addEventListener('click', () => {
+  if (!menu.classList.toggle('active')) { panel.innerHTML = ''; return; }
+  panel.innerHTML = ['Download', 'Save As'].map((t) =>
+    '<div><button type="button"><svg aria-hidden="true" width="10" height="10"></svg><span>' + t + '</span></button></div>'
+  ).join('');
+  for (const b of panel.querySelectorAll('button')) {
+    b.addEventListener('click', () => { window.__clicked.push(b.textContent); menu.click(); });
+  }
+});
+</script>"""
 
 
 @_skip_no_browser
 @pytest.mark.asyncio
-async def test_observe_logs_omission_only_when_something_was_actually_omitted() -> None:
-    # The LOG.info call is gated on a non-zero count; pin both directions, not just the firing case —
-    # a page that omits nothing must not emit this event at all. The log is also the instrument this
-    # limitation will be sized by in production, so its counts must equal the note's own counts.
-    event = "taskv3 observe omitted component controls it could not name"
-
-    async with _live_page("<button id='go'>Go</button>") as page:
+async def test_observe_lists_anonymous_menu_rows_inside_a_component_by_handle() -> None:
+    # Every toolbar button shares its tag, type, class and position in its own wrapper, and the rows
+    # differ only by text, so no selector scoped under the host names any of them.
+    async with _live_page(_ANONYMOUS_MENU_VIEWER_HTML, init_script=_WRITE_PROBE_JS) as page:
         tools = build_browser_tools(_fixed_page_provider(page))
-        with capture_logs() as logs:
-            await _tool(tools, "observe").handler({})
-        assert not [entry for entry in logs if entry["event"] == event], logs
+        observe, click = _tool(tools, "observe").handler, _tool(tools, "click").handler
+        closed = await observe({})
+        menu = _ref_line(closed.content, "'Menu'")
+        assert (await observe({})).content == closed.content
+        residue = await page.evaluate(
+            "() => Array.from(document.getElementById('viewer').shadowRoot.querySelectorAll('*'))"
+            ".flatMap((e) => e.getAttributeNames().filter((n) => n.startsWith('data-tv3')))"
+        )
+        assert residue == []
+        assert not [w for w in await page.evaluate("() => window.__tv3_writes") if w["inRoot"] is not False]
 
+        assert (await click({"selector": menu})).status == "ok"
+        opened = await observe({})
+        assert _ref_line(opened.content, "'Menu'") == menu, opened.content
+        download = _ref_line(opened.content, "'Download'")
+        assert _ref_line(opened.content, "'Save As'") != download
+
+        hit = await click({"selector": download})
+        assert hit.status == "ok", hit.content
+        assert await page.evaluate("() => window.__clicked") == ["Download"]
+
+        gone = await click({"selector": download})
+        assert gone.error_class == "stale_ref", gone.content
+        assert await page.evaluate("() => window.__clicked") == ["Download"]
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+async def test_a_handle_only_control_survives_a_walk_the_page_mutated() -> None:
+    # The page answers our light-DOM marker write with a change of its own, so every record is
+    # re-checked after the walk; one with no selector has nothing to re-resolve and must not read as
+    # an unreadable root.
     async with _live_page(
-        """<x-anon id="a"><button id="twin" type="button" style="width:80px;height:20px">Twin</button></x-anon>
+        """<x-anon id="a"><button type="button" style="width:80px;height:20px">Twin</button></x-anon>
         <script>
+        new MutationObserver((recs) => {
+          if (recs.some((m) => m.attributeName === 'data-tv3')) document.body.setAttribute('data-seen', '1');
+        }).observe(document.body, {subtree: true, attributes: true});
         document.getElementById('a').attachShadow({mode:'open'}).innerHTML =
           '<slot></slot><button type="button" style="width:80px;height:20px">Inner Go</button>';
         </script>"""
     ) as page:
         tools = build_browser_tools(_fixed_page_provider(page))
-        with capture_logs() as logs:
-            r = await _tool(tools, "observe").handler({})
-        omissions = [entry for entry in logs if entry["event"] == event]
-        assert len(omissions) == 1, logs
-        entry = omissions[0]
-        assert entry["omitted_anonymous"] == 1
-        assert entry["omitted_duplicated"] == 0
-        assert entry["omitted_unverifiable"] == 0
-        assert entry["omitted_unsafe"] == 0
-        assert entry["omitted_in_components"] == 1
-        note = next(ln for ln in r.content.splitlines() if "not listed because we have no selector" in ln)
-        assert f"{entry['omitted_anonymous']} have no id, name or data-testid of their own" in note
+        r = await _tool(tools, "observe").handler({})
+        assert await page.evaluate("() => document.body.getAttribute('data-seen')") == "1"
+        assert _ref_line(r.content, "Inner Go")
+        assert r.data["summary"]["listed_by_handle_only"] == 1, r.data["summary"]
+        assert "could not be verified" not in r.content, r.content
 
 
 @_skip_no_browser
@@ -20459,8 +20503,7 @@ async def test_one_unreadable_root_does_not_cost_every_selector_on_the_page() ->
         # The condition itself must be disclosed too, not just its consequence (markers instead of
         # ids) — a reader who never sees this note has no way to tell the page just has few ids.
         assert (
-            "note: part of this page could not be queried, so selector uniqueness could not be "
-            "verified here; elements we could not name are not listed"
+            "note: part of this page could not be queried, so selector uniqueness could not be verified here\n"
         ) in first.content
 
 
@@ -20569,16 +20612,19 @@ async def test_select_option_drives_a_hidden_native_select_inside_an_open_shadow
         )
 
 
-# Two dropzones of the same component reuse one id, so neither is nameable and both are dropped
-# AFTER the styled-proxy gate already counted them. The note must count what it listed, not what it
-# retained, or it reports controls the model cannot find any line for.
+# Dropzones of one component that reuse an internal id. The note must count what it listed, not
+# what it retained, or it reports controls the model cannot find any line for.
 _SHARED_ID_DROPZONES_HTML = """
 <!doctype html><html><body>
   <ds-drop id="dz-single"></ds-drop>
   <ds-drop id="dz-a"></ds-drop>
   <ds-drop id="dz-b"></ds-drop>
   <ds-drop class="anon"></ds-drop>
+  <label style="display:inline-block;width:240px;height:40px">Upload references<input type="file" class="refused" style="position:absolute;width:0;height:0;opacity:0"></label>
   <script>
+    // A light-DOM control that swallows our marker write passes the hidden-native gate and is then
+    // dropped unnamed, so it is the one control retained but never listed.
+    document.querySelector('input.refused').setAttribute = function () {};
     // An immediate-upload form: attaching a file dispatches an upload request. Absolute URL so the
     // request is dispatched (and observed) even though it fails against no server.
     function upl() { fetch('https://api.example.test/upload', {method: 'POST', body: new FormData()}).catch(function () {}); }
@@ -20594,8 +20640,7 @@ _SHARED_ID_DROPZONES_HTML = """
     mk('dz-a', 'resume', 'Upload resume');
     mk('dz-b', 'resume', 'Upload cover letter');
     // An instance that slots a light-DOM twin of its own control beside it, so nothing under the
-    // host singles the inner one out: it stays retained-but-unlisted and the note keeps having
-    // something to count that the listing does not.
+    // host singles the inner one out and only its live handle reaches it.
     var anon = document.querySelector('ds-drop.anon');
     anon.innerHTML = '<input type="file" id="portfolio" style="position:absolute;width:0;height:0;opacity:0">';
     anon.attachShadow({mode: 'open'}).innerHTML = '<slot></slot>' +
@@ -20614,12 +20659,10 @@ async def test_hidden_native_note_counts_only_the_controls_it_actually_listed() 
         r = await _tool(tools, "observe").handler({})
         assert r.status == "ok"
         tagged = [ln for ln in r.content.splitlines() if "[hidden-native" in ln and not ln.startswith("note:")]
-        assert len(tagged) == 3, r.content
-        assert "note: 3 native control(s) hidden behind styled proxies" in r.content, r.content
-        # The one that nothing under its host singles out stays unlisted, and is said to be dropped
-        # rather than counted as listed: the note claims what it printed, not what it walked.
-        assert "reused by another instance of the same component" in r.content
-        assert "portfolio" not in r.content, r.content
+        assert len(tagged) == 4, r.content
+        assert "note: 4 native control(s) hidden behind styled proxies" in r.content, r.content
+        assert any("'Upload portfolio'" in ln for ln in tagged), r.content
+        assert "Upload references" not in r.content, r.content
 
 
 # Two instances of one component, each holding a control under the same id. Shadow encapsulation
@@ -21026,9 +21069,8 @@ async def test_verify_commit_reads_a_shadow_hosted_field() -> None:
 async def test_a_shadow_selector_is_never_handed_out_when_it_would_denote_a_sibling() -> None:
     # Unique is not enough, it must be THIS element, and that has to hold on the pierced path too: a
     # NULL id folds to U+FFFD when escaped, so a selector built from it denotes a sibling carrying
-    # the real U+FFFD id. observe declines to name the first control and says why, rather than
-    # handing out a selector that resolves to the second -- and the sibling it does name still
-    # resolves to itself.
+    # the real U+FFFD id. observe declines to name the first control, rather than handing out a
+    # selector that resolves to the second, and reaches it by its own handle instead.
     async with _live_page(
         """<x-host id="h"></x-host><script>
         var r = document.getElementById('h').attachShadow({mode: 'open'});
@@ -21045,11 +21087,9 @@ async def test_a_shadow_selector_is_never_handed_out_when_it_would_denote_a_sibl
     ) as page:
         tools = build_browser_tools(_fixed_page_provider(page))
         r = await _tool(tools, "observe").handler({})
-        assert "Real Control" not in r.content, r.content
-        assert "identifier we cannot render safely" in r.content, r.content
-        ref = _ref_line(r.content, "Decoy")
-        text = await _tool(tools, "get_html").handler({"selector": ref, "format": "text"})
-        assert text.status == "ok" and text.content.strip() == "Decoy", text.content
+        for name in ("Real Control", "Decoy"):
+            text = await _tool(tools, "get_html").handler({"selector": _ref_line(r.content, name), "format": "text"})
+            assert text.status == "ok" and text.content.strip() == name, text.content
 
 
 # The seam between the two shipped halves: a styled listbox proxy AND the hidden native it writes
@@ -21260,30 +21300,44 @@ async def test_the_address_observe_prints_is_byte_identical_to_the_argument_the_
 
 @_skip_no_browser
 @pytest.mark.asyncio
-async def test_a_control_replaced_by_the_act_leaves_bookkeeping_an_address_that_re_resolves() -> None:
+@pytest.mark.parametrize("in_root", [False, True], ids=["named", "handle_only"])
+async def test_a_control_replaced_by_the_act_leaves_bookkeeping_an_address_that_re_resolves(in_root: bool) -> None:
     # The submit watch's in-flight probe, the repeat guard's key and the nudge all read the caller's
     # args AFTER dispatch, and turns later. The act token is a stamp on ONE node, so a control the
     # page replaces as it acts -- a submit button swapped for its "Submitting" version -- carries it
     # away; the probe fails open on a selector that resolves to nothing, which is exactly how a
     # submission still in flight reads as settled. What those readers get back has to re-resolve.
-    async with _live_page(
-        """<button id="send" style="width:120px;height:24px">Send</button>
-        <script>
-        window.hits = [];
-        document.getElementById('send').addEventListener('click', () => {
+    swap = """function () {
           window.hits.push('send');
-          const old = document.getElementById('send');
           const fresh = document.createElement('button');
-          fresh.id = 'send';
+          fresh.type = 'button';
+          if (this.id) fresh.id = this.id;
           fresh.textContent = 'Submitting';
           fresh.style.cssText = 'width:120px;height:24px';
-          old.parentNode.insertBefore(fresh, old);
-          old.remove();
-        });
+          this.parentNode.insertBefore(fresh, this);
+          this.remove();
+        }"""
+    page_html = (
+        f"""<x-form id="f"></x-form>
+        <script>
+        window.hits = [];
+        const root = document.getElementById('f').attachShadow({{mode: 'open'}});
+        root.innerHTML = '<div><button type="button" style="width:120px;height:24px">Send</button></div>'
+          + '<div><button type="button" style="width:120px;height:24px">Cancel</button></div>';
+        root.querySelector('button').addEventListener('click', {swap});
         </script>"""
-    ) as page:
+        if in_root
+        else f"""<button id="send" style="width:120px;height:24px">Send</button>
+        <script>
+        window.hits = [];
+        document.getElementById('send').addEventListener('click', {swap});
+        </script>"""
+    )
+    async with _live_page(page_html) as page:
         tools = build_browser_tools(_fixed_page_provider(page))
         r = await _tool(tools, "observe").handler({})
+        if in_root:
+            assert r.data["summary"]["listed_by_handle_only"] == 2, r.data["summary"]
         args = {"selector": _ref_line(r.content, "'Send'")}
 
         clicked = await _tool(tools, "click").handler(args)
@@ -21461,12 +21515,24 @@ async def test_a_coupled_transposition_is_the_one_form_still_open_and_this_pins_
 @_skip_no_browser
 @pytest.mark.asyncio
 @pytest.mark.parametrize("attack", sorted(_PAIRING_ATTACKS), ids=sorted(_PAIRING_ATTACKS))
-async def test_no_poisoned_dispatch_can_pair_a_digest_line_with_a_decoy_element(attack: str) -> None:
+@pytest.mark.parametrize("in_root", [False, True], ids=["named", "handle_only"])
+async def test_no_poisoned_dispatch_can_pair_a_digest_line_with_a_decoy_element(attack: str, in_root: bool) -> None:
     # The perceive->act identity invariant: whatever the page does to the intrinsics, the element the
     # engine acts on is the one the line the model read described. Failing closed is allowed -- acting
     # on Beta is not, because that is a wrong-element commit the PAGE chose.
-    async with _live_page(
-        """<button id="alpha" style="width:90px;height:22px">Alpha</button>
+    page_html = (
+        """<x-pair id="p"></x-pair>
+        <script>
+        window.hits = [];
+        const root = document.getElementById('p').attachShadow({mode: 'open'});
+        root.innerHTML = '<div><button type="button" style="width:90px;height:22px">Alpha</button></div>'
+          + '<div><button type="button" style="width:90px;height:22px">Beta</button></div>';
+        for (const b of root.querySelectorAll('button'))
+          b.addEventListener('click', (e) => window.hits.push(e.currentTarget.textContent.toLowerCase()));
+        const beta = root.querySelectorAll('button')[1];
+        """
+        if in_root
+        else """<button id="alpha" style="width:90px;height:22px">Alpha</button>
         <button id="beta" style="width:90px;height:22px">Beta</button>
         <script>
         window.hits = [];
@@ -21474,12 +21540,12 @@ async def test_no_poisoned_dispatch_can_pair_a_digest_line_with_a_decoy_element(
           b.addEventListener('click', (e) => window.hits.push(e.currentTarget.id));
         const beta = document.getElementById('beta');
         """
-        + _PAIRING_ATTACKS[attack]
-        + """
-        </script>"""
-    ) as page:
+    )
+    async with _live_page(page_html + _PAIRING_ATTACKS[attack] + "\n</script>") as page:
         tools = build_browser_tools(_fixed_page_provider(page))
         r = await _tool(tools, "observe").handler({})
+        if in_root:
+            assert r.data["summary"]["listed_by_handle_only"] == 2, r.data["summary"]
         # Non-vacuous: the attack must not simply hide Alpha, or there would be nothing to mis-address.
         alpha_ref = _ref_line(r.content, "'Alpha'")
 
@@ -21648,7 +21714,7 @@ async def test_a_host_anchored_control_is_driven_rather_than_reported_gone() -> 
         tools = build_browser_tools(_fixed_page_provider(page))
         r = await _tool(tools, "observe").handler({})
         listed = [ln for ln in r.content.splitlines() if "[hidden-native" in ln and not ln.startswith("note:")]
-        assert len(listed) == 3, r.content
+        assert len(listed) == 4, r.content
         # dz-b's own dropzone, distinguished from dz-a's identical-shaped one by its label.
         chosen = _ref_line(r.content, "Upload cover letter")
         assert any("hidden-native" in ln for ln in listed if chosen in ln), r.content
@@ -21682,15 +21748,14 @@ async def test_a_host_anchored_selector_counts_what_the_host_slots_as_well_as_wh
         r = await _tool(tools, "observe").handler({})
         # Armed on the DIGEST too, not only on the fixture: the property below is quantified over what
         # was actually listed, so an empty or collapsed digest would satisfy it without protecting
-        # anything. The light-DOM twin is still named, and the one under the host is refused AND said
-        # to be.
-        assert re.search(r"\((\d+) interactive elements\)", r.content).group(1) == "1", r.content
-        assert "reused by another instance of the same component" in r.content, r.content
-        # Whatever selector the internal mint fell back to for the one control it DID list (no longer
-        # anything the digest shows the model), it must genuinely denote only that element.
+        # anything. The light-DOM twin is still named, and the one under the host is listed with no
+        # selector at all rather than an ambiguous one.
+        assert re.search(r"\((\d+) interactive elements\)", r.content).group(1) == "2", r.content
+        # Whatever selector the internal mint fell back to for a control it named (no longer anything
+        # the digest shows the model), it must genuinely denote only that element.
         selectors = [e["selector"] for e in (await _observe_data(page))["elements"]]
-        assert len(selectors) == 1, selectors
-        for sel in selectors:
+        assert len(selectors) == 2 and selectors.count("") == 1, selectors
+        for sel in filter(None, selectors):
             assert await page.locator(sel).count() == 1, f"{sel} denotes more than one element: {selectors}"
 
 
