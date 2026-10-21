@@ -24,7 +24,7 @@ from skyvern.forge.sdk.db.repositories.workflow_run_attempts import (
     ATTEMPT_RECOVERY_MAX_PAGES,
 )
 from skyvern.forge.sdk.executor.async_executor import AsyncExecutor
-from skyvern.forge.sdk.executor.run_liveness import acquire_run_lease, hold_run, track_run
+from skyvern.forge.sdk.executor.run_liveness import acquire_run_lease, hold_run, run_lease_lost, track_run
 from skyvern.forge.sdk.schemas.organizations import Organization
 from skyvern.forge.sdk.schemas.persistent_browser_sessions import FORCED_WORKFLOW_SESSION_RUNNABLE_TYPE
 from skyvern.forge.sdk.schemas.task_v2 import TaskV2Status
@@ -381,6 +381,16 @@ class BackgroundTaskExecutor(AsyncExecutor):
         return org_auth_token.token if org_auth_token else None
 
     async def _initialize_retry_resume(self, attempt: Any, *, prepared: bool) -> tuple[Organization, str] | None:
+        with track_run(attempt.workflow_run_id, "workflow_run", attempt.attempt_number):
+            if not await acquire_run_lease(attempt.workflow_run_id):
+                # Without this key the sweep treats a stale retry decision as orphaned and abandons it.
+                self._retry_resumes_needing_recovery.add((attempt.workflow_run_id, attempt.attempt_number))
+                return None
+            return await self._initialize_admitted_retry_resume(attempt, prepared=prepared)
+
+    async def _initialize_admitted_retry_resume(
+        self, attempt: Any, *, prepared: bool
+    ) -> tuple[Organization, str] | None:
         deadline = naive_utc_now() + timedelta(seconds=LEASE_TAKEOVER_SECONDS)
         backoff_seconds = 1.0
         previous_missing: str | None = None
@@ -613,6 +623,16 @@ class BackgroundTaskExecutor(AsyncExecutor):
         return False
 
     async def _dispatch_retry_resume(self, attempt: Any, execution_kwargs: dict[str, Any]) -> None:
+        with track_run(attempt.workflow_run_id, "workflow_run", execution_kwargs["attempt_number"]):
+            if not await acquire_run_lease(attempt.workflow_run_id):
+                # A prepared claim is already stamped; only stale-claim recovery could otherwise reach it.
+                key = (attempt.workflow_run_id, attempt.attempt_number)
+                self._retry_dispatches_needing_recovery[key] = (attempt, execution_kwargs)
+                self._retry_resumes_needing_recovery.add(key)
+                return
+            await self._dispatch_admitted_retry_resume(attempt, execution_kwargs)
+
+    async def _dispatch_admitted_retry_resume(self, attempt: Any, execution_kwargs: dict[str, Any]) -> None:
         key = (attempt.workflow_run_id, attempt.attempt_number)
         self._retry_dispatches_needing_recovery.pop(key, None)
         execution_started = False
@@ -719,16 +739,17 @@ class BackgroundTaskExecutor(AsyncExecutor):
         if organization is None:
             raise OrganizationNotFound(organization_id)
 
-        step = await app.DATABASE.tasks.create_step(
-            task_id,
-            order=0,
-            retry_index=0,
-            organization_id=organization_id,
-        )
-
         release_hold = hold_run(task_id, "task")
         try:
-            await acquire_run_lease(task_id)
+            if not await acquire_run_lease(task_id):
+                release_hold()
+                return
+            step = await app.DATABASE.tasks.create_step(
+                task_id,
+                order=0,
+                retry_index=0,
+                organization_id=organization_id,
+            )
             task = await app.DATABASE.tasks.update_task(
                 task_id,
                 status=TaskStatus.running,
@@ -763,6 +784,8 @@ class BackgroundTaskExecutor(AsyncExecutor):
             async def execute_registered_step(*args: Any, **kwargs: Any) -> None:
                 with track_run(task_id, "task"):
                     release_hold()
+                    if await run_lease_lost(task_id):
+                        return
                     await app.agent.execute_step(*args, **kwargs)
 
             self._schedule(
@@ -957,28 +980,40 @@ class BackgroundTaskExecutor(AsyncExecutor):
         if not task_v2 or not task_v2.workflow_run_id:
             raise ValueError("No task v2 or no workflow run associated with task v2")
 
-        # mark task v2 as queued
-        await app.DATABASE.observer.update_task_v2(
-            task_v2_id=task_v2_id,
-            status=TaskV2Status.queued,
-            organization_id=organization_id,
-        )
-        await app.DATABASE.workflow_runs.update_workflow_run(
-            workflow_run_id=task_v2.workflow_run_id,
-            status=WorkflowRunStatus.queued,
-        )
+        workflow_run_id = task_v2.workflow_run_id
+        release_hold = hold_run(workflow_run_id, "workflow_run")
+        try:
+            if not await acquire_run_lease(workflow_run_id):
+                release_hold()
+                return
+            await app.DATABASE.observer.update_task_v2(
+                task_v2_id=task_v2_id,
+                status=TaskV2Status.queued,
+                organization_id=organization_id,
+            )
+            await app.DATABASE.workflow_runs.update_workflow_run(
+                workflow_run_id=workflow_run_id,
+                status=WorkflowRunStatus.queued,
+            )
 
-        await initialize_skyvern_state_file(workflow_run_id=task_v2.workflow_run_id, organization_id=organization_id)
-        await prepare_org_llm_runtime(app.DATABASE, organization_id, organization)
-        self._schedule(
-            background_tasks,
-            task_v2_service.run_task_v2,
-            organization=organization,
-            task_v2_id=task_v2_id,
-            max_steps_override=max_steps_override,
-            max_iterations_override=max_iterations_override,
-            browser_session_id=browser_session_id,
-        )
+            await initialize_skyvern_state_file(workflow_run_id=workflow_run_id, organization_id=organization_id)
+            await prepare_org_llm_runtime(app.DATABASE, organization_id, organization)
+
+            async def execute_registered_task_v2() -> None:
+                with track_run(workflow_run_id, "workflow_run"):
+                    release_hold()
+                    await task_v2_service.run_task_v2(
+                        organization=organization,
+                        task_v2_id=task_v2_id,
+                        max_steps_override=max_steps_override,
+                        max_iterations_override=max_iterations_override,
+                        browser_session_id=browser_session_id,
+                    )
+
+            self._schedule(background_tasks, execute_registered_task_v2)
+        except BaseException:
+            release_hold()
+            raise
 
     async def execute_script(
         self,

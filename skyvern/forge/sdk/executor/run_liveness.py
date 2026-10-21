@@ -74,14 +74,9 @@ def _register(
         return lambda cancelled: None
     _kept_leases.discard(run_id)
     entry = _registry.get(run_id)
-    if entry is None:
+    if entry is None or entry.attempt_number != attempt_number:
         entry = _Registration(run_type, attempt_number)
         _registry[run_id] = entry
-    elif entry.attempt_number != attempt_number:
-        entry.attempt_number = attempt_number
-        entry.acquired = False
-        entry.lost = False
-        entry.finalized = False
     entry.count += 1
     entry.task = task
     _wake.set()
@@ -134,23 +129,29 @@ def note_run_finalized(run_id: str) -> None:
         entry.finalized = True
 
 
-async def acquire_run_lease(run_id: str) -> None:
+async def acquire_run_lease(run_id: str) -> bool:
     if not _enabled:
-        return
+        return True
     entry = _registry.get(run_id)
-    if entry is None or entry.acquired or entry.lost:
-        return
+    if entry is None:
+        return True
+    if entry.acquired or entry.lost:
+        return not entry.lost
     attempt = entry.attempt_number
     try:
         async with _lease_write_lock:
-            if _registry.get(run_id) is not entry or entry.attempt_number != attempt or entry.acquired or entry.lost:
-                return
+            if _registry.get(run_id) is not entry or entry.attempt_number != attempt:
+                return False
+            if entry.acquired or entry.lost:
+                return not entry.lost
             acquired = await app.DATABASE.run_execution_leases.acquire(
                 owner_id(),
                 {run_id: (entry.run_type, attempt)},
                 stale_before=naive_utc_now() - timedelta(minutes=effective_timeout_minutes()),
             )
             if run_id not in acquired:
+                entry.lost = True
+                entry.acquired = False
                 LOG.info(
                     "Run lease held by another process",
                     run_id=run_id,
@@ -158,12 +159,15 @@ async def acquire_run_lease(run_id: str) -> None:
                     attempt_number=attempt,
                     owner_id=owner_id(),
                 )
-                return
+                return False
             _held.add(run_id)
             if _registry.get(run_id) is entry and entry.attempt_number == attempt:
                 entry.acquired = True
+                return True
+            return False
     except Exception:
         LOG.warning("Run lease acquire failed before run start", run_id=run_id, exc_info=True)
+        return _registry.get(run_id) is entry and entry.attempt_number == attempt and not entry.lost
 
 
 async def run_lease_lost(run_id: str) -> bool:
@@ -189,6 +193,16 @@ async def run_lease_lost(run_id: str) -> bool:
         owner_id=owner_id(),
     )
     return True
+
+
+def _cancel_lost_runs(entries: list[_Registration]) -> None:
+    # Repeated cancellation would interrupt the cleanup started by the first cancellation.
+    lost_targets = {entry.task for entry in entries if entry.task is not None and not entry.finalized}
+    for target in lost_targets:
+        if not target.done() and all(
+            entry.lost and not entry.finalized for entry in _registry.values() if entry.task is target
+        ):
+            target.cancel()
 
 
 async def _heartbeat(repository: RunExecutionLeasesRepository) -> None:
@@ -226,13 +240,7 @@ async def _heartbeat(repository: RunExecutionLeasesRepository) -> None:
                         attempt_number=attempt,
                         owner_id=owner_id(),
                     )
-                # Repeated cancellation would interrupt the cleanup started by the first cancellation.
-                lost_targets = {entry.task for entry in newly_lost if entry.task is not None and not entry.finalized}
-                for target in lost_targets:
-                    if not target.done() and all(
-                        entry.lost and not entry.finalized for entry in _registry.values() if entry.task is target
-                    ):
-                        target.cancel()
+                _cancel_lost_runs(newly_lost)
             async with _lease_write_lock:
                 acquiring = {
                     key: (entry, entry.attempt_number)
@@ -244,8 +252,14 @@ async def _heartbeat(repository: RunExecutionLeasesRepository) -> None:
                     {key: (entry.run_type, attempt) for key, (entry, attempt) in acquiring.items()},
                     stale_before=naive_utc_now() - timedelta(minutes=effective_timeout_minutes()),
                 )
+                acquisition_losses: list[_Registration] = []
                 for run_id, (entry, attempt) in acquiring.items():
                     if run_id not in acquired:
+                        if _registry.get(run_id) is not entry or entry.attempt_number != attempt:
+                            continue
+                        entry.lost = True
+                        entry.acquired = False
+                        acquisition_losses.append(entry)
                         LOG.info(
                             "Run lease held by another process",
                             run_id=run_id,
@@ -257,6 +271,7 @@ async def _heartbeat(repository: RunExecutionLeasesRepository) -> None:
                     _held.add(run_id)
                     if _registry.get(run_id) is entry and entry.attempt_number == attempt:
                         entry.acquired = True
+                _cancel_lost_runs(acquisition_losses)
             _kept_leases.intersection_update(_held)
         except Exception:
             LOG.exception("Run lease heartbeat failed", owner_id=owner_id())

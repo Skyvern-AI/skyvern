@@ -3732,6 +3732,8 @@ class ForLoopBlock(Block):
         cancellation) always persist since they are terminal."""
         if not self.output_parameter:
             return
+        if run_lease_tasks_enabled() and await run_lease_lost(workflow_run_id):
+            return
         _maybe_truncate_loop_outputs(
             outputs_with_loop_values,
             workflow_run_id=workflow_run_id,
@@ -4442,6 +4444,8 @@ class WhileLoopBlock(Block):
         Temporal activity timeouts. Mirrors ``ForLoopBlock._persist_partial_loop_output``.
         """
         if not self.output_parameter:
+            return
+        if run_lease_tasks_enabled() and await run_lease_lost(workflow_run_id):
             return
         _maybe_truncate_loop_outputs(
             outputs_with_loop_values,
