@@ -37,7 +37,7 @@ export const navigationNodeDefaultData: NavigationNodeData = {
   completeCriterion: "",
   terminateCriterion: "",
   errorCodeMapping: "null",
-  model: { model_name: "" },
+  model: null,
   engine: null,
   maxRetries: null,
   maxStepsOverride: null,

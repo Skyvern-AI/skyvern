@@ -521,3 +521,30 @@ describe("block engine load and save", () => {
     ]);
   });
 });
+
+describe("block model override on save", () => {
+  test("a new navigation block saves no model override", () => {
+    const node = createNode({ id: "n1" }, "navigation", "Go to page");
+
+    expect(getWorkflowBlocks([node], [])[0]).toMatchObject({ model: null });
+  });
+
+  test.each([
+    ["an empty model name is dropped", { model_name: "" }, null],
+    [
+      "a chosen model is kept",
+      { model_name: "gemini-3-flash" },
+      { model_name: "gemini-3-flash" },
+    ],
+  ])("%s", (_name, stored, expected) => {
+    const { nodes, edges } = getElements(
+      [{ ...minimalTaskBlock(), model: stored } as WorkflowBlock],
+      SETTINGS,
+      true,
+    );
+
+    expect(getWorkflowBlocks(nodes, edges)[0]).toMatchObject({
+      model: expected,
+    });
+  });
+});

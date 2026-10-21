@@ -46,6 +46,7 @@ import {
   type ConditionalBlock,
   type ForLoopBlock,
   type WhileLoopBlock,
+  type WorkflowModel,
   isNestedLoopWorkflowBlock,
 } from "../types/workflowTypes";
 import {
@@ -3325,6 +3326,13 @@ function findNextBlockLabel(
   return null;
 }
 
+// Navigation blocks used to default to `{ model_name: "" }`, which is not an override.
+function blockModelOverride(
+  model: WorkflowModel | null | undefined,
+): WorkflowModel | null {
+  return model?.model_name ? model : null;
+}
+
 function getWorkflowBlock(
   node: WorkflowBlockNode,
   nodes: Array<AppNode>,
@@ -3337,7 +3345,7 @@ function getWorkflowBlock(
     label: node.data.label,
     continue_on_failure: node.data.continueOnFailure,
     next_loop_on_failure: node.data.nextLoopOnFailure,
-    model: node.data.model,
+    model: blockModelOverride(node.data.model),
     next_block_label: nextBlockLabel,
     ignore_workflow_system_prompt:
       node.data.ignoreWorkflowSystemPrompt ?? false,
@@ -5082,7 +5090,7 @@ function convertBlocksToBlockYAML(
           url: block.url,
           title: block.title,
           ...blockEngineYAML(block, effectiveDefaultEngine),
-          model: block.model,
+          model: blockModelOverride(block.model),
           navigation_goal: block.navigation_goal,
           error_code_mapping: block.error_code_mapping,
           max_retries: block.max_retries,
@@ -5398,7 +5406,7 @@ function convertBlocksToBlockYAML(
         const blockYaml: WebSearchBlockYAML = {
           ...base,
           block_type: "web_search",
-          model: block.model,
+          model: blockModelOverride(block.model),
           query: block.query,
           provider: block.provider,
           num_results: block.num_results,
