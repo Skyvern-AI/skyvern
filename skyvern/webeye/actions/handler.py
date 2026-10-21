@@ -241,6 +241,10 @@ from skyvern.webeye.cdp_download_interceptor import (
     redacted_exception_origin,
     settle_browser_downloads_for_context,
 )
+from skyvern.webeye.dom_inspection import (
+    is_static_listbox_option_snapshot,
+    read_static_listbox_option_snapshot,
+)
 from skyvern.webeye.main_world_eval import evaluate_in_main_world
 from skyvern.webeye.navigation import (
     clear_task_nav_error_code,
@@ -6349,6 +6353,10 @@ async def _is_paste_text_action_enabled(task: Task) -> bool:
         return False
 
 
+async def _has_static_option_role(element: SkyvernElement) -> bool:
+    return (await element.get_attr("role", mode="static") or "").strip().casefold() == "option"
+
+
 def check_for_invalid_web_action(
     action: actions.Action,
     page: Page,
@@ -6638,6 +6646,61 @@ async def _is_single_select_option_highlight(element: SkyvernElement) -> bool:
     if await multiselectable.count() == 0:
         return True
     return (await multiselectable.get_attribute("aria-multiselectable") or "").strip().casefold() != "true"
+
+
+async def _is_static_listbox_option(element: SkyvernElement) -> bool:
+    try:
+        snapshot = await read_static_listbox_option_snapshot(element.get_frame(), await element.get_element_handler())
+    except Exception:
+        LOG.debug("Static listbox option snapshot read failed; treating as not static", element_id=element.get_id())
+        return False
+    is_static = is_static_listbox_option_snapshot(snapshot)
+    if (
+        isinstance(snapshot, dict)
+        and snapshot.get("isOption") is True
+        and snapshot.get("inListbox") is True
+        and not is_static
+    ):
+        LOG.info("Option is not a static listbox option", element_id=element.get_id(), snapshot=snapshot)
+    return is_static
+
+
+def _static_listbox_replan_failure(action: actions.ClickAction, message: str) -> ActionFailure:
+    result = ActionFailure(FailToClick(action.element_id, msg=message))
+    result.skip_remaining_actions = True
+    return result
+
+
+async def _resolve_static_listbox_container_target(
+    action: actions.ClickAction, element: SkyvernElement, dom: DomUtil
+) -> SkyvernElement | ActionFailure | None:
+    try:
+        options = await element.get_locator().locator('[role="option"]').all()
+        if not options:
+            return None
+        for option in options:
+            # A hidden option means the container is collapsed; its click may be what expands it.
+            if not await option.is_visible():
+                return None
+            snapshot = await read_static_listbox_option_snapshot(
+                element.get_frame(), await option.element_handle(timeout=settings.BROWSER_ACTION_TIMEOUT_MS)
+            )
+            if not is_static_listbox_option_snapshot(snapshot):
+                return None
+        if len(options) != 1:
+            return _static_listbox_replan_failure(
+                action,
+                "This static listbox already exposes multiple options. Click the intended option directly; "
+                "clicking the container may select an arbitrary option.",
+            )
+        option_id = await options[0].get_attribute(SKYVERN_ID_ATTR)
+        target = await dom.safe_get_skyvern_element_by_id(option_id) if option_id else None
+        if target is None or not await _is_static_listbox_option(target) or await target.is_disabled(dynamic=True):
+            return _static_listbox_replan_failure(action, "The static listbox option is unavailable; rescrape it.")
+        return target
+    except Exception:
+        LOG.debug("Static listbox container inspection failed", element_id=element.get_id())
+        return None
 
 
 class _GridRowSelection(StrEnum):
@@ -6985,7 +7048,9 @@ class _EffectiveClickState(NamedTuple):
     control_type: str | None
 
 
-async def _resolve_live_click_state(element: SkyvernElement) -> _EffectiveClickState:
+async def _resolve_live_click_state(
+    element: SkyvernElement, *, trust_static_listbox: bool = False
+) -> _EffectiveClickState:
     """Read one generic, live selected/checked state and control type snapshot.
     ``checked`` is None when no boolean observable is readable (unknown control, malformed value,
     or a detached/unreadable element), so the caller falls open to an ordinary click. Native radio
@@ -7008,9 +7073,11 @@ async def _resolve_live_click_state(element: SkyvernElement) -> _EffectiveClickS
             if parsed is None:
                 continue
             if aria_attr == "aria-selected" and parsed and await _is_single_select_option_highlight(element):
-                # A single-select option's aria-selected="true" is a keyboard highlight, not committed
-                # state, so leave it unreadable and let the physical click commit the selection.
-                return _EffectiveClickState(checked=None, control_type=None)
+                if not (trust_static_listbox and await _is_static_listbox_option(element)):
+                    # A single-select option's aria-selected="true" is a keyboard highlight, not committed
+                    # state, so leave it unreadable and let the physical click commit the selection.
+                    return _EffectiveClickState(checked=None, control_type=None)
+                LOG.info("Trusting aria-selected on a static listbox option", element_id=element.get_id())
             return _EffectiveClickState(checked=parsed, control_type=None)
         return _EffectiveClickState(checked=None, control_type=None)
     except Exception:
@@ -7356,7 +7423,12 @@ async def _input_type_or_none(element: SkyvernElement) -> str | None:
 
 
 async def _apply_desired_click_state(
-    action: actions.ClickAction, element: SkyvernElement, desired_state: bool, dom: DomUtil
+    action: actions.ClickAction,
+    element: SkyvernElement,
+    desired_state: bool,
+    dom: DomUtil,
+    *,
+    trust_static_listbox: bool = False,
 ) -> list[ActionResult] | None:
     """Drive a selectable control to an explicit terminal state idempotently. Returns
     [ActionAbort()] to suppress the physical click -- when the control already matches the desired
@@ -7372,7 +7444,7 @@ async def _apply_desired_click_state(
         element_type = await _input_type_or_none(element)
     if element_type == "checkbox":
         return await _apply_checkbox_desired_click_state(action, element, desired_state)
-    state = await _resolve_live_click_state(element)
+    state = await _resolve_live_click_state(element, trust_static_listbox=trust_static_listbox)
     if state.checked is None:
         LOG.info("No readable selected state, continuing the normal click", action=action)
         return None
@@ -7465,6 +7537,7 @@ async def handle_click_action(
     action_phase.mark_action_phase(ActionPhase.RESOLVE_ELEMENT)
     skyvern_element = await dom.get_skyvern_element_by_id(action.element_id)
     action_phase.mark_action_phase(ActionPhase.PRE_CLICK_CHECKS)
+    static_listbox_fix = await _has_static_option_role(skyvern_element)
 
     # Wait after getting element to allow any dynamic changes
     await asyncio.sleep(get_wait_time(wait_config, "post_click_delay", default=0.3))
@@ -7475,7 +7548,11 @@ async def handle_click_action(
     # single ordinary click for a custom-control mismatch or an unreadable state.
     if action.click_context is not None and action.click_context.desired_state is not None:
         desired_state_result = await _apply_desired_click_state(
-            action, skyvern_element, action.click_context.desired_state, dom
+            action,
+            skyvern_element,
+            action.click_context.desired_state,
+            dom,
+            trust_static_listbox=static_listbox_fix and action.repeat == 1,
         )
         if desired_state_result is not None:
             return desired_state_result
@@ -7489,12 +7566,17 @@ async def handle_click_action(
         )
         if child is not None:
             skyvern_element = child
+            static_listbox_fix = await _has_static_option_role(skyvern_element)
             # Retarget moved the click to the descendant that will actually receive it, so re-run
             # the same guard on the child: the pre-retarget pass observed the (unreadable) wrapper
             # and fell open, and without this the retargeted child could still be re-toggled.
             if action.click_context is not None and action.click_context.desired_state is not None:
                 desired_state_result = await _apply_desired_click_state(
-                    action, skyvern_element, action.click_context.desired_state, dom
+                    action,
+                    skyvern_element,
+                    action.click_context.desired_state,
+                    dom,
+                    trust_static_listbox=static_listbox_fix and action.repeat == 1,
                 )
                 if desired_state_result is not None:
                     return desired_state_result
@@ -7505,6 +7587,47 @@ async def handle_click_action(
                 element_id=skyvern_element.get_id(),
             )
             return [ActionFailure(InteractWithDisabledElement(skyvern_element.get_id()))]
+
+    if (await skyvern_element.get_attr("role", mode="static") or "").strip().casefold() == "listbox":
+        target = await _resolve_static_listbox_container_target(action, skyvern_element, dom)
+        if isinstance(target, ActionFailure):
+            return [target]
+        if target is not None:
+            skyvern_element = target
+            action.element_id = target.get_id()
+            # Keep the persisted selector on the option that is clicked; scripts replay get_xpath().
+            action.xpath = None
+            action.skyvern_element_data = {
+                **target.get_element_dict(),
+                "page_url": (action.skyvern_element_data or {}).get("page_url"),
+            }
+            action.skyvern_element_hash = dom.scraped_page.id_to_element_hash.get(action.element_id)
+            static_listbox_fix = True
+            if action.click_context is not None and action.click_context.desired_state is not None:
+                desired_state_result = await _apply_desired_click_state(
+                    action,
+                    target,
+                    action.click_context.desired_state,
+                    dom,
+                    trust_static_listbox=action.repeat == 1,
+                )
+                if desired_state_result is not None:
+                    return desired_state_result
+
+    if (
+        static_listbox_fix
+        and action.repeat == 1
+        and (action.click_context is None or action.click_context.desired_state is None)
+        and await _is_static_listbox_option(skyvern_element)
+        and (await _resolve_live_click_state(skyvern_element, trust_static_listbox=True)).checked is True
+    ):
+        return [
+            _static_listbox_replan_failure(
+                action,
+                "This option is already selected. Set click_context.desired_state=true to keep it selected "
+                "or false to deselect it.",
+            )
+        ]
 
     # Skip scroll_into_view when a SCROLL action just completed on THIS element.
     # The scroll may have positioned the page or a container at the bottom to enable
@@ -7565,6 +7688,11 @@ async def handle_click_action(
                 remove_download_probe = _register_false_click_download_probe(page, false_click_download_observed)
 
             has_onclick_attr = await skyvern_element.has_attr("onclick", mode="static")
+            bypass_static_listbox_option = (
+                static_listbox_fix
+                and await _has_static_option_role(skyvern_element)
+                and await _is_static_listbox_option(skyvern_element)
+            )
             action_phase.mark_action_phase(ActionPhase.CLICK)
             results = await chain_click(
                 task,
@@ -7614,6 +7742,13 @@ async def handle_click_action(
                             element_id=skyvern_element.get_id(),
                         )
                         return results
+
+                if bypass_static_listbox_option:
+                    LOG.info(
+                        "Static listbox option click; bypassing the dropdown sequential-click rescrape",
+                        element_id=skyvern_element.get_id(),
+                    )
+                    return results
 
                 if sequential_click_result := await handle_sequential_click_with_submit_bypass(
                     action=action,

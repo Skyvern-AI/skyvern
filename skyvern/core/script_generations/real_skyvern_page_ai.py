@@ -242,10 +242,10 @@ class RealSkyvernPageAi(SkyvernPageAi):
             if ep_id is not None:
                 v3_parent_episode_id = ep_id
 
-        # Set when a setup already performed the interaction before raising SkyvernActionFailed,
-        # so the except block below can tell a genuine AI miss (safe to retry on selector) apart
-        # from a setup failure that already mutated the page (retrying would repeat side effects).
-        setup_performed_before_failure = False
+        # Set when the failure must not be retried as a raw selector click: a setup already
+        # performed the interaction (retrying would repeat side effects), or the handler refused
+        # the click and asked to stop (skip_remaining_actions), e.g. to wait for explicit intent.
+        raw_retry_unsafe = False
         try:
             # Build the element tree of the current page for the prompt
             context = skyvern_context.ensure_context()
@@ -302,7 +302,7 @@ class RealSkyvernPageAi(SkyvernPageAi):
                     setup_results = await setup(action, self.page, self.scraped_page, task, step)
                     if setup_results:
                         if setup_results[-1].success is False:
-                            setup_performed_before_failure = setup_results[-1].setup_performed
+                            raw_retry_unsafe = setup_results[-1].setup_performed
                             raise SkyvernActionFailed(
                                 setup_results[-1].exception_message or "Click action setup returned success=False"
                             )
@@ -311,7 +311,7 @@ class RealSkyvernPageAi(SkyvernPageAi):
                 if setup_result is None:
                     result = await handle_click_action(action, self.page, self.scraped_page, task, step)
                     if result and result[-1].success is False:
-                        setup_performed_before_failure = result[-1].setup_performed
+                        raw_retry_unsafe = result[-1].setup_performed or result[-1].skip_remaining_actions
                         raise SkyvernActionFailed(result[-1].exception_message or "Click action returned success=False")
                     if result and isinstance(result[-1], ActionAbort):
                         # handle_click_action's own ClickContext.desired_state guard can suppress
@@ -349,12 +349,11 @@ class RealSkyvernPageAi(SkyvernPageAi):
         except SkyvernActionFailed:
             if selector is None:
                 raise
-            if setup_performed_before_failure:
-                # The setup already mutated the page (e.g. clicked, toggled, or navigated) before
-                # this failure — a raw click on `selector` would repeat that side effect rather
-                # than recover from it, so surface the failure instead of retrying.
+            if raw_retry_unsafe:
+                # A raw click on `selector` would repeat a side effect the setup already caused, or
+                # override the handler's refusal, so surface the failure instead of retrying.
                 LOG.warning(
-                    "AI click setup already performed the interaction before failing; not retrying with a raw click",
+                    "AI click failure must not be retried with a raw click; surfacing it",
                     selector=selector,
                     intention=intention,
                 )
