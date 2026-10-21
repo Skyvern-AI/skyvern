@@ -25,6 +25,7 @@ from skyvern.forge.sdk.copilot.tools import (
     copilot_native_tools,
     get_skyvern_mcp_alias_map,
     list_integrations_tool,
+    offer_demonstration_tool,
 )
 from skyvern.forge.sdk.copilot.tools.integrations import (
     _list_integrations,
@@ -651,6 +652,45 @@ def test_request_google_connection_is_offered_only_to_a_client_that_renders_the_
     }
 
     assert ("request_google_connection" in names) is supports_google_setup_card
+
+
+@pytest.mark.parametrize("supports_demonstration_offer", [False, True])
+def test_offer_demonstration_is_offered_only_to_a_client_that_renders_the_card(
+    supports_demonstration_offer: bool,
+) -> None:
+    names = {
+        tool.name
+        for tool in copilot_native_tools(
+            supports_question_tool=True,
+            browser_code_available=False,
+            run_tools_available=True,
+            supports_demonstration_offer=supports_demonstration_offer,
+        )
+    }
+
+    assert ("offer_demonstration" in names) is supports_demonstration_offer
+
+
+@pytest.mark.asyncio
+async def test_offer_demonstration_sets_the_turn_flag_and_narrative_payload() -> None:
+    ctx = make_copilot_ctx()
+
+    await offer_demonstration_tool.on_invoke_tool(
+        SimpleNamespace(context=ctx, tool_name="offer_demonstration"),
+        "{}",
+    )
+    result = _make_agent_result(
+        ctx,
+        user_response="Show me.",
+        updated_workflow=None,
+        global_llm_context=None,
+        narrative_payload={"turnId": "turn-1", "terminal": "response"},
+        turn_outcome=TurnOutcome(response_kind=ResponseKind.ANSWER),
+    )
+
+    assert ctx.demonstration_offered is True
+    assert result.narrative_payload is not None
+    assert result.narrative_payload["demonstrationOffer"] is True
 
 
 def _persisted_offer_turn(ctx: CopilotContext) -> TurnOutcome:

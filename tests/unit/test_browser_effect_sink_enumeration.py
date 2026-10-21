@@ -80,6 +80,7 @@ _DISCOVERED_BROWSER_API_CALLS = {
             "click": 4,
             # A grid cell whose editor opens on a double-click (SKY-17868): one by selector, one by locator.
             "dblclick": 2,
+            "drag_and_drop": 1,
             "evaluate": 1,
             "fill": 3,
             "focus": 2,
@@ -268,14 +269,14 @@ def test_discovered_browser_api_lower_bound_is_stable() -> None:
     }
 
     assert observed == _DISCOVERED_BROWSER_API_CALLS
-    assert sum(sum(methods.values()) for methods in observed.values()) == 211
+    assert sum(sum(methods.values()) for methods in observed.values()) == 212
     handler_candidates = _candidate_signatures("skyvern/webeye/actions/handler.py", _CANDIDATE_METHODS)
     classified_non_browser = Counter(
         {signature: count for signature, count in handler_candidates.items() if signature in _NON_BROWSER_CANDIDATES}
     )
     assert classified_non_browser == _NON_BROWSER_CANDIDATES
     assert sum(_NON_BROWSER_CANDIDATES.values()) == 7
-    assert sum(sum(methods.values()) for methods in observed.values()) - sum(_NON_BROWSER_CANDIDATES.values()) == 204
+    assert sum(sum(methods.values()) for methods in observed.values()) - sum(_NON_BROWSER_CANDIDATES.values()) == 205
 
 
 def test_every_raw_evaluate_call_is_classified() -> None:

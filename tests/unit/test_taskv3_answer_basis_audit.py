@@ -70,7 +70,7 @@ def _tools(dispatched: list[tuple[str, dict[str, Any]]]) -> list[ToolSpec]:
             name=name, description="", parameters={}, handler=handler, address_probe=_address, answer_probe=probe
         )
 
-    names = ("click", "type", "select_option", "select_combobox", "press_key", CODE_TOOL_NAME, "observe")
+    names = ("click", "drag", "type", "select_option", "select_combobox", "press_key", CODE_TOOL_NAME, "observe")
     return [make(n) for n in names]
 
 
@@ -98,12 +98,13 @@ async def test_an_unsupported_answer_holds_every_moving_action_until_it_is_repla
     await click({"selector": '[data-tv3-menu="2"]', "_row": "No"})
     message = await _held(tools, "click", submit)
     assert DEBARMENT in message and "#q1" in message
-    # Neither a resubmit, the next question's opener, a submit by ref, an Enter nor the code tool spends the hold: each
-    # is refused and Submit stays refused after them.
+    # Neither a resubmit, the next question's opener, a submit by ref, an Enter, a drag nor the code tool spends the
+    # hold: each is refused and Submit stays refused after them.
     await _held(tools, "click", submit)
     await _held(tools, "click", {"selector": "#q2", "_label": "Are you willing to relocate?"})
     await _held(tools, "click", {"selector": "ref=40"})
     await _held(tools, "press_key", {"key": "Enter"})
+    await _held(tools, "drag", {"selector": "#slider", "target": "#end"})
     await _held(tools, CODE_TOOL_NAME, {"code": "await page.click('#submit')"})
     await _held(tools, "click", submit)
     assert [args for name, args in dispatched if name == "click"].count(submit) == 0
