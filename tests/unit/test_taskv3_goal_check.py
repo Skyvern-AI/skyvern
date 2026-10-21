@@ -1186,3 +1186,57 @@ async def test_a_cancel_landing_while_only_the_premise_check_runs_leaves_the_ver
     assert result.status == "ok" and result.data is not None
     assert result.data["status"] == ("completed" if converts else "terminated")
     assert checked == ["no PIN screen"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("reasks", [True, False])
+async def test_a_cancel_raised_inside_the_premise_check_does_not_end_the_run(reasks: bool) -> None:
+    async def premise(reason: str, prior_checks: int) -> None:
+        raise asyncio.CancelledError
+
+    finish = make_finish_tool(
+        **_gate_kwargs(pending=False, blocked=False, unsettled=False),
+        unlisted_reask=_ReaskSpy(converts=False) if reasks else None,
+        terminate_premise=premise,
+    )
+    result = await finish.handler({"status": "terminated", "reason": "no PIN screen"})
+
+    assert result.status == "ok" and result.data is not None
+    assert result.data["status"] == "terminated"
+
+
+@pytest.mark.asyncio
+async def test_the_runs_own_cancel_still_ends_the_run_while_the_premise_check_runs() -> None:
+    started = asyncio.Event()
+
+    async def premise(reason: str, prior_checks: int) -> None:
+        started.set()
+        await asyncio.Event().wait()
+
+    finish = make_finish_tool(
+        **_gate_kwargs(pending=False, blocked=False, unsettled=False),
+        terminate_premise=premise,
+    )
+    run = asyncio.ensure_future(finish.handler({"status": "terminated", "reason": "no PIN screen"}))
+    await started.wait()
+    run.cancel()
+
+    with pytest.raises(asyncio.CancelledError):
+        await run
+
+
+@pytest.mark.asyncio
+async def test_each_terminate_tells_the_premise_check_how_many_came_before() -> None:
+    seen: list[int] = []
+
+    async def premise(reason: str, prior_checks: int) -> None:
+        seen.append(prior_checks)
+
+    finish = make_finish_tool(
+        **_gate_kwargs(pending=False, blocked=False, unsettled=False),
+        terminate_premise=premise,
+    )
+    for _ in range(2):
+        await finish.handler({"status": "terminated", "reason": "no PIN screen"})
+
+    assert seen == [0, 1]
