@@ -645,7 +645,8 @@ async def run_task_v2(
         track_run(task_v2.workflow_run_id, "workflow_run") if task_v2.workflow_run_id else nullcontext(),
     ):
         if task_v2.workflow_run_id:
-            await acquire_run_lease(task_v2.workflow_run_id)
+            if not await acquire_run_lease(task_v2.workflow_run_id) or await run_lease_lost(task_v2.workflow_run_id):
+                return task_v2
         try:
             workflow, workflow_run, task_v2 = await run_task_v2_helper(
                 organization=organization,

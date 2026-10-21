@@ -15,7 +15,7 @@ import unicodedata
 import uuid
 from collections import Counter, deque
 from collections.abc import AsyncIterator, Awaitable, Callable, Iterable, Sequence
-from contextlib import asynccontextmanager, suppress
+from contextlib import ExitStack, asynccontextmanager, suppress
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from functools import partial
@@ -6551,52 +6551,59 @@ class WorkflowService:
             if serialized_identity:
                 retry_gate_run = recovered_run
         while True:
-            if retry_gate_run is not None:
-                try:
-                    stopped_run = await self._wait_for_retry_sequential_clearance(retry_gate_run, attempt_number)
-                except asyncio.CancelledError:
-                    # Only shutdown cancels this owner; the prepared attempt stays queued for recovery.
-                    LOG.info(
-                        "Workflow retry owner stopped while waiting for sequential clearance; leaving the attempt for recovery",
-                        workflow_run_id=workflow_run_id,
-                        attempt_number=attempt_number,
-                    )
-                    raise
-                if stopped_run is not None:
-                    final_decision = await finalize_abandoned_attempt(
-                        workflow_run_id=workflow_run_id,
-                        organization_id=organization_id,
-                        reason="sequential_gate_stopped",
-                        status=stopped_run.status,
-                        failure_reason=stopped_run.failure_reason,
-                        finished_at=stopped_run.finished_at,
-                        attempt_number=attempt_number,
-                    )
-                    await self._run_terminal_side_effects_with_retries(stopped_run, final_decision, api_key=api_key)
-                    return stopped_run
-                retry_gate_run = None
-            if not prepared_attempt_claimed and (attempt_number > 1 or claim_initial_attempt):
-                claimed = await app.DATABASE.workflow_run_attempts.claim_prepared_attempt_execution(
-                    workflow_run_id, organization_id, attempt_number
-                )
-                if not claimed:
-                    LOG.info(
-                        "Workflow attempt is owned by another dispatch; skipping execution",
-                        workflow_run_id=workflow_run_id,
-                        attempt_number=attempt_number,
-                    )
+            with ExitStack() as attempt_scope:
+                # The previous attempt's registration exits at `continue` with no await before this one, so the
+                # lease never lapses between attempts; admission must precede the dispatch claim below.
+                attempt_scope.enter_context(track_run(workflow_run_id, "workflow_run", attempt_number))
+                if not await acquire_run_lease(workflow_run_id):
                     deny_finalization()
                     return await self.get_workflow_run(workflow_run_id, organization_id)
-                dispatch_claim_started_at = claimed
-            if attempt_number > 1:
-                current_context = skyvern_context.current()
-                if current_context and current_context.browser_session_runnable_id == workflow_run_id:
-                    # A pinned session survives retries, but its released ownership generation does not.
-                    current_context.browser_session_runnable_id = None
-                    current_context.browser_session_runnable_generation_id = None
-            prepared_attempt_claimed = False
-            execution_entered = False
-            with skyvern_context.workflow_log_attempt(workflow_run_id, attempt_number):
+                if retry_gate_run is not None:
+                    try:
+                        stopped_run = await self._wait_for_retry_sequential_clearance(retry_gate_run, attempt_number)
+                    except asyncio.CancelledError:
+                        # Only shutdown cancels this owner; the prepared attempt stays queued for recovery.
+                        LOG.info(
+                            "Workflow retry owner stopped while waiting for sequential clearance; leaving the attempt for recovery",
+                            workflow_run_id=workflow_run_id,
+                            attempt_number=attempt_number,
+                        )
+                        raise
+                    if stopped_run is not None:
+                        final_decision = await finalize_abandoned_attempt(
+                            workflow_run_id=workflow_run_id,
+                            organization_id=organization_id,
+                            reason="sequential_gate_stopped",
+                            status=stopped_run.status,
+                            failure_reason=stopped_run.failure_reason,
+                            finished_at=stopped_run.finished_at,
+                            attempt_number=attempt_number,
+                        )
+                        await self._run_terminal_side_effects_with_retries(stopped_run, final_decision, api_key=api_key)
+                        return stopped_run
+                    retry_gate_run = None
+                if not prepared_attempt_claimed and (attempt_number > 1 or claim_initial_attempt):
+                    claimed = await app.DATABASE.workflow_run_attempts.claim_prepared_attempt_execution(
+                        workflow_run_id, organization_id, attempt_number
+                    )
+                    if not claimed:
+                        LOG.info(
+                            "Workflow attempt is owned by another dispatch; skipping execution",
+                            workflow_run_id=workflow_run_id,
+                            attempt_number=attempt_number,
+                        )
+                        deny_finalization()
+                        return await self.get_workflow_run(workflow_run_id, organization_id)
+                    dispatch_claim_started_at = claimed
+                if attempt_number > 1:
+                    current_context = skyvern_context.current()
+                    if current_context and current_context.browser_session_runnable_id == workflow_run_id:
+                        # A pinned session survives retries, but its released ownership generation does not.
+                        current_context.browser_session_runnable_id = None
+                        current_context.browser_session_runnable_generation_id = None
+                prepared_attempt_claimed = False
+                execution_entered = False
+                attempt_scope.enter_context(skyvern_context.workflow_log_attempt(workflow_run_id, attempt_number))
                 try:
                     if dispatch_claim_started_at is not None:
                         report_authority(attempt_number, dispatch_claim_started_at)
@@ -6837,7 +6844,10 @@ class WorkflowService:
         if on_execution_authority is not None:
             on_execution_authority(attempt_number, dispatch_claim_started_at)
         with track_run(workflow_run_id, "workflow_run", attempt_number):
-            await acquire_run_lease(workflow_run_id)
+            if not await acquire_run_lease(workflow_run_id):
+                if on_finalization_denied is not None:
+                    on_finalization_denied()
+                return await self.get_workflow_run(workflow_run_id, organization.organization_id)
             try:
                 return await self._execute_workflow(
                     workflow_run_id=workflow_run_id,
