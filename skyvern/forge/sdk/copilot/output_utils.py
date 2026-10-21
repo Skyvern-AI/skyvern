@@ -2288,6 +2288,8 @@ def summarize_tool_result(tool_name: str, result: dict[str, Any], *, for_display
         return f"Selected '{data.get('value', '?')}'"
     if tool_name == "press_key":
         return f"Pressed '{data.get('key', '?')}'"
+    if tool_name == "drag":
+        return f"Dragged {data.get('source_selector', '?')} to {data.get('target_selector', '?')}"
     if tool_name == "discover_workflow_entrypoint":
         candidate_url = data.get("candidate_url")
         if isinstance(candidate_url, str) and candidate_url:

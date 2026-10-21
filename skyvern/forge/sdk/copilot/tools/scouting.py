@@ -74,6 +74,7 @@ from skyvern.forge.sdk.copilot.page_identity import (
 from skyvern.forge.sdk.copilot.runtime import (
     AgentContext,
     PendingBrowserInteractionObservation,
+    ScoutedDragDestination,
     ScoutedInteraction,
     ScoutedSelectorCandidate,
     current_call_browser_session_override,
@@ -834,6 +835,7 @@ _RETAINED_LOCATOR_IDENTITY_FIELDS = (
     "element_fingerprint_test_id",
     "element_fingerprint_tag",
     "element_fingerprint_probed",
+    "destination",
 )
 
 
@@ -873,6 +875,7 @@ def _record_scouted_interaction(
     observation_step: int | None = None,
     key: str = "",
     typed_length: int = 0,
+    destination: ScoutedDragDestination | None = None,
     role: str = "",
     accessible_name: str = "",
     role_name_match_count: int | None = None,
@@ -957,6 +960,8 @@ def _record_scouted_interaction(
         artifact["key"] = key
     if typed_length:
         artifact["typed_length"] = typed_length
+    if destination:
+        artifact["destination"] = destination
     if role:
         artifact["role"] = role
     if accessible_name:

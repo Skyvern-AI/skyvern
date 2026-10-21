@@ -65,6 +65,7 @@ from skyvern.forge.sdk.copilot.request_slots import is_canonical_request_slot_pa
 from skyvern.forge.sdk.copilot.result_evidence import COMPOSITION_INSPECTION_TOOL_NAME, EVALUATE_TOOL_NAME
 from skyvern.forge.sdk.copilot.runtime import (
     AgentContext,
+    ScoutedDragDestination,
     ScoutedInteraction,
     ScoutedSelectorCandidate,
     browser_valid_tab_count,
@@ -998,6 +999,15 @@ async def _press_key_pre_hook(
 ) -> dict[str, Any] | None:
     await _capture_scout_source_url(ctx)
     await _capture_scout_pre_action(ctx, params.get("selector"))
+    return None
+
+
+async def _drag_pre_hook(
+    params: dict[str, Any],
+    ctx: AgentContext,
+) -> dict[str, Any] | None:
+    await _capture_scout_source_url(ctx)
+    await _capture_scout_pre_action(ctx, params.get("source_selector"))
     return None
 
 
@@ -1981,6 +1991,75 @@ async def _select_option_post_hook(
     return result
 
 
+async def _drag_post_hook(
+    result: dict[str, Any],
+    raw: dict[str, Any],
+    ctx: AgentContext,
+) -> dict[str, Any]:
+    _clear_pending_browser_interaction_observation(ctx)
+    source_url = _consume_scout_source_url(ctx)
+    pending_role_name = ctx.pending_scout_role_name
+    pending_selector_candidates = ctx.pending_scout_selector_candidates
+    _clear_pending_scout_selector_facts(ctx)
+    if not (result.get("ok") and result.get("data")):
+        return result
+    data = result["data"]
+    selector = str(data.get("source_selector") or "")
+    target_selector = str(data.get("target_selector") or "")
+    url, _ = await _resolve_url_title(raw, ctx)
+    _mark_pending_browser_interaction_observation(ctx, tool_name="drag", url=url)
+    result["data"] = {
+        "source_selector": selector,
+        "target_selector": target_selector,
+        "mode": data.get("mode"),
+        "url": url,
+    }
+    demonstrated_action = current_demonstrated_action()
+    role, accessible_name = _prenav_role_name_for_selector(pending_role_name, selector)
+    if not (role and accessible_name):
+        role, accessible_name = await _resolve_scout_role_name(
+            ctx, selector, allow_browser_read=demonstrated_action is None
+        )
+    target_role_name = (
+        demonstrated_action.target_packet.get("role_name")
+        if demonstrated_action and demonstrated_action.target_packet
+        else None
+    )
+    if isinstance(target_role_name, dict):
+        target_role = str(target_role_name.get("role") or "")
+        target_name = str(target_role_name.get("accessible_name") or "")
+    else:
+        target_role, target_name = await _resolve_scout_role_name(
+            ctx, target_selector, allow_browser_read=demonstrated_action is None
+        )
+    destination: ScoutedDragDestination = {"selector": target_selector}
+    if target_role:
+        destination["role"] = target_role
+    if target_name:
+        destination["accessible_name"] = target_name
+    _record_scouted_interaction(
+        ctx,
+        tool_name="drag",
+        selector=selector,
+        selector_candidates=pending_selector_candidates,
+        source_url=source_url,
+        result_url=url,
+        destination=destination,
+        role=role,
+        accessible_name=accessible_name,
+    )
+    observation_step, page_evidence = await _register_scout_interaction_observation(
+        ctx, tool_name="drag", selector=selector, source_url=source_url, url=url
+    )
+    _attach_scout_observation_step(ctx, tool_name="drag", selector=selector, observation_step=observation_step)
+    if observation_step is not None:
+        result["observation_step"] = observation_step
+        result["data"]["observation_step"] = observation_step
+    if page_evidence is not None:
+        _attach_scout_page_summary(ctx, result, page_evidence)
+    return result
+
+
 async def _press_key_post_hook(
     result: dict[str, Any],
     raw: dict[str, Any],
@@ -2080,6 +2159,7 @@ def get_skyvern_mcp_alias_map() -> dict[str, str]:
         "console_messages": "skyvern_console_messages",
         "select_option": "skyvern_select_option",
         "press_key": "skyvern_press_key",
+        "drag": "skyvern_drag",
         "wait_for_either_state": "skyvern_wait_for_either_state",
         # These frame and tab controls already use their user-facing MCP names.
         "skyvern_frame_list": "skyvern_frame_list",
@@ -2517,6 +2597,19 @@ def _build_skyvern_mcp_overlays(
             requires_browser=True,
             pre_hook=_press_key_pre_hook,
             post_hook=_press_key_post_hook,
+        ),
+        "drag": SchemaOverlay(
+            description=(
+                "Drag one element and drop it onto another, such as a card onto a column or a file onto a "
+                "drop zone. Both elements are CSS selectors. This cannot draw or follow a freehand path."
+            ),
+            hide_params=frozenset({"session_id", "cdp_url", "source_intent", "target_intent"}),
+            param_patches={"timeout": _ACTION_TIMEOUT_PATCH},
+            required_overrides=["source_selector", "target_selector"],
+            copilot_params={BROWSER_TARGET_PARAM_NAME: BROWSER_TARGET_PARAM},
+            requires_browser=True,
+            pre_hook=_drag_pre_hook,
+            post_hook=_drag_post_hook,
         ),
         "wait_for_either_state": SchemaOverlay(
             description=(

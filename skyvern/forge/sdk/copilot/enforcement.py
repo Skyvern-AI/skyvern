@@ -185,7 +185,7 @@ SYNTHESIZED_BLOCK_PERSISTENCE_TOOL = "update_and_run_blocks"
 # Both tools re-author the workflow draft and clear the coverage-reopen flag; the steer must fire
 # for either or an update_workflow re-author silently spends the one-shot rescout.
 _SYNTHESIZED_BLOCK_REAUTHORING_TOOLS = frozenset({SYNTHESIZED_BLOCK_PERSISTENCE_TOOL, "update_workflow"})
-_SYNTHESIZED_BLOCK_COMMIT_TOOLS = frozenset({"click", "press_key"})
+_SYNTHESIZED_BLOCK_COMMIT_TOOLS = frozenset({"click", "press_key", "drag"})
 _POST_RUN_PAGE_PATH_INTERACTION_BUDGET = 4
 # Evidence sources confirmable only after a run — excluded from the pre-run scout-coverage gate.
 _PRE_RUN_UNGATED_EVIDENCE_SOURCES = frozenset(

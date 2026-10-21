@@ -448,6 +448,10 @@ def _translate_action(
         alias = "click"
         real_args = model_args = {"selector": selector}
         data: dict[str, Any] = {"selector": selector}
+    elif kind == "drag" and selector and isinstance(event.get("target_selector"), str):
+        alias = "drag"
+        real_args = model_args = {"source_selector": selector, "target_selector": event["target_selector"]}
+        data = dict(real_args)
     elif kind == "type" and selector:
         value = event.get("value")
         if not isinstance(value, str):
@@ -499,6 +503,7 @@ def _translate_action(
             "browser_context": {"url": result_url, "title": "", "url_changed": source_url != result_url},
         },
         readback=readback,
+        target_packet=event.get("target_packet") if kind == "drag" else None,
     )
     return alias, real_args, model_args, action
 
