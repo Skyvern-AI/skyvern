@@ -150,6 +150,7 @@ def name_looks_like_a_label(raw: str) -> bool:
 TARGET_VERBS = {
     "click": "Clicked",
     "hover": "Hovered over",
+    "drag": "Dragged",
     "type": "Typed into",
     "select_option": "Selected an option in",
     "select_combobox": "Selected an option in",
@@ -211,6 +212,7 @@ _DEFAULT_KIND_BY_TOOL = {
 _FAILED_TARGET_VERBS = {
     "click": "Tried to click",
     "hover": "Tried to hover over",
+    "drag": "Tried to drag",
     "type": "Tried to type into",
     "select_option": "Tried to select an option in",
     "select_combobox": "Tried to select an option in",

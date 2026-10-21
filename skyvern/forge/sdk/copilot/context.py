@@ -306,6 +306,7 @@ class TurnNarrativePayload(TypedDict):
     connectedAccountChoices: NotRequired[list[NarrativeConnectedAccountChoice]]
     outputFiles: NotRequired[list[NarrativeOutputFile]]
     googleConnectionNotices: NotRequired[list[GoogleConnectionNoticePayload]]
+    demonstrationOffer: NotRequired[bool]
     designStarted: bool
     designEnded: bool
     draft: NarrativeDraft | None
@@ -1334,6 +1335,7 @@ class CopilotContext(AgentContext):
     demonstration_id: str | None = None
     demonstration_insertion: dict[str, str | None] | None = None
     demonstration_items: list[str] = field(default_factory=list)
+    demonstration_offered: bool = False
     # Set while a ``request_credential`` ask is open, so tool calls issued alongside it in the same
     # model response wait for the user's answer instead of racing it.
     credential_pause_settled: asyncio.Event | None = None

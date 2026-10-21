@@ -1304,6 +1304,21 @@ async def list_integrations_tool(ctx: RunContextWrapper) -> str:
 
 
 GOOGLE_SETUP_TOOL_NAME = "request_google_connection"
+DEMONSTRATION_OFFER_TOOL_NAME = "offer_demonstration"
+
+
+@function_tool(failure_error_function=copilot_tool_failure, name_override=DEMONSTRATION_OFFER_TOOL_NAME)
+async def offer_demonstration_tool(ctx: RunContextWrapper) -> str:
+    """Show the user a Start demonstration card in this chat. Use it when the user would rather show you the task in
+    the browser themselves than describe it. The card appears under your reply. Recording starts only when the user
+    clicks the card, and you see none of their actions while they record: the recorded steps reach you in a new turn
+    after they press Done. This call does not record or wait (`status` is `offered`).
+    """
+    copilot_ctx = ctx.context
+    copilot_ctx.demonstration_offered = True
+    result = {"ok": True, "data": {"status": "offered"}}
+    record_tool_step_result_for_ctx(copilot_ctx, DEMONSTRATION_OFFER_TOOL_NAME, {}, result)
+    return json.dumps(result)
 
 
 @function_tool(failure_error_function=copilot_tool_failure, name_override=GOOGLE_SETUP_TOOL_NAME)
@@ -2392,6 +2407,7 @@ NATIVE_TOOLS = [
     list_credentials_tool,
     list_integrations_tool,
     request_google_connection_tool,
+    offer_demonstration_tool,
     read_google_sheet_tool,
     get_organization_usage_quota_tool,
     run_blocks_tool,
@@ -2557,6 +2573,7 @@ def copilot_native_tools(
     supports_account_group_card: bool = False,
     supports_credential_delete_card: bool = False,
     supports_google_setup_card: bool = False,
+    supports_demonstration_offer: bool = False,
 ) -> list[FunctionTool]:
     capability = _normalized_authoring_capability(authoring_capability)
     both_families = capability.code_blocks and capability.agent_blocks
@@ -2568,6 +2585,7 @@ def copilot_native_tools(
             or (tool.name == BROWSER_CODE_TOOL_NAME and not browser_code_available)
             or (tool.name in ACCOUNT_GROUP_TOOL_NAMES and not supports_account_group_card)
             or (tool.name == GOOGLE_SETUP_TOOL_NAME and not supports_google_setup_card)
+            or (tool.name == DEMONSTRATION_OFFER_TOOL_NAME and not supports_demonstration_offer)
             or (tool.name == ACCOUNT_GROUP_SUBMIT_TOOL_NAME and not account_group_submit_enabled())
             or (
                 tool.name == CREDENTIAL_DELETE_TOOL_NAME

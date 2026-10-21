@@ -2124,6 +2124,8 @@ def _make_agent_result(
             notice_payloads = ctx.google_connection_notice_payloads()
             if notice_payloads:
                 payload_updates["googleConnectionNotices"] = notice_payloads
+        if ctx is not None and ctx.demonstration_offered and "demonstrationOffer" not in narrative_payload:
+            payload_updates["demonstrationOffer"] = True
         if payload_updates or len(payload_base) != len(narrative_payload):
             kwargs["narrative_payload"] = {**payload_base, **payload_updates}
     if turn_facts is not None:
@@ -2280,6 +2282,8 @@ def _build_narrative_payload(
     notice_payloads = ctx.google_connection_notice_payloads()
     if notice_payloads:
         payload["googleConnectionNotices"] = notice_payloads
+    if ctx.demonstration_offered:
+        payload["demonstrationOffer"] = True
     if ctx.demonstration_items:
         payload["demonstrationItems"] = list(ctx.demonstration_items)
     if ctx.staged_workflow_yaml is not None:
@@ -5597,6 +5601,7 @@ async def _run_copilot_turn_impl(
             supports_question_tool=chat_request.supports_question_tool,
             supports_account_group_card=chat_request.supports_account_group_card,
             supports_google_setup_card=chat_request.supports_google_setup_card,
+            supports_demonstration_offer=chat_request.supports_demonstration_offer,
             supports_credential_delete_card=chat_request.supports_credential_delete_card,
             browser_code_available=browser_code_mode != CopilotBrowserCodeMode.OFF
             and copilot_config.authoring_capability.code_blocks,

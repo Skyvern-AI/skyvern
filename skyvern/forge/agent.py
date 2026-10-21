@@ -294,6 +294,7 @@ from skyvern.webeye.actions.actions import (
     CompleteVerifyResult,
     DecisiveAction,
     DownloadFileAction,
+    DragAction,
     ExtractAction,
     GotoUrlAction,
     HoverAction,
@@ -501,6 +502,7 @@ def mark_pdf_source_downloaded(pdf_src: str) -> None:
 _TASKV3_TOOL_ACTION_TYPES = {
     "click": ActionType.CLICK,
     "hover": ActionType.HOVER,
+    "drag": ActionType.DRAG,
     "type": ActionType.INPUT_TEXT,
     "select_option": ActionType.SELECT_OPTION,
     "select_combobox": ActionType.SELECT_OPTION,
@@ -681,6 +683,8 @@ def _taskv3_action_for_tool_call(tool_name: str, args: dict[str, Any], **fields:
         return ClickAction(element_id=selector, **fields)
     if tool_name == "hover":
         return HoverAction(element_id=selector, **fields)
+    if tool_name == "drag":
+        return DragAction(element_id=selector, **fields)
     if tool_name == "type":
         return InputTextAction(element_id=selector, text=str(args.get("text") or ""), **fields)
     if tool_name in ("select_option", "select_combobox"):
@@ -2945,6 +2949,7 @@ class ForgeAgent:
                         args if isinstance(args, dict) else {}, secret_values, placeholder_ids
                     )
                     selector = tool_args.get("selector", "")
+                    drop_target = f" onto {tool_args['target']}" if name == "drag" and tool_args.get("target") else ""
                     row_response = _taskv3_row_response(round_action.outcome) if round_action.outcome else None
                     if row_response is not None:
                         # The outcome carries page-supplied URLs the arg redaction above never saw, and a
@@ -2980,7 +2985,7 @@ class ForgeAgent:
                         # order) pairs).
                         step_order=row_step_order,
                         action_order=len(v3_persisted_actions),
-                        description=f"{TASK_V3_ACTION_DESCRIPTION_PREFIX}{name} {selector}".strip(),
+                        description=f"{TASK_V3_ACTION_DESCRIPTION_PREFIX}{name} {selector}{drop_target}".strip(),
                         screenshot_artifact_id=screenshot_artifact_id,
                         reasoning=turn_reasoning,
                         intention=_taskv3_row_intention(task, round_action, secret_values, tool_args),

@@ -140,7 +140,7 @@ def apply_answer_basis_audit(tools: list[ToolSpec], audit: AnswerBasisAudit | No
         )
 
     for spec in tools:
-        if spec.name not in ("click", "type", "select_option", "select_combobox", "press_key", CODE_TOOL_NAME):
+        if spec.name not in ("click", "drag", "type", "select_option", "select_combobox", "press_key", CODE_TOOL_NAME):
             continue
 
         async def wrapped(
