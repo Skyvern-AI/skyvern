@@ -23,7 +23,7 @@ def released_session_stub() -> SimpleNamespace:
 
 def version_write_transaction_stub() -> MagicMock:
     """The save path's version/definition transaction, for workflow repositories faked without an engine."""
-    return MagicMock(side_effect=lambda: nullcontext())
+    return MagicMock(side_effect=lambda workflow_permanent_id=None: nullcontext())
 
 
 def create_forge_stub_app() -> ForgeApp:

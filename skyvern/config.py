@@ -383,6 +383,14 @@ class Settings(BaseSettings):
     AWS_REGION: str = "us-east-1"
     MAX_UPLOAD_FILE_SIZE: int = 30 * 1024 * 1024  # 30 MB
     MAX_HTTP_DOWNLOAD_FILE_SIZE: int = 500 * 1024 * 1024  # 500 MB
+    # Most memory a pdfplumber child may add (RLIMIT_AS on Linux, an RSS watchdog everywhere); rendering a 300 dpi A0
+    # or A1 scan for OCR can need more than 512 MiB. A pod with less free memory than this, after a 256 MiB margin and
+    # the result reserve, gets what is left, and under 128 MiB the call fails, because memory.oom.group kills the whole
+    # worker at its limit.
+    PDFPLUMBER_MAX_MEMORY_BYTES: int = Field(default=1536 * 1024 * 1024, gt=0)
+    # Most page PNG data a pdfplumber child may hand back for OCR; text, word and page-count results have smaller caps
+    # in pdf_parser. The parent holds a result outside the child's memory cap, so it reserves the decoded size.
+    PDFPLUMBER_MAX_RESULT_BYTES: int = Field(default=256 * 1024 * 1024, gt=0)
     PRESIGNED_URL_EXPIRATION: int = 60 * 60 * 24  # 24 hours
     # Ceiling on the retention_days a caller may request at upload time. A cap exists so a
     # retention period cannot be used to pin storage indefinitely; omitting retention_days
@@ -592,6 +600,9 @@ class Settings(BaseSettings):
     # Hold the first click or Enter after a password fill until 45 s after Task V3 started the block. Force-on term
     # only: runs are randomized per run by the flag of the same name, read through run_arm_enabled(LOGIN_PACE_FLAG, ...).
     TASK_V3_LOGIN_PACE: bool = False
+    # Store the error code v3's model chose on finish instead of the post-run page guess. Off: the guess is stored
+    # as before. Retry policies match on stored codes, so turning this on can change which runs retry.
+    TASK_V3_ERROR_CODE_ON_FINISH: bool = False
     # Which browser surface the v3 loop offers: today's action tools ("off"), those plus a code
     # tool ("add"), or the code tool instead of them ("replace"). Three states rather than a boolean
     # because the benchmark separated add from replace on speed alone, not on success. The code tool
@@ -1154,8 +1165,6 @@ class Settings(BaseSettings):
 
         # Gemini models: prefer Vertex when enabled, fall back to direct Gemini API
         gemini_models = [
-            ("gemini-2.5-pro-preview-05-06", "VERTEX_GEMINI_2.5_PRO", "GEMINI_2.5_PRO", "Gemini 2.5 Pro"),
-            ("gemini-2.5-flash", "VERTEX_GEMINI_2.5_FLASH", "GEMINI_2.5_FLASH", "Gemini 2.5 Flash"),
             ("gemini-3-pro-preview", "VERTEX_GEMINI_3_PRO", "GEMINI_3_PRO", "Gemini 3 Pro (Latest)"),
             ("gemini-3.0-flash", "VERTEX_GEMINI_3.0_FLASH", "GEMINI_3.0_FLASH", "Gemini 3 Flash"),
             ("gemini-3.5-flash", "VERTEX_GEMINI_3.5_FLASH", "GEMINI_3.5_FLASH", "Gemini 3.5 Flash"),
@@ -1167,12 +1176,6 @@ class Settings(BaseSettings):
                 "llm_key": vertex_key if self.ENABLE_VERTEX_AI else gemini_key,
                 "label": label,
             }
-
-        # Gemini Flash Lite: Vertex-only (no direct Gemini API config exists)
-        mapping["gemini-2.5-flash-lite"] = {
-            "llm_key": "VERTEX_GEMINI_2.5_FLASH_LITE",
-            "label": "Gemini 2.5 Flash Lite",
-        }
 
         mapping["mercury-2"] = {"llm_key": "INCEPTION_MERCURY_2", "label": "Inception Mercury 2"}
 

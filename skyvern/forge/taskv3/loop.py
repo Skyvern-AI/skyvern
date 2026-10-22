@@ -29,6 +29,7 @@ from urllib.parse import urlsplit
 
 import structlog
 
+from skyvern.errors.errors import resolve_error_code_mapping_key
 from skyvern.exceptions import CompletionGateTerminationError, SkyvernContextWindowExceededError, StepTerminationError
 from skyvern.forge.sdk.api.llm.exceptions import LLMContentFilteredError
 from skyvern.forge.sdk.core import skyvern_context
@@ -43,6 +44,7 @@ from skyvern.forge.taskv3.goal_check import (
 )
 from skyvern.forge.taskv3.handoff_redaction import MAX_HANDOFF_URL_CHARS, normalized_url, sanitize_published_url
 from skyvern.forge.taskv3.target_label import describe_target
+from skyvern.schemas.workflows import ERROR_CODE_MAPPING_MAX_ENTRIES, ERROR_CODE_MAPPING_MAX_UTF8_BYTES
 from skyvern.webeye.navigation import clear_task_nav_error_code, redact_url_secrets
 
 LOG = structlog.get_logger()
@@ -596,7 +598,7 @@ class ActionRoundSink(Protocol):
 DownloadWait = Callable[[], Awaitable[None]]
 DownloadSettle = Callable[[frozenset[str]], Awaitable[str | None]]
 # Consulted from finish for EVERY verdict, unlike DownloadSettle: it takes the finish status and
-# gates on state the caller already tracks (e.g. a verification-code budget), not on staged
+# gates on state the caller already tracks (e.g. a sign-in link polling budget), not on staged
 # downloads. One callback, because a completed claim made on a blank verification step and a
 # non-complete verdict given up with polling budget still unspent are the same concern seen from two
 # sides; splitting them into two hooks would scatter it.
@@ -749,6 +751,12 @@ class LoopOutcome:
     unlisted_reask: dict[str, Any] | None = None
     # The finish tool's completion gate approved this verdict, so the caller must not consult it again.
     gate_passed: bool = False
+    # The model's own user-defined error code on a failed/terminated finish, re-validated against the mapping.
+    error_code: str | None = None
+    # The model explicitly answered that none of the user's codes describes the failure.
+    error_code_declined: bool = False
+    # The status the model finished with, when the completion gate replaced it inside the loop.
+    model_status: str | None = None
 
 
 def _get(obj: Any, key: str, default: Any = None) -> Any:
@@ -2269,6 +2277,7 @@ OBSERVE_SUMMARY_FIELDS = frozenset(
         "elements_truncated",
         "icons_listed",
         "icons_truncated",
+        "unnamed_not_icon",
         "elements_truncated_in_components",
         "elements_dropped",
         "elements_truncated_by_page_cap",
@@ -2553,6 +2562,67 @@ def _non_completed(status: object) -> NonCompletedStatus | None:
     return None
 
 
+NO_MATCHING_ERROR_CODE = "NONE_OF_THESE"
+# Each customer description is cut here; the enum always carries every code.
+_ERROR_CODE_DESCRIPTION_MAX_CHARS = 1000
+
+
+def _offerable_code(code: str) -> bool:
+    # A key spelled like the sentinel would turn every "none of these" into that code.
+    return bool(code.strip()) and code.strip().upper() != NO_MATCHING_ERROR_CODE
+
+
+def _offered_error_codes(error_code_mapping: dict[str, str] | None) -> dict[str, str] | None:
+    """The codes `finish` offers, or None to leave the whole mapping to the post-run detector.
+
+    A mapping past the workflow caps would ride on every turn, and one with no offerable code could only decline."""
+    if not error_code_mapping or len(error_code_mapping) > ERROR_CODE_MAPPING_MAX_ENTRIES:
+        return None
+    size = sum(len(code.encode()) + len(str(description).encode()) for code, description in error_code_mapping.items())
+    if size > ERROR_CODE_MAPPING_MAX_UTF8_BYTES:
+        return None
+    return {code: description for code, description in error_code_mapping.items() if _offerable_code(code)} or None
+
+
+def _error_code_schema(error_code_mapping: dict[str, str]) -> dict[str, Any]:
+    codes = "\n".join(
+        f"- {code}: {str(description)[:_ERROR_CODE_DESCRIPTION_MAX_CHARS]}"
+        for code, description in sorted(error_code_mapping.items())
+    )
+    return {
+        "type": "string",
+        "enum": [*sorted(error_code_mapping), NO_MATCHING_ERROR_CODE],
+        "description": (
+            "Required when status is failed or terminated; ignored when completed. The user's code whose "
+            f"description is what actually happened, or {NO_MATCHING_ERROR_CODE} when none of them describes it."
+            f"\nThe user's codes:\n{codes}"
+        ),
+    }
+
+
+def _finish_error_code(status: Any, raw: Any, error_code_mapping: dict[str, str] | None) -> tuple[str | None, bool]:
+    """The mapping key the model chose and whether it explicitly chose none; both empty unless the run did not succeed.
+
+    A code on a completed run would make a successful run carry errors, which consumers read as a failure."""
+    if not error_code_mapping or status not in ("failed", "terminated"):
+        return None, False
+    answer = raw.strip() if isinstance(raw, str) else raw
+    declined = isinstance(answer, str) and answer.upper() == NO_MATCHING_ERROR_CODE
+    code = None
+    if not declined:
+        code = resolve_error_code_mapping_key(raw, error_code_mapping)
+        code = code or resolve_error_code_mapping_key(answer, error_code_mapping)
+    LOG.info(
+        "taskv3 finish user-defined error code",
+        status=status,
+        chosen_error_code=code,
+        declined=declined,
+        # Never the rejected value itself: a non-strict answer can carry page text or a secret.
+        rejected_error_code=code is None and not declined and raw is not None,
+    )
+    return code, declined
+
+
 def make_finish_tool(
     page_fingerprint: Callable[[], Awaitable[str | None]] | None = None,
     max_settle_deferrals: int = DEFAULT_MAX_SETTLE_DEFERRALS,
@@ -2573,6 +2643,7 @@ def make_finish_tool(
     unseen_text: UnseenPageText | None = None,
     terminate_premise: TerminatePremiseCheck | None = None,
     download_facts: DownloadFailureFacts | None = None,
+    error_code_mapping: dict[str, str] | None = None,
 ) -> ToolSpec:
     """`page_fingerprint` samples an opaque fingerprint of the page's rendered content (None when no
     page is available). A finish(completed) is deferred (bounded by `max_settle_deferrals`, then
@@ -2589,8 +2660,8 @@ def make_finish_tool(
     because async submissions and captcha protocols otherwise produce false-negative verdicts.
 
     `verification_blocker` is the one gate consulted for EVERY verdict: it refuses a completed claim
-    once the verification source terminally failed, and holds a failed OR terminated one while the
-    run is still awaiting a code it has unspent polling budget for -- a give-up at one 120s slice of
+    once the sign-in link source terminally failed, and holds a failed OR terminated one while the
+    run is still awaiting a sign-in link it has unspent polling budget for -- a give-up at one 120s slice of
     a 15-minute budget throws away minutes of waiting the run already owns. The hold is bounded by
     the callee (the budget shrinks under every productive hold) and refused here without the deadline
     headroom to fund the blocking poll slice it asks for. Apart from that gate, terminated is
@@ -2619,6 +2690,7 @@ def make_finish_tool(
     carried, or a result in the finish's own batch carried page text or download lines.
 
     `terminate_premise` checks every terminated finish past the holds above, alongside any re-ask, and changes nothing."""
+    error_code_mapping = _offered_error_codes(error_code_mapping)
     deferrals = 0
     stale_holds = 0
     failure_deferrals = 0
@@ -2773,6 +2845,8 @@ def make_finish_tool(
         )
         if result is None or not result.converted:
             return None
+        # The original verdict's code: a post-loop veto of this conversion restores that verdict.
+        error_code, error_code_declined = _finish_error_code(original, args.get("error_code"), error_code_mapping)
         return ToolResult.ok(
             content="Task attempt ended. No further actions are permitted.",
             data={
@@ -2781,6 +2855,8 @@ def make_finish_tool(
                 "extracted_output": args.get("extracted_output"),
                 "converted_from": original,
                 "converted_from_reason": reason,
+                "error_code": error_code,
+                "error_code_declined": error_code_declined,
             },
         )
 
@@ -2850,7 +2926,7 @@ def make_finish_tool(
                     # Fail closed: an exception here must not let a blank verification step read as done.
                     LOG.warning("taskv3 verification_blocker failed; failing closed", exc_info=True)
                     return ToolResult.error(
-                        "Could not verify that the verification-code step completed cleanly; retry "
+                        "Could not verify that the sign-in link step completed cleanly; retry "
                         "finish(status=completed) once verified, or finish with the non-completed "
                         "status the finish tool's own rule gives this outcome."
                     )
@@ -2932,6 +3008,7 @@ def make_finish_tool(
                         "status": "terminated",
                         "reason": termination.reason,
                         "extracted_output": args.get("extracted_output"),
+                        "model_status": status,
                     },
                 )
             except StepTerminationError as exhausted:
@@ -2941,6 +3018,7 @@ def make_finish_tool(
                         "status": "failed",
                         "reason": exhausted.message or "",
                         "extracted_output": args.get("extracted_output"),
+                        "model_status": status,
                     },
                 )
             except Exception:
@@ -3059,6 +3137,7 @@ def make_finish_tool(
                 no_file_line = [DOWNLOAD_NO_FILE_FACT]
         # Drained only here: a held finish leaves the failures for the next tool result to show.
         download_lines = no_file_line + (download_facts.deliver() if download_facts is not None else [])
+        error_code, error_code_declined = _finish_error_code(status, args.get("error_code"), error_code_mapping)
         return ToolResult.ok(
             content="\n".join(["Task attempt ended. No further actions are permitted.", *download_lines]),
             data={
@@ -3066,6 +3145,8 @@ def make_finish_tool(
                 "reason": args.get("reason") or "",
                 "extracted_output": args.get("extracted_output"),
                 "gate_passed": gate_passed,
+                "error_code": error_code,
+                "error_code_declined": error_code_declined,
             },
         )
 
@@ -3078,6 +3159,7 @@ def make_finish_tool(
                 "status": {"type": "string", "enum": ["completed", "failed", "terminated"]},
                 "reason": {"type": "string", "maxLength": 2000},
                 "extracted_output": {"description": "Structured output requested by the goal, if any."},
+                **({"error_code": _error_code_schema(error_code_mapping)} if error_code_mapping else {}),
             },
             "required": ["status", "reason"],
         },
@@ -3469,6 +3551,8 @@ async def run_agent_tool_loop(
     should_cancel: Callable[[], Awaitable[bool]] | None = None,
     on_action_round: ActionRoundSink | None = None,
     on_pre_action: Callable[[str, dict[str, Any]], Awaitable[None]] | None = None,
+    # Called before each page-touching tool call is dispatched.
+    on_page_action: Callable[[], None] | None = None,
     max_tokens: int | None = None,
     # The fixed input re-sent on every call is charged against max_tokens only up to this size, so a large task
     # payload does not shrink the turn horizon. None charges every call in full.
@@ -4790,6 +4874,8 @@ async def run_agent_tool_loop(
             # task ends on; reads and finish keep it, since a run that ends there ended on that navigation.
             if spec is not None and spec.touches_page and dispatch_ctx is not None and dispatch_ctx.task_id:
                 clear_task_nav_error_code(dispatch_ctx.task_id)
+            if spec is not None and spec.touches_page and on_page_action is not None:
+                on_page_action()
             tool_started_at = time.monotonic()
             st.event_seq += 1
             dispatch_seq = st.event_seq
@@ -5329,6 +5415,9 @@ async def run_agent_tool_loop(
                     converted_from=_non_completed(data.get("converted_from")),
                     converted_from_reason=data.get("converted_from_reason", ""),
                     gate_passed=bool(data.get("gate_passed")),
+                    error_code=data.get("error_code"),
+                    error_code_declined=bool(data.get("error_code_declined")),
+                    model_status=data.get("model_status"),
                     # The model's own verdict wins whether or not it landed on the granted final turn;
                     # cap_trip just records the fact that a cap forced this to be the last turn.
                     cap_trip=st.cap_trip_pending if st.final_turn_granted else None,

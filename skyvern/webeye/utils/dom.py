@@ -951,23 +951,6 @@ class SkyvernElement:
         entries.sort(key=lambda x: len(x[0]), reverse=True)
         return entries[0][1]
 
-    async def find_children_element_id_by_callback(
-        self, cb: typing.Callable[[dict], typing.Awaitable[bool]]
-    ) -> str | None:
-        index = 0
-        queue = [self.get_element_dict()]
-        while index < len(queue):
-            item = queue[index]
-            if await cb(item):
-                return item.get("id", "")
-
-            children: list[dict] = item.get("children", [])
-            for child in children:
-                queue.append(child)
-
-            index += 1
-        return None
-
     async def find_label_for(
         self, dom: DomUtil, timeout: float = settings.BROWSER_ACTION_TIMEOUT_MS
     ) -> SkyvernElement | None:

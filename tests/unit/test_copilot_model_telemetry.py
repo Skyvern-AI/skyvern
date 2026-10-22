@@ -1562,7 +1562,7 @@ async def test_browser_ablation_timeout_reports_active_model_and_browser_work(
     assert result.browser_ablation_metadata["tool_activity"] == [{"tool_name": "navigate_browser", "success": True}]
 
 
-_GEMINI = "vertex_ai/gemini-2.5-flash"
+_GEMINI = "vertex_ai/gemini-3-flash-preview"
 _SCHEMA_CALL = ResponseFunctionToolCall(
     type="function_call",
     call_id="call_schema",
@@ -1821,7 +1821,7 @@ def _tool_text(messages: list[dict[str, Any]]) -> str:
 def _gemini_function_responses(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
     contents = _gemini_convert_messages_with_history(
         messages=cast(Any, [message for message in messages if message["role"] != "system"]),
-        model="gemini-2.5-flash",
+        model="gemini-3-flash-preview",
         custom_llm_provider="vertex_ai",
     )
     return [

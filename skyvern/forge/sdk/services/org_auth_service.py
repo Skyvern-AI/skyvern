@@ -22,6 +22,9 @@ from skyvern.forge.sdk.db.agent_db import AgentDB
 from skyvern.forge.sdk.models import TokenPayload
 from skyvern.forge.sdk.schemas.organizations import Organization, OrganizationAuthToken, OrganizationAuthTokenType
 from skyvern.forge.sdk.services.request_principal import (
+    AuthKind,
+    get_request_principal,
+    human_user_id,
     resolve_api_key_profile_identity,
     resolve_request_principal,
     synthetic_user_id,
@@ -467,6 +470,9 @@ async def get_current_user_id_or_none(
     x_fern_language: Annotated[str | None, Header(include_in_schema=False)] = None,
 ) -> str | None:
     """Best-effort caller resolution for write attribution; never rejects the request."""
+    principal = get_request_principal()
+    if principal is not None and principal.auth_kind == AuthKind.member_api_key:
+        return human_user_id(principal, principal.organization_id)
     try:
         user_id = await get_current_user_id(
             authorization=authorization,

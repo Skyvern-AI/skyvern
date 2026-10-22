@@ -720,6 +720,8 @@ class SkyvernContext:
     seed_generated_totp_values: dict[str, set[str]] = field(default_factory=dict, repr=False)
     multi_field_totp: dict[str, MultiFieldTotpAttempt] = field(default_factory=dict)
     multi_field_totp_rejections: dict[str, MultiFieldTotpRejection] = field(default_factory=dict)
+    submit_click_evidence: dict[str, tuple[datetime.datetime, int, int, int]] = field(default_factory=dict, repr=False)
+    completion_gate_engine: RunEngine | None = None
     multi_field_totp_mask_values: dict[str, set[str]] = field(default_factory=dict, repr=False)
     multi_field_totp_prompt_values: dict[str, set[str]] = field(default_factory=dict, repr=False)
     multi_field_totp_artifact_fingerprints: dict[str, tuple[frozenset[str], tuple[tuple[frozenset[str], int], ...]]] = (

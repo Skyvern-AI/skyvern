@@ -1032,6 +1032,18 @@ class AgentFunction:
         """Cloud raises 403 when a workflow folder denies the action; OSS has no folder ACLs."""
         return None
 
+    async def enforce_workflow_delete(
+        self, principal: RequestPrincipal | None, workflow_permanent_id: str, organization_id: str
+    ) -> tuple[str, str | None] | None:
+        """Cloud enforces RBAC and folder permissions for workflow deletion; OSS has no RBAC policy."""
+        return None
+
+    async def enforce_workflow_deletes(
+        self, principal: RequestPrincipal | None, workflow_permanent_ids: set[str], organization_id: str
+    ) -> None:
+        for workflow_permanent_id in workflow_permanent_ids:
+            await self.enforce_workflow_delete(principal, workflow_permanent_id, organization_id)
+
     async def enforce_folder_access_for_references(
         self, principal: RequestPrincipal | None, action: str, payload: Mapping[str, object]
     ) -> None:
@@ -1160,6 +1172,11 @@ class AgentFunction:
     async def resolve_billing_tier(self, organization_id: str | None) -> BillingTier:
         return BillingTier.UNKNOWN
 
+    # Whether the error code v3's model chose on finish is stored in place of the post-run page guess. The model is
+    # offered the codes either way; cloud gates this per organization.
+    async def task_v3_error_code_on_finish(self, *, organization_id: str) -> bool:
+        return settings.TASK_V3_ERROR_CODE_ON_FINISH
+
     # (text appended to a page-aware v3 run's task message or None, reason logged on the loop-finished line), given
     # the run's payload. OSS supplies no default.
     def task_v3_age_default(self, parameters: dict[str, Any] | None) -> tuple[str | None, str] | None:
@@ -1189,6 +1206,9 @@ class AgentFunction:
 
     # Recognition of submit controls whose submission is wired in JS (rendered type=button); base recognizes none.
     async def is_recognized_submit_control(self, element: SkyvernElement) -> bool:
+        return False
+
+    async def is_submit_control_for_completion(self, element: SkyvernElement) -> bool:
         return False
 
     async def record_run_duration(

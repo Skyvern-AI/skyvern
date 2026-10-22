@@ -22,12 +22,13 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 from structlog.testing import capture_logs
 
-from skyvern.config import settings
+from skyvern.config import Settings, settings
 from skyvern.errors.errors import UserDefinedError
 from skyvern.exceptions import CompletionGateTerminationError, MissingBrowserStatePage, StepTerminationError
 from skyvern.forge import agent as agent_module
 from skyvern.forge import app
 from skyvern.forge.agent import ForgeAgent
+from skyvern.forge.agent_functions import AgentFunction
 from skyvern.forge.sdk.artifact.manager import ArtifactManager
 from skyvern.forge.sdk.core import skyvern_context
 from skyvern.forge.sdk.core.skyvern_context import EnrichTreeMode, SkyvernContext
@@ -82,16 +83,18 @@ from skyvern.forge.taskv3.loop import (
     NAV_DEAD_END_GUARD,
     LoopOutcome,
     RoundAction,
+    ToolResult,
     ToolSpec,
     _dead_end_reason,
     make_finish_tool,
+    run_agent_tool_loop,
 )
 from skyvern.forge.taskv3.run_arms import (
     DATE_SEGMENT_AIM_FLAG,
     LOGIN_PACE_FLAG,
     run_arm_enabled,
 )
-from skyvern.forge.taskv3.tools import PageProvider, _record_frame_work
+from skyvern.forge.taskv3.tools import NO_ONE_TIME_CODE_SOURCE, PageProvider, _record_frame_work
 from skyvern.schemas.llm import LLMConfig
 from skyvern.schemas.runs import RunEngine
 from skyvern.schemas.workflows import BlockType
@@ -124,6 +127,7 @@ from tests.unit.helpers import (
     make_task,
 )
 from tests.unit.scoped_asyncio import ScopedAsyncio
+from tests.unit.test_taskv3_loop import _ScriptedCaller
 
 
 async def _run_execute_task_v3(
@@ -4440,96 +4444,104 @@ async def test_execute_task_v3_detects_user_defined_errors_on_failure(
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("finish_status", [TaskStatus.failed, TaskStatus.terminated])
-@pytest.mark.parametrize(
-    "scenario",
-    [
-        "no_code_delivered",
-        "code_delivered",
-        "code_tool_offered",
-        "source_failed",
-        "credential_seed_missing",
-        "credential_seed_invalid",
-        "credential_seed_valid",
-    ],
-)
-async def test_execute_task_v3_attributes_a_run_whose_credential_had_no_usable_totp_source(
-    monkeypatch: pytest.MonkeyPatch, finish_status: TaskStatus, scenario: str
+@pytest.mark.parametrize("finish_status", [TaskStatus.failed, TaskStatus.terminated, TaskStatus.completed])
+@pytest.mark.parametrize("last_status", ["no_source", "source_error", "none"])
+async def test_execute_task_v3_reports_the_last_code_tool_status_as_the_failure_reason(
+    monkeypatch: pytest.MonkeyPatch, finish_status: TaskStatus, last_status: str
 ) -> None:
-    # The model narrates the symptom -- a rejected sign-in -- which classifies as the customer's
-    # credentials failing. When the run was refused a one-time code because its credential has no usable
-    # TOTP source and never got one, the run carries the same typed error the step engine records, and
-    # a reason that names the missing source instead. Like the step engine's error, it means NO code
-    # source at all: a run offered a polling source, or whose source failed, is not attributed. A code
-    # tool offered only for a credential whose TOTP seed is missing or invalid is not a source.
-    credential_seed = {
-        "credential_seed_missing": None,
-        "credential_seed_invalid": "not a totp secret!",
-        "credential_seed_valid": "JBSWY3DPEHPK3PXP",
-    }
-    uses_credential = scenario in credential_seed
-    run_overrides: dict[str, Any] = {}
-    task_block = _make_block(NavigationBlock, navigation_goal="Sign in")
-    if uses_credential:
-        run_context = _stub_recovery_run_context(monkeypatch, tested_url=None)
-        run_context.parameters["portal_credential"] = _make_credential_parameter("portal_credential")
-        run_context.values["portal_credential"]["totp"] = "placeholder_Zz9_totp"
-        run_context.secrets["placeholder_Zz9_totp"] = "BW_TOTP"
-        if credential_seed[scenario] is not None:
-            run_context.secrets[run_context.totp_secret_value_key("placeholder_Zz9_totp")] = credential_seed[scenario]
-        task_block = _make_block(
-            NavigationBlock, navigation_goal="Sign in", parameters=[_make_credential_parameter("portal_credential")]
-        )
-        run_overrides = {"workflow_run_id": "wr_test", "real_credential_totp_candidate": True}
+    # A failed run keeps the model's reason and carries the last status the code tool reported. Only the no-source
+    # status carries the step engine's typed MISSING_TOTP_SOURCE error, and a completed run carries neither.
+    status_text = {
+        "no_source": NO_ONE_TIME_CODE_SOURCE,
+        "source_error": "the verification code source returned an error (lookup failed); no polling time remains.",
+        "none": None,
+    }[last_status]
     errors_update = AsyncMock()
     monkeypatch.setattr("skyvern.forge.agent.app.DATABASE.tasks.update_task", errors_update)
     seen: dict[str, Any] = {}
 
-    def _refused_a_code(kwargs: dict[str, Any]) -> None:
+    def _reported(kwargs: dict[str, Any]) -> None:
         state = kwargs["verification_blocker"].__self__
-        seen["state"] = state
-        seen["resolver"] = kwargs["resolve_totp_placeholder"]
         seen["tools"] = kwargs["extra_tools"]
-        state.totp_source_missing = True
-        if scenario == "code_delivered":
-            state.values_delivered = 1
-        if scenario == "source_failed":
-            state.arm(VerificationFailure.BUDGET_EXHAUSTED, "get_verification_code")
+        seen["resolver"] = kwargs["resolve_totp_placeholder"]
+        seen["state"] = state
+        state.last_status = status_text
 
     model_reason = "Login failed: the MFA code was rejected"
-    outcome = LoopOutcome(status=finish_status.value, reason=model_reason, billable_actions=[])
-    _step, task, loop_mock, _post = await _run_execute_task_v3(
+    _step, task, _loop_mock, _post = await _run_execute_task_v3(
         monkeypatch,
-        outcome,
-        task_block=task_block,
-        on_loop=_refused_a_code,
+        LoopOutcome(status=finish_status.value, reason=model_reason, billable_actions=[]),
+        task_block=_make_block(NavigationBlock, navigation_goal="Sign in"),
+        on_loop=_reported,
         data_extraction_goal=None,
         extracted_information_schema=None,
-        totp_identifier="user@example.com" if scenario == "code_tool_offered" else None,
-        **run_overrides,
     )
     state = seen["state"]
-    assert state.code_tool_offered is (scenario in ("code_tool_offered", "credential_seed_valid"))
-    if uses_credential:
-        # The tool stays offered to the model either way; only the attribution input changes.
-        offered = [tool.name for tool in seen["tools"]]
-        assert "get_verification_code" in offered
+    assert "get_verification_code" in [tool.name for tool in seen["tools"]]
     assert seen["resolver"] == state.resolve_totp_placeholder
     assert state.totp_min_remaining_seconds == settings.TOTP_MULTI_FIELD_MIN_REMAINING_SECONDS
     written = [error for call in errors_update.await_args_list for error in call.kwargs.get("errors") or []]
     assert task.status == finish_status
-    category = loop_mock.update_task_kwargs.get("failure_category") or []
-    if scenario not in ("no_code_delivered", "credential_seed_missing", "credential_seed_invalid"):
-        assert written == []
-        assert task.failure_reason == model_reason
+    if finish_status == TaskStatus.completed:
+        assert task.failure_reason is None and written == []
         return
-    assert [error["error_code"] for error in written] == ["MISSING_TOTP_SOURCE"]
-    reason = (task.failure_reason or "").lower()
-    assert "one-time code" in reason and "totp" in reason
-    assert not any(word in reason for word in ("mfa", "password", "login fail", "authentication fail", "auth fail"))
-    assert all(entry["category"] not in ("AUTH_FAILURE", "CREDENTIAL_ERROR") for entry in category)
-    if finish_status == TaskStatus.failed:
-        assert category
+    assert task.failure_reason is not None and model_reason in task.failure_reason
+    assert status_text in task.failure_reason if status_text else task.failure_reason == model_reason
+    assert [error["error_code"] for error in written] == (["MISSING_TOTP_SOURCE"] if last_status == "no_source" else [])
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("clicked_after", [True, False], ids=["page_action_after_status", "status_last"])
+async def test_execute_task_v3_a_code_status_the_model_acted_past_is_not_the_failure_reason(
+    monkeypatch: pytest.MonkeyPatch, clicked_after: bool
+) -> None:
+    errors_update = AsyncMock()
+    monkeypatch.setattr("skyvern.forge.agent.app.DATABASE.tasks.update_task", errors_update)
+    model_reason = "the portal rejected the sign-in"
+    seen: dict[str, Any] = {}
+
+    async def _click(_args: dict[str, Any]) -> ToolResult:
+        return ToolResult.ok("clicked")
+
+    async def _real_loop(kwargs: dict[str, Any]) -> None:
+        click = ToolSpec(name="click", description="click", parameters={}, handler=_click, billable=True)
+        script = [[("get_verification_code", {})]]
+        if clicked_after:
+            script.append([("click", {"selector": "#skip"})])
+        script.append([("finish", {"status": "failed", "reason": model_reason})])
+        seen["outcome"] = await run_agent_tool_loop(
+            llm_caller=_ScriptedCaller(script),
+            system_prompt="sys",
+            user_prompt="goal",
+            tools=kwargs["extra_tools"] + [click, make_finish_tool()],
+            max_turns=10,
+            max_tool_calls=20,
+            on_page_action=kwargs["on_page_action"],
+        )
+
+    _step, task, _loop_mock, _post = await _run_execute_task_v3(
+        monkeypatch,
+        LoopOutcome(status="failed", reason=model_reason, billable_actions=[]),
+        task_block=_make_block(NavigationBlock, navigation_goal="Sign in"),
+        on_loop_async=_real_loop,
+        data_extraction_goal=None,
+        extracted_information_schema=None,
+    )
+    code_answers = [
+        m["content"]
+        for m in seen["outcome"].messages
+        if m.get("role") == "tool" and m.get("name") == "get_verification_code"
+    ]
+    assert code_answers == [NO_ONE_TIME_CODE_SOURCE]
+    assert (seen["outcome"].status, seen["outcome"].reason) == ("failed", model_reason)
+    written = [
+        error["error_code"] for call in errors_update.await_args_list for error in call.kwargs.get("errors") or []
+    ]
+    if clicked_after:
+        assert task.failure_reason == model_reason and "MISSING_TOTP_SOURCE" not in written
+    else:
+        assert task.failure_reason is not None and model_reason in task.failure_reason
+        assert NO_ONE_TIME_CODE_SOURCE in task.failure_reason and written == ["MISSING_TOTP_SOURCE"]
 
 
 @pytest.mark.asyncio
@@ -4541,7 +4553,7 @@ async def test_execute_task_v3_a_vetoed_completion_is_not_attributed_to_a_missin
     monkeypatch.setattr("skyvern.forge.agent.app.DATABASE.tasks.update_task", errors_update)
 
     def _refused_a_code(kwargs: dict[str, Any]) -> None:
-        kwargs["verification_blocker"].__self__.totp_source_missing = True
+        kwargs["verification_blocker"].__self__.last_status = NO_ONE_TIME_CODE_SOURCE
 
     _step, task, _loop_mock, _post = await _run_execute_task_v3(
         monkeypatch,
@@ -4559,11 +4571,76 @@ async def test_execute_task_v3_a_vetoed_completion_is_not_attributed_to_a_missin
 
 
 @pytest.mark.asyncio
-async def test_execute_task_v3_keeps_the_codes_out_of_the_loop_and_the_goal(
+@pytest.mark.parametrize(
+    "outcome",
+    [
+        LoopOutcome(status="loop_error", reason="llm_call_failed: TimeoutError: slow", billable_actions=[]),
+        LoopOutcome(status="budget_exhausted", reason="the run reached its turn limit", billable_actions=[]),
+        LoopOutcome(status="terminated", reason="the page stopped responding", guard=ACTION_LOOP_GUARD),
+    ],
+    ids=["loop_error", "budget_exhausted", "loop_guard"],
+)
+async def test_execute_task_v3_a_run_the_loop_ended_keeps_its_own_reason_over_a_code_status(
+    monkeypatch: pytest.MonkeyPatch, outcome: LoopOutcome
+) -> None:
+    errors_update = AsyncMock()
+    monkeypatch.setattr("skyvern.forge.agent.app.DATABASE.tasks.update_task", errors_update)
+
+    def _no_source(kwargs: dict[str, Any]) -> None:
+        kwargs["verification_blocker"].__self__.last_status = NO_ONE_TIME_CODE_SOURCE
+
+    _step, task, _loop_mock, _post = await _run_execute_task_v3(
+        monkeypatch,
+        outcome,
+        task_block=_make_block(NavigationBlock, navigation_goal="Sign in"),
+        on_loop=_no_source,
+        data_extraction_goal=None,
+        extracted_information_schema=None,
+    )
+    assert task.failure_reason and NO_ONE_TIME_CODE_SOURCE not in task.failure_reason
+    written = [error for call in errors_update.await_args_list for error in call.kwargs.get("errors") or []]
+    assert all(error["error_code"] != "MISSING_TOTP_SOURCE" for error in written)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("gate_runs", ["in_loop", "after_loop"])
+async def test_execute_task_v3_a_completion_gate_termination_keeps_the_gates_reason_over_a_code_status(
+    monkeypatch: pytest.MonkeyPatch, gate_runs: str
+) -> None:
+    errors_update = AsyncMock()
+    monkeypatch.setattr("skyvern.forge.agent.app.DATABASE.tasks.update_task", errors_update)
+    gate_reason = "the application was already submitted"
+
+    async def _claims_completion(kwargs: dict[str, Any]) -> None:
+        kwargs["verification_blocker"].__self__.last_status = NO_ONE_TIME_CODE_SOURCE
+        if gate_runs == "in_loop":
+            with pytest.raises(CompletionGateTerminationError):
+                await kwargs["completion_gate"]()
+
+    outcome = (
+        LoopOutcome(status="terminated", reason=gate_reason, billable_actions=[])
+        if gate_runs == "in_loop"
+        else LoopOutcome(status="completed", reason="signed in", billable_actions=[])
+    )
+    _step, task, _loop_mock, _post = await _run_execute_task_v3(
+        monkeypatch,
+        outcome,
+        task_block=_make_block(NavigationBlock, navigation_goal="Sign in"),
+        on_loop_async=_claims_completion,
+        completion_gate_raises=CompletionGateTerminationError(gate_reason),
+        data_extraction_goal=None,
+        extracted_information_schema=None,
+    )
+    assert task.status == TaskStatus.terminated
+    assert task.failure_reason == gate_reason
+    written = [error for call in errors_update.await_args_list for error in call.kwargs.get("errors") or []]
+    assert all(error["error_code"] != "MISSING_TOTP_SOURCE" for error in written)
+
+
+@pytest.mark.asyncio
+async def test_execute_task_v3_gives_the_codes_to_the_finish_tool_not_the_goal(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    # v3 never shows the model the customer's codes: they reach neither the loop nor the goal, and
-    # the detector after the loop is what assigns one.
     mapping = {"COVERAGE_NOT_ACTIVE": "The member has no active plan today."}
     outcome = LoopOutcome(status="completed", reason="ok", billable_actions=[])
     block = _make_block(NavigationBlock, navigation_goal="Go", error_code_mapping=mapping)
@@ -4575,9 +4652,236 @@ async def test_execute_task_v3_keeps_the_codes_out_of_the_loop_and_the_goal(
         data_extraction_goal=None,
         extracted_information_schema=None,
     )
-    assert "error_code_mapping" not in loop_mock.await_args.kwargs
+    assert loop_mock.await_args.kwargs["error_code_mapping"] == mapping
     assert "COVERAGE_NOT_ACTIVE" not in loop_mock.await_args.kwargs["goal"]
     assert "The member has no active plan today." not in loop_mock.await_args.kwargs["goal"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("outcome", "persisted_code", "detector_runs", "vetoed"),
+    [
+        (
+            LoopOutcome(status="failed", reason="password rejected", error_code="COVERAGE_NOT_ACTIVE"),
+            "COVERAGE_NOT_ACTIVE",
+            False,
+            False,
+        ),
+        (LoopOutcome(status="terminated", reason="no such member", error_code_declined=True), None, False, False),
+        (LoopOutcome(status="failed", reason="step budget used up"), "DETECTED", True, False),
+        (LoopOutcome(status="budget_exhausted", reason="max_turns (40) reached"), "DETECTED", True, False),
+        # A code must never make a successful run carry errors: consumers read errors as "did not succeed".
+        (LoopOutcome(status="completed", reason="done", error_code="COVERAGE_NOT_ACTIVE"), None, False, False),
+        # A conversion that stood, then failed for its missing extraction: the code answered a verdict that did not stand.
+        (
+            LoopOutcome(
+                status="completed",
+                reason="the site skipped a screen",
+                converted_from="failed",
+                converted_from_reason="password rejected",
+                error_code="COVERAGE_NOT_ACTIVE",
+            ),
+            "DETECTED",
+            True,
+            False,
+        ),
+        # A completion vetoed after the loop was never asked for a code, so the page guess decides.
+        (LoopOutcome(status="completed", reason="done"), "DETECTED", True, True),
+        # A vetoed re-ask conversion restores the model's failed verdict, and with it the code it chose.
+        (
+            LoopOutcome(
+                status="completed",
+                reason="the site skipped a screen",
+                converted_from="failed",
+                converted_from_reason="password rejected",
+                error_code="COVERAGE_NOT_ACTIVE",
+            ),
+            "COVERAGE_NOT_ACTIVE",
+            False,
+            True,
+        ),
+    ],
+)
+async def test_execute_task_v3_the_models_finish_answer_replaces_the_page_guess(
+    monkeypatch: pytest.MonkeyPatch, outcome: LoopOutcome, persisted_code: str | None, detector_runs: bool, vetoed: bool
+) -> None:
+    monkeypatch.setattr(
+        "skyvern.forge.agent.app.AGENT_FUNCTION.task_v3_error_code_on_finish", AsyncMock(return_value=True)
+    )
+    detect_mock = AsyncMock(
+        return_value=[UserDefinedError(error_code="DETECTED", reasoning="page guess", confidence_float=0.5)]
+    )
+    monkeypatch.setattr("skyvern.forge.agent.detect_user_defined_errors_for_task", detect_mock)
+    errors_update = AsyncMock()
+    monkeypatch.setattr("skyvern.forge.agent.app.DATABASE.tasks.update_task", errors_update)
+    mapping = {"COVERAGE_NOT_ACTIVE": "x", "DETECTED": "y"}
+    _step, task, _loop, _post = await _run_execute_task_v3(
+        monkeypatch,
+        outcome,
+        error_code_mapping=mapping,
+        data_extraction_goal="Extract the member id" if persisted_code == "DETECTED" and not vetoed else None,
+        extracted_information_schema=None,
+        completion_gate_vetoes=vetoed,
+    )
+
+    assert detect_mock.await_count == (1 if detector_runs else 0)
+    written = [error for call in errors_update.await_args_list for error in call.kwargs.get("errors") or []]
+    assert [error["error_code"] for error in written] == ([persisted_code] if persisted_code else [])
+    if persisted_code == "COVERAGE_NOT_ACTIVE":
+        assert written[0]["reasoning"] == (outcome.converted_from_reason or outcome.reason)
+
+
+@pytest.mark.asyncio
+async def test_execute_task_v3_a_missing_code_source_and_the_models_code_are_both_stored(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        "skyvern.forge.agent.app.AGENT_FUNCTION.task_v3_error_code_on_finish", AsyncMock(return_value=True)
+    )
+    detect_mock = AsyncMock(return_value=[])
+    monkeypatch.setattr("skyvern.forge.agent.detect_user_defined_errors_for_task", detect_mock)
+    errors_update = AsyncMock()
+    monkeypatch.setattr("skyvern.forge.agent.app.DATABASE.tasks.update_task", errors_update)
+
+    def _no_source(kwargs: dict[str, Any]) -> None:
+        kwargs["verification_blocker"].__self__.last_status = NO_ONE_TIME_CODE_SOURCE
+
+    await _run_execute_task_v3(
+        monkeypatch,
+        LoopOutcome(status="terminated", reason="no code was delivered", error_code="COVERAGE_NOT_ACTIVE"),
+        task_block=_make_block(NavigationBlock, navigation_goal="Sign in"),
+        on_loop=_no_source,
+        error_code_mapping={"COVERAGE_NOT_ACTIVE": "x"},
+        data_extraction_goal=None,
+        extracted_information_schema=None,
+    )
+
+    written = [error for call in errors_update.await_args_list for error in call.kwargs.get("errors") or []]
+    assert [error["error_code"] for error in written] == ["MISSING_TOTP_SOURCE", "COVERAGE_NOT_ACTIVE"]
+    assert detect_mock.await_count == 0
+
+
+@pytest.mark.asyncio
+async def test_execute_task_v3_a_conversion_a_deployment_gate_terminates_goes_to_the_detector(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    detect_mock = AsyncMock(
+        return_value=[UserDefinedError(error_code="DETECTED", reasoning="page guess", confidence_float=0.5)]
+    )
+    monkeypatch.setattr("skyvern.forge.agent.detect_user_defined_errors_for_task", detect_mock)
+    errors_update = AsyncMock()
+    monkeypatch.setattr("skyvern.forge.agent.app.DATABASE.tasks.update_task", errors_update)
+    outcome = LoopOutcome(
+        status="completed",
+        reason="the site skipped a screen",
+        converted_from="failed",
+        converted_from_reason="password rejected",
+        error_code="COVERAGE_NOT_ACTIVE",
+    )
+    await _run_execute_task_v3(
+        monkeypatch,
+        outcome,
+        error_code_mapping={"COVERAGE_NOT_ACTIVE": "x", "DETECTED": "y"},
+        data_extraction_goal=None,
+        extracted_information_schema=None,
+        completion_gate_raises=CompletionGateTerminationError("already applied to this job"),
+    )
+
+    written = [error for call in errors_update.await_args_list for error in call.kwargs.get("errors") or []]
+    assert [error["error_code"] for error in written] == ["DETECTED"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("enabled", [False, True])
+async def test_the_open_source_gate_follows_its_setting_and_is_off_by_default(
+    monkeypatch: pytest.MonkeyPatch, enabled: bool
+) -> None:
+    assert Settings.model_fields["TASK_V3_ERROR_CODE_ON_FINISH"].default is False
+    monkeypatch.setattr(settings, "TASK_V3_ERROR_CODE_ON_FINISH", enabled)
+    assert await AgentFunction().task_v3_error_code_on_finish(organization_id="org-1") is enabled
+
+
+@pytest.mark.asyncio
+async def test_execute_task_v3_gate_off_stores_the_page_guess_and_logs_both_codes(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        "skyvern.forge.agent.app.AGENT_FUNCTION.task_v3_error_code_on_finish", AsyncMock(return_value=False)
+    )
+    detect_mock = AsyncMock(
+        return_value=[UserDefinedError(error_code="DETECTED", reasoning="page guess", confidence_float=0.5)]
+    )
+    monkeypatch.setattr("skyvern.forge.agent.detect_user_defined_errors_for_task", detect_mock)
+    errors_update = AsyncMock()
+    monkeypatch.setattr("skyvern.forge.agent.app.DATABASE.tasks.update_task", errors_update)
+    outcome = LoopOutcome(status="terminated", reason="password rejected", error_code="COVERAGE_NOT_ACTIVE")
+    with capture_logs() as logs:
+        await _run_execute_task_v3(
+            monkeypatch, outcome, error_code_mapping={"COVERAGE_NOT_ACTIVE": "x", "DETECTED": "y"}
+        )
+
+    written = [error for call in errors_update.await_args_list for error in call.kwargs.get("errors") or []]
+    assert [error["error_code"] for error in written] == ["DETECTED"]
+    (line,) = (log for log in logs if log["event"] == "task_v3 user-defined error code sources")
+    assert (line["model_error_code"], line["detector_error_codes"]) == ("COVERAGE_NOT_ACTIVE", ["DETECTED"])
+    assert line["reached_finish"] is True and line["model_answer_used"] is False
+
+
+@pytest.mark.asyncio
+async def test_execute_task_v3_a_gate_error_falls_back_to_the_page_guess(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(
+        "skyvern.forge.agent.app.AGENT_FUNCTION.task_v3_error_code_on_finish",
+        AsyncMock(side_effect=RuntimeError("flag service down")),
+    )
+    detect_mock = AsyncMock(
+        return_value=[UserDefinedError(error_code="DETECTED", reasoning="page guess", confidence_float=0.5)]
+    )
+    monkeypatch.setattr("skyvern.forge.agent.detect_user_defined_errors_for_task", detect_mock)
+    errors_update = AsyncMock()
+    monkeypatch.setattr("skyvern.forge.agent.app.DATABASE.tasks.update_task", errors_update)
+    outcome = LoopOutcome(status="failed", reason="password rejected", error_code="COVERAGE_NOT_ACTIVE")
+    await _run_execute_task_v3(monkeypatch, outcome, error_code_mapping={"COVERAGE_NOT_ACTIVE": "x", "DETECTED": "y"})
+
+    written = [error for call in errors_update.await_args_list for error in call.kwargs.get("errors") or []]
+    assert [error["error_code"] for error in written] == ["DETECTED"]
+
+
+@pytest.mark.asyncio
+async def test_execute_task_v3_a_gate_demoted_completion_is_not_logged_as_a_model_answer(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    gate = AsyncMock(return_value=True)
+    monkeypatch.setattr("skyvern.forge.agent.app.AGENT_FUNCTION.task_v3_error_code_on_finish", gate)
+    monkeypatch.setattr("skyvern.forge.agent.detect_user_defined_errors_for_task", AsyncMock(return_value=[]))
+    monkeypatch.setattr("skyvern.forge.agent.app.DATABASE.tasks.update_task", AsyncMock())
+    outcome = LoopOutcome(status="completed", reason="done")
+    with capture_logs() as logs:
+        await _run_execute_task_v3(
+            monkeypatch,
+            outcome,
+            error_code_mapping={"COVERAGE_NOT_ACTIVE": "x"},
+            data_extraction_goal=None,
+            extracted_information_schema=None,
+            completion_gate_raises=CompletionGateTerminationError("already applied to this job"),
+        )
+
+    gate.assert_not_awaited()
+    (line,) = (log for log in logs if log["event"] == "task_v3 user-defined error code sources")
+    assert line["model_verdict"] == "completed" and line["model_answer_used"] is False
+
+
+@pytest.mark.asyncio
+async def test_execute_task_v3_a_completion_the_gate_ended_inside_the_loop_logs_the_models_verdict(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr("skyvern.forge.agent.detect_user_defined_errors_for_task", AsyncMock(return_value=[]))
+    monkeypatch.setattr("skyvern.forge.agent.app.DATABASE.tasks.update_task", AsyncMock())
+    outcome = LoopOutcome(status="terminated", reason="already applied", model_status="completed")
+    with capture_logs() as logs:
+        await _run_execute_task_v3(monkeypatch, outcome, error_code_mapping={"COVERAGE_NOT_ACTIVE": "x"})
+
+    (line,) = (log for log in logs if log["event"] == "task_v3 user-defined error code sources")
+    assert line["model_verdict"] == "completed"
 
 
 @pytest.mark.asyncio
@@ -4586,7 +4890,11 @@ async def test_execute_task_v3_vetoed_completion_still_reaches_the_detector(
 ) -> None:
     # A completion the gate vetoes is demoted to failed, and the detector runs on the demoted status,
     # not on the model's own "completed".
-    detected = [SimpleNamespace(model_dump=lambda: {"error_code": "COVERAGE_NOT_ACTIVE"}, reasoning="")]
+    detected = [
+        SimpleNamespace(
+            model_dump=lambda: {"error_code": "COVERAGE_NOT_ACTIVE"}, error_code="COVERAGE_NOT_ACTIVE", reasoning=""
+        )
+    ]
     detect_mock = AsyncMock(return_value=detected)
     monkeypatch.setattr("skyvern.forge.agent.detect_user_defined_errors_for_task", detect_mock)
     errors_update = AsyncMock()
@@ -4807,7 +5115,11 @@ async def test_execute_task_v3_leaves_unasked_failures_to_the_detector(
 ) -> None:
     # The scope guard: a failed v3 run on a task with a mapping hands the code to the detector,
     # exactly as v1's fail_task does.
-    detected = [SimpleNamespace(model_dump=lambda: {"error_code": "COVERAGE_NOT_ACTIVE"}, reasoning="")]
+    detected = [
+        SimpleNamespace(
+            model_dump=lambda: {"error_code": "COVERAGE_NOT_ACTIVE"}, error_code="COVERAGE_NOT_ACTIVE", reasoning=""
+        )
+    ]
     detect_mock = AsyncMock(return_value=detected)
     monkeypatch.setattr("skyvern.forge.agent.detect_user_defined_errors_for_task", detect_mock)
     errors_update = AsyncMock()
@@ -4866,8 +5178,6 @@ async def test_execute_task_v3_router_selected_data_only_validation_goes_page_fr
 async def test_execute_task_v3_hands_the_loop_the_live_verification_gate(monkeypatch: pytest.MonkeyPatch) -> None:
     # The finish gate the loop receives must be the same VerificationState the auth tools mutate;
     # a fresh or detached state would let a refused source false-complete despite the blocker.
-    from skyvern.forge.taskv3.auth_tools import VerificationFailure
-
     seen_states: list[Any] = []
 
     def capturing_build(
@@ -4885,7 +5195,7 @@ async def test_execute_task_v3_hands_the_loop_the_live_verification_gate(monkeyp
     assert blocker is not None
     assert len(seen_states) == 1 and blocker.__self__ is seen_states[0]
     assert await blocker("completed") is None
-    seen_states[0].arm(VerificationFailure.NO_CODE_TWICE, "get_verification_code")
+    seen_states[0].arm(VerificationFailure.LINK_REFUSED, "open_verification_link")
     assert await blocker("completed") is not None
 
 

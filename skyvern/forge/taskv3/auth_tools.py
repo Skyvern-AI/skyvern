@@ -72,27 +72,30 @@ _PER_CALL_WAIT_SECONDS = 120.0
 # The poll loop fetches once per 10s sleep, so a slice shorter than that would never fetch; a tail
 # that small counts as spent.
 _MIN_SLICE_SECONDS = 10.0
-# How long a "not yet" answer keeps the give-up gate armed. Past it the run has moved on and a
-# non-complete verdict is about something else; same idiom (and duration order) as the loop's
-# FAILURE_EVIDENCE_WINDOW_TURNS recency, expressed in seconds because the budget is.
+# How long a "no sign-in link yet" answer keeps the give-up hold armed. Past it the run has moved on and a
+# non-complete verdict is about something else.
 _NOT_YET_RECENCY_SECONDS = 180.0
-# Termination is guaranteed by the budget shrinking under every productive deferral, but a slice may
-# advance spend by as little as _MIN_SLICE_SECONDS, which would admit ~90 holds. 8 >= ceil(900/120),
-# so this never binds on the healthy path.
+# Termination is guaranteed by the budget shrinking under every productive deferral, but a slice may advance
+# spend by as little as _MIN_SLICE_SECONDS. 8 >= ceil(900/120), so this never binds on the healthy path.
 _MAX_GIVEUP_DEFERRALS = 8
 # A body-less landing must not hold the tool for a full navigation timeout.
 _BODY_TEXT_TIMEOUT_MS = 5000
 
-_BUDGET_EXHAUSTED = (
-    "verification code polling budget exhausted: no code arrived from the configured verification "
-    "source. Do not call get_verification_code again; finish the task as failed and say the "
-    "verification code never became available."
+_CODE_BUDGET_SPENT = "the verification code polling time is spent; no code arrived from the configured source."
+
+_CREDENTIAL_HAS_NO_CODE_SECRET = (
+    "this credential has no usable one-time-code secret, so no code can be generated for it; "
+    "get_verification_code fetches codes from this task's code source."
+)
+
+_CODE_CREDENTIAL_NOT_IN_USE = (
+    "more than one saved credential in this task has a one-time-code field and none of them is in use yet; "
+    "a code is generated for the credential in use."
 )
 
 _COMPLETION_BLOCKED = (
-    "the verification step never completed: no verification code was received and no sign-in link was "
-    "successfully opened (the source errored, refused, delivered nothing usable, or the polling budget "
-    "ran out). Finish with status=failed and say the verification step never completed."
+    "the sign-in link step never completed: no sign-in link was opened and no verification code was "
+    "received (the source errored, refused, delivered nothing usable, or the polling budget ran out)."
 )
 
 _LINK_BUDGET_EXHAUSTED = (
@@ -101,14 +104,10 @@ _LINK_BUDGET_EXHAUSTED = (
     "link never became available."
 )
 
-_MAGIC_LINK_UNSUPPORTED = (
-    "the verification source returned a sign-in link, which this engine cannot follow. Do not call "
-    "get_verification_code again; finish the task as failed and say the site verifies by sign-in link."
-)
+_SIGN_IN_LINK_INSTEAD_OF_CODE = "it sent a sign-in link, which this run cannot open"
 
 _MAGIC_LINK_REDIRECT = (
-    "the verification source returned a sign-in link, not a code. Call open_verification_link to open "
-    "it; do not call get_verification_code again unless the page then asks for a code."
+    "the verification source returned a sign-in link, not a code; open_verification_link opens it in this tab."
 )
 
 _CODE_INSTEAD_OF_LINK = (
@@ -123,16 +122,6 @@ _NO_LINK_AVAILABLE = (
 _NO_LINK_ONCE = (
     "no sign-in link available for this task right now (the verification source returned nothing to "
     "open). If the page sent one, call open_verification_link again."
-)
-
-_NO_CODE_AVAILABLE = (
-    "no verification code is available for this task (the verification source returned nothing). "
-    "Finish the task as failed and say the verification code never became available."
-)
-
-_NO_CODE_ONCE = (
-    "no verification code available for this task right now (the verification source returned nothing). "
-    "If the page asked for one, call get_verification_code again."
 )
 
 _LINK_OPENED = (
@@ -162,12 +151,6 @@ _GUIDANCE = (
     "`type` the returned value into the field. Never invent or guess a code."
 )
 
-_NO_CODE_SOURCE_GUIDANCE = (
-    "\n- If the page asks for a one-time / 2FA / verification code, type only a code this task gives you "
-    "(a credential's TOTP placeholder, or a code in the task's own instructions); if there is none, finish "
-    "as failed and say a verification code source is missing. Never invent or guess a code."
-)
-
 _LINK_GUIDANCE = (
     "\n- If the page says it sent / emailed a sign-in LINK (not a code), call `open_verification_link`; "
     "do not ask for a code and never try to read or type the link yourself."
@@ -176,6 +159,26 @@ _LINK_GUIDANCE = (
 
 def _tool_name(expected_otp_type: OTPType) -> str:
     return _LINK_TOOL if expected_otp_type == OTPType.MAGIC_LINK else _CODE_TOOL
+
+
+def _budget_spent(remaining_seconds: float) -> bool:
+    return remaining_seconds <= 0 or remaining_seconds < _MIN_SLICE_SECONDS
+
+
+def _time_left(remaining_seconds: float) -> str:
+    if _budget_spent(remaining_seconds):
+        return "no polling time remains"
+    return f"about {remaining_seconds / 60.0:.1f} minutes of polling time remain"
+
+
+def _code_not_yet(remaining_seconds: float) -> str:
+    if _budget_spent(remaining_seconds):
+        return _CODE_BUDGET_SPENT
+    return f"no verification code has arrived yet; {_time_left(remaining_seconds)}."
+
+
+def _code_source_error(detail: str, remaining_seconds: float) -> str:
+    return f"the verification code source returned an error ({detail}); {_time_left(remaining_seconds)}."
 
 
 def _is_token_shaped(value: str) -> bool:
@@ -292,11 +295,8 @@ async def _cookie_jar(page: Any) -> list[tuple[str, str, str, str]] | None:
 
 
 class VerificationFailure(StrEnum):
-    """Every condition that arms the completion refusal. This closes the VOCABULARY, which is what the
-    earlier hand-kept inventory could not do — it was missing six sites. Members are not one-per-site:
-    BUDGET_EXHAUSTED is written both where a slice spends the last of the budget and where a later
-    call finds it already spent. Closing the vocabulary is what this buys; a member-to-site bijection
-    is not, and nothing here depends on one."""
+    """Every condition `arm` narrates. Members are not one-per-site: BUDGET_EXHAUSTED is written both
+    where a slice spends the last of the budget and where a later call finds it already spent."""
 
     BUDGET_EXHAUSTED = "budget_exhausted"
     NO_CODE_TWICE = "no_code_twice"
@@ -316,19 +316,9 @@ class VerificationFailure(StrEnum):
 
 @dataclass
 class VerificationState:
-    """Lets the finish tool refuse a completed verdict once the source terminally failed to deliver, and
-    hold a non-complete one while the run is still awaiting a code it has unspent budget for.
-
-    The latch is armed by every terminal non-delivery answer (budget exhaustion, repeated lookup
-    empty answers, refused or unopenable link), never by a retryable "not yet" or by a link failure
-    that may have received a response (the URL moved, a cookie landed, or the jar could not be read).
-    Only the tools count as delivery, so a code read off the page after the source failed still
-    blocks; a value delivered at any point wins.
-
-    `source_failed` is derived from the recorded reason rather than settable on its own, so arming is
-    only reachable through `arm`, which narrates. The step engine narrates the same failure with the
-    same fields (`skyvern/forge/agent.py`, "TOTP polling timed out — terminating task"); without this
-    the v3 side latched silently and the failure could not be found in production at all."""
+    """Verification facts for one task: the polling budget, deliveries, and the last status the code tool
+    reported. It gives the model no orders about codes; it refuses a completion on a run whose sign-in link
+    never arrived or opened, and holds a give-up while the run still waits on a sign-in link."""
 
     # Excluded from the repr: the bound `block_finish` handed to the loop would otherwise carry
     # the task's navigation payload into any message that formats the callback.
@@ -336,41 +326,37 @@ class VerificationState:
     # A credential-generated code with less than this left in its TOTP step waits for the next step.
     totp_min_remaining_seconds: int = 0
     values_delivered: int = field(default=0, init=False)
-    # Whether `build_auth_tools` offered get_verification_code with a source that could produce a code.
-    code_tool_offered: bool = field(default=False, init=False)
-    # A credential one-time-code placeholder was refused because no code could be generated for it.
-    totp_source_missing: bool = field(default=False, init=False)
-    # The shared polling budget the tools draw down, lifted onto the state so the finish gate can
-    # read it. `build_auth_tools` advances `polling_spent_seconds` from its poll accounting.
+    # The last code-tool answer that carried no code, or the type tool's refusal on a task with no code source. A
+    # verification tool call, a delivery or a page action clears it; a model give-up reports it as its reason.
+    last_status: str | None = field(default=None, init=False)
+    # The block's credential scope, set by `build_auth_tools`; the type tool's refusal reads it.
+    allowed_credential_parameter_keys: Sequence[str] | None = field(default=None, init=False)
+    # Set when the latest verification answer asked the model to keep waiting for a sign-in link.
+    link_wait_since: float | None = field(default=None, init=False)
+    giveup_deferrals: int = field(default=0, init=False)
+    # A finish that arrives with spend unchanged since the last hold means the model did not re-poll, so it stands.
+    spend_at_last_giveup_deferral: float | None = field(default=None, init=False, repr=False)
+    # The shared polling budget the tools draw down. `build_auth_tools` advances `polling_spent_seconds`
+    # from its poll accounting.
     budget_seconds: float = field(
         default_factory=lambda: settings.VERIFICATION_CODE_POLLING_TIMEOUT_MINS * 60.0, init=False
     )
     polling_spent_seconds: float = field(default=0.0, init=False)
-    # Monotonic timestamp of the last answer that invited another call, cleared where the source
-    # produces a value. Written by the two retryable answers -- "not yet", and a first empty or
-    # errored lookup -- so "the run is awaiting a code right now" is a tool-call fact rather than a
-    # reading of the page. An arming does NOT clear it: `source_failed` is the conjunct that stops a
-    # hold once the source is judged, and it has to keep working when a later poll re-arms this latch.
-    awaiting_code_since: float | None = field(default=None, init=False)
-    # Which tool the latch belongs to. Both tools drain one source and share the budget, so a
-    # magic-link run must not be sent back to `get_verification_code`.
-    awaiting_code_tool: str = field(default=_CODE_TOOL, init=False)
-    giveup_deferrals: int = field(default=0, init=False)
-    # Spend at the previous honored deferral. A finish that arrives with spend unchanged means the
-    # model did not re-poll, so the next give-up stands rather than ping-ponging against the gate.
-    spend_at_last_giveup_deferral: float | None = field(default=None, init=False, repr=False)
-    _armings: list[VerificationFailure] = field(default_factory=list, init=False, repr=False)
+    # Set by the link tool's retryable answers and cleared when the source produces a value, so a re-ask
+    # conversion can tell a sign-in link screen that may still be waiting from one the site skipped.
+    awaiting_link_since: float | None = field(default=None, init=False)
+    _armings: list[tuple[VerificationFailure, str]] = field(default_factory=list, init=False, repr=False)
 
     @property
-    def source_failed(self) -> bool:
-        return bool(self._armings)
+    def link_failed(self) -> bool:
+        return any(tool == _LINK_TOOL for _, tool in self._armings)
 
     @property
     def remaining_budget_seconds(self) -> float:
         return self.budget_seconds - self.polling_spent_seconds
 
     def arm(self, reason: VerificationFailure, tool: str) -> None:
-        self._armings.append(reason)
+        self._armings.append((reason, tool))
         try:
             LOG.warning(
                 "task_v3 verification source failed",
@@ -384,27 +370,26 @@ class VerificationState:
                 # The count at THIS arming, not a verdict: a value delivered later unblocks the run,
                 # and no record is written when that happens. Reads as a bound, not as an outcome.
                 values_delivered=self.values_delivered,
-                # Every arming reports, so this is the true running total. The record this replaces
-                # was gated to one per task and could not be counted at all.
                 arming_count=len(self._armings),
                 # Masked to **** by `log_redaction.SENSITIVE_FIELDS` before rendering, as v1's is.
                 # Carried for field parity with the step engine; the stripped URL is the triage handle.
                 totp_identifier=self.task.totp_identifier,
                 totp_verification_url=_loggable_url(self.task.totp_verification_url),
                 # `strip_query_params` answers "" for a scheme-less or host-less string, which is
-                # indistinguishable from an absent URL; this pair keeps the two apart.
-                # Separates a source with no URL configured from one whose URL cannot be parsed —
-                # a malformed polling URL is a plausible root cause of the source never delivering.
+                # indistinguishable from an absent URL; this keeps a malformed polling URL visible.
                 totp_verification_url_configured=bool(self.task.totp_verification_url),
             )
         except Exception:
-            # The latch is already set above. Narration must never cost the tool its answer: an
-            # escape here would reach the model as a bare tool_error, dropping both the "finish as
-            # failed" guidance and the page-state payload the link paths attach.
+            # Narration must never cost the tool its answer: an escape here would reach the model as a
+            # bare tool_error, dropping the status and the page-state payload the link paths attach.
             pass
+
+    def page_engaged(self) -> None:
+        self.last_status = None
 
     def record_delivery(self, tool: str) -> None:
         self.values_delivered += 1
+        self.last_status = None
         LOG.info(
             "task_v3 verification value delivered",
             task_id=self.task.task_id,
@@ -419,9 +404,9 @@ class VerificationState:
     async def resolve_totp_placeholder(self, placeholder: str, authorize: TotpCodeAuthorizer | None = None) -> str:
         """Turn a credential's TOTP placeholder, which resolves to a vault marker rather than a code, into
         the code its secret generates now. Like the step engine, any run credential's placeholder qualifies:
-        the block's credential scope bounds the code tools, not typing. Refuses (and records the missing
-        source) when the credential holds no usable TOTP secret. A code `authorize` refuses is neither
-        registered nor counted as delivered."""
+        the block's credential scope bounds the code tools, not typing. Refuses when the credential holds no
+        usable TOTP secret, with the no-source status only when the task has no other code source. A code
+        `authorize` refuses is neither registered nor counted as delivered."""
         code: str | None = None
         workflow_run_id = self.task.workflow_run_id
         usable = False
@@ -443,7 +428,6 @@ class VerificationState:
             except NoTOTPSecretFound:
                 code = None
         if code is None:
-            self.totp_source_missing = True
             LOG.warning(
                 "task_v3 credential one-time code unavailable",
                 task_id=self.task.task_id,
@@ -451,6 +435,10 @@ class VerificationState:
                 workflow_run_id=workflow_run_id,
                 credential_usable=usable,
             )
+            allowed = self.allowed_credential_parameter_keys
+            if _code_source_can_produce(self.task, allowed) or _code_credential_not_in_use(self.task, allowed):
+                raise ToolRefusal(_CREDENTIAL_HAS_NO_CODE_SECRET, error_class="no_one_time_code_source")
+            self.last_status = NO_ONE_TIME_CODE_SOURCE
             raise ToolRefusal(NO_ONE_TIME_CODE_SOURCE, error_class="no_one_time_code_source")
         if authorize is not None and owner_key is not None:
             await authorize(code, owner_key)
@@ -462,23 +450,26 @@ class VerificationState:
         self.record_delivery("type")
         return code
 
-    async def block_completion(self) -> str | None:
-        if self.source_failed and self.values_delivered == 0:
+    async def block_finish(self, status: str) -> str | None:
+        """Refuses a completed claim once the sign-in link source terminally failed, and a re-ask conversion
+        also while a sign-in link is still awaited; a value delivered at any point lifts both. Any other
+        verdict is a give-up, held while a sign-in link is still awaited."""
+        if status not in ("completed", CONVERSION_VERIFICATION_STATUS):
+            return self._hold_link_giveup(status)
+        if self.values_delivered:
+            return None
+        if self.link_failed or (status == CONVERSION_VERIFICATION_STATUS and self.awaiting_link_since is not None):
             return _COMPLETION_BLOCKED
         return None
 
-    async def block_giveup(self, status: str) -> str | None:
-        """Defer a non-complete verdict exactly while the run is actively awaiting a verification
-        code it has unspent budget for. The first four conditions operationalize that one invariant;
-        the last two bound the hold, so a model that ignores the deferral still ends within two
-        finishes and one that polls minimally within `_MAX_GIVEUP_DEFERRALS`."""
+    def _hold_link_giveup(self, status: str) -> str | None:
+        if self.link_wait_since is None:
+            return None
         remaining = self.remaining_budget_seconds
         reason: str | None = None
-        if self.awaiting_code_since is None:
-            reason = "not_awaiting"
-        elif self.source_failed:
+        if self._armings:
             reason = "source_failed"
-        elif time.monotonic() - self.awaiting_code_since > _NOT_YET_RECENCY_SECONDS:
+        elif time.monotonic() - self.link_wait_since > _NOT_YET_RECENCY_SECONDS:
             reason = "stale"
         elif remaining < _MIN_SLICE_SECONDS:
             reason = "budget_spent"
@@ -489,76 +480,42 @@ class VerificationState:
             and self.polling_spent_seconds <= self.spend_at_last_giveup_deferral
         ):
             reason = "unproductive"
-        if reason is not None:
-            self._record_giveup(held=False, reason=reason, remaining=remaining, status=status)
-            return None
-        self.giveup_deferrals += 1
-        self.spend_at_last_giveup_deferral = self.polling_spent_seconds
-        self._record_giveup(held=True, reason="held", remaining=remaining, status=status)
-        # Both tools drain one source, so the artifact has to come off the same latch the tool does:
-        # telling a run that polled for a sign-in link that "the code has not arrived" contradicts the
-        # page and the answer the tool just gave it.
-        subject = "sign-in link" if self.awaiting_code_tool == _LINK_TOOL else "verification code"
-        return (
-            f"about {remaining / 60.0:.1f} minutes of {subject} polling budget remain and the "
-            f"{subject} has not arrived yet. Call {self.awaiting_code_tool} again to keep waiting for "
-            "it. If the page never sent one you may re-request it; otherwise do not act on the page "
-            "for this. Once the budget is spent the tool will say so; finish then and the verdict "
-            "will stand."
-        )
-
-    async def block_finish(self, status: str) -> str | None:
-        """The one verification gate the finish tool consults, for every verdict: a completed claim is
-        refused once the source terminally failed, a non-complete one is deferred while budget the
-        run is still waiting on remains."""
-        if status == "completed":
-            return await self.block_completion()
-        if status == CONVERSION_VERIFICATION_STATUS:
-            return self.block_conversion()
-        return await self.block_giveup(status)
-
-    def block_conversion(self) -> str | None:
-        """A re-ask may not turn a give-up into completed once the run asked for a verification code it never got:
-        the skipped screen may be the code screen still waiting."""
-        asked = self.awaiting_code_since is not None or self.source_failed or self.totp_source_missing
-        if asked and self.values_delivered == 0:
-            return _COMPLETION_BLOCKED
-        return None
-
-    def _record_giveup(self, *, held: bool, reason: str, remaining: float, status: str) -> None:
-        # The pre-registered probe: today the unspent residual at a give-up is only reconstructible by
-        # differencing poll timestamps, so it cannot be counted directly. `finish_status` is carried
-        # because failed and terminated are separate populations in that read and the record is the
-        # only place they can be told apart.
-        # A run offered the code tool that never polled is kept: it is the "offered, never called" give-up.
-        if not held and self.polling_spent_seconds <= 0 and not self.code_tool_offered:
-            return
+        if reason is None:
+            self.giveup_deferrals += 1
+            self.spend_at_last_giveup_deferral = self.polling_spent_seconds
         try:
             LOG.info(
                 "task_v3 verification give-up gate",
                 task_id=self.task.task_id,
                 organization_id=self.task.organization_id,
                 workflow_run_id=self.task.workflow_run_id,
-                held=held,
-                reason=reason,
+                tool=_LINK_TOOL,
+                held=reason is None,
+                reason=reason or "held",
                 finish_status=status,
                 polling_spent_seconds=round(self.polling_spent_seconds, 1),
                 remaining_seconds=round(remaining, 1),
                 budget_seconds=self.budget_seconds,
                 giveup_deferrals=self.giveup_deferrals,
-                code_tool_offered=self.code_tool_offered,
                 values_delivered=self.values_delivered,
-                source_failed=self.source_failed,
             )
         except Exception:
-            # Narration must never cost the gate its verdict, for the same reason `arm` swallows.
+            # Narration must never cost the hold its verdict, for the same reason `arm` swallows.
             pass
+        if reason is not None:
+            return None
+        return (
+            f"about {remaining / 60.0:.1f} minutes of sign-in link polling budget remain and the sign-in link has "
+            f"not arrived yet. Call {_LINK_TOOL} again to keep waiting for it. If the page never sent one you may "
+            "re-request it; otherwise do not act on the page for this. Once the budget is spent the tool will say "
+            "so; finish then and the verdict will stand."
+        )
 
 
 def _offered_code_source_can_produce(task: Task, allowed_credential_parameter_keys: Sequence[str] | None) -> bool:
-    """Whether the code tool `has_otp_source` offered has a source that could yield a code: a payload
-    code, a polling source, or a credential TOTP backed by a parseable secret. `has_otp_source` checks
-    only the credential's shape, which a missing or invalid seed still passes."""
+    """Whether the code source `has_otp_source` found could yield a code: a payload code, a polling
+    source, or a credential TOTP backed by a parseable secret. `has_otp_source` checks only the
+    credential's shape, which a missing or invalid seed still passes."""
     payload_otp_value = extract_totp_from_navigation_inputs(task.navigation_payload)
     if payload_otp_value is not None and payload_otp_value.get_otp_type() == OTPType.TOTP:
         return True
@@ -586,37 +543,65 @@ def _offered_code_source_can_produce(task: Task, allowed_credential_parameter_ke
     )
 
 
+def _code_source_can_produce(task: Task, allowed_credential_parameter_keys: Sequence[str] | None) -> bool:
+    return has_otp_source(
+        task, expected_otp_type=OTPType.TOTP, allowed_credential_parameter_keys=allowed_credential_parameter_keys
+    ) and _offered_code_source_can_produce(task, allowed_credential_parameter_keys)
+
+
+def _code_credential_not_in_use(task: Task, allowed_credential_parameter_keys: Sequence[str] | None) -> bool:
+    """Several credentials in scope carry a TOTP field and none is active, so `has_otp_source` picks none of them,
+    yet at least one could produce a code once it is the credential in use."""
+    workflow_run_id = task.workflow_run_id
+    if not workflow_run_id or not app.WORKFLOW_CONTEXT_MANAGER.has_workflow_run_context(workflow_run_id):
+        return False
+    context = skyvern_context.current()
+    active_key = context.active_credential_parameter_key if context else None
+    if active_key is not None and (
+        allowed_credential_parameter_keys is None or active_key in allowed_credential_parameter_keys
+    ):
+        return False
+    workflow_run_context = app.WORKFLOW_CONTEXT_MANAGER.get_workflow_run_context(workflow_run_id)
+    placeholders = [
+        value["totp"]
+        for key, value in workflow_run_context.values.items()
+        if isinstance(value, dict)
+        and isinstance(value.get("totp"), str)
+        and workflow_run_context.is_registered_credential_parameter_key(key)
+        and (allowed_credential_parameter_keys is None or key in allowed_credential_parameter_keys)
+    ]
+    return len(placeholders) > 1 and any(
+        is_usable_credential_totp_placeholder(
+            workflow_run_context,
+            placeholder,
+            active_credential_parameter_key=None,
+            allowed_credential_parameter_keys=allowed_credential_parameter_keys,
+        )
+        for placeholder in placeholders
+    )
+
+
 def build_auth_tools(
     task: Task,
     page_provider: PageProvider | None = None,
     state: VerificationState | None = None,
     allowed_credential_parameter_keys: Sequence[str] | None = None,
 ) -> tuple[list[ToolSpec], str]:
-    """Return (tools, system-prompt guidance) for verification handling. A task with no verification source
-    configured gets no tools (so they aren't offered needlessly) but still gets the never-invent guidance.
-    The link tool also needs a page to navigate, so a page-free run never gets it. `state`, if given, is mutated as the tools
-    poll and deliver values; pass its `block_finish` to `make_finish_tool` to gate every finish verdict
-    on it. A caller with no use for that gate can omit `state` entirely."""
+    """Return (tools, system-prompt guidance) for verification handling. The code tool is always offered and
+    answers with a status when no code source can produce a code; the link tool needs a link source and a
+    page to navigate. `state`, if given, is mutated as the tools poll and deliver values; pass its
+    `block_finish` to `make_finish_tool`. A caller with no use for that gate can omit `state` entirely."""
     if state is None:
         state = VerificationState(task=task)
-    offer_code_tool = has_otp_source(
-        task, expected_otp_type=OTPType.TOTP, allowed_credential_parameter_keys=allowed_credential_parameter_keys
-    )
+    state.allowed_credential_parameter_keys = allowed_credential_parameter_keys
     offer_link_tool = page_provider is not None and has_otp_source(
         task, expected_otp_type=OTPType.MAGIC_LINK, allowed_credential_parameter_keys=allowed_credential_parameter_keys
     )
-    state.code_tool_offered = offer_code_tool and _offered_code_source_can_produce(
-        task, allowed_credential_parameter_keys
-    )
-    if not offer_code_tool and not offer_link_tool:
-        return [], _NO_CODE_SOURCE_GUIDANCE
 
     # The model re-calls after every empty answer, so the cumulative polling across this task's calls
-    # is capped at VERIFICATION_CODE_POLLING_TIMEOUT_MINS (the step engine's single poll window) and
-    # then the tools refuse with stop guidance. One budget for both tools: they drain one source; it
-    # lives on `state` so the finish gate can see what is left of it. Re-derived here rather than
-    # taken from the state's default because a caller may have built the state before the setting was
-    # read, and the budget must be the one in force where it is actually drawn down.
+    # is capped at VERIFICATION_CODE_POLLING_TIMEOUT_MINS (the step engine's single poll window). One
+    # budget for both tools: they drain one source. Re-derived here rather than taken from the state's
+    # default because a caller may have built the state before the setting was read.
     # Scope is this task, so each block of a workflow run draws its own budget. Deliberate, not
     # emergent: v1's poll sites start a fresh full window on every invocation (`poll_otp_value`
     # callers pass no `max_wait_seconds`), so a per-run cap here would be stricter than v1.
@@ -631,72 +616,72 @@ def build_auth_tools(
     # verdict on it. Shared by both tools, like the budget, because they drain one source.
     empty_answer_streak = 0
 
+    def _code_answer(text: str, *, arm: VerificationFailure | None = None) -> ToolResult:
+        """A code-tool status that carries no code. Stays a ToolResult.error: the loop sends the model
+        `content` only, and the error status routes a call that blocked for up to 120s through the
+        batch-poisoning check, so a stale queued click cannot dispatch against a page that moved."""
+        if arm is not None:
+            state.arm(arm, _CODE_TOOL)
+        state.last_status = text
+        return ToolResult.error(text)
+
     def _budget_exhausted(expected_otp_type: OTPType) -> ToolResult:
-        state.arm(VerificationFailure.BUDGET_EXHAUSTED, _tool_name(expected_otp_type))
-        if expected_otp_type == OTPType.MAGIC_LINK:
-            return ToolResult.error(_LINK_BUDGET_EXHAUSTED)
-        return ToolResult.error(_BUDGET_EXHAUSTED)
+        if expected_otp_type == OTPType.TOTP:
+            return _code_answer(_CODE_BUDGET_SPENT, arm=VerificationFailure.BUDGET_EXHAUSTED)
+        state.arm(VerificationFailure.BUDGET_EXHAUSTED, _LINK_TOOL)
+        return ToolResult.error(_LINK_BUDGET_EXHAUSTED)
 
     def _failed(
         message: str, *, reason: VerificationFailure, tool: str, data: dict[str, Any] | None = None
     ) -> ToolResult:
-        """A terminal non-delivery answer: the finish tool must refuse a completed verdict from here on."""
+        """A terminal link-tool answer: the finish tool refuses a completed verdict from here on."""
         state.arm(reason, tool)
         return ToolResult.error(message, data=data)
 
-    def _not_yet(expected_otp_type: OTPType, detail: str, elapsed_seconds: float) -> ToolResult:
-        """A healthy source that has not delivered yet: the run is still awaiting a code, and the
-        message says how much budget is left to wait with — the old one gave no indication any
-        remained. Stays a ToolResult.error: the status is never serialized to the model (the loop
-        sends `content` only), and it is what routes a call that blocked for up to 120s through the
-        batch-poisoning check, so flipping it would let a stale queued click dispatch against a page
-        that moved during the wait. `elapsed_seconds` is this slice's wait, which the caller's
-        `finally` has not yet added to the running spend."""
-        state.awaiting_code_since = time.monotonic()
-        state.awaiting_code_tool = _tool_name(expected_otp_type)
+    def _not_yet(expected_otp_type: OTPType, detail: str, elapsed_seconds: float, *, errored: bool) -> ToolResult:
+        """A slice that timed out with nothing to hand over. `elapsed_seconds` is this slice's wait, which
+        the caller's `finally` has not yet added to the running spend."""
         spent = state.polling_spent_seconds + elapsed_seconds
         remaining = max(0.0, state.budget_seconds - spent)
+        tool = _tool_name(expected_otp_type)
         LOG.warning(
             "task_v3 verification poll slice timed out",
             task_id=task.task_id,
             organization_id=task.organization_id,
             workflow_run_id=task.workflow_run_id,
-            tool=_tool_name(expected_otp_type),
+            tool=tool,
             polling_spent_seconds=round(spent, 1),
             remaining_seconds=round(remaining, 1),
             budget_seconds=state.budget_seconds,
         )
-        tool = _tool_name(expected_otp_type)
-        subject = "sign-in link" if expected_otp_type == OTPType.MAGIC_LINK else "verification code"
-        if remaining < _MIN_SLICE_SECONDS:
-            # Nothing left to buy: the next call refuses without polling, so inviting one would spend
-            # a tool call and a turn to be told that -- and near the loop's own limits that trades a
-            # truthful verification failure for a generic budget-exhausted exit. Terminal, so it arms:
-            # the budget is exhausted here whether or not the model makes that pointless call, and
-            # leaving the latch to be set by the call itself is what let a model that obeys the
-            # instruction go on to claim the verification step completed.
+        spent_out = _budget_spent(remaining)
+        if expected_otp_type == OTPType.TOTP:
+            text = _code_source_error(detail, remaining) if errored else _code_not_yet(remaining)
+            return _code_answer(text, arm=VerificationFailure.BUDGET_EXHAUSTED if spent_out else None)
+        state.awaiting_link_since = state.link_wait_since = time.monotonic()
+        if spent_out:
             return _failed(
-                f"no {subject} available yet ({detail}), and the polling budget is now spent. Do not "
-                f"call {tool} again; finish the task as failed and say the {subject} never arrived.",
+                f"no sign-in link available yet ({detail}), and the polling budget is now spent. Do not "
+                f"call {tool} again; finish the task as failed and say the sign-in link never arrived.",
                 reason=VerificationFailure.BUDGET_EXHAUSTED,
                 tool=tool,
             )
         return ToolResult.error(
-            f"no {subject} available yet ({detail}); about {remaining / 60.0:.1f} minutes of polling "
+            f"no sign-in link available yet ({detail}); about {remaining / 60.0:.1f} minutes of polling "
             f"budget remain. If the page has not sent one, trigger it first, then call {tool} again."
         )
 
-    def _empty_answer(once: str, terminal: str, *, reason: VerificationFailure, tool: str) -> ToolResult:
+    def _code_empty(text: str, *, reason: VerificationFailure) -> ToolResult:
+        nonlocal empty_answer_streak
+        empty_answer_streak += 1
+        return _code_answer(text, arm=reason if empty_answer_streak > 1 else None)
+
+    def _empty_answer(once: str, terminal: str, *, reason: VerificationFailure) -> ToolResult:
         nonlocal empty_answer_streak
         empty_answer_streak += 1
         if empty_answer_streak > 1:
-            return _failed(terminal, reason=reason, tool=tool)
-        # Retryable, so it arms the give-up gate for the same reason `_not_yet` does: this answer
-        # invites another call, and a run that gives up right after it has exactly as much unspent
-        # budget as one that gave up after a "not yet". Arming only the "not yet" path would leave the
-        # gate holding on one of the four answers that ask the model to wait.
-        state.awaiting_code_since = time.monotonic()
-        state.awaiting_code_tool = tool
+            return _failed(terminal, reason=reason, tool=_LINK_TOOL)
+        state.awaiting_link_since = state.link_wait_since = time.monotonic()
         return ToolResult.error(once)
 
     async def _poll(expected_otp_type: OTPType) -> ToolResult | OTPValue:
@@ -707,14 +692,20 @@ def build_auth_tools(
             return _budget_exhausted(expected_otp_type)
         if first_poll_started_at is None:
             first_poll_started_at = datetime.utcnow()
+        is_code = expected_otp_type == OTPType.TOTP
         # A code poll may hand back a sign-in link stored for this run since this task began, but only when
-        # the link tool can open it; without a page the link would end the run as unsupported.
+        # the link tool can open it.
         surface_magic_link = (
             MagicLinkSurfacing(created_after=task.created_at, spent_values=frozenset(spent_links))
-            if expected_otp_type == OTPType.TOTP and offer_link_tool
+            if is_code and offer_link_tool
             else None
         )
         started = time.monotonic()
+
+        def _charged() -> float:
+            # An instant answer still costs a slice, so repeated calls reach the spent status in a bounded number.
+            return max(time.monotonic() - started, _MIN_SLICE_SECONDS)
+
         try:
             otp_value = await resolve_otp_value(
                 task,
@@ -726,28 +717,21 @@ def build_auth_tools(
                 surface_magic_link=surface_magic_link,
             )
             if otp_value is None:
-                if expected_otp_type == OTPType.MAGIC_LINK:
-                    return _empty_answer(
-                        _NO_LINK_ONCE,
-                        _NO_LINK_AVAILABLE,
-                        reason=VerificationFailure.NO_LINK_TWICE,
-                        tool=_tool_name(expected_otp_type),
+                if is_code:
+                    return _code_empty(
+                        _code_not_yet(state.remaining_budget_seconds - _charged()),
+                        reason=VerificationFailure.NO_CODE_TWICE,
                     )
-                return _empty_answer(
-                    _NO_CODE_ONCE,
-                    _NO_CODE_AVAILABLE,
-                    reason=VerificationFailure.NO_CODE_TWICE,
-                    tool=_tool_name(expected_otp_type),
-                )
+                return _empty_answer(_NO_LINK_ONCE, _NO_LINK_AVAILABLE, reason=VerificationFailure.NO_LINK_TWICE)
             empty_answer_streak = 0
             # Cleared here, not at delivery: several paths reach a value that is never handed to the
             # model -- a link when a code was asked for, a code when a link was, a link the browser
-            # could not open -- and on all of them the run has stopped waiting on the SOURCE. Holding
-            # a give-up there would contradict the very answer those paths return.
-            state.awaiting_code_since = None
+            # could not open -- and on all of them the run has stopped waiting on the SOURCE.
+            state.awaiting_link_since = None
             return otp_value
         except (NoTOTPVerificationCodeFound, FailedToGetTOTPVerificationCode) as exc:
-            if state.polling_spent_seconds + (time.monotonic() - started) >= state.budget_seconds:
+            elapsed = _charged()
+            if not is_code and state.polling_spent_seconds + elapsed >= state.budget_seconds:
                 return _budget_exhausted(expected_otp_type)
             detail = type(exc).__name__
             if isinstance(exc, FailedToGetTOTPVerificationCode):
@@ -755,18 +739,21 @@ def build_auth_tools(
                 # source, not a "not yet" from a healthy one.
                 if exc.reason:
                     detail = f"{detail}: {exc.reason}"
+                if is_code:
+                    return _code_empty(
+                        _code_source_error(detail, state.remaining_budget_seconds - elapsed),
+                        reason=VerificationFailure.SOURCE_ERRORED_TWICE,
+                    )
                 return _empty_answer(
-                    f"the verification source errored ({detail}). Call {_tool_name(expected_otp_type)} again; "
-                    "do not re-trigger the page.",
+                    f"the verification source errored ({detail}). Call {_LINK_TOOL} again; do not re-trigger the page.",
                     f"the verification source kept failing ({detail}). Finish the task as failed and say the "
                     "verification step never completed.",
                     reason=VerificationFailure.SOURCE_ERRORED_TWICE,
-                    tool=_tool_name(expected_otp_type),
                 )
             empty_answer_streak = 0
             if exc.webhook_diagnostics:
                 detail = f"{detail}: {exc.webhook_diagnostics}"
-            return _not_yet(expected_otp_type, detail, time.monotonic() - started)
+            return _not_yet(expected_otp_type, detail, elapsed, errored=bool(exc.webhook_diagnostics))
         except Exception as exc:
             LOG.warning(
                 "task_v3 verification tool lookup failed",
@@ -775,30 +762,38 @@ def build_auth_tools(
                 exc_info=True,
             )
             message = f"verification lookup failed: {type(exc).__name__}"
-            retry_hint = (
-                "If the page is waiting on a sign-in link, call open_verification_link again."
-                if expected_otp_type == OTPType.MAGIC_LINK
-                else "If the page asked for a code, call get_verification_code again."
-            )
+            if is_code:
+                return _code_empty(
+                    _code_source_error(message, state.remaining_budget_seconds - _charged()),
+                    reason=VerificationFailure.LOOKUP_FAILED_TWICE,
+                )
             return _empty_answer(
-                f"{message}. {retry_hint}",
+                f"{message}. If the page is waiting on a sign-in link, call open_verification_link again.",
                 f"{message} repeatedly. Finish the task as failed and say the verification step never completed.",
                 reason=VerificationFailure.LOOKUP_FAILED_TWICE,
-                tool=_tool_name(expected_otp_type),
             )
         finally:
-            state.polling_spent_seconds += time.monotonic() - started
+            state.polling_spent_seconds += _charged()
+
+    def _new_verification_call() -> None:
+        state.last_status = None
+        state.link_wait_since = None
 
     async def _get_verification_code(args: dict[str, Any]) -> ToolResult:
         nonlocal cached_otp_value
+        _new_verification_call()
+        # Per call, not at build time: the active credential can change between calls.
+        if not _code_source_can_produce(task, allowed_credential_parameter_keys):
+            if _code_credential_not_in_use(task, allowed_credential_parameter_keys):
+                return _code_answer(_CODE_CREDENTIAL_NOT_IN_USE)
+            return _code_answer(NO_ONE_TIME_CODE_SOURCE)
         cached = cached_otp_value
         if cached is not None:
             if cached.get_otp_type() == OTPType.MAGIC_LINK:
                 if not offer_link_tool:
-                    return _failed(
-                        _MAGIC_LINK_UNSUPPORTED,
-                        reason=VerificationFailure.MAGIC_LINK_UNSUPPORTED_CACHED,
-                        tool="get_verification_code",
+                    return _code_answer(
+                        _code_source_error(_SIGN_IN_LINK_INSTEAD_OF_CODE, state.remaining_budget_seconds),
+                        arm=VerificationFailure.MAGIC_LINK_UNSUPPORTED_CACHED,
                     )
                 # Asked for a code again instead of opening the link: the page may want a code after all, so
                 # poll for one rather than repeat the redirect, which would starve a code that arrives later.
@@ -830,12 +825,14 @@ def build_auth_tools(
                 tool="get_verification_code",
                 otp_type=OTPType.MAGIC_LINK.value,
             )
-            return _failed(
-                _MAGIC_LINK_UNSUPPORTED, reason=VerificationFailure.MAGIC_LINK_UNSUPPORTED, tool="get_verification_code"
+            return _code_answer(
+                _code_source_error(_SIGN_IN_LINK_INSTEAD_OF_CODE, state.remaining_budget_seconds),
+                arm=VerificationFailure.MAGIC_LINK_UNSUPPORTED,
             )
         if otp_value.get_otp_type() != OTPType.TOTP:
-            return _failed(
-                _NO_CODE_AVAILABLE, reason=VerificationFailure.VALUE_NOT_A_CODE, tool="get_verification_code"
+            return _code_answer(
+                _code_source_error("it returned a value that is not a code", state.remaining_budget_seconds),
+                arm=VerificationFailure.VALUE_NOT_A_CODE,
             )
         return _deliver_code(otp_value.value)
 
@@ -849,6 +846,7 @@ def build_auth_tools(
 
     async def _open_verification_link(args: dict[str, Any]) -> ToolResult:
         nonlocal cached_otp_value, first_poll_started_at
+        _new_verification_call()
         otp_value: OTPValue | None = cached_otp_value
         if otp_value is None:
             polled = await _poll(OTPType.MAGIC_LINK)
@@ -992,23 +990,22 @@ def build_auth_tools(
         state.record_delivery("open_verification_link")
         return ToolResult.ok(_LINK_OPENED, data={"page_state_changed": True})
 
-    tools: list[ToolSpec] = []
-    if offer_code_tool:
-        tools.append(
-            ToolSpec(
-                name="get_verification_code",
-                description=(
-                    "Fetch the one-time / 2FA verification code for this task (from the connected email inbox, "
-                    "the configured verification webhook, or the saved credential's authenticator). Call this "
-                    "after the page has sent or asked for a verification / OTP / 2FA code, then type the returned "
-                    "value. The call waits up to a couple of minutes for the code to arrive and the total wait per "
-                    "task is limited, so do not call it before the code has been requested. Never invent a code."
-                ),
-                parameters={"type": "object", "properties": {}},
-                handler=_get_verification_code,
-                billable=False,
-            )
+    tools: list[ToolSpec] = [
+        ToolSpec(
+            name="get_verification_code",
+            description=(
+                "Fetch the one-time / 2FA verification code for this task (from the connected email inbox, "
+                "the configured verification webhook, or the saved credential's authenticator). A call waits up "
+                "to a couple of minutes for the code and the total wait per task is limited. It returns the "
+                "code, or says that no code has arrived yet (with the polling time left), that no code source "
+                "is configured, that the polling time is spent, or that the code source returned an error. "
+                "Never invent or guess a code."
+            ),
+            parameters={"type": "object", "properties": {}},
+            handler=_get_verification_code,
+            billable=False,
         )
+    ]
     if offer_link_tool:
         tools.append(
             ToolSpec(
@@ -1030,7 +1027,4 @@ def build_auth_tools(
                 engages_page=True,
             )
         )
-    guidance = (_GUIDANCE if offer_code_tool else _NO_CODE_SOURCE_GUIDANCE) + (
-        _LINK_GUIDANCE if offer_link_tool else ""
-    )
-    return tools, guidance
+    return tools, _GUIDANCE + (_LINK_GUIDANCE if offer_link_tool else "")

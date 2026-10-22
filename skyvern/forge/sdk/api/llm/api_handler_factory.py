@@ -941,7 +941,7 @@ def _get_primary_model_dict(router: Any, main_model_group: str) -> dict[str, Any
 
 
 def _primary_deployment_label(primary_model_dict: dict[str, Any] | None) -> str | None:
-    """Provider label of the primary deployment (e.g. `vertex_ai/gemini-2.5-pro` -> `gemini-2.5-pro`)."""
+    """Provider label of the primary deployment (e.g. `vertex_ai/gemini-3-flash-preview` -> `gemini-3-flash-preview`)."""
     if not primary_model_dict:
         return None
     litellm_params = primary_model_dict.get("litellm_params") or {}
@@ -1054,7 +1054,7 @@ def _log_vertex_cache_hit_if_needed(
 
 def _normalize_llm_model(model: str | None) -> str | None:
     # LiteLLM's response.model can include a provider prefix
-    # (e.g. "vertex_ai/gemini-2.5-flash", "openai/gpt-4.1-mini") while
+    # (e.g. "vertex_ai/gemini-3-flash-preview", "openai/gpt-4.1-mini") while
     # config-side fallbacks tend to use the bare model name. Strip the
     # prefix so dbt aggregates the same model under one bucket.
     if not model:
@@ -1297,7 +1297,7 @@ class LLMAPIHandlerFactory:
     def _models_equivalent(left: str | None, right: str | None) -> bool:
         """Used only by `llm_api_handler_with_router_and_fallback`. Router model
         groups carry the `vertex-` prefix while LiteLLM responses return the
-        underlying provider label (e.g. `gemini-2.5-pro`). Stripping the prefix
+        underlying provider label (e.g. `gemini-3-flash-preview`). Stripping the prefix
         lets us detect whether the configured primary (the router's
         `main_model_group`) actually served the request without replumbing every
         config/registry reference.
@@ -1575,7 +1575,7 @@ class LLMAPIHandlerFactory:
                 )
 
         try:
-            # Gemini router/fallback configs (e.g., gemini-2.5-pro-gpt-5-fallback-router)
+            # Gemini router/fallback configs (e.g., gemini-3-pro-gpt-5-fallback-router)
             # are not recognized by litellm, but they do support reasoning budgets.
             if not supports_reasoning and model_label:
                 model_label_lower = model_label.lower()
@@ -2667,7 +2667,7 @@ class LLMAPIHandlerFactory:
                         cached_tokens = getattr(response.usage, "cache_read_input_tokens", 0) or 0
 
                 # Prefer the actual backing model returned by LiteLLM so we don't persist the
-                # router group name (e.g. "GEMINI_2_5_FLASH_WITH_FALLBACK") when the router
+                # router group name (e.g. "GEMINI_3_0_FLASH_WITH_FALLBACK") when the router
                 # falls back. Mirrors the pattern in llm_api_handler/call.
                 # Phase 1 tradeoff: last_llm_model records the most recent model used in
                 # the step. dbt attributes the full step_cost to it, which is accurate
