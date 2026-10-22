@@ -110,6 +110,7 @@ from skyvern.forge.taskv3.loop import (
     record_resolve_seconds,
     record_text_delta,
     run_agent_tool_loop,
+    submissions_across_contexts,
     submissions_since,
 )
 from skyvern.forge.taskv3.opaque_refs import mask_opaque_urls
@@ -7018,7 +7019,15 @@ class _FakeSubmissions:
         at = time.monotonic() - ago
         self.records.append(
             InterceptedSubmission(
-                record_id=len(self.records) + 1, outcome=outcome, started_at=at - 0.5, released_at=at, delivered_at=at
+                record_id=len(self.records) + 1,
+                outcome=outcome,
+                # A request sent now reaches the interceptor after the action that sent it was dispatched.
+                started_at=at - min(ago, 0.5),
+                released_at=at,
+                delivered_at=at,
+                site_error_type="RECAPTCHA_SCORE_BELOW_THRESHOLD"
+                if outcome is SubmissionOutcome.REJECTED_BY_SITE
+                else None,
             )
         )
 
@@ -7401,6 +7410,282 @@ def test_submissions_since_drops_an_earlier_blocks_settled_records() -> None:
     assert [r.record_id for r in read()] == [2]
     submissions.deliver()
     assert [r.record_id for r in read()] == [2, 3]
+
+
+_RETRY_HELD = "taskv3 finish held for the permitted retry of a typed site rejection"
+_RETRY_WOULD_HOLD = "taskv3 finish would hold for the permitted retry of a typed site rejection"
+_REJECTED = SubmissionOutcome.REJECTED_BY_SITE
+
+
+async def _typed_rejection_run(
+    submissions: _FakeSubmissions,
+    script: list[list[tuple[str, dict[str, Any]]]],
+    *,
+    click_outcomes: list[SubmissionOutcome] | None = None,
+    finish_kwargs: dict[str, Any] | None = None,
+    **kwargs: Any,
+) -> tuple[Any, list[dict[str, Any]]]:
+    """Each click is a submit the interceptor records with the next outcome; once they run out it records nothing."""
+    activity = ActivityRecency()
+    tools = _submission_tools(submissions, activity, **(finish_kwargs or {}))
+    pending = list(click_outcomes or [])
+
+    async def click(args: dict[str, Any]) -> ToolResult:
+        if pending:
+            next_outcome = pending.pop(0)
+            if next_outcome is SubmissionOutcome.HELD:
+                submissions.hold()
+            else:
+                submissions.deliver(outcome=next_outcome)
+            await asyncio.sleep(SUBMISSION_RENDER_MARGIN_SECONDS + 0.2)
+        return ToolResult.ok("click done")
+
+    tools[0] = ToolSpec(name="click", description="c", parameters={}, handler=click, billable=True)
+    with capture_logs() as logs:
+        outcome, _ = await _run(script, tools, activity=activity, **kwargs)
+    return outcome, logs
+
+
+_SUBMIT_REJECTED_THEN_GIVE_UP = [
+    [("observe", {})],
+    [("click", {"selector": "#submit"})],
+    [("observe", {})],
+    [("finish", {"status": "terminated", "reason": "flagged as spam"})],
+]
+
+
+@pytest.mark.asyncio
+async def test_a_lone_typed_rejection_holds_a_give_up_once_for_the_permitted_retry() -> None:
+    script = [*_SUBMIT_REJECTED_THEN_GIVE_UP, [("finish", {"status": "terminated", "reason": "not retrying"})]]
+    outcome, logs = await _typed_rejection_run(_FakeSubmissions(), script, click_outcomes=[_REJECTED])
+    assert (outcome.status, outcome.reason) == ("terminated", "not retrying")
+    assert [e["event"] for e in logs].count(_RETRY_HELD) == 1
+
+
+@pytest.mark.asyncio
+async def test_any_submit_after_the_typed_rejection_ends_the_offer() -> None:
+    # The retry's own record, whatever it got back, or a resubmit the interceptor never saw: either way no offer.
+    for retry in (_REJECTED, SubmissionOutcome.UNKNOWN, SubmissionOutcome.DELIVERED, None):
+        script = [
+            [("observe", {})],
+            [("click", {"selector": "#submit"})],
+            [("observe", {})],
+            [("click", {"selector": "#submit"})],
+            [("observe", {})],
+            [("finish", {"status": "terminated", "reason": "rejected again"})],
+        ]
+        outcomes = [_REJECTED] if retry is None else [_REJECTED, retry]
+        outcome, logs = await _typed_rejection_run(_FakeSubmissions(), script, click_outcomes=outcomes)
+        assert (retry, outcome.status, outcome.turns) == (retry, "terminated", 6)
+        assert _RETRY_HELD not in [e["event"] for e in logs]
+
+
+@pytest.mark.asyncio
+async def test_only_this_blocks_own_typed_rejection_offers_the_retry() -> None:
+    for lone in (SubmissionOutcome.DELIVERED, SubmissionOutcome.UNKNOWN):
+        script = [*_SUBMIT_REJECTED_THEN_GIVE_UP[:3], [("finish", {"status": "failed", "reason": "r"})]]
+        outcome, logs = await _typed_rejection_run(_FakeSubmissions(), script, click_outcomes=[lone])
+        assert (lone, outcome.status, outcome.turns) == (lone, "failed", 4)
+        assert _RETRY_HELD not in [e["event"] for e in logs]
+    # A rejection this block made no submit for: an earlier block's submission, settled while this one ran.
+    submissions = _FakeSubmissions()
+    submissions.deliver(ago=5.0, outcome=_REJECTED)
+    outcome, logs = await _typed_rejection_run(
+        submissions, [[("observe", {})], [("finish", {"status": "terminated", "reason": "nothing to submit"})]]
+    )
+    assert (outcome.status, outcome.turns) == ("terminated", 2)
+    assert _RETRY_HELD not in [e["event"] for e in logs]
+    submissions = _FakeSubmissions()
+    submissions.hold()
+
+    async def canceled() -> bool:
+        return True
+
+    activity = ActivityRecency()
+    finish = make_finish_tool(activity=activity, intercepted_submissions=submissions, should_cancel=canceled)
+    with capture_logs() as logs:
+        await finish.handler({"status": "terminated", "reason": "r"})
+        activity.turn += 1
+        result = await finish.handler({"status": "terminated", "reason": "r"})
+    assert result.status == "ok"
+    assert _RETRY_HELD not in [e["event"] for e in logs]
+
+
+@pytest.mark.asyncio
+async def test_a_second_finish_in_the_batch_of_the_retry_hold_is_held_too() -> None:
+    script = [
+        *_SUBMIT_REJECTED_THEN_GIVE_UP[:3],
+        [("finish", {"status": "terminated", "reason": "r1"}), ("finish", {"status": "terminated", "reason": "r2"})],
+        [("finish", {"status": "terminated", "reason": "r3"})],
+    ]
+    outcome, logs = await _typed_rejection_run(_FakeSubmissions(), script, click_outcomes=[_REJECTED])
+    assert (outcome.status, outcome.reason, outcome.turns) == ("terminated", "r3", 5)
+    assert [e["event"] for e in logs].count(_RETRY_HELD) == 1
+
+
+_RETRY_HOLD = "verdict held once: the only submission the page-level interceptor saw"
+# The hold reports the rejection as a fact; it must not tell the model what to do about it.
+_STEERING = ("you may retry", "unused", "retry the submission")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "second", [None, SubmissionOutcome.HELD, SubmissionOutcome.DELIVERED, SubmissionOutcome.UNKNOWN, _REJECTED]
+)
+async def test_a_submit_queued_behind_the_retry_hold_spends_the_offer_for_the_rest_of_the_batch(
+    second: SubmissionOutcome | None,
+) -> None:
+    # [finish, submit, finish] in one batch: the second finish must not repeat a permission the submit already used,
+    # whether the interceptor recorded it (in flight, delivered, unknown, rejected) or never saw it (None).
+    submissions = _FakeSubmissions()
+    outcomes = [_REJECTED] if second is None else [_REJECTED, second]
+    script = [
+        *_SUBMIT_REJECTED_THEN_GIVE_UP[:3],
+        [
+            ("finish", {"status": "terminated", "reason": "r1"}),
+            ("click", {"selector": "#submit"}),
+            ("finish", {"status": "terminated", "reason": "r2"}),
+        ],
+        [("observe", {})],
+        [("finish", {"status": "terminated", "reason": "r3"})],
+    ]
+
+    async def settle_held() -> None:
+        while not any(r.outcome is SubmissionOutcome.HELD for r in submissions.records):
+            await asyncio.sleep(0.01)
+        submissions.release(next(r.record_id for r in submissions.records if r.outcome is SubmissionOutcome.HELD))
+
+    releaser = asyncio.create_task(settle_held()) if second is SubmissionOutcome.HELD else None
+    outcome, logs = await _typed_rejection_run(submissions, script, click_outcomes=outcomes)
+    if releaser is not None:
+        await releaser
+    finishes = [
+        str(m.get("content")) for m in outcome.messages if m.get("role") == "tool" and m.get("name") == "finish"
+    ]
+    assert finishes[0].startswith(_RETRY_HOLD)
+    assert finishes[1].startswith("verdict held") and not finishes[1].startswith(_RETRY_HOLD), finishes[1]
+    assert all(not later.startswith(_RETRY_HOLD) for later in finishes[2:])
+    assert (outcome.status, outcome.reason) == ("terminated", "r3")
+    assert [e["event"] for e in logs].count(_RETRY_HELD) == 1
+
+
+@pytest.mark.asyncio
+async def test_a_submission_the_loop_did_not_send_also_spends_the_retry_offer_for_the_batch() -> None:
+    # The page can send a submission on its own (a script re-submitting): a new record with no submit-shaped action.
+    submissions, activity = _FakeSubmissions(), ActivityRecency()
+    tools = _submission_tools(submissions, activity)
+    reads = [0]
+
+    async def click(args: dict[str, Any]) -> ToolResult:
+        submissions.deliver(outcome=_REJECTED)
+        await asyncio.sleep(SUBMISSION_RENDER_MARGIN_SECONDS + 0.2)
+        return ToolResult.ok("click done")
+
+    async def observe(args: dict[str, Any]) -> ToolResult:
+        reads[0] += 1
+        if reads[0] == 2:
+            submissions.deliver(outcome=SubmissionOutcome.DELIVERED)
+        return ToolResult.ok("url=x text: 'Submit application'")
+
+    tools[0] = ToolSpec(name="click", description="c", parameters={}, handler=click, billable=True)
+    tools[1] = ToolSpec(name="observe", description="o", parameters={}, handler=observe, compactable=True)
+    script = [
+        [("click", {"selector": "#submit"})],
+        [("observe", {})],
+        [
+            ("finish", {"status": "terminated", "reason": "r1"}),
+            ("observe", {}),
+            ("finish", {"status": "terminated", "reason": "r2"}),
+        ],
+    ]
+    outcome, _ = await _run(script, tools, activity=activity)
+    finishes = [
+        str(m.get("content")) for m in outcome.messages if m.get("role") == "tool" and m.get("name") == "finish"
+    ]
+    assert finishes[0].startswith(_RETRY_HOLD)
+    assert finishes[1].startswith("verdict held") and not finishes[1].startswith(_RETRY_HOLD), finishes[1]
+
+
+@pytest.mark.asyncio
+async def test_the_typed_rejection_hold_states_the_rejection_without_steering() -> None:
+    script = [*_SUBMIT_REJECTED_THEN_GIVE_UP, [("finish", {"status": "terminated", "reason": "r2"})]]
+    outcome, _ = await _typed_rejection_run(_FakeSubmissions(), script, click_outcomes=[_REJECTED])
+    hold = next(m["content"] for m in outcome.messages if m.get("role") == "tool" and m.get("name") == "finish")
+    assert hold.startswith(_RETRY_HOLD) and "RECAPTCHA_SCORE_BELOW_THRESHOLD" in hold, hold
+    assert not any(phrase in hold.lower() for phrase in _STEERING), hold
+    assert (outcome.status, outcome.reason) == ("terminated", "r2")
+
+
+@pytest.mark.asyncio
+async def test_a_later_generic_hold_is_not_reported_as_a_spent_retry_offer() -> None:
+    # Offer in one turn, a submission in the next, then a plain unseen-response hold: the second finish in that later
+    # batch gets the same plain hold, not the claim that a submission followed the offer in this batch.
+    script = [
+        *_SUBMIT_REJECTED_THEN_GIVE_UP,
+        [("click", {"selector": "#submit"})],
+        [("finish", {"status": "terminated", "reason": "r1"}), ("finish", {"status": "terminated", "reason": "r2"})],
+        [("observe", {})],
+        [("finish", {"status": "terminated", "reason": "r3"})],
+    ]
+    outcome, _ = await _typed_rejection_run(
+        _FakeSubmissions(), script, click_outcomes=[_REJECTED, SubmissionOutcome.DELIVERED]
+    )
+    finishes = [
+        str(m.get("content")) for m in outcome.messages if m.get("role") == "tool" and m.get("name") == "finish"
+    ]
+    assert finishes[0].startswith(_RETRY_HOLD)
+    assert "got the site's response after your last look" in finishes[1], finishes[1]
+    assert finishes[2] == finishes[1], finishes[2]
+    assert (outcome.status, outcome.reason) == ("terminated", "r3")
+
+
+@pytest.mark.asyncio
+async def test_typed_rejection_retry_without_headroom_only_logs() -> None:
+    reloads: list[None] = []
+
+    async def reload_page() -> None:
+        reloads.append(None)
+
+    # The retry is a refill and a resubmit, so it is funded like the give-up hold, not like a re-observe.
+    deadline = {"deadline_at": time.monotonic() + VERIFICATION_GIVEUP_MIN_DEADLINE_HEADROOM_SECONDS - 10}
+    for limit, finish_kwargs in (
+        ({"max_turns": 4}, None),
+        ({"max_action_steps": 1}, None),
+        ({"max_refresh_cycles": 1}, None),
+        ({}, deadline),
+    ):
+        ctx = SkyvernContext(task_id="tsk_typed_rejection")
+        skyvern_context.set(ctx)
+        ctx.refresh_working_page = "max_refresh_cycles" in limit
+        try:
+            outcome, logs = await _typed_rejection_run(
+                _FakeSubmissions(),
+                _SUBMIT_REJECTED_THEN_GIVE_UP,
+                click_outcomes=[_REJECTED],
+                finish_kwargs=finish_kwargs,
+                reload_page=reload_page,
+                **limit,
+            )
+        finally:
+            skyvern_context.reset()
+        events = [e["event"] for e in logs]
+        assert (str(limit), outcome.status, _RETRY_HELD in events) == (str(limit), "terminated", False)
+        assert _RETRY_WOULD_HOLD in events
+
+
+def test_submissions_across_contexts_keeps_a_replaced_contexts_records_apart() -> None:
+    first, second = object(), object()
+    ledgers = {
+        first: (InterceptedSubmission(1, _REJECTED, started_at=1.0, released_at=2.0, delivered_at=2.0),),
+        second: (InterceptedSubmission(1, _REJECTED, started_at=3.0, released_at=4.0, delivered_at=4.0),),
+    }
+    current = [first]
+    read = submissions_across_contexts(lambda context: ledgers.get(context, ()), lambda: current[0])
+    current[0] = second
+    records = read()
+    assert [r.started_at for r in records] == [1.0, 3.0]
+    assert len({r.record_id for r in records}) == 2
+    assert [r.record_id for r in read()] == [r.record_id for r in records]
 
 
 @pytest.mark.asyncio
