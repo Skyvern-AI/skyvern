@@ -34,6 +34,13 @@ CODE_ONLY_FIELD_DESCRIPTION = (
 )
 
 
+class RawHTTPError(RuntimeError):
+    def __init__(self, status_code: int, detail: Any) -> None:
+        self.status_code = status_code
+        self.detail = detail
+        super().__init__(f"HTTP {status_code}: {detail}")
+
+
 async def raw_http_get(path: str, params: dict[str, Any] | None = None) -> Any:
     """GET request to Skyvern API for endpoints without SDK methods.
 
@@ -91,7 +98,7 @@ async def _raw_http_request(
             detail = response.json().get("detail", response.text)
         except Exception:
             detail = response.text
-        raise RuntimeError(f"HTTP {response.status_code}: {detail}")
+        raise RawHTTPError(response.status_code, detail)
     if response.status_code == 204:
         return {}
     try:
@@ -107,6 +114,7 @@ __all__ = [
     "DIRECT_TARGET_DESCRIPTION",
     "ErrorCode",
     "Timer",
+    "RawHTTPError",
     "get_artifact_dir",
     "make_error",
     "make_result",
