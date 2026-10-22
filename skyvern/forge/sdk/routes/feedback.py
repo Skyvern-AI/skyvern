@@ -169,10 +169,12 @@ _SECRET_ASSIGNMENT = re.compile(
     r"(?:(?:bearer|basic|token|digest)\s+)?(?:\[REDACTED_SECRET\]|[^\s,;}\])\"'])+",
     re.I | re.S,
 )
-_URL_USERINFO = re.compile(r"([A-Za-z][A-Za-z0-9+.-]*://)[^\s/:@?#]*:[^\s/@?#]*@")
+# Lookbehinds stand in for a leading scheme or key-prefix run, which re.sub would rescan from every start position
+# (quadratic, CodeQL py/polynomial-redos). The prefix stays outside the match, so the replacement keeps it.
+_URL_USERINFO = re.compile(r"(?<=[A-Za-z0-9+.-])://[^\s/:@?#]*:[^\s/@?#]*@")
 _AWS_ACCESS_KEY = re.compile(r"\b(?:AKIA|ASIA)[A-Z0-9]{16}\b")
 _AWS_SECRET_ASSIGNMENT = re.compile(
-    r"(?<![\w.-])([\"']?(?:[\w.-]*[_.-])?secret_access_key[\"']?\s*[:=]\s*)"
+    r"(?<![^\W_])(secret_access_key[\"']?\s*[:=]\s*)"
     r"(?:\"(?:\\.|[^\"\\])*\"|'(?:\\.|[^'\\])*'|[^\s,;\"'}]+)",
     re.I | re.S,
 )
@@ -227,7 +229,7 @@ def _redact_report_text(text: str, known_values: Collection[str]) -> str:
     parts.append(redact_raw_secrets_for_prompt(text[position:]))
     text = "".join(parts)
     text = redact_bearer_tokens_in_text(text)
-    text = _URL_USERINFO.sub(r"\1[REDACTED_SECRET]@", text)
+    text = _URL_USERINFO.sub("://[REDACTED_SECRET]@", text)
     text = _AWS_ACCESS_KEY.sub("[REDACTED_SECRET]", text)
     text = _AWS_SECRET_ASSIGNMENT.sub(r"\1[REDACTED_SECRET]", text)
     text = _VENDOR_TOKEN.sub("[REDACTED_SECRET]", text)

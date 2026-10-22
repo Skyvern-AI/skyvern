@@ -178,3 +178,16 @@ async def test_null_rating_clears_the_stored_row(monkeypatch: pytest.MonkeyPatch
     run_feedback.upsert_run_feedback.assert_not_awaited()
     event = hook.await_args.kwargs["event"]
     assert (event.rating, event.previous_rating) == (None, "up")
+
+
+@pytest.mark.parametrize(
+    ("text", "expected"),
+    [
+        ("read s3://reader:not-a-real-secret@bucket/key failed", "read s3://[REDACTED_SECRET]@bucket/key failed"),
+        ("export AWS_SECRET_ACCESS_KEY=not-a-real-secret done", "export AWS_SECRET_ACCESS_KEY=[REDACTED_SECRET] done"),
+        ("aws_secret_access_key: not-a-real-secret", "aws_secret_access_key: [REDACTED_SECRET]"),
+        ("mysecret_access_key=visible", "mysecret_access_key=visible"),
+    ],
+)
+def test_agent_report_redaction_keeps_the_url_scheme_and_key_name(text: str, expected: str) -> None:
+    assert feedback_routes._redact_report_text(text, ()) == expected
