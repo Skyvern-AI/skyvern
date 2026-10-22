@@ -1045,8 +1045,17 @@ function CredentialsModal({
 
   const createCredentialMutation = useMutation({
     mutationFn: async (request: CreateCredentialRequest) => {
-      const client = await getClient(credentialGetter);
-      const response = await client.post("/credentials", request);
+      const isPasskeySetup =
+        "totp_type" in request.credential &&
+        request.credential.totp_type === "passkey";
+      const client = await getClient(
+        credentialGetter,
+        isPasskeySetup ? "sans-api-v1" : "v1",
+      );
+      const response = await client.post(
+        isPasskeySetup ? "/credentials/passkey/setup" : "/credentials",
+        request,
+      );
       return response.data;
     },
     onSuccess: async (data) => {
@@ -1531,6 +1540,9 @@ function CredentialsModal({
         isEditMode &&
         Boolean(editingCredential?.credential_id) &&
         selectedAdditionalTwoFactorMethod?.saveBeforeCredentialUpdate === true;
+      const createPendingPasskey =
+        !isEditMode &&
+        selectedAdditionalTwoFactorMethod?.requestType === "passkey";
       saveIntentRef.current = {
         shouldTestAfterSave:
           supportsInlineTest &&
@@ -1585,12 +1597,13 @@ function CredentialsModal({
           username,
           ...(preservesStoredPassword ? {} : { password }),
           totp: selectedAdditionalTwoFactorMethod || totp === "" ? null : totp,
-          // Stage "none" for methods that attach after the base update. Methods
-          // that opt into attach-first keep their server-written type here.
-          totp_type:
-            selectedAdditionalTwoFactorMethod &&
-            selectedAdditionalTwoFactorMethod.value !==
-              configuredAdditionalTwoFactorMethod?.value
+          // Create passkeys through the dedicated setup route; other methods
+          // that attach after an edit stage "none" until their material is saved.
+          totp_type: createPendingPasskey
+            ? selectedAdditionalTwoFactorMethod.requestType
+            : selectedAdditionalTwoFactorMethod &&
+                selectedAdditionalTwoFactorMethod.value !==
+                  configuredAdditionalTwoFactorMethod?.value
               ? saveAdditionalTwoFactorBeforeUpdate
                 ? selectedAdditionalTwoFactorMethod.requestType
                 : "none"

@@ -497,6 +497,8 @@ class Credential(BaseModel):
         default=None,
         description="ID of the credential folder this credential belongs to, if any",
     )
+    is_test_login_temporary: bool | None = Field(default=None, exclude=True)
+    is_passkey_setup_pending: bool | None = Field(default=None, exclude=True)
     proxy_location: ProxyLocationInput = Field(
         default=None,
         description="Optional proxy location used for the credential's pinned proxy identity.",

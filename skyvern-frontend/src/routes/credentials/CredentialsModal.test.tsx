@@ -12,6 +12,7 @@ import { AxiosError, AxiosHeaders } from "axios";
 import { MemoryRouter } from "react-router-dom";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
+import { getClient } from "@/api/AxiosClient";
 import type { CredentialApiResponse } from "@/api/types";
 import { PageSlotsProvider, type PermissionsState } from "@/store/PageSlots";
 
@@ -490,6 +491,8 @@ describe("CredentialsModal additional two-factor methods", () => {
           expect.objectContaining({ credentialId: "cred-passkey" }),
         );
       });
+      expect(postMock.mock.calls[0]?.[0]).toBe("/credentials/passkey/setup");
+      expect(getClient).toHaveBeenNthCalledWith(1, null, "sans-api-v1");
       await waitFor(() => {
         expect(deleteMock.mock.calls.map(([path]) => path)).toEqual(
           retry
