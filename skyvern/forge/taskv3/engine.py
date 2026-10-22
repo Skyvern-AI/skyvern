@@ -93,6 +93,7 @@ from skyvern.schemas.workflows import BlockType
 from skyvern.services.otp_service import iter_totp_from_navigation_inputs
 from skyvern.utils.prompt_engine import PROMPT_HARD_CEILING_TOKENS
 from skyvern.utils.token_counter import approx_count_tokens, count_tokens
+from skyvern.webeye.native_downloads import NativeDownloadAttempt
 
 LOG = structlog.get_logger()
 
@@ -284,6 +285,7 @@ async def run_task_v3_agent_loop(
     pending_marker: Callable[[str], Awaitable[str | None]] | None = None,
     download_wait: DownloadWait | None = None,
     download_settle: DownloadSettle | None = None,
+    native_download_attempt: NativeDownloadAttempt | None = None,
     completion_gate: CompletionGate | None = None,
     staged_downloads: set[str] | None = None,
     verification_blocker: VerificationBlocker | None = None,
@@ -421,7 +423,11 @@ async def run_task_v3_agent_loop(
         )
     )
     unseen_text = None if page_free else UnseenPageText()
-    failure_watch = None if page_free or download_settle is None else DownloadFailureWatch(page_provider, refs)
+    failure_watch = (
+        None
+        if page_free or download_settle is None
+        else DownloadFailureWatch(page_provider, refs, native_download_attempt=native_download_attempt)
+    )
     browser_tools = (
         []
         if page_free

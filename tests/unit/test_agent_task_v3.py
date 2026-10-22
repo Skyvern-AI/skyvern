@@ -111,6 +111,8 @@ from skyvern.webeye.actions.actions import (
     SolveCaptchaAction,
     UploadFileAction,
 )
+from skyvern.webeye.browser_artifacts import DownloadBinding
+from skyvern.webeye.native_downloads import NativeDownloads
 from tests.unit._download_provider_fakes import (
     _ActionDownloadSource,
     _FakeActionDownloadObservation,
@@ -7060,6 +7062,63 @@ def _record_provider_sleeps(monkeypatch: pytest.MonkeyPatch) -> list[float]:
 
     monkeypatch.setattr(taskv3_provider_downloads, "asyncio", ScopedAsyncio(sleep=_record))
     return sleeps
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "guard", ["provider", "session_directory", "external", "replaced_context", "unknown_directory"]
+)
+async def test_native_quiescence_never_overrides_an_unknown_download_owner(monkeypatch, tmp_path, guard):
+    original_state = make_browser_state
+    observers = []
+    waits = []
+    real_wait = ForgeAgent._wait_for_in_flight_downloads
+
+    def owned_state():
+        state, browser, page = original_state()
+        observer = NativeDownloads(
+            state.browser_context, str(tmp_path) if guard != "unknown_directory" else None, covered=True
+        )
+        observer.quiescent = AsyncMock(return_value=True)
+        state.browser_artifacts.native_downloads = observer
+        state.browser_artifacts.download_binding = DownloadBinding.RUN_DIR
+        state.browser_context._skyvern_external_browser = guard == "external"
+        if guard == "session_directory":
+            state.browser_artifacts.download_binding = DownloadBinding.SESSION_DIR
+        observers.append(observer)
+        return state, browser, page
+
+    async def observed_wait(self, *args, **kwargs):
+        result = await real_wait(self, *args, **kwargs)
+        waits.append((result, set(kwargs["exhausted"])))
+        return result
+
+    async def run_loop(kwargs, captured):
+        observer = observers[0]
+        assert observer.attempt is kwargs["native_download_attempt"]
+        observer.attempt.interrupted = 1
+        if guard == "replaced_context":
+            observer.context = MagicMock()
+        residual = tmp_path / "retained.crdownload"
+        residual.write_bytes(b"partial")
+        await kwargs["download_wait"]()
+        assert residual.exists()
+        return LoopOutcome(status="terminated", reason="Observed transfer outcome.", billable_actions=[])
+
+    monkeypatch.setattr(__name__ + ".make_browser_state", owned_state)
+    monkeypatch.setattr(ForgeAgent, "_wait_for_in_flight_downloads", observed_wait)
+    source = _ActionDownloadSource(_FakeActionDownloadObservation([])) if guard == "provider" else None
+    await _run_execute_task_v3_download(
+        monkeypatch,
+        tmp_path,
+        drop_file=False,
+        provider_source=source,
+        download_timeout=1.2,
+        loop_fn=run_loop,
+    )
+    assert waits == [(False, {str(tmp_path / "retained.crdownload")})]
+    assert observers[0].attempt.closed
+    observers[0].quiescent.assert_not_awaited()
 
 
 @pytest.mark.asyncio
