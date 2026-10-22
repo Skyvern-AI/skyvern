@@ -1,0 +1,1390 @@
+{
+  "schemaVersion": 1,
+  "posts": [
+    {
+      "slug": "10-insights-from-ycs-open-source-conference",
+      "path": "blogs/10-insights-from-ycs-open-source-conference.md",
+      "sha256": "4f6a6a4eb258b3afe5f203a75bf0d8ec1cecce2c78f4250dc4654def74cfd18a"
+    },
+    {
+      "slug": "13k-github-stars-and-why-star-count-isnt-our-primary-metric",
+      "path": "blogs/13k-github-stars-and-why-star-count-isnt-our-primary-metric.md",
+      "sha256": "cf3bdd9ff54c26fcbcc187eff8b5497cd7893269e1cf939b72d1a9fff14fe1a6"
+    },
+    {
+      "slug": "14k-github-stars-and-the-long-journey-ahead",
+      "path": "blogs/14k-github-stars-and-the-long-journey-ahead.md",
+      "sha256": "7f0caa2165d0e2f76116b798eaa505ed14047654d0dfa41723c67d54ee9f613b"
+    },
+    {
+      "slug": "5-browser-workflows-you-didnt-know-you-could-automate",
+      "path": "blogs/5-browser-workflows-you-didnt-know-you-could-automate.md",
+      "sha256": "ea50e8ddb3dc48707fa5d0d4ce8929dfcb54c9801b297d717112d9fa3dc357de"
+    },
+    {
+      "slug": "6-000-github-stars-and-why-we-open-sourced",
+      "path": "blogs/6-000-github-stars-and-why-we-open-sourced.md",
+      "sha256": "3f5fc627151fa2c64ae3caa2f69bf89ea8862b0dcbb854e52ca670c611b984f7"
+    },
+    {
+      "slug": "6-common-mistakes-in-browser-automation-and-how-to-avoid-them",
+      "path": "blogs/6-common-mistakes-in-browser-automation-and-how-to-avoid-them.md",
+      "sha256": "e26391234d6dc79c01fc3a7dcab7a4968dbe0745e91e32d7a9ed25397484c639"
+    },
+    {
+      "slug": "681eda2c6bc9770001747073",
+      "path": "blogs/681eda2c6bc9770001747073.md",
+      "sha256": "90f68739022662d2132470d420af3697fbe127d041d70740a126766fb585fd3d"
+    },
+    {
+      "slug": "681eda536bc977000174707b",
+      "path": "blogs/681eda536bc977000174707b.md",
+      "sha256": "f99a2d7dfd74073508e978c495ddce4473d6df5f8c7fd2a2b9888f4d6a8207e8"
+    },
+    {
+      "slug": "8-browser-workflows-with-skyvern",
+      "path": "blogs/8-browser-workflows-with-skyvern.md",
+      "sha256": "71a4b4fe6fb113d832e61ea6f1c7964abc7281765d056cb0cd696eeacd250406"
+    },
+    {
+      "slug": "9000-stars-and-a-thank-you",
+      "path": "blogs/9000-stars-and-a-thank-you.md",
+      "sha256": "4a99fcf5c12159de8523f635ff7b2ec28d8c2dba56f40af40cf7c56f18ebc642"
+    },
+    {
+      "slug": "a-major-update-credentialing-in-skyvern",
+      "path": "blogs/a-major-update-credentialing-in-skyvern.md",
+      "sha256": "a2deddaf6cbb464604710cc5db51961e5d689a9b01affa3b92213ca2a52af04b"
+    },
+    {
+      "slug": "agentic-process-automation-agents-orchestration-governance",
+      "path": "blogs/agentic-process-automation-agents-orchestration-governance.md",
+      "sha256": "23eadc37fd4372b1d50d0f4714f877bf8552a6892ac2c6b7b8200bbb899778fc"
+    },
+    {
+      "slug": "agentic-process-automation-explained",
+      "path": "blogs/agentic-process-automation-explained.md",
+      "sha256": "1220351c20c9ccece81d555c50521b31dec804aacafacddc2606721e8362af6f"
+    },
+    {
+      "slug": "agentic-process-automation-maturity-stages",
+      "path": "blogs/agentic-process-automation-maturity-stages.md",
+      "sha256": "128976701788bad5cedf0b210962f7613eaec06a4892092856b2279e55dd9949"
+    },
+    {
+      "slug": "agentic-process-automation-roi",
+      "path": "blogs/agentic-process-automation-roi.md",
+      "sha256": "092413e41504b1cae1c513a3e89efff02ec3736d2576cbf1f51ceafddd53821f"
+    },
+    {
+      "slug": "ai-rpa-guide-intelligent-browser-automation",
+      "path": "blogs/ai-rpa-guide-intelligent-browser-automation.md",
+      "sha256": "3e1a337bb29e73880897f78f26cf5df4102789da150f558e0a01ead18c211628"
+    },
+    {
+      "slug": "ai-web-agents-complete-guide-to-intelligent-browser-automation-november-2025",
+      "path": "blogs/ai-web-agents-complete-guide-to-intelligent-browser-automation-november-2025.md",
+      "sha256": "627bbed5db5c5fb1cc16c4ad4be5963a115074580f93a8a9b3f432128a44863e"
+    },
+    {
+      "slug": "airtop-reviews-pricing-alternatives",
+      "path": "blogs/airtop-reviews-pricing-alternatives.md",
+      "sha256": "cd184364f5c640d32e5eecfdbf4f22320a3198508557e8921a8337561d7e100a"
+    },
+    {
+      "slug": "airtop-vs-skyvern-portal-automation",
+      "path": "blogs/airtop-vs-skyvern-portal-automation.md",
+      "sha256": "575cb069c0effa9e66bef6b81ee5c33227fe2604b36ec611b7a34115740649fd"
+    },
+    {
+      "slug": "analytics-and-attribution-for-an-open-source-project-a-k-a-story-of-how-we-tracked-an-unexpected-burst-of-traffic",
+      "path": "blogs/analytics-and-attribution-for-an-open-source-project-a-k-a-story-of-how-we-tracked-an-unexpected-burst-of-traffic.md",
+      "sha256": "c0de94f218339ed82d5599f8f0add31b14468ac22fbea3232262f0324cc9325c"
+    },
+    {
+      "slug": "anchorbrowser-alternatives-pricing-reviews",
+      "path": "blogs/anchorbrowser-alternatives-pricing-reviews.md",
+      "sha256": "77a464c2cd993ff6361269e47e7c8e6e14fef62c423ec7491aab20812da67f79"
+    },
+    {
+      "slug": "anchorbrowser-vs-skyvern",
+      "path": "blogs/anchorbrowser-vs-skyvern.md",
+      "sha256": "6603cfffae9855e310b7c3682db5bae45569f89345a14faa7bac2ae4bdcd5a4b"
+    },
+    {
+      "slug": "and-how-to-start-applying-them-today",
+      "path": "blogs/and-how-to-start-applying-them-today.md",
+      "sha256": "a1952b617dc9112e4ea18588591ecae0031764a43922495aaacb0df6eba8833e"
+    },
+    {
+      "slug": "apa-control-plane-agentic-automation",
+      "path": "blogs/apa-control-plane-agentic-automation.md",
+      "sha256": "f1cabc599189f1e79f7ea05d2b4b54e8df81411683c91123d36e27e255636420"
+    },
+    {
+      "slug": "apa-enterprise-guide",
+      "path": "blogs/apa-enterprise-guide.md",
+      "sha256": "b10268dc180e7e889f40747ee365dca8d6f9f7adb722c84e509dffc0df187358"
+    },
+    {
+      "slug": "apa-vs-rpa-automation",
+      "path": "blogs/apa-vs-rpa-automation.md",
+      "sha256": "123dada222491ef190e2d901f61d96bd8a17c6ab181f1b3ba4836fa045c08115"
+    },
+    {
+      "slug": "api-less-system-automation-tools-legacy-enterprise",
+      "path": "blogs/api-less-system-automation-tools-legacy-enterprise.md",
+      "sha256": "9ba6c63127a40d2684a6fffa452eadb1621506e6b1f2b093135955666759c8a3"
+    },
+    {
+      "slug": "asking-ai-to-build-scrapers-should-be-easy-right",
+      "path": "blogs/asking-ai-to-build-scrapers-should-be-easy-right.md",
+      "sha256": "eb3c8ea6b220294b9c04abc8938cc4808c05516ec65e1e4bb4b2108849d4ebc0"
+    },
+    {
+      "slug": "authentication-automation-platforms-enterprise",
+      "path": "blogs/authentication-automation-platforms-enterprise.md",
+      "sha256": "d5f5c41ef299e138110bd37e9f79845a7c30ad4afb9da04390bbe4879bc5f501"
+    },
+    {
+      "slug": "automate-anything",
+      "path": "blogs/automate-anything.md",
+      "sha256": "eabf30982b6ef619c46ab1079b15a9f757212e1578cf9bba6cbe8c79c8a61042"
+    },
+    {
+      "slug": "automate-construction-permit-applications-inspection-forms",
+      "path": "blogs/automate-construction-permit-applications-inspection-forms.md",
+      "sha256": "024a34206939c3e1ebc2f645af3ccfc836c36ff0a03735cda3c82f683fc9debf"
+    },
+    {
+      "slug": "automate-construction-permit-applications",
+      "path": "blogs/automate-construction-permit-applications.md",
+      "sha256": "88d41e7452dd5f3a7a3406539b47838a815b5d759c898e38866758d1012d909f"
+    },
+    {
+      "slug": "automate-education-enrollment-student-portals",
+      "path": "blogs/automate-education-enrollment-student-portals.md",
+      "sha256": "e6a6471bc76f88836c9c3620258876af07feb8a0b43e599809a9fe01d7bda15a"
+    },
+    {
+      "slug": "automate-emr-ehr-data-extraction-healthcare",
+      "path": "blogs/automate-emr-ehr-data-extraction-healthcare.md",
+      "sha256": "6d36a72e240cdb594e276713d882a761319161a97ede2ffa068e0fadb947e9a7"
+    },
+    {
+      "slug": "automate-form-filling-with-skyvern-ai-browser-automation",
+      "path": "blogs/automate-form-filling-with-skyvern-ai-browser-automation.md",
+      "sha256": "9c0744e4a40b085828b2ecbefe850e9bd0911d3744fba3022af017d3ab475c1b"
+    },
+    {
+      "slug": "automate-grocery-price-comparison",
+      "path": "blogs/automate-grocery-price-comparison.md",
+      "sha256": "ee51098398c3155d1f922d46041e3f69a6c9299b52c282f26ae1983682254ecc"
+    },
+    {
+      "slug": "automate-healthcare-credentialing-medical-boards-caqh-nppes",
+      "path": "blogs/automate-healthcare-credentialing-medical-boards-caqh-nppes.md",
+      "sha256": "3735740ab2866b2a4967ec8cf8eec16d29b354afddba399123ee6bca5785813a"
+    },
+    {
+      "slug": "automate-healthcare-prior-authorization-insurance-portals",
+      "path": "blogs/automate-healthcare-prior-authorization-insurance-portals.md",
+      "sha256": "e6423e18312df38eb2d2cbf8b3e223fffd89904b1af0d4cdc0e610472ce23871"
+    },
+    {
+      "slug": "automate-immigration-visa-applications-government-portals",
+      "path": "blogs/automate-immigration-visa-applications-government-portals.md",
+      "sha256": "2b259590449e2140826ed6b8e09b1fd32304738a9e015597c9ac056231d00ee2"
+    },
+    {
+      "slug": "automate-insurance-carrier-portal-workflows",
+      "path": "blogs/automate-insurance-carrier-portal-workflows.md",
+      "sha256": "37ca0a4abf5d0451c61f1fda6b5be1822c296f37a289253be7316ba3dddf77e9"
+    },
+    {
+      "slug": "automate-kyc-kyb-verification-government-databases",
+      "path": "blogs/automate-kyc-kyb-verification-government-databases.md",
+      "sha256": "86b299377146b1ab76984d983cbc8bd8eb473fce2be9d36016f599c4cfcee1d5"
+    },
+    {
+      "slug": "automate-legal-court-filing-submissions-e-filing-portals",
+      "path": "blogs/automate-legal-court-filing-submissions-e-filing-portals.md",
+      "sha256": "66db2ef742b5dedce1077ab24f19d7dcece1fcd3e274a90377ae7949974edf50"
+    },
+    {
+      "slug": "automate-logistics-freight-broker-portal-interactions",
+      "path": "blogs/automate-logistics-freight-broker-portal-interactions.md",
+      "sha256": "5f13e350733df7ebb67af57d84ccd890f2956d8690c71d5bac0d94aa6d7cafa6"
+    },
+    {
+      "slug": "automate-partner-account-health-checks-at-scale",
+      "path": "blogs/automate-partner-account-health-checks-at-scale.md",
+      "sha256": "17a6cd2a2ff1246510a56b380e20730d51c2fcc4ce33f3c2b0d4f915699fd574"
+    },
+    {
+      "slug": "automate-public-records-retrieval",
+      "path": "blogs/automate-public-records-retrieval.md",
+      "sha256": "9d24c541326e2881d815d3e8e705c358fd52be3239bc952b3ee250cf228866c0"
+    },
+    {
+      "slug": "automate-regulatory-compliance-monitoring-government-websites",
+      "path": "blogs/automate-regulatory-compliance-monitoring-government-websites.md",
+      "sha256": "3091d93e8a5c05e788a506b1ca8334e4f6113f23cc783b5af9cc80a8135b90ee"
+    },
+    {
+      "slug": "automate-security-questionnaire-responses-trust-portals-2",
+      "path": "blogs/automate-security-questionnaire-responses-trust-portals-2.md",
+      "sha256": "c83b8ae7d29b93f683200995a9c78c63cf9c7f27ce7334f0d80e9f117bd11210"
+    },
+    {
+      "slug": "automate-security-questionnaire-responses-trust-portals",
+      "path": "blogs/automate-security-questionnaire-responses-trust-portals.md",
+      "sha256": "dd2e5782b4176ecbc47a911a41e3386fa131307f358ad99a43673a52d9ff51b3"
+    },
+    {
+      "slug": "automate-state-tax-filings-withholding-portals",
+      "path": "blogs/automate-state-tax-filings-withholding-portals.md",
+      "sha256": "4e1e43cbccdba8722ccdd39b1b86715b2e8218ed20717d368de5f94e35b0f79f"
+    },
+    {
+      "slug": "automate-travel-booking-browser-agents",
+      "path": "blogs/automate-travel-booking-browser-agents.md",
+      "sha256": "71e15b322c74dd2f83e016112c3fc702137706e498faee42b9ee4d6df32e5763"
+    },
+    {
+      "slug": "automate-utility-billing-data-extraction",
+      "path": "blogs/automate-utility-billing-data-extraction.md",
+      "sha256": "7d88fa2789a5c9141b60c2e090da86d2a6aa5dd6abd3a55247c5cc7651808abf"
+    },
+    {
+      "slug": "automated-ui-testing-tools-guide",
+      "path": "blogs/automated-ui-testing-tools-guide.md",
+      "sha256": "b8f67eecfcce3509664b8b7e4fc4ebaec03bc8cdeace3222fe690f8e137e0a37"
+    },
+    {
+      "slug": "automating-bank-statement-downloads-financial-reconciliation",
+      "path": "blogs/automating-bank-statement-downloads-financial-reconciliation.md",
+      "sha256": "ac54f969587011d91958deff02ae277b477ee42f465783a9b98e474506c490fb"
+    },
+    {
+      "slug": "automating-ecommerce-checkout-testing-across-geographies",
+      "path": "blogs/automating-ecommerce-checkout-testing-across-geographies.md",
+      "sha256": "685f9372937fa021a8c54d8b230dea1074cba66ee44413a9b052312c8f47407e"
+    },
+    {
+      "slug": "automating-employee-onboarding-benefits-enrollment",
+      "path": "blogs/automating-employee-onboarding-benefits-enrollment.md",
+      "sha256": "e99e882b049116a81776ba9540256729d7f47a1d65b068622c1cc38c0769e7f3"
+    },
+    {
+      "slug": "automating-healthcare-claims-eob-processing-billing",
+      "path": "blogs/automating-healthcare-claims-eob-processing-billing.md",
+      "sha256": "19bca6108c75fb6ef1f7223ef9e8cf1beb5bbba1fc181c4e0c47f1c02d2c493f"
+    },
+    {
+      "slug": "automating-healthcare-insurance-eligibility-verification",
+      "path": "blogs/automating-healthcare-insurance-eligibility-verification.md",
+      "sha256": "d98e3fe8c186d11a9d05b533db0a50cdac90d840c5c10de9a2a8b5d4b58b654b"
+    },
+    {
+      "slug": "automating-i9-verification-background-checks-government-portals",
+      "path": "blogs/automating-i9-verification-background-checks-government-portals.md",
+      "sha256": "cc5b5619d5e76becf5f9d85092b9c272c3e0aa086577cfa450027fa2ec1d30a6"
+    },
+    {
+      "slug": "automating-mortgage-lending-workflows-lender-portals",
+      "path": "blogs/automating-mortgage-lending-workflows-lender-portals.md",
+      "sha256": "e89721315c74e339460c7bef24ca3596b906ee28934c8a57b78541fdd2f97728"
+    },
+    {
+      "slug": "automating-payroll-registration-50-states",
+      "path": "blogs/automating-payroll-registration-50-states.md",
+      "sha256": "c4876fdcedeff60155a414bc25a0d6f8228bb29bb42e1cb3e99a51096f34cb26"
+    },
+    {
+      "slug": "automating-pharmacy-invoice-downloads-from-pbm-and-wholesaler-portals-march-2026",
+      "path": "blogs/automating-pharmacy-invoice-downloads-from-pbm-and-wholesaler-portals-march-2026.md",
+      "sha256": "d35989e668dcc8ef772042896854f4d1046dd89a1140859ef8c4657dca31ff99"
+    },
+    {
+      "slug": "automating-pharmacy-invoice-downloads-pbm-wholesaler-portals",
+      "path": "blogs/automating-pharmacy-invoice-downloads-pbm-wholesaler-portals.md",
+      "sha256": "b95a6997f6e314249067e86673f0ef72a0086d7faf19a6a992c0d2bf287a58a9"
+    },
+    {
+      "slug": "automating-probate-estate-filing-submissions",
+      "path": "blogs/automating-probate-estate-filing-submissions.md",
+      "sha256": "e21ff94554a2e749a6b1bad8d131206f593f1c7777e2efd133687d458454e274"
+    },
+    {
+      "slug": "automating-rbt-bcba-credential-verification-behavioral-health-2",
+      "path": "blogs/automating-rbt-bcba-credential-verification-behavioral-health-2.md",
+      "sha256": "807a4450da48da5a0948d0e7358256e3f80398d4a5d8e89641a27ddfdb158641"
+    },
+    {
+      "slug": "automating-rbt-bcba-credential-verification-behavioral-health",
+      "path": "blogs/automating-rbt-bcba-credential-verification-behavioral-health.md",
+      "sha256": "bbb1724a854dda3245b15202688b26818b944ebeb45d1508b237d3c3b68ac4b9"
+    },
+    {
+      "slug": "automation-anywhere-alternatives-pricing-reviews",
+      "path": "blogs/automation-anywhere-alternatives-pricing-reviews.md",
+      "sha256": "4cfeb330dd8bcfb5d61caeab444b41f62ef93da89d5ee4df0d09cc6bea3e353a"
+    },
+    {
+      "slug": "automation-anywhere-vs-skyvern",
+      "path": "blogs/automation-anywhere-vs-skyvern.md",
+      "sha256": "b2f995bbf34bc5e5cc97b54927362446e7d642dbab1572f04cf1841d7c11f98c"
+    },
+    {
+      "slug": "axiom-reviews-pricing-alternatives",
+      "path": "blogs/axiom-reviews-pricing-alternatives.md",
+      "sha256": "749e25c0de6d1f7e1e8c74b62dc3b8fee27dda6ffd42f193c95ec7344086bafe"
+    },
+    {
+      "slug": "axiom-vs-skyvern",
+      "path": "blogs/axiom-vs-skyvern.md",
+      "sha256": "872d88767198322c33748f11cfb0a6e01b3fc4f82c855b3cb54362abb3e5f146"
+    },
+    {
+      "slug": "best-2fa-browser-automation-tools-for-enterprise-workflows-november-2025",
+      "path": "blogs/best-2fa-browser-automation-tools-for-enterprise-workflows-november-2025.md",
+      "sha256": "a52476dacf892006ec2d8539adc3efb9e03290356bcb19eec2f9f2e048c13bb9"
+    },
+    {
+      "slug": "best-ai-browser-automation-tools-for-e-commerce-in-2025",
+      "path": "blogs/best-ai-browser-automation-tools-for-e-commerce-in-2025.md",
+      "sha256": "aa0947a79dc0db3eb888dbb730d0c0af4aa7ea8b4caf388f6fb7531d193bd553"
+    },
+    {
+      "slug": "best-ai-native-alternative-uipath",
+      "path": "blogs/best-ai-native-alternative-uipath.md",
+      "sha256": "d6f3bee77cbfa8fe34f4f06631e01855b4b620e71db1154eaf7e76f0ba357e6a"
+    },
+    {
+      "slug": "best-ai-powered-form-filling-tools-for-enterprise-workflows-november-2025",
+      "path": "blogs/best-ai-powered-form-filling-tools-for-enterprise-workflows-november-2025.md",
+      "sha256": "3b44e83d566f353bf168a1de48c1578b4370c95087fc28ce973edc100511f228"
+    },
+    {
+      "slug": "best-ai-rpa-tools-business-automation",
+      "path": "blogs/best-ai-rpa-tools-business-automation.md",
+      "sha256": "349cd5d8cb386e6144e72c896e11441016a6695580ef3ce6f09e949a2bb49e4c"
+    },
+    {
+      "slug": "best-ai-rpa-tools-invoice-processing-document-automation",
+      "path": "blogs/best-ai-rpa-tools-invoice-processing-document-automation.md",
+      "sha256": "826d3b1272ace953eed4088efb355f5763d47e9d0365520ec9301f2ee98f3fb8"
+    },
+    {
+      "slug": "best-anti-bot-detection-bypass-tools-enterprise-automation",
+      "path": "blogs/best-anti-bot-detection-bypass-tools-enterprise-automation.md",
+      "sha256": "87ee29b63549fde8ca393ab08fae15d7567810bca3561832a2e32c564818817e"
+    },
+    {
+      "slug": "best-explainable-ai-automation-tools-compliance-teams",
+      "path": "blogs/best-explainable-ai-automation-tools-compliance-teams.md",
+      "sha256": "44fc2cefedb5581fb8c6343e324b0b15e993aa58134c614fdd024f5f14e21ed9"
+    },
+    {
+      "slug": "best-free-open-source-browser-automation-tools-in-2025",
+      "path": "blogs/best-free-open-source-browser-automation-tools-in-2025.md",
+      "sha256": "5dc70e24f9c27cc15edc1aba6c779420e8c98469f38ac4da79f158c9fcbc4068"
+    },
+    {
+      "slug": "best-free-open-source-browser-automation-tools-in",
+      "path": "blogs/best-free-open-source-browser-automation-tools-in.md",
+      "sha256": "9491757710cf6f5c3790eda74c85ac25ec9541da6c40fb4e039504400f48d5bc"
+    },
+    {
+      "slug": "best-intelligent-process-automation-tools",
+      "path": "blogs/best-intelligent-process-automation-tools.md",
+      "sha256": "dc639d54a70f53a725ab4fed57474ec93377deefa60160525b5e33a73d451523"
+    },
+    {
+      "slug": "best-multi-website-automation-platforms",
+      "path": "blogs/best-multi-website-automation-platforms.md",
+      "sha256": "ba7164a7a23a06ce95c23037085a3c999146ddda8a6a21d0bcf5331e6cb88d0c"
+    },
+    {
+      "slug": "best-open-source-web-scraping-libraries-in-2025",
+      "path": "blogs/best-open-source-web-scraping-libraries-in-2025.md",
+      "sha256": "a2f78c0a482616ae472ce584bf0663817b1bb8088fe6b5d0acbb05343ac5420b"
+    },
+    {
+      "slug": "best-practices-for-web-scraping-without-getting-banned",
+      "path": "blogs/best-practices-for-web-scraping-without-getting-banned.md",
+      "sha256": "ab1ea42fc57868e23d518586314fcedbbe544808c706febf9fd94b913f4aaa0f"
+    },
+    {
+      "slug": "best-proxy-integrated-automation-platforms-for-global-testing-november-2025",
+      "path": "blogs/best-proxy-integrated-automation-platforms-for-global-testing-november-2025.md",
+      "sha256": "795d13c64602fc43e2e0a4f1d36bf4056baa20bb2565c739dcc8689323a59eef"
+    },
+    {
+      "slug": "best-real-time-debugging-browser-automation-platforms",
+      "path": "blogs/best-real-time-debugging-browser-automation-platforms.md",
+      "sha256": "2750ebcef6fb7ebf80d7a25c371f35474117f643b3bf803718533cfb56a68cdb"
+    },
+    {
+      "slug": "best-rpa-software-complete-guide-tools-compared",
+      "path": "blogs/best-rpa-software-complete-guide-tools-compared.md",
+      "sha256": "2feb9be6afa8ffa882d2fd156f5496e64c342daefa3a724b4ef0071767930b6d"
+    },
+    {
+      "slug": "best-schema-based-data-extraction-tools",
+      "path": "blogs/best-schema-based-data-extraction-tools.md",
+      "sha256": "51ddc73f03addc85af947965bee87d8e1376fb64666042152931b200b3b7192c"
+    },
+    {
+      "slug": "best-way-to-bypass-captcha-for-ai-browser-automation-september-2025",
+      "path": "blogs/best-way-to-bypass-captcha-for-ai-browser-automation-september-2025.md",
+      "sha256": "2e8e12e609bdb999277b7f5b5ae393cc867ad9c654310dda2c29a05d3e23d7d2"
+    },
+    {
+      "slug": "best-web-automation-tools",
+      "path": "blogs/best-web-automation-tools.md",
+      "sha256": "2643b0558e2dc083493da90c7503536810ff750251146c7c273b53b01e338ff2"
+    },
+    {
+      "slug": "best-web-scraping-tools",
+      "path": "blogs/best-web-scraping-tools.md",
+      "sha256": "1403b3d4773c46751d20411b56521ce6bfd02b8ed4f427ef0a7b710d04ae005d"
+    },
+    {
+      "slug": "browse-ai-reviews-pricing-alternatives",
+      "path": "blogs/browse-ai-reviews-pricing-alternatives.md",
+      "sha256": "26c29925137afdb1d70a8931702612d1ec68fd26f1b1e9094e4306bfd58b11bb"
+    },
+    {
+      "slug": "browse-ai-vs-skyvern",
+      "path": "blogs/browse-ai-vs-skyvern.md",
+      "sha256": "6920c0960826d25e0dd58d9ebe41495cb04d2677f356c1d73801b6721147bd8e"
+    },
+    {
+      "slug": "browser-automation-mcp-servers-guide",
+      "path": "blogs/browser-automation-mcp-servers-guide.md",
+      "sha256": "cc856d06c9b978ea7a3595370f2d57024dba05e7ad5e5270f24e3cf7bd0e340f"
+    },
+    {
+      "slug": "browser-automation-security-best-practices",
+      "path": "blogs/browser-automation-security-best-practices.md",
+      "sha256": "7cc74098e278ba26e6f266ce79a6d02dadd53a092ea89484b20ac6a12f7c03da"
+    },
+    {
+      "slug": "browser-automation-session-management",
+      "path": "blogs/browser-automation-session-management.md",
+      "sha256": "4812ec76f29d9325c2ffa8a0cf89c32a8b1cba67e2065058f110b68de5b82628"
+    },
+    {
+      "slug": "browser-automation-what-works-what-doesnt-and-why-it-matters",
+      "path": "blogs/browser-automation-what-works-what-doesnt-and-why-it-matters.md",
+      "sha256": "4755a8ea465592365abd0d3ce32d20a14659d3e9ca68221ffab8686757f847c1"
+    },
+    {
+      "slug": "browser-based-rpa-materials-procurement-workflows",
+      "path": "blogs/browser-based-rpa-materials-procurement-workflows.md",
+      "sha256": "dfdf8162657621e71e2c747d0327d72f4cea0bf5e910cb2637679e4fb8c396c6"
+    },
+    {
+      "slug": "browser-mcp-explained",
+      "path": "blogs/browser-mcp-explained.md",
+      "sha256": "a394f452662748bace0965693d1c74adde898aa81acded65d17bd661328fd796"
+    },
+    {
+      "slug": "browser-use-reviews-and-alternatives-in-2025-copy",
+      "path": "blogs/browser-use-reviews-and-alternatives-in-2025-copy.md",
+      "sha256": "4c2d552d6e9b95bd77e3bf677e395ed65256acf576065c9c238758fab59386e8"
+    },
+    {
+      "slug": "browser-use-reviews-and-alternatives-in-2025",
+      "path": "blogs/browser-use-reviews-and-alternatives-in-2025.md",
+      "sha256": "2d91da5576f48ca462d99cad9c43ba50a7e4f4f7f846a58ac6048b364d1da5af"
+    },
+    {
+      "slug": "browser-use-vs-airtop-which-is-better",
+      "path": "blogs/browser-use-vs-airtop-which-is-better.md",
+      "sha256": "9d1b4c0a756617cbf13e8df3bf6ab01e138ad7efab97dc0600ad9621a8913b76"
+    },
+    {
+      "slug": "browser-use-vs-automation-anywhere",
+      "path": "blogs/browser-use-vs-automation-anywhere.md",
+      "sha256": "ff75dd137f28be400dde517e13cdea65d68b3bd86616f64dc5201fe08800ae3b"
+    },
+    {
+      "slug": "browser-use-vs-autotab-which-ai-automation-tool-is-better",
+      "path": "blogs/browser-use-vs-autotab-which-ai-automation-tool-is-better.md",
+      "sha256": "2cfe17dcd9e697b6884754774a7c0aca60b8925aa1d72f0f60a208ee69caea79"
+    },
+    {
+      "slug": "browser-use-vs-axiom-which-browser-automation-tool-wins-in-december-2025",
+      "path": "blogs/browser-use-vs-axiom-which-browser-automation-tool-wins-in-december-2025.md",
+      "sha256": "7aae323aaeee8f5add571852066cbe3c974b35c95374e7a6d067fc3cc3362d5f"
+    },
+    {
+      "slug": "browser-use-vs-browse-ai",
+      "path": "blogs/browser-use-vs-browse-ai.md",
+      "sha256": "8e3352e60706aad8a30c24fc876a4b89a6cdec40d6908c0e147e8ee33b317586"
+    },
+    {
+      "slug": "browser-use-vs-browserbase-comparison-reviews-and-alternatives",
+      "path": "blogs/browser-use-vs-browserbase-comparison-reviews-and-alternatives.md",
+      "sha256": "5154e720a11afae9706c223ce6968a5d92104c2009250a28914a719e3063dbb9"
+    },
+    {
+      "slug": "browser-use-vs-firecrawl-vs-skyvern-which-is-better-december-2025",
+      "path": "blogs/browser-use-vs-firecrawl-vs-skyvern-which-is-better-december-2025.md",
+      "sha256": "de163ed2b60350a962e798090073d3123b256cc101259bd1cd19ea8995e2bddb"
+    },
+    {
+      "slug": "browser-use-vs-hyperbrowser-ai",
+      "path": "blogs/browser-use-vs-hyperbrowser-ai.md",
+      "sha256": "ef377c54106002c2bfa02ea9a6e615db1414618357281f6464c20ede1d99e62e"
+    },
+    {
+      "slug": "browser-use-vs-kernel-comparison",
+      "path": "blogs/browser-use-vs-kernel-comparison.md",
+      "sha256": "02ec45a9f3c9e250fb866c3f4c6692bffa87fee70bfb9c970009bef9655997fb"
+    },
+    {
+      "slug": "browser-use-vs-stagehand-which-is-better",
+      "path": "blogs/browser-use-vs-stagehand-which-is-better.md",
+      "sha256": "5fd19ecb22d9c0a10c9685f91d27a6bd83ebc5b16b4076df4aa143c2c4ae7b3b"
+    },
+    {
+      "slug": "browser-use-vs-uipath-which-is-better",
+      "path": "blogs/browser-use-vs-uipath-which-is-better.md",
+      "sha256": "25747433d1f1cde2b3bf94d2ffb49fbf8b2f7b3146283e261b18608431a6c047"
+    },
+    {
+      "slug": "browserbase-vs-airtop-which-is-better",
+      "path": "blogs/browserbase-vs-airtop-which-is-better.md",
+      "sha256": "5bb88f2718ec4d6bbfa307a43766e96e0cf53bf85e4401ddb8944f342c7a3aad"
+    },
+    {
+      "slug": "browserbase-vs-automation-anywhere",
+      "path": "blogs/browserbase-vs-automation-anywhere.md",
+      "sha256": "b867403c691f0c5f8cf617263d94652cafc5e9c489aaef2b6f1849ba127562bb"
+    },
+    {
+      "slug": "browserbase-vs-autotab-which-browser-automation-tool-works-better",
+      "path": "blogs/browserbase-vs-autotab-which-browser-automation-tool-works-better.md",
+      "sha256": "b80663d832e6c0ab8142d9538da82c42ce0cf5a92f1bc9d530c341f77764cd32"
+    },
+    {
+      "slug": "browserbase-vs-axiom-which-browser-automation-tool-fits-your-needs-december-2025",
+      "path": "blogs/browserbase-vs-axiom-which-browser-automation-tool-fits-your-needs-december-2025.md",
+      "sha256": "e697b677781db8a352b17430b459af9fba752560993112345cb24eb43459fdcd"
+    },
+    {
+      "slug": "browserbase-vs-browse-ai-comparison",
+      "path": "blogs/browserbase-vs-browse-ai-comparison.md",
+      "sha256": "777f2de0a7abc948a2267094d019e2ca3246039db52e7a800727a0b2206c42e3"
+    },
+    {
+      "slug": "browserbase-vs-firecrawl-vs-skyvern-which-is-better-for-workflow-automation-december-2025",
+      "path": "blogs/browserbase-vs-firecrawl-vs-skyvern-which-is-better-for-workflow-automation-december-2025.md",
+      "sha256": "7b560b99a253cbe81d9d5adecd6d4da67b3b97a9597407414f1aebce0d030d1c"
+    },
+    {
+      "slug": "browserbase-vs-hyperbrowser-ai",
+      "path": "blogs/browserbase-vs-hyperbrowser-ai.md",
+      "sha256": "b920e44cddd7a4a50aca950efa6fb398cea8d5ac86704f431070aa22245af5ec"
+    },
+    {
+      "slug": "browserbase-vs-kernel-which-is-better",
+      "path": "blogs/browserbase-vs-kernel-which-is-better.md",
+      "sha256": "a5cbaaa95fba08b0434379cdd58906f5b8f8e8c0e977dc7e1d3e77d3255f4d02"
+    },
+    {
+      "slug": "browserbase-vs-skyvern-browser-automation-2025",
+      "path": "blogs/browserbase-vs-skyvern-browser-automation-2025.md",
+      "sha256": "0509c34297066a3fad3e9d874f939d4b6252739c1693a58fac1f4a87e87673fa"
+    },
+    {
+      "slug": "browserbase-vs-stagehand-which-is-better",
+      "path": "blogs/browserbase-vs-stagehand-which-is-better.md",
+      "sha256": "4f7920a465c0b2a0a229d201973cc010295f88d48b3d484160171e902f27269d"
+    },
+    {
+      "slug": "browserbase-vs-uipath-which-is-better",
+      "path": "blogs/browserbase-vs-uipath-which-is-better.md",
+      "sha256": "d658b27f6041721cf6af0769a9f892ad0957662fa5f7409023bce1588cdea178"
+    },
+    {
+      "slug": "build-your-ai-business-on-skyvern",
+      "path": "blogs/build-your-ai-business-on-skyvern.md",
+      "sha256": "822dc9dcbe3615c74818992d4315b887750a9725275c0d2efdff9e08848bd241"
+    },
+    {
+      "slug": "build-your-ai-job-saas-on-skyvern",
+      "path": "blogs/build-your-ai-job-saas-on-skyvern.md",
+      "sha256": "a3245f235f88692d955ae50d4b509e428ad85b4788512f87faf0689884bdadf0"
+    },
+    {
+      "slug": "build-your-ai-saas-with-skyvern",
+      "path": "blogs/build-your-ai-saas-with-skyvern.md",
+      "sha256": "74a1953b2d6f0e136845a3712ad69e04bf7963259ee2daee122f89cd3ae6a667"
+    },
+    {
+      "slug": "celebrat",
+      "path": "blogs/celebrat.md",
+      "sha256": "4e7f55a6160105e841933f035f531fb1b952822a3580e9a7d74339968af413c9"
+    },
+    {
+      "slug": "changelog-1-july-5",
+      "path": "blogs/changelog-1-july-5.md",
+      "sha256": "944c46088c15c9a5caf30dbb9c4f29da49d1a65544ec193d87aa37a7c6a087a9"
+    },
+    {
+      "slug": "changelog-date-prompt-compression",
+      "path": "blogs/changelog-date-prompt-compression.md",
+      "sha256": "ab32a2a1a27a5665f5689172f32e77ebe01cfe65a07a1966dfb3ba2386a5f140"
+    },
+    {
+      "slug": "changelog-december-2",
+      "path": "blogs/changelog-december-2.md",
+      "sha256": "c32152511d6ff6f108d2daae6dd3b12c43860426ba5ed0d2e61a42d993384ccb"
+    },
+    {
+      "slug": "changelog-january-2025-hot-off-the-press",
+      "path": "blogs/changelog-january-2025-hot-off-the-press.md",
+      "sha256": "8caa247bf62f02e6a4eebee092d0c124f610ae5d8b2a1a78c225dc4978e920e8"
+    },
+    {
+      "slug": "changelog-july-23-gpt-4o-mini-shadow-dom-csv-support-and-more",
+      "path": "blogs/changelog-july-23-gpt-4o-mini-shadow-dom-csv-support-and-more.md",
+      "sha256": "fc7914c2bb3414a9454a227778a32ccd9545bb5fb9e5dc06dcd5f7d69ee342a3"
+    },
+    {
+      "slug": "changelog-november-p2-quality-of-life",
+      "path": "blogs/changelog-november-p2-quality-of-life.md",
+      "sha256": "d60560d0ae9acda21271ffc5bb11b50a4510429a85cb1d2e823aa9058f8b691c"
+    },
+    {
+      "slug": "changelog-november-part-1-site-wide-makeover",
+      "path": "blogs/changelog-november-part-1-site-wide-makeover.md",
+      "sha256": "1448baba3139d32d8641d9c754fa8d419ed03dc2902dc75f2845a7e77451c59c"
+    },
+    {
+      "slug": "changelog-october-pdf-upload-2fa-magic-links-typescript-sdk",
+      "path": "blogs/changelog-october-pdf-upload-2fa-magic-links-typescript-sdk.md",
+      "sha256": "1720518b7b3d0ed6de52db823527bcc54cad3f5091b2739d9f3ea9d41b78c291"
+    },
+    {
+      "slug": "changelog-september-4-new-pricing-page-faster-live-streams-and-more",
+      "path": "blogs/changelog-september-4-new-pricing-page-faster-live-streams-and-more.md",
+      "sha256": "3d337243d3a43751e3ccb12bb7ee66c48fb5d731b1f5d59e8530330524e21a40"
+    },
+    {
+      "slug": "cloudcruise-reviews-pricing-alternatives",
+      "path": "blogs/cloudcruise-reviews-pricing-alternatives.md",
+      "sha256": "51a514e231a27d709483cdb04ba3806c507191cfd1dd2f15ba2684e702eb49c2"
+    },
+    {
+      "slug": "cloudcruise-vs-skyvern-review",
+      "path": "blogs/cloudcruise-vs-skyvern-review.md",
+      "sha256": "1d90c3fa2014d2dd593484e565b264eeb0adfc94cbbed3d3adf8a8753db08b9b"
+    },
+    {
+      "slug": "company-operating-principles",
+      "path": "blogs/company-operating-principles.md",
+      "sha256": "8b989f50bf67c7b650c196e69b06ac2c638f564d3179d7e340954ae6e033b9e9"
+    },
+    {
+      "slug": "complete-puppeteer-scraping-guide-best-practices-for-september-2025",
+      "path": "blogs/complete-puppeteer-scraping-guide-best-practices-for-september-2025.md",
+      "sha256": "c23928bfcd9d83194f7658ccf71f591fc4f3ab4291e25e7fca167cb1b39d0171"
+    },
+    {
+      "slug": "cross-website-workflow-automation-procurement",
+      "path": "blogs/cross-website-workflow-automation-procurement.md",
+      "sha256": "71cfee8a07351b19a0c801461aabd26dd8354f7128e9b0f247fe6d1818401a2e"
+    },
+    {
+      "slug": "director-reviews-pricing-alternatives",
+      "path": "blogs/director-reviews-pricing-alternatives.md",
+      "sha256": "f017e5ca161cb2f0641b868da5fed2c868e0486caad91ddd641d03dacb4151fe"
+    },
+    {
+      "slug": "director-vs-skyvern-browser-automation",
+      "path": "blogs/director-vs-skyvern-browser-automation.md",
+      "sha256": "7082b739d215d30ba4ebaa3444ffdf91baaaf0578fbc2061288f45a852de1977"
+    },
+    {
+      "slug": "error-handling-in-browser-automation",
+      "path": "blogs/error-handling-in-browser-automation.md",
+      "sha256": "c72214c87fff917c78608a105fc8489a8fffc01503871251cbaa3cb4fb81be01"
+    },
+    {
+      "slug": "ever-had-a-software-project-complete-ahead-of-schedule",
+      "path": "blogs/ever-had-a-software-project-complete-ahead-of-schedule.md",
+      "sha256": "2c2ca7142d1f77c8df491fb02ba2251f92b75830655f986abd6bea7a68a80687"
+    },
+    {
+      "slug": "feature-gaps-and-roadmap-planning",
+      "path": "blogs/feature-gaps-and-roadmap-planning.md",
+      "sha256": "daed02b595d60ce8da5d7f3d4ed75dc38ba5e186c1aec4b9e8e6df43007d468f"
+    },
+    {
+      "slug": "file-download-automation-cloud-storage",
+      "path": "blogs/file-download-automation-cloud-storage.md",
+      "sha256": "27b92ce0b09acd57d0bcba22d89995ab8a43ea77fd09570b930b0aed5a636ffd"
+    },
+    {
+      "slug": "firecrawl-reviews-pricing-alternatives",
+      "path": "blogs/firecrawl-reviews-pricing-alternatives.md",
+      "sha256": "ca8c70699ca5d72cc3c0f3bd40d0d6b6bf50fe5cbf55c8384b85af6edfc7f49a"
+    },
+    {
+      "slug": "firecrawl-vs-skyvern-breakdown",
+      "path": "blogs/firecrawl-vs-skyvern-breakdown.md",
+      "sha256": "40b71b08523614a1abba72670c6242236d196709e7490b7caa5a0dd8b0ac5a50"
+    },
+    {
+      "slug": "geographic-proxy-automation-platforms",
+      "path": "blogs/geographic-proxy-automation-platforms.md",
+      "sha256": "9cef3b89c36c8f6b8f0422b2d18408382640e1f44a7d93a4cef9a1a206cb71f3"
+    },
+    {
+      "slug": "getting-claude-to-qa-its-own-work",
+      "path": "blogs/getting-claude-to-qa-its-own-work.md",
+      "sha256": "b6fbb99d4f57a94923bb8e40008da095059ae722e740d412e18267d76837f330"
+    },
+    {
+      "slug": "getting-started-with-skyvern-what-you-need-to-know",
+      "path": "blogs/getting-started-with-skyvern-what-you-need-to-know.md",
+      "sha256": "bb6c76c3c228d009cf9adbb29b3fa5cfd213121bfb8afde7e080e7aa85b9a31d"
+    },
+    {
+      "slug": "gpt-5-in-skyvern-day-0-support",
+      "path": "blogs/gpt-5-in-skyvern-day-0-support.md",
+      "sha256": "b67812d92e27e6b1fd23af1a265f177d28ac20400195a1c12308fd3a2add91f0"
+    },
+    {
+      "slug": "high-conviction-bet-on-open-sourcing-skyvern",
+      "path": "blogs/high-conviction-bet-on-open-sourcing-skyvern.md",
+      "sha256": "345666f9a7e4c0b24fb0dd2d93bb6df92da5b76c20517a68d76d3703c58d152a"
+    },
+    {
+      "slug": "hipaa-compliance",
+      "path": "blogs/hipaa-compliance.md",
+      "sha256": "55e8300e1f6fb7179980a096c6c1e5a328af473a3231c35c5f402cfa8fb7240a"
+    },
+    {
+      "slug": "how-ai-agents-navigate-old-websites",
+      "path": "blogs/how-ai-agents-navigate-old-websites.md",
+      "sha256": "bd59d7d60c9713234d0b9f9083a21c35b1ee7442b812b79733b3dddfa523851d"
+    },
+    {
+      "slug": "how-has-yc-transformed-our-trajectory",
+      "path": "blogs/how-has-yc-transformed-our-trajectory.md",
+      "sha256": "cfa395c522578aa596967347b4485f2cbc287903e4a475768a646ed4180c3ebb"
+    },
+    {
+      "slug": "how-much-does-enterprise-browser-automation-cost-in-2025",
+      "path": "blogs/how-much-does-enterprise-browser-automation-cost-in-2025.md",
+      "sha256": "e940e202fcca268feef36c0d42c895cf7c762c2a9068d7f62d85e3212a3465f5"
+    },
+    {
+      "slug": "how-skyvern-agents-think-and-plan-tasks",
+      "path": "blogs/how-skyvern-agents-think-and-plan-tasks.md",
+      "sha256": "145aaf4aa5fae19f21d32f33272e9ba7c6541100d0cd334281ecfd03d9dbec69"
+    },
+    {
+      "slug": "how-skyvern-handles-authentication",
+      "path": "blogs/how-skyvern-handles-authentication.md",
+      "sha256": "9611dd8405e25d7f0a9b46e74c13fed90666553c8b66b5895ad71ebdc80dbf2e"
+    },
+    {
+      "slug": "how-skyvern-reads-and-understands-the-web",
+      "path": "blogs/how-skyvern-reads-and-understands-the-web.md",
+      "sha256": "606fc9201ca9d33980214064365e218bd9d373ee82fd5dd52148046ce98506c0"
+    },
+    {
+      "slug": "how-to-automate-downloading-invoices-september-2025",
+      "path": "blogs/how-to-automate-downloading-invoices-september-2025.md",
+      "sha256": "a4638a02a94ea1f521efa10524cd77d7081027a974adc80bdc2349beb658a822"
+    },
+    {
+      "slug": "how-to-automate-government-form-submissions-with-browser-automation",
+      "path": "blogs/how-to-automate-government-form-submissions-with-browser-automation.md",
+      "sha256": "a7279ede9de327c55eb276862ef8e01c03a22847d16387a4a63674c66766d1ae"
+    },
+    {
+      "slug": "how-to-automate-provider-directory-profile-updates",
+      "path": "blogs/how-to-automate-provider-directory-profile-updates.md",
+      "sha256": "6731299fcd5a57f68bf3686276f64059b9051726a222f289e5973b0b61e6469f"
+    },
+    {
+      "slug": "how-to-automate-purchasing-september-2025",
+      "path": "blogs/how-to-automate-purchasing-september-2025.md",
+      "sha256": "07cb9f31b1e482cbf2fbc9680bb9bd91ee29ce1021a8cbebd5a8355c6f134eb6"
+    },
+    {
+      "slug": "how-to-manage-by-ben-horowitz",
+      "path": "blogs/how-to-manage-by-ben-horowitz.md",
+      "sha256": "f95000e2500b77385a80f61071d1efd68734c0f27aecac0e6ae5092e10270e8d"
+    },
+    {
+      "slug": "how-we-accidentally-burned-through-200gb-of-proxy-bandwidth-in-6-hours",
+      "path": "blogs/how-we-accidentally-burned-through-200gb-of-proxy-bandwidth-in-6-hours.md",
+      "sha256": "47b735c5bc654056aff27add01ac92aa98210c4154b55887edb59e35e4c95e4e"
+    },
+    {
+      "slug": "how-we-cut-token-count-by-11-and-boosted-success-rate-by-3-9-by-using-html-instead-of-json-in-our-llm-calls",
+      "path": "blogs/how-we-cut-token-count-by-11-and-boosted-success-rate-by-3-9-by-using-html-instead-of-json-in-our-llm-calls.md",
+      "sha256": "f012bd8309c390bfeba751a7078047c596d494c5c4cad1d74628ebff7b372e15"
+    },
+    {
+      "slug": "how-we-got-to-10-000-stars-why-you-should-be-launching-as-often-as-you-can",
+      "path": "blogs/how-we-got-to-10-000-stars-why-you-should-be-launching-as-often-as-you-can.md",
+      "sha256": "cadfdd78b20699b176ae826b95c0c7a49b7d2978b8885dadb7bec00cadb94ffc"
+    },
+    {
+      "slug": "html-vs-json-llm-tokens-cost-reduction-success-rate",
+      "path": "blogs/html-vs-json-llm-tokens-cost-reduction-success-rate.md",
+      "sha256": "9a643358716e89391c836352984bbd3efdda1764b640dc2b786bcbb471a26fae"
+    },
+    {
+      "slug": "hyperbrowser-ai-reviews-pricing-alternatives",
+      "path": "blogs/hyperbrowser-ai-reviews-pricing-alternatives.md",
+      "sha256": "a81a56e134157cde4175ce35c6d914c5ed106e7a93326912aa657cbb5120c104"
+    },
+    {
+      "slug": "hyperbrowser-ai-vs-skyvern",
+      "path": "blogs/hyperbrowser-ai-vs-skyvern.md",
+      "sha256": "f9c8bf8bb51ff6ec859669273d36b29f2fc7ac9e1f996e618837ed1329f9bb6c"
+    },
+    {
+      "slug": "insurance-carrier-workflows-automate",
+      "path": "blogs/insurance-carrier-workflows-automate.md",
+      "sha256": "05cfeb85142382ac0c734c232d31502c6fc319f526bd93dc2f1f249b7914d994"
+    },
+    {
+      "slug": "intelligent-process-automation-guide",
+      "path": "blogs/intelligent-process-automation-guide.md",
+      "sha256": "bdf880707d88f5aefb7b4b5a4fbff232f72ba1d4f83ee274c6b86a0f2b435295"
+    },
+    {
+      "slug": "investor-update-templates",
+      "path": "blogs/investor-update-templates.md",
+      "sha256": "d9d6414e31593f687c75eacad2d8216baf897c356392895e3c90e2b6c259965e"
+    },
+    {
+      "slug": "juggling-balls-as-a-startup",
+      "path": "blogs/juggling-balls-as-a-startup.md",
+      "sha256": "1594e5e1306a5bdd3baa027a53f92c65d54038b042d7ef2214b71620f200a900"
+    },
+    {
+      "slug": "kernel-reviews-pricing-alternatives",
+      "path": "blogs/kernel-reviews-pricing-alternatives.md",
+      "sha256": "67a8d3a5c8df7f8b75b9e7fe93dbfdc15c3b4651518959a1b826d298a71332f9"
+    },
+    {
+      "slug": "kernel-vs-skyvern",
+      "path": "blogs/kernel-vs-skyvern.md",
+      "sha256": "ccd1b7c322e170caf547f1b3a82fdc9dd72647f0da5beb1332f4f16b7044ff17"
+    },
+    {
+      "slug": "kura-ai-review-features-limitations-alternatives",
+      "path": "blogs/kura-ai-review-features-limitations-alternatives.md",
+      "sha256": "50eadee35368e6bcf362523ae84af523f8e8e94bc925f9e3d46d1265fce864ca"
+    },
+    {
+      "slug": "launch-checklist-in-case-youre-thinking-about-launching",
+      "path": "blogs/launch-checklist-in-case-youre-thinking-about-launching.md",
+      "sha256": "5004c4aa8edfea5a2be4475ba2f977445a7990947c252a2c1245589574aeef47"
+    },
+    {
+      "slug": "launch-week-day-1-automating-with-skyvern-got-50-cheaper",
+      "path": "blogs/launch-week-day-1-automating-with-skyvern-got-50-cheaper.md",
+      "sha256": "c0bcb7ee4f67f1e248710406a8eb562b875674d15551defa6872cb254774c92d"
+    },
+    {
+      "slug": "launch-week-day-1-automation-copilot-faster-time-to-automation",
+      "path": "blogs/launch-week-day-1-automation-copilot-faster-time-to-automation.md",
+      "sha256": "2859812ba50c2dddca3a78b1bbf241e14307a509c970ec85e33fbf347d4906c0"
+    },
+    {
+      "slug": "launch-week-day-2-meet-the-debugger",
+      "path": "blogs/launch-week-day-2-meet-the-debugger.md",
+      "sha256": "02b27c4811a3a1a8a6059819df950f119ecdaa993e62e4ef36e7a1f339b111fc"
+    },
+    {
+      "slug": "launch-week-day-2-skyverns-contact-form-agent",
+      "path": "blogs/launch-week-day-2-skyverns-contact-form-agent.md",
+      "sha256": "ca63a93c2d4fa5d1c46bb49a39173ab27feeb6cd75831eeacd544e0a7ded2e3a"
+    },
+    {
+      "slug": "launch-week-day-3-langchain-llamaindex-support-is-here",
+      "path": "blogs/launch-week-day-3-langchain-llamaindex-support-is-here.md",
+      "sha256": "a13220a9d7757d98a5232380e2c1e0fd052287df2d8d314f7be3aab0dccef62a"
+    },
+    {
+      "slug": "launch-week-day-3-show-dont-tell-screen-record-your-workflows-with-skyvern",
+      "path": "blogs/launch-week-day-3-show-dont-tell-screen-record-your-workflows-with-skyvern.md",
+      "sha256": "ca0b481fa15f8416aa68851920c52f16b15db402c610c50170ee273e3ab9dd0c"
+    },
+    {
+      "slug": "launch-week-day-3-workflow-version-history",
+      "path": "blogs/launch-week-day-3-workflow-version-history.md",
+      "sha256": "bf13d3d04b3984e5a6fe07f28160644eced1d5e5d334f7790309bada8f3d34fe"
+    },
+    {
+      "slug": "launch-week-day-4-browser-sessions",
+      "path": "blogs/launch-week-day-4-browser-sessions.md",
+      "sha256": "e991b861a6356741f54291f4e98e2c0744e736064ce5dab6978c21bda64092ca"
+    },
+    {
+      "slug": "launch-week-day-4-improved-context-parameters-a-story-about-user-pain",
+      "path": "blogs/launch-week-day-4-improved-context-parameters-a-story-about-user-pain.md",
+      "sha256": "f0f844965294cec52d7beac3d1dd332f72a5c321c097bba8e00c6d0ddf0a5871"
+    },
+    {
+      "slug": "launch-week-day-4-sop-upload-to-build-new-workflows",
+      "path": "blogs/launch-week-day-4-sop-upload-to-build-new-workflows.md",
+      "sha256": "f45bb9b0df3b39a6a983c82a37347c74138f1f3ab13e61dbd177318d46d1c204"
+    },
+    {
+      "slug": "launch-week-day-5-simpler-pricing-model",
+      "path": "blogs/launch-week-day-5-simpler-pricing-model.md",
+      "sha256": "1665b4adac8c8f9d102438b5b1fede8054b055864c19da0add5999bba6b7f5c0"
+    },
+    {
+      "slug": "launch-week-day-5-skyvern-x-make-com",
+      "path": "blogs/launch-week-day-5-skyvern-x-make-com.md",
+      "sha256": "25ddf1f067308b24e5ecc0ffbc2c678ff2dd8ee75986db3fc2c7fd0251871881"
+    },
+    {
+      "slug": "launch-week-day-6-sequential-runs",
+      "path": "blogs/launch-week-day-6-sequential-runs.md",
+      "sha256": "51eb499824e4e25c1aaae6cf1094d6589451347eb260796fae4f47e29e04f443"
+    },
+    {
+      "slug": "launch-week-day-7-faster-open-source-package",
+      "path": "blogs/launch-week-day-7-faster-open-source-package.md",
+      "sha256": "b59034291d00e0ca1af5edade14b4d489b5f211235c3839fab985831dc852539"
+    },
+    {
+      "slug": "launch-week-new-and-improved-sdk",
+      "path": "blogs/launch-week-new-and-improved-sdk.md",
+      "sha256": "1e7c909044e75716160e9705168e12955187c1db35e3dd9acfeb5cd2114f5630"
+    },
+    {
+      "slug": "launching-skyverns-jobs-agent-automate-job-applications-with-ai-2",
+      "path": "blogs/launching-skyverns-jobs-agent-automate-job-applications-with-ai-2.md",
+      "sha256": "d552f3aa5530fb8b76c50ec104b25ce6f322782e7da9224b80ce9deaa0dce18f"
+    },
+    {
+      "slug": "layers-of-agentic-process-automation",
+      "path": "blogs/layers-of-agentic-process-automation.md",
+      "sha256": "71932d987f8a1603ee2e087dd177215643c820b39a298668ebdf279ee39af506"
+    },
+    {
+      "slug": "layout-resistant-browser-automation-tools",
+      "path": "blogs/layout-resistant-browser-automation-tools.md",
+      "sha256": "18cdd94dddc0cae865aebe5f9abfadd7da65fdd4e1d2d52c89c8ff0f7d182ddd"
+    },
+    {
+      "slug": "learning-the-hard-way-aws-ec2-tmp-folder-is-always-loaded-into-memory",
+      "path": "blogs/learning-the-hard-way-aws-ec2-tmp-folder-is-always-loaded-into-memory.md",
+      "sha256": "e146dac14339776273c07c418c47941eb7768906d7fd95f2b8d7cc7ba6eccd38"
+    },
+    {
+      "slug": "mcp-server-architecture-explained",
+      "path": "blogs/mcp-server-architecture-explained.md",
+      "sha256": "e33f27bcb6e3846ce97b964dae8a4feb6907d669661be45973eff5da6b97548d"
+    },
+    {
+      "slug": "new-collab-ben-ai-x-skyvern-automate-the-browser-with-whatsapp-voice-messages-2",
+      "path": "blogs/new-collab-ben-ai-x-skyvern-automate-the-browser-with-whatsapp-voice-messages-2.md",
+      "sha256": "77208fdc49560037c916e9d360d4d5b7398f08fce84bfbfc2c8e101f26a536cc"
+    },
+    {
+      "slug": "new-credential-integration-azure-key-vault",
+      "path": "blogs/new-credential-integration-azure-key-vault.md",
+      "sha256": "d9bd7f904aeb67366756308f9fde5636f0d6362d7badcfa577d2d44c3fed9ba7"
+    },
+    {
+      "slug": "new-drop-skyvern-n8n-verifi",
+      "path": "blogs/new-drop-skyvern-n8n-verifi.md",
+      "sha256": "019dfbc1e664f76e9233b351cd8be4ba194e6d596affffaad45ed1ebdb8f3c56"
+    },
+    {
+      "slug": "new-drop-skyvern-x-activepieces",
+      "path": "blogs/new-drop-skyvern-x-activepieces.md",
+      "sha256": "c57bf2df7ffe8260733ce77ab6f094017ca9038f59a39283989fe62798638691"
+    },
+    {
+      "slug": "new-drop-skyvern-x-eachlabs",
+      "path": "blogs/new-drop-skyvern-x-eachlabs.md",
+      "sha256": "09a8a390e54294b475509db84caf4c5e83839f52dfde00771ac6ee1e57cb352c"
+    },
+    {
+      "slug": "new-drop-skyvern-x-integrately",
+      "path": "blogs/new-drop-skyvern-x-integrately.md",
+      "sha256": "e69eec9804e5086597a73a904a106a06776eacc34b6a588e9fc62677d68cc3a4"
+    },
+    {
+      "slug": "new-drop-skyvern-x-n8n",
+      "path": "blogs/new-drop-skyvern-x-n8n.md",
+      "sha256": "a973779cd277b544cf92bd9c8afdf664f136ff6a147c3fda4a8889d73702d6db"
+    },
+    {
+      "slug": "new-drop-skyvern-x-workato",
+      "path": "blogs/new-drop-skyvern-x-workato.md",
+      "sha256": "bf537a5765e20061f770644db1566d6a89b76a7b1fb02be4deb49950ab1744c0"
+    },
+    {
+      "slug": "new-drop-skyvern-x",
+      "path": "blogs/new-drop-skyvern-x.md",
+      "sha256": "a1fa831b21265094cf533ce7d6102655db9a226dc89706370aa3907a298b3a60"
+    },
+    {
+      "slug": "new-feature-natural-language-loo",
+      "path": "blogs/new-feature-natural-language-loo.md",
+      "sha256": "b348f28dba654c27293fb4de879bd4b13cb0885a0cd888121b3656aa9421c32f"
+    },
+    {
+      "slug": "new-month-new-docs",
+      "path": "blogs/new-month-new-docs.md",
+      "sha256": "c5d2b8e2fb93c94bf607d6eb8f27b4e6424a17c16c8ec8f8f7653135c9846168"
+    },
+    {
+      "slug": "new-workflow-blocks",
+      "path": "blogs/new-workflow-blocks.md",
+      "sha256": "185d199472e408965d5e039566e1e79c5fd45edadcdb50b27f884c6bc2f5d173"
+    },
+    {
+      "slug": "new-years-reflections",
+      "path": "blogs/new-years-reflections.md",
+      "sha256": "6fdd58b8c9c9e056f89d02256048abedd3c48b54d5b5efd4372623701d6336dd"
+    },
+    {
+      "slug": "page-object-model-guide",
+      "path": "blogs/page-object-model-guide.md",
+      "sha256": "ece93fae735e0aca6a8a9c2e9c8c1dfa07d23726f13eaa9702579985b921b5ce"
+    },
+    {
+      "slug": "playwright-mcp-reviews-and-alternatives-2025",
+      "path": "blogs/playwright-mcp-reviews-and-alternatives-2025.md",
+      "sha256": "00714b9f25f43b46f7e39b17131cc354b887b52c68d8418230c944499f5c66f7"
+    },
+    {
+      "slug": "product-hunt-launch-checklist",
+      "path": "blogs/product-hunt-launch-checklist.md",
+      "sha256": "801a2babe823d153466bb6e9bb06dbf1c65c7f5d2613eade7053469eed3b0027"
+    },
+    {
+      "slug": "puppeteer-vs-playwright-complete-performance-comparison-2025",
+      "path": "blogs/puppeteer-vs-playwright-complete-performance-comparison-2025.md",
+      "sha256": "56f3df189a8986834d3085c35017a008f2fa2e64b97e2d03525cb65de7da5732"
+    },
+    {
+      "slug": "python-web-scraping-ai",
+      "path": "blogs/python-web-scraping-ai.md",
+      "sha256": "ce838df3757249947a0df7161603f0590d7af89a20724e0ed84c28e82672bc8f"
+    },
+    {
+      "slug": "residential-proxy-vs-vpn-guide",
+      "path": "blogs/residential-proxy-vs-vpn-guide.md",
+      "sha256": "f854c2d9aac3144e5749e37cab34898b7a97b52d0d4bc1b3a73e6841df77fef3"
+    },
+    {
+      "slug": "roi-of-posting-regularly-or-why-i-sta",
+      "path": "blogs/roi-of-posting-regularly-or-why-i-sta.md",
+      "sha256": "4c9907f3c392583986a3d1b672c05d3f1e0367be255dfc72df6dd0b4f898c52a"
+    },
+    {
+      "slug": "rpa-ai-agents-comparison-guide",
+      "path": "blogs/rpa-ai-agents-comparison-guide.md",
+      "sha256": "444eea0d9dd27ee01ff6f8f05401ff1fb13d873d1dd55b26ca48d236b551d76d"
+    },
+    {
+      "slug": "rustwright-playwright-rewritten-in-rust-that-occupies-70-less-memory-and-is-2-55x-faster",
+      "path": "blogs/rustwright-playwright-rewritten-in-rust-that-occupies-70-less-memory-and-is-2-55x-faster.md",
+      "sha256": "992b6f8bc775db35fa4a0b02eba9561dac24cbbf70a49251ee27e420ffed75bc"
+    },
+    {
+      "slug": "sales",
+      "path": "blogs/sales.md",
+      "sha256": "1f32049d763137f7de0b0f47115d192f4fca6bd1115d96331d5f22206d39db8a"
+    },
+    {
+      "slug": "scraperapi-alternatives-web-scraping-tools",
+      "path": "blogs/scraperapi-alternatives-web-scraping-tools.md",
+      "sha256": "9349e742aaf0925ca8be55e4482b2e382955adea986fd6fbebdbd14b0df697cb"
+    },
+    {
+      "slug": "selenium-alternatives-5-better-browser-automation-tools-in-2025",
+      "path": "blogs/selenium-alternatives-5-better-browser-automation-tools-in-2025.md",
+      "sha256": "2e7391006dbf43b2b4ba22593c8a9a6f3033f6126c11624de014647112820fd3"
+    },
+    {
+      "slug": "selenium-reviews-and-alternatives-2025",
+      "path": "blogs/selenium-reviews-and-alternatives-2025.md",
+      "sha256": "24da7cb18fda37862a53acc3c82d4f84b61f86acf1537ba292a2e933dd23e5e2"
+    },
+    {
+      "slug": "shipping-fast-and-furiously",
+      "path": "blogs/shipping-fast-and-furiously.md",
+      "sha256": "d4ddf49dcaae131b09b34182841a810a74a1b0d6125c5af5b0f6579f32da918d"
+    },
+    {
+      "slug": "skyvern-2-0-webvoyager-benchmark-results",
+      "path": "blogs/skyvern-2-0-webvoyager-benchmark-results.md",
+      "sha256": "666fcba77a90f7eb6f11b29ab11e9f73ef3886d1a78d370e9a45b0425f9b04d9"
+    },
+    {
+      "slug": "skyvern-changelog-april-may-2026",
+      "path": "blogs/skyvern-changelog-april-may-2026.md",
+      "sha256": "d67d803ead53360a0b5cd66753e3707c110f5300e57da3f1023f0300665f2be8"
+    },
+    {
+      "slug": "skyvern-changelog-july-2026",
+      "path": "blogs/skyvern-changelog-july-2026.md",
+      "sha256": "c06291c0c67b4e88d72cefee0fe226fb0a7ba23e20b39456c7ec9baa96856ebf"
+    },
+    {
+      "slug": "skyvern-changelog-june-2026",
+      "path": "blogs/skyvern-changelog-june-2026.md",
+      "sha256": "6405ed751867ad8f5eec9c22c0bca3d6110bb8c23a3c55a549ad1d0efc04a3f1"
+    },
+    {
+      "slug": "skyvern-mcp-server-let-agents-control-your-browser",
+      "path": "blogs/skyvern-mcp-server-let-agents-control-your-browser.md",
+      "sha256": "199fe3942bca158a05656e5b2c7b2d4572ae41681e9b692c3f0d8731e0637936"
+    },
+    {
+      "slug": "skyvern-mcp-vs-browser-tools-mcp-automation",
+      "path": "blogs/skyvern-mcp-vs-browser-tools-mcp-automation.md",
+      "sha256": "d5fda83bd81273ab116199d4a059941d82ff061aba3a8c5d310365a754007583"
+    },
+    {
+      "slug": "skyvern-mcp-vs-browserbase",
+      "path": "blogs/skyvern-mcp-vs-browserbase.md",
+      "sha256": "3325cb54d753e21652feb6b361626750b37c3b2579f1f02bdc653bcc0e8ff276"
+    },
+    {
+      "slug": "skyvern-mcp-vs-firecrawl-mcp-comparison",
+      "path": "blogs/skyvern-mcp-vs-firecrawl-mcp-comparison.md",
+      "sha256": "0d506d9d959e9923e694ff62f997076172d9d163258fca88100213db12926014"
+    },
+    {
+      "slug": "skyvern-mcp-vs-hyperbrowser-ai",
+      "path": "blogs/skyvern-mcp-vs-hyperbrowser-ai.md",
+      "sha256": "7aca3a5c54420510e013ef674aab4cdbf3b07797991d7c025d643a3b562ac018"
+    },
+    {
+      "slug": "skyvern-mcp-vs-puppeteer-mcp",
+      "path": "blogs/skyvern-mcp-vs-puppeteer-mcp.md",
+      "sha256": "3d53bba013485a82e45f8fb5e9113e1aad0667707ec1fa233722308315e413da"
+    },
+    {
+      "slug": "skyvern-mcp-vs-selenium-comparison",
+      "path": "blogs/skyvern-mcp-vs-selenium-comparison.md",
+      "sha256": "00f8b6cbed92e40d8f5bb8c111b5573afc4cf3cb49b95b1abaf928c82b4d09fa"
+    },
+    {
+      "slug": "skyvern-mcp-vs-stagehand-compared-ai-browser-automation",
+      "path": "blogs/skyvern-mcp-vs-stagehand-compared-ai-browser-automation.md",
+      "sha256": "26db670023ea1fab33b40750c99c737853ad5c9173990610d90c71fc95b00945"
+    },
+    {
+      "slug": "skyvern-vs-scripts-ai-automation-comparison",
+      "path": "blogs/skyvern-vs-scripts-ai-automation-comparison.md",
+      "sha256": "cad5a949868532c2e178e7503b86f4d3c9f0141f41510a1ebfe11188aab91b8b"
+    },
+    {
+      "slug": "skyvern-we-raised-2-7m-to-fix-browser-automation-open-source",
+      "path": "blogs/skyvern-we-raised-2-7m-to-fix-browser-automation-open-source.md",
+      "sha256": "c0faf528f59b1e8e0ac43327ecc8594bfe7202f5710341d8ec4703f7707a0503"
+    },
+    {
+      "slug": "skyvern-x-soc-2",
+      "path": "blogs/skyvern-x-soc-2.md",
+      "sha256": "1436a9c953042ad83e67b4567f64dbb466e4929488c6207755f42528fb885b1e"
+    },
+    {
+      "slug": "skyverns-first-autonomous-order",
+      "path": "blogs/skyverns-first-autonomous-order.md",
+      "sha256": "df6c34eafd1807078ea2be5dfda02da083cfe0e221509e3e5cfee49459ba2e44"
+    },
+    {
+      "slug": "sola-reviews-pricing-alternatives",
+      "path": "blogs/sola-reviews-pricing-alternatives.md",
+      "sha256": "1da0cdbbe11bc181cb3de2353c087587572c09be248faf3fbed3eb4071494c31"
+    },
+    {
+      "slug": "sola-vs-skyvern-comparison",
+      "path": "blogs/sola-vs-skyvern-comparison.md",
+      "sha256": "768b554cfc6674e1003c2f6fd263eb0fe209aba31d13fdce37cce5d65cd42849"
+    },
+    {
+      "slug": "stagehand-alternatives-pricing-reviews",
+      "path": "blogs/stagehand-alternatives-pricing-reviews.md",
+      "sha256": "688b7d09f107a18823337de1cf83708bd10080bbfb235a704ea89c961f23ba93"
+    },
+    {
+      "slug": "stagehand-vs-skyvern-which-is-better",
+      "path": "blogs/stagehand-vs-skyvern-which-is-better.md",
+      "sha256": "7ff71e4619856016ffe21dfcf7330fc346f1a11f86a4a329207b1347d8f79e23"
+    },
+    {
+      "slug": "startup-learnings-nirvana-fallacy",
+      "path": "blogs/startup-learnings-nirvana-fallacy.md",
+      "sha256": "352352eb4861c746d2073fcb5e732956f1b71ac7159e8c104575286273d8a901"
+    },
+    {
+      "slug": "startuphow-we-got-our-first-4-customers",
+      "path": "blogs/startuphow-we-got-our-first-4-customers.md",
+      "sha256": "551fca555293405fd6e6f620326756397b93747d1141e8a4b830097ed2903aeb"
+    },
+    {
+      "slug": "startups-and-type-2-fun",
+      "path": "blogs/startups-and-type-2-fun.md",
+      "sha256": "20cd72198193c20ed3b7259b6c3509b45576028e97dfc96f69fe71f2e6086eaa"
+    },
+    {
+      "slug": "steel-reviews-pricing-alternatives",
+      "path": "blogs/steel-reviews-pricing-alternatives.md",
+      "sha256": "698d5c93539be1a94c5904c5df12d77148f8151eb5e450f979734b07b2c48edc"
+    },
+    {
+      "slug": "steel-vs-skyvern-which-is-better",
+      "path": "blogs/steel-vs-skyvern-which-is-better.md",
+      "sha256": "38350e71adafa80d5ce9fc322db2083def0495eec934c7f27299c7ecedfd2b12"
+    },
+    {
+      "slug": "surprise-launch-day-1-credit-card-support",
+      "path": "blogs/surprise-launch-day-1-credit-card-support.md",
+      "sha256": "a1dc97775736c466b5f7ad66f41a42752c9acc7263ef1155d327eb4380a879a2"
+    },
+    {
+      "slug": "surprise-launch-day-2-openrouter-support-is-live-in-skyvern",
+      "path": "blogs/surprise-launch-day-2-openrouter-support-is-live-in-skyvern.md",
+      "sha256": "af14c1e8eb707ad489373c1b256bac3ffac07b76021f59ec070960ae6172d776"
+    },
+    {
+      "slug": "surprise-launch-week-day-4-ollama-support",
+      "path": "blogs/surprise-launch-week-day-4-ollama-support.md",
+      "sha256": "c6d051101337b18b03cb20bb890dca013dfafec33563e8525a5ea8c6b638003d"
+    },
+    {
+      "slug": "surprise-launch-week-day-5-product-hunt-launch",
+      "path": "blogs/surprise-launch-week-day-5-product-hunt-launch.md",
+      "sha256": "41951e26f5018884c3e3d956fc5ade75462bb563eb1721daa1157e9ab9a46898"
+    },
+    {
+      "slug": "the-dark-path-to-discovering-our-icps",
+      "path": "blogs/the-dark-path-to-discovering-our-icps.md",
+      "sha256": "a5b8317142cc4e18657e7fc43bd821e7aca2d72d5705cba5ca9da05d61db2baf"
+    },
+    {
+      "slug": "the-fundamental-difference-between-engineering-and-data-science",
+      "path": "blogs/the-fundamental-difference-between-engineering-and-data-science.md",
+      "sha256": "4f5f5396fb364befbfe024495540d9c0a33f939dd03cf231af38dd66ea67c7d6"
+    },
+    {
+      "slug": "top-8-browser-automation-tools-in-2024",
+      "path": "blogs/top-8-browser-automation-tools-in-2024.md",
+      "sha256": "f6f35b7050f53fc2b6ea00dcabb8f4ae16eca570f9b93e6ca3b522ca452d1f9f"
+    },
+    {
+      "slug": "top-mcp-servers-web-scraping",
+      "path": "blogs/top-mcp-servers-web-scraping.md",
+      "sha256": "f6ef97a9c72c3e130feb496b535ccb7d71a0b062194e3dcedfe9b7474cfb3bb7"
+    },
+    {
+      "slug": "turn-any-website-into-an-api-methods-and-best-practices-september-2025",
+      "path": "blogs/turn-any-website-into-an-api-methods-and-best-practices-september-2025.md",
+      "sha256": "964de40e733b613c4e2ca9bb89b6bdded3ffa358e68c3d5d7d1b211be9c66d58"
+    },
+    {
+      "slug": "uipath-reviews-pricing-alternatives",
+      "path": "blogs/uipath-reviews-pricing-alternatives.md",
+      "sha256": "4636bbaef405eec3d024699896ea899709270e1480858329d961d97363555e0e"
+    },
+    {
+      "slug": "uipath-vs-skyvern-review",
+      "path": "blogs/uipath-vs-skyvern-review.md",
+      "sha256": "276d3ac1113e63ec0b4c405ff7110023bde981923037c78941ed32ff26ad14dd"
+    },
+    {
+      "slug": "untitled-2",
+      "path": "blogs/untitled-2.md",
+      "sha256": "04e3e90f322a9cf3df6f6f784367397e82f4291f9cbfb9eae24848c4539fb893"
+    },
+    {
+      "slug": "untitled-3",
+      "path": "blogs/untitled-3.md",
+      "sha256": "bdccd1040030ea614c20594536fcd2fe72e0536714790ee64d027042bb1fa8ef"
+    },
+    {
+      "slug": "untitled",
+      "path": "blogs/untitled.md",
+      "sha256": "ed2b469956a1acaa106da63dcc6d537be851cd197ce6b8700a9309e859ab3050"
+    },
+    {
+      "slug": "we-open-sourced-and-ended-up-1-on-hackernews",
+      "path": "blogs/we-open-sourced-and-ended-up-1-on-hackernews.md",
+      "sha256": "e401026d96dc818c0d865c4a748cc825f67b16cd327dc54332b9ce2f323f4fce"
+    },
+    {
+      "slug": "web-bench-a-new-way-to-compare-ai-browser-agents",
+      "path": "blogs/web-bench-a-new-way-to-compare-ai-browser-agents.md",
+      "sha256": "38c27bcf129d6453e7be9d4fec4af2507648eee7f2b82da4065d87a4b32d0d5c"
+    },
+    {
+      "slug": "what-is-agentic-ai-complete-guide",
+      "path": "blogs/what-is-agentic-ai-complete-guide.md",
+      "sha256": "db4a777fc974f1b8c15589e8d7552de612146e6820bb437fee3042a5a60bdb7f"
+    },
+    {
+      "slug": "what-is-agentic-automation-ops-guide",
+      "path": "blogs/what-is-agentic-automation-ops-guide.md",
+      "sha256": "0388042ea96d67c4afed01ae33b4d076ebd843d59b3dfdae6e48da33e0d05a62"
+    },
+    {
+      "slug": "what-is-ai-automation-complete-guide",
+      "path": "blogs/what-is-ai-automation-complete-guide.md",
+      "sha256": "5f24b361d857179c746eedfa204a43b50adea499dc80e269d36de033230a7de9"
+    },
+    {
+      "slug": "what-is-browser-automation",
+      "path": "blogs/what-is-browser-automation.md",
+      "sha256": "ff12c54f16b23c5e68f0305b0f890cb4529b4512e26895ccab6bb7c022758478"
+    },
+    {
+      "slug": "what-is-playwright-mcp-server",
+      "path": "blogs/what-is-playwright-mcp-server.md",
+      "sha256": "5de25841298ea3c120da835674d14f552aad033b1a71416c90c3e5e4e6c69db5"
+    },
+    {
+      "slug": "what-tasks-can-you-automate-with-skyvern",
+      "path": "blogs/what-tasks-can-you-automate-with-skyvern.md",
+      "sha256": "4c0eec688914cec16904df9d0f72b780ff9233a99832c44e7fd56779cb7c0839"
+    },
+    {
+      "slug": "why-mcp-is-a-big-deal",
+      "path": "blogs/why-mcp-is-a-big-deal.md",
+      "sha256": "b6c64bec48d4dd9fff84f434b6f3b8fe1a2e80c599c99bacb90e053cecd801ed"
+    },
+    {
+      "slug": "why-open-s",
+      "path": "blogs/why-open-s.md",
+      "sha256": "7826c464054b076858ee730ffbf7eebdb4eaca24d61534ba9124d6c485957525"
+    },
+    {
+      "slug": "why-open-source-is-the-future-of-browser-automation",
+      "path": "blogs/why-open-source-is-the-future-of-browser-automation.md",
+      "sha256": "7b7fb9d43aa78d2021edd8c8d21d969c2ecf2b7447df307685a4a6422cdbcfc6"
+    },
+    {
+      "slug": "workflow-chaining-automation-platforms",
+      "path": "blogs/workflow-chaining-automation-platforms.md",
+      "sha256": "ac440d3909de634223d06eadc4758c55ddc14747bfc4969e870b05d631f856e5"
+    }
+  ]
+}
