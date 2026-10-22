@@ -424,11 +424,8 @@ class TestIsLoggableContentType:
 # ---------------------------------------------------------------------------
 
 
-def _make_request(method: str = "GET", path: str = "/api/v1/test") -> MagicMock:
-    request = MagicMock()
-    request.method = method
-    request.url.path = path
-    return request
+def _make_request(method: str = "GET", path: str = "/api/v1/test") -> Request:
+    return Request({"type": "http", "method": method, "path": path, "headers": [], "query_string": b""})
 
 
 def test_sanitize_headers_removes_posthog_attribution_but_keeps_ordinary_header() -> None:
