@@ -1,4 +1,5 @@
 from datetime import UTC, datetime
+from time import perf_counter
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
@@ -16,6 +17,34 @@ ORG = Organization(
     created_at=datetime(2026, 1, 1, tzinfo=UTC),
     modified_at=datetime(2026, 1, 1, tzinfo=UTC),
 )
+
+
+def test_report_redaction_still_masks_url_credentials_and_aws_secret_assignments() -> None:
+    assert feedback_routes._redact_report_text("Open https://reporter:pw123@example.invalid/path", ()) == (
+        "Open https://[REDACTED_SECRET]@example.invalid/path"
+    )
+    assert feedback_routes._redact_report_text("prefixhttps://user:pw@host 3+https://user:pw@host", ()) == (
+        "prefixhttps://[REDACTED_SECRET]@host 3+https://[REDACTED_SECRET]@host"
+    )
+    assert feedback_routes._redact_report_text("https://not-a-userinfo and https://user:pw@host", ()) == (
+        "https://not-a-userinfo and https://[REDACTED_SECRET]@host"
+    )
+    assert feedback_routes._redact_report_text("AWS_SECRET_ACCESS_KEY=synthetic-secret", ()) == (
+        "AWS_SECRET_ACCESS_KEY=[REDACTED_SECRET]"
+    )
+    assert feedback_routes._redact_report_text("my_secret_access_key=synthetic-secret", ()) == (
+        "my_secret_access_key=[REDACTED_SECRET]"
+    )
+    assert feedback_routes._redact_report_text('"x.secret_access_key": "synthetic-secret"', ()) == (
+        '"x.secret_access_key": [REDACTED_SECRET]'
+    )
+
+
+@pytest.mark.parametrize("text", ["A" * 80_000, "A" * 80_000 + "://", "a_" * 40_000])
+def test_report_redaction_completes_quickly_on_long_inputs(text: str) -> None:
+    started = perf_counter()
+    assert feedback_routes._redact_report_text(text, ()) == text
+    assert perf_counter() - started < 1.0
 
 
 def _stored(rating: str = "up") -> RunFeedback:
