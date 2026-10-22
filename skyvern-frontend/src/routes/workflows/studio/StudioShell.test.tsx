@@ -11,10 +11,6 @@ import { type StudioPaneId } from "./panes";
 import { paneAccessibleName } from "./paneMeta";
 import { paneExpansionKeyframes } from "./paneLayout";
 import {
-  advanceRecordingStopLifecycle,
-  panesAfterRecordingTransition,
-} from "./recordingPaneLifecycle";
-import {
   EmbeddedBrowserOverlays,
   StudioPane,
   StudioShell,
@@ -103,86 +99,6 @@ describe("StudioShell inspected run header", () => {
     expect(
       within(header).queryByRole("button", { name: "Copy to clipboard" }),
     ).toBeNull();
-  });
-});
-
-describe("panesAfterRecordingTransition", () => {
-  test("replaces the Editor with Browser and Copilot when recording starts", () => {
-    expect(
-      panesAfterRecordingTransition(["overview", "editor"], "started"),
-    ).toEqual(["overview", "browser", "copilot"]);
-  });
-
-  test("replaces Browser with Editor when a recording starts processing", () => {
-    expect(
-      panesAfterRecordingTransition(
-        ["overview", "copilot", "browser"],
-        "processing",
-      ),
-    ).toEqual(["overview", "editor", "copilot"]);
-  });
-
-  test("restores Editor but leaves Browser open when recording is discarded", () => {
-    expect(
-      panesAfterRecordingTransition(["copilot", "browser"], "ended"),
-    ).toEqual(["browser", "editor", "copilot"]);
-  });
-
-  test("remembers zero-action Done without leaking into the next Discard", () => {
-    let lifecycle = advanceRecordingStopLifecycle(false, {
-      isRecording: true,
-      wasRecording: false,
-      finishRequested: false,
-      processingRecording: false,
-    });
-
-    lifecycle = advanceRecordingStopLifecycle(lifecycle.finishWasRequested, {
-      isRecording: true,
-      wasRecording: true,
-      finishRequested: true,
-      processingRecording: true,
-    });
-    expect(lifecycle).toEqual({
-      finishWasRequested: true,
-      transition: null,
-    });
-
-    lifecycle = advanceRecordingStopLifecycle(lifecycle.finishWasRequested, {
-      isRecording: false,
-      wasRecording: true,
-      finishRequested: false,
-      processingRecording: false,
-    });
-    expect(lifecycle).toEqual({
-      finishWasRequested: false,
-      transition: "processing",
-    });
-
-    lifecycle = advanceRecordingStopLifecycle(lifecycle.finishWasRequested, {
-      isRecording: true,
-      wasRecording: false,
-      finishRequested: false,
-      processingRecording: false,
-    });
-    lifecycle = advanceRecordingStopLifecycle(lifecycle.finishWasRequested, {
-      isRecording: false,
-      wasRecording: true,
-      finishRequested: false,
-      processingRecording: false,
-    });
-    expect(lifecycle).toEqual({
-      finishWasRequested: false,
-      transition: "ended",
-    });
-  });
-
-  test("does not duplicate panes already in the requested layout", () => {
-    expect(
-      panesAfterRecordingTransition(
-        ["copilot", "browser", "editor"],
-        "started",
-      ),
-    ).toEqual(["browser", "copilot"]);
   });
 });
 

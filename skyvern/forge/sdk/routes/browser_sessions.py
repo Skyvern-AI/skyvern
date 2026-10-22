@@ -64,17 +64,13 @@ from skyvern.schemas.browser_session_timeouts import (
     max_timeout_exceeded_warning,
 )
 from skyvern.schemas.browser_sessions import (
-    BrowserRecording,
     CreateBrowserSessionRequest,
     ExtendBrowserSessionRequest,
-    ProcessBrowserSessionRecordingRequest,
-    ProcessBrowserSessionRecordingResponse,
     RegisterExternalBrowserSessionRequest,
     UpdateBrowserSessionRequest,
 )
 from skyvern.schemas.proxy_pinning import should_generate_proxy_session_id
 from skyvern.schemas.runs import ProxyLocation
-from skyvern.services.browser_recording.session_registry import interpretation_registry
 from skyvern.webeye.external_cdp_sessions import (
     close_expired_external_cdp_sessions,
     connect_external_cdp_browser,
@@ -882,94 +878,3 @@ async def get_browser_session_action_logs(
     events.sort(key=lambda event: event.order_key)
     next_cursor = _encode_action_log_cursor(page_artifacts[-1]) if page_artifacts else None
     return ActionLogPage(events=events, next_cursor=next_cursor)
-
-
-@base_router.post(
-    "/browser_sessions/{browser_session_id}/process_recording",
-    include_in_schema=False,
-)
-async def process_recording(
-    browser_session_id: str = Path(..., description="The ID of the browser session.", examples=["pbs_123456"]),
-    recording_request: ProcessBrowserSessionRecordingRequest = ProcessBrowserSessionRecordingRequest(),
-    current_org: Organization = Depends(org_auth_service.get_current_org),
-) -> ProcessBrowserSessionRecordingResponse:
-    browser_session = await app.PERSISTENT_SESSIONS_MANAGER.get_session(
-        browser_session_id,
-        current_org.organization_id,
-    )
-    if not browser_session:
-        raise HTTPException(status_code=404, detail=f"Browser session {browser_session_id} not found")
-
-    # Record Browser now emits Code blocks exclusively. Reject processing before
-    # producing a workflow that this organization cannot execute.
-    await app.AGENT_FUNCTION.validate_code_block(current_org.organization_id)
-
-    recorded_actions = interpretation_registry.get_finalized_actions(
-        interpretation_session_id=recording_request.interpretation_session_id,
-        browser_session_id=browser_session_id,
-        organization_id=current_org.organization_id,
-        workflow_permanent_id=recording_request.workflow_permanent_id,
-    )
-    if recorded_actions is None and recording_request.interpretation_session_id is not None:
-        # Done can reach this route while the websocket is still flushing its
-        # final snapshot. Join that stop task so a successful chunk fallback
-        # cannot leave a late finalized-action cache entry behind.
-        await interpretation_registry.stop_session(browser_session_id)
-        recorded_actions = interpretation_registry.get_finalized_actions(
-            interpretation_session_id=recording_request.interpretation_session_id,
-            browser_session_id=browser_session_id,
-            organization_id=current_org.organization_id,
-            workflow_permanent_id=recording_request.workflow_permanent_id,
-        )
-    blocks, parameters, recording_id, evidence = await app.BROWSER_SESSION_RECORDING_SERVICE.process_recording(
-        organization_id=current_org.organization_id,
-        browser_session_id=browser_session_id,
-        compressed_chunks=recording_request.compressed_chunks,
-        workflow_permanent_id=recording_request.workflow_permanent_id,
-        draft_steps=recording_request.draft_steps,
-        recorded_actions=recorded_actions,
-        supports_credential_tokens=recording_request.supports_credential_tokens,
-        recording_attempt_id=recording_request.recording_attempt_id,
-        interpretation_session_id=recording_request.interpretation_session_id,
-    )
-    if recorded_actions is not None:
-        interpretation_registry.discard_finalized_actions(recording_request.interpretation_session_id)
-
-    return ProcessBrowserSessionRecordingResponse(
-        recording_id=recording_id,
-        blocks=blocks,
-        parameters=parameters,
-        evidence=evidence,
-    )
-
-
-@base_router.delete(
-    "/browser_recordings/{recording_id}",
-    status_code=status.HTTP_204_NO_CONTENT,
-    include_in_schema=False,
-)
-async def delete_pending_recording(
-    recording_id: str,
-    current_org: Organization = Depends(org_auth_service.get_current_org),
-) -> None:
-    await app.DATABASE.browser_recordings.delete_pending_recording(recording_id, current_org.organization_id)
-
-
-@base_router.get(
-    "/workflows/{workflow_permanent_id}/versions/{version}/recording",
-    response_model=BrowserRecording,
-    include_in_schema=False,
-)
-async def get_workflow_version_recording(
-    workflow_permanent_id: str,
-    version: int,
-    current_org: Organization = Depends(org_auth_service.get_current_org),
-) -> BrowserRecording:
-    recording = await app.DATABASE.browser_recordings.get_for_workflow_version(
-        workflow_permanent_id=workflow_permanent_id,
-        version=version,
-        organization_id=current_org.organization_id,
-    )
-    if recording is None:
-        raise HTTPException(status_code=404, detail="Recording not found")
-    return recording

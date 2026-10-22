@@ -3,7 +3,6 @@ import { ReactNode, useMemo } from "react";
 
 import { RadialMenu, RadialMenuItem } from "@/components/RadialMenu";
 import { useDebugStore } from "@/store/useDebugStore";
-import { useRecordingStore } from "@/store/useRecordingStore";
 import { useSettingsStore } from "@/store/SettingsStore";
 
 type WorkflowAddMenuProps = {
@@ -38,7 +37,6 @@ function WorkflowAddMenu({
   onPinnedChange,
 }: WorkflowAddMenuProps) {
   const debugStore = useDebugStore();
-  const recordingStore = useRecordingStore();
   const settingsStore = useSettingsStore();
 
   const items = useMemo(() => {
@@ -60,10 +58,7 @@ function WorkflowAddMenu({
       menuItems.push({
         id: "2",
         icon: <SquareIcon className={buttonSize ? "h-3 w-3" : undefined} />,
-        enabled:
-          canRecordTask &&
-          settingsStore.isUsingABrowser &&
-          !recordingStore.isRecording,
+        enabled: canRecordTask && settingsStore.isUsingABrowser,
         text: "Demonstrate task",
         onClick: () => {
           onRecord();
@@ -88,7 +83,6 @@ function WorkflowAddMenu({
     onAdd,
     onRecord,
     onUploadSOP,
-    recordingStore.isRecording,
     settingsStore.isUsingABrowser,
     settingsStore.isLoadingABrowser,
     canUploadSOP,

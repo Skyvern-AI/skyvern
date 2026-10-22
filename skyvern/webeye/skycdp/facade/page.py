@@ -1004,19 +1004,18 @@ class Page:
     async def expose_binding(self, name: str, callback: Callable[..., Any]) -> None:
         """Install `window[name]` and route its calls to `callback(source, payload)`.
 
-        The exfiltration channel depends on this -- it calls the binding with an OBJECT from page JS
-        while CDP's `Runtime.addBinding` only accepts a string and only reports it back as one. So the
-        raw binding is registered under an internal name and a shim over it does the JSON, which is the
-        same shape Playwright uses.
+        Page JS may call the binding with an object while CDP's `Runtime.addBinding` only accepts a
+        string and only reports it back as one. The raw binding is registered under an internal name
+        and a shim over it does the JSON, which is the same shape Playwright uses.
 
         The shim is installed twice on purpose: as an init script for documents that do not exist
         yet, and evaluated once now, because a caller that binds after the page has already loaded
         would otherwise see nothing until the next navigation.
 
         Limit worth stating: the shim resolves immediately rather than waiting for the Python
-        callback's return value. The exfiltration channel caller is synchronous and returns None, and
-        the page side does `Promise.resolve(window[name](...))` without reading the result. A caller
-        that needs a value back would need the reply plumbing this deliberately does not have.
+        callback's return value. The page side does `Promise.resolve(window[name](...))` without
+        reading the result. A caller that needs a value back would need the reply plumbing this
+        deliberately does not have.
         """
         raw_name = f"__skycdp_binding_{name}"
         shim = (
@@ -1036,8 +1035,7 @@ class Page:
             try:
                 callback({"page": self, "frame": self.main_frame}, payload)
             except Exception:
-                # A raising callback must not kill the CDP read loop; the exfiltration channel consumer
-                # records events, and dropping one is better than losing the connection.
+                # A raising callback must not kill the CDP read loop.
                 LOG.warning("skycdp exposed binding callback raised", binding=name, exc_info=True)
 
         self._session.on("Runtime.bindingCalled", _on_binding_called)

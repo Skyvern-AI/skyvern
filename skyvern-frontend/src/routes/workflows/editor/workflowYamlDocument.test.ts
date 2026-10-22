@@ -23,14 +23,7 @@ import {
   renderHook,
   waitFor,
 } from "@testing-library/react";
-import {
-  useState,
-  createElement,
-  useLayoutEffect,
-  type ReactNode,
-} from "react";
-import { useRecordedBlocksStore } from "@/store/RecordedBlocksStore";
-import { useApplyRecordedBlocks } from "./recording/useApplyRecordedBlocks";
+import { createElement, useLayoutEffect, type ReactNode } from "react";
 import {
   commitYamlDraft,
   isWorkflowYamlDirty,
@@ -2590,88 +2583,6 @@ describe("regular save transactions", () => {
       view.unmount();
       client.clear();
     }
-  });
-  test("defers a recording import until a pending PUT settles, then keeps it dirty", async () => {
-    const { view, client } = mountSave();
-    const doLayout = vi.fn();
-    const recording = renderHook(() => {
-      const [nodes, setNodes] = useState<AppNode[]>([]);
-      useApplyRecordedBlocks({
-        enabled: true,
-        nodes,
-        edges: [],
-        doLayout: (nextNodes, nextEdges) => {
-          doLayout(nextNodes, nextEdges);
-          setNodes(nextNodes);
-        },
-      });
-      return nodes;
-    });
-    let resolvePut!: (value: unknown) => void;
-    put.mockImplementation(
-      () =>
-        new Promise((resolve) => {
-          resolvePut = resolve;
-        }),
-    );
-    let saving!: Promise<unknown>;
-    act(() => {
-      saving = view.result.current.mutateAsync(undefined);
-    });
-    await waitFor(() => expect(put).toHaveBeenCalledOnce());
-    act(() => {
-      useRecordedBlocksStore.getState().setRecordedBlocks(
-        {
-          blocks: [
-            {
-              block_type: "goto_url",
-              label: "imported",
-              url: "https://example.test",
-              output_parameter: {
-                parameter_type: "output",
-                key: "imported_output",
-                description: null,
-                output_parameter_id: "op_fixture",
-                workflow_id: workflow.workflow_id,
-                created_at: workflow.created_at,
-                modified_at: workflow.modified_at,
-                deleted_at: null,
-              },
-              continue_on_failure: false,
-              model: null,
-            },
-          ],
-          parameters: [
-            {
-              key: "recorded_input",
-              parameter_type: "credential",
-              credential_id: "cred_fixture",
-            },
-          ],
-        },
-        { previous: null, next: null, connectingEdgeType: "default" },
-        useWorkflowYamlEditorStore.getState().editorOwner!,
-      );
-    });
-    expect.soft(doLayout).not.toHaveBeenCalled();
-    expect.soft(useRecordedBlocksStore.getState().blocks).not.toBeNull();
-    expect.soft(useWorkflowParametersStore.getState().parameters).toEqual([]);
-    await act(async () => {
-      resolvePut({ data: workflow });
-      await saving;
-    });
-    expect(doLayout).toHaveBeenCalledOnce();
-    expect(
-      recording.result.current.some((node) => node.data.label === "imported"),
-    ).toBe(true);
-    expect(useWorkflowParametersStore.getState().parameters).toEqual([
-      expect.objectContaining({ credentialId: "cred_fixture" }),
-    ]);
-    expect(useWorkflowHasChangesStore.getState().hasChanges).toBe(true);
-    expect(useRecordedBlocksStore.getState().blocks).toBeNull();
-    recording.unmount();
-    view.unmount();
-    client.clear();
   });
   test.each([
     ["yaml", "A YAML commit is in progress"],

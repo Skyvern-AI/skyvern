@@ -30415,18 +30415,6 @@
             "type": "string",
             "title": "Title"
           },
-          "recording_id": {
-            "anyOf": [
-              {
-                "type": "string"
-              },
-              {
-                "type": "null"
-              }
-            ],
-            "title": "Recording Id",
-            "description": "Durable browser recording to attach to the workflow version created by this save."
-          },
           "description": {
             "anyOf": [
               {

@@ -3,16 +3,12 @@ from typing import Any
 
 from pydantic import BaseModel, Field, field_validator
 
-from skyvern.client.types.workflow_definition_yaml_blocks_item import WorkflowDefinitionYamlBlocksItem
-from skyvern.client.types.workflow_definition_yaml_parameters_item import WorkflowDefinitionYamlParametersItem
 from skyvern.forge.sdk.schemas.persistent_browser_sessions import Extensions, PersistentBrowserType
 from skyvern.schemas.browser_session_timeouts import DEFAULT_TIMEOUT, MAX_EXTENDED_TIMEOUT, MAX_TIMEOUT, MIN_TIMEOUT
 from skyvern.schemas.browser_settings import BrowserSettings, require_known_timezone
 from skyvern.schemas.docs.doc_strings import PROXY_LOCATION_DOC_STRING
 from skyvern.schemas.proxy_pinning import validate_proxy_session_id
 from skyvern.schemas.runs import GeoTarget, ProxyLocationInput, _validate_browser_address
-from skyvern.services.browser_recording.evidence import RecordingEvidencePacket
-from skyvern.services.browser_recording.types import RecordingDraftStep
 from skyvern.utils.url_validators import is_tls_or_local_browser_address, validate_url
 
 
@@ -151,58 +147,6 @@ class ExtendBrowserSessionRequest(BaseModel):
             "carries a warning."
         ),
         ge=1,
-    )
-
-
-class ProcessBrowserSessionRecordingRequest(BaseModel):
-    compressed_chunks: list[str] = Field(
-        default=[],
-        description="List of base64 encoded and compressed (gzip) event strings representing the browser session recording.",
-    )
-    workflow_permanent_id: str = Field(
-        default="no-such-wpid",
-        description="Permanent ID of the workflow associated with the browser session recording.",
-    )
-    draft_steps: list[RecordingDraftStep] | None = Field(
-        default=None,
-        description="Optional live interpretation drafts to commit instead of reprocessing the compressed recording.",
-    )
-    supports_credential_tokens: bool = Field(
-        default=False,
-        description=(
-            "Whether the caller substitutes credential tokens in a code block's code. A frontend that "
-            "does not would save the renamed parameters beside code still reading the token, which fails "
-            "at run time; recorded credentials stay unbound for those callers."
-        ),
-    )
-    recording_attempt_id: str | None = Field(
-        default=None,
-        description="Client-generated ID for the Record Browser attempt.",
-    )
-    interpretation_session_id: str | None = Field(
-        default=None,
-        description="Server-generated ID for the logical live-interpretation session.",
-    )
-
-
-class ProcessBrowserSessionRecordingResponse(BaseModel):
-    recording_id: str | None = Field(
-        description="ID of the durable, redacted recording created when processing produced workflow blocks."
-    )
-    blocks: list[WorkflowDefinitionYamlBlocksItem] = Field(
-        default=[],
-        description="List of workflow blocks generated from the processed browser session recording.",
-    )
-    parameters: list[WorkflowDefinitionYamlParametersItem] = Field(
-        default=[],
-        description="List of workflow parameters generated from the processed browser session recording.",
-    )
-    evidence: RecordingEvidencePacket | None = Field(
-        default=None,
-        description=(
-            "Observation-only projection of the recorded actions, returned for code-first "
-            "processing so a refinement request can reuse it instead of re-uploading the recording."
-        ),
     )
 
 

@@ -8,7 +8,6 @@ import {
   TooltipTrigger,
 } from "@/components/ui/tooltip";
 import { useWorkflowHistoryAccessStore } from "@/store/WorkflowHistoryAccessStore";
-import { useRecordingStore } from "@/store/useRecordingStore";
 
 import { CollapsibleControl } from "./CollapsibleControl";
 import { useUndoRedoShortcutLabels } from "./useUndoRedoShortcutLabels";
@@ -16,10 +15,9 @@ import { useUndoRedoShortcutLabels } from "./useUndoRedoShortcutLabels";
 export function UndoControl() {
   const canUndo = useWorkflowHistoryAccessStore((s) => s.canUndo);
   const onUndo = useWorkflowHistoryAccessStore((s) => s.undo);
-  const isRecording = useRecordingStore((s) => s.isRecording);
   const { undoShortcutLabel } = useUndoRedoShortcutLabels();
 
-  const disabled = !canUndo || isRecording;
+  const disabled = !canUndo;
 
   return (
     <CollapsibleControl show={canUndo}>

@@ -1,7 +1,6 @@
 import asyncio
 import copy
 import difflib
-import hmac
 import importlib.util
 import json
 import os
@@ -1953,22 +1952,6 @@ async def recover_pending_workflow_attempts(
             "Workflow retry recovery reached its page limit; remaining attempts wait for the next sweep",
             max_pages=ATTEMPT_RECOVERY_MAX_PAGES,
         )
-
-
-_WORKFLOW_SAVE_FINGERPRINT_DOMAIN = b"skyvern.workflow_save_fingerprint.v2\0"
-
-
-def _workflow_save_fingerprint(request: WorkflowCreateYAMLRequest) -> str:
-    payload = request.model_dump(mode="json")
-    payload.pop("recording_id", None)
-    payload["cdp_connect_headers"] = request.cdp_connect_headers
-    payload["explicit_fields"] = sorted(request.model_fields_set - {"recording_id"})
-    serialized = json.dumps(payload, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
-    return hmac.new(
-        settings.SECRET_KEY.encode(),
-        _WORKFLOW_SAVE_FINGERPRINT_DOMAIN + serialized.encode(),
-        sha256,
-    ).hexdigest()
 
 
 async def _roll_back_after_swallowed_write() -> None:
@@ -17445,33 +17428,7 @@ class WorkflowService:
             )
             return (workflow, ("workflow_definition",) if created else ()) if return_write_result else workflow
 
-        recording_id_to_attach = request.recording_id
-        workflow_save_fingerprint = _workflow_save_fingerprint(request) if request.recording_id is not None else None
-        if request.recording_id is not None:
-            recording = await app.DATABASE.browser_recordings.get_recording(
-                request.recording_id,
-                organization_id,
-            )
-            if (
-                recording is None
-                or workflow_permanent_id is None
-                or recording.workflow_permanent_id != workflow_permanent_id
-            ):
-                raise SkyvernHTTPException(
-                    f"Browser recording {request.recording_id} not found",
-                    status_code=HTTPStatus.NOT_FOUND,
-                )
-            if recording.workflow_id is not None:
-                if recording.metadata.get("workflow_save_fingerprint") == workflow_save_fingerprint:
-                    workflow = await self.get_workflow(
-                        workflow_id=recording.workflow_id,
-                        organization_id=organization_id,
-                    )
-                    return (workflow, ()) if return_write_result else workflow
-                recording_id_to_attach = None
-
         new_workflow_id: str | None = None
-        attached_recording_to_new_version = False
         refresh_schedule_runtime_limits = False
         effective_max_elapsed_time_minutes: int | None = None
 
@@ -17697,44 +17654,6 @@ class WorkflowService:
             # transaction above already rolled it back.
             new_workflow_id = updated_workflow.workflow_id
 
-            if recording_id_to_attach is not None:
-                try:
-                    attached_recording = await app.DATABASE.browser_recordings.attach_to_workflow_version(
-                        recording_id=recording_id_to_attach,
-                        workflow_id=updated_workflow.workflow_id,
-                        workflow_permanent_id=updated_workflow.workflow_permanent_id,
-                        organization_id=organization_id,
-                        workflow_save_fingerprint=workflow_save_fingerprint,
-                    )
-                except ValueError as exc:
-                    raise SkyvernHTTPException(
-                        f"Browser recording {request.recording_id} not found",
-                        status_code=HTTPStatus.NOT_FOUND,
-                    ) from exc
-                if attached_recording.workflow_id is None:
-                    raise SkyvernHTTPException(
-                        f"Browser recording {request.recording_id} not found",
-                        status_code=HTTPStatus.NOT_FOUND,
-                    )
-
-                attached_recording_to_new_version = attached_recording.workflow_id == updated_workflow.workflow_id
-
-                # A concurrent retry may have attached the idempotency key to
-                # the first version while this duplicate version was built.
-                if (
-                    attached_recording.workflow_id != updated_workflow.workflow_id
-                    and attached_recording.metadata.get("workflow_save_fingerprint") == workflow_save_fingerprint
-                ):
-                    original_workflow = await self.get_workflow(
-                        workflow_id=attached_recording.workflow_id,
-                        organization_id=organization_id,
-                    )
-                    await self.delete_workflow_by_id(
-                        workflow_id=updated_workflow.workflow_id,
-                        organization_id=organization_id,
-                    )
-                    return (original_workflow, ()) if return_write_result else original_workflow
-
             await self.maybe_delete_cached_code(
                 updated_workflow,
                 workflow_definition=workflow_definition,
@@ -17755,22 +17674,10 @@ class WorkflowService:
         except SkyvernHTTPException:
             # Bubble up well-formed client errors (e.g. WorkflowNotFound 404)
             # so they are not wrapped in a 500 by the caller.
-            if attached_recording_to_new_version and new_workflow_id and recording_id_to_attach:
-                await app.DATABASE.browser_recordings.detach_from_workflow_version(
-                    recording_id=recording_id_to_attach,
-                    workflow_id=new_workflow_id,
-                    organization_id=organization_id,
-                )
             if new_workflow_id:
                 await self.delete_workflow_by_id(workflow_id=new_workflow_id, organization_id=organization_id)
             raise
         except Exception:
-            if attached_recording_to_new_version and new_workflow_id and recording_id_to_attach:
-                await app.DATABASE.browser_recordings.detach_from_workflow_version(
-                    recording_id=recording_id_to_attach,
-                    workflow_id=new_workflow_id,
-                    organization_id=organization_id,
-                )
             if new_workflow_id:
                 LOG.error(
                     "Failed to create workflow from request, deleting workflow",

@@ -13,7 +13,6 @@ import {
   canonicalRecoveriesByWorkflow,
 } from "./WorkflowCopilotChat";
 import { useCopilotActionStore } from "@/store/useCopilotActionStore";
-import { useRecordingStore } from "@/store/useRecordingStore";
 import { useWorkflowYamlEditorStore } from "@/store/WorkflowYamlEditorStore";
 import { COPILOT_WORKING_VERBS } from "./workingVerbs";
 
@@ -67,7 +66,6 @@ const { streamCalls, postStreaming, cancelPost, historyResponse } = vi.hoisted(
     };
   },
 );
-const recordingPanelMounts = vi.hoisted(() => ({ nextId: 0 }));
 
 vi.mock("@/api/sse", () => ({
   getSseClient: vi.fn().mockResolvedValue({ postStreaming }),
@@ -150,53 +148,6 @@ vi.mock("@/store/WorkflowHasChangesStore", () => {
 vi.mock("@/routes/workflows/hooks/useWorkflowRunQuery", () => ({
   useWorkflowRunQuery: () => ({ data: undefined }),
 }));
-
-vi.mock("@/routes/workflows/editor/recording/RecordingPanel", async () => {
-  const { forwardRef, useRef } = await import("react");
-  const { createPortal } = await import("react-dom");
-  return {
-    RecordingPanel: forwardRef<
-      HTMLDivElement,
-      {
-        expanded?: boolean;
-        onExpandedChange?: (expanded: boolean) => void;
-        onBackToChat?: () => void;
-        suggestionPortalTarget?: HTMLElement | null;
-      }
-    >(function MockRecordingPanel(
-      { expanded, onExpandedChange, onBackToChat, suggestionPortalTarget },
-      ref,
-    ) {
-      const mountId = useRef(++recordingPanelMounts.nextId).current;
-      return (
-        <>
-          <div
-            ref={ref}
-            data-mount-id={mountId}
-            data-recording-controller="true"
-            data-testid={expanded ? "recording-focus" : "recording-inline"}
-          >
-            {expanded ? (
-              <button type="button" onClick={onBackToChat}>
-                Back to chat
-              </button>
-            ) : (
-              <button type="button" onClick={() => onExpandedChange?.(true)}>
-                Expand demonstration
-              </button>
-            )}
-          </div>
-          {suggestionPortalTarget
-            ? createPortal(
-                <div data-testid="mock-recording-suggestion">Suggestion</div>,
-                suggestionPortalTarget,
-              )
-            : null}
-        </>
-      );
-    }),
-  };
-});
 
 type FlagConfig = {
   codeBlockMode?: boolean;
@@ -286,14 +237,8 @@ beforeEach(() => {
   HTMLElement.prototype.scrollIntoView = vi.fn();
   HTMLElement.prototype.scrollTo = vi.fn();
   streamCalls.length = 0;
-  recordingPanelMounts.nextId = 0;
   postStreaming.mockClear();
   cancelPost.mockClear();
-  useRecordingStore.setState({
-    isRecording: false,
-    finishRequested: false,
-    isCommitting: false,
-  });
   useCopilotActionStore.setState({
     pendingBuild: null,
     generatingBlockLabel: null,
@@ -308,11 +253,6 @@ beforeEach(() => {
 });
 
 afterEach(() => {
-  useRecordingStore.setState({
-    isRecording: false,
-    finishRequested: false,
-    isCommitting: false,
-  });
   cleanup();
   canonicalRecoveriesByWorkflow.clear();
 });
@@ -336,9 +276,6 @@ describe("WorkflowCopilotChat — unflagged S4 composer", () => {
     expect(postStreaming).toHaveBeenCalledTimes(1);
     await deliverFirstFrame();
 
-    await act(async () => {
-      useRecordingStore.setState({ isRecording: true });
-    });
     const button = screen.getByRole("button", { name: "Stop" });
     expect(screen.getByTestId("copilot-stop-ring").className).not.toContain(
       "paused",
@@ -364,7 +301,6 @@ describe("WorkflowCopilotChat — unflagged S4 composer", () => {
         signal: expect.any(AbortSignal),
       }),
     );
-    useRecordingStore.setState({ isRecording: false });
   });
 
   it("arms stop on the first streamed frame even when that frame carries no turn id", async () => {
@@ -755,153 +691,5 @@ describe("WorkflowCopilotChat — unflagged S4 composer", () => {
     expect(
       ta.compareDocumentPosition(mic) & Node.DOCUMENT_POSITION_FOLLOWING,
     ).toBeTruthy();
-  });
-
-  it("keeps the credential suggestion below the latest Copilot reply while recording", async () => {
-    await renderChat({
-      codeBlockMode: true,
-      liveBrowserSessionId: "pbs_recording",
-    });
-    await act(async () => {
-      useRecordingStore.setState({ isRecording: true });
-    });
-
-    await submit("Always choose the first available appointment.");
-    await waitFor(() => expect(postStreaming).toHaveBeenCalledTimes(1));
-
-    await act(async () => {
-      streamCalls[0]?.onMessage({
-        type: "response",
-        message: "Got it — I’ll keep that preference with this demonstration.",
-        workflow_copilot_chat_id: "chat-1",
-        response_time: "2026-09-19T20:00:00Z",
-        proposal_disposition: "no_proposal",
-      });
-      streamCalls[0]?.resolve();
-    });
-
-    const copilotReply = screen.getByText(
-      "Got it — I’ll keep that preference with this demonstration.",
-    );
-    const suggestion = screen.getByTestId("mock-recording-suggestion");
-    expect(
-      screen.getByTestId("recording-suggestion-host").contains(suggestion),
-    ).toBe(true);
-    expect(
-      copilotReply.compareDocumentPosition(suggestion) &
-        Node.DOCUMENT_POSITION_FOLLOWING,
-    ).toBeTruthy();
-    expect(
-      document.querySelectorAll('[data-recording-controller="true"]'),
-    ).toHaveLength(1);
-  });
-
-  it("returns from full-pane recording to the transcript when the user sends", async () => {
-    useRecordingStore.setState({ isRecording: true });
-    await renderChat({
-      codeBlockMode: true,
-      liveBrowserSessionId: "pbs_recording",
-    });
-    const mountId = screen
-      .getByTestId("recording-inline")
-      .getAttribute("data-mount-id");
-
-    fireEvent.click(
-      screen.getByRole("button", { name: "Expand demonstration" }),
-    );
-    expect(screen.getByTestId("recording-focus")).toBeTruthy();
-    expect(
-      document.querySelectorAll('[data-recording-controller="true"]'),
-    ).toHaveLength(1);
-
-    await submit("Only download invoices marked Paid.");
-
-    expect(screen.queryByTestId("recording-focus")).toBeNull();
-    expect(screen.getByTestId("recording-inline")).toBeTruthy();
-    expect(
-      screen.getByTestId("recording-inline").getAttribute("data-mount-id"),
-    ).toBe(mountId);
-    expect(
-      document.querySelectorAll('[data-recording-controller="true"]'),
-    ).toHaveLength(1);
-    expect(
-      screen.getByText("Only download invoices marked Paid."),
-    ).toBeTruthy();
-  });
-
-  it("keeps the recording controller mounted while the Copilot pane is closed", async () => {
-    useRecordingStore.setState({
-      isRecording: false,
-      finishRequested: true,
-    });
-    const { rerender } = await renderChat({
-      codeBlockMode: true,
-      liveBrowserSessionId: "pbs_recording",
-      isOpen: false,
-    });
-
-    expect(screen.getByTestId("recording-inline")).toBeTruthy();
-    const mountId = screen
-      .getByTestId("recording-inline")
-      .getAttribute("data-mount-id");
-    expect(
-      document.querySelectorAll('[data-recording-controller="true"]'),
-    ).toHaveLength(1);
-
-    rerender(
-      <FeatureFlagContext.Provider value={() => true}>
-        <WorkflowCopilotChat isOpen liveBrowserSessionId="pbs_recording" />
-      </FeatureFlagContext.Provider>,
-    );
-
-    expect(screen.getByTestId("recording-inline")).toBeTruthy();
-    // A finishing recording refuses sends, so the composer must not offer one.
-    expect(textarea().disabled).toBe(true);
-    expect(
-      (
-        screen.getByRole("button", {
-          name: "Send disabled — finish the current authoring action",
-        }) as HTMLButtonElement
-      ).disabled,
-    ).toBe(true);
-    expect(
-      screen.getByTestId("recording-inline").getAttribute("data-mount-id"),
-    ).toBe(mountId);
-    expect(
-      document.querySelectorAll('[data-recording-controller="true"]'),
-    ).toHaveLength(1);
-  });
-
-  it("keeps the recording controller mounted through a browser session id blip", async () => {
-    useRecordingStore.setState({
-      isRecording: false,
-      finishRequested: true,
-    });
-    const { rerender } = await renderChat({
-      codeBlockMode: true,
-      liveBrowserSessionId: "pbs_recording",
-    });
-    const mountId = screen
-      .getByTestId("recording-inline")
-      .getAttribute("data-mount-id");
-
-    rerender(
-      <FeatureFlagContext.Provider value={() => true}>
-        <WorkflowCopilotChat />
-      </FeatureFlagContext.Provider>,
-    );
-    expect(screen.getByTestId("recording-inline")).toBeTruthy();
-    expect(
-      screen.getByTestId("recording-inline").getAttribute("data-mount-id"),
-    ).toBe(mountId);
-
-    rerender(
-      <FeatureFlagContext.Provider value={() => true}>
-        <WorkflowCopilotChat liveBrowserSessionId="pbs_recording" />
-      </FeatureFlagContext.Provider>,
-    );
-    expect(
-      screen.getByTestId("recording-inline").getAttribute("data-mount-id"),
-    ).toBe(mountId);
   });
 });

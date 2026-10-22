@@ -12,24 +12,14 @@ import type { Edge, NodeProps } from "@xyflow/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
-import { useRecordedBlocksStore } from "@/store/RecordedBlocksStore";
 import { useCopilotActionStore } from "@/store/useCopilotActionStore";
-import type { useProcessRecordingMutation } from "@/routes/browserSessions/hooks/useProcessRecordingMutation";
 import { useWorkflowHasChangesStore } from "@/store/WorkflowHasChangesStore";
 import {
-  beginCopilotAcceptance,
-  finishCopilotAcceptance,
-  beginYamlCommit,
   createYamlCommitOwner,
   registerEditorOwner,
-  unregisterEditorOwner,
-  finishYamlCommit,
   useWorkflowYamlEditorStore,
 } from "@/store/WorkflowYamlEditorStore";
 import { DebugStoreContext } from "@/store/DebugStoreContext";
-import { useRecordingStore } from "@/store/useRecordingStore";
-import { usePendingRecordingStartGate } from "@/routes/workflows/editor/recording/pendingRecordingStartGate";
-import { PendingRecordingStartDialog } from "@/routes/workflows/editor/recording/PendingRecordingStartDialog";
 import { useSettingsStore } from "@/store/SettingsStore";
 import { useWorkflowPanelStore } from "@/store/WorkflowPanelStore";
 import { useWorkflowSettingsStore } from "@/store/WorkflowSettingsStore";
@@ -64,20 +54,6 @@ vi.mock("react-router-dom", async () => {
   };
 });
 
-const recordingMutation = vi.hoisted(() => ({
-  onSuccess: undefined as Parameters<
-    typeof useProcessRecordingMutation
-  >[0]["onSuccess"],
-}));
-vi.mock("@/routes/browserSessions/hooks/useProcessRecordingMutation", () => ({
-  useProcessRecordingMutation: (
-    options: Parameters<typeof useProcessRecordingMutation>[0],
-  ) => {
-    recordingMutation.onSuccess = options.onSuccess;
-    return { isPending: false, mutate: vi.fn() };
-  },
-}));
-
 vi.mock("@/components/ui/use-toast", () => ({ toast: vi.fn() }));
 vi.mock("posthog-js/react", () => ({
   usePostHog: () => ({ capture: vi.fn() }),
@@ -92,7 +68,6 @@ function queryWrapper({ children }: { children: ReactNode }) {
 }
 
 const initialSettings = useSettingsStore.getState();
-const initialRecording = useRecordingStore.getState();
 const initialWorkflowSettings = useWorkflowSettingsStore.getState();
 
 function renderNodeAdder(
@@ -118,7 +93,6 @@ function renderNodeAdder(
 describe("NodeAdderNode", () => {
   beforeEach(() => {
     vi.clearAllMocks();
-    useRecordedBlocksStore.getState().clearRecordedBlocks();
     useWorkflowYamlEditorStore.setState(
       useWorkflowYamlEditorStore.getInitialState(),
     );
@@ -127,7 +101,6 @@ describe("NodeAdderNode", () => {
       useWorkflowHasChangesStore.getInitialState(),
     );
     useSettingsStore.setState(initialSettings, true);
-    useRecordingStore.setState(initialRecording, true);
     useWorkflowSettingsStore.setState(initialWorkflowSettings, true);
     useWorkflowPanelStore.setState({
       workflowPanelState: {
@@ -138,7 +111,6 @@ describe("NodeAdderNode", () => {
 
     useSettingsStore.getState().setIsUsingABrowser(false);
     useSettingsStore.getState().setIsLoadingABrowser(false);
-    useRecordingStore.setState({ isRecording: false });
     useWorkflowSettingsStore.setState({ finallyBlockLabel: null });
     useEdgesMock.mockReset();
     useNodesMock.mockReset();
@@ -147,112 +119,9 @@ describe("NodeAdderNode", () => {
   afterEach(() => {
     cleanup();
     useCopilotActionStore.setState({ stageAttachment: null });
-    useRecordedBlocksStore.getState().clearRecordedBlocks();
-    useRecordingStore.setState(initialRecording, true);
     useWorkflowYamlEditorStore.setState(
       useWorkflowYamlEditorStore.getInitialState(),
     );
-  });
-
-  it.each([true, false])(
-    "publishes recording blocks only for a live owner: %s",
-    (live) => {
-      const owner = useWorkflowYamlEditorStore.getState().editorOwner!;
-      useNodesMock.mockReturnValue([]);
-      useEdgesMock.mockReturnValue([]);
-      renderNodeAdder({});
-      if (!live) {
-        act(() => {
-          unregisterEditorOwner(owner);
-          registerEditorOwner(createYamlCommitOwner("wpid-other"));
-        });
-      }
-      act(() =>
-        recordingMutation.onSuccess?.(
-          { recordingId: "br-1", blocks: [], parameters: [] },
-          owner,
-        ),
-      );
-      expect(useRecordedBlocksStore.getState().owner).toBe(live ? owner : null);
-      expect(useRecordedBlocksStore.getState().blocks).toEqual(
-        live ? [] : null,
-      );
-    },
-  );
-
-  it.each(["copilot", "yaml"])(
-    "refuses canvas recording during %s ownership and releases it on abort",
-    async (lock) => {
-      useEdgesMock.mockReturnValue([
-        { id: "edge", source: "start", target: "adder" },
-      ]);
-      useNodesMock.mockReturnValue([{ id: "start", type: "start", data: {} }]);
-      useSettingsStore.getState().setIsUsingABrowser(true);
-      const owner = createYamlCommitOwner("wpid_test");
-      const token = lock === "copilot" ? beginCopilotAcceptance() : null;
-      if (lock === "yaml") expect(beginYamlCommit(owner)).toBe(true);
-      renderNodeAdder({}, { debug: true });
-      await act(async () =>
-        fireEvent.click(screen.getByText("Demonstrate task")),
-      );
-      expect(useRecordingStore.getState().isRecording).toBe(false);
-      act(() => {
-        if (token) finishCopilotAcceptance(token);
-        else finishYamlCommit(owner);
-      });
-      await act(async () =>
-        fireEvent.click(screen.getByText("Demonstrate task")),
-      );
-      expect(useRecordingStore.getState().isRecording).toBe(true);
-      expect(useWorkflowYamlEditorStore.getState().authoringInProgress).toBe(
-        true,
-      );
-      const conversational = beginCopilotAcceptance();
-      expect(conversational).not.toBeNull();
-      finishCopilotAcceptance(conversational!);
-      act(() => useRecordingStore.getState().reset());
-      expect(useWorkflowYamlEditorStore.getState().authoringInProgress).toBe(
-        false,
-      );
-      const reservation = beginCopilotAcceptance();
-      expect(reservation).not.toBeNull();
-      finishCopilotAcceptance(reservation!);
-    },
-  );
-
-  it("asks to save or discard pending generated changes before recording", async () => {
-    useEdgesMock.mockReturnValue([
-      { id: "edge", source: "start", target: "adder" },
-    ]);
-    useNodesMock.mockReturnValue([{ id: "start", type: "start", data: {} }]);
-    useSettingsStore.getState().setIsUsingABrowser(true);
-    useWorkflowHasChangesStore.setState({ hasChanges: true });
-    useWorkflowHasChangesStore
-      .getState()
-      .setPendingRecording("br-pending", "wpid_test");
-    const { unmount } = renderNodeAdder({}, { debug: true });
-    await act(async () =>
-      fireEvent.click(screen.getByText("Demonstrate task")),
-    );
-    expect(useRecordingStore.getState().isRecording).toBe(false);
-    const blockedStart = usePendingRecordingStartGate.getState().blockedStart;
-    expect(blockedStart).not.toBeNull();
-    // Discard regenerates canvas ids, so this entry point must not record after it.
-    render(
-      <PendingRecordingStartDialog
-        onSave={async () => {}}
-        onDiscard={() => {}}
-      />,
-    );
-    expect(
-      screen.getByRole("button", { name: "Discard changes" }),
-    ).toBeTruthy();
-    // Discard reloads the graph with new ids, which unmounts this location.
-    unmount();
-    act(() => {
-      expect(blockedStart!()).toBe(false);
-    });
-    expect(useRecordingStore.getState().isRecording).toBe(false);
   });
 
   it("stages a picked PDF in Copilot with a draft naming the block before it", () => {
@@ -339,47 +208,5 @@ describe("NodeAdderNode", () => {
       },
     });
     expect(state.data?.branchContext).toBeUndefined();
-  });
-
-  it("shows processing instead of a second stop action after Done", () => {
-    useEdgesMock.mockReturnValue([
-      { id: "edge", source: "start", target: "adder" },
-    ]);
-    useNodesMock.mockReturnValue([
-      { id: "start", parentId: "loop", type: "start", data: {} },
-    ]);
-    useSettingsStore.getState().setIsUsingABrowser(true);
-    useRecordingStore.setState({
-      isRecording: true,
-      finishRequested: true,
-    });
-    useWorkflowPanelStore.setState({
-      workflowPanelState: {
-        active: false,
-        content: "nodeLibrary",
-        data: {
-          previous: "start",
-          next: "adder",
-          parent: "loop",
-          connectingEdgeType: "default",
-        },
-      },
-    });
-
-    renderNodeAdder({}, { debug: true });
-
-    const busyControl =
-      screen.getByTestId("node-adder-button").parentElement?.parentElement;
-    expect(busyControl).toBeTruthy();
-    fireEvent.mouseEnter(busyControl!);
-
-    expect(screen.getAllByText("Processing...").length).toBeGreaterThan(0);
-    expect(screen.queryAllByText("Stop & generate workflow")).toHaveLength(0);
-
-    fireEvent.click(busyControl!.firstElementChild!);
-    expect(useRecordingStore.getState()).toMatchObject({
-      isRecording: true,
-      finishRequested: true,
-    });
   });
 });

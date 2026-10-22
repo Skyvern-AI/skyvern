@@ -18,7 +18,6 @@ from skyvern.forge.sdk.routes.streaming.channels import message as message_modul
 from skyvern.forge.sdk.routes.streaming.channels.execution import ExecutionChannel, LocalExecutionChannel
 from skyvern.forge.sdk.routes.streaming.channels.message import (
     MessageChannel,
-    MessageInBeginExfiltration,
     MessageInClearAllData,
     MessageInClearCookies,
     MessageInClearHistory,
@@ -26,18 +25,13 @@ from skyvern.forge.sdk.routes.streaming.channels.message import (
     MessageInGoBack,
     MessageInGoForward,
     MessageInNavigate,
-    MessageInRecordingRearmCapture,
     MessageInReload,
     MessageInTakeScreenshot,
     MessageKind,
     MessageOutBrowserUrl,
-    MessageOutExfiltratedEvent,
-    MessageOutRecordingInterpretationUpdate,
     loop_stream_messages,
-    message_to_dict,
     reify_channel_message,
 )
-from skyvern.services.browser_recording.types import ActionKind, RecordingDraftStep
 
 
 class TestReifyChannelMessage:
@@ -96,101 +90,6 @@ class TestReifyChannelMessage:
     def test_unknown_kind_raises(self) -> None:
         with pytest.raises(ValueError):
             reify_channel_message({"kind": "totally-not-a-real-kind"})
-
-    def test_begin_exfiltration_carries_live_interpretation_context(self) -> None:
-        msg = reify_channel_message(
-            {
-                "kind": "begin-exfiltration",
-                "workflow_permanent_id": "wpid_123",
-                "live_interpretation_enabled": True,
-            }
-        )
-
-        assert isinstance(msg, MessageInBeginExfiltration)
-        assert msg.workflow_permanent_id == "wpid_123"
-        assert msg.live_interpretation_enabled is True
-
-    def test_begin_exfiltration_defaults_no_delta_support(self) -> None:
-        # An existing client that predates deltas omits the field; it must default
-        # false so the backend keeps sending full snapshots (no breakage).
-        msg = reify_channel_message(
-            {
-                "kind": "begin-exfiltration",
-                "workflow_permanent_id": "wpid_123",
-                "live_interpretation_enabled": True,
-            }
-        )
-        assert isinstance(msg, MessageInBeginExfiltration)
-        assert msg.supports_interpretation_deltas is False
-
-    def test_begin_exfiltration_honors_declared_delta_support(self) -> None:
-        msg = reify_channel_message(
-            {
-                "kind": "begin-exfiltration",
-                "workflow_permanent_id": "wpid_123",
-                "live_interpretation_enabled": True,
-                "supports_interpretation_deltas": True,
-            }
-        )
-        assert isinstance(msg, MessageInBeginExfiltration)
-        assert msg.supports_interpretation_deltas is True
-
-    def test_begin_exfiltration_defaults_no_recording_attempt_id(self) -> None:
-        msg = reify_channel_message(
-            {
-                "kind": "begin-exfiltration",
-                "workflow_permanent_id": "wpid_123",
-                "live_interpretation_enabled": True,
-            }
-        )
-        assert isinstance(msg, MessageInBeginExfiltration)
-        assert msg.recording_attempt_id is None
-
-    def test_begin_exfiltration_carries_recording_attempt_id(self) -> None:
-        msg = reify_channel_message(
-            {
-                "kind": "begin-exfiltration",
-                "workflow_permanent_id": "wpid_123",
-                "live_interpretation_enabled": True,
-                "recording_attempt_id": "attempt-abc",
-            }
-        )
-        assert isinstance(msg, MessageInBeginExfiltration)
-        assert msg.recording_attempt_id == "attempt-abc"
-
-    def test_recording_rearm_capture(self) -> None:
-        assert isinstance(
-            reify_channel_message({"kind": "recording-rearm-capture"}),
-            MessageInRecordingRearmCapture,
-        )
-
-
-class TestMessageSerialization:
-    def test_recording_interpretation_update_serializes_pydantic_steps(self) -> None:
-        message = MessageOutRecordingInterpretationUpdate(
-            interpretation_session_id="session-abc",
-            session_revision=2,
-            pending=False,
-            finalized=True,
-            steps=[
-                RecordingDraftStep(
-                    step_id="step-1",
-                    action_kind=ActionKind.CLICK,
-                    block_type="action",
-                    label="click_submit",
-                    title="Click submit",
-                    navigation_goal="Click submit",
-                )
-            ],
-        )
-
-        serialized = message_to_dict(message)
-
-        assert serialized["kind"] == "recording-interpretation-update"
-        assert serialized["interpretation_session_id"] == "session-abc"
-        assert serialized["session_revision"] == 2
-        assert serialized["finalized"] is True
-        assert serialized["steps"][0]["action_kind"] == "click"
 
 
 class TestExecutionChannelHelpers:
@@ -657,30 +556,7 @@ class TestMessageLoopPump:
 
 class TestMessageToDictJsonSafety:
     def test_non_finite_floats_become_null(self) -> None:
-        msg = MessageOutExfiltratedEvent(
-            event_name="click",
-            params={"mousePosition": {"xa": 42.0, "xp": float("nan"), "yp": float("inf")}},
-        )
+        data = message_module._replace_non_finite({"mouse": {"xa": 42.0, "xp": float("nan"), "yp": [float("inf")]}})
 
-        data = message_to_dict(msg)
-
-        mouse = data["params"]["mousePosition"]
-        assert mouse["xa"] == 42.0
-        assert mouse["xp"] is None
-        assert mouse["yp"] is None
-        json.dumps(data, allow_nan=False)
-
-    def test_non_finite_floats_in_nested_model_become_null(self) -> None:
-        step = RecordingDraftStep(
-            step_id="s1",
-            action_kind=ActionKind.CLICK,
-            block_type="action",
-            label="click",
-            timestamp_start=float("nan"),
-        )
-        msg = MessageOutRecordingInterpretationUpdate(steps=[step])
-
-        data = message_to_dict(msg)
-
-        assert data["steps"][0]["timestamp_start"] is None
+        assert data == {"mouse": {"xa": 42.0, "xp": None, "yp": [None]}}
         json.dumps(data, allow_nan=False)

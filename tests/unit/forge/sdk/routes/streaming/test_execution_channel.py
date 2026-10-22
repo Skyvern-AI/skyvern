@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import typing as t
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
 
@@ -10,11 +11,140 @@ import pytest
 from playwright._impl._errors import TargetClosedError
 
 from skyvern.forge.sdk.routes.streaming.channels.execution import ExecutionChannel, execution_channel
-from tests.unit.forge.sdk.routes.streaming.test_exfiltration_channel import (
-    _FakePw,
-    _make_context,
-    _patch_pw_stack,
-)
+
+
+def _make_context() -> MagicMock:
+    browser_session = MagicMock()
+    browser_session.browser_address = "http://localhost:9222"
+    browser_session.persistent_browser_session_id = "pbs_123"
+
+    context = MagicMock()
+    context.organization_id = "org_123"
+    context.x_api_key = "api-key-123"
+    context.browser_session = browser_session
+    context.identity = {
+        "client_id": "client-1",
+        "browser_session_id": browser_session.persistent_browser_session_id,
+    }
+
+    return context
+
+
+class _FakeCdpSession:
+    def __init__(self) -> None:
+        self.detached = False
+
+    async def send(self, method: str, params: dict | None = None) -> None:
+        return None
+
+    async def detach(self) -> None:
+        self.detached = True
+
+
+class _FakePwPage:
+    def __init__(self, context: _FakeContext) -> None:
+        self.url = "https://example.com"
+        self.context = context
+
+    async def add_init_script(self, *args: object, **kwargs: object) -> None:
+        return None
+
+    async def evaluate(self, *args: object, **kwargs: object) -> None:
+        return None
+
+    def on(self, *args: object, **kwargs: object) -> None:
+        return None
+
+    def remove_listener(self, *args: object, **kwargs: object) -> None:
+        return None
+
+
+class _FakeContext:
+    def __init__(self) -> None:
+        self.pages: list[_FakePwPage] = [_FakePwPage(self)]
+
+    async def new_cdp_session(self, page: object) -> _FakeCdpSession:
+        return _FakeCdpSession()
+
+
+class _FakePwBrowser:
+    """A stand-in for a Playwright Browser obtained via connect_over_cdp."""
+
+    def __init__(self, *, fire_disconnect_on_close: bool) -> None:
+        self._connected = True
+        self._fire_disconnect_on_close = fire_disconnect_on_close
+        self.handlers: dict[str, t.Callable[[], None]] = {}
+        self.context = _FakeContext()
+        self.contexts = [self.context]
+        self.close_calls = 0
+
+    def is_connected(self) -> bool:
+        return self._connected
+
+    def on(self, event: str, callback: t.Callable[[], None]) -> None:
+        self.handlers[event] = callback
+
+    async def new_browser_cdp_session(self) -> _FakeCdpSession:
+        return _FakeCdpSession()
+
+    async def new_context(self) -> _FakeContext:
+        return self.context
+
+    async def close(self) -> None:
+        self.close_calls += 1
+        self._connected = False
+        # Real playwright fires "disconnected" when a connected browser is closed;
+        # this reproduces that so the reconnect-guard can be exercised end-to-end.
+        if self._fire_disconnect_on_close:
+            handler = self.handlers.get("disconnected")
+            if handler is not None:
+                handler()
+
+
+class _FakePw:
+    def __init__(self) -> None:
+        self.stopped = False
+
+    async def stop(self) -> None:
+        self.stopped = True
+
+
+class _FakePwManager:
+    def __init__(self, on_start: t.Callable[[], _FakePw]) -> None:
+        self._on_start = on_start
+
+    async def start(self) -> _FakePw:
+        return self._on_start()
+
+
+def _patch_pw_stack(monkeypatch: pytest.MonkeyPatch, *, fire_disconnect_on_close: bool = False) -> SimpleNamespace:
+    """Replace the Playwright driver + CDP connect helper with counting fakes.
+
+    `start_calls` counts local Playwright driver spawns, so a reconnect (which starts
+    a fresh driver) is observable without launching a real Node subprocess.
+    """
+    import skyvern.forge.sdk.routes.streaming.channels.cdp as cdp_mod
+
+    state = SimpleNamespace(start_calls=0, pws=[], browsers=[], connections=[])
+
+    def _make_pw() -> _FakePw:
+        state.start_calls += 1
+        pw = _FakePw()
+        state.pws.append(pw)
+        return pw
+
+    def _fake_async_playwright() -> _FakePwManager:
+        return _FakePwManager(_make_pw)
+
+    async def _fake_connect(pw: object, url: str, headers: dict | None = None, **kwargs: object) -> _FakePwBrowser:
+        browser = _FakePwBrowser(fire_disconnect_on_close=fire_disconnect_on_close)
+        state.browsers.append(browser)
+        state.connections.append((url, headers))
+        return browser
+
+    monkeypatch.setattr(cdp_mod, "async_playwright", _fake_async_playwright)
+    monkeypatch.setattr(cdp_mod, "connect_over_cdp_with_diagnostics", _fake_connect)
+    return state
 
 
 async def _drain_loop() -> None:

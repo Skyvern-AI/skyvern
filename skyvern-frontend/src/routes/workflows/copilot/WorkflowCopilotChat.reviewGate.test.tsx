@@ -99,7 +99,6 @@ import type {
 import { TooltipProvider } from "@/components/ui/tooltip";
 import { SaveButton } from "@/routes/workflows/studio/StudioTopBar";
 import { useCopilotActionStore } from "@/store/useCopilotActionStore";
-import { useRecordingStore } from "@/store/useRecordingStore";
 
 import {
   fenceBaselineFor,
@@ -313,9 +312,6 @@ vi.mock("./useInfiniteCopilotChatsQuery", () => ({
     isFetchingNextPage: false,
     isFetching: false,
   }),
-}));
-vi.mock("@/routes/workflows/editor/recording/RecordingPanel", () => ({
-  RecordingPanel: () => <div data-testid="recording-chapter" />,
 }));
 
 let editorNodes: AppNode[] = [];
@@ -7813,37 +7809,6 @@ describe("WorkflowCopilotChat — g2 review gate", () => {
       });
     } finally {
       finishSaveTransaction(owner);
-      useCopilotActionStore.setState(useCopilotActionStore.getInitialState());
-    }
-  });
-
-  it("clears a block Generate refused during recording and disarms its target", async () => {
-    useCopilotActionStore.setState(useCopilotActionStore.getInitialState());
-    useRecordingStore.setState({ isRecording: true });
-    await renderChat();
-    try {
-      await act(async () => {
-        useCopilotActionStore.getState().requestBuild({
-          blockLabel: "extract_titles",
-          prompt: "read titles",
-        });
-      });
-      expect(useCopilotActionStore.getState().pendingBuild).toBeNull();
-      expect(useCopilotActionStore.getState().generatingBlockLabel).toBeNull();
-      expect(postStreaming).not.toHaveBeenCalled();
-      expect(
-        useWorkflowYamlEditorStore.getState().copilotAcceptance,
-      ).toBeNull();
-
-      await act(async () => useRecordingStore.setState({ isRecording: false }));
-      await submit("Continue editing the workflow");
-      await waitFor(() => expect(postStreaming).toHaveBeenCalledOnce());
-      expect(streamCalls[0]?.body).toMatchObject({
-        message: "Continue editing the workflow",
-        target_block_label: null,
-      });
-    } finally {
-      useRecordingStore.setState({ isRecording: false });
       useCopilotActionStore.setState(useCopilotActionStore.getInitialState());
     }
   });

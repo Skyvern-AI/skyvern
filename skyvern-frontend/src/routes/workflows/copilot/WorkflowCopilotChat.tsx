@@ -48,12 +48,10 @@ import {
   Status,
 } from "@/api/types";
 import { useCredentialGetter } from "@/hooks/useCredentialGetter";
-import { useFeatureFlag } from "@/hooks/useFeatureFlag";
 import { CredentialsModal } from "@/routes/credentials/CredentialsModal";
 import { CredentialModalTypes } from "@/routes/credentials/useCredentialModalState";
 import { useLocation, useNavigate, useParams } from "react-router-dom";
 import { useWorkflowPermanentId } from "@/routes/workflows/WorkflowPermanentIdContext";
-import { RecordingPanel } from "@/routes/workflows/editor/recording/RecordingPanel";
 import {
   ReloadIcon,
   Cross2Icon,
@@ -63,7 +61,6 @@ import {
   PlusIcon,
   PauseIcon,
   ExclamationTriangleIcon,
-  EnterFullScreenIcon,
   DownloadIcon,
 } from "@radix-ui/react-icons";
 import { createPortal } from "react-dom";
@@ -184,10 +181,6 @@ import {
 import { QueuedMessageStrip } from "./QueuedMessageStrip";
 import { ScreenshotThumbnail } from "./ScreenshotThumbnail";
 import { SteerReceipt } from "./SteerReceipt";
-import {
-  RecordingRefinementProgressCard,
-  type RecordingRefinementStatus,
-} from "./RecordingRefinementProgressCard";
 import { useRunLifecycleAnnouncements } from "./useRunLifecycleAnnouncements";
 import { useWorkflowRunQuery } from "../hooks/useWorkflowRunQuery";
 import { runIsLogicallyFinal } from "@/routes/workflows/workflowRun/runRetryState";
@@ -277,10 +270,6 @@ import {
 } from "@/routes/workflows/studio/liveSearch";
 import { useStudioPanes } from "@/routes/workflows/studio/useStudioPanes";
 import { useStudioPaneDefaults } from "@/routes/workflows/studio/StudioPaneDefaultsContext";
-import { useRecordingStore } from "@/store/useRecordingStore";
-import { useRecordingRefinementEvidenceStore } from "@/store/RecordingRefinementEvidenceStore";
-import { captureRecordBrowser } from "@/util/recordBrowserTelemetry";
-import { RecordingFeedbackPrompt } from "@/routes/workflows/editor/recording/RecordingFeedbackPrompt";
 import {
   sopAttachmentDraft,
   stageSopFile,
@@ -291,7 +280,6 @@ import { TooltipProvider } from "@/components/ui/tooltip";
 import { useLogging } from "@/hooks/useLogging";
 import { getCopilotFailureLogFields } from "./copilotFailureLogFields";
 import { captureChatScope, type ChatScopeRefs } from "./chatReadScope";
-import { WORKFLOW_COPILOT_DEMONSTRATION_FLAG } from "@/util/featureFlags";
 import { safeHttpUrl } from "@/util/httpUrl";
 import { useDemonstrationRecorder } from "./useDemonstrationRecorder";
 import {
@@ -458,21 +446,7 @@ const DEMONSTRATION_DONE_MESSAGE =
   "I've shown you the task in the browser. Build a workflow that does it.";
 const diagnoseRunReceipt = (runId: string) =>
   `Diagnose run ${runId} and repair the workflow.`;
-// Must stay equal to REFINE_RECORDING_RECEIPT in routes/workflow_copilot.py: the server
-// rewrites the message, so a different wording here would change the row on history reload.
-const refineRecordingReceipt = (actionCount: number) =>
-  `Refine the recording (${actionCount} actions) into a reusable workflow.`;
-const REFINE_RECORDING_RECEIPT_PATTERN =
-  /^Refine the recording \((\d+) actions\) into a reusable workflow\.$/;
-
-function refineRecordingActionCount(content: string): number | null {
-  const match = REFINE_RECORDING_RECEIPT_PATTERN.exec(content);
-  if (!match) return null;
-  const count = Number(match[1]);
-  return Number.isSafeInteger(count) && count >= 0 ? count : null;
-}
-
-function isCancelledRefinementTurn(
+function isCancelledTurn(
   terminalReason: string | null | undefined,
   narrative: TurnNarrativeState | undefined,
 ): boolean {
@@ -483,47 +457,13 @@ function isCancelledRefinementTurn(
   );
 }
 
-type RefinementFailureClass =
-  | "turn_error"
-  | "run_failed"
-  | "no_proposal"
-  | "interrupted"
-  | "connection_lost";
-
-// `reported` is keyed by turn id so the live stream and a recovery poll for one turn report once.
-function reportRecordingRefinementOutcome(
-  reported: Set<string>,
-  key: string,
-  status: Exclude<RecordingRefinementStatus, "working">,
-  failureClass: RefinementFailureClass,
-  properties: Record<string, unknown>,
-): void {
-  if (reported.has(key)) return;
-  reported.add(key);
-  captureRecordBrowser("record_browser.refinement_finished", {
-    ...properties,
-    // The refinement turn has no browser, so "drafted" is never a validated run.
-    outcome: status === "complete" ? "drafted" : status,
-    failure_class: status === "failed" ? failureClass : undefined,
-  });
-}
-
-function refinementFailureClass(
-  narrative: TurnNarrativeState | undefined,
-): RefinementFailureClass {
-  if (narrative?.terminal === "error") return "turn_error";
-  if (narrative && notConfirmedOutcome(narrative) !== null) return "run_failed";
-  return "no_proposal";
-}
-
-// diagnose_run and refine_recording both open the turn with a server-authored receipt.
+// diagnose_run opens the turn with a server-authored receipt.
 const isProductAuthoredAction = (action: ArmedProductAction | null): boolean =>
-  action?.action === "diagnose_run" || action?.action === "refine_recording";
+  action?.action === "diagnose_run";
 
 type ArmedProductAction =
   | { action: "test_end_to_end"; workflowRunId?: undefined; nonce?: undefined }
   | { action: "diagnose_run"; workflowRunId: string; nonce?: undefined }
-  | { action: "refine_recording"; workflowRunId?: undefined; nonce: string }
   | {
       action: "demonstrate";
       workflowRunId?: undefined;
@@ -759,15 +699,8 @@ export interface ChatMessage {
     | "run_lifecycle"
     | "status_notice"
     | "template_inputs"
-    | "recording_refinement"
     | "initial_handoff";
   recoveryTurnId?: string;
-  recordingRefinement?: {
-    actionCount: number;
-    startedAtMs: number;
-    status: RecordingRefinementStatus;
-    turnId?: string;
-  };
   attachedFiles?: CopilotAttachedFile[];
   demonstrationItems?: string[];
   // Persisted row id, known after a history load or a feedback write; a live turn is rated by turnId.
@@ -1011,19 +944,6 @@ const findLastIndexOfTurn = (
   return -1;
 };
 
-type RecordingSnapshot = Pick<
-  WorkflowCopilotChatRequest,
-  "recording_in_progress" | "recording_deleted_step_ids"
->;
-
-const snapshotRecording = (): RecordingSnapshot => {
-  const { isRecording, deletedStepIds } = useRecordingStore.getState();
-  return {
-    recording_in_progress: isRecording,
-    recording_deleted_step_ids: isRecording ? deletedStepIds : [],
-  };
-};
-
 // Only "typed" text is added to by a later send; a programmatic message (account choice, block
 // rebuild, armed action) is replaced, and a product receipt has no text to edit.
 type QueuedPromptOrigin = "typed" | "programmatic" | "product";
@@ -1037,17 +957,15 @@ type QueuedPrompt = {
   audioBlob?: Blob | null;
   idempotencyKey?: string;
   attachments?: CopilotAttachedFile[];
-  recording?: RecordingSnapshot;
 };
 
-// "Send now" delivers words only: audio, files and recording state ride on a turn's own request.
+// "Send now" delivers words only: audio and files ride on a turn's own request.
 function canSendQueuedPromptNow(prompt: QueuedPrompt): boolean {
   return (
     prompt.origin === "typed" &&
     prompt.reason === "working" &&
     !prompt.audioBlob &&
-    !prompt.attachments?.length &&
-    !prompt.recording?.recording_in_progress
+    !prompt.attachments?.length
   );
 }
 
@@ -1068,8 +986,6 @@ type SendOptions = {
   audioBlob?: Blob | null;
   idempotencyKey?: string;
   attachments?: CopilotAttachedFile[];
-  // Taken when the message was queued; undefined reads the store at send time.
-  recording?: RecordingSnapshot;
 };
 
 type WorkflowCopilotSsePayload =
@@ -1352,81 +1268,6 @@ function RunLifecycleLine({ content }: { content: string }) {
   );
 }
 
-function RecordingChapterProxy({
-  actionCount,
-  newActionCount,
-  lastActionTitle,
-  isFinishing,
-  stopSlotRef,
-  onJumpToChapter,
-  onExpand,
-}: {
-  actionCount: number;
-  newActionCount: number;
-  lastActionTitle: string | null;
-  isFinishing: boolean;
-  stopSlotRef: (el: HTMLDivElement | null) => void;
-  onJumpToChapter: () => void;
-  onExpand: () => void;
-}) {
-  return (
-    <div className="absolute inset-x-2 top-2 z-20 overflow-hidden rounded-lg border border-border bg-slate-elevation2 shadow-lg">
-      <div className="flex items-center gap-2 px-2.5 py-2">
-        <span className="flex size-6 shrink-0 items-center justify-center rounded-md bg-red-500/10">
-          {isFinishing ? (
-            <ReloadIcon className="size-3.5 animate-spin text-red-500 motion-reduce:animate-none" />
-          ) : (
-            <span className="size-2 animate-pulse rounded-full bg-red-500 motion-reduce:animate-none" />
-          )}
-        </span>
-        <button
-          type="button"
-          onClick={onJumpToChapter}
-          className="min-w-0 flex-1 text-left focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
-        >
-          <span className="block truncate text-xs font-semibold text-foreground">
-            {isFinishing
-              ? "Finishing demonstration…"
-              : "Copilot is following along"}
-          </span>
-          <span className="block truncate text-[10.5px] text-muted-foreground">
-            {isFinishing ? (
-              "Saving the last actions"
-            ) : (
-              <>
-                {actionCount} captured action{actionCount === 1 ? "" : "s"}
-                {newActionCount > 0 ? ` · ${newActionCount} new` : ""}
-              </>
-            )}
-          </span>
-        </button>
-        <div ref={stopSlotRef} className="flex shrink-0" />
-        <button
-          type="button"
-          aria-label="Expand demonstration"
-          title="Expand demonstration"
-          onClick={onExpand}
-          className="flex size-7 items-center justify-center rounded-md text-muted-foreground hover:bg-accent hover:text-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
-        >
-          <EnterFullScreenIcon className="size-3.5" />
-        </button>
-      </div>
-      {lastActionTitle && !isFinishing ? (
-        <button
-          type="button"
-          onClick={onJumpToChapter}
-          className="flex w-full items-center gap-1.5 border-t border-border px-3 py-1.5 text-left text-[11px] text-muted-foreground hover:bg-slate-elevation3 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-ring"
-        >
-          <span className="shrink-0 font-medium text-foreground">
-            Latest action:
-          </span>
-          <span className="truncate">{lastActionTitle}</span>
-        </button>
-      ) : null}
-    </div>
-  );
-}
-
 // `persisted` true = atomic accept (server already wrote new version); false/undefined = local edit.
 // `applied` marks a turn's accepted terminal apply; drafts and snap-backs omit it.
 export type WorkflowUpdateOptions = {
@@ -1492,6 +1333,8 @@ interface WorkflowCopilotChatProps {
   onRequestOpen?: () => void;
   onRecordTask?: () => void;
   canRecordTask?: boolean;
+  // The browser pane shows a run's browser, so a demonstration would record the hidden debug browser.
+  runOwnsBrowser?: boolean;
   authoringUnavailableReason?: string | null;
   // Render as a docked panel (no float/drag/resize) instead of a floating window.
   docked?: boolean;
@@ -1550,7 +1393,6 @@ type RecoveryPollOwnership = {
   reservation?: symbol;
   canonicalRecovery: CanonicalRecovery | null;
   ownsTurn: boolean;
-  recordingRefinementMessageId?: string;
   aliases: string[];
 };
 
@@ -1567,7 +1409,6 @@ type RecoveryPoll = {
       requestId: string;
       reservation?: symbol;
       ownsTurn: boolean;
-      recordingRefinementMessageId?: string;
     },
   ) => boolean;
 };
@@ -1583,7 +1424,6 @@ type CanonicalRecovery = {
     requestId: string;
     deadline: number;
     ownsTurn: boolean;
-    recordingRefinementMessageId?: string;
   };
   resumed?: boolean;
   cancellationRequested?: boolean;
@@ -1780,6 +1620,7 @@ export function WorkflowCopilotChat({
   onRequestOpen,
   onRecordTask,
   canRecordTask = false,
+  runOwnsBrowser = false,
   authoringUnavailableReason,
   docked = false,
   chromeless = false,
@@ -1787,8 +1628,6 @@ export function WorkflowCopilotChat({
 }: WorkflowCopilotChatProps = {}) {
   const workflowPermanentId = useWorkflowPermanentId();
   const logging = useLogging();
-  const demonstrationEnabled =
-    useFeatureFlag(WORKFLOW_COPILOT_DEMONSTRATION_FLAG) === true;
   useLayoutEffect(() => {
     if (workflowPermanentId)
       useWorkflowTitleStore
@@ -1804,16 +1643,6 @@ export function WorkflowCopilotChat({
   const initialHandoffMessageId = `initial-copilot-message-${workflowPermanentId ?? "pending"}`;
   // Set when a file is staged while the composer is hidden or not yet mounted.
   const focusComposerWhenShownRef = useRef(false);
-  const recordingAuthoringActive = useRecordingStore(
-    (state) => state.isRecording || state.finishRequested || state.isCommitting,
-  );
-  const recordingIsFinishing = useRecordingStore(
-    (state) => state.finishRequested || state.isCommitting,
-  );
-  // Recording is deliberately conversational: the live chapter owns capture,
-  // while the existing composer remains available for instructions and
-  // clarifications. Finishing a recording owns it exclusively.
-  const authoringInProgress = recordingIsFinishing;
   const [messages, setMessages] = useState<ChatMessage[]>(() => [
     ...(templateGuidance
       ? [
@@ -2181,7 +2010,6 @@ export function WorkflowCopilotChat({
   // the cancel POST and the watcher firing, so the frontend must remember it.
   const cancelInFlightController = useRef<AbortController | null>(null);
   const recoveryPolls = useRef(new Map<string, RecoveryPoll>());
-  const reportedRefinementOutcomes = useRef(new Set<string>());
   const chatPresentationGeneration = useRef(0);
   const recoverySnapshotStamps = useRef(new Map<string, number>());
   const recoveryGeneration = useRef(0);
@@ -2742,12 +2570,11 @@ export function WorkflowCopilotChat({
       const handle = useWorkflowBlockSearchStore.getState().handle;
       if (!handle) return;
       // Follow is a courtesy, so every guard errs toward not moving: the user
-      // disengaged (touched the studio), recording mode owns the panes, or the
-      // frame repeats the block already followed. resolveTimelineBlockJumpNodeId
+      // disengaged (touched the studio) or the frame repeats the block already
+      // followed. resolveTimelineBlockJumpNodeId
       // adds the editor-open and unique-canvas-match rules.
       if (
         !buildFollowEngaged.current ||
-        useRecordingStore.getState().isRecording ||
         label === lastFollowedLabelRef.current
       ) {
         return;
@@ -3210,25 +3037,13 @@ export function WorkflowCopilotChat({
       state.copilotAcceptance !== null ||
       state.authoringInProgress,
   );
-  // Mirrors beginCopilotAcceptance: a capturing recording does not hold back queued messages.
-  const queueDrainLocked = useWorkflowYamlEditorStore(
-    (state) =>
-      state.commitInProgress ||
-      state.copilotAcceptance !== null ||
-      (state.authoringInProgress &&
-        (!recordingAuthoringActive || recordingIsFinishing)),
-  );
+  const queueDrainLocked = workflowMutationLocked;
   const hasInitializedPosition = useRef(false);
   const hasAutoSentRef = useRef(false);
   const isWaitingForLiveBrowser = shouldWaitForLiveBrowser({
     requiresLiveBrowser,
     isLiveBrowserReady,
   });
-  // Read, not taken: the receipt names the action count, and the packet itself is
-  // taken (and cleared) only when the turn is actually posted.
-  const armedRecordingEvidence = useRecordingRefinementEvidenceStore(
-    (state) => state.armed,
-  );
   // Reset on initialMessage/action change so a re-arrival of the prop (without a
   // remount) can fire auto-send again.
   useEffect(() => {
@@ -3236,13 +3051,9 @@ export function WorkflowCopilotChat({
   }, [initialMessage, initialAction?.nonce]);
   // The server rewrites a typed action's message to its own receipt; echoing that same
   // text keeps the row from changing wording when the persisted history reloads.
-  const autoSendMessage = !initialAction
-    ? initialMessage
-    : initialAction.kind === "diagnose_run"
-      ? diagnoseRunReceipt(initialAction.workflowRunId)
-      : refineRecordingReceipt(
-          armedRecordingEvidence?.evidence.actions.length ?? 0,
-        );
+  const autoSendMessage = initialAction
+    ? diagnoseRunReceipt(initialAction.workflowRunId)
+    : initialMessage;
   const onInitialMessageConsumedRef = useRef(onInitialMessageConsumed);
   useEffect(() => {
     onInitialMessageConsumedRef.current = onInitialMessageConsumed;
@@ -3270,121 +3081,8 @@ export function WorkflowCopilotChat({
       proposedWorkflow,
     ],
   );
-  const recordingChapterRef = useRef<HTMLDivElement | null>(null);
-  const recordingFocusPortalRef = useRef<HTMLDivElement | null>(null);
-  const [recordingInlinePortalEl, setRecordingInlinePortalEl] =
-    useState<HTMLDivElement | null>(null);
-  const [recordingSuggestionPortalEl, setRecordingSuggestionPortalEl] =
-    useState<HTMLDivElement | null>(null);
-  const recordingWasActiveRef = useRef(false);
-  const [recordingBoundary, setRecordingBoundary] = useState<number | null>(
-    null,
-  );
-  const [recordingFocusOpen, setRecordingFocusOpen] = useState(false);
-  const [recordingCollapsed, setRecordingCollapsed] = useState(false);
-  const [recordingChapterAboveViewport, setRecordingChapterAboveViewport] =
-    useState(false);
-  const [recordingProxyStopSlotEl, setRecordingProxyStopSlotEl] =
-    useState<HTMLDivElement | null>(null);
-  const [recordingProxyBaseline, setRecordingProxyBaseline] = useState(0);
-  const recordingDraftSteps = useRecordingStore((state) => state.draftSteps);
-  const recordingDeletedStepIds = useRecordingStore(
-    (state) => state.deletedStepIds,
-  );
-  const dismissedCredentialStepIds = useRecordingStore(
-    (state) => state.dismissedCredentialStepIds,
-  );
-  const recordingOptimisticSteps = useRecordingStore(
-    (state) => state.optimisticSteps,
-  );
-  const recordingActionCount =
-    recordingDraftSteps.filter(
-      (step) => !recordingDeletedStepIds.includes(step.step_id),
-    ).length + recordingOptimisticSteps.length;
-  const visibleRecordingDraftSteps = recordingDraftSteps.filter(
-    (step) => !recordingDeletedStepIds.includes(step.step_id),
-  );
-  const recordingSuggestionSignature = visibleRecordingDraftSteps
-    .filter(
-      (step) =>
-        step.credential_kind &&
-        !dismissedCredentialStepIds.includes(step.step_id),
-    )
-    .map((step) => `${step.step_id}:${step.credential_kind}`)
-    .join(",");
-  const outerFollowSignature = `${followSignature}|recording-suggestions:${recordingSuggestionSignature}`;
   const { scrollRef, isPinned, jumpToLatest, repin } =
-    useStickToBottom<HTMLDivElement>(outerFollowSignature, { enabled: isOpen });
-  const lastRecordingActionTitle =
-    recordingOptimisticSteps[recordingOptimisticSteps.length - 1]?.title ??
-    visibleRecordingDraftSteps[visibleRecordingDraftSteps.length - 1]?.title ??
-    null;
-
-  useEffect(() => {
-    const wasActive = recordingWasActiveRef.current;
-    if (recordingAuthoringActive && !wasActive) {
-      setRecordingBoundary(messages.length);
-      setRecordingFocusOpen(false);
-      setRecordingCollapsed(false);
-      setRecordingChapterAboveViewport(false);
-      setRecordingProxyBaseline(recordingActionCount);
-    } else if (!recordingAuthoringActive && wasActive) {
-      setRecordingBoundary(null);
-      setRecordingFocusOpen(false);
-      setRecordingChapterAboveViewport(false);
-    }
-    recordingWasActiveRef.current = recordingAuthoringActive;
-  }, [messages.length, recordingActionCount, recordingAuthoringActive]);
-
-  useEffect(() => {
-    const chapter = recordingChapterRef.current;
-    const transcript = scrollRef.current;
-    if (
-      !recordingAuthoringActive ||
-      recordingFocusOpen ||
-      !chapter ||
-      !transcript ||
-      typeof IntersectionObserver === "undefined"
-    ) {
-      setRecordingChapterAboveViewport(false);
-      return;
-    }
-
-    const observer = new IntersectionObserver(
-      ([entry]) => {
-        if (!entry) return;
-        const above =
-          !entry.isIntersecting &&
-          entry.rootBounds !== null &&
-          entry.boundingClientRect.bottom <= entry.rootBounds.top;
-        setRecordingChapterAboveViewport((wasAbove) => {
-          if (above && !wasAbove) {
-            setRecordingProxyBaseline(recordingActionCount);
-          }
-          return above;
-        });
-      },
-      { root: transcript, threshold: 0.05 },
-    );
-    // The chapter is portaled into its inline host, so a moved host means a new
-    // chapter element; re-observe or the stale node reads as scrolled away.
-    observer.observe(chapter);
-    return () => observer.disconnect();
-  }, [
-    recordingActionCount,
-    recordingAuthoringActive,
-    recordingFocusOpen,
-    recordingInlinePortalEl,
-    scrollRef,
-  ]);
-
-  const jumpToRecordingChapter = useCallback(() => {
-    setRecordingProxyBaseline(recordingActionCount);
-    recordingChapterRef.current?.scrollIntoView({
-      behavior: "smooth",
-      block: "start",
-    });
-  }, [recordingActionCount]);
+    useStickToBottom<HTMLDivElement>(followSignature, { enabled: isOpen });
 
   const adjustTextareaHeight = useCallback(() => {
     const textarea = textareaRef.current;
@@ -3498,12 +3196,6 @@ export function WorkflowCopilotChat({
     (
       data: WorkflowCopilotChatHistoryResponse,
       carryForwardLifecycle = true,
-      recoveredRecordingRefinement?: {
-        responseIndex: number;
-        turnId: string;
-        messageId: string;
-        status: RecordingRefinementStatus;
-      },
       // Pass for a re-read of the chat on screen; a chat switch or first load always takes the row's value.
       autoAcceptWritesAtRead?: number,
     ) => {
@@ -3567,65 +3259,6 @@ export function WorkflowCopilotChat({
           })(),
         }),
       );
-      for (let index = 0; index < data.chat_history.length; index += 1) {
-        const productRow = data.chat_history[index];
-        const productMessage = historyMessages[index];
-        if (!productRow || !productMessage) continue;
-        const actionCount = refineRecordingActionCount(productRow.content);
-        const turnId = productRow.turn_id ?? undefined;
-        if (
-          productRow.sender !== "product" ||
-          actionCount === null ||
-          turnId === undefined
-        ) {
-          continue;
-        }
-
-        const responseIndex = data.chat_history.findIndex(
-          (message) =>
-            message.sender === "ai" &&
-            message.turn_outcome?.copilot_turn_id === turnId,
-        );
-        const responseRow =
-          responseIndex >= 0 ? data.chat_history[responseIndex] : undefined;
-        const responseMessage =
-          responseIndex >= 0 ? historyMessages[responseIndex] : undefined;
-        const terminalReason = responseRow?.turn_outcome?.terminal_reason;
-        const ownsChatProposal = Boolean(
-          turnId &&
-          data.proposed_workflow &&
-          data.proposed_workflow_metadata?.owner_turn_id === turnId,
-        );
-        const producedWorkflow = Boolean(
-          responseMessage?.narrative?.proposalDisposition !== "no_proposal" &&
-          (responseMessage?.narrative?.draft || ownsChatProposal),
-        );
-        const status: RecordingRefinementStatus = !responseRow
-          ? "working"
-          : isCancelledRefinementTurn(
-                terminalReason,
-                responseMessage?.narrative,
-              )
-            ? "cancelled"
-            : terminalReason === INTERRUPTED_TERMINAL_REASON ||
-                responseMessage?.narrative?.terminal === "error" ||
-                (responseMessage?.narrative &&
-                  notConfirmedOutcome(responseMessage.narrative) !== null) ||
-                !producedWorkflow
-              ? "failed"
-              : "complete";
-        historyMessages[index] = {
-          ...productMessage,
-          id: `recording-refinement-${turnId}`,
-          kind: "recording_refinement",
-          recordingRefinement: {
-            actionCount,
-            startedAtMs: parseServerStamp(productRow.created_at) || Date.now(),
-            status,
-            turnId,
-          },
-        };
-      }
       // A rehydrated turn still owns the run its records name, so the
       // lifecycle hook keeps announcing nothing about it after a reload.
       for (const message of historyMessages) {
@@ -3662,44 +3295,6 @@ export function WorkflowCopilotChat({
             ? prev.filter((message) => message.kind === "run_lifecycle")
             : []),
         ];
-        const recovery = recoveredRecordingRefinement;
-        const hydratedProgressIndex = recovery
-          ? nextMessages.findIndex(
-              (message) =>
-                message.kind === "recording_refinement" &&
-                message.recordingRefinement?.turnId === recovery.turnId,
-            )
-          : -1;
-        const progressMessage = recovery
-          ? (prev.find(
-              (message) =>
-                message.id === recovery.messageId &&
-                message.kind === "recording_refinement" &&
-                message.recordingRefinement?.turnId === recovery.turnId,
-            ) ??
-            (hydratedProgressIndex >= 0
-              ? nextMessages[hydratedProgressIndex]
-              : undefined))
-          : undefined;
-        if (!recovery || !progressMessage?.recordingRefinement) {
-          return nextMessages;
-        }
-        const completedProgress: ChatMessage = {
-          ...progressMessage,
-          recordingRefinement: {
-            ...progressMessage.recordingRefinement,
-            status: recovery.status,
-          },
-        };
-        if (hydratedProgressIndex >= 0) {
-          nextMessages[hydratedProgressIndex] = completedProgress;
-        } else {
-          nextMessages.splice(
-            Math.max(0, recovery.responseIndex),
-            0,
-            completedProgress,
-          );
-        }
         return nextMessages;
       });
       // Bumped here rather than when navigation starts, so a history load that FAILS does not
@@ -3848,7 +3443,6 @@ export function WorkflowCopilotChat({
       requestId = turnId ?? crypto.randomUUID(),
       reservation?: symbol,
       ownsTurn = false,
-      recordingRefinementMessageId?: string,
       presentationGeneration = chatPresentationGeneration.current,
     ) => {
       const editor = useWorkflowYamlEditorStore.getState().editorOwner;
@@ -3874,7 +3468,6 @@ export function WorkflowCopilotChat({
           requestId,
           reservation,
           ownsTurn,
-          recordingRefinementMessageId,
         })
       ) {
         return existing.adopt;
@@ -3922,7 +3515,6 @@ export function WorkflowCopilotChat({
           requestId,
           deadline,
           ownsTurn,
-          recordingRefinementMessageId,
         };
       let timer: ReturnType<typeof setTimeout> | null = null;
       let step = 0;
@@ -4010,35 +3602,13 @@ export function WorkflowCopilotChat({
           new Error("Copilot recovery polling gave up"),
           chatId,
         );
-        if (recordingRefinementMessageId && turnId) {
-          reportRecordingRefinementOutcome(
-            reportedRefinementOutcomes.current,
-            turnId,
-            "failed",
-            "connection_lost",
-            {
-              workflow_permanent_id: workflowPermanentId,
-              turn_id: turnId,
-              recovered: true,
-            },
-          );
-        }
         setMessages((prev) =>
           prev.map((message) =>
-            message.recordingRefinement?.turnId === turnId &&
-            message.recordingRefinement.status === "working"
-              ? {
-                  ...message,
-                  recordingRefinement: {
-                    ...message.recordingRefinement,
-                    status: "failed",
-                  },
-                }
-              : (message.recoveryTurnId === turnId ||
-                    message.recoveryTurnId === requestId) &&
-                  message.content === RECOVERY_IN_PROGRESS_MESSAGE
-                ? { ...message, content: SEND_FAILED_MESSAGE }
-                : message,
+            (message.recoveryTurnId === turnId ||
+              message.recoveryTurnId === requestId) &&
+            message.content === RECOVERY_IN_PROGRESS_MESSAGE
+              ? { ...message, content: SEND_FAILED_MESSAGE }
+              : message,
           ),
         );
       }
@@ -4464,68 +4034,9 @@ export function WorkflowCopilotChat({
             }
             if (isPresented() && row.content !== appliedContent) {
               appliedContent = row.content;
-              const recoveredNarrative = hydrateHistoryNarrative(
-                row.narrative_payload,
-                row.turn_outcome,
-              );
-              const interrupted =
-                row.turn_outcome?.terminal_reason ===
-                INTERRUPTED_TERMINAL_REASON;
-              const ownsChatProposal = Boolean(
-                response.data.proposed_workflow &&
-                response.data.proposed_workflow_metadata?.owner_turn_id ===
-                  turnId,
-              );
-              const recoveredProducedWorkflow = Boolean(
-                recoveredNarrative?.proposalDisposition !== "no_proposal" &&
-                (recoveredNarrative?.draft || ownsChatProposal),
-              );
-              const recoveredStatus: RecordingRefinementStatus = interrupted
-                ? holdingReservation ||
-                  !isReplaceableInterruptedRow(row.turn_outcome)
-                  ? "failed"
-                  : "working"
-                : isCancelledRefinementTurn(
-                      row.turn_outcome?.terminal_reason,
-                      recoveredNarrative,
-                    )
-                  ? "cancelled"
-                  : recoveredNarrative?.terminal === "error" ||
-                      (recoveredNarrative &&
-                        notConfirmedOutcome(recoveredNarrative) !== null) ||
-                      !recoveredProducedWorkflow
-                    ? "failed"
-                    : "complete";
-              if (
-                recordingRefinementMessageId &&
-                turnId &&
-                recoveredStatus !== "working"
-              ) {
-                reportRecordingRefinementOutcome(
-                  reportedRefinementOutcomes.current,
-                  turnId,
-                  recoveredStatus,
-                  interrupted
-                    ? "interrupted"
-                    : refinementFailureClass(recoveredNarrative),
-                  {
-                    workflow_permanent_id: workflowPermanentId,
-                    turn_id: turnId,
-                    recovered: true,
-                  },
-                );
-              }
               applyHistoryResponse(
                 response.data,
                 true,
-                recordingRefinementMessageId && turnId
-                  ? {
-                      responseIndex: response.data.chat_history.indexOf(row),
-                      turnId,
-                      messageId: recordingRefinementMessageId,
-                      status: recoveredStatus,
-                    }
-                  : undefined,
                 autoAcceptWritesBeforeRead,
               );
             }
@@ -4552,7 +4063,7 @@ export function WorkflowCopilotChat({
                   canonicalRecovery.endedInterrupted =
                     reason === INTERRUPTED_TERMINAL_REASON;
                   canonicalRecovery.restoreRollback ||=
-                    isCancelledRefinementTurn(reason, narrative) ||
+                    isCancelledTurn(reason, narrative) ||
                     narrative?.terminal === "error" ||
                     (!!reason &&
                       [
@@ -4686,8 +4197,6 @@ export function WorkflowCopilotChat({
           if (ownership) {
             chatId ??= ownership.chatId;
             ownsTurn ||= ownership.ownsTurn;
-            recordingRefinementMessageId ??=
-              ownership.recordingRefinementMessageId;
             if (!holdingReservation && ownership.reservation) {
               reservation = ownership.reservation;
               holdingReservation = true;
@@ -4715,7 +4224,6 @@ export function WorkflowCopilotChat({
           }
           if (options.ownsTurn && !claimRecovery()) return false;
           ownsTurn ||= options.ownsTurn;
-          recordingRefinementMessageId ??= options.recordingRefinementMessageId;
           recoveryPolls.current.set(options.requestId, operation);
         }
         if ((ownsTurn || holdingReservation) && !claimRecovery()) return false;
@@ -4726,7 +4234,6 @@ export function WorkflowCopilotChat({
             requestId,
             deadline,
             ownsTurn,
-            recordingRefinementMessageId,
           };
         recoveryPolls.current.set(requestId, operation);
         if (turnId !== null) {
@@ -4763,7 +4270,6 @@ export function WorkflowCopilotChat({
             reservation: holdingReservation ? reservation : undefined,
             canonicalRecovery,
             ownsTurn,
-            recordingRefinementMessageId,
             aliases: [...recoveryPolls.current].flatMap(([alias, poll]) =>
               poll === operation ? [alias] : [],
             ),
@@ -4923,19 +4429,6 @@ export function WorkflowCopilotChat({
           });
         }
       }
-      const pendingRefinements = data.chat_history.filter(
-        (message) =>
-          message.sender === "product" &&
-          message.turn_id &&
-          refineRecordingActionCount(message.content) !== null &&
-          !completedTurnIds.has(message.turn_id),
-      );
-      const pendingRefinementIds = new Map(
-        pendingRefinements.map((message) => [
-          message.turn_id as string,
-          `recording-refinement-${message.turn_id}`,
-        ]),
-      );
       if (pending) {
         const adopted = startRecoveryPoll(
           data.workflow_copilot_chat_id,
@@ -4943,7 +4436,6 @@ export function WorkflowCopilotChat({
           undefined,
           undefined,
           true,
-          pendingRefinementIds.get(pending.turn_id),
           chatPresentationGeneration.current,
         );
         if (
@@ -4954,18 +4446,6 @@ export function WorkflowCopilotChat({
           )
         )
           setIsLoading(false);
-      }
-      for (const [turnId, messageId] of pendingRefinementIds) {
-        if (turnId !== pending?.turn_id) {
-          startRecoveryPoll(
-            data.workflow_copilot_chat_id,
-            turnId,
-            undefined,
-            undefined,
-            false,
-            messageId,
-          );
-        }
       }
     },
     [startRecoveryPoll],
@@ -7024,7 +6504,7 @@ export function WorkflowCopilotChat({
   const demonstrationMessageIdRef = useRef<string | null>(null);
   const demonstrationRecorder = useDemonstrationRecorder({
     workflowPermanentId,
-    browserSessionId: demonstrationEnabled ? liveBrowserSessionId : null,
+    browserSessionId: liveBrowserSessionId,
     deleteFile: removeUnsentUpload,
     onDone: async ({ demonstrationId, actions, files }) => {
       const messageId =
@@ -7086,6 +6566,7 @@ export function WorkflowCopilotChat({
       setMessages((prev) => prev.filter((message) => message.id !== messageId));
     },
   });
+  const demonstrationUnavailable = demonstrationRecorder.unavailable;
   const isDemonstrating = demonstrationRecorder.phase !== "idle";
   useEffect(() => {
     if (
@@ -7415,7 +6896,6 @@ export function WorkflowCopilotChat({
         parked.poll?.requestId ?? crypto.randomUUID(),
         reservation,
         parked.poll?.ownsTurn,
-        parked.poll?.recordingRefinementMessageId,
       );
     };
     resume();
@@ -7764,9 +7244,6 @@ export function WorkflowCopilotChat({
     return () => window.clearTimeout(timer);
   }, [nextPauseExpiry]);
   const lastTurnIndex = findLastTurnIndex(messages);
-  const lastRefinementIndex = messages
-    .map((message) => message.kind)
-    .lastIndexOf("recording_refinement");
   // Only the tail turn's ask docks; a stranded one further up stays actionable inline.
   const tailTerminalAsk =
     trayPauseFrame || isLoadingHistory || lastTurnIndex < 0
@@ -8078,10 +7555,7 @@ export function WorkflowCopilotChat({
         refuseMutationDuringYamlCommit()
       )
         return false;
-      if (
-        authoringInProgress ||
-        (isDemonstrating && productActionRef.current?.action !== "demonstrate")
-      )
+      if (isDemonstrating && productActionRef.current?.action !== "demonstrate")
         return false;
       // A turn started now could stage a proposal the pending Accept then clears, and the
       // setGateFailure below would drop a hold whose write is still unaccounted for.
@@ -8171,9 +7645,6 @@ export function WorkflowCopilotChat({
           });
         }
         return false;
-      }
-      if (recordingFocusOpen) {
-        setRecordingFocusOpen(false);
       }
       if (!workflowPermanentId) {
         productActionRef.current = null;
@@ -8302,7 +7773,6 @@ export function WorkflowCopilotChat({
           idempotencyKey: options.idempotencyKey,
           selectedConnectedAccountId: options.selectedConnectedAccountId,
           attachments: combinedAttachments,
-          recording: options.recording ?? snapshotRecording(),
         });
         if (composerSend) {
           clearSentTray();
@@ -8346,7 +7816,6 @@ export function WorkflowCopilotChat({
           idempotencyKey: options.idempotencyKey,
           selectedConnectedAccountId: options.selectedConnectedAccountId,
           attachments: sentAttachments,
-          recording: options.recording ?? snapshotRecording(),
         });
         if (composerSend) {
           clearSentTray();
@@ -8376,24 +7845,8 @@ export function WorkflowCopilotChat({
         options.optimisticMessageId ??
         Date.now().toString();
       const sendOwnsTray = composerSend;
-      const recordingRefinementAction =
-        productActionRef.current?.action === "refine_recording"
-          ? productActionRef.current
-          : null;
       const demonstrationAction =
         productActionRef.current?.action === "demonstrate";
-      const recordingEvidence = recordingRefinementAction
-        ? useRecordingRefinementEvidenceStore
-            .getState()
-            .peek(recordingRefinementAction.nonce)
-        : null;
-      const recordingRefinement = recordingRefinementAction
-        ? {
-            actionCount: recordingEvidence?.actions.length ?? 0,
-            startedAtMs: Date.now(),
-            status: "working" as const,
-          }
-        : undefined;
       const userMessage: ChatMessage = {
         id: userMessageId,
         sender: echoSenderForArmedAction(),
@@ -8402,8 +7855,6 @@ export function WorkflowCopilotChat({
           productActionRef.current?.action === "demonstrate"
             ? productActionRef.current.demonstrationItems
             : undefined,
-        kind: recordingRefinement ? "recording_refinement" : undefined,
-        recordingRefinement,
         attachedFiles: sentAttachments.length > 0 ? sentAttachments : undefined,
       };
       if (sendOwnsTray) {
@@ -8435,11 +7886,6 @@ export function WorkflowCopilotChat({
               message.id === userMessageId
                 ? {
                     ...message,
-                    kind: recordingRefinement
-                      ? "recording_refinement"
-                      : message.kind,
-                    recordingRefinement:
-                      recordingRefinement ?? message.recordingRefinement,
                     // Also when the filtered list is empty: the bubble must not keep showing
                     // files the request did not carry.
                     attachedFiles:
@@ -8507,8 +7953,6 @@ export function WorkflowCopilotChat({
       let canonicalAtSubmit: WorkflowApiResponse | undefined;
       let submittedSettings: WorkflowSettings | undefined;
       let terminalRecovery: Promise<boolean | undefined> | undefined;
-      let adoptRecoveryTurn: ReturnType<typeof startRecoveryPoll>;
-      let sendFinished = false;
       let sawCredentialPause = false;
       let unconfirmedRetained = false;
       const captureRecovery = (): CanonicalRecovery | null => {
@@ -8537,9 +7981,6 @@ export function WorkflowCopilotChat({
             requestId: cancelToken,
             deadline: Date.now() + RECOVERY_POLL_BUDGET_MS,
             ownsTurn: sawCredentialPause,
-            recordingRefinementMessageId: recordingRefinement
-              ? userMessageId
-              : undefined,
           },
         };
       };
@@ -8593,16 +8034,14 @@ export function WorkflowCopilotChat({
         )
           return;
         unconfirmedRetained = true;
-        if (!recordingRefinement)
-          adoptRecoveryTurn = startRecoveryPoll(
-            streamChatId ?? workflowCopilotChatIdRef.current,
-            streamTurnId,
-            cancelToken,
-            reservation,
-            sawCredentialPause,
-            undefined,
-            sendPresentationGeneration,
-          );
+        startRecoveryPoll(
+          streamChatId ?? workflowCopilotChatIdRef.current,
+          streamTurnId,
+          cancelToken,
+          reservation,
+          sawCredentialPause,
+          sendPresentationGeneration,
+        );
         if (!abortController.signal.aborted) {
           terminalRecovery = reconcileCanonicalWorkflow(
             reservation,
@@ -8630,248 +8069,6 @@ export function WorkflowCopilotChat({
         releaseUnsentReservation,
         { once: true },
       );
-      let recoveryNoticeId: string | null = null;
-      const finishRecordingRefinement = (
-        status: Exclude<RecordingRefinementStatus, "working">,
-        failureClass: RefinementFailureClass = "turn_error",
-      ) => {
-        if (recordingRefinement) {
-          reportRecordingRefinementOutcome(
-            reportedRefinementOutcomes.current,
-            streamTurnId ?? userMessageId,
-            status,
-            failureClass,
-            {
-              recording_id: recordingEvidence?.recording_id ?? undefined,
-              recording_attempt_id:
-                recordingEvidence?.recording.recording_attempt_id,
-              workflow_permanent_id: workflowPermanentId,
-              browser_session_id:
-                recordingEvidence?.recording.browser_session_id,
-              turn_id: streamTurnId ?? undefined,
-              action_count: recordingRefinement.actionCount,
-              latency_ms: Date.now() - recordingRefinement.startedAtMs,
-            },
-          );
-        }
-        setMessages((current) =>
-          current.map((message) =>
-            message.id === userMessageId && message.recordingRefinement
-              ? {
-                  ...message,
-                  recordingRefinement: {
-                    ...message.recordingRefinement,
-                    status,
-                  },
-                }
-              : message,
-          ),
-        );
-      };
-      const recoverPersistedRecordingTurn = async (
-        signal = abortController.signal,
-      ): Promise<boolean> => {
-        if (!recordingRefinement || !requestStarted || streamTurnId !== null) {
-          return false;
-        }
-        try {
-          const client = await getClient(credentialGetter, "sans-api-v1");
-          const response = await client.get<WorkflowCopilotChatHistoryResponse>(
-            "/workflow/copilot/chat-history",
-            {
-              params: chatIdForRequest
-                ? {
-                    workflow_copilot_chat_id: chatIdForRequest,
-                    request_cancel_token: cancelToken,
-                  }
-                : {
-                    workflow_permanent_id: workflowPermanentId,
-                    request_cancel_token: cancelToken,
-                  },
-              signal,
-            },
-          );
-          if (!isCopilotTurnCurrent(reservation) || signal?.aborted)
-            return false;
-          const earliestMatchingCreatedAt =
-            recordingRefinement.startedAtMs - 5 * 60 * 1000;
-          const opener = [...response.data.chat_history]
-            .reverse()
-            .find(
-              (message) =>
-                message.sender === "product" &&
-                message.turn_id &&
-                message.content === messageContent &&
-                parseServerStamp(message.created_at) >=
-                  earliestMatchingCreatedAt,
-            );
-          const recoveredTurnId =
-            response.data.request_turn_id === undefined
-              ? opener?.turn_id
-              : (response.data.request_turn_id ?? undefined);
-          if (!recoveredTurnId) {
-            return false;
-          }
-          streamTurnId = recoveredTurnId;
-          streamChatId = response.data.workflow_copilot_chat_id;
-          if (recordingRefinementAction) {
-            useRecordingRefinementEvidenceStore
-              .getState()
-              .take(recordingRefinementAction.nonce);
-            onInitialMessageConsumedRef.current?.();
-          }
-          if (
-            chatPresentationGeneration.current === sendPresentationGeneration
-          ) {
-            setWorkflowCopilotChatId(streamChatId);
-            workflowCopilotChatIdRef.current = streamChatId;
-          }
-          setMessages((current) =>
-            current.map((message) =>
-              message.id === userMessageId && message.recordingRefinement
-                ? {
-                    ...message,
-                    recordingRefinement: {
-                      ...message.recordingRefinement,
-                      turnId: recoveredTurnId,
-                    },
-                  }
-                : message,
-            ),
-          );
-          return true;
-        } catch (historyError) {
-          console.warn(
-            "Failed to recover recording refinement after losing turn_start:",
-            historyError,
-          );
-          return false;
-        }
-      };
-      const startPersistedRecordingTurnLookup = () => {
-        if (!isCopilotTurnCurrent(reservation)) return;
-        const recoveryKey = `recording-request:${userMessageId}`;
-        const generation = sendGeneration;
-        const deadline = Date.now() + RECOVERY_POLL_BUDGET_MS;
-        let step = 0;
-        let timer: ReturnType<typeof setTimeout> | null = null;
-        let deadlineTimer: ReturnType<typeof setTimeout> | null = null;
-        let inFlight: AbortController | null = null;
-        let stopped = false;
-
-        const finish = () => {
-          stopped = true;
-          if (timer !== null) {
-            clearTimeout(timer);
-            timer = null;
-          }
-          inFlight?.abort();
-          inFlight = null;
-          if (deadlineTimer !== null) {
-            clearTimeout(deadlineTimer);
-            deadlineTimer = null;
-          }
-          if (recoveryPolls.current.get(recoveryKey)?.stop === finish) {
-            recoveryPolls.current.delete(recoveryKey);
-          }
-        };
-        const giveUp = () => {
-          finish();
-          if (!isCopilotTurnCurrent(reservation)) return;
-          logCopilotRequestFailure(
-            "recovery_poll_gave_up",
-            new Error("Copilot recovery polling gave up"),
-            chatIdForRequest,
-          );
-          finishRecordingRefinement("failed", "connection_lost");
-          if (recoveryNoticeId) {
-            setMessages((current) =>
-              current.map((message) =>
-                message.id === recoveryNoticeId
-                  ? { ...message, content: SEND_FAILED_MESSAGE }
-                  : message,
-              ),
-            );
-          }
-        };
-        const schedule = () => {
-          if (stopped) return;
-          if (Date.now() >= deadline) {
-            giveUp();
-            return;
-          }
-          const delay =
-            RECOVERY_POLL_DELAYS_MS[step] ?? RECOVERY_POLL_STEADY_MS;
-          step += 1;
-          timer = setTimeout(() => {
-            timer = null;
-            void tick();
-          }, delay);
-        };
-        const tick = async () => {
-          if (
-            stopped ||
-            !isCopilotTurnCurrent(reservation) ||
-            recoveryGeneration.current !== generation
-          ) {
-            finish();
-            return;
-          }
-          const controller = new AbortController();
-          inFlight = controller;
-          const recovered = await recoverPersistedRecordingTurn(
-            controller.signal,
-          );
-          if (inFlight === controller) {
-            inFlight = null;
-          }
-          if (stopped || !isCopilotTurnCurrent(reservation)) return;
-          if (recovered) {
-            finish();
-            if (streamTurnId && shouldArmRecovery()) {
-              if (recoveryNoticeId) {
-                setMessages((current) =>
-                  current.map((message) =>
-                    message.id === recoveryNoticeId
-                      ? {
-                          ...message,
-                          recoveryTurnId: streamTurnId ?? undefined,
-                        }
-                      : message,
-                  ),
-                );
-              }
-              const recoveredChatId =
-                streamChatId ?? workflowCopilotChatIdRef.current;
-              if (
-                sendFinished &&
-                !adoptRecoveryTurn?.(recoveredChatId, streamTurnId)
-              ) {
-                adoptRecoveryTurn = startRecoveryPoll(
-                  recoveredChatId,
-                  streamTurnId,
-                  cancelToken,
-                  undefined,
-                  sawCredentialPause,
-                  userMessageId,
-                  sendPresentationGeneration,
-                );
-              }
-            }
-            return;
-          }
-          schedule();
-        };
-
-        recoveryPolls.current.get(recoveryKey)?.stop();
-        recoveryPolls.current.set(recoveryKey, {
-          stop: finish,
-          isReserved: () => copilotReservation.current === reservation,
-        });
-        deadlineTimer = setTimeout(giveUp, RECOVERY_POLL_BUDGET_MS);
-        void tick();
-      };
-
       setStopArmed(false);
       if (stopArmTimer.current !== null) {
         clearTimeout(stopArmTimer.current);
@@ -9029,20 +8226,6 @@ export function WorkflowCopilotChat({
           const runFailed =
             frozenNarrative !== undefined &&
             notConfirmedOutcome(frozenNarrative) !== null;
-          const refinementProducedWorkflow = Boolean(
-            response.updated_workflow &&
-            response.proposal_disposition !== "no_proposal",
-          );
-          finishRecordingRefinement(
-            response.cancelled || userCancelledThisTurn
-              ? "cancelled"
-              : frozenNarrative?.terminal === "error" ||
-                  runFailed ||
-                  !refinementProducedWorkflow
-                ? "failed"
-                : "complete",
-            refinementFailureClass(frozenNarrative),
-          );
           if (
             lastTurnRef.current &&
             !response.cancelled &&
@@ -9203,7 +8386,6 @@ export function WorkflowCopilotChat({
           payload: WorkflowCopilotStreamErrorUpdate,
           errorNarrative?: TurnNarrativeState,
         ) => {
-          finishRecordingRefinement("failed");
           pendingCancelToken.current = null;
           // A terminal error carries no credentialPause payload, so the dead
           // frame must be cleared explicitly or its card would stay actionable.
@@ -9268,9 +8450,6 @@ export function WorkflowCopilotChat({
         ) {
           if (isCopilotOwnerCurrent(reservation)) {
             returnFilesToTray(sentAttachments);
-            if (abortController.signal.aborted) {
-              finishRecordingRefinement("cancelled");
-            }
           }
           return false;
         }
@@ -9337,13 +8516,6 @@ export function WorkflowCopilotChat({
               productAction?.action === "demonstrate"
                 ? productAction.demonstrationId
                 : null,
-            recording_evidence:
-              productAction?.action === "refine_recording"
-                ? useRecordingRefinementEvidenceStore
-                    .getState()
-                    .peek(productAction.nonce)
-                : null,
-            ...(options.recording ?? snapshotRecording()),
             selected_block_label: readSelectedBlockLabel(),
             keep_pending_proposal: Boolean(pendingProposalTurnId),
             supports_credential_pause: true,
@@ -9357,9 +8529,9 @@ export function WorkflowCopilotChat({
             supports_credential_delete_card: true,
             supports_google_setup_card: true,
             supports_demonstration_offer:
-              demonstrationEnabled &&
               Boolean(onRecordTask) &&
-              !authoringUnavailableReason,
+              !authoringUnavailableReason &&
+              !demonstrationUnavailable,
           } as WorkflowCopilotChatRequest,
           (payload) => {
             if (
@@ -9479,26 +8651,6 @@ export function WorkflowCopilotChat({
                 return false;
               }
               case "turn_start": {
-                if (productAction?.action === "refine_recording") {
-                  useRecordingRefinementEvidenceStore
-                    .getState()
-                    .take(productAction.nonce);
-                  onInitialMessageConsumedRef.current?.();
-                  setMessages((prev) =>
-                    prev.map((message) =>
-                      message.id === userMessageId &&
-                      message.recordingRefinement
-                        ? {
-                            ...message,
-                            recordingRefinement: {
-                              ...message.recordingRefinement,
-                              turnId: payload.turn_id,
-                            },
-                          }
-                        : message,
-                    ),
-                  );
-                }
                 // A new turn can't carry the prior turn's dead resume_token.
                 setLivePauseFrame(null);
                 setLivePauseFrameHistory([]);
@@ -9605,8 +8757,6 @@ export function WorkflowCopilotChat({
         // The streaming client resolves rather than throws on abort, so New chat, a chat switch, or
         // Stop before turn_start ends here, not in the catch.
         if (abortController.signal.aborted) {
-          if (!requestStarted || sawTerminalFrame)
-            finishRecordingRefinement("cancelled");
           returnPossiblySavedFiles();
         }
       } catch (error) {
@@ -9615,8 +8765,6 @@ export function WorkflowCopilotChat({
         // before turn_start is definitive and leaves the files deletable.
         if (abortController.signal.aborted) {
           returnPossiblySavedFiles();
-          if (!requestStarted || sawTerminalFrame)
-            finishRecordingRefinement("cancelled");
           return false;
         }
         definitiveRejection =
@@ -9652,17 +8800,7 @@ export function WorkflowCopilotChat({
           });
           await loadChatInPlace(workflowCopilotChatId);
         } else {
-          const recovering =
-            shouldArmRecovery() ||
-            Boolean(
-              recordingRefinement && requestStarted && !definitiveRejection,
-            );
-          if (!recovering) {
-            finishRecordingRefinement(
-              "failed",
-              definitiveRejection ? "turn_error" : "connection_lost",
-            );
-          }
+          const recovering = shouldArmRecovery();
           const errorMessage: ChatMessage = {
             id: Date.now().toString(),
             sender: "ai",
@@ -9675,11 +8813,7 @@ export function WorkflowCopilotChat({
               ? (streamTurnId ?? cancelToken)
               : undefined,
           };
-          recoveryNoticeId = errorMessage.id;
           setMessages((prev) => [...prev, errorMessage]);
-          if (recovering && streamTurnId === null && recordingRefinement) {
-            startPersistedRecordingTurnLookup();
-          }
         }
         // A thrown stream never emits a terminal narrative event, so clear the
         // bubble or its Working/elapsed indicator would tick forever.
@@ -9697,16 +8831,6 @@ export function WorkflowCopilotChat({
             pendingCanonicalRecovery.current)
         )
           captureLiveTurnRecovery.current = null;
-        sendFinished = true;
-        if (
-          recordingRefinement &&
-          requestStarted &&
-          streamTurnId === null &&
-          shouldArmRecovery() &&
-          !recoveryNoticeId
-        ) {
-          startPersistedRecordingTurnLookup();
-        }
         abortController.signal.removeEventListener(
           "abort",
           releaseUnsentReservation,
@@ -9766,13 +8890,12 @@ export function WorkflowCopilotChat({
           stopAllRecordedActionsPolls();
           buildFollowEngaged.current = false;
           if (armRecovery) {
-            adoptRecoveryTurn = startRecoveryPoll(
+            startRecoveryPoll(
               streamChatId ?? chatIdForRequest,
               streamTurnId,
               cancelToken,
               retainReservation ? reservation : undefined,
               sawCredentialPause,
-              recordingRefinement ? userMessageId : undefined,
               sendPresentationGeneration,
             );
           }
@@ -9783,12 +8906,12 @@ export function WorkflowCopilotChat({
     [
       acceptUnresolved,
       applyStoredNarrativeEvent,
+      demonstrationUnavailable,
       takePendingSteers,
       requeueSteers,
       restoreSteersToComposer,
       captureCopilotEvent,
       createCanonicalRecovery,
-      demonstrationEnabled,
       onWorkflowPersisted,
       onRecordTask,
       authoringUnavailableReason,
@@ -9798,14 +8921,12 @@ export function WorkflowCopilotChat({
       applyWorkflowUpdate,
       reconcileCanonicalWorkflow,
       armStop,
-      authoringInProgress,
       isDemonstrating,
       backfillProposalRunFacts,
       credentialGetter,
       fetchRecordedActions,
       finalizeRecordedActionsPoll,
       attachments,
-      recordingFocusOpen,
       pendingAttachments,
       focusTurnRun,
       releaseTurnRun,
@@ -9851,7 +8972,7 @@ export function WorkflowCopilotChat({
     ({
       insertion,
     }: { insertion?: WorkflowCopilotDemonstrationInsertion } = {}) => {
-      if (!demonstrationEnabled || !liveBrowserSessionId) return;
+      if (!liveBrowserSessionId) return;
       if (historyLoadedForRef.current !== workflowPermanentId) {
         toast({ title: "Wait for Copilot to finish loading" });
         return;
@@ -9884,7 +9005,6 @@ export function WorkflowCopilotChat({
       startRecording({ insertion });
     },
     [
-      demonstrationEnabled,
       hasPendingQuestion,
       isDemonstrating,
       liveBrowserSessionId,
@@ -9898,21 +9018,20 @@ export function WorkflowCopilotChat({
   );
   useEffect(() => {
     setStartDemonstration(
-      demonstrationEnabled &&
-        liveBrowserSessionId &&
+      liveBrowserSessionId &&
         historyLoadedForRef.current === workflowPermanentId &&
         !hasPendingQuestion &&
         !isLoading &&
         !isLoadingHistory &&
         !queuedPrompt &&
         !isDemonstrating &&
-        !authoringInProgress
+        !demonstrationUnavailable &&
+        !runOwnsBrowser
         ? handleStartDemonstration
         : null,
     );
     return () => setStartDemonstration(null);
   }, [
-    demonstrationEnabled,
     handleStartDemonstration,
     hasPendingQuestion,
     isLoading,
@@ -9920,7 +9039,8 @@ export function WorkflowCopilotChat({
     liveBrowserSessionId,
     queuedPrompt,
     isDemonstrating,
-    authoringInProgress,
+    demonstrationUnavailable,
+    runOwnsBrowser,
     setStartDemonstration,
     workflowPermanentId,
   ]);
@@ -9930,11 +9050,9 @@ export function WorkflowCopilotChat({
     ? demonstrationRecorder.phase === "recording"
       ? "Use Done before attaching a file"
       : "Use Build before attaching a file"
-    : authoringInProgress
-      ? "Finish the current authoring action before attaching a file"
-      : hasPendingQuestion
-        ? "Answer the pending question before attaching a file"
-        : null;
+    : hasPendingQuestion
+      ? "Answer the pending question before attaching a file"
+      : null;
   const stageComposerAttachment = useCallback(
     (file: File, draft: string) => {
       onRequestOpen?.();
@@ -10030,10 +9148,9 @@ export function WorkflowCopilotChat({
     }
     const message = blockBuildMessageRef.current;
     blockBuildMessageRef.current = null;
-    // A prompt is already queued, so this send no-ops; a recording still owns
-    // the canvas, so block rebuilds are refused. Disarm the block target
+    // A prompt is already queued, so this send no-ops. Disarm the block target
     // (else the queued drain inherits it) and clear the stuck generating state.
-    if (queuedPromptRef.current || useRecordingStore.getState().isRecording) {
+    if (queuedPromptRef.current) {
       blockBuildTargetLabelRef.current = null;
       finishBlockGenerating();
       return;
@@ -10118,8 +9235,7 @@ export function WorkflowCopilotChat({
       queuedPromptRef.current !== queuedPrompt ||
       hasPendingQuestion ||
       queueDrainLocked ||
-      acceptUnresolved ||
-      authoringInProgress
+      acceptUnresolved
     ) {
       return;
     }
@@ -10175,14 +9291,12 @@ export function WorkflowCopilotChat({
       idempotencyKey: promptToSend.idempotencyKey,
       selectedConnectedAccountId: promptToSend.selectedConnectedAccountId,
       attachments: promptToSend.attachments,
-      recording: promptToSend.recording,
     }).catch((error) => {
       console.error("Queued send failed:", error);
       logCopilotRequestFailure("queued_send", error);
     });
   }, [
     acceptUnresolved,
-    authoringInProgress,
     handleSend,
     hasPendingQuestion,
     isLoading,
@@ -10204,7 +9318,6 @@ export function WorkflowCopilotChat({
       !workflowPermanentId ||
       queuedPrompt ||
       workflowMutationLocked ||
-      authoringInProgress ||
       acceptUnresolved
     ) {
       return;
@@ -10225,17 +9338,12 @@ export function WorkflowCopilotChat({
     // an in-flight send. handleSend internally routes to the queue when the
     // live browser isn't ready yet.
     hasAutoSentRef.current = true;
-    if (initialAction?.kind !== "refine_recording") {
-      onInitialMessageConsumedRef.current?.();
-    }
+    onInitialMessageConsumedRef.current?.();
     if (initialAction) {
-      productActionRef.current =
-        initialAction.kind === "diagnose_run"
-          ? {
-              action: "diagnose_run",
-              workflowRunId: initialAction.workflowRunId,
-            }
-          : { action: "refine_recording", nonce: initialAction.nonce };
+      productActionRef.current = {
+        action: "diagnose_run",
+        workflowRunId: initialAction.workflowRunId,
+      };
     }
     handleSend(autoSendMessage, {
       deferReservation: true,
@@ -10254,7 +9362,6 @@ export function WorkflowCopilotChat({
   }, [
     handleSend,
     autoSendMessage,
-    authoringInProgress,
     initialAttachments,
     initialAction,
     initialHandoffMessageId,
@@ -10278,7 +9385,6 @@ export function WorkflowCopilotChat({
       acceptUnresolved ||
       isWaitingForLiveBrowser ||
       workflowMutationLocked ||
-      authoringInProgress ||
       queuedPrompt
     ) {
       return;
@@ -10308,7 +9414,6 @@ export function WorkflowCopilotChat({
     };
   }, [
     autoSendMessage,
-    authoringInProgress,
     initialAction,
     acceptUnresolved,
     isLoadingHistory,
@@ -10769,11 +9874,7 @@ export function WorkflowCopilotChat({
       </div>
     </div>
   ) : null;
-  // The studio keeps closed panes mounted and CSS-hidden. Keep this controller
-  // mounted with them until recording finalization completes; otherwise a pane
-  // close would cancel the finalize timer and a later reopen could start a
-  // second process_recording mutation from fresh component state.
-  if ((!isOpen && !recordingAuthoringActive) || (docked && !portalTarget)) {
+  if (!isOpen || (docked && !portalTarget)) {
     return recoveryBanner
       ? createPortal(
           <div className="fixed bottom-4 right-4 z-[100] max-w-md rounded-lg border border-border bg-background shadow-lg">
@@ -10871,18 +9972,6 @@ export function WorkflowCopilotChat({
     inputValue.trim().length > 0 ||
     attachments.length > 0 ||
     pendingAttachments.some((item) => item.status === "uploading");
-  const recordingRefinementInFlight = messages.some((message) => {
-    const refinement = message.recordingRefinement;
-    if (refinement?.status !== "working") return false;
-    return (
-      message.id === pendingMessageId.current ||
-      (recoveredTurnOwnerRef.current !== null &&
-        refinement.turnId === recoveredTurnOwnerRef.current)
-    );
-  });
-  // Recording refinement now settles into the same conversation rhythm as any
-  // other Copilot turn: its receipt stays in the transcript while the existing
-  // working row reports that the turn is still live.
   const showWorkingRow = isLoading;
   // A pending question outranks a live turn, as it does in the session pill.
   const composerStatus: CopilotComposerStatus | null = hasPendingQuestion
@@ -10917,17 +10006,13 @@ export function WorkflowCopilotChat({
     isStopping ||
     stopBlockedByDeletion ||
     (turnObservablyRunning && !hasComposerText);
-  const authoringBlocksComposerAction = authoringInProgress && !showsStopGlyph;
   // Sent, no frame yet: the control reports the wait rather than an action, and
   // cancelSend's own guard is what makes a press in this window issue no cancel.
   const turnPendingFirstFrame =
     isLoading && !turnObservablyRunning && narrative.terminal === null;
   const morphButtonPending = turnPendingFirstFrame && !hasComposerText;
   const morphButtonStarting =
-    morphButtonPending &&
-    !authoringBlocksComposerAction &&
-    !isStopping &&
-    !waitingOnQueueOnly;
+    morphButtonPending && !isStopping && !waitingOnQueueOnly;
   // Attachments alone can't answer a question, so the last step needs a choice or text, and a
   // choice that asks for text needs it before any step moves on.
   const questionAnswerMissing =
@@ -10937,31 +10022,29 @@ export function WorkflowCopilotChat({
     (!turnObservablyRunning || hasComposerText);
   const morphButtonLabel = stopBlockedByDeletion
     ? DELETION_STOP_BLOCKED_REASON
-    : authoringBlocksComposerAction
-      ? "Send disabled — finish the current authoring action"
-      : isStopping
-        ? "Stopping…"
-        : waitingOnQueueOnly
-          ? "Send disabled — waiting for live browser"
-          : morphButtonStarting
-            ? "Starting…"
-            : questionAnswerMissing
-              ? "Send disabled — answer or skip the question"
-              : composerQuestion && (!turnObservablyRunning || hasComposerText)
-                ? questionStepper.isLast
-                  ? "Send answer"
-                  : "Next question"
-                : queuedPrompt && hasComposerText
-                  ? queuedPrompt.origin === "typed"
-                    ? "Add to the queued message"
-                    : "Replace queued message"
-                  : !turnObservablyRunning
-                    ? isLoading
-                      ? "Queue for next turn"
-                      : "Send"
-                    : hasComposerText
-                      ? "Queue for next turn"
-                      : "Stop";
+    : isStopping
+      ? "Stopping…"
+      : waitingOnQueueOnly
+        ? "Send disabled — waiting for live browser"
+        : morphButtonStarting
+          ? "Starting…"
+          : questionAnswerMissing
+            ? "Send disabled — answer or skip the question"
+            : composerQuestion && (!turnObservablyRunning || hasComposerText)
+              ? questionStepper.isLast
+                ? "Send answer"
+                : "Next question"
+              : queuedPrompt && hasComposerText
+                ? queuedPrompt.origin === "typed"
+                  ? "Add to the queued message"
+                  : "Replace queued message"
+                : !turnObservablyRunning
+                  ? isLoading
+                    ? "Queue for next turn"
+                    : "Send"
+                  : hasComposerText
+                    ? "Queue for next turn"
+                    : "Stop";
   const demonstrationSendButtonLabel =
     demonstrationRecorder.phase === "recording"
       ? "Done, build the workflow"
@@ -11069,7 +10152,8 @@ export function WorkflowCopilotChat({
     }
   };
 
-  const recordTaskDisabled = !onRecordTask || !canRecordTask;
+  const recordTaskDisabled =
+    !onRecordTask || !canRecordTask || demonstrationUnavailable;
   const recordTaskUnavailableReason =
     authoringUnavailableReason ??
     "Demonstrate task is available when the browser is ready";
@@ -11077,38 +10161,6 @@ export function WorkflowCopilotChat({
     if (refuseMutationDuringYamlCommit()) return;
     onRecordTask?.();
   };
-  const recordingChapterController = recordingAuthoringActive ? (
-    <RecordingPanel
-      key="live-recording-chapter"
-      ref={recordingChapterRef}
-      browserSessionId={liveBrowserSessionId ?? null}
-      expanded={recordingFocusOpen}
-      collapsed={recordingCollapsed}
-      onCollapsedChange={setRecordingCollapsed}
-      onExpandedChange={setRecordingFocusOpen}
-      onBackToChat={() => setRecordingFocusOpen(false)}
-      portalTarget={
-        recordingFocusOpen
-          ? recordingFocusPortalRef.current
-          : recordingInlinePortalEl
-      }
-      suggestionPortalTarget={recordingSuggestionPortalEl}
-      stopPortalTarget={
-        recordingChapterAboveViewport ? recordingProxyStopSlotEl : null
-      }
-    />
-  ) : null;
-  const recordingChapterHost = recordingAuthoringActive ? (
-    <div key="live-recording-chapter-host" ref={setRecordingInlinePortalEl} />
-  ) : null;
-  const recordingSuggestionHost = recordingAuthoringActive ? (
-    <div
-      key="live-recording-suggestion-host"
-      ref={setRecordingSuggestionPortalEl}
-      data-testid="recording-suggestion-host"
-    />
-  ) : null;
-
   const content = (
     <div
       className={
@@ -11203,26 +10255,9 @@ export function WorkflowCopilotChat({
 
       {/* Messages */}
       <div className="relative min-h-0 flex-1">
-        {recordingChapterController}
-        <div
-          ref={recordingFocusPortalRef}
-          className={cn(
-            "absolute inset-0 z-30 bg-slate-elevation1",
-            !recordingFocusOpen && "hidden",
-          )}
-        />
-        <div
-          ref={scrollRef}
-          className={cn(
-            "h-full overflow-y-auto p-4",
-            recordingFocusOpen && "pointer-events-none invisible",
-          )}
-        >
+        <div ref={scrollRef} className="h-full overflow-y-auto p-4">
           <div className="space-y-3">
-            {!isLoadingHistory &&
-            messages.length === 0 &&
-            !isLoading &&
-            !recordingAuthoringActive ? (
+            {!isLoadingHistory && messages.length === 0 && !isLoading ? (
               <div className="flex flex-col gap-6 px-1 pt-2 text-sm text-muted-foreground">
                 <div>
                   <p className="text-base font-semibold text-foreground">
@@ -11274,29 +10309,6 @@ export function WorkflowCopilotChat({
               let questionsPlaced = false;
               const rendered = (() => {
                 const isLastMessage = index === lastTurnIndex;
-                if (
-                  message.kind === "recording_refinement" &&
-                  message.recordingRefinement
-                ) {
-                  return (
-                    <div key={message.id} className="flex flex-col gap-3">
-                      <RecordingRefinementProgressCard
-                        awaitingReview={Boolean(
-                          proposedWorkflow &&
-                          pendingProposalTurnId ===
-                            message.recordingRefinement.turnId,
-                        )}
-                        {...message.recordingRefinement}
-                      />
-                      {index === lastRefinementIndex &&
-                      message.recordingRefinement.status !== "working" ? (
-                        <RecordingFeedbackPrompt
-                          workflowPermanentId={workflowPermanentId}
-                        />
-                      ) : null}
-                    </div>
-                  );
-                }
                 if (
                   message.kind === "run_lifecycle" ||
                   message.sender === "product"
@@ -11593,8 +10605,7 @@ export function WorkflowCopilotChat({
                           />
                         ),
                       )}
-                      {demonstrationEnabled &&
-                      message.narrative.demonstrationOffer ? (
+                      {message.narrative.demonstrationOffer ? (
                         <div className="max-w-sm">
                           <DemonstrateTaskButton
                             label="Start demonstration"
@@ -11812,17 +10823,10 @@ export function WorkflowCopilotChat({
               })();
               // A turn's own view places its questions under the step that asked; any other row
               // lists them after itself, since that row is what asked.
-              const rows = questionsPlaced
+              return questionsPlaced
                 ? [rendered]
                 : [rendered, ...turnQuestions];
-              return recordingChapterHost && recordingBoundary === index
-                ? [recordingChapterHost, ...rows]
-                : rows;
             })}
-            {recordingChapterHost &&
-            (recordingBoundary === null || recordingBoundary >= messages.length)
-              ? recordingChapterHost
-              : null}
             {startupPending && startupFailed && !recoveryControls ? (
               <div
                 role="status"
@@ -11893,9 +10897,7 @@ export function WorkflowCopilotChat({
             every send, including queued-then-drained follow-ups.
           */}
             {isLoading && !isLoadingHistory && narrative.turnId === null ? (
-              recordingRefinementInFlight ? null : (
-                <InstantAckPlaceholder />
-              )
+              <InstantAckPlaceholder />
             ) : null}
             {/*
             Bottom in-flight narrative bubble. Suppressed once the terminal
@@ -11939,26 +10941,8 @@ export function WorkflowCopilotChat({
             {lastTurnPlanIndex === -1 && liveTurnPlan === null ? (
               <WorkPlanCard items={workPlan} />
             ) : null}
-            {recordingSuggestionHost}
           </div>
         </div>
-        {recordingChapterAboveViewport ? (
-          <RecordingChapterProxy
-            actionCount={recordingActionCount}
-            newActionCount={Math.max(
-              0,
-              recordingActionCount - recordingProxyBaseline,
-            )}
-            lastActionTitle={lastRecordingActionTitle}
-            isFinishing={recordingIsFinishing}
-            stopSlotRef={setRecordingProxyStopSlotEl}
-            onJumpToChapter={jumpToRecordingChapter}
-            onExpand={() => {
-              setRecordingProxyBaseline(recordingActionCount);
-              setRecordingFocusOpen(true);
-            }}
-          />
-        ) : null}
         {!isPinned ? (
           <button
             type="button"
@@ -12484,7 +11468,7 @@ export function WorkflowCopilotChat({
                     : QUESTION_PROMPT_ID
                   : undefined
               }
-              disabled={authoringInProgress || isDemonstrating}
+              disabled={isDemonstrating}
               rows={1}
               className="min-h-10 flex-1 resize-none border-0 bg-transparent py-2 text-sm leading-6 text-foreground placeholder:truncate placeholder:text-muted-foreground focus:outline-none disabled:cursor-not-allowed disabled:opacity-50"
               style={{
@@ -12521,9 +11505,7 @@ export function WorkflowCopilotChat({
                 isSupported={isSpeechSupported}
                 isListening={isSpeechListening}
                 isHearingSpeech={isSpeechHearing}
-                disabled={
-                  isDemonstrating || (authoringInProgress && !isSpeechListening)
-                }
+                disabled={isDemonstrating}
                 onToggle={toggleSpeech}
                 className="h-8 w-8 rounded-full border-0 bg-transparent"
                 iconClassName="h-3.5 w-3.5"
@@ -12548,7 +11530,6 @@ export function WorkflowCopilotChat({
                       : stopBlockedByDeletion ||
                         waitingOnQueueOnly ||
                         acceptUnresolved ||
-                        authoringBlocksComposerAction ||
                         questionAnswerMissing
                   }
                 >
@@ -12561,7 +11542,6 @@ export function WorkflowCopilotChat({
                           waitingOnQueueOnly ||
                           isStopping ||
                           acceptUnresolved ||
-                          authoringBlocksComposerAction ||
                           questionAnswerMissing
                     }
                     aria-busy={

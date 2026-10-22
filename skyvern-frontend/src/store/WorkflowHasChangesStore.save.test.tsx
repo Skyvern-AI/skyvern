@@ -37,9 +37,6 @@ import {
   usePendingWorkflowSaveRecovery,
   type WorkflowSaveData,
 } from "./WorkflowHasChangesStore";
-import { useProcessRecordingMutation } from "@/routes/browserSessions/hooks/useProcessRecordingMutation";
-import { useRecordingFeedbackStore } from "./RecordingFeedbackStore";
-import { useRecordingStore } from "./useRecordingStore";
 import {
   confirmCodeCacheDeletion,
   useSaveWorkflow,
@@ -68,7 +65,6 @@ import {
 const mocks = vi.hoisted(() => ({
   workflowId: "wpid-1",
   post: vi.fn(),
-  delete: vi.fn(),
   getClient: vi.fn(),
   get: vi.fn(),
   put: vi.fn(),
@@ -88,12 +84,6 @@ vi.mock("@/routes/workflows/hooks/useWorkflowQuery", () => ({
 }));
 vi.mock("@/routes/workflows/studio/useStudioPanes", () => ({
   useStudioPanes: () => ({ openPane: vi.fn() }),
-}));
-vi.mock("@/util/recordBrowserTelemetry", () => ({
-  captureRecordBrowser: vi.fn(),
-  getRecordBrowserContext: () => ({}),
-  markRecordBrowserProcessed: vi.fn(),
-  setRecordBrowserContext: vi.fn(),
 }));
 vi.mock("@/api/AxiosClient", () => ({
   getClient: mocks.getClient,
@@ -132,14 +122,13 @@ const saveData = {
   },
 } as unknown as WorkflowSaveData;
 
-describe("workflow recording attachment", () => {
+describe("workflow save reservation", () => {
   afterEach(() => vi.useRealTimers());
   beforeEach(() => {
     vi.clearAllMocks();
     mocks.getNodes.mockReset().mockReturnValue([]);
     sessionStorage.clear();
     mocks.workflowId = "wpid-1";
-    useRecordingStore.getState().reset();
     useWorkflowHasChangesStore.setState(
       useWorkflowHasChangesStore.getInitialState(),
     );
@@ -150,7 +139,6 @@ describe("workflow recording attachment", () => {
     mocks.getClient.mockResolvedValue({
       get: mocks.get,
       post: mocks.post,
-      delete: mocks.delete,
       put: mocks.put,
     });
     mocks.put.mockResolvedValue({
@@ -162,8 +150,6 @@ describe("workflow recording attachment", () => {
     });
     useWorkflowHasChangesStore.setState({
       getSaveData: () => saveData,
-      pendingRecordingId: "br-1",
-      pendingRecordingWorkflowPermanentId: "wpid-1",
     });
   });
 
@@ -340,9 +326,6 @@ describe("workflow recording attachment", () => {
       });
       expect(mocks.put).not.toHaveBeenCalled();
       expect(mocks.post).not.toHaveBeenCalled();
-      expect(mocks.delete).toHaveBeenCalledExactlyOnceWith(
-        "/browser_recordings/br-1",
-      );
       expect(mocks.capture).not.toHaveBeenCalled();
       expect(screen.queryByRole("status")).toBeNull();
 
@@ -759,9 +742,6 @@ describe("workflow recording attachment", () => {
   );
 
   it("writes the pending-save marker without a degraded-mode notice when storage works", async () => {
-    useRecordingFeedbackStore
-      .getState()
-      .show({ workflow_permanent_id: "wpid-1" });
     let resolvePut!: (value: unknown) => void;
     mocks.put.mockReset().mockImplementationOnce(
       () =>
@@ -798,7 +778,6 @@ describe("workflow recording attachment", () => {
       await saving;
     });
     expect(sessionStorage.getItem("workflow-pending-save:wpid-1")).toBeNull();
-    expect(useRecordingFeedbackStore.getState().target).toBeNull();
   });
 
   it.each([false, true])(
@@ -939,67 +918,6 @@ describe("workflow recording attachment", () => {
     },
   );
 
-  it("A46 clears an attached recording after disposed-owner success without deleting it", async () => {
-    const owner = useWorkflowYamlEditorStore.getState().editorOwner!;
-    let resolvePut!: (value: unknown) => void;
-    mocks.put.mockImplementationOnce(
-      () =>
-        new Promise((resolve) => {
-          resolvePut = resolve;
-        }),
-    );
-    const hook = renderHook(() => useWorkflowSave(), { wrapper });
-    let saving!: Promise<unknown>;
-    act(() => {
-      saving = hook.result.current.mutateAsync(undefined);
-    });
-    await waitFor(() => expect(mocks.put).toHaveBeenCalledOnce());
-    hook.unmount();
-    unregisterEditorOwner(owner);
-    registerEditorOwner(createYamlCommitOwner("wpid-next"));
-    await act(async () => {
-      resolvePut({ data: saveData.workflow });
-      await saving;
-    });
-    expect(useWorkflowHasChangesStore.getState().pendingRecordingId).toBeNull();
-    expect(mocks.delete).not.toHaveBeenCalled();
-    mocks.workflowId = "wpid-next";
-    mocks.post.mockResolvedValueOnce({
-      data: {
-        recording_id: "br-next",
-        blocks: [{ block_type: "action", label: "next" }],
-        parameters: [],
-      },
-    });
-    const process = renderHook(
-      () => useProcessRecordingMutation({ browserSessionId: "pbs-next" }),
-      { wrapper },
-    );
-    await act(async () => {
-      await process.result.current.mutateAsync({
-        draftSteps: [
-          {
-            step_id: "step-next",
-            action_kind: "click",
-            block_type: "action",
-            label: "Next",
-            status: "ready",
-            editable_fields: [],
-            parameters: [],
-            parameter_keys: [],
-          },
-        ],
-      });
-    });
-    expect(mocks.post).toHaveBeenCalledWith(
-      "/browser_sessions/pbs-next/process_recording",
-      expect.objectContaining({ workflow_permanent_id: "wpid-next" }),
-    );
-    expect(useWorkflowHasChangesStore.getState().pendingRecordingId).toBe(
-      "br-next",
-    );
-  });
-
   it("A47 keeps a slow PUT reserved until its own response despite newer canonical versions", async () => {
     const owner = useWorkflowYamlEditorStore.getState().editorOwner!;
     let resolvePut!: (value: unknown) => void;
@@ -1014,7 +932,6 @@ describe("workflow recording attachment", () => {
     mocks.getClient.mockResolvedValue({
       put: mocks.put,
       get,
-      delete: mocks.delete,
     });
     useWorkflowHasChangesStore.setState({
       getSaveData: () => ({
@@ -1429,7 +1346,6 @@ describe("workflow recording attachment", () => {
         else rejectPut(failure);
         expect(await settled).toEqual(outcome === "success" ? null : failure);
       });
-      expect(mocks.delete).not.toHaveBeenCalled();
       const token = beginCopilotAcceptance();
       if (outcome === "abort") {
         expect(token).toBeNull();
@@ -1584,15 +1500,7 @@ describe("workflow recording attachment", () => {
         false,
       );
       expect(hydrateSavedSettings).not.toHaveBeenCalled();
-      expect(useWorkflowHasChangesStore.getState()).toEqual(
-        outcome === "success"
-          ? {
-              ...editorState,
-              pendingRecordingId: null,
-              pendingRecordingWorkflowPermanentId: null,
-            }
-          : editorState,
-      );
+      expect(useWorkflowHasChangesStore.getState()).toEqual(editorState);
       expect(useWorkflowTitleStore.getState()).toBe(metadataState);
       const refetch = vi.fn().mockResolvedValue(serverWorkflow);
       const reopened = renderHook(
@@ -1608,27 +1516,6 @@ describe("workflow recording attachment", () => {
     },
   );
 
-  it("sends the pending recording on save and clears it only after success", async () => {
-    const { result } = renderHook(() => useWorkflowSave(), { wrapper });
-
-    await act(async () => result.current.mutateAsync(undefined));
-
-    const call = mocks.put.mock.calls[0];
-    expect(call).toBeDefined();
-    const yamlBody = call?.[1] as string;
-    expect(parseYaml(yamlBody)).toMatchObject({ recording_id: "br-1" });
-    await waitFor(() =>
-      expect(
-        useWorkflowHasChangesStore.getState().pendingRecordingId,
-      ).toBeNull(),
-    );
-    expect(mocks.capture).toHaveBeenCalledWith(
-      "builder.workflow.saved",
-      expect.objectContaining({ source_recording_id: "br-1" }),
-    );
-    expect(mocks.delete).not.toHaveBeenCalled();
-  });
-
   it.each(["before save", "while credentials load"])(
     "preserves the draft when authoring starts %s",
     async (timing) => {
@@ -1638,7 +1525,7 @@ describe("workflow recording attachment", () => {
       } else {
         mocks.getClient.mockImplementationOnce(async () => {
           useWorkflowYamlEditorStore.setState({ authoringInProgress: true });
-          return { delete: mocks.delete, put: mocks.put };
+          return { put: mocks.put };
         });
       }
       const { result } = renderHook(() => useWorkflowSave(), { wrapper });
@@ -1649,17 +1536,13 @@ describe("workflow recording attachment", () => {
         "Finish the current authoring action before saving",
       );
       expect(mocks.put).not.toHaveBeenCalled();
-      expect(mocks.delete).not.toHaveBeenCalled();
       expect(useWorkflowHasChangesStore.getState()).toMatchObject({
         hasChanges: true,
-        pendingRecordingId: "br-1",
       });
 
       useWorkflowYamlEditorStore.setState({ authoringInProgress: false });
       await act(async () => result.current.mutateAsync(undefined));
-      expect(parseYaml(mocks.put.mock.calls[0]?.[1])).toMatchObject({
-        recording_id: "br-1",
-      });
+      expect(mocks.put).toHaveBeenCalledOnce();
     },
   );
 
@@ -1674,7 +1557,6 @@ describe("workflow recording attachment", () => {
     expect(mocks.put).not.toHaveBeenCalled();
     expect(useWorkflowHasChangesStore.getState()).toMatchObject({
       hasChanges: true,
-      pendingRecordingId: "br-1",
     });
     finishCopilotAcceptance(reservation);
   });
@@ -1700,7 +1582,7 @@ describe("workflow recording attachment", () => {
     ).rejects.toThrow("A save is in progress");
     expect(beginCopilotAcceptance()).toBeNull();
     await act(async () => {
-      resolveClient({ put: mocks.put, delete: mocks.delete });
+      resolveClient({ put: mocks.put });
       await saving;
     });
     expect(mocks.put).toHaveBeenCalledOnce();
@@ -1730,7 +1612,6 @@ describe("workflow recording attachment", () => {
     expect(mocks.put).toHaveBeenCalledOnce();
     expect(parseYaml(mocks.put.mock.calls[0]?.[1])).toMatchObject({
       title: "Committed YAML title",
-      recording_id: "br-1",
     });
     expect(useWorkflowYamlEditorStore.getState().commitOwner).toBe(owner);
     await act(async () => {
@@ -1738,8 +1619,6 @@ describe("workflow recording attachment", () => {
         .getState()
         .setHasChanges(false, { fromYamlCommit: true });
     });
-    expect(useWorkflowHasChangesStore.getState().pendingRecordingId).toBeNull();
-    expect(mocks.delete).not.toHaveBeenCalled();
     finishYamlCommit(owner);
   });
 
@@ -1753,147 +1632,6 @@ describe("workflow recording attachment", () => {
     const token = beginCopilotAcceptance();
     expect(token).not.toBeNull();
     finishCopilotAcceptance(token!);
-  });
-
-  it("deletes an unattached recording when changes are discarded", async () => {
-    renderHook(() => useWorkflowSave(), { wrapper });
-
-    useWorkflowHasChangesStore.getState().setHasChanges(false);
-
-    expect(useWorkflowHasChangesStore.getState()).toMatchObject({
-      hasChanges: false,
-      pendingRecordingId: null,
-      pendingRecordingWorkflowPermanentId: null,
-    });
-    await waitFor(() =>
-      expect(mocks.delete).toHaveBeenCalledWith("/browser_recordings/br-1"),
-    );
-    expect(mocks.getClient).toHaveBeenCalledWith(
-      expect.any(Function),
-      "sans-api-v1",
-    );
-  });
-
-  it("keeps discard deletion registered while another save hook remains mounted", async () => {
-    renderHook(() => useWorkflowSave(), { wrapper });
-    const latestHook = renderHook(() => useWorkflowSave(), { wrapper });
-    latestHook.unmount();
-
-    useWorkflowHasChangesStore.getState().setHasChanges(false);
-
-    await waitFor(() =>
-      expect(mocks.delete).toHaveBeenCalledWith("/browser_recordings/br-1"),
-    );
-  });
-
-  it("discards a recording for another workflow after this workflow saves", async () => {
-    useWorkflowHasChangesStore.setState({
-      pendingRecordingWorkflowPermanentId: "wpid-other",
-    });
-    const { result } = renderHook(() => useWorkflowSave(), { wrapper });
-
-    await act(async () => result.current.mutateAsync(undefined));
-
-    await waitFor(() =>
-      expect(mocks.delete).toHaveBeenCalledWith("/browser_recordings/br-1"),
-    );
-    expect(useWorkflowHasChangesStore.getState()).toMatchObject({
-      hasChanges: false,
-      pendingRecordingId: null,
-      pendingRecordingWorkflowPermanentId: null,
-    });
-  });
-
-  it("does not replace the first recording waiting to be saved", () => {
-    useWorkflowHasChangesStore.getState().setPendingRecording("br-2", "wpid-1");
-
-    expect(useWorkflowHasChangesStore.getState()).toMatchObject({
-      pendingRecordingId: "br-1",
-      pendingRecordingWorkflowPermanentId: "wpid-1",
-    });
-  });
-
-  it("keeps the pending recording when the workflow save fails", async () => {
-    mocks.put.mockRejectedValue(new Error("save failed"));
-    const { result } = renderHook(() => useWorkflowSave(), { wrapper });
-
-    await expect(
-      act(async () => result.current.mutateAsync(undefined)),
-    ).rejects.toThrow("save failed");
-
-    expect(useWorkflowHasChangesStore.getState().pendingRecordingId).toBe(
-      "br-1",
-    );
-  });
-
-  it.each([
-    ["deletes the recording on a definite failure", true],
-    ["keeps it on a transport failure with an unknown outcome", false],
-  ])("after its marker was dropped mid-PUT, it %s", async (_, definite) => {
-    mocks.put.mockImplementation(async () => {
-      // Another editor's Record dropped the marker after this save captured it.
-      useWorkflowHasChangesStore.getState().clearPendingRecording("br-1");
-      throw new AxiosError(
-        "save failed",
-        undefined,
-        undefined,
-        undefined,
-        definite ? ({ status: 409, data: {} } as never) : undefined,
-      );
-    });
-    const { result } = renderHook(() => useWorkflowSave(), { wrapper });
-
-    await expect(
-      act(async () => result.current.mutateAsync(undefined)),
-    ).rejects.toThrow("save failed");
-
-    await new Promise((resolve) => setTimeout(resolve, 0));
-    if (definite)
-      expect(mocks.delete).toHaveBeenCalledWith("/browser_recordings/br-1");
-    else expect(mocks.delete).not.toHaveBeenCalled();
-  });
-
-  it("does not delete a recording whose marker survives a failed save", async () => {
-    mocks.put.mockRejectedValue(
-      new AxiosError("save failed", undefined, undefined, undefined, {
-        status: 500,
-        data: {},
-      } as never),
-    );
-    const { result } = renderHook(() => useWorkflowSave(), { wrapper });
-
-    await expect(
-      act(async () => result.current.mutateAsync(undefined)),
-    ).rejects.toThrow("save failed");
-
-    await new Promise((resolve) => setTimeout(resolve, 0));
-    expect(mocks.delete).not.toHaveBeenCalled();
-    expect(useWorkflowHasChangesStore.getState().pendingRecordingId).toBe(
-      "br-1",
-    );
-  });
-
-  it("keeps the pending recording when header validation fails", async () => {
-    useWorkflowHasChangesStore.setState({
-      getSaveData: () => ({
-        ...saveData,
-        settings: { ...saveData.settings, extraHttpHeaders: "{" },
-      }),
-      hasChanges: true,
-    });
-    const { result } = renderHook(() => useWorkflowSave(), { wrapper });
-
-    await expect(
-      act(async () => result.current.mutateAsync(undefined)),
-    ).rejects.toThrow();
-
-    expect(mocks.put).not.toHaveBeenCalled();
-    expect(mocks.delete).not.toHaveBeenCalled();
-    expect(useWorkflowHasChangesStore.getState()).toMatchObject({
-      hasChanges: true,
-      pendingRecordingId: "br-1",
-      pendingRecordingWorkflowPermanentId: "wpid-1",
-    });
   });
 
   it("initializes another workflow clean while the previous workflow save stays pending", async () => {
@@ -1924,7 +1662,6 @@ describe("workflow recording attachment", () => {
     });
     expect(useWorkflowHasChangesStore.getState()).toMatchObject({
       hasChanges: false,
-      pendingRecordingId: null,
       saveGenerationsByWorkflow: {},
     });
     expect(
@@ -1982,7 +1719,6 @@ describe("workflow recording attachment", () => {
     );
     expect(useWorkflowYamlEditorStore.getState().commitInProgress).toBe(false);
     expect(useWorkflowHasChangesStore.getState().hasChanges).toBe(false);
-    expect(mocks.delete).not.toHaveBeenCalled();
   });
 
   it.each(["before save", "while credentials load"])(
@@ -2001,7 +1737,7 @@ describe("workflow recording attachment", () => {
             copilotAcceptance: reservation,
             lockKind: "copilot",
           });
-          return { delete: mocks.delete, put: mocks.put };
+          return { put: mocks.put };
         });
       }
       const { result } = renderHook(() => useWorkflowSave(), { wrapper });
@@ -2013,10 +1749,8 @@ describe("workflow recording attachment", () => {
         timing === "before save" ? 0 : 1,
       );
       expect(mocks.put).not.toHaveBeenCalled();
-      expect(mocks.delete).not.toHaveBeenCalled();
       expect(useWorkflowHasChangesStore.getState()).toMatchObject({
         hasChanges: true,
-        pendingRecordingId: "br-1",
       });
       expect(useWorkflowHasChangesStore.getState().getSaveData()).toBe(
         saveData,
@@ -2041,7 +1775,7 @@ describe("workflow recording attachment", () => {
             commitInProgress: true,
             lockKind: "yaml",
           });
-          return { delete: mocks.delete, put: mocks.put };
+          return { put: mocks.put };
         });
       }
       const { result } = renderHook(() => useWorkflowSave(), { wrapper });
@@ -2066,7 +1800,6 @@ describe("workflow recording attachment", () => {
       expect(mocks.put).toHaveBeenCalledTimes(1);
       expect(parseYaml(mocks.put.mock.calls[0]?.[1])).toMatchObject({
         title: "Committed YAML title",
-        recording_id: "br-1",
       });
       finishYamlCommit(owner);
     },
@@ -2102,7 +1835,6 @@ describe("workflow recording attachment", () => {
     expect(hydrate).not.toHaveBeenCalled();
     expect(useWorkflowHasChangesStore.getState()).toMatchObject({
       hasChanges: true,
-      pendingRecordingId: null,
       saveGenerationsByWorkflow: { "wpid-1": 1 },
     });
     expect(useWorkflowYamlEditorStore.getState().commitInProgress).toBe(false);
@@ -2285,12 +2017,10 @@ describe("workflow recording attachment", () => {
 describe("blocked saves", () => {
   it("refuses to write the workflow and keeps it dirty while a save is blocked", async () => {
     mocks.put.mockClear();
-    mocks.getClient.mockResolvedValue({ delete: mocks.delete, put: mocks.put });
+    mocks.getClient.mockResolvedValue({ put: mocks.put });
     useWorkflowHasChangesStore.setState({
       getSaveData: () => saveData,
       hasChanges: true,
-      pendingRecordingId: null,
-      pendingRecordingWorkflowPermanentId: null,
       saveBlockedReason: "An Accept's outcome is still unconfirmed.",
     });
     const { result } = renderHook(() => useWorkflowSave(), { wrapper });

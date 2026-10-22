@@ -7,7 +7,6 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 
 import { Status } from "@/api/types";
 import type { StreamStateChangeHandler } from "@/routes/streaming/streamState";
-import { useRecordingStore } from "@/store/useRecordingStore";
 import { useStudioBrowserStore } from "@/store/useStudioBrowserStore";
 
 import { StudioBrowserStream } from "./StudioBrowserStream";
@@ -134,7 +133,6 @@ vi.mock("@/routes/browserSessions/BrowserSessionStream", () => ({
 }));
 
 const initialBrowserState = useStudioBrowserStore.getState();
-const initialRecordingState = useRecordingStore.getState();
 
 // Drives a real runtime pane change, so the effect chain under test is the
 // same one a spine click goes through.
@@ -196,7 +194,6 @@ function controlButtonsAttr(streamButtonName: string): string | null {
 beforeEach(() => {
   runtimeConfigMock.browserStreamingMode = "vnc";
   useStudioBrowserStore.setState(initialBrowserState, true);
-  useRecordingStore.setState(initialRecordingState, true);
   workflowRunQueryMock.mockReset();
   workflowRunQueryMock.mockReturnValue({ data: undefined });
 });
@@ -385,15 +382,6 @@ describe("StudioBrowserStream block-run co-drive", () => {
     renderStudioBrowserStream(BLOCK_RUN_OPEN_PATH, ["editor"]);
 
     expect(controlButtonsAttr("emit vnc frame")).toBe("no");
-    expect(screen.queryByRole("status")).toBeNull();
-  });
-
-  it("shows no sharing pill during a recording (the recorder is driving)", () => {
-    useRecordingStore.setState({ isRecording: true });
-    mockWorkflowRun(Status.Running, "pbs_test");
-    renderStudioBrowserStream(BLOCK_RUN_OPEN_PATH);
-
-    expect(controlButtonsAttr("emit vnc frame")).toBe("yes");
     expect(screen.queryByRole("status")).toBeNull();
   });
 });
