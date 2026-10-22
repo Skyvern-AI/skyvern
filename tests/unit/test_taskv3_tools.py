@@ -9,6 +9,7 @@ from __future__ import annotations
 import ast
 import asyncio
 import contextlib
+import dataclasses
 import decimal
 import html
 import html as html_lib
@@ -43124,6 +43125,127 @@ document.getElementById('go').addEventListener('click', () => {
         assert _delta_section(held).endswith(" (+26 more lines)"), held.content
         # Held once only: what that report left out too is not held again.
         assert _delta_section(await observe.handler({})) is None
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+async def test_a_delta_whose_cap_only_held_old_lines_is_not_a_fresh_page_read() -> None:
+    # Held lines go out first and can fill the whole section, so this call's own new line is left out: the model
+    # still has not seen the page after the response, though the call's own read succeeded and found the line.
+    from skyvern.forge.taskv3.loop import ActivityRecency, make_finish_tool, run_agent_tool_loop  # noqa: PLC0415
+    from tests.unit.test_taskv3_loop import _FakeSubmissions  # noqa: PLC0415
+
+    html_page = """<!doctype html><html><body><button id="go" type="button">Load</button>
+<button id="more" type="button">Send</button><ul id="rows"></ul><script>
+document.getElementById('go').addEventListener('click', () => {
+  for (let i = 0; i < 40; i++) {
+    const li = document.createElement('li'); li.textContent = 'Row ' + i + ' ' + 'x'.repeat(40);
+    document.getElementById('rows').appendChild(li);
+  }
+});
+document.getElementById('more').addEventListener('click', () => {
+  const li = document.createElement('li'); li.textContent = 'Submission received ' + 'y'.repeat(90);
+  document.getElementById('rows').appendChild(li);
+});
+</script></body></html>"""
+    async with _live_page(html_page) as page:
+        submissions, activity = _FakeSubmissions(), ActivityRecency()
+        tools = build_browser_tools(_fixed_page_provider(page))
+        click = _tool(tools, "click")
+
+        async def click_then_response_lands(args: dict[str, Any]) -> Any:
+            result = await click.handler(args)
+            if args.get("selector") == "#go":
+                submissions.deliver()
+                await asyncio.sleep(taskv3_loop.SUBMISSION_RENDER_MARGIN_SECONDS + 0.2)
+            return result
+
+        tools = [dataclasses.replace(t, handler=click_then_response_lands) if t.name == "click" else t for t in tools]
+        script = [
+            [("observe", {})],
+            [("click", {"selector": "#go"})],
+            [("click", {"selector": "#more"})],
+            [("finish", {"status": "terminated", "reason": "r1"})],
+            [("finish", {"status": "terminated", "reason": "r2"})],
+        ]
+        outcome = await run_agent_tool_loop(
+            llm_caller=_ScriptedCaller(script),
+            system_prompt="sys",
+            user_prompt="goal",
+            tools=tools + [make_finish_tool(activity=activity, intercepted_submissions=submissions)],
+            max_turns=10,
+            max_tool_calls=20,
+            activity=activity,
+        )
+        clicks = [m["content"] for m in outcome.messages if m.get("role") == "tool" and m.get("name") == "click"]
+        assert "Submission received" not in clicks[1] and "Row " in clicks[1], clicks[1]
+        assert (outcome.status, outcome.reason) == ("terminated", "r2")
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+async def test_held_lines_flushed_after_a_failed_read_do_not_count_as_a_fresh_page_read(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Lines held from an earlier read go out with the next call even when that call cannot read the page; that
+    # result shows old text, so a submission response that landed in between is still one the model has not seen.
+    import skyvern.utils.url_validators as urlv  # noqa: PLC0415
+    from skyvern.forge.taskv3.loop import ActivityRecency, make_finish_tool, run_agent_tool_loop  # noqa: PLC0415
+    from tests.unit.test_taskv3_loop import _FakeSubmissions  # noqa: PLC0415
+
+    monkeypatch.setattr(urlv, "validate_fetch_url", lambda url: url)
+    served = {
+        "/": """<!doctype html><html><body><button id="go" type="button">Load</button>
+<a id="broken" href="/broken">Broken</a><ul id="rows"></ul><script>
+document.getElementById('go').addEventListener('click', () => {
+  for (let i = 0; i < 40; i++) {
+    const li = document.createElement('li'); li.textContent = 'Row ' + i; document.getElementById('rows').appendChild(li);
+  }
+});
+</script></body></html>""",
+        "/broken": """<!doctype html><html><body><p>Broken page</p><script>
+Object.defineProperty(window, '__skyvern_doc_nonce', { configurable: true, get() { throw new Error('x'); }, set() {} });
+</script></body></html>""",
+    }
+    async with _live_page("") as page:
+        await page.route(
+            "http://rows.test/**",
+            lambda route: route.fulfill(body=served[urlparse(route.request.url).path], content_type="text/html"),
+        )
+        await page.goto("http://rows.test/")
+        submissions, activity = _FakeSubmissions(), ActivityRecency()
+        tools = build_browser_tools(_fixed_page_provider(page))
+        click = _tool(tools, "click")
+
+        async def click_then_response_lands(args: dict[str, Any]) -> Any:
+            result = await click.handler(args)
+            if args.get("selector") == "#go":
+                submissions.deliver()
+                await asyncio.sleep(taskv3_loop.SUBMISSION_RENDER_MARGIN_SECONDS + 0.2)
+            return result
+
+        tools = [dataclasses.replace(t, handler=click_then_response_lands) if t.name == "click" else t for t in tools]
+        script = [
+            [("observe", {})],
+            [("click", {"selector": "#go"})],
+            [("click", {"selector": "#broken"})],
+            [("finish", {"status": "terminated", "reason": "r1"})],
+            [("finish", {"status": "terminated", "reason": "r2"})],
+        ]
+        outcome = await run_agent_tool_loop(
+            llm_caller=_ScriptedCaller(script),
+            system_prompt="sys",
+            user_prompt="goal",
+            tools=tools + [make_finish_tool(activity=activity, intercepted_submissions=submissions)],
+            max_turns=10,
+            max_tool_calls=20,
+            activity=activity,
+        )
+        clicks = [m["content"] for m in outcome.messages if m.get("role") == "tool" and m.get("name") == "click"]
+        # The second click's own read failed; all it carries is what the first click's read held back.
+        assert "before this call ran, the page newly showed" in clicks[1] and "Row 39" in clicks[1], clicks[1]
+        assert page.url == "http://rows.test/broken"
+        assert (outcome.status, outcome.reason) == ("terminated", "r2")
 
 
 @_skip_no_browser

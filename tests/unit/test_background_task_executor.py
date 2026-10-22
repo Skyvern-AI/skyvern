@@ -1525,6 +1525,7 @@ async def test_historical_child_artifacts_use_parent_attempt(
         attempt_number=1,
         historical_artifacts=[],
     )
+    assert files is not None
     assert [file.artifact_id for file in files] == ["child_1_pdf"]
     assert urls == ["https://example.com/child_1_pdf"]
     assert lookup.await_count == 4
