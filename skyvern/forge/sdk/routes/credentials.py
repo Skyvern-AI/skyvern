@@ -122,6 +122,8 @@ from skyvern.forge.sdk.schemas.organizations import (
     AzureOrganizationAuthToken,
     BitwardenCredentialResponse,
     BitwardenCredentialSafe,
+    BitwardenCredentialStatus,
+    BitwardenCredentialStatusResponse,
     BitwardenOrganizationAuthToken,
     BitwardenOrganizationAuthTokenSafe,
     ClearOrganizationAuthTokenResponse,
@@ -3979,19 +3981,19 @@ def _to_safe_bitwarden_response(auth_token: BitwardenOrganizationAuthToken) -> B
 
 @base_router.get(
     "/credentials/bitwarden/get",
-    response_model=BitwardenCredentialResponse,
+    response_model=BitwardenCredentialResponse | BitwardenCredentialStatusResponse,
     summary="Get Bitwarden credential",
     description="Retrieves the current Bitwarden credential for the organization. The master_password is never returned for security.",
     include_in_schema=False,
 )
 @base_router.get(
     "/credentials/bitwarden/get/",
-    response_model=BitwardenCredentialResponse,
+    response_model=BitwardenCredentialResponse | BitwardenCredentialStatusResponse,
     include_in_schema=False,
 )
 async def get_bitwarden_credential(
     current_org: Organization = Depends(org_auth_service.get_current_org_for_credential_routes),
-) -> BitwardenCredentialResponse:
+) -> BitwardenCredentialResponse | BitwardenCredentialStatusResponse:
     """
     Get the current Bitwarden credential for the organization.
     """
@@ -4006,6 +4008,16 @@ async def get_bitwarden_credential(
                 detail="No Bitwarden credential found for this organization",
             )
 
+        if await _should_redact_org_credential_secrets(current_org.organization_id):
+            return BitwardenCredentialStatusResponse(
+                token=BitwardenCredentialStatus(
+                    id=auth_token.id,
+                    token_type=auth_token.token_type,
+                    valid=auth_token.valid,
+                    created_at=auth_token.created_at,
+                    modified_at=auth_token.modified_at,
+                )
+            )
         return _to_safe_bitwarden_response(auth_token)
 
     except HTTPException:

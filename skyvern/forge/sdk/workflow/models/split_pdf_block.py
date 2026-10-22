@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import io
 import json
 import os
@@ -454,7 +455,7 @@ class SplitPdfBlock(Block):
 
         try:
             try:
-                validate_pdf_file(source_pdf_path, file_identifier=self.file_url)
+                await asyncio.to_thread(validate_pdf_file, source_pdf_path, file_identifier=self.file_url)
                 reader = PdfReader(source_pdf_path)
                 total_pages = len(reader.pages)
             except PDFParsingError as e:

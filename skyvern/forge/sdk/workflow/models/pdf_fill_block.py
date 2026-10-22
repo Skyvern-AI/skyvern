@@ -14,7 +14,6 @@ from typing import Any, ClassVar, Literal, cast
 from urllib.parse import urlparse
 
 import aiofiles
-import pdfplumber
 import structlog
 from pypdf import PdfReader, PdfWriter
 from pypdf.generic import DecodedStreamObject, DictionaryObject, NameObject
@@ -40,7 +39,11 @@ from skyvern.forge.sdk.core import skyvern_context
 from skyvern.forge.sdk.db.exceptions import NotFoundError
 from skyvern.forge.sdk.experimentation.llm_prompt_config import get_llm_handler_for_prompt_type
 from skyvern.forge.sdk.schemas.files import FileInfo
-from skyvern.forge.sdk.utils.pdf_parser import render_pdf_pages_as_images, validate_pdf_file
+from skyvern.forge.sdk.utils.pdf_parser import (
+    extract_upright_pdf_words,
+    render_pdf_pages_as_images,
+    validate_pdf_file,
+)
 from skyvern.forge.sdk.utils.tesseract_languages import DEFAULT_FLAT_FILL_OCR_LANGUAGES
 from skyvern.forge.sdk.workflow.context_manager import WorkflowRunContext
 from skyvern.forge.sdk.workflow.loop_download_filter import filter_downloaded_files_for_current_iteration
@@ -307,6 +310,11 @@ class PdfFillBlock(Block):
             return "checkbox"
         return "text"
 
+    def _read_pdf_and_inventory(self, pdf_path: str) -> tuple[PdfReader, dict[str, PdfFieldInventory]]:
+        validate_pdf_file(pdf_path, file_identifier=self.file_url)
+        reader = PdfReader(pdf_path)
+        return reader, self._extract_field_inventory(reader, pdf_path)
+
     def _extract_field_inventory(self, reader: PdfReader, pdf_path: str | None = None) -> dict[str, PdfFieldInventory]:
         fields = reader.get_fields() or {}
         if not fields:
@@ -354,11 +362,7 @@ class PdfFillBlock(Block):
             if not leaf_rects:
                 return {}
 
-            with pdfplumber.open(pdf_path) as pdf:
-                words_by_page = {
-                    pi: [w for w in pg.extract_words(extra_attrs=["upright"]) if w.get("upright", True)]
-                    for pi, pg in enumerate(pdf.pages)
-                }
+            words_by_page = extract_upright_pdf_words(pdf_path, {rect[0] for rect in leaf_rects.values()})
 
             labels: dict[str, str] = {}
             for leaf, (page_index, fx0, ftop, fx1, fbot, is_button) in leaf_rects.items():
@@ -563,7 +567,8 @@ class PdfFillBlock(Block):
         return shutil.which("tesseract") is not None
 
     async def _extract_flat_anchors(self, pdf_path: str) -> list[FlatPdfAnchor]:
-        page_images = render_pdf_pages_as_images(
+        page_images = await asyncio.to_thread(
+            render_pdf_pages_as_images,
             pdf_path,
             file_identifier=self.file_url,
             max_pages=FLAT_FILL_MAX_PAGES,
@@ -1091,9 +1096,7 @@ class PdfFillBlock(Block):
 
         try:
             try:
-                validate_pdf_file(source_pdf_path, file_identifier=self.file_url)
-                reader = PdfReader(source_pdf_path)
-                inventory = self._extract_field_inventory(reader, source_pdf_path)
+                reader, inventory = await asyncio.to_thread(self._read_pdf_and_inventory, source_pdf_path)
             except PDFParsingError as e:
                 return await self._record_failure(
                     workflow_run_context,

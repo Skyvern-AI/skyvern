@@ -1679,7 +1679,7 @@ class SkyvernPage(Page):
         Args:
             prompt: Validation criteria or condition to check
             model: Optional model configuration. Can be either:
-                   - A dict with model configuration (e.g., {"model_name": "gemini-2.5-flash-lite", "max_tokens": 2048})
+                   - A dict with model configuration (e.g., {"model_name": "gemini-3.0-flash", "max_tokens": 2048})
                    - A string with just the model name (e.g., "gpt-4")
 
         Returns:
@@ -1693,13 +1693,13 @@ class SkyvernPage(Page):
             # Validation with specific model (as string)
             is_valid = await page.validate(
                 "Check if the order was placed",
-                model="gemini-2.5-flash-lite"
+                model="gemini-3.0-flash"
             )
 
             # Validation with model config (as dict)
             is_valid = await page.validate(
                 "Check if the payment completed",
-                model={"model_name": "gemini-2.5-flash-lite", "max_tokens": 1024}
+                model={"model_name": "gemini-3.0-flash", "max_tokens": 1024}
             )
             ```
         """
@@ -3684,8 +3684,8 @@ class SkyvernPage(Page):
             schema: Optional JSON schema to structure the response. If provided, the LLM response
                    will be validated against this schema.
             model: Optional model configuration. Can be either:
-                   - A dict with model configuration (e.g., {"model_name": "gemini-2.5-flash-lite", "max_tokens": 2048})
-                   - A string with just the model name (e.g., "gemini-2.5-flash-lite")
+                   - A dict with model configuration (e.g., {"model_name": "gemini-3.0-flash", "max_tokens": 2048})
+                   - A string with just the model name (e.g., "gemini-3.0-flash")
 
         Returns:
             LLM response structured according to the schema if provided, or unstructured response otherwise.

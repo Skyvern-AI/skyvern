@@ -872,7 +872,7 @@ def has_otp_source(
         return True
     has_polling_source = bool((task.totp_verification_url or task.totp_identifier) and task.organization_id)
     if not has_polling_source:
-        # This False withholds the v3 code tool entirely, which is otherwise invisible in logs.
+        # This False makes the v3 code tool answer that no code source is configured.
         _warn_if_scope_suppresses_legacy_credential(task, expected_otp_type, allowed_credential_parameter_keys)
     return has_polling_source
 

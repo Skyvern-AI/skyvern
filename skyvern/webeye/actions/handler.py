@@ -2662,32 +2662,6 @@ class CustomSingleSelectResult:
         return not await self.skyvern_frame.get_element_visible(self.dropdown_menu.get_locator())
 
 
-def is_ul_or_listbox_element_factory(
-    incremental_scraped: IncrementalScrapePage, task: Task, step: Step
-) -> Callable[[dict], Awaitable[bool]]:
-    async def wrapper(element_dict: dict) -> bool:
-        element_id: str = element_dict.get("id", "")
-        try:
-            element = await SkyvernElement.create_from_incremental(incremental_scraped, element_id)
-        except Exception:
-            LOG.debug(
-                "Failed to element in the incremental page",
-                element_id=element_id,
-                exc_info=True,
-            )
-            return False
-
-        if element.get_tag_name() == "ul":
-            return True
-
-        if await element.get_attr("role") == "listbox":
-            return True
-
-        return False
-
-    return wrapper
-
-
 CheckFilterOutElementIDFunc = Callable[[dict, Page | Frame], Awaitable[bool]]
 
 
@@ -7489,6 +7463,37 @@ async def _apply_desired_click_state(
     return None
 
 
+async def _is_submit_control_for_completion(element: SkyvernElement) -> bool:
+    if skyvern_context.current() is None:
+        return False
+    try:
+        return await app.AGENT_FUNCTION.is_submit_control_for_completion(element)
+    except Exception:
+        LOG.debug("Submit-control detection failed before click", element_id=element.get_id(), exc_info=True)
+        return False
+
+
+def _record_submit_click_evidence(action: actions.Action, task: Task, step: Step) -> None:
+    context = skyvern_context.current()
+    if context is None:
+        return
+    action_order = action.action_order
+    if action_order is None:
+        action_order = len(step.output.actions_and_results or []) if step.output is not None else 0
+    context.submit_click_evidence[task.task_id] = (
+        datetime.now(UTC),
+        step.order,
+        step.retry_index,
+        action_order,
+    )
+    LOG.info(
+        "Submit-control click recorded for completion evidence",
+        task_id=task.task_id,
+        step_id=step.step_id,
+        action_order=action_order,
+    )
+
+
 @traced(name="skyvern.agent.action.click")
 async def handle_click_action(
     action: actions.ClickAction,
@@ -7532,6 +7537,22 @@ async def handle_click_action(
             if skyvern_element := await dom.safe_get_skyvern_element_by_id(element_id):
                 if await skyvern_element.navigate_to_a_href(page=page):
                     return [ActionSuccess()]
+                submit_control = await _is_submit_control_for_completion(skyvern_element)
+                if submit_control:
+                    try:
+                        # A dispatched coordinate click on a disabled button is not submit evidence.
+                        submit_control = await skyvern_element.get_locator().is_enabled()
+                    except Exception:
+                        LOG.debug(
+                            "Submit-control enabled-state lookup failed before coordinate click",
+                            element_id=skyvern_element.get_id(),
+                            exc_info=True,
+                        )
+                        submit_control = False
+            else:
+                submit_control = False
+        else:
+            submit_control = False
 
         await EventStrategyFactory.move_cursor(page, action.x, action.y)
         if action.repeat == 1:
@@ -7542,6 +7563,9 @@ async def handle_click_action(
             await page.mouse.click(x=action.x, y=action.y, button=action.button, click_count=3)
         else:
             raise ValueError(f"Invalid repeat value: {action.repeat}")
+
+        if submit_control:
+            _record_submit_click_evidence(action, task, step)
 
         return [ActionSuccess()]
 
@@ -7664,7 +7688,10 @@ async def handle_click_action(
             )
 
     if action.download:
+        submit_control = await _is_submit_control_for_completion(skyvern_element)
         results = await handle_click_to_download_file_action(action, page, scraped_page, task, step)
+        if results and results[-1].success and submit_control:
+            _record_submit_click_evidence(action, task, step)
 
     elif action.file_url:
         upload_file_action = UploadFileAction(
@@ -7676,6 +7703,7 @@ async def handle_click_action(
         preflight_derived_action(upload_file_action, page, parent=action, site="click_to_upload")
         return await handle_upload_file_action(upload_file_action, page, scraped_page, task, step)
     else:
+        submit_control = await _is_submit_control_for_completion(skyvern_element)
         incremental_scraped: IncrementalScrapePage | None = None
         # Inside a file-download block, a non-download click authorized as a false-click candidate can
         # still mint the file. If it does, the post-click dropdown/custom-select rescrape below is dead
@@ -7715,6 +7743,8 @@ async def handle_click_action(
                 incremental_scraped=incremental_scraped,
                 skyvern_frame=skyvern_frame,
             )
+            if results and results[-1].success and submit_control:
+                _record_submit_click_evidence(action, task, step)
             action_phase.mark_action_phase(ActionPhase.POST_CLICK)
             if page.url != original_url:
                 return results
@@ -15362,8 +15392,6 @@ async def select_from_dropdown(
         potential_scrollable_element = await try_to_find_potential_scrollable_element(
             skyvern_element=dropdown_menu_element,
             incremental_scraped=incremental_scraped,
-            step=step,
-            task=task,
         )
 
         if await skyvern_frame.get_element_scrollable(await potential_scrollable_element.get_element_handler()):
@@ -15708,8 +15736,6 @@ async def select_from_dropdown_by_value(
     potential_scrollable_element = await try_to_find_potential_scrollable_element(
         skyvern_element=dropdown_menu_element,
         incremental_scraped=incremental_scraped,
-        task=task,
-        step=step,
     )
     if not await skyvern_frame.get_element_scrollable(await potential_scrollable_element.get_element_handler()):
         return _no_element_matched_failure(
@@ -15825,8 +15851,8 @@ async def locate_dropdown_menu(
             )
             continue
 
-        ul_or_listbox_element_id = await head_element.find_children_element_id_by_callback(
-            cb=is_ul_or_listbox_element_factory(incremental_scraped=incremental_scraped, task=task, step=step),
+        ul_or_listbox_element_id = await incremental_scraped.find_option_list_element_id(
+            head_element.get_element_dict()
         )
 
         if ul_or_listbox_element_id:
@@ -15898,17 +15924,13 @@ async def locate_dropdown_menu(
 async def try_to_find_potential_scrollable_element(
     skyvern_element: SkyvernElement,
     incremental_scraped: IncrementalScrapePage,
-    task: Task,
-    step: Step,
 ) -> SkyvernElement:
     """
     check any <ul> or <role="listbox"> element in the chidlren.
     if yes, return the found element,
     else, return the orginal one
     """
-    found_element_id = await skyvern_element.find_children_element_id_by_callback(
-        cb=is_ul_or_listbox_element_factory(incremental_scraped=incremental_scraped, task=task, step=step),
-    )
+    found_element_id = await incremental_scraped.find_option_list_element_id(skyvern_element.get_element_dict())
     if found_element_id and found_element_id != skyvern_element.get_id():
         LOG.debug(
             "Found 'ul or listbox' element in children list",
@@ -16951,7 +16973,9 @@ async def _get_input_or_select_context(
     return input_or_select_context
 
 
-def _match_user_defined_error_from_reasoning(task: Task, step: Step, reasoning: str) -> list[UserDefinedError]:
+def _match_user_defined_error_from_reasoning(
+    task: Task, step: Step, reasoning: str, codes_only: bool = False
+) -> list[UserDefinedError]:
     # If the LLM returns no structured errors but its terminate reasoning
     # explicitly mentions a configured code or description, preserve that
     # machine-readable code for task/run/webhook error aggregation.
@@ -16963,7 +16987,9 @@ def _match_user_defined_error_from_reasoning(task: Task, step: Step, reasoning: 
         code_matches = (
             "_" in error_code and re.search(rf"\b{re.escape(error_code.lower())}\b", normalized_reasoning) is not None
         )
-        description_matches = isinstance(error_description, str) and error_description.lower() in normalized_reasoning
+        description_matches = (
+            not codes_only and isinstance(error_description, str) and error_description.lower() in normalized_reasoning
+        )
         if code_matches or description_matches:
             matched_errors.append(
                 UserDefinedError(
@@ -16972,6 +16998,9 @@ def _match_user_defined_error_from_reasoning(task: Task, step: Step, reasoning: 
                     confidence_float=1.0,
                 )
             )
+    if codes_only and len(matched_errors) > 1:
+        # Naming several codes is weighing them, not concluding one.
+        return []
     if matched_errors:
         if len(matched_errors) > 1:
             LOG.warning(

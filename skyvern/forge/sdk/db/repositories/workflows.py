@@ -76,6 +76,10 @@ class WorkflowCreationLockTimeout(Exception):
     pass
 
 
+class WorkflowFolderChangedError(ValueError):
+    """The workflow moved after its folder access was checked for deletion."""
+
+
 @dataclass(frozen=True)
 class WorkflowDispatchState:
     run_with: str | None
@@ -202,16 +206,20 @@ class WorkflowsRepository(BaseRepository):
                 yield
 
     @asynccontextmanager
-    async def version_write_transaction(self) -> AsyncIterator[None]:
+    async def version_write_transaction(self, workflow_permanent_id: str | None = None) -> AsyncIterator[None]:
         """Bind every write in the block to one transaction.
 
         A save allocates its version row before it can build the definition that fills it (the
         definition is keyed by the new ``workflow_id``). Committing the row first publishes an
         empty workflow as the latest version, so every write between entering and leaving this
-        block becomes visible at once instead.
+        block becomes visible at once instead. Updates also serialize with deletion for this workflow.
         """
-        async with self._workflow_creation_transaction():
-            yield
+        if workflow_permanent_id is None:
+            async with self._workflow_creation_transaction():
+                yield
+        else:
+            async with self.acquire_workflow_creation_lock(workflow_permanent_id):
+                yield
 
     async def _latest_version_definition(
         self, session: Any, workflow_permanent_id: str, organization_id: str | None
@@ -369,9 +377,7 @@ class WorkflowsRepository(BaseRepository):
                 workflow.workflow_id = workflow_id
             if version:
                 workflow.version = version
-            session.add(workflow)
-
-            # Update folder's modified_at if folder_id is provided
+            # Serialize creates with folder cascades so the cascade sees this row or rejects the create.
             if folder_id:
                 # Validate folder exists and belongs to the same organization
                 folder_stmt = (
@@ -379,14 +385,16 @@ class WorkflowsRepository(BaseRepository):
                     .where(FolderModel.folder_id == folder_id)
                     .where(FolderModel.organization_id == organization_id)
                     .where(FolderModel.deleted_at.is_(None))
+                    .with_for_update()
                 )
                 folder_model = await session.scalar(folder_stmt)
                 if not folder_model:
                     raise ValueError(
                         f"Folder {folder_id} not found or does not belong to organization {organization_id}"
                     )
-                folder_model.modified_at = datetime.now(UTC)
+                folder_model.modified_at = datetime.now(UTC).replace(tzinfo=None)
 
+            session.add(workflow)
             await session.commit()
             await session.refresh(workflow)
             return convert_to_workflow(workflow, self.debug_enabled)
@@ -538,6 +546,53 @@ class WorkflowsRepository(BaseRepository):
                     is_template=is_template,
                 )
             return None
+
+    @db_operation("get_workflow_original_creators")
+    async def get_workflow_original_creators(
+        self, workflow_permanent_ids: set[str], organization_id: str
+    ) -> dict[str, str | None]:
+        if not workflow_permanent_ids:
+            return {}
+        async with self.Session() as session:
+            workflow_ids = (
+                select(WorkflowModel.organization_id, WorkflowModel.workflow_permanent_id)
+                .where(
+                    WorkflowModel.organization_id == organization_id,
+                    WorkflowModel.workflow_permanent_id.in_(workflow_permanent_ids),
+                )
+                .group_by(WorkflowModel.organization_id, WorkflowModel.workflow_permanent_id)
+                .subquery()
+            )
+            first_versions = (
+                select(
+                    WorkflowModel.organization_id,
+                    WorkflowModel.workflow_permanent_id,
+                    func.min(WorkflowModel.version).label("min_version"),
+                )
+                .where(
+                    WorkflowModel.organization_id == organization_id,
+                    WorkflowModel.workflow_permanent_id.in_(workflow_permanent_ids),
+                    or_(WorkflowModel.created_by.is_(None), WorkflowModel.created_by != COPILOT_TEST_WORKFLOW_CREATOR),
+                )
+                .group_by(WorkflowModel.organization_id, WorkflowModel.workflow_permanent_id)
+                .subquery()
+            )
+            result = await session.execute(
+                select(workflow_ids.c.workflow_permanent_id, WorkflowModel.created_by)
+                .select_from(workflow_ids)
+                .outerjoin(
+                    first_versions,
+                    (workflow_ids.c.organization_id == first_versions.c.organization_id)
+                    & (workflow_ids.c.workflow_permanent_id == first_versions.c.workflow_permanent_id),
+                )
+                .outerjoin(
+                    WorkflowModel,
+                    (WorkflowModel.organization_id == workflow_ids.c.organization_id)
+                    & (WorkflowModel.workflow_permanent_id == workflow_ids.c.workflow_permanent_id)
+                    & (WorkflowModel.version == first_versions.c.min_version),
+                )
+            )
+            return dict(result.all())
 
     @db_operation("get_workflow_for_workflow_run")
     async def get_workflow_for_workflow_run(
@@ -1553,56 +1608,76 @@ class WorkflowsRepository(BaseRepository):
                 is_template=is_template,
             )
 
-    @db_operation("soft_delete_workflow_and_schedules_by_permanent_id")
+    @db_operation("soft_delete_workflow_and_schedules_by_permanent_id", expected_errors=(WorkflowFolderChangedError,))
     async def soft_delete_workflow_and_schedules_by_permanent_id(
         self,
         workflow_permanent_id: str,
         organization_id: str | None = None,
+        *,
+        expected_folder_assignment: tuple[str, str | None] | None = None,
     ) -> tuple[list[tuple[str, str | None]], str | None]:
         """Soft-delete a workflow and its active schedules in one transaction; returns (schedule id, backend id)."""
-        async with self.Session() as session:
-            select_query = (
-                select(WorkflowScheduleModel.workflow_schedule_id, WorkflowScheduleModel.backend_schedule_id)
-                .where(WorkflowScheduleModel.workflow_permanent_id == workflow_permanent_id)
-                .where(WorkflowScheduleModel.deleted_at.is_(None))
-            )
-            if organization_id is not None:
-                select_query = select_query.where(WorkflowScheduleModel.organization_id == organization_id)
-            result = await session.execute(select_query)
-            deleted_schedules = [(row[0], row[1]) for row in result.all()]
-            schedule_ids = [schedule_id for schedule_id, _ in deleted_schedules]
+        async with self.acquire_workflow_creation_lock(workflow_permanent_id):
+            async with self.Session() as session:
+                if expected_folder_assignment is not None:
+                    expected_workflow_id, expected_folder_id = expected_folder_assignment
+                    if expected_workflow_id != workflow_permanent_id:
+                        raise WorkflowFolderChangedError("Workflow folder changed during delete; retry the request.")
+                    workflow_query = (
+                        select(WorkflowModel)
+                        .where(WorkflowModel.workflow_permanent_id == workflow_permanent_id)
+                        .where(WorkflowModel.deleted_at.is_(None))
+                    )
+                    if organization_id is not None:
+                        workflow_query = workflow_query.where(WorkflowModel.organization_id == organization_id)
+                    current_workflow = await session.scalar(
+                        workflow_query.order_by(WorkflowModel.version.desc()).limit(1).with_for_update()
+                    )
+                    if current_workflow is not None and current_workflow.folder_id != expected_folder_id:
+                        raise WorkflowFolderChangedError("Workflow folder changed during delete; retry the request.")
 
-            deleted_at = datetime.now(UTC)
-            if schedule_ids:
-                update_schedules_query = (
-                    update(WorkflowScheduleModel)
-                    .where(WorkflowScheduleModel.workflow_schedule_id.in_(schedule_ids))
-                    .values(deleted_at=deleted_at)
+                select_query = (
+                    select(WorkflowScheduleModel.workflow_schedule_id, WorkflowScheduleModel.backend_schedule_id)
+                    .where(WorkflowScheduleModel.workflow_permanent_id == workflow_permanent_id)
+                    .where(WorkflowScheduleModel.deleted_at.is_(None))
                 )
-                await session.execute(update_schedules_query)
+                if organization_id is not None:
+                    select_query = select_query.where(WorkflowScheduleModel.organization_id == organization_id)
+                result = await session.execute(select_query)
+                deleted_schedules = [(row[0], row[1]) for row in result.all()]
+                schedule_ids = [schedule_id for schedule_id, _ in deleted_schedules]
 
-            update_workflow_query = (
-                update(WorkflowModel)
-                .where(WorkflowModel.workflow_permanent_id == workflow_permanent_id)
-                .where(WorkflowModel.deleted_at.is_(None))
-            )
-            if organization_id is not None:
-                update_workflow_query = update_workflow_query.filter_by(organization_id=organization_id)
-            workflow_result = await session.execute(
-                update_workflow_query.values(deleted_at=deleted_at).returning(WorkflowModel.workflow_permanent_id)
-            )
-            deleted_workflow_id = workflow_result.scalars().first()
-            recording_delete_query = update(BrowserRecordingModel).where(
-                BrowserRecordingModel.workflow_permanent_id == workflow_permanent_id,
-                BrowserRecordingModel.deleted_at.is_(None),
-            )
-            if organization_id is not None:
-                recording_delete_query = recording_delete_query.where(
-                    BrowserRecordingModel.organization_id == organization_id
+                deleted_at = datetime.now(UTC)
+                if schedule_ids:
+                    update_schedules_query = (
+                        update(WorkflowScheduleModel)
+                        .where(WorkflowScheduleModel.workflow_schedule_id.in_(schedule_ids))
+                        .values(deleted_at=deleted_at)
+                    )
+                    await session.execute(update_schedules_query)
+
+                update_workflow_query = (
+                    update(WorkflowModel)
+                    .where(WorkflowModel.workflow_permanent_id == workflow_permanent_id)
+                    .where(WorkflowModel.deleted_at.is_(None))
                 )
-            await session.execute(recording_delete_query.values(deleted_at=deleted_at))
-            await session.commit()
-            return deleted_schedules, deleted_workflow_id
+                if organization_id is not None:
+                    update_workflow_query = update_workflow_query.filter_by(organization_id=organization_id)
+                workflow_result = await session.execute(
+                    update_workflow_query.values(deleted_at=deleted_at).returning(WorkflowModel.workflow_permanent_id)
+                )
+                deleted_workflow_id = workflow_result.scalars().first()
+                recording_delete_query = update(BrowserRecordingModel).where(
+                    BrowserRecordingModel.workflow_permanent_id == workflow_permanent_id,
+                    BrowserRecordingModel.deleted_at.is_(None),
+                )
+                if organization_id is not None:
+                    recording_delete_query = recording_delete_query.where(
+                        BrowserRecordingModel.organization_id == organization_id
+                    )
+                await session.execute(recording_delete_query.values(deleted_at=deleted_at))
+                await session.commit()
+                return deleted_schedules, deleted_workflow_id
 
     @db_operation("add_workflow_template")
     async def add_workflow_template(

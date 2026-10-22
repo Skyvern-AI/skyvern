@@ -57,14 +57,14 @@ def filter_to_user_defined_codes(
     """
     if not error_code_mapping:
         return [], [error.error_code for error in errors]
-    allowed = set(error_code_mapping.keys())
     kept: list[UserDefinedError] = []
     dropped: list[str] = []
     for error in errors:
-        if error.error_code in allowed:
-            kept.append(error)
-        else:
+        key = resolve_error_code_mapping_key(error.error_code, error_code_mapping)
+        if key is None:
             dropped.append(error.error_code)
+        else:
+            kept.append(error if key == error.error_code else error.model_copy(update={"error_code": key}))
     return kept, dropped
 
 

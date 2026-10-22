@@ -16,7 +16,7 @@ from copy import deepcopy
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Awaitable, Callable, Literal, NamedTuple, Sequence, Tuple, cast
+from typing import Any, Awaitable, Callable, Literal, NamedTuple, Sequence, Tuple, cast
 
 import structlog
 from openai.types.responses.response import Response as OpenAIResponse
@@ -358,10 +358,6 @@ from skyvern.webeye.scraper.scraped_page import ElementTreeFormat, ScrapedPage
 from skyvern.webeye.scraper.scraper import page_is_dead_blank, page_is_http_survivor
 from skyvern.webeye.utils.document import get_main_document_loader_id
 from skyvern.webeye.utils.page import OTP_INPUT_PRIVACY_JS, ScreenshotMode, SkyvernFrame, build_open_tabs_context
-
-if TYPE_CHECKING:
-    # Runtime import is local to _execute_task_v3: auth_tools imports the action handler, which imports this module.
-    from skyvern.forge.taskv3.auth_tools import VerificationState
 
 LOG = structlog.get_logger()
 BLANK_WORKFLOW_TASK_URLS = {"about:blank", ":"}
@@ -1710,26 +1706,6 @@ def _v3_task_status(
     return task_status, missing_extraction
 
 
-# Worded to stay clear of the classifier's credential and sign-in keywords: the customer's credentials
-# were never tried with a code, so neither category is the cause.
-_V3_TOTP_SOURCE_MISSING_REASON = (
-    "task_v3 could not produce the one-time code the page asked for: the credential has no usable TOTP "
-    "source for this block"
-)
-
-
-def _v3_totp_source_missing(task_status: TaskStatus, verification_state: "VerificationState") -> bool:
-    """Whether the run ended on a credential code it could not produce with no other code source at all --
-    the condition the step engine's MISSING_TOTP_SOURCE names."""
-    return (
-        task_status in (TaskStatus.failed, TaskStatus.terminated)
-        and verification_state.totp_source_missing
-        and verification_state.values_delivered == 0
-        and not verification_state.code_tool_offered
-        and not verification_state.source_failed
-    )
-
-
 def _v3_failure_reason(
     outcome: LoopOutcome,
     *,
@@ -1737,7 +1713,7 @@ def _v3_failure_reason(
     completion_rejection: str | None,
     missing_extraction: bool,
     run_secrets: Collection[str],
-    totp_source_missing: bool = False,
+    verification_status: str | None = None,
 ) -> str | None:
     if task_status in (TaskStatus.completed, TaskStatus.canceled):
         failure_reason = None
@@ -1745,8 +1721,9 @@ def _v3_failure_reason(
         failure_reason = f"task_v3 reported completion but {completion_rejection}"
     elif missing_extraction:
         failure_reason = "task_v3 reported completion but returned no extracted_output for the data-extraction goal"
-    elif totp_source_missing:
-        failure_reason = _V3_TOTP_SOURCE_MISSING_REASON
+    # Only the model's own give-up: a loop guard, a loop error or a spent budget ended the run for its own reason.
+    elif verification_status is not None and outcome.guard is None and outcome.status in ("failed", "terminated"):
+        failure_reason = f"{outcome.reason or outcome.status} (last verification code status: {verification_status})"
     else:
         failure_reason = outcome.reason or outcome.status
     # failure_reason is a first-class field on the task webhook payload, so the model's finish
@@ -2413,6 +2390,7 @@ class ForgeAgent:
         )
         from skyvern.forge.taskv3.opaque_refs import mask_opaque_urls
         from skyvern.forge.taskv3.tools import (
+            NO_ONE_TIME_CODE_SOURCE,
             _document_unidentifiable,
             _observable_child_frames,
             _realm_document_id,
@@ -3192,8 +3170,8 @@ class ForgeAgent:
         if context and credential_parameter_key is not None:
             context.active_credential_parameter_key = credential_parameter_key
         try:
-            # Built AFTER the credential pin: the tool-offer gate (has_credential_totp_candidate)
-            # must see the pinned key, or a multi-credential context hides get_verification_code.
+            # Built AFTER the credential pin: the code-source check (has_credential_totp_candidate)
+            # must see the pinned key, or a multi-credential context reads as having no code source.
             # No page provider in page-free mode: the sign-in-link tool navigates, and a run that
             # structurally never touches the live DOM must not be offered it.
             verification_state = VerificationState(
@@ -3265,13 +3243,18 @@ class ForgeAgent:
                     )
 
             async def _completion_gate() -> bool:
-                return await app.AGENT_FUNCTION.gate_step_completion(
-                    task=task,
-                    step=step,
-                    task_block=task_block,
-                    page=await browser_state.get_working_page(),
-                    browser_state=browser_state,
-                )
+                try:
+                    return await app.AGENT_FUNCTION.gate_step_completion(
+                        task=task,
+                        step=step,
+                        task_block=task_block,
+                        page=await browser_state.get_working_page(),
+                        browser_state=browser_state,
+                    )
+                except (CompletionGateTerminationError, StepTerminationError):
+                    # The gate's verdict ends the run with its own reason, not a code status the model saw earlier.
+                    verification_state.last_status = None
+                    raise
 
             outcome = await run_task_v3_agent_loop(
                 page_provider=_page_provider,
@@ -3289,6 +3272,7 @@ class ForgeAgent:
                 download_attempts=_download_attempts,
                 block_type=block_type,
                 has_navigation_goal=bool(task.navigation_goal),
+                error_code_mapping=task.error_code_mapping,
                 extraction_requested=extraction_requested,
                 # Only the customer's own instructions can define what counts as done. Auth and captcha
                 # guidance are how-to, and the judge is told an outcome its instructions allow is no
@@ -3332,6 +3316,8 @@ class ForgeAgent:
                 should_cancel=_should_cancel,
                 on_action_round=_on_action_round,
                 on_pre_action=pre_submit_ring.capture if pre_submit_ring is not None else None,
+                # A code status the model has moved past is no longer what the run ends on.
+                on_page_action=verification_state.page_engaged,
                 extra_tools=auth_tools + captcha_tools,
                 extra_system_guidance="\n\n".join(
                     part for part in (auth_guidance, captcha_guidance, workflow_system_guidance) if part
@@ -3370,6 +3356,8 @@ class ForgeAgent:
             with contained_effect("task_v3 pre-submit frame persist", task_id=task.task_id):
                 async with asyncio.timeout(30):
                     await _persist_pre_submit_frames()
+        # The model's own verdict, before a completion gate or a re-ask conversion rewrote the status.
+        model_verdict = outcome.model_status or outcome.converted_from or outcome.status
         LOG.info(
             "Task V3 loop finished",
             task_id=task.task_id,
@@ -3406,6 +3394,8 @@ class ForgeAgent:
                 LOG.warning(
                     "task_v3 completion gate errored; accepting completion", task_id=task.task_id, exc_info=True
                 )
+            if outcome.status != "completed":
+                verification_state.last_status = None
             if outcome.status == "terminated":
                 LOG.info("task_v3 completion terminated by completion gate", task_id=task.task_id)
             elif outcome.status == "failed":
@@ -3599,17 +3589,30 @@ class ForgeAgent:
                 step_id=step.step_id,
                 exc_info=True,
             )
-        totp_source_missing = _v3_totp_source_missing(task_status, verification_state)
         failure_reason = _v3_failure_reason(
             outcome,
             task_status=task_status,
             completion_rejection=completion_rejection,
             missing_extraction=missing_extraction,
             run_secrets=run_secrets,
-            totp_source_missing=totp_source_missing,
+            verification_status=verification_state.last_status,
         )
-        # Only when that is the reason recorded: a vetoed completion or a missing extraction failed for its own.
-        if totp_source_missing and failure_reason == _V3_TOTP_SOURCE_MISSING_REASON:
+        if verification_state.last_status is not None:
+            LOG.info(
+                "task_v3 ended on a verification code status",
+                task_id=task.task_id,
+                organization_id=task.organization_id,
+                workflow_run_id=task.workflow_run_id,
+                task_status=task_status.value,
+                polling_spent_seconds=round(verification_state.polling_spent_seconds, 1),
+                remaining_seconds=round(verification_state.remaining_budget_seconds, 1),
+                values_delivered=verification_state.values_delivered,
+            )
+        # Only when the reason recorded carries that status: a vetoed completion or a missing extraction failed for
+        # its own.
+        if verification_state.last_status == NO_ONE_TIME_CODE_SOURCE and NO_ONE_TIME_CODE_SOURCE in (
+            failure_reason or ""
+        ):
             LOG.info("task_v3 attributed to a missing TOTP source", task_id=task.task_id, task_status=task_status)
             with contained_effect("task_v3 missing TOTP source error persist", task_id=task.task_id):
                 await app.DATABASE.tasks.update_task(
@@ -3634,7 +3637,44 @@ class ForgeAgent:
             completion_rejection=completion_rejection,
             missing_extraction=missing_extraction,
         )
-        if task.error_code_mapping and task_status in (TaskStatus.failed, TaskStatus.terminated):
+        coded_failure = bool(task.error_code_mapping) and task_status in (TaskStatus.failed, TaskStatus.terminated)
+        # The answer belongs to the model's own failed/terminated verdict, never to a completion demoted after the loop.
+        # A conversion still standing here was ended by a deployment gate, not by the model's verdict.
+        model_answered = (
+            coded_failure
+            and outcome.status in ("failed", "terminated")
+            and outcome.converted_from is None
+            and (outcome.error_code is not None or outcome.error_code_declined)
+        )
+        model_answer_used = False
+        if model_answered:
+            try:
+                model_answer_used = await app.AGENT_FUNCTION.task_v3_error_code_on_finish(
+                    organization_id=task.organization_id
+                )
+            except Exception:
+                LOG.warning("task_v3 error code on finish gate failed", task_id=task.task_id, exc_info=True)
+        detector_codes: list[str] | None = None
+        if model_answer_used and outcome.error_code:
+            with contained_effect("task_v3 model-chosen error code persist", task_id=task.task_id):
+                code_reasoning = outcome.reason
+                if run_secrets:
+                    code_reasoning = redact_secrets_from_text(code_reasoning, run_secrets)
+                await app.DATABASE.tasks.update_task(
+                    task_id=task.task_id,
+                    organization_id=task.organization_id,
+                    errors=[
+                        UserDefinedError(
+                            error_code=outcome.error_code,
+                            reasoning=code_reasoning[:_TASKV3_REASONING_MAX_CHARS],
+                            confidence_float=1.0,
+                        ).model_dump()
+                    ],
+                )
+        elif model_answer_used and outcome.error_code_declined:
+            # An explicit "none of these" is the model's judgment, so the page guess must not override it.
+            LOG.info("task_v3 user-defined error code declined by the model", task_id=task.task_id)
+        elif coded_failure:
             try:
                 detected_errors = await detect_user_defined_errors_for_task(
                     task=task,
@@ -3664,8 +3704,22 @@ class ForgeAgent:
                         organization_id=task.organization_id,
                         errors=[error.model_dump() for error in detected_errors],
                     )
+                detector_codes = [error.error_code for error in detected_errors]
             except Exception:
                 LOG.warning("task_v3 user-defined error detection failed", task_id=task.task_id, exc_info=True)
+        if coded_failure:
+            # One line per task, so the model's code can be read against the page guess before an org relies on it.
+            LOG.info(
+                "task_v3 user-defined error code sources",
+                task_id=task.task_id,
+                task_status=task_status,
+                reached_finish=outcome.guard is None and model_verdict in ("completed", "failed", "terminated"),
+                model_verdict=model_verdict,
+                model_error_code=outcome.error_code,
+                model_declined=outcome.error_code_declined,
+                detector_error_codes=detector_codes,
+                model_answer_used=model_answer_used,
+            )
         need_call_webhook = True
         try:
             task = await self.update_task(
@@ -3800,6 +3854,7 @@ class ForgeAgent:
         context.task_id = task.task_id
         context.navigation_goal = task.navigation_goal
         context.navigation_payload = task.navigation_payload
+        context.completion_gate_engine = engine
         if download_baseline_files is None:
             context.download_suffix_applied_files = {}
         context.download_suffix = task_block.download_suffix if task_block else None
@@ -4018,6 +4073,9 @@ class ForgeAgent:
                     await app.ARTIFACT_MANAGER.flush_step_archive(step.step_id)
                 return step, detailed_output, None
 
+            if dispatched_as_v3:
+                context.completion_gate_engine = RunEngine.skyvern_v1
+
             if workflow_owned_recovery:
                 # A recovery on the step engine would hold the block's credential placeholders with
                 # run-scoped credential and OTP access, so it fails instead of falling through.
@@ -4059,6 +4117,7 @@ class ForgeAgent:
                     )
                 # Later steps recurse with this engine; pinning v1 keeps them off the gate and this write.
                 engine = RunEngine.skyvern_v1
+                context.completion_gate_engine = engine
 
             if page := await browser_state.get_working_page():
                 await self.register_async_operations(organization, task, page)
@@ -8083,8 +8142,8 @@ class ForgeAgent:
             cache_key = f"{EXTRACT_ACTION_CACHE_KEY_PREFIX}{variant_suffix}-{resolved_llm_key}"
 
             # Get the actual model name from LLM config to ensure correct format
-            # (e.g., "gemini-2.5-flash" with decimal, not "gemini-2-5-flash")
-            model_name = "gemini-2.5-flash"  # Default
+            # (e.g., "gemini-3.1-flash-lite" with decimal, not "gemini-3-1-flash-lite")
+            model_name = "gemini-3-flash-preview"  # Default
 
             try:
                 llm_config = LLMConfigRegistry.get_config(resolved_llm_key)
@@ -8108,7 +8167,7 @@ class ForgeAgent:
                 # Try to extract from model_name if it contains "vertex_ai/" or starts with "gemini-"
                 if not extracted_name and hasattr(llm_config, "model_name") and isinstance(llm_config.model_name, str):
                     if "vertex_ai/" in llm_config.model_name:
-                        # Direct Vertex config: "vertex_ai/gemini-2.5-flash" -> "gemini-2.5-flash"
+                        # Direct Vertex config: "vertex_ai/gemini-3-flash-preview" -> "gemini-3-flash-preview"
                         extracted_name = llm_config.model_name.split("/")[-1]
                     elif llm_config.model_name.startswith("gemini-"):
                         # Already in correct format
@@ -8119,15 +8178,15 @@ class ForgeAgent:
                     params = llm_config.litellm_params
                     api_base = getattr(params, "api_base", None)
                     if api_base and isinstance(api_base, str) and "/models/" in api_base:
-                        # Extract from URL: .../models/gemini-2.5-flash -> "gemini-2.5-flash"
+                        # Extract from URL: .../models/gemini-3-flash-preview -> "gemini-3-flash-preview"
                         extracted_name = api_base.split("/models/")[-1]
 
                 # For router configs without api_base, infer from the llm_key itself
                 if not extracted_name:
-                    # Extract version from llm_key (e.g., VERTEX_GEMINI_1_5_FLASH -> "1_5" or VERTEX_GEMINI_2.5_FLASH -> "2.5")
+                    # Extract version from llm_key (e.g., VERTEX_GEMINI_1_5_FLASH -> "1_5" or VERTEX_GEMINI_3.0_FLASH -> "3.0")
                     # Pattern: GEMINI_{version}_{flavor} where version can use dots, underscores, or dashes
                     version_match = re.search(r"GEMINI[_-](\d+[._-]\d+)", resolved_llm_key, re.IGNORECASE)
-                    version = version_match.group(1).replace("_", ".").replace("-", ".") if version_match else "2.5"
+                    version = version_match.group(1).replace("_", ".").replace("-", ".") if version_match else "3"
 
                     # Determine flavor
                     if "_PRO_" in resolved_llm_key or resolved_llm_key.endswith("_PRO"):
@@ -8143,7 +8202,7 @@ class ForgeAgent:
             except Exception as e:
                 LOG.debug("Failed to extract model name from config, using default", error=str(e))
 
-            # Normalize model name to the canonical Vertex identifier (e.g., gemini-2.5-pro).
+            # Normalize model name to the canonical Vertex identifier (e.g., gemini-3-flash-preview).
             # Preserve preview suffixes so we don't strip required identifiers (e.g., gemini-3-flash-preview).
             match = re.search(
                 r"(gemini-\d+(?:\.\d+)?-(?:flash-lite|flash|pro)(?:-preview)?)", model_name, re.IGNORECASE

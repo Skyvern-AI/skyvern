@@ -91,7 +91,7 @@ class VertexCacheManager:
         Create a cache object using Vertex AI's /cachedContents API.
 
         Args:
-            model_name: Full model path (e.g., "gemini-2.5-flash")
+            model_name: Full model path (e.g., "gemini-3-flash-preview")
             static_content: The static content to cache
             cache_key: Unique key to identify this cache (e.g., f"task_{task_id}")
             ttl_seconds: Time to live in seconds (default: 1 hour)

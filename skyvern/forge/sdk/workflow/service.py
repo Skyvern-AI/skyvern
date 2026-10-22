@@ -11888,16 +11888,23 @@ class WorkflowService:
         self,
         workflow_permanent_id: str,
         organization_id: str | None = None,
+        *,
+        expected_folder_assignment: tuple[str, str | None] | None = None,
     ) -> tuple[list[tuple[str, str | None]], str | None]:
         """Soft-delete a workflow and its schedules in one transaction; the caller owes `delete_backend_schedules`."""
         # One transaction so we do not leave the workflow active if a process exits between separate commits.
-        (
-            deleted_schedules,
-            deleted_workflow_id,
-        ) = await app.DATABASE.workflows.soft_delete_workflow_and_schedules_by_permanent_id(
-            workflow_permanent_id=workflow_permanent_id,
-            organization_id=organization_id,
-        )
+        delete = app.DATABASE.workflows.soft_delete_workflow_and_schedules_by_permanent_id
+        if expected_folder_assignment is None:
+            deleted_schedules, deleted_workflow_id = await delete(
+                workflow_permanent_id=workflow_permanent_id,
+                organization_id=organization_id,
+            )
+        else:
+            deleted_schedules, deleted_workflow_id = await delete(
+                workflow_permanent_id=workflow_permanent_id,
+                organization_id=organization_id,
+                expected_folder_assignment=expected_folder_assignment,
+            )
         if deleted_schedules:
             LOG.info(
                 "Cascade-deleted schedules during workflow deletion",
@@ -17117,36 +17124,31 @@ class WorkflowService:
                 is_saved_task=runtime_workflow.is_saved_task,
             )
 
-        placeholder = await self._insert_next_workflow_version(
+        # Let concurrent dispatches reach the lock after reading the same candidate; allocation is refreshed under it.
+        next_workflow_version = await next_version()
+
+        async def insert_and_persist_dispatch_version(_candidate_version: int) -> Workflow:
+            async with app.DATABASE.workflows.acquire_workflow_creation_lock(runtime_workflow.workflow_permanent_id):
+                # A deletion that won the lock must not be undone by this stale dispatch.
+                await self.get_workflow_by_permanent_id(
+                    workflow_permanent_id=runtime_workflow.workflow_permanent_id,
+                    organization_id=organization_id,
+                )
+                placeholder = await insert_placeholder(await next_version())
+                self._regenerate_dispatch_draft_parameter_ids(dispatch_definition, placeholder.workflow_id)
+                return await self.update_workflow_definition(
+                    workflow_id=placeholder.workflow_id,
+                    organization_id=organization_id,
+                    workflow_definition=dispatch_definition,
+                    validate_code_block_templates=False,
+                )
+
+        return await self._insert_next_workflow_version(
             workflow_permanent_id=runtime_workflow.workflow_permanent_id,
-            version=await next_version(),
-            insert=insert_placeholder,
+            version=next_workflow_version,
+            insert=insert_and_persist_dispatch_version,
             next_version_after_conflict=next_version,
         )
-        try:
-            self._regenerate_dispatch_draft_parameter_ids(dispatch_definition, placeholder.workflow_id)
-            return await self.update_workflow_definition(
-                workflow_id=placeholder.workflow_id,
-                organization_id=organization_id,
-                workflow_definition=dispatch_definition,
-                validate_code_block_templates=False,
-            )
-        except Exception:
-            # The placeholder row already exists as the latest version; if definition
-            # persistence fails, soft-delete it so it does not linger as the latest pointer.
-            try:
-                await app.DATABASE.workflows.soft_delete_workflow_by_id(
-                    workflow_id=placeholder.workflow_id,
-                    organization_id=organization_id,
-                )
-            except Exception:
-                LOG.warning(
-                    "Failed to clean up partial copilot dispatch version after persistence error",
-                    workflow_id=placeholder.workflow_id,
-                    organization_id=organization_id,
-                    exc_info=True,
-                )
-            raise
 
     async def make_workflow_definition(
         self,
@@ -17486,7 +17488,7 @@ class WorkflowService:
             )
 
         async def persist_version_with_definition(
-            insert_version_row: Callable[[], Awaitable[Workflow]],
+            insert_version_row: Callable[[int], Awaitable[Workflow]],
         ) -> tuple[Workflow, WorkflowDefinition]:
             """Allocate the new version row and fill in its definition as one transaction.
 
@@ -17496,8 +17498,24 @@ class WorkflowService:
             and a save precondition checked against it would reject a valid draft over a version
             that validation is about to discard.
             """
-            async with app.DATABASE.workflows.version_write_transaction():
-                allocated_workflow = await insert_version_row()
+            async with app.DATABASE.workflows.version_write_transaction(
+                workflow_permanent_id=(
+                    existing_latest_workflow.workflow_permanent_id if existing_latest_workflow is not None else None
+                )
+            ):
+                if existing_latest_workflow is not None:
+                    if getattr(existing_latest_workflow, "deleted_at", None) is None:
+                        # Deletion shares this lock; reject a stale save that got here after it committed.
+                        await self.get_workflow_by_permanent_id(
+                            workflow_permanent_id=existing_latest_workflow.workflow_permanent_id,
+                            organization_id=organization_id,
+                        )
+                    # A writer may have committed since the earlier allocation read. Refresh under
+                    # the lock so a stale insert cannot abort this transaction on the unique constraint.
+                    version = await next_version_from_same_settings()
+                else:
+                    version = 1
+                allocated_workflow = await insert_version_row(version)
                 built_definition = await self.make_workflow_definition(
                     allocated_workflow.workflow_id,
                     request.workflow_definition,
@@ -17627,8 +17645,8 @@ class WorkflowService:
                         raise WorkflowVersionConflict(existing_latest_workflow.workflow_permanent_id)
                     return latest_version + 1
 
-                async def insert_version_with_definition(version: int) -> tuple[Workflow, WorkflowDefinition]:
-                    return await persist_version_with_definition(lambda: insert_version(version))
+                async def insert_version_with_definition(_version: int) -> tuple[Workflow, WorkflowDefinition]:
+                    return await persist_version_with_definition(insert_version)
 
                 updated_workflow, workflow_definition = await self._insert_next_workflow_version(
                     workflow_permanent_id=existing_latest_workflow.workflow_permanent_id,
@@ -17642,7 +17660,7 @@ class WorkflowService:
                 # literal "***" placeholder from a misbehaving client.
                 new_cdp_connect_headers = merge_masked_headers(request.cdp_connect_headers, None)
                 updated_workflow, workflow_definition = await persist_version_with_definition(
-                    lambda: self._create_initial_workflow_from_request(
+                    lambda _version: self._create_initial_workflow_from_request(
                         organization_id=organization_id,
                         request=request,
                         title=title,

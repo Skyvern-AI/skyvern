@@ -266,6 +266,7 @@ async def run_task_v3_agent_loop(
     should_cancel: Callable[[], Awaitable[bool]] | None = None,
     on_action_round: ActionRoundSink | None = None,
     on_pre_action: Callable[[str, dict[str, Any]], Awaitable[None]] | None = None,
+    on_page_action: Callable[[], None] | None = None,
     extra_tools: list[ToolSpec] | None = None,
     extra_system_guidance: str = "",
     max_tokens: int | None = DEFAULT_MAX_TOKENS,
@@ -298,6 +299,7 @@ async def run_task_v3_agent_loop(
     download_attempts: Callable[[], int | None] | None = None,
     block_type: str | None = None,
     has_navigation_goal: bool = False,
+    error_code_mapping: dict[str, str] | None = None,
     extraction_requested: bool = False,
     # Customer instructions that can redefine what "done" means, shown to the goal judge with the goal.
     goal_instructions: str = "",
@@ -614,6 +616,7 @@ async def run_task_v3_agent_loop(
         document_identity=None if page_free else document_identity,
         completion_gate=None if page_free else completion_gate,
         download_facts=failure_watch.facts if failure_watch is not None else None,
+        error_code_mapping=error_code_mapping,
     )
     tools = browser_tools + (extra_tools or []) + [finish_tool]
     # The COMPLETE dispatch list, not just the browser tools: auth / captcha / code tools and finish
@@ -686,6 +689,7 @@ async def run_task_v3_agent_loop(
             should_cancel=should_cancel,
             on_action_round=on_action_round,
             on_pre_action=on_pre_action,
+            on_page_action=on_page_action,
             max_tokens=max_tokens,
             prefix_ref_tokens=PREFIX_REF_TOKENS,
             max_raw_tokens=MAX_RAW_TOKENS,
