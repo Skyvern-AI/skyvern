@@ -1,5 +1,6 @@
 """Tests for string utility functions."""
 
+import random
 import string
 
 from skyvern.utils.strings import RANDOM_STRING_POOL, generate_random_string
@@ -89,3 +90,14 @@ class TestGenerateRandomString:
         """Should handle large lengths."""
         result = generate_random_string(10000)
         assert len(result) == 10000
+
+    def test_does_not_reseed_global_random(self) -> None:
+        """Generating a string must not mutate the process-global PRNG state (see issue #7072)."""
+        original_state = random.getstate()
+        try:
+            random.seed(1234)
+            expected_state = random.getstate()
+            generate_random_string(32)
+            assert random.getstate() == expected_state
+        finally:
+            random.setstate(original_state)
