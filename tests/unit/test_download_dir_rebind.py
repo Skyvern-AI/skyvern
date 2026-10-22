@@ -538,11 +538,46 @@ async def test_listener_timeout_cancels_and_marks_download() -> None:
     await asyncio.sleep(0)
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("explicit", "task_timeout", "cancelled"),
+    [(None, 5.0, False), (0.001, 5.0, True), (None, None, True)],
+    ids=["task_timeout_set_after_registration", "explicit_kwarg_wins", "no_task_timeout_uses_default"],
+)
+async def test_listener_reads_the_task_download_timeout_when_the_download_starts(
+    explicit: float | None, task_timeout: float | None, cancelled: bool
+) -> None:
+    async def slow_path() -> Path:
+        await asyncio.sleep(0.05)
+        return Path("not-on-disk")
+
+    download = MagicMock()
+    download.path = AsyncMock(side_effect=slow_path)
+    download.cancel = AsyncMock()
+    run_context = SkyvernContext(workflow_run_id="wr_priv", task_id="task_priv")
+
+    with patch("skyvern.webeye.browser_factory.BROWSER_DOWNLOAD_TIMEOUT", 0.001):
+        await _run_listener(
+            download,
+            download_timeout=explicit,
+            run_context=run_context,
+            context_timeout_after_registration=task_timeout,
+        )
+
+    assert download.cancel.await_count == (1 if cancelled else 0)
+
+
 _SENTINEL_STEM = "zz-sentinel-suggested-stem"
 _SENTINEL_QUERY_NAME = "zz-sentinel-query-stem"
 
 
-async def _run_listener(download: MagicMock, *, download_timeout: float | None = None) -> list[dict[str, object]]:
+async def _run_listener(
+    download: MagicMock,
+    *,
+    download_timeout: float | None = None,
+    run_context: SkyvernContext | None = None,
+    context_timeout_after_registration: float | None = None,
+) -> list[dict[str, object]]:
     events: list[dict[str, object]] = []
 
     def capture(_msg: str, **kwargs: object) -> None:
@@ -558,6 +593,8 @@ async def _run_listener(download: MagicMock, *, download_timeout: float | None =
         workflow_run_id="wr_priv",
         task_id="task_priv",
     )
+    if run_context is not None:
+        run_context.download_timeout = context_timeout_after_registration
 
     page = MagicMock()
     page_handlers: dict[str, object] = {}
@@ -565,7 +602,7 @@ async def _run_listener(download: MagicMock, *, download_timeout: float | None =
     captured_handler["handler"](page)
 
     with (
-        patch("skyvern.webeye.browser_factory.current", return_value=None),
+        patch("skyvern.webeye.browser_factory.current", return_value=run_context),
         patch("skyvern.webeye.browser_factory.LOG.info", side_effect=capture),
         patch("skyvern.webeye.browser_factory.LOG.debug", side_effect=capture),
     ):

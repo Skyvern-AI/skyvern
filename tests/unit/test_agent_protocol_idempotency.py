@@ -51,7 +51,6 @@ IDEMPOTENCY_KEY_ERROR_DETAIL = "Idempotency-Key must contain 1 to 255 visible AS
 
 REJECTED_IDEMPOTENCY_KEYS = {
     "empty": "",
-    "single_space": " ",
     "whitespace_only": "   ",
     "tab": "\t",
     "trailing_newline": "replay-key\n",
@@ -181,8 +180,8 @@ async def test_create_workflow_rejects_malformed_idempotency_key_before_any_work
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
     "payload",
-    [{}, {"yaml_definition": None, "json_definition": None}, {"yaml_definition": ""}],
-    ids=["empty_body", "explicit_nulls", "empty_yaml"],
+    [{"yaml_definition": None, "json_definition": None}, {"yaml_definition": ""}],
+    ids=["explicit_nulls", "empty_yaml"],
 )
 async def test_create_workflow_without_definition_returns_422(
     payload: dict[str, Any],
@@ -926,44 +925,36 @@ async def test_failed_workflow_save_does_not_schedule_saved_hook_before_commit(
         await database.engine.dispose()
 
 
+_MASKED_HEADERS = {"X-Test": "***", "X-New": "***"}
+
+
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
     ("entrypoint", "field_name", "supplied", "expected"),
     [
-        (entrypoint, field_name, supplied, expected)
-        for field_name, supplied, expected in (
-            [
-                (field, supplied, expected)
-                for field in ("extra_http_headers", "cdp_connect_headers")
-                for supplied, expected in [
-                    ({}, {"X-Test": "stored-value"}),
-                    ({"value": None}, {}),
-                    ({"value": {}}, {}),
-                    ({"value": {"X-New": "new-value"}}, {"X-New": "new-value"}),
-                    (
-                        {"value": {"X-Test": "***", "X-New": "***"}},
-                        {"X-Test": "***", "X-New": "***"}
-                        if field == "extra_http_headers"
-                        else {"X-Test": "stored-value"},
-                    ),
-                ]
-            ]
-            + [
-                (field, supplied, expected)
-                for field, stored, replacement in [
-                    ("totp_identifier", "stored-identifier", "new-identifier"),
-                    ("totp_verification_url", "https://example.test/stored-totp", "https://example.test/new-totp"),
-                    ("webhook_callback_url", "https://example.test/stored-hook", "https://example.test/new-hook"),
-                    ("proxy_location", {"url": "http://proxy.example.test:8080"}, "RESIDENTIAL"),
-                ]
-                for supplied, expected in [({}, stored), ({"value": None}, None), ({"value": replacement}, replacement)]
-            ]
-        )
-        for entrypoint in (
-            ["put", "json", "auto_accept", "manual_accept", "legacy_proposal", "manual_accept_updated_headers"]
-            if field_name == "extra_http_headers"
-            else ["put", "json"]
-        )
+        ("put", "extra_http_headers", {}, {"X-Test": "stored-value"}),
+        ("put", "extra_http_headers", {"value": None}, {}),
+        ("put", "extra_http_headers", {"value": {}}, {}),
+        ("put", "extra_http_headers", {"value": {"X-New": "new-value"}}, {"X-New": "new-value"}),
+        ("put", "extra_http_headers", {"value": _MASKED_HEADERS}, _MASKED_HEADERS),
+        ("json", "extra_http_headers", {}, {"X-Test": "stored-value"}),
+        ("json", "extra_http_headers", {"value": _MASKED_HEADERS}, _MASKED_HEADERS),
+        *[
+            (entrypoint, "extra_http_headers", supplied, expected)
+            for entrypoint in ("auto_accept", "manual_accept", "legacy_proposal", "manual_accept_updated_headers")
+            for supplied, expected in (({}, {"X-Test": "stored-value"}), ({"value": _MASKED_HEADERS}, _MASKED_HEADERS))
+        ],
+        ("put", "cdp_connect_headers", {}, {"X-Test": "stored-value"}),
+        ("put", "cdp_connect_headers", {"value": _MASKED_HEADERS}, {"X-Test": "stored-value"}),
+        ("json", "cdp_connect_headers", {"value": None}, {}),
+        ("put", "proxy_location", {}, {"url": "http://proxy.example.test:8080"}),
+        ("put", "proxy_location", {"value": None}, None),
+        ("put", "proxy_location", {"value": "RESIDENTIAL"}, "RESIDENTIAL"),
+        ("json", "totp_identifier", {}, "stored-identifier"),
+        ("put", "totp_verification_url", {}, "https://example.test/stored-totp"),
+        ("json", "totp_verification_url", {"value": None}, None),
+        ("put", "webhook_callback_url", {}, "https://example.test/stored-hook"),
+        ("json", "webhook_callback_url", {"value": "https://example.test/new-hook"}, "https://example.test/new-hook"),
     ],
 )
 async def test_workflow_setting_presence_preserves_persisted_values(

@@ -474,6 +474,51 @@ async def test_execute_safe_persists_the_resolved_engine(scoped_context: Skyvern
     assert persisted_engine == RunEngine.skyvern_v3
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("override", "script_mode", "fails", "seen"),
+    [
+        (RunEngine.skyvern_v3, False, False, 30.0),
+        (RunEngine.skyvern_v3, False, True, 30.0),
+        (None, False, False, 7.0),
+        (RunEngine.skyvern_v3, True, False, 7.0),
+    ],
+    ids=["v3_block", "v3_block_that_fails", "v1_block_unchanged", "script_mode_unchanged"],
+)
+async def test_a_v3_block_scopes_its_download_timeout_to_the_whole_block(
+    scoped_context: SkyvernContext,
+    override: RunEngine | None,
+    script_mode: bool,
+    fails: bool,
+    seen: float,
+) -> None:
+    # The browser's download listener reads this value when a download starts, including one the block's own
+    # navigation starts before the task loop; it must be the outer value again once the block ends.
+    scoped_context.workflow_block_engine_resolved_run_id = "wr_scope"
+    scoped_context.workflow_block_engine_override = override
+    scoped_context.script_mode = script_mode
+    scoped_context.download_timeout = 7.0
+    block = _make_block(TaskBlock, label="scope_block", download_timeout=30.0)
+    observed: list[float | None] = []
+
+    async def run_block(*_args: Any, **_kwargs: Any) -> BlockResult:
+        observed.append(scoped_context.download_timeout)
+        if fails:
+            raise RuntimeError("block failed")
+        return _block_result()
+
+    with (
+        patch("skyvern.forge.sdk.workflow.models.block.app") as mock_app,
+        patch.object(BaseTaskBlock, "execute", new_callable=AsyncMock, side_effect=run_block),
+        patch.object(Block, "_generate_workflow_run_block_description", new_callable=AsyncMock),
+    ):
+        _setup_mocks(mock_app)
+        await block.execute_safe(workflow_run_id="wr_scope")
+
+    assert observed == [seen]
+    assert scoped_context.download_timeout == 7.0
+
+
 class _EngineCaptured(BaseException):
     """Raised from the create_workflow_run_block mock once the dispatched engine is captured.
 

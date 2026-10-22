@@ -3149,6 +3149,7 @@ class TestScriptSkyvernPageMagicLink:
 
         monkeypatch.setattr(module, "poll_otp_value", fake_poll)
         monkeypatch.setattr(module, "render_template", fake_render)
+        monkeypatch.setattr(module, "default_navigation_settle", AsyncMock())
         monkeypatch.setattr(module.settings, "ALLOWED_HOSTS", ["portal.example.com"])
 
         page = SimpleNamespace(goto=fake_goto, fill=fake_fill)

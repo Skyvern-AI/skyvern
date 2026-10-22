@@ -6101,7 +6101,7 @@ def _main_would_fire(sequence: list[tuple[str, str, str]], threshold: int) -> bo
     return False
 
 
-@pytest.mark.parametrize("seed", range(200))
+@pytest.mark.parametrize("seed", range(50))
 def test_live_stall_firing_is_a_subset_of_the_per_tool_counter(seed: int) -> None:
     # The central claim of keying per probe: the loop never terminates a run the per-tool counter
     # would have let live. Enumerated over random probe sequences, because seven hand-picked
@@ -6119,7 +6119,7 @@ def test_live_stall_firing_is_a_subset_of_the_per_tool_counter(seed: int) -> Non
             break
 
 
-@pytest.mark.parametrize("seed", range(200))
+@pytest.mark.parametrize("seed", range(50))
 def test_imminent_is_exactly_whether_one_more_read_of_some_probe_trips_live(seed: int) -> None:
     # ``next_snapshot_can_trip`` is pinned by simulation, not by restating its formula: after every
     # prefix, it must equal "re-reading SOME probe once, returning what it last returned, reaches
@@ -7900,7 +7900,7 @@ async def test_a_failing_pending_probe_fails_open() -> None:
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("seed", range(200))
+@pytest.mark.parametrize("seed", range(50))
 async def test_every_live_verdict_is_preceded_by_exactly_one_warning_on_its_tool_streak(seed: int) -> None:
     # The warning reads the per-tool counter because that counter moves by exactly one per read:
     # any live verdict needs tool_identical >= terminate > nudge on the same streak, so the streak

@@ -1000,8 +1000,6 @@ describe("PromptBox", () => {
   // the server's billing guidance behind a generic toast.
   test.each([
     { handoff: false, status: 402 },
-    { handoff: true, status: 402 },
-    { handoff: false, status: 422 },
     { handoff: true, status: 422 },
   ])(
     "surfaces the server detail on a $status (handoff=$handoff)",

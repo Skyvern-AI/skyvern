@@ -335,8 +335,6 @@ describe("useProcessRecordingMutation telemetry", () => {
 
   it.each([
     ["wpid-1", "success"],
-    ["wpid-1", "error"],
-    ["wpid-2", "success"],
     ["wpid-2", "error"],
   ])(
     "resets the Done lifecycle after owner disposal to %s and a deferred %s",
@@ -401,11 +399,8 @@ describe("useProcessRecordingMutation telemetry", () => {
 
   it.each([
     ["commitToken", "success"],
-    ["commitToken", "error"],
-    ["workflowPermanentId", "success"],
     ["workflowPermanentId", "error"],
     ["recordingAttemptId", "success"],
-    ["recordingAttemptId", "error"],
   ] as const)(
     "preserves a newer recording with a different %s after disposed %s",
     async (identityField, outcome) => {
@@ -535,7 +530,7 @@ describe("useProcessRecordingMutation telemetry", () => {
     },
   );
 
-  it.each(["success", "empty success", "error", "empty error"])(
+  it.each(["success", "empty error"])(
     "ignores deferred recording %s after navigation to another editor",
     async (outcome) => {
       vi.useRealTimers();

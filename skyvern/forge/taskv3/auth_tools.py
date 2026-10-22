@@ -171,10 +171,11 @@ def _time_left(remaining_seconds: float) -> str:
     return f"about {remaining_seconds / 60.0:.1f} minutes of polling time remain"
 
 
-def _code_not_yet(remaining_seconds: float) -> str:
+def _code_not_yet(remaining_seconds: float, webhook_answers: str | None = None) -> str:
     if _budget_spent(remaining_seconds):
-        return _CODE_BUDGET_SPENT
-    return f"no verification code has arrived yet; {_time_left(remaining_seconds)}."
+        return f"{_CODE_BUDGET_SPENT} It answered: {webhook_answers}." if webhook_answers else _CODE_BUDGET_SPENT
+    answers = f" ({webhook_answers})" if webhook_answers else ""
+    return f"no verification code has arrived yet{answers}; {_time_left(remaining_seconds)}."
 
 
 def _code_source_error(detail: str, remaining_seconds: float) -> str:
@@ -638,7 +639,9 @@ def build_auth_tools(
         state.arm(reason, tool)
         return ToolResult.error(message, data=data)
 
-    def _not_yet(expected_otp_type: OTPType, detail: str, elapsed_seconds: float, *, errored: bool) -> ToolResult:
+    def _not_yet(
+        expected_otp_type: OTPType, detail: str, elapsed_seconds: float, *, webhook_answers: str | None
+    ) -> ToolResult:
         """A slice that timed out with nothing to hand over. `elapsed_seconds` is this slice's wait, which
         the caller's `finally` has not yet added to the running spend."""
         spent = state.polling_spent_seconds + elapsed_seconds
@@ -656,8 +659,10 @@ def build_auth_tools(
         )
         spent_out = _budget_spent(remaining)
         if expected_otp_type == OTPType.TOTP:
-            text = _code_source_error(detail, remaining) if errored else _code_not_yet(remaining)
-            return _code_answer(text, arm=VerificationFailure.BUDGET_EXHAUSTED if spent_out else None)
+            return _code_answer(
+                _code_not_yet(remaining, webhook_answers),
+                arm=VerificationFailure.BUDGET_EXHAUSTED if spent_out else None,
+            )
         state.awaiting_link_since = state.link_wait_since = time.monotonic()
         if spent_out:
             return _failed(
@@ -753,7 +758,7 @@ def build_auth_tools(
             empty_answer_streak = 0
             if exc.webhook_diagnostics:
                 detail = f"{detail}: {exc.webhook_diagnostics}"
-            return _not_yet(expected_otp_type, detail, elapsed, errored=bool(exc.webhook_diagnostics))
+            return _not_yet(expected_otp_type, detail, elapsed, webhook_answers=exc.webhook_diagnostics)
         except Exception as exc:
             LOG.warning(
                 "task_v3 verification tool lookup failed",

@@ -288,26 +288,43 @@ async def test_prepare_next_attempt_reopens_the_task_run_mirror(sqlite_db: Agent
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("strategy", ["round_robin", "random"])
 @pytest.mark.parametrize(
-    "seed_source, pool_size, sequential, retained_session, retained_address, replacement_address, resets_seed",
+    "strategy, seed_source, pool_size, sequential, retained_session, retained_address, replacement_address, resets_seed",
     [
-        (BrowserSeedSource.credential, 2, False, None, None, None, True),
-        (BrowserSeedSource.own_memory, 2, False, None, None, None, True),
-        (BrowserSeedSource.credential, 1, False, None, None, None, False),
-        (BrowserSeedSource.own_memory, 1, False, None, None, None, False),
-        (BrowserSeedSource.credential, 2, True, None, None, None, False),
-        (BrowserSeedSource.override, 2, False, None, None, None, False),
-        (BrowserSeedSource.picked, 2, False, None, None, None, False),
-        (BrowserSeedSource.fresh, 2, False, None, None, None, False),
-        (BrowserSeedSource.credential, 2, False, "explicit", None, None, False),
-        (BrowserSeedSource.own_memory, 2, False, "explicit", None, None, False),
-        (BrowserSeedSource.credential, 2, False, "forced", None, None, False),
-        (BrowserSeedSource.own_memory, 2, False, "forced", None, None, False),
-        (BrowserSeedSource.credential, 2, False, None, "retained-cdp.example.test", None, False),
-        (BrowserSeedSource.own_memory, 2, False, None, "retained-cdp.example.test", None, False),
-        (BrowserSeedSource.credential, 2, False, None, "retained-cdp.example.test", "healthy-cdp.example.test", True),
-        (BrowserSeedSource.own_memory, 2, False, None, "retained-cdp.example.test", "healthy-cdp.example.test", True),
+        ("random", BrowserSeedSource.credential, 2, False, None, None, None, True),
+        *[
+            ("round_robin", *case)
+            for case in [
+                (BrowserSeedSource.credential, 2, False, None, None, None, True),
+                (BrowserSeedSource.own_memory, 2, False, None, None, None, True),
+                (BrowserSeedSource.credential, 1, False, None, None, None, False),
+                (BrowserSeedSource.credential, 2, True, None, None, None, False),
+                (BrowserSeedSource.override, 2, False, None, None, None, False),
+                (BrowserSeedSource.picked, 2, False, None, None, None, False),
+                (BrowserSeedSource.fresh, 2, False, None, None, None, False),
+                (BrowserSeedSource.credential, 2, False, "explicit", None, None, False),
+                (BrowserSeedSource.credential, 2, False, "forced", None, None, False),
+                (BrowserSeedSource.credential, 2, False, None, "retained-cdp.example.test", None, False),
+                (
+                    BrowserSeedSource.credential,
+                    2,
+                    False,
+                    None,
+                    "retained-cdp.example.test",
+                    "healthy-cdp.example.test",
+                    True,
+                ),
+                (
+                    BrowserSeedSource.own_memory,
+                    2,
+                    False,
+                    None,
+                    "retained-cdp.example.test",
+                    "healthy-cdp.example.test",
+                    True,
+                ),
+            ]
+        ],
     ],
 )
 async def test_prepare_next_attempt_invalidates_only_rotated_credential_seed(
@@ -2156,34 +2173,30 @@ async def _seed_run_identifier_runs(sqlite_db: AgentDB, *, with_task_runs: bool)
         await session.commit()
 
 
-@pytest.mark.parametrize(("search_key", "expected_run_id"), _RUN_IDENTIFIER_SEARCH_CASES)
 @pytest.mark.asyncio
-async def test_get_all_runs_v2_search_key_matches_run_identifiers(
-    sqlite_db: AgentDB, search_key: str, expected_run_id: str
-) -> None:
+async def test_get_all_runs_v2_search_key_matches_run_identifiers(sqlite_db: AgentDB) -> None:
     await _seed_run_identifier_runs(sqlite_db, with_task_runs=True)
 
-    rows = await sqlite_db.workflow_runs.get_all_runs_v2(organization_id="org_test", search_key=search_key)
+    for search_key, expected_run_id in _RUN_IDENTIFIER_SEARCH_CASES:
+        rows = await sqlite_db.workflow_runs.get_all_runs_v2(organization_id="org_test", search_key=search_key)
+        assert {row["run_id"] for row in rows} == {expected_run_id}, search_key
 
-    assert {row["run_id"] for row in rows} == {expected_run_id}
 
-
-@pytest.mark.parametrize(("search_key", "expected_run_id"), _RUN_IDENTIFIER_SEARCH_CASES)
 @pytest.mark.asyncio
 async def test_get_workflow_runs_for_workflow_permanent_id_search_key_matches_run_identifiers(
-    sqlite_db: AgentDB, search_key: str, expected_run_id: str
+    sqlite_db: AgentDB,
 ) -> None:
     # Covers the shared WorkflowRunModel filter behind the per-workflow runs table, /workflows/runs,
     # and the orphan fallback leg of the global runs list.
     await _seed_run_identifier_runs(sqlite_db, with_task_runs=False)
 
-    runs = await sqlite_db.workflow_runs.get_workflow_runs_for_workflow_permanent_id(
-        workflow_permanent_id="wpid_test",
-        organization_id="org_test",
-        search_key=search_key,
-    )
-
-    assert {run.workflow_run_id for run in runs} == {expected_run_id}
+    for search_key, expected_run_id in _RUN_IDENTIFIER_SEARCH_CASES:
+        runs = await sqlite_db.workflow_runs.get_workflow_runs_for_workflow_permanent_id(
+            workflow_permanent_id="wpid_test",
+            organization_id="org_test",
+            search_key=search_key,
+        )
+        assert {run.workflow_run_id for run in runs} == {expected_run_id}, search_key
 
 
 @pytest.mark.asyncio

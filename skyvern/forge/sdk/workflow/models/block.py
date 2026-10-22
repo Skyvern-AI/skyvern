@@ -1763,9 +1763,18 @@ class Block(BaseModel, abc.ABC):
         self._output_recorded_this_execution = False
         workflow_run_block_id = None
         engine: RunEngine | None = None
+        # Scoped to the whole block so a download its own navigation starts is covered, not just its task loop.
+        download_timeout_context = skyvern_context.current()
+        prev_download_timeout = download_timeout_context.download_timeout if download_timeout_context else None
         try:
             if isinstance(self, BaseTaskBlock):
                 engine = self.resolve_engine(workflow_run_id)
+                if (
+                    engine == RunEngine.skyvern_v3
+                    and download_timeout_context is not None
+                    and not download_timeout_context.script_mode
+                ):
+                    download_timeout_context.download_timeout = self.download_timeout
 
             workflow_run_block = await app.DATABASE.observer.create_workflow_run_block(
                 workflow_run_id=workflow_run_id,
@@ -1944,6 +1953,9 @@ class Block(BaseModel, abc.ABC):
                 organization_id=organization_id,
                 error_codes=error_codes or None,
             )
+        finally:
+            if download_timeout_context is not None:
+                download_timeout_context.download_timeout = prev_download_timeout
 
     @abc.abstractmethod
     def get_all_parameters(

@@ -149,8 +149,14 @@ def _bare_span_start_sites() -> list[str]:
             if path == helper:
                 continue
             try:
-                tree = ast.parse(path.read_text(encoding="utf-8"))
-            except (SyntaxError, UnicodeDecodeError):
+                source = path.read_text(encoding="utf-8")
+            except UnicodeDecodeError:
+                continue
+            if "start_as_current_span" not in source:
+                continue
+            try:
+                tree = ast.parse(source)
+            except SyntaxError:
                 continue
             for node in ast.walk(tree):
                 if (
@@ -184,8 +190,14 @@ def _bare_record_exception_sites() -> list[str]:
             if path == helper:
                 continue
             try:
-                tree = ast.parse(path.read_text(encoding="utf-8"))
-            except (SyntaxError, UnicodeDecodeError):
+                source = path.read_text(encoding="utf-8")
+            except UnicodeDecodeError:
+                continue
+            if "record_exception" not in source:
+                continue
+            try:
+                tree = ast.parse(source)
+            except SyntaxError:
                 continue
             for node in ast.walk(tree):
                 if (

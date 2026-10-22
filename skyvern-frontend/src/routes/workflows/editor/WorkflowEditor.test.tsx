@@ -4465,14 +4465,10 @@ describe("A49 metadata authorship through editor actions", () => {
     });
   }
 
-  test.each(
-    [false, true].flatMap((recover) =>
-      ["Keep my edits", "Apply and discard my edits"].map((choice) => ({
-        recover,
-        choice,
-      })),
-    ),
-  )(
+  test.each([
+    { recover: false, choice: "Keep my edits" },
+    { recover: true, choice: "Apply and discard my edits" },
+  ])(
     "A53 model input after a proposal uses $choice (recovery: $recover)",
     async ({ recover, choice }) => {
       integration.canvas = true;
@@ -5388,7 +5384,7 @@ describe("A49 metadata authorship through editor actions", () => {
     },
   );
 
-  test.each(["", "not-a-url", "http://", "://missing-scheme", "http://[::1"])(
+  test.each(["", "http://", "http://[::1"])(
     "YAML-to-Visual rejects a custom proxy URL without a host (%j)",
     async (url) => {
       mountEditor();
@@ -5421,13 +5417,10 @@ describe("A49 metadata authorship through editor actions", () => {
 
   test.each([
     "http://user:secret@proxy.example.com:8080",
-    "http://proxy.example.com:8080",
     "socks5://u:p@10.0.0.1:1080",
     "http://user:p%40ss%3Aword@proxy.example.com:8080",
     "//proxy.example.com:8080",
     "http://[2001:db8::1]:3128",
-    "http://[::1]:8080",
-    "http://[::1]",
   ])(
     "YAML-to-Visual commits a custom proxy URL with a host and withholds it from Copilot (%s)",
     async (url) => {

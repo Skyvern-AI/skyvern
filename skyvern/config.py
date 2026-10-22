@@ -494,7 +494,8 @@ class Settings(BaseSettings):
     BITWARDEN_TIMEOUT_SECONDS: int = 60
     # A cold `bw login` downloads and decrypts the whole vault, so it is categorically slower than the
     # reads behind it and needs its own budget. Runs arriving as a batch each start on their own pod and
-    # pay that login concurrently, which pushes it well past a budget sized for a read.
+    # pay that login concurrently, which pushes it well past a budget sized for a read. The unlock that
+    # follows an API-key login gets the same budget.
     BITWARDEN_LOGIN_TIMEOUT_SECONDS: int = 180
     BITWARDEN_MAX_RETRIES: int = 3
     BITWARDEN_MAX_JITTER_SECONDS: float = 2.0

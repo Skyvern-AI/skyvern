@@ -444,16 +444,21 @@ def set_download_file_listener(
         context = current()
         workflow_run_id = (context.workflow_run_id if context else None) or kwargs.get("workflow_run_id")
         task_id = (context.task_id if context else None) or kwargs.get("task_id")
+        # Read when the download starts, not when the context is built: one browser serves many tasks.
+        timeout_seconds = (
+            download_timeout or (context.download_timeout if context else None) or BROWSER_DOWNLOAD_TIMEOUT
+        )
         try:
             # Route path() through resolve_artifact_path so a timeout can never cancel a shared
             # artifact future (see resolve_artifact_path). Everything after the await is synchronous
             # filesystem work, so it does not need to run under a timeout.
-            resolved_path = await resolve_artifact_path(download, download_timeout or BROWSER_DOWNLOAD_TIMEOUT)
+            resolved_path = await resolve_artifact_path(download, timeout_seconds)
             if resolved_path is None:
                 LOG.error(
                     "timeout to download file, going to cancel the download",
                     workflow_run_id=workflow_run_id,
                     task_id=task_id,
+                    timeout_seconds=timeout_seconds,
                 )
                 mark_download_cancelled_by_skyvern(download)
                 await download.cancel()

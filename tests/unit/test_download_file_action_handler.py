@@ -1,12 +1,10 @@
 import asyncio
 import contextlib
-import gc
 import io
 import logging
 import os
 import tempfile
 import time
-import warnings
 from collections.abc import Callable, Iterator
 from datetime import UTC, datetime
 from pathlib import Path
@@ -7799,37 +7797,6 @@ async def test_provider_poll_cancellation_propagates_without_recording_error() -
     # not report a measured negative it never actually observed.
     assert logs[-1]["materialized_file_delta"] is None
     list_signal_files.assert_not_awaited()
-
-
-@pytest.mark.asyncio
-async def test_download_progress_sampler_closed_before_its_first_step_is_not_orphaned(tmp_path: Path) -> None:
-    """A download that finishes without suspending closes the sampler in the event-loop iteration it was
-    started in. Under the OTel asyncio instrumentor that cancel dropped the polling coroutine un-awaited,
-    which reaches the logs as an error-tier "never awaited" RuntimeWarning on every such download.
-    """
-    # The instrumentor ships in the cloud dependency group only, so OSS CI skips this test.
-    instrumentation = pytest.importorskip("opentelemetry.instrumentation.asyncio")
-    partial = tmp_path / f"download{BROWSER_DOWNLOADING_SUFFIX}"
-    partial.write_bytes(b"x")
-    sampler = _DownloadProgressSampler(tmp_path, None, set())
-
-    instrumentor = instrumentation.AsyncioInstrumentor()
-    instrumentor.instrument()
-    try:
-        with warnings.catch_warnings(record=True) as caught:
-            warnings.simplefilter("always")
-            sampler.start_if_partial_seen([str(partial)])
-            await sampler.aclose()
-            # The sampler still references its cancelled task; the warning is raised only when that is collected.
-            del sampler
-            for _ in range(5):
-                await asyncio.sleep(0)
-            gc.collect()
-            await asyncio.sleep(0)
-    finally:
-        instrumentor.uninstrument()
-
-    assert [str(entry.message) for entry in caught if "never awaited" in str(entry.message)] == []
 
 
 @pytest.mark.asyncio

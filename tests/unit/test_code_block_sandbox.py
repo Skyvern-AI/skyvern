@@ -3075,6 +3075,7 @@ class TestCodeBlockMagicLink:
         from skyvern.forge.sdk.workflow.models import block as block_module
 
         _patch_context_resolution(monkeypatch, wrc)
+        monkeypatch.setattr(settings, "BROWSER_ACTION_TIMEOUT_MS", 0)
 
         async def fake_get_workflow_run(*args: object, **kwargs: object) -> _FakeWorkflowRun:
             return _FakeWorkflowRun()
