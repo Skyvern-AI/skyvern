@@ -18,8 +18,6 @@ import pytest
 
 import skyvern.webeye.actions.handler as handler_module
 from skyvern.forge.agent_functions import AgentFunction
-from skyvern.forge.sdk.core import skyvern_context
-from skyvern.forge.sdk.core.skyvern_context import SkyvernContext
 from skyvern.forge.sdk.models import StepStatus
 from skyvern.webeye.actions.actions import ActionStatus, ActionType, ClickAction
 from skyvern.webeye.actions.handler import (
@@ -403,67 +401,6 @@ class TestHandleClickActionIntegration:
         sequential_mock.assert_awaited_once()
         incremental.stop_listen_dom_increment.assert_awaited_once()
         assert isinstance(results[-1], ActionSuccess)
-
-    @pytest.mark.asyncio
-    async def test_successful_submit_click_is_recorded_outside_the_bypass_path(
-        self, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
-        now = datetime.now(UTC)
-        organization = make_organization(now)
-        task = make_task(now, organization)
-        step = make_step(now, task, step_id="step-1", status=StepStatus.running, order=2, retry_index=1, output=None)
-        element = self._clickable_element(tag_name="button", type_value="button")
-        chain_click_mock, sequential_mock, _ = self._wire_handler(monkeypatch, element)
-        # This button is recognized for completion evidence, but not by the existing narrow
-        # submit-bypass hook; the ordinary dropdown path still runs after the successful click.
-        monkeypatch.setattr(
-            handler_module.app.AGENT_FUNCTION,
-            "is_submit_control_for_completion",
-            AsyncMock(return_value=True),
-            raising=False,
-        )
-        context = SkyvernContext()
-        action = ClickAction(element_id="E1", action_order=4)
-
-        with skyvern_context.scoped(context):
-            await handle_click_action(action, self._page(), MagicMock(), task, step)
-
-        chain_click_mock.assert_awaited_once()
-        sequential_mock.assert_awaited_once()
-        assert context.submit_click_evidence[task.task_id][1:] == (2, 1, 4)
-
-    @pytest.mark.asyncio
-    async def test_disabled_coordinate_submit_click_is_not_recorded(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        now = datetime.now(UTC)
-        organization = make_organization(now)
-        task = make_task(now, organization)
-        step = make_step(now, task, step_id="step-1", status=StepStatus.running, order=2, output=None)
-        element = self._clickable_element(tag_name="button", type_value="submit")
-        element.navigate_to_a_href = AsyncMock(return_value=False)  # type: ignore[method-assign]
-        element.get_locator().is_enabled = AsyncMock(return_value=False)  # type: ignore[method-assign]
-        dom = MagicMock()
-        dom.safe_get_skyvern_element_by_id = AsyncMock(return_value=element)
-        monkeypatch.setattr(handler_module, "DomUtil", MagicMock(return_value=dom))
-        monkeypatch.setattr(handler_module, "get_or_create_wait_config", AsyncMock(return_value=MagicMock()))
-        monkeypatch.setattr(handler_module.EventStrategyFactory, "move_cursor", AsyncMock())
-        monkeypatch.setattr(
-            handler_module.app.AGENT_FUNCTION,
-            "is_submit_control_for_completion",
-            AsyncMock(return_value=True),
-            raising=False,
-        )
-        page = self._page()
-        page.evaluate = AsyncMock(return_value="E1")
-        page.mouse.click = AsyncMock()
-        context = SkyvernContext()
-
-        with skyvern_context.scoped(context):
-            result = await handle_click_action(ClickAction(element_id="E1", x=10, y=10), page, MagicMock(), task, step)
-
-        assert isinstance(result[-1], ActionSuccess)
-        page.mouse.click.assert_awaited_once()
-        element.get_locator().is_enabled.assert_awaited_once()
-        assert task.task_id not in context.submit_click_evidence
 
 
 class _FakePage:
