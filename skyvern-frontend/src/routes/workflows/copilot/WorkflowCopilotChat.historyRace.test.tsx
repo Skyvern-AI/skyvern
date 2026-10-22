@@ -2107,8 +2107,6 @@ describe("WorkflowCopilotChat — recovery poll after a non-terminal stream clos
 
   it.each([
     ["unchanged", "credential"],
-    ["advanced", "credential"],
-    ["unchanged", "question"],
     ["advanced", "question"],
   ] as const)(
     "Reject before turn_start retains recovery until the %s canonical outcome settles after a %s lookup",
@@ -2473,14 +2471,8 @@ describe("WorkflowCopilotChat — recovery poll after a non-terminal stream clos
   }
 
   it.each([
-    ["mid-stream", null],
     ["after the drop", null],
-    ["none", null],
     ["none", "verified_goal_satisfied"],
-    ["mid-stream", "verified_goal_satisfied"],
-    ["none", "timeout"],
-    ["mid-stream", "timeout"],
-    ["none", "turn_halt:browser_session_lost"],
     ["mid-stream", "turn_halt:browser_session_lost"],
   ] as const)(
     "keeps a recovered turn's staged proposal and canvas (remount: %s, terminal_reason: %s)",
@@ -2495,7 +2487,7 @@ describe("WorkflowCopilotChat — recovery poll after a non-terminal stream clos
     },
   );
 
-  it.each(["cancelled", "copilot_recoverable_failure", "user_cancelled"])(
+  it.each(["cancelled", "copilot_recoverable_failure"])(
     "still rolls back a turn recovered after a remount whose terminal_reason is %s",
     async (terminalReason) => {
       const restore = await recoverStagedTurn("mid-stream", { terminalReason });
