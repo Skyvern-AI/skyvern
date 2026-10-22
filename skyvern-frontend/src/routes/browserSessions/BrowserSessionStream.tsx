@@ -51,10 +51,6 @@ import type {
 } from "@/routes/streaming/streamState";
 import { useSettingsStore } from "@/store/SettingsStore";
 import { useRecordingLauncherStore } from "@/store/useRecordingLauncherStore";
-import {
-  captureRecordBrowser,
-  getRecordBrowserContext,
-} from "@/util/recordBrowserTelemetry";
 
 type StreamMessage = {
   browser_session_id?: string;
@@ -118,8 +114,6 @@ interface Props {
   enableUrlInput?: boolean;
   // Passing this hands the window frame to the caller (see InteractiveStreamView).
   onFrameWidthChange?: (width: number | null) => void;
-  exfiltrate?: boolean;
-  workflowPermanentId?: string | null;
 }
 
 function BrowserSessionStream({
@@ -134,8 +128,6 @@ function BrowserSessionStream({
   forceCdp = false,
   enableUrlInput = false,
   onFrameWidthChange,
-  exfiltrate,
-  workflowPermanentId,
 }: Props) {
   const [streamImgSrc, setStreamImgSrc] = useState<string>("");
   const [streamImgToken, setStreamImgToken] = useState<number>(0);
@@ -162,14 +154,6 @@ function BrowserSessionStream({
 
   const socketRef = useRef<WebSocket | null>(null);
   const streamImgSrcRef = useRef("");
-  const exfiltrateRef = useRef(!!exfiltrate);
-  const recordingFrameCountRef = useRef(0);
-  const recordingFpsSamplesRef = useRef<number[]>([]);
-  const recordingHealthFlushTimerRef = useRef<number | null>(null);
-  const recordingHealthEndedRef = useRef(false);
-  const recordingOwnsControlRef = useRef(false);
-  const previousControlExfiltrateRef = useRef(false);
-  const previousInputReadyRef = useRef(false);
   const onActivityRef = useRef(onActivity);
   const hasFrameRef = useRef(false);
   const pendingFrameRef = useRef<{
@@ -199,7 +183,6 @@ function BrowserSessionStream({
     () => false,
   );
   const [pastedCharacters, showPasted] = usePastedNotice();
-  exfiltrateRef.current = !!exfiltrate;
 
   const scheduleRecordingReconnect = useCallback(() => {
     if (recordingReconnectTimerRef.current) {
@@ -313,8 +296,7 @@ function BrowserSessionStream({
     onClipboardPaste: controllable ? onClipboardPaste : undefined,
     onClipboardPasteError: toastClipboardReadFailed,
     onClipboardCopy: controllable ? onClipboardCopy : undefined,
-    // Recording keeps copy local so the keystroke never lands in the capture.
-    forwardCopyShortcut: !exfiltrate,
+    forwardCopyShortcut: true,
   });
   useManualSignInControl(
     controllable ? browserSessionId : undefined,
@@ -326,29 +308,16 @@ function BrowserSessionStream({
     setUserIsControlling,
     inputReady,
   );
-  const keepMessageChannelAlive = !!exfiltrate || userIsControlling;
+  const keepMessageChannelAlive = userIsControlling;
   keepMessageChannelAliveRef.current = keepMessageChannelAlive;
 
-  // Outside a recording the channel is open only while the user is in control, so
-  // pasting works without holding a socket per passive viewer. exfiltrate stays
-  // false then, so opening it never sends begin-exfiltration.
-  const recordingChannelActive = exfiltrate !== undefined;
-  const messageChannelEnabled = recordingChannelActive || userIsControlling;
-  const previousRecordingChannelActiveRef = useRef(recordingChannelActive);
-  useEffect(() => {
-    // Closing the socket is what finalizes a recording and clears its retained
-    // identity, so a user still in control after one gets a fresh socket.
-    if (previousRecordingChannelActiveRef.current && !recordingChannelActive) {
-      setRecordingReconnectTrigger((trigger) => trigger + 1);
-    }
-    previousRecordingChannelActiveRef.current = recordingChannelActive;
-  }, [recordingChannelActive]);
+  // The channel is open only while the user is in control, so pasting works
+  // without holding a socket per passive viewer.
+  const messageChannelEnabled = userIsControlling;
   const { isMessageConnected, sendCommand: sendMessageCommand } =
     useRecordingMessageChannel({
       browserSessionId,
       enabled: messageChannelEnabled,
-      exfiltrate: !!exfiltrate,
-      workflowPermanentId: workflowPermanentId ?? null,
       clipboard: "message",
       reconnectTrigger: recordingReconnectTrigger,
       onConnectionChange: handleRecordingConnectionChange,
@@ -374,84 +343,8 @@ function BrowserSessionStream({
   ]);
 
   useEffect(() => {
-    const recordingStarted =
-      !!exfiltrate && !previousControlExfiltrateRef.current;
-    const recordingEnded = !exfiltrate && previousControlExfiltrateRef.current;
-    const inputBecameReady = inputReady && !previousInputReadyRef.current;
-
-    if (recordingStarted) {
-      recordingOwnsControlRef.current = !userIsControlling;
-      setUserIsControlling(true);
-    } else if (exfiltrate && inputBecameReady) {
-      setUserIsControlling(true);
-    } else if (recordingEnded) {
-      if (recordingOwnsControlRef.current) {
-        setUserIsControlling(false);
-      }
-      recordingOwnsControlRef.current = false;
-    }
-
-    previousControlExfiltrateRef.current = !!exfiltrate;
-    previousInputReadyRef.current = inputReady;
-  }, [exfiltrate, inputReady, setUserIsControlling, userIsControlling]);
-
-  useEffect(() => {
     onActivityRef.current = onActivity;
   }, [onActivity]);
-
-  useEffect(() => {
-    if (!exfiltrate) {
-      recordingHealthEndedRef.current = true;
-      return;
-    }
-
-    if (recordingHealthFlushTimerRef.current !== null) {
-      if (!recordingHealthEndedRef.current) {
-        window.clearTimeout(recordingHealthFlushTimerRef.current);
-      }
-      recordingHealthFlushTimerRef.current = null;
-    }
-    recordingHealthEndedRef.current = false;
-    const recordingContext = getRecordBrowserContext();
-    recordingFrameCountRef.current = 0;
-    recordingFpsSamplesRef.current = [];
-    let sampleStartedAtMs = Date.now();
-    const recordSample = (ensureSample: boolean) => {
-      const now = Date.now();
-      const elapsedSeconds = (now - sampleStartedAtMs) / 1000;
-      if (elapsedSeconds > 0) {
-        recordingFpsSamplesRef.current.push(
-          recordingFrameCountRef.current / elapsedSeconds,
-        );
-      } else if (ensureSample && recordingFpsSamplesRef.current.length === 0) {
-        recordingFpsSamplesRef.current.push(0);
-      }
-      recordingFrameCountRef.current = 0;
-      sampleStartedAtMs = now;
-    };
-    const interval = window.setInterval(() => recordSample(false), 30_000);
-
-    return () => {
-      window.clearInterval(interval);
-      recordSample(true);
-      const samples = [...recordingFpsSamplesRef.current];
-      recordingFpsSamplesRef.current = [];
-      const flushTimer = window.setTimeout(() => {
-        captureRecordBrowser("record_browser.cdp_stream_health", {
-          ...recordingContext,
-          fps_avg:
-            samples.reduce((total, sample) => total + sample, 0) /
-            samples.length,
-          fps_min: Math.min(...samples),
-          sample_count: samples.length,
-        });
-        if (recordingHealthFlushTimerRef.current === flushTimer) {
-          recordingHealthFlushTimerRef.current = null;
-        }
-      }, 0);
-      recordingHealthFlushTimerRef.current = flushTimer;
-    };
-  }, [exfiltrate]);
 
   useEffect(() => startDebugReport(), []);
 
@@ -555,9 +448,6 @@ function BrowserSessionStream({
             }
           };
           if (message.screenshot) {
-            if (exfiltrateRef.current) {
-              recordingFrameCountRef.current += 1;
-            }
             hasFrameRef.current = true;
             reconnectAttemptsRef.current = 0;
             streamEndedDiagnosticRef.current = null;
@@ -792,7 +682,7 @@ function BrowserSessionStream({
         setUserIsControlling={setUserIsControlling}
         inputReady={inputReady}
         containerRef={containerRef}
-        showControlButtons={showControlButtons && !exfiltrate && !demonstrating}
+        showControlButtons={showControlButtons && !demonstrating}
         handlers={handlers}
         currentUrl={currentUrl}
         centered={centered}

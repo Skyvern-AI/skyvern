@@ -85,7 +85,6 @@ import {
 } from "@/routes/workflows/studio/panes";
 import { ControlTooltip } from "@/routes/workflows/studio/ControlTooltip";
 import { useStudioPanes } from "@/routes/workflows/studio/useStudioPanes";
-import { useRecordingStore } from "@/store/useRecordingStore";
 import { useWorkflowPanelStore } from "@/store/WorkflowPanelStore";
 
 import {
@@ -279,7 +278,6 @@ function NodeHeader({
     useBlockRunTarget();
   const blockOutputsStore = useBlockOutputStore();
   const debugStore = useDebugStore();
-  const recordingStore = useRecordingStore();
   const isCollapsed = useIsBlockCollapsed(blockLabel);
   const toggleBlockCollapsed = useNodeCollapseStore((s) => s.toggleBlock);
   const isCollapsible = collapsibleWorkflowBlockTypes.has(type);
@@ -338,8 +336,6 @@ function NodeHeader({
 
   const thisBlockIsTargetted =
     targetBlockLabel !== undefined && targetBlockLabel === blockLabel;
-
-  const isRecording = recordingStore.isRecording;
 
   const [workflowRunStatus, setWorkflowRunStatus] = useState(
     workflowRun?.status,
@@ -898,7 +894,7 @@ function NodeHeader({
 
   const isReadOnlyScope = useWorkflowScopeReadOnly();
   const isCanvasLocked = useIsCanvasLocked();
-  const dragGatedByMode = isDragGatedByMode({ isRecording, isCanvasLocked });
+  const dragGatedByMode = isDragGatedByMode({ isCanvasLocked });
   const duplicateDisabledReason = isBlockFinallyGated(
     blockLabel,
     workflowSettingsStore.finallyBlockLabel,
@@ -918,7 +914,7 @@ function NodeHeader({
       />
     );
     const dragGateReason = dragGatedByMode
-      ? getDragGateReason({ isRecording, isCanvasLocked })
+      ? getDragGateReason({ isCanvasLocked })
       : null;
     gripHandle = dragGatedByMode ? (
       <TooltipProvider delayDuration={200}>
@@ -940,7 +936,6 @@ function NodeHeader({
   const collapseToggleGated =
     mutationLocked ||
     isCollapseGated({
-      isRecording,
       isReadOnlyScope,
       isCanvasLocked,
     });
@@ -953,7 +948,6 @@ function NodeHeader({
     workflowRunIsRunningOrQueued ||
     !workflowPermanentId ||
     debugSession === undefined ||
-    isRecording ||
     Boolean(saveBlockedReason);
 
   const collapseToggleButton =

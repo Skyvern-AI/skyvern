@@ -12,7 +12,6 @@ import { useWorkflowPermanentId } from "@/routes/workflows/WorkflowPermanentIdCo
 
 import { statusIsRunningOrQueued } from "@/routes/tasks/types";
 import { useWorkflowRunQuery } from "@/routes/workflows/hooks/useWorkflowRunQuery";
-import { useRecordingStore } from "@/store/useRecordingStore";
 import { cn } from "@/util/utils";
 import {
   selectEditorMutationLocked,
@@ -52,7 +51,6 @@ function LoopNode({ id, data }: NodeProps<LoopNode>) {
   const thisBlockIsPlaying =
     workflowRunIsRunningOrQueued && thisBlockIsTargetted;
   const children = nodes.filter((node) => node.parentId === id);
-  const recordingStore = useRecordingStore();
   const observerRef = useRef<ResizeObserver | null>(null);
   const { updateNodeData, setNodes } = useReactFlow<AppNode>();
   const lastHeaderHeight = useRef<number | undefined>(data._headerHeight);
@@ -152,11 +150,7 @@ function LoopNode({ id, data }: NodeProps<LoopNode>) {
 
   if (isCollapsed) {
     return (
-      <div
-        className={cn({
-          "pointer-events-none opacity-50": recordingStore.isRecording,
-        })}
-      >
+      <div>
         <Handle
           type="source"
           position={Position.Bottom}
@@ -193,11 +187,7 @@ function LoopNode({ id, data }: NodeProps<LoopNode>) {
   }
 
   return (
-    <div
-      className={cn({
-        "pointer-events-none opacity-50": recordingStore.isRecording,
-      })}
-    >
+    <div>
       <Handle
         type="source"
         position={Position.Bottom}

@@ -1,4 +1,5 @@
 import type { ComponentProps } from "react";
+import { AxiosError, type AxiosResponse } from "axios";
 import {
   act,
   cleanup,
@@ -41,7 +42,6 @@ const {
   credentials,
   historyResponse,
   sansApiGet,
-  demonstrationFlag,
 } = vi.hoisted(() => {
   const calls: StreamCall[] = [];
   const active = { value: null as Record<string, unknown> | null };
@@ -100,7 +100,6 @@ const {
     credentials: savedCredentials,
     historyResponse: history,
     sansApiGet: get,
-    demonstrationFlag: { value: true },
   };
 });
 
@@ -112,7 +111,7 @@ vi.mock("@/hooks/useCredentialGetter", () => ({
   useCredentialGetter: () => null,
 }));
 vi.mock("@/hooks/useFeatureFlag", () => ({
-  useFeatureFlag: () => demonstrationFlag.value,
+  useFeatureFlag: () => true,
 }));
 vi.mock("@/components/ui/use-toast", () => ({ toast: vi.fn() }));
 vi.mock("react-router-dom", async (importOriginal) => {
@@ -255,7 +254,6 @@ beforeEach(() => {
   sansApiPost.mockClear();
   sansApiPost.mockResolvedValue({ data: { seq: 1 } });
   activeDemonstration.value = null;
-  demonstrationFlag.value = true;
   sansApiGet.mockClear();
   credentials.value = [
     {
@@ -328,17 +326,6 @@ describe("WorkflowCopilotChat demonstration", () => {
       name: "Start demonstration",
     })) as HTMLButtonElement;
     expect(offer.disabled).toBe(true);
-  });
-
-  it("never looks for an active demonstration when the feature is off", async () => {
-    demonstrationFlag.value = false;
-    await renderChat({ liveBrowserSessionId: "browser-1" });
-    await waitFor(() => expect(sansApiGet).toHaveBeenCalled());
-    expect(
-      sansApiGet.mock.calls.some(
-        ([path]) => path === "/workflow/copilot/demonstration/active",
-      ),
-    ).toBe(false);
   });
 
   it("opens the recorder stream and renders recorded actions in the transcript", async () => {
@@ -861,6 +848,62 @@ describe("WorkflowCopilotChat demonstration", () => {
     expect(
       within(card).getByRole("button", { name: "Skip for now" }),
     ).toBeTruthy();
+  });
+
+  it("disables Demonstrate task when the backend refuses demonstrations", async () => {
+    const answer = sansApiGet.getMockImplementation()!;
+    sansApiGet.mockImplementation(((path: string) =>
+      path === "/workflow/copilot/demonstration/active"
+        ? Promise.reject(
+            new AxiosError(
+              "forbidden",
+              "ERR_BAD_REQUEST",
+              undefined,
+              undefined,
+              {
+                status: 403,
+              } as AxiosResponse,
+            ),
+          )
+        : answer(path)) as typeof answer);
+    try {
+      await renderChat({
+        liveBrowserSessionId: "browser-1",
+        onRecordTask: vi.fn(),
+        canRecordTask: true,
+      });
+      await waitFor(() =>
+        expect(
+          (
+            screen.getByRole("button", {
+              name: "Demonstrate task",
+            }) as HTMLButtonElement
+          ).disabled,
+        ).toBe(true),
+      );
+      expect(
+        useRecordingLauncherStore.getState().startDemonstration,
+      ).toBeNull();
+    } finally {
+      sansApiGet.mockImplementation(answer);
+    }
+  });
+
+  it("registers no demonstration launcher while a run owns the browser", async () => {
+    const rerender = await renderChat({ liveBrowserSessionId: "browser-1" });
+    await waitFor(() =>
+      expect(
+        useRecordingLauncherStore.getState().startDemonstration,
+      ).toBeTruthy(),
+    );
+
+    rerender({ liveBrowserSessionId: "browser-1", runOwnsBrowser: true });
+
+    await waitFor(() =>
+      expect(
+        useRecordingLauncherStore.getState().startDemonstration,
+      ).toBeNull(),
+    );
   });
 
   it("hides Resume for a restored recording past its limit", async () => {

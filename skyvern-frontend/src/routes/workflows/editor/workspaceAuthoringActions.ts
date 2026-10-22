@@ -1,7 +1,13 @@
 import { toast } from "@/components/ui/use-toast";
-import type { InsertionPoint } from "@/store/RecordedBlocksStore";
 import { useCopilotActionStore } from "@/store/useCopilotActionStore";
 import type { WorkflowCopilotDemonstrationInsertion } from "@/routes/workflows/copilot/workflowCopilotTypes";
+
+type InsertionPoint = {
+  previous: string | null;
+  next: string | null;
+  parent?: string;
+  connectingEdgeType: string;
+};
 
 type WorkflowNodeLike = {
   id: string;
@@ -104,7 +110,6 @@ function resolveWorkspaceAuthoringActionAvailability({
   isComparing,
   isEditingYaml,
   hasFinallyBlock,
-  isRecording,
 }: {
   browserReady: boolean;
   isGlobalWorkflow: boolean;
@@ -113,7 +118,6 @@ function resolveWorkspaceAuthoringActionAvailability({
   isComparing: boolean;
   isEditingYaml: boolean;
   hasFinallyBlock: boolean;
-  isRecording: boolean;
 }) {
   const unavailableReason = isWorkflowDeleted
     ? "This agent is deleted and view-only"
@@ -125,9 +129,7 @@ function resolveWorkspaceAuthoringActionAvailability({
           ? "Make a copy to edit this agent"
           : hasFinallyBlock
             ? "The finally block must remain last. Add steps above it in the editor."
-            : isRecording
-              ? "Finish recording the current task first"
-              : null;
+            : null;
   const recordUnavailableReason =
     unavailableReason ??
     (hasActiveRun ? "Stop the active run before recording a task" : null);

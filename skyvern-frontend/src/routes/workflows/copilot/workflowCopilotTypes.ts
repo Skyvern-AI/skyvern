@@ -4,32 +4,11 @@ import {
 } from "@/routes/workflows/types/workflowTypes";
 
 export type WorkflowCopilotChatSender = "user" | "ai" | "product";
-/**
- * Mirrors `RecordingEvidencePacket` in skyvern/services/browser_recording/evidence.py.
- * The frontend only counts actions; the rest is opaque payload it forwards verbatim.
- */
-export type RecordingEvidencePacket = {
-  schema_version: number;
-  recording_id?: string | null;
-  recording: Record<string, unknown> & {
-    recording_attempt_id?: string;
-    browser_session_id?: string;
-  };
-  actions: Array<Record<string, unknown>>;
-  deleted_action_ids: Array<string>;
-  truncated_action_count: number;
-  provenance: Record<string, string | number>;
+export type CopilotProductAction = {
+  kind: "diagnose_run";
+  workflowRunId: string;
+  nonce: string;
 };
-export type CopilotProductAction =
-  | {
-      kind: "diagnose_run";
-      workflowRunId: string;
-      nonce: string;
-    }
-  | {
-      kind: "refine_recording";
-      nonce: string;
-    };
 
 export interface WorkflowCopilotDemonstrationInsertion {
   after_label: string | null;
@@ -228,20 +207,8 @@ export interface WorkflowCopilotChatRequest {
   // sent — context for "this block" references, never a directive.
   selected_block_label?: string | null;
   keep_pending_proposal?: boolean;
-  product_action?:
-    | "test_end_to_end"
-    | "diagnose_run"
-    | "refine_recording"
-    | "demonstrate"
-    | null;
+  product_action?: "test_end_to_end" | "diagnose_run" | "demonstrate" | null;
   demonstration_id?: string | null;
-  // Required by the refine_recording action; reaches the model as untrusted
-  // evidence, never as the turn's message.
-  recording_evidence?: RecordingEvidencePacket | null;
-  // The server attaches its own redacted projection of the live recording.
-  recording_in_progress?: boolean;
-  // Panel deletions the server applies to its own draft; no step content is sent.
-  recording_deleted_step_ids?: Array<string>;
   // Opt-in: only clients that can render the credential_required frame set
   // this, so the backend never pauses a turn a client would silently drop.
   supports_credential_pause?: boolean;

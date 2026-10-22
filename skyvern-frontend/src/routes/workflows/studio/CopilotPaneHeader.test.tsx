@@ -4,11 +4,7 @@ import { describe, expect, it } from "vitest";
 import { TooltipProvider } from "@/components/ui/tooltip";
 import { useCopilotHeaderStore } from "@/store/useCopilotHeaderStore";
 
-import {
-  CopilotActiveDot,
-  CopilotPaneControls,
-  CopilotPaneStatus,
-} from "./CopilotPaneHeader";
+import { CopilotActiveDot, CopilotPaneControls } from "./CopilotPaneHeader";
 
 const noop = () => {};
 
@@ -59,12 +55,7 @@ describe("CopilotPaneControls", () => {
 describe("Copilot pane waiting signal", () => {
   it("carries a pending question on the status dot instead of a header label", () => {
     useCopilotHeaderStore.setState({ attention: "question" });
-    render(
-      <>
-        <CopilotActiveDot />
-        <CopilotPaneStatus />
-      </>,
-    );
+    render(<CopilotActiveDot />);
 
     const dot = screen.getByRole("img", { name: "Copilot needs your answer" });
     expect(dot.getAttribute("title")).toBe("Copilot needs your answer");

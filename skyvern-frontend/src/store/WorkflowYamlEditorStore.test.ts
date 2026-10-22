@@ -4,8 +4,6 @@ import {
   beginSaveTransaction,
   finishSaveTransaction,
   isLockedByOther,
-  disposeWorkflowAuthoringSubscriptions,
-  registerWorkflowAuthoringSubscriptions,
   isWorkflowYamlDirty,
   persistYamlCommitIfCurrent,
   refuseMutationDuringYamlCommit,
@@ -28,8 +26,6 @@ import { toast } from "@/components/ui/use-toast";
 import type { NodeChange, EdgeChange } from "@xyflow/react";
 import { useWorkflowHasChangesStore } from "./WorkflowHasChangesStore";
 import { useWorkflowTitleStore } from "./WorkflowTitleStore";
-import { useRecordingStore } from "./useRecordingStore";
-import { useRecordedBlocksStore } from "./RecordedBlocksStore";
 import { useWorkflowParametersStore } from "./WorkflowParametersStore";
 
 vi.mock("@/components/ui/use-toast", () => ({ toast: vi.fn() }));
@@ -577,42 +573,6 @@ describe("YAML commit concurrency", () => {
     await expect(commitYamlDraft(true)).rejects.toThrow("failure");
     expect(useWorkflowYamlEditorStore.getState().committing).toBe(false);
     expect(useWorkflowYamlEditorStore.getState().commitInProgress).toBe(false);
-  });
-});
-
-describe("authoring subscription lifecycle", () => {
-  test("disposes both subscriptions and re-registers them only once", () => {
-    disposeWorkflowAuthoringSubscriptions();
-    const recordingSubscribe = vi.spyOn(useRecordingStore, "subscribe");
-    const blocksSubscribe = vi.spyOn(useRecordedBlocksStore, "subscribe");
-    try {
-      registerWorkflowAuthoringSubscriptions();
-      registerWorkflowAuthoringSubscriptions();
-      expect(recordingSubscribe).toHaveBeenCalledOnce();
-      expect(blocksSubscribe).toHaveBeenCalledOnce();
-      useRecordingStore.setState({ isRecording: true });
-      expect(useWorkflowYamlEditorStore.getState().authoringInProgress).toBe(
-        true,
-      );
-      disposeWorkflowAuthoringSubscriptions();
-      useRecordingStore.setState({ isRecording: false });
-      expect(useWorkflowYamlEditorStore.getState().authoringInProgress).toBe(
-        true,
-      );
-      registerWorkflowAuthoringSubscriptions();
-      expect(useWorkflowYamlEditorStore.getState().authoringInProgress).toBe(
-        false,
-      );
-      expect(recordingSubscribe).toHaveBeenCalledTimes(2);
-      expect(blocksSubscribe).toHaveBeenCalledTimes(2);
-    } finally {
-      recordingSubscribe.mockRestore();
-      blocksSubscribe.mockRestore();
-      useRecordingStore.getState().reset();
-      useWorkflowYamlEditorStore.setState(
-        useWorkflowYamlEditorStore.getInitialState(),
-      );
-    }
   });
 });
 
