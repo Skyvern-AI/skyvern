@@ -57,6 +57,7 @@ import {
   useSearchParams,
 } from "react-router-dom";
 import { useWorkflowPermanentId } from "@/routes/workflows/WorkflowPermanentIdContext";
+import { takeSopHandoffFile } from "@/routes/workflows/sopHandoff";
 import { useReactFlow, Edge } from "@xyflow/react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { usePostHog } from "posthog-js/react";
@@ -264,6 +265,8 @@ import {
   demonstrationInsertionFromNodes,
   resolveAppendInsertionPoint,
   resolveWorkspaceAuthoringActionAvailability,
+  sopAttachmentDraft,
+  stageSopFile,
 } from "./workspaceAuthoringActions";
 import { paneWidthsKey } from "../studio/paneLayout";
 import { useStudioPanes } from "../studio/useStudioPanes";
@@ -1915,6 +1918,54 @@ function Workspace({
     authoringActionAvailability.canRecordTask,
     authoringBlocked,
     startRecordingAtEnd,
+  ]);
+  // `/discover`'s "Upload an SOP" lands here with ?sop=1; stage the PDF in Copilot once its
+  // composer can take a file.
+  const sopHandoffRequested = searchParams.get("sop") === "1";
+  const sopHandoffHandledRef = useRef(false);
+  // A boolean, not the function: the chat re-registers the stager whenever its callbacks change,
+  // and subscribing to the identity would re-render this component into a loop.
+  const copilotCanStageAttachment = useCopilotActionStore(
+    (state) => state.stageAttachment !== null,
+  );
+  useEffect(() => {
+    if (
+      !sopHandoffRequested ||
+      sopHandoffHandledRef.current ||
+      !copilotCanStageAttachment
+    ) {
+      return;
+    }
+    // Deferred past the mount commit: an upload started inside it is detached from its
+    // observer by StrictMode's simulated remount and reports pending forever.
+    const timer = window.setTimeout(() => {
+      sopHandoffHandledRef.current = true;
+      const file = takeSopHandoffFile(workflow.workflow_permanent_id);
+      if (file) stageSopFile(file, sopAttachmentDraft());
+      else
+        toast({
+          variant: "destructive",
+          title: "SOP not received",
+          description:
+            "The PDF did not reach the editor. Use Upload an SOP in the Copilot panel to try again.",
+        });
+      // After staging: opening the Copilot pane navigates with the current URL, which would
+      // put the marker back if it ran after this rewrite.
+      setRecordSearchParams(
+        (current) => {
+          const next = new URLSearchParams(current);
+          next.delete("sop");
+          return next;
+        },
+        { replace: true },
+      );
+    }, 0);
+    return () => window.clearTimeout(timer);
+  }, [
+    sopHandoffRequested,
+    copilotCanStageAttachment,
+    setRecordSearchParams,
+    workflow.workflow_permanent_id,
   ]);
   useEffect(() => {
     if (!embedded) {
