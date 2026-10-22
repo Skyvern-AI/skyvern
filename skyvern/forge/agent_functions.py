@@ -1864,6 +1864,9 @@ class AgentFunction:
     async def setup_browser_context_extensions(self, browser_context: Any, **kwargs: Any) -> None:
         """Attach cloud-only listeners/route handlers to a fresh BrowserContext. OSS no-op."""
 
+    def is_residential_browser_egress(self, browser_context: BrowserContext) -> bool:
+        return False
+
     async def on_browser_context_acquired(
         self,
         browser_context: Any,

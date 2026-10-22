@@ -1648,28 +1648,51 @@ class AsyncAWSClient:
         container_overrides = container_overrides or {}
         depends_on = [{"jobId": job_id} for job_id in depends_on_ids or []]
         async with self._batch_client() as client:
-            if job_priority is None or share_identifier is None:
-                response = await client.submit_job(
-                    jobName=job_name,
-                    jobQueue=job_queue,
-                    jobDefinition=job_definition,
-                    parameters=params,
-                    containerOverrides=container_overrides,
-                    dependsOn=depends_on,
+            attempts: list[tuple[type[BaseException] | None, type[BaseException] | None, int | None]] = []
+
+            def record_attempt(**kwargs: Any) -> None:
+                error = kwargs.get("caught_exception")
+                cause = getattr(error, "kwargs", {}).get("error")
+                response = kwargs.get("response")
+                status_code = getattr(response[0], "status_code", None) if response else None
+                attempts.append(
+                    (
+                        type(error) if error is not None else None,
+                        type(cause) if cause is not None else None,
+                        status_code,
+                    )
                 )
+
+            # Keep lightweight per-attempt outcomes; the final exception can hide an earlier ambiguity.
+            event_name = "needs-retry.batch.SubmitJob"
+            client.meta.events.register(event_name, record_attempt)
+            try:
+                if job_priority is None or share_identifier is None:
+                    response = await client.submit_job(
+                        jobName=job_name,
+                        jobQueue=job_queue,
+                        jobDefinition=job_definition,
+                        parameters=params,
+                        containerOverrides=container_overrides,
+                        dependsOn=depends_on,
+                    )
+                else:
+                    response = await client.submit_job(
+                        jobName=job_name,
+                        jobQueue=job_queue,
+                        jobDefinition=job_definition,
+                        parameters=params,
+                        schedulingPriorityOverride=job_priority,
+                        shareIdentifier=share_identifier,
+                        containerOverrides=container_overrides,
+                        dependsOn=depends_on,
+                    )
                 return response.get("jobId")
-            else:
-                response = await client.submit_job(
-                    jobName=job_name,
-                    jobQueue=job_queue,
-                    jobDefinition=job_definition,
-                    parameters=params,
-                    schedulingPriorityOverride=job_priority,
-                    shareIdentifier=share_identifier,
-                    containerOverrides=container_overrides,
-                    dependsOn=depends_on,
-                )
-                return response.get("jobId")
+            except Exception as error:
+                vars(error)["_skyvern_submit_job_attempts"] = attempts
+                raise
+            finally:
+                client.meta.events.unregister(event_name, record_attempt)
 
 
 class S3Uri:

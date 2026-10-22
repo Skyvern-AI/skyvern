@@ -233,7 +233,7 @@ from skyvern.forge.validation_evidence_router import (
     ValidationRouterResult,
     route_validation_evidence,
 )
-from skyvern.schemas.runs import CUA_ENGINES, RunEngine
+from skyvern.schemas.runs import CUA_ENGINES, ProxyLocation, RunEngine
 from skyvern.schemas.steps import AgentStepOutput
 from skyvern.services import run_service, service_utils, uploaded_file_service
 from skyvern.services.action_service import get_action_history
@@ -2732,6 +2732,8 @@ class ForgeAgent:
                 )
                 if not new_files:
                     return None
+                if context is not None:
+                    context.download_completed_task_ids.add(task.task_id)
                 download_finalized = True
                 download_completion_reason = f"download completed ({len(new_files)} new file(s))"
                 LOG.info(
@@ -4825,24 +4827,37 @@ class ForgeAgent:
             return None
 
     async def _enrich_failure_reason_with_download_status(self, task: Task, reason: str) -> str:
-        """Append one bounded sentence to a terminal failure reason when the run's latest download-intent
-        action received no file and passively observed a server 5xx status.
-
-        Folds over every persisted step's output in execution order; only the latest download-intent
-        action's own evidence counts. The original reason is preserved verbatim and the sentence is
-        appended once (deduplicated). Returns the (possibly unchanged) reason to store; never raises.
-        """
+        """Append terminal download evidence without changing the original reason or its classification."""
         try:
             steps = await app.DATABASE.tasks.get_task_steps(task_id=task.task_id, organization_id=task.organization_id)
             status = self._latest_download_failure_status(steps)
-            if status is None:
+            if status is not None:
+                sentence = (
+                    f"An HTTP request made during the download action returned HTTP {status}, and no file was received."
+                )
+                if sentence not in reason:
+                    reason = f"{reason} {sentence}"
+            context = skyvern_context.current()
+            if (
+                context is None
+                or context.task_id != task.task_id
+                or context.workflow_run_id != task.workflow_run_id
+                or context.organization_id != task.organization_id
+                or task.task_id not in context.residential_download_interrupted_task_ids
+                or task.task_id in context.download_completed_task_ids
+                or task.proxy_location == ProxyLocation.RESIDENTIAL_ISP
+                or task.status in (TaskStatus.completed, TaskStatus.canceled, TaskStatus.timed_out)
+                or any(
+                    result.downloaded_files
+                    for step in steps
+                    if step.output and step.output.actions_and_results
+                    for _action, results in step.output.actions_and_results
+                    for result in results
+                )
+            ):
                 return reason
-            sentence = (
-                f"An HTTP request made during the download action returned HTTP {status}, and no file was received."
-            )
-            if sentence in reason:
-                return reason
-            return f"{reason} {sentence}"
+            advice = "Try using an ISP proxy."
+            return reason if advice in reason else f"{reason} {advice}"
         except Exception:
             LOG.warning(
                 "Failed to enrich failure reason with download status",
@@ -9880,9 +9895,7 @@ class ForgeAgent:
         if task_from_db:
             task = task_from_db
 
-        # Enrich only the stored reason with a server 5xx observed on an admitted xhr/fetch request during
-        # the run's latest download action that received no file. Runs at the shared terminal seam so every
-        # failed/terminated path inherits it; the caller's classification of the original reason is untouched.
+        # Enrich only the stored terminal reason; callers classify the original before this seam.
         if status in (TaskStatus.failed, TaskStatus.terminated) and failure_reason is not None:
             failure_reason = await self._enrich_failure_reason_with_download_status(task, failure_reason)
 

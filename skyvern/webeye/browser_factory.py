@@ -17,7 +17,7 @@ from contextlib import suppress
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any, Awaitable, Callable, Literal, Protocol, cast
+from typing import Any, Awaitable, Callable, Coroutine, Literal, Protocol, cast
 from urllib.parse import parse_qsl, urlparse
 
 import psutil
@@ -64,7 +64,7 @@ from skyvern.forge.sdk.core.http_request_authorization import (
     RunScopedRedirectHopAuthorizer,
     deny_unenrolled_redirect_hop,
 )
-from skyvern.forge.sdk.core.skyvern_context import current, ensure_context
+from skyvern.forge.sdk.core.skyvern_context import SkyvernContext, current, ensure_context
 from skyvern.schemas.runs import ProxyLocation, ProxyLocationInput, get_tzinfo_from_proxy
 from skyvern.utils.url_validators import redacted_url_origin, signed_url_ttl_remaining_seconds
 from skyvern.webeye.attach_only import forbid
@@ -439,11 +439,12 @@ def _redact_url_query(url: str) -> str:
 def set_download_file_listener(
     browser_context: BrowserContext, download_timeout: float | None = None, **kwargs: Any
 ) -> None:
-    async def listen_to_download(download: Download) -> None:
+    async def save_download(
+        download: Download, context: SkyvernContext | None, owner_task_id: str | None, residential_egress: bool
+    ) -> None:
         download_started_at = time.monotonic()
-        context = current()
         workflow_run_id = (context.workflow_run_id if context else None) or kwargs.get("workflow_run_id")
-        task_id = (context.task_id if context else None) or kwargs.get("task_id")
+        task_id = owner_task_id or (context.task_id if context else None) or kwargs.get("task_id")
         # Read when the download starts, not when the context is built: one browser serves many tasks.
         timeout_seconds = (
             download_timeout or (context.download_timeout if context else None) or BROWSER_DOWNLOAD_TIMEOUT
@@ -463,6 +464,8 @@ def set_download_file_listener(
                 mark_download_cancelled_by_skyvern(download)
                 await download.cancel()
                 return
+            if context and owner_task_id:
+                context.download_completed_task_ids.add(owner_task_id)
             file_path = Path(resolved_path)
             if not file_path.exists():
                 # On an adopted persistent session the bytes live on the run connection, not
@@ -526,6 +529,15 @@ def set_download_file_listener(
             # An aborted transfer surfaces here as a path() error; reporting it as a rename failure
             # sends triage to the wrong subsystem and hides that no file was ever saved.
             failure = await read_download_failure(download)
+            if (
+                failure == "canceled"
+                and not was_download_cancelled_by_skyvern(download)
+                and not download.page.is_closed()
+                and context
+                and owner_task_id
+                and residential_egress
+            ):
+                context.residential_download_interrupted_task_ids.add(owner_task_id)
             if failure is not None:
                 LOG.warning(
                     "Browser aborted the download before any file was saved",
@@ -543,6 +555,25 @@ def set_download_file_listener(
                 workflow_run_id=workflow_run_id,
                 task_id=task_id,
             )
+
+    def listen_to_download(download: Download) -> Coroutine[Any, Any, None]:
+        # Snapshot the task synchronously at event delivery; the context can change before the coroutine runs.
+        # Callback kwargs can belong to an older task or run and cannot establish ownership.
+        context = current()
+        owner_task_id = context.task_id if context else None
+        residential_egress = False
+        try:
+            state = app.BROWSER_MANAGER.get_for_task(owner_task_id) if owner_task_id else None
+            # Workflow blocks register their browser under the run id only. A plain lookup avoids aliasing the task.
+            if state is None and owner_task_id and context and context.workflow_run_id:
+                state = app.BROWSER_MANAGER.get_for_workflow_run(context.workflow_run_id)
+            if state is None or state.browser_context is not browser_context:
+                owner_task_id = None
+            elif owner_task_id:
+                residential_egress = app.AGENT_FUNCTION.is_residential_browser_egress(browser_context)
+        except Exception:
+            owner_task_id = None
+        return save_download(download, context, owner_task_id, residential_egress)
 
     def listen_to_new_page(page: Page) -> None:
         page.on("download", listen_to_download)
