@@ -338,6 +338,7 @@ from skyvern.webeye.actions.parse_actions import (
     parse_ui_tars_actions,
 )
 from skyvern.webeye.actions.responses import STALE_TARGET_TOOL_RESULT, ActionFailure, ActionResult, ActionSuccess
+from skyvern.webeye.browser_artifacts import DownloadBinding
 from skyvern.webeye.browser_driver_errors import is_driver_error
 from skyvern.webeye.browser_engine import BrowserEngineSelection, is_any_engine_error
 from skyvern.webeye.browser_errors import (
@@ -355,6 +356,7 @@ from skyvern.webeye.cdp_download_interceptor import (
     settle_browser_downloads_for_context,
 )
 from skyvern.webeye.dom_inspection import read_current_url
+from skyvern.webeye.native_downloads import NativeDownloadAttempt, NativeDownloads
 from skyvern.webeye.scraper.scraped_page import ElementTreeFormat, ScrapedPage
 from skyvern.webeye.scraper.scraper import page_is_dead_blank, page_is_http_survivor
 from skyvern.webeye.utils.document import get_main_document_loader_id
@@ -2036,6 +2038,7 @@ class ForgeAgent:
         attempt_started_at: datetime | None = None,
         exhausted: set[str] | None = None,
         should_cancel: Callable[[], Awaitable[bool]] | None = None,
+        native_failure_quiescent: Callable[[], Awaitable[bool]] | None = None,
     ) -> bool:
         """Block until any download the task already kicked off settles (or times out).
 
@@ -2077,7 +2080,7 @@ class ForgeAgent:
             if timeout_cap is not None:
                 timeout = min(timeout, timeout_cap)
             try:
-                if should_cancel is None:
+                if should_cancel is None and native_failure_quiescent is None:
                     await wait_for_download_finished(
                         downloading_files=downloading_files,
                         timeout=timeout,
@@ -2087,6 +2090,7 @@ class ForgeAgent:
                         downloading_files=downloading_files,
                         timeout=timeout,
                         should_cancel=should_cancel,
+                        native_failure_quiescent=native_failure_quiescent,
                     )
             except DownloadFileMaxWaitingTime as e:
                 LOG.warning(
@@ -2103,19 +2107,34 @@ class ForgeAgent:
         *,
         downloading_files: list[str],
         timeout: float,
-        should_cancel: Callable[[], Awaitable[bool]],
+        should_cancel: Callable[[], Awaitable[bool]] | None,
+        native_failure_quiescent: Callable[[], Awaitable[bool]] | None = None,
     ) -> bool:
         """Returns True when should_cancel fired and the wait was cut short; False on normal completion."""
         wait_task = asyncio.ensure_future(
             wait_for_download_finished(downloading_files=downloading_files, timeout=timeout)
         )
+        native_check: asyncio.Task[bool] | None = None
+
+        async def check_native() -> bool:
+            if native_failure_quiescent is not None and await native_failure_quiescent():
+                # Stop at the observation, before another poll could reuse a stale quiescent result.
+                wait_task.cancel()
+                return True
+            return False
+
         try:
+            # Probe at once: a retained partial from an already-failed download would otherwise cost a poll per call.
+            if native_failure_quiescent is not None:
+                native_check = asyncio.ensure_future(check_native())
             while True:
                 done, _pending = await asyncio.wait({wait_task}, timeout=1.0)
                 if wait_task in done:
+                    if wait_task.cancelled() and native_check is not None and await native_check:
+                        return False
                     await wait_task
                     return False
-                if await should_cancel():
+                if should_cancel is not None and await should_cancel():
                     LOG.info(
                         "Cancelling in-flight download wait: run was canceled",
                         downloading_files=downloading_files,
@@ -2124,11 +2143,19 @@ class ForgeAgent:
                     with contextlib.suppress(asyncio.CancelledError):
                         await wait_task
                     return True
+                if native_check is not None and native_check.done():
+                    # A True probe already cancelled wait_task; re-probing could re-raise that cancellation.
+                    if await native_check:
+                        return False
+                    native_check = None
+                if native_failure_quiescent is not None and native_check is None:
+                    native_check = asyncio.ensure_future(check_native())
         finally:
-            if not wait_task.done():
-                wait_task.cancel()
-                with contextlib.suppress(asyncio.CancelledError):
-                    await wait_task
+            pending: list[asyncio.Future[Any]] = [wait_task] if native_check is None else [wait_task, native_check]
+            for pending_task in pending:
+                if not pending_task.done():
+                    pending_task.cancel()
+            await asyncio.gather(*pending, return_exceptions=True)
 
     async def create_task_and_step_from_block(
         self,
@@ -2688,6 +2715,35 @@ class ForgeAgent:
         def _provider_wait_seconds(block: BaseTaskBlock) -> float:
             return min(block.download_timeout or PROVIDER_DOWNLOAD_WAIT_SECONDS, loop_deadline_at - time.monotonic())
 
+        native_download_attempt: NativeDownloadAttempt | None = None
+
+        def _native_attempt_eligible() -> bool:
+            artifacts = browser_state.browser_artifacts
+            observer = artifacts.native_downloads
+            if (
+                native_download_attempt is None
+                or observer is None
+                or observer.attempt is not native_download_attempt
+                or native_download_attempt.task_id != task.task_id
+                or browser_state.browser_context is not observer.context
+                or workflow_download_directory is None
+                or observer.download_dir != workflow_download_directory.resolve()
+                or task.browser_session_id
+                or browser_session_id
+                or artifacts.download_binding != DownloadBinding.RUN_DIR
+                or artifacts.get_action_download_source() is not None
+                or getattr(observer.context, "_skyvern_cdp_download_interceptor", None) is not None
+                or getattr(observer.context, "_skyvern_external_browser", False) is True
+            ):
+                return False
+            return True
+
+        async def _native_failure_quiescent() -> bool:
+            if not _native_attempt_eligible() or native_download_attempt is None:
+                return False
+            quiet = await native_download_attempt.failed_and_quiescent()
+            return quiet and _native_attempt_eligible()
+
         download_wait: DownloadWait | None = None
         download_settle: DownloadSettle | None = None
         if task_block is not None and task_block.complete_on_download and task.workflow_run_id:
@@ -2707,6 +2763,7 @@ class ForgeAgent:
                     exhausted=download_wait_exhausted,
                     should_cancel=_should_cancel,
                     attempt_started_at=attempt_started_at,
+                    native_failure_quiescent=_native_failure_quiescent,
                 )
                 if cancelled:
                     # The run is being canceled; even if a file landed while we waited, don't
@@ -2763,6 +2820,10 @@ class ForgeAgent:
                     exhausted=download_wait_exhausted,
                     should_cancel=_should_cancel,
                     attempt_started_at=attempt_started_at,
+                    # Only a complete_on_download block has the failure watch that tells the model why it ended early.
+                    native_failure_quiescent=_native_failure_quiescent
+                    if wait_only_block.complete_on_download
+                    else None,
                 ):
                     return
                 # A vendor session can keep a file its replay could not fetch; reading it back into the run dir is
@@ -3172,6 +3233,15 @@ class ForgeAgent:
         prev_active_credential_parameter_key = context.active_credential_parameter_key if context else None
         if context and credential_parameter_key is not None:
             context.active_credential_parameter_key = credential_parameter_key
+        observer = browser_state.browser_artifacts.native_downloads
+        if (
+            isinstance(observer, NativeDownloads)
+            and observer.context is browser_state.browser_context
+            and task_block is not None
+            and not task.browser_session_id
+            and not browser_session_id
+        ):
+            native_download_attempt = observer.begin_attempt(task.task_id)
         try:
             # Built AFTER the credential pin: the code-source check (has_credential_totp_candidate)
             # must see the pinned key, or a multi-credential context reads as having no code source.
@@ -3332,6 +3402,7 @@ class ForgeAgent:
                 ),
                 download_wait=download_wait,
                 download_settle=download_settle,
+                native_download_attempt=native_download_attempt,
                 completion_gate=_completion_gate,
                 staged_downloads=staged_downloads,
                 deadline_seconds=loop_deadline_seconds,
@@ -3356,6 +3427,8 @@ class ForgeAgent:
                 anthropic_cache_markers=uses_only_anthropic_models(llm_caller.llm_config),
             )
         finally:
+            if native_download_attempt is not None:
+                native_download_attempt.end()
             input_dispatch.end_login_pace()
             if context and credential_parameter_key is not None:
                 context.active_credential_parameter_key = prev_active_credential_parameter_key

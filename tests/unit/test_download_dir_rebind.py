@@ -29,6 +29,7 @@ from skyvern.webeye.browser_factory import (
     set_download_file_listener,
     was_download_cancelled_by_skyvern,
 )
+from skyvern.webeye.native_downloads import NativeDownloads
 from skyvern.webeye.real_browser_manager import RealBrowserManager
 
 
@@ -480,6 +481,43 @@ async def test_listener_logs_run_identity_from_context(tmp_path: Path) -> None:
 
     assert captured.get("workflow_run_id") == "wr_real"
     assert captured.get("task_id") == "task_real"
+
+
+@pytest.mark.asyncio
+async def test_listener_cancelled_while_reading_a_failure_keeps_the_download_pending() -> None:
+    browser_context = MagicMock()
+    browser_context.pages = []
+    page_listener: dict[str, object] = {}
+    browser_context.on = lambda event, handler: page_listener.setdefault(event, handler)
+    observer = NativeDownloads(browser_context, None, covered=True)
+    attempt = observer.begin_attempt("task_real")
+    set_download_file_listener(browser_context, browser_artifacts=SimpleNamespace(native_downloads=observer))
+    page = MagicMock()
+    page_handlers: dict[str, object] = {}
+    page.on = lambda _event, handler: page_handlers.setdefault("download", handler)
+    page_listener["page"](page)
+
+    reading = asyncio.Event()
+
+    async def stalled_failure_read(_download: object) -> str | None:
+        reading.set()
+        await asyncio.Event().wait()
+        return None
+
+    download = MagicMock()
+    download.path = AsyncMock(side_effect=RuntimeError("download aborted"))
+    with (
+        patch("skyvern.webeye.browser_factory.current", return_value=None),
+        patch("skyvern.webeye.browser_factory.read_download_failure", stalled_failure_read),
+    ):
+        task = page_handlers["download"](download)
+        await asyncio.wait_for(reading.wait(), timeout=2)
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+    assert download in attempt.pending
+    assert not await observer.quiescent()
 
 
 @pytest.mark.asyncio
