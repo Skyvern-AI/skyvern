@@ -24,9 +24,18 @@ from skyvern.exceptions import (
     UnresolvableNavigationHost,
 )
 from skyvern.forge.sdk.core import skyvern_context
-from skyvern.utils.url_validators import canonical_navigation_host, host_has_no_address_record, is_blocked_host
+from skyvern.utils.url_validators import (
+    HostVerdict,
+    canonical_navigation_host,
+    classify_host,
+    host_has_no_address_record,
+)
 
 LOG = structlog.get_logger()
+
+# Both carry no part of the URL, so a redacting caller can re-raise the refusal verbatim.
+_NO_ADDRESS_RECORD_REFUSAL = "refused before dispatch: the resolver reports no address record"
+_UNVERIFIABLE_HOST_REASON = "unverifiable host: the destination could not be resolved for review"
 
 NavigateFunc = Callable[[str], Awaitable[object]]
 SettleFunc = Callable[[], Awaitable[None]]
@@ -42,12 +51,14 @@ _MAX_REDIRECT_HOPS = 100
 
 
 def validate_navigation_destination(url: str) -> None:
-    """Fail closed unless ``url`` targets a public http(s) destination.
+    """Fail closed unless ``url`` targets a verified public http(s) destination.
 
     Rejects local-resource schemes (``file://`` and anything other than http/https) and
     private, loopback, link-local, metadata, or otherwise-internal hosts, including
-    public-looking names that resolve to internal addresses. Every navigation entry point
-    that funnels through navigate_with_retry is guarded identically.
+    public-looking names that resolve to internal addresses. A host the worker cannot resolve
+    is refused too: the browser resolves the name itself, so a split-horizon record can reach an
+    internal address the worker's view never shows. Every navigation entry point that funnels
+    through navigate_with_retry is guarded identically.
     The host comes from the browser's WHATWG canonicalization, not stdlib urlparse, so
     numeric-IP and backslash authority tricks that resolve to an internal host are caught.
     """
@@ -59,8 +70,17 @@ def validate_navigation_destination(url: str) -> None:
     except InvalidUrl as error:
         raise BlockedNavigationDestination(url=url, reason="unsupported scheme or malformed url") from error
 
-    if not host or is_blocked_host(host, resolve_dns=True):
+    verdict = classify_host(host, resolve_dns=True) if host else HostVerdict.DENY
+    if verdict is HostVerdict.ALLOW:
+        return
+    if verdict is HostVerdict.DENY:
         raise BlockedNavigationDestination(url=url, reason="internal, loopback, link-local, or metadata host")
+    # Refusing is the policy decision; naming the target internal would not be. A name the resolver
+    # says has no address record is the target's own state, so it keeps the dead-host verdict and
+    # error code instead of reading as our egress or our policy having rejected a live site.
+    if host and host_has_no_address_record(host):
+        raise UnresolvableNavigationHost(url=url, host=host, error_message=_NO_ADDRESS_RECORD_REFUSAL)
+    raise BlockedNavigationDestination(url=url, reason=_UNVERIFIABLE_HOST_REASON)
 
 
 def _navigation_hop_urls(response: object) -> list[str]:
@@ -285,6 +305,12 @@ async def navigate_with_retry(
         if not redacting:
             raise
         raise BlockedNavigationDestination(url=display_url, reason=error.reason) from None
+    except UnresolvableNavigationHost as error:
+        if not redacting:
+            raise
+        raise UnresolvableNavigationHost(
+            url=display_url, host=error.host, error_message=_NO_ADDRESS_RECORD_REFUSAL
+        ) from None
 
     for attempt in range(retry_times):
         strategy = degradation[min(attempt, len(degradation) - 1)]
@@ -310,6 +336,14 @@ async def navigate_with_retry(
             # This one names a refused redirect hop, not the requested url, so redact that hop
             # rather than substituting the caller's display value for it.
             raise BlockedNavigationDestination(url=redact_url_secrets(error.url), reason=error.reason) from None
+        except UnresolvableNavigationHost as error:
+            # Only redirect revalidation reaches here, and the browser already fetched the hop it
+            # refused: our resolver's silence is a split-horizon view of a live host, not the dead
+            # target the verdict would otherwise claim.
+            raise BlockedNavigationDestination(
+                url=redact_url_secrets(error.url) if redacting else error.url,
+                reason=_UNVERIFIABLE_HOST_REASON,
+            ) from (None if redacting else error)
         except Exception as error:
             error_str = str(error)
             # Playwright names the destination in its own message, so the raw text carries the

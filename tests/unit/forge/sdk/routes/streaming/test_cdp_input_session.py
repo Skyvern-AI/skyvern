@@ -4,6 +4,7 @@ user keeps interacting with a surface that no longer receives input."""
 
 import asyncio
 import json
+import socket
 from types import SimpleNamespace
 from typing import Any
 from unittest.mock import Mock
@@ -288,10 +289,14 @@ class _BlockingWebSocket(_FakeWebSocket):
         self.disconnected.set()
 
 
+@pytest.mark.usefixtures("public_dns")
 class TestNavigateEvent:
     """SKY-13683: a live-view URL input navigates the remote page over the existing
     cdp_input WebSocket, gated by the same take-control check as mouse/keyboard input,
-    and validated through the same SSRF guard every real page navigation goes through."""
+    and validated through the same SSRF guard every real page navigation goes through.
+
+    The guard refuses a destination it cannot resolve, so these fixture origins need an address
+    to get past it; a test that wants the refusal stubs the resolver itself."""
 
     @pytest.mark.asyncio
     async def test_dropped_when_not_in_control(self) -> None:
@@ -337,14 +342,14 @@ class TestNavigateEvent:
         channel = SimpleNamespace(interactor="user", client_id="c1")
         websocket = _FakeWebSocket(
             [
-                json.dumps({"type": "navigateEvent", "url": "https://unresolvable.invalid"}),
+                json.dumps({"type": "navigateEvent", "url": "https://refused.example.test"}),
                 json.dumps({"type": "mouseEvent", "eventType": "mouseMoved", "x": 10, "y": 20}),
             ]
         )
 
         await cdp_input._run_input_loop(websocket, channel, input_session, "browser_session_id", "pbs_test")
 
-        assert page.goto_calls == ["https://unresolvable.invalid", "about:blank"]
+        assert page.goto_calls == ["https://refused.example.test", "about:blank"]
         assert page.goto_timeouts == [None, 5000]
         assert websocket.sent_json == [{"kind": "navigate-error", "reason": "failed"}]
         assert session.sent == [
@@ -412,14 +417,14 @@ class TestNavigateEvent:
         channel = SimpleNamespace(interactor="user", client_id="c1")
         websocket = _PendingCommitWebSocket(
             [
-                json.dumps({"type": "navigateEvent", "url": "https://public.invalid"}),
+                json.dumps({"type": "navigateEvent", "url": "https://slow.example.test"}),
                 json.dumps({"type": "mouseEvent", "eventType": "mouseMoved", "x": 10, "y": 20}),
             ]
         )
 
         await cdp_input._run_input_loop(websocket, channel, input_session, "browser_session_id", "pbs_test")
 
-        assert page.goto_calls == ["https://public.invalid", "about:blank"]
+        assert page.goto_calls == ["https://slow.example.test", "about:blank"]
         assert input_dispatch_urls == ["about:blank"]
         assert websocket.sent_json == [{"kind": "navigate-error", "reason": "failed"}]
         assert websocket.closed is None
@@ -443,14 +448,14 @@ class TestNavigateEvent:
         channel = SimpleNamespace(interactor="user", client_id="c1")
         websocket = _FakeWebSocket(
             [
-                json.dumps({"type": "navigateEvent", "url": "https://public.invalid"}),
+                json.dumps({"type": "navigateEvent", "url": "https://redirected.example.test"}),
                 json.dumps({"type": "mouseEvent", "eventType": "mouseMoved", "x": 10, "y": 20}),
             ]
         )
 
         await cdp_input._run_input_loop(websocket, channel, input_session, "browser_session_id", "pbs_test")
 
-        assert page.goto_calls == ["https://public.invalid", "about:blank"]
+        assert page.goto_calls == ["https://redirected.example.test", "about:blank"]
         assert input_dispatch_urls == ["about:blank"]
         assert websocket.sent_json == [{"kind": "navigate-error", "reason": "failed"}]
         assert websocket.closed is None
@@ -472,6 +477,36 @@ class TestNavigateEvent:
         assert page.goto_calls == []
         assert websocket.sent_json == [{"kind": "navigate-error", "reason": "blocked"}]
         assert websocket.closed is None
+
+    @pytest.mark.asyncio
+    async def test_unresolvable_destination_is_refused_without_closing_the_input_channel(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """SKY-18836: the guard refuses a host it cannot resolve, so this path is newly reachable.
+        The viewer must get a navigate-error and keep typing; closing the channel would strand the
+        session on one dead URL."""
+
+        def no_such_host(*args: object, **kwargs: object) -> list[object]:
+            raise socket.gaierror(socket.EAI_NONAME, "nodename nor servname provided, or not known")
+
+        monkeypatch.setattr("skyvern.utils.url_validators.socket.getaddrinfo", no_such_host)
+        page = _FakeNavigablePage()
+        session = _FakeSession("s")
+        input_session = _FakeInputSession(session, page=page)
+        channel = SimpleNamespace(interactor="user", client_id="c1")
+        websocket = _FakeWebSocket(
+            [
+                json.dumps({"type": "navigateEvent", "url": "https://gone.example.com/"}),
+                json.dumps({"type": "mouseEvent", "eventType": "mouseMoved", "x": 10, "y": 20}),
+            ]
+        )
+
+        await cdp_input._run_input_loop(websocket, channel, input_session, "browser_session_id", "pbs_test")
+
+        assert page.goto_calls == []
+        assert websocket.sent_json == [{"kind": "navigate-error", "reason": "failed"}]
+        assert websocket.closed is None
+        assert len(session.sent) == 1
 
     @pytest.mark.asyncio
     async def test_rejects_empty_url_without_dispatching(self) -> None:
@@ -575,6 +610,7 @@ def _dispatched(session: _FakeSession) -> list[tuple[str, dict]]:
     return [call for call in session.sent if call[0] != "Page.getNavigationHistory"]
 
 
+@pytest.mark.usefixtures("public_dns")
 class TestHistoryNavigation:
     """SKY-13724: the live-view browser chrome drives back/forward/reload over the same
     cdp_input socket, behind the same take-control gate, and re-validates the history entry

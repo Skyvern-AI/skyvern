@@ -3095,6 +3095,7 @@ class TestCodeBlockMagicLink:
         return captured
 
     @pytest.mark.asyncio
+    @pytest.mark.usefixtures("public_dns")
     async def test_polls_for_a_link_and_navigates_once_without_filling(self, monkeypatch: pytest.MonkeyPatch) -> None:
         from skyvern.forge.sdk.schemas.totp_codes import OTPType
         from skyvern.forge.sdk.workflow.models.block import _bind_code_block_magic_link
