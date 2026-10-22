@@ -129,6 +129,7 @@ from skyvern.webeye.actions.key_names import normalize_key_chord
 from skyvern.webeye.browser_driver_errors import is_driver_error, is_driver_timeout_error
 from skyvern.webeye.browser_state import BLANK_PAGE_URLS, is_selectable_page_url
 from skyvern.webeye.cdp_download_interceptor import download_tally_for_context
+from skyvern.webeye.native_downloads import NativeDownloadAttempt
 from skyvern.webeye.navigation import driver_nav_error_code, record_task_nav_error_code, redact_url_secrets
 from skyvern.webeye.utils.challenge_signature import CHALLENGE_VENDOR_FRAME_URL, CHALLENGE_VENDOR_SIGNATURE
 from skyvern.webeye.utils.flutter_semantics import (
@@ -23486,8 +23487,16 @@ class DownloadFailureWatch:
     """Records, on a download block, xhr/fetch requests and documents a call started that came back 4xx/5xx or failed,
     and browser downloads the interceptor could not save, into `facts` for the next tool result to report."""
 
-    def __init__(self, page_provider: PageProvider, opaque_refs: OpaqueUrlRefs | None = None) -> None:
+    def __init__(
+        self,
+        page_provider: PageProvider,
+        opaque_refs: OpaqueUrlRefs | None = None,
+        *,
+        native_download_attempt: NativeDownloadAttempt | None = None,
+    ) -> None:
         self.facts = DownloadFailureFacts(refresh=self._read_tally)
+        self._native_download_attempt = native_download_attempt
+        self._native_failures_seen = (0, 0)
         self._page_provider = page_provider
         self._opaque_refs = opaque_refs
         self._context: BrowserContext | None = None
@@ -23592,6 +23601,13 @@ class DownloadFailureWatch:
         self.facts.add(f"Request failed: {self._describe(request)} {what}", repeat=self._live[request] is not None)
 
     def _read_tally(self) -> None:
+        attempt = self._native_download_attempt
+        if attempt is not None and not attempt.closed and attempt.observer.context is self._context:
+            if attempt.interrupted > self._native_failures_seen[0]:
+                self.facts.add("Browser download interrupted before completion.", repeat=True)
+            if attempt.cancelled_by_skyvern > self._native_failures_seen[1]:
+                self.facts.add("Browser download cancelled at the configured download timeout.", repeat=True)
+            self._native_failures_seen = (attempt.interrupted, attempt.cancelled_by_skyvern)
         tally = download_tally_for_context(self._context)
         if tally is None:
             return
@@ -23640,7 +23656,7 @@ class DownloadFailureWatch:
             request for request, started in self._live.items() if started == call and request not in self._responded
         ]
 
-    async def settle(self, call: int, *, wait: bool) -> list[str]:
+    async def settle(self, call: int, *, wait: bool, deliver: bool = True) -> list[str]:
         """Waits, boundedly and only when `wait`, for the requests call `call` started, then hands out the
         undelivered facts and the requests still unanswered."""
         deadline = time.monotonic() + _DOWNLOAD_FAILURE_SETTLE_SECONDS
@@ -23665,7 +23681,7 @@ class DownloadFailureWatch:
                     await asyncio.wait_for(self._changed.wait(), remaining)
         finally:
             self.end()
-        return self.facts.deliver() + pending
+        return (self.facts.deliver() if deliver else []) + pending
 
     def close(self) -> None:
         for working_page in list(self._named_pages):
@@ -23853,7 +23869,7 @@ def _apply_download_signal(
             failures: list[str] = []
             page_names: Mapping[str, str] = {}
             if failure_watch is not None:
-                failures = await failure_watch.settle(call, wait=_may_submit(_tool_name, args))
+                failures = await failure_watch.settle(call, wait=_may_submit(_tool_name, args), deliver=False)
             # A file a tool staged itself (file_upload) is not a download to wait for.
             staged = bool((result.data or {}).get("staged_download"))
             if download_wait is not None and ((_billable and not staged) or _list_split()[1]):
@@ -23862,6 +23878,7 @@ def _apply_download_signal(
                 except Exception:
                     LOG.warning("taskv3 download wait failed", tool=_tool_name, exc_info=True)
             if failure_watch is not None:
+                failures = failure_watch.facts.deliver() + failures
                 landed = [name for name in _list_split()[0] if name not in seen_completed]
                 if landed:
                     page_names = await failure_watch.page_names(landed)
