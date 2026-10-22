@@ -270,7 +270,6 @@ async def test_composition_visual_handler_uses_fast_copilot_lane(
 
 @pytest.fixture
 def eval_llm_registry(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setattr(settings, "WORKFLOW_COPILOT_EVAL_LLM_OVERRIDES_ENABLED", True)
     monkeypatch.setattr(settings, "WORKFLOW_COPILOT_EVAL_LLM_OVERRIDES_ORGANIZATION_IDS", ["org_eval"])
     monkeypatch.setattr(
         LLMConfigRegistry,
@@ -343,19 +342,20 @@ def test_eval_overrides_reject_invalid_or_unavailable_configuration(raw: str, ev
     assert error.value.status_code == 400
 
 
-def test_eval_overrides_require_server_and_org_authorization(
-    eval_llm_registry: None, monkeypatch: pytest.MonkeyPatch
+@pytest.mark.parametrize(
+    ("allowed_organizations", "organization_id"),
+    [([], "org_eval"), (["org_eval"], "org_other")],
+)
+def test_eval_overrides_require_allowlisted_evaluation_org(
+    allowed_organizations: list[str], organization_id: str, eval_llm_registry: None, monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    monkeypatch.setattr(settings, "WORKFLOW_COPILOT_EVAL_LLM_OVERRIDES_ORGANIZATION_IDS", allowed_organizations)
     raw = '{"workflow-copilot":"EVAL_ACTOR"}'
     with pytest.raises(HTTPException) as error:
-        admit_eval_llm_overrides(raw, "org_other")
+        admit_eval_llm_overrides(raw, organization_id)
     assert error.value.status_code == 403
-    monkeypatch.setattr(settings, "WORKFLOW_COPILOT_EVAL_LLM_OVERRIDES_ENABLED", False)
-    with pytest.raises(HTTPException) as error:
-        admit_eval_llm_overrides(raw, "org_eval")
-    assert error.value.status_code == 403
-    assert admit_eval_llm_overrides(None, "org_other") is None
-    assert admit_eval_llm_overrides("{}", "org_other") is None
+    assert admit_eval_llm_overrides(None, organization_id) is None
+    assert admit_eval_llm_overrides("{}", organization_id) is None
 
 
 @pytest.mark.asyncio

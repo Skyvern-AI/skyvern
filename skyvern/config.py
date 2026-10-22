@@ -311,7 +311,7 @@ class Settings(BaseSettings):
     # The caller-supplied header is not an authorization: on a shared deployment only API
     # credentials belonging to these explicitly configured eval organizations may seed an entry point.
     WORKFLOW_COPILOT_ODYSSEYS_EVAL_ORGANIZATION_IDS: list[str] = []
-    WORKFLOW_COPILOT_EVAL_LLM_OVERRIDES_ENABLED: bool = False
+    # Request-scoped model overrides require an authenticated organization in this allowlist.
     WORKFLOW_COPILOT_EVAL_LLM_OVERRIDES_ORGANIZATION_IDS: list[str] = []
     WORKFLOW_COPILOT_EVAL_COST_ENABLED: bool = False
     WORKFLOW_COPILOT_EVAL_COST_ORGANIZATION_IDS: list[str] = []
