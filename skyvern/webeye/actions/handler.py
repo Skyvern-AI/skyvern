@@ -7463,37 +7463,6 @@ async def _apply_desired_click_state(
     return None
 
 
-async def _is_submit_control_for_completion(element: SkyvernElement) -> bool:
-    if skyvern_context.current() is None:
-        return False
-    try:
-        return await app.AGENT_FUNCTION.is_submit_control_for_completion(element)
-    except Exception:
-        LOG.debug("Submit-control detection failed before click", element_id=element.get_id(), exc_info=True)
-        return False
-
-
-def _record_submit_click_evidence(action: actions.Action, task: Task, step: Step) -> None:
-    context = skyvern_context.current()
-    if context is None:
-        return
-    action_order = action.action_order
-    if action_order is None:
-        action_order = len(step.output.actions_and_results or []) if step.output is not None else 0
-    context.submit_click_evidence[task.task_id] = (
-        datetime.now(UTC),
-        step.order,
-        step.retry_index,
-        action_order,
-    )
-    LOG.info(
-        "Submit-control click recorded for completion evidence",
-        task_id=task.task_id,
-        step_id=step.step_id,
-        action_order=action_order,
-    )
-
-
 @traced(name="skyvern.agent.action.click")
 async def handle_click_action(
     action: actions.ClickAction,
@@ -7537,22 +7506,6 @@ async def handle_click_action(
             if skyvern_element := await dom.safe_get_skyvern_element_by_id(element_id):
                 if await skyvern_element.navigate_to_a_href(page=page):
                     return [ActionSuccess()]
-                submit_control = await _is_submit_control_for_completion(skyvern_element)
-                if submit_control:
-                    try:
-                        # A dispatched coordinate click on a disabled button is not submit evidence.
-                        submit_control = await skyvern_element.get_locator().is_enabled()
-                    except Exception:
-                        LOG.debug(
-                            "Submit-control enabled-state lookup failed before coordinate click",
-                            element_id=skyvern_element.get_id(),
-                            exc_info=True,
-                        )
-                        submit_control = False
-            else:
-                submit_control = False
-        else:
-            submit_control = False
 
         await EventStrategyFactory.move_cursor(page, action.x, action.y)
         if action.repeat == 1:
@@ -7563,9 +7516,6 @@ async def handle_click_action(
             await page.mouse.click(x=action.x, y=action.y, button=action.button, click_count=3)
         else:
             raise ValueError(f"Invalid repeat value: {action.repeat}")
-
-        if submit_control:
-            _record_submit_click_evidence(action, task, step)
 
         return [ActionSuccess()]
 
@@ -7688,10 +7638,7 @@ async def handle_click_action(
             )
 
     if action.download:
-        submit_control = await _is_submit_control_for_completion(skyvern_element)
         results = await handle_click_to_download_file_action(action, page, scraped_page, task, step)
-        if results and results[-1].success and submit_control:
-            _record_submit_click_evidence(action, task, step)
 
     elif action.file_url:
         upload_file_action = UploadFileAction(
@@ -7703,7 +7650,6 @@ async def handle_click_action(
         preflight_derived_action(upload_file_action, page, parent=action, site="click_to_upload")
         return await handle_upload_file_action(upload_file_action, page, scraped_page, task, step)
     else:
-        submit_control = await _is_submit_control_for_completion(skyvern_element)
         incremental_scraped: IncrementalScrapePage | None = None
         # Inside a file-download block, a non-download click authorized as a false-click candidate can
         # still mint the file. If it does, the post-click dropdown/custom-select rescrape below is dead
@@ -7743,8 +7689,6 @@ async def handle_click_action(
                 incremental_scraped=incremental_scraped,
                 skyvern_frame=skyvern_frame,
             )
-            if results and results[-1].success and submit_control:
-                _record_submit_click_evidence(action, task, step)
             action_phase.mark_action_phase(ActionPhase.POST_CLICK)
             if page.url != original_url:
                 return results

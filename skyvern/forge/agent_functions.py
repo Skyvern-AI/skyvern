@@ -1208,9 +1208,6 @@ class AgentFunction:
     async def is_recognized_submit_control(self, element: SkyvernElement) -> bool:
         return False
 
-    async def is_submit_control_for_completion(self, element: SkyvernElement) -> bool:
-        return False
-
     async def record_run_duration(
         self,
         run_type: str,

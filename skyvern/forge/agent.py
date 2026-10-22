@@ -3854,7 +3854,6 @@ class ForgeAgent:
         context.task_id = task.task_id
         context.navigation_goal = task.navigation_goal
         context.navigation_payload = task.navigation_payload
-        context.completion_gate_engine = engine
         if download_baseline_files is None:
             context.download_suffix_applied_files = {}
         context.download_suffix = task_block.download_suffix if task_block else None
@@ -4078,9 +4077,6 @@ class ForgeAgent:
                     await app.ARTIFACT_MANAGER.flush_step_archive(step.step_id)
                 return step, detailed_output, None
 
-            if dispatched_as_v3:
-                context.completion_gate_engine = RunEngine.skyvern_v1
-
             if workflow_owned_recovery:
                 # A recovery on the step engine would hold the block's credential placeholders with
                 # run-scoped credential and OTP access, so it fails instead of falling through.
@@ -4122,7 +4118,6 @@ class ForgeAgent:
                     )
                 # Later steps recurse with this engine; pinning v1 keeps them off the gate and this write.
                 engine = RunEngine.skyvern_v1
-                context.completion_gate_engine = engine
 
             if page := await browser_state.get_working_page():
                 await self.register_async_operations(organization, task, page)
