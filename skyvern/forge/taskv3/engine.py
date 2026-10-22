@@ -26,7 +26,7 @@ import functools
 import json
 import time
 from datetime import UTC, datetime
-from typing import Any, Awaitable, Callable, Collection
+from typing import Any, Awaitable, Callable, Collection, Sequence
 
 import litellm
 import structlog
@@ -59,6 +59,7 @@ from skyvern.forge.taskv3.goal_check import (
     run_unlisted_reask,
 )
 from skyvern.forge.taskv3.goal_composition import CodeTypedValue, build_user_prompt, typed_value_rows
+from skyvern.forge.taskv3.intercepted_submission import InterceptedSubmission
 from skyvern.forge.taskv3.llm_call_params import build_call_kwargs
 from skyvern.forge.taskv3.loop import (
     DEFAULT_MAX_SETTLE_DEFERRALS,
@@ -76,6 +77,7 @@ from skyvern.forge.taskv3.loop import (
     VerificationBlocker,
     make_finish_tool,
     run_agent_tool_loop,
+    submissions_since,
 )
 from skyvern.forge.taskv3.opaque_refs import OpaqueUrlRefs, is_signed_url, mask_opaque_urls
 from skyvern.forge.taskv3.tools import (
@@ -323,6 +325,8 @@ async def run_task_v3_agent_loop(
     # Appended to the goal, whose Code outline section is last, only as far as the request has room for them.
     code_typed_values: tuple[CodeTypedValue, ...] = (),
     anthropic_cache_markers: bool = False,
+    # The submissions a page-level interceptor held for the run's browser context; a local read, never a page call.
+    intercepted_submissions: Callable[[], Sequence[InterceptedSubmission]] | None = None,
 ) -> LoopOutcome:
     """Run one Task V3 task to completion against `page`, returning the loop outcome.
 
@@ -456,6 +460,11 @@ async def run_task_v3_agent_loop(
     refuse_input_entry = block_type == BlockType.EXTRACTION
     refuse_navigation = block_type == BlockType.VALIDATION
     deadline_at = time.monotonic() + deadline_seconds if deadline_seconds is not None else None
+    block_submissions = (
+        submissions_since(intercepted_submissions, time.monotonic())
+        if intercepted_submissions is not None and not page_free
+        else None
+    )
     # A block with its own completion verifier is left to it by every completion judge; the terminate check is not one.
     judge_eligible = goal_check_eligible(
         page_free=page_free,
@@ -617,6 +626,7 @@ async def run_task_v3_agent_loop(
         completion_gate=None if page_free else completion_gate,
         download_facts=failure_watch.facts if failure_watch is not None else None,
         error_code_mapping=error_code_mapping,
+        intercepted_submissions=block_submissions,
     )
     tools = browser_tools + (extra_tools or []) + [finish_tool]
     # The COMPLETE dispatch list, not just the browser tools: auth / captcha / code tools and finish

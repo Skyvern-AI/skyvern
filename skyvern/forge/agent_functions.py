@@ -116,6 +116,7 @@ if TYPE_CHECKING:
     from skyvern.forge.sdk.workflow.models.tags import CallerType
     from skyvern.forge.sdk.workflow.models.workflow import Workflow, WorkflowRun, WorkflowRunStatus
     from skyvern.forge.taskv3.answer_basis_audit import AnswerBasisAudit
+    from skyvern.forge.taskv3.intercepted_submission import InterceptedSubmission
     from skyvern.forge.taskv3.loop import ToolSpec
     from skyvern.forge.taskv3.tools import PageProvider
     from skyvern.schemas.workflows import WorkflowStatus
@@ -1185,6 +1186,11 @@ class AgentFunction:
     # Same contract as task_v3_age_default, for the job-application availability, experience and disclosure defaults.
     def task_v3_application_defaults(self, parameters: dict[str, Any] | None) -> tuple[str | None, str] | None:
         return None
+
+    # The submissions a page-level interceptor in this process held for the browser context, oldest first. Must stay a
+    # local read with no page or CDP call: the finish tool reads it on every non-completed verdict. OSS has none.
+    def task_v3_intercepted_submissions(self, browser_context: Any) -> tuple[InterceptedSubmission, ...]:
+        return ()
 
     # An audit of the answers a run entered, consulted before the form moves on, or None (OSS: none).
     def task_v3_answer_basis_audit(

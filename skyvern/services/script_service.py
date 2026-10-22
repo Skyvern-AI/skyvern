@@ -1060,7 +1060,7 @@ async def _update_workflow_block(
                 )
             if run_lease_tasks_enabled() and lease_lost:
                 return
-            downloaded_files: list[FileInfo] = []
+            downloaded_files: list[FileInfo] | None = None
             try:
                 async with asyncio.timeout(GET_DOWNLOADED_FILES_TIMEOUT):
                     downloaded_files = await app.STORAGE.get_current_attempt_downloaded_files(
@@ -1069,11 +1069,12 @@ async def _update_workflow_block(
                     )
             except asyncio.TimeoutError:
                 LOG.warning("Timeout getting downloaded files", task_id=task_id)
-            downloaded_files = _filter_downloaded_files_for_current_iteration(
-                downloaded_files,
-                context.loop_internal_state,
-                aliases=app.STORAGE.get_downloaded_file_signature_aliases,
-            )
+            if downloaded_files is not None:
+                downloaded_files = _filter_downloaded_files_for_current_iteration(
+                    downloaded_files,
+                    context.loop_internal_state,
+                    aliases=app.STORAGE.get_downloaded_file_signature_aliases,
+                )
 
             task_screenshot_artifacts = await app.WORKFLOW_SERVICE.get_recent_task_screenshot_artifacts(
                 organization_id=context.organization_id,

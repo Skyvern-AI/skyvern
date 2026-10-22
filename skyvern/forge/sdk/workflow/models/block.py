@@ -2718,7 +2718,7 @@ class BaseTaskBlock(Block):
                 )
                 success = updated_task.status == TaskStatus.completed
 
-                downloaded_files: list[FileInfo] = []
+                downloaded_files: list[FileInfo] | None = None
                 try:
                     async with asyncio.timeout(GET_DOWNLOADED_FILES_TIMEOUT):
                         downloaded_files = await app.STORAGE.get_current_attempt_downloaded_files(
@@ -2731,11 +2731,12 @@ class BaseTaskBlock(Block):
                     LOG.warning("Timeout getting downloaded files", task_id=updated_task.task_id)
 
                 # SKY-7005: scope downloaded files to the current loop iteration
-                downloaded_files = filter_downloaded_files_for_current_iteration(
-                    downloaded_files,
-                    current_context.loop_internal_state if current_context else None,
-                    aliases=app.STORAGE.get_downloaded_file_signature_aliases,
-                )
+                if downloaded_files is not None:
+                    downloaded_files = filter_downloaded_files_for_current_iteration(
+                        downloaded_files,
+                        current_context.loop_internal_state if current_context else None,
+                        aliases=app.STORAGE.get_downloaded_file_signature_aliases,
+                    )
 
                 task_screenshot_artifacts = await app.WORKFLOW_SERVICE.get_recent_task_screenshot_artifacts(
                     organization_id=workflow_run.organization_id,
@@ -2824,7 +2825,7 @@ class BaseTaskBlock(Block):
                     )
                     will_retry = False
                 retry_message = f", retrying task {current_retry}/{self.max_retries}" if will_retry else ""
-                downloaded_files = []
+                downloaded_files = None
                 try:
                     async with asyncio.timeout(GET_DOWNLOADED_FILES_TIMEOUT):
                         downloaded_files = await app.STORAGE.get_current_attempt_downloaded_files(
@@ -2838,11 +2839,12 @@ class BaseTaskBlock(Block):
                     LOG.warning("Timeout getting downloaded files", task_id=updated_task.task_id)
 
                 # SKY-7005: scope downloaded files to the current loop iteration
-                downloaded_files = filter_downloaded_files_for_current_iteration(
-                    downloaded_files,
-                    current_context.loop_internal_state if current_context else None,
-                    aliases=app.STORAGE.get_downloaded_file_signature_aliases,
-                )
+                if downloaded_files is not None:
+                    downloaded_files = filter_downloaded_files_for_current_iteration(
+                        downloaded_files,
+                        current_context.loop_internal_state if current_context else None,
+                        aliases=app.STORAGE.get_downloaded_file_signature_aliases,
+                    )
 
                 task_screenshot_artifacts = await app.WORKFLOW_SERVICE.get_recent_task_screenshot_artifacts(
                     organization_id=workflow_run.organization_id,

@@ -35,6 +35,7 @@ from skyvern.forge.taskv3.auth_tools import _MAX_GIVEUP_DEFERRALS, VerificationF
 from skyvern.forge.taskv3.engine import MAX_TOKENS_CEILING, MAX_TOKENS_PER_ACTION_STEP, taskv3_runaway_backstops
 from skyvern.forge.taskv3.goal_check import GoalVerdict, ToolTrail, run_goal_check
 from skyvern.forge.taskv3.handoff_redaction import ELIDED_URL_PATH, caller_known_published_urls
+from skyvern.forge.taskv3.intercepted_submission import InterceptedSubmission, SubmissionOutcome
 from skyvern.forge.taskv3.loop import (
     ACTION_BLOCK_TARGET_ACTION_RESERVE,
     ACTION_BUDGET_EXTENDED_EVENT,
@@ -49,6 +50,7 @@ from skyvern.forge.taskv3.loop import (
     COMPLETION_GATE_REFUSAL,
     DOWNLOAD_FAILURE_MAX_LINES,
     DOWNLOAD_NO_FILE_FACT,
+    FAILURE_EVIDENCE_MIN_DEADLINE_HEADROOM_SECONDS,
     FAILURE_EVIDENCE_MIN_TOOL_CALLS,
     FAILURE_EVIDENCE_MIN_TURNS,
     FINAL_TURN_GRANTED_EVENT,
@@ -71,6 +73,8 @@ from skyvern.forge.taskv3.loop import (
     PROGRESS_LEDGER_SHADOW_EVENT,
     PROGRESS_LEDGER_WINDOW,
     STALE_READ_MAX_HOLDS,
+    SUBMISSION_HELD_WAIT_MAX_SECONDS,
+    SUBMISSION_RENDER_MARGIN_SECONDS,
     TARGET_ACTION_ROUND_EVENT,
     TOKEN_BUDGET_EXTENDED_EVENT,
     TOKEN_BUDGET_EXTENSION_REFUSED_EVENT,
@@ -104,7 +108,9 @@ from skyvern.forge.taskv3.loop import (
     record_covered_layer,
     record_hit_class,
     record_resolve_seconds,
+    record_text_delta,
     run_agent_tool_loop,
+    submissions_since,
 )
 from skyvern.forge.taskv3.opaque_refs import mask_opaque_urls
 from skyvern.forge.taskv3.tools import build_browser_tools
@@ -6997,6 +7003,404 @@ async def test_finish_terminated_after_submit_click_stands_without_a_relook() ->
     assert outcome.reason == "submission rejected"
     assert outcome.turns == 2
     assert fp_calls["n"] == 0
+
+
+class _FakeSubmissions:
+    """What a page-level interceptor's ledger reports, driven by the test's own tools."""
+
+    def __init__(self) -> None:
+        self.records: list[InterceptedSubmission] = []
+
+    def __call__(self) -> tuple[InterceptedSubmission, ...]:
+        return tuple(self.records)
+
+    def deliver(self, *, ago: float = 0.0, outcome: SubmissionOutcome = SubmissionOutcome.DELIVERED) -> None:
+        at = time.monotonic() - ago
+        self.records.append(
+            InterceptedSubmission(
+                record_id=len(self.records) + 1, outcome=outcome, started_at=at - 0.5, released_at=at, delivered_at=at
+            )
+        )
+
+    def hold(self) -> int:
+        record_id = len(self.records) + 1
+        self.records.append(
+            InterceptedSubmission(record_id=record_id, outcome=SubmissionOutcome.HELD, started_at=time.monotonic())
+        )
+        return record_id
+
+    def release(self, record_id: int) -> None:
+        now = time.monotonic()
+        self.records[record_id - 1] = dataclasses.replace(
+            self.records[record_id - 1], outcome=SubmissionOutcome.DELIVERED, released_at=now, delivered_at=now
+        )
+
+
+def _submission_tools(
+    submissions: _FakeSubmissions,
+    activity: ActivityRecency,
+    *,
+    observe_delivers_mid_read: bool = False,
+    click_delivers: bool = False,
+    click_settles: bool = False,
+    **finish_kwargs: Any,
+) -> list[ToolSpec]:
+    async def click(args: dict[str, Any]) -> ToolResult:
+        if click_delivers:
+            submissions.deliver()
+        if click_settles:
+            await asyncio.sleep(SUBMISSION_RENDER_MARGIN_SECONDS + 0.2)
+        return ToolResult.ok("click done")
+
+    async def observe(args: dict[str, Any]) -> ToolResult:
+        if observe_delivers_mid_read:
+            # The reference run: the read started before the response reached the page and returned after it.
+            submissions.deliver()
+            await asyncio.sleep(SUBMISSION_RENDER_MARGIN_SECONDS + 0.2)
+        return ToolResult.ok("url=x text: 'Submit application'")
+
+    return [
+        ToolSpec(name="click", description="c", parameters={}, handler=click, billable=True),
+        ToolSpec(name="observe", description="o", parameters={}, handler=observe, compactable=True),
+        make_finish_tool(activity=activity, intercepted_submissions=submissions, **finish_kwargs),
+    ]
+
+
+@pytest.mark.asyncio
+async def test_terminated_held_once_when_a_submission_response_landed_after_the_last_read() -> None:
+    submissions, activity = _FakeSubmissions(), ActivityRecency()
+    tools = _submission_tools(submissions, activity, click_delivers=True)
+    script = [
+        [("observe", {})],
+        [("click", {"selector": "#submit"})],
+        [("finish", {"status": "terminated", "reason": "form still shows submit"})],
+        [("observe", {})],
+        [("finish", {"status": "completed", "reason": "confirmation shown"})],
+    ]
+    with capture_logs() as logs:
+        outcome, caller = await _run(script, tools, activity=activity)
+    assert outcome.status == "completed"
+    assert outcome.turns == 5
+    held = [e for e in logs if e["event"] == "taskv3 finish held on an unseen submission response"]
+    assert [e["record_ids"] for e in held] == [[1]]
+    hold_result = next(m for m in caller.message_history if m.get("role") == "tool" and "verdict held" in m["content"])
+    assert "not by itself a confirmation" in hold_result["content"]
+
+
+@pytest.mark.asyncio
+async def test_submission_hold_counts_a_read_from_its_start_not_its_end() -> None:
+    # A read that began before the response reached the page and returned after it can still show the old page.
+    submissions, activity = _FakeSubmissions(), ActivityRecency()
+    tools = _submission_tools(submissions, activity, observe_delivers_mid_read=True)
+    script = [
+        [("observe", {})],
+        [("finish", {"status": "terminated", "reason": "nothing happened"})],
+        [("finish", {"status": "terminated", "reason": "nothing happened, re-checked"})],
+    ]
+    outcome, _ = await _run(script, tools, activity=activity)
+    assert outcome.status == "terminated"
+    assert outcome.reason == "nothing happened, re-checked"
+
+
+@pytest.mark.asyncio
+async def test_submission_hold_ignores_page_text_in_the_finishs_own_batch() -> None:
+    # The model emitted finish alongside the reads, so it decided before any of them came back.
+    submissions, activity = _FakeSubmissions(), ActivityRecency()
+    tools = _submission_tools(submissions, activity, click_delivers=True, click_settles=True)
+    script = [
+        [("click", {"selector": "#submit"}), ("observe", {}), ("finish", {"status": "terminated", "reason": "r1"})],
+        [("observe", {})],
+        [("finish", {"status": "terminated", "reason": "r2"})],
+    ]
+    outcome, _ = await _run(script, tools, activity=activity)
+    assert outcome.status == "terminated"
+    assert outcome.reason == "r2"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("own_read_lines", "earlier_lines", "shown_fresh", "counts"),
+    # (41, 40, 0): the budget cut every line this call found, so only held lines reached the model.
+    [(1, 0, 1, True), (2, 1, 1, True), (None, 1, 0, False), (1, 1, 0, False), (41, 40, 0, False)],
+)
+async def test_action_result_page_text_counts_as_a_read_only_when_this_call_read_it(
+    own_read_lines: int | None, earlier_lines: int, shown_fresh: int, counts: bool
+) -> None:
+    # Lines held back by an earlier read and flushed by this call show the page from before it.
+    submissions, activity = _FakeSubmissions(), ActivityRecency()
+    submissions.deliver(ago=5.0)
+
+    async def type_(args: dict[str, Any]) -> ToolResult:
+        record_text_delta(0.0, own_read_lines, pending=earlier_lines, shown_fresh=shown_fresh)
+        return ToolResult.ok("typed\nThe page newly shows: 'Thanks'", data={"delta_at": 6})
+
+    tools = [
+        ToolSpec(name="type", description="t", parameters={}, handler=type_, billable=True),
+        make_finish_tool(activity=activity, intercepted_submissions=submissions),
+    ]
+    script = [
+        [("type", {"selector": "#q", "text": "x"})],
+        [("finish", {"status": "terminated", "reason": "r1"})],
+        [("finish", {"status": "terminated", "reason": "r2"})],
+    ]
+    outcome, _ = await _run(script, tools, activity=activity)
+    assert outcome.reason == ("r1" if counts else "r2")
+
+
+@pytest.mark.asyncio
+async def test_submission_hold_negatives_leave_the_verdict_alone() -> None:
+    # A response the model's last read already covered, no submissions, and a completed verdict.
+    for setup, status in (("covered", "terminated"), ("none", "terminated"), ("fresh", "completed")):
+        submissions, activity = _FakeSubmissions(), ActivityRecency()
+        if setup == "covered":
+            submissions.deliver(ago=5.0)
+        tools = _submission_tools(submissions, activity, click_delivers=setup == "fresh")
+        script = [
+            [("observe", {})],
+            [("click", {"selector": "#submit"})] if setup == "fresh" else [("observe", {})],
+            [("finish", {"status": status, "reason": "r"})],
+        ]
+        outcome, _ = await _run(script, tools, activity=activity)
+        assert (setup, outcome.status, outcome.turns) == (setup, status, 3)
+
+
+@pytest.mark.asyncio
+async def test_failed_submission_hold_replaces_the_failure_evidence_hold() -> None:
+    submissions, activity = _FakeSubmissions(), ActivityRecency()
+    fingerprint, _ = _fingerprint_seq(["fp"])
+    tools = _submission_tools(
+        submissions,
+        activity,
+        click_delivers=True,
+        page_fingerprint=fingerprint,
+        settle_wait_seconds=0.0,
+        failure_settle_max_seconds=0.01,
+    )
+    script = [
+        [("click", {"selector": "#submit"})],
+        [("finish", {"status": "failed", "reason": "r1"})],
+        [("observe", {})],
+        [("finish", {"status": "failed", "reason": "r2"})],
+    ]
+    outcome, _ = await _run(script, tools, activity=activity)
+    assert (outcome.status, outcome.reason, outcome.turns) == ("failed", "r2", 4)
+
+
+@pytest.mark.asyncio
+async def test_submission_hold_without_headroom_only_logs() -> None:
+    submissions, activity = _FakeSubmissions(), ActivityRecency()
+    tools = _submission_tools(submissions, activity, click_delivers=True)
+    script = [[("click", {"selector": "#submit"})], [("finish", {"status": "terminated", "reason": "r"})]]
+    with capture_logs() as logs:
+        outcome, _ = await _run(script, tools, activity=activity, max_turns=3)
+    assert (outcome.status, outcome.turns) == ("terminated", 2)
+    events = [e["event"] for e in logs]
+    assert "taskv3 finish would hold on an unseen submission response" in events
+    assert "taskv3 finish held on an unseen submission response" not in events
+
+
+@pytest.mark.asyncio
+async def test_submission_hold_waits_for_a_held_submission_then_holds() -> None:
+    submissions, activity = _FakeSubmissions(), ActivityRecency()
+    record_id = submissions.hold()
+
+    async def release_soon() -> None:
+        await asyncio.sleep(0.3)
+        submissions.release(record_id)
+
+    tools = _submission_tools(submissions, activity)
+    script = [
+        [("observe", {})],
+        [("finish", {"status": "terminated", "reason": "r1"})],
+        [("finish", {"status": "terminated", "reason": "r2"})],
+    ]
+    releaser = asyncio.create_task(release_soon())
+    with capture_logs() as logs:
+        outcome, _ = await _run(script, tools, activity=activity)
+    await releaser
+    assert (outcome.status, outcome.reason) == ("terminated", "r2")
+    held = next(e for e in logs if e["event"] == "taskv3 finish held on an unseen submission response")
+    assert held["outcomes"] == ["delivered"]
+
+
+@pytest.mark.asyncio
+async def test_submission_hold_wait_on_a_held_submission_ends_on_cancel() -> None:
+    submissions, activity = _FakeSubmissions(), ActivityRecency()
+    submissions.hold()
+
+    async def canceled() -> bool:
+        return True
+
+    finish = make_finish_tool(activity=activity, intercepted_submissions=submissions, should_cancel=canceled)
+    started = time.monotonic()
+    result = await finish.handler({"status": "terminated", "reason": "r"})
+    assert result.status == "error"
+    assert "still waiting" in result.content
+    assert time.monotonic() - started < SUBMISSION_HELD_WAIT_MAX_SECONDS / 2
+
+
+@pytest.mark.asyncio
+async def test_submission_hold_rechecks_headroom_after_waiting_on_a_held_submission() -> None:
+    # The wait spends deadline; a hold issued without the headroom it needs would end the run budget_exhausted.
+    submissions, activity = _FakeSubmissions(), ActivityRecency()
+    record_id = submissions.hold()
+
+    async def release_soon() -> None:
+        await asyncio.sleep(0.3)
+        submissions.release(record_id)
+
+    finish = make_finish_tool(
+        activity=activity,
+        intercepted_submissions=submissions,
+        deadline_at=time.monotonic() + FAILURE_EVIDENCE_MIN_DEADLINE_HEADROOM_SECONDS + 0.2,
+    )
+    releaser = asyncio.create_task(release_soon())
+    with capture_logs() as logs:
+        result = await finish.handler({"status": "terminated", "reason": "r"})
+    await releaser
+    assert result.status == "ok"
+    events = [e["event"] for e in logs]
+    assert "taskv3 finish would hold on an unseen submission response" in events
+    assert "taskv3 finish held on an unseen submission response" not in events
+
+
+@pytest.mark.asyncio
+async def test_a_second_finish_in_the_held_batch_is_held_too() -> None:
+    # Neither finish in the batch has seen the hold, so the second must not stand without the re-observe.
+    submissions, activity = _FakeSubmissions(), ActivityRecency()
+    tools = _submission_tools(submissions, activity, click_delivers=True)
+    script = [
+        [("observe", {})],
+        [("click", {"selector": "#submit"})],
+        [("finish", {"status": "terminated", "reason": "r1"}), ("finish", {"status": "terminated", "reason": "r2"})],
+        [("observe", {})],
+        [("finish", {"status": "terminated", "reason": "r3"})],
+    ]
+    with capture_logs() as logs:
+        outcome, _ = await _run(script, tools, activity=activity)
+    assert (outcome.status, outcome.reason, outcome.turns) == ("terminated", "r3", 5)
+    held = [e for e in logs if e["event"] == "taskv3 finish held on an unseen submission response"]
+    assert len(held) == 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("status", ["terminated", "failed"])
+async def test_a_submission_released_after_the_wait_cap_is_still_shown_before_the_verdict_stands(
+    status: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # The interceptor can hold longer than the wait: the hold that fired while it was held must not spend the
+    # chance to see the response it later delivers, here behind a read that started before that response.
+    monkeypatch.setattr(loop_module, "SUBMISSION_HELD_WAIT_MAX_SECONDS", 0.2)
+    submissions, activity = _FakeSubmissions(), ActivityRecency()
+    record_id = submissions.hold()
+    reads = [0]
+
+    async def observe(args: dict[str, Any]) -> ToolResult:
+        reads[0] += 1
+        if reads[0] == 2:
+            submissions.release(record_id)
+            await asyncio.sleep(SUBMISSION_RENDER_MARGIN_SECONDS + 0.2)
+        return ToolResult.ok("url=x text: 'Submit application'")
+
+    tools = [
+        ToolSpec(name="observe", description="o", parameters={}, handler=observe, compactable=True),
+        make_finish_tool(activity=activity, intercepted_submissions=submissions),
+    ]
+    script = [
+        [("observe", {})],
+        [("finish", {"status": status, "reason": "r1"})],
+        [("observe", {})],
+        [("finish", {"status": status, "reason": "r2"})],
+        [("observe", {})],
+        [("finish", {"status": status, "reason": "r3"})],
+    ]
+    with capture_logs() as logs:
+        outcome, _ = await _run(script, tools, activity=activity)
+    held = [e["outcomes"] for e in logs if e["event"] == "taskv3 finish held on an unseen submission response"]
+    assert held == [["held"], ["delivered"]]
+    assert (outcome.status, outcome.reason) == (status, "r3")
+
+
+@pytest.mark.asyncio
+async def test_a_submission_still_held_after_its_hold_is_not_waited_on_or_held_again(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(loop_module, "SUBMISSION_HELD_WAIT_MAX_SECONDS", 0.3)
+    submissions, activity = _FakeSubmissions(), ActivityRecency()
+    submissions.hold()
+    tools = _submission_tools(submissions, activity)
+    script = [
+        [("observe", {})],
+        [("finish", {"status": "terminated", "reason": "r1"})],
+        [("finish", {"status": "terminated", "reason": "r2"})],
+    ]
+    started = time.monotonic()
+    outcome, _ = await _run(script, tools, activity=activity)
+    assert (outcome.status, outcome.reason) == ("terminated", "r2")
+    assert time.monotonic() - started < 0.3 * 2
+
+
+@pytest.mark.asyncio
+async def test_a_new_response_does_not_re_wait_on_a_submission_already_held_for(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(loop_module, "SUBMISSION_HELD_WAIT_MAX_SECONDS", 0.6)
+    submissions, activity = _FakeSubmissions(), ActivityRecency()
+    submissions.hold()
+    finish = make_finish_tool(activity=activity, intercepted_submissions=submissions)
+    await finish.handler({"status": "terminated", "reason": "r1"})
+    submissions.deliver()
+    activity.turn += 1
+    started = time.monotonic()
+    second = await finish.handler({"status": "terminated", "reason": "r2"})
+    assert second.status == "error" and "got the site's response" in second.content
+    assert time.monotonic() - started < 0.6
+
+
+@pytest.mark.asyncio
+async def test_a_late_released_submission_without_headroom_only_logs(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(loop_module, "SUBMISSION_HELD_WAIT_MAX_SECONDS", 0.2)
+    submissions, activity = _FakeSubmissions(), ActivityRecency()
+    record_id = submissions.hold()
+    finish = make_finish_tool(activity=activity, intercepted_submissions=submissions)
+    first = await finish.handler({"status": "terminated", "reason": "r1"})
+    submissions.release(record_id)
+    activity.turn += 1
+    activity.final_turn_active = True
+    with capture_logs() as logs:
+        second = await finish.handler({"status": "terminated", "reason": "r2"})
+    assert (first.status, second.status) == ("error", "ok")
+    assert "taskv3 finish would hold on an unseen submission response" in [e["event"] for e in logs]
+
+
+def test_submissions_since_keeps_a_response_landing_within_the_render_margin_before_the_block() -> None:
+    # The page may still be rendering a response that landed just before the block began, so the read-start check,
+    # not the block boundary, decides whether this block saw it.
+    submissions = _FakeSubmissions()
+    started_at = time.monotonic()
+    inside = started_at - SUBMISSION_RENDER_MARGIN_SECONDS / 2
+    outside = started_at - SUBMISSION_RENDER_MARGIN_SECONDS * 2
+    for at in (outside, inside):
+        submissions.records.append(
+            InterceptedSubmission(
+                record_id=len(submissions.records) + 1,
+                outcome=SubmissionOutcome.DELIVERED,
+                started_at=at - 0.1,
+                released_at=at,
+                delivered_at=at,
+            )
+        )
+    assert [r.record_id for r in submissions_since(submissions, started_at)()] == [2]
+
+
+def test_submissions_since_drops_an_earlier_blocks_settled_records() -> None:
+    submissions = _FakeSubmissions()
+    submissions.deliver(ago=5.0)
+    submissions.hold()
+    read = submissions_since(submissions, time.monotonic() - 1.0)
+    assert [r.record_id for r in read()] == [2]
+    submissions.deliver()
+    assert [r.record_id for r in read()] == [2, 3]
 
 
 @pytest.mark.asyncio

@@ -1,5 +1,6 @@
+from collections.abc import Sequence
 from enum import StrEnum
-from typing import Literal
+from typing import Any, Literal
 
 from pydantic import BaseModel, Field, PrivateAttr, field_validator
 
@@ -76,6 +77,23 @@ def resolve_error_code_mapping_key(code: object, error_code_mapping: dict[str, s
         return code
     matches = [key for key in error_code_mapping if key.lower() == code.lower()]
     return matches[0] if len(matches) == 1 else None
+
+
+BROWSER_DOWNLOAD_PARTIAL_FAILURE_CODE = "BROWSER_DOWNLOAD_PARTIAL_FAILURE"
+
+
+def drop_unsolicited_download_errors(
+    errors: list[dict[str, Any]],
+    *,
+    downloaded_files: Sequence[object] | None,
+) -> list[dict[str, Any]]:
+    """Keep the unsolicited-download failure only when a file lookup confirms that none landed.
+
+    ``None`` means the caller never fetched the files, so it cannot support the failure's no-file claim.
+    """
+    if downloaded_files is not None and not downloaded_files:
+        return errors
+    return [error for error in errors if error.get("error_code") != BROWSER_DOWNLOAD_PARTIAL_FAILURE_CODE]
 
 
 class SkyvernDefinedError(BaseModel):

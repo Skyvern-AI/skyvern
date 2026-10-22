@@ -49,6 +49,7 @@ from skyvern.constants import (
     BROWSER_INTERCEPTOR_DISABLE_TIMEOUT,
     BROWSER_PAGE_CLOSE_TIMEOUT,
 )
+from skyvern.errors.errors import BROWSER_DOWNLOAD_PARTIAL_FAILURE_CODE
 from skyvern.exceptions import DownloadFileMaxSizeExceeded, redact_cdp_endpoint_urls
 from skyvern.forge.sdk.api import files as file_api
 from skyvern.forge.sdk.core.hashing import diagnostic_fingerprint
@@ -1000,15 +1001,17 @@ class CDPDownloadInterceptor:
         }
 
     def consume_unsolicited_download_error(self) -> dict[str, Any] | None:
+        # States only what this call observed: whether the run ends up with a file is unknown here,
+        # and the row is persisted for readers that never consult the download count.
         if not self._unsolicited_download_failures:
             return None
         reasons = dict(sorted(self._unsolicited_download_failures.items()))
         self._unsolicited_download_failures.clear()
         failed_count = sum(reasons.values())
-        noun = "download was" if failed_count == 1 else "downloads were"
+        subject = "A browser download" if failed_count == 1 else f"{failed_count} browser downloads"
         return {
-            "error_code": "BROWSER_DOWNLOAD_PARTIAL_FAILURE",
-            "reasoning": f"{failed_count if failed_count > 1 else 'One'} unsolicited browser {noun} not saved.",
+            "error_code": BROWSER_DOWNLOAD_PARTIAL_FAILURE_CODE,
+            "reasoning": f"{subject} could not be saved.",
             "error_type": "SYSTEM_DEFINED_ERROR",
             "details": {"failed_download_count": failed_count, "reasons": reasons},
         }

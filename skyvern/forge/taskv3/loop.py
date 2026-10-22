@@ -43,6 +43,7 @@ from skyvern.forge.taskv3.goal_check import (
     UnlistedReask,
 )
 from skyvern.forge.taskv3.handoff_redaction import MAX_HANDOFF_URL_CHARS, normalized_url, sanitize_published_url
+from skyvern.forge.taskv3.intercepted_submission import InterceptedSubmission, SubmissionOutcome
 from skyvern.forge.taskv3.target_label import describe_target
 from skyvern.schemas.workflows import ERROR_CODE_MAPPING_MAX_ENTRIES, ERROR_CODE_MAPPING_MAX_UTF8_BYTES
 from skyvern.webeye.navigation import clear_task_nav_error_code, redact_url_secrets
@@ -366,6 +367,8 @@ _ENTRY_RECORD: ContextVar[dict[str, Any] | None] = ContextVar("taskv3_entry_reco
 _TEXT_DELTA: ContextVar[tuple[float, int | None, int, bool, str | None, int] | None] = ContextVar(
     "taskv3_text_delta", default=None
 )
+# How many of this call's own newly read lines its result actually showed the model; read by the submission hold.
+_TEXT_DELTA_SHOWN_FRESH: ContextVar[int] = ContextVar("taskv3_text_delta_shown_fresh", default=0)
 # The ordinal of the tool call being dispatched, so a tool can say how many calls a report spans.
 _TOOL_CALL_SEQ: ContextVar[int | None] = ContextVar("taskv3_tool_call_seq", default=None)
 
@@ -415,8 +418,10 @@ def record_text_delta(
     over_bound: bool = False,
     skipped: str | None = None,
     pending: int = 0,
+    shown_fresh: int = 0,
 ) -> None:
-    """Record the text-delta read. Telemetry only. `lines` is None when the read failed, timed out or
+    """Record the text-delta read. Telemetry, except `shown_fresh`: how many of this call's own new lines the
+    result showed after the char budget cut, which the finish tool's submission hold reads. `lines` is None when the read failed, timed out or
     was past the char bound (`over_bound`), or when the tool errored after a read before it ran; else
     how many lines rose, counted before the char budget cut them. `chars` is the section's length.
     `skipped` names why a call did not read at all: "over_bound" (this document was already read past
@@ -426,6 +431,7 @@ def record_text_delta(
     read succeeded, and still reported when it did not (`lines` None). A call that does not report
     records it too when it carries flushed lines."""
     _TEXT_DELTA.set((seconds, lines, chars, over_bound, skipped, pending))
+    _TEXT_DELTA_SHOWN_FRESH.set(shown_fresh)
 
 
 def current_tool_call_seq() -> int | None:
@@ -1483,6 +1489,11 @@ FAILURE_EVIDENCE_MIN_TURNS = 3
 # of that cycle, so the 60s above would let the gate convert an honest failure into the
 # budget-exhausted end it exists to prevent. Not imported from auth_tools: that module imports this one.
 VERIFICATION_GIVEUP_MIN_DEADLINE_HEADROOM_SECONDS = 180.0
+# An interceptor holds a submission while it retries the site (observed holding one for ~20s).
+SUBMISSION_HELD_WAIT_MAX_SECONDS = 30.0
+SUBMISSION_HELD_POLL_SECONDS = 0.5
+# A read that starts this soon after a response reached the page may still show the page before the page rendered it.
+SUBMISSION_RENDER_MARGIN_SECONDS = 0.5
 
 
 def _is_enter_submit(tool_name: str, args: dict[str, Any]) -> bool:
@@ -1698,6 +1709,10 @@ class ActivityRecency:
     action_attempts: int = 0
     # Successful perceptions (the compactable tools: observe / get_html / look).
     perceptions: int = 0
+    # When the newest page read the model has received STARTED (a read begun before a response landed can return
+    # after it showing the old page); this batch's reads wait in `batch_read_started_at` until the next model turn.
+    read_started_at: float | None = None
+    batch_read_started_at: float | None = None
     # State at the FIRST failed/terminated finish past the failure-evidence gate, emitted once per run
     # by the engine's summary line. Not the run's first verdict: a zero-action `completed` refused by a
     # gate above reaches this point later as failed/terminated.
@@ -1707,6 +1722,31 @@ class ActivityRecency:
 
     def armed(self, window: int = FAILURE_EVIDENCE_WINDOW_TURNS) -> bool:
         return self.last_trigger_turn is not None and (self.turn - self.last_trigger_turn) <= window
+
+    def record_read(self, started_at: float) -> None:
+        if self.batch_read_started_at is None or started_at > self.batch_read_started_at:
+            self.batch_read_started_at = started_at
+
+    def deliver_batch_reads(self) -> None:
+        """Called as the batch's results go to the model."""
+        if self.batch_read_started_at is not None and (
+            self.read_started_at is None or self.batch_read_started_at > self.read_started_at
+        ):
+            self.read_started_at = self.batch_read_started_at
+        self.batch_read_started_at = None
+
+
+def submissions_since(
+    source: Callable[[], Sequence[InterceptedSubmission]], started_at: float
+) -> Callable[[], tuple[InterceptedSubmission, ...]]:
+    """`source` without the submissions whose response reached the page before `started_at` (an earlier block's),
+    except within the render margin: the page may still have been rendering one, so the read-start check decides."""
+    cutoff = started_at - SUBMISSION_RENDER_MARGIN_SECONDS
+
+    def read() -> tuple[InterceptedSubmission, ...]:
+        return tuple(r for r in source() if r.effect_at is None or r.effect_at >= cutoff)
+
+    return read
 
 
 def _names_submit_control(tool_name: str, args: dict[str, Any], ok: bool, data: dict[str, Any]) -> str | None:
@@ -2644,6 +2684,7 @@ def make_finish_tool(
     terminate_premise: TerminatePremiseCheck | None = None,
     download_facts: DownloadFailureFacts | None = None,
     error_code_mapping: dict[str, str] | None = None,
+    intercepted_submissions: Callable[[], Sequence[InterceptedSubmission]] | None = None,
 ) -> ToolSpec:
     """`page_fingerprint` samples an opaque fingerprint of the page's rendered content (None when no
     page is available). A finish(completed) is deferred (bounded by `max_settle_deferrals`, then
@@ -2664,8 +2705,8 @@ def make_finish_tool(
     run is still awaiting a sign-in link it has unspent polling budget for -- a give-up at one 120s slice of
     a 15-minute budget throws away minutes of waiting the run already owns. The hold is bounded by
     the callee (the budget shrinks under every productive hold) and refused here without the deadline
-    headroom to fund the blocking poll slice it asks for. Apart from that gate, terminated is
-    ungated on both sides.
+    headroom to fund the blocking poll slice it asks for. Apart from that gate and the submission hold
+    below, terminated is ungated on both sides.
 
     `pending_marker` reports the text the page still shows the control in `submit_watch` as in
     flight with, or None. A settled page is not a submitted one -- a submit frozen mid-flight is
@@ -2689,13 +2730,73 @@ def make_finish_tool(
     `unseen_text` holds a completed verdict, on its own budget, while the page shows text no result the model read
     carried, or a result in the finish's own batch carried page text or download lines.
 
-    `terminate_premise` checks every terminated finish past the holds above, alongside any re-ask, and changes nothing."""
+    `terminate_premise` checks every terminated finish past the holds above, alongside any re-ask, and changes nothing.
+
+    `intercepted_submissions` lists the submissions a page-level interceptor held this block. A failed or terminated
+    verdict is held once per submission whose response reached the page after the newest read the model received
+    started: the verdict may describe the page before the response. One still held is waited on first (bounded) and,
+    if still held, holds once on the wait; when it is released later its response can hold once more. The hold asks
+    for a re-observe and never implies the response was an acceptance."""
     error_code_mapping = _offered_error_codes(error_code_mapping)
     deferrals = 0
     stale_holds = 0
     failure_deferrals = 0
     premise_checks = 0
     reask_asked = False
+    submission_holds: set[int] = set()
+    # Held while the interceptor still held them: the hold spent waiting on the request, not on its response, so a
+    # response released later is held for once more; while still held they are neither waited on nor held again.
+    submission_held_pending: set[int] = set()
+    submission_would_holds: set[int] = set()
+    # The turn a submission hold fired in and its message: a later finish in that batch has not received it either.
+    submission_hold_turn: int | None = None
+    submission_hold_message = ""
+
+    def _read_submissions() -> list[InterceptedSubmission]:
+        assert intercepted_submissions is not None
+        try:
+            return list(intercepted_submissions())
+        except Exception:
+            LOG.warning("taskv3 intercepted submissions could not be read", exc_info=True)
+            return []
+
+    def _unseen_submissions(records: list[InterceptedSubmission]) -> list[InterceptedSubmission]:
+        read_started_at = activity.read_started_at if activity is not None else None
+        return [
+            record
+            for record in records
+            if record.record_id not in submission_holds
+            and not (record.record_id in submission_held_pending and record.outcome is SubmissionOutcome.HELD)
+            and (
+                record.effect_at is None
+                or read_started_at is None
+                or read_started_at < record.effect_at + SUBMISSION_RENDER_MARGIN_SECONDS
+            )
+        ]
+
+    async def _released_submissions() -> list[InterceptedSubmission]:
+        """The records once no unheld-before one is still held, waiting at most SUBMISSION_HELD_WAIT_MAX_SECONDS."""
+        records = _read_submissions()
+        cap_at = time.monotonic() + SUBMISSION_HELD_WAIT_MAX_SECONDS
+        while any(
+            r.outcome is SubmissionOutcome.HELD
+            and r.record_id not in submission_holds
+            and r.record_id not in submission_held_pending
+            for r in records
+        ):
+            wait = min(SUBMISSION_HELD_POLL_SECONDS, cap_at - time.monotonic())
+            if deadline_at is not None:
+                wait = min(wait, deadline_at - time.monotonic())
+            if wait <= 0:
+                break
+            await asyncio.sleep(wait)
+            try:
+                if should_cancel is not None and await should_cancel():
+                    break
+            except Exception:
+                break
+            records = _read_submissions()
+        return records
 
     async def _bounded_fingerprint() -> str | None:
         """page_fingerprint(), timed out against whatever is left of the run's deadline instead of
@@ -2872,6 +2973,7 @@ def make_finish_tool(
 
     async def handler(args: dict[str, Any]) -> ToolResult:
         nonlocal deferrals, stale_holds, failure_deferrals, reask_asked, premise_checks
+        nonlocal submission_hold_turn, submission_hold_message
         status = args.get("status")
         if status not in ("completed", "failed", "terminated"):
             return ToolResult.error(
@@ -3027,6 +3129,63 @@ def make_finish_tool(
                 if not gate_passed:
                     LOG.info("taskv3 completed verdict refused by the completion gate")
                     return ToolResult.error(COMPLETION_GATE_REFUSAL)
+        if status in ("failed", "terminated") and intercepted_submissions is not None and activity is not None:
+            if submission_hold_turn == activity.turn:
+                return ToolResult.error(submission_hold_message)
+            unseen = _unseen_submissions(_read_submissions())
+            can_hold = bool(unseen) and _has_hold_headroom(activity, deadline_at)
+            if can_hold:
+                unseen = _unseen_submissions(await _released_submissions())
+                # The wait spent deadline, so the hold must still have the headroom it asks the model to spend.
+                can_hold = bool(unseen) and _has_hold_headroom(activity, deadline_at)
+            if unseen and not can_hold:
+                new = [r.record_id for r in unseen if r.record_id not in submission_would_holds]
+                if new:
+                    submission_would_holds.update(new)
+                    LOG.info(
+                        "taskv3 finish would hold on an unseen submission response",
+                        status=status,
+                        record_ids=new,
+                        turn=activity.turn,
+                    )
+            elif unseen:
+                for r in unseen:
+                    if r.outcome is SubmissionOutcome.HELD:
+                        submission_held_pending.add(r.record_id)
+                    else:
+                        submission_holds.add(r.record_id)
+                if status == "failed":
+                    # The failure-evidence hold below asks for the same re-observe; one is enough.
+                    failure_deferrals = max_failure_deferrals
+                now = time.monotonic()
+                LOG.info(
+                    "taskv3 finish held on an unseen submission response",
+                    status=status,
+                    record_ids=[r.record_id for r in unseen],
+                    outcomes=[str(r.outcome) for r in unseen],
+                    seconds_since_response=[
+                        None if r.effect_at is None else round(now - r.effect_at, 2) for r in unseen
+                    ],
+                    read_age_seconds=None
+                    if activity.read_started_at is None
+                    else round(now - activity.read_started_at, 2),
+                    turn=activity.turn,
+                )
+                still_held = any(r.outcome is SubmissionOutcome.HELD for r in unseen)
+                submission_hold_turn = activity.turn
+                submission_hold_message = (
+                    "verdict held once: a form submission on this page "
+                    + (
+                        "is still waiting for the site's response"
+                        if still_held
+                        else "got the site's response after your last look at the page"
+                    )
+                    + ", so the page may no longer show what this verdict describes. That response is not by "
+                    "itself a confirmation or a rejection. Re-observe the page (waiting briefly first if it may "
+                    "still be processing) and finish on what it shows now: status=completed only on a positive "
+                    "confirmation of the goal; otherwise finish again with your verdict and it will stand."
+                )
+                return ToolResult.error(submission_hold_message)
         if (
             status == "failed"
             and activity is not None
@@ -4175,6 +4334,7 @@ async def run_agent_tool_loop(
                 activity.final_turn_active = True
         st.turns += 1
         if activity is not None:
+            activity.deliver_batch_reads()
             activity.turn = st.turns
             activity.turns_remaining = st.max_turns - st.turns
             activity.tool_calls_remaining = st.max_tool_calls - st.total_tool_calls
@@ -4867,6 +5027,7 @@ async def run_agent_tool_loop(
             _CLICK_DISPATCHED.set(False)
             _ENTRY_RECORD.set(None)
             _TEXT_DELTA.set(None)
+            _TEXT_DELTA_SHOWN_FRESH.set(0)
             _TOOL_CALL_SEQ.set(st.total_tool_calls)
             dispatch_ctx = skyvern_context.current()
             runtime_secrets_before = len(dispatch_ctx.runtime_secret_values) if dispatch_ctx is not None else 0
@@ -4910,6 +5071,17 @@ async def run_agent_tool_loop(
             tool_duration_seconds = time.monotonic() - tool_started_at
             st.tool_seconds += tool_duration_seconds
             news_at = (result.data or {}).get("delta_at")
+            # A delta can show only lines an earlier read held back (flushed after this call's read failed, or filling the
+            # char budget ahead of this call's own lines): that is the page from before this call, so it counts as a
+            # fresh read only if the result showed at least one line this call's own read found.
+            fresh_delta = type(news_at) is int and _TEXT_DELTA_SHOWN_FRESH.get() > 0
+            if (
+                activity is not None
+                and spec is not None
+                and result.status == "ok"
+                and (spec.compactable or fresh_delta)
+            ):
+                activity.record_read(tool_started_at)
             if unseen_text is not None and result.status == "ok" and type(news_at) is int:
                 news_end = (result.data or {}).get("delta_end")
                 end = news_end if type(news_end) is int and news_at <= news_end else len(result.content)
