@@ -1039,6 +1039,98 @@ async def test_wait_for_in_flight_downloads_completes_normally_when_should_cance
 
 
 @pytest.mark.asyncio
+async def test_native_probe_does_not_delay_user_cancellation_or_outlive_wait(tmp_path) -> None:
+    residual = tmp_path / "unfinished.crdownload"
+    residual.write_bytes(b"partial")
+    probe_started = asyncio.Event()
+    probe_reaped = asyncio.Event()
+
+    async def stalled_probe() -> bool:
+        probe_started.set()
+        try:
+            await asyncio.Event().wait()
+        finally:
+            probe_reaped.set()
+        return False
+
+    async def should_cancel() -> bool:
+        return probe_started.is_set()
+
+    async with asyncio.timeout(4):
+        cancelled = await ForgeAgent()._wait_for_download_finished_cancellable(
+            downloading_files=[str(residual)],
+            timeout=30,
+            should_cancel=should_cancel,
+            native_failure_quiescent=stalled_probe,
+        )
+    assert cancelled and probe_reaped.is_set()
+    assert residual.read_bytes() == b"partial"
+
+
+@pytest.mark.asyncio
+async def test_an_already_quiescent_native_failure_does_not_wait_a_poll(tmp_path) -> None:
+    residual = tmp_path / "unfinished.crdownload"
+    residual.write_bytes(b"partial")
+    async with asyncio.timeout(0.5):
+        cancelled = await ForgeAgent()._wait_for_download_finished_cancellable(
+            downloading_files=[str(residual)],
+            timeout=30,
+            should_cancel=None,
+            native_failure_quiescent=AsyncMock(return_value=True),
+        )
+    assert cancelled is False
+    assert residual.read_bytes() == b"partial"
+
+
+@pytest.mark.asyncio
+async def test_unknown_native_liveness_preserves_timeout_cap_and_exhausted(tmp_path) -> None:
+    residual = tmp_path / "unfinished.crdownload"
+    residual.write_bytes(b"partial")
+    task = _make_task()
+    exhausted: set[str] = set()
+    with (
+        patch("skyvern.forge.agent.get_path_for_workflow_download_directory", return_value=tmp_path),
+        patch("skyvern.forge.agent.skyvern_context.current", return_value=None),
+    ):
+        async with asyncio.timeout(3):
+            result = await ForgeAgent()._wait_for_in_flight_downloads(
+                task,
+                SimpleNamespace(download_timeout=30),
+                task.organization_id,
+                timeout_cap=1.2,
+                exhausted=exhausted,
+                native_failure_quiescent=AsyncMock(return_value=False),
+            )
+    assert result is False and exhausted == {str(residual)}
+    assert residual.read_bytes() == b"partial"
+
+
+@pytest.mark.asyncio
+async def test_native_probe_error_still_reaps_the_file_wait(tmp_path) -> None:
+    residual = tmp_path / "unfinished.crdownload"
+    residual.write_bytes(b"partial")
+    reaped = asyncio.Event()
+
+    async def file_wait(**kwargs):
+        try:
+            await asyncio.Event().wait()
+        finally:
+            reaped.set()
+
+    with patch("skyvern.forge.agent.wait_for_download_finished", file_wait):
+        async with asyncio.timeout(4):
+            with pytest.raises(RuntimeError, match="probe unavailable"):
+                await ForgeAgent()._wait_for_download_finished_cancellable(
+                    downloading_files=[str(residual)],
+                    timeout=30,
+                    should_cancel=None,
+                    native_failure_quiescent=AsyncMock(side_effect=RuntimeError("probe unavailable")),
+                )
+    assert reaped.is_set()
+    assert residual.exists()
+
+
+@pytest.mark.asyncio
 async def test_finalize_skips_session_copy_whose_bytes_already_in_run_dir(tmp_path) -> None:
     # A persistent-session blob: download lands in BOTH the session downloads dir and the run dir
     # (the eager blob carve-out). Finalization must not materialize a second physical copy of
