@@ -4632,7 +4632,7 @@ class ForgeAgent:
             await self.fail_task(
                 task,
                 step,
-                "The browser Skyvern was driving stopped responding to its commands and did not recover. This is a fault in the browser itself rather than in the website, so retrying the run should get a healthy one.",
+                "The browser stopped responding to Skyvern's commands and did not recover. Retrying in that browser will likely fail the same way. A new run gets a fresh browser, unless it uses an existing session or connects to your own browser.",
                 browser_state,
                 exception=e,
             )
