@@ -14,12 +14,15 @@ from unittest.mock import AsyncMock
 
 import pytest
 import structlog
+import tldextract
+import tldextract.tldextract
 from _pytest.monkeypatch import NOTSET, derive_importpath
 from structlog._config import BoundLoggerLazyProxy
 
 from skyvern.cli.core import action_log
 from skyvern.config import settings
 from skyvern.forge import app, forge_app_initializer, request_logging
+from skyvern.forge.sdk import credential_site_policy
 from skyvern.forge.sdk.core import organization_age_cache
 from skyvern.forge.sdk.experimentation.code_block_ai_fallback import CODE_BLOCK_AI_FALLBACK_FLAG
 from skyvern.forge.sdk.experimentation.providers import NoOpExperimentationProvider
@@ -83,6 +86,23 @@ def _configure_logging_once_per_process() -> None:
     hooks = (sys.excepthook, threading.excepthook, sys.unraisablehook)
     setup_logger()
     sys.excepthook, threading.excepthook, sys.unraisablehook = hooks
+
+
+def _offline_twin(extractor: tldextract.TLDExtract) -> tldextract.TLDExtract:
+    return tldextract.TLDExtract(
+        include_psl_private_domains=extractor.include_psl_private_domains, suffix_list_urls=(), cache_dir=None
+    )
+
+
+@pytest.fixture(autouse=True, scope="session")
+def _bundled_public_suffix_list() -> Iterator[None]:
+    """An extractor downloads the public suffix list on its first call, with no timeout; tests read tldextract's
+    bundled snapshot instead, without the disk cache."""
+    with pytest.MonkeyPatch.context() as mp:
+        mp.setattr(credential_site_policy, "_SITE_EXTRACT", _offline_twin(credential_site_policy._SITE_EXTRACT))
+        # tldextract.extract() resolves through this module-level default.
+        mp.setattr(tldextract.tldextract, "TLD_EXTRACTOR", _offline_twin(tldextract.tldextract.TLD_EXTRACTOR))
+        yield
 
 
 @pytest.fixture(autouse=True)
