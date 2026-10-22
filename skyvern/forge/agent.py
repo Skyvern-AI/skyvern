@@ -3964,6 +3964,11 @@ class ForgeAgent:
         # than an inference from the task row, which cannot distinguish it from the unconditional
         # handlers that clean up on an already-final row too.
         cleanup_skipped_by_handler = False
+        # Set before the browser is acquired so a download the task's first navigation starts is covered too.
+        download_timeout_context = context
+        prev_download_timeout = download_timeout_context.download_timeout
+        if engine == RunEngine.skyvern_v3:
+            download_timeout_context.download_timeout = task.download_timeout
         try:
             if download_baseline_files is None and task.workflow_run_id:
                 list_files_before = list_files_in_directory(
@@ -4757,6 +4762,7 @@ class ForgeAgent:
                 context.task_id = None
                 context.navigation_goal = None
                 context.navigation_payload = None
+                download_timeout_context.download_timeout = prev_download_timeout
 
     @staticmethod
     def _latest_download_failure_status(steps: list[Step]) -> int | None:

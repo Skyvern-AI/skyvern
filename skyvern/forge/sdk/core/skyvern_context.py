@@ -711,6 +711,9 @@ class SkyvernContext:
     navigation_payload: dict[str, Any] | list | str | None = None
     complete_criterion_is_untrusted: bool = False
     download_suffix: str | None = None
+    # Explicit download_timeout of the Task V3 block or task now running; the browser download listener
+    # reads it when a download starts, so it also covers the initial navigation and a relaunched browser.
+    download_timeout: float | None = None
     # Keep source names with exact CDP targets; finalization must not infer provenance from affixes.
     download_suffix_applied_files: dict[str, tuple[str, str]] = field(default_factory=dict, repr=False)
     totp_codes: dict[str, str | None] = field(default_factory=dict)

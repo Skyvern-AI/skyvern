@@ -69,9 +69,11 @@ def _login_timeout_seconds(timeout: int) -> int:
     return max(timeout, settings.BITWARDEN_LOGIN_TIMEOUT_SECONDS)
 
 
-def _attempt_deadline_seconds(timeout: int) -> int:
-    """One attempt is a login plus the reads behind it, so it gets both budgets rather than twice one."""
-    return _login_timeout_seconds(timeout) + timeout
+def _attempt_deadline_seconds(timeout: int, identity: "_VaultIdentity") -> int:
+    """One attempt is a cold session plus the reads behind it. An API-key session pays a cold unlock on
+    top of its login, so it gets a second cold budget; an email login prints a key it can unlock with."""
+    cold = _login_timeout_seconds(timeout)
+    return cold + timeout if identity.uses_email_auth else 2 * cold + timeout
 
 
 # The CLI keeps its login state, tokens and encrypted vault copy in one data directory. Pointing each
@@ -814,8 +816,11 @@ class BitwardenService:
         if identity.uses_email_auth and trust_login_key and login_key:
             session.session_key = login_key
         else:
+            # Under a batch the cold unlock after an API-key login runs as long as the login itself, so it
+            # gets the login's budget. An email fallback unlock keeps the read budget.
+            unlock_timeout = timeout if identity.uses_email_auth else login_timeout or timeout
             session.session_key = await BitwardenService.unlock(
-                identity.master_password, timeout=timeout, appdata_dir=session.appdata_dir
+                identity.master_password, timeout=unlock_timeout, appdata_dir=session.appdata_dir
             )
         if verify_sync:
             # The sync inside `bw login` swallows its own failure; `bw sync` reports one.
@@ -1147,12 +1152,15 @@ class BitwardenService:
 
         await BitwardenService._apply_jitter()
         login_timeout = _login_timeout_seconds(timeout)
+        attempt_deadline = _attempt_deadline_seconds(
+            timeout, _VaultIdentity.resolve(client_id, client_secret, email, master_password)
+        )
         for attempt in range(max_retries):
             try:
-                # A cold login gets `login_timeout` and every other CLI command gets `timeout`; the attempt
-                # as a whole gets both, so one slow step cannot consume the other's budget and a dead vault
-                # still fails in bounded time.
-                async with asyncio.timeout(_attempt_deadline_seconds(timeout)):
+                # A cold login (and an API-key unlock) gets `login_timeout` and every other CLI command gets
+                # `timeout`; the attempt as a whole gets all of them, so one slow step cannot consume
+                # another's budget and a dead vault still fails in bounded time.
+                async with asyncio.timeout(attempt_deadline):
                     return await BitwardenService._get_secret_value_from_url(
                         client_id=client_id,
                         client_secret=client_secret,
@@ -1356,7 +1364,8 @@ class BitwardenService:
         if not fail_reasons:
             await BitwardenService._apply_jitter()
         try:
-            async with asyncio.timeout(_attempt_deadline_seconds(timeout)):
+            vault_identity = _VaultIdentity.resolve(client_id, client_secret, email, master_password)
+            async with asyncio.timeout(_attempt_deadline_seconds(timeout, vault_identity)):
                 return await BitwardenService._get_sensitive_information_from_identity(
                     client_id=client_id,
                     client_secret=client_secret,
@@ -1672,7 +1681,9 @@ class BitwardenService:
         if not fail_reasons:
             await BitwardenService._apply_jitter()
         try:
-            async with asyncio.timeout(_attempt_deadline_seconds(settings.BITWARDEN_TIMEOUT_SECONDS)):
+            timeout = settings.BITWARDEN_TIMEOUT_SECONDS
+            vault_identity = _VaultIdentity.resolve(client_id, client_secret, email, master_password)
+            async with asyncio.timeout(_attempt_deadline_seconds(timeout, vault_identity)):
                 return await BitwardenService._get_credit_card_data(
                     client_id=client_id,
                     client_secret=client_secret,
@@ -1682,7 +1693,8 @@ class BitwardenService:
                     collection_id=collection_id,
                     item_id=item_id,
                     email=email,
-                    login_timeout=_login_timeout_seconds(settings.BITWARDEN_TIMEOUT_SECONDS),
+                    timeout=timeout,
+                    login_timeout=_login_timeout_seconds(timeout),
                 )
         except BitwardenAccessDeniedError as e:
             raise e
