@@ -101,7 +101,6 @@ from skyvern.exceptions import (
     SkyvernException,
     SkyvernHTTPException,
     SkyvernPageAnalysisTimeout,
-    UnresolvableHost,
 )
 from skyvern.experimentation.wait_utils import get_or_create_wait_config, get_wait_time
 from skyvern.forge import app
@@ -12085,10 +12084,6 @@ def _get_click_count(action: ClickAction | UploadFileAction) -> int:
     return 1
 
 
-def _is_policy_blocked_host(error: Exception) -> bool:
-    return isinstance(error, BlockedHost) and not isinstance(error, UnresolvableHost)
-
-
 async def _locator_click(
     locator: Locator,
     click_count: int,
@@ -12196,9 +12191,8 @@ async def chain_click(
             action_results = [ActionSuccess()]
             return action_results
 
-        # The browser resolves through the run proxy and may reach hosts the worker cannot;
-        # worker resolution failure is not a policy signal.
-        if _is_policy_blocked_host(e):
+        # A refused or unresolvable href cannot be made safe by dispatching a click fallback.
+        if isinstance(e, BlockedHost):
             action_results = [ActionFailure(FailToClick(action.element_id, msg=str(e)))]
             return action_results
 
@@ -12354,9 +12348,8 @@ async def chain_click(
                     try:
                         navigated_href = await skyvern_element.try_navigate_via_href(page=page)
                     except BlockedHost as e:
-                        if _is_policy_blocked_host(e):
-                            action_results = [ActionFailure(FailToClick(action.element_id, msg=str(e)))]
-                            return action_results
+                        action_results = [ActionFailure(FailToClick(action.element_id, msg=str(e)))]
+                        return action_results
                     else:
                         if navigated_href:
                             LOG.info(
