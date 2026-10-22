@@ -215,6 +215,7 @@ from skyvern.forge.taskv3.loop import (
     DownloadWait,
     LoopOutcome,
     RoundAction,
+    submissions_across_contexts,
 )
 from skyvern.forge.taskv3.pre_submit_capture import PreSubmitCaptureRing, is_run_sampled, pre_submit_screenshot
 from skyvern.forge.taskv3.provider_downloads import (
@@ -3260,9 +3261,10 @@ class ForgeAgent:
 
             outcome = await run_task_v3_agent_loop(
                 page_provider=_page_provider,
-                # Read through browser_state each time: a recovered browser brings a new context.
-                intercepted_submissions=lambda: app.AGENT_FUNCTION.task_v3_intercepted_submissions(
-                    browser_state.browser_context
+                # Read through browser_state each time: a recovered browser brings a new context, and the old
+                # one's submissions still count.
+                intercepted_submissions=submissions_across_contexts(
+                    app.AGENT_FUNCTION.task_v3_intercepted_submissions, lambda: browser_state.browser_context
                 ),
                 resolve_typed_text=resolve_typed_text,
                 credential_release_guard=release_guard,

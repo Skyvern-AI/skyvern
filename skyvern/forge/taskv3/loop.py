@@ -15,6 +15,7 @@ core can be unit-tested with scripted fakes.
 from __future__ import annotations
 
 import asyncio
+import dataclasses
 import hashlib
 import json
 import re
@@ -1713,6 +1714,10 @@ class ActivityRecency:
     # after it showing the old page); this batch's reads wait in `batch_read_started_at` until the next model turn.
     read_started_at: float | None = None
     batch_read_started_at: float | None = None
+    # Page reloads a page-level handler may still request before the run ends on the refresh cap.
+    refresh_cycles_remaining: int | None = None
+    # time.monotonic() at the dispatch of the newest submit-shaped action (`_may_submit`), whatever its result.
+    last_submit_attempt_at: float | None = None
     # State at the FIRST failed/terminated finish past the failure-evidence gate, emitted once per run
     # by the engine's summary line. Not the run's first verdict: a zero-action `completed` refused by a
     # gate above reaches this point later as failed/terminated.
@@ -1747,6 +1752,32 @@ def submissions_since(
         return tuple(r for r in source() if r.effect_at is None or r.effect_at >= cutoff)
 
     return read
+
+
+def submissions_across_contexts(
+    read: Callable[[Any], Sequence[InterceptedSubmission]], current_context: Callable[[], Any]
+) -> Callable[[], tuple[InterceptedSubmission, ...]]:
+    """Records from every browser context the run has read, oldest first, so a recovered browser cannot hide a
+    submission made in the one it replaced. Ids are renumbered per (context, id), since a reader may restart them."""
+    contexts: list[Any] = []
+    ids: dict[tuple[int, int], int] = {}
+
+    def track() -> None:
+        context = current_context()
+        if context is not None and not any(seen is context for seen in contexts):
+            contexts.append(context)
+
+    def records() -> tuple[InterceptedSubmission, ...]:
+        track()
+        out = []
+        for index, context in enumerate(contexts):
+            for record in read(context):
+                record_id = ids.setdefault((index, record.record_id), len(ids) + 1)
+                out.append(dataclasses.replace(record, record_id=record_id))
+        return tuple(out)
+
+    track()
+    return records
 
 
 def _names_submit_control(tool_name: str, args: dict[str, Any], ok: bool, data: dict[str, Any]) -> str | None:
@@ -2736,7 +2767,10 @@ def make_finish_tool(
     verdict is held once per submission whose response reached the page after the newest read the model received
     started: the verdict may describe the page before the response. One still held is waited on first (bounded) and,
     if still held, holds once on the wait; when it is released later its response can hold once more. The hold asks
-    for a re-observe and never implies the response was an acceptance."""
+    for a re-observe and never implies the response was an acceptance. When the only submission the
+    interceptor saw is the site's typed machine rejection, and no submit-shaped action followed the one that sent it,
+    a failed or terminated verdict is held once more, funded like the give-up hold, so the one retry the prompt
+    permits is not left unused; any other record or later submit-shaped action ends that."""
     error_code_mapping = _offered_error_codes(error_code_mapping)
     deferrals = 0
     stale_holds = 0
@@ -2751,6 +2785,15 @@ def make_finish_tool(
     # The turn a submission hold fired in and its message: a later finish in that batch has not received it either.
     submission_hold_turn: int | None = None
     submission_hold_message = ""
+    retry_offered = False
+    retry_would_offer = False
+    # What the retry hold was granted on; a submit later in its batch spends it, so a later finish there must not
+    # repeat the permission.
+    retry_granted_on: tuple[tuple[tuple[int, SubmissionOutcome], ...], float | None] | None = None
+
+    def _submission_state() -> tuple[tuple[tuple[int, SubmissionOutcome], ...], float | None]:
+        records = tuple((r.record_id, r.outcome) for r in _read_submissions())
+        return records, activity.last_submit_attempt_at if activity is not None else None
 
     def _read_submissions() -> list[InterceptedSubmission]:
         assert intercepted_submissions is not None
@@ -2974,6 +3017,7 @@ def make_finish_tool(
     async def handler(args: dict[str, Any]) -> ToolResult:
         nonlocal deferrals, stale_holds, failure_deferrals, reask_asked, premise_checks
         nonlocal submission_hold_turn, submission_hold_message
+        nonlocal retry_offered, retry_would_offer, retry_granted_on
         status = args.get("status")
         if status not in ("completed", "failed", "terminated"):
             return ToolResult.error(
@@ -3131,6 +3175,11 @@ def make_finish_tool(
                     return ToolResult.error(COMPLETION_GATE_REFUSAL)
         if status in ("failed", "terminated") and intercepted_submissions is not None and activity is not None:
             if submission_hold_turn == activity.turn:
+                if retry_granted_on is not None and _submission_state() != retry_granted_on:
+                    return ToolResult.error(
+                        "verdict held: a submission was made after the retry offer in this same batch, so that "
+                        "offer is spent. Do not submit again; re-observe the page and finish on what it shows."
+                    )
                 return ToolResult.error(submission_hold_message)
             unseen = _unseen_submissions(_read_submissions())
             can_hold = bool(unseen) and _has_hold_headroom(activity, deadline_at)
@@ -3173,6 +3222,8 @@ def make_finish_tool(
                 )
                 still_held = any(r.outcome is SubmissionOutcome.HELD for r in unseen)
                 submission_hold_turn = activity.turn
+                # A plain hold, not the retry offer: a later finish in this batch gets it unchanged.
+                retry_granted_on = None
                 submission_hold_message = (
                     "verdict held once: a form submission on this page "
                     + (
@@ -3186,6 +3237,54 @@ def make_finish_tool(
                     "confirmation of the goal; otherwise finish again with your verdict and it will stand."
                 )
                 return ToolResult.error(submission_hold_message)
+        if status in ("failed", "terminated") and intercepted_submissions is not None and activity is not None:
+            records = _read_submissions()
+            rejection = (
+                records[0] if len(records) == 1 and records[0].outcome is SubmissionOutcome.REJECTED_BY_SITE else None
+            )
+            # The ledger can miss a submit (another op, a frameless request), so the loop's own trail must agree that
+            # the rejected request came from this block's latest submit-shaped action.
+            if rejection is not None and (
+                activity.last_submit_attempt_at is None or activity.last_submit_attempt_at > rejection.started_at
+            ):
+                rejection = None
+            if rejection is not None and not retry_offered:
+                can_retry = (
+                    _has_hold_headroom(
+                        activity,
+                        deadline_at,
+                        min_deadline_headroom_seconds=VERIFICATION_GIVEUP_MIN_DEADLINE_HEADROOM_SECONDS,
+                    )
+                    and (activity.action_steps_remaining is None or activity.action_steps_remaining > 0)
+                    and (activity.refresh_cycles_remaining is None or activity.refresh_cycles_remaining > 0)
+                )
+                if not can_retry:
+                    if not retry_would_offer:
+                        retry_would_offer = True
+                        LOG.info(
+                            "taskv3 finish would hold for the permitted retry of a typed site rejection",
+                            status=status,
+                            site_error_type=rejection.site_error_type,
+                            turn=activity.turn,
+                        )
+                else:
+                    retry_offered = True
+                    if status == "failed":
+                        failure_deferrals = max_failure_deferrals
+                    LOG.info(
+                        "taskv3 finish held for the permitted retry of a typed site rejection",
+                        status=status,
+                        site_error_type=rejection.site_error_type,
+                        turn=activity.turn,
+                    )
+                    submission_hold_turn = activity.turn
+                    retry_granted_on = _submission_state()
+                    submission_hold_message = (
+                        "verdict held once: the only submission the page-level interceptor saw this block got the "
+                        f"site's own machine-typed rejection ({rejection.site_error_type}). Finish again with the "
+                        "verdict you decide on and it will stand."
+                    )
+                    return ToolResult.error(submission_hold_message)
         if (
             status == "failed"
             and activity is not None
@@ -3832,6 +3931,8 @@ async def run_agent_tool_loop(
         """Clear the page-refresh signal and, unless dropped or past the cap, reload and void `remaining`."""
         ctx.refresh_working_page = False
         st.refresh_cycles += 1
+        if activity is not None:
+            activity.refresh_cycles_remaining = max_refresh_cycles - st.refresh_cycles
         if drop:
             LOG.info("taskv3 loop refresh signal dropped", tool=tool_name, turn=st.turns)
             return False
@@ -4335,6 +4436,7 @@ async def run_agent_tool_loop(
         st.turns += 1
         if activity is not None:
             activity.deliver_batch_reads()
+            activity.refresh_cycles_remaining = max_refresh_cycles - st.refresh_cycles
             activity.turn = st.turns
             activity.turns_remaining = st.max_turns - st.turns
             activity.tool_calls_remaining = st.max_tool_calls - st.total_tool_calls
@@ -5542,6 +5644,8 @@ async def run_agent_tool_loop(
                         st.block_action_transitioned = True
                 if activity is not None and _arms_failure_evidence(tool_name, args, result.status == "ok"):
                     activity.last_trigger_turn = st.turns
+                if activity is not None and _may_submit(tool_name, args):
+                    activity.last_submit_attempt_at = tool_started_at
                 if submit_watch is not None:
                     submit_selector = _names_submit_control(tool_name, args, result.status == "ok", result_data)
                     if submit_selector is not None:
