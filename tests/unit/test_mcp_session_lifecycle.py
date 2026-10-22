@@ -2196,7 +2196,9 @@ async def test_session_close_without_id_closes_cloud_session_via_api_first(
     )
 
     fake_skyvern = MagicMock()
+    fake_skyvern.get_browser_session = AsyncMock(side_effect=RuntimeError("recording data unavailable"))
     monkeypatch.setattr(session_manager, "get_skyvern", lambda: fake_skyvern)
+    monkeypatch.setattr(mcp_session, "get_skyvern", lambda: fake_skyvern)
 
     async def _api_close(skyvern: object, session_id: str) -> SessionCloseResult:
         call_order.append("api_close")
@@ -2236,7 +2238,9 @@ async def test_session_close_without_id_is_best_effort_when_api_close_fails(
     )
 
     fake_skyvern = MagicMock()
+    fake_skyvern.get_browser_session = AsyncMock(side_effect=RuntimeError("recording data unavailable"))
     monkeypatch.setattr(session_manager, "get_skyvern", lambda: fake_skyvern)
+    monkeypatch.setattr(mcp_session, "get_skyvern", lambda: fake_skyvern)
 
     do_session_close = AsyncMock(side_effect=ConnectionError("API close failed"))
     monkeypatch.setattr("skyvern.cli.core.session_ops.do_session_close", do_session_close)
