@@ -5264,6 +5264,11 @@ class ActionHandler:
                         attempt_started_at=false_click_attempt_started_at,
                     )
             action.finished_at = naive_utc_now()
+            # _handle_action stamped the status from the results it returned, but the download
+            # lifecycle above can still downgrade the terminal result (a settled false-click close
+            # here, a replaced result on the download path). Re-derive before the row is written so
+            # the persisted status can never disagree with the result the run reports.
+            action.status = _terminal_action_status(results)
             persisted_action = await app.DATABASE.workflow_params.create_action(
                 action=skyvern_context.action_for_multi_field_totp_persistence(
                     action, app.WORKFLOW_CONTEXT_MANAGER.get_one_time_codes_for_run(action.workflow_run_id)
@@ -6082,6 +6087,8 @@ class ActionHandler:
                     download_triggered=download_triggered,
                 )
                 results[-1].download_failure_status = preserved_download_failure_status
+            if "results" in locals() and results:
+                action.status = _terminal_action_status(results)
             persisted_action = await app.DATABASE.workflow_params.create_action(
                 action=skyvern_context.action_for_multi_field_totp_persistence(
                     action, app.WORKFLOW_CONTEXT_MANAGER.get_one_time_codes_for_run(action.workflow_run_id)

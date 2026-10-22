@@ -340,7 +340,7 @@ def _run_child(
         timer.start()
         watchdog.start()
         # A child that died before reading its request closes the pipe; reading its exit below reports that. Stdin
-        # stays open until the child's memory has been read, because the child waits for it to close before it exits.
+        # stays open for the ready acknowledgement and until the child's memory has been read.
         with contextlib.suppress(BrokenPipeError):
             stdin.write(struct.pack("<Q", len(request)) + request)
             stdin.flush()
@@ -349,6 +349,8 @@ def _run_child(
             loaded = _PlainDataUnpickler(reader).load()
             if isinstance(loaded, dict) and loaded.get("status") == "ready":
                 watchdog.learn(_checked_ready(loaded))
+                stdin.write(b"\x00")
+                stdin.flush()
                 # A new unpickler per message, because one unpickler numbers its memo across the messages it loads.
                 loaded = _PlainDataUnpickler(reader).load()
             outcome = _checked_outcome(loaded)
@@ -377,6 +379,7 @@ def _run_child(
 
     duration_seconds = round(time.monotonic() - started, 2)
     applied_allowance = outcome.get("allowance_bytes", allowance) if outcome is not None else allowance
+    memory_limit_exceeded = watchdog.growth_bytes is not None and watchdog.growth_bytes > watchdog.allowance_bytes
     memory_fields = {
         "rss_baseline_bytes": watchdog.baseline_bytes,
         "rss_peak_sampled_bytes": watchdog.peak_sampled_bytes,
@@ -384,7 +387,7 @@ def _run_child(
         "recheck_headroom_bytes": outcome.get("headroom_bytes") if outcome is not None else None,
         "recheck_headroom_source": outcome.get("headroom_source") if outcome is not None else None,
     }
-    if outcome is not None and outcome["status"] == "ok":
+    if outcome is not None and outcome["status"] == "ok" and not memory_limit_exceeded:
         LOG.info(
             "Capped subprocess finished",
             target=target,
@@ -400,6 +403,11 @@ def _run_child(
     if result_too_large or status == "result_too_large":
         kind = "result_too_large"
         message = f"returned more than the {_describe_bytes(max_result_bytes)} a result may hold"
+    elif watchdog.killed.is_set() or memory_limit_exceeded:
+        kind = "out_of_memory"
+        message = (
+            f"ran out of memory: it needed more than the {watchdog.allowance_bytes // (1024 * 1024)} MiB it may use"
+        )
     elif outcome is not None and status == "error":
         kind = "error"
         message = outcome["message"]
@@ -410,11 +418,6 @@ def _run_child(
     elif status == "no_headroom":
         kind = "no_headroom"
         message = _NO_HEADROOM_MESSAGE
-    elif watchdog.killed.is_set():
-        kind = "out_of_memory"
-        message = (
-            f"ran out of memory: it needed more than the {watchdog.allowance_bytes // (1024 * 1024)} MiB it may use"
-        )
     elif result_problem is not None:
         kind = "crashed"
         message = f"returned a result that {result_problem}"
