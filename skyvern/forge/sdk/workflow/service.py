@@ -358,6 +358,7 @@ from skyvern.schemas.workflows import (
     BlockResult,
     BlockStatus,
     BlockType,
+    CodeBlockFailureKind,
     CredentialParameterYAML,
     WorkflowCreateYAMLRequest,
     WorkflowDefinitionYAML,
@@ -10460,6 +10461,12 @@ class WorkflowService:
             block=block,
             block_result=block_result,
         )
+        # Omitted rather than logged as null: an unclassified failure is the field's absence.
+        failure_kind_fields: dict[str, CodeBlockFailureKind] = (
+            {"codeblock_failure_kind": block_result.codeblock_failure_kind}
+            if block_result.codeblock_failure_kind is not None
+            else {}
+        )
         # The resolver returns no target for ``continue_on_failure``. Keep the
         # status-specific early returns below so each case retains its useful log.
         if block_result.status == BlockStatus.failed:
@@ -10472,6 +10479,7 @@ class WorkflowService:
                 block_status=block_result.status,
                 block_type_var=block.block_type,
                 block_label=block.label,
+                **failure_kind_fields,
             )
             if block.continue_on_failure and getattr(block_result, "can_continue_after_failure", True):
                 LOG.warning(
@@ -10483,6 +10491,7 @@ class WorkflowService:
                     continue_on_failure=block.continue_on_failure,
                     block_type_var=block.block_type,
                     block_label=block.label,
+                    **failure_kind_fields,
                 )
                 return workflow_run, False
 
@@ -10495,6 +10504,7 @@ class WorkflowService:
                 block_status=block_result.status,
                 block_type_var=block.block_type,
                 block_label=block.label,
+                **failure_kind_fields,
             )
 
             if block.continue_on_failure and getattr(block_result, "can_continue_after_failure", True):
@@ -10507,6 +10517,7 @@ class WorkflowService:
                     continue_on_failure=block.continue_on_failure,
                     block_type_var=block.block_type,
                     block_label=block.label,
+                    **failure_kind_fields,
                 )
                 return workflow_run, False
 
@@ -10519,6 +10530,7 @@ class WorkflowService:
                 block_status=block_result.status,
                 block_type_var=block.block_type,
                 block_label=block.label,
+                **failure_kind_fields,
             )
 
             if block.continue_on_failure and getattr(block_result, "can_continue_after_failure", True):
@@ -10531,6 +10543,7 @@ class WorkflowService:
                     continue_on_failure=block.continue_on_failure,
                     block_type_var=block.block_type,
                     block_label=block.label,
+                    **failure_kind_fields,
                 )
                 return workflow_run, False
 

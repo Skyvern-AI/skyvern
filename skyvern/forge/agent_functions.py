@@ -84,7 +84,7 @@ from skyvern.forge.sdk.trace import traced
 from skyvern.forge.sdk.workflow.models.block import BaseTaskBlock, BlockTypeVar
 from skyvern.forge.sdk.workflow.retry_policy import WORKFLOW_WEBHOOK_HTTP_TIMEOUT_SECONDS
 from skyvern.schemas.run_enums import RunEngine, RunType
-from skyvern.schemas.workflows import BlockResult, FileStorageType, FileUploadDestination
+from skyvern.schemas.workflows import BlockResult, CodeBlockFailureKind, FileStorageType, FileUploadDestination
 from skyvern.services.otp_email import EmailOTPSearchError, EmailOTPVerificationContext, build_email_otp_sources
 from skyvern.services.workflow_run_group_service import schedule_advance_after_terminal
 from skyvern.utils.email_validation import normalize_identifier_if_email
@@ -317,6 +317,8 @@ class CodeBlockEngineFailure:
     # Bare native worker exception class for operation attribution, so secure events are comparable
     # to inline ones; distinct from the healing-facing exception_class above.
     native_exception_class: str | None = None
+    # Decided by the executor from the runner's typed code, so it survives when redaction empties the reason.
+    failure_kind: CodeBlockFailureKind | None = None
 
 
 DownloadClaimOutcome = Literal["returned_proven", "returned_unproven", "raised"]
