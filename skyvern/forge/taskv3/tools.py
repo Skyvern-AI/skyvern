@@ -14875,13 +14875,22 @@ def build_browser_tools(
                     section += "\n" + shown
                     if cut and since is not None:
                         _defer(page, [risen[i][0] for i in cut], prior, since)
+                    left_out = set(cut)
+                    # Rank 0 is a held line rising again: the page before this call, not this call's own read.
+                    shown_fresh = sum(1 for i, (_, rank) in enumerate(risen) if rank != 0 and i not in left_out)
+                else:
+                    shown_fresh = 0
                 if not section:
                     record_text_delta(time.monotonic() - started, 0)
                     return result
                 returned = sum(1 for _, rank in risen if rank == 0)
                 earlier = len(before) + held + returned - pending_held
                 record_text_delta(
-                    time.monotonic() - started, earlier + len(risen) - returned, len(section), pending=earlier
+                    time.monotonic() - started,
+                    earlier + len(risen) - returned,
+                    len(section),
+                    pending=earlier,
+                    shown_fresh=shown_fresh,
                 )
                 return _with_delta_section(result, section)
 

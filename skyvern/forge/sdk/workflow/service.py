@@ -51,6 +51,7 @@ from skyvern.constants import (
     GET_DOWNLOADED_FILES_TIMEOUT,
     SAVE_DOWNLOADED_FILES_TIMEOUT,
 )
+from skyvern.errors.errors import drop_unsolicited_download_errors
 from skyvern.exceptions import (
     BlockedHost,
     BlockNotFound,
@@ -15074,10 +15075,11 @@ class WorkflowService:
         attempt_rows: Sequence[Any] | None = None,
         attempt_number: int | None = None,
         historical_artifacts: list[Artifact] | None = None,
-    ) -> tuple[list[FileInfo], list[str] | None]:
+    ) -> tuple[list[FileInfo] | None, list[str] | None]:
         """Fetch downloaded files for a workflow run, including task_v2 files when present."""
-        downloaded_files: list[FileInfo] = []
+        downloaded_files: list[FileInfo] | None = None
         downloaded_file_urls: list[str] | None = None
+        workflow_run_downloaded_files: list[FileInfo] | None = None
         try:
             async with asyncio.timeout(GET_DOWNLOADED_FILES_TIMEOUT):
                 context = skyvern_context.current()
@@ -15106,6 +15108,9 @@ class WorkflowService:
                     attempt_number=attempt_number,
                     artifact_ids=artifact_ids,
                 )
+                workflow_run_downloaded_files = downloaded_files
+                if workflow_run_downloaded_files:
+                    downloaded_file_urls = [file_info.url for file_info in workflow_run_downloaded_files]
                 if task_v2:
                     task_v2_downloaded_files = await app.STORAGE.get_downloaded_files(
                         organization_id=workflow_run.organization_id,
@@ -15145,12 +15150,14 @@ class WorkflowService:
                 "Timeout to get downloaded files",
                 workflow_run_id=workflow_run.workflow_run_id,
             )
+            downloaded_files = workflow_run_downloaded_files or None
         except Exception:
             LOG.warning(
                 "Failed to get downloaded files",
                 exc_info=True,
                 workflow_run_id=workflow_run.workflow_run_id,
             )
+            downloaded_files = workflow_run_downloaded_files or None
         return downloaded_files, downloaded_file_urls
 
     async def build_workflow_run_status_response(
@@ -15400,6 +15407,8 @@ class WorkflowService:
             ),
             workflow_run_id=workflow_run_id,
         )
+        # After the merge so a code copied onto a block's error_codes is filtered too.
+        errors = drop_unsolicited_download_errors(errors, downloaded_files=downloaded_files)
 
         parameters_with_value = {wfp.key: wfrp.value for wfp, wfrp in workflow_parameter_tuples}
 

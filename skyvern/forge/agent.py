@@ -3260,6 +3260,10 @@ class ForgeAgent:
 
             outcome = await run_task_v3_agent_loop(
                 page_provider=_page_provider,
+                # Read through browser_state each time: a recovered browser brings a new context.
+                intercepted_submissions=lambda: app.AGENT_FUNCTION.task_v3_intercepted_submissions(
+                    browser_state.browser_context
+                ),
                 resolve_typed_text=resolve_typed_text,
                 credential_release_guard=release_guard,
                 resolve_totp_placeholder=verification_state.resolve_totp_placeholder,
