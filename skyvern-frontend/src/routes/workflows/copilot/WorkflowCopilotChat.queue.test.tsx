@@ -298,7 +298,7 @@ async function attachSpreadsheet(
   file = new File(["row_id,url\n"], filename),
 ) {
   const input = document.querySelector(
-    'input[accept*=".pdf"]',
+    'input[type="file"][accept*=".csv"]',
   ) as HTMLInputElement;
   if (!input) throw new Error("composer has no attachment input");
   await act(async () => {

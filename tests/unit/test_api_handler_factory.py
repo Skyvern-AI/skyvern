@@ -182,6 +182,7 @@ async def test_custom_llm_http_clients_do_not_follow_redirects(
 
 @pytest.mark.parametrize("request_error", [None, RuntimeError("provider failed")], ids=["success", "failure"])
 @pytest.mark.asyncio
+@pytest.mark.usefixtures("public_dns")
 async def test_custom_openrouter_client_is_scoped_to_request(
     monkeypatch: pytest.MonkeyPatch, request_error: Exception | None
 ) -> None:
@@ -344,6 +345,7 @@ async def test_hard_deadline_surfaces_as_retryable_from_the_public_call(monkeypa
 
 
 @pytest.mark.asyncio
+@pytest.mark.usefixtures("public_dns")
 async def test_hard_deadline_on_a_custom_openrouter_client_closes_it(monkeypatch: pytest.MonkeyPatch) -> None:
     async def _hang(**kwargs: Any) -> Any:
         await asyncio.sleep(60)
@@ -502,6 +504,7 @@ def _litellm_rate_limit_error() -> Exception:
     "make_rate_limit_error", [_openai_rate_limit_error, _litellm_rate_limit_error], ids=["openai", "litellm"]
 )
 @pytest.mark.asyncio
+@pytest.mark.usefixtures("public_dns")
 async def test_a_rate_limited_custom_client_call_is_retryable(
     monkeypatch: pytest.MonkeyPatch, make_rate_limit_error: Any
 ) -> None:

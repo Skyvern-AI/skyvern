@@ -24,6 +24,7 @@ import { toast } from "@/components/ui/use-toast";
 import { UserContext } from "@/store/UserContext";
 import { Link } from "react-router-dom";
 
+import { takeSopHandoffFile } from "@/routes/workflows/sopHandoff";
 import { PromptBox, type PromptBoxHandle } from "./PromptBox";
 import {
   PREWARM_DISPATCH_WAIT_TIMEOUT_MS,
@@ -202,6 +203,7 @@ function renderPromptBox(
   ref?: Ref<PromptBoxHandle>,
   minimal = false,
   handoffFlagLoading = false,
+  siblingBusy = false,
 ) {
   const queryClient = new QueryClient({
     defaultOptions: { queries: { retry: false }, mutations: { retry: false } },
@@ -219,6 +221,7 @@ function renderPromptBox(
           enableCopilotHandoff={enableCopilotHandoff}
           minimal={minimal}
           handoffFlagLoading={handoffFlagLoading}
+          siblingBusy={siblingBusy}
         />
       </QueryClientProvider>
     </UserContext.Provider>,
@@ -934,36 +937,120 @@ describe("PromptBox", () => {
     ]);
   });
 
-  test("drops only the example's sample resume when switching to an example without one", async () => {
+  test("drops the example's sample resume when switching to an example without one", async () => {
     vi.stubGlobal(
       "fetch",
       vi.fn(() =>
         Promise.resolve(new Response(new Blob(["%PDF"]), { status: 200 })),
       ),
     );
-    mockPost
-      .mockResolvedValueOnce({ data: { file_id: "file_user" } })
-      .mockResolvedValueOnce({ data: { file_id: "file_example" } });
+    mockPost.mockResolvedValueOnce({ data: { file_id: "file_example" } });
 
     renderPromptBox(true);
-    fireEvent.change(screen.getByLabelText("Upload document"), {
-      target: {
-        files: [
-          new File(["%PDF"], "sample-resume.pdf", { type: "application/pdf" }),
-        ],
-      },
-    });
-    await screen.findByText("sample-resume.pdf");
     fireEvent.click(screen.getByRole("button", { name: "Apply for a job" }));
-    await waitFor(() =>
-      expect(screen.getAllByText("sample-resume.pdf")).toHaveLength(2),
-    );
+    await screen.findByText("sample-resume.pdf");
 
     fireEvent.click(
       screen.getByRole("button", { name: "Add a product to cart" }),
     );
     await waitFor(() =>
-      expect(screen.getAllByText("sample-resume.pdf")).toHaveLength(1),
+      expect(screen.queryByText("sample-resume.pdf")).toBeNull(),
+    );
+  });
+
+  test("Upload an SOP creates a blank agent and hands the PDF to the editor once", async () => {
+    mockPost.mockResolvedValue({
+      data: {
+        workflow_permanent_id: "wpid_sop",
+        workflow_definition: { blocks: [] },
+      },
+    });
+    const pdf = new File(["%PDF"], "procedure.pdf", {
+      type: "application/pdf",
+    });
+
+    renderPromptBox(true);
+    expect(screen.queryByLabelText("Add files and more")).toBeNull();
+    fireEvent.change(screen.getByLabelText("Choose an SOP PDF"), {
+      target: { files: [pdf] },
+    });
+
+    await waitFor(() =>
+      expect(mockNavigate).toHaveBeenCalledWith(
+        "/agents/wpid_sop/studio?sop=1",
+      ),
+    );
+    expect(mockPost).toHaveBeenCalledTimes(1);
+    expect(mockPost.mock.calls[0]![0]).toBe("/workflows");
+    expect(mockPost.mock.calls[0]![1]).toContain("title: New Agent");
+    expect(takeSopHandoffFile("wpid_sop")).toBe(pdf);
+    expect(takeSopHandoffFile("wpid_sop")).toBeNull();
+    expect(mockPostHogCapture).toHaveBeenCalledWith(
+      "home.upload_sop_selected",
+      expect.any(Object),
+    );
+  });
+
+  test("rejects a non-PDF SOP without creating an agent", () => {
+    renderPromptBox(true);
+    fireEvent.change(screen.getByLabelText("Choose an SOP PDF"), {
+      target: {
+        files: [new File(["steps"], "procedure.txt", { type: "text/plain" })],
+      },
+    });
+
+    expect(toast).toHaveBeenCalledWith(
+      expect.objectContaining({ title: "Invalid file type" }),
+    );
+    expect(mockPost).not.toHaveBeenCalled();
+    expect(mockNavigate).not.toHaveBeenCalled();
+  });
+
+  test("start cards wait while the blank-canvas link is creating an agent", () => {
+    renderPromptBox(true, undefined, false, false, true);
+    expect(
+      (screen.getByLabelText("Upload an SOP") as HTMLButtonElement).disabled,
+    ).toBe(true);
+    expect(
+      (screen.getByLabelText("Demonstrate task") as HTMLButtonElement).disabled,
+    ).toBe(true);
+  });
+
+  test("rejects an oversized SOP before creating an agent", () => {
+    const big = new File(["%PDF"], "huge.pdf", { type: "application/pdf" });
+    Object.defineProperty(big, "size", { value: 31 * 1024 * 1024 });
+    renderPromptBox(true);
+    fireEvent.change(screen.getByLabelText("Choose an SOP PDF"), {
+      target: { files: [big] },
+    });
+
+    expect(toast).toHaveBeenCalledWith(
+      expect.objectContaining({ title: "File too large" }),
+    );
+    expect(mockPost).not.toHaveBeenCalled();
+    expect(mockNavigate).not.toHaveBeenCalled();
+  });
+
+  test("Demonstrate task creates a blank agent and opens the editor recording", async () => {
+    mockPost.mockResolvedValue({
+      data: {
+        workflow_permanent_id: "wpid_demo",
+        workflow_definition: { blocks: [] },
+      },
+    });
+
+    renderPromptBox(true);
+    fireEvent.click(screen.getByRole("button", { name: "Demonstrate task" }));
+
+    await waitFor(() =>
+      expect(mockNavigate).toHaveBeenCalledWith(
+        "/agents/wpid_demo/studio?record=1",
+      ),
+    );
+    expect(mockPost.mock.calls[0]![1]).toContain("title: Demonstrated Agent");
+    expect(mockPostHogCapture).toHaveBeenCalledWith(
+      "home.record_task_selected",
+      expect.any(Object),
     );
   });
 
