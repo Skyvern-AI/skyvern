@@ -18,6 +18,7 @@ from structlog.testing import capture_logs
 
 from skyvern.config import settings
 from skyvern.constants import BROWSER_DOWNLOAD_TIMEOUT, BROWSER_DOWNLOADING_SUFFIX
+from skyvern.errors.errors import UserDefinedError
 from skyvern.exceptions import BlockedHost
 from skyvern.forge.agent import ForgeAgent
 from skyvern.forge.sdk.core.skyvern_context import SkyvernContext
@@ -1224,6 +1225,59 @@ async def test_handle_action_recovers_working_page_closed_by_download_click() ->
     browser_state.set_active_page.assert_awaited_once_with(recovered_page)
     assert unrelated_page is not recovered_page
     assert results[-1].download_triggered is False
+
+
+@pytest.mark.asyncio
+async def test_persisted_status_follows_a_result_the_download_wrapper_downgraded() -> None:
+    """The inner handler succeeds, then the download lifecycle finds no file and replaces the
+    terminal result with a failure. The status written to the actions row is stamped before that
+    replacement, so without a re-derive the run reports status=completed alongside success=False."""
+    now = datetime.now(UTC)
+    organization = make_organization(now)
+    task, step, page, browser_state, scraped_page, action = _make_download_click_context(
+        now=now,
+        organization=organization,
+        page_url="https://example.com/downloads",
+    )
+    task = task.model_copy(update={"download_timeout": 0.01})
+    action.errors = [
+        UserDefinedError(error_code="no_file_registered", reasoning="no file was registered", confidence_float=1.0)
+    ]
+    page.evaluate = AsyncMock(return_value=[])
+    page.context._skyvern_cdp_download_active = False
+    persisted_statuses: list[ActionStatus] = []
+
+    async def succeed_and_stamp(*args: object, **kwargs: object) -> list[ActionSuccess]:
+        # What the real _handle_action does in its finally block for a successful result.
+        action.status = ActionStatus.completed
+        return [ActionSuccess()]
+
+    with tempfile.TemporaryDirectory() as temp_dir:
+        mock_app = MagicMock()
+        mock_app.BROWSER_MANAGER.get_for_task.return_value = browser_state
+        mock_app.DATABASE.workflow_params.create_action = AsyncMock(
+            side_effect=lambda action: persisted_statuses.append(action.status) or action
+        )
+        mock_app.STORAGE = MagicMock()
+
+        with (
+            patch.object(ActionHandler, "_handle_action", side_effect=succeed_and_stamp),
+            patch("skyvern.webeye.actions.handler.get_download_dir", return_value=temp_dir),
+            patch("skyvern.webeye.actions.handler.list_files_in_directory", return_value=[]),
+            patch("skyvern.webeye.actions.handler.skyvern_context.current", return_value=None),
+            patch("skyvern.webeye.actions.handler.app", mock_app),
+        ):
+            results = await ActionHandler.handle_action(
+                scraped_page=scraped_page,
+                task=task,
+                step=step,
+                page=page,
+                action=action,
+            )
+
+    assert results[-1].success is False
+    assert results[-1].download_triggered is False
+    assert persisted_statuses == [ActionStatus.failed]
 
 
 @pytest.mark.asyncio
