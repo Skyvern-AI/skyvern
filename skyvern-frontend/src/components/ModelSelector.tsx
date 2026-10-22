@@ -28,9 +28,6 @@ const constants = {
 } as const;
 
 const deprecatedModelNames = new Set<string>([
-  "gemini-2.5-pro-preview-05-06",
-  "gemini-2.5-flash",
-  "gemini-2.5-flash-lite",
   "gemini-3-pro-preview",
   "gemini-3.0-flash",
   "gemini-3.5-flash",
