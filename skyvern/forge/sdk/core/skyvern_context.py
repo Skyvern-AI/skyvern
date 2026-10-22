@@ -714,6 +714,8 @@ class SkyvernContext:
     # Explicit download_timeout of the Task V3 block or task now running; the browser download listener
     # reads it when a download starts, so it also covers the initial navigation and a relaunched browser.
     download_timeout: float | None = None
+    residential_download_interrupted_task_ids: set[str] = field(default_factory=builtins.set)
+    download_completed_task_ids: set[str] = field(default_factory=builtins.set)
     # Keep source names with exact CDP targets; finalization must not infer provenance from affixes.
     download_suffix_applied_files: dict[str, tuple[str, str]] = field(default_factory=dict, repr=False)
     totp_codes: dict[str, str | None] = field(default_factory=dict)
