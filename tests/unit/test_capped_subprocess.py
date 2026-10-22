@@ -174,7 +174,33 @@ def test_a_child_that_outgrows_its_allowance_is_killed_and_reported_out_of_memor
     assert "ran out of memory" in str(excinfo.value)
 
 
-def test_the_growth_of_a_child_is_measured_by_the_parent_before_the_child_exits() -> None:
+def test_a_child_that_returns_past_its_allowance_is_still_reported_out_of_memory(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(capped_subprocess, "MEMORY_CAP_ENFORCED", False)
+    monkeypatch.setattr(capped_subprocess, "_WATCHDOG_POLL_SECONDS", 10)
+
+    with pytest.raises(CappedSubprocessError) as excinfo:
+        run_in_capped_subprocess(
+            _keep_memory_and_return, 50, memory_limit_bytes=40 * MIB, max_result_bytes=MIB, timeout_seconds=60
+        )
+
+    assert excinfo.value.kind == "out_of_memory"
+
+
+def test_the_growth_of_a_child_is_measured_by_the_parent_before_the_child_exits(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    sample = capped_subprocess._MemoryWatchdog.sample
+
+    def delayed_baseline_sample(watchdog: capped_subprocess._MemoryWatchdog) -> int | None:
+        if watchdog.baseline_bytes is None:
+            # Reproduce a parent preempted between receiving ready and sampling its baseline.
+            time.sleep(0.5)
+        return sample(watchdog)
+
+    monkeypatch.setattr(capped_subprocess._MemoryWatchdog, "sample", delayed_baseline_sample)
+
     with structlog.testing.capture_logs() as logs:
         run_in_capped_subprocess(
             _keep_memory_and_return, 50, memory_limit_bytes=256 * MIB, max_result_bytes=MIB, timeout_seconds=60

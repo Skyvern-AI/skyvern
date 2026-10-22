@@ -56,9 +56,11 @@ def main() -> None:
             if allowance is None:
                 raise _NoHeadroom
         _apply_limits(allowance, request["cpu_seconds"])
-        # The parent reads this process's resident memory when it gets this message, so growth counts from here.
+        # The parent samples this ready state before acknowledging work, so growth counts from here.
         pickle.dump({"status": "ready", "allowance_bytes": allowance}, result_stream, protocol=pickle.HIGHEST_PROTOCOL)
         result_stream.flush()
+        if sys.stdin.buffer.read(1) != b"\x00":
+            return
         outcome = {"status": "ok", "value": func(*args)}
     except _NoHeadroom:
         outcome = {"status": "no_headroom"}
