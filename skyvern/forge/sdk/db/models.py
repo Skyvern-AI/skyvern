@@ -2010,6 +2010,8 @@ class CredentialModel(Base):
     proxy_session_id = Column(String, nullable=True)
     folder_id = Column(String, ForeignKey("credential_folders.folder_id", ondelete="SET NULL"), nullable=True)
     created_by = Column(String, nullable=True)
+    is_test_login_temporary = Column(Boolean, nullable=True)
+    is_passkey_setup_pending = Column(Boolean, nullable=True)
 
     created_at = Column(DateTime, default=datetime.datetime.utcnow, nullable=False)
     modified_at = Column(DateTime, default=datetime.datetime.utcnow, onupdate=datetime.datetime.utcnow, nullable=False)

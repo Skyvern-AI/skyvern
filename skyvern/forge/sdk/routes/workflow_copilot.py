@@ -169,11 +169,7 @@ from skyvern.forge.sdk.routes.browser_profiles import (
     _hard_delete_created_profile_after_store_failure,
     create_profile_from_running_session,
 )
-from skyvern.forge.sdk.routes.credentials import (
-    delete_organization_credential,
-    prepare_credential_create,
-    store_new_credential,
-)
+from skyvern.forge.sdk.routes.credentials import delete_organization_credential
 from skyvern.forge.sdk.routes.routers import base_router
 from skyvern.forge.sdk.schemas.copilot_turn_outcome import PersistedCopilotComposerMode, ResponseKind, TurnOutcome
 from skyvern.forge.sdk.schemas.credentials import (
@@ -236,6 +232,10 @@ from skyvern.forge.sdk.schemas.workflow_copilot import (
     copilot_proposal_metadata,
 )
 from skyvern.forge.sdk.services import org_auth_service
+from skyvern.forge.sdk.services.credential.credential_creation_service import (
+    prepare_credential_create,
+    store_new_credential,
+)
 from skyvern.forge.sdk.services.credential.credential_vault_service import CredentialVaultService
 from skyvern.forge.sdk.services.request_principal import get_request_principal
 from skyvern.forge.sdk.services.route_authorization import require_request_actions
