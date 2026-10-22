@@ -92,6 +92,7 @@ from skyvern.forge.taskv3.tools import (
     DOWNLOAD_NO_FILE_THIS_ACTION,
     DOWNLOAD_NO_SESSION_FILE_YET,
     NAVIGATION_DEAD_END_STATUSES,
+    NO_ONE_TIME_CODE_SOURCE,
     OBSERVE_DISPLAY_WIDTHS,
     OBSERVE_POINTER_ROOT_CAP,
     OBSERVE_RETAIN_WIDTH_MIN,
@@ -2110,7 +2111,7 @@ async def test_type_of_a_credential_totp_placeholder_enters_a_real_code(monkeypa
     assert typed[0] in {totp.at(before), totp.at(after)}
     assert re.fullmatch(r"\d{6}", typed[0])
     assert run.state.values_delivered == 1
-    assert run.state.totp_source_missing is False
+    assert run.state.last_status is None
     assert typed[0] in run.context.runtime_secret_values
     assert "BW_TOTP" not in result.content and _TOTP_PLACEHOLDER not in result.content
 
@@ -2139,10 +2140,10 @@ async def test_type_of_a_totp_placeholder_with_no_usable_secret_types_nothing(
     type_messages = [m for m in outcome.messages if m.get("role") == "tool" and m.get("name") == "type"]
     assert len(type_messages) == 1
     content = type_messages[0]["content"]
-    assert "one-time" in content and "Never invent or guess a code" in content
+    assert NO_ONE_TIME_CODE_SOURCE in content
     assert "BW_TOTP" not in content and _TOTP_PLACEHOLDER not in content and "tool_error" not in content
     assert not re.search(r"\d", content)
-    assert run.state.totp_source_missing is True
+    assert run.state.last_status == NO_ONE_TIME_CODE_SOURCE
     assert run.state.values_delivered == 0
 
 
@@ -2216,7 +2217,7 @@ async def test_type_enters_the_code_of_a_credential_other_than_the_blocks_pinned
     typed = [c[1]["text"] for c in run.page.calls if c[0] == "fill"]
     assert len(typed) == 1 and re.fullmatch(r"\d{6}", typed[0])
     assert run.state.values_delivered == 1
-    assert run.state.totp_source_missing is False
+    assert run.state.last_status is None
 
 
 @pytest.mark.asyncio
@@ -2279,7 +2280,7 @@ async def test_a_totp_placeholder_not_typed_alone_is_refused_without_blaming_the
     assert "typed alone" in refused.content
     assert "no usable" not in refused.content and "BW_TOTP" not in refused.content
     assert [c for c in run.page.calls if c[0] == "fill"] == []
-    assert run.state.totp_source_missing is False
+    assert run.state.last_status is None
     assert run.state.values_delivered == 0
 
 
@@ -3688,6 +3689,7 @@ async def test_observe_result_carries_count_only_summary_for_the_call_record() -
         "ready_state_when_empty",
         "icons_listed",
         "icons_truncated",
+        "unnamed_not_icon",
     }
     assert all(type(v) is int for v in summary.values())
     assert summary["invalid_fields"] == 1
@@ -12475,6 +12477,851 @@ async def test_observe_lists_every_unnamed_icon_control_and_its_ref_clicks_it() 
         assert await page.evaluate("() => window.__deleted") == [str(last)]
 
 
+# A "more actions" kebab drawn without a graphic element: a font ligature in a ::before, a background
+# image, and three styled dots. None holds an svg/img/canvas and none carries a name, so the icon rule
+# is the only thing that can list them -- and a reading that requires a graphic drops all three while
+# listing the row's link, which is the neighbour the model then clicks instead.
+_CSS_KEBAB_HTML = (
+    "<!doctype html><html><head><style>"
+    ".kebab{cursor:pointer;display:inline-block;width:24px;height:24px}"
+    ".kebab.glyph::before{content:'\\22EE';font-size:18px}"
+    ".kebab.bg{background-image:url('data:image/gif;base64,"
+    "R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7');background-repeat:no-repeat}"
+    ".kebab.dots span{cursor:pointer;display:block;width:4px;height:4px;border-radius:50%;background:#333;margin:2px auto}"
+    ".curtain{cursor:pointer;width:320px;height:220px;background:#ddd}"
+    ".curtain span{display:inline-block;width:2px;height:2px}"
+    ".too-small{cursor:pointer;width:4px;height:4px;background:#333}"
+    ".blank-icon{cursor:pointer;display:inline-block;width:24px;height:24px}"
+    "</style></head><body><table>"
+    # One tag for all three, as a real table repeats: the lines are identical but for the row they sit
+    # in, so this exercises the row qualifier the listing needs to tell them apart as well.
+    '<tr><td><a href="/b/1">Bill 1</a></td><td><div class="kebab glyph"></div></td></tr>'
+    '<tr><td><a href="/b/2">Bill 2</a></td><td><div class="kebab bg"></div></td></tr>'
+    '<tr><td><a href="/b/3">Bill 3</a></td><td><div class="kebab dots">'
+    "<span></span><span></span><span></span></div></td></tr>"
+    "</table>"
+    # Unnamed, clickable, and far bigger than a glyph: its centre need not be on any control, so it
+    # stays unlisted and is counted instead.
+    '<div>Large curtain <div id="curtain" class="curtain"><span></span><span></span><span></span></div></div>'
+    '<div>Tiny target <div id="too-small" class="too-small"></div></div>'
+    '<div>Blank target <div id="blank" class="blank-icon"></div></div>'
+    "<script>window.__opened = [];document.addEventListener('click', (e) => {"
+    " const k = e.target.closest('.kebab');"
+    " if (k) window.__opened.push(k.closest('tr').querySelector('a').textContent); });</script>"
+    "</body></html>"
+)
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+async def test_observe_lists_an_icon_control_however_the_page_draws_its_glyph() -> None:
+    async with _live_page(_CSS_KEBAB_HTML) as page:
+        tools = build_browser_tools(_fixed_page_provider(page))
+        r = await _tool(tools, "observe").handler({})
+        assert r.status == "ok"
+        lines = [line for line in r.content.splitlines() if line.startswith("ref=")]
+        # One unnamed icon line per row, each told apart by the row it sits in.
+        icons = [line for line in lines if " '' in='Bill " in line]
+        assert len(icons) == 3, r.content
+        assert r.data["summary"]["icons_listed"] == 3, r.data["summary"]
+        assert r.data["summary"]["duplicate_digest_lines"] == 0, r.data["summary"]
+        # The inked curtain fails only the 48px ceiling, the inkless 24px box fails only ink, and
+        # the 4px inked control fails only the 6px floor. Nested layout spans count as one rejected root.
+        assert r.data["summary"]["unnamed_not_icon"] == 3, r.data["summary"]
+        listed = [line for line in r.content.splitlines() if line.startswith("ref=")]
+        assert not any("in='Large curtain'" in line for line in listed), r.content
+        assert not any("in='Tiny target'" in line for line in listed), r.content
+        assert not any("in='Blank target'" in line for line in listed), r.content
+        # The ref opens the row's own menu, not the link beside it.
+        third = next(line for line in icons if "in='Bill 3'" in line)
+        click = await _tool(tools, "click").handler({"selector": _ref_line(third, "div ''")})
+        assert click.status == "ok", click.content
+        assert await page.evaluate("() => window.__opened") == ["Bill 3"]
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+async def test_observe_lists_nested_css_action_in_a_clickable_row() -> None:
+    html = """<!doctype html><html><head><style>
+      .row {
+        cursor: pointer;
+        .action {
+          cursor: pointer;
+          display: inline-block;
+          width: 24px;
+          height: 24px;
+          background: #333;
+        }
+      }
+      .outside { cursor:pointer; width:120px; height:40px }
+      .outside .action { display:inline-block; width:24px; height:24px; background:#333 }
+    </style></head><body>
+      <div class="row"><a href="#invoice">Invoice 9</a><div class="action" id="inside"></div></div>
+      <div class="outside"><a href="#other">Other</a><div class="action" id="outside"></div></div>
+      <script>
+        document.getElementById('inside').addEventListener('click', () => window.__clicked = 'inside');
+        document.getElementById('outside').addEventListener('click', () => window.__clicked = 'outside');
+      </script>
+    </body></html>"""
+    async with _live_page(html) as page:
+        tools = build_browser_tools(_fixed_page_provider(page))
+        result = await _tool(tools, "observe").handler({})
+        assert result.status == "ok", result.content
+        lines = [line for line in result.content.splitlines() if line.startswith("ref=")]
+        icon = next(line for line in lines if "div ''" in line)
+        click = await _tool(tools, "click").handler({"selector": _ref_line(icon, "div ''")})
+        clicked = await page.evaluate("() => window.__clicked")
+
+    assert sum("div ''" in line for line in result.content.splitlines()) == 1, result.content
+    assert result.data["summary"]["icons_listed"] == 1, result.data["summary"]
+    assert not any("id='outside'" in line for line in lines), result.content
+    assert click.status == "ok", click.content
+    assert clicked == "inside"
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+async def test_nested_selector_list_scopes_each_pointer_rule_branch() -> None:
+    html = """<!doctype html><html><head><style>
+      .row {
+        display:flex; cursor:pointer; width:300px; height:36px; align-items:center;
+        &.selected, .action { cursor:pointer; }
+      }
+      .other-row { display:flex; cursor:pointer; width:300px; height:36px; align-items:center }
+      .action { display:inline-block; width:22px; height:20px; background:#333 }
+    </style></head><body>
+      <div class="row selected"><input type="checkbox"><a href="#selected">Selected</a>
+        <span id="real-action" class="action" onclick="window.__realAction=true"></span></div>
+      <div class="other-row"><input type="checkbox"><a href="#other">Other</a>
+        <span id="decorative-action" class="action"></span></div>
+      <script>window.__realAction=false;</script>
+    </body></html>"""
+    async with _live_page(html) as page:
+        # Expose the raw implicit branch form that some CSSOMs return for nested selector lists.
+        patched = await page.evaluate(
+            """() => {
+              const descriptor = Object.getOwnPropertyDescriptor(CSSStyleRule.prototype, 'selectorText');
+              if (!descriptor?.get || !descriptor.configurable) return false;
+              Object.defineProperty(CSSStyleRule.prototype, 'selectorText', {
+                configurable: true,
+                get() {
+                  const selector = descriptor.get.call(this);
+                  return selector === '&.selected, & .action' ? '&.selected, .action' : selector;
+                },
+              });
+              return true;
+            }"""
+        )
+        cursors = await page.evaluate(
+            "() => ['real-action','decorative-action'].map(id => getComputedStyle(document.getElementById(id)).cursor)"
+        )
+        tools = build_browser_tools(_fixed_page_provider(page))
+        result = await _tool(tools, "observe").handler({})
+        action_lines = [line for line in result.content.splitlines() if line.startswith("ref=") and "span ''" in line]
+        assert result.status == "ok", result.content
+        assert result.data["summary"]["icons_listed"] == 1, result.data["summary"]
+        assert len(action_lines) == 1, result.content
+        click = await _tool(tools, "click").handler({"selector": _ref_line(action_lines[0], "span ''")})
+        clicked = await page.evaluate("() => window.__realAction")
+
+    assert patched, "could not expose the unexpanded nested selector text to the collector"
+    assert cursors == ["pointer", "pointer"], cursors
+    assert click.status == "ok" and clicked is True, (click.content, clicked)
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+async def test_observe_lists_cursor_action_from_imported_stylesheet() -> None:
+    html = """<!doctype html><html><head><style>
+      .row { cursor:pointer; width:200px; height:40px }
+      .action { display:inline-block; width:24px; height:24px; background:#333 }
+    </style></head><body>
+      <div class="row"><a href="#invoice">Invoice 9</a><div class="action"></div></div>
+      <script>
+        const css = new Blob(['.row .action { cursor:pointer }'], {type:'text/css'});
+        const url = URL.createObjectURL(css);
+        const imported = document.createElement('style');
+        imported.id = 'imported-style';
+        imported.textContent = `@import url("${url}");`;
+        document.head.append(imported);
+        document.querySelector('.action').addEventListener('click', () => window.__clicked = true);
+      </script>
+    </body></html>"""
+    async with _live_page(html) as page:
+        await page.wait_for_function(
+            """() => {
+              const rule = document.querySelector('#imported-style').sheet.cssRules[0];
+              return rule.styleSheet?.cssRules?.length === 1
+                && getComputedStyle(document.querySelector('.action')).cursor === 'pointer';
+            }"""
+        )
+        tools = build_browser_tools(_fixed_page_provider(page))
+        result = await _tool(tools, "observe").handler({})
+        lines = [line for line in result.content.splitlines() if line.startswith("ref=")]
+        icon = next(line for line in lines if "div ''" in line)
+        click = await _tool(tools, "click").handler({"selector": _ref_line(icon, "div ''")})
+        clicked = await page.evaluate("() => window.__clicked")
+
+    assert result.status == "ok", result.content
+    assert result.data["summary"]["icons_listed"] == 1, result.data["summary"]
+    assert click.status == "ok", click.content
+    assert clicked
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+async def test_css_painted_wrapper_with_multiple_graphics_is_not_an_icon() -> None:
+    html = """<!doctype html><html><head><style>
+      .wrapper { cursor:pointer; display:inline-flex; width:24px; height:24px; background:#333 }
+      svg { width:8px; height:8px }
+    </style></head><body>
+      <div class="wrapper"><svg id="first"><rect width="8" height="8"></rect></svg>
+        <svg id="second"><rect width="8" height="8"></rect></svg></div>
+      <script>
+        window.__hits = [];
+        for (const id of ['first', 'second']) {
+          document.getElementById(id).addEventListener('click', () => window.__hits.push(id));
+        }
+      </script>
+    </body></html>"""
+    async with _live_page(html) as page:
+        tools = build_browser_tools(_fixed_page_provider(page))
+        result = await _tool(tools, "observe").handler({})
+        lines = [line for line in result.content.splitlines() if line.startswith("ref=")]
+        graphics = [line for line in lines if " svg ''" in line]
+        clicks = [await _tool(tools, "click").handler({"selector": _ref_line(line, "svg ''")}) for line in graphics]
+        hits = await page.evaluate("() => window.__hits")
+
+    assert result.status == "ok", result.content
+    assert result.data["summary"]["icons_listed"] == 2, result.data["summary"]
+    assert len(graphics) == 2, result.content
+    assert all(click.status == "ok" for click in clicks), [click.content for click in clicks]
+    assert sorted(hits) == ["first", "second"]
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+async def test_observe_ignores_cursor_rules_under_inactive_conditions() -> None:
+    html = """<!doctype html><html><head><style>
+      .container { container-type:inline-size; width:100px }
+      .row { cursor:pointer }
+      .row .paint { display:inline-block; width:24px; height:24px; background:#333 }
+      @supports (display: unsupported-value) {
+        .row { .unsupported { cursor:pointer } }
+      }
+      @container (min-width: 800px) {
+        .row { .container-inactive { cursor:pointer } }
+      }
+      @media screen {
+        .row { .media-active { cursor:pointer } }
+      }
+    </style></head><body>
+      <div class="container"><div class="row">
+        <a href="#invoice">Invoice 9</a>
+        <div class="paint unsupported"></div>
+        <div class="paint container-inactive"></div>
+        <div class="paint media-active" id="media-active"></div>
+      </div></div>
+    </body></html>"""
+    async with _live_page(html) as page:
+        result = await _tool(build_browser_tools(_fixed_page_provider(page)), "observe").handler({})
+
+    assert result.status == "ok", result.content
+    assert result.data["summary"]["icons_listed"] == 1, result.data["summary"]
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+async def test_unnamed_pointer_miss_dedup_stops_at_cursor_default() -> None:
+    html = """<!doctype html><html><head><style>
+      #outer, #inner { cursor:pointer; display:block; width:64px; height:64px; background:#333 }
+      #boundary { cursor:default; width:80px; height:80px }
+    </style></head><body>
+      <div id="outer"><div id="boundary"><div id="inner"></div></div></div>
+    </body></html>"""
+    async with _live_page(html) as page:
+        result = await _tool(build_browser_tools(_fixed_page_provider(page)), "observe").handler({})
+
+    assert result.status == "ok", result.content
+    assert result.data["summary"]["unnamed_not_icon"] == 2, result.data["summary"]
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+async def test_observe_does_not_list_a_slot_wrapper_for_its_light_dom_control() -> None:
+    html = """<!doctype html><html><body>
+      <x-action><button slot="action">Save</button></x-action>
+      <script>
+        customElements.define('x-action', class extends HTMLElement {
+          constructor() {
+            super();
+            this.attachShadow({mode: 'open'}).innerHTML =
+              '<div style="cursor:pointer"><slot name="action"></slot></div>';
+          }
+        });
+      </script>
+    </body></html>"""
+    async with _live_page(html) as page:
+        result = await _tool(build_browser_tools(_fixed_page_provider(page)), "observe").handler({})
+
+    assert result.status == "ok", result.content
+    save_lines = [line for line in result.content.splitlines() if line.startswith("ref=") and "'Save'" in line]
+    assert len(save_lines) == 1, result.content
+    assert "button/submit 'Save'" in save_lines[0], result.content
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+async def test_observe_uses_native_treewalker_when_document_name_shadows_it() -> None:
+    html = """<!doctype html><html><body>
+      <div style="cursor:pointer">Invoice 9</div>
+      <img name="createTreeWalker" src="data:,">
+    </body></html>"""
+    async with _live_page(html) as page:
+        assert await page.evaluate("() => document.createTreeWalker.tagName") == "IMG"
+        result = await _tool(build_browser_tools(_fixed_page_provider(page)), "observe").handler({})
+
+    assert result.status == "ok", result.content
+    assert any("div 'Invoice 9'" in line for line in result.content.splitlines()), result.content
+
+
+_CSS_ICON_PAINT_HTML = (
+    "<!doctype html><html><head><style>"
+    ".icon{cursor:pointer;display:inline-block;width:24px;height:24px}"
+    "#border-top{border-top:2px solid rgb(30,60,90)}"
+    "#border-right{border-right:2px solid rgb(30,60,90)}"
+    "#border-bottom{border-bottom:2px solid rgb(30,60,90)}"
+    "#border-left{border-left:2px solid rgb(30,60,90)}"
+    "#outline{outline:2px solid rgb(30,60,90)}"
+    "#shadow{box-shadow:0 0 3px 1px rgb(30,60,90)}"
+    "#gradient{background-image:linear-gradient(rgb(30,60,90),rgb(90,60,30))}"
+    "#pseudo::before{content:'\\22EE';color:rgb(30,60,90)}"
+    "#text-shadow-pseudo::before{content:'\\22EE';color:transparent;text-shadow:0 0 #333}"
+    "#empty-content-pseudo::before{content:'';display:block;width:8px;height:8px;background:#333}"
+    "#zero-area-pseudo::before{content:'';display:block;width:0;height:0;background:#333}"
+    "#whitespace-text-shadow-pseudo::before{content:' ';color:transparent;text-shadow:0 0 #333}"
+    "#transparent-border{border:2px solid rgba(0,0,0,0)}"
+    "#transparent-outline{outline:2px solid rgba(0,0,0,0)}"
+    "#transparent-shadow{box-shadow:0 0 0 0 rgba(0,0,0,0)}"
+    "#transparent-gradient{background-image:linear-gradient(transparent,transparent)}"
+    "#clip-hidden{background:#333;clip-path:inset(50%)}"
+    "#clip-circle-hidden{background:#333;clip-path:circle(0)}"
+    "#clip-ellipse-hidden{background:#333;clip-path:ellipse(0 50% at 50% 50%)}"
+    "#clip-polygon-hidden{background:#333;clip-path:polygon(0 0,100% 100%,50% 50%)}"
+    "#clip-polygon-visible{background:#333;clip-path:polygon(50% 0,100% 100%,0 100%)}"
+    ".child{display:inline-block;width:8px;height:8px;background:#f00}"
+    "#outside-descendant{position:relative}"
+    "#outside-descendant .child{position:absolute;left:32px;cursor:default}"
+    "#display-none .child{display:none}"
+    "#visibility-hidden .child{visibility:hidden}"
+    "#opacity-zero .child{opacity:0}"
+    "#transparent-pseudo::before{content:'\\22EE';color:transparent}"
+    "#hidden-pseudo::before{content:'\\22EE';visibility:hidden;color:#333}"
+    "#no-content-pseudo::before{content:normal;display:block;width:8px;height:8px;background:#333}"
+    "#whitespace-content-pseudo::before{content:' ';color:#333}"
+    "#clipped-pseudo::before{content:'';display:block;width:8px;height:8px;background:#333;clip-path:inset(50%)}"
+    "#zero-size-child .child{width:0;height:0}"
+    "</style></head><body>"
+    '<div>Paint border-top <div id="border-top" class="icon"></div></div>'
+    '<div>Paint border-right <div id="border-right" class="icon"></div></div>'
+    '<div>Paint border-bottom <div id="border-bottom" class="icon"></div></div>'
+    '<div>Paint border-left <div id="border-left" class="icon"></div></div>'
+    '<div>Paint outline <div id="outline" class="icon"></div></div>'
+    '<div>Paint shadow <div id="shadow" class="icon"></div></div>'
+    '<div>Paint gradient <div id="gradient" class="icon"></div></div>'
+    '<div>Paint pseudo <div id="pseudo" class="icon"></div></div>'
+    '<div>Paint text-shadow-pseudo <div id="text-shadow-pseudo" class="icon"></div></div>'
+    '<div>Paint empty-content-pseudo <div id="empty-content-pseudo" class="icon"></div></div>'
+    '<div>Paint zero-area-pseudo <div id="zero-area-pseudo" class="icon"></div></div>'
+    '<div>Paint whitespace-text-shadow-pseudo <div id="whitespace-text-shadow-pseudo" class="icon"></div></div>'
+    '<div>Paint transparent-border <div id="transparent-border" class="icon"></div></div>'
+    '<div>Paint transparent-outline <div id="transparent-outline" class="icon"></div></div>'
+    '<div>Paint transparent-shadow <div id="transparent-shadow" class="icon"></div></div>'
+    '<div>Paint transparent-gradient <div id="transparent-gradient" class="icon"></div></div>'
+    '<div>Paint clip-hidden <div id="clip-hidden" class="icon"></div></div>'
+    '<div>Paint clip-circle-hidden <div id="clip-circle-hidden" class="icon"></div></div>'
+    '<div>Paint clip-ellipse-hidden <div id="clip-ellipse-hidden" class="icon"></div></div>'
+    '<div>Paint clip-polygon-hidden <div id="clip-polygon-hidden" class="icon"></div></div>'
+    '<div>Paint clip-polygon-visible <div id="clip-polygon-visible" class="icon"></div></div>'
+    '<div>Paint outside-descendant <div id="outside-descendant" class="icon"><span class="child"></span></div></div>'
+    '<div>Paint display-none <div id="display-none" class="icon"><span class="child"></span></div></div>'
+    '<div>Paint visibility-hidden <div id="visibility-hidden" class="icon"><span class="child"></span></div></div>'
+    '<div>Paint opacity-zero <div id="opacity-zero" class="icon"><span class="child"></span></div></div>'
+    '<div>Paint transparent-pseudo <div id="transparent-pseudo" class="icon"></div></div>'
+    '<div>Paint hidden-pseudo <div id="hidden-pseudo" class="icon"></div></div>'
+    '<div>Paint no-content-pseudo <div id="no-content-pseudo" class="icon"></div></div>'
+    '<div>Paint whitespace-content-pseudo <div id="whitespace-content-pseudo" class="icon"></div></div>'
+    '<div>Paint clipped-pseudo <div id="clipped-pseudo" class="icon"></div></div>'
+    '<div>Paint zero-size-child <div id="zero-size-child" class="icon"><span class="child"></span></div></div>'
+    "</body></html>"
+)
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+async def test_css_icon_detection_requires_visible_ink() -> None:
+    async with _live_page(_CSS_ICON_PAINT_HTML) as page:
+        result = await _tool(build_browser_tools(_fixed_page_provider(page)), "observe").handler({})
+
+    assert result.status == "ok", result.content
+    summary = result.data["summary"]
+    visible = {
+        "border-top",
+        "border-right",
+        "border-bottom",
+        "border-left",
+        "outline",
+        "shadow",
+        "gradient",
+        "pseudo",
+        "text-shadow-pseudo",
+        "empty-content-pseudo",
+        "clip-polygon-visible",
+    }
+    invisible = {
+        "transparent-border",
+        "transparent-outline",
+        "transparent-shadow",
+        "transparent-gradient",
+        "clip-hidden",
+        "clip-circle-hidden",
+        "clip-ellipse-hidden",
+        "clip-polygon-hidden",
+        "outside-descendant",
+        "display-none",
+        "visibility-hidden",
+        "opacity-zero",
+        "transparent-pseudo",
+        "zero-area-pseudo",
+        "hidden-pseudo",
+        "no-content-pseudo",
+        "whitespace-content-pseudo",
+        "whitespace-text-shadow-pseudo",
+        "clipped-pseudo",
+        "zero-size-child",
+    }
+    assert summary["icons_listed"] == len(visible), summary
+    lines = [line for line in result.content.splitlines() if line.startswith("ref=")]
+    assert all(any(f"id='{id}'" in line for line in lines) for id in visible), result.content
+    assert all(not any(f"id='{id}'" in line for line in lines) for id in invisible), result.content
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+async def test_css_icon_detection_covers_the_closed_paint_channel_set() -> None:
+    image = "data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='16' height='16'%3E%3Crect width='16' height='16' fill='red'/%3E%3C/svg%3E"
+    html = f"""<!doctype html><html><head><style>
+      .channel {{ display:inline-block; cursor:pointer; width:24px; height:24px; margin:2px }}
+      #background-color {{ background-color:#333 }}
+      #background-image {{ background-image:linear-gradient(#333,#666) }}
+      #border {{ border:1px solid #333 }}
+      #outline {{ outline:1px solid #333 }}
+      #box-shadow {{ box-shadow:1px 1px 0 #333 }}
+      #before::before {{ content:'⋮'; color:#333; font-size:18px }}
+      #after::after {{ content:''; display:block; width:8px; height:8px; background:#333 }}
+      #text-glyph {{ color:#333; font-size:18px }}
+      #replaced {{ width:24px; height:24px }}
+    </style></head><body>
+      <span id="background-color" class="channel"></span>
+      <span id="background-image" class="channel"></span>
+      <span id="border" class="channel"></span>
+      <span id="outline" class="channel"></span>
+      <span id="box-shadow" class="channel"></span>
+      <span id="before" class="channel"></span>
+      <span id="after" class="channel"></span>
+      <span id="text-glyph" class="channel">⋮</span>
+      <img id="replaced" class="channel" alt="" src="{image}">
+    </body></html>"""
+    async with _live_page(html) as page:
+        result = await _tool(build_browser_tools(_fixed_page_provider(page)), "observe").handler({})
+        lines = [line for line in result.content.splitlines() if line.startswith("ref=")]
+
+    assert result.status == "ok", result.content
+    names = (
+        "background-color",
+        "background-image",
+        "border",
+        "outline",
+        "box-shadow",
+        "before",
+        "after",
+    )
+    listed = [name for name in names if any(f"id='{name}'" in line for line in lines)]
+    assert result.data["summary"]["icons_listed"] == 8, result.data["summary"]
+    assert len(listed) == len(names), (result.content, listed)
+    assert len(lines) == 9 and any("span '⋮'" in line for line in lines), result.content
+    assert any("img ''" in line for line in lines), result.content
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+async def test_transparent_pointer_overlay_is_not_listed_or_clicked_as_an_icon() -> None:
+    html = """<!doctype html><html><head><style>
+      #pay, #overlay { position:absolute; left:0; top:0; width:40px; height:40px }
+      #overlay { cursor:pointer; border:2px solid transparent; z-index:1 }
+    </style></head><body>
+      <button id="pay">Pay</button>
+      <div id="overlay"></div>
+      <script>window.__clicks=[];document.addEventListener('click',e=>window.__clicks.push(e.target.id));</script>
+    </body></html>"""
+    async with _live_page(html) as page:
+        tools = build_browser_tools(_fixed_page_provider(page))
+        result = await _tool(tools, "observe").handler({})
+        lines = [line for line in result.content.splitlines() if line.startswith("ref=")]
+        pay = next(line for line in lines if "button/submit 'Pay'" in line)
+        click = await _tool(tools, "click").handler({"selector": _ref_line(pay, "button/submit 'Pay'")})
+        clicks = await page.evaluate("() => window.__clicks")
+
+    assert result.status == "ok", result.content
+    assert not any("id='overlay'" in line for line in lines), result.content
+    assert click.status == "error", click.content
+    assert "covered by" in click.content, click.content
+    assert clicks == []
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+async def test_css_icon_detection_rejects_fully_clipped_ancestor() -> None:
+    html = """<!doctype html><html><head><style>
+      #pay, #clipper { position:absolute; left:0; top:0; width:24px; height:24px }
+      #clipper { clip-path:circle(0); z-index:1 }
+      #icon { cursor:pointer; width:24px; height:24px; background:#333 }
+    </style></head><body>
+      <button id="pay">Pay</button>
+      <div id="clipper"><div id="icon"></div></div>
+    </body></html>"""
+    async with _live_page(html) as page:
+        facts = await page.evaluate(
+            "() => ({"
+            "clip:getComputedStyle(document.querySelector('#clipper')).clipPath,"
+            "visible:document.querySelector('#icon').checkVisibility(),"
+            "hit:document.elementFromPoint(12,12)?.id})"
+        )
+        result = await _tool(build_browser_tools(_fixed_page_provider(page)), "observe").handler({})
+        lines = [line for line in result.content.splitlines() if line.startswith("ref=")]
+
+    assert facts["clip"].startswith("circle(0"), facts
+    assert facts["visible"] is True, facts
+    assert facts["hit"] == "pay", facts
+    assert result.status == "ok", result.content
+    assert any("button/submit 'Pay'" in line for line in lines), result.content
+    assert not any("id='icon'" in line for line in lines), result.content
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+async def test_css_icon_detection_respects_clip_edges_and_hidden_scroll_reachability() -> None:
+    html = """<!doctype html><html><head><style>
+      #pay { position:absolute; left:0; top:0; width:300px; height:210px }
+      #clipper, #overflow-hidden, #overflow-clip, #overflow-margin, #overflow-scrollable, #overflow-unreachable {
+        position:absolute; left:0; width:100px; height:24px; z-index:1
+      }
+      #clipper { top:0; clip-path:inset(0 50% 0 0) }
+      #icon { position:absolute; left:70px; cursor:pointer; width:24px; height:24px; background:#333 }
+      #svg-icon { position:absolute; left:70px; top:0; cursor:pointer; width:24px; height:24px }
+      #overflow-hidden { top:30px; overflow:hidden }
+      #overflow-clip { top:60px; overflow:clip }
+      #overflow-margin { top:90px; overflow:clip; overflow-clip-margin:padding-box 30px }
+      #overflow-scrollable { top:120px; overflow:hidden }
+      #overflow-unreachable { top:150px; left:80px; overflow:hidden }
+      #hidden-icon, #clip-icon, #partial-clip-icon, #margin-icon, #scroll-icon, #unreachable-icon {
+        position:absolute; top:0; cursor:pointer; width:24px; height:24px; background:#333
+      }
+      #hidden-icon, #clip-icon, #margin-icon { left:110px }
+      #partial-clip-icon { left:90px }
+      #scroll-content, #unreachable-content { position:relative; width:220px; height:24px }
+      #scroll-icon { left:90px }
+      #unreachable-icon { left:-30px }
+    </style></head><body>
+      <button id="pay">Pay</button>
+      <div id="clipper"><div id="icon"></div><svg id="svg-icon" viewBox="0 0 24 24"><path fill="#333" d="M0 0h24v24H0z"/></svg></div>
+      <div id="overflow-hidden"><div id="hidden-icon"></div></div>
+      <div id="overflow-clip"><div id="clip-icon"></div><div id="partial-clip-icon"></div></div>
+      <div id="overflow-margin"><div id="margin-icon"></div></div>
+      <div id="overflow-scrollable"><div id="scroll-content"><div id="scroll-icon"></div></div></div>
+      <div id="overflow-unreachable"><div id="unreachable-content"><div id="unreachable-icon"></div></div></div>
+    </body></html>"""
+    async with _live_page(html) as page:
+        facts = await page.evaluate(
+            "() => ({clip:getComputedStyle(document.querySelector('#clipper')).clipPath,"
+            "clipMargin:getComputedStyle(document.querySelector('#overflow-margin')).overflowClipMargin,"
+            "scroll:[document.querySelector('#overflow-scrollable').scrollWidth,"
+            "document.querySelector('#overflow-scrollable').clientWidth],"
+            "unreachable:[document.querySelector('#overflow-unreachable').scrollWidth,"
+            "document.querySelector('#overflow-unreachable').clientWidth],"
+            "hits:[document.elementFromPoint(82,12)?.id,document.elementFromPoint(122,42)?.id,"
+            "document.elementFromPoint(122,72)?.id,document.elementFromPoint(102,72)?.id,"
+            "document.elementFromPoint(122,102)?.id,document.elementFromPoint(102,132)?.id,"
+            "document.elementFromPoint(62,162)?.id]})"
+        )
+        tools = build_browser_tools(_fixed_page_provider(page))
+        result = await _tool(tools, "observe").handler({})
+        lines = [line for line in result.content.splitlines() if line.startswith("ref=")]
+
+    assert facts["clip"].startswith("inset("), facts
+    assert facts["clipMargin"] == "30px", facts
+    assert facts["scroll"][0] > facts["scroll"][1], facts
+    assert facts["unreachable"][0] > facts["unreachable"][1], facts
+    assert facts["hits"] == ["pay", "pay", "pay", "pay", "margin-icon", "pay", "pay"], facts
+    assert result.status == "ok", result.content
+    assert any("button/submit 'Pay'" in line for line in lines), result.content
+    assert not any("id='icon'" in line for line in lines), result.content
+    assert not any("id='svg-icon'" in line for line in lines), result.content
+    assert not any("id='clip-icon'" in line for line in lines), result.content
+    assert not any("id='partial-clip-icon'" in line for line in lines), result.content
+    assert not any("id='unreachable-icon'" in line for line in lines), result.content
+    assert any("id='hidden-icon'" in line for line in lines), result.content
+    assert any("id='margin-icon'" in line for line in lines), result.content
+    assert any("id='scroll-icon'" in line for line in lines), result.content
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+async def test_css_icon_detection_rejects_zero_opacity_filters() -> None:
+    html = """<!doctype html><html><head><style>
+      .target { cursor:pointer; display:inline-block; width:24px; height:24px; background:#333 }
+      #filtered-child span { filter:opacity(0); background:#333; display:inline-block; width:8px; height:8px }
+      #filtered-pseudo::before { content:'\\22EE'; filter:opacity(0); background:#333 }
+      #hidden-ancestor { filter:opacity(0) }
+    </style></head><body>
+      <div id="filtered-target" class="target" style="filter:opacity(0)"></div>
+      <div id="filtered-child" class="target" style="background:none"><span></span></div>
+      <div id="filtered-pseudo" class="target" style="background:none"></div>
+      <div id="hidden-ancestor"><div id="filtered-descendant" class="target"></div></div>
+      <x-hidden><div id="filtered-slotted" slot="target" class="target"></div></x-hidden>
+      <script>
+        customElements.define('x-hidden', class extends HTMLElement {
+          constructor() {
+            super();
+            this.attachShadow({mode:'open'}).innerHTML =
+              '<div style="filter:opacity(0)"><slot name="target"></slot></div>';
+          }
+        });
+      </script>
+    </body></html>"""
+    async with _live_page(html) as page:
+        result = await _tool(build_browser_tools(_fixed_page_provider(page)), "observe").handler({})
+
+    assert result.status == "ok", result.content
+    lines = [line for line in result.content.splitlines() if line.startswith("ref=")]
+    assert result.data["summary"]["icons_listed"] == 0, result.data["summary"]
+    assert not any(
+        f"id='{id}'" in line
+        for line in lines
+        for id in ("filtered-target", "filtered-child", "filtered-pseudo", "filtered-descendant", "filtered-slotted")
+    ), result.content
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+async def test_nested_pointer_scan_work_is_bounded() -> None:
+    count = 200
+    html = (
+        "<!doctype html><html><head><style>"
+        ".pointer{cursor:pointer;display:block;width:24px;height:24px}"
+        "</style></head><body>" + '<div class="pointer">' * count + "</div>" * count + "</body></html>"
+    )
+    async with _live_page(html) as page:
+        tools = build_browser_tools(_fixed_page_provider(page))
+        started = time.monotonic()
+        result = await _tool(tools, "observe").handler({})
+        elapsed = time.monotonic() - started
+
+    assert result.status == "ok", result.content
+    assert elapsed < 5, f"nested pointer scan took {elapsed:.2f}s"
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+async def test_nested_pointer_scan_caches_each_descendants_pseudo_ink_result() -> None:
+    count = 12
+    html = (
+        "<!doctype html><html><head><style>"
+        ".pointer{cursor:pointer;display:block;width:24px;height:24px}"
+        "#ink::before{content:'\\22EE';color:transparent}"
+        "</style></head><body>"
+        + '<div class="pointer">' * count
+        + '<span id="ink"></span>'
+        + "</div>" * count
+        + "</body></html>"
+    )
+    async with _live_page(html) as page:
+        await page.evaluate(
+            """() => {
+              const native = window.getComputedStyle;
+              window.__inkPseudoReads = 0;
+              window.getComputedStyle = function (element, pseudo) {
+                if (element.id === 'ink' && pseudo === '::before') window.__inkPseudoReads++;
+                return native.call(window, element, pseudo);
+              };
+            }"""
+        )
+        result = await _tool(build_browser_tools(_fixed_page_provider(page)), "observe").handler({})
+        reads = await page.evaluate("() => window.__inkPseudoReads")
+
+    assert result.status == "ok", result.content
+    assert reads == 1, f"descendant pseudo ink was recomputed {reads} times"
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+async def test_icon_budget_overflow_is_not_reported_as_an_ink_miss() -> None:
+    icons = "".join(f'<span id="icon-{i}" class="icon"></span>' for i in range(400))
+    icons += "<span id=icon-400 class=icon><svg width=24 height=24><rect width=24 height=24></rect></svg></span>"
+    html = (
+        "<!doctype html><html><head><style>"
+        ".icon{cursor:pointer;display:inline-block;width:24px;height:24px;background:#333}"
+        "</style></head><body>" + icons + "</body></html>"
+    )
+    async with _live_page(html) as page:
+        result = await _tool(build_browser_tools(_fixed_page_provider(page)), "observe").handler({})
+
+    assert result.status == "ok", result.content
+    assert result.data["summary"]["icons_listed"] == 250, result.data["summary"]
+    assert result.data["summary"]["unnamed_not_icon"] == 0, result.data["summary"]
+    assert result.data["summary"]["icons_truncated"] == 151, result.data["summary"]
+
+
+_ROW_CSS_ACTIONS_HTML = (
+    "<!doctype html><html><head><style>"
+    ".row{display:flex;cursor:pointer;width:300px;height:36px;align-items:center}"
+    ".status-dot{display:inline-block;width:10px;height:10px;border-radius:50%;background:#e33}"
+    ".actions{display:inline-flex;cursor:pointer;width:44px;height:20px}"
+    ".action{display:inline-block;cursor:pointer;width:22px;height:20px}"
+    ".action::before{color:#333;font-size:12px}"
+    ".copy::before{content:'C'}.delete::before{content:'D'}"
+    "</style></head><body>"
+    '<div class="row"><input type="checkbox"><span id="status-dot" class="status-dot"></span>'
+    '<span>Invoice</span><div id="actions" class="actions">'
+    '<span id="copy-action" class="action copy"></span>'
+    '<span id="delete-action" class="action delete"></span></div></div>'
+    "<script>window.__actions=[];document.addEventListener('click',e=>{"
+    "const a=e.target.closest('.action');if(a)window.__actions.push(a.id);});</script>"
+    "</body></html>"
+)
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+async def test_css_icons_in_clickable_rows_skip_decorations_and_keep_separate_actions() -> None:
+    async with _live_page(_ROW_CSS_ACTIONS_HTML) as page:
+        tools = build_browser_tools(_fixed_page_provider(page))
+        result = await _tool(tools, "observe").handler({})
+        assert result.status == "ok", result.content
+        lines = [line for line in result.content.splitlines() if line.startswith("ref=")]
+        action_lines = [line for line in lines if "id='copy-action'" in line or "id='delete-action'" in line]
+
+        assert result.data["summary"]["icons_listed"] == 2, (result.data["summary"], result.content)
+        assert len(action_lines) == 2, result.content
+        assert not any("id='actions'" in line or "id='status-dot'" in line for line in lines), result.content
+        for line in action_lines:
+            click = await _tool(tools, "click").handler({"selector": _ref_line(line, "span ''")})
+            assert click.status == "ok", click.content
+        actions = await page.evaluate("() => window.__actions")
+
+    assert actions == ["copy-action", "delete-action"]
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+async def test_css_icon_cursor_uses_the_winning_declaration() -> None:
+    html = """<!doctype html><html><head><style>
+      .row { display:flex; cursor:pointer; width:300px; height:36px; align-items:center }
+      .action { display:inline-block; cursor:pointer; width:22px; height:20px; background:#333 }
+      #real-action { cursor:pointer }
+      .row .action { cursor:inherit }
+    </style></head><body>
+      <div class="row"><input type="checkbox"><span>Invoice</span>
+        <span id="decorative-action" class="action"></span>
+        <span id="real-action" class="action"></span>
+      </div>
+      <script>window.__action=false;document.addEventListener('click',e=>{
+        if(e.target.id==='real-action')window.__action=true;
+      });</script>
+    </body></html>"""
+    async with _live_page(html) as page:
+        assert await page.locator("#decorative-action").evaluate("el => getComputedStyle(el).cursor") == "pointer"
+        assert await page.locator("#real-action").evaluate("el => getComputedStyle(el).cursor") == "pointer"
+        tools = build_browser_tools(_fixed_page_provider(page))
+        result = await _tool(tools, "observe").handler({})
+        lines = [line for line in result.content.splitlines() if line.startswith("ref=")]
+        action_lines = [line for line in lines if "span ''" in line]
+        assert len(action_lines) == 1, result.content
+        click = await _tool(tools, "click").handler({"selector": _ref_line(action_lines[0], "span ''")})
+        action = await page.evaluate("() => window.__action")
+
+    assert result.status == "ok", result.content
+    assert result.data["summary"]["icons_listed"] == 1, result.data["summary"]
+    assert click.status == "ok", click.content
+    assert action is True
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+async def test_css_icon_cursor_fails_closed_for_layer_and_scope_rules() -> None:
+    html = """<!doctype html><html><head><style>
+      @layer early { #row .layered { cursor:pointer } }
+      @layer late { .row .layered { cursor:inherit } }
+      @scope (#outside) { .scoped { cursor:pointer } }
+      .row { display:flex; cursor:pointer; width:300px; height:36px; align-items:center }
+      .action { display:inline-block; width:22px; height:20px; background:#333 }
+    </style></head><body>
+      <div id="outside"></div>
+      <div id="row" class="row">
+        <input type="checkbox"><a href="/invoice">Invoice</a>
+        <span id="layered" class="action layered"></span>
+        <span id="scoped" class="action scoped"></span>
+        <span id="real-action" class="action layered scoped" style="cursor:pointer" onclick="window.__realAction=true"></span>
+      </div>
+      <script>window.__realAction=false;</script>
+    </body></html>"""
+    async with _live_page(html) as page:
+        cursors = await page.evaluate(
+            "() => ['layered','scoped','real-action'].map(id => getComputedStyle(document.getElementById(id)).cursor)"
+        )
+        tools = build_browser_tools(_fixed_page_provider(page))
+        result = await _tool(tools, "observe").handler({})
+        action_lines = [line for line in result.content.splitlines() if line.startswith("ref=") and "span ''" in line]
+        click = await _tool(tools, "click").handler({"selector": _ref_line(action_lines[0], "span ''")})
+        clicked = await page.evaluate("() => window.__realAction")
+
+    assert cursors == ["pointer", "pointer", "pointer"], cursors
+    assert result.status == "ok", result.content
+    assert result.data["summary"]["icons_listed"] == 1, result.data["summary"]
+    assert len(action_lines) == 1, result.content
+    assert click.status == "ok" and clicked is True, (click.content, clicked)
+
+
+_SHADOW_ROW_CSS_ACTION_HTML = (
+    "<!doctype html><html><body>"
+    '<div class="row" style="display:flex;cursor:pointer;width:300px;height:36px;align-items:center">'
+    '<a href="/invoice">Invoice</a><x-menu></x-menu></div>'
+    "<script>window.__shadowAction=false;customElements.define('x-menu',class extends HTMLElement{"
+    "constructor(){super();const root=this.attachShadow({mode:'open'});"
+    "root.innerHTML='<style>.action{cursor:pointer;display:inline-block;width:24px;height:24px}"
+    '.action::before{content:"⋮";color:#333}</style><span id="shadow-action" class="action"></span>\';'
+    "root.getElementById('shadow-action').addEventListener('click',()=>window.__shadowAction=true);}});</script>"
+    "</body></html>"
+)
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+async def test_shadow_root_stylesheet_cursor_keeps_css_action_in_clickable_row() -> None:
+    async with _live_page(_SHADOW_ROW_CSS_ACTION_HTML) as page:
+        tools = build_browser_tools(_fixed_page_provider(page))
+        result = await _tool(tools, "observe").handler({})
+        assert result.status == "ok", result.content
+        actions = [line for line in result.content.splitlines() if line.startswith("ref=") and " span ''" in line]
+        assert len(actions) == 1, result.content
+        action = actions[0]
+        click = await _tool(tools, "click").handler({"selector": _ref_line(action, "span ''")})
+        hit = await page.evaluate("() => window.__shadowAction")
+
+    assert click.status == "ok", click.content
+    assert hit is True
+
+
 @_skip_no_browser
 @pytest.mark.asyncio
 async def test_observe_labels_an_icon_by_its_graphic_without_spending_a_named_root_slot() -> None:
@@ -13433,7 +14280,14 @@ async def _code_with_no_resolver(page: Any, mp: pytest.MonkeyPatch) -> tuple[lis
 
 
 async def _code_with_no_secret(page: Any, mp: pytest.MonkeyPatch) -> tuple[list[Any], str, dict[str, Any]]:
-    task = SimpleNamespace(task_id="tsk_otp", organization_id="o_1", workflow_run_id=None)
+    task = SimpleNamespace(
+        task_id="tsk_otp",
+        organization_id="o_1",
+        workflow_run_id=None,
+        totp_verification_url=None,
+        totp_identifier=None,
+        navigation_payload=None,
+    )
     tools = build_browser_tools(
         _fixed_page_provider(page),
         resolve_typed_text=lambda text: "BW_TOTP",

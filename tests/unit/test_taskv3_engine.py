@@ -1871,6 +1871,27 @@ async def _run_to_finish(caller: _ScriptedCaller) -> None:
 
 
 @pytest.mark.asyncio
+async def test_the_model_is_offered_the_users_error_codes_on_finish() -> None:
+    caller = _ScriptedCaller(
+        [[("finish", {"status": "failed", "reason": "password rejected", "error_code": "invalid_credentials"})]]
+    )
+    skyvern_context.set(SkyvernContext(task_id="tsk_codes"))
+    try:
+        outcome = await run_task_v3_agent_loop(
+            page_provider=_fixed_page_provider(_FakePage()),
+            llm_caller=caller,
+            goal="Sign in.",
+            error_code_mapping={"invalid_credentials": "The site rejected the password."},
+        )
+    finally:
+        skyvern_context.reset()
+
+    (finish,) = (t for t in caller.sent_tools or [] if t["function"]["name"] == "finish")
+    assert "invalid_credentials" in finish["function"]["parameters"]["properties"]["error_code"]["enum"]
+    assert outcome.error_code == "invalid_credentials"
+
+
+@pytest.mark.asyncio
 async def test_code_tool_surface_off_never_asks_the_deployment_for_a_code_tool(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

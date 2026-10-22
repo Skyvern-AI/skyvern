@@ -5,6 +5,7 @@ import itertools
 import re
 import time
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 
 import jinja2
@@ -14,6 +15,7 @@ from structlog.testing import capture_logs
 from skyvern.forge.sdk.api.llm.exceptions import InvalidLLMResponseFormat
 from skyvern.forge.sdk.workflow.context_manager import RANDOM_SECRET_ID_PREFIX
 from skyvern.forge.taskv3 import loop as taskv3_loop
+from skyvern.forge.taskv3.auth_tools import VerificationFailure, VerificationState
 from skyvern.forge.taskv3.goal_check import (
     GoalJudge,
     NonCompletedStatus,
@@ -781,6 +783,21 @@ async def test_a_completed_finish_never_reaches_the_reask(pending: bool, blocked
 
 
 @pytest.mark.asyncio
+async def test_a_reask_conversion_keeps_the_original_verdicts_error_code_for_a_post_loop_veto() -> None:
+    finish = make_finish_tool(
+        **_gate_kwargs(pending=False, blocked=False, unsettled=False),
+        unlisted_reask=_ReaskSpy(),
+        error_code_mapping={"invalid_credentials": "The site rejected the password."},
+    )
+    result = await finish.handler(
+        {"status": "failed", "reason": "password rejected", "error_code": "invalid_credentials"}
+    )
+    assert result.data is not None
+    assert (result.data["status"], result.data["converted_from"]) == ("completed", "failed")
+    assert result.data["error_code"] == "invalid_credentials"
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("status", ["terminated", "failed"])
 async def test_a_grounded_reask_completes_once_and_a_completed_side_veto_keeps_the_models_verdict(
     status: NonCompletedStatus,
@@ -794,6 +811,8 @@ async def test_a_grounded_reask_completes_once_and_a_completed_side_veto_keeps_t
         "extracted_output": None,
         "converted_from": status,
         "converted_from_reason": "no PIN screen",
+        "error_code": None,
+        "error_code_declined": False,
     }
 
     for veto in ("pending", "blocked", "unsettled"):
@@ -820,6 +839,32 @@ async def test_a_grounded_reask_completes_once_and_a_completed_side_veto_keeps_t
         # Once per run: a second give-up is not re-asked.
         await finish.handler({"status": status, "reason": "again"})
         assert len(spy.calls) == 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("verification", ["link_armed", "link_awaited", "code_armed", "code_not_yet"])
+async def test_a_reask_conversion_is_vetoed_only_while_a_sign_in_link_never_arrived(verification: str) -> None:
+    state = VerificationState(
+        task=SimpleNamespace(task_id="tsk_1", organization_id="o_1", workflow_run_id=None)  # type: ignore[arg-type]
+    )
+    if verification == "link_armed":
+        state.arm(VerificationFailure.NO_LINK_TWICE, "open_verification_link")
+    elif verification == "link_awaited":
+        state.awaiting_link_since = time.monotonic()
+    elif verification == "code_armed":
+        state.arm(VerificationFailure.BUDGET_EXHAUSTED, "get_verification_code")
+    else:
+        state.last_status = "no verification code has arrived yet; about 13.0 minutes of polling time remain."
+    kwargs = {**_gate_kwargs(pending=False, blocked=False, unsettled=False), "verification_blocker": state.block_finish}
+    finish = make_finish_tool(**kwargs, unlisted_reask=_ReaskSpy())
+
+    with capture_logs() as logs:
+        result = await finish.handler({"status": "terminated", "reason": "no PIN screen"})
+
+    vetoed = verification.startswith("link")
+    assert result.data is not None and result.data["status"] == ("terminated" if vetoed else "completed")
+    (line,) = (log for log in logs if log["event"] == "taskv3 finish unlisted reask")
+    assert line["veto"] == ("verification_blocker" if vetoed else None)
 
 
 class _SettleWindowPage:

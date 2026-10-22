@@ -330,7 +330,7 @@ async def test_dropdown_screenshot_uses_frame_selection_and_skips_selected_timeo
     candidate = MagicMock(
         get_locator=MagicMock(return_value=locator),
         is_next_to_element=AsyncMock(return_value=True),
-        find_children_element_id_by_callback=AsyncMock(return_value=None),
+        get_element_dict=MagicMock(return_value={"id": "candidate"}),
         get_attr=AsyncMock(return_value=None),
     )
     frame = MagicMock(
@@ -339,7 +339,11 @@ async def test_dropdown_screenshot_uses_frame_selection_and_skips_selected_timeo
         get_scroll_x_y=AsyncMock(return_value=(4, 8)),
         safe_scroll_to_x_y=AsyncMock(),
     )
-    incremental = MagicMock(skyvern_frame=frame, element_tree=[{"id": "candidate"}])
+    incremental = MagicMock(
+        skyvern_frame=frame,
+        element_tree=[{"id": "candidate"}],
+        find_option_list_element_id=AsyncMock(return_value=None),
+    )
     anchor = MagicMock(is_visible=AsyncMock(return_value=True))
     monkeypatch.setattr(handler.SkyvernElement, "create_from_incremental", AsyncMock(return_value=candidate))
     llm = AsyncMock()

@@ -85,7 +85,7 @@ def test_block_explicit_llm_key_wins_over_org_default(monkeypatch: pytest.Monkey
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
     "model_name",
-    ["gemini-2.5-flash", "gemini-3-pro-preview"],
+    ["gemini-3.0-flash", "gemini-3-pro-preview"],
 )
 async def test_text_prompt_block_uses_selected_model(monkeypatch, model_name):
     # Reset SettingsManager to base settings so cloud overrides from earlier tests don't leak
@@ -982,7 +982,7 @@ async def test_text_prompt_block_non_transient_db_error_not_retried(monkeypatch)
 async def test_text_prompt_block_uses_fallback_llm_key_when_available(monkeypatch):
     """send_prompt upgrades the block's key to a fallback-capable key when one exists."""
     block = _make_text_prompt_block(prompt="Summarize status.")
-    block.llm_key = "VERTEX_GEMINI_2.5_FLASH"
+    block.llm_key = "VERTEX_GEMINI_3.0_FLASH"
     captured: dict[str, str | None] = {}
     handler = AsyncMock(return_value={"llm_response": "ok"})
 
@@ -998,13 +998,13 @@ async def test_text_prompt_block_uses_fallback_llm_key_when_available(monkeypatc
     monkeypatch.setattr(
         block_module.app.AGENT_FUNCTION,
         "get_fallback_llm_key",
-        lambda llm_key: "GEMINI_2_5_FLASH_WITH_FALLBACK",
+        lambda llm_key: "GEMINI_3_0_FLASH_WITH_FALLBACK",
         raising=False,
     )
 
     await block.send_prompt(block.prompt, workflow_run_id="wr", organization_id="org-1")
 
-    assert captured["llm_key"] == "GEMINI_2_5_FLASH_WITH_FALLBACK"
+    assert captured["llm_key"] == "GEMINI_3_0_FLASH_WITH_FALLBACK"
 
 
 @pytest.mark.asyncio
@@ -1014,7 +1014,7 @@ async def test_text_prompt_block_org_default_derives_key_for_fallback(monkeypatc
     block.llm_key = None
     captured: dict[str, str | None] = {}
     handler = AsyncMock(return_value={"llm_response": "ok"})
-    handler.llm_key = "VERTEX_GEMINI_2.5_FLASH"
+    handler.llm_key = "VERTEX_GEMINI_3.0_FLASH"
 
     async def fake_resolve(*args, **kwargs):
         return handler
@@ -1034,7 +1034,7 @@ async def test_text_prompt_block_org_default_derives_key_for_fallback(monkeypatc
 
     await block.send_prompt(block.prompt, workflow_run_id="wr", organization_id="org-1")
 
-    assert captured["llm_key"] == "VERTEX_GEMINI_2.5_FLASH_WITH_FALLBACK"
+    assert captured["llm_key"] == "VERTEX_GEMINI_3.0_FLASH_WITH_FALLBACK"
 
 
 def test_workflow_request_deserialization_strips_invalid_text_prompt_llm_key() -> None:

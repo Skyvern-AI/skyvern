@@ -220,6 +220,46 @@ def setup_forge_stub_app():
     yield
 
 
+def cancel_leftover_tasks(loop: asyncio.AbstractEventLoop) -> None:
+    # A task left suspended in a SQLAlchemy session on a closed loop is later finalized by a garbage collection
+    # inside another test's session, which fails that test with GeneratorExit and stops all later collections.
+    cancelled: set[asyncio.Task[Any]] = set()
+    for _ in range(3):
+        leftover = {task for task in asyncio.all_tasks(loop) if not task.done()}
+        if not leftover:
+            break
+        for task in leftover:
+            task.cancel()
+        cancelled |= leftover
+        # Bounded and repeated, as asyncio.run is not: a task that swallows one cancel must not hang teardown.
+        loop.run_until_complete(asyncio.wait(leftover, timeout=2))
+    for task in cancelled:
+        # Reading the exception also marks it retrieved, so the loop handler reports it once.
+        if task.done() and not task.cancelled() and task.exception() is not None:
+            loop.call_exception_handler(
+                {
+                    "message": "unhandled exception during test loop teardown",
+                    "exception": task.exception(),
+                    "task": task,
+                }
+            )
+    for task in asyncio.all_tasks(loop):
+        loop.call_exception_handler(
+            {"message": "task still pending after cancellation at test loop teardown", "task": task}
+        )
+
+
+@pytest.fixture
+def event_loop() -> Iterator[asyncio.AbstractEventLoop]:
+    # pytest-asyncio's default loop closes without cancelling the tasks a test left running.
+    loop = asyncio.new_event_loop()
+    yield loop
+    if not loop.is_closed():
+        cancel_leftover_tasks(loop)
+        loop.run_until_complete(loop.shutdown_asyncgens())
+        loop.close()
+
+
 @pytest.fixture(autouse=True)
 def reset_collapse_xp_assignment_memo():
     # The collapse umbrella memo is process-global by design; without clearing it,

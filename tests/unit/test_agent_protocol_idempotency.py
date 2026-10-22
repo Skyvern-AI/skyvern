@@ -813,9 +813,9 @@ async def test_nonterminal_finally_validation_rolls_back_before_version_commit(
     original_validate = WorkflowDefinition.validate
 
     @asynccontextmanager
-    async def track_version_write_transaction() -> AsyncIterator[None]:
+    async def track_version_write_transaction(workflow_permanent_id: str | None = None) -> AsyncIterator[None]:
         nonlocal transaction_open
-        async with original_version_write_transaction():
+        async with original_version_write_transaction(workflow_permanent_id):
             transaction_open = True
             try:
                 yield

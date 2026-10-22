@@ -85,7 +85,7 @@ def test_copilot_router_provider_model_retains_only_its_source_provenance(
     monkeypatch: pytest.MonkeyPatch, builtin: bool
 ) -> None:
     monkeypatch.setattr(config_registry.LLMConfigRegistry, "_configs", {})
-    provider_model = "vertex_ai/gemini-2.5-flash"
+    provider_model = "vertex_ai/gemini-3-flash-preview"
     credential = "synthetic-test-key"
     parameters = {"model": provider_model, "api_key": credential}
     config = llm_schemas.LLMRouterConfig(
@@ -100,7 +100,7 @@ def test_copilot_router_provider_model_retains_only_its_source_provenance(
         config_registry._register_builtin_config if builtin else config_registry.LLMConfigRegistry.register_config
     )
     register("TEST_ROUTER", config)
-    with skyvern_context.scoped(SkyvernContext(runtime_secret_values={"5", credential})):
+    with skyvern_context.scoped(SkyvernContext(runtime_secret_values={"3", credential})):
         model_name, run_config, _, _ = resolve_model_config(None, llm_key_override="TEST_ROUTER")
         model = run_config.model_provider.get_model(model_name)
         with capture_runtime_logs() as events:
@@ -116,7 +116,7 @@ def test_copilot_router_provider_model_retains_only_its_source_provenance(
             structlog.get_logger().info("Caller parameters", payload=parameters)
     records = json.loads(json.dumps(events))
     usage = next(record for record in records if record.get("log_code") == "copilot_model_usage")
-    redacted = f"vertex_ai/gemini-2.{REDACTED_SECRET_PLACEHOLDER}-flash"
+    redacted = f"vertex_ai/gemini-{REDACTED_SECRET_PLACEHOLDER}-flash-preview"
     assert usage["gen_ai.request.model"] == (provider_model if builtin else redacted)
     assert usage["gen_ai.response.model"] == redacted
     assert usage["gen_ai.usage.input_tokens"] == 15 and type(usage["gen_ai.usage.input_tokens"]) is int

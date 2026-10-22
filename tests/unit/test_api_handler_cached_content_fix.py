@@ -17,7 +17,7 @@ forge_module.app.EXPERIMENTATION_PROVIDER = MagicMock()
 @pytest.mark.asyncio
 async def test_cached_content_removed_from_non_extract_prompts() -> None:
     mock_config = MagicMock(spec=LLMConfig)
-    mock_config.model_name = "gemini-2.5-pro"
+    mock_config.model_name = "gemini-3.1-pro-preview"
     mock_config.litellm_params = {}
     mock_config.supports_vision = False
     mock_config.add_assistant_prefix = False
@@ -62,7 +62,7 @@ async def test_cached_content_removed_from_non_extract_prompts() -> None:
         mock_builder.return_value = [{"role": "user", "content": "test"}]
         mock_acompletion.return_value = mock_response
 
-        handler = LLMAPIHandlerFactory.get_llm_api_handler("gemini-2.5-pro")
+        handler = LLMAPIHandlerFactory.get_llm_api_handler("gemini-3.1-pro-preview")
 
         context = SkyvernContext()
         context.cached_static_prompt = "some static prompt"

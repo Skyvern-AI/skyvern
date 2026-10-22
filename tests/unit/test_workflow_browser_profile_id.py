@@ -709,6 +709,7 @@ def _make_workflow_update_service(
 ) -> tuple[WorkflowService, SimpleNamespace]:
     service = WorkflowService()
     existing_workflow = SimpleNamespace(
+        workflow_id="wf_existing",
         version=2,
         proxy_location=None,
         totp_identifier=None,

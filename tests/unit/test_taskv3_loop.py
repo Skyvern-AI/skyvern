@@ -31,7 +31,7 @@ from skyvern.forge.sdk.core import skyvern_context
 from skyvern.forge.sdk.core.skyvern_context import SkyvernContext
 from skyvern.forge.taskv3 import loop as loop_module
 from skyvern.forge.taskv3 import tools as taskv3_tools_module
-from skyvern.forge.taskv3.auth_tools import VerificationFailure, VerificationState
+from skyvern.forge.taskv3.auth_tools import _MAX_GIVEUP_DEFERRALS, VerificationFailure, VerificationState
 from skyvern.forge.taskv3.engine import MAX_TOKENS_CEILING, MAX_TOKENS_PER_ACTION_STEP, taskv3_runaway_backstops
 from skyvern.forge.taskv3.goal_check import GoalVerdict, ToolTrail, run_goal_check
 from skyvern.forge.taskv3.handoff_redaction import ELIDED_URL_PATH, caller_known_published_urls
@@ -76,6 +76,7 @@ from skyvern.forge.taskv3.loop import (
     TOKEN_BUDGET_EXTENSION_REFUSED_EVENT,
     UNCHARGED_REFUSAL_GRACE,
     VERDICT_URL_MAX_CHARS,
+    VERIFICATION_GIVEUP_MIN_DEADLINE_HEADROOM_SECONDS,
     ActivityRecency,
     DownloadFailureFacts,
     LoopOutcome,
@@ -299,6 +300,67 @@ async def test_finish_terminates_with_status_and_output() -> None:
     assert outcome.turns == 2
     assert outcome.tool_calls == 2
     assert observe_calls == [("observe", {})]
+
+
+_UNMAPPED_FINISH_SCHEMA_SHA256 = "7d3bd060a60aa326dedb4cd5474b0bf4b9e7f25ea19ea60ddfb9f19375cd8d33"
+
+
+def test_finish_schema_is_unchanged_for_a_task_without_error_codes() -> None:
+    # finish is on every v3 run, so a task without codes must see exactly the schema it saw before codes existed.
+    spec = make_finish_tool(error_code_mapping=None)
+    blob = json.dumps({"description": spec.description, "parameters": spec.parameters}, sort_keys=True)
+    assert hashlib.sha256(blob.encode()).hexdigest() == _UNMAPPED_FINISH_SCHEMA_SHA256
+    assert make_finish_tool(error_code_mapping={}).parameters == spec.parameters
+
+
+def test_finish_offers_exactly_the_users_codes_plus_none_of_these() -> None:
+    mapping = {"invalid_credentials": "The site rejected the username or password.", "account_locked": "Locked."}
+    spec = make_finish_tool(error_code_mapping=mapping)
+    error_code = spec.parameters["properties"]["error_code"]
+    assert error_code["enum"] == ["account_locked", "invalid_credentials", loop_module.NO_MATCHING_ERROR_CODE]
+    assert "The site rejected the username or password." in error_code["description"]
+    assert "error_code" not in spec.parameters["required"]
+    assert spec.description == make_finish_tool().description
+
+    colliding = make_finish_tool(error_code_mapping={"none_of_these": "x", "": "y", "invalid_credentials": "z"})
+    assert colliding.parameters["properties"]["error_code"]["enum"] == [
+        "invalid_credentials",
+        loop_module.NO_MATCHING_ERROR_CODE,
+    ]
+    # Nothing to offer, or too much to send on every turn: the post-run detector keeps the mapping.
+    for unoffered in ({"none_of_these": "x", " ": "y"}, {f"code_{i}": "d" for i in range(65)}, {"big": "x" * 40_000}):
+        assert make_finish_tool(error_code_mapping=unoffered).parameters == make_finish_tool().parameters
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("status", "answer", "code", "declined"),
+    [
+        ("failed", "INVALID_CREDENTIALS", "invalid_credentials", False),
+        ("terminated", "invalid_credentials", "invalid_credentials", False),
+        ("failed", "none_of_these", None, True),
+        ("failed", "PAYMENT_DECLINED", None, False),
+        ("failed", " invalid_credentials ", "invalid_credentials", False),
+        ("failed", None, None, False),
+        ("completed", "invalid_credentials", None, False),
+    ],
+)
+async def test_finish_carries_only_a_validated_code_on_a_run_that_did_not_succeed(
+    status: str, answer: str | None, code: str | None, declined: bool
+) -> None:
+    mapping = {"invalid_credentials": "The site rejected the username or password."}
+    args: dict[str, Any] = {"status": status, "reason": "the site said the password is wrong"}
+    if answer is not None:
+        args["error_code"] = answer
+    tools = [make_finish_tool(error_code_mapping=mapping)]
+    with capture_logs() as logs:
+        outcome, _ = await _run([[("finish", args)]], tools)
+
+    assert outcome.status == status
+    assert outcome.error_code == code
+    assert outcome.error_code_declined is declined
+    if answer == "PAYMENT_DECLINED":
+        assert all(answer not in str(log) for log in logs)
 
 
 @pytest.mark.asyncio
@@ -8739,6 +8801,7 @@ async def test_completion_gate_raise_ends_the_run_with_the_gates_reason(
     assert outcome.status == status
     assert reason in outcome.reason
     assert not outcome.gate_passed
+    assert outcome.model_status == "completed"
     assert caller.calls == 1
 
 
@@ -11139,110 +11202,77 @@ async def test_a_renumbered_mark_does_not_alias_with_its_pre_renumber_history() 
     assert [e for e in logs if e.get("event") == CANONICAL_LOOP_EVENT] == []
 
 
-def _awaiting_verification_state(*, spent: float = 120.0, budget: float = 900.0) -> Any:
-    """A VerificationState in the exact shape the bug produces: a healthy source that answered "not
-    yet" one 120s slice ago, with most of the 900s budget still unspent."""
-
-    state = VerificationState(
+def _verification_state() -> VerificationState:
+    return VerificationState(
         task=SimpleNamespace(task_id="tsk_1", organization_id="o_1", workflow_run_id=None)  # type: ignore[arg-type]
     )
-    state.budget_seconds = budget
+
+
+def _awaiting_link_state(*, spent: float = 120.0) -> VerificationState:
+    state = _verification_state()
     state.polling_spent_seconds = spent
-    state.awaiting_code_since = time.monotonic()
+    state.awaiting_link_since = state.link_wait_since = time.monotonic()
     return state
-
-
-def _spend_tool(state: Any, per_call_seconds: float) -> ToolSpec:
-    """Stands in for get_verification_code: the only thing the loop can see it do is draw the budget
-    down, which is exactly what the gate's monotone bound is keyed on."""
-
-    async def _handler(args: dict[str, Any]) -> ToolResult:
-        state.polling_spent_seconds += per_call_seconds
-        state.awaiting_code_since = time.monotonic()
-        return ToolResult.ok("no verification code available yet")
-
-    return ToolSpec(name="get_verification_code", description="poll", parameters={"type": "object"}, handler=_handler)
 
 
 @pytest.mark.parametrize("status", ["failed", "terminated"])
 @pytest.mark.asyncio
-async def test_giveup_with_unspent_verification_budget_is_deferred(status: str) -> None:
-    # The defect: a run that has spent one 120s slice of a 900s budget on a source that has not
-    # answered yet ends on the model's first non-complete verdict, throwing away ~13 minutes of
-    # polling it already owns. Both non-complete verdicts, not just `failed` -- `terminated` was
-    # gated by nothing at all.
-    state = _awaiting_verification_state()
+async def test_a_non_complete_verdict_stands_while_a_code_is_awaited(status: str) -> None:
+    # The model decides from the code statuses it was given; the finish tool does not hold that give-up.
+    state = _verification_state()
+    state.polling_spent_seconds = 120.0
+    state.last_status = "no verification code has arrived yet; about 13.0 minutes of polling time remain."
     tools = [make_finish_tool(verification_blocker=state.block_finish, activity=ActivityRecency())]
-    script = [
-        [("finish", {"status": status, "reason": "the code never arrived"})],
-        [("finish", {"status": status, "reason": "the code never arrived"})],
-    ]
-    outcome, _ = await _run(script, tools)
-
-    finish_messages = [m["content"] for m in outcome.messages if m.get("role") == "tool" and m.get("name") == "finish"]
-    assert any("polling budget remain" in m for m in finish_messages)
-    # The number is the point: an unquantified "keep waiting" is the prose the customer's own "do not
-    # retry" instruction competes with. 900 - 120 = 780s = 13.0 minutes.
-    assert any("13.0 minutes" in m for m in finish_messages)
-    assert state.giveup_deferrals == 1
-    # ...and the hold is a hold, not a trap: the verdict still lands.
-    assert outcome.status == status
-
-
-@pytest.mark.asyncio
-async def test_a_model_that_ignores_the_giveup_deferral_ends_on_its_second_verdict() -> None:
-    # Bounded termination for the model that refuses to re-poll. Asserted on the run's TERMINAL
-    # STATUS, not on a deferral counter: without the unproductive-deferral bound this run ping-pongs
-    # against the gate until the budget is exhausted, and the assertion that catches that is the run
-    # never reaching `failed`.
-    state = _awaiting_verification_state()
-    tools = [make_finish_tool(verification_blocker=state.block_finish, activity=ActivityRecency())]
-    script = [[("finish", {"status": "failed", "reason": "no code"})] for _ in range(6)]
+    script = [[("finish", {"status": status, "reason": "the code never arrived"})]]
     outcome, caller = await _run(script, tools)
 
-    assert outcome.status == "failed"
+    assert outcome.status == status
+    assert caller.calls == 1
+
+
+@pytest.mark.parametrize("status", ["failed", "terminated"])
+@pytest.mark.asyncio
+async def test_a_give_up_while_a_sign_in_link_is_awaited_is_held_once_then_stands(status: str) -> None:
+    state = _awaiting_link_state()
+    tools = [make_finish_tool(verification_blocker=state.block_finish, activity=ActivityRecency())]
+    script = [[("finish", {"status": status, "reason": "the link never arrived"})] for _ in range(4)]
+    outcome, caller = await _run(script, tools)
+
+    finish_messages = [m["content"] for m in outcome.messages if m.get("role") == "tool" and m.get("name") == "finish"]
+    # 900 - 120 = 780s of budget left.
+    assert any("13.0 minutes of sign-in link polling budget remain" in m for m in finish_messages)
+    assert outcome.status == status
     assert caller.calls == 2
     assert state.giveup_deferrals == 1
 
 
 @pytest.mark.asyncio
-async def test_a_model_that_polls_minimally_ends_within_the_absolute_deferral_cap() -> None:
-    # The monotone-budget bound alone does not terminate: a slice may advance spend by as little as
-    # _MIN_SLICE_SECONDS, so 10s polls would buy ~90 deferrals out of a 900s budget. The absolute cap
-    # is what ends this run, and the assertion is again the terminal status -- a run that never
-    # reaches `failed` here is one the gate trapped.
-    from skyvern.forge.taskv3.auth_tools import _MAX_GIVEUP_DEFERRALS
+async def test_a_model_that_polls_for_a_link_minimally_ends_within_the_deferral_cap() -> None:
+    state = _awaiting_link_state(spent=0.0)
 
-    state = _awaiting_verification_state(spent=0.0)
+    async def _poll(args: dict[str, Any]) -> ToolResult:
+        state.polling_spent_seconds += 10.0
+        state.link_wait_since = time.monotonic()
+        return ToolResult.error("no sign-in link available yet")
+
     tools = [
-        _spend_tool(state, 10.0),
+        ToolSpec(name="open_verification_link", description="poll", parameters={"type": "object"}, handler=_poll),
         make_finish_tool(verification_blocker=state.block_finish, activity=ActivityRecency()),
     ]
     script: list[list[tuple[str, dict[str, Any]]]] = []
     for _ in range(15):
-        script.append([("get_verification_code", {})])
-        script.append([("finish", {"status": "failed", "reason": "no code"})])
+        script.append([("open_verification_link", {})])
+        script.append([("finish", {"status": "failed", "reason": "no link"})])
     outcome, _ = await _run(script, tools, max_turns=60, max_tool_calls=200)
 
     assert outcome.status == "failed"
     assert state.giveup_deferrals == _MAX_GIVEUP_DEFERRALS
-    # The cap, not the budget, is what bound this run: 8 x 10s of polling leaves the budget nearly full.
     assert state.remaining_budget_seconds > 800.0
 
 
 @pytest.mark.asyncio
-async def test_giveup_deferral_is_refused_without_the_deadline_headroom_to_fund_a_poll_slice() -> None:
-    # A deferral asks for a 120s BLOCKING poll on top of the re-finish cycle. Deferring with less
-    # than that leaves the run to die on the wall clock as budget_exhausted -- converting the
-    # model's honest verdict into an unmapped one, the exact conversion the headroom gates exist to
-    # prevent. The failure-evidence gate's 60s reservation is not enough to cover a poll slice.
-    from skyvern.forge.taskv3.loop import (
-        FAILURE_EVIDENCE_MIN_DEADLINE_HEADROOM_SECONDS,
-        VERIFICATION_GIVEUP_MIN_DEADLINE_HEADROOM_SECONDS,
-    )
-
-    assert VERIFICATION_GIVEUP_MIN_DEADLINE_HEADROOM_SECONDS > FAILURE_EVIDENCE_MIN_DEADLINE_HEADROOM_SECONDS
-    state = _awaiting_verification_state()
+async def test_a_link_give_up_is_not_held_without_the_deadline_headroom_to_fund_a_poll_slice() -> None:
+    state = _awaiting_link_state()
     tools = [
         make_finish_tool(
             verification_blocker=state.block_finish,
@@ -11250,66 +11280,42 @@ async def test_giveup_deferral_is_refused_without_the_deadline_headroom_to_fund_
             deadline_at=time.monotonic() + (VERIFICATION_GIVEUP_MIN_DEADLINE_HEADROOM_SECONDS - 5.0),
         )
     ]
-    script = [[("finish", {"status": "failed", "reason": "no code"})]]
-    with capture_logs() as logs:
-        outcome, caller = await _run(script, tools)
+    script = [[("finish", {"status": "failed", "reason": "no link"})]]
+    outcome, caller = await _run(script, tools)
 
     assert outcome.status == "failed"
     assert caller.calls == 1
     assert state.giveup_deferrals == 0
-    # The gate is not consulted at all here, so it writes nothing. That is a KNOWN LIMIT of the
-    # probe, asserted rather than papered over: a give-up refused for want of hold budget is not
-    # directly counted, because only the gate knows whether the run was awaiting a code and this is
-    # the one case where the gate is not asked.
-    assert [e for e in logs if e.get("event") == "task_v3 verification give-up gate"] == []
 
 
 @pytest.mark.asyncio
-async def test_a_completed_verdict_is_never_held_for_unspent_verification_budget() -> None:
-    # The widened primitive answers all three verdicts from one branch, so the completed side has to
-    # be shown unchanged: unspent budget is a reason to keep WAITING, never a reason to refuse a
-    # success the model can see on the page.
-    state = _awaiting_verification_state()
+async def test_a_completed_verdict_after_a_failed_code_source_stands() -> None:
+    state = _verification_state()
+    state.arm(VerificationFailure.NO_CODE_TWICE, "get_verification_code")
+    state.arm(VerificationFailure.BUDGET_EXHAUSTED, "get_verification_code")
     tools = [make_finish_tool(verification_blocker=state.block_finish, activity=ActivityRecency())]
     script = [[("finish", {"status": "completed", "reason": "signed in"})]]
     outcome, caller = await _run(script, tools)
 
     assert outcome.status == "completed"
     assert caller.calls == 1
-    assert state.giveup_deferrals == 0
 
 
 @pytest.mark.asyncio
-async def test_a_completion_blocked_run_still_escapes_via_failed_at_production_wiring() -> None:
-    # The escape hatch `test_verification_blocker_refuses_completed_but_not_failed` protects, pinned
-    # where it actually has to hold. That test passes a bare mock and no `activity`, so the widened
-    # primitive is consulted for `completed` only and the give-up side is never exercised -- but
-    # engine.py always passes an ActivityRecency, so the production configuration DOES reach the
-    # give-up side. What makes the escape safe there is not the missing accounting, it is that a
-    # terminally-failed source returns None from `block_giveup` by construction: giving up IS the
-    # correct answer once the source has been judged. Asserted against the real VerificationState,
-    # not a mock that cannot disagree with the gate it is standing in for.
-
-    state = VerificationState(
-        task=SimpleNamespace(task_id="tsk_1", organization_id="o_1", workflow_run_id=None)  # type: ignore[arg-type]
-    )
-    state.polling_spent_seconds = 120.0
-    state.awaiting_code_since = time.monotonic()
-    state.arm(VerificationFailure.NO_CODE_TWICE, "get_verification_code")
-
+async def test_a_completion_refused_after_a_failed_sign_in_link_still_escapes_via_failed() -> None:
+    state = _verification_state()
+    state.arm(VerificationFailure.NO_LINK_TWICE, "open_verification_link")
     tools = [make_finish_tool(verification_blocker=state.block_finish, activity=ActivityRecency())]
     script = [
         [("finish", {"status": "completed", "reason": "signed in"})],
-        [("finish", {"status": "failed", "reason": "the code never arrived"})],
+        [("finish", {"status": "failed", "reason": "the link never arrived"})],
     ]
     outcome, caller = await _run(script, tools)
 
     finish_messages = [m["content"] for m in outcome.messages if m.get("role") == "tool" and m.get("name") == "finish"]
-    assert any("the verification step never completed" in m for m in finish_messages)
-    # On its FIRST failed verdict, with no hold in between -- two LLM turns total.
+    assert any("the sign-in link step never completed" in m for m in finish_messages)
     assert outcome.status == "failed"
     assert caller.calls == 2
-    assert state.giveup_deferrals == 0
 
 
 @pytest.mark.asyncio
