@@ -1537,6 +1537,7 @@ class TestSkyvernExecuteMCP:
         assert mcp_browser.skyvern_click.call_args.kwargs["selector"] == 'role=button[name="Current"]'
 
     @pytest.mark.asyncio
+    @pytest.mark.usefixtures("public_dns")
     async def test_navigate_clears_session_refs(self, monkeypatch: pytest.MonkeyPatch) -> None:
         page = _make_page()
         ctx = BrowserContext(mode="cloud_session", session_id="pbs_navigate_refs")
@@ -1560,6 +1561,7 @@ class TestSkyvernExecuteMCP:
         )
 
     @pytest.mark.asyncio
+    @pytest.mark.usefixtures("public_dns")
     async def test_navigate_clears_batch_refs(self, monkeypatch: pytest.MonkeyPatch) -> None:
         page = _make_page()
         ctx = BrowserContext(mode="cloud_session", session_id="pbs_batch_navigate_refs")
@@ -1780,6 +1782,7 @@ class TestSkyvernExecuteMCP:
         assert result.error_step is None
 
     @pytest.mark.asyncio
+    @pytest.mark.usefixtures("public_dns")
     async def test_observe_started_during_navigation_is_discarded(self, monkeypatch: pytest.MonkeyPatch) -> None:
         """A generation captured while navigation is in flight must not commit after it completes."""
         page = _make_page()
@@ -1900,6 +1903,7 @@ class TestSkyvernExecuteMCP:
         click.assert_not_awaited()
 
     @pytest.mark.asyncio
+    @pytest.mark.usefixtures("public_dns")
     async def test_failed_navigation_still_invalidates_midflight_observe(self, monkeypatch: pytest.MonkeyPatch) -> None:
         """A navigation that raises can still have replaced the document — mid-flight commits must die."""
         page = _make_page()

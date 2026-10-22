@@ -3,6 +3,7 @@ import type {
   EditorStateSnapshot,
   RestoreResult,
 } from "../editor/editorStateSnapshot";
+import { ATTACHMENT_SIZE_LIMIT_BYTES } from "./attachmentLimits";
 import { flushBufferedEditorEdits } from "@/hooks/useDeferredLockedEdit";
 import { hashKey } from "@tanstack/react-query";
 import {
@@ -25,6 +26,7 @@ import {
 } from "@/store/WorkflowYamlEditorStore";
 import { ArtifactDownloadLink } from "@/components/ArtifactDownloadLink";
 import { Button } from "@/components/ui/button";
+import { StartFromCards } from "@/components/StartFromCards";
 import {
   Fragment,
   useState,
@@ -58,7 +60,6 @@ import {
   ChevronDownIcon,
   ArrowUpIcon,
   FileIcon,
-  UploadIcon,
   PlusIcon,
   PauseIcon,
   ExclamationTriangleIcon,
@@ -791,8 +792,6 @@ const ATTACHMENT_EXTENSIONS = [
   ...VIDEO_ATTACHMENT_EXTENSIONS,
 ] as const;
 const ATTACHMENT_ACCEPT = ATTACHMENT_EXTENSIONS.join(",");
-// Mirrors the server's MAX_UPLOAD_FILE_SIZE.
-const ATTACHMENT_SIZE_LIMIT_BYTES = 30 * 1024 * 1024;
 // Mirrors MAX_ATTACHED_FILES_PER_MESSAGE on the chat request.
 const ATTACHMENT_COUNT_LIMIT = 20;
 
@@ -1803,7 +1802,6 @@ export function WorkflowCopilotChat({
     (outstandingAccept?.snapshot as CanonicalRecovery | undefined)
       ?.unattributedClaim === true;
   const initialHandoffMessageId = `initial-copilot-message-${workflowPermanentId ?? "pending"}`;
-  const sopFileInputRef = useRef<HTMLInputElement>(null);
   // Set when a file is staged while the composer is hidden or not yet mounted.
   const focusComposerWhenShownRef = useRef(false);
   const recordingAuthoringActive = useRecordingStore(
@@ -11239,49 +11237,22 @@ export function WorkflowCopilotChat({
                   </p>
                 </div>
 
-                <div className="[container-name:copilot-actions] [container-type:inline-size]">
-                  <p className="text-xs text-muted-foreground/80">
-                    Or start from
-                  </p>
-                  <div className="mt-2 grid grid-cols-1 gap-2 [@container_copilot-actions_(min-width:440px)]:grid-cols-2">
-                    <TooltipProvider>
-                      <ControlTooltip
-                        content={
-                          attachDisabledReason ??
-                          "Attach a procedure PDF for Copilot to build from"
-                        }
-                        blocked={attachDisabledReason !== null}
-                        side="top"
-                        wrapperClassName="min-w-0 w-full"
-                      >
-                        <button
-                          type="button"
-                          aria-label="Upload an SOP"
-                          className="flex w-full min-w-0 items-center gap-3 rounded-lg border border-border bg-slate-elevation3 p-3 text-left transition-colors hover:bg-accent focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring disabled:pointer-events-none disabled:cursor-not-allowed disabled:opacity-50"
-                          disabled={attachDisabledReason !== null}
-                          onClick={() => sopFileInputRef.current?.click()}
-                        >
-                          <span className="flex h-8 w-8 shrink-0 items-center justify-center rounded-md border border-border bg-slate-elevation2">
-                            <UploadIcon className="h-4 w-4" />
-                          </span>
-                          <span className="min-w-0">
-                            <span className="block font-medium text-foreground">
-                              Upload an SOP
-                            </span>
-                            <span className="mt-0.5 block text-xs leading-snug text-muted-foreground">
-                              A PDF of the procedure
-                            </span>
-                          </span>
-                        </button>
-                      </ControlTooltip>
-                    </TooltipProvider>
-                    <DemonstrateTaskButton
-                      disabled={recordTaskDisabled}
-                      disabledReason={recordTaskUnavailableReason}
-                      onClick={startRecordTask}
-                    />
-                  </div>
-                </div>
+                <StartFromCards
+                  className="[container-name:copilot-actions] [container-type:inline-size]"
+                  gridClassName="[@container_copilot-actions_(min-width:440px)]:grid-cols-2"
+                  uploadSOP={{
+                    onFile: (file) => stageSopFile(file, sopAttachmentDraft()),
+                    disabled: attachDisabledReason !== null,
+                    tooltip: attachDisabledReason ?? undefined,
+                  }}
+                  recordTask={{
+                    onSelect: startRecordTask,
+                    disabled: recordTaskDisabled,
+                    tooltip: recordTaskDisabled
+                      ? recordTaskUnavailableReason
+                      : undefined,
+                  }}
+                />
               </div>
             ) : null}
             <ConvoAggregatePill
@@ -12532,18 +12503,6 @@ export function WorkflowCopilotChat({
                 // Reset first: picking the same file twice in a row fires no change event otherwise.
                 event.target.value = "";
                 if (file) void uploadAttachment(file);
-              }}
-            />
-            <input
-              ref={sopFileInputRef}
-              type="file"
-              accept=".pdf,application/pdf"
-              aria-label="Choose an SOP PDF"
-              className="hidden"
-              onChange={(event) => {
-                const file = event.target.files?.[0];
-                event.target.value = "";
-                if (file) stageSopFile(file, sopAttachmentDraft());
               }}
             />
             {/* As tall as one textarea line box, so the controls center on the last line as the textarea grows. */}

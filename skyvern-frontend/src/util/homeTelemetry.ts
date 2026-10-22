@@ -120,6 +120,7 @@ export const HomeTelemetry = {
   uploadDocumentSelected: () => capture("upload_document_selected"),
   uploadDocumentFinished: (ok: boolean) =>
     capture("upload_document_finished", { ok }),
+  uploadSopSelected: () => capture("upload_sop_selected"),
   recordTaskSelected: () => capture("record_task_selected"),
   voiceToggled: () => capture("voice_toggled"),
   skipToBlankCanvasClicked: (attempt: AgentCreationAttempt) =>

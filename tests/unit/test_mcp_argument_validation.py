@@ -207,6 +207,7 @@ def test_csv_list_repair_leaves_excessive_item_count_for_other_validation() -> N
 
 
 @pytest.mark.asyncio
+@pytest.mark.usefixtures("public_dns")
 async def test_navigate_sub_1000_timeout_is_treated_as_seconds_and_converted_to_milliseconds(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -244,6 +245,7 @@ async def test_navigate_fractional_seconds_stay_unchanged_when_rescaling_is_stil
 
 
 @pytest.mark.asyncio
+@pytest.mark.usefixtures("public_dns")
 async def test_navigate_timeout_at_millisecond_threshold_is_not_scaled(monkeypatch: pytest.MonkeyPatch) -> None:
     navigate = _mock_navigation(monkeypatch)
 
