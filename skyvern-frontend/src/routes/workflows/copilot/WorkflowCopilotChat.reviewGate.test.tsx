@@ -638,6 +638,11 @@ async function acceptRefusedWith(status: number) {
   });
 }
 
+// The save path's own wording for a proposal whose block graph it refuses.
+const INVALID_GRAPH_DETAIL =
+  "Circular reference detected: some blocks form a loop through their next_block_label" +
+  " references, causing an infinite cycle.";
+
 const proposedWorkflowPayload = (
   overrides: Record<string, unknown> = {},
 ): Record<string, unknown> => ({
@@ -2772,7 +2777,7 @@ describe("WorkflowCopilotChat — g2 review gate", () => {
       const owner = createYamlCommitOwner("wpid_1");
       registerEditorOwner(owner);
       if (mode === "HTTP rejection")
-        cancelPost.mockRejectedValueOnce({ response: { status: 422 } });
+        cancelPost.mockRejectedValueOnce({ response: { status: 500 } });
       vi.useFakeTimers();
       await act(async () =>
         fireEvent.click(screen.getByRole("button", { name: "Accept" })),
@@ -3330,7 +3335,7 @@ describe("WorkflowCopilotChat — g2 review gate", () => {
         historyResponse.data.workflow_copilot_chat_id = null;
       } else if (mode === "failed-server") {
         historyResponse.data.proposed_workflow = proposedWorkflowPayload();
-        cancelPost.mockRejectedValueOnce({ response: { status: 422 } });
+        cancelPost.mockRejectedValueOnce({ response: { status: 500 } });
       } else {
         cancelPost.mockResolvedValueOnce({
           data: proposedWorkflowPayload({
@@ -4514,7 +4519,7 @@ describe("WorkflowCopilotChat — g2 review gate", () => {
         if (mode !== "terminal") {
           if (mode === "fallback") {
             historyResponse.data.proposed_workflow = appliedWorkflow;
-            cancelPost.mockRejectedValueOnce({ response: { status: 422 } });
+            cancelPost.mockRejectedValueOnce({ response: { status: 500 } });
           } else cancelPost.mockResolvedValueOnce({ data: appliedWorkflow });
           await act(async () =>
             fireEvent.click(screen.getByRole("button", { name: "Accept" })),
@@ -7682,9 +7687,33 @@ describe("WorkflowCopilotChat — g2 review gate", () => {
     expect(screen.getByRole("button", { name: "Accept" })).toBeTruthy();
   });
 
-  it.each([false, true])(
-    "settles a surviving proposal from a newer canonical version only with no-write proof: %s",
-    async (wroteNothing) => {
+  it.each([
+    {
+      refusal: "unproven",
+      error: new Error("Network Error"),
+      wroteNothing: false,
+    },
+    {
+      refusal: "409",
+      error: { response: { status: 409 } },
+      wroteNothing: true,
+    },
+    {
+      // SKY-18820: the save path refusing the proposal's own definition. While 422 was not
+      // no-write proof this entered the recovery poll instead, and the proposal the route
+      // restores on the way out keeps that poll running, so Send and Save never came back.
+      refusal: "422 invalid definition",
+      error: {
+        response: {
+          status: 422,
+          data: { detail: INVALID_GRAPH_DETAIL },
+        },
+      },
+      wroteNothing: true,
+    },
+  ])(
+    "settles a surviving proposal from a newer canonical version only with no-write proof: $refusal",
+    async ({ error: refusalError, wroteNothing }) => {
       const onWorkflowUpdate = vi.fn();
       useWorkflowHasChangesStore.setState({
         getSaveData: () =>
@@ -7712,11 +7741,7 @@ describe("WorkflowCopilotChat — g2 review gate", () => {
           path === "/workflows/wpid_1" ? { data: created } : historyResponse,
         ),
       );
-      cancelPost.mockRejectedValueOnce(
-        wroteNothing
-          ? { response: { status: 409 } }
-          : new Error("Network Error"),
-      );
+      cancelPost.mockRejectedValueOnce(refusalError);
 
       await act(async () => {
         fireEvent.click(screen.getByRole("button", { name: "Accept" }));
@@ -7743,6 +7768,18 @@ describe("WorkflowCopilotChat — g2 review gate", () => {
         useWorkflowYamlEditorStore.getState().copilotAcceptance !== null,
       ).toBe(!wroteNothing);
       if (wroteNothing) expect(screen.getByText("Not saved")).toBeTruthy();
+      // A refusal that names the problem has to reach the user: the toast is the only place the
+      // save path's verdict is shown, and it is what tells them what to change.
+      const detail = (
+        refusalError as { response?: { data?: { detail?: string } } }
+      ).response?.data?.detail;
+      if (detail)
+        expect(toast).toHaveBeenCalledWith(
+          expect.objectContaining({
+            title: "Accept failed",
+            description: detail,
+          }),
+        );
     },
   );
 
@@ -13214,7 +13251,7 @@ describe("WorkflowCopilotChat — g2 review gate", () => {
       const owner = createYamlCommitOwner("wpid_1");
       registerEditorOwner(owner);
       if (mode === "HTTP rejection")
-        cancelPost.mockRejectedValueOnce({ response: { status: 422 } });
+        cancelPost.mockRejectedValueOnce({ response: { status: 500 } });
       vi.useFakeTimers();
       await act(async () =>
         fireEvent.click(screen.getByRole("button", { name: "Accept" })),
