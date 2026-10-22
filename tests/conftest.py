@@ -17,6 +17,7 @@ import structlog
 from _pytest.monkeypatch import NOTSET, derive_importpath
 from structlog._config import BoundLoggerLazyProxy
 
+from skyvern.cli.core import action_log
 from skyvern.config import settings
 from skyvern.forge import app, forge_app_initializer, request_logging
 from skyvern.forge.sdk.core import organization_age_cache
@@ -88,6 +89,13 @@ def _configure_logging_once_per_process() -> None:
 def _url_validation_enabled(monkeypatch: pytest.MonkeyPatch) -> None:
     """URL validation is off by default; tests assert the validated behavior unless they opt out."""
     monkeypatch.setattr(settings, "ENABLE_URL_VALIDATION", True)
+
+
+@pytest.fixture(autouse=True)
+def _no_action_log_delivery(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The shared MCP action-log worker posts each cloud-session tool call to SKYVERN_BASE_URL, the public API by
+    default. Tests that exercise delivery build their own ActionLogWorker."""
+    monkeypatch.setattr(action_log.action_log_worker, "_send_batch", AsyncMock())
 
 
 LOOP_OWNER = ("skyvern/forge/agent.py", "_execute_task_v3")
