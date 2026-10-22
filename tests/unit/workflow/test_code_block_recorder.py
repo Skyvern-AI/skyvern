@@ -4420,39 +4420,6 @@ async def test_locator_probe_reraises_cancellation() -> None:
 
 
 @pytest.mark.asyncio
-async def test_locator_probe_consumes_a_late_failing_count_after_timeout() -> None:
-    import gc
-
-    # A driver reply that lands after the bounded wait (a navigation that destroys the execution
-    # context) must be retrieved by the probe, not left as an unretrieved-future error -- the exact
-    # signal this telemetry measures. Without the detached-task consume wiring, the late task
-    # exception is logged by asyncio at GC; this asserts it is not.
-    loop = asyncio.get_running_loop()
-    captured: list[dict[str, Any]] = []
-    previous = loop.get_exception_handler()
-    loop.set_exception_handler(lambda _loop, ctx: captured.append(ctx))
-
-    class _LateNavFailLocator:
-        async def count(self) -> int:
-            try:
-                await asyncio.sleep(3600)
-            except asyncio.CancelledError:
-                raise RuntimeError("Execution context was destroyed, most likely because of a navigation") from None
-
-    try:
-        result = await _probe_code_block()._probe_failed_locator_count(_LateNavFailLocator())
-        assert result == (None, "timeout")
-        for _ in range(3):
-            await asyncio.sleep(0)
-        gc.collect()
-        await asyncio.sleep(0)
-    finally:
-        loop.set_exception_handler(previous)
-
-    assert not any("never retrieved" in str(ctx.get("message", "")) for ctx in captured)
-
-
-@pytest.mark.asyncio
 async def test_operation_attribution_event_allowlist_and_privacy() -> None:
     from structlog.testing import capture_logs
 

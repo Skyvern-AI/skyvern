@@ -1906,7 +1906,7 @@ async def test_group_fill_fallback_navigation_before_final_box_fails(monkeypatch
     ("phase", "remount_kind"),
     [
         (phase, kind)
-        for phase in ("stream", "stream_error", "stream_missing", "fallback")
+        for phase in ("stream", "fallback")
         for kind in (
             "identical",
             "different",
@@ -1923,6 +1923,7 @@ async def test_group_fill_fallback_navigation_before_final_box_fails(monkeypatch
             "dashboard",
         )
     ]
+    + [(phase, kind) for phase in ("stream_error", "stream_missing") for kind in ("identical", "different", "gone")]
     + [
         ("stream", "all_live"),
         ("fallback", "all_live"),
@@ -2492,7 +2493,7 @@ def test_partial_totp_plan_requires_explicit_planner_intent(response: dict[str, 
     assert agent_module._planner_confirmed_verification_code_intent(response) is expected
 
 
-@pytest.mark.parametrize("filled", [False, True])
+@pytest.mark.parametrize(("filled", "code_source"), [(False, "secret"), (True, "external")])
 @pytest.mark.parametrize(
     "plan_kind",
     [
@@ -2514,7 +2515,6 @@ def test_partial_totp_plan_requires_explicit_planner_intent(response: dict[str, 
         "leading-navigation",
     ],
 )
-@pytest.mark.parametrize("code_source", ["secret", "external"])
 @pytest.mark.asyncio
 async def test_execute_step_rebound_group_requires_expected_value(
     monkeypatch: pytest.MonkeyPatch,

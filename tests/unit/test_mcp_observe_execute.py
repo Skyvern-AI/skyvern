@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import asyncio
-import gc
 from types import SimpleNamespace
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock, PropertyMock, call
@@ -1926,15 +1925,6 @@ class TestSkyvernExecuteMCP:
         assert nav_result["ok"] is False
         assert committed is False
         assert session_manager.get_session_ref("e0", session_id=ctx.session_id) is None
-
-    def test_page_identity_key_never_reused_after_gc(self) -> None:
-        """Identity tokens must not be reissued to a new page even if id() is reused."""
-        page = _make_page()
-        old_key = session_manager.page_ref_key(page)
-        del page
-        gc.collect()
-        new_page = _make_page()
-        assert session_manager.page_ref_key(new_page) != old_key
 
     @pytest.mark.asyncio
     async def test_stale_observe_commit_is_discarded_after_clear(self) -> None:

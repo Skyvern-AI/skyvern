@@ -844,7 +844,7 @@ async def test_invalid_credential_id_degrades_instead_of_crashing(monkeypatch: p
     monkeypatch.setattr(credential_pause_module, "CREDENTIAL_RESPONSE_POLL_SECONDS", 0.01)
 
     stream = _make_stream()
-    config = CopilotConfig(credential_pause_enabled=True, credential_pause_timeout_seconds=5)
+    config = CopilotConfig(credential_pause_enabled=True, credential_pause_timeout_seconds=1)
 
     resume_msgs = await maybe_credential_pause(ctx, _fake_result(), stream, config)
 

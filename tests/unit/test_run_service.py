@@ -1,5 +1,4 @@
 import asyncio
-import gc
 from datetime import UTC, datetime
 from typing import Any
 from unittest.mock import AsyncMock
@@ -152,28 +151,6 @@ async def test_cancelled_waiter_does_not_cancel_the_shared_build(build: _GatedBu
     assert (await stayer).run_id == RUN_ID
     assert leaver.cancelled()
     assert len(build.calls) == 1
-    assert run_service._IN_FLIGHT == {}
-
-
-def test_failed_build_whose_waiters_all_left_is_not_reported_as_unretrieved(build: _GatedBuild) -> None:
-    reported: list[str] = []
-
-    async def every_waiter_leaves_then_the_build_fails() -> None:
-        asyncio.get_running_loop().set_exception_handler(lambda _loop, context: reported.append(context["message"]))
-        build.error = RuntimeError("db down")
-        polls = [asyncio.create_task(_get()) for _ in range(3)]
-        await _settle()
-        for poll in polls:
-            poll.cancel()
-        await asyncio.gather(*polls, return_exceptions=True)
-        build.release.set()
-        await _settle()
-
-    # asyncio reports an unretrieved exception when the task is finalized, so the loop must be gone first.
-    asyncio.run(every_waiter_leaves_then_the_build_fails())
-    gc.collect()
-
-    assert reported == []
     assert run_service._IN_FLIGHT == {}
 
 

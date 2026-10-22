@@ -736,8 +736,7 @@ async def test_get_verification_code_tail_shorter_than_a_poll_interval_counts_as
     tools, _ = auth_tools.build_auth_tools(_task(totp_verification_url="https://totp.example"))
     first = await tools[0].handler({})
     second = await tools[0].handler({})
-    assert "returned an error" in first.content and "http_status=204x3" in first.content
-    assert "no polling time remains" in first.content
+    assert first.content == f"{auth_tools._CODE_BUDGET_SPENT} It answered: http_status=204x3."
     assert second.content == auth_tools._CODE_BUDGET_SPENT
     assert resolver_calls == 1
 
@@ -1836,7 +1835,7 @@ _STATUS_CASES: list[tuple[str, Any, str]] = [
     (
         "webhook_answering_http_500",
         NoTOTPVerificationCodeFound(task_id="tsk_1", webhook_diagnostics="http_status=500x12"),
-        "returned an error (NoTOTPVerificationCodeFound: http_status=500x12); about",
+        "no verification code has arrived yet (http_status=500x12); about",
     ),
     (
         "transport_error",

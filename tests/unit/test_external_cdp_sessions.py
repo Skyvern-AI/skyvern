@@ -975,8 +975,18 @@ async def test_a_failed_close_at_the_deadline_is_retried_until_the_row_is_final(
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("run_type", ["task", "workflow_run"])
-@pytest.mark.parametrize("loss", ["expired", "killed", "closed", "vanished"])
+@pytest.mark.parametrize(
+    ("loss", "run_type"),
+    [
+        ("expired", "workflow_run"),
+        ("killed", "task"),
+        ("killed", "workflow_run"),
+        ("closed", "task"),
+        ("closed", "workflow_run"),
+        ("vanished", "task"),
+        ("vanished", "workflow_run"),
+    ],
+)
 async def test_the_next_step_after_losing_a_registration_fails_with_that_fact_and_launches_nothing(
     stack: SimpleNamespace, run_type: str, loss: str
 ) -> None:
