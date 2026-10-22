@@ -62,7 +62,6 @@ from skyvern.forge.sdk.services.local_org_auth_token_service import (
     regenerate_local_api_key,
 )
 from skyvern.forge.sdk.services.route_authorization import ROUTE_AUTHORIZATION_DEPENDENCY
-from skyvern.services.browser_recording.session_registry import interpretation_registry
 from skyvern.services.cleanup_service import (
     start_cleanup_scheduler,
     start_hosted_driver_sweep,
@@ -469,7 +468,6 @@ async def lifespan(fastapi_app: FastAPI) -> AsyncGenerator[None, Any]:
     await stop_cleanup_scheduler()
     await stop_temp_artifact_sweep()
     await stop_hosted_driver_sweep()
-    await interpretation_registry.stop_all()
 
     if forge_app.api_app_shutdown_event:
         LOG.info("Calling api app shutdown event")

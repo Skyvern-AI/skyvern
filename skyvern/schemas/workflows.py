@@ -1897,10 +1897,6 @@ class WorkflowDefinitionYAML(BaseModel):
 
 class WorkflowCreateYAMLRequest(BaseModel):
     title: str
-    recording_id: str | None = Field(
-        default=None,
-        description="Durable browser recording to attach to the workflow version created by this save.",
-    )
     description: str | None = None
     proxy_location: ProxyLocation | GeoTarget | dict | None = Field(
         default=None,
