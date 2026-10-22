@@ -325,6 +325,7 @@ from skyvern.schemas.workflows import (
     BlockResult,
     BlockStatus,
     BlockType,
+    CodeBlockFailureKind,
     FileDownloadTarget,
     FileStorageType,
     FileType,
@@ -1219,6 +1220,7 @@ class Block(BaseModel, abc.ABC):
         error_codes: list[str] | None = None,
         is_synthetic_loop_failure: bool = False,
         can_continue_after_failure: bool | None = None,
+        codeblock_failure_kind: CodeBlockFailureKind | None = None,
     ) -> BlockResult:
         if can_continue_after_failure is None:
             can_continue_after_failure = success or self.FAILURE_IS_CONTINUABLE
@@ -1254,6 +1256,7 @@ class Block(BaseModel, abc.ABC):
             workflow_run_block_id=workflow_run_block_id,
             is_synthetic_loop_failure=is_synthetic_loop_failure,
             can_continue_after_failure=can_continue_after_failure,
+            codeblock_failure_kind=codeblock_failure_kind,
         )
 
     async def get_or_create_browser_state(
@@ -9056,6 +9059,7 @@ async def wrapper({default_args}):
         sign_in_form_visible: bool = False,
         authored_code: str | None,
         code_failure_reason: str | None,
+        failure_kind: CodeBlockFailureKind | None = None,
     ) -> BlockResult:
         resolved_redaction_parameters = redaction_parameters or {}
         staged_frame: _StagedFrame | None = None
@@ -9066,6 +9070,11 @@ async def wrapper({default_args}):
 
         def with_sign_in_fact(result: BlockResult) -> BlockResult:
             return replace(result, sign_in_form_visible=True) if sign_in_form_visible else result
+
+        def with_failure_kind(result: BlockResult) -> BlockResult:
+            # Only the handed-in failure and a fallback that fired and still failed inherit it; a download-binding
+            # failure after a successful heal is a new failure and stays unclassified.
+            return replace(result, codeblock_failure_kind=failure_kind) if failure_kind is not None else result
 
         if (
             organization_id
@@ -9182,6 +9191,7 @@ async def wrapper({default_args}):
                             organization_id=organization_id,
                             error_codes=result.error_codes or None,
                         )
+                    result = with_failure_kind(result)
                 result = _redact_codeblock_result(result, resolved_redaction_parameters)
                 output_obligation = self._output_obligation_for_heal_result(result)
                 # Record output before finalizing so a failed write fails closed, never leaving a
@@ -9214,7 +9224,9 @@ async def wrapper({default_args}):
 
             async def persist_unhealed_failure() -> BlockResult:
                 result = await build_failure_result()
-                return with_sign_in_fact(_redact_codeblock_result(result, resolved_redaction_parameters))
+                return with_failure_kind(
+                    with_sign_in_fact(_redact_codeblock_result(result, resolved_redaction_parameters))
+                )
 
             return await self._publish_failure_result_with_evidence(
                 build_failure_result=persist_unhealed_failure,
@@ -9949,6 +9961,7 @@ async def wrapper({default_args}):
                                 if secure_code_block_result.download_operation_receipt is not None
                                 else None
                             ),
+                            failure_kind=secure_failure.failure_kind,
                         )
                     if secure_code_block_result.block_result is None:
                         LOG.warning(
