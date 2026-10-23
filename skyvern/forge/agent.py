@@ -412,6 +412,15 @@ CUA_EXECUTE_ACTIONS_DIRECTIVE = (
 )
 
 
+def _get_browser_state_for_cleanup(task: Task) -> BrowserState | None:
+    # Workflow blocks that never ran a v1 action (Task V3) register the browser under the run id only.
+    # A plain lookup avoids aliasing the task, which would make workflow-run teardown close the state twice.
+    browser_state = app.BROWSER_MANAGER.get_for_task(task.task_id)
+    if browser_state is None and task.workflow_run_id:
+        browser_state = app.BROWSER_MANAGER.get_for_workflow_run(task.workflow_run_id)
+    return browser_state
+
+
 async def resolve_inherited_workflow_task_page(browser_state: BrowserState, workflow_run_id: str) -> Page:
     working_page = await browser_state.get_working_page()
     if not working_page:
@@ -4456,6 +4465,8 @@ class ForgeAgent:
                     last_step=step,
                     api_key=api_key,
                     need_call_webhook=True,
+                    # A goto-only workflow block never took a final screenshot; the full-page capture costs seconds.
+                    need_final_screenshot=task.workflow_run_id is None,
                     close_browser_on_completion=close_browser_on_completion,
                     browser_session_id=browser_session_id,
                 )
@@ -9656,7 +9667,7 @@ class ForgeAgent:
             # initialization. In this case, we don't have any artifacts to send and we can't take final screenshots etc.
             # since the browser is not initialized properly or the proxy is not working.
 
-            browser_state = app.BROWSER_MANAGER.get_for_task(task.task_id)
+            browser_state = _get_browser_state_for_cleanup(task)
             if browser_state is not None:
                 # get_working_page() is inside the try so a raise here cannot propagate and strand the
                 # task listener/claim state armed (terminal-expiry promise).
@@ -9685,7 +9696,7 @@ class ForgeAgent:
             _tracer = otel_trace.get_tracer("skyvern")
             with traced_span(_tracer, "skyvern.agent.cleanup.save_downloaded_files") as _cl_save_span:
                 apply_context_attrs(_cl_save_span)
-                browser_state = app.BROWSER_MANAGER.get_for_task(task.task_id)
+                browser_state = _get_browser_state_for_cleanup(task)
                 browser_context = browser_state.browser_context if browser_state is not None else None
                 track_download_outcome = has_download_interceptor_for_context(browser_context)
                 context = skyvern_context.current()
