@@ -97,6 +97,7 @@ from skyvern.exceptions import (
     OptionIndexOutOfBound,
     PhoneNumberInputBrowserInteractionFailed,
     PhoneNumberInputBrowserValidityMismatch,
+    PhoneNumberInputCountryCodeMismatch,
     PhoneNumberInputMismatch,
     ScreenshotTargetClosed,
     SecretInputMismatch,
@@ -2785,6 +2786,7 @@ async def check_phone_number_format(
     scraped_page: ScrapedPage,
     task: Task,
     step: Step,
+    field_current_value: str | None = None,
 ) -> str:
     # check the phone number format
     LOG.info(
@@ -2810,22 +2812,37 @@ async def check_phone_number_format(
     )
 
     check_phone_number_format_response = CheckPhoneNumberFormatResponse.model_validate(json_response)
+    recommended_phone_number = check_phone_number_format_response.recommended_phone_number
     if (
         not check_phone_number_format_response.is_phone_number_input
         or check_phone_number_format_response.is_current_format_correct
-        or not check_phone_number_format_response.recommended_phone_number
+        or not recommended_phone_number
     ):
+        return value
+
+    # A country picker next to an international field selects the same dial code the field holds, so
+    # dropping the dial code here leaves the picker to infer a country from the national digits.
+    if _recommendation_drops_dial_code(value, recommended_phone_number) and _tel_field_carries_dial_code(
+        field_value=field_current_value,
+        placeholder=await skyvern_element.get_attr("placeholder"),
+        autocomplete=await skyvern_element.get_attr("autocomplete"),
+    ):
+        LOG.info(
+            "Keeping the country calling code of an international phone input, ignoring the recommended number",
+            element_id=skyvern_element.get_id(),
+            source_digit_count=len(_phone_digits(value)),
+            recommended_digit_count=len(_phone_digits(recommended_phone_number)),
+        )
         return value
 
     LOG.info(
         "The current phone number format is incorrect, using the recommended phone number",
         element_id=skyvern_element.get_id(),
         source_digit_count=len(_phone_digits(value)),
-        recommended_digit_count=len(_phone_digits(check_phone_number_format_response.recommended_phone_number)),
-        digit_count_changed=len(_phone_digits(value))
-        != len(_phone_digits(check_phone_number_format_response.recommended_phone_number)),
+        recommended_digit_count=len(_phone_digits(recommended_phone_number)),
+        digit_count_changed=len(_phone_digits(value)) != len(_phone_digits(recommended_phone_number)),
     )
-    return check_phone_number_format_response.recommended_phone_number
+    return recommended_phone_number
 
 
 def _phone_digits(value: str | None) -> str:
@@ -2860,6 +2877,92 @@ def _phone_readback_digits_match(
 
 def _has_explicit_nanp_country_code(value: str | None) -> bool:
     return re.match(r"\+1|1[ \-.(]", (value or "").strip()) is not None
+
+
+_DIAL_CODE_PREFIX_RE = re.compile(r"^\s*\+\s*\d")
+# Shorter digit strings are more likely an extension or a local number than an international number
+# whose leading digits a widget could read as a country calling code.
+_MIN_INTERNATIONAL_PHONE_DIGITS = 8
+_NATIONAL_ONLY_AUTOCOMPLETE_TOKENS = frozenset({"tel-national", "tel-local", "tel-area-code", "tel-extension"})
+
+
+def _has_explicit_dial_code(value: str | None) -> bool:
+    return _DIAL_CODE_PREFIX_RE.match(value or "") is not None
+
+
+def _is_international_phone_form(value: str | None) -> bool:
+    # A leading "+" makes the digits that follow a country calling code plus the number. Unlike
+    # _has_explicit_dial_code this accepts a bare "+", which is a field's own international form
+    # before any digits are in it.
+    return (value or "").lstrip().startswith("+")
+
+
+def _tel_field_carries_dial_code(*, field_value: str | None, placeholder: str | None, autocomplete: str | None) -> bool:
+    """Whether this field takes the international number, so a paired country picker only mirrors it."""
+    autocomplete_tokens = (autocomplete or "").lower().split()
+    if _NATIONAL_ONLY_AUTOCOMPLETE_TOKENS.intersection(autocomplete_tokens):
+        return False
+    # A placeholder needs a dial code in it to be about phone format at all ("+ Add phone" is not); an
+    # example number in a national box can still read as one, which keeps a code the site may not want
+    # over dropping one it does. A value of bare "+" is what such a field holds before anything is typed.
+    return (
+        "tel" in autocomplete_tokens
+        or _has_explicit_dial_code(placeholder)
+        or _is_international_phone_form(field_value)
+    )
+
+
+def _recommendation_drops_dial_code(value: str, recommended: str) -> bool:
+    if not _has_explicit_dial_code(value) or _is_international_phone_form(recommended):
+        return False
+    value_digits = _phone_digits(value)
+    recommended_digits = _phone_digits(recommended)
+    return (
+        bool(recommended_digits)
+        and len(recommended_digits) < len(value_digits)
+        and (
+            value_digits.endswith(recommended_digits)
+            or (
+                recommended_digits.startswith("0")
+                and len(recommended_digits) > 1
+                and value_digits.endswith(recommended_digits[1:])
+            )
+        )
+    )
+
+
+def _tel_country_code_mismatch(
+    *, expected_value: str, actual_value: str | None, dial_code_withheld: bool = False
+) -> PhoneNumberInputCountryCodeMismatch | None:
+    """A field rendering its value in international form while reading digits of the number itself as the
+    country calling code. ``dial_code_withheld`` says the digits typed are a number whose own calling code
+    was taken off, which is the only evidence that a "+" in front of them is the wrong country: digits
+    that were never written with a "+" can equally be an international number given without one.
+    """
+    if not _is_international_phone_form(actual_value):
+        return None
+    expected_digits = _phone_digits(expected_value)
+    actual_digits = _phone_digits(actual_value)
+    if not actual_digits:
+        return None
+    if _has_explicit_dial_code(expected_value):
+        # A national trunk zero promoted to a false calling code also hides the lost dial code.
+        actual_without_trunk_prefix = (
+            actual_digits[1:] if actual_digits.startswith("0") and len(actual_digits) > 1 else actual_digits
+        )
+        if not (
+            len(actual_digits) < len(expected_digits)
+            and (expected_digits.endswith(actual_digits) or expected_digits.endswith(actual_without_trunk_prefix))
+        ):
+            return None
+    elif not dial_code_withheld or actual_digits != expected_digits:
+        return None
+    elif len(actual_digits) < _MIN_INTERNATIONAL_PHONE_DIGITS:
+        return None
+    return PhoneNumberInputCountryCodeMismatch(
+        expected_digit_count=len(expected_digits),
+        actual_digit_count=len(actual_digits),
+    )
 
 
 def _nanp_national_digits(value: str | None) -> str | None:
@@ -3108,6 +3211,7 @@ async def verify_phone_input_digits(
     locator: Locator,
     expected_value: str,
     allow_nanp_country_prefix: bool = False,
+    dial_code_withheld: bool = False,
     pattern: str | None = None,
     maxlength: str | None = None,
     engine_selection: BrowserEngineSelection | None = None,
@@ -3131,6 +3235,11 @@ async def verify_phone_input_digits(
             expected_digit_count=len(expected_digits),
             actual_digit_count=len(actual_digits),
         )
+    country_code_mismatch = _tel_country_code_mismatch(
+        expected_value=expected_value, actual_value=actual_value, dial_code_withheld=dial_code_withheld
+    )
+    if country_code_mismatch is not None:
+        raise country_code_mismatch
     LOG.info(
         "Phone input read-back verified",
         expected_digit_count=len(expected_digits),
@@ -3145,6 +3254,7 @@ async def _verify_tel_input_after_fill(
     tag_name: str,
     expected_value: str,
     allow_nanp_country_prefix: bool,
+    dial_code_withheld: bool = False,
     pattern: str | None = None,
     maxlength: str | None = None,
     engine_selection: BrowserEngineSelection | None = None,
@@ -3154,6 +3264,7 @@ async def _verify_tel_input_after_fill(
         locator=skyvern_element.get_locator(),
         expected_value=expected_value,
         allow_nanp_country_prefix=allow_nanp_country_prefix,
+        dial_code_withheld=dial_code_withheld,
         pattern=pattern,
         maxlength=maxlength,
         engine_selection=engine_selection,
@@ -3208,7 +3319,10 @@ async def _fill_nanp_tel_with_readback(
                 skyvern_element=skyvern_element,
                 tag_name=tag_name,
                 expected_value=national_digits,
+                # An E.164 retry exists only for a number written with its own "+1", so typing the
+                # national digits is both what permits a rendered "+1" and what withheld that code.
                 allow_nanp_country_prefix=e164_fallback is not None,
+                dial_code_withheld=e164_fallback is not None,
                 pattern=pattern,
                 maxlength=maxlength,
                 engine_selection=engine_selection,
@@ -3255,7 +3369,14 @@ async def _fill_nanp_tel_with_readback(
     return None
 
 
-async def _log_tel_fallback_fill_digit_counts(
+class TelFallbackReadback(NamedTuple):
+    expected_digit_count: int
+    actual_digit_count: int | None
+    country_code_mismatch: PhoneNumberInputCountryCodeMismatch | None = None
+    digits_match: bool = False
+
+
+async def _read_back_tel_fallback_fill(
     *,
     skyvern_element: SkyvernElement,
     tag_name: str,
@@ -3263,9 +3384,10 @@ async def _log_tel_fallback_fill_digit_counts(
     task_id: str | None,
     step_id: str | None,
     engine_selection: BrowserEngineSelection | None = None,
-) -> tuple[int, int | None]:
-    # Observability only: the LLM-fallback tel fill has no raising read-back, so a digit drop there is
-    # otherwise invisible. Count-only (values may be secrets) and never fails the action.
+) -> TelFallbackReadback:
+    # The LLM-fallback tel fill has no raising read-back, so a digit drop there is otherwise invisible.
+    # Counts are logged for every fill (values may be secrets); only a wrong international reading of
+    # the number is reported back as a failure.
     expected_digit_count = len(_phone_digits(expected_value))
     try:
         actual_value = await get_input_value(
@@ -3274,6 +3396,28 @@ async def _log_tel_fallback_fill_digit_counts(
             engine_selection=engine_selection,
         )
         actual_digit_count = len(_phone_digits(actual_value))
+        expected_digits = _phone_digits(expected_value)
+        actual_digits = _phone_digits(actual_value)
+        field_asserts_nanp = (
+            len(expected_digits) == 10
+            and actual_digits == f"1{expected_digits}"
+            and (actual_value or "").strip().startswith("+1")
+            and _tel_constraints_accept(
+                actual_value or "",
+                pattern=await skyvern_element.get_attr("pattern"),
+                maxlength=await skyvern_element.get_attr("maxlength"),
+            )
+        )
+        # `(0)` explicitly marks an optional national trunk prefix; all other digits must match.
+        optional_trunk_digits = _phone_digits(re.sub(r"\(\s*0\s*\)", "", expected_value))
+        digits_match = (
+            _phone_readback_digits_match(
+                expected_digits,
+                actual_digits,
+                allow_nanp_country_prefix=field_asserts_nanp,
+            )
+            or actual_digits == optional_trunk_digits
+        )
         LOG.info(
             "Tel fallback fill digit counts",
             expected_digit_count=expected_digit_count,
@@ -3283,7 +3427,17 @@ async def _log_tel_fallback_fill_digit_counts(
             task_id=task_id,
             step_id=step_id,
         )
-        return expected_digit_count, actual_digit_count
+        country_code_mismatch = _tel_country_code_mismatch(expected_value=expected_value, actual_value=actual_value)
+        if country_code_mismatch is not None:
+            LOG.warning(
+                "Phone input country calling code mismatch",
+                element_id=skyvern_element.get_id(),
+                expected_digit_count=expected_digit_count,
+                actual_digit_count=actual_digit_count,
+                task_id=task_id,
+                step_id=step_id,
+            )
+        return TelFallbackReadback(expected_digit_count, actual_digit_count, country_code_mismatch, digits_match)
     except Exception as exc:
         LOG.warning(
             "Failed to read back tel fallback fill",
@@ -3291,7 +3445,39 @@ async def _log_tel_fallback_fill_digit_counts(
             step_id=step_id,
             error_type=type(exc).__name__,
         )
-        return expected_digit_count, None
+        return TelFallbackReadback(expected_digit_count, None, digits_match=False)
+
+
+async def _tel_fill_recovers_with_source_number(
+    *,
+    skyvern_element: SkyvernElement,
+    tag_name: str,
+    source_value: str,
+    task_id: str | None,
+    step_id: str | None,
+    engine_selection: BrowserEngineSelection | None = None,
+) -> bool:
+    """Re-enter the number as the task gave it, once a recommended format left the field under another
+    country calling code. The field renders a "+", so it takes the number whole."""
+    try:
+        await skyvern_element.input_clear()
+        await skyvern_element.input_fill(text=source_value)
+    except Exception as exc:
+        LOG.warning(
+            "Failed to re-enter the phone number with its country calling code",
+            element_id=skyvern_element.get_id(),
+            error_type=type(exc).__name__,
+        )
+        return False
+    readback = await _read_back_tel_fallback_fill(
+        skyvern_element=skyvern_element,
+        tag_name=tag_name,
+        expected_value=source_value,
+        task_id=task_id,
+        step_id=step_id,
+        engine_selection=engine_selection,
+    )
+    return readback.digits_match and readback.country_code_mismatch is None
 
 
 _CARD_NUMBER_MIN_DIGITS = 13
@@ -9741,6 +9927,7 @@ async def _handle_input_text_action(
                 scraped_page=scraped_page,
                 task=task,
                 step=step,
+                field_current_value=current_text,
             )
         except Exception as exc:
             LOG.warning(
@@ -9808,6 +9995,7 @@ async def _handle_input_text_action(
                         scraped_page=scraped_page,
                         task=task,
                         step=step,
+                        field_current_value=current_text,
                     )
                 except Exception as exc:
                     LOG.warning(
@@ -9828,7 +10016,7 @@ async def _handle_input_text_action(
                 return [ActionFailure(PhoneNumberInputBrowserInteractionFailed())]
             raise
         if tel_outcome is not None and is_tel:
-            expected_digit_count, actual_digit_count = await _log_tel_fallback_fill_digit_counts(
+            readback = await _read_back_tel_fallback_fill(
                 skyvern_element=skyvern_element,
                 tag_name=tag_name,
                 expected_value=tel_source_text or text,
@@ -9837,8 +10025,23 @@ async def _handle_input_text_action(
                 engine_selection=engine_selection,
             )
             tel_outcome.attempt_count = max(tel_outcome.attempt_count, 1)
-            tel_outcome.actual_digit_count = actual_digit_count
+            tel_outcome.actual_digit_count = readback.actual_digit_count
             tel_outcome.browser_valid = await _probe_tel_browser_validity(skyvern_element.get_locator())
+            if readback.country_code_mismatch is not None:
+                # The recommended format is what lost the calling code, so the number as given is a
+                # retry the field has not seen yet.
+                if tel_source_text is None or _phone_digits(tel_source_text) == _phone_digits(text):
+                    return [ActionFailure(readback.country_code_mismatch)]
+                if not await _tel_fill_recovers_with_source_number(
+                    skyvern_element=skyvern_element,
+                    tag_name=tag_name,
+                    source_value=tel_source_text,
+                    task_id=task.task_id,
+                    step_id=step.step_id,
+                    engine_selection=engine_selection,
+                ):
+                    return [ActionFailure(readback.country_code_mismatch)]
+                tel_outcome.attempt_count += 1
         return [ActionSuccess()]
 
     # `Locator.clear()` on a spin button could cause the cursor moving away, and never be back
@@ -9984,6 +10187,7 @@ async def _handle_input_text_action(
                         scraped_page=scraped_page,
                         task=task,
                         step=step,
+                        field_current_value=current_text,
                     )
                 except Exception as exc:
                     LOG.warning(
@@ -10237,7 +10441,7 @@ async def _handle_input_text_action(
                     if isinstance(truncation_failure, ActionFailure):
                         return [truncation_failure]
                 if tel_outcome is not None and is_tel and not verify_tel_input_after_fill:
-                    expected_digit_count, actual_digit_count = await _log_tel_fallback_fill_digit_counts(
+                    readback = await _read_back_tel_fallback_fill(
                         skyvern_element=skyvern_element,
                         tag_name=tag_name,
                         expected_value=tel_source_text or text,
@@ -10246,8 +10450,21 @@ async def _handle_input_text_action(
                         engine_selection=engine_selection,
                     )
                     tel_outcome.attempt_count = max(tel_outcome.attempt_count, 1)
-                    tel_outcome.actual_digit_count = actual_digit_count
+                    tel_outcome.actual_digit_count = readback.actual_digit_count
                     tel_outcome.browser_valid = await _probe_tel_browser_validity(skyvern_element.get_locator())
+                    if readback.country_code_mismatch is not None:
+                        if tel_source_text is None or _phone_digits(tel_source_text) == _phone_digits(text):
+                            return [ActionFailure(readback.country_code_mismatch)]
+                        if not await _tel_fill_recovers_with_source_number(
+                            skyvern_element=skyvern_element,
+                            tag_name=tag_name,
+                            source_value=tel_source_text,
+                            task_id=task.task_id,
+                            step_id=step.step_id,
+                            engine_selection=engine_selection,
+                        ):
+                            return [ActionFailure(readback.country_code_mismatch)]
+                        tel_outcome.attempt_count += 1
 
             incremental_cleanup = clean_and_remove_element_tree_factory(
                 task=task,
