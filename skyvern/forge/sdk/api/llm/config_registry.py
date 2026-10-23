@@ -41,6 +41,23 @@ OPENINFERENCE_PROVIDER_SLUG = "open-inference"
 # OpenRouter routes by provider SLUG and skips an unrecognised one silently, so a name here
 # that no longer matches enforces nothing. Both are asserted in tests for that reason.
 AMAZON_BEDROCK_PROVIDER_SLUG = "amazon-bedrock"
+# A completion cap bounds reasoning and answer together, so a reasoning model can spend the whole
+# cap thinking and stop at finish_reason=length with no content at all (SKY-18857). Reserve this
+# much of the cap for the answer and give reasoning the rest.
+OPENROUTER_ANSWER_TOKEN_RESERVE = 16_384
+# Shared by every OpenRouter config serving this model, so a reasoning budget derived from it can
+# never drift from the cap it has to fit inside.
+DEEPSEEK_V4_FLASH_MAX_COMPLETION_TOKENS = 65_536
+
+
+def openrouter_reasoning_budget(max_completion_tokens: int) -> dict[str, int]:
+    """OpenRouter's reasoning budget for a completion cap, leaving the answer room to be written.
+
+    Mutually exclusive with `reasoning.effort` / `reasoning_effort` upstream, so never set both.
+    """
+    return {
+        "max_tokens": max(max_completion_tokens - OPENROUTER_ANSWER_TOKEN_RESERVE, max_completion_tokens // 2),
+    }
 
 
 @dataclass(frozen=True)
@@ -2057,13 +2074,16 @@ if settings.ENABLE_OPENROUTER:
             ["OPENROUTER_API_KEY"],
             supports_vision=False,
             add_assistant_prefix=False,
-            max_completion_tokens=65536,
+            max_completion_tokens=DEEPSEEK_V4_FLASH_MAX_COMPLETION_TOKENS,
             litellm_params=LiteLLMParams(
                 api_key=settings.OPENROUTER_API_KEY,
                 api_base=settings.OPENROUTER_API_BASE,
                 api_version=None,
                 model_info={"model_name": "openrouter/deepseek/deepseek-v4-flash"},
-                extra_body={"provider": {"ignore": [OPENINFERENCE_PROVIDER_SLUG]}},
+                extra_body={
+                    "provider": {"ignore": [OPENINFERENCE_PROVIDER_SLUG]},
+                    "reasoning": openrouter_reasoning_budget(DEEPSEEK_V4_FLASH_MAX_COMPLETION_TOKENS),
+                },
             ),
         ),
     )
@@ -2075,13 +2095,15 @@ if settings.ENABLE_OPENROUTER:
             ["OPENROUTER_API_KEY"],
             supports_vision=False,
             add_assistant_prefix=False,
-            max_completion_tokens=65536,
+            max_completion_tokens=DEEPSEEK_V4_FLASH_MAX_COMPLETION_TOKENS,
             litellm_params=LiteLLMParams(
                 api_key=settings.OPENROUTER_API_KEY,
                 api_base=settings.OPENROUTER_API_BASE,
                 api_version=None,
                 model_info={"model_name": "openrouter/deepseek/deepseek-v4-flash-0731"},
                 extra_body={
+                    # Bounds reasoning by effort, not by openrouter_reasoning_budget: upstream treats
+                    # the two as mutually exclusive, and effort is this config's reason for existing.
                     "reasoning_effort": "high",
                     "provider": {
                         "order": ["cloudflare", "parasail"],
