@@ -1282,6 +1282,8 @@ async def test_get_workflow_run_timeline_caps_action_text(monkeypatch: pytest.Mo
         task_id="tsk_1",
         response="r" * (cap * 3),
         text="t" * (cap * 3),
+        file_url="https://files.invalid/" + "f" * (cap * 3),
+        download_url="https://files.invalid/" + "d" * (cap * 3),
     )
     monkeypatch.setattr(
         workflow_service_module.app,
@@ -1298,7 +1300,7 @@ async def test_get_workflow_run_timeline_caps_action_text(monkeypatch: pytest.Mo
     )
 
     capped_action = timeline[0].block.actions[0]
-    for field in ("response", "text"):
+    for field in ("response", "text", "file_url", "download_url"):
         value = getattr(capped_action, field)
         assert isinstance(value, str), field
         assert "[truncated" in value, field

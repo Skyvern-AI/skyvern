@@ -41,6 +41,7 @@ from skyvern.forge.sdk.core import skyvern_context
 from skyvern.forge.sdk.core.skyvern_context import SkyvernContext
 from skyvern.forge.taskv3 import loop as loop_module
 from skyvern.forge.taskv3 import tools as taskv3_tools_module
+from skyvern.forge.taskv3.answer_basis_audit import ANSWER_BASIS_MAX_HOLDS, RecordedAnswer, apply_answer_basis_audit
 from skyvern.forge.taskv3.auth_tools import _MAX_GIVEUP_DEFERRALS, VerificationFailure, VerificationState
 from skyvern.forge.taskv3.engine import MAX_TOKENS_CEILING, MAX_TOKENS_PER_ACTION_STEP, taskv3_runaway_backstops
 from skyvern.forge.taskv3.goal_check import GoalVerdict, ToolTrail, run_goal_check
@@ -55,6 +56,7 @@ from skyvern.forge.taskv3.loop import (
     ACTION_LOOP_NUDGE_AFTER,
     ACTION_LOOP_TERMINATE_AFTER,
     ACTION_OUTCOME_DATA_KEY,
+    ANSWER_BASIS_HOLD_BOUND_GUARD,
     BROWSER_LOST_EVENT,
     BROWSER_LOST_GUARD,
     BROWSER_LOST_REASON,
@@ -89,6 +91,8 @@ from skyvern.forge.taskv3.loop import (
     SUBMISSION_HELD_WAIT_MAX_SECONDS,
     SUBMISSION_RENDER_MARGIN_SECONDS,
     TARGET_ACTION_ROUND_EVENT,
+    TARGET_KIND_DATA_KEY,
+    TARGET_LABEL_DATA_KEY,
     TOKEN_BUDGET_EXTENDED_EVENT,
     TOKEN_BUDGET_EXTENSION_REFUSED_EVENT,
     UNCHARGED_REFUSAL_GRACE,
@@ -12453,6 +12457,41 @@ async def test_a_lost_browser_ends_the_run_where_any_other_raise_comes_back_as_a
     assert any("tool_error: RuntimeError" in content for content in _tool_contents(outcome, "type"))
     (lost,) = (entry for entry in logs if entry["event"] == BROWSER_LOST_EVENT)
     assert (lost["guard"], lost["tool"]) == (BROWSER_LOST_GUARD, "click")
+
+
+@pytest.mark.asyncio
+async def test_the_answer_audit_ends_a_run_it_keeps_holding_with_a_verdict_naming_the_question() -> None:
+    # The bound's hold ends the run terminated; the holds before it stay ordinary refusals the model reads.
+    clicks: list[tuple[str, dict[str, Any]]] = []
+
+    class _FlagsEverything:
+        async def unsupported(self, answers: list[RecordedAnswer]) -> list[RecordedAnswer]:
+            return answers
+
+    async def type_answer(args: dict[str, Any]) -> ToolResult:
+        return ToolResult.ok(
+            "typed", data={TARGET_LABEL_DATA_KEY: "Work authorization", TARGET_KIND_DATA_KEY: "textbox"}
+        )
+
+    tools = [
+        ToolSpec(name="type", description="t", parameters={}, handler=type_answer, billable=True),
+        _recording_tool("click", clicks, billable=True),
+        make_finish_tool(),
+    ]
+    apply_answer_basis_audit(tools, _FlagsEverything())
+    # A different control each turn, so the repeated-action guard never fires first.
+    submits = [[("click", {"selector": f"#next{i}"})] for i in range(ANSWER_BASIS_MAX_HOLDS + 1)]
+    script = [
+        [("type", {"selector": "#auth", "text": "Yes"})],
+        *submits,
+        [("finish", {"status": "completed", "reason": "x"})],
+    ]
+    outcome, caller = await _run(script, tools, max_turns=30)
+
+    assert (outcome.status, outcome.guard) == ("terminated", ANSWER_BASIS_HOLD_BOUND_GUARD)
+    assert "'Work authorization'" in outcome.reason and "Yes" not in outcome.reason
+    assert caller.calls == 1 + ANSWER_BASIS_MAX_HOLDS
+    assert clicks == []
 
 
 def test_every_driver_timeout_type_installed_here_classifies_as_a_driver_timeout() -> None:

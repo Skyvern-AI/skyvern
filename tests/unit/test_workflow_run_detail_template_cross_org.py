@@ -1,15 +1,21 @@
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
+import httpx
 import pytest
+from fastapi import FastAPI
 
 from skyvern.forge import app
+from skyvern.forge.sdk.routes import agent_protocol
+from skyvern.forge.sdk.services import org_auth_service
 from skyvern.forge.sdk.workflow.models.workflow import (
     Workflow,
     WorkflowDefinition,
+    WorkflowRun,
     WorkflowRunResponseBase,
     WorkflowRunStatus,
+    WorkflowRunWithWorkflowResponse,
     WorkflowStatus,
 )
 from skyvern.forge.sdk.workflow.service import WorkflowService
@@ -20,7 +26,7 @@ CALLER_ORG_ID = "o_caller"
 
 
 def _make_template_workflow() -> Workflow:
-    now = datetime.now(timezone.utc)
+    now = datetime.now(UTC)
     return Workflow(
         workflow_id="w_tmpl",
         organization_id=TEMPLATE_ORG_ID,
@@ -36,37 +42,22 @@ def _make_template_workflow() -> Workflow:
     )
 
 
-def _make_workflow_run(workflow_run_id: str = "wr_tmpl", organization_id: str = CALLER_ORG_ID) -> SimpleNamespace:
-    now = datetime.now(timezone.utc)
-    return SimpleNamespace(
+def _make_workflow_run(
+    workflow_run_id: str = "wr_tmpl",
+    organization_id: str = CALLER_ORG_ID,
+    copilot_session_id: str | None = None,
+) -> WorkflowRun:
+    now = datetime.now(UTC)
+    return WorkflowRun(
         workflow_run_id=workflow_run_id,
         workflow_id="w_tmpl",
+        workflow_permanent_id="wpid_tmpl",
         organization_id=organization_id,
+        copilot_session_id=copilot_session_id,
         status=WorkflowRunStatus.running,
-        failure_reason=None,
-        failure_category=None,
-        retried_from_workflow_run_id=None,
-        proxy_location=None,
-        webhook_callback_url=None,
-        webhook_failure_reason=None,
-        totp_verification_url=None,
-        totp_identifier=None,
-        extra_http_headers=None,
-        cdp_connect_headers=None,
-        queued_at=None,
         started_at=now,
-        finished_at=None,
         created_at=now,
         modified_at=now,
-        credits_used=0,
-        cached_credits_used=0,
-        browser_session_id=None,
-        browser_profile_id=None,
-        browser_seed_source=None,
-        max_screenshot_scrolls=None,
-        browser_address=None,
-        run_with=None,
-        script_run=None,
     )
 
 
@@ -86,7 +77,13 @@ def template_run_db(monkeypatch: pytest.MonkeyPatch) -> tuple[AsyncMock, AsyncMo
                 get_workflow_by_permanent_id=get_by_wpid,
             ),
             observer=SimpleNamespace(get_task_v2_by_workflow_run_id=AsyncMock(return_value=None)),
-            tasks=SimpleNamespace(get_tasks_by_workflow_run_id=AsyncMock(return_value=[])),
+            tasks=SimpleNamespace(
+                get_tasks_by_workflow_run_id=AsyncMock(return_value=[]),
+                get_step_counts_by_task_ids=AsyncMock(return_value=(0, 0)),
+            ),
+            browser_sessions=SimpleNamespace(
+                get_persistent_browser_session_by_runnable_id=AsyncMock(return_value=None)
+            ),
             workflow_runs=SimpleNamespace(
                 get_workflow_run_parameters=AsyncMock(return_value=[]),
                 get_workflow_run_block_errors=AsyncMock(return_value=[]),
@@ -99,11 +96,14 @@ def template_run_db(monkeypatch: pytest.MonkeyPatch) -> tuple[AsyncMock, AsyncMo
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("copilot_session_id", [None, "wcc_123456"])
 async def test_template_run_detail_resolves_via_run_join(
-    monkeypatch: pytest.MonkeyPatch, template_run_db: tuple[AsyncMock, AsyncMock]
+    monkeypatch: pytest.MonkeyPatch,
+    template_run_db: tuple[AsyncMock, AsyncMock],
+    copilot_session_id: str | None,
 ) -> None:
     get_by_run, get_by_wpid = template_run_db
-    workflow_run = _make_workflow_run()
+    workflow_run = _make_workflow_run(copilot_session_id=copilot_session_id)
 
     # A real service instance: the stub app's WORKFLOW_SERVICE is a lazy auto-mock, so we must
     # exercise the actual build_workflow_run_status_response rather than app.WORKFLOW_SERVICE.
@@ -125,6 +125,7 @@ async def test_template_run_detail_resolves_via_run_join(
     assert isinstance(response, WorkflowRunResponseBase)
     assert response.workflow_run_id == "wr_tmpl"
     assert response.workflow_title == "Job Application Workflow"
+    assert response.copilot_session_id == copilot_session_id
 
     # Resolution must go through the run join (scoped by the run's org), not the caller-org
     # permanent-id lookup that returns None for cross-org template workflows.
@@ -132,6 +133,26 @@ async def test_template_run_detail_resolves_via_run_join(
     assert get_by_run.await_args.args[0] == "wr_tmpl"
     assert get_by_run.await_args.kwargs.get("organization_id") == CALLER_ORG_ID
     get_by_wpid.assert_not_awaited()
+
+    monkeypatch.setattr(service, "get_workflow_by_workflow_run_id", AsyncMock(return_value=get_by_run.return_value))
+    monkeypatch.setattr(app, "WORKFLOW_SERVICE", service)
+    monkeypatch.setattr(app.AGENT_FUNCTION, "calculate_workflow_run_total_cost", AsyncMock(return_value=0.0))
+    canonical = next(
+        route for route in agent_protocol.base_router.routes if route.path == "/workflows/runs/{workflow_run_id}"
+    )
+    assert canonical.endpoint is agent_protocol.get_workflow_and_run_from_workflow_run_id
+    assert canonical.response_model is WorkflowRunWithWorkflowResponse
+    api = FastAPI()
+    api.dependency_overrides[org_auth_service.get_current_org] = lambda: SimpleNamespace(organization_id=CALLER_ORG_ID)
+    api.include_router(agent_protocol.base_router, prefix="/v1")
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=api), base_url="http://test", trust_env=False
+    ) as client:
+        serialized = await client.get("/v1/workflows/runs/wr_tmpl")
+
+    assert serialized.status_code == 200
+    assert serialized.json()["copilot_session_id"] == copilot_session_id
+    assert serialized.json()["workflow"]["organization_id"] == TEMPLATE_ORG_ID
 
 
 @pytest.mark.asyncio

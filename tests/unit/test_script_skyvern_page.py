@@ -1890,6 +1890,55 @@ class TestActionSubclassPersistence:
             )
 
     @pytest.mark.asyncio
+    async def test_native_download_records_the_url_fetch_even_with_ignored_byte_kwargs(
+        self, mock_scraped_page, mock_ai
+    ):
+        script_page = self._build_script_page(mock_scraped_page, mock_ai)
+        script_page._wait_for_page_ready_before_action = AsyncMock()
+        script_page._create_screenshot_after_execution = AsyncMock()
+        script_page._create_html_action_after_execution = AsyncMock()
+        context = self._build_context()
+        captured = []
+
+        async def save_action(action):
+            captured.append(action)
+            return action
+
+        with (
+            patch("skyvern.core.script_generations.script_skyvern_page.skyvern_context.current", return_value=context),
+            patch(
+                "skyvern.core.script_generations.skyvern_page.download_file_from_url",
+                new=AsyncMock(return_value="/synthetic/report.pdf"),
+            ) as fetch,
+            patch(
+                "skyvern.core.script_generations.script_skyvern_page.app.DATABASE.workflow_params.create_action",
+                new=AsyncMock(side_effect=save_action),
+            ),
+            patch(
+                "skyvern.core.script_generations.script_skyvern_page.app.DATABASE.workflow_params.update_action_reasoning",
+                new=AsyncMock(),
+            ),
+            patch(
+                "skyvern.core.script_generations.script_skyvern_page.script_run_context_manager.get_run_context",
+                return_value=None,
+            ),
+            patch.object(settings, "CACHED_ACTION_DELAY_SECONDS", 0),
+        ):
+            path = await script_page.download_file(
+                file_name="report.pdf", download_url="https://example.com/report.pdf", byte=b"ignored bytes"
+            )
+
+        assert path == "/synthetic/report.pdf"
+        fetch.assert_awaited_once_with(
+            "https://example.com/report.pdf", filename="report.pdf", organization_id="o_test"
+        )
+        action = captured[0]
+        assert action.status == "completed" and action.created_by == "script"
+        assert action.download is True
+        assert action.file_name == "report.pdf" and action.download_url == "https://example.com/report.pdf"
+        assert action.download_triggered is None and action.downloaded_files is None
+
+    @pytest.mark.asyncio
     async def test_move_persists_x_and_y(self, mock_scraped_page, mock_ai):
         from skyvern.webeye.actions.action_types import ActionType
         from skyvern.webeye.actions.actions import MoveAction
