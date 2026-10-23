@@ -6,6 +6,7 @@ workflow_run_blocks and the dispatched engine come from the same resolution.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import json
 import time
 from collections.abc import Callable, Iterator
@@ -18,7 +19,10 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 from pydantic import BaseModel, ConfigDict, ValidationError
 
+import skyvern.forge.sdk.workflow.models.block as block_module
+import skyvern.webeye.cdp_download_interceptor as cdp_module
 from skyvern.config import settings
+from skyvern.exceptions import FailedToNavigateToUrl
 from skyvern.forge import app
 from skyvern.forge.sdk.core import skyvern_context
 from skyvern.forge.sdk.core.skyvern_context import SkyvernContext
@@ -67,13 +71,20 @@ from skyvern.forge.sdk.workflow.models.block import (
     takes_default_engine,
     v3_ab_ineligibility_reason,
 )
-from skyvern.forge.sdk.workflow.models.workflow import COPILOT_TEST_WORKFLOW_CREATOR, Workflow, WorkflowDefinition
+from skyvern.forge.sdk.workflow.models.workflow import (
+    COPILOT_TEST_WORKFLOW_CREATOR,
+    Workflow,
+    WorkflowDefinition,
+    WorkflowRunStatus,
+)
 from skyvern.forge.sdk.workflow.service import WorkflowService, workflow_definitions_differ
 from skyvern.forge.sdk.workflow.workflow_definition_converter import convert_workflow_definition
 from skyvern.forge.taskv3.goal_composition import render_block_context
+from skyvern.forge.taskv3.tools import DownloadFailureWatch
 from skyvern.schemas.run_enums import RunEngine
 from skyvern.schemas.workflows import (
     BlockResult,
+    BlockStatus,
     BlockType,
     NavigationBlockYAML,
     WorkflowCreateYAMLRequest,
@@ -81,7 +92,8 @@ from skyvern.schemas.workflows import (
     WorkflowStatus,
 )
 from skyvern.services import script_service
-from tests.unit._task_block_fakes import mock_block_execute_deps
+from skyvern.webeye.cdp_download_interceptor import CDPDownloadInterceptor, begin_replay_candidate_hold
+from tests.unit._task_block_fakes import mock_block_execute_deps, output_parameter
 from tests.unit._workflow_block_engine_fakes import (
     WORKFLOW_BLOCK_ENGINE_APP_TARGET,
     FakeExperimentationProvider,
@@ -2273,3 +2285,283 @@ async def test_an_explicit_code_generation_request_stays_on_v1(
     )
 
     assert engine == RunEngine.skyvern_v1
+
+
+def _download_context(tmp_path: Path, *, holding: bool = False) -> MagicMock:
+    interceptor = CDPDownloadInterceptor(
+        output_dir=str(tmp_path), network_egress_monitor=MagicMock(), redirect_hop_authorizer=AsyncMock()
+    )
+    interceptor.set_replay_candidate_mode(holding)
+    context = MagicMock()
+    context._skyvern_cdp_download_interceptor = interceptor
+    return context
+
+
+def _holding(context: MagicMock) -> bool:
+    return context._skyvern_cdp_download_interceptor._replay_candidate_mode
+
+
+def _v3_download_block(block_cls: type[BaseTaskBlock], **overrides: Any) -> BaseTaskBlock:
+    fields: dict[str, Any] = {
+        "label": "export",
+        "output_parameter": output_parameter(),
+        "url": "https://site.example/export",
+        "complete_on_download": True,
+        "engine": RunEngine.skyvern_v3,
+        **overrides,
+    }
+    return block_cls(**fields)
+
+
+class _TaskRan(Exception):
+    """Raised by the stubbed execute_step: what follows it is not under test here."""
+
+
+async def _execute_block(block: BaseTaskBlock) -> None:
+    skyvern_context.set(SkyvernContext(organization_id="o_test", workflow_run_id="wr_task_block_test"))
+    try:
+        with contextlib.suppress(_TaskRan):
+            await block.execute(
+                workflow_run_id="wr_task_block_test", workflow_run_block_id="wrb_test", organization_id="o_test"
+            )
+    finally:
+        skyvern_context.reset()
+
+
+@contextlib.contextmanager
+def _v3_block_deps(working_page_url: str, context: MagicMock | None = None) -> Iterator[Any]:
+    with (
+        mock_block_execute_deps(working_page_url=working_page_url) as deps,
+        patch("skyvern.forge.sdk.workflow.models.block.task_v3_disabled", AsyncMock(return_value=False)),
+    ):
+        deps.task.organization_id = "o_test"
+        if context is not None:
+            deps.browser_state.browser_context = context
+        yield deps
+
+
+@pytest.mark.parametrize("cancelled_at", ["profile_settle", "screenshot"])
+@pytest.mark.asyncio
+async def test_a_block_cancelled_after_its_start_url_ends_the_hold_it_began(tmp_path: Path, cancelled_at: str) -> None:
+    block = _v3_download_block(FileDownloadBlock)
+    context = _download_context(tmp_path)
+    with _v3_block_deps("about:blank", context) as deps:
+        page = deps.browser_state.must_get_working_page.return_value
+        if cancelled_at == "profile_settle":
+            deps.workflow_run.browser_profile_id = "bp_test"
+            deps.browser_state.browser_artifacts.applied_browser_profile_id = "bp_test"
+            page.wait_for_load_state = AsyncMock(side_effect=asyncio.CancelledError())
+        else:
+            deps.browser_state.take_fullpage_screenshot = AsyncMock(side_effect=asyncio.CancelledError())
+        with pytest.raises(asyncio.CancelledError):
+            await _execute_block(block)
+
+        deps.browser_state.navigate_to_url.assert_awaited_once()
+        assert _holding(context) is False
+
+
+@pytest.mark.asyncio
+async def test_a_first_block_holds_before_the_browser_navigates_and_ends_only_the_holds_it_began(
+    tmp_path: Path,
+) -> None:
+    block = _v3_download_block(TaskBlock, title="Export")
+    replaced, current = _download_context(tmp_path / "a"), _download_context(tmp_path / "b")
+    borrowed = _download_context(tmp_path / "c", holding=True)
+    holding_during_task: dict[str, bool] = {}
+    with _v3_block_deps("https://site.example/export", current) as deps:
+
+        async def get_or_create_for_workflow_run(**kwargs: Any) -> Any:
+            before_navigation = kwargs.get("before_navigation")
+            for context in (replaced, current, borrowed):
+                if before_navigation is not None:
+                    before_navigation(SimpleNamespace(browser_context=context))
+            return deps.browser_state
+
+        async def execute_step(**_kwargs: Any) -> None:
+            holding_during_task.update(replaced=_holding(replaced), current=_holding(current))
+            raise _TaskRan
+
+        deps.browser_manager.get_or_create_for_workflow_run = AsyncMock(side_effect=get_or_create_for_workflow_run)
+        deps.agent.execute_step = AsyncMock(side_effect=execute_step)
+        await _execute_block(block)
+
+    assert holding_during_task == {"replaced": True, "current": True}
+    assert (_holding(replaced), _holding(current), _holding(borrowed)) == (False, False, True)
+
+
+@pytest.mark.parametrize(
+    "overrides", [{"complete_on_download": False}, {"engine": RunEngine.skyvern_v1}], ids=["not-download", "v1"]
+)
+@pytest.mark.asyncio
+async def test_a_block_that_does_not_hold_leaves_browser_creation_unchanged(
+    tmp_path: Path, overrides: dict[str, Any]
+) -> None:
+    block = _v3_download_block(TaskBlock, title="Export", **overrides)
+    context = _download_context(tmp_path)
+    with _v3_block_deps("https://site.example/export", context) as deps:
+        deps.agent.execute_step = AsyncMock(side_effect=_TaskRan)
+        await _execute_block(block)
+
+        assert deps.browser_manager.get_or_create_for_workflow_run.await_args.kwargs["before_navigation"] is None
+        assert _holding(context) is False
+
+
+@pytest.mark.asyncio
+async def test_a_later_block_still_holds_through_its_own_navigation(tmp_path: Path) -> None:
+    block = _v3_download_block(TaskBlock, title="Export")
+    context = _download_context(tmp_path)
+    holding_at_navigation: list[bool] = []
+    with (
+        _v3_block_deps("https://site.example/previous", context) as deps,
+        patch.object(TaskBlock, "get_task_order", AsyncMock(return_value=(1, 0))),
+    ):
+        deps.browser_manager.get_for_workflow_run = MagicMock(return_value=deps.browser_state)
+        deps.browser_state.navigate_to_url = AsyncMock(
+            side_effect=lambda **_: holding_at_navigation.append(_holding(context))
+        )
+        deps.agent.execute_step = AsyncMock(side_effect=_TaskRan)
+        await _execute_block(block)
+
+    assert holding_at_navigation == [True]
+    assert _holding(context) is False
+
+
+@pytest.mark.asyncio
+async def test_a_block_keeps_a_replacement_context_its_task_watch_held_through_cleanup(tmp_path: Path) -> None:
+    block = _v3_download_block(TaskBlock, title="Export")
+    replacement = _download_context(tmp_path)
+    replacement.cookies = AsyncMock(return_value=[])
+    interceptor = replacement._skyvern_cdp_download_interceptor
+    interceptor._browser_context = replacement
+    page = MagicMock()
+    page.context = replacement
+    seen: dict[str, Any] = {}
+    reply = MagicMock(body=b"account,amount\nA-1,12.50\n", content_type="text/csv", filename="export.csv", status=200)
+
+    async def _page() -> Any:
+        return page
+
+    async def execute_step(**_kwargs: Any) -> None:
+        watch = DownloadFailureWatch(_page)
+        await watch.attach()
+        watch.close()
+        with patch.object(cdp_module.file_api, "fetch_file_bytes", AsyncMock(return_value=reply), create=True):
+            await interceptor._download_url_directly("https://site.example/export.csv", "export.csv")
+        seen.update(held=len(interceptor.replay_candidates()), landed=sorted(p.name for p in tmp_path.iterdir()))
+        raise _TaskRan
+
+    with _v3_block_deps("https://site.example/export") as deps:
+        deps.agent.execute_step = AsyncMock(side_effect=execute_step)
+        await _execute_block(block)
+
+    assert seen == {"held": 1, "landed": []}
+    assert _holding(replacement) is False
+
+
+@pytest.mark.asyncio
+async def test_parallel_and_nested_blocks_each_end_only_their_own_holds(tmp_path: Path) -> None:
+    outer, sibling, nested = (_download_context(tmp_path / name) for name in ("outer", "sibling", "nested"))
+    blocks = {
+        name: _v3_download_block(TaskBlock, label=name, title=name, complete_on_download=False)
+        for name in ("outer", "sibling", "nested")
+    }
+    outer_holding, sibling_done = asyncio.Event(), asyncio.Event()
+    observed: dict[str, bool] = {}
+
+    async def execute_step(*, task_block: BaseTaskBlock, **_kwargs: Any) -> None:
+        if task_block.label == "outer":
+            begin_replay_candidate_hold(outer)
+            outer_holding.set()
+            await sibling_done.wait()
+            await _execute_block(blocks["nested"])
+            observed["outer_after_sibling_and_nested"] = _holding(outer)
+        elif task_block.label == "sibling":
+            await outer_holding.wait()
+            begin_replay_candidate_hold(sibling)
+        else:
+            begin_replay_candidate_hold(nested)
+        raise _TaskRan
+
+    async def sibling_then_signal() -> None:
+        try:
+            await _execute_block(blocks["sibling"])
+        finally:
+            sibling_done.set()
+
+    with mock_block_execute_deps(working_page_url="https://site.example/export") as deps:
+        deps.task.organization_id = "o_test"
+        deps.agent.execute_step = AsyncMock(side_effect=execute_step)
+        await asyncio.gather(_execute_block(blocks["outer"]), sibling_then_signal())
+
+    assert observed == {"outer_after_sibling_and_nested": True}
+    assert (_holding(outer), _holding(sibling), _holding(nested)) == (False, False, False)
+
+
+@pytest.mark.asyncio
+async def test_a_replay_a_failed_earlier_block_admitted_saves_as_before_inside_the_next_v3_blocks_hold(
+    tmp_path: Path,
+) -> None:
+    # An earlier block's navigation fails with its export in flight; execute_safe lets the next V3 download block hold.
+    earlier = TaskBlock(
+        label="earlier",
+        output_parameter=output_parameter(),
+        title="Earlier",
+        url="https://site.example/export",
+        continue_on_failure=True,
+    )
+    later = _v3_download_block(TaskBlock, label="later", title="Later")
+    context = _download_context(tmp_path)
+    context.cookies = AsyncMock(return_value=[])
+    interceptor = context._skyvern_cdp_download_interceptor
+    interceptor._browser_context = context
+    released = asyncio.Event()
+    csv_bytes = b"account,amount\nA-1,12.50\n"
+    in_flight: list[asyncio.Task[None]] = []
+    holding_when_it_landed: list[bool] = []
+
+    async def slow_fetch(*_args: Any, **_kwargs: Any) -> Any:
+        await released.wait()
+        return MagicMock(body=csv_bytes, content_type="text/csv", filename="export.csv", status=200)
+
+    async def earlier_navigation_fails(**_kwargs: Any) -> Any:
+        in_flight.append(
+            asyncio.create_task(interceptor._download_url_directly("https://site.example/export.csv", "export.csv"))
+        )
+        await asyncio.sleep(0)
+        raise FailedToNavigateToUrl(url="https://site.example/export", error_message="net::ERR_ABORTED")
+
+    @contextlib.asynccontextmanager
+    async def running_run(*_args: Any) -> Any:
+        yield SimpleNamespace(status=WorkflowRunStatus.running)
+
+    async def task_order_by_label(block: TaskBlock, *_args: Any) -> tuple[int, int]:
+        return (0, 0) if block.label == "earlier" else (1, 0)
+
+    async def later_navigation(**_kwargs: Any) -> None:
+        holding_when_it_landed.append(_holding(context))
+        released.set()
+        await in_flight[0]
+
+    with (
+        _v3_block_deps("https://site.example/previous", context) as deps,
+        patch.object(TaskBlock, "get_task_order", task_order_by_label),
+        patch.object(cdp_module.file_api, "fetch_file_bytes", slow_fetch, create=True),
+    ):
+        deps.browser_manager.get_or_create_for_workflow_run = AsyncMock(side_effect=earlier_navigation_fails)
+        deps.browser_manager.get_for_workflow_run = MagicMock(return_value=deps.browser_state)
+        deps.browser_state.navigate_to_url = AsyncMock(side_effect=later_navigation)
+        deps.agent.execute_step = AsyncMock(side_effect=_TaskRan)
+        deps.observer_db.create_workflow_run_block = AsyncMock(return_value=MagicMock(workflow_run_block_id="wrb_test"))
+        block_module.app.DATABASE.workflow_runs.create_or_update_workflow_run_output_parameter = AsyncMock()
+        block_module.app.DATABASE.workflow_runs.admit_workflow_run_block_dispatch = running_run
+        skyvern_context.set(SkyvernContext(organization_id="o_test", workflow_run_id="wr_task_block_test"))
+        try:
+            result = await earlier.execute_safe(workflow_run_id="wr_task_block_test", organization_id="o_test")
+        finally:
+            skyvern_context.reset()
+        await _execute_block(later)
+
+    assert result.status == BlockStatus.failed and result.can_continue_after_failure
+    assert holding_when_it_landed == [True]
+    assert interceptor.replay_candidates() == {}
+    assert (tmp_path / "export.csv").read_bytes() == csv_bytes

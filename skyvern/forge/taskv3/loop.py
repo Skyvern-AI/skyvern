@@ -642,6 +642,17 @@ class UnseenPageText:
     held: bool = False
 
 
+def _candidate_hold_message(held: dict[str, str]) -> str:
+    return (
+        "This block holds downloaded bytes it has not saved. Decide from the goal and the page whether each is the "
+        "requested file, then finish again with accept_download_candidates listing the ones to save, or [] to save "
+        "none.\n" + "\n".join(held.values())
+    )
+
+
+_CANDIDATE_HOLD_SKIP = "queued before the held download facts above were shown; decide on them, then finish again"
+
+
 @dataclass
 class DownloadFailureFacts:
     """Failures a download block's requests and browser downloads hit; `undelivered` reached no result yet."""
@@ -651,6 +662,11 @@ class DownloadFailureFacts:
     delivered: set[str] = field(default_factory=set)
     # Set by DownloadFailureWatch to pull facts that arrive without an event (a browser download that was not saved).
     refresh: Callable[[], None] | None = None
+    # Set by DownloadFailureWatch: replay bytes held unsaved (fact line by handle), and saving the selected ones.
+    held_candidates: Callable[[], dict[str, str]] | None = None
+    resolve_candidates: Callable[[frozenset[str]], list[str]] | None = None
+    # Reads candidates held before any wrapped tool call attached the watcher.
+    attach: Callable[[], Awaitable[None]] | None = None
 
     def add(self, fact: str, *, repeat: bool) -> None:
         if fact in self.undelivered or (not repeat and fact in self.delivered):
@@ -670,6 +686,16 @@ class DownloadFailureFacts:
         self.undelivered, self.undelivered_extra = [], set()
         self.delivered.update(lines)
         return _with_more_failures(lines, extra)
+
+    def unseen(self, held: dict[str, str], batch: str) -> dict[str, str]:
+        """Held candidates no result the model received carried: never delivered, or delivered only in this batch."""
+        return {handle: fact for handle, fact in held.items() if fact not in self.delivered or fact in batch}
+
+    def mark_shown(self, facts: Collection[str]) -> None:
+        shown = set(facts)
+        self.undelivered = [fact for fact in self.undelivered if fact not in shown]
+        self.undelivered_extra -= shown
+        self.delivered |= shown
 
 
 @dataclass
@@ -2706,6 +2732,7 @@ def make_finish_tool(
     pending_marker: Callable[[str], Awaitable[str | None]] | None = None,
     submit_watch: SubmitWatch | None = None,
     download_settle: DownloadSettle | None = None,
+    download_wait: DownloadWait | None = None,
     staged_downloads: set[str] | None = None,
     verification_blocker: VerificationBlocker | None = None,
     unlisted_reask: UnlistedReaskCheck | None = None,
@@ -3369,6 +3396,69 @@ def make_finish_tool(
                 return converted
         else:
             await _premise_done(premise)
+        candidates = download_facts if status == "completed" and download_settle is not None else None
+        if candidates is not None and (candidates.held_candidates is None or candidates.resolve_candidates is None):
+            candidates = None
+        unselected: list[str] = []
+
+        def _verdict_turn_left() -> bool:
+            # Candidate facts need only the next verdict, not the failure-evidence reserve _has_hold_headroom keeps.
+            return (deadline_at is None or deadline_at > time.monotonic()) and (
+                activity is None
+                or not activity.final_turn_active
+                and (activity.turns_remaining is None or activity.turns_remaining > 0)
+                and (activity.tool_calls_remaining is None or activity.tool_calls_remaining > 0)
+            )
+
+        if candidates is not None:
+            assert candidates.held_candidates is not None and candidates.resolve_candidates is not None
+            selection = args.get("accept_download_candidates")
+            if selection is not None and not (
+                isinstance(selection, list) and all(isinstance(h, str) for h in selection)
+            ):
+                return ToolResult.error('accept_download_candidates must be a list of candidate handles such as "c1".')
+            if candidates.attach is not None:
+                await candidates.attach()
+            if download_wait is not None:
+                # Recovery first: the provider's copy is read back while no selected candidate sits on disk, and a
+                # replay still in flight is drained into a candidate before the decision below.
+                try:
+                    await download_wait()
+                except Exception:
+                    LOG.warning("taskv3 finish download wait failed", exc_info=True)
+            try:
+                canceled_before_selection = should_cancel is not None and await should_cancel()
+            except Exception:
+                canceled_before_selection = False
+            if canceled_before_selection:
+                return ToolResult.error("the run was canceled while the verdict was being checked.")
+            held = candidates.held_candidates()
+            if selection and not set(selection) <= set(held):
+                missing = sorted(set(selection) - set(held))
+                return ToolResult.error(
+                    f"accept_download_candidates names {', '.join(missing)}, which this block no longer holds "
+                    f"(held: {', '.join(held) or 'none'}). Finish again listing only held handles, or with [] to "
+                    "save none."
+                )
+            batch = "".join(unseen_text.batch) if unseen_text is not None else ""
+            unshown_candidates = candidates.unseen(held, batch)
+            if unshown_candidates and _verdict_turn_left():
+                # One hold per candidate, even over a selection written before its facts; the next verdict stands.
+                candidates.mark_shown(list(unshown_candidates.values()))
+                return ToolResult.error(
+                    _candidate_hold_message(unshown_candidates), {"stop_batch": _CANDIDATE_HOLD_SKIP}
+                )
+            if held:
+                # Not selected means not saved: an omitted selection never publishes a candidate.
+                chosen = frozenset(selection or ())
+                saved = candidates.resolve_candidates(chosen)
+                unsaved = sorted(chosen - set(saved))
+                if unsaved:
+                    return ToolResult.error(
+                        f"Download candidate(s) {', '.join(unsaved)} could not be saved. Finish again listing them "
+                        "to retry, or with accept_download_candidates [] to save none."
+                    )
+                unselected.extend(sorted(set(held) - chosen))
         no_file_line: list[str] = []
         # After every hold: the settle records the block's files once, so a file that lands while a finish is held
         # is still recorded.
@@ -3391,8 +3481,22 @@ def make_finish_tool(
                 # The settle declines to finalize a canceled run, so its silence must not become completed.
                 return ToolResult.error("the run was canceled while the verdict was being checked.")
             LOG.info("taskv3 finish on a download block", file_landed=bool(landed), reason=landed)
+            if candidates is not None:
+                assert candidates.held_candidates is not None and candidates.resolve_candidates is not None
+                late = candidates.held_candidates()
+                unseen_late = candidates.unseen(late, "")
+                if unseen_late and _verdict_turn_left():
+                    # Arrived during the settle: offered now; the next settle records a selection beside any file
+                    # this settle already recorded.
+                    candidates.mark_shown(list(unseen_late.values()))
+                    return ToolResult.error(_candidate_hold_message(unseen_late), {"stop_batch": _CANDIDATE_HOLD_SKIP})
+                if late:
+                    candidates.resolve_candidates(frozenset())
+                    unselected.extend(sorted(late))
             if not landed:
-                no_file_line = [DOWNLOAD_NO_FILE_FACT]
+                no_file_line = [DOWNLOAD_NO_FILE_FACT, *no_file_line]
+        if unselected:
+            no_file_line.append(f"Download candidate(s) {', '.join(unselected)} not selected, so not saved.")
         # Drained only here: a held finish leaves the failures for the next tool result to show.
         download_lines = no_file_line + (download_facts.deliver() if download_facts is not None else [])
         error_code, error_code_declined = _finish_error_code(status, args.get("error_code"), error_code_mapping)
@@ -3418,6 +3522,20 @@ def make_finish_tool(
                 "reason": {"type": "string", "maxLength": 2000},
                 "extracted_output": {"description": "Structured output requested by the goal, if any."},
                 **({"error_code": _error_code_schema(error_code_mapping)} if error_code_mapping else {}),
+                **(
+                    {
+                        "accept_download_candidates": {
+                            "type": "array",
+                            "items": {"type": "string"},
+                            "description": (
+                                "Download candidates (c1, c2, ...) to save when a held download is reported; "
+                                "[] saves none. A candidate not listed is never saved."
+                            ),
+                        }
+                    }
+                    if download_settle is not None
+                    else {}
+                ),
             },
             "required": ["status", "reason"],
         },
@@ -5781,7 +5899,9 @@ async def run_agent_tool_loop(
                     _append_skipped_tool_results(
                         st.messages,
                         tool_calls[idx + 1 :],
-                        "an earlier call in this batch left a list open and is waiting for a pick from it — make "
+                        result_data["stop_batch"]
+                        if isinstance(result_data.get("stop_batch"), str)
+                        else "an earlier call in this batch left a list open and is waiting for a pick from it — make "
                         "that pick or close the list, then re-issue these"
                         if list_left_open
                         else "earlier tool call in this batch failed and changed the page — re-observe before "

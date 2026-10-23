@@ -1,6 +1,7 @@
 import asyncio
 import base64
 import contextlib
+import functools
 import hashlib
 import json
 import os
@@ -16,13 +17,13 @@ from copy import deepcopy
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any, Awaitable, Callable, Literal, NamedTuple, Sequence, Tuple, cast
+from typing import Any, Awaitable, Callable, Concatenate, Literal, NamedTuple, ParamSpec, Sequence, Tuple, cast
 
 import structlog
 from openai.types.responses.response import Response as OpenAIResponse
 from opentelemetry import trace as otel_trace
 from playwright._impl._errors import TargetClosedError
-from playwright.async_api import Page
+from playwright.async_api import BrowserContext, Page
 from yutori.navigator.tools import GET_ELEMENT_BY_REF_SCRIPT, evaluate_tool_script
 
 from skyvern import analytics
@@ -357,10 +358,12 @@ from skyvern.webeye.browser_errors import (
 )
 from skyvern.webeye.browser_state import BrowserState, get_browser_connection_loss, get_browser_state_diagnostic
 from skyvern.webeye.cdp_download_interceptor import (
+    begin_replay_candidate_hold,
     consume_unsolicited_download_error_for_context,
     download_filename_from_suffix,
     has_download_interceptor_for_context,
     record_download_artifact_outcome_for_context,
+    replay_candidate_holds,
     settle_browser_downloads_for_context,
 )
 from skyvern.webeye.dom_inspection import read_current_url
@@ -2024,6 +2027,34 @@ def _v3_failure_category(
     return None
 
 
+_ExecuteArgs = ParamSpec("_ExecuteArgs")
+
+
+def _holding_replay_candidates(
+    execute: Callable[Concatenate["ForgeAgent", _ExecuteArgs], Awaitable[tuple[Step, Task]]],
+) -> Callable[Concatenate["ForgeAgent", _ExecuteArgs], Awaitable[tuple[Step, Task]]]:
+    """Holds a download block's replay candidates from before its download baseline through every exit, so a replay its
+    start URL left in flight waits for the model's selection and no hold outlives the block."""
+
+    @functools.wraps(execute)
+    async def holding(
+        agent: "ForgeAgent", /, *args: _ExecuteArgs.args, **kwargs: _ExecuteArgs.kwargs
+    ) -> tuple[Step, Task]:
+        task = cast(Task, kwargs["task"])
+        task_block = cast(BaseTaskBlock | None, kwargs.get("task_block"))
+        browser_state = cast(BrowserState, kwargs["browser_state"])
+        holds = bool(task_block is not None and task_block.complete_on_download and task.workflow_run_id)
+        # The context it began on: a mid-run reconnect swaps browser_state's, whose hold the run's watcher ends.
+        holding_context = browser_state.browser_context if holds else None
+        # Inside a block this joins its scope; alone it opens one. Either way the scope also ends the holds the run's
+        # download watch begins on contexts a reconnect hands it, after the task's cleanup, never one it borrowed.
+        with replay_candidate_holds(own=False):
+            begin_replay_candidate_hold(holding_context)
+            return await execute(agent, *args, **kwargs)
+
+    return holding
+
+
 class ForgeAgent:
     def __init__(self) -> None:
         self.async_operation_pool = AsyncOperationPool()
@@ -2037,12 +2068,13 @@ class ForgeAgent:
         list_files_before: list[str],
         randomize_if_missing: bool,
         attempt_started_at: datetime | None = None,
+        recorded_into: list[str] | None = None,
     ) -> list[str]:
         """Rename newly downloaded files for a task before persistence.
 
         Returns the list of pre-rename file names discovered as new since
         ``list_files_before``, for logging continuity with the legacy inline
-        path.
+        path. ``recorded_into``, when given, receives each recorded file's run-directory path after renaming.
         """
         if not task.workflow_run_id:
             return []
@@ -2155,14 +2187,19 @@ class ForgeAgent:
                     desired_name_fp=diagnostic_fingerprint(desired_name),
                     will_rename=local_basename != desired_name,
                 )
+                recorded_path = os.path.join(workflow_download_directory, local_file_name)
                 if local_basename != desired_name:
-                    rename_file(os.path.join(workflow_download_directory, local_file_name), desired_name)
+                    recorded_path = rename_file(recorded_path, desired_name)
+                if recorded_into is not None:
+                    recorded_into.append(recorded_path)
                 continue
 
             if randomize_if_missing:
                 random_file_id = "".join(random.choices(string.ascii_uppercase + string.digits, k=4))
                 final_file_name = f"download-{datetime.now().strftime('%Y%m%d%H%M%S%f')}-{random_file_id}"
             else:
+                if recorded_into is not None:
+                    recorded_into.append(os.path.join(workflow_download_directory, local_file_name))
                 continue
 
             base_final_file_name = final_file_name
@@ -2173,10 +2210,12 @@ class ForgeAgent:
                 target_path = os.path.join(workflow_download_directory, final_file_name + file_extension)
                 counter += 1
 
-            rename_file(
+            recorded_path = rename_file(
                 os.path.join(workflow_download_directory, local_file_name),
                 final_file_name + file_extension,
             )
+            if recorded_into is not None:
+                recorded_into.append(recorded_path)
 
         return files_to_rename
 
@@ -2606,6 +2645,7 @@ class ForgeAgent:
         operations = await app.AGENT_FUNCTION.generate_async_operations(organization, task, page)
         self.async_operation_pool.add_operations(task.task_id, operations)
 
+    @_holding_replay_candidates
     async def _execute_task_v3(
         self,
         *,
@@ -2924,6 +2964,9 @@ class ForgeAgent:
         download_wait_exhausted: set[str] = set()
 
         download_finalized = False
+        # Files settle already recorded, as the finalizer left them, so a later settle records only files new since.
+        recorded_files: list[str] = []
+        recorded_count = 0
         download_completion_reason: str | None = None
 
         # Owned here (not by the engine) so the final clean_up_task below can also exclude names
@@ -2995,12 +3038,72 @@ class ForgeAgent:
         if task_block is not None and task_block.complete_on_download and task.workflow_run_id:
             complete_on_download_block = task_block
 
+            def _kept_after_recording(recorded: list[str], outputs: list[str]) -> list[str]:
+                # What still names a recorded file: its run-directory output, and a session id (never removed). A local
+                # name the rename vacated is excluded no longer, so a later download saved under it is still new.
+                return [*outputs, *(name for name in recorded if name.startswith(("s3://", "gs://")))]
+
+            replay_drain_until: float | None = None
+
+            async def _settle_context(browser_context: BrowserContext) -> None:
+                async with settle_browser_downloads_for_context(browser_context, keep_producers=True):
+                    pass
+
+            async def _drain_held_replays() -> bool:
+                """False when the run was canceled. A replay a hold admitted is a candidate before this verdict,
+                not in cleanup after it; one in flight past the block's download timeout fails the verdict closed."""
+                nonlocal replay_drain_until
+                if replay_drain_until is None:
+                    timeout = complete_on_download_block.download_timeout or BROWSER_DOWNLOAD_TIMEOUT
+                    replay_drain_until = min(loop_deadline_at, time.monotonic() + timeout)
+                drained: BrowserContext | None = None
+                # Rechecked, so a context a reconnect hands the browser state during the wait is drained too.
+                while (current := browser_state.browser_context) is not drained:
+                    if not has_download_interceptor_for_context(current):
+                        break
+                    drained, drain = current, asyncio.ensure_future(_settle_context(current))
+                    try:
+                        # Polled like the download wait; a replay left in flight stays the interceptor's until teardown.
+                        while (await asyncio.wait({drain}, timeout=1.0))[1]:
+                            if await _should_cancel():
+                                return False
+                            if time.monotonic() >= replay_drain_until:
+                                raise TimeoutError("a download this block's hold admitted is still in flight")
+                    finally:
+                        drain.cancel()
+                        await asyncio.wait({drain})
+                    drain.result()
+                # Quiescent: a download begun after this gets its own window, as a new file does in the download wait.
+                replay_drain_until = None
+                return True
+
             async def _settle_downloads(staged: frozenset[str]) -> str | None:
-                nonlocal download_finalized, download_completion_reason
-                # Finalizing again would re-rename the same file (or re-fetch a browser-session download).
-                if download_finalized:
-                    return download_completion_reason
+                nonlocal download_finalized, download_completion_reason, recorded_files, recorded_count
                 assert workflow_download_directory is not None  # set alongside complete_on_download above
+                if not await _drain_held_replays():
+                    return None
+                staged_paths = [str(workflow_download_directory / name) for name in sorted(staged)]
+                if download_finalized:
+                    # A candidate selected after a held finish lands after this block recorded its files. The files
+                    # already recorded (their names before and after renaming) are excluded, so none is renamed, or a
+                    # browser-session download re-fetched, twice; with none new this returns the recorded result.
+                    recorded_now: list[str] = []
+                    before = [*(download_baseline_files or []), *staged_paths, *recorded_files]
+                    later = await self._finalize_downloaded_files_for_task(
+                        task,
+                        organization_id=organization.organization_id,
+                        download_suffix=complete_on_download_block.download_suffix,
+                        list_files_before=before,
+                        randomize_if_missing=True,
+                        attempt_started_at=attempt_started_at,
+                        recorded_into=recorded_now,
+                    )
+                    if later:
+                        recorded_files = [*recorded_files, *_kept_after_recording(later, recorded_now)]
+                        recorded_count += len(later)
+                        download_completion_reason = f"download completed ({recorded_count} new file(s))"
+                        LOG.info("Task V3 download finalized", task_id=task.task_id, num_new_files=len(later))
+                    return download_completion_reason
                 cancelled = await self._wait_for_in_flight_downloads(
                     task,
                     complete_on_download_block,
@@ -3025,20 +3128,24 @@ class ForgeAgent:
                 # landed meanwhile must not be finalized into a `completed` result.
                 if await _should_cancel():
                     return None
-                staged_paths = [str(workflow_download_directory / name) for name in sorted(staged)]
+                recorded_now = []
+                before = [*(download_baseline_files or []), *staged_paths]
                 new_files = await self._finalize_downloaded_files_for_task(
                     task,
                     organization_id=organization.organization_id,
                     download_suffix=complete_on_download_block.download_suffix,
-                    list_files_before=[*(download_baseline_files or []), *staged_paths],
+                    list_files_before=before,
                     randomize_if_missing=True,
                     attempt_started_at=attempt_started_at,
+                    recorded_into=recorded_now,
                 )
                 if not new_files:
                     return None
                 if context is not None:
                     context.download_completed_task_ids.add(task.task_id)
                 download_finalized = True
+                recorded_files = _kept_after_recording(new_files, recorded_now)
+                recorded_count = len(new_files)
                 download_completion_reason = f"download completed ({len(new_files)} new file(s))"
                 LOG.info(
                     "Task V3 download finalized",
