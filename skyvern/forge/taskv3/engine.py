@@ -74,6 +74,8 @@ from skyvern.forge.taskv3.loop import (
     SemanticCommitStats,
     SubmitWatch,
     ToolSpec,
+    TurnEnd,
+    TurnStart,
     UnseenPageText,
     VerificationBlocker,
     make_finish_tool,
@@ -269,6 +271,8 @@ async def run_task_v3_agent_loop(
     step: Any = None,
     should_cancel: Callable[[], Awaitable[bool]] | None = None,
     on_action_round: ActionRoundSink | None = None,
+    on_turn_start: TurnStart | None = None,
+    on_turn_end: TurnEnd | None = None,
     on_pre_action: Callable[[str, dict[str, Any]], Awaitable[None]] | None = None,
     on_page_action: Callable[[], None] | None = None,
     extra_tools: list[ToolSpec] | None = None,
@@ -334,7 +338,8 @@ async def run_task_v3_agent_loop(
     """Run one Task V3 task to completion against `page`, returning the loop outcome.
 
     `step` is threaded into every LLMCaller.call so the run's cost/tokens/model and LLM
-    artifacts attribute to it. `should_cancel` is polled between turns and mid-batch; token
+    artifacts attribute to it, except a turn's own model call when `on_turn_start` returns a `step`
+    for that turn. `should_cancel` is polled between turns and mid-batch; token
     and wall-clock budgets bound cost beyond the turn/tool-call caps. When a
     `page_fingerprint` sampler is provided, a finish(completed) on an unsettled page IS forced back
     for a bounded re-verification turn; without one, pre-finish re-verification is prompt guidance
@@ -717,6 +722,8 @@ async def run_task_v3_agent_loop(
             call_kwargs=build_call_kwargs(step, llm_caller),
             should_cancel=should_cancel,
             on_action_round=on_action_round,
+            on_turn_start=on_turn_start,
+            on_turn_end=on_turn_end,
             on_pre_action=on_pre_action,
             on_page_action=on_page_action,
             max_tokens=max_tokens,
