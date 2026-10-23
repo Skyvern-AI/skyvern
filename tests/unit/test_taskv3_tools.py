@@ -748,8 +748,8 @@ async def test_click_refuses_a_natively_disabled_target_before_the_actionability
         blinked = await click({"selector": "#blink-on"})
         # The gate stands in for the driver's own enabled check, so the contract is agreement with it,
         # asserted against `is_enabled` rather than against a hardcoded rule. Which shapes the driver
-        # refuses is version-dependent (`aria-disabled` on an ANCESTOR is refused by 1.61 and clicked
-        # by 1.58), and a test naming the shapes pins the gate to whichever driver it was written on.
+        # refuses is version-dependent (`aria-disabled` on a role-less ANCESTOR is clicked by 1.46 and
+        # refused by 1.56), and a test naming the shapes pins the gate to the driver it was written on.
         aria: dict[str, tuple[bool, str | None, str, float]] = {}
         for selector in ("#aria-off", "#aria-under-wrapper", "#declared-off"):
             driver_refuses = not await page.locator(selector).is_enabled()
@@ -17549,7 +17549,7 @@ async def test_type_says_an_aria_disabled_field_is_disabled_instead_of_waiting_f
     # fill() waits on the driver's own rule, which is wider than `:disabled`, so a gate reading
     # `:disabled` alone pays the full timeout on a field the driver was never going to fill. Asserted
     # as agreement with `is_enabled` rather than per shape: which shapes it refuses moves between
-    # driver versions (`aria-disabled` on an ANCESTOR is refused by 1.61 and filled by 1.58).
+    # driver versions (`aria-disabled` on a role-less ANCESTOR is filled by 1.46 and refused by 1.56).
     html = (
         '<input id="own" type="text" aria-disabled="true" style="width:200px;height:30px">'
         '<div aria-disabled="true"><input id="under" type="text" style="width:200px;height:30px"></div>'
