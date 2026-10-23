@@ -138,7 +138,9 @@ async def get_run_response(
             downloaded_files=task_v1_response.downloaded_files,
             run_request=TaskRunRequest(
                 engine=run_engine,
-                prompt=task_v1_response.request.navigation_goal,
+                # An extraction-only task has no navigation goal, so resolve the prompt the same
+                # way the agent resolves its first-turn goal instead of failing validation.
+                prompt=task_v1_response.request.navigation_goal or task_v1_response.request.data_extraction_goal or "",
                 url=task_v1_response.request.url,
                 webhook_url=task_v1_response.request.webhook_callback_url,
                 totp_identifier=task_v1_response.request.totp_identifier,
