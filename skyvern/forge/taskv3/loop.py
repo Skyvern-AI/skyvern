@@ -54,6 +54,7 @@ from skyvern.forge.taskv3.handoff_redaction import MAX_HANDOFF_URL_CHARS, normal
 from skyvern.forge.taskv3.intercepted_submission import InterceptedSubmission, SubmissionOutcome
 from skyvern.forge.taskv3.run_arms import DEAD_END_RETURN_FLAG, run_arm_enabled
 from skyvern.forge.taskv3.target_label import describe_target
+from skyvern.schemas.steps import StepToolCall
 from skyvern.schemas.workflows import ERROR_CODE_MAPPING_MAX_ENTRIES, ERROR_CODE_MAPPING_MAX_UTF8_BYTES
 from skyvern.webeye.navigation import clear_task_nav_error_code, redact_url_secrets
 
@@ -626,6 +627,33 @@ class ActionRoundSink(Protocol):
     async def __call__(
         self, actions: list[RoundAction], turn_reasoning: str | None, /, *, round_done: bool
     ) -> None: ...
+
+
+@dataclass
+class TurnRecord:
+    """One loop turn as `on_turn_end` receives it: one model call and every tool call it asked for, in order."""
+
+    turn: int
+    llm_seconds: float | None = None
+    tool_calls: list[StepToolCall] = field(default_factory=list)
+    # The loop's terminal status when the run ended during this turn, else None.
+    outcome_status: str | None = None
+
+
+# Awaited right before a turn's model call with the turn number (from 1). A step it returns is that call's `step`,
+# so the call's cost, tokens and artifacts land on the turn; None keeps the run-wide one.
+TurnStart = Callable[[int], Awaitable[Any]]
+# Awaited once the turn is over: when the next turn starts, or when the loop ends during it.
+TurnEnd = Callable[[TurnRecord], Awaitable[None]]
+
+
+@dataclass
+class _OpenTurn:
+    record: TurnRecord
+    # (recorded name, billable) per call the model asked for, and what each dispatched call returned, both by batch
+    # position: a provider's tool-call ids are not guaranteed unique within a response.
+    requested: list[tuple[str, bool]] = field(default_factory=list)
+    dispatched: dict[int, StepToolCall] = field(default_factory=dict)
 
 
 # Awaited after a billable/download-signaling result; it never ends the run. A settle hook awaited from
@@ -3943,6 +3971,7 @@ class LoopState:
     # This cap trip's reserve verdict, so the completion offer on the same page does not ask the judge again.
     block_reserve_verdict: GoalVerdict | None = None
     target_action_rounds_granted: int = 0
+    open_turn: _OpenTurn | None = None
 
 
 async def run_agent_tool_loop(
@@ -3960,6 +3989,8 @@ async def run_agent_tool_loop(
     call_kwargs: dict[str, Any] | None = None,
     should_cancel: Callable[[], Awaitable[bool]] | None = None,
     on_action_round: ActionRoundSink | None = None,
+    on_turn_start: TurnStart | None = None,
+    on_turn_end: TurnEnd | None = None,
     on_pre_action: Callable[[str, dict[str, Any]], Awaitable[None]] | None = None,
     # Called before each page-touching tool call is dispatched.
     on_page_action: Callable[[], None] | None = None,
@@ -4059,6 +4090,21 @@ async def run_agent_tool_loop(
     def _clear_action_state() -> None:
         st.action_counts.clear()
         st.action_warned.clear()
+
+    async def _close_turn() -> None:
+        open_turn, st.open_turn = st.open_turn, None
+        if open_turn is None or on_turn_end is None:
+            return
+        record = open_turn.record
+        record.tool_calls = [
+            open_turn.dispatched.get(position) or StepToolCall(tool=name, status="skipped", billable=billable)
+            for position, (name, billable) in enumerate(open_turn.requested)
+        ]
+        record.outcome_status = st.outcome.status if st.outcome is not None else None
+        try:
+            await on_turn_end(record)
+        except Exception:
+            LOG.warning("taskv3 on_turn_end callback failed", turn=record.turn, exc_info=True)
 
     def _tokens_remaining() -> int | None:
         """Charged headroom, clamped to the raw ceiling's turns left in charged units, so a hold or evidence gate
@@ -4530,6 +4576,8 @@ async def run_agent_tool_loop(
             )
 
     while st.outcome is None:
+        # The previous turn ends here rather than at each of its exits: a turn leaves by `continue` as well.
+        await _close_turn()
         if should_cancel is not None and await should_cancel():
             st.outcome = LoopOutcome("canceled", "run canceled")
             break
@@ -4594,6 +4642,16 @@ async def run_agent_tool_loop(
             activity.tool_calls_remaining = st.max_tool_calls - st.total_tool_calls
             if st.max_action_steps is not None:
                 activity.action_steps_remaining = st.max_action_steps - st.action_steps
+        open_turn = st.open_turn = _OpenTurn(TurnRecord(turn=st.turns))
+        turn_call_kwargs: dict[str, Any] = {}
+        if on_turn_start is not None:
+            try:
+                turn_step = await on_turn_start(st.turns)
+            except Exception:
+                LOG.warning("taskv3 on_turn_start callback failed", turn=st.turns, exc_info=True)
+            else:
+                if turn_step is not None:
+                    turn_call_kwargs["step"] = turn_step
 
         # Elide superseded perception results before re-sending the transcript, so a perception-heavy
         # run can't balloon the context to the token backstop (the pre-compaction runaway mode).
@@ -4627,6 +4685,7 @@ async def run_agent_tool_loop(
         # resilience, which v3 otherwise loses by running as one non-retried unit.
         response = None
         call_attempt = 0
+        llm_started_at = time.monotonic()
         while True:
             try:
                 response = await llm_caller.call(
@@ -4637,7 +4696,7 @@ async def run_agent_tool_loop(
                     use_message_history=True,
                     raw_response=True,
                     screenshots=screenshots_for_call,
-                    **active_call_kwargs,
+                    **{**active_call_kwargs, **turn_call_kwargs},
                 )
                 break
             except retryable_call_exceptions as exc:
@@ -4669,6 +4728,7 @@ async def run_agent_tool_loop(
                     on_llm_call_exhausted(exc)
                 st.outcome = LoopOutcome("loop_error", f"llm_call_failed: {type(exc).__name__}: {exc}")
                 break
+        open_turn.record.llm_seconds = time.monotonic() - llm_started_at
         if st.outcome is not None:
             break
 
@@ -4696,6 +4756,10 @@ async def run_agent_tool_loop(
         text = _extract_text(response)
         reasoning_summary = _extract_reasoning_summary(response)
         tool_calls = _extract_tool_calls(response)
+        open_turn.requested = [
+            (name, tool_by_name[name].billable) if name in tool_by_name else ("unknown_tool", False)
+            for _, name, _ in tool_calls
+        ]
 
         assistant_message: dict[str, Any] = {"role": "assistant", "content": text or None}
         if tool_calls:
@@ -5549,6 +5613,12 @@ async def run_agent_tool_loop(
                 **solve_fields,
                 **attribution,
             )
+            open_turn.dispatched[idx] = StepToolCall(
+                tool=tool_name if spec is not None else "unknown_tool",
+                status="refused" if result.status == "error" and result.refused else result.status,
+                duration_seconds=tool_duration_seconds,
+                billable=bool(spec is not None and spec.billable),
+            )
             if spec is not None and spec.billable:
                 target_key = _call_selector(args) or f"tool:{tool_name}"
                 same_count, same_errors = st.canonical.record_touch(target_key, result.status == "error")
@@ -6153,6 +6223,7 @@ async def run_agent_tool_loop(
 
     if st.outcome is None:
         st.outcome = LoopOutcome("loop_error", "loop exited without an outcome")
+    await _close_turn()
 
     # Every model- or loop-produced terminal once the cap tripped — a finish verdict, a guard
     # termination (even in the granting batch itself), a stall exit, the spent-grant exit —

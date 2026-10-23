@@ -9,6 +9,7 @@ import random
 import re
 import secrets
 import string
+import sys
 import time
 import uuid
 from asyncio.exceptions import CancelledError
@@ -180,7 +181,7 @@ from skyvern.forge.sdk.experimentation.workflow_block_engine import task_v3_disa
 from skyvern.forge.sdk.fail_fast.shadow import record_fail_fast_shadow
 from skyvern.forge.sdk.forge_log import exception_log_fields
 from skyvern.forge.sdk.log_artifacts import save_step_logs, save_task_logs
-from skyvern.forge.sdk.models import SpeculativeLLMMetadata, Step, StepStatus
+from skyvern.forge.sdk.models import TASK_V3_TURN_STEP_CREATED_BY, SpeculativeLLMMetadata, Step, StepStatus
 from skyvern.forge.sdk.schemas.files import FileInfo
 from skyvern.forge.sdk.schemas.organizations import Organization
 from skyvern.forge.sdk.schemas.persistent_browser_sessions import (
@@ -219,6 +220,7 @@ from skyvern.forge.taskv3.loop import (
     DownloadWait,
     LoopOutcome,
     RoundAction,
+    TurnRecord,
     submissions_across_contexts,
 )
 from skyvern.forge.taskv3.pre_submit_capture import PreSubmitCaptureRing, is_run_sampled, pre_submit_screenshot
@@ -620,6 +622,9 @@ _TASKV3_REASONING_MAX_CHARS = 1000
 # Same reason, for the outcome line: it can carry two page-supplied URLs (or, when the call reached no
 # page, the tool's own error text), and neither a URL nor a tool error has a length bound.
 _TASKV3_RESPONSE_MAX_CHARS = 500
+# A turn step write sits on the turn's critical path (the create precedes its model call), so a slow database
+# costs the run at most this per write instead of stalling it.
+_TASKV3_TURN_STEP_WRITE_TIMEOUT_SECONDS = 3
 
 
 def _taskv3_row_response(outcome: dict[str, Any]) -> str | None:
@@ -3356,6 +3361,60 @@ class ForgeAgent:
                 v3_round_index += 1
             v3_round_billed = False
 
+        # One step row per loop turn beside this block's own `step`: the turn's model call, its tool calls and the
+        # action rows it wrote land on it. `step` keeps the run's status, billing and step-budget unit.
+        v3_turn_step: Step | None = None
+        v3_turn_step_open = False
+
+        async def _on_turn_start(turn: int) -> Step | None:
+            nonlocal v3_turn_step, v3_turn_step_open
+            v3_turn_step, v3_turn_step_open = None, False
+            try:
+                async with asyncio.timeout(_TASKV3_TURN_STEP_WRITE_TIMEOUT_SECONDS):
+                    v3_turn_step = await app.DATABASE.tasks.create_step(
+                        task_id=task.task_id,
+                        order=turn,
+                        # The LLM layer reads the attributed step's retry_index to decide whether to send screenshots.
+                        retry_index=step.retry_index,
+                        organization_id=task.organization_id,
+                        status=StepStatus.running,
+                        created_by=TASK_V3_TURN_STEP_CREATED_BY,
+                    )
+            except Exception:
+                # The turn's model call and rows then land on the block's step, as before turn steps existed.
+                LOG.warning("task_v3 failed to create turn step", task_id=task.task_id, turn=turn, exc_info=True)
+                v3_turn_step = None
+                return None
+            v3_turn_step_open = True
+            return v3_turn_step
+
+        async def _finish_v3_turn_step(status: StepStatus, record: TurnRecord | None) -> None:
+            nonlocal v3_turn_step_open
+            if v3_turn_step is None or not v3_turn_step_open:
+                return
+            v3_turn_step_open = False
+            with contained_effect("task_v3 turn step finish", task_id=task.task_id, step_id=v3_turn_step.step_id):
+                async with asyncio.timeout(_TASKV3_TURN_STEP_WRITE_TIMEOUT_SECONDS):
+                    await app.DATABASE.tasks.finish_step(
+                        task_id=task.task_id,
+                        step_id=v3_turn_step.step_id,
+                        organization_id=task.organization_id,
+                        status=status,
+                        output=AgentStepOutput(
+                            llm_seconds=record.llm_seconds if record else None,
+                            tool_calls=record.tool_calls if record else None,
+                        ),
+                    )
+
+        async def _on_turn_end(record: TurnRecord) -> None:
+            if record.outcome_status == "canceled":
+                status = StepStatus.canceled
+            elif record.outcome_status == "loop_error":
+                status = StepStatus.failed
+            else:
+                status = StepStatus.completed
+            await _finish_v3_turn_step(status, record)
+
         async def _on_action_round(
             round_actions: list[RoundAction], turn_reasoning: str | None, /, *, round_done: bool
         ) -> None:
@@ -3378,7 +3437,7 @@ class ForgeAgent:
                 await _settle_before_post_action_screenshot(browser_state)
                 screenshot = await browser_state.take_post_action_screenshot(scrolling_number=0)
                 screenshot_artifact_id = await app.ARTIFACT_MANAGER.create_artifact(
-                    step=step, artifact_type=ArtifactType.SCREENSHOT_ACTION, data=screenshot
+                    step=v3_turn_step or step, artifact_type=ArtifactType.SCREENSHOT_ACTION, data=screenshot
                 )
             except Exception:
                 LOG.warning("task_v3 failed to capture post-action screenshot", task_id=task.task_id, exc_info=True)
@@ -3394,7 +3453,7 @@ class ForgeAgent:
                 turn_reasoning = turn_reasoning[:_TASKV3_REASONING_MAX_CHARS]
             for round_action in round_actions:
                 v3_round_billed = v3_round_billed or round_action.billable
-                # A row that bills nothing rides the LAST consumed index (or the single Step's own
+                # A row that bills nothing rides the LAST consumed index (or the block step's own
                 # order 0) the way the decision row below does: the workflow-run step budget counts
                 # distinct (task_id, step_order) pairs, and a fresh index nothing later claims would
                 # open one of its own. Read per row because a row publishes before the rest of its
@@ -3436,8 +3495,8 @@ class ForgeAgent:
                         organization_id=task.organization_id,
                         workflow_run_id=task.workflow_run_id,
                         task_id=task.task_id,
-                        step_id=step.step_id,
-                        # Round index, not the single Step's order: makes each BILLABLE v3 action
+                        step_id=(v3_turn_step or step).step_id,
+                        # Round index, not the turn step's order: makes each BILLABLE v3 action
                         # ROUND count as one unit of the workflow-run step budget (distinct (task,
                         # order) pairs).
                         step_order=row_step_order,
@@ -3810,6 +3869,8 @@ class ForgeAgent:
                 step=step,
                 should_cancel=_should_cancel,
                 on_action_round=_on_action_round,
+                on_turn_start=_on_turn_start,
+                on_turn_end=_on_turn_end,
                 on_pre_action=pre_submit_ring.capture if pre_submit_ring is not None else None,
                 # A code status the model has moved past is no longer what the run ends on.
                 on_page_action=verification_state.page_engaged,
@@ -3849,6 +3910,11 @@ class ForgeAgent:
             input_dispatch.end_login_pace()
             if context and credential_parameter_key is not None:
                 context.active_credential_parameter_key = prev_active_credential_parameter_key
+            # A loop that raised never ended its last turn.
+            await _finish_v3_turn_step(
+                StepStatus.canceled if isinstance(sys.exception(), asyncio.CancelledError) else StepStatus.failed,
+                None,
+            )
             # Frames are already in memory, so a loop that raised or ran out of budget still
             # persists what it captured; bounded so the unwind of a cancelled run is not held up.
             with contained_effect("task_v3 pre-submit frame persist", task_id=task.task_id):
@@ -3995,7 +4061,9 @@ class ForgeAgent:
                         async with asyncio.timeout(30):
                             decision_shot = await browser_state.take_post_action_screenshot(scrolling_number=0)
                             decision_screenshot_id = await app.ARTIFACT_MANAGER.create_artifact(
-                                step=step, artifact_type=ArtifactType.SCREENSHOT_ACTION, data=decision_shot
+                                step=v3_turn_step or step,
+                                artifact_type=ArtifactType.SCREENSHOT_ACTION,
+                                data=decision_shot,
                             )
                     except Exception:
                         LOG.warning(
@@ -4008,8 +4076,9 @@ class ForgeAgent:
                     organization_id=task.organization_id,
                     workflow_run_id=task.workflow_run_id,
                     task_id=task.task_id,
-                    step_id=step.step_id,
-                    # The decision rides on the LAST consumed billable index (or the single Step's own
+                    # The last turn's step: a verdict is that turn's finish call.
+                    step_id=(v3_turn_step or step).step_id,
+                    # The decision rides on the LAST consumed billable index (or the block step's own
                     # order 0): a fresh index would read as a new distinct (task, step_order) pair to
                     # the workflow-run step budget, the way v1's complete shares its final step.
                     step_order=max(v3_round_index - 1, 0),
@@ -4587,7 +4656,8 @@ class ForgeAgent:
                         recovery_code_progress=recovery_code_progress,
                     )
                 finally:
-                    await app.ARTIFACT_MANAGER.flush_step_archive(step.step_id)
+                    # The block's turn steps share its ZIP: one storage PUT per block rather than one per turn.
+                    await app.ARTIFACT_MANAGER.flush_task_step_archives_as_one(step)
                 return step, detailed_output, None
 
             if workflow_owned_recovery:
