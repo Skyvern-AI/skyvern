@@ -27,6 +27,7 @@ from skyvern.forge.sdk.db.models import (
 from skyvern.forge.sdk.db.repositories.organizations import OrganizationsRepository
 from skyvern.forge.sdk.db.repositories.scripts import ScriptsRepository
 from skyvern.forge.sdk.db.repositories.tasks import TasksRepository
+from skyvern.forge.sdk.models import Step
 from skyvern.forge.sdk.schemas.tasks import TaskStatus
 from skyvern.forge.sdk.schemas.totp_codes import OTPType, RawTOTPCode, TOTPCode
 from skyvern.schemas.runs import ProxyLocation
@@ -800,6 +801,18 @@ async def _read_raw_otp_code(db: AgentDB, organization_id: str, created: RawTOTP
     return next(code for code in codes if code.totp_code_id == created.totp_code_id)
 
 
+async def _create_step(db: AgentDB, organization_id: str) -> Step:
+    task = await db.tasks.create_task(
+        url="https://example.test/",
+        title="Insert",
+        navigation_goal=None,
+        data_extraction_goal=None,
+        navigation_payload=None,
+        organization_id=organization_id,
+    )
+    return await db.tasks.create_step(task.task_id, order=1, retry_index=0, organization_id=organization_id)
+
+
 # Each entry: (create the row, read the same row back by its id).
 _INSERTS: dict[str, tuple[Callable[..., Awaitable[BaseModel]], Callable[..., Awaitable[BaseModel | None]]]] = {
     "artifact": (
@@ -849,6 +862,10 @@ _INSERTS: dict[str, tuple[Callable[..., Awaitable[BaseModel]], Callable[..., Awa
             download_timeout=1.5,
         ),
         lambda db, org, row: db.tasks.get_task(row.task_id, organization_id=org),
+    ),
+    "step": (
+        _create_step,
+        lambda db, org, row: db.tasks.get_step(row.step_id, organization_id=org),
     ),
     # The ISP pin is written by a second flush, whose UPDATE also stamps modified_at.
     "browser_session": (

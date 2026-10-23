@@ -104,6 +104,7 @@ from skyvern.forge.taskv3.loop import (
     ToolRefusal,
     ToolResult,
     ToolSpec,
+    TurnRecord,
     UnseenPageText,
     _arms_failure_evidence,
     _budget_extension_gate,
@@ -5034,6 +5035,74 @@ async def test_on_action_round_falls_back_to_reasoning_summary_when_text_empty()
     )
     assert outcome.status == "completed"
     assert round_texts == ["clicked the primary submit button"]
+
+
+@pytest.mark.asyncio
+async def test_each_turn_runs_its_model_call_under_its_own_kwargs_and_reports_every_tool_call() -> None:
+    # One record per turn whatever the turn did (SKY-18790): a read, a batch with a failed call, its skipped
+    # dependent and an independent call, a turn with no tool call, and the finish. The step on_turn_start returns
+    # is that turn's model call `step`, over the run-wide one.
+    events: list[Any] = []
+
+    class _StepRecordingCaller(_ScriptedCaller):
+        async def call(self, *, step: Any = None, **kwargs: Any) -> dict[str, Any]:
+            events.append(("call", step))
+            return await super().call(**kwargs)
+
+    async def on_turn_start(turn: int) -> str:
+        events.append(("start", turn))
+        return f"turn-step-{turn}"
+
+    async def on_turn_end(record: TurnRecord) -> None:
+        assert record.llm_seconds is not None
+        calls = [(call.tool, call.status, call.billable) for call in record.tool_calls]
+        events.append(("end", record.turn, calls, record.outcome_status))
+
+    async def probe() -> str | None:
+        return "doc-1"
+
+    sink: list[tuple[str, dict[str, Any]]] = []
+    tools = [
+        _recording_tool("observe", sink),
+        _recording_tool("type", sink, raises=True, billable=True),
+        _recording_tool("press_key", sink, billable=True),
+        _recording_tool("select_option", sink, billable=True),
+        make_finish_tool(),
+    ]
+    script = [
+        [("observe", {})],
+        [("type", {"selector": "#q"}), ("press_key", {"selector": "#q"}), ("select_option", {"selector": "#z"})],
+        [],
+        [("finish", {"status": "completed", "reason": "done"})],
+    ]
+    outcome = await run_agent_tool_loop(
+        llm_caller=_StepRecordingCaller(script),
+        system_prompt="sys",
+        user_prompt="goal",
+        tools=tools,
+        max_turns=20,
+        max_tool_calls=100,
+        call_kwargs={"step": "block-step"},
+        page_probe=probe,
+        on_turn_start=on_turn_start,
+        on_turn_end=on_turn_end,
+    )
+
+    assert outcome.status == "completed"
+    assert events == [
+        ("start", 1),
+        ("call", "turn-step-1"),
+        ("end", 1, [("observe", "ok", False)], None),
+        ("start", 2),
+        ("call", "turn-step-2"),
+        ("end", 2, [("type", "error", True), ("press_key", "skipped", True), ("select_option", "ok", True)], None),
+        ("start", 3),
+        ("call", "turn-step-3"),
+        ("end", 3, [], None),
+        ("start", 4),
+        ("call", "turn-step-4"),
+        ("end", 4, [("finish", "ok", False)], "completed"),
+    ]
 
 
 @pytest.mark.asyncio

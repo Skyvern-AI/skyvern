@@ -47,7 +47,7 @@ from skyvern.forge.sdk.db.utils import hydrate_action
 from skyvern.forge.sdk.experimentation.billing_tier import BillingTier
 from skyvern.forge.sdk.experimentation.providers import BaseExperimentationProvider
 from skyvern.forge.sdk.experimentation.workflow_block_engine import DISABLE_TASK_V3_FLAG
-from skyvern.forge.sdk.models import Step, StepStatus
+from skyvern.forge.sdk.models import TASK_V3_TURN_STEP_CREATED_BY, Step, StepStatus
 from skyvern.forge.sdk.schemas.tasks import Task, TaskStatus
 from skyvern.forge.sdk.schemas.workflow_runs import WorkflowRunBlock
 from skyvern.forge.sdk.workflow.context_manager import WorkflowContextManager, WorkflowRunContext
@@ -94,6 +94,7 @@ from skyvern.forge.taskv3.loop import (
     RoundAction,
     ToolResult,
     ToolSpec,
+    TurnRecord,
     _dead_end_reason,
     make_finish_tool,
     run_agent_tool_loop,
@@ -107,6 +108,7 @@ from skyvern.forge.taskv3.run_arms import (
 from skyvern.forge.taskv3.tools import NO_ONE_TIME_CODE_SOURCE, PageProvider, _record_frame_work
 from skyvern.schemas.llm import LLMConfig
 from skyvern.schemas.runs import RunEngine
+from skyvern.schemas.steps import StepToolCall
 from skyvern.schemas.workflows import BlockType
 from skyvern.utils.secret_redaction import REDACTED_SECRET_PLACEHOLDER
 from skyvern.webeye.actions.actions import (
@@ -2225,6 +2227,7 @@ async def _run_execute_step_gate(
     workflow_owned_recovery: bool = False,
     recovery_code_progress: CodeProgressRecord | None = None,
     observer: Any = None,
+    artifact_manager: ArtifactManager | None = None,
     **task_overrides: Any,
 ) -> tuple[AsyncMock, AsyncMock]:
     """Drive ForgeAgent.execute_step through the v3 dispatch gate and return (mocked _execute_task_v3,
@@ -2275,7 +2278,10 @@ async def _run_execute_step_gate(
                 mock_app.EXPERIMENTATION_PROVIDER.resolve_feature_flag_strict = AsyncMock(return_value=False)
                 mock_wbe_app.EXPERIMENTATION_PROVIDER.is_feature_enabled_cached = AsyncMock(return_value=False)
                 mock_wbe_app.EXPERIMENTATION_PROVIDER.resolve_feature_flag_strict = AsyncMock(return_value=False)
-            mock_app.ARTIFACT_MANAGER.flush_step_archive = AsyncMock()
+            if artifact_manager is not None:
+                mock_app.ARTIFACT_MANAGER = artifact_manager
+            else:
+                mock_app.ARTIFACT_MANAGER.flush_task_step_archives_as_one = AsyncMock()
             try:
                 await agent.execute_step(
                     organization=organization,
@@ -2324,6 +2330,40 @@ async def test_execute_step_dispatches_download_semantics_blocks_to_v3(overrides
     v3_mock.assert_awaited_once()
     assert v3_mock.await_args.kwargs["task_block"] is block
     step_engine_mock.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_execute_step_writes_a_v3_blocks_turn_files_as_one_zip(monkeypatch: pytest.MonkeyPatch) -> None:
+    # A v3 block's turn steps share its ZIP (SKY-18790): the block's end writes their LLM files in one storage PUT,
+    # instead of one ZIP per turn left in memory until the run or workflow ends.
+    manager = ArtifactManager()
+    now = datetime.now(UTC)
+    turn_task = make_task(now, make_organization(now), task_id="tsk_zip")
+    for order in (1, 2):
+        turn = make_step(now, turn_task, step_id=f"turn-{order}", status=StepStatus.completed, order=order, output=None)
+        manager.accumulate_llm_call_to_archive(step=turn, request=b"request", response=b"response")
+    stored: list[Any] = []
+
+    async def _store(artifact: Any, data: bytes) -> None:
+        stored.append(artifact)
+
+    monkeypatch.setattr("skyvern.forge.sdk.artifact.manager._bundling_enabled", lambda: True)
+    monkeypatch.setattr(
+        "skyvern.forge.sdk.artifact.manager.app.STORAGE",
+        SimpleNamespace(build_uri=lambda **kwargs: f"s3://artifacts/{kwargs['artifact_id']}", store_artifact=_store),
+    )
+    monkeypatch.setattr("skyvern.forge.sdk.artifact.manager.app.DATABASE.artifacts.bulk_create_artifacts", AsyncMock())
+
+    v3_mock, _ = await _run_execute_step_gate(
+        engine=agent_module.RunEngine.skyvern_v3,
+        task_block=_make_block(ActionBlock),
+        artifact_manager=manager,
+        task_id="tsk_zip",
+    )
+
+    v3_mock.assert_awaited_once()
+    assert [artifact.step_id for artifact in stored] == ["step-gate"]
+    assert manager._step_archives == {}
 
 
 @pytest.mark.asyncio
@@ -4422,6 +4462,10 @@ async def test_execute_task_v3_native_browser_loss_after_the_last_action_fails_t
 
     monkeypatch.setattr("skyvern.forge.agent.app.DATABASE.workflow_params.create_action", _create_action)
     monkeypatch.setattr(
+        "skyvern.forge.agent.app.DATABASE.tasks.create_step",
+        AsyncMock(side_effect=lambda **kwargs: SimpleNamespace(step_id=f"turn-{kwargs['order']}", retry_index=0)),
+    )
+    monkeypatch.setattr(
         "skyvern.forge.agent.app.DATABASE.observer.get_workflow_run_block_by_task_id", AsyncMock(return_value=None)
     )
     monkeypatch.setattr("skyvern.services.otp_service.has_credential_totp_candidate", lambda *_a, **_k: False)
@@ -4664,6 +4708,61 @@ async def test_execute_task_v3_actions_are_round_stamped(monkeypatch: pytest.Mon
     # as a new distinct (task, step_order) pair to the workflow-run step budget.
     decision = create_action.await_args_list[-1].kwargs["action"]
     assert (decision.step_order, decision.action_order) == (1, 3)
+
+
+@pytest.mark.asyncio
+async def test_execute_task_v3_writes_a_step_per_turn_beside_the_billed_block_step(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Each loop turn gets its own step (SKY-18790): the turn's model call runs under it and the rows it writes
+    # point at it, while the block's own step stays the one billing meters and the run's status lands on.
+    created: list[dict[str, Any]] = []
+
+    async def fake_create_step(**kwargs: Any) -> Any:
+        created.append(kwargs)
+        return SimpleNamespace(step_id=f"turn-{kwargs['order']}")
+
+    monkeypatch.setattr("skyvern.forge.agent.app.DATABASE.tasks.create_step", fake_create_step)
+    finish_turn = AsyncMock()
+    monkeypatch.setattr("skyvern.forge.agent.app.DATABASE.tasks.finish_step", finish_turn)
+    steps_by_turn: list[Any] = []
+
+    async def drive_turns(kwargs: dict[str, Any]) -> None:
+        steps_by_turn.append(await kwargs["on_turn_start"](1))
+        click = RoundAction("click", {"selector": "#go"}, True, billable=True)
+        await kwargs["on_action_round"]([click], "clicking", round_done=True)
+        await kwargs["on_turn_end"](
+            TurnRecord(turn=1, llm_seconds=1.5, tool_calls=[StepToolCall(tool="click", status="ok", billable=True)])
+        )
+        steps_by_turn.append(await kwargs["on_turn_start"](2))
+        await kwargs["on_turn_end"](
+            TurnRecord(turn=2, tool_calls=[StepToolCall(tool="finish", status="ok")], outcome_status="completed")
+        )
+
+    outcome = LoopOutcome(status="completed", reason="done", billable_actions=["click"])
+    step, _task, _loop_mock, post_step = await _run_execute_task_v3(
+        monkeypatch,
+        outcome,
+        on_loop_async=drive_turns,
+        data_extraction_goal=None,
+        extracted_information_schema=None,
+    )
+
+    assert [(c["order"], c["retry_index"], c["status"], c["created_by"]) for c in created] == [
+        (1, step.retry_index, StepStatus.running, TASK_V3_TURN_STEP_CREATED_BY),
+        (2, step.retry_index, StepStatus.running, TASK_V3_TURN_STEP_CREATED_BY),
+    ]
+    assert [turn_step.step_id for turn_step in steps_by_turn] == ["turn-1", "turn-2"]
+    finished = [
+        (c.kwargs["step_id"], c.kwargs["status"], [t.tool for t in c.kwargs["output"].tool_calls])
+        for c in finish_turn.await_args_list
+    ]
+    assert finished == [("turn-1", StepStatus.completed, ["click"]), ("turn-2", StepStatus.completed, ["finish"])]
+    # The click row and the finish decision sit on their turns' steps, still stamped with the round index.
+    rows = [c.kwargs["action"] for c in agent_module.app.DATABASE.workflow_params.create_action.await_args_list]
+    assert [(row.step_id, row.step_order) for row in rows] == [("turn-1", 0), ("turn-2", 0)]
+    assert step.step_id == "step-v3" and step.status == StepStatus.completed
+    assert post_step.await_args.args[1] is step
 
 
 @pytest.mark.asyncio
