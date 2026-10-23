@@ -41,6 +41,7 @@ from skyvern.forge.sdk.copilot.tools.locator_inspection import (
     TOOL_NAME,
     TOOL_SCHEMA,
     inspect_locator_matches,
+    visibility_counts,
 )
 from skyvern.forge.sdk.copilot.tools.run_execution import build_test_evidence_packet
 from skyvern.forge.sdk.schemas.workflow_runs import WorkflowRunBlock
@@ -76,7 +77,7 @@ class _FakeMatch:
         return self
 
     async def is_visible(self) -> bool:
-        return True
+        return self._facts.get("visible", True)
 
     async def evaluate(self, _expression: str) -> dict[str, Any]:
         return dict(self._facts)
@@ -236,6 +237,22 @@ async def test_each_match_reports_whether_playwright_considers_it_visible() -> N
     assert entry["match_count"] == 3
     assert [match["visible"] for match in entry["matches"]] == [False, False, True]
     assert {match["text_content"] for match in entry["matches"]} == {"23.2k stars"}
+
+
+@pytest.mark.asyncio
+async def test_the_visibility_log_carries_counts_but_no_selector_or_page_text() -> None:
+    hidden = {"tag": "strong", "text_content": "23.2k", "descendants": [], "visible": False}
+    selector = 'span:has-text("Jane Doe") strong'
+    page = _FakePage({selector: [hidden, dict(hidden, visible=True)], DEAD: []}, invalid={"span:has-text("})
+
+    counts = visibility_counts(await inspect_locator_matches(page, [selector, DEAD, "span:has-text("]))
+
+    assert [{k: v for k, v in entry.items() if k != "selector_sha256"} for entry in counts] == [
+        {"error": False, "match_count": 2, "listed_visible": 1, "first_match_visible": False},
+        {"error": False, "match_count": 0, "listed_visible": 0, "first_match_visible": None},
+        {"error": True, "match_count": None, "listed_visible": 0, "first_match_visible": None},
+    ]
+    assert "Jane" not in json.dumps(counts) and "23.2k" not in json.dumps(counts)
 
 
 class _SwapDuringRead:
