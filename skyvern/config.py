@@ -1039,8 +1039,8 @@ class Settings(BaseSettings):
     # OpenTelemetry Settings
     OTEL_ENABLED: bool = False
     OTEL_SERVICE_NAME: str = "skyvern"
-    # Which infrastructure this process runs on ("aws", "hetzner", or "local"
-    # for self-hosted/dev); stamped on run-telemetry metrics so run time and
+    # Which infrastructure this process runs on ("aws", or "local" in
+    # self-hosted and dev); stamped on run-telemetry metrics so run time and
     # cost can be split by infra. Cloud deploy configs set it explicitly.
     INFRA_PROVIDER: str = "local"
     OTEL_EXPORTER_OTLP_ENDPOINT: str = ""

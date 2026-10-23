@@ -128,7 +128,7 @@ def test_filter_keeps_target_closed_error_from_awaited_path() -> None:
 
 
 def test_filter_drops_collected_object_task_noise() -> None:
-    # The recurring Hetzner burst: an orphaned Playwright teardown coroutine raises
+    # The recurring teardown burst: an orphaned Playwright teardown coroutine raises
     # "Channel.send: The object has been collected ..." and asyncio logs it as a
     # "Task exception was never retrieved" record. Pre-existing benign teardown noise.
     record = _orphaned_task_record_for(PlaywrightError(_CHANNEL_COLLECTED_TEXT))
