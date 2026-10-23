@@ -29,6 +29,7 @@ import uuid
 import zipfile
 from collections import defaultdict, deque
 from collections.abc import AsyncIterator, Iterator, Mapping, Sequence
+from contextvars import ContextVar
 from dataclasses import dataclass, replace
 from datetime import UTC, date, datetime, time
 from email.message import EmailMessage
@@ -94,6 +95,7 @@ from skyvern.constants import (
 )
 from skyvern.errors.errors import UserDefinedError
 from skyvern.exceptions import (
+    BROWSER_CONNECTION_LOST_ERROR_CODE,
     AzureConfigurationError,
     BlockedHost,
     BlockedNavigationDestination,
@@ -363,7 +365,12 @@ from skyvern.webeye.browser_driver_errors import is_driver_error
 from skyvern.webeye.browser_engine import is_any_engine_error
 from skyvern.webeye.browser_factory import rebind_download_dir
 from skyvern.webeye.browser_object_predicates import is_page_like
-from skyvern.webeye.browser_state import BrowserState, get_browser_state_diagnostic
+from skyvern.webeye.browser_state import (
+    BrowserState,
+    get_browser_connection_loss,
+    get_browser_state_diagnostic,
+    raise_if_browser_connection_lost,
+)
 from skyvern.webeye.cdp_download_interceptor import (
     ORIGINAL_FILENAME_MARKER,
     ORIGINAL_FILENAME_TEMPLATE_VARIABLE,
@@ -1318,6 +1325,14 @@ class Block(BaseModel, abc.ABC):
         # stopped it — reusing it makes the block's first page.goto raise "Connection closed
         # while reading from the driver". Rebuild a fresh connection to the same browser first.
         if browser_state is not None and not browser_state.is_connected():
+            connection_loss = get_browser_connection_loss(browser_state)
+            if connection_loss is not None:
+                raise MissingBrowserState(
+                    workflow_run_id=workflow_run_id,
+                    diagnostic=connection_loss,
+                    detected_at=datetime.now(UTC),
+                    failure_reason=BROWSER_CONNECTION_LOST_ERROR_CODE,
+                )
             workflow_run = await app.WORKFLOW_SERVICE.get_workflow_run(
                 workflow_run_id=workflow_run_id,
                 organization_id=organization_id,
@@ -1862,6 +1877,11 @@ class Block(BaseModel, abc.ABC):
                     organization_id=organization_id,
                     can_continue_after_failure=False,
                 )
+            # A native loss can latch during the setup awaits above; only the finally route runs after one.
+            if not _runs_after_browser_loss(workflow_run_id):
+                raise_if_browser_connection_lost(
+                    app.BROWSER_MANAGER.get_for_workflow_run(workflow_run_id), workflow_run_id=workflow_run_id
+                )
 
             LOG.info(
                 "Executing block",
@@ -1883,6 +1903,9 @@ class Block(BaseModel, abc.ABC):
             if not result.success:
                 await self._invalidate_stale_output_on_failure(
                     workflow_run_id, current_index, include_missing_value_guard=False
+                )
+                result = await self._with_browser_connection_loss(
+                    result, workflow_run_id, workflow_run_block_id, organization_id
                 )
             return result
         except Exception as e:
@@ -1953,6 +1976,14 @@ class Block(BaseModel, abc.ABC):
                     nav_run_context = None
                 if nav_run_context is not None and not is_registered_secret(e.nav_error_code, nav_run_context):
                     error_codes = [*error_codes, e.nav_error_code]
+            # The run's browser is known lost, so this failure is terminal whatever exception surfaced it. Inside the
+            # finally block only a refused browser use is; the body's loss does not end its ordinary failures.
+            browser_lost = _run_lost_its_browser(workflow_run_id) and (
+                not _runs_after_browser_loss(workflow_run_id)
+                or isinstance(e, (MissingBrowserState, MissingBrowserStatePage))
+            )
+            if browser_lost:
+                error_codes = [*error_codes, BROWSER_CONNECTION_LOST_ERROR_CODE]
 
             return await self.build_block_result(
                 success=False,
@@ -1961,11 +1992,37 @@ class Block(BaseModel, abc.ABC):
                 workflow_run_block_id=workflow_run_block_id,
                 organization_id=organization_id,
                 error_codes=error_codes or None,
-                can_continue_after_failure=can_continue_after_failure,
+                can_continue_after_failure=False if browser_lost else can_continue_after_failure,
             )
         finally:
             if download_timeout_context is not None:
                 download_timeout_context.download_timeout = prev_download_timeout
+
+    async def _with_browser_connection_loss(
+        self,
+        result: BlockResult,
+        workflow_run_id: str,
+        workflow_run_block_id: str | None,
+        organization_id: str | None,
+    ) -> BlockResult:
+        # A block that returns its outcome instead of raising it never reaches the exception handler above. After the
+        # loss any unsuccessful outcome but a cancellation fails the run, so a terminated task cannot let it continue.
+        if (
+            _runs_after_browser_loss(workflow_run_id)
+            or not _run_lost_its_browser(workflow_run_id)
+            or result.success
+            or result.status == BlockStatus.canceled
+        ):
+            return result
+        error_codes = list(dict.fromkeys([*result.error_codes, BROWSER_CONNECTION_LOST_ERROR_CODE]))
+        if workflow_run_block_id and (result.status != BlockStatus.failed or error_codes != result.error_codes):
+            await app.DATABASE.observer.update_workflow_run_block(
+                workflow_run_block_id=workflow_run_block_id,
+                organization_id=organization_id,
+                status=BlockStatus.failed,
+                error_codes=error_codes,
+            )
+        return replace(result, status=BlockStatus.failed, error_codes=error_codes, can_continue_after_failure=False)
 
     @abc.abstractmethod
     def get_all_parameters(
@@ -1973,6 +2030,30 @@ class Block(BaseModel, abc.ABC):
         workflow_run_id: str,
     ) -> list[PARAMETER_TYPE]:
         pass
+
+
+# The finally block's dispatch task copies this context. It names the run whose finally block it is, because a
+# synchronous child workflow started there runs inline in the same context and keeps its own body guards.
+_finally_after_browser_loss_run_id: ContextVar[str | None] = ContextVar(
+    "finally_after_browser_loss_run_id", default=None
+)
+
+
+@contextlib.contextmanager
+def running_after_browser_loss(workflow_run_id: str) -> Iterator[None]:
+    token = _finally_after_browser_loss_run_id.set(workflow_run_id)
+    try:
+        yield
+    finally:
+        _finally_after_browser_loss_run_id.reset(token)
+
+
+def _runs_after_browser_loss(workflow_run_id: str) -> bool:
+    return _finally_after_browser_loss_run_id.get() == workflow_run_id
+
+
+def _run_lost_its_browser(workflow_run_id: str) -> bool:
+    return get_browser_connection_loss(app.BROWSER_MANAGER.get_for_workflow_run(workflow_run_id)) is not None
 
 
 def _is_retry_blocking_anti_bot_entry(category: dict) -> bool:
@@ -2469,8 +2550,9 @@ class BaseTaskBlock(Block):
 
         # TODO (kerem) we should always retry on terminated. We should make a distinction between retriable and
         # non-retryable terminations
+        next_task_order: tuple[int, int] | None = None
         while will_retry:
-            task_order, task_retry = await self.get_task_order(workflow_run_id, current_retry)
+            task_order, task_retry = next_task_order or await self.get_task_order(workflow_run_id, current_retry)
             is_first_task = task_order == 0
             task, step = await app.agent.create_task_and_step_from_block(
                 task_block=self,
@@ -2834,7 +2916,6 @@ class BaseTaskBlock(Block):
                         failure_category=updated_task.failure_category,
                     )
                     will_retry = False
-                retry_message = f", retrying task {current_retry}/{self.max_retries}" if will_retry else ""
                 downloaded_files = None
                 try:
                     async with asyncio.timeout(GET_DOWNLOADED_FILES_TIMEOUT):
@@ -2864,6 +2945,13 @@ class BaseTaskBlock(Block):
                     workflow_run_id=workflow_run_id,
                     organization_id=workflow_run.organization_id,
                 )
+                if will_retry:
+                    next_task_order = await self.get_task_order(workflow_run_id, current_retry)
+                # The retry is admitted only after every await above, so a loss during one ends the block here.
+                browser_lost = _run_lost_its_browser(workflow_run_id)
+                if browser_lost:
+                    will_retry = False
+                retry_message = f", retrying task {current_retry}/{self.max_retries}" if will_retry else ""
 
                 task_output = TaskOutput.from_task(
                     updated_task,
@@ -2887,6 +2975,9 @@ class BaseTaskBlock(Block):
                     await self.record_output_parameter_value(
                         workflow_run_context, workflow_run_id, output_parameter_value
                     )
+                    error_codes = _recorded_task_nav_error_codes(updated_task.task_id, workflow_run_context) or []
+                    if browser_lost:
+                        error_codes.append(BROWSER_CONNECTION_LOST_ERROR_CODE)
                     return await self.build_block_result(
                         success=False,
                         failure_reason=(
@@ -2897,7 +2988,8 @@ class BaseTaskBlock(Block):
                         status=block_status_mapping[updated_task.status],
                         workflow_run_block_id=workflow_run_block_id,
                         organization_id=organization_id,
-                        error_codes=_recorded_task_nav_error_codes(updated_task.task_id, workflow_run_context),
+                        error_codes=error_codes or None,
+                        can_continue_after_failure=False if browser_lost else None,
                     )
 
         await self.record_output_parameter_value(workflow_run_context, workflow_run_id)
@@ -5937,6 +6029,7 @@ def _bind_code_block_magic_link(
             retry_times=NAVIGATION_MAX_RETRY_TIME,
             settle=default_navigation_settle,
             log_url=redact_url_secrets(link),
+            stop_retrying=lambda: workflow_run_id is not None and _run_lost_its_browser(workflow_run_id),
         )
 
     return magic_link
@@ -6579,6 +6672,7 @@ def _bind_code_block_open_page(
         open_tabs = await open_page_tab_count(_raw_code_block_page(page), browser_state)
         if open_page_cap_reached(open_tabs):
             raise RuntimeError(open_page_cap_error(open_tabs))
+        raise_if_browser_connection_lost(browser_state)
         opened: Page | RecordingPage
         if isinstance(page, RecordingPage):
             opened = page._wrap_page(await page._underlying_page.context.new_page())
@@ -9247,6 +9341,13 @@ async def wrapper({default_args}):
                 final_url=staged_failure_url,
             )
 
+        if (
+            get_browser_connection_loss(
+                browser_state or app.BROWSER_MANAGER.get_for_workflow_run(workflow_run_id=workflow_run_id)
+            )
+            is not None
+        ):
+            return await _finalize_heal_result(None)
         if not classification.healable:
             return await _finalize_heal_result(None)
         if not await self._ai_fallback_enabled(workflow_run_context):
@@ -9418,12 +9519,15 @@ async def wrapper({default_args}):
     ) -> BlockResult:
         propagated_error: BaseException
         try:
-            return await self._execute(
+            result = await self._execute(
                 workflow_run_id,
                 workflow_run_block_id,
                 organization_id=organization_id,
                 browser_session_id=browser_session_id,
                 **kwargs,
+            )
+            return await self._with_browser_connection_loss(
+                result, workflow_run_id, workflow_run_block_id, organization_id
             )
         except BaseException as exc:
             if isinstance(exc, (MissingBrowserState, MissingBrowserStatePage)):
@@ -16870,13 +16974,20 @@ class TaskV2Block(Block):
             "workflow_screenshot_artifact_ids": [a.artifact_id for a in workflow_screenshot_artifacts],
         }
         await self.record_output_parameter_value(workflow_run_context, workflow_run_id, task_v2_output)
+        # An explicit persistent session registers the child's browser under the child run only.
+        browser_lost = not success and (
+            _run_lost_its_browser(workflow_run_id)
+            or (task_v2_workflow_run_id is not None and _run_lost_its_browser(task_v2_workflow_run_id))
+        )
         return await self.build_block_result(
-            success=success or self.continue_on_failure,
+            success=success or (self.continue_on_failure and not browser_lost),
             failure_reason=failure_reason,
             output_parameter_value=task_v2_output,
             status=block_status,
             workflow_run_block_id=workflow_run_block_id,
             organization_id=organization_id,
+            error_codes=[BROWSER_CONNECTION_LOST_ERROR_CODE] if browser_lost else None,
+            can_continue_after_failure=False if browser_lost else None,
         )
 
 

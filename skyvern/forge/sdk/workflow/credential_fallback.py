@@ -3,7 +3,7 @@ from __future__ import annotations
 import structlog
 from sqlalchemy.exc import IntegrityError
 
-from skyvern.exceptions import WorkflowNotFound
+from skyvern.exceptions import BROWSER_CONNECTION_LOST_ERROR_CODE, WorkflowNotFound
 from skyvern.forge import app
 from skyvern.forge.failure_classifier import classify_from_failure_reason
 from skyvern.forge.sdk.core import skyvern_context
@@ -178,6 +178,12 @@ async def _maybe_start_credential_fallback_retry(workflow_run: WorkflowRun, orga
         parameter for parameter in credential_parameters if _trigger_matches(workflow_run, parameter.fallback_trigger)
     ]
     if not triggered_parameters:
+        return None
+    # Another credential cannot help a run whose browser went away under it.
+    run_blocks = await app.DATABASE.observer.get_workflow_run_blocks(
+        workflow_run_id=workflow_run.workflow_run_id, organization_id=organization_id
+    )
+    if any(BROWSER_CONNECTION_LOST_ERROR_CODE in run_block.error_codes for run_block in run_blocks):
         return None
 
     all_fallback_ids = list(

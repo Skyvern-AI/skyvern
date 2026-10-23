@@ -23,12 +23,14 @@ from skyvern.constants import (
     NAVIGATION_MAX_RETRY_TIME,
 )
 from skyvern.exceptions import (
+    BROWSER_CONNECTION_LOST_ERROR_CODE,
     BrowserStateDiagnostic,
     EmptyBrowserContext,
     ExternalBrowserUnavailable,
     FailedToNavigateToUrl,
     FailedToReloadPage,
     FailedToStopLoadingPage,
+    MissingBrowserState,
     MissingBrowserStatePage,
     UnresolvableNavigationHost,
 )
@@ -428,6 +430,9 @@ class RealBrowserState(BrowserState):
         # A release retry after a transient DB failure must not repeat local CDP teardown.
         self._remote_driver_detached = False
         self._browser_state_diagnostic: BrowserStateDiagnostic | None = None
+        # The run that saw this browser end unexpectedly, and how. Unlike the diagnostic it survives a context
+        # rebuild, so that run never gets the browser back; a later run that reuses this state does not see it.
+        self._connection_loss: tuple[str | None, BrowserStateDiagnostic] | None = None
         # HTTP status of the most recent navigate_to_url (None until one runs, or when it produced no
         # response). Read by the Task V3 loop to classify a dead/removed starting URL; v1 ignores it.
         self.last_navigation_status: int | None = None
@@ -573,10 +578,17 @@ class RealBrowserState(BrowserState):
         # A tab can die on its own (a download-turned-navigation, a renderer crash) while the
         # context survives. Recover here rather than in each consumer: every caller that needs a
         # page treats "no page" as fatal, so one of them recovering only relocates the failure.
-        if self.browser_context is None or self.external_browser or not self.is_connected():
+        if (
+            self.browser_context is None
+            or self.external_browser
+            or not self.is_connected()
+            or self.get_browser_connection_loss() is not None
+        ):
             return None
         async with self._reopen_working_page_lock:
             already_reopened = await self.get_working_page()
+            if self.get_browser_connection_loss() is not None:
+                return None
             if already_reopened is not None:
                 await self._close_crashed_targets()
                 return already_reopened
@@ -704,6 +716,7 @@ class RealBrowserState(BrowserState):
         reconcile_persistent_init_scripts: bool = False,
         sessionless_init_script_registrations: Collection[Any] = (),
     ) -> None:
+        self._refuse_after_connection_loss()
         if self.browser_context is None:
             if self.external_browser:
                 raise ExternalBrowserUnavailable.lost()
@@ -790,6 +803,7 @@ class RealBrowserState(BrowserState):
                 if pages:
                     page = pages[-1]
                     use_existing_page = True
+            self._refuse_after_connection_loss()
             if page is None:
                 page = await self.browser_context.new_page()
 
@@ -894,6 +908,7 @@ class RealBrowserState(BrowserState):
         retry_times: int = NAVIGATION_MAX_RETRY_TIME,
         wait_until: Literal["load", "domcontentloaded", "commit"] = "load",
     ) -> None:
+        self._refuse_after_connection_loss()
         landed_url: str | None = None
 
         async def goto(strategy: str) -> object:
@@ -916,6 +931,7 @@ class RealBrowserState(BrowserState):
                 retry_times=retry_times,
                 settle=self._wait_for_settle,
                 wait_until=wait_until,
+                stop_retrying=lambda: self.get_browser_connection_loss() is not None,
             )
         except Exception as navigation_error:
             await self.record_navigation_result(navigation_error)
@@ -1386,15 +1402,7 @@ class RealBrowserState(BrowserState):
         observation_source: Literal["liveness_probe", "browser_event", "driver_event"] = "liveness_probe",
         disconnect_evidence: DisconnectEvidence = "liveness_state",
     ) -> None:
-        if self._browser_state_diagnostic is not None or not self._ever_connected:
-            return
-        pending = self._deferred_runtime_end
-        if (
-            self._runtime_events_deferred
-            and pending is not None
-            and pending.context is self.browser_context
-            and pending.driver is self.pw
-        ):
+        if not self._ever_connected:
             return
         observation = self._make_runtime_end_observation(
             reason,
@@ -1406,6 +1414,18 @@ class RealBrowserState(BrowserState):
             observation_source=observation_source,
             disconnect_evidence=disconnect_evidence,
         )
+        # Before the first-diagnostic dedupe: a probe failure may already have latched the diagnostic.
+        self._latch_connection_loss(observation)
+        if self._browser_state_diagnostic is not None:
+            return
+        pending = self._deferred_runtime_end
+        if (
+            self._runtime_events_deferred
+            and pending is not None
+            and pending.context is self.browser_context
+            and pending.driver is self.pw
+        ):
+            return
         if self._runtime_events_deferred:
             self._deferred_runtime_end = observation
             return
@@ -1515,6 +1535,47 @@ class RealBrowserState(BrowserState):
     def get_browser_state_diagnostic(self) -> BrowserStateDiagnostic | None:
         return self._browser_state_diagnostic
 
+    def _run_owner(self) -> str | None:
+        return self._runtime_event_context.workflow_run_id or self._runtime_event_context.task_id
+
+    def _latch_connection_loss(self, observation: _RuntimeEndObservation) -> None:
+        owner = self._run_owner()
+        # No run owns an unbound or not-yet-published state, so its loss is not a run's terminal fact.
+        if (
+            owner is None
+            or self._runtime_events_deferred
+            or observation.source != "browser_event"
+            or observation.expected
+            or observation.run_phase != "active"
+            or observation.context is None
+            or observation.context is not self.browser_context
+            or observation.driver is not self.pw
+            or (self._connection_loss is not None and self._connection_loss[0] == owner)
+        ):
+            return
+        self._connection_loss = (owner, observation.diagnostic)
+
+    def get_browser_connection_loss(self) -> BrowserStateDiagnostic | None:
+        if self._connection_loss is None or self._connection_loss[0] != self._run_owner():
+            return None
+        return self._connection_loss[1]
+
+    @property
+    def active_run_owner(self) -> str | None:
+        return None if self._run_released else self._run_owner()
+
+    def _refuse_after_connection_loss(self) -> None:
+        # Reconnect, context rebuild and navigation for the owning run stop here, before any side effect.
+        connection_loss = self.get_browser_connection_loss()
+        if connection_loss is not None:
+            raise MissingBrowserState(
+                task_id=self._runtime_event_context.task_id,
+                workflow_run_id=self._runtime_event_context.workflow_run_id,
+                diagnostic=connection_loss,
+                detected_at=datetime.now(UTC),
+                failure_reason=BROWSER_CONNECTION_LOST_ERROR_CODE,
+            )
+
     def _connection_status(self) -> tuple[bool, str | None]:
         stopped = browser_context_stopped_reason(self.browser_context)
         return stopped is None, stopped
@@ -1540,6 +1601,7 @@ class RealBrowserState(BrowserState):
         browser_session_id: str | None = None,
         stale_context_is_unusable: bool = False,
     ) -> None:
+        self._refuse_after_connection_loss()
         # Rebuild through a fresh Playwright driver only after the old connection is known dead or
         # an explicitly unusable connection has completed bounded shutdown.
         stale_pw = self.pw
@@ -1888,6 +1950,7 @@ class RealBrowserState(BrowserState):
             raise FailedToStopLoadingPage(url=page.url, error_message=repr(e))
 
     async def new_page(self) -> Page:
+        self._refuse_after_connection_loss()
         if self.browser_context is None:
             raise EmptyBrowserContext()
         return await self.browser_context.new_page()
@@ -1938,7 +2001,8 @@ class RealBrowserState(BrowserState):
                 return
             except Exception as e:
                 self._record_reload_timeout(e)
-                if i < len(strategies) - 1:
+                # A reload that failed after the owning run lost its browser is final; degrading would send another.
+                if i < len(strategies) - 1 and self.get_browser_connection_loss() is None:
                     LOG.warning(
                         "Reload timed out, degrading wait strategy",
                         url=url,

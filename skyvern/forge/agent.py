@@ -52,6 +52,7 @@ from skyvern.errors.errors import (
     resolve_error_code_mapping_key,
 )
 from skyvern.exceptions import (
+    BROWSER_CONNECTION_LOST_ERROR_CODE,
     BrowserSessionAlreadyOccupiedError,
     BrowserSessionClosed,
     BrowserSessionDegraded,
@@ -347,7 +348,7 @@ from skyvern.webeye.browser_errors import (
     is_context_lost_message,
     is_target_closed_message,
 )
-from skyvern.webeye.browser_state import BrowserState, get_browser_state_diagnostic
+from skyvern.webeye.browser_state import BrowserState, get_browser_connection_loss, get_browser_state_diagnostic
 from skyvern.webeye.cdp_download_interceptor import (
     consume_unsolicited_download_error_for_context,
     download_filename_from_suffix,
@@ -3449,7 +3450,11 @@ class ForgeAgent:
             block_type=block_type,
         )
         completion_rejection: str | None = None
-        if outcome.status == "completed":
+        if outcome.status == "completed" and get_browser_connection_loss(browser_state) is not None:
+            # The gates below fail open on a page that is gone, so a loss after the last action must fail here.
+            completion_rejection = f"the run lost its browser connection ({BROWSER_CONNECTION_LOST_ERROR_CODE})"
+            LOG.warning("task_v3 completion rejected after a browser connection loss", task_id=task.task_id)
+        elif outcome.status == "completed":
             # The deployment gate for a completion the finish tool could not put to it (no headroom left to
             # act on a refusal, a re-ask conversion, or a gate error). The loop has returned, so a veto fails.
             gate_page = None
@@ -5508,6 +5513,8 @@ class ForgeAgent:
             )
             if canceled is not None:
                 return actions, canceled
+            if get_browser_connection_loss(browser_state) is not None:
+                return actions, await self._fail_step_unless_run_canceled(task, step, detailed_agent_step_output)
 
             context = skyvern_context.ensure_context()
             if context.refresh_working_page:
@@ -5818,6 +5825,8 @@ class ForgeAgent:
                 return actions, await self._fail_step_unless_run_canceled(task, step, detailed_agent_step_output)
 
         await artifact_tracker.drain()
+        if get_browser_connection_loss(browser_state) is not None:
+            return actions, await self._fail_step_unless_run_canceled(task, step, detailed_agent_step_output)
         # A cancel landing during the last action would otherwise reach extraction and completion.
         return actions, await self._stop_step_if_run_canceled(task, step, detailed_agent_step_output, skipped_actions=0)
 

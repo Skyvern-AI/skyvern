@@ -280,6 +280,7 @@ async def navigate_with_retry(
     wait_until: Literal["load", "domcontentloaded", "commit"] = "load",
     sleep: SleepFunc | None = None,
     log_url: str | None = None,
+    stop_retrying: Callable[[], bool] | None = None,
 ) -> int | None:
     # Returns the final navigation response's HTTP status when one is available (None when the
     # navigation produced no response object). Additive: every caller today ignores the return; the
@@ -311,6 +312,11 @@ async def navigate_with_retry(
         raise UnresolvableNavigationHost(
             url=display_url, host=error.host, error_message=_NO_ADDRESS_RECORD_REFUSAL
         ) from None
+
+    # The destination check above can wait on DNS, and the caller's stop (the run's lost browser connection) may
+    # have latched meanwhile; nothing is dispatched then.
+    if stop_retrying is not None and stop_retrying():
+        raise FailedToNavigateToUrl(url=display_url, error_message="the browser connection was lost before navigation")
 
     for attempt in range(retry_times):
         strategy = degradation[min(attempt, len(degradation) - 1)]
@@ -376,7 +382,21 @@ async def navigate_with_retry(
                     nav_error_code=driver_nav_error_code(error_str),
                 ) from (None if redacting else error)
 
-            if attempt >= retry_times - 1:
+            # The caller's typed stop ends retries too, rechecked after the backoff so a loss latched while sleeping
+            # never reaches another dispatch.
+            stopped = stop_retrying is not None and stop_retrying()
+            if attempt < retry_times - 1 and not stopped:
+                LOG.warning(
+                    "Error while navigating to url, retrying",
+                    exc_info=not redacting,
+                    url=display_url,
+                    retry_time=attempt,
+                    wait_until=strategy,
+                    error=safe_error_str,
+                )
+                await sleep(1)
+                stopped = stop_retrying is not None and stop_retrying()
+            if attempt >= retry_times - 1 or stopped:
                 # Terminal navigation failure is re-raised as FailedToNavigateToUrl and surfaced
                 # via the run's failure_reason; logging at error here double-logs an external
                 # (site-unreachable) outcome. Keep the traceback, drop the error level.
@@ -392,16 +412,6 @@ async def navigate_with_retry(
                     error_message=safe_error_str,
                     nav_error_code=driver_nav_error_code(error_str),
                 ) from (None if redacting else error)
-
-            LOG.warning(
-                "Error while navigating to url, retrying",
-                exc_info=not redacting,
-                url=display_url,
-                retry_time=attempt,
-                wait_until=strategy,
-                error=safe_error_str,
-            )
-            await sleep(1)
 
     # Reached only when retry_times <= 0 (the loop never ran); a real navigation returns or raises inside.
     return None

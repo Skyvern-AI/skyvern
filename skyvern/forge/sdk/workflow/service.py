@@ -52,6 +52,7 @@ from skyvern.constants import (
 )
 from skyvern.errors.errors import drop_unsolicited_download_errors
 from skyvern.exceptions import (
+    BROWSER_CONNECTION_LOST_ERROR_CODE,
     BlockedHost,
     BlockNotFound,
     BrowserActionPolicyNotEnforceable,
@@ -68,6 +69,7 @@ from skyvern.exceptions import (
     InProcessScriptExecutionDenied,
     InvalidCredentialId,
     InvalidWorkflowParameter,
+    MissingBrowserState,
     MissingValueForParameter,
     ScriptTerminationException,
     SequentialCredentialLimitExceeded,
@@ -226,6 +228,7 @@ from skyvern.forge.sdk.workflow.models.block import (
     get_all_blocks,
     pinned_v1_block_count,
     resolve_conditional_merge_edges,
+    running_after_browser_loss,
     takes_default_engine,
     v3_ab_ineligibility_reason,
 )
@@ -420,7 +423,7 @@ from skyvern.utils.url_validators import validate_webhook_url
 from skyvern.webeye.actions.action_types import ActionType
 from skyvern.webeye.actions.actions import Action, InputTextAction, VerificationCodeAction
 from skyvern.webeye.actions.responses import ActionResult
-from skyvern.webeye.browser_state import BrowserState
+from skyvern.webeye.browser_state import BrowserState, get_browser_connection_loss
 from skyvern.webeye.persistent_session_errors import BrowserSessionCreditAdmissionRefusal
 from skyvern.webeye.persistent_sessions_manager import BROWSER_RETIREMENT_DENIED_NOTE
 from skyvern.webeye.profile_cookie_merge import cookie_delta, seed_cookie_values, union_cookies_into_profile_dir
@@ -8567,10 +8570,9 @@ class WorkflowService:
             page_text_snapshot = None
             working_page = None
             try:
-                browser_state = await app.BROWSER_MANAGER.get_or_create_for_workflow_run(
-                    workflow_run=workflow_run,
-                )
-                working_page = await browser_state.get_working_page()
+                # A diagnostic read: acquiring here would open a browser or take over one another run holds.
+                browser_state = app.BROWSER_MANAGER.get_for_workflow_run(workflow_run_id=workflow_run.workflow_run_id)
+                working_page = await browser_state.get_working_page() if browser_state else None
                 if working_page:
                     page_url = working_page.url
                     page_text_snapshot = (await working_page.inner_text("body"))[:5000]
@@ -9047,6 +9049,15 @@ class WorkflowService:
                 )
                 return workflow_run, blocks_to_update, workflow_run_block_result, True, branch_metadata
 
+            # A unit that completed after the run lost its browser natively cannot complete the body.
+            if (
+                workflow_run_block_result.success
+                and get_browser_connection_loss(app.BROWSER_MANAGER.get_for_workflow_run(workflow_run_id)) is not None
+            ):
+                workflow_run_block_result = await self._browser_lost_script_block_result(
+                    block, workflow_run_id, organization_id, attempt, parent_workflow_run_block_id
+                )
+
             self._track_blocks_for_script_generation(
                 workflow=workflow,
                 workflow_run=workflow_run,
@@ -9496,6 +9507,58 @@ class WorkflowService:
             script_exception=script_exception,
         )
 
+    async def _browser_lost_script_block_result(
+        self,
+        block: BlockTypeVar,
+        workflow_run_id: str,
+        organization_id: str,
+        attempt: ScriptBlockAttempt,
+        parent_workflow_run_block_id: str | None = None,
+    ) -> BlockResult:
+        attempt_number = app.WORKFLOW_CONTEXT_MANAGER.get_attempt_number(workflow_run_id)
+        workflow_run_blocks = await app.DATABASE.observer.get_workflow_run_blocks(
+            workflow_run_id=workflow_run_id, organization_id=organization_id
+        )
+        matching_blocks = [
+            b
+            for b in workflow_run_blocks
+            if b.label == block.label
+            and (b.attempt_number or 1) == attempt_number
+            and b.parent_workflow_run_block_id == parent_workflow_run_block_id
+        ]
+        latest_block = max(matching_blocks, key=lambda b: b.created_at) if matching_blocks else None
+        if attempt.block_result is not None:
+            latest_block = next(
+                (b for b in matching_blocks if b.workflow_run_block_id == attempt.block_result.workflow_run_block_id),
+                latest_block,
+            )
+        if latest_block is None:
+            latest_block = await app.DATABASE.observer.create_workflow_run_block(
+                workflow_run_id=workflow_run_id,
+                organization_id=organization_id,
+                attempt_number=attempt_number,
+                parent_workflow_run_block_id=parent_workflow_run_block_id,
+                label=block.label,
+                block_type=block.block_type,
+                continue_on_failure=block.continue_on_failure,
+            )
+        failure_reason = latest_block.failure_reason
+        if failure_reason is None and attempt.script_exception is not None:
+            failure_reason = str(attempt.script_exception)
+        if failure_reason is None:
+            failure_reason = get_user_facing_exception_message(MissingBrowserState(workflow_run_id=workflow_run_id))
+        error_codes = latest_block.error_codes
+        return await block.build_block_result(
+            success=False,
+            failure_reason=failure_reason,
+            output_parameter_value=latest_block.output,
+            status=BlockStatus.failed,
+            workflow_run_block_id=latest_block.workflow_run_block_id,
+            organization_id=organization_id,
+            error_codes=list(dict.fromkeys([*error_codes, BROWSER_CONNECTION_LOST_ERROR_CODE])),
+            can_continue_after_failure=False,
+        )
+
     async def _execute_block_via_agent_if_allowed(
         self,
         *,
@@ -9509,6 +9572,19 @@ class WorkflowService:
         script_blocks_by_label: dict[str, Any],
         attempt: ScriptBlockAttempt,
     ) -> tuple[BlockResult | None, bool] | WorkflowRunDispatchStopped:
+        if (
+            attempt.valid_to_run_code
+            and get_browser_connection_loss(app.BROWSER_MANAGER.get_for_workflow_run(workflow_run_id)) is not None
+        ):
+            LOG.warning(
+                "Browser connection lost: skipping agent fallback for the failed script block", block_label=block.label
+            )
+            return (
+                await self._browser_lost_script_block_result(
+                    block, workflow_run_id, organization_id, attempt, parent_workflow_run_block_id
+                ),
+                False,
+            )
         workflow_run_block_result = attempt.block_result
         # Check if this block is designated as requires_agent by the script reviewer.
         # These blocks must execute via agent even when ai_fallback=False.
@@ -10687,14 +10763,15 @@ class WorkflowService:
             await app.WORKFLOW_CONTEXT_MANAGER.register_block_parameters_for_workflow_run(
                 workflow_run.workflow_run_id, parameters, organization
             )
-            finally_execution = await self._dispatch_workflow_run_block(
-                workflow_run.workflow_run_id,
-                lambda: block.execute_safe(
-                    workflow_run_id=workflow_run.workflow_run_id,
-                    organization_id=organization.organization_id,
-                    browser_session_id=browser_session_id,
-                ),
-            )
+            with running_after_browser_loss(workflow_run.workflow_run_id):
+                finally_execution = await self._dispatch_workflow_run_block(
+                    workflow_run.workflow_run_id,
+                    lambda: block.execute_safe(
+                        workflow_run_id=workflow_run.workflow_run_id,
+                        organization_id=organization.organization_id,
+                        browser_session_id=browser_session_id,
+                    ),
+                )
             if isinstance(finally_execution, WorkflowRunDispatchStopped):
                 return finally_execution
             block_result = finally_execution
