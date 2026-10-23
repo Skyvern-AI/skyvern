@@ -15820,8 +15820,8 @@ def build_browser_tools(
                 skin_probe = await _probe_evaluate(page, _SKINNED_CHECKBOX_PROBE_JS, selector, pre_click_arg)
             except Exception:
                 skin_probe = None
-            # Every toggle answer carries `radio`. The browser engine's own enabled check decides (Playwright reads
-            # aria-disabled only on roles that take it), so the label click below is never looser than a plain click.
+            # Every toggle answer carries `radio`. The browser engine's own enabled check decides (its aria-disabled
+            # rule moves between driver versions), so the label click below is never looser than a plain click.
             if not (isinstance(skin_probe, dict) and "radio" in skin_probe):
                 break
             if await _engine_enabled(page, selector):
