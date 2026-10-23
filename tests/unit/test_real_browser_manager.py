@@ -8,7 +8,7 @@ on every call and re-invoke navigate_to_url() on every step.
 
 import asyncio
 from collections.abc import Iterator
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 from dataclasses import replace
 from itertools import pairwise
 from types import SimpleNamespace
@@ -19,8 +19,10 @@ import pytest
 from structlog.testing import capture_logs
 
 from skyvern.exceptions import (
+    BROWSER_CONNECTION_LOST_ERROR_CODE,
     BrowserSessionAlreadyOccupiedError,
     FailedToNavigateToUrl,
+    MissingBrowserState,
     MissingBrowserStateForBrowserSession,
 )
 from skyvern.forge import app as forge_app
@@ -49,6 +51,7 @@ from skyvern.webeye.browser_runtime_events import BrowserRuntimeLogContext
 from skyvern.webeye.real_browser_manager import RealBrowserManager, _PersistentSessionLease
 from skyvern.webeye.real_browser_state import RealBrowserState
 from skyvern.webeye.utils.page import SkyvernFrame
+from tests.unit._task_block_fakes import lost_browser_state, run_bound_browser_state
 from tests.unit.forge_log_capture import capture_runtime_logs
 
 
@@ -4214,3 +4217,171 @@ async def test_the_receipt_accepts_the_browser_name_for_the_requested_zone_and_n
     )
 
     assert receipt.status == expected_status
+
+
+@pytest.mark.asyncio
+async def test_persistent_session_lost_mid_run_is_not_reconnected_for_that_run() -> None:
+    manager = RealBrowserManager()
+    state = lost_browser_state("wfr_pbs")
+    manager.pages["wfr_pbs"] = state
+
+    with (
+        patch.object(manager, "_create_browser_state", new=AsyncMock()) as mock_create,
+        pytest.raises(MissingBrowserState) as exc_info,
+    ):
+        await manager.get_or_create_for_workflow_run(
+            workflow_run=make_workflow_run("wfr_pbs"), url=None, browser_session_id="pbs_1"
+        )
+
+    assert BROWSER_CONNECTION_LOST_ERROR_CODE in str(exc_info.value)
+    mock_create.assert_not_awaited()
+    assert manager.pages["wfr_pbs"] is state
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("loss", ["before_inheritance", "during_the_liveness_probe", "probe_failure_only"])
+async def test_child_run_does_not_get_a_fresh_browser_after_the_parent_lost_its_browser(loss: str) -> None:
+    manager = RealBrowserManager()
+    parent_state, context = run_bound_browser_state("wfr_parent")
+    context._impl_obj = SimpleNamespace(_closed=False, _close_was_called=False, _connection=None)
+    context.browser.is_connected.return_value = True
+
+    def probe() -> None:
+        if loss == "during_the_liveness_probe":
+            parent_state._on_browser_context_closed(context)
+        raise TargetClosedError("Target page, context or browser has been closed")
+
+    context.cookies = AsyncMock(side_effect=probe)
+    if loss == "before_inheritance":
+        parent_state._on_browser_context_closed(context)
+    manager.pages["wfr_parent"] = parent_state
+    fresh_state = MagicMock()
+    fresh_state.get_or_create_page = AsyncMock()
+
+    with patch.object(manager, "_create_browser_state", new=AsyncMock(return_value=fresh_state)) as mock_create:
+        acquire = manager.get_or_create_for_workflow_run(
+            workflow_run=make_workflow_run("wfr_child", parent_workflow_run_id="wfr_parent"),
+            url="https://example.com",
+            browser_session_id=None,
+        )
+        if loss == "probe_failure_only":
+            assert await acquire is fresh_state
+            assert manager.pages["wfr_parent"] is fresh_state
+            return
+        with pytest.raises(MissingBrowserState, match=BROWSER_CONNECTION_LOST_ERROR_CODE):
+            await acquire
+
+    assert context.cookies.await_count == (0 if loss == "before_inheritance" else 1)
+    mock_create.assert_not_awaited()
+    assert manager.pages["wfr_parent"] is parent_state
+    assert parent_state.get_browser_connection_loss() is not None
+    assert "wfr_child" not in manager.pages
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("seam", ["frame_publisher", "timezone_receipt", "acquisition_hook", None])
+async def test_child_does_not_take_over_a_parent_browser_lost_during_the_handoff(seam: str | None) -> None:
+    manager = RealBrowserManager()
+    parent_state, context = run_bound_browser_state("wfr_parent")
+    parent_state.get_working_page = AsyncMock(return_value=MagicMock())
+    manager.pages["wfr_parent"] = parent_state
+
+    def lose_at(name: str) -> None:
+        if seam == name:
+            parent_state._on_browser_context_closed(context)
+
+    with (
+        patch.object(manager, "_start_frame_publisher", AsyncMock(side_effect=lambda **_: lose_at("frame_publisher"))),
+        patch.object(
+            real_browser_manager,
+            "_record_run_timezone_receipt",
+            AsyncMock(side_effect=lambda *_, **__: lose_at("timezone_receipt")),
+        ),
+        patch.object(
+            real_browser_manager.app.AGENT_FUNCTION,
+            "on_browser_context_acquired",
+            AsyncMock(side_effect=lambda *_: lose_at("acquisition_hook")),
+        ),
+        patch.object(manager, "_create_browser_state", new=AsyncMock()) as mock_create,
+        pytest.raises(MissingBrowserState, match=BROWSER_CONNECTION_LOST_ERROR_CODE) if seam else nullcontext(),
+    ):
+        await manager.get_or_create_for_workflow_run(
+            workflow_run=make_workflow_run("wfr_child", parent_workflow_run_id="wfr_parent"), browser_session_id=None
+        )
+
+    mock_create.assert_not_awaited()
+    assert manager.pages["wfr_parent"] is parent_state
+    assert manager.pages.get("wfr_child") is (None if seam else parent_state)
+    assert parent_state.runtime_event_context.workflow_run_id == ("wfr_parent" if seam else "wfr_child")
+    assert (parent_state.get_browser_connection_loss() is not None) == bool(seam)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("bound_to", ["finished_child_lost", "finished_child_healthy", "own_run_lost"])
+async def test_run_does_not_take_over_a_shared_browser_its_finished_child_lost(bound_to: str) -> None:
+    manager = RealBrowserManager()
+    owner = "wfr_parent" if bound_to == "own_run_lost" else "wfr_child"
+    state, context = run_bound_browser_state(owner)
+    if bound_to != "finished_child_healthy":
+        state._on_browser_context_closed(context)
+    # A finished child that shared the parent's browser leaves it bound to itself; only the parent key remains.
+    manager.pages["wfr_parent"] = state
+
+    with (
+        patch.object(manager, "_create_browser_state", new=AsyncMock()) as mock_create,
+        pytest.raises(MissingBrowserState, match=BROWSER_CONNECTION_LOST_ERROR_CODE)
+        if bound_to == "finished_child_lost"
+        else nullcontext(),
+    ):
+        assert await manager.get_or_create_for_workflow_run(make_workflow_run("wfr_parent")) is state
+
+    mock_create.assert_not_awaited()
+    assert manager.pages == {"wfr_parent": state}
+    assert state.runtime_event_context.workflow_run_id == (
+        "wfr_child" if bound_to == "finished_child_lost" else "wfr_parent"
+    )
+    assert (state.get_browser_connection_loss() is not None) == (bound_to != "finished_child_healthy")
+
+
+@pytest.mark.asyncio
+async def test_released_owners_loss_does_not_refuse_an_independent_later_owner() -> None:
+    manager = RealBrowserManager()
+    state = lost_browser_state("wfr_earlier")
+    state.mark_run_released()
+    manager.pages["wfr_later"] = state
+
+    assert (
+        await manager.get_or_create_for_workflow_run(make_workflow_run("wfr_later"), browser_session_id=None) is state
+    )
+    assert state.runtime_event_context.workflow_run_id == "wfr_later"
+    assert state.get_browser_connection_loss() is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("released", [False, True])
+async def test_parent_keyed_loss_only_blocks_an_active_owner(released: bool, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(forge_app.AGENT_FUNCTION, "on_browser_run_released", MagicMock())
+    manager = RealBrowserManager()
+    state = lost_browser_state("wfr_sibling")
+    if released:
+        state.mark_run_released()
+    manager.pages["wfr_parent"] = state
+    fresh_state, _ = run_bound_browser_state("wfr_child")
+    fresh_state.get_or_create_page = AsyncMock()
+    state.get_or_create_page = AsyncMock(side_effect=AssertionError("stale browser must not be reconnected"))
+
+    with patch.object(manager, "_create_browser_state", new=AsyncMock(return_value=fresh_state)) as create:
+        acquire = manager.get_or_create_for_workflow_run(
+            make_workflow_run("wfr_child", parent_workflow_run_id="wfr_parent")
+        )
+        if released:
+            assert await acquire is fresh_state
+            assert manager.pages["wfr_parent"] is fresh_state
+            assert manager.pages["wfr_child"] is fresh_state
+            create.assert_awaited_once()
+        else:
+            with pytest.raises(MissingBrowserState, match=BROWSER_CONNECTION_LOST_ERROR_CODE):
+                await acquire
+            assert manager.pages == {"wfr_parent": state}
+            create.assert_not_awaited()
+    state.get_or_create_page.assert_not_awaited()

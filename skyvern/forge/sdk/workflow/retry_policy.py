@@ -10,7 +10,7 @@ import structlog
 from sqlalchemy import update
 from sqlalchemy.exc import IntegrityError
 
-from skyvern.exceptions import WorkflowNotFound, WorkflowNotFoundForWorkflowRun
+from skyvern.exceptions import BROWSER_CONNECTION_LOST_ERROR_CODE, WorkflowNotFound, WorkflowNotFoundForWorkflowRun
 from skyvern.forge import app
 from skyvern.forge.sdk.cache import extraction_cache
 from skyvern.forge.sdk.db.datetime_utils import naive_utc_now, to_naive_utc
@@ -121,6 +121,8 @@ def evaluate_retry_policy(
 ) -> tuple[bool, str]:
     if status is WorkflowRunStatus.canceled:
         return False, "canceled"
+    if BROWSER_CONNECTION_LOST_ERROR_CODE in error_codes:
+        return False, BROWSER_CONNECTION_LOST_ERROR_CODE
     if retries_used >= policy.max_retries:
         return False, "budget_exhausted"
 

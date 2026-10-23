@@ -52,6 +52,7 @@ from skyvern.constants import (
 from skyvern.core.script_generations.fuzzy_matcher import match_option_exact_or_stem
 from skyvern.errors.errors import UserDefinedError, filter_to_user_defined_codes
 from skyvern.exceptions import (
+    BROWSER_CONNECTION_LOST_ERROR_CODE,
     ActionExecutionTimeout,
     BlockedHost,
     CaptchaSolveError,
@@ -79,6 +80,7 @@ from skyvern.exceptions import (
     InteractWithDisabledElement,
     InteractWithDropdownContainer,
     InvalidElementForTextInput,
+    MissingBrowserState,
     MissingElement,
     MissingElementDict,
     MissingElementInCSSMap,
@@ -223,7 +225,7 @@ from skyvern.webeye.browser_factory import (
     resolve_artifact_path,
     was_download_cancelled_by_skyvern,
 )
-from skyvern.webeye.browser_state import BLANK_PAGE_URLS, BrowserState
+from skyvern.webeye.browser_state import BLANK_PAGE_URLS, BrowserState, get_browser_connection_loss
 from skyvern.webeye.cdp_download_interceptor import (
     BROWSER_DOWNLOAD_EVENT_ADMISSION_GRACE_SECONDS,
     DOWNLOAD_MIME_TYPES,
@@ -2437,6 +2439,15 @@ async def _recover_download_page(
     timeout_seconds: float,
     recovery_site: str,
 ) -> Page | None:
+    connection_loss = get_browser_connection_loss(browser_state)
+    if connection_loss is not None:
+        raise MissingBrowserState(
+            task_id=task.task_id,
+            workflow_run_id=task.workflow_run_id,
+            diagnostic=connection_loss,
+            detected_at=datetime.now(UTC),
+            failure_reason=BROWSER_CONNECTION_LOST_ERROR_CODE,
+        )
     LOG.warning(
         "Working page closed during download action; recreating it before continuing",
         workflow_run_id=task.workflow_run_id,
@@ -2509,6 +2520,9 @@ async def _recover_download_page(
                     recovery_site=recovery_site,
                     exc_info=True,
                 )
+        # A connection lost while recovery was in flight ends the action, so the caller never starts waiting.
+        if get_browser_connection_loss(browser_state) is not None:
+            raise
         return None
     return recovered_page
 

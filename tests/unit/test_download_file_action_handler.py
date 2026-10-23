@@ -19,10 +19,11 @@ from structlog.testing import capture_logs
 from skyvern.config import settings
 from skyvern.constants import BROWSER_DOWNLOAD_TIMEOUT, BROWSER_DOWNLOADING_SUFFIX
 from skyvern.errors.errors import UserDefinedError
-from skyvern.exceptions import BlockedHost
+from skyvern.exceptions import BROWSER_CONNECTION_LOST_ERROR_CODE, BlockedHost, MissingBrowserState
 from skyvern.forge.agent import ForgeAgent
 from skyvern.forge.sdk.core.skyvern_context import SkyvernContext
 from skyvern.forge.sdk.models import StepStatus
+from skyvern.webeye import real_browser_state as real_browser_state_module
 from skyvern.webeye.actions.actions import (
     ActionStatus,
     ClickAction,
@@ -49,6 +50,7 @@ from skyvern.webeye.actions.handler import (
     _record_action_owned_popup_delta,
     _recover_adopted_session_blob_pdf_iframe,
     _recover_blocked_inline_pdf_download,
+    _recover_download_page,
     _remove_download_listener,
     handle_download_file_action,
 )
@@ -56,7 +58,9 @@ from skyvern.webeye.actions.responses import ActionAbort, ActionFailure, ActionS
 from skyvern.webeye.browser_factory import (
     mark_download_cancelled_by_skyvern,
 )
+from skyvern.webeye.browser_runtime_events import BrowserRuntimeLogContext
 from skyvern.webeye.cdp_download_interceptor import CDPDownloadInterceptor
+from skyvern.webeye.real_browser_state import RealBrowserState
 from skyvern.webeye.scraper.scraped_page import ScrapedPage
 from skyvern.webeye.utils.page import BlobActionFreshness
 from tests.unit._download_provider_fakes import (
@@ -1559,6 +1563,156 @@ async def test_handle_action_reconnects_context_closed_during_download_wait(
     blocked_inline_recovery.assert_not_awaited()
     assert results[-1].download_triggered is False
     assert results[-1].skip_remaining_actions is True
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("recovery_site", ["post_click", "post_wait"])
+@pytest.mark.parametrize("native_close", [True, False], ids=["native_context_close", "page_only_close"])
+async def test_download_page_recovery_refuses_a_browser_whose_context_closed_natively(
+    recovery_site: str, native_close: bool
+) -> None:
+    now = datetime.now(UTC)
+    organization = make_organization(now)
+    task, step, page, _, scraped_page, action = _make_download_click_context(
+        now=now,
+        organization=organization,
+        page_url="https://example.com/downloads",
+    )
+    if recovery_site == "post_click":
+        task = task.model_copy(update={"download_timeout": 0.01})
+    page.expose_binding = AsyncMock()
+    page.evaluate = AsyncMock(return_value=[])
+    context = page.context
+    context._skyvern_cdp_download_active = False
+    context._skyvern_cdp_download_interceptor = None
+    browser_state = RealBrowserState(pw=MagicMock(), browser_context=context)
+    browser_state.bind_runtime_event_context(
+        BrowserRuntimeLogContext(workflow_run_id=task.workflow_run_id, task_id=task.task_id)
+    )
+    recovered_page = MagicMock(url=page.url, context=context)
+    recovered_page.is_closed.return_value = False
+    recovered_page.evaluate = AsyncMock(return_value=[])
+    recovered_page.expose_binding = AsyncMock()
+    page_closed = False
+    page.is_closed.side_effect = lambda: page_closed
+
+    async def get_working_page(**_: object) -> object | None:
+        return None if page_closed else page
+
+    browser_state.get_working_page = AsyncMock(side_effect=get_working_page)  # type: ignore[method-assign]
+    browser_state.list_valid_pages = AsyncMock(return_value=[page])  # type: ignore[method-assign]
+    browser_state.new_page = AsyncMock(return_value=recovered_page)  # type: ignore[method-assign]
+    browser_state.reconnect = AsyncMock()  # type: ignore[method-assign]
+    browser_state.navigate_to_url = AsyncMock()  # type: ignore[method-assign]
+    browser_state.set_active_page = AsyncMock()  # type: ignore[method-assign]
+
+    calls_at_close: int | None = None
+
+    def close_working_page() -> None:
+        nonlocal page_closed, calls_at_close
+        page_closed = True
+        calls_at_close = list_calls
+        if native_close:
+            browser_state._on_browser_context_closed(context)
+
+    async def click(*_args: object, **_kwargs: object) -> list[ActionSuccess]:
+        if recovery_site == "post_click":
+            close_working_page()
+        return [ActionSuccess()]
+
+    list_calls = 0
+
+    def list_files(_path: Path | str, *, attempt_started_at: datetime | None = None) -> list[str]:
+        nonlocal list_calls
+        list_calls += 1
+        if recovery_site == "post_wait" and list_calls == 2:
+            close_working_page()
+        return []
+
+    xhr_capture = MagicMock(has_in_flight_requests=False)
+    xhr_capture.drain = AsyncMock(return_value=False)
+    mock_app = MagicMock()
+    mock_app.BROWSER_MANAGER.get_for_task.return_value = browser_state
+    mock_app.DATABASE.workflow_params.create_action = AsyncMock(return_value=action)
+    mock_app.STORAGE = MagicMock()
+
+    with tempfile.TemporaryDirectory() as temp_dir:
+        with (
+            patch.object(ActionHandler, "_handle_action", side_effect=click),
+            patch("skyvern.webeye.actions.handler.BROWSER_DOWNLOAD_NO_SIGNAL_GRACE_TIME", 0),
+            patch("skyvern.webeye.actions.handler.get_download_dir", return_value=temp_dir),
+            patch("skyvern.webeye.actions.handler.list_files_in_directory", side_effect=list_files),
+            patch("skyvern.webeye.actions.handler.ScopedXhrDownloadCapture", return_value=xhr_capture),
+            patch("skyvern.webeye.actions.handler._recover_blocked_inline_pdf_download", new=AsyncMock()),
+            patch("skyvern.webeye.actions.handler.skyvern_context.current", return_value=None),
+            patch("skyvern.webeye.actions.handler.app", mock_app),
+        ):
+            handle = ActionHandler.handle_action(
+                scraped_page=scraped_page, task=task, step=step, page=page, action=action
+            )
+            if native_close:
+                with pytest.raises(MissingBrowserState) as refusal:
+                    await handle
+            else:
+                await handle
+
+    if native_close:
+        assert BROWSER_CONNECTION_LOST_ERROR_CODE in str(refusal.value)
+        browser_state.new_page.assert_not_awaited()
+        browser_state.reconnect.assert_not_awaited()
+        browser_state.navigate_to_url.assert_not_awaited()
+        if recovery_site == "post_click":
+            # The download wait never starts polling after the refusal.
+            assert list_calls == calls_at_close
+    else:
+        browser_state.new_page.assert_awaited_once_with()
+        browser_state.reconnect.assert_not_awaited()
+        browser_state.navigate_to_url.assert_awaited_once_with(page=recovered_page, url="https://example.com/downloads")
+
+
+@pytest.mark.asyncio
+async def test_download_page_recovery_propagates_a_loss_observed_while_new_page_is_pending(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    now = datetime.now(UTC)
+    task, _, page, _, _, _ = _make_download_click_context(
+        now=now, organization=make_organization(now), page_url="https://example.com/downloads"
+    )
+    context = page.context
+    context._skyvern_cdp_download_interceptor = None
+    browser_state = RealBrowserState(pw=MagicMock(), browser_context=context)
+    browser_state.bind_runtime_event_context(
+        BrowserRuntimeLogContext(workflow_run_id=task.workflow_run_id, task_id=task.task_id)
+    )
+
+    async def new_page() -> object:
+        # The context-close event lands while newPage is pending, after the recovery entry check passed.
+        browser_state._on_browser_context_closed(context)
+        raise RuntimeError("Target page, context or browser has been closed")
+
+    driver_starts: list[bool] = []
+
+    class CountingPlaywright:
+        async def start(self) -> object:
+            driver_starts.append(True)
+            raise RuntimeError("driver start reached")
+
+    monkeypatch.setattr(real_browser_state_module, "async_playwright", lambda: CountingPlaywright())
+    create_context = AsyncMock(side_effect=RuntimeError("context factory reached"))
+    monkeypatch.setattr(real_browser_state_module.BrowserContextFactory, "create_browser_context", create_context)
+    browser_state.new_page = AsyncMock(side_effect=new_page)  # type: ignore[method-assign]
+    browser_state.navigate_to_url = AsyncMock()  # type: ignore[method-assign]
+
+    with pytest.raises(MissingBrowserState) as refusal:
+        await _recover_download_page(
+            browser_state, task, "https://example.com/downloads", 5.0, recovery_site="post_click"
+        )
+
+    assert BROWSER_CONNECTION_LOST_ERROR_CODE in str(refusal.value)
+    browser_state.new_page.assert_awaited_once_with()
+    assert driver_starts == []
+    create_context.assert_not_awaited()
+    browser_state.navigate_to_url.assert_not_awaited()
 
 
 @pytest.mark.asyncio

@@ -3,12 +3,14 @@ mark_task_v2_as_* terminal transitions refuse to overwrite a status that is alre
 
 from __future__ import annotations
 
-from unittest.mock import AsyncMock
+from types import SimpleNamespace
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
 from skyvern.forge.prompts import prompt_engine
 from skyvern.forge.sdk.schemas.task_v2 import TaskV2Status
+from skyvern.schemas.workflows import BlockResult, BlockStatus, BlockType
 from skyvern.services import task_v2_service
 
 
@@ -217,3 +219,35 @@ async def test_mark_task_v2_as_failed_redrive_keeps_termination_metadata(monkeyp
     terminate_run.assert_awaited_once_with(
         "wr_test", "late failure", failure_category=[{"category": "unreachable_goal"}]
     )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("error_codes", "fails_run"), [(["browser_connection_lost"], True), ([], False)], ids=["browser_lost", "other"]
+)
+async def test_failed_block_stops_the_planner_only_when_the_browser_was_lost(
+    monkeypatch: pytest.MonkeyPatch, error_codes: list[str], fails_run: bool
+) -> None:
+    mark_failed = AsyncMock()
+    monkeypatch.setattr(task_v2_service.app.WORKFLOW_SERVICE, "mark_workflow_run_as_failed_if_not_final", mark_failed)
+    monkeypatch.setattr(task_v2_service.app.WORKFLOW_SERVICE, "get_workflow_run", AsyncMock())
+    block = SimpleNamespace(block_type=BlockType.NAVIGATION, label="nav", continue_on_failure=True)
+    result = BlockResult(
+        success=False,
+        output_parameter=MagicMock(),
+        status=BlockStatus.failed,
+        failure_reason="Browser state page is missing.",
+        error_codes=error_codes,
+        can_continue_after_failure=not error_codes,
+    )
+
+    await task_v2_service.handle_block_result(
+        "tsk_v2_test",
+        block,  # type: ignore[arg-type]
+        result,
+        MagicMock(),
+        SimpleNamespace(workflow_run_id="wr_test", organization_id="o_test"),  # type: ignore[arg-type]
+        is_last_block=False,
+    )
+
+    assert mark_failed.await_count == (1 if fails_run else 0)

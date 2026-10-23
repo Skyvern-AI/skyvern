@@ -5,7 +5,7 @@ import inspect
 import os
 import re
 import weakref
-from datetime import datetime
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, Callable
 
@@ -27,8 +27,10 @@ from skyvern.core.script_generations.skyvern_page import (
 from skyvern.core.script_generations.skyvern_page_ai import SkyvernPageAi
 from skyvern.errors.errors import UserDefinedError, filter_to_user_defined_codes
 from skyvern.exceptions import (
+    BROWSER_CONNECTION_LOST_ERROR_CODE,
     BrowserSessionSwitchNotAllowed,
     IllegitCompleteScriptTermination,
+    MissingBrowserState,
     ScriptTerminationException,
     WorkflowRunNotFound,
 )
@@ -74,7 +76,7 @@ from skyvern.webeye.actions.handler import (
 )
 from skyvern.webeye.actions.responses import ActionFailure, ActionResult, ActionSuccess
 from skyvern.webeye.browser_engine import BrowserEngineSelection
-from skyvern.webeye.browser_state import BrowserState
+from skyvern.webeye.browser_state import BrowserState, get_browser_connection_loss, raise_if_browser_connection_lost
 from skyvern.webeye.navigation import default_navigation_settle, navigate_with_retry, redact_url_secrets
 from skyvern.webeye.scraper.scraped_page import ScrapedPage
 from skyvern.webeye.utils.challenge_solve_record import calling_solve_client
@@ -144,6 +146,12 @@ class ScriptSkyvernPage(SkyvernPage):
         self.scraped_page = scraped_page
         _set_scraped_page(self, scraped_page)
         self._record = recorder or (lambda ac: None)
+
+    def _raise_if_browser_connection_lost(self) -> None:
+        context = skyvern_context.current()
+        raise_if_browser_connection_lost(
+            _get_scraped_page(self)._browser_state, workflow_run_id=context.workflow_run_id if context else None
+        )
 
     @classmethod
     async def _get_or_create_browser_state(
@@ -286,6 +294,7 @@ class ScriptSkyvernPage(SkyvernPage):
         Auto-creates action records in DB before action execution
         and screenshot artifacts after action execution.
         """
+        self._raise_if_browser_connection_lost()
 
         prompt = kwargs.get("prompt", "")
 
@@ -338,6 +347,7 @@ class ScriptSkyvernPage(SkyvernPage):
             # Wait for page to be ready before executing action
             # This helps prevent issues where cached actions execute before the page is fully loaded
             await self._wait_for_page_ready_before_action()
+            self._raise_if_browser_connection_lost()
             # NOTE: _ensure_element_ids_on_page() removed from here.
             # unique_id attrs are only needed by the AI fallback path, which
             # already calls _refresh_scraped_page() → build_tree_from_body()
@@ -1115,6 +1125,16 @@ class ScriptSkyvernPage(SkyvernPage):
         last_error: Exception | None = None
         _get_scraped_page(self)._browser_state.begin_navigation()
         for attempt in range(max_retries):
+            # The URL check and the retry backoff both await, and a loss latched meanwhile must not reach a dispatch.
+            connection_loss = get_browser_connection_loss(_get_scraped_page(self)._browser_state)
+            if connection_loss is not None:
+                last_error = last_error or MissingBrowserState(
+                    workflow_run_id=context.workflow_run_id if context else None,
+                    diagnostic=connection_loss,
+                    detected_at=datetime.now(UTC),
+                    failure_reason=BROWSER_CONNECTION_LOST_ERROR_CODE,
+                )
+                break
             try:
                 await self.page.goto(url, timeout=timeout, **kwargs)
                 await _get_scraped_page(self)._browser_state.record_navigation_result(None, url=url)
@@ -1123,7 +1143,10 @@ class ScriptSkyvernPage(SkyvernPage):
                 return
             except Exception as e:
                 last_error = e
-                if attempt >= max_retries - 1:
+                if (
+                    attempt >= max_retries - 1
+                    or get_browser_connection_loss(_get_scraped_page(self)._browser_state) is not None
+                ):
                     break
                 LOG.warning(
                     "Navigation attempt failed, retrying",
@@ -1188,6 +1211,7 @@ class ScriptSkyvernPage(SkyvernPage):
             retry_times=NAVIGATION_MAX_RETRY_TIME,
             settle=default_navigation_settle,
             log_url=redact_url_secrets(polled.value),
+            stop_retrying=lambda: get_browser_connection_loss(_get_scraped_page(self)._browser_state) is not None,
         )
 
     @action_wrap(ActionType.SOLVE_CAPTCHA)

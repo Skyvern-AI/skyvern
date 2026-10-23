@@ -22,7 +22,7 @@ from structlog.testing import capture_logs
 
 import skyvern.webeye.navigation as navigation_module
 from skyvern.errors.errors import UserDefinedError
-from skyvern.exceptions import NO_ADDRESS_RECORD_NAV_ERROR_CODE
+from skyvern.exceptions import BROWSER_CONNECTION_LOST_ERROR_CODE, NO_ADDRESS_RECORD_NAV_ERROR_CODE
 from skyvern.forge import app
 from skyvern.forge.agent_functions import CodeBlockEngineFailure, CodeBlockEngineResult
 from skyvern.forge.sdk.api.llm.schema_validator import validate_and_fill_extraction_result, validate_schema
@@ -61,7 +61,7 @@ from skyvern.forge.sdk.workflow.models.parameter import (
     WorkflowParameterType,
 )
 from skyvern.forge.sdk.workflow.models.workflow import WorkflowRun
-from skyvern.forge.sdk.workflow.service import _merge_workflow_run_errors
+from skyvern.forge.sdk.workflow.service import WorkflowService, _merge_workflow_run_errors
 from skyvern.forge.taskv3.goal_composition import (
     CodeProgressRecord,
     GoalDirectives,
@@ -74,7 +74,9 @@ from skyvern.schemas.self_heal import HealClassification, HealSkipReason, HealSt
 from skyvern.webeye.actions.action_types import ActionType
 from skyvern.webeye.actions.actions import Action
 from skyvern.webeye.browser_artifacts import BrowserArtifacts
+from skyvern.webeye.browser_runtime_events import BrowserRuntimeLogContext
 from skyvern.webeye.navigation import clear_task_nav_error_code, record_task_nav_error_code
+from skyvern.webeye.real_browser_state import RealBrowserState
 
 SECRET_VALUE = "hunter2-super-secret"
 SHORT_SECRET_VALUE = "abc"
@@ -3833,6 +3835,124 @@ async def test_legacy_heal_success_skips_failed_write_and_ends_completed(
     assert record_output_mock.await_count == 1
     assert len(FakeRecorder.instances) == 1
     assert FakeRecorder.instances[0].finalized_success is True
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("engine", ["inline", "secure"])
+@pytest.mark.parametrize("browser_lost", [True, False], ids=["native_context_close", "ordinary_failure"])
+async def test_failure_after_native_browser_loss_stops_the_run_instead_of_healing(
+    monkeypatch: pytest.MonkeyPatch,
+    ai_fallback_flag: Callable[[str | None], None],
+    engine: str,
+    browser_lost: bool,
+) -> None:
+    ai_fallback_flag("o_test")
+    state = _install_db_fakes(monkeypatch, final_status=TaskStatus.completed)
+    block = _make_code_block(
+        steps=[CodeBlockStep(description="open the report", line_start=1, line_end=1)],
+        code="await page.click('#go')",
+    )
+    block.continue_on_failure = True
+    context = _make_context()
+    native_context = MagicMock(browser=MagicMock())
+    browser_state = RealBrowserState(pw=MagicMock(), browser_context=native_context)
+    browser_state.bind_runtime_event_context(BrowserRuntimeLogContext(workflow_run_id="wr_test"))
+    browser_state.get_working_page = AsyncMock(return_value=MagicMock())  # type: ignore[method-assign]
+    _patch_execute_chokepoint_environment(
+        monkeypatch, context=context, fake_browser_state=browser_state, use_codeblock_runner=engine == "secure"
+    )
+    closed = PlaywrightError("Target page, context or browser has been closed")
+
+    def close_in_flight() -> None:
+        if browser_lost:
+            browser_state._on_browser_context_closed(native_context)
+
+    async def run_on_secure_runner(**_: Any) -> CodeBlockEngineResult | None:
+        if engine != "secure":
+            return None
+        close_in_flight()
+        return CodeBlockEngineResult(
+            block_result=None,
+            failure=CodeBlockEngineFailure(
+                error_code="user_code_error",
+                safe_message=None,
+                failure_reason="CodeBlock failed while running user code.",
+                exception_class="playwright._impl._errors.Error",
+                failing_line=1,
+                healability_hint=True,
+            ),
+        )
+
+    class ClickInFlightRecorder(FakeRecorder):
+        def __init__(self, **kwargs: Any) -> None:
+            super().__init__(**kwargs)
+
+            async def click(*_: Any, **__: Any) -> None:
+                close_in_flight()
+                raise closed
+
+            self.recording_page.click = click
+
+    monkeypatch.setattr(app.AGENT_FUNCTION, "execute_code_block_override", AsyncMock(side_effect=run_on_secure_runner))
+    ClickInFlightRecorder.reset(last_recorded_exception=closed)
+    monkeypatch.setattr("skyvern.forge.sdk.workflow.models.block.CodeBlockActionRecording", ClickInFlightRecorder)
+    monkeypatch.setattr(CodeBlock, "_capture_failure_evidence", AsyncMock(return_value=None))
+    monkeypatch.setattr(CodeBlock, "record_output_parameter_value", AsyncMock(return_value=None))
+
+    async def heal_and_fall_through(**kwargs: Any) -> BlockResult:
+        return await block.build_block_result(
+            success=True,
+            failure_reason=None,
+            output_parameter_value={"task_id": "tsk_escalation", "status": "completed"},
+            status=BlockStatus.completed,
+            workflow_run_block_id=kwargs["workflow_run_block_id"],
+            organization_id=kwargs["organization_id"],
+        )
+
+    heal = AsyncMock(side_effect=heal_and_fall_through)
+    monkeypatch.setattr(block, "_attempt_self_heal", heal)
+    mark_failed = AsyncMock(return_value=MagicMock())
+    monkeypatch.setattr(WorkflowService, "mark_workflow_run_as_failed_if_not_final", mark_failed)
+
+    with skyvern_context.scoped(SkyvernContext(organization_id="o_test", workflow_run_id="wr_test")):
+        result = await block.execute(
+            workflow_run_id="wr_test",
+            workflow_run_block_id="wrb_test",
+            organization_id="o_test",
+            browser_session_id="pbs_test",
+        )
+    _, should_stop = await WorkflowService()._handle_block_result_status(
+        block=block,
+        block_idx=0,
+        blocks_cnt=2,
+        block_result=result,
+        workflow_run=MagicMock(),
+        workflow_run_id="wr_test",
+    )
+
+    persisted_codes = [
+        code
+        for update in state["workflow_run_block_updates"]
+        if update.get("workflow_run_block_id") == "wrb_test"
+        for code in update.get("error_codes") or []
+    ]
+    if browser_lost:
+        heal.assert_not_awaited()
+        assert result.success is False
+        assert result.status == BlockStatus.failed
+        assert result.failure_reason
+        assert result.can_continue_after_failure is False
+        assert BROWSER_CONNECTION_LOST_ERROR_CODE in result.error_codes
+        assert BROWSER_CONNECTION_LOST_ERROR_CODE in persisted_codes
+        assert _statuses_for_block(state, "wrb_test")[-1] == BlockStatus.failed
+        assert ClickInFlightRecorder.instances[0].finalized_success is False
+        assert should_stop is True
+        mark_failed.assert_awaited_once()
+    else:
+        heal.assert_awaited_once()
+        assert result.success is True
+        assert BROWSER_CONNECTION_LOST_ERROR_CODE not in persisted_codes
+        assert should_stop is False
 
 
 @pytest.mark.asyncio

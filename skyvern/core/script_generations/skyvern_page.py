@@ -286,6 +286,10 @@ class SkyvernPage(Page):
             return ResolvedSensitiveValue(totp_code[digit_index])
         return ""
 
+    def _raise_if_browser_connection_lost(self) -> None:
+        # Only a run-bound page knows its run's browser; a standalone library page has no loss to observe.
+        return None
+
     @staticmethod
     def _track_ai_call() -> None:
         """Increment the script LLM call counter for cost-cap tracking."""
@@ -346,6 +350,7 @@ class SkyvernPage(Page):
                         retry_interval=retry_interval,
                     )
                     await asyncio.sleep(retry_interval)
+                    self._raise_if_browser_connection_lost()
                     # Re-acquire locator in case the DOM was replaced entirely
                     locator = self._locator_scope.locator(selector).first
                 else:
@@ -511,6 +516,7 @@ class SkyvernPage(Page):
                 except StaleFrameSelectionError:
                     raise
                 except Exception as e:
+                    self._raise_if_browser_connection_lost()
                     if is_post_dispatch_click_timeout(e, self.engine_selection):
                         LOG.info(
                             "CSS selector click dispatched; navigation-wait timed out — skipping fallback",
@@ -533,6 +539,7 @@ class SkyvernPage(Page):
                         try:
                             await self.page.keyboard.press("Escape")
                             await asyncio.sleep(0.3)
+                            self._raise_if_browser_connection_lost()
                             locator = self._locator_scope.locator(selector).first
                             # The primary click may have dispatched and reached the desired state
                             # before raising, in which case retrying would toggle it back off.
@@ -545,6 +552,7 @@ class SkyvernPage(Page):
                             )
                             return selector
                         except Exception as retry_error:
+                            self._raise_if_browser_connection_lost()
                             if is_post_dispatch_click_timeout(retry_error, self.engine_selection):
                                 LOG.info(
                                     "CSS selector click dispatched after dismissing overlay; "
@@ -1917,6 +1925,7 @@ class SkyvernPage(Page):
             return True
 
         for idx, value in sorted(mapping.items()):
+            self._raise_if_browser_connection_lost()
             if idx >= len(form_fields) or value is None:
                 continue
             totp_placeholder = value if isinstance(value, str) and is_unresolved_totp_value(value) else None
@@ -2202,6 +2211,7 @@ class SkyvernPage(Page):
                             break
                     if uploaded:
                         break
+        self._raise_if_browser_connection_lost()
 
     async def validate_mapping(
         self,
@@ -2405,6 +2415,7 @@ class SkyvernPage(Page):
             if page_num > 0:
                 await asyncio.sleep(1)
 
+            self._raise_if_browser_connection_lost()
             form_fields = await self.extract_form_fields()
 
             # Filter to fillable fields — includes standard inputs AND custom widgets
@@ -2602,6 +2613,7 @@ class SkyvernPage(Page):
             except Exception:
                 pass
 
+        self._raise_if_browser_connection_lost()
         elapsed = time.monotonic() - start_time
         LOG.info(
             "fill_multipage_form: completed",

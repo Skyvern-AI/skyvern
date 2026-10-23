@@ -1365,7 +1365,7 @@ async def test_successor_execute_safe_settles_capture_before_first_execution_mut
     result = await _block().execute_safe(workflow_run_id="wr_test", organization_id="o_test")
 
     assert result.success is True
-    assert events == ["capture_settled", "browser_read"]
+    assert events[0] == "capture_settled" and set(events[1:]) == {"browser_read"}
 
 
 @pytest.mark.asyncio
@@ -1434,7 +1434,9 @@ async def test_capture_settlement_failure_uses_protected_block_failure_path(monk
 
     assert result.failure_reason == "CodeBlock execution failed."
     assert build_result.await_args.kwargs["workflow_run_block_id"] == "wrb_successor"
-    browser_lookup.assert_not_called()
+    # The failure handler may read the run's browser-loss fact from the registry; the block itself
+    # must still never reach the browser (its pre-execution screenshot) after a failed settlement.
+    browser_lookup.return_value.take_fullpage_screenshot.assert_not_called()
 
 
 @pytest.mark.asyncio

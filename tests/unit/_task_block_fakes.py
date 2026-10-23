@@ -10,6 +10,8 @@ from unittest.mock import AsyncMock, MagicMock, patch
 from skyvern.forge.sdk.schemas.tasks import TaskStatus
 from skyvern.forge.sdk.workflow.context_manager import WorkflowRunContext
 from skyvern.forge.sdk.workflow.models.parameter import OutputParameter, ParameterType
+from skyvern.webeye.browser_runtime_events import BrowserRuntimeLogContext
+from skyvern.webeye.real_browser_state import RealBrowserState
 
 
 def output_parameter(key: str = "task_output") -> OutputParameter:
@@ -36,6 +38,21 @@ def _workflow_run_context(values: dict[str, Any] | None = None) -> WorkflowRunCo
     if values:
         ctx.values.update(values)
     return ctx
+
+
+def run_bound_browser_state(workflow_run_id: str) -> tuple[RealBrowserState, MagicMock]:
+    """A run-bound browser state and its still-open current context."""
+    context = MagicMock(browser=MagicMock())
+    state = RealBrowserState(pw=MagicMock(), browser_context=context)
+    state.bind_runtime_event_context(BrowserRuntimeLogContext(workflow_run_id=workflow_run_id))
+    return state, context
+
+
+def lost_browser_state(workflow_run_id: str) -> RealBrowserState:
+    """A run-bound browser state whose current context has just closed unexpectedly."""
+    state, context = run_bound_browser_state(workflow_run_id)
+    state._on_browser_context_closed(context)
+    return state
 
 
 @dataclass(frozen=True)
