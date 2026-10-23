@@ -21,6 +21,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import httpx
 import pytest
+from playwright.async_api import Error as PlaywrightError
 from playwright.async_api import TimeoutError as PlaywrightTimeoutError
 
 import skyvern.forge.api_app as api_app_module
@@ -30,12 +31,16 @@ import skyvern.forge.sdk.artifact.storage.local as local_storage_module
 import skyvern.forge.sdk.workflow.service as workflow_service_module
 import skyvern.library.embedded_server_factory as embedded_server_module
 from skyvern.config import settings
+from skyvern.constants import NAVIGATION_MAX_RETRY_TIME
+from skyvern.core.script_generations import skyvern_page as skyvern_page_module
 from skyvern.core.script_generations.real_skyvern_page_ai import RealSkyvernPageAi
 from skyvern.core.script_generations.script_skyvern_page import ScriptSkyvernPage
 from skyvern.core.script_generations.skyvern_page import ResolvedSensitiveValue, SkyvernPage
 from skyvern.errors.errors import UserDefinedError
 from skyvern.exceptions import (
+    FailedToNavigateToUrl,
     IllegitCompleteScriptTermination,
+    MissingBrowserState,
     NoTOTPSecretFound,
     ScriptTerminationException,
     SkyvernActionFailed,
@@ -54,10 +59,14 @@ from skyvern.forge.sdk.workflow.service import WorkflowService
 from skyvern.library.skyvern import Skyvern
 from skyvern.library.skyvern_browser_page import SkyvernBrowserPage
 from skyvern.services import script_service
+from skyvern.webeye import navigation as navigation_module
 from skyvern.webeye.actions.action_types import ActionType
 from skyvern.webeye.actions.handler import ActionHandler
 from skyvern.webeye.actions.responses import ActionAbort, ActionFailure, ActionSuccess
 from skyvern.webeye.skycdp.facade.page import Frame as CdpFrame
+from skyvern.webeye.utils.page import SkyvernFrame
+from tests.unit._task_block_fakes import run_bound_browser_state
+from tests.unit.scoped_asyncio import ScopedAsyncio
 
 
 class _KeyboardStub:
@@ -174,6 +183,51 @@ async def test_script_page_reports_deferred_navigation_failure(mock_scraped_page
 
     mock_scraped_page._browser_state.begin_navigation.assert_called_once_with()
     mock_scraped_page._browser_state.record_navigation_result.assert_awaited_once_with(error)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("seam", "dispatches", "backoffs"),
+    [
+        ("native_close_during_goto", 1, 0),
+        ("ordinary_navigation_error", 5, 4),
+        ("native_close_during_backoff", 1, 1),
+        ("lost_before_first_dispatch", 0, 0),
+    ],
+)
+async def test_script_page_stops_retrying_navigation_after_native_browser_loss(
+    seam: str, dispatches: int, backoffs: int, mock_ai, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from skyvern.core.script_generations import script_skyvern_page as module
+
+    browser_state, context = run_bound_browser_state("wr_script")
+    context._skyvern_cdp_download_interceptor = None
+    scraped_page = SimpleNamespace(_browser_state=browser_state)
+    page, raw_page = _build_navigation_page(ScriptSkyvernPage, scraped_page, mock_ai)
+
+    async def goto(url: str, **_: object) -> None:
+        if seam == "native_close_during_goto":
+            browser_state._on_browser_context_closed(context)
+            raise PlaywrightError("Target page, context or browser has been closed")
+        raise PlaywrightError("Timeout 30000ms exceeded.")
+
+    async def lose_browser_while_waiting(_: float) -> None:
+        if seam == "native_close_during_backoff":
+            browser_state._on_browser_context_closed(context)
+
+    raw_page.goto = AsyncMock(side_effect=goto)
+    backoff = AsyncMock(side_effect=lose_browser_while_waiting)
+    monkeypatch.setattr(module, "asyncio", ScopedAsyncio(sleep=backoff))
+    if seam == "lost_before_first_dispatch":
+        browser_state._on_browser_context_closed(context)
+
+    with pytest.raises(MissingBrowserState if seam == "lost_before_first_dispatch" else PlaywrightError) as error:
+        await page.goto("https://93.184.216.34/path", max_retries=5)
+
+    assert raw_page.goto.await_count == dispatches
+    assert backoff.await_count == backoffs
+    if seam == "native_close_during_backoff":
+        assert "Timeout 30000ms exceeded." in str(error.value)
 
 
 @pytest.mark.asyncio
@@ -1643,6 +1697,7 @@ async def test_input_text_rejects_raw_totp_markers_in_direct_mode(mock_scraped_p
 @pytest.mark.asyncio
 async def test_real_page_ai_rejects_raw_totp_placeholder_before_fallback() -> None:
     page_ai = RealSkyvernPageAi.__new__(RealSkyvernPageAi)
+    page_ai.scraped_page = SimpleNamespace(_browser_state=None)
     page_ai._maybe_run_v3_midrun = AsyncMock(return_value=(None, False))
 
     with (
@@ -2975,6 +3030,183 @@ async def test_post_dispatch_timeout_after_escape_skips_ai_fallback(mock_ai, eng
     mock_ai.ai_click.assert_not_awaited()
 
 
+_TARGET_CLOSED = "Target page, context or browser has been closed"
+
+
+def _run_bound_script_page(ai: object, locators: dict[str, object]) -> tuple[ScriptSkyvernPage, object, MagicMock]:
+    """A cached-script page whose scraped page carries a real run-bound browser state."""
+    browser_state, browser_context = run_bound_browser_state("wr_script")
+    raw_page = create_mock_page()
+    raw_page.keyboard = MagicMock(press=AsyncMock())
+    with patch("skyvern.core.script_generations.skyvern_page.Page.__init__", return_value=None):
+        script_page = ScriptSkyvernPage(
+            scraped_page=SimpleNamespace(_browser_state=browser_state), page=raw_page, ai=ai
+        )
+    script_page._working_frame = MagicMock(page=raw_page, locator=MagicMock(side_effect=lambda s, **_: locators[s]))
+    return script_page, browser_state, browser_context
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    # expected: page-ready waits, selector waits, clicks, Escape presses, AI fallbacks
+    ("seam", "expected"),
+    [
+        ("lost_before_the_action", [0, 0, 0, 0, 0]),
+        ("lost_during_the_page_ready_wait", [1, 0, 0, 0, 0]),
+        ("lost_during_the_selector_backoff", [1, 1, 0, 0, 0]),
+        ("lost_with_the_click_failure", [1, 1, 1, 0, 0]),
+        ("lost_with_a_post_dispatch_click_timeout", [1, 1, 1, 0, 0]),
+        ("lost_during_the_escape_pause", [1, 1, 1, 1, 0]),
+        ("lost_during_the_reclick", [1, 1, 2, 1, 0]),
+        ("ordinary_selector_timeout", [1, 3, 1, 1, 1]),
+        ("ordinary_post_dispatch_click_timeout", [1, 1, 1, 0, 0]),
+    ],
+)
+async def test_cached_click_dispatches_nothing_after_native_browser_loss(
+    monkeypatch: pytest.MonkeyPatch, seam: str, expected: list[int]
+) -> None:
+    ai = _AiStub()
+    ai.ai_click = AsyncMock(return_value="xpath=//button")
+    locator = MagicMock()
+    locator.first = locator
+    page, browser_state, browser_context = _run_bound_script_page(ai, {"#submit": locator})
+    calls: list[str] = []
+    dispatched = PlaywrightTimeoutError("click action done; waiting for scheduled navigations to finish")
+    intercepted = PlaywrightTimeoutError("<div class='overlay'></div> intercepts pointer events")
+    timed_out = PlaywrightTimeoutError("Timeout 5000ms exceeded.")
+    # Per click: (whether the native loss latches during it, what it raises).
+    click_outcomes = {
+        "lost_with_the_click_failure": [(True, PlaywrightError(_TARGET_CLOSED))],
+        "lost_with_a_post_dispatch_click_timeout": [(True, dispatched)],
+        "lost_during_the_escape_pause": [(False, intercepted)],
+        "lost_during_the_reclick": [(False, intercepted), (True, PlaywrightError(_TARGET_CLOSED))],
+        "ordinary_selector_timeout": [(False, timed_out)],
+        "ordinary_post_dispatch_click_timeout": [(False, dispatched)],
+    }
+
+    def lose_browser() -> None:
+        browser_state._on_browser_context_closed(browser_context)
+
+    async def wait_for(*, state: str, **_: object) -> None:
+        if state == "attached":
+            calls.append("attached")
+            if browser_state.get_browser_connection_loss() is not None:
+                raise PlaywrightError(_TARGET_CLOSED)
+            if seam in ("lost_during_the_selector_backoff", "ordinary_selector_timeout"):
+                raise timed_out
+
+    async def click(**_: object) -> None:
+        calls.append("click")
+        if browser_state.get_browser_connection_loss() is not None:
+            raise PlaywrightError(_TARGET_CLOSED)
+        latches, error = click_outcomes[seam][calls.count("click") - 1]
+        if latches:
+            lose_browser()
+        raise error
+
+    async def pause(seconds: float) -> None:
+        if (seam, seconds) in (("lost_during_the_selector_backoff", 1.0), ("lost_during_the_escape_pause", 0.3)):
+            lose_browser()
+
+    async def wait_for_page_ready() -> None:
+        calls.append("page_ready")
+        if seam == "lost_during_the_page_ready_wait":
+            lose_browser()
+
+    locator.wait_for = AsyncMock(side_effect=wait_for)
+    locator.scroll_into_view_if_needed = AsyncMock()
+    locator.click = AsyncMock(side_effect=click)
+    monkeypatch.setattr(page, "_wait_for_page_ready_before_action", wait_for_page_ready)
+    monkeypatch.setattr(skyvern_page_module, "asyncio", ScopedAsyncio(sleep=pause))
+    if seam == "lost_before_the_action":
+        lose_browser()
+
+    with skyvern_context.scoped(SkyvernContext(code_version=2)):
+        if seam.startswith("lost"):
+            with pytest.raises(MissingBrowserState):
+                await page.click("#submit", prompt="Click submit")
+        else:
+            result = await page.click("#submit", prompt="Click submit")
+            assert result == ("xpath=//button" if seam == "ordinary_selector_timeout" else "#submit")
+
+    escapes, ai_clicks = page.page.keyboard.press.await_count, ai.ai_click.await_count
+    assert [*(calls.count(call) for call in ("page_ready", "attached", "click")), escapes, ai_clicks] == expected
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("browser_lost", "mapping"),
+    [(True, {0: "Noor", 1: "Blue"}), (True, {0: "Noor"}), (False, {0: "Noor", 1: "Blue"})],
+    ids=["lost_before_the_next_field", "lost_on_the_last_field", "ordinary_field_failure"],
+)
+async def test_fill_from_mapping_stops_at_the_field_after_native_browser_loss(
+    browser_lost: bool, mapping: dict[int, str]
+) -> None:
+    ai = _AiStub()
+    ai.ai_input_text = AsyncMock(return_value="Noor")
+    name, color = MagicMock(), MagicMock(select_option=AsyncMock())
+    name.first = name
+    page, browser_state, browser_context = _run_bound_script_page(ai, {"#name": name, "#color": color})
+
+    async def fill(_value: str, **_: object) -> None:
+        if browser_lost:
+            browser_state._on_browser_context_closed(browser_context)
+            raise PlaywrightError(_TARGET_CLOSED)
+        raise RuntimeError("element is not attached to the DOM")
+
+    name.fill = AsyncMock(side_effect=fill)
+    page._wait_for_page_ready_before_action = AsyncMock()  # type: ignore[method-assign]
+    form_fields = [
+        {"selector": "#name", "type": "text", "tag": "input", "label": "Name"},
+        {"selector": "#color", "type": "select-one", "tag": "select", "label": "Color"},
+    ]
+
+    with pytest.raises(MissingBrowserState) if browser_lost else contextlib.nullcontext():
+        await page.fill_from_mapping(form_fields, mapping)
+
+    assert color.select_option.await_count == ai.ai_input_text.await_count == (0 if browser_lost else 1)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "seam", ["lost_during_the_next_click", "lost_during_the_page_transition", "ordinary_last_page"]
+)
+async def test_fill_multipage_form_reports_no_pages_after_native_browser_loss(
+    monkeypatch: pytest.MonkeyPatch, seam: str
+) -> None:
+    page, browser_state, browser_context = _run_bound_script_page(_AiStub(), {})
+    pages = [[{"selector": f"#{name}", "type": "text", "tag": "input", "label": name}] for name in ("name", "email")]
+    extract_form_fields = AsyncMock(side_effect=[pages[0], pages[0], pages[1], pages[1]])
+
+    async def click_next(**_: object) -> None:
+        if seam == "lost_during_the_next_click":
+            browser_state._on_browser_context_closed(browser_context)
+        if seam != "lost_during_the_page_transition":
+            raise RuntimeError("no next button")
+
+    async def pause(seconds: float) -> None:
+        if seam == "lost_during_the_page_transition" and seconds == 1:
+            browser_state._on_browser_context_closed(browser_context)
+
+    monkeypatch.setattr(page, "extract_form_fields", extract_form_fields)
+    monkeypatch.setattr(page, "dynamic_field_map", AsyncMock(return_value={0: "Noor"}))
+    monkeypatch.setattr(page, "fill_from_mapping", AsyncMock())
+    monkeypatch.setattr(page, "click", AsyncMock(side_effect=click_next))
+    monkeypatch.setattr(page.page, "evaluate", AsyncMock(return_value=[]), raising=False)
+    ready_frame = SimpleNamespace(wait_for_page_ready=AsyncMock())
+    monkeypatch.setattr(SkyvernFrame, "create_instance", AsyncMock(return_value=ready_frame))
+    monkeypatch.setattr(skyvern_page_module, "asyncio", ScopedAsyncio(sleep=pause))
+
+    if seam == "ordinary_last_page":
+        assert await page.fill_multipage_form({"name": "Noor"}, max_pages=2) == 1
+    else:
+        with pytest.raises(MissingBrowserState):
+            await page.fill_multipage_form({"name": "Noor"}, max_pages=2)
+
+    assert extract_form_fields.await_count == 2
+    assert page.dynamic_field_map.await_count == 1
+
+
 @pytest.mark.asyncio
 async def test_get_or_create_browser_state_forwards_script_id_to_manager(monkeypatch):
     # MUST_FIX 1: the production script caller must forward the active run's script_id so the
@@ -3155,6 +3387,7 @@ class TestScriptSkyvernPageMagicLink:
         page = SimpleNamespace(goto=fake_goto, fill=fake_fill)
         script_page = ScriptSkyvernPage.__new__(ScriptSkyvernPage)
         script_page.page = page
+        module._set_scraped_page(script_page, SimpleNamespace(_browser_state=None))
         return script_page, state
 
     @staticmethod
@@ -3191,6 +3424,39 @@ class TestScriptSkyvernPageMagicLink:
         assert anchor.tzinfo is None
         expected_anchor = datetime.now(timezone.utc).replace(tzinfo=None) - MAGIC_LINK_ANCHOR_GRACE
         assert abs((anchor - expected_anchor).total_seconds()) < 30
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "native_close", [True, False], ids=["native_close_during_goto", "ordinary_navigation_error"]
+    )
+    async def test_link_navigation_stops_retrying_after_native_browser_loss(self, monkeypatch, native_close) -> None:
+        from skyvern.core.script_generations import script_skyvern_page as module
+        from skyvern.forge.sdk.schemas.totp_codes import OTPType
+        from skyvern.services.otp_service import OTPValue
+
+        link = "https://portal.example.com/verify?token=x"
+        script_page, state = self._install(monkeypatch, OTPValue(value=link, type=OTPType.MAGIC_LINK))
+        browser_state, context = run_bound_browser_state("wr_1")
+        module._set_scraped_page(script_page, SimpleNamespace(_browser_state=browser_state))
+        monkeypatch.setattr(navigation_module, "asyncio", ScopedAsyncio(sleep=AsyncMock()))
+
+        async def goto(url, **kwargs):
+            state["navigations"].append(url)
+            if native_close:
+                browser_state._on_browser_context_closed(context)
+                raise PlaywrightError("Target page, context or browser has been closed")
+            raise PlaywrightError("Timeout 30000ms exceeded.")
+
+        script_page.page.goto = goto
+
+        ctx = self._with_context()
+        try:
+            with pytest.raises(FailedToNavigateToUrl):
+                await script_page.magic_link(totp_identifier="inbox@example.com")
+        finally:
+            ctx.reset()
+
+        assert state["navigations"] == [link] * (1 if native_close else NAVIGATION_MAX_RETRY_TIME)
 
     @pytest.mark.asyncio
     async def test_a_returned_one_time_code_is_reported_not_navigated_to(self, monkeypatch) -> None:

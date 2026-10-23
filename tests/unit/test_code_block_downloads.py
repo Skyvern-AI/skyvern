@@ -269,6 +269,7 @@ def _fake_storage_app(
             get_downloaded_file_signature_aliases=lambda _: [],
             list_downloading_files_in_browser_session=in_flight or AsyncMock(return_value=[]),
         ),
+        BROWSER_MANAGER=SimpleNamespace(get_for_workflow_run=lambda *_args, **_kwargs: None),
         AGENT_FUNCTION=SimpleNamespace(
             validate_code_block=AsyncMock(),
             validate_block_execution=AsyncMock(),

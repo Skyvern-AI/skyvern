@@ -1588,6 +1588,8 @@ async def test_final_release_retries_keep_own_claim_and_completed_hook(
         ("failed", "failed", ["A", "B"], {"C"}, 0, (False, "no_match")),
         ("failed", "failed", ["A"], set(), 0, (False, "no_match")),
         ("completed", "failed", None, set(), 0, (False, "no_match")),
+        ("failed", "failed", None, {"browser_connection_lost"}, 0, (False, "browser_connection_lost")),
+        ("failed", "failed", [], {"ANY", "browser_connection_lost"}, 0, (False, "browser_connection_lost")),
     ],
 )
 def test_evaluate_retry_policy_decisions(status, rule_status, rule_codes, errors, retries_used, expected) -> None:

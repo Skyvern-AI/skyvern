@@ -24,7 +24,12 @@ from structlog.testing import capture_logs
 
 from skyvern.config import Settings, settings
 from skyvern.errors.errors import UserDefinedError
-from skyvern.exceptions import CompletionGateTerminationError, MissingBrowserStatePage, StepTerminationError
+from skyvern.exceptions import (
+    BROWSER_CONNECTION_LOST_ERROR_CODE,
+    CompletionGateTerminationError,
+    MissingBrowserStatePage,
+    StepTerminationError,
+)
 from skyvern.forge import agent as agent_module
 from skyvern.forge import app
 from skyvern.forge.agent import ForgeAgent
@@ -121,6 +126,7 @@ from tests.unit._download_provider_fakes import (
     _secret_bearing_validation_error,
     _StallingActionDownloadObservation,
 )
+from tests.unit._task_block_fakes import run_bound_browser_state
 from tests.unit.helpers import (
     make_action_row,
     make_browser_state,
@@ -130,6 +136,7 @@ from tests.unit.helpers import (
 )
 from tests.unit.scoped_asyncio import ScopedAsyncio
 from tests.unit.test_taskv3_loop import _ScriptedCaller
+from tests.unit.test_taskv3_tools import _FakePage
 
 
 async def _run_execute_task_v3(
@@ -4171,6 +4178,172 @@ async def test_a_fifth_veto_on_a_reask_conversion_restores_the_models_own_verdic
 
     assert task.status == TaskStatus.terminated
     assert task.failure_reason == "the site offers no way to continue"
+
+
+class _ModelSubstitute(_ScriptedCaller):
+    """A deterministic stand-in for the Task V3 model; no LLM is called."""
+
+    def __init__(self, script: list[list[tuple[str, dict[str, Any]]]]) -> None:
+        super().__init__(script)
+        self.original_llm_key = self.llm_key
+        self.llm_config = LLMConfig("scripted/model-substitute", [], True, False)
+
+    async def call(self, *, step: Step | None = None, **kwargs: Any) -> dict[str, Any]:
+        return await super().call(**kwargs)
+
+    def emit_retry_chain_exhausted(self, error: BaseException, prompt_name: str | None) -> None:
+        raise AssertionError(f"the model substitute never exhausts a retry chain: {error!r}")
+
+
+class _PageWithEventAfterFill(_FakePage):
+    def __init__(self, after_fill: Callable[[], None]) -> None:
+        super().__init__()
+        self._after_fill = after_fill
+
+    async def fill(self, selector: str, text: str, timeout: int | None = None) -> None:
+        await super().fill(selector, text, timeout=timeout)
+        self._after_fill()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("event", "status"),
+    [
+        ("none", TaskStatus.completed),
+        ("expected_close", TaskStatus.completed),
+        ("native_close", TaskStatus.failed),
+        ("cancel_and_native_close", TaskStatus.canceled),
+    ],
+)
+async def test_execute_task_v3_native_browser_loss_after_the_last_action_fails_the_completion(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, event: str, status: TaskStatus
+) -> None:
+    # The real loop, finish tool, completion gate and post-loop write; only the model and the page are fakes.
+    agent = ForgeAgent()
+    now = datetime.now(UTC)
+    organization = make_organization(now)
+    task = make_task(
+        now,
+        organization,
+        workflow_run_id="wr_v3_browser_loss",
+        navigation_goal="Fill in the first name",
+        data_extraction_goal=None,
+        extracted_information_schema=None,
+    )
+    step = make_step(now, task, step_id="step-v3", status=StepStatus.created, order=0, output=None)
+    state, context = run_bound_browser_state("wr_v3_browser_loss")
+    canceled = False
+
+    def _after_last_action() -> None:
+        nonlocal canceled
+        if event == "expected_close":
+            state._expect_runtime_end("normal_close", context)
+        if event == "cancel_and_native_close":
+            canceled = True
+        if event != "none":
+            # Playwright closes a closed context's pages and stops listing them.
+            page._closed = True
+            context.pages = []
+            state._on_browser_context_closed(context)
+
+    page = _PageWithEventAfterFill(_after_last_action)
+    page.url = task.url
+    context.pages = [page]
+    context._skyvern_cdp_download_interceptor = None
+    await state.set_working_page(page)
+    monkeypatch.setattr(state, "take_post_action_screenshot", AsyncMock(return_value=b"png-bytes"))
+
+    # The settle check may hold a finish twice before it accepts one.
+    finish = [("finish", {"status": "completed", "reason": "the first name is filled in"})]
+    model = _ModelSubstitute([[("observe", {})], [("type", {"selector": "#first", "text": "John"})], *[finish] * 3])
+    monkeypatch.setattr("skyvern.forge.agent.LLMCaller", lambda **_kwargs: model)
+    run_context = WorkflowRunContext(
+        workflow_title="wf",
+        workflow_id="w_test",
+        workflow_permanent_id="wpid_test",
+        workflow_run_id="wr_v3_browser_loss",
+        aws_client=MagicMock(),
+    )
+    monkeypatch.setattr(
+        "skyvern.forge.agent.app.WORKFLOW_CONTEXT_MANAGER.has_workflow_run_context", lambda *_a, **_k: True
+    )
+    monkeypatch.setattr(
+        "skyvern.forge.agent.app.WORKFLOW_CONTEXT_MANAGER.get_workflow_run_context", lambda *_a, **_k: run_context
+    )
+
+    async def _get_task(**_kwargs: Any) -> SimpleNamespace:
+        return SimpleNamespace(status=TaskStatus.canceled if canceled else TaskStatus.running)
+
+    monkeypatch.setattr("skyvern.forge.agent.app.DATABASE.tasks.get_task", AsyncMock(side_effect=_get_task))
+    monkeypatch.setattr(
+        "skyvern.forge.agent.app.DATABASE.workflow_runs.get_workflow_run",
+        AsyncMock(return_value=SimpleNamespace(status=WorkflowRunStatus.running, parent_workflow_run_id=None)),
+    )
+    monkeypatch.setattr("skyvern.forge.sdk.api.files.get_download_dir", lambda *_a, **_k: str(tmp_path))
+    monkeypatch.setattr(
+        "skyvern.forge.agent.app.ARTIFACT_MANAGER.create_artifact", AsyncMock(return_value="artifact-1")
+    )
+    persisted_actions: list[Any] = []
+
+    async def _create_action(action: Any) -> Any:
+        persisted_actions.append(action)
+        return action
+
+    monkeypatch.setattr("skyvern.forge.agent.app.DATABASE.workflow_params.create_action", _create_action)
+    monkeypatch.setattr(
+        "skyvern.forge.agent.app.DATABASE.observer.get_workflow_run_block_by_task_id", AsyncMock(return_value=None)
+    )
+    monkeypatch.setattr("skyvern.services.otp_service.has_credential_totp_candidate", lambda *_a, **_k: False)
+    monkeypatch.setattr("skyvern.forge.agent.app.AGENT_FUNCTION.post_step_execution", AsyncMock())
+
+    async def fake_update_step(step: Step, status: StepStatus | None = None, **_kwargs: Any) -> Step:
+        if status is not None:
+            step.status = status
+        return step
+
+    async def fake_update_task(task: Any, status: Any = None, **kwargs: Any) -> Any:
+        task.status = status
+        task.failure_reason = kwargs.get("failure_reason")
+        return task
+
+    agent.update_step = AsyncMock(side_effect=fake_update_step)
+    agent.update_task = AsyncMock(side_effect=fake_update_task)
+    agent.clean_up_task = AsyncMock()
+
+    skyvern_context.set(
+        SkyvernContext(
+            task_id=task.task_id,
+            step_id=step.step_id,
+            organization_id=task.organization_id,
+            workflow_run_id=task.workflow_run_id,
+        )
+    )
+    try:
+        await agent._execute_task_v3(
+            task=task,
+            step=step,
+            browser_state=state,
+            organization=organization,
+            api_key=None,
+            close_browser_on_completion=True,
+            browser_session_id=None,
+            task_block=_make_block(NavigationBlock, navigation_goal="Fill in the first name"),
+        )
+    finally:
+        skyvern_context.reset()
+
+    assert ("fill", {"selector": "#first", "text": "John"}) in page.calls
+    assert task.status == status
+    if status == TaskStatus.canceled:
+        return
+    decision = persisted_actions[-1]
+    assert decision.description.endswith("finish completed")
+    if status == TaskStatus.failed:
+        assert decision.status == ActionStatus.failed
+        assert BROWSER_CONNECTION_LOST_ERROR_CODE in task.failure_reason
+    else:
+        assert decision.status == ActionStatus.completed
+        assert task.failure_reason is None
 
 
 @pytest.mark.asyncio
