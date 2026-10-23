@@ -428,6 +428,7 @@ class BitwardenItemOverview(BaseModel):
     )
     credential_type: CredentialType = Field(..., description="The item's credential type")
     url: str | None = Field(default=None, description="The primary website URL associated with the item, if any")
+    urls: list[str] = Field(default_factory=list, exclude=True, description="Every website URL saved on the item")
 
 
 class BitwardenItemsResponse(BaseModel):

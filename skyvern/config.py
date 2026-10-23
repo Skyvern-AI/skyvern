@@ -575,6 +575,8 @@ class Settings(BaseSettings):
     # Fraction of Task V3 runs (keyed by workflow run, else task) that persist their last pre-submit
     # page frames as artifacts. Instrumentation sampling, not a traffic knob; 0 disables.
     TASK_V3_PRE_SUBMIT_CAPTURE_SAMPLE_RATE: float = 0.25
+    # Kill switch: one page DOM per Task V3 block, saved after the loop as html_action (v1 saves html_scrape).
+    TASK_V3_BLOCK_END_DOM: bool = True
     # Kill switch for the tier-1 semantic commit read (SKY-15322): decisive-accept-only ARIA/value
     # probe consulted before the shape heuristics, which remain the fallback either way.
     TASK_V3_SEMANTIC_COMMIT_VERIFY: bool = True
