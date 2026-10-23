@@ -19,12 +19,15 @@ export type AcceptAttempt = {
   wroteNothing: boolean;
 };
 
-// The only two statuses the apply route's refusal ladder raises, and it raises both before it
-// creates the version, so either proves no write. Nothing wider qualifies: a transport failure
-// carries no status at all, its 404 says the chat id did not resolve so a later read of that same
-// id proves nothing, and a gateway or auth 4xx never reached the ladder.
+// The statuses that prove the apply route wrote nothing. 400 and 409 are its own refusal ladder,
+// raised before it creates the version. 422 is the save path refusing the proposal's definition -
+// an invalid block graph, duplicate labels, reserved parameter keys - and those validators run
+// inside the version write transaction, ahead of the definition write, so the version row they
+// raise over rolls back with them. Nothing wider qualifies: a transport failure carries no status
+// at all, its 404 says the chat id did not resolve so a later read of that same id proves nothing,
+// and a gateway or auth 4xx never reached the route.
 export const applyWroteNothing = (status: number | undefined): boolean =>
-  status === 400 || status === 409;
+  status === 400 || status === 409 || status === 422;
 
 export const proposalTokenOf = (
   metadata: CopilotProposalMetadata | null,
@@ -246,5 +249,10 @@ export function definitiveAcceptRejection(error: unknown): string | null {
     ].includes(detail)
   )
     return detail;
+  // The save path refusing the proposal's definition. Its messages name the problem and say how to
+  // fix it ("Circular reference detected: ...", "Duplicate block label detected: ..."), and the set
+  // is open, so the status carries the proof and the message is passed through as written. FastAPI's
+  // own request-validation 422 sends a list, which the string check above already drops.
+  if (response?.status === 422) return detail;
   return null;
 }

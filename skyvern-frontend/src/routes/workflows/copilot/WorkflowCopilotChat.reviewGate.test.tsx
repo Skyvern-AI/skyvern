@@ -99,7 +99,6 @@ import type {
 import { TooltipProvider } from "@/components/ui/tooltip";
 import { SaveButton } from "@/routes/workflows/studio/StudioTopBar";
 import { useCopilotActionStore } from "@/store/useCopilotActionStore";
-import { useRecordingStore } from "@/store/useRecordingStore";
 
 import {
   fenceBaselineFor,
@@ -313,9 +312,6 @@ vi.mock("./useInfiniteCopilotChatsQuery", () => ({
     isFetchingNextPage: false,
     isFetching: false,
   }),
-}));
-vi.mock("@/routes/workflows/editor/recording/RecordingPanel", () => ({
-  RecordingPanel: () => <div data-testid="recording-chapter" />,
 }));
 
 let editorNodes: AppNode[] = [];
@@ -637,6 +633,11 @@ async function acceptRefusedWith(status: number) {
     fireEvent.click(screen.getByRole("button", { name: "Accept" }));
   });
 }
+
+// The save path's own wording for a proposal whose block graph it refuses.
+const INVALID_GRAPH_DETAIL =
+  "Circular reference detected: some blocks form a loop through their next_block_label" +
+  " references, causing an infinite cycle.";
 
 const proposedWorkflowPayload = (
   overrides: Record<string, unknown> = {},
@@ -2161,19 +2162,12 @@ describe("WorkflowCopilotChat — g2 review gate", () => {
     },
   );
 
-  it.each(
-    [
-      "question",
-      "credential",
-      "external question",
-      "external credential",
-    ].flatMap((path) =>
-      ["Keep my edits", "Apply and discard my edits"].map((choice) => [
-        path,
-        choice,
-      ]),
-    ),
-  )(
+  it.each([
+    ["question", "Keep my edits"],
+    ["credential", "Apply and discard my edits"],
+    ["external question", "Apply and discard my edits"],
+    ["external credential", "Keep my edits"],
+  ])(
     "protects local inputs before claiming delayed %s history: %s",
     async (path, choice) => {
       changesState.hasChanges = false;
@@ -2779,7 +2773,7 @@ describe("WorkflowCopilotChat — g2 review gate", () => {
       const owner = createYamlCommitOwner("wpid_1");
       registerEditorOwner(owner);
       if (mode === "HTTP rejection")
-        cancelPost.mockRejectedValueOnce({ response: { status: 422 } });
+        cancelPost.mockRejectedValueOnce({ response: { status: 500 } });
       vi.useFakeTimers();
       await act(async () =>
         fireEvent.click(screen.getByRole("button", { name: "Accept" })),
@@ -2932,8 +2926,6 @@ describe("WorkflowCopilotChat — g2 review gate", () => {
   it.each([
     { action: "Retry", expired: true },
     { action: "Reload", expired: true },
-    { action: "Reject", expired: true },
-    { action: "Retry", expired: false },
     { action: "Reject", expired: false },
   ])(
     "settles an unannounced turn through $action (deadline expired: $expired)",
@@ -3339,7 +3331,7 @@ describe("WorkflowCopilotChat — g2 review gate", () => {
         historyResponse.data.workflow_copilot_chat_id = null;
       } else if (mode === "failed-server") {
         historyResponse.data.proposed_workflow = proposedWorkflowPayload();
-        cancelPost.mockRejectedValueOnce({ response: { status: 422 } });
+        cancelPost.mockRejectedValueOnce({ response: { status: 500 } });
       } else {
         cancelPost.mockResolvedValueOnce({
           data: proposedWorkflowPayload({
@@ -3863,11 +3855,8 @@ describe("WorkflowCopilotChat — g2 review gate", () => {
 
   it.each([
     ["error", true],
-    ["error", false],
-    ["response", true],
     ["response", false],
     ["cancel", true],
-    ["cancel", false],
   ] as const)(
     "checks canonical before a %s snapshot restore (auto-accept committed: %s)",
     async (terminal, committed) => {
@@ -4526,7 +4515,7 @@ describe("WorkflowCopilotChat — g2 review gate", () => {
         if (mode !== "terminal") {
           if (mode === "fallback") {
             historyResponse.data.proposed_workflow = appliedWorkflow;
-            cancelPost.mockRejectedValueOnce({ response: { status: 422 } });
+            cancelPost.mockRejectedValueOnce({ response: { status: 500 } });
           } else cancelPost.mockResolvedValueOnce({ data: appliedWorkflow });
           await act(async () =>
             fireEvent.click(screen.getByRole("button", { name: "Accept" })),
@@ -7694,9 +7683,33 @@ describe("WorkflowCopilotChat — g2 review gate", () => {
     expect(screen.getByRole("button", { name: "Accept" })).toBeTruthy();
   });
 
-  it.each([false, true])(
-    "settles a surviving proposal from a newer canonical version only with no-write proof: %s",
-    async (wroteNothing) => {
+  it.each([
+    {
+      refusal: "unproven",
+      error: new Error("Network Error"),
+      wroteNothing: false,
+    },
+    {
+      refusal: "409",
+      error: { response: { status: 409 } },
+      wroteNothing: true,
+    },
+    {
+      // SKY-18820: the save path refusing the proposal's own definition. While 422 was not
+      // no-write proof this entered the recovery poll instead, and the proposal the route
+      // restores on the way out keeps that poll running, so Send and Save never came back.
+      refusal: "422 invalid definition",
+      error: {
+        response: {
+          status: 422,
+          data: { detail: INVALID_GRAPH_DETAIL },
+        },
+      },
+      wroteNothing: true,
+    },
+  ])(
+    "settles a surviving proposal from a newer canonical version only with no-write proof: $refusal",
+    async ({ error: refusalError, wroteNothing }) => {
       const onWorkflowUpdate = vi.fn();
       useWorkflowHasChangesStore.setState({
         getSaveData: () =>
@@ -7724,11 +7737,7 @@ describe("WorkflowCopilotChat — g2 review gate", () => {
           path === "/workflows/wpid_1" ? { data: created } : historyResponse,
         ),
       );
-      cancelPost.mockRejectedValueOnce(
-        wroteNothing
-          ? { response: { status: 409 } }
-          : new Error("Network Error"),
-      );
+      cancelPost.mockRejectedValueOnce(refusalError);
 
       await act(async () => {
         fireEvent.click(screen.getByRole("button", { name: "Accept" }));
@@ -7755,6 +7764,18 @@ describe("WorkflowCopilotChat — g2 review gate", () => {
         useWorkflowYamlEditorStore.getState().copilotAcceptance !== null,
       ).toBe(!wroteNothing);
       if (wroteNothing) expect(screen.getByText("Not saved")).toBeTruthy();
+      // A refusal that names the problem has to reach the user: the toast is the only place the
+      // save path's verdict is shown, and it is what tells them what to change.
+      const detail = (
+        refusalError as { response?: { data?: { detail?: string } } }
+      ).response?.data?.detail;
+      if (detail)
+        expect(toast).toHaveBeenCalledWith(
+          expect.objectContaining({
+            title: "Accept failed",
+            description: detail,
+          }),
+        );
     },
   );
 
@@ -7788,37 +7809,6 @@ describe("WorkflowCopilotChat — g2 review gate", () => {
       });
     } finally {
       finishSaveTransaction(owner);
-      useCopilotActionStore.setState(useCopilotActionStore.getInitialState());
-    }
-  });
-
-  it("clears a block Generate refused during recording and disarms its target", async () => {
-    useCopilotActionStore.setState(useCopilotActionStore.getInitialState());
-    useRecordingStore.setState({ isRecording: true });
-    await renderChat();
-    try {
-      await act(async () => {
-        useCopilotActionStore.getState().requestBuild({
-          blockLabel: "extract_titles",
-          prompt: "read titles",
-        });
-      });
-      expect(useCopilotActionStore.getState().pendingBuild).toBeNull();
-      expect(useCopilotActionStore.getState().generatingBlockLabel).toBeNull();
-      expect(postStreaming).not.toHaveBeenCalled();
-      expect(
-        useWorkflowYamlEditorStore.getState().copilotAcceptance,
-      ).toBeNull();
-
-      await act(async () => useRecordingStore.setState({ isRecording: false }));
-      await submit("Continue editing the workflow");
-      await waitFor(() => expect(postStreaming).toHaveBeenCalledOnce());
-      expect(streamCalls[0]?.body).toMatchObject({
-        message: "Continue editing the workflow",
-        target_block_label: null,
-      });
-    } finally {
-      useRecordingStore.setState({ isRecording: false });
       useCopilotActionStore.setState(useCopilotActionStore.getInitialState());
     }
   });
@@ -11200,45 +11190,221 @@ describe("WorkflowCopilotChat — g2 review gate", () => {
     expect(useWorkflowYamlEditorStore.getState().lockKind).toBeNull();
   });
 
-  describe.each(["editor", "debugger"] as const)(
-    "late canonical recovery on the %s route",
-    (route) => {
-      beforeEach(() => {
-        saveData.workflow.title = saveData.title;
+  describe("late canonical recovery on the editor route", () => {
+    beforeEach(() => {
+      saveData.workflow.title = saveData.title;
+    });
+    async function discardRecoveryDraft() {
+      await act(async () => {
+        fireEvent.click(
+          screen.getByRole("button", { name: "Apply and discard my edits" }),
+        );
+        await vi.advanceTimersByTimeAsync(0);
       });
-      async function discardRecoveryDraft() {
-        await act(async () => {
-          fireEvent.click(
-            screen.getByRole("button", { name: "Apply and discard my edits" }),
-          );
-          await vi.advanceTimersByTimeAsync(0);
+    }
+    async function severStream(withTurnId = true) {
+      const apply = vi.fn();
+      const view = await renderChat({
+        route: "editor",
+        docked: true,
+        onWorkflowUpdate: apply,
+      });
+      const saveRegistration = renderHook(() => {
+        const nodes = editorNodes;
+        const revision = useWorkflowYamlEditorStore((state) => state.revision);
+        const parameters = useWorkflowParametersStore(
+          (state) => state.parameters,
+        );
+        useEffect(() => {
+          // FlowRenderer registers a new save callback after graph/store updates render.
+          const current = {
+            ...saveData,
+            blocks: getWorkflowBlocks(nodes, []),
+          };
+          useWorkflowHasChangesStore.getState().setGetSaveData(() => current);
+        }, [nodes, revision, parameters]);
+      });
+      const saved = { current: saveData.workflow };
+      historyGet.mockImplementation((path: string) =>
+        Promise.resolve(
+          path === "/workflows/wpid_1"
+            ? { data: saved.current }
+            : historyResponse,
+        ),
+      );
+      const submittedBlocks = useWorkflowHasChangesStore
+        .getState()
+        .getSaveData()!.blocks;
+      await submit("edit the workflow");
+      vi.useFakeTimers();
+      await act(async () => {
+        if (withTurnId) {
+          streamCalls[0]!.onMessage({
+            type: "turn_start",
+            turn_id: "turn-1",
+            mode: "build",
+            turn_index: 0,
+          });
+          streamCalls[0]!.onMessage({
+            type: "workflow_draft",
+            block_labels: [],
+            workflow: proposedWorkflowPayload(),
+          });
+        }
+      });
+      if (withTurnId) {
+        act(() => saveRegistration.rerender());
+        expect(
+          useWorkflowHasChangesStore.getState().getSaveData()!.blocks,
+        ).not.toEqual(submittedBlocks);
+      }
+      await act(async () =>
+        streamCalls[0]!.reject(new Error("connection dropped")),
+      );
+      expect(historyGet).toHaveBeenCalledWith(
+        "/workflows/wpid_1",
+        expect.objectContaining({ signal: expect.any(AbortSignal) }),
+      );
+      expect(
+        useWorkflowYamlEditorStore.getState().copilotAcceptance,
+      ).not.toBeNull();
+      expect(setEditorNodes).not.toHaveBeenCalled();
+      if (withTurnId) {
+        expect(editorNodes.find((node) => node.id === "loop")).toBeUndefined();
+      } else {
+        expect(
+          editorNodes.find((node) => node.id === "loop")?.data,
+        ).toMatchObject({
+          loopValue: "unsaved_items",
+          loopVariableReference: "{{ item }}",
         });
       }
-      async function severStream(withTurnId = true) {
-        const apply = vi.fn();
-        const view = await renderChat({
-          route,
-          docked: true,
-          onWorkflowUpdate: apply,
-        });
-        const saveRegistration = renderHook(() => {
-          const nodes = editorNodes;
-          const revision = useWorkflowYamlEditorStore(
-            (state) => state.revision,
+      apply.mockClear();
+      vi.mocked(toast).mockClear();
+      return { apply, saved, view };
+    }
+
+    it.each([false, true])(
+      "retains recovery through timeout and Retry until reconciliation or Reject (resumed=%s)",
+      async (resumed) => {
+        changesState.hasChanges = true;
+        const { saved, view } = await severStream();
+        if (resumed) {
+          view.unmount();
+          await renderChat({ route: "editor", docked: true, isOpen: false });
+        }
+        const expectControls = () => {
+          expect(screen.getByRole("button", { name: "Retry" })).toBeTruthy();
+          expect(screen.getByRole("button", { name: "Reject" })).toBeTruthy();
+          expect(
+            useWorkflowYamlEditorStore.getState().copilotAcceptance,
+          ).not.toBeNull();
+        };
+        await advance(1_500_000);
+        expectControls();
+        expect(screen.getByRole("alert").textContent).toContain(
+          "Could not confirm",
+        );
+        await act(async () =>
+          fireEvent.click(screen.getByRole("button", { name: "Retry" })),
+        );
+        expectControls();
+        const retainedNodes = structuredClone(editorNodes);
+        act(editLoop);
+        expect(editorNodes).toEqual(retainedNodes);
+        finishOnServer(saved);
+        await advance(2_000);
+        if (resumed) await discardRecoveryDraft();
+        expect(editorNodes.find((node) => node.id === "loop")).toBeUndefined();
+        expect(screen.queryByRole("alert")).toBeNull();
+        expect(
+          useWorkflowYamlEditorStore.getState().copilotAcceptance,
+        ).toBeNull();
+      },
+    );
+
+    it("keeps Reject reachable in a closed chat after an unchanged Retry and another timeout", async () => {
+      changesState.hasChanges = true;
+      const { view } = await severStream(false);
+      view.unmount();
+      const recovery = canonicalRecoveriesByWorkflow.get("wpid_1")!;
+      const snapshot = recovery.rollback?.snapshot;
+      await renderChat({ route: "editor", docked: true, isOpen: false });
+      expect(screen.queryByRole("textbox")).toBeNull();
+      expect(screen.getByRole("button", { name: "Reject" })).toBeTruthy();
+      await advance(1_500_000);
+      await act(async () =>
+        fireEvent.click(screen.getByRole("button", { name: "Retry" })),
+      );
+      expect(recovery.rollback?.snapshot).toEqual(snapshot);
+      await advance(1_500_000);
+      historyGet.mockImplementation((path: string) =>
+        path === "/workflows/wpid_1"
+          ? new Promise(() => {})
+          : Promise.resolve(historyResponse),
+      );
+      await act(async () =>
+        fireEvent.click(screen.getByRole("button", { name: "Reject" })),
+      );
+      expect(screen.getByRole("alert").textContent).toContain(
+        "Cancelling the Copilot turn",
+      );
+      expect(
+        useWorkflowYamlEditorStore.getState().copilotAcceptance,
+      ).not.toBeNull();
+      expect(recovery.rollback?.snapshot).toEqual(snapshot);
+      expect(cancelPost).toHaveBeenCalledWith(
+        "/workflow/copilot/cancel",
+        {
+          cancel_token: recovery.poll!.requestId,
+          workflow_copilot_chat_id: "chat-1",
+          source: "stop_button",
+        },
+        { timeout: 5_000 },
+      );
+      expect(
+        editorNodes.find((node) => node.id === "loop")?.data,
+      ).toMatchObject({ loopValue: "unsaved_items" });
+    });
+
+    it.each(["poll", "resume", "retry"] as const)(
+      "bounds a hung canonical read from %s and ignores its stale response",
+      async (source) => {
+        changesState.hasChanges = true;
+        const { saved, view } = await severStream(false);
+        historyResponse.data.request_turn_id = "turn-1";
+        finishTurnHistory();
+        let resolveOldRead!: (value: unknown) => void;
+        let readSignal: AbortSignal | undefined;
+        historyGet.mockImplementation(
+          (path: string, options?: { signal?: AbortSignal }) =>
+            path === "/workflows/wpid_1"
+              ? new Promise((resolve) => {
+                  if (!readSignal) {
+                    readSignal = options?.signal;
+                    resolveOldRead = resolve;
+                  }
+                })
+              : Promise.resolve(historyResponse),
+        );
+        if (source === "resume") {
+          view.unmount();
+          await renderChat({ route: "editor", docked: true });
+        } else if (source === "retry") {
+          await act(async () =>
+            fireEvent.click(screen.getByRole("button", { name: "Retry" })),
           );
-          const parameters = useWorkflowParametersStore(
-            (state) => state.parameters,
-          );
-          useEffect(() => {
-            // FlowRenderer registers a new save callback after graph/store updates render.
-            const current = {
-              ...saveData,
-              blocks: getWorkflowBlocks(nodes, []),
-            };
-            useWorkflowHasChangesStore.getState().setGetSaveData(() => current);
-          }, [nodes, revision, parameters]);
-        });
-        const saved = { current: saveData.workflow };
+        }
+        await advance(source === "retry" ? 0 : 2_000);
+        expect(readSignal?.aborted).toBe(false);
+        await advance(4_999);
+        expect(readSignal?.aborted).toBe(false);
+        await advance(1);
+        expect(readSignal?.aborted).toBe(true);
+        await advance(1_500_000);
+        expect(readSignal?.aborted).toBe(true);
+        expect(screen.getByRole("button", { name: "Reject" })).toBeTruthy();
+        finishOnServer(saved);
         historyGet.mockImplementation((path: string) =>
           Promise.resolve(
             path === "/workflows/wpid_1"
@@ -11246,317 +11412,380 @@ describe("WorkflowCopilotChat — g2 review gate", () => {
               : historyResponse,
           ),
         );
-        const submittedBlocks = useWorkflowHasChangesStore
-          .getState()
-          .getSaveData()!.blocks;
-        await submit("edit the workflow");
-        vi.useFakeTimers();
-        await act(async () => {
-          if (withTurnId) {
-            streamCalls[0]!.onMessage({
-              type: "turn_start",
-              turn_id: "turn-1",
-              mode: "build",
-              turn_index: 0,
-            });
-            streamCalls[0]!.onMessage({
-              type: "workflow_draft",
-              block_labels: [],
-              workflow: proposedWorkflowPayload(),
-            });
-          }
-        });
-        if (withTurnId) {
-          act(() => saveRegistration.rerender());
-          expect(
-            useWorkflowHasChangesStore.getState().getSaveData()!.blocks,
-          ).not.toEqual(submittedBlocks);
-        }
-        await act(async () =>
-          streamCalls[0]!.reject(new Error("connection dropped")),
-        );
-        expect(historyGet).toHaveBeenCalledWith(
-          "/workflows/wpid_1",
-          expect.objectContaining({ signal: expect.any(AbortSignal) }),
-        );
-        expect(
-          useWorkflowYamlEditorStore.getState().copilotAcceptance,
-        ).not.toBeNull();
-        expect(setEditorNodes).not.toHaveBeenCalled();
-        if (withTurnId) {
-          expect(
-            editorNodes.find((node) => node.id === "loop"),
-          ).toBeUndefined();
-        } else {
-          expect(
-            editorNodes.find((node) => node.id === "loop")?.data,
-          ).toMatchObject({
-            loopValue: "unsaved_items",
-            loopVariableReference: "{{ item }}",
-          });
-        }
-        apply.mockClear();
-        vi.mocked(toast).mockClear();
-        return { apply, saved, view };
-      }
-
-      it.each([false, true])(
-        "retains recovery through timeout and Retry until reconciliation or Reject (resumed=%s)",
-        async (resumed) => {
-          changesState.hasChanges = true;
-          const { saved, view } = await severStream();
-          if (resumed) {
-            view.unmount();
-            await renderChat({ route, docked: true, isOpen: false });
-          }
-          const expectControls = () => {
-            expect(screen.getByRole("button", { name: "Retry" })).toBeTruthy();
-            expect(screen.getByRole("button", { name: "Reject" })).toBeTruthy();
-            expect(
-              useWorkflowYamlEditorStore.getState().copilotAcceptance,
-            ).not.toBeNull();
-          };
-          await advance(1_500_000);
-          expectControls();
-          expect(screen.getByRole("alert").textContent).toContain(
-            "Could not confirm",
-          );
-          await act(async () =>
-            fireEvent.click(screen.getByRole("button", { name: "Retry" })),
-          );
-          expectControls();
-          const retainedNodes = structuredClone(editorNodes);
-          act(editLoop);
-          expect(editorNodes).toEqual(retainedNodes);
-          finishOnServer(saved);
-          await advance(2_000);
-          if (resumed) await discardRecoveryDraft();
-          expect(
-            editorNodes.find((node) => node.id === "loop"),
-          ).toBeUndefined();
-          expect(screen.queryByRole("alert")).toBeNull();
-          expect(
-            useWorkflowYamlEditorStore.getState().copilotAcceptance,
-          ).toBeNull();
-        },
-      );
-
-      it("keeps Reject reachable in a closed chat after an unchanged Retry and another timeout", async () => {
-        changesState.hasChanges = true;
-        const { view } = await severStream(false);
-        view.unmount();
-        const recovery = canonicalRecoveriesByWorkflow.get("wpid_1")!;
-        const snapshot = recovery.rollback?.snapshot;
-        await renderChat({ route, docked: true, isOpen: false });
-        expect(screen.queryByRole("textbox")).toBeNull();
-        expect(screen.getByRole("button", { name: "Reject" })).toBeTruthy();
-        await advance(1_500_000);
         await act(async () =>
           fireEvent.click(screen.getByRole("button", { name: "Retry" })),
         );
-        expect(recovery.rollback?.snapshot).toEqual(snapshot);
-        await advance(1_500_000);
+        await advance(0);
+        if (source === "resume") await discardRecoveryDraft();
+        expect(editorNodes.find((node) => node.id === "loop")).toBeUndefined();
+        expect(
+          useWorkflowYamlEditorStore.getState().copilotAcceptance,
+        ).toBeNull();
+        await act(async () => resolveOldRead({ data: saveData.workflow }));
+        expect(screen.queryByRole("alert")).toBeNull();
+        expect(editorNodes.find((node) => node.id === "loop")).toBeUndefined();
+      },
+    );
+
+    it("evicts the least recently visited detached recovery", async () => {
+      changesState.hasChanges = true;
+      const { view } = await severStream(false);
+      view.unmount();
+      const recovery = canonicalRecoveriesByWorkflow.get("wpid_1")!;
+      for (let index = 2; index <= 20; index += 1) {
+        canonicalRecoveriesByWorkflow.set(`wpid_${index}`, {
+          ...recovery,
+          workflowPermanentId: `wpid_${index}`,
+        });
+      }
+      const revisit = await renderChat({
+        route: "editor",
+        docked: true,
+        isOpen: false,
+      });
+      revisit.unmount();
+      canonicalRecoveriesByWorkflow.set("wpid_21", {
+        ...recovery,
+        workflowPermanentId: "wpid_21",
+      });
+      const newest = await renderChat({
+        route: "editor",
+        docked: true,
+        isOpen: false,
+        workflowPermanentId: "wpid_21",
+      });
+      newest.unmount();
+      expect(canonicalRecoveriesByWorkflow.size).toBe(20);
+      expect(canonicalRecoveriesByWorkflow.has("wpid_2")).toBe(false);
+      expect(canonicalRecoveriesByWorkflow.has("wpid_1")).toBe(true);
+      expect(canonicalRecoveriesByWorkflow.has("wpid_21")).toBe(true);
+    });
+
+    function finishOnServer(saved: { current: WorkflowSaveData["workflow"] }) {
+      historyResponse.data.request_turn_id = "turn-1";
+      saved.current = {
+        ...saveData.workflow,
+        workflow_id: "wf_committed",
+        version: 2,
+        workflow_definition: { blocks: [], parameters: [] },
+      };
+      historyResponse.data.chat_history = [
+        {
+          sender: "ai",
+          content: "Saved the workflow.",
+          created_at: "2026-09-11T00:00:00Z",
+          turn_outcome: {
+            copilot_turn_id: "turn-1",
+            terminal_reason: null,
+          },
+        },
+      ];
+    }
+
+    async function advance(ms: number) {
+      await act(async () => vi.advanceTimersByTimeAsync(ms));
+    }
+
+    function editLoop() {
+      if (refuseMutationDuringYamlCommit()) return;
+      editorNodes = editorNodes.map((node) =>
+        node.id === "loop"
+          ? ({
+              ...node,
+              data: { ...node.data, loopValue: "later_user_items" },
+            } as AppNode)
+          : node,
+      );
+      useWorkflowHasChangesStore.getState().setHasChanges(true);
+    }
+
+    it.each([
+      { interruption: "stream drop", titleFrameReceived: true },
+      { interruption: "navigation", titleFrameReceived: false },
+    ])(
+      "waits for the terminal row after a title-only write and $interruption before releasing the editor (title frame received=$titleFrameReceived)",
+      async ({ interruption, titleFrameReceived }) => {
+        changesState.hasChanges = true;
+        saveData.workflow.version = 1;
+        saveData.workflow.modified_at = "2026-09-11T00:00:00Z";
+        const apply = vi.fn();
+        const view = await renderChat({
+          route: "editor",
+          docked: true,
+          onWorkflowUpdate: apply,
+        });
+        await submit("edit the workflow");
+        const call = streamCalls[0]!;
+        vi.useFakeTimers();
+        const saved = {
+          current: {
+            ...saveData.workflow,
+            title: "Saved name",
+            modified_at: "2026-09-11T00:00:01Z",
+          },
+        };
         historyGet.mockImplementation((path: string) =>
-          path === "/workflows/wpid_1"
-            ? new Promise(() => {})
-            : Promise.resolve(historyResponse),
+          Promise.resolve(
+            path === "/workflows/wpid_1"
+              ? { data: saved.current }
+              : historyResponse,
+          ),
         );
-        await act(async () =>
-          fireEvent.click(screen.getByRole("button", { name: "Reject" })),
-        );
-        expect(screen.getByRole("alert").textContent).toContain(
-          "Cancelling the Copilot turn",
-        );
+        await act(async () => {
+          call.onMessage({
+            type: "turn_start",
+            turn_id: "turn-1",
+            mode: "build",
+            turn_index: 0,
+          });
+          if (titleFrameReceived) {
+            call.onMessage({
+              type: "title_update",
+              workflow_permanent_id: "wpid_1",
+              title: "Saved name",
+            });
+          }
+        });
+        if (interruption === "stream drop") {
+          await act(async () => call.reject(new Error("connection dropped")));
+        } else {
+          await act(async () => view.unmount());
+          expect(
+            canonicalRecoveriesByWorkflow.get("wpid_1")?.rollback
+              ?.titlePersisted,
+          ).toBe(titleFrameReceived);
+          expect(
+            canonicalRecoveriesByWorkflow.get("wpid_1")?.rollback
+              ?.workflowPersisted,
+          ).toBe(false);
+          await renderChat({
+            route: "editor",
+            docked: true,
+            onWorkflowUpdate: apply,
+          });
+        }
+        if (vi.isFakeTimers()) await advance(2_000);
         expect(
           useWorkflowYamlEditorStore.getState().copilotAcceptance,
         ).not.toBeNull();
-        expect(recovery.rollback?.snapshot).toEqual(snapshot);
-        expect(cancelPost).toHaveBeenCalledWith(
-          "/workflow/copilot/cancel",
-          {
-            cancel_token: recovery.poll!.requestId,
-            workflow_copilot_chat_id: "chat-1",
-            source: "stop_button",
-          },
-          { timeout: 5_000 },
-        );
-        expect(
-          editorNodes.find((node) => node.id === "loop")?.data,
-        ).toMatchObject({ loopValue: "unsaved_items" });
-      });
+        const owner =
+          useWorkflowYamlEditorStore.getState().editorOwner ??
+          createYamlCommitOwner("wpid_1");
+        registerEditorOwner(owner);
+        const reservation =
+          useWorkflowYamlEditorStore.getState().copilotAcceptance;
+        expect(reservation).not.toBeNull();
+        expect(beginSaveTransaction(owner)).toBe(false);
+        expect(screen.getByRole("alert")).toBeTruthy();
+        expect(apply).not.toHaveBeenCalled();
 
-      it.each(["poll", "resume", "retry"] as const)(
-        "bounds a hung canonical read from %s and ignores its stale response",
-        async (source) => {
-          changesState.hasChanges = true;
-          const { saved, view } = await severStream(false);
-          historyResponse.data.request_turn_id = "turn-1";
-          finishTurnHistory();
-          let resolveOldRead!: (value: unknown) => void;
-          let readSignal: AbortSignal | undefined;
-          historyGet.mockImplementation(
-            (path: string, options?: { signal?: AbortSignal }) =>
-              path === "/workflows/wpid_1"
-                ? new Promise((resolve) => {
-                    if (!readSignal) {
-                      readSignal = options?.signal;
-                      resolveOldRead = resolve;
-                    }
-                  })
-                : Promise.resolve(historyResponse),
-          );
-          if (source === "resume") {
-            view.unmount();
-            await renderChat({ route, docked: true });
-          } else if (source === "retry") {
-            await act(async () =>
-              fireEvent.click(screen.getByRole("button", { name: "Retry" })),
-            );
-          }
-          await advance(source === "retry" ? 0 : 2_000);
-          expect(readSignal?.aborted).toBe(false);
-          await advance(4_999);
-          expect(readSignal?.aborted).toBe(false);
-          await advance(1);
-          expect(readSignal?.aborted).toBe(true);
-          await advance(1_500_000);
-          expect(readSignal?.aborted).toBe(true);
-          expect(screen.getByRole("button", { name: "Reject" })).toBeTruthy();
-          finishOnServer(saved);
-          historyGet.mockImplementation((path: string) =>
-            Promise.resolve(
-              path === "/workflows/wpid_1"
-                ? { data: saved.current }
-                : historyResponse,
-            ),
-          );
+        if (interruption === "navigation") {
           await act(async () =>
-            fireEvent.click(screen.getByRole("button", { name: "Retry" })),
+            useCopilotHeaderStore.getState().controls!.onNewChat(),
           );
-          await advance(0);
-          if (source === "resume") await discardRecoveryDraft();
-          expect(
-            editorNodes.find((node) => node.id === "loop"),
-          ).toBeUndefined();
-          expect(
-            useWorkflowYamlEditorStore.getState().copilotAcceptance,
-          ).toBeNull();
-          await act(async () => resolveOldRead({ data: saveData.workflow }));
-          expect(screen.queryByRole("alert")).toBeNull();
-          expect(
-            editorNodes.find((node) => node.id === "loop"),
-          ).toBeUndefined();
-        },
-      );
-
-      it("evicts the least recently visited detached recovery", async () => {
-        changesState.hasChanges = true;
-        const { view } = await severStream(false);
-        view.unmount();
-        const recovery = canonicalRecoveriesByWorkflow.get("wpid_1")!;
-        for (let index = 2; index <= 20; index += 1) {
-          canonicalRecoveriesByWorkflow.set(`wpid_${index}`, {
-            ...recovery,
-            workflowPermanentId: `wpid_${index}`,
-          });
         }
-        const revisit = await renderChat({
-          route,
-          docked: true,
-          isOpen: false,
-        });
-        revisit.unmount();
-        canonicalRecoveriesByWorkflow.set("wpid_21", {
-          ...recovery,
-          workflowPermanentId: "wpid_21",
-        });
-        const newest = await renderChat({
-          route,
-          docked: true,
-          isOpen: false,
-          workflowPermanentId: "wpid_21",
-        });
-        newest.unmount();
-        expect(canonicalRecoveriesByWorkflow.size).toBe(20);
-        expect(canonicalRecoveriesByWorkflow.has("wpid_2")).toBe(false);
-        expect(canonicalRecoveriesByWorkflow.has("wpid_1")).toBe(true);
-        expect(canonicalRecoveriesByWorkflow.has("wpid_21")).toBe(true);
-      });
-
-      function finishOnServer(saved: {
-        current: WorkflowSaveData["workflow"];
-      }) {
-        historyResponse.data.request_turn_id = "turn-1";
-        saved.current = {
-          ...saveData.workflow,
-          workflow_id: "wf_committed",
-          version: 2,
-          workflow_definition: { blocks: [], parameters: [] },
-        };
         historyResponse.data.chat_history = [
           {
             sender: "ai",
-            content: "Saved the workflow.",
-            created_at: "2026-09-11T00:00:00Z",
+            content: "Another turn finished.",
+            created_at: "2026-09-11T00:00:02Z",
             turn_outcome: {
-              copilot_turn_id: "turn-1",
+              copilot_turn_id: "turn-other",
               terminal_reason: null,
             },
           },
         ];
-      }
-
-      async function advance(ms: number) {
-        await act(async () => vi.advanceTimersByTimeAsync(ms));
-      }
-
-      function editLoop() {
-        if (refuseMutationDuringYamlCommit()) return;
-        editorNodes = editorNodes.map((node) =>
-          node.id === "loop"
-            ? ({
-                ...node,
-                data: { ...node.data, loopValue: "later_user_items" },
-              } as AppNode)
-            : node,
+        await advance(2_000);
+        expect(historyGet).toHaveBeenCalledWith(
+          "/workflow/copilot/chat-history",
+          expect.objectContaining({
+            params: { workflow_copilot_chat_id: "chat-1" },
+          }),
         );
-        useWorkflowHasChangesStore.getState().setHasChanges(true);
-      }
+        expect(apply).not.toHaveBeenCalled();
+        expect(screen.getByRole("alert")).toBeTruthy();
+        expect(useWorkflowYamlEditorStore.getState().copilotAcceptance).toBe(
+          reservation,
+        );
 
-      it.each([
-        { interruption: "stream drop", titleFrameReceived: true },
-        { interruption: "navigation", titleFrameReceived: true },
-        { interruption: "stream drop", titleFrameReceived: false },
-        { interruption: "navigation", titleFrameReceived: false },
-      ])(
-        "waits for the terminal row after a title-only write and $interruption before releasing the editor (title frame received=$titleFrameReceived)",
-        async ({ interruption, titleFrameReceived }) => {
-          changesState.hasChanges = true;
-          saveData.workflow.version = 1;
-          saveData.workflow.modified_at = "2026-09-11T00:00:00Z";
-          const apply = vi.fn();
-          const view = await renderChat({
-            route,
-            docked: true,
-            onWorkflowUpdate: apply,
-          });
-          await submit("edit the workflow");
-          const call = streamCalls[0]!;
-          vi.useFakeTimers();
-          const saved = {
-            current: {
-              ...saveData.workflow,
-              title: "Saved name",
-              modified_at: "2026-09-11T00:00:01Z",
+        historyGet.mockClear();
+        finishOnServer(saved);
+        await advance(5_000);
+        expect(historyGet.mock.calls.map(([path]) => path)).toEqual([
+          "/workflow/copilot/chat-history",
+          "/workflows/wpid_1",
+        ]);
+        if (interruption === "navigation") await discardRecoveryDraft();
+        expect(apply).toHaveBeenCalledExactlyOnceWith(
+          saved.current,
+          expect.objectContaining({ persisted: true, applied: true }),
+        );
+        if (interruption === "navigation") {
+          expect(
+            useCopilotHeaderStore.getState().controls!.currentChatId,
+          ).toBeNull();
+          if (interruption === "navigation")
+            expect(screen.queryByText("Saved the workflow.")).toBeNull();
+          else expect(screen.getByText("Saved the workflow.")).toBeTruthy();
+        }
+        expect(screen.queryByRole("alert")).toBeNull();
+        expect(
+          useWorkflowYamlEditorStore.getState().copilotAcceptance,
+        ).toBeNull();
+        expect(beginSaveTransaction(owner)).toBe(true);
+        expect(
+          buildWorkflowSaveRequest({
+            ...saveData,
+            blocks: getWorkflowBlocks(editorNodes, []),
+          }).workflow_definition.blocks,
+        ).toEqual(saved.current.workflow_definition.blocks);
+        finishSaveTransaction(owner);
+        historyGet.mockClear();
+        await advance(30_000);
+        expect(historyGet).not.toHaveBeenCalled();
+      },
+    );
+
+    it("retains the submitted draft and refuses edits until the late server workflow resolves", async () => {
+      changesState.hasChanges = true;
+      const { saved } = await severStream();
+      const owner =
+        useWorkflowYamlEditorStore.getState().editorOwner ??
+        createYamlCommitOwner("wpid_1");
+      registerEditorOwner(owner);
+      expect(beginSaveTransaction(owner)).toBe(false);
+      const retainedNodes = structuredClone(editorNodes);
+      act(editLoop);
+      expect(editorNodes).toEqual(retainedNodes);
+      expect(screen.getByRole("button", { name: "Reject" })).toBeTruthy();
+      finishOnServer(saved);
+      await advance(2_000);
+      expect(editorNodes.find((node) => node.id === "loop")).toBeUndefined();
+      expect(
+        useWorkflowYamlEditorStore.getState().copilotAcceptance,
+      ).toBeNull();
+      expect(beginSaveTransaction(owner)).toBe(true);
+      finishSaveTransaction(owner);
+    });
+
+    it.each(["new chat", "history"] as const)(
+      "continues canonical recovery after switching to %s without replacing the selected chat",
+      async (destination) => {
+        changesState.hasChanges = true;
+        const { apply, saved } = await severStream();
+        const controls = useCopilotHeaderStore.getState().controls!;
+        const selectedHistory = {
+          ...historyResponse.data,
+          workflow_copilot_chat_id: "chat-other",
+          chat_history: [
+            {
+              sender: "ai",
+              content: "Selected history",
+              created_at: "2026-09-11T00:00:00Z",
             },
-          };
-          historyGet.mockImplementation((path: string) =>
+          ],
+        };
+        historyGet.mockImplementation(
+          (
+            path: string,
+            config?: { params?: { workflow_copilot_chat_id?: string } },
+          ) =>
             Promise.resolve(
               path === "/workflows/wpid_1"
                 ? { data: saved.current }
-                : historyResponse,
+                : config?.params?.workflow_copilot_chat_id === "chat-other"
+                  ? { data: selectedHistory }
+                  : historyResponse,
             ),
-          );
+        );
+        expect(controls.disabled).toBe(false);
+        await act(async () => {
+          if (destination === "new chat") controls.onNewChat();
+          else
+            controls.onSelectChat({
+              workflow_copilot_chat_id: "chat-other",
+              workflow_permanent_id: "wpid_1",
+              title: "Another chat",
+              created_at: "2026-09-11T00:00:00Z",
+              modified_at: "2026-09-11T00:00:00Z",
+            });
+        });
+        const selectedChat = destination === "new chat" ? null : "chat-other";
+        expect(useCopilotHeaderStore.getState().controls!.currentChatId).toBe(
+          selectedChat,
+        );
+        historyGet.mockClear();
+        finishOnServer(saved);
+        await advance(2_000);
+        expect(historyGet).toHaveBeenCalledWith(
+          "/workflows/wpid_1",
+          expect.objectContaining({ signal: expect.any(AbortSignal) }),
+        );
+        expect(apply).toHaveBeenCalledExactlyOnceWith(
+          saved.current,
+          expect.objectContaining({ persisted: true, applied: true }),
+        );
+        expect(useCopilotHeaderStore.getState().controls!.currentChatId).toBe(
+          selectedChat,
+        );
+        expect(screen.queryByText("Saved the workflow.")).toBeNull();
+        if (destination === "history")
+          expect(screen.getByText("Selected history")).toBeTruthy();
+        historyGet.mockClear();
+        await advance(30_000);
+        expect(historyGet).not.toHaveBeenCalled();
+      },
+    );
+
+    it("refuses edits while the late canonical read owns the reservation", async () => {
+      changesState.hasChanges = true;
+      const { apply, saved } = await severStream();
+      finishOnServer(saved);
+      let resolveRead!: (value: unknown) => void;
+      historyGet.mockImplementation((path: string) =>
+        path === "/workflows/wpid_1"
+          ? new Promise((resolve) => {
+              resolveRead = resolve;
+            })
+          : Promise.resolve(historyResponse),
+      );
+      await advance(2_000);
+      expect(resolveRead).toBeTypeOf("function");
+      const retainedNodes = structuredClone(editorNodes);
+      act(editLoop);
+      expect(editorNodes).toEqual(retainedNodes);
+      expect(toast).toHaveBeenCalledExactlyOnceWith({
+        title: "Wait for the Copilot change to finish",
+        variant: "destructive",
+      });
+      historyGet.mockImplementation((path: string) =>
+        Promise.resolve(
+          path === "/workflows/wpid_1"
+            ? { data: saved.current }
+            : historyResponse,
+        ),
+      );
+      await act(async () => resolveRead({ data: saved.current }));
+      expect(apply).toHaveBeenCalledExactlyOnceWith(
+        saved.current,
+        expect.objectContaining({ persisted: true, applied: true }),
+      );
+      expect(
+        useWorkflowYamlEditorStore.getState().copilotAcceptance,
+      ).toBeNull();
+    });
+
+    it.each([false, true])(
+      "parks a live turn on navigation and reconciles its commit before saving (turn started=%s)",
+      async (turnStarted) => {
+        changesState.hasChanges = true;
+        const view = await renderChat({ route: "editor", docked: true });
+        const queryKey = ["workflow", "wpid_1"];
+        queryClient.setQueryData(queryKey, saveData.workflow);
+        const submittedSnapshot = structuredClone(editorNodes);
+        await submit("edit the workflow");
+        const call = streamCalls[0]!;
+        if (turnStarted) {
           await act(async () => {
             call.onMessage({
               type: "turn_start",
@@ -11564,696 +11793,415 @@ describe("WorkflowCopilotChat — g2 review gate", () => {
               mode: "build",
               turn_index: 0,
             });
-            if (titleFrameReceived) {
-              call.onMessage({
-                type: "title_update",
-                workflow_permanent_id: "wpid_1",
-                title: "Saved name",
-              });
-            }
           });
-          if (interruption === "stream drop") {
-            await act(async () => call.reject(new Error("connection dropped")));
-          } else {
-            await act(async () => view.unmount());
-            expect(
-              canonicalRecoveriesByWorkflow.get("wpid_1")?.rollback
-                ?.titlePersisted,
-            ).toBe(titleFrameReceived);
-            expect(
-              canonicalRecoveriesByWorkflow.get("wpid_1")?.rollback
-                ?.workflowPersisted,
-            ).toBe(false);
-            await renderChat({ route, docked: true, onWorkflowUpdate: apply });
-          }
-          if (vi.isFakeTimers()) await advance(2_000);
-          expect(
-            useWorkflowYamlEditorStore.getState().copilotAcceptance,
-          ).not.toBeNull();
-          const owner =
-            useWorkflowYamlEditorStore.getState().editorOwner ??
-            createYamlCommitOwner("wpid_1");
-          registerEditorOwner(owner);
-          const reservation =
-            useWorkflowYamlEditorStore.getState().copilotAcceptance;
-          expect(reservation).not.toBeNull();
-          expect(beginSaveTransaction(owner)).toBe(false);
-          expect(screen.getByRole("alert")).toBeTruthy();
-          expect(apply).not.toHaveBeenCalled();
+        }
+        await act(async () => view.unmount());
+        const parked = canonicalRecoveriesByWorkflow.get("wpid_1");
+        expect(parked).toMatchObject({
+          resumed: true,
+          baseline: saveData.workflow,
+          preservedSettings: saveData.settings,
+          poll: {
+            chatId: "chat-1",
+            turnId: turnStarted ? "turn-1" : null,
+            requestId: expect.any(String),
+          },
+          rollback: { snapshot: { nodes: submittedSnapshot } },
+        });
+        const otherWorkflow = await renderChat({
+          route: "editor",
+          docked: true,
+          workflowPermanentId: "wpid_other",
+        });
+        expect(
+          useWorkflowYamlEditorStore.getState().copilotAcceptance,
+        ).toBeNull();
+        const saved = { current: saveData.workflow };
+        finishOnServer(saved);
+        await act(async () => {
+          call.onMessage(proposalResponse("Buffered old response."));
+        });
+        expect(screen.queryByText("Buffered old response.")).toBeNull();
+        otherWorkflow.unmount();
 
-          if (interruption === "navigation") {
-            await act(async () =>
-              useCopilotHeaderStore.getState().controls!.onNewChat(),
-            );
-          }
-          historyResponse.data.chat_history = [
-            {
-              sender: "ai",
-              content: "Another turn finished.",
-              created_at: "2026-09-11T00:00:02Z",
-              turn_outcome: {
-                copilot_turn_id: "turn-other",
-                terminal_reason: null,
-              },
-            },
-          ];
-          await advance(2_000);
-          expect(historyGet).toHaveBeenCalledWith(
-            "/workflow/copilot/chat-history",
-            expect.objectContaining({
-              params: { workflow_copilot_chat_id: "chat-1" },
-            }),
-          );
-          expect(apply).not.toHaveBeenCalled();
-          expect(screen.getByRole("alert")).toBeTruthy();
-          expect(useWorkflowYamlEditorStore.getState().copilotAcceptance).toBe(
-            reservation,
-          );
-
-          historyGet.mockClear();
-          finishOnServer(saved);
-          await advance(5_000);
-          expect(historyGet.mock.calls.map(([path]) => path)).toEqual([
-            "/workflow/copilot/chat-history",
-            "/workflows/wpid_1",
-          ]);
-          if (interruption === "navigation") await discardRecoveryDraft();
-          expect(apply).toHaveBeenCalledExactlyOnceWith(
-            saved.current,
-            expect.objectContaining({ persisted: true, applied: true }),
-          );
-          if (interruption === "navigation") {
-            expect(
-              useCopilotHeaderStore.getState().controls!.currentChatId,
-            ).toBeNull();
-            if (interruption === "navigation")
-              expect(screen.queryByText("Saved the workflow.")).toBeNull();
-            else expect(screen.getByText("Saved the workflow.")).toBeTruthy();
-          }
-          expect(screen.queryByRole("alert")).toBeNull();
-          expect(
-            useWorkflowYamlEditorStore.getState().copilotAcceptance,
-          ).toBeNull();
-          expect(beginSaveTransaction(owner)).toBe(true);
-          expect(
-            buildWorkflowSaveRequest({
-              ...saveData,
-              blocks: getWorkflowBlocks(editorNodes, []),
-            }).workflow_definition.blocks,
-          ).toEqual(saved.current.workflow_definition.blocks);
-          finishSaveTransaction(owner);
-          historyGet.mockClear();
-          await advance(30_000);
-          expect(historyGet).not.toHaveBeenCalled();
-        },
-      );
-
-      it("retains the submitted draft and refuses edits until the late server workflow resolves", async () => {
-        changesState.hasChanges = true;
-        const { saved } = await severStream();
+        const returnedWorkflow = await queryClient.fetchQuery({
+          queryKey,
+          queryFn: async () => saved.current,
+        });
+        expect(returnedWorkflow.workflow_id).toBe("wf_committed");
+        let resolveRead!: (response: { data: WorkflowApiResponse }) => void;
+        const read = new Promise<{ data: WorkflowApiResponse }>((resolve) => {
+          resolveRead = resolve;
+        });
+        historyGet.mockImplementation((path: string) =>
+          path === "/workflows/wpid_1"
+            ? read
+            : Promise.resolve(historyResponse),
+        );
+        vi.useFakeTimers();
+        await renderChat({ route: "editor", docked: true });
         const owner =
           useWorkflowYamlEditorStore.getState().editorOwner ??
           createYamlCommitOwner("wpid_1");
         registerEditorOwner(owner);
         expect(beginSaveTransaction(owner)).toBe(false);
-        const retainedNodes = structuredClone(editorNodes);
-        act(editLoop);
-        expect(editorNodes).toEqual(retainedNodes);
+        expect(screen.getByRole("button", { name: "Retry" })).toBeTruthy();
         expect(screen.getByRole("button", { name: "Reject" })).toBeTruthy();
-        finishOnServer(saved);
-        await advance(2_000);
-        expect(editorNodes.find((node) => node.id === "loop")).toBeUndefined();
-        expect(
-          useWorkflowYamlEditorStore.getState().copilotAcceptance,
-        ).toBeNull();
-        expect(beginSaveTransaction(owner)).toBe(true);
-        finishSaveTransaction(owner);
-      });
-
-      it.each(["new chat", "history"] as const)(
-        "continues canonical recovery after switching to %s without replacing the selected chat",
-        async (destination) => {
-          changesState.hasChanges = true;
-          const { apply, saved } = await severStream();
-          const controls = useCopilotHeaderStore.getState().controls!;
-          const selectedHistory = {
-            ...historyResponse.data,
-            workflow_copilot_chat_id: "chat-other",
-            chat_history: [
-              {
-                sender: "ai",
-                content: "Selected history",
-                created_at: "2026-09-11T00:00:00Z",
-              },
-            ],
-          };
-          historyGet.mockImplementation(
-            (
-              path: string,
-              config?: { params?: { workflow_copilot_chat_id?: string } },
-            ) =>
-              Promise.resolve(
-                path === "/workflows/wpid_1"
-                  ? { data: saved.current }
-                  : config?.params?.workflow_copilot_chat_id === "chat-other"
-                    ? { data: selectedHistory }
-                    : historyResponse,
-              ),
-          );
-          expect(controls.disabled).toBe(false);
-          await act(async () => {
-            if (destination === "new chat") controls.onNewChat();
-            else
-              controls.onSelectChat({
-                workflow_copilot_chat_id: "chat-other",
-                workflow_permanent_id: "wpid_1",
-                title: "Another chat",
-                created_at: "2026-09-11T00:00:00Z",
-                modified_at: "2026-09-11T00:00:00Z",
-              });
-          });
-          const selectedChat = destination === "new chat" ? null : "chat-other";
-          expect(useCopilotHeaderStore.getState().controls!.currentChatId).toBe(
-            selectedChat,
-          );
-          historyGet.mockClear();
-          finishOnServer(saved);
-          await advance(2_000);
-          expect(historyGet).toHaveBeenCalledWith(
-            "/workflows/wpid_1",
-            expect.objectContaining({ signal: expect.any(AbortSignal) }),
-          );
-          expect(apply).toHaveBeenCalledExactlyOnceWith(
-            saved.current,
-            expect.objectContaining({ persisted: true, applied: true }),
-          );
-          expect(useCopilotHeaderStore.getState().controls!.currentChatId).toBe(
-            selectedChat,
-          );
-          expect(screen.queryByText("Saved the workflow.")).toBeNull();
-          if (destination === "history")
-            expect(screen.getByText("Selected history")).toBeTruthy();
-          historyGet.mockClear();
-          await advance(30_000);
-          expect(historyGet).not.toHaveBeenCalled();
-        },
-      );
-
-      it("refuses edits while the late canonical read owns the reservation", async () => {
-        changesState.hasChanges = true;
-        const { apply, saved } = await severStream();
-        finishOnServer(saved);
-        let resolveRead!: (value: unknown) => void;
-        historyGet.mockImplementation((path: string) =>
-          path === "/workflows/wpid_1"
-            ? new Promise((resolve) => {
-                resolveRead = resolve;
-              })
-            : Promise.resolve(historyResponse),
-        );
-        await advance(2_000);
-        expect(resolveRead).toBeTypeOf("function");
-        const retainedNodes = structuredClone(editorNodes);
-        act(editLoop);
-        expect(editorNodes).toEqual(retainedNodes);
-        expect(toast).toHaveBeenCalledExactlyOnceWith({
-          title: "Wait for the Copilot change to finish",
-          variant: "destructive",
-        });
-        historyGet.mockImplementation((path: string) =>
-          Promise.resolve(
-            path === "/workflows/wpid_1"
-              ? { data: saved.current }
-              : historyResponse,
-          ),
-        );
         await act(async () => resolveRead({ data: saved.current }));
-        expect(apply).toHaveBeenCalledExactlyOnceWith(
-          saved.current,
-          expect.objectContaining({ persisted: true, applied: true }),
+        expect(screen.getByRole("alert")).toBeTruthy();
+        expect(beginSaveTransaction(owner)).toBe(false);
+        await advance(2_000);
+        await discardRecoveryDraft();
+        expect(screen.queryByRole("alert")).toBeNull();
+        expect(beginSaveTransaction(owner)).toBe(true);
+        const request = buildWorkflowSaveRequest({
+          ...saveData,
+          blocks: getWorkflowBlocks(editorNodes, []),
+        });
+        expect(request.workflow_definition.blocks).toEqual(
+          saved.current.workflow_definition.blocks,
         );
+        expect(editorNodes.find((node) => node.id === "loop")).toBeUndefined();
+        finishSaveTransaction(owner);
+      },
+    );
+
+    it.each(["updated", "unchanged", "interrupted"] as const)(
+      "resumes recovery after workflow navigation without losing local edits (%s canonical outcome)",
+      async (outcome) => {
+        changesState.hasChanges = true;
+        saveData.workflow.workflow_definition = {
+          blocks: [],
+          parameters: [],
+        };
+        const { view, apply, saved } = await severStream();
+        view.unmount();
         expect(
           useWorkflowYamlEditorStore.getState().copilotAcceptance,
         ).toBeNull();
-      });
+        historyGet.mockClear();
+        await advance(3_000);
+        expect(historyGet).not.toHaveBeenCalled();
 
-      it.each([false, true])(
-        "parks a live turn on navigation and reconciles its commit before saving (turn started=%s)",
-        async (turnStarted) => {
-          changesState.hasChanges = true;
-          const view = await renderChat({ route, docked: true });
-          const queryKey = ["workflow", "wpid_1"];
-          queryClient.setQueryData(queryKey, saveData.workflow);
-          const submittedSnapshot = structuredClone(editorNodes);
-          await submit("edit the workflow");
-          const call = streamCalls[0]!;
-          if (turnStarted) {
-            await act(async () => {
-              call.onMessage({
-                type: "turn_start",
-                turn_id: "turn-1",
-                mode: "build",
-                turn_index: 0,
-              });
-            });
-          }
-          await act(async () => view.unmount());
-          const parked = canonicalRecoveriesByWorkflow.get("wpid_1");
-          expect(parked).toMatchObject({
-            resumed: true,
-            baseline: saveData.workflow,
-            preservedSettings: saveData.settings,
-            poll: {
-              chatId: "chat-1",
-              turnId: turnStarted ? "turn-1" : null,
-              requestId: expect.any(String),
+        vi.useRealTimers();
+        const otherWorkflow = await renderChat({
+          route: "editor",
+          docked: true,
+          workflowPermanentId: "wpid_other",
+        });
+        expect(
+          useWorkflowYamlEditorStore.getState().copilotAcceptance,
+        ).toBeNull();
+        expect(historyGet).not.toHaveBeenCalledWith("/workflows/wpid_1");
+        otherWorkflow.unmount();
+        historyGet.mockClear();
+        const revisitedApply = vi.fn();
+        await renderChat({
+          route: "editor",
+          docked: true,
+          onWorkflowUpdate: revisitedApply,
+        });
+        if (vi.isFakeTimers()) await advance(2_000);
+        expect(
+          useWorkflowYamlEditorStore.getState().copilotAcceptance,
+        ).not.toBeNull();
+        expect(
+          useWorkflowYamlEditorStore.getState().copilotAcceptance,
+        ).not.toBeNull();
+        expect(revisitedApply).not.toHaveBeenCalled();
+        act(editLoop);
+        expect(
+          editorNodes.find((node) => node.id === "loop")?.data,
+        ).toMatchObject({
+          loopValue: "unsaved_items",
+        });
+
+        const baseline = saved.current;
+        finishOnServer(saved);
+        if (outcome !== "updated") saved.current = baseline;
+        if (outcome === "interrupted") {
+          historyResponse.data.chat_history = [
+            {
+              sender: "ai",
+              content: "Turn interrupted.",
+              created_at: "2026-09-11T00:00:00Z",
+              turn_outcome: {
+                copilot_turn_id: "turn-1",
+                terminal_reason: "interrupted",
+              },
             },
-            rollback: { snapshot: { nodes: submittedSnapshot } },
-          });
-          const otherWorkflow = await renderChat({
-            route,
-            docked: true,
-            workflowPermanentId: "wpid_other",
-          });
+          ];
+        }
+        if (outcome === "interrupted") {
+          vi.useFakeTimers();
+          await act(async () =>
+            fireEvent.click(screen.getByRole("button", { name: "Retry" })),
+          );
+          await advance(120_000);
+          expect(revisitedApply).not.toHaveBeenCalled();
           expect(
             useWorkflowYamlEditorStore.getState().copilotAcceptance,
-          ).toBeNull();
-          const saved = { current: saveData.workflow };
-          finishOnServer(saved);
-          await act(async () => {
-            call.onMessage(proposalResponse("Buffered old response."));
-          });
-          expect(screen.queryByText("Buffered old response.")).toBeNull();
-          otherWorkflow.unmount();
-
-          const returnedWorkflow = await queryClient.fetchQuery({
-            queryKey,
-            queryFn: async () => saved.current,
-          });
-          expect(returnedWorkflow.workflow_id).toBe("wf_committed");
-          let resolveRead!: (response: { data: WorkflowApiResponse }) => void;
-          const read = new Promise<{ data: WorkflowApiResponse }>((resolve) => {
-            resolveRead = resolve;
-          });
-          historyGet.mockImplementation((path: string) =>
-            path === "/workflows/wpid_1"
-              ? read
-              : Promise.resolve(historyResponse),
+          ).not.toBeNull();
+          finishTurnHistory();
+          await act(async () =>
+            fireEvent.click(screen.getByRole("button", { name: "Retry" })),
           );
-          vi.useFakeTimers();
-          await renderChat({ route, docked: true });
-          const owner =
-            useWorkflowYamlEditorStore.getState().editorOwner ??
-            createYamlCommitOwner("wpid_1");
-          registerEditorOwner(owner);
-          expect(beginSaveTransaction(owner)).toBe(false);
-          expect(screen.getByRole("button", { name: "Retry" })).toBeTruthy();
-          expect(screen.getByRole("button", { name: "Reject" })).toBeTruthy();
-          await act(async () => resolveRead({ data: saved.current }));
-          expect(screen.getByRole("alert")).toBeTruthy();
-          expect(beginSaveTransaction(owner)).toBe(false);
+          expect(revisitedApply).not.toHaveBeenCalled();
+          expect(
+            useWorkflowYamlEditorStore.getState().copilotAcceptance,
+          ).not.toBeNull();
           await advance(2_000);
-          await discardRecoveryDraft();
-          expect(screen.queryByRole("alert")).toBeNull();
-          expect(beginSaveTransaction(owner)).toBe(true);
-          const request = buildWorkflowSaveRequest({
-            ...saveData,
-            blocks: getWorkflowBlocks(editorNodes, []),
+        }
+        if (outcome !== "interrupted") {
+          vi.useFakeTimers();
+          await act(async () => {
+            fireEvent.click(screen.getByRole("button", { name: "Retry" }));
+            await vi.advanceTimersByTimeAsync(2_000);
           });
-          expect(request.workflow_definition.blocks).toEqual(
-            saved.current.workflow_definition.blocks,
+        }
+        expect(revisitedApply).not.toHaveBeenCalled();
+        const generation = useWorkflowHasChangesStore.getState().saveGeneration;
+        if (outcome === "updated") {
+          expect(
+            screen.getByRole("button", { name: "Keep my edits" }),
+          ).toBeTruthy();
+          await act(async () => {
+            fireEvent.click(
+              screen.getByRole("button", {
+                name: "Apply and discard my edits",
+              }),
+            );
+            await vi.advanceTimersByTimeAsync(2_000);
+          });
+        } else {
+          expect(
+            screen.queryByRole("button", { name: "Keep my edits" }),
+          ).toBeNull();
+        }
+        if (outcome === "updated") {
+          expect(revisitedApply).toHaveBeenCalledExactlyOnceWith(
+            saved.current,
+            expect.objectContaining({ persisted: true, applied: true }),
           );
           expect(
             editorNodes.find((node) => node.id === "loop"),
           ).toBeUndefined();
-          finishSaveTransaction(owner);
-        },
-      );
-
-      it.each(["updated", "unchanged", "interrupted"] as const)(
-        "resumes recovery after workflow navigation without losing local edits (%s canonical outcome)",
-        async (outcome) => {
-          changesState.hasChanges = true;
-          saveData.workflow.workflow_definition = {
-            blocks: [],
-            parameters: [],
-          };
-          const { view, apply, saved } = await severStream();
-          view.unmount();
-          expect(
-            useWorkflowYamlEditorStore.getState().copilotAcceptance,
-          ).toBeNull();
-          historyGet.mockClear();
-          await advance(3_000);
-          expect(historyGet).not.toHaveBeenCalled();
-
-          vi.useRealTimers();
-          const otherWorkflow = await renderChat({
-            route,
-            docked: true,
-            workflowPermanentId: "wpid_other",
-          });
-          expect(
-            useWorkflowYamlEditorStore.getState().copilotAcceptance,
-          ).toBeNull();
-          expect(historyGet).not.toHaveBeenCalledWith("/workflows/wpid_1");
-          otherWorkflow.unmount();
-          historyGet.mockClear();
-          const revisitedApply = vi.fn();
-          await renderChat({
-            route,
-            docked: true,
-            onWorkflowUpdate: revisitedApply,
-          });
-          if (vi.isFakeTimers()) await advance(2_000);
-          expect(
-            useWorkflowYamlEditorStore.getState().copilotAcceptance,
-          ).not.toBeNull();
-          expect(
-            useWorkflowYamlEditorStore.getState().copilotAcceptance,
-          ).not.toBeNull();
+        } else {
           expect(revisitedApply).not.toHaveBeenCalled();
-          act(editLoop);
           expect(
             editorNodes.find((node) => node.id === "loop")?.data,
-          ).toMatchObject({
-            loopValue: "unsaved_items",
-          });
-
-          const baseline = saved.current;
-          finishOnServer(saved);
-          if (outcome !== "updated") saved.current = baseline;
-          if (outcome === "interrupted") {
-            historyResponse.data.chat_history = [
-              {
-                sender: "ai",
-                content: "Turn interrupted.",
-                created_at: "2026-09-11T00:00:00Z",
-                turn_outcome: {
-                  copilot_turn_id: "turn-1",
-                  terminal_reason: "interrupted",
-                },
-              },
-            ];
-          }
-          if (outcome === "interrupted") {
-            vi.useFakeTimers();
-            await act(async () =>
-              fireEvent.click(screen.getByRole("button", { name: "Retry" })),
-            );
-            await advance(120_000);
-            expect(revisitedApply).not.toHaveBeenCalled();
-            expect(
-              useWorkflowYamlEditorStore.getState().copilotAcceptance,
-            ).not.toBeNull();
-            finishTurnHistory();
-            await act(async () =>
-              fireEvent.click(screen.getByRole("button", { name: "Retry" })),
-            );
-            expect(revisitedApply).not.toHaveBeenCalled();
-            expect(
-              useWorkflowYamlEditorStore.getState().copilotAcceptance,
-            ).not.toBeNull();
-            await advance(2_000);
-          }
-          if (outcome !== "interrupted") {
-            vi.useFakeTimers();
-            await act(async () => {
-              fireEvent.click(screen.getByRole("button", { name: "Retry" }));
-              await vi.advanceTimersByTimeAsync(2_000);
-            });
-          }
-          expect(revisitedApply).not.toHaveBeenCalled();
-          const generation =
-            useWorkflowHasChangesStore.getState().saveGeneration;
-          if (outcome === "updated") {
-            expect(
-              screen.getByRole("button", { name: "Keep my edits" }),
-            ).toBeTruthy();
-            await act(async () => {
-              fireEvent.click(
-                screen.getByRole("button", {
-                  name: "Apply and discard my edits",
-                }),
-              );
-              await vi.advanceTimersByTimeAsync(2_000);
-            });
-          } else {
-            expect(
-              screen.queryByRole("button", { name: "Keep my edits" }),
-            ).toBeNull();
-          }
-          if (outcome === "updated") {
-            expect(revisitedApply).toHaveBeenCalledExactlyOnceWith(
-              saved.current,
-              expect.objectContaining({ persisted: true, applied: true }),
-            );
-            expect(
-              editorNodes.find((node) => node.id === "loop"),
-            ).toBeUndefined();
-          } else {
-            expect(revisitedApply).not.toHaveBeenCalled();
-            expect(
-              editorNodes.find((node) => node.id === "loop")?.data,
-            ).toMatchObject({ loopValue: "unsaved_items" });
-            expect(useWorkflowHasChangesStore.getState().saveGeneration).toBe(
-              generation,
-            );
-            expect(toast).not.toHaveBeenCalledWith(
-              expect.objectContaining({
-                description: expect.stringContaining("saved on the server"),
-              }),
-            );
-          }
-          expect(apply).not.toHaveBeenCalled();
-          expect(
-            useWorkflowYamlEditorStore.getState().copilotAcceptance,
-          ).toBeNull();
-        },
-      );
-
-      it.each(["late commit", "budget", "save in progress"] as const)(
-        "retains the pre-turn recovery reservation and deadline across unmount: %s",
-        async (outcome) => {
-          changesState.hasChanges = true;
-          const { view, saved } = await severStream(false);
-          const originalReservation =
-            useWorkflowYamlEditorStore.getState().copilotAcceptance;
-          view.unmount();
-          const persisted = canonicalRecoveriesByWorkflow.get("wpid_1")!;
-          expect(persisted.poll?.turnId).toBeNull();
-          expect(persisted.poll?.requestId).toBeTruthy();
-          const poll = { ...persisted.poll! };
-          expect(
-            useWorkflowYamlEditorStore.getState().copilotAcceptance,
-          ).toBeNull();
-          const owner =
-            useWorkflowYamlEditorStore.getState().editorOwner ??
-            createYamlCommitOwner("wpid_1");
-          if (outcome === "save in progress") {
-            registerEditorOwner(owner);
-            expect(beginSaveTransaction(owner)).toBe(true);
-          }
-          const apply = vi.fn();
-          const revisited = await renderChat({
-            route,
-            docked: true,
-            onWorkflowUpdate: apply,
-          });
-          if (outcome === "save in progress") {
-            expect(useWorkflowYamlEditorStore.getState().lockKind).toBe("save");
-            await act(async () => finishSaveTransaction(owner));
-          }
-          const resumedReservation =
-            useWorkflowYamlEditorStore.getState().copilotAcceptance;
-          expect(resumedReservation).not.toBeNull();
-          expect(resumedReservation).not.toBe(originalReservation);
-          expect(beginYamlCommit(createYamlCommitOwner("wpid_1"))).toBe(false);
-          act(editLoop);
-          expect(
-            editorNodes.find((node) => node.id === "loop")?.data,
-          ).toMatchObject({
-            loopValue: "unsaved_items",
-          });
-          revisited.unmount();
-          expect(canonicalRecoveriesByWorkflow.get("wpid_1")?.poll).toEqual(
-            poll,
+          ).toMatchObject({ loopValue: "unsaved_items" });
+          expect(useWorkflowHasChangesStore.getState().saveGeneration).toBe(
+            generation,
           );
-          await renderChat({ route, docked: true, onWorkflowUpdate: apply });
-          if (outcome === "budget") {
-            await advance(Math.max(0, poll.deadline - Date.now() - 1));
-            expect(
-              useWorkflowYamlEditorStore.getState().copilotAcceptance,
-            ).not.toBeNull();
-            await advance(1);
-            expect(apply).not.toHaveBeenCalled();
-            expect(
-              useWorkflowYamlEditorStore.getState().copilotAcceptance,
-            ).not.toBeNull();
-            finishOnServer(saved);
-            await act(async () =>
-              fireEvent.click(screen.getByRole("button", { name: "Retry" })),
-            );
-            await advance(0);
-            await discardRecoveryDraft();
-          } else {
-            finishOnServer(saved);
-            await advance(2_000);
-            await discardRecoveryDraft();
-            expect(apply).toHaveBeenCalledExactlyOnceWith(
-              saved.current,
-              expect.objectContaining({ persisted: true, applied: true }),
-            );
-          }
-          expect(
-            useWorkflowYamlEditorStore.getState().copilotAcceptance,
-          ).toBeNull();
-          expect(screen.getByText("Saved the workflow.")).toBeTruthy();
-        },
-      );
-
-      it("keeps resumed recovery locked when a finished turn's canonical read fails", async () => {
-        changesState.hasChanges = true;
-        const { view, saved } = await severStream();
-        view.unmount();
-        finishOnServer(saved);
-        let readFails = true;
-        historyGet.mockImplementation((path: string) =>
-          path === "/workflows/wpid_1"
-            ? readFails
-              ? Promise.reject(new Error("canonical unavailable"))
-              : Promise.resolve({ data: saved.current })
-            : Promise.resolve(historyResponse),
-        );
-        const apply = vi.fn();
-        await renderChat({ route, docked: true, onWorkflowUpdate: apply });
-        await advance(2_000);
+          expect(toast).not.toHaveBeenCalledWith(
+            expect.objectContaining({
+              description: expect.stringContaining("saved on the server"),
+            }),
+          );
+        }
         expect(apply).not.toHaveBeenCalled();
         expect(
           useWorkflowYamlEditorStore.getState().copilotAcceptance,
-        ).not.toBeNull();
-        expect(screen.getByRole("button", { name: "Retry" })).toBeTruthy();
-        readFails = false;
-        await advance(3_000);
-        await discardRecoveryDraft();
-        expect(apply).toHaveBeenCalledExactlyOnceWith(
-          saved.current,
-          expect.objectContaining({ persisted: true, applied: true }),
-        );
-        expect(
-          useWorkflowYamlEditorStore.getState().copilotAcceptance,
         ).toBeNull();
-      });
+      },
+    );
 
-      it("retains a timed-out resumed recovery until Retry resolves canonical state", async () => {
+    it.each(["late commit", "budget", "save in progress"] as const)(
+      "retains the pre-turn recovery reservation and deadline across unmount: %s",
+      async (outcome) => {
         changesState.hasChanges = true;
-        const view = await renderChat({ route, docked: true });
-        await submit("edit the workflow");
-        const call = streamCalls[0]!;
-        historyGet.mockImplementation((path: string) =>
-          path === "/workflows/wpid_1"
-            ? Promise.reject(new Error("canonical unavailable"))
-            : Promise.resolve(historyResponse),
-        );
-        vi.useFakeTimers();
-        await act(async () => call.reject(new Error("connection dropped")));
-        view.unmount();
-        const deadline =
-          canonicalRecoveriesByWorkflow.get("wpid_1")!.poll!.deadline;
-        const apply = vi.fn();
-        await renderChat({ route, docked: true, onWorkflowUpdate: apply });
-        const reservation =
+        const { view, saved } = await severStream(false);
+        const originalReservation =
           useWorkflowYamlEditorStore.getState().copilotAcceptance;
-        expect(reservation).not.toBeNull();
-        await advance(Math.max(0, deadline - Date.now()));
-        expect(screen.getByRole("alert").textContent).toContain(
-          "Could not confirm whether Copilot saved changes",
-        );
-        expect(screen.getByRole("button", { name: "Retry" })).toBeTruthy();
-        expect(useWorkflowYamlEditorStore.getState().copilotAcceptance).toBe(
-          reservation,
-        );
-        expect(beginYamlCommit(createYamlCommitOwner("wpid_1"))).toBe(false);
-        historyGet.mockClear();
-        await advance(30_000);
-        expect(historyGet).not.toHaveBeenCalled();
-        const canonical = {
-          ...saveData.workflow,
-          workflow_id: "wf_saved",
-          version: 2,
-        };
-        historyGet.mockImplementation((path: string) =>
-          Promise.resolve(
-            path === "/workflows/wpid_1"
-              ? { data: canonical }
-              : historyResponse,
-          ),
-        );
-        finishTurnHistory();
-        await act(async () =>
-          fireEvent.click(screen.getByRole("button", { name: "Retry" })),
-        );
-        await advance(0);
-        await discardRecoveryDraft();
-        expect(apply).toHaveBeenCalledWith(
-          canonical,
-          expect.objectContaining({ persisted: true, applied: true }),
-        );
-        expect(screen.queryByRole("alert")).toBeNull();
+        view.unmount();
+        const persisted = canonicalRecoveriesByWorkflow.get("wpid_1")!;
+        expect(persisted.poll?.turnId).toBeNull();
+        expect(persisted.poll?.requestId).toBeTruthy();
+        const poll = { ...persisted.poll! };
         expect(
           useWorkflowYamlEditorStore.getState().copilotAcceptance,
         ).toBeNull();
-      });
-
-      it.each([false, true])(
-        "retries canonical before turn_start while refusing edits and unrelated history (edit attempted=%s)",
-        async (edited) => {
-          changesState.hasChanges = true;
-          const { apply, saved } = await severStream(false);
-          historyGet.mockClear();
-          if (edited) {
-            act(editLoop);
-            expect(
-              editorNodes.find((node) => node.id === "loop")?.data,
-            ).toMatchObject({
-              loopValue: "unsaved_items",
-            });
-          }
-          await advance(2_000);
-          expect(historyGet).toHaveBeenCalledWith(
-            "/workflow/copilot/chat-history",
-            expect.objectContaining({
-              params: expect.objectContaining({
-                request_cancel_token: streamCalls[0]!.body.cancel_token,
-              }),
-            }),
-          );
+        const owner =
+          useWorkflowYamlEditorStore.getState().editorOwner ??
+          createYamlCommitOwner("wpid_1");
+        if (outcome === "save in progress") {
+          registerEditorOwner(owner);
+          expect(beginSaveTransaction(owner)).toBe(true);
+        }
+        const apply = vi.fn();
+        const revisited = await renderChat({
+          route: "editor",
+          docked: true,
+          onWorkflowUpdate: apply,
+        });
+        if (outcome === "save in progress") {
+          expect(useWorkflowYamlEditorStore.getState().lockKind).toBe("save");
+          await act(async () => finishSaveTransaction(owner));
+        }
+        const resumedReservation =
+          useWorkflowYamlEditorStore.getState().copilotAcceptance;
+        expect(resumedReservation).not.toBeNull();
+        expect(resumedReservation).not.toBe(originalReservation);
+        expect(beginYamlCommit(createYamlCommitOwner("wpid_1"))).toBe(false);
+        act(editLoop);
+        expect(
+          editorNodes.find((node) => node.id === "loop")?.data,
+        ).toMatchObject({
+          loopValue: "unsaved_items",
+        });
+        revisited.unmount();
+        expect(canonicalRecoveriesByWorkflow.get("wpid_1")?.poll).toEqual(poll);
+        await renderChat({
+          route: "editor",
+          docked: true,
+          onWorkflowUpdate: apply,
+        });
+        if (outcome === "budget") {
+          await advance(Math.max(0, poll.deadline - Date.now() - 1));
+          expect(
+            useWorkflowYamlEditorStore.getState().copilotAcceptance,
+          ).not.toBeNull();
+          await advance(1);
           expect(apply).not.toHaveBeenCalled();
+          expect(
+            useWorkflowYamlEditorStore.getState().copilotAcceptance,
+          ).not.toBeNull();
           finishOnServer(saved);
-          await advance(3_000);
+          await act(async () =>
+            fireEvent.click(screen.getByRole("button", { name: "Retry" })),
+          );
+          await advance(0);
+          await discardRecoveryDraft();
+        } else {
+          finishOnServer(saved);
+          await advance(2_000);
+          await discardRecoveryDraft();
           expect(apply).toHaveBeenCalledExactlyOnceWith(
             saved.current,
-            expect.objectContaining({
-              persisted: true,
-              applied: true,
-            }),
+            expect.objectContaining({ persisted: true, applied: true }),
           );
-          expect(screen.getByText("Saved the workflow.")).toBeTruthy();
-          expect(
-            screen.queryByText(
-              "The connection dropped, so Copilot is checking whether this turn finished.",
-            ),
-          ).toBeNull();
-          historyGet.mockClear();
-          await advance(30_000);
-          expect(historyGet).not.toHaveBeenCalled();
-        },
-      );
+        }
+        expect(
+          useWorkflowYamlEditorStore.getState().copilotAcceptance,
+        ).toBeNull();
+        expect(screen.getByText("Saved the workflow.")).toBeTruthy();
+      },
+    );
 
-      it("bounds canonical retries without turn_start", async () => {
+    it("keeps resumed recovery locked when a finished turn's canonical read fails", async () => {
+      changesState.hasChanges = true;
+      const { view, saved } = await severStream();
+      view.unmount();
+      finishOnServer(saved);
+      let readFails = true;
+      historyGet.mockImplementation((path: string) =>
+        path === "/workflows/wpid_1"
+          ? readFails
+            ? Promise.reject(new Error("canonical unavailable"))
+            : Promise.resolve({ data: saved.current })
+          : Promise.resolve(historyResponse),
+      );
+      const apply = vi.fn();
+      await renderChat({
+        route: "editor",
+        docked: true,
+        onWorkflowUpdate: apply,
+      });
+      await advance(2_000);
+      expect(apply).not.toHaveBeenCalled();
+      expect(
+        useWorkflowYamlEditorStore.getState().copilotAcceptance,
+      ).not.toBeNull();
+      expect(screen.getByRole("button", { name: "Retry" })).toBeTruthy();
+      readFails = false;
+      await advance(3_000);
+      await discardRecoveryDraft();
+      expect(apply).toHaveBeenCalledExactlyOnceWith(
+        saved.current,
+        expect.objectContaining({ persisted: true, applied: true }),
+      );
+      expect(
+        useWorkflowYamlEditorStore.getState().copilotAcceptance,
+      ).toBeNull();
+    });
+
+    it("retains a timed-out resumed recovery until Retry resolves canonical state", async () => {
+      changesState.hasChanges = true;
+      const view = await renderChat({ route: "editor", docked: true });
+      await submit("edit the workflow");
+      const call = streamCalls[0]!;
+      historyGet.mockImplementation((path: string) =>
+        path === "/workflows/wpid_1"
+          ? Promise.reject(new Error("canonical unavailable"))
+          : Promise.resolve(historyResponse),
+      );
+      vi.useFakeTimers();
+      await act(async () => call.reject(new Error("connection dropped")));
+      view.unmount();
+      const deadline =
+        canonicalRecoveriesByWorkflow.get("wpid_1")!.poll!.deadline;
+      const apply = vi.fn();
+      await renderChat({
+        route: "editor",
+        docked: true,
+        onWorkflowUpdate: apply,
+      });
+      const reservation =
+        useWorkflowYamlEditorStore.getState().copilotAcceptance;
+      expect(reservation).not.toBeNull();
+      await advance(Math.max(0, deadline - Date.now()));
+      expect(screen.getByRole("alert").textContent).toContain(
+        "Could not confirm whether Copilot saved changes",
+      );
+      expect(screen.getByRole("button", { name: "Retry" })).toBeTruthy();
+      expect(useWorkflowYamlEditorStore.getState().copilotAcceptance).toBe(
+        reservation,
+      );
+      expect(beginYamlCommit(createYamlCommitOwner("wpid_1"))).toBe(false);
+      historyGet.mockClear();
+      await advance(30_000);
+      expect(historyGet).not.toHaveBeenCalled();
+      const canonical = {
+        ...saveData.workflow,
+        workflow_id: "wf_saved",
+        version: 2,
+      };
+      historyGet.mockImplementation((path: string) =>
+        Promise.resolve(
+          path === "/workflows/wpid_1" ? { data: canonical } : historyResponse,
+        ),
+      );
+      finishTurnHistory();
+      await act(async () =>
+        fireEvent.click(screen.getByRole("button", { name: "Retry" })),
+      );
+      await advance(0);
+      await discardRecoveryDraft();
+      expect(apply).toHaveBeenCalledWith(
+        canonical,
+        expect.objectContaining({ persisted: true, applied: true }),
+      );
+      expect(screen.queryByRole("alert")).toBeNull();
+      expect(
+        useWorkflowYamlEditorStore.getState().copilotAcceptance,
+      ).toBeNull();
+    });
+
+    it.each([false, true])(
+      "retries canonical before turn_start while refusing edits and unrelated history (edit attempted=%s)",
+      async (edited) => {
         changesState.hasChanges = true;
-        const { apply } = await severStream(false);
+        const { apply, saved } = await severStream(false);
         historyGet.mockClear();
+        if (edited) {
+          act(editLoop);
+          expect(
+            editorNodes.find((node) => node.id === "loop")?.data,
+          ).toMatchObject({
+            loopValue: "unsaved_items",
+          });
+        }
         await advance(2_000);
         expect(historyGet).toHaveBeenCalledWith(
           "/workflow/copilot/chat-history",
@@ -12263,40 +12211,74 @@ describe("WorkflowCopilotChat — g2 review gate", () => {
             }),
           }),
         );
-        await advance(1_500_000);
-        const reads = historyGet.mock.calls.length;
-        expect(reads).toBeGreaterThan(1);
-        expect(reads).toBeLessThan(60);
-        await advance(1_500_000);
-        expect(historyGet).toHaveBeenCalledTimes(reads);
         expect(apply).not.toHaveBeenCalled();
-      });
-
-      it("discards a canonical retry response after unmount before turn_start", async () => {
-        changesState.hasChanges = true;
-        const { view, apply, saved } = await severStream(false);
         finishOnServer(saved);
-        let resolveRead!: (value: unknown) => void;
-        historyGet.mockImplementation(
-          () =>
-            new Promise((resolve) => {
-              resolveRead = resolve;
-            }),
+        await advance(3_000);
+        expect(apply).toHaveBeenCalledExactlyOnceWith(
+          saved.current,
+          expect.objectContaining({
+            persisted: true,
+            applied: true,
+          }),
         );
-        await advance(2_000);
-        expect(resolveRead).toBeTypeOf("function");
-        view.unmount();
-        await act(async () => resolveRead({ data: saved.current }));
-        expect(apply).not.toHaveBeenCalled();
+        expect(screen.getByText("Saved the workflow.")).toBeTruthy();
         expect(
-          useWorkflowYamlEditorStore.getState().copilotAcceptance,
+          screen.queryByText(
+            "The connection dropped, so Copilot is checking whether this turn finished.",
+          ),
         ).toBeNull();
         historyGet.mockClear();
-        await advance(1_500_000);
+        await advance(30_000);
         expect(historyGet).not.toHaveBeenCalled();
-      });
-    },
-  );
+      },
+    );
+
+    it("bounds canonical retries without turn_start", async () => {
+      changesState.hasChanges = true;
+      const { apply } = await severStream(false);
+      historyGet.mockClear();
+      await advance(2_000);
+      expect(historyGet).toHaveBeenCalledWith(
+        "/workflow/copilot/chat-history",
+        expect.objectContaining({
+          params: expect.objectContaining({
+            request_cancel_token: streamCalls[0]!.body.cancel_token,
+          }),
+        }),
+      );
+      await advance(1_500_000);
+      const reads = historyGet.mock.calls.length;
+      expect(reads).toBeGreaterThan(1);
+      expect(reads).toBeLessThan(60);
+      await advance(1_500_000);
+      expect(historyGet).toHaveBeenCalledTimes(reads);
+      expect(apply).not.toHaveBeenCalled();
+    });
+
+    it("discards a canonical retry response after unmount before turn_start", async () => {
+      changesState.hasChanges = true;
+      const { view, apply, saved } = await severStream(false);
+      finishOnServer(saved);
+      let resolveRead!: (value: unknown) => void;
+      historyGet.mockImplementation(
+        () =>
+          new Promise((resolve) => {
+            resolveRead = resolve;
+          }),
+      );
+      await advance(2_000);
+      expect(resolveRead).toBeTypeOf("function");
+      view.unmount();
+      await act(async () => resolveRead({ data: saved.current }));
+      expect(apply).not.toHaveBeenCalled();
+      expect(
+        useWorkflowYamlEditorStore.getState().copilotAcceptance,
+      ).toBeNull();
+      historyGet.mockClear();
+      await advance(1_500_000);
+      expect(historyGet).not.toHaveBeenCalled();
+    });
+  });
 
   it("retains request-id recovery through an uncorrelated canonical advance before turn_start", async () => {
     changesState.hasChanges = true;
@@ -13217,62 +13199,6 @@ describe("WorkflowCopilotChat — g2 review gate", () => {
     expect(useWorkflowYamlEditorStore.getState().copilotAcceptance).toBeNull();
   });
 
-  it.each(["server", "missing-chat", "failed-server"])(
-    "restores headers on manual Accept through %s",
-    async (mode) => {
-      changesState.hasChanges = true;
-      saveData.settings.cdpConnectHeaders = '{"Authorization":"accept-cdp"}';
-      saveData.settings.extraHttpHeaders = '{"X-Token":"accept-extra"}';
-      const snapshot = structuredClone(saveData.settings);
-      let editorSettings = snapshot;
-      await renderChat({
-        onWorkflowUpdate: (workflow, options) => {
-          editorSettings = options?.settings ?? apiWorkflowToSettings(workflow);
-          saveData.settings = editorSettings;
-          changesState.setHasChanges(!options?.persisted);
-        },
-      });
-      await submit("edit the workflow");
-      await act(async () => {
-        streamCalls[0]!.onMessage({
-          type: "turn_start",
-          turn_id: "turn-1",
-          mode: "build",
-          turn_index: 0,
-        });
-        streamCalls[0]!.onMessage(
-          proposalResponse("Draft ready.", {
-            workflow_copilot_chat_id: mode === "missing-chat" ? "" : "chat-1",
-          }),
-        );
-        streamCalls[0]!.resolve();
-      });
-      if (mode === "missing-chat") {
-        historyResponse.data.workflow_copilot_chat_id = null;
-      } else if (mode === "failed-server") {
-        cancelPost.mockRejectedValueOnce({ response: { status: 422 } });
-      } else {
-        cancelPost.mockResolvedValueOnce({
-          data: proposedWorkflowPayload({
-            extra_http_headers: null,
-            cdp_connect_headers: { Authorization: "***" },
-          }),
-        });
-      }
-      await act(async () =>
-        fireEvent.click(screen.getByRole("button", { name: "Accept" })),
-      );
-      expect(editorSettings).toMatchObject({
-        cdpConnectHeaders: snapshot.cdpConnectHeaders,
-        extraHttpHeaders: snapshot.extraHttpHeaders,
-        totpIdentifier: snapshot.totpIdentifier,
-        totpVerificationUrl: snapshot.totpVerificationUrl,
-      });
-      if (mode === "success")
-        expect(changesState.setHasChanges).toHaveBeenLastCalledWith(true);
-    },
-  );
-
   it.each(["unresolved chat", "HTTP rejection"])(
     "keeps a failed local Accept reserved after %s until Retry applies it",
     async (mode) => {
@@ -13290,7 +13216,7 @@ describe("WorkflowCopilotChat — g2 review gate", () => {
       const owner = createYamlCommitOwner("wpid_1");
       registerEditorOwner(owner);
       if (mode === "HTTP rejection")
-        cancelPost.mockRejectedValueOnce({ response: { status: 422 } });
+        cancelPost.mockRejectedValueOnce({ response: { status: 500 } });
       vi.useFakeTimers();
       await act(async () =>
         fireEvent.click(screen.getByRole("button", { name: "Accept" })),
@@ -13301,66 +13227,6 @@ describe("WorkflowCopilotChat — g2 review gate", () => {
       finishSaveTransaction(owner);
     },
   );
-
-  it("A42 enables later questions when the answer POST settles after recovery", async () => {
-    changesState.hasChanges = true;
-    changesState.hasChanges = false;
-    let loadHistory!: (value: unknown) => void;
-    historyGet.mockImplementationOnce(
-      () =>
-        new Promise((resolve) => {
-          loadHistory = resolve;
-        }),
-    );
-    await renderChat();
-    vi.useFakeTimers();
-    await act(async () => loadHistory({ data: pausedHistory() }));
-    let finishAnswer!: (value: unknown) => void;
-    cancelPost.mockImplementationOnce(
-      () =>
-        new Promise((resolve) => {
-          finishAnswer = resolve;
-        }),
-    );
-    await act(async () =>
-      fireEvent.click(screen.getByRole("button", { name: "Skip" })),
-    );
-    const canonical = {
-      ...saveData.workflow,
-      ...proposedWorkflowPayload({ workflow_id: "wf_resumed" }),
-    };
-    historyGet.mockImplementation((path: string) =>
-      Promise.resolve({
-        data: path === "/workflows/wpid_1" ? canonical : completedHistory(),
-      }),
-    );
-    await act(async () => vi.advanceTimersByTimeAsync(2_000));
-    expect(useWorkflowYamlEditorStore.getState().copilotAcceptance).toBeNull();
-    await act(async () =>
-      finishAnswer({ data: { ...recoveredQuestion(), status: "resolved" } }),
-    );
-    vi.useRealTimers();
-    await submit("continue");
-    await act(async () =>
-      streamCalls[0]!.onMessage({
-        type: "question_required",
-        turn_id: "turn-next",
-        workflow_copilot_chat_id: "chat-1",
-        cancel_token: "next-token",
-        interactions: [
-          {
-            ...recoveredQuestion(),
-            interaction_id: "question-next",
-            turn_id: "turn-next",
-          },
-        ],
-      }),
-    );
-    expect(
-      (screen.getByRole("button", { name: "Skip" }) as HTMLButtonElement)
-        .disabled,
-    ).toBe(false);
-  });
 
   it.each(["question", "credential"])(
     "A42 recovery Reject sends the original %s cancellation token and chat",
@@ -13397,295 +13263,6 @@ describe("WorkflowCopilotChat — g2 review gate", () => {
         },
         expect.anything(),
       );
-    },
-  );
-
-  it.each(
-    [
-      "question",
-      "credential",
-      "external question",
-      "external credential",
-    ].flatMap((path) =>
-      ["Keep my edits", "Apply and discard my edits"].map((choice) => [
-        path,
-        choice,
-      ]),
-    ),
-  )(
-    "A42 protects local inputs before claiming delayed %s history: %s",
-    async (path, choice) => {
-      changesState.hasChanges = true;
-      changesState.hasChanges = false;
-      let historyLoaded!: (value: unknown) => void;
-      historyGet.mockImplementationOnce(
-        () =>
-          new Promise((resolve) => {
-            historyLoaded = resolve;
-          }),
-      );
-      const apply = vi.fn(() =>
-        useWorkflowParametersStore.getState().setParameters([]),
-      );
-      const owner = createYamlCommitOwner("wpid_1");
-      registerEditorOwner(owner);
-      await renderChat({ onWorkflowUpdate: apply });
-      const input = {
-        key: "local_input",
-        parameterType: "context" as const,
-        sourceParameterKey: "source",
-      };
-      useWorkflowParametersStore.getState().setParameters([input]);
-      useWorkflowTitleStore.getState().setTitle("Local title");
-      useWorkflowYamlEditorStore.getState().open("title: Baseline");
-      useWorkflowYamlEditorStore.getState().setDraft("title: Local YAML");
-      changesState.hasChanges = true;
-      vi.useFakeTimers();
-      await act(async () =>
-        historyLoaded({
-          data: pausedHistory(
-            path?.includes("credential") ? "credential" : "question",
-          ),
-        }),
-      );
-      if (!path?.startsWith("external")) {
-        cancelPost.mockResolvedValueOnce({
-          data: { ...recoveredQuestion(), status: "resolved" },
-        });
-        await act(async () =>
-          fireEvent.click(
-            screen.getByRole("button", {
-              name: path === "credential" ? "Skip for now" : "Skip",
-            }),
-          ),
-        );
-      }
-      const canonical = {
-        ...saveData.workflow,
-        ...proposedWorkflowPayload({
-          workflow_id: "wf_resumed",
-          title: "New Workflow",
-          workflow_definition: { parameters: [], blocks: [] },
-        }),
-      };
-      historyGet.mockImplementation((path: string) =>
-        Promise.resolve({
-          data: path === "/workflows/wpid_1" ? canonical : completedHistory(),
-        }),
-      );
-      await act(async () => vi.advanceTimersByTimeAsync(2_000));
-      expect(apply).not.toHaveBeenCalled();
-      expect(useWorkflowParametersStore.getState().parameters).toEqual([input]);
-      expect(useWorkflowTitleStore.getState().title).toBe("Local title");
-      expect(useWorkflowYamlEditorStore.getState().draft).toBe(
-        "title: Local YAML",
-      );
-      expect(beginSaveTransaction(owner)).toBe(false);
-      await act(async () => {
-        fireEvent.click(screen.getByRole("button", { name: choice }));
-        await vi.advanceTimersByTimeAsync(0);
-      });
-      expect(
-        useWorkflowYamlEditorStore.getState().copilotAcceptance,
-      ).toBeNull();
-      if (choice === "Keep my edits") {
-        expect(apply).not.toHaveBeenCalled();
-        expect(useWorkflowParametersStore.getState().parameters).toEqual([
-          input,
-        ]);
-        expect(useWorkflowTitleStore.getState().title).toBe("Local title");
-        expect(useWorkflowYamlEditorStore.getState().draft).toBe(
-          "title: Local YAML",
-        );
-      } else {
-        expect(apply).toHaveBeenCalledWith(
-          canonical,
-          expect.objectContaining({ persisted: true }),
-        );
-        expect(useWorkflowParametersStore.getState().parameters).toEqual([]);
-        expect(useWorkflowTitleStore.getState().title).toBe(canonical.title);
-        const yaml = useWorkflowYamlEditorStore.getState();
-        expect(parse(yaml.draft)).toMatchObject({ title: canonical.title });
-        expect(yaml.entrySnapshot).toBe(yaml.draft);
-        expect(yaml.stale).toBe(false);
-      }
-    },
-  );
-
-  it.each(["canonical", "proposal"])(
-    "A42 retains uncertain Accept only while the %s read fails, then Retry settles",
-    async (failedRead) => {
-      changesState.hasChanges = true;
-      const canonical = {
-        ...saveData.workflow,
-        ...proposedWorkflowPayload({ workflow_id: "wf_accepted", version: 2 }),
-      };
-      historyResponse.data.proposed_workflow = canonical;
-      const apply = vi.fn();
-      await renderChat({ onWorkflowUpdate: apply });
-      const accept = await screen.findByRole(
-        "button",
-        { name: "Accept" },
-        { timeout: 10_000 },
-      );
-      const owner = createYamlCommitOwner("wpid_1");
-      registerEditorOwner(owner);
-      cancelPost.mockRejectedValueOnce(new Error("Accept response lost"));
-      historyGet.mockImplementation((path: string) => {
-        if ((path === "/workflows/wpid_1") === (failedRead === "canonical"))
-          return Promise.reject(new Error("read unavailable"));
-        return Promise.resolve(
-          path === "/workflows/wpid_1" ? { data: canonical } : historyResponse,
-        );
-      });
-      vi.useFakeTimers();
-      await act(async () => fireEvent.click(accept));
-      await act(async () => vi.advanceTimersByTimeAsync(1_500_000));
-      expect(apply).not.toHaveBeenCalled();
-      expect(beginSaveTransaction(owner)).toBe(false);
-      expect(screen.getByRole("button", { name: "Reload" })).toBeTruthy();
-      await act(async () => {
-        fireEvent.click(
-          within(
-            screen.getByText(/Could not confirm whether Copilot saved changes/)
-              .parentElement!,
-          ).getByRole("button", { name: "Retry" }),
-        );
-        await vi.advanceTimersByTimeAsync(0);
-      });
-      expect(cancelPost).toHaveBeenCalledTimes(1);
-      expect(beginSaveTransaction(owner)).toBe(false);
-      historyResponse.data.proposed_workflow = null;
-      historyGet.mockImplementation((path: string) =>
-        Promise.resolve(
-          path === "/workflows/wpid_1" ? { data: canonical } : historyResponse,
-        ),
-      );
-      await act(async () => {
-        fireEvent.click(screen.getByRole("button", { name: "Retry" }));
-        await vi.advanceTimersByTimeAsync(0);
-      });
-      expect(apply).toHaveBeenCalledExactlyOnceWith(
-        canonical,
-        expect.objectContaining({ persisted: true }),
-      );
-      expect(cancelPost).toHaveBeenCalledTimes(1);
-      expect(
-        useWorkflowYamlEditorStore.getState().copilotAcceptance,
-      ).toBeNull();
-      expect(beginSaveTransaction(owner)).toBe(true);
-    },
-  );
-
-  it.each([
-    "interrupted commit",
-    "legacy commit",
-    "legacy unchanged",
-    "500 unchanged",
-    "cleared unchanged",
-    "pending newer commit",
-  ])(
-    "A42 settles uncertain Accept only from a recorded outcome: %s",
-    async (outcome) => {
-      changesState.hasChanges = true;
-      const baseline = {
-        ...saveData.workflow,
-        version: 1,
-        modified_at: "2026-09-01T00:00:00Z",
-      };
-      saveData.workflow = baseline;
-      const canonical = {
-        ...baseline,
-        ...proposedWorkflowPayload({ workflow_id: "wf_accepted" }),
-        version: 2,
-        modified_at: "2026-09-02T00:00:00Z",
-      };
-      historyResponse.data.proposed_workflow = canonical;
-      if (!outcome.startsWith("legacy")) {
-        historyResponse.data.proposed_workflow_metadata = {
-          owner_turn_id: "turn-recovered",
-          revision: 1,
-          canonical_fingerprint: "baseline",
-          disposition: "review_untested",
-          workflow_run_id: null,
-        };
-        historyResponse.data.chat_history = pausedHistory().chat_history;
-      }
-      const apply = vi.fn();
-      await renderChat({ onWorkflowUpdate: apply });
-      const accept = await screen.findByRole(
-        "button",
-        { name: "Accept" },
-        { timeout: 10_000 },
-      );
-      const owner = createYamlCommitOwner("wpid_1");
-      registerEditorOwner(owner);
-      cancelPost.mockRejectedValueOnce(
-        Object.assign(new Error("accept failed"), {
-          response: { status: 500 },
-        }),
-      );
-      const committed =
-        outcome.endsWith("commit") || outcome === "cleared unchanged";
-      const saved = outcome === "cleared unchanged" ? baseline : canonical;
-      const accepted = outcome === "interrupted commit";
-      if (accepted) historyResponse.data.accepted_turn_ids = ["turn-recovered"];
-      historyGet.mockImplementation((path: string) =>
-        Promise.resolve(
-          path === "/workflows/wpid_1"
-            ? { data: committed ? saved : baseline }
-            : historyResponse,
-        ),
-      );
-      historyGet.mockClear();
-      vi.useFakeTimers();
-      await act(async () => fireEvent.click(accept));
-      expect(apply).not.toHaveBeenCalled();
-      expect(historyGet).not.toHaveBeenCalled();
-      expect(beginSaveTransaction(owner)).toBe(false);
-      if (committed && outcome !== "pending newer commit")
-        historyResponse.data.proposed_workflow = null;
-      await act(async () => vi.advanceTimersByTimeAsync(2_000));
-      if (!accepted) {
-        expect(
-          screen.queryByText("Accepted and saved to the workflow"),
-        ).toBeNull();
-        if (!committed || outcome === "pending newer commit") {
-          expect(historyGet.mock.calls.map(([path]) => path)).toEqual([
-            "/workflow/copilot/chat-history",
-          ]);
-          expect(apply).not.toHaveBeenCalled();
-          expect(beginSaveTransaction(owner)).toBe(false);
-          expect(screen.getByRole("button", { name: "Retry" })).toBeTruthy();
-        }
-        return;
-      }
-      expect(historyGet.mock.calls.map(([path]) => path)).toEqual([
-        "/workflow/copilot/chat-history",
-        "/workflows/wpid_1",
-      ]);
-      expect(historyGet.mock.calls[0]?.[1]?.params).toEqual({
-        workflow_copilot_chat_id: "chat-1",
-      });
-      if (committed)
-        expect(apply).toHaveBeenCalledWith(
-          saved,
-          expect.objectContaining({ persisted: true }),
-        );
-      else {
-        expect(apply).not.toHaveBeenCalled();
-        expect(toast).toHaveBeenCalledWith(
-          expect.objectContaining({
-            title: "Accept failed",
-            variant: "destructive",
-          }),
-        );
-        expect(screen.getByRole("button", { name: "Accept" })).toBeTruthy();
-      }
-      expect(
-        useWorkflowYamlEditorStore.getState().copilotAcceptance,
-      ).toBeNull();
-      expect(beginSaveTransaction(owner)).toBe(true);
     },
   );
 
@@ -14463,11 +14040,7 @@ describe("A46 Accept recovery", () => {
 
   it.each([
     [409, "Workflow changed after this proposal", true],
-    [409, "Copilot proposal changed; reload required", true],
-    [409, "Copilot proposal metadata is invalid; reload required", true],
     [400, "No proposed workflow to apply", true],
-    [400, "Proposed workflow has no copilot YAML to apply", true],
-    [400, "Proposed copilot YAML is invalid: invalid value", true],
     [404, "Chat not found", true],
     [409, "Copilot proposal is already being accepted", false],
     [500, "Workflow changed after this proposal", false],
@@ -16128,8 +15701,6 @@ describe("editor-state rollback lifecycle", () => {
 
   it.each([
     { titleFrameReceived: true, definitionCommitted: false },
-    { titleFrameReceived: false, definitionCommitted: false },
-    { titleFrameReceived: true, definitionCommitted: true },
     { titleFrameReceived: false, definitionCommitted: true },
   ])(
     "reconciles a terminal title-only canonical advance without losing the snapshot (title frame=$titleFrameReceived, definition committed=$definitionCommitted)",

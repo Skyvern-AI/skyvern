@@ -1265,3 +1265,104 @@ def test_local_snapshot_aliases_consume_primary_before_live_baseline_and_preserv
         {DOWNLOADED_FILE_SIGS_KEY: [to_downloaded_file_signature(live)]},
         aliases=storage.get_downloaded_file_signature_aliases,
     ) == [retry]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("backend", ["local", "s3", "azure", "gcs"])
+@pytest.mark.parametrize("signed", [False, True])
+@pytest.mark.parametrize("run_id", ["wr_1", "tsk_1"])
+async def test_partial_bytes_are_neither_published_nor_returned(tmp_path, monkeypatch, backend, signed, run_id):
+    monkeypatch.setattr(settings, "ARTIFACT_CONTENT_HMAC_KEYRING", _DUMMY_KEYRING_JSON if signed else None)
+    storage = {
+        "local": lambda: LocalStorage(str(tmp_path / "artifacts")),
+        "s3": S3Storage,
+        "azure": lambda: AzureStorageForTests("uploads"),
+        "gcs": lambda: GcsStorageForTests("uploads"),
+    }[backend]()
+    storage.async_client = MagicMock()
+    if backend in ("s3", "gcs"):
+        monkeypatch.setattr(storage, "_get_storage_class_for_org", AsyncMock(return_value="STANDARD"))
+    if backend == "gcs":
+        monkeypatch.setattr(storage, "_get_tags_for_org", AsyncMock(return_value=None))
+    directory = tmp_path / "downloads"
+    directory.mkdir()
+    (directory / "extensionless").write_bytes(b"complete")
+    (directory / "unconfirmed.crdownload").write_bytes(b"partial")
+    rows = []
+    objects = {}
+    metadata = {}
+    now = datetime.now(UTC)
+
+    async def create(**kwargs):
+        row = Artifact(**kwargs, created_at=now, modified_at=now)
+        rows.append(row)
+        return row
+
+    async def upload(*, uri, file_path, **kwargs):
+        objects[uri] = Path(file_path).read_bytes()
+        metadata[uri] = {
+            "Metadata": kwargs.get("metadata", {}),
+            "ContentLength": len(objects[uri]),
+            "LastModified": now,
+        }
+
+    manager = ArtifactManager()
+    fake_app = SimpleNamespace(
+        ARTIFACT_MANAGER=manager,
+        WORKFLOW_CONTEXT_MANAGER=WorkflowContextManager(),
+        DATABASE=SimpleNamespace(
+            workflow_run_attempts=SimpleNamespace(get_attempts=AsyncMock(return_value=[])),
+            workflow_runs=SimpleNamespace(get_workflow_run=AsyncMock(return_value=None)),
+            artifacts=SimpleNamespace(
+                find_download_artifact=AsyncMock(return_value=None),
+                create_artifact=create,
+                list_artifacts_for_run_by_type=AsyncMock(side_effect=lambda **_: list(rows)),
+            ),
+        ),
+    )
+    module = {"local": local_module, "s3": s3_module, "azure": azure_module, "gcs": gcs_module}[backend]
+    for item in (module, base_module, manager_module):
+        monkeypatch.setattr(item, "app", fake_app)
+    monkeypatch.setattr(module, "get_download_dir", lambda **_: str(directory))
+    monkeypatch.setattr(
+        manager_module.skyvern_context,
+        "current",
+        lambda: SkyvernContext(workflow_run_id=run_id if run_id.startswith("wr_") else None),
+    )
+    storage.async_client.upload_file_from_path = upload
+    storage.async_client.list_files = AsyncMock(
+        side_effect=lambda **_: [urlparse(uri).path.lstrip("/") for uri in objects]
+    )
+    storage.async_client.get_object_info = AsyncMock(side_effect=lambda uri: metadata[uri])
+    signing = {
+        "s3": "create_presigned_urls",
+        "azure": "create_sas_urls",
+        "gcs": "create_signed_urls",
+        "local": "unused",
+    }[backend]
+    setattr(
+        storage.async_client,
+        signing,
+        AsyncMock(side_effect=lambda uris: ["https://storage.example/file" for _ in uris]),
+    )
+    monkeypatch.setattr(
+        manager,
+        "resolve_share_url",
+        AsyncMock(side_effect=lambda artifact, **_: f"https://api.example/{artifact.artifact_id}"),
+    )
+    monkeypatch.setattr(manager, "resolve_artifact_url_expiry_seconds", AsyncMock(return_value=3600))
+    await storage.save_downloaded_files(organization_id="o_1", run_id=run_id)
+    assert len(rows) == 1 and rows[0].uri.endswith("/extensionless")
+    assert all(not uri.endswith(".crdownload") for uri in objects)
+    legacy = rows[0].model_copy(
+        update={"artifact_id": "a_legacy_partial", "uri": rows[0].uri.rsplit("/", 1)[0] + "/legacy.crdownload"}
+    )
+    rows.append(legacy)
+    if backend == "local":
+        Path(parse_uri_to_path(legacy.uri)).write_bytes(b"legacy partial")
+    else:
+        objects[legacy.uri] = b"legacy partial"
+        metadata[legacy.uri] = {"Metadata": {}, "ContentLength": 14, "LastModified": now}
+    infos = await storage.get_downloaded_files(organization_id="o_1", run_id=run_id)
+    assert [info.filename for info in infos] == ["extensionless"]
+    assert (directory / "unconfirmed.crdownload").read_bytes() == b"partial"

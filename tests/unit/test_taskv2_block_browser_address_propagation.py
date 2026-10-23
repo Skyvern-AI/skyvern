@@ -8,12 +8,19 @@ from unittest.mock import AsyncMock
 
 import pytest
 
+from skyvern.exceptions import BROWSER_CONNECTION_LOST_ERROR_CODE
 from skyvern.forge.sdk.core import skyvern_context
 from skyvern.forge.sdk.core.skyvern_context import SkyvernContext
 from skyvern.forge.sdk.schemas.task_v2 import TaskV2Status
 from skyvern.forge.sdk.workflow.models import block as block_module
 from skyvern.forge.sdk.workflow.models.block import TaskV2Block
 from skyvern.forge.sdk.workflow.models.parameter import OutputParameter, ParameterType
+from skyvern.forge.sdk.workflow.models.workflow import WorkflowRunStatus
+from skyvern.forge.sdk.workflow.retry_policy import evaluate_retry_policy
+from skyvern.schemas.workflows import WorkflowRetryPolicy
+from skyvern.webeye.real_browser_manager import RealBrowserManager
+from skyvern.webeye.real_browser_state import RealBrowserState
+from tests.unit._task_block_fakes import run_bound_browser_state
 
 
 @pytest.fixture(autouse=True)
@@ -218,3 +225,108 @@ async def test_taskv2_block_settles_the_child_capture_when_the_runner_raises(
         )
 
     assert settled == ["wr_child"]
+
+
+def _child_browser_state(*, lost: bool) -> RealBrowserState:
+    state, context = run_bound_browser_state("wr_child")
+    if lost:
+        state._on_browser_context_closed(context)
+    return state
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("mapping", ["persistent_session_child_only", "shared_with_parent"])
+@pytest.mark.parametrize("continue_on_failure", [True, False])
+@pytest.mark.parametrize("child_lost_browser", [True, False], ids=["child_lost_browser", "ordinary_child_failure"])
+async def test_taskv2_block_reports_a_child_browser_loss_from_the_child_run_entry(
+    monkeypatch: pytest.MonkeyPatch, mapping: str, continue_on_failure: bool, child_lost_browser: bool
+) -> None:
+    skyvern_context.set(SkyvernContext(organization_id="org_1", workflow_run_id="wr_parent", run_id="wr_parent"))
+    child_state = _child_browser_state(lost=child_lost_browser)
+    browser_manager = RealBrowserManager()
+    # An explicit persistent session registers only the child run; a shared browser is also aliased to the parent.
+    browser_manager.pages = (
+        {"wr_child": child_state}
+        if mapping == "persistent_session_child_only"
+        else {"wr_child": child_state, "wr_parent": child_state}
+    )
+    workflow_run = SimpleNamespace(
+        proxy_location=None,
+        max_screenshot_scrolls=None,
+        browser_address=None,
+        extra_http_headers=None,
+        cdp_connect_headers=None,
+        failure_reason="Browser state page is missing.",
+    )
+    update_block = AsyncMock()
+    fake_app = SimpleNamespace(
+        DATABASE=SimpleNamespace(
+            organizations=SimpleNamespace(get_organization=AsyncMock(return_value=SimpleNamespace())),
+            workflow_runs=SimpleNamespace(
+                get_workflow_run=AsyncMock(return_value=workflow_run), update_workflow_run=AsyncMock()
+            ),
+            observer=SimpleNamespace(update_task_v2=AsyncMock(), update_workflow_run_block=update_block),
+        ),
+        BROWSER_MANAGER=browser_manager,
+        WORKFLOW_SERVICE=SimpleNamespace(
+            get_recent_task_screenshot_artifacts=AsyncMock(return_value=[]),
+            get_recent_workflow_screenshot_artifacts=AsyncMock(return_value=[]),
+        ),
+        STORAGE=SimpleNamespace(
+            get_current_attempt_downloaded_files=AsyncMock(return_value=[]),
+            get_downloaded_file_signature_aliases=lambda _: [],
+        ),
+        WORKFLOW_CONTEXT_MANAGER=SimpleNamespace(has_workflow_run_context=lambda _run_id: False),
+    )
+    monkeypatch.setattr(block_module, "app", fake_app)
+
+    from skyvern.services import task_v2_service
+
+    child = SimpleNamespace(
+        observer_cruise_id="tsk_v2_1",
+        workflow_run_id="wr_child",
+        output=None,
+        status=TaskV2Status.failed,
+        summary=None,
+        failure_category=None,
+    )
+    monkeypatch.setattr(task_v2_service, "initialize_task_v2", AsyncMock(return_value=child))
+    monkeypatch.setattr(task_v2_service, "run_task_v2", AsyncMock(return_value=child))
+    monkeypatch.setattr(
+        TaskV2Block,
+        "get_workflow_run_context",
+        lambda self, workflow_run_id: SimpleNamespace(credential_totp_identifiers={}),
+    )
+    monkeypatch.setattr(TaskV2Block, "format_potential_template_parameters", lambda self, _: None)
+    monkeypatch.setattr(TaskV2Block, "record_output_parameter_value", AsyncMock())
+
+    block = TaskV2Block(
+        label="task1",
+        output_parameter=_output_parameter("task1_output"),
+        prompt="do the thing",
+        url="https://example.com",
+        continue_on_failure=continue_on_failure,
+    )
+
+    result = await block.execute(workflow_run_id="wr_parent", workflow_run_block_id="wrb_1", organization_id="org_1")
+
+    persisted_codes = {
+        code
+        for call in update_block.await_args_list
+        if call.kwargs.get("workflow_run_block_id") == "wrb_1"
+        for code in call.kwargs.get("error_codes") or []
+    }
+    retry_policy = WorkflowRetryPolicy.model_validate({"max_retries": 2, "retry_on": [{"status": "failed"}]})
+    retry = evaluate_retry_policy(retry_policy, WorkflowRunStatus.failed, persisted_codes, 0)
+    if child_lost_browser:
+        assert result.success is False
+        assert result.can_continue_after_failure is False
+        assert result.error_codes == [BROWSER_CONNECTION_LOST_ERROR_CODE]
+        assert persisted_codes == {BROWSER_CONNECTION_LOST_ERROR_CODE}
+        assert retry == (False, BROWSER_CONNECTION_LOST_ERROR_CODE)
+    else:
+        assert result.success is continue_on_failure
+        assert result.can_continue_after_failure is True
+        assert result.error_codes == []
+        assert persisted_codes == set()
+        assert retry == (True, "matched")

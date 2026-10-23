@@ -7,27 +7,14 @@ import {
   useNodes,
 } from "@xyflow/react";
 import { useRef } from "react";
-import { useWorkflowPermanentId } from "@/routes/workflows/WorkflowPermanentIdContext";
 
 import {
   BranchContext,
   useWorkflowPanelStore,
 } from "@/store/WorkflowPanelStore";
 import { useWorkflowScopeReadOnly } from "../WorkflowScopeContext";
-import { useProcessRecordingMutation } from "@/routes/browserSessions/hooks/useProcessRecordingMutation";
 import { useCopilotActionStore } from "@/store/useCopilotActionStore";
-import { useDebugStore } from "@/store/useDebugStore";
-import { useRecordedBlocksStore } from "@/store/RecordedBlocksStore";
-import { useRecordingStore } from "@/store/useRecordingStore";
 import { useRecordingLauncherStore } from "@/store/useRecordingLauncherStore";
-import { useFeatureFlag } from "@/hooks/useFeatureFlag";
-import { WORKFLOW_COPILOT_DEMONSTRATION_FLAG } from "@/util/featureFlags";
-import {
-  requestRecordingStart,
-  useIsMountedRef,
-} from "@/routes/workflows/editor/recording/pendingRecordingStartGate";
-import { runWorkflowAuthoringAction } from "@/store/WorkflowYamlEditorStore";
-import { useSettingsStore } from "@/store/SettingsStore";
 import { cn } from "@/util/utils";
 import { toast } from "@/components/ui/use-toast";
 
@@ -37,7 +24,6 @@ import {
 } from "../constants";
 import { SELECTED_RING_CLASSES } from "../selection/selectedRingClasses";
 import { WorkflowAddMenu } from "../WorkflowAddMenu";
-import { WorkflowAdderBusy } from "../WorkflowAdderBusy";
 import { findBranchContextForInsertion } from "../workflowInsertion";
 import {
   blockLabelFor,
@@ -59,7 +45,6 @@ function EdgeWithAddButton({
   markerEnd,
 }: EdgeProps) {
   const isReadOnly = useWorkflowScopeReadOnly();
-  const workflowPermanentId = useWorkflowPermanentId();
   const nodes = useNodes();
   const [edgePath, labelX, labelY] = getBezierPath({
     sourceX,
@@ -69,21 +54,13 @@ function EdgeWithAddButton({
     targetY,
     targetPosition,
   });
-  const debugStore = useDebugStore();
-  const recordingStore = useRecordingStore();
   const startDemonstration = useRecordingLauncherStore(
     (state) => state.startDemonstration,
   );
   const stageAttachment = useCopilotActionStore(
     (state) => state.stageAttachment,
   );
-  const demonstrationEnabled =
-    useFeatureFlag(WORKFLOW_COPILOT_DEMONSTRATION_FLAG) === true;
-  const settingsStore = useSettingsStore();
   const workflowStatePanel = useWorkflowPanelStore();
-  const setRecordedBlocks = useRecordedBlocksStore(
-    (state) => state.setRecordedBlocks,
-  );
   const setWorkflowPanelState = useWorkflowPanelStore(
     (state) => state.setWorkflowPanelState,
   );
@@ -91,38 +68,6 @@ function EdgeWithAddButton({
   const fileInputRef = useRef<HTMLInputElement>(null);
 
   const sourceNode = nodes.find((node) => node.id === source);
-
-  const processRecordingMutation = useProcessRecordingMutation({
-    browserSessionId: settingsStore.browserSessionId,
-    onSuccess: (result, owner) => {
-      setRecordedBlocks(
-        result,
-        {
-          previous: source,
-          next: target,
-          parent: sourceNode?.parentId,
-          connectingEdgeType: "edgeWithAddButton",
-        },
-        owner,
-      );
-    },
-  });
-
-  const isProcessing =
-    processRecordingMutation.isPending ||
-    recordingStore.finishRequested ||
-    recordingStore.isCommitting;
-
-  const isBusy =
-    (isProcessing || recordingStore.isRecording) &&
-    (debugStore.isDebugMode || debugStore.blockRunsEnabled) &&
-    settingsStore.isUsingABrowser &&
-    workflowStatePanel.workflowPanelState.data?.previous === source &&
-    workflowStatePanel.workflowPanelState.data?.next === target &&
-    workflowStatePanel.workflowPanelState.data?.parent ===
-      (sourceNode?.parentId || undefined);
-
-  const isDisabled = !isBusy && recordingStore.isRecording;
 
   const deriveBranchContext = (): BranchContext | undefined =>
     findBranchContextForInsertion(nodes, source, sourceNode?.parentId);
@@ -145,67 +90,23 @@ function EdgeWithAddButton({
   };
 
   const onAdd = () => {
-    if (isDisabled) {
-      return;
-    }
     const branchContext = deriveBranchContext();
     updateWorkflowPanelState(true, branchContext);
   };
 
-  const mountedRef = useIsMountedRef();
   const onRecord = () => {
-    if (demonstrationEnabled) {
-      const insertion = demonstrationInsertionFromNodes(nodes, {
-        previous: source,
-        next: target,
-        parent: sourceNode?.parentId,
+    const insertion = demonstrationInsertionFromNodes(nodes, {
+      previous: source,
+      next: target,
+      parent: sourceNode?.parentId,
+    });
+    if (!insertion) {
+      toast({
+        title: "Recording inside a loop or branch isn't supported yet",
       });
-      if (!insertion) {
-        toast({
-          title: "Recording inside a loop or branch isn't supported yet",
-        });
-        return;
-      }
-      startDemonstration?.({ insertion });
       return;
     }
-    if (recordingStore.isRecording) {
-      recordingStore.setIsRecording(false);
-    } else {
-      requestRecordingStart(
-        () =>
-          void runWorkflowAuthoringAction(() => {
-            recordingStore.setIsRecording(true, {
-              workflowPermanentId: workflowPermanentId ?? null,
-              browserSessionId: settingsStore.browserSessionId,
-            });
-            updateWorkflowPanelState(false);
-          }),
-        "edge",
-        { isStillValid: () => mountedRef.current, recordsAfterDiscard: false },
-      );
-    }
-  };
-
-  const onEndRecord = () => {
-    if (isProcessing) {
-      return;
-    }
-
-    // With live interpretation, the recording panel owns the commit so user
-    // edits/deletes to draft steps are honored.
-    if (recordingStore.isRecording && recordingStore.sessionRevision > 0) {
-      recordingStore.requestFinish();
-      return;
-    }
-
-    if (recordingStore.isRecording) {
-      recordingStore.setIsRecording(false);
-    }
-
-    void runWorkflowAuthoringAction(() =>
-      processRecordingMutation.mutateAsync(),
-    );
+    startDemonstration?.({ insertion });
   };
 
   const onUploadSOP = () => {
@@ -244,16 +145,11 @@ function EdgeWithAddButton({
     <div
       className={cn(
         "flex h-6 w-6 items-center justify-center rounded-full bg-slate-50 transition-colors hover:bg-blue-50 hover:ring-2 hover:ring-blue-500/40",
-        {
-          "cursor-not-allowed bg-muted text-muted-foreground hover:bg-muted hover:ring-0":
-            isDisabled,
-          [SELECTED_RING_CLASSES]: isAdding,
-        },
+        { [SELECTED_RING_CLASSES]: isAdding },
       )}
       role="button"
-      tabIndex={isDisabled ? -1 : 0}
+      tabIndex={0}
       aria-label="Add block"
-      aria-disabled={isDisabled}
       data-testid="edge-add-button"
       onClick={() => onAdd()}
       onKeyDown={(e) => {
@@ -275,23 +171,10 @@ function EdgeWithAddButton({
       onRecord={onRecord}
       onUploadSOP={onUploadSOP}
       canUploadSOP={stageAttachment !== null}
-      canRecordTask={!demonstrationEnabled || startDemonstration !== null}
+      canRecordTask={startDemonstration !== null}
     >
       {adder}
     </WorkflowAddMenu>
-  );
-
-  const busy = (
-    <WorkflowAdderBusy
-      color={isProcessing ? "white" : "red"}
-      operation={isProcessing ? "processing" : "recording"}
-      size="small"
-      onComplete={() => {
-        onEndRecord();
-      }}
-    >
-      {adder}
-    </WorkflowAdderBusy>
   );
 
   if (isReadOnly) {
@@ -325,7 +208,7 @@ function EdgeWithAddButton({
             className="hidden"
             onChange={handleSOPFileChange}
           />
-          {isBusy ? busy : isDisabled ? adder : menu}
+          {menu}
         </div>
       </EdgeLabelRenderer>
     </>

@@ -9,6 +9,7 @@ import { GraphIcon } from "@/components/icons/GraphIcon";
 import { InboxIcon } from "@/components/icons/InboxIcon";
 import { ToastAction } from "@/components/ui/toast";
 import { toast } from "@/components/ui/use-toast";
+import { ATTACHMENT_SIZE_LIMIT_BYTES } from "@/routes/workflows/copilot/attachmentLimits";
 import { useCredentialGetter } from "@/hooks/useCredentialGetter";
 import { WorkflowApiResponse } from "@/routes/workflows/types/workflowTypes";
 import { useBrowserSessionPrewarm } from "./useBrowserSessionPrewarm";
@@ -39,6 +40,9 @@ import {
   DropdownMenuItem,
   DropdownMenuTrigger,
 } from "@/components/ui/dropdown-menu";
+import { StartFromCards } from "@/components/StartFromCards";
+import { defaultWorkflowRequest } from "@/routes/workflows/defaultWorkflowRequest";
+import { rememberSopHandoffFile } from "@/routes/workflows/sopHandoff";
 import { useMutation, useQueryClient } from "@tanstack/react-query";
 import { AxiosError, type AxiosResponse } from "axios";
 import {
@@ -192,7 +196,9 @@ type PromptBoxProps = {
   /** Fires once an agent has been created from this prompt box. */
   onAgentCreated?: () => void;
   /** Rendered under the prompt input in the full (non-minimal) layout. */
-  secondaryAction?: ReactNode;
+  secondaryAction?: ReactNode | ((state: { busy: boolean }) => ReactNode);
+  /** True while a sibling creation path (the blank-canvas link) is posting, so the cards wait for it. */
+  siblingBusy?: boolean;
 };
 
 type PromptBoxHandle = {
@@ -280,6 +286,7 @@ function PromptBoxImpl(
     minimal = false,
     onAgentCreated,
     secondaryAction,
+    siblingBusy = false,
   }: PromptBoxProps,
   ref: ForwardedRef<PromptBoxHandle>,
 ) {
@@ -324,6 +331,9 @@ function PromptBoxImpl(
   // react-query isPending only flips on the next render, so a same-frame
   // double-click can slip past it; the ref is the synchronous guard.
   const submitInFlightRef = useRef(false);
+  // Synchronous guard for the start cards: a second activation before the pending state renders
+  // would create a second agent.
+  const cardStartRef = useRef(false);
 
   const updatePrompt = useCallback((value: string) => {
     setPrompt(value);
@@ -443,37 +453,59 @@ function PromptBoxImpl(
     return prompt;
   };
 
+  const createBlankWorkflow = async (title: string) => {
+    const client = await getClient(credentialGetter);
+    const yaml = convertToYAML(buildBlankWorkflowRequest(title));
+    const result = await client.post<string, AxiosResponse<unknown>>(
+      "/workflows",
+      yaml,
+      { headers: { "Content-Type": "text/plain" } },
+    );
+    if (!hasWorkflowShape(result.data)) {
+      throw new Error(
+        `workflow create returned an unexpected response shape (${describeResponseEnvelope(result)})`,
+      );
+    }
+    return result.data;
+  };
+
+  const openCreatedWorkflow = (
+    workflow: WorkflowApiResponse,
+    search: string,
+  ) => {
+    onAgentCreated?.();
+    queryClient.invalidateQueries({ queryKey: ["workflows"] });
+    navigate(
+      workflowEditorPath(workflow.workflow_permanent_id, studioEnabled, search),
+    );
+  };
+
   const recordTaskMutation = useMutation({
-    mutationFn: async () => {
-      const client = await getClient(credentialGetter);
-      const yaml = convertToYAML(
-        buildBlankWorkflowRequest("Demonstrated Agent"),
-      );
-      const result = await client.post<string, AxiosResponse<unknown>>(
-        "/workflows",
-        yaml,
-        { headers: { "Content-Type": "text/plain" } },
-      );
-      if (!hasWorkflowShape(result.data)) {
-        throw new Error(
-          `workflow create returned an unexpected response shape (${describeResponseEnvelope(result)})`,
-        );
-      }
-      return result.data;
-    },
-    onSuccess: (workflow) => {
-      onAgentCreated?.();
-      queryClient.invalidateQueries({ queryKey: ["workflows"] });
-      navigate(
-        workflowEditorPath(
-          workflow.workflow_permanent_id,
-          studioEnabled,
-          "?record=1",
-        ),
-      );
-    },
+    mutationFn: () => createBlankWorkflow("Demonstrated Agent"),
+    onSuccess: (workflow) => openCreatedWorkflow(workflow, "?record=1"),
     onError: (error: AxiosError) => {
       showCreateErrorToast("Could not start demonstration", error);
+    },
+    onSettled: () => {
+      cardStartRef.current = false;
+    },
+  });
+
+  // The editor stages the PDF in Copilot once it opens (`?sop=1`), the same path as the Copilot card.
+  const startFromSopMutation = useMutation({
+    mutationFn: async (file: File) => ({
+      file,
+      workflow: await createBlankWorkflow(defaultWorkflowRequest.title),
+    }),
+    onSuccess: ({ file, workflow }) => {
+      rememberSopHandoffFile(workflow.workflow_permanent_id, file);
+      openCreatedWorkflow(workflow, "?sop=1");
+    },
+    onError: (error: AxiosError) => {
+      showCreateErrorToast("Could not start from the SOP", error);
+    },
+    onSettled: () => {
+      cardStartRef.current = false;
     },
   });
 
@@ -666,7 +698,9 @@ function PromptBoxImpl(
     generateWorkflowMutation.isPending ||
     handoffWorkflowMutation.isPending ||
     uploadDocumentMutation.isPending ||
-    recordTaskMutation.isPending;
+    recordTaskMutation.isPending ||
+    startFromSopMutation.isPending;
+  const cardsBusy = isSubmitting || siblingBusy;
 
   const {
     isSupported: isSpeechSupported,
@@ -764,6 +798,7 @@ function PromptBoxImpl(
       </div>
     ) : null;
 
+  // Only the redesigned (minimal) home still offers the "+" menu; the hero shows the cards instead.
   const fileInput = (
     <input
       ref={fileInputRef}
@@ -873,12 +908,6 @@ function PromptBoxImpl(
               <div className="px-5">{attachmentChips}</div>
             ) : null}
             <div className="flex items-center gap-1.5 px-2.5 pb-2.5 pt-2">
-              {!hideFlagControls && enableCopilotHandoff ? (
-                <>
-                  {renderAddMenu("size-11 md:size-9")}
-                  {fileInput}
-                </>
-              ) : null}
               {!hideFlagControls ? (
                 <SpeechInputButton
                   isSupported={isSpeechSupported}
@@ -935,8 +964,43 @@ function PromptBoxImpl(
               }}
             />
           ) : null}
+          <StartFromCards
+            className="mt-3.5"
+            labelClassName="text-left"
+            gridClassName="md:grid-cols-2"
+            uploadSOP={{
+              onFile: (file) => {
+                if (cardStartRef.current || cardsBusy) return;
+                if (file.size > ATTACHMENT_SIZE_LIMIT_BYTES) {
+                  toast({
+                    variant: "destructive",
+                    title: "File too large",
+                    description: `${file.name} exceeds the 30MB limit.`,
+                  });
+                  return;
+                }
+                cardStartRef.current = true;
+                HomeTelemetry.uploadSopSelected();
+                startFromSopMutation.mutate(file);
+              },
+              disabled: cardsBusy,
+            }}
+            recordTask={{
+              onSelect: () => {
+                if (cardStartRef.current || cardsBusy) return;
+                cardStartRef.current = true;
+                HomeTelemetry.recordTaskSelected();
+                recordTaskMutation.mutate();
+              },
+              disabled: cardsBusy,
+            }}
+          />
           {secondaryAction ? (
-            <div className="mt-3 flex md:justify-end">{secondaryAction}</div>
+            <div className="mt-2.5 flex justify-start md:justify-center">
+              {typeof secondaryAction === "function"
+                ? secondaryAction({ busy: isSubmitting })
+                : secondaryAction}
+            </div>
           ) : null}
         </div>
         <section className="mt-9 w-full max-w-[60rem] md:mt-16">

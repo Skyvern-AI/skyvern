@@ -69,6 +69,7 @@ async def test_get_secret_value_by_item_id_coerces_null_fields_to_empty_string(
         "object": "item",
         "id": "11111111-1111-1111-1111-111111111111",
         "type": 1,
+        "organizationId": "org-id",
         "login": login,
     }
 
@@ -134,6 +135,7 @@ async def test_get_secret_value_by_item_id_preserves_real_values(
         "object": "item",
         "id": "33333333-3333-3333-3333-333333333333",
         "type": 1,
+        "organizationId": "org-id",
         "login": {
             "username": "alice@example.com",
             "password": "hunter2",
@@ -169,6 +171,7 @@ async def test_get_secret_value_by_item_id_preserves_raw_totp_uri(
         "object": "item",
         "id": "55555555-5555-5555-5555-555555555555",
         "type": 1,
+        "organizationId": "org-id",
         "login": {
             "username": "alice@example.test",
             "password": "hunter2",

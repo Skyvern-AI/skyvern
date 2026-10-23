@@ -235,6 +235,7 @@ from skyvern.forge.sdk.copilot.turn_halt import (
     stash_turn_halt_from_blocker_signal,
 )
 from skyvern.forge.sdk.copilot.turn_origin import TurnOrigin
+from skyvern.forge.sdk.copilot.workflow_credential_utils import CONNECTED_VAULT_ID_PREFIX
 from skyvern.forge.sdk.copilot.workflow_yaml import (
     _process_workflow_yaml,
     runner_code_block_associations,
@@ -3315,6 +3316,10 @@ async def _bind_origin_run_redaction_registry(
     awaiting_runtime_secret_values = False
     credential_parameters: dict[str, Any] = {}
     for index, credential_id in enumerate(credential_ids):
+        if credential_id.startswith(CONNECTED_VAULT_ID_PREFIX):
+            # The worker reads a connected-vault login itself, so its values arrive with the terminal handoff.
+            sensitive_values_complete = False
+            continue
         await app.AGENT_FUNCTION.enforce_credential_use(
             ctx.organization_id,
             credential_id,
@@ -4125,11 +4130,14 @@ async def _run_blocks_and_collect_debug(
         approval_credential_ids,
         ctx.request_policy,
         additional_approved_ids=dispatch_scoped_sheet_ids,
+        workflow_definition=workflow.workflow_definition,
     )
     if credential_approval_error is not None:
         return {"ok": False, "error": credential_approval_error}
 
-    credential_error = await _credential_ids_validation_error(credential_ids, ctx)
+    credential_error = await _credential_ids_validation_error(
+        credential_ids, ctx, workflow_definition=workflow.workflow_definition
+    )
     if credential_error is not None:
         return {"ok": False, "error": credential_error}
 

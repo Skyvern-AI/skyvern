@@ -1,12 +1,10 @@
 import asyncio
 import contextlib
-import gc
 import io
 import logging
 import os
 import tempfile
 import time
-import warnings
 from collections.abc import Callable, Iterator
 from datetime import UTC, datetime
 from pathlib import Path
@@ -20,10 +18,12 @@ from structlog.testing import capture_logs
 
 from skyvern.config import settings
 from skyvern.constants import BROWSER_DOWNLOAD_TIMEOUT, BROWSER_DOWNLOADING_SUFFIX
-from skyvern.exceptions import BlockedHost
+from skyvern.errors.errors import UserDefinedError
+from skyvern.exceptions import BROWSER_CONNECTION_LOST_ERROR_CODE, BlockedHost, MissingBrowserState
 from skyvern.forge.agent import ForgeAgent
 from skyvern.forge.sdk.core.skyvern_context import SkyvernContext
 from skyvern.forge.sdk.models import StepStatus
+from skyvern.webeye import real_browser_state as real_browser_state_module
 from skyvern.webeye.actions.actions import (
     ActionStatus,
     ClickAction,
@@ -50,6 +50,7 @@ from skyvern.webeye.actions.handler import (
     _record_action_owned_popup_delta,
     _recover_adopted_session_blob_pdf_iframe,
     _recover_blocked_inline_pdf_download,
+    _recover_download_page,
     _remove_download_listener,
     handle_download_file_action,
 )
@@ -57,7 +58,9 @@ from skyvern.webeye.actions.responses import ActionAbort, ActionFailure, ActionS
 from skyvern.webeye.browser_factory import (
     mark_download_cancelled_by_skyvern,
 )
+from skyvern.webeye.browser_runtime_events import BrowserRuntimeLogContext
 from skyvern.webeye.cdp_download_interceptor import CDPDownloadInterceptor
+from skyvern.webeye.real_browser_state import RealBrowserState
 from skyvern.webeye.scraper.scraped_page import ScrapedPage
 from skyvern.webeye.utils.page import BlobActionFreshness
 from tests.unit._download_provider_fakes import (
@@ -1229,6 +1232,59 @@ async def test_handle_action_recovers_working_page_closed_by_download_click() ->
 
 
 @pytest.mark.asyncio
+async def test_persisted_status_follows_a_result_the_download_wrapper_downgraded() -> None:
+    """The inner handler succeeds, then the download lifecycle finds no file and replaces the
+    terminal result with a failure. The status written to the actions row is stamped before that
+    replacement, so without a re-derive the run reports status=completed alongside success=False."""
+    now = datetime.now(UTC)
+    organization = make_organization(now)
+    task, step, page, browser_state, scraped_page, action = _make_download_click_context(
+        now=now,
+        organization=organization,
+        page_url="https://example.com/downloads",
+    )
+    task = task.model_copy(update={"download_timeout": 0.01})
+    action.errors = [
+        UserDefinedError(error_code="no_file_registered", reasoning="no file was registered", confidence_float=1.0)
+    ]
+    page.evaluate = AsyncMock(return_value=[])
+    page.context._skyvern_cdp_download_active = False
+    persisted_statuses: list[ActionStatus] = []
+
+    async def succeed_and_stamp(*args: object, **kwargs: object) -> list[ActionSuccess]:
+        # What the real _handle_action does in its finally block for a successful result.
+        action.status = ActionStatus.completed
+        return [ActionSuccess()]
+
+    with tempfile.TemporaryDirectory() as temp_dir:
+        mock_app = MagicMock()
+        mock_app.BROWSER_MANAGER.get_for_task.return_value = browser_state
+        mock_app.DATABASE.workflow_params.create_action = AsyncMock(
+            side_effect=lambda action: persisted_statuses.append(action.status) or action
+        )
+        mock_app.STORAGE = MagicMock()
+
+        with (
+            patch.object(ActionHandler, "_handle_action", side_effect=succeed_and_stamp),
+            patch("skyvern.webeye.actions.handler.get_download_dir", return_value=temp_dir),
+            patch("skyvern.webeye.actions.handler.list_files_in_directory", return_value=[]),
+            patch("skyvern.webeye.actions.handler.skyvern_context.current", return_value=None),
+            patch("skyvern.webeye.actions.handler.app", mock_app),
+        ):
+            results = await ActionHandler.handle_action(
+                scraped_page=scraped_page,
+                task=task,
+                step=step,
+                page=page,
+                action=action,
+            )
+
+    assert results[-1].success is False
+    assert results[-1].download_triggered is False
+    assert persisted_statuses == [ActionStatus.failed]
+
+
+@pytest.mark.asyncio
 async def test_handle_action_download_recovery_new_context_does_not_claim_preexisting_page() -> None:
     """Working-page recovery can reconnect into a NEW BrowserContext, replacing the working page. The
     action-window page delta is baselined against the ORIGINAL context; after replacement the current
@@ -1507,6 +1563,156 @@ async def test_handle_action_reconnects_context_closed_during_download_wait(
     blocked_inline_recovery.assert_not_awaited()
     assert results[-1].download_triggered is False
     assert results[-1].skip_remaining_actions is True
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("recovery_site", ["post_click", "post_wait"])
+@pytest.mark.parametrize("native_close", [True, False], ids=["native_context_close", "page_only_close"])
+async def test_download_page_recovery_refuses_a_browser_whose_context_closed_natively(
+    recovery_site: str, native_close: bool
+) -> None:
+    now = datetime.now(UTC)
+    organization = make_organization(now)
+    task, step, page, _, scraped_page, action = _make_download_click_context(
+        now=now,
+        organization=organization,
+        page_url="https://example.com/downloads",
+    )
+    if recovery_site == "post_click":
+        task = task.model_copy(update={"download_timeout": 0.01})
+    page.expose_binding = AsyncMock()
+    page.evaluate = AsyncMock(return_value=[])
+    context = page.context
+    context._skyvern_cdp_download_active = False
+    context._skyvern_cdp_download_interceptor = None
+    browser_state = RealBrowserState(pw=MagicMock(), browser_context=context)
+    browser_state.bind_runtime_event_context(
+        BrowserRuntimeLogContext(workflow_run_id=task.workflow_run_id, task_id=task.task_id)
+    )
+    recovered_page = MagicMock(url=page.url, context=context)
+    recovered_page.is_closed.return_value = False
+    recovered_page.evaluate = AsyncMock(return_value=[])
+    recovered_page.expose_binding = AsyncMock()
+    page_closed = False
+    page.is_closed.side_effect = lambda: page_closed
+
+    async def get_working_page(**_: object) -> object | None:
+        return None if page_closed else page
+
+    browser_state.get_working_page = AsyncMock(side_effect=get_working_page)  # type: ignore[method-assign]
+    browser_state.list_valid_pages = AsyncMock(return_value=[page])  # type: ignore[method-assign]
+    browser_state.new_page = AsyncMock(return_value=recovered_page)  # type: ignore[method-assign]
+    browser_state.reconnect = AsyncMock()  # type: ignore[method-assign]
+    browser_state.navigate_to_url = AsyncMock()  # type: ignore[method-assign]
+    browser_state.set_active_page = AsyncMock()  # type: ignore[method-assign]
+
+    calls_at_close: int | None = None
+
+    def close_working_page() -> None:
+        nonlocal page_closed, calls_at_close
+        page_closed = True
+        calls_at_close = list_calls
+        if native_close:
+            browser_state._on_browser_context_closed(context)
+
+    async def click(*_args: object, **_kwargs: object) -> list[ActionSuccess]:
+        if recovery_site == "post_click":
+            close_working_page()
+        return [ActionSuccess()]
+
+    list_calls = 0
+
+    def list_files(_path: Path | str, *, attempt_started_at: datetime | None = None) -> list[str]:
+        nonlocal list_calls
+        list_calls += 1
+        if recovery_site == "post_wait" and list_calls == 2:
+            close_working_page()
+        return []
+
+    xhr_capture = MagicMock(has_in_flight_requests=False)
+    xhr_capture.drain = AsyncMock(return_value=False)
+    mock_app = MagicMock()
+    mock_app.BROWSER_MANAGER.get_for_task.return_value = browser_state
+    mock_app.DATABASE.workflow_params.create_action = AsyncMock(return_value=action)
+    mock_app.STORAGE = MagicMock()
+
+    with tempfile.TemporaryDirectory() as temp_dir:
+        with (
+            patch.object(ActionHandler, "_handle_action", side_effect=click),
+            patch("skyvern.webeye.actions.handler.BROWSER_DOWNLOAD_NO_SIGNAL_GRACE_TIME", 0),
+            patch("skyvern.webeye.actions.handler.get_download_dir", return_value=temp_dir),
+            patch("skyvern.webeye.actions.handler.list_files_in_directory", side_effect=list_files),
+            patch("skyvern.webeye.actions.handler.ScopedXhrDownloadCapture", return_value=xhr_capture),
+            patch("skyvern.webeye.actions.handler._recover_blocked_inline_pdf_download", new=AsyncMock()),
+            patch("skyvern.webeye.actions.handler.skyvern_context.current", return_value=None),
+            patch("skyvern.webeye.actions.handler.app", mock_app),
+        ):
+            handle = ActionHandler.handle_action(
+                scraped_page=scraped_page, task=task, step=step, page=page, action=action
+            )
+            if native_close:
+                with pytest.raises(MissingBrowserState) as refusal:
+                    await handle
+            else:
+                await handle
+
+    if native_close:
+        assert BROWSER_CONNECTION_LOST_ERROR_CODE in str(refusal.value)
+        browser_state.new_page.assert_not_awaited()
+        browser_state.reconnect.assert_not_awaited()
+        browser_state.navigate_to_url.assert_not_awaited()
+        if recovery_site == "post_click":
+            # The download wait never starts polling after the refusal.
+            assert list_calls == calls_at_close
+    else:
+        browser_state.new_page.assert_awaited_once_with()
+        browser_state.reconnect.assert_not_awaited()
+        browser_state.navigate_to_url.assert_awaited_once_with(page=recovered_page, url="https://example.com/downloads")
+
+
+@pytest.mark.asyncio
+async def test_download_page_recovery_propagates_a_loss_observed_while_new_page_is_pending(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    now = datetime.now(UTC)
+    task, _, page, _, _, _ = _make_download_click_context(
+        now=now, organization=make_organization(now), page_url="https://example.com/downloads"
+    )
+    context = page.context
+    context._skyvern_cdp_download_interceptor = None
+    browser_state = RealBrowserState(pw=MagicMock(), browser_context=context)
+    browser_state.bind_runtime_event_context(
+        BrowserRuntimeLogContext(workflow_run_id=task.workflow_run_id, task_id=task.task_id)
+    )
+
+    async def new_page() -> object:
+        # The context-close event lands while newPage is pending, after the recovery entry check passed.
+        browser_state._on_browser_context_closed(context)
+        raise RuntimeError("Target page, context or browser has been closed")
+
+    driver_starts: list[bool] = []
+
+    class CountingPlaywright:
+        async def start(self) -> object:
+            driver_starts.append(True)
+            raise RuntimeError("driver start reached")
+
+    monkeypatch.setattr(real_browser_state_module, "async_playwright", lambda: CountingPlaywright())
+    create_context = AsyncMock(side_effect=RuntimeError("context factory reached"))
+    monkeypatch.setattr(real_browser_state_module.BrowserContextFactory, "create_browser_context", create_context)
+    browser_state.new_page = AsyncMock(side_effect=new_page)  # type: ignore[method-assign]
+    browser_state.navigate_to_url = AsyncMock()  # type: ignore[method-assign]
+
+    with pytest.raises(MissingBrowserState) as refusal:
+        await _recover_download_page(
+            browser_state, task, "https://example.com/downloads", 5.0, recovery_site="post_click"
+        )
+
+    assert BROWSER_CONNECTION_LOST_ERROR_CODE in str(refusal.value)
+    browser_state.new_page.assert_awaited_once_with()
+    assert driver_starts == []
+    create_context.assert_not_awaited()
+    browser_state.navigate_to_url.assert_not_awaited()
 
 
 @pytest.mark.asyncio
@@ -7799,37 +8005,6 @@ async def test_provider_poll_cancellation_propagates_without_recording_error() -
     # not report a measured negative it never actually observed.
     assert logs[-1]["materialized_file_delta"] is None
     list_signal_files.assert_not_awaited()
-
-
-@pytest.mark.asyncio
-async def test_download_progress_sampler_closed_before_its_first_step_is_not_orphaned(tmp_path: Path) -> None:
-    """A download that finishes without suspending closes the sampler in the event-loop iteration it was
-    started in. Under the OTel asyncio instrumentor that cancel dropped the polling coroutine un-awaited,
-    which reaches the logs as an error-tier "never awaited" RuntimeWarning on every such download.
-    """
-    # The instrumentor ships in the cloud dependency group only, so OSS CI skips this test.
-    instrumentation = pytest.importorskip("opentelemetry.instrumentation.asyncio")
-    partial = tmp_path / f"download{BROWSER_DOWNLOADING_SUFFIX}"
-    partial.write_bytes(b"x")
-    sampler = _DownloadProgressSampler(tmp_path, None, set())
-
-    instrumentor = instrumentation.AsyncioInstrumentor()
-    instrumentor.instrument()
-    try:
-        with warnings.catch_warnings(record=True) as caught:
-            warnings.simplefilter("always")
-            sampler.start_if_partial_seen([str(partial)])
-            await sampler.aclose()
-            # The sampler still references its cancelled task; the warning is raised only when that is collected.
-            del sampler
-            for _ in range(5):
-                await asyncio.sleep(0)
-            gc.collect()
-            await asyncio.sleep(0)
-    finally:
-        instrumentor.uninstrument()
-
-    assert [str(entry.message) for entry in caught if "never awaited" in str(entry.message)] == []
 
 
 @pytest.mark.asyncio

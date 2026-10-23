@@ -254,6 +254,14 @@ class _BoundedLookups(dict):
         return super().__getitem__(key)
 
 
+def _frame_map(owning_frame_by_id: dict[str, str]) -> MagicMock:
+    scraped_page = MagicMock()
+    scraped_page.id_to_element_dict = _BoundedLookups(
+        {element_id: {"id": element_id, "frame": frame} for element_id, frame in owning_frame_by_id.items()}
+    )
+    return scraped_page
+
+
 def _scraped_frames(elements: list[tuple[str, str]]) -> MagicMock:
     """(element id, owning frame) pairs in scrape order, merged by the same build_element_dict a scrape uses."""
     _, id_to_element_dict, _, _, _ = scraper_module.build_element_dict(
@@ -264,8 +272,7 @@ def _scraped_frames(elements: list[tuple[str, str]]) -> MagicMock:
     return scraped_page
 
 
-# A frame's document holds a copy of an already-tagged node whose id is an iframe's, so the later frame's
-# copy replaces the iframe's entry and the chain points back into itself.
+# A frame's document holds a copy of an already-tagged node whose id is an iframe's.
 _SELF_LOOP = [("AAAB", "main.frame"), ("AAAB", "AAAB"), ("AAAC", "AAAB")]
 _TWO_FRAME_LOOP = [("AAAB", "main.frame"), ("AAAC", "AAAB"), ("AAAB", "AAAC"), ("AAAD", "AAAC")]
 _TOO_DEEP = [(f"F{depth}", f"F{depth - 1}" if depth else "main.frame") for depth in range(MAX_FRAME_CHAIN_DEPTH + 1)]
@@ -282,14 +289,23 @@ async def test_resolve_locator_classifies_a_looping_frame_chain_as_missing_eleme
 ) -> None:
     page = MagicMock()
     page.query_selector = AsyncMock(return_value=None)
+    # Merged later-wins, so the copied iframe ids loop. A map can still loop when an iframe is missing from the
+    # scraped elements, which is what the guard is for.
     with pytest.raises(FrameChainLoop) as raised:
-        await resolve_locator(_scraped_frames(elements), page, target_frame, "[unique_id='ZZZZ']")
+        await resolve_locator(_frame_map(dict(elements)), page, target_frame, "[unique_id='ZZZZ']")
     # The action handler's known-failure branch catches MissingElement, which is what keeps the run alive.
     assert isinstance(raised.value, MissingElement)
 
 
 @pytest.mark.asyncio
-async def test_resolve_locator_walks_a_nested_iframe_chain_from_the_outside_in() -> None:
+@pytest.mark.parametrize(
+    "elements",
+    [[("AAAB", "main.frame"), ("AAAC", "AAAB"), ("AAAD", "AAAC")], _TWO_FRAME_LOOP],
+    ids=["plain-chain", "inner-frame-holds-a-copy-of-the-outer-iframe"],
+)
+async def test_resolve_locator_walks_a_nested_iframe_chain_from_the_outside_in(
+    elements: list[tuple[str, str]],
+) -> None:
     inner = MagicMock()
     outer = MagicMock()
     outer.query_selector = AsyncMock(
@@ -299,9 +315,7 @@ async def test_resolve_locator_walks_a_nested_iframe_chain_from_the_outside_in()
     page.query_selector = AsyncMock(
         side_effect=lambda selector: _frame_handler(outer) if selector == "[unique_id='AAAB']" else None
     )
-    scraped = _scraped_frames([("AAAB", "main.frame"), ("AAAC", "AAAB"), ("AAAD", "AAAC")])
-
-    _, frame = await resolve_locator(scraped, page, "AAAC", "[unique_id='AAAD']")
+    _, frame = await resolve_locator(_scraped_frames(elements), page, "AAAC", "[unique_id='AAAD']")
 
     assert frame is inner
 
@@ -318,31 +332,28 @@ async def test_resolve_locator_walks_a_nested_iframe_chain_from_the_outside_in()
             0,
             ("main.frame", "AAAB"),
         ),
-        (
-            # Every element of frame AAAB is overwritten too, so no winning element still names it as its frame.
-            [("AAAB", "main.frame"), ("AAAC", "AAAB"), ("AAAB", "AAAD"), ("AAAC", "AAAD")],
-            "warning",
-            2,
-            1,
-            ("AAAB", "AAAD"),
-        ),
     ],
-    ids=["iframe-id-overwritten", "plain-node-overwritten", "iframe-with-no-surviving-element"],
+    ids=["iframe-id-shared", "plain-node-id-shared"],
 )
-def test_build_element_dict_reports_cross_frame_id_collisions_without_changing_the_winner(
+def test_build_element_dict_keeps_the_main_frame_element_when_a_later_frame_reuses_its_id(
     elements: list[tuple[str, str]],
     level: str,
     collision_count: int,
     iframe_collision_count: int,
     frame_pair: tuple[str, str],
 ) -> None:
+    scraped = [{"id": element_id, "frame": frame, "tagName": "div"} for element_id, frame in elements]
     with capture_logs() as logs:
-        _, id_to_element_dict, _, _, _ = scraper_module.build_element_dict(
-            [{"id": element_id, "frame": frame, "tagName": "div"} for element_id, frame in elements]
-        )
+        _, id_to_element_dict, id_to_frame_dict, id_to_element_hash, _ = scraper_module.build_element_dict(scraped)
 
-    later_frame_by_id = dict(elements)
-    assert {element_id: element["frame"] for element_id, element in id_to_element_dict.items()} == later_frame_by_id
+    first_by_id: dict[str, dict] = {}
+    for element in scraped:
+        first_by_id.setdefault(element["id"], element)
+    assert id_to_element_dict == first_by_id
+    assert id_to_frame_dict == {element_id: element["frame"] for element_id, element in first_by_id.items()}
+    assert id_to_element_hash == {
+        element_id: scraper_module.hash_element(element) for element_id, element in first_by_id.items()
+    }
     collisions = [log for log in logs if log["event"].startswith("Element ids collide across frames")]
     assert len(collisions) == 1
     assert collisions[0]["log_level"] == level

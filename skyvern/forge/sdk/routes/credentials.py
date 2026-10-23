@@ -45,7 +45,6 @@ from fastapi import BackgroundTasks, Body, Depends, Header, HTTPException, Path,
 from onepassword.client import Client as OnePasswordClient
 from onepassword.errors import DesktopSessionExpiredException, RateLimitExceededException
 from onepassword.types import Item
-from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from skyvern.config import settings
@@ -96,7 +95,6 @@ from skyvern.forge.sdk.schemas.credentials import (
     CredentialTotpCodeResponse,
     CredentialType,
     CredentialVaultType,
-    CreditCardCredentialResponse,
     ImportOnePasswordCredentialsRequest,
     ImportOnePasswordCredentialsResponse,
     NonEmptyPasswordCredential,
@@ -105,10 +103,8 @@ from skyvern.forge.sdk.schemas.credentials import (
     OnePasswordItemOverview,
     OnePasswordItemsResponse,
     PasswordCredential,
-    PasswordCredentialResponse,
     RefreshOnePasswordCredentialsRequest,
     RefreshOnePasswordCredentialsResponse,
-    SecretCredentialResponse,
     TestCredentialRequest,
     TestCredentialResponse,
     TestCredentialStatusResponse,
@@ -122,6 +118,8 @@ from skyvern.forge.sdk.schemas.organizations import (
     AzureOrganizationAuthToken,
     BitwardenCredentialResponse,
     BitwardenCredentialSafe,
+    BitwardenCredentialStatus,
+    BitwardenCredentialStatusResponse,
     BitwardenOrganizationAuthToken,
     BitwardenOrganizationAuthTokenSafe,
     ClearOrganizationAuthTokenResponse,
@@ -142,9 +140,24 @@ from skyvern.forge.sdk.schemas.organizations import (
 from skyvern.forge.sdk.schemas.totp_codes import OTPType, RawTOTPCodeAccepted, TOTPCode, TOTPCodeCreate
 from skyvern.forge.sdk.services import org_auth_service
 from skyvern.forge.sdk.services.bitwarden import BitwardenService
+from skyvern.forge.sdk.services.credential import credential_creation_service
+from skyvern.forge.sdk.services.credential.credential_creation_service import (
+    convert_to_response as _convert_to_response,
+)
+from skyvern.forge.sdk.services.credential.credential_creation_service import (
+    fetch_credential_item_background,
+)
+from skyvern.forge.sdk.services.credential.credential_creation_service import (
+    get_credential_vault_service as _get_credential_vault_service,
+)
+from skyvern.forge.sdk.services.credential.credential_creation_service import (
+    update_credential_or_profile_conflict as _update_credential_or_profile_conflict,
+)
+from skyvern.forge.sdk.services.credential.credential_creation_service import (
+    validate_credential_browser_profile_id as _validate_credential_browser_profile_id,
+)
 from skyvern.forge.sdk.services.credential.credential_vault_service import CredentialVaultService
 from skyvern.forge.sdk.services.credential.custom_credential_vault_service import (
-    CustomCredentialConfigurationError,
     CustomCredentialNotConfiguredError,
 )
 from skyvern.forge.sdk.services.credentials import (
@@ -158,7 +171,6 @@ from skyvern.forge.sdk.services.credentials import (
 from skyvern.forge.sdk.services.onepassword_token_service import resolve_onepassword_token, to_status
 from skyvern.forge.sdk.services.request_principal import RequestPrincipal, get_request_principal, synthetic_user_id
 from skyvern.forge.sdk.services.route_authorization import require_request_actions
-from skyvern.forge.sdk.settings_manager import SettingsManager
 from skyvern.forge.sdk.workflow.browser_session_persistence import retrieve_persisted_workflow_browser_state_dir
 from skyvern.forge.sdk.workflow.models.parameter import WorkflowParameterType
 from skyvern.forge.sdk.workflow.models.workflow import WorkflowRequestBody, WorkflowRunStatus
@@ -485,19 +497,6 @@ def _cache_totp_code_preview(
     )
 
 
-async def fetch_credential_item_background(item_id: str) -> None:
-    """
-    Background task to fetch the recently added credential item from Bitwarden.
-    This triggers Bitwarden to sync the vault earlier so the next request does not have to wait for the sync.
-    """
-    try:
-        LOG.info("Pre-fetching credential item from Bitwarden in background", item_id=item_id)
-        credential_item = await BitwardenService.get_credential_item(item_id)
-        LOG.info("Successfully fetched credential item from Bitwarden", item_id=item_id, name=credential_item.name)
-    except Exception as e:
-        LOG.exception("Failed to fetch credential item from Bitwarden in background", item_id=item_id, error=str(e))
-
-
 @legacy_base_router.post(
     "/totp",
     responses={402: {"description": "Insufficient credits to parse OTP content"}},
@@ -780,51 +779,6 @@ async def get_totp_codes(
     return codes[:limit]
 
 
-async def _validate_credential_browser_profile_id(
-    browser_profile_id: str,
-    organization_id: str,
-    current_credential_id: str | None = None,
-) -> None:
-    """A credential may only link a PLAIN, unowned profile from its own org: not a workflow-managed
-    profile and not one another credential already owns (living credential profiles are auto-created,
-    never hand-linked). Raises HTTP 400 otherwise."""
-    profile = await app.DATABASE.browser_sessions.get_browser_profile(
-        profile_id=browser_profile_id, organization_id=organization_id
-    )
-    if profile is None:
-        raise HTTPException(
-            status_code=400, detail=f"Browser profile not found, browser_profile_id={browser_profile_id}"
-        )
-    if profile.is_managed or profile.workflow_permanent_id is not None:
-        raise HTTPException(
-            status_code=400,
-            detail="A credential can only link a plain browser profile, not a workflow-managed one.",
-        )
-    links_by_profile = await app.DATABASE.credentials.get_browser_profile_credential_links(
-        {browser_profile_id}, organization_id
-    )
-    if any(
-        credential_id != current_credential_id
-        for credential_id, _folder_id in links_by_profile.get(browser_profile_id, [])
-    ):
-        raise HTTPException(
-            status_code=400,
-            detail="This browser profile is already linked to another credential.",
-        )
-
-
-async def _update_credential_or_profile_conflict(**kwargs: Any) -> Credential:
-    """Apply a credential update, translating the one-credential-per-profile unique-constraint violation
-    — the atomic backstop when a concurrent link slips past the read-before-write ownership check — into
-    the same 400 the read-check raises."""
-    try:
-        return await app.DATABASE.credentials.update_credential(**kwargs)
-    except IntegrityError as exc:
-        if "uq_credentials_browser_profile_id" in str(getattr(exc, "orig", exc)):
-            raise HTTPException(status_code=400, detail="This browser profile is already linked to another credential.")
-        raise
-
-
 @legacy_base_router.post("/credentials")
 @legacy_base_router.post("/credentials/", include_in_schema=False)
 @base_router.post(
@@ -875,90 +829,16 @@ async def create_credential(
     current_org: Organization = Depends(org_auth_service.get_current_org_for_credential_routes),
     current_user_id: str | None = Depends(org_auth_service.get_current_user_id_or_none),
 ) -> CredentialResponse:
-    credential_service = await prepare_credential_create(current_org.organization_id, data)
-    credential = await store_new_credential(
-        current_org.organization_id, data, current_user_id, credential_service, background_tasks
-    )
-    return _convert_to_response(credential)
-
-
-async def prepare_credential_create(organization_id: str, data: CreateCredentialRequest) -> CredentialVaultService:
-    """Every check a create runs before it touches a vault; raising here means nothing was stored."""
     if isinstance(data.credential, NonEmptyPasswordCredential):
         await _normalize_authenticator_totp_for_organization_or_raise(
             data.credential,
-            organization_id=organization_id,
+            organization_id=current_org.organization_id,
         )
-
-    await app.AGENT_FUNCTION.validate_credential_write(
-        organization_id=organization_id,
-        credential_type=data.credential_type,
-        credential=data.credential,
-        existing_credential=None,
+    credential_service = await credential_creation_service.prepare_credential_create(current_org.organization_id, data)
+    credential = await credential_creation_service.store_new_credential(
+        current_org.organization_id, data, current_user_id, credential_service, background_tasks
     )
-
-    # Validate the profile link BEFORE provisioning, so an invalid/managed/cross-org/owned profile
-    # rejects with a 400 without leaving an orphan credential (and vault secret) behind.
-    if data.browser_profile_id is not None:
-        await _validate_credential_browser_profile_id(data.browser_profile_id, organization_id)
-
-    return await _get_credential_vault_service(
-        vault_type_override=data.vault_type,
-        organization_id=organization_id,
-    )
-
-
-async def store_new_credential(
-    organization_id: str,
-    data: CreateCredentialRequest,
-    created_by: str | None,
-    credential_service: CredentialVaultService,
-    background_tasks: BackgroundTasks,
-) -> Credential:
-    try:
-        credential = await credential_service.create_credential(
-            organization_id=organization_id,
-            data=data,
-            created_by=created_by,
-        )
-    except SkyvernHttpException as e:
-        detail = (
-            f"Custom credential service returned {e.error_message}"
-            if e.error_message
-            else f"Custom credential service returned HTTP {e.status_code}"
-        )
-        raise HTTPException(status_code=502, detail=detail) from e
-
-    await record_request_audit_event(organization_id, "credential.create", "credential", credential.credential_id)
-    if credential.vault_type == CredentialVaultType.BITWARDEN:
-        # Early resyncing the Bitwarden vault
-        background_tasks.add_task(fetch_credential_item_background, credential.item_id)
-
-    pin_provided = "pin_saved_session_ip" in data.model_fields_set
-    bpid_provided = "browser_profile_id" in data.model_fields_set
-    auto_profile_disabled_provided = "auto_profile_disabled" in data.model_fields_set
-    if bpid_provided or pin_provided or auto_profile_disabled_provided:
-        # Only pass browser_profile_id when the caller sent it, so a pin-only request never passes the
-        # omitted default (None) into the repo's unlink sentinel.
-        profile_update: dict[str, Any] = {"browser_profile_id": data.browser_profile_id} if bpid_provided else {}
-        credential = await _update_credential_or_profile_conflict(
-            credential_id=credential.credential_id,
-            organization_id=organization_id,
-            **profile_update,
-            # Only touch the pin when the caller sent it — supplying a profile alone must not reset it.
-            pin_saved_session_ip=data.pin_saved_session_ip if pin_provided else None,
-            auto_profile_disabled=data.auto_profile_disabled if auto_profile_disabled_provided else None,
-        )
-
-    background_tasks.add_task(
-        app.AGENT_FUNCTION.on_credential_saved,
-        organization_id=organization_id,
-        credential_id=credential.credential_id,
-        credential_type=data.credential_type,
-        actor_user_id=created_by,
-        vault=credential.vault_type.value if credential.vault_type is not None else None,
-    )
-    return credential
+    return _convert_to_response(credential)
 
 
 LOGIN_TEST_PROMPT = (
@@ -1086,8 +966,11 @@ async def rename_credential(
         "credential_id": credential_id,
         "organization_id": current_org.organization_id,
     }
-    if "name" in data.model_fields_set:
+    if data.name is not None:
         update_kwargs["name"] = data.name
+        if credential.is_test_login_temporary is True:
+            # The modal saves an inline test-login credential by renaming it.
+            update_kwargs["is_test_login_temporary"] = False
     if "browser_profile_id" in data.model_fields_set:
         # Explicit null unlinks (user picked Auto after attaching a profile); a non-null value still
         # validates plain/unowned before linking. Omitted leaves the existing link untouched.
@@ -1205,11 +1088,12 @@ async def test_login(
         background_tasks.add_task(fetch_credential_item_background, credential.item_id)
 
     credential_id = credential.credential_id
+    update_kwargs: dict[str, Any] = {
+        "credential_id": credential_id,
+        "organization_id": organization_id,
+        "is_test_login_temporary": True,
+    }
     if "proxy_location" in data.model_fields_set or "proxy_session_id" in data.model_fields_set:
-        update_kwargs: dict[str, Any] = {
-            "credential_id": credential_id,
-            "organization_id": organization_id,
-        }
         _apply_proxy_pin_update(
             update_kwargs,
             proxy_location_was_set="proxy_location" in data.model_fields_set,
@@ -1217,7 +1101,6 @@ async def test_login(
             proxy_session_id_was_set="proxy_session_id" in data.model_fields_set,
             proxy_session_id=data.proxy_session_id,
         )
-        credential = await app.DATABASE.credentials.update_credential(**update_kwargs)
 
     LOG.info(
         "Testing login with inline credentials",
@@ -1266,6 +1149,8 @@ async def test_login(
     )
 
     try:
+        # Mark before workflow setup so any member cleanup can only target this test-login row.
+        credential = await app.DATABASE.credentials.update_credential(**update_kwargs)
         workflow = await app.WORKFLOW_SERVICE.create_workflow_from_request(
             organization=current_org,
             request=workflow_create_request,
@@ -2335,8 +2220,8 @@ TEMP_CREDENTIAL_CLEANUP_WINDOW = timedelta(hours=24)
 @legacy_base_router.delete(
     "/credentials/{credential_id}/temporary",
     status_code=204,
-    summary="Delete a recently created credential",
-    description="Deletes only a credential created by the current user in the last 24 hours.",
+    summary="Delete a temporary credential",
+    description="Deletes a temporary test-login or incomplete passkey credential created by the current user in the last 24 hours.",
     tags=["Credentials"],
     include_in_schema=False,
 )
@@ -2369,7 +2254,9 @@ async def delete_temporary_credential(
     )
 
 
-def _is_recent_credential_created_by(credential: Credential, user_id: str) -> bool:
+def _is_recent_temporary_credential_created_by(credential: Credential, user_id: str) -> bool:
+    if credential.is_test_login_temporary is not True and credential.is_passkey_setup_pending is not True:
+        return False
     created_at = to_naive_utc(credential.created_at)
     if credential.created_by != user_id or created_at is None:
         return False
@@ -2390,10 +2277,12 @@ async def delete_organization_credential(
     )
     if not credential:
         raise HTTPException(status_code=404, detail=f"Credential not found, credential_id={credential_id}")
-    if expected_created_by is not None and not _is_recent_credential_created_by(credential, expected_created_by):
+    if expected_created_by is not None and not _is_recent_temporary_credential_created_by(
+        credential, expected_created_by
+    ):
         raise HTTPException(status_code=404, detail=f"Credential not found, credential_id={credential_id}")
 
-    requires_write_lock = await app.AGENT_FUNCTION.should_lock_credential_write(
+    requires_write_lock = expected_created_by is not None or await app.AGENT_FUNCTION.should_lock_credential_write(
         credential=None,
         existing_credential=credential,
     )
@@ -2410,7 +2299,7 @@ async def delete_organization_credential(
         )
         if not latest_credential:
             raise HTTPException(status_code=404, detail=f"Credential not found, credential_id={credential_id}")
-        if expected_created_by is not None and not _is_recent_credential_created_by(
+        if expected_created_by is not None and not _is_recent_temporary_credential_created_by(
             latest_credential, expected_created_by
         ):
             raise HTTPException(status_code=404, detail=f"Credential not found, credential_id={credential_id}")
@@ -2447,69 +2336,69 @@ async def delete_organization_credential(
                 vault_type=vault_type,
             )
 
-    # Reap the credential's living browser profile so deleting a credential doesn't silently orphan
-    # its cookie-bearing archive (unbounded S3 growth). Kept if a live owner still references it. The
-    # reap hard-deletes the profile's S3 archive (irreversible, version-purging), so it rides the engine
-    # kill-switch: flag-off orgs never lose a saved profile on credential delete (v1 has no unlink to
-    # recover with), and a rollback disables it.
-    profile_id = credential.browser_profile_id
-    if profile_id and await app.AGENT_FUNCTION.is_browser_memory_engine_enabled_for_org(organization_id):
-        try:
-            # Narrow accepted race: a concurrent re-link between this check and the delete below.
-            if await app.DATABASE.browser_sessions.has_live_browser_profile_references(
-                profile_id=profile_id,
-                organization_id=organization_id,
-                exclude_credential_id=credential_id,
-            ):
-                LOG.info(
-                    "browser_memory.credential_profile_kept",
-                    organization_id=organization_id,
-                    credential_id=credential_id,
-                    browser_profile_id=profile_id,
-                )
-            else:
-                # Erase the S3 archive first (idempotent, version-purging) so cookies are gone even if
-                # the DB row was already soft-deleted; then soft-delete the row for bookkeeping.
-                await app.STORAGE.delete_browser_profile(
-                    organization_id=organization_id,
+        # Reap the credential's living browser profile so deleting a credential doesn't silently orphan
+        # its cookie-bearing archive (unbounded S3 growth). Kept if a live owner still references it. The
+        # reap hard-deletes the profile's S3 archive (irreversible, version-purging), so it rides the engine
+        # kill-switch: flag-off orgs never lose a saved profile on credential delete (v1 has no unlink to
+        # recover with), and a rollback disables it.
+        profile_id = credential.browser_profile_id
+        if profile_id and await app.AGENT_FUNCTION.is_browser_memory_engine_enabled_for_org(organization_id):
+            try:
+                # Narrow accepted race: a concurrent re-link between this check and the delete below.
+                if await app.DATABASE.browser_sessions.has_live_browser_profile_references(
                     profile_id=profile_id,
-                    hard_delete=True,
-                )
-                try:
-                    await app.DATABASE.browser_sessions.delete_browser_profile(
-                        profile_id=profile_id,
-                        organization_id=organization_id,
-                    )
-                except BrowserProfileNotFound:
-                    pass
-                except Exception:
-                    # Erasure already succeeded; only the row soft-delete failed, leaving the row
-                    # alive with its blob gone. Log distinctly (not reap_failed) — the stale-memory
-                    # sweep reaps such rows.
-                    LOG.exception(
-                        "browser_memory.credential_profile_row_delete_failed",
+                    organization_id=organization_id,
+                    exclude_credential_id=credential_id,
+                ):
+                    LOG.info(
+                        "browser_memory.credential_profile_kept",
                         organization_id=organization_id,
                         credential_id=credential_id,
                         browser_profile_id=profile_id,
                     )
-                LOG.info(
-                    "browser_memory.credential_profile_reaped",
+                else:
+                    # Erase the S3 archive first (idempotent, version-purging) so cookies are gone even if
+                    # the DB row was already soft-deleted; then soft-delete the row for bookkeeping.
+                    await app.STORAGE.delete_browser_profile(
+                        organization_id=organization_id,
+                        profile_id=profile_id,
+                        hard_delete=True,
+                    )
+                    try:
+                        await app.DATABASE.browser_sessions.delete_browser_profile(
+                            profile_id=profile_id,
+                            organization_id=organization_id,
+                        )
+                    except BrowserProfileNotFound:
+                        pass
+                    except Exception:
+                        # Erasure already succeeded; only the row soft-delete failed, leaving the row
+                        # alive with its blob gone. Log distinctly (not reap_failed) — the stale-memory
+                        # sweep reaps such rows.
+                        LOG.exception(
+                            "browser_memory.credential_profile_row_delete_failed",
+                            organization_id=organization_id,
+                            credential_id=credential_id,
+                            browser_profile_id=profile_id,
+                        )
+                    LOG.info(
+                        "browser_memory.credential_profile_reaped",
+                        organization_id=organization_id,
+                        credential_id=credential_id,
+                        browser_profile_id=profile_id,
+                    )
+            except Exception as exc:
+                # The reap did not complete (typically the S3 hard-delete raised): the cookie-bearing archive
+                # is RETAINED and the row is left alive (the soft-delete runs only after a successful erase),
+                # so it stays discoverable for the stale-memory sweep. Never fail the user-facing delete for
+                # this (204 stands) — but log LOUD + alertable so the retained archive is not silently orphaned.
+                LOG.exception(
+                    "browser_memory.credential_profile_reap_failed",
                     organization_id=organization_id,
                     credential_id=credential_id,
                     browser_profile_id=profile_id,
+                    error=str(exc),
                 )
-        except Exception as exc:
-            # The reap did not complete (typically the S3 hard-delete raised): the cookie-bearing archive
-            # is RETAINED and the row is left alive (the soft-delete runs only after a successful erase),
-            # so it stays discoverable for the stale-memory sweep. Never fail the user-facing delete for
-            # this (204 stands) — but log LOUD + alertable so the retained archive is not silently orphaned.
-            LOG.exception(
-                "browser_memory.credential_profile_reap_failed",
-                organization_id=organization_id,
-                credential_id=credential_id,
-                browser_profile_id=profile_id,
-                error=str(exc),
-            )
 
     _clear_cached_totp_code_preview(organization_id=organization_id, credential_id=credential_id)
     await record_request_audit_event(
@@ -3979,19 +3868,19 @@ def _to_safe_bitwarden_response(auth_token: BitwardenOrganizationAuthToken) -> B
 
 @base_router.get(
     "/credentials/bitwarden/get",
-    response_model=BitwardenCredentialResponse,
+    response_model=BitwardenCredentialResponse | BitwardenCredentialStatusResponse,
     summary="Get Bitwarden credential",
     description="Retrieves the current Bitwarden credential for the organization. The master_password is never returned for security.",
     include_in_schema=False,
 )
 @base_router.get(
     "/credentials/bitwarden/get/",
-    response_model=BitwardenCredentialResponse,
+    response_model=BitwardenCredentialResponse | BitwardenCredentialStatusResponse,
     include_in_schema=False,
 )
 async def get_bitwarden_credential(
     current_org: Organization = Depends(org_auth_service.get_current_org_for_credential_routes),
-) -> BitwardenCredentialResponse:
+) -> BitwardenCredentialResponse | BitwardenCredentialStatusResponse:
     """
     Get the current Bitwarden credential for the organization.
     """
@@ -4006,6 +3895,16 @@ async def get_bitwarden_credential(
                 detail="No Bitwarden credential found for this organization",
             )
 
+        if await _should_redact_org_credential_secrets(current_org.organization_id):
+            return BitwardenCredentialStatusResponse(
+                token=BitwardenCredentialStatus(
+                    id=auth_token.id,
+                    token_type=auth_token.token_type,
+                    valid=auth_token.valid,
+                    created_at=auth_token.created_at,
+                    modified_at=auth_token.modified_at,
+                )
+            )
         return _to_safe_bitwarden_response(auth_token)
 
     except HTTPException:
@@ -4436,53 +4335,6 @@ async def test_custom_credential_service_connection(
         ) from e
 
 
-async def _get_credential_vault_service(
-    vault_type_override: CredentialVaultType | None = None,
-    organization_id: str | None = None,
-) -> CredentialVaultService:
-    """Resolve the vault service for a request.
-
-    Callers about to write a secret pass ``organization_id`` so a vault configured per organization
-    is preflighted here and an unusable configuration is refused before the write is attempted.
-    """
-    settings = SettingsManager.get_settings()
-    vault_type = vault_type_override or settings.CREDENTIAL_VAULT_TYPE
-    service: CredentialVaultService
-    if vault_type == CredentialVaultType.SKYVERN:
-        if not settings.is_local_credential_vault_enabled():
-            raise HTTPException(status_code=400, detail="Skyvern local credential vault is not enabled")
-        if not app.SKYVERN_CREDENTIAL_VAULT_SERVICE:
-            raise HTTPException(status_code=400, detail="Skyvern local credential vault is not configured")
-        service = app.SKYVERN_CREDENTIAL_VAULT_SERVICE
-    elif vault_type == CredentialVaultType.BITWARDEN:
-        service = app.BITWARDEN_CREDENTIAL_VAULT_SERVICE
-    elif vault_type == CredentialVaultType.AZURE_VAULT:
-        if not app.AZURE_CREDENTIAL_VAULT_SERVICE:
-            raise HTTPException(status_code=400, detail="Azure Vault credential is not supported")
-        service = app.AZURE_CREDENTIAL_VAULT_SERVICE
-    elif vault_type == CredentialVaultType.GCP:
-        if not app.GCP_CREDENTIAL_VAULT_SERVICE:
-            raise HTTPException(status_code=400, detail="GCP credential vault is not supported")
-        service = app.GCP_CREDENTIAL_VAULT_SERVICE
-    elif vault_type == CredentialVaultType.CUSTOM:
-        if not app.CUSTOM_CREDENTIAL_VAULT_SERVICE:
-            raise HTTPException(status_code=400, detail="Custom credential vault is not supported")
-        service = app.CUSTOM_CREDENTIAL_VAULT_SERVICE
-    elif vault_type == CredentialVaultType.ONEPASSWORD:
-        service = app.ONEPASSWORD_CREDENTIAL_VAULT_SERVICE
-    else:
-        raise HTTPException(status_code=400, detail="Credential storage not supported")
-
-    if organization_id is not None:
-        try:
-            await service.validate_organization_configuration(organization_id)
-        except CustomCredentialConfigurationError as e:
-            # Already reported by the vault service; re-logging here would double-count.
-            raise HTTPException(status_code=400, detail=str(e)) from e
-
-    return service
-
-
 async def _delete_temporary_test_login_credential(
     *,
     credential_id: str,
@@ -4505,94 +4357,3 @@ async def _delete_temporary_test_login_credential(
         organization_id=organization_id,
         reason=reason,
     )
-
-
-def _convert_to_response(credential: Credential) -> CredentialResponse:
-    """Convert an internal ``Credential`` to a safe API response.
-
-    SECURITY: This function must ONLY copy non-sensitive metadata into the
-    response. Never include passwords, TOTP secrets, full card numbers, CVVs,
-    expiration dates, card holder names, credit card billing/contact fields,
-    credit card metadata, or secret values. See the module
-    docstring for the full security invariant.
-    """
-    is_onepassword = credential.vault_type == CredentialVaultType.ONEPASSWORD
-    if credential.credential_type == CredentialType.PASSWORD:
-        credential_response = PasswordCredentialResponse(
-            username=credential.username or credential.credential_id,
-            totp_type=credential.totp_type,
-            totp_identifier=credential.totp_identifier,
-            has_totp=bool(credential.has_totp_seed),
-        )
-        return CredentialResponse(
-            credential=credential_response,
-            credential_id=credential.credential_id,
-            credential_type=credential.credential_type,
-            name=credential.name,
-            vault_type=credential.vault_type,
-            vault_id=credential.vault_id if is_onepassword else None,
-            item_id=credential.item_id if is_onepassword else None,
-            upstream_missing_at=credential.upstream_missing_at if is_onepassword else None,
-            browser_profile_id=credential.browser_profile_id,
-            auto_profile_disabled=credential.auto_profile_disabled,
-            pin_saved_session_ip=credential.pin_saved_session_ip,
-            tested_url=credential.tested_url,
-            user_context=credential.user_context,
-            save_browser_session_intent=credential.save_browser_session_intent,
-            run_sequentially=credential.run_sequentially,
-            folder_id=credential.folder_id,
-            proxy_location=credential.proxy_location,
-            proxy_session_id=credential.proxy_session_id,
-            created_by=credential.created_by,
-        )
-    elif credential.credential_type == CredentialType.CREDIT_CARD:
-        credential_response = CreditCardCredentialResponse(
-            last_four=credential.card_last4 or "****",
-            brand=credential.card_brand or "Card Brand",
-        )
-        return CredentialResponse(
-            credential=credential_response,
-            credential_id=credential.credential_id,
-            credential_type=credential.credential_type,
-            name=credential.name,
-            vault_type=credential.vault_type,
-            vault_id=credential.vault_id if is_onepassword else None,
-            item_id=credential.item_id if is_onepassword else None,
-            upstream_missing_at=credential.upstream_missing_at if is_onepassword else None,
-            browser_profile_id=credential.browser_profile_id,
-            auto_profile_disabled=credential.auto_profile_disabled,
-            pin_saved_session_ip=credential.pin_saved_session_ip,
-            tested_url=credential.tested_url,
-            user_context=credential.user_context,
-            save_browser_session_intent=credential.save_browser_session_intent,
-            run_sequentially=credential.run_sequentially,
-            folder_id=credential.folder_id,
-            proxy_location=credential.proxy_location,
-            proxy_session_id=credential.proxy_session_id,
-            created_by=credential.created_by,
-        )
-    elif credential.credential_type == CredentialType.SECRET:
-        credential_response = SecretCredentialResponse(secret_label=credential.secret_label)
-        return CredentialResponse(
-            credential=credential_response,
-            credential_id=credential.credential_id,
-            credential_type=credential.credential_type,
-            name=credential.name,
-            vault_type=credential.vault_type,
-            vault_id=credential.vault_id if is_onepassword else None,
-            item_id=credential.item_id if is_onepassword else None,
-            upstream_missing_at=credential.upstream_missing_at if is_onepassword else None,
-            browser_profile_id=credential.browser_profile_id,
-            auto_profile_disabled=credential.auto_profile_disabled,
-            pin_saved_session_ip=credential.pin_saved_session_ip,
-            tested_url=credential.tested_url,
-            user_context=credential.user_context,
-            save_browser_session_intent=credential.save_browser_session_intent,
-            run_sequentially=credential.run_sequentially,
-            folder_id=credential.folder_id,
-            proxy_location=credential.proxy_location,
-            proxy_session_id=credential.proxy_session_id,
-            created_by=credential.created_by,
-        )
-    else:
-        raise HTTPException(status_code=400, detail="Credential type not supported")

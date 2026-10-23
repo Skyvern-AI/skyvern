@@ -13,8 +13,6 @@ Channel data:
 from __future__ import annotations
 
 import asyncio
-import functools
-import pathlib
 import typing as t
 
 import structlog
@@ -52,23 +50,6 @@ class ChannelContext(t.Protocol):
 
     @property
     def identity(self) -> dict[str, t.Any]: ...
-
-
-@functools.lru_cache(maxsize=None)
-def _load_js_asset(file_name: str) -> str:
-    # Module-level so the cache key is the asset name only. A method-level lru_cache
-    # keys on `self`, pinning every channel instance (and its Playwright driver) for
-    # the lifetime of the process.
-    base_path = pathlib.Path(__file__).parent / "js"
-    file_name = file_name.lstrip("/")
-
-    if not file_name.endswith(".js"):
-        file_name += ".js"
-
-    full_path = base_path / pathlib.Path(file_name)
-
-    with open(full_path, encoding="utf-8") as f:
-        return f.read()
 
 
 class CdpChannel:
@@ -261,6 +242,3 @@ class CdpChannel:
         except Exception:
             LOG.exception(f"{self.class_name} failed to evaluate js", expression=expression, **self.identity)
             raise
-
-    def js(self, file_name: str) -> str:
-        return _load_js_asset(file_name)

@@ -138,7 +138,7 @@ def test_collects_conditional_branch_target_gated_blocks() -> None:
 def test_ignores_non_enterprise_models_and_engines() -> None:
     workflow = _workflow(
         [_navigation_block("standard", model={"model_name": "gpt-4o"})],
-        model={"model_name": "gemini-2.5-flash"},
+        model={"model_name": "gemini-3.0-flash"},
     )
 
     assert _collect_enterprise_gated_workflow_features(workflow) == set()

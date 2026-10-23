@@ -49,7 +49,6 @@ from skyvern.forge.sdk.copilot.credential_resolution import (
 from skyvern.forge.sdk.copilot.diagnosis_repair_contract import DiagnosisFailureType, RepairNextAction
 from skyvern.forge.sdk.copilot.human_input_wait import pause_human_input
 from skyvern.forge.sdk.copilot.request_policy import RequestPolicy
-from skyvern.forge.sdk.credential_site_policy import same_site
 from skyvern.forge.sdk.schemas.credentials import Credential
 from skyvern.forge.sdk.schemas.workflow_copilot import (
     CredentialPauseResolvedOutcome,
@@ -1088,7 +1087,7 @@ async def _run_credential_pause(
             vault_sites = await _read_vault_named_sites(ctx, named_credential_id)
         except PermissionError:
             vault_sites = None
-        if vault_sites is None or (vault_sites and not any(same_site(login_page_urls[0], uri) for uri in vault_sites)):
+        if vault_sites is None or (vault_sites and not any(site.admits(login_page_urls[0]) for site in vault_sites)):
             named_credential_id = None
     timeout_seconds = copilot_config.credential_pause_timeout_seconds
     now = datetime.now(timezone.utc)

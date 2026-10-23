@@ -30,8 +30,10 @@ from skyvern.webeye.real_browser_state import RealBrowserState, _same_page_ignor
 def browser_state(monkeypatch: pytest.MonkeyPatch) -> RealBrowserState:
     retry_sleep = AsyncMock()
     monkeypatch.setattr(real_browser_state, "navigate_with_retry", partial(navigate_with_retry, sleep=retry_sleep))
-    # Bypass __init__; navigate_to_url only uses `self` for LOG context and _wait_for_settle.
+    # Bypass __init__; navigate_to_url only uses `self` for LOG context, _wait_for_settle and the
+    # run's browser-loss fact (none here).
     state = RealBrowserState.__new__(RealBrowserState)
+    state._connection_loss = None
     monkeypatch.setattr(state, "_wait_for_settle", AsyncMock())
     return state
 

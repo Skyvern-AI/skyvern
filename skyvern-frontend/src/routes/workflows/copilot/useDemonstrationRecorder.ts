@@ -68,6 +68,8 @@ export function useDemonstrationRecorder({
     useState(false);
   const [limitReached, setLimitReached] = useState(false);
   const [browserRestarted, setBrowserRestarted] = useState(false);
+  // The backend refuses demonstrations with 403 when its cache is not shared (no Redis).
+  const [unavailable, setUnavailable] = useState(false);
   const busyRef = useRef(false);
   const streamControllerRef = useRef<AbortController | null>(null);
   const demonstrationIdRef = useRef<string | null>(null);
@@ -551,6 +553,7 @@ export function useDemonstrationRecorder({
               signal: controller.signal,
             },
           );
+        setUnavailable(false);
         if (
           !response.data ||
           typeof response.data.demonstration_id !== "string" ||
@@ -574,8 +577,9 @@ export function useDemonstrationRecorder({
         setLimitReached(!response.data.can_resume);
         insertionRef.current = response.data.insertion ?? undefined;
         updatePhase("stopped");
-      } catch {
-        return;
+      } catch (error) {
+        if (isAxiosError(error) && error.response?.status === 403)
+          setUnavailable(true);
       }
     })();
     return () => {
@@ -612,6 +616,7 @@ export function useDemonstrationRecorder({
     hasSkippedSensitiveField,
     limitReached,
     browserRestarted,
+    unavailable,
     busy,
     start,
     resume,

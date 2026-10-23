@@ -551,6 +551,9 @@ def _browser_state_diagnostic_suffix(
     return suffix
 
 
+BROWSER_CONNECTION_LOST_ERROR_CODE = "browser_connection_lost"
+
+
 class MissingBrowserState(SkyvernException):
     def __init__(
         self,

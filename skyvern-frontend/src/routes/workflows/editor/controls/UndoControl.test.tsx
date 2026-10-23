@@ -10,7 +10,6 @@ import {
 import { afterEach, beforeEach, describe, expect, test, vi } from "vitest";
 
 import { useWorkflowHistoryAccessStore } from "@/store/WorkflowHistoryAccessStore";
-import { useRecordingStore } from "@/store/useRecordingStore";
 
 import { UndoControl } from "./UndoControl";
 
@@ -25,7 +24,6 @@ describe("UndoControl", () => {
       redo: vi.fn(),
       captureImmediately: vi.fn(),
     });
-    useRecordingStore.setState({ isRecording: false });
   });
 
   afterEach(() => {
@@ -66,21 +64,5 @@ describe("UndoControl", () => {
     render(<UndoControl />);
     fireEvent.click(screen.getByRole("button", { name: /undo/i }));
     expect(undo).toHaveBeenCalledTimes(1);
-  });
-
-  test("button is disabled while recording even when canUndo is true", () => {
-    useWorkflowHistoryAccessStore.getState().setHistoryAccess({
-      canUndo: true,
-      canRedo: false,
-      undo,
-      redo: vi.fn(),
-      captureImmediately: vi.fn(),
-    });
-    useRecordingStore.setState({ isRecording: true });
-    render(<UndoControl />);
-    const btn = screen.getByRole("button", { name: /undo/i });
-    expect(btn.hasAttribute("disabled")).toBe(true);
-    fireEvent.click(btn);
-    expect(undo).not.toHaveBeenCalled();
   });
 });

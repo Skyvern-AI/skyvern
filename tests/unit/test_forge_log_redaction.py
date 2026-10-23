@@ -1589,7 +1589,10 @@ def test_setup_logger_pins_redactor_processor_order() -> None:
         assert names.index("redact_bearer_tokens") < names.index("redact_sensitive_event_fields")
         assert names.index("compact_action_objects") < names.index("redact_sensitive_event_fields")
         assert names.index("redact_sensitive_event_fields") < names.index("redact_registered_secrets")
-        assert names.index("redact_registered_secrets") + 1 == names.index("skyvern_logs_processor")
+        privacy_boundaries = [index for index, name in enumerate(names) if name == "redact_private_log_event"]
+        assert privacy_boundaries[0] == 0
+        assert privacy_boundaries[-1] == names.index("redact_registered_secrets") + 1
+        assert privacy_boundaries[-1] + 1 == names.index("skyvern_logs_processor")
     finally:
         structlog.configure(**saved_config)
         root.handlers[:] = saved_handlers

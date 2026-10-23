@@ -3,7 +3,7 @@ from __future__ import annotations
 import asyncio
 import re
 from collections.abc import Collection, Sequence
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import structlog
 import yaml
@@ -15,29 +15,45 @@ from skyvern.forge.sdk.copilot.blocker_signal import (
 )
 from skyvern.forge.sdk.copilot.context import CopilotContext
 from skyvern.forge.sdk.copilot.credential_resolution import (
+    ConnectedVault,
+    ConnectedVaultFailure,
+    ConnectedVaultLogin,
+    connected_vault_login_sites,
     credential_reference_spans,
-    grounded_credential_references,
     grounded_references,
+    load_connected_vault,
     load_credentials,
+    loggable_origin,
 )
 from skyvern.forge.sdk.copilot.request_policy import RequestPolicy
 from skyvern.forge.sdk.copilot.runtime import AgentContext
 from skyvern.forge.sdk.copilot.secret_scrub import scrub_secrets_from_structure
 from skyvern.forge.sdk.copilot.workflow_credential_utils import (
+    BITWARDEN_LOGIN_PARAMETER_SECRET_KEYS,
+    CONNECTED_VAULT_ID_PREFIX,
+    bitwarden_login_parameter_credential_id,
+    bitwarden_secret_bindings,
     block_credential_ids,
+    connected_vault_item_id,
     credential_param_ids,
     declared_non_credential_keys,
+    declared_parameters,
     saved_credential_ids,
     workflow_blocks,
 )
 from skyvern.forge.sdk.copilot.workflow_yaml import dump_workflow_yaml
+from skyvern.forge.sdk.credential_site_policy import LoginSite
 from skyvern.forge.sdk.schemas.copilot_turn_outcome import ConnectedAccountChoice
 from skyvern.forge.sdk.schemas.credentials import Credential, CredentialType, TotpType
 from skyvern.forge.sdk.schemas.google_oauth import GoogleOAuthCredentialBase
 from skyvern.forge.sdk.services import google_oauth_service, google_sheets_service
-from skyvern.forge.sdk.workflow.models.parameter import WorkflowParameterType
+from skyvern.forge.sdk.workflow.models.parameter import ParameterType, WorkflowParameterType
 from skyvern.schemas.google_sheets import extract_sheet_gid, extract_spreadsheet_id, is_plain_cell_range
+from skyvern.utils.strings import is_uuid
 from skyvern.utils.yaml_loader import safe_load_no_dates
+
+if TYPE_CHECKING:
+    from skyvern.forge.sdk.workflow.models.workflow import WorkflowDefinition
 
 from ._shared import _iter_yaml_blocks, _workflow_definition_as_dict
 from .banned_blocks import CREDENTIAL_CODE_ACCESSORS, ONE_TIME_CODE_TOTP_TYPES, credential_code_accessors
@@ -59,7 +75,7 @@ def _extract_credential_ids_from_tool_value(value: Any) -> list[str]:
             # search prose for them: account authority comes from a verified click, a persisted
             # workflow binding, or a selected native Sheets binding cited from this turn's
             # server-owned integration result. This extractor is only the later validation seam.
-            if item.startswith("goac_"):
+            if item.startswith(("goac_", CONNECTED_VAULT_ID_PREFIX)):
                 found.append(item)
         elif isinstance(item, dict):
             for nested in item.values():
@@ -102,6 +118,10 @@ def _extract_credential_ids_from_workflow_parameters(parameters: Any) -> list[st
 
     found: list[str] = []
     for parameter in parameters:
+        vault_id = bitwarden_login_parameter_credential_id(parameter)
+        if vault_id is not None:
+            found.append(vault_id)
+            continue
         slot_field = _credential_parameter_slot_field(parameter)
         if slot_field is None:
             continue
@@ -253,7 +273,11 @@ def _unbacked_templated_google_sheet_slots(parsed: dict[str, Any], selected_labe
     run time with no citation, approval, state, or scope check and carries no authority of its own."""
     definition = parsed.get("workflow_definition")
     parameters = definition.get("parameters") if isinstance(definition, dict) else None
-    credential_keys = set(credential_param_ids(parameters))
+    credential_keys = {
+        key
+        for key, ids in credential_param_ids(parameters).items()
+        if not any(credential_id.startswith(CONNECTED_VAULT_ID_PREFIX) for credential_id in ids)
+    }
     return [
         reference
         for block in workflow_blocks(parsed, selected_labels=selected_labels)
@@ -616,7 +640,11 @@ def _saved_workflow_credential_ids(request_policy: RequestPolicy) -> set[str]:
     # Read from the saved workflow row at turn start. Deliberately not the submitted YAML: that is the
     # live canvas, which carries a copilot proposal until the user accepts or rejects it, so a binding
     # the model staged would come back as authority on the next turn.
-    return saved_credential_ids(request_policy.persisted_workflow_credential_ids)
+    return saved_credential_ids(request_policy.persisted_workflow_credential_ids) | {
+        credential_id
+        for credential_id in request_policy.persisted_workflow_credential_ids
+        if credential_id.startswith(CONNECTED_VAULT_ID_PREFIX)
+    }
 
 
 def _approved_run_credential_ids(request_policy: RequestPolicy | None) -> set[str]:
@@ -739,9 +767,14 @@ def _credential_run_approval_error(
     request_policy: RequestPolicy | None,
     *,
     additional_approved_ids: Collection[str] = (),
+    workflow_definition: WorkflowDefinition | dict[str, Any] | None = None,
 ) -> str | None:
+    """``workflow_definition`` is the definition the ids were read from; without one, no vault login is bound."""
     if not credential_ids:
         return None
+    placement_error = _connected_vault_placement_error(credential_ids, workflow_definition)
+    if placement_error is not None:
+        return placement_error
     approved_ids = _approved_run_credential_ids(request_policy) | set(additional_approved_ids)
     unapproved_ids = [credential_id for credential_id in credential_ids if credential_id not in approved_ids]
     if not unapproved_ids:
@@ -817,6 +850,7 @@ def _saved_unapproved_google_connection_ids(request_policy: RequestPolicy | None
         credential_id
         for credential_id in request_policy.persisted_workflow_credential_ids
         if not _CREDENTIAL_ID_RE.fullmatch(credential_id.strip())
+        and not credential_id.startswith(CONNECTED_VAULT_ID_PREFIX)
     } - approved_ids
 
 
@@ -871,12 +905,130 @@ async def _server_verified_google_account_choices(
     return choices or None
 
 
-async def _credential_ids_validation_error(credential_ids: list[str], ctx: AgentContext) -> str | None:
+def _bitwarden_login_parameters(
+    workflow_definition: WorkflowDefinition | dict[str, Any] | None,
+) -> dict[str, list[dict[str, Any]]]:
+    """Each connected-vault id with the `bitwarden_login_credential` parameters that bind it."""
+    bindings: dict[str, list[dict[str, Any]]] = {}
+    for parameter in declared_parameters({"workflow_definition": _workflow_definition_as_dict(workflow_definition)}):
+        if (vault_id := bitwarden_login_parameter_credential_id(parameter)) is not None:
+            bindings.setdefault(vault_id, []).append(parameter)
+    return bindings
+
+
+def _connected_vault_placement_error(
+    credential_ids: Collection[str], workflow_definition: WorkflowDefinition | dict[str, Any] | None
+) -> str | None:
+    bound = _bitwarden_login_parameters(workflow_definition)
+    misplaced = [
+        credential_id
+        for credential_id in credential_ids
+        if credential_id.startswith(CONNECTED_VAULT_ID_PREFIX) and credential_id not in bound
+    ]
+    if not misplaced:
+        return None
+    return (
+        f"{', '.join(f'`{vault_id}`' for vault_id in misplaced)} names a login in the connected Bitwarden vault. "
+        "Bind it only through a `bitwarden_login_credential` parameter copied from the `workflow_parameter` "
+        "that `list_credentials` returns with `exact_reference` set to the login's title; a credential slot or "
+        "run input cannot carry it."
+    )
+
+
+def _unpinned_vault_binding_ids(
+    vault_ids: list[str], workflow_definition: WorkflowDefinition | dict[str, Any] | None
+) -> list[str]:
+    """Bindings whose item id is not a literal Bitwarden item id (the runtime resolves a parameter key first), or
+    that name an account other than the organization's connected one."""
+    bindings = _bitwarden_login_parameters(workflow_definition)
+    parameter_keys = {
+        parameter.get("key")
+        for parameter in declared_parameters({"workflow_definition": _workflow_definition_as_dict(workflow_definition)})
+        if isinstance(parameter, dict)
+    }
+    return [
+        vault_id
+        for vault_id in vault_ids
+        if not is_uuid(item_id := connected_vault_item_id(vault_id) or "")
+        or item_id in parameter_keys
+        or any(
+            parameter.get(field_name) != placeholder
+            for parameter in bindings.get(vault_id, [])
+            for field_name, placeholder in BITWARDEN_LOGIN_PARAMETER_SECRET_KEYS.items()
+        )
+    ]
+
+
+async def _connected_vault_reference_error(
+    vault_ids: list[str], ctx: AgentContext, workflow_definition: WorkflowDefinition | dict[str, Any] | None
+) -> str | None:
+    placement_error = _connected_vault_placement_error(vault_ids, workflow_definition)
+    if placement_error is not None:
+        return placement_error
+    policy = ctx.request_policy
+    saved = set(policy.persisted_workflow_credential_ids) if policy is not None else set()
+    unsaved = [vault_id for vault_id in vault_ids if vault_id not in saved]
+    if not unsaved:
+        return None
+    unpinned = _unpinned_vault_binding_ids(unsaved, workflow_definition)
+    if unpinned:
+        return (
+            "A `bitwarden_login_credential` parameter must copy the `workflow_parameter` from `exact_reference` "
+            "as given: "
+            "`bitwarden_item_id` is that login's literal item id (not a template, a parameter key, or a URL-only "
+            "lookup) and the `bitwarden_*_aws_secret_key` fields keep their placeholders. Refused: "
+            f"{', '.join(f'`{vault_id}`' for vault_id in unpinned)}."
+        )
+    vault = await load_connected_vault(ctx.organization_id, policy)
+    if vault.status == "not_available_to_user":
+        return (
+            "The connected Bitwarden vault is not available to this user, because their credential access is "
+            "limited to specific folders, so a Bitwarden login cannot be bound here."
+        )
+    if vault.status != "connected":
+        # The literal id cannot be checked against the vault now; run approval still gates it.
+        return None
+    unlisted = [vault_id for vault_id in unsaved if vault.login(vault_id) is None]
+    if unlisted:
+        return (
+            "These are not logins the connected Bitwarden vault lists: "
+            f"{', '.join(f'`{vault_id}`' for vault_id in unlisted)}. Bind a login from `vault_logins`."
+        )
+    bindings = _bitwarden_login_parameters(workflow_definition)
+    # The runtime reads the item from the collection the parameter names, so it must be the listed one.
+    moved = [
+        vault_id
+        for vault_id in unsaved
+        if (login := vault.login(vault_id)) is not None
+        and any(
+            (parameter.get("bitwarden_collection_id") or None) != (login.collection_id or None)
+            for parameter in bindings.get(vault_id, [])
+        )
+    ]
+    if not moved:
+        return None
+    return (
+        f"{', '.join(f'`{vault_id}`' for vault_id in moved)}: `bitwarden_collection_id` must be the collection "
+        "the `workflow_parameter` from `exact_reference` gives."
+    )
+
+
+async def _credential_ids_validation_error(
+    credential_ids: list[str],
+    ctx: AgentContext,
+    *,
+    workflow_definition: WorkflowDefinition | dict[str, Any] | None = None,
+) -> str | None:
     if not credential_ids:
         return None
+    vault_ids = [
+        credential_id for credential_id in credential_ids if credential_id.startswith(CONNECTED_VAULT_ID_PREFIX)
+    ]
     google_connection_ids = [credential_id for credential_id in credential_ids if credential_id.startswith("goac_")]
     password_credential_ids = [
-        credential_id for credential_id in credential_ids if not credential_id.startswith("goac_")
+        credential_id
+        for credential_id in credential_ids
+        if not credential_id.startswith(("goac_", CONNECTED_VAULT_ID_PREFIX))
     ]
     try:
         existing_credentials = (
@@ -913,15 +1065,27 @@ async def _credential_ids_validation_error(credential_ids: list[str], ctx: Agent
             "Stop before running the workflow and ask the user to reconnect or select an active account "
             "on the Integrations page."
         )
+    if vault_ids:
+        return await _connected_vault_reference_error(vault_ids, ctx, workflow_definition)
     return None
 
 
 async def _credential_reference_validation_error(value: Any, ctx: AgentContext) -> str | None:
     if isinstance(value, str):
-        credential_ids = _extract_credential_ids_from_workflow_yaml(value)
-    else:
-        credential_ids = _extract_credential_ids_from_tool_value(value)
-    return await _credential_ids_validation_error(credential_ids, ctx)
+        policy = ctx.request_policy
+        existing = policy.existing_bitwarden_secret_bindings if policy is not None else set()
+        if bitwarden_secret_bindings(value) - existing:
+            return (
+                "Copilot cannot add or change a `bitwarden_sensitive_information` or `bitwarden_credit_card_data` "
+                "parameter; only logins from the connected Bitwarden vault can be bound, through "
+                "`bitwarden_login_credential`. The user can add the parameter in the workflow editor."
+            )
+        return await _credential_ids_validation_error(
+            _extract_credential_ids_from_workflow_yaml(value),
+            ctx,
+            workflow_definition=_parsed_workflow_definition(value),
+        )
+    return await _credential_ids_validation_error(_extract_credential_ids_from_tool_value(value), ctx)
 
 
 def _serialize_credential(credential: Credential) -> dict[str, Any]:
@@ -966,6 +1130,58 @@ def _serialize_credential(credential: Credential) -> dict[str, Any]:
     return entry
 
 
+_ACCOUNT_SETTINGS_CHECKS = (
+    "the email saved on the Bitwarden connection in Settings",
+    "the master password saved on the Bitwarden connection",
+    "that the Bitwarden account is hosted on vault.bitwarden.com",
+)
+_CONNECTED_VAULT_CHECKS: dict[ConnectedVaultFailure, tuple[str, ...]] = {
+    "login_failed": _ACCOUNT_SETTINGS_CHECKS,
+    "unreadable": _ACCOUNT_SETTINGS_CHECKS,
+    "timeout": ("Bitwarden did not answer in time; retry, and check the Bitwarden connection if it keeps failing",),
+}
+
+
+def _connected_vault_fact(vault: ConnectedVault) -> dict[str, Any]:
+    fact: dict[str, Any] = {"provider": "bitwarden", "status": vault.status}
+    if vault.reason is not None:
+        fact["reason"] = vault.reason
+        fact["check"] = list(_CONNECTED_VAULT_CHECKS[vault.reason])
+    return fact
+
+
+def _serialize_connected_vault_login(login: ConnectedVaultLogin) -> dict[str, Any]:
+    return {
+        "vault_login_id": login.credential.credential_id,
+        "title": login.credential.name,
+        "site": loggable_origin(login.url) if login.url else None,
+    }
+
+
+def _serialize_connected_vault_login_binding(
+    login: ConnectedVaultLogin, sites: list[LoginSite] | None
+) -> dict[str, Any]:
+    parameter: dict[str, Any] = {
+        "parameter_type": ParameterType.BITWARDEN_LOGIN_CREDENTIAL.value,
+        "bitwarden_item_id": login.credential.item_id,
+        **BITWARDEN_LOGIN_PARAMETER_SECRET_KEYS,
+    }
+    if login.collection_id:
+        parameter["bitwarden_collection_id"] = login.collection_id
+    return {
+        **_serialize_connected_vault_login(login),
+        # None when Bitwarden could not be read; a workflow cannot place this login on a site until it is.
+        "sites": [loggable_origin(site.url) for site in sites] if sites is not None else None,
+        "workflow_parameter": parameter,
+        "code": {"accessors": list(CREDENTIAL_CODE_ACCESSORS[CredentialType.PASSWORD].fields)},
+    }
+
+
+def _serialize_reference_match(credential: Credential, vault: ConnectedVault | None) -> dict[str, Any]:
+    login = vault.login(credential.credential_id) if vault is not None else None
+    return _serialize_connected_vault_login(login) if login is not None else _serialize_credential(credential)
+
+
 _DENIED_PASS_ROUTES = ["typed_resume", "request_credential_tool", "literal_credential_id"]
 
 
@@ -1004,6 +1220,22 @@ def _typed_resume_arm(reference: str, policy: RequestPolicy, matches: list[Crede
 
 
 async def _resolve_exact_credential(reference: str, ctx: AgentContext) -> dict[str, Any]:
+    saved_credentials = await load_credentials(ctx.organization_id)
+    # A vault title can look like a saved credential id, so only a real one skips the vault listing.
+    vault = (
+        None
+        if any(credential.credential_id == reference for credential in saved_credentials)
+        else await load_connected_vault(ctx.organization_id, ctx.request_policy)
+    )
+    result = await _resolve_exact_reference(reference, ctx, vault, saved_credentials)
+    if vault is not None and "data" in result:
+        result["data"]["connected_vault"] = _connected_vault_fact(vault)
+    return result
+
+
+async def _resolve_exact_reference(
+    reference: str, ctx: AgentContext, vault: ConnectedVault | None, saved_credentials: list[Credential]
+) -> dict[str, Any]:
     policy = ctx.request_policy
     if not isinstance(policy, RequestPolicy):
         return {
@@ -1015,14 +1247,27 @@ async def _resolve_exact_credential(reference: str, ctx: AgentContext) -> dict[s
             },
         }
 
-    credentials = await load_credentials(ctx.organization_id)
-    grounded_references = grounded_credential_references(policy.canonical_user_message, credentials)
+    vault_credentials = vault.credentials if vault is not None else []
+    # A vault login is named by its title only: its id is an internal namespace, never something a user types.
+    grounded = grounded_references(
+        policy.canonical_user_message,
+        [
+            *(value for credential in saved_credentials for value in (credential.name, credential.credential_id)),
+            *(credential.name for credential in vault_credentials),
+        ],
+    )
     matches_by_id = {
         credential.credential_id: credential
-        for credential in credentials
-        if credential.credential_id == reference or credential.name == reference
+        for credential in [*saved_credentials, *vault_credentials]
+        if credential.name == reference
+        or (credential.credential_id == reference and not reference.startswith(CONNECTED_VAULT_ID_PREFIX))
     }
     matches = list(matches_by_id.values())
+    if not matches and reference.startswith(CONNECTED_VAULT_ID_PREFIX):
+        return {
+            "ok": False,
+            "error": "exact_reference resolves a vault login by its exact `title`, not its `vault_login_id`.",
+        }
     literal_reference = bool(credential_reference_spans(policy.canonical_user_message, reference))
     typed_resume_arm = _typed_resume_arm(reference, policy, matches)
     if len(matches) == 1 and matches[0].credential_id in _saved_workflow_credential_ids(policy):
@@ -1031,7 +1276,7 @@ async def _resolve_exact_credential(reference: str, ctx: AgentContext) -> dict[s
     # objective provenance and identity: an exact reference is grounded in the current
     # turn, a structured selection, or the server-saved workflow. It deliberately
     # does not implement a second English policy language beside the agent.
-    if typed_resume_arm is None and reference not in grounded_references and (matches or not literal_reference):
+    if typed_resume_arm is None and reference not in grounded and (matches or not literal_reference):
         LOG.info(
             "copilot_credential_reference_not_literal",
             reference_is_saved_credential=bool(matches),
@@ -1052,7 +1297,7 @@ async def _resolve_exact_credential(reference: str, ctx: AgentContext) -> dict[s
         data: dict[str, Any] = {
             "status": "ambiguous" if matches else "not_found",
             "reference": reference,
-            "candidates": [_serialize_credential(credential) for credential in matches],
+            "candidates": [_serialize_reference_match(credential, vault) for credential in matches],
         }
         if not matches:
             withdrawn = policy.record_named_login_not_found()
@@ -1068,7 +1313,7 @@ async def _resolve_exact_credential(reference: str, ctx: AgentContext) -> dict[s
     ]
     # A literal span the grounded check dropped — a shorter saved name sitting inside a longer one the
     # user actually typed — is not the user naming this credential; no arm here already implies grounded.
-    user_named = typed_resume_arm is None or reference in grounded_references
+    user_named = typed_resume_arm is None or reference in grounded
     if user_named:
         policy.current_turn_named_credential_ids.add(credential.credential_id)
         # A carried origin answers where the secret belongs only while nobody better has. The user
@@ -1086,12 +1331,19 @@ async def _resolve_exact_credential(reference: str, ctx: AgentContext) -> dict[s
         credential_id=credential.credential_id,
         pass_arm=typed_resume_arm or "literal_in_current_user_turn",
     )
+    vault_login = vault.login(credential.credential_id) if vault is not None else None
+    if vault_login is not None:
+        # The output policy places a vault login only on sites read before the draft reaches it.
+        sites = await connected_vault_login_sites(ctx.organization_id, policy, credential.credential_id)
+        match_key, match = "vault_login", _serialize_connected_vault_login_binding(vault_login, sites)
+    else:
+        match_key, match = "credential", _serialize_credential(credential)
     return {
         "ok": True,
         "data": {
             "status": "resolved",
             "reference": reference,
-            "credential": _serialize_credential(credential),
+            match_key: match,
         },
     }
 
@@ -1103,19 +1355,23 @@ async def _list_credentials(params: dict[str, Any], ctx: AgentContext) -> dict[s
             return {"ok": False, "error": "exact_reference must be a non-empty exact saved name or credential ID"}
         return await _resolve_exact_credential(exact_reference, ctx)
 
+    vault = await load_connected_vault(ctx.organization_id, ctx.request_policy)
     page = max(1, params.get("page", 1))
     page_size = min(max(1, params.get("page_size") or 10), LIST_CREDENTIALS_MAX_PAGE_SIZE)
     credentials = await load_credentials(ctx.organization_id, page=page, page_size=page_size)
     serialized = [_serialize_credential(credential) for credential in credentials]
     _record_discovered_credentials_on_policy(ctx, credentials)
+    vault_logins = vault.logins[(page - 1) * page_size : page * page_size]
     return {
         "ok": True,
         "data": {
             "credentials": serialized,
+            "vault_logins": [_serialize_connected_vault_login(login) for login in vault_logins],
             "page": page,
             "page_size": page_size,
             "count": len(serialized),
-            "has_more": len(serialized) == page_size,
+            "has_more": len(serialized) == page_size or len(vault.logins) > page * page_size,
+            "connected_vault": _connected_vault_fact(vault),
         },
     }
 

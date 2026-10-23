@@ -44,8 +44,10 @@ from skyvern.forge.sdk.copilot.runtime import (
     BROWSER_TOOLS_UNAVAILABLE_ERROR,
     RAW_SECRET_BROWSER_ERROR,
     AgentContext,
+    BrowserProbeOutcome,
     BrowserSessionReplacement,
     BuildTestBrowserSeed,
+    _browser_context_attachability,
     ensure_browser_session,
     ensure_build_test_browser_session,
     mcp_browser_context,
@@ -91,9 +93,27 @@ class _FakeBrowser:
 
 
 class _FakeBrowserContext:
-    def __init__(self, *, connected: bool = True, closed: bool = False) -> None:
+    def __init__(self, *, connected: bool = True, closed: bool = False, closing: bool | None = None) -> None:
         self.browser = _FakeBrowser(connected=connected)
-        self._impl_obj = SimpleNamespace(_close_was_called=closed, _closed=closed)
+        self._impl_obj = SimpleNamespace(_closing_or_closed=closed if closing is None else closing, _closed=closed)
+
+
+@pytest.mark.parametrize(
+    ("context", "expected"),
+    [
+        pytest.param(_FakeBrowserContext(), BrowserProbeOutcome.attachable, id="healthy"),
+        pytest.param(
+            _FakeBrowserContext(closing=True),
+            BrowserProbeOutcome.positively_unreachable,
+            id="driver_closing_while_browser_connected",
+        ),
+    ],
+)
+def test_a_context_the_driver_is_closing_is_unreachable_while_its_browser_stays_connected(
+    context: _FakeBrowserContext, expected: BrowserProbeOutcome
+) -> None:
+    assert context.browser.is_connected()
+    assert _browser_context_attachability(context) is expected
 
 
 @pytest.mark.parametrize(

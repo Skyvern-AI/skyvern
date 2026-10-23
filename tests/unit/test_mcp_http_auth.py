@@ -426,6 +426,76 @@ def test_stateful_fastmcp_transport_rejects_exact_session_id_from_another_organi
     assert session_manager._current_organization_id.get() is None
 
 
+def test_stateless_transport_falls_back_to_legacy_after_unsupported_discovery_probe(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    server = FastMCP("protocol-version-test")
+
+    @server.tool
+    async def ping() -> str:
+        return "pong"
+
+    monkeypatch.setattr(mcp_http_auth, "validate_mcp_api_key", AsyncMock(return_value=_build_validation("org_pv")))
+    app = server.http_app(
+        path="/",
+        middleware=[Middleware(mcp_http_auth.MCPAPIKeyMiddleware)],
+        stateless_http=True,
+        json_response=True,
+    )
+
+    headers = {
+        "accept": "application/json, text/event-stream",
+        "content-type": "application/json",
+        "x-api-key": "sk_pv",
+    }
+    with TestClient(app) as client:
+        discovery_response = client.post(
+            "/",
+            headers={
+                **headers,
+                "mcp-protocol-version": "2026-07-28",
+            },
+            json={
+                "jsonrpc": "2.0",
+                "id": "discover-1",
+                "method": "server/discover",
+                "params": {
+                    "_meta": {
+                        "io.modelcontextprotocol/protocolVersion": "2026-07-28",
+                        "io.modelcontextprotocol/clientInfo": {"name": "test-client", "version": "1"},
+                        "io.modelcontextprotocol/clientCapabilities": {},
+                    }
+                },
+            },
+        )
+        legacy_response = client.post(
+            "/",
+            headers=headers,
+            json={
+                "jsonrpc": "2.0",
+                "id": 2,
+                "method": "initialize",
+                "params": {
+                    "protocolVersion": "2025-11-25",
+                    "capabilities": {},
+                    "clientInfo": {"name": "test-client", "version": "1"},
+                },
+            },
+        )
+        legacy_tools_response = client.post(
+            "/",
+            headers={**headers, "mcp-protocol-version": "2025-11-25"},
+            json={"jsonrpc": "2.0", "id": 3, "method": "tools/list", "params": {}},
+        )
+
+    assert discovery_response.status_code == 400
+    assert "Unsupported protocol version: 2026-07-28" in discovery_response.json()["error"]["message"]
+    assert legacy_response.status_code == 200
+    assert legacy_response.json()["result"]["protocolVersion"] == "2025-11-25"
+    assert legacy_tools_response.status_code == 200
+    assert [tool["name"] for tool in legacy_tools_response.json()["result"]["tools"]] == ["ping"]
+
+
 @pytest.mark.asyncio
 async def test_validate_mcp_api_key_uses_ttl_cache(monkeypatch: pytest.MonkeyPatch) -> None:
     calls = 0

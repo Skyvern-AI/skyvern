@@ -45,7 +45,6 @@ from skyvern.forge.sdk.services.credential.skyvern_credential_vault_service impo
 from skyvern.forge.sdk.settings_manager import SettingsManager
 from skyvern.forge.sdk.workflow.context_manager import WorkflowContextManager
 from skyvern.forge.sdk.workflow.service import WorkflowService
-from skyvern.services.browser_recording.service import BrowserSessionRecordingService
 from skyvern.webeye.browser_manager import BrowserManager
 from skyvern.webeye.default_persistent_sessions_manager import DefaultPersistentSessionsManager
 from skyvern.webeye.persistent_sessions_manager import PersistentSessionsManager
@@ -105,7 +104,6 @@ class ForgeApp:
     WORKFLOW_SERVICE: WorkflowService
     AGENT_FUNCTION: AgentFunction
     PERSISTENT_SESSIONS_MANAGER: PersistentSessionsManager
-    BROWSER_SESSION_RECORDING_SERVICE: BrowserSessionRecordingService
     SKYVERN_CREDENTIAL_VAULT_SERVICE: SkyvernCredentialVaultService | None
     BITWARDEN_CREDENTIAL_VAULT_SERVICE: BitwardenCredentialVaultService
     AZURE_CREDENTIAL_VAULT_SERVICE: AzureCredentialVaultService | None
@@ -283,7 +281,6 @@ def create_forge_app() -> ForgeApp:
             "Set BROWSER_STREAMING_MODE=cdp to stream the remote browser through this backend.",
             browser_streaming_mode=settings.BROWSER_STREAMING_MODE,
         )
-    app.BROWSER_SESSION_RECORDING_SERVICE = BrowserSessionRecordingService()
 
     app.AZURE_CLIENT_FACTORY = RealAzureClientFactory()
     app.GCP_CLIENT_FACTORY = RealGcpClientFactory()

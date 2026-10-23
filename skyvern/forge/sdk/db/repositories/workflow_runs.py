@@ -3223,6 +3223,18 @@ class WorkflowRunsRepository(BaseRepository):
                 for run, title in workflow_runs
             ]
 
+    @db_operation("count_recent_workflow_runs")
+    async def count_recent_workflow_runs(self, workflow_permanent_id: str, organization_id: str, days: int) -> int:
+        async with self.Session() as session:
+            count_query = (
+                select(func.count())
+                .select_from(WorkflowRunModel)
+                .filter(WorkflowRunModel.workflow_permanent_id == workflow_permanent_id)
+                .filter(WorkflowRunModel.organization_id == organization_id)
+                .filter(WorkflowRunModel.created_at >= naive_utc_now() - timedelta(days=days))
+            )
+            return (await session.execute(count_query)).scalar_one()
+
     @db_operation("get_workflow_runs_count")
     async def get_workflow_runs_count(
         self,

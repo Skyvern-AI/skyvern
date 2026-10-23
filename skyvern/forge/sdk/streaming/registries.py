@@ -11,8 +11,8 @@ The tale-of-the-tape is this:
   - legacy VNC viewers open two paired channels (WS connections) to the backend api
     - one dedicated to streaming VNC's RFB protocol
     - the other dedicated to messaging (JSON)
-  - the CDP Record Browser path opens only the Message channel here; frames and
-    user-event capture ride CDP (screencast + ExfiltrationChannel) instead of VNC
+  - the CDP path opens only the Message channel here; frames ride CDP
+    (screencast) instead of VNC
   - stateful channels sharing a `client_id` need to coordinate with one another
 
 Additionally, this module manages:

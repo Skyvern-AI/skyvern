@@ -23,6 +23,7 @@ from skyvern.forge.log_redaction import (
     redact_sensitive_fields,
     strip_artifact_url_query,
 )
+from skyvern.forge.request_privacy import private_logging_scope, private_request_audit, private_request_path
 from skyvern.forge.sdk.forge_log import exception_log_fields
 
 if typing.TYPE_CHECKING:  # pragma: no cover - import only for type hints
@@ -36,6 +37,8 @@ if typing.TYPE_CHECKING:  # pragma: no cover - import only for type hints
 LOG = structlog.get_logger()
 
 _SENSITIVE_ENDPOINTS = {
+    # Agent reports can contain credentials before route redaction.
+    "POST /v1/agent_feedback",
     "GET /api/v1/users/me/onboarding",
     "POST /api/v1/users/me/onboarding",
     "POST /api/v1/credentials",
@@ -239,7 +242,8 @@ def _is_fixture_endpoint(request: Request) -> bool:
 def _is_sensitive_endpoint(request: Request) -> bool:
     endpoint = f"{request.method.upper()} {request.url.path.rstrip('/')}"
     return (
-        _is_fixture_endpoint(request)
+        private_request_path(request.scope) is not None
+        or _is_fixture_endpoint(request)
         or endpoint in _SENSITIVE_ENDPOINTS
         or any(pattern.fullmatch(endpoint) for pattern in _SENSITIVE_ENDPOINT_PATTERNS)
         or (request.method.upper() == "POST" and _ACTION_LOG_ENDPOINT_RE.fullmatch(request.url.path) is not None)
@@ -506,6 +510,15 @@ class RequestLoggingMiddleware(BaseHTTPMiddleware):
             await super().__call__(scope, receive, send)
             return
 
+        if audit_path := private_request_path(scope):
+            with private_logging_scope(audit_path):
+                identity = _request_identity.set(_RequestIdentity())
+                try:
+                    await self._private_request(scope, receive, send, audit_path=audit_path)
+                finally:
+                    _request_identity.reset(identity)
+            return
+
         # BaseHTTPMiddleware raises a started stream's error only after dispatch returns.
         # Keep the client-visible status here so that error is still countable.
         response_status: int | None = None
@@ -529,3 +542,70 @@ class RequestLoggingMiddleware(BaseHTTPMiddleware):
             _raw_request_exception_logger.set(None)
         finally:
             _raw_request_stream_success_logger.set(None)
+
+    async def _private_request(self, scope: Scope, receive: Receive, send: Send, *, audit_path: str) -> None:
+        start = time.monotonic()
+        status: int | None = None
+        complete = False
+        outcome = "complete"
+
+        async def opaque_send(message: Message) -> None:
+            nonlocal status, complete
+            await send(message)
+            if message["type"] == "http.response.start":
+                status = message["status"]
+            elif message["type"] == "http.response.body" and not message.get("more_body", False):
+                complete = True
+
+        try:
+            try:
+                # Passing receive/send directly keeps payload bytes out of the logger's buffers.
+                await self.app(scope, receive, opaque_send)
+            except ClientDisconnect:
+                outcome = "disconnected"
+                if status is None:
+                    try:
+                        await Response(status_code=499)(scope, receive, opaque_send)
+                    except Exception:
+                        pass
+            except Exception:
+                outcome = "stream_failed" if status is not None else "failed"
+                if status is None:
+                    try:
+                        await Response(
+                            b'{"detail":"private_request_failed"}', status_code=500, media_type="application/json"
+                        )(scope, receive, opaque_send)
+                    except Exception:
+                        pass
+                elif not complete:
+                    try:
+                        await send({"type": "http.response.body", "body": b"", "more_body": False})
+                    except Exception:
+                        pass
+        except asyncio.CancelledError:
+            outcome = "cancelled"
+            raise
+        finally:
+            if settings.LOG_RAW_API_REQUESTS:
+                code = status
+                log = (
+                    LOG.error
+                    if outcome != "complete" or (code is not None and code >= 500)
+                    else LOG.warning
+                    if code is not None and code >= 400
+                    else LOG.info
+                )
+                try:
+                    with private_request_audit():
+                        log(
+                            "api.raw_request",
+                            method=scope["method"]
+                            if scope["method"] in {"GET", "POST", "PUT", "PATCH", "DELETE", "HEAD", "OPTIONS"}
+                            else "OTHER",
+                            path=audit_path,
+                            status_code=code,
+                            duration_seconds=time.monotonic() - start,
+                            outcome=outcome,
+                        )
+                except Exception:
+                    pass

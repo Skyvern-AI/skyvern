@@ -24,9 +24,18 @@ from skyvern.exceptions import (
     UnresolvableNavigationHost,
 )
 from skyvern.forge.sdk.core import skyvern_context
-from skyvern.utils.url_validators import canonical_navigation_host, host_has_no_address_record, is_blocked_host
+from skyvern.utils.url_validators import (
+    HostVerdict,
+    canonical_navigation_host,
+    classify_host,
+    host_has_no_address_record,
+)
 
 LOG = structlog.get_logger()
+
+# Both carry no part of the URL, so a redacting caller can re-raise the refusal verbatim.
+_NO_ADDRESS_RECORD_REFUSAL = "refused before dispatch: the resolver reports no address record"
+_UNVERIFIABLE_HOST_REASON = "unverifiable host: the destination could not be resolved for review"
 
 NavigateFunc = Callable[[str], Awaitable[object]]
 SettleFunc = Callable[[], Awaitable[None]]
@@ -42,12 +51,14 @@ _MAX_REDIRECT_HOPS = 100
 
 
 def validate_navigation_destination(url: str) -> None:
-    """Fail closed unless ``url`` targets a public http(s) destination.
+    """Fail closed unless ``url`` targets a verified public http(s) destination.
 
     Rejects local-resource schemes (``file://`` and anything other than http/https) and
     private, loopback, link-local, metadata, or otherwise-internal hosts, including
-    public-looking names that resolve to internal addresses. Every navigation entry point
-    that funnels through navigate_with_retry is guarded identically.
+    public-looking names that resolve to internal addresses. A host the worker cannot resolve
+    is refused too: the browser resolves the name itself, so a split-horizon record can reach an
+    internal address the worker's view never shows. Every navigation entry point that funnels
+    through navigate_with_retry is guarded identically.
     The host comes from the browser's WHATWG canonicalization, not stdlib urlparse, so
     numeric-IP and backslash authority tricks that resolve to an internal host are caught.
     """
@@ -59,8 +70,17 @@ def validate_navigation_destination(url: str) -> None:
     except InvalidUrl as error:
         raise BlockedNavigationDestination(url=url, reason="unsupported scheme or malformed url") from error
 
-    if not host or is_blocked_host(host, resolve_dns=True):
+    verdict = classify_host(host, resolve_dns=True) if host else HostVerdict.DENY
+    if verdict is HostVerdict.ALLOW:
+        return
+    if verdict is HostVerdict.DENY:
         raise BlockedNavigationDestination(url=url, reason="internal, loopback, link-local, or metadata host")
+    # Refusing is the policy decision; naming the target internal would not be. A name the resolver
+    # says has no address record is the target's own state, so it keeps the dead-host verdict and
+    # error code instead of reading as our egress or our policy having rejected a live site.
+    if host and host_has_no_address_record(host):
+        raise UnresolvableNavigationHost(url=url, host=host, error_message=_NO_ADDRESS_RECORD_REFUSAL)
+    raise BlockedNavigationDestination(url=url, reason=_UNVERIFIABLE_HOST_REASON)
 
 
 def _navigation_hop_urls(response: object) -> list[str]:
@@ -260,6 +280,7 @@ async def navigate_with_retry(
     wait_until: Literal["load", "domcontentloaded", "commit"] = "load",
     sleep: SleepFunc | None = None,
     log_url: str | None = None,
+    stop_retrying: Callable[[], bool] | None = None,
 ) -> int | None:
     # Returns the final navigation response's HTTP status when one is available (None when the
     # navigation produced no response object). Additive: every caller today ignores the return; the
@@ -285,6 +306,17 @@ async def navigate_with_retry(
         if not redacting:
             raise
         raise BlockedNavigationDestination(url=display_url, reason=error.reason) from None
+    except UnresolvableNavigationHost as error:
+        if not redacting:
+            raise
+        raise UnresolvableNavigationHost(
+            url=display_url, host=error.host, error_message=_NO_ADDRESS_RECORD_REFUSAL
+        ) from None
+
+    # The destination check above can wait on DNS, and the caller's stop (the run's lost browser connection) may
+    # have latched meanwhile; nothing is dispatched then.
+    if stop_retrying is not None and stop_retrying():
+        raise FailedToNavigateToUrl(url=display_url, error_message="the browser connection was lost before navigation")
 
     for attempt in range(retry_times):
         strategy = degradation[min(attempt, len(degradation) - 1)]
@@ -310,6 +342,14 @@ async def navigate_with_retry(
             # This one names a refused redirect hop, not the requested url, so redact that hop
             # rather than substituting the caller's display value for it.
             raise BlockedNavigationDestination(url=redact_url_secrets(error.url), reason=error.reason) from None
+        except UnresolvableNavigationHost as error:
+            # Only redirect revalidation reaches here, and the browser already fetched the hop it
+            # refused: our resolver's silence is a split-horizon view of a live host, not the dead
+            # target the verdict would otherwise claim.
+            raise BlockedNavigationDestination(
+                url=redact_url_secrets(error.url) if redacting else error.url,
+                reason=_UNVERIFIABLE_HOST_REASON,
+            ) from (None if redacting else error)
         except Exception as error:
             error_str = str(error)
             # Playwright names the destination in its own message, so the raw text carries the
@@ -342,7 +382,21 @@ async def navigate_with_retry(
                     nav_error_code=driver_nav_error_code(error_str),
                 ) from (None if redacting else error)
 
-            if attempt >= retry_times - 1:
+            # The caller's typed stop ends retries too, rechecked after the backoff so a loss latched while sleeping
+            # never reaches another dispatch.
+            stopped = stop_retrying is not None and stop_retrying()
+            if attempt < retry_times - 1 and not stopped:
+                LOG.warning(
+                    "Error while navigating to url, retrying",
+                    exc_info=not redacting,
+                    url=display_url,
+                    retry_time=attempt,
+                    wait_until=strategy,
+                    error=safe_error_str,
+                )
+                await sleep(1)
+                stopped = stop_retrying is not None and stop_retrying()
+            if attempt >= retry_times - 1 or stopped:
                 # Terminal navigation failure is re-raised as FailedToNavigateToUrl and surfaced
                 # via the run's failure_reason; logging at error here double-logs an external
                 # (site-unreachable) outcome. Keep the traceback, drop the error level.
@@ -358,16 +412,6 @@ async def navigate_with_retry(
                     error_message=safe_error_str,
                     nav_error_code=driver_nav_error_code(error_str),
                 ) from (None if redacting else error)
-
-            LOG.warning(
-                "Error while navigating to url, retrying",
-                exc_info=not redacting,
-                url=display_url,
-                retry_time=attempt,
-                wait_until=strategy,
-                error=safe_error_str,
-            )
-            await sleep(1)
 
     # Reached only when retry_times <= 0 (the loop never ran); a real navigation returns or raises inside.
     return None

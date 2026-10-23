@@ -421,7 +421,7 @@ export function CustomLLMConfigForm() {
                         : provider === "ollama"
                           ? "llama3.1"
                           : provider === "gemini"
-                            ? "gemini-2.5-flash"
+                            ? "gemini-3-flash-preview"
                             : "mistral"
                     }
                     disabled={formControlsDisabled}

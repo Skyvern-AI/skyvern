@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import re
 import socket
+from collections.abc import Callable
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
 
@@ -246,6 +247,25 @@ def _resolver_cannot_answer(*args: object, **kwargs: object) -> list[object]:
     raise socket.gaierror(socket.EAI_AGAIN, "Temporary failure in name resolution")
 
 
+def _resolves_once_then(failure: Callable[..., list[object]]) -> Callable[..., list[object]]:
+    """A resolver that answers the pre-dispatch check and then stops answering.
+
+    The pre-dispatch guard refuses a host it cannot resolve, so this is what still reaches the
+    post-failure corroboration: a record that was there when the destination was reviewed and
+    gone (or unanswerable) by the time the navigation failed.
+    """
+    answered = False
+
+    def resolve(*args: object, **kwargs: object) -> list[object]:
+        nonlocal answered
+        if answered:
+            return failure(*args, **kwargs)
+        answered = True
+        return [(socket.AF_INET, socket.SOCK_STREAM, 0, "", ("93.184.216.34", 0))]
+
+    return resolve
+
+
 async def _navigate_failing_with(error_message: str) -> FailedToNavigateToUrl:
     page = AsyncMock()
     page.goto = AsyncMock(side_effect=Exception(error_message))
@@ -276,7 +296,7 @@ async def test_a_proxy_error_for_a_host_with_no_address_record_is_not_blamed_on_
 ) -> None:
     # A proxied browser hands the hostname to the proxy, so a domain whose record is gone comes
     # back as the proxy failing to open a tunnel rather than as ERR_NAME_NOT_RESOLVED.
-    monkeypatch.setattr("skyvern.utils.url_validators.socket.getaddrinfo", _no_such_host)
+    monkeypatch.setattr("skyvern.utils.url_validators.socket.getaddrinfo", _resolves_once_then(_no_such_host))
 
     error = await _navigate_failing_with(error_message)
 
@@ -303,7 +323,7 @@ async def test_a_resolver_that_cannot_answer_does_not_reattribute_a_proxy_error(
 ) -> None:
     # EAI_AGAIN means the resolver never answered. Reading it as a dead host would reclassify every
     # egress failure fleet-wide the moment worker DNS degrades.
-    monkeypatch.setattr("skyvern.utils.url_validators.socket.getaddrinfo", _resolver_cannot_answer)
+    monkeypatch.setattr("skyvern.utils.url_validators.socket.getaddrinfo", _resolves_once_then(_resolver_cannot_answer))
 
     error = await _navigate_failing_with("net::ERR_TUNNEL_CONNECTION_FAILED")
 
@@ -350,15 +370,55 @@ def test_validate_navigation_destination_allows_public_targets(url: str) -> None
     validate_navigation_destination(url)
 
 
-def test_validate_navigation_destination_allows_a_host_the_worker_cannot_resolve(
+@pytest.mark.asyncio
+async def test_a_host_the_worker_cannot_resolve_is_refused_before_dispatch(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    def fails_dns(host: str, port: int | None, *args: object, **kwargs: object) -> list[object]:
-        raise OSError("dns unavailable")
+    # SKY-18836: the browser resolves the hostname itself, so a public-suffix name with a
+    # split-horizon internal A record is NXDOMAIN here and 10.x there. Admitting it because our
+    # own check could not run would hand the browser an unreviewed internal destination.
+    monkeypatch.setattr("skyvern.utils.url_validators.socket.getaddrinfo", _no_such_host)
+    page = AsyncMock()
+    page.goto = AsyncMock()
 
-    monkeypatch.setattr("skyvern.utils.url_validators.socket.getaddrinfo", fails_dns)
+    with pytest.raises(UnresolvableNavigationHost) as raised:
+        await navigate_with_retry(
+            navigate=lambda strategy: page.goto(_DEAD_URL, wait_until=strategy),
+            url=_DEAD_URL,
+            retry_times=5,
+            settle=AsyncMock(),
+            sleep=AsyncMock(),
+        )
 
-    validate_navigation_destination("https://public.example.test/path")
+    page.goto.assert_not_awaited()
+    # A resolver that answers "this name has no address" is reporting the target's own state, so
+    # the refusal keeps the dead-host verdict rather than calling a public name internal.
+    assert raised.value.host == "gone.example.com"
+    assert is_egress_attributable_navigation_failure(raised.value) is False
+
+
+@pytest.mark.asyncio
+async def test_a_destination_the_resolver_cannot_answer_for_is_refused_before_dispatch(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr("skyvern.utils.url_validators.socket.getaddrinfo", _resolver_cannot_answer)
+    page = AsyncMock()
+    page.goto = AsyncMock()
+
+    with pytest.raises(BlockedNavigationDestination) as raised:
+        await navigate_with_retry(
+            navigate=lambda strategy: page.goto(_DEAD_URL, wait_until=strategy),
+            url=_DEAD_URL,
+            retry_times=5,
+            settle=AsyncMock(),
+            sleep=AsyncMock(),
+        )
+
+    page.goto.assert_not_awaited()
+    # A resolver that could not answer says nothing about the target, so the refusal must not
+    # claim it is internal either.
+    assert "unverifiable host" in raised.value.reason
+    assert not isinstance(raised.value, UnresolvableNavigationHost)
 
 
 @pytest.mark.parametrize("url", BLOCKED_DESTINATIONS)

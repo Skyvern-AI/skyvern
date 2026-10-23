@@ -8,6 +8,7 @@ import inspect
 import json
 import shutil
 import subprocess
+import time
 from copy import deepcopy
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -25,6 +26,7 @@ from pydantic import TypeAdapter
 from skyvern.config import settings
 from skyvern.exceptions import SkyvernPageAnalysisTimeout
 from skyvern.forge import agent as agent_module
+from skyvern.forge import agent_functions as agent_functions_module
 from skyvern.forge.agent import (
     ForgeAgent,
     _first_plan_carries_consumable_totp,
@@ -41,12 +43,14 @@ from skyvern.forge.sdk.core.skyvern_context import (
 from skyvern.forge.sdk.db.utils import hydrate_action
 from skyvern.forge.sdk.models import Step, StepStatus
 from skyvern.forge.sdk.schemas.tasks import Task
+from skyvern.forge.sdk.schemas.totp_codes import TOTPCode
 from skyvern.forge.sdk.services.bitwarden import BitwardenConstants
 from skyvern.forge.sdk.workflow import service as workflow_service
 from skyvern.forge.sdk.workflow.context_manager import WorkflowContextManager, WorkflowRunContext
 from skyvern.forge.sdk.workflow.models.parameter import CredentialParameter
 from skyvern.schemas.run_enums import RunEngine
 from skyvern.services import otp_service
+from skyvern.services.otp_email import EmailOTPCandidate
 from skyvern.services.otp_service import OTPType, OTPValue
 from skyvern.utils import stall_watch
 from skyvern.utils.action_redaction import REDACTED_INPUT_VALUE, redact_action_for_log
@@ -57,6 +61,7 @@ from skyvern.webeye.actions.actions import (
     ActionStatus,
     ActionType,
     ClickAction,
+    CompleteAction,
     InputOrSelectContext,
     InputTextAction,
     TerminateAction,
@@ -93,7 +98,10 @@ def _submit_candidate(control):
 
 @pytest.fixture(autouse=True)
 def stub_fill_observer_for_dom_fakes(monkeypatch: pytest.MonkeyPatch, request: pytest.FixtureRequest) -> None:
-    if request.function.__name__ == "test_multi_field_totp_browser_privacy_after_fill":
+    if (
+        request.function.__name__ == "test_multi_field_totp_browser_privacy_after_fill"
+        or request.function.__name__.startswith("test_external_otp_browser")
+    ):
         return
     monkeypatch.setattr(
         handler,
@@ -1906,7 +1914,7 @@ async def test_group_fill_fallback_navigation_before_final_box_fails(monkeypatch
     ("phase", "remount_kind"),
     [
         (phase, kind)
-        for phase in ("stream", "stream_error", "stream_missing", "fallback")
+        for phase in ("stream", "fallback")
         for kind in (
             "identical",
             "different",
@@ -1923,6 +1931,7 @@ async def test_group_fill_fallback_navigation_before_final_box_fails(monkeypatch
             "dashboard",
         )
     ]
+    + [(phase, kind) for phase in ("stream_error", "stream_missing") for kind in ("identical", "different", "gone")]
     + [
         ("stream", "all_live"),
         ("fallback", "all_live"),
@@ -2349,7 +2358,9 @@ async def test_group_fill_same_page_detach_reresolves_once_then_falls_back(
             assert not context.totp_codes
             assert state.filled_code_hash is None
         else:
-            assert context.totp_codes == {task.task_id: code}
+            # The whole code was sent before the group changed: it is recorded as entered and not handed back.
+            assert not context.totp_codes
+            assert context.external_otp_code_used(task.task_id, code)
             assert state.filled_code_hash == hashlib.sha256(code.encode()).hexdigest()
             assert not state.fill_verified
             with skyvern_context.scoped(context):
@@ -2358,7 +2369,7 @@ async def test_group_fill_same_page_detach_reresolves_once_then_falls_back(
                     step=SimpleNamespace(),
                     scraped_page=_box_page(0),
                 )
-            assert next_payload["verification_code"] == "*"
+            assert code not in json.dumps(next_payload)
     assert all(entry in (call(0.1), call(0.2)) for entry in sleep.await_args_list)
     assert sum(entry.args[0] for entry in sleep.await_args_list if entry == call(0.2)) <= 0.4
     if not accepted:
@@ -2492,7 +2503,7 @@ def test_partial_totp_plan_requires_explicit_planner_intent(response: dict[str, 
     assert agent_module._planner_confirmed_verification_code_intent(response) is expected
 
 
-@pytest.mark.parametrize("filled", [False, True])
+@pytest.mark.parametrize(("filled", "code_source"), [(False, "secret"), (True, "external")])
 @pytest.mark.parametrize(
     "plan_kind",
     [
@@ -2514,7 +2525,6 @@ def test_partial_totp_plan_requires_explicit_planner_intent(response: dict[str, 
         "leading-navigation",
     ],
 )
-@pytest.mark.parametrize("code_source", ["secret", "external"])
 @pytest.mark.asyncio
 async def test_execute_step_rebound_group_requires_expected_value(
     monkeypatch: pytest.MonkeyPatch,
@@ -2736,8 +2746,11 @@ async def test_execute_step_rebound_group_requires_expected_value(
                     assert getattr(state, attribute) == getattr(before_dispatch, attribute)
                 persisted_inputs.append(action_for_multi_field_totp_persistence(action))
             else:
-                assert kwargs["scraped_page"] is scraped_page
-                assert action.element_id in {"open-authenticator", "fixture-submit"}
+                # Once an external code is entered, the executor remaps a stale submit itself, before its guard.
+                remapped_early = action.element_id == "remounted-submit"
+                assert not remapped_early or context.external_otp_uses
+                assert kwargs["scraped_page"] is (fresh if remapped_early else scraped_page)
+                assert action.element_id in {"open-authenticator", "fixture-submit", "remounted-submit"}
             return await handler.ActionHandler._handle_action(
                 scraped_page=kwargs["scraped_page"],
                 page=kwargs["page"],
@@ -2791,6 +2804,7 @@ async def test_execute_step_rebound_group_requires_expected_value(
         monkeypatch.setitem(handler.ActionHandler._handled_action_types, handler.ActionType.CLICK, click_handler)
         remapper = AsyncMock(wraps=handler._refresh_stale_web_action_before_dispatch)
         monkeypatch.setattr(handler, "_refresh_stale_web_action_before_dispatch", remapper)
+        monkeypatch.setattr(agent_module, "_refresh_stale_web_action_before_dispatch", remapper)
     agent = ForgeAgent()
     agent.record_artifacts_after_action = AsyncMock(return_value=None)
     agent._persist_scrape_artifacts = AsyncMock()
@@ -3528,10 +3542,20 @@ async def test_rejection_retry_termination_contract(monkeypatch: pytest.MonkeyPa
         for pending in context.pending_speculative_persist_tasks:
             await pending
     assert not submission_errors, repr(submission_errors)
-    if scenario in {
-        "retry",
+    # An external code is never fetched again automatically; a new one needs an executed resend.
+    external_no_retry = {
         "retry_external",
         "retry_external_fullwidth",
+        "unsupported_punctuation",
+        "unsupported_letter",
+        "poll_error",
+        "used_cached_external",
+    }
+    if scenario in external_no_retry:
+        assert resolve_external.await_args is None
+        assert fill.await_args is None
+    if scenario in {
+        "retry",
         "retry_rebound",
         "retry_fill_remount",
         "retry_submit_timeout",
@@ -3558,24 +3582,10 @@ async def test_rejection_retry_termination_contract(monkeypatch: pytest.MonkeyPa
         assert context.speculative_plans == {}
         if scenario == "retry_consumed":
             assert submit.await_args is None
-        if scenario in {"retry_external", "retry_external_fullwidth"}:
-            assert credential_resolution.await_args is None
-            assert context.totp_codes[f"{task.task_id}_totp_cache"] == fresh_code
-            rejection = context.multi_field_totp_rejections[task.task_id]
-            assert resolve_external.await_args.kwargs["created_after"] == datetime.fromtimestamp(10, UTC).replace(
-                tzinfo=None
-            )
-            assert resolve_external.await_args.kwargs["rejected_code_hash"] == rejection.rejected_code_hash
-            assert resolve_external.await_args.kwargs["multi_field_expected_digits"] == attempt.expected_digits
-            with skyvern_context.scoped(context):
-                prompt_fields = agent_module._replace_multi_field_totp_prompt_code(
-                    task.task_id, {"navigation_goal": f"Use code {_CODE}; terminate if rejected."}
-                )
-            assert _CODE not in prompt_fields["navigation_goal"]
     else:
         assert result[2] is None
         skipped = [entry for entry in retry_logs if entry["event"] == "Multi-field TOTP retry skipped"]
-        if scenario in {"used_rebuilt", "used_cached_external", "used_cached_secret"}:
+        if scenario in {"used_rebuilt", "used_cached_secret"}:
             assert not skipped
         else:
             assert len(skipped) == 1
@@ -3592,17 +3602,14 @@ async def test_rejection_retry_termination_contract(monkeypatch: pytest.MonkeyPa
                 "used_unsubmitted": "retry_budget_exhausted",
                 "classifier_error": "classifier_error",
                 "classifier_timeout": "classifier_error",
+                **dict.fromkeys(external_no_retry, "external_code_not_retried"),
             }.get(scenario, skipped[0]["reason"])
             assert _CODE not in str(skipped) and fresh_code not in str(skipped)
         assert update_task.await_args.kwargs["failure_reason"] == (
-            SECOND_REJECTION_REASON
-            if scenario in {"used_rebuilt", "used_cached_external", "used_cached_secret"}
-            else reason
+            SECOND_REJECTION_REASON if scenario in {"used_rebuilt", "used_cached_secret"} else reason
         )
         assert context.multi_field_totp_rejections == original_ledger
         if scenario.startswith("unsupported_"):
-            assert f"{task.task_id}_totp_cache" not in context.totp_codes
-            assert any(entry.get("reason") == "unsupported_code_format" for entry in retry_logs)
             assert supplied_external not in str(retry_logs)
         if scenario not in {"no_evidence", "clear_failed", "clear_error", "submission_error", "submit_trial_timeout"}:
             assert clear.await_args is None
@@ -3610,7 +3617,6 @@ async def test_rejection_retry_termination_contract(monkeypatch: pytest.MonkeyPa
         expected_error = {
             "submission_error": ("submission_failed", "TypeError"),
             "clear_error": ("clear_failed", "TimeoutError"),
-            "poll_error": ("external_code_poll_failed", "RuntimeError"),
             "submit_trial_timeout": ("submit_control_not_actionable", "TimeoutError"),
         }.get(scenario)
         if expected_error:
@@ -4052,7 +4058,7 @@ async def test_retry_submit_discovery_stays_with_otp_widget(markup: str, selecte
 @pytest.mark.asyncio
 @pytest.mark.parametrize("source", ["db", "email"])
 @pytest.mark.parametrize("obtained_offset", [0, None, 25])
-async def test_external_retry_accepts_code_pushed_before_rejection_decision(
+async def test_external_rejection_does_not_fetch_a_code_pushed_before_the_decision(
     monkeypatch: pytest.MonkeyPatch, source: str, obtained_offset: int | None
 ) -> None:
     obtained = datetime(2026, 9, 14, tzinfo=UTC)
@@ -4150,13 +4156,9 @@ async def test_external_retry_accepts_code_pushed_before_rejection_decision(
         result = await ForgeAgent()._maybe_retry_multi_field_totp_after_rejection(
             task, step, page, snapshot, "The one-time code was rejected."
         )
-    expected_cutoff = (obtained if obtained_offset == 0 else delivered).replace(tzinfo=None)
-    assert cutoffs and all(cutoff == expected_cutoff for cutoff in cutoffs)
-    assert result == multi_field_totp_module.RetryOutcome.RETRIED
-    assert fill.await_args.args[-1] == fresh.value
-    assert context.multi_field_totp_rejections[task.task_id].rejected_at == decision
-    assert context.multi_field_totp_rejections[task.task_id].rejected_code_obtained_at == expected_cutoff
-    assert state.external_code_obtained_at == Clock.now_value.replace(tzinfo=UTC).timestamp()
+    assert result == multi_field_totp_module.RetryOutcome.NO_RETRY
+    assert not cutoffs
+    fill.assert_not_awaited()
 
 
 @pytest.mark.asyncio
@@ -6588,11 +6590,10 @@ async def test_verified_burst_observation_controls_retry_dispatch(
             outcome = await ForgeAgent()._maybe_retry_multi_field_totp_after_rejection(
                 task, step, page, snapshot, "The submitted one-time code was rejected."
             )
-            assert outcome == multi_field_totp_module.RetryOutcome.RETRIED
-            rejection = context.multi_field_totp_rejections[task.task_id]
-            assert rejection.retry_used and rejection.submitted_at is not None
-            assert len(dispatches) == (0 if auto_submit else 1)
-            result = fill_results[0]
+            # A rejected external code is not replaced by a fetched one; that needs an executed resend.
+            assert outcome == multi_field_totp_module.RetryOutcome.NO_RETRY
+            assert not fill_results and not dispatches
+            return
     assert isinstance(result, ActionSuccess) and state.fill_verified
     assert result.data.get("totp_submission_observed", False) is auto_submit
     if auto_submit:
@@ -6733,3 +6734,926 @@ async def test_computer_use_code_hand_off_without_a_workflow_run_marks_the_typed
     persisted = action_for_multi_field_totp_persistence(action, codes)
     assert isinstance(persisted, InputTextAction) and persisted.totp_code_required
     assert action.text == ONE_TIME_CODE
+
+
+_OTP_PAGE = (
+    '<form unique_id="otp-scope" id="otp-scope">Enter the code we sent you'
+    + "".join(f'<input unique_id="box-{i}" id="box-{i}" maxlength="1" inputmode="numeric">' for i in range(6))
+    + '<label><input unique_id="remember" id="remember" type="checkbox">Remember this device</label>'
+    + '<button unique_id="verify" id="verify" type="button">Verify</button>'
+    + '<button unique_id="resend" id="resend" type="button">Resend code</button>'
+    + '<button unique_id="help" id="help" type="button">Didn\'t get a code? Help</button>'
+    + '<div id="status"></div></form>'
+)
+_OTP_PAGE_JS = """(cfg) => {
+    window.__submits = 0;
+    window.__resends = 0;
+    window.__fullEntries = 0;
+    window.__verifyClicks = 0;
+    const form = () => document.querySelector('#otp-scope');
+    const boxes = () => [...form().querySelectorAll('input[inputmode]')];
+    const verify = () => document.querySelector('#verify');
+    const submit = () => {
+        window.__submits += 1;
+        if (cfg.submitStatus) document.querySelector('#status').textContent = cfg.submitStatus;
+        if (cfg.disableOnSubmit) boxes().forEach(box => { box.disabled = true; });
+        if (cfg.hideAfterSubmit) form().style.display = 'none';
+        if (cfg.clear) boxes().forEach(box => { box.value = ''; box.setAttribute('value', ''); });
+    };
+    // A framework re-render: every control becomes a fresh node, without the markers Skyvern injected.
+    const remount = () => form().querySelectorAll('[unique_id]').forEach(node => {
+        const fresh = node.cloneNode(true);
+        fresh.removeAttribute('unique_id');
+        node.replaceWith(fresh);
+    });
+    if (cfg.enableVerifyWhenFull) verify().disabled = true;
+    // Delegated, so the page keeps working after a remount.
+    form().addEventListener('input', event => {
+        const box = event.target;
+        const i = boxes().indexOf(box);
+        if (i < 0) return;
+        box.setAttribute('value', box.value);
+        if (box.value && boxes()[i + 1] && (cfg.stopAdvancingAt === null || i + 1 < cfg.stopAdvancingAt)) {
+            boxes()[i + 1].focus();
+        }
+        if (boxes().every(item => item.value)) {
+            window.__fullEntries += 1;
+            // A re-render that silently drops the last digit of a complete entry: no submit, no status change.
+            if (cfg.dropLastDigitWhenFull) {
+                boxes().at(-1).value = '';
+                boxes().at(-1).setAttribute('value', '');
+            }
+        }
+        if (cfg.enableVerifyWhenFull) verify().disabled = !boxes().every(item => item.value);
+        if (cfg.autoSubmit && boxes().every(item => item.value)) setTimeout(submit, 150);
+    });
+    form().addEventListener('keydown', event => {
+        if (event.key === 'Enter' && boxes().includes(event.target)) submit();
+    });
+    form().addEventListener('click', event => {
+        if (event.target.closest('#verify')) {
+            window.__verifyClicks += 1;
+            submit();
+        }
+        if (event.target.closest('#resend')) window.__resends += 1;
+        if (event.target.closest('#remember') && cfg.remountOnRemember) remount();
+    });
+    document.querySelector('#resend').disabled = cfg.resendDisabled;
+}"""
+_NEW_CODE = "483917"
+
+
+def _step_output(scraped: Any, actions: list[Action]) -> Any:
+    from skyvern.webeye.actions.models import DetailedAgentStepOutput
+
+    return DetailedAgentStepOutput(
+        scraped_page=scraped,
+        extract_action_prompt="",
+        llm_response=None,
+        actions=actions,
+        action_results=[],
+        actions_and_results=[],
+    )
+
+
+class _OtpSite:
+    """A synthetic code page driven through real acquisition, the OTP hook, the step executor and finalization.
+
+    Codes arrive through the real producer of ``channel``: the connected-inbox lookup (only its mailbox search and
+    the content parser are replaced), the webhook (only its network call), or stored codes (only the row query).
+    The planner's language model is replaced too.
+    """
+
+    def __init__(
+        self, monkeypatch: pytest.MonkeyPatch, live_page: Any, task: Task, deliveries: list[str], channel: str = "email"
+    ) -> None:
+        from skyvern.webeye.scraper.scraped_page import ScrapedPage
+
+        monkeypatch.setattr(ScrapedPage, "generate_scraped_page_without_screenshots", lambda _page: self.scrape())
+        self.page = live_page
+        self.task = task
+        self.context = SkyvernContext(task_id=task.task_id)
+        self.agent = ForgeAgent()
+        self.deliveries = deliveries
+        self.channel = channel
+        self.fetch = AsyncMock(side_effect=self._deliver)
+        self.last_scrape: Any = None
+        self.browser_state = SimpleNamespace(
+            get_working_page=AsyncMock(return_value=live_page),
+            must_get_working_page=AsyncMock(return_value=live_page),
+            engine_selection=None,
+            take_post_action_screenshot=AsyncMock(return_value=b""),
+        )
+        self.task_updates: list[dict[str, Any]] = []
+
+        async def update_task(_task, status=None, **kwargs):
+            self.task_updates.append({"status": status, **kwargs})
+            return _task
+
+        async def replan(*_a, **_k):
+            return {"actions": self.entry_plan()}
+
+        async def build_prompt(_task, step, _browser_state, scraped_page, **_k):
+            self.agent._build_navigation_payload(_task, step=step, scraped_page=scraped_page)
+            return SimpleNamespace(
+                prompt="", prompt_name="extract-action", use_caching=False, without_page_information=True
+            )
+
+        monkeypatch.setattr(otp_service, "_get_otp_value_from_url", AsyncMock(side_effect=self._from_webhook))
+        inbox = SimpleNamespace(
+            name="gmail",
+            list_credential_ids=AsyncMock(return_value=["credential-1"]),
+            search_recent_otp_messages=AsyncMock(side_effect=self._from_inbox),
+        )
+        monkeypatch.setattr(agent_functions_module, "build_email_otp_sources", lambda _agent_function: [inbox])
+        # The test app stubs AGENT_FUNCTION; bind the real connected-inbox producer to it.
+        monkeypatch.setattr(
+            otp_service.app.AGENT_FUNCTION,
+            "get_otp_value_from_email",
+            agent_functions_module.AgentFunction().get_otp_value_from_email,
+        )
+        monkeypatch.setattr(
+            otp_service,
+            "parse_otp_login",
+            AsyncMock(side_effect=lambda content, *_a, **_k: OTPValue(value=content, type=OTPType.TOTP)),
+        )
+        monkeypatch.setattr(otp_service.app.DATABASE.otp, "create_otp_code", AsyncMock())
+        monkeypatch.setattr(otp_service.app.DATABASE.otp, "get_otp_codes", AsyncMock(side_effect=self._from_store))
+        monkeypatch.setattr(otp_service.app.DATABASE.otp, "get_raw_otp_codes", AsyncMock(return_value=[]))
+        monkeypatch.setattr(otp_service.app.AGENT_FUNCTION, "enforce_totp_identifier_credential_use", AsyncMock())
+        monkeypatch.setattr(
+            otp_service, "asyncio", ScopedAsyncio(sleep=lambda seconds: asyncio.sleep(min(seconds, 0.05)))
+        )
+        monkeypatch.setattr(
+            otp_service.app.DATABASE.organizations,
+            "get_valid_org_auth_token",
+            AsyncMock(return_value=SimpleNamespace(token="token")),
+        )
+        monkeypatch.setattr(agent_module.app.DATABASE.workflow_runs, "get_workflow_run", AsyncMock(return_value=None))
+        monkeypatch.setattr(agent_module, "get_org_aware_primary_llm_api_handler", lambda: replan)
+        monkeypatch.setattr(agent_module.LLMAPIHandlerFactory, "get_override_llm_api_handler", lambda *a, **k: replan)
+        monkeypatch.setattr(agent_module.service_utils, "is_cua_task", AsyncMock(return_value=False))
+        monkeypatch.setattr(self.agent, "_build_extract_action_prompt", build_prompt)
+        # The existing completion check is an LLM call; each test decides what it reports.
+        self.completion = AsyncMock(return_value=None)
+        monkeypatch.setattr(self.agent, "check_user_goal_complete", self.completion)
+        monkeypatch.setattr(self.agent, "get_extracted_information_for_task", AsyncMock(return_value=None))
+        monkeypatch.setattr(self.agent, "record_artifacts_after_action", AsyncMock())
+
+        def update_step(step, status=None, is_last=None, **_):
+            if status is not None:
+                step.status = status
+            if is_last is not None:
+                step.is_last = is_last
+            return step
+
+        monkeypatch.setattr(self.agent, "update_step", AsyncMock(side_effect=update_step))
+        monkeypatch.setattr(
+            agent_module.app.DATABASE.tasks,
+            "create_step",
+            AsyncMock(
+                side_effect=lambda **kw: make_step(
+                    datetime.now(UTC),
+                    task,
+                    step_id=f"retry-{kw['order']}-{kw['retry_index']}",
+                    status=StepStatus.created,
+                    order=kw["order"],
+                    output=None,
+                    retry_index=kw["retry_index"],
+                )
+            ),
+        )
+        monkeypatch.setattr(self.agent, "update_task", update_task)
+        monkeypatch.setattr(agent_module, "read_run_cancellation", AsyncMock(return_value=None))
+        monkeypatch.setattr(agent_module, "get_or_create_wait_config", AsyncMock(return_value=None))
+        monkeypatch.setattr(handler, "get_or_create_wait_config", AsyncMock(return_value=None))
+        monkeypatch.setattr(agent_module, "get_wait_time", lambda *_a, **_k: 0.0)
+        monkeypatch.setattr(
+            agent_module.app.DATABASE.workflow_params,
+            "create_action",
+            AsyncMock(return_value=SimpleNamespace(action_id="action")),
+        )
+        monkeypatch.setattr(agent_module.app.AGENT_FUNCTION, "post_action_execution", AsyncMock())
+        monkeypatch.setattr(settings, "ENABLE_SECRET_VISUAL_MASKING", False)
+        # Cloud test modules register click setup hooks process-wide; this OSS page runs without them.
+        monkeypatch.setattr(handler.ActionHandler, "_setup_action_types", {})
+        monkeypatch.setattr(handler.ActionHandler, "_teardown_action_types", {})
+
+    async def _deliver(self, channel: str) -> str | None:
+        return self.deliveries[-1] if self.deliveries and channel == self.channel else None
+
+    async def _from_webhook(self, *_a, **_k) -> OTPValue | None:
+        code = await self.fetch("webhook")
+        return OTPValue(value=code, type=OTPType.TOTP) if code else None
+
+    async def _from_inbox(self, **_k) -> list[EmailOTPCandidate]:
+        code = await self.fetch("email")
+        return [EmailOTPCandidate(message_id=f"message-{len(self.deliveries)}", content=code)] if code else []
+
+    async def _from_store(self, **_k) -> list[TOTPCode]:
+        code = await self.fetch("db")
+        if not code:
+            return []
+        now = datetime.now(UTC)
+        return [
+            TOTPCode(
+                totp_code_id=f"code-{len(self.deliveries)}",
+                totp_identifier=self.task.totp_identifier or "",
+                organization_id=self.task.organization_id or "",
+                content=code,
+                code=code,
+                source="sms",
+                otp_type=OTPType.TOTP,
+                created_at=now,
+                modified_at=now,
+            )
+        ]
+
+    async def scrape(self) -> Any:
+        from skyvern.webeye.scraper.scraped_page import ScrapedPage
+        from skyvern.webeye.scraper.scraper import build_element_dict, trim_element_tree
+        from skyvern.webeye.utils.document import get_main_document_loader_id
+        from skyvern.webeye.utils.page import SkyvernFrame
+
+        frame = await SkyvernFrame.create_instance(self.page)
+        elements, tree, _ = await frame.build_tree_from_body("main.frame", 0)
+        css, by_id, frames, hashes, hash_ids = build_element_dict(elements)
+        self.last_scrape = ScrapedPage(
+            elements=elements,
+            element_tree=tree,
+            element_tree_trimmed=trim_element_tree(deepcopy(tree)),
+            id_to_css_dict=css,
+            id_to_element_dict=by_id,
+            id_to_frame_dict=frames,
+            id_to_element_hash=hashes,
+            hash_to_element_ids=hash_ids,
+            url=self.page.url,
+            _browser_state=self.browser_state,
+            _clean_up_func=AsyncMock(),
+            _scrape_exclude=None,
+            # As the production scraper does, so document-continuity checks have the batch's document.
+            _document_loader_id=await get_main_document_loader_id(self.page),
+        )
+        return self.last_scrape
+
+    async def count(self, name: str) -> int:
+        return await self.page.evaluate(f"() => window.__{name}")
+
+    def entry_plan(self) -> list[dict[str, Any]]:
+        attempt = self.context.multi_field_totp.get(self.task.task_id)
+        hint = attempt.hint_code if attempt and attempt.hint_code else _HINT
+        # Like the planner, address the boxes by the ids of the latest scrape; a re-render assigns new ones.
+        boxes = (_multi_field_totp_box_group(self.last_scrape, 6) if self.last_scrape else None) or [
+            f"box-{i}" for i in range(6)
+        ]
+        return [
+            {"action_type": "input_text", "element_id": boxes[i], "text": hint[i], "reasoning": "Enter the code"}
+            for i in range(6)
+        ]
+
+    async def execute(self, step: Step, actions: list[Action], scraped: Any = None) -> Step | None:
+        """Run the step executor, then the same finalizer as ``agent_step``; returns the next step, if any."""
+        scraped = scraped or await self.scrape()
+        output = _step_output(scraped, actions)
+        _, early_return = await self.agent._execute_step_actions(
+            task=self.task,
+            step=step,
+            browser_state=self.browser_state,
+            engine=RunEngine.skyvern_v1,
+            scraped_page=scraped,
+            complete_verification=False,
+            actions=actions,
+            detailed_agent_step_output=output,
+            pdf_auto_download_src=None,
+            pdf_auto_download_used_bytes=False,
+            file_download_false_click_eligible=False,
+            _step_span=MagicMock(),
+            artifact_tracker=agent_module._BackgroundArtifactTaskTracker(),
+        )
+        organization = make_organization(datetime.now(UTC))
+        if early_return is not None:
+            return await self.agent.handle_failed_step(organization, self.task, early_return[0])
+        finalized, _ = await self.agent._finalize_step_execution(
+            task=self.task,
+            step=step,
+            browser_state=self.browser_state,
+            engine=RunEngine.skyvern_v1,
+            scraped_page=scraped,
+            complete_verification=False,
+            task_block=None,
+            actions=actions,
+            detailed_agent_step_output=output,
+        )
+        _, _, next_step = await self.agent.handle_completed_step(
+            organization, self.task, finalized, self.page, complete_verification=False
+        )
+        return next_step
+
+    @property
+    def final_status(self) -> Any:
+        return self.task_updates[-1]["status"] if self.task_updates else None
+
+    async def step(
+        self,
+        step: Step,
+        extra: list[dict[str, Any]] | None = None,
+        *,
+        entry: bool = True,
+        code_field: bool = True,
+        hydrate: bool = False,
+    ) -> list[Action]:
+        """One agent step: the OTP hook on a first-pass plan, then the executor on the plan that survives it.
+
+        ``hydrate`` first builds the navigation payload as the step's prompt does, which arms credential codes.
+        """
+        from skyvern.forge.agent import ReplacedOTPPlan
+        from skyvern.webeye.actions.parse_actions import parse_actions
+
+        self.context.step_id = step.step_id
+        scraped = await self.scrape()
+        if hydrate:
+            self.agent._build_navigation_payload(self.task, step=step, scraped_page=scraped)
+        plan = {
+            "place_to_enter_verification_code": code_field,
+            "should_enter_verification_code": code_field,
+            "actions": [*(self.entry_plan() if entry else []), *(extra or [])],
+        }
+        otp = await self.agent.handle_potential_OTP_actions(self.task, step, scraped, self.browser_state, plan)
+        if isinstance(otp, ReplacedOTPPlan) or otp[1]:
+            planned = otp[1]
+        else:
+            planned = parse_actions(self.task, step.step_id, step.order, scraped, plan["actions"])
+        self.next_step = await self.execute(step, planned, scraped)
+        return planned
+
+
+async def _launch_otp_page(playwright: Any, **cfg: Any) -> tuple[Any, Any]:
+    browser = await playwright.chromium.launch(headless=True, args=["--use-mock-keychain", "--password-store=basic"])
+    live_page = await browser.new_page()
+    await _open_routed_otp_page(live_page, "/verify-code", **cfg)
+    return browser, live_page
+
+
+_OTP_PAGE_DEFAULTS = {
+    "autoSubmit": True,
+    "clear": True,
+    "resendDisabled": False,
+    "submitStatus": "Verifying…",
+    "hideAfterSubmit": False,
+    "disableOnSubmit": False,
+    "enableVerifyWhenFull": False,
+    "stopAdvancingAt": None,
+    "dropLastDigitWhenFull": False,
+    "remountOnRemember": False,
+}
+
+
+async def _open_routed_otp_page(live_page: Any, path: str, **cfg: Any) -> None:
+    """Serve the code page from a real origin, as a login page would be."""
+
+    async def serve(route: Any) -> None:
+        await route.fulfill(status=200, body=f"<html><body>{_OTP_PAGE}</body></html>", content_type="text/html")
+
+    await live_page.route("https://otp.test/**", serve)
+    await live_page.goto(f"https://otp.test{path}")
+    await live_page.evaluate(_OTP_PAGE_JS, {**_OTP_PAGE_DEFAULTS, **cfg})
+
+
+def _otp_task(*, webhook: bool = False, inbox: bool = True) -> tuple[Task, list[Step]]:
+    now = datetime.now(UTC)
+    task = make_task(now, make_organization(now), navigation_payload={}, url="about:blank")
+    task.totp_verification_url = "https://example.test/otp" if webhook else None
+    task.totp_identifier = "user@example.test" if inbox else None
+    steps = [
+        make_step(now, task, step_id=f"step-{i}", status=StepStatus.created, order=i, output=None) for i in range(5)
+    ]
+    return task, steps
+
+
+def _terminal_codes(planned: list[Action]) -> list[str]:
+    return [error.error_code for action in planned if isinstance(action, TerminateAction) for error in action.errors]
+
+
+def _click(element_id: str, **extra: Any) -> dict[str, Any]:
+    return {"action_type": "click", "element_id": element_id, "reasoning": "plan", **extra}
+
+
+async def _counts(site: _OtpSite) -> tuple[int, int, int]:
+    return (await site.count("fullEntries"), await site.count("verifyClicks"), _fetched(site))
+
+
+def _fetched(site: _OtpSite) -> int:
+    return sum(1 for entry in site.fetch.await_args_list if entry.args[0] == site.channel)
+
+
+async def _run_until_terminal(
+    site: _OtpSite, steps: list[Step], *, budget_s: float, hydrate: bool = False
+) -> list[Action]:
+    """Keep re-planning code entry, as the planner did in the incident, until the task ends."""
+    planned: list[Action] = []
+    deadline = time.monotonic() + budget_s + 3
+    for step in steps:
+        planned = await site.step(step, hydrate=hydrate)
+        if site.next_step is None or time.monotonic() > deadline:
+            return planned
+        if [action.action_type for action in planned] == [ActionType.NULL_ACTION]:
+            await asyncio.sleep(budget_s / 3)
+    return planned
+
+
+def _many_steps(task: Task, count: int) -> list[Step]:
+    now = datetime.now(UTC)
+    return [
+        make_step(now, task, step_id=f"step-{i}", status=StepStatus.created, order=i, output=None) for i in range(count)
+    ]
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "page_reaction",
+    [
+        {"clear": True},
+        {"clear": False, "submitStatus": None},
+        {"clear": False, "disableOnSubmit": True},
+        {"clear": False, "submitStatus": "Enter the code we just sent"},
+    ],
+    ids=["silently_cleared", "retained_unchanged", "boxes_disabled", "label_changed"],
+)
+async def test_external_otp_browser_entered_code_is_not_entered_again(
+    monkeypatch: pytest.MonkeyPatch, page_reaction: dict[str, Any]
+) -> None:
+    from playwright.async_api import async_playwright
+
+    task, _ = _otp_task()
+    steps = _many_steps(task, 10)
+    monkeypatch.setattr(settings, "BROWSER_LOADING_TIMEOUT_MS", 1500)
+    async with async_playwright() as playwright:
+        browser, live_page = await _launch_otp_page(playwright, **page_reaction)
+        try:
+            site = _OtpSite(monkeypatch, live_page, task, [_CODE])
+            with skyvern_context.scoped(site.context), structlog.testing.capture_logs() as events:
+                await site.step(steps[0], entry=False)
+                await live_page.wait_for_function("() => window.__submits === 1")
+                planned = await _run_until_terminal(site, steps[1:], budget_s=1.5)
+                assert await _counts(site) == (1, 0, 1)
+                assert _terminal_codes(planned) == ["OTP_OUTCOME_UNCONFIRMED"]
+                assert site.final_status == agent_module.TaskStatus.terminated and site.next_step is None
+                assert "not entered again" in site.task_updates[-1]["failure_reason"]
+        finally:
+            await browser.close()
+    assert _CODE not in str(events)
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+@pytest.mark.parametrize("opaque_autosubmit", [False, True])
+async def test_external_otp_browser_first_manual_verify_still_runs_once(
+    monkeypatch: pytest.MonkeyPatch, opaque_autosubmit: bool
+) -> None:
+    from playwright.async_api import async_playwright
+
+    task, steps = _otp_task()
+    task.data_extraction_goal = None
+    cfg: dict[str, Any] = (
+        {"autoSubmit": True, "clear": False, "submitStatus": None}
+        if opaque_autosubmit
+        else {"autoSubmit": False, "clear": False, "enableVerifyWhenFull": True}
+    )
+    async with async_playwright() as playwright:
+        browser, live_page = await _launch_otp_page(playwright, **cfg)
+        try:
+            site = _OtpSite(monkeypatch, live_page, task, [_CODE])
+            with skyvern_context.scoped(site.context):
+                await site.step(steps[0], entry=False)
+                await asyncio.sleep(0.4)
+                # The plan types the code again and presses Verify: only the press runs, and only once.
+                await site.step(steps[1], [_click("verify"), _click("verify")])
+                assert await _counts(site) == (1, 1, 1)
+                site.completion.return_value = CompleteAction(reasoning="Signed in", verified=True)
+                await site.step(steps[2], [{"action_type": "complete", "reasoning": "Signed in"}], entry=False)
+                assert site.final_status == agent_module.TaskStatus.completed and site.next_step is None
+                assert await _counts(site) == (1, 1, 1)
+        finally:
+            await browser.close()
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+@pytest.mark.parametrize("failure", ["partial_entry", "detach_after_full_entry"])
+async def test_external_otp_browser_partial_entry_is_repaired_but_full_entry_is_not_replayed(
+    monkeypatch: pytest.MonkeyPatch, failure: str
+) -> None:
+    from playwright.async_api import async_playwright
+
+    task, steps = _otp_task()
+    monkeypatch.setattr(settings, "BROWSER_LOADING_TIMEOUT_MS", 1500)
+    cfg: dict[str, Any] = {"autoSubmit": False, "clear": False}
+    if failure == "partial_entry":
+        cfg["stopAdvancingAt"] = 2
+    async with async_playwright() as playwright:
+        browser, live_page = await _launch_otp_page(playwright, **cfg)
+        try:
+            site = _OtpSite(monkeypatch, live_page, task, [_CODE])
+            if failure == "detach_after_full_entry":
+                monkeypatch.setattr(
+                    handler,
+                    "_read_multi_field_totp_values",
+                    AsyncMock(side_effect=PlaywrightError("Element is not attached to the DOM")),
+                )
+                monkeypatch.setattr(
+                    handler,
+                    "_reresolve_multi_field_totp_group_elements",
+                    AsyncMock(return_value=MultiFieldTotpBindingFailure.UNCONFIRMED),
+                )
+            with skyvern_context.scoped(site.context):
+                await site.step(steps[0], entry=False)
+                values = await live_page.locator("#otp-scope input[inputmode]").evaluate_all(
+                    "bs => bs.map(b => b.value)"
+                )
+                if failure == "partial_entry":
+                    # Focus stopped after two digits; the remaining boxes are filled once, in the same action.
+                    assert values == list(_CODE) and await site.count("fullEntries") == 1
+                else:
+                    # Cleanup after the detach restores no code: the next plans cannot type it again.
+                    await live_page.locator("#otp-scope input[inputmode]").evaluate_all(
+                        "bs => bs.forEach(b => b.value = '')"
+                    )
+                    await site.step(steps[1])
+                    await site.step(steps[2])
+                    assert await site.count("fullEntries") == 1 and _fetched(site) == 1
+        finally:
+            await browser.close()
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+@pytest.mark.parametrize("failure", ["after_effect", "cancelled_after_effect", "before_effect", "teardown"])
+async def test_external_otp_browser_verify_press_reaches_the_page_once(
+    monkeypatch: pytest.MonkeyPatch, failure: str
+) -> None:
+    from playwright.async_api import TimeoutError as PlaywrightTimeout
+    from playwright.async_api import async_playwright
+
+    task, steps = _otp_task()
+    real_click = handler.EventStrategyFactory.click_element
+    calls = {"count": 0}
+
+    async def click_element(page, locator, **kwargs):
+        calls["count"] += 1
+        if failure == "before_effect" and calls["count"] == 1:
+            raise PlaywrightTimeout("locator.click: Timeout exceeded. waiting for element to be visible, enabled")
+        await real_click(page, locator, **kwargs)
+        if failure == "after_effect" and calls["count"] == 1:
+            raise RuntimeError("Execution context was destroyed after the click")
+        if failure == "cancelled_after_effect" and calls["count"] == 1:
+            raise asyncio.CancelledError
+
+    async def failing_teardown(*_args, **_kwargs):
+        raise RuntimeError("teardown failed after the click")
+
+    async with async_playwright() as playwright:
+        browser, live_page = await _launch_otp_page(playwright, autoSubmit=False, clear=False)
+        try:
+            site = _OtpSite(monkeypatch, live_page, task, [_CODE])
+            monkeypatch.setattr(handler.EventStrategyFactory, "click_element", click_element)
+            if failure == "teardown":
+                monkeypatch.setattr(
+                    handler.ActionHandler, "_teardown_action_types", {ActionType.CLICK: failing_teardown}
+                )
+            with skyvern_context.scoped(site.context):
+                await site.step(steps[0], entry=False)
+                if failure == "cancelled_after_effect":
+                    with pytest.raises(asyncio.CancelledError):
+                        await site.step(steps[1], [_click("verify")], entry=False, code_field=False)
+                    assert handler.otp_single_dispatch.get() is False and handler.otp_dispatch_effect.get() is None
+                else:
+                    await site.step(steps[1], [_click("verify")], entry=False, code_field=False)
+                assert await site.count("verifyClicks") == (0 if failure == "before_effect" else 1)
+                # Only a press known not to have landed may run again; no fallback follows a possible press.
+                await site.step(steps[2], [_click("verify")], entry=False, code_field=False)
+                assert await site.count("verifyClicks") == 1
+                use = site.context.external_otp_uses[task.task_id]
+                assert use.current_code_hash in use.submitted_code_hashes
+        finally:
+            await browser.close()
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("case", "webhook_first"),
+    [
+        ("new_code", False),
+        # A webhook is configured but has no code, so the inbox fallback delivers.
+        ("new_code", True),
+        ("old_code_only", False),
+        ("no_delivery", False),
+        ("disabled_resend", False),
+        ("help_instead", False),
+    ],
+)
+async def test_external_otp_browser_only_a_pressed_resend_fetches_once(
+    monkeypatch: pytest.MonkeyPatch, case: str, webhook_first: bool
+) -> None:
+    from playwright.async_api import async_playwright
+
+    task, _ = _otp_task(webhook=webhook_first)
+    steps = _many_steps(task, 10)
+    monkeypatch.setattr(settings, "BROWSER_LOADING_TIMEOUT_MS", 1500)
+    async with async_playwright() as playwright:
+        browser, live_page = await _launch_otp_page(playwright, resendDisabled=case == "disabled_resend")
+        try:
+            site = _OtpSite(monkeypatch, live_page, task, [_CODE])
+            with skyvern_context.scoped(site.context):
+                await site.step(steps[0], entry=False)
+                await live_page.wait_for_function("() => window.__submits === 1")
+                if case == "new_code":
+                    site.deliveries.append(_NEW_CODE)
+                elif case == "no_delivery":
+                    site.deliveries.clear()
+                fetches = _fetched(site)
+                await site.step(steps[1], [_click("help" if case == "help_instead" else "resend")])
+                assert await site.count("resends") == (1 if case in ("new_code", "old_code_only", "no_delivery") else 0)
+                await site.step(steps[2])
+                if case == "new_code":
+                    # The fetched code is new, so it is entered once; the old one never again.
+                    await live_page.wait_for_function("() => window.__submits === 2")
+                    assert await site.count("fullEntries") == 2 and _fetched(site) == fetches + 1
+                    return
+                planned = await _run_until_terminal(site, steps[3:], budget_s=1.5)
+                assert _terminal_codes(planned) == ["OTP_OUTCOME_UNCONFIRMED"]
+                fetched = _fetched(site) > fetches
+                assert fetched is (case in ("old_code_only", "no_delivery"))
+                assert ("new one-time code was requested" in planned[0].reasoning) is fetched
+                assert await site.count("fullEntries") == 1 and site.next_step is None
+        finally:
+            await browser.close()
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+@pytest.mark.parametrize("later", ["remount_with_help_while_hidden", "new_task_same_code", "seed_totp_factor"])
+async def test_external_otp_browser_remount_new_task_and_seed(monkeypatch: pytest.MonkeyPatch, later: str) -> None:
+    from playwright.async_api import async_playwright
+
+    task, _ = _otp_task()
+    steps = _many_steps(task, 6)
+    monkeypatch.setattr(settings, "BROWSER_LOADING_TIMEOUT_MS", 1500)
+    cfg: dict[str, Any] = {"hideAfterSubmit": True} if later == "remount_with_help_while_hidden" else {}
+    async with async_playwright() as playwright:
+        browser, live_page = await _launch_otp_page(playwright, **cfg)
+        try:
+            site = _OtpSite(monkeypatch, live_page, task, [_CODE])
+            with skyvern_context.scoped(site.context):
+                await site.step(steps[0], entry=False)
+                await live_page.wait_for_function("() => window.__submits === 1")
+                if later == "remount_with_help_while_hidden":
+                    await live_page.evaluate("() => document.querySelector('#help').style.display = 'none'")
+                    await live_page.evaluate(
+                        "() => document.body.insertAdjacentHTML('beforeend', "
+                        '\'<button unique_id="help2" id="help2">Help</button>\')'
+                    )
+                    await site.step(steps[1], [_click("help2")], entry=False, code_field=False)
+                    await live_page.evaluate(
+                        "() => { const f = document.querySelector('#otp-scope'); f.style.display = ''; "
+                        "f.querySelectorAll('input[inputmode]').forEach(b => b.replaceWith(b.cloneNode())); }"
+                    )
+                    planned = await _run_until_terminal(site, steps[2:], budget_s=1.5)
+                    assert _terminal_codes(planned) == ["OTP_OUTCOME_UNCONFIRMED"]
+                    assert await _counts(site) == (1, 0, 1)
+                elif later == "seed_totp_factor":
+                    await _open_routed_otp_page(live_page, "/authenticator", autoSubmit=False, clear=False)
+                    site.context.multi_field_totp[task.task_id] = MultiFieldTotpAttempt(
+                        [f"box-{i}" for i in range(6)], 6, "secret", hint_code=_HINT
+                    )
+                    site.context.totp_codes[f"{task.task_id}_secret"] = _SEED
+                    await site.step(steps[1], [_click("verify")])
+                    assert await site.count("fullEntries") == 1 and await site.count("verifyClicks") == 1
+                    assert site.final_status is None and site.next_step is not None
+                else:
+                    # A new task (a new block) has its own record: the same code from the source is usable there.
+                    now = datetime.now(UTC)
+                    next_task = make_task(now, make_organization(now), task_id="task-next", url="about:blank")
+                    next_task.totp_identifier = task.totp_identifier
+                    await _open_routed_otp_page(live_page, "/next-block")
+                    next_site = _OtpSite(monkeypatch, live_page, next_task, [_CODE])
+                    with skyvern_context.scoped(next_site.context):
+                        next_step = make_step(
+                            now, next_task, step_id="next-0", status=StepStatus.created, order=0, output=None
+                        )
+                        await next_site.step(next_step, entry=False)
+                        await live_page.wait_for_function("() => window.__submits === 1")
+                        assert await next_site.count("fullEntries") == 1
+        finally:
+            await browser.close()
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+async def test_external_otp_browser_cancelled_resend_restores_context_and_keeps_its_fact(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from playwright.async_api import async_playwright
+
+    task, steps = _otp_task()
+
+    async def cancelled_press(*_args, **_kwargs):
+        handler.otp_dispatch_effect.set("dispatched")
+        raise asyncio.CancelledError
+
+    async with async_playwright() as playwright:
+        browser, live_page = await _launch_otp_page(playwright, autoSubmit=False, clear=False)
+        try:
+            site = _OtpSite(monkeypatch, live_page, task, [_CODE])
+            with skyvern_context.scoped(site.context):
+                await site.step(steps[0], entry=False)
+                monkeypatch.setattr(handler.ActionHandler, "handle_action", cancelled_press)
+                with pytest.raises(asyncio.CancelledError):
+                    await site.execute(steps[1], [ClickAction(element_id="resend")])
+                assert handler.otp_single_dispatch.get() is False and handler.otp_dispatch_effect.get() is None
+                assert site.context.external_otp_uses[task.task_id].resend_requested_at is not None
+        finally:
+            await browser.close()
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("source", "channel"),
+    [
+        ("inbox", "email"),
+        ("inbox_after_empty_webhook", "email"),
+        ("webhook", "webhook"),
+        ("webhook_with_inbox_configured", "webhook"),
+        ("stored_row", "db"),
+        ("payload", "payload"),
+    ],
+)
+async def test_external_otp_browser_every_supplied_code_is_entered_once(
+    monkeypatch: pytest.MonkeyPatch, source: str, channel: str
+) -> None:
+    from playwright.async_api import async_playwright
+
+    task, _ = _otp_task(webhook="webhook" in source, inbox=source not in ("webhook", "payload"))
+    if source == "payload":
+        task.navigation_payload = {"otp_code": _CODE}
+    steps = _many_steps(task, 8)
+    monkeypatch.setattr(settings, "BROWSER_LOADING_TIMEOUT_MS", 1500)
+    async with async_playwright() as playwright:
+        browser, live_page = await _launch_otp_page(playwright, clear=True)
+        try:
+            site = _OtpSite(monkeypatch, live_page, task, [_CODE], channel=channel)
+            # A payload code is armed when the step's prompt builds the navigation payload, and the planner types it.
+            hydrate = source == "payload"
+            with skyvern_context.scoped(site.context):
+                await site.step(steps[0], entry=hydrate, hydrate=hydrate)
+                await live_page.wait_for_function("() => window.__submits === 1")
+                planned = await _run_until_terminal(site, steps[1:], budget_s=1.5, hydrate=hydrate)
+                # Main types the silently cleared code on every step until the step cap (5 entries, 5 submits).
+                observed = (await site.count("fullEntries"), await site.count("submits"))
+                assert observed == (1, 1) and _fetched(site) == (0 if channel == "payload" else 1)
+                assert _terminal_codes(planned) == ["OTP_OUTCOME_UNCONFIRMED"]
+                assert site.final_status == agent_module.TaskStatus.terminated and site.next_step is None
+        finally:
+            await browser.close()
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+@pytest.mark.parametrize("press", ["verify", "resend"])
+async def test_external_otp_browser_press_on_a_control_remounted_earlier_in_the_batch_is_tracked(
+    monkeypatch: pytest.MonkeyPatch, press: str
+) -> None:
+    from playwright.async_api import async_playwright
+
+    task, _ = _otp_task()
+    steps = _many_steps(task, 5)
+    monkeypatch.setattr(settings, "BROWSER_LOADING_TIMEOUT_MS", 1500)
+    resend = press == "resend"
+    async with async_playwright() as playwright:
+        browser, live_page = await _launch_otp_page(playwright, autoSubmit=resend, clear=resend, remountOnRemember=True)
+        try:
+            site = _OtpSite(monkeypatch, live_page, task, [_CODE])
+            with skyvern_context.scoped(site.context):
+                await site.step(steps[0], entry=False)
+                if resend:
+                    await live_page.wait_for_function("() => window.__submits === 1")
+                # One plan: ticking the checkbox re-renders the widget, so the queued press is remapped by the
+                # executor's stale-target refresh before it runs.
+                await site.step(steps[1], [_click("remember"), _click(press)], entry=False, code_field=False)
+                use = site.context.external_otp_uses[task.task_id]
+                if not resend:
+                    assert await site.count("verifyClicks") == 1
+                    assert use.current_code_hash in use.submitted_code_hashes
+                    await site.step(steps[2], [_click("verify")], entry=False, code_field=False)
+                    assert await site.count("verifyClicks") == 1
+                else:
+                    assert await site.count("resends") == 1 and use.resend_requested_at is not None
+                    site.deliveries.append(_NEW_CODE)
+                    await site.step(steps[2])
+                    await live_page.wait_for_function("() => window.__submits === 2")
+                    # Exactly one new code is entered, once. (The remount also makes the next plan re-resolve the
+                    # source, which returns that same new code.)
+                    assert await site.count("fullEntries") == 2
+                    assert use.used_code_hashes == {
+                        hashlib.sha256(code.encode()).hexdigest() for code in (_CODE, _NEW_CODE)
+                    }
+                assert site.next_step is not None and site.final_status is None
+        finally:
+            await browser.close()
+
+
+@pytest.mark.asyncio
+async def test_external_otp_record_does_not_block_a_later_seed_totp(monkeypatch: pytest.MonkeyPatch) -> None:
+    task, steps = _otp_task()
+    attempt = MultiFieldTotpAttempt([f"box-{i}" for i in range(6)], 6, "secret", hint_code=_HINT)
+    context = SkyvernContext(task_id=task.task_id, multi_field_totp={task.task_id: attempt})
+    context.note_external_otp_input(task.task_id, hashlib.sha256(b"111111").hexdigest(), 6, 60)
+    monkeypatch.setattr(handler, "_resolve_multi_field_totp_code", AsyncMock(return_value="111111"))
+    fill = AsyncMock(return_value=ActionSuccess(data={"totp_group_filled": True}))
+    monkeypatch.setattr(handler, "_fill_multi_field_totp_group", fill)
+    action = InputTextAction(element_id="box-0", text=_HINT, totp_timing_info={"is_totp_sequence": True})
+    with skyvern_context.scoped(context):
+        [result] = await handler._handle_input_text_action(action, SimpleNamespace(), _box_page(6), task, steps[0])
+    assert result.success
+    fill.assert_awaited_once()
+
+
+class _FreshTotpWindowClock:
+    """The handler's clock, shifted so the current 30-second TOTP window has most of its time left."""
+
+    def __init__(self) -> None:
+        now = time.time()
+        self.offset = now - (now // 30 * 30 + 2)
+
+    def time(self) -> float:
+        return time.time() - self.offset
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(time, name)
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+@pytest.mark.parametrize("seed_code", ["generated", "cached"])
+async def test_external_otp_browser_same_digit_seed_after_external_code_keeps_the_original_fill(
+    monkeypatch: pytest.MonkeyPatch, seed_code: str
+) -> None:
+    import pyotp
+    from playwright.async_api import async_playwright
+
+    task, _ = _otp_task(webhook=True, inbox=False)
+    task.workflow_run_id = "workflow"
+    steps = _many_steps(task, 5)
+    monkeypatch.setattr(settings, "BROWSER_LOADING_TIMEOUT_MS", 1500)
+    clock = _FreshTotpWindowClock()
+    monkeypatch.setattr(handler, "time", clock)
+    # The webhook delivers exactly the digits the credential seed produces in this window.
+    same_digits = pyotp.TOTP(_SEED).at(int(clock.time()))
+    workflow = WorkflowRunContext("title", "workflow-id", "permanent-id", "workflow", None)
+    workflow.parameters["credentials"] = CredentialParameter.model_construct()
+    workflow.values["credentials"] = {"totp": "placeholder_seed1_totp"}
+    workflow.secrets["placeholder_seed1_totp"] = BitwardenConstants.TOTP
+    workflow.secrets["placeholder_seed1_totp_value"] = _SEED
+    manager = WorkflowContextManager.__new__(WorkflowContextManager)
+    manager.workflow_run_contexts = {}
+    monkeypatch.setattr(agent_module.app, "WORKFLOW_CONTEXT_MANAGER", manager)
+    async with async_playwright() as playwright:
+        browser, live_page = await _launch_otp_page(playwright, clear=True)
+        try:
+            site = _OtpSite(monkeypatch, live_page, task, [same_digits], channel="webhook")
+            with skyvern_context.scoped(site.context):
+                await site.step(steps[0], entry=False)
+                await live_page.wait_for_function("() => window.__submits === 1")
+                external_use = deepcopy(site.context.external_otp_uses[task.task_id])
+                # The agent typed the credential; hydration now arms its seed for the next code group.
+                manager.workflow_run_contexts["workflow"] = workflow
+                site.context.active_credential_parameter_key = "credentials"
+                task.navigation_payload = {"credentials": {"totp": "placeholder_seed1_totp"}}
+                # A page without a code group ends the external attempt; no code is resolved on the way.
+                await live_page.set_content("<html><body>Signed in. Set up your authenticator next.</body></html>")
+                await site.step(steps[1], [], entry=False, code_field=False, hydrate=True)
+                assert task.task_id not in site.context.multi_field_totp
+                next_step = steps[2]
+                if seed_code == "cached":
+                    await _open_routed_otp_page(live_page, "/authenticator", autoSubmit=False, clear=False)
+                    await site.step(steps[2], hydrate=True)
+                    assert await site.count("fullEntries") == 1
+                    assert site.context.totp_codes[f"{task.task_id}_totp_cache"] == same_digits
+                    next_step = steps[3]
+                # This page drops part of a complete entry without submitting, so the keystream read-back fails.
+                await _open_routed_otp_page(
+                    live_page, "/authenticator", autoSubmit=False, clear=False, dropLastDigitWhenFull=True
+                )
+                planned = await site.step(next_step, hydrate=True)
+                attempt = site.context.multi_field_totp[task.task_id]
+                # The original seed handling: the boxes are refilled one by one after the failed read-back.
+                assert await site.count("fullEntries") == 2
+                assert attempt.code_source == "secret"
+                assert [action.action_type for action in planned].count(ActionType.INPUT_TEXT) == 6
+                assert site.next_step is not None and site.final_status is None
+                # The external record is left as it was: no seed entry, deadline or terminal is added to it.
+                assert site.context.external_otp_uses[task.task_id] == external_use
+        finally:
+            await browser.close()

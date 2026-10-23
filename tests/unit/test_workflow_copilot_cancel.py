@@ -83,6 +83,8 @@ from tests.unit.copilot_test_helpers import (
 class _FakeCache:
     """Minimal in-memory double of the ``get`` / ``set`` surface of app.CACHE."""
 
+    is_shared = False
+
     def __init__(self) -> None:
         self.store: dict[str, Any] = {}
         self.set_calls: list[tuple[str, Any, Any]] = []

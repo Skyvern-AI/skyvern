@@ -52,6 +52,7 @@ from skyvern.constants import (
 from skyvern.core.script_generations.fuzzy_matcher import match_option_exact_or_stem
 from skyvern.errors.errors import UserDefinedError, filter_to_user_defined_codes
 from skyvern.exceptions import (
+    BROWSER_CONNECTION_LOST_ERROR_CODE,
     ActionExecutionTimeout,
     BlockedHost,
     CaptchaSolveError,
@@ -79,6 +80,7 @@ from skyvern.exceptions import (
     InteractWithDisabledElement,
     InteractWithDropdownContainer,
     InvalidElementForTextInput,
+    MissingBrowserState,
     MissingElement,
     MissingElementDict,
     MissingElementInCSSMap,
@@ -101,7 +103,6 @@ from skyvern.exceptions import (
     SkyvernException,
     SkyvernHTTPException,
     SkyvernPageAnalysisTimeout,
-    UnresolvableHost,
 )
 from skyvern.experimentation.wait_utils import get_or_create_wait_config, get_wait_time
 from skyvern.forge import app
@@ -224,7 +225,7 @@ from skyvern.webeye.browser_factory import (
     resolve_artifact_path,
     was_download_cancelled_by_skyvern,
 )
-from skyvern.webeye.browser_state import BLANK_PAGE_URLS, BrowserState
+from skyvern.webeye.browser_state import BLANK_PAGE_URLS, BrowserState, get_browser_connection_loss
 from skyvern.webeye.cdp_download_interceptor import (
     BROWSER_DOWNLOAD_EVENT_ADMISSION_GRACE_SECONDS,
     DOWNLOAD_MIME_TYPES,
@@ -276,6 +277,7 @@ from skyvern.webeye.utils.dom import (
     SkyvernOptionType,
     bounded_lookup_call,
     is_element_detached_error,
+    is_engine_timeout_error,
     is_incompatible_text_input_error,
     is_post_dispatch_click_timeout,
     resolve_locator,
@@ -1653,6 +1655,12 @@ _false_click_download_eligible: ContextVar[bool] = ContextVar("false_click_downl
 # them. Fails toward retention -- a missed suppression stays committed, degrading to base-equivalent
 # retention rather than releasing a genuinely-owned claim.
 _browser_dispatch_committed: ContextVar[bool] = ContextVar("browser_dispatch_committed", default=False)
+# Set by the step executor around a click or Enter on a one-time code group's submit or resend control: the
+# action may reach the page once, so no fallback runs after a click that might already have landed.
+otp_single_dispatch: ContextVar[bool] = ContextVar("otp_single_dispatch", default=False)
+# What such an action did to the page: "dispatched" once the click or key press returned, "unknown" from the
+# first await that may reach the page until then, None when it is known not to have reached the page.
+otp_dispatch_effect: ContextVar[str | None] = ContextVar("otp_dispatch_effect", default=None)
 
 
 def _suppress_redundant_desired_click() -> list[ActionResult]:
@@ -2438,6 +2446,15 @@ async def _recover_download_page(
     timeout_seconds: float,
     recovery_site: str,
 ) -> Page | None:
+    connection_loss = get_browser_connection_loss(browser_state)
+    if connection_loss is not None:
+        raise MissingBrowserState(
+            task_id=task.task_id,
+            workflow_run_id=task.workflow_run_id,
+            diagnostic=connection_loss,
+            detected_at=datetime.now(UTC),
+            failure_reason=BROWSER_CONNECTION_LOST_ERROR_CODE,
+        )
     LOG.warning(
         "Working page closed during download action; recreating it before continuing",
         workflow_run_id=task.workflow_run_id,
@@ -2510,6 +2527,9 @@ async def _recover_download_page(
                     recovery_site=recovery_site,
                     exc_info=True,
                 )
+        # A connection lost while recovery was in flight ends the action, so the caller never starts waiting.
+        if get_browser_connection_loss(browser_state) is not None:
+            raise
         return None
     return recovered_page
 
@@ -2660,32 +2680,6 @@ class CustomSingleSelectResult:
             return True
 
         return not await self.skyvern_frame.get_element_visible(self.dropdown_menu.get_locator())
-
-
-def is_ul_or_listbox_element_factory(
-    incremental_scraped: IncrementalScrapePage, task: Task, step: Step
-) -> Callable[[dict], Awaitable[bool]]:
-    async def wrapper(element_dict: dict) -> bool:
-        element_id: str = element_dict.get("id", "")
-        try:
-            element = await SkyvernElement.create_from_incremental(incremental_scraped, element_id)
-        except Exception:
-            LOG.debug(
-                "Failed to element in the incremental page",
-                element_id=element_id,
-                exc_info=True,
-            )
-            return False
-
-        if element.get_tag_name() == "ul":
-            return True
-
-        if await element.get_attr("role") == "listbox":
-            return True
-
-        return False
-
-    return wrapper
 
 
 CheckFilterOutElementIDFunc = Callable[[dict, Page | Frame], Awaitable[bool]]
@@ -5290,6 +5284,11 @@ class ActionHandler:
                         attempt_started_at=false_click_attempt_started_at,
                     )
             action.finished_at = naive_utc_now()
+            # _handle_action stamped the status from the results it returned, but the download
+            # lifecycle above can still downgrade the terminal result (a settled false-click close
+            # here, a replaced result on the download path). Re-derive before the row is written so
+            # the persisted status can never disagree with the result the run reports.
+            action.status = _terminal_action_status(results)
             persisted_action = await app.DATABASE.workflow_params.create_action(
                 action=skyvern_context.action_for_multi_field_totp_persistence(
                     action, app.WORKFLOW_CONTEXT_MANAGER.get_one_time_codes_for_run(action.workflow_run_id)
@@ -6108,6 +6107,8 @@ class ActionHandler:
                     download_triggered=download_triggered,
                 )
                 results[-1].download_failure_status = preserved_download_failure_status
+            if "results" in locals() and results:
+                action.status = _terminal_action_status(results)
             persisted_action = await app.DATABASE.workflow_params.create_action(
                 action=skyvern_context.action_for_multi_field_totp_persistence(
                     action, app.WORKFLOW_CONTEXT_MANAGER.get_one_time_codes_for_run(action.workflow_run_id)
@@ -8260,6 +8261,12 @@ def _record_multi_field_totp_fill(
     if verified:
         state.observed_max_filled = state.expected_digits
     state.filled_code_hash = hashlib.sha256(code.encode()).hexdigest()
+    context = skyvern_context.current()
+    if state.code_source == "external" and context is not None and context.task_id:
+        # Recorded here, before any cleanup, restore or result handling, so no later failure undoes it.
+        context.note_external_otp_input(
+            context.task_id, state.filled_code_hash, state.expected_digits, settings.BROWSER_LOADING_TIMEOUT_MS / 1000
+        )
     state.filled_at = time.time()
     state.filled_url = filled_url
     state.filled_loader_id = filled_loader_id
@@ -8622,6 +8629,10 @@ async def _fill_multi_field_totp_group(
                 result.data = {"totp_group_filled": True, "verified": False, "totp_submission_observed": True}
                 return result
 
+        if state.code_source == "external" and stream_completed and state.observed_max_filled == state.expected_digits:
+            # Every digit already reached the boxes; typing them again box by box would enter the code twice.
+            return delivered_unverified_or_failure("keyboard_stream_delivered_unconfirmed")
+
         code_refresh_error = await refresh_code_if_expiring()
         if code_refresh_error is not None:
             strategy = "per_box_fill_code_refresh_failed"
@@ -8701,6 +8712,14 @@ async def _fill_multi_field_totp_group(
                 code_source=state.code_source,
                 verified=verified,
             )
+
+
+def _external_otp_reentry_refused() -> ActionFailure:
+    # Not stopping: the batch's other actions (a first Verify, the next page's steps) still run.
+    return ActionFailure(
+        SkyvernException("This one-time code was already entered and is not entered again."),
+        stop_execution_on_failure=False,
+    )
 
 
 def _normalize_dropdown_match_text(value: str) -> str:
@@ -9239,6 +9258,12 @@ async def _handle_input_text_action(
         code = await _resolve_multi_field_totp_code(task, attempt)
         if isinstance(code, ActionFailure):
             return [code]
+        if (
+            attempt.code_source == "external"
+            and context is not None
+            and context.external_otp_code_used(task.task_id, code)
+        ):
+            return [_external_otp_reentry_refused()]
         resolved_hint = code
     if not action.element_id:
         # This is a CUA type action
@@ -9304,6 +9329,9 @@ async def _handle_input_text_action(
         code = await _resolve_multi_field_totp_code(task, attempt)
         if isinstance(code, ActionFailure):
             return [code]
+        if attempt.code_source == "external" and context.external_otp_code_used(task.task_id, code):
+            LOG.info("Refused to enter a one-time code again", task_id=task.task_id)
+            return [_external_otp_reentry_refused()]
         return [await _fill_multi_field_totp_group(page, scraped_page, task, attempt, code)]
 
     dom = DomUtil(scraped_page, page)
@@ -11505,7 +11533,9 @@ async def handle_keypress_action(
     task: Task,
     step: Step,
 ) -> list[ActionResult]:
+    otp_dispatch_effect.set("unknown")
     await handler_utils.keypress(page, action.keys, hold=action.hold, duration=action.duration, repeat=action.repeat)
+    otp_dispatch_effect.set("dispatched")
     return [ActionSuccess()]
 
 
@@ -12104,10 +12134,6 @@ def _get_click_count(action: ClickAction | UploadFileAction) -> int:
     return 1
 
 
-def _is_policy_blocked_host(error: Exception) -> bool:
-    return isinstance(error, BlockedHost) and not isinstance(error, UnresolvableHost)
-
-
 async def _locator_click(
     locator: Locator,
     click_count: int,
@@ -12188,6 +12214,8 @@ async def chain_click(
     engine_selection = resolve_engine_selection_for_task(task, app.BROWSER_MANAGER)
     # Tracks the return value so the finally block can inspect click success.
     action_results: list[ActionResult] = []
+    # Marked before the first await that may reach the page, so a cancellation mid-click keeps the press.
+    otp_dispatch_effect.set("unknown")
     try:
         if not await skyvern_element.navigate_to_a_href(page=page):
             if resolved_href := await skyvern_element.resolve_http_href(page):
@@ -12202,10 +12230,19 @@ async def chain_click(
                 await EventStrategyFactory.move_to_element(page, locator)
                 await _locator_click(locator, click_count, timeout=timeout)
             LOG.info("Chain click: main element click succeeded", action=action, locator=locator, sampling=True)
+        otp_dispatch_effect.set("dispatched")
         action_results = [ActionSuccess()]
         return action_results
 
     except Exception as e:
+        if otp_single_dispatch.get():
+            # Only an actionability timeout is known to precede the click; anything else may follow it.
+            post_dispatch = is_post_dispatch_click_timeout(e, engine_selection)
+            if post_dispatch:
+                otp_dispatch_effect.set("dispatched")
+            elif is_engine_timeout_error(e, engine_selection):
+                otp_dispatch_effect.set(None)
+            return [ActionSuccess()] if post_dispatch else [ActionFailure(FailToClick(action.element_id, msg=str(e)))]
         if is_post_dispatch_click_timeout(e, engine_selection):
             LOG.info(
                 "Chain click: physical click dispatched; navigation-wait timed out — skipping fallback",
@@ -12215,9 +12252,8 @@ async def chain_click(
             action_results = [ActionSuccess()]
             return action_results
 
-        # The browser resolves through the run proxy and may reach hosts the worker cannot;
-        # worker resolution failure is not a policy signal.
-        if _is_policy_blocked_host(e):
+        # A refused or unresolvable href cannot be made safe by dispatching a click fallback.
+        if isinstance(e, BlockedHost):
             action_results = [ActionFailure(FailToClick(action.element_id, msg=str(e)))]
             return action_results
 
@@ -12373,9 +12409,8 @@ async def chain_click(
                     try:
                         navigated_href = await skyvern_element.try_navigate_via_href(page=page)
                     except BlockedHost as e:
-                        if _is_policy_blocked_host(e):
-                            action_results = [ActionFailure(FailToClick(action.element_id, msg=str(e)))]
-                            return action_results
+                        action_results = [ActionFailure(FailToClick(action.element_id, msg=str(e)))]
+                        return action_results
                     else:
                         if navigated_href:
                             LOG.info(
@@ -15362,8 +15397,6 @@ async def select_from_dropdown(
         potential_scrollable_element = await try_to_find_potential_scrollable_element(
             skyvern_element=dropdown_menu_element,
             incremental_scraped=incremental_scraped,
-            step=step,
-            task=task,
         )
 
         if await skyvern_frame.get_element_scrollable(await potential_scrollable_element.get_element_handler()):
@@ -15708,8 +15741,6 @@ async def select_from_dropdown_by_value(
     potential_scrollable_element = await try_to_find_potential_scrollable_element(
         skyvern_element=dropdown_menu_element,
         incremental_scraped=incremental_scraped,
-        task=task,
-        step=step,
     )
     if not await skyvern_frame.get_element_scrollable(await potential_scrollable_element.get_element_handler()):
         return _no_element_matched_failure(
@@ -15825,8 +15856,8 @@ async def locate_dropdown_menu(
             )
             continue
 
-        ul_or_listbox_element_id = await head_element.find_children_element_id_by_callback(
-            cb=is_ul_or_listbox_element_factory(incremental_scraped=incremental_scraped, task=task, step=step),
+        ul_or_listbox_element_id = await incremental_scraped.find_option_list_element_id(
+            head_element.get_element_dict()
         )
 
         if ul_or_listbox_element_id:
@@ -15898,17 +15929,13 @@ async def locate_dropdown_menu(
 async def try_to_find_potential_scrollable_element(
     skyvern_element: SkyvernElement,
     incremental_scraped: IncrementalScrapePage,
-    task: Task,
-    step: Step,
 ) -> SkyvernElement:
     """
     check any <ul> or <role="listbox"> element in the chidlren.
     if yes, return the found element,
     else, return the orginal one
     """
-    found_element_id = await skyvern_element.find_children_element_id_by_callback(
-        cb=is_ul_or_listbox_element_factory(incremental_scraped=incremental_scraped, task=task, step=step),
-    )
+    found_element_id = await incremental_scraped.find_option_list_element_id(skyvern_element.get_element_dict())
     if found_element_id and found_element_id != skyvern_element.get_id():
         LOG.debug(
             "Found 'ul or listbox' element in children list",
@@ -16951,7 +16978,9 @@ async def _get_input_or_select_context(
     return input_or_select_context
 
 
-def _match_user_defined_error_from_reasoning(task: Task, step: Step, reasoning: str) -> list[UserDefinedError]:
+def _match_user_defined_error_from_reasoning(
+    task: Task, step: Step, reasoning: str, codes_only: bool = False
+) -> list[UserDefinedError]:
     # If the LLM returns no structured errors but its terminate reasoning
     # explicitly mentions a configured code or description, preserve that
     # machine-readable code for task/run/webhook error aggregation.
@@ -16963,7 +16992,9 @@ def _match_user_defined_error_from_reasoning(task: Task, step: Step, reasoning: 
         code_matches = (
             "_" in error_code and re.search(rf"\b{re.escape(error_code.lower())}\b", normalized_reasoning) is not None
         )
-        description_matches = isinstance(error_description, str) and error_description.lower() in normalized_reasoning
+        description_matches = (
+            not codes_only and isinstance(error_description, str) and error_description.lower() in normalized_reasoning
+        )
         if code_matches or description_matches:
             matched_errors.append(
                 UserDefinedError(
@@ -16972,6 +17003,9 @@ def _match_user_defined_error_from_reasoning(task: Task, step: Step, reasoning: 
                     confidence_float=1.0,
                 )
             )
+    if codes_only and len(matched_errors) > 1:
+        # Naming several codes is weighing them, not concluding one.
+        return []
     if matched_errors:
         if len(matched_errors) > 1:
             LOG.warning(

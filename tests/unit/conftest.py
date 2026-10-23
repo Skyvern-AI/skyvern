@@ -46,13 +46,17 @@ from skyvern.forge.sdk.copilot.context import (
     model_written_context_fields,
     tool_recorded_context_fields,
 )
+from skyvern.forge.sdk.credential_site_policy import LoginSite
 from skyvern.forge.sdk.db.agent_db import AgentDB
+from skyvern.forge.sdk.db.enums import OrganizationAuthTokenType
 from skyvern.forge.sdk.db.models import Base, CredentialModel, WorkflowModel
 from skyvern.forge.sdk.db.utils import _custom_json_serializer
 from skyvern.forge.sdk.executor.async_executor import AsyncExecutor
 from skyvern.forge.sdk.executor.factory import AsyncExecutorFactory
+from skyvern.forge.sdk.schemas.credentials import BitwardenItemOverview, CredentialType
 from skyvern.forge.sdk.schemas.files import FileInfo
-from skyvern.forge.sdk.schemas.organizations import Organization
+from skyvern.forge.sdk.schemas.organizations import BitwardenCredential, BitwardenOrganizationAuthToken, Organization
+from skyvern.forge.sdk.services.bitwarden import BitwardenConstants, BitwardenService
 from skyvern.forge.sdk.settings_manager import SettingsManager
 from skyvern.forge.sdk.workflow import web_search, web_search_client
 from skyvern.forge.sdk.workflow.context_manager import WorkflowContextManager
@@ -64,7 +68,7 @@ from skyvern.services import workflow_run_group_service as group_service
 from skyvern.webeye.utils import page as page_module
 from skyvern.webeye.utils.page import ScreenshotMode
 from tests.unit._fingerprint_expectations import FINGERPRINT_TEST_SECRET_KEY
-from tests.unit.dns_fixtures import no_env_proxy, public_dns  # noqa: F401
+from tests.unit.dns_fixtures import no_env_proxy, public_dns, unresolvable_dns  # noqa: F401
 from tests.unit.force_stub_app import start_forge_stub_app
 from tests.unit.google.conftest import mock_sheets_transport  # noqa: F401
 from tests.unit.litellm_model_registry import registered_gpt56_litellm_models
@@ -218,6 +222,46 @@ structlog.configure(
 def setup_forge_stub_app():
     start_forge_stub_app()
     yield
+
+
+def cancel_leftover_tasks(loop: asyncio.AbstractEventLoop) -> None:
+    # A task left suspended in a SQLAlchemy session on a closed loop is later finalized by a garbage collection
+    # inside another test's session, which fails that test with GeneratorExit and stops all later collections.
+    cancelled: set[asyncio.Task[Any]] = set()
+    for _ in range(3):
+        leftover = {task for task in asyncio.all_tasks(loop) if not task.done()}
+        if not leftover:
+            break
+        for task in leftover:
+            task.cancel()
+        cancelled |= leftover
+        # Bounded and repeated, as asyncio.run is not: a task that swallows one cancel must not hang teardown.
+        loop.run_until_complete(asyncio.wait(leftover, timeout=2))
+    for task in cancelled:
+        # Reading the exception also marks it retrieved, so the loop handler reports it once.
+        if task.done() and not task.cancelled() and task.exception() is not None:
+            loop.call_exception_handler(
+                {
+                    "message": "unhandled exception during test loop teardown",
+                    "exception": task.exception(),
+                    "task": task,
+                }
+            )
+    for task in asyncio.all_tasks(loop):
+        loop.call_exception_handler(
+            {"message": "task still pending after cancellation at test loop teardown", "task": task}
+        )
+
+
+@pytest.fixture
+def event_loop() -> Iterator[asyncio.AbstractEventLoop]:
+    # pytest-asyncio's default loop closes without cancelling the tasks a test left running.
+    loop = asyncio.new_event_loop()
+    yield loop
+    if not loop.is_closed():
+        cancel_leftover_tasks(loop)
+        loop.run_until_complete(loop.shutdown_asyncgens())
+        loop.close()
 
 
 @pytest.fixture(autouse=True)
@@ -1196,3 +1240,81 @@ async def run_group_env(monkeypatch: pytest.MonkeyPatch, sqlite_engine: AsyncEng
     for coroutine in spawned:
         coroutine.close()
     await asyncio.gather(*app.WORKFLOW_SERVICE._background_tasks, return_exceptions=True)
+
+
+ORG_VAULT_ITEM_ID = "0f4a3a52-6f4e-4c43-9d37-8f6f2a1c9b10"
+ORG_VAULT_LOGIN_ID = f"bwitem_{ORG_VAULT_ITEM_ID}"
+ORG_VAULT_ACCOUNT_EMAIL = "vault-owner@example.com"
+ORG_VAULT_MASTER_PASSWORD = "ORG_VAULT_MASTER_SECRET"
+ORG_VAULT_LOGIN_PASSWORD = "ORG_VAULT_LOGIN_SECRET"
+
+
+def org_vault_overview(**overrides: Any) -> BitwardenItemOverview:
+    fields: dict[str, Any] = {
+        "item_id": ORG_VAULT_ITEM_ID,
+        "title": "Example portal",
+        "collection_id": "col_1",
+        "credential_type": CredentialType.PASSWORD,
+        "url": "https://portal.example.com/login",
+        **overrides,
+    }
+    fields.setdefault("urls", [fields["url"]] if fields["url"] else [])
+    return BitwardenItemOverview(**fields)
+
+
+@dataclass
+class OrgVaultFake:
+    listing: AsyncMock
+    sites: AsyncMock
+    secret: AsyncMock
+    org_token: AsyncMock
+    folders_restricted: AsyncMock
+    organization: Organization
+
+
+@pytest.fixture
+def org_vault(monkeypatch: pytest.MonkeyPatch) -> OrgVaultFake:
+    """An organization with a connected Bitwarden account, faked only at the BitwardenService boundary and the
+    org-token read. It lists one login whose whole-site URI is portal.example.com."""
+    now = datetime(2026, 1, 1, tzinfo=UTC)
+    token = BitwardenOrganizationAuthToken(
+        id="oat_org_vault",
+        organization_id="o_test_org",
+        token_type=OrganizationAuthTokenType.bitwarden_credential,
+        valid=True,
+        created_at=now,
+        modified_at=now,
+        credential=BitwardenCredential(email=ORG_VAULT_ACCOUNT_EMAIL, master_password=ORG_VAULT_MASTER_PASSWORD),
+    )
+    organization = Organization(
+        organization_id="o_test_org",
+        organization_name="Test org",
+        bw_collection_ids=["col_1"],
+        created_at=now,
+        modified_at=now,
+    )
+    fake = OrgVaultFake(
+        listing=AsyncMock(return_value=[org_vault_overview()]),
+        sites=AsyncMock(return_value=[LoginSite("https://portal.example.com", whole_site=False)]),
+        secret=AsyncMock(
+            return_value={
+                BitwardenConstants.USERNAME: "vault-user@example.com",
+                BitwardenConstants.PASSWORD: ORG_VAULT_LOGIN_PASSWORD,
+                BitwardenConstants.TOTP: "",
+            }
+        ),
+        org_token=AsyncMock(return_value=token),
+        folders_restricted=AsyncMock(return_value=False),
+        organization=organization,
+    )
+    monkeypatch.setattr(
+        app.DATABASE,
+        "organizations",
+        SimpleNamespace(get_valid_org_auth_token=fake.org_token, get_organization=AsyncMock(return_value=organization)),
+        raising=False,
+    )
+    monkeypatch.setattr(app.AGENT_FUNCTION, "credential_folders_restricted", fake.folders_restricted)
+    monkeypatch.setattr(BitwardenService, "list_item_overviews", fake.listing)
+    monkeypatch.setattr(BitwardenService, "get_login_item_sites", fake.sites)
+    monkeypatch.setattr(BitwardenService, "get_secret_value_from_url", fake.secret)
+    return fake

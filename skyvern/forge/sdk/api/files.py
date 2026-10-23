@@ -371,6 +371,7 @@ class GuardedFileResponse:
     body: bytes
     content_type: str
     filename: str
+    status: int | None = None
 
 
 GuardedFileFetchHopResult: TypeAlias = GuardedFileRedirect | GuardedFileResponse
@@ -462,6 +463,7 @@ async def fetch_file_bytes(
                         body=bytes(body),
                         content_type=response.headers.get("Content-Type", ""),
                         filename=_determine_download_filename(filename, response.headers, current_url),
+                        status=response.status,
                     )
 
             result = await authorize_request_hop_once(

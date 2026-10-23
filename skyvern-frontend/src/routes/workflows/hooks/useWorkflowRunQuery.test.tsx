@@ -63,7 +63,9 @@ async function outageAcrossFailedPolls(
   polls: number,
 ): Promise<{ gaps: number[]; intervals: Array<number | false> }> {
   const client = new QueryClient({
-    defaultOptions: { queries: { retry: retryTransientNetworkFailures } },
+    defaultOptions: {
+      queries: { retry: retryTransientNetworkFailures, retryDelay: 0 },
+    },
   });
   let succeed = true;
   const observer = new QueryObserver(client, {

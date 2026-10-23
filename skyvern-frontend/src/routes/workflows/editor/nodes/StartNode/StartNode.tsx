@@ -20,7 +20,6 @@ import { useWorkflowSettingsStore } from "@/store/WorkflowSettingsStore";
 import { Flippable } from "@/components/Flippable";
 import { useRerender } from "@/hooks/useRerender";
 import { useBlockScriptStore } from "@/store/BlockScriptStore";
-import { useRecordingStore } from "@/store/useRecordingStore";
 import { BlockCodeEditor } from "@/routes/workflows/components/BlockCodeEditor";
 import { cn } from "@/util/utils";
 import { BuildModeOnly } from "../BuildModeOnly";
@@ -54,11 +53,9 @@ function StartNode({ id, data, parentId }: NodeProps<StartNode>) {
   const [facing, setFacing] = useState<"front" | "back">("front");
   const [settingsAccordionValue, setSettingsAccordionValue] = useState("");
   const blockScriptStore = useBlockScriptStore();
-  const recordingStore = useRecordingStore();
   const script = blockScriptStore.scripts.__start_block__;
   const rerender = useRerender({ prefix: "accordion" });
   const toggleScriptForNodeCallback = useToggleScriptForNodeCallback();
-  const isRecording = recordingStore.isRecording;
   const reviewAnnotation = useReviewAnnotation();
   const startReview =
     reviewAnnotation?.kind === "start" ? reviewAnnotation : null;
@@ -252,11 +249,7 @@ function StartNode({ id, data, parentId }: NodeProps<StartNode>) {
   }
 
   return (
-    <div
-      className={cn({
-        "pointer-events-none opacity-50": isRecording,
-      })}
-    >
+    <div>
       <Handle
         type="source"
         position={Position.Bottom}

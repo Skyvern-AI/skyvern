@@ -698,31 +698,31 @@ async def test_zero_usage_records_none_token_fields_on_both(span_exporter: InMem
 async def test_provider_prefixed_response_model(span_exporter: InMemorySpanExporter) -> None:
     direct = await _run_direct(
         span_exporter,
-        responses=[ParityResponse("vertex_ai/gemini-2.5-flash")],
-        model_name="gemini-2.5-flash",
+        responses=[ParityResponse("vertex_ai/gemini-3-flash-preview")],
+        model_name="gemini-3-flash-preview",
         step=_make_step(),
         parameters={},
     )
     router = await _run_router(
         span_exporter,
-        responses=[ParityResponse("vertex_ai/gemini-2.5-flash")],
-        main_model_group="vertex-gemini-2.5-flash",
-        litellm_model="vertex_ai/gemini-2.5-flash",
+        responses=[ParityResponse("vertex_ai/gemini-3-flash-preview")],
+        main_model_group="vertex-gemini-3-flash-preview",
+        litellm_model="vertex_ai/gemini-3-flash-preview",
         step=_make_step(),
         parameters={},
     )
 
     assert direct.error is None and router.error is None
     # Both variants normalize the persisted model to the bare name.
-    assert direct.update_step_calls[0]["last_llm_model"] == "gemini-2.5-flash"
-    assert router.update_step_calls[0]["last_llm_model"] == "gemini-2.5-flash"
+    assert direct.update_step_calls[0]["last_llm_model"] == "gemini-3-flash-preview"
+    assert router.update_step_calls[0]["last_llm_model"] == "gemini-3-flash-preview"
 
     # drift: the router span/event record the raw provider-prefixed response.model while
     # the direct handler records the normalized bare name.
-    assert direct.span_attrs["llm_model"] == "gemini-2.5-flash"
-    assert direct.event_attrs["model"] == "gemini-2.5-flash"
-    assert router.span_attrs["llm_model"] == "vertex_ai/gemini-2.5-flash"
-    assert router.event_attrs["model"] == "vertex_ai/gemini-2.5-flash"
+    assert direct.span_attrs["llm_model"] == "gemini-3-flash-preview"
+    assert direct.event_attrs["model"] == "gemini-3-flash-preview"
+    assert router.span_attrs["llm_model"] == "vertex_ai/gemini-3-flash-preview"
+    assert router.event_attrs["model"] == "vertex_ai/gemini-3-flash-preview"
 
 
 @pytest.mark.parametrize(
@@ -861,17 +861,17 @@ async def test_vertex_cache_attached_for_gemini_extract_actions(span_exporter: I
 
     direct = await _run_direct(
         span_exporter,
-        responses=[ParityResponse("vertex_ai/gemini-2.5-flash")],
-        model_name="gemini-2.5-flash",
+        responses=[ParityResponse("vertex_ai/gemini-3-flash-preview")],
+        model_name="gemini-3-flash-preview",
         context=cached_context(),
         prompt_name=EXTRACT_ACTION_PROMPT_NAME,
         parameters={},
     )
     router = await _run_router(
         span_exporter,
-        responses=[ParityResponse("vertex_ai/gemini-2.5-flash")],
-        main_model_group="vertex-gemini-2.5-flash",
-        litellm_model="vertex_ai/gemini-2.5-flash",
+        responses=[ParityResponse("vertex_ai/gemini-3-flash-preview")],
+        main_model_group="vertex-gemini-3-flash-preview",
+        litellm_model="vertex_ai/gemini-3-flash-preview",
         context=cached_context(),
         prompt_name=EXTRACT_ACTION_PROMPT_NAME,
         parameters={},
@@ -884,8 +884,8 @@ async def test_vertex_cache_attached_for_gemini_extract_actions(span_exporter: I
     assert len(router.completion_calls) == 1 and not router.router_calls
     assert direct.completion_calls[0]["cached_content"] == cache_name
     assert router.completion_calls[0]["cached_content"] == cache_name
-    assert direct.completion_calls[0]["model"] == "gemini-2.5-flash"
-    assert router.completion_calls[0]["model"] == "vertex_ai/gemini-2.5-flash"
+    assert direct.completion_calls[0]["model"] == "gemini-3-flash-preview"
+    assert router.completion_calls[0]["model"] == "vertex_ai/gemini-3-flash-preview"
     assert direct.completion_calls[0]["timeout"] == settings.LLM_CONFIG_TIMEOUT
     assert router.completion_calls[0]["timeout"] == settings.LLM_CONFIG_TIMEOUT
 
@@ -899,17 +899,17 @@ async def test_no_vertex_cache_when_prompt_caching_disabled(span_exporter: InMem
 
     direct = await _run_direct(
         span_exporter,
-        responses=[ParityResponse("vertex_ai/gemini-2.5-flash")],
-        model_name="gemini-2.5-flash",
+        responses=[ParityResponse("vertex_ai/gemini-3-flash-preview")],
+        model_name="gemini-3-flash-preview",
         context=uncached_context(),
         prompt_name=EXTRACT_ACTION_PROMPT_NAME,
         parameters={},
     )
     router = await _run_router(
         span_exporter,
-        responses=[ParityResponse("vertex_ai/gemini-2.5-flash")],
-        main_model_group="vertex-gemini-2.5-flash",
-        litellm_model="vertex_ai/gemini-2.5-flash",
+        responses=[ParityResponse("vertex_ai/gemini-3-flash-preview")],
+        main_model_group="vertex-gemini-3-flash-preview",
+        litellm_model="vertex_ai/gemini-3-flash-preview",
         context=uncached_context(),
         prompt_name=EXTRACT_ACTION_PROMPT_NAME,
         parameters={},

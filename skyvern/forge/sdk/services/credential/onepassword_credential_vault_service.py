@@ -114,6 +114,7 @@ class OnePasswordCredentialVaultService(CredentialVaultService):
         organization_id: str,
         data: CreateCredentialRequest,
         created_by: str | None = None,
+        is_passkey_setup_pending: bool = False,
     ) -> Credential:
         raise HTTPException(status_code=405, detail="Creating 1Password-backed credentials is not supported")
 

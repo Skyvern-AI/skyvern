@@ -1499,7 +1499,6 @@ def _build_user_context(
     user_workflow_change_summary: str = "",
     runnable_draft_summary: str = "",
     user_goal_summary: str = "",
-    untrusted_evidence: str = "",
     attached_files_summary: str = "",
     scope_check: str = "",
 ) -> str:
@@ -1524,7 +1523,6 @@ def _build_user_context(
         user_workflow_change_summary=escape_code_fences(user_workflow_change_summary or ""),
         runnable_draft_summary=escape_code_fences(runnable_draft_summary or ""),
         user_goal_summary=escape_code_fences(redact_raw_secrets_for_prompt(user_goal_summary or "")),
-        untrusted_evidence=escape_code_fences(redact_raw_secrets_for_structured_prompt(untrusted_evidence or "")),
         attached_files_summary=escape_code_fences(redact_raw_secrets_for_prompt(attached_files_summary or "")),
         video_attachment_formats="/".join(VIDEO_ATTACHMENT_FORMAT_NAMES.values()),
         scope_check=scope_check,
@@ -4556,6 +4554,8 @@ def _copy_output_policy_verdict(verdict: OutputPolicyVerdict) -> OutputPolicyVer
 def _blocked_final_output_kind(verdict: OutputPolicyVerdict) -> CopilotOutputKind:
     clarification_reasons = {
         OutputPolicyReason.CREDENTIAL_SCOPE_BROADENED,
+        OutputPolicyReason.CONNECTED_VAULT_LOGIN_OFF_SITE,
+        OutputPolicyReason.CONNECTED_VAULT_LOGIN_SITES_UNREAD,
     }
     if any(reason in clarification_reasons for reason in verdict.reason_codes):
         return CopilotOutputKind.CLARIFICATION_REQUEST
@@ -4817,6 +4817,18 @@ def _build_output_policy_blocked_result(
             "workflow without a tracked URL, re-select it so Copilot can confirm its URL scope."
         )
         add_saved_draft_copy = True
+    elif OutputPolicyReason.CONNECTED_VAULT_LOGIN_OFF_SITE in verdict.reason_codes:
+        user_response = (
+            "A Bitwarden login in this workflow is used on a site that isn't one of the login's saved websites. "
+            "Add that site to the login's websites in Bitwarden, or change the block URL to one of them."
+        )
+        add_saved_draft_copy = True
+    elif OutputPolicyReason.CONNECTED_VAULT_LOGIN_SITES_UNREAD in verdict.reason_codes:
+        user_response = (
+            "I couldn't read which websites a Bitwarden login in this workflow is saved for, so I didn't use it. "
+            "Check the Bitwarden connection in Settings and try again."
+        )
+        add_saved_draft_copy = True
     elif preserved_workflow is not None:
         user_response = (
             "I could not safely return that chat reply, but the workflow draft is still saved. "
@@ -4953,7 +4965,6 @@ async def run_copilot_agent(
     ) = None,
     persisted_workflow_yaml: str | None = None,
     opening_workflow_title: str | None = None,
-    untrusted_evidence: str | None = None,
     prior_executed_block_fingerprints: dict[str, set[str]] | None = None,
     eval_capture_case_id: str | None = None,
     eval_mode: CopilotEvalMode | None = None,
@@ -5008,7 +5019,6 @@ async def run_copilot_agent(
                     persist_video_evidence_artifacts=persist_video_evidence_artifacts,
                     persisted_workflow_yaml=persisted_workflow_yaml,
                     opening_workflow_title=opening_workflow_title,
-                    untrusted_evidence=untrusted_evidence,
                     prior_executed_block_fingerprints=prior_executed_block_fingerprints,
                     eval_capture_case_id=eval_capture_case_id,
                     eval_mode=eval_mode,
@@ -5144,7 +5154,6 @@ async def _run_copilot_turn_impl(
     ) = None,
     persisted_workflow_yaml: str | None = None,
     opening_workflow_title: str | None = None,
-    untrusted_evidence: str | None = None,
     prior_executed_block_fingerprints: dict[str, set[str]] | None = None,
     eval_capture_case_id: str | None = None,
     eval_mode: CopilotEvalMode | None = None,
@@ -5702,7 +5711,6 @@ async def _run_copilot_turn_impl(
         user_workflow_change_summary=user_workflow_change_summary,
         runnable_draft_summary=runnable_draft_summary,
         user_goal_summary=user_goal_summary,
-        untrusted_evidence=untrusted_evidence or "",
         attached_files_summary=attached_files_summary,
         scope_check=copilot_config.scope_check,
     )

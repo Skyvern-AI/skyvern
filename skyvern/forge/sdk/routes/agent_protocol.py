@@ -84,6 +84,7 @@ from skyvern.forge.sdk.db.enums import (
     is_job_recipe_workflow_run_trigger_type,
 )
 from skyvern.forge.sdk.db.exceptions import RunsListSearchCanceled
+from skyvern.forge.sdk.db.repositories.folders import FolderWorkflowSetChangedError
 from skyvern.forge.sdk.db.repositories.tags import (
     RunTagWorkflowRunMismatch,
     TagValueAlreadyExists,
@@ -94,7 +95,7 @@ from skyvern.forge.sdk.db.repositories.workflow_runs import (
     RUNS_LIST_STATEMENT_TIMEOUT_SECONDS,
     is_indexed_runs_list_search_key,
 )
-from skyvern.forge.sdk.db.repositories.workflows import WorkflowCreationLockTimeout
+from skyvern.forge.sdk.db.repositories.workflows import WorkflowCreationLockTimeout, WorkflowFolderChangedError
 from skyvern.forge.sdk.db.statement_timeout import is_statement_timeout
 from skyvern.forge.sdk.enterprise_features import collect_enterprise_gated_run_features
 from skyvern.forge.sdk.executor.factory import AsyncExecutorFactory
@@ -1486,6 +1487,12 @@ async def update_workflow_legacy(
         if 400 <= e.status_code < 500:
             log_save_rejected(e)
         raise
+    except WorkflowCreationLockTimeout as exc:
+        log_save_rejected(exc)
+        raise HTTPException(
+            status_code=http_status.HTTP_409_CONFLICT,
+            detail="Workflow is being updated; retry the save request.",
+        ) from exc
     except Exception as e:
         LOG.exception(
             "Failed to update workflow",
@@ -1586,6 +1593,11 @@ async def update_workflow(
     except (HTTPException, SkyvernHTTPException, ValidationError) as e:
         # Bubble up well-formed client errors so they are not converted to 500s
         raise e
+    except WorkflowCreationLockTimeout as exc:
+        raise HTTPException(
+            status_code=http_status.HTTP_409_CONFLICT,
+            detail="Workflow is being updated; retry the save request.",
+        ) from exc
     except Exception as e:
         LOG.exception(
             "Failed to update workflow",
@@ -1647,9 +1659,28 @@ async def delete_workflow(
     current_org: Organization = Depends(org_auth_service.get_current_org),
 ) -> None:
     analytics.capture("skyvern-oss-agent-workflow-delete")
-    deleted_schedules, deleted_workflow_id = await app.WORKFLOW_SERVICE.soft_delete_workflow_by_permanent_id(
-        workflow_id, current_org.organization_id
+    expected_folder_assignment = await app.AGENT_FUNCTION.enforce_workflow_delete(
+        get_request_principal(), workflow_id, current_org.organization_id
     )
+    try:
+        soft_delete_workflow = app.WORKFLOW_SERVICE.soft_delete_workflow_by_permanent_id
+        if expected_folder_assignment is None:
+            deleted_schedules, deleted_workflow_id = await soft_delete_workflow(
+                workflow_id, current_org.organization_id
+            )
+        else:
+            deleted_schedules, deleted_workflow_id = await soft_delete_workflow(
+                workflow_id,
+                current_org.organization_id,
+                expected_folder_assignment=expected_folder_assignment,
+            )
+    except WorkflowFolderChangedError as exc:
+        raise HTTPException(status_code=http_status.HTTP_409_CONFLICT, detail=str(exc)) from exc
+    except WorkflowCreationLockTimeout as exc:
+        raise HTTPException(
+            status_code=http_status.HTTP_409_CONFLICT,
+            detail="Workflow is being updated; retry the delete request.",
+        ) from exc
     # Audit before the cancellable backend cleanup: the delete has already committed. Schedules are soft-deleted
     # even when no live workflow was, so their backend schedules are deleted either way.
     try:
@@ -1927,11 +1958,24 @@ async def delete_folder(
     current_org: Organization = Depends(org_auth_service.get_current_org),
 ) -> dict:
     analytics.capture("skyvern-oss-folder-delete")
-    deleted_folder = await app.DATABASE.folders.soft_delete_folder(
-        folder_id=folder_id,
-        organization_id=current_org.organization_id,
-        delete_workflows=delete_workflows,
-    )
+    expected_workflow_permanent_ids: set[str] | None = None
+    if delete_workflows:
+        workflow_ids = await app.DATABASE.folders.get_workflow_permanent_ids_in_folder(
+            folder_id, current_org.organization_id
+        )
+        expected_workflow_permanent_ids = set(workflow_ids)
+        await app.AGENT_FUNCTION.enforce_workflow_deletes(
+            get_request_principal(), expected_workflow_permanent_ids, current_org.organization_id
+        )
+    try:
+        deleted_folder = await app.DATABASE.folders.soft_delete_folder(
+            folder_id=folder_id,
+            organization_id=current_org.organization_id,
+            delete_workflows=delete_workflows,
+            expected_workflow_permanent_ids=expected_workflow_permanent_ids,
+        )
+    except FolderWorkflowSetChangedError as exc:
+        raise HTTPException(status_code=http_status.HTTP_409_CONFLICT, detail=str(exc)) from exc
     if deleted_folder is None:
         raise HTTPException(status_code=http_status.HTTP_404_NOT_FOUND, detail=f"Folder {folder_id} not found")
     # Audit before the cancellable backend cleanup: the delete has already committed.

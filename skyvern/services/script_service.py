@@ -30,10 +30,12 @@ from skyvern.core.script_generations.generate_script import _build_block_fn, cre
 from skyvern.core.script_generations.script_skyvern_page import script_run_context_manager
 from skyvern.errors.errors import UserDefinedError, filter_to_user_defined_codes
 from skyvern.exceptions import (
+    BROWSER_CONNECTION_LOST_ERROR_CODE,
     CachedDownloadError,
     DownloadSaveIncompleteError,
     IllegitCompleteScriptTermination,
     InProcessScriptExecutionDenied,
+    MissingBrowserState,
     ScriptNotFound,
     ScriptTerminationException,
     StepTerminationError,
@@ -131,6 +133,7 @@ from skyvern.utils.templating import reject_jinja_transformations_on_variable
 from skyvern.utils.url_validators import validate_fetch_url
 from skyvern.webeye.actions.action_types import ActionType
 from skyvern.webeye.actions.actions import Action, DecisiveAction, reasoning_is_turn_scoped
+from skyvern.webeye.browser_state import get_browser_connection_loss, raise_if_browser_connection_lost
 from skyvern.webeye.cdp_download_interceptor import (
     ORIGINAL_FILENAME_MARKER,
     ORIGINAL_FILENAME_TEMPLATE_VARIABLE,
@@ -1060,7 +1063,7 @@ async def _update_workflow_block(
                 )
             if run_lease_tasks_enabled() and lease_lost:
                 return
-            downloaded_files: list[FileInfo] = []
+            downloaded_files: list[FileInfo] | None = None
             try:
                 async with asyncio.timeout(GET_DOWNLOADED_FILES_TIMEOUT):
                     downloaded_files = await app.STORAGE.get_current_attempt_downloaded_files(
@@ -1069,11 +1072,12 @@ async def _update_workflow_block(
                     )
             except asyncio.TimeoutError:
                 LOG.warning("Timeout getting downloaded files", task_id=task_id)
-            downloaded_files = _filter_downloaded_files_for_current_iteration(
-                downloaded_files,
-                context.loop_internal_state,
-                aliases=app.STORAGE.get_downloaded_file_signature_aliases,
-            )
+            if downloaded_files is not None:
+                downloaded_files = _filter_downloaded_files_for_current_iteration(
+                    downloaded_files,
+                    context.loop_internal_state,
+                    aliases=app.STORAGE.get_downloaded_file_signature_aliases,
+                )
 
             task_screenshot_artifacts = await app.WORKFLOW_SERVICE.get_recent_task_screenshot_artifacts(
                 organization_id=context.organization_id,
@@ -1125,6 +1129,15 @@ async def _update_workflow_block(
 
         if run_lease_tasks_enabled() and await run_lease_lost(context.workflow_run_id):
             return
+        # User-defined codes stay on the task row (run details read both rows), but the lost-browser code has no
+        # task record, so a failed row carries it for workflow retry and credential fallback.
+        browser_connection_lost = (
+            status == BlockStatus.failed
+            and get_browser_connection_loss(app.BROWSER_MANAGER.get_for_workflow_run(context.workflow_run_id))
+            is not None
+        )
+        if browser_connection_lost:
+            error_codes = list(dict.fromkeys([*(error_codes or []), BROWSER_CONNECTION_LOST_ERROR_CODE]))
         updated_block = await app.DATABASE.observer.update_workflow_run_block(
             workflow_run_block_id=workflow_run_block_id,
             organization_id=context.organization_id if context else None,
@@ -1132,6 +1145,7 @@ async def _update_workflow_block(
             failure_reason=failure_reason,
             output=final_output,
             ai_fallback_triggered=ai_fallback_triggered,
+            error_codes=[BROWSER_CONNECTION_LOST_ERROR_CODE] if browser_connection_lost else None,
         )
 
         # The row carries the block label even when the caller passed none (a cached wait block).
@@ -1174,7 +1188,36 @@ async def _update_workflow_block(
         )
 
 
+def _raise_if_browser_connection_lost(outcome: BlockResult | BlockStatus | None) -> None:
+    # Generated statements and loop iterations run in sequence, so a child that failed after the run lost its
+    # browser stops the script here; its outcome is already published.
+    context = skyvern_context.current()
+    if not context or not context.workflow_run_id:
+        return
+    connection_loss = get_browser_connection_loss(app.BROWSER_MANAGER.get_for_workflow_run(context.workflow_run_id))
+    if connection_loss is None:
+        return
+    status = outcome.status if isinstance(outcome, BlockResult) else outcome
+    if status == BlockStatus.failed:
+        raise MissingBrowserState(
+            workflow_run_id=context.workflow_run_id,
+            diagnostic=connection_loss,
+            detected_at=datetime.now(timezone.utc),
+            failure_reason=BROWSER_CONNECTION_LOST_ERROR_CODE,
+        )
+
+
+def _refuse_statement_after_browser_connection_loss() -> None:
+    # A loss can latch between statements, with no browser call in flight; the next statement must not start.
+    context = skyvern_context.current()
+    if context and context.workflow_run_id:
+        raise_if_browser_connection_lost(
+            app.BROWSER_MANAGER.get_for_workflow_run(context.workflow_run_id), workflow_run_id=context.workflow_run_id
+        )
+
+
 async def _run_cached_function(cached_fn: Callable) -> Any:
+    _refuse_statement_after_browser_connection_loss()
     run_context = script_run_context_manager.ensure_run_context()
     return await cached_fn(page=run_context.page, context=run_context)
 
@@ -1530,7 +1573,7 @@ async def _fallback_to_ai_run(
     include_action_history_in_verification: bool = False,
     error: Exception | None = None,
     workflow_run_block_id: str | None = None,
-) -> None:
+) -> BlockStatus | None:
     context = skyvern_context.current()
     if not (
         context
@@ -1540,7 +1583,7 @@ async def _fallback_to_ai_run(
         and context.task_id
         and context.step_id
     ):
-        return
+        return None
     organization_id = context.organization_id
     workflow_id = context.workflow_id
     workflow_run_id = context.workflow_run_id
@@ -1563,6 +1606,21 @@ async def _fallback_to_ai_run(
             organization_id=organization_id,
             status=StepStatus.failed,
         )
+        if get_browser_connection_loss(app.BROWSER_MANAGER.get_for_workflow_run(workflow_run_id)) is not None:
+            LOG.warning("Browser connection lost: script failure will not be retried by agent", cache_key=cache_key)
+            if workflow_run_block_id:
+                await _update_workflow_block(
+                    workflow_run_block_id,
+                    BlockStatus.failed,
+                    task_id=task_id,
+                    task_status=TaskStatus.failed,
+                    failure_reason=str(error),
+                    step_id=script_step_id,
+                    step_status=StepStatus.failed,
+                    label=cache_key,
+                    error_codes=[BROWSER_CONNECTION_LOST_ERROR_CODE],
+                )
+            return BlockStatus.failed
         # 2. run execute_step
         organization = await app.DATABASE.organizations.get_organization(organization_id=organization_id)
         if not organization:
@@ -1574,12 +1632,12 @@ async def _fallback_to_ai_run(
             workflow_id=context.workflow_id, organization_id=organization_id
         )
         if not workflow:
-            return
+            return None
         workflow_run = await app.DATABASE.workflow_runs.get_workflow_run(
             workflow_run_id=workflow_run_id, organization_id=organization_id
         )
         if not workflow_run:
-            return
+            return None
         # Use workflow_run.ai_fallback if explicitly set, otherwise fall back to workflow.ai_fallback
         effective_ai_fallback = (
             workflow_run.ai_fallback if workflow_run.ai_fallback is not None else workflow.ai_fallback
@@ -1643,7 +1701,7 @@ async def _fallback_to_ai_run(
                     label=cache_key,
                     error_codes=error_codes,
                 )
-            return
+            return BlockStatus.failed
 
         # Record a fallback episode for adaptive caching (code_v2).
         # This must happen BEFORE the AI step runs so we capture the page state
@@ -1659,10 +1717,9 @@ async def _fallback_to_ai_run(
                 page_text_snapshot = None
                 working_page = None
                 try:
-                    browser_state = await app.BROWSER_MANAGER.get_or_create_for_workflow_run(
-                        workflow_run=workflow_run,
-                    )
-                    working_page = await browser_state.get_working_page()
+                    # A diagnostic read: acquiring here would open a browser or take over one another run holds.
+                    browser_state = app.BROWSER_MANAGER.get_for_workflow_run(workflow_run_id=workflow_run_id)
+                    working_page = await browser_state.get_working_page() if browser_state else None
                     if working_page:
                         page_url = working_page.url
                         page_text_snapshot = (await working_page.inner_text("body", timeout=5000))[:5000]
@@ -1821,6 +1878,7 @@ async def _fallback_to_ai_run(
             )
 
         # Update block status to completed if workflow block was created
+        fallback_status: BlockStatus | None = None
         if workflow_run_block_id:
             # refresh the task
             failure_reason = None
@@ -1834,9 +1892,10 @@ async def _fallback_to_ai_run(
                 for error in task.errors or []
                 if isinstance(error, dict) and isinstance(error.get("error_code"), str)
             ]
+            fallback_status = BlockStatus(task.status.value)
             await _update_workflow_block(
                 workflow_run_block_id,
-                BlockStatus(task.status.value),
+                fallback_status,
                 task_id=task_id,
                 failure_reason=failure_reason,
                 label=cache_key,
@@ -1931,6 +1990,7 @@ async def _fallback_to_ai_run(
                     episode_id=fallback_episode_id,
                     exc_info=True,
                 )
+        return fallback_status
     except Exception as e:
         LOG.warning("Failed to fallback to AI run", cache_key=cache_key, exc_info=True)
         # Update block status to failed if workflow block was created
@@ -2369,6 +2429,7 @@ async def run_task(
 
     context: skyvern_context.SkyvernContext | None = None
     if cache_key and cached_fn:
+        _refuse_statement_after_browser_connection_loss()
         # Auto-create workflow block run and task if workflow_run_id is available.
         # Use `label` (the workflow block label) for the block run so the
         # framework can match it, and `cache_key` to look up the cached function.
@@ -2415,7 +2476,7 @@ async def run_task(
             raise
         except Exception as e:
             LOG.warning("Failed to run task block. Falling back to AI run.", exc_info=True)
-            await _fallback_to_ai_run(
+            fallback_status = await _fallback_to_ai_run(
                 block_type=BlockType.NAVIGATION,
                 cache_key=cache_key,
                 prompt=prompt,
@@ -2427,6 +2488,7 @@ async def run_task(
                 workflow_run_block_id=workflow_run_block_id,
                 error_code_mapping=error_code_mapping,
             )
+            _raise_if_browser_connection_lost(fallback_status)
             return None
         finally:
             # clear the prompt in the RunContext
@@ -2457,6 +2519,7 @@ async def run_task(
             label,
             output_parameter=block_validation_output.output_parameter,
         )
+        _raise_if_browser_connection_lost(block_output)
         return block_output.output_parameter_value
 
 
@@ -2565,6 +2628,7 @@ async def download(
     cached_fn = script_run_context_manager.get_cached_fn(cache_key)
     context: skyvern_context.SkyvernContext | None
     if cache_key and cached_fn:
+        _refuse_statement_after_browser_connection_loss()
         # Auto-create workflow block run and task if workflow_run_id is available
         workflow_run_block_id, task_id, step_id = await _create_workflow_block_run_and_task(
             block_type=BlockType.FILE_DOWNLOAD,
@@ -3008,7 +3072,7 @@ async def download(
                 except OSError:
                     continue
                 fallback_file_signatures_before[file_path] = (file_stat.st_mtime_ns, file_stat.st_size)
-            await _fallback_to_ai_run(
+            fallback_status = await _fallback_to_ai_run(
                 block_type=BlockType.FILE_DOWNLOAD,
                 cache_key=cache_key,
                 prompt=navigation_prompt,
@@ -3020,6 +3084,7 @@ async def download(
                 workflow_run_block_id=workflow_run_block_id,
                 error_code_mapping=error_code_mapping,
             )
+            _raise_if_browser_connection_lost(fallback_status)
             if file_download_block is not None and storage_type is not None:
                 fallback_files_after = current_attempt_local_files(fallback_download_dir)
                 fallback_downloaded_files = []
@@ -3097,6 +3162,7 @@ async def download(
             browser_session_id=block_validation_output.browser_session_id,
         )
         if not download_result.success:
+            _raise_if_browser_connection_lost(download_result)
             # Halt the script on a failed download/delivery instead of ignoring the result, matching
             # the cached path; otherwise later generated statements would run after the failure.
             raise ScriptTerminationException(download_result.failure_reason or "File download block failed")
@@ -3118,6 +3184,7 @@ async def action(
     cache_key = cache_key or label
     cached_fn = script_run_context_manager.get_cached_fn(cache_key)
     if cache_key and cached_fn:
+        _refuse_statement_after_browser_connection_loss()
         # Auto-create workflow block run and task if workflow_run_id is available
         workflow_run_block_id, task_id, step_id = await _create_workflow_block_run_and_task(
             block_type=BlockType.ACTION,
@@ -3153,7 +3220,7 @@ async def action(
             raise
         except Exception as e:
             LOG.warning("Failed to run action block. Falling back to AI run.", exc_info=True)
-            await _fallback_to_ai_run(
+            fallback_status = await _fallback_to_ai_run(
                 block_type=BlockType.ACTION,
                 cache_key=cache_key,
                 prompt=prompt,
@@ -3166,6 +3233,7 @@ async def action(
                 workflow_run_block_id=workflow_run_block_id,
                 error_code_mapping=error_code_mapping,
             )
+            _raise_if_browser_connection_lost(fallback_status)
         finally:
             context.prompt = None
             _clear_cached_block_overrides(cache_key)
@@ -3184,12 +3252,13 @@ async def action(
             model=model,
             download_suffix=download_suffix,
         )
-        await action_block.execute_safe(
+        action_result = await action_block.execute_safe(
             workflow_run_id=block_validation_output.workflow_run_id,
             parent_workflow_run_block_id=block_validation_output.context.parent_workflow_run_block_id,
             organization_id=block_validation_output.organization_id,
             browser_session_id=block_validation_output.browser_session_id,
         )
+        _raise_if_browser_connection_lost(action_result)
 
 
 async def login(
@@ -3207,6 +3276,7 @@ async def login(
     cache_key = cache_key or label
     cached_fn = script_run_context_manager.get_cached_fn(cache_key)
     if cache_key and cached_fn:
+        _refuse_statement_after_browser_connection_loss()
         # Auto-create workflow block run and task if workflow_run_id is available
         # render template with label
         prompt = _render_template_with_label(prompt, cache_key) if prompt else prompt
@@ -3247,7 +3317,7 @@ async def login(
             raise
         except Exception as e:
             LOG.exception("Failed to run login block")
-            await _fallback_to_ai_run(
+            fallback_status = await _fallback_to_ai_run(
                 block_type=BlockType.LOGIN,
                 cache_key=cache_key,
                 prompt=prompt,
@@ -3259,6 +3329,7 @@ async def login(
                 workflow_run_block_id=workflow_run_block_id,
                 error_code_mapping=error_code_mapping,
             )
+            _raise_if_browser_connection_lost(fallback_status)
         finally:
             context.prompt = None
             _clear_cached_block_overrides(cache_key)
@@ -3276,12 +3347,13 @@ async def login(
             model=model,
         )
         login_block._built_by_script = True
-        await login_block.execute_safe(
+        login_result = await login_block.execute_safe(
             workflow_run_id=block_validation_output.workflow_run_id,
             parent_workflow_run_block_id=block_validation_output.context.parent_workflow_run_block_id,
             organization_id=block_validation_output.organization_id,
             browser_session_id=block_validation_output.browser_session_id,
         )
+        _raise_if_browser_connection_lost(login_result)
 
 
 async def extract(
@@ -3299,6 +3371,7 @@ async def extract(
     cache_key = cache_key or label
     cached_fn = script_run_context_manager.get_cached_fn(cache_key)
     if cache_key and cached_fn:
+        _refuse_statement_after_browser_connection_loss()
         # Auto-create workflow block run and task if workflow_run_id is available
         workflow_run_block_id, task_id, step_id = await _create_workflow_block_run_and_task(
             block_type=BlockType.EXTRACTION,
@@ -3367,6 +3440,7 @@ async def extract(
             label,
             output_parameter=block_validation_output.output_parameter,
         )
+        _raise_if_browser_connection_lost(block_result)
         return block_result.output_parameter_value
 
 
@@ -3381,6 +3455,7 @@ async def conditional(
     cached_fn = script_run_context_manager.get_cached_fn(label)
     if not cached_fn:
         raise Exception(f"No cached function for conditional block '{label}'")
+    _refuse_statement_after_browser_connection_loss()
 
     # Create workflow run block entry (no task needed for conditional blocks)
     workflow_run_block_id, _, _ = await _create_workflow_block_run_and_task(
@@ -3399,6 +3474,7 @@ async def conditional(
                 run_context.parameters[key] = value
 
     try:
+        _refuse_statement_after_browser_connection_loss()
         result = await cached_fn(page=run_context.page, context=run_context)
         if not isinstance(result, dict) or "next_block_label" not in result:
             raise Exception(f"Conditional function '{label}' must return dict with 'next_block_label', got: {result}")
@@ -3444,6 +3520,7 @@ async def validate(
     result = await execute_validation(complete_criterion, terminate_criterion, error_code_mapping, label, model)
     if result.status == BlockStatus.terminated:
         raise ScriptTerminationException(result.failure_reason)
+    _raise_if_browser_connection_lost(result)
 
 
 async def execute_validation(
@@ -3476,10 +3553,12 @@ async def execute_validation(
         label,
         output_parameter=block_validation_output.output_parameter,
     )
+    _raise_if_browser_connection_lost(result)
     return result
 
 
 async def wait(seconds: int, label: str | None = None) -> None:
+    _refuse_statement_after_browser_connection_loss()
     # Auto-create workflow block run if workflow_run_id is available (wait block doesn't create tasks)
     workflow_run_block_id, _, _ = await _create_workflow_block_run_and_task(block_type=BlockType.WAIT, label=label)
 
@@ -3746,6 +3825,7 @@ class BlockValidationOutput:
 async def _validate_and_get_output_parameter(
     label: str | None = None, parameter_keys: list[str] | None = None
 ) -> BlockValidationOutput:
+    _refuse_statement_after_browser_connection_loss()
     context = skyvern_context.ensure_context()
     workflow_id = context.workflow_id
     workflow_run_id = context.workflow_run_id
@@ -3818,6 +3898,7 @@ async def run_code(
         label,
         output_parameter=block_validation_output.output_parameter,
     )
+    _raise_if_browser_connection_lost(block_result)
     return cast(dict[str, Any], block_result.output_parameter_value)
 
 
@@ -3911,12 +3992,13 @@ async def upload_file(
         prompt=prompt,
         path=path,
     )
-    await file_upload_block.execute_safe(
+    upload_result = await file_upload_block.execute_safe(
         workflow_run_id=block_validation_output.workflow_run_id,
         parent_workflow_run_block_id=block_validation_output.context.parent_workflow_run_block_id,
         organization_id=block_validation_output.organization_id,
         browser_session_id=block_validation_output.browser_session_id,
     )
+    _raise_if_browser_connection_lost(upload_result)
 
 
 async def _send_email_via_gmail(block_validation_output: BlockValidationOutput, credential_id: str | None) -> None:
@@ -3946,6 +4028,7 @@ async def _send_email_via_gmail(block_validation_output: BlockValidationOutput, 
         block_validation_output.label,
         output_parameter=block_validation_output.output_parameter,
     )
+    _raise_if_browser_connection_lost(result)
     if not result.success and not send_email_block.continue_on_failure:
         raise Exception(result.failure_reason or "Gmail send failed")
 
@@ -4037,12 +4120,13 @@ async def send_email(
         output_parameter=block_validation_output.output_parameter,
         parameters=block_validation_output.input_parameters,
     )
-    await send_email_block.execute_safe(
+    send_email_result = await send_email_block.execute_safe(
         workflow_run_id=block_validation_output.workflow_run_id,
         parent_workflow_run_block_id=block_validation_output.context.parent_workflow_run_block_id,
         organization_id=block_validation_output.organization_id,
         browser_session_id=block_validation_output.browser_session_id,
     )
+    _raise_if_browser_connection_lost(send_email_result)
 
 
 async def parse_pdf(
@@ -4060,12 +4144,13 @@ async def parse_pdf(
         output_parameter=block_validation_output.output_parameter,
         parameters=block_validation_output.input_parameters,
     )
-    await pdf_parser_block.execute_safe(
+    parse_pdf_result = await pdf_parser_block.execute_safe(
         workflow_run_id=block_validation_output.workflow_run_id,
         parent_workflow_run_block_id=block_validation_output.context.parent_workflow_run_block_id,
         organization_id=block_validation_output.organization_id,
         browser_session_id=block_validation_output.browser_session_id,
     )
+    _raise_if_browser_connection_lost(parse_pdf_result)
 
 
 async def parse_file(
@@ -4093,12 +4178,13 @@ async def parse_file(
         parameters=block_validation_output.input_parameters,
         model=model,
     )
-    await file_parser_block.execute_safe(
+    parse_file_result = await file_parser_block.execute_safe(
         workflow_run_id=block_validation_output.workflow_run_id,
         parent_workflow_run_block_id=block_validation_output.context.parent_workflow_run_block_id,
         organization_id=block_validation_output.organization_id,
         browser_session_id=block_validation_output.browser_session_id,
     )
+    _raise_if_browser_connection_lost(parse_file_result)
 
 
 async def http_request(
@@ -4127,12 +4213,13 @@ async def http_request(
         output_parameter=block_validation_output.output_parameter,
         parameters=block_validation_output.input_parameters,
     )
-    await http_request_block.execute_safe(
+    http_request_result = await http_request_block.execute_safe(
         workflow_run_id=block_validation_output.workflow_run_id,
         parent_workflow_run_block_id=block_validation_output.context.parent_workflow_run_block_id,
         organization_id=block_validation_output.organization_id,
         browser_session_id=block_validation_output.browser_session_id,
     )
+    _raise_if_browser_connection_lost(http_request_result)
 
 
 async def goto(
@@ -4149,7 +4236,7 @@ async def goto(
             output_parameter=block_validation_output.output_parameter,
             parameters=block_validation_output.input_parameters,
         )
-        await goto_url_block.execute_safe(
+        goto_result = await goto_url_block.execute_safe(
             workflow_run_id=block_validation_output.workflow_run_id,
             parent_workflow_run_block_id=block_validation_output.context.parent_workflow_run_block_id,
             organization_id=block_validation_output.organization_id,
@@ -4163,6 +4250,8 @@ async def goto(
         candidate_url = await asyncio.to_thread(validate_fetch_url, candidate_url)
         run_context = script_run_context_manager.ensure_run_context()
         await run_context.page.goto(candidate_url)
+    else:
+        _raise_if_browser_connection_lost(goto_result)
 
 
 async def trigger_workflow(
@@ -4206,6 +4295,7 @@ async def trigger_workflow(
         label,
         output_parameter=block_validation_output.output_parameter,
     )
+    _raise_if_browser_connection_lost(result)
     return result.output_parameter_value
 
 
@@ -4237,6 +4327,7 @@ async def prompt(
         label,
         output_parameter=block_validation_output.output_parameter,
     )
+    _raise_if_browser_connection_lost(result)
     return result.output_parameter_value
 
 
@@ -4279,6 +4370,7 @@ async def loop(
     complete_if_empty: bool = False,
     label: str | None = None,
 ) -> AsyncGenerator[SkyvernLoopItem, None]:
+    _refuse_statement_after_browser_connection_loss()
     workflow_run_block_id, _, _ = await _create_workflow_block_run_and_task(block_type=BlockType.FOR_LOOP, label=label)
     # process values:
     loop_variable_reference = None
@@ -4383,6 +4475,7 @@ async def loop(
                     workflow_run_id=workflow_run_id,
                     loop_index=index,
                 )
+            _refuse_statement_after_browser_connection_loss()
 
             # register current_value, current_item and current_index in workflow run context
             # Block metadata for template context (user-facing fields only)
@@ -4407,6 +4500,7 @@ async def loop(
             # Build the SkyvernLoopItem for this loop
             yield SkyvernLoopItem(index, value)
 
+        _refuse_statement_after_browser_connection_loss()
         # build success output
         if workflow_run_block_id:
             await _update_workflow_block(
@@ -4456,6 +4550,7 @@ async def while_loop(
     *,
     criteria_type: str | None = None,
 ) -> AsyncGenerator[SkyvernLoopItem, None]:
+    _refuse_statement_after_browser_connection_loss()
     workflow_run_block_id, _, _ = await _create_workflow_block_run_and_task(
         block_type=BlockType.WHILE_LOOP,
         label=label,
@@ -4479,6 +4574,7 @@ async def while_loop(
     loop_idx = 0
     try:
         while True:
+            _refuse_statement_after_browser_connection_loss()
             condition_metadata: BlockMetadata = {
                 "current_index": loop_idx,
                 "current_value": None,
@@ -4505,6 +4601,7 @@ async def while_loop(
                     )
                 raise Exception(f"Failed to evaluate while-loop condition: {exc}") from exc
 
+            _refuse_statement_after_browser_connection_loss()
             if not should_continue:
                 break
 
@@ -4538,6 +4635,7 @@ async def while_loop(
                     workflow_run_id=workflow_run_id,
                     loop_index=loop_idx,
                 )
+            _refuse_statement_after_browser_connection_loss()
 
             loop_metadata: BlockMetadata = {
                 "current_index": loop_idx,

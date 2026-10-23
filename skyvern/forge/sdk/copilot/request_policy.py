@@ -21,8 +21,10 @@ from skyvern.forge.sdk.copilot.ask_user import QuestionInteraction
 from skyvern.forge.sdk.copilot.config import CopilotConfig
 from skyvern.forge.sdk.copilot.context import ProposedCredential, StructuredContext
 from skyvern.forge.sdk.copilot.credential_resolution import (
+    ConnectedVault,
     CredentialResolution,
     CredentialResolutionTier,
+    connected_vault_login_sites,
 )
 from skyvern.forge.sdk.copilot.credential_resolution import deduplicate_credentials as _deduplicate_credentials
 from skyvern.forge.sdk.copilot.credential_resolution import (
@@ -30,6 +32,7 @@ from skyvern.forge.sdk.copilot.credential_resolution import (
 )
 from skyvern.forge.sdk.copilot.credential_resolution import load_credentials as _load_credentials
 from skyvern.forge.sdk.copilot.credential_resolution import (
+    load_credentials_by_ids,
     loggable_origin,
     resolve_by_url,
     unresolved_page_url_for_log,
@@ -52,11 +55,14 @@ from skyvern.forge.sdk.copilot.secret_redaction import (
 )
 from skyvern.forge.sdk.copilot.tracing_setup import copilot_span
 from skyvern.forge.sdk.copilot.workflow_credential_utils import (
+    CONNECTED_VAULT_ID_PREFIX,
     URL_CANDIDATE_RE,
+    bitwarden_secret_bindings,
     parse_workflow_yaml,
     workflow_credential_ids,
     workflow_credential_origins,
 )
+from skyvern.forge.sdk.credential_site_policy import LoginSite, same_release_scope
 from skyvern.forge.sdk.schemas.credentials import Credential, TotpType
 from skyvern.forge.sdk.schemas.google_oauth import STATE_ACTIVE
 from skyvern.forge.sdk.schemas.workflow_copilot import (
@@ -1017,6 +1023,7 @@ class RequestPolicy:
     # Spreadsheet ids from every URL the user wrote, not one per origin: two sheets share an origin.
     user_provided_spreadsheet_ids: list[str] = field(default_factory=list)
     existing_workflow_credential_ids: list[str] = field(default_factory=list)
+    existing_bitwarden_secret_bindings: set[str] = field(default_factory=set)
     # Read from the saved workflow row, never from the submitted YAML. The submission is the live
     # canvas, which carries a copilot proposal the user has not accepted, so it cannot grant a run.
     persisted_workflow_credential_ids: list[str] = field(default_factory=list)
@@ -1052,6 +1059,10 @@ class RequestPolicy:
     # excluded from traces and comparisons: it must describe only the latest literal user turn,
     # even when the agent input later expands terse replies with earlier context.
     canonical_user_message: str = field(default="", repr=False, compare=False)
+    # This turn's one successful read of the organization's connected Bitwarden vault; each read force-syncs it.
+    connected_vault: ConnectedVault | None = field(default=None, repr=False, compare=False)
+    # Whole-site URIs read from each vault login's own item: the only thing that places it on a site.
+    connected_vault_sites: dict[str, list[LoginSite]] = field(default_factory=dict, repr=False, compare=False)
     _authoring_pending: bool = field(default=False, repr=False, compare=False)
 
     def project_question_response_sites(self, interaction: QuestionInteraction) -> None:
@@ -4376,7 +4387,9 @@ def _prior_approved_connection_ids(global_llm_context: str) -> set[str]:
 def _prior_approved_credential_ids(global_llm_context: str) -> set[str]:
     structured = StructuredContext.from_json_str(global_llm_context)
     return {
-        record.credential_id for record in structured.approved_credentials if record.credential_id.startswith("cred_")
+        record.credential_id
+        for record in structured.approved_credentials
+        if record.credential_id.startswith(("cred_", CONNECTED_VAULT_ID_PREFIX))
     }
 
 
@@ -4398,7 +4411,7 @@ async def _seed_prior_approved_credentials(
     missing_ids = sorted(approved_ids - {credential.credential_id for credential in policy.resolved_credentials})
     if not missing_ids:
         return
-    credentials = await _load_credentials(organization_id, credential_ids=missing_ids)
+    credentials = await load_credentials_by_ids(organization_id, missing_ids)
     policy.resolved_credentials = _deduplicate_credentials(
         [
             *policy.resolved_credentials,
@@ -4409,7 +4422,7 @@ async def _seed_prior_approved_credentials(
 
 def _proposed_credential_seed(global_llm_context: str) -> ProposedCredential | None:
     seed = StructuredContext.from_json_str(global_llm_context).proposed_credential
-    if seed is None or not seed.credential_id.startswith("cred_") or not seed.admitted_url:
+    if seed is None or not seed.credential_id.startswith(("cred_", CONNECTED_VAULT_ID_PREFIX)) or not seed.admitted_url:
         return None
     return seed
 
@@ -4423,7 +4436,7 @@ async def _seed_proposed_credential(
     seed = _proposed_credential_seed(global_llm_context)
     if seed is None:
         return
-    credentials = await _load_credentials(organization_id, credential_ids=[seed.credential_id])
+    credentials = await load_credentials_by_ids(organization_id, [seed.credential_id])
     credential = next((item for item in credentials if item.credential_id == seed.credential_id), None)
     if credential is None:
         return
@@ -4451,6 +4464,8 @@ class LiveCredentialAdmission:
     admitted: bool
     steer: str | None = None
     page_url: str | None = None
+    # Whether a fill grant from this admission may follow the login across its whole site.
+    whole_site: bool = False
 
 
 def _live_page_log_allowed(policy: RequestPolicy, page_url: str, seam: LiveCredentialSeam, outcome: str = "") -> bool:
@@ -4525,7 +4540,7 @@ async def _resolve_live_page_credentials(
     # load is awaited. Callers record the admission without another await, so re-read it here.
     if not live_page_credentials_admissible(policy):
         return None
-    return resolve_by_url(
+    resolution = resolve_by_url(
         credentials,
         [page_url],
         # The scout reached this page, so its own path is the evidence; a bare host match would let
@@ -4533,6 +4548,20 @@ async def _resolve_live_page_credentials(
         tiers=("url_exact", "url_path"),
         password_only=True,
     )
+    rivals = _connected_vault_rivals(policy, page_url)
+    if not rivals or resolution.verdict == "unresolved":
+        return resolution
+    return CredentialResolution(
+        "ambiguous", tuple(_deduplicate_credentials([*resolution.candidates, *rivals])), resolution.tier
+    )
+
+
+def _connected_vault_rivals(policy: RequestPolicy, page_url: str) -> list[Credential]:
+    """Vault logins listed this turn with any saved URI on the page's site. They only compete; never grant."""
+    vault = policy.connected_vault
+    if vault is None:
+        return []
+    return [login.credential for login in vault.logins if any(same_release_scope(page_url, url) for url in login.urls)]
 
 
 def _record_live_page_admission(policy: RequestPolicy, candidates: Sequence[Credential], page_url: str) -> None:
@@ -4684,6 +4713,61 @@ async def admit_credential_for_live_page(
     return LiveCredentialAdmission(False)
 
 
+async def admit_connected_vault_login_for_live_page(
+    policy: RequestPolicy,
+    *,
+    organization_id: str,
+    credential_id: str,
+    page_url: str,
+    load_org_credentials: Callable[[], Awaitable[list[Credential]]],
+) -> LiveCredentialAdmission:
+    """Grant run authority for a vault login listed this turn when it is the page's sole candidate and its own
+    whole-site URIs cover the page. The listing's first URI only picks candidates; it never grants."""
+    vault = policy.connected_vault
+    login = vault.login(credential_id) if vault is not None else None
+    if (
+        vault is None
+        or login is None
+        or not page_url
+        or _live_page_url_abstains(
+            policy, organization_id=organization_id, page_url=page_url, seam="fill", credential_id=credential_id
+        )
+    ):
+        return LiveCredentialAdmission(False)
+    resolution = await _resolve_live_page_credentials(
+        policy,
+        organization_id=organization_id,
+        page_url=page_url,
+        load_org_credentials=load_org_credentials,
+        seam="fill",
+        credential_id=credential_id,
+    )
+    if resolution is None:
+        return LiveCredentialAdmission(False)
+    candidates = _deduplicate_credentials([*resolution.candidates, *_connected_vault_rivals(policy, page_url)])
+    sites = (
+        await connected_vault_login_sites(organization_id, policy, credential_id)
+        if [candidate.credential_id for candidate in candidates] == [credential_id]
+        else None
+    )
+    matched = next((site for site in sites or [] if site.admits(page_url)), None)
+    admitted = matched is not None
+    LOG.info(
+        "copilot credential live-page admission",
+        outcome="admitted" if admitted else ("ambiguous" if len(candidates) > 1 else "no_match"),
+        seam="fill",
+        organization_id=organization_id,
+        credential_id=credential_id,
+        page_url=loggable_origin(page_url),
+        tier="vault_site",
+        candidate_credential_ids=[candidate.credential_id for candidate in candidates],
+    )
+    if matched is None:
+        return LiveCredentialAdmission(False)
+    _record_live_page_admission(policy, [login.credential], page_url)
+    return LiveCredentialAdmission(True, page_url=page_url, whole_site=matched.whole_site)
+
+
 def _is_login_credential_param(param: dict[str, Any]) -> bool:
     raw = param.get("parameter_type")
     if not isinstance(raw, str):
@@ -4819,6 +4903,7 @@ async def _build_request_policy_bootstrap(
         persisted_browser_profile_id if isinstance(persisted_browser_profile_id, str) else None
     )
     policy.existing_workflow_credential_ids = sorted(workflow_credential_ids(workflow_yaml))
+    policy.existing_bitwarden_secret_bindings = bitwarden_secret_bindings(workflow_yaml)
     policy.existing_workflow_credential_origins = {
         credential_id: sorted(origins) for credential_id, origins in workflow_credential_origins(workflow_yaml).items()
     }
