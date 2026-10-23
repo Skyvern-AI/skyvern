@@ -9193,6 +9193,62 @@ async (__tv3TextArgs) => {
     } catch (e) { /* fail open: the record keeps today's shape */ }
     return '';
   };
+  // Pressable buttons that set a form value -- a wrapper holding only pressable buttons and the checkbox, radio
+  // or hidden input they write (a Yes/No pair) -- answer one question, the way a radio group does. Without that
+  // input they are page controls (a save, view or font toggle) that their own labels name.
+  const _isToggleChoice = (el) => {
+    try {
+      const own = el.getAttribute('aria-pressed');
+      if (own !== 'true' && own !== 'false') return false;
+      const parent = _parentOf.call(el);
+      if (!parent) return false;
+      const buttons = _qsa.call(parent, 'button,[role=button]');
+      if (buttons.length < 2) return false;
+      for (const b of buttons) {
+        const p = b.getAttribute('aria-pressed');
+        if (p !== 'true' && p !== 'false') return false;
+      }
+      const inputs = _qsa.call(parent, 'input,select,textarea');
+      if (!inputs.length) return false;
+      for (const i of inputs) {
+        const t = (i.getAttribute('type') || '').toLowerCase();
+        if (t !== 'checkbox' && t !== 'radio' && t !== 'hidden') return false;
+      }
+      return true;
+    } catch (e) { return false; }
+  };
+  // A toggle pair's question is the label or legend before it in its entry, past any description or hint between
+  // them: two questions sharing one hint ("answer for this role's location") would otherwise read the same. Only a
+  // label beside that text outranks it; climbing past the first level with text or a control would reach a section
+  // legend, so the nearest text decides there.
+  const _toggleQuestion = (el) => {
+    try {
+      let node = _parentOf.call(el);
+      for (let depth = 0; node && depth < 3; depth++) {
+        let scanned = 0;
+        let stop = false;
+        for (let s = _prevOf.call(node); s && scanned < 8; s = _prevOf.call(s), scanned++) {
+          const kind = _nodeTypeOf.call(s);
+          if (kind === 3) { if (_normText(_contentOf.call(s)).length >= 2) stop = true; continue; }
+          if (kind !== 1) continue;
+          if (_matches.call(s, _CTRL_SEL) || _qs.call(s, _CTRL_SEL)) { stop = true; break; }
+          if (_unseen(s)) continue;
+          const t = _visibleText(s, 0);
+          if (t.length < 2) continue;
+          // A label is often wrapped in a title box of its own; a sibling holding no control can only caption.
+          const lab = _matches.call(s, 'label,legend') ? s : _qs.call(s, 'label,legend');
+          if (lab && !_unseen(lab)) {
+            const lt = lab === s ? t : _visibleText(lab, 0);
+            if (lt.length >= 2) return lt;
+          }
+          stop = true;
+        }
+        if (stop) break;
+        node = _parentOf.call(node);
+      }
+    } catch (e) { /* fall back to the nearest text */ }
+    return _groupText(el, false);
+  };
   // A choice group's question: the legacy text for this member when it names more than the options,
   // else what the page declares for the group, resolved once per group.
   const _choiceGroupText = (el) => {
@@ -10631,6 +10687,7 @@ async (__tv3TextArgs) => {
     return false;
   };
   let lastGroup = '';
+  let lastGroupToggle = false;
   let groupTotal = 0;
   let radioGroupsMissing = 0;
   const _a11yRemoved = """
@@ -10934,6 +10991,8 @@ async (__tv3TextArgs) => {
     Object.assign(rec, _stateFields(el));
     if (el.getAttribute('aria-required') === 'true' || el.required) rec.required = true;
     const isChoice = el.type === 'checkbox' || el.type === 'radio' || role === 'checkbox' || role === 'radio';
+    const isToggle = !isChoice && _isToggleChoice(el);
+    if (isToggle) rec.toggle_choice = true;
     // Read .validity, never checkValidity(): that dispatches an 'invalid' event and perception must
     // not mutate the page. Checkbox/radio .value is the static attribute ("on"), so they are excluded.
     const ai = el.getAttribute('aria-invalid');
@@ -10951,7 +11010,7 @@ async (__tv3TextArgs) => {
     // answer without fetching raw HTML. Deduped against the previous element to keep grouped
     // options compact; capped per page so a long form cannot turn this into a second DOM dump.
     // A pointer root is named by its own content; a short caption ('?') would borrow a stranger's text.
-    if (!pointerRoot && (isChoice || strongLabel.length < 3)) {
+    if (!pointerRoot && (isChoice || isToggle || strongLabel.length < 3)) {
       // The description is the last rung: it is routinely a per-field hint ("This field is
       // required") shared by every field, which would name nothing and dedupe to nothing.
       // The record carries the text at the masking width; the budget, the dedupe and the
@@ -10960,9 +11019,9 @@ async (__tv3TextArgs) => {
       // that only acts it names the wrong target, as a date heading read as the name of the arrow beside it.
       const takesValue = isChoice || _isFieldControl(el) || rec.autocomplete === true
         || el.hasAttribute('aria-checked') || el.hasAttribute('aria-pressed');
-      const ownGroup = takesValue ? _groupText(el, isChoice) : '';
+      const ownGroup = !takesValue ? '' : isToggle ? _toggleQuestion(el) : _groupText(el, isChoice);
       // Every member keeps its group's question, though the digest prints it on the first member only.
-      if (isChoice && ownGroup) rec.question = ownGroup.slice(0, _RETAIN_WIDTH);
+      if ((isChoice || isToggle) && ownGroup) rec.question = ownGroup.slice(0, _RETAIN_WIDTH);
       const gtFull = (ownGroup || byId('aria-describedby')).slice(0, _RETAIN_WIDTH);
       const gt = gtFull.slice(0, 200);
       // A slotted caption is compared at the 140 width it used to be stored at. A drawn shadow caption
@@ -10977,13 +11036,19 @@ async (__tv3TextArgs) => {
         if (!g.entry.shown && groupTotal + gt.length <= _GROUP_TEXT_TOTAL_CAP) {
           rec.group = gtFull;
           lastGroup = gt;
+          lastGroupToggle = false;
           groupTotal += gt.length;
         }
         g.entry.shown = true;
       } else if (gt && gt.length > nameLength && gt !== lastGroup && groupTotal + gt.length <= _GROUP_TEXT_TOTAL_CAP) {
         rec.group = gtFull;
         lastGroup = gt;
+        lastGroupToggle = isToggle;
         groupTotal += gt.length;
+      } else if (isToggle && lastGroupToggle && gt && gt === lastGroup) {
+        // Every button of a pair prints its question: one printed only on its neighbour reads as answering the
+        // question beside it. The repeat is not charged, as the budget bounds distinct question text.
+        rec.group = gtFull;
       }
       // Every member carries its group's number, so the digest can say once per group that no
       // question was found; checkboxes are left out, being mostly self-describing consents.
@@ -13834,7 +13899,8 @@ def build_browser_tools(
                 # A radio or checkbox's question and caption as observe read them, for a click's answer.
                 "question": _mask_refs(str(e.get("question") or "")),
                 "option": _mask_refs(str(e.get("label") or "")),
-                "choice": next((c for c in (e.get("role"), e.get("type")) if c in ("radio", "checkbox")), ""),
+                "choice": next((c for c in (e.get("role"), e.get("type")) if c in ("radio", "checkbox")), "")
+                or ("toggle" if e.get("toggle_choice") else ""),
             }
         # Compact rendering keeps the persistent-conversation prefix small (cost is ~linear in it).
         raw_url = _mask_refs(str(data.get("url") or ""))
