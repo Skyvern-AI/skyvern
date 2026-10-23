@@ -19,6 +19,7 @@ from skyvern.exceptions import SkyvernPageAnalysisTimeout
 from skyvern.forge.sdk.core import skyvern_context
 from skyvern.forge.sdk.core.skyvern_context import MultiFieldTotpAttempt
 from skyvern.utils.contained_effects import contained_effect
+from skyvern.webeye.actions.handler_utils import keys_include_enter
 from skyvern.webeye.scraper.scraped_page import ScrapedPage
 from skyvern.webeye.scraper.scraper import structural_identity
 from skyvern.webeye.utils.document import get_main_document_loader_id
@@ -874,6 +875,72 @@ async def find_multi_field_totp_submit_controls(boxes: list[Locator]) -> list[Mu
                 (rank - 9 if form_submit else rank, MultiFieldTotpSubmitControl(controls.nth(index), fields))
             )
     return [candidate for _, candidate in sorted(candidates, key=lambda candidate: candidate[0])]
+
+
+# A request for a new code, not text about a missing one ("didn't get a code? help").
+_ONE_TIME_CODE_RESEND_LABEL = re.compile(
+    r"\b(?:re-?send|send (?:it |the code |a code |the |a )?(?:new code|another code|again)|"
+    r"(?:get|request) (?:a )?new code)",
+    re.IGNORECASE,
+)
+_ONE_TIME_CODE_CONTROL_SELECTOR = (
+    'button, a[href], input[type="button"], input[type="submit"], [role="button"], [role="link"]'
+)
+
+
+def is_one_time_code_resend_label(label: str) -> bool:
+    return bool(_ONE_TIME_CODE_RESEND_LABEL.search(label))
+
+
+_ONE_TIME_CODE_CONTROL_LABEL_JS = """(node, selector) => node.closest(selector)
+    ? node.getAttribute('aria-label') || node.innerText || node.value || ''
+    : ''"""
+
+
+async def one_time_code_dispatch_kind(
+    page: Page,
+    scraped_page: ScrapedPage,
+    expected_digits: int,
+    *,
+    element_id: str | None,
+    keys: list[str] | None,
+) -> Literal["submit", "resend"] | None:
+    """Whether a click (``element_id``) or key press (``keys``) about to run submits the code group or asks for a new code.
+
+    Only controls inside the group's widget count; a key press counts only as Enter on a focused control there.
+    """
+    group = _multi_field_totp_box_group(scraped_page, expected_digits)
+    if not group:
+        return None
+    boxes = await _retry_box_locators(page, scraped_page, group)
+    scopes = await _multi_field_totp_widget_scopes(boxes, include_ancestors=True)
+    if not scopes:
+        return None
+    if keys is not None:
+        if not keys_include_enter(keys):
+            return None
+        target = scopes[-1].locator(":focus")
+        if await bounded_lookup_call(target.count) != 1:
+            return None
+    elif element_id and element_id in scraped_page.id_to_css_dict:
+        [target] = await _retry_box_locators(page, scraped_page, [element_id])
+        scope_handle = await scopes[-1].element_handle(timeout=1000)
+        if not await target.evaluate("(node, scope) => scope.contains(node)", scope_handle, timeout=1000):
+            return None
+    else:
+        return None
+    label = await target.evaluate(_ONE_TIME_CODE_CONTROL_LABEL_JS, _ONE_TIME_CODE_CONTROL_SELECTOR, timeout=1000)
+    if is_one_time_code_resend_label(label):
+        return "resend"
+    if keys is not None and await target.evaluate(
+        "(node, boxes) => boxes.includes(node)", [await box.element_handle(timeout=1000) for box in boxes], timeout=1000
+    ):
+        return "submit"
+    for control in await find_multi_field_totp_submit_controls(boxes):
+        handle = await control.locator.element_handle(timeout=1000)
+        if await target.evaluate("(node, control) => control.contains(node)", handle, timeout=1000):
+            return "submit"
+    return None
 
 
 _MULTI_FIELD_TOTP_WIDGET_FINGERPRINT_JS = """(element) => {

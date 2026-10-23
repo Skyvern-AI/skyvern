@@ -277,6 +277,7 @@ from skyvern.webeye.utils.dom import (
     SkyvernOptionType,
     bounded_lookup_call,
     is_element_detached_error,
+    is_engine_timeout_error,
     is_incompatible_text_input_error,
     is_post_dispatch_click_timeout,
     resolve_locator,
@@ -1654,6 +1655,12 @@ _false_click_download_eligible: ContextVar[bool] = ContextVar("false_click_downl
 # them. Fails toward retention -- a missed suppression stays committed, degrading to base-equivalent
 # retention rather than releasing a genuinely-owned claim.
 _browser_dispatch_committed: ContextVar[bool] = ContextVar("browser_dispatch_committed", default=False)
+# Set by the step executor around a click or Enter on a one-time code group's submit or resend control: the
+# action may reach the page once, so no fallback runs after a click that might already have landed.
+otp_single_dispatch: ContextVar[bool] = ContextVar("otp_single_dispatch", default=False)
+# What such an action did to the page: "dispatched" once the click or key press returned, "unknown" from the
+# first await that may reach the page until then, None when it is known not to have reached the page.
+otp_dispatch_effect: ContextVar[str | None] = ContextVar("otp_dispatch_effect", default=None)
 
 
 def _suppress_redundant_desired_click() -> list[ActionResult]:
@@ -8254,6 +8261,12 @@ def _record_multi_field_totp_fill(
     if verified:
         state.observed_max_filled = state.expected_digits
     state.filled_code_hash = hashlib.sha256(code.encode()).hexdigest()
+    context = skyvern_context.current()
+    if state.code_source == "external" and context is not None and context.task_id:
+        # Recorded here, before any cleanup, restore or result handling, so no later failure undoes it.
+        context.note_external_otp_input(
+            context.task_id, state.filled_code_hash, state.expected_digits, settings.BROWSER_LOADING_TIMEOUT_MS / 1000
+        )
     state.filled_at = time.time()
     state.filled_url = filled_url
     state.filled_loader_id = filled_loader_id
@@ -8616,6 +8629,10 @@ async def _fill_multi_field_totp_group(
                 result.data = {"totp_group_filled": True, "verified": False, "totp_submission_observed": True}
                 return result
 
+        if state.code_source == "external" and stream_completed and state.observed_max_filled == state.expected_digits:
+            # Every digit already reached the boxes; typing them again box by box would enter the code twice.
+            return delivered_unverified_or_failure("keyboard_stream_delivered_unconfirmed")
+
         code_refresh_error = await refresh_code_if_expiring()
         if code_refresh_error is not None:
             strategy = "per_box_fill_code_refresh_failed"
@@ -8695,6 +8712,14 @@ async def _fill_multi_field_totp_group(
                 code_source=state.code_source,
                 verified=verified,
             )
+
+
+def _external_otp_reentry_refused() -> ActionFailure:
+    # Not stopping: the batch's other actions (a first Verify, the next page's steps) still run.
+    return ActionFailure(
+        SkyvernException("This one-time code was already entered and is not entered again."),
+        stop_execution_on_failure=False,
+    )
 
 
 def _normalize_dropdown_match_text(value: str) -> str:
@@ -9233,6 +9258,12 @@ async def _handle_input_text_action(
         code = await _resolve_multi_field_totp_code(task, attempt)
         if isinstance(code, ActionFailure):
             return [code]
+        if (
+            attempt.code_source == "external"
+            and context is not None
+            and context.external_otp_code_used(task.task_id, code)
+        ):
+            return [_external_otp_reentry_refused()]
         resolved_hint = code
     if not action.element_id:
         # This is a CUA type action
@@ -9298,6 +9329,9 @@ async def _handle_input_text_action(
         code = await _resolve_multi_field_totp_code(task, attempt)
         if isinstance(code, ActionFailure):
             return [code]
+        if attempt.code_source == "external" and context.external_otp_code_used(task.task_id, code):
+            LOG.info("Refused to enter a one-time code again", task_id=task.task_id)
+            return [_external_otp_reentry_refused()]
         return [await _fill_multi_field_totp_group(page, scraped_page, task, attempt, code)]
 
     dom = DomUtil(scraped_page, page)
@@ -11499,7 +11533,9 @@ async def handle_keypress_action(
     task: Task,
     step: Step,
 ) -> list[ActionResult]:
+    otp_dispatch_effect.set("unknown")
     await handler_utils.keypress(page, action.keys, hold=action.hold, duration=action.duration, repeat=action.repeat)
+    otp_dispatch_effect.set("dispatched")
     return [ActionSuccess()]
 
 
@@ -12178,6 +12214,8 @@ async def chain_click(
     engine_selection = resolve_engine_selection_for_task(task, app.BROWSER_MANAGER)
     # Tracks the return value so the finally block can inspect click success.
     action_results: list[ActionResult] = []
+    # Marked before the first await that may reach the page, so a cancellation mid-click keeps the press.
+    otp_dispatch_effect.set("unknown")
     try:
         if not await skyvern_element.navigate_to_a_href(page=page):
             if resolved_href := await skyvern_element.resolve_http_href(page):
@@ -12192,10 +12230,19 @@ async def chain_click(
                 await EventStrategyFactory.move_to_element(page, locator)
                 await _locator_click(locator, click_count, timeout=timeout)
             LOG.info("Chain click: main element click succeeded", action=action, locator=locator, sampling=True)
+        otp_dispatch_effect.set("dispatched")
         action_results = [ActionSuccess()]
         return action_results
 
     except Exception as e:
+        if otp_single_dispatch.get():
+            # Only an actionability timeout is known to precede the click; anything else may follow it.
+            post_dispatch = is_post_dispatch_click_timeout(e, engine_selection)
+            if post_dispatch:
+                otp_dispatch_effect.set("dispatched")
+            elif is_engine_timeout_error(e, engine_selection):
+                otp_dispatch_effect.set(None)
+            return [ActionSuccess()] if post_dispatch else [ActionFailure(FailToClick(action.element_id, msg=str(e)))]
         if is_post_dispatch_click_timeout(e, engine_selection):
             LOG.info(
                 "Chain click: physical click dispatched; navigation-wait timed out — skipping fallback",

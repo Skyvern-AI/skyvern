@@ -141,6 +141,14 @@ class TOTPExpiredError(SkyvernDefinedError):
     reasoning: str = "TOTP verification code has expired during multi-field input sequence."
 
 
+class OTPOutcomeUnconfirmedError(SkyvernDefinedError):
+    error_code: str = "OTP_OUTCOME_UNCONFIRMED"
+    reasoning: str = (
+        "The one-time code was entered, but the site did not confirm whether it was accepted before the page load "
+        "timeout. The same code was not entered again."
+    )
+
+
 class MissingTOTPSourceError(SkyvernDefinedError):
     error_code: str = "MISSING_TOTP_SOURCE"
     reasoning: str = (

@@ -43,6 +43,7 @@ from skyvern.constants import (
 from skyvern.errors.errors import (
     GetTOTPVerificationCodeError,
     MissingTOTPSourceError,
+    OTPOutcomeUnconfirmedError,
     ReachMaxRetriesError,
     ReachMaxStepsError,
     SkyvernDefinedError,
@@ -151,6 +152,7 @@ from skyvern.forge.sdk.core import skyvern_context
 from skyvern.forge.sdk.core.hashing import diagnostic_fingerprint
 from skyvern.forge.sdk.core.security import generate_skyvern_webhook_signature
 from skyvern.forge.sdk.core.skyvern_context import (
+    ExternalOTPUse,
     MultiFieldTotpAttempt,
     MultiFieldTotpRejection,
     SkyvernContext,
@@ -302,6 +304,7 @@ from skyvern.webeye.actions.actions import (
     HoverAction,
     InputTextAction,
     KeypressAction,
+    NullAction,
     ReloadPageAction,
     SelectOption,
     SelectOptionAction,
@@ -313,8 +316,11 @@ from skyvern.webeye.actions.actions import (
 from skyvern.webeye.actions.handler import (
     ActionHandler,
     _fill_multi_field_totp_group,
+    _refresh_stale_web_action_before_dispatch,
     _register_runtime_otp_value_best_effort,
     _resolve_multi_field_totp_code,
+    otp_dispatch_effect,
+    otp_single_dispatch,
 )
 from skyvern.webeye.actions.handler_utils import should_stop_batch_after_dropdown_select
 from skyvern.webeye.actions.models import DetailedAgentStepOutput
@@ -329,6 +335,7 @@ from skyvern.webeye.actions.multi_field_totp import (
     clear_multi_field_totp_boxes,
     multi_field_totp_candidate_input_count,
     multi_field_totp_group_identity,
+    one_time_code_dispatch_kind,
     parse_multi_field_totp_rejection,
     submit_multi_field_totp_retry,
 )
@@ -959,6 +966,244 @@ def _replace_multi_field_totp_prompt_code(
 
 def _mask_multi_field_totp_rejection_digits(value: str | None) -> str:
     return re.sub(r"[0-9]", "*", value or "")
+
+
+_OTP_RESEND_UNANSWERED_REASON = (
+    "A new one-time code was requested, but no new code arrived before the page load timeout. "
+    "The earlier code was not entered again."
+)
+
+
+def _external_otp_use(context: SkyvernContext, task_id: str) -> ExternalOTPUse | None:
+    """The task's entered external codes, unless the current code group takes a seed-generated TOTP."""
+    use = context.external_otp_uses.get(task_id)
+    attempt = context.multi_field_totp.get(task_id)
+    return None if use is None or (attempt is not None and attempt.code_source != "external") else use
+
+
+async def _external_otp_action_kind(
+    page: Page, scraped_page: ScrapedPage, use: ExternalOTPUse, action: Action
+) -> Literal["submit", "resend"] | None:
+    """Whether the action is a click or Enter on the code group's own submit or resend control."""
+    if not isinstance(action, (ClickAction, KeypressAction)):
+        return None
+    try:
+        return await one_time_code_dispatch_kind(
+            page,
+            scraped_page,
+            use.expected_digits,
+            element_id=action.element_id if isinstance(action, ClickAction) else None,
+            keys=action.keys if isinstance(action, KeypressAction) else None,
+        )
+    except Exception as exc:
+        # A control that cannot be tied to the group keeps the ordinary click semantics.
+        LOG.debug("Unable to tie an action to the one-time code group", error_type=type(exc).__name__)
+        return None
+
+
+async def _guard_external_otp_dispatch(
+    context: SkyvernContext, task_id: str, page: Page, scraped_page: ScrapedPage, action: Action
+) -> tuple[Literal["submit", "resend"] | None, ActionFailure | None]:
+    """A press of the group's submit control runs once per entered code; its resend control once per press."""
+    use = _external_otp_use(context, task_id)
+    kind = await _external_otp_action_kind(page, scraped_page, use, action) if use is not None else None
+    if use is None or kind is None or (kind == "submit" and use.current_code_hash is None):
+        return None, None
+    assert isinstance(action, (ClickAction, KeypressAction))
+    if kind == "submit" and use.current_code_hash in use.submitted_code_hashes:
+        LOG.info("Refused to press submit again for the same one-time code", task_id=task_id)
+        refusal = ActionFailure(
+            SkyvernException("The submit control was already pressed for this one-time code."),
+            stop_execution_on_failure=False,
+        )
+        return kind, refusal
+    action.repeat = 1
+    if kind == "submit" and use.current_code_hash is not None:
+        # Recorded before the press and undone only if the press is known not to have reached the page.
+        use.submitted_code_hashes = use.submitted_code_hashes | {use.current_code_hash}
+    return kind, None
+
+
+def _note_external_otp_dispatch(
+    context: SkyvernContext,
+    task_id: str,
+    kind: Literal["submit", "resend"],
+    results: list[ActionResult],
+    dispatched_at: datetime,
+) -> None:
+    use = context.external_otp_uses.get(task_id)
+    if use is None:
+        return
+    effect = otp_dispatch_effect.get()
+    if kind == "submit" and effect is None and not (results and results[-1].success) and use.current_code_hash:
+        use.submitted_code_hashes = use.submitted_code_hashes - {use.current_code_hash}
+    elif kind == "resend" and effect == "dispatched":
+        # The press reached the page, even if the action then failed or was cancelled: one fetch is authorized.
+        use.resend_requested_at = dispatched_at
+        use.resend_attempted = True
+        context.pop_totp_code(task_id)
+        context.totp_codes.pop(f"{task_id}_totp_cache", None)
+        LOG.info("Requested a new one-time code", task_id=task_id)
+
+
+def _external_otp_terminal_plan(
+    task: Task, step: Step, json_response: dict[str, Any], use: ExternalOTPUse
+) -> "ReplacedOTPPlan":
+    errors = (
+        [OTPOutcomeUnconfirmedError(reasoning=use.terminal_reasoning).to_user_defined_error()]
+        if use.terminal_error_code and use.terminal_reasoning
+        else []
+    )
+    return ReplacedOTPPlan(
+        json_response,
+        [
+            TerminateAction(
+                reasoning=use.terminal_reasoning,
+                intention=use.terminal_reasoning,
+                errors=errors,
+                organization_id=task.organization_id,
+                workflow_run_id=task.workflow_run_id,
+                task_id=task.task_id,
+                step_id=step.step_id,
+                step_order=step.order,
+                action_order=0,
+            )
+        ],
+    )
+
+
+async def _fetch_reissued_external_otp(
+    task: Task, context: SkyvernContext, use: ExternalOTPUse, requested_at: datetime
+) -> bool:
+    """The one bounded fetch a dispatched resend authorizes. It does not prove the site sent a code: it only
+    accepts a code not entered before, delivered after the press. A same-digit new code cannot be told apart."""
+    if task.organization_id is None or not (task.totp_verification_url or task.totp_identifier):
+        return False
+    workflow_run = (
+        await app.DATABASE.workflow_runs.get_workflow_run(task.workflow_run_id) if task.workflow_run_id else None
+    )
+    try:
+        otp_value = await poll_otp_value(
+            organization_id=task.organization_id,
+            task_id=task.task_id,
+            workflow_id=workflow_run.workflow_id if workflow_run else None,
+            workflow_run_id=task.workflow_run_id,
+            workflow_permanent_id=workflow_run.workflow_permanent_id if workflow_run else None,
+            totp_verification_url=task.totp_verification_url,
+            totp_identifier=task.totp_identifier,
+            created_after=requested_at,
+            expected_otp_type=OTPType.TOTP,
+            max_wait_seconds=settings.BROWSER_LOADING_TIMEOUT_MS / 1000,
+            rejected_code_hash=use.current_code_hash,
+            multi_field_expected_digits=use.expected_digits,
+        )
+    except (NoTOTPVerificationCodeFound, FailedToGetTOTPVerificationCode):
+        otp_value = None
+    if (
+        otp_value is None
+        or otp_value.from_credential_seed
+        or context.external_otp_code_used(task.task_id, otp_value.value)
+    ):
+        LOG.info("No new one-time code arrived after the resend", task_id=task.task_id)
+        return False
+    context.register_secret_value(otp_value.value)
+    attempt = context.multi_field_totp.get(task.task_id)
+    if attempt is not None:
+        context.reset_attempt(task.task_id)
+        attempt.external_code_obtained_at = time.time()
+    context.totp_codes[f"{task.task_id}_totp_cache"] = otp_value.value
+    LOG.info("Accepted a new one-time code after the resend", task_id=task.task_id)
+    return True
+
+
+async def _plan_has_work_besides_reentry(
+    page: Page,
+    scraped_page: ScrapedPage,
+    use: ExternalOTPUse,
+    attempt: MultiFieldTotpAttempt | None,
+    actions: list[Action],
+) -> bool:
+    """Whether the plan does anything besides typing an entered code again or pressing submit again for it."""
+    reentry = _multi_field_totp_action_indices(actions, attempt, allow_partial=True) if attempt is not None else set()
+    for index, action in enumerate(actions):
+        if index in reentry or action.action_type in (ActionType.WAIT, ActionType.NULL_ACTION):
+            continue
+        if isinstance(action, InputTextAction) and attempt is not None and action.text == attempt.hint_code:
+            continue
+        if (
+            use.current_code_hash in use.submitted_code_hashes
+            and await _external_otp_action_kind(page, scraped_page, use, action) == "submit"
+        ):
+            continue
+        return True
+    return False
+
+
+async def _external_otp_reuse_plan(
+    agent: "ForgeAgent",
+    task: Task,
+    step: Step,
+    scraped_page: ScrapedPage,
+    browser_state: BrowserState,
+    json_response: dict[str, Any],
+) -> "ReplacedOTPPlan | None":
+    """When the plan asks for a code and only an entered one is available, never fetch or type it again.
+
+    The plan's other actions still run. If repeating the code is all it can do, the step waits within the
+    entry's page-load budget; then the normal completion check decides between completed and unconfirmed.
+    """
+    context = skyvern_context.current()
+    use = _external_otp_use(context, task.task_id) if context else None
+    if context is None or use is None:
+        return None
+    if use.terminal_reasoning is not None:
+        return _external_otp_terminal_plan(task, step, json_response, use)
+    if use.resend_requested_at is not None:
+        requested_at, use.resend_requested_at = use.resend_requested_at, None
+        await _fetch_reissued_external_otp(task, context, use, requested_at)
+    cached = context.totp_codes.get(f"{task.task_id}_totp_cache")
+    if not json_response.get("place_to_enter_verification_code") or (
+        cached and not context.external_otp_code_used(task.task_id, cached)
+    ):
+        return None
+    page = await browser_state.must_get_working_page()
+    actions = parse_actions(task, step.step_id, step.order, scraped_page, _require_actions_payload(json_response))
+    stamp_parsed_actions(actions)
+    attempt = context.multi_field_totp.get(task.task_id)
+    if await _plan_has_work_besides_reentry(page, scraped_page, use, attempt, actions):
+        return ReplacedOTPPlan(json_response, actions)
+    if use.deadline is not None and time.monotonic() < use.deadline:
+        return ReplacedOTPPlan(
+            json_response,
+            [
+                NullAction(
+                    reasoning="The one-time code was already entered; waiting for the page to respond.",
+                    organization_id=task.organization_id,
+                    workflow_run_id=task.workflow_run_id,
+                    task_id=task.task_id,
+                    step_id=step.step_id,
+                    step_order=step.order,
+                    action_order=0,
+                )
+            ],
+        )
+    completion = await agent.check_user_goal_complete(
+        page=page, scraped_page=scraped_page, task=task, step=step, verification_trigger="periodic_after_step"
+    )
+    if isinstance(completion, CompleteAction):
+        completion.organization_id = task.organization_id
+        completion.workflow_run_id = task.workflow_run_id
+        completion.task_id = task.task_id
+        completion.step_id = step.step_id
+        completion.step_order = step.order
+        completion.action_order = 0
+        return ReplacedOTPPlan(json_response, [completion])
+    use.terminal_error_code = OTPOutcomeUnconfirmedError.model_fields["error_code"].default
+    use.terminal_reasoning = (
+        _OTP_RESEND_UNANSWERED_REASON if use.resend_attempted else OTPOutcomeUnconfirmedError().reasoning
+    )
+    LOG.info("One-time code outcome unconfirmed", task_id=task.task_id, step_id=step.step_id)
+    return _external_otp_terminal_plan(task, step, json_response, use)
 
 
 def _planner_confirmed_verification_code_intent(json_response: dict[str, Any]) -> bool:
@@ -5687,17 +5932,42 @@ class ForgeAgent:
                     action.skip_auto_complete_tab = True
                 action.stop_batch_after_dropdown_select = should_stop_batch_after_dropdown_select(next_action)
 
-            results = await ActionHandler.handle_action(
-                scraped_page=totp_dispatch_page if totp_armed else scraped_page,
-                task=task,
-                step=step,
-                page=current_page,
-                action=action,
-                file_download_false_click_eligible=file_download_false_click_eligible,
-                # Only actions after the first can be stale: an earlier action in this same batch
-                # may have remounted/reflowed this one's target away from the shared pre-batch scrape.
-                allow_stale_refresh=action_idx > 0,
+            dispatch_page = totp_dispatch_page if totp_armed else scraped_page
+            if action_idx > 0 and not totp_armed and _external_otp_use(context, task.task_id) is not None:
+                # The handler's own stale remap would run after the guard below and hand it a remounted Verify or
+                # Resend it cannot classify; remap here so the guard and the click see the same control.
+                refreshed = await _refresh_stale_web_action_before_dispatch(dispatch_page, current_page, action)
+                if refreshed is not None:
+                    dispatch_page, action = refreshed
+            otp_dispatch, otp_refusal = await _guard_external_otp_dispatch(
+                context, task.task_id, current_page, dispatch_page, action
             )
+            dispatched_at = naive_utc_now()
+            effect_token = otp_dispatch_effect.set(None)
+            single_token = otp_single_dispatch.set(otp_dispatch is not None)
+            otp_results: list[ActionResult] = []
+            try:
+                if otp_refusal is not None:
+                    results = [otp_refusal]
+                else:
+                    results = await ActionHandler.handle_action(
+                        scraped_page=dispatch_page,
+                        task=task,
+                        step=step,
+                        page=current_page,
+                        action=action,
+                        file_download_false_click_eligible=file_download_false_click_eligible,
+                        # Only actions after the first can be stale: an earlier action in this same batch
+                        # may have remounted/reflowed this one's target away from the shared pre-batch scrape.
+                        allow_stale_refresh=action_idx > 0,
+                    )
+                otp_results = results
+            finally:
+                # Before the context is restored, so a press that reached the page is kept even on cancellation.
+                if otp_dispatch is not None and otp_refusal is None:
+                    _note_external_otp_dispatch(context, task.task_id, otp_dispatch, otp_results, dispatched_at)
+                otp_single_dispatch.reset(single_token)
+                otp_dispatch_effect.reset(effect_token)
             await app.AGENT_FUNCTION.post_action_execution(action)
             detailed_agent_step_output.actions_and_results[action_idx] = (
                 action,
@@ -10138,6 +10408,12 @@ class ForgeAgent:
         context = skyvern_context.ensure_context()
         previous_rejection = context.multi_field_totp_rejections.get(task.task_id)
         attempt = context.multi_field_totp.get(task.task_id)
+        if attempt is not None and attempt.code_source == "external":
+            use = context.external_otp_uses.get(task.task_id)
+            if use is not None and use.terminal_reasoning is None:
+                use.terminal_reasoning = reasoning
+            # Another external code needs a dispatched resend; fetching one automatically would repeat the entry.
+            return skipped("external_code_not_retried")
         if skyvern_context.multi_field_totp_retry_budget_exhausted(task.task_id):
             assert previous_rejection is not None
             if previous_rejection.submitted_at is None:
@@ -11601,6 +11877,10 @@ class ForgeAgent:
     ) -> tuple[dict[str, Any], list[Action]]:
         if not task.organization_id:
             return json_response, []
+
+        reuse_plan = await _external_otp_reuse_plan(self, task, step, scraped_page, browser_state, json_response)
+        if reuse_plan is not None:
+            return reuse_plan
 
         if not task.totp_verification_url and not task.totp_identifier:
             return json_response, []
