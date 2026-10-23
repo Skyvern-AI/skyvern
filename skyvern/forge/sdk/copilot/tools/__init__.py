@@ -109,6 +109,7 @@ from skyvern.forge.sdk.copilot.tools.locator_inspection import TOOL_NAME as LOCA
 from skyvern.forge.sdk.copilot.tools.locator_inspection import TOOL_SCHEMA as LOCATOR_INSPECTION_TOOL_SCHEMA
 from skyvern.forge.sdk.copilot.tools.locator_inspection import (
     inspect_locator_matches,
+    visibility_counts,
 )
 from skyvern.forge.sdk.copilot.tracing_setup import copilot_span
 from skyvern.forge.sdk.copilot.work_plan import WorkPlanArguments, set_work_plan
@@ -2385,6 +2386,13 @@ async def _inspect_locator_matches_invoke(ctx: RunContextWrapper, arguments: str
                     }
                 )
             facts = await inspect_locator_matches(page, selectors)
+            LOG.info(
+                "copilot_locator_inspection_visibility",
+                selectors=visibility_counts(facts),
+                workflow_permanent_id=copilot_ctx.workflow_permanent_id,
+                workflow_copilot_chat_id=copilot_ctx.workflow_copilot_chat_id,
+                turn_id=copilot_ctx.turn_id,
+            )
             return finish({"ok": True, "current_url": page.url, **binding.provenance(), "data": facts})
 
 

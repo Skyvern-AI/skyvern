@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import hashlib
 from typing import Any
 
 from playwright.async_api import Error as PlaywrightError
@@ -139,3 +140,20 @@ async def inspect_locator_matches(page: Page, selectors: list[str]) -> dict[str,
         entry["matches"] = matches
         results.append(entry)
     return {"selectors": results, "selectors_truncated": len(selectors) > MAX_SELECTORS}
+
+
+def visibility_counts(result: dict[str, Any]) -> list[dict[str, Any]]:
+    """What a result told the model about visibility, without selector or page text, for logging."""
+    counts: list[dict[str, Any]] = []
+    for entry in result["selectors"]:
+        matches = entry.get("matches") or []
+        counts.append(
+            {
+                "selector_sha256": hashlib.sha256(entry["selector"].encode()).hexdigest()[:12],
+                "error": "error" in entry,
+                "match_count": entry.get("match_count"),
+                "listed_visible": sum(1 for match in matches if match.get("visible") is True),
+                "first_match_visible": matches[0].get("visible") if matches else None,
+            }
+        )
+    return counts
