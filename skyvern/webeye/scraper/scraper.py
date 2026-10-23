@@ -318,6 +318,9 @@ def build_element_dict(
         if previous_frame is not None and previous_frame != element["frame"]:
             cross_frame_collision_ids.add(element_id)
             colliding_frame_pairs.add((previous_frame, element["frame"]))
+            # Frames arrive breadth-first, parents before children, so the first owner is the likelier target, and a
+            # frame's copy of its own iframe cannot re-point that iframe into its subtree and loop the frame chain.
+            continue
         # get_interactable_element_tree marks each interactable element with a SKYVERN_ID_ATTR attribute
         id_to_css_dict[element_id] = f"[{SKYVERN_ID_ATTR}='{element_id}']"
         id_to_element_dict[element_id] = element
@@ -328,10 +331,10 @@ def build_element_dict(
 
     if cross_frame_collision_ids:
         iframe_collision_count = len(cross_frame_collision_ids & {element["frame"] for element in elements})
-        # Only an overwritten iframe entry can turn an element's frame chain into a loop.
+        # A shared iframe id is the collision that can misroute an element's frame chain.
         log = LOG.warning if iframe_collision_count else LOG.info
         log(
-            "Element ids collide across frames; the later frame's element replaces the earlier one",
+            "Element ids collide across frames; the earlier frame's element is kept",
             collision_count=len(cross_frame_collision_ids),
             iframe_collision_count=iframe_collision_count,
             frame_pairs=sorted(colliding_frame_pairs)[:MAX_LOGGED_FRAME_COLLISION_PAIRS],

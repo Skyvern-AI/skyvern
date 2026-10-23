@@ -171,8 +171,8 @@ async def resolve_locator(
     iframe_path: list[str] = []
 
     while frame != "main.frame":
-        # Element ids are reused across frames, so a later frame's copy can overwrite an iframe's entry and
-        # point the chain back at itself. This loop never awaits, so a cycle would block the event loop.
+        # A chain can still loop when an iframe element is missing from the scraped elements and a descendant
+        # frame holds an element with that iframe's id. This loop never awaits, so a cycle would block the event loop.
         if frame in iframe_path or len(iframe_path) >= MAX_FRAME_CHAIN_DEPTH:
             LOG.warning(
                 "Frame chain of the scraped element loops or exceeds the depth cap",

@@ -1895,27 +1895,38 @@ if (window.elementIdCounter === undefined) {
   window.elementIdCounter = new SafeCounter();
 }
 
-// generate a unique id for the element
-// length is 4, the first character is from the frame index, the last 3 characters are from the counter,
+const UNIQUE_ID_CHARACTERS =
+  "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789";
+const UNIQUE_ID_COUNTER_LENGTH = 3;
+
+// The frame index in base 62 that starts every id this window mints, or null while it has no frame index.
+// Every window's counter starts at 1, so one character modulo 62 would give frame 62 the main frame's ids.
+function uniqueIdFramePrefix() {
+  const base = UNIQUE_ID_CHARACTERS.length;
+  let frameIndex = window.GlobalSkyvernFrameIndex;
+  if (frameIndex === undefined || frameIndex < 0) return null;
+  let prefix = UNIQUE_ID_CHARACTERS[frameIndex % base];
+  frameIndex = Math.floor(frameIndex / base);
+  // The page can overwrite the global: Infinity would never floor to 0, so the loop stops past safe integers.
+  while (Number.isSafeInteger(frameIndex) && frameIndex > 0) {
+    prefix = UNIQUE_ID_CHARACTERS[frameIndex % base] + prefix;
+    frameIndex = Math.floor(frameIndex / base);
+  }
+  return prefix;
+}
+
+// generate a unique id for the element: the frame prefix, then the last 3 characters from the counter
 async function uniqueId() {
-  const characters =
-    "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789";
+  const characters = UNIQUE_ID_CHARACTERS;
   const base = characters.length;
 
   const extraCharacters = "~!@#$%^&*()-_+=";
   const extraBase = extraCharacters.length;
 
-  let result = "";
-
-  if (
-    window.GlobalSkyvernFrameIndex === undefined ||
-    window.GlobalSkyvernFrameIndex < 0
-  ) {
+  let result = uniqueIdFramePrefix();
+  if (result === null) {
     const randomIndex = Math.floor(Math.random() * extraBase);
-    result += extraCharacters[randomIndex];
-  } else {
-    const c1 = window.GlobalSkyvernFrameIndex % base;
-    result += characters[c1];
+    result = extraCharacters[randomIndex];
   }
 
   const countPart =
@@ -1928,6 +1939,28 @@ async function uniqueId() {
   result += characters[c4];
 
   return result;
+}
+
+// The shape of an id a frame below index 238,328 minted. Other values are left alone: the page's own, and the
+// symbol-led ids a window mints while it has no frame index.
+const MINTED_UNIQUE_ID = /^[A-Za-z0-9]{4,6}$/;
+
+// A child document can hold copies of nodes another frame already tagged, so a minted id is kept only when
+// this window minted it; a node the page moves between frames is given a new id once.
+async function ownUniqueId(element) {
+  const existing = element.getAttribute("unique_id");
+  const prefix = uniqueIdFramePrefix();
+  if (
+    existing &&
+    (prefix === null ||
+      !MINTED_UNIQUE_ID.test(existing) ||
+      existing.slice(0, -UNIQUE_ID_COUNTER_LENGTH) === prefix)
+  ) {
+    return existing;
+  }
+  const fresh = await uniqueId();
+  element.setAttribute("unique_id", fresh);
+  return fresh;
 }
 
 const ENRICHED_ELEMENT_TEXT_LIMIT = 120;
@@ -2363,8 +2396,7 @@ async function buildElementObject(
       budget.remaining -= maxOptions;
     }
   }
-  var element_id = element.getAttribute("unique_id") ?? (await uniqueId());
-  element.setAttribute("unique_id", element_id);
+  var element_id = await ownUniqueId(element);
   // Inputs can appear after the stamp pass while the asynchronous tree build runs.
   if (
     !element.hasAttribute("data-skyvern-otp-box") &&
@@ -2509,13 +2541,7 @@ async function buildElementObject(
   let isInShadowRoot = element.getRootNode() instanceof ShadowRoot;
   if (isInShadowRoot) {
     let shadowHostEle = element.getRootNode().host;
-    let shadowHostId = shadowHostEle.getAttribute("unique_id");
-    // assign shadowHostId to the shadowHost element if it doesn't have unique_id
-    if (!shadowHostId) {
-      shadowHostId = await uniqueId();
-      shadowHostEle.setAttribute("unique_id", shadowHostId);
-    }
-    elementObj.shadowHost = shadowHostId;
+    elementObj.shadowHost = await ownUniqueId(shadowHostEle);
   }
 
   // get options for select element or for listbox element
