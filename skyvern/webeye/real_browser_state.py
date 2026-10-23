@@ -111,12 +111,12 @@ def browser_context_stopped_reason(context: BrowserContext | None) -> str | None
     A reused browser state (e.g. a persistent debug session) can have a stopped driver after a
     prior owner's cleanup; page.goto then raises "Connection closed while reading from the
     driver". A bare pw.stop() leaves browser.is_connected() stale and never flips
-    _close_was_called, so the shared driver Connection's closed-error is inspected too.
+    _closing_or_closed, so the shared driver Connection's closed-error is inspected too.
     """
     if context is None:
         return "browser_context_missing"
     impl = getattr(context, "_impl_obj", None)
-    if getattr(impl, "_close_was_called", False) is True:
+    if getattr(impl, "_closing_or_closed", False) is True:
         return "browser_context_close_called"
     if getattr(impl, "_closed", False) is True:
         return "browser_context_closed"

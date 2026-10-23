@@ -252,11 +252,11 @@ def _browser_context_attachability(browser_context: object | None) -> BrowserPro
     if browser_context is None:
         return BrowserProbeOutcome.positively_unreachable
 
-    # Playwright Python has no public BrowserContext.closed flag. These private
-    # attrs are a best-effort early guard; fallback defaults keep future
+    # These private attrs are a best-effort early guard that also tolerates
+    # Playwright-like contexts without is_closed(); fallback defaults keep future
     # Playwright changes from breaking the public browser.is_connected probe.
     impl = _playwright_private_impl(browser_context)
-    if _object_bool_attr(impl, "_close_was_called") or _object_bool_attr(impl, "_closed"):
+    if _object_bool_attr(impl, "_closing_or_closed") or _object_bool_attr(impl, "_closed"):
         return BrowserProbeOutcome.positively_unreachable
 
     # Test doubles and older Playwright-like wrappers may omit the public
