@@ -62,6 +62,15 @@ FinishStatus = Literal["completed", "failed", "terminated"]
 UnlistedReaskCheck = Callable[[NonCompletedStatus, str], Awaitable[UnlistedReask]]
 # (reason, earlier checks this run); logs its own verdict and never raises.
 TerminatePremiseCheck = Callable[[str, int], Awaitable[None]]
+# The loop only holds weak references to its tasks, so a shadow nobody awaits is kept here until it ends.
+_PREMISE_CHECKS: set[asyncio.Task[None]] = set()
+
+
+def _premise_check_done(task: asyncio.Task[None]) -> None:
+    _PREMISE_CHECKS.discard(task)
+    if not task.cancelled() and (exc := task.exception()) is not None:
+        LOG.warning("taskv3 terminate premise failed", exc_info=exc)
+
 
 # Why a failing tool call failed, as one closed vocabulary. Spelled as a `Literal` rather than `str`
 # because the whole value of the facet is that it is closed: it is written at ~33 literal sites in
@@ -2818,7 +2827,8 @@ def make_finish_tool(
     `unseen_text` holds a completed verdict, on its own budget, while the page shows text no result the model read
     carried, or a result in the finish's own batch carried page text or download lines.
 
-    `terminate_premise` checks every terminated finish past the holds above, alongside any re-ask, and changes nothing.
+    `terminate_premise` checks every terminated finish past the holds above in the background, never awaited, and
+    changes nothing.
 
     `intercepted_submissions` lists the submissions a page-level interceptor held this block. A failed or terminated
     verdict is held once per submission whose response reached the page after the newest read the model received
@@ -3060,16 +3070,6 @@ def make_finish_tool(
                 "error_code_declined": error_code_declined,
             },
         )
-
-    async def _premise_done(premise: asyncio.Future[None] | None) -> None:
-        try:
-            if premise is not None:
-                await premise
-        except asyncio.CancelledError:
-            # A cancel raised inside the shadow's own call is not the run's; only the run's own cancel goes on.
-            task = asyncio.current_task()
-            if task is not None and task.cancelling():
-                raise
 
     async def handler(args: dict[str, Any]) -> ToolResult:
         nonlocal deferrals, stale_holds, failure_deferrals, reask_asked, premise_checks
@@ -3402,7 +3402,11 @@ def make_finish_tool(
         premise = None
         if status == "terminated" and terminate_premise is not None:
             premise = asyncio.ensure_future(terminate_premise(args.get("reason") or "", premise_checks))
+            _PREMISE_CHECKS.add(premise)
+            premise.add_done_callback(_premise_check_done)
             premise_checks += 1
+            # One yield, so the check renders its prompt from the trail this verdict saw before anything else runs.
+            await asyncio.sleep(0)
         if original is not None and unlisted_reask is not None and not reask_asked:
             reask_asked = True
             try:
@@ -3420,12 +3424,8 @@ def make_finish_tool(
                     premise.cancel()
                 # Defer: the loop's cancellation check persists `canceled` before another turn.
                 return ToolResult.error("the run was canceled while the verdict was being checked.")
-            # After the cancel check, so the shadow's wait never widens the window in which a cancel changes the result.
-            await _premise_done(premise)
             if converted is not None:
                 return converted
-        else:
-            await _premise_done(premise)
         candidates = download_facts if status == "completed" and download_settle is not None else None
         if candidates is not None and (candidates.held_candidates is None or candidates.resolve_candidates is None):
             candidates = None

@@ -1684,7 +1684,7 @@ async def test_the_answer_audit_wraps_the_run_tools_and_sees_the_instructions(mo
     applied: list[tuple[list[str], object]] = []
     audit = object()
 
-    def hook(parameters: Any, *, goal: str, organization_id: Any, step: Any) -> object:
+    async def hook(parameters: Any, *, goal: str, organization_id: Any, step: Any) -> object:
         hook_calls.append({"parameters": parameters, "goal": goal})
         return audit
 
@@ -2682,9 +2682,7 @@ async def test_a_terminate_with_a_completion_criterion_asks_both_judges_once_eac
 
 
 @pytest.mark.asyncio
-async def test_a_premise_check_that_fails_or_outlasts_its_timeout_still_ends_the_run_as_the_model_said(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
+async def test_a_premise_check_that_fails_still_ends_the_run_as_the_model_said() -> None:
     def broken_redactor() -> Any:
         raise RuntimeError("redactor down")
 
@@ -2700,23 +2698,57 @@ async def test_a_premise_check_that_fails_or_outlasts_its_timeout_still_ends_the
     )
     assert outcome.status == "terminated"
 
+
+@pytest.mark.asyncio
+async def test_a_slow_premise_check_logs_after_the_run_ends_under_the_runs_own_ids(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    release = asyncio.Event()
+    checked_under: list[str | None] = []
+
     class _SlowCaller(_PremiseAnsweringCaller):
         async def call(self, **kwargs: Any) -> dict[str, Any]:  # type: ignore[override]
+            kwargs.pop("step", None)
             if kwargs.get("prompt_name") == TERMINATE_PREMISE_PROMPT_NAME:
-                await asyncio.sleep(5)
+                await release.wait()
+                checked_under.append(skyvern_context.ensure_context().task_id)
             return await super().call(**kwargs)
 
-    monkeypatch.setattr(engine_mod, "GOAL_CHECK_TIMEOUT_SECONDS", 0.05)
+    flushed: list[str] = []
+
+    async def flush_step_archive(step_id: str) -> None:
+        flushed.append(step_id)
+
+    monkeypatch.setattr(app, "ARTIFACT_MANAGER", SimpleNamespace(flush_step_archive=flush_step_archive))
     slow = _SlowCaller([[("finish", {"status": "terminated", "reason": "Not listed."})]], answer={})
-    with capture_logs() as logs:
-        outcome = await run_task_v3_agent_loop(
-            page_provider=_fixed_page_provider(_FakePage()),
-            llm_caller=slow,
-            goal="Open the statements.",
-            unlisted_reask_criteria=("", "the statements link is not on the page"),
+
+    def premise_whys() -> list[str]:
+        return [log["why"] for log in logs if log["event"] == "taskv3 terminate premise"]
+
+    with skyvern_context.scoped(SkyvernContext(task_id="tsk_premise")) as run_context, capture_logs() as logs:
+        outcome = await asyncio.wait_for(
+            run_task_v3_agent_loop(
+                page_provider=_fixed_page_provider(_FakePage()),
+                llm_caller=slow,
+                goal="Open the statements.",
+                unlisted_reask_criteria=("", "the statements link is not on the page"),
+                step=SimpleNamespace(step_id="stp_premise"),
+            ),
+            timeout=1.0,
         )
-    assert outcome.status == "terminated"
-    assert [log["why"] for log in logs if log["event"] == "taskv3 terminate premise"] == ["skipped:timeout"]
+        assert outcome.status == "terminated"
+        assert premise_whys() == []
+        # What the block does once it ends; the shared context then belongs to the next block.
+        run_context.task_id = None
+        release.set()
+        async with asyncio.timeout(5):
+            while not premise_whys():
+                await asyncio.sleep(0.01)
+
+    assert premise_whys() == ["skipped:unparseable"]
+    assert checked_under == ["tsk_premise"]
+    # The run's own archive flush has already happened, so the late check flushes what its call wrote.
+    assert flushed == ["stp_premise"]
 
 
 def _fixed_read_tool(content: str, *, page: _FakePage | None = None, lands_at: str | None = None) -> ToolSpec:

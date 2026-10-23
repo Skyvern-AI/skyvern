@@ -1195,7 +1195,7 @@ class AgentFunction:
         return ()
 
     # An audit of the answers a run entered, consulted before the form moves on, or None (OSS: none).
-    def task_v3_answer_basis_audit(
+    async def task_v3_answer_basis_audit(
         self, parameters: dict[str, Any] | None, *, goal: str, organization_id: str | None, step: Step | None
     ) -> AnswerBasisAudit | None:
         return None
