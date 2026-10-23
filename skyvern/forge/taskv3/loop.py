@@ -31,7 +31,13 @@ from urllib.parse import urlsplit
 import structlog
 
 from skyvern.errors.errors import resolve_error_code_mapping_key
-from skyvern.exceptions import CompletionGateTerminationError, SkyvernContextWindowExceededError, StepTerminationError
+from skyvern.exceptions import (
+    CompletionGateTerminationError,
+    MissingBrowserState,
+    MissingBrowserStatePage,
+    SkyvernContextWindowExceededError,
+    StepTerminationError,
+)
 from skyvern.forge.sdk.api.llm.exceptions import LLMContentFilteredError
 from skyvern.forge.sdk.core import skyvern_context
 from skyvern.forge.sdk.core.skyvern_context import SkyvernContext
@@ -529,6 +535,17 @@ def _raised_error_class(exc: BaseException) -> ToolErrorClass:
     if isinstance(exc, TimeoutError):
         return "timeout_other"
     return "handler_raised"
+
+
+def _is_browser_gone(exc: BaseException) -> bool:
+    """Whether a raise that escaped a tool handler says the browser itself is gone.
+
+    The same closed pair the block layer tests for a terminal browser loss
+    (`skyvern/forge/sdk/workflow/models/block.py`), so the loop and the block agree on what "the
+    browser is gone" means rather than carrying two spellings of it. Decided by TYPE, never by the
+    message: a page accessor's message can carry the URLs it found.
+    """
+    return isinstance(exc, (MissingBrowserState, MissingBrowserStatePage))
 
 
 def mark_is_filler(mark: Any) -> bool:
@@ -1029,6 +1046,15 @@ NAV_DEAD_END_GUARD = "navigation_dead_end"
 # A page-level handler kept asking for the page to be reloaded past the per-run cap: the page cannot
 # be stabilized, and acting on it would mean acting on a page declared stale.
 PAGE_REFRESH_EXHAUSTED_GUARD = "page_refresh_exhausted"
+# The browser or its page is gone: the page accessor behind every tool already tried to reopen a lost
+# tab and could not, so every later call raises the same error and the model spends turns on a browser
+# that cannot come back (SKY-18903). The only guard whose verdict is `failed` rather than `terminated`:
+# the run reached no verdict about the task, the engine lost the browser under it.
+BROWSER_LOST_GUARD = "browser_lost"
+BROWSER_LOST_EVENT = "taskv3 loop browser lost"
+BROWSER_LOST_REASON = "The run lost its connection to the browser and could not continue."
+# What the model is told about the calls queued behind the one that found the browser gone.
+BROWSER_LOST_SKIP_REASON = "the run lost its connection to the browser"
 
 # A URL long enough to be a payload rather than a place is DROPPED from a verdict, never cut: the
 # customer-facing reason is redacted by whole-value match, so a truncated URL would no longer match a
@@ -2181,7 +2207,7 @@ def _budget_exhausted_observation(cap: str, recency: ActivityRecency | None) -> 
     return f"{json_line}\nThe run's budget cap has tripped; this is the final turn before the run ends."
 
 
-def _guard_verdict(guard: str, reason: str) -> LoopOutcome:
+def _guard_verdict(guard: str, reason: str, *, status: Literal["failed", "terminated"] = "terminated") -> LoopOutcome:
     """The one way a loop guard ends a run: the customer-facing sentence in `reason`, the machine class
     in `guard`.
 
@@ -2190,8 +2216,12 @@ def _guard_verdict(guard: str, reason: str) -> LoopOutcome:
     that tripped, the tool that reported it and the selector it compared all belong on the guard's own
     log line instead (SKY-16271). `_budget_exhausted_reason` below holds the same standard for the
     budget exits.
+
+    `terminated` is the default because a guard normally reports a verdict the run reached about the
+    task (see FINISH_STATUS_TAXONOMY). A guard that reports the engine losing the browser under the
+    run reached no such verdict and passes `failed`.
     """
-    return LoopOutcome("terminated", reason, guard=guard)
+    return LoopOutcome(status, reason, guard=guard)
 
 
 def _verdict_url(url: Any, caller_known_urls: Collection[str]) -> str | None:
@@ -5260,6 +5290,7 @@ async def run_agent_tool_loop(
             tool_started_at = time.monotonic()
             st.event_seq += 1
             dispatch_seq = st.event_seq
+            browser_gone = False
             if spec is None:
                 result = ToolResult.error(f"unknown_tool: {tool_name}")
             elif refuse_navigation and tool_name in URL_CHANGING_TOOLS:
@@ -5286,6 +5317,7 @@ async def run_agent_tool_loop(
                         exc_info=True,
                         **_navigate_record_fields(tool_name, args, None),
                     )
+                    browser_gone = _is_browser_gone(exc)
                     raised_class = _raised_error_class(exc)
                     result = ToolResult.error(f"tool_error: {type(exc).__name__}: {exc}", error_class=raised_class)
             tool_duration_seconds = time.monotonic() - tool_started_at
@@ -5839,6 +5871,16 @@ async def run_agent_tool_loop(
                     "an earlier field in this batch failed and was left on the previous step; the page moved "
                     "on — re-observe",
                 )
+                break
+
+            if browser_gone:
+                # The page accessor behind every tool already tried to reopen a lost tab and could not,
+                # so nothing the model does next can reach a page: handing this back as a tool error buys
+                # only identical raises on later turns (SKY-18903). Checked ahead of the poisoning read
+                # below, which would spend a probe on the dead page to learn what this already says.
+                LOG.info(BROWSER_LOST_EVENT, tool=tool_name, turn=st.turns, guard=BROWSER_LOST_GUARD)
+                st.outcome = _guard_verdict(BROWSER_LOST_GUARD, BROWSER_LOST_REASON, status="failed")
+                _append_skipped_tool_results(st.messages, tool_calls[idx + 1 :], BROWSER_LOST_SKIP_REASON)
                 break
 
             if result.status == "error":
