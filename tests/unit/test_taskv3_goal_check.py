@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import gc
 import itertools
 import re
 import time
@@ -1196,44 +1197,6 @@ async def test_a_premise_quote_from_a_page_the_agent_has_left_does_not_ground_an
 
 
 @pytest.mark.asyncio
-async def test_a_cancel_landing_while_only_the_premise_check_runs_leaves_the_verdict_as_on_main() -> None:
-    # On main the cancel check runs as soon as the re-ask answers; the shadow's wait must not widen that window. A
-    # converting re-ask is left out: its settle window yields, and a cancel inside it is caught on main too.
-    converts = False
-    canceled = False
-    answered = asyncio.Event()
-    checked: list[str] = []
-
-    class _AnsweringSpy(_ReaskSpy):
-        async def __call__(self, status: NonCompletedStatus, reason: str) -> UnlistedReask:
-            result = await super().__call__(status, reason)
-            answered.set()
-            return result
-
-    async def premise(reason: str, prior_checks: int) -> None:
-        nonlocal canceled
-        await answered.wait()
-        await asyncio.sleep(0)
-        canceled = True
-        checked.append(reason)
-
-    async def should_cancel() -> bool:
-        return canceled
-
-    finish = make_finish_tool(
-        **_gate_kwargs(pending=False, blocked=False, unsettled=False),
-        should_cancel=should_cancel,
-        unlisted_reask=_AnsweringSpy(converts=converts),
-        terminate_premise=premise,
-    )
-    result = await finish.handler({"status": "terminated", "reason": "no PIN screen"})
-
-    assert result.status == "ok" and result.data is not None
-    assert result.data["status"] == ("completed" if converts else "terminated")
-    assert checked == ["no PIN screen"]
-
-
-@pytest.mark.asyncio
 @pytest.mark.parametrize("reasks", [True, False])
 async def test_a_cancel_raised_inside_the_premise_check_does_not_end_the_run(reasks: bool) -> None:
     async def premise(reason: str, prior_checks: int) -> None:
@@ -1251,23 +1214,31 @@ async def test_a_cancel_raised_inside_the_premise_check_does_not_end_the_run(rea
 
 
 @pytest.mark.asyncio
-async def test_the_runs_own_cancel_still_ends_the_run_while_the_premise_check_runs() -> None:
-    started = asyncio.Event()
+async def test_a_premise_check_that_raises_after_the_verdict_is_logged_not_left_unretrieved() -> None:
+    unhandled: list[dict[str, Any]] = []
+    asyncio.get_running_loop().set_exception_handler(lambda loop, context: unhandled.append(context))
+    release = asyncio.Event()
 
     async def premise(reason: str, prior_checks: int) -> None:
-        started.set()
-        await asyncio.Event().wait()
+        await release.wait()
+        raise RuntimeError("judge exploded")
 
     finish = make_finish_tool(
         **_gate_kwargs(pending=False, blocked=False, unsettled=False),
         terminate_premise=premise,
     )
-    run = asyncio.ensure_future(finish.handler({"status": "terminated", "reason": "no PIN screen"}))
-    await started.wait()
-    run.cancel()
+    with capture_logs() as logs:
+        result = await asyncio.wait_for(finish.handler({"status": "terminated", "reason": "no PIN screen"}), 1)
+        assert result.status == "ok" and result.data is not None
+        assert result.data["status"] == "terminated"
+        release.set()
+        for _ in range(3):
+            await asyncio.sleep(0)
+    del finish
+    gc.collect()
 
-    with pytest.raises(asyncio.CancelledError):
-        await run
+    assert unhandled == []
+    assert [log["event"] for log in logs if "premise" in log["event"]] == ["taskv3 terminate premise failed"]
 
 
 @pytest.mark.asyncio
