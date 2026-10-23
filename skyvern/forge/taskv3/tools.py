@@ -128,7 +128,13 @@ from skyvern.webeye.action_deadline import cancellable_driver_call
 from skyvern.webeye.actions.key_names import normalize_key_chord
 from skyvern.webeye.browser_driver_errors import is_driver_error, is_driver_timeout_error
 from skyvern.webeye.browser_state import BLANK_PAGE_URLS, is_selectable_page_url
-from skyvern.webeye.cdp_download_interceptor import download_tally_for_context
+from skyvern.webeye.cdp_download_interceptor import (
+    begin_replay_candidate_hold,
+    download_tally_for_context,
+    replay_candidates_for_context,
+    resolve_replay_candidates_for_context,
+    set_replay_candidate_mode_for_context,
+)
 from skyvern.webeye.native_downloads import NativeDownloadAttempt
 from skyvern.webeye.navigation import driver_nav_error_code, record_task_nav_error_code, redact_url_secrets
 from skyvern.webeye.utils.challenge_signature import CHALLENGE_VENDOR_FRAME_URL, CHALLENGE_VENDOR_SIGNATURE
@@ -23494,12 +23500,19 @@ class DownloadFailureWatch:
         *,
         native_download_attempt: NativeDownloadAttempt | None = None,
     ) -> None:
-        self.facts = DownloadFailureFacts(refresh=self._read_tally)
+        self.facts = DownloadFailureFacts(
+            refresh=self._read_tally,
+            held_candidates=lambda: replay_candidates_for_context(self._context),
+            resolve_candidates=lambda accepted: resolve_replay_candidates_for_context(self._context, accepted),
+            attach=self.attach,
+        )
         self._native_download_attempt = native_download_attempt
         self._native_failures_seen = (0, 0)
         self._page_provider = page_provider
         self._opaque_refs = opaque_refs
         self._context: BrowserContext | None = None
+        # The run may already hold candidates on its context; only a hold this watch began is its to end.
+        self._owns_candidate_mode = False
         self._open_calls = 0
         self._call_seq = 0
         self._unattached_logged = False
@@ -23623,6 +23636,8 @@ class DownloadFailureWatch:
                     f"Browser download not saved ({_DOWNLOAD_NOTICE_SANITIZE_RE.sub('', reason)[:80]}): {unsaved}",
                     repeat=True,
                 )
+        for fact in replay_candidates_for_context(self._context).values():
+            self.facts.add(fact, repeat=False)
 
     async def begin(self) -> int:
         try:
@@ -23632,6 +23647,8 @@ class DownloadFailureWatch:
                 if context is not self._context:
                     self.close()
                     self._context = context
+                    # Inside a run's scope the scope ends this hold, after the task's cleanup rather than at close().
+                    self._owns_candidate_mode = begin_replay_candidate_hold(context)
                     self._tally_generation = None
                     self._read_tally()
                     for event, hook in self._hooks.items():
@@ -23650,6 +23667,10 @@ class DownloadFailureWatch:
 
     def end(self) -> None:
         self._open_calls = max(0, self._open_calls - 1)
+
+    async def attach(self) -> None:
+        await self.begin()
+        self.end()
 
     def _unanswered(self, call: int) -> list[Request]:
         return [
@@ -23695,6 +23716,10 @@ class DownloadFailureWatch:
         for event, hook in self._hooks.items():
             with contextlib.suppress(Exception):
                 self._context.remove_listener(event, hook)
+        if self._owns_candidate_mode:
+            # Ends the hold: whatever the run did not select is discarded, never saved.
+            set_replay_candidate_mode_for_context(self._context, False)
+        self._owns_candidate_mode = False
         self._context = None
         self._live.clear()
         self._responded.clear()
@@ -23877,6 +23902,9 @@ def _apply_download_signal(
                     await download_wait()
                 except Exception:
                     LOG.warning("taskv3 download wait failed", tool=_tool_name, exc_info=True)
+                if failure_watch is not None:
+                    # A replay the wait saw held belongs in this call's result, before the model's next choice.
+                    failures.extend(failure_watch.facts.deliver())
             if failure_watch is not None:
                 failures = failure_watch.facts.deliver() + failures
                 landed = [name for name in _list_split()[0] if name not in seen_completed]

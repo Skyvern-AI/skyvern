@@ -8,6 +8,7 @@ import codecs
 import contextlib
 import copy
 import csv
+import functools
 import hashlib
 import html
 import inspect
@@ -28,7 +29,7 @@ import unicodedata
 import uuid
 import zipfile
 from collections import defaultdict, deque
-from collections.abc import AsyncIterator, Iterator, Mapping, Sequence
+from collections.abc import AsyncIterator, Coroutine, Iterator, Mapping, Sequence
 from contextvars import ContextVar
 from dataclasses import dataclass, replace
 from datetime import UTC, date, datetime, time
@@ -46,9 +47,11 @@ from typing import (
     Awaitable,
     Callable,
     ClassVar,
+    Concatenate,
     Literal,
     NamedTuple,
     NoReturn,
+    ParamSpec,
     Protocol,
     TypeVar,
     Union,
@@ -191,6 +194,7 @@ from skyvern.forge.sdk.experimentation.code_block_ai_fallback import code_block_
 from skyvern.forge.sdk.experimentation.llm_prompt_config import get_llm_handler_for_prompt_type
 from skyvern.forge.sdk.experimentation.workflow_block_engine import (
     run_honors_chosen_engine,
+    task_v3_disabled,
     workflow_block_engine_override,
 )
 from skyvern.forge.sdk.forge_log import exception_log_fields
@@ -374,7 +378,10 @@ from skyvern.webeye.browser_state import (
 from skyvern.webeye.cdp_download_interceptor import (
     ORIGINAL_FILENAME_MARKER,
     ORIGINAL_FILENAME_TEMPLATE_VARIABLE,
+    begin_replay_candidate_hold,
+    end_replay_candidate_holds,
     normalize_download_filename,
+    replay_candidate_holds,
     settle_browser_downloads_for_context,
 )
 from skyvern.webeye.navigation import (
@@ -2084,6 +2091,25 @@ def _engine_pin_is_unset(engine_pinned: bool) -> bool:
     return not engine_pinned
 
 
+_ExecuteArgs = ParamSpec("_ExecuteArgs")
+
+
+def _hold_for_start_url(browser_state: BrowserState) -> None:
+    begin_replay_candidate_hold(browser_state.browser_context)
+
+
+def _ending_start_url_holds(
+    execute: Callable[Concatenate[BaseTaskBlock, _ExecuteArgs], Coroutine[Any, Any, BlockResult]],
+) -> Callable[Concatenate[BaseTaskBlock, _ExecuteArgs], Coroutine[Any, Any, BlockResult]]:
+    @functools.wraps(execute)
+    async def ending(block: BaseTaskBlock, /, *args: _ExecuteArgs.args, **kwargs: _ExecuteArgs.kwargs) -> BlockResult:
+        # Its own frame, even inside another block's execution, so nested and parallel blocks never end each other's.
+        with replay_candidate_holds(own=True):
+            return await execute(block, *args, **kwargs)
+
+    return ending
+
+
 class BaseTaskBlock(Block):
     task_type: str = TaskType.general
     url: str | None = None
@@ -2346,6 +2372,21 @@ class BaseTaskBlock(Block):
 
         return order, retry + 1
 
+    async def _holds_start_url(self, task: Task) -> bool:
+        """Whether this block runs as a Task V3 download block, whose start URL is navigated inside its hold."""
+        if not (
+            self.complete_on_download
+            and task.workflow_run_id
+            and _task_block_supports_v3(self)
+            and self.resolve_engine(task.workflow_run_id) == RunEngine.skyvern_v3
+        ):
+            return False
+        try:
+            # The read execute_step makes, cached per run; on an error that decision stays execute_step's.
+            return not await task_v3_disabled(task.workflow_run_id or task.task_id, task.organization_id)
+        except Exception:
+            return False
+
     async def _handle_task_failure_with_error_detection(
         self,
         task: Task,
@@ -2420,6 +2461,7 @@ class BaseTaskBlock(Block):
                     task_id=task.task_id,
                 )
 
+    @_ending_start_url_holds
     async def execute(
         self,
         workflow_run_id: str,
@@ -2577,6 +2619,7 @@ class BaseTaskBlock(Block):
                 raise Exception(f"Organization is missing organization_id={workflow_run.organization_id}")
 
             browser_state: BrowserState | None = None
+            holds_start_url = await self._holds_start_url(task)
             if is_first_task:
                 # the first task block will create the browser state and do the navigation
                 try:
@@ -2589,6 +2632,8 @@ class BaseTaskBlock(Block):
                         url=_bm_url,
                         browser_session_id=browser_session_id,
                         browser_profile_id=workflow_run.browser_profile_id,
+                        # Held from just before the manager's own navigation to the start URL, on every context it uses.
+                        before_navigation=_hold_for_start_url if holds_start_url else None,
                     )
                     working_page = await browser_state.must_get_working_page()
                     # SKY-8818: for file_download we passed url=None above so the factory
@@ -2601,10 +2646,10 @@ class BaseTaskBlock(Block):
                             _is_file_download and working_page.url.rstrip("/") != self.url.rstrip("/")
                         )
                         if _needs_navigation:
+                            if holds_start_url:
+                                _hold_for_start_url(browser_state)
                             await browser_state.navigate_to_url(
-                                page=working_page,
-                                url=self.url,
-                                wait_until=_navigate_wait_until,
+                                page=working_page, url=self.url, wait_until=_navigate_wait_until
                             )
 
                     # When a browser profile is loaded, wait for the page to fully settle
@@ -2742,10 +2787,10 @@ class BaseTaskBlock(Block):
                     try:
                         # SKY-8818: use the hoisted wait_until override so file_download
                         # pages with slow subresources can still resolve via domcontentloaded.
+                        if holds_start_url:
+                            _hold_for_start_url(browser_state)
                         await browser_state.navigate_to_url(
-                            page=working_page,
-                            url=self.url,
-                            wait_until=_navigate_wait_until,
+                            page=working_page, url=self.url, wait_until=_navigate_wait_until
                         )
                     except Exception as e:
                         await self._handle_task_failure_with_error_detection(
@@ -2786,6 +2831,8 @@ class BaseTaskBlock(Block):
             finally:
                 current_context.task_id = None
                 current_context.complete_criterion_is_untrusted = previous_complete_criterion_is_untrusted
+                # After execute_step's own cleanup, so a download landing while the task is cleaned up is held too.
+                end_replay_candidate_holds()
 
             # Check task status
             updated_task = await app.DATABASE.tasks.get_task(

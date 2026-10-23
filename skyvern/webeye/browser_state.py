@@ -77,6 +77,8 @@ class BrowserState(Protocol):
         browser_address: str | None = None,
         browser_profile_id: str | None = None,
         browser_session_id: str | None = None,
+        *,
+        before_navigation: Callable[[BrowserState], None] | None = None,
     ) -> None: ...
 
     def is_connected(self) -> bool: ...
@@ -143,6 +145,7 @@ class BrowserState(Protocol):
         browser_profile_id: str | None = None,
         browser_session_id: str | None = None,
         navigation_run_id: str | None = None,
+        before_navigation: Callable[[BrowserState], None] | None = None,
     ) -> Page: ...
 
     async def list_valid_pages(self, max_pages: int = settings.BROWSER_MAX_PAGES_NUMBER) -> list[Page]: ...

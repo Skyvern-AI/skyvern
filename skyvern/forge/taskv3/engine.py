@@ -624,6 +624,7 @@ async def run_task_v3_agent_loop(
         deadline_at=deadline_at,
         activity=activity,
         download_settle=download_settle,
+        download_wait=download_wait,
         staged_downloads=staged_downloads,
         verification_blocker=verification_blocker,
         unlisted_reask=_unlisted_reask if reask_on else None,

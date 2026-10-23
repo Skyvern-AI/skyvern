@@ -4,7 +4,7 @@ import asyncio
 import functools
 import os
 import time
-from collections.abc import AsyncIterator, Iterable
+from collections.abc import AsyncIterator, Callable, Iterable
 from contextlib import asynccontextmanager, suppress
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime
@@ -1270,6 +1270,7 @@ class RealBrowserManager(BrowserManager):
         navigate: bool = True,
         browser_session_runnable_id: str | None = None,
         browser_session_runnable_generation_id: str | None = None,
+        before_navigation: Callable[[BrowserState], None] | None = None,
     ) -> BrowserState:
         parent_workflow_run_id = workflow_run.parent_workflow_run_id
         workflow_run_id = workflow_run.workflow_run_id
@@ -1471,6 +1472,8 @@ class RealBrowserManager(BrowserManager):
                 page = await browser_state.get_working_page()
                 if page:
                     if url and navigate:
+                        if before_navigation is not None:
+                            before_navigation(browser_state)
                         try:
                             await browser_state.navigate_to_url(page=page, url=url)
                         except FailedToNavigateToUrl as nav_exc:
@@ -1533,6 +1536,8 @@ class RealBrowserManager(BrowserManager):
                                 await _rebind_pbs_download_dir(browser_state, download_run_id, browser_session_id)
                             page = await browser_state.get_working_page()
                             if page is not None:
+                                if before_navigation is not None:
+                                    before_navigation(browser_state)
                                 await browser_state.navigate_to_url(page=page, url=url)
                             else:
                                 # The fresh CDP connection has no working page (e.g. the
@@ -1623,6 +1628,7 @@ class RealBrowserManager(BrowserManager):
             browser_address=workflow_run.browser_address,
             browser_profile_id=browser_profile_id,
             browser_session_id=browser_session_id,
+            before_navigation=before_navigation,
         )
         if launched_session is not None and requested_timezone_id(launched_session.browser_settings) is not None:
             await record_session_timezone_receipt(launched_session, await browser_state.get_working_page())

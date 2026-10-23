@@ -715,6 +715,8 @@ class RealBrowserState(BrowserState):
         display_recording_owner_id: str | None = None,
         reconcile_persistent_init_scripts: bool = False,
         sessionless_init_script_registrations: Collection[Any] = (),
+        *,
+        before_navigation: Callable[[BrowserState], None] | None = None,
     ) -> None:
         self._refuse_after_connection_loss()
         if self.browser_context is None:
@@ -812,6 +814,8 @@ class RealBrowserState(BrowserState):
                 await self._close_all_other_pages(discard_orphaned_videos=True)
 
             if url and not _same_page_ignoring_fragment(page.url, url):
+                if before_navigation is not None:
+                    before_navigation(self)
                 try:
                     await self.navigate_to_url(page=page, url=url)
                 finally:
@@ -1078,6 +1082,7 @@ class RealBrowserState(BrowserState):
         browser_profile_id: str | None = None,
         browser_session_id: str | None = None,
         navigation_run_id: str | None = None,
+        before_navigation: Callable[[BrowserState], None] | None = None,
     ) -> Page:
         if browser_address is not None:
             self._browser_address = browser_address
@@ -1101,6 +1106,7 @@ class RealBrowserState(BrowserState):
                 browser_address=browser_address,
                 browser_profile_id=browser_profile_id,
                 browser_session_id=browser_session_id,
+                before_navigation=before_navigation,
             )
         except Exception as e:
             # Recreating the context draws a different proxy node, and no proxy node can invent an
@@ -1128,6 +1134,7 @@ class RealBrowserState(BrowserState):
                 browser_address=browser_address,
                 browser_profile_id=browser_profile_id,
                 browser_session_id=browser_session_id,
+                before_navigation=before_navigation,
             )
         page = await self.__assert_page()
 
@@ -1148,6 +1155,7 @@ class RealBrowserState(BrowserState):
                 browser_address=browser_address,
                 browser_profile_id=browser_profile_id,
                 browser_session_id=browser_session_id,
+                before_navigation=before_navigation,
             )
             page = await self.__assert_page()
         return page
