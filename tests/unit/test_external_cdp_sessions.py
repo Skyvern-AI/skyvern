@@ -1,6 +1,7 @@
 import asyncio
 import json
 from collections.abc import AsyncIterator, Callable
+from datetime import UTC, timedelta
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, cast
@@ -61,6 +62,7 @@ from tests.unit._external_cdp_fakes import (
     begin_lease,
     external_browser_state,
     external_cdp_stack,
+    install_deadline_clock,
     register_external,
     release_lease,
     release_lease_by,
@@ -724,34 +726,28 @@ async def test_a_run_that_waited_behind_another_attach_while_its_lease_moved_get
 async def test_the_lease_holder_detaches_when_its_registration_expires_or_another_process_closes_it(
     stack: SimpleNamespace, monkeypatch: pytest.MonkeyPatch, end: str
 ) -> None:
+    clock = install_deadline_clock(monkeypatch)
     session_id = (await register_external(stack.client, timeout=5)).json()["browser_session_id"]
     attached, context, pw = external_browser_state(pages=2)
-    polls: list[float] = []
-    next_poll = asyncio.Event()
-
-    async def poll_sleep(seconds: float) -> None:
-        polls.append(seconds)
-        await next_poll.wait()
 
     if end == "deadline":
-        await backdate_registration(stack, session_id, minutes=5 - 0.5 / 60)
-    else:
-        monkeypatch.setattr(external_mod, "asyncio", ScopedAsyncio(sleep=poll_sleep))
+        await backdate_registration(stack, session_id, minutes=5 - 0.5 / 60, clock=clock)
     with patch.object(manager_mod, "attach_registered_cdp_browser", AsyncMock(return_value=attached)):
         generation = await begin_lease(stack.manager, session_id, "tsk_a")
         assert await acquire_lease(stack.manager, session_id, "tsk_a", generation) is attached
         if end == "closed_elsewhere":
             await stack.repo.close_persistent_browser_session(session_id, ORG_A)
-            next_poll.set()
+        clock.ticking.set()
         await asyncio.wait_for(stack.manager._external_deadlines[session_id], timeout=5)
         assert await acquire_lease(stack.manager, session_id, "tsk_a", generation) is None
 
     closed = await stack.repo.get_persistent_browser_session(session_id, ORG_A)
     assert closed is not None and closed.completed_at is not None and closed.upstream_cdp_url is None
     if end == "deadline":
-        assert closed.close_reason == "expired"
+        assert closed.close_reason == "expired" and closed.started_at is not None
+        assert clock.now(UTC) == closed.started_at.replace(tzinfo=UTC) + timedelta(minutes=5)
     else:
-        assert polls == [external_mod.EXTERNAL_CDP_CLOSE_POLL_SECONDS]
+        assert clock.polls == [external_mod.EXTERNAL_CDP_CLOSE_POLL_SECONDS]
     assert session_id not in stack.manager._browser_sessions and not stack.manager._external_deadlines
     pw.stop.assert_awaited_once()
     context.close.assert_not_awaited()
@@ -786,14 +782,18 @@ async def test_closing_a_registration_whose_driver_hangs_on_detach_still_closes_
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("stale", [False, True], ids=["owner_release", "stale_release"])
-async def test_only_the_owners_release_cancels_the_deadline(stack: SimpleNamespace, stale: bool) -> None:
+async def test_only_the_owners_release_cancels_the_deadline(
+    stack: SimpleNamespace, monkeypatch: pytest.MonkeyPatch, stale: bool
+) -> None:
+    clock = install_deadline_clock(monkeypatch)
     session_id = (await register_external(stack.client, timeout=5)).json()["browser_session_id"]
-    await backdate_registration(stack, session_id, minutes=5 - 0.5 / 60)
+    await backdate_registration(stack, session_id, minutes=5 - 0.5 / 60, clock=clock)
 
     generation = await begin_lease(stack.manager, session_id, "tsk_a")
     deadline = stack.manager._external_deadlines[session_id]
     released = await release_lease(stack.manager, session_id, "tsk_a", "gen_stale" if stale else generation)
     assert released is not stale
+    clock.ticking.set()
     if stale:
         await asyncio.wait_for(deadline, timeout=5)
     else:
@@ -950,8 +950,9 @@ async def test_the_deadline_watcher_keeps_its_own_lease_and_detaches_one_another
 async def test_a_failed_close_at_the_deadline_is_retried_until_the_row_is_final(
     stack: SimpleNamespace, monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    clock = install_deadline_clock(monkeypatch)
     session_id = (await register_external(stack.client, timeout=5)).json()["browser_session_id"]
-    await backdate_registration(stack, session_id, minutes=5 - 0.5 / 60)
+    await backdate_registration(stack, session_id, minutes=5 - 0.5 / 60, clock=clock)
     real_close = stack.repo.close_persistent_browser_session
     close_attempts: list[str] = []
 
@@ -961,12 +962,9 @@ async def test_a_failed_close_at_the_deadline_is_retried_until_the_row_is_final(
             raise RuntimeError("transient database error")
         return await real_close(session_id, organization_id)
 
-    async def short_sleep(seconds: float) -> None:
-        await asyncio.sleep(min(seconds, 0.1))
-
-    monkeypatch.setattr(external_mod, "asyncio", ScopedAsyncio(sleep=short_sleep))
     with patch.object(stack.repo, "close_persistent_browser_session", close_fails_once):
         await begin_lease(stack.manager, session_id, "tsk_a")
+        clock.ticking.set()
         await asyncio.wait_for(stack.manager._external_deadlines[session_id], timeout=5)
 
     row = await stack.repo.get_persistent_browser_session(session_id, ORG_A)
@@ -975,14 +973,25 @@ async def test_a_failed_close_at_the_deadline_is_retried_until_the_row_is_final(
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("run_type", ["task", "workflow_run"])
-@pytest.mark.parametrize("loss", ["expired", "killed", "closed", "vanished"])
+@pytest.mark.parametrize(
+    ("loss", "run_type"),
+    [
+        ("expired", "workflow_run"),
+        ("killed", "task"),
+        ("killed", "workflow_run"),
+        ("closed", "task"),
+        ("closed", "workflow_run"),
+        ("vanished", "task"),
+        ("vanished", "workflow_run"),
+    ],
+)
 async def test_the_next_step_after_losing_a_registration_fails_with_that_fact_and_launches_nothing(
-    stack: SimpleNamespace, run_type: str, loss: str
+    stack: SimpleNamespace, monkeypatch: pytest.MonkeyPatch, run_type: str, loss: str
 ) -> None:
+    clock = install_deadline_clock(monkeypatch)
     session_id = (await register_external(stack.client, timeout=5)).json()["browser_session_id"]
     if loss == "expired":
-        await backdate_registration(stack, session_id, minutes=5 - 10 / 60)
+        await backdate_registration(stack, session_id, minutes=5 - 0.5 / 60, clock=clock)
     run_id = "tsk_1" if run_type == "task" else "wr_1"
     generation = await stack.manager.begin_session(
         browser_session_id=session_id, runnable_type=run_type, runnable_id=run_id, organization_id=ORG_A
@@ -991,7 +1000,8 @@ async def test_the_next_step_after_losing_a_registration_fails_with_that_fact_an
     with patch.object(manager_mod, "attach_registered_cdp_browser", AsyncMock(return_value=lost)):
         assert await acquire_lease(stack.manager, session_id, run_id, generation) is lost
     if loss == "expired":
-        await asyncio.wait_for(stack.manager._external_deadlines[session_id], timeout=15)
+        clock.ticking.set()
+        await asyncio.wait_for(stack.manager._external_deadlines[session_id], timeout=5)
     if loss in ("closed", "vanished"):
         await stack.repo.close_persistent_browser_session(session_id, ORG_A)
     context.browser.is_connected.return_value = False

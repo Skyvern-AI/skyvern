@@ -65,7 +65,6 @@ import { stringify as toYaml } from "yaml";
 
 import type { BlockYAML } from "@/routes/workflows/types/workflowYamlTypes";
 import { snapshotOf } from "@/routes/workflows/editor/workflowChangesSummary";
-import { useRecordingStore } from "@/store/useRecordingStore";
 import {
   SaveRefusedError,
   SaveStaleError,
@@ -405,7 +404,6 @@ describe("SaveButton confirmation gating", () => {
       authoringInProgress: false,
       copilotAcceptance: null,
     });
-    useRecordingStore.setState({ isRecording: false });
   });
 
   test.each([
@@ -693,7 +691,6 @@ describe("TitleSection title link + edit affordance", () => {
     });
     useWorkflowTitleStore.setState({ title: "My Workflow" });
     useWorkflowHasChangesStore.setState({ hasChanges: false });
-    useRecordingStore.setState({ isRecording: false });
   });
 
   function AutoTitleGenerator() {

@@ -1,4 +1,4 @@
-import { StrictMode, type ComponentProps } from "react";
+import { type ComponentProps } from "react";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import {
   act,
@@ -94,26 +94,12 @@ const mocks = vi.hoisted(() => {
     setIsUsingABrowser: vi.fn(),
   };
 
-  const recordingStore = {
-    add: vi.fn(),
-    applyInterpretationUpdate: vi.fn(),
-    compressedChunks: [],
-    draftEditDepth: 0,
-    getEventCount: vi.fn(() => 0),
-    getSecondsRecording: vi.fn(() => 0),
-    isRecording: false,
-    pendingEvents: [],
-    reset: vi.fn(),
-    setIsRecording: vi.fn(),
-  };
-
   return {
     MockRFB,
     MockWebSocket,
     apiGet,
     autoConnect,
     rfbInstances,
-    recordingStore,
     wsInstances,
     settingsStore,
     toast: vi.fn(),
@@ -197,29 +183,9 @@ vi.mock("@/store/SettingsStore", () => ({
   useSettingsStore: () => mocks.settingsStore,
 }));
 
-vi.mock("@/components/RecordingPill", () => ({
-  RecordingPill: () => null,
-}));
-
 vi.mock("@/components/ui/use-toast", () => ({
   toast: mocks.toast,
 }));
-
-vi.mock("@/store/useRecordingStore", () => {
-  // Honor the selector: BrowserStream reads slices (e.g. state.isRecording) via
-  // useRecordingStore(selector). Ignoring the selector and returning the whole
-  // store makes primitive selectors yield the store object instead of the field
-  // value — truthy where a boolean was expected — spuriously rendering the
-  // recording UI.
-  const useRecordingStore = (
-    selector?: (state: typeof mocks.recordingStore) => unknown,
-  ) => (selector ? selector(mocks.recordingStore) : mocks.recordingStore);
-  useRecordingStore.getState = () => mocks.recordingStore;
-  return {
-    useRecordingStore,
-    countVisibleDraftSteps: (steps: Array<unknown> = []) => steps.length,
-  };
-});
 
 const respondWithRunningSession = mocks.apiGet.getMockImplementation()!;
 
@@ -290,26 +256,6 @@ function renderBrowserStream(
       />
     </QueryClientProvider>,
   );
-}
-
-function renderWithRecordingReset(
-  resetRecordingOnUnmount: boolean | undefined,
-  { strict = false }: { strict?: boolean } = {},
-) {
-  const queryClient = new QueryClient({
-    defaultOptions: { queries: { retry: false } },
-  });
-  const tree = (
-    <QueryClientProvider client={queryClient}>
-      <BrowserStream
-        browserSessionId="pbs_test"
-        interactive={false}
-        showControlButtons={true}
-        resetRecordingOnUnmount={resetRecordingOnUnmount}
-      />
-    </QueryClientProvider>
-  );
-  return render(strict ? <StrictMode>{tree}</StrictMode> : tree);
 }
 
 function renderBrowserSession() {
@@ -761,28 +707,6 @@ describe("BrowserStream", () => {
     expect(rfb.sendKey).toHaveBeenCalledWith(0x0076, "KeyV", true);
   });
 
-  it("offers no control bar while recording holds control", async () => {
-    mocks.recordingStore.isRecording = true;
-    try {
-      const { container } = renderBrowserStream();
-      await waitFor(
-        () =>
-          expect(
-            container
-              .querySelector(".browser-stream")
-              ?.classList.contains("user-is-controlling"),
-          ).toBe(true),
-        { timeout: 10000 },
-      );
-      await screen.findByTestId("browser-stream-overlay");
-      expect(
-        screen.queryByRole("button", { name: /stop controlling/i }),
-      ).toBeNull();
-    } finally {
-      mocks.recordingStore.isRecording = false;
-    }
-  });
-
   it("takes control on a click anywhere on the read-only picture, not just the button", async () => {
     const { container } = renderBrowserStream();
     await screen.findByRole(
@@ -1209,46 +1133,6 @@ describe("BrowserStream", () => {
         "stopped",
         "pbs_test",
       );
-    });
-  });
-
-  describe("recording reset lifecycle", () => {
-    it("resets the recording store on unmount by default", async () => {
-      const { unmount } = renderWithRecordingReset(undefined);
-      await waitFor(() => expect(mocks.rfbInstances).toHaveLength(1));
-
-      expect(mocks.recordingStore.reset).not.toHaveBeenCalled();
-      unmount();
-      expect(mocks.recordingStore.reset).toHaveBeenCalledTimes(1);
-    });
-
-    it("does not reset the recording store on unmount when opted out", async () => {
-      const { unmount } = renderWithRecordingReset(false);
-      await waitFor(() => expect(mocks.rfbInstances).toHaveLength(1));
-
-      unmount();
-      expect(mocks.recordingStore.reset).not.toHaveBeenCalled();
-    });
-
-    // Pins that StrictMode's transient unmount really fires the cleanup in this
-    // environment, so the opt-out test below cannot pass vacuously.
-    it("runs the unmount cleanup on a StrictMode double-mount by default", async () => {
-      renderWithRecordingReset(undefined, { strict: true });
-      await waitFor(() =>
-        expect(mocks.recordingStore.reset).toHaveBeenCalledTimes(1),
-      );
-    });
-
-    // The local repro: StrictMode remounts the fresh VNC stream (mount -> unmount
-    // -> mount) the instant recording starts. The transient unmount must not
-    // clear the recording that just began.
-    it("survives a StrictMode double-mount when opted out", async () => {
-      renderWithRecordingReset(false, { strict: true });
-      await waitFor(() =>
-        expect(mocks.rfbInstances.length).toBeGreaterThanOrEqual(1),
-      );
-
-      expect(mocks.recordingStore.reset).not.toHaveBeenCalled();
     });
   });
 });

@@ -13,7 +13,6 @@ import {
 
 export type WorkflowCreateYAMLRequest = {
   title: string;
-  recording_id?: string | null;
   description?: string | null;
   proxy_location?: ProxyLocation | null;
   webhook_callback_url?: string | null;

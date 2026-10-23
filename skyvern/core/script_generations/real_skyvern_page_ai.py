@@ -59,6 +59,7 @@ from skyvern.webeye.actions.handler import (
 )
 from skyvern.webeye.actions.parse_actions import parse_actions
 from skyvern.webeye.actions.responses import ActionAbort, ActionResult
+from skyvern.webeye.browser_state import raise_if_browser_connection_lost
 from skyvern.webeye.scraper.scraped_page import ScrapedPage
 
 jinja_sandbox_env = SandboxedEnvironment()
@@ -191,9 +192,16 @@ class RealSkyvernPageAi(SkyvernPageAi):
         self.page = page
         self.current_label: str | None = None
 
+    def _raise_if_browser_connection_lost(self) -> None:
+        context = skyvern_context.current()
+        raise_if_browser_connection_lost(
+            self.scraped_page._browser_state, workflow_run_id=context.workflow_run_id if context else None
+        )
+
     async def _refresh_scraped_page(
         self, take_screenshots: bool = True, max_retries: int = SKYVERN_PAGE_MAX_SCRAPING_RETRIES
     ) -> None:
+        self._raise_if_browser_connection_lost()
         self.scraped_page = await self.scraped_page.generate_scraped_page(
             take_screenshots=take_screenshots, max_retries=max_retries
         )
@@ -372,6 +380,7 @@ class RealSkyvernPageAi(SkyvernPageAi):
                 exc_info=True,
             )
 
+        self._raise_if_browser_connection_lost()
         if selector:
             locator = self.page.locator(selector)
             await locator.click(timeout=timeout)
@@ -395,6 +404,7 @@ class RealSkyvernPageAi(SkyvernPageAi):
         v3_parent_episode_id: str | None = None,
     ) -> str:
         """Input text into an element using AI to determine the value."""
+        self._raise_if_browser_connection_lost()
         sensitive_value = value if value_is_sensitive else None
 
         # v3 mid-run hook — see ai_click for the contract.
@@ -534,6 +544,7 @@ class RealSkyvernPageAi(SkyvernPageAi):
             except Exception:
                 LOG.exception("Failed to adapt value for input text action", selector=selector)
 
+        self._raise_if_browser_connection_lost()
         if action and organization_id and task and step:
             result = await handle_input_text_action_direct(action, self.page, self.scraped_page, task, step)
             if result and result[-1].success is False:
@@ -658,6 +669,7 @@ class RealSkyvernPageAi(SkyvernPageAi):
             except Exception:
                 LOG.exception(f"Failed to adapt value for upload file action on selector={selector}, file={files}")
 
+        self._raise_if_browser_connection_lost()
         if action and original_files and action.file_url and action.file_url != original_files:
             LOG.warning(
                 "LLM returned a different file url than the user provided, using the original",
@@ -757,6 +769,7 @@ class RealSkyvernPageAi(SkyvernPageAi):
                         exc_info=True,
                     )
 
+        self._raise_if_browser_connection_lost()
         if not selector:
             raise SkyvernActionFailed(
                 f"Select option failed and no fallback selector available for intention: {intention}"

@@ -134,6 +134,7 @@ export type StepApiResponse = {
   retry_index: number;
   status: Status;
   step_cost: number;
+  created_by?: string | null;
 };
 
 export type Task = {

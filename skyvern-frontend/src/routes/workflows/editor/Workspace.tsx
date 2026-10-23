@@ -22,7 +22,6 @@ import {
   createYamlCommitOwner,
   finishYamlCommit,
   isYamlCommitOwnerCurrent,
-  runWorkflowAuthoringAction,
   refuseMutationDuringYamlCommit,
   selectSaveLockReason,
   type YamlCommitOwner,
@@ -57,6 +56,7 @@ import {
   useSearchParams,
 } from "react-router-dom";
 import { useWorkflowPermanentId } from "@/routes/workflows/WorkflowPermanentIdContext";
+import { takeSopHandoffFile } from "@/routes/workflows/sopHandoff";
 import { useReactFlow, Edge } from "@xyflow/react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { usePostHog } from "posthog-js/react";
@@ -92,7 +92,6 @@ import {
 import { useBlockScriptStore } from "@/store/BlockScriptStore";
 import { useBlockSidebarWidthStore } from "@/store/BlockSidebarWidthStore";
 import { useCacheKeyValueStore } from "@/store/CacheKeyValueStore";
-import { useRecordingStore } from "@/store/useRecordingStore";
 import { useWorkflowSettingsStore } from "@/store/WorkflowSettingsStore";
 import { useStudioPaneDefaults } from "../studio/StudioPaneDefaultsContext";
 import { useCopilotActionStore } from "@/store/useCopilotActionStore";
@@ -125,9 +124,6 @@ import { useLogging } from "@/hooks/useLogging";
 import { ConfirmDialog } from "@/components/ui/confirm-dialog";
 import { AffectedBlocksNotice } from "./AffectedBlocksNotice";
 import { BrowserStream } from "@/components/BrowserStream";
-import { useApplyRecordedBlocks } from "@/routes/workflows/editor/recording/useApplyRecordedBlocks";
-import { PendingRecordingStartDialog } from "@/routes/workflows/editor/recording/PendingRecordingStartDialog";
-import { requestRecordingStart } from "@/routes/workflows/editor/recording/pendingRecordingStartGate";
 import {
   runIsLogicallyFinal,
   runIsExecuting,
@@ -143,7 +139,6 @@ import {
 } from "@/store/WorkflowPanelStore";
 import {
   reflectYamlDraftDirtiness,
-  reloadConflictedWorkflow,
   useWorkflowHasChangesStore,
   usePendingWorkflowSaveRecovery,
   useWorkflowSave,
@@ -257,13 +252,13 @@ import {
 import { useStudioShellContext } from "../studio/StudioShellContext";
 import { StudioShellPanelPortal } from "../studio/StudioShellPanelPortal";
 import { useRecordingLauncherStore } from "@/store/useRecordingLauncherStore";
-import { useFeatureFlag } from "@/hooks/useFeatureFlag";
-import { WORKFLOW_COPILOT_DEMONSTRATION_FLAG } from "@/util/featureFlags";
 import type { CopilotAttachedFile } from "@/routes/workflows/copilot/workflowCopilotTypes";
 import {
   demonstrationInsertionFromNodes,
   resolveAppendInsertionPoint,
   resolveWorkspaceAuthoringActionAvailability,
+  sopAttachmentDraft,
+  stageSopFile,
 } from "./workspaceAuthoringActions";
 import { paneWidthsKey } from "../studio/paneLayout";
 import { useStudioPanes } from "../studio/useStudioPanes";
@@ -325,9 +320,7 @@ function readCopilotProductAction(value: unknown): CopilotProductAction | null {
       nonce: candidate.nonce,
     };
   }
-  return candidate.kind === "refine_recording"
-    ? { kind: "refine_recording", nonce: candidate.nonce }
-    : null;
+  return null;
 }
 
 function getAxiosErrorDetail(error: unknown): string | undefined {
@@ -899,7 +892,6 @@ function Workspace({
   const [shouldFetchDebugSession, setShouldFetchDebugSession] = useState(false);
   const [isCopilotTurnActive, setIsCopilotTurnActive] = useState(false);
   const blockScriptStore = useBlockScriptStore();
-  const recordingStore = useRecordingStore();
   const finallyBlockLabel = useWorkflowSettingsStore(
     (state) => state.finallyBlockLabel,
   );
@@ -983,7 +975,6 @@ function Workspace({
 
   // Undo/redo keyboard shortcuts. Skip when the user is typing inside an
   // editable element so the browser's native per-input undo keeps working.
-  const isRecording = recordingStore.isRecording;
   // macOS users expect Cmd+Y to be browser "History Forward" (some apps
   // bind it to "Redo Typing"), so we only honour Ctrl+Y on non-Mac.
   // Memoized so the platform sniff runs exactly once per mount.
@@ -1003,9 +994,6 @@ function Workspace({
     };
 
     const handleKeyDown = (event: KeyboardEvent) => {
-      // Recording owns the editor - don't let hotkeys mutate state behind
-      // the disabled toolbar buttons.
-      if (isRecording) return;
       // IME composition (CJK, accents) fires keydown events we must not
       // intercept - those belong to the composition flow.
       if (event.isComposing) return;
@@ -1037,7 +1025,7 @@ function Workspace({
     return () => {
       document.removeEventListener("keydown", handleKeyDown);
     };
-  }, [undoWorkflowEdit, redoWorkflowEdit, isRecording, isMac]);
+  }, [undoWorkflowEdit, redoWorkflowEdit, isMac]);
 
   const { data: blockScriptsPublished } = useBlockScriptsQuery({
     cacheKey,
@@ -1228,17 +1216,6 @@ function Workspace({
     (!activeDebugSession || activeDebugSession.vnc_streaming_supported);
   const showCdpBrowserPanel =
     isCdpStreamingMode && shouldFetchDebugSession && !isRateLimited;
-  // Recording is session-scoped: the stream opts out of reset-on-unmount (it can
-  // remount while the session persists), so the debug session owns the reset
-  // here — embedded, StudioBrowserStream owns it. The id guard keeps the
-  // null -> first-id transition from clearing a recording that started before
-  // the session resolved.
-  useEffect(() => {
-    if (embedded || !debugBrowserSessionId) {
-      return;
-    }
-    return () => useRecordingStore.getState().reset();
-  }, [embedded, debugBrowserSessionId]);
   // Embedded: the shell owns the stream, so bind the copilot once the backend
   // session exists — else it gets a null id and the backend spins a separate browser.
   const copilotRequiresLiveBrowser =
@@ -1776,29 +1753,9 @@ function Workspace({
     [setNodes, setEdges, blockLabel],
   );
 
-  useApplyRecordedBlocks({
-    // Recording runs in the debugger (build + showBrowser), not only on /edit.
-    enabled: !workflowPanelState.data?.showComparison,
-    nodes,
-    edges,
-    doLayout,
-  });
-
-  // Studio entry point for recording: the Browser-tab Record button lives outside
-  // the canvas, so the canvas-aware Workspace registers a launcher that resolves
-  // the append-at-end insertion point (the trailing top-level NodeAdder, same as
-  // clicking its "+") and starts recording. MVP only appends at the end.
-  const setStartRecordingAtEnd = useRecordingLauncherStore(
-    (s) => s.setStartRecordingAtEnd,
-  );
   const startDemonstration = useRecordingLauncherStore(
     (s) => s.startDemonstration,
   );
-  const demonstrationEnabled =
-    useFeatureFlag(WORKFLOW_COPILOT_DEMONSTRATION_FLAG) === true;
-  // Stable action ref (vs the whole-store `recordingStore` object, which gets a
-  // new reference on every store write and would re-register the launcher).
-  const setIsRecording = useRecordingStore((s) => s.setIsRecording);
   const getAppendInsertionPoint = useCallback(() => {
     return resolveAppendInsertionPoint(
       getNodes() as Array<AppNode>,
@@ -1814,16 +1771,7 @@ function Workspace({
       isComparing: Boolean(workflowPanelState.data?.showComparison),
       isEditingYaml: yamlEditorActive,
       hasFinallyBlock: Boolean(finallyBlockLabel),
-      isRecording:
-        recordingStore.isRecording ||
-        recordingStore.finishRequested ||
-        recordingStore.isCommitting,
     });
-  // A deferred start runs after a save; the browser may have stopped being ready.
-  const canRecordTaskRef = useRef(authoringActionAvailability.canRecordTask);
-  useEffect(() => {
-    canRecordTaskRef.current = authoringActionAvailability.canRecordTask;
-  }, [authoringActionAvailability.canRecordTask]);
   const [, setRecordSearchParams] = useSearchParams();
   const autoRecordRequested = searchParams.get("record") === "1";
   const authoringBlocked = useWorkflowYamlEditorStore(
@@ -1834,27 +1782,13 @@ function Workspace({
   );
   const startRecordingAtEnd = useCallback(() => {
     if (!authoringActionAvailability.canRecordTask) return;
-    if (demonstrationEnabled) {
-      if (!startDemonstration) return;
-      const insertion = demonstrationInsertionFromNodes(
-        getNodes() as Array<AppNode>,
-        getAppendInsertionPoint(),
-      );
-      if (!insertion) return;
-      startDemonstration({ insertion });
-      if (autoRecordRequested) {
-        setRecordSearchParams(
-          (current) => {
-            const next = new URLSearchParams(current);
-            next.delete("record");
-            return next;
-          },
-          { replace: true },
-        );
-      }
-      return;
-    }
-    // Consume ?record=1 up front so a dismissed prompt does not re-fire auto-record.
+    if (!startDemonstration) return;
+    const insertion = demonstrationInsertionFromNodes(
+      getNodes() as Array<AppNode>,
+      getAppendInsertionPoint(),
+    );
+    if (!insertion) return;
+    startDemonstration({ insertion });
     if (autoRecordRequested) {
       setRecordSearchParams(
         (current) => {
@@ -1865,38 +1799,11 @@ function Workspace({
         { replace: true },
       );
     }
-    requestRecordingStart(
-      () =>
-        void runWorkflowAuthoringAction(() => {
-          const insertionPoint = getAppendInsertionPoint();
-          setWorkflowPanelState({
-            active: false,
-            content: "nodeLibrary",
-            data: {
-              previous: insertionPoint.previous,
-              next: insertionPoint.next,
-              parent: undefined,
-              connectingEdgeType: "default",
-            },
-          });
-          setIsRecording(true, {
-            workflowPermanentId: workflowPermanentId ?? null,
-            browserSessionId: debugBrowserSessionId,
-          });
-        }),
-      autoRecordRequested ? "auto_record" : "launcher",
-      { isStillValid: () => canRecordTaskRef.current },
-    );
   }, [
     getAppendInsertionPoint,
-    setWorkflowPanelState,
-    setIsRecording,
-    workflowPermanentId,
-    debugBrowserSessionId,
     authoringActionAvailability.canRecordTask,
     autoRecordRequested,
     setRecordSearchParams,
-    demonstrationEnabled,
     startDemonstration,
     getNodes,
   ]);
@@ -1916,26 +1823,54 @@ function Workspace({
     authoringBlocked,
     startRecordingAtEnd,
   ]);
+  // `/discover`'s "Upload an SOP" lands here with ?sop=1; stage the PDF in Copilot once its
+  // composer can take a file.
+  const sopHandoffRequested = searchParams.get("sop") === "1";
+  const sopHandoffHandledRef = useRef(false);
+  // A boolean, not the function: the chat re-registers the stager whenever its callbacks change,
+  // and subscribing to the identity would re-render this component into a loop.
+  const copilotCanStageAttachment = useCopilotActionStore(
+    (state) => state.stageAttachment !== null,
+  );
   useEffect(() => {
-    if (!embedded) {
+    if (
+      !sopHandoffRequested ||
+      sopHandoffHandledRef.current ||
+      !copilotCanStageAttachment
+    ) {
       return;
     }
-    setStartRecordingAtEnd(
-      authoringActionAvailability.canRecordTask &&
-        (!demonstrationEnabled || startDemonstration)
-        ? startRecordingAtEnd
-        : null,
-    );
-    return () => setStartRecordingAtEnd(null);
+    // Deferred past the mount commit: an upload started inside it is detached from its
+    // observer by StrictMode's simulated remount and reports pending forever.
+    const timer = window.setTimeout(() => {
+      sopHandoffHandledRef.current = true;
+      const file = takeSopHandoffFile(workflow.workflow_permanent_id);
+      if (file) stageSopFile(file, sopAttachmentDraft());
+      else
+        toast({
+          variant: "destructive",
+          title: "SOP not received",
+          description:
+            "The PDF did not reach the editor. Use Upload an SOP in the Copilot panel to try again.",
+        });
+      // After staging: opening the Copilot pane navigates with the current URL, which would
+      // put the marker back if it ran after this rewrite.
+      setRecordSearchParams(
+        (current) => {
+          const next = new URLSearchParams(current);
+          next.delete("sop");
+          return next;
+        },
+        { replace: true },
+      );
+    }, 0);
+    return () => window.clearTimeout(timer);
   }, [
-    authoringActionAvailability.canRecordTask,
-    embedded,
-    startRecordingAtEnd,
-    setStartRecordingAtEnd,
-    demonstrationEnabled,
-    startDemonstration,
+    sopHandoffRequested,
+    copilotCanStageAttachment,
+    setRecordSearchParams,
+    workflow.workflow_permanent_id,
   ]);
-
   // Listen for conditional branch changes to trigger re-layout
   useEffect(() => {
     const handleBranchChange = () => {
@@ -2768,11 +2703,6 @@ function Workspace({
         </DialogContent>
       </Dialog>
 
-      <PendingRecordingStartDialog
-        onSave={handleOnSave}
-        onDiscard={() => reloadConflictedWorkflow(workflow)}
-      />
-
       {/* header panel */}
       {!embedded && (
         <div
@@ -3169,9 +3099,7 @@ function Workspace({
                   {
                     "translate-x-0": showAllCode,
                   },
-                  recordingStore.isRecording && "pointer-events-none invisible",
                 )}
-                aria-hidden={recordingStore.isRecording}
                 ref={dom.splitLeft}
               >
                 {/* code */}
@@ -3286,22 +3214,12 @@ function Workspace({
                             }}
                           />
                         )
-                      ) : isFlowCanvasReady || recordingStore.isRecording ? (
+                      ) : isFlowCanvasReady ? (
                         <BrowserStream
                           key={displayBrowserSessionId}
-                          exfiltrate={
-                            recordingStore.isRecording &&
-                            !recordingStore.finishRequested
-                          }
                           interactive={true}
                           browserSessionId={displayBrowserSessionId}
                           showControlButtons={true}
-                          // The recording panel overlays the canvas whenever a
-                          // recording is live here, so the REC pill is redundant.
-                          hideRecordingIndicator={true}
-                          // Remounts across the CDP<->VNC recording swap; the
-                          // debug session owns the recording reset.
-                          resetRecordingOnUnmount={false}
                           resizeTrigger={windowResizeTrigger}
                           isExecuting={
                             !!workflowRun && runIsExecuting(workflowRun)
@@ -3336,12 +3254,10 @@ function Workspace({
                           "mr-16": !blockLabel,
                         })}
                       >
-                        {!recordingStore.isRecording &&
-                          showPowerButton &&
-                          !isRateLimited && (
-                            <PowerButton onClick={() => cycle()} />
-                          )}
-                        {!recordingStore.isRecording && !isRateLimited && (
+                        {showPowerButton && !isRateLimited && (
+                          <PowerButton onClick={() => cycle()} />
+                        )}
+                        {!isRateLimited && (
                           <ReloadButton
                             isReloading={isReloading}
                             onClick={() => reload()}
@@ -3370,7 +3286,7 @@ function Workspace({
                             }}
                           />
                         )
-                      ) : isFlowCanvasReady || recordingStore.isRecording ? (
+                      ) : isFlowCanvasReady ? (
                         <BrowserSessionStream
                           browserSessionId={displayBrowserSessionId}
                           interactive={true}
@@ -3380,15 +3296,6 @@ function Workspace({
                           // to type into and a session resting on about:blank has
                           // no way out (SKY-13705).
                           enableUrlInput={true}
-                          // A defined value starts recording capture; undefined
-                          // leaves the message channel open only while the user is
-                          // in control.
-                          exfiltrate={
-                            recordingStore.isRecording
-                              ? !recordingStore.finishRequested
-                              : undefined
-                          }
-                          workflowPermanentId={workflowPermanentId ?? null}
                           onReadyChange={handleLiveBrowserReadyChange}
                         />
                       ) : (
@@ -3419,15 +3326,13 @@ function Workspace({
                           "mr-16": !blockLabel,
                         })}
                       >
-                        {!recordingStore.isRecording && showPowerButton && (
+                        {showPowerButton && (
                           <PowerButton onClick={() => cycle()} />
                         )}
-                        {!recordingStore.isRecording && (
-                          <ReloadButton
-                            isReloading={isReloading}
-                            onClick={() => reload()}
-                          />
-                        )}
+                        <ReloadButton
+                          isReloading={isReloading}
+                          onClick={() => reload()}
+                        />
                       </div>
                     </footer>
                   </div>
@@ -3584,6 +3489,7 @@ function Workspace({
           onRequestOpen={openCopilot}
           onRecordTask={startRecordingAtEnd}
           canRecordTask={authoringActionAvailability.canRecordTask}
+          runOwnsBrowser={Boolean(viewerState?.active_run_session_id)}
           authoringUnavailableReason={
             authoringActionAvailability.unavailableReason
           }

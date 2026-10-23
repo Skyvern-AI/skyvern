@@ -60,6 +60,7 @@ class TestMCPFrameTools:
         assert result["error"]["code"] == mcp_browser.ErrorCode.NO_ACTIVE_BROWSER
 
     @pytest.mark.asyncio
+    @pytest.mark.usefixtures("public_dns")
     async def test_navigate_clears_working_frame(self, monkeypatch: pytest.MonkeyPatch) -> None:
         """skyvern_navigate must clear _working_frame to prevent stale frame references."""
         from skyvern.cli.core.session_manager import SessionState
@@ -85,6 +86,7 @@ class TestMCPFrameTools:
         assert state._working_frame is None
 
     @pytest.mark.asyncio
+    @pytest.mark.usefixtures("public_dns")
     async def test_navigate_clears_frame_on_failure(self, monkeypatch: pytest.MonkeyPatch) -> None:
         """Frame state must be cleared even when navigation fails (partial load may destroy iframes)."""
         from skyvern.cli.core.session_manager import SessionState

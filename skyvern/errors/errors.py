@@ -1,5 +1,6 @@
+from collections.abc import Sequence
 from enum import StrEnum
-from typing import Literal
+from typing import Any, Literal
 
 from pydantic import BaseModel, Field, PrivateAttr, field_validator
 
@@ -57,14 +58,14 @@ def filter_to_user_defined_codes(
     """
     if not error_code_mapping:
         return [], [error.error_code for error in errors]
-    allowed = set(error_code_mapping.keys())
     kept: list[UserDefinedError] = []
     dropped: list[str] = []
     for error in errors:
-        if error.error_code in allowed:
-            kept.append(error)
-        else:
+        key = resolve_error_code_mapping_key(error.error_code, error_code_mapping)
+        if key is None:
             dropped.append(error.error_code)
+        else:
+            kept.append(error if key == error.error_code else error.model_copy(update={"error_code": key}))
     return kept, dropped
 
 
@@ -76,6 +77,23 @@ def resolve_error_code_mapping_key(code: object, error_code_mapping: dict[str, s
         return code
     matches = [key for key in error_code_mapping if key.lower() == code.lower()]
     return matches[0] if len(matches) == 1 else None
+
+
+BROWSER_DOWNLOAD_PARTIAL_FAILURE_CODE = "BROWSER_DOWNLOAD_PARTIAL_FAILURE"
+
+
+def drop_unsolicited_download_errors(
+    errors: list[dict[str, Any]],
+    *,
+    downloaded_files: Sequence[object] | None,
+) -> list[dict[str, Any]]:
+    """Keep the unsolicited-download failure only when a file lookup confirms that none landed.
+
+    ``None`` means the caller never fetched the files, so it cannot support the failure's no-file claim.
+    """
+    if downloaded_files is not None and not downloaded_files:
+        return errors
+    return [error for error in errors if error.get("error_code") != BROWSER_DOWNLOAD_PARTIAL_FAILURE_CODE]
 
 
 class SkyvernDefinedError(BaseModel):
@@ -121,6 +139,14 @@ class TimeoutGetTOTPVerificationCodeError(SkyvernDefinedError):
 class TOTPExpiredError(SkyvernDefinedError):
     error_code: str = "OTP_EXPIRED"
     reasoning: str = "TOTP verification code has expired during multi-field input sequence."
+
+
+class OTPOutcomeUnconfirmedError(SkyvernDefinedError):
+    error_code: str = "OTP_OUTCOME_UNCONFIRMED"
+    reasoning: str = (
+        "The one-time code was entered, but the site did not confirm whether it was accepted before the page load "
+        "timeout. The same code was not entered again."
+    )
 
 
 class MissingTOTPSourceError(SkyvernDefinedError):

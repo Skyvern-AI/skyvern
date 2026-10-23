@@ -92,6 +92,7 @@ TAG_KEY_PREFIX = "tkey"
 TAG_VALUE_PREFIX = "tval"
 UPLOADED_FILE_PREFIX = "file"
 RUN_FEEDBACK_PREFIX = "fb"
+AGENT_FEEDBACK_PREFIX = "afb"
 
 
 def generate_workflow_id() -> str:
@@ -312,6 +313,11 @@ def generate_uploaded_file_id() -> str:
 def generate_run_feedback_id() -> str:
     int_id = generate_id()
     return f"{RUN_FEEDBACK_PREFIX}_{int_id}"
+
+
+def generate_agent_feedback_id() -> str:
+    int_id = generate_id()
+    return f"{AGENT_FEEDBACK_PREFIX}_{int_id}"
 
 
 def generate_gmail_send_dispatch_id() -> str:

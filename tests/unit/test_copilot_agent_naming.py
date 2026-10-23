@@ -285,7 +285,6 @@ async def test_a_newer_version_wins_the_race(repo: WorkflowsRepository, title_ll
         ),
         (_policy(canonical_user_message="   "), None),
         (_policy(), "diagnose_run"),
-        (_policy(), "refine_recording"),
         (_policy(), "test_end_to_end"),
     ],
 )

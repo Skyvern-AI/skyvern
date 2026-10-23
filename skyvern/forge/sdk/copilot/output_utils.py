@@ -2014,9 +2014,9 @@ _HEADERS_BLOB_RE = re.compile(r"\s*headers:\s*\{[^{}]*\}\s*", re.IGNORECASE)
 _LARGE_DICT_BLOB_RE = re.compile(r"\{[^{}]{40,}\}")
 # Every credential-shaped id prefix in skyvern/forge/sdk/db/id.py, so a new one does
 # not quietly become renderable: cred, the vault/parameter kinds, folders, OAuth,
-# and run credential selections.
+# and run credential selections, plus Copilot's connected-vault login ids.
 _CREDENTIAL_ID_RE = re.compile(
-    r"`?\b(?:cred|cp|cfld|blc|bccd|bsi|opp|azcp|asp|goac|moac|wrcs)_[A-Za-z0-9][A-Za-z0-9_-]*`?"
+    r"`?\b(?:cred|cp|cfld|blc|bccd|bsi|opp|azcp|asp|goac|moac|wrcs|bwitem)_[A-Za-z0-9][A-Za-z0-9_-]*`?"
 )
 # Punctuation an LLM-authored block label may keep. Everything outside this set and
 # the letter/digit categories becomes a space: a whitelist, because any quote-class
@@ -2210,15 +2210,17 @@ def summarize_tool_result(tool_name: str, result: dict[str, Any], *, for_display
         return ran
     if tool_name == "list_credentials":
         if data.get("status") == "resolved":
-            credential = data.get("credential")
-            if isinstance(credential, dict):
-                name = credential.get("name")
+            match = data.get("credential") or data.get("vault_login")
+            if isinstance(match, dict):
+                name = match.get("name") or match.get("title")
                 if isinstance(name, str) and name:
                     safe_name = sanitize_block_label_for_display(name)
                     if safe_name:
                         return f"Found 1 credential: {safe_name}"
                 return "Found 1 credential(s)"
-        return f"Found {data.get('count', 0)} credential(s)"
+        vault_logins = data.get("vault_logins")
+        count = data.get("count", 0) + (len(vault_logins) if isinstance(vault_logins, list) else 0)
+        return f"Found {count} credential(s)"
     if tool_name == "list_integrations":
         return f"Found {data.get('count', 0)} connected integration(s)"
     if tool_name == "read_google_sheet":

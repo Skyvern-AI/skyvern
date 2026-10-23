@@ -770,6 +770,7 @@ class TestHttpRequestBlockCredentialSiteConfinement:
         requested.assert_not_called()
 
     @pytest.mark.asyncio
+    @pytest.mark.usefixtures("public_dns")
     async def test_execute_holds_a_same_site_file_fetch_to_the_credential_site(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
@@ -797,6 +798,7 @@ class TestHttpRequestBlockCredentialSiteConfinement:
         assert authorize("https://collector.example.net/collect") is False
 
     @pytest.mark.asyncio
+    @pytest.mark.usefixtures("public_dns")
     async def test_execute_confines_only_the_file_entry_that_references_the_credential(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
@@ -827,6 +829,7 @@ class TestHttpRequestBlockCredentialSiteConfinement:
         assert authorize("https://collector.example.net/x") is False
 
     @pytest.mark.asyncio
+    @pytest.mark.usefixtures("public_dns")
     async def test_execute_renders_a_templated_file_field_name_and_keeps_its_entry_confined(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:

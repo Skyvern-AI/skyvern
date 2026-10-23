@@ -24,6 +24,7 @@ class BitwardenCredentialVaultService(CredentialVaultService):
         organization_id: str,
         data: CreateCredentialRequest,
         created_by: str | None = None,
+        is_passkey_setup_pending: bool = False,
     ) -> Credential:
         org_collection = await app.DATABASE.credentials.get_organization_bitwarden_collection(organization_id)
 
@@ -52,6 +53,7 @@ class BitwardenCredentialVaultService(CredentialVaultService):
             item_id=item_id,
             vault_type=CredentialVaultType.BITWARDEN,
             created_by=created_by,
+            is_passkey_setup_pending=is_passkey_setup_pending,
         )
 
         return credential

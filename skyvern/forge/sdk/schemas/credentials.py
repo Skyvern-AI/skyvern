@@ -428,6 +428,7 @@ class BitwardenItemOverview(BaseModel):
     )
     credential_type: CredentialType = Field(..., description="The item's credential type")
     url: str | None = Field(default=None, description="The primary website URL associated with the item, if any")
+    urls: list[str] = Field(default_factory=list, exclude=True, description="Every website URL saved on the item")
 
 
 class BitwardenItemsResponse(BaseModel):
@@ -497,6 +498,8 @@ class Credential(BaseModel):
         default=None,
         description="ID of the credential folder this credential belongs to, if any",
     )
+    is_test_login_temporary: bool | None = Field(default=None, exclude=True)
+    is_passkey_setup_pending: bool | None = Field(default=None, exclude=True)
     proxy_location: ProxyLocationInput = Field(
         default=None,
         description="Optional proxy location used for the credential's pinned proxy identity.",

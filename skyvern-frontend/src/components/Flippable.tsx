@@ -1,6 +1,5 @@
 import { ReactNode, Children, useRef, useEffect } from "react";
 
-import { useRecordingStore } from "@/store/useRecordingStore";
 import { cn } from "@/util/utils";
 
 interface FlippableProps {
@@ -30,7 +29,6 @@ export function Flippable({
   className,
   preserveFrontsideHeight = false,
 }: FlippableProps) {
-  const recordingStore = useRecordingStore();
   const childrenArray = Children.toArray(children);
   const front = childrenArray[0];
   const back = childrenArray[1];
@@ -57,12 +55,7 @@ export function Flippable({
   }, [facing, preserveFrontsideHeight]);
 
   return (
-    <div
-      className={cn(className, {
-        "pointer-events-none opacity-50": recordingStore.isRecording,
-      })}
-      style={{ perspective: "1000px" }}
-    >
+    <div className={className} style={{ perspective: "1000px" }}>
       <div
         className={cn(
           "transition-transform duration-700",

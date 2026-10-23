@@ -200,7 +200,6 @@ import {
   buildDragAnnouncements,
 } from "./sortable/dragAnnouncements";
 import { PoliteDndLiveRegionPolicy } from "./sortable/dragLiveRegionPolicy";
-import { useRecordingStore } from "@/store/useRecordingStore";
 import { useIsCanvasLocked } from "./controls/useIsCanvasLocked";
 import { BlockConfigSidebar } from "./panels/BlockConfigSidebar";
 import { STUDIO_COPILOT_TRANSITION_MS } from "../studio/constants";
@@ -490,7 +489,6 @@ function FlowRenderer({
   const reactFlowInstance = useReactFlow();
   const postHog = usePostHog();
   const debugStore = useDebugStore();
-  const recordingStore = useRecordingStore();
   const isCanvasLocked = useIsCanvasLocked();
   const hydrationLocked = useWorkflowYamlEditorStore(
     selectEditorMutationLocked,
@@ -1360,15 +1358,9 @@ function FlowRenderer({
       );
 
       workflowChangesStore.setHasChanges(true);
-      const { pendingRecordingId, pendingRecordingWorkflowPermanentId } =
-        useWorkflowHasChangesStore.getState();
       postHog.capture("builder.block.removed", {
         org_id: workflow.organization_id,
         workflow_permanent_id: workflow.workflow_permanent_id,
-        pending_recording_id:
-          pendingRecordingWorkflowPermanentId === workflow.workflow_permanent_id
-            ? (pendingRecordingId ?? undefined)
-            : undefined,
         block_type: blockTypeFromNode(node) ?? node.type,
       });
 
@@ -1794,10 +1786,8 @@ function FlowRenderer({
           : activeId;
 
       // Drag-mode gate: grip handle is already disabled at the DOM level when
-      // recording or when the canvas is locked, but keyboard/programmatic
-      // drags reach here.
+      // the canvas is locked, but keyboard/programmatic drags reach here.
       const dragModeGateInputs: DragModeGateInputs = {
-        isRecording: recordingStore.isRecording,
         isCanvasLocked,
       };
       if (isDragGatedByMode(dragModeGateInputs)) {
@@ -1875,7 +1865,6 @@ function FlowRenderer({
       workflowChangesStore,
       scopeForActiveId,
       finallyBlockLabel,
-      recordingStore.isRecording,
       isCanvasLocked,
       captureHistoryImmediately,
       readOnly,

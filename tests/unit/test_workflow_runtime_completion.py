@@ -36,6 +36,7 @@ from tests.unit._external_cdp_fakes import (
     begin_lease,
     external_browser_state,
     external_cdp_stack,
+    install_deadline_clock,
     register_external,
 )
 from tests.unit.conftest import FakeWorkflowRunAttemptsRepository
@@ -805,14 +806,16 @@ def test_apply_proposed_workflow_route_is_bound_to_the_route_handler() -> None:
     ids=["open", "expired_mid_run", "browser_died_mid_run", "browser_died_and_row_unreadable"],
 )
 async def test_a_workflow_whose_registered_browser_ended_mid_run_fails_at_finalization(
-    registration: str, browser_connected: bool, expected_reason: str | None
+    monkeypatch: pytest.MonkeyPatch, registration: str, browser_connected: bool, expected_reason: str | None
 ) -> None:
+    clock = install_deadline_clock(monkeypatch)
     async with external_cdp_stack() as stack:
         session_id = (await register_external(stack.client, timeout=5)).json()["browser_session_id"]
         if registration == "expired":
-            await backdate_registration(stack, session_id, minutes=5 - 0.5 / 60)
+            await backdate_registration(stack, session_id, minutes=5 - 0.5 / 60, clock=clock)
         await begin_lease(stack.manager, session_id, "wr_a")
         if registration == "expired":
+            clock.ticking.set()
             await asyncio.wait_for(stack.manager._external_deadlines[session_id], timeout=5)
         run = SimpleNamespace(
             workflow_run_id="wr_a",

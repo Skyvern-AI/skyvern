@@ -39,6 +39,7 @@ class SkyvernCredentialVaultService(CredentialVaultService):
         organization_id: str,
         data: CreateCredentialRequest,
         created_by: str | None = None,
+        is_passkey_setup_pending: bool = False,
     ) -> Credential:
         item_id = self._generate_item_id()
         item = CredentialItem(
@@ -56,6 +57,7 @@ class SkyvernCredentialVaultService(CredentialVaultService):
                 item_id=item_id,
                 vault_type=CredentialVaultType.SKYVERN,
                 created_by=created_by,
+                is_passkey_setup_pending=is_passkey_setup_pending,
             )
         except BaseException:
             await self._reclaim_orphaned_vault_item(

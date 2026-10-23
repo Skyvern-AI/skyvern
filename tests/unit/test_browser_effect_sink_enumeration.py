@@ -50,7 +50,7 @@ _DISCOVERED_BROWSER_API_CALLS = {
             "wheel": 5,
         }
     ),
-    "skyvern/webeye/actions/multi_field_totp.py": Counter({"fill": 1, "click": 2, "press": 1, "evaluate": 5}),
+    "skyvern/webeye/actions/multi_field_totp.py": Counter({"fill": 1, "click": 2, "press": 1, "evaluate": 9}),
     "skyvern/webeye/actions/handler_utils.py": Counter(
         {"dispatch_event": 1, "down": 3, "evaluate": 1, "fill": 3, "press": 1, "up": 3}
     ),
@@ -114,6 +114,8 @@ _EVALUATE_CALLERS = {
             "bind": 1,
             "refresh": 1,
             "find_multi_field_totp_submit_controls": 1,
+            # read-only checks that a pending click or Enter targets the code group's own submit or resend control
+            "one_time_code_dispatch_kind": 4,
         }
     ),
     "skyvern/webeye/actions/handler_utils.py": Counter({"_uses_native_value_set_fill": 1}),
@@ -271,21 +273,21 @@ def test_discovered_browser_api_lower_bound_is_stable() -> None:
     }
 
     assert observed == _DISCOVERED_BROWSER_API_CALLS
-    assert sum(sum(methods.values()) for methods in observed.values()) == 213
+    assert sum(sum(methods.values()) for methods in observed.values()) == 217
     handler_candidates = _candidate_signatures("skyvern/webeye/actions/handler.py", _CANDIDATE_METHODS)
     classified_non_browser = Counter(
         {signature: count for signature, count in handler_candidates.items() if signature in _NON_BROWSER_CANDIDATES}
     )
     assert classified_non_browser == _NON_BROWSER_CANDIDATES
     assert sum(_NON_BROWSER_CANDIDATES.values()) == 7
-    assert sum(sum(methods.values()) for methods in observed.values()) - sum(_NON_BROWSER_CANDIDATES.values()) == 206
+    assert sum(sum(methods.values()) for methods in observed.values()) - sum(_NON_BROWSER_CANDIDATES.values()) == 210
 
 
 def test_every_raw_evaluate_call_is_classified() -> None:
     observed = {path: callers for path in _owned_source_paths() if (callers := _callers_for_method(path, "evaluate"))}
 
     assert observed == _EVALUATE_CALLERS
-    assert sum(sum(callers.values()) for callers in observed.values()) == 42
+    assert sum(sum(callers.values()) for callers in observed.values()) == 46
 
 
 def test_every_cdp_dispatch_is_classified_by_exact_command() -> None:

@@ -1,18 +1,22 @@
 from collections.abc import Awaitable, Callable
-from datetime import datetime, timezone
+from datetime import UTC, datetime, timezone
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, call
 
 import pytest
-from fastapi import HTTPException
+from fastapi import FastAPI, HTTPException
+from fastapi.testclient import TestClient
 
 from skyvern.forge.sdk.db.enums import OrganizationAuthTokenType
 from skyvern.forge.sdk.routes import credentials as routes
 from skyvern.forge.sdk.schemas.organizations import (
+    BitwardenCredential,
+    BitwardenOrganizationAuthToken,
     CreateOnePasswordTokenRequest,
     Organization,
     OrganizationAuthToken,
 )
+from skyvern.forge.sdk.services import org_auth_service
 
 
 class FakeOrganizationsRepository:
@@ -128,6 +132,54 @@ async def test_clear_org_auth_credential_succeeds_without_existing_token(
 ) -> None:
     assert (await routes.clear_org_auth_credential("onepassword", _org())).success is True
     assert len(fake_organizations.invalidate_calls) == 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("redact", [True, False], ids=["status-only", "email-authorized"])
+async def test_get_bitwarden_credential_redacts_email_without_vault_read(
+    monkeypatch: pytest.MonkeyPatch,
+    redact: bool,
+) -> None:
+    organization = _org()
+    now = datetime.now(UTC)
+    token = BitwardenOrganizationAuthToken(
+        id="oat_bitwarden",
+        organization_id=organization.organization_id,
+        token_type=OrganizationAuthTokenType.bitwarden_credential,
+        valid=True,
+        created_at=now,
+        modified_at=now,
+        credential=BitwardenCredential(email="test@example.com", master_password="test-password"),
+    )
+    get_token = AsyncMock(return_value=token)
+    monkeypatch.setattr(
+        routes.app,
+        "DATABASE",
+        SimpleNamespace(organizations=SimpleNamespace(get_valid_org_auth_token=get_token)),
+    )
+    should_redact = AsyncMock(return_value=redact)
+    monkeypatch.setattr(routes, "_should_redact_org_credential_secrets", should_redact)
+    app = FastAPI()
+    app.add_api_route("/bitwarden", routes.get_bitwarden_credential, methods=["GET"])
+    app.dependency_overrides[org_auth_service.get_current_org_for_credential_routes] = lambda: organization
+
+    with TestClient(app) as client:
+        response = client.get("/bitwarden")
+
+    assert response.status_code == 200, response.text
+    get_token.assert_awaited_once_with(
+        organization_id=organization.organization_id,
+        token_type=OrganizationAuthTokenType.bitwarden_credential.value,
+    )
+    should_redact.assert_awaited_once_with(organization.organization_id)
+    if redact:
+        redacted_token = response.json()["token"]
+        assert set(redacted_token) == {"id", "token_type", "valid", "created_at", "modified_at"}
+        assert redacted_token["id"] == "oat_bitwarden"
+        assert redacted_token["token_type"] == OrganizationAuthTokenType.bitwarden_credential.value
+        assert redacted_token["valid"] is True
+    else:
+        assert response.json()["token"]["credential"]["email"] == "test@example.com"
 
 
 @pytest.mark.asyncio

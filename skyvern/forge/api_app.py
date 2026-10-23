@@ -62,7 +62,6 @@ from skyvern.forge.sdk.services.local_org_auth_token_service import (
     regenerate_local_api_key,
 )
 from skyvern.forge.sdk.services.route_authorization import ROUTE_AUTHORIZATION_DEPENDENCY
-from skyvern.services.browser_recording.session_registry import interpretation_registry
 from skyvern.services.cleanup_service import (
     start_cleanup_scheduler,
     start_hosted_driver_sweep,
@@ -469,7 +468,6 @@ async def lifespan(fastapi_app: FastAPI) -> AsyncGenerator[None, Any]:
     await stop_cleanup_scheduler()
     await stop_temp_artifact_sweep()
     await stop_hosted_driver_sweep()
-    await interpretation_registry.stop_all()
 
     if forge_app.api_app_shutdown_event:
         LOG.info("Calling api app shutdown event")
@@ -632,7 +630,9 @@ def create_api_app() -> FastAPI:
             # Both validation messages and unknown field names can contain reported contact details.
             return JSONResponse(status_code=422, content={"detail": "invalid_onboarding_data"})
         sensitive_prefixes = ("/v1/credentials", "/api/v1/credentials", "/v1/browser_sessions/external")
-        if not any(path == prefix or path.startswith(f"{prefix}/") for prefix in sensitive_prefixes):
+        if path != "/v1/agent_feedback" and not any(
+            path == prefix or path.startswith(f"{prefix}/") for prefix in sensitive_prefixes
+        ):
             return await request_validation_exception_handler(request, exc)
 
         return JSONResponse(

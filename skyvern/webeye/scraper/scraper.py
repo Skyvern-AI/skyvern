@@ -60,6 +60,34 @@ if TYPE_CHECKING:
 LOG = structlog.get_logger()
 MAX_LOGGED_FRAME_COLLISION_PAIRS = 10
 
+# Reads every stamped element's live tag name, role and match count in one pass, open shadow roots
+# included, so a caller can resolve a whole subtree without a round trip per element.
+LIVE_ELEMENT_PROBE_JS = """(attrName) => {
+    // Element ids come from page attributes and can collide with Object.prototype keys.
+    const probes = Object.create(null);
+    const pending = [document.documentElement];
+    while (pending.length) {
+        const node = pending.pop();
+        if (!node) continue;
+        const elementId = node.getAttribute ? node.getAttribute(attrName) : null;
+        if (elementId) {
+            const probe = probes[elementId];
+            if (probe === undefined) {
+                probes[elementId] = {
+                    count: 1,
+                    tagName: node.tagName ? node.tagName.toLowerCase() : "",
+                    role: node.getAttribute("role"),
+                };
+            } else {
+                probe.count += 1;
+            }
+        }
+        for (const child of node.children || []) pending.push(child);
+        if (node.shadowRoot) pending.push(node.shadowRoot);
+    }
+    return probes;
+}"""
+
 
 async def build_scraping_failed_reason(
     browser_state: BrowserState, requested_url: str, *, timed_out: bool = False, canvas_app: bool = False
@@ -290,6 +318,9 @@ def build_element_dict(
         if previous_frame is not None and previous_frame != element["frame"]:
             cross_frame_collision_ids.add(element_id)
             colliding_frame_pairs.add((previous_frame, element["frame"]))
+            # Frames arrive breadth-first, parents before children, so the first owner is the likelier target, and a
+            # frame's copy of its own iframe cannot re-point that iframe into its subtree and loop the frame chain.
+            continue
         # get_interactable_element_tree marks each interactable element with a SKYVERN_ID_ATTR attribute
         id_to_css_dict[element_id] = f"[{SKYVERN_ID_ATTR}='{element_id}']"
         id_to_element_dict[element_id] = element
@@ -300,10 +331,10 @@ def build_element_dict(
 
     if cross_frame_collision_ids:
         iframe_collision_count = len(cross_frame_collision_ids & {element["frame"] for element in elements})
-        # Only an overwritten iframe entry can turn an element's frame chain into a loop.
+        # A shared iframe id is the collision that can misroute an element's frame chain.
         log = LOG.warning if iframe_collision_count else LOG.info
         log(
-            "Element ids collide across frames; the later frame's element replaces the earlier one",
+            "Element ids collide across frames; the earlier frame's element is kept",
             collision_count=len(cross_frame_collision_ids),
             iframe_collision_count=iframe_collision_count,
             frame_pairs=sorted(colliding_frame_pairs)[:MAX_LOGGED_FRAME_COLLISION_PAIRS],
@@ -1042,6 +1073,7 @@ class IncrementalScrapePage(ElementTreeBuilder):
         # native analysis timeout; None (default) preserves the stock Playwright timeout identity.
         self.engine_selection = engine_selection
         self.last_used_element_tree_html: str | None = None
+        self._live_element_probes: dict[str, dict] | None = None
 
     def set_element_tree_trimmed(self, element_tree_trimmed: list[dict]) -> None:
         self.element_tree_trimmed = element_tree_trimmed
@@ -1077,6 +1109,7 @@ class IncrementalScrapePage(ElementTreeBuilder):
         self.id_to_css_dict, self.id_to_element_dict, _, _, _ = build_element_dict(incremental_elements)
 
         self.elements = incremental_elements
+        self._live_element_probes = None
 
         incremental_tree = await cleanup_element_tree(frame, frame.url, _deepcopy_element_tree(incremental_tree))
         trimmed_element_tree = trim_element_tree(_deepcopy_element_tree(incremental_tree))
@@ -1130,6 +1163,49 @@ class IncrementalScrapePage(ElementTreeBuilder):
             return 0;
         }"""
         return await SkyvernFrame.evaluate(frame=self.skyvern_frame.get_frame(), expression=js_script)
+
+    async def _get_live_element_probes(self) -> dict[str, dict]:
+        """Live tag name, role and match count of every stamped element in the frame, keyed by element id.
+
+        Read in one pass instead of a locator resolve plus an attribute read per element: an opened
+        dropdown menu can hold hundreds of elements, and each round trip to a remote browser costs
+        a fraction of a second. Cached until the next incremental scrape replaces the element tree.
+        """
+        cached = self._live_element_probes
+        if cached is not None:
+            return cached
+
+        probes: dict[str, dict] = await SkyvernFrame.evaluate(
+            frame=self.skyvern_frame.get_frame(), expression=LIVE_ELEMENT_PROBE_JS, arg=SKYVERN_ID_ATTR
+        )
+        self._live_element_probes = probes
+        return probes
+
+    async def find_option_list_element_id(self, root_element: dict) -> str | None:
+        """Id of the first <ul> or role="listbox" element in the subtree, the root element included."""
+        try:
+            probes = await self._get_live_element_probes()
+        except Exception:
+            # Same outcome the per-element reads had when the page wouldn't answer: no match.
+            LOG.debug("Failed to read the live element tree, no option list element found", exc_info=True)
+            return None
+
+        queue = [root_element]
+        index = 0
+        while index < len(queue):
+            element = queue[index]
+            index += 1
+            element_id: str = element.get("id", "")
+            probe = probes.get(element_id)
+            # An id matching no element, or more than one, is not addressable by its selector.
+            if probe is not None and probe.get("count") == 1:
+                if element.get("tagName") == "ul":
+                    return element_id
+                # The role may change after the scrape, so use the live probe as authoritative.
+                if probe.get("role") == "listbox":
+                    return element_id
+            queue.extend(element.get("children", []))
+        return None
 
     async def __validate_element_by_value(self, value: str, element: dict) -> tuple[Locator | None, bool]:
         """

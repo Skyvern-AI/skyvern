@@ -1,7 +1,6 @@
 import { InputIcon, PlusIcon } from "@radix-ui/react-icons";
 
 import { Button } from "@/components/ui/button";
-import { useRecordingStore } from "@/store/useRecordingStore";
 import { useWorkflowPanelStore } from "@/store/WorkflowPanelStore";
 import { useWorkflowParametersStore } from "@/store/WorkflowParametersStore";
 import { cn } from "@/util/utils";
@@ -74,7 +73,6 @@ function summarize(keys: string[], maxKeyChars = Infinity): string {
  */
 function WorkflowInputsSection({ editable }: { editable: boolean }) {
   const parameters = useWorkflowParametersStore((s) => s.parameters);
-  const isRecording = useRecordingStore((s) => s.isRecording);
   const setWorkflowPanelState = useWorkflowPanelStore(
     (s) => s.setWorkflowPanelState,
   );
@@ -110,7 +108,6 @@ function WorkflowInputsSection({ editable }: { editable: boolean }) {
           {editable ? (
             <button
               type="button"
-              disabled={isRecording}
               onClick={openPanel}
               className={cn(
                 "group flex items-center gap-2 py-1 text-sm font-medium",
@@ -130,7 +127,6 @@ function WorkflowInputsSection({ editable }: { editable: boolean }) {
             variant="ghost"
             size="sm"
             className="-mr-3 shrink-0 text-muted-foreground hover:text-foreground"
-            disabled={isRecording}
             onClick={openPanel}
           >
             <PlusIcon className="mr-1 size-3.5" aria-hidden />
@@ -145,7 +141,6 @@ function WorkflowInputsSection({ editable }: { editable: boolean }) {
       ) : editable ? (
         <button
           type="button"
-          disabled={isRecording}
           onClick={openPanel}
           title={fullSummary}
           aria-label={fullSummary}

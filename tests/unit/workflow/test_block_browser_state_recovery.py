@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import json
 import socket
 import subprocess
@@ -11,29 +12,49 @@ from collections.abc import Awaitable
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import AsyncMock, MagicMock, PropertyMock, call
+from unittest.mock import AsyncMock, MagicMock, PropertyMock, call, patch
 
 import pytest
+from playwright.async_api import Error as PlaywrightError
 from playwright.async_api import async_playwright
 from structlog.testing import capture_logs
 
+from skyvern.constants import NAVIGATION_MAX_RETRY_TIME
 from skyvern.exceptions import (
+    BROWSER_CONNECTION_LOST_ERROR_CODE,
     BrowserStateDiagnostic,
+    FailedToNavigateToUrl,
+    FailedToReloadPage,
     MissingBrowserState,
     MissingBrowserStatePage,
     get_user_facing_exception_message,
 )
 from skyvern.forge import app
+from skyvern.forge.agent import ForgeAgent
 from skyvern.forge.sdk.core import skyvern_context
 from skyvern.forge.sdk.core.skyvern_context import SkyvernContext
-from skyvern.forge.sdk.workflow.models.block import CodeBlock
+from skyvern.forge.sdk.models import StepStatus
+from skyvern.forge.sdk.schemas.tasks import TaskStatus
+from skyvern.forge.sdk.workflow.models import block as block_module
+from skyvern.forge.sdk.workflow.models.block import Block, CodeBlock, TaskBlock, UrlBlock
 from skyvern.forge.sdk.workflow.models.parameter import OutputParameter, ParameterType
+from skyvern.forge.sdk.workflow.models.workflow import WorkflowRunStatus
+from skyvern.forge.sdk.workflow.retry_policy import evaluate_retry_policy
+from skyvern.forge.sdk.workflow.service import WorkflowService
+from skyvern.schemas.workflows import BlockResult, BlockStatus, WorkflowRetryPolicy
+from skyvern.webeye import navigation as navigation_module
 from skyvern.webeye import real_browser_state as real_browser_state_module
 from skyvern.webeye.browser_artifacts import BrowserArtifacts
 from skyvern.webeye.browser_runtime_events import BrowserRuntimeLogContext
 from skyvern.webeye.driver_connection import close_driver_connection_on_transport_loss
+from skyvern.webeye.real_browser_manager import RealBrowserManager
 from skyvern.webeye.real_browser_state import RealBrowserState, expect_process_driver_teardown
+from tests.unit._task_block_fakes import lost_browser_state, mock_block_execute_deps, output_parameter
+from tests.unit.force_stub_app import admit_block_dispatch
 from tests.unit.forge_log_capture import capture_runtime_logs
+from tests.unit.helpers import make_organization, make_step, make_task
+from tests.unit.scoped_asyncio import ScopedAsyncio
+from tests.unit.test_block_description_caching import _setup_mocks
 
 
 def _has_playwright_browser() -> bool:
@@ -342,12 +363,736 @@ def test_browser_disconnect_event_latches_event_observation() -> None:
     assert diagnostic.observation_source == "browser_event"
 
 
+def _bound_state(run_id: str = "wr_test") -> tuple[RealBrowserState, MagicMock, MagicMock]:
+    browser = MagicMock()
+    browser.is_connected = MagicMock(return_value=True)
+    context = MagicMock(browser=browser)
+    context._impl_obj = MagicMock(_close_was_called=False, _closed=False, _connection=MagicMock(_closed_error=None))
+    state = RealBrowserState(pw=MagicMock(), browser_context=context)
+    state.bind_runtime_event_context(BrowserRuntimeLogContext(workflow_run_id=run_id))
+    return state, context, browser
+
+
+def _probe_timeout(state: RealBrowserState, context: MagicMock, browser: MagicMock) -> None:
+    state.record_connection_probe_failure(context, state.pw, timed_out=True)
+
+
+@pytest.mark.parametrize(
+    ("events", "terminal"),
+    [
+        pytest.param([lambda s, c, b: s._on_browser_context_closed(c)], True, id="native_context_close"),
+        pytest.param([lambda s, c, b: s._on_browser_disconnected(b)], True, id="native_browser_disconnect"),
+        pytest.param(
+            [_probe_timeout, lambda s, c, b: s._on_browser_context_closed(c)], True, id="probe_then_native_close"
+        ),
+        pytest.param(
+            [lambda s, c, b: s._on_driver_transport_lost(s.pw, c), lambda s, c, b: s._on_browser_disconnected(b)],
+            True,
+            id="driver_loss_then_native_disconnect",
+        ),
+        pytest.param([lambda s, c, b: s._on_driver_transport_lost(s.pw, c)], False, id="driver_loss_only"),
+        pytest.param([_probe_timeout], False, id="probe_timeout_only"),
+        pytest.param([lambda s, c, b: s.record_connection_probe_failure(c, s.pw)], False, id="probe_failure_only"),
+        pytest.param(
+            [
+                lambda s, c, b: s._expect_runtime_end("normal_close", c),
+                lambda s, c, b: s._on_browser_context_closed(c),
+            ],
+            False,
+            id="expected_close",
+        ),
+        pytest.param(
+            [
+                lambda s, c, b: s._expect_runtime_end("driver_replacement", c),
+                lambda s, c, b: s._on_browser_context_closed(c),
+            ],
+            False,
+            id="expected_driver_replacement",
+        ),
+        pytest.param(
+            [lambda s, c, b: s.mark_run_released(), lambda s, c, b: s._on_browser_context_closed(c)],
+            False,
+            id="after_release",
+        ),
+    ],
+)
+def test_browser_connection_loss_is_only_an_unexpected_active_native_event(
+    events: list, terminal: bool, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(app.AGENT_FUNCTION, "on_browser_run_released", MagicMock())
+    state, context, browser = _bound_state()
+
+    for event in events:
+        event(state, context, browser)
+
+    loss = state.get_browser_connection_loss()
+    if terminal:
+        assert loss is not None
+        assert loss.observation_source == "browser_event"
+    else:
+        assert loss is None
+
+
+def test_browser_connection_loss_ignores_a_stale_generation() -> None:
+    state, old_context, old_browser = _bound_state()
+    new_context = MagicMock(browser=MagicMock())
+    state.browser_context = new_context
+    state._register_disconnect_listeners(new_context)
+
+    state._on_browser_context_closed(old_context)
+    state._on_browser_disconnected(old_browser)
+
+    assert state.get_browser_connection_loss() is None
+
+
+def test_browser_connection_loss_belongs_to_the_run_that_observed_it() -> None:
+    state, context, _ = _bound_state("wr_first")
+    state._on_browser_context_closed(context)
+    assert state.get_browser_connection_loss() is not None
+
+    state.bind_runtime_event_context(BrowserRuntimeLogContext(workflow_run_id="wr_next"))
+
+    assert state.get_browser_connection_loss() is None
+
+
+@pytest.mark.asyncio
+async def test_lost_browser_is_not_reconnected_for_the_same_run(monkeypatch: pytest.MonkeyPatch) -> None:
+    state, _, browser = _bound_state()
+    browser.is_connected.return_value = False
+    state._on_browser_disconnected(browser)
+    state.reconnect = AsyncMock()  # type: ignore[method-assign]
+    monkeypatch.setattr(app.BROWSER_MANAGER, "get_for_workflow_run", MagicMock(return_value=state))
+    monkeypatch.setattr(app.WORKFLOW_SERVICE, "get_workflow_run", AsyncMock(return_value=_FakeWorkflowRun()))
+
+    with pytest.raises(MissingBrowserState) as exc_info:
+        await _make_code_block().get_or_create_browser_state(workflow_run_id="wr_test", organization_id="o_test")
+
+    assert BROWSER_CONNECTION_LOST_ERROR_CODE in str(exc_info.value)
+    state.reconnect.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("browser_lost", [True, False], ids=["browser_lost", "browser_alive"])
+async def test_block_that_failed_on_a_lost_browser_cannot_be_continued(browser_lost: bool) -> None:
+    block = _make_code_block()
+    block.continue_on_failure = True
+    with (
+        patch("skyvern.forge.sdk.workflow.models.block.app") as mock_app,
+        patch.object(CodeBlock, "execute", AsyncMock(side_effect=MissingBrowserStatePage(workflow_run_id="wr_test"))),
+        patch.object(Block, "_generate_workflow_run_block_description", new_callable=AsyncMock),
+    ):
+        _setup_mocks(mock_app)
+        mock_app.BROWSER_MANAGER.get_for_workflow_run.return_value = (
+            lost_browser_state("wr_test") if browser_lost else None
+        )
+
+        result = await block.execute_safe(workflow_run_id="wr_test")
+
+    assert result.success is False
+    assert result.can_continue_after_failure is not browser_lost
+    assert (BROWSER_CONNECTION_LOST_ERROR_CODE in result.error_codes) is browser_lost
+
+
+@pytest.mark.asyncio
+async def test_task_block_is_not_retried_after_its_browser_was_lost() -> None:
+    block = TaskBlock(
+        label="nav",
+        url="https://example.com",
+        navigation_goal="go",
+        output_parameter=output_parameter(),
+        max_retries=2,
+    )
+    state, context, _ = _bound_state("wr_task_block_test")
+
+    async def _lose_browser(**_: object) -> None:
+        state._on_browser_context_closed(context)
+
+    now = datetime.now(timezone.utc)
+    failed_task = make_task(now, make_organization(now), status=TaskStatus.failed, failure_reason="page is missing")
+    with (
+        skyvern_context.scoped(SkyvernContext()),
+        mock_block_execute_deps(working_page_url="https://example.com") as deps,
+    ):
+        deps.browser_manager.get_for_workflow_run = MagicMock(return_value=state)
+        deps.agent.execute_step = AsyncMock(side_effect=_lose_browser)
+        deps.tasks_db.get_task = AsyncMock(return_value=failed_task)
+        with (
+            patch.object(Block, "record_output_parameter_value", new_callable=AsyncMock),
+            patch(
+                "skyvern.forge.sdk.workflow.models.block.app.STORAGE",
+                new=MagicMock(
+                    get_current_attempt_downloaded_files=AsyncMock(return_value=[]),
+                    get_downloaded_file_signature_aliases=MagicMock(return_value=()),
+                ),
+                create=True,
+            ),
+            patch(
+                "skyvern.forge.sdk.workflow.models.block.app.WORKFLOW_SERVICE.get_recent_task_screenshot_artifacts",
+                new=AsyncMock(return_value=[]),
+            ),
+            patch(
+                "skyvern.forge.sdk.workflow.models.block.app.WORKFLOW_SERVICE.get_recent_workflow_screenshot_artifacts",
+                new=AsyncMock(return_value=[]),
+            ),
+        ):
+            result = await block.execute(
+                workflow_run_id="wr_task_block_test", workflow_run_block_id="wrb_test", organization_id="o_test"
+            )
+
+    assert deps.agent.execute_step.await_count == 1
+    assert result.success is False
+    assert result.can_continue_after_failure is False
+    assert BROWSER_CONNECTION_LOST_ERROR_CODE in result.error_codes
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("case", ["lost_during_downloaded_files", "lost_during_task_order", "ordinary_failure"])
+async def test_task_block_admits_no_retry_after_a_loss_during_its_failure_bookkeeping(case: str) -> None:
+    block = TaskBlock(
+        label="nav",
+        url="https://example.com",
+        navigation_goal="go",
+        output_parameter=output_parameter(),
+        max_retries=1,
+    )
+    state, context, _ = _bound_state("wr_task_block_test")
+    now = datetime.now(timezone.utc)
+    organization = make_organization(now)
+    first = make_task(now, organization, task_id="tsk_first", status=TaskStatus.failed, failure_reason="No such button")
+    second = make_task(now, organization, task_id="tsk_second", status=TaskStatus.completed)
+    order_reads: list[str] = []
+
+    async def downloaded_files(**_: object) -> list:
+        if case == "lost_during_downloaded_files":
+            state._on_browser_context_closed(context)
+        return []
+
+    async def last_task_for_run(**_: object) -> object:
+        # The first read orders the first attempt, the second orders its retry.
+        order_reads.append("read")
+        if case == "lost_during_task_order" and len(order_reads) == 2:
+            state._on_browser_context_closed(context)
+        return None if len(order_reads) == 1 else first
+
+    with (
+        skyvern_context.scoped(SkyvernContext()),
+        mock_block_execute_deps(working_page_url="https://example.com") as deps,
+        patch.object(Block, "record_output_parameter_value", new_callable=AsyncMock),
+    ):
+        deps.browser_manager.get_for_workflow_run = MagicMock(return_value=state)
+        deps.tasks_db.get_last_task_for_workflow_run = AsyncMock(side_effect=last_task_for_run)
+        deps.tasks_db.get_task = AsyncMock(side_effect=[first, second])
+        deps.agent.create_task_and_step_from_block = AsyncMock(
+            side_effect=[(first, SimpleNamespace(step_id="stp_first")), (second, SimpleNamespace(step_id="stp_second"))]
+        )
+        block_module.app.STORAGE = MagicMock(
+            get_current_attempt_downloaded_files=AsyncMock(side_effect=downloaded_files),
+            get_downloaded_file_signature_aliases=MagicMock(return_value=()),
+        )
+        block_module.app.WORKFLOW_SERVICE.get_recent_task_screenshot_artifacts = AsyncMock(return_value=[])
+        block_module.app.WORKFLOW_SERVICE.get_recent_workflow_screenshot_artifacts = AsyncMock(return_value=[])
+
+        result = await block.execute(
+            workflow_run_id="wr_task_block_test", workflow_run_block_id="wrb_test", organization_id="o_test"
+        )
+
+    linked_tasks = [
+        update.kwargs["task_id"]
+        for update in deps.observer_db.update_workflow_run_block.await_args_list
+        if "task_id" in update.kwargs
+    ]
+    if case == "ordinary_failure":
+        assert linked_tasks == ["tsk_first", "tsk_second"]
+        assert result.success is True
+        return
+    # The loss lands after the retry decision was first made; no second attempt is created or linked.
+    assert deps.agent.create_task_and_step_from_block.await_count == 1
+    assert linked_tasks == ["tsk_first"]
+    assert result.status == BlockStatus.failed
+    assert result.failure_reason == "No such button"
+    assert isinstance(result.output_parameter_value, dict)
+    assert result.output_parameter_value["task_id"] == "tsk_first"
+    assert result.can_continue_after_failure is False
+    assert result.error_codes == [BROWSER_CONNECTION_LOST_ERROR_CODE]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "case",
+    ["lost_during_downloaded_files", "lost_during_screenshot_query", "healthy_termination", "canceled_after_loss"],
+)
+async def test_a_terminated_task_cannot_carry_the_run_on_after_a_loss_during_its_artifact_reads(
+    monkeypatch: pytest.MonkeyPatch, case: str
+) -> None:
+    block = TaskBlock(
+        label="nav",
+        url="https://example.com",
+        navigation_goal="go",
+        output_parameter=output_parameter(),
+        continue_on_failure=True,
+    )
+    state, context, _ = _bound_state("wr_task_block_test")
+    state.take_fullpage_screenshot = AsyncMock(return_value=None)  # type: ignore[method-assign]
+    now = datetime.now(timezone.utc)
+    status = TaskStatus.canceled if case == "canceled_after_loss" else TaskStatus.terminated
+    finished = make_task(now, make_organization(now), task_id="tsk_nav", status=status, failure_reason="Blocked page")
+
+    async def execute_step(**_: object) -> None:
+        if case == "canceled_after_loss":
+            state._on_browser_context_closed(context)
+
+    async def downloaded_files(**_: object) -> list:
+        if case == "lost_during_downloaded_files":
+            state._on_browser_context_closed(context)
+        return []
+
+    async def task_screenshots(**_: object) -> list:
+        if case == "lost_during_screenshot_query":
+            state._on_browser_context_closed(context)
+        return []
+
+    mark_failed = AsyncMock(return_value=MagicMock())
+    mark_canceled = AsyncMock(return_value=MagicMock())
+    monkeypatch.setattr(WorkflowService, "mark_workflow_run_as_failed_if_not_final", mark_failed)
+    monkeypatch.setattr(WorkflowService, "mark_workflow_run_as_canceled", mark_canceled)
+
+    with (
+        skyvern_context.scoped(SkyvernContext()),
+        mock_block_execute_deps(working_page_url="https://example.com") as deps,
+        patch.object(Block, "_generate_workflow_run_block_description", new_callable=AsyncMock),
+        patch.object(Block, "record_output_parameter_value", new_callable=AsyncMock),
+    ):
+        deps.browser_manager.get_for_workflow_run = MagicMock(return_value=state)
+        deps.agent.execute_step = AsyncMock(side_effect=execute_step)
+        deps.tasks_db.get_task = AsyncMock(return_value=finished)
+        deps.observer_db.create_workflow_run_block = AsyncMock(
+            return_value=SimpleNamespace(workflow_run_block_id="wrb_nav")
+        )
+        block_module.app.DATABASE.workflow_runs.admit_workflow_run_block_dispatch = admit_block_dispatch()
+        block_module.app.STORAGE = MagicMock(
+            get_current_attempt_downloaded_files=AsyncMock(side_effect=downloaded_files),
+            get_downloaded_file_signature_aliases=MagicMock(return_value=()),
+        )
+        block_module.app.WORKFLOW_SERVICE.get_recent_task_screenshot_artifacts = AsyncMock(side_effect=task_screenshots)
+        block_module.app.WORKFLOW_SERVICE.get_recent_workflow_screenshot_artifacts = AsyncMock(return_value=[])
+
+        result = await block.execute_safe(workflow_run_id="wr_task_block_test", organization_id="o_test")
+        row: dict[str, object] = {}
+        for update in deps.observer_db.update_workflow_run_block.await_args_list:
+            row.update({key: value for key, value in update.kwargs.items() if value is not None})
+
+    _, should_stop = await WorkflowService()._handle_block_result_status(
+        block=block,
+        block_idx=0,
+        blocks_cnt=1,
+        block_result=result,
+        workflow_run=MagicMock(),
+        workflow_run_id="wr_task_block_test",
+    )
+
+    if case == "canceled_after_loss":
+        # A cancellation keeps its outcome; the loss does not turn it into a failure.
+        assert result.status == row["status"] == BlockStatus.canceled
+        assert BROWSER_CONNECTION_LOST_ERROR_CODE not in result.error_codes
+        assert should_stop is True
+        mark_canceled.assert_awaited_once()
+        mark_failed.assert_not_awaited()
+        return
+    output = row["output"]
+    assert isinstance(output, dict)
+    assert output["task_id"] == "tsk_nav"
+    assert result.output_parameter_value == output
+    assert result.failure_reason == "Blocked page"
+    if case == "healthy_termination":
+        assert result.status == row["status"] == BlockStatus.terminated
+        assert result.can_continue_after_failure is True
+        assert should_stop is False
+        mark_failed.assert_not_awaited()
+        return
+    assert result.status == row["status"] == BlockStatus.failed
+    assert result.error_codes == row["error_codes"] == [BROWSER_CONNECTION_LOST_ERROR_CODE]
+    assert result.can_continue_after_failure is False
+    assert should_stop is True
+    mark_failed.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_a_code_block_success_after_a_loss_is_left_to_the_run_completion_gate() -> None:
+    block = _make_code_block()
+    succeeded = BlockResult(
+        success=True,
+        output_parameter=block.output_parameter,
+        status=BlockStatus.completed,
+        workflow_run_block_id="wrb_code",
+    )
+    with (
+        patch("skyvern.forge.sdk.workflow.models.block.app") as mock_app,
+        patch.object(CodeBlock, "_execute", AsyncMock(return_value=succeeded)),
+    ):
+        mock_app.BROWSER_MANAGER.get_for_workflow_run.return_value = lost_browser_state("wr_test")
+        mock_app.DATABASE.observer.update_workflow_run_block = AsyncMock()
+
+        result = await block.execute(workflow_run_id="wr_test", workflow_run_block_id="wrb_code")
+
+    assert result == succeeded
+    mock_app.DATABASE.observer.update_workflow_run_block.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_task_block_does_not_take_over_a_browser_its_finished_child_lost() -> None:
+    block = TaskBlock(
+        label="nav",
+        url="https://example.com",
+        navigation_goal="go",
+        output_parameter=output_parameter(),
+        max_retries=1,
+    )
+    # A synchronous child shared this run's browser and finished; the browser stays bound to the child.
+    state, context, _ = _bound_state("wr_child")
+    state.reconnect = AsyncMock()  # type: ignore[method-assign]
+    manager = RealBrowserManager()
+    manager.pages["wr_task_block_test"] = state
+    now = datetime.now(timezone.utc)
+    organization = make_organization(now)
+    task = make_task(now, organization, workflow_run_id="wr_task_block_test")
+    step = make_step(now, task, step_id="stp_test", status=StepStatus.created, order=0, output=None)
+    workflow_run = MagicMock(workflow_run_id="wr_task_block_test", parent_workflow_run_id=None, browser_profile_id=None)
+
+    async def execute_step(**_: object) -> None:
+        # The loss lands after the block checked its browser and before the step acquires it.
+        state._on_browser_context_closed(context)
+        # The real step fails its task on either refusal and returns.
+        with contextlib.suppress(MissingBrowserState, MissingBrowserStatePage):
+            await ForgeAgent().initialize_execution_state(task, step, workflow_run)
+
+    with (
+        skyvern_context.scoped(SkyvernContext()),
+        mock_block_execute_deps(working_page_url="https://example.com") as deps,
+        patch.object(object.__getattribute__(app, "_inst"), "BROWSER_MANAGER", manager),
+        patch.object(manager, "_create_browser_state", new=AsyncMock()) as mock_create,
+    ):
+        deps.browser_manager.get_for_workflow_run = MagicMock(return_value=state)
+        deps.agent.create_task_and_step_from_block = AsyncMock(return_value=(task, step))
+        deps.agent.execute_step = AsyncMock(side_effect=execute_step)
+        deps.tasks_db.get_task = AsyncMock(return_value=task.model_copy(update={"status": TaskStatus.failed}))
+        with (
+            patch.object(Block, "record_output_parameter_value", new_callable=AsyncMock),
+            patch(
+                "skyvern.forge.sdk.workflow.models.block.app.STORAGE",
+                new=MagicMock(
+                    get_current_attempt_downloaded_files=AsyncMock(return_value=[]),
+                    get_downloaded_file_signature_aliases=MagicMock(return_value=()),
+                ),
+                create=True,
+            ),
+            patch(
+                "skyvern.forge.sdk.workflow.models.block.app.WORKFLOW_SERVICE.get_recent_task_screenshot_artifacts",
+                new=AsyncMock(return_value=[]),
+            ),
+            patch(
+                "skyvern.forge.sdk.workflow.models.block.app.WORKFLOW_SERVICE.get_recent_workflow_screenshot_artifacts",
+                new=AsyncMock(return_value=[]),
+            ),
+        ):
+            result = await block.execute(
+                workflow_run_id="wr_task_block_test", workflow_run_block_id="wrb_test", organization_id="o_test"
+            )
+
+    assert deps.agent.execute_step.await_count == 1
+    state.reconnect.assert_not_awaited()
+    mock_create.assert_not_awaited()
+    assert state.runtime_event_context.workflow_run_id == "wr_child"
+    assert result.can_continue_after_failure is False
+    assert BROWSER_CONNECTION_LOST_ERROR_CODE in result.error_codes
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("owner", ["observing_run", "later_run"])
+async def test_lost_browser_refuses_state_mutations_for_its_owner_before_side_effects(
+    monkeypatch: pytest.MonkeyPatch, owner: str
+) -> None:
+    state, context, _ = _bound_state("wr_test")
+    state._on_browser_context_closed(context)
+    if owner == "later_run":
+        state.bind_runtime_event_context(BrowserRuntimeLogContext(workflow_run_id="wr_next"))
+    refused = owner == "observing_run"
+    driver_starts: list[bool] = []
+
+    class CountingPlaywright:
+        async def start(self) -> object:
+            driver_starts.append(True)
+            raise RuntimeError("driver start reached")
+
+    monkeypatch.setattr(real_browser_state_module, "async_playwright", lambda: CountingPlaywright())
+    create_context = AsyncMock(side_effect=RuntimeError("context factory reached"))
+    monkeypatch.setattr(real_browser_state_module.BrowserContextFactory, "create_browser_context", create_context)
+    monkeypatch.setattr(navigation_module, "asyncio", ScopedAsyncio(sleep=AsyncMock()))
+    context.new_page = AsyncMock(side_effect=RuntimeError("new page reached"))
+    context._skyvern_cdp_download_interceptor = None
+    page = MagicMock()
+    page.goto = AsyncMock(side_effect=PlaywrightError("Target page, context or browser has been closed"))
+
+    with pytest.raises(MissingBrowserStatePage):
+        await state.must_get_working_page()
+    with pytest.raises(MissingBrowserState if refused else FailedToNavigateToUrl):
+        await state.navigate_to_url(page=page, url="https://93.184.216.34/next")
+    state._connection_status = MagicMock(return_value=(False, "playwright_driver_connection_closed"))  # type: ignore[method-assign]
+    with pytest.raises((MissingBrowserState, RuntimeError)) as reconnect_error:
+        await state.reconnect(browser_address="ws://remote-browser")
+    state.browser_context = None
+    with pytest.raises((MissingBrowserState, RuntimeError)):
+        await state.check_and_fix_state()
+
+    assert context.new_page.await_count == (0 if refused else 1)
+    assert page.goto.await_count == (0 if refused else NAVIGATION_MAX_RETRY_TIME)
+    assert len(driver_starts) == (0 if refused else 1)
+    assert create_context.await_count == (0 if refused else 1)
+    assert (BROWSER_CONNECTION_LOST_ERROR_CODE in str(reconnect_error.value)) is refused
+
+
+def _page_opening_context(context: MagicMock) -> None:
+    """The run's retained context object: it opens tabs as Playwright does, so any attempt is counted."""
+    context.pages = []
+    context._skyvern_cdp_download_interceptor = None
+    replacement = MagicMock(url="about:blank", close=AsyncMock(), bring_to_front=AsyncMock())
+    context.new_page = _replacement_page_opener(context, replacement, [])
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("owner", ["observing_run", "later_run", "page_only_close"])
+async def test_retained_closed_context_opens_no_page_for_the_run_that_lost_it(owner: str) -> None:
+    state, context, _ = _bound_state("wr_test")
+    _page_opening_context(context)
+    if owner != "page_only_close":
+        state._on_browser_context_closed(context)
+    if owner == "later_run":
+        state.bind_runtime_event_context(BrowserRuntimeLogContext(workflow_run_id="wr_next"))
+    refused = owner == "observing_run"
+
+    for open_page in (state.new_page, state.check_and_fix_state):
+        with (
+            pytest.raises(MissingBrowserState, match=BROWSER_CONNECTION_LOST_ERROR_CODE)
+            if refused
+            else (contextlib.nullcontext())
+        ):
+            await open_page()
+
+    assert context.new_page.await_count == (0 if refused else 2)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("existing_page", [False, True], ids=["opens_a_page", "reuses_a_page"])
+@pytest.mark.parametrize("native_close", [True, False], ids=["lost_during_page_selection", "browser_alive"])
+async def test_missing_page_is_neither_opened_nor_reused_after_a_loss_during_page_selection(
+    monkeypatch: pytest.MonkeyPatch, existing_page: bool, native_close: bool
+) -> None:
+    state, context, _ = _bound_state("wr_test")
+    _page_opening_context(context)
+    remote_page = MagicMock(url="https://example.test/app")
+    context.pages = [remote_page]
+    state.browser_artifacts = BrowserArtifacts(remote_browser_session_id="pbs_remote")
+
+    async def select_pages(*_args: object, **_kwargs: object) -> list[MagicMock]:
+        if native_close:
+            state._on_browser_context_closed(context)
+        return [remote_page] if existing_page else []
+
+    monkeypatch.setattr(state, "list_valid_pages", select_pages)
+    monkeypatch.setattr(state, "set_working_page", set_working_page := AsyncMock())
+    monkeypatch.setattr(state, "_close_all_other_pages", AsyncMock())
+
+    with pytest.raises(MissingBrowserState) if native_close else contextlib.nullcontext():
+        await state.check_and_fix_state()
+
+    assert context.new_page.await_count == (0 if native_close or existing_page else 1)
+    assert set_working_page.await_count == (0 if native_close else 1)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("native_close", [True, False], ids=["lost_during_destination_check", "browser_alive"])
+async def test_new_tab_opens_no_page_after_a_loss_during_its_destination_check(
+    monkeypatch: pytest.MonkeyPatch, native_close: bool
+) -> None:
+    from skyvern.webeye.actions import actions as action_types
+    from skyvern.webeye.actions import handler as handler_module
+    from skyvern.webeye.actions.handler import handle_new_tab_action
+    from skyvern.webeye.actions.responses import ActionSuccess
+
+    state, context, _ = _bound_state("wr_tab")
+    _page_opening_context(context)
+
+    async def check_destination(validate: object, url: str) -> str:
+        if native_close:
+            state._on_browser_context_closed(context)
+        return url
+
+    monkeypatch.setattr(handler_module, "asyncio", ScopedAsyncio(to_thread=check_destination))
+    monkeypatch.setattr(app.BROWSER_MANAGER, "get_for_task", lambda *_args, **_kwargs: state)
+    monkeypatch.setattr(state, "navigate_to_url", AsyncMock())
+    monkeypatch.setattr(state, "set_active_page", AsyncMock())
+    task = SimpleNamespace(task_id="tsk_tab", workflow_run_id="wr_tab")
+    action = action_types.NewTabAction(url="https://93.184.216.34/next")
+
+    with pytest.raises(MissingBrowserState) if native_close else contextlib.nullcontext():
+        results = await handle_new_tab_action(action, MagicMock(), MagicMock(), task, MagicMock())
+        assert isinstance(results[-1], ActionSuccess)
+
+    assert context.new_page.await_count == (0 if native_close else 1)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("native_close", [True, False], ids=["native_close_during_goto", "ordinary_navigation_error"])
+async def test_url_block_that_loses_its_browser_mid_navigation_stops_the_run(
+    monkeypatch: pytest.MonkeyPatch, native_close: bool
+) -> None:
+    block = UrlBlock(
+        label="go", url="https://93.184.216.34/next", output_parameter=output_parameter(), continue_on_failure=True
+    )
+    state, context, _ = _bound_state("wr_task_block_test")
+    gotos: list[str] = []
+
+    async def goto(url: str, **_: object) -> None:
+        gotos.append(url)
+        if native_close:
+            state._on_browser_context_closed(context)
+            raise PlaywrightError("Target page, context or browser has been closed")
+        raise PlaywrightError("Timeout 30000ms exceeded.")
+
+    page = MagicMock(url="https://93.184.216.34/start")
+    page.goto = goto
+    state.get_working_page = AsyncMock(return_value=page)  # type: ignore[method-assign]
+    state.take_fullpage_screenshot = AsyncMock(return_value=None)  # type: ignore[method-assign]
+    monkeypatch.setattr(navigation_module, "asyncio", ScopedAsyncio(sleep=AsyncMock()))
+    now = datetime.now(timezone.utc)
+    previous_task = make_task(now, make_organization(now), status=TaskStatus.completed)
+    mark_failed = AsyncMock(return_value=MagicMock())
+    monkeypatch.setattr(WorkflowService, "mark_workflow_run_as_failed_if_not_final", mark_failed)
+
+    with (
+        skyvern_context.scoped(SkyvernContext()),
+        mock_block_execute_deps(working_page_url="https://93.184.216.34/start") as deps,
+        patch.object(Block, "_generate_workflow_run_block_description", new_callable=AsyncMock),
+        patch.object(Block, "record_output_parameter_value", new_callable=AsyncMock),
+    ):
+        deps.browser_manager.get_for_workflow_run = MagicMock(return_value=state)
+        deps.tasks_db.get_last_task_for_workflow_run = AsyncMock(return_value=previous_task)
+        deps.observer_db.create_workflow_run_block = AsyncMock(
+            return_value=SimpleNamespace(workflow_run_block_id="wrb_go")
+        )
+        block_module.app.DATABASE.workflow_runs.admit_workflow_run_block_dispatch = admit_block_dispatch()
+
+        result = await block.execute_safe(workflow_run_id="wr_task_block_test", organization_id="o_test")
+        persisted_codes = {
+            code
+            for update in deps.observer_db.update_workflow_run_block.await_args_list
+            if update.kwargs.get("workflow_run_block_id") == "wrb_go"
+            for code in update.kwargs.get("error_codes") or []
+        }
+
+    _, should_stop = await WorkflowService()._handle_block_result_status(
+        block=block,
+        block_idx=0,
+        blocks_cnt=3,
+        block_result=result,
+        workflow_run=MagicMock(),
+        workflow_run_id="wr_task_block_test",
+    )
+    retry_policy = WorkflowRetryPolicy.model_validate({"max_retries": 2, "retry_on": [{"status": "failed"}]})
+    retry = evaluate_retry_policy(retry_policy, WorkflowRunStatus.failed, persisted_codes, 0)
+
+    assert result.status == BlockStatus.failed
+    if native_close:
+        assert gotos == [block.url]
+        assert result.can_continue_after_failure is False
+        assert persisted_codes == {BROWSER_CONNECTION_LOST_ERROR_CODE}
+        assert should_stop is True
+        assert retry == (False, BROWSER_CONNECTION_LOST_ERROR_CODE)
+    else:
+        assert gotos == [block.url] * NAVIGATION_MAX_RETRY_TIME
+        assert result.can_continue_after_failure is True
+        assert persisted_codes == set()
+        assert should_stop is False
+        assert retry == (True, "matched")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("seam", "dispatches", "backoffs"),
+    [
+        ("native_close_during_goto", 1, 0),
+        ("native_close_during_backoff", 1, 1),
+        ("native_close_during_destination_check", 0, 0),
+        ("probe_timeout_during_backoff", NAVIGATION_MAX_RETRY_TIME, NAVIGATION_MAX_RETRY_TIME - 1),
+        ("cancelled_during_backoff", 1, 1),
+    ],
+)
+async def test_navigation_is_not_dispatched_again_after_its_browser_is_lost_while_it_waits(
+    monkeypatch: pytest.MonkeyPatch, seam: str, dispatches: int, backoffs: int
+) -> None:
+    state, context, browser = _bound_state("wr_test")
+    context._skyvern_cdp_download_interceptor = None
+    page = MagicMock()
+
+    async def goto(*_: object, **__: object) -> None:
+        if seam == "native_close_during_goto":
+            state._on_browser_context_closed(context)
+        raise PlaywrightError("net::ERR_CONNECTION_RESET")
+
+    async def lose_browser_while_waiting(_: float) -> None:
+        if seam == "native_close_during_backoff":
+            state._on_browser_context_closed(context)
+        elif seam == "probe_timeout_during_backoff":
+            _probe_timeout(state, context, browser)
+        elif seam == "cancelled_during_backoff":
+            raise asyncio.CancelledError
+
+    async def destination_check(check: object, *args: object) -> object:
+        if seam == "native_close_during_destination_check":
+            state._on_browser_context_closed(context)
+        return check(*args)  # type: ignore[operator]
+
+    page.goto = AsyncMock(side_effect=goto)
+    backoff = AsyncMock(side_effect=lose_browser_while_waiting)
+    monkeypatch.setattr(navigation_module, "asyncio", ScopedAsyncio(sleep=backoff, to_thread=destination_check))
+
+    with pytest.raises(
+        asyncio.CancelledError if seam == "cancelled_during_backoff" else FailedToNavigateToUrl
+    ) as error:
+        await state.navigate_to_url(page=page, url="https://93.184.216.34/next")
+
+    assert page.goto.await_count == dispatches
+    assert backoff.await_count == backoffs
+    if seam == "native_close_during_backoff":
+        assert "ERR_CONNECTION_RESET" in str(error.value)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("native_close", [True, False], ids=["native_close_during_reload", "ordinary_reload_failure"])
+async def test_reload_degradation_stops_after_its_browser_is_lost(native_close: bool) -> None:
+    state, context, _ = _bound_state("wr_test")
+    page = MagicMock(url="https://93.184.216.34/page")
+
+    async def reload(**_: object) -> None:
+        if native_close:
+            state._on_browser_context_closed(context)
+            raise PlaywrightError("Target page, context or browser has been closed")
+        raise PlaywrightError("net::ERR_CONNECTION_RESET")
+
+    page.reload = AsyncMock(side_effect=reload)
+    state.get_working_page = AsyncMock(return_value=page)  # type: ignore[method-assign]
+
+    with pytest.raises(FailedToReloadPage):
+        await state.reload_page(degradation=True)
+
+    assert page.reload.await_count == (1 if native_close else 3)
+
+
 def test_is_connected_false_when_context_close_was_called() -> None:
     browser = MagicMock()
     browser.is_connected = MagicMock(return_value=True)
     context = MagicMock()
     context.browser = browser
-    context._impl_obj = MagicMock(_close_was_called=True, _closed=False)
+    context._impl_obj = MagicMock(_closing_or_closed=True, _closed=False)
     assert _state_with_context(context).is_connected() is False
 
 
@@ -1570,7 +2315,7 @@ async def test_runtime_disconnect_liveness_requires_transport_evidence(signal: s
     if signal in {"closed", "cancelled", "result", "transport"}:
         context._impl_obj._connection._closed_error = RuntimeError("connection closed")
     elif signal == "close_called":
-        context._impl_obj._close_was_called = True
+        context._impl_obj._closing_or_closed = True
         kind = "context_closed"
     else:
         context.browser.is_connected.return_value = False
@@ -2040,7 +2785,7 @@ async def test_browser_runtime_event_failed_close_intent_is_not_proof_of_context
     context.cookies = AsyncMock(return_value=[])
 
     async def fail_after_close_intent() -> None:
-        context._impl_obj._close_was_called = True
+        context._impl_obj._closing_or_closed = True
         if failure == "timeout":
             await asyncio.Event().wait()
         raise RuntimeError("context close failed before completion")
@@ -2622,6 +3367,37 @@ async def test_a_caller_recovering_during_the_reap_gets_the_reaper_replacement()
 
     assert await caller is replacement
     assert context.new_page.await_count == 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("native_close", [True, False], ids=["lost_during_the_first_replacement", "page_only_crash"])
+async def test_queued_crash_recoveries_open_no_page_after_the_first_lost_the_browser(native_close: bool) -> None:
+    gate = asyncio.Event()
+    crashed, sibling, replacement = _crashable_page(), _crashable_page(), _crashable_page()
+    crashed.url = sibling.url = replacement.url = "about:blank"
+    context = _crashable_context(crashed, sibling)
+    state = RealBrowserState(pw=MagicMock(), browser_context=context, page=crashed)
+    state.bind_runtime_event_context(BrowserRuntimeLogContext(workflow_run_id="wr_test"))
+
+    async def open_page() -> MagicMock:
+        await gate.wait()
+        if native_close:
+            state._on_browser_context_closed(context)
+            raise PlaywrightError("Target page, context or browser has been closed")
+        context.pages.append(replacement)
+        return replacement
+
+    context.new_page = AsyncMock(side_effect=open_page)
+    state._on_page_crashed(crashed)
+    state._on_page_crashed(sibling)
+    await asyncio.sleep(0)
+    gate.set()
+    await _reap_crashed_pages(state)
+
+    assert context.new_page.await_count == 1
+    async with state._reopen_working_page_lock:
+        with pytest.raises(MissingBrowserStatePage) if native_close else contextlib.nullcontext():
+            assert await asyncio.wait_for(state.must_get_working_page(), 1) is replacement
 
 
 @pytest.mark.asyncio
@@ -3547,6 +4323,16 @@ async def test_reconnect_scheduled_stop_observes_loss_before_installing_intent(
     )
     monkeypatch.setattr(state, "get_working_page", AsyncMock(return_value=MagicMock()))
     monkeypatch.setattr(state, "check_and_fix_state", finish_setup)
+    if signal == "context_then_driver" and not guarded:
+        # The owning run's current context closes natively before the swap, so the run never gets a replacement.
+        with skyvern_context.scoped(SkyvernContext(workflow_run_id="ambient-run")):
+            with pytest.raises(MissingBrowserState, match=BROWSER_CONNECTION_LOST_ERROR_CODE):
+                await state.reconnect(stale_context_is_unusable=True)
+        assert state.browser_context is old
+        assert state.pw is old_pw
+        replacement.pw.stop.assert_awaited()
+        assert state.get_browser_connection_loss() is not None
+        return
     with skyvern_context.scoped(SkyvernContext(workflow_run_id="ambient-run")), capture_logs() as logs:
         await state.reconnect(stale_context_is_unusable=True)
         await delivered.wait()

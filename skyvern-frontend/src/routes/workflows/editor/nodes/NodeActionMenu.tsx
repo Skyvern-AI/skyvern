@@ -14,7 +14,6 @@ import {
   TooltipProvider,
   TooltipTrigger,
 } from "@/components/ui/tooltip";
-import { useRecordingStore } from "@/store/useRecordingStore";
 
 type Props = {
   duplicateDisabledReason?: string | null;
@@ -39,21 +38,14 @@ function NodeActionMenu({
   onDuplicate,
   onShowScript,
 }: Props) {
-  const recordingStore = useRecordingStore();
-  const isRecording = recordingStore.isRecording;
-  const deleteGated = isRecording || isCanvasLocked;
-  const deleteGateReason = isRecording
-    ? "Finish recording the task to delete blocks"
-    : isCanvasLocked
-      ? "Unlock canvas to delete blocks"
-      : null;
-  const duplicateGated =
-    isRecording || isCanvasLocked || Boolean(duplicateDisabledReason);
-  const duplicateGateReason = isRecording
-    ? "Finish recording the task to duplicate blocks"
-    : isCanvasLocked
-      ? "Unlock canvas to duplicate blocks"
-      : duplicateDisabledReason;
+  const deleteGated = isCanvasLocked;
+  const deleteGateReason = isCanvasLocked
+    ? "Unlock canvas to delete blocks"
+    : null;
+  const duplicateGated = isCanvasLocked || Boolean(duplicateDisabledReason);
+  const duplicateGateReason = isCanvasLocked
+    ? "Unlock canvas to duplicate blocks"
+    : duplicateDisabledReason;
 
   if (!isDeletable && !isDuplicable && !isScriptable) {
     return null;

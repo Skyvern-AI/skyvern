@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from datetime import UTC, datetime
 from typing import TYPE_CHECKING, Awaitable, Callable, Literal, Protocol
 from urllib.parse import urlparse
 
@@ -7,7 +8,7 @@ from playwright.async_api import BrowserContext, Page, Playwright
 
 from skyvern.config import settings
 from skyvern.constants import NAVIGATION_MAX_RETRY_TIME
-from skyvern.exceptions import BrowserStateDiagnostic
+from skyvern.exceptions import BROWSER_CONNECTION_LOST_ERROR_CODE, BrowserStateDiagnostic, MissingBrowserState
 from skyvern.schemas.runs import ProxyLocationInput
 from skyvern.webeye.browser_artifacts import BrowserArtifacts
 from skyvern.webeye.browser_factory import BrowserCleanupFunc
@@ -76,6 +77,8 @@ class BrowserState(Protocol):
         browser_address: str | None = None,
         browser_profile_id: str | None = None,
         browser_session_id: str | None = None,
+        *,
+        before_navigation: Callable[[BrowserState], None] | None = None,
     ) -> None: ...
 
     def is_connected(self) -> bool: ...
@@ -85,6 +88,11 @@ class BrowserState(Protocol):
     ) -> None: ...
 
     def get_browser_state_diagnostic(self) -> BrowserStateDiagnostic | None: ...
+
+    def get_browser_connection_loss(self) -> BrowserStateDiagnostic | None: ...
+
+    @property
+    def active_run_owner(self) -> str | None: ...
 
     async def reconnect(
         self,
@@ -137,6 +145,7 @@ class BrowserState(Protocol):
         browser_profile_id: str | None = None,
         browser_session_id: str | None = None,
         navigation_run_id: str | None = None,
+        before_navigation: Callable[[BrowserState], None] | None = None,
     ) -> Page: ...
 
     async def list_valid_pages(self, max_pages: int = settings.BROWSER_MAX_PAGES_NUMBER) -> list[Page]: ...
@@ -194,3 +203,26 @@ def get_browser_state_diagnostic(browser_state: BrowserState | None) -> BrowserS
     getter = getattr(browser_state, "get_browser_state_diagnostic", None)
     diagnostic = getter() if callable(getter) else None
     return diagnostic if isinstance(diagnostic, BrowserStateDiagnostic) else None
+
+
+def get_browser_connection_loss(browser_state: BrowserState | None) -> BrowserStateDiagnostic | None:
+    """Read the terminal loss fact without requiring every test double to implement it."""
+    if browser_state is None:
+        return None
+    getter = getattr(browser_state, "get_browser_connection_loss", None)
+    loss = getter() if callable(getter) else None
+    return loss if isinstance(loss, BrowserStateDiagnostic) else None
+
+
+def raise_if_browser_connection_lost(
+    browser_state: BrowserState | None, *, task_id: str | None = None, workflow_run_id: str | None = None
+) -> None:
+    connection_loss = get_browser_connection_loss(browser_state)
+    if connection_loss is not None:
+        raise MissingBrowserState(
+            task_id=task_id,
+            workflow_run_id=workflow_run_id,
+            diagnostic=connection_loss,
+            detected_at=datetime.now(UTC),
+            failure_reason=BROWSER_CONNECTION_LOST_ERROR_CODE,
+        )

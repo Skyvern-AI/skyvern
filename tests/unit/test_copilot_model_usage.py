@@ -88,8 +88,8 @@ def test_direct_event_preserves_zeroes_and_omits_unavailable_optional_fields() -
 def test_direct_event_is_a_closed_content_free_scalar_schema() -> None:
     logger = CapturingLogger()
     event = CopilotModelUsageEvent(
-        request_model="vertex_ai/gemini-2.5-flash",
-        response_model="gemini-2.5-flash",
+        request_model="vertex_ai/gemini-3-flash-preview",
+        response_model="gemini-3-flash-preview",
         provider_name="vertex_ai",
         input_tokens=12,
         output_tokens=3,
@@ -281,7 +281,7 @@ def test_unrelated_direct_event_does_not_log() -> None:
 @pytest.mark.parametrize(
     ("provider_name", "model", "expected"),
     [
-        ("vertex_ai", "gemini-2.5-flash", "gcp.vertex_ai"),
+        ("vertex_ai", "gemini-3-flash-preview", "gcp.vertex_ai"),
         ("bedrock", "anthropic.claude", "aws.bedrock"),
         ("Azure", "gpt-5.6", "azure.ai.openai"),
         ("Cloudflare", "anthropic/claude-sonnet-4-6", "anthropic"),

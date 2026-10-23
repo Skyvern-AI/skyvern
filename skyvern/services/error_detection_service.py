@@ -21,7 +21,7 @@ from skyvern.forge.sdk.core import skyvern_context
 from skyvern.forge.sdk.models import Step
 from skyvern.forge.sdk.schemas.tasks import Task
 from skyvern.services.action_service import get_action_history
-from skyvern.webeye.actions.handler import extract_user_defined_errors
+from skyvern.webeye.actions.handler import _match_user_defined_error_from_reasoning, extract_user_defined_errors
 from skyvern.webeye.browser_state import BrowserState
 
 LOG = structlog.get_logger()
@@ -58,28 +58,26 @@ async def detect_user_defined_errors_for_task(
         )
         return []
 
+    detected: list[UserDefinedError] = []
     try:
-        # Try to use full page-based detection if browser state is available
-        if browser_state is not None:
-            page = await browser_state.get_working_page()
-            if page is not None:
-                LOG.info(
-                    "Using page-based error detection",
-                    task_id=task.task_id,
-                    step_id=step.step_id,
-                    url=page.url,
-                )
-                return await _detect_errors_from_page(task, step, page, browser_state, failure_reason)
-
-        # Fall back to context-based detection when page is not available
-        LOG.info(
-            "Browser state or page not available, using context-based error detection",
-            task_id=task.task_id,
-            step_id=step.step_id,
-            has_browser_state=browser_state is not None,
-            has_failure_reason=failure_reason is not None,
-        )
-        return await _detect_errors_from_context(task, step, failure_reason)
+        page = await browser_state.get_working_page() if browser_state is not None else None
+        if browser_state is not None and page is not None:
+            LOG.info(
+                "Using page-based error detection",
+                task_id=task.task_id,
+                step_id=step.step_id,
+                url=page.url,
+            )
+            detected = await _detect_errors_from_page(task, step, page, browser_state, failure_reason)
+        else:
+            LOG.info(
+                "Browser state or page not available, using context-based error detection",
+                task_id=task.task_id,
+                step_id=step.step_id,
+                has_browser_state=browser_state is not None,
+                has_failure_reason=failure_reason is not None,
+            )
+            detected = await _detect_errors_from_context(task, step, failure_reason)
 
     except asyncio.CancelledError:
         # Don't swallow cancellation - let it propagate
@@ -93,7 +91,11 @@ async def detect_user_defined_errors_for_task(
             step_id=step.step_id,
             exc_info=True,
         )
-        return []
+    if not detected and failure_reason:
+        # Also overrides a model that read the reason and answered no code, as the page path's own match already does.
+        # Only a single code named verbatim counts; a description substring is too loose to stand on its own.
+        detected = _match_user_defined_error_from_reasoning(task, step, failure_reason, codes_only=True)
+    return detected
 
 
 async def _detect_errors_from_page(

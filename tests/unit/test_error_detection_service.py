@@ -344,3 +344,57 @@ async def test_detect_errors_empty_llm_response(mock_browser_state, mock_step):
         )
 
         assert detected_errors == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("path", ["no_page", "scrape_fails", "detector_raises", "page_lookup_raises"])
+@pytest.mark.parametrize(
+    ("failure_reason", "expected"),
+    [
+        ("The bank answered payment_failed at checkout.", ["payment_failed"]),
+        # A description substring is too loose to stand on its own, and naming two codes is not concluding one.
+        ("The bank said: Credit card was declined.", []),
+        ("Either payment_failed or address_invalid; the page did not say.", []),
+    ],
+)
+async def test_every_empty_detection_path_falls_back_to_a_single_code_the_reason_names(
+    mock_step, path: str, failure_reason: str, expected: list[str]
+) -> None:
+    now = datetime.now()
+    task = make_task(
+        now,
+        make_organization(now),
+        error_code_mapping={"payment_failed": "Credit card was declined", "address_invalid": "Bad address"},
+    )
+    browser_state = MagicMock()
+    page = MagicMock()
+    page.url = "https://example.com"
+    browser_state.get_working_page = AsyncMock(
+        return_value=None if path == "no_page" else page,
+        side_effect=Exception("browser gone") if path == "page_lookup_raises" else None,
+    )
+    browser_state.scrape_website = AsyncMock(
+        side_effect=Exception("down") if path == "scrape_fails" else None,
+        return_value=MagicMock() if path == "detector_raises" else None,
+    )
+
+    with (
+        patch(
+            "skyvern.services.error_detection_service._detect_errors_from_context",
+            new_callable=AsyncMock,
+            return_value=[],
+        ),
+        patch(
+            "skyvern.services.error_detection_service.extract_user_defined_errors",
+            new_callable=AsyncMock,
+            side_effect=Exception("llm down"),
+        ),
+    ):
+        detected = await detect_user_defined_errors_for_task(
+            task=task,
+            step=mock_step,
+            browser_state=browser_state,
+            failure_reason=failure_reason,
+        )
+
+    assert [error.error_code for error in detected] == expected

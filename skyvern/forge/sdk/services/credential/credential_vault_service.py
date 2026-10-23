@@ -15,6 +15,7 @@ from skyvern.forge.sdk.schemas.credentials import (
     CreditCardBillingAddress,
     CreditCardCredential,
     PasswordCredential,
+    TotpType,
 )
 
 LOG = structlog.get_logger()
@@ -44,6 +45,7 @@ class CredentialVaultService(ABC):
         organization_id: str,
         data: CreateCredentialRequest,
         created_by: str | None = None,
+        is_passkey_setup_pending: bool = False,
     ) -> Credential:
         """Create a new credential in the vault and database."""
 
@@ -269,6 +271,7 @@ class CredentialVaultService(ABC):
         item_id: str,
         vault_type: CredentialVaultType,
         created_by: str | None = None,
+        is_passkey_setup_pending: bool = False,
     ) -> Credential:
         if data.credential_type == CredentialType.PASSWORD:
             return await app.DATABASE.credentials.create_credential(
@@ -287,6 +290,9 @@ class CredentialVaultService(ABC):
                 proxy_location=data.proxy_location,
                 proxy_session_id=data.proxy_session_id,
                 created_by=created_by,
+                is_passkey_setup_pending=(
+                    True if is_passkey_setup_pending and data.credential.totp_type == TotpType.PASSKEY else None
+                ),
             )
         elif data.credential_type == CredentialType.CREDIT_CARD:
             return await app.DATABASE.credentials.create_credential(

@@ -1,27 +1,14 @@
 import { PlusIcon } from "@radix-ui/react-icons";
 import { Handle, NodeProps, Position, useEdges, useNodes } from "@xyflow/react";
 import { useRef, useState } from "react";
-import { useWorkflowPermanentId } from "@/routes/workflows/WorkflowPermanentIdContext";
 
-import { useProcessRecordingMutation } from "@/routes/browserSessions/hooks/useProcessRecordingMutation";
 import { useCopilotActionStore } from "@/store/useCopilotActionStore";
-import { useDebugStore } from "@/store/useDebugStore";
 import {
   BranchContext,
   useWorkflowPanelStore,
 } from "@/store/WorkflowPanelStore";
 import { useWorkflowSettingsStore } from "@/store/WorkflowSettingsStore";
-import { useRecordedBlocksStore } from "@/store/RecordedBlocksStore";
-import { useRecordingStore } from "@/store/useRecordingStore";
 import { useRecordingLauncherStore } from "@/store/useRecordingLauncherStore";
-import { useFeatureFlag } from "@/hooks/useFeatureFlag";
-import { WORKFLOW_COPILOT_DEMONSTRATION_FLAG } from "@/util/featureFlags";
-import {
-  requestRecordingStart,
-  useIsMountedRef,
-} from "@/routes/workflows/editor/recording/pendingRecordingStartGate";
-import { runWorkflowAuthoringAction } from "@/store/WorkflowYamlEditorStore";
-import { useSettingsStore } from "@/store/SettingsStore";
 import { cn } from "@/util/utils";
 import {
   Tooltip,
@@ -33,7 +20,6 @@ import { toast } from "@/components/ui/use-toast";
 
 import type { NodeAdderNode } from "./types";
 import { WorkflowAddMenu } from "../../WorkflowAddMenu";
-import { WorkflowAdderBusy } from "../../WorkflowAdderBusy";
 import { SELECTED_RING_CLASSES } from "../../selection/selectedRingClasses";
 import { useWorkflowScopeReadOnly } from "../../WorkflowScopeContext";
 import { findBranchContextForInsertion } from "../../workflowInsertion";
@@ -45,28 +31,19 @@ import {
 } from "../../workspaceAuthoringActions";
 
 function NodeAdderNode({ id, parentId }: NodeProps<NodeAdderNode>) {
-  const workflowPermanentId = useWorkflowPermanentId();
   const edges = useEdges();
   const nodes = useNodes();
-  const debugStore = useDebugStore();
-  const recordingStore = useRecordingStore();
   const startDemonstration = useRecordingLauncherStore(
     (state) => state.startDemonstration,
   );
   const stageAttachment = useCopilotActionStore(
     (state) => state.stageAttachment,
   );
-  const demonstrationEnabled =
-    useFeatureFlag(WORKFLOW_COPILOT_DEMONSTRATION_FLAG) === true;
-  const settingsStore = useSettingsStore();
   const workflowSettingsStore = useWorkflowSettingsStore();
   const setWorkflowPanelState = useWorkflowPanelStore(
     (state) => state.setWorkflowPanelState,
   );
   const workflowStatePanel = useWorkflowPanelStore();
-  const setRecordedBlocks = useRecordedBlocksStore(
-    (state) => state.setRecordedBlocks,
-  );
 
   // SOP upload
   const fileInputRef = useRef<HTMLInputElement>(null);
@@ -108,53 +85,18 @@ function NodeAdderNode({ id, parentId }: NodeProps<NodeAdderNode>) {
     return incomingEdges[0]?.source;
   })();
 
-  const processRecordingMutation = useProcessRecordingMutation({
-    browserSessionId: settingsStore.browserSessionId,
-    onSuccess: (result, owner) => {
-      setRecordedBlocks(
-        result,
-        {
-          previous: previous ?? null,
-          next: id,
-          parent: parentId,
-          connectingEdgeType: "default",
-        },
-        owner,
-      );
-    },
-  });
-
-  const isProcessing =
-    processRecordingMutation.isPending ||
-    recordingStore.finishRequested ||
-    recordingStore.isCommitting;
-
-  const isBusy =
-    (isProcessing || recordingStore.isRecording) &&
-    (debugStore.isDebugMode || debugStore.blockRunsEnabled) &&
-    settingsStore.isUsingABrowser &&
-    workflowStatePanel.workflowPanelState.data?.previous === previous &&
-    workflowStatePanel.workflowPanelState.data?.next === id &&
-    workflowStatePanel.workflowPanelState.data?.parent ===
-      (parentId || undefined);
-
   const isBlockedByFinally =
     !parentId && Boolean(workflowSettingsStore.finallyBlockLabel);
   // Read-only canvases (WorkflowComparisonPanel) must not let the `+`
   // affordance open the node library — selecting a block from there
   // would route through `addNode` and mutate the underlying workflow.
   const isReadOnlyScope = useWorkflowScopeReadOnly();
-  const isDisabled =
-    isReadOnlyScope ||
-    isBlockedByFinally ||
-    (!isBusy && recordingStore.isRecording);
+  const isDisabled = isReadOnlyScope || isBlockedByFinally;
   const disabledReason: string | null = isReadOnlyScope
     ? "This canvas is read-only"
     : isBlockedByFinally
       ? "Finally block must run last - choose a position above it"
-      : !isBusy && recordingStore.isRecording
-        ? "Finish recording the task to add a block"
-        : null;
+      : null;
 
   const updateWorkflowPanelState = (
     active: boolean,
@@ -181,60 +123,19 @@ function NodeAdderNode({ id, parentId }: NodeProps<NodeAdderNode>) {
     updateWorkflowPanelState(true, branchContext);
   };
 
-  const mountedRef = useIsMountedRef();
   const onRecord = () => {
-    if (demonstrationEnabled) {
-      const insertion = demonstrationInsertionFromNodes(nodes, {
-        previous: previous ?? null,
-        next: id,
-        parent: parentId,
+    const insertion = demonstrationInsertionFromNodes(nodes, {
+      previous: previous ?? null,
+      next: id,
+      parent: parentId,
+    });
+    if (!insertion) {
+      toast({
+        title: "Recording inside a loop or branch isn't supported yet",
       });
-      if (!insertion) {
-        toast({
-          title: "Recording inside a loop or branch isn't supported yet",
-        });
-        return;
-      }
-      startDemonstration?.({ insertion });
       return;
     }
-    if (recordingStore.isRecording) {
-      recordingStore.setIsRecording(false);
-    } else {
-      requestRecordingStart(
-        () =>
-          void runWorkflowAuthoringAction(() => {
-            recordingStore.setIsRecording(true, {
-              workflowPermanentId: workflowPermanentId ?? null,
-              browserSessionId: settingsStore.browserSessionId,
-            });
-            updateWorkflowPanelState(false);
-          }),
-        "node_adder",
-        { isStillValid: () => mountedRef.current, recordsAfterDiscard: false },
-      );
-    }
-  };
-
-  const onEndRecord = () => {
-    if (isProcessing) {
-      return;
-    }
-
-    // With live interpretation, the recording panel owns the commit so user
-    // edits/deletes to draft steps are honored.
-    if (recordingStore.isRecording && recordingStore.sessionRevision > 0) {
-      recordingStore.requestFinish();
-      return;
-    }
-
-    if (recordingStore.isRecording) {
-      recordingStore.setIsRecording(false);
-    }
-
-    void runWorkflowAuthoringAction(() =>
-      processRecordingMutation.mutateAsync(),
-    );
+    startDemonstration?.({ insertion });
   };
 
   const onUploadSOP = () => {
@@ -302,25 +203,13 @@ function NodeAdderNode({ id, parentId }: NodeProps<NodeAdderNode>) {
       adderInner
     );
 
-  const busy = (
-    <WorkflowAdderBusy
-      color={isProcessing ? "gray" : "red"}
-      operation={isProcessing ? "processing" : "recording"}
-      onComplete={() => {
-        onEndRecord();
-      }}
-    >
-      {adder}
-    </WorkflowAdderBusy>
-  );
-
   const menu = (
     <WorkflowAddMenu
       onAdd={onAdd}
       onRecord={onRecord}
       onUploadSOP={onUploadSOP}
       canUploadSOP={stageAttachment !== null}
-      canRecordTask={!demonstrationEnabled || startDemonstration !== null}
+      canRecordTask={startDemonstration !== null}
       onPinnedChange={setMenuPinned}
     >
       {adder}
@@ -348,7 +237,7 @@ function NodeAdderNode({ id, parentId }: NodeProps<NodeAdderNode>) {
         id="b"
         className="opacity-0"
       />
-      {isBusy ? busy : isDisabled ? adder : menu}
+      {isDisabled ? adder : menu}
     </div>
   );
 }

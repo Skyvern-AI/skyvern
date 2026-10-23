@@ -36,6 +36,7 @@ from skyvern.forge.sdk.api.llm.exceptions import (
 )
 from skyvern.forge.sdk.api.llm.models import LLMConfig
 from skyvern.forge.sdk.api.llm.utils import uses_only_anthropic_models
+from skyvern.forge.sdk.artifact.models import ArtifactType
 from skyvern.forge.sdk.copilot import secret_scrub
 from skyvern.forge.sdk.copilot.secret_scrub import REDACTED_SECRET_PLACEHOLDER
 from skyvern.forge.sdk.core.skyvern_context import SkyvernContext
@@ -182,6 +183,7 @@ async def test_custom_llm_http_clients_do_not_follow_redirects(
 
 @pytest.mark.parametrize("request_error", [None, RuntimeError("provider failed")], ids=["success", "failure"])
 @pytest.mark.asyncio
+@pytest.mark.usefixtures("public_dns")
 async def test_custom_openrouter_client_is_scoped_to_request(
     monkeypatch: pytest.MonkeyPatch, request_error: Exception | None
 ) -> None:
@@ -344,6 +346,7 @@ async def test_hard_deadline_surfaces_as_retryable_from_the_public_call(monkeypa
 
 
 @pytest.mark.asyncio
+@pytest.mark.usefixtures("public_dns")
 async def test_hard_deadline_on_a_custom_openrouter_client_closes_it(monkeypatch: pytest.MonkeyPatch) -> None:
     async def _hang(**kwargs: Any) -> Any:
         await asyncio.sleep(60)
@@ -502,6 +505,7 @@ def _litellm_rate_limit_error() -> Exception:
     "make_rate_limit_error", [_openai_rate_limit_error, _litellm_rate_limit_error], ids=["openai", "litellm"]
 )
 @pytest.mark.asyncio
+@pytest.mark.usefixtures("public_dns")
 async def test_a_rate_limited_custom_client_call_is_retryable(
     monkeypatch: pytest.MonkeyPatch, make_rate_limit_error: Any
 ) -> None:
@@ -651,6 +655,22 @@ def _stub_successful_llm_caller(
     logger = DummyLogger()
     monkeypatch.setattr(api_handler_factory, "LOG", logger)
     return caller, logger
+
+
+@pytest.mark.asyncio
+async def test_llm_caller_records_the_tool_schema_it_sent(monkeypatch: pytest.MonkeyPatch) -> None:
+    caller, _ = _stub_successful_llm_caller(monkeypatch)
+    api_handler_factory.app.ARTIFACT_MANAGER.prepare_llm_artifact = AsyncMock(return_value=None)
+    tools = [{"type": "function", "function": {"name": "click", "parameters": {"type": "object", "properties": {}}}}]
+
+    await caller.call(prompt="test", prompt_name="tool-schema-test", thought=MagicMock(), tools=tools)
+
+    requests = [
+        json.loads(call.kwargs["data"])
+        for call in api_handler_factory.app.ARTIFACT_MANAGER.prepare_llm_artifact.call_args_list
+        if call.kwargs["artifact_type"] == ArtifactType.LLM_REQUEST
+    ]
+    assert [request["tools"] for request in requests] == [tools]
 
 
 @pytest.mark.asyncio
@@ -1342,7 +1362,7 @@ def test_uses_only_anthropic_models_rejects_openai_claude_proxy() -> None:
 
 def test_normalize_llm_model_strips_provider_prefix() -> None:
     """LiteLLM returns model names with provider prefixes; dbt expects the bare name."""
-    assert api_handler_factory._normalize_llm_model("vertex_ai/gemini-2.5-flash") == "gemini-2.5-flash"
+    assert api_handler_factory._normalize_llm_model("vertex_ai/gemini-3-flash-preview") == "gemini-3-flash-preview"
     assert api_handler_factory._normalize_llm_model("openai/gpt-4.1-mini") == "gpt-4.1-mini"
     assert api_handler_factory._normalize_llm_model("gpt-4") == "gpt-4"
     assert api_handler_factory._normalize_llm_model(None) is None
@@ -1436,7 +1456,7 @@ async def test_handler_persists_response_model_not_router_group(monkeypatch: pyt
     context.task_id = None
 
     llm_config = LLMConfig(
-        model_name="GEMINI_2_5_FLASH_WITH_FALLBACK",  # router group name, not what response.model returns
+        model_name="TEST_GEMINI_ROUTER_GROUP",  # router group name, not what response.model returns
         required_env_vars=[],
         supports_vision=True,
         add_assistant_prefix=False,
@@ -1456,7 +1476,7 @@ async def test_handler_persists_response_model_not_router_group(monkeypatch: pyt
 
     # LiteLLM returns the actual backing model with its provider prefix
     async def mock_acompletion(*args, **kwargs):
-        return FakeLLMResponse("vertex_ai/gemini-2.5-flash")
+        return FakeLLMResponse("vertex_ai/gemini-3-flash-preview")
 
     monkeypatch.setattr(api_handler_factory.litellm, "acompletion", AsyncMock(side_effect=mock_acompletion))
 
@@ -1488,17 +1508,17 @@ async def test_handler_persists_response_model_not_router_group(monkeypatch: pyt
         organization_id="org_test",
     )
 
-    handler = LLMAPIHandlerFactory.get_llm_api_handler("GEMINI_2_5_FLASH_WITH_FALLBACK")
+    handler = LLMAPIHandlerFactory.get_llm_api_handler("TEST_GEMINI_ROUTER_GROUP")
     await handler(prompt="test prompt", prompt_name=EXTRACT_ACTION_PROMPT_NAME, step=step)
 
     # The persisted model should be the bare response.model, not the router group key
-    assert captured_kwargs.get("last_llm_model") == "gemini-2.5-flash"
+    assert captured_kwargs.get("last_llm_model") == "gemini-3-flash-preview"
 
 
 @pytest.mark.asyncio
 async def test_single_handler_maps_an_unparseable_body_to_retryable(monkeypatch: pytest.MonkeyPatch) -> None:
     llm_config = LLMConfig(
-        model_name="vertex_ai/gemini-2.5-flash",
+        model_name="vertex_ai/gemini-3-flash-preview",
         required_env_vars=[],
         supports_vision=False,
         add_assistant_prefix=False,
@@ -1771,23 +1791,6 @@ def _gemini_3_flash_router() -> LLMRouterConfig:
     )
 
 
-def _gemini_2_5_flash_router() -> LLMRouterConfig:
-    return LLMRouterConfig(
-        model_name="gemini-2.5-flash-gpt-5-mini-fallback-router",
-        required_env_vars=[],
-        supports_vision=True,
-        add_assistant_prefix=False,
-        model_list=[
-            LLMRouterModelConfig(
-                model_name="vertex-gemini-2.5-flash",
-                litellm_params={"model": "vertex_ai/gemini-2.5-flash"},
-            ),
-        ],
-        main_model_group="vertex-gemini-2.5-flash",
-        fallback_model_group="gpt-5-mini-fallback",
-    )
-
-
 class TestGemini3ReasoningEffortExperiment:
     """SKY-9785 experiment. Grouped under a class so the autouse reset doesn't
     couple unrelated tests in this module to the new class-level override."""
@@ -1802,9 +1805,6 @@ class TestGemini3ReasoningEffortExperiment:
     def test_is_gemini_3_model_detects_router_primary(self) -> None:
         """Router primary `main_model_group` carries the gemini-3 substring."""
         assert LLMAPIHandlerFactory._is_gemini_3_model(_gemini_3_flash_router()) is True
-
-    def test_is_gemini_3_model_rejects_gemini_2(self) -> None:
-        assert LLMAPIHandlerFactory._is_gemini_3_model(_gemini_2_5_flash_router()) is False
 
     def test_is_gemini_3_model_detects_direct_config(self) -> None:
         cfg = LLMConfig(
@@ -1839,17 +1839,6 @@ class TestGemini3ReasoningEffortExperiment:
         )
         assert params["reasoning_effort"] == "low"
         assert "thinking" not in params
-
-    def test_apply_gemini_thinking_optimization_leaves_gemini_2_5_alone(self) -> None:
-        """The experiment only rewrites Gemini 3 calls. Gemini 2.5 keeps the strict
-        `thinking={budget_tokens:N}` path that Vertex 2.5 honors."""
-        LLMAPIHandlerFactory.set_gemini_3_reasoning_effort_override("low")
-        params: dict[str, Any] = {}
-        LLMAPIHandlerFactory._apply_gemini_thinking_optimization(
-            params, new_budget=1024, llm_config=_gemini_2_5_flash_router(), prompt_name="extract-actions"
-        )
-        assert "reasoning_effort" not in params
-        assert params["thinking"]["budget_tokens"] == 1024
 
     def test_apply_gemini_thinking_optimization_control_leaves_gemini_3_alone(self) -> None:
         """Override unset (control arm) — Gemini 3 keeps today's behavior so we have a
@@ -1891,21 +1880,6 @@ class TestGemini3ReasoningEffortExperiment:
         assert params["reasoning_effort"] == "medium"
         assert "thinking_level" not in params
         assert "thinking" not in params
-
-    def test_apply_gemini_thinking_optimization_keeps_guard_for_gemini_2_5_with_thinking_level(self) -> None:
-        """Override is set, but model is Gemini 2.5 — the override doesn't apply,
-        and the legacy thinking_level guard fires as before (preserves the historic
-        behavior that Gemini 2.5 routes with a thinking_level config field never
-        get a budget_tokens write)."""
-        LLMAPIHandlerFactory.set_gemini_3_reasoning_effort_override("medium")
-        params: dict[str, Any] = {"thinking_level": "minimal"}
-        LLMAPIHandlerFactory._apply_gemini_thinking_optimization(
-            params, new_budget=1024, llm_config=_gemini_2_5_flash_router(), prompt_name="extract-actions"
-        )
-        # Override didn't fire (not gemini-3), guard fired, nothing else changed.
-        assert "reasoning_effort" not in params
-        assert "thinking" not in params
-        assert params["thinking_level"] == "minimal"
 
 
 class TestThinkingBudgetOptimization:
@@ -2938,7 +2912,7 @@ async def test_non_speculative_cancelled_error_propagates(monkeypatch: pytest.Mo
 
 def test_get_api_parameters_injects_safety_settings_for_gemini_direct_config() -> None:
     llm_config = LLMConfig(
-        model_name="vertex_ai/gemini-2.5-flash",
+        model_name="vertex_ai/gemini-3-flash-preview",
         required_env_vars=[],
         supports_vision=True,
         add_assistant_prefix=False,
@@ -2951,7 +2925,7 @@ def test_get_api_parameters_injects_safety_settings_for_gemini_direct_config() -
 def test_get_api_parameters_omits_safety_settings_for_gemini_router_config() -> None:
     # Router configs must NOT carry safety_settings at the request level — it would ride along
     # to the non-Gemini fallback deployment and 400. Injection happens per-deployment instead.
-    params = LLMAPIHandlerFactory.get_api_parameters(_gemini_2_5_flash_router())
+    params = LLMAPIHandlerFactory.get_api_parameters(_gemini_3_flash_router())
     assert "safety_settings" not in params
 
 
@@ -2959,7 +2933,7 @@ def test_inject_gemini_safety_settings_targets_only_gemini_deployments() -> None
     # Reproduces incident #646: a Gemini primary + Azure fallback in one router. safety_settings
     # must land on the Gemini deployment and stay off the Azure one so the fallback hop survives.
     model_list = [
-        {"model_name": "vertex-gemini-2.5-flash-lite", "litellm_params": {"model": "vertex_ai/gemini-2.5-flash-lite"}},
+        {"model_name": "vertex-gemini-3.1-flash-lite", "litellm_params": {"model": "vertex_ai/gemini-3.1-flash-lite"}},
         {"model_name": "gpt-5-mini-fallback", "litellm_params": {"model": "azure/gpt-5-mini"}},
     ]
     result = api_handler_factory._inject_gemini_safety_settings(model_list)
@@ -3607,7 +3581,7 @@ async def test_router_speculative_call_cost_reaches_its_step(monkeypatch: pytest
 @pytest.mark.asyncio
 async def test_single_model_speculative_call_cost_reaches_its_step(monkeypatch: pytest.MonkeyPatch) -> None:
     llm_config = LLMConfig(
-        model_name="vertex_ai/gemini-2.5-flash",
+        model_name="vertex_ai/gemini-3-flash-preview",
         required_env_vars=[],
         supports_vision=False,
         add_assistant_prefix=False,
@@ -3622,7 +3596,7 @@ async def test_single_model_speculative_call_cost_reaches_its_step(monkeypatch: 
     monkeypatch.setattr(
         api_handler_factory.litellm,
         "acompletion",
-        AsyncMock(return_value=FakeLLMResponse("vertex_ai/gemini-2.5-flash")),
+        AsyncMock(return_value=FakeLLMResponse("vertex_ai/gemini-3-flash-preview")),
     )
     costs = _record_step_cost_writes(monkeypatch)
 

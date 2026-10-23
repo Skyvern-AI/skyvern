@@ -4,7 +4,6 @@
 import _RFB, { type RfbEvent } from "@novnc/novnc/lib/rfb.js";
 type RFB = _RFB;
 const RFB = (_RFB as typeof _RFB & { default?: typeof _RFB }).default ?? _RFB;
-import { InfoCircledIcon } from "@radix-ui/react-icons";
 import { useEffect, useState, useRef, useCallback } from "react";
 import { useQuery } from "@tanstack/react-query";
 
@@ -15,13 +14,10 @@ import {
   type TaskApiResponse,
   type WorkflowRunStatusApiResponse,
 } from "@/api/types";
-import { RecordingPill } from "@/components/RecordingPill";
-import { Tip } from "@/components/Tip";
 import { toast } from "@/components/ui/use-toast";
 import { useCredentialGetter } from "@/hooks/useCredentialGetter";
 import { useLogging } from "@/hooks/useLogging";
 import { statusIsNotFinalized } from "@/routes/tasks/types";
-import { useRecordingStore } from "@/store/useRecordingStore";
 import { useSettingsStore } from "@/store/SettingsStore";
 import {
   useDemonstrationControl,
@@ -105,12 +101,8 @@ type Props = {
   // The session behind browserSessionId, from a parent that already polls it.
   // The stream then reads this instead of polling the session a second time.
   browserSession?: BrowserSessionLiveness;
-  exfiltrate?: boolean;
   interactive?: boolean;
   showControlButtons?: boolean;
-  // Whether unmounting clears the recording store. The studio passes false: it
-  // remounts this component across CDP<->VNC swaps without the session ending.
-  resetRecordingOnUnmount?: boolean;
   task?: {
     run: TaskApiResponse;
   };
@@ -120,9 +112,6 @@ type Props = {
   resizeTrigger?: number;
   isVisible?: boolean;
   isExecuting?: boolean;
-  // Hide the REC pill overlay when the recording panel is visible beside the
-  // stream (its header already shows the timer + step count).
-  hideRecordingIndicator?: boolean;
   onReadyChange?: (isReady: boolean, browserSessionId: string | null) => void;
   onStreamStateChange?: StreamStateChangeHandler;
   onActivity?: () => void;
@@ -134,34 +123,16 @@ type RfbWithFrameUpdates = RFB & {
   _framebufferUpdate?: () => boolean;
 };
 
-/** VNC encode settings: favor fast frames when the user is driving the browser. */
-function applyVncStreamProfile(
-  rfb: RFB,
-  profile: "interactive" | "passive",
-): void {
-  if (profile === "interactive") {
-    // Low CPU per frame beats max zlib compression for click/type latency.
-    rfb.compressionLevel = 1;
-    rfb.qualityLevel = 7;
-    return;
-  }
-  rfb.compressionLevel = 2;
-  rfb.qualityLevel = 6;
-}
-
 function BrowserStream({
   browserSessionId = undefined,
   browserSession: parentBrowserSession = undefined,
-  exfiltrate = false,
   interactive = true,
   showControlButtons = undefined,
-  resetRecordingOnUnmount = true,
   task = undefined,
   workflow = undefined,
   resizeTrigger,
   isVisible = true,
   isExecuting = false,
-  hideRecordingIndicator = false,
   onReadyChange,
   onStreamStateChange,
   onActivity,
@@ -297,10 +268,6 @@ function BrowserStream({
   const gaveUpLoggedRef = useRef(false);
   const streamLogFieldsRef = useRef({ browserSessionId, entity, runId });
   streamLogFieldsRef.current = { browserSessionId, entity, runId };
-  const isRecording = useRecordingStore((state) => state.isRecording);
-  const workflowPermanentId = useRecordingStore(
-    (state) => state.workflowPermanentId,
-  );
   const settingsStore = useSettingsStore();
   const credentialGetter = useCredentialGetter();
   const logging = useLogging();
@@ -351,8 +318,6 @@ function BrowserStream({
       isBrowserSessionAvailable &&
       isBrowserSessionBackendReady &&
       hasVncConnected,
-    exfiltrate,
-    workflowPermanentId,
     clipboard: "vnc",
     socketUrl: legacyMessageSocketUrl,
     reconnectTrigger: messagesDisconnectedTrigger,
@@ -517,11 +482,6 @@ function BrowserStream({
     };
   }, []);
 
-  // The low-latency encode profile is scoped to recording: that's where frame
-  // lag directly delays draft feedback. Other interactive live-browser streams
-  // keep the default profile to avoid a broad bandwidth/CPU bump.
-  const vncInteractive = exfiltrate;
-
   // vnc socket
   useEffect(
     () => {
@@ -590,7 +550,8 @@ function BrowserStream({
         const rfb = new RFB(canvas, vncUrl);
 
         rfb.scaleViewport = true;
-        applyVncStreamProfile(rfb, vncInteractive ? "interactive" : "passive");
+        rfb.compressionLevel = 2;
+        rfb.qualityLevel = 6;
 
         const frameUpdateRfb = rfb as RfbWithFrameUpdates;
         // noVNC does not expose a public framebuffer-update event in 1.5.x.
@@ -717,17 +678,6 @@ function BrowserStream({
     ],
   );
 
-  // Re-apply encode profile when recording starts without tearing down the socket.
-  useEffect(() => {
-    if (!rfbRef.current) {
-      return;
-    }
-    applyVncStreamProfile(
-      rfbRef.current,
-      vncInteractive ? "interactive" : "passive",
-    );
-  }, [vncInteractive]);
-
   // effect to send a message when the user is controlling, vs not controlling.
   // Waits for VNC: the backend drops control messages until its VNC channel
   // exists, and every VNC (re)connect starts that channel agent-controlled.
@@ -804,10 +754,10 @@ function BrowserStream({
   // interactive), a prior grab must be released or its input keeps flowing.
   // Recording and demonstration modes hold control while their control buttons are hidden.
   useEffect(() => {
-    if (!interactive && !showControlButtons && !isRecording && !demonstrating) {
+    if (!interactive && !showControlButtons && !demonstrating) {
       setUserIsControlling(false);
     }
-  }, [interactive, showControlButtons, isRecording, demonstrating]);
+  }, [interactive, showControlButtons, demonstrating]);
 
   useDemonstrationControl(recordingDemonstration, true, setUserIsControlling);
 
@@ -948,37 +898,6 @@ function BrowserStream({
     };
   }, [canvasContainer, showPasted, sendTextToVnc]);
 
-  // Read the flag through a ref so the unmount cleanup stays mount-scoped: a
-  // StrictMode double-mount or transport swap must not cancel a live recording.
-  const resetRecordingOnUnmountRef = useRef(resetRecordingOnUnmount);
-  resetRecordingOnUnmountRef.current = resetRecordingOnUnmount;
-  // By default an unmount means the user abandoned the session, and the reset
-  // keeps stale isRecording from leaking into the next mounted workflow as a
-  // stuck recording panel. Surfaces that remount the stream while the session
-  // lives on (transport swaps, per-run streams) opt out and reset at the
-  // session level instead.
-  useEffect(() => {
-    return () => {
-      if (resetRecordingOnUnmountRef.current) {
-        useRecordingStore.getState().reset();
-      }
-    };
-  }, []);
-
-  // effect to ensure 'take-control' is sent on the rising edge of isRecording
-  useEffect(() => {
-    if (!isRecording) {
-      return;
-    }
-
-    if (!isMessageConnected) {
-      return;
-    }
-
-    sendCommand({ kind: "take-control" });
-    setUserIsControlling(true);
-  }, [isRecording, isMessageConnected, sendCommand]);
-
   const streamDiagnostic: StreamDiagnostic =
     !showStream || !runId
       ? {
@@ -1056,8 +975,7 @@ function BrowserStream({
                     hide: userIsControlling,
                   })}
                 />
-                {/* Recording holds control for capture, so it offers no way to cede it. */}
-                {userIsControlling && !isRecording && !demonstrating && (
+                {userIsControlling && !demonstrating && (
                   <StreamControlBar
                     onStop={() => setUserIsControlling(false)}
                     onPaste={pasteIntoVnc}
@@ -1067,25 +985,7 @@ function BrowserStream({
             )}
           </div>
         )}
-        {isRecording && (
-          <div className="pointer-events-none absolute flex aspect-video w-full items-center justify-center rounded-xl p-2 outline outline-8 outline-offset-[-2px] outline-red-500 animate-in fade-in">
-            {/* The pill duplicates the recording panel's header (timer + step
-                count), so it's hidden while the panel is visible alongside. */}
-            {!hideRecordingIndicator && (
-              <div className="relative h-full w-full">
-                <div className="pointer-events-auto absolute top-[-3rem] flex w-full items-center justify-start gap-2">
-                  <RecordingPill />
-                  <Tip content="Your actions appear in Copilot while you demonstrate the task. Finish when you are ready, or discard from the demonstration menu.">
-                    <div className="cursor-pointer text-red-500">
-                      <InfoCircledIcon />
-                    </div>
-                  </Tip>
-                </div>
-              </div>
-            )}
-          </div>
-        )}
-        {isExecuting && !isRecording && (
+        {isExecuting && (
           <div className="pointer-events-none absolute flex aspect-video w-full animate-glow items-center justify-center rounded-xl p-2 outline outline-8 outline-offset-[-2px] outline-yellow-500">
             <div className="relative h-full w-full">
               <div className="pointer-events-auto absolute top-[-3rem] flex w-full items-center justify-start gap-2 text-yellow-500">

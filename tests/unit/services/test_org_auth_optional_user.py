@@ -7,6 +7,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 
 from skyvern.forge.sdk.services import org_auth_service
+from skyvern.forge.sdk.services.request_principal import AuthKind, RequestPrincipal
 
 
 @pytest.mark.asyncio
@@ -31,6 +32,18 @@ async def test_returns_none_without_credentials() -> None:
             x_user_agent=None,
         )
     assert result is None
+
+
+@pytest.mark.asyncio
+async def test_returns_member_id_for_member_bound_api_key_attribution() -> None:
+    principal = RequestPrincipal("o_123", AuthKind.member_api_key, "user_member", "org:member")
+    with patch("skyvern.forge.sdk.services.org_auth_service.get_request_principal", return_value=principal):
+        result = await org_auth_service.get_current_user_id_or_none(
+            authorization=None,
+            x_api_key="member-api-key",
+            x_user_agent=None,
+        )
+    assert result == "user_member"
 
 
 @pytest.mark.asyncio

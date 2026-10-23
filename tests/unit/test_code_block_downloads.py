@@ -269,6 +269,7 @@ def _fake_storage_app(
             get_downloaded_file_signature_aliases=lambda _: [],
             list_downloading_files_in_browser_session=in_flight or AsyncMock(return_value=[]),
         ),
+        BROWSER_MANAGER=SimpleNamespace(get_for_workflow_run=lambda *_args, **_kwargs: None),
         AGENT_FUNCTION=SimpleNamespace(
             validate_code_block=AsyncMock(),
             validate_block_execution=AsyncMock(),
@@ -1019,6 +1020,7 @@ async def test_an_inline_session_block_uploads_the_download_it_claimed_from_the_
 
 
 @pytest.mark.asyncio
+@pytest.mark.usefixtures("unresolvable_dns")
 async def test_a_parameter_named_after_the_attach_helper_still_wins(
     monkeypatch: pytest.MonkeyPatch, _isolated_download_path: str
 ) -> None:

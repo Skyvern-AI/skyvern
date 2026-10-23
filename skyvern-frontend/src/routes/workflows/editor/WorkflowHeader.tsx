@@ -30,7 +30,6 @@ import { useWorkflowQuery } from "@/routes/workflows/hooks/useWorkflowQuery";
 import { useWorkflowRunQuery } from "@/routes/workflows/hooks/useWorkflowRunQuery";
 import { useCacheKeyValueStore } from "@/store/CacheKeyValueStore";
 import { useDebugStore } from "@/store/useDebugStore";
-import { useRecordingStore } from "@/store/useRecordingStore";
 import { useShowAllCodeStore } from "@/store/ShowAllCodeStore";
 import {
   SaveRefusedError,
@@ -78,7 +77,6 @@ function BrowserModeButton() {
   const navigate = useNavigate();
   const workflowPermanentId = useWorkflowPermanentId();
   const debugStore = useDebugStore();
-  const recordingStore = useRecordingStore();
   const { data: workflowRun } = useWorkflowRunQuery();
   const workflowRunIsRunningOrQueued = Boolean(
     workflowRun && runIsLogicallyActive(workflowRun),
@@ -97,9 +95,7 @@ function BrowserModeButton() {
             size="icon"
             variant={debugStore.isDebugMode ? "default" : "tertiary"}
             className="size-10 min-w-[2.5rem]"
-            disabled={
-              workflowRunIsRunningOrQueued || recordingStore.isRecording
-            }
+            disabled={workflowRunIsRunningOrQueued}
             onClick={handleClick}
           >
             <BrowserIcon className="h-6 w-6" />
@@ -115,7 +111,6 @@ function BrowserModeButton() {
 
 function SaveButton() {
   const saving = useWorkflowHasChangesStore((s) => s.saveIsPending);
-  const isRecording = useRecordingStore().isRecording;
   const saveLockReason = useWorkflowYamlEditorStore(selectSaveLockReason);
   const isGlobalWorkflow = useIsGlobalWorkflow();
   const onSave = useSaveWorkflow();
@@ -147,7 +142,7 @@ function SaveButton() {
           size="icon"
           variant="tertiary"
           className="size-10 min-w-[2.5rem] disabled:pointer-events-none"
-          disabled={isGlobalWorkflow || isRecording || saveLockReason !== null}
+          disabled={isGlobalWorkflow || saveLockReason !== null}
           onClick={() => {
             if (pendingGoalChangeCount > 0) {
               setGoalDialogOpen(true);
@@ -189,7 +184,6 @@ function PanelToggleButton({
   iconOnly = false,
   count,
 }: PanelToggleButtonProps) {
-  const isRecording = useRecordingStore().isRecording;
   const workflowPanelState = useWorkflowPanelStore((s) => s.workflowPanelState);
   const setWorkflowPanelState = useWorkflowPanelStore(
     (s) => s.setWorkflowPanelState,
@@ -212,7 +206,6 @@ function PanelToggleButton({
         <Tooltip>
           <TooltipTrigger asChild>
             <Button
-              disabled={isRecording}
               variant="tertiary"
               size="icon"
               className="size-10 min-w-[2.5rem]"
@@ -230,7 +223,6 @@ function PanelToggleButton({
 
   return (
     <Button
-      disabled={isRecording}
       variant="tertiary"
       size="lg"
       onClick={handleClick}
@@ -254,7 +246,6 @@ function RunButton() {
   const navigate = useNavigate();
   const workflowPermanentId = useWorkflowPermanentId();
   const closeWorkflowPanel = useWorkflowPanelStore((s) => s.closeWorkflowPanel);
-  const isRecording = useRecordingStore().isRecording;
   const blockingBlocks = useRunValidationStore((s) => s.blockingBlocks);
   const hasBlockingBlocks = blockingBlocks.length > 0;
 
@@ -264,11 +255,7 @@ function RunButton() {
   };
 
   const button = (
-    <Button
-      disabled={isRecording || hasBlockingBlocks}
-      size="lg"
-      onClick={handleClick}
-    >
+    <Button disabled={hasBlockingBlocks} size="lg" onClick={handleClick}>
       <PlayIcon className="mr-2 h-6 w-6" />
       Run
     </Button>
@@ -334,12 +321,10 @@ function EditorActionToolbar() {
 function TitleSection() {
   const title = useWorkflowTitleStore((state) => state.title);
   const { mutationLocked, onTitleChange } = useDeferredTitleEdit();
-  const isRecording = useRecordingStore().isRecording;
-
   return (
     <div className="flex h-full min-w-0 flex-1 items-center">
       <EditableNodeTitle
-        editable={!isRecording && !mutationLocked}
+        editable={!mutationLocked}
         mutationLocked={mutationLocked}
         onChange={onTitleChange}
         value={title}

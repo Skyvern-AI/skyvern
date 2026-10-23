@@ -41,6 +41,7 @@ from playwright.async_api import (
 from skyvern.config import settings
 from skyvern.constants import (
     BROWSER_DOWNLOAD_TIMEOUT,
+    BROWSER_DOWNLOADING_SUFFIX,
     SAVE_DOWNLOADED_FILES_TIMEOUT,
     SKYVERN_DIR,
 )
@@ -64,7 +65,7 @@ from skyvern.forge.sdk.core.http_request_authorization import (
     RunScopedRedirectHopAuthorizer,
     deny_unenrolled_redirect_hop,
 )
-from skyvern.forge.sdk.core.skyvern_context import current, ensure_context
+from skyvern.forge.sdk.core.skyvern_context import SkyvernContext, current, ensure_context
 from skyvern.schemas.runs import ProxyLocation, ProxyLocationInput, get_tzinfo_from_proxy
 from skyvern.utils.url_validators import redacted_url_origin, signed_url_ttl_remaining_seconds
 from skyvern.webeye.attach_only import forbid
@@ -93,6 +94,11 @@ from skyvern.webeye.display_recorder import (
     prepare_local_display_recording,
     release_display_recorder,
     release_started_display_recording,
+)
+from skyvern.webeye.native_downloads import (
+    DOWNLOAD_FAILURE_READ_TIMEOUT_SECONDS,
+    NativeDownloadAttempt,
+    NativeDownloads,
 )
 from skyvern.webeye.playwright_input import register_playwright_input_context
 from skyvern.webeye.profile_download_state import strip_download_history_state
@@ -360,7 +366,6 @@ def _consume_abandoned_task_result(task: asyncio.Task) -> None:
         task.exception()
 
 
-DOWNLOAD_FAILURE_READ_TIMEOUT_SECONDS = 5.0
 _DOWNLOADS_CANCELLED_BY_SKYVERN: weakref.WeakSet[Download] = weakref.WeakSet()
 
 
@@ -428,6 +433,12 @@ def set_popup_video_listener(browser_context: BrowserContext, browser_artifacts:
         asyncio.ensure_future(_on_page(page))
 
 
+def _completed_file_suffix(name: str) -> str:
+    # Storage treats the in-progress suffix as a partial, so a finished file named "x.crdownload" must not take it.
+    suffix = Path(name).suffix
+    return "" if suffix == BROWSER_DOWNLOADING_SUFFIX else suffix
+
+
 def _redact_url_query(url: str) -> str:
     # Download URLs are often S3 presigned, carrying an X-Amz signature in the query — drop it before logging.
     try:
@@ -437,27 +448,51 @@ def _redact_url_query(url: str) -> str:
 
 
 def set_download_file_listener(
-    browser_context: BrowserContext, download_timeout: float | None = None, **kwargs: Any
+    browser_context: BrowserContext,
+    download_timeout: float | None = None,
+    browser_artifacts: BrowserArtifacts | None = None,
+    **kwargs: Any,
 ) -> None:
-    async def listen_to_download(download: Download) -> None:
+    async def save_download(
+        download: Download,
+        context: SkyvernContext | None,
+        owner_task_id: str | None,
+        residential_egress: bool,
+        observer: NativeDownloads | None,
+        attempt: NativeDownloadAttempt | None,
+    ) -> None:
         download_started_at = time.monotonic()
-        context = current()
+        failed = False
+        self_cancelled = False
+        # An unreadable terminal state stays pending: only a known outcome may release the wait.
+        settled = True
+        resolved = False
         workflow_run_id = (context.workflow_run_id if context else None) or kwargs.get("workflow_run_id")
-        task_id = (context.task_id if context else None) or kwargs.get("task_id")
+        task_id = owner_task_id or (context.task_id if context else None) or kwargs.get("task_id")
+        # Read when the download starts, not when the context is built: one browser serves many tasks.
+        timeout_seconds = (
+            download_timeout or (context.download_timeout if context else None) or BROWSER_DOWNLOAD_TIMEOUT
+        )
         try:
             # Route path() through resolve_artifact_path so a timeout can never cancel a shared
             # artifact future (see resolve_artifact_path). Everything after the await is synchronous
             # filesystem work, so it does not need to run under a timeout.
-            resolved_path = await resolve_artifact_path(download, download_timeout or BROWSER_DOWNLOAD_TIMEOUT)
+            resolved_path = await resolve_artifact_path(download, timeout_seconds)
             if resolved_path is None:
                 LOG.error(
                     "timeout to download file, going to cancel the download",
                     workflow_run_id=workflow_run_id,
                     task_id=task_id,
+                    timeout_seconds=timeout_seconds,
                 )
                 mark_download_cancelled_by_skyvern(download)
                 await download.cancel()
+                self_cancelled = await read_download_failure(download) is not None
+                settled = self_cancelled
                 return
+            resolved = True
+            if context and owner_task_id:
+                context.download_completed_task_ids.add(owner_task_id)
             file_path = Path(resolved_path)
             if not file_path.exists():
                 # On an adopted persistent session the bytes live on the run connection, not
@@ -479,7 +514,7 @@ def set_download_file_listener(
                 suggested_filename_fp=diagnostic_fingerprint(download.suggested_filename),
                 url=_redact_url_query(download.url),
             )
-            suffix = Path(download.suggested_filename).suffix
+            suffix = _completed_file_suffix(download.suggested_filename)
             if suffix:
                 LOG.info(
                     "Add extension according to suggested filename",
@@ -494,7 +529,7 @@ def set_download_file_listener(
             parsed_qs = parse_qsl(parsed_url.query)
             for key, value in parsed_qs:
                 if key.lower() == "filename":
-                    suffix = Path(value).suffix
+                    suffix = _completed_file_suffix(value)
                     if suffix:
                         LOG.info(
                             "Add extension according to the parsed query params of download url",
@@ -505,7 +540,7 @@ def set_download_file_listener(
                         file_path.rename(str(file_path) + suffix)
                         return
 
-            suffix = Path(parsed_url.path).suffix
+            suffix = _completed_file_suffix(parsed_url.path)
             if suffix:
                 LOG.info(
                     "Add extension according to download url path",
@@ -517,11 +552,29 @@ def set_download_file_listener(
                 return
             # TODO: maybe should try to parse it from URL response
 
+        except asyncio.CancelledError:
+            settled = False
+            raise
         except Exception:
             # An aborted transfer surfaces here as a path() error; reporting it as a rename failure
             # sends triage to the wrong subsystem and hides that no file was ever saved.
-            failure = await read_download_failure(download)
+            try:
+                failure = await read_download_failure(download)
+            except asyncio.CancelledError:
+                settled = False
+                raise
+            if (
+                failure == "canceled"
+                and not was_download_cancelled_by_skyvern(download)
+                and not download.page.is_closed()
+                and context
+                and owner_task_id
+                and residential_egress
+            ):
+                context.residential_download_interrupted_task_ids.add(owner_task_id)
             if failure is not None:
+                failed = True
+                self_cancelled = was_download_cancelled_by_skyvern(download)
                 LOG.warning(
                     "Browser aborted the download before any file was saved",
                     workflow_run_id=workflow_run_id,
@@ -533,16 +586,51 @@ def set_download_file_listener(
                     signed_url_ttl_remaining_s=signed_url_ttl_remaining_seconds(download.url, datetime.now(UTC)),
                 )
                 return
+            settled = resolved
             LOG.exception(
                 "Failed to add file extension name to downloaded file",
                 workflow_run_id=workflow_run_id,
                 task_id=task_id,
             )
 
+        finally:
+            if observer is not None and settled:
+                observer.finished(download, attempt, failed=failed, self_cancelled=self_cancelled)
+
+    def on_download(download: Download) -> asyncio.Task[None]:
+        # Snapshot the task synchronously at event delivery; the context can change before the coroutine runs.
+        # Callback kwargs can belong to an older task or run and cannot establish ownership.
+        context = current()
+        owner_task_id = context.task_id if context else None
+        residential_egress = False
+        try:
+            state = app.BROWSER_MANAGER.get_for_task(owner_task_id) if owner_task_id else None
+            # Workflow blocks register their browser under the run id only. A plain lookup avoids aliasing the task.
+            if state is None and owner_task_id and context and context.workflow_run_id:
+                state = app.BROWSER_MANAGER.get_for_workflow_run(context.workflow_run_id)
+            if state is None or state.browser_context is not browser_context:
+                owner_task_id = None
+            elif owner_task_id:
+                residential_egress = app.AGENT_FUNCTION.is_residential_browser_egress(browser_context)
+        except Exception:
+            owner_task_id = None
+        observer = browser_artifacts.native_downloads if browser_artifacts is not None else None
+        if observer is not None and observer.context is not browser_context:
+            observer = None
+        attempt = observer.started(download) if observer is not None else None
+        return asyncio.create_task(
+            save_download(download, context, owner_task_id, residential_egress, observer, attempt)
+        )
+
     def listen_to_new_page(page: Page) -> None:
-        page.on("download", listen_to_download)
+        page.on("download", on_download)
 
     browser_context.on("page", listen_to_new_page)
+    for page in browser_context.pages:
+        listen_to_new_page(page)
+    observer = browser_artifacts.native_downloads if browser_artifacts is not None else None
+    if observer is not None and observer.context is browser_context:
+        observer.listeners_registered()
 
 
 async def start_unreported_download_renamer(cdp_port: int, download_dir: str) -> asyncio.Task[None] | None:
@@ -597,7 +685,7 @@ def _add_suggested_extension(event: dict[str, Any], suggested_filenames: dict[st
         suggested_filenames[params["guid"]] = params["suggestedFilename"]
     if event.get("method") != "Browser.downloadProgress" or params["state"] == "inProgress":
         return
-    suffix = Path(suggested_filenames.pop(params["guid"], "")).suffix
+    suffix = _completed_file_suffix(suggested_filenames.pop(params["guid"], ""))
     file_path = download_dir / params["guid"]
     # set_download_file_listener also checks and renames without awaiting in between, so on one event loop whichever
     # runs second finds the file already renamed and skips it.
@@ -913,7 +1001,7 @@ class BrowserContextFactory:
             # created regardless of who launched the browser).
             if not attach_only_enforcing() and browser_artifacts._display_recorder is None:
                 set_popup_video_listener(browser_context=browser_context, browser_artifacts=browser_artifacts)
-            set_download_file_listener(browser_context=browser_context, **kwargs)
+            set_download_file_listener(browser_context=browser_context, browser_artifacts=browser_artifacts, **kwargs)
             set_dialog_handler(browser_context=browser_context)
             route_handlers_allowed = None
             if scoped_headers or route_policy_url is not None:
@@ -1211,6 +1299,18 @@ async def _create_headless_chromium(
         discard_temp_working_dir(read_only_copy)
         raise
     browser_artifacts.note_requested_launch_args(browser_args.get("args"))
+    browser_artifacts.attach_native_downloads(
+        NativeDownloads.attach(
+            browser_context,
+            download_dir=download_dir,
+            before_activity=(
+                not loaded_from_saved_profile
+                and not settings.EXTENSIONS
+                and not settings.BROWSER_ADDITIONAL_ARGS
+                and not cdp_port
+            ),
+        )
+    )
     return browser_context, browser_artifacts, _read_only_copy_cleanup(read_only_copy)
 
 
@@ -1345,6 +1445,18 @@ async def _create_headful_chromium(
         await release_started_display_recording(browser_artifacts)
         raise
     browser_artifacts.note_requested_launch_args(browser_args.get("args"))
+    browser_artifacts.attach_native_downloads(
+        NativeDownloads.attach(
+            browser_context,
+            download_dir=download_dir,
+            before_activity=(
+                not loaded_from_saved_profile
+                and not settings.EXTENSIONS
+                and not settings.BROWSER_ADDITIONAL_ARGS
+                and not cdp_port
+            ),
+        )
+    )
     return browser_context, browser_artifacts, _read_only_copy_cleanup(read_only_copy)
 
 

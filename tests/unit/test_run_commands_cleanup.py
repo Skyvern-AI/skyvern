@@ -404,7 +404,7 @@ def test_run_mcp_http_transport_wires_auth_middleware(monkeypatch: pytest.Monkey
     set_stateless = MagicMock()
 
     monkeypatch.setattr(run_commands, "_cleanup_mcp_resources", cleanup)
-    monkeypatch.setattr(run_commands.atexit, "register", register)
+    monkeypatch.setattr(run_commands, "atexit", SimpleNamespace(register=register))
     monkeypatch.setattr("skyvern.cli.mcp_tools.mcp.run_async", run)
     monkeypatch.setattr("skyvern.cli.core.session_manager.set_stateless_http_mode", set_stateless)
 

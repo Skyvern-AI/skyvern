@@ -5,9 +5,13 @@ workflow_run_blocks and the dispatched engine come from the same resolution.
 
 from __future__ import annotations
 
+import asyncio
+import contextlib
+import json
 import time
 from collections.abc import Callable, Iterator
 from datetime import UTC, datetime, timedelta, timezone
+from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -15,11 +19,16 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 from pydantic import BaseModel, ConfigDict, ValidationError
 
+import skyvern.forge.sdk.workflow.models.block as block_module
+import skyvern.webeye.cdp_download_interceptor as cdp_module
 from skyvern.config import settings
+from skyvern.exceptions import FailedToNavigateToUrl
 from skyvern.forge import app
 from skyvern.forge.sdk.core import skyvern_context
 from skyvern.forge.sdk.core.skyvern_context import SkyvernContext
+from skyvern.forge.sdk.db.agent_db import AgentDB
 from skyvern.forge.sdk.db.enums import WorkflowRunTriggerType
+from skyvern.forge.sdk.db.models import Base
 from skyvern.forge.sdk.experimentation.billing_tier import BILLING_TIER_PROPERTY, BillingTier
 from skyvern.forge.sdk.experimentation.providers import BaseExperimentationProvider, NoOpExperimentationProvider
 from skyvern.forge.sdk.experimentation.workflow_block_engine import (
@@ -57,24 +66,34 @@ from skyvern.forge.sdk.workflow.models.block import (
     WhileLoopBlock,
     _evaluate_prompt_branch_conditions_batch,
     get_all_blocks,
+    pinned_v1_block_count,
     run_is_eligible_for_v3_ab,
     takes_default_engine,
     v3_ab_ineligibility_reason,
 )
-from skyvern.forge.sdk.workflow.models.workflow import WorkflowDefinition
+from skyvern.forge.sdk.workflow.models.workflow import (
+    COPILOT_TEST_WORKFLOW_CREATOR,
+    Workflow,
+    WorkflowDefinition,
+    WorkflowRunStatus,
+)
 from skyvern.forge.sdk.workflow.service import WorkflowService, workflow_definitions_differ
 from skyvern.forge.sdk.workflow.workflow_definition_converter import convert_workflow_definition
 from skyvern.forge.taskv3.goal_composition import render_block_context
+from skyvern.forge.taskv3.tools import DownloadFailureWatch
 from skyvern.schemas.run_enums import RunEngine
 from skyvern.schemas.workflows import (
     BlockResult,
+    BlockStatus,
     BlockType,
     NavigationBlockYAML,
+    WorkflowCreateYAMLRequest,
     WorkflowDefinitionYAML,
     WorkflowStatus,
 )
 from skyvern.services import script_service
-from tests.unit._task_block_fakes import mock_block_execute_deps
+from skyvern.webeye.cdp_download_interceptor import CDPDownloadInterceptor, begin_replay_candidate_hold
+from tests.unit._task_block_fakes import mock_block_execute_deps, output_parameter
 from tests.unit._workflow_block_engine_fakes import (
     WORKFLOW_BLOCK_ENGINE_APP_TARGET,
     FakeExperimentationProvider,
@@ -472,6 +491,51 @@ async def test_execute_safe_persists_the_resolved_engine(scoped_context: Skyvern
 
     persisted_engine = mock_app.DATABASE.observer.create_workflow_run_block.await_args.kwargs["engine"]
     assert persisted_engine == RunEngine.skyvern_v3
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("override", "script_mode", "fails", "seen"),
+    [
+        (RunEngine.skyvern_v3, False, False, 30.0),
+        (RunEngine.skyvern_v3, False, True, 30.0),
+        (None, False, False, 7.0),
+        (RunEngine.skyvern_v3, True, False, 7.0),
+    ],
+    ids=["v3_block", "v3_block_that_fails", "v1_block_unchanged", "script_mode_unchanged"],
+)
+async def test_a_v3_block_scopes_its_download_timeout_to_the_whole_block(
+    scoped_context: SkyvernContext,
+    override: RunEngine | None,
+    script_mode: bool,
+    fails: bool,
+    seen: float,
+) -> None:
+    # The browser's download listener reads this value when a download starts, including one the block's own
+    # navigation starts before the task loop; it must be the outer value again once the block ends.
+    scoped_context.workflow_block_engine_resolved_run_id = "wr_scope"
+    scoped_context.workflow_block_engine_override = override
+    scoped_context.script_mode = script_mode
+    scoped_context.download_timeout = 7.0
+    block = _make_block(TaskBlock, label="scope_block", download_timeout=30.0)
+    observed: list[float | None] = []
+
+    async def run_block(*_args: Any, **_kwargs: Any) -> BlockResult:
+        observed.append(scoped_context.download_timeout)
+        if fails:
+            raise RuntimeError("block failed")
+        return _block_result()
+
+    with (
+        patch("skyvern.forge.sdk.workflow.models.block.app") as mock_app,
+        patch.object(BaseTaskBlock, "execute", new_callable=AsyncMock, side_effect=run_block),
+        patch.object(Block, "_generate_workflow_run_block_description", new_callable=AsyncMock),
+    ):
+        _setup_mocks(mock_app)
+        await block.execute_safe(workflow_run_id="wr_scope")
+
+    assert observed == [seen]
+    assert scoped_context.download_timeout == 7.0
 
 
 class _EngineCaptured(BaseException):
@@ -1857,6 +1921,249 @@ def test_a_pinned_skyvern_v1_survives_the_stored_definition_and_counts_as_a_chan
     assert workflow_definitions_differ(unmarked, pinned)
 
 
+_PIN_ADDED_EVENT = "Workflow version adds a skyvern-1.0 engine pin"
+_WAREHOUSE_PIN_PATTERN = '"engine":"skyvern-1.0","engine_pinned":true'
+
+
+def _nav(label: str, engine: str | None = None, pinned: bool = False) -> dict[str, Any]:
+    block: dict[str, Any] = {
+        "block_type": "navigation",
+        "label": label,
+        "url": "https://e.com",
+        "navigation_goal": "Go",
+    }
+    if engine is not None:
+        block["engine"] = engine
+    if pinned:
+        block["engine_pinned"] = True
+    return block
+
+
+def _v1_pin(label: str) -> dict[str, Any]:
+    return _nav(label, "skyvern-1.0", pinned=True)
+
+
+def _for_loop(*inner: dict[str, Any]) -> dict[str, Any]:
+    return {"block_type": "for_loop", "label": "loop", "loop_variable_reference": "{{ items }}", "loop_blocks": inner}
+
+
+def _definition(blocks: list[dict[str, Any]]) -> WorkflowDefinition:
+    return convert_workflow_definition(
+        WorkflowDefinitionYAML.model_validate({"parameters": [], "blocks": blocks}), "w_test"
+    )
+
+
+def _workflow_row(blocks: list[dict[str, Any]], version: int, created_by: str | None = None) -> Workflow:
+    now = datetime.now(UTC)
+    return Workflow(
+        workflow_id=f"w_v{version}",
+        organization_id="o_test",
+        workflow_permanent_id="wpid_test",
+        title="test",
+        version=version,
+        is_saved_task=False,
+        workflow_definition=_definition(blocks),
+        created_at=now,
+        modified_at=now,
+        created_by=created_by,
+    )
+
+
+async def _save_definition(
+    monkeypatch: pytest.MonkeyPatch,
+    new_blocks: list[dict[str, Any]],
+    *,
+    overwritten: Workflow | None,
+    get_previous_version: AsyncMock,
+    created_by: str | None = None,
+    get_overwritten: AsyncMock | None = None,
+    dialect: str | None = "postgresql",
+) -> tuple[Workflow, Workflow, MagicMock]:
+    saved = _workflow_row(new_blocks, version=3, created_by=created_by)
+    engine = SimpleNamespace() if dialect is None else SimpleNamespace(dialect=SimpleNamespace(name=dialect))
+    monkeypatch.setattr(app.DATABASE, "engine", engine)
+    monkeypatch.setattr(app.DATABASE.workflows, "get_workflow", get_overwritten or AsyncMock(return_value=overwritten))
+    monkeypatch.setattr(app.DATABASE.workflows, "get_workflow_by_permanent_id", get_previous_version)
+    monkeypatch.setattr(
+        app.DATABASE.workflows, "update_workflow_and_reconcile_definition_params", AsyncMock(return_value=saved)
+    )
+    monkeypatch.setattr(app.DATABASE.organizations, "get_organization", AsyncMock(return_value=None))
+    monkeypatch.setattr(app.DATABASE.workflow_runs, "count_recent_workflow_runs", AsyncMock(return_value=327))
+    monkeypatch.setattr("skyvern.forge.sdk.workflow.service.encrypt_workflow_definition_secrets", AsyncMock())
+    with patch("skyvern.forge.sdk.workflow.service.LOG") as mock_log:
+        returned = await WorkflowService().update_workflow_definition(
+            workflow_id=saved.workflow_id,
+            organization_id="o_test",
+            workflow_definition=saved.workflow_definition,
+            notify_workflow_saved=False,
+        )
+    return returned, saved, mock_log
+
+
+def _pin_added_logs(mock_log: MagicMock) -> list[dict[str, Any]]:
+    return [call.kwargs for call in mock_log.info.call_args_list if call.args and call.args[0] == _PIN_ADDED_EVENT]
+
+
+@pytest.mark.parametrize(
+    ("previous_blocks", "overwritten_blocks", "new_blocks", "created_by", "expected"),
+    [
+        pytest.param([_nav("a", "skyvern-1.0")], [], [_v1_pin("a")], None, (0, 1, 2), id="new_version_adds_pin"),
+        pytest.param([_v1_pin("a")], [], [_v1_pin("a")], None, None, id="new_version_keeps_pin"),
+        pytest.param([_v1_pin("a"), _v1_pin("b")], [], [_v1_pin("a")], None, None, id="new_version_unpins"),
+        pytest.param(
+            [_v1_pin("a"), _nav("b")], [], [_nav("b"), _v1_pin("a")], None, None, id="new_version_reorders_pin"
+        ),
+        pytest.param(
+            [_v1_pin("a")], [], [_v1_pin("a"), _for_loop(_v1_pin("inner"))], None, (1, 2, 2), id="nested_second_pin"
+        ),
+        pytest.param(None, [], [_v1_pin("a")], None, (0, 1, None), id="first_version_with_pin"),
+        pytest.param([_nav("a")], [_v1_pin("a")], [_v1_pin("a")], None, None, id="in_place_edit_keeps_pin"),
+        pytest.param([_nav("a")], [], [_v1_pin("a")], COPILOT_TEST_WORKFLOW_CREATOR, None, id="copilot_test_row"),
+    ],
+)
+@pytest.mark.asyncio
+async def test_a_saved_version_logs_only_when_it_adds_a_skyvern_v1_pin(
+    monkeypatch: pytest.MonkeyPatch,
+    previous_blocks: list[dict[str, Any]] | None,
+    overwritten_blocks: list[dict[str, Any]],
+    new_blocks: list[dict[str, Any]],
+    created_by: str | None,
+    expected: tuple[int, int, int | None] | None,
+) -> None:
+    previous = None if previous_blocks is None else _workflow_row(previous_blocks, version=2)
+    returned, saved, mock_log = await _save_definition(
+        monkeypatch,
+        new_blocks,
+        overwritten=_workflow_row(overwritten_blocks, version=3),
+        get_previous_version=AsyncMock(return_value=previous),
+        created_by=created_by,
+    )
+
+    assert returned is saved
+    logs = _pin_added_logs(mock_log)
+    if expected is None:
+        assert logs == []
+        return
+    before, after, previous_version = expected
+    [log] = logs
+    assert log["workflow_permanent_id"] == "wpid_test"
+    assert log["version"] == 3
+    assert log["previous_version"] == previous_version
+    assert log["pinned_v1_blocks_before"] == before
+    assert log["pinned_v1_blocks_after"] == after
+    assert log["recent_runs_7d"] == 327
+
+
+@pytest.mark.parametrize("idempotent", [pytest.param(True, id="idempotent_create"), pytest.param(False, id="create")])
+@pytest.mark.asyncio
+async def test_a_first_version_created_with_a_v1_pin_logs(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, idempotent: bool
+) -> None:
+    database = AgentDB(f"sqlite+aiosqlite:///{tmp_path / 'pin.db'}")
+    async with database.engine.begin() as connection:
+        await connection.run_sync(Base.metadata.create_all)
+    organization = await database.organizations.create_organization(organization_name="Test", organization_id="o_test")
+    monkeypatch.setattr(app, "DATABASE", database)
+    monkeypatch.setattr(app, "WORKFLOW_SERVICE", WorkflowService())
+    # A file database has its own connection per task, unlike the in-memory one the dialect gate exists for.
+    monkeypatch.setattr(
+        WorkflowService, "_pinned_v1_blocks_to_check", staticmethod(lambda d: pinned_v1_block_count(d.blocks))
+    )
+    request = WorkflowCreateYAMLRequest.model_validate(
+        {"title": "test", "workflow_definition": {"parameters": [], "blocks": [_v1_pin("a")]}}
+    )
+    try:
+        with patch("skyvern.forge.sdk.workflow.service.LOG") as mock_log:
+            saved = await app.WORKFLOW_SERVICE.create_workflow_from_request(
+                organization=organization,
+                request=request,
+                new_workflow_permanent_id="wpid_test" if idempotent else None,
+            )
+    finally:
+        await database.engine.dispose()
+
+    [log] = _pin_added_logs(mock_log)
+    assert (log["workflow_permanent_id"], log["version"]) == (saved.workflow_permanent_id, 1)
+    assert (log["pinned_v1_blocks_before"], log["pinned_v1_blocks_after"]) == (0, 1)
+
+
+@pytest.mark.parametrize(
+    ("blocks", "dialect"),
+    [
+        # Without a v1 pin the save must not touch the engine; some test doubles of the database have none.
+        pytest.param([_nav("a", "skyvern-1.0"), _nav("b", "skyvern-2.0", pinned=True)], None, id="no_v1_pin"),
+        # An in-memory SQLite database pools one connection, so a read on another task would roll the save back.
+        pytest.param([_v1_pin("a")], "sqlite", id="v1_pin_on_sqlite"),
+    ],
+)
+@pytest.mark.asyncio
+async def test_a_save_reads_no_prior_row_without_a_v1_pin_or_on_sqlite(
+    monkeypatch: pytest.MonkeyPatch, blocks: list[dict[str, Any]], dialect: str | None
+) -> None:
+    reads: list[dict[str, Any]] = []
+
+    async def prior_row_read(**kwargs: Any) -> None:
+        reads.append(kwargs)
+
+    returned, saved, mock_log = await _save_definition(
+        monkeypatch,
+        blocks,
+        overwritten=None,
+        get_previous_version=AsyncMock(side_effect=prior_row_read),
+        get_overwritten=AsyncMock(side_effect=prior_row_read),
+        dialect=dialect,
+    )
+
+    assert returned is saved
+    assert reads == []
+    assert _pin_added_logs(mock_log) == []
+
+
+@pytest.mark.asyncio
+async def test_a_failing_pin_read_never_runs_on_the_save_task_or_fails_the_save(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    save_task = asyncio.current_task()
+    read_tasks: list[asyncio.Task[Any] | None] = []
+
+    async def failing_read(**_: Any) -> Workflow:
+        read_tasks.append(asyncio.current_task())
+        raise RuntimeError("db down")
+
+    returned, saved, mock_log = await _save_definition(
+        monkeypatch,
+        [_v1_pin("a")],
+        overwritten=None,
+        get_previous_version=AsyncMock(side_effect=failing_read),
+        get_overwritten=AsyncMock(side_effect=failing_read),
+    )
+
+    assert returned is saved
+    assert len(read_tasks) == 2 and save_task not in read_tasks
+    assert _pin_added_logs(mock_log) == []
+    assert any(call.kwargs.get("workflow_permanent_id") == "wpid_test" for call in mock_log.warning.call_args_list)
+
+
+@pytest.mark.parametrize(
+    ("blocks", "expected_pins"),
+    [
+        pytest.param([_v1_pin("a")], 1, id="pinned_v1"),
+        pytest.param([_nav("a", "skyvern-1.0")], 0, id="unpinned_v1"),
+        pytest.param([_nav("a", "skyvern-3.0", pinned=True)], 0, id="pinned_v3"),
+        pytest.param([_for_loop(_v1_pin("inner"))], 1, id="pinned_v1_in_for_loop"),
+        pytest.param([_v1_pin("a"), _nav("b"), _v1_pin("c")], 2, id="two_pins"),
+    ],
+)
+def test_the_warehouse_pin_regex_counts_what_the_service_counts(
+    blocks: list[dict[str, Any]], expected_pins: int
+) -> None:
+    definition = _definition(blocks)
+    stored = json.dumps(definition.model_dump(mode="json"), separators=(",", ":"), sort_keys=True)
+
+    assert pinned_v1_block_count(get_all_blocks(definition.blocks)) == expected_pins
+    assert stored.count(_WAREHOUSE_PIN_PATTERN) == expected_pins
+
+
 @pytest.mark.parametrize(
     ("flags", "expected_reason", "displaced"),
     [
@@ -1978,3 +2285,283 @@ async def test_an_explicit_code_generation_request_stays_on_v1(
     )
 
     assert engine == RunEngine.skyvern_v1
+
+
+def _download_context(tmp_path: Path, *, holding: bool = False) -> MagicMock:
+    interceptor = CDPDownloadInterceptor(
+        output_dir=str(tmp_path), network_egress_monitor=MagicMock(), redirect_hop_authorizer=AsyncMock()
+    )
+    interceptor.set_replay_candidate_mode(holding)
+    context = MagicMock()
+    context._skyvern_cdp_download_interceptor = interceptor
+    return context
+
+
+def _holding(context: MagicMock) -> bool:
+    return context._skyvern_cdp_download_interceptor._replay_candidate_mode
+
+
+def _v3_download_block(block_cls: type[BaseTaskBlock], **overrides: Any) -> BaseTaskBlock:
+    fields: dict[str, Any] = {
+        "label": "export",
+        "output_parameter": output_parameter(),
+        "url": "https://site.example/export",
+        "complete_on_download": True,
+        "engine": RunEngine.skyvern_v3,
+        **overrides,
+    }
+    return block_cls(**fields)
+
+
+class _TaskRan(Exception):
+    """Raised by the stubbed execute_step: what follows it is not under test here."""
+
+
+async def _execute_block(block: BaseTaskBlock) -> None:
+    skyvern_context.set(SkyvernContext(organization_id="o_test", workflow_run_id="wr_task_block_test"))
+    try:
+        with contextlib.suppress(_TaskRan):
+            await block.execute(
+                workflow_run_id="wr_task_block_test", workflow_run_block_id="wrb_test", organization_id="o_test"
+            )
+    finally:
+        skyvern_context.reset()
+
+
+@contextlib.contextmanager
+def _v3_block_deps(working_page_url: str, context: MagicMock | None = None) -> Iterator[Any]:
+    with (
+        mock_block_execute_deps(working_page_url=working_page_url) as deps,
+        patch("skyvern.forge.sdk.workflow.models.block.task_v3_disabled", AsyncMock(return_value=False)),
+    ):
+        deps.task.organization_id = "o_test"
+        if context is not None:
+            deps.browser_state.browser_context = context
+        yield deps
+
+
+@pytest.mark.parametrize("cancelled_at", ["profile_settle", "screenshot"])
+@pytest.mark.asyncio
+async def test_a_block_cancelled_after_its_start_url_ends_the_hold_it_began(tmp_path: Path, cancelled_at: str) -> None:
+    block = _v3_download_block(FileDownloadBlock)
+    context = _download_context(tmp_path)
+    with _v3_block_deps("about:blank", context) as deps:
+        page = deps.browser_state.must_get_working_page.return_value
+        if cancelled_at == "profile_settle":
+            deps.workflow_run.browser_profile_id = "bp_test"
+            deps.browser_state.browser_artifacts.applied_browser_profile_id = "bp_test"
+            page.wait_for_load_state = AsyncMock(side_effect=asyncio.CancelledError())
+        else:
+            deps.browser_state.take_fullpage_screenshot = AsyncMock(side_effect=asyncio.CancelledError())
+        with pytest.raises(asyncio.CancelledError):
+            await _execute_block(block)
+
+        deps.browser_state.navigate_to_url.assert_awaited_once()
+        assert _holding(context) is False
+
+
+@pytest.mark.asyncio
+async def test_a_first_block_holds_before_the_browser_navigates_and_ends_only_the_holds_it_began(
+    tmp_path: Path,
+) -> None:
+    block = _v3_download_block(TaskBlock, title="Export")
+    replaced, current = _download_context(tmp_path / "a"), _download_context(tmp_path / "b")
+    borrowed = _download_context(tmp_path / "c", holding=True)
+    holding_during_task: dict[str, bool] = {}
+    with _v3_block_deps("https://site.example/export", current) as deps:
+
+        async def get_or_create_for_workflow_run(**kwargs: Any) -> Any:
+            before_navigation = kwargs.get("before_navigation")
+            for context in (replaced, current, borrowed):
+                if before_navigation is not None:
+                    before_navigation(SimpleNamespace(browser_context=context))
+            return deps.browser_state
+
+        async def execute_step(**_kwargs: Any) -> None:
+            holding_during_task.update(replaced=_holding(replaced), current=_holding(current))
+            raise _TaskRan
+
+        deps.browser_manager.get_or_create_for_workflow_run = AsyncMock(side_effect=get_or_create_for_workflow_run)
+        deps.agent.execute_step = AsyncMock(side_effect=execute_step)
+        await _execute_block(block)
+
+    assert holding_during_task == {"replaced": True, "current": True}
+    assert (_holding(replaced), _holding(current), _holding(borrowed)) == (False, False, True)
+
+
+@pytest.mark.parametrize(
+    "overrides", [{"complete_on_download": False}, {"engine": RunEngine.skyvern_v1}], ids=["not-download", "v1"]
+)
+@pytest.mark.asyncio
+async def test_a_block_that_does_not_hold_leaves_browser_creation_unchanged(
+    tmp_path: Path, overrides: dict[str, Any]
+) -> None:
+    block = _v3_download_block(TaskBlock, title="Export", **overrides)
+    context = _download_context(tmp_path)
+    with _v3_block_deps("https://site.example/export", context) as deps:
+        deps.agent.execute_step = AsyncMock(side_effect=_TaskRan)
+        await _execute_block(block)
+
+        assert deps.browser_manager.get_or_create_for_workflow_run.await_args.kwargs["before_navigation"] is None
+        assert _holding(context) is False
+
+
+@pytest.mark.asyncio
+async def test_a_later_block_still_holds_through_its_own_navigation(tmp_path: Path) -> None:
+    block = _v3_download_block(TaskBlock, title="Export")
+    context = _download_context(tmp_path)
+    holding_at_navigation: list[bool] = []
+    with (
+        _v3_block_deps("https://site.example/previous", context) as deps,
+        patch.object(TaskBlock, "get_task_order", AsyncMock(return_value=(1, 0))),
+    ):
+        deps.browser_manager.get_for_workflow_run = MagicMock(return_value=deps.browser_state)
+        deps.browser_state.navigate_to_url = AsyncMock(
+            side_effect=lambda **_: holding_at_navigation.append(_holding(context))
+        )
+        deps.agent.execute_step = AsyncMock(side_effect=_TaskRan)
+        await _execute_block(block)
+
+    assert holding_at_navigation == [True]
+    assert _holding(context) is False
+
+
+@pytest.mark.asyncio
+async def test_a_block_keeps_a_replacement_context_its_task_watch_held_through_cleanup(tmp_path: Path) -> None:
+    block = _v3_download_block(TaskBlock, title="Export")
+    replacement = _download_context(tmp_path)
+    replacement.cookies = AsyncMock(return_value=[])
+    interceptor = replacement._skyvern_cdp_download_interceptor
+    interceptor._browser_context = replacement
+    page = MagicMock()
+    page.context = replacement
+    seen: dict[str, Any] = {}
+    reply = MagicMock(body=b"account,amount\nA-1,12.50\n", content_type="text/csv", filename="export.csv", status=200)
+
+    async def _page() -> Any:
+        return page
+
+    async def execute_step(**_kwargs: Any) -> None:
+        watch = DownloadFailureWatch(_page)
+        await watch.attach()
+        watch.close()
+        with patch.object(cdp_module.file_api, "fetch_file_bytes", AsyncMock(return_value=reply), create=True):
+            await interceptor._download_url_directly("https://site.example/export.csv", "export.csv")
+        seen.update(held=len(interceptor.replay_candidates()), landed=sorted(p.name for p in tmp_path.iterdir()))
+        raise _TaskRan
+
+    with _v3_block_deps("https://site.example/export") as deps:
+        deps.agent.execute_step = AsyncMock(side_effect=execute_step)
+        await _execute_block(block)
+
+    assert seen == {"held": 1, "landed": []}
+    assert _holding(replacement) is False
+
+
+@pytest.mark.asyncio
+async def test_parallel_and_nested_blocks_each_end_only_their_own_holds(tmp_path: Path) -> None:
+    outer, sibling, nested = (_download_context(tmp_path / name) for name in ("outer", "sibling", "nested"))
+    blocks = {
+        name: _v3_download_block(TaskBlock, label=name, title=name, complete_on_download=False)
+        for name in ("outer", "sibling", "nested")
+    }
+    outer_holding, sibling_done = asyncio.Event(), asyncio.Event()
+    observed: dict[str, bool] = {}
+
+    async def execute_step(*, task_block: BaseTaskBlock, **_kwargs: Any) -> None:
+        if task_block.label == "outer":
+            begin_replay_candidate_hold(outer)
+            outer_holding.set()
+            await sibling_done.wait()
+            await _execute_block(blocks["nested"])
+            observed["outer_after_sibling_and_nested"] = _holding(outer)
+        elif task_block.label == "sibling":
+            await outer_holding.wait()
+            begin_replay_candidate_hold(sibling)
+        else:
+            begin_replay_candidate_hold(nested)
+        raise _TaskRan
+
+    async def sibling_then_signal() -> None:
+        try:
+            await _execute_block(blocks["sibling"])
+        finally:
+            sibling_done.set()
+
+    with mock_block_execute_deps(working_page_url="https://site.example/export") as deps:
+        deps.task.organization_id = "o_test"
+        deps.agent.execute_step = AsyncMock(side_effect=execute_step)
+        await asyncio.gather(_execute_block(blocks["outer"]), sibling_then_signal())
+
+    assert observed == {"outer_after_sibling_and_nested": True}
+    assert (_holding(outer), _holding(sibling), _holding(nested)) == (False, False, False)
+
+
+@pytest.mark.asyncio
+async def test_a_replay_a_failed_earlier_block_admitted_saves_as_before_inside_the_next_v3_blocks_hold(
+    tmp_path: Path,
+) -> None:
+    # An earlier block's navigation fails with its export in flight; execute_safe lets the next V3 download block hold.
+    earlier = TaskBlock(
+        label="earlier",
+        output_parameter=output_parameter(),
+        title="Earlier",
+        url="https://site.example/export",
+        continue_on_failure=True,
+    )
+    later = _v3_download_block(TaskBlock, label="later", title="Later")
+    context = _download_context(tmp_path)
+    context.cookies = AsyncMock(return_value=[])
+    interceptor = context._skyvern_cdp_download_interceptor
+    interceptor._browser_context = context
+    released = asyncio.Event()
+    csv_bytes = b"account,amount\nA-1,12.50\n"
+    in_flight: list[asyncio.Task[None]] = []
+    holding_when_it_landed: list[bool] = []
+
+    async def slow_fetch(*_args: Any, **_kwargs: Any) -> Any:
+        await released.wait()
+        return MagicMock(body=csv_bytes, content_type="text/csv", filename="export.csv", status=200)
+
+    async def earlier_navigation_fails(**_kwargs: Any) -> Any:
+        in_flight.append(
+            asyncio.create_task(interceptor._download_url_directly("https://site.example/export.csv", "export.csv"))
+        )
+        await asyncio.sleep(0)
+        raise FailedToNavigateToUrl(url="https://site.example/export", error_message="net::ERR_ABORTED")
+
+    @contextlib.asynccontextmanager
+    async def running_run(*_args: Any) -> Any:
+        yield SimpleNamespace(status=WorkflowRunStatus.running)
+
+    async def task_order_by_label(block: TaskBlock, *_args: Any) -> tuple[int, int]:
+        return (0, 0) if block.label == "earlier" else (1, 0)
+
+    async def later_navigation(**_kwargs: Any) -> None:
+        holding_when_it_landed.append(_holding(context))
+        released.set()
+        await in_flight[0]
+
+    with (
+        _v3_block_deps("https://site.example/previous", context) as deps,
+        patch.object(TaskBlock, "get_task_order", task_order_by_label),
+        patch.object(cdp_module.file_api, "fetch_file_bytes", slow_fetch, create=True),
+    ):
+        deps.browser_manager.get_or_create_for_workflow_run = AsyncMock(side_effect=earlier_navigation_fails)
+        deps.browser_manager.get_for_workflow_run = MagicMock(return_value=deps.browser_state)
+        deps.browser_state.navigate_to_url = AsyncMock(side_effect=later_navigation)
+        deps.agent.execute_step = AsyncMock(side_effect=_TaskRan)
+        deps.observer_db.create_workflow_run_block = AsyncMock(return_value=MagicMock(workflow_run_block_id="wrb_test"))
+        block_module.app.DATABASE.workflow_runs.create_or_update_workflow_run_output_parameter = AsyncMock()
+        block_module.app.DATABASE.workflow_runs.admit_workflow_run_block_dispatch = running_run
+        skyvern_context.set(SkyvernContext(organization_id="o_test", workflow_run_id="wr_task_block_test"))
+        try:
+            result = await earlier.execute_safe(workflow_run_id="wr_task_block_test", organization_id="o_test")
+        finally:
+            skyvern_context.reset()
+        await _execute_block(later)
+
+    assert result.status == BlockStatus.failed and result.can_continue_after_failure
+    assert holding_when_it_landed == [True]
+    assert interceptor.replay_candidates() == {}
+    assert (tmp_path / "export.csv").read_bytes() == csv_bytes

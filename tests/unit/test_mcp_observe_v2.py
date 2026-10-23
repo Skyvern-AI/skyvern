@@ -2604,6 +2604,7 @@ async def test_stale_document_cleanup_replaces_mismatched_newer_publication(
 
 
 @pytest.mark.asyncio
+@pytest.mark.usefixtures("public_dns")
 async def test_failed_navigation_invalidates_inflight_publication(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv(_FLAG, "1")
     page = _page()

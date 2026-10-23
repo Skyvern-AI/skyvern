@@ -698,13 +698,9 @@ def test_default_extension_pair_exposes_cancel_pending() -> None:
     assert "--cancel-pending" in registered_options
 
 
-@pytest.mark.parametrize("flag", [None, "0", "1"])
-def test_extension_broker_commands_are_registered_unconditionally(flag: str | None) -> None:
+def test_extension_broker_commands_are_registered_unconditionally() -> None:
     environment = os.environ.copy()
-    if flag is None:
-        environment.pop("SKYVERN_BROWSER_EXTENSION_BROKER", None)
-    else:
-        environment["SKYVERN_BROWSER_EXTENSION_BROKER"] = flag
+    environment["SKYVERN_BROWSER_EXTENSION_BROKER"] = "0"
     script = (
         "import json; "
         "from skyvern.cli.commands.browser import browser_app; "

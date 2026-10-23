@@ -43,12 +43,10 @@ from skyvern.forge.sdk.copilot.build_test_connect_failure import (
 from skyvern.forge.sdk.copilot.build_test_outcome import RecordedBuildTestOutcome
 from skyvern.forge.sdk.copilot.canonical_ownership import workflow_content_fingerprint
 from skyvern.forge.sdk.copilot.completion_verification import CompletionVerificationResult, CriterionVerdict
-from skyvern.forge.sdk.copilot.config import BlockAuthoringPolicy
 from skyvern.forge.sdk.copilot.context import (
     AgentResult,
     CopilotContext,
     ProposalDisposition,
-    StructuredContext,
     TurnNarrativePayload,
 )
 from skyvern.forge.sdk.copilot.demonstration_recorder import (
@@ -128,8 +126,6 @@ from skyvern.forge.sdk.schemas.workflow_copilot import (
 from skyvern.forge.sdk.workflow.models.workflow import Workflow, WorkflowDefinition, WorkflowRunStatus
 from skyvern.forge.sdk.workflow.workflow_definition_converter import convert_workflow_definition
 from skyvern.schemas.workflows import WorkflowCreateYAMLRequest
-from skyvern.services.browser_recording.evidence import RecordingEvidencePacket, build_recording_evidence
-from skyvern.services.browser_recording.session_registry import RecordingInterpretationSessionRegistry
 from skyvern.utils.url_validators import validate_webhook_url
 from tests.copilot_policy_support import authoring_barred_policy, screen_interrupted_proposal
 from tests.unit._copilot_workflow_fakes import fake_workflow
@@ -147,7 +143,6 @@ from tests.unit.copilot_test_helpers import (
     receipt_coverage_after,
     receipt_message,
 )
-from tests.unit.services.test_browser_recording_code_first import draft_for, make_click, make_input, make_url_change
 from tests.unit.test_copilot_credential_pause import _FakeCache
 
 
@@ -187,8 +182,6 @@ def _make_chat_request(
     product_action: str | None = None,
     workflow_run_id: str | None = None,
     message: str = "Please update it",
-    recording_evidence: RecordingEvidencePacket | None = None,
-    recording_in_progress: bool = False,
     browser_session_id: str | None = None,
     demonstration_id: str | None = None,
 ) -> WorkflowCopilotChatRequest:
@@ -205,21 +198,20 @@ def _make_chat_request(
         idempotency_key=idempotency_key,
         eval_entrypoint_url=eval_entrypoint_url,
         product_action=product_action,
-        recording_evidence=recording_evidence,
-        recording_in_progress=recording_in_progress,
         browser_session_id=browser_session_id,
         demonstration_id=demonstration_id,
     )
 
 
 @pytest.mark.asyncio
-async def test_demonstration_flag_off_refuses_record_control_and_done(
+async def test_demonstration_requires_shared_cache_for_record_control_and_done(
     monkeypatch: pytest.MonkeyPatch,
     api_key_request: MagicMock,
     organization: SimpleNamespace,
 ) -> None:
-    monkeypatch.setattr(app, "CACHE", _FakeCache())
-    monkeypatch.setattr(workflow_copilot_route, "copilot_demonstration_enabled", AsyncMock(return_value=False))
+    cache = _FakeCache()
+    cache.is_shared = False
+    monkeypatch.setattr(app, "CACHE", cache)
 
     calls = (
         workflow_copilot_demonstration_record(
@@ -255,7 +247,6 @@ async def test_demonstration_control_checks_the_demonstrations_workflow_before_a
     organization: SimpleNamespace,
 ) -> None:
     monkeypatch.setattr(app, "CACHE", _FakeCache())
-    monkeypatch.setattr(workflow_copilot_route, "copilot_demonstration_enabled", AsyncMock(return_value=True))
     monkeypatch.setattr(
         workflow_copilot_route,
         "load_demonstration_record",
@@ -284,7 +275,6 @@ async def test_demonstration_done_requires_demonstration_id(
     organization: SimpleNamespace,
 ) -> None:
     monkeypatch.setattr(app, "CACHE", _FakeCache())
-    monkeypatch.setattr(workflow_copilot_route, "copilot_demonstration_enabled", AsyncMock(return_value=True))
 
     with pytest.raises(HTTPException) as exc_info:
         await workflow_copilot_chat_post(
@@ -358,7 +348,6 @@ async def test_demonstration_done_rejects_unfinished_consumed_or_other_workflow(
 ) -> None:
     cache = _FakeCache()
     monkeypatch.setattr(app, "CACHE", cache)
-    monkeypatch.setattr(workflow_copilot_route, "copilot_demonstration_enabled", AsyncMock(return_value=True))
     cache.store[demonstration_record_key("org-1", "demo-1")] = encode_demonstration_record(
         DemonstrationRecord(
             workflow_permanent_id=workflow_permanent_id,
@@ -1417,10 +1406,10 @@ def test_chat_history_correlates_interleaved_turn_openers() -> None:
     now = datetime.now(UTC)
     messages = [
         WorkflowCopilotChatMessage(
-            workflow_copilot_chat_message_id="message-refine",
+            workflow_copilot_chat_message_id="message-product",
             workflow_copilot_chat_id="chat-1",
             sender=WorkflowCopilotChatSender.PRODUCT,
-            content="Refine the recording (2 actions) into a reusable workflow.",
+            content="Test the workflow end to end.",
             created_at=now,
             modified_at=now,
         ),
@@ -1446,14 +1435,14 @@ def test_chat_history_correlates_interleaved_turn_openers() -> None:
             modified_at=now,
         ),
         WorkflowCopilotChatMessage(
-            workflow_copilot_chat_message_id="response-refine",
+            workflow_copilot_chat_message_id="response-product",
             workflow_copilot_chat_id="chat-1",
             sender=WorkflowCopilotChatSender.AI,
-            content="Refinement ready.",
+            content="Test complete.",
             turn_outcome=TurnOutcome(
                 response_kind=ResponseKind.BUILD,
-                copilot_turn_id="turn-refine",
-                user_message_id="message-refine",
+                copilot_turn_id="turn-product",
+                user_message_id="message-product",
             ),
             created_at=now,
             modified_at=now,
@@ -1463,20 +1452,20 @@ def test_chat_history_correlates_interleaved_turn_openers() -> None:
     history = convert_to_history_messages(messages)
 
     assert [message.turn_id for message in history] == [
-        "turn-refine",
+        "turn-product",
         "turn-later",
         "turn-later",
-        "turn-refine",
+        "turn-product",
     ]
 
 
 def test_chat_history_correlates_a_pending_turn_opener() -> None:
     now = datetime.now(UTC)
     message = WorkflowCopilotChatMessage(
-        workflow_copilot_chat_message_id="message-refine",
+        workflow_copilot_chat_message_id="message-product",
         workflow_copilot_chat_id="chat-1",
         sender=WorkflowCopilotChatSender.PRODUCT,
-        content="Refine the recording (2 actions) into a reusable workflow.",
+        content="Test the workflow end to end.",
         created_at=now,
         modified_at=now,
     )
@@ -1484,15 +1473,15 @@ def test_chat_history_correlates_a_pending_turn_opener() -> None:
     history = convert_to_history_messages(
         [message],
         {
-            "turn-refine": _make_pending_turn(
-                "turn-refine",
+            "turn-product": _make_pending_turn(
+                "turn-product",
                 10,
-                user_message_id="message-refine",
+                user_message_id="message-product",
             )
         },
     )
 
-    assert history[0].turn_id == "turn-refine"
+    assert history[0].turn_id == "turn-product"
 
 
 @pytest.mark.asyncio
@@ -5118,7 +5107,7 @@ async def test_request_webhook_is_validated_before_staging_once(
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("new_header", [False, True], ids=["saved", "newly-authored"])
-@pytest.mark.parametrize("next_turn", ["canvas", "blockless", "test_end_to_end", "refine_recording"])
+@pytest.mark.parametrize("next_turn", ["canvas", "blockless", "test_end_to_end"])
 async def test_proposal_header_secrets_stay_server_side_across_endpoints(
     monkeypatch: pytest.MonkeyPatch,
     organization: SimpleNamespace,
@@ -5187,9 +5176,6 @@ async def test_proposal_header_secrets_stay_server_side_across_endpoints(
         dispatched_settings.append(private_settings)
         workflow_yaml = ctx.workflow_yaml
         assert "synthetic-secret" not in workflow_yaml
-        if kwargs["chat_request"].product_action == "refine_recording":
-            assert kwargs["config"].browser_tools_available is False
-            assert kwargs["untrusted_evidence"] == _recording_evidence().model_dump_json()
         updated = await _process_workflow_yaml(
             workflow_id=original.workflow_id,
             workflow_permanent_id=original.workflow_permanent_id,
@@ -5256,9 +5242,7 @@ async def test_proposal_header_secrets_stay_server_side_across_endpoints(
             }
             if turn == 0:
                 request["workflow_yaml"] = "" if next_turn == "blockless" else visible["_copilot_yaml"]
-                request["product_action"] = next_turn if next_turn in {"test_end_to_end", "refine_recording"} else None
-                if next_turn == "refine_recording":
-                    request["recording_evidence"] = _recording_evidence().model_dump(mode="json")
+                request["product_action"] = next_turn if next_turn == "test_end_to_end" else None
 
         accepted = await client.post("/accept", json={"workflow_copilot_chat_id": "chat-1"})
         assert accepted.status_code == 200, accepted.text
@@ -7158,7 +7142,6 @@ async def test_concurrent_demonstration_replay_claim_finalizes_the_losing_turn(
     captured = install_fake_create(monkeypatch)
     cache = _FakeCache()
     monkeypatch.setattr(app, "CACHE", cache)
-    monkeypatch.setattr(workflow_copilot_route, "copilot_demonstration_enabled", AsyncMock(return_value=True))
     cache.store[demonstration_record_key("org-1", "demo-1")] = encode_demonstration_record(
         DemonstrationRecord(
             workflow_permanent_id="wpid-1",
@@ -8214,325 +8197,6 @@ async def test_accept_writes_the_live_title_when_the_row_was_renamed_after_publi
     assert create_workflow.await_args.kwargs["request"].title == expected
 
 
-def _recording_evidence(
-    *,
-    workflow_permanent_id: str = "wpid-1",
-    browser_session_id: str = "pbs_123",
-    recording_id: str | None = None,
-    empty: bool = False,
-) -> RecordingEvidencePacket:
-    evidence = build_recording_evidence(
-        [] if empty else [make_click(1000, selector="#submit")],
-        None,
-        browser_session_id=browser_session_id,
-        workflow_permanent_id=workflow_permanent_id,
-        recording_attempt_id="rra_test",
-    )
-    evidence.recording_id = recording_id
-    return evidence
-
-
-def _refine_recording_mocks(monkeypatch: pytest.MonkeyPatch, *, session_found: bool = True) -> SimpleNamespace:
-    workflow_params = _diagnose_run_mocks(monkeypatch)
-    monkeypatch.setattr(
-        app,
-        "PERSISTENT_SESSIONS_MANAGER",
-        SimpleNamespace(get_session=AsyncMock(return_value=SimpleNamespace() if session_found else None)),
-    )
-    return workflow_params
-
-
-def test_refine_recording_instruction_balances_simplification_and_interaction_fidelity() -> None:
-    instruction = workflow_copilot_route.REFINE_RECORDING_INSTRUCTION.lower()
-
-    assert len(instruction.split()) < 200
-    assert "collapse a multi-action path" in instruction
-    assert "neither the objective nor any retained interaction" in instruction
-    assert "interaction primitive" in instruction
-    assert "actionable target" in instruction
-    assert "successfully tested" in instruction
-    assert "extraction required by the objective" in instruction
-    assert "prose-only answer" in instruction
-    assert "never answer in prose" not in instruction
-
-
-async def _live_recording_turn_evidence(
-    monkeypatch: pytest.MonkeyPatch,
-    api_key_request: MagicMock,
-    copilot_stream: MagicMock,
-    organization: SimpleNamespace,
-    *,
-    session_organization_id: str | None,
-    deleted_step_ids: list[str] | None = None,
-) -> str | None:
-    captured = install_fake_create(monkeypatch)
-    _diagnose_run_mocks(monkeypatch)
-    agent_mock = AsyncMock(side_effect=RuntimeError("stop after dispatch"))
-    monkeypatch.setattr(workflow_copilot_route, "run_copilot_agent", agent_mock)
-    registry = RecordingInterpretationSessionRegistry()
-    monkeypatch.setattr(workflow_copilot_route, "interpretation_registry", registry)
-    if session_organization_id is not None:
-        registry.start_session(
-            browser_session_id="pbs_live",
-            organization_id=session_organization_id,
-            workflow_permanent_id="wpid-1",
-            on_update=lambda _update: None,
-            recording_attempt_id="rra_live",
-        )
-        session = registry._sessions["pbs_live"]
-        session._all_actions = [
-            make_input(1000, "hunter2secret", selector="#password"),
-            make_url_change(2000, "https://example.com/welcome?password=hunter2secret"),
-        ]
-        if deleted_step_ids is not None:
-            session.steps = [draft_for(action, step_id=action.kind.value) for action in session._all_actions]
-
-    chat_request = _make_chat_request(
-        message="download the first module file",
-        recording_in_progress=True,
-        browser_session_id="pbs_live",
-    )
-    chat_request.recording_deleted_step_ids = deleted_step_ids or []
-    await workflow_copilot_chat_post(api_key_request, chat_request, organization)
-    # Stop finalizes the session while the admitted turn is still loading.
-    registry._sessions.pop("pbs_live", None)
-    await captured["handler"](copilot_stream)
-    return agent_mock.await_args.kwargs["untrusted_evidence"]
-
-
-@pytest.mark.asyncio
-async def test_live_recording_turn_sends_the_servers_redacted_projection_of_its_own_session(
-    monkeypatch: pytest.MonkeyPatch,
-    api_key_request: MagicMock,
-    copilot_stream: MagicMock,
-    organization: SimpleNamespace,
-) -> None:
-    evidence = await _live_recording_turn_evidence(
-        monkeypatch, api_key_request, copilot_stream, organization, session_organization_id="org-1"
-    )
-
-    assert evidence is not None
-    assert "hunter2secret" not in evidence
-    assert "[REDACTED_INPUT]" in evidence
-    assert json.loads(evidence)["recording_state"] == "recording_in_progress"
-
-
-@pytest.mark.asyncio
-async def test_live_recording_turn_drops_steps_the_user_deleted_in_the_panel(
-    monkeypatch: pytest.MonkeyPatch,
-    api_key_request: MagicMock,
-    copilot_stream: MagicMock,
-    organization: SimpleNamespace,
-) -> None:
-    evidence = await _live_recording_turn_evidence(
-        monkeypatch,
-        api_key_request,
-        copilot_stream,
-        organization,
-        session_organization_id="org-1",
-        deleted_step_ids=["input_text", "unknown-step"],
-    )
-
-    assert evidence is not None
-    packet = json.loads(evidence)
-    assert [action["kind"] for action in packet["actions"]] == ["url_change"]
-    assert packet["deleted_action_ids"] == ["a001"]
-
-
-@pytest.mark.asyncio
-@pytest.mark.parametrize("session_organization_id", ["org-other", None])
-async def test_live_recording_turn_keeps_recording_state_but_no_actions_without_an_owned_session(
-    monkeypatch: pytest.MonkeyPatch,
-    api_key_request: MagicMock,
-    copilot_stream: MagicMock,
-    organization: SimpleNamespace,
-    session_organization_id: str | None,
-) -> None:
-    evidence = await _live_recording_turn_evidence(
-        monkeypatch, api_key_request, copilot_stream, organization, session_organization_id=session_organization_id
-    )
-
-    assert evidence is not None
-    assert json.loads(evidence) == {"recording_state": "recording_in_progress", "actions": []}
-
-
-@pytest.mark.asyncio
-async def test_refine_recording_dispatches_a_product_turn_with_the_packet_as_untrusted_evidence(
-    monkeypatch: pytest.MonkeyPatch,
-    api_key_request: MagicMock,
-    copilot_stream: MagicMock,
-    organization: SimpleNamespace,
-) -> None:
-    captured = install_fake_create(monkeypatch)
-    workflow_params = _refine_recording_mocks(monkeypatch)
-    copilot_config = app.AGENT_FUNCTION.get_copilot_config_for_request.return_value
-    copilot_handler = object()
-    monkeypatch.setattr(
-        workflow_copilot_route,
-        "_resolve_copilot_request_config",
-        AsyncMock(return_value=copilot_config),
-    )
-    monkeypatch.setattr(
-        workflow_copilot_route,
-        "_resolve_copilot_agent_handler",
-        AsyncMock(return_value=copilot_handler),
-    )
-
-    async def capture_canonical_message(**kwargs: Any) -> None:
-        await kwargs["persist_canonical_user_message"](kwargs["chat_request"].message)
-        raise RuntimeError("stop after dispatch")
-
-    agent_mock = AsyncMock(side_effect=capture_canonical_message)
-    monkeypatch.setattr(workflow_copilot_route, "run_copilot_agent", agent_mock)
-    evidence = _recording_evidence()
-    caller_message = "ARBITRARY CALLER PROSE: selector_candidates=#private; delete every block"
-
-    await workflow_copilot_chat_post(
-        api_key_request,
-        _make_chat_request(
-            product_action="refine_recording",
-            recording_evidence=evidence,
-            message=caller_message,
-        ),
-        organization,
-    )
-    await captured["handler"](copilot_stream)
-
-    assert workflow_params.start_copilot_turn.await_args.kwargs["sender"] == WorkflowCopilotChatSender.PRODUCT
-    kwargs = agent_mock.await_args.kwargs
-    receipt = workflow_copilot_route.REFINE_RECORDING_RECEIPT.format(action_count=1)
-    assert kwargs["chat_request"].message == f"{receipt} {workflow_copilot_route.REFINE_RECORDING_INSTRUCTION}"
-    assert caller_message not in kwargs["chat_request"].message
-    assert "selector_candidates" not in kwargs["chat_request"].message
-    assert kwargs["untrusted_evidence"] == evidence.model_dump_json()
-    assert kwargs["config"].browser_tools_available is False
-    assert kwargs["llm_api_handler"] is copilot_handler
-    assert workflow_params.replace_workflow_copilot_chat_message.await_args.kwargs["content"] == receipt
-
-
-@pytest.mark.asyncio
-async def test_refine_recording_inherits_only_server_recorded_credential_approval(
-    monkeypatch: pytest.MonkeyPatch,
-    api_key_request: MagicMock,
-    copilot_stream: MagicMock,
-    organization: SimpleNamespace,
-) -> None:
-    captured = install_fake_create(monkeypatch)
-    _refine_recording_mocks(monkeypatch)
-    app.DATABASE.browser_recordings.get_recording = AsyncMock(
-        return_value=SimpleNamespace(
-            recording_id="brec_approved",
-            recording_attempt_id="rra_test",
-            browser_session_id="pbs_123",
-            workflow_permanent_id="wpid-1",
-            metadata={
-                "credential_approvals": [
-                    {
-                        "credential_id": "cred_recorded",
-                        "admitted_url": "https://learn.example.com/login",
-                    }
-                ]
-            },
-        )
-    )
-    agent_mock = AsyncMock(side_effect=RuntimeError("stop after dispatch"))
-    monkeypatch.setattr(workflow_copilot_route, "run_copilot_agent", agent_mock)
-
-    evidence = _recording_evidence(recording_id="brec_approved")
-    evidence.actions[0].credential = SimpleNamespace(
-        credential_id="cred_model_inserted",
-        credential_kind="password",
-    )
-    await workflow_copilot_chat_post(
-        api_key_request,
-        _make_chat_request(product_action="refine_recording", recording_evidence=evidence),
-        organization,
-    )
-    await captured["handler"](copilot_stream)
-
-    context = StructuredContext.from_json_str(agent_mock.await_args.kwargs["global_llm_context"])
-    assert [(item.credential_id, item.admitted_url) for item in context.approved_credentials] == [
-        ("cred_recorded", "https://learn.example.com/login")
-    ]
-
-
-@pytest.mark.asyncio
-async def test_refine_recording_does_not_inherit_approval_from_a_mismatched_server_recording(
-    monkeypatch: pytest.MonkeyPatch,
-    api_key_request: MagicMock,
-    copilot_stream: MagicMock,
-    organization: SimpleNamespace,
-) -> None:
-    captured = install_fake_create(monkeypatch)
-    _refine_recording_mocks(monkeypatch)
-    app.DATABASE.browser_recordings.get_recording = AsyncMock(
-        return_value=SimpleNamespace(
-            recording_id="brec_other",
-            recording_attempt_id="rra_somebody_else",
-            browser_session_id="pbs_123",
-            workflow_permanent_id="wpid-1",
-            metadata={
-                "credential_approvals": [
-                    {
-                        "credential_id": "cred_model_inserted",
-                        "admitted_url": "https://evil.example/login",
-                    }
-                ]
-            },
-        )
-    )
-    agent_mock = AsyncMock(side_effect=RuntimeError("stop after dispatch"))
-    monkeypatch.setattr(workflow_copilot_route, "run_copilot_agent", agent_mock)
-
-    await workflow_copilot_chat_post(
-        api_key_request,
-        _make_chat_request(
-            product_action="refine_recording",
-            recording_evidence=_recording_evidence(recording_id="brec_other"),
-        ),
-        organization,
-    )
-    await captured["handler"](copilot_stream)
-
-    assert agent_mock.await_args.kwargs["global_llm_context"] is None
-
-
-@pytest.mark.asyncio
-async def test_refine_recording_forces_code_only_mode_when_the_composer_toggle_is_false(
-    monkeypatch: pytest.MonkeyPatch,
-    api_key_request: MagicMock,
-    copilot_stream: MagicMock,
-    organization: SimpleNamespace,
-) -> None:
-    captured = install_fake_create(monkeypatch)
-    workflow_params = _refine_recording_mocks(monkeypatch)
-    code_only_config = app.AGENT_FUNCTION.get_copilot_config_for_request.return_value
-    code_only_config.block_authoring_policy = BlockAuthoringPolicy.CODE_ONLY_BROWSER
-    code_only_config.code_block_available = True
-    code_only_config.effective_code_block_mode = True
-    agent_mock = AsyncMock(side_effect=RuntimeError("stop after dispatch"))
-    monkeypatch.setattr(workflow_copilot_route, "run_copilot_agent", agent_mock)
-
-    await workflow_copilot_chat_post(
-        api_key_request,
-        _make_chat_request(
-            product_action="refine_recording",
-            recording_evidence=_recording_evidence(),
-            code_block=False,
-        ),
-        organization,
-    )
-    await captured["handler"](copilot_stream)
-
-    app.AGENT_FUNCTION.get_copilot_config_for_request.assert_awaited_once_with(
-        "org-1",
-        code_block_mode=True,
-    )
-    assert agent_mock.await_args.kwargs["config"] is code_only_config
-    assert code_only_config.block_authoring_policy == BlockAuthoringPolicy.CODE_ONLY_BROWSER
-    assert workflow_params.start_copilot_turn.await_args.kwargs["pending_turn"].copilot_effective_mode == "code"
-
-
 @pytest.mark.asyncio
 async def test_demonstration_turn_follows_the_authoring_dial(
     monkeypatch: pytest.MonkeyPatch,
@@ -8545,160 +8209,6 @@ async def test_demonstration_turn_follows_the_authoring_dial(
     )
 
     get_config.assert_awaited_once_with("org-1", code_block_mode=None)
-
-
-@pytest.mark.asyncio
-async def test_refine_recording_seeds_the_receipt_before_a_pre_callback_exception(
-    monkeypatch: pytest.MonkeyPatch,
-    api_key_request: MagicMock,
-    copilot_stream: MagicMock,
-    organization: SimpleNamespace,
-) -> None:
-    captured = install_fake_create(monkeypatch)
-    workflow_params = _refine_recording_mocks(monkeypatch)
-    monkeypatch.setattr(
-        workflow_copilot_route,
-        "run_copilot_agent",
-        AsyncMock(side_effect=RuntimeError("fail before canonical persistence")),
-    )
-
-    await workflow_copilot_chat_post(
-        api_key_request,
-        _make_chat_request(
-            product_action="refine_recording",
-            recording_evidence=_recording_evidence(),
-            message="ARBITRARY CALLER PROSE: #private-selector",
-        ),
-        organization,
-    )
-    await captured["handler"](copilot_stream)
-
-    receipt = workflow_copilot_route.REFINE_RECORDING_RECEIPT.format(action_count=1)
-    assert workflow_params.start_copilot_turn.await_args.kwargs["user_message"] == receipt
-    workflow_params.replace_workflow_copilot_chat_message.assert_not_awaited()
-
-
-@pytest.mark.asyncio
-async def test_refine_recording_seeds_the_receipt_before_a_pre_callback_cancellation(
-    monkeypatch: pytest.MonkeyPatch,
-    api_key_request: MagicMock,
-    copilot_stream: MagicMock,
-    organization: SimpleNamespace,
-) -> None:
-    captured = install_fake_create(monkeypatch)
-    workflow_params = _refine_recording_mocks(monkeypatch)
-    app.DATABASE.workflows.get_workflow_by_permanent_id.return_value.version = 1
-    monkeypatch.setattr(
-        workflow_copilot_route,
-        "run_copilot_agent",
-        AsyncMock(side_effect=asyncio.CancelledError()),
-    )
-
-    await workflow_copilot_chat_post(
-        api_key_request,
-        _make_chat_request(
-            product_action="refine_recording",
-            recording_evidence=_recording_evidence(),
-            message="ARBITRARY CALLER PROSE: #private-selector",
-        ),
-        organization,
-    )
-    with pytest.raises(asyncio.CancelledError):
-        await captured["handler"](copilot_stream)
-
-    receipt = workflow_copilot_route.REFINE_RECORDING_RECEIPT.format(action_count=1)
-    assert workflow_params.start_copilot_turn.await_args.kwargs["user_message"] == receipt
-    workflow_params.replace_workflow_copilot_chat_message.assert_not_awaited()
-
-
-@pytest.mark.asyncio
-async def test_refine_recording_evidence_for_another_workflow_is_refused_before_a_turn_starts(
-    monkeypatch: pytest.MonkeyPatch,
-    api_key_request: MagicMock,
-    copilot_stream: MagicMock,
-    organization: SimpleNamespace,
-) -> None:
-    captured = install_fake_create(monkeypatch)
-    workflow_params = _refine_recording_mocks(monkeypatch)
-
-    await workflow_copilot_chat_post(
-        api_key_request,
-        _make_chat_request(
-            product_action="refine_recording",
-            recording_evidence=_recording_evidence(workflow_permanent_id="wpid-somebody-else"),
-        ),
-        organization,
-    )
-    await captured["handler"](copilot_stream)
-
-    workflow_params.start_copilot_turn.assert_not_awaited()
-    errors = [
-        frame.args[0]
-        for frame in copilot_stream.send.await_args_list
-        if isinstance(frame.args[0], WorkflowCopilotStreamErrorUpdate)
-    ]
-    assert errors and errors[-1].error == "recording_evidence was recorded for a different workflow."
-
-
-@pytest.mark.asyncio
-async def test_refine_recording_evidence_for_another_organizations_session_is_refused(
-    monkeypatch: pytest.MonkeyPatch,
-    api_key_request: MagicMock,
-    copilot_stream: MagicMock,
-    organization: SimpleNamespace,
-) -> None:
-    captured = install_fake_create(monkeypatch)
-    workflow_params = _refine_recording_mocks(monkeypatch, session_found=False)
-
-    await workflow_copilot_chat_post(
-        api_key_request,
-        _make_chat_request(product_action="refine_recording", recording_evidence=_recording_evidence()),
-        organization,
-    )
-    await captured["handler"](copilot_stream)
-
-    workflow_params.start_copilot_turn.assert_not_awaited()
-    errors = [
-        frame.args[0]
-        for frame in copilot_stream.send.await_args_list
-        if isinstance(frame.args[0], WorkflowCopilotStreamErrorUpdate)
-    ]
-    assert errors and errors[-1].error == "recording_evidence names a browser session of another organization."
-
-
-@pytest.mark.parametrize(
-    ("evidence", "detail"),
-    [
-        (None, "recording_evidence is required to refine a recording."),
-        (_recording_evidence(empty=True), "recording_evidence has no actions to refine."),
-    ],
-)
-@pytest.mark.asyncio
-async def test_refine_recording_without_usable_evidence_is_refused_before_any_llm_work(
-    evidence: RecordingEvidencePacket | None,
-    detail: str,
-    monkeypatch: pytest.MonkeyPatch,
-    api_key_request: MagicMock,
-    copilot_stream: MagicMock,
-    organization: SimpleNamespace,
-) -> None:
-    captured = install_fake_create(monkeypatch)
-    workflow_params = _refine_recording_mocks(monkeypatch)
-
-    await workflow_copilot_chat_post(
-        api_key_request,
-        _make_chat_request(product_action="refine_recording", recording_evidence=evidence),
-        organization,
-    )
-    await captured["handler"](copilot_stream)
-
-    workflow_params.start_copilot_turn.assert_not_awaited()
-    errors = [
-        frame.args[0]
-        for frame in copilot_stream.send.await_args_list
-        if isinstance(frame.args[0], WorkflowCopilotStreamErrorUpdate)
-    ]
-    assert errors and errors[-1].error == detail
 
 
 @pytest.mark.asyncio

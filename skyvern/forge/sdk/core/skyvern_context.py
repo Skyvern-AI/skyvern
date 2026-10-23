@@ -6,6 +6,7 @@ import datetime
 import hashlib
 import html
 import re
+import time
 import unicodedata
 from bisect import bisect_left, bisect_right
 from contextlib import contextmanager
@@ -40,6 +41,31 @@ if TYPE_CHECKING:
     # must not pull a service module at import time. String annotation below.
     from skyvern.services.script_reviewer_v3.budget import RunBudget
     from skyvern.webeye.actions.actions import Action
+
+
+@dataclass
+class ExternalOTPUse:
+    """Externally delivered one-time codes already entered in this task, kept apart from ``multi_field_totp``.
+
+    Clearing, remounts, replans, URL changes, ``reset_attempt`` and cache restores rebuild that binding; none
+    of them makes an entered code enterable again. Entering, and pressing the group's submit control, are
+    recorded separately; whether the site accepted a code is never inferred.
+    """
+
+    expected_digits: int
+    # Fingerprints of codes whose whole value reached the group, or was sent without a confirmed read-back.
+    used_code_hashes: frozenset[str] = field(default_factory=frozenset, repr=False)
+    current_code_hash: str | None = field(default=None, repr=False)
+    # Codes whose bound submit control or Enter was pressed (or may have been, if the press failed late).
+    submitted_code_hashes: frozenset[str] = field(default_factory=frozenset, repr=False)
+    # time.monotonic() limit, fixed when the current code was entered, for a step that can only repeat it.
+    deadline: float | None = None
+    # Start of a dispatched press on the group's resend control; authorizes one fetch.
+    resend_requested_at: datetime.datetime | None = None
+    resend_attempted: bool = False
+    # Latched once the task is to end here, so a failed terminate action cannot reopen code entry.
+    terminal_reasoning: str | None = None
+    terminal_error_code: str | None = None
 
 
 @dataclass
@@ -711,6 +737,11 @@ class SkyvernContext:
     navigation_payload: dict[str, Any] | list | str | None = None
     complete_criterion_is_untrusted: bool = False
     download_suffix: str | None = None
+    # Explicit download_timeout of the Task V3 block or task now running; the browser download listener
+    # reads it when a download starts, so it also covers the initial navigation and a relaunched browser.
+    download_timeout: float | None = None
+    residential_download_interrupted_task_ids: set[str] = field(default_factory=builtins.set)
+    download_completed_task_ids: set[str] = field(default_factory=builtins.set)
     # Keep source names with exact CDP targets; finalization must not infer provenance from affixes.
     download_suffix_applied_files: dict[str, tuple[str, str]] = field(default_factory=dict, repr=False)
     totp_codes: dict[str, str | None] = field(default_factory=dict)
@@ -726,6 +757,7 @@ class SkyvernContext:
         field(default_factory=dict, repr=False)
     )
     multi_field_totp_rejected_candidates: dict[str, set[str]] = field(default_factory=dict, repr=False)
+    external_otp_uses: dict[str, ExternalOTPUse] = field(default_factory=dict)
     active_credential_parameter_key: str | None = None
     log: list[dict] = field(default_factory=list)
     hashed_href_map: dict[str, str] = field(default_factory=dict)
@@ -1119,6 +1151,23 @@ class SkyvernContext:
         self.multi_field_totp_mask_values.pop(task_id, None)
         self.multi_field_totp_prompt_values.pop(task_id, None)
         self.multi_field_totp_rejected_candidates.pop(task_id, None)
+        self.external_otp_uses.pop(task_id, None)
+
+    def note_external_otp_input(
+        self, task_id: str, code_hash: str, expected_digits: int, budget_seconds: float
+    ) -> None:
+        use = self.external_otp_uses.setdefault(task_id, ExternalOTPUse(expected_digits=expected_digits))
+        if use.current_code_hash != code_hash:
+            use.current_code_hash = code_hash
+            use.expected_digits = expected_digits
+            use.deadline = time.monotonic() + budget_seconds
+        use.used_code_hashes = use.used_code_hashes | {code_hash}
+
+    def external_otp_code_used(self, task_id: str, code: str | None) -> bool:
+        use = self.external_otp_uses.get(task_id)
+        return (
+            code is not None and use is not None and hashlib.sha256(code.encode()).hexdigest() in use.used_code_hashes
+        )
 
     def clear_multi_field_totp_state(self, task_id: str, *, restore_unverified_external: bool = False) -> None:
         attempt = self.multi_field_totp.pop(task_id, None)
@@ -1134,6 +1183,7 @@ class SkyvernContext:
             and attempt.filled_code_hash is not None
             and not attempt.fill_verified
             and cached_code
+            and not self.external_otp_code_used(task_id, cached_code)
         ):
             self.totp_codes[task_id] = cached_code
 

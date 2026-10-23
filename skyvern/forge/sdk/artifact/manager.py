@@ -1885,10 +1885,35 @@ class ArtifactManager:
         )
 
         if _bundling_enabled():
-            await self._flush_step_archive_bundled(accumulator)
+            await self._flush_step_archives_bundled(accumulator.step, [accumulator])
         else:
             await self._flush_step_archive_unbundled(accumulator)
+        await self._apply_pending_action_screenshot_updates(accumulator)
 
+    async def flush_task_step_archives_as_one(self, owner: Step) -> None:
+        """Persist every buffered archive of ``owner``'s task as one ZIP owned by ``owner``.
+
+        One storage PUT for the task instead of one per step; each member row keeps the step that produced it.
+        Unbundled mode has no ZIP, so each step flushes on its own there.
+        """
+        step_ids = [sid for sid, acc in list(self._step_archives.items()) if acc.step.task_id == owner.task_id]
+        if not _bundling_enabled():
+            for step_id in step_ids:
+                await self.flush_step_archive(step_id)
+            return
+        accumulators = [
+            acc
+            for step_id in step_ids
+            if (acc := self._step_archives.pop(step_id, None)) is not None and acc.entries and acc.member_types
+        ]
+        if not accumulators:
+            return
+        accumulators.sort(key=lambda acc: (acc.step.order, acc.step.retry_index))
+        await self._flush_step_archives_bundled(owner, accumulators)
+        for accumulator in accumulators:
+            await self._apply_pending_action_screenshot_updates(accumulator)
+
+    async def _apply_pending_action_screenshot_updates(self, accumulator: StepArchiveAccumulator) -> None:
         for organization_id, action_id, artifact_id in accumulator.pending_action_screenshot_updates:
             try:
                 await app.DATABASE.artifacts.update_action_screenshot_artifact_id(
@@ -1904,14 +1929,14 @@ class ArtifactManager:
                     exc_info=True,
                 )
 
-    async def _flush_step_archive_bundled(self, accumulator: StepArchiveAccumulator) -> None:
-        """Bundle all accumulated entries into a single ZIP, one storage PUT, parent + member rows."""
-        step = accumulator.step
+    async def _flush_step_archives_bundled(self, owner: Step, accumulators: list[StepArchiveAccumulator]) -> None:
+        """Bundle the accumulators' entries into one ZIP owned by ``owner``: one storage PUT, parent + member rows."""
+        run_scope = accumulators[0]
         archive_artifact_id = generate_artifact_id()
         archive_uri = app.STORAGE.build_uri(
-            organization_id=step.organization_id,
+            organization_id=owner.organization_id,
             artifact_id=archive_artifact_id,
-            step=step,
+            step=owner,
             artifact_type=ArtifactType.STEP_ARCHIVE,
         )
 
@@ -1920,17 +1945,26 @@ class ArtifactManager:
             artifact_id=archive_artifact_id,
             artifact_type=ArtifactType.STEP_ARCHIVE,
             uri=archive_uri,
-            organization_id=step.organization_id,
-            step_id=step.step_id,
-            task_id=step.task_id,
-            workflow_run_id=accumulator.workflow_run_id,
-            workflow_run_block_id=accumulator.workflow_run_block_id,
-            run_id=accumulator.run_id,
+            organization_id=owner.organization_id,
+            step_id=owner.step_id,
+            task_id=owner.task_id,
+            workflow_run_id=run_scope.workflow_run_id,
+            workflow_run_block_id=run_scope.workflow_run_block_id,
+            run_id=run_scope.run_id,
             created_at=now,
             modified_at=now,
         )
 
-        zip_bytes = self._build_zip(accumulator.entries)
+        entries: dict[str, bytes] = {}
+        members: list[tuple[StepArchiveAccumulator, ArtifactType, str, str]] = []
+        for accumulator in accumulators:
+            # Every step numbers its files from 0, so another step's files get its step id as a prefix in the ZIP.
+            prefix = "" if accumulator.step.step_id == owner.step_id else f"{accumulator.step.step_id}_"
+            for artifact_type, filename, artifact_id in accumulator.member_types:
+                entries[prefix + filename] = accumulator.entries[filename]
+                members.append((accumulator, artifact_type, prefix + filename, artifact_id))
+
+        zip_bytes = self._build_zip(entries)
         await app.STORAGE.store_artifact(archive_artifact, zip_bytes)
 
         # Parent archive row (no bundle_key — represents the ZIP object itself)
@@ -1938,12 +1972,12 @@ class ArtifactManager:
             artifact_id=archive_artifact_id,
             artifact_type=ArtifactType.STEP_ARCHIVE,
             uri=archive_uri,
-            organization_id=step.organization_id,
-            step_id=step.step_id,
-            task_id=step.task_id,
-            workflow_run_id=accumulator.workflow_run_id,
-            workflow_run_block_id=accumulator.workflow_run_block_id,
-            run_id=accumulator.run_id,
+            organization_id=owner.organization_id,
+            step_id=owner.step_id,
+            task_id=owner.task_id,
+            workflow_run_id=run_scope.workflow_run_id,
+            workflow_run_block_id=run_scope.workflow_run_block_id,
+            run_id=run_scope.run_id,
         )
         # Member rows (bundle_key points to the filename inside the ZIP)
         member_models = [
@@ -1952,14 +1986,14 @@ class ArtifactManager:
                 artifact_type=artifact_type,
                 uri=archive_uri,
                 bundle_key=filename,
-                organization_id=step.organization_id,
-                step_id=step.step_id,
-                task_id=step.task_id,
+                organization_id=accumulator.step.organization_id,
+                step_id=accumulator.step.step_id,
+                task_id=accumulator.step.task_id,
                 workflow_run_id=accumulator.workflow_run_id,
                 workflow_run_block_id=accumulator.workflow_run_block_id,
                 run_id=accumulator.run_id,
             )
-            for artifact_type, filename, artifact_id in accumulator.member_types
+            for accumulator, artifact_type, filename, artifact_id in members
         ]
         await app.DATABASE.artifacts.bulk_create_artifacts([parent_model, *member_models])
 

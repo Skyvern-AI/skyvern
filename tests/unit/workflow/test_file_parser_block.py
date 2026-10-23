@@ -32,13 +32,24 @@ import structlog
 from pypdf import PdfReader, apply_configuration
 from pypdf.errors import LimitReachedError, PdfReadError
 
+import skyvern.forge.sdk.utils.capped_subprocess as capped_subprocess_module
+import skyvern.forge.sdk.utils.pdf_parser as pdf_parser_module
 import skyvern.forge.sdk.workflow.models.block as block_module
+from skyvern.config import settings
 from skyvern.core.script_generations.generate_script import _build_file_url_parser_statement
 from skyvern.exceptions import PDFParsingError
 from skyvern.forge import app
 from skyvern.forge.forge_app_initializer import start_forge_app
 from skyvern.forge.sdk.api.llm.exceptions import InvalidLLMResponseFormat
-from skyvern.forge.sdk.utils.pdf_parser import extract_pdf_file, scrambled_text_layer_reason, validate_pdf_file
+from skyvern.forge.sdk.utils.capped_subprocess import MEMORY_CAP_ENFORCED, CappedSubprocessError
+from skyvern.forge.sdk.utils.capped_subprocess_child import MIN_MEMORY_BUDGET_BYTES
+from skyvern.forge.sdk.utils.pdf_parser import (
+    extract_pdf_file,
+    extract_upright_pdf_words,
+    render_pdf_pages_as_images,
+    scrambled_text_layer_reason,
+    validate_pdf_file,
+)
 from skyvern.forge.sdk.workflow.context_manager import WorkflowRunContext
 from skyvern.forge.sdk.workflow.exceptions import FileParseTimeout, InvalidFileType, WorksheetNotFound
 from skyvern.forge.sdk.workflow.models.block import BlockType, FileParserBlock, PDFParserBlock
@@ -1424,6 +1435,9 @@ class TestPypdfLimitFallback:
                 {"content_length": 5}, {"maximum_declared_stream_length": 100}, id="stream_length_understated"
             ),
             pytest.param({}, {"page_tree_maximum_entries": 0}, id="page_tree_entries"),
+            pytest.param({}, {"array_maximum_element_count": 0}, id="array_elements"),
+            pytest.param({}, {"dictionary_maximum_element_count": 0}, id="dictionary_entries"),
+            pytest.param({}, {"stream_parsing_work_maximum_count": 0}, id="content_stream_tokens"),
             pytest.param({"cid_widths": b"[0 65535 500 65536 131071 500]"}, {}, id="cid_width_entries"),
             pytest.param({"gzip_content": True}, {"zlib_maximum_output_length": 64}, id="flate_recovery_output"),
             pytest.param(
@@ -1762,6 +1776,245 @@ class TestParsingDoesNotBlockEventLoop:
             )
 
         assert ticks > 0
+
+
+def _build_inflating_pdf(inflated_mib: int) -> bytes:
+    """One text page, no xref table, and an object stream inflating to inflated_mib MiB of zeros.
+    Past pypdf's 75 MB decompression limit pypdf cannot find the catalog, so the pdfplumber fallback gets the file."""
+    compressor = zlib.compressobj(9)
+    zeros = b"\x00" * (16 << 20)
+    stream = compressor.compress(b"10 0 ") + b"".join(compressor.compress(zeros) for _ in range(inflated_mib // 16))
+    stream += compressor.flush()
+    content = b"BT /F1 12 Tf 72 720 Td (Invoice Total 1234.56 GBP) Tj ET"
+    objects = [
+        b"<< /Type /Catalog /Pages 2 0 R >>",
+        b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>",
+        b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Resources << /Font << /F1 4 0 R >> >> "
+        b"/Contents 5 0 R >>",
+        b"<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>",
+        b"<< /Length %d >>\nstream\n" % len(content) + content + b"\nendstream",
+        b"<< /Type /ObjStm /N 1 /First 5 /Filter /FlateDecode /Length %d >>\nstream\n" % len(stream)
+        + stream
+        + b"\nendstream",
+    ]
+    out = bytearray(b"%PDF-1.7\n")
+    for number, payload in enumerate(objects, start=1):
+        out += b"%d 0 obj\n" % number + payload + b"\nendobj\n"
+    out += b"trailer\n<< /Size %d /Root 1 0 R >>\nstartxref\n%d\n%%%%EOF\n" % (len(objects) + 1, len(out))
+    return bytes(out)
+
+
+def _build_letter_pdf(pages: int, lines: tuple[str, ...] = _INVOICE_LINES) -> bytes:
+    """A Letter-size PDF with the same few lines of text on each page."""
+    content = ("BT /F1 12 Tf 72 720 Td 16 TL\n" + "".join(f"({line}) Tj T*\n" for line in lines) + "ET").encode()
+    objects = [
+        b"<< /Type /Catalog /Pages 2 0 R >>",
+        b"<< /Type /Pages /Kids [%s] /Count %d >>" % (b" ".join(b"%d 0 R" % (5 + i) for i in range(pages)), pages),
+        b"<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>",
+        b"<< /Length %d >>\nstream\n" % len(content) + content + b"\nendstream",
+    ]
+    objects += [
+        b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] "
+        b"/Resources << /Font << /F1 3 0 R >> >> /Contents 4 0 R >>"
+    ] * pages
+    out = bytearray(b"%PDF-1.4\n")
+    offsets = []
+    for number, payload in enumerate(objects, start=1):
+        offsets.append(len(out))
+        out += b"%d 0 obj\n" % number + payload + b"\nendobj\n"
+    xref_at = len(out)
+    out += b"xref\n0 %d\n" % (len(objects) + 1) + b"0000000000 65535 f \n"
+    out += b"".join(b"%010d 00000 n \n" % offset for offset in offsets)
+    out += b"trailer\n<< /Size %d /Root 1 0 R >>\nstartxref\n%d\n%%%%EOF\n" % (len(objects) + 1, xref_at)
+    return bytes(out)
+
+
+class _RejectingPdfReader:
+    def __init__(self, *args: object, **kwargs: object) -> None:
+        raise ValueError("pypdf rejected the file")
+
+
+@pytest.fixture(scope="module")
+def inflating_pdf(tmp_path_factory: pytest.TempPathFactory) -> Path:
+    path = tmp_path_factory.mktemp("inflating") / "inflating.pdf"
+    path.write_bytes(_build_inflating_pdf(128))
+    return path
+
+
+class TestPdfplumberFallbackIsContained:
+    """pdfplumber's parser has no decoded-size limit, so a hostile PDF must fail alone, not OOM-kill the pod."""
+
+    def test_fallback_that_outlives_the_parse_budget_fails_the_pdf(
+        self, inflating_pdf: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setattr(pdf_parser_module, "FILE_PARSE_STEP_TIMEOUT_SECONDS", 1)
+
+        with pytest.raises(PDFParsingError, match="did not finish within 1 second"):
+            extract_pdf_file(str(inflating_pdf))
+
+    @pytest.mark.skipif(
+        not MEMORY_CAP_ENFORCED, reason="only Linux enforces RLIMIT_AS; elsewhere the child is uncapped"
+    )
+    def test_fallback_that_outgrows_its_memory_cap_fails_the_pdf(
+        self, inflating_pdf: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setattr(settings, "PDFPLUMBER_MAX_MEMORY_BYTES", 16 * 1024 * 1024)
+
+        with pytest.raises(PDFParsingError, match="ran out of memory"):
+            extract_pdf_file(str(inflating_pdf))
+
+    def test_words_past_the_word_cap_fail_the_lookup_instead_of_filling_the_pod(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Every glyph here is its own word, so a small file decodes to many times its pickled size in the parent."""
+        crowded_pdf = tmp_path / "crowded.pdf"
+        crowded_pdf.write_bytes(_build_letter_pdf(1, ("a " * 30,) * 20))
+        monkeypatch.setattr(pdf_parser_module, "_UPRIGHT_WORDS_RESULT", pdf_parser_module._ResultLimit(16 * 1024, 6))
+
+        with pytest.raises(CappedSubprocessError) as excinfo:
+            extract_upright_pdf_words(str(crowded_pdf), {0})
+
+        assert excinfo.value.kind == "result_too_large"
+
+    def test_fallback_in_a_pod_without_free_memory_fails_the_pdf_before_parsing(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        cgroup = tmp_path / "cgroup"
+        cgroup.mkdir()
+        (cgroup / "memory.max").write_text(str(6144 * 1024 * 1024))
+        (cgroup / "memory.current").write_text(str(6000 * 1024 * 1024))
+        letter_pdf = tmp_path / "letter.pdf"
+        letter_pdf.write_bytes(_build_letter_pdf(1))
+        monkeypatch.setattr(capped_subprocess_module, "MEMORY_CAP_ENFORCED", True)
+        monkeypatch.setattr(capped_subprocess_module, "CGROUP_DIR", str(cgroup))
+        monkeypatch.setattr(pdf_parser_module, "PdfReader", _RejectingPdfReader)
+
+        with pytest.raises(PDFParsingError, match="not enough free memory"):
+            extract_pdf_file(str(letter_pdf))
+
+    def test_page_images_past_the_result_cap_fail_the_render(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        letter_pdf = tmp_path / "letter.pdf"
+        letter_pdf.write_bytes(_build_letter_pdf(3))
+        monkeypatch.setattr(settings, "PDFPLUMBER_MAX_RESULT_BYTES", 16 * 1024)
+
+        with pytest.raises(CappedSubprocessError, match="limit on page images"):
+            render_pdf_pages_as_images(str(letter_pdf))
+
+    @pytest.mark.skipif(
+        not MEMORY_CAP_ENFORCED, reason="only Linux enforces RLIMIT_AS; elsewhere the child is uncapped"
+    )
+    @pytest.mark.parametrize(
+        ("memory_ceiling", "letter_pages"),
+        [
+            pytest.param(None, 10, id="default ceiling"),
+            pytest.param(MIN_MEMORY_BUDGET_BYTES, 1, id="budget floor"),
+        ],
+    )
+    def test_ordinary_pdfs_fit_the_memory_budget(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, memory_ceiling: int | None, letter_pages: int
+    ) -> None:
+        if memory_ceiling is not None:
+            monkeypatch.setattr(settings, "PDFPLUMBER_MAX_MEMORY_BYTES", memory_ceiling)
+        text_pdf = tmp_path / "invoice.pdf"
+        text_pdf.write_bytes(_build_pdf(_ITEMISED_INVOICE_LINES))
+        letter_pdf = tmp_path / "letter.pdf"
+        letter_pdf.write_bytes(_build_letter_pdf(letter_pages))
+        monkeypatch.setattr(pdf_parser_module, "PdfReader", _RejectingPdfReader)
+
+        with structlog.testing.capture_logs() as logs:
+            text = extract_pdf_file(str(text_pdf))
+            images = render_pdf_pages_as_images(str(letter_pdf))
+
+        assert "Invoice Total: 1234.56 GBP" in text
+        assert len(images) == letter_pages and all(image.startswith(b"\x89PNG") for image in images)
+        finished = {
+            log["target"].rpartition(".")[2]: log for log in logs if log["event"] == "Capped subprocess finished"
+        }
+        assert set(finished) == {"page_texts", "page_images"}
+        for log in finished.values():
+            assert log["memory_budget_bytes"] <= (memory_ceiling or settings.PDFPLUMBER_MAX_MEMORY_BYTES)
+            assert 0 <= log["rss_growth_sampled_bytes"] < log["memory_budget_bytes"]
+
+
+class TestPdfplumberFallbackTokenLimit:
+    def test_pages_the_character_stop_skipped_are_still_read_up_to_the_token_limit(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A long run of one symbol is a few tokens, so the first pass stops at its character limit with the token
+        cap not yet reached and the pages that fit must be read in a second pass."""
+        symbols_pdf = tmp_path / "symbols.pdf"
+        symbols_pdf.write_bytes(_build_letter_pdf(3, ("=" * 60,) * 3))
+        monkeypatch.setattr(pdf_parser_module, "PdfReader", _RejectingPdfReader)
+
+        text = extract_pdf_file(str(symbols_pdf), max_tokens=14)
+
+        # Each page is 3 lines and 6 tokens: two pages fit under 14 tokens, the third does not.
+        assert text.count("=" * 60) == 6
+
+    def test_text_past_the_character_limit_is_cut_at_a_page_boundary(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        symbols_pdf = tmp_path / "symbols.pdf"
+        symbols_pdf.write_bytes(_build_letter_pdf(6, ("=" * 60,) * 3))
+        monkeypatch.setattr(pdf_parser_module, "PdfReader", _RejectingPdfReader)
+        monkeypatch.setattr(pdf_parser_module, "_PAGE_TEXTS_CHAR_LIMIT", 500)
+
+        with structlog.testing.capture_logs() as logs:
+            text = extract_pdf_file(str(symbols_pdf), max_tokens=40)
+
+        # Pages are 182 characters, so the read goes on to the third page, which takes it past 500.
+        assert text.count("=" * 60) == 9
+        assert any("exceeds the size limit" in log["event"] for log in logs)
+
+    def test_a_second_pass_that_fails_keeps_the_pages_the_first_pass_read(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        symbols_pdf = tmp_path / "symbols.pdf"
+        symbols_pdf.write_bytes(_build_letter_pdf(6, ("=" * 60,) * 3))
+        monkeypatch.setattr(pdf_parser_module, "PdfReader", _RejectingPdfReader)
+        run_in_capped_subprocess = pdf_parser_module.run_in_capped_subprocess
+        passes: list[int] = []
+
+        def time_out_on_the_second_pass(*args: Any, **kwargs: Any) -> Any:
+            passes.append(1)
+            if len(passes) == 2:
+                raise CappedSubprocessError("did not finish within 1 second and was stopped", kind="timeout")
+            return run_in_capped_subprocess(*args, **kwargs)
+
+        monkeypatch.setattr(pdf_parser_module, "run_in_capped_subprocess", time_out_on_the_second_pass)
+
+        with structlog.testing.capture_logs() as logs:
+            text = extract_pdf_file(str(symbols_pdf), max_tokens=40)
+
+        assert text.count("=" * 60) == 6
+        (warning,) = (log for log in logs if "failed, keeping the pages already read" in log["event"])
+        assert warning["failure"] == "timeout"
+
+    def test_the_page_that_crosses_the_result_cap_is_cut_instead_of_failing_the_parse(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        symbols_pdf = tmp_path / "symbols.pdf"
+        symbols_pdf.write_bytes(_build_letter_pdf(6, ("=" * 60,) * 3))
+        monkeypatch.setattr(pdf_parser_module, "PdfReader", _RejectingPdfReader)
+        monkeypatch.setattr(pdf_parser_module, "_PAGE_TEXTS_RESULT", pdf_parser_module._ResultLimit(2048, 6))
+
+        text = extract_pdf_file(str(symbols_pdf), max_tokens=0)
+
+        # The child keeps 1024 of the 2048 bytes for the text and counts 198 for each page, so the sixth is cut.
+        assert text.count("=" * 60) == 15
+
+    def test_a_first_page_that_does_not_fit_the_result_cap_fails_the_parse(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        symbols_pdf = tmp_path / "symbols.pdf"
+        symbols_pdf.write_bytes(_build_letter_pdf(2, ("=" * 60,) * 3))
+        monkeypatch.setattr(pdf_parser_module, "PdfReader", _RejectingPdfReader)
+        monkeypatch.setattr(pdf_parser_module, "_PAGE_TEXTS_RESULT", pdf_parser_module._ResultLimit(300, 6))
+
+        with pytest.raises(PDFParsingError, match="a result may hold"):
+            extract_pdf_file(str(symbols_pdf), max_tokens=0)
 
 
 @pytest.mark.asyncio

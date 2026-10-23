@@ -1,11 +1,12 @@
 import asyncio
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta, timezone, tzinfo
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import httpx
+import pytest
 from sqlalchemy import update
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 from sqlalchemy.pool import StaticPool
@@ -19,13 +20,16 @@ from skyvern.forge.sdk.db.repositories.browser_sessions import BrowserSessionsRe
 from skyvern.forge.sdk.encrypt import encryptor
 from skyvern.forge.sdk.encrypt.bootstrap import register_aes_encryptor
 from skyvern.forge.sdk.routes import browser_sessions as routes_mod
+from skyvern.forge.sdk.schemas import persistent_browser_sessions as persistent_browser_sessions_mod
 from skyvern.forge.sdk.schemas.persistent_browser_sessions import EXTERNAL_CDP_BROWSER_VENDOR, PersistentBrowserSession
 from skyvern.forge.sdk.services import org_auth_service
+from skyvern.webeye import external_cdp_sessions as external_mod
 from skyvern.webeye.browser_artifacts import BrowserArtifacts
 from skyvern.webeye.browser_state import BrowserState
 from skyvern.webeye.default_persistent_sessions_manager import DefaultPersistentSessionsManager
 from skyvern.webeye.persistent_sessions_manager import PersistentSessionsManager
 from skyvern.webeye.real_browser_state import RealBrowserState
+from tests.unit.scoped_asyncio import ScopedAsyncio
 
 TOKEN = "tok-9f3c1d7e5b"
 CDP_URL = f"wss://127.0.0.1:9333/devtools/browser/b1?token={TOKEN}"
@@ -125,12 +129,41 @@ async def external_cdp_stack() -> AsyncIterator[SimpleNamespace]:
         await engine.dispose()
 
 
-async def backdate_registration(stack: SimpleNamespace, session_id: str, minutes: float) -> None:
+class DeadlineClock:
+    """The clock registration deadlines are read against and the deadline watcher's sleep: frozen until a test sets
+    ``ticking``, after which each watcher poll moves it by exactly what the poll slept. Concurrent watchers share it,
+    so it moves by the sum of their sleeps."""
+
+    def __init__(self) -> None:
+        self._now = datetime.now(UTC)
+        self.ticking = asyncio.Event()
+        self.polls: list[float] = []
+
+    def now(self, tz: tzinfo) -> datetime:
+        return self._now.astimezone(tz)
+
+    async def sleep(self, seconds: float) -> None:
+        self.polls.append(seconds)
+        await self.ticking.wait()
+        self._now += timedelta(seconds=seconds)
+
+
+def install_deadline_clock(monkeypatch: pytest.MonkeyPatch) -> DeadlineClock:
+    clock = DeadlineClock()
+    monkeypatch.setattr(persistent_browser_sessions_mod, "datetime", clock)
+    monkeypatch.setattr(external_mod, "asyncio", ScopedAsyncio(sleep=clock.sleep))
+    return clock
+
+
+async def backdate_registration(
+    stack: SimpleNamespace, session_id: str, minutes: float, *, clock: DeadlineClock | None = None
+) -> None:
+    now = naive_utc_now() if clock is None else clock.now(UTC).replace(tzinfo=None)
     async with stack.session_factory() as session:
         await session.execute(
             update(PersistentBrowserSessionModel)
             .where(PersistentBrowserSessionModel.persistent_browser_session_id == session_id)
-            .values(started_at=naive_utc_now() - timedelta(minutes=minutes))
+            .values(started_at=now - timedelta(minutes=minutes))
         )
         await session.commit()
 

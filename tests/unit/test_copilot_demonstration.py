@@ -167,11 +167,13 @@ async def test_replay_contract_never_touches_a_browser_and_consumes_once(monkeyp
     cache = _SharedCache()
     monkeypatch.setattr(app, "CACHE", cache)
     credential = _credential()
+    create_recording = AsyncMock()
     monkeypatch.setattr(
         app,
         "DATABASE",
         SimpleNamespace(
             credentials=SimpleNamespace(get_credentials_by_ids=AsyncMock(return_value=[credential])),
+            browser_recordings=SimpleNamespace(create_recording=create_recording),
         ),
     )
     token = "sk-proj-" + "a" * 48
@@ -319,7 +321,7 @@ async def test_replay_contract_never_touches_a_browser_and_consumes_once(monkeyp
     ctx = make_copilot_ctx(
         organization_id="org-1",
         workflow_permanent_id="wfp-1",
-        browser_session_id="pbs-1",
+        browser_session_id="pbs-chat",
         turn_id="turn-1",
     )
     ctx.demonstration_id = "demo-1"
@@ -395,9 +397,23 @@ async def test_replay_contract_never_touches_a_browser_and_consumes_once(monkeyp
     payload_keys.append(demonstration_record_key("org-1", "demo-1"))
     payload_keys.append(demonstration_controls_key("org-1", "demo-1"))
     assert {cache.expirations[key] for key in payload_keys} == {recorder_module.DEMONSTRATION_CANCELLED_TTL}
+    create_recording.assert_awaited_once()
+    saved = create_recording.await_args.kwargs
+    assert saved["recording_attempt_id"] == "turn-1"
+    assert saved["browser_session_id"] == "pbs-1"
+    assert saved["workflow_permanent_id"] == "wfp-1"
+    assert saved["metadata"] == {
+        "source": "demonstration",
+        "outcome": "done",
+        "action_count": len(events),
+        "workflow_copilot_chat_id": ctx.workflow_copilot_chat_id,
+        "turn_id": "turn-1",
+    }
+    assert token not in json.dumps(saved["evidence"])
     with pytest.raises(DemonstrationRejection) as exc_info:
         await replay_demonstration(ctx, server)
     assert exc_info.value.status_code == 409
+    create_recording.assert_awaited_once()
 
 
 @pytest.mark.asyncio
@@ -1146,6 +1162,12 @@ async def test_recorder_runs_controls_queued_before_stop(monkeypatch: pytest.Mon
 async def test_replay_failure_restores_stopped_record(monkeypatch: pytest.MonkeyPatch) -> None:
     cache = _SharedCache()
     monkeypatch.setattr(app, "CACHE", cache)
+    create_recording = AsyncMock()
+    monkeypatch.setattr(
+        app,
+        "DATABASE",
+        SimpleNamespace(browser_recordings=SimpleNamespace(create_recording=create_recording)),
+    )
     cache.store[demonstration_record_key("org-1", "demo-1")] = encode_demonstration_record(
         DemonstrationRecord(
             workflow_permanent_id="wfp-1",
@@ -1177,6 +1199,7 @@ async def test_replay_failure_restores_stopped_record(monkeypatch: pytest.Monkey
     record = await load_demonstration_record(cache, "org-1", "demo-1")  # type: ignore[arg-type]
     assert record is not None and record.status == "stopped"
     call_tool.assert_awaited_once_with("click", {"selector": "#submit"})
+    create_recording.assert_not_awaited()
 
 
 @pytest.mark.asyncio

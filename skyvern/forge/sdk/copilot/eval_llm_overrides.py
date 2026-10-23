@@ -65,11 +65,11 @@ def admit_eval_llm_overrides(raw: str | None, organization_id: str) -> EvalLLMOv
         raise HTTPException(status_code=400, detail="Invalid Copilot eval model overrides") from exc
     if not parsed:
         return None
-    if (
-        not settings.WORKFLOW_COPILOT_EVAL_LLM_OVERRIDES_ENABLED
-        or organization_id not in settings.WORKFLOW_COPILOT_EVAL_LLM_OVERRIDES_ORGANIZATION_IDS
-    ):
-        raise HTTPException(status_code=403, detail="Copilot eval model overrides are disabled")
+    if organization_id not in settings.WORKFLOW_COPILOT_EVAL_LLM_OVERRIDES_ORGANIZATION_IDS:
+        raise HTTPException(
+            status_code=403,
+            detail="Copilot eval model overrides require an allowlisted Evaluation organization",
+        )
     keys: dict[str, str] = dict(sorted(parsed.items()))
     handlers: dict[str, LLMAPIHandler] = {}
     try:

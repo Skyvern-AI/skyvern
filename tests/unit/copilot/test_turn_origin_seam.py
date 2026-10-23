@@ -30,7 +30,7 @@ class _FakeBrowser:
 class _FakeBrowserContext:
     def __init__(self, *, connected: bool = True, closed: bool = False) -> None:
         self.browser = _FakeBrowser(connected=connected)
-        self._impl_obj = SimpleNamespace(_close_was_called=closed, _closed=closed)
+        self._impl_obj = SimpleNamespace(_closing_or_closed=closed, _closed=closed)
 
 
 def _make_stream() -> MagicMock:

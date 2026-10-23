@@ -127,8 +127,8 @@ async def test_prompt_type_missing_from_config_returns_none_without_warning(
     These fall back to the default app handler; warning was incorrect.
     """
     config = {
-        "extract-information": "GEMINI_2_5_FLASH_WITH_FALLBACK",
-        "normal-select": "GEMINI_2_5_FLASH_WITH_FALLBACK",
+        "extract-information": "GEMINI_3_0_FLASH_WITH_FALLBACK",
+        "normal-select": "GEMINI_3_0_FLASH_WITH_FALLBACK",
     }
     monkeypatch.setattr(
         module,
@@ -154,7 +154,7 @@ async def test_prompt_type_missing_from_config_returns_none_without_warning(
 @pytest.mark.asyncio
 async def test_prompt_type_in_config_returns_handler(monkeypatch: pytest.MonkeyPatch) -> None:
     """Config contains prompt type → LLMAPIHandlerFactory is called, handler returned."""
-    config = {"extract-information": "GEMINI_2_5_FLASH_WITH_FALLBACK"}
+    config = {"extract-information": "GEMINI_3_0_FLASH_WITH_FALLBACK"}
     monkeypatch.setattr(
         module,
         "get_llm_config_by_prompt_type",

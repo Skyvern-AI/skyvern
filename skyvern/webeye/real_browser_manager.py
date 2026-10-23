@@ -4,7 +4,7 @@ import asyncio
 import functools
 import os
 import time
-from collections.abc import AsyncIterator, Iterable
+from collections.abc import AsyncIterator, Callable, Iterable
 from contextlib import asynccontextmanager, suppress
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime
@@ -66,7 +66,7 @@ from skyvern.webeye.browser_settings_receipts import (
     measure_timezone_receipt,
     record_session_timezone_receipt,
 )
-from skyvern.webeye.browser_state import BrowserState
+from skyvern.webeye.browser_state import BrowserState, raise_if_browser_connection_lost
 from skyvern.webeye.cdp_frame_publisher import (
     CDPFramePublisher,
     stream_key_for_task,
@@ -301,11 +301,15 @@ async def _on_browser_state_acquired(
     task_id: str | None = None,
     browser_session_id: str | None = None,
     acquire: bool = True,
+    handoff: bool = False,
 ) -> BrowserState:
     browser_context = browser_state.browser_context
     if browser_context is not None:
         _retain_run_dialog_answers(browser_state, workflow_run_id, parent_workflow_run_id, live_run_ids)
         await app.AGENT_FUNCTION.on_browser_context_acquired(browser_context, workflow_run_id)
+    if handoff:
+        # The run still bound to this browser owns any loss latched up to here; rebinding would hide it.
+        raise_if_browser_connection_lost(browser_state, workflow_run_id=workflow_run_id)
     if acquire:
         browser_state.bind_runtime_event_context(
             BrowserRuntimeLogContext.for_run(
@@ -1050,6 +1054,9 @@ class RealBrowserManager(BrowserManager):
         lost_external_browser = False
         if browser_state is not None:
             if browser_session_id and not browser_state.is_connected():
+                raise_if_browser_connection_lost(
+                    browser_state, workflow_run_id=task.workflow_run_id, task_id=task.task_id
+                )
                 lost_external_browser = is_external_browser_state(browser_state)
                 LOG.warning(
                     "Cached persistent-session browser state for task is disconnected; reconnecting",
@@ -1263,6 +1270,7 @@ class RealBrowserManager(BrowserManager):
         navigate: bool = True,
         browser_session_runnable_id: str | None = None,
         browser_session_runnable_generation_id: str | None = None,
+        before_navigation: Callable[[BrowserState], None] | None = None,
     ) -> BrowserState:
         parent_workflow_run_id = workflow_run.parent_workflow_run_id
         workflow_run_id = workflow_run.workflow_run_id
@@ -1295,6 +1303,7 @@ class RealBrowserManager(BrowserManager):
         lost_external_browser = False
         if browser_state:
             if browser_session_id and not browser_state.is_connected():
+                raise_if_browser_connection_lost(browser_state, workflow_run_id=workflow_run_id)
                 lost_external_browser = is_external_browser_state(browser_state)
                 LOG.warning(
                     "Cached persistent-session browser state for workflow run is disconnected; reconnecting",
@@ -1313,6 +1322,7 @@ class RealBrowserManager(BrowserManager):
                     self._live_run_ids_sharing(browser_state),
                     browser_session_id=browser_session_id,
                     acquire=acquire,
+                    handoff=browser_state.active_run_owner not in (None, workflow_run_id),
                 )
 
         # When an explicit browser_session_id is provided (e.g. from a workflow
@@ -1325,6 +1335,8 @@ class RealBrowserManager(BrowserManager):
                 workflow_run_id=workflow_run_id, parent_workflow_run_id=parent_workflow_run_id
             )
             if browser_state:
+                if browser_state.active_run_owner is not None:
+                    raise_if_browser_connection_lost(browser_state, workflow_run_id=workflow_run_id)
                 # A parent_workflow_run_id entry is shared by every child run of the same parent.
                 # Independent children dispatched to one long-lived worker (e.g. a sequential
                 # fan-out) can therefore find an earlier, already-completed sibling's torn-down
@@ -1354,6 +1366,8 @@ class RealBrowserManager(BrowserManager):
                         browser_profile_id=browser_profile_id,
                     )
                     working_page = await browser_state.get_working_page()
+                if browser_state.active_run_owner is not None:
+                    raise_if_browser_connection_lost(browser_state, workflow_run_id=workflow_run_id)
                 if working_page is not None:
                     # always keep the browser state for the workflow run and the parent workflow run synced
                     self.pages[workflow_run_id] = browser_state
@@ -1370,13 +1384,19 @@ class RealBrowserManager(BrowserManager):
                     await _record_run_timezone_receipt(
                         workflow_run, browser_state, browser_session_id=None, inherited=True
                     )
-                    return await _on_browser_state_acquired(
-                        browser_state,
-                        workflow_run_id,
-                        parent_workflow_run_id,
-                        self._live_run_ids_sharing(browser_state),
-                        browser_session_id=browser_session_id,
-                    )
+                    try:
+                        return await _on_browser_state_acquired(
+                            browser_state,
+                            workflow_run_id,
+                            parent_workflow_run_id,
+                            self._live_run_ids_sharing(browser_state),
+                            browser_session_id=browser_session_id,
+                            handoff=browser_state.active_run_owner is not None,
+                        )
+                    except MissingBrowserState:
+                        if self.pages.get(workflow_run_id) is browser_state:
+                            self.pages.pop(workflow_run_id, None)
+                        raise
                 # The inherited state is genuinely torn down (disconnected and page-less).
                 # Drop the stale entry and fall through to create a fresh browser for this run.
                 LOG.warning(
@@ -1444,9 +1464,16 @@ class RealBrowserManager(BrowserManager):
                     "Browser state not found in persistent sessions manager", browser_session_id=browser_session_id
                 )
             else:
+                # Register before the first goto, as the creation path below does: a navigation
+                # failure here raises past the registry write at the end of this method, and every
+                # later block of the run would then find an empty registry and report a missing
+                # browser instead of the navigation failure.
+                self.pages[workflow_run_id] = browser_state
                 page = await browser_state.get_working_page()
                 if page:
                     if url and navigate:
+                        if before_navigation is not None:
+                            before_navigation(browser_state)
                         try:
                             await browser_state.navigate_to_url(page=page, url=url)
                         except FailedToNavigateToUrl as nav_exc:
@@ -1470,6 +1497,10 @@ class RealBrowserManager(BrowserManager):
                                 organization_id=workflow_run.organization_id,
                                 expected=browser_state,
                             )
+                            # The evicted state's CDP is dead, so it must not stay registered for
+                            # the run once the reconnect below replaces or fails to replace it.
+                            if self.pages.get(workflow_run_id) is browser_state:
+                                self.pages.pop(workflow_run_id, None)
                             browser_state = await app.PERSISTENT_SESSIONS_MANAGER.get_browser_state(
                                 browser_session_id,
                                 organization_id=workflow_run.organization_id,
@@ -1484,6 +1515,7 @@ class RealBrowserManager(BrowserManager):
                             )
                             if browser_state is None:
                                 raise
+                            self.pages[workflow_run_id] = browser_state
                             _retain_run_dialog_answers(
                                 browser_state,
                                 workflow_run_id,
@@ -1504,6 +1536,8 @@ class RealBrowserManager(BrowserManager):
                                 await _rebind_pbs_download_dir(browser_state, download_run_id, browser_session_id)
                             page = await browser_state.get_working_page()
                             if page is not None:
+                                if before_navigation is not None:
+                                    before_navigation(browser_state)
                                 await browser_state.navigate_to_url(page=page, url=url)
                             else:
                                 # The fresh CDP connection has no working page (e.g. the
@@ -1594,6 +1628,7 @@ class RealBrowserManager(BrowserManager):
             browser_address=workflow_run.browser_address,
             browser_profile_id=browser_profile_id,
             browser_session_id=browser_session_id,
+            before_navigation=before_navigation,
         )
         if launched_session is not None and requested_timezone_id(launched_session.browser_settings) is not None:
             await record_session_timezone_receipt(launched_session, await browser_state.get_working_page())

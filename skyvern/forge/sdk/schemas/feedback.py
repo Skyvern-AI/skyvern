@@ -48,3 +48,44 @@ class RunFeedback(BaseModel):
     submitted_by: str | None = None
     created_at: datetime
     modified_at: datetime
+
+
+AgentFeedbackCategory = Literal[
+    "missing_capability", "tool_failure", "unexpected_behavior", "unclear_guidance", "user_frustration", "other"
+]
+AgentFeedbackSeverity = Literal["low", "medium", "high"]
+
+
+class AgentFeedbackContext(BaseModel):
+    client_name: str | None = Field(None, max_length=200)
+    client_version: str | None = Field(None, max_length=200)
+    runtime_mode: str | None = Field(None, max_length=200)
+    skyvern_version: str | None = Field(None, max_length=200)
+
+
+class AgentFeedbackRequest(BaseModel):
+    category: AgentFeedbackCategory
+    summary: str = Field(..., min_length=1, max_length=300)
+    details: str | None = Field(None, max_length=4000)
+    tool_name: str | None = Field(None, max_length=128)
+    severity: AgentFeedbackSeverity | None = None
+    context: AgentFeedbackContext | None = None
+
+
+class AgentFeedbackResponse(BaseModel):
+    agent_feedback_id: str
+    redacted: bool
+
+
+class AgentFeedback(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    agent_feedback_id: str
+    organization_id: str
+    category: AgentFeedbackCategory
+    severity: AgentFeedbackSeverity | None = None
+    summary: str
+    details: str | None = None
+    tool_name: str | None = None
+    context: dict[str, str | None] | None = None
+    created_at: datetime

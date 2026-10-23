@@ -15,12 +15,15 @@ from sqlalchemy.exc import OperationalError
 from skyvern.config import settings
 from skyvern.constants import MINI_GOAL_TEMPLATE
 from skyvern.exceptions import (
+    BROWSER_CONNECTION_LOST_ERROR_CODE,
     BrowserSessionNotFound,
     FailedToSendWebhook,
+    MissingBrowserState,
     ScreenshotTargetClosed,
     TaskTerminationError,
     TaskV2NotFound,
     UrlGenerationFailure,
+    get_user_facing_exception_message,
 )
 from skyvern.forge import app
 from skyvern.forge.failure_classifier import bounded_failure_categories, classify_from_failure_reason
@@ -120,7 +123,7 @@ from skyvern.utils.prompt_engine import load_prompt_with_elements
 from skyvern.utils.strings import generate_random_string
 from skyvern.utils.url_validators import validate_fetch_url
 from skyvern.webeye.actions.actions import ActionType
-from skyvern.webeye.browser_state import BrowserState
+from skyvern.webeye.browser_state import BrowserState, get_browser_connection_loss
 from skyvern.webeye.scraper.scraped_page import ScrapedPage
 from skyvern.webeye.utils.page import SkyvernFrame, build_open_tabs_context, capture_open_tab_screenshots
 
@@ -1126,6 +1129,10 @@ async def run_task_v2_helper(
                     iteration=i,
                     workflow_run_id=workflow_run_id,
                 )
+                lost_task_v2 = await _fail_task_v2_after_browser_loss(task_v2_id, workflow_run_id, organization_id)
+                if lost_task_v2 is not None:
+                    task_v2 = lost_task_v2
+                    break
                 await _persist_completion_tab_screenshots(browser_state=browser_state, thought=thought)
                 task_v2 = await _summarize_task_v2(
                     task_v2=task_v2,
@@ -1133,7 +1140,7 @@ async def run_task_v2_helper(
                     context=context,
                     screenshots=scraped_page.screenshots,
                 )
-                if task_v2.run_with == "code":
+                if task_v2.run_with == "code" and task_v2.status == TaskV2Status.completed:
                     await app.WORKFLOW_SERVICE.generate_script_if_needed(
                         workflow=workflow,
                         workflow_run=workflow_run,
@@ -1385,6 +1392,12 @@ async def run_task_v2_helper(
                     )
                 except Exception:
                     LOG.warning("Failed to build open-tabs context for completion check", exc_info=True)
+            lost_task_v2 = await _fail_task_v2_after_browser_loss(
+                task_v2_id, workflow_run_id, organization_id, completed_block=(block, block_result)
+            )
+            if lost_task_v2 is not None:
+                task_v2 = lost_task_v2
+                break
 
             task_v2_completion_prompt = prompt_engine.load_prompt(
                 "task_v2_check_completion",
@@ -1438,14 +1451,21 @@ async def run_task_v2_helper(
                     workflow_run_id=workflow_run_id,
                     completion_resp=completion_resp,
                 )
+                lost_task_v2 = await _fail_task_v2_after_browser_loss(
+                    task_v2_id, workflow_run_id, organization_id, completed_block=(block, block_result)
+                )
+                if lost_task_v2 is not None:
+                    task_v2 = lost_task_v2
+                    break
                 await _persist_completion_tab_screenshots(browser_state=browser_state, thought=thought)
                 task_v2 = await _summarize_task_v2(
                     task_v2=task_v2,
                     task_history=task_history,
                     context=context,
                     screenshots=completion_screenshots,
+                    completed_block=(block, block_result),
                 )
-                if task_v2.run_with == "code":
+                if task_v2.run_with == "code" and task_v2.status == TaskV2Status.completed:
                     await app.WORKFLOW_SERVICE.generate_script_if_needed(
                         workflow=workflow,
                         workflow_run=workflow_run,
@@ -1586,7 +1606,12 @@ async def handle_block_result(
             block_type_var=block.block_type,
             block_label=block.label,
         )
-        if block.continue_on_failure and not is_last_block:
+        if BROWSER_CONNECTION_LOST_ERROR_CODE in block_result.error_codes:
+            await app.WORKFLOW_SERVICE.mark_workflow_run_as_failed_if_not_final(
+                workflow_run_id=workflow_run_id, failure_reason=block_result.failure_reason
+            )
+            await _end_task_v2_after_browser_loss(task_v2_id, workflow_run_id, workflow_run.organization_id)
+        elif block.continue_on_failure and not is_last_block:
             LOG.warning(
                 f"Block with type {block.block_type} failed but will continue executing the workflow run {workflow_run_id}",
                 block_type=block.block_type,
@@ -1621,6 +1646,57 @@ async def handle_block_result(
         workflow_run_id=workflow_run_id,
         organization_id=workflow_run.organization_id,
     )
+
+
+async def _fail_task_v2_after_browser_loss(
+    task_v2_id: str,
+    workflow_run_id: str,
+    organization_id: str,
+    completed_block: tuple[BlockTypeVar, BlockResult] | None = None,
+) -> TaskV2 | None:
+    # A success observed after the run lost its browser natively cannot complete the task.
+    if get_browser_connection_loss(app.BROWSER_MANAGER.get_for_workflow_run(workflow_run_id)) is None:
+        return None
+    LOG.warning("Browser connection lost: task v2 stops without a completion decision", workflow_run_id=workflow_run_id)
+    failure_reason = get_user_facing_exception_message(MissingBrowserState(workflow_run_id=workflow_run_id))
+    if completed_block is not None:
+        block, block_result = completed_block
+        await block.build_block_result(
+            success=False,
+            failure_reason=failure_reason,
+            status=BlockStatus.failed,
+            workflow_run_block_id=block_result.workflow_run_block_id,
+            organization_id=organization_id,
+            error_codes=list(dict.fromkeys([*block_result.error_codes, BROWSER_CONNECTION_LOST_ERROR_CODE])),
+            can_continue_after_failure=False,
+        )
+    await app.WORKFLOW_SERVICE.mark_workflow_run_as_failed_if_not_final(
+        workflow_run_id=workflow_run_id, failure_reason=failure_reason
+    )
+    return await _end_task_v2_after_browser_loss(task_v2_id, workflow_run_id, organization_id)
+
+
+async def _end_task_v2_after_browser_loss(task_v2_id: str, workflow_run_id: str, organization_id: str) -> TaskV2:
+    current = await app.DATABASE.observer.get_task_v2(task_v2_id, organization_id=organization_id)
+    if current is not None and current.status.is_final():
+        # The writer that ended the task first, such as a cancellation, already sent its terminal callback.
+        return current
+    workflow_run = await app.WORKFLOW_SERVICE.get_workflow_run(
+        workflow_run_id=workflow_run_id, organization_id=organization_id
+    )
+    won = False
+    if workflow_run.status.is_final():
+        won = await app.DATABASE.observer.update_task_v2_status_if_not_final(
+            task_v2_id=task_v2_id,
+            organization_id=organization_id,
+            status=TaskV2Status(workflow_run.status),
+        )
+    task_v2 = await app.DATABASE.observer.get_task_v2(task_v2_id, organization_id=organization_id)
+    if task_v2 is None:
+        raise TaskV2NotFound(task_v2_id=task_v2_id)
+    if won:
+        await send_task_v2_webhook(task_v2)
+    return task_v2
 
 
 async def _set_up_workflow_context(workflow: Workflow, workflow_run_id: str, organization: Organization) -> None:
@@ -2819,6 +2895,7 @@ async def _summarize_task_v2(
     task_history: list[dict],
     context: SkyvernContext,
     screenshots: list[bytes] | None = None,
+    completed_block: tuple[BlockTypeVar, BlockResult] | None = None,
 ) -> TaskV2:
     summary_description, summarized_output = await _generate_task_v2_deliverable(
         task_v2=task_v2,
@@ -2827,6 +2904,12 @@ async def _summarize_task_v2(
         screenshots=screenshots,
         is_partial=False,
     )
+    if task_v2.workflow_run_id is not None:
+        lost_task_v2 = await _fail_task_v2_after_browser_loss(
+            task_v2.observer_cruise_id, task_v2.workflow_run_id, task_v2.organization_id, completed_block
+        )
+        if lost_task_v2 is not None:
+            return lost_task_v2
     return await mark_task_v2_as_completed(
         task_v2_id=task_v2.observer_cruise_id,
         workflow_run_id=task_v2.workflow_run_id,

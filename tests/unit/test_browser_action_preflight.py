@@ -679,7 +679,10 @@ class TestDialogAcceptBoundary:
     def test_dialog_accepts_exist_only_in_the_dialog_handler(self) -> None:
         accepting: dict[str, int] = {}
         for path in self._python_files():
-            tree = ast.parse(path.read_text())
+            source = path.read_text()
+            if "dialog" not in source:
+                continue
+            tree = ast.parse(source)
             count = sum(
                 1
                 for node in ast.walk(tree)
@@ -699,7 +702,10 @@ class TestDialogAcceptBoundary:
     def test_dialog_listener_registrations_are_pinned(self) -> None:
         registering: list[str] = []
         for path in self._python_files():
-            tree = ast.parse(path.read_text())
+            source = path.read_text()
+            if "dialog" not in source:
+                continue
+            tree = ast.parse(source)
             for node in ast.walk(tree):
                 if (
                     isinstance(node, ast.Call)

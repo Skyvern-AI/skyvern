@@ -17,7 +17,7 @@ from opentelemetry import metrics
 from playwright.async_api import CDPSession
 from websockets.exceptions import ConnectionClosedError, ConnectionClosedOK
 
-from skyvern.exceptions import BlockedNavigationDestination, InvalidUrl
+from skyvern.exceptions import BlockedNavigationDestination, InvalidUrl, UnresolvableNavigationHost
 from skyvern.forge import app
 from skyvern.forge.sdk.routes.routers import base_router, legacy_base_router
 from skyvern.forge.sdk.routes.streaming.auth import auth, require_client_id
@@ -383,6 +383,13 @@ async def _dispatch_navigate_event(
         # Fail closed before any request reaches the remote browser -- the same choke point
         # every real page.goto in the codebase funnels through (see navigate_with_retry).
         await asyncio.to_thread(validate_navigation_destination, url)
+    except UnresolvableNavigationHost as error:
+        # The guard refuses a host it cannot resolve, but the target having no address record is
+        # the target's state, not a policy refusal: report it as a failed navigation, and keep the
+        # input channel open so the next URL the user types still reaches the browser.
+        LOG.info("CDP input: navigate target has no address record", **{log_id_key: log_id_value}, host=error.host)
+        await websocket.send_json({"kind": "navigate-error", "reason": "failed"})
+        return
     except BlockedNavigationDestination as error:
         LOG.info("CDP input: navigate blocked", **{log_id_key: log_id_value}, reason=error.reason)
         await websocket.send_json({"kind": "navigate-error", "reason": "blocked"})
@@ -408,8 +415,14 @@ async def _dispatch_navigate_event(
         # page.goto follows redirects at the network layer, so a validated public entry point
         # can still land on an internal host -- re-check the followed chain (SKY-13112 pattern).
         await revalidate_redirect_chain(response, validate_navigation_destination)
-    except BlockedNavigationDestination as error:
-        LOG.info("CDP input: navigate blocked via redirect", **{log_id_key: log_id_value}, reason=error.reason)
+    # The browser already fetched every hop here, so a hop our resolver cannot answer for is a
+    # split-horizon view of a live host rather than a dead one: refused on the same terms.
+    except (BlockedNavigationDestination, UnresolvableNavigationHost) as error:
+        LOG.info(
+            "CDP input: navigate blocked via redirect",
+            **{log_id_key: log_id_value},
+            reason=error.error_message,
+        )
         await _reset_page_after_navigation_failure(page, log_id_key, log_id_value)
         await websocket.send_json({"kind": "navigate-error", "reason": "blocked"})
 
@@ -447,14 +460,17 @@ async def _dispatch_history_event(
         # guard resets the page, not the history -- so replaying an entry unvalidated would
         # reopen exactly the SSRF that _dispatch_navigate_event closes.
         await asyncio.to_thread(validate_navigation_destination, url)
-    except BlockedNavigationDestination as error:
+    # An entry whose host no longer has an address record is a dead target, not a policy refusal,
+    # and neither one may close the channel: the user still has the rest of their history.
+    except (BlockedNavigationDestination, UnresolvableNavigationHost) as error:
+        dead_target = isinstance(error, UnresolvableNavigationHost)
         LOG.info(
-            "CDP input: history navigation blocked",
+            "CDP input: history navigation refused",
             **{log_id_key: log_id_value},
             kind=kind,
-            reason=error.reason,
+            reason=error.error_message,
         )
-        await websocket.send_json({"kind": "navigate-error", "reason": "blocked"})
+        await websocket.send_json({"kind": "navigate-error", "reason": "failed" if dead_target else "blocked"})
         return
 
     if kind == "reloadEvent":

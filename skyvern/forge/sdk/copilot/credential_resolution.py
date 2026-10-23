@@ -9,12 +9,33 @@ from __future__ import annotations
 
 from collections.abc import Iterable, Sequence
 from dataclasses import dataclass
-from typing import Literal
+from datetime import UTC, datetime
+from typing import TYPE_CHECKING, Literal
 from urllib.parse import ParseResult, parse_qsl, urlencode, urlparse
 
+import structlog
+
+from skyvern.exceptions import BitwardenBaseError, BitwardenLoginError, BitwardenUnlockError
 from skyvern.forge import app
-from skyvern.forge.sdk.schemas.credentials import Credential, CredentialType
+from skyvern.forge.sdk.copilot.workflow_credential_utils import connected_vault_credential_id, connected_vault_item_id
+from skyvern.forge.sdk.credential_site_policy import LoginSite
+from skyvern.forge.sdk.db.enums import OrganizationAuthTokenType
+from skyvern.forge.sdk.schemas.credentials import (
+    Credential,
+    CredentialItem,
+    CredentialType,
+    CredentialVaultType,
+    PasswordCredential,
+    TotpType,
+)
+from skyvern.forge.sdk.schemas.organizations import BitwardenOrganizationAuthToken, Organization
+from skyvern.forge.sdk.services.bitwarden import BitwardenConstants, BitwardenService
 from skyvern.forge.sdk.services.request_principal import get_request_principal
+
+if TYPE_CHECKING:
+    from skyvern.forge.sdk.copilot.request_policy import RequestPolicy
+
+LOG = structlog.get_logger()
 
 CredentialUrlTier = Literal["url_exact", "url_path", "url_host"]
 CredentialResolutionTier = Literal["url_exact", "url_path", "url_host", "urlless_sole"]
@@ -75,6 +96,219 @@ async def load_credentials(
         if len(items) < 50:
             return sorted(credentials, key=lambda c: getattr(c, "created_at", None) or "", reverse=True)
         page += 1
+
+
+CONNECTED_VAULT_TIMEOUT_SECONDS = 30
+
+ConnectedVaultStatus = Literal["not_configured", "connected", "unreadable", "not_available_to_user"]
+ConnectedVaultFailure = Literal["login_failed", "timeout", "unreadable"]
+
+
+@dataclass(frozen=True)
+class ConnectedVaultLogin:
+    credential: Credential
+    collection_id: str | None
+    # The first URI, a display hint only.
+    url: str | None
+    # Every saved URI without its match mode: enough to say a login competes for a page, never to grant it.
+    urls: tuple[str, ...] = ()
+
+
+@dataclass(frozen=True)
+class ConnectedVault:
+    status: ConnectedVaultStatus
+    reason: ConnectedVaultFailure | None = None
+    logins: tuple[ConnectedVaultLogin, ...] = ()
+
+    @property
+    def credentials(self) -> list[Credential]:
+        return [login.credential for login in self.logins]
+
+    def login(self, credential_id: str) -> ConnectedVaultLogin | None:
+        return next((login for login in self.logins if login.credential.credential_id == credential_id), None)
+
+
+def connected_vault_credential(organization_id: str, item_id: str, title: str) -> Credential:
+    now = datetime.now(UTC)
+    return Credential(
+        credential_id=connected_vault_credential_id(item_id),
+        organization_id=organization_id,
+        name=title,
+        vault_type=CredentialVaultType.BITWARDEN,
+        item_id=item_id,
+        credential_type=CredentialType.PASSWORD,
+        username=None,
+        card_last4=None,
+        card_brand=None,
+        created_at=now,
+        modified_at=now,
+    )
+
+
+def _connected_vault_failure(error: BaseException) -> ConnectedVaultFailure:
+    if isinstance(error, (BitwardenLoginError, BitwardenUnlockError)):
+        return "login_failed"
+    if isinstance(error, TimeoutError):
+        return "timeout"
+    return "unreadable"
+
+
+async def connected_vault_access_denied(organization_id: str) -> bool:
+    """Vault items carry no credential folder, so only a principal no folder restricts may use them."""
+    principal = get_request_principal()
+    if principal is None:
+        return await app.AGENT_FUNCTION.credential_folders_restricted(organization_id)
+    return await app.AGENT_FUNCTION.accessible_credential_folder_ids(principal) is not None
+
+
+async def _org_vault_access(organization_id: str) -> tuple[BitwardenOrganizationAuthToken, Organization] | None:
+    # Org-scoped only, like the editor's item listing: never the instance's global Bitwarden credentials.
+    token = await app.DATABASE.organizations.get_valid_org_auth_token(
+        organization_id, OrganizationAuthTokenType.bitwarden_credential.value
+    )
+    if token is None:
+        return None
+    organization = await app.DATABASE.organizations.get_organization(organization_id=organization_id)
+    return (token, organization) if organization is not None else None
+
+
+async def _read_connected_vault(organization_id: str) -> ConnectedVault:
+    access = await _org_vault_access(organization_id)
+    if access is None:
+        return ConnectedVault("not_configured")
+    if await connected_vault_access_denied(organization_id):
+        return ConnectedVault("not_available_to_user")
+    token, organization = access
+    try:
+        overviews = await BitwardenService.list_item_overviews(
+            client_id=None,
+            client_secret=None,
+            master_password=token.credential.master_password,
+            bw_organization_id=organization.bw_organization_id,
+            bw_collection_ids=organization.bw_collection_ids,
+            email=str(token.credential.email),
+            timeout=CONNECTED_VAULT_TIMEOUT_SECONDS,
+        )
+    except (BitwardenBaseError, TimeoutError) as error:
+        reason = _connected_vault_failure(error)
+        # The exception text can carry the account email, so only its type is logged.
+        LOG.warning(
+            "copilot connected vault unreadable",
+            organization_id=organization_id,
+            reason=reason,
+            error_type=type(error).__name__,
+        )
+        return ConnectedVault("unreadable", reason)
+    return ConnectedVault(
+        "connected",
+        logins=tuple(
+            ConnectedVaultLogin(
+                credential=connected_vault_credential(organization_id, overview.item_id, overview.title),
+                collection_id=overview.collection_id,
+                url=overview.url,
+                urls=tuple(overview.urls),
+            )
+            for overview in overviews
+            if overview.credential_type == CredentialType.PASSWORD
+        ),
+    )
+
+
+async def load_connected_vault(organization_id: str, policy: RequestPolicy | None) -> ConnectedVault:
+    """The organization's connected Bitwarden logins. A listing force-syncs the vault, so a connected one is
+    read once per turn; a failed read is not kept, so the next call retries."""
+    if policy is not None and policy.connected_vault is not None:
+        return policy.connected_vault
+    vault = await _read_connected_vault(organization_id)
+    if policy is not None and vault.status == "connected":
+        policy.connected_vault = vault
+        listed = {credential.credential_id: credential for credential in vault.credentials}
+        # Approvals hydrate as id-only stubs; the listing supplies their titles.
+        policy.resolved_credentials = [listed.get(c.credential_id, c) for c in policy.resolved_credentials]
+        policy.auto_bound_credentials = [listed.get(c.credential_id, c) for c in policy.auto_bound_credentials]
+    return vault
+
+
+async def load_credentials_by_ids(organization_id: str, credential_ids: Sequence[str]) -> list[Credential]:
+    """Saved credentials by id, plus an id-only stub for each connected-vault id. Nothing here lists the vault:
+    a stub's login, collection and sites are read when a tool first needs them."""
+    saved_ids = [credential_id for credential_id in credential_ids if connected_vault_item_id(credential_id) is None]
+    credentials = await load_credentials(organization_id, credential_ids=saved_ids) if saved_ids else []
+    vault_item_ids = [
+        item_id for credential_id in credential_ids if (item_id := connected_vault_item_id(credential_id))
+    ]
+    if vault_item_ids and not await connected_vault_access_denied(organization_id):
+        credentials.extend(
+            connected_vault_credential(organization_id, item_id, connected_vault_credential_id(item_id))
+            for item_id in vault_item_ids
+        )
+    return credentials
+
+
+async def connected_vault_login_sites(
+    organization_id: str, policy: RequestPolicy, credential_id: str
+) -> list[LoginSite] | None:
+    """Sites a vault login is saved for, scoped by its own URI match modes; None when they cannot be read."""
+    cached = policy.connected_vault_sites.get(credential_id)
+    if cached is not None:
+        return cached
+    item_id = connected_vault_item_id(credential_id)
+    access = await _org_vault_access(organization_id) if item_id else None
+    if item_id is None or access is None or await connected_vault_access_denied(organization_id):
+        return None
+    token, organization = access
+    try:
+        sites = await BitwardenService.get_login_item_sites(
+            None,
+            None,
+            token.credential.master_password,
+            organization.bw_organization_id,
+            organization.bw_collection_ids,
+            item_id,
+            email=str(token.credential.email),
+            timeout=CONNECTED_VAULT_TIMEOUT_SECONDS,
+        )
+    except (BitwardenBaseError, TimeoutError) as error:
+        LOG.info(
+            "copilot could not read the connected vault login's sites",
+            credential_id=credential_id,
+            error_type=type(error).__name__,
+        )
+        return None
+    policy.connected_vault_sites[credential_id] = sites
+    return sites
+
+
+async def load_connected_vault_item(organization_id: str, login: ConnectedVaultLogin) -> CredentialItem:
+    item_id = login.credential.item_id
+    access = await _org_vault_access(organization_id)
+    if access is None:
+        raise LookupError("the connected vault is no longer configured")
+    token, organization = access
+    secret = await BitwardenService.get_secret_value_from_url(
+        None,
+        None,
+        token.credential.master_password,
+        organization.bw_organization_id,
+        organization.bw_collection_ids,
+        collection_id=login.collection_id,
+        item_id=item_id,
+        max_retries=1,
+        timeout=CONNECTED_VAULT_TIMEOUT_SECONDS,
+        email=str(token.credential.email),
+    )
+    totp = secret.get(BitwardenConstants.TOTP) or None
+    return CredentialItem(
+        item_id=item_id,
+        name=login.credential.name,
+        credential_type=CredentialType.PASSWORD,
+        credential=PasswordCredential(
+            username=secret.get(BitwardenConstants.USERNAME) or "",
+            password=secret.get(BitwardenConstants.PASSWORD) or "",
+            totp=totp,
+            totp_type=TotpType.AUTHENTICATOR if totp else TotpType.NONE,
+        ),
+    )
 
 
 async def count_visible_credentials(organization_id: str) -> int:
@@ -226,13 +460,6 @@ def grounded_references(message: str, candidates: Iterable[str]) -> set[str]:
             for _other, other_start, other_end in occurrences
         )
     }
-
-
-def grounded_credential_references(message: str, credentials: list[Credential]) -> set[str]:
-    """Find complete saved names/IDs in a turn, preferring the longest overlap."""
-    return grounded_references(
-        message, (value for credential in credentials for value in (credential.name, credential.credential_id))
-    )
 
 
 def _match_by_url_tiered(

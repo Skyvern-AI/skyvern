@@ -29,21 +29,6 @@ describe("workspace authoring actions", () => {
     });
   });
 
-  it("blocks task demonstration while a recording is in progress", () => {
-    expect(
-      resolveWorkspaceAuthoringActionAvailability({
-        browserReady: true,
-        isGlobalWorkflow: false,
-        isWorkflowDeleted: false,
-        hasActiveRun: false,
-        isComparing: false,
-        isEditingYaml: false,
-        hasFinallyBlock: false,
-        isRecording: true,
-      }),
-    ).toMatchObject({ canRecordTask: false });
-  });
-
   it("blocks append-only actions on global workflows and after a finally block", () => {
     const base = {
       browserReady: true,
@@ -51,7 +36,6 @@ describe("workspace authoring actions", () => {
       hasActiveRun: false,
       isComparing: false,
       isEditingYaml: false,
-      isRecording: false,
     };
 
     expect(
@@ -85,7 +69,6 @@ describe("workspace authoring actions", () => {
       hasFinallyBlock: false,
       isComparing: false,
       isEditingYaml: false,
-      isRecording: false,
     };
 
     expect(

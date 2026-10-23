@@ -104,6 +104,8 @@ class FakeVaultCli:
             "object": "item",
             "id": ITEM_ID,
             "type": 1,
+            "organizationId": "org-id",
+            "collectionIds": ["collection-id"],
             "login": {"username": "alice@example.com", "password": "hunter2", "totp": ""},
             "fields": [{"name": "first_name", "value": "Alice"}],
         }
@@ -708,6 +710,7 @@ async def test_fetches_for_different_organizations_do_not_serialize(monkeypatch:
                         "object": "item",
                         "id": ITEM_ID,
                         "type": 1,
+                        "organizationId": "org-id",
                         "login": {"username": "u", "password": "p", "totp": ""},
                     }
                 ),
@@ -834,6 +837,7 @@ async def test_concurrent_cli_commands_are_bounded(monkeypatch: pytest.MonkeyPat
                         "object": "item",
                         "id": ITEM_ID,
                         "type": 1,
+                        "organizationId": "org-id",
                         "login": {"username": "u", "password": "p", "totp": ""},
                     }
                 ),
@@ -1124,6 +1128,7 @@ async def test_a_burst_across_more_vaults_than_the_cache_holds_drains_back_to_ca
                         "object": "item",
                         "id": ITEM_ID,
                         "type": 1,
+                        "organizationId": "org-id",
                         "login": {"username": "u", "password": "p", "totp": ""},
                     }
                 ),
