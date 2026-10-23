@@ -5208,6 +5208,25 @@ async def test_recovery_pins_the_login_key_on_a_block_that_also_carries_a_card(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(("lineage", "enforced"), [(True, True), (None, True), (False, False)])
+async def test_recovery_enforces_vault_login_sites_as_the_code_block_does(
+    monkeypatch: pytest.MonkeyPatch,
+    ai_fallback_flag: Callable[[str | None], None],
+    lineage: bool | None,
+    enforced: bool,
+) -> None:
+    # The recovery task has no workflow lineage of its own, so the block's decision travels with it.
+    ai_fallback_flag("o_test")
+    state = _install_db_fakes(monkeypatch, final_status=TaskStatus.completed)
+    monkeypatch.setattr(CodeBlock, "_workflow_copilot_lineage", AsyncMock(return_value=lineage))
+    block = _make_code_block()
+
+    await _heal(block, _make_context(), PlaywrightTimeoutError("timeout"), _recording_page(None))
+
+    assert state["execute_step_kwargs"]["recovery_enforce_vault_sites"] is enforced
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("make_parameter", [_credential_parameter, _credential_id_workflow_parameter])
 async def test_recovery_task_is_built_from_the_block_fields(
     monkeypatch: pytest.MonkeyPatch,
