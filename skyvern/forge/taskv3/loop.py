@@ -30,6 +30,7 @@ from urllib.parse import urlsplit
 
 import structlog
 
+from skyvern.config import settings
 from skyvern.errors.errors import resolve_error_code_mapping_key
 from skyvern.exceptions import (
     CompletionGateTerminationError,
@@ -51,6 +52,7 @@ from skyvern.forge.taskv3.goal_check import (
 )
 from skyvern.forge.taskv3.handoff_redaction import MAX_HANDOFF_URL_CHARS, normalized_url, sanitize_published_url
 from skyvern.forge.taskv3.intercepted_submission import InterceptedSubmission, SubmissionOutcome
+from skyvern.forge.taskv3.run_arms import DEAD_END_RETURN_FLAG, run_arm_enabled
 from skyvern.forge.taskv3.target_label import describe_target
 from skyvern.schemas.workflows import ERROR_CODE_MAPPING_MAX_ENTRIES, ERROR_CODE_MAPPING_MAX_UTF8_BYTES
 from skyvern.webeye.navigation import clear_task_nav_error_code, redact_url_secrets
@@ -1785,6 +1787,8 @@ class ActivityRecency:
     attempts_at_hold_gate: int | None = None
     perceptions_at_hold_gate: int | None = None
     status_at_hold_gate: str | None = None
+    # In-loop dead ends returned to the model as the navigate result instead of ending the run.
+    dead_ends_returned: int = 0
 
     def armed(self, window: int = FAILURE_EVIDENCE_WINDOW_TURNS) -> bool:
         return self.last_trigger_turn is not None and (self.turn - self.last_trigger_turn) <= window
@@ -5977,22 +5981,30 @@ async def run_agent_tool_loop(
         # failed/terminated choice to the model's finish tool (which does not converge on this class).
         if st.outcome is None and st.pending_nav_dead_end is not None:
             dead = st.pending_nav_dead_end
+            # Not on the granted final turn: with no turn left to act on it, a return would end the run budget_exhausted.
+            returned = not (activity is not None and activity.final_turn_active) and run_arm_enabled(
+                DEAD_END_RETURN_FLAG, settings.TASK_V3_DEAD_END_RETURN
+            )
             LOG.info(
                 "taskv3 loop navigation dead end",
                 http_status=dead.status,
                 turn=st.turns,
                 guard=NAV_DEAD_END_GUARD,
+                returned_to_model=returned,
                 **_dead_end_provenance((dead.url, dead.requested_url), task_target_urls, dead.revisit),
             )
-            st.outcome = _guard_verdict(
-                NAV_DEAD_END_GUARD,
-                _dead_end_reason(
-                    st.pending_nav_dead_end.status,
-                    st.pending_nav_dead_end.url,
-                    page_noun="The page the run opened",
-                    caller_known_urls=caller_known_urls,
-                ),
-            )
+            if returned:
+                # The navigate's own result already gave the model the status and the URL it landed on.
+                st.pending_nav_dead_end = None
+                if activity is not None:
+                    activity.dead_ends_returned += 1
+            else:
+                st.outcome = _guard_verdict(
+                    NAV_DEAD_END_GUARD,
+                    _dead_end_reason(
+                        dead.status, dead.url, page_noun="The page the run opened", caller_known_urls=caller_known_urls
+                    ),
+                )
 
         # Page-state stall detector (SKY-15265): tool-independent — any batch of billable work that
         # leaves the rendered document byte-identical ticks the counter, whatever tools produced it.

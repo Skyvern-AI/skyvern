@@ -18,6 +18,7 @@ LOG = structlog.get_logger()
 
 DATE_SEGMENT_AIM_FLAG = "TASK_V3_DATE_SEGMENT_AIM"
 LOGIN_PACE_FLAG = "TASK_V3_LOGIN_PACE"
+DEAD_END_RETURN_FLAG = "TASK_V3_DEAD_END_RETURN"
 
 # Person properties a flag is evaluated with beyond organization_id; resolve_run_arm drops any other key. The
 # PostHog preflight (scripts/check_run_arm_flags.py) reads this mapping to accept release conditions on them.

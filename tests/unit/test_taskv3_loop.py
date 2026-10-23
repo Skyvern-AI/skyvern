@@ -29,6 +29,7 @@ import pytest
 from structlog.testing import capture_logs
 
 import skyvern.webeye.cdp_download_interceptor as cdp_module
+from skyvern.config import settings
 from skyvern.exceptions import (
     CompletionGateTerminationError,
     MissingBrowserStatePage,
@@ -126,6 +127,7 @@ from skyvern.forge.taskv3.loop import (
     submissions_since,
 )
 from skyvern.forge.taskv3.opaque_refs import mask_opaque_urls
+from skyvern.forge.taskv3.run_arms import DEAD_END_RETURN_FLAG
 from skyvern.forge.taskv3.tools import build_browser_tools
 from skyvern.utils.url_validators import validate_fetch_url
 
@@ -649,26 +651,177 @@ async def test_navigate_without_dead_end_does_not_terminate() -> None:
     assert outcome.reason == "applied"
 
 
+_DEAD = "https://jobs.example.test/acme/closed"
+_DEAD_TOO = "https://jobs.example.test/acme/gone"
+_DEAD_THREE = "https://jobs.example.test/acme/removed"
+_LIVE = "https://jobs.example.test/acme/open"
+
+
+def _url_navigate_tool(dead: frozenset[str] = frozenset({_DEAD, _DEAD_TOO, _DEAD_THREE})) -> ToolSpec:
+    # Like the real tool: ok either way, the dead end in its data, and the move inside its action outcome.
+    async def handler(args: dict[str, Any]) -> ToolResult:
+        url = args["url"]
+        data: dict[str, Any] = {"page_state_changed": True, ACTION_OUTCOME_DATA_KEY: {"page_transitioned": True}}
+        if url in dead:
+            return ToolResult.ok(
+                f"navigated to {url} (HTTP 404)",
+                data={**data, "navigation_dead_end": 404, "navigation_dead_end_url": url},
+            )
+        return ToolResult.ok(f"navigated to {url}", data=data)
+
+    return ToolSpec(
+        name="navigate",
+        description="navigate",
+        parameters={"type": "object", "properties": {"url": {"type": "string"}}},
+        handler=handler,
+    )
+
+
+def _page_text_tool() -> ToolSpec:
+    async def handler(args: dict[str, Any]) -> ToolResult:
+        return ToolResult.ok("page text")
+
+    return ToolSpec(name="observe", description="observe", parameters={}, handler=handler, compactable=True)
+
+
+async def _run_dead_end(
+    script: list[list[tuple[str, dict[str, Any]]]], *, activity: ActivityRecency | None = None, **kwargs: Any
+) -> tuple[LoopOutcome, list[ToolResult]]:
+    activity = activity or ActivityRecency()
+    finish = make_finish_tool(activity=activity)
+    finishes: list[ToolResult] = []
+
+    async def recording_finish(args: dict[str, Any]) -> ToolResult:
+        finishes.append(result := await finish.handler(args))
+        return result
+
+    tools = [_url_navigate_tool(), _page_text_tool(), dataclasses.replace(finish, handler=recording_finish)]
+    outcome, _ = await _run(script, tools, activity=activity, **kwargs)
+    return outcome, finishes
+
+
 @pytest.mark.asyncio
-async def test_batched_dead_end_then_live_navigate_recovers() -> None:
-    # The system prompt tells the model to batch aggressively. A turn that batches a speculative
-    # navigate that 404s WITH a fallback navigate to a live page must NOT be terminated on the first
-    # of the batch — the fallback runs and the run proceeds to the model's own verdict.
-    live = _navigate_tool(dead_end_status=None)
-    dead = _navigate_tool(dead_end_status=404)
-    tools = [
-        ToolSpec(name="navigate_dead", description="d", parameters=dead.parameters, handler=dead.handler),
-        ToolSpec(name="navigate_live", description="l", parameters=live.parameters, handler=live.handler),
-        make_finish_tool(),
-    ]
+@pytest.mark.parametrize("arm", ["forced", "treatment"])
+async def test_every_in_loop_dead_end_goes_back_to_the_model_under_the_arm(
+    monkeypatch: pytest.MonkeyPatch, arm: str
+) -> None:
+    if arm == "forced":
+        monkeypatch.setattr(settings, "TASK_V3_DEAD_END_RETURN", True)
     script = [
-        [("navigate_dead", {"url": "https://jobs.example.test/acme/closed"}), ("navigate_live", {"url": "x"})],
+        [("navigate", {"url": _DEAD})],
+        [("navigate", {"url": _DEAD_TOO}), ("observe", {})],
+        [("navigate", {"url": _DEAD_THREE})],
+        [("navigate", {"url": _LIVE})],
+        [("finish", {"status": "completed", "reason": "posting is open"})],
+    ]
+    context = SkyvernContext(run_arms={DEAD_END_RETURN_FLAG: ("wr_1", "treatment")} if arm == "treatment" else {})
+    activity = ActivityRecency()
+    with skyvern_context.scoped(context), capture_logs() as logs:
+        outcome, _ = await _run_dead_end(script, activity=activity)
+
+    assert (outcome.status, outcome.reason) == ("completed", "posting is open")
+    lines = [entry for entry in logs if entry["event"] == "taskv3 loop navigation dead end"]
+    assert [(line["returned_to_model"], line["provenance"]) for line in lines] == [(True, "undecided")] * 3
+    assert activity.dead_ends_returned == 3
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("status", ["completed", "failed", "terminated"])
+async def test_any_verdict_is_accepted_on_a_returned_dead_end(monkeypatch: pytest.MonkeyPatch, status: str) -> None:
+    # A goal can be met by confirming a link is dead; the model, which sees the goal and the page, decides.
+    monkeypatch.setattr(settings, "TASK_V3_DEAD_END_RETURN", True)
+    script = [[("navigate", {"url": _DEAD})], [("finish", {"status": status, "reason": "the posting is gone"})]]
+    outcome, finishes = await _run_dead_end(script)
+
+    assert [result.status for result in finishes] == ["ok"]
+    assert (outcome.status, outcome.reason) == (status, "the posting is gone")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("arm_on", [False, True])
+async def test_batched_dead_end_then_live_navigate_recovers(monkeypatch: pytest.MonkeyPatch, arm_on: bool) -> None:
+    # The model is told to batch aggressively: a fallback navigate in the same batch recovers, under either arm.
+    monkeypatch.setattr(settings, "TASK_V3_DEAD_END_RETURN", arm_on)
+    script = [
+        [("navigate", {"url": _DEAD}), ("navigate", {"url": _LIVE})],
+        [("navigate", {"url": _DEAD_TOO}), ("observe", {})],
+        [("navigate", {"url": _LIVE})],
         [("finish", {"status": "completed", "reason": "applied to the live one"})],
     ]
-    outcome, _ = await _run(script, tools)
+    with capture_logs() as logs:
+        outcome, _ = await _run_dead_end(script)
 
-    assert outcome.status == "completed"
-    assert outcome.reason == "applied to the live one"
+    if arm_on:
+        assert (outcome.status, outcome.reason) == ("completed", "applied to the live one")
+    else:
+        assert (outcome.status, outcome.guard) == ("terminated", NAV_DEAD_END_GUARD)
+    # Only the second batch's dead end reaches the settle site.
+    assert len([entry for entry in logs if entry["event"] == "taskv3 loop navigation dead end"]) == 1
+
+
+@pytest.mark.asyncio
+async def test_a_failed_call_after_a_task_url_dead_end_behaves_the_same_under_either_arm(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def stale_click(args: dict[str, Any]) -> ToolResult:
+        return ToolResult.error("stale ref", data={"page_state_changed": True})
+
+    click = ToolSpec(name="click", description="click", parameters={}, handler=stale_click, billable=True)
+    script = [
+        [("navigate", {"url": _DEAD}), ("click", {"ref": 3})],
+        [("finish", {"status": "failed", "reason": "gone"})],
+    ]
+    outcomes = []
+    for arm_on in (False, True):
+        monkeypatch.setattr(settings, "TASK_V3_DEAD_END_RETURN", arm_on)
+        activity = ActivityRecency()
+        tools = [_url_navigate_tool(), click, make_finish_tool(activity=activity)]
+        outcome, _ = await _run(
+            script, tools, activity=activity, task_target_urls=caller_known_published_urls(_DEAD, keep_query=True)
+        )
+        outcomes.append((outcome.status, outcome.guard))
+
+    # The failed click reports a page change, which clears the pending dead end as on main, so the model's verdict stands.
+    assert outcomes == [("failed", None), ("failed", None)]
+
+
+@pytest.mark.asyncio
+async def test_a_dead_end_on_the_granted_final_turn_still_ends_the_run(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(settings, "TASK_V3_DEAD_END_RETURN", True)
+    activity = ActivityRecency(final_turn_active=True)
+    script = [[("navigate", {"url": _DEAD})], [("finish", {"status": "completed", "reason": "never"})]]
+    outcome, _ = await _run(script, [_url_navigate_tool(), make_finish_tool(activity=activity)], activity=activity)
+
+    assert (outcome.status, outcome.guard) == ("terminated", NAV_DEAD_END_GUARD)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("arm_on", [False, True])
+async def test_a_dead_end_on_the_tasks_own_url_is_the_models_evidence_under_the_arm(
+    monkeypatch: pytest.MonkeyPatch, arm_on: bool
+) -> None:
+    # The goal can be to confirm the link it supplies is dead; under the arm the model judges that from the status.
+    monkeypatch.setattr(settings, "TASK_V3_DEAD_END_RETURN", arm_on)
+    script = [
+        [("navigate", {"url": _DEAD})],
+        [("finish", {"status": "completed", "reason": "the supplied link is dead"})],
+    ]
+    with capture_logs() as logs:
+        outcome, finishes = await _run_dead_end(
+            script, task_target_urls=caller_known_published_urls(_DEAD, keep_query=True)
+        )
+
+    if arm_on:
+        assert (outcome.status, outcome.reason) == ("completed", "the supplied link is dead")
+        assert [result.status for result in finishes] == ["ok"]
+    else:
+        assert (outcome.status, outcome.guard) == ("terminated", NAV_DEAD_END_GUARD)
+    (line,) = (entry for entry in logs if entry["event"] == "taskv3 loop navigation dead end")
+    assert (line["provenance"], line["returned_to_model"]) == ("task_supplied", arm_on)
+
+    # The pre-loop initial navigation is not in-loop: it ends the run under either arm.
+    initial, _ = await _run_dead_end(script[1:], initial_navigation_status=404, initial_navigation_url=_DEAD)
+    assert (initial.status, initial.guard) == ("terminated", NAV_DEAD_END_GUARD)
 
 
 @pytest.mark.parametrize("status", sorted(NAVIGATION_DEAD_END_STATUSES))

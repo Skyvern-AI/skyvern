@@ -100,6 +100,7 @@ from skyvern.forge.taskv3.loop import (
 )
 from skyvern.forge.taskv3.run_arms import (
     DATE_SEGMENT_AIM_FLAG,
+    DEAD_END_RETURN_FLAG,
     LOGIN_PACE_FLAG,
     run_arm_enabled,
 )
@@ -459,11 +460,9 @@ async def test_execute_task_v3_buckets_the_date_segment_aim_arm_per_run(monkeypa
 
     assert loop_mock.date_segment_aim_enabled_during_loop is True
     assert loop_mock.context.run_arms[DATE_SEGMENT_AIM_FLAG] == (task.workflow_run_id, "treatment")
-    provider.assert_any_await(
-        DATE_SEGMENT_AIM_FLAG,
-        task.workflow_run_id,
-        properties={"organization_id": task.organization_id},
-    )
+    assert loop_mock.context.run_arms[DEAD_END_RETURN_FLAG] == (task.workflow_run_id, "treatment")
+    for flag in (DATE_SEGMENT_AIM_FLAG, DEAD_END_RETURN_FLAG):
+        provider.assert_any_await(flag, task.workflow_run_id, properties={"organization_id": task.organization_id})
 
 
 @pytest.mark.asyncio

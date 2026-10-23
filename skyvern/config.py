@@ -590,6 +590,9 @@ class Settings(BaseSettings):
     # Hold the first click or Enter after a password fill until 45 s after Task V3 started the block. Force-on term
     # only: runs are randomized per run by the flag of the same name, read through run_arm_enabled(LOGIN_PACE_FLAG, ...).
     TASK_V3_LOGIN_PACE: bool = False
+    # Return an in-loop navigate's 404/410 to the model as the navigate result instead of ending the run (SKY-16206).
+    # Force-on term only: runs are randomized per run by the flag of the same name (DEAD_END_RETURN_FLAG).
+    TASK_V3_DEAD_END_RETURN: bool = False
     # Store the error code v3's model chose on finish instead of the post-run page guess. Off: the guess is stored
     # as before. Retry policies match on stored codes, so turning this on can change which runs retry.
     TASK_V3_ERROR_CODE_ON_FINISH: bool = False
