@@ -10976,12 +10976,13 @@ class WorkflowService:
         workflow_id: str | None = None,
         encrypt_secrets: bool = True,
     ) -> Workflow:
+        pinned_v1_blocks = self._pinned_v1_blocks_to_check(workflow_definition)
         try:
             self._validate_code_block_templates(workflow_definition)
             self._validate_block_engines(workflow_definition)
             if encrypt_secrets:
                 await encrypt_workflow_definition_secrets(workflow_definition, organization_id)
-            return await app.DATABASE.workflows.create_workflow(
+            created_workflow = await app.DATABASE.workflows.create_workflow(
                 title=title,
                 workflow_definition=workflow_definition.model_dump(mode="json"),
                 organization_id=organization_id,
@@ -11025,6 +11026,19 @@ class WorkflowService:
             if "uc_org_permanent_id_version" in str(e) and workflow_permanent_id:
                 raise WorkflowVersionConflict(workflow_permanent_id) from e
             raise
+        if pinned_v1_blocks:
+            await asyncio.create_task(self._log_if_v1_pin_added(None, created_workflow, pinned_v1_blocks))
+        return created_workflow
+
+    @staticmethod
+    def _pinned_v1_blocks_to_check(workflow_definition: WorkflowDefinition | None) -> int:
+        pinned_v1_blocks = (
+            pinned_v1_block_count(get_all_blocks(workflow_definition.blocks)) if workflow_definition is not None else 0
+        )
+        # Off on SQLite: an in-memory database pools one connection, so the check's reads would share the save's.
+        if pinned_v1_blocks and app.DATABASE.engine.dialect.name == "sqlite":
+            return 0
+        return pinned_v1_blocks
 
     @staticmethod
     async def _insert_next_workflow_version(
@@ -11630,6 +11644,10 @@ class WorkflowService:
         preserve_redacted_credential_references_from: Workflow | None = None,
         preserved_credential_references: set[tuple[str, str, str]] | None = None,
     ) -> Workflow:
+        pinned_v1_blocks = self._pinned_v1_blocks_to_check(workflow_definition)
+        overwritten_workflow = (
+            await self._read_overwritten_workflow(workflow_id, organization_id) if pinned_v1_blocks else None
+        )
         if workflow_definition is not None:
             if validate_code_block_templates:
                 self._validate_code_block_templates(workflow_definition)
@@ -11719,6 +11737,12 @@ class WorkflowService:
                 refuse_if_pinned_by_run_group=True,
             )
 
+        if pinned_v1_blocks:
+            # A task gets its own connection; a failed read on the save's bound transaction would abort the save.
+            await asyncio.create_task(
+                self._log_if_v1_pin_added(overwritten_workflow, updated_workflow, pinned_v1_blocks)
+            )
+
         if notify_workflow_saved:
             self._schedule_workflow_saved_hook_best_effort(
                 organization_id=updated_workflow.organization_id,
@@ -11732,6 +11756,61 @@ class WorkflowService:
             )
 
         return updated_workflow
+
+    @staticmethod
+    async def _read_overwritten_workflow(workflow_id: str, organization_id: str | None) -> Workflow | None:
+        """None for a row the save's own transaction has not committed yet, which a new version's row is."""
+        try:
+            return await asyncio.create_task(
+                app.DATABASE.workflows.get_workflow(workflow_id=workflow_id, organization_id=organization_id)
+            )
+        except Exception:
+            LOG.warning("Failed to read the workflow row a save overwrites", workflow_id=workflow_id, exc_info=True)
+            return None
+
+    @staticmethod
+    async def _log_if_v1_pin_added(
+        overwritten_workflow: Workflow | None, saved_workflow: Workflow, pinned_v1_blocks: int
+    ) -> None:
+        """One new skyvern-1.0 pin takes every run of the workflow off the v3 A/B, so a save that adds one is logged."""
+        if saved_workflow.created_by == COPILOT_TEST_WORKFLOW_CREATOR:
+            return
+        try:
+            baseline = overwritten_workflow
+            # A new version's row is inserted empty before its definition is written; the version it follows is the
+            # one its runs routed on until now.
+            if baseline is None or not baseline.workflow_definition.blocks:
+                baseline = await app.DATABASE.workflows.get_workflow_by_permanent_id(
+                    workflow_permanent_id=saved_workflow.workflow_permanent_id,
+                    organization_id=saved_workflow.organization_id,
+                    ignore_version=saved_workflow.version,
+                )
+            pinned_before = (
+                pinned_v1_block_count(get_all_blocks(baseline.workflow_definition.blocks)) if baseline else 0
+            )
+            if pinned_v1_blocks <= pinned_before:
+                return
+            LOG.info(
+                "Workflow version adds a skyvern-1.0 engine pin",
+                organization_id=saved_workflow.organization_id,
+                workflow_permanent_id=saved_workflow.workflow_permanent_id,
+                version=saved_workflow.version,
+                previous_version=baseline.version if baseline else None,
+                pinned_v1_blocks_before=pinned_before,
+                pinned_v1_blocks_after=pinned_v1_blocks,
+                build_source=saved_workflow.build_source,
+                recent_runs_7d=await app.DATABASE.workflow_runs.count_recent_workflow_runs(
+                    workflow_permanent_id=saved_workflow.workflow_permanent_id,
+                    organization_id=saved_workflow.organization_id,
+                    days=7,
+                ),
+            )
+        except Exception:
+            LOG.warning(
+                "Failed to check a saved workflow version for an added skyvern-1.0 engine pin",
+                workflow_permanent_id=saved_workflow.workflow_permanent_id,
+                exc_info=True,
+            )
 
     async def maybe_delete_cached_code(
         self,

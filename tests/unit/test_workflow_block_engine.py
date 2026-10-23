@@ -5,9 +5,12 @@ workflow_run_blocks and the dispatched engine come from the same resolution.
 
 from __future__ import annotations
 
+import asyncio
+import json
 import time
 from collections.abc import Callable, Iterator
 from datetime import UTC, datetime, timedelta, timezone
+from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -19,7 +22,9 @@ from skyvern.config import settings
 from skyvern.forge import app
 from skyvern.forge.sdk.core import skyvern_context
 from skyvern.forge.sdk.core.skyvern_context import SkyvernContext
+from skyvern.forge.sdk.db.agent_db import AgentDB
 from skyvern.forge.sdk.db.enums import WorkflowRunTriggerType
+from skyvern.forge.sdk.db.models import Base
 from skyvern.forge.sdk.experimentation.billing_tier import BILLING_TIER_PROPERTY, BillingTier
 from skyvern.forge.sdk.experimentation.providers import BaseExperimentationProvider, NoOpExperimentationProvider
 from skyvern.forge.sdk.experimentation.workflow_block_engine import (
@@ -57,11 +62,12 @@ from skyvern.forge.sdk.workflow.models.block import (
     WhileLoopBlock,
     _evaluate_prompt_branch_conditions_batch,
     get_all_blocks,
+    pinned_v1_block_count,
     run_is_eligible_for_v3_ab,
     takes_default_engine,
     v3_ab_ineligibility_reason,
 )
-from skyvern.forge.sdk.workflow.models.workflow import WorkflowDefinition
+from skyvern.forge.sdk.workflow.models.workflow import COPILOT_TEST_WORKFLOW_CREATOR, Workflow, WorkflowDefinition
 from skyvern.forge.sdk.workflow.service import WorkflowService, workflow_definitions_differ
 from skyvern.forge.sdk.workflow.workflow_definition_converter import convert_workflow_definition
 from skyvern.forge.taskv3.goal_composition import render_block_context
@@ -70,6 +76,7 @@ from skyvern.schemas.workflows import (
     BlockResult,
     BlockType,
     NavigationBlockYAML,
+    WorkflowCreateYAMLRequest,
     WorkflowDefinitionYAML,
     WorkflowStatus,
 )
@@ -1900,6 +1907,249 @@ def test_a_pinned_skyvern_v1_survives_the_stored_definition_and_counts_as_a_chan
     assert WorkflowDefinition.model_validate(pinned.model_dump(mode="json")).blocks[0].engine_pinned is True
     # Before the cutoff an unmarked skyvern-1.0 and an unset engine compare alike; a pin must not.
     assert workflow_definitions_differ(unmarked, pinned)
+
+
+_PIN_ADDED_EVENT = "Workflow version adds a skyvern-1.0 engine pin"
+_WAREHOUSE_PIN_PATTERN = '"engine":"skyvern-1.0","engine_pinned":true'
+
+
+def _nav(label: str, engine: str | None = None, pinned: bool = False) -> dict[str, Any]:
+    block: dict[str, Any] = {
+        "block_type": "navigation",
+        "label": label,
+        "url": "https://e.com",
+        "navigation_goal": "Go",
+    }
+    if engine is not None:
+        block["engine"] = engine
+    if pinned:
+        block["engine_pinned"] = True
+    return block
+
+
+def _v1_pin(label: str) -> dict[str, Any]:
+    return _nav(label, "skyvern-1.0", pinned=True)
+
+
+def _for_loop(*inner: dict[str, Any]) -> dict[str, Any]:
+    return {"block_type": "for_loop", "label": "loop", "loop_variable_reference": "{{ items }}", "loop_blocks": inner}
+
+
+def _definition(blocks: list[dict[str, Any]]) -> WorkflowDefinition:
+    return convert_workflow_definition(
+        WorkflowDefinitionYAML.model_validate({"parameters": [], "blocks": blocks}), "w_test"
+    )
+
+
+def _workflow_row(blocks: list[dict[str, Any]], version: int, created_by: str | None = None) -> Workflow:
+    now = datetime.now(UTC)
+    return Workflow(
+        workflow_id=f"w_v{version}",
+        organization_id="o_test",
+        workflow_permanent_id="wpid_test",
+        title="test",
+        version=version,
+        is_saved_task=False,
+        workflow_definition=_definition(blocks),
+        created_at=now,
+        modified_at=now,
+        created_by=created_by,
+    )
+
+
+async def _save_definition(
+    monkeypatch: pytest.MonkeyPatch,
+    new_blocks: list[dict[str, Any]],
+    *,
+    overwritten: Workflow | None,
+    get_previous_version: AsyncMock,
+    created_by: str | None = None,
+    get_overwritten: AsyncMock | None = None,
+    dialect: str | None = "postgresql",
+) -> tuple[Workflow, Workflow, MagicMock]:
+    saved = _workflow_row(new_blocks, version=3, created_by=created_by)
+    engine = SimpleNamespace() if dialect is None else SimpleNamespace(dialect=SimpleNamespace(name=dialect))
+    monkeypatch.setattr(app.DATABASE, "engine", engine)
+    monkeypatch.setattr(app.DATABASE.workflows, "get_workflow", get_overwritten or AsyncMock(return_value=overwritten))
+    monkeypatch.setattr(app.DATABASE.workflows, "get_workflow_by_permanent_id", get_previous_version)
+    monkeypatch.setattr(
+        app.DATABASE.workflows, "update_workflow_and_reconcile_definition_params", AsyncMock(return_value=saved)
+    )
+    monkeypatch.setattr(app.DATABASE.organizations, "get_organization", AsyncMock(return_value=None))
+    monkeypatch.setattr(app.DATABASE.workflow_runs, "count_recent_workflow_runs", AsyncMock(return_value=327))
+    monkeypatch.setattr("skyvern.forge.sdk.workflow.service.encrypt_workflow_definition_secrets", AsyncMock())
+    with patch("skyvern.forge.sdk.workflow.service.LOG") as mock_log:
+        returned = await WorkflowService().update_workflow_definition(
+            workflow_id=saved.workflow_id,
+            organization_id="o_test",
+            workflow_definition=saved.workflow_definition,
+            notify_workflow_saved=False,
+        )
+    return returned, saved, mock_log
+
+
+def _pin_added_logs(mock_log: MagicMock) -> list[dict[str, Any]]:
+    return [call.kwargs for call in mock_log.info.call_args_list if call.args and call.args[0] == _PIN_ADDED_EVENT]
+
+
+@pytest.mark.parametrize(
+    ("previous_blocks", "overwritten_blocks", "new_blocks", "created_by", "expected"),
+    [
+        pytest.param([_nav("a", "skyvern-1.0")], [], [_v1_pin("a")], None, (0, 1, 2), id="new_version_adds_pin"),
+        pytest.param([_v1_pin("a")], [], [_v1_pin("a")], None, None, id="new_version_keeps_pin"),
+        pytest.param([_v1_pin("a"), _v1_pin("b")], [], [_v1_pin("a")], None, None, id="new_version_unpins"),
+        pytest.param(
+            [_v1_pin("a"), _nav("b")], [], [_nav("b"), _v1_pin("a")], None, None, id="new_version_reorders_pin"
+        ),
+        pytest.param(
+            [_v1_pin("a")], [], [_v1_pin("a"), _for_loop(_v1_pin("inner"))], None, (1, 2, 2), id="nested_second_pin"
+        ),
+        pytest.param(None, [], [_v1_pin("a")], None, (0, 1, None), id="first_version_with_pin"),
+        pytest.param([_nav("a")], [_v1_pin("a")], [_v1_pin("a")], None, None, id="in_place_edit_keeps_pin"),
+        pytest.param([_nav("a")], [], [_v1_pin("a")], COPILOT_TEST_WORKFLOW_CREATOR, None, id="copilot_test_row"),
+    ],
+)
+@pytest.mark.asyncio
+async def test_a_saved_version_logs_only_when_it_adds_a_skyvern_v1_pin(
+    monkeypatch: pytest.MonkeyPatch,
+    previous_blocks: list[dict[str, Any]] | None,
+    overwritten_blocks: list[dict[str, Any]],
+    new_blocks: list[dict[str, Any]],
+    created_by: str | None,
+    expected: tuple[int, int, int | None] | None,
+) -> None:
+    previous = None if previous_blocks is None else _workflow_row(previous_blocks, version=2)
+    returned, saved, mock_log = await _save_definition(
+        monkeypatch,
+        new_blocks,
+        overwritten=_workflow_row(overwritten_blocks, version=3),
+        get_previous_version=AsyncMock(return_value=previous),
+        created_by=created_by,
+    )
+
+    assert returned is saved
+    logs = _pin_added_logs(mock_log)
+    if expected is None:
+        assert logs == []
+        return
+    before, after, previous_version = expected
+    [log] = logs
+    assert log["workflow_permanent_id"] == "wpid_test"
+    assert log["version"] == 3
+    assert log["previous_version"] == previous_version
+    assert log["pinned_v1_blocks_before"] == before
+    assert log["pinned_v1_blocks_after"] == after
+    assert log["recent_runs_7d"] == 327
+
+
+@pytest.mark.parametrize("idempotent", [pytest.param(True, id="idempotent_create"), pytest.param(False, id="create")])
+@pytest.mark.asyncio
+async def test_a_first_version_created_with_a_v1_pin_logs(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, idempotent: bool
+) -> None:
+    database = AgentDB(f"sqlite+aiosqlite:///{tmp_path / 'pin.db'}")
+    async with database.engine.begin() as connection:
+        await connection.run_sync(Base.metadata.create_all)
+    organization = await database.organizations.create_organization(organization_name="Test", organization_id="o_test")
+    monkeypatch.setattr(app, "DATABASE", database)
+    monkeypatch.setattr(app, "WORKFLOW_SERVICE", WorkflowService())
+    # A file database has its own connection per task, unlike the in-memory one the dialect gate exists for.
+    monkeypatch.setattr(
+        WorkflowService, "_pinned_v1_blocks_to_check", staticmethod(lambda d: pinned_v1_block_count(d.blocks))
+    )
+    request = WorkflowCreateYAMLRequest.model_validate(
+        {"title": "test", "workflow_definition": {"parameters": [], "blocks": [_v1_pin("a")]}}
+    )
+    try:
+        with patch("skyvern.forge.sdk.workflow.service.LOG") as mock_log:
+            saved = await app.WORKFLOW_SERVICE.create_workflow_from_request(
+                organization=organization,
+                request=request,
+                new_workflow_permanent_id="wpid_test" if idempotent else None,
+            )
+    finally:
+        await database.engine.dispose()
+
+    [log] = _pin_added_logs(mock_log)
+    assert (log["workflow_permanent_id"], log["version"]) == (saved.workflow_permanent_id, 1)
+    assert (log["pinned_v1_blocks_before"], log["pinned_v1_blocks_after"]) == (0, 1)
+
+
+@pytest.mark.parametrize(
+    ("blocks", "dialect"),
+    [
+        # Without a v1 pin the save must not touch the engine; some test doubles of the database have none.
+        pytest.param([_nav("a", "skyvern-1.0"), _nav("b", "skyvern-2.0", pinned=True)], None, id="no_v1_pin"),
+        # An in-memory SQLite database pools one connection, so a read on another task would roll the save back.
+        pytest.param([_v1_pin("a")], "sqlite", id="v1_pin_on_sqlite"),
+    ],
+)
+@pytest.mark.asyncio
+async def test_a_save_reads_no_prior_row_without_a_v1_pin_or_on_sqlite(
+    monkeypatch: pytest.MonkeyPatch, blocks: list[dict[str, Any]], dialect: str | None
+) -> None:
+    reads: list[dict[str, Any]] = []
+
+    async def prior_row_read(**kwargs: Any) -> None:
+        reads.append(kwargs)
+
+    returned, saved, mock_log = await _save_definition(
+        monkeypatch,
+        blocks,
+        overwritten=None,
+        get_previous_version=AsyncMock(side_effect=prior_row_read),
+        get_overwritten=AsyncMock(side_effect=prior_row_read),
+        dialect=dialect,
+    )
+
+    assert returned is saved
+    assert reads == []
+    assert _pin_added_logs(mock_log) == []
+
+
+@pytest.mark.asyncio
+async def test_a_failing_pin_read_never_runs_on_the_save_task_or_fails_the_save(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    save_task = asyncio.current_task()
+    read_tasks: list[asyncio.Task[Any] | None] = []
+
+    async def failing_read(**_: Any) -> Workflow:
+        read_tasks.append(asyncio.current_task())
+        raise RuntimeError("db down")
+
+    returned, saved, mock_log = await _save_definition(
+        monkeypatch,
+        [_v1_pin("a")],
+        overwritten=None,
+        get_previous_version=AsyncMock(side_effect=failing_read),
+        get_overwritten=AsyncMock(side_effect=failing_read),
+    )
+
+    assert returned is saved
+    assert len(read_tasks) == 2 and save_task not in read_tasks
+    assert _pin_added_logs(mock_log) == []
+    assert any(call.kwargs.get("workflow_permanent_id") == "wpid_test" for call in mock_log.warning.call_args_list)
+
+
+@pytest.mark.parametrize(
+    ("blocks", "expected_pins"),
+    [
+        pytest.param([_v1_pin("a")], 1, id="pinned_v1"),
+        pytest.param([_nav("a", "skyvern-1.0")], 0, id="unpinned_v1"),
+        pytest.param([_nav("a", "skyvern-3.0", pinned=True)], 0, id="pinned_v3"),
+        pytest.param([_for_loop(_v1_pin("inner"))], 1, id="pinned_v1_in_for_loop"),
+        pytest.param([_v1_pin("a"), _nav("b"), _v1_pin("c")], 2, id="two_pins"),
+    ],
+)
+def test_the_warehouse_pin_regex_counts_what_the_service_counts(
+    blocks: list[dict[str, Any]], expected_pins: int
+) -> None:
+    definition = _definition(blocks)
+    stored = json.dumps(definition.model_dump(mode="json"), separators=(",", ":"), sort_keys=True)
+
+    assert pinned_v1_block_count(get_all_blocks(definition.blocks)) == expected_pins
+    assert stored.count(_WAREHOUSE_PIN_PATTERN) == expected_pins
 
 
 @pytest.mark.parametrize(
