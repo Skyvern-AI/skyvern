@@ -274,6 +274,38 @@ async def test_composite_navigate_sub_1000_timeout_reaches_the_navigate_step_as_
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
+    ("timeout", "expected_timeout", "expected_error"),
+    [
+        (60, 60000, None),
+        (90, None, "timeout is in milliseconds (1000-60000); got 90 - for seconds, use 1-60"),
+        (100, None, "timeout is in milliseconds (1000-60000); got 100 - for seconds, use 1-60"),
+        (500, None, "timeout is in milliseconds (1000-60000); got 500 - for seconds, use 1-60"),
+    ],
+)
+async def test_click_timeout_repairs_valid_seconds_and_rejects_ambiguous_values_at_mcp_dispatch(
+    monkeypatch: pytest.MonkeyPatch, timeout: int, expected_timeout: int | None, expected_error: str | None
+) -> None:
+    click = AsyncMock(return_value="#submit")
+    page = make_skyvern_page(make_mock_page())
+    page.click = click
+    context = BrowserContext(mode="cloud_session", session_id="pbs_test")
+    monkeypatch.setattr(mcp_browser, "get_page", AsyncMock(return_value=(page, context)))
+
+    payload = await _call("skyvern_click", {"selector": "#submit", "selector_mode": "direct", "timeout": timeout})
+
+    if expected_error is not None:
+        assert payload["ok"] is False
+        assert payload["error"]["code"] == "INVALID_INPUT"
+        assert payload["error"]["message"] == expected_error
+        assert payload["error"]["hint"] == "For seconds, pass 1-60; otherwise provide milliseconds from 1000-60000."
+        click.assert_not_awaited()
+    else:
+        assert payload["ok"] is True
+        assert _awaited_kwargs(click)["timeout"] == expected_timeout
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
     ("tool_name", "argument", "sent", "expected"),
     [
         # Sub-floor values on millisecond-named parameters are interpreted as seconds.
@@ -288,8 +320,9 @@ async def test_composite_navigate_sub_1000_timeout_reaches_the_navigate_step_as_
         ("skyvern_run_task", "timeout_seconds", 45, 45),
         ("skyvern_workflow_run", "timeout_seconds", 30, 30),
         ("skyvern_login", "timeout_seconds", 60, 60),
-        # Rescaling past the published ceiling would trade one validation failure for another.
-        ("skyvern_click", "timeout", 90, 90),
+        # Seconds are converted only when the result fits the schema's millisecond range.
+        ("skyvern_click", "timeout", 45, 45000),
+        ("skyvern_click", "timeout", 60, 60000),
     ],
 )
 async def test_timeout_repair_rescales_millisecond_parameters_only(
