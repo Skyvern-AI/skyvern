@@ -19,7 +19,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 from structlog.testing import capture_logs
 
-from skyvern.exceptions import StepTerminationError
+from skyvern.exceptions import MissingBrowserState, MissingBrowserStatePage, StepTerminationError
 from skyvern.forge import app
 from skyvern.forge.sdk.db.enums import BrowserSeedSource
 from skyvern.forge.sdk.workflow.context_manager import BlockOutcome, WorkflowRunContext
@@ -662,6 +662,37 @@ async def test_ordinary_code_failure_still_honors_continue_on_failure(monkeypatc
     assert workflow_run is running
     assert should_stop is False
     mark_failed.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("the_run_lost_its_browser", [True, False])
+async def test_a_lost_browser_stops_the_run_despite_continue_on_failure(
+    monkeypatch: pytest.MonkeyPatch,
+    the_run_lost_its_browser: bool,
+) -> None:
+    """SKY-18860: nothing hands a later block a browser once the run has lost its own, so every
+    remaining block would fail the same way — that failure must not be continuable. A missing page
+    is a different story: a later block can open one, so it keeps honoring continue_on_failure."""
+    service = WorkflowService()
+    block = _navigation_block("nav")
+    block.continue_on_failure = True
+    error = (
+        MissingBrowserState(workflow_run_id="wr_test", failure_reason="browser_state_registry_lookup_miss")
+        if the_run_lost_its_browser
+        else MissingBrowserStatePage(workflow_run_id="wr_test")
+    )
+    _wire_real_execute_safe(monkeypatch, [WorkflowRunStatus.running], execute=AsyncMock(side_effect=error))
+    failed_run = MagicMock()
+    mark_failed = AsyncMock(return_value=failed_run)
+    monkeypatch.setattr(WorkflowService, "mark_workflow_run_as_failed_if_not_final", mark_failed)
+
+    workflow_run, _, block_result, should_stop, _ = await _run_single_block(service, block)
+
+    assert block_result is not None
+    assert block_result.success is False
+    assert block_result.can_continue_after_failure is not the_run_lost_its_browser
+    assert should_stop is the_run_lost_its_browser
+    assert (workflow_run is failed_run) is the_run_lost_its_browser
 
 
 @pytest.mark.asyncio

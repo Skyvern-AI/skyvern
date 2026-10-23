@@ -1444,6 +1444,11 @@ class RealBrowserManager(BrowserManager):
                     "Browser state not found in persistent sessions manager", browser_session_id=browser_session_id
                 )
             else:
+                # Register before the first goto, as the creation path below does: a navigation
+                # failure here raises past the registry write at the end of this method, and every
+                # later block of the run would then find an empty registry and report a missing
+                # browser instead of the navigation failure.
+                self.pages[workflow_run_id] = browser_state
                 page = await browser_state.get_working_page()
                 if page:
                     if url and navigate:
@@ -1470,6 +1475,10 @@ class RealBrowserManager(BrowserManager):
                                 organization_id=workflow_run.organization_id,
                                 expected=browser_state,
                             )
+                            # The evicted state's CDP is dead, so it must not stay registered for
+                            # the run once the reconnect below replaces or fails to replace it.
+                            if self.pages.get(workflow_run_id) is browser_state:
+                                self.pages.pop(workflow_run_id, None)
                             browser_state = await app.PERSISTENT_SESSIONS_MANAGER.get_browser_state(
                                 browser_session_id,
                                 organization_id=workflow_run.organization_id,
@@ -1484,6 +1493,7 @@ class RealBrowserManager(BrowserManager):
                             )
                             if browser_state is None:
                                 raise
+                            self.pages[workflow_run_id] = browser_state
                             _retain_run_dialog_answers(
                                 browser_state,
                                 workflow_run_id,

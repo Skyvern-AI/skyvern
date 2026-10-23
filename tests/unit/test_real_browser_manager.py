@@ -18,7 +18,11 @@ from unittest.mock import AsyncMock, MagicMock, call, patch
 import pytest
 from structlog.testing import capture_logs
 
-from skyvern.exceptions import BrowserSessionAlreadyOccupiedError, MissingBrowserStateForBrowserSession
+from skyvern.exceptions import (
+    BrowserSessionAlreadyOccupiedError,
+    FailedToNavigateToUrl,
+    MissingBrowserStateForBrowserSession,
+)
 from skyvern.forge import app as forge_app
 from skyvern.forge.sdk.artifact.storage.recording_test_helpers import fake_prepared_recording
 from skyvern.forge.sdk.core import skyvern_context
@@ -662,6 +666,48 @@ async def test_pbs_workflow_run_without_lease_still_asserts_run_as_expected_owne
 
     call_kwargs = mock_app.PERSISTENT_SESSIONS_MANAGER.get_browser_state.await_args.kwargs
     assert call_kwargs["expected_runnable_id"] == "wfr_child"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("browser_survives_the_goto", [True, False])
+async def test_pbs_registry_after_a_failed_first_goto_holds_only_a_usable_browser(
+    browser_survives_the_goto: bool,
+) -> None:
+    """SKY-18860: later blocks of the run find their browser through the registry. A goto that fails
+    on the site or the proxy leaves the session's browser alive, so it must stay registered —
+    otherwise every later block reports a missing browser instead of the navigation failure. A goto
+    that fails because the cached CDP dropped leaves nothing usable, so the evicted state must go."""
+    manager = RealBrowserManager()
+    workflow_run = make_workflow_run("wfr_child")
+
+    error_message = (
+        "Page.goto: net::ERR_TUNNEL_CONNECTION_FAILED"
+        if browser_survives_the_goto
+        else "Connection closed while reading from the driver"
+    )
+    pbs_state = MagicMock()
+    pbs_state.get_working_page = AsyncMock(return_value=MagicMock())
+    pbs_state.navigate_to_url = AsyncMock(
+        side_effect=FailedToNavigateToUrl(url="https://example.com", error_message=error_message)
+    )
+
+    with patch_browser_manager_app() as mock_app:
+        configure_browser_context_acquired_hook(mock_app)
+        # The reconnect after an evict finds the session gone, so the run keeps no browser at all.
+        mock_app.PERSISTENT_SESSIONS_MANAGER.get_browser_state = AsyncMock(side_effect=[pbs_state, None])
+        mock_app.PERSISTENT_SESSIONS_MANAGER.set_browser_state = AsyncMock()
+        mock_app.PERSISTENT_SESSIONS_MANAGER.evict_cached_browser_state = AsyncMock()
+        mock_app.PERSISTENT_SESSIONS_MANAGER.supports_evict_and_reconnect = MagicMock(return_value=True)
+
+        with pytest.raises(FailedToNavigateToUrl):
+            await manager.get_or_create_for_workflow_run(
+                workflow_run=workflow_run,
+                url="https://example.com",
+                browser_session_id="bs_123",
+            )
+
+    expected = pbs_state if browser_survives_the_goto else None
+    assert manager.get_for_workflow_run(workflow_run_id="wfr_child") is expected
 
 
 @pytest.mark.asyncio

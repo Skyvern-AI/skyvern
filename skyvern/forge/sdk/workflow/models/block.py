@@ -1886,6 +1886,7 @@ class Block(BaseModel, abc.ABC):
                 )
             return result
         except Exception as e:
+            can_continue_after_failure: bool | None = None
             if isinstance(e, (MissingBrowserState, MissingBrowserStatePage)):
                 LOG.exception(
                     "Block execution failed because browser state is unavailable",
@@ -1894,6 +1895,11 @@ class Block(BaseModel, abc.ABC):
                     block_type=self.block_type,
                 )
                 failure_reason = get_user_facing_exception_message(e)
+                if isinstance(e, MissingBrowserState):
+                    # Nothing hands a later block a browser once the run has lost its own, so
+                    # continuing only replays this failure for every remaining block or loop
+                    # iteration. A missing page stays continuable: a later block can open one.
+                    can_continue_after_failure = False
             elif isinstance(e, FailedToNavigateToUrl) and not isinstance(e, BlockedNavigationDestination):
                 # The target site did not load. Site-caused, and already surfaced on the run through
                 # failure_reason below. BlockedNavigationDestination is excluded on purpose: it is the
@@ -1955,6 +1961,7 @@ class Block(BaseModel, abc.ABC):
                 workflow_run_block_id=workflow_run_block_id,
                 organization_id=organization_id,
                 error_codes=error_codes or None,
+                can_continue_after_failure=can_continue_after_failure,
             )
         finally:
             if download_timeout_context is not None:
