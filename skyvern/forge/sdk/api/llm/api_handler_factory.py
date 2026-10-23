@@ -4092,6 +4092,7 @@ class LLMCaller:
             llm_request_payload = {
                 "model": self.llm_key if openrouter_model_name and self.openai_client else self.llm_config.model_name,
                 "messages": messages,
+                **({"tools": tools} if tools else {}),
                 # we're not using active_parameters here because it may contain sensitive information
                 **parameters,
             }

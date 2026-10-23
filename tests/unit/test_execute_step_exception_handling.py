@@ -560,6 +560,52 @@ async def test_execute_step_releases_scraped_page_before_recursion(monkeypatch: 
         assert handle_completed_step.await_args.kwargs["scraped_page"] is scraped_page
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("workflow_run_id", "expected_final_screenshot"),
+    [("wr-123", False), (None, True)],
+    ids=["workflow-block", "standalone-task"],
+)
+async def test_goto_only_task_takes_final_screenshot_only_outside_a_workflow(
+    monkeypatch: pytest.MonkeyPatch, workflow_run_id: str | None, expected_final_screenshot: bool
+) -> None:
+    agent = ForgeAgent()
+    now = datetime.now(UTC)
+    organization = make_organization(now)
+    task = make_task(
+        now, organization, navigation_goal=None, data_extraction_goal=None, workflow_run_id=workflow_run_id
+    )
+    step = make_step(now, task, step_id="step-0", status=StepStatus.running, order=0, output=None)
+
+    page = MagicMock()
+    page.url = task.url
+    browser_state = MagicMock()
+    browser_state.must_get_working_page = AsyncMock(return_value=page)
+
+    monkeypatch.setattr("skyvern.forge.agent.app.DATABASE.workflow_runs.get_workflow_run", AsyncMock(return_value=None))
+    monkeypatch.setattr("skyvern.forge.agent.app.DATABASE.tasks.get_task", AsyncMock(return_value=None))
+    monkeypatch.setattr("skyvern.forge.agent.app.DATABASE.tasks.update_task", AsyncMock(return_value=task))
+    monkeypatch.setattr("skyvern.forge.agent.app.AGENT_FUNCTION.validate_step_execution", AsyncMock(return_value=None))
+    agent.initialize_execution_state = AsyncMock(return_value=(step, browser_state, None))  # type: ignore[method-assign]
+    agent.update_step = AsyncMock(return_value=step)  # type: ignore[method-assign]
+    agent.update_task = AsyncMock(return_value=task)  # type: ignore[method-assign]
+    clean_up_task = AsyncMock(return_value=None)
+    agent.clean_up_task = clean_up_task  # type: ignore[method-assign]
+
+    skyvern_context.set(
+        SkyvernContext(organization_id=organization.organization_id, task_id=task.task_id, tz_info=ZoneInfo("UTC"))
+    )
+    try:
+        await agent.execute_step(
+            organization=organization, task=task, step=step, api_key="api-key", download_baseline_files=[]
+        )
+    finally:
+        skyvern_context.reset()
+
+    assert clean_up_task.await_count == 1
+    assert clean_up_task.await_args.kwargs["need_final_screenshot"] is expected_final_screenshot
+
+
 # These drive the REAL ``fail_task`` and ``clean_up_task``, because mocking exactly those two hides
 # that most handlers clean up unconditionally. Only the browser, storage and webhook edges are faked,
 # and ``fail_task`` genuinely returns False because the row it is handed is already final.

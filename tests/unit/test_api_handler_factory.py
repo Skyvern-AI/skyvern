@@ -36,6 +36,7 @@ from skyvern.forge.sdk.api.llm.exceptions import (
 )
 from skyvern.forge.sdk.api.llm.models import LLMConfig
 from skyvern.forge.sdk.api.llm.utils import uses_only_anthropic_models
+from skyvern.forge.sdk.artifact.models import ArtifactType
 from skyvern.forge.sdk.copilot import secret_scrub
 from skyvern.forge.sdk.copilot.secret_scrub import REDACTED_SECRET_PLACEHOLDER
 from skyvern.forge.sdk.core.skyvern_context import SkyvernContext
@@ -654,6 +655,22 @@ def _stub_successful_llm_caller(
     logger = DummyLogger()
     monkeypatch.setattr(api_handler_factory, "LOG", logger)
     return caller, logger
+
+
+@pytest.mark.asyncio
+async def test_llm_caller_records_the_tool_schema_it_sent(monkeypatch: pytest.MonkeyPatch) -> None:
+    caller, _ = _stub_successful_llm_caller(monkeypatch)
+    api_handler_factory.app.ARTIFACT_MANAGER.prepare_llm_artifact = AsyncMock(return_value=None)
+    tools = [{"type": "function", "function": {"name": "click", "parameters": {"type": "object", "properties": {}}}}]
+
+    await caller.call(prompt="test", prompt_name="tool-schema-test", thought=MagicMock(), tools=tools)
+
+    requests = [
+        json.loads(call.kwargs["data"])
+        for call in api_handler_factory.app.ARTIFACT_MANAGER.prepare_llm_artifact.call_args_list
+        if call.kwargs["artifact_type"] == ArtifactType.LLM_REQUEST
+    ]
+    assert [request["tools"] for request in requests] == [tools]
 
 
 @pytest.mark.asyncio
