@@ -472,7 +472,7 @@ async def test_runtime_end_run_phase_follows_the_runs_hold_on_the_browser(
         elif after_cleanup == "terminal_close_hangs":
 
             async def hang_after_close_call() -> None:
-                context._impl_obj._close_was_called = True
+                context._impl_obj._closing_or_closed = True
                 await asyncio.Event().wait()
 
             context.close = hang_after_close_call

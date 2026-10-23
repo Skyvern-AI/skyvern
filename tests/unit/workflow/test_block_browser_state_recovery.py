@@ -1092,7 +1092,7 @@ def test_is_connected_false_when_context_close_was_called() -> None:
     browser.is_connected = MagicMock(return_value=True)
     context = MagicMock()
     context.browser = browser
-    context._impl_obj = MagicMock(_close_was_called=True, _closed=False)
+    context._impl_obj = MagicMock(_closing_or_closed=True, _closed=False)
     assert _state_with_context(context).is_connected() is False
 
 
@@ -2315,7 +2315,7 @@ async def test_runtime_disconnect_liveness_requires_transport_evidence(signal: s
     if signal in {"closed", "cancelled", "result", "transport"}:
         context._impl_obj._connection._closed_error = RuntimeError("connection closed")
     elif signal == "close_called":
-        context._impl_obj._close_was_called = True
+        context._impl_obj._closing_or_closed = True
         kind = "context_closed"
     else:
         context.browser.is_connected.return_value = False
@@ -2785,7 +2785,7 @@ async def test_browser_runtime_event_failed_close_intent_is_not_proof_of_context
     context.cookies = AsyncMock(return_value=[])
 
     async def fail_after_close_intent() -> None:
-        context._impl_obj._close_was_called = True
+        context._impl_obj._closing_or_closed = True
         if failure == "timeout":
             await asyncio.Event().wait()
         raise RuntimeError("context close failed before completion")
