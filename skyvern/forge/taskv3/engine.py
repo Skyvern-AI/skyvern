@@ -21,6 +21,7 @@ in-process adapter over ``do_observe``/``do_execute`` for shared hardening + act
 
 from __future__ import annotations
 
+import copy
 import dataclasses
 import functools
 import json
@@ -582,6 +583,10 @@ async def run_task_v3_agent_loop(
 
     async def _terminate_premise(reason: str, prior_checks: int) -> None:
         assert unlisted_reask_criteria is not None and tool_trail is not None
+        # The run's context object is shared and the next block rewrites its ids; a check that outlives the run must
+        # log and attribute under this run's. Set before the first await, inside the check's own context copy.
+        if (run_context := skyvern_context.current()) is not None:
+            skyvern_context.set(copy.copy(run_context))
         try:
             timeout, redact, caller, skip = _stop_check_setup()
             if not terminate_premise_check:
@@ -613,7 +618,14 @@ async def run_task_v3_agent_loop(
             )
         except Exception:
             LOG.warning("taskv3 terminate premise failed", exc_info=True)
+        # The run flushes its step archive once, as it ends; a check still running then lands in a fresh one.
+        if loop_ended and step is not None:
+            try:
+                await app.ARTIFACT_MANAGER.flush_step_archive(step.step_id)
+            except Exception:
+                LOG.warning("taskv3 terminate premise archive flush failed", exc_info=True)
 
+    loop_ended = False
     finish_tool = make_finish_tool(
         unseen_text=unseen_text,
         page_fingerprint=None if page_free else (settle_fingerprint or page_fingerprint),
@@ -655,7 +667,7 @@ async def run_task_v3_agent_loop(
     answer_audit = (
         None
         if page_free
-        else app.AGENT_FUNCTION.task_v3_answer_basis_audit(
+        else await app.AGENT_FUNCTION.task_v3_answer_basis_audit(
             refs.masked,
             goal="\n\n".join(part for part in (model_goal, goal_instructions) if part),
             organization_id=organization_id,
@@ -742,6 +754,7 @@ async def run_task_v3_agent_loop(
             anthropic_cache_markers=anthropic_cache_markers,
         )
     finally:
+        loop_ended = True
         if failure_watch is not None:
             failure_watch.close()
         # The context outlives this run; a signal raised as the loop was cancelled must not fire
