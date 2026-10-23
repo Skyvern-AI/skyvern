@@ -826,6 +826,26 @@ def _response_finish_reason(response: object) -> str | None:
     return None
 
 
+def _halved_reasoning_budget_parameters(active_parameters: dict[str, Any]) -> dict[str, Any] | None:
+    """A copy of these parameters with the declared reasoning budget halved.
+
+    None when the request declares no budget, and so has nothing it can hand back to the answer.
+    """
+    extra_body = active_parameters.get("extra_body")
+    if not isinstance(extra_body, dict):
+        return None
+    reasoning = extra_body.get("reasoning")
+    if not isinstance(reasoning, dict):
+        return None
+    budget = reasoning.get("max_tokens")
+    if not isinstance(budget, int) or isinstance(budget, bool) or budget < 2:
+        return None
+    return {
+        **active_parameters,
+        "extra_body": {**extra_body, "reasoning": {**reasoning, "max_tokens": budget // 2}},
+    }
+
+
 def _usage_int_field(value: Any, *field_names: str) -> int | None:
     for field_name in field_names:
         field = value.get(field_name) if isinstance(value, dict) else getattr(value, field_name, None)
@@ -4091,6 +4111,7 @@ class LLMCaller:
             t_llm_request = time.perf_counter()
             llm_duration_seconds = 0.0
             refused_call_stats: LLMCallStats | None = None
+            truncated_call_stats: LLMCallStats | None = None
             try:
                 # `timeout` may already live in active_parameters via litellm_params (flex configs
                 # carry their own); passing it explicitly too collides on kwarg unpacking.
@@ -4101,6 +4122,10 @@ class LLMCaller:
                 )
                 if _response_finish_reason(response) == "content_filter":
                     response, refused_call_stats = await self._retry_refused_call_on_fallback(
+                        response, messages, tools, active_parameters, prompt_name
+                    )
+                if isinstance(response, ModelResponse) and is_truncated_response(response):
+                    response, truncated_call_stats = await self._retry_truncated_call_with_less_reasoning(
                         response, messages, tools, active_parameters, prompt_name
                     )
                 llm_duration_seconds = time.perf_counter() - t_llm_request
@@ -4212,6 +4237,8 @@ class LLMCaller:
                 )
             if refused_call_stats is not None:
                 call_stats = _combined_call_stats(call_stats, refused_call_stats)
+            if truncated_call_stats is not None:
+                call_stats = _combined_call_stats(call_stats, truncated_call_stats)
 
             llm_response_json = _safe_model_dump_json(response)
             if should_persist_llm_artifacts:
@@ -4455,13 +4482,50 @@ class LLMCaller:
             raise LLMContentFilteredError(self.llm_key, [refused_on, fallback_group])
         return fallback_response, refused_stats
 
-    async def _log_refused_response(
+    async def _retry_truncated_call_with_less_reasoning(
+        self,
+        response: ModelResponse,
+        messages: list[dict[str, Any]],
+        tools: list | None,
+        active_parameters: dict[str, Any],
+        prompt_name: str | None,
+    ) -> tuple[ModelResponse | CustomStreamWrapper | AnthropicMessage | UITarsResponse, LLMCallStats | None]:
+        """A model that spent its whole completion budget reasoning stops at finish_reason=length with no
+        content, which arrives as a valid response the router's exception-driven fallback never sees. Send it
+        once more with the declared reasoning budget halved, so the answer has room (SKY-18857). A step retry
+        is no substitute: it re-sends the same budget and truncates the same way."""
+        retry_parameters = _halved_reasoning_budget_parameters(active_parameters)
+        usage = getattr(response, "usage", None)
+        usage_detail = getattr(usage, "completion_tokens_details", None)
+        LOG.warning(
+            "LLM spent its whole completion budget on reasoning and returned no content",
+            llm_key=self.llm_key,
+            prompt_name=prompt_name,
+            model=getattr(response, "model", None) or self.llm_config.model_name,
+            prompt_tokens=getattr(usage, "prompt_tokens", None),
+            completion_tokens=getattr(usage, "completion_tokens", None),
+            reasoning_tokens=getattr(usage_detail, "reasoning_tokens", None),
+            # False means the request declared no reasoning budget to lower, so this call fails as it
+            # did before. Read with retried_reasoning_budget to tell a recovery from a bare report.
+            retried=retry_parameters is not None,
+            retried_reasoning_budget=(
+                retry_parameters["extra_body"]["reasoning"]["max_tokens"] if retry_parameters else None
+            ),
+        )
+        if retry_parameters is None:
+            return response, None
+        truncated_stats = await self._log_discarded_response_stats(response, prompt_name)
+        return (
+            await self._dispatch_llm_call(messages=messages, tools=tools, **retry_parameters),
+            truncated_stats,
+        )
+
+    async def _log_discarded_response_stats(
         self,
         response: ModelResponse | CustomStreamWrapper | AnthropicMessage | UITarsResponse,
         prompt_name: str | None,
-        refused_on: str,
-        fallback_group: str | None,
     ) -> LLMCallStats:
+        """Usage for a response this call is throwing away; its tokens were still spent and still bill."""
         stats = await self.get_call_stats(response)
         _emit_copilot_model_usage_for_response(
             response,
@@ -4469,6 +4533,16 @@ class LLMCaller:
             prompt_name=prompt_name,
             cost=stats.llm_cost if stats.llm_cost_available else None,
         )
+        return stats
+
+    async def _log_refused_response(
+        self,
+        response: ModelResponse | CustomStreamWrapper | AnthropicMessage | UITarsResponse,
+        prompt_name: str | None,
+        refused_on: str,
+        fallback_group: str | None,
+    ) -> LLMCallStats:
+        stats = await self._log_discarded_response_stats(response, prompt_name)
         LOG.warning(
             "LLM response refused or blocked by content filter",
             llm_key=self.llm_key,

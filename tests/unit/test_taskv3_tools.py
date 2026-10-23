@@ -1872,6 +1872,7 @@ async def test_navigate_refuses_a_url_carrying_a_resolved_credential_off_site() 
 
 
 @pytest.mark.asyncio
+@pytest.mark.usefixtures("unresolvable_dns")
 async def test_file_upload_from_a_local_path_carrying_the_username_is_not_refused(tmp_path: Path) -> None:
     # The tool takes "a local path or URL", and a file downloaded earlier in the run is routinely named
     # after the account. A path names no site, so reading it releases nothing and must not be refused.
@@ -2345,6 +2346,7 @@ async def test_a_url_argument_never_carries_a_totp_placeholder(
 
 
 @pytest.mark.asyncio
+@pytest.mark.usefixtures("public_dns")
 async def test_navigate_to_a_url_that_merely_spells_a_vault_marker_goes_through(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

@@ -9023,6 +9023,7 @@ async def test_navigate_records_name_the_host_and_no_other_tool_does() -> None:
 
 
 @pytest.mark.asyncio
+@pytest.mark.usefixtures("public_dns")
 async def test_a_url_the_record_cannot_parse_redacts_it_and_never_aborts_the_run() -> None:
     # The record helper is evaluated to build the kwargs BEFORE the `taskv3 tool handler raised` call
     # is entered, so anything it raises escapes that except block, the per-call try AND the batch loop:

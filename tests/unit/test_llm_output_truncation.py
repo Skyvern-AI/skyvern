@@ -7,6 +7,7 @@ from unittest.mock import MagicMock
 import pytest
 from PIL import Image
 
+from skyvern.forge.sdk.api.llm.api_handler_factory import _halved_reasoning_budget_parameters
 from skyvern.forge.sdk.api.llm.exceptions import LLMOutputTruncatedError
 from skyvern.forge.sdk.api.llm.utils import (
     is_content_filtered_response,
@@ -140,6 +141,42 @@ class TestIsContentFilteredResponse:
         resp = MagicMock()
         resp.choices = []
         assert is_content_filtered_response(resp) is False
+
+
+class TestHalvedReasoningBudgetParameters:
+    """What arms the truncation retry. Arming it for a request that declares no reasoning budget
+    would re-send identical parameters and double the cost of every truncated call for nothing."""
+
+    def test_declared_budget_is_halved_without_touching_the_completion_cap(self) -> None:
+        reduced = _halved_reasoning_budget_parameters(
+            {
+                "max_completion_tokens": 65536,
+                "extra_body": {"provider": {"ignore": ["open-inference"]}, "reasoning": {"max_tokens": 49152}},
+            }
+        )
+        assert reduced == {
+            "max_completion_tokens": 65536,
+            "extra_body": {"provider": {"ignore": ["open-inference"]}, "reasoning": {"max_tokens": 24576}},
+        }
+
+    def test_frozen_config_parameters_are_not_mutated(self) -> None:
+        extra_body = {"reasoning": {"max_tokens": 49152}}
+        parameters = {"extra_body": extra_body}
+        _halved_reasoning_budget_parameters(parameters)
+        assert extra_body == {"reasoning": {"max_tokens": 49152}}
+
+    @pytest.mark.parametrize(
+        "parameters",
+        [
+            pytest.param({"max_completion_tokens": 65536}, id="no_extra_body"),
+            pytest.param({"extra_body": {"provider": {"order": ["cloudflare"]}}}, id="no_reasoning"),
+            pytest.param({"extra_body": {"reasoning": {"effort": "high"}}}, id="effort_not_budget"),
+            pytest.param({"extra_body": {"reasoning_effort": "high"}}, id="top_level_effort"),
+            pytest.param({"extra_body": {"reasoning": {"max_tokens": 1}}}, id="nothing_left_to_halve"),
+        ],
+    )
+    def test_requests_with_no_reducible_budget_are_left_alone(self, parameters: dict[str, Any]) -> None:
+        assert _halved_reasoning_budget_parameters(parameters) is None
 
 
 class TestParseApiResponseTruncation:
