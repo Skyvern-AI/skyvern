@@ -29,7 +29,12 @@ import pytest
 from structlog.testing import capture_logs
 
 import skyvern.webeye.cdp_download_interceptor as cdp_module
-from skyvern.exceptions import CompletionGateTerminationError, SkyvernContextWindowExceededError, StepTerminationError
+from skyvern.exceptions import (
+    CompletionGateTerminationError,
+    MissingBrowserStatePage,
+    SkyvernContextWindowExceededError,
+    StepTerminationError,
+)
 from skyvern.forge.sdk.api.llm.exceptions import LLMContentFilteredError, LLMProviderErrorRetryableTask
 from skyvern.forge.sdk.core import skyvern_context
 from skyvern.forge.sdk.core.skyvern_context import SkyvernContext
@@ -49,6 +54,9 @@ from skyvern.forge.taskv3.loop import (
     ACTION_LOOP_NUDGE_AFTER,
     ACTION_LOOP_TERMINATE_AFTER,
     ACTION_OUTCOME_DATA_KEY,
+    BROWSER_LOST_EVENT,
+    BROWSER_LOST_GUARD,
+    BROWSER_LOST_REASON,
     CLICK_DISPATCHED_DATA_KEY,
     CODE_TOOL_NAME,
     COMPLETION_GATE_REFUSAL,
@@ -12182,6 +12190,47 @@ async def test_a_handler_that_raises_still_reports_the_time_it_spent_resolving_t
     assert by_tool["type"]["resolve_seconds"] == 0.5
     # Per call, never carried over: finish resolved no address and must report none.
     assert "resolve_seconds" not in by_tool["finish"]
+
+
+@pytest.mark.asyncio
+async def test_a_lost_browser_ends_the_run_where_any_other_raise_comes_back_as_a_tool_error() -> None:
+    # SKY-18903: the page accessor behind every tool raises MissingBrowserStatePage only after its own
+    # reopen attempt failed, so handing that back as a tool error bought 7-9 identical errors and four
+    # more model turns per task on a browser that cannot come back. The arms are in ONE script because
+    # the whole claim is the discriminator: a generic raise must still be a retryable tool error (turn 1
+    # is answered and the run reaches turn 2), and only the browser-gone class ends the run.
+    observe_calls: list[tuple[str, dict[str, Any]]] = []
+    type_calls: list[tuple[str, dict[str, Any]]] = []
+
+    async def browser_is_gone(args: dict[str, Any]) -> ToolResult:
+        raise MissingBrowserStatePage(task_id="tsk_lost")
+
+    tools = [
+        _recording_tool("type", type_calls, raises=True, billable=True),
+        ToolSpec(name="click", description="c", parameters={}, handler=browser_is_gone, billable=True),
+        _recording_tool("observe", observe_calls),
+        make_finish_tool(),
+    ]
+    script = [
+        [("type", {"selector": "#a", "text": "x"})],
+        [("click", {"selector": "#b"}), ("observe", {})],
+        [("finish", {"status": "completed", "reason": "never reached"})],
+    ]
+    with capture_logs() as logs:
+        outcome, caller = await _run(script, tools)
+
+    assert (outcome.status, outcome.guard) == ("failed", BROWSER_LOST_GUARD)
+    # Verbatim: this leaves the system as the task's customer-visible failure_reason.
+    assert outcome.reason == BROWSER_LOST_REASON
+    # Two turns, not three: the model was never asked to act on the dead browser again.
+    assert caller.calls == 2
+    # The sibling queued behind it never ran, and its tool_call id is still answered.
+    assert observe_calls == []
+    assert [content.startswith("skipped:") for content in _tool_contents(outcome, "observe")] == [True]
+    # The control arm: the generic raise was answered as an error the model could read and retry past.
+    assert any("tool_error: RuntimeError" in content for content in _tool_contents(outcome, "type"))
+    (lost,) = (entry for entry in logs if entry["event"] == BROWSER_LOST_EVENT)
+    assert (lost["guard"], lost["tool"]) == (BROWSER_LOST_GUARD, "click")
 
 
 def test_every_driver_timeout_type_installed_here_classifies_as_a_driver_timeout() -> None:

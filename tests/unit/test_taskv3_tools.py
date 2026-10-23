@@ -5803,6 +5803,55 @@ async def test_click_on_a_choice_option_names_the_question_observe_bound_it_to()
 
 @_skip_no_browser
 @pytest.mark.asyncio
+async def test_yes_no_toggle_buttons_name_their_question_and_echo_it_but_page_toggles_do_not() -> None:
+    # Adjacent Yes/No pairs of pressable buttons: with the question on the "No" alone, the model paired the
+    # unlabeled "Yes" with the question beside it and pressed the wrong button.
+    questions = (
+        "Are you legally authorized to work in this country?",
+        "Will you now or in the future require visa sponsorship?",
+    )
+    pair = (
+        "<div class='yesno'><button type='button' aria-pressed='false'>Yes</button>"
+        "<button type='button' aria-pressed='false'>No</button><input type='checkbox' hidden></div>"
+    )
+    # Both questions share one hint between their label and their buttons; the hint names neither question.
+    hint = "<div class='hint'><p>Answer for the country where this role is located.</p></div>"
+    # The second label sits in a title box of its own, a common layout.
+    labels = (f"<label>{questions[0]}</label>", f"<div class='title'><label>{questions[1]}</label></div>")
+    entries = "".join(f"<div class='entry'>{label}{hint}{pair}</div>" for label in labels)
+    # A pair whose question is plain text, in a section whose legend titles the section and asks nothing.
+    unlabeled = "Are you at least 18 years old?"
+    section = (
+        f"<fieldset><legend>Work eligibility</legend><div class='entry'><div>{unlabeled}</div>{pair}</div></fieldset>"
+    )
+    # Pressable buttons that set no form value are page controls; the card title beside them is not a question.
+    card = (
+        "<div class='card'><h3>Blue road bike</h3><div class='actions'>"
+        "<button type='button' aria-pressed='false'>Save this bike</button>"
+        "<button type='button' aria-pressed='false'>Track price on this bike</button></div></div>"
+    )
+    async with _live_page(f"<!doctype html><html><body><form>{entries}{section}</form>{card}</body></html>") as page:
+        tools = build_browser_tools(_fixed_page_provider(page))
+        r = await _tool(tools, "observe").handler({})
+        buttons = re.findall(r"^ref=(\d+) button\S* '(Yes|No)'.*?(?: group='([^']*)')?$", r.content, re.M)
+        assert [(label, group) for _, label, group in buttons] == [
+            (label, q) for q in (*questions, unlabeled) for label in ("Yes", "No")
+        ], r.content
+        page_toggles = [line for line in r.content.splitlines() if line.startswith("ref=") and "this bike'" in line]
+        assert len(page_toggles) == 2 and not any(" group=" in line for line in page_toggles), r.content
+        sponsorship_yes = next(ref for ref, label, group in buttons if label == "Yes" and group == questions[1])
+        clicked = await _tool(tools, "click").handler({"selector": f"ref={sponsorship_yes}"})
+        save = re.search(r"^ref=(\d+) button\S* 'Save this bike'", r.content, re.M)
+        assert save, r.content
+        saved = await _tool(tools, "click").handler({"selector": f"ref={save.group(1)}"})
+    assert clicked.status == "ok" and clicked.content.endswith(f"\nclicked 'Yes' for question {questions[1]!r}"), (
+        clicked.content
+    )
+    assert saved.status == "ok" and "question" not in saved.content, saved.content
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
 async def test_click_echo_stays_silent_when_the_pick_could_not_be_confirmed() -> None:
     # The card leaves the page on click, so its state cannot be read back.
     html = (
