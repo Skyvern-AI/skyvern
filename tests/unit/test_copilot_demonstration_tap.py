@@ -16,6 +16,10 @@ from skyvern.forge.sdk.copilot.demonstration_tap import PageTap, TapEvent
 from tests.unit.copilot_test_helpers import skip_no_browser
 from tests.unit.scoped_asyncio import ScopedAsyncio
 
+# Linux chromium-headless-shell ignores printable type-ahead on a closed <select> (no input/change fires);
+# full Chromium commits it on Linux and macOS, so tests that type into a select launch this channel.
+SELECT_TYPE_AHEAD_CHANNEL = "chromium"
+
 
 def test_page_tap_queue_stops_accepting_events_at_limit() -> None:
     tap = PageTap(SimpleNamespace(), max_events=1)  # type: ignore[arg-type]
@@ -147,6 +151,7 @@ async def test_page_tap_captures_trusted_actions_navigation_and_oopif() -> None:
         async with async_playwright() as playwright:
             browser = await playwright.chromium.launch(
                 headless=True,
+                channel=SELECT_TYPE_AHEAD_CHANNEL,
                 args=["--site-per-process", "--use-mock-keychain", "--password-store=basic"],
             )
             context = await browser.new_context()
@@ -576,7 +581,7 @@ async def test_page_tap_credits_each_navigation_to_its_own_entry_when_the_url_re
 async def test_page_tap_protects_labelled_secrets_and_captures_combobox_typing() -> None:
     tap: PageTap | None = None
     async with async_playwright() as playwright:
-        browser = await playwright.chromium.launch(headless=True)
+        browser = await playwright.chromium.launch(headless=True, channel=SELECT_TYPE_AHEAD_CHANNEL)
         context = await browser.new_context()
         page = await context.new_page()
         await page.set_content(
