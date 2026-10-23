@@ -229,6 +229,7 @@ from skyvern.forge.taskv3.provider_downloads import (
 )
 from skyvern.forge.taskv3.run_arms import (
     DATE_SEGMENT_AIM_FLAG,
+    DEAD_END_RETURN_FLAG,
     LOGIN_PACE_FLAG,
     resolve_run_arm,
 )
@@ -2829,6 +2830,13 @@ class ForgeAgent:
                 organization_id=task.organization_id,
                 forced=settings.TASK_V3_LOGIN_PACE,
                 properties={"workflow_permanent_id": task.workflow_permanent_id or context.workflow_permanent_id or ""},
+            )
+            await resolve_run_arm(
+                context,
+                DEAD_END_RETURN_FLAG,
+                distinct_id=task.workflow_run_id or task.task_id,
+                organization_id=task.organization_id,
+                forced=settings.TASK_V3_DEAD_END_RETURN,
             )
         page_free_validation = bool(
             task_block is not None

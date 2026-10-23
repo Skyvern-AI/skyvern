@@ -815,6 +815,7 @@ async def run_task_v3_agent_loop(
         attempts_at_hold_gate=activity.attempts_at_hold_gate,
         perceptions_at_hold_gate=activity.perceptions_at_hold_gate,
         status_at_hold_gate=activity.status_at_hold_gate,
+        dead_ends_returned=activity.dead_ends_returned,
         has_navigation_goal=has_navigation_goal,
         age_default_rendered=bool(age_default_text),
         age_default_reason=age_default_reason,
