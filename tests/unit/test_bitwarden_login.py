@@ -960,6 +960,7 @@ async def test_every_cli_step_receives_the_attempt_budget(monkeypatch: pytest.Mo
         if command[1] == "get":
             item = _cli_item()
             item["id"] = command[3]
+            item["collectionIds"] = ["coll-1"]
             return RunCommandResult(stdout=json.dumps(item), stderr="", returncode=0)
         return RunCommandResult(stdout="", stderr="", returncode=0)
 

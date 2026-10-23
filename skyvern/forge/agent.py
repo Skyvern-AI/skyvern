@@ -1322,7 +1322,7 @@ def block_credential_parameter_keys(task_block: BaseTaskBlock | None, workflow_r
 
 
 def recovery_credential_release_guard(
-    task: Task, parameter_keys: Sequence[str] | None
+    task: Task, parameter_keys: Sequence[str] | None, *, enforce_vault_sites: bool
 ) -> CredentialReleaseGuard | None:
     """Arm a workflow-owned recovery's credentials against their saved sites, as the code block arms
     its own before running; None when no credential has a site to compare against."""
@@ -1335,18 +1335,27 @@ def recovery_credential_release_guard(
     for key in parameter_keys:
         tested_url = workflow_run_context.credential_tested_urls.get(key)
         fields = workflow_run_context.get_value_or_none(key)
-        armed = False
-        if tested_url and isinstance(fields, dict):
-            for field, placeholder in fields.items():
-                if field in NON_SECRET_CREDENTIAL_FIELDS:
-                    continue
-                secret = workflow_run_context.get_original_secret_value_or_none(placeholder)
-                armed |= guard.arm(secret, tested_url, key)
-        if not armed:
+        armed = (
+            guard.arm_login(
+                [
+                    workflow_run_context.get_original_secret_value_or_none(placeholder)
+                    for field, placeholder in fields.items()
+                    if field not in NON_SECRET_CREDENTIAL_FIELDS
+                ],
+                key,
+                tested_url=tested_url,
+                vault_sites=workflow_run_context.bitwarden_login_sites.get(key),
+                enforce_vault_sites=enforce_vault_sites,
+            )
+            if isinstance(fields, dict)
+            else []
+        )
+        if not any(entry.enforced for entry in armed):
             LOG.info(
                 "taskv3_credential_release_unarmed",
                 parameter_key=key,
                 has_tested_url=bool(tested_url),
+                observed=bool(armed),
                 task_id=task.task_id,
                 workflow_run_id=task.workflow_run_id,
             )
@@ -1757,6 +1766,41 @@ def _is_transient_page_read_refusal(exc: BaseException) -> bool:
     return (
         is_target_closed_message(message) or is_content_navigating_message(message) or is_context_lost_message(message)
     )
+
+
+_BLOCK_END_DOM_TIMEOUT_SECONDS = 5.0
+
+
+async def _save_block_end_dom(browser_state: BrowserState, step: Step, task_id: str) -> None:
+    # v1's html_scrape content, once per block after the loop. One cap covers the page lookup too,
+    # which can wait on a lost-page recovery; get_content's own timeout is 300 s.
+    started = time.monotonic()
+    html: str | None = None
+    reason = "no_working_page"
+    try:
+        async with asyncio.timeout(_BLOCK_END_DOM_TIMEOUT_SECONDS):
+            page = await browser_state.get_working_page(prune_excess_pages=False)
+            if page is not None:
+                html = await SkyvernFrame(frame=page, engine_selection=browser_state.engine_selection).get_content()
+    except Exception as exc:
+        reason = type(exc).__name__
+    if html is None:
+        LOG.info(
+            "taskv3 block-end DOM skipped",
+            task_id=task_id,
+            reason=reason,
+            capture_seconds=round(time.monotonic() - started, 3),
+        )
+        return
+    with contained_effect("task_v3 block-end DOM", task_id=task_id):
+        data = html.encode("utf-8")
+        app.ARTIFACT_MANAGER.accumulate_action_html_to_archive(step=step, html_action=data)
+        LOG.info(
+            "taskv3 block-end DOM captured",
+            task_id=task_id,
+            bytes=len(data),
+            capture_seconds=round(time.monotonic() - started, 3),
+        )
 
 
 async def _settle_before_post_action_screenshot(browser_state: BrowserState) -> None:
@@ -2669,6 +2713,7 @@ class ForgeAgent:
         workflow_owned_recovery: bool = False,
         recovery_credential_parameter_keys: list[str] | None = None,
         recovery_release_parameter_keys: list[str] | None = None,
+        recovery_enforce_vault_sites: bool = True,
         recovery_code_progress: CodeProgressRecord | None = None,
     ) -> tuple[Step, Task]:
         """Run a whole task via the native Task V3 tool-loop (one persistent conversation).
@@ -3448,7 +3493,9 @@ class ForgeAgent:
         )
         release_guard = (
             recovery_credential_release_guard(
-                task, recovery_release_parameter_keys or recovery_credential_parameter_keys
+                task,
+                recovery_release_parameter_keys or recovery_credential_parameter_keys,
+                enforce_vault_sites=recovery_enforce_vault_sites,
             )
             if task_block is None and workflow_owned_recovery
             else None
@@ -3799,6 +3846,13 @@ class ForgeAgent:
             with contained_effect("task_v3 pre-submit frame persist", task_id=task.task_id):
                 async with asyncio.timeout(30):
                     await _persist_pre_submit_frames()
+        if (
+            settings.TASK_V3_BLOCK_END_DOM
+            and not page_free_validation
+            and outcome.status != "canceled"
+            and get_browser_connection_loss(browser_state) is None
+        ):
+            await _save_block_end_dom(browser_state, step, task.task_id)
         # The model's own verdict, before a completion gate or a re-ask conversion rewrote the status.
         model_verdict = outcome.model_status or outcome.converted_from or outcome.status
         LOG.info(
@@ -4288,6 +4342,7 @@ class ForgeAgent:
         workflow_owned_recovery: bool = False,
         recovery_credential_parameter_keys: list[str] | None = None,
         recovery_release_parameter_keys: list[str] | None = None,
+        recovery_enforce_vault_sites: bool = True,
         recovery_code_progress: CodeProgressRecord | None = None,
         cua_response: OpenAIResponse | None = None,
         llm_caller: LLMCaller | None = None,
@@ -4520,6 +4575,7 @@ class ForgeAgent:
                         workflow_owned_recovery=workflow_owned_recovery,
                         recovery_credential_parameter_keys=recovery_credential_parameter_keys,
                         recovery_release_parameter_keys=recovery_release_parameter_keys,
+                        recovery_enforce_vault_sites=recovery_enforce_vault_sites,
                         recovery_code_progress=recovery_code_progress,
                     )
                 finally:
@@ -4836,6 +4892,7 @@ class ForgeAgent:
                     workflow_owned_recovery=workflow_owned_recovery,
                     recovery_credential_parameter_keys=recovery_credential_parameter_keys,
                     recovery_release_parameter_keys=recovery_release_parameter_keys,
+                    recovery_enforce_vault_sites=recovery_enforce_vault_sites,
                     cua_response=cua_response_param,
                     llm_caller=llm_caller,
                     download_baseline_files=list_files_before,
@@ -4856,6 +4913,7 @@ class ForgeAgent:
                     workflow_owned_recovery=workflow_owned_recovery,
                     recovery_credential_parameter_keys=recovery_credential_parameter_keys,
                     recovery_release_parameter_keys=recovery_release_parameter_keys,
+                    recovery_enforce_vault_sites=recovery_enforce_vault_sites,
                     cua_response=cua_response_param,
                     llm_caller=llm_caller,
                     download_baseline_files=list_files_before,

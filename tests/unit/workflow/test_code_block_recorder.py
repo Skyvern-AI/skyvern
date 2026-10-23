@@ -19,6 +19,7 @@ from playwright.async_api import Error as PlaywrightError
 from playwright.async_api import Locator, Page
 from playwright.async_api import TimeoutError as PlaywrightTimeoutError
 from sqlalchemy import select
+from structlog.testing import capture_logs
 
 import skyvern.webeye.navigation as navigation_module
 from skyvern.config import settings
@@ -28,6 +29,7 @@ from skyvern.exceptions import NO_ADDRESS_RECORD_NAV_ERROR_CODE, FailedToNavigat
 from skyvern.forge import app
 from skyvern.forge.agent import ForgeAgent
 from skyvern.forge.sdk.copilot.code_block_steps import _METHOD_ACTION_TYPES
+from skyvern.forge.sdk.credential_site_policy import LoginSite
 from skyvern.forge.sdk.db.agent_db import AgentDB
 from skyvern.forge.sdk.db.models import ActionModel
 from skyvern.forge.sdk.db.utils import hydrate_action
@@ -63,6 +65,7 @@ from skyvern.forge.sdk.workflow.models.credential_release import (
     CredentialReleaseGuard,
 )
 from skyvern.forge.sdk.workflow.models.parameter import (
+    BitwardenLoginCredentialParameter,
     CredentialParameter,
     OutputParameter,
     ParameterType,
@@ -1297,6 +1300,7 @@ class FakeWorkflowRunContext:
     def __init__(self, secrets: dict[str, str] | None = None) -> None:
         self.secrets = secrets or {}
         self.credential_tested_urls: dict[str, str] = {}
+        self.bitwarden_login_sites: dict[str, list[LoginSite]] = {}
         self._failure_evidence_capture = None
 
     start_failure_evidence_capture = WorkflowRunContext.start_failure_evidence_capture
@@ -1419,10 +1423,10 @@ async def test_copilot_lineage_tracks_runtime_timeout_during_code_block_executio
     page = FakePage()
     context = FakeWorkflowRunContext()
     _patch_execute_environment(monkeypatch, page, context)
-    copilot_authored = AsyncMock(return_value=True)
+    copilot_lineage = AsyncMock(return_value=True)
     clear_field = AsyncMock()
     type_text = AsyncMock()
-    monkeypatch.setattr(CodeBlock, "_workflow_is_copilot_authored", copilot_authored)
+    monkeypatch.setattr(CodeBlock, "_workflow_copilot_lineage", copilot_lineage)
     monkeypatch.setattr("skyvern.webeye.actions.handler_utils.EventStrategyFactory.clear_field", clear_field)
     monkeypatch.setattr("skyvern.webeye.actions.handler_utils.EventStrategyFactory.type_text", type_text)
     setter_block = _make_code_block("page.set_default_timeout(8765)")
@@ -1441,7 +1445,7 @@ async def test_copilot_lineage_tracks_runtime_timeout_during_code_block_executio
 
     assert setter_result.success is True
     assert input_result.success is True
-    assert copilot_authored.await_args_list == [call(context), call(context)]
+    assert copilot_lineage.await_args_list == [call(context), call(context)]
     clear_field.assert_awaited_once_with(
         page,
         page.inner,
@@ -2508,6 +2512,17 @@ def test_a_value_shared_by_two_credentials_releases_on_either_site() -> None:
         )
 
 
+def test_an_unenforced_owner_cannot_authorize_a_value_an_enforced_owner_refuses() -> None:
+    guard = CredentialReleaseGuard(workflow_run_id="wr_x", block_label="b")
+    guard.arm("Sup3rSecretPW!", "https://one.example.com/login", "saved_credentials")
+    guard.arm("Sup3rSecretPW!", "https://two.example.net/login", "vault_login", enforced=False)
+    candidates = guard.matches("Sup3rSecretPW!")
+    with pytest.raises(CodeBlockCredentialReleaseError):
+        guard.check_release(
+            candidates[0], "https://two.example.net/login", operation="locator.fill", alternatives=candidates[1:]
+        )
+
+
 def test_a_shorter_secret_cannot_authorize_releasing_a_longer_one() -> None:
     """Two credentials sharing one value may each authorize it, but a shorter secret that merely
     appears inside the typed value is a different secret: site A's password must not ride out on
@@ -2653,6 +2668,121 @@ async def test_execute_arms_the_guard_from_a_credential_parameter(monkeypatch: p
     assert result.success is False
     assert "belongs to https://example.com" in (result.failure_reason or "")
     assert not any(call.startswith("fill:") for call in page.inner.calls)
+
+
+async def _execute_vault_login_block(
+    monkeypatch: pytest.MonkeyPatch, frame_url: str, sites: list[LoginSite], *, copilot_lineage: bool | None
+) -> tuple[BlockResult, FakePage, list[dict[str, Any]]]:
+    page = FakePage()
+    page.inner.frame_url = frame_url
+    context = FakeWorkflowRunContext()
+    context.bitwarden_login_sites = {"vault_login": sites}
+    _patch_execute_environment(monkeypatch, page, context)
+    now = datetime.now(timezone.utc)
+    vault_parameter = BitwardenLoginCredentialParameter(
+        key="vault_login",
+        bitwarden_login_credential_parameter_id="blc_test",
+        workflow_id="w_test",
+        bitwarden_client_id_aws_secret_key="unused",
+        bitwarden_client_secret_aws_secret_key="unused",
+        bitwarden_master_password_aws_secret_key="unused",
+        bitwarden_item_id="5c1d2e3f-0000-4000-8000-000000000000",
+        created_at=now,
+        modified_at=now,
+    )
+    context.values = {"vault_login": {"context": "placeholders", "password": "Sup3rSecretPW!"}}
+    monkeypatch.setattr(
+        FakeWorkflowRunContext, "get_original_secret_value_or_none", lambda self, value: value, raising=False
+    )
+    block = _make_code_block('await page.locator("#password").fill(vault_login.password)')
+    block.parameters = [vault_parameter]
+    monkeypatch.setattr(type(block), "_workflow_copilot_lineage", AsyncMock(return_value=copilot_lineage))
+    with capture_logs() as logs:
+        result = await block.execute(
+            workflow_run_id="wr_test", workflow_run_block_id="wrb_test", organization_id="o_test"
+        )
+    return result, page, logs
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("sites", "allowed_scope"),
+    [
+        pytest.param(
+            [LoginSite("https://login.example.com/account", whole_site=True)], "https://example.com", id="other-site"
+        ),
+        pytest.param([], None, id="item-with-no-checkable-site"),
+    ],
+)
+async def test_a_bitwarden_login_off_its_item_site_is_only_logged_outside_copilot_workflows(
+    monkeypatch: pytest.MonkeyPatch, sites: list[LoginSite], allowed_scope: str | None
+) -> None:
+    result, page, logs = await _execute_vault_login_block(
+        monkeypatch, "https://accounts.example.org/challenge", sites, copilot_lineage=False
+    )
+
+    assert result.success is True
+    assert any(call.startswith("fill:") for call in page.inner.calls)
+    would_refuse = [log for log in logs if log["event"] == "codeblock_credential_release_would_refuse"]
+    assert [(log["parameter_key"], log["allowed_scope"], log["actual_scope"]) for log in would_refuse] == [
+        ("vault_login", allowed_scope, "https://example.org")
+    ]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("frame_url", "sites", "copilot_lineage", "refused_for"),
+    [
+        pytest.param(
+            "https://accounts.example.org/challenge",
+            [LoginSite("https://login.example.com/account", whole_site=True)],
+            True,
+            "https://example.com",
+            id="other-site",
+        ),
+        pytest.param(
+            "https://www.example.com/sign-in",
+            [LoginSite("https://login.example.com", whole_site=False)],
+            True,
+            "https://login.example.com",
+            id="host-only-site-sibling-host",
+        ),
+        pytest.param(
+            "https://login.example.com/sign-in",
+            [LoginSite("https://login.example.com", whole_site=False)],
+            True,
+            None,
+            id="host-only-site-own-host",
+        ),
+        pytest.param(
+            "https://login.example.com/sign-in",
+            [],
+            True,
+            "no website Skyvern can check",
+            id="item-with-no-checkable-site",
+        ),
+        pytest.param(
+            "https://accounts.example.org/challenge",
+            [LoginSite("https://login.example.com/account", whole_site=True)],
+            None,
+            "https://example.com",
+            id="lineage-lookup-failed",
+        ),
+    ],
+)
+async def test_a_copilot_workflow_types_a_bitwarden_login_only_on_its_item_sites(
+    monkeypatch: pytest.MonkeyPatch,
+    frame_url: str,
+    sites: list[LoginSite],
+    copilot_lineage: bool | None,
+    refused_for: str | None,
+) -> None:
+    result, page, _ = await _execute_vault_login_block(monkeypatch, frame_url, sites, copilot_lineage=copilot_lineage)
+
+    assert result.success is (refused_for is None)
+    assert any(call.startswith("fill:") for call in page.inner.calls) is (refused_for is None)
+    if refused_for is not None:
+        assert f"belongs to {refused_for}," in (result.failure_reason or "")
 
 
 @pytest.mark.asyncio

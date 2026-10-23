@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import re
 from collections.abc import Iterable, Mapping
 from typing import Any
@@ -7,11 +8,73 @@ from urllib.parse import urlparse
 
 from skyvern.forge.sdk.browser_action_policy import canonicalize_origin
 from skyvern.forge.sdk.copilot.workflow_block_traversal import workflow_block_locations
+from skyvern.forge.sdk.workflow.models.parameter import ParameterType
 from skyvern.utils.yaml_loader import safe_load_no_dates
 
 URL_CANDIDATE_RE = re.compile(r"\b(?:https?://[^\s)>,]+|www\.[^\s)>,]+)", re.IGNORECASE)
 # The shape of every issued credential ID (see generate_credential_id).
 _ISSUED_CREDENTIAL_ID_RE = re.compile(r"cred_\d+")
+# A login in the organization's connected Bitwarden vault, named by its item id. It is never a row in the
+# credentials table, so every seam that reads one must branch on this prefix before a table or vault lookup.
+CONNECTED_VAULT_ID_PREFIX = "bwitem_"
+# The placeholders the workflow editor writes; at run time the organization's connected account is tried first.
+BITWARDEN_LOGIN_PARAMETER_SECRET_KEYS = {
+    "bitwarden_client_id_aws_secret_key": "SKYVERN_BITWARDEN_CLIENT_ID",
+    "bitwarden_client_secret_aws_secret_key": "SKYVERN_BITWARDEN_CLIENT_SECRET",
+    "bitwarden_master_password_aws_secret_key": "SKYVERN_BITWARDEN_MASTER_PASSWORD",
+}
+
+
+def connected_vault_credential_id(item_id: str) -> str:
+    return f"{CONNECTED_VAULT_ID_PREFIX}{item_id}"
+
+
+def connected_vault_item_id(credential_id: str) -> str | None:
+    if not credential_id.startswith(CONNECTED_VAULT_ID_PREFIX):
+        return None
+    return credential_id.removeprefix(CONNECTED_VAULT_ID_PREFIX)
+
+
+def bitwarden_login_parameter_credential_id(parameter: Any) -> str | None:
+    """The connected-vault id a `bitwarden_login_credential` parameter binds, else None. A missing, templated or
+    key-referencing item id still yields an id, so the binding stays visible to approval and validation."""
+    if not isinstance(parameter, dict):
+        return None
+    if str(parameter.get("parameter_type") or "").lower() != ParameterType.BITWARDEN_LOGIN_CREDENTIAL:
+        return None
+    item_id = parameter.get("bitwarden_item_id")
+    return connected_vault_credential_id(item_id.strip() if isinstance(item_id, str) else "")
+
+
+# Bitwarden identity and card bindings. Copilot lists and approves only logins, so it never adds or edits these.
+_BITWARDEN_SECRET_PARAMETER_TYPES = frozenset(
+    {ParameterType.BITWARDEN_SENSITIVE_INFORMATION.value, ParameterType.BITWARDEN_CREDIT_CARD_DATA.value}
+)
+_BITWARDEN_SECRET_BINDING_FIELDS = (
+    "bitwarden_collection_id",
+    "bitwarden_item_id",
+    "bitwarden_identity_key",
+    "bitwarden_identity_fields",
+    *BITWARDEN_LOGIN_PARAMETER_SECRET_KEYS,
+)
+
+
+def bitwarden_secret_bindings(workflow_yaml: str) -> set[str]:
+    parsed = parse_workflow_yaml(workflow_yaml) if workflow_yaml else None
+    if not isinstance(parsed, dict):
+        return set()
+    return {
+        json.dumps(
+            {
+                "parameter_type": parameter_type,
+                **{name: parameter.get(name) for name in _BITWARDEN_SECRET_BINDING_FIELDS},
+            },
+            sort_keys=True,
+        )
+        for parameter in declared_parameters(parsed)
+        if isinstance(parameter, dict)
+        and (parameter_type := str(parameter.get("parameter_type") or "").lower()) in _BITWARDEN_SECRET_PARAMETER_TYPES
+    }
 
 
 def parse_workflow_yaml(workflow_yaml: str) -> Any:
@@ -48,17 +111,22 @@ def saved_credential_ids(candidates: Iterable[str]) -> set[str]:
     return {candidate for candidate in candidates if isinstance(candidate, str) and candidate.startswith("cred_")}
 
 
-def declared_non_credential_keys(parsed: dict[str, Any]) -> set[str]:
-    """Parameter keys that are only names, so a `cred_`-prefixed key is not reported as a credential ID. A
-    key with the issued-ID shape, or one also bound as a credential value, is still reported."""
+def declared_parameters(parsed: dict[str, Any]) -> list[Any]:
     workflow_definition = parsed.get("workflow_definition")
     if not isinstance(workflow_definition, dict):
-        return set()
+        return []
     parameters = list(workflow_definition.get("parameters") or [])
     for block in workflow_blocks(parsed):
         block_parameters = block.get("parameters")
         if isinstance(block_parameters, list):
             parameters.extend(block_parameters)
+    return parameters
+
+
+def declared_non_credential_keys(parsed: dict[str, Any]) -> set[str]:
+    """Parameter keys that are only names, so a `cred_`-prefixed key is not reported as a credential ID. A
+    key with the issued-ID shape, or one also bound as a credential value, is still reported."""
+    parameters = declared_parameters(parsed)
     keys = {
         parameter["key"]
         for parameter in parameters
@@ -84,6 +152,8 @@ def credential_params(parameters: Any) -> dict[str, str]:
         workflow_parameter_type = str(parameter.get("workflow_parameter_type") or "").lower()
         if parameter_type == "credential" and isinstance(parameter.get("credential_id"), str):
             out[key] = parameter["credential_id"]
+        elif (vault_id := bitwarden_login_parameter_credential_id(parameter)) is not None:
+            out[key] = vault_id
         elif (
             parameter_type == "workflow"
             and workflow_parameter_type == "credential_id"
@@ -114,6 +184,8 @@ def credential_param_ids(parameters: Any) -> dict[str, set[str]]:
                 ids.add(parameter["credential_id"])
             if ids:
                 out[key] = ids
+        elif (vault_id := bitwarden_login_parameter_credential_id(parameter)) is not None:
+            out[key] = {vault_id}
         elif (
             parameter_type == "workflow"
             and workflow_parameter_type == "credential_id"

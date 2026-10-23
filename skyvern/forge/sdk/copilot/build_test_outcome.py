@@ -34,6 +34,7 @@ from skyvern.forge.sdk.copilot.request_policy import redact_raw_secrets_for_prom
 from skyvern.forge.sdk.copilot.run_outcome import RecordedRunOutcome
 from skyvern.forge.sdk.copilot.secret_scrub import scrub_all_registered_from_text
 from skyvern.forge.sdk.copilot.workflow_credential_utils import (
+    CONNECTED_VAULT_ID_PREFIX,
     block_credential_ids,
     credential_param_ids,
     parse_workflow_yaml,
@@ -2111,8 +2112,11 @@ def failed_block_bound_credential_ids(
         return set()
     credential_ids = block_credential_ids(code_blocks[0], credential_params_by_key)
     # A rotation pool or a fallback list picks its credential per run, out of reach here, so naming any
-    # member could send the user to edit a credential the site never saw.
-    return credential_ids if len(credential_ids) == 1 else set()
+    # member could send the user to edit a credential the site never saw. A connected Bitwarden login is
+    # edited in Bitwarden, not on the credential card.
+    if len(credential_ids) != 1 or any(item.startswith(CONNECTED_VAULT_ID_PREFIX) for item in credential_ids):
+        return set()
+    return credential_ids
 
 
 def connect_failure_from_run_blocks_result(result: Mapping[str, object]) -> BuildTestConnectFailure | None:

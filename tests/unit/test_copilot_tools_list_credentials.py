@@ -1,15 +1,44 @@
 import json
-from datetime import datetime
+from datetime import UTC, datetime
 from types import SimpleNamespace
+from typing import Any
 from unittest.mock import AsyncMock, patch
 
 import pytest
+import yaml
 
-from skyvern.forge.sdk.copilot.request_policy import RequestPolicy, resolve_credential_for_live_page
+from skyvern.exceptions import BitwardenListItemsError, BitwardenLoginError
+from skyvern.forge import app
+from skyvern.forge.sdk.copilot import credential_resolution as credential_resolution_module
+from skyvern.forge.sdk.copilot.context import record_approved_credentials_in_global_llm_context
+from skyvern.forge.sdk.copilot.request_policy import (
+    RequestPolicy,
+    _seed_prior_approved_credentials,
+    resolve_credential_for_live_page,
+)
 from skyvern.forge.sdk.copilot.tools import credentials as credentials_module
 from skyvern.forge.sdk.copilot.tools.credential_fill import _request_settled_credential
-from skyvern.forge.sdk.copilot.tools.credentials import _resolve_exact_credential, _serialize_credential
+from skyvern.forge.sdk.copilot.tools.credentials import (
+    _credential_ids_validation_error,
+    _credential_run_approval_error,
+    _list_credentials,
+    _resolve_exact_credential,
+    _serialize_credential,
+)
+from skyvern.forge.sdk.copilot.tools.guardrails import _workflow_yaml_output_policy_guardrail
 from skyvern.forge.sdk.schemas.credentials import Credential, CredentialType, TotpType
+from skyvern.forge.sdk.services.request_principal import AuthKind, RequestPrincipal
+from skyvern.forge.sdk.workflow.context_manager import WorkflowRunContext
+from skyvern.forge.sdk.workflow.models.parameter import BitwardenLoginCredentialParameter
+from tests.unit.conftest import (
+    ORG_VAULT_ACCOUNT_EMAIL,
+    ORG_VAULT_ITEM_ID,
+    ORG_VAULT_LOGIN_ID,
+    ORG_VAULT_LOGIN_PASSWORD,
+    ORG_VAULT_MASTER_PASSWORD,
+    OrgVaultFake,
+    org_vault_overview,
+)
 
 SECRET_MARKER = "SECRET_VALUE"
 
@@ -375,3 +404,270 @@ async def test_saved_workflow_selection_resolves_but_a_canvas_proposal_does_not(
     data = await _resolve(credential.name, policy, [credential])
     assert data["status"] == ("resolved" if saved else "denied")
     assert policy.current_turn_named_credential_ids == set()
+
+
+async def _list(policy: RequestPolicy, saved: list[Credential], page: int = 1, page_size: int = 10) -> dict[str, Any]:
+    ctx = SimpleNamespace(organization_id="o_test_org", request_policy=policy)
+    with patch.object(credentials_module, "load_credentials", AsyncMock(return_value=saved)):
+        return await _list_credentials({"page": page, "page_size": page_size}, ctx)
+
+
+async def _resolve_vault(reference: str, policy: RequestPolicy) -> dict[str, Any]:
+    ctx = SimpleNamespace(organization_id="o_test_org", request_policy=policy)
+    with patch.object(credentials_module, "load_credentials", AsyncMock(return_value=[])):
+        return await _resolve_exact_credential(reference, ctx)
+
+
+@pytest.mark.asyncio
+async def test_discovery_pages_connected_vault_logins_beside_saved_credentials_without_their_binding(
+    org_vault: OrgVaultFake,
+) -> None:
+    card = org_vault_overview(
+        item_id="5c1d2e3f-0000-4000-8000-000000000001", credential_type=CredentialType.CREDIT_CARD
+    )
+    second = org_vault_overview(item_id="5c1d2e3f-0000-4000-8000-000000000002", title="Second portal")
+    org_vault.listing.return_value = [org_vault_overview(), card, second]
+
+    first_page = await _list(RequestPolicy(), [_password_credential()], page_size=1)
+    second_page = await _list(RequestPolicy(), [], page=2, page_size=1)
+
+    data = first_page["data"]
+    assert data["connected_vault"] == {"provider": "bitwarden", "status": "connected"}
+    assert [entry["credential_id"] for entry in data["credentials"]] == ["cred_1"]
+    assert data["vault_logins"] == [
+        {"vault_login_id": ORG_VAULT_LOGIN_ID, "title": "Example portal", "site": "https://portal.example.com"}
+    ]
+    assert [entry["title"] for entry in second_page["data"]["vault_logins"]] == ["Second portal"]
+    assert second_page["data"]["has_more"] is False
+    serialized = json.dumps(first_page)
+    assert ORG_VAULT_MASTER_PASSWORD not in serialized
+    assert ORG_VAULT_ACCOUNT_EMAIL not in serialized
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("error", "reason"),
+    [
+        (BitwardenLoginError(f"Invalid master password. Confirm your email {ORG_VAULT_ACCOUNT_EMAIL}"), "login_failed"),
+        (TimeoutError(), "timeout"),
+        (BitwardenListItemsError(f"Failed to list items for {ORG_VAULT_ACCOUNT_EMAIL}"), "unreadable"),
+    ],
+)
+async def test_an_unreadable_connected_vault_is_reported_with_what_to_check_and_retried_next_call(
+    org_vault: OrgVaultFake, error: Exception, reason: str
+) -> None:
+    org_vault.listing.side_effect = error
+    policy = RequestPolicy()
+
+    result = await _list(policy, [])
+    org_vault.listing.side_effect = None
+    retried = await _list(policy, [])
+
+    vault = result["data"]["connected_vault"]
+    assert vault["status"] == "unreadable"
+    assert vault["reason"] == reason
+    assert vault["check"]
+    assert result["data"]["vault_logins"] == []
+    assert ORG_VAULT_ACCOUNT_EMAIL not in json.dumps(result)
+    assert retried["data"]["connected_vault"]["status"] == "connected"
+
+
+@pytest.mark.asyncio
+async def test_an_organization_without_a_connected_vault_says_so(org_vault: OrgVaultFake) -> None:
+    org_vault.org_token.return_value = None
+
+    result = await _list(RequestPolicy(), [_password_credential()])
+
+    assert result["data"]["connected_vault"] == {"provider": "bitwarden", "status": "not_configured"}
+    assert result["data"]["vault_logins"] == []
+    org_vault.listing.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("principal", [None, RequestPrincipal("o_test_org", AuthKind.ui_session, user_id="u_1")])
+async def test_a_folder_restricted_requester_sees_no_vault_logins_and_cannot_bind_one(
+    org_vault: OrgVaultFake, monkeypatch: pytest.MonkeyPatch, principal: RequestPrincipal | None
+) -> None:
+    org_vault.folders_restricted.return_value = True
+    monkeypatch.setattr(credential_resolution_module, "get_request_principal", lambda: principal)
+    monkeypatch.setattr(app.AGENT_FUNCTION, "accessible_credential_folder_ids", AsyncMock(return_value={"cfld_1"}))
+    policy = RequestPolicy()
+    ctx = SimpleNamespace(organization_id="o_test_org", request_policy=policy)
+
+    result = await _list(policy, [])
+    binding_error = await _credential_ids_validation_error(
+        [ORG_VAULT_LOGIN_ID], ctx, workflow_definition={"parameters": [_vault_parameter()]}
+    )
+
+    assert result["data"]["connected_vault"]["status"] == "not_available_to_user"
+    assert result["data"]["vault_logins"] == []
+    org_vault.listing.assert_not_awaited()
+    assert binding_error is not None and "not available to this user" in binding_error
+
+
+@pytest.mark.asyncio
+async def test_a_vault_login_the_user_names_by_title_returns_its_binding_and_is_approved_for_the_run(
+    org_vault: OrgVaultFake,
+) -> None:
+    policy = RequestPolicy(canonical_user_message="sign in with my Bitwarden login Example portal")
+
+    result = await _resolve_vault("Example portal", policy)
+    by_id = await _resolve_vault(ORG_VAULT_LOGIN_ID, policy)
+
+    assert result["data"]["status"] == "resolved"
+    assert result["data"]["vault_login"]["workflow_parameter"] == _vault_parameter(include_key=False)
+    assert ORG_VAULT_MASTER_PASSWORD not in json.dumps(result)
+    assert (
+        _credential_run_approval_error(
+            [ORG_VAULT_LOGIN_ID], policy, workflow_definition={"parameters": [_vault_parameter()]}
+        )
+        is None
+    )
+    assert by_id["ok"] is False and "title" in by_id["error"]
+    assert policy.named_login_not_found is False
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("title", ["bwitem_payroll", "cred_payroll"])
+async def test_a_vault_login_titled_like_an_id_resolves_by_its_title(org_vault: OrgVaultFake, title: str) -> None:
+    org_vault.listing.return_value = [org_vault_overview(title=title)]
+    policy = RequestPolicy(canonical_user_message=f"sign in with my Bitwarden login {title}")
+
+    result = await _resolve_vault(title, policy)
+
+    assert result["data"]["status"] == "resolved"
+    assert result["data"]["vault_login"]["workflow_parameter"] == _vault_parameter(include_key=False)
+
+
+@pytest.mark.asyncio
+async def test_a_vault_login_approved_on_one_turn_hydrates_on_the_next_without_listing_the_vault(
+    org_vault: OrgVaultFake,
+) -> None:
+    first_turn = RequestPolicy(canonical_user_message="use Example portal")
+    await _resolve_vault("Example portal", first_turn)
+    carried_context = record_approved_credentials_in_global_llm_context(
+        SimpleNamespace(request_policy=first_turn), None
+    )
+    org_vault.listing.reset_mock()
+
+    next_turn = RequestPolicy(canonical_user_message="now run it")
+    await _seed_prior_approved_credentials(
+        next_turn, organization_id="o_test_org", global_llm_context=carried_context or ""
+    )
+
+    org_vault.listing.assert_not_awaited()
+    assert [credential.credential_id for credential in next_turn.resolved_credentials] == [ORG_VAULT_LOGIN_ID]
+    assert (
+        _credential_run_approval_error(
+            [ORG_VAULT_LOGIN_ID], next_turn, workflow_definition={"parameters": [_vault_parameter()]}
+        )
+        is None
+    )
+    assert (
+        _credential_run_approval_error(
+            ["bwitem_5c1d2e3f-0000-4000-8000-000000000001"],
+            next_turn,
+            workflow_definition={
+                "parameters": [_vault_parameter(bitwarden_item_id="5c1d2e3f-0000-4000-8000-000000000001")]
+            },
+        )
+        is not None
+    )
+
+
+@pytest.mark.asyncio
+async def test_the_returned_binding_resolves_at_run_time_through_the_organizations_own_vault_account(
+    org_vault: OrgVaultFake,
+) -> None:
+    policy = RequestPolicy(canonical_user_message="use Example portal")
+    recipe = (await _resolve_vault("Example portal", policy))["data"]["vault_login"]["workflow_parameter"]
+    now = datetime(2026, 1, 1, tzinfo=UTC)
+    parameter = BitwardenLoginCredentialParameter(
+        **{key: value for key, value in recipe.items() if key != "parameter_type"},
+        key="portal_login",
+        bitwarden_login_credential_parameter_id="blc_1",
+        workflow_id="wf-1",
+        created_at=now,
+        modified_at=now,
+    )
+    context = WorkflowRunContext(
+        workflow_title="title",
+        workflow_id="wf-1",
+        workflow_permanent_id="wfp-1",
+        workflow_run_id="wr-1",
+        aws_client=SimpleNamespace(),
+    )
+
+    await context.register_bitwarden_login_credential_parameter_value(parameter, org_vault.organization)
+
+    fetch = org_vault.secret.await_args
+    assert fetch.args[:3] == (None, None, ORG_VAULT_MASTER_PASSWORD)
+    assert fetch.kwargs["email"] == ORG_VAULT_ACCOUNT_EMAIL
+    assert fetch.kwargs["item_id"] == ORG_VAULT_ITEM_ID
+    assert fetch.kwargs["collection_id"] == "col_1"
+    assert context.secrets[context.values["portal_login"]["password"]] == ORG_VAULT_LOGIN_PASSWORD
+
+
+def _vault_login_draft(block_url: str) -> str:
+    return yaml.safe_dump(
+        {
+            "title": "Sign in",
+            "workflow_definition": {
+                "parameters": [_vault_parameter()],
+                "blocks": [
+                    {
+                        "block_type": "login",
+                        "label": "login_to_portal",
+                        "url": block_url,
+                        "parameter_keys": ["portal_login"],
+                    }
+                ],
+            },
+        }
+    )
+
+
+def _guardrail_reason_codes(policy: RequestPolicy, workflow_yaml: str) -> list[str]:
+    tool_context = SimpleNamespace(
+        tool_name="update_workflow",
+        tool_call_id="call_1",
+        tool_arguments=json.dumps({"workflow_yaml": workflow_yaml}),
+        context=SimpleNamespace(request_policy=policy),
+    )
+    output = _workflow_yaml_output_policy_guardrail(SimpleNamespace(context=tool_context))  # type: ignore[arg-type]
+    return output.output_info["reason_codes"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("looked_up", "block_url", "reason_codes"),
+    [
+        pytest.param(True, "https://portal.example.com/login", [], id="own-site"),
+        pytest.param(True, "https://other.example.org/login", ["connected_vault_login_off_site"], id="off-site"),
+        pytest.param(
+            False, "https://portal.example.com/login", ["connected_vault_login_sites_unread"], id="not-looked-up"
+        ),
+    ],
+)
+async def test_a_vault_login_draft_passes_the_input_guardrail_only_on_a_site_its_lookup_read(
+    org_vault: OrgVaultFake, looked_up: bool, block_url: str, reason_codes: list[str]
+) -> None:
+    policy = RequestPolicy(canonical_user_message="sign in with Example portal")
+    if looked_up:
+        resolved = await _resolve_vault("Example portal", policy)
+        assert resolved["data"]["vault_login"]["sites"] == ["https://portal.example.com"]
+        assert resolved["data"]["vault_login"]["workflow_parameter"] == _vault_parameter(include_key=False)
+
+    assert _guardrail_reason_codes(policy, _vault_login_draft(block_url)) == reason_codes
+
+
+def _vault_parameter(*, include_key: bool = True, bitwarden_item_id: str = ORG_VAULT_ITEM_ID) -> dict[str, str]:
+    parameter = {
+        "parameter_type": "bitwarden_login_credential",
+        "bitwarden_item_id": bitwarden_item_id,
+        "bitwarden_collection_id": "col_1",
+        "bitwarden_client_id_aws_secret_key": "SKYVERN_BITWARDEN_CLIENT_ID",
+        "bitwarden_client_secret_aws_secret_key": "SKYVERN_BITWARDEN_CLIENT_SECRET",
+        "bitwarden_master_password_aws_secret_key": "SKYVERN_BITWARDEN_MASTER_PASSWORD",
+    }
+    return {"key": "portal_login", **parameter} if include_key else parameter

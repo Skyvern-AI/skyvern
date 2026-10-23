@@ -38,7 +38,14 @@ from skyvern.forge.sdk.copilot.credential_pause import (
     request_credential_pause,
     signed_in_facts,
 )
-from skyvern.forge.sdk.copilot.credential_resolution import is_resolved_page_url, load_credentials, url_parts
+from skyvern.forge.sdk.copilot.credential_resolution import (
+    connected_vault_login_sites,
+    is_resolved_page_url,
+    load_connected_vault,
+    load_connected_vault_item,
+    load_credentials,
+    url_parts,
+)
 from skyvern.forge.sdk.copilot.loop_detection import record_tool_step_result_for_ctx
 from skyvern.forge.sdk.copilot.page_identity import safe_page_origin
 from skyvern.forge.sdk.copilot.request_policy import (
@@ -48,6 +55,7 @@ from skyvern.forge.sdk.copilot.request_policy import (
     SiteURLSource,
     SteerMessageSiteURLSource,
     UserMessageSiteURLSource,
+    admit_connected_vault_login_for_live_page,
     admit_credential_for_live_page,
     loggable_origin,
 )
@@ -68,11 +76,12 @@ from skyvern.forge.sdk.copilot.secret_scrub import (
     scrub_secrets_from_text,
 )
 from skyvern.forge.sdk.copilot.workflow_credential_utils import (
+    CONNECTED_VAULT_ID_PREFIX,
     saved_credential_ids,
     workflow_credential_ids,
     workflow_credential_origins,
 )
-from skyvern.forge.sdk.credential_site_policy import same_release_scope, same_site
+from skyvern.forge.sdk.credential_site_policy import LoginSite, same_release_scope, same_site
 from skyvern.forge.sdk.schemas.credentials import (
     Credential,
     CredentialItem,
@@ -185,13 +194,9 @@ def _still_on_admitted_site(current_url: str | None, admitted_url: str) -> bool:
     return bool(current_origin and admitted_origin and current_origin == admitted_origin)
 
 
-# One site policy, shared with code-block credential release.
-_same_site = same_site
-
-
 def _within_grant(current_url: str | None, grant: _CredentialFillOriginGrant) -> bool:
     if grant.whole_site:
-        return _same_site(current_url, grant.intended_url)
+        return same_release_scope(current_url, grant.intended_url)
     return _still_on_admitted_site(current_url, grant.intended_url)
 
 
@@ -299,8 +304,11 @@ async def _credential_evidence_admits_origin(
         return False
     if vault_sites is None:
         return False
-    evidence = ([credential.tested_url] if credential.tested_url else []) + vault_sites
-    return bool(evidence) and all(same_release_scope(url, recovery.origin) for url in evidence)
+    tested = [credential.tested_url] if credential.tested_url else []
+    return bool(tested or vault_sites) and (
+        all(same_release_scope(url, recovery.origin) for url in tested)
+        and all(site.admits(recovery.origin) for site in vault_sites)
+    )
 
 
 def _credential_submit_origin_mismatch_notice() -> str:
@@ -404,12 +412,15 @@ def _resolved_credential_intended_url(policy: RequestPolicy, credential_id: str)
     )
 
 
-async def _vault_named_sites(copilot_ctx: AgentContext, credential_id: str) -> list[str]:
+async def _vault_named_sites(copilot_ctx: AgentContext, credential_id: str) -> list[LoginSite]:
     return await _read_vault_named_sites(copilot_ctx, credential_id) or []
 
 
-async def _read_vault_named_sites(copilot_ctx: AgentContext, credential_id: str) -> list[str] | None:
+async def _read_vault_named_sites(copilot_ctx: AgentContext, credential_id: str) -> list[LoginSite] | None:
     """Sites the credential's own vault entry names (only Bitwarden items carry any), or None when the read failed."""
+    if credential_id.startswith(CONNECTED_VAULT_ID_PREFIX):
+        policy = copilot_ctx.request_policy
+        return await connected_vault_login_sites(copilot_ctx.organization_id, policy, credential_id) if policy else None
     await app.AGENT_FUNCTION.enforce_credential_use(
         copilot_ctx.organization_id,
         credential_id,
@@ -417,7 +428,7 @@ async def _read_vault_named_sites(copilot_ctx: AgentContext, credential_id: str)
     )
     cached = copilot_ctx.vault_login_uris_by_credential_id.get(credential_id)
     if cached is not None:
-        return cached
+        return [LoginSite(uri, whole_site=True) for uri in cached]
     uris: list[str] = []
     try:
         db_credential = await app.DATABASE.credentials.get_credential(
@@ -433,7 +444,7 @@ async def _read_vault_named_sites(copilot_ctx: AgentContext, credential_id: str)
         LOG.info("copilot could not read the vault entry's sites", credential_id=credential_id, exc_info=True)
         return None
     copilot_ctx.vault_login_uris_by_credential_id[credential_id] = uris
-    return uris
+    return [LoginSite(uri, whole_site=True) for uri in uris]
 
 
 def _missing_credential_origin_error(credential_id: str, page_url: str | None, *, user_named: bool = False) -> str:
@@ -455,6 +466,15 @@ def _missing_credential_origin_error(credential_id: str, page_url: str | None, *
     return (
         f"Credential `{credential_id}` cannot be filled: no live page is open. "
         "Navigate to the sign-in page first, then retry."
+    )
+
+
+def _connected_vault_login_off_site_error(credential_id: str, page_url: str) -> str:
+    origin = loggable_origin(page_url)
+    return (
+        f"`{credential_id}` is a login in the connected Bitwarden vault, and none of its saved websites covers "
+        f"{origin}, so it is not filled here. The user can add {origin} to that login's websites in Bitwarden, "
+        "or set an existing website's match detection to Base domain so it covers that site's other hosts."
     )
 
 
@@ -488,7 +508,7 @@ def _user_provided_site_url_match(policy: RequestPolicy, page_url: str) -> tuple
     registrable site to compare, so they fall back to an exact-origin match.
     """
     for url in policy.user_provided_site_urls:
-        if _same_site(page_url, url):
+        if same_site(page_url, url):
             return url, True
         if _still_on_admitted_site(page_url, url):
             return url, False
@@ -570,6 +590,14 @@ async def _update_ask_target(
 
     A missing-authenticator ask needs a credential with no one-time-code method at all. A site-rejected
     one asks whatever methods it has, since the saved values themselves were turned away."""
+    if credential_id.startswith(CONNECTED_VAULT_ID_PREFIX):
+        return None, {
+            "ok": False,
+            "error": (
+                f"`{credential_id}` is a login in the connected Bitwarden vault, which the credential card cannot "
+                "edit. The user updates it in Bitwarden."
+            ),
+        }
     policy = copilot_ctx.request_policy
     # A saved workflow's own binding, read from its row at turn start, is authority to edit that record
     # even when the chat never named it; the card grants no origin, so no fill grant is needed.
@@ -983,6 +1011,8 @@ async def _credential_fill_origin_grant(
             copilot_ctx.org_credentials_for_turn = await load_credentials(copilot_ctx.organization_id)
         return copilot_ctx.org_credentials_for_turn
 
+    if isinstance(policy, RequestPolicy) and credential_id.startswith(CONNECTED_VAULT_ID_PREFIX):
+        return await _connected_vault_login_fill_grant(copilot_ctx, policy, credential_id, load_once)
     if (
         isinstance(policy, RequestPolicy)
         and credential_id in policy.persisted_workflow_credential_ids
@@ -1011,9 +1041,12 @@ async def _credential_fill_origin_grant(
             return _CredentialFillOriginGrant(page_url), None
         # The vault entry names the site the user filed this credential under, so it answers where
         # the secret belongs without anyone having to run the test flow first.
-        if page_url and any(_same_site(page_url, uri) for uri in await _vault_named_sites(copilot_ctx, credential_id)):
+        vault_site = next(
+            (site for site in await _vault_named_sites(copilot_ctx, credential_id) if site.admits(page_url)), None
+        )
+        if page_url and vault_site is not None:
             _log_fill_grant("vault_site", page_url, credential_id)
-            return _CredentialFillOriginGrant(page_url, whole_site=True), None
+            return _CredentialFillOriginGrant(page_url, whole_site=vault_site.whole_site), None
         if page_url:
             matched_url, site_level = _user_provided_site_url_match(policy, page_url)
             if matched_url is not None:
@@ -1063,9 +1096,66 @@ async def _credential_fill_origin_grant(
     return None, admission.steer or authority_error
 
 
+async def _connected_vault_login_fill_grant(
+    copilot_ctx: AgentContext,
+    policy: RequestPolicy,
+    credential_id: str,
+    load_org_credentials: Callable[[], Awaitable[list[Credential]]],
+) -> tuple[_CredentialFillOriginGrant | None, str | None]:
+    """A vault login is placed on a site only by its own whole-site URIs: no tested URL, saved-workflow origin,
+    admitted page or chat URL stands in for them, whichever route vouches for the login itself."""
+    page_url = await _live_working_page_url(copilot_ctx) or ""
+    vouched = credential_id in policy.persisted_workflow_credential_ids or credential_id in {
+        credential.credential_id for credential in policy.resolved_credentials
+    }
+    if not vouched:
+        admission = await admit_connected_vault_login_for_live_page(
+            policy,
+            organization_id=copilot_ctx.organization_id,
+            credential_id=credential_id,
+            page_url=page_url,
+            load_org_credentials=load_org_credentials,
+        )
+        if not (admission.admitted and admission.page_url):
+            return None, _credential_fill_authority_error(copilot_ctx, credential_id)
+        _log_fill_grant("live_page_admission", admission.page_url, credential_id)
+        return _CredentialFillOriginGrant(admission.page_url, whole_site=admission.whole_site), None
+    if not page_url:
+        return None, _missing_credential_origin_error(credential_id, None)
+    sites = await connected_vault_login_sites(copilot_ctx.organization_id, policy, credential_id)
+    matched = next((site for site in sites or [] if site.admits(page_url)), None)
+    if matched is None:
+        return None, _connected_vault_login_off_site_error(credential_id, page_url)
+    _log_fill_grant("vault_site", page_url, credential_id)
+    return _CredentialFillOriginGrant(page_url, whole_site=matched.whole_site), None
+
+
+async def _load_connected_vault_item(
+    copilot_ctx: AgentContext, credential_id: str
+) -> tuple[CredentialItem | None, str]:
+    vault = await load_connected_vault(copilot_ctx.organization_id, copilot_ctx.request_policy)
+    login = vault.login(credential_id)
+    if login is None:
+        return None, (
+            f"`{credential_id}` is not a login the connected Bitwarden vault lists (vault status: {vault.status})."
+        )
+    try:
+        return await load_connected_vault_item(copilot_ctx.organization_id, login), ""
+    except Exception as exc:
+        # Bitwarden errors can quote the account email, so only the type reaches the log and the result.
+        LOG.warning(
+            "fill_credential_field could not fetch the login from the connected vault",
+            credential_id=credential_id,
+            error_type=type(exc).__name__,
+        )
+        return None, f"Could not fetch `{credential_id}` from the connected Bitwarden vault: {type(exc).__name__}."
+
+
 async def _load_vault_credential_item(
     copilot_ctx: AgentContext, credential_id: str
 ) -> tuple[CredentialItem | None, str]:
+    if credential_id.startswith(CONNECTED_VAULT_ID_PREFIX):
+        return await _load_connected_vault_item(copilot_ctx, credential_id)
     try:
         await app.AGENT_FUNCTION.enforce_credential_use(
             copilot_ctx.organization_id,

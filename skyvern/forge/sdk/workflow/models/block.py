@@ -8086,6 +8086,10 @@ async def wrapper({default_args}):
         )
 
     async def _workflow_is_copilot_authored(self, workflow_run_context: WorkflowRunContext) -> bool:
+        return await self._workflow_copilot_lineage(workflow_run_context) is True
+
+    async def _workflow_copilot_lineage(self, workflow_run_context: WorkflowRunContext) -> bool | None:
+        """Whether Copilot wrote any version of this workflow, or None when the lookup failed."""
         workflow = workflow_run_context.workflow
         if workflow is None:
             return False
@@ -8093,8 +8097,7 @@ async def wrapper({default_args}):
             return True
         # User saves re-stamp both fields with the user id, so the current version alone is
         # not durable; fall back to lineage (copilot stamps every version it writes). A lookup
-        # failure must fail closed — callers gate copilot-only behavior on this, and it must
-        # never mask a block failure.
+        # failure must never mask a block failure.
         try:
             copilot_authored = await app.DATABASE.workflows.is_workflow_copilot_authored(
                 workflow_permanent_id=workflow.workflow_permanent_id,
@@ -8106,7 +8109,7 @@ async def wrapper({default_args}):
                 "Copilot-lineage lookup failed; failing closed",
                 workflow_permanent_id=workflow.workflow_permanent_id,
             )
-            return False
+            return None
 
     async def _ai_fallback_enabled(self, workflow_run_context: WorkflowRunContext) -> bool:
         workflow = workflow_run_context.workflow
@@ -8328,6 +8331,7 @@ async def wrapper({default_args}):
                     and parameter.workflow_parameter_type.is_credential_type()
                 )
             ]
+            recovery_enforce_vault_sites = await self._workflow_copilot_lineage(workflow_run_context) is not False
 
             workflow_system_prompt = (
                 None
@@ -8495,6 +8499,7 @@ async def wrapper({default_args}):
                     workflow_owned_recovery=True,
                     recovery_credential_parameter_keys=login_credential_parameter_keys,
                     recovery_release_parameter_keys=recovery_release_parameter_keys,
+                    recovery_enforce_vault_sites=recovery_enforce_vault_sites,
                     recovery_code_progress=self._code_progress_record(
                         workflow_run_context=workflow_run_context,
                         failing_line=failing_line,
@@ -9708,6 +9713,11 @@ async def wrapper({default_args}):
             authorized_file_materializations: dict[str, AuthorizedFileMaterialization] = {}
             credential_parameter_keys: set[str] = set()
             credential_release_guard = CredentialReleaseGuard(workflow_run_id=workflow_run_id, block_label=self.label)
+            copilot_lineage = await self._workflow_copilot_lineage(workflow_run_context)
+            copilot_authored = copilot_lineage is True
+            # Editor-built vault logins are only logged off their item's sites until production counts show refusing
+            # them would not break working workflows. Unknown lineage still enforces.
+            enforce_vault_sites = copilot_lineage is not False
             sheets_read_output_keys = _sheets_read_output_keys(workflow_run_context)
             sheets_read_parameter_keys: list[str] = []
             for parameter in self.parameters:
@@ -9779,15 +9789,21 @@ async def wrapper({default_args}):
                         parameter.key, organization_id, workflow_run_id
                     )
                     parameter_values[parameter.key] = credential_namespace
-                    tested_url = workflow_run_context.credential_tested_urls.get(parameter.key)
-                    armed_any = False
-                    if tested_url:
-                        for credential_field, secret in real_secret_values.items():
-                            # card_brand and friends are stored as plain values on purpose; arming them
-                            # would refuse an ordinary off-site field that happens to read "visa".
-                            if credential_field in NON_SECRET_CREDENTIAL_FIELDS:
-                                continue
-                            armed_any |= credential_release_guard.arm(secret, tested_url, parameter.key)
+                    armed = credential_release_guard.arm_login(
+                        # card_brand and friends are stored as plain values on purpose; arming them
+                        # would refuse an ordinary off-site field that happens to read "visa".
+                        [
+                            secret
+                            for credential_field, secret in real_secret_values.items()
+                            if credential_field not in NON_SECRET_CREDENTIAL_FIELDS
+                        ],
+                        parameter.key,
+                        tested_url=workflow_run_context.credential_tested_urls.get(parameter.key),
+                        vault_sites=workflow_run_context.bitwarden_login_sites.get(parameter.key),
+                        enforce_vault_sites=enforce_vault_sites,
+                    )
+                    armed_any = any(entry.enforced for entry in armed)
+                    observed_any = any(not entry.enforced for entry in armed)
                     if not armed_any:
                         # Coverage is only measurable if the unarmed case says so: a credential with no
                         # tested_url has no release scope, so its secrets are unguarded on this path.
@@ -9795,6 +9811,7 @@ async def wrapper({default_args}):
                             "codeblock_credential_release_unarmed",
                             parameter_key=parameter.key,
                             reason="credential has no usable tested_url",
+                            observed=observed_any,
                             workflow_run_id=workflow_run_id,
                             block_label=self.label,
                         )
@@ -9852,7 +9869,7 @@ async def wrapper({default_args}):
             # Every code block gets a container task v1 + step so its recorded calls render through
             # the standard action/artifact timeline and are billable; on prompt-bearing blocks the
             # task also seats a later agent takeover on failure.
-            strategy_aware_typing = await self._workflow_is_copilot_authored(workflow_run_context)
+            strategy_aware_typing = copilot_authored
             playwright_input_defaults = playwright_input_defaults_for_page(page) if strategy_aware_typing else None
             recorder = CodeBlockActionRecording(
                 code_block=self,

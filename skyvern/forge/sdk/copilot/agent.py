@@ -4554,6 +4554,8 @@ def _copy_output_policy_verdict(verdict: OutputPolicyVerdict) -> OutputPolicyVer
 def _blocked_final_output_kind(verdict: OutputPolicyVerdict) -> CopilotOutputKind:
     clarification_reasons = {
         OutputPolicyReason.CREDENTIAL_SCOPE_BROADENED,
+        OutputPolicyReason.CONNECTED_VAULT_LOGIN_OFF_SITE,
+        OutputPolicyReason.CONNECTED_VAULT_LOGIN_SITES_UNREAD,
     }
     if any(reason in clarification_reasons for reason in verdict.reason_codes):
         return CopilotOutputKind.CLARIFICATION_REQUEST
@@ -4813,6 +4815,18 @@ def _build_output_policy_blocked_result(
             "Please use a saved credential tested for that URL, update the block URL to match the credential's "
             "tested site, or adjust the workflow to avoid using credentials. If the credential was already in this "
             "workflow without a tracked URL, re-select it so Copilot can confirm its URL scope."
+        )
+        add_saved_draft_copy = True
+    elif OutputPolicyReason.CONNECTED_VAULT_LOGIN_OFF_SITE in verdict.reason_codes:
+        user_response = (
+            "A Bitwarden login in this workflow is used on a site that isn't one of the login's saved websites. "
+            "Add that site to the login's websites in Bitwarden, or change the block URL to one of them."
+        )
+        add_saved_draft_copy = True
+    elif OutputPolicyReason.CONNECTED_VAULT_LOGIN_SITES_UNREAD in verdict.reason_codes:
+        user_response = (
+            "I couldn't read which websites a Bitwarden login in this workflow is saved for, so I didn't use it. "
+            "Check the Bitwarden connection in Settings and try again."
         )
         add_saved_draft_copy = True
     elif preserved_workflow is not None:

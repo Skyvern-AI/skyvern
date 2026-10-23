@@ -2247,6 +2247,31 @@ async def test_a_totp_code_is_judged_on_the_page_it_is_typed_into_after_the_wind
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("enforced", "whole_site", "page_url", "refused"),
+    [
+        (False, True, "https://phisher-signin.net/mfa", False),
+        (True, False, "https://accounts.portal-example.com/mfa", True),
+    ],
+    ids=["log-only-login-off-site", "host-only-login-on-sibling-host"],
+)
+async def test_a_vault_logins_totp_code_keeps_the_logins_own_scope(
+    monkeypatch: pytest.MonkeyPatch, enforced: bool, whole_site: bool, page_url: str, refused: bool
+) -> None:
+    guard = CredentialReleaseGuard(workflow_run_id="wr_totp", block_label="sign_in")
+    assert guard.arm("BW_TOTP", "https://login.portal-example.com", "login", enforced=enforced, whole_site=whole_site)
+    with _credential_totp_run(
+        monkeypatch, seed=_TOTP_SEED, guard=guard, page_url=page_url, window_wait=lambda _page: None
+    ) as run:
+        if refused:
+            with pytest.raises(CodeBlockCredentialReleaseError):
+                await _tool(run.tools, "type").handler({"selector": "#otp", "text": _TOTP_PLACEHOLDER})
+        else:
+            await _tool(run.tools, "type").handler({"selector": "#otp", "text": _TOTP_PLACEHOLDER})
+    assert run.state.values_delivered == (0 if refused else 1)
+
+
+@pytest.mark.asyncio
 async def test_a_totp_placeholder_on_the_credentials_own_site_still_enters_a_code(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

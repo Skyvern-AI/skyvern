@@ -51,7 +51,6 @@ from skyvern.forge.sdk.services.credentials import (
     is_unresolved_totp_placeholder,
 )
 from skyvern.forge.sdk.workflow.models.credential_release import (
-    ArmedSecret,
     CredentialReleaseGuard,
     release_target_url,
 )
@@ -13348,7 +13347,7 @@ def build_browser_tools(
             return
         # Re-keyed to the code: check_release groups owners by secret value, so marker-valued
         # alternatives would form a second group that must be authorized on its own.
-        entries = [ArmedSecret(code, entry.allowed_url, parameter_key) for entry in owned]
+        entries = [dataclasses.replace(entry, secret_value=code) for entry in owned]
         credential_release_guard.check_release(
             entries[0],
             await _field_release_url(page, selector),

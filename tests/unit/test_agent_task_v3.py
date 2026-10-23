@@ -40,6 +40,7 @@ from skyvern.forge.agent_functions import AgentFunction
 from skyvern.forge.sdk.artifact.manager import ArtifactManager
 from skyvern.forge.sdk.core import skyvern_context
 from skyvern.forge.sdk.core.skyvern_context import EnrichTreeMode, SkyvernContext
+from skyvern.forge.sdk.credential_site_policy import LoginSite
 from skyvern.forge.sdk.db.enums import TaskType, WorkflowRunTriggerType
 from skyvern.forge.sdk.db.exceptions import NotFoundError
 from skyvern.forge.sdk.db.utils import hydrate_action
@@ -186,8 +187,11 @@ async def _run_execute_task_v3(
     # Leave the credential-TOTP candidate gate reading the real workflow-run context.
     real_credential_totp_candidate: bool = False,
     llm_caller_factory: Any = None,
+    # Off by default: the block-end DOM adds one get_working_page call after the loop.
+    block_end_dom: bool = False,
     **task_overrides: Any,
 ) -> tuple[Step, Any, AsyncMock, AsyncMock]:
+    monkeypatch.setattr(settings, "TASK_V3_BLOCK_END_DOM", block_end_dom)
     agent = ForgeAgent()
     now = datetime.now(UTC)
     organization = make_organization(now)
@@ -353,6 +357,88 @@ async def _run_execute_task_v3(
     loop_mock.update_task_kwargs = agent.update_task.await_args.kwargs if agent.update_task.await_args else {}
     loop_mock.get_own_block_mock = get_own_block_mock
     return out_step, out_task, loop_mock, post_step_mock
+
+
+class _ContentPage:
+    url = "https://example.test/done"
+
+    def __init__(self, content: Callable[[], Awaitable[str]]) -> None:
+        self.content = content
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(("status", "saved"), [("completed", True), ("canceled", False)])
+async def test_v3_block_saves_one_end_of_block_dom_unless_canceled(
+    monkeypatch: pytest.MonkeyPatch, status: str, saved: bool
+) -> None:
+    async def _content() -> str:
+        return "<html><body>final page</body></html>"
+
+    accumulate = MagicMock()
+    monkeypatch.setattr("skyvern.forge.agent.app.ARTIFACT_MANAGER.accumulate_action_html_to_archive", accumulate)
+
+    step, _task, _loop, _post = await _run_execute_task_v3(
+        monkeypatch,
+        LoopOutcome(status=status, reason="done", billable_actions=[]),
+        working_page=_ContentPage(_content),
+        block_end_dom=True,
+        data_extraction_goal=None,
+        extracted_information_schema=None,
+    )
+
+    saved_html = [call.kwargs["html_action"] for call in accumulate.call_args_list]
+    assert saved_html == ([b"<html><body>final page</body></html>"] if saved else [])
+    if saved:
+        assert accumulate.call_args.kwargs["step"].step_id == step.step_id
+
+
+@pytest.mark.asyncio
+async def test_a_failing_end_of_block_dom_write_does_not_fail_the_block(monkeypatch: pytest.MonkeyPatch) -> None:
+    async def _content() -> str:
+        return "<html><body>final page</body></html>"
+
+    monkeypatch.setattr(
+        "skyvern.forge.agent.app.ARTIFACT_MANAGER.accumulate_action_html_to_archive",
+        MagicMock(side_effect=RuntimeError("redaction failed")),
+    )
+
+    _step, task, _loop, _post = await _run_execute_task_v3(
+        monkeypatch,
+        LoopOutcome(status="completed", reason="done", billable_actions=[]),
+        working_page=_ContentPage(_content),
+        block_end_dom=True,
+        data_extraction_goal=None,
+        extracted_information_schema=None,
+    )
+
+    assert task.status == TaskStatus.completed
+
+
+@pytest.mark.asyncio
+async def test_a_hanging_end_of_block_dom_is_cut_at_its_cap_and_the_block_still_completes(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def _hang() -> str:
+        await asyncio.Event().wait()
+        return ""
+
+    accumulate = MagicMock()
+    monkeypatch.setattr("skyvern.forge.agent.app.ARTIFACT_MANAGER.accumulate_action_html_to_archive", accumulate)
+    monkeypatch.setattr("skyvern.forge.agent._BLOCK_END_DOM_TIMEOUT_SECONDS", 0.05)
+
+    started = time.monotonic()
+    _step, task, _loop, _post = await _run_execute_task_v3(
+        monkeypatch,
+        LoopOutcome(status="completed", reason="done", billable_actions=[]),
+        working_page=_ContentPage(_hang),
+        block_end_dom=True,
+        data_extraction_goal=None,
+        extracted_information_schema=None,
+    )
+
+    assert task.status == TaskStatus.completed
+    accumulate.assert_not_called()
+    assert time.monotonic() - started < 5
 
 
 @pytest.mark.asyncio
@@ -3699,7 +3785,7 @@ async def test_recovery_guard_refuses_the_block_credential_off_site_and_admits_i
     _stub_recovery_run_context(monkeypatch, tested_url="https://portal-example.com/login")
     task = make_task(datetime.now(UTC), make_organization(datetime.now(UTC)), workflow_run_id="wr_test")
 
-    guard = agent_module.recovery_credential_release_guard(task, ["portal_credential"])
+    guard = agent_module.recovery_credential_release_guard(task, ["portal_credential"], enforce_vault_sites=True)
 
     assert guard is not None
     armed = guard.matches("s3cret-value")
@@ -3707,6 +3793,43 @@ async def test_recovery_guard_refuses_the_block_credential_off_site_and_admits_i
     with pytest.raises(CodeBlockCredentialReleaseError):
         guard.check_release(armed[0], "https://phisher-signin.net/login", operation="taskv3.type")
     guard.check_release(armed[0], "https://accounts.portal-example.com/signin", operation="taskv3.type")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("sites", "enforced", "page_url", "refused"),
+    [
+        ([LoginSite("https://portal-example.com", whole_site=True)], True, "https://phisher-signin.net/login", True),
+        (
+            [LoginSite("https://portal-example.com", whole_site=True)],
+            True,
+            "https://accounts.portal-example.com/signin",
+            False,
+        ),
+        ([LoginSite("https://portal-example.com", whole_site=True)], False, "https://phisher-signin.net/login", False),
+        ([], True, "https://portal-example.com/login", True),
+    ],
+    ids=["copilot-off-site", "copilot-own-site", "editor-off-site-logged", "copilot-no-checkable-site"],
+)
+async def test_recovery_guard_holds_a_vault_login_to_its_items_sites(
+    monkeypatch: pytest.MonkeyPatch, sites: list[LoginSite], enforced: bool, page_url: str, refused: bool
+) -> None:
+    context = _stub_recovery_run_context(monkeypatch, tested_url=None)
+    context.bitwarden_login_sites["portal_credential"] = sites
+    task = make_task(datetime.now(UTC), make_organization(datetime.now(UTC)), workflow_run_id="wr_test")
+
+    guard = agent_module.recovery_credential_release_guard(task, ["portal_credential"], enforce_vault_sites=enforced)
+
+    assert guard is not None
+    armed = guard.matches("s3cret-value")
+    with capture_logs() as logs:
+        if refused:
+            with pytest.raises(CodeBlockCredentialReleaseError):
+                guard.check_release(armed[0], page_url, operation="taskv3.type")
+        else:
+            guard.check_release(armed[0], page_url, operation="taskv3.type")
+    would_refuse = [log for log in logs if log["event"] == "codeblock_credential_release_would_refuse"]
+    assert bool(would_refuse) is (not enforced and not refused)
 
 
 @pytest.mark.asyncio
@@ -3718,7 +3841,7 @@ async def test_recovery_guard_is_absent_when_the_credential_has_no_saved_site(
     _stub_recovery_run_context(monkeypatch, tested_url=None)
     task = make_task(datetime.now(UTC), make_organization(datetime.now(UTC)), workflow_run_id="wr_test")
 
-    assert agent_module.recovery_credential_release_guard(task, ["portal_credential"]) is None
+    assert agent_module.recovery_credential_release_guard(task, ["portal_credential"], enforce_vault_sites=True) is None
 
 
 @pytest.mark.asyncio

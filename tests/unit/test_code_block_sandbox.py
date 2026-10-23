@@ -29,6 +29,7 @@ import pytest
 from playwright.async_api import Error as PlaywrightError
 from playwright.async_api import Page
 from playwright.async_api import TimeoutError as PlaywrightTimeoutError
+from structlog.testing import capture_logs
 
 import skyvern.forge.sdk.copilot.code_block_security as code_block_security
 import skyvern.forge.sdk.workflow.models.block as block_module
@@ -3655,6 +3656,22 @@ class TestDirectPathDialogPolicyBinding:
         with pytest.raises(CodeBlockCredentialReleaseError, match="card_cvv"):
             await declare(page, "accept", "CVV: 123")
         assert dialog_handler._dialog_policies.get(page.context) is None
+
+    @pytest.mark.asyncio
+    async def test_prompt_text_carrying_a_log_only_secret_is_logged_not_refused(self) -> None:
+        page = MagicMock(spec=Page)
+        page.context = MagicMock()
+        guard = CredentialReleaseGuard(workflow_run_id="wr-1", block_label="block")
+        assert guard.arm("hunter2-long-secret", "https://accounts.example.com/login", "password", enforced=False)
+        declare = _bind_code_block_set_dialog_policy(page, guard)
+
+        with capture_logs() as logs:
+            await declare(page, "accept", "hunter2-long-secret")
+
+        would_refuse = [log for log in logs if log["event"] == "codeblock_credential_release_would_refuse"]
+        assert [log["parameter_key"] for log in would_refuse] == ["password"]
+        assert dialog_handler._dialog_policies.get(page.context) is not None
+        dialog_handler.clear_dialog_policy(page.context)
 
     @pytest.mark.parametrize("revoke_fails", [False, True])
     @pytest.mark.asyncio

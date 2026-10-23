@@ -6090,6 +6090,23 @@ def test_a_failed_sign_in_block_names_its_bound_credential_without_changing_the_
     assert _update_lever_ids(contract) == update_levers
 
 
+def test_a_failed_sign_in_on_a_connected_vault_login_offers_no_credential_card_update() -> None:
+    ctx = _ctx()
+    ctx.workflow_yaml = _sign_in_workflow_yaml(binds_credential=True).replace(
+        """    parameter_type: workflow
+    workflow_parameter_type: credential_id
+    default_value: cred_bound""",
+        """    parameter_type: bitwarden_login_credential
+    bitwarden_item_id: 0f4a3a52-6f4e-4c43-9d37-8f6f2a1c9b10""",
+    )
+
+    contract = build_diagnosis_repair_contract(
+        source_tool="update_and_run_blocks", result=_failed_sign_in_result(), ctx=ctx
+    )
+
+    assert _update_lever_ids(contract) == []
+
+
 def test_a_failed_sign_in_on_a_bound_credential_keeps_the_code_repair_context() -> None:
     ctx = _ctx()
     ctx.block_authoring_policy = BlockAuthoringPolicy.CODE_ONLY_BROWSER

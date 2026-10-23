@@ -2125,7 +2125,8 @@ async def _answer_two_cards_with_different_logins(
                     side_effect=lambda ids, **_: [login for login in logins if login.credential_id in ids]
                 ),
                 get_credential=AsyncMock(return_value=None),
-            )
+            ),
+            organizations=SimpleNamespace(get_valid_org_auth_token=AsyncMock(return_value=None)),
         ),
     )
     ctx.stream.send = AsyncMock(
