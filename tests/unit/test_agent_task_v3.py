@@ -10,6 +10,8 @@ meters per action exactly like the step engine.
 from __future__ import annotations
 
 import asyncio
+import contextlib
+import itertools
 import json
 import time
 from collections.abc import Awaitable, Callable, Sequence
@@ -22,6 +24,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 from structlog.testing import capture_logs
 
+import skyvern.webeye.cdp_download_interceptor as cdp_module
 from skyvern.config import Settings, settings
 from skyvern.errors.errors import UserDefinedError
 from skyvern.exceptions import (
@@ -2439,7 +2442,7 @@ async def _run_execute_task_v3_download(
         AsyncMock(return_value=SimpleNamespace(status=WorkflowRunStatus.running)),
     )
 
-    captured: dict[str, Any] = {"cancel_checks": cancel_checks}
+    captured: dict[str, Any] = {"cancel_checks": cancel_checks, "browser_state": browser_state}
 
     async def _default_loop_body(**kwargs: Any) -> LoopOutcome:
         if drop_file:
@@ -2896,10 +2899,14 @@ async def test_execute_task_v3_download_settle_does_not_refinalize_once_cached(
     original_finalize = ForgeAgent._finalize_downloaded_files_for_task
     finalize_calls = 0
 
+    finalized: list[list[str]] = []
+
     async def _spy_finalize(self: ForgeAgent, *args: Any, **kwargs: Any) -> Any:
         nonlocal finalize_calls
         finalize_calls += 1
-        return await original_finalize(self, *args, **kwargs)
+        new_files = await original_finalize(self, *args, **kwargs)
+        finalized.append(new_files)
+        return new_files
 
     monkeypatch.setattr(ForgeAgent, "_finalize_downloaded_files_for_task", _spy_finalize)
 
@@ -2924,7 +2931,9 @@ async def test_execute_task_v3_download_settle_does_not_refinalize_once_cached(
 
     assert captured["listing_2"] == captured["listing_1"]
 
-    assert finalize_calls == 1
+    # A later settle may look again for files that landed since, but nothing already recorded is recorded again.
+    assert finalize_calls >= 1
+    assert sum(len(files) for files in finalized) == 1
 
 
 # ---------------------------------------------------------------------------
@@ -7797,3 +7806,386 @@ async def test_v3_download_cancellation_returns_only_after_the_provider_poll_cle
 
     assert captured["probe_reason"] is None
     assert captured["cleanup_finished_at_return"] is True
+
+
+@pytest.mark.parametrize(
+    "names", [("first.csv", "second.csv"), ("export.csv", "export.csv")], ids=["new-name", "reused-name"]
+)
+@pytest.mark.asyncio
+async def test_v3_download_records_a_file_that_lands_after_the_block_already_recorded_one(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, names: tuple[str, str]
+) -> None:
+    # A file selected after the block recorded one gets the suffix too, even under the name a rename vacated.
+    async def _loop(kwargs: dict[str, Any], captured: dict[str, Any]) -> LoopOutcome:
+        settle = kwargs["download_settle"]
+        (tmp_path / names[0]).write_bytes(b"a,b\n1,2\n")
+        captured["first"] = await settle(frozenset())
+        captured["after_first"] = sorted(p.name for p in tmp_path.iterdir())
+        (tmp_path / names[1]).write_bytes(b"c,d\n3,4\n")
+        captured["second"] = await settle(frozenset())
+        captured["again"] = await settle(frozenset())
+        return LoopOutcome(status="completed", reason=captured["again"] or "", billable_actions=["click"])
+
+    captured = await _run_execute_task_v3_download(monkeypatch, tmp_path, drop_file=False, loop_fn=_loop)
+
+    assert captured["first"] == "download completed (1 new file(s))"
+    assert captured["second"] == captured["again"] == "download completed (2 new file(s))"
+    files = sorted(p.name for p in tmp_path.iterdir())
+    assert len(files) == 2 and all(name.startswith("invoice") for name in files), files
+    assert set(captured["after_first"]) <= set(files)
+    assert sorted(p.read_bytes() for p in tmp_path.iterdir()) == [b"a,b\n1,2\n", b"c,d\n3,4\n"]
+
+
+@pytest.mark.asyncio
+async def test_v3_download_a_listing_failure_never_skips_or_repeats_recording_a_later_file(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    original_finalize = ForgeAgent._finalize_downloaded_files_for_task
+    original_listing = agent_module.list_files_in_directory
+    finalized: list[list[str]] = []
+    armed = {"listing_fails": False}
+
+    async def _spy_finalize(self: ForgeAgent, *args: Any, **kwargs: Any) -> Any:
+        new_files = await original_finalize(self, *args, **kwargs)
+        finalized.append(new_files)
+        if new_files and len(finalized) == 1:
+            armed["listing_fails"] = True
+        return new_files
+
+    def _listing(*args: Any, **kwargs: Any) -> Any:
+        if armed["listing_fails"]:
+            armed["listing_fails"] = False
+            raise OSError("listing unavailable")
+        return original_listing(*args, **kwargs)
+
+    monkeypatch.setattr(ForgeAgent, "_finalize_downloaded_files_for_task", _spy_finalize)
+    monkeypatch.setattr(agent_module, "list_files_in_directory", _listing)
+
+    async def _settle_allowing_failure(settle: Any) -> str | None:
+        try:
+            return await settle(frozenset())
+        except OSError:
+            return "raised"
+
+    async def _loop(kwargs: dict[str, Any], captured: dict[str, Any]) -> LoopOutcome:
+        settle = kwargs["download_settle"]
+        (tmp_path / "first.csv").write_bytes(b"a,b\n1,2\n")
+        captured["reasons"] = [await _settle_allowing_failure(settle)]
+        captured["after_first"] = sorted(p.name for p in tmp_path.iterdir())
+        (tmp_path / "second.csv").write_bytes(b"c,d\n3,4\n")
+        captured["reasons"].append(await _settle_allowing_failure(settle))
+        if captured["reasons"][-1] == "raised":
+            captured["reasons"].append(await _settle_allowing_failure(settle))
+        captured["reasons"].append(await _settle_allowing_failure(settle))
+        return LoopOutcome(status="completed", reason=captured["reasons"][-1] or "", billable_actions=["click"])
+
+    captured = await _run_execute_task_v3_download(monkeypatch, tmp_path, drop_file=False, loop_fn=_loop)
+
+    assert captured["reasons"][0] == "download completed (1 new file(s))"
+    assert captured["reasons"][-1] == "download completed (2 new file(s))", captured["reasons"]
+    names = sorted(p.name for p in tmp_path.iterdir())
+    assert len(names) == 2 and all(name.startswith("invoice") for name in names), names
+    assert set(captured["after_first"]) <= set(names)
+    assert sum(len(files) for files in finalized) == 2
+
+
+@pytest.mark.asyncio
+async def test_v3_download_records_a_later_session_file_once(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    session_files: list[str] = []
+
+    async def _session_listing(**_kwargs: Any) -> list[str]:
+        return list(session_files)
+
+    download = AsyncMock(return_value=b"x,y\n5,6\n")
+    monkeypatch.setattr("skyvern.forge.agent.app.STORAGE.list_downloaded_files_in_browser_session", _session_listing)
+    monkeypatch.setattr(agent_module, "get_aws_client", lambda: SimpleNamespace(download_file=download))
+
+    async def _loop(kwargs: dict[str, Any], captured: dict[str, Any]) -> LoopOutcome:
+        settle = kwargs["download_settle"]
+        (tmp_path / "local.csv").write_bytes(b"a,b\n1,2\n")
+        captured["first"] = await settle(frozenset())
+        session_files.append("s3://bucket/run/late.csv")
+        captured["second"] = await settle(frozenset())
+        captured["again"] = await settle(frozenset())
+        return LoopOutcome(status="completed", reason=captured["again"] or "", billable_actions=["click"])
+
+    captured = await _run_execute_task_v3_download(
+        monkeypatch, tmp_path, drop_file=False, loop_fn=_loop, browser_session_id="pbs_1"
+    )
+
+    assert captured["first"] == "download completed (1 new file(s))"
+    assert captured["second"] == captured["again"] == "download completed (2 new file(s))"
+    assert download.await_count == 1
+    names = sorted(p.name for p in tmp_path.iterdir())
+    assert len(names) == 2 and all(name.startswith("invoice") for name in names), names
+
+
+_REPLAYED_CSV = b"account,amount\nA-1,12.50\n"
+
+
+def _replay_interceptor(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> cdp_module.CDPDownloadInterceptor:
+    monkeypatch.setattr(cdp_module, "_REPLAY_CANDIDATE_HANDLES", itertools.count(1))
+    monitor = MagicMock()
+    monitor.authorize_request.return_value = True
+    interceptor = cdp_module.CDPDownloadInterceptor(
+        output_dir=str(tmp_path), network_egress_monitor=monitor, redirect_hop_authorizer=AsyncMock()
+    )
+    context = MagicMock()
+    context.cookies = AsyncMock(return_value=[])
+    interceptor._browser_context = context
+    return interceptor
+
+
+def _replay_fetch(monkeypatch: pytest.MonkeyPatch, released: asyncio.Event | None = None) -> None:
+    async def _fetch(*_args: Any, **_kwargs: Any) -> Any:
+        if released is not None:
+            await released.wait()
+        return MagicMock(body=_REPLAYED_CSV, content_type="text/csv", filename="export.csv", status=200)
+
+    monkeypatch.setattr(cdp_module.file_api, "fetch_file_bytes", _fetch, raising=False)
+
+
+@pytest.mark.parametrize("lands", ["in-the-loop", "after-completed", "after-error", "after-cancel"])
+@pytest.mark.asyncio
+async def test_v3_download_block_saves_as_before_a_replay_admitted_before_its_hold(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, lands: str
+) -> None:
+    interceptor = _replay_interceptor(tmp_path, monkeypatch)
+    released = asyncio.Event()
+    _replay_fetch(monkeypatch, released)
+    # Admitted while no block held candidates, as a download the block's start URL begins is.
+    in_flight = asyncio.ensure_future(
+        interceptor._download_url_directly("https://site.example/export.csv", "export.csv")
+    )
+    await asyncio.sleep(0)
+    raised = {"after-error": RuntimeError("loop crashed"), "after-cancel": asyncio.CancelledError()}.get(lands)
+    seen: dict[str, Any] = {}
+
+    async def _loop(kwargs: dict[str, Any], captured: dict[str, Any]) -> LoopOutcome:
+        seen["holding_at_entry"] = interceptor._replay_candidate_mode
+        if lands == "in-the-loop":
+            released.set()
+            await in_flight
+            seen.update(held=interceptor.replay_candidates(), landed=sorted(p.name for p in tmp_path.iterdir()))
+        if raised is not None:
+            raise raised
+        return LoopOutcome(status="completed", reason="done", billable_actions=["click"])
+
+    with contextlib.suppress(RuntimeError, asyncio.CancelledError):
+        await _run_execute_task_v3_download(
+            monkeypatch, tmp_path, drop_file=False, loop_fn=_loop, download_monitor=interceptor
+        )
+    released.set()
+    await in_flight
+
+    assert seen["holding_at_entry"] is True
+    if lands == "in-the-loop":
+        assert seen["held"] == {} and seen["landed"] == ["export.csv"]
+    assert interceptor.replay_candidates() == {}
+    assert (tmp_path / "export.csv").read_bytes() == _REPLAYED_CSV
+    tally = interceptor.download_tally()
+    assert tally is not None and "capture_failed" not in tally.unsolicited_failures
+
+
+@pytest.mark.parametrize("raised", [RuntimeError("loop crashed"), asyncio.CancelledError()], ids=["error", "cancel"])
+@pytest.mark.asyncio
+async def test_v3_download_block_ends_its_hold_on_every_exit(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, raised: BaseException
+) -> None:
+    interceptor = _replay_interceptor(tmp_path, monkeypatch)
+    _replay_fetch(monkeypatch)
+
+    async def _loop(kwargs: dict[str, Any], captured: dict[str, Any]) -> LoopOutcome:
+        await interceptor._download_url_directly("https://site.example/export.csv", "export.csv")
+        captured["held"] = sorted(interceptor.replay_candidates())
+        raise raised
+
+    captured: dict[str, Any] = {}
+
+    async def _capturing_loop(kwargs: dict[str, Any], run_captured: dict[str, Any]) -> LoopOutcome:
+        try:
+            return await _loop(kwargs, run_captured)
+        finally:
+            captured.update(run_captured)
+
+    with contextlib.suppress(RuntimeError, asyncio.CancelledError):
+        await _run_execute_task_v3_download(
+            monkeypatch, tmp_path, drop_file=False, loop_fn=_capturing_loop, download_monitor=interceptor
+        )
+
+    assert captured["held"] == ["c1"]
+    assert not interceptor._replay_candidate_mode
+    # Ending the hold is not a verdict: the bytes stay held, unsaved, for a later model or the run's end.
+    assert list(interceptor.replay_candidates()) == ["c1"] and list(tmp_path.iterdir()) == []
+    # The browser's later downloads outside a hold save as before.
+    await interceptor._download_url_directly("https://site.example/export.csv", "export.csv")
+    assert (tmp_path / "export.csv").read_bytes() == _REPLAYED_CSV
+
+
+@pytest.mark.asyncio
+async def test_a_block_without_complete_on_download_never_holds_replays(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    interceptor = _replay_interceptor(tmp_path, monkeypatch)
+    _replay_fetch(monkeypatch)
+
+    async def _loop(kwargs: dict[str, Any], captured: dict[str, Any]) -> LoopOutcome:
+        captured["holding"] = interceptor._replay_candidate_mode
+        await interceptor._download_url_directly("https://site.example/export.csv", "export.csv")
+        return LoopOutcome(status="completed", reason="done", billable_actions=["click"])
+
+    captured = await _run_execute_task_v3_download(
+        monkeypatch, tmp_path, drop_file=False, loop_fn=_loop, download_monitor=interceptor, complete_on_download=False
+    )
+
+    assert captured["holding"] is False
+    assert (tmp_path / "export.csv").read_bytes() == _REPLAYED_CSV
+
+
+@pytest.mark.asyncio
+async def test_v3_download_block_leaves_a_hold_it_did_not_begin(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    interceptor = _replay_interceptor(tmp_path, monkeypatch)
+    # The block runner begins the hold before navigating to the start URL, and ends it after the task is cleaned up.
+    interceptor.set_replay_candidate_mode(True)
+
+    async def _loop(kwargs: dict[str, Any], captured: dict[str, Any]) -> LoopOutcome:
+        return LoopOutcome(status="completed", reason="done", billable_actions=["click"])
+
+    await _run_execute_task_v3_download(
+        monkeypatch, tmp_path, drop_file=False, loop_fn=_loop, download_monitor=interceptor
+    )
+
+    assert interceptor._replay_candidate_mode is True
+
+
+def _replacement_page(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> tuple[Any, cdp_module.CDPDownloadInterceptor]:
+    interceptor = _replay_interceptor(tmp_path, monkeypatch)
+    page = MagicMock(context=interceptor._browser_context)
+    page.context._skyvern_cdp_download_interceptor = interceptor
+    return page, interceptor
+
+
+@pytest.mark.parametrize("raised", [None, asyncio.CancelledError()], ids=["completed", "cancel"])
+@pytest.mark.asyncio
+async def test_v3_download_block_keeps_a_replacement_context_held_through_cleanup(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, raised: BaseException | None
+) -> None:
+    entry = _replay_interceptor(tmp_path, monkeypatch)
+    _replay_fetch(monkeypatch)
+    page, replacement = _replacement_page(tmp_path, monkeypatch)
+
+    async def _page() -> Any:
+        return page
+
+    captured: dict[str, Any] = {}
+
+    async def _loop(kwargs: dict[str, Any], run_captured: dict[str, Any]) -> LoopOutcome:
+        watch = taskv3_tools.DownloadFailureWatch(_page)
+        await watch.attach()
+        watch.close()
+        await replacement._download_url_directly("https://site.example/export.csv", "export.csv")
+        captured["entry_holding"] = entry._replay_candidate_mode
+        captured["held"] = sorted(replacement.replay_candidates())
+        captured["landed"] = sorted(p.name for p in tmp_path.iterdir())
+        if raised is not None:
+            raise raised
+        return LoopOutcome(status="completed", reason="done", billable_actions=["click"])
+
+    with contextlib.suppress(asyncio.CancelledError):
+        await _run_execute_task_v3_download(
+            monkeypatch, tmp_path, drop_file=False, loop_fn=_loop, download_monitor=entry
+        )
+
+    assert captured["entry_holding"] is True
+    assert captured["held"] == ["c1"] and captured["landed"] == []
+    assert not entry._replay_candidate_mode and not replacement._replay_candidate_mode
+
+
+# A replay its hold admitted, in flight at finish (the original one past the 2.5 s request settle), is offered before
+# the task is written completed; one a download timeout or cancel leaves in flight blocks completion and stays running.
+class _SkewedClock:
+    skew = 0.0
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(time, name)
+
+    def monotonic(self) -> float:
+        return time.monotonic() + self.skew
+
+
+@pytest.mark.parametrize("mode", ["original-selected", "replacement-empty", "timed-out", "canceled", "fresh-window"])
+@pytest.mark.asyncio
+async def test_a_replay_in_flight_at_finish_is_settled_before_the_task_is_written(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, mode: str
+) -> None:
+    release_after = {"original-selected": 2.6, "replacement-empty": 0.05, "fresh-window": 0.05}.get(mode)
+    selection = {"original-selected": ["c1"], "fresh-window": ["c2"]}.get(mode, [])
+    harness = {"timed-out": {"download_timeout": 0.5}, "canceled": {"cancel_after_checks": 0}}.get(mode, {})
+    if mode == "fresh-window":
+        harness = {"download_timeout": 2.0}
+    monkeypatch.setattr(agent_module, "time", clock := _SkewedClock())
+    steps = [{}, *([{}] if mode == "fresh-window" else []), {"accept_download_candidates": selection}]
+    entry = _replay_interceptor(tmp_path, monkeypatch)
+    released = asyncio.Event()
+    _replay_fetch(monkeypatch, released)
+    page, replacement = _replacement_page(tmp_path, monkeypatch)
+    target = replacement if mode == "replacement-empty" else entry
+    page.context._skyvern_cdp_download_interceptor = target
+    target._accepting_browser_downloads = True
+    finishes: list[ToolResult] = []
+
+    async def _loop(kwargs: dict[str, Any], captured: dict[str, Any]) -> LoopOutcome:
+        if mode == "replacement-empty":
+            captured["browser_state"].browser_context = page.context
+        watch = taskv3_tools.DownloadFailureWatch(AsyncMock(return_value=page))
+        finish = make_finish_tool(
+            download_settle=kwargs["download_settle"],
+            download_wait=kwargs["download_wait"],
+            download_facts=watch.facts,
+            should_cancel=kwargs["should_cancel"],
+        )
+        await watch.attach()
+        if mode == "canceled":
+            # Canceled only once finish is already waiting on the replay.
+            captured["cancel_checks"]["count"] = -(10**6)
+            asyncio.get_running_loop().call_later(0.5, captured["cancel_checks"].update, {"count": 1})
+        target._schedule_browser_download_handler({"url": "https://site.example/export.csv", "suggestedFilename": "x"})
+        if release_after is not None:
+            asyncio.get_running_loop().call_later(release_after, released.set)
+        for step, chosen in enumerate(steps):
+            if step == 1 and mode == "fresh-window":
+                # Long after the first replay's window, a new one needs 1.2 s of its own 2 s.
+                clock.skew += 10
+                released.clear()
+                target._schedule_browser_download_handler(
+                    {"url": "https://site.example/b.csv", "suggestedFilename": "x"}
+                )
+                asyncio.get_running_loop().call_later(1.2, released.set)
+            finishes.append(await finish.handler({"status": "completed", "reason": "exported", **chosen}))
+            if "Task attempt ended" in finishes[-1].content:
+                break
+        watch.close()
+        return LoopOutcome(status="completed", reason="exported", billable_actions=["click"])
+
+    captured = await _run_execute_task_v3_download(
+        monkeypatch, tmp_path, drop_file=False, loop_fn=_loop, download_monitor=entry, **harness
+    )
+    in_flight = [task for task in target._browser_download_tasks if not task.done()]
+    released.set()
+    await asyncio.gather(*target._browser_download_tasks)
+
+    contents = [f.content for f in finishes]
+    if release_after is None:
+        refusal = "could not record them" if mode == "timed-out" else "was canceled"
+        assert len(contents) == 2 and all(refusal in content for content in contents), contents
+        assert len(in_flight) == 1 and not in_flight[0].cancelled() and list(target.replay_candidates()) == ["c1"]
+        assert list(tmp_path.iterdir()) == []
+        return
+    assert "Download candidate c1 held" in contents[0], (contents, target.replay_candidates())
+    assert len(contents) == len(steps) and "Task attempt ended" in contents[-1], contents
+    assert mode != "fresh-window" or "Download candidate c2 held" in contents[1]
+    assert captured["task"].status == TaskStatus.completed
+    assert [p.read_bytes() for p in tmp_path.iterdir()] == ([_REPLAYED_CSV] if selection else [])
+    assert target.replay_candidates() == {}

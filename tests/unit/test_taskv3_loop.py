@@ -13,18 +13,22 @@ import copy
 import dataclasses
 import functools
 import hashlib
+import itertools
 import json
 import random
 import re
 import subprocess
 import sys
 import time
+from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, Awaitable, Callable, Collection
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 from structlog.testing import capture_logs
 
+import skyvern.webeye.cdp_download_interceptor as cdp_module
 from skyvern.exceptions import CompletionGateTerminationError, SkyvernContextWindowExceededError, StepTerminationError
 from skyvern.forge.sdk.api.llm.exceptions import LLMContentFilteredError, LLMProviderErrorRetryableTask
 from skyvern.forge.sdk.core import skyvern_context
@@ -14581,3 +14585,289 @@ def test_every_finish_status_is_defined_on_its_own_in_the_tool_description() -> 
 def test_every_menu_withhold_reason_reaches_the_call_record(reason: str) -> None:
     result = ToolResult.ok("menu", data={"menu_note": "withheld", "menu_rows": 3, "withhold_reason": reason})
     assert loop_module._menu_note_record_fields("click", result).get("withhold_reason") == reason
+
+
+_EXPORT_CSV = b"account,amount\nA-1,12.50\n"
+
+
+def _candidate_interceptor(output_dir: Path, monkeypatch: pytest.MonkeyPatch) -> cdp_module.CDPDownloadInterceptor:
+    # Handles are process-wide; a fresh sequence lets the script name the first candidate.
+    monkeypatch.setattr(cdp_module, "_REPLAY_CANDIDATE_HANDLES", itertools.count(1))
+    monitor = MagicMock()
+    monitor.authorize_request.return_value = True
+    interceptor = cdp_module.CDPDownloadInterceptor(
+        output_dir=str(output_dir), network_egress_monitor=monitor, redirect_hop_authorizer=AsyncMock()
+    )
+    context = MagicMock()
+    context.cookies = AsyncMock(return_value=[])
+    interceptor._browser_context = context
+    interceptor.set_replay_candidate_mode(True)
+    return interceptor
+
+
+async def _replay_into(interceptor: cdp_module.CDPDownloadInterceptor, body: bytes = _EXPORT_CSV) -> None:
+    response = MagicMock(body=body, content_type="text/csv", filename="export.csv", status=200)
+    with patch.object(cdp_module.file_api, "fetch_file_bytes", AsyncMock(return_value=response), create=True):
+        await interceptor._download_url_directly("https://site.example/export.csv", "export.csv")
+
+
+async def _no_settle(_staged: frozenset[str]) -> str | None:
+    return None
+
+
+def _candidate_facts(interceptor: cdp_module.CDPDownloadInterceptor) -> DownloadFailureFacts:
+    return DownloadFailureFacts(
+        held_candidates=interceptor.replay_candidates, resolve_candidates=interceptor.resolve_replay_candidates
+    )
+
+
+def _finish_contents(outcome: Any) -> list[str]:
+    return [m["content"] for m in outcome.messages if m.get("role") == "tool" and m.get("name") == "finish"]
+
+
+@pytest.mark.asyncio
+async def test_a_candidate_that_arrives_during_the_final_settle_is_offered_before_the_block_ends(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    interceptor = _candidate_interceptor(tmp_path, monkeypatch)
+    settles = 0
+
+    async def settle(_staged: frozenset[str]) -> str | None:
+        nonlocal settles
+        settles += 1
+        if settles == 1:
+            await _replay_into(interceptor)
+        return "download completed (1 new file(s))" if any(tmp_path.iterdir()) else None
+
+    plain = ("finish", {"status": "completed", "reason": "exported"})
+    accept = ("finish", {"status": "completed", "reason": "exported", "accept_download_candidates": ["c1"]})
+    outcome, _ = await _run(
+        [[plain], [accept]],
+        [make_finish_tool(download_settle=settle, download_facts=_candidate_facts(interceptor))],
+    )
+
+    finishes = _finish_contents(outcome)
+    assert outcome.status == "completed"
+    assert len(finishes) == 2 and "Download candidate c1" in finishes[0], finishes
+    assert (tmp_path / "export.csv").read_bytes() == _EXPORT_CSV
+
+
+@pytest.mark.asyncio
+async def test_a_selected_candidate_that_fails_to_save_holds_the_finish(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    interceptor = _candidate_interceptor(tmp_path, monkeypatch)
+    await _replay_into(interceptor)
+
+    accept = ("finish", {"status": "completed", "reason": "exported", "accept_download_candidates": ["c1"]})
+    none = ("finish", {"status": "completed", "reason": "nothing to save", "accept_download_candidates": []})
+    with patch.object(interceptor, "_atomically_write_bytes", side_effect=OSError("disk full")):
+        # The first selection came before c1's facts were shown, so it holds; the next one fails to save.
+        outcome, _ = await _run(
+            [[accept], [accept], [none]],
+            [make_finish_tool(download_settle=_no_settle, download_facts=_candidate_facts(interceptor))],
+        )
+
+    finishes = _finish_contents(outcome)
+    assert len(finishes) == 3, finishes
+    assert "c1" in finishes[1] and "could not be saved" in finishes[1], finishes
+    assert outcome.reason == "nothing to save"
+    assert list(tmp_path.iterdir()) == []
+
+
+@pytest.mark.asyncio
+async def test_the_provider_copy_is_read_back_before_a_selected_candidate_lands(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    interceptor = _candidate_interceptor(tmp_path, monkeypatch)
+    await _replay_into(interceptor, b'{"outcome": "error"}')
+    provider_reads: list[bool] = []
+
+    async def read_back() -> None:
+        # Whether the selected candidate's bytes were already on disk when the provider was read back.
+        provider_reads.append(not (tmp_path / "export.csv").exists())
+        (tmp_path / "provider.csv").write_bytes(_EXPORT_CSV)
+
+    async def settle(_staged: frozenset[str]) -> str | None:
+        return "download completed" if any(tmp_path.iterdir()) else None
+
+    accept = ("finish", {"status": "completed", "reason": "exported", "accept_download_candidates": ["c1"]})
+    # The first selection came before c1's facts were shown, so it holds; the provider is read again before the save.
+    outcome, _ = await _run(
+        [[accept], [accept]],
+        [
+            make_finish_tool(
+                download_settle=settle, download_wait=read_back, download_facts=_candidate_facts(interceptor)
+            )
+        ],
+    )
+
+    assert outcome.status == "completed"
+    assert provider_reads == [True, True]
+    assert sorted(p.name for p in tmp_path.iterdir()) == ["export.csv", "provider.csv"]
+
+
+@pytest.mark.asyncio
+async def test_a_late_candidate_is_offered_even_when_another_file_was_recorded(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    interceptor = _candidate_interceptor(tmp_path, monkeypatch)
+    settles = 0
+
+    async def settle(_staged: frozenset[str]) -> str | None:
+        nonlocal settles
+        settles += 1
+        if settles == 1:
+            (tmp_path / "provider.csv").write_bytes(_EXPORT_CSV)
+            await _replay_into(interceptor, b"second,file\n1,2\n")
+        return f"download completed ({len(list(tmp_path.iterdir()))} new file(s))"
+
+    plain = ("finish", {"status": "completed", "reason": "exported"})
+    accept = ("finish", {"status": "completed", "reason": "exported", "accept_download_candidates": ["c1"]})
+    outcome, _ = await _run(
+        [[plain], [accept]],
+        [make_finish_tool(download_settle=settle, download_facts=_candidate_facts(interceptor))],
+    )
+
+    finishes = _finish_contents(outcome)
+    assert outcome.status == "completed"
+    assert len(finishes) == 2 and "Download candidate c1" in finishes[0], finishes
+    assert sorted(p.name for p in tmp_path.iterdir()) == ["export.csv", "provider.csv"]
+
+
+@pytest.mark.asyncio
+async def test_selecting_a_candidate_the_block_no_longer_holds_does_not_complete(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    interceptor = _candidate_interceptor(tmp_path, monkeypatch)
+
+    stale = ("finish", {"status": "completed", "reason": "exported", "accept_download_candidates": ["c7"]})
+    none = ("finish", {"status": "completed", "reason": "nothing to save", "accept_download_candidates": []})
+    outcome, _ = await _run(
+        [[stale], [none]],
+        [make_finish_tool(download_settle=_no_settle, download_facts=_candidate_facts(interceptor))],
+    )
+
+    finishes = _finish_contents(outcome)
+    assert len(finishes) == 2 and "c7" in finishes[0], finishes
+    assert outcome.reason == "nothing to save"
+
+
+def _observe_then(*finishes: tuple[str, dict[str, Any]]) -> list[list[tuple[str, dict[str, Any]]]]:
+    return [[("observe", {})], *[[finish] for finish in finishes]]
+
+
+_OMITTED = ("finish", {"status": "completed", "reason": "exported"})
+
+
+def _held_fact_count(outcome: Any, handle: str = "c1") -> int:
+    return sum(
+        m["content"].count(f"Download candidate {handle} held") for m in outcome.messages if m.get("role") == "tool"
+    )
+
+
+# Andrew's reviews of 89c31976 and a44bc56b: unseen facts are held once while a verdict turn remains (a finish queued
+# behind the hold is skipped); after them, or on the granted final turn, the verdict stands, omitted or [].
+@pytest.mark.parametrize("same_batch", [False, True], ids=["next-turn", "same-batch"])
+@pytest.mark.parametrize("future_turns", [0, 1, 2], ids=["granted-final-turn", "one-turn-left", "two-turns-left"])
+@pytest.mark.parametrize("prefill", [{}, {"accept_download_candidates": []}], ids=["omitted", "empty"])
+@pytest.mark.parametrize("held", ["informed", "unseen", "arriving-in-settle"])
+@pytest.mark.asyncio
+async def test_a_held_candidate_is_held_once_while_a_verdict_turn_remains(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    held: str,
+    prefill: dict[str, Any],
+    future_turns: int,
+    same_batch: bool,
+) -> None:
+    interceptor = _candidate_interceptor(tmp_path, monkeypatch)
+    arriving = [held == "arriving-in-settle"]
+
+    async def settle(_staged: frozenset[str]) -> str | None:
+        if arriving[0]:
+            arriving[0] = False
+            await _replay_into(interceptor)
+        return None
+
+    if held != "arriving-in-settle":
+        await _replay_into(interceptor)
+    activity = ActivityRecency()
+    facts = _candidate_facts(interceptor)
+    if held == "informed":
+        facts.mark_shown(list(interceptor.replay_candidates().values()))
+    finish = make_finish_tool(download_settle=settle, download_facts=facts, activity=activity)
+    verdict = ("finish", {**_OMITTED[1], **prefill})
+    script = [[("observe", {})], [verdict, verdict], [verdict]] if same_batch else _observe_then(verdict, verdict)
+    tools = [_recording_tool("observe", []), finish]
+    outcome, _ = await _run(script, tools, max_turns=2 + future_turns if future_turns else 1, activity=activity)
+
+    finishes, held_once = _finish_contents(outcome), held != "informed" and future_turns > 0
+    assert outcome.status == "completed", outcome
+    assert len(finishes) == 1 + held_once * (1 + same_batch) and _held_fact_count(outcome) == held_once, finishes
+    assert not (held_once and same_batch) or finishes[1].startswith("skipped:")
+    assert "c1" in finishes[-1] and "not selected, so not saved" in finishes[-1]
+    assert list(tmp_path.iterdir()) == [] and interceptor.replay_candidates() == {}
+
+
+# A selection written in the same turn as the click, before its facts were shown, is not a verdict on them.
+@pytest.mark.parametrize("prefill", [{}, {"accept_download_candidates": []}], ids=["omitted", "prefilled-empty"])
+@pytest.mark.asyncio
+async def test_a_click_and_finish_in_one_turn_hold_once_then_complete_unsaved(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, prefill: dict[str, Any]
+) -> None:
+    interceptor = _candidate_interceptor(tmp_path, monkeypatch)
+
+    async def export(_args: dict[str, Any]) -> ToolResult:
+        await _replay_into(interceptor)
+        return ToolResult.ok("click done")
+
+    click = ToolSpec(name="click", description="click", parameters={"type": "object", "properties": {}}, handler=export)
+    finish = make_finish_tool(download_settle=_no_settle, download_facts=_candidate_facts(interceptor))
+    first = ("finish", {**_OMITTED[1], **prefill})
+    outcome, _ = await _run([[("click", {}), first], [_OMITTED], [_OMITTED]], [click, finish], max_turns=4)
+
+    finishes = _finish_contents(outcome)
+    assert outcome.status == "completed", outcome
+    assert len(finishes) == 2 and "Download candidate c1" in finishes[0], finishes
+    assert _held_fact_count(outcome) == 1
+    assert list(tmp_path.iterdir()) == []
+
+
+@pytest.mark.asyncio
+async def test_an_explicit_empty_selection_completes_and_saves_nothing(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    interceptor = _candidate_interceptor(tmp_path, monkeypatch)
+    await _replay_into(interceptor)
+
+    none = ("finish", {"status": "completed", "reason": "not the file", "accept_download_candidates": []})
+    finish = make_finish_tool(download_settle=_no_settle, download_facts=_candidate_facts(interceptor))
+    outcome, _ = await _run([[none], [none]], [finish])
+
+    # The first [] came before c1's facts were shown, so it holds; the [] after them stands.
+    assert "Download candidate c1" in _finish_contents(outcome)[0]
+    assert outcome.status == "completed" and outcome.reason == "not the file", outcome
+    assert list(tmp_path.iterdir()) == [] and interceptor.replay_candidates() == {}
+
+
+@pytest.mark.asyncio
+async def test_an_unowned_candidate_is_shown_once_then_an_omitted_selection_discards_it(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    interceptor = _candidate_interceptor(tmp_path, monkeypatch)
+    # This block's hold began after an earlier block's hold ended (epochs 1, 2, 3).
+    interceptor.set_replay_candidate_mode(False)
+    interceptor.set_replay_candidate_mode(True)
+    response = MagicMock(body=_EXPORT_CSV, content_type="text/csv", filename="export.csv", status=200)
+    with patch.object(cdp_module.file_api, "fetch_file_bytes", AsyncMock(return_value=response), create=True):
+        # Its request began during the earlier block's hold, as that block's late download does.
+        await interceptor._download_url_directly("https://site.example/export.csv", "export.csv", candidate_epoch=1)
+
+    finish = make_finish_tool(download_settle=_no_settle, download_facts=_candidate_facts(interceptor))
+    outcome, _ = await _run(_observe_then(_OMITTED, _OMITTED), [_recording_tool("observe", []), finish], max_turns=4)
+
+    finishes = _finish_contents(outcome)
+    assert outcome.status == "completed", outcome
+    assert len(finishes) == 2 and "its request began during an earlier block's hold" in finishes[0], finishes
+    assert list(tmp_path.iterdir()) == [] and interceptor.replay_candidates() == {}

@@ -45472,3 +45472,104 @@ async def test_select_combobox_reads_a_declared_sentence_row_longer_than_a_capti
     # The full value's own read admits the row; a shorter search reaching it would be a "searched" gate.
     gates = [e["gate"] for e in logs if e["event"] == "taskv3 choice match" and e["path"] == "typeahead"]
     assert gates == ["overlap"], gates
+
+
+def _replay_holding_page(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> tuple[Any, CDPDownloadInterceptor]:
+    monkeypatch.setattr(cdp_download_interceptor, "_REPLAY_CANDIDATE_HANDLES", itertools.count(1))
+    monitor = MagicMock()
+    monitor.authorize_request.return_value = True
+    interceptor = CDPDownloadInterceptor(
+        output_dir=str(tmp_path), network_egress_monitor=monitor, redirect_hop_authorizer=AsyncMock()
+    )
+    context = MagicMock()
+    context.cookies = AsyncMock(return_value=[])
+    context._skyvern_cdp_download_interceptor = interceptor
+    interceptor._browser_context = context
+    page = MagicMock()
+    page.context = context
+    reply = MagicMock(body=b"account,amount\nA-1,12.50\n", content_type="text/csv", filename="export.csv", status=200)
+    monkeypatch.setattr(
+        cdp_download_interceptor.file_api, "fetch_file_bytes", AsyncMock(return_value=reply), raising=False
+    )
+    return page, interceptor
+
+
+@pytest.mark.parametrize("run_holds", [True, False], ids=["run-held", "watch-held"])
+@pytest.mark.asyncio
+async def test_closing_the_download_watch_ends_only_a_hold_it_began(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, run_holds: bool
+) -> None:
+    page, interceptor = _replay_holding_page(tmp_path, monkeypatch)
+    interceptor.set_replay_candidate_mode(run_holds)
+    watch = DownloadFailureWatch(_fixed_page_provider(page))
+    await watch.attach()
+    if not run_holds:
+        await interceptor._download_url_directly("https://site.example/export.csv", "export.csv")
+    watch.close()
+    if run_holds:
+        # Admitted by the browser after the loop ended, while the run is still cleaning up.
+        await interceptor._download_url_directly("https://site.example/export.csv", "export.csv")
+
+    assert interceptor._replay_candidate_mode is run_holds
+    assert list(tmp_path.iterdir()) == [] and list(interceptor.replay_candidates()) == ["c1"]
+    if run_holds:
+        interceptor.set_replay_candidate_mode(False)
+        interceptor.invalidate_download_scope()
+        assert list(tmp_path.iterdir()) == [] and interceptor.replay_candidates() == {}
+    else:
+        await interceptor._download_url_directly("https://site.example/export.csv", "export.csv")
+        assert (tmp_path / "export.csv").exists()
+
+
+@pytest.mark.asyncio
+async def test_a_reconnected_download_watch_ends_only_the_hold_it_began(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    first, original = _replay_holding_page(tmp_path / "a", monkeypatch)
+    second, reconnected = _replay_holding_page(tmp_path / "b", monkeypatch)
+    original.set_replay_candidate_mode(True)
+    pages = iter([first, second])
+
+    async def _provider() -> Any:
+        return next(pages)
+
+    watch = DownloadFailureWatch(_provider)
+    await watch.attach()
+    await watch.attach()
+    assert original._replay_candidate_mode and reconnected._replay_candidate_mode
+    watch.close()
+
+    assert original._replay_candidate_mode and not reconnected._replay_candidate_mode
+
+
+@pytest.mark.asyncio
+async def test_a_replay_from_an_earlier_hold_is_offered_unowned_once_the_watch_is_attached(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    page, interceptor = _replay_holding_page(tmp_path, monkeypatch)
+    released = asyncio.Event()
+    reply = MagicMock(body=b"account,amount\nA-1,12.50\n", content_type="text/csv", filename="export.csv", status=200)
+
+    async def _slow_fetch(*_args: Any, **_kwargs: Any) -> Any:
+        await released.wait()
+        return reply
+
+    monkeypatch.setattr(cdp_download_interceptor.file_api, "fetch_file_bytes", _slow_fetch, raising=False)
+    interceptor.set_replay_candidate_mode(True)
+    in_flight = asyncio.ensure_future(
+        interceptor._download_url_directly("https://site.example/export.csv", "export.csv")
+    )
+    await asyncio.sleep(0)
+    interceptor.set_replay_candidate_mode(False)
+    watch = DownloadFailureWatch(_fixed_page_provider(page))
+    await watch.attach()
+    released.set()
+    await in_flight
+
+    assert list(tmp_path.iterdir()) == [] and list(interceptor.replay_candidates()) == ["c1"]
+    delivered = watch.facts.deliver()
+    assert any(
+        "Download candidate c1 held" in fact and "its request began during an earlier block's hold" in fact
+        for fact in delivered
+    ), delivered
+    watch.close()

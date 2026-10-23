@@ -4385,3 +4385,46 @@ async def test_parent_keyed_loss_only_blocks_an_active_owner(released: bool, mon
             assert manager.pages == {"wfr_parent": state}
             create.assert_not_awaited()
     state.get_or_create_page.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_pbs_navigation_runs_before_navigation_before_each_goto_including_the_reconnect() -> None:
+    from skyvern.exceptions import FailedToNavigateToUrl
+
+    order: list[tuple[str, object]] = []
+    stale = _stale_pbs_browser_state(
+        navigate_exc=FailedToNavigateToUrl(
+            url="https://example.com",
+            error_message="Page.goto: Connection closed while reading from the driver",
+        )
+    )
+    fresh = _fresh_pbs_browser_state()
+
+    async def stale_goto(**_kwargs: object) -> None:
+        order.append(("goto", stale))
+        raise FailedToNavigateToUrl(
+            url="https://example.com", error_message="Page.goto: Connection closed while reading from the driver"
+        )
+
+    async def fresh_goto(**_kwargs: object) -> None:
+        order.append(("goto", fresh))
+
+    stale.navigate_to_url = AsyncMock(side_effect=stale_goto)
+    fresh.navigate_to_url = AsyncMock(side_effect=fresh_goto)
+    workflow_run = make_workflow_run("wfr_pbs_hook")
+
+    with patch_browser_manager_app() as mock_app:
+        configure_browser_context_acquired_hook(mock_app)
+        mock_app.PERSISTENT_SESSIONS_MANAGER.get_browser_state = AsyncMock(side_effect=[stale, fresh])
+        mock_app.PERSISTENT_SESSIONS_MANAGER.evict_cached_browser_state = AsyncMock()
+        mock_app.PERSISTENT_SESSIONS_MANAGER.set_browser_state = AsyncMock()
+
+        result = await RealBrowserManager().get_or_create_for_workflow_run(
+            workflow_run=workflow_run,
+            url="https://example.com",
+            browser_session_id="pbs_hook",
+            before_navigation=lambda state: order.append(("hook", state)),
+        )
+
+    assert result is fresh
+    assert order == [("hook", stale), ("goto", stale), ("hook", fresh), ("goto", fresh)]
