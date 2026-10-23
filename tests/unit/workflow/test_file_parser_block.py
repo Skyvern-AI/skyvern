@@ -1435,6 +1435,9 @@ class TestPypdfLimitFallback:
                 {"content_length": 5}, {"maximum_declared_stream_length": 100}, id="stream_length_understated"
             ),
             pytest.param({}, {"page_tree_maximum_entries": 0}, id="page_tree_entries"),
+            pytest.param({}, {"array_maximum_element_count": 0}, id="array_elements"),
+            pytest.param({}, {"dictionary_maximum_element_count": 0}, id="dictionary_entries"),
+            pytest.param({}, {"stream_parsing_work_maximum_count": 0}, id="content_stream_tokens"),
             pytest.param({"cid_widths": b"[0 65535 500 65536 131071 500]"}, {}, id="cid_width_entries"),
             pytest.param({"gzip_content": True}, {"zlib_maximum_output_length": 64}, id="flate_recovery_output"),
             pytest.param(

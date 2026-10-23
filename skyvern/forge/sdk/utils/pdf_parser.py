@@ -72,9 +72,10 @@ _MIN_ISOLATED_GLYPH_SHARE = 0.6
 # shares would be measuring the wrong thing.
 _MIN_ASCII_LETTER_SHARE = 0.5
 # pypdf raises one LimitReachedError class for every limit, sometimes re-raised as PdfReadError, so only the raising
-# frame tells a size cap from a structural limit pdfminer reads safely. Any limit in the filter modules is a size cap
-# unless carved out below, so one a later pypdf adds fails closed; the frames after the carve-outs are the other caps
-# pdfminer lacks: a content array, a ToUnicode range, CID widths and an eager page tree.
+# frame (as of pypdf 6.21, the floor in pyproject.toml) tells a size cap from a structural limit pdfminer reads safely.
+# Any limit in the filter modules is a size cap unless carved out below, so one a later pypdf adds fails closed; the
+# frames after the carve-outs are the other caps pdfminer lacks: a content array, element and token counts, a ToUnicode
+# range, CID widths and an eager page tree.
 _PYPDF_DECOMPRESSION_LIMIT_MODULES = frozenset({"pypdf.filters", "pypdf._codecs._codecs"})
 # A predictor row length pdfminer never allocates, and JBIG2, which pdfminer passes through undecoded.
 _PYPDF_STRUCTURAL_FILTER_FRAMES = frozenset(
@@ -83,10 +84,13 @@ _PYPDF_STRUCTURAL_FILTER_FRAMES = frozenset(
 _PYPDF_SIZE_LIMIT_FRAMES = frozenset(
     {
         ("pypdf.generic._data_structures", "ContentStream.__init__"),
+        ("pypdf.generic._data_structures", "ContentStream._check_limits"),
+        ("pypdf.generic._data_structures", "ArrayObject._check_limits"),
         ("pypdf.generic._data_structures", "DictionaryObject.read_from_stream"),
+        ("pypdf.generic._data_structures", "DictionaryObject._read_stream_data"),
         ("pypdf.generic._data_structures", "DictionaryObject._read_unsized_from_stream"),
         ("pypdf._cmap", "_check_mapping_size"),
-        ("pypdf._doc_common", "PdfDocCommon._flatten_page_tree_node"),
+        ("pypdf._doc_common", "PdfDocCommon._pop_next_page_tree_kid"),
     }
 )
 # These frames also enforce structural limits (token lengths, simple-font widths), so the caller tells them apart.
@@ -98,15 +102,15 @@ _PYPDF_SIZE_LIMIT_CALLS = frozenset(
         ),
         (
             ("pypdf._utils", "read_until_regex"),
-            ("pypdf.generic._data_structures", "DictionaryObject.read_from_stream"),
+            ("pypdf.generic._data_structures", "DictionaryObject._read_stream_data"),
         ),
         (
-            ("pypdf._font", "Font.__check_entry_count"),
-            ("pypdf._font", "Font._collect_cid_character_widths"),
+            ("pypdf.generic._font", "Font.__check_entry_count"),
+            ("pypdf.generic._font", "Font._collect_cid_character_widths"),
         ),
     }
 )
-_PYPDF_CID_WIDTH_RANGE_FRAME = ("pypdf._font", "Font.__check_range_length")
+_PYPDF_CID_WIDTH_RANGE_FRAME = ("pypdf.generic._font", "Font.__check_range_length")
 _PYPDF_PREDICTOR_PARAMETERS_FRAME = ("pypdf.filters", "FlateDecode._get_parameters")
 
 
