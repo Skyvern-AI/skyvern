@@ -849,6 +849,7 @@ async def test_in_process_retry_continues_after_interim_payload_failure(
         ("time", "cloud", "running", False, True),
     ],
 )
+@pytest.mark.usefixtures("public_dns")
 async def test_recovered_interim_payload_describes_target_attempt(
     interim_retry_db: AgentDB,
     monkeypatch: pytest.MonkeyPatch,
@@ -2219,6 +2220,7 @@ async def test_startup_retry_backoff_preserves_sweep_recovery_or_cancellation(
 
 
 @pytest.mark.asyncio
+@pytest.mark.usefixtures("public_dns")
 async def test_startup_retry_with_definitively_missing_token_remains_abandonable(
     interim_retry_db: AgentDB, monkeypatch: pytest.MonkeyPatch
 ) -> None:

@@ -1019,6 +1019,7 @@ async def test_an_inline_session_block_uploads_the_download_it_claimed_from_the_
 
 
 @pytest.mark.asyncio
+@pytest.mark.usefixtures("unresolvable_dns")
 async def test_a_parameter_named_after_the_attach_helper_still_wins(
     monkeypatch: pytest.MonkeyPatch, _isolated_download_path: str
 ) -> None:

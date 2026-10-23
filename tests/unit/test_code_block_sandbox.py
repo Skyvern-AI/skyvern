@@ -3118,6 +3118,7 @@ class TestCodeBlockMagicLink:
         assert fills == []
 
     @pytest.mark.asyncio
+    @pytest.mark.usefixtures("public_dns")
     async def test_anchors_created_after_at_call_time_not_run_start(self, monkeypatch: pytest.MonkeyPatch) -> None:
         from skyvern.forge.sdk.schemas.totp_codes import OTPType
         from skyvern.forge.sdk.workflow.models.block import _bind_code_block_magic_link

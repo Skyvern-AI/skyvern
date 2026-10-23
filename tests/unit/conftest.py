@@ -64,7 +64,7 @@ from skyvern.services import workflow_run_group_service as group_service
 from skyvern.webeye.utils import page as page_module
 from skyvern.webeye.utils.page import ScreenshotMode
 from tests.unit._fingerprint_expectations import FINGERPRINT_TEST_SECRET_KEY
-from tests.unit.dns_fixtures import no_env_proxy, public_dns  # noqa: F401
+from tests.unit.dns_fixtures import no_env_proxy, public_dns, unresolvable_dns  # noqa: F401
 from tests.unit.force_stub_app import start_forge_stub_app
 from tests.unit.google.conftest import mock_sheets_transport  # noqa: F401
 from tests.unit.litellm_model_registry import registered_gpt56_litellm_models
