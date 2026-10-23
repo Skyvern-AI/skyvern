@@ -67,6 +67,7 @@ def create_forge_stub_app() -> ForgeApp:
     # get_for_task is a sync lookup returning None when no browser state is registered; _LazyNamespace
     # would otherwise auto-mock it as an (awaitable) AsyncMock, breaking sync callers.
     fake_app_module.BROWSER_MANAGER.get_for_task = MagicMock(return_value=None)
+    fake_app_module.BROWSER_MANAGER.get_for_workflow_run = MagicMock(return_value=None)
     fake_app_module.PERSISTENT_SESSIONS_MANAGER = _LazyNamespace()
     # A synchronous capability check; auto-mocked, its un-awaited coroutine leaks into later tests.
     fake_app_module.PERSISTENT_SESSIONS_MANAGER.supports_evict_and_reconnect = MagicMock(return_value=False)

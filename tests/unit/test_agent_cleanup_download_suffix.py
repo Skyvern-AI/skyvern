@@ -580,6 +580,7 @@ async def test_execute_step_complete_on_download_does_not_double_finalize(tmp_pa
         mock_app.AGENT_FUNCTION.post_step_execution = AsyncMock()
         mock_app.ARTIFACT_MANAGER.flush_step_archive = AsyncMock()
         mock_app.BROWSER_MANAGER.get_for_task = MagicMock(return_value=None)
+        mock_app.BROWSER_MANAGER.get_for_workflow_run = MagicMock(return_value=None)
         mock_app.STORAGE.save_downloaded_files = AsyncMock()
         mock_app.STORAGE.list_downloaded_files_in_browser_session = AsyncMock(return_value=[])
 
@@ -710,6 +711,7 @@ async def test_execute_step_reuses_initial_download_baseline_across_recursive_st
         mock_app.AGENT_FUNCTION.post_step_execution = AsyncMock()
         mock_app.ARTIFACT_MANAGER.flush_step_archive = AsyncMock()
         mock_app.BROWSER_MANAGER.get_for_task = MagicMock(return_value=None)
+        mock_app.BROWSER_MANAGER.get_for_workflow_run = MagicMock(return_value=None)
         mock_app.BROWSER_MANAGER.get_video_artifacts = AsyncMock(return_value=[])
         mock_app.STORAGE.save_downloaded_files = AsyncMock()
         mock_app.STORAGE.list_downloaded_files_in_browser_session = AsyncMock(return_value=[])
@@ -882,6 +884,7 @@ async def test_execute_step_complete_on_download_emits_finalize_lineage(tmp_path
         mock_app.AGENT_FUNCTION.post_step_execution = AsyncMock()
         mock_app.ARTIFACT_MANAGER.flush_step_archive = AsyncMock()
         mock_app.BROWSER_MANAGER.get_for_task = MagicMock(return_value=None)
+        mock_app.BROWSER_MANAGER.get_for_workflow_run = MagicMock(return_value=None)
         mock_app.STORAGE.save_downloaded_files = AsyncMock()
         mock_app.STORAGE.list_downloaded_files_in_browser_session = AsyncMock(return_value=[])
 
@@ -1849,6 +1852,7 @@ async def test_execute_step_complete_on_download_closes_claimed_popup_before_han
         mock_app.AGENT_FUNCTION.post_step_execution = AsyncMock()
         mock_app.ARTIFACT_MANAGER.flush_step_archive = AsyncMock()
         mock_app.BROWSER_MANAGER.get_for_task = MagicMock(return_value=None)
+        mock_app.BROWSER_MANAGER.get_for_workflow_run = MagicMock(return_value=None)
         mock_app.STORAGE.save_downloaded_files = AsyncMock()
         mock_app.STORAGE.list_downloaded_files_in_browser_session = AsyncMock(return_value=[])
 
@@ -1954,6 +1958,7 @@ async def test_execute_step_no_credit_releases_deferred_dispatched_failure_reser
         mock_app.AGENT_FUNCTION.post_step_execution = AsyncMock()
         mock_app.ARTIFACT_MANAGER.flush_step_archive = AsyncMock()
         mock_app.BROWSER_MANAGER.get_for_task = MagicMock(return_value=None)
+        mock_app.BROWSER_MANAGER.get_for_workflow_run = MagicMock(return_value=None)
         mock_app.STORAGE.list_downloaded_files_in_browser_session = AsyncMock(return_value=[])
 
         await agent.execute_step(
