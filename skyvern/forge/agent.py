@@ -6272,8 +6272,8 @@ class ForgeAgent:
             # Skip sleep and post-action artifacts for page-level SCROLL to preserve
             # scroll-driven JS state. Many pages enable buttons only while scrolled to
             # bottom (e.g. T&C "Agree" buttons) and re-disable them after any delay or
-            # programmatic scroll. Sub-container scrolls (strategies 1 & 2) don't affect
-            # page position, so they keep normal sleep and artifact recording.
+            # programmatic scroll. Sub-container scrolls don't affect page position, so they
+            # keep normal sleep and artifact recording.
             is_page_level_scroll = action.action_type == ActionType.SCROLL and any(
                 r.success and isinstance(r.data, dict) and r.data.get("page_level_scroll") for r in results
             )

@@ -204,13 +204,13 @@ def integration_platform_from_user_agent(user_agent: str | None) -> str | None:
         return None
 
     value = user_agent.casefold()
-    if "zapier" in value:
+    if re.search(r"(?<![\w-])zapier(?![\w-])", value):
         return "zapier"
-    if "n8n" in value:
+    if re.search(r"(?<![\w-])n8n(?![\w-])", value):
         return "n8n"
     if value.startswith("make/") or re.search(r"\bmake\.com\b", value) or "integromat" in value:
         return "make"
-    if "workato" in value:
+    if re.search(r"(?<![\w-])workato(?![\w-])", value):
         return "workato"
     return "other"
 
