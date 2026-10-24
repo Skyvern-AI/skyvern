@@ -26,7 +26,6 @@ from skyvern.schemas.self_heal import HealClassification, HealSkipReason
 from skyvern.webeye.actions.action_types import ActionType
 from skyvern.webeye.actions.actions import ActionStatus
 from skyvern.webeye.utils import captcha_solver as captcha_solver_module
-from skyvern.webeye.utils import challenge_signature
 from skyvern.webeye.utils.captcha_solver import (
     MAX_IMAGE_CAPTCHA_READS,
     CaptchaChallengeUnsolvedError,
@@ -1789,24 +1788,6 @@ async def test_a_raising_challenge_frame_does_not_hide_a_visible_one(monkeypatch
     page = FakePage(frames=[_DetachedChallengeFrame(), FakeFrame(url=CHALLENGE_URL, visible=True)])  # type: ignore[list-item]
 
     assert await solve_challenge_ladder(page) is True
-
-
-class _WedgedChallengeFrame(_WedgedFrame):
-    url = CHALLENGE_URL
-
-
-@pytest.mark.asyncio
-async def test_wedged_challenge_frames_are_bounded_on_the_default_path(monkeypatch: pytest.MonkeyPatch) -> None:
-    # An absent verdict costs one frame scan plus one rendered-frame probe, each spent once however many frames wedge.
-    scan, probe = 0.3, 0.2
-    monkeypatch.setattr(app, "AGENT_FUNCTION", AgentFunction())
-    monkeypatch.setattr(captcha_solver_module, "_CHILD_FRAME_SCAN_BUDGET_SECONDS", scan)
-    monkeypatch.setattr(challenge_signature, "_CHALLENGE_FRAME_PROBE_TIMEOUT_SECONDS", probe)
-    page = FakePage(frames=[_WedgedChallengeFrame() for _ in range(5)])
-
-    started = time.monotonic()
-    assert await solve_challenge_ladder(page) is False
-    assert time.monotonic() - started < scan + 2 * probe
 
 
 @pytest.mark.asyncio

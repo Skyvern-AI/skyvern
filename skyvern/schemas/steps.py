@@ -26,6 +26,15 @@ class StepToolCall(BaseModel):
     billable: bool = False
 
 
+class StepPageDom(BaseModel):
+    """The page a Task V3 turn started from: stored in the turn's archive, the same as an earlier turn's stored page
+    (`artifact_id` names that copy), or skipped for `reason`."""
+
+    status: Literal["stored", "deduped", "skipped"]
+    artifact_id: str | None = None
+    reason: str | None = None
+
+
 class AgentStepOutput(BaseModel):
     """
     Output of the agent step, this is recorded in the database.
@@ -43,6 +52,7 @@ class AgentStepOutput(BaseModel):
     # Task V3 turn steps only: how long the turn's model call took (retries included) and what it called.
     llm_seconds: float | None = None
     tool_calls: list[StepToolCall] | None = None
+    page_dom: StepPageDom | None = None
 
     @model_serializer(mode="wrap")
     def serialize_model(self, handler: SerializerFunctionWrapHandler) -> dict[str, Any]:

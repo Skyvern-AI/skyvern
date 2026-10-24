@@ -634,6 +634,41 @@ describe("request-scoped authentication", () => {
     expect(headers?.get("Authorization")).toBe("Bearer token-a");
     expect(headers?.get("X-API-Key")).toBe("api-key-a");
   });
+
+  it("attaches the signed-in Bearer token alongside the ui_session key", async () => {
+    const uiSession = "oidc-ui-session-canary";
+    vi.stubGlobal(
+      "fetch",
+      vi.fn().mockResolvedValue(
+        new Response(
+          JSON.stringify({
+            token: uiSession,
+            expires_at: Math.floor(Date.now() / 1000) + 3600,
+          }),
+          { status: 200, headers: { "content-type": "application/json" } },
+        ),
+      ),
+    );
+
+    const { getClient, initializeUiSession } = await import("./AxiosClient");
+    await initializeUiSession();
+    const adapter = vi.fn<AxiosAdapter>(async (config) => ({
+      data: { ok: true },
+      status: 200,
+      statusText: "OK",
+      headers: {},
+      config,
+    }));
+    const client = await getClient(async () => "oidc-access-token-canary");
+    await client.get("/auth/capabilities", { adapter });
+
+    const headers = adapter.mock.calls[0]?.[0].headers;
+    expect(headers?.get("Authorization")).toBe(
+      "Bearer oidc-access-token-canary",
+    );
+    expect(headers?.get("X-API-Key")).toBe(uiSession);
+  });
+
   it("waits for the runtime API key before snapshotting request headers", async () => {
     const token = "scoped-boot-race-session-canary";
     let releaseMint: (response: Response) => void = () => {};

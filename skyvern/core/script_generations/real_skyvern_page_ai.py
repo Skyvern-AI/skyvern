@@ -23,6 +23,7 @@ from skyvern.forge.sdk.api.llm.api_handler_factory import (
     get_org_aware_secondary_llm_api_handler,
 )
 from skyvern.forge.sdk.api.llm.schema_validator import validate_and_fill_extraction_result
+from skyvern.forge.sdk.api.llm.utils import llm_response_log_metadata
 from skyvern.forge.sdk.cache import extraction_cache
 from skyvern.forge.sdk.core import skyvern_context
 from skyvern.forge.sdk.experimentation.llm_prompt_config import resolve_prompt_type_handler
@@ -887,9 +888,7 @@ class RealSkyvernPageAi(SkyvernPageAi):
 
             LOG.info(
                 "page.classify: LLM classification result",
-                classification=classification,
-                confidence=confidence,
-                reasoning=reasoning,
+                **llm_response_log_metadata(json_response),
             )
 
             if classification in options or classification == "UNKNOWN":
@@ -1660,7 +1659,7 @@ class RealSkyvernPageAi(SkyvernPageAi):
                 LOG.warning("ai_extract cache store failed; ignoring", exc_info=True)
 
         if context and context.script_mode:
-            LOG.debug("Extracted information", result=result)
+            LOG.debug("Extracted information", **llm_response_log_metadata(result))
         return result
 
     async def ai_validate(
@@ -1720,14 +1719,12 @@ class RealSkyvernPageAi(SkyvernPageAi):
         if not result or not isinstance(result, dict):
             LOG.error(
                 "AI locate element failed - invalid result",
-                result=result,
-                result_type=type(result).__name__,
+                **llm_response_log_metadata(result),
                 prompt=prompt_rendered,
             )
             return None
 
         element_id = result.get("element_id", None)
-        confidence = result.get("confidence_float", 0.0)
 
         xpath: str | None = None
         if element_id:
@@ -1741,17 +1738,14 @@ class RealSkyvernPageAi(SkyvernPageAi):
         if not xpath:
             LOG.error(
                 "AI locate element failed - no xpath in element data",
-                element_id=element_id,
-                result=result,
+                **llm_response_log_metadata(result),
                 prompt=prompt_rendered,
             )
             return None
 
         LOG.info(
             "AI locate element result",
-            element_id=element_id,
-            xpath=xpath,
-            confidence=confidence,
+            **llm_response_log_metadata(result),
             prompt=prompt_rendered,
         )
 
@@ -1807,25 +1801,29 @@ class RealSkyvernPageAi(SkyvernPageAi):
         )
 
         if not json_response or "inferred_actions" not in json_response:
-            LOG.warning("ai_act: failed to infer action type", prompt=prompt, response=json_response)
+            LOG.warning(
+                "ai_act: failed to infer action type",
+                prompt=prompt,
+                **llm_response_log_metadata(json_response),
+            )
             return
 
         inferred_actions = json_response.get("inferred_actions", [])
         if not inferred_actions:
-            error = json_response.get("error")
-            LOG.warning("ai_act: no action type inferred", prompt=prompt, error=error)
+            LOG.warning(
+                "ai_act: no action type inferred",
+                prompt=prompt,
+                **llm_response_log_metadata(json_response),
+            )
             return
 
         action_info = inferred_actions[0]
         action_type = action_info.get("action_type")
-        confidence = action_info.get("confidence_float", 0.0)
 
         LOG.info(
             "ai_act: inferred action type",
             prompt=prompt,
-            action_type=action_type,
-            confidence=confidence,
-            reasoning=action_info.get("reasoning"),
+            **llm_response_log_metadata(json_response),
         )
 
         if not skip_refresh:

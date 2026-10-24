@@ -140,6 +140,9 @@ def test_uvicorn_run_configuration(module_path: str) -> None:
             isinstance(keep_alive_kwarg.value, ast.Attribute)
             and keep_alive_kwarg.value.attr == "UVICORN_TIMEOUT_KEEP_ALIVE"
         ), f"{module_path} must source timeout_keep_alive from settings.UVICORN_TIMEOUT_KEEP_ALIVE"
+        ws_max_size_kwarg = next((kw for kw in node.keywords if kw.arg == "ws_max_size"), None)
+        assert ws_max_size_kwarg is not None, f"{module_path} must set the WebSocket upload message ceiling"
+        assert ast.unparse(ws_max_size_kwarg.value) == "max_file_upload_ws_message_size(settings.MAX_UPLOAD_FILE_SIZE)"
         for kw in node.keywords:
             assert kw.arg != "log_level", (
                 f"{module_path} must not pass log_level= to uvicorn.run(); it triggers "
@@ -185,7 +188,7 @@ def test_uvicorn_liveness_configuration_outlasts_cdp_input_timeout(
     pytest.fail(f"expected a uvicorn.run() call in {module_path}")
 
 
-def test_uvicorn_cli_uses_asyncio_loop() -> None:
+def test_uvicorn_cli_uses_asyncio_loop_and_upload_message_limit() -> None:
     module: ModuleType = importlib.import_module("skyvern.cli.run_commands")
     tree = ast.parse(inspect.getsource(module))
 
@@ -210,6 +213,14 @@ def test_uvicorn_cli_uses_asyncio_loop() -> None:
         assert loop_index is not None, "the Uvicorn CLI must select the stdlib asyncio loop"
         loop_value = command[loop_index + 1]
         assert isinstance(loop_value, ast.Constant) and loop_value.value == "asyncio"
+        ws_max_size_index = next(
+            (i for i, arg in enumerate(command) if isinstance(arg, ast.Constant) and arg.value == "--ws-max-size"),
+            None,
+        )
+        assert ws_max_size_index is not None, "the Uvicorn CLI must set the WebSocket upload message ceiling"
+        assert ast.unparse(command[ws_max_size_index + 1]) == (
+            "str(max_file_upload_ws_message_size(skyvern_settings.MAX_UPLOAD_FILE_SIZE))"
+        )
         return
 
     pytest.fail("expected a Uvicorn CLI subprocess")

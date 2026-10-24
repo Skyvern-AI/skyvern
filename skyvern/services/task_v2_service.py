@@ -37,6 +37,7 @@ from skyvern.forge.sdk.api.llm.custom_llm_registry import (
     ensure_custom_llm_model_registered_for_org,
 )
 from skyvern.forge.sdk.api.llm.exceptions import EmptyLLMResponseError, InvalidLLMResponseFormat
+from skyvern.forge.sdk.api.llm.utils import llm_response_log_metadata
 from skyvern.forge.sdk.artifact.models import ArtifactType
 from skyvern.forge.sdk.core import skyvern_context
 from skyvern.forge.sdk.core.hashing import generate_url_hash
@@ -513,7 +514,7 @@ async def initialize_task_v2_metadata(
     )
 
     # validate
-    LOG.info(f"Initialized task v2 initial response: {metadata_response}")
+    LOG.info("Initialized task v2 initial response", **llm_response_log_metadata(metadata_response))
     url: str = user_url or metadata_response.get("url", "")
     if not url:
         raise UrlGenerationFailure()
@@ -1086,7 +1087,7 @@ async def run_task_v2_helper(
             )
             LOG.info(
                 "Task v2 response",
-                task_v2_response=task_v2_response,
+                **llm_response_log_metadata(task_v2_response),
                 iteration=i,
                 current_url=current_url,
                 workflow_run_id=workflow_run_id,
@@ -1161,12 +1162,12 @@ async def run_task_v2_helper(
                 return workflow, workflow_run, task_v2
 
             if not plan:
-                LOG.warning("No plan found in task v2 response", task_v2_response=task_v2_response)
+                LOG.warning("No plan found in task v2 response", **llm_response_log_metadata(task_v2_response))
                 continue
 
             # parse task v2 response and run the next task
             if not task_type:
-                LOG.error("No task type found in task v2 response", task_v2_response=task_v2_response)
+                LOG.error("No task type found in task v2 response", **llm_response_log_metadata(task_v2_response))
                 task_v2 = await mark_task_v2_as_failed(
                     task_v2_id=task_v2_id,
                     workflow_run_id=workflow_run_id,
@@ -1424,10 +1425,10 @@ async def run_task_v2_helper(
             )
             LOG.info(
                 "Task v2 completion check response",
-                completion_resp=completion_resp,
+                **llm_response_log_metadata(completion_resp),
                 iteration=i,
                 workflow_run_id=workflow_run_id,
-                task_history=task_history,
+                task_history_count=len(task_history),
             )
             user_goal_achieved = completion_resp.get("user_goal_achieved", False)
             should_terminate = completion_resp.get("should_terminate", False)
@@ -1449,7 +1450,7 @@ async def run_task_v2_helper(
                     "User goal achieved according to the task v2 completion check",
                     iteration=i,
                     workflow_run_id=workflow_run_id,
-                    completion_resp=completion_resp,
+                    **llm_response_log_metadata(completion_resp),
                 )
                 lost_task_v2 = await _fail_task_v2_after_browser_loss(
                     task_v2_id, workflow_run_id, organization_id, completed_block=(block, block_result)
@@ -1901,7 +1902,7 @@ async def _generate_loop_task(
         prompt_name="task_v2_generate_task_block",
         system_prompt=task_v2.workflow_system_prompt,
     )
-    LOG.info("Task in loop metadata response", task_in_loop_metadata_response=task_in_loop_metadata_response)
+    LOG.info("Task in loop metadata response", **llm_response_log_metadata(task_in_loop_metadata_response))
     navigation_goal = task_in_loop_metadata_response.get("navigation_goal")
     data_extraction_goal = task_in_loop_metadata_response.get("data_extraction_goal")
     data_extraction_schema = task_in_loop_metadata_response.get("data_schema")
@@ -2021,7 +2022,7 @@ async def _generate_extraction_task(
         raise last_exc  # type: ignore[misc]
 
     assert generate_extraction_task_response is not None
-    LOG.info("Data extraction response", data_extraction_response=generate_extraction_task_response)
+    LOG.info("Data extraction response", **llm_response_log_metadata(generate_extraction_task_response))
 
     # create OutputParameter for the data_extraction block
     data_schema: dict[str, Any] | list | None = generate_extraction_task_response.get("schema")
@@ -2134,7 +2135,11 @@ async def _generate_compute_task(
     plan: str,
     task_history: list[dict] | None = None,
 ) -> tuple[CodeBlock, list[BLOCK_YAML_TYPES], list[PARAMETER_YAML_TYPES]]:
-    LOG.info("Generating compute task", plan=plan)
+    LOG.info(
+        "Generating compute task",
+        plan_type=type(plan).__name__,
+        plan_length=len(plan) if isinstance(plan, str) else None,
+    )
     context = skyvern_context.ensure_context()
     gathered = [record for record in (task_history or []) if record.get("extracted_data") is not None]
     if not gathered:
@@ -2647,7 +2652,7 @@ def _get_extracted_data_from_block_result(
                 if not isinstance(inner_loop_output, list):
                     LOG.warning(
                         "Inner loop output is not a list",
-                        inner_loop_output=inner_loop_output,
+                        **llm_response_log_metadata(inner_loop_output),
                         task_v2_id=task_v2_id,
                         workflow_run_id=workflow_run_id,
                         workflow_run_block_id=block_result.workflow_run_block_id,
@@ -2657,7 +2662,7 @@ def _get_extracted_data_from_block_result(
                     if not isinstance(inner_output, dict):
                         LOG.warning(
                             "inner output is not a dict",
-                            inner_output=inner_output,
+                            **llm_response_log_metadata(inner_output),
                             task_v2_id=task_v2_id,
                             workflow_run_id=workflow_run_id,
                             workflow_run_block_id=block_result.workflow_run_block_id,
@@ -2667,7 +2672,7 @@ def _get_extracted_data_from_block_result(
                     if not isinstance(output_value, dict):
                         LOG.warning(
                             "output_value is not a dict",
-                            output_value=output_value,
+                            **llm_response_log_metadata(output_value),
                             task_v2_id=task_v2_id,
                             workflow_run_id=workflow_run_id,
                             workflow_run_block_id=block_result.workflow_run_block_id,
@@ -2814,7 +2819,7 @@ def _parse_task_v2_summary_response(resp: Any) -> tuple[str | None, Any]:
             }
             LOG.info(
                 "Recovered task_v2 summary output from non-envelope response",
-                recovered_keys=sorted(output.keys()),
+                recovered_keys_count=len(output),
             )
     return description, output
 
@@ -2851,7 +2856,11 @@ async def _generate_task_v2_deliverable(
         prompt_name="task_v2_summary",
         system_prompt=task_v2.workflow_system_prompt,
     )
-    LOG.info("Task v2 summary response", task_v2_summary_resp=task_v2_summary_resp, is_partial=is_partial)
+    LOG.info(
+        "Task v2 summary response",
+        **llm_response_log_metadata(task_v2_summary_resp),
+        is_partial=is_partial,
+    )
 
     summary_description, summarized_output = _parse_task_v2_summary_response(task_v2_summary_resp)
     await app.DATABASE.observer.update_thought(

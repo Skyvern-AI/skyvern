@@ -167,6 +167,7 @@ from skyvern.forge.sdk.api.llm.schema_validator import (
     resolve_schema_type,
     validate_schema,
 )
+from skyvern.forge.sdk.api.llm.utils import llm_response_log_metadata
 from skyvern.forge.sdk.artifact.models import ArtifactType
 from skyvern.forge.sdk.artifact.storage.base import get_download_retry_started_at, is_file_from_retry_attempt
 from skyvern.forge.sdk.copilot.code_block_security import SlottedReference, is_inert_slot, slot_template
@@ -2981,7 +2982,7 @@ class BaseTaskBlock(Block):
                     organization_id=workflow_run.organization_id,
                     current_retry=current_retry,
                     max_retries=self.max_retries,
-                    task_output=task_output.model_dump_json(),
+                    **llm_response_log_metadata(task_output.model_dump()),
                 )
                 if not will_retry:
                     output_parameter_value = task_output.model_dump()
@@ -11297,7 +11298,7 @@ class TextPromptBlock(Block):
             except Exception as e:
                 LOG.error("Failed to save TextPromptBlock artifacts", error=e)
 
-        LOG.info("TextPromptBlock Received response from LLM", response=response)
+        LOG.info("TextPromptBlock Received response from LLM", **llm_response_log_metadata(response))
         return response
 
     async def send_prompt_with_schema_retries(
@@ -12870,7 +12871,8 @@ class FileUploadBlock(FileDestinationBlock):
                         workflow_run_block_id=workflow_run_block_id,
                         candidate_count=candidate_count,
                         selected_count=selected_count,
-                        reasoning=selection_reasoning,
+                        reasoning_type=type(selection_reasoning).__name__,
+                        reasoning_length=len(selection_reasoning) if isinstance(selection_reasoning, str) else None,
                     )
                     await self.record_output_parameter_value(workflow_run_context, workflow_run_id, uploaded_uris)
                     return await self.build_block_result(
@@ -16697,7 +16699,8 @@ class FileDownloadBlock(BaseTaskBlock, FileDestinationBlock):
                         workflow_run_block_id=workflow_run_block_id,
                         candidate_count=candidate_count,
                         selected_count=selected_count,
-                        reasoning=selection_reasoning,
+                        reasoning_type=type(selection_reasoning).__name__,
+                        reasoning_length=len(selection_reasoning) if isinstance(selection_reasoning, str) else None,
                     )
                     return result
 
@@ -17131,6 +17134,30 @@ class HttpRequestBlock(Block):
     TEMPLATABLE_FIELDS: ClassVar[frozenset[str]] = frozenset({"body", "download_filename", "files", "headers", "url"})
 
     @staticmethod
+    def _payload_size_bytes(value: Any) -> int | None:
+        if value is None:
+            return 0
+        if isinstance(value, bytes):
+            return len(value)
+        if isinstance(value, str):
+            return len(value.encode("utf-8"))
+        try:
+            return len(json.dumps(value).encode("utf-8"))
+        except (TypeError, ValueError, RecursionError):
+            return None
+
+    @staticmethod
+    def _normalized_media_type(value: str | None) -> str | None:
+        if not value:
+            return None
+        message = EmailMessage()
+        try:
+            message["Content-Type"] = value
+        except ValueError:
+            return None
+        return message.get_content_type()
+
+    @staticmethod
     def get_allowed_dirs(workflow_run_id: str, organization_id: str | None) -> list[str]:
         run_download_id = resolve_run_download_id(skyvern_context.current(), fallback_run_id=workflow_run_id)
         allowed_dirs = [
@@ -17501,10 +17528,7 @@ class HttpRequestBlock(Block):
         # If files are provided, don't set default Content-Type (aiohttp will set multipart/form-data)
         if not self.files:
             if not self.headers.get("Content-Type") and not self.headers.get("content-type"):
-                LOG.info(
-                    "Adding default content-type as application/json",
-                    headers=workflow_run_context.mask_secrets_in_data(self.headers),
-                )
+                LOG.info("Adding default content-type as application/json")
                 self.headers["Content-Type"] = "application/json"
 
         # Download files from HTTP URLs or S3 URIs if needed
@@ -17582,18 +17606,12 @@ class HttpRequestBlock(Block):
                             organization_id=organization_id,
                         )
                     downloaded_files[field_name] = local_file_path_str
-                    LOG.info(
-                        "HttpRequestBlock Using allowed local file",
-                        field_name=field_name,
-                        file_path=masked_local_file_path,
-                    )
+                    LOG.info("HttpRequestBlock Using allowed local file")
                 else:
                     # Download from remote source
                     try:
                         LOG.info(
                             "HttpRequestBlock Downloading file from remote source",
-                            field_name=field_name,
-                            file_path=masked_file_path,
                             is_url=is_url,
                             is_managed_storage_uri=is_managed_storage_uri,
                         )
@@ -17603,12 +17621,7 @@ class HttpRequestBlock(Block):
                             authorize_redirect=self._authorize_file_redirect(field_name),
                         )
                         downloaded_files[field_name] = local_file_path
-                        LOG.info(
-                            "HttpRequestBlock File downloaded successfully",
-                            field_name=field_name,
-                            original_path=masked_file_path,
-                            local_path=local_file_path,
-                        )
+                        LOG.info("HttpRequestBlock File downloaded successfully")
                     except Exception as e:
                         masked_error = str(workflow_run_context.mask_secrets_in_data(str(e)))
                         return await self.build_block_result(
@@ -17632,14 +17645,19 @@ class HttpRequestBlock(Block):
             )
 
         try:
+            request_content_type = self._normalized_media_type(
+                workflow_run_context.mask_secrets_in_data(
+                    (self.headers or {}).get("Content-Type") or (self.headers or {}).get("content-type")
+                )
+            )
             LOG.info(
                 "Executing HTTP request",
                 method=self.method,
                 url=workflow_run_context.mask_secrets_in_data(self.url),
-                headers=workflow_run_context.mask_secrets_in_data(self.headers),
                 workflow_run_id=workflow_run_id,
-                body=workflow_run_context.mask_secrets_in_data(self.body),
-                files=workflow_run_context.mask_secrets_in_data(self.files),
+                request_content_type=request_content_type,
+                request_body_size_bytes=self._payload_size_bytes(self.body),
+                files_count=len(self.files or {}),
             )
 
             status_code, response_headers, response_body = await aiohttp_request(
@@ -17695,7 +17713,15 @@ class HttpRequestBlock(Block):
                 url=workflow_run_context.mask_secrets_in_data(self.url),
                 method=self.method,
                 workflow_run_id=workflow_run_id,
-                response_data=response_data,
+                request_content_type=request_content_type,
+                response_content_type=self._normalized_media_type(
+                    workflow_run_context.mask_secrets_in_data(
+                        response_headers.get("Content-Type") or response_headers.get("content-type")
+                    )
+                ),
+                request_body_size_bytes=self._payload_size_bytes(self.body),
+                response_body_size_bytes=self._payload_size_bytes(response_body),
+                files_count=len(self.files or {}),
             )
 
             if failure_reason is None and not success:
@@ -18691,7 +18717,8 @@ def _parse_single_evaluation(
             LOG.warning(
                 "Conditional branch evaluation returned non-boolean result",
                 branch_index=idx,
-                result=result,
+                result_type=type(result).__name__,
+                result_length=len(result) if isinstance(result, str) else None,
                 evaluated_result=bool_result,
             )
 
@@ -19250,8 +19277,8 @@ async def _evaluate_prompt_branch_conditions_batch(
                 block_label=log_label,
                 attempt=attempt,
                 will_retry=attempt + 1 < MAX_PROMPT_BRANCH_EVAL_ATTEMPTS,
-                error=str(malformed),
-                raw_output=raw_output_value,
+                error_type=type(malformed).__name__,
+                **llm_response_log_metadata(raw_output_value),
             )
             continue
 
@@ -19275,10 +19302,10 @@ async def _evaluate_prompt_branch_conditions_batch(
         LOG.info(
             "Conditional branch evaluation results",
             block_label=log_label,
-            results=results_array,
-            llm_rendered_expressions=llm_rendered_expressions,
+            results_count=len(results_array),
+            llm_rendered_expressions_count=len(llm_rendered_expressions),
             attempt=attempt,
-            raw_output=normalized_output,
+            **llm_response_log_metadata(normalized_output),
         )
         return (results_array, llm_rendered_expressions, extraction_goal, normalized_output)
 
@@ -19286,7 +19313,7 @@ async def _evaluate_prompt_branch_conditions_batch(
         "Conditional branch evaluation failed after retries",
         block_label=log_label,
         attempts=MAX_PROMPT_BRANCH_EVAL_ATTEMPTS,
-        error=str(last_malformed),
+        error_type=type(last_malformed).__name__ if last_malformed is not None else None,
     )
     raise ConditionalBranchEvaluationError(f"Conditional branch evaluation failed: {last_malformed}")
 

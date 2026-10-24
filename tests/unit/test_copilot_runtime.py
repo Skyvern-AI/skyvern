@@ -38,6 +38,7 @@ from skyvern.forge.sdk.copilot.build_test_connect_failure import (
 )
 from skyvern.forge.sdk.copilot.build_test_outcome import connect_failure_from_run_blocks_result
 from skyvern.forge.sdk.copilot.config import CopilotConfig
+from skyvern.forge.sdk.copilot.enforcement import TOTAL_TIMEOUT_SECONDS
 from skyvern.forge.sdk.copilot.mcp_adapter import SchemaOverlay
 from skyvern.forge.sdk.copilot.request_policy import RequestPolicy
 from skyvern.forge.sdk.copilot.runtime import (
@@ -58,6 +59,7 @@ from skyvern.forge.sdk.copilot.tools import mcp_hooks, run_execution
 from skyvern.forge.sdk.copilot.unrecoverable_tool_error import _is_unrecoverable_browser_session_error
 from skyvern.forge.sdk.schemas.persistent_browser_sessions import PersistentBrowserSession, export_profile_storage_id
 from skyvern.forge.sdk.workflow.models.workflow import WorkflowRunStatus
+from skyvern.forge.sdk.workflow.service import BROWSER_SESSION_RENEWAL_INTERVAL_SECONDS
 from skyvern.schemas.browser_session_close import BrowserSessionCloseReason
 from skyvern.schemas.browser_session_kind import BrowserSessionKind
 from skyvern.schemas.proxy_location import ProxyLocation
@@ -949,7 +951,7 @@ async def test_create_closes_its_session_when_a_sibling_installed_one_first(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """Two calls can both find no session and both mint. Assigning over the winner would
-    leave a live browser referenced by nobody until its 30-minute timeout."""
+    leave a live browser referenced by nobody until its timeout."""
     ready = MagicMock()
     ready.browser_context = _FakeBrowserContext()
     mine = MagicMock()
@@ -1018,7 +1020,7 @@ async def test_a_seeded_build_test_mint_loads_the_profile_without_exporting_over
     create = mock_manager.create_session.call_args.kwargs
     assert create == {
         "organization_id": ctx.organization_id,
-        "timeout_minutes": 30,
+        "timeout_minutes": settings.DEBUG_SESSION_TIMEOUT_MINUTES,
         "created_by": "copilot",
         "session_kind": BrowserSessionKind.copilot,
         "created_for_workflow_permanent_id": ctx.workflow_permanent_id,
@@ -1042,6 +1044,18 @@ async def test_a_seeded_build_test_mint_loads_the_profile_without_exporting_over
         generate_browser_profile=create["generate_browser_profile"],
     )
     assert fallback_export_target == "bs_seeded"
+
+
+def test_the_chat_browser_budget_outlasts_a_turn_and_its_first_renewal_attempt() -> None:
+    """The session worker reuses a creation budget as its idle grace, so this budget is both what a
+    browser nothing comes back for bills (SKY-18904) and what a live one relies on. Below either
+    floor a browser dies under someone: a turn may hold it for a whole ``TOTAL_TIMEOUT_SECONDS``
+    without driving it, and the renewal loop a test run starts reads a session with less than the
+    threshold left as expired and closes it."""
+    budget_seconds = settings.DEBUG_SESSION_TIMEOUT_MINUTES * 60
+    threshold_seconds = settings.DEBUG_SESSION_TIMEOUT_THRESHOLD_MINUTES * 60
+    assert budget_seconds >= TOTAL_TIMEOUT_SECONDS
+    assert budget_seconds - BROWSER_SESSION_RENEWAL_INTERVAL_SECONDS > threshold_seconds
 
 
 def test_every_connect_failure_without_a_retry_reads_back_as_recorded() -> None:
@@ -2045,6 +2059,50 @@ async def test_every_turn_exit_releases_the_driver_it_attached(monkeypatch: pyte
     assert [(log["session_id"], log["had_cached_driver"]) for log in released] == [("pbs_turn", True)]
     assert result is not None
     assert result.turn_outcome.terminal_reason == _TURN_EXIT_TERMINAL_REASONS[exit_path]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("exit_path", ["normal", "cancel"])
+async def test_turn_finalizer_closes_its_minted_browser_after_driver_release(
+    monkeypatch: pytest.MonkeyPatch, exit_path: str
+) -> None:
+    release_complete = asyncio.Event()
+
+    async def _evict(*_args: object, **_kwargs: object) -> bool:
+        release_complete.set()
+        return True
+
+    async def _close(*_args: object, **_kwargs: object) -> bool:
+        assert release_complete.is_set()
+        return True
+
+    manager = _release_manager(evict=AsyncMock(side_effect=_evict))
+    close = AsyncMock(side_effect=_close)
+    monkeypatch.setattr(run_execution, "close_browser_session_quietly", close)
+    contexts = []
+
+    async def _mint_for_turn(ctx: Any) -> None:
+        contexts.append(ctx)
+        ctx.minted_browser_sessions["pbs_minted"] = None
+
+    result, raised = await run_turn_to_exit(
+        monkeypatch,
+        manager=manager,
+        exit_path=exit_path,
+        browser_state=MagicMock(),
+        on_attached=_mint_for_turn,
+    )
+
+    assert len(contexts) == 1
+    assert contexts[0].minted_browser_sessions == {}
+    assert release_complete.is_set()
+    close.assert_awaited_once_with("org-1", "pbs_minted", reason=BrowserSessionCloseReason.turn_ended)
+    if exit_path == "cancel":
+        assert result is not None and result.turn_outcome.terminal_reason == "cancel"
+        assert raised is None
+    else:
+        assert raised is None
+        assert result is not None
 
 
 @pytest.mark.asyncio

@@ -9,6 +9,7 @@ from skyvern.forge.taskv3.loop import (
     PICKED_OPTION_DATA_KEY,
     TARGET_KIND_DATA_KEY,
     TARGET_LABEL_DATA_KEY,
+    TARGET_LABEL_IS_PLACEHOLDER_DATA_KEY,
     ToolRefusal,
     ToolResult,
     ToolSpec,
@@ -39,11 +40,12 @@ async def _address(args: dict[str, Any]) -> tuple[str, bool]:
     return _REFS.get(selector, (selector, False))
 
 
-async def _answer(args: dict[str, Any]) -> tuple[str, str, str]:
+async def _answer(args: dict[str, Any]) -> tuple[str, str, str, bool]:
     # What the field reads as before the call acts; `_probed` stands in for a probe that resolves elsewhere or fails.
     if args.get("_probed") == "":
-        return "", "", ""
-    return str(args.get("_probed", args.get("selector"))), str(args.get("_label", "")), args.get("_kind", "textbox")
+        return "", "", "", False
+    selector, label = str(args.get("_probed", args.get("selector"))), str(args.get("_label", ""))
+    return selector, label, args.get("_kind", "textbox"), bool(args.get("_placeholder"))
 
 
 def _tools(dispatched: list[tuple[str, dict[str, Any]]]) -> list[ToolSpec]:
@@ -63,7 +65,12 @@ def _tools(dispatched: list[tuple[str, dict[str, Any]]]) -> list[ToolSpec]:
             if name == "select_combobox" and args.get("_no_match"):
                 content = f"opened {sel} but no option matched {args['value']!r}"
                 return ToolResult("error", content, {TARGET_LABEL_DATA_KEY: label}, error_class="list_no_match")
-            return ToolResult("ok", f"{name} done", {TARGET_LABEL_DATA_KEY: label, TARGET_KIND_DATA_KEY: "textbox"})
+            data = {TARGET_LABEL_DATA_KEY: label, TARGET_KIND_DATA_KEY: "textbox"}
+            if "_shown" in args:
+                data[PICKED_OPTION_DATA_KEY] = args["_shown"]
+            if args.get("_placeholder"):
+                data[TARGET_LABEL_IS_PLACEHOLDER_DATA_KEY] = True
+            return ToolResult("ok", f"{name} done", data)
 
         probe = _answer if name == "type" else None
         return ToolSpec(
@@ -309,3 +316,23 @@ async def test_a_typed_enter_the_probe_cannot_place_is_still_recorded_after_the_
     await _by_name(tools, "type").handler({**TYPED, "_probed": "#elsewhere", "text": "Yes"})
     await _by_name(tools, "click").handler({"selector": "#submit"})
     assert [name for name, _ in dispatched] == ["type", "click"] and len(audit.seen) == 2
+
+
+@pytest.mark.asyncio
+async def test_the_audit_records_what_the_page_shows_and_where_its_question_came_from() -> None:
+    audit = _Audit()
+    tools = _tools([])
+    apply_answer_basis_audit(tools, audit)
+    select, type_ = _by_name(tools, "select_option").handler, _by_name(tools, "type").handler
+
+    await select({"selector": "#auth", "value": "10", "_label": DEBARMENT, "_shown": "No"})
+    # A field named only by its placeholder is still audited; the audit is told the name is a placeholder.
+    await type_({"selector": "#country", "text": "Canada", "_label": "Country", "_placeholder": True})
+    await type_({"selector": "#visa", "text": "No", "_label": "Visa", "_placeholder": True, "press_enter": True})
+    await _by_name(tools, "click").handler({"selector": "#submit"})
+
+    assert audit.seen == [
+        [RecordedAnswer(DEBARMENT, "No")],
+        [RecordedAnswer("Country", "Canada", label_is_placeholder=True)],
+        [RecordedAnswer("Visa", "No", label_is_placeholder=True)],
+    ]

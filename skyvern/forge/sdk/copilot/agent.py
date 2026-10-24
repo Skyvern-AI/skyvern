@@ -256,6 +256,7 @@ from skyvern.forge.sdk.copilot.tools.run_execution import (
     recorded_open_step_runs,
     reusable_origin_input_keys,
     run_workflow_end_to_end,
+    start_minted_browser_session_close,
 )
 from skyvern.forge.sdk.copilot.tools.scouting import (
     _release_scout_challenge_listeners,
@@ -1656,7 +1657,11 @@ _RAW_SECRET_CARD_NOT_CONNECTED = {
 
 
 def _rewrite_failed_test_response(user_response: str, ctx: CopilotContext) -> str:
-    has_keepable_draft = ctx.last_workflow is not None and bool(ctx.last_workflow_yaml)
+    has_keepable_draft = (
+        ctx.last_workflow is not None
+        and bool(ctx.last_workflow_yaml)
+        and not _is_saved_workflow(ctx, ctx.last_workflow)
+    )
     keep_draft_affordance = " Keep the draft to iterate on, or discard." if has_keepable_draft else ""
     block_count = ctx.last_update_block_count if isinstance(ctx.last_update_block_count, int) else None
     positive_block_count = block_count if block_count is not None and block_count > 0 else None
@@ -1761,6 +1766,10 @@ def _rewrite_failed_test_response(user_response: str, ctx: CopilotContext) -> st
     return user_response
 
 
+def _is_saved_workflow(ctx: CopilotContext, workflow: Workflow | None) -> bool:
+    return workflow is not None and any(workflow is saved for saved in ctx.saved_workflows_under_test)
+
+
 def _verified_workflow_or_none(ctx: CopilotContext) -> tuple[Any, str | None]:
     """Surface a proposal only when the current candidate passed its test run."""
     run_status_clean = ctx.last_test_ok is True and ctx.last_full_workflow_test_ok is True
@@ -1769,6 +1778,7 @@ def _verified_workflow_or_none(ctx: CopilotContext) -> tuple[Any, str | None]:
         and ctx.last_workflow_yaml
         and run_status_clean
         and not artifact_health_blocked(ctx)
+        and not _is_saved_workflow(ctx, ctx.last_workflow)
     ):
         return ctx.last_workflow, ctx.last_workflow_yaml
     return None, None
@@ -1999,6 +2009,13 @@ def _make_agent_result(
                     ]
                 }
             )
+    if ctx is not None and _is_saved_workflow(ctx, kwargs.get("updated_workflow")):
+        LOG.warning(
+            "copilot dropped saved workflow offered as a proposal",
+            workflow_permanent_id=ctx.workflow_permanent_id,
+            proposal_disposition=kwargs.get("proposal_disposition"),
+        )
+        kwargs.update(updated_workflow=None, workflow_yaml=None, proposal_disposition="no_proposal")
     proposal_yaml = kwargs.get("workflow_yaml")
     if isinstance(proposal_yaml, str):
         proposal_yaml = derive_code_block_steps_in_yaml(proposal_yaml)
@@ -2949,7 +2966,12 @@ def _observed_facts_halt_reply(ctx: CopilotContext) -> str:
     block_count = _workflow_block_count(ctx)
     block_phrase = f"a {block_count}-block draft" if block_count else "a draft"
     observed = _observed_page_sentence(ctx)
-    if getattr(ctx, "last_workflow", None) is not None:
+    if _is_saved_workflow(ctx, ctx.last_workflow):
+        return (
+            f"I was testing the saved workflow when the turn ran out of time.{observed}"
+            " I haven't verified the results, so I'm not claiming them."
+        )
+    if ctx.last_workflow is not None:
         return (
             f"I built {block_phrase} and was still testing it when the turn ran out of time."
             f"{observed} I haven't verified the results, so I'm not claiming them."
@@ -3062,13 +3084,19 @@ def _recorded_failure_reply(
     # Only the run id proves a row existed: pre-run refusals can carry a synthetic
     # overall_status="failed" even though execution never started.
     run_created = bool(getattr(diagnosis_input, "workflow_run_id", None))
-    if getattr(ctx, "last_workflow", None) is not None:
+    if ctx.last_workflow is not None:
+        saved = _is_saved_workflow(ctx, ctx.last_workflow)
+        tested = "I tested the saved workflow" if saved else f"I built {block_phrase} and tested it"
         if (unrecoverable_stop and not run_created) or ctx.last_test_run_started is False:
+            if saved:
+                return f"I couldn't start a test run of the saved workflow: {reason}.{status_sentence}"
             return f"I built {block_phrase}, but I couldn't start a test run: {reason}.{status_sentence}"
         if test_attempted and test_failed and not unrecoverable_stop:
-            return f"I built {block_phrase} and tested it, but the test failed: {reason}.{status_sentence}"
+            return f"{tested}, but the test failed: {reason}.{status_sentence}"
         if test_attempted:
-            return f"I built {block_phrase} and tested it, but the test couldn't finish: {reason}.{status_sentence}"
+            return f"{tested}, but the test couldn't finish: {reason}.{status_sentence}"
+        if saved:
+            return f"I couldn't verify the saved workflow: {reason}.{status_sentence}"
         return f"I built {block_phrase}, but I couldn't verify it: {reason}.{status_sentence}"
     return f"I couldn't finish the Copilot turn: {reason}.{status_sentence}"
 
@@ -3153,6 +3181,7 @@ def _build_wip_exit_result(
         and ctx.last_good_workflow_yaml
         and ctx.last_workflow is not ctx.last_good_workflow
         and not ctx.last_test_suspicious_success
+        and not _is_saved_workflow(ctx, ctx.last_good_workflow)
     ):
         append_failure_detail = recorded_failure_reply
         held_reply = _tested_draft_reply(
@@ -3191,7 +3220,7 @@ def _build_wip_exit_result(
             ),
             exit_site="wip_last_good_workflow",
         )
-    if ctx.last_workflow is not None and ctx.last_workflow_yaml:
+    if ctx.last_workflow is not None and ctx.last_workflow_yaml and not _is_saved_workflow(ctx, ctx.last_workflow):
         full_test_ok = (
             ctx.last_test_ok is True and ctx.last_full_workflow_test_ok is True and not ctx.last_test_suspicious_success
         )
@@ -3888,6 +3917,7 @@ async def _translate_to_agent_result(
         and bool(ctx.last_failed_workflow_yaml or ctx.last_test_ok is False)
         and not ctx.last_test_suspicious_success
         and not blocker_active
+        and not _is_saved_workflow(ctx, ctx.last_good_workflow)
     )
 
     # ASK_QUESTION replies carry a specific clarifying question — often the
@@ -3924,7 +3954,13 @@ async def _translate_to_agent_result(
     elif salvaged_reply:
         last_workflow, last_workflow_yaml = ctx.last_good_workflow, ctx.last_good_workflow_yaml
         unvalidated = True
-    elif resp_type == "REPLY" and ctx.last_workflow is not None and ctx.last_workflow_yaml and not blocker_active:
+    elif (
+        resp_type == "REPLY"
+        and ctx.last_workflow is not None
+        and ctx.last_workflow_yaml
+        and not blocker_active
+        and not _is_saved_workflow(ctx, ctx.last_workflow)
+    ):
         # Failures are often environmental (captcha, transient block); surface the draft so the user can keep iterating.
         last_workflow = ctx.last_workflow
         last_workflow_yaml = ctx.last_workflow_yaml
@@ -4032,7 +4068,9 @@ async def _translate_to_agent_result(
         staged_workflow=ctx.staged_workflow,
         canonical_was_persisted_due_to_param_change=ctx.canonical_was_persisted_due_to_param_change,
         total_tokens=ctx.total_tokens_used,
-        clear_proposed_workflow=(resp_type == "ASK_QUESTION" and last_workflow is None),
+        clear_proposed_workflow=(
+            resp_type == "ASK_QUESTION" and last_workflow is None and not _is_saved_workflow(ctx, ctx.last_workflow)
+        ),
         proposal_disposition=(
             "review_tested"
             if chat_request.product_action == "test_end_to_end"
@@ -4538,7 +4576,12 @@ def _agent_output_to_text(agent_output: Any) -> str:
 
 
 def _should_surface_untested_draft_despite_question(ctx: CopilotContext, response_type: str) -> bool:
-    if response_type != "ASK_QUESTION" or ctx.last_workflow is None or not ctx.last_workflow_yaml:
+    if (
+        response_type != "ASK_QUESTION"
+        or ctx.last_workflow is None
+        or not ctx.last_workflow_yaml
+        or _is_saved_workflow(ctx, ctx.last_workflow)
+    ):
         return False
     return ctx.last_test_ok is None and ctx.last_run_skipped_unbound_credentials
 
@@ -4580,16 +4623,17 @@ def _evaluate_copilot_final_output_policy(
 ) -> tuple[OutputPolicyVerdict, str, dict[str, Any]]:
     action_data, response_type, policy_user_response = _final_output_policy_reply(agent_output)
 
+    candidate_workflow = None if _is_saved_workflow(ctx, ctx.last_workflow) else ctx.last_workflow
     workflow_yaml = None
     if response_type == "REPLACE_WORKFLOW" and isinstance(action_data.get("workflow_yaml"), str):
         workflow_yaml = action_data["workflow_yaml"]
-    elif isinstance(getattr(ctx, "last_workflow_yaml", None), str):
+    elif candidate_workflow is not None and isinstance(ctx.last_workflow_yaml, str):
         workflow_yaml = ctx.last_workflow_yaml
 
     workflow_attempted = ctx.has_genuine_workflow_attempt()
     _log_output_policy_parity(
         ctx,
-        has_workflow_proposal=bool(workflow_yaml or ctx.last_workflow is not None),
+        has_workflow_proposal=bool(workflow_yaml or candidate_workflow is not None),
         workflow_attempted=workflow_attempted,
     )
     surface_untested_draft = _should_surface_untested_draft_despite_question(ctx, response_type)
@@ -4597,7 +4641,7 @@ def _evaluate_copilot_final_output_policy(
     if surface_untested_draft:
         policy_user_response = _rewrite_failed_test_response(policy_user_response, ctx)
     updated_workflow_for_kind = (
-        ctx.last_workflow if ctx.last_workflow is not None else WORKFLOW_PRESENT_SENTINEL if workflow_yaml else None
+        candidate_workflow if candidate_workflow is not None else WORKFLOW_PRESENT_SENTINEL if workflow_yaml else None
     )
     if surface_untested_draft:
         output_kind = (
@@ -4620,7 +4664,7 @@ def _evaluate_copilot_final_output_policy(
         user_response=policy_user_response,
         global_llm_context=action_data.get("global_llm_context"),
         workflow_yaml=workflow_yaml,
-        has_workflow_proposal=bool(workflow_yaml or ctx.last_workflow is not None),
+        has_workflow_proposal=bool(workflow_yaml or candidate_workflow is not None),
         workflow_was_persisted=ctx.workflow_persisted,
         workflow_attempted=workflow_attempted,
         output_kind=output_kind,
@@ -4789,7 +4833,12 @@ def _build_output_policy_blocked_result(
     local_blocker_signal = ctx.blocker_signal if isinstance(ctx.blocker_signal, CopilotToolBlockerSignal) else None
     blocker_active = local_blocker_signal is not None and local_blocker_signal.renders_final_reply
     preserved_workflow = (
-        ctx.last_workflow if ctx.last_workflow is not None and ctx.last_workflow_yaml and not blocker_active else None
+        ctx.last_workflow
+        if ctx.last_workflow is not None
+        and ctx.last_workflow_yaml
+        and not blocker_active
+        and not _is_saved_workflow(ctx, ctx.last_workflow)
+        else None
     )
     preserved_workflow_yaml = ctx.last_workflow_yaml if preserved_workflow is not None else None
     output_policy_reasons = list(verdict.reason_codes if evaluated_reason_codes is None else evaluated_reason_codes)
@@ -5083,6 +5132,9 @@ async def run_copilot_agent(
                         for attached in list(turn_end_ctx.attached_browser_drivers.values())
                     ]
                     await wait_for_driver_releases(releases)
+                if turn_end_ctx is not None and turn_end_ctx.minted_browser_sessions:
+                    # After the driver release, so each browser is detached before it is ended.
+                    await asyncio.shield(start_minted_browser_session_close(turn_end_ctx))
     except asyncio.CancelledError:
         if eval_mode == CopilotEvalMode.BROWSER_ABLATION and ctx_sink:
             browser_session_id = ctx_sink[0].browser_session_id

@@ -5,9 +5,11 @@ import type { Connect, Plugin } from "vite";
 import react from "@vitejs/plugin-react-swc";
 
 import {
+  createOidcRuntimeConfigHandler,
   createUiSessionHandler,
   createUiSessionNonceManager,
   issueUiSessionNonceCookie,
+  resolveOidcRuntimeConfig,
 } from "./localServer.js";
 import { resolveAppVersion } from "./scripts/app-version.mjs";
 
@@ -58,9 +60,18 @@ export function createUiSessionDevPlugin({
     requestTimeoutMs,
     nonceManager,
   });
+  const serveOidcRuntimeConfig = createOidcRuntimeConfigHandler(
+    resolveOidcRuntimeConfig(env),
+  );
 
   const middleware: Connect.NextHandleFunction = async (request, response) => {
     await serveUiSession(request, response);
+  };
+  const oidcConfigMiddleware: Connect.NextHandleFunction = async (
+    request,
+    response,
+  ) => {
+    await serveOidcRuntimeConfig(request, response);
   };
 
   return {
@@ -72,6 +83,7 @@ export function createUiSessionDevPlugin({
         next();
       });
       server.middlewares.use("/ui-session", middleware);
+      server.middlewares.use("/oidc-config", oidcConfigMiddleware);
     },
   };
 }

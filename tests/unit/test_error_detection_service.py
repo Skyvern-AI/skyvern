@@ -8,6 +8,7 @@ from datetime import datetime
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
+from structlog.testing import capture_logs
 
 from skyvern.forge.sdk.models import Step, StepStatus
 from skyvern.services.error_detection_service import detect_user_defined_errors_for_task
@@ -147,6 +148,32 @@ async def test_detect_errors_no_browser_state(mock_step):
 
         assert len(detected_errors) == 1
         assert detected_errors[0].error_code == "payment_failed"
+
+
+@pytest.mark.asyncio
+async def test_context_detection_does_not_log_malformed_llm_error_payload(mock_step):
+    now = datetime.now()
+    organization = make_organization(now)
+    task = make_task(now, organization, error_code_mapping={"payment_failed": "Credit card was declined"})
+    sentinel = "private-malformed-error-sentinel"
+
+    with patch("skyvern.services.error_detection_service.app") as mock_app, capture_logs() as events:
+        mock_app.EXTRACTION_LLM_API_HANDLER = AsyncMock(
+            return_value={
+                "errors": [
+                    {"error_code": sentinel, "reasoning": sentinel, "confidence_float": sentinel},
+                ]
+            }
+        )
+        detected = await detect_user_defined_errors_for_task(
+            task=task, step=mock_step, browser_state=None, failure_reason=None
+        )
+
+    assert detected == []
+    event = next(event for event in events if event["event"] == "Failed to validate user-defined error")
+    assert event["error_type"] == "ValidationError"
+    assert "exc_info" not in event
+    assert sentinel not in repr(event)
 
 
 @pytest.mark.asyncio

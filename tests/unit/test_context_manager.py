@@ -50,6 +50,7 @@ from skyvern.forge.sdk.workflow.models.block import BranchEvaluationContext, Wai
 from skyvern.forge.sdk.workflow.models.parameter import (
     AzureVaultCredentialParameter,
     BitwardenLoginCredentialParameter,
+    ContextParameter,
     CredentialParameter,
     WorkflowParameter,
     WorkflowParameterType,
@@ -148,6 +149,55 @@ async def test_a_scrubbed_typed_input_cannot_start_execution(parameter_type: Wor
             secret_parameters=[],
             workflow=_make_workflow([parameter]),
         )
+
+
+@pytest.mark.asyncio
+async def test_duplicate_workflow_parameter_log_omits_values() -> None:
+    parameter = _make_workflow_parameter("input")
+    old_value = "DUPLICATE_OLD_VALUE_SENTINEL"
+    new_value = "DUPLICATE_NEW_VALUE_SENTINEL"
+
+    with capture_logs() as logs:
+        context = await _init_context(
+            workflow_parameter_tuples=[
+                (parameter, _make_run_parameter(parameter, old_value)),
+                (parameter, _make_run_parameter(parameter, new_value)),
+            ]
+        )
+
+    assert old_value not in json.dumps(logs, default=str)
+    assert new_value not in json.dumps(logs, default=str)
+    log = next(log for log in logs if "Duplicate parameter key" in log["event"])
+    assert log["parameter_key"] == "input"
+    assert context.values["input"] == new_value
+
+
+@pytest.mark.asyncio
+async def test_context_parameter_overwrite_log_omits_values() -> None:
+    output_parameter = make_block_output_parameter("source_output")
+    old_value = "CONTEXT_OLD_VALUE_SENTINEL"
+    new_value = "CONTEXT_NEW_VALUE_SENTINEL"
+    parameter = ContextParameter(
+        key="context_value",
+        description=None,
+        source=output_parameter,
+        value=old_value,
+    )
+    context = WorkflowRunContext.__new__(WorkflowRunContext)
+    context.parameters = {parameter.key: parameter}
+    context.values = {parameter.key: old_value}
+
+    with capture_logs() as logs:
+        await context.set_parameter_values_for_output_parameter_dependent_blocks(
+            output_parameter,
+            {parameter.key: new_value},
+        )
+
+    assert old_value not in json.dumps(logs, default=str)
+    assert new_value not in json.dumps(logs, default=str)
+    log = next(log for log in logs if "already has a value" in log["event"])
+    assert log["parameter_key"] == "context_value"
+    assert context.values[parameter.key] == new_value
 
 
 class TestAtWillCredentialBackfill:

@@ -9,6 +9,7 @@ from fastapi import HTTPException
 from skyvern.config import settings
 from skyvern.forge.prompts import prompt_engine
 from skyvern.forge.sdk.api.llm.api_handler_factory import LLMAPIHandlerFactory
+from skyvern.forge.sdk.api.llm.utils import llm_response_log_metadata
 from skyvern.forge.sdk.schemas.organizations import Organization
 from skyvern.forge.sdk.utils.pdf_parser import extract_pdf_file
 from skyvern.schemas.workflows import WorkflowCreateYAMLRequest
@@ -215,8 +216,7 @@ class PDFImportService:
 
         LOG.info(
             "LLM response received",
-            response_type=type(response),
-            response_keys=list(response.keys()) if isinstance(response, dict) else None,
+            **llm_response_log_metadata(response),
             organization_id=organization.organization_id,
         )
 
@@ -225,8 +225,7 @@ class PDFImportService:
         if not isinstance(response, dict):
             LOG.error(
                 "LLM returned non-dict response",
-                response_type=type(response),
-                response=str(response)[:500],
+                **llm_response_log_metadata(response),
                 organization_id=organization.organization_id,
             )
             raise HTTPException(status_code=422, detail="LLM returned invalid response format - expected JSON object")
@@ -235,7 +234,7 @@ class PDFImportService:
         if response.get("error") == "not_sop":
             LOG.info(
                 "LLM detected non-SOP content",
-                reason=response.get("reason"),
+                **llm_response_log_metadata(response),
                 organization_id=organization.organization_id,
             )
             raise HTTPException(
@@ -249,7 +248,7 @@ class PDFImportService:
         if "workflow_definition" not in response:
             LOG.error(
                 "LLM response missing workflow_definition",
-                response_keys=list(response.keys()),
+                **llm_response_log_metadata(response),
                 organization_id=organization.organization_id,
             )
             raise HTTPException(status_code=422, detail="LLM response missing 'workflow_definition' field")
@@ -257,7 +256,7 @@ class PDFImportService:
         if "blocks" not in response.get("workflow_definition", {}):
             LOG.error(
                 "LLM workflow_definition missing blocks",
-                workflow_def_keys=list(response.get("workflow_definition", {}).keys()),
+                workflow_def_keys_count=len(response.get("workflow_definition", {})),
                 organization_id=organization.organization_id,
             )
             raise HTTPException(status_code=422, detail="LLM workflow definition missing 'blocks' field")
@@ -269,17 +268,15 @@ class PDFImportService:
 
             LOG.info(
                 "Workflow JSON validated successfully",
-                title=response.get("title"),
+                **llm_response_log_metadata(response),
                 block_count=len(response.get("workflow_definition", {}).get("blocks", [])),
                 organization_id=organization.organization_id,
             )
         except Exception as e:
             LOG.error(
                 "Failed to validate workflow request",
-                error=str(e),
                 error_type=type(e).__name__,
                 organization_id=organization.organization_id,
-                exc_info=True,
             )
             raise HTTPException(
                 status_code=422,

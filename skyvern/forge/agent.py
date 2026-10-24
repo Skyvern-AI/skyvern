@@ -131,7 +131,7 @@ from skyvern.forge.sdk.api.llm.exceptions import (
     LLMResponseMissingActionsError,
 )
 from skyvern.forge.sdk.api.llm.ui_tars_llm_caller import UITarsLLMCaller
-from skyvern.forge.sdk.api.llm.utils import uses_only_anthropic_models
+from skyvern.forge.sdk.api.llm.utils import llm_response_log_metadata, uses_only_anthropic_models
 from skyvern.forge.sdk.api.llm.vertex_cache_manager import get_cache_manager
 from skyvern.forge.sdk.api.llm.yutori_navigator_llm_caller import (
     YutoriNavigatorLLMCaller,
@@ -236,6 +236,7 @@ from skyvern.forge.taskv3.run_arms import (
     resolve_run_arm,
 )
 from skyvern.forge.taskv3.target_label import compose_target_intention
+from skyvern.forge.taskv3.turn_dom import TurnDomCapture
 from skyvern.forge.validation_evidence_router import (
     ValidationRouterMode,
     ValidationRouterResult,
@@ -1777,17 +1778,23 @@ def _is_transient_page_read_refusal(exc: BaseException) -> bool:
 _BLOCK_END_DOM_TIMEOUT_SECONDS = 5.0
 
 
+async def _read_page_html(browser_state: BrowserState) -> str | None:
+    # v1's html_scrape content. Callers cap it: the page lookup can wait on a lost-page recovery, and get_content's
+    # own timeout is 300 s.
+    page = await browser_state.get_working_page(prune_excess_pages=False)
+    if page is None:
+        return None
+    return await SkyvernFrame(frame=page, engine_selection=browser_state.engine_selection).get_content()
+
+
 async def _save_block_end_dom(browser_state: BrowserState, step: Step, task_id: str) -> None:
-    # v1's html_scrape content, once per block after the loop. One cap covers the page lookup too,
-    # which can wait on a lost-page recovery; get_content's own timeout is 300 s.
+    # Once per block after the loop.
     started = time.monotonic()
     html: str | None = None
     reason = "no_working_page"
     try:
         async with asyncio.timeout(_BLOCK_END_DOM_TIMEOUT_SECONDS):
-            page = await browser_state.get_working_page(prune_excess_pages=False)
-            if page is not None:
-                html = await SkyvernFrame(frame=page, engine_selection=browser_state.engine_selection).get_content()
+            html = await _read_page_html(browser_state)
     except Exception as exc:
         reason = type(exc).__name__
     if html is None:
@@ -3365,8 +3372,26 @@ class ForgeAgent:
         # action rows it wrote land on it. `step` keeps the run's status, billing and step-budget unit.
         v3_turn_step: Step | None = None
         v3_turn_step_open = False
+        # Salted so this sample is independent of the pre-submit one, which buckets the same run key.
+        turn_dom = (
+            TurnDomCapture(
+                functools.partial(_read_page_html, browser_state),
+                app.ARTIFACT_MANAGER.accumulate_html_scrape_to_archive,
+            )
+            if not page_free_validation
+            and is_run_sampled(
+                f"turn_dom:{task.workflow_run_id or task.task_id}", settings.TASK_V3_TURN_DOM_SAMPLE_RATE
+            )
+            else None
+        )
 
         async def _on_turn_start(turn: int) -> Step | None:
+            turn_step = await _open_v3_turn_step(turn)
+            if turn_dom is not None:
+                turn_dom.start(turn_step, turn)
+            return turn_step
+
+        async def _open_v3_turn_step(turn: int) -> Step | None:
             nonlocal v3_turn_step, v3_turn_step_open
             v3_turn_step, v3_turn_step_open = None, False
             try:
@@ -3403,8 +3428,12 @@ class ForgeAgent:
                         output=AgentStepOutput(
                             llm_seconds=record.llm_seconds if record else None,
                             tool_calls=record.tool_calls if record else None,
+                            page_dom=turn_dom.turn_output() if turn_dom is not None else None,
                         ),
                     )
+            if turn_dom is not None:
+                # A sampled run keeps each turn durable as it ends; the rest share the block's ZIP.
+                app.ARTIFACT_MANAGER.flush_step_archive_in_background(v3_turn_step)
 
         async def _on_turn_end(record: TurnRecord) -> None:
             if record.outcome_status == "canceled":
@@ -3871,6 +3900,7 @@ class ForgeAgent:
                 on_action_round=_on_action_round,
                 on_turn_start=_on_turn_start,
                 on_turn_end=_on_turn_end,
+                turn_dom=turn_dom,
                 on_pre_action=pre_submit_ring.capture if pre_submit_ring is not None else None,
                 # A code status the model has moved past is no longer what the run ends on.
                 on_page_action=verification_state.page_engaged,
@@ -3915,6 +3945,8 @@ class ForgeAgent:
                 StepStatus.canceled if isinstance(sys.exception(), asyncio.CancelledError) else StepStatus.failed,
                 None,
             )
+            if turn_dom is not None:
+                turn_dom.cancel()
             # Frames are already in memory, so a loop that raised or ran out of budget still
             # persists what it captured; bounded so the unwind of a cancelled run is not held up.
             with contained_effect("task_v3 pre-submit frame persist", task_id=task.task_id):
@@ -4396,6 +4428,7 @@ class ForgeAgent:
             browser_session_id=browser_session_id,
             download_suffix=task_block.download_suffix if task_block else None,
             list_files_before=cleanup_list_files_before,
+            bundle_step_archives=True,
         )
         return step, task
 
@@ -4657,7 +4690,8 @@ class ForgeAgent:
                     )
                 finally:
                     # The block's turn steps share its ZIP: one storage PUT per block rather than one per turn.
-                    await app.ARTIFACT_MANAGER.flush_task_step_archives_as_one(step)
+                    with contained_effect("task_v3 block archive flush", task_id=step.task_id):
+                        await app.ARTIFACT_MANAGER.flush_task_step_archives_as_one(step)
                 return step, detailed_output, None
 
             if workflow_owned_recovery:
@@ -6238,8 +6272,8 @@ class ForgeAgent:
             # Skip sleep and post-action artifacts for page-level SCROLL to preserve
             # scroll-driven JS state. Many pages enable buttons only while scrolled to
             # bottom (e.g. T&C "Agree" buttons) and re-disable them after any delay or
-            # programmatic scroll. Sub-container scrolls (strategies 1 & 2) don't affect
-            # page position, so they keep normal sleep and artifact recording.
+            # programmatic scroll. Sub-container scrolls don't affect page position, so they
+            # keep normal sleep and artifact recording.
             is_page_level_scroll = action.action_type == ActionType.SCROLL and any(
                 r.success and isinstance(r.data, dict) and r.data.get("page_level_scroll") for r in results
             )
@@ -6899,7 +6933,7 @@ class ForgeAgent:
                     screenshots=scraped_page.screenshots,
                     system_prompt=task.workflow_system_prompt,
                 )
-                LOG.info("Skyvern response to CUA question", skyvern_response=skyvern_response)
+                LOG.info("Skyvern response to CUA question", **llm_response_log_metadata(skyvern_response))
                 cua_question = cua_question or skyvern_response.get("question_or_decision")
                 resp_content = skyvern_response.get("answer")
                 if not resp_content:
@@ -7129,7 +7163,7 @@ class ForgeAgent:
         # Generate response using the LLMCaller
         response_content = await llm_caller.generate_ui_tars_response(step)
 
-        LOG.info(f"UI-TARS raw response: {response_content}")
+        LOG.info("UI-TARS raw response", **llm_response_log_metadata(response_content))
 
         window_dimension = (
             cast(Resolution, scraped_page.window_dimension)
@@ -9714,6 +9748,7 @@ class ForgeAgent:
         browser_session_id: str | None = None,
         download_suffix: str | None = None,
         list_files_before: list[str] | None = None,
+        bundle_step_archives: bool = False,
     ) -> None:
         cleanup_context = skyvern_context.current()
         try:
@@ -9727,6 +9762,7 @@ class ForgeAgent:
                 browser_session_id,
                 download_suffix,
                 list_files_before,
+                bundle_step_archives=bundle_step_archives,
             )
         finally:
             if cleanup_context is not None:
@@ -9747,6 +9783,7 @@ class ForgeAgent:
         browser_session_id: str | None = None,
         download_suffix: str | None = None,
         list_files_before: list[str] | None = None,
+        bundle_step_archives: bool = False,
     ) -> None:
         # Keep the capture window alive through settle/finalize; only durable credit permits closing reservations.
         # The outer finally releases ownership on every terminal exit.
@@ -10016,6 +10053,10 @@ class ForgeAgent:
         # Wait for all tasks to complete before generating the links for the artifacts
         with traced_span(_tracer, "skyvern.agent.cleanup.wait_for_upload") as _cl_wait_span:
             apply_context_attrs(_cl_wait_span)
+            if bundle_step_archives:
+                # The drain below writes one ZIP per step; a Task V3 block's turn steps share one on its block step.
+                with contained_effect("task_v3 block archive flush", task_id=task.task_id):
+                    await app.ARTIFACT_MANAGER.flush_task_step_archives_as_one(last_step)
             await app.ARTIFACT_MANAGER.wait_for_upload_aiotasks([task.task_id])
 
         # Before the webhook, so a caller acting on the run's completion already sees the
@@ -11075,8 +11116,9 @@ class ForgeAgent:
                     "Parallel verification: termination required, marking task as terminated",
                     step_id=step.step_id,
                     task_id=task.task_id,
-                    reasoning=skyvern_context.mask_multi_field_totp_data(
-                        complete_action.reasoning, task_id=task.task_id
+                    reasoning_type=type(complete_action.reasoning).__name__,
+                    reasoning_length=(
+                        len(complete_action.reasoning) if isinstance(complete_action.reasoning, str) else None
                     ),
                 )
                 final_status = step.speculative_original_status or StepStatus.completed
@@ -11455,8 +11497,8 @@ class ForgeAgent:
                 "Dropped LLM-returned error codes not in user error_code_mapping",
                 task_id=task.task_id,
                 step_id=step.step_id,
-                dropped_codes=dropped,
-                allowed_codes=sorted((task.error_code_mapping or {}).keys()),
+                dropped_count=len(dropped),
+                allowed_codes_count=len(task.error_code_mapping or {}),
             )
         return kept
 
@@ -11944,7 +11986,7 @@ class ForgeAgent:
                 "Step completed and goal achieved, marking task as completed",
                 step_order=step.order,
                 step_retry=step.retry_index,
-                output=step.output,
+                **llm_response_log_metadata(step.output.model_dump() if step.output is not None else None),
             )
             last_step = await self.update_step(step, is_last=True)
             extracted_information = await self.get_extracted_information_for_task(task)
@@ -11995,9 +12037,7 @@ class ForgeAgent:
                     "Step completed and terminated by the agent, marking task as terminated",
                     step_order=step.order,
                     step_retry=step.retry_index,
-                    output=skyvern_context.mask_multi_field_totp_data(step.output.model_dump(), task_id=task.task_id)
-                    if step.output is not None and task.task_id in skyvern_context.multi_field_totp_masking_task_ids()
-                    else step.output,
+                    **llm_response_log_metadata(step.output.model_dump() if step.output is not None else None),
                 )
                 last_step = await self.update_step(step, is_last=True)
                 failure_category = classify_from_failure_reason(failure_reason)
@@ -12035,7 +12075,7 @@ class ForgeAgent:
                 "Step completed for the action block, marking task as completed",
                 step_order=step.order,
                 step_retry=step.retry_index,
-                output=step.output,
+                **llm_response_log_metadata(step.output.model_dump() if step.output is not None else None),
             )
             last_step = await self.update_step(step, is_last=True)
             await self.update_task(

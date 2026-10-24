@@ -475,6 +475,10 @@ OWNED_SESSION_CLOSE_TIMEOUT_SECONDS = 30.0
 # Ten windows (300 seconds), plus the timestamp CAS pin, require five full minutes of continuously
 # failed activity writes before a live client can lose its browser.
 REUSED_SESSION_ROUTER_ACTIVITY_STALE_AFTER = timedelta(seconds=300)
+# How often a running workflow asks the manager to move its browser session's deadline. Paired with
+# DEBUG_SESSION_TIMEOUT_THRESHOLD_MINUTES so a session gets 2+ renewal attempts before it expires,
+# which is the floor any caller-supplied session's creation budget has to clear.
+BROWSER_SESSION_RENEWAL_INTERVAL_SECONDS = 300
 
 # Limit burst concurrency for status-path fetches that are typically hit by client polling.
 WORKFLOW_STATUS_RESPONSE_MAX_IN_FLIGHT = 3
@@ -755,6 +759,7 @@ ACTION_TEXT_FIELDS = (
     "reasoning",
     "intention",
     "file_url",
+    "download_url",
     "file_name",
     "description",
     "data_extraction_goal",
@@ -8064,7 +8069,7 @@ class WorkflowService:
         start_time = asyncio.get_event_loop().time()
         while True:
             try:
-                await asyncio.sleep(300)  # 5 minutes — ensures 2+ attempts within the 10-min renewal threshold
+                await asyncio.sleep(BROWSER_SESSION_RENEWAL_INTERVAL_SECONDS)
                 elapsed = asyncio.get_event_loop().time() - start_time
                 if elapsed >= max_renewal_seconds:
                     LOG.info(
@@ -12072,16 +12077,18 @@ class WorkflowService:
         self,
         deleted_schedules: list[tuple[str, str | None]],
         organization_id: str | None,
-    ) -> None:
-        """Best effort: a failed backend delete is logged and left for the backend's own cleanup."""
+    ) -> list[str]:
+        """Best effort: returns the schedule ids whose backend schedule is gone; a failed delete is only logged."""
         targets = [(schedule_id, backend_id) for schedule_id, backend_id in deleted_schedules if backend_id]
         slots = asyncio.Semaphore(BACKEND_SCHEDULE_DELETE_CONCURRENCY)
         outcomes = await asyncio.gather(
             *(_delete_backend_schedule(backend_id, slots) for _, backend_id in targets), return_exceptions=True
         )
+        gone_schedule_ids: list[str] = []
         deleted_backend_ids: list[str] = []
         for (workflow_schedule_id, backend_schedule_id), outcome in zip(targets, outcomes, strict=True):
             if outcome is None:
+                gone_schedule_ids.append(workflow_schedule_id)
                 deleted_backend_ids.append(backend_schedule_id)
                 continue
             LOG.warning(
@@ -12098,6 +12105,7 @@ class WorkflowService:
                 backend_schedule_ids=deleted_backend_ids,
                 count=len(deleted_backend_ids),
             )
+        return gone_schedule_ids
 
     async def delete_workflow_by_id(
         self,
@@ -15619,6 +15627,7 @@ class WorkflowService:
             credits_used=workflow_run.credits_used,
             cached_credits_used=workflow_run.cached_credits_used,
             workflow_title=workflow.title,
+            copilot_session_id=workflow_run.copilot_session_id,
             browser_session_id=workflow_run.browser_session_id,
             browser_profile_id=workflow_run.browser_profile_id,
             browser_seed_source=workflow_run.browser_seed_source,

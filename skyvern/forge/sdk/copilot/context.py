@@ -1368,6 +1368,8 @@ class CopilotContext(AgentContext):
     private_workflow_settings: dict[str, Any] = field(default_factory=dict, repr=False)
     last_workflow: Workflow | None = None
     last_workflow_yaml: str | None = None
+    # Copies of the saved workflow a full test loaded this turn; matched by identity, never offered as a proposal.
+    saved_workflows_under_test: list[Workflow] = field(default_factory=list)
     # Always False under staging; ``has_staged_proposal`` carries the signal.
     workflow_persisted: bool = False
     last_update_block_count: int | None = None

@@ -12,7 +12,7 @@ import litellm
 import structlog
 from PIL import Image
 
-from skyvern.constants import MAX_IMAGE_MESSAGES
+from skyvern.constants import MAX_IMAGE_BLOCKS
 from skyvern.forge.sdk.api.llm import commentjson
 from skyvern.forge.sdk.api.llm.exceptions import (
     EmptyLLMResponseError,
@@ -28,6 +28,9 @@ _PASS_THROUGH_IMAGE_MEDIA_TYPES = frozenset({"image/png", "image/jpeg", "image/w
 # A file under the upload cap can still decode to hundreds of megapixels, which RGBA conversion
 # would expand to gigabytes in the worker process.
 _MAX_DECODED_IMAGE_PIXELS = 25_000_000
+_MAX_DECODED_IMAGE_FRAMES = MAX_IMAGE_BLOCKS
+# Keep the frame cap as the limiting guard for roughly 4 MP fax pages.
+_MAX_TOTAL_DECODED_IMAGE_PIXELS = _MAX_DECODED_IMAGE_FRAMES * 4_000_000
 
 
 def is_anthropic_model(model: str) -> bool:
@@ -53,33 +56,51 @@ def is_image_message(message: dict[str, Any]) -> bool:
     )
 
 
-async def normalize_llm_image(image: bytes) -> tuple[str, bytes]:
+async def normalize_llm_image(image: bytes) -> tuple[str, bytes] | list[tuple[str, bytes]]:
     media_type = filetype.guess_mime(image) or "image/png"
     if media_type in _PASS_THROUGH_IMAGE_MEDIA_TYPES:
         return media_type, image
     return await asyncio.to_thread(_reencode_llm_image_as_png, image, media_type)
 
 
-def _reencode_llm_image_as_png(image: bytes, media_type: str) -> tuple[str, bytes]:
+def _reencode_llm_image_as_png(image: bytes, media_type: str) -> tuple[str, bytes] | list[tuple[str, bytes]]:
     # Converting would drop extra frames, clip high-bit-depth samples, or expand a heavily compressed
     # image to gigabytes in the worker. Those are refused here rather than sent in a format the
     # provider will not decode, which would fail later and less clearly.
     refusal = ""
+    png_images: list[bytes] = []
     try:
         with Image.open(io.BytesIO(image)) as decoded:
-            if getattr(decoded, "n_frames", 1) > 1:
+            frame_count = getattr(decoded, "n_frames", 1)
+            if frame_count > 1 and media_type != "image/tiff":
                 refusal = "it has more than one frame"
-            elif decoded.mode.startswith("I") or decoded.mode == "F":
-                refusal = "it stores more than 8 bits per channel"
-            elif decoded.width * decoded.height > _MAX_DECODED_IMAGE_PIXELS:
-                refusal = f"it decodes to more than {_MAX_DECODED_IMAGE_PIXELS} pixels"
+            elif frame_count > _MAX_DECODED_IMAGE_FRAMES:
+                refusal = f"it has more than {_MAX_DECODED_IMAGE_FRAMES} frames"
             else:
-                buffer = io.BytesIO()
-                decoded.convert("RGBA").save(buffer, format="PNG")
-                return "image/png", buffer.getvalue()
+                total_pixels = 0
+                for frame_index in range(frame_count):
+                    decoded.seek(frame_index)
+                    if decoded.mode.startswith("I") or decoded.mode == "F":
+                        refusal = "it stores more than 8 bits per channel"
+                        break
+                    frame_pixels = decoded.width * decoded.height
+                    if frame_pixels > _MAX_DECODED_IMAGE_PIXELS:
+                        refusal = f"it decodes to more than {_MAX_DECODED_IMAGE_PIXELS} pixels"
+                        break
+                    if total_pixels + frame_pixels > _MAX_TOTAL_DECODED_IMAGE_PIXELS:
+                        refusal = f"it decodes to more than {_MAX_TOTAL_DECODED_IMAGE_PIXELS} pixels across frames"
+                        break
+                    total_pixels += frame_pixels
+                    buffer = io.BytesIO()
+                    decoded.convert("RGBA").save(buffer, format="PNG")
+                    png_images.append(buffer.getvalue())
     except (OSError, ValueError, Image.DecompressionBombError) as error:
         raise ValueError(f"This {media_type} image could not be decoded to send to the model") from error
-    raise ValueError(f"This {media_type} image cannot be sent to the model because {refusal}")
+    if refusal:
+        raise ValueError(f"This {media_type} image cannot be sent to the model because {refusal}")
+    if len(png_images) == 1:
+        return "image/png", png_images[0]
+    return [("image/png", png_image) for png_image in png_images]
 
 
 async def llm_messages_builder(
@@ -96,26 +117,33 @@ async def llm_messages_builder(
     ]
 
     if screenshots:
+        image_count = 0
         for screenshot in screenshots:
-            media_type, image_bytes = await normalize_llm_image(screenshot)
-            encoded_image = base64.b64encode(image_bytes).decode("utf-8")
-            if message_pattern == "anthropic":
-                message = {
-                    "type": "image",
-                    "source": {
-                        "type": "base64",
-                        "media_type": media_type,
-                        "data": encoded_image,
-                    },
-                }
-            else:
-                message = {
-                    "type": "image_url",
-                    "image_url": {
-                        "url": f"data:{media_type};base64,{encoded_image}",
-                    },
-                }
-            messages.append(message)
+            normalized_images = await normalize_llm_image(screenshot)
+            for media_type, image_bytes in (
+                normalized_images if isinstance(normalized_images, list) else [normalized_images]
+            ):
+                if image_count >= MAX_IMAGE_BLOCKS:
+                    raise ValueError(f"Cannot send a model request with more than {MAX_IMAGE_BLOCKS} image blocks")
+                image_count += 1
+                encoded_image = base64.b64encode(image_bytes).decode("utf-8")
+                if message_pattern == "anthropic":
+                    message = {
+                        "type": "image",
+                        "source": {
+                            "type": "base64",
+                            "media_type": media_type,
+                            "data": encoded_image,
+                        },
+                    }
+                else:
+                    message = {
+                        "type": "image_url",
+                        "image_url": {
+                            "url": f"data:{media_type};base64,{encoded_image}",
+                        },
+                    }
+                messages.append(message)
     # Anthropic models seems to struggle to always output a valid json object so we need to prefill the response to force it:
     if add_assistant_prefix:
         return [
@@ -144,65 +172,64 @@ async def llm_messages_builder_with_history(
             }
         )
 
+    current_image_count = 0
     if screenshots:
         for screenshot in screenshots:
-            media_type, image_bytes = await normalize_llm_image(screenshot)
-            encoded_image = base64.b64encode(image_bytes).decode("utf-8")
-            message: dict[str, Any]
-            if message_pattern == "anthropic":
-                message = {
-                    "type": "image",
-                    "source": {
-                        "type": "base64",
-                        "media_type": media_type,
-                        "data": encoded_image,
-                    },
-                }
-            else:
-                message = {
-                    "type": "image_url",
-                    "image_url": {
-                        "url": f"data:{media_type};base64,{encoded_image}",
-                    },
-                }
-            current_user_messages.append(message)
+            normalized_images = await normalize_llm_image(screenshot)
+            for media_type, image_bytes in (
+                normalized_images if isinstance(normalized_images, list) else [normalized_images]
+            ):
+                if current_image_count >= MAX_IMAGE_BLOCKS:
+                    raise ValueError(f"Cannot send a model request with more than {MAX_IMAGE_BLOCKS} image blocks")
+                current_image_count += 1
+                encoded_image = base64.b64encode(image_bytes).decode("utf-8")
+                message: dict[str, Any]
+                if message_pattern == "anthropic":
+                    message = {
+                        "type": "image",
+                        "source": {
+                            "type": "base64",
+                            "media_type": media_type,
+                            "data": encoded_image,
+                        },
+                    }
+                else:
+                    message = {
+                        "type": "image_url",
+                        "image_url": {
+                            "url": f"data:{media_type};base64,{encoded_image}",
+                        },
+                    }
+                current_user_messages.append(message)
 
-    # Only append a user message if there's actually content to add
+    history_image_count = sum(
+        1
+        for message in messages
+        if isinstance(message.get("content"), list)
+        for block in message["content"]
+        if isinstance(block, dict) and block.get("type") in ("image", "image_url")
+    )
+    images_to_delete = history_image_count + current_image_count - MAX_IMAGE_BLOCKS
+    if images_to_delete > 0:
+        new_messages = []
+        for message in messages:
+            blocks = message.get("content")
+            if not isinstance(blocks, list) or images_to_delete == 0:
+                new_messages.append(message)
+                continue
+            new_content = []
+            for block in blocks:
+                if images_to_delete > 0 and isinstance(block, dict) and block.get("type") in ("image", "image_url"):
+                    images_to_delete -= 1
+                else:
+                    new_content.append(block)
+            if new_content or not blocks:
+                message["content"] = new_content
+                new_messages.append(message)
+        messages = new_messages
+
     if current_user_messages:
         messages.append({"role": "user", "content": current_user_messages})
-
-    # anthropic has hard limit of image & document messages (20 as of Apr 2025)
-    # limit the number of image type messages to 10 for anthropic
-    # delete the oldest image type message if the number of image type messages is greater than 10
-    if message_pattern == "anthropic":
-        image_message_count = 0
-        for message in messages:
-            if message.get("role") == "user":
-                blocks: list[dict[str, Any]] = message.get("content", [])
-                has_image = any(block.get("type") == "image" for block in blocks)
-                if has_image:
-                    image_message_count += 1
-
-        images_to_delete = image_message_count - MAX_IMAGE_MESSAGES
-        if images_to_delete > 0:
-            new_messages = []
-            for message in messages:
-                if message.get("role") != "user":
-                    new_messages.append(message)
-                    continue
-                blocks = message.get("content", [])
-                has_image = any(block.get("type") == "image" for block in blocks)
-                new_content = []
-                if has_image and images_to_delete > 0:
-                    images_to_delete -= 1
-                    for block in blocks:
-                        if block.get("type") != "image":
-                            new_content.append(block)
-                    if new_content:
-                        new_messages.append({"role": "user", "content": new_content})
-                else:
-                    new_messages.append(message)
-            messages = new_messages
 
     return messages
 
@@ -250,6 +277,16 @@ def _reassemble_list_response(response: list[Any], allow_action_list_wrap: bool)
     return None
 
 
+def llm_response_log_metadata(response: Any) -> dict[str, str | int]:
+    """Return content-free metadata suitable for logging an LLM response."""
+    metadata: dict[str, str | int] = {"response_type": type(response).__name__}
+    if isinstance(response, dict):
+        metadata["response_keys_count"] = len(response)
+    elif isinstance(response, (list, str)):
+        metadata["response_length"] = len(response)
+    return metadata
+
+
 def _coerce_response_to_dict(response: Any, prompt_name: str | None = None) -> dict[str, Any]:
     """Ensure parsed LLM responses expose a dict interface to callers."""
     if isinstance(response, dict):
@@ -258,7 +295,7 @@ def _coerce_response_to_dict(response: Any, prompt_name: str | None = None) -> d
     LOG.warning(
         "Parsed LLM response is not a dict",
         response_type=type(response).__name__,
-        response=response,
+        response_length=len(response) if isinstance(response, (list, str)) else None,
         prompt_name=prompt_name,
     )
 
@@ -268,7 +305,7 @@ def _coerce_response_to_dict(response: Any, prompt_name: str | None = None) -> d
             LOG.info(
                 "Recovered single-object response from list-shaped LLM output",
                 response_length=len(response),
-                recovered_keys=list(reassembled.keys()),
+                recovered_keys_count=len(reassembled),
                 prompt_name=prompt_name,
             )
             return reassembled
@@ -278,7 +315,7 @@ def _coerce_response_to_dict(response: Any, prompt_name: str | None = None) -> d
             "Parsed LLM response is a list; using first dict element",
             response_length=len(response),
             first_item_type=type(response[0]).__name__ if response else None,
-            first_item_keys=list(first_dict.keys()) if first_dict else None,
+            first_item_keys_count=len(first_dict) if first_dict else None,
             prompt_name=prompt_name,
         )
         if first_dict is not None:
@@ -351,14 +388,14 @@ def parse_api_response(
             return parsed
         return _coerce_response_to_dict(parsed, prompt_name)
 
-    except Exception:
+    except Exception as parse_error:
         LOG.warning(
             "Failed to parse LLM response using json_repair. Will retry auto-fixing the response for unescaped quotes.",
-            exc_info=True,
+            error_type=type(parse_error).__name__,
         )
         try:
             if not content:
-                raise EmptyLLMResponseError(str(response))
+                raise EmptyLLMResponseError("response content was empty")
             content = _try_to_extract_json_from_markdown_format(content)
             parsed = commentjson.loads(content)
             if not force_dict:
@@ -366,10 +403,27 @@ def parse_api_response(
             return _coerce_response_to_dict(parsed, prompt_name)
         except Exception as e:
             if content:
+                choices = getattr(response, "choices", None) or []
+                choice = choices[0] if choices else None
+                usage = getattr(response, "usage", None)
                 LOG.warning(
                     "Failed to parse LLM response. Will retry auto-fixing the response for unescaped quotes.",
-                    exc_info=True,
-                    content=content,
+                    error_type=type(e).__name__,
+                    model=getattr(response, "model", None),
+                    prompt_name=prompt_name,
+                    response_type=type(response).__name__,
+                    content_length=len(content),
+                    stop_reason=getattr(choice, "finish_reason", None),
+                    token_usage=(
+                        {
+                            "prompt_tokens": getattr(usage, "prompt_tokens", None),
+                            "completion_tokens": getattr(usage, "completion_tokens", None),
+                            "total_tokens": getattr(usage, "total_tokens", None),
+                        }
+                        if usage
+                        else None
+                    ),
+                    response_id=getattr(response, "id", None),
                 )
                 try:
                     parsed = _fix_and_parse_json_string(content)
@@ -377,10 +431,10 @@ def parse_api_response(
                         return parsed
                     return _coerce_response_to_dict(parsed, prompt_name)
                 except Exception as e2:
-                    LOG.exception("Failed to auto-fix LLM response.", error=str(e2))
-                    raise InvalidLLMResponseFormat(str(response)) from e2
+                    LOG.warning("Failed to auto-fix LLM response.", error_type=type(e2).__name__)
+                    raise InvalidLLMResponseFormat("unable to parse response as JSON") from None
 
-            raise InvalidLLMResponseFormat(str(response)) from e
+            raise InvalidLLMResponseFormat("unable to parse response as JSON") from None
 
 
 def _fix_cutoff_json(json_string: str, error_position: int) -> dict[str, Any]:
