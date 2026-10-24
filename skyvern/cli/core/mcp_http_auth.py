@@ -30,7 +30,11 @@ from skyvern.forge.sdk.core.aiohttp_helper import aiohttp_request
 from skyvern.forge.sdk.db.agent_db import AgentDB
 from skyvern.forge.sdk.db.enums import OrganizationAuthTokenType
 from skyvern.forge.sdk.services.org_auth_service import resolve_org_from_api_key
-from skyvern.forge.sdk.services.request_principal import AuthKind, RequestPrincipal
+from skyvern.forge.sdk.services.request_principal import (
+    AuthKind,
+    RequestPrincipal,
+    extract_clerk_impersonator_user_id,
+)
 
 from .api_key_hash import hash_api_key_for_cache
 from .client import reset_api_key_override, set_api_key_override
@@ -359,7 +363,12 @@ async def _resolve_oauth_subject_to_org(
         api_token = await org_auth_token_service.create_org_api_token(org_id)
         LOG.info("MCP OAuth: auto-created API key for org", organization_id=org_id)
         await app.AGENT_FUNCTION.record_audit_event(
-            RequestPrincipal(organization_id=org_id, auth_kind=AuthKind.bearer, user_id=subject),
+            RequestPrincipal(
+                organization_id=org_id,
+                auth_kind=AuthKind.bearer,
+                user_id=subject,
+                impersonator_user_id=extract_clerk_impersonator_user_id(payload),
+            ),
             AuditEvent(
                 organization_id=org_id, action="api_key.create", resource_type="api_key", resource_id=api_token.id
             ),
