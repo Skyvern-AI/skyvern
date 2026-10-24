@@ -10854,7 +10854,17 @@ async def handle_upload_file_action(
 
     locator = skyvern_element.locator
 
-    file_path = await handler_utils.download_file(file_url, action.model_dump(), task.organization_id)
+    try:
+        file_path = await handler_utils.download_file(file_url, action.model_dump(), task.organization_id)
+    except handler_utils.UploadFileDownloadError as exc:
+        context = skyvern_context.current()
+        if (
+            context is not None
+            and context.pending_file_chooser is not None
+            and context.pending_file_chooser.page is page
+        ):
+            context.cleanup_pending_file_chooser()
+        return [ActionFailure(Exception(f"Failed to download file from {action.file_url}: {exc}"))]
     is_file_input = await skyvern_element.is_file_input()
 
     if not is_file_input:
@@ -12493,7 +12503,17 @@ async def chain_click(
     file = pending_upload_files or []
     if not file and action.file_url:
         file_url = get_actual_value_of_parameter_if_secret_with_task(task, action.file_url)
-        file = await handler_utils.download_file(file_url, action.model_dump(), task.organization_id)
+        try:
+            file = await handler_utils.download_file(file_url, action.model_dump(), task.organization_id)
+        except handler_utils.UploadFileDownloadError as exc:
+            context = skyvern_context.current()
+            if (
+                context is not None
+                and context.pending_file_chooser is not None
+                and context.pending_file_chooser.page is page
+            ):
+                context.cleanup_pending_file_chooser()
+            return [ActionFailure(Exception(f"Failed to download file from {action.file_url}: {exc}"))]
 
     is_filechooser_trigger = False
     is_upload_action = bool(action.file_url)
