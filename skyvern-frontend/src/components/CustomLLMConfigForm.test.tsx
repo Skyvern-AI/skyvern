@@ -72,7 +72,10 @@ async function expectTooltipFor(button: HTMLElement) {
   expect((await screen.findByRole("tooltip")).textContent).toBe(reason);
 }
 
+const originalScrollIntoView = Element.prototype.scrollIntoView;
+
 beforeEach(() => {
+  Element.prototype.scrollIntoView = vi.fn();
   state.customLLMs = [customLLM];
   state.isLoading = false;
   state.isCreating = false;
@@ -82,6 +85,7 @@ beforeEach(() => {
 
 afterEach(() => {
   cleanup();
+  Element.prototype.scrollIntoView = originalScrollIntoView;
   vi.clearAllMocks();
 });
 
@@ -136,4 +140,60 @@ describe("CustomLLMConfigForm capabilities", () => {
       ).disabled,
     ).toBe(false);
   });
+});
+
+function fillModel() {
+  fireEvent.change(screen.getByLabelText("Name"), {
+    target: { value: "Custom endpoint" },
+  });
+  fireEvent.change(screen.getByLabelText("Model ID"), {
+    target: { value: "example-model" },
+  });
+}
+
+describe("CustomLLMConfigForm", () => {
+  it.each(["", "  "])(
+    "saves a keyless OpenAI-compatible endpoint with key %j",
+    async (apiKey) => {
+      renderFor("admin");
+      fillModel();
+      fireEvent.change(screen.getByLabelText("API Base"), {
+        target: { value: "https://llm.example.test/v1" },
+      });
+      fireEvent.change(screen.getByLabelText("API Key (optional)"), {
+        target: { value: apiKey },
+      });
+      fireEvent.click(screen.getByRole("button", { name: "Add Custom LLM" }));
+
+      await waitFor(() => expect(state.createCustomLLM).toHaveBeenCalledOnce());
+      expect(state.createCustomLLM.mock.calls[0]![0].config).toMatchObject({
+        provider: "openai_compatible",
+        api_base: "https://llm.example.test/v1",
+        api_key: null,
+      });
+    },
+  );
+
+  it("still requires an API base for a keyless endpoint", async () => {
+    renderFor("admin");
+    fillModel();
+    fireEvent.click(screen.getByRole("button", { name: "Add Custom LLM" }));
+
+    expect(await screen.findByText("API base is required")).toBeTruthy();
+    expect(state.createCustomLLM).not.toHaveBeenCalled();
+  });
+
+  it.each(["OpenRouter", "Gemini"])(
+    "still requires an API key for %s",
+    async (provider) => {
+      renderFor("admin");
+      fireEvent.keyDown(screen.getByRole("combobox"), { key: "Enter" });
+      fireEvent.click(await screen.findByRole("option", { name: provider }));
+      fillModel();
+      fireEvent.click(screen.getByRole("button", { name: "Add Custom LLM" }));
+
+      expect(await screen.findByText("API key is required")).toBeTruthy();
+      expect(state.createCustomLLM).not.toHaveBeenCalled();
+    },
+  );
 });
