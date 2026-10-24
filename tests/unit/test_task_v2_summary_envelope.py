@@ -13,6 +13,7 @@ from datetime import timezone
 from types import SimpleNamespace
 
 import pytest
+from structlog.testing import capture_logs
 
 from skyvern.forge.prompts import prompt_engine
 from skyvern.services import task_v2_service
@@ -65,6 +66,20 @@ def test_parser_recovers_top_level_payload() -> None:
     assert description is None
     # The whole non-envelope reply IS the deliverable.
     assert output == _NON_ENVELOPE_RESPONSE
+
+
+def test_parser_recovery_logs_only_key_count() -> None:
+    response = {"private-model-key": "private-model-value"}
+
+    with capture_logs() as events:
+        assert _parse_task_v2_summary_response(response) == (None, response)
+
+    event = next(
+        event for event in events if event["event"] == "Recovered task_v2 summary output from non-envelope response"
+    )
+    assert event["recovered_keys_count"] == 1
+    assert "private-model-key" not in repr(event)
+    assert "private-model-value" not in repr(event)
 
 
 def test_parser_recovery_preserves_user_schema_description_key() -> None:

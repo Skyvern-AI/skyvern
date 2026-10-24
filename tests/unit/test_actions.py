@@ -1,7 +1,7 @@
 from datetime import datetime
 from pathlib import Path
 from typing import Any
-from unittest.mock import MagicMock
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 from pydantic import TypeAdapter, ValidationError
@@ -47,7 +47,13 @@ from skyvern.webeye.actions.actions import (
     WebAction,
 )
 from skyvern.webeye.actions.models import DetailedAgentStepOutput
-from skyvern.webeye.actions.parse_actions import parse_action, parse_actions
+from skyvern.webeye.actions.parse_actions import (
+    parse_action,
+    parse_actions,
+    parse_anthropic_actions,
+    parse_cua_actions,
+    parse_ui_tars_actions,
+)
 
 
 def _mock_scraped_page() -> MagicMock:
@@ -55,6 +61,115 @@ def _mock_scraped_page() -> MagicMock:
     page.id_to_element_hash = {}
     page.id_to_element_dict = {}
     return page
+
+
+@pytest.mark.asyncio
+async def test_parse_anthropic_actions_does_not_log_model_response_content(monkeypatch: pytest.MonkeyPatch) -> None:
+    sentinel = "private-anthropic-response-sentinel"
+    task = MagicMock(task_id="tsk_private", organization_id="org_private", workflow_run_id=None)
+    step = MagicMock(step_id="stp_private", order=0)
+    assistant_content = [
+        {"type": "thinking", "thinking": sentinel},
+        {"type": "thinking", "thinking": sentinel},
+        {
+            "type": "tool_use",
+            "name": "computer",
+            "id": "tool_private",
+            "input": {"action": "mouse_move", "private": sentinel},
+        },
+    ]
+    fallback = AsyncMock(return_value=[])
+    monkeypatch.setattr("skyvern.webeye.actions.parse_actions.generate_cua_fallback_actions", fallback)
+
+    with capture_logs() as events:
+        actions = await parse_anthropic_actions(task, step, assistant_content, None, None)
+
+    assert actions == []
+    assert sentinel not in repr(events)
+    assert fallback.await_count == 1
+
+
+def test_parse_actions_does_not_log_malformed_response_content(monkeypatch: pytest.MonkeyPatch) -> None:
+    sentinel = "private-malformed-action-sentinel"
+    context = MagicMock(totp_codes={})
+    monkeypatch.setattr("skyvern.webeye.actions.parse_actions.skyvern_context.ensure_context", lambda: context)
+    task = MagicMock(
+        task_id="tsk_private",
+        organization_id="org_private",
+        workflow_run_id=None,
+        data_extraction_goal=None,
+        extracted_information_schema=None,
+    )
+
+    with capture_logs() as events:
+        actions = parse_actions(
+            task,
+            "stp_private",
+            0,
+            _mock_scraped_page(),
+            [
+                {"action_type": "INPUT_TEXT", "id": "e1", "reasoning": sentinel},
+                {"action_type": "SWITCH_TAB", "tab_index": sentinel},
+                sentinel,
+            ],
+        )
+
+    assert len(actions) == 1
+    assert isinstance(actions[0], NullAction)
+    assert sentinel not in repr(events)
+    assert not any("exc_info" in event for event in events)
+
+
+@pytest.mark.asyncio
+async def test_parse_cua_actions_does_not_log_malformed_response_content(monkeypatch: pytest.MonkeyPatch) -> None:
+    sentinel = "private-cua-action-sentinel"
+    task = MagicMock(task_id="tsk_private", organization_id="org_private", workflow_run_id=None)
+    step = MagicMock(step_id="stp_private", order=0)
+    response = MagicMock()
+    response.output = [MagicMock(type="computer_call", action=MagicMock(type=sentinel))]
+    response.model_dump.return_value = {"output": [{"type": "computer_call", "action": {"type": sentinel}}]}
+    fallback = AsyncMock(return_value=[])
+    monkeypatch.setattr("skyvern.webeye.actions.parse_actions.generate_cua_fallback_actions", fallback)
+
+    with capture_logs() as events:
+        actions = await parse_cua_actions(task, step, response)
+
+    assert actions == []
+    assert sentinel not in repr(events)
+    assert not any("exc_info" in event for event in events)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("response_content", "sentinel", "expected_event"),
+    [
+        ("Action: private_ui_tars_sentinel((", "private_ui_tars_sentinel", "Failed to parse action string"),
+        ("Action: private_ui_tars_sentinel()", "private_ui_tars_sentinel", "Unsupported UI-TARS action type"),
+        (
+            "Action: click(start_box='private-ui-tars-sentinel')",
+            "private-ui-tars-sentinel",
+            "Failed to parse UI-TARS coordinates",
+        ),
+    ],
+    ids=["malformed-action", "unsupported-action-type", "malformed-coordinates"],
+)
+async def test_parse_ui_tars_actions_does_not_log_malformed_response_content(
+    response_content: str,
+    sentinel: str,
+    expected_event: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    task = MagicMock(task_id="tsk_private", organization_id="org_private", workflow_run_id=None)
+    step = MagicMock(step_id="stp_private", order=0)
+    logger = MagicMock()
+    monkeypatch.setattr("skyvern.webeye.actions.parse_actions.LOG", logger)
+
+    actions = await parse_ui_tars_actions(task, step, response_content, {"width": 1280, "height": 720})
+
+    assert actions == []
+    assert expected_event in repr(logger.mock_calls)
+    assert sentinel not in repr(logger.mock_calls)
+    assert "exc_info" not in repr(logger.mock_calls)
 
 
 def test_sdk_input_text_action_type_constant_matches_sdk_enum() -> None:

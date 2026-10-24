@@ -277,6 +277,16 @@ def _reassemble_list_response(response: list[Any], allow_action_list_wrap: bool)
     return None
 
 
+def llm_response_log_metadata(response: Any) -> dict[str, str | int]:
+    """Return content-free metadata suitable for logging an LLM response."""
+    metadata: dict[str, str | int] = {"response_type": type(response).__name__}
+    if isinstance(response, dict):
+        metadata["response_keys_count"] = len(response)
+    elif isinstance(response, (list, str)):
+        metadata["response_length"] = len(response)
+    return metadata
+
+
 def _coerce_response_to_dict(response: Any, prompt_name: str | None = None) -> dict[str, Any]:
     """Ensure parsed LLM responses expose a dict interface to callers."""
     if isinstance(response, dict):
@@ -295,7 +305,7 @@ def _coerce_response_to_dict(response: Any, prompt_name: str | None = None) -> d
             LOG.info(
                 "Recovered single-object response from list-shaped LLM output",
                 response_length=len(response),
-                recovered_keys=list(reassembled.keys()),
+                recovered_keys_count=len(reassembled),
                 prompt_name=prompt_name,
             )
             return reassembled
@@ -305,7 +315,7 @@ def _coerce_response_to_dict(response: Any, prompt_name: str | None = None) -> d
             "Parsed LLM response is a list; using first dict element",
             response_length=len(response),
             first_item_type=type(response[0]).__name__ if response else None,
-            first_item_keys=list(first_dict.keys()) if first_dict else None,
+            first_item_keys_count=len(first_dict) if first_dict else None,
             prompt_name=prompt_name,
         )
         if first_dict is not None:

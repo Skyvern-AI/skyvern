@@ -42,6 +42,22 @@ def test_coerce_response_to_dict_variants(response, expected):
         assert expected[1]
 
 
+@pytest.mark.parametrize(
+    ("response", "expected"),
+    [
+        ({"llm_response": "private-sentinel"}, {"response_type": "dict", "response_keys_count": 1}),
+        (["private-sentinel"], {"response_type": "list", "response_length": 1}),
+        ("private-sentinel", {"response_type": "str", "response_length": 16}),
+        (None, {"response_type": "NoneType"}),
+    ],
+)
+def test_llm_response_log_metadata_contains_only_shape(response, expected):
+    metadata = llm_utils.llm_response_log_metadata(response)
+
+    assert metadata == expected
+    assert "private-sentinel" not in repr(metadata)
+
+
 def test_coerce_response_warning_keeps_metadata_without_response_content():
     sentinel = "private-response-sentinel"
     response = [{"reasoning": sentinel}]
@@ -53,6 +69,11 @@ def test_coerce_response_warning_keeps_metadata_without_response_content():
     assert event["response_type"] == "list"
     assert event["response_length"] == 1
     assert event["prompt_name"] == "extract-actions"
+    first_item_event = next(
+        event for event in events if event["event"] == "Parsed LLM response is a list; using first dict element"
+    )
+    assert first_item_event["first_item_keys_count"] == 1
+    assert "first_item_keys" not in first_item_event
     assert all(sentinel not in repr(event) for event in events)
 
 

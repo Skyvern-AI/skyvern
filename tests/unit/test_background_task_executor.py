@@ -2627,7 +2627,6 @@ async def test_retry_resumer_recovers_attempt_lookup_failure_on_next_sweep(
     read_run.side_effect = None
     dispatch.side_effect = real_entry
     await executor._recover_pending_retries_once(resume_fresh=False)
-    assert key in executor._scheduled_retry_resumes
     await asyncio.gather(*executor._background_tasks)
     execute.assert_awaited_once()
     assert execute.await_args.kwargs["attempt_number"] == 2

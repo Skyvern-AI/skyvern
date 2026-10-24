@@ -167,6 +167,7 @@ from skyvern.forge.sdk.api.llm.schema_validator import (
     resolve_schema_type,
     validate_schema,
 )
+from skyvern.forge.sdk.api.llm.utils import llm_response_log_metadata
 from skyvern.forge.sdk.artifact.models import ArtifactType
 from skyvern.forge.sdk.artifact.storage.base import get_download_retry_started_at, is_file_from_retry_attempt
 from skyvern.forge.sdk.copilot.code_block_security import SlottedReference, is_inert_slot, slot_template
@@ -2981,7 +2982,7 @@ class BaseTaskBlock(Block):
                     organization_id=workflow_run.organization_id,
                     current_retry=current_retry,
                     max_retries=self.max_retries,
-                    task_output=task_output.model_dump_json(),
+                    **llm_response_log_metadata(task_output.model_dump()),
                 )
                 if not will_retry:
                     output_parameter_value = task_output.model_dump()
@@ -11297,7 +11298,7 @@ class TextPromptBlock(Block):
             except Exception as e:
                 LOG.error("Failed to save TextPromptBlock artifacts", error=e)
 
-        LOG.info("TextPromptBlock Received response from LLM", response=response)
+        LOG.info("TextPromptBlock Received response from LLM", **llm_response_log_metadata(response))
         return response
 
     async def send_prompt_with_schema_retries(
@@ -12870,7 +12871,8 @@ class FileUploadBlock(FileDestinationBlock):
                         workflow_run_block_id=workflow_run_block_id,
                         candidate_count=candidate_count,
                         selected_count=selected_count,
-                        reasoning=selection_reasoning,
+                        reasoning_type=type(selection_reasoning).__name__,
+                        reasoning_length=len(selection_reasoning) if isinstance(selection_reasoning, str) else None,
                     )
                     await self.record_output_parameter_value(workflow_run_context, workflow_run_id, uploaded_uris)
                     return await self.build_block_result(
@@ -16697,7 +16699,8 @@ class FileDownloadBlock(BaseTaskBlock, FileDestinationBlock):
                         workflow_run_block_id=workflow_run_block_id,
                         candidate_count=candidate_count,
                         selected_count=selected_count,
-                        reasoning=selection_reasoning,
+                        reasoning_type=type(selection_reasoning).__name__,
+                        reasoning_length=len(selection_reasoning) if isinstance(selection_reasoning, str) else None,
                     )
                     return result
 
@@ -18714,7 +18717,8 @@ def _parse_single_evaluation(
             LOG.warning(
                 "Conditional branch evaluation returned non-boolean result",
                 branch_index=idx,
-                result=result,
+                result_type=type(result).__name__,
+                result_length=len(result) if isinstance(result, str) else None,
                 evaluated_result=bool_result,
             )
 
@@ -19273,8 +19277,8 @@ async def _evaluate_prompt_branch_conditions_batch(
                 block_label=log_label,
                 attempt=attempt,
                 will_retry=attempt + 1 < MAX_PROMPT_BRANCH_EVAL_ATTEMPTS,
-                error=str(malformed),
-                raw_output=raw_output_value,
+                error_type=type(malformed).__name__,
+                **llm_response_log_metadata(raw_output_value),
             )
             continue
 
@@ -19298,10 +19302,10 @@ async def _evaluate_prompt_branch_conditions_batch(
         LOG.info(
             "Conditional branch evaluation results",
             block_label=log_label,
-            results=results_array,
-            llm_rendered_expressions=llm_rendered_expressions,
+            results_count=len(results_array),
+            llm_rendered_expressions_count=len(llm_rendered_expressions),
             attempt=attempt,
-            raw_output=normalized_output,
+            **llm_response_log_metadata(normalized_output),
         )
         return (results_array, llm_rendered_expressions, extraction_goal, normalized_output)
 
@@ -19309,7 +19313,7 @@ async def _evaluate_prompt_branch_conditions_batch(
         "Conditional branch evaluation failed after retries",
         block_label=log_label,
         attempts=MAX_PROMPT_BRANCH_EVAL_ATTEMPTS,
-        error=str(last_malformed),
+        error_type=type(last_malformed).__name__ if last_malformed is not None else None,
     )
     raise ConditionalBranchEvaluationError(f"Conditional branch evaluation failed: {last_malformed}")
 

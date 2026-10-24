@@ -19,6 +19,7 @@ from skyvern.exceptions import (
 from skyvern.forge import app
 from skyvern.forge.prompts import prompt_engine
 from skyvern.forge.sdk.api.llm.api_handler_factory import get_org_aware_primary_llm_api_handler
+from skyvern.forge.sdk.api.llm.utils import llm_response_log_metadata
 from skyvern.forge.sdk.core import skyvern_context
 from skyvern.forge.sdk.models import Step
 from skyvern.forge.sdk.schemas.tasks import Task
@@ -247,7 +248,10 @@ def parse_action(
         if key:
             is_single_char = len(key) == 1 and (key.isdigit() or key.isalpha())
             if key not in allowed_keys and not is_single_char:
-                LOG.warning("KEYPRESS action has unsupported key, skipping action", key=key)
+                LOG.warning(
+                    "KEYPRESS action has unsupported key, skipping action",
+                    **llm_response_log_metadata(key),
+                )
                 return NullAction(**base_action_dict)
             keys = [key]
         else:
@@ -262,7 +266,10 @@ def parse_action(
         base_action_dict["skyvern_element_data"] = None
         direction = action.get("direction", "down").lower()
         if direction not in ("up", "down"):
-            LOG.warning("SCROLL action has unexpected direction, defaulting to down", direction=direction)
+            LOG.warning(
+                "SCROLL action has unexpected direction, defaulting to down",
+                **llm_response_log_metadata(direction),
+            )
             direction = "down"
         if direction == "up":
             scroll_x = 0
@@ -281,7 +288,7 @@ def parse_action(
         except (TypeError, ValueError):
             LOG.warning(
                 "CLOSE_PAGE action returned with a non-integer tab_index, closing the current tab instead",
-                raw_action=action,
+                **llm_response_log_metadata(action),
             )
             return ClosePageAction(**base_action_dict)
         return ClosePageAction(**base_action_dict, tab_index=tab_index)
@@ -291,7 +298,10 @@ def parse_action(
         base_action_dict["skyvern_element_hash"] = None
         base_action_dict["skyvern_element_data"] = None
         if not data_extraction_goal:
-            LOG.warning("EXTRACT action returned without a data extraction goal, skipping action", raw_action=action)
+            LOG.warning(
+                "EXTRACT action returned without a data extraction goal, skipping action",
+                **llm_response_log_metadata(action),
+            )
             return NullAction(**base_action_dict)
         return ExtractAction(
             **base_action_dict,
@@ -305,18 +315,27 @@ def parse_action(
         base_action_dict["skyvern_element_data"] = None
         url = action.get("url")
         if not url or not isinstance(url, str):
-            LOG.warning("GOTO_URL action returned without a url, skipping action", raw_action=action)
+            LOG.warning(
+                "GOTO_URL action returned without a url, skipping action",
+                **llm_response_log_metadata(action),
+            )
             return NullAction(**base_action_dict)
         try:
             validated_url = prepend_scheme_and_validate_url(url.strip())
         except InvalidUrl:
-            LOG.warning("GOTO_URL action returned with an invalid url, skipping action", url=url)
+            LOG.warning(
+                "GOTO_URL action returned with an invalid url, skipping action",
+                **llm_response_log_metadata(url),
+            )
             return NullAction(**base_action_dict)
         # LLM-generated navigation targets can be steered by page content, so block
         # private/loopback/link-local hosts the same way the task URL boundary does.
         host = urlparse(validated_url).hostname
         if not host or is_blocked_host(host, resolve_dns=False):
-            LOG.warning("GOTO_URL action targets a blocked host, skipping action", url=validated_url)
+            LOG.warning(
+                "GOTO_URL action targets a blocked host, skipping action",
+                **llm_response_log_metadata(validated_url),
+            )
             return NullAction(**base_action_dict)
         return GotoUrlAction(**base_action_dict, url=validated_url)
 
@@ -328,28 +347,43 @@ def parse_action(
     if action_type == ActionType.NEW_TAB:
         url = action.get("url")
         if not url or not isinstance(url, str):
-            LOG.warning("NEW_TAB action returned without a url, skipping action", raw_action=action)
+            LOG.warning(
+                "NEW_TAB action returned without a url, skipping action",
+                **llm_response_log_metadata(action),
+            )
             return NullAction(**base_action_dict)
         try:
             validated_url = prepend_scheme_and_validate_url(url.strip())
         except InvalidUrl:
-            LOG.warning("NEW_TAB action returned with an invalid url, skipping action", url=url)
+            LOG.warning(
+                "NEW_TAB action returned with an invalid url, skipping action",
+                **llm_response_log_metadata(url),
+            )
             return NullAction(**base_action_dict)
         host = urlparse(validated_url).hostname
         if not host or is_blocked_host(host, resolve_dns=False):
-            LOG.warning("NEW_TAB action targets a blocked host, skipping action", url=validated_url)
+            LOG.warning(
+                "NEW_TAB action targets a blocked host, skipping action",
+                **llm_response_log_metadata(validated_url),
+            )
             return NullAction(**base_action_dict)
         return NewTabAction(**base_action_dict, url=validated_url)
 
     if action_type == ActionType.SWITCH_TAB:
         raw_index = action.get("tab_index")
         if raw_index is None:
-            LOG.warning("SWITCH_TAB action returned without a tab_index, skipping action", raw_action=action)
+            LOG.warning(
+                "SWITCH_TAB action returned without a tab_index, skipping action",
+                **llm_response_log_metadata(action),
+            )
             return NullAction(**base_action_dict)
         try:
             tab_index = int(raw_index)
         except (TypeError, ValueError):
-            LOG.warning("SWITCH_TAB action returned with a non-integer tab_index, skipping action", raw_action=action)
+            LOG.warning(
+                "SWITCH_TAB action returned with a non-integer tab_index, skipping action",
+                **llm_response_log_metadata(action),
+            )
             return NullAction(**base_action_dict)
         return SwitchTabAction(**base_action_dict, tab_index=tab_index)
 
@@ -392,32 +426,31 @@ def parse_actions(
                 LOG.warning(
                     "Agent decided to terminate",
                     task_id=task.task_id,
-                    llm_response=json_response,
-                    reasoning=action_instance.reasoning,
-                    actions=actions,
+                    **llm_response_log_metadata(json_response),
+                    action_type=type(action_instance).__name__,
                 )
             actions.append(action_instance)
 
-        except UnsupportedActionType:
+        except UnsupportedActionType as exc:
             LOG.error(
                 "Unsupported action type when parsing actions",
                 task_id=task.task_id,
-                raw_action=action,
-                exc_info=True,
+                error_type=type(exc).__name__,
+                **llm_response_log_metadata(action),
             )
-        except (ValidationError, ValueError):
+        except (ValidationError, ValueError) as exc:
             LOG.warning(
                 "Invalid action",
                 task_id=task.task_id,
-                raw_action=action,
-                exc_info=True,
+                error_type=type(exc).__name__,
+                **llm_response_log_metadata(action),
             )
-        except Exception:
+        except Exception as exc:
             LOG.error(
                 "Failed to marshal action",
                 task_id=task.task_id,
-                raw_action=action,
-                exc_info=True,
+                error_type=type(exc).__name__,
+                **llm_response_log_metadata(action),
             )
 
     if non_object_entries:
@@ -427,7 +460,6 @@ def parse_actions(
             skipped_count=len(non_object_entries),
             raw_action_count=len(json_response),
             parsed_action_count=len(actions),
-            sample_entries=[str(entry)[:200] for entry in non_object_entries[:3]],
         )
 
     ############################ This part of code might not be needed ############################
@@ -442,8 +474,8 @@ def parse_actions(
         LOG.warning(
             "Missing elements in scraped page",
             task_id=task.task_id,
-            missing_element_ids=missing_element_ids,
-            all_element_ids=all_element_ids,
+            missing_element_ids_count=len(missing_element_ids),
+            all_element_ids_count=len(all_element_ids),
         )
     ############################ This part of code might not be needed ############################
     return actions
@@ -467,13 +499,15 @@ async def parse_cua_actions(
             if idx < len(reasonings):
                 try:
                     reasoning = reasonings[idx].summary[0].text
-                except Exception:
-                    LOG.exception(
+                except Exception as exc:
+                    LOG.error(
                         "Failed to parse reasoning",
                         task_id=task.task_id,
                         step_id=step.step_id,
                         step_order=step.order,
                         action_order=idx,
+                        error_type=type(exc).__name__,
+                        **llm_response_log_metadata(reasonings[idx]),
                     )
 
             match action_type:
@@ -547,7 +581,7 @@ async def parse_cua_actions(
                             step_id=step.step_id,
                             step_order=step.order,
                             action_order=idx,
-                            whole_path=whole_path,
+                            **llm_response_log_metadata(whole_path),
                         )
                         action = WaitAction(
                             seconds=5,
@@ -579,13 +613,15 @@ async def parse_cua_actions(
             action.step_order = step.order
             action.action_order = idx
             actions.append(action)
-        except Exception:
-            LOG.exception(
+        except Exception as exc:
+            LOG.error(
                 "Failed to parse action",
                 task_id=task.task_id,
                 step_id=step.step_id,
                 step_order=step.order,
                 action_order=idx,
+                error_type=type(exc).__name__,
+                **llm_response_log_metadata(cua_action),
             )
             break
     if not actions:
@@ -595,7 +631,7 @@ async def parse_cua_actions(
             step_id=step.step_id,
             organization_id=task.organization_id,
             workflow_run_id=task.workflow_run_id,
-            response=response.model_dump(),
+            **llm_response_log_metadata(response.model_dump()),
         )
         reasoning = reasonings[0].summary[0].text if reasonings and reasonings[0].summary else None
         assistant_message = assistant_messages[0].content[0].text if assistant_messages else None
@@ -615,13 +651,18 @@ async def parse_anthropic_actions(
 ) -> list[Action]:
     tool_calls = [block for block in assistant_content if block["type"] == "tool_use" and block["name"] == "computer"]
     reasonings = [block for block in assistant_content if block["type"] == "thinking"]
-    LOG.info("Anthropic tool calls", tool_calls=tool_calls, reasonings=reasonings, assistant_content=assistant_content)
+    LOG.info(
+        "Anthropic tool calls",
+        tool_call_count=len(tool_calls),
+        reasoning_count=len(reasonings),
+        assistant_content_count=len(assistant_content),
+    )
     if len(reasonings) > 1:
         LOG.warning(
             "Anthropic CUA: multiple reasonings in assistant content",
             task_id=task.task_id,
             step_id=step.step_id,
-            assistant_content=assistant_content,
+            assistant_content_count=len(assistant_content),
         )
     reasoning = reasonings[0]["thinking"] if reasonings else None
     idx = 0
@@ -640,7 +681,8 @@ async def parse_anthropic_actions(
                 if not coordinate:
                     LOG.warning(
                         "Anthropic CUA error: mouse move action has no coordinate",
-                        tool_call=tool_call,
+                        tool_call_type=type(tool_call).__name__,
+                        tool_call_keys_count=len(tool_call),
                     )
                     idx += 1
                     continue
@@ -677,7 +719,8 @@ async def parse_anthropic_actions(
                 if not coordinate:
                     LOG.warning(
                         "Anthropic CUA error: left click action has no coordinate and it doesn't have mouse_move before it",
-                        tool_call=tool_call,
+                        tool_call_type=type(tool_call).__name__,
+                        tool_call_keys_count=len(tool_call),
                     )
                     idx += 1
                     continue
@@ -719,7 +762,8 @@ async def parse_anthropic_actions(
                 if not text:
                     LOG.warning(
                         "Anthropic CUA error: type action has no text",
-                        tool_call=tool_call,
+                        tool_call_type=type(tool_call).__name__,
+                        tool_call_keys_count=len(tool_call),
                     )
                     idx += 1
                     continue
@@ -744,7 +788,8 @@ async def parse_anthropic_actions(
                 if not text:
                     LOG.warning(
                         "Anthropic CUA error: key action has no text",
-                        tool_call=tool_call,
+                        tool_call_type=type(tool_call).__name__,
+                        tool_call_keys_count=len(tool_call),
                     )
                     idx += 1
                     continue
@@ -811,7 +856,8 @@ async def parse_anthropic_actions(
                 else:
                     LOG.warning(
                         "Anthropic CUA error: unsupported scroll direction",
-                        tool_call=tool_call,
+                        tool_call_type=type(tool_call).__name__,
+                        tool_call_keys_count=len(tool_call),
                     )
                     idx += 1
                     continue
@@ -867,12 +913,19 @@ async def parse_anthropic_actions(
                 coordinate = tool_call_input.get("coordinate")
                 start_coordinate = tool_call_input.get("start_coordinate")
                 LOG.info(
-                    "Anthropic CUA left click drag action", coordinate=coordinate, start_coordinate=start_coordinate
+                    "Anthropic CUA left click drag action",
+                    coordinate_type=type(coordinate).__name__,
+                    coordinate_length=len(coordinate) if isinstance(coordinate, (list, tuple, str)) else None,
+                    start_coordinate_type=type(start_coordinate).__name__,
+                    start_coordinate_length=(
+                        len(start_coordinate) if isinstance(start_coordinate, (list, tuple, str)) else None
+                    ),
                 )
                 if not coordinate or not start_coordinate:
                     LOG.warning(
                         "Anthropic CUA error: left click drag action has no coordinate or start coordinate",
-                        tool_call=tool_call,
+                        tool_call_type=type(tool_call).__name__,
+                        tool_call_keys_count=len(tool_call),
                     )
                     idx += 1
                     continue
@@ -921,15 +974,18 @@ async def parse_anthropic_actions(
             else:
                 LOG.error(
                     "Anthropic CUA error: unsupported action",
-                    tool_call=tool_call,
+                    tool_call_type=type(tool_call).__name__,
+                    tool_call_keys_count=len(tool_call),
                 )
             idx += 1
-        except Exception:
-            LOG.exception(
+        except Exception as exc:
+            LOG.error(
                 "Anthropic CUA error: failed to parse action",
                 task_id=task.task_id,
                 step_id=step.step_id,
-                tool_call=tool_call,
+                tool_call_type=type(tool_call).__name__,
+                tool_call_keys_count=len(tool_call),
+                error_type=type(exc).__name__,
             )
             break
     if not actions:
@@ -976,9 +1032,8 @@ async def generate_cua_fallback_actions(
         prompt_name="cua-fallback-action",
         step=step,
     )
-    LOG.info("Fallback action response", action_response=action_response)
+    LOG.info("Fallback action response", **llm_response_log_metadata(action_response))
     skyvern_action_type = action_response.get("action")
-    useful_information = action_response.get("useful_information")
 
     # use 'other' action as fallback in the 'cua-fallback-action' prompt
     # it can avoid LLM returning unreasonable actions, and fallback to use 'wait' action in agent instead
@@ -992,9 +1047,7 @@ async def generate_cua_fallback_actions(
             "Updating task with useful information",
             task_id=task.task_id,
             organization_id=task.organization_id,
-            useful_information=useful_information,
-            assistant_message=assistant_message,
-            reasoning=reasoning,
+            **llm_response_log_metadata(action_response),
         )
         await app.DATABASE.tasks.update_task(
             task.task_id,
@@ -1203,12 +1256,13 @@ async def parse_ui_tars_actions(
                 action = _create_ui_tars_action(parsed_action, task, step, browser_window_dimension, idx)
                 if action:
                     actions.append(action)
-            except Exception:
-                LOG.exception(
+            except Exception as exc:
+                LOG.error(
                     "Failed to create UI-TARS action",
                     task_id=task.task_id,
                     step_id=step.step_id,
-                    parsed_action=parsed_action,
+                    error_type=type(exc).__name__,
+                    **llm_response_log_metadata(parsed_action),
                 )
                 continue
 
@@ -1217,17 +1271,18 @@ async def parse_ui_tars_actions(
                 "No valid actions generated from UI-TARS response",
                 task_id=task.task_id,
                 step_id=step.step_id,
-                response_preview=response_content[:200],
+                **llm_response_log_metadata(response_content),
             )
 
         return actions
 
-    except Exception:
-        LOG.exception(
+    except Exception as exc:
+        LOG.error(
             "Failed to parse UI-TARS actions",
             task_id=task.task_id,
             step_id=step.step_id,
-            response_content=response_content[:200],
+            error_type=type(exc).__name__,
+            **llm_response_log_metadata(response_content),
         )
         return []
 
@@ -1307,11 +1362,11 @@ def _parse_ui_tars_response(response_content: str, browser_window_dimension: Res
                 parsed_action["thought"] = thought
                 parsed_action["browser_window_dimension"] = browser_window_dimension
                 parsed_actions.append(parsed_action)
-        except Exception:
+        except Exception as exc:
             LOG.warning(
                 "Failed to parse individual UI-TARS action",
-                action_str=action_str,
-                exc_info=True,
+                error_type=type(exc).__name__,
+                **llm_response_log_metadata(action_str),
             )
             continue
 
@@ -1351,8 +1406,12 @@ def _parse_single_action(action_str: str) -> dict[str, Any] | None:
             "action_inputs": action_inputs,
         }
 
-    except Exception:
-        LOG.debug(f"Failed to parse action string: {action_str}", exc_info=True)
+    except Exception as exc:
+        LOG.debug(
+            "Failed to parse action string",
+            error_type=type(exc).__name__,
+            **llm_response_log_metadata(action_str),
+        )
         return None
 
 
@@ -1508,7 +1567,10 @@ def _create_ui_tars_action(
         )
 
     else:
-        LOG.warning(f"Unsupported UI-TARS action type: {action_type}")
+        LOG.warning(
+            "Unsupported UI-TARS action type",
+            **llm_response_log_metadata(action_type),
+        )
         return None
 
 
@@ -1581,6 +1643,10 @@ def _extract_ui_tars_coordinates(box_str: str, browser_window_dimension: Resolut
         else:
             return None, None
 
-    except Exception:
-        LOG.debug(f"Failed to parse UI-TARS coordinates: {box_str}", exc_info=True)
+    except Exception as exc:
+        LOG.debug(
+            "Failed to parse UI-TARS coordinates",
+            error_type=type(exc).__name__,
+            **llm_response_log_metadata(box_str),
+        )
         return None, None
