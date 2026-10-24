@@ -613,33 +613,6 @@ class SchedulesRepository(BaseRepository):
             await session.refresh(workflow_schedule)
             return convert_to_workflow_schedule(workflow_schedule, self.debug_enabled)
 
-    @db_operation("restore_workflow_schedule")
-    async def restore_workflow_schedule(
-        self,
-        workflow_schedule_id: str,
-        organization_id: str,
-    ) -> WorkflowSchedule | None:
-        async with self.Session() as session:
-            workflow_schedule = (
-                await session.scalars(
-                    select(WorkflowScheduleModel)
-                    .filter_by(
-                        workflow_schedule_id=workflow_schedule_id,
-                        organization_id=organization_id,
-                    )
-                    .filter(WorkflowScheduleModel.deleted_at.isnot(None))
-                )
-            ).first()
-            if not workflow_schedule:
-                return None
-
-            _adopt_schedule(workflow_schedule, organization_id)
-            workflow_schedule.deleted_at = None
-            workflow_schedule.modified_at = datetime.now(UTC)
-            await session.commit()
-            await session.refresh(workflow_schedule)
-            return convert_to_workflow_schedule(workflow_schedule, self.debug_enabled)
-
     @db_operation("list_organization_schedules")
     async def list_organization_schedules(
         self,
@@ -822,8 +795,8 @@ class SchedulesRepository(BaseRepository):
         return schedules, total_count
 
     @db_operation("soft_delete_orphaned_schedules")
-    async def soft_delete_orphaned_schedules(self, limit: int = 500) -> list[tuple[str, str]]:
-        """Soft-delete orphaned schedules and return their identities.
+    async def soft_delete_orphaned_schedules(self, limit: int = 500) -> list[tuple[str, str, str | None]]:
+        """Soft-delete orphaned schedules; returns (schedule id, workflow permanent id, backend schedule id).
 
         Uses a single UPDATE ... RETURNING statement so orphan detection and
         soft-deletion happen atomically in one DB round-trip.
@@ -856,8 +829,53 @@ class SchedulesRepository(BaseRepository):
                 .returning(
                     WorkflowScheduleModel.workflow_schedule_id,
                     WorkflowScheduleModel.workflow_permanent_id,
+                    WorkflowScheduleModel.backend_schedule_id,
                 )
             )
             result = await session.execute(update_query)
             await session.commit()
-            return [(row[0], row[1]) for row in result.all()]
+            return [(row[0], row[1], row[2]) for row in result.all()]
+
+    @db_operation("list_deleted_schedules_with_backend_schedules")
+    async def list_deleted_schedules_with_backend_schedules(self, limit: int = 500) -> list[tuple[str, str]]:
+        """(schedule id, backend schedule id) of soft-deleted rows whose backend schedule is not yet known gone."""
+        async with self.Session() as session:
+            rows = await session.execute(
+                select(WorkflowScheduleModel.workflow_schedule_id, WorkflowScheduleModel.backend_schedule_id)
+                .where(
+                    WorkflowScheduleModel.deleted_at.is_not(None),
+                    WorkflowScheduleModel.backend_schedule_id.is_not(None),
+                )
+                .order_by(WorkflowScheduleModel.deleted_at)
+                .limit(limit)
+            )
+            return [(row[0], row[1]) for row in rows.all()]
+
+    @db_operation("get_live_backend_schedule_ids")
+    async def get_live_backend_schedule_ids(self, backend_schedule_ids: list[str]) -> set[str]:
+        if not backend_schedule_ids:
+            return set()
+        async with self.Session() as session:
+            rows = await session.scalars(
+                select(WorkflowScheduleModel.backend_schedule_id).where(
+                    WorkflowScheduleModel.deleted_at.is_(None),
+                    WorkflowScheduleModel.backend_schedule_id.in_(backend_schedule_ids),
+                )
+            )
+            return {backend_id for backend_id in rows.all() if backend_id}
+
+    @db_operation("clear_deleted_schedule_backend_ids")
+    async def clear_deleted_schedule_backend_ids(self, workflow_schedule_ids: list[str]) -> None:
+        """Record that these soft-deleted rows' backend schedules are gone, so the sweep stops retrying them."""
+        if not workflow_schedule_ids:
+            return
+        async with self.Session() as session:
+            await session.execute(
+                update(WorkflowScheduleModel)
+                .where(
+                    WorkflowScheduleModel.workflow_schedule_id.in_(workflow_schedule_ids),
+                    WorkflowScheduleModel.deleted_at.is_not(None),
+                )
+                .values({WorkflowScheduleModel.backend_schedule_id: None})
+            )
+            await session.commit()
