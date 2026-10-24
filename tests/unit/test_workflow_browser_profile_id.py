@@ -12,10 +12,13 @@ import pytest
 
 from skyvern.exceptions import SkyvernHTTPException, WorkflowHasNoBlocks
 from skyvern.forge.sdk.core import skyvern_context
+from skyvern.forge.sdk.routes.agent_protocol import _workflow_run_request_to_legacy_request
 from skyvern.forge.sdk.workflow.models.block import ForLoopBlock
 from skyvern.forge.sdk.workflow.models.parameter import OutputParameter
 from skyvern.forge.sdk.workflow.models.workflow import Workflow, WorkflowDefinition, WorkflowRequestBody
 from skyvern.forge.sdk.workflow.service import WorkflowService
+from skyvern.schemas.proxy_location import ProxyLocation, ProxyLocationInput
+from skyvern.schemas.runs import WorkflowRunRequest
 from skyvern.schemas.workflows import WorkflowCreateYAMLRequest, WorkflowDefinitionYAML, WorkflowStatus
 
 
@@ -509,13 +512,14 @@ def _configure_setup_app_mocks(mock_app: Any) -> None:
 def _make_workflow_stub(
     browser_profile_id: str | None,
     max_elapsed_time_minutes: int | None = None,
+    proxy_location: ProxyLocationInput = None,
 ) -> SimpleNamespace:
     return SimpleNamespace(
         workflow_id="wf_test",
         workflow_permanent_id="wpid_test",
         organization_id="org_test",
         title="test",
-        proxy_location=None,
+        proxy_location=proxy_location,
         webhook_callback_url=None,
         extra_http_headers=None,
         cdp_connect_headers=None,
@@ -623,6 +627,57 @@ async def test_setup_workflow_run_session_present_skips_workflow_default() -> No
         )
 
     assert request.browser_profile_id is None
+
+
+async def _setup_run_proxy_location(
+    workflow_proxy_location: ProxyLocationInput, body: dict[str, Any]
+) -> WorkflowRequestBody:
+    """Run the public /run/agents body through the route conversion and setup_workflow_run.
+
+    The body is validated the way FastAPI validates it so an omitted proxy_location carries the
+    request model's RESIDENTIAL default, which is the state that used to shadow the workflow value.
+    """
+    workflow_stub = _make_workflow_stub(browser_profile_id=None, proxy_location=workflow_proxy_location)
+    service, organization, _ = _make_setup_service(workflow_stub)
+    request = _workflow_run_request_to_legacy_request(WorkflowRunRequest.model_validate(body))
+
+    with patch("skyvern.forge.sdk.workflow.service.app") as mock_app:
+        _configure_setup_app_mocks(mock_app)
+
+        await service.setup_workflow_run(
+            request_id="req_test",
+            workflow_request=request,
+            workflow_permanent_id="wpid_test",
+            organization=organization,
+        )
+
+    return request
+
+
+@pytest.mark.asyncio
+async def test_run_without_proxy_location_inherits_the_workflow_region() -> None:
+    request = await _setup_run_proxy_location(ProxyLocation.RESIDENTIAL_FR, {"workflow_id": "wpid_test"})
+
+    assert request.proxy_location == ProxyLocation.RESIDENTIAL_FR
+
+
+@pytest.mark.asyncio
+async def test_run_level_proxy_location_overrides_the_workflow_region() -> None:
+    request = await _setup_run_proxy_location(
+        ProxyLocation.RESIDENTIAL_FR,
+        {"workflow_id": "wpid_test", "proxy_location": ProxyLocation.RESIDENTIAL_IT.value},
+    )
+
+    assert request.proxy_location == ProxyLocation.RESIDENTIAL_IT
+
+
+@pytest.mark.asyncio
+async def test_run_without_proxy_location_on_a_regionless_workflow_stays_unset() -> None:
+    # Nothing configured anywhere still resolves to the residential default at launch, via
+    # runtime_proxy_location rather than a value baked onto the run.
+    request = await _setup_run_proxy_location(None, {"workflow_id": "wpid_test"})
+
+    assert request.proxy_location is None
 
 
 @pytest.mark.asyncio
