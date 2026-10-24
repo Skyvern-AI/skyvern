@@ -1,3 +1,5 @@
+import { useContext } from "react";
+
 import { DOCS_MCP_URL } from "@/util/externalLinks";
 import {
   BookmarkIcon,
@@ -39,6 +41,10 @@ import { defaultWorkflowRequest } from "@/routes/workflows/defaultWorkflowReques
 import { useCreateWorkflowMutation } from "@/routes/workflows/hooks/useCreateWorkflowMutation";
 import { shouldDefaultRecipesOpen } from "./sidebarDefaults";
 import { usePostHog } from "posthog-js/react";
+import { OidcAuthContext } from "@/store/OnPremOidcContext";
+import { usePageSlots } from "@/store/PageSlots";
+
+const MANAGE_ORGANIZATION_CAPABILITY = "organization.rbac.manage";
 
 const recipeAnalyticsByPath: Record<string, { beta: boolean; badge?: string }> =
   {
@@ -60,6 +66,15 @@ type Props = {
 function SideNav({ collapsed }: Props = {}) {
   const createWorkflowMutation = useCreateWorkflowMutation();
   const postHog = usePostHog();
+  const { enabled: oidcEnabled } = useContext(OidcAuthContext);
+  const { permissions } = usePageSlots();
+  const canManageOrganization =
+    permissions?.status === "ready" &&
+    permissions.data.capabilities.some(
+      (permission) =>
+        permission.capability === MANAGE_ORGANIZATION_CAPABILITY &&
+        permission.allowed,
+    );
   const captureRecipeClick = (label: string, to: string) => {
     const analytics = recipeAnalyticsByPath[to] ?? { beta: false };
     postHog?.capture("sidebar.agent.clicked", {
@@ -276,6 +291,15 @@ function SideNav({ collapsed }: Props = {}) {
           to: "/settings",
           icon: <GearIcon className="size-3.5" />,
         },
+        ...(oidcEnabled && canManageOrganization
+          ? [
+              {
+                label: "Members",
+                to: "/settings/members",
+                icon: <PersonIcon className="size-3.5" />,
+              },
+            ]
+          : []),
         {
           label: "Labels",
           to: "/settings/labels",

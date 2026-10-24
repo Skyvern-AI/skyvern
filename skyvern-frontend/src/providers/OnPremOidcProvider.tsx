@@ -67,7 +67,7 @@ function OidcPermissionsProvider({
     let retryTimeout: number | undefined;
     const loadCapabilities = async () => {
       try {
-        const client = await getClient(credentialGetter, "sans-api-v1");
+        const client = await getClient(credentialGetter, "v1");
         const { data } =
           await client.get<CapabilitiesResponse>("/auth/capabilities");
         if (active) setPermissions({ status: "ready", data });

@@ -170,6 +170,7 @@ describe("OnPremOidcProvider", () => {
     expect((await screen.findByTestId("permissions")).textContent).toContain(
       "ready:true",
     );
+    expect(mocks.getClient).toHaveBeenCalledWith(expect.any(Function), "v1");
     expect(get).toHaveBeenCalledWith("/auth/capabilities");
   });
 
@@ -200,6 +201,7 @@ describe("OnPremOidcProvider", () => {
       "ready:true",
     );
     expect(manager.getUser).toHaveBeenCalledTimes(2);
+    expect(mocks.getClient).toHaveBeenCalledWith(expect.any(Function), "v1");
     expect(get).toHaveBeenCalledWith("/auth/capabilities");
   });
 
