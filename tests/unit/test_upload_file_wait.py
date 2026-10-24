@@ -14,8 +14,9 @@ from playwright.async_api import TimeoutError as PlaywrightTimeoutError
 
 from skyvern.exceptions import SkyvernPageAnalysisTimeout
 from skyvern.webeye.actions import handler as handler_module
-from skyvern.webeye.actions.actions import UploadFileAction
+from skyvern.webeye.actions.actions import ClickAction, UploadFileAction
 from skyvern.webeye.actions.handler import _wait_for_upload_processing
+from skyvern.webeye.actions.responses import ActionFailure, ActionSuccess
 from skyvern.webeye.browser_engine import BrowserEngineMetadata, BrowserEngineSelection
 
 
@@ -160,6 +161,109 @@ async def test_upload_resolves_before_dispatch_and_reuses_exact_selection(select
     assert events == ["resolve", "dispatch", "wait"]
     resolver.assert_called_once_with(task, handler_module.app.BROWSER_MANAGER)
     assert wait.await_args.kwargs["engine_selection"] is selection
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("local_path", [False, True], ids=["remote-fetch", "local-path-permission"])
+async def test_upload_fetch_failure_does_not_fall_through_to_click_success(local_path: bool) -> None:
+    file_url = "/outside/example.txt" if local_path else "https://files.example.test/example.txt"
+    element = MagicMock(
+        locator=MagicMock(),
+        is_file_input=AsyncMock(return_value=False),
+        find_file_input_in_children=AsyncMock(return_value=None),
+    )
+    dom = MagicMock(get_skyvern_element_by_id=AsyncMock(return_value=element))
+    task = MagicMock(navigation_goal=file_url, navigation_payload={}, organization_id="org")
+    click_fallback = AsyncMock(return_value=[ActionSuccess()])
+    page = MagicMock()
+    listener = Mock()
+    context = handler_module.skyvern_context.SkyvernContext(
+        pending_file_chooser=handler_module.skyvern_context.PendingFileChooserListener(
+            page=page,
+            file_paths="/tmp/previous.txt",
+            handler=listener,
+        )
+    )
+
+    with (
+        patch.object(handler_module, "DomUtil", return_value=dom),
+        patch.object(handler_module, "get_actual_value_of_parameter_if_secret_with_task", return_value=file_url),
+        patch.object(
+            handler_module.handler_utils,
+            "download_file_api",
+            new=AsyncMock(
+                side_effect=AssertionError("local paths must not use the remote fetch")
+                if local_path
+                else RuntimeError("fetch failed")
+            ),
+        ),
+        patch.object(handler_module.handler_utils, "resolve_run_download_id", return_value="wr_test"),
+        patch.object(
+            handler_module.handler_utils,
+            "validate_local_file_path",
+            side_effect=PermissionError("outside the allowed download directory")
+            if local_path
+            else AssertionError("remote URLs must not use local path validation"),
+        ),
+        patch.object(handler_module.SkyvernElement, "wait_until_enabled", new=AsyncMock(return_value=True)),
+        patch.object(handler_module, "chain_click", new=click_fallback),
+        patch.object(handler_module.skyvern_context, "current", return_value=context),
+    ):
+        results = await handler_module.handle_upload_file_action(
+            UploadFileAction(element_id="file", file_url=file_url),
+            page,
+            MagicMock(),
+            task,
+            MagicMock(),
+        )
+
+    assert len(results) == 1
+    assert isinstance(results[0], ActionFailure)
+    assert "Failed to download file" in results[0].exception_message
+    click_fallback.assert_not_awaited()
+    assert context.pending_file_chooser is None
+    page.remove_listener.assert_called_once_with("filechooser", listener)
+
+
+@pytest.mark.asyncio
+async def test_click_upload_fetch_failure_returns_action_failure() -> None:
+    file_url = "https://files.example.test/example.txt"
+    element = MagicMock(get_id=Mock(return_value="file"), locator=MagicMock())
+    dom = MagicMock(resolve_effective_click_target=AsyncMock(return_value=element))
+    task = MagicMock(organization_id="org")
+    page = MagicMock()
+    listener = Mock()
+    context = handler_module.skyvern_context.SkyvernContext(
+        pending_file_chooser=handler_module.skyvern_context.PendingFileChooserListener(
+            page=page,
+            file_paths="/tmp/previous.txt",
+            handler=listener,
+        )
+    )
+
+    with (
+        patch.object(handler_module, "DomUtil", return_value=dom),
+        patch.object(handler_module, "get_actual_value_of_parameter_if_secret_with_task", return_value=file_url),
+        patch.object(
+            handler_module.handler_utils,
+            "download_file_api",
+            new=AsyncMock(side_effect=RuntimeError("fetch failed")),
+        ),
+        patch.object(handler_module.skyvern_context, "current", return_value=context),
+    ):
+        results = await handler_module.chain_click(
+            task,
+            MagicMock(),
+            page,
+            ClickAction(element_id="file", file_url=file_url),
+            element,
+        )
+
+    assert len(results) == 1
+    assert isinstance(results[0], ActionFailure)
+    assert results[0].exception_message == f"Failed to download file from {file_url}: File download failed"
+    assert context.pending_file_chooser is None
+    page.remove_listener.assert_called_once_with("filechooser", listener)
 
 
 @pytest.mark.asyncio
