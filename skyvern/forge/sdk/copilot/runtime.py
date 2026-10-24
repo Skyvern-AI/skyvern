@@ -801,6 +801,11 @@ class AgentContext:
     # Keyed by (browser session, run): how to fetch the secrets that run has not handed over yet. A run
     # that paused or was stopped at the ceiling returns before the worker publishes them.
     awaited_run_secret_handoffs: dict[tuple[str, str], Callable[[], Awaitable[None]]] = field(default_factory=dict)
+    # Browsers this turn minted, each mapped to the last run dispatched into it. A client's
+    # browser_session_id is honoured only when it names a studio debug session, so these are
+    # reachable by this turn alone and are closed when it ends rather than left to bill out their
+    # budgets. A run left to its owner takes its browser out of the ledger.
+    minted_browser_sessions: dict[str, str | None] = field(default_factory=dict)
 
     # Set by tool gates / loop guards / tool-side error branches when a tool
     # dispatch is blocked. The finalization shim in agent.py reads this at
@@ -1818,13 +1823,16 @@ async def acquire_fresh_exit_browser_session(
     if denial is not None:
         return _browser_session_acquisition_failure_result(denial)
     try:
-        return await app.PERSISTENT_SESSIONS_MANAGER.create_fresh_exit_session(
+        receipt = await app.PERSISTENT_SESSIONS_MANAGER.create_fresh_exit_session(
             organization_id=ctx.organization_id,
             prior_browser_session_id=prior_browser_session_id,
             proxy_location=proxy_location,
             browser_profile_id=browser_profile_id,
             session_kind=BrowserSessionKind.copilot,
         )
+        if receipt.new_browser_session_id:
+            ctx.minted_browser_sessions.setdefault(receipt.new_browser_session_id, None)
+        return receipt
     except BrowserSessionCreditAdmissionRefusal:
         return _browser_session_acquisition_failure_result(
             BuildTestConnectFailure(state="billing_credit_admission_refusal", retry_action=None)
@@ -1928,9 +1936,12 @@ async def _provision_browser_session(
             creation_kwargs = _seeded_create_session_kwargs(seed)
             if proxy_location is not None:
                 creation_kwargs.setdefault("proxy_location", proxy_location)
+            # The session worker reuses a creation budget as its idle grace, so this budget is how
+            # long a browser nothing comes back for stays up and billable. The studio's own
+            # interactive budget is the one the renewal thresholds are calibrated against.
             session = await app.PERSISTENT_SESSIONS_MANAGER.create_session(
                 organization_id=ctx.organization_id,
-                timeout_minutes=30,
+                timeout_minutes=settings.DEBUG_SESSION_TIMEOUT_MINUTES,
                 created_by="copilot",
                 session_kind=BrowserSessionKind.copilot,
                 created_for_workflow_permanent_id=ctx.workflow_permanent_id,
@@ -1955,6 +1966,9 @@ async def _provision_browser_session(
         else:
             ctx.browser_session_id = session.persistent_browser_session_id
             installed_session_id = ctx.browser_session_id
+            # Recorded before the boot wait: a session that never became attachable is still a live
+            # browser this turn is the only reader of.
+            ctx.minted_browser_sessions.setdefault(installed_session_id, None)
 
         # DefaultPersistentSessionsManager schedules chromium in a background
         # task and returns from create_session before browser_context is set,

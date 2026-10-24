@@ -171,7 +171,7 @@ FILE_PARSER_LLM_CALL_TIMEOUT_SECONDS = 250
 # Wall-clock ceiling for OCR'ing every page of one scanned PDF: MAX_PDF_OCR_PAGES in rounds of PDF_OCR_PAGE_CONCURRENCY,
 # one retry per page, at the ~30 s a slow OCR call takes. It, not the per-call ceiling, bounds a scan whose pages stall.
 PDF_OCR_TOTAL_TIMEOUT_SECONDS = 600
-MAX_IMAGE_MESSAGES = 10
+MAX_IMAGE_BLOCKS = 20
 SCROLL_AMOUNT_MULTIPLIER = 100
 EXTRACT_ACTION_SCROLL_AMOUNT = 500  # pixels per scroll action from extract-action prompt
 

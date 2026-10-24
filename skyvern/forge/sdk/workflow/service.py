@@ -475,6 +475,10 @@ OWNED_SESSION_CLOSE_TIMEOUT_SECONDS = 30.0
 # Ten windows (300 seconds), plus the timestamp CAS pin, require five full minutes of continuously
 # failed activity writes before a live client can lose its browser.
 REUSED_SESSION_ROUTER_ACTIVITY_STALE_AFTER = timedelta(seconds=300)
+# How often a running workflow asks the manager to move its browser session's deadline. Paired with
+# DEBUG_SESSION_TIMEOUT_THRESHOLD_MINUTES so a session gets 2+ renewal attempts before it expires,
+# which is the floor any caller-supplied session's creation budget has to clear.
+BROWSER_SESSION_RENEWAL_INTERVAL_SECONDS = 300
 
 # Limit burst concurrency for status-path fetches that are typically hit by client polling.
 WORKFLOW_STATUS_RESPONSE_MAX_IN_FLIGHT = 3
@@ -8065,7 +8069,7 @@ class WorkflowService:
         start_time = asyncio.get_event_loop().time()
         while True:
             try:
-                await asyncio.sleep(300)  # 5 minutes — ensures 2+ attempts within the 10-min renewal threshold
+                await asyncio.sleep(BROWSER_SESSION_RENEWAL_INTERVAL_SECONDS)
                 elapsed = asyncio.get_event_loop().time() - start_time
                 if elapsed >= max_renewal_seconds:
                     LOG.info(

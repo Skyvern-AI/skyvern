@@ -2395,7 +2395,7 @@ class LLMAPIHandlerFactory:
                             LOG.warning(
                                 "Vertex cache primary call failed, retrying via router",
                                 prompt_name=prompt_name,
-                                error=str(cache_error),
+                                error_type=type(cache_error).__name__,
                                 cache_name=cache_resource_name,
                                 cache_variant=cache_variant,
                             )
@@ -4119,6 +4119,7 @@ class LLMCaller:
                 response = await self._dispatch_llm_call(
                     messages=messages,
                     tools=tools,
+                    prompt_name=prompt_name,
                     **active_parameters,
                 )
                 if _response_finish_reason(response) == "content_filter":
@@ -4476,7 +4477,11 @@ class LLMCaller:
         if fallback_group is None:
             raise LLMContentFilteredError(self.llm_key, [refused_on])
         fallback_response = await self._dispatch_llm_call(
-            messages=messages, tools=tools, router_model_group=fallback_group, **active_parameters
+            messages=messages,
+            tools=tools,
+            router_model_group=fallback_group,
+            prompt_name=prompt_name,
+            **active_parameters,
         )
         if _response_finish_reason(fallback_response) == "content_filter":
             await self._log_refused_response(fallback_response, prompt_name, fallback_group, None)
@@ -4517,7 +4522,7 @@ class LLMCaller:
             return response, None
         truncated_stats = await self._log_discarded_response_stats(response, prompt_name)
         return (
-            await self._dispatch_llm_call(messages=messages, tools=tools, **retry_parameters),
+            await self._dispatch_llm_call(messages=messages, tools=tools, prompt_name=prompt_name, **retry_parameters),
             truncated_stats,
         )
 
@@ -4563,6 +4568,7 @@ class LLMCaller:
         tools: list | None = None,
         timeout: float = settings.LLM_CONFIG_TIMEOUT,
         router_model_group: str | None = None,
+        prompt_name: str | None = None,
         **active_parameters: dict[str, Any],
     ) -> ModelResponse | CustomStreamWrapper | AnthropicMessage | UITarsResponse:
         await _validate_custom_llm_api_base(self.original_llm_key, self.llm_config)
@@ -4691,7 +4697,7 @@ class LLMCaller:
             )
 
         if self.llm_key and "ANTHROPIC" in self.llm_key:
-            return await self._call_anthropic(messages, tools, timeout, **active_parameters)
+            return await self._call_anthropic(messages, tools, timeout, prompt_name=prompt_name, **active_parameters)
 
         # Route UI-TARS models to custom handler instead of LiteLLM
         if self.llm_key and "UI_TARS" in self.llm_key:
@@ -4715,6 +4721,7 @@ class LLMCaller:
         messages: list[dict[str, Any]],
         tools: list | None = None,
         timeout: float = settings.LLM_CONFIG_TIMEOUT,
+        prompt_name: str | None = None,
         **active_parameters: dict[str, Any],
     ) -> AnthropicMessage:
         max_tokens = active_parameters.get("max_completion_tokens") or active_parameters.get("max_tokens") or 4096
@@ -4748,7 +4755,12 @@ class LLMCaller:
         LOG.info(
             "Anthropic response",
             model_name=model_name,
-            response=response,
+            prompt_name=prompt_name,
+            response_type=type(response).__name__,
+            response_id=response.id,
+            content_length=sum(len(block.text) for block in response.content if block.type == "text"),
+            stop_reason=response.stop_reason,
+            token_usage={"input_tokens": response.usage.input_tokens, "output_tokens": response.usage.output_tokens},
             betas=betas,
             tools=tools,
             timeout=timeout,

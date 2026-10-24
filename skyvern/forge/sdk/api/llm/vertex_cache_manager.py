@@ -148,9 +148,8 @@ class VertexCacheManager:
                     "Failed to create cache",
                     cache_key=cache_key,
                     status_code=response.status_code,
-                    response=response.text,
                 )
-                raise Exception(f"Cache creation failed: {response.text}")
+                raise Exception(f"Cache creation failed (HTTP {response.status_code})")
 
             cache_data = response.json()
             cache_name = cache_data["name"]
@@ -171,7 +170,7 @@ class VertexCacheManager:
             LOG.error("Cache creation timed out", cache_key=cache_key)
             raise
         except Exception as e:
-            LOG.error("Cache creation failed", cache_key=cache_key, error=str(e))
+            LOG.error("Cache creation failed", cache_key=cache_key, error_type=type(e).__name__)
             raise
 
     def delete_cache(self, cache_key: str) -> bool:
@@ -203,7 +202,6 @@ class VertexCacheManager:
                     "Failed to delete cache",
                     cache_key=cache_key,
                     status_code=response.status_code,
-                    response=response.text,
                 )
                 return False
         except Exception as e:
