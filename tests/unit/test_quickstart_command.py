@@ -323,6 +323,45 @@ print(json.dumps({"config_imported_before_intent": config_imported_before_intent
     assert json.loads(result.stdout) == {"config_imported_before_intent": False, "port": 8765}
 
 
+def test_run_commands_import_preserves_project_cloud_env_before_settings(tmp_path) -> None:
+    project_env = tmp_path / ".skyvern" / ".env"
+    project_env.parent.mkdir(parents=True)
+    project_env.write_text("SKYVERN_API_KEY=project-test-key\nSKYVERN_BASE_URL=http://project-test\n")
+
+    script = """
+import json
+import sys
+import skyvern.cli.run_commands
+config_imported_before_intent = "skyvern.config" in sys.modules
+from skyvern._cli_bootstrap import prepare_cli_runtime
+from skyvern.utils.env_paths import EnvIntent
+prepare_cli_runtime(intent=EnvIntent.CLOUD)
+from skyvern.config import settings
+print(json.dumps({
+    "config_imported_before_intent": config_imported_before_intent,
+    "api_key": settings.SKYVERN_API_KEY,
+    "base_url": settings.SKYVERN_BASE_URL,
+}))
+"""
+    env = {**os.environ, "HOME": str(tmp_path / "home")}
+    for key in ("SKYVERN_API_KEY", "SKYVERN_BASE_URL", "SKYVERN_ENV_INTENT", "SKYVERN_ENV_FILE"):
+        env.pop(key, None)
+    result = subprocess.run(
+        [sys.executable, "-c", script],
+        cwd=tmp_path,
+        env=env,
+        text=True,
+        capture_output=True,
+        check=True,
+    )
+
+    assert json.loads(result.stdout) == {
+        "config_imported_before_intent": False,
+        "api_key": "project-test-key",
+        "base_url": "http://project-test",
+    }
+
+
 def test_run_mcp_prepares_cloud_env_before_starting_mcp(tmp_path, monkeypatch) -> None:
     from skyvern import _cli_bootstrap
     from skyvern.cli import run_commands
