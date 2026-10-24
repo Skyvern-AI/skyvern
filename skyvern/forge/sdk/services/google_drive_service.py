@@ -20,6 +20,7 @@ import httpx
 
 from skyvern.config import settings
 from skyvern.exceptions import DownloadFileMaxSizeExceeded
+from skyvern.forge.sdk.services.file_download_utils import publish_unique_download
 
 DRIVE_UPLOAD_API_BASE = "https://www.googleapis.com/upload/drive/v3"
 DRIVE_API_BASE = "https://www.googleapis.com/drive/v3"
@@ -634,28 +635,6 @@ def _downloadable_file_from_payload(payload: Mapping[str, Any], file_id: str) ->
     )
 
 
-def _publish_unique_download(
-    temporary_path: Path,
-    destination_dir: Path,
-    filename: str,
-) -> Path:
-    requested_path = destination_dir / filename
-    collision_index = 0
-    while True:
-        destination_path = (
-            requested_path
-            if collision_index == 0
-            else requested_path.with_name(f"{requested_path.stem} ({collision_index}){requested_path.suffix}")
-        )
-        try:
-            os.link(temporary_path, destination_path)
-        except FileExistsError:
-            collision_index += 1
-            continue
-        temporary_path.unlink()
-        return destination_path
-
-
 async def _get_download_metadata_with_retry(
     client: httpx.AsyncClient,
     url: str,
@@ -788,7 +767,7 @@ async def download_file(
                 break
             else:
                 raise AssertionError("Drive download media retry loop exited without a response")
-            destination_path = _publish_unique_download(temporary_path, destination_dir, metadata.name)
+            destination_path = publish_unique_download(temporary_path, destination_dir, metadata.name)
             return str(destination_path)
         except BaseException:
             temporary_path.unlink(missing_ok=True)

@@ -2555,6 +2555,7 @@ async def download(
     sftp_private_key_passphrase: str | None = None,
     sftp_remote_path: str | None = None,
     sftp_host_key: str | None = None,
+    sftp_source_path: str | None = None,
     path: str | None = None,
     continue_on_empty: bool | None = None,
 ) -> None:
@@ -2595,6 +2596,8 @@ async def download(
         sftp_remote_path = _render_template_with_label(sftp_remote_path, cache_key)
     if sftp_host_key:
         sftp_host_key = _render_template_with_label(sftp_host_key, cache_key)
+    if sftp_source_path:
+        sftp_source_path = _render_template_with_label(sftp_source_path, cache_key)
     if destination_prompt:
         destination_prompt = _render_template_with_label(destination_prompt, cache_key)
     if path:
@@ -2621,11 +2624,12 @@ async def download(
         "sftp_private_key_passphrase": sftp_private_key_passphrase,
         "sftp_remote_path": sftp_remote_path,
         "sftp_host_key": sftp_host_key,
+        "sftp_source_path": sftp_source_path,
         "prompt": destination_prompt,
         "path": path,
         "continue_on_empty": continue_on_empty if continue_on_empty is not None else False,
     }
-    cached_fn = script_run_context_manager.get_cached_fn(cache_key)
+    cached_fn = None if sftp_source_path else script_run_context_manager.get_cached_fn(cache_key)
     context: skyvern_context.SkyvernContext | None
     if cache_key and cached_fn:
         _refuse_statement_after_browser_connection_loss()

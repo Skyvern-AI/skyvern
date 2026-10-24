@@ -918,6 +918,7 @@ def block_yaml_to_block(
             sftp_private_key_passphrase=block_yaml.sftp_private_key_passphrase,
             sftp_remote_path=block_yaml.sftp_remote_path,
             sftp_host_key=block_yaml.sftp_host_key,
+            sftp_source_path=block_yaml.sftp_source_path,
             path=block_yaml.path,
             prompt=block_yaml.prompt,
             continue_on_empty=block_yaml.continue_on_empty,
