@@ -91,6 +91,7 @@ from skyvern.forge.taskv3.tools import (
     apply_blank_page_guard,
     build_browser_tools,
 )
+from skyvern.forge.taskv3.turn_dom import TurnDomCapture
 from skyvern.schemas.llm import LLMConfig, LLMRouterConfig
 from skyvern.schemas.workflows import BlockType
 from skyvern.services.otp_service import iter_totp_from_navigation_inputs
@@ -273,6 +274,7 @@ async def run_task_v3_agent_loop(
     on_action_round: ActionRoundSink | None = None,
     on_turn_start: TurnStart | None = None,
     on_turn_end: TurnEnd | None = None,
+    turn_dom: TurnDomCapture | None = None,
     on_pre_action: Callable[[str, dict[str, Any]], Awaitable[None]] | None = None,
     on_page_action: Callable[[], None] | None = None,
     extra_tools: list[ToolSpec] | None = None,
@@ -724,6 +726,7 @@ async def run_task_v3_agent_loop(
             on_action_round=on_action_round,
             on_turn_start=on_turn_start,
             on_turn_end=on_turn_end,
+            on_model_returned=turn_dom.wait if turn_dom is not None else None,
             on_pre_action=on_pre_action,
             on_page_action=on_page_action,
             max_tokens=max_tokens,
@@ -816,6 +819,8 @@ async def run_task_v3_agent_loop(
         no_tool_call_turns=outcome.no_tool_call_turns,
         duration_seconds=time.monotonic() - loop_started_at,
         block_type=block_type,
+        dom_arm=turn_dom is not None,
+        **(turn_dom.totals() if turn_dom is not None else {}),
         # State at the run's first failed/terminated finish that got past the failure-evidence gate, next to the
         # terminal attempt count; all None when no such finish happened.
         action_attempts=activity.action_attempts,

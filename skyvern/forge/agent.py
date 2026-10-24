@@ -236,6 +236,7 @@ from skyvern.forge.taskv3.run_arms import (
     resolve_run_arm,
 )
 from skyvern.forge.taskv3.target_label import compose_target_intention
+from skyvern.forge.taskv3.turn_dom import TurnDomCapture
 from skyvern.forge.validation_evidence_router import (
     ValidationRouterMode,
     ValidationRouterResult,
@@ -1777,17 +1778,23 @@ def _is_transient_page_read_refusal(exc: BaseException) -> bool:
 _BLOCK_END_DOM_TIMEOUT_SECONDS = 5.0
 
 
+async def _read_page_html(browser_state: BrowserState) -> str | None:
+    # v1's html_scrape content. Callers cap it: the page lookup can wait on a lost-page recovery, and get_content's
+    # own timeout is 300 s.
+    page = await browser_state.get_working_page(prune_excess_pages=False)
+    if page is None:
+        return None
+    return await SkyvernFrame(frame=page, engine_selection=browser_state.engine_selection).get_content()
+
+
 async def _save_block_end_dom(browser_state: BrowserState, step: Step, task_id: str) -> None:
-    # v1's html_scrape content, once per block after the loop. One cap covers the page lookup too,
-    # which can wait on a lost-page recovery; get_content's own timeout is 300 s.
+    # Once per block after the loop.
     started = time.monotonic()
     html: str | None = None
     reason = "no_working_page"
     try:
         async with asyncio.timeout(_BLOCK_END_DOM_TIMEOUT_SECONDS):
-            page = await browser_state.get_working_page(prune_excess_pages=False)
-            if page is not None:
-                html = await SkyvernFrame(frame=page, engine_selection=browser_state.engine_selection).get_content()
+            html = await _read_page_html(browser_state)
     except Exception as exc:
         reason = type(exc).__name__
     if html is None:
@@ -3365,8 +3372,26 @@ class ForgeAgent:
         # action rows it wrote land on it. `step` keeps the run's status, billing and step-budget unit.
         v3_turn_step: Step | None = None
         v3_turn_step_open = False
+        # Salted so this sample is independent of the pre-submit one, which buckets the same run key.
+        turn_dom = (
+            TurnDomCapture(
+                functools.partial(_read_page_html, browser_state),
+                app.ARTIFACT_MANAGER.accumulate_html_scrape_to_archive,
+            )
+            if not page_free_validation
+            and is_run_sampled(
+                f"turn_dom:{task.workflow_run_id or task.task_id}", settings.TASK_V3_TURN_DOM_SAMPLE_RATE
+            )
+            else None
+        )
 
         async def _on_turn_start(turn: int) -> Step | None:
+            turn_step = await _open_v3_turn_step(turn)
+            if turn_dom is not None:
+                turn_dom.start(turn_step, turn)
+            return turn_step
+
+        async def _open_v3_turn_step(turn: int) -> Step | None:
             nonlocal v3_turn_step, v3_turn_step_open
             v3_turn_step, v3_turn_step_open = None, False
             try:
@@ -3403,8 +3428,12 @@ class ForgeAgent:
                         output=AgentStepOutput(
                             llm_seconds=record.llm_seconds if record else None,
                             tool_calls=record.tool_calls if record else None,
+                            page_dom=turn_dom.turn_output() if turn_dom is not None else None,
                         ),
                     )
+            if turn_dom is not None:
+                # A sampled run keeps each turn durable as it ends; the rest share the block's ZIP.
+                app.ARTIFACT_MANAGER.flush_step_archive_in_background(v3_turn_step)
 
         async def _on_turn_end(record: TurnRecord) -> None:
             if record.outcome_status == "canceled":
@@ -3871,6 +3900,7 @@ class ForgeAgent:
                 on_action_round=_on_action_round,
                 on_turn_start=_on_turn_start,
                 on_turn_end=_on_turn_end,
+                turn_dom=turn_dom,
                 on_pre_action=pre_submit_ring.capture if pre_submit_ring is not None else None,
                 # A code status the model has moved past is no longer what the run ends on.
                 on_page_action=verification_state.page_engaged,
@@ -3915,6 +3945,8 @@ class ForgeAgent:
                 StepStatus.canceled if isinstance(sys.exception(), asyncio.CancelledError) else StepStatus.failed,
                 None,
             )
+            if turn_dom is not None:
+                turn_dom.cancel()
             # Frames are already in memory, so a loop that raised or ran out of budget still
             # persists what it captured; bounded so the unwind of a cancelled run is not held up.
             with contained_effect("task_v3 pre-submit frame persist", task_id=task.task_id):

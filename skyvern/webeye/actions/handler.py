@@ -2694,7 +2694,7 @@ def check_existed_but_not_option_element_in_dom_factory(
         if not element_id:
             return False
         try:
-            locator = frame.locator(f"[{SKYVERN_ID_ATTR}={element_id}]")
+            locator = frame.locator(f'[{SKYVERN_ID_ATTR}="{element_id}"]')
             current_element = SkyvernElement(
                 locator=locator,
                 frame=frame,
