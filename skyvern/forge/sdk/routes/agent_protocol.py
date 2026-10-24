@@ -203,6 +203,7 @@ from skyvern.schemas.runs import (
     BrowserTypeOption,
     BulkCancelRunsRequest,
     BulkCancelRunsResponse,
+    ProxyLocationInput,
     RunEngine,
     RunResponse,
     RunStatus,
@@ -651,7 +652,13 @@ async def run_task(
 def _workflow_run_request_to_legacy_request(workflow_run_request: WorkflowRunRequest) -> WorkflowRequestBody:
     return WorkflowRequestBody(
         data=workflow_run_request.parameters,
-        proxy_location=workflow_run_request.proxy_location,
+        # WorkflowRunRequest.proxy_location carries a RESIDENTIAL default, so forwarding it verbatim
+        # would hand setup_workflow_run a non-null value for every caller that omitted the field and
+        # suppress the workflow-level inheritance the other trigger paths get. Null means "omitted"
+        # on the legacy body, so an unsupplied field has to arrive as null.
+        proxy_location=(
+            workflow_run_request.proxy_location if "proxy_location" in workflow_run_request.model_fields_set else None
+        ),
         webhook_callback_url=workflow_run_request.webhook_url,
         totp_identifier=workflow_run_request.totp_identifier,
         totp_verification_url=workflow_run_request.totp_url,
@@ -686,9 +693,13 @@ def _hydrate_run_request_for_response(
 
     A run that omits browser_type inherits the workflow's engine (resolved onto workflow_run at
     persistence), so the returned request must report that engine rather than the request's omitted
-    null; the title is hydrated from the workflow when one exists.
+    null; the title is hydrated from the workflow when one exists. A run that omits proxy_location
+    inherits the workflow's region the same way, so the persisted value is echoed over the request's
+    RESIDENTIAL default whenever one was resolved.
     """
-    updates: dict[str, str | None] = {"browser_type": read_browser_type(workflow_run)}
+    updates: dict[str, ProxyLocationInput | str | None] = {"browser_type": read_browser_type(workflow_run)}
+    if workflow_run.proxy_location is not None:
+        updates["proxy_location"] = workflow_run.proxy_location
     if workflow is not None:
         updates["title"] = workflow.title
     return run_request.model_copy(update=updates)
