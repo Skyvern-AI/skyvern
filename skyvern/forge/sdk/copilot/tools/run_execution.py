@@ -22,7 +22,6 @@ from typing import Any, Literal, NamedTuple, NotRequired, TypedDict
 from urllib.parse import urlparse
 
 import structlog
-import yaml
 from fastapi import HTTPException
 
 from skyvern.constants import SCRUBBED_VALUE
@@ -240,6 +239,7 @@ from skyvern.forge.sdk.copilot.workflow_yaml import (
     _process_workflow_yaml,
     runner_code_block_associations,
     stored_block_code,
+    workflow_to_copilot_yaml,
 )
 from skyvern.forge.sdk.core import skyvern_context
 from skyvern.forge.sdk.db.enums import BrowserSeedSource
@@ -4043,8 +4043,7 @@ async def _run_blocks_and_collect_debug(
     workflow = snapshot.workflow
     execution = _RunExecution(
         snapshot=snapshot,
-        workflow_yaml=snapshot.workflow_yaml
-        or yaml.safe_dump({"workflow_definition": workflow.workflow_definition.model_dump(mode="json")}),
+        workflow_yaml=snapshot.workflow_yaml or workflow_to_copilot_yaml(workflow),
         metadata=copy.deepcopy(ctx.code_artifact_metadata),
         associations=copy.deepcopy(ctx.runner_code_block_associations_by_label),
         source_at_start=(
@@ -4081,6 +4080,7 @@ async def _run_blocks_and_collect_debug(
         # Existing verification consumers need the same source this full test selected.
         ctx.last_workflow = snapshot.workflow
         ctx.last_workflow_yaml = execution.workflow_yaml
+        ctx.saved_workflows_under_test.append(snapshot.workflow)
 
     for label in block_labels:
         if not workflow.get_output_parameter(label):
