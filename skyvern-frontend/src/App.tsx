@@ -9,6 +9,7 @@ import { LoggingContext, loggingStub } from "@/store/LoggingContext";
 import { UserContext } from "@/store/UserContext";
 import { dropNoiseExceptions } from "@/util/posthogNoiseFilter";
 import { RuntimeFeatureFlagProvider } from "@/providers/RuntimeFeatureFlagProvider";
+import { OnPremOidcProvider } from "@/providers/OnPremOidcProvider";
 
 const postHogOptions = {
   api_host: "https://app.posthog.com",
@@ -34,7 +35,9 @@ function App() {
           <QueryClientProvider client={queryClient}>
             <RuntimeFeatureFlagProvider>
               <ThemeProvider defaultTheme="dark">
-                <RouterProvider router={router} />
+                <OnPremOidcProvider>
+                  <RouterProvider router={router} />
+                </OnPremOidcProvider>
               </ThemeProvider>
             </RuntimeFeatureFlagProvider>
           </QueryClientProvider>
