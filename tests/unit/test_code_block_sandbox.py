@@ -7,6 +7,7 @@ Verifies that the CodeBlock safety layer:
 """
 
 import asyncio
+import importlib.util
 import inspect
 import json
 import operator
@@ -20,6 +21,7 @@ from datetime import datetime
 from datetime import time as stdlib_time
 from datetime import timedelta, timezone
 from functools import partial
+from pathlib import Path
 from types import FunctionType, SimpleNamespace
 from typing import Any, NoReturn
 from unittest.mock import AsyncMock, MagicMock
@@ -639,6 +641,94 @@ class TestIsSafeCodeBlockedAttrsCompleteness:
         code = f"obj.{attr}()"
         with pytest.raises(InsecureCodeDetected):
             CodeBlock.is_safe_code(code)
+
+
+class TestScriptSandboxRejectsBytecodeConstruction:
+    """Keep the bytecode-construction bypass from #8927 blocked."""
+
+    @pytest.mark.parametrize(
+        "code",
+        [
+            "import types",
+            "import types as runtime_types",
+            "from types import CodeType",
+            "from types import CodeType as make_code",
+            "from types import FunctionType",
+            "from types import FunctionType as make_function",
+            "from types import LambdaType",
+            "from types import LambdaType as make_function",
+        ],
+    )
+    def test_types_imports_are_rejected(self, code: str) -> None:
+        """Import aliases must not expose the bytecode constructors."""
+        with pytest.raises(InsecureCodeDetected, match="import module 'types'"):
+            is_safe_script_code(code)
+
+    @pytest.mark.parametrize("constructor", ["CodeType", "FunctionType", "LambdaType"])
+    @pytest.mark.parametrize(
+        "template",
+        [
+            "factory = exposed.{constructor}",
+            "exposed.{constructor}()",
+            "{constructor}()",
+            "from exposed import {constructor}",
+            "from exposed import {constructor} as factory",
+        ],
+    )
+    def test_constructor_access_is_rejected(self, constructor: str, template: str) -> None:
+        """Prebound or re-exported constructors must hit the attribute/name guard."""
+        with pytest.raises(InsecureCodeDetected, match=f"'{constructor}'"):
+            is_safe_script_code(template.format(constructor=constructor))
+
+    def test_working_bytecode_reconstruction_is_rejected(self, tmp_path: Path) -> None:
+        """A harmless importlib payload must execute only when validation is skipped."""
+
+        def hidden_builtin_call() -> int:
+            return eval("6 * 7")
+
+        # Use this interpreter's bytecode instead of hard-coding version-specific opcodes.
+        code = hidden_builtin_call.__code__
+        constructor_args = (
+            code.co_argcount,
+            code.co_posonlyargcount,
+            code.co_kwonlyargcount,
+            code.co_nlocals,
+            code.co_stacksize,
+            code.co_flags,
+            code.co_code,
+            code.co_consts,
+            code.co_names,
+            code.co_varnames,
+            code.co_filename,
+            code.co_name,
+            code.co_qualname,
+            code.co_firstlineno,
+            code.co_linetable,
+            code.co_exceptiontable,
+            code.co_freevars,
+            code.co_cellvars,
+        )
+        args = ", ".join(repr(value) for value in constructor_args)
+        script = "\n".join(
+            (
+                "import types",
+                f"code = types.CodeType({args})",
+                "result = types.FunctionType(code, {})()",
+                "",
+            )
+        )
+
+        # Prove the payload is executable and can call a blocked builtin, without I/O.
+        script_path = tmp_path / "bytecode_script.py"
+        script_path.write_text(script, encoding="utf-8")
+        spec = importlib.util.spec_from_file_location("bytecode_script", script_path)
+        assert spec is not None and spec.loader is not None
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        assert module.result == 42
+
+        with pytest.raises(InsecureCodeDetected, match="import module 'types'"):
+            is_safe_script_code(script)
 
 
 # ---------------------------------------------------------------------------
