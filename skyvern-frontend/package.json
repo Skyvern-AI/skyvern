@@ -135,7 +135,7 @@
     "@types/node": "$@types/node",
     "protobufjs": "^8.6.0",
     "qs": ">=6.16.0",
-    "undici": "^7.28.0",
+    "undici": "^7.30.1",
     "dompurify": "^3.4.11",
     "js-yaml": "^4.2.0",
     "@opentelemetry/core": "^2.8.0",
