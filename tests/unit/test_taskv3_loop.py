@@ -5110,6 +5110,50 @@ async def test_each_turn_runs_its_model_call_under_its_own_kwargs_and_reports_ev
 
 
 @pytest.mark.asyncio
+async def test_on_model_returned_runs_after_each_model_call_and_before_the_turn_touches_the_page() -> None:
+    # The per-turn page capture joins here, so nothing that reads or acts on the page may run first:
+    # not the batch fingerprint sample, not a tool, and not the nudge on a turn with no tool call.
+    events: list[str] = []
+
+    class _Caller(_ScriptedCaller):
+        async def call(self, **kwargs: Any) -> dict[str, Any]:
+            events.append("call")
+            return await super().call(**kwargs)
+
+    async def on_model_returned() -> None:
+        events.append("returned")
+
+    async def fingerprint() -> str | None:
+        events.append("fingerprint")
+        return "fp"
+
+    async def click(_args: dict[str, Any]) -> ToolResult:
+        events.append("click")
+        return ToolResult.ok("clicked")
+
+    tools = [
+        ToolSpec(name="click", description="click", parameters={"type": "object"}, handler=click, billable=True),
+        make_finish_tool(),
+    ]
+    script = [[("click", {"selector": "#go"})], [], [("finish", {"status": "completed", "reason": "done"})]]
+    outcome = await run_agent_tool_loop(
+        llm_caller=_Caller(script),
+        system_prompt="sys",
+        user_prompt="goal",
+        tools=tools,
+        max_turns=20,
+        max_tool_calls=100,
+        page_fingerprint=fingerprint,
+        on_model_returned=on_model_returned,
+    )
+
+    assert outcome.status == "completed"
+    assert events[:4] == ["call", "returned", "fingerprint", "click"]
+    assert events.count("call") == events.count("returned") == 3
+    assert all(events[i + 1] == "returned" for i, event in enumerate(events) if event == "call")
+
+
+@pytest.mark.asyncio
 async def test_on_action_round_prefers_content_over_reasoning_summary() -> None:
     round_texts: list[str | None] = []
 

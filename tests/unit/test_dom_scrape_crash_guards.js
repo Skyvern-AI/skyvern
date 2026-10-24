@@ -660,8 +660,11 @@ test("isElementVisible: display:contents parent containing an option does not ov
     });
   }
   // Each frame is its own window whose element counter starts at 1, as in a browser.
-  const extractConst = (name) =>
-    src.match(new RegExp(`^const ${name} =[^;]*;`, "m"))[0];
+  const extractConst = (name) => {
+    const match = src.match(new RegExp(`^const ${name} =[^;]*;`, "m"));
+    if (match === null) throw new Error(`const ${name} not found`);
+    return match[0];
+  };
   const idCode = [
     extractConst("UNIQUE_ID_CHARACTERS"),
     extractConst("UNIQUE_ID_COUNTER_LENGTH"),
