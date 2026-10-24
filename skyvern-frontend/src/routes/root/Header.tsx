@@ -17,7 +17,11 @@ function Header() {
       <div className="flex h-24 items-center justify-between px-6">
         <NavigationHamburgerMenu />
         {enabled && user && (
-          <Button variant="ghost" onClick={() => void signOut()}>
+          <Button
+            className="ml-auto"
+            variant="ghost"
+            onClick={() => void signOut()}
+          >
             Sign out
           </Button>
         )}
