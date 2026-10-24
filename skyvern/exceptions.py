@@ -1693,6 +1693,20 @@ class InputToReadonlyElement(SkyvernException):
         )
 
 
+class ScrollMadeNoProgress(SkyvernException):
+    def __init__(self, element_id: str, direction: str, boundary: str | None = None):
+        reason = (
+            f" because the content is already scrolled to the {boundary}"
+            if boundary
+            else " and the content did not move"
+        )
+        super().__init__(
+            f"Scrolling {direction} from element(id={element_id}) revealed no new content{reason}. "
+            "Repeating this scroll will not change the page: work with the content already visible, "
+            "scroll the other direction, or interact with a different element."
+        )
+
+
 class FailedToParseActionInstruction(SkyvernException):
     def __init__(self, reason: str | None, error_type: str | None):
         super().__init__(

@@ -17,7 +17,7 @@ from contextvars import ContextVar
 from datetime import UTC, datetime, timedelta, timezone
 from enum import StrEnum
 from pathlib import Path
-from typing import Any, AsyncIterator, Awaitable, Callable, List, NamedTuple, TypedDict, TypeGuard, cast
+from typing import Any, AsyncIterator, Awaitable, Callable, List, Literal, NamedTuple, TypedDict, TypeGuard, cast
 
 import structlog
 from cachetools import TTLCache
@@ -35,7 +35,7 @@ from playwright.async_api import (
     Request,
     Response,
 )
-from pydantic import BaseModel, field_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 from skyvern.config import settings
 from skyvern.constants import (
@@ -100,6 +100,7 @@ from skyvern.exceptions import (
     PhoneNumberInputCountryCodeMismatch,
     PhoneNumberInputMismatch,
     ScreenshotTargetClosed,
+    ScrollMadeNoProgress,
     SecretInputMismatch,
     SkyvernException,
     SkyvernHTTPException,
@@ -285,6 +286,7 @@ from skyvern.webeye.utils.dom import (
 )
 from skyvern.webeye.utils.flutter_semantics import FLUTTER_TEXT_FIELD_JS, FRAME_SETTLE_TIMEOUT_SECONDS, TWO_FRAMES_JS
 from skyvern.webeye.utils.page import (
+    ElementScrollMetrics,
     SkyvernFrame,
     _all_page_frames,
     _blob_url_origin,
@@ -11626,6 +11628,34 @@ async def handle_extract_action(
         return [ActionFailure(exception=Exception("No data extraction goal"))]
 
 
+class ScrollContainerOutcome(BaseModel):
+    """What ``scrollNearestScrollableContainer()`` in domUtils.js did.
+
+    The metrics are absent for the "page" and "none" modes, where no container was scrolled.
+    """
+
+    model_config = ConfigDict(populate_by_name=True)
+
+    mode: Literal["container", "page", "none"]
+    scrolled: bool = False
+    scroll_top: float | None = Field(default=None, alias="scrollTop")
+    client_height: float | None = Field(default=None, alias="clientHeight")
+    scroll_height: float | None = Field(default=None, alias="scrollHeight")
+
+    def boundary(self, direction: str) -> str | None:
+        """The end the content is pinned against, or None when it stalled somewhere in between."""
+        if self.scroll_top is None or self.client_height is None or self.scroll_height is None:
+            return None
+        if direction == "up":
+            return "top" if self.scroll_top <= 0 else None
+        metrics = ElementScrollMetrics(
+            scroll_top=self.scroll_top,
+            client_height=self.client_height,
+            scroll_height=self.scroll_height,
+        )
+        return "bottom" if metrics.at_bottom else None
+
+
 @traced(name="skyvern.agent.action.scroll")
 async def handle_scroll_action(
     action: actions.ScrollAction,
@@ -11639,18 +11669,20 @@ async def handle_scroll_action(
     if action.element_id:
         # Element-based scrolling from extract-action prompt. Uses
         # scrollNearestScrollableContainer() from domUtils.js which walks the DOM to find
-        # the nearest scrollable ancestor or sibling container relative to the element.
-        # Returns: truthy value if scrolled (true for sub-container, "page" for page-level),
-        # false if nothing was scrollable.
+        # the nearest scrollable container relative to the element — the element itself, a
+        # viewport inside it, an ancestor, or an ancestor's sibling — and reports whether
+        # that container's scroll position actually moved.
         scroll_direction = "down" if action.scroll_y >= 0 else "up"
-        scroll_result = False
+        scroll_result = ScrollContainerOutcome(mode="none")
         dom = DomUtil(scraped_page=scraped_page, page=page)
         skyvern_element = await dom.safe_get_skyvern_element_by_id(action.element_id)
         if skyvern_element:
             try:
-                scroll_result = await skyvern_element.locator.evaluate(
-                    "(el, direction) => scrollNearestScrollableContainer(el, direction)",
-                    scroll_direction,
+                scroll_result = ScrollContainerOutcome.model_validate(
+                    await skyvern_element.locator.evaluate(
+                        "(el, direction) => scrollNearestScrollableContainer(el, direction)",
+                        scroll_direction,
+                    )
                 )
             except Exception:
                 LOG.warning(
@@ -11661,7 +11693,28 @@ async def handle_scroll_action(
         else:
             LOG.warning("Could not resolve element for scroll action", element_id=action.element_id)
 
-        if scroll_result == "page":
+        if scroll_result.mode == "container" and not scroll_result.scrolled:
+            # The container was found but would not move, so the scrape after this action shows
+            # the same content. Reporting success here is what let a run spend its whole runtime
+            # re-scrolling an exhausted container; the planner needs to see that it is stuck.
+            LOG.info(
+                "Container scroll revealed no new content",
+                element_id=action.element_id,
+                direction=scroll_direction,
+                scroll_top=scroll_result.scroll_top,
+            )
+            return [
+                ActionFailure(
+                    ScrollMadeNoProgress(
+                        element_id=action.element_id,
+                        direction=scroll_direction,
+                        boundary=scroll_result.boundary(scroll_direction),
+                    ),
+                    stop_execution_on_failure=False,
+                )
+            ]
+
+        if scroll_result.mode == "page":
             # No scrollable sub-container found, but the page itself is scrollable.
             # Use incremental mouse.wheel events at the center of the viewport to
             # simulate natural user scrolling. This fires native wheel/scroll events
@@ -11681,8 +11734,13 @@ async def handle_scroll_action(
             # Dynamically compute iterations based on remaining scrollable distance
             # so we reach the bottom even on very long T&C pages.
             scroll_info = await page.evaluate(
-                "() => ({ scrollHeight: document.documentElement.scrollHeight,"
-                " scrollTop: window.pageYOffset, innerHeight: window.innerHeight })"
+                "() => { let node = document.elementFromPoint(window.innerWidth / 2, window.innerHeight / 2);"
+                " while (node && node !== document.body && node !== document.documentElement) {"
+                " const style = window.getComputedStyle(node);"
+                " if ((style.overflowY === 'auto' || style.overflowY === 'scroll') && node.scrollHeight > node.clientHeight) break;"
+                " node = node.parentElement; }"
+                " return { scrollHeight: document.documentElement.scrollHeight, scrollTop: window.pageYOffset,"
+                " innerHeight: window.innerHeight, centerScrollTop: node && node !== document.body && node !== document.documentElement ? node.scrollTop : null }; }"
             )
             if scroll_direction == "down":
                 remaining = scroll_info["scrollHeight"] - scroll_info["scrollTop"] - scroll_info["innerHeight"]
@@ -11706,6 +11764,42 @@ async def handle_scroll_action(
             # Wait for page JS to process scroll events (e.g. enabling buttons)
             await page.wait_for_timeout(500)
 
+            settled_scroll = await page.evaluate(
+                "() => { let node = document.elementFromPoint(window.innerWidth / 2, window.innerHeight / 2);"
+                " while (node && node !== document.body && node !== document.documentElement) {"
+                " const style = window.getComputedStyle(node);"
+                " if ((style.overflowY === 'auto' || style.overflowY === 'scroll') && node.scrollHeight > node.clientHeight) break;"
+                " node = node.parentElement; }"
+                " return { scrollTop: window.pageYOffset,"
+                " centerScrollTop: node && node !== document.body && node !== document.documentElement ? node.scrollTop : null }; }"
+            )
+            settled_scroll_top = settled_scroll["scrollTop"]
+            center_container_moved = (
+                scroll_info["centerScrollTop"] is not None
+                and settled_scroll["centerScrollTop"] is not None
+                and settled_scroll["centerScrollTop"] != scroll_info["centerScrollTop"]
+            )
+            if settled_scroll_top == scroll_info["scrollTop"] and not center_container_moved:
+                LOG.info(
+                    "Page-level scroll revealed no new content",
+                    element_id=action.element_id,
+                    direction=scroll_direction,
+                    scroll_top=settled_scroll_top,
+                )
+                # A page that still had room but would not move is scroll-locked (an open modal
+                # or dropdown), which is a different thing to tell the planner than "at the end".
+                at_boundary = remaining <= 1
+                return [
+                    ActionFailure(
+                        ScrollMadeNoProgress(
+                            element_id=action.element_id,
+                            direction=scroll_direction,
+                            boundary=("bottom" if scroll_direction == "down" else "top") if at_boundary else None,
+                        ),
+                        stop_execution_on_failure=False,
+                    )
+                ]
+
             # Record which element was just deliberately scrolled. The click handler
             # checks this to skip scroll_into_view() for the SAME element, which
             # would use element.scrollIntoView() to center it — undoing the
@@ -11715,8 +11809,11 @@ async def handle_scroll_action(
                 "(id) => { window.__skyvernScrolledElementId = id; }",
                 action.element_id,
             )
+            if settled_scroll_top == scroll_info["scrollTop"]:
+                # The center-point wheel was consumed by an overlay rather than the page.
+                return [ActionSuccess(data={"container_scroll": True})]
             return [ActionSuccess(data={"page_level_scroll": True})]
-        elif scroll_result:
+        elif scroll_result.mode == "container":
             # Sub-container was scrolled successfully. Record the element ID so
             # the click handler skips scroll_into_view() for this element — same
             # protection as page-level scrolls. Without this, element.scrollIntoView()
@@ -11732,6 +11829,9 @@ async def handle_scroll_action(
                 "Could not find scrollable container near element, falling back to mouse wheel",
                 element_id=action.element_id,
             )
+            # No progress verdict on this path: the wheel lands wherever the cursor already is,
+            # so an unrelated container under it can absorb the scroll and the window offset
+            # alone cannot tell a real move from a no-op.
             await EventStrategyFactory.scroll_by(page, action.scroll_x, action.scroll_y)
     elif action.x and action.y:
         # Coordinate-based scrolling from CUA/UI-TARS agents
