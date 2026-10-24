@@ -139,6 +139,7 @@ class AuditEvent:
     related_resource_ids: tuple[str, ...] = ()
     auth_kind: str | None = None
     oauth_client_id: str | None = None
+    app_role: str | None = None
 
 
 async def record_request_audit_event(
