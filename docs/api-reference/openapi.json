@@ -7814,6 +7814,18 @@
             ],
             "title": "File Url"
           },
+          "download_url": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Download Url",
+            "description": "Origin URL recorded by a download action."
+          },
           "download": {
             "anyOf": [
               {

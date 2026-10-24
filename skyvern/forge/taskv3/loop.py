@@ -338,11 +338,22 @@ class ToolRefusal(Exception):
 # tokens. The label composition itself -- the floor vocabulary, the shape filter, the secret matcher --
 # lives in target_label.py; this module only carries the two raw values from probe to `RoundAction`.
 TARGET_LABEL_DATA_KEY = "target_label"
-# The option text a click on a menu row committed (page text: never on the call record).
+# The option text a click on a menu row, or a native select, committed (page text: never on the call record).
 PICKED_OPTION_DATA_KEY = "picked_option"
 # A list the control opened but could not settle a row in: the list stays open for a pick.
 OPENED_LIST_ERROR_CLASSES = frozenset({"list_no_match", "list_unread", "list_ambiguous", "identical_rows"})
 TARGET_KIND_DATA_KEY = "target_kind"
+# Set when the target label is the field's placeholder, a hint rather than its question.
+TARGET_LABEL_IS_PLACEHOLDER_DATA_KEY = "target_label_is_placeholder"
+# A refusal whose data carries a GuardEnd under this key ends the run with that guard's verdict.
+GUARD_END_DATA_KEY = "guard_end"
+
+
+class GuardEnd(NamedTuple):
+    guard: str
+    reason: str
+
+
 # The durable selector of the element a `drag` dropped onto, for the pending-submit watch.
 DROP_TARGET_DATA_KEY = "drop_target"
 # The tool-result `data` key a recorded action's outcome rides on: the machine facts about what the
@@ -780,8 +791,9 @@ class ToolSpec:
     # The selector a click's arguments resolve to as the call's record keeps it after dispatch (a ref's durable
     # selector, a mark's act tag), and whether it names a row of an open list; set on click alone.
     address_probe: Callable[[dict[str, Any]], Awaitable[tuple[str, bool]]] | None = None
-    # The selector, name and kind of the field a type call is about to enter, read before it acts; set on type alone.
-    answer_probe: Callable[[dict[str, Any]], Awaitable[tuple[str, str, str]]] | None = None
+    # The selector, name and kind of the field a type call is about to enter, and whether the name is its placeholder,
+    # read before it acts; set on type alone.
+    answer_probe: Callable[[dict[str, Any]], Awaitable[tuple[str, str, str, bool]]] | None = None
 
     @property
     def touches_page(self) -> bool:
@@ -1085,6 +1097,8 @@ NAV_DEAD_END_GUARD = "navigation_dead_end"
 # A page-level handler kept asking for the page to be reloaded past the per-run cap: the page cannot
 # be stabilized, and acting on it would mean acting on a page declared stale.
 PAGE_REFRESH_EXHAUSTED_GUARD = "page_refresh_exhausted"
+# The answer-basis audit refused moving on ANSWER_BASIS_MAX_HOLDS times in one run.
+ANSWER_BASIS_HOLD_BOUND_GUARD = "answer_basis_hold_bound"
 # The browser or its page is gone: the page accessor behind every tool already tried to reopen a lost
 # tab and could not, so every later call raises the same error and the model spends turns on a browser
 # that cannot come back (SKY-18903). The only guard whose verdict is `failed` rather than `terminated`:
@@ -5905,6 +5919,13 @@ async def run_agent_tool_loop(
             elif result_data.get("page_state_changed"):
                 # A successful navigate moved the run off any dead page seen earlier this batch.
                 st.pending_nav_dead_end = None
+
+            guard_end = result_data.get(GUARD_END_DATA_KEY) if result.refused else None
+            if isinstance(guard_end, GuardEnd):
+                LOG.info("taskv3 loop guard ended the run", tool=tool_name, turn=st.turns, guard=guard_end.guard)
+                st.outcome = _guard_verdict(guard_end.guard, guard_end.reason)
+                _append_skipped_tool_results(st.messages, tool_calls[idx + 1 :], guard_end.reason)
+                break
 
             if spec is not None and spec.terminal and result.status == "ok":
                 data = result.data or {}
