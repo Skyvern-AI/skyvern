@@ -17,6 +17,7 @@ from starlette.requests import ClientDisconnect
 from starlette.responses import Response
 
 from skyvern.config import settings
+from skyvern.forge import app
 from skyvern.forge.log_redaction import (
     REDACTED,
     SENSITIVE_HEADERS,
@@ -199,6 +200,26 @@ def _identity_log_fields() -> dict[str, str | int | bool | None]:
     return fields
 
 
+def _should_log_request_bodies() -> bool:
+    identity = _request_identity.get()
+    if identity is None or identity.organization_id is None:
+        return True
+    return app.AGENT_FUNCTION.should_log_request_bodies(identity.organization_id)
+
+
+def _schedule_validation_error_code(status_code: int, response_body: str) -> str | None:
+    if status_code != 400:
+        return None
+    try:
+        response = json.loads(response_body)
+    except json.JSONDecodeError:
+        return None
+    detail = response.get("detail") if isinstance(response, dict) else None
+    if isinstance(detail, str) and detail.startswith("Missing schedule parameters for workflow "):
+        return "missing_schedule_parameters"
+    return None
+
+
 def integration_platform_from_user_agent(user_agent: str | None) -> str | None:
     if not isinstance(user_agent, str) or not user_agent.strip():
         return None
@@ -331,6 +352,7 @@ def _log_unhandled_request(
     """Emit the raw-request row after the server error handler selects a response."""
     exc = sys.exc_info()[1]
     try:
+        body_fields = {"body": body} if _should_log_request_bodies() else {}
         # No traceback: the server error handler already logs it, and with one this row can pass the
         # container log driver's 16 KiB line limit and be split into fragments that lose every field.
         LOG.error(
@@ -339,9 +361,9 @@ def _log_unhandled_request(
             path=path,
             status_code=status_code,
             client_ip=client_ip,
-            body=body,
             headers=headers,
             duration_seconds=time.monotonic() - start_time,
+            **body_fields,
             **(exception_log_fields(exc) if exc is not None else {}),
             **_identity_log_fields(),
         )
@@ -371,18 +393,26 @@ def _log_request(
         log_method = LOG.info
 
     try:
+        body_fields = (
+            {
+                "body": body,
+                "response_body": response_body,
+                # backwards-compat: keep error_body for existing Datadog queries
+                "error_body": response_body if status_code >= 400 else None,
+            }
+            if _should_log_request_bodies()
+            else {}
+        )
         log_method(
             "api.raw_request",
             method=method,
             path=path,
             status_code=status_code,
             client_ip=client_ip,
-            body=body,
             headers=headers,
-            response_body=response_body,
-            # backwards-compat: keep error_body for existing Datadog queries
-            error_body=response_body if status_code >= 400 else None,
             duration_seconds=time.monotonic() - start_time,
+            error_code=_schedule_validation_error_code(status_code, response_body),
+            **body_fields,
             **_identity_log_fields(),
         )
     except Exception:
