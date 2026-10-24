@@ -192,6 +192,7 @@ async def _run_execute_task_v3(
     llm_caller_factory: Any = None,
     # Off by default: the block-end DOM adds one get_working_page call after the loop.
     block_end_dom: bool = False,
+    clean_up_task: AsyncMock | None = None,
     **task_overrides: Any,
 ) -> tuple[Step, Any, AsyncMock, AsyncMock]:
     monkeypatch.setattr(settings, "TASK_V3_BLOCK_END_DOM", block_end_dom)
@@ -311,7 +312,7 @@ async def _run_execute_task_v3(
 
     agent.update_step = AsyncMock(side_effect=fake_update_step)
     agent.update_task = AsyncMock(side_effect=update_task_side_effect or fake_update_task)
-    agent.clean_up_task = AsyncMock()
+    agent.clean_up_task = clean_up_task or AsyncMock()
 
     post_step_mock = AsyncMock(side_effect=post_step_side_effect)
     monkeypatch.setattr("skyvern.forge.agent.app.AGENT_FUNCTION.post_step_execution", post_step_mock)
@@ -4763,6 +4764,85 @@ async def test_execute_task_v3_writes_a_step_per_turn_beside_the_billed_block_st
     assert [(row.step_id, row.step_order) for row in rows] == [("turn-1", 0), ("turn-2", 0)]
     assert step.step_id == "step-v3" and step.status == StepStatus.completed
     assert post_step.await_args.args[1] is step
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("store_fails", [False, True])
+async def test_a_bare_v3_tasks_turn_files_are_one_zip_on_its_block_step(
+    monkeypatch: pytest.MonkeyPatch, store_fails: bool
+) -> None:
+    # A bare task's cleanup drains each leftover step archive as its own ZIP, so the turns' shared ZIP is written first,
+    # after the browser closes. A failed write must not cost the rest of the cleanup or the webhook.
+    manager = ArtifactManager()
+    monkeypatch.setattr(agent_module.app, "ARTIFACT_MANAGER", manager)
+    stored: list[Any] = []
+
+    async def _store(artifact: Any, data: bytes) -> None:
+        if store_fails:
+            raise OSError("storage unavailable")
+        stored.append(artifact)
+
+    monkeypatch.setattr("skyvern.forge.sdk.artifact.manager._bundling_enabled", lambda: True)
+    monkeypatch.setattr(
+        "skyvern.forge.sdk.artifact.manager.app.STORAGE",
+        SimpleNamespace(
+            build_uri=lambda **kwargs: f"s3://artifacts/{kwargs['artifact_id']}",
+            store_artifact=_store,
+            save_downloaded_files=AsyncMock(),
+        ),
+    )
+    monkeypatch.setattr("skyvern.forge.sdk.artifact.manager.app.DATABASE.artifacts.bulk_create_artifacts", AsyncMock())
+    now = datetime.now(UTC)
+
+    async def fake_create_step(**kwargs: Any) -> Step:
+        task = make_task(now, make_organization(now), task_id=kwargs["task_id"])
+        return make_step(
+            now, task, step_id=f"turn-{kwargs['order']}", status=StepStatus.running, order=kwargs["order"], output=None
+        )
+
+    monkeypatch.setattr("skyvern.forge.agent.app.DATABASE.tasks.create_step", fake_create_step)
+    monkeypatch.setattr("skyvern.forge.agent.app.DATABASE.tasks.finish_step", AsyncMock())
+
+    async def drive_turns(kwargs: dict[str, Any]) -> None:
+        for turn in (1, 2):
+            turn_step = await kwargs["on_turn_start"](turn)
+            manager.accumulate_llm_call_to_archive(step=turn_step, request=b"request", response=b"response")
+            await kwargs["on_turn_end"](TurnRecord(turn=turn))
+
+    # The real cleanup, with only its browser, webhook and file-store edges faked.
+    cleaner = ForgeAgent()
+    buffered_at_browser_close: list[list[str]] = []
+
+    async def close_browser(*_args: Any, **_kwargs: Any) -> None:
+        buffered_at_browser_close.append(sorted(manager._step_archives))
+
+    cleaner.cleanup_browser_and_create_artifacts = AsyncMock(side_effect=close_browser)  # type: ignore[method-assign]
+    cleaner.async_operation_pool.remove_task = AsyncMock()  # type: ignore[method-assign]
+    webhook = AsyncMock()
+    cleaner.execute_task_webhook = webhook  # type: ignore[method-assign]
+    monkeypatch.setattr("skyvern.forge.agent.app.BROWSER_MANAGER.get_for_task", MagicMock(return_value=None))
+    monkeypatch.setattr("skyvern.forge.agent.drain_speculative_persist_tasks", AsyncMock(return_value=None))
+    monkeypatch.setattr(
+        "skyvern.forge.agent.uploaded_file_service.delete_files_attached_to_run", AsyncMock(return_value=None)
+    )
+
+    async def real_clean_up(**kwargs: Any) -> None:
+        monkeypatch.setattr("skyvern.forge.agent.app.DATABASE.tasks.get_task", AsyncMock(return_value=kwargs["task"]))
+        await cleaner.clean_up_task(**kwargs)
+
+    await _run_execute_task_v3(
+        monkeypatch,
+        LoopOutcome(status="completed", reason="done", billable_actions=[]),
+        on_loop_async=drive_turns,
+        clean_up_task=AsyncMock(side_effect=real_clean_up),
+        data_extraction_goal=None,
+        extracted_information_schema=None,
+    )
+
+    assert buffered_at_browser_close == [["turn-1", "turn-2"]]
+    assert [artifact.step_id for artifact in stored] == ([] if store_fails else ["step-v3"])
+    assert manager._step_archives == {}
+    webhook.assert_awaited_once()
 
 
 @pytest.mark.asyncio

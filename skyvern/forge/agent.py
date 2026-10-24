@@ -4396,6 +4396,7 @@ class ForgeAgent:
             browser_session_id=browser_session_id,
             download_suffix=task_block.download_suffix if task_block else None,
             list_files_before=cleanup_list_files_before,
+            bundle_step_archives=True,
         )
         return step, task
 
@@ -4657,7 +4658,8 @@ class ForgeAgent:
                     )
                 finally:
                     # The block's turn steps share its ZIP: one storage PUT per block rather than one per turn.
-                    await app.ARTIFACT_MANAGER.flush_task_step_archives_as_one(step)
+                    with contained_effect("task_v3 block archive flush", task_id=step.task_id):
+                        await app.ARTIFACT_MANAGER.flush_task_step_archives_as_one(step)
                 return step, detailed_output, None
 
             if workflow_owned_recovery:
@@ -9714,6 +9716,7 @@ class ForgeAgent:
         browser_session_id: str | None = None,
         download_suffix: str | None = None,
         list_files_before: list[str] | None = None,
+        bundle_step_archives: bool = False,
     ) -> None:
         cleanup_context = skyvern_context.current()
         try:
@@ -9727,6 +9730,7 @@ class ForgeAgent:
                 browser_session_id,
                 download_suffix,
                 list_files_before,
+                bundle_step_archives=bundle_step_archives,
             )
         finally:
             if cleanup_context is not None:
@@ -9747,6 +9751,7 @@ class ForgeAgent:
         browser_session_id: str | None = None,
         download_suffix: str | None = None,
         list_files_before: list[str] | None = None,
+        bundle_step_archives: bool = False,
     ) -> None:
         # Keep the capture window alive through settle/finalize; only durable credit permits closing reservations.
         # The outer finally releases ownership on every terminal exit.
@@ -10016,6 +10021,10 @@ class ForgeAgent:
         # Wait for all tasks to complete before generating the links for the artifacts
         with traced_span(_tracer, "skyvern.agent.cleanup.wait_for_upload") as _cl_wait_span:
             apply_context_attrs(_cl_wait_span)
+            if bundle_step_archives:
+                # The drain below writes one ZIP per step; a Task V3 block's turn steps share one on its block step.
+                with contained_effect("task_v3 block archive flush", task_id=task.task_id):
+                    await app.ARTIFACT_MANAGER.flush_task_step_archives_as_one(last_step)
             await app.ARTIFACT_MANAGER.wait_for_upload_aiotasks([task.task_id])
 
         # Before the webhook, so a caller acting on the run's completion already sees the
