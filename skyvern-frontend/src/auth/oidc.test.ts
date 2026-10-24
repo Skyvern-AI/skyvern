@@ -1,3 +1,7 @@
+import { readdirSync, readFileSync } from "node:fs";
+import { dirname, join } from "node:path";
+import { fileURLToPath } from "node:url";
+
 import { afterEach, describe, expect, it, vi } from "vitest";
 
 import { createOidcUserManager } from "./oidc";
@@ -29,6 +33,14 @@ function base64UrlEncode(bytes: Uint8Array) {
     .replace(/\+/g, "-")
     .replace(/\//g, "_")
     .replace(/=+$/, "");
+}
+
+function sourceFiles(directory: string): string[] {
+  return readdirSync(directory, { withFileTypes: true }).flatMap((entry) => {
+    const path = join(directory, entry.name);
+    if (entry.isDirectory()) return sourceFiles(path);
+    return /\.[cm]?[jt]sx?$/.test(entry.name) ? [path] : [];
+  });
 }
 
 afterEach(() => {
@@ -107,7 +119,17 @@ describe("OIDC browser client", () => {
 
   it("rejects a callback with no matching state", async () => {
     let redirectUrl = "";
-    vi.stubGlobal("fetch", vi.fn().mockResolvedValue(jsonResponse(metadata)));
+    const fetchMock = vi
+      .fn()
+      .mockResolvedValueOnce(jsonResponse(metadata))
+      .mockResolvedValueOnce(
+        jsonResponse({
+          access_token: "unexpected-token",
+          token_type: "Bearer",
+          expires_in: 3600,
+        }),
+      );
+    vi.stubGlobal("fetch", fetchMock);
     const manager = createOidcUserManager(config, (url) => {
       redirectUrl = url;
     });
@@ -118,7 +140,22 @@ describe("OIDC browser client", () => {
       manager.signinRedirectCallback(
         `${window.location.origin}/oidc/callback?code=authorization-code&state=wrong-${state}`,
       ),
-    ).rejects.toThrow();
+    ).rejects.toThrow("OIDC callback state is invalid");
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+  });
+
+  it("does not import cloud-only packages in the self-hosted frontend source", () => {
+    const src = join(dirname(fileURLToPath(import.meta.url)), "..");
+    const forbiddenImport =
+      /\b(?:from|import)\s*(?:\(\s*)?["'](?:@(?:clerk|cloud)\/|cloud(?:\/|["']))/;
+    expect(
+      forbiddenImport.test(['import { value } from "', '@cloud/api"'].join("")),
+    ).toBe(true);
+    const importedFiles = sourceFiles(src).filter((path) =>
+      forbiddenImport.test(readFileSync(path, "utf8")),
+    );
+
+    expect(importedFiles).toEqual([]);
   });
 
   it("normalizes trailing slashes when matching the discovery issuer", async () => {
