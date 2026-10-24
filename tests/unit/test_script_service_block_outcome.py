@@ -473,6 +473,45 @@ async def test_uncached_download_failure_after_browser_loss_raises_the_typed_ref
 
 
 @pytest.mark.asyncio
+async def test_sftp_source_download_bypasses_cached_browser_download(
+    cached_run: SimpleNamespace, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    cached_lookup = MagicMock(side_effect=AssertionError("SFTP sources must bypass cached browser downloads"))
+    monkeypatch.setattr(script_service.script_run_context_manager, "get_cached_fn", cached_lookup)
+    executed_blocks: list[FileDownloadBlock] = []
+
+    async def execute_source(block: FileDownloadBlock, **_: object) -> BlockResult:
+        executed_blocks.append(block)
+        return BlockResult(
+            success=True,
+            output_parameter=make_block_output_parameter("download_output"),
+            status=BlockStatus.completed,
+        )
+
+    monkeypatch.setattr(FileDownloadBlock, "execute_safe", execute_source)
+
+    await script_service.download(
+        prompt="Read the report",
+        label="sftp_source",
+        sftp_source_path="/reports/report.csv",
+        sftp_host="sftp.example.test",
+        sftp_port=2222,
+        sftp_username="source_user",
+        sftp_password="source_password",
+        sftp_host_key="ssh-ed25519 AAAA",
+    )
+
+    cached_lookup.assert_not_called()
+    assert len(executed_blocks) == 1
+    assert executed_blocks[0].sftp_source_path == "/reports/report.csv"
+    assert executed_blocks[0].sftp_host == "sftp.example.test"
+    assert executed_blocks[0].sftp_port == 2222
+    assert executed_blocks[0].sftp_username == "source_user"
+    assert executed_blocks[0].sftp_password == "source_password"
+    assert executed_blocks[0].sftp_host_key == "ssh-ed25519 AAAA"
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize(
     ("complete_if_empty", "expected_status", "expected_reason"),
     [

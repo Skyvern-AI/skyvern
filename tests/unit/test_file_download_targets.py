@@ -16,13 +16,14 @@ from skyvern.config import settings
 from skyvern.exceptions import AzureConfigurationError, BlockedHost, DownloadSaveIncompleteError, UnresolvableHost
 from skyvern.forge.sdk.api.llm.api_handler_factory import LLMAPIHandlerFactory
 from skyvern.forge.sdk.schemas.files import FileInfo
-from skyvern.forge.sdk.services import google_drive_service, google_oauth_service
+from skyvern.forge.sdk.services import google_drive_service, google_oauth_service, sftp_service
 from skyvern.forge.sdk.workflow.models.block import BaseTaskBlock, FileDownloadBlock
 from skyvern.forge.sdk.workflow.models.parameter import OutputParameter
 from skyvern.forge.sdk.workflow.workflow_definition_converter import block_yaml_to_block
 from skyvern.schemas.workflows import (
     BlockResult,
     BlockStatus,
+    BlockType,
     FileDownloadBlockYAML,
     FileDownloadTarget,
     FileStorageType,
@@ -112,6 +113,11 @@ async def _execute_file_download(
                 block.sftp_password,
                 block.sftp_private_key,
                 block.sftp_private_key_passphrase,
+                block.sftp_host,
+                block.sftp_username,
+                block.sftp_host_key,
+                block.sftp_source_path,
+                block.sftp_remote_path,
                 block.google_credential_id,
             )
             if value
@@ -421,6 +427,124 @@ async def test_google_drive_api_file_not_downloadable_does_not_fall_back_to_brow
     assert "Drive rejected a regular blob download" in execution.result.failure_reason
     execution.browser_execute.assert_not_awaited()
     execution.record_output.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_sftp_source_downloads_without_browser_and_binds_registered_file(tmp_path: Path) -> None:
+    payload = b"id,value\n1,ok\n"
+    download_dir = tmp_path / "downloads"
+    block = _file_download_block(
+        FileDownloadTarget.WEBSITE,
+        sftp_host="host-ref",
+        sftp_port=2222,
+        sftp_username="username-ref",
+        sftp_password="password-ref",
+        sftp_source_path="path-ref",
+        sftp_host_key="host-key-ref",
+    )
+    downloaded_file = FileInfo(
+        url="https://app.example.test/artifacts/private",
+        checksum=hashlib.sha256(payload).hexdigest(),
+        filename="report.csv",
+        file_size=len(payload),
+        artifact_id="artifact-private",
+    )
+
+    async def download_source(**kwargs: object) -> str:
+        assert kwargs["host"] == "resolved-host"
+        assert kwargs["remote_path"] == "/reports/report.csv"
+        assert kwargs["username"] == "resolved-user"
+        assert kwargs["password"] == "resolved-password"
+        assert kwargs["host_key"] == "resolved-host-key"
+        path = Path(str(kwargs["output_dir"])) / "report.csv"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(payload)
+        return str(path)
+
+    with patch(
+        "skyvern.forge.sdk.workflow.models.block.sftp_service.download_file",
+        new_callable=AsyncMock,
+        side_effect=download_source,
+    ) as sftp_download:
+        execution = await _execute_file_download(
+            block,
+            _browser_result(block),
+            download_dir,
+            secret_values={
+                "host-ref": "resolved-host",
+                "path-ref": "/reports/report.csv",
+                "username-ref": "resolved-user",
+                "password-ref": "resolved-password",
+                "host-key-ref": "resolved-host-key",
+            },
+            downloaded_file_infos=[downloaded_file],
+        )
+
+    assert execution.result.success is True
+    assert execution.result.output_parameter_value["file_name"] == "report.csv"
+    assert execution.result.output_parameter_value["downloaded_files"][0]["filename"] == "report.csv"
+    execution.browser_execute.assert_not_awaited()
+    execution.storage_save.assert_awaited_once_with(organization_id="organization-id", run_id="workflow-run-id")
+    execution.upload.assert_not_awaited()
+    sftp_download.assert_awaited_once()
+
+
+def test_file_download_sftp_source_is_optional_and_round_trips_yaml() -> None:
+    base = {
+        "block_type": BlockType.FILE_DOWNLOAD,
+        "label": "download",
+        "navigation_goal": "Download the requested file.",
+    }
+    legacy_yaml = FileDownloadBlockYAML(**base)
+    legacy_block = block_yaml_to_block(legacy_yaml, {"download_output": _output_parameter()}, workflow_id="workflow-id")
+    assert legacy_yaml.sftp_source_path is None
+    assert legacy_block.sftp_source_path is None
+
+    source_yaml = FileDownloadBlockYAML(**base, sftp_source_path="/reports/report.csv")
+    source_block = block_yaml_to_block(source_yaml, {"download_output": _output_parameter()}, workflow_id="workflow-id")
+    assert source_block.sftp_source_path == "/reports/report.csv"
+
+
+@pytest.mark.asyncio
+async def test_sftp_source_failure_does_not_fall_back_to_browser(tmp_path: Path) -> None:
+    block = _file_download_block(
+        FileDownloadTarget.WEBSITE,
+        sftp_host="sftp.example.test",
+        sftp_username="user",
+        sftp_password="password",
+        sftp_source_path="/reports/report.csv",
+    )
+    error = sftp_service.SFTPDownloadError(sftp_service.SFTPDownloadErrorCategory.HOST_KEY_MISMATCH)
+
+    with patch(
+        "skyvern.forge.sdk.workflow.models.block.sftp_service.download_file",
+        new_callable=AsyncMock,
+        side_effect=error,
+    ):
+        execution = await _execute_file_download(block, _browser_result(block), tmp_path / "downloads")
+
+    assert execution.result.success is False
+    assert execution.result.failure_reason == "Failed to download file from SFTP: host_key_mismatch"
+    execution.browser_execute.assert_not_awaited()
+    execution.record_output.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_sftp_source_template_failure_is_configuration_error(tmp_path: Path) -> None:
+    block = _file_download_block(
+        FileDownloadTarget.WEBSITE,
+        sftp_host="sftp.example.test",
+        sftp_username="user",
+        sftp_password="password",
+        sftp_source_path="/reports/report.csv",
+    )
+
+    with patch.object(FileDownloadBlock, "render_templatable_field", side_effect=ValueError("invalid template")):
+        execution = await _execute_file_download(block, _browser_result(block), tmp_path / "downloads")
+
+    assert execution.result.success is False
+    assert execution.result.failure_reason == "Failed to download file from SFTP: configuration"
+    execution.browser_execute.assert_not_awaited()
 
 
 @pytest.mark.asyncio
