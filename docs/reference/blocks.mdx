@@ -289,6 +289,8 @@ Very large files can exceed the parser's time budget and fail the block. When a 
 | **Data Schema** | JSON | Schema for the extracted output. Enable the checkbox to reveal the editor. |
 | **Model** | selector | Which LLM model to use |
 
+**Force OCR** (Advanced Settings, `force_ocr` in YAML, default off) applies to PDFs only. It makes Skyvern ignore the PDF's embedded text layer and read the pages with vision OCR instead. Skyvern already falls back to OCR when the text layer is empty or scrambled, so turn this on only when the text layer is unreadable in some other way. OCR is slower, costs more, and reads at most the first 50 pages, so a longer PDF loses the remaining pages.
+
 <Frame>
 <img width="400" src="/images/cloud/file_parse_block.png" alt="File Parser block configuration with File URL, Data Schema, and Model fields" />
 </Frame>
