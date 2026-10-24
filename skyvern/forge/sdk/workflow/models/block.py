@@ -17131,6 +17131,30 @@ class HttpRequestBlock(Block):
     TEMPLATABLE_FIELDS: ClassVar[frozenset[str]] = frozenset({"body", "download_filename", "files", "headers", "url"})
 
     @staticmethod
+    def _payload_size_bytes(value: Any) -> int | None:
+        if value is None:
+            return 0
+        if isinstance(value, bytes):
+            return len(value)
+        if isinstance(value, str):
+            return len(value.encode("utf-8"))
+        try:
+            return len(json.dumps(value).encode("utf-8"))
+        except (TypeError, ValueError, RecursionError):
+            return None
+
+    @staticmethod
+    def _normalized_media_type(value: str | None) -> str | None:
+        if not value:
+            return None
+        message = EmailMessage()
+        try:
+            message["Content-Type"] = value
+        except ValueError:
+            return None
+        return message.get_content_type()
+
+    @staticmethod
     def get_allowed_dirs(workflow_run_id: str, organization_id: str | None) -> list[str]:
         run_download_id = resolve_run_download_id(skyvern_context.current(), fallback_run_id=workflow_run_id)
         allowed_dirs = [
@@ -17501,10 +17525,7 @@ class HttpRequestBlock(Block):
         # If files are provided, don't set default Content-Type (aiohttp will set multipart/form-data)
         if not self.files:
             if not self.headers.get("Content-Type") and not self.headers.get("content-type"):
-                LOG.info(
-                    "Adding default content-type as application/json",
-                    headers=workflow_run_context.mask_secrets_in_data(self.headers),
-                )
+                LOG.info("Adding default content-type as application/json")
                 self.headers["Content-Type"] = "application/json"
 
         # Download files from HTTP URLs or S3 URIs if needed
@@ -17582,18 +17603,12 @@ class HttpRequestBlock(Block):
                             organization_id=organization_id,
                         )
                     downloaded_files[field_name] = local_file_path_str
-                    LOG.info(
-                        "HttpRequestBlock Using allowed local file",
-                        field_name=field_name,
-                        file_path=masked_local_file_path,
-                    )
+                    LOG.info("HttpRequestBlock Using allowed local file")
                 else:
                     # Download from remote source
                     try:
                         LOG.info(
                             "HttpRequestBlock Downloading file from remote source",
-                            field_name=field_name,
-                            file_path=masked_file_path,
                             is_url=is_url,
                             is_managed_storage_uri=is_managed_storage_uri,
                         )
@@ -17603,12 +17618,7 @@ class HttpRequestBlock(Block):
                             authorize_redirect=self._authorize_file_redirect(field_name),
                         )
                         downloaded_files[field_name] = local_file_path
-                        LOG.info(
-                            "HttpRequestBlock File downloaded successfully",
-                            field_name=field_name,
-                            original_path=masked_file_path,
-                            local_path=local_file_path,
-                        )
+                        LOG.info("HttpRequestBlock File downloaded successfully")
                     except Exception as e:
                         masked_error = str(workflow_run_context.mask_secrets_in_data(str(e)))
                         return await self.build_block_result(
@@ -17632,14 +17642,19 @@ class HttpRequestBlock(Block):
             )
 
         try:
+            request_content_type = self._normalized_media_type(
+                workflow_run_context.mask_secrets_in_data(
+                    (self.headers or {}).get("Content-Type") or (self.headers or {}).get("content-type")
+                )
+            )
             LOG.info(
                 "Executing HTTP request",
                 method=self.method,
                 url=workflow_run_context.mask_secrets_in_data(self.url),
-                headers=workflow_run_context.mask_secrets_in_data(self.headers),
                 workflow_run_id=workflow_run_id,
-                body=workflow_run_context.mask_secrets_in_data(self.body),
-                files=workflow_run_context.mask_secrets_in_data(self.files),
+                request_content_type=request_content_type,
+                request_body_size_bytes=self._payload_size_bytes(self.body),
+                files_count=len(self.files or {}),
             )
 
             status_code, response_headers, response_body = await aiohttp_request(
@@ -17695,7 +17710,15 @@ class HttpRequestBlock(Block):
                 url=workflow_run_context.mask_secrets_in_data(self.url),
                 method=self.method,
                 workflow_run_id=workflow_run_id,
-                response_data=response_data,
+                request_content_type=request_content_type,
+                response_content_type=self._normalized_media_type(
+                    workflow_run_context.mask_secrets_in_data(
+                        response_headers.get("Content-Type") or response_headers.get("content-type")
+                    )
+                ),
+                request_body_size_bytes=self._payload_size_bytes(self.body),
+                response_body_size_bytes=self._payload_size_bytes(response_body),
+                files_count=len(self.files or {}),
             )
 
             if failure_reason is None and not success:

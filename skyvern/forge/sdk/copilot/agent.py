@@ -256,6 +256,7 @@ from skyvern.forge.sdk.copilot.tools.run_execution import (
     recorded_open_step_runs,
     reusable_origin_input_keys,
     run_workflow_end_to_end,
+    start_minted_browser_session_close,
 )
 from skyvern.forge.sdk.copilot.tools.scouting import (
     _release_scout_challenge_listeners,
@@ -5083,6 +5084,9 @@ async def run_copilot_agent(
                         for attached in list(turn_end_ctx.attached_browser_drivers.values())
                     ]
                     await wait_for_driver_releases(releases)
+                if turn_end_ctx is not None and turn_end_ctx.minted_browser_sessions:
+                    # After the driver release, so each browser is detached before it is ended.
+                    await asyncio.shield(start_minted_browser_session_close(turn_end_ctx))
     except asyncio.CancelledError:
         if eval_mode == CopilotEvalMode.BROWSER_ABLATION and ctx_sink:
             browser_session_id = ctx_sink[0].browser_session_id

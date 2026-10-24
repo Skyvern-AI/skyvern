@@ -285,6 +285,7 @@ from skyvern.forge.sdk.workflow.models.workflow import (
     workflow_definition_sha256,
 )
 from skyvern.forge.sdk.workflow.runtime_secret_bridge import consume_copilot_runtime_secret_values
+from skyvern.schemas.browser_session_close import BrowserSessionCloseReason
 from skyvern.schemas.proxy_location import ProxyLocationInput, runtime_proxy_location
 from skyvern.schemas.self_heal import HealEpisodeDetail, HealStatus
 from skyvern.schemas.workflows import BlockStatus, BlockType
@@ -3453,6 +3454,88 @@ def _withhold_browser_until_run_secrets_arrive(
         )
 
 
+async def _run_in_a_minted_browser_is_still_live(session_id: str, run_id: str, organization_id: str) -> bool:
+    """Whether a run dispatched into a minted browser, or a descendant that inherited it, is still going.
+
+    A fire-and-forget child outlives its parent, so a terminal parent is not on its own proof that
+    the browser is free. The run row is terminal before workflow cleanup releases its session lease.
+    Anything unreadable counts as live: closing a browser under a running test is worse than a
+    browser closed late.
+    """
+    try:
+        session = await app.PERSISTENT_SESSIONS_MANAGER.get_session(session_id, organization_id)
+        if session is not None and session.runnable_id:
+            return True
+        pending_run_ids = [run_id]
+        seen_run_ids: set[str] = set()
+        while pending_run_ids:
+            current_run_id = pending_run_ids.pop()
+            if current_run_id in seen_run_ids:
+                continue
+            seen_run_ids.add(current_run_id)
+            run = await app.DATABASE.workflow_runs.get_workflow_run(current_run_id, organization_id)
+            if run is None or not run.status.is_final():
+                return True
+            children = await app.DATABASE.workflow_runs.get_workflow_runs_by_parent_workflow_run_id(
+                parent_workflow_run_id=current_run_id,
+                organization_id=organization_id,
+            )
+            pending_run_ids.extend(child.workflow_run_id for child in children)
+        return False
+    except Exception:
+        LOG.warning(
+            "Could not read a minted browser's run or lease; keeping the browser open",
+            workflow_run_id=run_id,
+            exc_info=True,
+        )
+        return True
+
+
+async def close_minted_browser_sessions(ctx: CopilotContext) -> None:
+    """Close the browsers this turn minted, at the end of the turn that is their only reader.
+
+    A browser_session_id a client supplies is honoured only when it names a studio debug session, so
+    a browser Copilot minted is unreachable the moment its turn ends -- no later turn can be handed
+    it, and nothing else closes it, so its whole remaining budget is billed as uptime (SKY-18904).
+    A run that outlived the turn keeps its browser until its session lease and all inherited child
+    runs are done; its tracked close waits in the background so a paused run does not hold the turn.
+    """
+    minted = list(ctx.minted_browser_sessions.items())
+    ctx.minted_browser_sessions.clear()
+
+    async def _close(session_id: str, run_id: str | None) -> None:
+        if run_id is not None and await _run_in_a_minted_browser_is_still_live(session_id, run_id, ctx.organization_id):
+            LOG.info("copilot_minted_browser_kept_for_live_run", browser_session_id=session_id, run_id=run_id)
+
+            async def _close_when_idle() -> None:
+                while await _run_in_a_minted_browser_is_still_live(session_id, run_id, ctx.organization_id):
+                    await asyncio.sleep(RUN_BLOCKS_POLL_INTERVAL_SECONDS)
+                await _close(session_id, None)
+
+            task = asyncio.create_task(_close_when_idle())
+            _DETACHED_CLEANUP_TASKS.add(task)
+            task.add_done_callback(_DETACHED_CLEANUP_TASKS.discard)
+            task.add_done_callback(_log_detached_cleanup_failure)
+            return
+        closed = await close_browser_session_quietly(
+            ctx.organization_id, session_id, reason=BrowserSessionCloseReason.turn_ended
+        )
+        LOG.info("copilot_minted_browser_closed", browser_session_id=session_id, run_id=run_id, closed=closed)
+
+    if minted:
+        await asyncio.gather(*(_close(session_id, run_id) for session_id, run_id in minted))
+
+
+def start_minted_browser_session_close(ctx: CopilotContext) -> asyncio.Task[None]:
+    """Run the close as a tracked task so a cancelled turn — the likeliest time nobody comes back for
+    the browser — still finishes it after the caller's await is interrupted."""
+    task = asyncio.ensure_future(close_minted_browser_sessions(ctx))
+    _DETACHED_CLEANUP_TASKS.add(task)
+    task.add_done_callback(_DETACHED_CLEANUP_TASKS.discard)
+    task.add_done_callback(_log_detached_cleanup_failure)
+    return task
+
+
 def terminal_ready_for_latch(
     *,
     current_workflow_labels: list[str],
@@ -5491,6 +5574,9 @@ async def _run_blocks_and_collect_debug(
                     exc_info=True,
                 )
         _withhold_browser_until_run_secrets_arrive(ctx, origin_registry, run_session_id)
+        if run_session_id and run_session_id in ctx.minted_browser_sessions:
+            # Keep the run id so turn-end cleanup can close the browser after an outliving run releases it.
+            ctx.minted_browser_sessions[run_session_id] = workflow_run.workflow_run_id
         if secret_run_session_lock is not None:
             secret_run_session_lock.release()
 

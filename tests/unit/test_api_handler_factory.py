@@ -17,6 +17,7 @@ import pytest  # type: ignore[import-not-found]
 import structlog
 from litellm.llms.anthropic.chat.transformation import AnthropicConfig  # type: ignore[import-not-found]
 from PIL import Image
+from structlog.testing import capture_logs
 
 from skyvern.forge.sdk.api.llm import api_handler_factory
 from skyvern.forge.sdk.api.llm.api_handler_factory import (
@@ -138,6 +139,48 @@ def test_render_hashed_href_map_returns_expensive_templates_unchanged() -> None:
 
     assert api_handler_factory._render_hashed_href_map(range_payload, {}) == range_payload
     assert api_handler_factory._render_hashed_href_map(multiplication_payload, {}) == multiplication_payload
+
+
+@pytest.mark.asyncio
+async def test_anthropic_response_log_contains_metadata_but_not_response_content(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    sentinel = "private-response-sentinel"
+    response = SimpleNamespace(
+        id="response-123",
+        model="claude-test",
+        content=[SimpleNamespace(type="text", text=sentinel)],
+        stop_reason="end_turn",
+        usage=SimpleNamespace(input_tokens=12, output_tokens=4),
+    )
+    create = AsyncMock(return_value=response)
+    monkeypatch.setitem(
+        vars(api_handler_factory.app),
+        "ANTHROPIC_CLIENT",
+        SimpleNamespace(beta=SimpleNamespace(messages=SimpleNamespace(create=create))),
+    )
+    caller = object.__new__(LLMCaller)
+    caller.llm_config = SimpleNamespace(model_name="anthropic/claude-test")
+    caller.llm_key = "ANTHROPIC_TEST"
+    caller.original_llm_key = caller.llm_key
+    caller.openai_client = None
+    caller._custom_openrouter = False
+    caller._router = None
+
+    with capture_logs() as events:
+        result = await caller._dispatch_llm_call([], prompt_name="extract-actions")
+
+    assert result is response
+    assert "prompt_name" not in create.await_args.kwargs
+    event = next(event for event in events if event["event"] == "Anthropic response")
+    assert event["model_name"] == "claude-test"
+    assert event["prompt_name"] == "extract-actions"
+    assert event["response_type"] == "SimpleNamespace"
+    assert event["content_length"] == len(sentinel)
+    assert event["stop_reason"] == "end_turn"
+    assert event["token_usage"] == {"input_tokens": 12, "output_tokens": 4}
+    assert event["response_id"] == "response-123"
+    assert all(sentinel not in repr(event) for event in events)
 
 
 @pytest.mark.parametrize(
@@ -3890,3 +3933,46 @@ async def test_router_call_served_from_the_vertex_cache_counts_as_primary(monkey
     assert fallback_receipts([fields | {"event": event} for event, fields in logger.events + logger.warnings]) == [
         ("primary", "gemini-group", "gemini-group")
     ]
+
+
+@pytest.mark.asyncio
+async def test_vertex_cache_primary_failure_log_omits_provider_error(monkeypatch: pytest.MonkeyPatch) -> None:
+    sentinel = "private-provider-error-sentinel"
+    llm_key = "TEST_VERTEX_CACHE_PROVIDER_ERROR"
+    config = LLMRouterConfig(
+        model_name="test-router",
+        required_env_vars=[],
+        supports_vision=False,
+        add_assistant_prefix=False,
+        model_list=[
+            LLMRouterModelConfig(
+                model_name=group,
+                litellm_params={"model": model, "mock_response": '{"actions": []}'},
+            )
+            for group, model in (("gemini-group", "vertex_ai/gemini-x"), ("gpt-group", "azure/gpt-x"))
+        ],
+        main_model_group="gemini-group",
+        fallback_model_group=["gpt-group"],
+        routing_strategy="simple-shuffle",
+        num_retries=0,
+        disable_cooldowns=True,
+        temperature=None,
+    )
+    _stub_for_router_test(monkeypatch, llm_key=llm_key, config=config)
+    context = SkyvernContext()
+    context.use_prompt_caching = True
+    context.vertex_cache_name = "projects/1/locations/global/cachedContents/2"
+    monkeypatch.setattr(api_handler_factory.skyvern_context, "current", lambda: context)
+    monkeypatch.setattr(
+        api_handler_factory.litellm,
+        "acompletion",
+        AsyncMock(side_effect=[RuntimeError(sentinel), FakeLLMResponse("azure/gpt-x")]),
+    )
+
+    with capture_logs() as events:
+        handler = LLMAPIHandlerFactory.get_llm_api_handler_with_router(llm_key)
+        await handler(prompt='{"actions": []}', prompt_name=EXTRACT_ACTION_PROMPT_NAME)
+
+    event = next(event for event in events if event["event"] == "Vertex cache primary call failed, retrying via router")
+    assert event["error_type"] == "RuntimeError"
+    assert all(sentinel not in repr(event) for event in events)
