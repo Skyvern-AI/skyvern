@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 from collections.abc import AsyncIterator
 from datetime import UTC, datetime, timedelta
 from types import SimpleNamespace
@@ -549,10 +550,16 @@ async def test_mcp_tools_create_edit_cancel_and_read_back_every_one_time_state(
     ("attempts", "statuses", "deleted"),
     [
         (["fails"], [502], False),
+        (["hangs"], [502], False),
         (["deletes"], [200], True),
         (["deletes, then times out", "deletes"], [502, 200], True),
     ],
-    ids=["backend-delete-fails", "backend-delete-succeeds", "retry-after-a-backend-delete-that-landed"],
+    ids=[
+        "backend-delete-fails",
+        "backend-delete-hangs",
+        "backend-delete-succeeds",
+        "retry-after-a-backend-delete-that-landed",
+    ],
 )
 async def test_deleting_a_schedule_deletes_its_backend_schedule_before_its_row(
     schedules_client: httpx.AsyncClient,
@@ -575,12 +582,16 @@ async def test_deleting_a_schedule_deletes_its_backend_schedule_before_its_row(
         attempt = next(pending)
         if attempt == "fails":
             raise RuntimeError("scheduler unavailable")
+        if attempt == "hangs":
+            # Outlasts the route's timeout, so only a bounded route answers before this would land.
+            await asyncio.sleep(2)
         # Like the cloud backend, deleting a schedule that is already gone succeeds.
         live_backend.discard(backend_schedule_id)
         if attempt == "deletes, then times out":
             raise TimeoutError
 
     monkeypatch.setattr(workflow_schedule_routes.app.AGENT_FUNCTION, "delete_workflow_schedule", delete_backend)
+    monkeypatch.setattr(workflow_schedule_routes, "BACKEND_SCHEDULE_DELETE_TIMEOUT_SECONDS", 0.05)
 
     responses = [await _request(schedules_client, NOW, "DELETE", f"/{schedule_id}") for _ in attempts]
 
