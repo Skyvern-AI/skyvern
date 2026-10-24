@@ -12073,16 +12073,18 @@ class WorkflowService:
         self,
         deleted_schedules: list[tuple[str, str | None]],
         organization_id: str | None,
-    ) -> None:
-        """Best effort: a failed backend delete is logged and left for the backend's own cleanup."""
+    ) -> list[str]:
+        """Best effort: returns the schedule ids whose backend schedule is gone; a failed delete is only logged."""
         targets = [(schedule_id, backend_id) for schedule_id, backend_id in deleted_schedules if backend_id]
         slots = asyncio.Semaphore(BACKEND_SCHEDULE_DELETE_CONCURRENCY)
         outcomes = await asyncio.gather(
             *(_delete_backend_schedule(backend_id, slots) for _, backend_id in targets), return_exceptions=True
         )
+        gone_schedule_ids: list[str] = []
         deleted_backend_ids: list[str] = []
         for (workflow_schedule_id, backend_schedule_id), outcome in zip(targets, outcomes, strict=True):
             if outcome is None:
+                gone_schedule_ids.append(workflow_schedule_id)
                 deleted_backend_ids.append(backend_schedule_id)
                 continue
             LOG.warning(
@@ -12099,6 +12101,7 @@ class WorkflowService:
                 backend_schedule_ids=deleted_backend_ids,
                 count=len(deleted_backend_ids),
             )
+        return gone_schedule_ids
 
     async def delete_workflow_by_id(
         self,
