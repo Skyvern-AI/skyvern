@@ -36,6 +36,7 @@ from sqlalchemy import (
     update,
 )
 from sqlalchemy.dialects.postgresql import JSONB
+from sqlalchemy.engine import RowMapping
 from sqlalchemy.exc import IntegrityError, SQLAlchemyError, StatementError
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.ext.compiler import compiles
@@ -451,6 +452,58 @@ def _final_webhook_claim_is_free(stale_before: datetime) -> ColumnElement[bool]:
 
 class WorkflowRunsRepository(BaseRepository):
     """Database operations for workflow runs."""
+
+    @db_operation("list_workflow_run_activity_for_export", log_errors=False)
+    async def list_for_activity_export(
+        self,
+        *,
+        organization_id: str,
+        since: datetime,
+        until: datetime,
+        before_created_at: datetime | None,
+        before_workflow_run_id: str | None,
+        limit: int,
+    ) -> list[RowMapping]:
+        filters = [
+            WorkflowRunModel.organization_id == organization_id,
+            WorkflowRunModel.created_at >= to_naive_utc(since),
+            WorkflowRunModel.created_at <= to_naive_utc(until),
+            WorkflowRunModel.parent_workflow_run_id.is_(None),
+        ]
+        before_created_at = to_naive_utc(before_created_at)
+        if before_created_at is not None and before_workflow_run_id is not None:
+            filters.append(
+                (WorkflowRunModel.created_at < before_created_at)
+                | (
+                    (WorkflowRunModel.created_at == before_created_at)
+                    & (WorkflowRunModel.workflow_run_id < before_workflow_run_id)
+                )
+            )
+            # Bound the index walk at the cursor instead of filtering every newer run.
+            filters.append(WorkflowRunModel.created_at <= before_created_at)
+
+        async with self.Session() as session:
+            return list(
+                (
+                    await session.execute(
+                        select(
+                            WorkflowRunModel.workflow_run_id,
+                            WorkflowRunModel.created_at,
+                            WorkflowRunModel.workflow_permanent_id,
+                            WorkflowRunModel.trigger_type,
+                            WorkflowRunModel.created_by,
+                            WorkflowRunModel.requested_by,
+                            WorkflowRunModel.workflow_schedule_id,
+                            WorkflowRunModel.retried_from_workflow_run_id,
+                        )
+                        .where(*filters)
+                        .order_by(WorkflowRunModel.created_at.desc(), WorkflowRunModel.workflow_run_id.desc())
+                        .limit(limit)
+                    )
+                )
+                .mappings()
+                .all()
+            )
 
     async def finalize_workflow_run_for_dispatch(
         self,
