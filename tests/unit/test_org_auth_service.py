@@ -1154,6 +1154,7 @@ _NO_USER = {
     "token_has_organization_claim": None,
     "app_role": None,
     "app_role_is_authoritative": False,
+    "impersonator_user_id": None,
 }
 _ADMIN = {
     "user_id": "user_admin",
@@ -1162,6 +1163,7 @@ _ADMIN = {
     "token_has_organization_claim": None,
     "app_role": None,
     "app_role_is_authoritative": False,
+    "impersonator_user_id": None,
 }
 _MEMBER = {
     "user_id": "user_member",
@@ -1170,6 +1172,7 @@ _MEMBER = {
     "token_has_organization_claim": None,
     "app_role": None,
     "app_role_is_authoritative": False,
+    "impersonator_user_id": None,
 }
 _ROLELESS = {
     "user_id": "user_roleless",
@@ -1178,6 +1181,7 @@ _ROLELESS = {
     "token_has_organization_claim": None,
     "app_role": None,
     "app_role_is_authoritative": False,
+    "impersonator_user_id": None,
 }
 
 
