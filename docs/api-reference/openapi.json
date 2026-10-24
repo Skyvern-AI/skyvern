@@ -9084,6 +9084,17 @@
             ],
             "title": "Actor User Id"
           },
+          "impersonated_by": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Impersonated By"
+          },
           "auth_kind": {
             "type": "string",
             "title": "Auth Kind"
@@ -9141,6 +9152,7 @@
           "created_at",
           "organization_id",
           "actor_user_id",
+          "impersonated_by",
           "auth_kind",
           "org_role",
           "action",
