@@ -26,6 +26,9 @@ vi.mock("../WorkflowRowActions", () => ({
     children: (kebab: ReactNode) => ReactNode;
   }) => children(null),
 }));
+vi.mock("../WorkflowFolderCell", () => ({
+  WorkflowFolderCell: () => null,
+}));
 vi.mock("@/hooks/useWorkflowStudioEnabled", () => ({
   useWorkflowStudioEnabled: () => false,
 }));

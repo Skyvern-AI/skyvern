@@ -85,6 +85,7 @@ import { FolderCard } from "./components/FolderCard";
 import { CreateFolderDialog } from "./components/CreateFolderDialog";
 import { CreateFromTemplateDialog } from "./components/CreateFromTemplateDialog";
 import { ViewAllFoldersDialog } from "./components/ViewAllFoldersDialog";
+import { WorkflowFolderCell } from "./components/WorkflowFolderCell";
 import { HighlightText } from "./components/HighlightText";
 import { useCreateWorkflowMutation } from "./hooks/useCreateWorkflowMutation";
 import { useFoldersQuery } from "./hooks/useFoldersQuery";
@@ -1102,38 +1103,20 @@ function WorkflowsFlat() {
                                   ) : null}
                                 </div>
                               </TableCell>
-                              <TableCell
-                                onClick={(event) => {
-                                  handleRowClick(
-                                    event,
-                                    workflow.workflow_permanent_id,
-                                  );
-                                }}
-                              >
-                                {workflow.folder_id ? (
-                                  <div className="flex min-w-0 items-center gap-1.5">
-                                    <FolderIcon className="h-3.5 w-3.5 shrink-0 text-blue-700 dark:text-blue-400" />
-                                    <span
-                                      className="truncate text-sm"
-                                      title={
-                                        foldersMap.get(workflow.folder_id)
-                                          ?.title || workflow.folder_id
-                                      }
-                                    >
-                                      <HighlightText
-                                        text={
-                                          foldersMap.get(workflow.folder_id)
-                                            ?.title || workflow.folder_id
-                                        }
-                                        query={debouncedSearch}
-                                      />
-                                    </span>
-                                  </div>
-                                ) : (
-                                  <span className="text-muted-foreground">
-                                    -
-                                  </span>
-                                )}
+                              <TableCell>
+                                <WorkflowFolderCell
+                                  workflowPermanentId={
+                                    workflow.workflow_permanent_id
+                                  }
+                                  folderId={workflow.folder_id ?? null}
+                                  folderTitle={
+                                    (workflow.folder_id &&
+                                      foldersMap.get(workflow.folder_id)
+                                        ?.title) ||
+                                    null
+                                  }
+                                  highlightQuery={debouncedSearch}
+                                />
                               </TableCell>
                               {showCreator && (
                                 <TableCell
