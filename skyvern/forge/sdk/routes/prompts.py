@@ -13,6 +13,7 @@ from skyvern.forge.sdk.api.llm.exceptions import (
     InvalidLLMResponseType,
     LLMProviderError,
 )
+from skyvern.forge.sdk.api.llm.utils import llm_response_log_metadata
 from skyvern.forge.sdk.routes.routers import base_router
 from skyvern.forge.sdk.schemas.organizations import Organization
 from skyvern.forge.sdk.schemas.prompts import (
@@ -119,7 +120,7 @@ async def improve_prompt(
             use_case=use_case,
             organization_id=current_org.organization_id,
             prompt=request.prompt,
-            improved_prompt=output,
+            **llm_response_log_metadata(output),
         )
 
         response = ImprovePromptResponse(

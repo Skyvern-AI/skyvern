@@ -130,6 +130,7 @@ from skyvern.forge.sdk.api.llm.api_handler_factory import (
 )
 from skyvern.forge.sdk.api.llm.exceptions import BaseLLMError, LLMProviderError
 from skyvern.forge.sdk.api.llm.schema_validator import extraction_shape_matches, validate_and_fill_extraction_result
+from skyvern.forge.sdk.api.llm.utils import llm_response_log_metadata
 from skyvern.forge.sdk.artifact.storage.base import get_download_retry_started_at, is_file_from_retry_attempt
 from skyvern.forge.sdk.browser_action_preflight import preflight_action, preflight_derived_action
 from skyvern.forge.sdk.cache import extraction_cache, extraction_shadow
@@ -11513,13 +11514,13 @@ async def handle_terminate_action(
             extracted_errors = await extract_user_defined_errors(
                 task=task, step=step, scraped_page=scraped_page, reasoning=action.reasoning
             )
-        except Exception:
+        except Exception as exc:
             LOG.warning(
                 "extract_user_defined_errors failed, using errors from action reasoning",
                 task_id=task.task_id,
                 step_id=step.step_id,
-                action_errors=action.errors,
-                exc_info=True,
+                action_error_count=len(action.errors),
+                error_type=type(exc).__name__,
             )
         else:
             skyvern_codes = {error.error_code for error in skyvern_errors}
@@ -13466,7 +13467,7 @@ async def input_or_auto_complete_input(
         if input_or_select_context.is_search_bar:
             LOG.info(
                 "Stop generating potential values for the auto-completion since it's a search bar",
-                context=input_or_select_context,
+                **llm_response_log_metadata(input_or_select_context.model_dump()),
             )
             return None
 
@@ -13620,7 +13621,7 @@ async def input_or_auto_complete_input(
         LOG.info(
             "Auto completion didn't finish, this might leave the input value to be empty.",
             sampling=True,
-            context=input_or_select_context,
+            **llm_response_log_metadata(input_or_select_context.model_dump()),
             attempts=attempt_timings,
             total_seconds=round(_elapsed_seconds(), 1),
         )
@@ -13845,7 +13846,7 @@ async def sequentially_select_from_dropdown(
     if not force_select and input_or_select_context.is_search_bar:
         LOG.info(
             "Exit custom selection mode since it's a non-force search bar",
-            context=input_or_select_context,
+            **llm_response_log_metadata(input_or_select_context.model_dump()),
         )
         return None
 
@@ -15422,8 +15423,7 @@ async def select_from_emerging_elements(
     LOG.info(
         "LLM response for the matched element",
         sampling=True,
-        matched_value=value,
-        response=json_response,
+        **llm_response_log_metadata(json_response),
     )
 
     # Check the no-match shape before ``ActionType`` coercion — coercing an empty
@@ -15861,8 +15861,7 @@ async def select_from_dropdown(
         LOG.info(
             "LLM response for the matched element",
             sampling=True,
-            matched_value=value,
-            response=json_response,
+            **llm_response_log_metadata(json_response),
         )
 
         # Check the no-match shape before ``ActionType`` coercion — coercing an empty
@@ -16456,7 +16455,7 @@ async def normal_select(
     )
     LOG.debug(
         "Parsed input/select context",
-        context=input_or_select_context,
+        **llm_response_log_metadata(input_or_select_context.model_dump()),
     )
 
     select_options_result = await skyvern_element.refresh_select_options()
@@ -17300,7 +17299,7 @@ async def _get_input_or_select_context(
             original_response_type=type(json_response).__name__,
             original_response_length=len(json_response) if json_response else 0,
             first_item_type=type(json_response[0]).__name__ if json_response else None,
-            first_item_keys=list(json_response[0].keys())
+            first_item_keys_count=len(json_response[0])
             if json_response and isinstance(json_response[0], dict)
             else None,
         )
@@ -17310,7 +17309,7 @@ async def _get_input_or_select_context(
     input_or_select_context = InputOrSelectContext.model_validate(json_response)
     LOG.debug(
         "Parsed input/select context",
-        context=input_or_select_context,
+        **llm_response_log_metadata(input_or_select_context.model_dump()),
     )
     return input_or_select_context
 
@@ -17385,8 +17384,8 @@ async def extract_user_defined_errors(
             "Dropped LLM-returned error codes not in user error_code_mapping",
             task_id=task.task_id,
             step_id=step.step_id,
-            dropped_codes=dropped,
-            allowed_codes=sorted((task.error_code_mapping or {}).keys()),
+            dropped_count=len(dropped),
+            allowed_codes_count=len(task.error_code_mapping or {}),
         )
     if not kept and reasoning:
         return _match_user_defined_error_from_reasoning(task=task, step=step, reasoning=reasoning)

@@ -26,6 +26,7 @@ from skyvern.core.script_generations.script_validators import (
 from skyvern.forge import app
 from skyvern.forge.prompts import prompt_engine
 from skyvern.forge.sdk.api.llm.api_handler_factory import get_org_aware_secondary_llm_api_handler
+from skyvern.forge.sdk.api.llm.utils import llm_response_log_metadata
 from skyvern.forge.sdk.workflow.models.block import get_all_blocks
 from skyvern.forge.sdk.workflow.models.parameter import is_sensitive_workflow_parameter
 from skyvern.schemas.scripts import ScriptBranchHit, ScriptFallbackEpisode
@@ -1020,7 +1021,7 @@ class ScriptReviewer:
                 "ScriptReviewer: triage result",
                 episode_id=episode.episode_id,
                 code_fixable=is_code_fixable,
-                triage_response=response_text[:200] if response_text else None,
+                **llm_response_log_metadata(response_text),
             )
             return is_code_fixable
         except Exception:
@@ -1222,8 +1223,7 @@ class ScriptReviewer:
                     block_label=block_label,
                     attempt=attempt,
                     prompt_name=template,
-                    response_type=type(llm_response).__name__,
-                    response_snippet=str(llm_response)[:200],
+                    **llm_response_log_metadata(llm_response),
                 )
 
                 updated_code = self._extract_code_from_response(
@@ -1237,7 +1237,7 @@ class ScriptReviewer:
                         block_label=block_label,
                         attempt=attempt,
                         prompt_name=template,
-                        response_snippet=str(llm_response)[:500],
+                        **llm_response_log_metadata(llm_response),
                     )
                     if attempt >= max_attempts:
                         return None

@@ -131,7 +131,7 @@ from skyvern.forge.sdk.api.llm.exceptions import (
     LLMResponseMissingActionsError,
 )
 from skyvern.forge.sdk.api.llm.ui_tars_llm_caller import UITarsLLMCaller
-from skyvern.forge.sdk.api.llm.utils import uses_only_anthropic_models
+from skyvern.forge.sdk.api.llm.utils import llm_response_log_metadata, uses_only_anthropic_models
 from skyvern.forge.sdk.api.llm.vertex_cache_manager import get_cache_manager
 from skyvern.forge.sdk.api.llm.yutori_navigator_llm_caller import (
     YutoriNavigatorLLMCaller,
@@ -6933,7 +6933,7 @@ class ForgeAgent:
                     screenshots=scraped_page.screenshots,
                     system_prompt=task.workflow_system_prompt,
                 )
-                LOG.info("Skyvern response to CUA question", skyvern_response=skyvern_response)
+                LOG.info("Skyvern response to CUA question", **llm_response_log_metadata(skyvern_response))
                 cua_question = cua_question or skyvern_response.get("question_or_decision")
                 resp_content = skyvern_response.get("answer")
                 if not resp_content:
@@ -7163,7 +7163,7 @@ class ForgeAgent:
         # Generate response using the LLMCaller
         response_content = await llm_caller.generate_ui_tars_response(step)
 
-        LOG.info(f"UI-TARS raw response: {response_content}")
+        LOG.info("UI-TARS raw response", **llm_response_log_metadata(response_content))
 
         window_dimension = (
             cast(Resolution, scraped_page.window_dimension)
@@ -11116,8 +11116,9 @@ class ForgeAgent:
                     "Parallel verification: termination required, marking task as terminated",
                     step_id=step.step_id,
                     task_id=task.task_id,
-                    reasoning=skyvern_context.mask_multi_field_totp_data(
-                        complete_action.reasoning, task_id=task.task_id
+                    reasoning_type=type(complete_action.reasoning).__name__,
+                    reasoning_length=(
+                        len(complete_action.reasoning) if isinstance(complete_action.reasoning, str) else None
                     ),
                 )
                 final_status = step.speculative_original_status or StepStatus.completed
@@ -11496,8 +11497,8 @@ class ForgeAgent:
                 "Dropped LLM-returned error codes not in user error_code_mapping",
                 task_id=task.task_id,
                 step_id=step.step_id,
-                dropped_codes=dropped,
-                allowed_codes=sorted((task.error_code_mapping or {}).keys()),
+                dropped_count=len(dropped),
+                allowed_codes_count=len(task.error_code_mapping or {}),
             )
         return kept
 
@@ -11985,7 +11986,7 @@ class ForgeAgent:
                 "Step completed and goal achieved, marking task as completed",
                 step_order=step.order,
                 step_retry=step.retry_index,
-                output=step.output,
+                **llm_response_log_metadata(step.output.model_dump() if step.output is not None else None),
             )
             last_step = await self.update_step(step, is_last=True)
             extracted_information = await self.get_extracted_information_for_task(task)
@@ -12036,9 +12037,7 @@ class ForgeAgent:
                     "Step completed and terminated by the agent, marking task as terminated",
                     step_order=step.order,
                     step_retry=step.retry_index,
-                    output=skyvern_context.mask_multi_field_totp_data(step.output.model_dump(), task_id=task.task_id)
-                    if step.output is not None and task.task_id in skyvern_context.multi_field_totp_masking_task_ids()
-                    else step.output,
+                    **llm_response_log_metadata(step.output.model_dump() if step.output is not None else None),
                 )
                 last_step = await self.update_step(step, is_last=True)
                 failure_category = classify_from_failure_reason(failure_reason)
@@ -12076,7 +12075,7 @@ class ForgeAgent:
                 "Step completed for the action block, marking task as completed",
                 step_order=step.order,
                 step_retry=step.retry_index,
-                output=step.output,
+                **llm_response_log_metadata(step.output.model_dump() if step.output is not None else None),
             )
             last_step = await self.update_step(step, is_last=True)
             await self.update_task(

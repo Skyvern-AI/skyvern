@@ -56,6 +56,7 @@ from skyvern.forge.sdk.api.llm.api_handler_factory import (
     get_org_aware_primary_llm_api_handler,
     get_org_aware_secondary_llm_api_handler,
 )
+from skyvern.forge.sdk.api.llm.utils import llm_response_log_metadata
 from skyvern.forge.sdk.artifact.models import ArtifactType
 from skyvern.forge.sdk.artifact.storage.base import get_download_retry_started_at, is_file_from_retry_attempt
 from skyvern.forge.sdk.core import skyvern_context
@@ -1498,7 +1499,7 @@ async def _detect_user_defined_errors(
             except Exception:
                 LOG.warning(
                     "Failed to validate user-defined error",
-                    error_dict=error_dict,
+                    **llm_response_log_metadata(error_dict),
                 )
 
         user_defined_errors, dropped = filter_to_user_defined_codes(user_defined_errors, error_code_mapping)
@@ -1507,8 +1508,8 @@ async def _detect_user_defined_errors(
                 "Dropped LLM-returned error codes not in user error_code_mapping",
                 task_id=task.task_id,
                 step_id=step.step_id,
-                dropped_codes=dropped,
-                allowed_codes=sorted((error_code_mapping or {}).keys()),
+                dropped_count=len(dropped),
+                allowed_codes_count=len(error_code_mapping or {}),
             )
 
         LOG.info(
@@ -1516,7 +1517,6 @@ async def _detect_user_defined_errors(
             task_id=task.task_id,
             step_id=step.step_id,
             error_count=len(user_defined_errors),
-            errors=[e.error_code for e in user_defined_errors],
         )
 
         return user_defined_errors
