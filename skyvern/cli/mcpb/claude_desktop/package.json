@@ -2,13 +2,20 @@
   "name": "skyvern-claude-desktop-mcpb",
   "version": "0.0.0-private",
   "private": true,
-  "description": "Claude Desktop MCP bundle for Skyvern Cloud",
+  "description": "Claude Desktop API-key bridge for Skyvern HTTPS deployments",
   "license": "Apache-2.0",
   "dependencies": {
-    "mcp-remote": "0.1.38"
+    "@modelcontextprotocol/client": "2.3.1",
+    "@modelcontextprotocol/core": "2.3.1",
+    "@modelcontextprotocol/server": "2.3.1"
   },
-  "overrides": {
-    "undici": "7.29.1",
-    "qs": "^6.15.2"
+  "type": "module",
+  "scripts": {
+    "test": "node --import ./test/no-network.mjs --test test/contract.test.mjs test/proxy.test.mjs test/desktop-ca.test.mjs",
+    "check": "tsc --allowJs --checkJs --noEmit --strict --skipLibCheck --target ES2022 --module NodeNext --moduleResolution NodeNext proxy.mjs desktop.mjs desktop-ca.mjs"
+  },
+  "devDependencies": {
+    "@types/node": "22.13.10",
+    "typescript": "5.9.3"
   }
 }
