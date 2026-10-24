@@ -45,6 +45,8 @@ if TYPE_CHECKING:
 LOG = structlog.get_logger(__name__)
 
 ARCHIVE_AGE_THRESHOLD = timedelta(days=90)
+# Long enough for slow storage that still progresses; bounds the archive bytes a stalled store keeps alive.
+BACKGROUND_FLUSH_TIMEOUT_SECONDS = 120.0
 
 
 def _ensure_aware_utc(value: datetime) -> datetime:
@@ -249,6 +251,7 @@ class ArtifactManager:
         self.upload_aiotasks_map: dict[str, list[asyncio.Task[None]]] = defaultdict(list)
         # step_id -> accumulator for step archive artifacts
         self._step_archives: dict[str, StepArchiveAccumulator] = {}
+        self._background_flushes: set[asyncio.Task[None]] = set()
 
     def _track_upload_aiotask(
         self,
@@ -1799,6 +1802,10 @@ class ArtifactManager:
         filename = f"html_action_{action_idx}.html"
         self._add_to_step_archive(acc, filename, html_action, ArtifactType.HTML_ACTION)
 
+    def accumulate_html_scrape_to_archive(self, step: Step, html: bytes) -> str:
+        acc = self._get_or_create_step_archive(step, None, None, None)
+        return self._add_to_step_archive(acc, "scrape.html", html, ArtifactType.HTML_SCRAPE)
+
     def accumulate_screenshot_to_step_archive(
         self,
         step: Step,
@@ -1889,6 +1896,25 @@ class ArtifactManager:
         else:
             await self._flush_step_archive_unbundled(accumulator)
         await self._apply_pending_action_screenshot_updates(accumulator)
+
+    def flush_step_archive_in_background(self, step: Step) -> None:
+        # wait_for_upload_aiotasks cancels what it tracks at its timeout, and a flush cancelled after it popped the
+        # accumulator loses the archive, so the flush itself is shielded and held here until it ends.
+        async def _flush() -> None:
+            try:
+                async with asyncio.timeout(BACKGROUND_FLUSH_TIMEOUT_SECONDS):
+                    await self.flush_step_archive(step.step_id)
+            except Exception:
+                LOG.warning("Failed to flush step archive", step_id=step.step_id, exc_info=True)
+
+        flush = asyncio.create_task(_flush())
+        self._background_flushes.add(flush)
+        flush.add_done_callback(self._background_flushes.discard)
+
+        async def _shielded() -> None:
+            await asyncio.shield(flush)
+
+        self._track_upload_aiotask(step.task_id, asyncio.create_task(_shielded()))
 
     async def flush_task_step_archives_as_one(self, owner: Step) -> None:
         """Persist every buffered archive of ``owner``'s task as one ZIP owned by ``owner``.

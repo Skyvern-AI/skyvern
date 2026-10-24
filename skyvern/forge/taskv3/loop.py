@@ -4005,6 +4005,8 @@ async def run_agent_tool_loop(
     on_action_round: ActionRoundSink | None = None,
     on_turn_start: TurnStart | None = None,
     on_turn_end: TurnEnd | None = None,
+    # Awaited after each successful model call, before the turn touches the page.
+    on_model_returned: Callable[[], Awaitable[None]] | None = None,
     on_pre_action: Callable[[str, dict[str, Any]], Awaitable[None]] | None = None,
     # Called before each page-touching tool call is dispatched.
     on_page_action: Callable[[], None] | None = None,
@@ -4745,6 +4747,11 @@ async def run_agent_tool_loop(
         open_turn.record.llm_seconds = time.monotonic() - llm_started_at
         if st.outcome is not None:
             break
+        if on_model_returned is not None:
+            try:
+                await on_model_returned()
+            except Exception:
+                LOG.warning("taskv3 on_model_returned callback failed", turn=st.turns, exc_info=True)
 
         usage = _get(response, "usage") or {}
         turn_tokens = _get(usage, "total_tokens")
