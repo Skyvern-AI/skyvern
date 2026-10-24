@@ -548,3 +548,76 @@ describe("block model override on save", () => {
     });
   });
 });
+
+describe("FileDownloadBlock SFTP source round trip", () => {
+  test("preserves source path and shared credentials for website downloads", () => {
+    const sourceBlock = {
+      block_type: "file_download",
+      label: "read_report",
+      continue_on_failure: false,
+      next_loop_on_failure: false,
+      url: null,
+      title: "Read report",
+      navigation_goal: "Read the report",
+      error_code_mapping: null,
+      parameters: [],
+      download_target: "website",
+      path: "{{ workflow_run_id }}",
+      prompt: null,
+      sftp_source_path: "/reports/report.csv",
+      sftp_host: "sftp.example.test",
+      sftp_port: 2222,
+      sftp_username: "source_user",
+      sftp_password: "source_password",
+      sftp_private_key: "source_private_key",
+      sftp_private_key_passphrase: "source_passphrase",
+      sftp_host_key: "ssh-ed25519 AAAA",
+    } as unknown as WorkflowBlock;
+
+    const { nodes, edges } = getElements([sourceBlock], SETTINGS, true);
+    const fileDownloadNode = nodes.find((node) => node.type === "fileDownload");
+    expect(fileDownloadNode?.data).toMatchObject({
+      sftpSourcePath: "/reports/report.csv",
+      sftpHost: "sftp.example.test",
+      sftpPort: "2222",
+      sftpUsername: "source_user",
+      sftpPassword: "source_password",
+      sftpPrivateKey: "source_private_key",
+      sftpPrivateKeyPassphrase: "source_passphrase",
+      sftpHostKey: "ssh-ed25519 AAAA",
+    });
+
+    const savedFromNodes = getWorkflowBlocks(nodes, edges)[0];
+    expect(savedFromNodes).toMatchObject({
+      block_type: "file_download",
+      sftp_source_path: "/reports/report.csv",
+      sftp_host: "sftp.example.test",
+      sftp_port: 2222,
+      sftp_username: "source_user",
+      sftp_password: "source_password",
+      sftp_private_key: "source_private_key",
+      sftp_private_key_passphrase: "source_passphrase",
+      sftp_host_key: "ssh-ed25519 AAAA",
+    });
+    expect(savedFromNodes).not.toHaveProperty("sftp_remote_path");
+
+    const exportedBlock = convert({
+      workflow_definition: {
+        version: 1,
+        parameters: [],
+        blocks: [sourceBlock],
+      },
+    } as unknown as WorkflowApiResponse).workflow_definition.blocks[0];
+    expect(exportedBlock).toMatchObject({
+      sftp_source_path: "/reports/report.csv",
+      sftp_host: "sftp.example.test",
+      sftp_port: 2222,
+      sftp_username: "source_user",
+      sftp_password: "source_password",
+      sftp_private_key: "source_private_key",
+      sftp_private_key_passphrase: "source_passphrase",
+      sftp_host_key: "ssh-ed25519 AAAA",
+    });
+    expect(exportedBlock).not.toHaveProperty("sftp_remote_path");
+  });
+});

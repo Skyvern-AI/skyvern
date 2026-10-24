@@ -1490,6 +1490,7 @@ class FileDownloadBlockYAML(BlockYAML):
     sftp_private_key_passphrase: str | None = None
     sftp_remote_path: str | None = None
     sftp_host_key: str | None = None
+    sftp_source_path: str | None = None
     path: str | None = None
     prompt: str | None = None
     continue_on_empty: bool = False
