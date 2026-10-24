@@ -84,7 +84,7 @@ _NAVIGATION_RESET_TIMEOUT_MS = 5_000
 _TARGET_CLOSED_ERROR_TYPES = frozenset({"TargetClosedError", "CdpTargetClosedError"})
 _PIPELINED_INPUT_KINDS = frozenset({"mouseEvent", "wheelEvent", "keyEvent"})
 _MAX_IN_FLIGHT_INPUT_DISPATCHES = 32
-_MAX_FILE_UPLOAD_BYTES = 10 * 1024 * 1024
+_MAX_FILE_UPLOAD_BYTES = 30 * 1024 * 1024
 
 
 def _input_kind_label(kind: object) -> str:
