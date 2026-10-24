@@ -1147,24 +1147,37 @@ def test_bearer_scheme_is_matched_case_insensitively() -> None:
 
 
 _PRINCIPAL_FIELDS = ("auth_kind", "user_id", "org_role", "org_role_claim", "token_has_organization_claim")
-_NO_USER = {"user_id": None, "org_role": None, "org_role_claim": None, "token_has_organization_claim": None}
+_NO_USER = {
+    "user_id": None,
+    "org_role": None,
+    "org_role_claim": None,
+    "token_has_organization_claim": None,
+    "app_role": None,
+    "app_role_is_authoritative": False,
+}
 _ADMIN = {
     "user_id": "user_admin",
     "org_role": "org:admin",
     "org_role_claim": "org_role",
     "token_has_organization_claim": None,
+    "app_role": None,
+    "app_role_is_authoritative": False,
 }
 _MEMBER = {
     "user_id": "user_member",
     "org_role": "member",
     "org_role_claim": "o.rol",
     "token_has_organization_claim": None,
+    "app_role": None,
+    "app_role_is_authoritative": False,
 }
 _ROLELESS = {
     "user_id": "user_roleless",
     "org_role": None,
     "org_role_claim": None,
     "token_has_organization_claim": None,
+    "app_role": None,
+    "app_role_is_authoritative": False,
 }
 
 
@@ -1275,6 +1288,10 @@ def _logged_principals(log: MagicMock) -> list[dict[str, object]]:
     ]
 
 
+def _logged_principal_snapshot(principal: dict[str, object]) -> dict[str, object]:
+    return {field: principal[field] for field in ("organization_id", *_PRINCIPAL_FIELDS)}
+
+
 def _use_bearer_authentication(monkeypatch: pytest.MonkeyPatch, organization: Organization | None) -> None:
     """Configure bearer authentication for ``organization``, or none at all as in a self-hosted deployment."""
 
@@ -1355,7 +1372,7 @@ async def test_raw_request_record_carries_the_request_principal(
     principal = {"organization_id": organization_id, **expected}
     assert response.status_code == 200
     assert response.json() == principal
-    assert _logged_principals(raw_request_log) == [principal]
+    assert _logged_principals(raw_request_log) == [_logged_principal_snapshot(principal)]
 
 
 @pytest.mark.asyncio
@@ -1396,7 +1413,7 @@ async def test_every_org_auth_dependency_resolves_the_principal_without_changing
     principal = {"organization_id": organization_id, **expected}
     assert response.status_code == 200
     assert response.json() == principal
-    assert _logged_principals(raw_request_log) == [principal]
+    assert _logged_principals(raw_request_log) == [_logged_principal_snapshot(principal)]
 
 
 @pytest.mark.asyncio
@@ -1418,7 +1435,7 @@ async def test_two_users_behind_one_key_each_get_their_own_principal_across_a_ca
         {"organization_id": organization_id, "auth_kind": "api_key_and_bearer", **user} for user in (_ADMIN, _MEMBER)
     ]
     assert [response.json() for response in responses] == principals
-    assert _logged_principals(raw_request_log) == principals
+    assert _logged_principals(raw_request_log) == [_logged_principal_snapshot(principal) for principal in principals]
 
 
 @pytest.mark.asyncio

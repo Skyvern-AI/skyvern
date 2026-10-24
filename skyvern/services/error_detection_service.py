@@ -17,6 +17,7 @@ from skyvern.errors.errors import UserDefinedError, filter_to_user_defined_codes
 from skyvern.forge import app
 from skyvern.forge.prompts import prompt_engine
 from skyvern.forge.sdk.api.llm.api_handler_factory import get_org_aware_primary_llm_api_handler
+from skyvern.forge.sdk.api.llm.utils import llm_response_log_metadata
 from skyvern.forge.sdk.core import skyvern_context
 from skyvern.forge.sdk.models import Step
 from skyvern.forge.sdk.schemas.tasks import Task
@@ -156,7 +157,6 @@ async def _detect_errors_from_page(
             task_id=task.task_id,
             step_id=step.step_id,
             error_count=len(user_defined_errors),
-            errors=[e.error_code for e in user_defined_errors],
         )
 
         return user_defined_errors
@@ -238,13 +238,13 @@ async def _detect_errors_from_context(
             try:
                 user_defined_error = UserDefinedError.model_validate(error_dict)
                 user_defined_errors.append(user_defined_error)
-            except Exception:
+            except Exception as exc:
                 LOG.warning(
                     "Failed to validate user-defined error",
                     task_id=task.task_id,
                     step_id=step.step_id,
-                    error_dict=error_dict,
-                    exc_info=True,
+                    **llm_response_log_metadata(error_dict),
+                    error_type=type(exc).__name__,
                 )
 
         user_defined_errors, dropped = filter_to_user_defined_codes(user_defined_errors, task.error_code_mapping)
@@ -253,8 +253,8 @@ async def _detect_errors_from_context(
                 "Dropped LLM-returned error codes not in user error_code_mapping",
                 task_id=task.task_id,
                 step_id=step.step_id,
-                dropped_codes=dropped,
-                allowed_codes=sorted((task.error_code_mapping or {}).keys()),
+                dropped_count=len(dropped),
+                allowed_codes_count=len(task.error_code_mapping or {}),
             )
 
         LOG.info(
@@ -262,16 +262,15 @@ async def _detect_errors_from_context(
             task_id=task.task_id,
             step_id=step.step_id,
             error_count=len(user_defined_errors),
-            errors=[e.error_code for e in user_defined_errors],
         )
 
         return user_defined_errors
 
-    except Exception:
+    except Exception as exc:
         LOG.warning(
             "Failed to detect errors from context",
             task_id=task.task_id,
             step_id=step.step_id,
-            exc_info=True,
+            error_type=type(exc).__name__,
         )
         return []

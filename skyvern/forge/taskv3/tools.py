@@ -93,6 +93,7 @@ from skyvern.forge.taskv3.loop import (
     REF_SELECTOR_RE,
     TARGET_KIND_DATA_KEY,
     TARGET_LABEL_DATA_KEY,
+    TARGET_LABEL_IS_PLACEHOLDER_DATA_KEY,
     CoveredBranch,
     CoveredLayerKind,
     DownloadFailureFacts,
@@ -5457,8 +5458,11 @@ _TARGET_NAME_JS = (
   // from one.
   const textEntry = editable || tag === 'TEXTAREA' || _matches(el, '[role=textbox],[role=searchbox]')
     || (tag === 'INPUT' && ['button', 'submit', 'reset', 'image', 'checkbox', 'radio', 'file', 'range'].indexOf(type) === -1);
-  const name = nrm(_attr(el, 'aria-label')) || labelled() || labelledBy() || contents || caption
-    || nrm(_attr(el, 'alt')) || nrm(_attr(el, 'placeholder')) || (textEntry ? '' : nrm(_attr(el, 'title')));
+  const named = nrm(_attr(el, 'aria-label')) || labelled() || labelledBy() || contents || caption
+    || nrm(_attr(el, 'alt'));
+  // A placeholder is a hint, often a sample answer, not the question: the name says when it came from one.
+  const hint = named ? '' : nrm(_attr(el, 'placeholder'));
+  const name = named || hint || (textEntry ? '' : nrm(_attr(el, 'title')));
   // Refused here rather than truncated, and this is the only place that can be exact: `length` is
   // UTF-16 code units while Python counts code points, so a name whose bound falls on an astral
   // character (an emoji is one code point, two units) would arrive UNDER the Python cap and be
@@ -5498,7 +5502,7 @@ _TARGET_NAME_JS = (
       kind = 'textbox';
     }
   }
-  return { name: finalName, kind: kind };
+  return { name: finalName, kind: kind, placeholder: Boolean(hint) && finalName !== null };
 }"""
 )
 
@@ -15318,6 +15322,7 @@ def build_browser_tools(
             selector = args.get("selector")
             name: str | None = None
             kind: str | None = None
+            from_placeholder = False
             # The page comes from the preflight handoff, read and not popped -- the handler's own
             # _resolve_page consumes it. Never page_provider(): a second must_get_working_page can
             # recover or relaunch a page, and a label is not worth a side effect. Every labelled tool
@@ -15355,6 +15360,7 @@ def build_browser_tools(
                     name = raw_name if isinstance(raw_name, str) and raw_name.strip() else None
                     raw_kind = raw.get("kind")
                     kind = raw_kind if isinstance(raw_kind, str) and raw_kind else None
+                    from_placeholder = raw.get("placeholder") is True
             result = await handler(args)
             # Only a call that acted carries a name/kind. The probe resolves the selector on its own,
             # so on a refusal the two can disagree about which element the selector meant -- a cloned
@@ -15367,6 +15373,8 @@ def build_browser_tools(
             data = {**(result.data or {})}
             if name is not None:
                 data[TARGET_LABEL_DATA_KEY] = name
+                if from_placeholder:
+                    data[TARGET_LABEL_IS_PLACEHOLDER_DATA_KEY] = True
             if kind is not None:
                 data[TARGET_KIND_DATA_KEY] = kind
             # `replace`, not a positional rebuild: this carries every field the result already has,
@@ -21668,12 +21676,17 @@ def build_browser_tools(
                 f"selected on {selector} — {reason}, so the selection could not be verified; re-observe "
                 "before relying on it"
             )
+        # The visible text of what is now selected: a call by value names only an internal code.
+        shown = readback.get("selectedLabels" if is_multi else "selectedLabel") if isinstance(readback, dict) else None
+        shown = ", ".join(x for x in shown if isinstance(x, str)) if isinstance(shown, list) else shown
+        data = {PICKED_OPTION_DATA_KEY: shown} if isinstance(shown, str) and shown.strip() else None
         if is_multi:
             return ToolResult.ok(
-                f"selected on {selector} — it now holds {len(held)} option(s): {_selection_report(held)}"
+                f"selected on {selector} — it now holds {len(held)} option(s): {_selection_report(held)}", data=data
             )
         return ToolResult.ok(
-            f"selected on {selector} (hidden native select, set directly)" if force else f"selected on {selector}"
+            f"selected on {selector} (hidden native select, set directly)" if force else f"selected on {selector}",
+            data=data,
         )
 
     async def press_key(args: dict[str, Any]) -> ToolResult:
@@ -22965,13 +22978,14 @@ def build_browser_tools(
         _with_ref_resolution("answer_probe", _with_selector_guard(_answer_target))
     )
 
-    async def _answer_field(args: dict[str, Any]) -> tuple[str, str, str]:
+    async def _answer_field(args: dict[str, Any]) -> tuple[str, str, str, bool]:
         resolved = dict(args)
         try:
             data = (await _resolve_answer_target(resolved)).data or {}
         except Exception:
-            return "", "", ""
-        return str(resolved.get("selector") or ""), str(data.get("name") or ""), str(data.get("kind") or "")
+            return "", "", "", False
+        name, kind = str(data.get("name") or ""), str(data.get("kind") or "")
+        return str(resolved.get("selector") or ""), name, kind, data.get("placeholder") is True
 
     tools = [
         _spec(

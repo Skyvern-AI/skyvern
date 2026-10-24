@@ -17,7 +17,7 @@ from contextvars import ContextVar
 from datetime import UTC, datetime, timedelta, timezone
 from enum import StrEnum
 from pathlib import Path
-from typing import Any, AsyncIterator, Awaitable, Callable, List, NamedTuple, TypedDict, TypeGuard, cast
+from typing import Any, AsyncIterator, Awaitable, Callable, List, Literal, NamedTuple, TypedDict, TypeGuard, cast
 
 import structlog
 from cachetools import TTLCache
@@ -35,7 +35,7 @@ from playwright.async_api import (
     Request,
     Response,
 )
-from pydantic import BaseModel, field_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 from skyvern.config import settings
 from skyvern.constants import (
@@ -97,8 +97,10 @@ from skyvern.exceptions import (
     OptionIndexOutOfBound,
     PhoneNumberInputBrowserInteractionFailed,
     PhoneNumberInputBrowserValidityMismatch,
+    PhoneNumberInputCountryCodeMismatch,
     PhoneNumberInputMismatch,
     ScreenshotTargetClosed,
+    ScrollMadeNoProgress,
     SecretInputMismatch,
     SkyvernException,
     SkyvernHTTPException,
@@ -128,6 +130,7 @@ from skyvern.forge.sdk.api.llm.api_handler_factory import (
 )
 from skyvern.forge.sdk.api.llm.exceptions import BaseLLMError, LLMProviderError
 from skyvern.forge.sdk.api.llm.schema_validator import extraction_shape_matches, validate_and_fill_extraction_result
+from skyvern.forge.sdk.api.llm.utils import llm_response_log_metadata
 from skyvern.forge.sdk.artifact.storage.base import get_download_retry_started_at, is_file_from_retry_attempt
 from skyvern.forge.sdk.browser_action_preflight import preflight_action, preflight_derived_action
 from skyvern.forge.sdk.cache import extraction_cache, extraction_shadow
@@ -284,6 +287,7 @@ from skyvern.webeye.utils.dom import (
 )
 from skyvern.webeye.utils.flutter_semantics import FLUTTER_TEXT_FIELD_JS, FRAME_SETTLE_TIMEOUT_SECONDS, TWO_FRAMES_JS
 from skyvern.webeye.utils.page import (
+    ElementScrollMetrics,
     SkyvernFrame,
     _all_page_frames,
     _blob_url_origin,
@@ -2693,7 +2697,7 @@ def check_existed_but_not_option_element_in_dom_factory(
         if not element_id:
             return False
         try:
-            locator = frame.locator(f"[{SKYVERN_ID_ATTR}={element_id}]")
+            locator = frame.locator(f'[{SKYVERN_ID_ATTR}="{element_id}"]')
             current_element = SkyvernElement(
                 locator=locator,
                 frame=frame,
@@ -2785,6 +2789,7 @@ async def check_phone_number_format(
     scraped_page: ScrapedPage,
     task: Task,
     step: Step,
+    field_current_value: str | None = None,
 ) -> str:
     # check the phone number format
     LOG.info(
@@ -2810,22 +2815,37 @@ async def check_phone_number_format(
     )
 
     check_phone_number_format_response = CheckPhoneNumberFormatResponse.model_validate(json_response)
+    recommended_phone_number = check_phone_number_format_response.recommended_phone_number
     if (
         not check_phone_number_format_response.is_phone_number_input
         or check_phone_number_format_response.is_current_format_correct
-        or not check_phone_number_format_response.recommended_phone_number
+        or not recommended_phone_number
     ):
+        return value
+
+    # A country picker next to an international field selects the same dial code the field holds, so
+    # dropping the dial code here leaves the picker to infer a country from the national digits.
+    if _recommendation_drops_dial_code(value, recommended_phone_number) and _tel_field_carries_dial_code(
+        field_value=field_current_value,
+        placeholder=await skyvern_element.get_attr("placeholder"),
+        autocomplete=await skyvern_element.get_attr("autocomplete"),
+    ):
+        LOG.info(
+            "Keeping the country calling code of an international phone input, ignoring the recommended number",
+            element_id=skyvern_element.get_id(),
+            source_digit_count=len(_phone_digits(value)),
+            recommended_digit_count=len(_phone_digits(recommended_phone_number)),
+        )
         return value
 
     LOG.info(
         "The current phone number format is incorrect, using the recommended phone number",
         element_id=skyvern_element.get_id(),
         source_digit_count=len(_phone_digits(value)),
-        recommended_digit_count=len(_phone_digits(check_phone_number_format_response.recommended_phone_number)),
-        digit_count_changed=len(_phone_digits(value))
-        != len(_phone_digits(check_phone_number_format_response.recommended_phone_number)),
+        recommended_digit_count=len(_phone_digits(recommended_phone_number)),
+        digit_count_changed=len(_phone_digits(value)) != len(_phone_digits(recommended_phone_number)),
     )
-    return check_phone_number_format_response.recommended_phone_number
+    return recommended_phone_number
 
 
 def _phone_digits(value: str | None) -> str:
@@ -2860,6 +2880,92 @@ def _phone_readback_digits_match(
 
 def _has_explicit_nanp_country_code(value: str | None) -> bool:
     return re.match(r"\+1|1[ \-.(]", (value or "").strip()) is not None
+
+
+_DIAL_CODE_PREFIX_RE = re.compile(r"^\s*\+\s*\d")
+# Shorter digit strings are more likely an extension or a local number than an international number
+# whose leading digits a widget could read as a country calling code.
+_MIN_INTERNATIONAL_PHONE_DIGITS = 8
+_NATIONAL_ONLY_AUTOCOMPLETE_TOKENS = frozenset({"tel-national", "tel-local", "tel-area-code", "tel-extension"})
+
+
+def _has_explicit_dial_code(value: str | None) -> bool:
+    return _DIAL_CODE_PREFIX_RE.match(value or "") is not None
+
+
+def _is_international_phone_form(value: str | None) -> bool:
+    # A leading "+" makes the digits that follow a country calling code plus the number. Unlike
+    # _has_explicit_dial_code this accepts a bare "+", which is a field's own international form
+    # before any digits are in it.
+    return (value or "").lstrip().startswith("+")
+
+
+def _tel_field_carries_dial_code(*, field_value: str | None, placeholder: str | None, autocomplete: str | None) -> bool:
+    """Whether this field takes the international number, so a paired country picker only mirrors it."""
+    autocomplete_tokens = (autocomplete or "").lower().split()
+    if _NATIONAL_ONLY_AUTOCOMPLETE_TOKENS.intersection(autocomplete_tokens):
+        return False
+    # A placeholder needs a dial code in it to be about phone format at all ("+ Add phone" is not); an
+    # example number in a national box can still read as one, which keeps a code the site may not want
+    # over dropping one it does. A value of bare "+" is what such a field holds before anything is typed.
+    return (
+        "tel" in autocomplete_tokens
+        or _has_explicit_dial_code(placeholder)
+        or _is_international_phone_form(field_value)
+    )
+
+
+def _recommendation_drops_dial_code(value: str, recommended: str) -> bool:
+    if not _has_explicit_dial_code(value) or _is_international_phone_form(recommended):
+        return False
+    value_digits = _phone_digits(value)
+    recommended_digits = _phone_digits(recommended)
+    return (
+        bool(recommended_digits)
+        and len(recommended_digits) < len(value_digits)
+        and (
+            value_digits.endswith(recommended_digits)
+            or (
+                recommended_digits.startswith("0")
+                and len(recommended_digits) > 1
+                and value_digits.endswith(recommended_digits[1:])
+            )
+        )
+    )
+
+
+def _tel_country_code_mismatch(
+    *, expected_value: str, actual_value: str | None, dial_code_withheld: bool = False
+) -> PhoneNumberInputCountryCodeMismatch | None:
+    """A field rendering its value in international form while reading digits of the number itself as the
+    country calling code. ``dial_code_withheld`` says the digits typed are a number whose own calling code
+    was taken off, which is the only evidence that a "+" in front of them is the wrong country: digits
+    that were never written with a "+" can equally be an international number given without one.
+    """
+    if not _is_international_phone_form(actual_value):
+        return None
+    expected_digits = _phone_digits(expected_value)
+    actual_digits = _phone_digits(actual_value)
+    if not actual_digits:
+        return None
+    if _has_explicit_dial_code(expected_value):
+        # A national trunk zero promoted to a false calling code also hides the lost dial code.
+        actual_without_trunk_prefix = (
+            actual_digits[1:] if actual_digits.startswith("0") and len(actual_digits) > 1 else actual_digits
+        )
+        if not (
+            len(actual_digits) < len(expected_digits)
+            and (expected_digits.endswith(actual_digits) or expected_digits.endswith(actual_without_trunk_prefix))
+        ):
+            return None
+    elif not dial_code_withheld or actual_digits != expected_digits:
+        return None
+    elif len(actual_digits) < _MIN_INTERNATIONAL_PHONE_DIGITS:
+        return None
+    return PhoneNumberInputCountryCodeMismatch(
+        expected_digit_count=len(expected_digits),
+        actual_digit_count=len(actual_digits),
+    )
 
 
 def _nanp_national_digits(value: str | None) -> str | None:
@@ -3108,6 +3214,7 @@ async def verify_phone_input_digits(
     locator: Locator,
     expected_value: str,
     allow_nanp_country_prefix: bool = False,
+    dial_code_withheld: bool = False,
     pattern: str | None = None,
     maxlength: str | None = None,
     engine_selection: BrowserEngineSelection | None = None,
@@ -3131,6 +3238,11 @@ async def verify_phone_input_digits(
             expected_digit_count=len(expected_digits),
             actual_digit_count=len(actual_digits),
         )
+    country_code_mismatch = _tel_country_code_mismatch(
+        expected_value=expected_value, actual_value=actual_value, dial_code_withheld=dial_code_withheld
+    )
+    if country_code_mismatch is not None:
+        raise country_code_mismatch
     LOG.info(
         "Phone input read-back verified",
         expected_digit_count=len(expected_digits),
@@ -3145,6 +3257,7 @@ async def _verify_tel_input_after_fill(
     tag_name: str,
     expected_value: str,
     allow_nanp_country_prefix: bool,
+    dial_code_withheld: bool = False,
     pattern: str | None = None,
     maxlength: str | None = None,
     engine_selection: BrowserEngineSelection | None = None,
@@ -3154,6 +3267,7 @@ async def _verify_tel_input_after_fill(
         locator=skyvern_element.get_locator(),
         expected_value=expected_value,
         allow_nanp_country_prefix=allow_nanp_country_prefix,
+        dial_code_withheld=dial_code_withheld,
         pattern=pattern,
         maxlength=maxlength,
         engine_selection=engine_selection,
@@ -3208,7 +3322,10 @@ async def _fill_nanp_tel_with_readback(
                 skyvern_element=skyvern_element,
                 tag_name=tag_name,
                 expected_value=national_digits,
+                # An E.164 retry exists only for a number written with its own "+1", so typing the
+                # national digits is both what permits a rendered "+1" and what withheld that code.
                 allow_nanp_country_prefix=e164_fallback is not None,
+                dial_code_withheld=e164_fallback is not None,
                 pattern=pattern,
                 maxlength=maxlength,
                 engine_selection=engine_selection,
@@ -3255,7 +3372,14 @@ async def _fill_nanp_tel_with_readback(
     return None
 
 
-async def _log_tel_fallback_fill_digit_counts(
+class TelFallbackReadback(NamedTuple):
+    expected_digit_count: int
+    actual_digit_count: int | None
+    country_code_mismatch: PhoneNumberInputCountryCodeMismatch | None = None
+    digits_match: bool = False
+
+
+async def _read_back_tel_fallback_fill(
     *,
     skyvern_element: SkyvernElement,
     tag_name: str,
@@ -3263,9 +3387,10 @@ async def _log_tel_fallback_fill_digit_counts(
     task_id: str | None,
     step_id: str | None,
     engine_selection: BrowserEngineSelection | None = None,
-) -> tuple[int, int | None]:
-    # Observability only: the LLM-fallback tel fill has no raising read-back, so a digit drop there is
-    # otherwise invisible. Count-only (values may be secrets) and never fails the action.
+) -> TelFallbackReadback:
+    # The LLM-fallback tel fill has no raising read-back, so a digit drop there is otherwise invisible.
+    # Counts are logged for every fill (values may be secrets); only a wrong international reading of
+    # the number is reported back as a failure.
     expected_digit_count = len(_phone_digits(expected_value))
     try:
         actual_value = await get_input_value(
@@ -3274,6 +3399,28 @@ async def _log_tel_fallback_fill_digit_counts(
             engine_selection=engine_selection,
         )
         actual_digit_count = len(_phone_digits(actual_value))
+        expected_digits = _phone_digits(expected_value)
+        actual_digits = _phone_digits(actual_value)
+        field_asserts_nanp = (
+            len(expected_digits) == 10
+            and actual_digits == f"1{expected_digits}"
+            and (actual_value or "").strip().startswith("+1")
+            and _tel_constraints_accept(
+                actual_value or "",
+                pattern=await skyvern_element.get_attr("pattern"),
+                maxlength=await skyvern_element.get_attr("maxlength"),
+            )
+        )
+        # `(0)` explicitly marks an optional national trunk prefix; all other digits must match.
+        optional_trunk_digits = _phone_digits(re.sub(r"\(\s*0\s*\)", "", expected_value))
+        digits_match = (
+            _phone_readback_digits_match(
+                expected_digits,
+                actual_digits,
+                allow_nanp_country_prefix=field_asserts_nanp,
+            )
+            or actual_digits == optional_trunk_digits
+        )
         LOG.info(
             "Tel fallback fill digit counts",
             expected_digit_count=expected_digit_count,
@@ -3283,7 +3430,17 @@ async def _log_tel_fallback_fill_digit_counts(
             task_id=task_id,
             step_id=step_id,
         )
-        return expected_digit_count, actual_digit_count
+        country_code_mismatch = _tel_country_code_mismatch(expected_value=expected_value, actual_value=actual_value)
+        if country_code_mismatch is not None:
+            LOG.warning(
+                "Phone input country calling code mismatch",
+                element_id=skyvern_element.get_id(),
+                expected_digit_count=expected_digit_count,
+                actual_digit_count=actual_digit_count,
+                task_id=task_id,
+                step_id=step_id,
+            )
+        return TelFallbackReadback(expected_digit_count, actual_digit_count, country_code_mismatch, digits_match)
     except Exception as exc:
         LOG.warning(
             "Failed to read back tel fallback fill",
@@ -3291,7 +3448,39 @@ async def _log_tel_fallback_fill_digit_counts(
             step_id=step_id,
             error_type=type(exc).__name__,
         )
-        return expected_digit_count, None
+        return TelFallbackReadback(expected_digit_count, None, digits_match=False)
+
+
+async def _tel_fill_recovers_with_source_number(
+    *,
+    skyvern_element: SkyvernElement,
+    tag_name: str,
+    source_value: str,
+    task_id: str | None,
+    step_id: str | None,
+    engine_selection: BrowserEngineSelection | None = None,
+) -> bool:
+    """Re-enter the number as the task gave it, once a recommended format left the field under another
+    country calling code. The field renders a "+", so it takes the number whole."""
+    try:
+        await skyvern_element.input_clear()
+        await skyvern_element.input_fill(text=source_value)
+    except Exception as exc:
+        LOG.warning(
+            "Failed to re-enter the phone number with its country calling code",
+            element_id=skyvern_element.get_id(),
+            error_type=type(exc).__name__,
+        )
+        return False
+    readback = await _read_back_tel_fallback_fill(
+        skyvern_element=skyvern_element,
+        tag_name=tag_name,
+        expected_value=source_value,
+        task_id=task_id,
+        step_id=step_id,
+        engine_selection=engine_selection,
+    )
+    return readback.digits_match and readback.country_code_mismatch is None
 
 
 _CARD_NUMBER_MIN_DIGITS = 13
@@ -9741,6 +9930,7 @@ async def _handle_input_text_action(
                 scraped_page=scraped_page,
                 task=task,
                 step=step,
+                field_current_value=current_text,
             )
         except Exception as exc:
             LOG.warning(
@@ -9808,6 +9998,7 @@ async def _handle_input_text_action(
                         scraped_page=scraped_page,
                         task=task,
                         step=step,
+                        field_current_value=current_text,
                     )
                 except Exception as exc:
                     LOG.warning(
@@ -9828,7 +10019,7 @@ async def _handle_input_text_action(
                 return [ActionFailure(PhoneNumberInputBrowserInteractionFailed())]
             raise
         if tel_outcome is not None and is_tel:
-            expected_digit_count, actual_digit_count = await _log_tel_fallback_fill_digit_counts(
+            readback = await _read_back_tel_fallback_fill(
                 skyvern_element=skyvern_element,
                 tag_name=tag_name,
                 expected_value=tel_source_text or text,
@@ -9837,8 +10028,23 @@ async def _handle_input_text_action(
                 engine_selection=engine_selection,
             )
             tel_outcome.attempt_count = max(tel_outcome.attempt_count, 1)
-            tel_outcome.actual_digit_count = actual_digit_count
+            tel_outcome.actual_digit_count = readback.actual_digit_count
             tel_outcome.browser_valid = await _probe_tel_browser_validity(skyvern_element.get_locator())
+            if readback.country_code_mismatch is not None:
+                # The recommended format is what lost the calling code, so the number as given is a
+                # retry the field has not seen yet.
+                if tel_source_text is None or _phone_digits(tel_source_text) == _phone_digits(text):
+                    return [ActionFailure(readback.country_code_mismatch)]
+                if not await _tel_fill_recovers_with_source_number(
+                    skyvern_element=skyvern_element,
+                    tag_name=tag_name,
+                    source_value=tel_source_text,
+                    task_id=task.task_id,
+                    step_id=step.step_id,
+                    engine_selection=engine_selection,
+                ):
+                    return [ActionFailure(readback.country_code_mismatch)]
+                tel_outcome.attempt_count += 1
         return [ActionSuccess()]
 
     # `Locator.clear()` on a spin button could cause the cursor moving away, and never be back
@@ -9984,6 +10190,7 @@ async def _handle_input_text_action(
                         scraped_page=scraped_page,
                         task=task,
                         step=step,
+                        field_current_value=current_text,
                     )
                 except Exception as exc:
                     LOG.warning(
@@ -10237,7 +10444,7 @@ async def _handle_input_text_action(
                     if isinstance(truncation_failure, ActionFailure):
                         return [truncation_failure]
                 if tel_outcome is not None and is_tel and not verify_tel_input_after_fill:
-                    expected_digit_count, actual_digit_count = await _log_tel_fallback_fill_digit_counts(
+                    readback = await _read_back_tel_fallback_fill(
                         skyvern_element=skyvern_element,
                         tag_name=tag_name,
                         expected_value=tel_source_text or text,
@@ -10246,8 +10453,21 @@ async def _handle_input_text_action(
                         engine_selection=engine_selection,
                     )
                     tel_outcome.attempt_count = max(tel_outcome.attempt_count, 1)
-                    tel_outcome.actual_digit_count = actual_digit_count
+                    tel_outcome.actual_digit_count = readback.actual_digit_count
                     tel_outcome.browser_valid = await _probe_tel_browser_validity(skyvern_element.get_locator())
+                    if readback.country_code_mismatch is not None:
+                        if tel_source_text is None or _phone_digits(tel_source_text) == _phone_digits(text):
+                            return [ActionFailure(readback.country_code_mismatch)]
+                        if not await _tel_fill_recovers_with_source_number(
+                            skyvern_element=skyvern_element,
+                            tag_name=tag_name,
+                            source_value=tel_source_text,
+                            task_id=task.task_id,
+                            step_id=step.step_id,
+                            engine_selection=engine_selection,
+                        ):
+                            return [ActionFailure(readback.country_code_mismatch)]
+                        tel_outcome.attempt_count += 1
 
             incremental_cleanup = clean_and_remove_element_tree_factory(
                 task=task,
@@ -10635,7 +10855,17 @@ async def handle_upload_file_action(
 
     locator = skyvern_element.locator
 
-    file_path = await handler_utils.download_file(file_url, action.model_dump(), task.organization_id)
+    try:
+        file_path = await handler_utils.download_file(file_url, action.model_dump(), task.organization_id)
+    except handler_utils.UploadFileDownloadError as exc:
+        context = skyvern_context.current()
+        if (
+            context is not None
+            and context.pending_file_chooser is not None
+            and context.pending_file_chooser.page is page
+        ):
+            context.cleanup_pending_file_chooser()
+        return [ActionFailure(Exception(f"Failed to download file from {action.file_url}: {exc}"))]
     is_file_input = await skyvern_element.is_file_input()
 
     if not is_file_input:
@@ -11284,13 +11514,13 @@ async def handle_terminate_action(
             extracted_errors = await extract_user_defined_errors(
                 task=task, step=step, scraped_page=scraped_page, reasoning=action.reasoning
             )
-        except Exception:
+        except Exception as exc:
             LOG.warning(
                 "extract_user_defined_errors failed, using errors from action reasoning",
                 task_id=task.task_id,
                 step_id=step.step_id,
-                action_errors=action.errors,
-                exc_info=True,
+                action_error_count=len(action.errors),
+                error_type=type(exc).__name__,
             )
         else:
             skyvern_codes = {error.error_code for error in skyvern_errors}
@@ -11409,6 +11639,34 @@ async def handle_extract_action(
         return [ActionFailure(exception=Exception("No data extraction goal"))]
 
 
+class ScrollContainerOutcome(BaseModel):
+    """What ``scrollNearestScrollableContainer()`` in domUtils.js did.
+
+    The metrics are absent for the "page" and "none" modes, where no container was scrolled.
+    """
+
+    model_config = ConfigDict(populate_by_name=True)
+
+    mode: Literal["container", "page", "none"]
+    scrolled: bool = False
+    scroll_top: float | None = Field(default=None, alias="scrollTop")
+    client_height: float | None = Field(default=None, alias="clientHeight")
+    scroll_height: float | None = Field(default=None, alias="scrollHeight")
+
+    def boundary(self, direction: str) -> str | None:
+        """The end the content is pinned against, or None when it stalled somewhere in between."""
+        if self.scroll_top is None or self.client_height is None or self.scroll_height is None:
+            return None
+        if direction == "up":
+            return "top" if self.scroll_top <= 0 else None
+        metrics = ElementScrollMetrics(
+            scroll_top=self.scroll_top,
+            client_height=self.client_height,
+            scroll_height=self.scroll_height,
+        )
+        return "bottom" if metrics.at_bottom else None
+
+
 @traced(name="skyvern.agent.action.scroll")
 async def handle_scroll_action(
     action: actions.ScrollAction,
@@ -11422,18 +11680,20 @@ async def handle_scroll_action(
     if action.element_id:
         # Element-based scrolling from extract-action prompt. Uses
         # scrollNearestScrollableContainer() from domUtils.js which walks the DOM to find
-        # the nearest scrollable ancestor or sibling container relative to the element.
-        # Returns: truthy value if scrolled (true for sub-container, "page" for page-level),
-        # false if nothing was scrollable.
+        # the nearest scrollable container relative to the element — the element itself, a
+        # viewport inside it, an ancestor, or an ancestor's sibling — and reports whether
+        # that container's scroll position actually moved.
         scroll_direction = "down" if action.scroll_y >= 0 else "up"
-        scroll_result = False
+        scroll_result = ScrollContainerOutcome(mode="none")
         dom = DomUtil(scraped_page=scraped_page, page=page)
         skyvern_element = await dom.safe_get_skyvern_element_by_id(action.element_id)
         if skyvern_element:
             try:
-                scroll_result = await skyvern_element.locator.evaluate(
-                    "(el, direction) => scrollNearestScrollableContainer(el, direction)",
-                    scroll_direction,
+                scroll_result = ScrollContainerOutcome.model_validate(
+                    await skyvern_element.locator.evaluate(
+                        "(el, direction) => scrollNearestScrollableContainer(el, direction)",
+                        scroll_direction,
+                    )
                 )
             except Exception:
                 LOG.warning(
@@ -11444,7 +11704,28 @@ async def handle_scroll_action(
         else:
             LOG.warning("Could not resolve element for scroll action", element_id=action.element_id)
 
-        if scroll_result == "page":
+        if scroll_result.mode == "container" and not scroll_result.scrolled:
+            # The container was found but would not move, so the scrape after this action shows
+            # the same content. Reporting success here is what let a run spend its whole runtime
+            # re-scrolling an exhausted container; the planner needs to see that it is stuck.
+            LOG.info(
+                "Container scroll revealed no new content",
+                element_id=action.element_id,
+                direction=scroll_direction,
+                scroll_top=scroll_result.scroll_top,
+            )
+            return [
+                ActionFailure(
+                    ScrollMadeNoProgress(
+                        element_id=action.element_id,
+                        direction=scroll_direction,
+                        boundary=scroll_result.boundary(scroll_direction),
+                    ),
+                    stop_execution_on_failure=False,
+                )
+            ]
+
+        if scroll_result.mode == "page":
             # No scrollable sub-container found, but the page itself is scrollable.
             # Use incremental mouse.wheel events at the center of the viewport to
             # simulate natural user scrolling. This fires native wheel/scroll events
@@ -11464,8 +11745,13 @@ async def handle_scroll_action(
             # Dynamically compute iterations based on remaining scrollable distance
             # so we reach the bottom even on very long T&C pages.
             scroll_info = await page.evaluate(
-                "() => ({ scrollHeight: document.documentElement.scrollHeight,"
-                " scrollTop: window.pageYOffset, innerHeight: window.innerHeight })"
+                "() => { let node = document.elementFromPoint(window.innerWidth / 2, window.innerHeight / 2);"
+                " while (node && node !== document.body && node !== document.documentElement) {"
+                " const style = window.getComputedStyle(node);"
+                " if ((style.overflowY === 'auto' || style.overflowY === 'scroll') && node.scrollHeight > node.clientHeight) break;"
+                " node = node.parentElement; }"
+                " return { scrollHeight: document.documentElement.scrollHeight, scrollTop: window.pageYOffset,"
+                " innerHeight: window.innerHeight, centerScrollTop: node && node !== document.body && node !== document.documentElement ? node.scrollTop : null }; }"
             )
             if scroll_direction == "down":
                 remaining = scroll_info["scrollHeight"] - scroll_info["scrollTop"] - scroll_info["innerHeight"]
@@ -11489,6 +11775,42 @@ async def handle_scroll_action(
             # Wait for page JS to process scroll events (e.g. enabling buttons)
             await page.wait_for_timeout(500)
 
+            settled_scroll = await page.evaluate(
+                "() => { let node = document.elementFromPoint(window.innerWidth / 2, window.innerHeight / 2);"
+                " while (node && node !== document.body && node !== document.documentElement) {"
+                " const style = window.getComputedStyle(node);"
+                " if ((style.overflowY === 'auto' || style.overflowY === 'scroll') && node.scrollHeight > node.clientHeight) break;"
+                " node = node.parentElement; }"
+                " return { scrollTop: window.pageYOffset,"
+                " centerScrollTop: node && node !== document.body && node !== document.documentElement ? node.scrollTop : null }; }"
+            )
+            settled_scroll_top = settled_scroll["scrollTop"]
+            center_container_moved = (
+                scroll_info["centerScrollTop"] is not None
+                and settled_scroll["centerScrollTop"] is not None
+                and settled_scroll["centerScrollTop"] != scroll_info["centerScrollTop"]
+            )
+            if settled_scroll_top == scroll_info["scrollTop"] and not center_container_moved:
+                LOG.info(
+                    "Page-level scroll revealed no new content",
+                    element_id=action.element_id,
+                    direction=scroll_direction,
+                    scroll_top=settled_scroll_top,
+                )
+                # A page that still had room but would not move is scroll-locked (an open modal
+                # or dropdown), which is a different thing to tell the planner than "at the end".
+                at_boundary = remaining <= 1
+                return [
+                    ActionFailure(
+                        ScrollMadeNoProgress(
+                            element_id=action.element_id,
+                            direction=scroll_direction,
+                            boundary=("bottom" if scroll_direction == "down" else "top") if at_boundary else None,
+                        ),
+                        stop_execution_on_failure=False,
+                    )
+                ]
+
             # Record which element was just deliberately scrolled. The click handler
             # checks this to skip scroll_into_view() for the SAME element, which
             # would use element.scrollIntoView() to center it — undoing the
@@ -11498,8 +11820,11 @@ async def handle_scroll_action(
                 "(id) => { window.__skyvernScrolledElementId = id; }",
                 action.element_id,
             )
+            if settled_scroll_top == scroll_info["scrollTop"]:
+                # The center-point wheel was consumed by an overlay rather than the page.
+                return [ActionSuccess(data={"container_scroll": True})]
             return [ActionSuccess(data={"page_level_scroll": True})]
-        elif scroll_result:
+        elif scroll_result.mode == "container":
             # Sub-container was scrolled successfully. Record the element ID so
             # the click handler skips scroll_into_view() for this element — same
             # protection as page-level scrolls. Without this, element.scrollIntoView()
@@ -11515,6 +11840,9 @@ async def handle_scroll_action(
                 "Could not find scrollable container near element, falling back to mouse wheel",
                 element_id=action.element_id,
             )
+            # No progress verdict on this path: the wheel lands wherever the cursor already is,
+            # so an unrelated container under it can absorb the scroll and the window offset
+            # alone cannot tell a real move from a no-op.
             await EventStrategyFactory.scroll_by(page, action.scroll_x, action.scroll_y)
     elif action.x and action.y:
         # Coordinate-based scrolling from CUA/UI-TARS agents
@@ -12176,7 +12504,17 @@ async def chain_click(
     file = pending_upload_files or []
     if not file and action.file_url:
         file_url = get_actual_value_of_parameter_if_secret_with_task(task, action.file_url)
-        file = await handler_utils.download_file(file_url, action.model_dump(), task.organization_id)
+        try:
+            file = await handler_utils.download_file(file_url, action.model_dump(), task.organization_id)
+        except handler_utils.UploadFileDownloadError as exc:
+            context = skyvern_context.current()
+            if (
+                context is not None
+                and context.pending_file_chooser is not None
+                and context.pending_file_chooser.page is page
+            ):
+                context.cleanup_pending_file_chooser()
+            return [ActionFailure(Exception(f"Failed to download file from {action.file_url}: {exc}"))]
 
     is_filechooser_trigger = False
     is_upload_action = bool(action.file_url)
@@ -13129,7 +13467,7 @@ async def input_or_auto_complete_input(
         if input_or_select_context.is_search_bar:
             LOG.info(
                 "Stop generating potential values for the auto-completion since it's a search bar",
-                context=input_or_select_context,
+                **llm_response_log_metadata(input_or_select_context.model_dump()),
             )
             return None
 
@@ -13283,7 +13621,7 @@ async def input_or_auto_complete_input(
         LOG.info(
             "Auto completion didn't finish, this might leave the input value to be empty.",
             sampling=True,
-            context=input_or_select_context,
+            **llm_response_log_metadata(input_or_select_context.model_dump()),
             attempts=attempt_timings,
             total_seconds=round(_elapsed_seconds(), 1),
         )
@@ -13508,7 +13846,7 @@ async def sequentially_select_from_dropdown(
     if not force_select and input_or_select_context.is_search_bar:
         LOG.info(
             "Exit custom selection mode since it's a non-force search bar",
-            context=input_or_select_context,
+            **llm_response_log_metadata(input_or_select_context.model_dump()),
         )
         return None
 
@@ -15085,8 +15423,7 @@ async def select_from_emerging_elements(
     LOG.info(
         "LLM response for the matched element",
         sampling=True,
-        matched_value=value,
-        response=json_response,
+        **llm_response_log_metadata(json_response),
     )
 
     # Check the no-match shape before ``ActionType`` coercion — coercing an empty
@@ -15524,8 +15861,7 @@ async def select_from_dropdown(
         LOG.info(
             "LLM response for the matched element",
             sampling=True,
-            matched_value=value,
-            response=json_response,
+            **llm_response_log_metadata(json_response),
         )
 
         # Check the no-match shape before ``ActionType`` coercion — coercing an empty
@@ -16119,7 +16455,7 @@ async def normal_select(
     )
     LOG.debug(
         "Parsed input/select context",
-        context=input_or_select_context,
+        **llm_response_log_metadata(input_or_select_context.model_dump()),
     )
 
     select_options_result = await skyvern_element.refresh_select_options()
@@ -16963,7 +17299,7 @@ async def _get_input_or_select_context(
             original_response_type=type(json_response).__name__,
             original_response_length=len(json_response) if json_response else 0,
             first_item_type=type(json_response[0]).__name__ if json_response else None,
-            first_item_keys=list(json_response[0].keys())
+            first_item_keys_count=len(json_response[0])
             if json_response and isinstance(json_response[0], dict)
             else None,
         )
@@ -16973,7 +17309,7 @@ async def _get_input_or_select_context(
     input_or_select_context = InputOrSelectContext.model_validate(json_response)
     LOG.debug(
         "Parsed input/select context",
-        context=input_or_select_context,
+        **llm_response_log_metadata(input_or_select_context.model_dump()),
     )
     return input_or_select_context
 
@@ -17048,8 +17384,8 @@ async def extract_user_defined_errors(
             "Dropped LLM-returned error codes not in user error_code_mapping",
             task_id=task.task_id,
             step_id=step.step_id,
-            dropped_codes=dropped,
-            allowed_codes=sorted((task.error_code_mapping or {}).keys()),
+            dropped_count=len(dropped),
+            allowed_codes_count=len(task.error_code_mapping or {}),
         )
     if not kept and reasoning:
         return _match_user_defined_error_from_reasoning(task=task, step=step, reasoning=reasoning)

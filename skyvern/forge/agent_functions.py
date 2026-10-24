@@ -139,6 +139,7 @@ class AuditEvent:
     related_resource_ids: tuple[str, ...] = ()
     auth_kind: str | None = None
     oauth_client_id: str | None = None
+    app_role: str | None = None
 
 
 async def record_request_audit_event(
@@ -991,6 +992,9 @@ OnePasswordTelemetryErrorClass = Literal["invalid_token", "rate_limited", "timeo
 
 
 class AgentFunction:
+    def should_log_request_bodies(self, organization_id: str) -> bool:
+        return True
+
     async def accessible_workflow_folder_ids(self, principal: RequestPrincipal | None) -> set[str] | None:
         """Return visible folder IDs for Cloud request lists; OSS keeps organization-wide visibility."""
         return None

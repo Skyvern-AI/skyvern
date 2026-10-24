@@ -44,6 +44,8 @@ class BearerIdentity:
     org_role: str | None = None
     org_role_claim: str | None = None
     token_has_organization_claim: bool | None = None
+    app_role: str | None = None
+    app_role_is_authoritative: bool = False
 
 
 @dataclass(frozen=True)
@@ -62,6 +64,8 @@ class RequestPrincipal:
     token_has_organization_claim: bool | None = None
     # Last, so callers that build a principal positionally as (organization, kind, user, role) keep their meaning.
     api_key_token_id: str | None = None
+    app_role: str | None = None
+    app_role_is_authoritative: bool = False
 
 
 def synthetic_user_id(organization_id: str) -> str:
@@ -175,6 +179,8 @@ def _build_request_principal(
         token_has_organization_claim=(
             True if member_key else (identity.token_has_organization_claim if identity else None)
         ),
+        app_role=identity.app_role if identity else None,
+        app_role_is_authoritative=identity.app_role_is_authoritative if identity else False,
     )
 
 

@@ -1,3 +1,4 @@
+import asyncio
 import io
 import zipfile
 from datetime import datetime
@@ -76,3 +77,83 @@ async def test_a_tasks_step_archives_flush_as_one_zip_with_each_file_on_its_own_
     rows.clear()
     await manager.flush_step_archive("stp_other")
     assert sorted(row.bundle_key for row in rows[1:]) == ["llm_request_0.json", "llm_response_0.json"]
+
+
+@pytest.mark.asyncio
+async def test_a_background_turn_flush_survives_the_upload_barrier_cancelling_it(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # A turn flushed on its own is one object per turn; a barrier that gives up and cancels the tracked task must not
+    # lose an archive the flush already popped, and the block-end flush then finds nothing of those turns left.
+    manager = ArtifactManager()
+    block, turn_1, turn_2 = _step("stp_block", 0), _step("stp_turn_1", 1), _step("stp_turn_2", 2)
+    for step in (block, turn_1, turn_2):
+        manager.accumulate_llm_call_to_archive(step=step, request=f"{step.step_id} request".encode())
+    manager.accumulate_html_scrape_to_archive(turn_1, b"<p>turn 1</p>")
+
+    release = asyncio.Event()
+    stored: list[tuple[str, bytes]] = []
+
+    async def _store(artifact: Any, data: bytes) -> None:
+        await release.wait()
+        stored.append((artifact.step_id, data))
+
+    async def _bulk_create(models: list[Any]) -> list[Any]:
+        return models
+
+    monkeypatch.setattr("skyvern.forge.sdk.artifact.manager._bundling_enabled", lambda: True)
+    monkeypatch.setattr(
+        "skyvern.forge.sdk.artifact.manager.app.STORAGE",
+        SimpleNamespace(build_uri=lambda **kwargs: f"s3://artifacts/{kwargs['artifact_id']}", store_artifact=_store),
+    )
+    monkeypatch.setattr("skyvern.forge.sdk.artifact.manager.app.DATABASE.artifacts.bulk_create_artifacts", _bulk_create)
+
+    manager.flush_step_archive_in_background(turn_1)
+    manager.flush_step_archive_in_background(turn_2)
+    await asyncio.sleep(0)
+    assert set(manager._step_archives) == {"stp_block"}
+    for tracked in list(manager.upload_aiotasks_map["tsk_block"]):
+        tracked.cancel()
+    await asyncio.sleep(0)
+    release.set()
+    await asyncio.gather(*manager._background_flushes)
+
+    turn_zips = dict(stored)
+    assert sorted(turn_zips) == ["stp_turn_1", "stp_turn_2"]
+    with zipfile.ZipFile(io.BytesIO(turn_zips["stp_turn_1"])) as zf:
+        assert (sorted(zf.namelist()), zf.read("scrape.html")) == (
+            ["llm_request_0.json", "scrape.html"],
+            b"<p>turn 1</p>",
+        )
+    stored.clear()
+    await manager.flush_task_step_archives_as_one(block)
+    [(owner, zip_bytes)] = stored
+    with zipfile.ZipFile(io.BytesIO(zip_bytes)) as zf:
+        assert (owner, zf.namelist()) == ("stp_block", ["llm_request_0.json"])
+
+
+@pytest.mark.asyncio
+async def test_a_background_turn_flush_against_a_stalled_store_ends_at_its_deadline(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    manager = ArtifactManager()
+    turn = _step("stp_turn_1", 1)
+    manager.accumulate_llm_call_to_archive(step=turn, request=b"request")
+
+    async def _never_returns(artifact: Any, data: bytes) -> None:
+        await asyncio.Event().wait()
+
+    monkeypatch.setattr("skyvern.forge.sdk.artifact.manager.BACKGROUND_FLUSH_TIMEOUT_SECONDS", 0.05)
+    monkeypatch.setattr("skyvern.forge.sdk.artifact.manager._bundling_enabled", lambda: True)
+    monkeypatch.setattr(
+        "skyvern.forge.sdk.artifact.manager.app.STORAGE",
+        SimpleNamespace(
+            build_uri=lambda **kwargs: f"s3://artifacts/{kwargs['artifact_id']}", store_artifact=_never_returns
+        ),
+    )
+
+    manager.flush_step_archive_in_background(turn)
+    # The outer bound only keeps a regression from hanging the suite.
+    await asyncio.wait_for(asyncio.gather(*manager._background_flushes), timeout=5)
+
+    assert manager._background_flushes == set()

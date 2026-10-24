@@ -410,11 +410,13 @@ async def test_prompt_selecting_zero_files_completes_and_records_empty_output(
         "workflow_run_block_id": "workflow-run-block-id",
         "candidate_count": 3,
         "selected_count": 0,
-        "reasoning": "No candidates match.",
+        "reasoning_type": "str",
+        "reasoning_length": len("No candidates match."),
     }
     warning_event = zero_selection_warnings[0]
     for field, value in expected_fields.items():
         assert warning_event[field] == value
+    assert "No candidates match." not in repr(warning_event)
 
 
 @pytest.mark.asyncio

@@ -485,10 +485,9 @@ class WorkflowRunContext:
                 )
                 continue
             if parameter.key in workflow_run_context.parameters:
-                prev_value = workflow_run_context.parameters[parameter.key]
-                new_value = run_parameter.value
                 LOG.error(
-                    f"Duplicate parameter key {parameter.key} found while initializing context manager, previous value: {prev_value}, new value: {new_value}. Using new value."
+                    "Duplicate parameter key found while initializing context manager, using new value",
+                    parameter_key=parameter.key,
                 )
 
             workflow_run_context.parameters[parameter.key] = parameter
@@ -2196,9 +2195,8 @@ class WorkflowRunContext:
                 )
                 if parameter.value:
                     LOG.warning(
-                        f"Context parameter {parameter.key} already has a value, overwriting",
-                        old_value=parameter.value,
-                        new_value=value,
+                        "Context parameter already has a value, overwriting",
+                        parameter_key=parameter.key,
                     )
                 if not isinstance(value, dict) and not isinstance(value, list):
                     raise ValueError(

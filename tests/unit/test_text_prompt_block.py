@@ -865,6 +865,26 @@ def _patch_send_prompt_deps(monkeypatch, *, handler) -> None:
 
 
 @pytest.mark.asyncio
+async def test_text_prompt_response_log_omits_llm_output(monkeypatch):
+    from structlog.testing import capture_logs
+
+    sentinel = "private-llm-response-sentinel"
+
+    async def fake_llm(**kwargs):
+        return {"llm_response": sentinel}
+
+    _patch_send_prompt_deps(monkeypatch, handler=fake_llm)
+    block = _make_text_prompt_block(prompt="Return a synthetic response.")
+
+    with capture_logs() as events:
+        result = await block.send_prompt(block.prompt, workflow_run_id="wr_qa", organization_id="o_qa")
+
+    assert result == {"llm_response": sentinel}
+    response_log = next(event for event in events if event["event"] == "TextPromptBlock Received response from LLM")
+    assert sentinel not in repr(response_log)
+
+
+@pytest.mark.asyncio
 async def test_text_prompt_block_retries_transient_llm_provider_error(monkeypatch):
     """A transient provider error retries with backoff and recovers instead of failing."""
     block = _make_text_prompt_block(prompt="Summarize status.")

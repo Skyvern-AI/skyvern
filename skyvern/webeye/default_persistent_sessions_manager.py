@@ -212,7 +212,7 @@ def _renewal_extension_minutes(new_timeout_datetime: datetime, current_timeout_d
     """Minutes to extend a session by so its expiry never moves earlier than it already is.
 
     A fresh DEBUG_SESSION_TIMEOUT_MINUTES window from now can land before the session's existing
-    expiry (e.g. Copilot's 30-minute sessions), which would otherwise shorten it.
+    expiry (any session created with a longer budget), which would otherwise shorten it.
     """
     return max(0, floor((new_timeout_datetime - current_timeout_datetime).total_seconds() / 60))
 

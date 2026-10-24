@@ -10,7 +10,7 @@ import time
 from collections.abc import AsyncIterator, Callable, Iterator
 from dataclasses import dataclass, field, replace
 from types import SimpleNamespace
-from typing import Any, Literal, cast, overload
+from typing import Any, Literal, TypeVar, cast, overload
 from urllib.parse import urlparse
 
 import litellm
@@ -25,7 +25,7 @@ from agents.models.chatcmpl_converter import Converter
 from agents.models.fake_id import FAKE_RESPONSES_ID
 from agents.models.interface import ModelTracing
 from agents.models.openai_responses import Converter as OpenAIResponsesConverter
-from agents.tool import Tool
+from agents.tool import FunctionTool, Tool
 from agents.tracing.span_data import GenerationSpanData
 from agents.tracing.spans import Span
 from litellm.completion_extras import responses_api_bridge
@@ -49,6 +49,7 @@ from skyvern.forge.sdk.api.llm.copilot_model_usage import (
     normalize_gen_ai_provider,
 )
 from skyvern.forge.sdk.api.llm.litellm_pricing import long_prompt_cost_multiplier
+from skyvern.forge.sdk.api.llm.utils import is_anthropic_model
 from skyvern.forge.sdk.copilot.cache_envelope import (
     CacheableSystemInstructions,
     ExplicitCacheEnvelope,
@@ -611,6 +612,40 @@ def _escape_ref_tool_outputs_for_gemini(
     return rewritten
 
 
+_SCHEMA_LITERALS = frozenset({"default", "const", "enum", "examples"})
+
+
+def _drop_schema_titles(node: Any) -> Any:
+    if isinstance(node, list):
+        return [_drop_schema_titles(item) for item in node]
+    if not isinstance(node, dict):
+        return node
+    return {
+        key: value if key in _SCHEMA_LITERALS else _drop_schema_titles(value)
+        for key, value in node.items()
+        if not (key == "title" and isinstance(value, str))
+    }
+
+
+_ToolT = TypeVar("_ToolT", bound=Tool)
+
+
+def drop_tool_schema_titles(tools: list[_ToolT], model: str, model_settings: ModelSettings) -> list[_ToolT]:
+    # Pydantic's generated titles carry nothing the property names don't. Offline replay showed no behavior change
+    # without them on Claude and terra; gpt-6.1-sol replied less often after a passing test run, so other models keep them.
+    if not all(
+        is_anthropic_model(candidate) or "gpt-5.6-terra" in candidate
+        for candidate in model_chain(model, model_settings)
+    ):
+        return tools
+    return [
+        replace(tool, params_json_schema=_drop_schema_titles(tool.params_json_schema))
+        if isinstance(tool, FunctionTool)
+        else tool
+        for tool in tools
+    ]
+
+
 class CopilotLitellmModel(LitellmModel):
     def __init__(
         self,
@@ -636,7 +671,6 @@ class CopilotLitellmModel(LitellmModel):
         conversation_id: str | None = None,
         prompt: Any | None = None,
     ) -> ModelResponse:
-        attach_tool_surface_to_pending_capture(tools)
         with _model_call_telemetry_scope(
             self.next_model_call_index(),
             model=self.model,
@@ -668,7 +702,6 @@ class CopilotLitellmModel(LitellmModel):
         conversation_id: str | None = None,
         prompt: Any | None = None,
     ) -> AsyncIterator[TResponseStreamEvent]:
-        attach_tool_surface_to_pending_capture(tools)
         with _model_call_telemetry_scope(
             self.next_model_call_index(),
             model=self.model,
@@ -732,6 +765,8 @@ class CopilotLitellmModel(LitellmModel):
         prompt: Any | None = None,
     ) -> LiteLLMModelResponse | tuple[Response, AsyncStream[ChatCompletionChunk]]:
         input = _escape_ref_tool_outputs_for_gemini(input, self.model, model_settings)
+        tools = drop_tool_schema_titles(tools, self.model, model_settings)
+        attach_tool_surface_to_pending_capture(tools)
         anchors = stable_prefix_anchors(input) if isinstance(input, list) else []
         anchor = anchors[-1] if anchors else None
         explicit_cache_envelope = build_explicit_cache_envelope(

@@ -577,6 +577,9 @@ class Settings(BaseSettings):
     TASK_V3_PRE_SUBMIT_CAPTURE_SAMPLE_RATE: float = 0.25
     # Kill switch: one page DOM per Task V3 block, saved after the loop as html_action (v1 saves html_scrape).
     TASK_V3_BLOCK_END_DOM: bool = True
+    # Fraction of Task V3 runs (keyed like the pre-submit sample) that store the page DOM on every turn step and
+    # flush each turn's archive as the turn ends; the rest keep one archive ZIP per block. 0 disables.
+    TASK_V3_TURN_DOM_SAMPLE_RATE: float = 0.05
     # Kill switch for the tier-1 semantic commit read (SKY-15322): decisive-accept-only ARIA/value
     # probe consulted before the shape heuristics, which remain the fallback either way.
     TASK_V3_SEMANTIC_COMMIT_VERIFY: bool = True

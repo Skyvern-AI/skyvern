@@ -67,6 +67,7 @@ from skyvern.forge.taskv3.loop import (
 )
 from skyvern.forge.taskv3.opaque_refs import OpaqueUrlRefs, mask_opaque_urls
 from skyvern.forge.taskv3.tools import PAGE_UNAVAILABLE_ERROR, DownloadFailureWatch
+from skyvern.forge.taskv3.turn_dom import TurnDomCapture
 from skyvern.schemas.llm import LLMConfig, LLMRouterConfig, LLMRouterModelConfig
 from skyvern.utils.prompt_engine import PROMPT_HARD_CEILING_TOKENS
 from skyvern.utils.token_counter import count_tokens
@@ -199,6 +200,39 @@ async def test_engine_exposes_browser_and_finish_tools_no_task_ecosystem() -> No
     sent = {t["function"]["name"] for t in (caller.sent_tools or [])}
     assert {"observe", "type", "click", "file_upload", "finish"} <= sent
     assert not ({"act", "extract", "validate", "run_task", "login"} & sent)
+
+
+@pytest.mark.asyncio
+async def test_engine_joins_the_turn_page_read_after_each_model_call_and_logs_its_totals() -> None:
+    saved: list[bytes] = []
+
+    def store(_step: Any, html: bytes) -> str:
+        saved.append(html)
+        return f"a_{len(saved)}"
+
+    turn_dom = TurnDomCapture(AsyncMock(return_value="<p>page</p>"), store)
+
+    async def on_turn_start(turn: int) -> None:
+        turn_dom.start(SimpleNamespace(step_id=f"turn-{turn}"), turn)
+
+    caller = _ScriptedCaller([[("observe", {})], [("finish", {"status": "completed", "reason": "done"})]])
+    with capture_logs() as logs:
+        await run_task_v3_agent_loop(
+            page_provider=_fixed_page_provider(_FakePage()),
+            llm_caller=caller,
+            goal="x",
+            on_turn_start=on_turn_start,
+            turn_dom=turn_dom,
+        )
+
+    finished = next(entry for entry in logs if entry["event"] == "taskv3 engine loop finished")
+    assert (finished["dom_arm"], finished["dom_captures"], finished["dom_stored"], finished["dom_deduped"]) == (
+        True,
+        2,
+        1,
+        1,
+    )
+    assert saved == [b"<p>page</p>"]
 
 
 @pytest.mark.asyncio

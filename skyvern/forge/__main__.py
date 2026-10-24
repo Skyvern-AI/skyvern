@@ -8,6 +8,7 @@ from dotenv import load_dotenv
 from skyvern import analytics
 from skyvern.config import settings
 from skyvern.exceptions import require_server_extra_modules
+from skyvern.forge.payload_limits import max_file_upload_ws_message_size
 
 LOG = structlog.stdlib.get_logger()
 
@@ -96,6 +97,7 @@ if __name__ == "__main__":
         factory=True,
         timeout_keep_alive=settings.UVICORN_TIMEOUT_KEEP_ALIVE,
         ws="websockets-sansio",
+        ws_max_size=max_file_upload_ws_message_size(settings.MAX_UPLOAD_FILE_SIZE),
         # Let cdp_input emit its 120s setup-time close before Uvicorn's liveness timeout.
         ws_ping_interval=20.0,
         ws_ping_timeout=120.0,

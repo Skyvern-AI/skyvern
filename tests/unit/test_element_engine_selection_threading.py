@@ -5,6 +5,7 @@ from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
+from bs4 import BeautifulSoup
 
 from skyvern.forge import agent_functions
 from skyvern.webeye.actions import handler
@@ -141,6 +142,20 @@ async def test_dom_filter_threads_dom_public_engine_selection(monkeypatch: pytes
     assert await helper({"id": "option-1"}, MagicMock()) is True
 
     assert constructor.call_args.kwargs["engine_selection"] is selection
+
+
+@pytest.mark.asyncio
+async def test_dom_filter_locator_selects_an_id_that_starts_with_a_digit() -> None:
+    # Minted ids can start with a digit, and an unquoted CSS attribute value cannot.
+    document = BeautifulSoup('<div unique_id="0AB"></div><div unique_id="0ABC"></div>', "html.parser")
+    dom = MagicMock(engine_selection=None, check_id_in_dom=AsyncMock(return_value=True))
+    frame = MagicMock()
+
+    helper = handler.check_existed_but_not_option_element_in_dom_factory(dom)
+    await helper({"id": "0AB", "tagName": "div"}, frame)
+
+    (selector,) = frame.locator.call_args.args
+    assert [tag["unique_id"] for tag in document.select(selector)] == ["0AB"]
 
 
 @pytest.mark.asyncio

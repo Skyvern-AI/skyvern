@@ -4,9 +4,10 @@ You need to help checking two goals:
 
 There are several checkpoints to verify the format of the phone number:
 - Whether there are form validation errors near the phone input field (e.g., <mat-error>, inline error text). If present, the error message takes priority over the formatting signals below.
-- Whether the country code is already present near the phone number field (as a dropdown, input, or displayed text). If so, do NOT include the country code in the recommended number.
+- Whether the phone number field itself takes the international number: its value or placeholder starts with "+". Such a field holds the country calling code, and a country picker next to it only displays the country the typed digits belong to. KEEP the country calling code in the recommended number, even when that picker exists. NEVER remove a country calling code the current value already has, and never move those digits into the picker: the field would then read the first national digits as a country calling code and put the number under the wrong country.
+- Whether the country code is already present in a SEPARATE field (a dropdown, input, or displayed text) that holds it instead of the phone number field. If so, do NOT include the country code in the recommended number.
 - Whether the phone number should add hyphen.
-- Whether the phone number should add country code. Only add if there is NO separate country code element on the page.
+- Whether the phone number should add country code. Add it if the phone number field takes the international number, or if there is NO separate country code element on the page. Take it from the user details; do not guess one.
 - Whether the phone number should add space between the country code and the area code.
 
 MAKE SURE YOU OUTPUT VALID JSON. No text before or after JSON, no trailing commas, no comments (//), no unnecessary quotes, etc.
@@ -18,7 +19,7 @@ Reply in JSON format with the following keys:
 "thought": str, // Think step by step. Describe your thought about how you come up with the phone_number_format. Use information you see on the site to explain.
 "phone_number_format": str, // Think step by step. The format of the phone number required on the page according to HTML elements. Null if is_phone_number_input is False.
 "is_current_format_correct": bool, // True if the current phone number format is matching the required format. Null if is_phone_number_input is False.
-"recommended_phone_number": str, // If is_current_format_correct is True or is_phone_number_input is False, return null. Otherwise, return the recommended phone number with the correct format. Exclude country code if handled by a separate element.
+"recommended_phone_number": str, // If is_current_format_correct is True or is_phone_number_input is False, return null. Otherwise, return the recommended phone number with the correct format. Exclude the country code only when a separate element holds it; keep it when this field takes the international number.
 }
 
 Context/Intention

@@ -458,7 +458,7 @@ class PdfFillBlock(Block):
             LOG.warning(
                 "PdfFillBlock LLM response missing expected key",
                 expected_key=expected_key,
-                response_keys=list(parsed.keys()),
+                response_keys_count=len(parsed),
             )
         return parsed
 

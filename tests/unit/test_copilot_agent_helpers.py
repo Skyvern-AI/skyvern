@@ -5961,6 +5961,7 @@ class _CredentialWorkflow(BaseModel):
     """Raw definition fixture for credential admission, with snapshot copy semantics."""
 
     workflow_id: str = "wf-1"
+    workflow_permanent_id: str = "wfp-1"
     workflow_definition: _CredentialWorkflowDefinition
     output_labels: set[str]
 

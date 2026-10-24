@@ -2,7 +2,8 @@
 
 The audit decides which recorded answers have no basis in the run's data; this module only records what was
 answered and refuses every moving action while a flagged answer is unchanged, so the model switches it to a decline
-option, clears it or stops. With no audit supplied (the default), nothing is wrapped.
+option, clears it or stops. The tenth refused call ends the task. With no audit supplied (the default), nothing is
+wrapped.
 """
 
 from __future__ import annotations
@@ -16,11 +17,15 @@ from typing import Any, Protocol
 import structlog
 
 from skyvern.forge.taskv3.loop import (
+    ANSWER_BASIS_HOLD_BOUND_GUARD,
     CODE_TOOL_NAME,
+    GUARD_END_DATA_KEY,
     OPENED_LIST_ERROR_CLASSES,
     PICKED_OPTION_DATA_KEY,
     TARGET_KIND_DATA_KEY,
     TARGET_LABEL_DATA_KEY,
+    TARGET_LABEL_IS_PLACEHOLDER_DATA_KEY,
+    GuardEnd,
     ToolRefusal,
     ToolResult,
     ToolSpec,
@@ -36,12 +41,16 @@ _MENU_NOTE_KEY = "menu_note"
 _FREE_TEXT_KINDS = frozenset({"textbox", "textarea", "combobox"})
 # Longer typed text is a cover letter or a description, never a legal-standing answer.
 _MAX_AUDITED_WORDS = 25
+# The refused call that ends the task (holds count per call, per engine run of one task).
+ANSWER_BASIS_MAX_HOLDS = 10
 
 
 @dataclass(frozen=True)
 class RecordedAnswer:
     question: str
     value: str
+    # The question is the field's placeholder, the only text it shows; the audit decides whether it asks anything.
+    label_is_placeholder: bool = False
 
 
 class AnswerBasisAudit(Protocol):
@@ -80,6 +89,11 @@ def apply_answer_basis_audit(tools: list[ToolSpec], audit: AnswerBasisAudit | No
     flagged: dict[Field, str] = {}
     refused: set[tuple[Field, str]] = set()
     open_menu: dict[str, Field | None] = {"field": None}
+    placeholders: set[Field] = set()
+    holds = 0
+
+    def answer(field: Field, value: str) -> RecordedAnswer:
+        return RecordedAnswer(field[0], value, field in placeholders)
 
     def record(field: Field, value: str) -> None:
         previous = pending.pop(field, None)
@@ -88,7 +102,7 @@ def apply_answer_basis_audit(tools: list[ToolSpec], audit: AnswerBasisAudit | No
         # An emptied field holds no answer, so its flag goes with it.
         flagged.pop(field, None)
         if field[0] and value:
-            pending[field] = (value, asyncio.create_task(audit.unsupported([RecordedAnswer(field[0], value)])))
+            pending[field] = (value, asyncio.create_task(audit.unsupported([answer(field, value)])))
 
     async def found(job: Awaitable[list[RecordedAnswer]]) -> bool:
         try:
@@ -112,7 +126,7 @@ def apply_answer_basis_audit(tools: list[ToolSpec], audit: AnswerBasisAudit | No
         if entering is not None and flagged.get(entering[0]) != entering[1]:
             if not appends:
                 shown.pop(entering[0], None)
-            if entering in refused or await found(audit.unsupported([RecordedAnswer(entering[0][0], entering[1])])):
+            if entering in refused or await found(audit.unsupported([answer(*entering)])):
                 refused.add(entering)
                 shown[entering[0]] = entering[1]
                 untyped = entering[0]
@@ -124,12 +138,20 @@ def apply_answer_basis_audit(tools: list[ToolSpec], audit: AnswerBasisAudit | No
             selector, menu_row = await spec.address_probe(args) if spec.address_probe else (_selector(args), False)
             if menu_row or any(selector == field[1] for field in flagged):
                 return True
-        LOG.info("taskv3 answer basis hold", tool=spec.name, flagged=len(shown))
+        nonlocal holds
+        holds += 1
+        LOG.info("taskv3 answer basis hold", tool=spec.name, flagged=len(shown), holds=holds)
         named = "; ".join(
             f"'{q}' with '{v}' (field {s}; not typed, nothing was entered or pressed)"
             if (q, s) == untyped
             else f"'{q}' answered '{v}' (field {s})"
             for (q, s), v in shown.items()
+        )
+        questions = "; ".join(f"'{q}'" for q, _ in shown)
+        end = GuardEnd(
+            ANSWER_BASIS_HOLD_BOUND_GUARD,
+            f"Stopped without submitting: the answer audit found nothing in the data that supports the answer to "
+            f"{questions}.",
         )
         raise ToolRefusal(
             f"Not done: nothing in the data supports these answers: {named}. For each, choose the field's decline "
@@ -137,6 +159,7 @@ def apply_answer_basis_audit(tools: list[ToolSpec], audit: AnswerBasisAudit | No
             "it; if it is optional, clear it and continue. Until each answered one is changed, only a click on that field "
             "or on a row of its open list goes through.",
             error_class="answer_without_basis",
+            data={GUARD_END_DATA_KEY: end} if holds >= ANSWER_BASIS_MAX_HOLDS else None,
         )
 
     for spec in tools:
@@ -154,9 +177,11 @@ def apply_answer_basis_audit(tools: list[ToolSpec], audit: AnswerBasisAudit | No
             # Its own Enter can submit the form, so the text is judged first, appended (clear=false) or not.
             enters = args.get("press_enter") and 0 < len(text.split()) <= _MAX_AUDITED_WORDS
             if _spec.answer_probe is not None and enters:
-                selector, label, kind = await _spec.answer_probe(args)
+                selector, label, kind, from_placeholder = await _spec.answer_probe(args)
                 if label.strip() and kind in _FREE_TEXT_KINDS:
                     entering = ((label.strip(), selector), text)
+                    if from_placeholder:
+                        placeholders.add(entering[0])
                 elif not selector:
                     LOG.info("taskv3 answer basis probe missed", tool=_tool)
             repair = _may_move_on(_tool, args) and await hold(_spec, args, entering, not args.get("clear", True))
@@ -180,13 +205,17 @@ def apply_answer_basis_audit(tools: list[ToolSpec], audit: AnswerBasisAudit | No
                 return result
             # The ref resolver rewrites args["selector"] in place, so this is the selector the call acted on.
             field = (_label(result), _selector(args))
+            if data.get(TARGET_LABEL_IS_PLACEHOLDER_DATA_KEY):
+                placeholders.add(field)
+            else:
+                placeholders.discard(field)
             if entering is not None and field == entering[0]:
                 record(field, "")
                 return result
             if _tool == "select_combobox":
                 record(field, str(args.get("value") or ""))
             elif _tool == "select_option":
-                record(field, str(args.get("label") or args.get("value") or ""))
+                record(field, str(data.get(PICKED_OPTION_DATA_KEY) or args.get("label") or args.get("value") or ""))
             elif _tool == "type" and str(data.get(TARGET_KIND_DATA_KEY) or "") in _FREE_TEXT_KINDS:
                 text = str(args.get("text") or "")
                 if len(text.split()) <= _MAX_AUDITED_WORDS:

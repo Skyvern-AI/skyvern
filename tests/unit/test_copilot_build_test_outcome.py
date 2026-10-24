@@ -30,6 +30,7 @@ from skyvern.forge.sdk.copilot.agent import (
     _prior_run_debug_text,
     _recorded_build_test_outcome_prompt,
     _review_projection_for,
+    _translate_to_agent_result,
 )
 from skyvern.forge.sdk.copilot.build_test_connect_failure import build_test_connect_failure_sentence
 from skyvern.forge.sdk.copilot.build_test_outcome import (
@@ -67,9 +68,10 @@ from skyvern.forge.sdk.copilot.build_test_outcome import (
 )
 from skyvern.forge.sdk.copilot.completion_verification import CompletionVerificationResult, CriterionVerdict
 from skyvern.forge.sdk.copilot.config import BlockAuthoringPolicy, CopilotConfig
-from skyvern.forge.sdk.copilot.context import CodeAuthoringRepairContext, CopilotContext
+from skyvern.forge.sdk.copilot.context import AgentResult, CodeAuthoringRepairContext, CopilotContext
 from skyvern.forge.sdk.copilot.enforcement import _summarize_tool_output
 from skyvern.forge.sdk.copilot.hooks import CopilotRunHooks
+from skyvern.forge.sdk.copilot.output_policy import CopilotOutputKind
 from skyvern.forge.sdk.copilot.output_utils import (
     _BUILD_TEST_PACKET_MAX_CHARS,
     _INTERNAL_RUN_OUTCOME_RECORDED_KEY,
@@ -82,6 +84,7 @@ from skyvern.forge.sdk.copilot.output_utils import (
     project_direct_test_handoff_packet_for_llm,
     sanitize_tool_result_for_llm,
 )
+from skyvern.forge.sdk.copilot.request_policy import RequestPolicy
 from skyvern.forge.sdk.copilot.review_gate import workflow_block_fingerprints
 from skyvern.forge.sdk.copilot.run_outcome import RecordedRunOutcome
 from skyvern.forge.sdk.copilot.runtime_authoring_repair import (
@@ -8923,3 +8926,154 @@ async def test_an_unprovable_executed_version_is_unavailable_and_never_falls_bac
         "workflow_id": "wf-1",
         "reason": reason,
     }
+
+
+_SAVED_SIGN_IN_AND_SEARCH_YAML = """
+title: sign in and search
+workflow_definition:
+  version: 2
+  parameters:
+  - key: login_credentials
+    parameter_type: workflow
+    workflow_parameter_type: credential_id
+    default_value: cred_saved
+  - key: search_term
+    parameter_type: workflow
+    workflow_parameter_type: string
+    default_value: widgets
+  blocks:
+  - block_type: login
+    label: sign_in
+    url: https://example.com/login
+    parameter_keys: [login_credentials]
+    next_block_label: search
+  - block_type: code
+    label: search
+    parameter_keys: [login_credentials, search_term]
+    code: |
+      await page.fill("#q", search_term)
+"""
+
+_PROPOSAL_OUTPUT_KINDS = {
+    CopilotOutputKind.WORKFLOW_DRAFT_PROPOSAL.value,
+    CopilotOutputKind.WORKFLOW_UPDATE_PROPOSAL.value,
+}
+
+
+def _saved_sign_in_ctx() -> CopilotContext:
+    return make_copilot_ctx(
+        browser_session_id="pbs_chat",
+        workflow_copilot_chat_id="chat-1",
+        request_policy=RequestPolicy(persisted_workflow_credential_ids=["cred_saved"]),
+    )
+
+
+async def _blank_browser_retest_of_saved_workflow(
+    monkeypatch: pytest.MonkeyPatch, ctx: CopilotContext, status: str
+) -> None:
+    await install_run_blocks_harness(
+        monkeypatch,
+        workflow_yaml=_SAVED_SIGN_IN_AND_SEARCH_YAML,
+        polled_status=status,
+        dispatch_to_worker=True,
+        terminal_blocks=[
+            terminal_extraction_block("completed", label="sign_in"),
+            terminal_extraction_block(status, label="search"),
+        ],
+    )
+    forge_app.WORKFLOW_SERVICE.mark_workflow_run_as_canceled_if_not_final = AsyncMock()
+    monkeypatch.setattr(run_execution_module, "_credential_ids_validation_error", AsyncMock(return_value=None))
+
+    async def mint_blank_browser(acquisition_ctx: CopilotContext, *, fresh: bool, **_kwargs: object) -> None:
+        acquisition_ctx.browser_session_id = "pbs_run"
+
+    monkeypatch.setattr(run_execution_module, "acquire_build_test_browser_session", mint_blank_browser)
+    workflow_service_module.prepare_workflow.return_value.browser_session_id = "pbs_run"
+    result = await run_execution_module.run_workflow_end_to_end(ctx)
+    assert result["data"]["execution_source"]["source_kind"] == "canonical", result
+
+
+@pytest.mark.asyncio
+async def test_canonical_blank_browser_retest_records_yaml_the_accept_resolver_keeps_bindings(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    ctx = _saved_sign_in_ctx()
+
+    await _blank_browser_retest_of_saved_workflow(monkeypatch, ctx, "failed")
+
+    assert ctx.last_workflow is not None and ctx.last_workflow_yaml
+    proposal = workflow_copilot_route._build_proposed_workflow_data(
+        ctx.last_workflow,
+        AgentResult(
+            user_response="",
+            updated_workflow=ctx.last_workflow,
+            workflow_yaml=ctx.last_workflow_yaml,
+            global_llm_context=None,
+        ),
+    )
+    resolved = await workflow_copilot_route._resolve_proposal_for_accept(
+        proposal, organization_id="org-1", workflow_permanent_id="wfp-1"
+    )
+
+    blocks = {block.label: block for block in resolved.workflow_definition.blocks}
+    assert blocks["search"].parameter_keys == ["login_credentials", "search_term"]
+    assert blocks["sign_in"].parameter_keys == ["login_credentials"]
+    assert {parameter.key for parameter in resolved.workflow_definition.parameters} >= {
+        "login_credentials",
+        "search_term",
+    }
+    assert ctx.latest_diagnosis_repair_contract is not None
+    assert {
+        lever.credential_id
+        for lever in ctx.latest_diagnosis_repair_contract.levers
+        if lever.mechanism == "credential_update"
+    } == {"cred_saved"}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("run_statuses", [("completed",), ("failed",), ("completed", "failed")])
+@pytest.mark.parametrize(
+    ("response_type", "product_action"),
+    [("REPLY", None), ("ASK_QUESTION", None), ("REPLY", "test_end_to_end")],
+)
+async def test_canonical_blank_browser_retests_stage_no_proposal_on_any_exit(
+    monkeypatch: pytest.MonkeyPatch, run_statuses: tuple[str, ...], response_type: str, product_action: str | None
+) -> None:
+    ctx = _saved_sign_in_ctx()
+
+    for status in run_statuses:
+        await _blank_browser_retest_of_saved_workflow(monkeypatch, ctx, status)
+
+    failed = run_statuses[-1] == "failed"
+    assert ctx.last_workflow is not None and ctx.last_test_ok is not failed
+    chat_request = SimpleNamespace(
+        workflow_id="wf-1",
+        workflow_permanent_id="wfp-1",
+        workflow_copilot_chat_id="chat-1",
+        workflow_run_id=None,
+        workflow_yaml="",
+        product_action=product_action,
+    )
+    normal_exit = await _translate_to_agent_result(
+        SimpleNamespace(
+            final_output=json.dumps({"type": response_type, "user_response": "I re-ran the saved workflow."}),
+            new_items=[],
+        ),
+        ctx,
+        None,
+        chat_request,
+        "org-1",
+    )
+    wip_exit = _build_wip_exit_result(ctx, None, default_reply="Stopped.")
+
+    for result in (normal_exit, wip_exit):
+        assert (result.updated_workflow, result.workflow_yaml, result.staged_workflow) == (None, None, None)
+        assert result.proposal_disposition == "no_proposal"
+        assert result.clear_proposed_workflow is False
+        assert (result.output_policy_diagnostics or {}).get("final_output_kind") not in _PROPOSAL_OUTPUT_KINDS
+    assert ctx.last_workflow is not None
+    if failed:
+        ctx.saved_workflows_under_test.clear()
+        draft_wip_exit = _build_wip_exit_result(ctx, None, default_reply="Stopped.")
+        assert draft_wip_exit.updated_workflow is ctx.last_workflow
+        assert wip_exit.user_response != draft_wip_exit.user_response

@@ -4,19 +4,24 @@ from __future__ import annotations
 
 import json
 from datetime import UTC, datetime, timedelta, timezone
+from types import SimpleNamespace
 from typing import Any
 from unittest.mock import AsyncMock
 
+import httpx
 import pytest
+from fastapi import FastAPI
 from pydantic import TypeAdapter
 
 from skyvern.forge import app
 from skyvern.forge.sdk.db.repositories.tasks import TasksRepository
 from skyvern.forge.sdk.routes import agent_protocol
 from skyvern.forge.sdk.schemas.workflow_runs import WorkflowRunBlock, WorkflowRunTimeline, WorkflowRunTimelineType
+from skyvern.forge.sdk.services import org_auth_service
 from skyvern.forge.sdk.workflow.service import WorkflowService
+from skyvern.schemas.run_enums import RunType
 from skyvern.schemas.workflows import BlockType
-from skyvern.webeye.actions.actions import Action, ExtractAction
+from skyvern.webeye.actions.actions import Action, DownloadFileAction, ExtractAction
 from tests.unit.helpers import (
     ONE_TIME_CODE,
     assert_one_time_code_withheld,
@@ -158,6 +163,46 @@ async def test_timeline_attaches_actions_to_code_blocks(mock_db: AsyncMock) -> N
 
     assert timeline[0].block is not None
     assert timeline[0].block.actions == [action]
+
+
+@pytest.mark.asyncio
+async def test_native_download_url_survives_registered_timeline_response(
+    mock_db: AsyncMock, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    stamp = datetime(2026, 5, 4, 12, 0, tzinfo=UTC)
+    mock_db.return_value = [_block("wrb_download", created_at=stamp, block_type=BlockType.CODE, task_id="tsk_download")]
+    app.DATABASE.tasks.get_tasks_actions.return_value = [
+        DownloadFileAction(
+            action_id="act_download",
+            organization_id="o_test",
+            workflow_run_id="wr_test",
+            task_id="tsk_download",
+            step_id="stp_download",
+            status="completed",
+            file_name="report.pdf",
+            download_url="https://example.com/files/report.pdf?token=synthetic-private-query",
+            byte=b"PRIVATE_DOWNLOAD_BYTES",
+            created_by="script",
+        )
+    ]
+    monkeypatch.setattr(
+        app.DATABASE.tasks, "get_run", AsyncMock(return_value=SimpleNamespace(task_run_type=RunType.workflow_run))
+    )
+    monkeypatch.setattr(app.DATABASE.observer, "get_task_v2_by_workflow_run_id", AsyncMock(return_value=None))
+    monkeypatch.setattr(app, "WORKFLOW_SERVICE", WorkflowService())
+    monkeypatch.setattr(agent_protocol.analytics, "capture", lambda *_args, **_kwargs: None)
+    api = FastAPI()
+    api.include_router(agent_protocol.base_router, prefix="/v1")
+    api.dependency_overrides[org_auth_service.get_current_org] = lambda: SimpleNamespace(organization_id="o_test")
+
+    async with httpx.AsyncClient(transport=httpx.ASGITransport(app=api), base_url="http://test") as client:
+        response = await client.get("/v1/runs/wr_test/timeline")
+
+    assert response.status_code == 200
+    action = response.json()[0]["block"]["actions"][0]
+    assert action["download_url"] == "https://example.com/files/report.pdf?token=synthetic-private-query"
+    assert action["file_name"] == "report.pdf" and action["created_by"] == "script"
+    assert "byte" not in action and "PRIVATE_DOWNLOAD_BYTES" not in response.text
 
 
 @pytest.mark.asyncio
