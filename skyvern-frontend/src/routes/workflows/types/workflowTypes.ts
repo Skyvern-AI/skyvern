@@ -659,6 +659,7 @@ export type FileDownloadBlock = WorkflowBlockBase & {
   sftp_private_key_passphrase: string | null;
   sftp_remote_path: string | null;
   sftp_host_key: string | null;
+  sftp_source_path: string | null;
   continue_on_empty: boolean;
 };
 

@@ -14,6 +14,7 @@ import {
   navigationNodeDefaultData,
   type NavigationNodeData,
 } from "./nodes/NavigationNode/types";
+import { fileDownloadNodeDefaultData } from "./nodes/FileDownloadNode/types";
 import { urlNodeDefaultData } from "./nodes/URLNode/types";
 import { isMissingRequiredStartUrl } from "./workflowEditorUtils";
 
@@ -56,6 +57,27 @@ describe("isMissingRequiredStartUrl", () => {
       navigation("second"),
     ];
     expect(isMissingRequiredStartUrl(withUrl, edges, "first")).toBe(false);
+  });
+
+  test("an SFTP source needs no start URL and does not provide browser state", () => {
+    const sftpSource = {
+      id: "sftp-source",
+      type: "fileDownload",
+      position: { x: 0, y: 0 },
+      data: {
+        ...fileDownloadNodeDefaultData,
+        label: "sftp-source",
+        sftpSourcePath: "/reports/report.csv",
+      },
+    } as AppNode;
+    const nodes = [start, sftpSource, navigation("after-sftp")];
+    const edges = [
+      edge("start", "sftp-source"),
+      edge("sftp-source", "after-sftp"),
+    ];
+
+    expect(isMissingRequiredStartUrl(nodes, edges, "sftp-source")).toBe(false);
+    expect(isMissingRequiredStartUrl(nodes, edges, "after-sftp")).toBe(true);
   });
 
   test("a 2.0 block derives its own URL and does not open a page for later blocks", () => {

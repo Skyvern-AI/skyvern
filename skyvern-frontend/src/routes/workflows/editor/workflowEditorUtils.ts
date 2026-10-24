@@ -1102,6 +1102,7 @@ function convertToNode(
           sftpPrivateKeyPassphrase: block.sftp_private_key_passphrase ?? "",
           sftpRemotePath: block.sftp_remote_path ?? "",
           sftpHostKey: block.sftp_host_key ?? "",
+          sftpSourcePath: block.sftp_source_path ?? "",
           continueOnEmpty: block.continue_on_empty ?? false,
         },
       };
@@ -3602,22 +3603,26 @@ function getWorkflowBlock(
             ...(node.data.downloadTarget === "google_drive" && {
               google_drive_folder_id: node.data.googleDriveFolderId ?? "",
             }),
-            ...(node.data.downloadTarget === "sftp" && {
-              sftp_host: node.data.sftpHost ?? "",
-              sftp_port:
-                node.data.sftpPort &&
-                Number.isFinite(Number(node.data.sftpPort))
-                  ? Number(node.data.sftpPort)
-                  : null,
-              sftp_username: node.data.sftpUsername ?? "",
-              sftp_password: node.data.sftpPassword ?? "",
-              sftp_private_key: node.data.sftpPrivateKey ?? "",
-              sftp_private_key_passphrase:
-                node.data.sftpPrivateKeyPassphrase ?? "",
-              sftp_remote_path: node.data.sftpRemotePath ?? "",
-              sftp_host_key: node.data.sftpHostKey ?? "",
-            }),
           }),
+        ...((node.data.downloadTarget === "sftp" ||
+          node.data.sftpSourcePath) && {
+          sftp_host: node.data.sftpHost ?? "",
+          sftp_port:
+            node.data.sftpPort && Number.isFinite(Number(node.data.sftpPort))
+              ? Number(node.data.sftpPort)
+              : null,
+          sftp_username: node.data.sftpUsername ?? "",
+          sftp_password: node.data.sftpPassword ?? "",
+          sftp_private_key: node.data.sftpPrivateKey ?? "",
+          sftp_private_key_passphrase: node.data.sftpPrivateKeyPassphrase ?? "",
+          sftp_host_key: node.data.sftpHostKey ?? "",
+          ...(node.data.downloadTarget === "sftp" && {
+            sftp_remote_path: node.data.sftpRemotePath ?? "",
+          }),
+          ...(node.data.sftpSourcePath && {
+            sftp_source_path: node.data.sftpSourcePath,
+          }),
+        }),
       };
     }
     case "sendEmail": {
@@ -4710,6 +4715,8 @@ function leavesBrowserState(node: AppNode, nodes: Array<AppNode>): boolean {
     case "url":
       return true;
     case "fileDownload":
+      // An SFTP source bypasses super().execute entirely, so it leaves no page.
+      if (node.data.sftpSourcePath) return false;
       // A Drive source download is fetched through the Drive API and skips
       // super().execute entirely, so it leaves no page for a later block to
       // start from. A maybe counts as the Drive path, which keeps the warning.
@@ -5208,18 +5215,23 @@ function convertBlocksToBlockYAML(
               ...(block.download_target === "google_drive" && {
                 google_drive_folder_id: block.google_drive_folder_id ?? "",
               }),
-              ...(block.download_target === "sftp" && {
-                sftp_host: block.sftp_host ?? "",
-                sftp_port: block.sftp_port ?? null,
-                sftp_username: block.sftp_username ?? "",
-                sftp_password: block.sftp_password ?? "",
-                sftp_private_key: block.sftp_private_key ?? "",
-                sftp_private_key_passphrase:
-                  block.sftp_private_key_passphrase ?? "",
-                sftp_remote_path: block.sftp_remote_path ?? "",
-                sftp_host_key: block.sftp_host_key ?? "",
-              }),
             }),
+          ...((block.download_target === "sftp" || block.sftp_source_path) && {
+            sftp_host: block.sftp_host ?? "",
+            sftp_port: block.sftp_port ?? null,
+            sftp_username: block.sftp_username ?? "",
+            sftp_password: block.sftp_password ?? "",
+            sftp_private_key: block.sftp_private_key ?? "",
+            sftp_private_key_passphrase:
+              block.sftp_private_key_passphrase ?? "",
+            sftp_host_key: block.sftp_host_key ?? "",
+            ...(block.download_target === "sftp" && {
+              sftp_remote_path: block.sftp_remote_path ?? "",
+            }),
+            ...(block.sftp_source_path && {
+              sftp_source_path: block.sftp_source_path,
+            }),
+          }),
         };
         return blockYaml;
       }
