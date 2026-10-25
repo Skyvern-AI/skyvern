@@ -245,6 +245,90 @@ def _manager_reporting_fixed_deadline(remaining_seconds: float | None) -> MagicM
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("borrowed", [False, True])
+async def test_browser_creation_records_intent_then_owned_id_before_browser_use(monkeypatch, borrowed):
+    manager = _manager_reporting_fixed_deadline(None)
+    records = []
+
+    async def record(allocation_id, session_id):
+        records.append((allocation_id, session_id))
+
+    async def create(**kwargs):
+        assert len(records) == 1 and records[0][1] is None
+        return SimpleNamespace(persistent_browser_session_id="pbs_77")
+
+    async def attach(**kwargs):
+        assert records[-1][1] == "pbs_77"
+        return SimpleNamespace(browser_context=_FakeBrowserContext())
+
+    manager.create_session = AsyncMock(side_effect=create)
+    manager.get_browser_state = AsyncMock(side_effect=attach)
+    monkeypatch.setattr(runtime, "app", SimpleNamespace(PERSISTENT_SESSIONS_MANAGER=manager))
+    ctx = _make_ctx()
+    ctx.browser_allocation_recorder = record
+    if borrowed:
+        ctx.browser_session_id = "pbs_borrowed"
+    assert await ensure_browser_session(ctx) is None
+    if borrowed:
+        assert records == []
+        manager.create_session.assert_not_awaited()
+    else:
+        assert len(records) == 2 and records[0][0] == records[1][0]
+        assert ctx.browser_session_id == "pbs_77"
+
+
+@pytest.mark.asyncio
+async def test_cancelled_browser_allocation_keeps_unknown_id_intent(monkeypatch):
+    manager = _manager_reporting_fixed_deadline(None)
+    manager.create_session = AsyncMock(side_effect=asyncio.CancelledError())
+    monkeypatch.setattr(runtime, "app", SimpleNamespace(PERSISTENT_SESSIONS_MANAGER=manager))
+    records = []
+
+    async def record(allocation_id, session_id):
+        records.append((allocation_id, session_id))
+
+    ctx = _make_ctx()
+    ctx.browser_allocation_recorder = record
+    with pytest.raises(asyncio.CancelledError):
+        await ensure_browser_session(ctx)
+    assert len(records) == 1 and records[0][1] is None
+    assert ctx.browser_session_id is None
+
+
+@pytest.mark.asyncio
+async def test_failed_allocation_intent_write_does_not_start_an_untracked_browser(monkeypatch):
+    manager = _manager_reporting_fixed_deadline(None)
+    monkeypatch.setattr(runtime, "app", SimpleNamespace(PERSISTENT_SESSIONS_MANAGER=manager))
+    ctx = _make_ctx()
+    ctx.browser_allocation_recorder = AsyncMock(side_effect=OSError("synthetic database failure"))
+    result = await ensure_browser_session(ctx)
+    assert result["ok"] is False
+    manager.create_session.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_fresh_exit_records_its_new_browser_before_returning_to_the_caller(monkeypatch):
+    records = []
+
+    async def record(allocation_id, session_id):
+        records.append((allocation_id, session_id))
+
+    async def create(**kwargs):
+        assert len(records) == 1 and records[0][1] is None
+        return SimpleNamespace(new_browser_session_id="pbs_88")
+
+    manager = SimpleNamespace(create_fresh_exit_session=AsyncMock(side_effect=create))
+    monkeypatch.setattr(runtime, "app", SimpleNamespace(PERSISTENT_SESSIONS_MANAGER=manager))
+    ctx = _make_ctx()
+    ctx.browser_allocation_recorder = record
+    result = await runtime.acquire_fresh_exit_browser_session(
+        ctx, prior_browser_session_id="pbs_1", proxy_location=None, browser_profile_id=None
+    )
+    assert result.new_browser_session_id == "pbs_88"
+    assert records[0][0] == records[1][0] and records[1][1] == "pbs_88"
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize(
     ("remaining_seconds", "expected_session_id"),
     [(30.0, "pbs_fresh"), (900.0, "pbs_held"), (None, "pbs_held")],
