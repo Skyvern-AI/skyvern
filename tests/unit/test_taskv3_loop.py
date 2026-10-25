@@ -44,7 +44,7 @@ from skyvern.forge.taskv3 import tools as taskv3_tools_module
 from skyvern.forge.taskv3.answer_basis_audit import ANSWER_BASIS_MAX_HOLDS, RecordedAnswer, apply_answer_basis_audit
 from skyvern.forge.taskv3.auth_tools import _MAX_GIVEUP_DEFERRALS, VerificationFailure, VerificationState
 from skyvern.forge.taskv3.engine import MAX_TOKENS_CEILING, MAX_TOKENS_PER_ACTION_STEP, taskv3_runaway_backstops
-from skyvern.forge.taskv3.goal_check import GoalVerdict, ToolTrail, run_goal_check
+from skyvern.forge.taskv3.goal_check import GoalVerdict, ToolTrail, UnlistedReask, run_goal_check
 from skyvern.forge.taskv3.handoff_redaction import ELIDED_URL_PATH, caller_known_published_urls
 from skyvern.forge.taskv3.intercepted_submission import InterceptedSubmission, SubmissionOutcome
 from skyvern.forge.taskv3.loop import (
@@ -135,10 +135,12 @@ from skyvern.forge.taskv3.opaque_refs import mask_opaque_urls
 from skyvern.forge.taskv3.run_arms import DEAD_END_RETURN_FLAG
 from skyvern.forge.taskv3.tools import build_browser_tools
 from skyvern.utils.url_validators import validate_fetch_url
+from tests.unit.helpers import held_finish_restated
 
 
 class _ScriptedCaller:
-    """Emits one queued turn per ``call``. Each turn is a list of (tool_name, args)."""
+    """Emits one queued turn per ``call``. Each turn is a list of (tool_name, args). Past the script's end, a finish the
+    justification hold held is made again unless ``restate_held_finish`` is off."""
 
     def __init__(
         self,
@@ -147,8 +149,10 @@ class _ScriptedCaller:
         reasoning_contents: list[str | None] | None = None,
         turn_tokens: int = 15,
         usage_for_call: Callable[[int], dict[str, int]] | None = None,
+        restate_held_finish: bool = True,
     ) -> None:
         self._script = script
+        self._restate_held_finish = restate_held_finish
         self._turn_tokens = turn_tokens
         # Per-call usage by call index, for tests that need a fixed prefix plus growth; overrides turn_tokens.
         self._usage_for_call = usage_for_call
@@ -195,7 +199,10 @@ class _ScriptedCaller:
         )
         self.image_blocks_per_call.append(history_images + (len(screenshots) if screenshots else 0))
         idx = self.calls
-        turn = self._script[idx] if idx < len(self._script) else []
+        if idx < len(self._script):
+            turn = self._script[idx]
+        else:
+            turn = held_finish_restated(self.message_history) if self._restate_held_finish else []
         text = self._texts[idx] if self._texts and idx < len(self._texts) else "reasoning..."
         reasoning_content = (
             self._reasoning_contents[idx] if self._reasoning_contents and idx < len(self._reasoning_contents) else None
@@ -7953,6 +7960,312 @@ async def test_typed_rejection_retry_without_headroom_only_logs() -> None:
         events = [e["event"] for e in logs]
         assert (str(limit), outcome.status, _RETRY_HELD in events) == (str(limit), "terminated", False)
         assert _RETRY_WOULD_HOLD in events
+
+
+_JUSTIFY_HELD = "taskv3 finish justification held"
+_JUSTIFY_WOULD_HOLD = "taskv3 finish justification would hold"
+
+
+def _justify_tools(
+    activity: ActivityRecency, clicks: list[tuple[str, dict[str, Any]]] | None = None, **finish_kwargs: Any
+) -> list[ToolSpec]:
+    return [
+        _perception_tool("observe", "url=x text: 'Results'"),
+        _billable_tool("click", clicks if clicks is not None else []),
+        make_finish_tool(activity=activity, justify_stops=True, **finish_kwargs),
+    ]
+
+
+def _finish_results(outcome: Any) -> list[str]:
+    return [str(m.get("content")) for m in outcome.messages if m.get("role") == "tool" and m.get("name") == "finish"]
+
+
+def _justify_events(logs: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    return [e for e in logs if e["event"] in (_JUSTIFY_HELD, _JUSTIFY_WOULD_HOLD)]
+
+
+@pytest.mark.asyncio
+async def test_first_terminated_verdict_is_held_once_then_stands() -> None:
+    activity = ActivityRecency()
+    reason = "I can't search for this person's records."
+    script = [
+        [("observe", {})],
+        [("finish", {"status": "terminated", "reason": reason})],
+        [("finish", {"status": "terminated", "reason": reason})],
+    ]
+    with capture_logs() as logs:
+        outcome, _ = await _run(script, _justify_tools(activity), activity=activity)
+
+    assert (outcome.status, outcome.reason, outcome.turns) == ("terminated", reason, 3)
+    assert _finish_results(outcome)[0] == loop_module.JUSTIFY_HOLD_MESSAGE
+    (held,) = _justify_events(logs)
+    assert (held["event"], held["status"], held["turn"], held["reason_chars"]) == (
+        _JUSTIFY_HELD,
+        "terminated",
+        2,
+        len(reason),
+    )
+    assert held["reason_refusal_shaped"] is True
+    assert reason not in str(held)
+
+
+@pytest.mark.asyncio
+async def test_a_held_terminated_that_continues_can_complete() -> None:
+    activity = ActivityRecency()
+    clicks: list[tuple[str, dict[str, Any]]] = []
+    script = [
+        [("observe", {})],
+        [("finish", {"status": "terminated", "reason": "this lookup is not permitted"})],
+        [("click", {"selector": "#result"})],
+        [("finish", {"status": "completed", "reason": "opened the record"})],
+    ]
+    outcome, _ = await _run(script, _justify_tools(activity, clicks), activity=activity)
+    assert outcome.status == "completed"
+    assert clicks == [("click", {"selector": "#result"})]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("state", "cause"),
+    [
+        ({"final_turn_active": True}, "final_turn"),
+        ({"turns_remaining": FAILURE_EVIDENCE_MIN_TURNS - 1}, "no_headroom"),
+        ({"tool_calls_remaining": FAILURE_EVIDENCE_MIN_TOOL_CALLS - 1}, "no_headroom"),
+        ({"tokens_remaining": 10, "last_turn_tokens": 10}, "no_headroom"),
+        ({"perception_stall_imminent": True}, "no_headroom"),
+        ({}, "no_headroom"),
+        ({"action_steps_remaining": 1}, "no_action_step"),
+        ({"action_steps_remaining": 2}, None),
+    ],
+    ids=["final_turn", "turns", "tool_calls", "tokens", "stall", "deadline", "one_action_step", "two_action_steps"],
+)
+async def test_justification_hold_stands_aside_without_room_to_continue(
+    state: dict[str, Any], cause: str | None
+) -> None:
+    short_deadline = not state
+    deadline_at = time.monotonic() + FAILURE_EVIDENCE_MIN_DEADLINE_HEADROOM_SECONDS - 10 if short_deadline else None
+    finish = make_finish_tool(activity=ActivityRecency(**state), justify_stops=True, deadline_at=deadline_at)
+    with capture_logs() as logs:
+        result = await finish.handler({"status": "terminated", "reason": "r1"})
+    if cause is None:
+        assert (result.status, result.content) == ("error", loop_module.JUSTIFY_HOLD_MESSAGE)
+        assert [e["event"] for e in _justify_events(logs)] == [_JUSTIFY_HELD]
+    else:
+        assert result.status == "ok"
+        assert [(e["event"], e["cause"]) for e in _justify_events(logs)] == [(_JUSTIFY_WOULD_HOLD, cause)]
+
+
+@pytest.mark.asyncio
+async def test_justification_hold_does_not_stack_on_a_submission_hold() -> None:
+    submissions, activity = _FakeSubmissions(), ActivityRecency()
+    tools = _submission_tools(submissions, activity, click_delivers=True, justify_stops=True)
+    script = [
+        [("observe", {})],
+        [("click", {"selector": "#submit"})],
+        [("finish", {"status": "terminated", "reason": "r1"})],
+        [("finish", {"status": "terminated", "reason": "r2"})],
+    ]
+    with capture_logs() as logs:
+        outcome, _ = await _run(script, tools, activity=activity)
+    assert (outcome.status, outcome.reason, outcome.turns) == ("terminated", "r2", 4)
+    assert [e["event"] for e in logs].count("taskv3 finish held on an unseen submission response") == 1
+    assert [(e["event"], e["cause"]) for e in _justify_events(logs)] == [(_JUSTIFY_WOULD_HOLD, "other_hold")]
+
+
+@pytest.mark.asyncio
+async def test_justification_hold_does_not_stack_on_the_typed_rejection_or_failure_evidence_hold() -> None:
+    script = [*_SUBMIT_REJECTED_THEN_GIVE_UP, [("finish", {"status": "terminated", "reason": "not retrying"})]]
+    outcome, logs = await _typed_rejection_run(
+        _FakeSubmissions(), script, click_outcomes=[_REJECTED], finish_kwargs={"justify_stops": True}
+    )
+    assert (outcome.status, outcome.reason, outcome.turns) == ("terminated", "not retrying", 5)
+    assert [e["event"] for e in logs].count(_RETRY_HELD) == 1
+    assert [e["event"] for e in _justify_events(logs)] == [_JUSTIFY_WOULD_HOLD]
+
+    activity = ActivityRecency()
+    fingerprint, _ = _fingerprint_seq(["fp"])
+    tools = _justify_tools(activity, page_fingerprint=fingerprint, settle_wait_seconds=0.0)
+    script = [
+        [("click", {"selector": "#submit"})],
+        [("finish", {"status": "failed", "reason": "blocked"})],
+        [("observe", {})],
+        [("finish", {"status": "terminated", "reason": "the site refused it"})],
+    ]
+    with capture_logs() as logs:
+        outcome, _ = await _run(script, tools, activity=activity)
+    assert (outcome.status, outcome.reason, outcome.turns) == ("terminated", "the site refused it", 4)
+    assert [e["event"] for e in logs].count("taskv3 finish failure deferred for evidence") == 1
+    assert [(e["event"], e["cause"]) for e in _justify_events(logs)] == [(_JUSTIFY_WOULD_HOLD, "other_hold")]
+
+
+@pytest.mark.asyncio
+async def test_a_verification_blocker_give_up_hold_comes_first() -> None:
+    waits = {"n": 0}
+
+    async def verification_blocker(status: str) -> str | None:
+        if status != "completed" and waits["n"] == 0:
+            waits["n"] += 1
+            return "still waiting for the sign-in link"
+        return None
+
+    activity = ActivityRecency()
+    script = [[("finish", {"status": "terminated", "reason": f"r{i}"})] for i in (1, 2, 3)]
+    outcome, _ = await _run(
+        script, _justify_tools(activity, verification_blocker=verification_blocker), activity=activity
+    )
+    finishes = _finish_results(outcome)
+    assert finishes[:2] == ["still waiting for the sign-in link", loop_module.JUSTIFY_HOLD_MESSAGE]
+    assert (outcome.status, outcome.reason) == ("terminated", "r3")
+
+
+@pytest.mark.asyncio
+async def test_a_failed_verdict_is_never_held() -> None:
+    for first in ("observe", "click"):
+        activity = ActivityRecency()
+        script = [[(first, {"selector": "#a"})], [("finish", {"status": "failed", "reason": "r1"})]]
+        with capture_logs() as logs:
+            outcome, _ = await _run(script, _justify_tools(activity), activity=activity)
+        assert (first, outcome.status, outcome.turns) == (first, "failed", 2)
+        assert _justify_events(logs) == []
+
+    activity = ActivityRecency()
+    fingerprint, _ = _fingerprint_seq(["fp"])
+    script = [
+        [("click", {"selector": "#submit"})],
+        [("finish", {"status": "failed", "reason": "r1"})],
+        [("observe", {})],
+        [("finish", {"status": "failed", "reason": "r2"})],
+    ]
+    with capture_logs() as logs:
+        outcome, _ = await _run(
+            script,
+            _justify_tools(activity, page_fingerprint=fingerprint, settle_wait_seconds=0.0),
+            activity=activity,
+        )
+    assert (outcome.status, outcome.reason, outcome.turns) == ("failed", "r2", 4)
+    assert [e["event"] for e in logs].count("taskv3 finish failure deferred for evidence") == 1
+    assert _justify_events(logs) == []
+
+
+@pytest.mark.asyncio
+async def test_the_premise_check_runs_only_on_the_verdict_that_stands() -> None:
+    checks: list[tuple[str, int]] = []
+
+    async def terminate_premise(reason: str, prior_checks: int) -> None:
+        checks.append((reason, prior_checks))
+
+    activity = ActivityRecency()
+    script = [[("finish", {"status": "terminated", "reason": f"r{i}"})] for i in (1, 2)]
+    outcome, _ = await _run(script, _justify_tools(activity, terminate_premise=terminate_premise), activity=activity)
+    await asyncio.sleep(0)
+    assert outcome.reason == "r2"
+    assert checks == [("r2", 0)]
+
+
+@pytest.mark.asyncio
+async def test_the_unlisted_reask_runs_only_on_the_verdict_that_stands() -> None:
+    asked: list[tuple[str, str]] = []
+
+    async def unlisted_reask(original: str, reason: str) -> UnlistedReask:
+        asked.append((original, reason))
+        return UnlistedReask(original_status="terminated", converts=False, skipped_reason=None, latency_s=0.0)
+
+    activity = ActivityRecency()
+    script = [[("finish", {"status": "terminated", "reason": f"r{i}"})] for i in (1, 2)]
+    outcome, _ = await _run(script, _justify_tools(activity, unlisted_reask=unlisted_reask), activity=activity)
+    assert outcome.reason == "r2"
+    assert asked == [("terminated", "r2")]
+
+
+@pytest.mark.asyncio
+async def test_a_held_verdicts_error_code_is_not_reported() -> None:
+    mapping = {"not_permitted": "The task is not permitted.", "no_record": "No record matched."}
+    activity = ActivityRecency()
+    script = [
+        [("finish", {"status": "terminated", "reason": "r1", "error_code": "not_permitted"})],
+        [("finish", {"status": "terminated", "reason": "r2", "error_code": "no_record"})],
+    ]
+    with capture_logs() as logs:
+        outcome, _ = await _run(script, _justify_tools(activity, error_code_mapping=mapping), activity=activity)
+    assert (outcome.reason, outcome.error_code) == ("r2", "no_record")
+    assert [e["chosen_error_code"] for e in logs if e["event"] == "taskv3 finish user-defined error code"] == [
+        "no_record"
+    ]
+
+
+@pytest.mark.asyncio
+async def test_status_at_hold_gate_records_the_held_verdict() -> None:
+    activity = ActivityRecency()
+    script = [
+        [("finish", {"status": "terminated", "reason": "r1"})],
+        [("observe", {})],
+        [("finish", {"status": "failed", "reason": "r2"})],
+    ]
+    outcome, _ = await _run(script, _justify_tools(activity), activity=activity)
+    assert outcome.status == "failed"
+    assert (activity.status_at_hold_gate, activity.perceptions_at_hold_gate) == ("terminated", 0)
+
+
+@pytest.mark.asyncio
+async def test_calls_queued_after_a_held_finish_are_skipped_not_run() -> None:
+    activity = ActivityRecency()
+    clicks: list[tuple[str, dict[str, Any]]] = []
+    script = [
+        [("observe", {})],
+        [
+            ("finish", {"status": "terminated", "reason": "r1"}),
+            ("click", {"selector": "#next"}),
+            ("finish", {"status": "completed", "reason": "r2"}),
+        ],
+        [("finish", {"status": "terminated", "reason": "r3"})],
+    ]
+    outcome, _ = await _run(script, _justify_tools(activity, clicks), activity=activity)
+    assert clicks == []
+    assert (outcome.status, outcome.reason) == ("terminated", "r3")
+    asked = [c["id"] for m in outcome.messages if m.get("role") == "assistant" for c in m.get("tool_calls") or []]
+    answered = [m["tool_call_id"] for m in outcome.messages if m.get("role") == "tool"]
+    assert sorted(asked) == sorted(answered)
+    skipped = [str(m["content"]) for m in outcome.messages if str(m.get("content", "")).startswith("skipped:")]
+    assert skipped == [f"skipped: {loop_module._JUSTIFY_HOLD_SKIP}"] * 2
+
+
+@pytest.mark.asyncio
+async def test_a_completed_verdict_never_reaches_the_justification_hold() -> None:
+    activity = ActivityRecency()
+    with capture_logs() as logs:
+        outcome, _ = await _run(
+            [[("finish", {"status": "completed", "reason": "done"})]], _justify_tools(activity), activity=activity
+        )
+        assert (outcome.status, outcome.turns) == ("completed", 1)
+
+        async def completion_gate() -> bool:
+            raise CompletionGateTerminationError("an earlier entry exists")
+
+        finish = make_finish_tool(activity=ActivityRecency(), justify_stops=True, completion_gate=completion_gate)
+        result = await finish.handler({"status": "completed", "reason": "done"})
+        assert (result.status, (result.data or {}).get("status")) == ("ok", "terminated")
+    assert _justify_events(logs) == []
+
+
+def test_the_hold_text_is_generic() -> None:
+    words = set(re.findall(r"[a-z]+", loop_module.JUSTIFY_HOLD_MESSAGE.lower()))
+    assert not words & {"age", "minor", "minors", "adult", "privacy", "private", "person", "people", "broker"}
+    on, off = make_finish_tool(justify_stops=True), make_finish_tool()
+    assert (on.description, on.parameters) == (off.description, off.parameters)
+
+
+@pytest.mark.asyncio
+async def test_a_missing_fact_stop_restated_after_the_hold_stands_as_terminated() -> None:
+    activity = ActivityRecency()
+    reason = "The form requires a street address and the data gives none."
+    script = [
+        [("observe", {})],
+        [("finish", {"status": "terminated", "reason": reason})],
+        [("finish", {"status": "terminated", "reason": reason})],
+    ]
+    outcome, _ = await _run(script, _justify_tools(activity), activity=activity)
+    assert _finish_results(outcome)[0] == loop_module.JUSTIFY_HOLD_MESSAGE
+    assert (outcome.status, outcome.reason, outcome.turns) == ("terminated", reason, 3)
 
 
 def test_submissions_across_contexts_keeps_a_replaced_contexts_records_apart() -> None:
