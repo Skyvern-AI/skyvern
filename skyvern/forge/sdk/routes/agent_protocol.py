@@ -4794,8 +4794,11 @@ async def get_tasks(
 
 _RUN_IDENTIFIER_SEARCH_DESCRIPTION = (
     "A complete browser profile ID, browser session ID or credential ID matches the run that used it "
-    "exactly (no substring match). A complete browser profile or browser session ID is matched against "
-    "those identifiers only, not the text fields. A credential ID matches when it is the run's "
+    "exactly (no substring match). A complete workflow run ID matches that run. A complete task ID "
+    "matches the workflow run the task ran in, when this list includes that run, or the standalone task "
+    "itself where standalone tasks are listed. A complete browser profile, browser session, workflow run "
+    "or task ID is matched against those identifiers only, not the text fields. A credential ID matches "
+    "when it is the run's "
     "sequential credential, the credential the run selected from a pool or fell back to, or the "
     "credential bound by a credential parameter on the run's workflow version when the run was created "
     "and the run recorded no selection for it."
@@ -4922,11 +4925,11 @@ async def _parse_and_gate_tag_filter_terms(
 
 _RUNS_LIST_TIMEOUT_RETRY_AFTER_SECONDS = 15
 _RUNS_LIST_SEARCH_TIMEOUT_DETAIL = (
-    "Free-text run search exceeded its time limit. Try an exact browser profile or session ID."
+    "Free-text run search exceeded its time limit. Try an exact browser profile or session ID, or a complete run ID."
 )
 _WORKFLOW_RUNS_SEARCH_TIMEOUT_DETAIL = (
     "Free-text run search exceeded its time limit. Retry with a created_at_start/created_at_end "
-    "window of a few weeks or less, or search an exact browser profile or session ID."
+    "window of a few weeks or less, or search an exact browser profile or session ID, or a complete run ID."
 )
 # Unindexed free text walks the org's run history newest-first, so without a caller start it is bounded to
 # the window before the caller's end (or now). A product guardrail, not a measured optimum.
@@ -4934,11 +4937,12 @@ _ORG_RUNS_SEARCH_DEFAULT_WINDOW = timedelta(days=30)
 _ORG_RUNS_SEARCH_TIMEOUT_DETAIL = (
     "Free-text run search exceeded its time limit. Retry with a narrower created_at_start/created_at_end "
     "window (a search without created_at_start covers only the 30 days before created_at_end or now), or "
-    "search an exact browser profile or session ID."
+    "search an exact browser profile or session ID, or a complete run ID."
 )
 _ORG_RUNS_SEARCH_KEY_DESCRIPTION = (
     _WORKFLOW_RUN_SEARCH_KEY_DESCRIPTION + " Without created_at_start, a search other than a complete browser "
-    "profile or session ID covers only runs created in the 30 days before created_at_end (or before now)."
+    "profile, browser session, workflow run or task ID covers only runs created in the 30 days before "
+    "created_at_end (or before now)."
 )
 _ORG_RUNS_CREATED_AT_START_DESCRIPTION = (
     "Only include runs created at or after this timestamp (ISO 8601; a value without an offset is read as UTC). "
@@ -4958,7 +4962,7 @@ def _runs_list_filter_names(**filters: object | None) -> list[str]:
 
 def _runs_list_timeout_error(*, indexed_search: bool, search_detail: str) -> HTTPException:
     """The client-facing form of a runs-list search that ran out of time. An unindexed free-text
-    search is the caller's to narrow; an exact browser identifier resolves through indexed equality
+    search is the caller's to narrow; an exact browser, run or task identifier resolves through indexed equality
     lookups, so its timeout is transient and retryable."""
     if not indexed_search:
         # Do not suggest a rarer substring: the unindexed search can still walk the whole org.
@@ -5378,19 +5382,22 @@ async def run_workflow_legacy(
         "|---|---|\n"
         "| `browser_profile_id` | The browser profile the run used (e.g. `bp_123…`) |\n"
         "| `browser_session_id` | The browser session the run used (e.g. `pbs_123…`) |\n"
-        "| **Credential id** | A credential the run used (e.g. `cred_123…`) |\n\n"
-        "A complete browser profile or browser session id is matched against those identifiers only, not "
-        "the text fields above. "
+        "| **Credential id** | A credential the run used (e.g. `cred_123…`) |\n"
+        "| `workflow_run_id` | The run itself (e.g. `wr_123…`) |\n"
+        "| **Task id** | The workflow run the task ran in, when that run is top-level (e.g. `tsk_123…`) |\n\n"
+        "A complete browser profile, browser session, workflow run or task id is matched against those "
+        "identifiers only, not the text fields above. "
         "A credential id matches a run when it is the run's sequential credential, the credential the run "
         "selected from a pool or fell back to, or the credential bound by a credential parameter on the "
         "run's workflow version when the run was created and the run recorded no selection for that "
         "parameter. Other pool and fallback members the run did not use do not match.\n\n"
         "### Default search window\n\n"
-        "A `search_key` other than a complete browser profile or session id is matched only against runs created "
-        "in the **30 days before `created_at_end`** (or before now) unless the request supplies `created_at_start`. "
-        "This includes complete run and credential ids. Supply `created_at_start` (and optionally `created_at_end`) "
-        "to search a different range. Listings without `search_key` are not windowed. To fetch one run by its id, "
-        "use `GET /v1/runs/{run_id}`.\n\n"
+        "A `search_key` other than a complete browser profile, browser session, workflow run or task id is matched "
+        "only against runs created in the **30 days before `created_at_end`** (or before now) unless the request "
+        "supplies `created_at_start`. This includes complete credential ids. Supply `created_at_start` (and "
+        "optionally `created_at_end`) to search a different range. Explicit bounds apply to every search, complete "
+        "ids included. Listings without `search_key` are not windowed. To fetch one run by its id, use "
+        "`GET /v1/runs/{run_id}`.\n\n"
         "### created_at_start / created_at_end\n\n"
         "Optional ISO 8601 bounds on the run's creation time: `created_at_start` is inclusive and "
         "`created_at_end` is exclusive. A timestamp without an offset is read as UTC.\n\n"
@@ -5475,15 +5482,17 @@ async def get_workflow_runs(
     - `webhook_callback_url` — the webhook URL the run posts its result to
 
     A **complete** `browser_profile_id`, `browser_session_id` or credential ID matches the run that used
-    it by exact equality. A complete browser profile or browser session ID is matched against those
-    identifiers only, not the text fields above. A credential ID matches when it is the run's sequential
-    credential, the credential the run selected from a pool or fell back to, or the credential bound by a
-    credential parameter on the run's workflow version when the run was created and the run recorded no
-    selection for that parameter.
+    it by exact equality, a complete `workflow_run_id` matches that run, and a complete task ID matches the
+    top-level workflow run the task ran in. A complete browser profile, browser session, workflow run or
+    task ID is matched against those identifiers only, not the text fields above. A credential ID matches
+    when it is the run's sequential credential, the credential the run selected from a pool or fell back
+    to, or the credential bound by a credential parameter on the run's workflow version when the run was
+    created and the run recorded no selection for that parameter.
 
-    A `search_key` other than a complete browser profile or session ID (run and credential IDs included)
-    searches only runs created in the 30 days before `created_at_end` (or before now) unless
-    `created_at_start` is supplied. Listings without `search_key` are not windowed.
+    A `search_key` other than a complete browser profile, browser session, workflow run or task ID
+    (credential IDs included) searches only runs created in the 30 days before `created_at_end` (or before
+    now) unless `created_at_start` is supplied. Explicit bounds apply to every search, complete IDs included.
+    Listings without `search_key` are not windowed.
 
     **created_at_start** (inclusive) and **created_at_end** (exclusive) bound the run's creation time;
     a timestamp without an offset is read as UTC.
@@ -5495,7 +5504,8 @@ async def get_workflow_runs(
     - All failed runs: `?status=failed`
     - Failed runs with a specific error: `?status=failed&error_code=INVALID_CREDENTIALS`
     - Runs from the last 30 days matching a parameter value: `?search_key=https://example.com`
-    - Runs from the last 30 days matching a run ID: `?search_key=wr_abc123`
+    - Runs from the last 30 days matching part of a run ID: `?search_key=wr_abc123`
+    - The run with a complete run ID, at any age: `?search_key=wr_123456789012345678`
     - Runs from the last 30 days that used a credential: `?search_key=cred_123456789`
     - An older range: `?search_key=my_credential&created_at_start=2026-01-01T00:00:00Z`
     - Combined: `?status=failed&error_code=LOGIN_FAILED&search_key=my_credential`
