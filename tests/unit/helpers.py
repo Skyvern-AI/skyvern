@@ -23,6 +23,7 @@ from skyvern.forge.sdk.db.enums import TaskType
 from skyvern.forge.sdk.models import Step, StepStatus
 from skyvern.forge.sdk.schemas.organizations import Organization
 from skyvern.forge.sdk.schemas.tasks import Task, TaskStatus
+from skyvern.forge.taskv3.loop import JUSTIFY_HOLD_MESSAGE
 from skyvern.schemas.steps import AgentStepOutput
 from skyvern.utils.action_redaction import REDACTED_INPUT_VALUE, REDACTED_OTP_VALUE
 from skyvern.utils.secret_redaction import REDACTED_SECRET_PLACEHOLDER
@@ -38,6 +39,22 @@ from skyvern.webeye.actions.actions import (
 )
 from skyvern.webeye.actions.responses import ActionFailure, ActionResult, ActionSuccess
 from tests.unit.scoped_asyncio import ScopedAsyncio
+
+
+def held_finish_restated(history: Sequence[dict[str, Any]]) -> list[tuple[str, dict[str, Any]]]:
+    """The finish the justification hold answered in the last model turn, made again as a model with a real reason
+    would; an empty turn when the last turn had no held finish."""
+    calls: dict[str, Any] = {}
+    restated: list[tuple[str, dict[str, Any]]] = []
+    for message in history:
+        if message.get("role") == "assistant":
+            calls = {call["id"]: call["function"] for call in message.get("tool_calls") or []}
+            restated = []
+        elif message.get("role") == "tool" and message.get("content") == JUSTIFY_HOLD_MESSAGE:
+            function = calls.get(message.get("tool_call_id"))
+            if function is not None and function.get("name") == "finish":
+                restated = [("finish", json.loads(function.get("arguments") or "{}"))]
+    return restated
 
 
 class FakeLLMResponse:

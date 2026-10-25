@@ -567,11 +567,13 @@ def _org_runs_service(monkeypatch: pytest.MonkeyPatch, **service_kwargs: Any) ->
     [
         # Unindexed free text without a date range is bounded to the last 30 days.
         ("login", None, None, _ORG_RUNS_DEFAULT_START, None),
-        ("wr_123456789012345678", None, None, _ORG_RUNS_DEFAULT_START, None),
+        ("wr_12345678901234567", None, None, _ORG_RUNS_DEFAULT_START, None),
         ("cred_123456789", None, None, _ORG_RUNS_DEFAULT_START, None),
-        # Complete browser identifiers resolve through an indexed lookup and keep the full history.
+        # Complete browser, run and task identifiers resolve through an indexed lookup and keep the full history.
         ("bp_123456789", None, None, None, None),
         ("pbs_123456789", None, None, None, None),
+        ("wr_123456789012345678", None, None, None, None),
+        ("tsk_123456789012345678", None, None, None, None),
         # A listing without a search term is unchanged.
         (None, None, None, None, None),
         ("", None, None, None, None),
@@ -586,6 +588,8 @@ def _org_runs_service(monkeypatch: pytest.MonkeyPatch, **service_kwargs: Any) ->
         # Explicit bounds also narrow listings and indexed searches.
         (None, _EXPLICIT_START, _EXPLICIT_END, _EXPLICIT_START, _EXPLICIT_END),
         ("bp_123456789", None, _EXPLICIT_END, None, _EXPLICIT_END),
+        ("wr_123456789012345678", _EXPLICIT_START, _EXPLICIT_END, _EXPLICIT_START, _EXPLICIT_END),
+        ("tsk_123456789012345678", None, _EXPLICIT_END, None, _EXPLICIT_END),
     ],
 )
 async def test_get_workflow_runs_bounds_free_text_search_without_a_start_to_a_default_window(

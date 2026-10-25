@@ -1990,7 +1990,9 @@ class ArtifactManager:
                 entries[prefix + filename] = accumulator.entries[filename]
                 members.append((accumulator, artifact_type, prefix + filename, artifact_id))
 
-        zip_bytes = self._build_zip(entries)
+        # Deflating a block's raw DOM takes long enough to stall every run on this worker's event loop; zlib releases
+        # the GIL, so a thread keeps the loop free.
+        zip_bytes = await asyncio.to_thread(self._build_zip, entries)
         await app.STORAGE.store_artifact(archive_artifact, zip_bytes)
 
         # Parent archive row (no bundle_key — represents the ZIP object itself)
@@ -2146,7 +2148,7 @@ class ArtifactManager:
             filename: _maybe_redact_artifact_data(artifact_type, data, workflow_run_id=archive_artifact.workflow_run_id)
             for filename, (artifact_type, data) in entries.items()
         }
-        zip_bytes = self._build_zip(zip_entries)
+        zip_bytes = await asyncio.to_thread(self._build_zip, zip_entries)
         await app.STORAGE.store_artifact(archive_artifact, zip_bytes)
 
         # Parent archive row (no bundle_key — represents the ZIP object itself)

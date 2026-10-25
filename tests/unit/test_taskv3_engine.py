@@ -2580,8 +2580,8 @@ async def test_a_terminated_finish_is_reasked_on_the_runs_own_model_without_a_go
 class _PremiseAnsweringCaller(_ScriptedCaller):
     """The run's own caller, answering the terminate-premise check outside the scripted loop turns."""
 
-    def __init__(self, script: list[list[tuple[str, dict[str, Any]]]], answer: dict[str, Any]) -> None:
-        super().__init__(script)
+    def __init__(self, script: list[list[tuple[str, dict[str, Any]]]], answer: dict[str, Any], **kwargs: Any) -> None:
+        super().__init__(script, **kwargs)
         self.answer = answer
         self.premise_calls: list[dict[str, Any]] = []
         self.reask_calls: list[dict[str, Any]] = []
@@ -2678,7 +2678,7 @@ async def test_stop_criteria_for_a_block_without_a_completion_criterion_change_n
     signed = "https://files.example.test/uploads/deadbeef/statement.pdf?token=eyJhbGciOiJIUzI1NiJ9.c2lnbmVk.QQ"
     terminate = f"the statement at {signed} is not listed"
     seen = []
-    for criteria in (None, ("", terminate)):
+    for criteria in (("", ""), ("", terminate)):
         caller = _PremiseAnsweringCaller(
             [[("read_fixture", {})], [("finish", {"status": "terminated", "reason": "Not listed."})]],
             answer={"cited": "none", "condition": "unclear", "stop_kind": "none", "quote": ""},
@@ -3198,3 +3198,85 @@ async def test_engine_logs_a_dead_end_provenance_through_the_real_navigate_tool(
     assert (outcome.status, outcome.guard) == ("terminated", NAV_DEAD_END_GUARD)
     (line,) = (entry for entry in logs if entry["event"] == "taskv3 loop navigation dead end")
     assert line["provenance"] == ("previously_visited" if via_click else "task_supplied")
+
+
+_JUSTIFY_CRITERIA = ("", "the record is not listed")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("scope", "held"),
+    [
+        ({"unlisted_reask_criteria": _JUSTIFY_CRITERIA}, True),
+        ({"unlisted_reask_criteria": None}, False),
+        ({"unlisted_reask_criteria": _JUSTIFY_CRITERIA, "page_free": True}, False),
+    ],
+    ids=["browser_loop", "validation", "page_free"],
+)
+async def test_validation_and_page_free_runs_are_never_held_for_a_source(scope: dict[str, Any], held: bool) -> None:
+    caller = _PremiseAnsweringCaller(
+        [[("finish", {"status": "terminated", "reason": f"r{i}"})] for i in (1, 2)], answer={}
+    )
+    outcome = await run_task_v3_agent_loop(
+        page_provider=_fixed_page_provider(_FakePage()), llm_caller=caller, goal="Look up the record.", **scope
+    )
+    assert (outcome.status, outcome.reason, outcome.turns) == ("terminated", *(("r2", 2) if held else ("r1", 1)))
+
+
+_TERMINATE = ("finish", {"status": "terminated", "reason": "r1"})
+_ACT = ("type", {"selector": "#first", "text": "John"})
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("script", "expected"),
+    [
+        ([[_TERMINATE], [_TERMINATE]], ("refinished_same", 1, 0, 0)),
+        ([[_TERMINATE], [("read_fixture", {})], [_TERMINATE]], ("looked_then_terminated", 2, 0, 1)),
+        (
+            [[_TERMINATE], [_ACT], [("finish", {"status": "terminated", "reason": "r2"})]],
+            ("continued_terminated", 2, 1, 0),
+        ),
+        (
+            [[_TERMINATE], [_ACT], [("finish", {"status": "completed", "reason": "done"})]],
+            ("continued_completed", 2, 1, 0),
+        ),
+    ],
+    ids=["refinished_same", "looked_then_terminated", "continued_terminated", "continued_completed"],
+)
+async def test_engine_summary_line_carries_the_justification_outcome(
+    script: list[list[tuple[str, dict[str, Any]]]], expected: tuple[str, int, int, int]
+) -> None:
+    caller = _PremiseAnsweringCaller(script, answer={})
+    with capture_logs() as logs:
+        await run_task_v3_agent_loop(
+            page_provider=_fixed_page_provider(_FakePage()),
+            llm_caller=caller,
+            goal="Look up the record.",
+            parameters={"first_name": "John"},
+            extra_tools=[_fixed_read_tool("Results")],
+            unlisted_reask_criteria=_JUSTIFY_CRITERIA,
+        )
+    finished = next(e for e in logs if e["event"] == "taskv3 engine loop finished")
+    assert (
+        finished["justify_outcome"],
+        finished["justify_turns_after"],
+        finished["justify_actions_after"],
+        finished["justify_perceptions_after"],
+    ) == expected
+    assert (finished["justify_held"], finished["justify_status"], finished["justify_turn"]) == (True, "terminated", 1)
+
+
+@pytest.mark.asyncio
+async def test_the_justification_hold_switch_turns_the_hold_off(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(settings, "DISABLE_TASK_V3_JUSTIFY_HOLD", True)
+    caller = _PremiseAnsweringCaller([[_TERMINATE]], answer={})
+    with capture_logs() as logs:
+        outcome = await run_task_v3_agent_loop(
+            page_provider=_fixed_page_provider(_FakePage()),
+            llm_caller=caller,
+            goal="Look up the record.",
+            unlisted_reask_criteria=_JUSTIFY_CRITERIA,
+        )
+    assert (outcome.status, outcome.turns) == ("terminated", 1)
+    assert "taskv3 finish justification held" not in [e["event"] for e in logs]

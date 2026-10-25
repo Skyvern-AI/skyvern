@@ -487,6 +487,13 @@ async def run_task_v3_agent_loop(
     )
     reask_on = unlisted_reask_criteria is not None and bool(unlisted_reask_criteria[0]) and judge_eligible
     premise_on = unlisted_reask_criteria is not None and not page_free
+    justify_on = (
+        unlisted_reask_criteria is not None
+        and not page_free
+        and await app.AGENT_FUNCTION.task_v3_justify_hold_enabled(
+            task_id=ctx.task_id if ctx is not None else None, organization_id=organization_id
+        )
+    )
     block_check_on = single_action_block and block_completion_judge is not None and judge_eligible
     tool_trail = ToolTrail() if reask_on or premise_on or block_check_on else None
     reasks: list[UnlistedReask] = []
@@ -653,6 +660,7 @@ async def run_task_v3_agent_loop(
         download_facts=failure_watch.facts if failure_watch is not None else None,
         error_code_mapping=error_code_mapping,
         intercepted_submissions=block_submissions,
+        justify_stops=justify_on,
     )
     tools = browser_tools + (extra_tools or []) + [finish_tool]
     # The COMPLETE dispatch list, not just the browser tools: auth / captcha / code tools and finish
@@ -828,6 +836,7 @@ async def run_task_v3_agent_loop(
         perceptions_at_hold_gate=activity.perceptions_at_hold_gate,
         status_at_hold_gate=activity.status_at_hold_gate,
         dead_ends_returned=activity.dead_ends_returned,
+        **activity.justify_summary(outcome.status),
         has_navigation_goal=has_navigation_goal,
         age_default_rendered=bool(age_default_text),
         age_default_reason=age_default_reason,
