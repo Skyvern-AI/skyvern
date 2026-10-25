@@ -446,6 +446,7 @@ async def _await_vendor_clear(page: Page | RecordingPage) -> ChallengePageState:
                 state = "challenged"
         except Exception as exc:
             clear_reads = 0
+            state = "not_rechecked"
             LOG.info("CAPTCHA vendor recheck read failed", arm="vendor_handler", error_type=type(exc).__name__)
         if time.monotonic() >= deadline and clear_reads == 0:
             return state

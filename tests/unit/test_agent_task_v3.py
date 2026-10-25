@@ -83,7 +83,7 @@ from skyvern.forge.taskv3.engine import DEFAULT_MAX_SETTLE_DEFERRALS, MIN_ACTION
 from skyvern.forge.taskv3.goal_check import (
     BLOCK_COMPLETION_CHECK_PROMPT_NAME,
 )
-from skyvern.forge.taskv3.goal_composition import CodeProgressRecord, CodeTypedValue
+from skyvern.forge.taskv3.goal_composition import DOWNLOAD_BLOCK_FACT, CodeProgressRecord, CodeTypedValue
 from skyvern.forge.taskv3.handoff_redaction import pin_caller_authored_block_urls
 from skyvern.forge.taskv3.loop import (
     ACTION_BLOCK_TARGET_ACTION_RESERVE,
@@ -2775,6 +2775,7 @@ async def test_execute_task_v3_download_block_completes_with_zero_files_when_non
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path, block_cls: type[BaseTaskBlock], extraction: bool
 ) -> None:
     async def _finish_without_a_file(kwargs: dict[str, Any], captured: dict[str, Any]) -> LoopOutcome:
+        captured["goal"] = kwargs["goal"]
         return await _finish_through_the_real_tool(kwargs, captured, {"records": 0} if extraction else None)
 
     captured = await _run_execute_task_v3_download(
@@ -2786,6 +2787,7 @@ async def test_execute_task_v3_download_block_completes_with_zero_files_when_non
         data_extraction_goal="Extract the record count" if extraction else None,
     )
 
+    assert DOWNLOAD_BLOCK_FACT in captured["goal"]
     assert DOWNLOAD_NO_FILE_FACT in captured["finish_content"]
     assert captured["task"].status == TaskStatus.completed
     assert list(tmp_path.iterdir()) == []
@@ -2875,6 +2877,7 @@ async def test_execute_task_v3_download_timeout_only_gets_a_download_wait_and_no
     wait = loop_mock.await_args.kwargs["download_wait"]
     assert wait is not None
     assert loop_mock.await_args.kwargs["download_settle"] is None
+    assert DOWNLOAD_BLOCK_FACT not in loop_mock.await_args.kwargs["goal"]
 
     await wait()
     wait_mock.assert_awaited_once()

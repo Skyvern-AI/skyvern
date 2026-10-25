@@ -32,6 +32,10 @@ vi.mock("posthog-js/react", () => ({
   useFeatureFlagEnabled: (flag: string) => mockFeatureFlagEnabled(flag),
   useFeatureFlagVariantKey: () => undefined,
 }));
+vi.mock("@/hooks/usePostHogFeatureFlag", () => ({
+  usePostHogFeatureFlagEnabled: (flag: string) => mockFeatureFlagEnabled(flag),
+  usePostHogFeatureFlagVariantKey: () => undefined,
+}));
 
 vi.mock("use-debounce", () => ({
   useDebounce: <T,>(value: T): [T] => [value],

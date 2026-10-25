@@ -888,6 +888,9 @@ async def test_multi_field_totp_browser_privacy_after_fill(monkeypatch: pytest.M
                 assert [line.split("input ", 1)[1] for line in legend] == [repr("*" * len(value)) for value in values]
                 # The same sanitized labels are retained for subsequent mark actions.
                 raw_look = inspect.unwrap(look.handler)
+                # Some tool wrappers keep the inner handler as their `_handler` default instead of `__wrapped__`.
+                while "_look_manifest" not in raw_look.__code__.co_freevars:
+                    raw_look = inspect.unwrap(inspect.signature(raw_look).parameters["_handler"].default)
                 look_state = dict(
                     zip(raw_look.__code__.co_freevars, [cell.cell_contents for cell in raw_look.__closure__])
                 )
@@ -6736,13 +6739,14 @@ async def test_computer_use_code_hand_off_without_a_workflow_run_marks_the_typed
     assert action.text == ONE_TIME_CODE
 
 
+# Preset unique_ids contain a hyphen: the scraper re-mints 4-6 character alphanumeric ids that this frame did not mint.
 _OTP_PAGE = (
     '<form unique_id="otp-scope" id="otp-scope">Enter the code we sent you'
     + "".join(f'<input unique_id="box-{i}" id="box-{i}" maxlength="1" inputmode="numeric">' for i in range(6))
     + '<label><input unique_id="remember" id="remember" type="checkbox">Remember this device</label>'
-    + '<button unique_id="verify" id="verify" type="button">Verify</button>'
-    + '<button unique_id="resend" id="resend" type="button">Resend code</button>'
-    + '<button unique_id="help" id="help" type="button">Didn\'t get a code? Help</button>'
+    + '<button unique_id="otp-verify" id="verify" type="button">Verify</button>'
+    + '<button unique_id="otp-resend" id="resend" type="button">Resend code</button>'
+    + '<button unique_id="otp-help" id="help" type="button">Didn\'t get a code? Help</button>'
     + '<div id="status"></div></form>'
 )
 _OTP_PAGE_JS = """(cfg) => {
@@ -7228,7 +7232,7 @@ async def test_external_otp_browser_first_manual_verify_still_runs_once(
                 await site.step(steps[0], entry=False)
                 await asyncio.sleep(0.4)
                 # The plan types the code again and presses Verify: only the press runs, and only once.
-                await site.step(steps[1], [_click("verify"), _click("verify")])
+                await site.step(steps[1], [_click("otp-verify"), _click("otp-verify")])
                 assert await _counts(site) == (1, 1, 1)
                 site.completion.return_value = CompleteAction(reasoning="Signed in", verified=True)
                 await site.step(steps[2], [{"action_type": "complete", "reasoning": "Signed in"}], entry=False)
@@ -7325,13 +7329,13 @@ async def test_external_otp_browser_verify_press_reaches_the_page_once(
                 await site.step(steps[0], entry=False)
                 if failure == "cancelled_after_effect":
                     with pytest.raises(asyncio.CancelledError):
-                        await site.step(steps[1], [_click("verify")], entry=False, code_field=False)
+                        await site.step(steps[1], [_click("otp-verify")], entry=False, code_field=False)
                     assert handler.otp_single_dispatch.get() is False and handler.otp_dispatch_effect.get() is None
                 else:
-                    await site.step(steps[1], [_click("verify")], entry=False, code_field=False)
+                    await site.step(steps[1], [_click("otp-verify")], entry=False, code_field=False)
                 assert await site.count("verifyClicks") == (0 if failure == "before_effect" else 1)
                 # Only a press known not to have landed may run again; no fallback follows a possible press.
-                await site.step(steps[2], [_click("verify")], entry=False, code_field=False)
+                await site.step(steps[2], [_click("otp-verify")], entry=False, code_field=False)
                 assert await site.count("verifyClicks") == 1
                 use = site.context.external_otp_uses[task.task_id]
                 assert use.current_code_hash in use.submitted_code_hashes
@@ -7373,7 +7377,7 @@ async def test_external_otp_browser_only_a_pressed_resend_fetches_once(
                 elif case == "no_delivery":
                     site.deliveries.clear()
                 fetches = _fetched(site)
-                await site.step(steps[1], [_click("help" if case == "help_instead" else "resend")])
+                await site.step(steps[1], [_click("otp-help" if case == "help_instead" else "otp-resend")])
                 assert await site.count("resends") == (1 if case in ("new_code", "old_code_only", "no_delivery") else 0)
                 await site.step(steps[2])
                 if case == "new_code":
@@ -7412,9 +7416,9 @@ async def test_external_otp_browser_remount_new_task_and_seed(monkeypatch: pytes
                     await live_page.evaluate("() => document.querySelector('#help').style.display = 'none'")
                     await live_page.evaluate(
                         "() => document.body.insertAdjacentHTML('beforeend', "
-                        '\'<button unique_id="help2" id="help2">Help</button>\')'
+                        '\'<button unique_id="otp-help-2" id="help2">Help</button>\')'
                     )
-                    await site.step(steps[1], [_click("help2")], entry=False, code_field=False)
+                    await site.step(steps[1], [_click("otp-help-2")], entry=False, code_field=False)
                     await live_page.evaluate(
                         "() => { const f = document.querySelector('#otp-scope'); f.style.display = ''; "
                         "f.querySelectorAll('input[inputmode]').forEach(b => b.replaceWith(b.cloneNode())); }"
@@ -7428,7 +7432,7 @@ async def test_external_otp_browser_remount_new_task_and_seed(monkeypatch: pytes
                         [f"box-{i}" for i in range(6)], 6, "secret", hint_code=_HINT
                     )
                     site.context.totp_codes[f"{task.task_id}_secret"] = _SEED
-                    await site.step(steps[1], [_click("verify")])
+                    await site.step(steps[1], [_click("otp-verify")])
                     assert await site.count("fullEntries") == 1 and await site.count("verifyClicks") == 1
                     assert site.final_status is None and site.next_step is not None
                 else:
@@ -7470,7 +7474,7 @@ async def test_external_otp_browser_cancelled_resend_restores_context_and_keeps_
                 await site.step(steps[0], entry=False)
                 monkeypatch.setattr(handler.ActionHandler, "handle_action", cancelled_press)
                 with pytest.raises(asyncio.CancelledError):
-                    await site.execute(steps[1], [ClickAction(element_id="resend")])
+                    await site.execute(steps[1], [ClickAction(element_id="otp-resend")])
                 assert handler.otp_single_dispatch.get() is False and handler.otp_dispatch_effect.get() is None
                 assert site.context.external_otp_uses[task.task_id].resend_requested_at is not None
         finally:
@@ -7541,12 +7545,12 @@ async def test_external_otp_browser_press_on_a_control_remounted_earlier_in_the_
                     await live_page.wait_for_function("() => window.__submits === 1")
                 # One plan: ticking the checkbox re-renders the widget, so the queued press is remapped by the
                 # executor's stale-target refresh before it runs.
-                await site.step(steps[1], [_click("remember"), _click(press)], entry=False, code_field=False)
+                await site.step(steps[1], [_click("remember"), _click(f"otp-{press}")], entry=False, code_field=False)
                 use = site.context.external_otp_uses[task.task_id]
                 if not resend:
                     assert await site.count("verifyClicks") == 1
                     assert use.current_code_hash in use.submitted_code_hashes
-                    await site.step(steps[2], [_click("verify")], entry=False, code_field=False)
+                    await site.step(steps[2], [_click("otp-verify")], entry=False, code_field=False)
                     assert await site.count("verifyClicks") == 1
                 else:
                     assert await site.count("resends") == 1 and use.resend_requested_at is not None

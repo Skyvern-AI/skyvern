@@ -16287,6 +16287,9 @@ class FileDownloadBlock(BaseTaskBlock, FileDestinationBlock):
     # Parameter 1 of Literal[...] cannot be of type "Any"
     block_type: Literal[BlockType.FILE_DOWNLOAD] = BlockType.FILE_DOWNLOAD  # type: ignore
     download_target: FileDownloadTarget = FileDownloadTarget.WEBSITE
+    sftp_source_path: str | None = None
+
+    TEMPLATABLE_FIELDS: ClassVar[frozenset[str]] = frozenset({"sftp_source_path"})
 
     def get_all_parameters(self, workflow_run_id: str) -> list[PARAMETER_TYPE]:
         parameters = super().get_all_parameters(workflow_run_id)
@@ -16296,9 +16299,13 @@ class FileDownloadBlock(BaseTaskBlock, FileDestinationBlock):
             if destination_param.key not in existing_keys:
                 parameters.append(destination_param)
                 existing_keys.add(destination_param.key)
+        if self.sftp_source_path and workflow_run_context.has_parameter(self.sftp_source_path):
+            source_param = workflow_run_context.get_parameter(self.sftp_source_path)
+            if source_param.key not in existing_keys:
+                parameters.append(source_param)
         return parameters
 
-    async def _register_authenticated_google_drive_download(
+    async def _register_authenticated_download(
         self,
         *,
         organization_id: str,
@@ -16314,9 +16321,9 @@ class FileDownloadBlock(BaseTaskBlock, FileDestinationBlock):
                     organization_id=organization_id,
                     run_id=run_download_id,
                 )
-        except asyncio.TimeoutError:
+        except TimeoutError:
             LOG.warning(
-                "Timeout saving authenticated Google Drive download; workflow finalization will retry",
+                "Timeout saving direct file download; workflow finalization will retry",
                 workflow_run_id=workflow_run_id,
                 workflow_run_block_id=workflow_run_block_id,
             )
@@ -16324,17 +16331,16 @@ class FileDownloadBlock(BaseTaskBlock, FileDestinationBlock):
         except DownloadSaveIncompleteError as exc:
             skipped_files = set(exc.skipped_files)
             LOG.warning(
-                "Storage partially saved authenticated Google Drive download; workflow finalization will retry",
+                "Storage partially saved direct file download; workflow finalization will retry",
                 workflow_run_id=workflow_run_id,
                 workflow_run_block_id=workflow_run_block_id,
                 skipped_file_count=len(skipped_files),
             )
-        except Exception:
+        except Exception:  # noqa: BLE001 -- workflow finalization retries registration failures.
             LOG.warning(
-                "Failed to save authenticated Google Drive download; workflow finalization will retry",
+                "Failed to save direct file download; workflow finalization will retry",
                 workflow_run_id=workflow_run_id,
                 workflow_run_block_id=workflow_run_block_id,
-                exc_info=True,
             )
             return None
 
@@ -16344,22 +16350,37 @@ class FileDownloadBlock(BaseTaskBlock, FileDestinationBlock):
                     organization_id=organization_id,
                     run_id=run_download_id,
                 )
-        except asyncio.TimeoutError:
+        except TimeoutError:
             LOG.warning(
-                "Timeout reading back authenticated Google Drive download",
+                "Timeout reading back direct file download",
                 workflow_run_id=workflow_run_id,
                 workflow_run_block_id=workflow_run_block_id,
             )
             return None
-        except Exception:
+        except Exception:  # noqa: BLE001 -- workflow finalization retries registration failures.
             LOG.warning(
-                "Failed to read back authenticated Google Drive download",
+                "Failed to read back direct file download",
                 workflow_run_id=workflow_run_id,
                 workflow_run_block_id=workflow_run_block_id,
-                exc_info=True,
             )
             return None
         return None if filename in skipped_files else downloaded_files
+
+    @staticmethod
+    def _matching_authenticated_download(
+        file_path: str,
+        downloaded_files: list[FileInfo] | None,
+    ) -> list[FileInfo] | None:
+        if downloaded_files is None:
+            return None
+        filename = Path(file_path).name
+        checksum = calculate_sha256_for_file(file_path)
+        filename_matches = [file_info for file_info in downloaded_files if file_info.filename == filename]
+        checksum_matches = [file_info for file_info in filename_matches if file_info.checksum == checksum]
+        if checksum_matches:
+            return checksum_matches
+        checksumless_matches = [file_info for file_info in filename_matches if file_info.checksum is None]
+        return checksumless_matches if len(checksumless_matches) == 1 else []
 
     async def _download_authenticated_google_drive_source(
         self,
@@ -16424,24 +16445,14 @@ class FileDownloadBlock(BaseTaskBlock, FileDestinationBlock):
             )
             return None
 
-        downloaded_files = await self._register_authenticated_google_drive_download(
+        downloaded_files = await self._register_authenticated_download(
             organization_id=org_id,
             workflow_run_id=workflow_run_id,
             workflow_run_block_id=workflow_run_block_id,
             run_download_id=run_download_id,
             filename=Path(file_path).name,
         )
-        filename = Path(file_path).name
-        matching_files: list[FileInfo] | None = None
-        if downloaded_files is not None:
-            checksum = calculate_sha256_for_file(file_path)
-            filename_matches = [file_info for file_info in downloaded_files if file_info.filename == filename]
-            checksum_matches = [file_info for file_info in filename_matches if file_info.checksum == checksum]
-            if checksum_matches:
-                matching_files = checksum_matches
-            else:
-                checksumless_matches = [file_info for file_info in filename_matches if file_info.checksum is None]
-                matching_files = checksumless_matches if len(checksumless_matches) == 1 else []
+        matching_files = self._matching_authenticated_download(file_path, downloaded_files)
         if matching_files == []:
             raise RuntimeError(DOWNLOAD_BINDING_FAILURE_REASON)
         return (
@@ -16449,6 +16460,131 @@ class FileDownloadBlock(BaseTaskBlock, FileDestinationBlock):
             matching_files[:1] if matching_files is not None else None,
             google_credentials.token,
         )
+
+    async def _download_authenticated_sftp_source(
+        self,
+        *,
+        workflow_run_context: WorkflowRunContext,
+        organization_id: str | None,
+        workflow_run_id: str,
+        run_download_id: str,
+        workflow_run_block_id: str,
+        download_files_path: str,
+    ) -> tuple[str, list[FileInfo], None]:
+        category = sftp_service.SFTPDownloadErrorCategory.CONFIGURATION
+        byte_count = 0
+        succeeded = False
+        started_at = monotonic()
+        org_id = organization_id or workflow_run_context.organization_id
+        try:
+            if not org_id:
+                raise sftp_service.SFTPDownloadError(sftp_service.SFTPDownloadErrorCategory.CONFIGURATION)
+
+            def render(field: str, value: str | None) -> str | None:
+                if not value:
+                    return value
+                return self.render_templatable_field(field, value, workflow_run_context)
+
+            host = _resolve_block_secret_reference(workflow_run_context, render("sftp_host", self.sftp_host))
+            remote_path = _resolve_block_secret_reference(
+                workflow_run_context,
+                render("sftp_source_path", self.sftp_source_path),
+            )
+            username = _resolve_block_secret_reference(
+                workflow_run_context,
+                render("sftp_username", self.sftp_username),
+            )
+            host_key = _resolve_block_secret_reference(
+                workflow_run_context,
+                render("sftp_host_key", self.sftp_host_key),
+            )
+            password = await _resolve_sensitive_block_secret(
+                workflow_run_context,
+                render("sftp_password", self.sftp_password),
+                "sftp_password",
+            )
+            private_key = await _resolve_sensitive_block_secret(
+                workflow_run_context,
+                render("sftp_private_key", self.sftp_private_key),
+                "sftp_private_key",
+            )
+            passphrase = await _resolve_sensitive_block_secret(
+                workflow_run_context,
+                render("sftp_private_key_passphrase", self.sftp_private_key_passphrase),
+                "sftp_private_key_passphrase",
+            )
+            if (
+                not host
+                or not host.strip()
+                or not remote_path
+                or not remote_path.strip()
+                or not username
+                or not username.strip()
+                or not (password or private_key)
+            ):
+                raise sftp_service.SFTPDownloadError(sftp_service.SFTPDownloadErrorCategory.CONFIGURATION)
+
+            category = sftp_service.SFTPDownloadErrorCategory.TRANSFER_FAILED
+            file_path = await sftp_service.download_file(
+                output_dir=download_files_path,
+                remote_path=remote_path,
+                host=host,
+                port=22 if self.sftp_port is None else self.sftp_port,
+                username=username,
+                password=password,
+                private_key=private_key,
+                private_key_passphrase=passphrase,
+                host_key=host_key,
+            )
+            byte_count = os.path.getsize(file_path)
+            registered_files = await self._register_authenticated_download(
+                organization_id=org_id,
+                workflow_run_id=workflow_run_id,
+                workflow_run_block_id=workflow_run_block_id,
+                run_download_id=run_download_id,
+                filename=Path(file_path).name,
+            )
+            matching_files = self._matching_authenticated_download(file_path, registered_files)
+            if not matching_files:
+                raise sftp_service.SFTPDownloadError(
+                    sftp_service.SFTPDownloadErrorCategory.REGISTRATION_FAILED,
+                    bytes_transferred=byte_count,
+                )
+            LOG.info(
+                "FileDownloadBlock SFTP source completed",
+                organization_id=org_id,
+                workflow_run_id=workflow_run_id,
+                workflow_run_block_id=workflow_run_block_id,
+                outcome="success",
+                error_category=None,
+                byte_count=byte_count,
+                duration_ms=int((monotonic() - started_at) * 1000),
+            )
+            succeeded = True
+            return file_path, matching_files, None
+        except sftp_service.SFTPDownloadError as exc:
+            category = exc.category
+            byte_count = exc.bytes_transferred or byte_count
+            raise
+        except Exception as exc:
+            raise sftp_service.SFTPDownloadError(category, byte_count) from exc
+        finally:
+            if not succeeded:
+                with contained_effect(
+                    "SFTP source failure log",
+                    workflow_run_id=workflow_run_id,
+                    workflow_run_block_id=workflow_run_block_id,
+                ):
+                    LOG.warning(
+                        "FileDownloadBlock SFTP source failed",
+                        organization_id=org_id,
+                        workflow_run_id=workflow_run_id,
+                        workflow_run_block_id=workflow_run_block_id,
+                        outcome="failure",
+                        error_category=category.value,
+                        byte_count=byte_count,
+                        duration_ms=int((monotonic() - started_at) * 1000),
+                    )
 
     async def execute(
         self,
@@ -16461,11 +16597,21 @@ class FileDownloadBlock(BaseTaskBlock, FileDestinationBlock):
         download_files_path = ""
         run_download_id = workflow_run_id
         direct_google_access_token: str | None = None
+        attempt_started_at: datetime | None = None
         baseline_unknown = False
         pre_names: set[str] = set()
         pre_hashes: dict[str, str] = {}
         pre_mtimes: dict[str, int] = {}
         colliding_normalized_names: set[str] = set()
+        if self.sftp_source_path and self.download_target == FileDownloadTarget.WEBSITE:
+            early_context = self.get_workflow_run_context(workflow_run_id)
+            context = skyvern_context.current()
+            run_download_id = resolve_run_download_id(context, fallback_run_id=workflow_run_id) or workflow_run_id
+            download_files_path = str(get_path_for_workflow_download_directory(run_download_id).absolute())
+            attempt_started_at = await get_download_retry_started_at(
+                organization_id or early_context.organization_id,
+                run_download_id,
+            )
         if self.download_target != FileDownloadTarget.WEBSITE:
             # Fail fast on a misconfigured destination before running the (expensive) browser
             # download, so a missing required field does not waste a download that cannot be delivered.
@@ -16538,8 +16684,29 @@ class FileDownloadBlock(BaseTaskBlock, FileDestinationBlock):
                     organization_id=organization_id,
                 )
 
-        direct_download: tuple[str, list[FileInfo] | None, str] | None = None
-        if self.download_target != FileDownloadTarget.WEBSITE:
+        direct_download: tuple[str, list[FileInfo] | None, str | None] | None = None
+        if self.sftp_source_path:
+            workflow_run_context = self.get_workflow_run_context(workflow_run_id)
+            try:
+                direct_download = await self._download_authenticated_sftp_source(
+                    workflow_run_context=workflow_run_context,
+                    organization_id=organization_id,
+                    workflow_run_id=workflow_run_id,
+                    run_download_id=run_download_id,
+                    workflow_run_block_id=workflow_run_block_id,
+                    download_files_path=download_files_path,
+                )
+            except sftp_service.SFTPDownloadError as exc:
+                await self.record_output_parameter_value(workflow_run_context, workflow_run_id, None)
+                return await self.build_block_result(
+                    success=False,
+                    failure_reason=f"Failed to download file from SFTP: {exc.category.value}",
+                    output_parameter_value=None,
+                    status=BlockStatus.failed,
+                    workflow_run_block_id=workflow_run_block_id,
+                    organization_id=organization_id,
+                )
+        elif self.download_target != FileDownloadTarget.WEBSITE:
             workflow_run_context = self.get_workflow_run_context(workflow_run_id)
             try:
                 direct_download = await self._download_authenticated_google_drive_source(
@@ -16598,6 +16765,9 @@ class FileDownloadBlock(BaseTaskBlock, FileDestinationBlock):
                 workflow_run_block_id=workflow_run_block_id,
                 organization_id=organization_id,
             )
+
+        if self.download_target == FileDownloadTarget.WEBSITE:
+            return result
 
         storage_type = FileStorageType(self.download_target.value)
         workflow_run_context = self.get_workflow_run_context(workflow_run_id)

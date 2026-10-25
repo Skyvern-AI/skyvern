@@ -37,6 +37,7 @@ export type FileDownloadNodeData = NodeBaseData & {
   sftpPrivateKeyPassphrase: string | null;
   sftpRemotePath: string | null;
   sftpHostKey: string | null;
+  sftpSourcePath: string | null;
   continueOnEmpty: boolean;
 };
 
@@ -81,6 +82,7 @@ export const fileDownloadNodeDefaultData: FileDownloadNodeData = {
   sftpPrivateKeyPassphrase: null,
   sftpRemotePath: null,
   sftpHostKey: null,
+  sftpSourcePath: null,
   continueOnEmpty: false,
   ignoreWorkflowSystemPrompt: false,
 } as const;

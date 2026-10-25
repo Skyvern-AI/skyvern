@@ -83,7 +83,7 @@ import { useParameterExpansion } from "./hooks/useParameterExpansion";
 import { ParameterDisplayInline } from "./components/ParameterDisplayInline";
 import { getOrderedRunParameters } from "./utils";
 import { buildWorkflowAnalyticsPath } from "./workflowAnalyticsPath";
-import { useFeatureFlagVariantKey } from "posthog-js/react";
+import { usePostHogFeatureFlagVariantKey as useFeatureFlagVariantKey } from "@/hooks/usePostHogFeatureFlag";
 import { EXPERIMENT, isABVariant } from "@/util/onboarding/experimentConfig";
 import { useAnalyticsDashboardFlag } from "@/hooks/useAnalyticsDashboardFlag";
 import {

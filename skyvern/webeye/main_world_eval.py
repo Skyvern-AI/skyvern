@@ -10,14 +10,53 @@ the prefix intact. With no prefix configured the call falls through to
 from __future__ import annotations
 
 import contextlib
+import functools
+import inspect
 import json
 import re
+import sys
 import weakref
+from collections.abc import Awaitable, Callable
 from typing import Any
 
 from playwright.async_api import BrowserContext, Page
 
 _CONTEXT_PREFIXES: weakref.WeakKeyDictionary[BrowserContext, str] = weakref.WeakKeyDictionary()
+
+_MAIN_WORLD_DEFAULT_METHODS: dict[str, tuple[str, ...]] = {
+    "Page": ("evaluate", "evaluate_handle"),
+    "Frame": ("evaluate", "evaluate_handle"),
+    "Worker": ("evaluate", "evaluate_handle"),
+    "Locator": ("evaluate", "evaluate_handle", "evaluate_all"),
+}
+_MAIN_WORLD_DEFAULT_WRAPPERS: set[Callable[..., Awaitable[Any]]] = set()
+
+
+def _with_main_world_default(method: Callable[..., Awaitable[Any]]) -> Callable[..., Awaitable[Any]]:
+    @functools.wraps(method)
+    async def evaluate(self: Any, *args: Any, isolated_context: bool = False, **kwargs: Any) -> Any:
+        return await method(self, *args, isolated_context=isolated_context, **kwargs)
+
+    _MAIN_WORLD_DEFAULT_WRAPPERS.add(evaluate)
+    return evaluate
+
+
+def default_evaluate_to_main_world(driver: Any) -> None:
+    """Make the driver's ``evaluate`` family default to the page's main world. Idempotent."""
+    # Some drivers default these to an isolated world that cannot see page globals or init-script state
+    # unless the caller passes ``isolated_context=False``; drivers without that parameter use the main world.
+    api = sys.modules.get(type(driver).__module__)
+    for class_name, method_names in _MAIN_WORLD_DEFAULT_METHODS.items():
+        cls = getattr(api, class_name, None)
+        if not isinstance(cls, type):
+            continue
+        for method_name in method_names:
+            method = cls.__dict__.get(method_name)
+            if not callable(method) or method in _MAIN_WORLD_DEFAULT_WRAPPERS:
+                continue
+            if "isolated_context" not in inspect.signature(method).parameters:
+                continue
+            setattr(cls, method_name, _with_main_world_default(method))
 
 
 def configure_main_world_prefix(context: BrowserContext, prefix: str) -> None:

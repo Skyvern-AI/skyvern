@@ -5,11 +5,12 @@ import type { Connect, Plugin } from "vite";
 import react from "@vitejs/plugin-react-swc";
 
 import {
-  createOidcRuntimeConfigHandler,
+  createRuntimeConfigHandler,
   createUiSessionHandler,
   createUiSessionNonceManager,
   issueUiSessionNonceCookie,
   resolveOidcRuntimeConfig,
+  resolvePostHogRuntimeConfig,
 } from "./localServer.js";
 import { resolveAppVersion } from "./scripts/app-version.mjs";
 
@@ -60,8 +61,11 @@ export function createUiSessionDevPlugin({
     requestTimeoutMs,
     nonceManager,
   });
-  const serveOidcRuntimeConfig = createOidcRuntimeConfigHandler(
+  const serveOidcRuntimeConfig = createRuntimeConfigHandler(
     resolveOidcRuntimeConfig(env),
+  );
+  const servePostHogRuntimeConfig = createRuntimeConfigHandler(
+    resolvePostHogRuntimeConfig(env),
   );
 
   const middleware: Connect.NextHandleFunction = async (request, response) => {
@@ -72,6 +76,12 @@ export function createUiSessionDevPlugin({
     response,
   ) => {
     await serveOidcRuntimeConfig(request, response);
+  };
+  const postHogConfigMiddleware: Connect.NextHandleFunction = async (
+    request,
+    response,
+  ) => {
+    await servePostHogRuntimeConfig(request, response);
   };
 
   return {
@@ -84,6 +94,7 @@ export function createUiSessionDevPlugin({
       });
       server.middlewares.use("/ui-session", middleware);
       server.middlewares.use("/oidc-config", oidcConfigMiddleware);
+      server.middlewares.use("/posthog-config", postHogConfigMiddleware);
     },
   };
 }

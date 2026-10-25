@@ -134,6 +134,7 @@ function FileDownloadEditorBody({
     sftpPrivateKeyPassphrase,
     sftpRemotePath,
     sftpHostKey,
+    sftpSourcePath,
   } = data;
 
   const nodes = useNodes<AppNode>();
@@ -149,12 +150,14 @@ function FileDownloadEditorBody({
   const parentLoopSkipsOnFail = getParentLoopSkipsOnFail(nodes, blockId);
   const update = useUpdate<FileDownloadNodeData>({ id: blockId, editable });
   const hasInteracted = useHasInteractedThisSession();
+  const hasSftpSource = Boolean(sftpSourcePath);
   const credentialTotpIdentifier = useSelectedCredentialTotpIdentifier(
     parameterKeys.length > 0 ? parameterKeys[0] : undefined,
   );
   // Keep an already-selected account editable even once the URL stops looking like a
   // Drive link, so the field never disappears with a value still attached to the block.
   const showGoogleDriveSourceAccount =
+    !hasSftpSource &&
     downloadTarget !== "website" &&
     downloadTarget !== "google_drive" &&
     (urlMayBeGoogleDrive(url) || Boolean(googleCredentialId));
@@ -165,7 +168,13 @@ function FileDownloadEditorBody({
         <div className="space-y-2">
           <div className="flex gap-2">
             <Label className="text-xs text-tertiary-foreground">URL</Label>
-            <HelpTooltip content={urlTooltip} />
+            <HelpTooltip
+              content={
+                hasSftpSource
+                  ? "A URL is not required when reading a file from SFTP."
+                  : urlTooltip
+              }
+            />
           </div>
           <WorkflowBlockInputTextarea
             name="url"
@@ -189,6 +198,7 @@ function FileDownloadEditorBody({
             </p>
           ) : (
             isFirstBrowserTask &&
+            !hasSftpSource &&
             !url.trim() && (
               <p className="text-xs text-amber-700 dark:text-amber-400">
                 Nothing runs before this block, so it needs a URL to start from.
@@ -196,54 +206,84 @@ function FileDownloadEditorBody({
             )
           )}
         </div>
-        <div className="space-y-2">
-          <div className="flex gap-2">
-            <Label className="text-xs text-tertiary-foreground">
-              Download Goal
-            </Label>
-            <HelpTooltip content={navigationGoalTooltip} />
-          </div>
-          <WorkflowBlockInputTextarea
-            name="navigationGoal"
-            aiImprove={AI_IMPROVE_CONFIGS.fileDownload.navigationGoal}
-            nodeId={blockId}
-            onChange={(next) => update({ navigationGoal: next })}
-            value={navigationGoal}
-            placeholder={navigationGoalPlaceholder}
-            className="nopan text-xs"
-          />
-        </div>
-        <div className="space-y-2">
-          <div className="flex items-center gap-2">
-            <Label className="text-xs text-tertiary-foreground">
-              Download Timeout (sec)
-            </Label>
-            <HelpTooltip
-              content={`The maximum time to wait for downloads to complete, in seconds. If not set, defaults to ${BROWSER_DOWNLOAD_TIMEOUT_SECONDS} seconds.`}
-            />
-            <Input
-              className="ml-auto w-16 text-right"
-              type="number"
-              min={1}
-              value={downloadTimeout ?? ""}
-              placeholder={`${BROWSER_DOWNLOAD_TIMEOUT_SECONDS}`}
-              onChange={(event) => {
-                // Empty input clears the override; numeric inputs land
-                // verbatim. The previous `if (next) { update(...) }`
-                // silently dropped `0`, so a user typing "0" thinking
-                // "no timeout" got no save and no feedback.
-                if (event.target.value === "") {
-                  update({ downloadTimeout: null });
-                  return;
-                }
-                const next = Number(event.target.value);
-                if (Number.isFinite(next) && next >= 0) {
-                  update({ downloadTimeout: next });
-                }
-              }}
-            />
-          </div>
-        </div>
+        <Accordion
+          type="single"
+          collapsible
+          defaultValue={hasSftpSource ? "sftp-source" : undefined}
+        >
+          <AccordionItem value="sftp-source" className="border-b-0">
+            <AccordionTrigger className="py-0">
+              Read from SFTP (Optional)
+            </AccordionTrigger>
+            <AccordionContent className="pt-2">
+              <DestinationField
+                label="SFTP Source Path"
+                help="The file path to read from the SFTP server. Setting this path uses SFTP as the source instead of a browser URL."
+              >
+                <WorkflowBlockInputTextarea
+                  name="sftpSourcePath"
+                  nodeId={blockId}
+                  onChange={(value) => update({ sftpSourcePath: value })}
+                  value={sftpSourcePath ?? ""}
+                  placeholder="/path/to/file"
+                  className="nopan text-xs"
+                />
+              </DestinationField>
+            </AccordionContent>
+          </AccordionItem>
+        </Accordion>
+        {!hasSftpSource && (
+          <>
+            <div className="space-y-2">
+              <div className="flex gap-2">
+                <Label className="text-xs text-tertiary-foreground">
+                  Download Goal
+                </Label>
+                <HelpTooltip content={navigationGoalTooltip} />
+              </div>
+              <WorkflowBlockInputTextarea
+                name="navigationGoal"
+                aiImprove={AI_IMPROVE_CONFIGS.fileDownload.navigationGoal}
+                nodeId={blockId}
+                onChange={(next) => update({ navigationGoal: next })}
+                value={navigationGoal}
+                placeholder={navigationGoalPlaceholder}
+                className="nopan text-xs"
+              />
+            </div>
+            <div className="space-y-2">
+              <div className="flex items-center gap-2">
+                <Label className="text-xs text-tertiary-foreground">
+                  Download Timeout (sec)
+                </Label>
+                <HelpTooltip
+                  content={`The maximum time to wait for downloads to complete, in seconds. If not set, defaults to ${BROWSER_DOWNLOAD_TIMEOUT_SECONDS} seconds.`}
+                />
+                <Input
+                  className="ml-auto w-16 text-right"
+                  type="number"
+                  min={1}
+                  value={downloadTimeout ?? ""}
+                  placeholder={`${BROWSER_DOWNLOAD_TIMEOUT_SECONDS}`}
+                  onChange={(event) => {
+                    // Empty input clears the override; numeric inputs land
+                    // verbatim. The previous `if (next) { update(...) }`
+                    // silently dropped `0`, so a user typing "0" thinking
+                    // "no timeout" got no save and no feedback.
+                    if (event.target.value === "") {
+                      update({ downloadTimeout: null });
+                      return;
+                    }
+                    const next = Number(event.target.value);
+                    if (Number.isFinite(next) && next >= 0) {
+                      update({ downloadTimeout: next });
+                    }
+                  }}
+                />
+              </div>
+            </div>
+          </>
+        )}
 
         <div className="space-y-2">
           <div className="flex items-center gap-2">
@@ -441,11 +481,23 @@ function FileDownloadEditorBody({
           </>
         )}
 
-        {downloadTarget === "sftp" && (
+        {(downloadTarget === "sftp" || hasSftpSource) && (
           <>
             <DestinationField
-              label="SFTP Host"
-              help="The SFTP host to upload files to."
+              label={
+                hasSftpSource
+                  ? downloadTarget === "sftp"
+                    ? "SFTP Host (Source and Destination)"
+                    : "SFTP Host (Source)"
+                  : "SFTP Host"
+              }
+              help={
+                hasSftpSource
+                  ? downloadTarget === "sftp"
+                    ? "The SFTP host used to read the source file and upload files to the destination."
+                    : "The SFTP host to read files from."
+                  : "The SFTP host to upload files to."
+              }
             >
               <WorkflowBlockInputTextarea
                 name="sftpHost"
@@ -518,25 +570,36 @@ function FileDownloadEditorBody({
                 className="nopan text-xs"
               />
             </DestinationField>
+            {downloadTarget === "sftp" && (
+              <DestinationField
+                label="(Optional) Remote Directory"
+                help="Remote directory to upload into. Created if it does not exist. Defaults to the login directory."
+              >
+                <WorkflowBlockInputTextarea
+                  name="sftpRemotePath"
+                  nodeId={blockId}
+                  onChange={(value) => update({ sftpRemotePath: value })}
+                  value={sftpRemotePath ?? ""}
+                  className="nopan text-xs"
+                />
+              </DestinationField>
+            )}
             <DestinationField
-              label="(Optional) Remote Directory"
-              help="Remote directory to upload into. Created if it does not exist. Defaults to the login directory."
-            >
-              <WorkflowBlockInputTextarea
-                name="sftpRemotePath"
-                nodeId={blockId}
-                onChange={(value) => update({ sftpRemotePath: value })}
-                value={sftpRemotePath ?? ""}
-                className="nopan text-xs"
-              />
-            </DestinationField>
-            <DestinationField
-              label="(Optional) Host Key"
-              help="If blank, the server's host key is NOT verified and the connection can be intercepted (MITM). Pin a host key (e.g. 'ssh-ed25519 AAAA...') for untrusted networks."
+              label={
+                hasSftpSource
+                  ? "Host Key (Required for SFTP source)"
+                  : "(Optional) Host Key"
+              }
+              help={
+                hasSftpSource
+                  ? "Required when reading from SFTP. Pin the server's host key (e.g. 'ssh-ed25519 AAAA...') so the connection can be verified."
+                  : "If blank, the server's host key is NOT verified and the connection can be intercepted (MITM). Pin a host key (e.g. 'ssh-ed25519 AAAA...') for untrusted networks."
+              }
             >
               <WorkflowBlockInputTextarea
                 name="sftpHostKey"
                 nodeId={blockId}
+                aria-required={hasSftpSource}
                 onChange={(value) => update({ sftpHostKey: value })}
                 value={sftpHostKey ?? ""}
                 className="nopan text-xs"
