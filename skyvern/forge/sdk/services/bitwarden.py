@@ -29,6 +29,7 @@ from skyvern.exceptions import (
     BitwardenCreateCollectionError,
     BitwardenCreateCreditCardItemError,
     BitwardenCreateLoginItemError,
+    BitwardenCredentialsRejectedError,
     BitwardenGetItemError,
     BitwardenListItemsError,
     BitwardenLoginError,
@@ -118,6 +119,24 @@ _USER_KEY_ID_BACKFILL_ADVISORY = re.compile(
     r"needs migration: KeyIdBackfillError: User key is not available in key store$",
     re.IGNORECASE,
 )
+
+# How `bw login` reports the server rejecting the account's credentials, as opposed to not answering: the
+# email-login message CLI 2026.x prints, the server wording older CLIs passed through, and the API-key message.
+_REJECTED_CREDENTIALS_MARKERS = (
+    "invalid master password.",
+    "username or password is incorrect.",
+    "client_id or client_secret is incorrect.",
+)
+
+
+def _login_failure(stderr: str) -> BitwardenLoginError:
+    lowered = stderr.lower()
+    error_class = (
+        BitwardenCredentialsRejectedError
+        if any(marker in lowered for marker in _REJECTED_CREDENTIALS_MARKERS)
+        else BitwardenLoginError
+    )
+    return error_class(f"Failed to log in. stderr: {stderr}")
 
 
 def _contains_decryption_failure(value: Any) -> bool:
@@ -1583,10 +1602,10 @@ class BitwardenService:
         # Never quote stdout in an error: a successful email login prints the vault session key there,
         # even when stderr carries something unexpected.
         if login_result.stdout and "You are logged in!" not in login_result.stdout:
-            raise BitwardenLoginError(f"Failed to log in. stderr: {login_result.stderr}")
+            raise _login_failure(login_result.stderr)
 
         if login_result.stderr and not BitwardenService._is_ignorable_login_stderr(login_result.stderr):
-            raise BitwardenLoginError(f"Failed to log in. stderr: {login_result.stderr}")
+            raise _login_failure(login_result.stderr)
 
         LOG.info("Bitwarden login successful")
         return BitwardenService._extract_session_key(login_result.stdout)
