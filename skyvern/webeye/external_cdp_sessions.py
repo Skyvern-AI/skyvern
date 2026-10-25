@@ -35,6 +35,7 @@ from skyvern.utils.url_validators import (
 from skyvern.webeye.browser_artifacts import BrowserArtifacts
 from skyvern.webeye.cdp_discovery import resolve_websocket_url
 from skyvern.webeye.cdp_download_interceptor import CDPDownloadInterceptor, bind_download_interceptor_to_context
+from skyvern.webeye.main_world_eval import default_evaluate_to_main_world
 from skyvern.webeye.persistent_sessions_manager import PersistentSessionsManager
 from skyvern.webeye.real_browser_state import RealBrowserState
 
@@ -238,6 +239,7 @@ async def connect_external_cdp_browser(cdp_url: str) -> RealBrowserState:
             if ws_url != cdp_url:
                 await check_external_cdp_address(ws_url)
             pw = await async_playwright().start()
+            default_evaluate_to_main_world(pw)
             browser = await pw.chromium.connect_over_cdp(ws_url, timeout=EXTERNAL_CDP_CONNECT_TIMEOUT_MS)
     except (BlockedHost, ExternalBrowserEndpointNotEncrypted):
         if pw is not None:

@@ -69,6 +69,7 @@ from skyvern.webeye.driver_connection import (
     driver_transport_error_future,
     kill_driver_process,
 )
+from skyvern.webeye.main_world_eval import default_evaluate_to_main_world
 from skyvern.webeye.navigation import driver_nav_error_code, is_permanent_navigation_error, navigate_with_retry
 from skyvern.webeye.scraper import scraper
 from skyvern.webeye.scraper.scraped_page import CleanupElementTreeFunc, ScrapedPage, ScrapeExcludeFunc
@@ -1783,6 +1784,7 @@ class RealBrowserState(BrowserState):
             else:
                 fresh_pw = await async_playwright().start()
                 close_driver_connection_on_transport_loss(fresh_pw)
+                default_evaluate_to_main_world(fresh_pw)
         except BaseException:
             stale_diagnostic = self._browser_state_diagnostic
             stale_deferred_runtime_end = self._deferred_runtime_end
