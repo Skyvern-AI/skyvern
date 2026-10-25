@@ -1,5 +1,6 @@
 import asyncio
 import io
+import threading
 import zipfile
 from datetime import datetime
 from types import SimpleNamespace
@@ -157,3 +158,60 @@ async def test_a_background_turn_flush_against_a_stalled_store_ends_at_its_deadl
     await asyncio.wait_for(asyncio.gather(*manager._background_flushes), timeout=5)
 
     assert manager._background_flushes == set()
+
+
+@pytest.mark.asyncio
+async def test_archive_zips_are_built_off_the_event_loop_with_unchanged_bytes(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    manager = ArtifactManager()
+    turn = _step("stp_turn_1", 1)
+    manager.accumulate_llm_call_to_archive(step=turn, request=b"request")
+    page = b"<html>" + b"<p>row</p>" * 5000 + b"</html>"
+    manager.accumulate_html_scrape_to_archive(turn, page)
+
+    stored: list[tuple[ArtifactType, bytes]] = []
+    build_threads: list[int] = []
+    build_zip = ArtifactManager._build_zip
+
+    def _recording_build_zip(entries: dict[str, bytes]) -> bytes:
+        build_threads.append(threading.get_ident())
+        return build_zip(entries)
+
+    async def _store(artifact: Any, data: bytes) -> None:
+        stored.append((artifact.artifact_type, data))
+
+    async def _bulk_create(models: list[Any]) -> list[Any]:
+        return models
+
+    monkeypatch.setattr(ArtifactManager, "_build_zip", staticmethod(_recording_build_zip))
+    monkeypatch.setattr("skyvern.forge.sdk.artifact.manager._bundling_enabled", lambda: True)
+    monkeypatch.setattr(
+        "skyvern.forge.sdk.artifact.manager.app.STORAGE",
+        SimpleNamespace(build_uri=lambda **kwargs: f"s3://artifacts/{kwargs['artifact_id']}", store_artifact=_store),
+    )
+    monkeypatch.setattr("skyvern.forge.sdk.artifact.manager.app.DATABASE.artifacts.bulk_create_artifacts", _bulk_create)
+
+    await manager.flush_step_archive(turn.step_id)
+    await manager.create_task_archive(
+        step=turn,
+        entries={
+            "browser_console.log": (ArtifactType.BROWSER_CONSOLE_LOG, b"console line"),
+            "trace.zip": (ArtifactType.TRACE, b"PK trace"),
+        },
+        workflow_run_id="wr_archive",
+    )
+
+    loop_thread = threading.get_ident()
+    assert [artifact_type for artifact_type, _ in stored] == [ArtifactType.STEP_ARCHIVE, ArtifactType.TASK_ARCHIVE]
+    assert len(build_threads) == 2 and loop_thread not in build_threads
+    # Same bytes as building on the loop: member names, order and compress types are unchanged.
+    assert [data for _, data in stored] == [
+        build_zip({"llm_request_0.json": b"request", "scrape.html": page}),
+        build_zip({"browser_console.log": b"console line", "trace.zip": b"PK trace"}),
+    ]
+    with zipfile.ZipFile(io.BytesIO(stored[1][1])) as zf:
+        assert [(info.filename, info.compress_type) for info in zf.infolist()] == [
+            ("browser_console.log", zipfile.ZIP_DEFLATED),
+            ("trace.zip", zipfile.ZIP_STORED),
+        ]
