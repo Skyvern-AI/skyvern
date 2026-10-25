@@ -43,6 +43,13 @@ function resolveOidcRuntimeConfig(env = process.env) {
   };
 }
 
+function resolvePostHogRuntimeConfig(env = process.env) {
+  return {
+    api_key: env.POSTHOG_KEY?.trim() || "",
+    api_host: env.POSTHOG_HOST?.trim() || "",
+  };
+}
+
 function isLoopbackUrl(value) {
   try {
     return LOOPBACK_HOSTNAMES.has(new URL(value).hostname);
@@ -108,6 +115,7 @@ function resolveLocalServerConfiguration({
     apiBaseUrl: resolveServerApiBaseUrl(env),
     organizationApiKey: resolveOrganizationApiKey(env),
     oidcConfig: resolveOidcRuntimeConfig(env),
+    postHogConfig: resolvePostHogRuntimeConfig(env),
   };
 }
 
@@ -121,13 +129,13 @@ function sendJson(response, statusCode, payload) {
   response.end(body);
 }
 
-function createOidcRuntimeConfigHandler(oidcConfig) {
+function createRuntimeConfigHandler(config) {
   return async (request, response) => {
     if (request.method !== "GET") {
       sendJson(response, 405, { detail: "Method not allowed" });
       return;
     }
-    sendJson(response, 200, oidcConfig);
+    sendJson(response, 200, config);
   };
 }
 
@@ -390,6 +398,7 @@ function createLocalServer({
   apiBaseUrl = resolveServerApiBaseUrl(env),
   organizationApiKey = resolveOrganizationApiKey(env),
   oidcConfig = resolveOidcRuntimeConfig(env),
+  postHogConfig = resolvePostHogRuntimeConfig(env),
   fetchImpl = fetch,
   logger = console,
   requestTimeoutMs = UI_SESSION_REQUEST_TIMEOUT_MS,
@@ -403,12 +412,17 @@ function createLocalServer({
     requestTimeoutMs,
     nonceManager,
   });
-  const serveOidcRuntimeConfig = createOidcRuntimeConfigHandler(oidcConfig);
+  const serveOidcRuntimeConfig = createRuntimeConfigHandler(oidcConfig);
+  const servePostHogRuntimeConfig = createRuntimeConfigHandler(postHogConfig);
 
   return createServer(async (request, response) => {
     const requestUrl = new URL(request.url || "/", "http://localhost");
     if (requestUrl.pathname === "/oidc-config") {
       await serveOidcRuntimeConfig(request, response);
+      return;
+    }
+    if (requestUrl.pathname === "/posthog-config") {
+      await servePostHogRuntimeConfig(request, response);
       return;
     }
     if (requestUrl.pathname === "/ui-session") {
@@ -430,7 +444,7 @@ function createLocalServer({
 }
 
 function startLocalServer() {
-  const { apiBaseUrl, organizationApiKey, oidcConfig } =
+  const { apiBaseUrl, organizationApiKey, oidcConfig, postHogConfig } =
     resolveLocalServerConfiguration();
   if (organizationApiKey) {
     console.log("UI session minting is configured");
@@ -441,6 +455,7 @@ function startLocalServer() {
     apiBaseUrl,
     organizationApiKey,
     oidcConfig,
+    postHogConfig,
   });
   server.listen(8080, async () => {
     console.log("Running at http://localhost:8080");
@@ -461,13 +476,14 @@ if (isMainModule) {
 }
 
 export {
-  createOidcRuntimeConfigHandler,
   createLocalServer,
+  createRuntimeConfigHandler,
   createUiSessionHandler,
   createUiSessionNonceManager,
   issueUiSessionNonceCookie,
   resolveLocalServerConfiguration,
   resolveOidcRuntimeConfig,
+  resolvePostHogRuntimeConfig,
   resolveOrganizationApiKey,
   resolveServerApiBaseUrl,
   startLocalServer,
