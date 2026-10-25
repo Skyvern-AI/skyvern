@@ -49,6 +49,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from skyvern.config import settings
 from skyvern.exceptions import (
+    BitwardenCredentialsRejectedError,
     BrowserProfileNotFound,
     CredentialSourceNotConfiguredError,
 )
@@ -3682,6 +3683,11 @@ async def list_bitwarden_items(
             error=str(e),
             exc_info=True,
         )
+        if isinstance(e, BitwardenCredentialsRejectedError):
+            raise HTTPException(
+                status_code=400,
+                detail="Bitwarden rejected the credentials; check your Bitwarden credentials in Settings",
+            ) from e
         raise HTTPException(status_code=502, detail="Failed to list Bitwarden items") from e
 
 
