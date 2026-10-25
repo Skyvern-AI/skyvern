@@ -18,13 +18,19 @@ import os
 import random
 from collections.abc import Awaitable, Callable, Iterator
 from datetime import UTC, datetime
+from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
 import pytest
+from fastapi import HTTPException
 from structlog.testing import capture_logs
 
 from skyvern.exceptions import BitwardenGetItemError
+from skyvern.forge import app
+from skyvern.forge.sdk.db.enums import OrganizationAuthTokenType
+from skyvern.forge.sdk.routes.credentials import list_bitwarden_items
 from skyvern.forge.sdk.schemas.credentials import CredentialVaultType
+from skyvern.forge.sdk.schemas.organizations import BitwardenCredential, BitwardenOrganizationAuthToken, Organization
 from skyvern.forge.sdk.services import bitwarden as bitwarden_module
 from skyvern.forge.sdk.services.bitwarden import (
     BitwardenConstants,
@@ -807,6 +813,52 @@ async def test_browsing_a_vault_always_syncs_but_reuses_the_login(cli: FakeVault
     await list_overviews()
 
     assert cli.steps == ["sync", "list"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("login_stderr", "status_code"),
+    [
+        (
+            'Could not find data file, "/tmp/bw/data.json"; creating it instead.\n'
+            "Invalid master password. Confirm your email is correct and your account was created on "
+            "vault.bitwarden.com.",
+            400,
+        ),
+        ("Unable to fetch ServerConfig from https://vault.example.test/api FetchError", 502),
+    ],
+    ids=["credentials-rejected", "server-unreachable"],
+)
+async def test_listing_items_reports_rejected_vault_credentials_as_a_client_error(
+    cli: FakeVaultCli, monkeypatch: pytest.MonkeyPatch, login_stderr: str, status_code: int
+) -> None:
+    """A wrong master password is the customer's to fix; only a vault that fails to answer is our 5xx."""
+    now = datetime.now(UTC)
+    token = BitwardenOrganizationAuthToken(
+        id="oat_vault",
+        organization_id="o_vault",
+        token_type=OrganizationAuthTokenType.bitwarden_credential,
+        valid=True,
+        created_at=now,
+        modified_at=now,
+        credential=BitwardenCredential(email="someone@example.com", master_password="wrong-master-password"),
+    )
+    organization = Organization(
+        organization_id="o_vault", organization_name="Vault org", created_at=now, modified_at=now
+    )
+    monkeypatch.setattr(
+        app.DATABASE,
+        "organizations",
+        SimpleNamespace(get_valid_org_auth_token=AsyncMock(return_value=token)),
+        raising=False,
+    )
+    cli.login_stdout = ""
+    cli.login_stderr = login_stderr
+
+    with pytest.raises(HTTPException) as excinfo:
+        await list_bitwarden_items(current_org=organization)
+
+    assert excinfo.value.status_code == status_code
 
 
 @pytest.mark.asyncio

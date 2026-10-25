@@ -1215,6 +1215,10 @@ class BitwardenLoginError(BitwardenBaseError):
         super().__init__(f"Error logging in to Bitwarden: {message}")
 
 
+class BitwardenCredentialsRejectedError(BitwardenLoginError):
+    pass
+
+
 class BitwardenUnlockError(BitwardenBaseError):
     def __init__(self, message: str) -> None:
         super().__init__(f"Error unlocking Bitwarden: {message}")
