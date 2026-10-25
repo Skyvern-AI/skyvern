@@ -26,7 +26,7 @@ from skyvern.webeye.cdp_connection import (
     resolve_local_pbs_cdp_url,
 )
 from skyvern.webeye.driver_connection import close_driver_connection_on_transport_loss
-from skyvern.webeye.main_world_eval import evaluate_in_main_world
+from skyvern.webeye.main_world_eval import default_evaluate_to_main_world, evaluate_in_main_world
 
 if t.TYPE_CHECKING:
     from skyvern.forge.sdk.schemas.persistent_browser_sessions import AddressablePersistentBrowserSession
@@ -118,6 +118,7 @@ class CdpChannel:
         if pw is None:
             pw = await async_playwright().start()
             close_driver_connection_on_transport_loss(pw)
+            default_evaluate_to_main_world(pw)
 
         self.pw = pw
 

@@ -14,6 +14,7 @@ from skyvern.webeye.driver_connection import (
     driver_connection_closed,
     kill_driver_process,
 )
+from skyvern.webeye.main_world_eval import default_evaluate_to_main_world
 
 if TYPE_CHECKING:
     from playwright.async_api import Playwright
@@ -139,6 +140,7 @@ class HostedDriver:
 async def _launch(manager: PlaywrightContextManager) -> Playwright:
     driver = await manager.start()
     close_driver_connection_on_transport_loss(driver)
+    default_evaluate_to_main_world(driver)
     return driver
 
 

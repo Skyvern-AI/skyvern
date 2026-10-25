@@ -1,10 +1,15 @@
+import asyncio
+from contextlib import asynccontextmanager
+from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
+import asyncssh
 import libcst as cst
 import pytest
 
 from skyvern.core.script_generations.generate_script import _build_download_statement, _build_file_upload_statement
-from skyvern.exceptions import BlockedHost
+from skyvern.exceptions import BlockedHost, UnresolvableHost
 from skyvern.forge.agent_functions import AgentFunction
 from skyvern.forge.sdk.services import sftp_service
 from skyvern.schemas.workflows import FileStorageType, FileUploadDestination
@@ -45,6 +50,263 @@ def _sftp_destination(**overrides) -> FileUploadDestination:
     }
     fields.update(overrides)
     return FileUploadDestination(**fields)
+
+
+@asynccontextmanager
+async def _sftp_test_server(root: Path, password: str = "pw"):
+    class Server(asyncssh.SSHServer):
+        def begin_auth(self, username: str) -> bool:
+            return True
+
+        def password_auth_supported(self) -> bool:
+            return True
+
+        def validate_password(self, username: str, supplied_password: str) -> bool:
+            return supplied_password == password
+
+    server_key = asyncssh.generate_private_key("ssh-ed25519")
+    server = await asyncssh.create_server(
+        Server,
+        "127.0.0.1",
+        0,
+        server_host_keys=[server_key],
+        sftp_factory=lambda channel: asyncssh.SFTPServer(channel, chroot=str(root)),
+    )
+    try:
+        yield server, server_key
+    finally:
+        server.close()
+        await server.wait_closed()
+
+
+def _sftp_public_key(key) -> str:
+    return key.export_public_key().decode().strip()
+
+
+async def _download_from_server(server, host_key: str | None, **overrides) -> str:
+    args = {
+        "host": "sftp.test",
+        "port": server.get_port(),
+        "username": "user",
+        "password": "pw",
+        "remote_path": "/report.csv",
+        "output_dir": ".",
+        "host_key": host_key,
+    }
+    args.update(overrides)
+    with patch.object(sftp_service, "resolve_fetch_host_ips", return_value=("127.0.0.1",)):
+        return await sftp_service.download_file(**args)
+
+
+@pytest.mark.asyncio
+async def test_sftp_service_download_file_reads_and_pins_host_key(tmp_path, monkeypatch):
+    remote_root = tmp_path / "remote"
+    remote_root.mkdir()
+    (remote_root / "report.csv").write_bytes(b"id,value\n1,ok\n")
+    output_dir = tmp_path / "downloads"
+    monkeypatch.setattr(sftp_service.settings, "ALLOW_SFTP_INTERNAL_HOSTS", False)
+
+    async with _sftp_test_server(remote_root) as (server, server_key):
+        path = await _download_from_server(
+            server,
+            _sftp_public_key(server_key),
+            output_dir=str(output_dir),
+        )
+
+    assert Path(path).read_bytes() == b"id,value\n1,ok\n"
+    assert Path(path).name == "report.csv"
+
+
+@pytest.mark.asyncio
+async def test_sftp_service_download_file_preserves_same_basename_reads(tmp_path, monkeypatch):
+    remote_root = tmp_path / "remote"
+    remote_root.mkdir()
+    remote_file = remote_root / "report.csv"
+    remote_file.write_bytes(b"first report")
+    output_dir = tmp_path / "downloads"
+    monkeypatch.setattr(sftp_service.settings, "ALLOW_SFTP_INTERNAL_HOSTS", False)
+
+    async with _sftp_test_server(remote_root) as (server, server_key):
+        first_path = await _download_from_server(
+            server,
+            _sftp_public_key(server_key),
+            output_dir=str(output_dir),
+        )
+        remote_file.write_bytes(b"second report")
+        second_path = await _download_from_server(
+            server,
+            _sftp_public_key(server_key),
+            output_dir=str(output_dir),
+        )
+
+    assert first_path != second_path
+    assert Path(first_path).name == "report.csv"
+    assert Path(second_path).name == "report (1).csv"
+    assert Path(first_path).read_bytes() == b"first report"
+    assert Path(second_path).read_bytes() == b"second report"
+
+
+@pytest.mark.asyncio
+async def test_sftp_service_download_file_enforces_overall_timeout(tmp_path, monkeypatch):
+    monkeypatch.setattr(sftp_service, "BROWSER_DOWNLOAD_TIMEOUT", 0.05)
+    monkeypatch.setattr(sftp_service.settings, "ALLOW_SFTP_INTERNAL_HOSTS", True)
+
+    async def slow_read(_size: int) -> bytes:
+        await asyncio.sleep(1)
+        return b"report"
+
+    remote_file = MagicMock()
+    remote_file.read = AsyncMock(side_effect=slow_read)
+    sftp = MagicMock()
+    sftp.stat = AsyncMock(return_value=SimpleNamespace(size=6))
+    sftp.open = MagicMock(return_value=_acm(remote_file))
+    conn = MagicMock()
+    conn.start_sftp_client = MagicMock(return_value=_acm(sftp))
+
+    with (
+        patch.object(sftp_service.asyncssh, "connect", return_value=_acm(conn)),
+        pytest.raises(sftp_service.SFTPDownloadError) as error,
+    ):
+        await sftp_service.download_file(
+            output_dir=str(tmp_path / "downloads"),
+            remote_path="/report.csv",
+            host="sftp.test",
+            port=22,
+            username="user",
+            password="pw",
+            host_key="ssh-ed25519 AAAA",
+        )
+
+    assert error.value.category == sftp_service.SFTPDownloadErrorCategory.TRANSFER_FAILED
+    assert not list((tmp_path / "downloads").glob("report*"))
+    assert not list((tmp_path / "downloads").glob(".sftp-*"))
+
+
+@pytest.mark.asyncio
+async def test_sftp_service_download_file_requires_a_pinned_host_key(tmp_path):
+    async with _sftp_test_server(tmp_path) as (server, _server_key):
+        with pytest.raises(sftp_service.SFTPDownloadError) as error:
+            await _download_from_server(server, None, output_dir=str(tmp_path / "downloads"))
+
+    assert error.value.category == sftp_service.SFTPDownloadErrorCategory.HOST_KEY_MISSING
+
+
+@pytest.mark.asyncio
+async def test_sftp_service_download_file_rejects_mismatched_host_key(tmp_path):
+    async with _sftp_test_server(tmp_path) as (server, _server_key):
+        mismatched_key = asyncssh.generate_private_key("ssh-ed25519")
+        with pytest.raises(sftp_service.SFTPDownloadError) as error:
+            await _download_from_server(
+                server,
+                _sftp_public_key(mismatched_key),
+                output_dir=str(tmp_path / "downloads"),
+            )
+
+    assert error.value.category == sftp_service.SFTPDownloadErrorCategory.HOST_KEY_MISMATCH
+
+
+@pytest.mark.asyncio
+async def test_sftp_service_download_file_classifies_authentication_failure(tmp_path):
+    async with _sftp_test_server(tmp_path) as (server, server_key):
+        with pytest.raises(sftp_service.SFTPDownloadError) as error:
+            await _download_from_server(
+                server,
+                _sftp_public_key(server_key),
+                password="wrong",
+                output_dir=str(tmp_path / "downloads"),
+            )
+
+    assert error.value.category == sftp_service.SFTPDownloadErrorCategory.AUTHENTICATION_FAILED
+
+
+@pytest.mark.asyncio
+async def test_sftp_service_download_file_classifies_missing_remote_path(tmp_path):
+    async with _sftp_test_server(tmp_path) as (server, server_key):
+        with pytest.raises(sftp_service.SFTPDownloadError) as error:
+            await _download_from_server(
+                server,
+                _sftp_public_key(server_key),
+                output_dir=str(tmp_path / "downloads"),
+            )
+
+    assert error.value.category == sftp_service.SFTPDownloadErrorCategory.PATH_NOT_FOUND
+
+
+@pytest.mark.asyncio
+async def test_sftp_service_download_file_enforces_existing_size_cap(tmp_path, monkeypatch):
+    (tmp_path / "report.csv").write_bytes(b"larger than cap")
+    monkeypatch.setattr(sftp_service.settings, "MAX_HTTP_DOWNLOAD_FILE_SIZE", 3)
+
+    async with _sftp_test_server(tmp_path) as (server, server_key):
+        with pytest.raises(sftp_service.SFTPDownloadError) as error:
+            await _download_from_server(
+                server,
+                _sftp_public_key(server_key),
+                output_dir=str(tmp_path / "downloads"),
+            )
+
+    assert error.value.category == sftp_service.SFTPDownloadErrorCategory.FILE_TOO_LARGE
+    assert not (tmp_path / "downloads" / "report.csv").exists()
+
+
+@pytest.mark.asyncio
+async def test_sftp_service_download_file_classifies_blocked_host(tmp_path):
+    with (
+        patch.object(sftp_service, "resolve_fetch_host_ips", side_effect=BlockedHost(host="127.0.0.1")),
+        pytest.raises(sftp_service.SFTPDownloadError) as error,
+    ):
+        await sftp_service.download_file(
+            host="sftp.test",
+            port=22,
+            username="user",
+            password="pw",
+            remote_path="/report.csv",
+            output_dir=str(tmp_path / "downloads"),
+            host_key="ssh-ed25519 AAAA",
+        )
+
+    assert error.value.category == sftp_service.SFTPDownloadErrorCategory.HOST_BLOCKED
+
+
+@pytest.mark.asyncio
+async def test_sftp_service_download_file_classifies_unresolvable_host(tmp_path):
+    with (
+        patch.object(sftp_service, "resolve_fetch_host_ips", side_effect=UnresolvableHost(host="sftp.test")),
+        pytest.raises(sftp_service.SFTPDownloadError) as error,
+    ):
+        await sftp_service.download_file(
+            host="sftp.test",
+            port=22,
+            username="user",
+            password="pw",
+            remote_path="/report.csv",
+            output_dir=str(tmp_path / "downloads"),
+            host_key="ssh-ed25519 AAAA",
+        )
+
+    assert error.value.category == sftp_service.SFTPDownloadErrorCategory.HOST_UNREACHABLE
+
+
+@pytest.mark.asyncio
+async def test_sftp_service_upload_still_allows_missing_host_key(tmp_path, monkeypatch):
+    remote_root = tmp_path / "remote"
+    remote_root.mkdir()
+    file_path = _write_file(tmp_path)
+    monkeypatch.setattr(sftp_service.settings, "ALLOW_SFTP_INTERNAL_HOSTS", False)
+
+    async with _sftp_test_server(remote_root) as (server, _server_key):
+        with patch.object(sftp_service, "resolve_fetch_host_ips", return_value=("127.0.0.1",)):
+            result = await sftp_service.upload_file(
+                file_path=file_path,
+                host="sftp.test",
+                port=server.get_port(),
+                username="user",
+                password="pw",
+                remote_path="/incoming",
+            )
+
+    assert result == "/incoming/f.csv"
+    assert (remote_root / "incoming" / "f.csv").read_text() == "data"
 
 
 @pytest.mark.asyncio
@@ -363,6 +625,37 @@ def test_generated_website_download_with_stale_prompt_keeps_required_navigation_
     assert "aws_secret_access_key=" not in compact
     assert "path=" not in compact
     assert "continue_on_empty=" not in compact
+
+
+def test_generated_website_sftp_source_emits_source_and_shared_credentials():
+    block = {
+        "block_type": "file_download",
+        "label": "download",
+        "navigation_goal": "Download the file",
+        "download_target": "website",
+        "sftp_source_path": "/reports/report.csv",
+        "sftp_host": "sftp.example.test",
+        "sftp_port": 2222,
+        "sftp_username": "user",
+        "sftp_password": "password",
+        "sftp_private_key": "private-key",
+        "sftp_private_key_passphrase": "passphrase",
+        "sftp_host_key": "ssh-ed25519 AAAA",
+        "sftp_remote_path": "/stale-destination",
+    }
+
+    compact = cst.Module(body=[_build_download_statement("download", block)]).code.replace(" ", "").replace("\n", "")
+
+    assert "download_target=" not in compact
+    assert "sftp_source_path='/reports/report.csv'" in compact
+    assert "sftp_host='sftp.example.test'" in compact
+    assert "sftp_port=2222" in compact
+    assert "sftp_username='user'" in compact
+    assert "sftp_password='password'" in compact
+    assert "sftp_private_key='private-key'" in compact
+    assert "sftp_private_key_passphrase='passphrase'" in compact
+    assert "sftp_host_key='ssh-ed25519AAAA'" in compact
+    assert "sftp_remote_path=" not in compact
 
 
 def test_generated_external_download_omits_other_targets_stale_secrets():

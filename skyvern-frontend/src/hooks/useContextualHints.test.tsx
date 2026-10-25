@@ -27,6 +27,9 @@ const flagState = vi.hoisted(() => ({
 vi.mock("posthog-js/react", () => ({
   useFeatureFlagVariantKey: () => flagState.variant,
 }));
+vi.mock("@/hooks/usePostHogFeatureFlag", () => ({
+  usePostHogFeatureFlagVariantKey: () => flagState.variant,
+}));
 
 const COMPLETED_STATE: OnboardingState = {
   tour_completed_at: "2026-06-01T00:00:00Z",
