@@ -718,6 +718,15 @@ def _candidate_hold_message(held: dict[str, str]) -> str:
 
 
 _CANDIDATE_HOLD_SKIP = "queued before the held download facts above were shown; decide on them, then finish again"
+JUSTIFY_HOLD_MESSAGE = (
+    "verdict held once: a terminated verdict needs a rule written in the goal, its criteria or these instructions, "
+    "or text on the page, that prevents the task. If you can quote it, finish again with status=terminated and the "
+    "verdict will stand. If you cannot, nothing prevents the task: continue it. If a field the form requires has no "
+    "value in the data, finish again and name that field."
+)
+_JUSTIFY_HOLD_SKIP = "queued after a finish that was held; read the hold above, then decide"
+# Telemetry only: the loop never reads it, so no verdict depends on a model's wording.
+_REFUSAL_SHAPED = re.compile(r"\bI (can['’]t|cannot|won['’]t|will not|am unable to|am not able to)\b", re.IGNORECASE)
 
 
 @dataclass
@@ -1831,6 +1840,15 @@ class ActivityRecency:
     status_at_hold_gate: str | None = None
     # In-loop dead ends returned to the model as the navigate result instead of ending the run.
     dead_ends_returned: int = 0
+    # The justification hold's verdict and the state then, and the first failed/terminated verdict that reached the
+    # hold's position after it.
+    justify_hold_turn: int | None = None
+    justify_hold_status: str | None = None
+    justify_attempts_at_hold: int | None = None
+    justify_perceptions_at_hold: int | None = None
+    justify_refinish_status: str | None = None
+    justify_same_reason: bool | None = None
+    justify_reason_refusal_shaped: bool | None = None
 
     def armed(self, window: int = FAILURE_EVIDENCE_WINDOW_TURNS) -> bool:
         return self.last_trigger_turn is not None and (self.turn - self.last_trigger_turn) <= window
@@ -1846,6 +1864,51 @@ class ActivityRecency:
         ):
             self.read_started_at = self.batch_read_started_at
         self.batch_read_started_at = None
+
+    def justify_summary(self, final_status: str) -> dict[str, Any]:
+        """The justification hold's fields for the engine's summary line; without a hold, all None."""
+        if (
+            self.justify_hold_turn is None
+            or self.justify_attempts_at_hold is None
+            or self.justify_perceptions_at_hold is None
+        ):
+            return {
+                "justify_held": False,
+                "justify_status": None,
+                "justify_turn": None,
+                "justify_turns_after": None,
+                "justify_actions_after": None,
+                "justify_perceptions_after": None,
+                "justify_refinish_status": None,
+                "justify_same_reason": None,
+                "justify_reason_refusal_shaped": None,
+                "justify_outcome": None,
+            }
+        actions_after = self.action_attempts - self.justify_attempts_at_hold
+        perceptions_after = self.perceptions - self.justify_perceptions_at_hold
+        refinish = self.justify_refinish_status
+        if final_status == "completed":
+            outcome = "continued_completed" if actions_after else "completed_without_acting"
+        elif refinish is None:
+            outcome = "ended_by_engine"
+        elif actions_after:
+            outcome = f"continued_{refinish}"
+        elif perceptions_after:
+            outcome = f"looked_then_{refinish}"
+        else:
+            outcome = "refinished_same" if refinish == self.justify_hold_status else "refinished_other"
+        return {
+            "justify_held": True,
+            "justify_status": self.justify_hold_status,
+            "justify_turn": self.justify_hold_turn,
+            "justify_turns_after": self.turn - self.justify_hold_turn,
+            "justify_actions_after": actions_after,
+            "justify_perceptions_after": perceptions_after,
+            "justify_refinish_status": refinish,
+            "justify_same_reason": self.justify_same_reason,
+            "justify_reason_refusal_shaped": self.justify_reason_refusal_shaped,
+            "justify_outcome": outcome,
+        }
 
 
 def submissions_since(
@@ -2828,6 +2891,7 @@ def make_finish_tool(
     download_facts: DownloadFailureFacts | None = None,
     error_code_mapping: dict[str, str] | None = None,
     intercepted_submissions: Callable[[], Sequence[InterceptedSubmission]] | None = None,
+    justify_stops: bool = False,
 ) -> ToolSpec:
     """`page_fingerprint` samples an opaque fingerprint of the page's rendered content (None when no
     page is available). A finish(completed) is deferred (bounded by `max_settle_deferrals`, then
@@ -2883,7 +2947,11 @@ def make_finish_tool(
     for a re-observe and never implies the response was an acceptance. When the only submission the
     interceptor saw is the site's typed machine rejection, and no submit-shaped action followed the one that sent it,
     a failed or terminated verdict is held once more, funded like the give-up hold, so the one retry the prompt
-    permits is not left unused; any other record or later submit-shaped action ends that."""
+    permits is not left unused; any other record or later submit-shaped action ends that.
+
+    `justify_stops` holds once per run, with `activity` and headroom, the first terminated verdict that no hold above
+    already held, asking for the source of the stop or a continuation; a failed verdict is never held.
+    """
     error_code_mapping = _offered_error_codes(error_code_mapping)
     deferrals = 0
     stale_holds = 0
@@ -2903,6 +2971,9 @@ def make_finish_tool(
     # What the retry hold was granted on; a submit later in its batch spends it, so a later finish there must not
     # repeat the permission.
     retry_granted_on: tuple[tuple[tuple[int, SubmissionOutcome], ...], float | None] | None = None
+    # Spent by the first verdict the justification hold could apply to, held or not.
+    justify_spent = False
+    held_reason_key: str | None = None
 
     def _submission_state() -> tuple[tuple[tuple[int, SubmissionOutcome], ...], float | None]:
         records = tuple((r.record_id, r.outcome) for r in _read_submissions())
@@ -3121,6 +3192,7 @@ def make_finish_tool(
         nonlocal deferrals, stale_holds, failure_deferrals, reask_asked, premise_checks
         nonlocal submission_hold_turn, submission_hold_message
         nonlocal retry_offered, retry_would_offer, retry_granted_on
+        nonlocal justify_spent, held_reason_key
         status = args.get("status")
         if status not in ("completed", "failed", "terminated"):
             return ToolResult.error(
@@ -3444,6 +3516,49 @@ def make_finish_tool(
             activity.attempts_at_hold_gate = activity.action_attempts
             activity.perceptions_at_hold_gate = activity.perceptions
             activity.status_at_hold_gate = status
+        if justify_stops and activity is not None and status in ("failed", "terminated"):
+            reason = str(args.get("reason") or "")
+            if not justify_spent and status == "terminated":
+                justify_spent = True
+                if submission_holds or submission_held_pending or retry_offered or failure_deferrals > 0:
+                    cause = "other_hold"
+                elif activity.final_turn_active:
+                    cause = "final_turn"
+                elif not _has_hold_headroom(activity, deadline_at):
+                    cause = "no_headroom"
+                elif activity.action_steps_remaining is not None and activity.action_steps_remaining < 2:
+                    cause = "no_action_step"
+                else:
+                    cause = None
+                if cause is not None:
+                    LOG.info(
+                        "taskv3 finish justification would hold",
+                        status=status,
+                        cause=cause,
+                        turn=activity.turn,
+                        action_attempts=activity.action_attempts,
+                    )
+                else:
+                    activity.justify_hold_turn = activity.turn
+                    activity.justify_hold_status = status
+                    activity.justify_attempts_at_hold = activity.action_attempts
+                    activity.justify_perceptions_at_hold = activity.perceptions
+                    activity.justify_reason_refusal_shaped = bool(_REFUSAL_SHAPED.search(reason))
+                    held_reason_key = " ".join(reason.split()).casefold()
+                    # Never the reason itself: it can carry customer data.
+                    LOG.info(
+                        "taskv3 finish justification held",
+                        status=status,
+                        turn=activity.turn,
+                        action_attempts=activity.action_attempts,
+                        perceptions=activity.perceptions,
+                        reason_chars=len(reason),
+                        reason_refusal_shaped=activity.justify_reason_refusal_shaped,
+                    )
+                    return ToolResult.error(JUSTIFY_HOLD_MESSAGE, {"stop_batch": _JUSTIFY_HOLD_SKIP})
+            elif activity.justify_hold_turn is not None and activity.justify_refinish_status is None:
+                activity.justify_refinish_status = status
+                activity.justify_same_reason = " ".join(reason.split()).casefold() == held_reason_key
         original = _non_completed(status)
         premise = None
         if status == "terminated" and terminate_premise is not None:

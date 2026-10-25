@@ -599,6 +599,9 @@ class Settings(BaseSettings):
     # Store the error code v3's model chose on finish instead of the post-run page guess. Off: the guess is stored
     # as before. Retry policies match on stored codes, so turning this on can change which runs retry.
     TASK_V3_ERROR_CODE_ON_FINISH: bool = False
+    # Kill switch for the hold on a Task V3 run's first terminated verdict that asks for what prevents the task.
+    # On: every terminated verdict stands as the model gave it.
+    DISABLE_TASK_V3_JUSTIFY_HOLD: bool = False
     # Which browser surface the v3 loop offers: today's action tools ("off"), those plus a code
     # tool ("add"), or the code tool instead of them ("replace"). Three states rather than a boolean
     # because the benchmark separated add from replace on speed alone, not on success. The code tool
