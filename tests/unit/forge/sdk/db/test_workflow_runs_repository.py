@@ -31,6 +31,7 @@ from skyvern.forge.sdk.db.agent_db import AgentDB, _build_engine
 from skyvern.forge.sdk.db.datetime_utils import naive_utc_now
 from skyvern.forge.sdk.db.enums import BrowserSeedSource
 from skyvern.forge.sdk.db.exceptions import RunsListSearchCanceled
+from skyvern.forge.sdk.db.id import generate_task_id, generate_workflow_run_id
 from skyvern.forge.sdk.db.models import (
     ArtifactModel,
     Base,
@@ -2014,7 +2015,10 @@ async def test_get_all_runs_v2_search_key_matches_parameter_inputs() -> None:
 # unique to exactly one seeded run, so an over-broad clause fails the same assertion an absent one does;
 # the pool and fallback workflows each carry a sibling run whose recorded selection replaced the
 # definition's credential, so matching the definition alone returns two runs and fails. wr_mentions_ids
-# only mentions a profile and a session id in its webhook URL, so a substring arm on those ids fails too.
+# only mentions a profile, session, run and task id in its webhook URL, so a substring arm on those ids fails too.
+_COMPLETE_RUN_ID = "wr_100000000000000001"
+_COMPLETE_TASK_ID = "tsk_100000000000000002"
+_STANDALONE_TASK_ID = "tsk_100000000000000003"
 _RUN_IDENTIFIER_SEARCH_CASES = (
     ("hooks.example.com/notify", "wr_webhook"),
     ("bp_1001", "wr_profile"),
@@ -2032,6 +2036,8 @@ _RUN_IDENTIFIER_SEARCH_CASES = (
     ("bp_1015", "wr_previous_profile"),
     ("cred_1016", "wr_two_parameters"),
     ("cred_1017", "wr_two_parameters"),
+    (_COMPLETE_RUN_ID, _COMPLETE_RUN_ID),
+    (_COMPLETE_TASK_ID, "wr_with_task"),
 )
 
 
@@ -2058,7 +2064,7 @@ async def _seed_run_identifier_runs(sqlite_db: AgentDB, *, with_task_runs: bool)
         _workflow_run_model(
             workflow_run_id="wr_mentions_ids",
             queued_at=created_at,
-            webhook_callback_url="https://hooks.example.com/bp_1001/pbs_1002",
+            webhook_callback_url=f"https://hooks.example.com/bp_1001/pbs_1002/{_COMPLETE_RUN_ID}/{_COMPLETE_TASK_ID}",
         ),
         _workflow_run_model(workflow_run_id="wr_profile", queued_at=created_at, browser_profile_id="bp_1001"),
         _workflow_run_model(workflow_run_id="wr_session", queued_at=created_at, browser_session_id="pbs_1002"),
@@ -2076,6 +2082,8 @@ async def _seed_run_identifier_runs(sqlite_db: AgentDB, *, with_task_runs: bool)
         _workflow_run_model(workflow_run_id="wr_fallback_primary", queued_at=created_at, workflow_id="wf_fallback"),
         _workflow_run_model(workflow_run_id="wr_fallback_retry", queued_at=created_at, workflow_id="wf_fallback"),
         _workflow_run_model(workflow_run_id="wr_two_parameters", queued_at=created_at, workflow_id="wf_two_parameters"),
+        _workflow_run_model(workflow_run_id=_COMPLETE_RUN_ID, queued_at=created_at),
+        _workflow_run_model(workflow_run_id="wr_with_task", queued_at=created_at),
     ]
 
     async with sqlite_db.Session() as session:
@@ -2140,6 +2148,12 @@ async def _seed_run_identifier_runs(sqlite_db: AgentDB, *, with_task_runs: bool)
                     workflow_run_id="wr_previous_session",
                     browser_session_id="pbs_1012",
                 ),
+                TaskModel(
+                    task_id=_COMPLETE_TASK_ID,
+                    organization_id="org_test",
+                    workflow_run_id="wr_with_task",
+                    status="completed",
+                ),
             ]
         )
         session.add_all(
@@ -2197,6 +2211,70 @@ async def test_get_workflow_runs_for_workflow_permanent_id_search_key_matches_ru
             search_key=search_key,
         )
         assert {run.workflow_run_id for run in runs} == {expected_run_id}, search_key
+
+
+@pytest.mark.asyncio
+async def test_partial_run_id_search_keeps_substring_matching(sqlite_db: AgentDB) -> None:
+    # Only a complete run id is matched by equality; one still being typed must keep finding every run
+    # that mentions it.
+    await _seed_run_identifier_runs(sqlite_db, with_task_runs=False)
+
+    runs = await sqlite_db.workflow_runs.get_workflow_runs_for_workflow_permanent_id(
+        workflow_permanent_id="wpid_test",
+        organization_id="org_test",
+        search_key=_COMPLETE_RUN_ID[:-4],
+    )
+
+    assert {run.workflow_run_id for run in runs} == {_COMPLETE_RUN_ID, "wr_mentions_ids"}
+
+
+@pytest.mark.asyncio
+async def test_complete_standalone_task_id_search_finds_the_task_within_its_org(sqlite_db: AgentDB) -> None:
+    # A standalone task has no workflow run, so both runs lists must find it through its own task row. The
+    # task lookup carries no org filter of its own, so another org searching the same ids must get nothing.
+    await _seed_run_identifier_runs(sqlite_db, with_task_runs=False)
+    created_at = datetime(2026, 7, 20, 12, 0, tzinfo=timezone.utc)
+    mentions_url = f"https://example.com/{_STANDALONE_TASK_ID}"
+    decoy_task_run = _task_run_model(
+        run_id="tsk_mentions_standalone", created_at=created_at, workflow_permanent_id=None, task_run_type="task_v1"
+    )
+    decoy_task_run.searchable_text = mentions_url
+    async with sqlite_db.Session() as session:
+        session.add_all(
+            [
+                _task_run_model(
+                    run_id=_STANDALONE_TASK_ID,
+                    created_at=created_at,
+                    workflow_permanent_id=None,
+                    task_run_type="task_v1",
+                ),
+                decoy_task_run,
+                TaskModel(
+                    task_id=_STANDALONE_TASK_ID,
+                    organization_id="org_test",
+                    status="completed",
+                    url="https://example.com/standalone",
+                    created_at=datetime(2026, 7, 20, 12, 0),
+                ),
+                TaskModel(
+                    task_id="tsk_mentions_standalone",
+                    organization_id="org_test",
+                    status="completed",
+                    url=mentions_url,
+                    created_at=datetime(2026, 7, 20, 12, 0),
+                ),
+            ]
+        )
+        await session.commit()
+
+    rows = await sqlite_db.workflow_runs.get_all_runs_v2(organization_id="org_test", search_key=_STANDALONE_TASK_ID)
+    legacy_runs = await sqlite_db.workflow_runs.get_all_runs(organization_id="org_test", search_key=_STANDALONE_TASK_ID)
+
+    assert {row["run_id"] for row in rows} == {_STANDALONE_TASK_ID}
+    assert [getattr(run, "task_id", None) for run in legacy_runs] == [_STANDALONE_TASK_ID]
+    for search_key in (_COMPLETE_RUN_ID, _COMPLETE_TASK_ID, _STANDALONE_TASK_ID):
+        assert await sqlite_db.workflow_runs.get_all_runs_v2(organization_id="org_other", search_key=search_key) == []
+        assert await sqlite_db.workflow_runs.get_all_runs(organization_id="org_other", search_key=search_key) == []
 
 
 @pytest.mark.asyncio
@@ -4575,6 +4653,7 @@ async def test_workflow_runs_search_caps_only_the_unindexed_free_text_read(
         ("customer-private-search", False, workflow_runs_repository.RUNS_LIST_STATEMENT_TIMEOUT_SECONDS),
         # Never capped, so it ran under the connection's own timeout rather than this budget.
         ("pbs_123", True, None),
+        (_COMPLETE_RUN_ID, True, None),
     ],
 )
 async def test_cancelled_workflow_runs_search_is_typed_and_keeps_the_term_out_of_logs(
@@ -4899,3 +4978,39 @@ async def test_get_workflow_runs_never_defaults_a_window_and_combines_bounds_wit
     }
     assert _window_run_names(windowed_page, organization_id) == ["wr_window_at_start"]
     assert other_org == []
+
+
+@pytest.mark.asyncio
+async def test_get_workflow_runs_complete_id_search_still_applies_explicit_created_at_bounds(
+    org_scoped_db: tuple[AgentDB, AsyncEngine, str],
+) -> None:
+    # The route lets a complete run or task id skip the default window, so the caller's bounds are all that narrow it.
+    db, _engine, organization_id = org_scoped_db
+    await _seed_created_at_window_runs(db, organization_id)
+    run_id, task_id = generate_workflow_run_id(), generate_task_id()
+    created_at = _WINDOW_START - timedelta(days=60)
+    async with db.Session() as session:
+        session.add(
+            _workflow_run_model(
+                workflow_run_id=run_id,
+                queued_at=created_at,
+                workflow_id=f"wf_window_{organization_id}",
+                workflow_permanent_id=f"wpid_window_{organization_id}",
+                organization_id=organization_id,
+            )
+        )
+        await session.flush()
+        session.add(
+            TaskModel(task_id=task_id, organization_id=organization_id, workflow_run_id=run_id, status="completed")
+        )
+        await session.commit()
+
+    for search_key in (run_id, task_id):
+        before_window = await db.workflow_runs.get_workflow_runs(
+            organization_id=organization_id, search_key=search_key, created_at_end=_WINDOW_START
+        )
+        in_window = await db.workflow_runs.get_workflow_runs(
+            organization_id=organization_id, search_key=search_key, created_at_start=_WINDOW_START
+        )
+        assert [run.workflow_run_id for run in before_window] == [run_id], search_key
+        assert in_window == [], search_key
