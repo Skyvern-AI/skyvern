@@ -1184,6 +1184,10 @@ class AgentFunction:
     async def task_v3_error_code_on_finish(self, *, organization_id: str) -> bool:
         return settings.TASK_V3_ERROR_CODE_ON_FINISH
 
+    # Whether a v3 run holds its first terminated verdict once for what prevents the task. Read once per run.
+    async def task_v3_justify_hold_enabled(self, *, task_id: str | None, organization_id: str | None) -> bool:
+        return not settings.DISABLE_TASK_V3_JUSTIFY_HOLD
+
     # (text appended to a page-aware v3 run's task message or None, reason logged on the loop-finished line), given
     # the run's payload. OSS supplies no default.
     def task_v3_age_default(self, parameters: dict[str, Any] | None) -> tuple[str | None, str] | None:
