@@ -68,6 +68,27 @@ CopilotCancelSource = Literal["escape_key", "stop_button", "api"]
 PersistedCopilotComposerMode = Literal["ask", "build", "code"]
 
 
+class CopilotBrowserAllocation(BaseModel):
+    model_config = ConfigDict(extra="ignore", frozen=True)
+
+    allocation_id: str = Field(min_length=1, max_length=128)
+    browser_session_id: str | None = Field(default=None, max_length=128)
+    created_this_request: Literal[True] | None = None
+
+
+class CopilotRequestBrowserAllocations(BaseModel):
+    model_config = ConfigDict(extra="ignore", frozen=True)
+
+    organization_id: str
+    workflow_permanent_id: str
+    workflow_copilot_chat_id: str
+    turn_id: str
+    request_cancel_token: str | None = None
+    allocations: list[CopilotBrowserAllocation] = Field(default_factory=list, max_length=64)
+    recording_incomplete: bool = False
+    truncated: bool = False
+
+
 class TurnOutcome(BaseModel):
     # extra="ignore" so a rolling deploy that adds a new TurnOutcome field
     # does not make older readers silently treat freshly-written rows as None.
@@ -104,6 +125,7 @@ class TurnOutcome(BaseModel):
     # Client-generated per-request correlation value. Retained after the pending
     # marker is cleared so a disconnected client can recover the exact chat.
     request_cancel_token: str | None = None
+    request_browser_allocations: CopilotRequestBrowserAllocations | None = None
     # True on an interrupted row no late finalizer can replace. Chat history serves every stored
     # interrupted row this way; False only reaches a client from a backend that still replaced rows.
     interrupted_row_final: bool = False
