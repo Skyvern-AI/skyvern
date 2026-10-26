@@ -91,10 +91,10 @@ def compute_selector_options(element_data: dict | None) -> list[tuple[str, str]]
     elem_id = attrs.get("id", "").strip()
     if elem_id:
         if not _looks_dynamic(elem_id):
-            options.append((f"#{_css_escape(elem_id)}", "HTML id"))
+            options.append((_css_id_selector(elem_id), "HTML id"))
         else:
             # Still include dynamic IDs but clearly marked — let the reviewer decide
-            options.append((f"#{_css_escape(elem_id)}", "HTML id (likely auto-generated — may change between runs)"))
+            options.append((_css_id_selector(elem_id), "HTML id (likely auto-generated — may change between runs)"))
 
     # Input type attribute (weak selector — many inputs share the same type)
     input_type = attrs.get("type", "").strip()
@@ -118,6 +118,20 @@ def _looks_dynamic(value: str) -> bool:
 def _css_escape(s: str) -> str:
     """Escape a string for use as a CSS ID selector."""
     return re.sub(r'([!"#$%&\'()*+,./:;<=>?@[\\\]^`{|}~])', r"\\\1", s)
+
+
+def _css_id_selector(value: str) -> str:
+    """Build a selector that targets exactly the element with this id.
+
+    A ``#<id>`` selector is only valid when the id is a CSS identifier: an id
+    that starts with a digit (``123abc``) makes the selector invalid, and an id
+    that contains whitespace (``a b``) turns it into a descendant selector that
+    matches a different element. Both cases fall back to an attribute selector,
+    which matches the id literally.
+    """
+    if value and not value[0].isdigit() and not any(char.isspace() for char in value):
+        return f"#{_css_escape(value)}"
+    return f'[id="{_css_escape_attr(value)}"]'
 
 
 def _css_escape_attr(s: str) -> str:

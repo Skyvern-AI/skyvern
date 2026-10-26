@@ -182,3 +182,26 @@ class TestComputeSelectorOptions:
         # Name should be #1 (ranked above ID)
         assert options[0][0] == 'input[name="credentials.passcode"]'
         assert options[0][1] == "form element name"
+
+
+class TestIdSelectorValidity:
+    """IDs that are not CSS identifiers must still produce usable selectors."""
+
+    def test_digit_leading_id_uses_attribute_selector(self):
+        """``#123abc`` is not a valid CSS selector, so fall back to [id=...]."""
+        elem = {"tagName": "div", "text": "", "attributes": {"id": "123abc"}}
+        assert compute_stable_selector(elem) == '[id="123abc"]'
+
+    def test_id_with_whitespace_uses_attribute_selector(self):
+        """``#a b`` would match a descendant, not the element itself."""
+        elem = {"tagName": "div", "text": "", "attributes": {"id": "a b"}}
+        assert compute_stable_selector(elem) == '[id="a b"]'
+
+    def test_digit_leading_dynamic_id_is_marked_with_attribute_selector(self):
+        elem = {"tagName": "div", "text": "", "attributes": {"id": "123456789"}}
+        options = compute_selector_options(elem)
+        assert options == [('[id="123456789"]', "HTML id (likely auto-generated — may change between runs)")]
+
+    def test_regular_id_still_uses_hash_selector(self):
+        elem = {"tagName": "div", "text": "", "attributes": {"id": "signOnButton"}}
+        assert compute_stable_selector(elem) == "#signOnButton"
