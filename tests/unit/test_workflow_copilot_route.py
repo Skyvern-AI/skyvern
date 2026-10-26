@@ -97,7 +97,13 @@ from skyvern.forge.sdk.routes.workflow_copilot import (
     workflow_copilot_demonstration_control,
     workflow_copilot_demonstration_record,
 )
-from skyvern.forge.sdk.schemas.copilot_turn_outcome import ConnectedAccountChoice, ResponseKind, TurnOutcome
+from skyvern.forge.sdk.schemas.copilot_turn_outcome import (
+    ConnectedAccountChoice,
+    CopilotBrowserAllocation,
+    CopilotRequestBrowserAllocations,
+    ResponseKind,
+    TurnOutcome,
+)
 from skyvern.forge.sdk.schemas.workflow_copilot import (
     COPILOT_PROPOSAL_CLAIM_LEASE,
     COPILOT_PROPOSAL_METADATA_KEY,
@@ -6912,6 +6918,186 @@ async def _start_abandoned_turn(repo: WorkflowParametersRepository, turn_id: str
         user_message="build me a scraper",
     )
     return chat.workflow_copilot_chat_id
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("ack_before_clear", [False, True])
+async def test_request_browser_receipt_survives_terminal_pending_handoff(sqlite_engine, monkeypatch, ack_before_clear):
+    repo = WorkflowParametersRepository(BaseAlchemyDB(sqlite_engine).Session)
+    monkeypatch.setattr(app.DATABASE, "workflow_params", repo)
+    monkeypatch.setattr(workflow_copilot_route, "pending_credential_requests", AsyncMock(return_value=[]))
+    chat = await repo.create_workflow_copilot_chat(organization_id="org", workflow_permanent_id="wpid")
+    turn, token, allocation = "a" * 32, "b" * 32, "c" * 32
+    await repo.start_copilot_turn(
+        "org",
+        chat.workflow_copilot_chat_id,
+        CopilotPendingTurn(turn_id=turn, started_at=datetime.now(UTC), cancel_token=token),
+        "Read the fixture",
+    )
+    arguments = dict(
+        organization_id="org",
+        workflow_copilot_chat_id=chat.workflow_copilot_chat_id,
+        workflow_permanent_id="wpid",
+        turn_id=turn,
+        request_cancel_token=token,
+        allocation_id=allocation,
+    )
+    await repo.record_copilot_browser_allocation(**arguments, browser_session_id=None)
+    pending = await repo.get_workflow_copilot_chat_by_id("org", chat.workflow_copilot_chat_id)
+    assert pending.pending_turns[turn].request_browser_allocations.recording_incomplete is True
+    await repo.create_workflow_copilot_chat_message(
+        organization_id="org",
+        workflow_copilot_chat_id=chat.workflow_copilot_chat_id,
+        sender=WorkflowCopilotChatSender.AI,
+        content="Stopped",
+        turn_outcome=TurnOutcome(response_kind=ResponseKind.RECOVER, copilot_turn_id=turn, request_cancel_token=token),
+    )
+    if ack_before_clear:
+        await repo.record_copilot_browser_allocation(**arguments, browser_session_id="pbs_77")
+    await repo.clear_pending_copilot_turn("org", chat.workflow_copilot_chat_id, turn)
+    if not ack_before_clear:
+        await repo.record_copilot_browser_allocation(**arguments, browser_session_id="pbs_77")
+    response = await workflow_copilot_chat_history(
+        workflow_copilot_chat_id=chat.workflow_copilot_chat_id,
+        request_cancel_token=token,
+        organization=SimpleNamespace(organization_id="org"),
+    )
+    receipt = response.model_dump(mode="json")["request_browser_allocations"]
+    assert receipt["organization_id"] == "org" and receipt["request_cancel_token"] == token
+    assert receipt["workflow_copilot_chat_id"] == chat.workflow_copilot_chat_id and receipt["turn_id"] == turn
+    assert receipt["recording_incomplete"] is False
+    assert receipt["allocations"] == [
+        {"allocation_id": allocation, "browser_session_id": "pbs_77", "created_this_request": True}
+    ]
+    wrong = await workflow_copilot_chat_history(
+        workflow_copilot_chat_id=chat.workflow_copilot_chat_id,
+        request_cancel_token="d" * 32,
+        organization=SimpleNamespace(organization_id="org"),
+    )
+    assert wrong.request_browser_allocations is None
+    with pytest.raises(ValueError):
+        await repo.record_copilot_browser_allocation(
+            **dict(arguments, request_cancel_token="d" * 32), browser_session_id="pbs_88"
+        )
+
+
+@pytest.mark.asyncio
+async def test_request_browser_receipt_overflow_stays_explicitly_incomplete(sqlite_engine):
+    repo = WorkflowParametersRepository(BaseAlchemyDB(sqlite_engine).Session)
+    chat = await repo.create_workflow_copilot_chat(organization_id="org", workflow_permanent_id="wpid")
+    turn = "a" * 32
+    full = CopilotRequestBrowserAllocations(
+        organization_id="org",
+        workflow_permanent_id="wpid",
+        workflow_copilot_chat_id=chat.workflow_copilot_chat_id,
+        turn_id=turn,
+        allocations=[
+            CopilotBrowserAllocation(
+                allocation_id=str(index), browser_session_id=f"pbs_{index}", created_this_request=True
+            )
+            for index in range(64)
+        ],
+    )
+    await repo.start_copilot_turn(
+        "org",
+        chat.workflow_copilot_chat_id,
+        CopilotPendingTurn(turn_id=turn, started_at=datetime.now(UTC), request_browser_allocations=full),
+        "Read the fixture",
+    )
+    arguments = dict(
+        organization_id="org",
+        workflow_copilot_chat_id=chat.workflow_copilot_chat_id,
+        workflow_permanent_id="wpid",
+        turn_id=turn,
+        request_cancel_token=None,
+        allocation_id="overflow",
+    )
+    await repo.record_copilot_browser_allocation(**arguments, browser_session_id=None)
+    await repo.record_copilot_browser_allocation(**arguments, browser_session_id="pbs_999")
+    latest = await repo.get_workflow_copilot_chat_by_id("org", chat.workflow_copilot_chat_id)
+    receipt = latest.pending_turns[turn].request_browser_allocations
+    assert receipt.truncated is True and receipt.recording_incomplete is True
+    assert receipt.allocations == full.allocations
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("override_header", [None, "{}", '{"workflow-copilot":"EVAL_CONFIG"}'])
+async def test_browser_allocation_recorder_requires_admitted_request_override(
+    monkeypatch: pytest.MonkeyPatch,
+    api_key_request: MagicMock,
+    copilot_stream: MagicMock,
+    override_header: str | None,
+) -> None:
+    from skyvern.forge.sdk.api.llm.config_registry import LLMConfigRegistry
+    from skyvern.forge.sdk.copilot.eval_llm_overrides import EVAL_LLM_OVERRIDES_HEADER
+    from skyvern.schemas.llm import LLMConfig
+
+    captured = install_fake_create(monkeypatch)
+    chat = SimpleNamespace(
+        organization_id="org-1",
+        workflow_copilot_chat_id="chat-1",
+        workflow_permanent_id="wpid-1",
+        proposed_workflow=None,
+        auto_accept=False,
+    )
+    result = AgentResult(user_response="Done.", updated_workflow=None, global_llm_context=None)
+    _, workflow_params = setup_new_copilot_mocks(
+        monkeypatch, chat, SimpleNamespace(workflow_id="wf-canonical", workflow_definition=None), result
+    )
+    monkeypatch.setattr(settings, "WORKFLOW_COPILOT_EVAL_LLM_OVERRIDES_ORGANIZATION_IDS", ["org-1"])
+    monkeypatch.setattr(
+        LLMConfigRegistry,
+        "_configs",
+        {"EVAL_CONFIG": LLMConfig("openai/eval-model", [], supports_vision=True, add_assistant_prefix=False)},
+    )
+    if override_header is not None:
+        api_key_request.headers[EVAL_LLM_OVERRIDES_HEADER] = override_header
+    recorded = AsyncMock()
+    workflow_params.record_copilot_browser_allocation = recorded
+    calls = []
+
+    async def agent(**kwargs: Any) -> AgentResult:
+        calls.append(kwargs)
+        recorder = kwargs["browser_allocation_recorder"]
+        if recorder is not None:
+            await recorder("a" * 32, None)
+            await recorder("a" * 32, "pbs_77")
+        return result
+
+    monkeypatch.setattr(workflow_copilot_route, "run_copilot_agent", agent)
+    request = _make_chat_request()
+    request.cancel_token = "c" * 32
+    await workflow_copilot_chat_post(api_key_request, request, SimpleNamespace(organization_id="org-1"))
+    await captured["handler"](copilot_stream)
+    assert len(calls) == 1
+    pending = workflow_params.start_copilot_turn.await_args.kwargs["pending_turn"]
+    if override_header in {None, "{}"}:
+        assert calls[0]["browser_allocation_recorder"] is None
+        assert pending.request_browser_allocations is None
+        recorded.assert_not_awaited()
+    else:
+        assert callable(calls[0]["browser_allocation_recorder"])
+        assert pending.request_browser_allocations == CopilotRequestBrowserAllocations(
+            organization_id="org-1",
+            workflow_permanent_id="wpid-1",
+            workflow_copilot_chat_id="chat-1",
+            turn_id=calls[0]["turn_id"],
+            request_cancel_token="c" * 32,
+            allocations=[],
+            recording_incomplete=False,
+            truncated=False,
+        )
+        assert recorded.await_count == 2
+        for call, session_id in zip(recorded.await_args_list, (None, "pbs_77"), strict=True):
+            assert call.kwargs == {
+                "organization_id": "org-1",
+                "workflow_copilot_chat_id": "chat-1",
+                "workflow_permanent_id": "wpid-1",
+                "turn_id": calls[0]["turn_id"],
+                "request_cancel_token": "c" * 32,
+                "allocation_id": "a" * 32,
+                "browser_session_id": session_id,
+            }
 
 
 @pytest.mark.asyncio

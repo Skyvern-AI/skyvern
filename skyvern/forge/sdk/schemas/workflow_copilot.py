@@ -23,6 +23,7 @@ from skyvern.forge.sdk.copilot.context import ActivityBucket, ProposalDispositio
 from skyvern.forge.sdk.copilot.run_outcome import RunOutcomeReasonCode, RunOutcomeRole, RunOutcomeVerdict
 from skyvern.forge.sdk.schemas.copilot_turn_outcome import (
     CopilotCancelSource,
+    CopilotRequestBrowserAllocations,
     PersistedCopilotComposerMode,
     TurnOutcome,
 )
@@ -172,6 +173,7 @@ class CopilotPendingTurn(BaseModel):
     question_heartbeat_at: datetime | None = None
     question_client_seen_at: datetime | None = None
     cancel_token: str | None = None
+    request_browser_allocations: CopilotRequestBrowserAllocations | None = None
     # Build-test runs this turn ended so it could take the chat's browser. Copilot owns this list;
     # the run row's failure_reason carries the same fact but a later finalizer can overwrite it.
     superseded_build_test_run_ids: list[str] = Field(default_factory=list)
@@ -1146,6 +1148,7 @@ class WorkflowCopilotChatHistoryResponse(BaseModel):
     request_turn_id: str | None = Field(
         None, description="Turn matched by request_cancel_token when recovery requests provide one"
     )
+    request_browser_allocations: CopilotRequestBrowserAllocations | None = None
     chat_history: list[WorkflowCopilotChatHistoryMessage] = Field(default_factory=list, description="Chat messages")
     accepted_turn_ids: list[str] = Field(
         default_factory=list, description="Turns whose manual Accept completed on the server"
