@@ -94,7 +94,7 @@
               },
               {
                 "sdk": "typescript",
-                "code": "import { SkyvernClient } from \"@skyvern/client\";\n\nconst skyvern = new SkyvernClient({ apiKey: \"YOUR_API_KEY\" });\nawait skyvern.runTask({\n    body: {\n        prompt: \"Find the top 3 posts on Hacker News.\"\n    }\n})\n"
+                "code": "import { SkyvernClient } from \"@skyvern/client\";\n\nconst skyvern = new SkyvernClient({ apiKey: \"YOUR_API_KEY\" });\nawait skyvern.runTask({\n    prompt: \"Find the top 3 posts on Hacker News.\"\n})\n"
               }
             ]
           }
@@ -225,7 +225,7 @@
               },
               {
                 "sdk": "typescript",
-                "code": "import { SkyvernClient } from \"@skyvern/client\";\n\nconst skyvern = new SkyvernClient({ apiKey: \"YOUR_API_KEY\" });\nawait skyvern.runWorkflow({\n    body: {\n        workflow_id: \"wpid_123\",\n        parameters: { parameter1: \"value1\", parameter2: \"value2\" }\n    }\n});\n"
+                "code": "import { SkyvernClient } from \"@skyvern/client\";\n\nconst skyvern = new SkyvernClient({ apiKey: \"YOUR_API_KEY\" });\nawait skyvern.runWorkflow({\n    agent_id: \"wpid_123\",\n    parameters: { parameter1: \"value1\", parameter2: \"value2\" }\n});\n"
               }
             ]
           }
@@ -4025,6 +4025,31 @@
                 }
               }
             }
+          },
+          "429": {
+            "description": "Too many browser sessions are starting for this organization at once. Retry after the number of seconds in the Retry-After header.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "required": [
+                    "detail",
+                    "error_code"
+                  ],
+                  "properties": {
+                    "detail": {
+                      "type": "string"
+                    },
+                    "error_code": {
+                      "type": "string",
+                      "enum": [
+                        "too_many_starting_browser_sessions"
+                      ]
+                    }
+                  }
+                }
+              }
+            }
           }
         },
         "x-fern-sdk-method-name": "create_browser_session",
@@ -4783,10 +4808,10 @@
                   "type": "null"
                 }
               ],
-              "description": "Case-insensitive search across credential name, username, secret label, and card details",
+              "description": "Case-insensitive search across credential name, username, secret label, and card details, or an exact credential ID",
               "title": "Search"
             },
-            "description": "Case-insensitive search across credential name, username, secret label, and card details"
+            "description": "Case-insensitive search across credential name, username, secret label, and card details, or an exact credential ID"
           },
           {
             "name": "x-api-key",
@@ -6670,7 +6695,7 @@
           "Runs"
         ],
         "summary": "Get all runs",
-        "description": "List workflow runs across all workflows for the current organization.\n\nResults are paginated and can be filtered by **status**, **search_key**, and **error_code**. All filters are combined with **AND** logic — a run must match every supplied filter to be returned.\n\n### search_key\n\nA case-insensitive substring search that matches against **any** of the following fields:\n\n| Searched field | Description |\n|---|---|\n| `workflow_run_id` | The unique run identifier (e.g. `wr_123…`) |\n| `workflow_permanent_id` | The permanent ID of the workflow that ran (e.g. `wpid_123…`) |\n| Workflow **title** | The title of the workflow that ran |\n| Parameter **key** | The `key` of any workflow parameter definition associated with the run |\n| Parameter **description** | The `description` of any workflow parameter definition |\n| Run parameter **value** | The actual value supplied for any parameter when the run was created |\n| `extra_http_headers` | Extra HTTP headers attached to the run (searched as raw JSON text) |\n| `webhook_callback_url` | The webhook URL the run posts its result to |\n\nSoft-deleted parameter definitions are excluded from key/description matching. A run is returned if **any** of the fields above contain the search term.\n\nA **complete** identifier also matches the run that used it, by exact equality:\n\n| Identifier | Description |\n|---|---|\n| `browser_profile_id` | The browser profile the run used (e.g. `bp_123…`) |\n| `browser_session_id` | The browser session the run used (e.g. `pbs_123…`) |\n| **Credential id** | A credential the run used (e.g. `cred_123…`) |\n| `workflow_run_id` | The run itself (e.g. `wr_123…`) |\n| **Task id** | The workflow run the task ran in, when that run is top-level (e.g. `tsk_123…`) |\n\nA complete browser profile, browser session, workflow run or task id is matched against those identifiers only, not the text fields above. A credential id matches a run when it is the run's sequential credential, the credential the run selected from a pool or fell back to, or the credential bound by a credential parameter on the run's workflow version when the run was created and the run recorded no selection for that parameter. Other pool and fallback members the run did not use do not match.\n\n### error_code\n\nAn **exact-match** filter against the `error_code` field inside each task's `errors` JSON array. A run matches if **any** of its tasks contains an error object with a matching `error_code` value. Error codes are user-defined strings set during workflow execution (e.g. `INVALID_CREDENTIALS`, `LOGIN_FAILED`, `CAPTCHA_DETECTED`).\n\n### Combining filters\n\nAll query parameters use AND logic:\n- `?status=failed` — only failed runs\n- `?status=failed&error_code=LOGIN_FAILED` — failed runs **and** have a LOGIN_FAILED error\n- `?status=failed&error_code=LOGIN_FAILED&search_key=prod_credential` — all three conditions must match",
+        "description": "List workflow runs across all workflows for the current organization.\n\nResults are paginated and can be filtered by **status**, **search_key**, and **error_code**. All filters are combined with **AND** logic — a run must match every supplied filter to be returned.\n\n### search_key\n\nA case-insensitive substring search that matches against **any** of the following fields:\n\n| Searched field | Description |\n|---|---|\n| `workflow_run_id` | The unique run identifier (e.g. `wr_123…`) |\n| `workflow_permanent_id` | The permanent ID of the workflow that ran (e.g. `wpid_123…`) |\n| Workflow **title** | The title of the workflow that ran |\n| Parameter **key** | The `key` of any workflow parameter definition associated with the run |\n| Parameter **description** | The `description` of any workflow parameter definition |\n| Run parameter **value** | The actual value supplied for any parameter when the run was created |\n| `extra_http_headers` | Extra HTTP headers attached to the run (searched as raw JSON text) |\n| `webhook_callback_url` | The webhook URL the run posts its result to |\n\nSoft-deleted parameter definitions are excluded from key/description matching. A run is returned if **any** of the fields above contain the search term.\n\nA **complete** identifier also matches the run that used it, by exact equality:\n\n| Identifier | Description |\n|---|---|\n| `browser_profile_id` | The browser profile the run used (e.g. `bp_123…`) |\n| `browser_session_id` | The browser session the run used (e.g. `pbs_123…`) |\n| **Credential id** | A credential the run used (e.g. `cred_123…`) |\n| `workflow_run_id` | The run itself (e.g. `wr_123…`) |\n| **Task id** | The workflow run the task ran in, when that run is top-level (e.g. `tsk_123…`) |\n\nA complete browser profile, browser session, workflow run or task id is matched against those identifiers only, not the text fields above. A credential id matches a run when it is the run's sequential credential, the credential the run selected from a pool or fell back to, or the credential bound by a credential parameter on the run's workflow version when the run was created and the run recorded no selection for that parameter. Other pool and fallback members the run did not use do not match.\n\n### Default search window\n\nA `search_key` other than a complete browser profile, browser session, workflow run or task id is matched only against runs created in the **30 days before `created_at_end`** (or before now) unless the request supplies `created_at_start`. This includes complete credential ids. Supply `created_at_start` (and optionally `created_at_end`) to search a different range. Explicit bounds apply to every search, complete ids included. Listings without `search_key` are not windowed. To fetch one run by its id, use `GET /v1/runs/{run_id}`.\n\n### created_at_start / created_at_end\n\nOptional ISO 8601 bounds on the run's creation time: `created_at_start` is inclusive and `created_at_end` is exclusive. A timestamp without an offset is read as UTC.\n\n### error_code\n\nAn **exact-match** filter against the `error_code` field inside each task's `errors` JSON array. A run matches if **any** of its tasks contains an error object with a matching `error_code` value. Error codes are user-defined strings set during workflow execution (e.g. `INVALID_CREDENTIALS`, `LOGIN_FAILED`, `CAPTCHA_DETECTED`).\n\n### Combining filters\n\nAll query parameters use AND logic:\n- `?status=failed` — only failed runs\n- `?status=failed&error_code=LOGIN_FAILED` — failed runs **and** have a LOGIN_FAILED error\n- `?status=failed&error_code=LOGIN_FAILED&search_key=prod_credential` — all three conditions must match (searched over the last 30 days)\n- `?search_key=prod_credential&created_at_start=2026-01-01T00:00:00Z&created_at_end=2026-02-01T00:00:00Z` — search one explicit month",
         "operationId": "get_workflow_runs_v1_workflows_runs_get",
         "parameters": [
           {
@@ -6734,7 +6759,7 @@
                   "type": "null"
                 }
               ],
-              "description": "Case-insensitive substring search across: workflow run ID, parameter key, parameter description, run parameter value, extra HTTP headers and webhook callback URL. A run is returned if any of these fields match. Soft-deleted parameter definitions are excluded from key/description matching. A complete browser profile ID, browser session ID or credential ID matches the run that used it exactly (no substring match). A complete workflow run ID matches that run. A complete task ID matches the workflow run the task ran in, when this list includes that run, or the standalone task itself where standalone tasks are listed. A complete browser profile, browser session, workflow run or task ID is matched against those identifiers only, not the text fields. A credential ID matches when it is the run's sequential credential, the credential the run selected from a pool or fell back to, or the credential bound by a credential parameter on the run's workflow version when the run was created and the run recorded no selection for it. The workflow title and workflow permanent ID are matched as well.",
+              "description": "Case-insensitive substring search across: workflow run ID, parameter key, parameter description, run parameter value, extra HTTP headers and webhook callback URL. A run is returned if any of these fields match. Soft-deleted parameter definitions are excluded from key/description matching. A complete browser profile ID, browser session ID or credential ID matches the run that used it exactly (no substring match). A complete workflow run ID matches that run. A complete task ID matches the workflow run the task ran in, when this list includes that run, or the standalone task itself where standalone tasks are listed. A complete browser profile, browser session, workflow run or task ID is matched against those identifiers only, not the text fields. A credential ID matches when it is the run's sequential credential, the credential the run selected from a pool or fell back to, or the credential bound by a credential parameter on the run's workflow version when the run was created and the run recorded no selection for it. The workflow title and workflow permanent ID are matched as well. Without created_at_start, a search other than a complete browser profile, browser session, workflow run or task ID covers only runs created in the 30 days before created_at_end (or before now).",
               "examples": [
                 "login_url",
                 "wr_abc123",
@@ -6743,7 +6768,7 @@
               ],
               "title": "Search Key"
             },
-            "description": "Case-insensitive substring search across: workflow run ID, parameter key, parameter description, run parameter value, extra HTTP headers and webhook callback URL. A run is returned if any of these fields match. Soft-deleted parameter definitions are excluded from key/description matching. A complete browser profile ID, browser session ID or credential ID matches the run that used it exactly (no substring match). A complete workflow run ID matches that run. A complete task ID matches the workflow run the task ran in, when this list includes that run, or the standalone task itself where standalone tasks are listed. A complete browser profile, browser session, workflow run or task ID is matched against those identifiers only, not the text fields. A credential ID matches when it is the run's sequential credential, the credential the run selected from a pool or fell back to, or the credential bound by a credential parameter on the run's workflow version when the run was created and the run recorded no selection for it. The workflow title and workflow permanent ID are matched as well."
+            "description": "Case-insensitive substring search across: workflow run ID, parameter key, parameter description, run parameter value, extra HTTP headers and webhook callback URL. A run is returned if any of these fields match. Soft-deleted parameter definitions are excluded from key/description matching. A complete browser profile ID, browser session ID or credential ID matches the run that used it exactly (no substring match). A complete workflow run ID matches that run. A complete task ID matches the workflow run the task ran in, when this list includes that run, or the standalone task itself where standalone tasks are listed. A complete browser profile, browser session, workflow run or task ID is matched against those identifiers only, not the text fields. A credential ID matches when it is the run's sequential credential, the credential the run selected from a pool or fell back to, or the credential bound by a credential parameter on the run's workflow version when the run was created and the run recorded no selection for it. The workflow title and workflow permanent ID are matched as well. Without created_at_start, a search other than a complete browser profile, browser session, workflow run or task ID covers only runs created in the 30 days before created_at_end (or before now)."
           },
           {
             "name": "error_code",
@@ -6768,6 +6793,50 @@
               "title": "Error Code"
             },
             "description": "Exact-match filter on the error_code field inside each task's errors JSON array. A run matches if any of its tasks contains an error with a matching error_code. Error codes are user-defined strings set during workflow execution."
+          },
+          {
+            "name": "created_at_start",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string",
+                  "format": "date-time"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "Only include runs created at or after this timestamp (ISO 8601; a value without an offset is read as UTC). Supplying it replaces the 30-day default window of a free-text search_key.",
+              "examples": [
+                "2026-01-01T00:00:00Z"
+              ],
+              "title": "Created At Start"
+            },
+            "description": "Only include runs created at or after this timestamp (ISO 8601; a value without an offset is read as UTC). Supplying it replaces the 30-day default window of a free-text search_key."
+          },
+          {
+            "name": "created_at_end",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string",
+                  "format": "date-time"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "Only include runs created strictly before this timestamp (ISO 8601; a value without an offset is read as UTC). Without created_at_start, a free-text search_key covers the 30 days before this timestamp.",
+              "examples": [
+                "2026-02-01T00:00:00Z"
+              ],
+              "title": "Created At End"
+            },
+            "description": "Only include runs created strictly before this timestamp (ISO 8601; a value without an offset is read as UTC). Without created_at_start, a free-text search_key covers the 30 days before this timestamp."
           },
           {
             "name": "x-api-key",
@@ -7856,6 +7925,41 @@
             "application/json": {
               "schema": {
                 "properties": {
+                  "webhook_url": {
+                    "anyOf": [
+                      {
+                        "type": "string"
+                      },
+                      {
+                        "type": "null"
+                      }
+                    ],
+                    "format": "uri",
+                    "title": "Webhook Url",
+                    "description": "After a run is finished, send an update to this URL. Refer to https://www.skyvern.com/docs/running-tasks/webhooks-faq for more details.",
+                    "examples": [
+                      "https://my-site.com/webhook"
+                    ]
+                  },
+                  "proxy_location": {
+                    "anyOf": [
+                      {
+                        "$ref": "#/components/schemas/ProxyLocation"
+                      },
+                      {
+                        "$ref": "#/components/schemas/GeoTarget"
+                      },
+                      {
+                        "additionalProperties": true,
+                        "type": "object"
+                      },
+                      {
+                        "type": "null"
+                      }
+                    ],
+                    "title": "Proxy Location",
+                    "description": "Geographic Proxy location to route the browser traffic through. This is only available in Skyvern Cloud.\n\nAvailable geotargeting options:\n- RESIDENTIAL: the default value. Skyvern Cloud uses a random US residential proxy.\n- RESIDENTIAL_ES: Spain\n- RESIDENTIAL_IE: Ireland\n- RESIDENTIAL_GB: United Kingdom\n- RESIDENTIAL_IN: India\n- RESIDENTIAL_JP: Japan\n- RESIDENTIAL_FR: France\n- RESIDENTIAL_DE: Germany\n- RESIDENTIAL_NZ: New Zealand\n- RESIDENTIAL_PH: Philippines\n- RESIDENTIAL_KR: South Korea\n- RESIDENTIAL_SA: Saudi Arabia\n- RESIDENTIAL_ZA: South Africa\n- RESIDENTIAL_AR: Argentina\n- RESIDENTIAL_AU: Australia\n- RESIDENTIAL_BR: Brazil\n- RESIDENTIAL_TR: Turkey\n- RESIDENTIAL_CA: Canada\n- RESIDENTIAL_MX: Mexico\n- RESIDENTIAL_IT: Italy\n- RESIDENTIAL_NL: Netherlands\n- RESIDENTIAL_ISP: ISP proxy\n- US-CA: California (deprecated, routes through RESIDENTIAL_ISP)\n- US-NY: New York (deprecated, routes through RESIDENTIAL_ISP)\n- US-TX: Texas (deprecated, routes through RESIDENTIAL_ISP)\n- US-FL: Florida (deprecated, routes through RESIDENTIAL_ISP)\n- US-WA: Washington (deprecated, routes through RESIDENTIAL_ISP)\n- NONE: No proxy\n\nFor self-hosted deployments, you can pass a custom proxy URL as a dict: {\"url\": \"http://user:password@proxy.example.com:8080\"}. This routes the browser through your own proxy server and takes precedence over any globally configured proxy pool. Can also be a GeoTarget object for granular city/state targeting: {\"country\": \"US\", \"subdivision\": \"CA\", \"city\": \"San Francisco\"}. Omit it or send null to use the default; Skyvern Cloud then uses RESIDENTIAL."
+                  },
                   "job_url": {
                     "type": "string",
                     "format": "uri",
@@ -7921,6 +8025,41 @@
             "application/json": {
               "schema": {
                 "properties": {
+                  "webhook_url": {
+                    "anyOf": [
+                      {
+                        "type": "string"
+                      },
+                      {
+                        "type": "null"
+                      }
+                    ],
+                    "format": "uri",
+                    "title": "Webhook Url",
+                    "description": "After a run is finished, send an update to this URL. Refer to https://www.skyvern.com/docs/running-tasks/webhooks-faq for more details.",
+                    "examples": [
+                      "https://my-site.com/webhook"
+                    ]
+                  },
+                  "proxy_location": {
+                    "anyOf": [
+                      {
+                        "$ref": "#/components/schemas/ProxyLocation"
+                      },
+                      {
+                        "$ref": "#/components/schemas/GeoTarget"
+                      },
+                      {
+                        "additionalProperties": true,
+                        "type": "object"
+                      },
+                      {
+                        "type": "null"
+                      }
+                    ],
+                    "title": "Proxy Location",
+                    "description": "Geographic Proxy location to route the browser traffic through. This is only available in Skyvern Cloud.\n\nAvailable geotargeting options:\n- RESIDENTIAL: the default value. Skyvern Cloud uses a random US residential proxy.\n- RESIDENTIAL_ES: Spain\n- RESIDENTIAL_IE: Ireland\n- RESIDENTIAL_GB: United Kingdom\n- RESIDENTIAL_IN: India\n- RESIDENTIAL_JP: Japan\n- RESIDENTIAL_FR: France\n- RESIDENTIAL_DE: Germany\n- RESIDENTIAL_NZ: New Zealand\n- RESIDENTIAL_PH: Philippines\n- RESIDENTIAL_KR: South Korea\n- RESIDENTIAL_SA: Saudi Arabia\n- RESIDENTIAL_ZA: South Africa\n- RESIDENTIAL_AR: Argentina\n- RESIDENTIAL_AU: Australia\n- RESIDENTIAL_BR: Brazil\n- RESIDENTIAL_TR: Turkey\n- RESIDENTIAL_CA: Canada\n- RESIDENTIAL_MX: Mexico\n- RESIDENTIAL_IT: Italy\n- RESIDENTIAL_NL: Netherlands\n- RESIDENTIAL_ISP: ISP proxy\n- US-CA: California (deprecated, routes through RESIDENTIAL_ISP)\n- US-NY: New York (deprecated, routes through RESIDENTIAL_ISP)\n- US-TX: Texas (deprecated, routes through RESIDENTIAL_ISP)\n- US-FL: Florida (deprecated, routes through RESIDENTIAL_ISP)\n- US-WA: Washington (deprecated, routes through RESIDENTIAL_ISP)\n- NONE: No proxy\n\nFor self-hosted deployments, you can pass a custom proxy URL as a dict: {\"url\": \"http://user:password@proxy.example.com:8080\"}. This routes the browser through your own proxy server and takes precedence over any globally configured proxy pool. Can also be a GeoTarget object for granular city/state targeting: {\"country\": \"US\", \"subdivision\": \"CA\", \"city\": \"San Francisco\"}. Omit it or send null to use the default; Skyvern Cloud then uses RESIDENTIAL."
+                  },
                   "job_url": {
                     "type": "string",
                     "format": "uri",
@@ -8041,6 +8180,31 @@
                     "type": "string",
                     "format": "binary",
                     "title": "Resume File"
+                  },
+                  "webhook_url": {
+                    "anyOf": [
+                      {
+                        "type": "string"
+                      },
+                      {
+                        "type": "null"
+                      }
+                    ],
+                    "format": "uri",
+                    "title": "Webhook Url",
+                    "description": "After a run is finished, send an update to this URL. Refer to https://www.skyvern.com/docs/running-tasks/webhooks-faq for more details."
+                  },
+                  "proxy_location": {
+                    "anyOf": [
+                      {
+                        "type": "string"
+                      },
+                      {
+                        "type": "null"
+                      }
+                    ],
+                    "title": "Proxy Location",
+                    "description": "A ProxyLocation name such as RESIDENTIAL_GB, or JSON text for a GeoTarget or custom proxy object. Omit it or send blank text to use the default; Skyvern Cloud then uses RESIDENTIAL."
                   },
                   "other_information": {
                     "anyOf": [
@@ -8291,6 +8455,54 @@
             }
           },
           {
+            "name": "action",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Action"
+            }
+          },
+          {
+            "name": "actor_user_id",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Actor User Id"
+            }
+          },
+          {
+            "name": "resource_type",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Resource Type"
+            }
+          },
+          {
             "name": "limit",
             "in": "query",
             "required": false,
@@ -8388,6 +8600,149 @@
           }
         },
         "x-fern-sdk-method-name": "export_audit_events"
+      }
+    },
+    "/v1/audit-events/runs/export": {
+      "get": {
+        "tags": [
+          "Server"
+        ],
+        "summary": "Export workflow run activity",
+        "description": "Export top-level workflow runs for the authenticated organization as JSON or CSV. Only organization admins and full API keys may export. The default window is the last 90 days, with timezone-aware since/until bounds, newest-first keyset pagination, and a maximum page size of 500. CSV output uses fixed columns and is protected from spreadsheet formula execution.",
+        "operationId": "export_run_activity_v1_audit_events_runs_export_get",
+        "parameters": [
+          {
+            "name": "since",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string",
+                  "format": "date-time"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Since"
+            }
+          },
+          {
+            "name": "until",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string",
+                  "format": "date-time"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Until"
+            }
+          },
+          {
+            "name": "limit",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "maximum": 500,
+              "minimum": 1,
+              "default": 100,
+              "title": "Limit"
+            }
+          },
+          {
+            "name": "cursor",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Cursor"
+            }
+          },
+          {
+            "name": "format",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "enum": [
+                "json",
+                "csv"
+              ],
+              "type": "string",
+              "default": "json",
+              "title": "Format"
+            }
+          },
+          {
+            "name": "x-api-key",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Api-Key"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "A page of workflow run activity as JSON, or a CSV download when format=csv.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RunActivityExportResponse"
+                }
+              },
+              "text/csv": {
+                "schema": {
+                  "type": "string",
+                  "format": "binary"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "The caller must be an organization admin or use a full API key.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AuditExportDenialResponse"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        },
+        "x-fern-sdk-method-name": "export_run_activity"
       }
     }
   },
@@ -8830,6 +9185,18 @@
               }
             ],
             "title": "File Url"
+          },
+          "download_url": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Download Url",
+            "description": "Origin URL recorded by a download action."
           },
           "download": {
             "anyOf": [
@@ -9909,6 +10276,17 @@
             ],
             "title": "Actor User Id"
           },
+          "impersonated_by": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Impersonated By"
+          },
           "auth_kind": {
             "type": "string",
             "title": "Auth Kind"
@@ -9966,6 +10344,7 @@
           "created_at",
           "organization_id",
           "actor_user_id",
+          "impersonated_by",
           "auth_kind",
           "org_role",
           "action",
@@ -10016,6 +10395,28 @@
           "next_action": {
             "type": "string",
             "title": "Next Action"
+          },
+          "role": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Role"
+          },
+          "action": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Action"
           }
         },
         "type": "object",
@@ -11533,6 +11934,28 @@
             ],
             "title": "Warning",
             "description": "Advisory message about how the request was adjusted, if it was. Set when a requested timeout above the maximum was capped at creation, when an extension was granted less than it asked for, or when an extension was accepted but not yet confirmed; null otherwise."
+          },
+          "source": {
+            "type": "string",
+            "enum": [
+              "managed",
+              "external"
+            ],
+            "title": "Source",
+            "description": "\"external\" for a browser the caller registered and runs itself; \"managed\" for one Skyvern runs.",
+            "default": "managed"
+          },
+          "remaining_lifetime_seconds": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Remaining Lifetime Seconds",
+            "description": "Seconds left before a registered external browser's fixed deadline. Null for managed sessions and once the session has ended."
           }
         },
         "type": "object",
@@ -13275,6 +13698,43 @@
             ],
             "description": "Which vault stores this credential (e.g., 'skyvern', 'bitwarden', 'azure_vault', 'custom')"
           },
+          "vault_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Vault Id",
+            "description": "1Password vault ID for linked credentials"
+          },
+          "item_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Item Id",
+            "description": "1Password item ID for linked credentials"
+          },
+          "upstream_missing_at": {
+            "anyOf": [
+              {
+                "type": "string",
+                "format": "date-time"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Upstream Missing At",
+            "description": "When the linked 1Password item was last found missing upstream"
+          },
           "browser_profile_id": {
             "anyOf": [
               {
@@ -13432,7 +13892,8 @@
           "bitwarden",
           "azure_vault",
           "gcp",
-          "custom"
+          "custom",
+          "onepassword"
         ],
         "title": "CredentialVaultType"
       },
@@ -14786,6 +15247,7 @@
           "download_attachments": {
             "type": "boolean",
             "title": "Download Attachments",
+            "description": "Download non-inline attachments from matched emails for downstream blocks.",
             "default": false
           },
           "parameter_keys": {
@@ -14809,6 +15271,14 @@
           "email_client"
         ],
         "title": "EmailInboxBlockYAML"
+      },
+      "EmailTransport": {
+        "type": "string",
+        "enum": [
+          "smtp",
+          "gmail"
+        ],
+        "title": "EmailTransport"
       },
       "ExtendBrowserSessionRequest": {
         "properties": {
@@ -16007,6 +16477,17 @@
           "download_target": {
             "$ref": "#/components/schemas/FileDownloadTarget",
             "default": "website"
+          },
+          "sftp_source_path": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Sftp Source Path"
           }
         },
         "type": "object",
@@ -16269,6 +16750,17 @@
               }
             ],
             "title": "Sftp Host Key"
+          },
+          "sftp_source_path": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Sftp Source Path"
           },
           "path": {
             "anyOf": [
@@ -16693,6 +17185,12 @@
               }
             ],
             "title": "Worksheet"
+          },
+          "force_ocr": {
+            "type": "boolean",
+            "title": "Force Ocr",
+            "description": "PDF only: ignore the PDF's embedded text layer and read the pages with vision OCR instead. Use it when a PDF's text layer is unreadable in a way Skyvern does not detect on its own. OCR reads at most the first 50 pages, so a longer PDF loses the rest; leave this off unless the text layer is unusable.",
+            "default": false
           }
         },
         "type": "object",
@@ -16785,6 +17283,12 @@
               }
             ],
             "title": "Worksheet"
+          },
+          "force_ocr": {
+            "type": "boolean",
+            "title": "Force Ocr",
+            "description": "PDF only: ignore the PDF's embedded text layer and read the pages with vision OCR instead. Use it when a PDF's text layer is unreadable in a way Skyvern does not detect on its own. OCR reads at most the first 50 pages, so a longer PDF loses the rest; leave this off unless the text layer is unusable.",
+            "default": false
           }
         },
         "type": "object",
@@ -22941,6 +23445,118 @@
         "type": "object",
         "title": "RetryRunWebhookRequest"
       },
+      "RunActivityExportResponse": {
+        "properties": {
+          "rows": {
+            "items": {
+              "$ref": "#/components/schemas/RunActivityExportRow"
+            },
+            "type": "array",
+            "title": "Rows"
+          },
+          "next": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Next"
+          }
+        },
+        "type": "object",
+        "required": [
+          "rows",
+          "next"
+        ],
+        "title": "RunActivityExportResponse"
+      },
+      "RunActivityExportRow": {
+        "properties": {
+          "workflow_run_id": {
+            "type": "string",
+            "title": "Workflow Run Id"
+          },
+          "created_at": {
+            "type": "string",
+            "format": "date-time",
+            "title": "Created At"
+          },
+          "workflow_permanent_id": {
+            "type": "string",
+            "title": "Workflow Permanent Id"
+          },
+          "trigger_type": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Trigger Type"
+          },
+          "created_by": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Created By"
+          },
+          "requested_by": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Requested By"
+          },
+          "workflow_schedule_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Workflow Schedule Id"
+          },
+          "retried_from_workflow_run_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Retried From Workflow Run Id"
+          }
+        },
+        "type": "object",
+        "required": [
+          "workflow_run_id",
+          "created_at",
+          "workflow_permanent_id",
+          "trigger_type",
+          "created_by",
+          "requested_by",
+          "workflow_schedule_id",
+          "retried_from_workflow_run_id"
+        ],
+        "title": "RunActivityExportRow"
+      },
       "RunEngine": {
         "type": "string",
         "enum": [
@@ -23775,6 +24391,43 @@
               }
             ],
             "title": "Custom Smtp Password"
+          },
+          "transport": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/EmailTransport"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "credential_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Credential Id"
+          },
+          "cc": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array",
+            "title": "Cc",
+            "default": []
+          },
+          "bcc": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array",
+            "title": "Bcc",
+            "default": []
           }
         },
         "type": "object",
@@ -23936,7 +24589,9 @@
           },
           "sender": {
             "type": "string",
-            "title": "Sender"
+            "title": "Sender",
+            "description": "From address. Required unless transport is 'gmail'.",
+            "default": ""
           },
           "recipients": {
             "items": {
@@ -23970,12 +24625,50 @@
               }
             ],
             "title": "File Attachments"
+          },
+          "transport": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/EmailTransport"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "How the email is sent. Omit for SMTP. 'gmail' sends from the connected Google account named by credential_id; sender and the SMTP settings are then unused."
+          },
+          "credential_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Credential Id",
+            "description": "ID of a connected Google account that has send permission. Used only with transport 'gmail'."
+          },
+          "cc": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array",
+            "title": "Cc",
+            "description": "Cc recipients. Only with transport 'gmail'."
+          },
+          "bcc": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array",
+            "title": "Bcc",
+            "description": "Bcc recipients. Only with transport 'gmail'."
           }
         },
         "type": "object",
         "required": [
           "label",
-          "sender",
           "recipients",
           "subject",
           "body"
@@ -25886,7 +26579,7 @@
               }
             ],
             "title": "Totp Identifier",
-            "description": "\nIdentifier for the TOTP/2FA/MFA code when the code is pushed to Skyvern. Refer to https://www.skyvern.com/docs/credentials/totp#option-3-push-code-to-skyvern for more details.\n",
+            "description": "\nIdentifier for the TOTP/2FA/MFA code when the code is pushed to Skyvern. Refer to https://www.skyvern.com/docs/credentials#push-a-code for more details.\n",
             "examples": [
               "john.doe@example.com",
               "4155555555",
@@ -25903,7 +26596,7 @@
               }
             ],
             "title": "Totp Url",
-            "description": "\nURL that serves TOTP/2FA/MFA codes for Skyvern to use during the workflow run. Refer to https://www.skyvern.com/docs/credentials/totp#option-2-get-code-from-your-endpoint for more details.\n",
+            "description": "\nURL that serves TOTP/2FA/MFA codes for Skyvern to use during the workflow run. Refer to https://www.skyvern.com/docs/credentials#let-skyvern-fetch-codes-from-your-endpoint for more details.\n",
             "examples": [
               "https://my-totp-service.com/totp"
             ]
@@ -26227,7 +26920,7 @@
               }
             ],
             "title": "Totp Identifier",
-            "description": "\nIdentifier for the TOTP/2FA/MFA code when the code is pushed to Skyvern. Refer to https://www.skyvern.com/docs/credentials/totp#option-3-push-code-to-skyvern for more details.\n",
+            "description": "\nIdentifier for the TOTP/2FA/MFA code when the code is pushed to Skyvern. Refer to https://www.skyvern.com/docs/credentials#push-a-code for more details.\n",
             "examples": [
               "john.doe@example.com",
               "4155555555",
@@ -26244,7 +26937,7 @@
               }
             ],
             "title": "Totp Url",
-            "description": "\nURL that serves TOTP/2FA/MFA codes for Skyvern to use during the workflow run. Refer to https://www.skyvern.com/docs/credentials/totp#option-2-get-code-from-your-endpoint for more details.\n",
+            "description": "\nURL that serves TOTP/2FA/MFA codes for Skyvern to use during the workflow run. Refer to https://www.skyvern.com/docs/credentials#let-skyvern-fetch-codes-from-your-endpoint for more details.\n",
             "examples": [
               "https://my-totp-service.com/totp"
             ]
@@ -30324,6 +31017,17 @@
             ],
             "title": "Edited By"
           },
+          "build_source": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/WorkflowBuildSource"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Which surface wrote this version: ui, copilot, mcp, cli, api, or internal. Null before tracking began."
+          },
           "copilot_authored": {
             "type": "boolean",
             "title": "Copilot Authored",
@@ -30408,6 +31112,19 @@
           "agent_id"
         ],
         "title": "Workflow"
+      },
+      "WorkflowBuildSource": {
+        "type": "string",
+        "enum": [
+          "ui",
+          "copilot",
+          "mcp",
+          "cli",
+          "api",
+          "internal"
+        ],
+        "title": "WorkflowBuildSource",
+        "description": "Which surface wrote a workflow version.\n\n- ui: the Skyvern app\n- copilot: the workflow copilot\n- mcp: a first-party MCP client\n- cli: the Skyvern CLI\n- api: any other API or SDK caller\n- internal: a workflow Skyvern creates for its own runs (task v2, login, credential tests)"
       },
       "WorkflowCreateYAMLRequest": {
         "properties": {
@@ -32835,7 +33552,7 @@
               }
             ],
             "title": "Totp Url",
-            "description": "\nURL that serves TOTP/2FA/MFA codes for Skyvern to use during the workflow run. Refer to https://www.skyvern.com/docs/credentials/totp#option-2-get-code-from-your-endpoint for more details.\n",
+            "description": "\nURL that serves TOTP/2FA/MFA codes for Skyvern to use during the workflow run. Refer to https://www.skyvern.com/docs/credentials#let-skyvern-fetch-codes-from-your-endpoint for more details.\n",
             "examples": [
               "https://my-totp-service.com/totp"
             ]
@@ -32850,7 +33567,7 @@
               }
             ],
             "title": "Totp Identifier",
-            "description": "\nIdentifier for the TOTP/2FA/MFA code when the code is pushed to Skyvern. Refer to https://www.skyvern.com/docs/credentials/totp#option-3-push-code-to-skyvern for more details.\n",
+            "description": "\nIdentifier for the TOTP/2FA/MFA code when the code is pushed to Skyvern. Refer to https://www.skyvern.com/docs/credentials#push-a-code for more details.\n",
             "examples": [
               "john.doe@example.com",
               "4155555555",
@@ -33134,7 +33851,7 @@
               }
             ],
             "title": "Totp Url",
-            "description": "\nURL that serves TOTP/2FA/MFA codes for Skyvern to use during the workflow run. Refer to https://www.skyvern.com/docs/credentials/totp#option-2-get-code-from-your-endpoint for more details.\n",
+            "description": "\nURL that serves TOTP/2FA/MFA codes for Skyvern to use during the workflow run. Refer to https://www.skyvern.com/docs/credentials#let-skyvern-fetch-codes-from-your-endpoint for more details.\n",
             "examples": [
               "https://my-totp-service.com/totp"
             ]
@@ -33149,7 +33866,7 @@
               }
             ],
             "title": "Totp Identifier",
-            "description": "\nIdentifier for the TOTP/2FA/MFA code when the code is pushed to Skyvern. Refer to https://www.skyvern.com/docs/credentials/totp#option-3-push-code-to-skyvern for more details.\n",
+            "description": "\nIdentifier for the TOTP/2FA/MFA code when the code is pushed to Skyvern. Refer to https://www.skyvern.com/docs/credentials#push-a-code for more details.\n",
             "examples": [
               "john.doe@example.com",
               "4155555555",
@@ -33832,7 +34549,7 @@
           "job_recipe_apply"
         ],
         "title": "WorkflowRunTriggerType",
-        "description": "How a workflow run was initiated.\n\n- manual: User clicked \"Run\" in the UI\n- mcp: First-party MCP client request\n- api: Direct API call to the run endpoint\n- scheduled: Triggered by a cron schedule\n- webhook: Triggered by an external system via the webhook endpoint\n- event: Triggered by an external event source\n- job_recipe_extract: Launched by a job recipe extract request\n- job_recipe_apply: Launched by a job recipe apply request"
+        "description": "How a workflow run was initiated.\n\n- manual: User clicked \"Run\" in the UI\n- mcp: First-party MCP client or Skyvern CLI request\n- api: Direct API call to the run endpoint\n- scheduled: Triggered by a cron schedule\n- webhook: Triggered by an external system via the webhook endpoint\n- event: Triggered by an external event source\n- job_recipe_extract: Launched by a job recipe extract request\n- job_recipe_apply: Launched by a job recipe apply request"
       },
       "WorkflowSchedule": {
         "properties": {
@@ -33967,6 +34684,18 @@
               }
             ],
             "title": "Description"
+          },
+          "created_by": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Created By",
+            "description": "Who the schedule runs as; null for schedules created before owners were recorded."
           },
           "created_at": {
             "type": "string",
