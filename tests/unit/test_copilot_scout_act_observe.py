@@ -92,6 +92,7 @@ _LANDING_URL = "https://example.com/results"
 @pytest.fixture(autouse=True)
 def _page_evidence_fingerprint_key(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(settings, "SECRET_KEY", "test-page-evidence-key")
+    monkeypatch.setattr(settings, "COPILOT_SCOUT_ACT_OBSERVE_RECAPTURE_DELAY_SECONDS", 0.05)
 
 
 _SCHEMA_LESS_PACKET_KEYS = {

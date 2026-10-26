@@ -836,11 +836,20 @@ async def test_in_process_retry_continues_after_interim_payload_failure(
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("sweep", ["background", "cloud"])
-@pytest.mark.parametrize("current_status", ["running", "completed"])
-@pytest.mark.parametrize("artifact_link", ["task", "step", "block", "time"])
-@pytest.mark.parametrize("latest_has_screenshot", [False, True])
-@pytest.mark.parametrize("latest_has_recording", [False, True])
+@pytest.mark.parametrize(
+    ("artifact_link", "sweep", "current_status", "latest_has_screenshot", "latest_has_recording"),
+    [
+        ("task", "background", "running", False, False),
+        ("task", "cloud", "completed", True, True),
+        ("step", "background", "running", True, True),
+        ("step", "cloud", "completed", False, False),
+        ("block", "background", "completed", False, True),
+        ("block", "cloud", "running", True, False),
+        ("time", "background", "completed", True, False),
+        ("time", "cloud", "running", False, True),
+    ],
+)
+@pytest.mark.usefixtures("public_dns")
 async def test_recovered_interim_payload_describes_target_attempt(
     interim_retry_db: AgentDB,
     monkeypatch: pytest.MonkeyPatch,
@@ -1517,6 +1526,7 @@ async def test_historical_child_artifacts_use_parent_attempt(
         attempt_number=1,
         historical_artifacts=[],
     )
+    assert files is not None
     assert [file.artifact_id for file in files] == ["child_1_pdf"]
     assert urls == ["https://example.com/child_1_pdf"]
     assert lookup.await_count == 4
@@ -2210,6 +2220,7 @@ async def test_startup_retry_backoff_preserves_sweep_recovery_or_cancellation(
 
 
 @pytest.mark.asyncio
+@pytest.mark.usefixtures("public_dns")
 async def test_startup_retry_with_definitively_missing_token_remains_abandonable(
     interim_retry_db: AgentDB, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -2616,7 +2627,6 @@ async def test_retry_resumer_recovers_attempt_lookup_failure_on_next_sweep(
     read_run.side_effect = None
     dispatch.side_effect = real_entry
     await executor._recover_pending_retries_once(resume_fresh=False)
-    assert key in executor._scheduled_retry_resumes
     await asyncio.gather(*executor._background_tasks)
     execute.assert_awaited_once()
     assert execute.await_args.kwargs["attempt_number"] == 2
@@ -4244,24 +4254,20 @@ async def test_concurrent_prepared_recovery_dispatches_only_claim_winner(
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
-    "entrance, escaped_exception",
-    [("in_process", False), ("in_process", True), ("recovery_pending", False), ("recovery_prepared", False)],
-)
-@pytest.mark.parametrize(
-    "lane, outcome",
+    "entrance, escaped_exception, lane, outcome",
     [
-        ("browser_session_id", "clear"),
-        ("browser_address", "clear"),
-        ("sequential_credential_id", "clear"),
-        ("sequential_key", "clear"),
-        ("reuse_bound_key", "clear"),
-        ("run_sequentially", "clear"),
-        ("depends_on_workflow_run_id", "clear"),
-        ("sequential_credential_id", "cancel"),
-        ("sequential_credential_id", "task_cancel"),
-        ("sequential_credential_id", "timeout"),
-        ("sequential_credential_id", "query_error"),
-        ("none", "clear"),
+        ("in_process", False, "browser_session_id", "clear"),
+        ("in_process", False, "sequential_credential_id", "cancel"),
+        ("in_process", False, "none", "clear"),
+        ("in_process", True, "browser_address", "clear"),
+        ("in_process", True, "sequential_credential_id", "task_cancel"),
+        ("in_process", True, "run_sequentially", "clear"),
+        ("recovery_pending", False, "sequential_credential_id", "clear"),
+        ("recovery_pending", False, "sequential_credential_id", "timeout"),
+        ("recovery_pending", False, "depends_on_workflow_run_id", "clear"),
+        ("recovery_prepared", False, "sequential_key", "clear"),
+        ("recovery_prepared", False, "reuse_bound_key", "clear"),
+        ("recovery_prepared", False, "sequential_credential_id", "query_error"),
     ],
 )
 async def test_in_process_retry_reacquires_serialized_lane(

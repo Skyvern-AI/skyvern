@@ -141,6 +141,11 @@ class Settings(BaseSettings):
     TEMP_PATH: str = "./temp"
     DOWNLOAD_PATH: str = f"{REPO_ROOT_DIR}/downloads"
     BROWSER_ACTION_TIMEOUT_MS: int = 5000
+    # Playwright's `Locator.count()` and the iframe-chain `query_selector`/`content_frame` probes take
+    # no timeout argument, so a renderer that stopped answering leaves each one waiting on a protocol
+    # reply forever. The action deadline adds its headroom to this budget; expiry means the page stopped
+    # answering, not that a healthy lookup was merely slow.
+    BROWSER_ELEMENT_LOOKUP_TIMEOUT_MS: int = 5000
     BROWSER_ACTION_MAX_EXECUTION_SECONDS: int = 1200
     WORKER_STALL_DUMP_SECONDS: int = 0
     # "enforce" is deliberately absent: the policy core can only observe until every sink consumes
@@ -181,6 +186,12 @@ class Settings(BaseSettings):
     # picks from whatever loaded — so this is kept short enough that a never-settling menu costs
     # seconds rather than the minutes a run's elapsed budget cannot absorb.
     OPTION_LOADING_TIMEOUT_MS: int = 60000
+    # Wall-clock budget for the autocomplete guessed-value fanout, measured from the ladder's first
+    # probe. The probe for the requested value always runs; this only gates the LLM-guessed retries,
+    # each of which costs a full clear-and-retype plus a DOM scrape. Without it a control whose
+    # options never match spent minutes per field before the discovery fallback was reached. The budget
+    # stops new guesses from starting; a guess already in progress may overrun it. 0 disables this limit.
+    AUTO_COMPLETION_LADDER_BUDGET_SECONDS: float = 60.0
     MAX_STEPS_PER_RUN: int = 10
     MAX_STEPS_PER_TASK_V2: int = 25
     MAX_ITERATIONS_PER_TASK_V2: int = 50
@@ -288,7 +299,6 @@ class Settings(BaseSettings):
     # so this is a guaranteed no-op behind app.CACHE.is_shared regardless of this flag.
     WORKFLOW_COPILOT_CREDENTIAL_PAUSE_ENABLED: bool = True
     WORKFLOW_COPILOT_CREDENTIAL_PAUSE_TIMEOUT_SECONDS: int = 300
-    WORKFLOW_COPILOT_DEMONSTRATION_ENABLED: bool = False
     # Replaces the pause countdown once when the user chooses to sign in themselves in the live browser.
     WORKFLOW_COPILOT_MANUAL_SIGN_IN_TIMEOUT_SECONDS: int = 900
     # Kill switch for the live codegen-progress SSE frame (drafted block labels while an authoring
@@ -300,7 +310,7 @@ class Settings(BaseSettings):
     # The caller-supplied header is not an authorization: on a shared deployment only API
     # credentials belonging to these explicitly configured eval organizations may seed an entry point.
     WORKFLOW_COPILOT_ODYSSEYS_EVAL_ORGANIZATION_IDS: list[str] = []
-    WORKFLOW_COPILOT_EVAL_LLM_OVERRIDES_ENABLED: bool = False
+    # Request-scoped model overrides require an authenticated organization in this allowlist.
     WORKFLOW_COPILOT_EVAL_LLM_OVERRIDES_ORGANIZATION_IDS: list[str] = []
     WORKFLOW_COPILOT_EVAL_COST_ENABLED: bool = False
     WORKFLOW_COPILOT_EVAL_COST_ORGANIZATION_IDS: list[str] = []
@@ -372,6 +382,14 @@ class Settings(BaseSettings):
     AWS_REGION: str = "us-east-1"
     MAX_UPLOAD_FILE_SIZE: int = 30 * 1024 * 1024  # 30 MB
     MAX_HTTP_DOWNLOAD_FILE_SIZE: int = 500 * 1024 * 1024  # 500 MB
+    # Most memory a pdfplumber child may add (RLIMIT_AS on Linux, an RSS watchdog everywhere); rendering a 300 dpi A0
+    # or A1 scan for OCR can need more than 512 MiB. A pod with less free memory than this, after a 256 MiB margin and
+    # the result reserve, gets what is left, and under 128 MiB the call fails, because memory.oom.group kills the whole
+    # worker at its limit.
+    PDFPLUMBER_MAX_MEMORY_BYTES: int = Field(default=1536 * 1024 * 1024, gt=0)
+    # Most page PNG data a pdfplumber child may hand back for OCR; text, word and page-count results have smaller caps
+    # in pdf_parser. The parent holds a result outside the child's memory cap, so it reserves the decoded size.
+    PDFPLUMBER_MAX_RESULT_BYTES: int = Field(default=256 * 1024 * 1024, gt=0)
     PRESIGNED_URL_EXPIRATION: int = 60 * 60 * 24  # 24 hours
     # Ceiling on the retention_days a caller may request at upload time. A cap exists so a
     # retention period cannot be used to pin storage indefinitely; omitting retention_days
@@ -411,6 +429,7 @@ class Settings(BaseSettings):
     POSTHOG_PROJECT_HOST: str = "https://app.posthog.com"
     MCP_POSTHOG_PROJECT_API_KEY: str | None = "phc_m4epBbGS1Hf4NPRFNpR4WQ9Ob6yGy6SLbQckBxp3n0P"
     MCP_POSTHOG_PROJECT_HOST: str = "https://app.posthog.com"
+    AGENT_FEEDBACK_HOURLY_LIMIT: int = 20
 
     # email settings
     SMTP_HOST: str = "localhost"
@@ -433,18 +452,6 @@ class Settings(BaseSettings):
     # set both to record at an explicit resolution.
     BROWSER_RECORDING_WIDTH: int | None = None
     BROWSER_RECORDING_HEIGHT: int | None = None
-    # Max concurrent LLM enrichment calls per live browser-recording interpretation
-    # session. Bounds the per-action enrichment fan-out so a burst of interactions
-    # can't flood the event loop with simultaneous LLM requests.
-    RECORDING_ENRICHMENT_MAX_CONCURRENCY: int = 4
-    # LLM used to enrich live recording draft steps (label/title/goal). A fast, cheap
-    # model keeps the click->labeled-draft latency low. Falls back to the default
-    # LLM_API_HANDLER when the key is unset or not registered in this environment.
-    RECORDING_ENRICHMENT_LLM_KEY: str = "GEMINI_3.1_FLASH_LITE"
-    # Server-side kill switch for delta interpretation updates. Deltas are also
-    # gated per-connection on the client declaring support (begin-exfiltration
-    # supports_interpretation_deltas); this only force-disables them everywhere.
-    RECORDING_INTERPRETATION_DELTAS_ENABLED: bool = True
     BROWSER_POLICY_FILE: str = "/etc/chromium/policies/managed/policies.json"
     BROWSER_LOGS_ENABLED: bool = True
     BROWSER_CURSOR_VISUALIZATION: bool = False
@@ -474,7 +481,8 @@ class Settings(BaseSettings):
     BITWARDEN_TIMEOUT_SECONDS: int = 60
     # A cold `bw login` downloads and decrypts the whole vault, so it is categorically slower than the
     # reads behind it and needs its own budget. Runs arriving as a batch each start on their own pod and
-    # pay that login concurrently, which pushes it well past a budget sized for a read.
+    # pay that login concurrently, which pushes it well past a budget sized for a read. The unlock that
+    # follows an API-key login gets the same budget.
     BITWARDEN_LOGIN_TIMEOUT_SECONDS: int = 180
     BITWARDEN_MAX_RETRIES: int = 3
     BITWARDEN_MAX_JITTER_SECONDS: float = 2.0
@@ -567,6 +575,11 @@ class Settings(BaseSettings):
     # Fraction of Task V3 runs (keyed by workflow run, else task) that persist their last pre-submit
     # page frames as artifacts. Instrumentation sampling, not a traffic knob; 0 disables.
     TASK_V3_PRE_SUBMIT_CAPTURE_SAMPLE_RATE: float = 0.25
+    # Kill switch: one page DOM per Task V3 block, saved after the loop as html_action (v1 saves html_scrape).
+    TASK_V3_BLOCK_END_DOM: bool = True
+    # Fraction of Task V3 runs (keyed like the pre-submit sample) that store the page DOM on every turn step and
+    # flush each turn's archive as the turn ends; the rest keep one archive ZIP per block. 0 disables.
+    TASK_V3_TURN_DOM_SAMPLE_RATE: float = 0.05
     # Kill switch for the tier-1 semantic commit read (SKY-15322): decisive-accept-only ARIA/value
     # probe consulted before the shape heuristics, which remain the fallback either way.
     TASK_V3_SEMANTIC_COMMIT_VERIFY: bool = True
@@ -580,6 +593,15 @@ class Settings(BaseSettings):
     # Hold the first click or Enter after a password fill until 45 s after Task V3 started the block. Force-on term
     # only: runs are randomized per run by the flag of the same name, read through run_arm_enabled(LOGIN_PACE_FLAG, ...).
     TASK_V3_LOGIN_PACE: bool = False
+    # Return an in-loop navigate's 404/410 to the model as the navigate result instead of ending the run (SKY-16206).
+    # Force-on term only: runs are randomized per run by the flag of the same name (DEAD_END_RETURN_FLAG).
+    TASK_V3_DEAD_END_RETURN: bool = False
+    # Store the error code v3's model chose on finish instead of the post-run page guess. Off: the guess is stored
+    # as before. Retry policies match on stored codes, so turning this on can change which runs retry.
+    TASK_V3_ERROR_CODE_ON_FINISH: bool = False
+    # Kill switch for the hold on a Task V3 run's first terminated verdict that asks for what prevents the task.
+    # On: every terminated verdict stands as the model gave it.
+    DISABLE_TASK_V3_JUSTIFY_HOLD: bool = False
     # Which browser surface the v3 loop offers: today's action tools ("off"), those plus a code
     # tool ("add"), or the code tool instead of them ("replace"). Three states rather than a boolean
     # because the benchmark separated add from replace on speed alone, not on success. The code tool
@@ -1026,8 +1048,8 @@ class Settings(BaseSettings):
     # OpenTelemetry Settings
     OTEL_ENABLED: bool = False
     OTEL_SERVICE_NAME: str = "skyvern"
-    # Which infrastructure this process runs on ("aws", "hetzner", or "local"
-    # for self-hosted/dev); stamped on run-telemetry metrics so run time and
+    # Which infrastructure this process runs on ("aws", or "local" in
+    # self-hosted and dev); stamped on run-telemetry metrics so run time and
     # cost can be split by infra. Cloud deploy configs set it explicitly.
     INFRA_PROVIDER: str = "local"
     OTEL_EXPORTER_OTLP_ENDPOINT: str = ""
@@ -1142,8 +1164,6 @@ class Settings(BaseSettings):
 
         # Gemini models: prefer Vertex when enabled, fall back to direct Gemini API
         gemini_models = [
-            ("gemini-2.5-pro-preview-05-06", "VERTEX_GEMINI_2.5_PRO", "GEMINI_2.5_PRO", "Gemini 2.5 Pro"),
-            ("gemini-2.5-flash", "VERTEX_GEMINI_2.5_FLASH", "GEMINI_2.5_FLASH", "Gemini 2.5 Flash"),
             ("gemini-3-pro-preview", "VERTEX_GEMINI_3_PRO", "GEMINI_3_PRO", "Gemini 3 Pro (Latest)"),
             ("gemini-3.0-flash", "VERTEX_GEMINI_3.0_FLASH", "GEMINI_3.0_FLASH", "Gemini 3 Flash"),
             ("gemini-3.5-flash", "VERTEX_GEMINI_3.5_FLASH", "GEMINI_3.5_FLASH", "Gemini 3.5 Flash"),
@@ -1155,12 +1175,6 @@ class Settings(BaseSettings):
                 "llm_key": vertex_key if self.ENABLE_VERTEX_AI else gemini_key,
                 "label": label,
             }
-
-        # Gemini Flash Lite: Vertex-only (no direct Gemini API config exists)
-        mapping["gemini-2.5-flash-lite"] = {
-            "llm_key": "VERTEX_GEMINI_2.5_FLASH_LITE",
-            "label": "Gemini 2.5 Flash Lite",
-        }
 
         mapping["mercury-2"] = {"llm_key": "INCEPTION_MERCURY_2", "label": "Inception Mercury 2"}
 

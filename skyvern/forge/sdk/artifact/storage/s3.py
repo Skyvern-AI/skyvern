@@ -866,6 +866,8 @@ class S3Storage(BaseStorage, StreamingArtifactStorage):
         skipped_files: list[str] = []
         unchanged_file_count = 0
         for file in files:
+            if file.endswith(BROWSER_DOWNLOADING_SUFFIX):
+                continue
             fpath = os.path.join(download_dir, file)
             if not os.path.isfile(fpath):
                 continue
@@ -1067,6 +1069,8 @@ class S3Storage(BaseStorage, StreamingArtifactStorage):
 
         file_infos: list[FileInfo] = []
         for key in object_keys:
+            if key.endswith(BROWSER_DOWNLOADING_SUFFIX):
+                continue
             object_uri = f"s3://{bucket}/{key}"
 
             metadata = {}

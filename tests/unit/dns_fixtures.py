@@ -21,6 +21,21 @@ def public_dns(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr("skyvern.utils.url_validators.socket.getaddrinfo", _resolve)
 
 
+@pytest.fixture
+def unresolvable_dns(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Answer every hostname lookup with no such host, so a name that never resolves fails without network DNS."""
+    real_getaddrinfo = socket.getaddrinfo
+
+    def _resolve(host: str, port: object = None, *args: object, **kwargs: object) -> list:
+        try:
+            ipaddress.ip_address(host)
+        except ValueError:
+            raise socket.gaierror(socket.EAI_NONAME, "Name or service not known") from None
+        return real_getaddrinfo(host, port, *args, **kwargs)
+
+    monkeypatch.setattr("skyvern.utils.url_validators.socket.getaddrinfo", _resolve)
+
+
 _PROXY_ENV_VARS = ("http_proxy", "https_proxy", "all_proxy", "no_proxy")
 
 

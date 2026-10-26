@@ -198,10 +198,18 @@ class CopilotRunHooks(RunHooksBase):
                 exact = data.get("credential") if isinstance(data, dict) else None
                 if not listed and isinstance(exact, dict):
                     listed = [exact]
+                vault_logins = data.get("vault_logins") if isinstance(data, dict) else None
+                exact_vault_login = data.get("vault_login") if isinstance(data, dict) else None
+                if not isinstance(vault_logins, list):
+                    vault_logins = [exact_vault_login] if isinstance(exact_vault_login, dict) else []
                 resolved = [
                     {"credential_id": c.get("credential_id"), "name": c.get("name")}
                     for c in listed
                     if isinstance(c, dict) and isinstance(c.get("credential_id"), str)
+                ] + [
+                    {"credential_id": login.get("vault_login_id"), "name": login.get("title")}
+                    for login in vault_logins
+                    if isinstance(login, dict) and isinstance(login.get("vault_login_id"), str)
                 ]
                 if resolved:
                     activity_entry["credentials"] = resolved

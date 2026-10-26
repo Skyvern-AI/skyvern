@@ -32,7 +32,7 @@ from skyvern.forge.sdk.db.utils import (
     hydrate_action,
     serialize_proxy_location,
 )
-from skyvern.forge.sdk.models import Step, StepStatus
+from skyvern.forge.sdk.models import TASK_V3_TURN_STEP_CREATED_BY, Step, StepStatus
 from skyvern.forge.sdk.schemas.runs import Run
 from skyvern.forge.sdk.schemas.tasks import OrderBy, SortDirection, Task, TaskStatus
 from skyvern.forge.sdk.trace import traced
@@ -43,6 +43,13 @@ from skyvern.webeye.actions.action_types import ActionType
 from skyvern.webeye.actions.actions import Action
 
 LOG = structlog.get_logger()
+
+
+def _step_status_values(status: StepStatus) -> dict[str, Any]:
+    values: dict[str, Any] = {"status": status}
+    if status.is_terminal():
+        values["finished_at"] = func.coalesce(StepModel.finished_at, naive_utc_now())
+    return values
 
 
 class TasksRepository(BaseRepository):
@@ -173,9 +180,11 @@ class TasksRepository(BaseRepository):
                 created_by=created_by,
             )
             session.add(new_step)
+            # The flush fills every column default, so the row needs no re-read; convert it before commit expires it.
+            await session.flush()
+            step = convert_to_step(new_step, debug_enabled=self.debug_enabled)
             await session.commit()
-            await session.refresh(new_step)
-            return convert_to_step(new_step, debug_enabled=self.debug_enabled)
+            return step
 
     @read_retry()
     @db_operation("get_task", log_errors=False)
@@ -306,13 +315,14 @@ class TasksRepository(BaseRepository):
         """
         Get the total count of unique (step.task_id, step.order) pairs of StepModel for the given task ids
         Basically translate this sql query into a SQLAlchemy query: select count(distinct(s.task_id, s.order)) from steps s
-        where s.task_id in task_ids
+        where s.task_id in task_ids. Task V3 turn steps are not budget units.
         """
         async with self.Session() as session:
             unique_step_orders = (
                 select(StepModel.task_id, StepModel.order)
                 .where(StepModel.task_id.in_(task_ids))
                 .where(StepModel.organization_id == organization_id)
+                .where(StepModel.created_by.is_distinct_from(TASK_V3_TURN_STEP_CREATED_BY))
                 .distinct()
                 .subquery()
             )
@@ -329,14 +339,16 @@ class TasksRepository(BaseRepository):
         """Distinct (task_id, order) pairs across steps UNION actions' round-stamped step_order.
 
         A step-engine action's step_order mirrors an existing step order, so the union equals the
-        step count; a task_v3 task has one Step row but round-stamped actions, so each of its
-        action rounds counts individually. This is the workflow-run step-budget unit.
+        step count; a task_v3 task counts its order-0 step plus its round-stamped actions, so each of
+        its action rounds counts individually. Its per-turn steps are not budget units.
+        This is the workflow-run step-budget unit.
         """
         async with self.Session() as session:
             step_pairs = (
                 select(StepModel.task_id, StepModel.order)
                 .where(StepModel.task_id.in_(task_ids))
                 .where(StepModel.organization_id == organization_id)
+                .where(StepModel.created_by.is_distinct_from(TASK_V3_TURN_STEP_CREATED_BY))
             )
             action_pairs = (
                 select(ActionModel.task_id, ActionModel.step_order)
@@ -497,6 +509,8 @@ class TasksRepository(BaseRepository):
                     .filter_by(task_id=task_id)
                     .filter_by(organization_id=organization_id)
                     .filter(StepModel.status != StepStatus.canceled)
+                    # A Task V3 block's turn steps sit above its own step, which holds its final screenshot.
+                    .filter(StepModel.created_by.is_distinct_from(TASK_V3_TURN_STEP_CREATED_BY))
                     .order_by(StepModel.order.desc())
                     .order_by(StepModel.retry_index.desc())
                 )
@@ -531,9 +545,7 @@ class TasksRepository(BaseRepository):
     ) -> Step:
         values: dict[str, Any] = {}
         if status is not None:
-            values["status"] = status
-            if status.is_terminal():
-                values["finished_at"] = func.coalesce(StepModel.finished_at, naive_utc_now())
+            values.update(_step_status_values(status))
         if output is not None:
             values["output"] = output.model_dump(exclude_none=True)
         if is_last is not None:
@@ -557,17 +569,7 @@ class TasksRepository(BaseRepository):
             values["last_llm_model"] = last_llm_model
 
         if values:
-            async with self.Session() as session:
-                result = await session.execute(
-                    update(StepModel)
-                    .where(StepModel.task_id == task_id)
-                    .where(StepModel.step_id == step_id)
-                    .where(StepModel.organization_id == organization_id)
-                    .values(values)
-                )
-                if result.rowcount == 0:
-                    raise NotFoundError("Step not found")
-                await session.commit()
+            await self._write_step(task_id, step_id, organization_id, values)
 
         updated_step = await self.get_step(step_id, organization_id)
         # get_step does not scope by task_id, so re-check it here: a call carrying no field to
@@ -575,6 +577,35 @@ class TasksRepository(BaseRepository):
         if not updated_step or updated_step.task_id != task_id:
             raise NotFoundError("Step not found")
         return updated_step
+
+    @traced(name="skyvern.db.finish_step")
+    @db_operation("finish_step")
+    async def finish_step(
+        self,
+        task_id: str,
+        step_id: str,
+        organization_id: str | None,
+        status: StepStatus,
+        output: AgentStepOutput,
+    ) -> None:
+        """`update_step`'s status and output write without reading the row back, for a caller that has no use for it."""
+        values = {**_step_status_values(status), "output": output.model_dump(exclude_none=True)}
+        await self._write_step(task_id, step_id, organization_id, values)
+
+    async def _write_step(
+        self, task_id: str, step_id: str, organization_id: str | None, values: dict[str, Any]
+    ) -> None:
+        async with self.Session() as session:
+            result = await session.execute(
+                update(StepModel)
+                .where(StepModel.task_id == task_id)
+                .where(StepModel.step_id == step_id)
+                .where(StepModel.organization_id == organization_id)
+                .values(values)
+            )
+            if result.rowcount == 0:
+                raise NotFoundError("Step not found")
+            await session.commit()
 
     @db_operation("clear_task_failure_reason")
     async def clear_task_failure_reason(self, organization_id: str, task_id: str) -> Task:

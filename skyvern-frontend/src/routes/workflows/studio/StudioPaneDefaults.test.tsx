@@ -14,7 +14,6 @@ import { afterEach, beforeEach, describe, expect, test, vi } from "vitest";
 import { useMountEffect } from "@/hooks/useMountEffect";
 import { useStudioFirstRunStore } from "@/store/StudioFirstRunStore";
 import { useManualSignInStore } from "@/store/useManualSignInStore";
-import { useRecordingStore } from "@/store/useRecordingStore";
 
 import { shouldOpenCopilotPaneForHandoff } from "../discoverCopilotHandoff";
 import { useWorkspaceCopilotUpdate } from "../editor/Workspace";
@@ -722,18 +721,6 @@ describe("Copilot test run", () => {
     expect(panesText()).toBe("copilot,browser");
     fireEvent.click(screen.getByText("copilot-run-ended"));
     expect(panesText()).toBe("copilot,editor");
-  });
-
-  test("does not reopen Editor while a recording is capturing", () => {
-    renderStudio({ stageWidth: 800, children: <CopilotRunProbe /> });
-    fireEvent.click(screen.getByText("copilot-run-started"));
-    useRecordingStore.setState({ isRecording: true });
-    try {
-      fireEvent.click(screen.getByText("copilot-run-ended"));
-      expect(panesText()).toBe("copilot,browser");
-    } finally {
-      useRecordingStore.setState({ isRecording: false });
-    }
   });
 
   test("keeps a user's Editor close across a run they switch to", () => {

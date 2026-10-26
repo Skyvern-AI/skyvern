@@ -31,6 +31,11 @@ from skyvern.forge.log_redaction import (
     redact_proxy_observability_value,
     redact_sensitive_fields,
 )
+from skyvern.forge.request_privacy import (
+    PrivateRequestLogFilter,
+    redact_private_foreign_event,
+    redact_private_log_event,
+)
 from skyvern.forge.sdk.core import skyvern_context
 from skyvern.forge.sdk.core.organization_age_cache import cached_org_age
 
@@ -1694,6 +1699,7 @@ def setup_logger() -> None:
         wrapper_class=structlog.make_filtering_bound_logger(LOG_LEVEL_VAL),
         logger_factory=structlog.stdlib.LoggerFactory(),
         processors=[
+            redact_private_log_event,
             _add_log_level,
             _LogTimeStamper(fmt="iso"),
             _add_entrypoint,
@@ -1705,6 +1711,7 @@ def setup_logger() -> None:
             # Models and containers must be normalized before value scrubbing;
             # capture only copied, scrubbed values for later artifact serialization.
             redact_registered_secrets,
+            redact_private_log_event,
             skyvern_logs_processor,
             sample_logs_processor,
             structlog.stdlib.ProcessorFormatter.wrap_for_formatter,
@@ -1718,6 +1725,7 @@ def setup_logger() -> None:
     )
 
     handler = logging.StreamHandler()
+    handler.addFilter(PrivateRequestLogFilter())
     handler.setFormatter(
         structlog.stdlib.ProcessorFormatter(
             foreign_pre_chain=[
@@ -1725,6 +1733,7 @@ def setup_logger() -> None:
                 # and never becomes a queryable attribute. Modules that run in images
                 # without structlog installed have no other route to structured fields.
                 structlog.stdlib.ExtraAdder(),
+                redact_private_foreign_event,
                 add_error_processor,
                 structlog.processors.format_exc_info,
                 redact_sensitive_event_fields,
@@ -1747,6 +1756,7 @@ def setup_logger() -> None:
                 redact_bearer_tokens,
                 redact_registered_secrets,
                 redact_codeblock_parameters,
+                redact_private_log_event,
                 *([escape_reserved_log_keys] if settings.JSON_LOGGING else []),
                 renderer,
             ],

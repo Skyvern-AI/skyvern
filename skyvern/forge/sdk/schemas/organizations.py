@@ -130,6 +130,18 @@ class BitwardenCredentialResponse(BaseModel):
     )
 
 
+class BitwardenCredentialStatus(BaseModel):
+    id: str
+    token_type: str
+    valid: bool
+    created_at: datetime
+    modified_at: datetime
+
+
+class BitwardenCredentialStatusResponse(BaseModel):
+    token: BitwardenCredentialStatus
+
+
 def _twilio_error_without_inputs(error: ValidationError) -> ValidationError:
     # hide_input_in_errors only affects text; remove inputs from structured errors too.
     return ValidationError.from_exception_data(

@@ -2,6 +2,7 @@
 
 import io
 import json
+from collections.abc import Awaitable, Callable
 from datetime import UTC, datetime
 from types import SimpleNamespace
 from typing import Any, cast
@@ -25,6 +26,7 @@ from skyvern.exceptions import (
     OnePasswordSessionExpiredError,
 )
 from skyvern.forge.sdk.api.azure import AsyncAzureVaultClient
+from skyvern.forge.sdk.credential_site_policy import LoginSite
 from skyvern.forge.sdk.schemas.credentials import (
     CredentialItem,
     CredentialType,
@@ -48,6 +50,7 @@ from skyvern.forge.sdk.workflow.models.block import BranchEvaluationContext, Wai
 from skyvern.forge.sdk.workflow.models.parameter import (
     AzureVaultCredentialParameter,
     BitwardenLoginCredentialParameter,
+    ContextParameter,
     CredentialParameter,
     WorkflowParameter,
     WorkflowParameterType,
@@ -105,11 +108,15 @@ def _make_workflow(parameters: list[WorkflowParameter]) -> Workflow:
     )
 
 
-def _make_organization() -> Organization:
+def _make_organization(
+    bw_collection_ids: list[str] | None = None, bw_organization_id: str | None = None
+) -> Organization:
     now = datetime.now(UTC)
     return Organization(
         organization_id="org_test",
         organization_name="Test Org",
+        bw_collection_ids=bw_collection_ids,
+        bw_organization_id=bw_organization_id,
         created_at=now,
         modified_at=now,
     )
@@ -142,6 +149,55 @@ async def test_a_scrubbed_typed_input_cannot_start_execution(parameter_type: Wor
             secret_parameters=[],
             workflow=_make_workflow([parameter]),
         )
+
+
+@pytest.mark.asyncio
+async def test_duplicate_workflow_parameter_log_omits_values() -> None:
+    parameter = _make_workflow_parameter("input")
+    old_value = "DUPLICATE_OLD_VALUE_SENTINEL"
+    new_value = "DUPLICATE_NEW_VALUE_SENTINEL"
+
+    with capture_logs() as logs:
+        context = await _init_context(
+            workflow_parameter_tuples=[
+                (parameter, _make_run_parameter(parameter, old_value)),
+                (parameter, _make_run_parameter(parameter, new_value)),
+            ]
+        )
+
+    assert old_value not in json.dumps(logs, default=str)
+    assert new_value not in json.dumps(logs, default=str)
+    log = next(log for log in logs if "Duplicate parameter key" in log["event"])
+    assert log["parameter_key"] == "input"
+    assert context.values["input"] == new_value
+
+
+@pytest.mark.asyncio
+async def test_context_parameter_overwrite_log_omits_values() -> None:
+    output_parameter = make_block_output_parameter("source_output")
+    old_value = "CONTEXT_OLD_VALUE_SENTINEL"
+    new_value = "CONTEXT_NEW_VALUE_SENTINEL"
+    parameter = ContextParameter(
+        key="context_value",
+        description=None,
+        source=output_parameter,
+        value=old_value,
+    )
+    context = WorkflowRunContext.__new__(WorkflowRunContext)
+    context.parameters = {parameter.key: parameter}
+    context.values = {parameter.key: old_value}
+
+    with capture_logs() as logs:
+        await context.set_parameter_values_for_output_parameter_dependent_blocks(
+            output_parameter,
+            {parameter.key: new_value},
+        )
+
+    assert old_value not in json.dumps(logs, default=str)
+    assert new_value not in json.dumps(logs, default=str)
+    log = next(log for log in logs if "already has a value" in log["event"])
+    assert log["parameter_key"] == "context_value"
+    assert context.values[parameter.key] == new_value
 
 
 class TestAtWillCredentialBackfill:
@@ -355,10 +411,11 @@ async def _init_context(
     *,
     workflow_parameter_tuples: list[tuple[WorkflowParameter, WorkflowRunParameter]] | None = None,
     secret_parameters: list[Any] | None = None,
+    organization: Organization | None = None,
 ) -> WorkflowRunContext:
     return await WorkflowRunContext.init(
         aws_client=MagicMock(),
-        organization=_make_organization(),
+        organization=organization or _make_organization(),
         workflow_run_id="wr_test",
         workflow_title="Test",
         workflow_id="wf_test",
@@ -389,6 +446,145 @@ def _raised_while_handling(error: BaseException, handled: BaseException, *, supp
             raise error
     except type(error) as raised:
         return raised
+
+
+_VAULT_ITEM_ID = "5c1d2e3f-0000-4000-8000-000000000000"
+
+
+class TestBitwardenLoginScope:
+    """A Bitwarden login is read through the real service, faked only at the CLI."""
+
+    @staticmethod
+    def _wire_cli(monkeypatch: pytest.MonkeyPatch, collection_ids: list[str], uris: list[dict[str, Any]]) -> None:
+        _install_credential_app(monkeypatch)
+        monkeypatch.setattr(cm.settings, "BITWARDEN_CLIENT_ID", "client-id")
+        monkeypatch.setattr(cm.settings, "BITWARDEN_CLIENT_SECRET", "client-secret")
+        monkeypatch.setattr(cm.settings, "BITWARDEN_MASTER_PASSWORD", "master-password")
+        monkeypatch.setattr(bitwarden_module, "asyncio", ScopedAsyncio(sleep=AsyncMock()))
+        item = {
+            "object": "item",
+            "id": _VAULT_ITEM_ID,
+            "type": 1,
+            "collectionIds": collection_ids,
+            "login": {"username": "user@example.com", "password": "synthetic-password", "uris": uris},
+        }
+
+        async def run_command(command: list[str], **_kwargs: object) -> bitwarden_module.RunCommandResult:
+            stdout = json.dumps([item] if command[1] == "list" else item)
+            return bitwarden_module.RunCommandResult(stdout=stdout, stderr="", returncode=0)
+
+        async def run_against_item(
+            _identity: object, *, run: Callable[[object], Awaitable[object]], **_kwargs: object
+        ) -> object:
+            return await run(SimpleNamespace(session_key="sk", env={}))
+
+        monkeypatch.setattr(bitwarden_module.BitwardenService, "_with_cli_session", run_against_item)
+        monkeypatch.setattr(bitwarden_module.BitwardenService, "run_command", run_command)
+
+    @staticmethod
+    def _login(**fields: str) -> BitwardenLoginCredentialParameter:
+        now = datetime.now(UTC)
+        return BitwardenLoginCredentialParameter(
+            key="portal_login",
+            bitwarden_login_credential_parameter_id="blc_1",
+            workflow_id="wf_test",
+            bitwarden_client_id_aws_secret_key="unused",
+            bitwarden_client_secret_aws_secret_key="unused",
+            bitwarden_master_password_aws_secret_key="unused",
+            bitwarden_collection_id="col_1",
+            created_at=now,
+            modified_at=now,
+            **fields,
+        )
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ("uris", "sites"),
+        [
+            pytest.param(
+                [{"uri": "https://login.example.com/account", "match": None}],
+                [LoginSite("https://login.example.com/account", whole_site=False)],
+                id="default-match-is-host-only",
+            ),
+            pytest.param(
+                [{"uri": "https://example.com", "match": 0}, {"uri": "https://login.example.org", "match": 1}],
+                [
+                    LoginSite("https://example.com", whole_site=True),
+                    LoginSite("https://login.example.org", whole_site=False),
+                ],
+                id="base-domain-and-host",
+            ),
+            pytest.param([{"uri": "https://login.example.com/account", "match": 3}], [], id="exact-match-only"),
+        ],
+    )
+    async def test_a_login_read_by_item_id_records_the_sites_its_item_names(
+        self, monkeypatch: pytest.MonkeyPatch, uris: list[dict[str, Any]], sites: list[LoginSite]
+    ) -> None:
+        self._wire_cli(monkeypatch, ["col_1"], uris)
+
+        context = await _init_context(
+            secret_parameters=[self._login(bitwarden_item_id=_VAULT_ITEM_ID)],
+            organization=_make_organization(bw_collection_ids=["col_1"]),
+        )
+
+        assert context.bitwarden_login_sites["portal_login"] == sites
+        assert "portal_login" not in context.credential_tested_urls
+
+    @pytest.mark.asyncio
+    async def test_a_login_read_by_url_records_the_sites_its_item_names(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        self._wire_cli(monkeypatch, ["col_1"], [{"uri": "https://login.example.com", "match": None}])
+        url_parameter = _make_workflow_parameter("target_url")
+
+        context = await _init_context(
+            workflow_parameter_tuples=[
+                (url_parameter, _make_run_parameter(url_parameter, "https://example.com/login"))
+            ],
+            secret_parameters=[self._login(url_parameter_key="target_url")],
+            organization=_make_organization(bw_collection_ids=["col_1"]),
+        )
+
+        assert context.bitwarden_login_sites == {
+            "portal_login": [LoginSite("https://login.example.com", whole_site=False)]
+        }
+
+    @pytest.mark.asyncio
+    async def test_a_login_read_that_lost_its_sites_is_recorded_as_having_none(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        self._wire_cli(monkeypatch, ["col_1"], [])
+        plain_read = AsyncMock(
+            return_value={
+                bitwarden_module.BitwardenConstants.USERNAME: "user@example.com",
+                bitwarden_module.BitwardenConstants.PASSWORD: "synthetic-password",
+            }
+        )
+        monkeypatch.setattr(bitwarden_module.BitwardenService, "get_secret_value_from_url", plain_read)
+
+        context = await _init_context(
+            secret_parameters=[self._login(bitwarden_item_id=_VAULT_ITEM_ID)],
+            organization=_make_organization(bw_collection_ids=["col_1"]),
+        )
+
+        assert context.bitwarden_login_sites["portal_login"] == []
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ("item_collection_ids", "organization"),
+        [
+            pytest.param(["col_other"], _make_organization(bw_collection_ids=["col_1"]), id="other-collection"),
+            pytest.param(["col_1"], _make_organization(bw_organization_id="bw_org_1"), id="other-organization"),
+        ],
+    )
+    async def test_an_item_outside_the_organizations_vault_scope_is_refused_by_id(
+        self, monkeypatch: pytest.MonkeyPatch, item_collection_ids: list[str], organization: Organization
+    ) -> None:
+        self._wire_cli(monkeypatch, item_collection_ids, [{"uri": "https://login.example.com", "match": None}])
+
+        with pytest.raises(bitwarden_module.BitwardenAccessDeniedError):
+            await _init_context(
+                secret_parameters=[self._login(bitwarden_item_id=_VAULT_ITEM_ID)],
+                organization=organization,
+            )
 
 
 class TestRunCredentialFetchOutcome:

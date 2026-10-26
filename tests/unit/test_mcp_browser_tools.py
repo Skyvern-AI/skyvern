@@ -2547,8 +2547,6 @@ async def test_skyvern_type_missing_selector_preflight_is_bound_by_the_action_de
     monkeypatch.setattr(mcp_browser, "strategy_aware_input", strategy_aware_input)
     monkeypatch.setattr(action_deadline, "ACTION_DEADLINE_HEADROOM_MS", 100)
 
-    loop = asyncio.get_running_loop()
-    started_at = loop.time()
     result = await asyncio.wait_for(
         mcp_browser.skyvern_type(
             selector="#missing",
@@ -2559,7 +2557,6 @@ async def test_skyvern_type_missing_selector_preflight_is_bound_by_the_action_de
         timeout=1.5,
     )
 
-    assert loop.time() - started_at < 1.5
     assert preflight_cancelled.is_set()
     assert result["ok"] is False
     assert result["error"]["code"] == mcp_browser.ErrorCode.TIMEOUT

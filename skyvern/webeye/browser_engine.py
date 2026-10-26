@@ -40,6 +40,7 @@ from skyvern.webeye.browser_errors import (
     classify_browser_error,
 )
 from skyvern.webeye.driver_connection import close_driver_connection_on_transport_loss
+from skyvern.webeye.main_world_eval import default_evaluate_to_main_world
 
 if TYPE_CHECKING:
     from playwright.async_api import Frame as _StockFrame
@@ -355,6 +356,7 @@ class BrowserEngineRegistry:
 async def _start_stock_driver() -> Playwright:
     driver = await async_playwright().start()
     close_driver_connection_on_transport_loss(driver)
+    default_evaluate_to_main_world(driver)
     return driver
 
 

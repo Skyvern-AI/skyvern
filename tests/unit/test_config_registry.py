@@ -85,7 +85,7 @@ def test_copilot_router_provider_model_retains_only_its_source_provenance(
     monkeypatch: pytest.MonkeyPatch, builtin: bool
 ) -> None:
     monkeypatch.setattr(config_registry.LLMConfigRegistry, "_configs", {})
-    provider_model = "vertex_ai/gemini-2.5-flash"
+    provider_model = "vertex_ai/gemini-3-flash-preview"
     credential = "synthetic-test-key"
     parameters = {"model": provider_model, "api_key": credential}
     config = llm_schemas.LLMRouterConfig(
@@ -100,7 +100,7 @@ def test_copilot_router_provider_model_retains_only_its_source_provenance(
         config_registry._register_builtin_config if builtin else config_registry.LLMConfigRegistry.register_config
     )
     register("TEST_ROUTER", config)
-    with skyvern_context.scoped(SkyvernContext(runtime_secret_values={"5", credential})):
+    with skyvern_context.scoped(SkyvernContext(runtime_secret_values={"3", credential})):
         model_name, run_config, _, _ = resolve_model_config(None, llm_key_override="TEST_ROUTER")
         model = run_config.model_provider.get_model(model_name)
         with capture_runtime_logs() as events:
@@ -116,7 +116,7 @@ def test_copilot_router_provider_model_retains_only_its_source_provenance(
             structlog.get_logger().info("Caller parameters", payload=parameters)
     records = json.loads(json.dumps(events))
     usage = next(record for record in records if record.get("log_code") == "copilot_model_usage")
-    redacted = f"vertex_ai/gemini-2.{REDACTED_SECRET_PLACEHOLDER}-flash"
+    redacted = f"vertex_ai/gemini-{REDACTED_SECRET_PLACEHOLDER}-flash-preview"
     assert usage["gen_ai.request.model"] == (provider_model if builtin else redacted)
     assert usage["gen_ai.response.model"] == redacted
     assert usage["gen_ai.usage.input_tokens"] == 15 and type(usage["gen_ai.usage.input_tokens"]) is int
@@ -172,10 +172,30 @@ def test_openrouter_deepseek_v4_flash_0731_registry_config(monkeypatch: pytest.M
     }
 
 
-def _openrouter_capture_server(captured: dict[str, Any]) -> HTTPServer:
+_OPENROUTER_ANSWER = '{"actions": []}'
+# The shape production truncation arrives in: the completion cap spent entirely on reasoning,
+# so finish_reason is length and there is no content to parse at all (SKY-18857).
+_TRUNCATED_USAGE = {
+    "prompt_tokens": 26869,
+    "completion_tokens": 65536,
+    "total_tokens": 92405,
+    "completion_tokens_details": {"reasoning_tokens": 72544},
+}
+
+
+def _openrouter_capture_server(
+    captured: dict[str, Any], replies: list[tuple[str | None, str]] | None = None
+) -> HTTPServer:
+    """Serve `replies` as (content, finish_reason) in request order, recording every request body."""
+    scripted = replies or [(_OPENROUTER_ANSWER, "stop")]
+
     class _Handler(BaseHTTPRequestHandler):
         def do_POST(self) -> None:
-            captured["body"] = json.loads(self.rfile.read(int(self.headers.get("Content-Length", 0))))
+            body = json.loads(self.rfile.read(int(self.headers.get("Content-Length", 0))))
+            bodies = captured.setdefault("bodies", [])
+            bodies.append(body)
+            captured["body"] = body
+            content, finish_reason = scripted[min(len(bodies), len(scripted)) - 1]
             payload = json.dumps(
                 {
                     "id": "chatcmpl-test",
@@ -185,11 +205,13 @@ def _openrouter_capture_server(captured: dict[str, Any]) -> HTTPServer:
                     "choices": [
                         {
                             "index": 0,
-                            "message": {"role": "assistant", "content": '{"actions": []}'},
-                            "finish_reason": "stop",
+                            "message": {"role": "assistant", "content": content},
+                            "finish_reason": finish_reason,
                         }
                     ],
-                    "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2},
+                    "usage": _TRUNCATED_USAGE
+                    if finish_reason == "length"
+                    else {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2},
                 }
             ).encode()
             self.send_response(200)
@@ -204,44 +226,81 @@ def _openrouter_capture_server(captured: dict[str, Any]) -> HTTPServer:
     return HTTPServer(("127.0.0.1", 0), _Handler)
 
 
+def _pin_deepseek_v4_flash_at(server: HTTPServer, monkeypatch: pytest.MonkeyPatch) -> llm_schemas.LLMConfig:
+    """Re-register the registry against `server` and pin that config as the one the handler resolves."""
+    real_get_config = config_registry.LLMConfigRegistry.get_config
+    monkeypatch.setattr(config_registry.settings, "ENABLE_OPENROUTER", True)
+    monkeypatch.setattr(config_registry.settings, "OPENROUTER_API_KEY", "test-key")
+    monkeypatch.setattr(config_registry.settings, "OPENROUTER_API_BASE", f"http://127.0.0.1:{server.server_port}")
+    monkeypatch.setattr(llm_schemas, "_settings", lambda: config_registry.settings)
+    assert config_registry.__file__ is not None
+
+    registry_namespace = runpy.run_path(str(Path(config_registry.__file__)))
+    llm_config = registry_namespace["LLMConfigRegistry"].get_config("OPENROUTER_DEEPSEEK_V4_FLASH")
+    # The process-wide registry may hold a config issue for this key (no OpenRouter key in
+    # the environment), which would hand back the dummy handler instead of calling out.
+    monkeypatch.setattr(config_registry.LLMConfigRegistry, "get_config_issue", lambda _: None)
+    monkeypatch.setattr(
+        config_registry.LLMConfigRegistry,
+        "get_config",
+        lambda key: llm_config if key == "OPENROUTER_DEEPSEEK_V4_FLASH" else real_get_config(key),
+    )
+    monkeypatch.setattr(LLMAPIHandlerFactory, "_handler_cache", {})
+    return llm_config
+
+
 @pytest.mark.asyncio
 async def test_openrouter_deepseek_v4_flash_sends_provider_ignore_on_the_wire(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """OpenRouter skips an unrecognized slug in `ignore` silently instead of rejecting it, so a
-    typo would leave the route on the defective provider while the config still looked right."""
+    typo would leave the route on the defective provider while the config still looked right.
+    The reasoning budget rides the same `extra_body`, which the OpenRouter dispatch path rebuilds
+    from an allowlist — a budget that never reaches the wire bounds nothing."""
     captured: dict[str, Any] = {}
-    real_get_config = config_registry.LLMConfigRegistry.get_config
 
     with _openrouter_capture_server(captured) as server:
         thread = threading.Thread(target=server.serve_forever, daemon=True)
         thread.start()
         try:
-            monkeypatch.setattr(config_registry.settings, "ENABLE_OPENROUTER", True)
-            monkeypatch.setattr(config_registry.settings, "OPENROUTER_API_KEY", "test-key")
-            monkeypatch.setattr(
-                config_registry.settings, "OPENROUTER_API_BASE", f"http://127.0.0.1:{server.server_port}"
-            )
-            monkeypatch.setattr(llm_schemas, "_settings", lambda: config_registry.settings)
-            assert config_registry.__file__ is not None
-
-            registry_namespace = runpy.run_path(str(Path(config_registry.__file__)))
-            llm_config = registry_namespace["LLMConfigRegistry"].get_config("OPENROUTER_DEEPSEEK_V4_FLASH")
+            llm_config = _pin_deepseek_v4_flash_at(server, monkeypatch)
             assert llm_config.litellm_params is not None
-            assert llm_config.litellm_params["extra_body"] == {"provider": {"ignore": ["open-inference"]}}
-
-            # The process-wide registry may hold a config issue for this key (no OpenRouter key in
-            # the environment), which would hand back the dummy handler instead of calling out.
-            monkeypatch.setattr(config_registry.LLMConfigRegistry, "get_config_issue", lambda _: None)
-            monkeypatch.setattr(
-                config_registry.LLMConfigRegistry,
-                "get_config",
-                lambda key: llm_config if key == "OPENROUTER_DEEPSEEK_V4_FLASH" else real_get_config(key),
-            )
-            monkeypatch.setattr(LLMAPIHandlerFactory, "_handler_cache", {})
+            assert llm_config.litellm_params["extra_body"] == {
+                "provider": {"ignore": ["open-inference"]},
+                "reasoning": {"max_tokens": 49152},
+            }
             await LLMAPIHandlerFactory.get_llm_api_handler("OPENROUTER_DEEPSEEK_V4_FLASH")(prompt="hello")
         finally:
             server.shutdown()
             thread.join(timeout=5)
 
     assert captured["body"]["provider"] == {"ignore": ["open-inference"]}
+    assert captured["body"]["reasoning"] == {"max_tokens": 49152}
+    assert captured["body"]["max_completion_tokens"] == 65536
+
+
+@pytest.mark.asyncio
+async def test_reasoning_truncated_openrouter_call_is_retried_with_half_the_budget(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A model that spends the whole cap thinking answers 200 with finish_reason=length and no content,
+    so nothing in the router's exception-driven failover sees it and the step used to just fail. A step
+    retry re-sends the same budget and truncates again, so the retry has to lower it."""
+    captured: dict[str, Any] = {}
+    replies = [(None, "length"), (_OPENROUTER_ANSWER, "stop")]
+
+    with _openrouter_capture_server(captured, replies) as server:
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        try:
+            _pin_deepseek_v4_flash_at(server, monkeypatch)
+            response = await LLMAPIHandlerFactory.get_llm_api_handler("OPENROUTER_DEEPSEEK_V4_FLASH")(prompt="hello")
+        finally:
+            server.shutdown()
+            thread.join(timeout=5)
+
+    assert response == {"actions": []}
+    budgets = [body["reasoning"]["max_tokens"] for body in captured["bodies"]]
+    assert budgets == [49152, 24576]
+    # The cap itself stays put: the answer needs the room reasoning just gave back.
+    assert [body["max_completion_tokens"] for body in captured["bodies"]] == [65536, 65536]

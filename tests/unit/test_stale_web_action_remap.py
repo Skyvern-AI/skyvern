@@ -15,6 +15,7 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
+from skyvern.exceptions import SkyvernPageAnalysisTimeout
 from skyvern.webeye.actions import handler
 from skyvern.webeye.actions.actions import ClickAction
 
@@ -381,3 +382,25 @@ async def test_indeterminate_probe_falls_through_to_legacy(monkeypatch: pytest.M
     assert result is None
     assert action.element_id == "OLD"
     rescrape.assert_not_awaited()
+
+
+async def test_stale_remap_propagates_lookup_deadline(monkeypatch: pytest.MonkeyPatch) -> None:
+    batch = _scraped({"OLD": _element("Approve", html_id="approve_field")})
+    monkeypatch.setattr(handler, "_document_continuity", AsyncMock(return_value=True))
+    locator = MagicMock()
+    locator.count = AsyncMock(side_effect=SkyvernPageAnalysisTimeout("lookup deadline"))
+    monkeypatch.setattr(handler, "resolve_locator", AsyncMock(return_value=(locator, MagicMock())))
+
+    with pytest.raises(SkyvernPageAnalysisTimeout):
+        await handler._refresh_stale_web_action_before_dispatch(batch, _live_page(), ClickAction(element_id="OLD"))
+
+
+async def test_stale_batch_probe_propagates_lookup_deadline(monkeypatch: pytest.MonkeyPatch) -> None:
+    batch = _scraped({"OLD": _element("Approve", html_id="approve_field")})
+    monkeypatch.setattr(handler, "_document_continuity", AsyncMock(return_value=True))
+    locator = MagicMock()
+    locator.count = AsyncMock(side_effect=SkyvernPageAnalysisTimeout("lookup deadline"))
+    monkeypatch.setattr(handler, "resolve_locator", AsyncMock(return_value=(locator, MagicMock())))
+
+    with pytest.raises(SkyvernPageAnalysisTimeout):
+        await handler._batched_target_stale_beyond_remap(batch, _live_page(), ClickAction(element_id="OLD"))

@@ -21,10 +21,13 @@ from __future__ import annotations
 import asyncio
 import base64
 import binascii
+import csv
 import errno
 import hashlib
 import inspect
 import io
+import itertools
+import json
 import os
 import re
 import stat
@@ -33,8 +36,9 @@ import time
 import uuid
 import zipfile
 from collections import OrderedDict
-from collections.abc import AsyncIterator, Callable, Coroutine
-from contextlib import asynccontextmanager
+from collections.abc import AsyncIterator, Callable, Coroutine, Iterator
+from contextlib import asynccontextmanager, contextmanager
+from contextvars import ContextVar
 from dataclasses import dataclass
 from pathlib import Path
 from typing import IO, TYPE_CHECKING, Any, Literal, NamedTuple
@@ -49,6 +53,7 @@ from skyvern.constants import (
     BROWSER_INTERCEPTOR_DISABLE_TIMEOUT,
     BROWSER_PAGE_CLOSE_TIMEOUT,
 )
+from skyvern.errors.errors import BROWSER_DOWNLOAD_PARTIAL_FAILURE_CODE
 from skyvern.exceptions import DownloadFileMaxSizeExceeded, redact_cdp_endpoint_urls
 from skyvern.forge.sdk.api import files as file_api
 from skyvern.forge.sdk.core.hashing import diagnostic_fingerprint
@@ -113,6 +118,7 @@ MAX_PENDING_BROWSER_DOWNLOAD_EVENT_BYTES = 4 * MAX_FILE_SIZE_BYTES + 64 * 1024
 # bounds this and all subsequent handler work.
 BROWSER_DOWNLOAD_EVENT_ADMISSION_GRACE_SECONDS = 0.25
 _ARTIFACT_SCOPE_GENERATION_EVENT_KEY = "_skyvernArtifactScopeGeneration"
+_REPLAY_CANDIDATE_EPOCH_EVENT_KEY = "_skyvernReplayCandidateEpoch"
 # Each CDP session detach gets its own bounded cleanup task. This is deliberately shorter than
 # the interceptor's whole-disable budget so a stalled target cannot delay browser-monitor cleanup
 # or make a replacement bind race an unfinished teardown.
@@ -171,6 +177,17 @@ class _StreamAborted(Exception):
         super().__init__(f"streamed download exceeded {max_size_bytes} bytes ({total_bytes} read)")
         self.total_bytes = total_bytes
         self.max_size_bytes = max_size_bytes
+
+
+@dataclass
+class _ReplayCandidate:
+    attempt: _DownloadAttempt
+    data: bytes
+    filename: str
+    content_type: str
+    scope_generation: int
+    observations: str
+    admitted_epoch: int
 
 
 class _DownloadScopeInvalidated(Exception):
@@ -531,6 +548,14 @@ _OLE_COMPOUND_FILE_MAGIC = b"\xd0\xcf\x11\xe0\xa1\xb1\x1a\xe1"  # legacy Excel .
 # these formats are validated. CSV is deliberately absent: it has no reliable signature, so
 # validating it would risk false positives on legitimate downloads.
 _DOWNLOAD_FORMAT_BY_EXTENSION = {".pdf": "pdf", ".xlsx": "xlsx", ".xls": "xls", ".zip": "zip"}
+_CSV_CONTENT_TYPES = ("text/csv", "application/csv")
+# A CSV replay up to this size is held for the run to select instead of being saved; a larger one is saved as before.
+REPLAY_CANDIDATE_MAX_BYTES = 64 * 1024
+# Process-wide, so a handle from a replaced browser context can never name a later context's candidate.
+_REPLAY_CANDIDATE_HANDLES = itertools.count(1)
+# Passed when a caller has no admission-time epoch: the epoch at entry stands in for it.
+_CANDIDATE_EPOCH_AT_ENTRY = -1
+
 _DOWNLOAD_FORMAT_BY_CONTENT_TYPE = {
     "application/pdf": "pdf",
     "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet": "xlsx",
@@ -586,6 +611,77 @@ def _claimed_download_format(content_type: str, filename: str) -> str | None:
     if suffix:
         return _DOWNLOAD_FORMAT_BY_EXTENSION.get(suffix)
     return _DOWNLOAD_FORMAT_BY_CONTENT_TYPE.get(_normalized_content_type(content_type))
+
+
+def _claims_csv(content_type: str, filename: str) -> bool:
+    """Same precedence as :func:`_claimed_download_format`: an extension decides, Content-Type only when nameless."""
+    suffix = Path(filename).suffix.lower()
+    if suffix:
+        return suffix == ".csv"
+    return _normalized_content_type(content_type) in _CSV_CONTENT_TYPES
+
+
+def _replay_candidate_observations(data: bytes, content_type: str | None, status: int | None) -> str:
+    """Structural facts about held replay bytes. Built only from fixed vocabulary and counts: no body text, member
+    name, value, header, filename or URL reaches it, because the line goes to the model and its logs. No content type
+    means the bytes were refetched in the page after the replay returned an HTML page, with no response metadata."""
+    normalized = _normalized_content_type(content_type or "")
+    facts = [
+        *([] if content_type is not None else ["refetched in the page after the replay returned an HTML page"]),
+        f"HTTP status {status}" if isinstance(status, int) and 100 <= status <= 599 else "HTTP status not recorded",
+        "media type not recorded"
+        if content_type is None
+        else f"media type {normalized if normalized in _CSV_CONTENT_TYPES else 'other'}",
+        f"{len(data)} bytes",
+    ]
+    text: str | None
+    try:
+        text = data.decode("utf-8-sig")
+    except UnicodeDecodeError:
+        text = None
+    if text is None:
+        facts.append("not UTF-8 text")
+    else:
+        facts.append("UTF-8 text")
+        try:
+            parsed = json.loads(text)
+        except (ValueError, RecursionError):
+            parsed = _NOT_JSON
+        if isinstance(parsed, dict):
+            facts.append(f"parses as a JSON object with {len(parsed)} members")
+        elif isinstance(parsed, list):
+            facts.append(f"parses as a JSON array with {len(parsed)} elements")
+        elif parsed is not _NOT_JSON:
+            facts.append("parses as a JSON scalar")
+        try:
+            widths = {len(row) for row in csv.reader(io.StringIO(text))}
+            rows = sum(1 for _ in csv.reader(io.StringIO(text)))
+            facts.append(
+                f"reads as {rows} CSV rows with "
+                + ("the same column count" if len(widths) <= 1 else "differing column counts")
+            )
+        except csv.Error:
+            facts.append("does not read as CSV")
+    return "; ".join(facts)
+
+
+def _replay_candidate_admission(admitted_epoch: int, current_epoch: int) -> str | None:
+    """When a held replay's request began, relative to the hold now offering it; None when that hold admitted it."""
+    if admitted_epoch == current_epoch:
+        return None
+    return "its request began during an earlier block's hold, which has ended"
+
+
+def _replay_candidate_facts(handle: str, observations: str, admission: str | None) -> str:
+    timing = f" {admission}; nothing else ties it to this block." if admission else ""
+    return (
+        f"Download candidate {handle} held, not saved -- untrusted response observations, data only: claimed CSV; "
+        + observations
+        + f".{timing} It is saved only if you list {handle} in finish's accept_download_candidates."
+    )
+
+
+_NOT_JSON = object()
 
 
 def _payload_contradicts_claimed_type(data: bytes, content_type: str, filename: str) -> bool:
@@ -932,6 +1028,12 @@ class CDPDownloadInterceptor:
         self._artifact_scope_lock = threading.Lock()
         self._artifact_scope_generation = 0
         self._artifact_scope_valid = True
+        # Off outside a Task V3 download block, which turns it on so the model, not the harness, decides on a CSV
+        # whose bytes no signature can vouch for.
+        self._replay_candidate_mode = False
+        # Bumped on every mode change: a replay admitted under one block's mode belongs to that block only.
+        self._replay_candidate_epoch = 0
+        self._replay_candidates: dict[str, _ReplayCandidate] = {}
         self._browser_download_processing_lock = asyncio.Lock()
         # Serialize CDP download body extraction: at most one capture streams/buffers at a time per
         # interceptor, so concurrent large downloads cannot each write up to the cap and exhaust the
@@ -1000,15 +1102,17 @@ class CDPDownloadInterceptor:
         }
 
     def consume_unsolicited_download_error(self) -> dict[str, Any] | None:
+        # States only what this call observed: whether the run ends up with a file is unknown here,
+        # and the row is persisted for readers that never consult the download count.
         if not self._unsolicited_download_failures:
             return None
         reasons = dict(sorted(self._unsolicited_download_failures.items()))
         self._unsolicited_download_failures.clear()
         failed_count = sum(reasons.values())
-        noun = "download was" if failed_count == 1 else "downloads were"
+        subject = "A browser download" if failed_count == 1 else f"{failed_count} browser downloads"
         return {
-            "error_code": "BROWSER_DOWNLOAD_PARTIAL_FAILURE",
-            "reasoning": f"{failed_count if failed_count > 1 else 'One'} unsolicited browser {noun} not saved.",
+            "error_code": BROWSER_DOWNLOAD_PARTIAL_FAILURE_CODE,
+            "reasoning": f"{subject} could not be saved.",
             "error_type": "SYSTEM_DEFINED_ERROR",
             "details": {"failed_download_count": failed_count, "reasons": reasons},
         }
@@ -1268,6 +1372,8 @@ class CDPDownloadInterceptor:
         redirect_hop_authorizer: RedirectHopAuthorizer[GuardedFileFetchHopResult],
     ) -> None:
         """Rotate a persistent interceptor's directory and redirect-hop authority as one scope."""
+        # Held bytes belong to the run being replaced and never outlive it.
+        self._discard_replay_candidates()
         new_output_dir = Path(download_dir)
         new_output_dir.mkdir(parents=True, exist_ok=True)
         self._remember_download_directory(new_output_dir)
@@ -1291,6 +1397,7 @@ class CDPDownloadInterceptor:
 
     def invalidate_download_scope(self) -> None:
         """Revoke run authority after an interrupted/failed persistent-session rebind."""
+        self._discard_replay_candidates()
         with self._artifact_scope_lock:
             self._redirect_hop_authorizer = deny_unenrolled_redirect_hop
             self._download_scope = None
@@ -1300,6 +1407,86 @@ class CDPDownloadInterceptor:
         for task in tuple(self._browser_download_tasks):
             task.cancel()
         LOG.error("CDP download interceptor run scope invalidated")
+
+    def set_replay_candidate_mode(self, enabled: bool) -> bool:
+        """Returns whether this call changed the mode. Ending a hold keeps what it held: a candidate is discarded only
+        by a model's verdict or when its run scope ends."""
+        changed = enabled != self._replay_candidate_mode
+        if changed:
+            self._replay_candidate_epoch += 1
+        self._replay_candidate_mode = enabled
+        return changed
+
+    def _discard_replay_candidates(self) -> None:
+        for handle in list(self._replay_candidates):
+            self._discard_replay_candidate(handle)
+
+    def _current_candidate_epoch(self) -> int:
+        # Stamped even while no block holds candidates, so a replay admitted then is known to be outside any hold.
+        return self._replay_candidate_epoch
+
+    def replay_candidates(self) -> dict[str, str]:
+        """Held candidates' fact lines by handle; one whose run scope ended is discarded here."""
+        for handle, candidate in list(self._replay_candidates.items()):
+            if not self._artifact_scope_is_active(candidate.scope_generation):
+                self._discard_replay_candidate(handle)
+        return {
+            handle: _replay_candidate_facts(
+                handle,
+                candidate.observations,
+                _replay_candidate_admission(candidate.admitted_epoch, self._replay_candidate_epoch),
+            )
+            for handle, candidate in self._replay_candidates.items()
+        }
+
+    def resolve_replay_candidates(self, accepted: frozenset[str]) -> list[str]:
+        """Save the accepted candidates' original bytes and discard every other held candidate; returns those saved.
+        An accepted candidate whose write failed stays held, so the selection can be retried."""
+        saved: list[str] = []
+        for handle in list(self._replay_candidates):
+            outcome = self._publish_replay_candidate(handle) if handle in accepted else "discard"
+            if outcome == "saved":
+                saved.append(handle)
+            elif outcome == "discard":
+                self._discard_replay_candidate(handle)
+        return saved
+
+    def _discard_replay_candidate(self, handle: str) -> None:
+        candidate = self._replay_candidates.pop(handle)
+        self._record_download_failure(candidate.attempt, "capture_failed")
+
+    def _publish_replay_candidate(self, handle: str) -> Literal["saved", "failed", "discard"]:
+        candidate = self._replay_candidates[handle]
+        if not self._artifact_scope_is_active(candidate.scope_generation):
+            return "discard"
+        save_path, filename = self._resolve_save_path(candidate.filename, candidate.content_type)
+        if self._existing_file_is_identical(save_path, candidate.data):
+            del self._replay_candidates[handle]
+            self._discard_duplicate_download(candidate.attempt)
+            return "saved"
+        try:
+            self._atomically_write_bytes(save_path, candidate.data, candidate.scope_generation)
+        except _DownloadScopeInvalidated:
+            return "discard"
+        except (OSError, ValueError) as exc:
+            # Type only: a filesystem error names the candidate's private filename.
+            LOG.warning(
+                "CDP download selected replay candidate could not be saved",
+                handle=handle,
+                error_type=type(exc).__name__,
+            )
+            return "failed"
+        del self._replay_candidates[handle]
+        LOG.info(
+            "CDP download saved (selected replay candidate)",
+            filename_fp=diagnostic_fingerprint(filename),
+            size=len(candidate.data),
+            save_path_fp=diagnostic_fingerprint(str(save_path)),
+            download_index=self._download_index,
+            method="guarded_http",
+        )
+        self._record_download_saved(candidate.attempt)
+        return "saved"
 
     def _artifact_scope_is_active(self, generation: int) -> bool:
         return self._artifact_scope_valid and generation == self._artifact_scope_generation
@@ -1735,6 +1922,10 @@ class CDPDownloadInterceptor:
         artifact_scope_generation: int,
     ) -> None:
         """Handle Browser.downloadWillBegin — save the file from its URL."""
+        # Stamped at admission, like the scope generation, so a block that ends while this waits keeps ownership.
+        candidate_epoch = event.get(_REPLAY_CANDIDATE_EPOCH_EVENT_KEY, _CANDIDATE_EPOCH_AT_ENTRY)
+        if candidate_epoch is not None and not isinstance(candidate_epoch, int):
+            candidate_epoch = None
         is_data_url = False
         attempt: _DownloadAttempt | None = None
         try:
@@ -1770,7 +1961,9 @@ class CDPDownloadInterceptor:
                 # page instead of dropping the download.
                 await self._download_blob_url(url, suggested_filename, artifact_scope_generation)
             elif url.startswith("http"):
-                await self._download_url_directly(url, suggested_filename, artifact_scope_generation)
+                await self._download_url_directly(
+                    url, suggested_filename, artifact_scope_generation, candidate_epoch=candidate_epoch
+                )
             else:
                 LOG.warning("Download URL scheme not supported, skipping", scheme=urlparse(url).scheme)
                 self._record_download_failure(attempt, "unsupported_scheme")
@@ -1997,11 +2190,46 @@ class CDPDownloadInterceptor:
         finally:
             self._cleanup_confined_temporary_file(temporary_file)
 
+    def _held_as_candidate(
+        self,
+        attempt: _DownloadAttempt,
+        data: bytes,
+        filename: str,
+        content_type: str,
+        scope_generation: int,
+        candidate_epoch: int | None,
+        observed_type: str | None,
+        status: int | None,
+    ) -> bool:
+        """Whether claimed-CSV bytes were held for the model instead of saved. Only a request a block's hold admitted
+        is a candidate: the epoch starts with no hold and moves on every change, so an odd epoch is a hold. One that
+        lands after its hold ended is held unowned, saying so; one admitted outside any hold saves as before."""
+        if candidate_epoch is None or len(data) > REPLAY_CANDIDATE_MAX_BYTES or not candidate_epoch % 2:
+            return False
+        if not self._artifact_scope_is_active(scope_generation):
+            LOG.info("CDP download replay candidate outlived its run scope; discarded", size=len(data))
+            self._record_download_failure(attempt, "capture_failed")
+            return True
+        handle = f"c{next(_REPLAY_CANDIDATE_HANDLES)}"
+        self._replay_candidates[handle] = _ReplayCandidate(
+            attempt=attempt,
+            data=data,
+            filename=filename,
+            content_type=content_type,
+            scope_generation=scope_generation,
+            observations=_replay_candidate_observations(data, observed_type, status),
+            admitted_epoch=candidate_epoch,
+        )
+        LOG.info("CDP download held as a replay candidate", handle=handle, size=len(data))
+        return True
+
     async def _download_url_directly(
         self,
         url: str,
         suggested_filename: str,
         artifact_scope_generation: int | None = None,
+        *,
+        candidate_epoch: int | None = _CANDIDATE_EPOCH_AT_ENTRY,
     ) -> None:
         """Download through the validated, pinned, per-hop-authorized shared fetch seam.
 
@@ -2009,6 +2237,8 @@ class CDPDownloadInterceptor:
         guard rejects (or that fails for any other reason) drops the download rather than retrying
         it unmediated.
         """
+        if candidate_epoch == _CANDIDATE_EPOCH_AT_ENTRY:
+            candidate_epoch = self._current_candidate_epoch()
         attempt = self._browser_download_attempt
         if attempt is None:
             attempt = self._new_download_attempt()
@@ -2103,6 +2333,10 @@ class CDPDownloadInterceptor:
                 self._run_download_bytes -= len(data)
                 if not self._reserve_download_bytes(attempt, len(recovered)):
                     return
+                if _claims_csv(content_type, normalized_filename) and self._held_as_candidate(
+                    attempt, recovered, suggested_filename, "", artifact_scope_generation, candidate_epoch, None, None
+                ):
+                    return
                 save_path, filename = self._resolve_save_path(suggested_filename)
                 if self._existing_file_is_identical(save_path, recovered):
                     self._discard_duplicate_download(attempt)
@@ -2137,10 +2371,21 @@ class CDPDownloadInterceptor:
             self._record_download_failure(attempt, "capture_failed")
             return
 
-        save_path, filename = self._resolve_save_path(response_filename, content_type)
         if artifact_scope_generation is None:
             artifact_scope_generation = self._artifact_scope_generation
+        if _claims_csv(content_type, normalized_filename) and self._held_as_candidate(
+            attempt,
+            data,
+            response_filename,
+            content_type,
+            artifact_scope_generation,
+            candidate_epoch,
+            content_type,
+            response.status,
+        ):
+            return
 
+        save_path, filename = self._resolve_save_path(response_filename, content_type)
         scope_active = self._artifact_scope_is_active(artifact_scope_generation)
         if scope_active and self._existing_file_is_identical(save_path, data):
             self._discard_duplicate_download(attempt)
@@ -2342,6 +2587,8 @@ class CDPDownloadInterceptor:
 
     async def disable(self) -> None:
         """Disable Fetch interception on all CDP sessions and clean up browser monitor."""
+        self.set_replay_candidate_mode(False)
+        self._discard_replay_candidates()
         self._accepting_pages = False
         page_context = self._page_context
         page_listener = self._page_listener
@@ -2387,6 +2634,8 @@ class CDPDownloadInterceptor:
         try:
             await self._drain_tasks(self._cdp_handler_tasks)
         finally:
+            # Admission is closed, so this sweep also frees what the drains above landed, even when they were cancelled.
+            self._discard_replay_candidates()
             self._recovery_request_ids.clear()
             self._active_recovery_markers.clear()
             sessions = tuple(self._cdp_sessions)
@@ -2423,10 +2672,10 @@ class CDPDownloadInterceptor:
             raise detach_cancellation
 
     @asynccontextmanager
-    async def settle_browser_downloads(self) -> AsyncIterator[None]:
-        """Drain browser downloads to a stable admission snapshot before artifact collection."""
+    async def settle_browser_downloads(self, *, keep_producers: bool = False) -> AsyncIterator[None]:
+        """Drain browser downloads to a stable admission snapshot; `keep_producers` leaves them running if cancelled."""
         async with self._browser_download_monitor_lock:
-            await self._drain_browser_downloads_to_quiescence()
+            await self._drain_browser_downloads_to_quiescence(keep_producers=keep_producers)
             try:
                 yield
             except BaseException:
@@ -2437,16 +2686,21 @@ class CDPDownloadInterceptor:
                     await asyncio.gather(*tasks, return_exceptions=True)
                 raise
             else:
-                await self._drain_browser_downloads_to_quiescence(admit_browser_events=True)
+                await self._drain_browser_downloads_to_quiescence(
+                    admit_browser_events=True, keep_producers=keep_producers
+                )
 
-    async def _drain_browser_downloads_to_quiescence(self, *, admit_browser_events: bool = False) -> None:
+    async def _drain_browser_downloads_to_quiescence(
+        self, *, admit_browser_events: bool = False, keep_producers: bool = False
+    ) -> None:
         if admit_browser_events and self._browser_session is not None and self._accepting_browser_downloads:
             await asyncio.sleep(BROWSER_DOWNLOAD_EVENT_ADMISSION_GRACE_SECONDS)
         while True:
             generation = self._browser_download_generation
             cdp_generation = self._cdp_handler_generation
             if self._browser_download_tasks:
-                await asyncio.gather(*tuple(self._browser_download_tasks), return_exceptions=True)
+                tasks = tuple(self._browser_download_tasks)
+                await (asyncio.wait(tasks) if keep_producers else asyncio.gather(*tasks, return_exceptions=True))
             # A download capture runs inside a _cdp_handler_task, and a second Fetch.requestPaused may be
             # scheduled but not yet classified as a download (no .crdownload yet → invisible to the
             # file-snapshot waiter). Wait for in-flight/scheduled handlers too, or collection could finalize
@@ -2495,6 +2749,7 @@ class CDPDownloadInterceptor:
         self._browser_download_generation += 1
         admitted_event = dict(event)
         admitted_event[_ARTIFACT_SCOPE_GENERATION_EVENT_KEY] = self._artifact_scope_generation
+        admitted_event[_REPLAY_CANDIDATE_EPOCH_EVENT_KEY] = self._current_candidate_epoch()
         task = asyncio.create_task(self._handle_browser_download(admitted_event))
         self._browser_download_tasks.add(task)
         self._browser_download_task_event_bytes[task] = event_bytes
@@ -3222,14 +3477,17 @@ class CDPDownloadInterceptor:
 
 
 @asynccontextmanager
-async def settle_browser_downloads_for_context(browser_context: BrowserContext | None) -> AsyncIterator[None]:
+async def settle_browser_downloads_for_context(
+    browser_context: BrowserContext | None, *, keep_producers: bool = False
+) -> AsyncIterator[None]:
     interceptor: CDPDownloadInterceptor | None = (
         getattr(browser_context, "_skyvern_cdp_download_interceptor", None) if browser_context is not None else None
     )
     if interceptor is None:
         yield
         return
-    async with interceptor.settle_browser_downloads():
+    # Existing callers keep their exact call; only a caller that keeps producers passes the flag.
+    async with interceptor.settle_browser_downloads(**({"keep_producers": True} if keep_producers else {})):
         yield
 
 
@@ -3295,6 +3553,67 @@ def consume_unsolicited_download_error_for_context(browser_context: BrowserConte
         getattr(browser_context, "_skyvern_cdp_download_interceptor", None) if browser_context is not None else None
     )
     return interceptor.consume_unsolicited_download_error() if isinstance(interceptor, CDPDownloadInterceptor) else None
+
+
+def _interceptor_for_context(browser_context: BrowserContext | None) -> CDPDownloadInterceptor | None:
+    interceptor = (
+        getattr(browser_context, "_skyvern_cdp_download_interceptor", None) if browser_context is not None else None
+    )
+    return interceptor if isinstance(interceptor, CDPDownloadInterceptor) else None
+
+
+def set_replay_candidate_mode_for_context(browser_context: BrowserContext | None, enabled: bool) -> bool:
+    interceptor = _interceptor_for_context(browser_context)
+    return interceptor.set_replay_candidate_mode(enabled) if interceptor is not None else False
+
+
+# The holds the current run scope began, on whichever contexts it was handed, so it ends exactly those when it exits.
+_REPLAY_CANDIDATE_HOLDS: ContextVar[list[BrowserContext] | None] = ContextVar("replay_candidate_holds", default=None)
+
+
+@contextmanager
+def replay_candidate_holds(*, own: bool) -> Iterator[None]:
+    """A run scope whose holds end when it exits. `own` gives it a frame of its own; otherwise it joins an open one."""
+    if not own and _REPLAY_CANDIDATE_HOLDS.get() is not None:
+        yield
+        return
+    holds: list[BrowserContext] = []
+    token = _REPLAY_CANDIDATE_HOLDS.set(holds)
+    try:
+        yield
+    finally:
+        end_replay_candidate_holds()
+        _REPLAY_CANDIDATE_HOLDS.reset(token)
+
+
+def begin_replay_candidate_hold(browser_context: BrowserContext | None) -> bool:
+    """Holds candidates on `browser_context`; True when the caller must end the hold itself, as no run scope is open."""
+    if not set_replay_candidate_mode_for_context(browser_context, True):
+        return False
+    holds = _REPLAY_CANDIDATE_HOLDS.get()
+    if holds is None:
+        return True
+    assert browser_context is not None
+    holds.append(browser_context)
+    return False
+
+
+def end_replay_candidate_holds() -> None:
+    holds = _REPLAY_CANDIDATE_HOLDS.get()
+    while holds:
+        set_replay_candidate_mode_for_context(holds.pop(), False)
+
+
+def replay_candidates_for_context(browser_context: BrowserContext | None) -> dict[str, str]:
+    interceptor = _interceptor_for_context(browser_context)
+    return interceptor.replay_candidates() if interceptor is not None else {}
+
+
+def resolve_replay_candidates_for_context(
+    browser_context: BrowserContext | None, accepted: frozenset[str]
+) -> list[str]:
+    interceptor = _interceptor_for_context(browser_context)
+    return interceptor.resolve_replay_candidates(accepted) if interceptor is not None else []
 
 
 def download_tally_for_context(browser_context: BrowserContext | None) -> DownloadTally | None:

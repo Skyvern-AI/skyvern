@@ -10,8 +10,8 @@ from skyvern.cli.mcp_tools import mcp
 from skyvern.cli.mcp_tools.instructions import DEFAULT_INSTRUCTIONS
 from skyvern.cli.mcp_tools.scopes import MCPScope, apply_scope
 
-# Re-frozen for SKY-17457: engine guidance omits the field by default and sets skyvern-1.0 only on request.
-DEFAULT_INSTRUCTIONS_SHA256 = "3b05238400b52f2120120403f80b2a8af9c487e41990b95efb5310ccd0376312"
+# Re-frozen for SKY-17536: append guidance for skyvern_feedback.
+DEFAULT_INSTRUCTIONS_SHA256 = "2a5fae7eb9ab108d51666c0ce5896b76701c47bda32e5634bc69a41706854dac"
 
 # Digests snapshot each legacy tool's wire manifest: name, schema, description, annotations, _meta.
 # New tool names are ignored; any change to a legacy tool fails.
@@ -146,10 +146,11 @@ LEGACY_TOOL_MANIFEST_DIGESTS = {
 }
 
 # Resolved memberships for the three pre-existing scopes must remain byte-for-byte stable.
+# Re-frozen for SKY-17536: skyvern_feedback joins every scope.
 LEGACY_SCOPE_MEMBERSHIP_DIGESTS: dict[MCPScope, tuple[int, str]] = {
-    "browser": (54, "8c05058f36d5d4472e11f384ed68cabbae0478b3e16d2f7da6c2d07dda21703a"),
-    "build": (62, "0f6d512bf4a3af872181682aa1deb47df8180c9bf4da83e3ae9c63fc3b8ec121"),
-    "operate": (30, "fb27a193d3bedb074331306de64264afcce59dd88223b33045cb41d95cc612b7"),
+    "browser": (55, "8e5cfe12a7983984a3f0f26b2032e4a06c587f80136ff5a5d691ce5ac9127d07"),
+    "build": (63, "12263087bc69ec0ec1d6a877a452093f9d783e97aea91cb852633a61920f7560"),
+    "operate": (31, "e331676fab4dfab9b24ef014a7167966adb11348f2c6d679bf2de27ded8de28f"),
 }
 
 

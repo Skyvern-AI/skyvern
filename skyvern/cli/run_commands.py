@@ -346,6 +346,7 @@ def run_server() -> None:
 
     prepare_cli_runtime(intent=EnvIntent.SERVER)
     from skyvern.config import settings  # noqa: PLC0415
+    from skyvern.forge.payload_limits import max_file_upload_ws_message_size  # noqa: PLC0415
 
     port = settings.PORT
     console.print(Panel(f"[bold green]Starting Skyvern API Server on port {port}...", border_style="green"))
@@ -361,6 +362,7 @@ def run_server() -> None:
         loop="asyncio",
         timeout_keep_alive=settings.UVICORN_TIMEOUT_KEEP_ALIVE,
         ws="websockets-sansio",
+        ws_max_size=max_file_upload_ws_message_size(settings.MAX_UPLOAD_FILE_SIZE),
         # Let cdp_input emit its 120s setup-time close before Uvicorn's liveness timeout.
         ws_ping_interval=20.0,
         ws_ping_timeout=120.0,
@@ -576,6 +578,7 @@ def run_dev() -> None:
     """
     prepare_cli_runtime(intent=EnvIntent.SERVER)
     from skyvern.config import settings as skyvern_settings  # noqa: PLC0415
+    from skyvern.forge.payload_limits import max_file_upload_ws_message_size  # noqa: PLC0415
 
     console.print(Panel("[bold green]Starting Skyvern in development mode...[/bold green]", border_style="green"))
 
@@ -593,6 +596,8 @@ def run_dev() -> None:
             "asyncio",
             "--ws",
             "websockets-sansio",
+            "--ws-max-size",
+            str(max_file_upload_ws_message_size(skyvern_settings.MAX_UPLOAD_FILE_SIZE)),
         ],
         stdout=subprocess.DEVNULL,
         stderr=subprocess.DEVNULL,

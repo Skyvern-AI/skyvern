@@ -826,6 +826,26 @@ def _response_finish_reason(response: object) -> str | None:
     return None
 
 
+def _halved_reasoning_budget_parameters(active_parameters: dict[str, Any]) -> dict[str, Any] | None:
+    """A copy of these parameters with the declared reasoning budget halved.
+
+    None when the request declares no budget, and so has nothing it can hand back to the answer.
+    """
+    extra_body = active_parameters.get("extra_body")
+    if not isinstance(extra_body, dict):
+        return None
+    reasoning = extra_body.get("reasoning")
+    if not isinstance(reasoning, dict):
+        return None
+    budget = reasoning.get("max_tokens")
+    if not isinstance(budget, int) or isinstance(budget, bool) or budget < 2:
+        return None
+    return {
+        **active_parameters,
+        "extra_body": {**extra_body, "reasoning": {**reasoning, "max_tokens": budget // 2}},
+    }
+
+
 def _usage_int_field(value: Any, *field_names: str) -> int | None:
     for field_name in field_names:
         field = value.get(field_name) if isinstance(value, dict) else getattr(value, field_name, None)
@@ -941,7 +961,7 @@ def _get_primary_model_dict(router: Any, main_model_group: str) -> dict[str, Any
 
 
 def _primary_deployment_label(primary_model_dict: dict[str, Any] | None) -> str | None:
-    """Provider label of the primary deployment (e.g. `vertex_ai/gemini-2.5-pro` -> `gemini-2.5-pro`)."""
+    """Provider label of the primary deployment (e.g. `vertex_ai/gemini-3-flash-preview` -> `gemini-3-flash-preview`)."""
     if not primary_model_dict:
         return None
     litellm_params = primary_model_dict.get("litellm_params") or {}
@@ -1054,7 +1074,7 @@ def _log_vertex_cache_hit_if_needed(
 
 def _normalize_llm_model(model: str | None) -> str | None:
     # LiteLLM's response.model can include a provider prefix
-    # (e.g. "vertex_ai/gemini-2.5-flash", "openai/gpt-4.1-mini") while
+    # (e.g. "vertex_ai/gemini-3-flash-preview", "openai/gpt-4.1-mini") while
     # config-side fallbacks tend to use the bare model name. Strip the
     # prefix so dbt aggregates the same model under one bucket.
     if not model:
@@ -1297,7 +1317,7 @@ class LLMAPIHandlerFactory:
     def _models_equivalent(left: str | None, right: str | None) -> bool:
         """Used only by `llm_api_handler_with_router_and_fallback`. Router model
         groups carry the `vertex-` prefix while LiteLLM responses return the
-        underlying provider label (e.g. `gemini-2.5-pro`). Stripping the prefix
+        underlying provider label (e.g. `gemini-3-flash-preview`). Stripping the prefix
         lets us detect whether the configured primary (the router's
         `main_model_group`) actually served the request without replumbing every
         config/registry reference.
@@ -1575,7 +1595,7 @@ class LLMAPIHandlerFactory:
                 )
 
         try:
-            # Gemini router/fallback configs (e.g., gemini-2.5-pro-gpt-5-fallback-router)
+            # Gemini router/fallback configs (e.g., gemini-3-pro-gpt-5-fallback-router)
             # are not recognized by litellm, but they do support reasoning budgets.
             if not supports_reasoning and model_label:
                 model_label_lower = model_label.lower()
@@ -2375,7 +2395,7 @@ class LLMAPIHandlerFactory:
                             LOG.warning(
                                 "Vertex cache primary call failed, retrying via router",
                                 prompt_name=prompt_name,
-                                error=str(cache_error),
+                                error_type=type(cache_error).__name__,
                                 cache_name=cache_resource_name,
                                 cache_variant=cache_variant,
                             )
@@ -2667,7 +2687,7 @@ class LLMAPIHandlerFactory:
                         cached_tokens = getattr(response.usage, "cache_read_input_tokens", 0) or 0
 
                 # Prefer the actual backing model returned by LiteLLM so we don't persist the
-                # router group name (e.g. "GEMINI_2_5_FLASH_WITH_FALLBACK") when the router
+                # router group name (e.g. "GEMINI_3_0_FLASH_WITH_FALLBACK") when the router
                 # falls back. Mirrors the pattern in llm_api_handler/call.
                 # Phase 1 tradeoff: last_llm_model records the most recent model used in
                 # the step. dbt attributes the full step_cost to it, which is accurate
@@ -4072,6 +4092,7 @@ class LLMCaller:
             llm_request_payload = {
                 "model": self.llm_key if openrouter_model_name and self.openai_client else self.llm_config.model_name,
                 "messages": messages,
+                **({"tools": tools} if tools else {}),
                 # we're not using active_parameters here because it may contain sensitive information
                 **parameters,
             }
@@ -4091,16 +4112,22 @@ class LLMCaller:
             t_llm_request = time.perf_counter()
             llm_duration_seconds = 0.0
             refused_call_stats: LLMCallStats | None = None
+            truncated_call_stats: LLMCallStats | None = None
             try:
                 # `timeout` may already live in active_parameters via litellm_params (flex configs
                 # carry their own); passing it explicitly too collides on kwarg unpacking.
                 response = await self._dispatch_llm_call(
                     messages=messages,
                     tools=tools,
+                    prompt_name=prompt_name,
                     **active_parameters,
                 )
                 if _response_finish_reason(response) == "content_filter":
                     response, refused_call_stats = await self._retry_refused_call_on_fallback(
+                        response, messages, tools, active_parameters, prompt_name
+                    )
+                if isinstance(response, ModelResponse) and is_truncated_response(response):
+                    response, truncated_call_stats = await self._retry_truncated_call_with_less_reasoning(
                         response, messages, tools, active_parameters, prompt_name
                     )
                 llm_duration_seconds = time.perf_counter() - t_llm_request
@@ -4212,6 +4239,8 @@ class LLMCaller:
                 )
             if refused_call_stats is not None:
                 call_stats = _combined_call_stats(call_stats, refused_call_stats)
+            if truncated_call_stats is not None:
+                call_stats = _combined_call_stats(call_stats, truncated_call_stats)
 
             llm_response_json = _safe_model_dump_json(response)
             if should_persist_llm_artifacts:
@@ -4448,12 +4477,69 @@ class LLMCaller:
         if fallback_group is None:
             raise LLMContentFilteredError(self.llm_key, [refused_on])
         fallback_response = await self._dispatch_llm_call(
-            messages=messages, tools=tools, router_model_group=fallback_group, **active_parameters
+            messages=messages,
+            tools=tools,
+            router_model_group=fallback_group,
+            prompt_name=prompt_name,
+            **active_parameters,
         )
         if _response_finish_reason(fallback_response) == "content_filter":
             await self._log_refused_response(fallback_response, prompt_name, fallback_group, None)
             raise LLMContentFilteredError(self.llm_key, [refused_on, fallback_group])
         return fallback_response, refused_stats
+
+    async def _retry_truncated_call_with_less_reasoning(
+        self,
+        response: ModelResponse,
+        messages: list[dict[str, Any]],
+        tools: list | None,
+        active_parameters: dict[str, Any],
+        prompt_name: str | None,
+    ) -> tuple[ModelResponse | CustomStreamWrapper | AnthropicMessage | UITarsResponse, LLMCallStats | None]:
+        """A model that spent its whole completion budget reasoning stops at finish_reason=length with no
+        content, which arrives as a valid response the router's exception-driven fallback never sees. Send it
+        once more with the declared reasoning budget halved, so the answer has room (SKY-18857). A step retry
+        is no substitute: it re-sends the same budget and truncates the same way."""
+        retry_parameters = _halved_reasoning_budget_parameters(active_parameters)
+        usage = getattr(response, "usage", None)
+        usage_detail = getattr(usage, "completion_tokens_details", None)
+        LOG.warning(
+            "LLM spent its whole completion budget on reasoning and returned no content",
+            llm_key=self.llm_key,
+            prompt_name=prompt_name,
+            model=getattr(response, "model", None) or self.llm_config.model_name,
+            prompt_tokens=getattr(usage, "prompt_tokens", None),
+            completion_tokens=getattr(usage, "completion_tokens", None),
+            reasoning_tokens=getattr(usage_detail, "reasoning_tokens", None),
+            # False means the request declared no reasoning budget to lower, so this call fails as it
+            # did before. Read with retried_reasoning_budget to tell a recovery from a bare report.
+            retried=retry_parameters is not None,
+            retried_reasoning_budget=(
+                retry_parameters["extra_body"]["reasoning"]["max_tokens"] if retry_parameters else None
+            ),
+        )
+        if retry_parameters is None:
+            return response, None
+        truncated_stats = await self._log_discarded_response_stats(response, prompt_name)
+        return (
+            await self._dispatch_llm_call(messages=messages, tools=tools, prompt_name=prompt_name, **retry_parameters),
+            truncated_stats,
+        )
+
+    async def _log_discarded_response_stats(
+        self,
+        response: ModelResponse | CustomStreamWrapper | AnthropicMessage | UITarsResponse,
+        prompt_name: str | None,
+    ) -> LLMCallStats:
+        """Usage for a response this call is throwing away; its tokens were still spent and still bill."""
+        stats = await self.get_call_stats(response)
+        _emit_copilot_model_usage_for_response(
+            response,
+            request_model=self.llm_config.model_name,
+            prompt_name=prompt_name,
+            cost=stats.llm_cost if stats.llm_cost_available else None,
+        )
+        return stats
 
     async def _log_refused_response(
         self,
@@ -4462,13 +4548,7 @@ class LLMCaller:
         refused_on: str,
         fallback_group: str | None,
     ) -> LLMCallStats:
-        stats = await self.get_call_stats(response)
-        _emit_copilot_model_usage_for_response(
-            response,
-            request_model=self.llm_config.model_name,
-            prompt_name=prompt_name,
-            cost=stats.llm_cost if stats.llm_cost_available else None,
-        )
+        stats = await self._log_discarded_response_stats(response, prompt_name)
         LOG.warning(
             "LLM response refused or blocked by content filter",
             llm_key=self.llm_key,
@@ -4488,6 +4568,7 @@ class LLMCaller:
         tools: list | None = None,
         timeout: float = settings.LLM_CONFIG_TIMEOUT,
         router_model_group: str | None = None,
+        prompt_name: str | None = None,
         **active_parameters: dict[str, Any],
     ) -> ModelResponse | CustomStreamWrapper | AnthropicMessage | UITarsResponse:
         await _validate_custom_llm_api_base(self.original_llm_key, self.llm_config)
@@ -4616,7 +4697,7 @@ class LLMCaller:
             )
 
         if self.llm_key and "ANTHROPIC" in self.llm_key:
-            return await self._call_anthropic(messages, tools, timeout, **active_parameters)
+            return await self._call_anthropic(messages, tools, timeout, prompt_name=prompt_name, **active_parameters)
 
         # Route UI-TARS models to custom handler instead of LiteLLM
         if self.llm_key and "UI_TARS" in self.llm_key:
@@ -4640,6 +4721,7 @@ class LLMCaller:
         messages: list[dict[str, Any]],
         tools: list | None = None,
         timeout: float = settings.LLM_CONFIG_TIMEOUT,
+        prompt_name: str | None = None,
         **active_parameters: dict[str, Any],
     ) -> AnthropicMessage:
         max_tokens = active_parameters.get("max_completion_tokens") or active_parameters.get("max_tokens") or 4096
@@ -4673,7 +4755,12 @@ class LLMCaller:
         LOG.info(
             "Anthropic response",
             model_name=model_name,
-            response=response,
+            prompt_name=prompt_name,
+            response_type=type(response).__name__,
+            response_id=response.id,
+            content_length=sum(len(block.text) for block in response.content if block.type == "text"),
+            stop_reason=response.stop_reason,
+            token_usage={"input_tokens": response.usage.input_tokens, "output_tokens": response.usage.output_tokens},
             betas=betas,
             tools=tools,
             timeout=timeout,

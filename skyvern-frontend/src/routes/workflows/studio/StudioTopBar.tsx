@@ -41,8 +41,6 @@ import {
 } from "@/components/ui/dialog";
 import { toast } from "@/components/ui/use-toast";
 import { useCredentialGetter } from "@/hooks/useCredentialGetter";
-import { useRecordingStore } from "@/store/useRecordingStore";
-
 import { useWorkflowPanelStore } from "@/store/WorkflowPanelStore";
 import { useWorkflowParametersStore } from "@/store/WorkflowParametersStore";
 import { useWorkflowSnapshotStore } from "@/store/WorkflowSnapshotStore";
@@ -85,9 +83,8 @@ import { useStudioWorkflowDeletedAt } from "./StudioShellContext";
 export function TitleSection({ editable = true }: { editable?: boolean }) {
   const title = useWorkflowTitleStore((state) => state.title);
   const { mutationLocked, onTitleChange } = useDeferredTitleEdit();
-  const isRecording = useRecordingStore((s) => s.isRecording);
   const workflowPermanentId = useWorkflowPermanentId();
-  const canEdit = editable && !isRecording && !mutationLocked;
+  const canEdit = editable && !mutationLocked;
   return (
     <div className="flex min-w-0 max-w-[19rem] items-center gap-1">
       <EditableNodeTitle
@@ -142,9 +139,8 @@ export function SaveButton() {
   // instead of gating on it (see onClick).
   const contentDirty = useWorkflowSnapshotStore((s) => s.contentDirty);
   const snapshot = useWorkflowSnapshotStore((s) => s.snapshot);
-  const isRecording = useRecordingStore((s) => s.isRecording);
   const saveLockReason = useWorkflowYamlEditorStore(selectSaveLockReason);
-  const saveUnavailable = isRecording || saveLockReason !== null;
+  const saveUnavailable = saveLockReason !== null;
   const onSave = useSaveWorkflow();
   const [confirmOpen, setConfirmOpen] = useState(false);
   const pendingGoalChangeCount = useCopilotActionStore(
@@ -310,14 +306,12 @@ function PanelToggle({
   const state = useWorkflowPanelStore((s) => s.workflowPanelState);
   const setState = useWorkflowPanelStore((s) => s.setWorkflowPanelState);
   const close = useWorkflowPanelStore((s) => s.closeWorkflowPanel);
-  const isRecording = useRecordingStore((s) => s.isRecording);
   const isOpen = state.active && state.content === content;
   return (
-    <ControlTooltip content={label} blocked={isRecording}>
+    <ControlTooltip content={label}>
       <Button
         variant="ghost"
         size="icon"
-        disabled={isRecording}
         aria-pressed={isOpen}
         className={cn(
           "h-8 w-8 text-muted-foreground",
@@ -343,17 +337,12 @@ export function InputsToggle() {
   const state = useWorkflowPanelStore((s) => s.workflowPanelState);
   const close = useWorkflowPanelStore((s) => s.closeWorkflowPanel);
   const setState = useWorkflowPanelStore((s) => s.setWorkflowPanelState);
-  const isRecording = useRecordingStore((s) => s.isRecording);
   const count = useWorkflowParametersStore((s) => s.parameters.length);
   const isOpen = state.active && state.content === "parameters";
   return (
-    <ControlTooltip
-      content="Placeholder values you can link in any block, and fill in before each run"
-      blocked={isRecording}
-    >
+    <ControlTooltip content="Placeholder values you can link in any block, and fill in before each run">
       <Button
         variant="outline"
-        disabled={isRecording}
         aria-pressed={isOpen}
         className={cn(
           "h-8 gap-1.5 px-3 text-xs",
@@ -386,7 +375,6 @@ export function RunStopButton({ stopOnly = false }: { stopOnly?: boolean }) {
   const queryClient = useQueryClient();
   const postHog = usePostHog();
   const credentialGetter = useCredentialGetter();
-  const isRecording = useRecordingStore((s) => s.isRecording);
   const blockingBlocks = useRunValidationStore((s) => s.blockingBlocks);
   const hasBlockingBlocks = blockingBlocks.length > 0;
   const {
@@ -408,7 +396,7 @@ export function RunStopButton({ stopOnly = false }: { stopOnly?: boolean }) {
   const hasNoBlocks = useWorkflowHasChangesStore(
     (s) => s.editorHasBlocks === false,
   );
-  const runBlocked = isRecording || hasNoBlocks || hasBlockingBlocks;
+  const runBlocked = hasNoBlocks || hasBlockingBlocks;
   const runBlockedReason = hasBlockingBlocks
     ? getRunBlockingTooltipText(blockingBlocks)
     : hasNoBlocks
@@ -477,7 +465,7 @@ export function RunStopButton({ stopOnly = false }: { stopOnly?: boolean }) {
             variant="destructive"
             size="default"
             className="h-8 px-3"
-            disabled={cancelRun.isPending || isRecording}
+            disabled={cancelRun.isPending}
           >
             {cancelRun.isPending ? (
               <ReloadIcon className="mr-2 size-4 animate-spin" />

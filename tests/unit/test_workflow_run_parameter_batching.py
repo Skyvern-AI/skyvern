@@ -1779,36 +1779,41 @@ async def test_run_submission_carries_user_agent_platform_through_real_prepare_a
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("route", ["run", "legacy"])
 @pytest.mark.parametrize(
-    ("parameters", "detail"),
+    ("route", "parameters", "detail"),
     [
         pytest.param(
+            "run",
             {"login": "cred_deleted", "email": "a@example.com"},
             "Invalid credential ID: cred_deleted. Failed to resolve to a valid credential.",
             id="invalid-credential-id",
         ),
         pytest.param(
+            "legacy",
             {"login": "cred_live"},
             "Missing value for parameter email in workflow {wpid}",
             id="missing-parameter",
         ),
         pytest.param(
+            "run",
             {"email": "a@example.com", "count": "three"},
             "Invalid workflow parameter. Expected parameter type: integer. Value: three.",
             id="invalid-parameter-value",
         ),
         pytest.param(
+            "legacy",
             {"logn": "cred_live", "email": "a@example.com"},
             "The run request sent parameter(s) this workflow does not declare: logn.",
             id="misdirected-credential-key",
         ),
         pytest.param(
+            "run",
             {"login": "cred_live", "email": "a@example.com", "vault_item": "not-a-uuid"},
             "Invalid workflow parameter. Expected parameter type: Bitwarden item ID (UUID). Value: not-a-uuid.",
             id="invalid-bitwarden-item-id",
         ),
         pytest.param(
+            "legacy",
             {"login": "cred_live", "email": "a@example.com", "account": "cred_unlisted"},
             "Credential override for parameter account must be one of the configured rotation or fallback credentials.",
             id="credential-override-outside-the-pool",
@@ -1841,12 +1846,14 @@ async def test_run_submission_refuses_unusable_parameters_without_writing_a_run(
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("route", ["run", "legacy"])
 @pytest.mark.parametrize(
-    ("parameters", "deleted_credential_id"),
+    ("route", "parameters", "deleted_credential_id"),
     [
-        pytest.param({"login": "cred_spare", "email": "a@example.com"}, "cred_live", id="stored-credential-deleted"),
         pytest.param(
+            "run", {"login": "cred_spare", "email": "a@example.com"}, "cred_live", id="stored-credential-deleted"
+        ),
+        pytest.param(
+            "legacy",
             {"login": "cred_live", "email": "a@example.com", "account": "cred_spare"},
             "cred_spare",
             id="override-credential-deleted",

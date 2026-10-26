@@ -1,15 +1,21 @@
+import io
+import json
 from datetime import datetime
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
+import structlog
+from structlog.testing import capture_logs
 
 from skyvern.forge.agent import (
     _LLM_STEP_EXCEPTIONS,
     _require_actions_payload,
     _terminate_action_from_llm_error_code,
 )
-from skyvern.forge.sdk.api.llm.exceptions import LLMResponseMissingActionsError
-from skyvern.forge.sdk.api.llm.utils import _coerce_response_to_dict
+from skyvern.forge.sdk.api.llm import utils as llm_utils
+from skyvern.forge.sdk.api.llm.exceptions import InvalidLLMResponseFormat, LLMResponseMissingActionsError
+from skyvern.forge.sdk.api.llm.utils import _coerce_response_to_dict, parse_api_response
 from skyvern.forge.sdk.core import skyvern_context
 from skyvern.forge.sdk.core.skyvern_context import SkyvernContext
 from skyvern.forge.sdk.models import StepStatus
@@ -34,6 +40,95 @@ def test_coerce_response_to_dict_variants(response, expected):
         assert parsed == expected[0]
     except Exception:
         assert expected[1]
+
+
+@pytest.mark.parametrize(
+    ("response", "expected"),
+    [
+        ({"llm_response": "private-sentinel"}, {"response_type": "dict", "response_keys_count": 1}),
+        (["private-sentinel"], {"response_type": "list", "response_length": 1}),
+        ("private-sentinel", {"response_type": "str", "response_length": 16}),
+        (None, {"response_type": "NoneType"}),
+    ],
+)
+def test_llm_response_log_metadata_contains_only_shape(response, expected):
+    metadata = llm_utils.llm_response_log_metadata(response)
+
+    assert metadata == expected
+    assert "private-sentinel" not in repr(metadata)
+
+
+def test_coerce_response_warning_keeps_metadata_without_response_content():
+    sentinel = "private-response-sentinel"
+    response = [{"reasoning": sentinel}]
+
+    with capture_logs() as events:
+        assert _coerce_response_to_dict(response, "extract-actions") == response[0]
+
+    event = next(event for event in events if event["event"] == "Parsed LLM response is not a dict")
+    assert event["response_type"] == "list"
+    assert event["response_length"] == 1
+    assert event["prompt_name"] == "extract-actions"
+    first_item_event = next(
+        event for event in events if event["event"] == "Parsed LLM response is a list; using first dict element"
+    )
+    assert first_item_event["first_item_keys_count"] == 1
+    assert "first_item_keys" not in first_item_event
+    assert all(sentinel not in repr(event) for event in events)
+
+
+@pytest.mark.parametrize("include_metadata", [True, False])
+def test_parse_failure_log_keeps_metadata_without_response_content(monkeypatch, include_metadata):
+    sentinel = "private-response-sentinel"
+    content = f"not-json {sentinel}"
+    response_metadata = {
+        "id": "response-456",
+        "model": "test-model",
+        "usage": SimpleNamespace(prompt_tokens=8, completion_tokens=3, total_tokens=11),
+    }
+    response = SimpleNamespace(
+        choices=[SimpleNamespace(finish_reason="stop", message=SimpleNamespace(content=content))],
+        **(response_metadata if include_metadata else {}),
+    )
+
+    output = io.StringIO()
+    logger = structlog.wrap_logger(
+        structlog.PrintLogger(file=output),
+        processors=[structlog.processors.format_exc_info, structlog.processors.JSONRenderer()],
+    )
+
+    def fail_auto_fix(_content):
+        raise ValueError("Unable to parse text", content)
+
+    monkeypatch.setattr(llm_utils, "LOG", logger)
+    monkeypatch.setattr(llm_utils, "_fix_and_parse_json_string", fail_auto_fix)
+    with pytest.raises(InvalidLLMResponseFormat) as error:
+        parse_api_response(response, prompt_name="extract-actions")
+    assert sentinel not in str(error.value)
+    assert error.value.__suppress_context__
+    try:
+        raise error.value
+    except InvalidLLMResponseFormat:
+        logger.exception("Caller logs malformed LLM response.")
+
+    rendered_logs = output.getvalue()
+    events = [json.loads(line) for line in rendered_logs.splitlines()]
+    event = next(
+        event
+        for event in events
+        if event["event"] == "Failed to parse LLM response. Will retry auto-fixing the response for unescaped quotes."
+    )
+    assert event["model"] == ("test-model" if include_metadata else None)
+    assert event["prompt_name"] == "extract-actions"
+    assert event["response_type"] == "SimpleNamespace"
+    assert event["content_length"] == len(content)
+    assert event["stop_reason"] == "stop"
+    assert event["token_usage"] == (
+        {"prompt_tokens": 8, "completion_tokens": 3, "total_tokens": 11} if include_metadata else None
+    )
+    assert event["response_id"] == ("response-456" if include_metadata else None)
+    assert any(event["event"] == "Failed to auto-fix LLM response." for event in events)
+    assert sentinel not in rendered_logs
 
 
 def test_bare_action_list_wraps_into_actions_for_actions_prompt():

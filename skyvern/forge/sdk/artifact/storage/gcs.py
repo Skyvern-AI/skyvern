@@ -600,6 +600,8 @@ class GcsStorage(BaseStorage):
         skipped_files: list[str] = []
         unchanged_file_count = 0
         for file in files:
+            if file.endswith(BROWSER_DOWNLOADING_SUFFIX):
+                continue
             fpath = os.path.join(download_dir, file)
             if not os.path.isfile(fpath):
                 continue
@@ -735,6 +737,8 @@ class GcsStorage(BaseStorage):
 
         file_infos: list[FileInfo] = []
         for key in object_keys:
+            if key.endswith(BROWSER_DOWNLOADING_SUFFIX):
+                continue
             object_uri = f"gs://{settings.GCS_BUCKET_UPLOADS}/{key}"
 
             metadata = {}

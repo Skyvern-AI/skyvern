@@ -4,7 +4,6 @@ import { useParams } from "react-router-dom";
 import type { WorkflowBlockType } from "@/routes/workflows/types/workflowTypes";
 import { statusIsRunningOrQueued } from "@/routes/tasks/types";
 import { useWorkflowRunQuery } from "@/routes/workflows/hooks/useWorkflowRunQuery";
-import { useRecordingStore } from "@/store/useRecordingStore";
 import { cn } from "@/util/utils";
 
 import { useCollapseContext } from "../../collapse/CollapseContext";
@@ -25,15 +24,10 @@ function WebSearchNode({ id, data, type }: NodeProps<WebSearchNodeType>) {
     urlBlockLabel !== undefined && urlBlockLabel === label;
   const thisBlockIsPlaying =
     workflowRunIsRunningOrQueued && thisBlockIsTargetted;
-  const recordingStore = useRecordingStore();
   const { open } = useCollapseContext();
 
   return (
-    <div
-      className={cn({
-        "pointer-events-none opacity-50": recordingStore.isRecording,
-      })}
-    >
+    <div>
       <Handle
         type="source"
         position={Position.Bottom}

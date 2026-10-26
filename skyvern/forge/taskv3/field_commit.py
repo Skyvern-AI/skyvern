@@ -150,7 +150,8 @@ _PHONE_MIN_DIGITS = 8
 
 
 def _phone_digits(text: str) -> str | None:
-    return re.sub(r"\D", "", text) if _PHONE_RE.fullmatch(text.strip()) else None
+    folded = _fold(text)
+    return re.sub(r"\D", "", folded) if _PHONE_RE.fullmatch(folded.strip()) else None
 
 
 def _plus_added(typed: str, held: str) -> bool:
@@ -158,8 +159,8 @@ def _plus_added(typed: str, held: str) -> bool:
     return (
         digits is not None
         and len(digits) >= _PHONE_MIN_DIGITS
-        and not typed.strip().startswith("+")
-        and held.strip().startswith("+")
+        and not _fold(typed).strip().startswith("+")
+        and _fold(held).strip().startswith("+")
         and _phone_digits(held) == digits
     )
 

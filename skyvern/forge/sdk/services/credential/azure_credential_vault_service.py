@@ -63,6 +63,7 @@ class AzureCredentialVaultService(CredentialVaultService):
         organization_id: str,
         data: CreateCredentialRequest,
         created_by: str | None = None,
+        is_passkey_setup_pending: bool = False,
     ) -> Credential:
         item_id = await self._create_azure_secret_item(
             organization_id=organization_id,
@@ -78,6 +79,7 @@ class AzureCredentialVaultService(CredentialVaultService):
                 item_id=item_id,
                 vault_type=CredentialVaultType.AZURE_VAULT,
                 created_by=created_by,
+                is_passkey_setup_pending=is_passkey_setup_pending,
             )
         except BaseException:
             LOG.warning(

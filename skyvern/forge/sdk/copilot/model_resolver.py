@@ -44,7 +44,7 @@ from skyvern.schemas.llm import LLMConfig, LLMRouterConfig
 
 LOG = structlog.get_logger()
 
-# Shape of a Skyvern registry alias (e.g. AZURE_OPENAI_GPT5_6_SOL, VERTEX_GEMINI_2.5_PRO, or a
+# Shape of a Skyvern registry alias (e.g. AZURE_OPENAI_GPT5_6_SOL, VERTEX_GEMINI_3_PRO, or a
 # single-token key like OLLAMA, or a hyphenated one like OPENAI_GPT-4O-2024-08-06): all-caps
 # alphanumeric segments, optionally joined by "-"/"_"/".", no provider prefix. Real litellm
 # model strings (gpt-4o, azure/gpt-4.1) never match — they are lowercase and/or provider-
@@ -212,7 +212,7 @@ def _degrade_router_to_direct(llm_key: str, config: LLMRouterConfig) -> LLMConfi
         selected = config.model_list[0]
 
     # LLMRouterModelConfig.litellm_params carries the real litellm model string
-    # in its "model" key (e.g. "vertex_ai/gemini-2.5-flash"); the outer
+    # in its "model" key (e.g. "vertex_ai/gemini-3-flash-preview"); the outer
     # entry.model_name is just a router group alias.
     params = dict(selected.litellm_params)
     direct_model_name = params.pop("model", None) or selected.model_name

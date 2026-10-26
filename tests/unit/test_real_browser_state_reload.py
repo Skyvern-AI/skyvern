@@ -24,6 +24,7 @@ _AGENT_MODULE = "skyvern.forge.agent"
 def browser_state() -> RealBrowserState:
     state = RealBrowserState.__new__(RealBrowserState)
     state.engine_selection = None
+    state._connection_loss = None
     return state
 
 

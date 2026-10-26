@@ -558,6 +558,15 @@ class BlockStatus(StrEnum):
     skipped = "skipped"
 
 
+class CodeBlockFailureKind(StrEnum):
+    """Whose failure a failed CodeBlock was: the block's own code, or the runner executing it."""
+
+    user_exception = "user_exception"
+    browser_operation_failed = "browser_operation_failed"
+    runner_timeout = "runner_timeout"
+    runner_error = "runner_error"
+
+
 @dataclass(frozen=True)
 class BlockResult:
     success: bool
@@ -576,6 +585,8 @@ class BlockResult:
     can_continue_after_failure: bool = True
     # A failed CodeBlock's failing tab showed a sign-in form. Kept off the output so templates never see it.
     sign_in_form_visible: bool = False
+    # Set only by an executor that can classify a failed CodeBlock; None means unclassified, not "no failure".
+    codeblock_failure_kind: CodeBlockFailureKind | None = None
 
 
 class FileType(StrEnum):
@@ -1479,6 +1490,7 @@ class FileDownloadBlockYAML(BlockYAML):
     sftp_private_key_passphrase: str | None = None
     sftp_remote_path: str | None = None
     sftp_host_key: str | None = None
+    sftp_source_path: str | None = None
     path: str | None = None
     prompt: str | None = None
     continue_on_empty: bool = False
@@ -1886,10 +1898,6 @@ class WorkflowDefinitionYAML(BaseModel):
 
 class WorkflowCreateYAMLRequest(BaseModel):
     title: str
-    recording_id: str | None = Field(
-        default=None,
-        description="Durable browser recording to attach to the workflow version created by this save.",
-    )
     description: str | None = None
     proxy_location: ProxyLocation | GeoTarget | dict | None = Field(
         default=None,

@@ -7,6 +7,9 @@ from skyvern.forge import app
 from skyvern.forge.agent import ForgeAgent
 from skyvern.forge.sdk.db.enums import TaskType
 from skyvern.forge.sdk.db.models import TaskRunModel, WorkflowRunAttemptModel
+from skyvern.forge.sdk.models import TASK_V3_TURN_STEP_CREATED_BY, StepStatus
+from skyvern.schemas.steps import AgentStepOutput, StepToolCall
+from skyvern.webeye.actions.actions import ClickAction
 
 
 @pytest.mark.asyncio
@@ -49,6 +52,71 @@ async def test_total_unique_step_order_count_deduplicates_retries_in_sqlite(agen
         )
         == 2
     )
+
+
+@pytest.mark.asyncio
+async def test_task_v3_turn_steps_count_as_steps_but_not_budget_or_latest_steps(agent_db) -> None:
+    # A Task V3 block's turn steps sit above its own order-0 step (SKY-18790). The step budgets still count that step
+    # (the workflow one plus the action rounds), and the latest step stays the one holding the block's final screenshot.
+    organization = await agent_db.organizations.create_organization(
+        organization_name="Test organization", organization_id="o_test_v3_turn_steps"
+    )
+    org_id = organization.organization_id
+    task = await agent_db.tasks.create_task(
+        url="https://example.com",
+        title="v3 block",
+        navigation_goal=None,
+        data_extraction_goal=None,
+        navigation_payload=None,
+        organization_id=org_id,
+    )
+    block_step = await agent_db.tasks.create_step(task.task_id, order=0, retry_index=0, organization_id=org_id)
+    turn_steps = [
+        await agent_db.tasks.create_step(
+            task.task_id, order=turn, retry_index=0, organization_id=org_id, created_by=TASK_V3_TURN_STEP_CREATED_BY
+        )
+        for turn in (1, 2, 3)
+    ]
+    # Turn 1 reads, turns 2 and 3 each run a round: round indexes 0 and 1.
+    for round_index, turn_step in enumerate(turn_steps[1:]):
+        await agent_db.workflow_params.create_action(
+            action=ClickAction(
+                element_id="go",
+                organization_id=org_id,
+                task_id=task.task_id,
+                step_id=turn_step.step_id,
+                step_order=round_index,
+                action_order=round_index,
+            )
+        )
+
+    assert (
+        await agent_db.tasks.get_total_unique_progress_round_count_by_task_ids(
+            task_ids=[task.task_id], organization_id=org_id
+        )
+        == 2
+    )
+    await agent_db.tasks.finish_step(
+        task.task_id,
+        turn_steps[0].step_id,
+        org_id,
+        StepStatus.completed,
+        AgentStepOutput(llm_seconds=1.5, tool_calls=[StepToolCall(tool="observe", status="ok")]),
+    )
+
+    assert (
+        await agent_db.tasks.get_total_unique_step_order_count_by_task_ids(
+            task_ids=[task.task_id], organization_id=org_id
+        )
+        == 1
+    )
+    assert await agent_db.tasks.get_task_step_count(task.task_id, organization_id=org_id) == 4
+    assert await agent_db.tasks.get_step_counts_by_task_ids([task.task_id], organization_id=org_id) == (4, 1)
+    finished = await agent_db.tasks.get_step(turn_steps[0].step_id, organization_id=org_id)
+    assert finished is not None and finished.output is not None
+    assert finished.output.tool_calls == [StepToolCall(tool="observe", status="ok")]
+    latest = await agent_db.tasks.get_latest_step(task.task_id, organization_id=org_id)
+    assert latest is not None and latest.step_id == block_step.step_id
 
 
 @pytest.mark.asyncio

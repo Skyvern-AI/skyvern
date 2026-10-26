@@ -9,6 +9,7 @@ from urllib.parse import unquote
 
 import structlog
 
+from skyvern.constants import BROWSER_DOWNLOADING_SUFFIX
 from skyvern.forge import app
 from skyvern.forge.sdk.artifact.models import Artifact, ArtifactType, LogEntityType
 from skyvern.forge.sdk.artifact.signing import SENSITIVE_ARTIFACT_TYPES, SENSITIVE_ARTIFACT_URL_EXPIRY_SECONDS
@@ -304,7 +305,10 @@ async def _file_infos_from_download_artifacts(artifacts: list[Artifact]) -> list
     pre-existing import sites keep working without each having to thread the
     artifact_type through.
     """
-    return await _file_infos_from_artifacts(artifacts, artifact_type=ArtifactType.DOWNLOAD)
+    return await _file_infos_from_artifacts(
+        [a for a in artifacts if not artifact_filename_from_uri(a.uri).endswith(BROWSER_DOWNLOADING_SUFFIX)],
+        artifact_type=ArtifactType.DOWNLOAD,
+    )
 
 
 # TODO: This should be a part of the ArtifactType model

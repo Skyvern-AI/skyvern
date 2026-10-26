@@ -67,6 +67,7 @@ from skyvern.forge.taskv3.loop import (
 )
 from skyvern.forge.taskv3.opaque_refs import OpaqueUrlRefs, mask_opaque_urls
 from skyvern.forge.taskv3.tools import PAGE_UNAVAILABLE_ERROR, DownloadFailureWatch
+from skyvern.forge.taskv3.turn_dom import TurnDomCapture
 from skyvern.schemas.llm import LLMConfig, LLMRouterConfig, LLMRouterModelConfig
 from skyvern.utils.prompt_engine import PROMPT_HARD_CEILING_TOKENS
 from skyvern.utils.token_counter import count_tokens
@@ -199,6 +200,39 @@ async def test_engine_exposes_browser_and_finish_tools_no_task_ecosystem() -> No
     sent = {t["function"]["name"] for t in (caller.sent_tools or [])}
     assert {"observe", "type", "click", "file_upload", "finish"} <= sent
     assert not ({"act", "extract", "validate", "run_task", "login"} & sent)
+
+
+@pytest.mark.asyncio
+async def test_engine_joins_the_turn_page_read_after_each_model_call_and_logs_its_totals() -> None:
+    saved: list[bytes] = []
+
+    def store(_step: Any, html: bytes) -> str:
+        saved.append(html)
+        return f"a_{len(saved)}"
+
+    turn_dom = TurnDomCapture(AsyncMock(return_value="<p>page</p>"), store)
+
+    async def on_turn_start(turn: int) -> None:
+        turn_dom.start(SimpleNamespace(step_id=f"turn-{turn}"), turn)
+
+    caller = _ScriptedCaller([[("observe", {})], [("finish", {"status": "completed", "reason": "done"})]])
+    with capture_logs() as logs:
+        await run_task_v3_agent_loop(
+            page_provider=_fixed_page_provider(_FakePage()),
+            llm_caller=caller,
+            goal="x",
+            on_turn_start=on_turn_start,
+            turn_dom=turn_dom,
+        )
+
+    finished = next(entry for entry in logs if entry["event"] == "taskv3 engine loop finished")
+    assert (finished["dom_arm"], finished["dom_captures"], finished["dom_stored"], finished["dom_deduped"]) == (
+        True,
+        2,
+        1,
+        1,
+    )
+    assert saved == [b"<p>page</p>"]
 
 
 @pytest.mark.asyncio
@@ -1684,7 +1718,7 @@ async def test_the_answer_audit_wraps_the_run_tools_and_sees_the_instructions(mo
     applied: list[tuple[list[str], object]] = []
     audit = object()
 
-    def hook(parameters: Any, *, goal: str, organization_id: Any, step: Any) -> object:
+    async def hook(parameters: Any, *, goal: str, organization_id: Any, step: Any) -> object:
         hook_calls.append({"parameters": parameters, "goal": goal})
         return audit
 
@@ -1868,6 +1902,27 @@ async def _run_to_finish(caller: _ScriptedCaller) -> None:
         )
     finally:
         skyvern_context.reset()
+
+
+@pytest.mark.asyncio
+async def test_the_model_is_offered_the_users_error_codes_on_finish() -> None:
+    caller = _ScriptedCaller(
+        [[("finish", {"status": "failed", "reason": "password rejected", "error_code": "invalid_credentials"})]]
+    )
+    skyvern_context.set(SkyvernContext(task_id="tsk_codes"))
+    try:
+        outcome = await run_task_v3_agent_loop(
+            page_provider=_fixed_page_provider(_FakePage()),
+            llm_caller=caller,
+            goal="Sign in.",
+            error_code_mapping={"invalid_credentials": "The site rejected the password."},
+        )
+    finally:
+        skyvern_context.reset()
+
+    (finish,) = (t for t in caller.sent_tools or [] if t["function"]["name"] == "finish")
+    assert "invalid_credentials" in finish["function"]["parameters"]["properties"]["error_code"]["enum"]
+    assert outcome.error_code == "invalid_credentials"
 
 
 @pytest.mark.asyncio
@@ -2525,8 +2580,8 @@ async def test_a_terminated_finish_is_reasked_on_the_runs_own_model_without_a_go
 class _PremiseAnsweringCaller(_ScriptedCaller):
     """The run's own caller, answering the terminate-premise check outside the scripted loop turns."""
 
-    def __init__(self, script: list[list[tuple[str, dict[str, Any]]]], answer: dict[str, Any]) -> None:
-        super().__init__(script)
+    def __init__(self, script: list[list[tuple[str, dict[str, Any]]]], answer: dict[str, Any], **kwargs: Any) -> None:
+        super().__init__(script, **kwargs)
         self.answer = answer
         self.premise_calls: list[dict[str, Any]] = []
         self.reask_calls: list[dict[str, Any]] = []
@@ -2623,7 +2678,7 @@ async def test_stop_criteria_for_a_block_without_a_completion_criterion_change_n
     signed = "https://files.example.test/uploads/deadbeef/statement.pdf?token=eyJhbGciOiJIUzI1NiJ9.c2lnbmVk.QQ"
     terminate = f"the statement at {signed} is not listed"
     seen = []
-    for criteria in (None, ("", terminate)):
+    for criteria in (("", ""), ("", terminate)):
         caller = _PremiseAnsweringCaller(
             [[("read_fixture", {})], [("finish", {"status": "terminated", "reason": "Not listed."})]],
             answer={"cited": "none", "condition": "unclear", "stop_kind": "none", "quote": ""},
@@ -2661,9 +2716,7 @@ async def test_a_terminate_with_a_completion_criterion_asks_both_judges_once_eac
 
 
 @pytest.mark.asyncio
-async def test_a_premise_check_that_fails_or_outlasts_its_timeout_still_ends_the_run_as_the_model_said(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
+async def test_a_premise_check_that_fails_still_ends_the_run_as_the_model_said() -> None:
     def broken_redactor() -> Any:
         raise RuntimeError("redactor down")
 
@@ -2679,23 +2732,57 @@ async def test_a_premise_check_that_fails_or_outlasts_its_timeout_still_ends_the
     )
     assert outcome.status == "terminated"
 
+
+@pytest.mark.asyncio
+async def test_a_slow_premise_check_logs_after_the_run_ends_under_the_runs_own_ids(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    release = asyncio.Event()
+    checked_under: list[str | None] = []
+
     class _SlowCaller(_PremiseAnsweringCaller):
         async def call(self, **kwargs: Any) -> dict[str, Any]:  # type: ignore[override]
+            kwargs.pop("step", None)
             if kwargs.get("prompt_name") == TERMINATE_PREMISE_PROMPT_NAME:
-                await asyncio.sleep(5)
+                await release.wait()
+                checked_under.append(skyvern_context.ensure_context().task_id)
             return await super().call(**kwargs)
 
-    monkeypatch.setattr(engine_mod, "GOAL_CHECK_TIMEOUT_SECONDS", 0.05)
+    flushed: list[str] = []
+
+    async def flush_step_archive(step_id: str) -> None:
+        flushed.append(step_id)
+
+    monkeypatch.setattr(app, "ARTIFACT_MANAGER", SimpleNamespace(flush_step_archive=flush_step_archive))
     slow = _SlowCaller([[("finish", {"status": "terminated", "reason": "Not listed."})]], answer={})
-    with capture_logs() as logs:
-        outcome = await run_task_v3_agent_loop(
-            page_provider=_fixed_page_provider(_FakePage()),
-            llm_caller=slow,
-            goal="Open the statements.",
-            unlisted_reask_criteria=("", "the statements link is not on the page"),
+
+    def premise_whys() -> list[str]:
+        return [log["why"] for log in logs if log["event"] == "taskv3 terminate premise"]
+
+    with skyvern_context.scoped(SkyvernContext(task_id="tsk_premise")) as run_context, capture_logs() as logs:
+        outcome = await asyncio.wait_for(
+            run_task_v3_agent_loop(
+                page_provider=_fixed_page_provider(_FakePage()),
+                llm_caller=slow,
+                goal="Open the statements.",
+                unlisted_reask_criteria=("", "the statements link is not on the page"),
+                step=SimpleNamespace(step_id="stp_premise"),
+            ),
+            timeout=1.0,
         )
-    assert outcome.status == "terminated"
-    assert [log["why"] for log in logs if log["event"] == "taskv3 terminate premise"] == ["skipped:timeout"]
+        assert outcome.status == "terminated"
+        assert premise_whys() == []
+        # What the block does once it ends; the shared context then belongs to the next block.
+        run_context.task_id = None
+        release.set()
+        async with asyncio.timeout(5):
+            while not premise_whys():
+                await asyncio.sleep(0.01)
+
+    assert premise_whys() == ["skipped:unparseable"]
+    assert checked_under == ["tsk_premise"]
+    # The run's own archive flush has already happened, so the late check flushes what its call wrote.
+    assert flushed == ["stp_premise"]
 
 
 def _fixed_read_tool(content: str, *, page: _FakePage | None = None, lands_at: str | None = None) -> ToolSpec:
@@ -3111,3 +3198,85 @@ async def test_engine_logs_a_dead_end_provenance_through_the_real_navigate_tool(
     assert (outcome.status, outcome.guard) == ("terminated", NAV_DEAD_END_GUARD)
     (line,) = (entry for entry in logs if entry["event"] == "taskv3 loop navigation dead end")
     assert line["provenance"] == ("previously_visited" if via_click else "task_supplied")
+
+
+_JUSTIFY_CRITERIA = ("", "the record is not listed")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("scope", "held"),
+    [
+        ({"unlisted_reask_criteria": _JUSTIFY_CRITERIA}, True),
+        ({"unlisted_reask_criteria": None}, False),
+        ({"unlisted_reask_criteria": _JUSTIFY_CRITERIA, "page_free": True}, False),
+    ],
+    ids=["browser_loop", "validation", "page_free"],
+)
+async def test_validation_and_page_free_runs_are_never_held_for_a_source(scope: dict[str, Any], held: bool) -> None:
+    caller = _PremiseAnsweringCaller(
+        [[("finish", {"status": "terminated", "reason": f"r{i}"})] for i in (1, 2)], answer={}
+    )
+    outcome = await run_task_v3_agent_loop(
+        page_provider=_fixed_page_provider(_FakePage()), llm_caller=caller, goal="Look up the record.", **scope
+    )
+    assert (outcome.status, outcome.reason, outcome.turns) == ("terminated", *(("r2", 2) if held else ("r1", 1)))
+
+
+_TERMINATE = ("finish", {"status": "terminated", "reason": "r1"})
+_ACT = ("type", {"selector": "#first", "text": "John"})
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("script", "expected"),
+    [
+        ([[_TERMINATE], [_TERMINATE]], ("refinished_same", 1, 0, 0)),
+        ([[_TERMINATE], [("read_fixture", {})], [_TERMINATE]], ("looked_then_terminated", 2, 0, 1)),
+        (
+            [[_TERMINATE], [_ACT], [("finish", {"status": "terminated", "reason": "r2"})]],
+            ("continued_terminated", 2, 1, 0),
+        ),
+        (
+            [[_TERMINATE], [_ACT], [("finish", {"status": "completed", "reason": "done"})]],
+            ("continued_completed", 2, 1, 0),
+        ),
+    ],
+    ids=["refinished_same", "looked_then_terminated", "continued_terminated", "continued_completed"],
+)
+async def test_engine_summary_line_carries_the_justification_outcome(
+    script: list[list[tuple[str, dict[str, Any]]]], expected: tuple[str, int, int, int]
+) -> None:
+    caller = _PremiseAnsweringCaller(script, answer={})
+    with capture_logs() as logs:
+        await run_task_v3_agent_loop(
+            page_provider=_fixed_page_provider(_FakePage()),
+            llm_caller=caller,
+            goal="Look up the record.",
+            parameters={"first_name": "John"},
+            extra_tools=[_fixed_read_tool("Results")],
+            unlisted_reask_criteria=_JUSTIFY_CRITERIA,
+        )
+    finished = next(e for e in logs if e["event"] == "taskv3 engine loop finished")
+    assert (
+        finished["justify_outcome"],
+        finished["justify_turns_after"],
+        finished["justify_actions_after"],
+        finished["justify_perceptions_after"],
+    ) == expected
+    assert (finished["justify_held"], finished["justify_status"], finished["justify_turn"]) == (True, "terminated", 1)
+
+
+@pytest.mark.asyncio
+async def test_the_justification_hold_switch_turns_the_hold_off(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(settings, "DISABLE_TASK_V3_JUSTIFY_HOLD", True)
+    caller = _PremiseAnsweringCaller([[_TERMINATE]], answer={})
+    with capture_logs() as logs:
+        outcome = await run_task_v3_agent_loop(
+            page_provider=_fixed_page_provider(_FakePage()),
+            llm_caller=caller,
+            goal="Look up the record.",
+            unlisted_reask_criteria=_JUSTIFY_CRITERIA,
+        )
+    assert (outcome.status, outcome.turns) == ("terminated", 1)
+    assert "taskv3 finish justification held" not in [e["event"] for e in logs]

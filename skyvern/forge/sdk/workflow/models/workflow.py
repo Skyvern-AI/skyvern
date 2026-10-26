@@ -599,6 +599,9 @@ class WorkflowRunResponseBase(BaseModel):
     cached_credits_used: int = 0
     task_v2: TaskV2 | None = None
     workflow_title: str | None = None
+    copilot_session_id: str | None = Field(
+        default=None, description="ID of the Copilot chat associated with this workflow run."
+    )
     browser_session_id: str | None = None
     browser_profile_id: str | None = None
     browser_seed_source: BrowserSeedSource | None = None

@@ -323,7 +323,7 @@ def test_words_that_merely_end_in_rate_are_not_a_site_throttle() -> None:
     [
         pytest.param(
             "navigation block failed. failure reason: "
-            + str(ProviderLLMError("GEMINI_2_5_FLASH", cause=RateLimitError("Rate limit reached for the model"))),
+            + str(ProviderLLMError("GEMINI_3_0_FLASH", cause=RateLimitError("Rate limit reached for the model"))),
             None,
             id="provider-error-text",
         ),

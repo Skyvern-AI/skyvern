@@ -109,6 +109,7 @@ from skyvern.forge.sdk.copilot.tools.locator_inspection import TOOL_NAME as LOCA
 from skyvern.forge.sdk.copilot.tools.locator_inspection import TOOL_SCHEMA as LOCATOR_INSPECTION_TOOL_SCHEMA
 from skyvern.forge.sdk.copilot.tools.locator_inspection import (
     inspect_locator_matches,
+    visibility_counts,
 )
 from skyvern.forge.sdk.copilot.tracing_setup import copilot_span
 from skyvern.forge.sdk.copilot.work_plan import WorkPlanArguments, set_work_plan
@@ -1004,7 +1005,12 @@ the rest of the turn and withdraws one it had bound; the result lists it.
 Without `exact_reference`, this is metadata-only discovery. Paginated. `page_size` caps at {LIST_CREDENTIALS_MAX_PAGE_SIZE}. The response includes `has_more`;
 before concluding no credential exists, keep incrementing `page` until
 `has_more` is `false` — otherwise you risk telling the user to create
-a credential they have already stored on a later page."""
+a credential they have already stored on a later page.
+
+Results report `connected_vault` (the organization's connected Bitwarden: its status and, when unreadable,
+what to check) and page its logins under `vault_logins` (`vault_login_id`, `title`, `site`).
+`fill_credential_field` accepts a `vault_login_id`; `exact_reference` takes a vault login's `title` and returns
+its `sites` (the websites Bitwarden saves it for) and the `workflow_parameter` that binds it at run time."""
 
 
 @function_tool(
@@ -2380,6 +2386,13 @@ async def _inspect_locator_matches_invoke(ctx: RunContextWrapper, arguments: str
                     }
                 )
             facts = await inspect_locator_matches(page, selectors)
+            LOG.info(
+                "copilot_locator_inspection_visibility",
+                selectors=visibility_counts(facts),
+                workflow_permanent_id=copilot_ctx.workflow_permanent_id,
+                workflow_copilot_chat_id=copilot_ctx.workflow_copilot_chat_id,
+                turn_id=copilot_ctx.turn_id,
+            )
             return finish({"ok": True, "current_url": page.url, **binding.provenance(), "data": facts})
 
 

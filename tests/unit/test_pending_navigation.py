@@ -1153,3 +1153,24 @@ async def test_an_attached_external_browser_releases_observation_only_with_its_d
     await state.close(close_browser_on_completion=False, release_driver=release_driver)
 
     assert (state._main_frame_navigations.get(page) is not None) is kept  # type: ignore[call-overload]
+
+
+@requires_chromium
+@pytest.mark.asyncio
+@pytest.mark.parametrize("driver", ["playwright", "patchright"])
+async def test_a_closed_context_reports_stopped_while_its_browser_stays_connected(driver: str) -> None:
+    async_api = pytest.importorskip(f"{driver}.async_api")
+    async with async_api.async_playwright() as p:
+        browser = await p.chromium.launch(headless=True, args=["--no-proxy-server"])
+        try:
+            sibling = await browser.new_context()
+            closed = await browser.new_context()
+            await closed.new_page()
+            await closed.close()
+
+            assert browser.is_connected()
+            # The exact reason pins the driver's close flag; a disconnect or connection latch would report another.
+            assert real_browser_state_mod.browser_context_stopped_reason(closed) == "browser_context_close_called"
+            assert real_browser_state_mod.browser_context_stopped_reason(sibling) is None
+        finally:
+            await browser.close()

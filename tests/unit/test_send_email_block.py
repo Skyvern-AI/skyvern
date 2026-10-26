@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import ast
 import asyncio
+import contextlib
 import logging
 import os
 import pickle
@@ -49,7 +50,7 @@ from sqlalchemy.orm import undefer
 
 from skyvern.config import settings
 from skyvern.core.script_generations.generate_script import _build_send_email_statement
-from skyvern.exceptions import BlockedHost, UnresolvableHost
+from skyvern.exceptions import BlockedHost, MissingBrowserState, UnresolvableHost
 from skyvern.forge import app
 from skyvern.forge.sdk.api import email as email_api
 from skyvern.forge.sdk.api.email import InvalidEmailRecipient, send, validate_recipients
@@ -105,6 +106,7 @@ from skyvern.schemas.workflows import (
 )
 from skyvern.services import script_service
 from skyvern.services.email import gmail as gmail_service
+from tests.unit._task_block_fakes import run_bound_browser_state
 from tests.unit.scoped_asyncio import ScopedAsyncio
 
 
@@ -1866,6 +1868,48 @@ async def test_cached_nested_loop_records_the_inner_loop_in_each_outer_iteration
         [(entry["output_parameter"]["key"], entry["loop_value"], len(entry["output_value"])) for entry in iteration]
         for iteration in outer_row.output
     ] == [[("inner_output", "one", len(inner_items))], [("inner_output", "two", len(inner_items))]]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "seam", ["lost_during_the_send", "lost_before_the_send", "lost_before_a_wait", "ordinary_send_failure"]
+)
+async def test_cached_script_runs_no_statement_after_its_browser_was_lost(
+    gmail_env: GmailEnv, monkeypatch: pytest.MonkeyPatch, seam: str
+) -> None:
+    await _cached_run(gmail_env, "wr_lost", _gmail_block(continue_on_failure=True))
+    browser_state, browser_context = run_bound_browser_state("wr_lost")
+    monkeypatch.setattr(app.BROWSER_MANAGER, "get_for_workflow_run", lambda *_args, **_kwargs: browser_state)
+
+    def respond(request: httpx.Request) -> httpx.Response:
+        if seam == "lost_during_the_send":
+            browser_state._on_browser_context_closed(browser_context)
+        return _accepted(request) if seam == "lost_before_the_send" else _rejected(request)
+
+    gmail_env.respond = respond
+    if seam.startswith("lost_before"):
+        browser_state._on_browser_context_closed(browser_context)
+    statements: list[str] = []
+
+    async def generated_function() -> None:
+        if seam == "lost_before_a_wait":
+            await script_service.wait(0, label="pause")
+        else:
+            await script_service.send_email(transport="gmail", credential_id=GMAIL_CREDENTIAL, label="send_email")
+        statements.append("next statement")
+
+    try:
+        with contextlib.nullcontext() if seam == "ordinary_send_failure" else pytest.raises(MissingBrowserState):
+            await generated_function()
+    finally:
+        skyvern_context.reset()
+
+    started = seam.startswith("lost_before")
+    assert statements == (["next statement"] if seam == "ordinary_send_failure" else [])
+    assert len(gmail_env.requests) == (0 if started else 1)
+    assert len([row for row in await gmail_env.rows(WorkflowRunBlockModel) if row.workflow_run_id == "wr_lost"]) == (
+        0 if started else 1
+    )
 
 
 def test_gmail_send_block_carries_the_same_fields_through_yaml_conversion_reload_and_codegen() -> None:

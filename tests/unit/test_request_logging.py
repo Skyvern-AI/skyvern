@@ -16,7 +16,10 @@ from sqlalchemy.exc import OperationalError
 from starlette.requests import ClientDisconnect, Request
 from starlette.types import ASGIApp, Receive, Scope, Send
 
-from skyvern.forge import api_app, request_logging
+from skyvern.forge import api_app
+from skyvern.forge import app as forge_app
+from skyvern.forge import request_logging
+from skyvern.forge.agent_functions import AgentFunction
 from skyvern.forge.log_redaction import (
     REDACTED,
     SENSITIVE_FIELDS,
@@ -42,6 +45,13 @@ from skyvern.forge.request_logging import (
 from skyvern.forge.sdk.core.run_submission_gate import RunSubmissionGate
 from skyvern.forge.sdk.schemas.organizations import Organization
 from skyvern.forge.sdk.services.org_auth_service import apply_request_org_context
+
+
+class _NoRequestBodiesAgentFunction(AgentFunction):
+    def should_log_request_bodies(self, organization_id: str) -> bool:
+        assert organization_id == "o_request_log"
+        return False
+
 
 # ---------------------------------------------------------------------------
 # _client_ip_from_headers
@@ -79,11 +89,19 @@ class TestClientIpFromHeaders:
     ("user_agent", "expected"),
     [
         ("Zapier", "zapier"),
+        ("zApIeR/1.0", "zapier"),
+        ("curl/8.0 (Zapier/1.0)", "zapier"),
+        ("zapier-evil", "other"),
         ("n8n", "n8n"),
+        ("N8N/1.0", "n8n"),
+        ("not-n8n", "other"),
+        ("curl/8.0 build-xn8nq", "other"),
         ("make.com", "make"),
         ("Make/production", "make"),
         ("Integromat", "make"),
         ("Workato", "workato"),
+        ("wOrKaTo/1.0", "workato"),
+        ("not-workato", "other"),
         ("Mozilla/5.0", "other"),
         ("Power Automate", "other"),
         ("Pipedream", "other"),
@@ -424,11 +442,8 @@ class TestIsLoggableContentType:
 # ---------------------------------------------------------------------------
 
 
-def _make_request(method: str = "GET", path: str = "/api/v1/test") -> MagicMock:
-    request = MagicMock()
-    request.method = method
-    request.url.path = path
-    return request
+def _make_request(method: str = "GET", path: str = "/api/v1/test") -> Request:
+    return Request({"type": "http", "method": method, "path": path, "headers": [], "query_string": b""})
 
 
 def test_sanitize_headers_removes_posthog_attribution_but_keeps_ordinary_header() -> None:
@@ -744,6 +759,26 @@ def _make_app(unhandled_exception_status: int = 500) -> FastAPI:
             ),
         }
 
+    @app.post("/_test_request_logging_org")
+    async def create_org_task(error: bool = False) -> dict:
+        set_request_organization("o_request_log")
+        if error:
+            raise HTTPException(status_code=403, detail="response value")
+        return {"accepted": True}
+
+    @app.post("/api/v1/workflows/{workflow_id}/schedules")
+    async def create_invalid_schedule(workflow_id: str) -> JSONResponse:
+        set_request_organization("o_request_log")
+        return JSONResponse(
+            status_code=400,
+            content={"detail": f"Missing schedule parameters for workflow {workflow_id}: SYNTHETIC_MISSING_PARAMETER"},
+        )
+
+    @app.post("/_test_request_logging_org_boom")
+    async def create_org_task_boom() -> dict:
+        set_request_organization("o_request_log")
+        raise ValueError("request failed")
+
     @app.post("/integration-platform")
     async def integration_platform() -> dict:
         identity = get_request_principal_state()
@@ -1039,6 +1074,97 @@ class TestMiddlewareLogVolume:
 
         assert response.status_code == 500
         assert log_mock.error.call_args.kwargs["organization_id"] == "o_385835488455492960"
+
+    @pytest.mark.parametrize("allow_bodies", [False, True])
+    @pytest.mark.parametrize("error", [False, True])
+    def test_authenticated_request_bodies_follow_agent_function_policy(
+        self, log_mock: MagicMock, monkeypatch: pytest.MonkeyPatch, allow_bodies: bool, error: bool
+    ) -> None:
+        agent_function = AgentFunction() if allow_bodies else _NoRequestBodiesAgentFunction()
+        monkeypatch.setattr(forge_app, "AGENT_FUNCTION", agent_function)
+
+        response = TestClient(_make_app()).post(
+            "/_test_request_logging_org", params={"error": error}, json={"input": "request value"}
+        )
+
+        expected_status = 403 if error else 200
+        assert response.status_code == expected_status
+        logged = (log_mock.warning if error else log_mock.info).call_args.kwargs
+        assert logged["organization_id"] == "o_request_log"
+        assert {"method", "path", "status_code", "duration_seconds"} <= logged.keys()
+        assert ({"body", "response_body", "error_body"} <= logged.keys()) is allow_bodies
+        if allow_bodies:
+            assert agent_function.should_log_request_bodies("o_request_log") is True
+            assert "request value" in logged["body"]
+            if error:
+                assert logged["error_body"] == logged["response_body"]
+            else:
+                assert "accepted" in logged["response_body"]
+
+    @pytest.mark.parametrize("allow_bodies", [False, True])
+    def test_schedule_validation_error_has_safe_classification(
+        self, log_mock: MagicMock, monkeypatch: pytest.MonkeyPatch, allow_bodies: bool
+    ) -> None:
+        monkeypatch.setattr(
+            forge_app,
+            "AGENT_FUNCTION",
+            AgentFunction() if allow_bodies else _NoRequestBodiesAgentFunction(),
+        )
+
+        response = TestClient(_make_app()).post(
+            "/api/v1/workflows/wpid_test/schedules",
+            json={"SYNTHETIC_REQUEST_SECRET": "SYNTHETIC_REQUEST_VALUE"},
+        )
+
+        assert response.status_code == 400
+        logged = log_mock.warning.call_args.kwargs
+        assert logged["error_code"] == "missing_schedule_parameters"
+        assert ({"body", "response_body", "error_body"} <= logged.keys()) is allow_bodies
+        if allow_bodies:
+            assert "SYNTHETIC_MISSING_PARAMETER" in logged["error_body"]
+        else:
+            assert "SYNTHETIC_MISSING_PARAMETER" not in repr(log_mock.warning.call_args)
+            assert "SYNTHETIC_REQUEST_SECRET" not in repr(log_mock.warning.call_args)
+            assert "SYNTHETIC_REQUEST_VALUE" not in repr(log_mock.warning.call_args)
+
+    @pytest.mark.parametrize(
+        ("status_code", "response_body"),
+        [
+            (400, '{"detail":"Unknown schedule parameters for workflow wpid_test: name"}'),
+            (403, '{"detail":"Missing schedule parameters for workflow wpid_test: name"}'),
+            (400, "not json"),
+            (400, "[]"),
+        ],
+    )
+    def test_schedule_validation_error_code_ignores_other_responses(self, status_code: int, response_body: str) -> None:
+        assert request_logging._schedule_validation_error_code(status_code, response_body) is None
+
+    def test_unhandled_request_body_is_omitted_when_agent_function_disallows_it(
+        self, log_mock: MagicMock, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setattr(forge_app, "AGENT_FUNCTION", _NoRequestBodiesAgentFunction())
+
+        response = TestClient(_make_app(), raise_server_exceptions=False).post(
+            "/_test_request_logging_org_boom", json={"input": "request value"}
+        )
+
+        assert response.status_code == 500
+        logged = log_mock.error.call_args.kwargs
+        assert logged["organization_id"] == "o_request_log"
+        assert "body" not in logged
+        assert {"method", "path", "status_code", "duration_seconds"} <= logged.keys()
+
+    def test_request_without_resolved_organization_keeps_body_logging(
+        self, log_mock: MagicMock, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setattr(forge_app, "AGENT_FUNCTION", _NoRequestBodiesAgentFunction())
+
+        response = TestClient(_make_app()).post("/tasks", json={"input": "request value"})
+
+        assert response.status_code == 200
+        logged = log_mock.info.call_args.kwargs
+        assert "organization_id" not in logged
+        assert {"body", "response_body", "error_body"} <= logged.keys()
 
     def test_organization_does_not_leak_into_a_later_unauthenticated_request(
         self, log_mock: MagicMock, monkeypatch: pytest.MonkeyPatch

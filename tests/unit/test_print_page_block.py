@@ -4,18 +4,21 @@ recovering the print when the renderer crashes part-way through it (SKY-17342)."
 import asyncio
 from datetime import UTC, datetime
 from types import SimpleNamespace
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, patch
 
 import pytest
 from playwright.async_api import Error as PlaywrightError
 
-from skyvern.exceptions import MissingBrowserStatePage
+from skyvern.exceptions import BROWSER_CONNECTION_LOST_ERROR_CODE, MissingBrowserStatePage
 from skyvern.forge.sdk.core import skyvern_context
 from skyvern.forge.sdk.core.skyvern_context import SkyvernContext
 from skyvern.forge.sdk.schemas.files import FileInfo
 from skyvern.forge.sdk.workflow.models import block as block_module
-from skyvern.forge.sdk.workflow.models.block import PrintPageBlock
+from skyvern.forge.sdk.workflow.models.block import Block, PrintPageBlock
 from skyvern.forge.sdk.workflow.models.parameter import OutputParameter, ParameterType
+from skyvern.schemas.workflows import BlockStatus
+from tests.unit._task_block_fakes import run_bound_browser_state
+from tests.unit.test_block_description_caching import _setup_mocks
 
 
 def _output_parameter(key: str) -> OutputParameter:
@@ -653,3 +656,51 @@ async def test_print_page_block_fails_rather_than_printing_a_blank_replacement_t
     assert result.success is False
     assert "Printing failed" in result.failure_reason
     blank_page.pdf.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("native_close", [True, False], ids=["native_close_during_print", "ordinary_print_failure"])
+async def test_print_page_failure_after_native_browser_loss_cannot_be_continued(
+    monkeypatch: pytest.MonkeyPatch, _isolated_download_path: str, native_close: bool
+) -> None:
+    skyvern_context.set(SkyvernContext(organization_id="o_1", workflow_run_id="wr_1", run_id="wr_1"))
+    browser_state, context = run_bound_browser_state("wr_1")
+    page = SimpleNamespace(url="https://example.com/listing")
+
+    async def print_pdf(**_: object) -> bytes:
+        if native_close:
+            browser_state._on_browser_context_closed(context)
+            raise PlaywrightError("Target page, context or browser has been closed")
+        raise PlaywrightError("Page.pdf: some other failure")
+
+    page.pdf = print_pdf
+    browser_state.get_working_page = AsyncMock(return_value=page)  # type: ignore[method-assign]
+    browser_state.list_valid_pages = AsyncMock(return_value=[page])  # type: ignore[method-assign]
+    browser_state.take_fullpage_screenshot = AsyncMock(return_value=None)  # type: ignore[method-assign]
+    block = PrintPageBlock(label="print", output_parameter=_output_parameter("print_out"), continue_on_failure=True)
+
+    with (
+        patch("skyvern.forge.sdk.workflow.models.block.app") as mock_app,
+        patch.object(Block, "_generate_workflow_run_block_description", new_callable=AsyncMock),
+        patch.object(Block, "_invalidate_stale_output_on_failure", new_callable=AsyncMock),
+    ):
+        _setup_mocks(mock_app)
+        mock_app.BROWSER_MANAGER.get_for_workflow_run.return_value = browser_state
+        monkeypatch.setattr(PrintPageBlock, "get_or_create_browser_state", AsyncMock(return_value=browser_state))
+
+        result = await block.execute_safe(workflow_run_id="wr_1", organization_id="o_1")
+        persisted_codes = {
+            code
+            for update in mock_app.DATABASE.observer.update_workflow_run_block.await_args_list
+            for code in update.kwargs.get("error_codes") or []
+        }
+
+    assert result.status == BlockStatus.failed
+    assert result.failure_reason.startswith("Failed to generate PDF")
+    if native_close:
+        assert result.can_continue_after_failure is False
+        assert BROWSER_CONNECTION_LOST_ERROR_CODE in result.error_codes
+        assert persisted_codes == {BROWSER_CONNECTION_LOST_ERROR_CODE}
+    else:
+        assert result.can_continue_after_failure is True
+        assert persisted_codes == set()

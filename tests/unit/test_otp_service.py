@@ -1345,7 +1345,7 @@ class TestParseOtpLogin:
         from skyvern.services import otp_service
 
         async def failing_handler(*_args: object, **_kwargs: object) -> dict[str, object]:
-            raise LLMProviderError("gemini-2.5-flash")
+            raise LLMProviderError("gemini-3-flash-preview")
 
         charge = AsyncMock()
         monkeypatch.setattr(otp_service.prompt_engine, "load_prompt", lambda *a, **k: "prompt")
@@ -1401,7 +1401,7 @@ class TestParseOtpLogin:
         from skyvern.services import otp_service
 
         async def failing_handler(*_args: object, **_kwargs: object) -> dict[str, object]:
-            raise LLMProviderError("gemini-2.5-flash")
+            raise LLMProviderError("gemini-3-flash-preview")
 
         monkeypatch.setattr(otp_service.prompt_engine, "load_prompt", lambda *a, **k: "prompt")
         monkeypatch.setattr(otp_service.app, "SECONDARY_LLM_API_HANDLER", failing_handler, raising=False)

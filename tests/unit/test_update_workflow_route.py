@@ -18,7 +18,8 @@ from fastapi.responses import JSONResponse
 from fastapi.testclient import TestClient
 
 from skyvern.exceptions import SkyvernHTTPException
-from skyvern.forge.sdk.routes.routers import base_router
+from skyvern.forge.sdk.db.repositories.workflows import WorkflowCreationLockTimeout
+from skyvern.forge.sdk.routes.routers import base_router, legacy_base_router
 from skyvern.forge.sdk.schemas.organizations import Organization
 from skyvern.forge.sdk.services import org_auth_service
 from skyvern.forge.sdk.workflow.models.workflow import Workflow, WorkflowDefinition
@@ -43,6 +44,7 @@ def client() -> TestClient:
 
     app = FastAPI()
     app.include_router(base_router, prefix="/v1")
+    app.include_router(legacy_base_router, prefix="/v1")
 
     # Mirror api_app.py so a raised SkyvernHTTPException renders as its own status code
     # (e.g. the pre-fix FailedToUpdateWorkflow would render as 500 here, not be re-raised).
@@ -61,6 +63,30 @@ def test_update_workflow_without_definition_returns_422(client: TestClient) -> N
 
     assert resp.status_code == 422, resp.text
     assert "json" in resp.json()["detail"].lower()
+
+
+@pytest.mark.parametrize("legacy", [False, True], ids=["current", "legacy"])
+def test_workflow_save_lock_timeout_returns_retryable_conflict(client: TestClient, legacy: bool) -> None:
+    mock_app = MagicMock()
+    mock_app.WORKFLOW_SERVICE.create_workflow_from_request = AsyncMock(side_effect=WorkflowCreationLockTimeout())
+    yaml_definition = "title: t\nworkflow_definition:\n  parameters: []\n  blocks: []\n"
+    with (
+        patch("skyvern.forge.sdk.routes.agent_protocol.app", mock_app),
+        patch("skyvern.forge.sdk.routes.agent_protocol._authorize_definition_references", AsyncMock()),
+        patch("skyvern.forge.sdk.routes.agent_protocol.analytics.capture", lambda *_: None),
+    ):
+        if legacy:
+            response = client.put(
+                "/v1/workflows/wpid_test",
+                content=yaml_definition,
+                headers={"Content-Type": "application/x-yaml"},
+            )
+        else:
+            response = client.post("/v1/workflows/wpid_test", json={"yaml_definition": yaml_definition})
+
+    assert response.status_code == 409, response.text
+    assert "retry" in response.json()["detail"].lower()
+    mock_app.WORKFLOW_SERVICE.create_workflow_from_request.assert_awaited_once()
 
 
 def _stored_workflow() -> Workflow:

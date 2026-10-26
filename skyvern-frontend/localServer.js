@@ -35,6 +35,21 @@ function resolveOrganizationApiKey(env = process.env) {
   return key || null;
 }
 
+function resolveOidcRuntimeConfig(env = process.env) {
+  return {
+    issuer_url: env.OIDC_ISSUER_URL?.trim() || "",
+    client_id: env.OIDC_CLIENT_ID?.trim() || "",
+    scopes: env.OIDC_SCOPES?.trim() || "openid profile",
+  };
+}
+
+function resolvePostHogRuntimeConfig(env = process.env) {
+  return {
+    api_key: env.POSTHOG_KEY?.trim() || "",
+    api_host: env.POSTHOG_HOST?.trim() || "",
+  };
+}
+
 function isLoopbackUrl(value) {
   try {
     return LOOPBACK_HOSTNAMES.has(new URL(value).hostname);
@@ -99,6 +114,8 @@ function resolveLocalServerConfiguration({
   return {
     apiBaseUrl: resolveServerApiBaseUrl(env),
     organizationApiKey: resolveOrganizationApiKey(env),
+    oidcConfig: resolveOidcRuntimeConfig(env),
+    postHogConfig: resolvePostHogRuntimeConfig(env),
   };
 }
 
@@ -110,6 +127,16 @@ function sendJson(response, statusCode, payload) {
     "content-type": "application/json; charset=utf-8",
   });
   response.end(body);
+}
+
+function createRuntimeConfigHandler(config) {
+  return async (request, response) => {
+    if (request.method !== "GET") {
+      sendJson(response, 405, { detail: "Method not allowed" });
+      return;
+    }
+    sendJson(response, 200, config);
+  };
 }
 
 // Distinct label so the nonce key is a one-way derivation and never doubles as the organization key.
@@ -370,6 +397,8 @@ function createLocalServer({
   env = process.env,
   apiBaseUrl = resolveServerApiBaseUrl(env),
   organizationApiKey = resolveOrganizationApiKey(env),
+  oidcConfig = resolveOidcRuntimeConfig(env),
+  postHogConfig = resolvePostHogRuntimeConfig(env),
   fetchImpl = fetch,
   logger = console,
   requestTimeoutMs = UI_SESSION_REQUEST_TIMEOUT_MS,
@@ -383,9 +412,19 @@ function createLocalServer({
     requestTimeoutMs,
     nonceManager,
   });
+  const serveOidcRuntimeConfig = createRuntimeConfigHandler(oidcConfig);
+  const servePostHogRuntimeConfig = createRuntimeConfigHandler(postHogConfig);
 
   return createServer(async (request, response) => {
     const requestUrl = new URL(request.url || "/", "http://localhost");
+    if (requestUrl.pathname === "/oidc-config") {
+      await serveOidcRuntimeConfig(request, response);
+      return;
+    }
+    if (requestUrl.pathname === "/posthog-config") {
+      await servePostHogRuntimeConfig(request, response);
+      return;
+    }
     if (requestUrl.pathname === "/ui-session") {
       await serveUiSession(request, response);
       return;
@@ -405,13 +444,19 @@ function createLocalServer({
 }
 
 function startLocalServer() {
-  const { apiBaseUrl, organizationApiKey } = resolveLocalServerConfiguration();
+  const { apiBaseUrl, organizationApiKey, oidcConfig, postHogConfig } =
+    resolveLocalServerConfiguration();
   if (organizationApiKey) {
     console.log("UI session minting is configured");
   } else {
     console.error("UI session minting is disabled: no organization key found");
   }
-  const server = createLocalServer({ apiBaseUrl, organizationApiKey });
+  const server = createLocalServer({
+    apiBaseUrl,
+    organizationApiKey,
+    oidcConfig,
+    postHogConfig,
+  });
   server.listen(8080, async () => {
     console.log("Running at http://localhost:8080");
     try {
@@ -432,10 +477,13 @@ if (isMainModule) {
 
 export {
   createLocalServer,
+  createRuntimeConfigHandler,
   createUiSessionHandler,
   createUiSessionNonceManager,
   issueUiSessionNonceCookie,
   resolveLocalServerConfiguration,
+  resolveOidcRuntimeConfig,
+  resolvePostHogRuntimeConfig,
   resolveOrganizationApiKey,
   resolveServerApiBaseUrl,
   startLocalServer,

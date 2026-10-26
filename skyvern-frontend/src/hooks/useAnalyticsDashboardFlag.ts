@@ -1,5 +1,5 @@
-import { useFeatureFlagEnabled } from "posthog-js/react";
 import { useFeatureFlag } from "@/hooks/useFeatureFlag";
+import { usePostHogFeatureFlagEnabled as useFeatureFlagEnabled } from "@/hooks/usePostHogFeatureFlag";
 import { ANALYTICS_DASHBOARD_FLAG } from "@/util/featureFlags";
 
 // VITE_MOCK_ANALYTICS fakes API responses (see cloud/dev/mockAnalyticsServer.ts)

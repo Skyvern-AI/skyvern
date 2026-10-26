@@ -7,6 +7,9 @@ const { mockEnabled } = vi.hoisted(() => ({ mockEnabled: vi.fn() }));
 vi.mock("posthog-js/react", () => ({
   useFeatureFlagEnabled: () => mockEnabled(),
 }));
+vi.mock("@/hooks/usePostHogFeatureFlag", () => ({
+  usePostHogFeatureFlagEnabled: () => mockEnabled(),
+}));
 
 import { createElement, type ReactNode } from "react";
 import { FeatureFlagContext } from "@/hooks/useFeatureFlag";

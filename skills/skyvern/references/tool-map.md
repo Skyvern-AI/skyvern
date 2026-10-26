@@ -77,3 +77,9 @@
 | `skyvern_credential_get` | Get credential details |
 | `skyvern_credential_delete` | Delete a credential |
 | `skyvern_login` | Use a credential in a browser session |
+
+## Report a Skyvern problem
+
+| Tool | Purpose |
+|------|---------|
+| `skyvern_feedback` | Send one report per distinct problem to the team operating the connected server. Available in every scope. |

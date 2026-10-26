@@ -39,11 +39,12 @@ from skyvern.forge.failure_classifier import without_output_only_labels
 from skyvern.forge.sdk.api.aws import AsyncAWSClient
 from skyvern.forge.sdk.api.azure import AsyncAzureVaultClient
 from skyvern.forge.sdk.core import skyvern_context
+from skyvern.forge.sdk.credential_site_policy import LoginSite
 from skyvern.forge.sdk.db.enums import OrganizationAuthTokenType
 from skyvern.forge.sdk.schemas.credentials import CredentialVaultType, PasswordCredential
 from skyvern.forge.sdk.schemas.organizations import Organization
 from skyvern.forge.sdk.schemas.tasks import TaskStatus
-from skyvern.forge.sdk.services.bitwarden import BitwardenConstants, BitwardenService
+from skyvern.forge.sdk.services.bitwarden import BitwardenConstants, BitwardenLoginSecret, BitwardenService
 from skyvern.forge.sdk.services.credentials import (
     AzureVaultConstants,
     OnePasswordConstants,
@@ -484,10 +485,9 @@ class WorkflowRunContext:
                 )
                 continue
             if parameter.key in workflow_run_context.parameters:
-                prev_value = workflow_run_context.parameters[parameter.key]
-                new_value = run_parameter.value
                 LOG.error(
-                    f"Duplicate parameter key {parameter.key} found while initializing context manager, previous value: {prev_value}, new value: {new_value}. Using new value."
+                    "Duplicate parameter key found while initializing context manager, using new value",
+                    parameter_key=parameter.key,
                 )
 
             workflow_run_context.parameters[parameter.key] = parameter
@@ -629,6 +629,8 @@ class WorkflowRunContext:
         self.resolved_credential_parameter_ids: dict[str, str] = {}
         # tested_url per credential parameter key: where each credential's secrets may be released.
         self.credential_tested_urls: dict[str, str] = {}
+        # The sites each Bitwarden login's item is saved for, which a code block checks its release against.
+        self.bitwarden_login_sites: dict[str, list[LoginSite]] = {}
         self.materialized_file_paths: dict[str, tuple[str, str]] = {}
         self.runtime_otp_values: set[str] = set()
         self._failure_evidence_capture: _FailureEvidenceCapture | None = None
@@ -1792,6 +1794,10 @@ class WorkflowRunContext:
                     "password": password_secret_id,
                 }
                 self.parameters[parameter.key] = parameter
+                # A read that lost its site list counts as naming no checkable site, so enforced runs refuse the login.
+                self.bitwarden_login_sites[parameter.key] = (
+                    secret_credentials.login_sites if isinstance(secret_credentials, BitwardenLoginSecret) else []
+                )
                 if parameter.totp_identifier:
                     normalized_totp_identifier = _normalize_credential_totp_identifier(parameter.totp_identifier)
                     if normalized_totp_identifier is not None:
@@ -2189,9 +2195,8 @@ class WorkflowRunContext:
                 )
                 if parameter.value:
                     LOG.warning(
-                        f"Context parameter {parameter.key} already has a value, overwriting",
-                        old_value=parameter.value,
-                        new_value=value,
+                        "Context parameter already has a value, overwriting",
+                        parameter_key=parameter.key,
                     )
                 if not isinstance(value, dict) and not isinstance(value, list):
                     raise ValueError(

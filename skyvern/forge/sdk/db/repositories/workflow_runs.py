@@ -36,6 +36,7 @@ from sqlalchemy import (
     update,
 )
 from sqlalchemy.dialects.postgresql import JSONB
+from sqlalchemy.engine import RowMapping
 from sqlalchemy.exc import IntegrityError, SQLAlchemyError, StatementError
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.ext.compiler import compiles
@@ -53,7 +54,13 @@ from skyvern.forge.sdk.db.base_repository import BaseRepository
 from skyvern.forge.sdk.db.datetime_utils import naive_utc_now, to_naive_utc
 from skyvern.forge.sdk.db.enums import DispatchFinalizationStatus, WorkflowRunTriggerType
 from skyvern.forge.sdk.db.exceptions import NotFoundError, RunsListSearchCanceled
-from skyvern.forge.sdk.db.id import BROWSER_PROFILE_PREFIX, CREDENTIAL_PREFIX, PERSISTENT_BROWSER_SESSION_ID
+from skyvern.forge.sdk.db.id import (
+    BROWSER_PROFILE_PREFIX,
+    CREDENTIAL_PREFIX,
+    PERSISTENT_BROWSER_SESSION_ID,
+    TASK_PREFIX,
+    WORKFLOW_RUN_PREFIX,
+)
 from skyvern.forge.sdk.db.statement_timeout import apply_statement_timeout, is_statement_timeout
 from skyvern.forge.sdk.db.tag_filters import run_tag_run_id_subqueries
 
@@ -137,15 +144,31 @@ def _runs_list_search_id_prefix(search_key: str) -> str | None:
     return prefix if int_id.isdigit() else None
 
 
+# Every digit-form run and task id generated since March 2023 carries at least this many digits, so a shorter
+# one is a partial id still being typed and keeps the substring match. Ids reach 19 digits in November 2029,
+# after which an 18-digit prefix would read as complete unless this floor rises.
+_COMPLETE_RUN_ID_MIN_DIGITS = 18
+
+
+def _complete_run_id_prefix(search_key: str) -> str | None:
+    prefix, _, int_id = search_key.partition("_")
+    if prefix not in (WORKFLOW_RUN_PREFIX, TASK_PREFIX) or not (int_id.isascii() and int_id.isdigit()):
+        return None
+    return prefix if len(int_id) >= _COMPLETE_RUN_ID_MIN_DIGITS else None
+
+
 def is_indexed_runs_list_search_key(search_key: str) -> bool:
-    return _runs_list_search_id_prefix(search_key) in (BROWSER_PROFILE_PREFIX, PERSISTENT_BROWSER_SESSION_ID)
+    return (
+        _runs_list_search_id_prefix(search_key) in (BROWSER_PROFILE_PREFIX, PERSISTENT_BROWSER_SESSION_ID)
+        or _complete_run_id_prefix(search_key) is not None
+    )
 
 
 def _is_bounded_runs_list_read(session: AsyncSession, search_key: str | None) -> bool:
     """Whether a runs-list read runs under ``RUNS_LIST_STATEMENT_TIMEOUT_SECONDS``.
 
     Only the unindexed free-text search is capped: query plans for the other filter shapes are not
-    known, and a complete browser identifier resolves through an indexed equality lookup.
+    known, and a complete browser, run or task identifier resolves through an indexed equality lookup.
     """
     if not search_key or is_indexed_runs_list_search_key(search_key):
         return False
@@ -451,6 +474,58 @@ def _final_webhook_claim_is_free(stale_before: datetime) -> ColumnElement[bool]:
 
 class WorkflowRunsRepository(BaseRepository):
     """Database operations for workflow runs."""
+
+    @db_operation("list_workflow_run_activity_for_export", log_errors=False)
+    async def list_for_activity_export(
+        self,
+        *,
+        organization_id: str,
+        since: datetime,
+        until: datetime,
+        before_created_at: datetime | None,
+        before_workflow_run_id: str | None,
+        limit: int,
+    ) -> list[RowMapping]:
+        filters = [
+            WorkflowRunModel.organization_id == organization_id,
+            WorkflowRunModel.created_at >= to_naive_utc(since),
+            WorkflowRunModel.created_at <= to_naive_utc(until),
+            WorkflowRunModel.parent_workflow_run_id.is_(None),
+        ]
+        before_created_at = to_naive_utc(before_created_at)
+        if before_created_at is not None and before_workflow_run_id is not None:
+            filters.append(
+                (WorkflowRunModel.created_at < before_created_at)
+                | (
+                    (WorkflowRunModel.created_at == before_created_at)
+                    & (WorkflowRunModel.workflow_run_id < before_workflow_run_id)
+                )
+            )
+            # Bound the index walk at the cursor instead of filtering every newer run.
+            filters.append(WorkflowRunModel.created_at <= before_created_at)
+
+        async with self.Session() as session:
+            return list(
+                (
+                    await session.execute(
+                        select(
+                            WorkflowRunModel.workflow_run_id,
+                            WorkflowRunModel.created_at,
+                            WorkflowRunModel.workflow_permanent_id,
+                            WorkflowRunModel.trigger_type,
+                            WorkflowRunModel.created_by,
+                            WorkflowRunModel.requested_by,
+                            WorkflowRunModel.workflow_schedule_id,
+                            WorkflowRunModel.retried_from_workflow_run_id,
+                        )
+                        .where(*filters)
+                        .order_by(WorkflowRunModel.created_at.desc(), WorkflowRunModel.workflow_run_id.desc())
+                        .limit(limit)
+                    )
+                )
+                .mappings()
+                .all()
+            )
 
     async def finalize_workflow_run_for_dispatch(
         self,
@@ -1714,9 +1789,12 @@ class WorkflowRunsRepository(BaseRepository):
             )
             if search_key:
                 prefix = _runs_list_search_id_prefix(search_key)
+                complete_run_id_prefix = _complete_run_id_prefix(search_key)
                 if prefix == PERSISTENT_BROWSER_SESSION_ID:
                     task_query = task_query.filter(TaskModel.browser_session_id == search_key)
-                elif prefix in (BROWSER_PROFILE_PREFIX, CREDENTIAL_PREFIX):
+                elif complete_run_id_prefix == TASK_PREFIX:
+                    task_query = task_query.filter(TaskModel.task_id == search_key)
+                elif prefix in (BROWSER_PROFILE_PREFIX, CREDENTIAL_PREFIX) or complete_run_id_prefix:
                     task_query = task_query.filter(false())
                 else:
                     # Standalone callback URLs are not part of workflow-run webhook search.
@@ -3038,6 +3116,19 @@ class WorkflowRunsRepository(BaseRepository):
         identifier_run_ids = self._indexed_identifier_run_ids(search_key, standalone_tasks=standalone_tasks)
         if identifier_run_ids is not None:
             return run_id_col.in_(identifier_run_ids)
+        # Like a browser identifier, a complete run or task id replaces the substring arms: a page of
+        # them around one match walks every run in the organization.
+        complete_run_id_prefix = _complete_run_id_prefix(search_key)
+        if complete_run_id_prefix == WORKFLOW_RUN_PREFIX:
+            return run_id_col == search_key
+        if complete_run_id_prefix == TASK_PREFIX:
+            task_workflow_run_id = select(TaskModel.workflow_run_id).where(TaskModel.task_id == search_key)
+            if not standalone_tasks:
+                return run_id_col.in_(task_workflow_run_id)
+            # A standalone task's task_runs row carries the task id as its run_id.
+            return run_id_col.in_(
+                union_all(task_workflow_run_id, select(TaskModel.task_id).where(TaskModel.task_id == search_key))
+            )
         return or_(*substring_clauses, *self._run_identifier_search_clauses(search_key, run_id_col))
 
     def _apply_workflow_run_search_key_filter(self, query, search_key: str | None):  # type: ignore[no-untyped-def]
@@ -3223,6 +3314,18 @@ class WorkflowRunsRepository(BaseRepository):
                 for run, title in workflow_runs
             ]
 
+    @db_operation("count_recent_workflow_runs")
+    async def count_recent_workflow_runs(self, workflow_permanent_id: str, organization_id: str, days: int) -> int:
+        async with self.Session() as session:
+            count_query = (
+                select(func.count())
+                .select_from(WorkflowRunModel)
+                .filter(WorkflowRunModel.workflow_permanent_id == workflow_permanent_id)
+                .filter(WorkflowRunModel.organization_id == organization_id)
+                .filter(WorkflowRunModel.created_at >= naive_utc_now() - timedelta(days=days))
+            )
+            return (await session.execute(count_query)).scalar_one()
+
     @db_operation("get_workflow_runs_count")
     async def get_workflow_runs_count(
         self,
@@ -3303,7 +3406,7 @@ class WorkflowRunsRepository(BaseRepository):
     ) -> list[WorkflowRun]:
         """
         Get runs for a workflow, optionally searching its title, run ID, inputs, webhook URL,
-        and complete browser or credential identifiers.
+        and complete browser, credential, run or task identifiers.
         """
         await _hidden_workflow_ids(organization_id)  # before checking out a connection
         async with self.Session() as session:

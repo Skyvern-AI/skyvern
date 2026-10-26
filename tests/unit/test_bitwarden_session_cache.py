@@ -18,13 +18,19 @@ import os
 import random
 from collections.abc import Awaitable, Callable, Iterator
 from datetime import UTC, datetime
+from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
 import pytest
+from fastapi import HTTPException
 from structlog.testing import capture_logs
 
 from skyvern.exceptions import BitwardenGetItemError
+from skyvern.forge import app
+from skyvern.forge.sdk.db.enums import OrganizationAuthTokenType
+from skyvern.forge.sdk.routes.credentials import list_bitwarden_items
 from skyvern.forge.sdk.schemas.credentials import CredentialVaultType
+from skyvern.forge.sdk.schemas.organizations import BitwardenCredential, BitwardenOrganizationAuthToken, Organization
 from skyvern.forge.sdk.services import bitwarden as bitwarden_module
 from skyvern.forge.sdk.services.bitwarden import (
     BitwardenConstants,
@@ -104,6 +110,8 @@ class FakeVaultCli:
             "object": "item",
             "id": ITEM_ID,
             "type": 1,
+            "organizationId": "org-id",
+            "collectionIds": ["collection-id"],
             "login": {"username": "alice@example.com", "password": "hunter2", "totp": ""},
             "fields": [{"name": "first_name", "value": "Alice"}],
         }
@@ -708,6 +716,7 @@ async def test_fetches_for_different_organizations_do_not_serialize(monkeypatch:
                         "object": "item",
                         "id": ITEM_ID,
                         "type": 1,
+                        "organizationId": "org-id",
                         "login": {"username": "u", "password": "p", "totp": ""},
                     }
                 ),
@@ -807,6 +816,52 @@ async def test_browsing_a_vault_always_syncs_but_reuses_the_login(cli: FakeVault
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("login_stderr", "status_code"),
+    [
+        (
+            'Could not find data file, "/tmp/bw/data.json"; creating it instead.\n'
+            "Invalid master password. Confirm your email is correct and your account was created on "
+            "vault.bitwarden.com.",
+            400,
+        ),
+        ("Unable to fetch ServerConfig from https://vault.example.test/api FetchError", 502),
+    ],
+    ids=["credentials-rejected", "server-unreachable"],
+)
+async def test_listing_items_reports_rejected_vault_credentials_as_a_client_error(
+    cli: FakeVaultCli, monkeypatch: pytest.MonkeyPatch, login_stderr: str, status_code: int
+) -> None:
+    """A wrong master password is the customer's to fix; only a vault that fails to answer is our 5xx."""
+    now = datetime.now(UTC)
+    token = BitwardenOrganizationAuthToken(
+        id="oat_vault",
+        organization_id="o_vault",
+        token_type=OrganizationAuthTokenType.bitwarden_credential,
+        valid=True,
+        created_at=now,
+        modified_at=now,
+        credential=BitwardenCredential(email="someone@example.com", master_password="wrong-master-password"),
+    )
+    organization = Organization(
+        organization_id="o_vault", organization_name="Vault org", created_at=now, modified_at=now
+    )
+    monkeypatch.setattr(
+        app.DATABASE,
+        "organizations",
+        SimpleNamespace(get_valid_org_auth_token=AsyncMock(return_value=token)),
+        raising=False,
+    )
+    cli.login_stdout = ""
+    cli.login_stderr = login_stderr
+
+    with pytest.raises(HTTPException) as excinfo:
+        await list_bitwarden_items(current_org=organization)
+
+    assert excinfo.value.status_code == status_code
+
+
+@pytest.mark.asyncio
 async def test_concurrent_cli_commands_are_bounded(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(bitwarden_module, "_cli_command_semaphore", asyncio.Semaphore(2))
     in_flight = 0
@@ -834,6 +889,7 @@ async def test_concurrent_cli_commands_are_bounded(monkeypatch: pytest.MonkeyPat
                         "object": "item",
                         "id": ITEM_ID,
                         "type": 1,
+                        "organizationId": "org-id",
                         "login": {"username": "u", "password": "p", "totp": ""},
                     }
                 ),
@@ -1124,6 +1180,7 @@ async def test_a_burst_across_more_vaults_than_the_cache_holds_drains_back_to_ca
                         "object": "item",
                         "id": ITEM_ID,
                         "type": 1,
+                        "organizationId": "org-id",
                         "login": {"username": "u", "password": "p", "totp": ""},
                     }
                 ),

@@ -1,6 +1,7 @@
 import ipaddress
 import socket
 from datetime import UTC, datetime, timedelta
+from enum import StrEnum
 from http import HTTPStatus
 from typing import Annotated, Any
 from urllib.parse import parse_qsl, quote, urljoin, urlparse, urlsplit, urlunsplit
@@ -22,6 +23,13 @@ MAX_SAFE_REDIRECTS = 10
 _NO_SUCH_HOST_DNS_ERRNOS = frozenset(
     getattr(socket, name) for name in ("EAI_NONAME", "EAI_NODATA") if hasattr(socket, name)
 )
+
+
+class HostVerdict(StrEnum):
+    ALLOW = "allow"
+    DENY = "deny"
+    UNRESOLVABLE = "unresolvable"
+
 
 _BLOCKED_INTERNAL_HOSTNAMES = frozenset({"localhost", "metadata.google.internal", "kubernetes.default.svc"})
 _BLOCKED_INTERNAL_SUFFIXES = (".local", ".localhost", ".internal", ".cluster.local")
@@ -208,7 +216,15 @@ def is_tls_or_local_browser_address(address: str) -> bool:
 
 
 def validate_browser_host(host: str, *, resolve_dns: bool = False) -> None:
-    if not is_allowed_local_browser_host(host) and is_blocked_host(host, resolve_dns=resolve_dns):
+    if is_allowed_local_browser_host(host):
+        return
+    verdict = classify_host(host, resolve_dns=resolve_dns)
+    if verdict is HostVerdict.UNRESOLVABLE:
+        # UnresolvableHost subclasses BlockedHost, so a caller handling the refusal is unaffected;
+        # the distinct message is what keeps an unreachable browser host from reading as one our
+        # SSRF policy named.
+        raise UnresolvableHost(host=host)
+    if verdict is HostVerdict.DENY:
         raise BlockedHost(host=host)
 
 
@@ -242,17 +258,26 @@ def _is_internal_hostname(host: str) -> bool:
     return normalized.endswith(".svc")
 
 
-def is_blocked_host(host: str, *, resolve_dns: bool = False) -> bool:
+def classify_host(host: str, *, resolve_dns: bool = False) -> HostVerdict:
+    """Whether ``host`` may be reached, must be refused, or could not be checked at all.
+
+    ``UNRESOLVABLE`` exists so a resolution failure cannot be spelled the same way as a verified
+    public host: the browser resolves the name itself (split-horizon DNS, or a proxy handed the
+    name over HTTP CONNECT / SOCKS remote DNS), so a name the worker cannot resolve can still
+    reach an internal address from the browser's network. It is a refusal, and callers that report
+    the destination to a customer distinguish it so our own resolver's silence is not described as
+    the target being internal.
+    """
     normalized = _normalize_host(host)
     if not normalized:
-        return True
+        return HostVerdict.DENY
 
     if _is_allowed_host(host):
-        return False
+        return HostVerdict.ALLOW
 
     blocked = {b.lower().rstrip(".") for b in settings.BLOCKED_HOSTS}
     if normalized in blocked or _is_internal_hostname(normalized):
-        return True
+        return HostVerdict.DENY
 
     ip: ipaddress.IPv4Address | ipaddress.IPv6Address | None
     try:
@@ -260,24 +285,28 @@ def is_blocked_host(host: str, *, resolve_dns: bool = False) -> bool:
     except ValueError:
         ip = None
     except Exception:
-        return True
+        return HostVerdict.DENY
 
     if ip is not None:
-        return is_blocked_ip(ip)
+        return HostVerdict.DENY if is_blocked_ip(ip) else HostVerdict.ALLOW
 
     if not resolve_dns:
-        return False
+        return HostVerdict.ALLOW
 
     try:
         resolve_fetch_host_ips(normalized)
     except UnresolvableHost:
-        # UnresolvableHost subclasses BlockedHost, so it must be caught first. The browser resolves
-        # through the run proxy and may reach hosts the worker cannot; worker resolution failure is
-        # not a policy signal. Literal internal IPs and internal names are refused above, before DNS.
-        return False
+        # UnresolvableHost subclasses BlockedHost, so it must be caught first.
+        return HostVerdict.UNRESOLVABLE
     except BlockedHost:
-        return True
-    return False
+        return HostVerdict.DENY
+    return HostVerdict.ALLOW
+
+
+def is_blocked_host(host: str, *, resolve_dns: bool = False) -> bool:
+    # Anything short of an explicit allow is refused, so a destination admitted here was admitted
+    # because the check passed and not because it could not run.
+    return classify_host(host, resolve_dns=resolve_dns) is not HostVerdict.ALLOW
 
 
 def resolve_fetch_host_ips(host: str) -> tuple[str, ...]:
@@ -335,9 +364,10 @@ def host_has_no_address_record(host: str) -> bool:
 
     Deliberately narrower than ``UnresolvableHost``: a timeout or SERVFAIL means the resolver could
     not answer, and reading that as a dead host would misattribute every navigation failure during
-    a resolver outage. Callers use this to attribute a navigation that already failed, never to
-    decide whether one is allowed -- ``is_blocked_host`` ignores worker-side resolution failures
-    for that reason, since the browser resolves through the run proxy.
+    a resolver outage. Callers use this to attribute a navigation that is already being refused or
+    has already failed, never to decide whether one is allowed -- an unresolvable destination is
+    refused by ``classify_host`` either way, and this only separates "the target is gone" from
+    "we could not check it".
     """
     normalized = _normalize_host(host)
     if not normalized:

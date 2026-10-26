@@ -203,24 +203,6 @@ from tests.unit.copilot_test_helpers import make_verified_goal_contract as _veri
 from tests.unit.copilot_test_helpers import origin_run_input, passing_run, stub_copilot_agent_loop
 
 
-def test_build_user_context_preserves_structured_evidence_after_redacting_secret() -> None:
-    evidence = json.dumps(
-        {
-            "actions": [
-                {"action_id": "a001", "url": "https://example.com/?token=private-value"},
-                {"action_id": "a002", "url": "https://example.com/next"},
-            ]
-        },
-        separators=(",", ":"),
-    )
-
-    context = agent_module._build_user_context("", "", "", "", "refine", untrusted_evidence=evidence)
-
-    assert "private-value" not in context
-    assert "[REDACTED_SECRET]" in context
-    assert "a002" in context
-
-
 def test_build_user_context_renders_scope_check_after_the_user_message() -> None:
     context = agent_module._build_user_context(
         "", "user history", "", "", "make me a game", scope_check="SCOPE-SENTINEL"
@@ -5979,6 +5961,7 @@ class _CredentialWorkflow(BaseModel):
     """Raw definition fixture for credential admission, with snapshot copy semantics."""
 
     workflow_id: str = "wf-1"
+    workflow_permanent_id: str = "wfp-1"
     workflow_definition: _CredentialWorkflowDefinition
     output_labels: set[str]
 

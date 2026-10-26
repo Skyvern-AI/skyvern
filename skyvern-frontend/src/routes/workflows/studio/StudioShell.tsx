@@ -25,8 +25,6 @@ import {
   TooltipProvider,
   TooltipTrigger,
 } from "@/components/ui/tooltip";
-import { useRecordedBlocksStore } from "@/store/RecordedBlocksStore";
-import { useRecordingStore } from "@/store/useRecordingStore";
 import { useWorkflowTitleStore } from "@/store/WorkflowTitleStore";
 import { cn } from "@/util/utils";
 
@@ -34,11 +32,7 @@ import { deriveDropIndicator } from "../editor/sortable/dropIndicator";
 import { WorkflowRunVerificationCodeForm } from "../workflowRun/WorkflowRunVerificationCodeForm";
 
 import { BrowserPaneActions, BrowserPaneViewPills } from "./BrowserPaneHeader";
-import {
-  CopilotActiveDot,
-  CopilotPaneControls,
-  CopilotPaneStatus,
-} from "./CopilotPaneHeader";
+import { CopilotActiveDot, CopilotPaneControls } from "./CopilotPaneHeader";
 import {
   EditorPaneBlockSearch,
   EditorPaneModeToggle,
@@ -72,10 +66,6 @@ import {
 } from "./panes";
 import { StudioPaneDefaultsProvider } from "./StudioPaneDefaults";
 import { useStudioPaneDefaults } from "./StudioPaneDefaultsContext";
-import {
-  advanceRecordingStopLifecycle,
-  panesAfterRecordingTransition,
-} from "./recordingPaneLifecycle";
 import {
   StudioPaneCompactContext,
   StudioShellContext,
@@ -714,8 +704,7 @@ function StudioStage(props: StudioWorkspaceProps) {
   const logging = useLogging();
   const embedded = searchParams.get("embed") === "true";
   useStudioOnboardingTour(!embedded, props.workflow.workflow_permanent_id);
-  const { panes, closePane, openPane, setOpenPanes, setPanesOrder } =
-    useStudioPanes();
+  const { panes, closePane, setPanesOrder } = useStudioPanes();
   const {
     registerStageElement,
     paneWidths,
@@ -741,7 +730,6 @@ function StudioStage(props: StudioWorkspaceProps) {
       postHog.captureException(error, { error_source: "studio_pane", pane });
     }
   };
-  const isRecording = useRecordingStore((s) => s.isRecording);
   // The title store is normally seeded by the embedded Workspace's canvas,
   // which never mounts for a deleted agent — seed it here instead.
   const initializeTitle = useWorkflowTitleStore((s) => s.initializeTitle);
@@ -899,66 +887,6 @@ function StudioStage(props: StudioWorkspaceProps) {
     );
   };
 
-  // Recording lives in the Browser pane (the live stream is there) with the
-  // live-drafts panel taking over the Copilot pane. The Editor is not useful
-  // during capture, and the Browser is not useful while the recording is being
-  // applied. Gated on lifecycle transitions so manual pane changes made
-  // mid-recording are preserved.
-  const finishRequested = useRecordingStore((s) => s.finishRequested);
-  const isCommitting = useRecordingStore((s) => s.isCommitting);
-  const recordedBlocksPending = useRecordedBlocksStore(
-    (s) => (s.blocks?.length ?? 0) > 0,
-  );
-  const processingRecording =
-    finishRequested || isCommitting || recordedBlocksPending;
-  const prevIsRecordingRef = useRef(false);
-  const prevProcessingRef = useRef(false);
-  const finishWasRequestedRef = useRef(false);
-  useEffect(() => {
-    const wasRecording = prevIsRecordingRef.current;
-    const wasProcessing = prevProcessingRef.current;
-    const stopLifecycle = advanceRecordingStopLifecycle(
-      finishWasRequestedRef.current,
-      {
-        isRecording,
-        wasRecording,
-        finishRequested,
-        processingRecording,
-      },
-    );
-    finishWasRequestedRef.current = stopLifecycle.finishWasRequested;
-    if (processingRecording && !wasProcessing) {
-      restoreExpandedPane();
-      if (finishRequested || isCommitting || wasRecording) {
-        setOpenPanes(panesAfterRecordingTransition(panes, "processing"));
-      } else {
-        // Other block imports share this loading state but are not recordings.
-        openPane("editor");
-      }
-    } else if (isRecording && !wasRecording) {
-      // Recording → live browser + Copilot guidance.
-      restoreExpandedPane();
-      setOpenPanes(panesAfterRecordingTransition(panes, "started"));
-    } else if (stopLifecycle.transition !== null) {
-      // Stop removes Browser; Discard restores the canvas without closing it.
-      restoreExpandedPane();
-      setOpenPanes(
-        panesAfterRecordingTransition(panes, stopLifecycle.transition),
-      );
-    }
-    prevIsRecordingRef.current = isRecording;
-    prevProcessingRef.current = processingRecording;
-  }, [
-    isRecording,
-    finishRequested,
-    isCommitting,
-    openPane,
-    panes,
-    processingRecording,
-    restoreExpandedPane,
-    setOpenPanes,
-  ]);
-
   const paneProps = (id: StudioPaneId) => {
     const index = panes.indexOf(id);
     return {
@@ -1026,7 +954,6 @@ function StudioStage(props: StudioWorkspaceProps) {
             >
               <StudioPane
                 {...paneProps("copilot")}
-                headerExtras={<CopilotPaneStatus />}
                 headerActions={<CopilotPaneControls />}
                 iconBadge={<CopilotActiveDot />}
               >

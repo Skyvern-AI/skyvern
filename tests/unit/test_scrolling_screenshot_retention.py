@@ -11,6 +11,7 @@ Viewport CDP recovery contracts live in ``webeye/test_screenshot_cdp_fallback.py
 from __future__ import annotations
 
 import asyncio
+from contextlib import asynccontextmanager
 from io import BytesIO
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -23,6 +24,7 @@ import skyvern.webeye.utils.page as page_module
 from skyvern.webeye.browser_engine import BrowserEngineSelection
 from skyvern.webeye.utils.page import ScreenshotMode
 from tests.unit.conftest import settle_or_fail, stalling_async_mock
+from tests.unit.scoped_asyncio import ScopedAsyncio
 
 
 def _png_bytes(width: int, height: int, color: tuple[int, int, int]) -> bytes:
@@ -601,15 +603,64 @@ async def test_stalled_capture_settles_within_the_millisecond_budget() -> None:
 
 
 @pytest.mark.asyncio
-async def test_failed_capture_and_stalled_fallback_share_one_budget() -> None:
-    fallback_entered = asyncio.Event()
+async def test_failed_capture_and_stalled_fallback_share_one_budget(monkeypatch: pytest.MonkeyPatch) -> None:
+    class _Clock:
+        def __init__(self) -> None:
+            self.now = 0.0
+            self.active_deadlines: list[float] = []
+
+        def time(self) -> float:
+            return self.now
+
+        async def sleep(self, seconds: float) -> None:
+            self.now += seconds
+            if self.active_deadlines:
+                deadline = min(self.active_deadlines)
+                if self.now >= deadline:
+                    self.now = deadline
+                    raise TimeoutError
+
+    clock = _Clock()
+    armed_deadlines: list[float] = []
+    fallback_deadlines: list[float] = []
+    capture_failed_at: list[float] = []
+    timeout_ms = 300
+    budget_started_at = clock.now
+
+    def _timeout_at(deadline: float):
+        armed_deadlines.append(deadline)
+
+        @asynccontextmanager
+        async def _scope():
+            clock.active_deadlines.append(deadline)
+            try:
+                yield
+            finally:
+                clock.active_deadlines.remove(deadline)
+
+        return _scope()
+
+    monkeypatch.setattr(
+        page_module,
+        "asyncio",
+        ScopedAsyncio(
+            get_running_loop=lambda: clock,
+            sleep=clock.sleep,
+            timeout_at=_timeout_at,
+        ),
+    )
 
     async def _fail_late(*args: object, **kwargs: object) -> None:
-        await asyncio.sleep(0.25)
+        await page_module.asyncio.sleep(0.25)
+        capture_failed_at.append(clock.now)
         raise RuntimeError("capture boom")
 
+    async def _stall_fallback(*args: object, **kwargs: object) -> None:
+        fallback_deadlines.extend(clock.active_deadlines)
+        await page_module.asyncio.sleep(1.0)
+
     with patch.object(page_module.LOG, "warning", MagicMock()):
-        task, elapsed = await settle_or_fail(
+        task, _ = await settle_or_fail(
             _invoke_take_scrolling_screenshot(
                 screenshots=[],
                 positions=[],
@@ -618,15 +669,17 @@ async def test_failed_capture_and_stalled_fallback_share_one_budget() -> None:
                 fake_gc=MagicMock(),
                 bytesio_instances=[],
                 fake_frame=_HangingRestoreFrame(),
-                timeout_ms=300,
+                timeout_ms=timeout_ms,
                 scroll_helper=AsyncMock(side_effect=_fail_late),
-                fallback=stalling_async_mock(fallback_entered),
+                fallback=AsyncMock(side_effect=_stall_fallback),
             )
         )
 
-    assert fallback_entered.is_set()
     assert isinstance(task.exception(), TimeoutError)
-    assert 0.25 <= elapsed < 0.45, elapsed
+    assert capture_failed_at == [pytest.approx(0.25)]
+    assert armed_deadlines == [pytest.approx(budget_started_at + timeout_ms / 1000)]
+    assert fallback_deadlines == armed_deadlines
+    assert clock.now == pytest.approx(armed_deadlines[0])
 
 
 @pytest.mark.asyncio

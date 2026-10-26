@@ -273,6 +273,7 @@ async def _run_fallback_retry(
     flag_error: Exception | None = None,
     run_tags: dict[str, str] | None = None,
     run_group_item: object | None = None,
+    block_error_codes: list[str] | None = None,
 ) -> tuple[str | None, AsyncMock, MagicMock]:
     captured: dict[str, object] = {}
 
@@ -301,6 +302,9 @@ async def _run_fallback_retry(
         mock_app.AGENT_FUNCTION.is_block_scoped_workflow_run = AsyncMock(return_value=block_scoped)
         mock_app.AGENT_FUNCTION.strip_proxy_session_extra_http_headers = _strip_marker_header
         mock_app.DATABASE.debug.has_block_run_for_workflow_run = AsyncMock(return_value=False)
+        mock_app.DATABASE.observer.get_workflow_run_blocks = AsyncMock(
+            return_value=[SimpleNamespace(error_codes=block_error_codes or [])]
+        )
         mock_app.DATABASE.workflow_run_groups.get_item_by_workflow_run_id = AsyncMock(return_value=run_group_item)
         mock_app.WORKFLOW_SERVICE.get_workflow = AsyncMock(return_value=_workflow(parameters))
         if retried_by_results is not None:
@@ -333,6 +337,19 @@ async def _run_fallback_retry(
         mock_app.DATABASE.tags.get_active_grouped_tags_for_run = AsyncMock(return_value=run_tags)
         result = await maybe_start_credential_fallback_retry(workflow_run, "org_test")
         return result, run_workflow_mock, mock_app
+
+
+@pytest.mark.asyncio
+async def test_any_failure_fallback_is_not_started_after_the_run_lost_its_browser() -> None:
+    workflow_run = _workflow_run(failure_category=[{"category": "AUTH_FAILURE"}])
+    login = _credential_parameter(fallback_credential_ids=["cred_fb1"], fallback_trigger=ANY_FAILURE)
+
+    result, run_workflow_mock, _ = await _run_fallback_retry(
+        workflow_run=workflow_run, parameters=[login], block_error_codes=["browser_connection_lost"]
+    )
+
+    assert result is None
+    run_workflow_mock.assert_not_awaited()
 
 
 @pytest.mark.asyncio

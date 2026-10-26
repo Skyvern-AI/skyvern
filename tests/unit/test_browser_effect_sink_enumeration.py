@@ -27,8 +27,8 @@ _DISCOVERED_BROWSER_API_CALLS = {
             # 6 = 5 prior + the bounded v4 FileDownloadBlock synchronous popup close (SKY-15371).
             "close": 6,
             "dblclick": 2,
-            # 18 = 16 prior + the read-only Flutter text-field probe and two-frame wait around a credential write.
-            "evaluate": 18,
+            # 19 = 18 prior + the read-only window offset read behind the page-level scroll progress check.
+            "evaluate": 19,
             "fill": 2,
             # 5 = 4 prior + the focus that lets a Flutter text field start editing before a credential write.
             "focus": 5,
@@ -50,7 +50,7 @@ _DISCOVERED_BROWSER_API_CALLS = {
             "wheel": 5,
         }
     ),
-    "skyvern/webeye/actions/multi_field_totp.py": Counter({"fill": 1, "click": 2, "press": 1, "evaluate": 5}),
+    "skyvern/webeye/actions/multi_field_totp.py": Counter({"fill": 1, "click": 2, "press": 1, "evaluate": 9}),
     "skyvern/webeye/actions/handler_utils.py": Counter(
         {"dispatch_event": 1, "down": 3, "evaluate": 1, "fill": 3, "press": 1, "up": 3}
     ),
@@ -114,6 +114,8 @@ _EVALUATE_CALLERS = {
             "bind": 1,
             "refresh": 1,
             "find_multi_field_totp_submit_controls": 1,
+            # read-only checks that a pending click or Enter targets the code group's own submit or resend control
+            "one_time_code_dispatch_kind": 4,
         }
     ),
     "skyvern/webeye/actions/handler_utils.py": Counter({"_uses_native_value_set_fill": 1}),
@@ -136,7 +138,9 @@ _EVALUATE_CALLERS = {
             "_normal_select_readback_contradicts": 1,
             "_probe_tel_browser_validity": 1,
             "handle_click_action": 2,
-            "handle_scroll_action": 4,
+            # 5 = 4 prior + the read-only window offset read that decides whether a page-level
+            # scroll revealed anything (SKY-18891)
+            "handle_scroll_action": 5,
         }
     ),
     "skyvern/webeye/dom_inspection.py": Counter(
@@ -271,21 +275,21 @@ def test_discovered_browser_api_lower_bound_is_stable() -> None:
     }
 
     assert observed == _DISCOVERED_BROWSER_API_CALLS
-    assert sum(sum(methods.values()) for methods in observed.values()) == 213
+    assert sum(sum(methods.values()) for methods in observed.values()) == 218
     handler_candidates = _candidate_signatures("skyvern/webeye/actions/handler.py", _CANDIDATE_METHODS)
     classified_non_browser = Counter(
         {signature: count for signature, count in handler_candidates.items() if signature in _NON_BROWSER_CANDIDATES}
     )
     assert classified_non_browser == _NON_BROWSER_CANDIDATES
     assert sum(_NON_BROWSER_CANDIDATES.values()) == 7
-    assert sum(sum(methods.values()) for methods in observed.values()) - sum(_NON_BROWSER_CANDIDATES.values()) == 206
+    assert sum(sum(methods.values()) for methods in observed.values()) - sum(_NON_BROWSER_CANDIDATES.values()) == 211
 
 
 def test_every_raw_evaluate_call_is_classified() -> None:
     observed = {path: callers for path in _owned_source_paths() if (callers := _callers_for_method(path, "evaluate"))}
 
     assert observed == _EVALUATE_CALLERS
-    assert sum(sum(callers.values()) for callers in observed.values()) == 42
+    assert sum(sum(callers.values()) for callers in observed.values()) == 47
 
 
 def test_every_cdp_dispatch_is_classified_by_exact_command() -> None:

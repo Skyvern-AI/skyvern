@@ -10,7 +10,6 @@ import {
 import { afterEach, beforeEach, describe, expect, test, vi } from "vitest";
 
 import { useWorkflowHistoryAccessStore } from "@/store/WorkflowHistoryAccessStore";
-import { useRecordingStore } from "@/store/useRecordingStore";
 
 import { RedoControl } from "./RedoControl";
 
@@ -25,7 +24,6 @@ describe("RedoControl", () => {
       redo,
       captureImmediately: vi.fn(),
     });
-    useRecordingStore.setState({ isRecording: false });
   });
 
   afterEach(() => {
@@ -66,21 +64,5 @@ describe("RedoControl", () => {
     render(<RedoControl />);
     fireEvent.click(screen.getByRole("button", { name: /redo/i }));
     expect(redo).toHaveBeenCalledTimes(1);
-  });
-
-  test("button is disabled while recording even when canRedo is true", () => {
-    useWorkflowHistoryAccessStore.getState().setHistoryAccess({
-      canUndo: false,
-      canRedo: true,
-      undo: vi.fn(),
-      redo,
-      captureImmediately: vi.fn(),
-    });
-    useRecordingStore.setState({ isRecording: true });
-    render(<RedoControl />);
-    const btn = screen.getByRole("button", { name: /redo/i });
-    expect(btn.hasAttribute("disabled")).toBe(true);
-    fireEvent.click(btn);
-    expect(redo).not.toHaveBeenCalled();
   });
 });

@@ -1,7 +1,6 @@
 import asyncio
 import copy
 import difflib
-import hmac
 import importlib.util
 import json
 import os
@@ -51,7 +50,9 @@ from skyvern.constants import (
     GET_DOWNLOADED_FILES_TIMEOUT,
     SAVE_DOWNLOADED_FILES_TIMEOUT,
 )
+from skyvern.errors.errors import drop_unsolicited_download_errors
 from skyvern.exceptions import (
+    BROWSER_CONNECTION_LOST_ERROR_CODE,
     BlockedHost,
     BlockNotFound,
     BrowserActionPolicyNotEnforceable,
@@ -68,6 +69,7 @@ from skyvern.exceptions import (
     InProcessScriptExecutionDenied,
     InvalidCredentialId,
     InvalidWorkflowParameter,
+    MissingBrowserState,
     MissingValueForParameter,
     ScriptTerminationException,
     SequentialCredentialLimitExceeded,
@@ -226,6 +228,7 @@ from skyvern.forge.sdk.workflow.models.block import (
     get_all_blocks,
     pinned_v1_block_count,
     resolve_conditional_merge_edges,
+    running_after_browser_loss,
     takes_default_engine,
     v3_ab_ineligibility_reason,
 )
@@ -357,6 +360,7 @@ from skyvern.schemas.workflows import (
     BlockResult,
     BlockStatus,
     BlockType,
+    CodeBlockFailureKind,
     CredentialParameterYAML,
     WorkflowCreateYAMLRequest,
     WorkflowDefinitionYAML,
@@ -419,7 +423,7 @@ from skyvern.utils.url_validators import validate_webhook_url
 from skyvern.webeye.actions.action_types import ActionType
 from skyvern.webeye.actions.actions import Action, InputTextAction, VerificationCodeAction
 from skyvern.webeye.actions.responses import ActionResult
-from skyvern.webeye.browser_state import BrowserState
+from skyvern.webeye.browser_state import BrowserState, get_browser_connection_loss
 from skyvern.webeye.persistent_session_errors import BrowserSessionCreditAdmissionRefusal
 from skyvern.webeye.persistent_sessions_manager import BROWSER_RETIREMENT_DENIED_NOTE
 from skyvern.webeye.profile_cookie_merge import cookie_delta, seed_cookie_values, union_cookies_into_profile_dir
@@ -471,6 +475,10 @@ OWNED_SESSION_CLOSE_TIMEOUT_SECONDS = 30.0
 # Ten windows (300 seconds), plus the timestamp CAS pin, require five full minutes of continuously
 # failed activity writes before a live client can lose its browser.
 REUSED_SESSION_ROUTER_ACTIVITY_STALE_AFTER = timedelta(seconds=300)
+# How often a running workflow asks the manager to move its browser session's deadline. Paired with
+# DEBUG_SESSION_TIMEOUT_THRESHOLD_MINUTES so a session gets 2+ renewal attempts before it expires,
+# which is the floor any caller-supplied session's creation budget has to clear.
+BROWSER_SESSION_RENEWAL_INTERVAL_SECONDS = 300
 
 # Limit burst concurrency for status-path fetches that are typically hit by client polling.
 WORKFLOW_STATUS_RESPONSE_MAX_IN_FLIGHT = 3
@@ -751,6 +759,7 @@ ACTION_TEXT_FIELDS = (
     "reasoning",
     "intention",
     "file_url",
+    "download_url",
     "file_name",
     "description",
     "data_extraction_goal",
@@ -1951,22 +1960,6 @@ async def recover_pending_workflow_attempts(
             "Workflow retry recovery reached its page limit; remaining attempts wait for the next sweep",
             max_pages=ATTEMPT_RECOVERY_MAX_PAGES,
         )
-
-
-_WORKFLOW_SAVE_FINGERPRINT_DOMAIN = b"skyvern.workflow_save_fingerprint.v2\0"
-
-
-def _workflow_save_fingerprint(request: WorkflowCreateYAMLRequest) -> str:
-    payload = request.model_dump(mode="json")
-    payload.pop("recording_id", None)
-    payload["cdp_connect_headers"] = request.cdp_connect_headers
-    payload["explicit_fields"] = sorted(request.model_fields_set - {"recording_id"})
-    serialized = json.dumps(payload, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
-    return hmac.new(
-        settings.SECRET_KEY.encode(),
-        _WORKFLOW_SAVE_FINGERPRINT_DOMAIN + serialized.encode(),
-        sha256,
-    ).hexdigest()
 
 
 async def _roll_back_after_swallowed_write() -> None:
@@ -8076,7 +8069,7 @@ class WorkflowService:
         start_time = asyncio.get_event_loop().time()
         while True:
             try:
-                await asyncio.sleep(300)  # 5 minutes — ensures 2+ attempts within the 10-min renewal threshold
+                await asyncio.sleep(BROWSER_SESSION_RENEWAL_INTERVAL_SECONDS)
                 elapsed = asyncio.get_event_loop().time() - start_time
                 if elapsed >= max_renewal_seconds:
                     LOG.info(
@@ -8582,10 +8575,9 @@ class WorkflowService:
             page_text_snapshot = None
             working_page = None
             try:
-                browser_state = await app.BROWSER_MANAGER.get_or_create_for_workflow_run(
-                    workflow_run=workflow_run,
-                )
-                working_page = await browser_state.get_working_page()
+                # A diagnostic read: acquiring here would open a browser or take over one another run holds.
+                browser_state = app.BROWSER_MANAGER.get_for_workflow_run(workflow_run_id=workflow_run.workflow_run_id)
+                working_page = await browser_state.get_working_page() if browser_state else None
                 if working_page:
                     page_url = working_page.url
                     page_text_snapshot = (await working_page.inner_text("body"))[:5000]
@@ -9062,6 +9054,15 @@ class WorkflowService:
                 )
                 return workflow_run, blocks_to_update, workflow_run_block_result, True, branch_metadata
 
+            # A unit that completed after the run lost its browser natively cannot complete the body.
+            if (
+                workflow_run_block_result.success
+                and get_browser_connection_loss(app.BROWSER_MANAGER.get_for_workflow_run(workflow_run_id)) is not None
+            ):
+                workflow_run_block_result = await self._browser_lost_script_block_result(
+                    block, workflow_run_id, organization_id, attempt, parent_workflow_run_block_id
+                )
+
             self._track_blocks_for_script_generation(
                 workflow=workflow,
                 workflow_run=workflow_run,
@@ -9511,6 +9512,58 @@ class WorkflowService:
             script_exception=script_exception,
         )
 
+    async def _browser_lost_script_block_result(
+        self,
+        block: BlockTypeVar,
+        workflow_run_id: str,
+        organization_id: str,
+        attempt: ScriptBlockAttempt,
+        parent_workflow_run_block_id: str | None = None,
+    ) -> BlockResult:
+        attempt_number = app.WORKFLOW_CONTEXT_MANAGER.get_attempt_number(workflow_run_id)
+        workflow_run_blocks = await app.DATABASE.observer.get_workflow_run_blocks(
+            workflow_run_id=workflow_run_id, organization_id=organization_id
+        )
+        matching_blocks = [
+            b
+            for b in workflow_run_blocks
+            if b.label == block.label
+            and (b.attempt_number or 1) == attempt_number
+            and b.parent_workflow_run_block_id == parent_workflow_run_block_id
+        ]
+        latest_block = max(matching_blocks, key=lambda b: b.created_at) if matching_blocks else None
+        if attempt.block_result is not None:
+            latest_block = next(
+                (b for b in matching_blocks if b.workflow_run_block_id == attempt.block_result.workflow_run_block_id),
+                latest_block,
+            )
+        if latest_block is None:
+            latest_block = await app.DATABASE.observer.create_workflow_run_block(
+                workflow_run_id=workflow_run_id,
+                organization_id=organization_id,
+                attempt_number=attempt_number,
+                parent_workflow_run_block_id=parent_workflow_run_block_id,
+                label=block.label,
+                block_type=block.block_type,
+                continue_on_failure=block.continue_on_failure,
+            )
+        failure_reason = latest_block.failure_reason
+        if failure_reason is None and attempt.script_exception is not None:
+            failure_reason = str(attempt.script_exception)
+        if failure_reason is None:
+            failure_reason = get_user_facing_exception_message(MissingBrowserState(workflow_run_id=workflow_run_id))
+        error_codes = latest_block.error_codes
+        return await block.build_block_result(
+            success=False,
+            failure_reason=failure_reason,
+            output_parameter_value=latest_block.output,
+            status=BlockStatus.failed,
+            workflow_run_block_id=latest_block.workflow_run_block_id,
+            organization_id=organization_id,
+            error_codes=list(dict.fromkeys([*error_codes, BROWSER_CONNECTION_LOST_ERROR_CODE])),
+            can_continue_after_failure=False,
+        )
+
     async def _execute_block_via_agent_if_allowed(
         self,
         *,
@@ -9524,6 +9577,19 @@ class WorkflowService:
         script_blocks_by_label: dict[str, Any],
         attempt: ScriptBlockAttempt,
     ) -> tuple[BlockResult | None, bool] | WorkflowRunDispatchStopped:
+        if (
+            attempt.valid_to_run_code
+            and get_browser_connection_loss(app.BROWSER_MANAGER.get_for_workflow_run(workflow_run_id)) is not None
+        ):
+            LOG.warning(
+                "Browser connection lost: skipping agent fallback for the failed script block", block_label=block.label
+            )
+            return (
+                await self._browser_lost_script_block_result(
+                    block, workflow_run_id, organization_id, attempt, parent_workflow_run_block_id
+                ),
+                False,
+            )
         workflow_run_block_result = attempt.block_result
         # Check if this block is designated as requires_agent by the script reviewer.
         # These blocks must execute via agent even when ai_fallback=False.
@@ -10459,6 +10525,12 @@ class WorkflowService:
             block=block,
             block_result=block_result,
         )
+        # Omitted rather than logged as null: an unclassified failure is the field's absence.
+        failure_kind_fields: dict[str, CodeBlockFailureKind] = (
+            {"codeblock_failure_kind": block_result.codeblock_failure_kind}
+            if block_result.codeblock_failure_kind is not None
+            else {}
+        )
         # The resolver returns no target for ``continue_on_failure``. Keep the
         # status-specific early returns below so each case retains its useful log.
         if block_result.status == BlockStatus.failed:
@@ -10471,6 +10543,7 @@ class WorkflowService:
                 block_status=block_result.status,
                 block_type_var=block.block_type,
                 block_label=block.label,
+                **failure_kind_fields,
             )
             if block.continue_on_failure and getattr(block_result, "can_continue_after_failure", True):
                 LOG.warning(
@@ -10482,6 +10555,7 @@ class WorkflowService:
                     continue_on_failure=block.continue_on_failure,
                     block_type_var=block.block_type,
                     block_label=block.label,
+                    **failure_kind_fields,
                 )
                 return workflow_run, False
 
@@ -10494,6 +10568,7 @@ class WorkflowService:
                 block_status=block_result.status,
                 block_type_var=block.block_type,
                 block_label=block.label,
+                **failure_kind_fields,
             )
 
             if block.continue_on_failure and getattr(block_result, "can_continue_after_failure", True):
@@ -10506,6 +10581,7 @@ class WorkflowService:
                     continue_on_failure=block.continue_on_failure,
                     block_type_var=block.block_type,
                     block_label=block.label,
+                    **failure_kind_fields,
                 )
                 return workflow_run, False
 
@@ -10518,6 +10594,7 @@ class WorkflowService:
                 block_status=block_result.status,
                 block_type_var=block.block_type,
                 block_label=block.label,
+                **failure_kind_fields,
             )
 
             if block.continue_on_failure and getattr(block_result, "can_continue_after_failure", True):
@@ -10530,6 +10607,7 @@ class WorkflowService:
                     continue_on_failure=block.continue_on_failure,
                     block_type_var=block.block_type,
                     block_label=block.label,
+                    **failure_kind_fields,
                 )
                 return workflow_run, False
 
@@ -10690,14 +10768,15 @@ class WorkflowService:
             await app.WORKFLOW_CONTEXT_MANAGER.register_block_parameters_for_workflow_run(
                 workflow_run.workflow_run_id, parameters, organization
             )
-            finally_execution = await self._dispatch_workflow_run_block(
-                workflow_run.workflow_run_id,
-                lambda: block.execute_safe(
-                    workflow_run_id=workflow_run.workflow_run_id,
-                    organization_id=organization.organization_id,
-                    browser_session_id=browser_session_id,
-                ),
-            )
+            with running_after_browser_loss(workflow_run.workflow_run_id):
+                finally_execution = await self._dispatch_workflow_run_block(
+                    workflow_run.workflow_run_id,
+                    lambda: block.execute_safe(
+                        workflow_run_id=workflow_run.workflow_run_id,
+                        organization_id=organization.organization_id,
+                        browser_session_id=browser_session_id,
+                    ),
+                )
             if isinstance(finally_execution, WorkflowRunDispatchStopped):
                 return finally_execution
             block_result = finally_execution
@@ -10979,12 +11058,13 @@ class WorkflowService:
         workflow_id: str | None = None,
         encrypt_secrets: bool = True,
     ) -> Workflow:
+        pinned_v1_blocks = self._pinned_v1_blocks_to_check(workflow_definition)
         try:
             self._validate_code_block_templates(workflow_definition)
             self._validate_block_engines(workflow_definition)
             if encrypt_secrets:
                 await encrypt_workflow_definition_secrets(workflow_definition, organization_id)
-            return await app.DATABASE.workflows.create_workflow(
+            created_workflow = await app.DATABASE.workflows.create_workflow(
                 title=title,
                 workflow_definition=workflow_definition.model_dump(mode="json"),
                 organization_id=organization_id,
@@ -11028,6 +11108,19 @@ class WorkflowService:
             if "uc_org_permanent_id_version" in str(e) and workflow_permanent_id:
                 raise WorkflowVersionConflict(workflow_permanent_id) from e
             raise
+        if pinned_v1_blocks:
+            await asyncio.create_task(self._log_if_v1_pin_added(None, created_workflow, pinned_v1_blocks))
+        return created_workflow
+
+    @staticmethod
+    def _pinned_v1_blocks_to_check(workflow_definition: WorkflowDefinition | None) -> int:
+        pinned_v1_blocks = (
+            pinned_v1_block_count(get_all_blocks(workflow_definition.blocks)) if workflow_definition is not None else 0
+        )
+        # Off on SQLite: an in-memory database pools one connection, so the check's reads would share the save's.
+        if pinned_v1_blocks and app.DATABASE.engine.dialect.name == "sqlite":
+            return 0
+        return pinned_v1_blocks
 
     @staticmethod
     async def _insert_next_workflow_version(
@@ -11633,6 +11726,10 @@ class WorkflowService:
         preserve_redacted_credential_references_from: Workflow | None = None,
         preserved_credential_references: set[tuple[str, str, str]] | None = None,
     ) -> Workflow:
+        pinned_v1_blocks = self._pinned_v1_blocks_to_check(workflow_definition)
+        overwritten_workflow = (
+            await self._read_overwritten_workflow(workflow_id, organization_id) if pinned_v1_blocks else None
+        )
         if workflow_definition is not None:
             if validate_code_block_templates:
                 self._validate_code_block_templates(workflow_definition)
@@ -11722,6 +11819,12 @@ class WorkflowService:
                 refuse_if_pinned_by_run_group=True,
             )
 
+        if pinned_v1_blocks:
+            # A task gets its own connection; a failed read on the save's bound transaction would abort the save.
+            await asyncio.create_task(
+                self._log_if_v1_pin_added(overwritten_workflow, updated_workflow, pinned_v1_blocks)
+            )
+
         if notify_workflow_saved:
             self._schedule_workflow_saved_hook_best_effort(
                 organization_id=updated_workflow.organization_id,
@@ -11735,6 +11838,61 @@ class WorkflowService:
             )
 
         return updated_workflow
+
+    @staticmethod
+    async def _read_overwritten_workflow(workflow_id: str, organization_id: str | None) -> Workflow | None:
+        """None for a row the save's own transaction has not committed yet, which a new version's row is."""
+        try:
+            return await asyncio.create_task(
+                app.DATABASE.workflows.get_workflow(workflow_id=workflow_id, organization_id=organization_id)
+            )
+        except Exception:
+            LOG.warning("Failed to read the workflow row a save overwrites", workflow_id=workflow_id, exc_info=True)
+            return None
+
+    @staticmethod
+    async def _log_if_v1_pin_added(
+        overwritten_workflow: Workflow | None, saved_workflow: Workflow, pinned_v1_blocks: int
+    ) -> None:
+        """One new skyvern-1.0 pin takes every run of the workflow off the v3 A/B, so a save that adds one is logged."""
+        if saved_workflow.created_by == COPILOT_TEST_WORKFLOW_CREATOR:
+            return
+        try:
+            baseline = overwritten_workflow
+            # A new version's row is inserted empty before its definition is written; the version it follows is the
+            # one its runs routed on until now.
+            if baseline is None or not baseline.workflow_definition.blocks:
+                baseline = await app.DATABASE.workflows.get_workflow_by_permanent_id(
+                    workflow_permanent_id=saved_workflow.workflow_permanent_id,
+                    organization_id=saved_workflow.organization_id,
+                    ignore_version=saved_workflow.version,
+                )
+            pinned_before = (
+                pinned_v1_block_count(get_all_blocks(baseline.workflow_definition.blocks)) if baseline else 0
+            )
+            if pinned_v1_blocks <= pinned_before:
+                return
+            LOG.info(
+                "Workflow version adds a skyvern-1.0 engine pin",
+                organization_id=saved_workflow.organization_id,
+                workflow_permanent_id=saved_workflow.workflow_permanent_id,
+                version=saved_workflow.version,
+                previous_version=baseline.version if baseline else None,
+                pinned_v1_blocks_before=pinned_before,
+                pinned_v1_blocks_after=pinned_v1_blocks,
+                build_source=saved_workflow.build_source,
+                recent_runs_7d=await app.DATABASE.workflow_runs.count_recent_workflow_runs(
+                    workflow_permanent_id=saved_workflow.workflow_permanent_id,
+                    organization_id=saved_workflow.organization_id,
+                    days=7,
+                ),
+            )
+        except Exception:
+            LOG.warning(
+                "Failed to check a saved workflow version for an added skyvern-1.0 engine pin",
+                workflow_permanent_id=saved_workflow.workflow_permanent_id,
+                exc_info=True,
+            )
 
     async def maybe_delete_cached_code(
         self,
@@ -11888,16 +12046,23 @@ class WorkflowService:
         self,
         workflow_permanent_id: str,
         organization_id: str | None = None,
+        *,
+        expected_folder_assignment: tuple[str, str | None] | None = None,
     ) -> tuple[list[tuple[str, str | None]], str | None]:
         """Soft-delete a workflow and its schedules in one transaction; the caller owes `delete_backend_schedules`."""
         # One transaction so we do not leave the workflow active if a process exits between separate commits.
-        (
-            deleted_schedules,
-            deleted_workflow_id,
-        ) = await app.DATABASE.workflows.soft_delete_workflow_and_schedules_by_permanent_id(
-            workflow_permanent_id=workflow_permanent_id,
-            organization_id=organization_id,
-        )
+        delete = app.DATABASE.workflows.soft_delete_workflow_and_schedules_by_permanent_id
+        if expected_folder_assignment is None:
+            deleted_schedules, deleted_workflow_id = await delete(
+                workflow_permanent_id=workflow_permanent_id,
+                organization_id=organization_id,
+            )
+        else:
+            deleted_schedules, deleted_workflow_id = await delete(
+                workflow_permanent_id=workflow_permanent_id,
+                organization_id=organization_id,
+                expected_folder_assignment=expected_folder_assignment,
+            )
         if deleted_schedules:
             LOG.info(
                 "Cascade-deleted schedules during workflow deletion",
@@ -11912,16 +12077,18 @@ class WorkflowService:
         self,
         deleted_schedules: list[tuple[str, str | None]],
         organization_id: str | None,
-    ) -> None:
-        """Best effort: a failed backend delete is logged and left for the backend's own cleanup."""
+    ) -> list[str]:
+        """Best effort: returns the schedule ids whose backend schedule is gone; a failed delete is only logged."""
         targets = [(schedule_id, backend_id) for schedule_id, backend_id in deleted_schedules if backend_id]
         slots = asyncio.Semaphore(BACKEND_SCHEDULE_DELETE_CONCURRENCY)
         outcomes = await asyncio.gather(
             *(_delete_backend_schedule(backend_id, slots) for _, backend_id in targets), return_exceptions=True
         )
+        gone_schedule_ids: list[str] = []
         deleted_backend_ids: list[str] = []
         for (workflow_schedule_id, backend_schedule_id), outcome in zip(targets, outcomes, strict=True):
             if outcome is None:
+                gone_schedule_ids.append(workflow_schedule_id)
                 deleted_backend_ids.append(backend_schedule_id)
                 continue
             LOG.warning(
@@ -11938,6 +12105,7 @@ class WorkflowService:
                 backend_schedule_ids=deleted_backend_ids,
                 count=len(deleted_backend_ids),
             )
+        return gone_schedule_ids
 
     async def delete_workflow_by_id(
         self,
@@ -15067,10 +15235,11 @@ class WorkflowService:
         attempt_rows: Sequence[Any] | None = None,
         attempt_number: int | None = None,
         historical_artifacts: list[Artifact] | None = None,
-    ) -> tuple[list[FileInfo], list[str] | None]:
+    ) -> tuple[list[FileInfo] | None, list[str] | None]:
         """Fetch downloaded files for a workflow run, including task_v2 files when present."""
-        downloaded_files: list[FileInfo] = []
+        downloaded_files: list[FileInfo] | None = None
         downloaded_file_urls: list[str] | None = None
+        workflow_run_downloaded_files: list[FileInfo] | None = None
         try:
             async with asyncio.timeout(GET_DOWNLOADED_FILES_TIMEOUT):
                 context = skyvern_context.current()
@@ -15099,6 +15268,9 @@ class WorkflowService:
                     attempt_number=attempt_number,
                     artifact_ids=artifact_ids,
                 )
+                workflow_run_downloaded_files = downloaded_files
+                if workflow_run_downloaded_files:
+                    downloaded_file_urls = [file_info.url for file_info in workflow_run_downloaded_files]
                 if task_v2:
                     task_v2_downloaded_files = await app.STORAGE.get_downloaded_files(
                         organization_id=workflow_run.organization_id,
@@ -15138,12 +15310,14 @@ class WorkflowService:
                 "Timeout to get downloaded files",
                 workflow_run_id=workflow_run.workflow_run_id,
             )
+            downloaded_files = workflow_run_downloaded_files or None
         except Exception:
             LOG.warning(
                 "Failed to get downloaded files",
                 exc_info=True,
                 workflow_run_id=workflow_run.workflow_run_id,
             )
+            downloaded_files = workflow_run_downloaded_files or None
         return downloaded_files, downloaded_file_urls
 
     async def build_workflow_run_status_response(
@@ -15393,6 +15567,8 @@ class WorkflowService:
             ),
             workflow_run_id=workflow_run_id,
         )
+        # After the merge so a code copied onto a block's error_codes is filtered too.
+        errors = drop_unsolicited_download_errors(errors, downloaded_files=downloaded_files)
 
         parameters_with_value = {wfp.key: wfrp.value for wfp, wfrp in workflow_parameter_tuples}
 
@@ -15451,6 +15627,7 @@ class WorkflowService:
             credits_used=workflow_run.credits_used,
             cached_credits_used=workflow_run.cached_credits_used,
             workflow_title=workflow.title,
+            copilot_session_id=workflow_run.copilot_session_id,
             browser_session_id=workflow_run.browser_session_id,
             browser_profile_id=workflow_run.browser_profile_id,
             browser_seed_source=workflow_run.browser_seed_source,
@@ -17117,36 +17294,31 @@ class WorkflowService:
                 is_saved_task=runtime_workflow.is_saved_task,
             )
 
-        placeholder = await self._insert_next_workflow_version(
+        # Let concurrent dispatches reach the lock after reading the same candidate; allocation is refreshed under it.
+        next_workflow_version = await next_version()
+
+        async def insert_and_persist_dispatch_version(_candidate_version: int) -> Workflow:
+            async with app.DATABASE.workflows.acquire_workflow_creation_lock(runtime_workflow.workflow_permanent_id):
+                # A deletion that won the lock must not be undone by this stale dispatch.
+                await self.get_workflow_by_permanent_id(
+                    workflow_permanent_id=runtime_workflow.workflow_permanent_id,
+                    organization_id=organization_id,
+                )
+                placeholder = await insert_placeholder(await next_version())
+                self._regenerate_dispatch_draft_parameter_ids(dispatch_definition, placeholder.workflow_id)
+                return await self.update_workflow_definition(
+                    workflow_id=placeholder.workflow_id,
+                    organization_id=organization_id,
+                    workflow_definition=dispatch_definition,
+                    validate_code_block_templates=False,
+                )
+
+        return await self._insert_next_workflow_version(
             workflow_permanent_id=runtime_workflow.workflow_permanent_id,
-            version=await next_version(),
-            insert=insert_placeholder,
+            version=next_workflow_version,
+            insert=insert_and_persist_dispatch_version,
             next_version_after_conflict=next_version,
         )
-        try:
-            self._regenerate_dispatch_draft_parameter_ids(dispatch_definition, placeholder.workflow_id)
-            return await self.update_workflow_definition(
-                workflow_id=placeholder.workflow_id,
-                organization_id=organization_id,
-                workflow_definition=dispatch_definition,
-                validate_code_block_templates=False,
-            )
-        except Exception:
-            # The placeholder row already exists as the latest version; if definition
-            # persistence fails, soft-delete it so it does not linger as the latest pointer.
-            try:
-                await app.DATABASE.workflows.soft_delete_workflow_by_id(
-                    workflow_id=placeholder.workflow_id,
-                    organization_id=organization_id,
-                )
-            except Exception:
-                LOG.warning(
-                    "Failed to clean up partial copilot dispatch version after persistence error",
-                    workflow_id=placeholder.workflow_id,
-                    organization_id=organization_id,
-                    exc_info=True,
-                )
-            raise
 
     async def make_workflow_definition(
         self,
@@ -17421,33 +17593,7 @@ class WorkflowService:
             )
             return (workflow, ("workflow_definition",) if created else ()) if return_write_result else workflow
 
-        recording_id_to_attach = request.recording_id
-        workflow_save_fingerprint = _workflow_save_fingerprint(request) if request.recording_id is not None else None
-        if request.recording_id is not None:
-            recording = await app.DATABASE.browser_recordings.get_recording(
-                request.recording_id,
-                organization_id,
-            )
-            if (
-                recording is None
-                or workflow_permanent_id is None
-                or recording.workflow_permanent_id != workflow_permanent_id
-            ):
-                raise SkyvernHTTPException(
-                    f"Browser recording {request.recording_id} not found",
-                    status_code=HTTPStatus.NOT_FOUND,
-                )
-            if recording.workflow_id is not None:
-                if recording.metadata.get("workflow_save_fingerprint") == workflow_save_fingerprint:
-                    workflow = await self.get_workflow(
-                        workflow_id=recording.workflow_id,
-                        organization_id=organization_id,
-                    )
-                    return (workflow, ()) if return_write_result else workflow
-                recording_id_to_attach = None
-
         new_workflow_id: str | None = None
-        attached_recording_to_new_version = False
         refresh_schedule_runtime_limits = False
         effective_max_elapsed_time_minutes: int | None = None
 
@@ -17486,7 +17632,7 @@ class WorkflowService:
             )
 
         async def persist_version_with_definition(
-            insert_version_row: Callable[[], Awaitable[Workflow]],
+            insert_version_row: Callable[[int], Awaitable[Workflow]],
         ) -> tuple[Workflow, WorkflowDefinition]:
             """Allocate the new version row and fill in its definition as one transaction.
 
@@ -17496,8 +17642,24 @@ class WorkflowService:
             and a save precondition checked against it would reject a valid draft over a version
             that validation is about to discard.
             """
-            async with app.DATABASE.workflows.version_write_transaction():
-                allocated_workflow = await insert_version_row()
+            async with app.DATABASE.workflows.version_write_transaction(
+                workflow_permanent_id=(
+                    existing_latest_workflow.workflow_permanent_id if existing_latest_workflow is not None else None
+                )
+            ):
+                if existing_latest_workflow is not None:
+                    if getattr(existing_latest_workflow, "deleted_at", None) is None:
+                        # Deletion shares this lock; reject a stale save that got here after it committed.
+                        await self.get_workflow_by_permanent_id(
+                            workflow_permanent_id=existing_latest_workflow.workflow_permanent_id,
+                            organization_id=organization_id,
+                        )
+                    # A writer may have committed since the earlier allocation read. Refresh under
+                    # the lock so a stale insert cannot abort this transaction on the unique constraint.
+                    version = await next_version_from_same_settings()
+                else:
+                    version = 1
+                allocated_workflow = await insert_version_row(version)
                 built_definition = await self.make_workflow_definition(
                     allocated_workflow.workflow_id,
                     request.workflow_definition,
@@ -17627,8 +17789,8 @@ class WorkflowService:
                         raise WorkflowVersionConflict(existing_latest_workflow.workflow_permanent_id)
                     return latest_version + 1
 
-                async def insert_version_with_definition(version: int) -> tuple[Workflow, WorkflowDefinition]:
-                    return await persist_version_with_definition(lambda: insert_version(version))
+                async def insert_version_with_definition(_version: int) -> tuple[Workflow, WorkflowDefinition]:
+                    return await persist_version_with_definition(insert_version)
 
                 updated_workflow, workflow_definition = await self._insert_next_workflow_version(
                     workflow_permanent_id=existing_latest_workflow.workflow_permanent_id,
@@ -17642,7 +17804,7 @@ class WorkflowService:
                 # literal "***" placeholder from a misbehaving client.
                 new_cdp_connect_headers = merge_masked_headers(request.cdp_connect_headers, None)
                 updated_workflow, workflow_definition = await persist_version_with_definition(
-                    lambda: self._create_initial_workflow_from_request(
+                    lambda _version: self._create_initial_workflow_from_request(
                         organization_id=organization_id,
                         request=request,
                         title=title,
@@ -17656,44 +17818,6 @@ class WorkflowService:
             # Only the steps below still need the version cleaned up by hand; a failure inside the
             # transaction above already rolled it back.
             new_workflow_id = updated_workflow.workflow_id
-
-            if recording_id_to_attach is not None:
-                try:
-                    attached_recording = await app.DATABASE.browser_recordings.attach_to_workflow_version(
-                        recording_id=recording_id_to_attach,
-                        workflow_id=updated_workflow.workflow_id,
-                        workflow_permanent_id=updated_workflow.workflow_permanent_id,
-                        organization_id=organization_id,
-                        workflow_save_fingerprint=workflow_save_fingerprint,
-                    )
-                except ValueError as exc:
-                    raise SkyvernHTTPException(
-                        f"Browser recording {request.recording_id} not found",
-                        status_code=HTTPStatus.NOT_FOUND,
-                    ) from exc
-                if attached_recording.workflow_id is None:
-                    raise SkyvernHTTPException(
-                        f"Browser recording {request.recording_id} not found",
-                        status_code=HTTPStatus.NOT_FOUND,
-                    )
-
-                attached_recording_to_new_version = attached_recording.workflow_id == updated_workflow.workflow_id
-
-                # A concurrent retry may have attached the idempotency key to
-                # the first version while this duplicate version was built.
-                if (
-                    attached_recording.workflow_id != updated_workflow.workflow_id
-                    and attached_recording.metadata.get("workflow_save_fingerprint") == workflow_save_fingerprint
-                ):
-                    original_workflow = await self.get_workflow(
-                        workflow_id=attached_recording.workflow_id,
-                        organization_id=organization_id,
-                    )
-                    await self.delete_workflow_by_id(
-                        workflow_id=updated_workflow.workflow_id,
-                        organization_id=organization_id,
-                    )
-                    return (original_workflow, ()) if return_write_result else original_workflow
 
             await self.maybe_delete_cached_code(
                 updated_workflow,
@@ -17715,22 +17839,10 @@ class WorkflowService:
         except SkyvernHTTPException:
             # Bubble up well-formed client errors (e.g. WorkflowNotFound 404)
             # so they are not wrapped in a 500 by the caller.
-            if attached_recording_to_new_version and new_workflow_id and recording_id_to_attach:
-                await app.DATABASE.browser_recordings.detach_from_workflow_version(
-                    recording_id=recording_id_to_attach,
-                    workflow_id=new_workflow_id,
-                    organization_id=organization_id,
-                )
             if new_workflow_id:
                 await self.delete_workflow_by_id(workflow_id=new_workflow_id, organization_id=organization_id)
             raise
         except Exception:
-            if attached_recording_to_new_version and new_workflow_id and recording_id_to_attach:
-                await app.DATABASE.browser_recordings.detach_from_workflow_version(
-                    recording_id=recording_id_to_attach,
-                    workflow_id=new_workflow_id,
-                    organization_id=organization_id,
-                )
             if new_workflow_id:
                 LOG.error(
                     "Failed to create workflow from request, deleting workflow",

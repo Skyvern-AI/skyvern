@@ -853,25 +853,6 @@ _MAX_APPROVED_CREDENTIALS = 20
 _MAX_PROPOSAL_CARRIES = 5
 
 
-def merge_approved_credentials_into_global_llm_context(
-    raw_context: str | None,
-    approvals: list[ApprovedCredential],
-) -> str | None:
-    if not approvals:
-        return raw_context
-    structured = StructuredContext.from_json_str(raw_context)
-    by_id = {record.credential_id: record for record in structured.approved_credentials}
-    for approval in approvals:
-        existing = by_id.get(approval.credential_id)
-        if existing is not None:
-            existing.admitted_url = approval.admitted_url
-            continue
-        structured.approved_credentials.append(approval)
-        by_id[approval.credential_id] = approval
-    structured.approved_credentials = structured.approved_credentials[-_MAX_APPROVED_CREDENTIALS:]
-    return structured.to_json_str()
-
-
 def record_approved_credentials_in_global_llm_context(ctx: CopilotContext, raw_context: str | None) -> str | None:
     """Persist resolved credentials as durable cross-turn approval. Records only from
     resolved_credentials, never discovered_credentials, so ADR-0002's run/draft split
@@ -1387,6 +1368,8 @@ class CopilotContext(AgentContext):
     private_workflow_settings: dict[str, Any] = field(default_factory=dict, repr=False)
     last_workflow: Workflow | None = None
     last_workflow_yaml: str | None = None
+    # Copies of the saved workflow a full test loaded this turn; matched by identity, never offered as a proposal.
+    saved_workflows_under_test: list[Workflow] = field(default_factory=list)
     # Always False under staging; ``has_staged_proposal`` carries the signal.
     workflow_persisted: bool = False
     last_update_block_count: int | None = None

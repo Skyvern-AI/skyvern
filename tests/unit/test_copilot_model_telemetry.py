@@ -9,7 +9,7 @@ from collections.abc import AsyncIterator, Callable, Iterator
 from dataclasses import dataclass
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from types import SimpleNamespace
-from typing import Any, Self, cast
+from typing import Any, Literal, Self, cast
 from unittest.mock import AsyncMock, MagicMock
 
 import httpx
@@ -226,15 +226,13 @@ async def test_model_adapter_attaches_exact_tools_for_nonstream_and_stream_reque
 ) -> None:
     attached: list[list[Any]] = []
 
-    async def fake_get_response(*_args: Any, **_kwargs: Any) -> SimpleNamespace:
-        return SimpleNamespace(output=[])
-
-    async def fake_stream_response(*_args: Any, **_kwargs: Any) -> AsyncIterator[str]:
-        yield "done"
+    async def fake_acompletion(**kwargs: Any) -> Any:
+        if kwargs.get("stream"):
+            return cast(AsyncStream[ChatCompletionChunk], _ChunkStream(_stream_chunks()))
+        return _completion()
 
     monkeypatch.setattr(model_telemetry_module, "attach_tool_surface_to_pending_capture", attached.append)
-    monkeypatch.setattr(LitellmModel, "get_response", fake_get_response)
-    monkeypatch.setattr(LitellmModel, "stream_response", fake_stream_response)
+    monkeypatch.setattr("litellm.acompletion", fake_acompletion)
     model = CopilotLitellmModel(model="openai/gpt-5.6", next_model_call_index=lambda: 1)
 
     await model.get_response(
@@ -260,7 +258,7 @@ async def test_model_adapter_attaches_exact_tools_for_nonstream_and_stream_reque
     ]
 
     assert attached == [[_lookup_number], [_lookup_number]]
-    assert streamed == ["done"]
+    assert streamed
 
 
 @pytest.mark.asyncio
@@ -278,6 +276,62 @@ async def test_nonstream_capture_preserves_request_and_result(monkeypatch: pytes
     assert requests[0] == requests[1]
     assert adapter_result == base_result
     assert current_model_call_telemetry() is None
+
+
+@function_tool(strict_mode=False)
+def _pick(title: str | None = None, mode: Literal["a", "b"] | None = None) -> str:
+    return f"{title}{mode}"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("model_name", "drops_titles"),
+    [("anthropic/claude-sonnet-5-5", True), ("azure/gpt-5.6-terra", True), ("gpt-6.1-sol", False)],
+)
+async def test_sent_tool_schemas_drop_generated_titles_only_on_replay_checked_models(
+    monkeypatch: pytest.MonkeyPatch,
+    model_name: str,
+    drops_titles: bool,
+) -> None:
+    sent: list[dict[str, Any]] = []
+    attached: list[list[Any]] = []
+
+    async def fake_acompletion(**kwargs: Any) -> LiteLLMModelResponse:
+        sent.append(kwargs["tools"][0]["function"]["parameters"])
+        return _completion()
+
+    async def fake_aresponses(**kwargs: Any) -> ResponsesAPIResponse:
+        sent.append(kwargs["tools"][0]["parameters"])
+        return _responses_completion()
+
+    monkeypatch.setattr("litellm.acompletion", fake_acompletion)
+    monkeypatch.setattr("litellm.aresponses", fake_aresponses)
+    monkeypatch.setattr(model_telemetry_module, "attach_tool_surface_to_pending_capture", attached.append)
+    original = copy.deepcopy(_pick.params_json_schema)
+
+    await CopilotLitellmModel(model=model_name, next_model_call_index=lambda: 1).get_response(
+        system_instructions=_CACHED_PROMPT,
+        input=[{"role": "user", "content": "Pick one"}],
+        model_settings=ModelSettings(temperature=0, include_usage=True, extra_args=_GPT_REASONING),
+        tools=[_pick],
+        output_schema=None,
+        handoffs=[],
+        tracing=ModelTracing.DISABLED,
+    )
+
+    assert _pick.params_json_schema == original
+    assert sent == [
+        {
+            "properties": {
+                "title": {"anyOf": [{"type": "string"}, {"type": "null"}], "default": None},
+                "mode": {"anyOf": [{"enum": ["a", "b"], "type": "string"}, {"type": "null"}], "default": None},
+            },
+            "type": "object",
+        }
+        if drops_titles
+        else original
+    ]
+    assert [[tool.params_json_schema for tool in tools] for tools in attached] == [sent]
 
 
 @pytest.mark.asyncio
@@ -1562,7 +1616,7 @@ async def test_browser_ablation_timeout_reports_active_model_and_browser_work(
     assert result.browser_ablation_metadata["tool_activity"] == [{"tool_name": "navigate_browser", "success": True}]
 
 
-_GEMINI = "vertex_ai/gemini-2.5-flash"
+_GEMINI = "vertex_ai/gemini-3-flash-preview"
 _SCHEMA_CALL = ResponseFunctionToolCall(
     type="function_call",
     call_id="call_schema",
@@ -1821,7 +1875,7 @@ def _tool_text(messages: list[dict[str, Any]]) -> str:
 def _gemini_function_responses(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
     contents = _gemini_convert_messages_with_history(
         messages=cast(Any, [message for message in messages if message["role"] != "system"]),
-        model="gemini-2.5-flash",
+        model="gemini-3-flash-preview",
         custom_llm_provider="vertex_ai",
     )
     return [

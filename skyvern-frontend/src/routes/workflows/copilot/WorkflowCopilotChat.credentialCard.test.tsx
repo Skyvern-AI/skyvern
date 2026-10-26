@@ -16,7 +16,6 @@ import {
 } from "./WorkflowCopilotChat";
 
 import { useCopilotHeaderStore } from "@/store/useCopilotHeaderStore";
-import { useRecordingRefinementEvidenceStore } from "@/store/RecordingRefinementEvidenceStore";
 import {
   beginYamlCommit,
   createYamlCommitOwner,
@@ -534,7 +533,6 @@ beforeEach(() => {
     }
     return Promise.resolve(historyResponse);
   });
-  useRecordingRefinementEvidenceStore.setState({ armed: null });
   toastFn.mockClear();
   credentialsData.current = [];
   credsFail.current = false;
@@ -1379,7 +1377,7 @@ describe("WorkflowCopilotChat — credential card wiring", () => {
     { pause: "cancel-question", adopted: false },
     { pause: "new-chat", adopted: false },
   ])(
-    "retains one reserved recording recovery after $pause resumption (adopted: $adopted)",
+    "retains one reserved recovery after $pause resumption (adopted: $adopted)",
     async ({ pause, adopted }) => {
       const apply = vi.fn();
       let canonical = saveData.workflow;
@@ -1392,21 +1390,8 @@ describe("WorkflowCopilotChat — credential card wiring", () => {
               : historyResponse,
         ),
       );
-      useRecordingRefinementEvidenceStore.getState().set({
-        nonce: "resume-recording",
-        evidence: {
-          schema_version: 1,
-          recording: { browser_session_id: "pbs-resume" },
-          actions: [{ action_id: "a001" }],
-          deleted_action_ids: [],
-          truncated_action_count: 0,
-          provenance: { source: "browser_recording" },
-        },
-      });
-      await renderChat({
-        initialAction: { kind: "refine_recording", nonce: "resume-recording" },
-        onWorkflowUpdate: apply,
-      });
+      await renderChat({ onWorkflowUpdate: apply });
+      await submit("Add a final confirmation step");
       await waitFor(() => expect(streamCalls).toHaveLength(1));
       vi.useFakeTimers();
       historyResponse.data.request_turn_id = null;
@@ -1523,7 +1508,7 @@ describe("WorkflowCopilotChat — credential card wiring", () => {
       historyResponse.data.chat_history = [
         {
           sender: "ai",
-          content: "Recording changes saved.",
+          content: "Changes saved.",
           created_at: new Date().toISOString(),
           turn_outcome: {
             copilot_turn_id: "turn-1",
@@ -1542,7 +1527,7 @@ describe("WorkflowCopilotChat — credential card wiring", () => {
         expect.objectContaining({ persisted: true, applied: true }),
       );
       if (pause === "new-chat")
-        expect(screen.queryByText("Recording changes saved.")).toBeNull();
+        expect(screen.queryByText("Changes saved.")).toBeNull();
       expect(
         useWorkflowYamlEditorStore.getState().copilotAcceptance,
       ).toBeNull();
@@ -1560,125 +1545,6 @@ describe("WorkflowCopilotChat — credential card wiring", () => {
       expect(streamCalls).toHaveLength(2);
     },
   );
-
-  it("consolidates a reserved request poll when credential resumption precedes alias adoption", async () => {
-    let canonical = saveData.workflow;
-    let resolveLookup: ((value: typeof historyResponse) => void) | undefined;
-    let holdLookup = false;
-    const apply = vi.fn();
-    apiGet.mockImplementation(
-      (
-        path: string,
-        config?: { params?: { request_cancel_token?: string } },
-      ) => {
-        if (path === "/workflows/wpid_1")
-          return Promise.resolve({ data: canonical });
-        if (path === "/credentials")
-          return Promise.resolve({ data: credentialsData.current });
-        if (
-          holdLookup &&
-          config?.params?.request_cancel_token &&
-          !resolveLookup
-        ) {
-          return new Promise<typeof historyResponse>((resolve) => {
-            resolveLookup = resolve;
-          });
-        }
-        return Promise.resolve(historyResponse);
-      },
-    );
-    useRecordingRefinementEvidenceStore.getState().set({
-      nonce: "late-alias",
-      evidence: {
-        schema_version: 1,
-        recording: { browser_session_id: "pbs-alias" },
-        actions: [{ action_id: "a001" }],
-        deleted_action_ids: [],
-        truncated_action_count: 0,
-        provenance: { source: "browser_recording" },
-      },
-    });
-    const view = await renderChat({
-      initialAction: { kind: "refine_recording", nonce: "late-alias" },
-      onWorkflowUpdate: apply,
-    });
-    await waitFor(() => expect(streamCalls).toHaveLength(1));
-    vi.useFakeTimers();
-    historyResponse.data.request_turn_id = null;
-    await act(async () => {
-      streamCalls[0]!.reject(new Error("connection dropped"));
-      await vi.advanceTimersByTimeAsync(0);
-    });
-    const reservation = useWorkflowYamlEditorStore.getState().copilotAcceptance;
-    expect(reservation).not.toBeNull();
-    holdLookup = true;
-    credentialsData.current = [
-      {
-        credential_id: "cred-alias",
-        name: "Test login",
-        tested_url: "https://example.test/login",
-      },
-    ];
-    historyResponse.data.pending_credential_requests = [
-      credentialFrame({ login_page_urls: ["https://example.test/login"] }),
-    ];
-    await act(async () => vi.advanceTimersByTimeAsync(2_000));
-    expect(resolveLookup).toBeDefined();
-    await act(async () => fireEvent.click(screen.getByRole("combobox")));
-    await act(async () =>
-      fireEvent.click(screen.getByRole("button", { name: /^Test login/ })),
-    );
-    expect(credentialResponsePosts()).toHaveLength(1);
-    historyResponse.data.pending_credential_requests = [];
-    historyResponse.data.request_turn_id = "turn-1";
-    holdLookup = false;
-    await act(async () => resolveLookup!(structuredClone(historyResponse)));
-    expect(useWorkflowYamlEditorStore.getState().copilotAcceptance).toBe(
-      reservation,
-    );
-    expect(screen.getByRole("button", { name: "Retry" })).toBeTruthy();
-    apiGet.mockClear();
-    await act(async () => vi.advanceTimersByTimeAsync(3_000));
-    expect(
-      apiGet.mock.calls.filter(
-        ([path]) => path === "/workflow/copilot/chat-history",
-      ),
-    ).toHaveLength(1);
-    await act(async () =>
-      fireEvent.click(screen.getByRole("button", { name: "Reject" })),
-    );
-    expect(sansApiPost).toHaveBeenCalledWith(
-      "/workflow/copilot/cancel",
-      {
-        cancel_token: streamCalls[0]!.body.cancel_token,
-        workflow_copilot_chat_id: "chat-1",
-        source: "stop_button",
-      },
-      expect.anything(),
-    );
-    canonical = { ...saveData.workflow, workflow_id: "wf_alias_commit" };
-    historyResponse.data.chat_history = [
-      {
-        sender: "ai",
-        content: "Saved.",
-        created_at: new Date().toISOString(),
-        turn_outcome: {
-          copilot_turn_id: "turn-1",
-          terminal_reason: "completed",
-        },
-      },
-    ];
-    await act(async () => vi.advanceTimersByTimeAsync(0));
-    expect(apply).toHaveBeenCalledExactlyOnceWith(
-      canonical,
-      expect.objectContaining({ persisted: true, applied: true }),
-    );
-    view.unmount();
-    expect(vi.getTimerCount()).toBe(0);
-    apiGet.mockClear();
-    await act(async () => vi.advanceTimersByTimeAsync(30_000));
-    expect(apiGet).not.toHaveBeenCalled();
-  });
 
   it("unlocks ordinary disconnected turns when terminal history confirms unchanged canonical", async () => {
     const apply = vi.fn();

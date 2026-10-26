@@ -23,6 +23,7 @@ from skyvern.forge.sdk.api.llm.api_handler_factory import (
     get_org_aware_secondary_llm_api_handler,
 )
 from skyvern.forge.sdk.api.llm.schema_validator import validate_and_fill_extraction_result
+from skyvern.forge.sdk.api.llm.utils import llm_response_log_metadata
 from skyvern.forge.sdk.cache import extraction_cache
 from skyvern.forge.sdk.core import skyvern_context
 from skyvern.forge.sdk.experimentation.llm_prompt_config import resolve_prompt_type_handler
@@ -59,6 +60,7 @@ from skyvern.webeye.actions.handler import (
 )
 from skyvern.webeye.actions.parse_actions import parse_actions
 from skyvern.webeye.actions.responses import ActionAbort, ActionResult
+from skyvern.webeye.browser_state import raise_if_browser_connection_lost
 from skyvern.webeye.scraper.scraped_page import ScrapedPage
 
 jinja_sandbox_env = SandboxedEnvironment()
@@ -191,9 +193,16 @@ class RealSkyvernPageAi(SkyvernPageAi):
         self.page = page
         self.current_label: str | None = None
 
+    def _raise_if_browser_connection_lost(self) -> None:
+        context = skyvern_context.current()
+        raise_if_browser_connection_lost(
+            self.scraped_page._browser_state, workflow_run_id=context.workflow_run_id if context else None
+        )
+
     async def _refresh_scraped_page(
         self, take_screenshots: bool = True, max_retries: int = SKYVERN_PAGE_MAX_SCRAPING_RETRIES
     ) -> None:
+        self._raise_if_browser_connection_lost()
         self.scraped_page = await self.scraped_page.generate_scraped_page(
             take_screenshots=take_screenshots, max_retries=max_retries
         )
@@ -372,6 +381,7 @@ class RealSkyvernPageAi(SkyvernPageAi):
                 exc_info=True,
             )
 
+        self._raise_if_browser_connection_lost()
         if selector:
             locator = self.page.locator(selector)
             await locator.click(timeout=timeout)
@@ -395,6 +405,7 @@ class RealSkyvernPageAi(SkyvernPageAi):
         v3_parent_episode_id: str | None = None,
     ) -> str:
         """Input text into an element using AI to determine the value."""
+        self._raise_if_browser_connection_lost()
         sensitive_value = value if value_is_sensitive else None
 
         # v3 mid-run hook — see ai_click for the contract.
@@ -534,6 +545,7 @@ class RealSkyvernPageAi(SkyvernPageAi):
             except Exception:
                 LOG.exception("Failed to adapt value for input text action", selector=selector)
 
+        self._raise_if_browser_connection_lost()
         if action and organization_id and task and step:
             result = await handle_input_text_action_direct(action, self.page, self.scraped_page, task, step)
             if result and result[-1].success is False:
@@ -658,6 +670,7 @@ class RealSkyvernPageAi(SkyvernPageAi):
             except Exception:
                 LOG.exception(f"Failed to adapt value for upload file action on selector={selector}, file={files}")
 
+        self._raise_if_browser_connection_lost()
         if action and original_files and action.file_url and action.file_url != original_files:
             LOG.warning(
                 "LLM returned a different file url than the user provided, using the original",
@@ -757,6 +770,7 @@ class RealSkyvernPageAi(SkyvernPageAi):
                         exc_info=True,
                     )
 
+        self._raise_if_browser_connection_lost()
         if not selector:
             raise SkyvernActionFailed(
                 f"Select option failed and no fallback selector available for intention: {intention}"
@@ -874,9 +888,7 @@ class RealSkyvernPageAi(SkyvernPageAi):
 
             LOG.info(
                 "page.classify: LLM classification result",
-                classification=classification,
-                confidence=confidence,
-                reasoning=reasoning,
+                **llm_response_log_metadata(json_response),
             )
 
             if classification in options or classification == "UNKNOWN":
@@ -1647,7 +1659,7 @@ class RealSkyvernPageAi(SkyvernPageAi):
                 LOG.warning("ai_extract cache store failed; ignoring", exc_info=True)
 
         if context and context.script_mode:
-            LOG.debug("Extracted information", result=result)
+            LOG.debug("Extracted information", **llm_response_log_metadata(result))
         return result
 
     async def ai_validate(
@@ -1707,14 +1719,12 @@ class RealSkyvernPageAi(SkyvernPageAi):
         if not result or not isinstance(result, dict):
             LOG.error(
                 "AI locate element failed - invalid result",
-                result=result,
-                result_type=type(result).__name__,
+                **llm_response_log_metadata(result),
                 prompt=prompt_rendered,
             )
             return None
 
         element_id = result.get("element_id", None)
-        confidence = result.get("confidence_float", 0.0)
 
         xpath: str | None = None
         if element_id:
@@ -1728,17 +1738,14 @@ class RealSkyvernPageAi(SkyvernPageAi):
         if not xpath:
             LOG.error(
                 "AI locate element failed - no xpath in element data",
-                element_id=element_id,
-                result=result,
+                **llm_response_log_metadata(result),
                 prompt=prompt_rendered,
             )
             return None
 
         LOG.info(
             "AI locate element result",
-            element_id=element_id,
-            xpath=xpath,
-            confidence=confidence,
+            **llm_response_log_metadata(result),
             prompt=prompt_rendered,
         )
 
@@ -1794,25 +1801,29 @@ class RealSkyvernPageAi(SkyvernPageAi):
         )
 
         if not json_response or "inferred_actions" not in json_response:
-            LOG.warning("ai_act: failed to infer action type", prompt=prompt, response=json_response)
+            LOG.warning(
+                "ai_act: failed to infer action type",
+                prompt=prompt,
+                **llm_response_log_metadata(json_response),
+            )
             return
 
         inferred_actions = json_response.get("inferred_actions", [])
         if not inferred_actions:
-            error = json_response.get("error")
-            LOG.warning("ai_act: no action type inferred", prompt=prompt, error=error)
+            LOG.warning(
+                "ai_act: no action type inferred",
+                prompt=prompt,
+                **llm_response_log_metadata(json_response),
+            )
             return
 
         action_info = inferred_actions[0]
         action_type = action_info.get("action_type")
-        confidence = action_info.get("confidence_float", 0.0)
 
         LOG.info(
             "ai_act: inferred action type",
             prompt=prompt,
-            action_type=action_type,
-            confidence=confidence,
-            reasoning=action_info.get("reasoning"),
+            **llm_response_log_metadata(json_response),
         )
 
         if not skip_refresh:

@@ -2,17 +2,21 @@
 
 set -euo pipefail
 
-# Escape special sed characters in a value so it can be used safely in a
-# sed replacement string (s|old|new|g). Handles |, &, \, and / which are
-# metacharacters. Only handles single-line values (sufficient for URLs,
-# API keys, booleans, and path prefixes used here); a multi-line value
-# would corrupt the bundle silently, so fail fast instead.
-escape_sed() {
+# Escape a VITE value for JS string contents, then for a sed replacement.
+escape_js_sed() {
     if [[ "$1" == *$'\n'* ]]; then
-        echo "ERROR: escape_sed called with multi-line value; refusing to corrupt the bundle" >&2
+        echo "ERROR: escape_js_sed called with multi-line value; refusing to corrupt the bundle" >&2
         exit 1
     fi
-    printf '%s\n' "$1" | sed -e 's/[&/\|]/\\&/g'
+    VITE_VALUE="$1" node -e '
+        const value = JSON.stringify(process.env.VITE_VALUE).slice(1, -1)
+            .replace(/\x60/g, String.fromCharCode(92, 96))
+            .replace(/\$\{/g, String.fromCharCode(92, 36, 123))
+            .replace(/\x27/g, "\\x27")
+            .replace(/\u2028/g, "\\u2028")
+            .replace(/\u2029/g, "\\u2029");
+        process.stdout.write(value.replace(/[\\&|\/]/g, "\\$&"));
+    '
 }
 
 # Default values for environment variables
@@ -72,21 +76,22 @@ if [ -d /app/dist.template ]; then
 fi
 
 # Escape all values for safe use in sed replacement patterns
-ESC_API_BASE_URL=$(escape_sed "$VITE_API_BASE_URL")
-ESC_WSS_BASE_URL=$(escape_sed "$VITE_WSS_BASE_URL")
-ESC_ARTIFACT_API_BASE_URL=$(escape_sed "$VITE_ARTIFACT_API_BASE_URL")
-ESC_BROWSER_STREAMING_MODE=$(escape_sed "$VITE_BROWSER_STREAMING_MODE")
-ESC_ENABLE_LOG_ARTIFACTS=$(escape_sed "$VITE_ENABLE_LOG_ARTIFACTS")
-ESC_ENABLE_CODE_BLOCK=$(escape_sed "$VITE_ENABLE_CODE_BLOCK")
-ESC_ENVIRONMENT=$(escape_sed "$VITE_ENVIRONMENT")
-ESC_API_PATH_PREFIX=$(escape_sed "$VITE_API_PATH_PREFIX")
-ESC_ENABLE_2FA_NOTIFICATIONS=$(escape_sed "$VITE_ENABLE_2FA_NOTIFICATIONS")
-ESC_CLERK_PUBLISHABLE_KEY=$(escape_sed "$VITE_CLERK_PUBLISHABLE_KEY")
-ESC_PUBLIC_POSTHOG_HOST=$(escape_sed "$VITE_PUBLIC_POSTHOG_HOST")
-ESC_PUBLIC_POSTHOG_KEY=$(escape_sed "$VITE_PUBLIC_POSTHOG_KEY")
+ESC_API_BASE_URL=$(escape_js_sed "$VITE_API_BASE_URL")
+ESC_WSS_BASE_URL=$(escape_js_sed "$VITE_WSS_BASE_URL")
+ESC_ARTIFACT_API_BASE_URL=$(escape_js_sed "$VITE_ARTIFACT_API_BASE_URL")
+ESC_BROWSER_STREAMING_MODE=$(escape_js_sed "$VITE_BROWSER_STREAMING_MODE")
+ESC_ENABLE_LOG_ARTIFACTS=$(escape_js_sed "$VITE_ENABLE_LOG_ARTIFACTS")
+ESC_ENABLE_CODE_BLOCK=$(escape_js_sed "$VITE_ENABLE_CODE_BLOCK")
+ESC_ENVIRONMENT=$(escape_js_sed "$VITE_ENVIRONMENT")
+ESC_API_PATH_PREFIX=$(escape_js_sed "$VITE_API_PATH_PREFIX")
+ESC_ENABLE_2FA_NOTIFICATIONS=$(escape_js_sed "$VITE_ENABLE_2FA_NOTIFICATIONS")
+ESC_CLERK_PUBLISHABLE_KEY=$(escape_js_sed "$VITE_CLERK_PUBLISHABLE_KEY")
+ESC_PUBLIC_POSTHOG_HOST=$(escape_js_sed "$VITE_PUBLIC_POSTHOG_HOST")
+ESC_PUBLIC_POSTHOG_KEY=$(escape_js_sed "$VITE_PUBLIC_POSTHOG_KEY")
 
 # Replace placeholder strings in pre-built JS and HTML files with actual runtime values
 find /app/dist \( -name "*.js" -o -name "*.html" \) -exec sed -i \
+    -e "s|__VITE_API_BASE_URL_PLACEHOLDER__-__|${ESC_API_BASE_URL}|g" \
     -e "s|__VITE_API_BASE_URL_PLACEHOLDER__|${ESC_API_BASE_URL}|g" \
     -e "s|__VITE_WSS_BASE_URL_PLACEHOLDER__|${ESC_WSS_BASE_URL}|g" \
     -e "s|__VITE_ARTIFACT_API_BASE_URL_PLACEHOLDER__|${ESC_ARTIFACT_API_BASE_URL}|g" \

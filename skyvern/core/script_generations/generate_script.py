@@ -1768,6 +1768,20 @@ def _build_download_statement(
         ],
     }
     destination_fields = destination_fields_by_target.get(download_target)
+    source_fields = (
+        [
+            "sftp_source_path",
+            "sftp_host",
+            "sftp_port",
+            "sftp_username",
+            "sftp_password",
+            "sftp_private_key",
+            "sftp_private_key_passphrase",
+            "sftp_host_key",
+        ]
+        if block.get("sftp_source_path")
+        else []
+    )
     if destination_fields is not None and block.get("prompt") is not None:
         args[0] = args[0].with_changes(keyword=cst.Name("navigation_goal"))
 
@@ -1794,6 +1808,20 @@ def _build_download_statement(
                         ),
                     )
                 )
+    for key in source_fields:
+        if destination_fields is not None and key in destination_fields:
+            continue
+        if block.get(key) is not None:
+            args.append(
+                cst.Arg(
+                    keyword=cst.Name(key),
+                    value=_value(block.get(key, "")),
+                    whitespace_after_arg=cst.ParenthesizedWhitespace(
+                        indent=True,
+                        last_line=cst.SimpleWhitespace(INDENT),
+                    ),
+                )
+            )
     _mark_last_arg_as_comma(args)
     call = cst.Call(
         func=cst.Attribute(value=cst.Name("skyvern"), attr=cst.Name("download")),

@@ -17,11 +17,12 @@ from skyvern.errors.errors import UserDefinedError, filter_to_user_defined_codes
 from skyvern.forge import app
 from skyvern.forge.prompts import prompt_engine
 from skyvern.forge.sdk.api.llm.api_handler_factory import get_org_aware_primary_llm_api_handler
+from skyvern.forge.sdk.api.llm.utils import llm_response_log_metadata
 from skyvern.forge.sdk.core import skyvern_context
 from skyvern.forge.sdk.models import Step
 from skyvern.forge.sdk.schemas.tasks import Task
 from skyvern.services.action_service import get_action_history
-from skyvern.webeye.actions.handler import extract_user_defined_errors
+from skyvern.webeye.actions.handler import _match_user_defined_error_from_reasoning, extract_user_defined_errors
 from skyvern.webeye.browser_state import BrowserState
 
 LOG = structlog.get_logger()
@@ -58,28 +59,26 @@ async def detect_user_defined_errors_for_task(
         )
         return []
 
+    detected: list[UserDefinedError] = []
     try:
-        # Try to use full page-based detection if browser state is available
-        if browser_state is not None:
-            page = await browser_state.get_working_page()
-            if page is not None:
-                LOG.info(
-                    "Using page-based error detection",
-                    task_id=task.task_id,
-                    step_id=step.step_id,
-                    url=page.url,
-                )
-                return await _detect_errors_from_page(task, step, page, browser_state, failure_reason)
-
-        # Fall back to context-based detection when page is not available
-        LOG.info(
-            "Browser state or page not available, using context-based error detection",
-            task_id=task.task_id,
-            step_id=step.step_id,
-            has_browser_state=browser_state is not None,
-            has_failure_reason=failure_reason is not None,
-        )
-        return await _detect_errors_from_context(task, step, failure_reason)
+        page = await browser_state.get_working_page() if browser_state is not None else None
+        if browser_state is not None and page is not None:
+            LOG.info(
+                "Using page-based error detection",
+                task_id=task.task_id,
+                step_id=step.step_id,
+                url=page.url,
+            )
+            detected = await _detect_errors_from_page(task, step, page, browser_state, failure_reason)
+        else:
+            LOG.info(
+                "Browser state or page not available, using context-based error detection",
+                task_id=task.task_id,
+                step_id=step.step_id,
+                has_browser_state=browser_state is not None,
+                has_failure_reason=failure_reason is not None,
+            )
+            detected = await _detect_errors_from_context(task, step, failure_reason)
 
     except asyncio.CancelledError:
         # Don't swallow cancellation - let it propagate
@@ -93,7 +92,11 @@ async def detect_user_defined_errors_for_task(
             step_id=step.step_id,
             exc_info=True,
         )
-        return []
+    if not detected and failure_reason:
+        # Also overrides a model that read the reason and answered no code, as the page path's own match already does.
+        # Only a single code named verbatim counts; a description substring is too loose to stand on its own.
+        detected = _match_user_defined_error_from_reasoning(task, step, failure_reason, codes_only=True)
+    return detected
 
 
 async def _detect_errors_from_page(
@@ -154,7 +157,6 @@ async def _detect_errors_from_page(
             task_id=task.task_id,
             step_id=step.step_id,
             error_count=len(user_defined_errors),
-            errors=[e.error_code for e in user_defined_errors],
         )
 
         return user_defined_errors
@@ -236,13 +238,13 @@ async def _detect_errors_from_context(
             try:
                 user_defined_error = UserDefinedError.model_validate(error_dict)
                 user_defined_errors.append(user_defined_error)
-            except Exception:
+            except Exception as exc:
                 LOG.warning(
                     "Failed to validate user-defined error",
                     task_id=task.task_id,
                     step_id=step.step_id,
-                    error_dict=error_dict,
-                    exc_info=True,
+                    **llm_response_log_metadata(error_dict),
+                    error_type=type(exc).__name__,
                 )
 
         user_defined_errors, dropped = filter_to_user_defined_codes(user_defined_errors, task.error_code_mapping)
@@ -251,8 +253,8 @@ async def _detect_errors_from_context(
                 "Dropped LLM-returned error codes not in user error_code_mapping",
                 task_id=task.task_id,
                 step_id=step.step_id,
-                dropped_codes=dropped,
-                allowed_codes=sorted((task.error_code_mapping or {}).keys()),
+                dropped_count=len(dropped),
+                allowed_codes_count=len(task.error_code_mapping or {}),
             )
 
         LOG.info(
@@ -260,16 +262,15 @@ async def _detect_errors_from_context(
             task_id=task.task_id,
             step_id=step.step_id,
             error_count=len(user_defined_errors),
-            errors=[e.error_code for e in user_defined_errors],
         )
 
         return user_defined_errors
 
-    except Exception:
+    except Exception as exc:
         LOG.warning(
             "Failed to detect errors from context",
             task_id=task.task_id,
             step_id=step.step_id,
-            exc_info=True,
+            error_type=type(exc).__name__,
         )
         return []

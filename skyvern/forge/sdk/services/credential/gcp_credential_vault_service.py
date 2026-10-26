@@ -73,6 +73,7 @@ class GcpCredentialVaultService(CredentialVaultService):
         organization_id: str,
         data: CreateCredentialRequest,
         created_by: str | None = None,
+        is_passkey_setup_pending: bool = False,
     ) -> Credential:
         item_id = await self._create_gcp_secret_item(
             organization_id=organization_id,
@@ -88,6 +89,7 @@ class GcpCredentialVaultService(CredentialVaultService):
                 item_id=item_id,
                 vault_type=CredentialVaultType.GCP,
                 created_by=created_by,
+                is_passkey_setup_pending=is_passkey_setup_pending,
             )
         except BaseException:
             LOG.warning(

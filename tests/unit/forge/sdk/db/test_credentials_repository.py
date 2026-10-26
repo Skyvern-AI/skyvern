@@ -58,6 +58,102 @@ async def test_search_matches_an_exact_credential_id_within_the_org(repo_and_ses
 
 
 @pytest.mark.asyncio
+async def test_test_login_temporary_marker_can_be_set_and_cleared(repo_and_session) -> None:
+    repo, _session_factory = repo_and_session
+    credential_id = await _add_credential(_session_factory, ORG_A, "Login")
+
+    marked = await repo.update_credential(
+        credential_id=credential_id,
+        organization_id=ORG_A,
+        is_test_login_temporary=True,
+    )
+    assert marked.is_test_login_temporary is True
+
+    saved = await repo.update_credential(
+        credential_id=credential_id,
+        organization_id=ORG_A,
+        is_test_login_temporary=False,
+    )
+    assert saved.is_test_login_temporary is False
+
+
+@pytest.mark.asyncio
+async def test_pending_passkey_setup_marker_can_be_set_and_cleared(repo_and_session) -> None:
+    repo, _session_factory = repo_and_session
+    credential = await repo.create_credential(
+        organization_id=ORG_A,
+        name="Passkey login",
+        vault_type=CredentialVaultType.CUSTOM,
+        item_id="passkey-item",
+        credential_type=CredentialType.PASSWORD,
+        username="user@example.com",
+        totp_type="passkey",
+        card_last4=None,
+        card_brand=None,
+        is_passkey_setup_pending=True,
+    )
+    assert credential.is_passkey_setup_pending is True
+
+    saved = await repo.update_credential(
+        credential_id=credential.credential_id,
+        organization_id=ORG_A,
+        is_passkey_setup_pending=False,
+    )
+    assert saved.is_passkey_setup_pending is False
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("credential_type", "totp_type", "is_pending"),
+    [
+        (CredentialType.PASSWORD, "none", False),
+        (CredentialType.PASSWORD, "authenticator", False),
+        (CredentialType.PASSWORD, "passkey", True),
+        (CredentialType.CREDIT_CARD, "none", False),
+        (CredentialType.SECRET, "none", False),
+    ],
+)
+async def test_generic_update_tracks_pending_passkey_marker(
+    repo_and_session, credential_type: CredentialType, totp_type: str, is_pending: bool
+) -> None:
+    repo, _session_factory = repo_and_session
+    credential = await repo.create_credential(
+        organization_id=ORG_A,
+        name="Passkey login",
+        vault_type=CredentialVaultType.CUSTOM,
+        item_id="passkey-item",
+        credential_type=CredentialType.PASSWORD,
+        username="user@example.com",
+        totp_type="passkey",
+        card_last4=None,
+        card_brand=None,
+        is_passkey_setup_pending=True,
+    )
+    await repo.update_credential(
+        credential_id=credential.credential_id,
+        organization_id=ORG_A,
+        is_test_login_temporary=True,
+    )
+
+    updated = await repo.update_credential_vault_data(
+        credential_id=credential.credential_id,
+        organization_id=ORG_A,
+        item_id="updated-item",
+        name="Saved login",
+        credential_type=credential_type,
+        username="user@example.com",
+        totp_type=totp_type,
+        totp_identifier=None,
+        card_last4=None,
+        card_brand=None,
+    )
+
+    assert updated.totp_type == totp_type
+    assert updated.is_passkey_setup_pending is is_pending
+    assert updated.is_test_login_temporary is False
+
+
+@pytest.mark.asyncio
 async def test_vault_item_link_is_unique_per_organization_and_round_trips(repo_and_session) -> None:
     repo, _session_factory = repo_and_session
 

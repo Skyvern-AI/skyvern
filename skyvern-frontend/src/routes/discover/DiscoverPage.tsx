@@ -173,12 +173,12 @@ function DiscoverPage({ revamp = false, onRevampComplete }: Props = {}) {
         ref={promptBoxRef}
         enableCopilotHandoff={enableCopilotHandoff}
         handoffFlagLoading={copilotHandoffFlag === undefined}
-        secondaryAction={
-          <Button
-            variant="ghost"
-            size="sm"
-            className="h-11 w-full touch-manipulation gap-2 border border-border/70 text-muted-foreground hover:text-foreground md:h-10 md:w-auto md:border-0"
-            disabled={createWorkflowMutation.isPending}
+        siblingBusy={createWorkflowMutation.isPending}
+        secondaryAction={({ busy }) => (
+          <button
+            type="button"
+            className="relative inline-flex touch-manipulation items-center gap-1.5 rounded px-1 py-0.5 text-xs text-muted-foreground transition-colors before:absolute before:-inset-y-3 before:inset-x-0 before:content-[''] hover:text-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring disabled:pointer-events-none disabled:opacity-50 md:before:hidden"
+            disabled={createWorkflowMutation.isPending || busy}
             onClick={() => {
               createWorkflow({
                 ...defaultWorkflowRequest,
@@ -189,14 +189,14 @@ function DiscoverPage({ revamp = false, onRevampComplete }: Props = {}) {
             {createWorkflowMutation.isPending ? (
               <ReloadIcon
                 aria-hidden="true"
-                className="h-3 w-3 motion-safe:animate-spin motion-reduce:animate-none"
+                className="size-3.5 motion-safe:animate-spin motion-reduce:animate-none"
               />
             ) : (
-              <FilePlusIcon aria-hidden="true" className="size-4" />
+              <FilePlusIcon aria-hidden="true" className="size-3.5" />
             )}
             Start with a blank canvas
-          </Button>
-        }
+          </button>
+        )}
       />
       <div className="mx-auto w-full max-w-[60rem] pb-8">
         <WorkflowTemplates />

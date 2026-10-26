@@ -17,6 +17,7 @@ from cachetools import TTLCache
 from google.oauth2.credentials import Credentials
 from playwright.async_api import Frame, Page
 
+from skyvern import analytics
 from skyvern.config import CodeBlockMode, settings
 from skyvern.constants import CUSTOMER_STORAGE_UPLOAD_MAX_BYTES, SKYVERN_ID_ATTR
 from skyvern.core.script_generations.fuzzy_matcher import match_option_exact_or_stem_with_tier
@@ -61,7 +62,7 @@ from skyvern.forge.sdk.schemas.credentials import (
     NonEmptyPasswordCredential,
     SecretCredential,
 )
-from skyvern.forge.sdk.schemas.feedback import FeedbackEvent
+from skyvern.forge.sdk.schemas.feedback import AgentFeedback, FeedbackEvent
 from skyvern.forge.sdk.schemas.files import FileInfo
 from skyvern.forge.sdk.schemas.organizations import Organization
 from skyvern.forge.sdk.schemas.tasks import Task, TaskRequest, TaskStatus
@@ -83,7 +84,7 @@ from skyvern.forge.sdk.trace import traced
 from skyvern.forge.sdk.workflow.models.block import BaseTaskBlock, BlockTypeVar
 from skyvern.forge.sdk.workflow.retry_policy import WORKFLOW_WEBHOOK_HTTP_TIMEOUT_SECONDS
 from skyvern.schemas.run_enums import RunEngine, RunType
-from skyvern.schemas.workflows import BlockResult, FileStorageType, FileUploadDestination
+from skyvern.schemas.workflows import BlockResult, CodeBlockFailureKind, FileStorageType, FileUploadDestination
 from skyvern.services.otp_email import EmailOTPSearchError, EmailOTPVerificationContext, build_email_otp_sources
 from skyvern.services.workflow_run_group_service import schedule_advance_after_terminal
 from skyvern.utils.email_validation import normalize_identifier_if_email
@@ -115,6 +116,7 @@ if TYPE_CHECKING:
     from skyvern.forge.sdk.workflow.models.tags import CallerType
     from skyvern.forge.sdk.workflow.models.workflow import Workflow, WorkflowRun, WorkflowRunStatus
     from skyvern.forge.taskv3.answer_basis_audit import AnswerBasisAudit
+    from skyvern.forge.taskv3.intercepted_submission import InterceptedSubmission
     from skyvern.forge.taskv3.loop import ToolSpec
     from skyvern.forge.taskv3.tools import PageProvider
     from skyvern.schemas.workflows import WorkflowStatus
@@ -137,6 +139,7 @@ class AuditEvent:
     related_resource_ids: tuple[str, ...] = ()
     auth_kind: str | None = None
     oauth_client_id: str | None = None
+    app_role: str | None = None
 
 
 async def record_request_audit_event(
@@ -315,6 +318,8 @@ class CodeBlockEngineFailure:
     # Bare native worker exception class for operation attribution, so secure events are comparable
     # to inline ones; distinct from the healing-facing exception_class above.
     native_exception_class: str | None = None
+    # Decided by the executor from the runner's typed code, so it survives when redaction empties the reason.
+    failure_kind: CodeBlockFailureKind | None = None
 
 
 DownloadClaimOutcome = Literal["returned_proven", "returned_unproven", "raised"]
@@ -987,6 +992,9 @@ OnePasswordTelemetryErrorClass = Literal["invalid_token", "rate_limited", "timeo
 
 
 class AgentFunction:
+    def should_log_request_bodies(self, organization_id: str) -> bool:
+        return True
+
     async def accessible_workflow_folder_ids(self, principal: RequestPrincipal | None) -> set[str] | None:
         """Return visible folder IDs for Cloud request lists; OSS keeps organization-wide visibility."""
         return None
@@ -1030,6 +1038,18 @@ class AgentFunction:
     ) -> None:
         """Cloud raises 403 when a workflow folder denies the action; OSS has no folder ACLs."""
         return None
+
+    async def enforce_workflow_delete(
+        self, principal: RequestPrincipal | None, workflow_permanent_id: str, organization_id: str
+    ) -> tuple[str, str | None] | None:
+        """Cloud enforces RBAC and folder permissions for workflow deletion; OSS has no RBAC policy."""
+        return None
+
+    async def enforce_workflow_deletes(
+        self, principal: RequestPrincipal | None, workflow_permanent_ids: set[str], organization_id: str
+    ) -> None:
+        for workflow_permanent_id in workflow_permanent_ids:
+            await self.enforce_workflow_delete(principal, workflow_permanent_id, organization_id)
 
     async def enforce_folder_access_for_references(
         self, principal: RequestPrincipal | None, action: str, payload: Mapping[str, object]
@@ -1159,6 +1179,15 @@ class AgentFunction:
     async def resolve_billing_tier(self, organization_id: str | None) -> BillingTier:
         return BillingTier.UNKNOWN
 
+    # Whether the error code v3's model chose on finish is stored in place of the post-run page guess. The model is
+    # offered the codes either way; cloud gates this per organization.
+    async def task_v3_error_code_on_finish(self, *, organization_id: str) -> bool:
+        return settings.TASK_V3_ERROR_CODE_ON_FINISH
+
+    # Whether a v3 run holds its first terminated verdict once for what prevents the task. Read once per run.
+    async def task_v3_justify_hold_enabled(self, *, task_id: str | None, organization_id: str | None) -> bool:
+        return not settings.DISABLE_TASK_V3_JUSTIFY_HOLD
+
     # (text appended to a page-aware v3 run's task message or None, reason logged on the loop-finished line), given
     # the run's payload. OSS supplies no default.
     def task_v3_age_default(self, parameters: dict[str, Any] | None) -> tuple[str | None, str] | None:
@@ -1168,8 +1197,13 @@ class AgentFunction:
     def task_v3_application_defaults(self, parameters: dict[str, Any] | None) -> tuple[str | None, str] | None:
         return None
 
+    # The submissions a page-level interceptor in this process held for the browser context, oldest first. Must stay a
+    # local read with no page or CDP call: the finish tool reads it on every non-completed verdict. OSS has none.
+    def task_v3_intercepted_submissions(self, browser_context: Any) -> tuple[InterceptedSubmission, ...]:
+        return ()
+
     # An audit of the answers a run entered, consulted before the form moves on, or None (OSS: none).
-    def task_v3_answer_basis_audit(
+    async def task_v3_answer_basis_audit(
         self, parameters: dict[str, Any] | None, *, goal: str, organization_id: str | None, step: Step | None
     ) -> AnswerBasisAudit | None:
         return None
@@ -1845,6 +1879,9 @@ class AgentFunction:
 
     async def setup_browser_context_extensions(self, browser_context: Any, **kwargs: Any) -> None:
         """Attach cloud-only listeners/route handlers to a fresh BrowserContext. OSS no-op."""
+
+    def is_residential_browser_egress(self, browser_context: BrowserContext) -> bool:
+        return False
 
     async def on_browser_context_acquired(
         self,
@@ -3386,3 +3423,20 @@ class AgentFunction:
     # cloud overrides to fan the event out (Slack, product analytics).
     async def on_feedback_submitted(self, *, organization: Organization, event: FeedbackEvent) -> None:
         return None
+
+    async def on_agent_feedback_submitted(
+        self, *, organization: Organization, feedback: AgentFeedback, redacted: bool
+    ) -> None:
+        analytics.capture(
+            "mcp_agent_feedback_submitted",
+            data={
+                "agent_feedback_id": feedback.agent_feedback_id,
+                "category": feedback.category,
+                "severity": feedback.severity or "unspecified",
+                "has_tool_name": bool(feedback.tool_name),
+                "has_details": bool(feedback.details),
+                "redacted": redacted,
+            },
+            api_key=settings.MCP_POSTHOG_PROJECT_API_KEY,
+            host=settings.MCP_POSTHOG_PROJECT_HOST,
+        )

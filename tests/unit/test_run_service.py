@@ -1,6 +1,6 @@
 import asyncio
-import gc
 from datetime import UTC, datetime
+from types import SimpleNamespace
 from typing import Any
 from unittest.mock import AsyncMock
 
@@ -11,6 +11,7 @@ from skyvern.constants import SKYVERN_UI_USER_AGENT
 from skyvern.exceptions import SkyvernHTTPException, WorkflowNotFoundForWorkflowRun, WorkflowRunNotFound
 from skyvern.forge.sdk.routes import agent_protocol
 from skyvern.forge.sdk.schemas.organizations import Organization
+from skyvern.forge.sdk.schemas.tasks import TaskBase, TaskResponse, TaskStatus
 from skyvern.forge.sdk.workflow.models.workflow import (
     Workflow,
     WorkflowDefinition,
@@ -18,7 +19,7 @@ from skyvern.forge.sdk.workflow.models.workflow import (
     WorkflowRunStatus,
     WorkflowStatus,
 )
-from skyvern.schemas.runs import RunResponse, RunStatus, RunType, WorkflowRunResponse
+from skyvern.schemas.runs import RunResponse, RunStatus, RunType, TaskRunResponse, WorkflowRunResponse
 from skyvern.services import run_service
 
 OWNER_ORG = "o_owner"
@@ -155,28 +156,6 @@ async def test_cancelled_waiter_does_not_cancel_the_shared_build(build: _GatedBu
     assert run_service._IN_FLIGHT == {}
 
 
-def test_failed_build_whose_waiters_all_left_is_not_reported_as_unretrieved(build: _GatedBuild) -> None:
-    reported: list[str] = []
-
-    async def every_waiter_leaves_then_the_build_fails() -> None:
-        asyncio.get_running_loop().set_exception_handler(lambda _loop, context: reported.append(context["message"]))
-        build.error = RuntimeError("db down")
-        polls = [asyncio.create_task(_get()) for _ in range(3)]
-        await _settle()
-        for poll in polls:
-            poll.cancel()
-        await asyncio.gather(*polls, return_exceptions=True)
-        build.release.set()
-        await _settle()
-
-    # asyncio reports an unretrieved exception when the task is finalized, so the loop must be gone first.
-    asyncio.run(every_waiter_leaves_then_the_build_fails())
-    gc.collect()
-
-    assert reported == []
-    assert run_service._IN_FLIGHT == {}
-
-
 @pytest.mark.asyncio
 async def test_completed_build_is_not_reused_by_the_next_poll(build: _GatedBuild) -> None:
     build.release.set()
@@ -202,6 +181,52 @@ async def test_poll_after_build_finishes_but_before_cleanup_rebuilds(build: _Gat
 
     assert len(build.calls) == 2
     assert run_service._IN_FLIGHT == {}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("navigation_goal", "data_extraction_goal", "expected_prompt"),
+    [
+        ("book the cheapest flight", None, "book the cheapest flight"),
+        (None, "extract the quote price", "extract the quote price"),
+        (None, None, ""),
+    ],
+)
+async def test_task_run_response_builds_when_the_task_has_no_navigation_goal(
+    monkeypatch: pytest.MonkeyPatch,
+    navigation_goal: str | None,
+    data_extraction_goal: str | None,
+    expected_prompt: str,
+) -> None:
+    """POST /api/v1/tasks accepts an extraction-only task, so every reader of that run must still build."""
+    now = datetime.now(UTC)
+    task_response = TaskResponse(
+        request=TaskBase(
+            url="https://example.test",
+            navigation_goal=navigation_goal,
+            data_extraction_goal=data_extraction_goal,
+        ),
+        task_id="tsk_1",
+        status=TaskStatus.completed,
+        created_at=now,
+        modified_at=now,
+    )
+    monkeypatch.setattr(
+        run_service.app,
+        "DATABASE",
+        SimpleNamespace(
+            tasks=SimpleNamespace(
+                get_run=AsyncMock(return_value=SimpleNamespace(run_id="tsk_1", task_run_type=RunType.task_v1))
+            )
+        ),
+    )
+    monkeypatch.setattr(run_service.task_v1_service, "get_task_v1_response", AsyncMock(return_value=task_response))
+
+    run_response = await run_service.get_run_response("tsk_1", organization_id=OWNER_ORG)
+
+    assert isinstance(run_response, TaskRunResponse)
+    assert run_response.run_request is not None
+    assert run_response.run_request.prompt == expected_prompt
 
 
 WORKFLOW_ID = "wpid_1"

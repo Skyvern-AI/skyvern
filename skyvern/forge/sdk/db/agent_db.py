@@ -24,6 +24,7 @@ except ImportError:  # opentelemetry-api ships with the server extra only
 from skyvern.config import settings
 from skyvern.forge.sdk.db.base_alchemy_db import BaseAlchemyDB
 from skyvern.forge.sdk.db.exceptions import ScheduleLimitExceededError, is_connection_failure  # noqa: F401
+from skyvern.forge.sdk.db.repositories.agent_feedback import AgentFeedbackRepository
 from skyvern.forge.sdk.db.repositories.artifacts import ArtifactsRepository
 from skyvern.forge.sdk.db.repositories.browser_recordings import BrowserRecordingsRepository
 from skyvern.forge.sdk.db.repositories.browser_sessions import BrowserSessionsRepository
@@ -429,6 +430,7 @@ class AgentDB(BaseAlchemyDB):
         self.browser_recordings = BrowserRecordingsRepository(self.Session, debug_enabled, self.is_retryable_error)
         self.uploaded_files = UploadedFilesRepository(self.Session, debug_enabled, self.is_retryable_error)
         self.run_feedback = RunFeedbackRepository(self.Session, debug_enabled, self.is_retryable_error)
+        self.agent_feedback = AgentFeedbackRepository(self.Session, debug_enabled, self.is_retryable_error)
         self.google_oauth = GoogleOAuthRepository(self.Session, debug_enabled, self.is_retryable_error)
         self.microsoft_oauth = MicrosoftOAuthRepository(self.Session, debug_enabled, self.is_retryable_error)
         self.schedules = SchedulesRepository(

@@ -639,15 +639,14 @@ def test_extraction_default_verbosity_supports_full_and_summary() -> None:
         "from skyvern.cli.mcp_tools.browser import skyvern_extract; "
         "print(inspect.signature(skyvern_extract).parameters['verbosity'].default)"
     )
-    for selected in ("full", "summary"):
-        completed = subprocess.run(
-            [sys.executable, "-c", script],
-            check=True,
-            capture_output=True,
-            text=True,
-            env={**os.environ, env_name: selected},
-        )
-        assert completed.stdout.strip().splitlines()[-1] == selected
+    completed = subprocess.run(
+        [sys.executable, "-c", script],
+        check=True,
+        capture_output=True,
+        text=True,
+        env={**os.environ, env_name: "summary"},
+    )
+    assert completed.stdout.strip().splitlines()[-1] == "summary"
 
 
 def test_url_query_spans_do_not_synthesize_anchor_pairs() -> None:

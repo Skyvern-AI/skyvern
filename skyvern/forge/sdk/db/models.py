@@ -28,6 +28,7 @@ from skyvern.forge.sdk.db.datetime_utils import naive_utc_now
 from skyvern.forge.sdk.db.enums import TaskType
 from skyvern.forge.sdk.db.id import (
     generate_action_id,
+    generate_agent_feedback_id,
     generate_ai_suggestion_id,
     generate_artifact_id,
     generate_aws_secret_parameter_id,
@@ -2009,6 +2010,8 @@ class CredentialModel(Base):
     proxy_session_id = Column(String, nullable=True)
     folder_id = Column(String, ForeignKey("credential_folders.folder_id", ondelete="SET NULL"), nullable=True)
     created_by = Column(String, nullable=True)
+    is_test_login_temporary = Column(Boolean, nullable=True)
+    is_passkey_setup_pending = Column(Boolean, nullable=True)
 
     created_at = Column(DateTime, default=datetime.datetime.utcnow, nullable=False)
     modified_at = Column(DateTime, default=datetime.datetime.utcnow, onupdate=datetime.datetime.utcnow, nullable=False)
@@ -2581,3 +2584,18 @@ class RunFeedbackModel(Base):
         onupdate=datetime.datetime.utcnow,
         nullable=False,
     )
+
+
+class AgentFeedbackModel(Base):
+    __tablename__ = "agent_feedback"
+    __table_args__ = (Index("ix_agent_feedback_org_created_at", "organization_id", "created_at"),)
+
+    agent_feedback_id = Column(String, primary_key=True, default=generate_agent_feedback_id)
+    organization_id = Column(String, ForeignKey("organizations.organization_id"), nullable=False)
+    category = Column(String, nullable=False)
+    severity = Column(String, nullable=True)
+    summary = Column(UnicodeText, nullable=False)
+    details = Column(UnicodeText, nullable=True)
+    tool_name = Column(String, nullable=True)
+    context = Column(JSON, nullable=True)
+    created_at = Column(DateTime, default=datetime.datetime.utcnow, nullable=False)

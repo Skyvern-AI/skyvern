@@ -42,6 +42,7 @@ from skyvern.exceptions import (
     ScreenshotTargetClosed,
 )
 from skyvern.forge.agent import ForgeAgent
+from skyvern.forge.sdk.artifact.models import ArtifactType
 from skyvern.forge.sdk.core import skyvern_context
 from skyvern.forge.sdk.core.skyvern_context import SkyvernContext
 from skyvern.forge.sdk.models import StepStatus
@@ -600,6 +601,49 @@ class TestCleanUpTaskTargetClosed:
             "Failed to take screenshot before sending task response" in str(call.args[0])
             for call in log.exception.call_args_list
         )
+
+
+class TestCleanUpTaskWorkflowRunBrowser:
+    @pytest.mark.asyncio
+    async def test_browser_registered_under_run_id_only_gets_final_screenshot_and_settle(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # Task V3 workflow blocks never alias pages[task_id]; cleanup must still find the run's browser.
+        now = datetime.now(UTC)
+        organization = make_organization(now)
+        task = make_task(now, organization, workflow_run_id="wr-cleanup")
+        step = make_step(now, task, step_id="step-cleanup", status=StepStatus.completed, order=0, output=None)
+
+        browser_state, _, page = make_browser_state()
+        browser_state.get_working_page = AsyncMock(return_value=page)
+        browser_state.take_fullpage_screenshot = AsyncMock(return_value=b"png")
+        manager = RealBrowserManager()
+        manager.pages["wr-cleanup"] = browser_state
+
+        app_mock = MagicMock()
+        app_mock.DATABASE.tasks.get_task = AsyncMock(return_value=task)
+        app_mock.BROWSER_MANAGER = manager
+        app_mock.ARTIFACT_MANAGER.create_artifact = AsyncMock()
+        monkeypatch.setattr(agent_mod, "app", app_mock)
+        monkeypatch.setattr(agent_mod.analytics, "capture", MagicMock())
+        settled_contexts: list[object] = []
+
+        @asynccontextmanager
+        async def recording_settle(browser_context: object, *args: Any, **kwargs: Any) -> AsyncIterator[None]:
+            settled_contexts.append(browser_context)
+            yield
+
+        monkeypatch.setattr(agent_mod, "settle_browser_downloads_for_context", recording_settle)
+        skyvern_context.set(SkyvernContext(task_id=task.task_id, organization_id=task.organization_id))
+
+        await ForgeAgent().clean_up_task(task=task, last_step=step)
+
+        artifact_types = [
+            call.kwargs["artifact_type"] for call in app_mock.ARTIFACT_MANAGER.create_artifact.call_args_list
+        ]
+        assert ArtifactType.SCREENSHOT_FINAL in artifact_types
+        assert settled_contexts == [browser_state.browser_context]
+        assert task.task_id not in manager.pages
 
 
 class TestHandleActionTargetClosed:

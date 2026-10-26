@@ -345,12 +345,19 @@ async def test_list_credentials_exact_mode_accepts_typed_resume_reference() -> N
     assert [item.credential_id for item in policy.resolved_credentials] == ["cred_one"]
 
 
+def _database_without_vault(credentials: SimpleNamespace) -> SimpleNamespace:
+    return SimpleNamespace(
+        credentials=credentials,
+        organizations=SimpleNamespace(get_valid_org_auth_token=AsyncMock(return_value=None)),
+    )
+
+
 @pytest.mark.asyncio
 async def test_list_credentials_discovery_does_not_grant_authority(monkeypatch: pytest.MonkeyPatch) -> None:
     policy = RequestPolicy()
     ctx = SimpleNamespace(organization_id="org-1", user_message="List credentials", request_policy=policy)
     credential = _cred("saved-login", "cred_one")
-    database = SimpleNamespace(credentials=SimpleNamespace(get_credentials=AsyncMock(return_value=[credential])))
+    database = _database_without_vault(SimpleNamespace(get_credentials=AsyncMock(return_value=[credential])))
 
     monkeypatch.setattr(object.__getattribute__(app, "_inst"), "DATABASE", database, raising=False)
     result = await _list_credentials({"page": 1, "page_size": 10}, ctx)
@@ -391,7 +398,7 @@ async def test_list_credentials_exact_result_includes_tested_url() -> None:
 async def test_list_credentials_page_includes_null_tested_url(monkeypatch: pytest.MonkeyPatch) -> None:
     credential = _cred("Saved Login", "cred_saved_login")
     get_credentials = AsyncMock(return_value=[credential])
-    database = SimpleNamespace(credentials=SimpleNamespace(get_credentials=get_credentials))
+    database = _database_without_vault(SimpleNamespace(get_credentials=get_credentials))
     policy = RequestPolicy(canonical_user_message="List my credentials")
 
     monkeypatch.setattr(object.__getattribute__(app, "_inst"), "DATABASE", database, raising=False)
@@ -416,7 +423,7 @@ async def test_list_credentials_normalizes_pagination(
     expected_page_size: int,
 ) -> None:
     get_credentials = AsyncMock(return_value=[])
-    database = SimpleNamespace(credentials=SimpleNamespace(get_credentials=get_credentials))
+    database = _database_without_vault(SimpleNamespace(get_credentials=get_credentials))
     policy = RequestPolicy(canonical_user_message="List my credentials")
 
     monkeypatch.setattr(object.__getattribute__(app, "_inst"), "DATABASE", database, raising=False)
@@ -437,7 +444,7 @@ async def test_list_credentials_normalizes_pagination(
 async def test_list_credentials_nonempty_full_page_reports_more_results(monkeypatch: pytest.MonkeyPatch) -> None:
     credential = _cred("Saved Login", "cred_saved_login")
     get_credentials = AsyncMock(return_value=[credential])
-    database = SimpleNamespace(credentials=SimpleNamespace(get_credentials=get_credentials))
+    database = _database_without_vault(SimpleNamespace(get_credentials=get_credentials))
     policy = RequestPolicy(canonical_user_message="List my credentials")
 
     monkeypatch.setattr(object.__getattribute__(app, "_inst"), "DATABASE", database, raising=False)

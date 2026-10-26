@@ -317,12 +317,38 @@ class InvalidOpenAIResponseFormat(SkyvernException):
 
 
 class PhoneNumberInputMismatch(SkyvernException):
-    def __init__(self, *, expected_digit_count: int, actual_digit_count: int):
+    def __init__(self, *, expected_digit_count: int, actual_digit_count: int, message: str | None = None):
         self.expected_digit_count = expected_digit_count
         self.actual_digit_count = actual_digit_count
         super().__init__(
-            "Phone input read-back mismatch: "
-            f"expected {expected_digit_count} digits, found {actual_digit_count} digits."
+            message
+            or (
+                "Phone input read-back mismatch: "
+                f"expected {expected_digit_count} digits, found {actual_digit_count} digits."
+            )
+        )
+
+
+class PhoneNumberInputCountryCodeMismatch(PhoneNumberInputMismatch):
+    def __init__(self, *, expected_digit_count: int, actual_digit_count: int):
+        message = (
+            (
+                f"Phone input reads its value as an international number but holds {actual_digit_count} digits "
+                f"instead of the {expected_digit_count} entered, so its country calling code is gone and the "
+                "number now reads as another country. Enter the whole number, country calling code included, "
+                "into this field."
+            )
+            if actual_digit_count != expected_digit_count
+            else (
+                f"Phone input put a '+' in front of the {actual_digit_count} digits entered, so their leading "
+                "digits now read as a country calling code. Enter the number together with its country calling "
+                "code from the task data; do not guess one."
+            )
+        )
+        super().__init__(
+            expected_digit_count=expected_digit_count,
+            actual_digit_count=actual_digit_count,
+            message=message,
         )
 
 
@@ -549,6 +575,9 @@ def _browser_state_diagnostic_suffix(
     if failure_reason:
         suffix += f" failure_reason={failure_reason}."
     return suffix
+
+
+BROWSER_CONNECTION_LOST_ERROR_CODE = "browser_connection_lost"
 
 
 class MissingBrowserState(SkyvernException):
@@ -1186,6 +1215,10 @@ class BitwardenLoginError(BitwardenBaseError):
         super().__init__(f"Error logging in to Bitwarden: {message}")
 
 
+class BitwardenCredentialsRejectedError(BitwardenLoginError):
+    pass
+
+
 class BitwardenUnlockError(BitwardenBaseError):
     def __init__(self, message: str) -> None:
         super().__init__(f"Error unlocking Bitwarden: {message}")
@@ -1661,6 +1694,20 @@ class InputToReadonlyElement(SkyvernException):
     def __init__(self, element_id: str):
         super().__init__(
             f"The element(id={element_id}) now is readonly. Try to interact with other elements, or try to interact with it later when it's not readonly."
+        )
+
+
+class ScrollMadeNoProgress(SkyvernException):
+    def __init__(self, element_id: str, direction: str, boundary: str | None = None):
+        reason = (
+            f" because the content is already scrolled to the {boundary}"
+            if boundary
+            else " and the content did not move"
+        )
+        super().__init__(
+            f"Scrolling {direction} from element(id={element_id}) revealed no new content{reason}. "
+            "Repeating this scroll will not change the page: work with the content already visible, "
+            "scroll the other direction, or interact with a different element."
         )
 
 

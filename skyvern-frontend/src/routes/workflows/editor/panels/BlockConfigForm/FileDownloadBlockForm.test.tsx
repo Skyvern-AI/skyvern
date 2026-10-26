@@ -72,6 +72,8 @@ vi.mock("@/components/WorkflowBlockInputTextarea", () => ({
     onChange: (value: string) => void;
     placeholder?: string;
     aiImprove?: { useCase?: string };
+    name?: string;
+    "aria-required"?: boolean;
   }) => {
     // The useCase string is `workflow_editor.<block>.<field>` so we can
     // route assertions for AI-improved fields by field. For non-AI fields
@@ -81,6 +83,8 @@ vi.mock("@/components/WorkflowBlockInputTextarea", () => ({
     return (
       <textarea
         data-testid={testId}
+        name={props.name}
+        aria-required={props["aria-required"]}
         value={props.value}
         onChange={(event) => props.onChange(event.target.value)}
       />
@@ -384,6 +388,20 @@ describe("FileDownloadBlockForm (SKY-9361)", () => {
         "Nothing runs before this block, so it needs a URL to start from.",
       ),
     ).toBeDefined();
+
+    cleanup();
+    setFileDownloadNode("d4", {
+      downloadTarget: "sftp",
+      url: "",
+      sftpSourcePath: "/reports/report.csv",
+    });
+    render(<FileDownloadBlockForm blockId="d4" />);
+
+    expect(
+      screen.queryByText(
+        "Nothing runs before this block, so it needs a URL to start from.",
+      ),
+    ).toBeNull();
   });
 
   test("classifies predecessors by whether they reach BaseTaskBlock.execute", () => {
@@ -476,9 +494,70 @@ describe("FileDownloadBlockForm (SKY-9361)", () => {
     render(<FileDownloadBlockForm blockId="d1" />);
 
     expect(screen.getByText("SFTP Host")).toBeDefined();
+    expect(screen.getByText("(Optional) Host Key")).toBeDefined();
+    expect(screen.getByText("(Optional) Remote Directory")).toBeDefined();
+    expect(
+      document
+        .querySelector('[name="sftpHostKey"]')
+        ?.getAttribute("aria-required"),
+    ).toBe("false");
     expect(
       screen.queryByText("Google Drive Source Account (Optional)"),
     ).toBeNull();
+  });
+
+  test("offers SFTP source fields and requires its host key", () => {
+    setFileDownloadNode("d1", {
+      downloadTarget: "website",
+      sftpSourcePath: "/reports/report.csv",
+    });
+    render(<FileDownloadBlockForm blockId="d1" />);
+
+    expect(screen.getByText("SFTP Host (Source)")).toBeDefined();
+    expect(screen.getByText("SFTP Source Path")).toBeDefined();
+    expect(
+      screen.getByText("Host Key (Required for SFTP source)"),
+    ).toBeDefined();
+    expect(screen.queryByText("Download Goal")).toBeNull();
+    expect(screen.queryByText("Download Timeout (sec)")).toBeNull();
+    expect(
+      document
+        .querySelector('[name="sftpHostKey"]')
+        ?.getAttribute("aria-required"),
+    ).toBe("true");
+    expect(screen.queryByText("(Optional) Remote Directory")).toBeNull();
+  });
+
+  test("hides the Drive source account when an SFTP path is set", () => {
+    setFileDownloadNode("d1", {
+      downloadTarget: "sftp",
+      url: "https://drive.google.com/file/d/example/view",
+      googleCredentialId: "goac-existing",
+      sftpSourcePath: "/reports/report.csv",
+    });
+    render(<FileDownloadBlockForm blockId="d1" />);
+
+    expect(
+      screen.queryByText("Google Drive Source Account (Optional)"),
+    ).toBeNull();
+    expect(
+      document
+        .querySelector('[name="sftpHostKey"]')
+        ?.getAttribute("aria-required"),
+    ).toBe("true");
+  });
+
+  test("edits the SFTP source path", () => {
+    setFileDownloadNode("d1");
+    render(<FileDownloadBlockForm blockId="d1" />);
+
+    fireEvent.change(screen.getByTestId("wbi-ph-/path/to/file"), {
+      target: { value: "/reports/report.csv" },
+    });
+
+    expect(updateNodeData).toHaveBeenCalledWith("d1", {
+      sftpSourcePath: "/reports/report.csv",
+    });
   });
 
   test("offers the Google Drive source account for an SFTP block whose URL is a Drive link", () => {

@@ -25,14 +25,14 @@ type Props = {
   required?: boolean;
 };
 
-const FILE_SIZE_LIMIT_IN_BYTES = 10 * 1024 * 1024; // 10 MB
+const FILE_SIZE_LIMIT_IN_BYTES = 30 * 1024 * 1024; // 30 MB
 
 function showFileSizeError() {
   toast({
     variant: "destructive",
     title: "File size limit exceeded",
     description:
-      "The file you are trying to upload exceeds the 10MB limit, please try again with a different file",
+      "The file you are trying to upload exceeds the 30MB limit, please try again with a different file",
   });
 }
 
@@ -175,7 +175,7 @@ function FileUpload({ value, onChange, required }: Props) {
               <span>
                 {file
                   ? file.name
-                  : "Drag and drop file here or click to select (Max 10MB)"}
+                  : "Drag and drop file here or click to select (Max 30MB)"}
               </span>
             </div>
           </Label>

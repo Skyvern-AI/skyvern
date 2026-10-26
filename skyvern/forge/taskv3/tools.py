@@ -51,7 +51,6 @@ from skyvern.forge.sdk.services.credentials import (
     is_unresolved_totp_placeholder,
 )
 from skyvern.forge.sdk.workflow.models.credential_release import (
-    ArmedSecret,
     CredentialReleaseGuard,
     release_target_url,
 )
@@ -94,6 +93,7 @@ from skyvern.forge.taskv3.loop import (
     REF_SELECTOR_RE,
     TARGET_KIND_DATA_KEY,
     TARGET_LABEL_DATA_KEY,
+    TARGET_LABEL_IS_PLACEHOLDER_DATA_KEY,
     CoveredBranch,
     CoveredLayerKind,
     DownloadFailureFacts,
@@ -128,7 +128,14 @@ from skyvern.webeye.action_deadline import cancellable_driver_call
 from skyvern.webeye.actions.key_names import normalize_key_chord
 from skyvern.webeye.browser_driver_errors import is_driver_error, is_driver_timeout_error
 from skyvern.webeye.browser_state import BLANK_PAGE_URLS, is_selectable_page_url
-from skyvern.webeye.cdp_download_interceptor import download_tally_for_context
+from skyvern.webeye.cdp_download_interceptor import (
+    begin_replay_candidate_hold,
+    download_tally_for_context,
+    replay_candidates_for_context,
+    resolve_replay_candidates_for_context,
+    set_replay_candidate_mode_for_context,
+)
+from skyvern.webeye.native_downloads import NativeDownloadAttempt
 from skyvern.webeye.navigation import driver_nav_error_code, record_task_nav_error_code, redact_url_secrets
 from skyvern.webeye.utils.challenge_signature import CHALLENGE_VENDOR_FRAME_URL, CHALLENGE_VENDOR_SIGNATURE
 from skyvern.webeye.utils.flutter_semantics import (
@@ -176,8 +183,8 @@ _OBSERVE_DESCRIPTION_BASE = (
     "Snapshot the page's visible interactive elements (raw DOM) with a handle, label, type, value, and "
     "options for each. Each element line starts with its address, `ref=N`; pass that exact string (e.g. "
     "ref=12, no brackets) as the selector argument of click/hover/type/select_option/etc to act on it. A "
-    "ref names the element this reading described and keeps working while that element is on the page, "
-    "including across a re-render that replaces it. If it becomes ambiguous or is gone, the tool errors "
+    "ref names the element this reading described and keeps working while that element is on the page. "
+    "If it becomes ambiguous or is gone, the tool errors "
     "instead of acting on something else — re-observe and use a ref from the new reading. "
 )
 _OBSERVE_DESCRIPTION_FRAME_REACH = (
@@ -1436,6 +1443,24 @@ OBSERVE_POINTER_ROOT_CAP = 40
 # do not count toward it.
 _POINTER_ROOT_SCAN_CEILING = 400
 
+# A color paints nothing only when its ALPHA is zero. Parse the alpha channel, never a trailing ",0)",
+# which also matches an opaque color whose last channel is 0 (`rgb(0,0,0)`, `rgb(255,0,0)`). A form that
+# cannot be parsed is treated as paint, so the failure mode is under-suppression, not over.
+_OPAQUE_PAINT_JS = r"""(color) => {
+  const c = (color || '').replace(/\s+/g, '').toLowerCase();
+  if (!c || c === 'transparent') return false;
+  const hex = c.match(/^#([\da-f]+)$/);
+  if (hex && (hex[1].length === 4 || hex[1].length === 8)) {
+    return parseInt(hex[1].slice(-1 * (hex[1].length === 4 ? 1 : 2)), 16) !== 0;
+  }
+  const m = c.match(/^(?:rgba?|hsla?)\((.*)\)$/);
+  if (!m) return true;
+  const parts = m[1].split(',');
+  const alpha = m[1].includes('/') ? parseFloat(m[1].slice(m[1].lastIndexOf('/') + 1))
+    : parts.length >= 4 ? parseFloat(parts[parts.length - 1]) : 1;
+  return !(alpha === 0);
+}"""
+
 # v1's off-canvas test (isElementVisible, domUtils.js): a box whose horizontal centre sits left of the
 # page is off screen, unless a horizontally scrolled overflow ancestor explains it.
 _OFF_CANVAS_JS = r"""(el, r) => {
@@ -1461,6 +1486,117 @@ _OFF_CANVAS_JS = r"""(el, r) => {
 # not a root when the reading already covers it: it is or is inside a control `listable` keeps, or its
 # pointer parent is itself a root or covered. One that holds such a control is a holder: at most one
 # named, control-free pointer descendant is listed for it, recorded in `state.held`.
+_SCROLL_GEOMETRY_JS = r"""
+  const flowNegative = (cs) => {
+    const wm = cs.writingMode || 'horizontal-tb';
+    const rtl = cs.direction === 'rtl';
+    const vertical = wm.indexOf('horizontal') !== 0;
+    // `sideways-lr` is the one vertical mode whose inline axis runs bottom-to-top.
+    const inlineSign = vertical ? ((wm === 'sideways-lr') !== rtl ? -1 : 1) : (rtl ? -1 : 1);
+    const blockSign = vertical ? (/-rl$/.test(wm) ? -1 : 1) : 1;
+    const inlineIsX = !vertical;
+    let xSign = inlineIsX ? inlineSign : blockSign;
+    let ySign = inlineIsX ? blockSign : inlineSign;
+    const display = cs.display || '';
+    if (display === 'flex' || display === 'inline-flex') {
+      // A flex container lays content out along main/cross, not inline/block: `*-reverse` flips the
+      // main axis and `wrap-reverse` flips the cross axis.
+      const fd = cs.flexDirection || 'row';
+      const mainIsInline = fd.indexOf('row') === 0;
+      const mainSign = (mainIsInline ? inlineSign : blockSign) * (/-reverse$/.test(fd) ? -1 : 1);
+      const crossSign =
+        (mainIsInline ? blockSign : inlineSign) * (cs.flexWrap === 'wrap-reverse' ? -1 : 1);
+      const mainIsX = mainIsInline === inlineIsX;
+      xSign = mainIsX ? mainSign : crossSign;
+      ySign = mainIsX ? crossSign : mainSign;
+    }
+    return { x: xSign < 0, y: ySign < 0 };
+  };
+  // PER AXIS, the scale the ancestry applies to this container -- or `null` where the box ratio
+  // cannot express it. Rects are transformed viewport pixels; scroll offsets and computed lengths
+  // stay untransformed CSS units, and the conversion between them is only sound where the mapping
+  // is a positive, axis-aligned scale that actually changes scale. Each of the four answers this
+  // rules out is a way the ratio does harm rather than good:
+  //   scale 1        -- the two spaces COINCIDE, so the ratio carries only `offsetHeight`'s integer
+  //                     rounding: an untransformed 30.5px scroller reports 31, and that 1.6% names
+  //                     a collapsed panel for a control Playwright clicks. Composed, not remembered
+  //                     as a flag, because an outer `scale(2)` under an inner `scale(.5)` cancels.
+  //   per axis       -- a `scaleX(2)` ancestor leaves the VERTICAL spaces coinciding, so a shared
+  //                     answer would feed that same rounding into `scaleY`.
+  //   not axis-aligned -- under a rotation, a skew or a perspective the rect is an axis-aligned
+  //                     BOUND of the box, not a scaled copy: a 2deg tilt on a 600px strip reads
+  //                     1.52 at scale 1, which shrinks the distance asked for below a scroll-back
+  //                     that cannot reach the control.
+  //   reflected      -- `rect.width / offsetWidth` is unsigned, so a mirrored mapping would convert
+  //                     by the magnitude while the scroll that recovers the point runs the other
+  //                     way. `flowNegative` reverses flow, not geometry; nothing reverses this.
+  // Every `null` falls back to comparing the two spaces unconverted, which is what this branch did
+  // before the conversion existed -- a no-change, never a new guess.
+  const axisAligned = (m) =>
+    m.m12 === 0 && m.m13 === 0 && m.m14 === 0
+    && m.m21 === 0 && m.m23 === 0 && m.m24 === 0
+    && m.m31 === 0 && m.m32 === 0 && m.m34 === 0;
+  // An explicit `rotate: 0deg` is an identity an author writes to give a later transition something
+  // to animate from; excluded by the string alone it would disable the conversion for the whole
+  // chain.
+  const zeroAngle = (v) => {
+    const m = /(-?[0-9.]+)(deg|grad|rad|turn)\s*$/.exec(v || '');
+    return !!m && parseFloat(m[1]) === 0;
+  };
+  const flowScale = (start) => {
+    const none = { x: null, y: null };
+    const svgNs = 'http://www.w3.org/2000/svg';
+    let sx = 1, sy = 1;
+    for (
+      let p = start, hops = 0;
+      p && p !== document && hops < 60;
+      hops++, p = p.assignedSlot || p.parentNode || p.host || null
+    ) {
+      if (p.nodeType !== 1) continue;
+      // From a foreignObject up, the browser composes the whole mapping itself -- viewBox,
+      // `preserveAspectRatio`, nested viewports, `<g>` transforms and every CSS transform and `zoom`
+      // above the `<svg>` -- against the RENDERED viewport, which the `width` attribute is not once CSS
+      // sizes the `<svg>`. `getScreenCTM` is that whole product, so it ends the walk.
+      if (p.namespaceURI === svgNs && p.localName === 'foreignObject') {
+        let c;
+        try { c = p.getScreenCTM(); } catch (e) { return none; }
+        if (!c || c.b !== 0 || c.c !== 0) return none;
+        sx *= c.a;
+        sy *= c.d;
+        break;
+      }
+      let ps;
+      try { ps = getComputedStyle(p); } catch (e) { return none; }
+      // `zoom` DOES apply on inline and `display: contents` boxes, so it is read before the skip.
+      const z = parseFloat(ps.zoom);
+      if (Number.isFinite(z) && z > 0) { sx *= z; sy *= z; }
+      // A boxless element is not in the mapping, yet Chromium still reports its `rotate`/`scale` (a
+      // `display: contents` wrapper's `rotate: 45deg` would refuse a control under a real `scale(2)`).
+      // Inline `<svg>`/`<g>` transforms DO apply, hence the namespace.
+      if (ps.display === 'contents' || (ps.display === 'inline' && p.namespaceURI !== svgNs)) continue;
+      if (ps.rotate && ps.rotate !== 'none' && !zeroAngle(ps.rotate)) return none;
+      if (ps.scale && ps.scale !== 'none') {
+        const parts = String(ps.scale).trim().split(/\s+/).map((v) => parseFloat(v));
+        if (!parts.length || parts.some((v) => !Number.isFinite(v))) return none;
+        sx *= parts[0];
+        sy *= parts.length > 1 ? parts[1] : parts[0];
+      }
+      if (ps.transform && ps.transform !== 'none') {
+        let m;
+        try { m = new DOMMatrix(ps.transform); } catch (e) { return none; }
+        if (!axisAligned(m)) return none;
+        // A homogeneous matrix scales by `m11 / m44`: `matrix3d(1,0,0,0, 0,1,0,0, 0,0,1,0, 0,0,0,.5)`
+        // doubles everything while its `m11` reads 1.
+        if (!(m.m44 > 0)) return none;
+        sx *= m.m11 / m.m44;
+        sy *= m.m22 / m.m44;
+      }
+    }
+    const usable = (v) => (v > 0 && Math.abs(v - 1) > 1e-9 ? v : null);
+    return { x: usable(sx), y: usable(sy) };
+  };
+"""
+
 _WITH_POINTER_ROOTS_JS = (
     r"""(root, q, semantic, state, emit, listable) => {
   // A linked list, not an array: a page that poisons Array.prototype.push or its index setters
@@ -1472,31 +1608,651 @@ _WITH_POINTER_ROOTS_JS = (
     return d && d.get ? d.get : function () { return this[name]; };
   };
   const parentOf = getter(Node.prototype, 'parentElement');
+  const nodeTypeOf = getter(Node.prototype, 'nodeType');
   const localNameOf = getter(Element.prototype, 'localName');
   const innerTextOf = getter(HTMLElement.prototype, 'innerText');
   const textContentOf = getter(Node.prototype, 'textContent');
+  const createTreeWalker = Document.prototype.createTreeWalker;
   const textOf = (el) => { try { return String(innerTextOf.call(el) || '').trim(); } catch (e) { return ''; } };
+"""
+    + _SCROLL_GEOMETRY_JS
+    + r"""
+  let cursorRules = null;
+  let cursorRuleOrder = 0;
+  const splitSelectors = (selector) => {
+    const parts = [];
+    let start = 0, parens = 0, brackets = 0, quote = '', escaped = false;
+    for (let i = 0; i < selector.length; i++) {
+      const c = selector[i];
+      if (escaped) { escaped = false; continue; }
+      if (c === '\\') { escaped = true; continue; }
+      if (quote) { if (c === quote) quote = ''; continue; }
+      if (c === '"' || c === "'") { quote = c; continue; }
+      if (c === '(') parens++;
+      else if (c === ')') parens--;
+      else if (c === '[') brackets++;
+      else if (c === ']') brackets--;
+      else if (c === ',' && !parens && !brackets) { parts.push(selector.slice(start, i).trim()); start = i + 1; }
+    }
+    parts.push(selector.slice(start).trim());
+    return parts.filter(Boolean);
+  };
+  const selectorSpecificity = (selector) => {
+    let ids = 0, classes = 0, elements = 0, compoundStart = true;
+    const skipName = (text, start) => {
+      let i = start;
+      while (i < text.length) {
+        if (text[i] === '\\') {
+          i++;
+          if (/[\da-f]/i.test(text[i] || '')) {
+            for (let digits = 0; digits < 6 && /[\da-f]/i.test(text[i] || ''); digits++) i++;
+            if (/\s/.test(text[i] || '')) i++;
+          } else i++;
+        } else if (/[-_\da-z]/i.test(text[i]) || text.charCodeAt(i) >= 128) i++;
+        else break;
+      }
+      return i;
+    };
+    const matchingParen = (text, start) => {
+      let depth = 0, quote = '', escaped = false;
+      for (let i = start; i < text.length; i++) {
+        const c = text[i];
+        if (escaped) { escaped = false; continue; }
+        if (c === '\\') { escaped = true; continue; }
+        if (quote) { if (c === quote) quote = ''; continue; }
+        if (c === '"' || c === "'") { quote = c; continue; }
+        if (c === '(') depth++;
+        else if (c === ')' && --depth === 0) return i;
+      }
+      return text.length;
+    };
+    const addMax = (text) => {
+      let best = null;
+      for (const part of splitSelectors(text)) {
+        const candidate = selectorSpecificity(part);
+        if (!best || candidate[0] > best[0]
+            || (candidate[0] === best[0] && candidate[1] > best[1])
+            || (candidate[0] === best[0] && candidate[1] === best[1] && candidate[2] > best[2])) best = candidate;
+      }
+      if (best) { ids += best[0]; classes += best[1]; elements += best[2]; }
+    };
+    for (let i = 0; i < selector.length;) {
+      const c = selector[i];
+      if (/\s/.test(c) || c === '>' || c === '+' || c === '~') { compoundStart = true; i++; continue; }
+      if (c === '#') { ids++; i = skipName(selector, i + 1); compoundStart = false; continue; }
+      if (c === '.') { classes++; i = skipName(selector, i + 1); compoundStart = false; continue; }
+      if (c === '[') {
+        classes++;
+        let end = i + 1, quote = '', escaped = false;
+        for (; end < selector.length; end++) {
+          const ch = selector[end];
+          if (escaped) { escaped = false; continue; }
+          if (ch === '\\') { escaped = true; continue; }
+          if (quote) { if (ch === quote) quote = ''; continue; }
+          if (ch === '"' || ch === "'") quote = ch;
+          else if (ch === ']') break;
+        }
+        i = end + 1; compoundStart = false; continue;
+      }
+      if (c === ':') {
+        const pseudoElement = selector[i + 1] === ':';
+        const nameStart = i + (pseudoElement ? 2 : 1);
+        const nameEnd = skipName(selector, nameStart);
+        const name = selector.slice(nameStart, nameEnd).toLowerCase();
+        let end = nameEnd, args = '';
+        if (selector[end] === '(') {
+          const close = matchingParen(selector, end);
+          args = selector.slice(end + 1, close);
+          end = close + 1;
+        }
+        if (name === 'is' || name === 'not' || name === 'has' || name === 'host' || name === 'host-context') {
+          if (args) addMax(args);
+          if (name === 'host' || name === 'host-context') classes++;
+        } else if (name === 'nth-child' || name === 'nth-last-child') {
+          classes++;
+          const of = args.match(/\bof\s+(.+)$/i);
+          if (of) addMax(of[1]);
+        } else if (name !== 'where') {
+          if (pseudoElement || ['before', 'after', 'first-line', 'first-letter'].includes(name)) elements++;
+          else classes++;
+          if (pseudoElement && name === 'slotted' && args) addMax(args);
+        }
+        i = end; compoundStart = false; continue;
+      }
+      if (c === '|' && selector[i + 1] === '|') { i += 2; compoundStart = true; continue; }
+      if (c === '*' || c === '|') {
+        if (compoundStart && c === '*' && selector[i + 1] === '|') {
+          i += 2;
+          if (selector[i] === '*') i++;
+          else { i = skipName(selector, i); elements++; }
+        } else if (compoundStart && c === '|' && selector[i + 1] !== '|') {
+          i++;
+          if (selector[i] === '*') i++;
+          else { i = skipName(selector, i); elements++; }
+        } else i++;
+        compoundStart = false; continue;
+      }
+      if (c === '\\' || /[-_a-z]/i.test(c) || selector.charCodeAt(i) >= 128) {
+        const end = skipName(selector, i);
+        if (compoundStart) {
+          if (selector[end] === '|' && selector[end + 1] !== '|') {
+            i = end + 1;
+            if (selector[i] === '*') i++;
+            else { i = skipName(selector, i); elements++; }
+          } else { elements++; i = end; }
+        } else i = end;
+        compoundStart = false; continue;
+      }
+      if (c === '(') i = matchingParen(selector, i) + 1;
+      else i++;
+    }
+    return [ids, classes, elements];
+  };
+  const compareSpecificity = (a, b) => {
+    for (let i = 0; i < a.length; i++) if (a[i] !== b[i]) return a[i] - b[i];
+    return 0;
+  };
+  const directPointerCache = new WeakMap();
+  const ownPointerCursor = (el) => {
+    if (!isPointer(el)) return false;
+    const cached = directPointerCache.get(el);
+    if (cached !== undefined) return cached;
+    let direct = false;
+    try {
+      if (cursorRules === null) {
+        cursorRules = [];
+        let scanned = 0;
+        const collect = (rules, parentSelector = '', uncertainLayerContext = false, uncertainScopeContext = false) => {
+          for (const rule of rules) {
+            // shortcut: stop after 2048 rules; raise the cap if larger stylesheets hide row actions.
+            if (++scanned > 2048) break;
+            try {
+              if (rule.media && rule.media.mediaText && !matchMedia(rule.media.mediaText).matches) continue;
+              if (typeof CSSSupportsRule !== 'undefined' && rule instanceof CSSSupportsRule
+                  && !CSS.supports(rule.conditionText)) continue;
+              // shortcut: skip container-query cursor provenance until its condition can be matched per candidate.
+              if (typeof CSSContainerRule !== 'undefined' && rule instanceof CSSContainerRule) continue;
+              const layerContext = uncertainLayerContext
+                || (typeof CSSLayerBlockRule !== 'undefined' && rule instanceof CSSLayerBlockRule)
+                || (typeof CSSImportRule !== 'undefined' && rule instanceof CSSImportRule
+                    && rule.layerName !== undefined && rule.layerName !== null);
+              const scopeContext = uncertainScopeContext
+                || (typeof CSSScopeRule !== 'undefined' && rule instanceof CSSScopeRule)
+                || /^@scope\b/i.test(rule.cssText || '') && !rule.selectorText;
+              const uncertainContext = layerContext || scopeContext;
+              const selector = rule.selectorText
+                ? parentSelector
+                  ? splitSelectors(rule.selectorText).map((part) => part.includes('&')
+                    ? part.replaceAll('&', `:is(${parentSelector})`)
+                    : `:is(${parentSelector}) ${part}`).join(', ')
+                  : rule.selectorText
+                : parentSelector;
+              if (rule.style && selector) {
+                const cursor = rule.style.getPropertyValue('cursor').trim();
+                if (cursor) {
+                  const order = cursorRuleOrder++;
+                  for (const part of splitSelectors(selector)) {
+                    cursorRules.push({
+                      selector: part,
+                      cursor,
+                      important: rule.style.getPropertyPriority('cursor') === 'important',
+                      specificity: [0, ...selectorSpecificity(part)],
+                      order,
+                      uncertainContext,
+                      uncertainLayerContext: layerContext,
+                    });
+                  }
+                }
+              }
+              if (typeof CSSImportRule !== 'undefined' && rule instanceof CSSImportRule) {
+                collect(rule.styleSheet.cssRules, '', layerContext, scopeContext);
+              }
+              if (rule.cssRules) {
+                collect(rule.cssRules, rule.selectorText ? selector : parentSelector, layerContext, scopeContext);
+              }
+            } catch (e) { /* inaccessible or invalid rules cannot establish an independent target */ }
+          }
+        };
+        let sheets = [];
+        try { sheets = Array.from(root.styleSheets || []); } catch (e) {}
+        try { sheets.push(...(root.adoptedStyleSheets || [])); } catch (e) {}
+        if (root.nodeType === 11) {
+          try {
+            for (const node of root.querySelectorAll('style,link[rel~="stylesheet"]')) {
+              if (node.sheet) sheets.push(node.sheet);
+            }
+          } catch (e) {}
+        }
+        for (const sheet of sheets) {
+          try { if (!sheet.disabled) collect(sheet.cssRules); } catch (e) { /* cross-origin stylesheet */ }
+        }
+      }
+      const wins = (candidate, current) => {
+        if (!current) return true;
+        if (candidate.important !== current.important) return candidate.important;
+        const specificity = compareSpecificity(candidate.specificity, current.specificity);
+        return specificity ? specificity > 0 : candidate.order > current.order;
+      };
+      // shortcut: matched @layer/@scope rules fail closed unless the inline declaration provably outranks them.
+      // Only the cascade winner establishes independent cursor styling; a losing pointer rule is not provenance.
+      let winner = null;
+      let unknownContext = false, unknownImportant = false, unknownLayerImportant = false;
+      const consider = (candidate) => { if (wins(candidate, winner)) winner = candidate; };
+      for (const rule of cursorRules) {
+        try {
+          if (matches.call(el, rule.selector)) {
+            if (rule.uncertainContext) {
+              unknownContext = true;
+              unknownImportant ||= rule.important;
+              unknownLayerImportant ||= rule.uncertainLayerContext && rule.important;
+            }
+            else consider(rule);
+          }
+        } catch (e) { /* unsupported selector */ }
+      }
+      const inline = el.style && el.style.getPropertyValue('cursor').trim();
+      const inlineCandidate = inline ? {
+        cursor: inline,
+        important: el.style.getPropertyPriority('cursor') === 'important',
+        specificity: [1, 0, 0, 0],
+        order: cursorRuleOrder,
+      } : null;
+      if (inlineCandidate) consider(inlineCandidate);
+      // Inline author styling beats uncertain normal rules; an uncertain !important rule may still win.
+      if (unknownContext && (!inlineCandidate || winner !== inlineCandidate
+          || (unknownImportant && !inlineCandidate.important)
+          || (unknownLayerImportant && inlineCandidate.important))) {
+        directPointerCache.set(el, false);
+        return false;
+      }
+      if (winner && !/^(inherit|initial|unset|revert(?:-layer)?)$/i.test(winner.cursor)) {
+        direct = true;
+      }
+    } catch (e) { direct = false; }
+    directPointerCache.set(el, direct);
+    return direct;
+  };
   // An unnamed root drawing exactly one rendered graphic is an icon control, listed unnamed like an unnamed <button>,
   // up to the scan ceiling. A wrapper drawing two (copy and trash) is not one control: a click lands between them.
-  const drawsOneGraphic = (el) => {
-    const graphic = 'svg,img,canvas,[role="img" i]';
-    if (matches.call(el, graphic)) return true;
-    const checkVisibility = Element.prototype.checkVisibility;
-    let drawn = 0;
-    const found = qsa.call(el, graphic);
-    for (const g of found) {
-      if (checkVisibility && !checkVisibility.call(g, { opacityProperty: true, visibilityProperty: true })) continue;
-      // An icon font's <span role="img"><svg> is one graphic: one nested in another counts with it.
-      const outer = closest.call(parentOf.call(g), graphic);
-      if (outer && Array.prototype.indexOf.call(found, outer) >= 0) continue;
-      if (++drawn > 1) return false;
+  const GRAPHIC_SELECTOR = 'svg,img,canvas,[role="img" i]';
+  const graphicCounts = new WeakMap();
+  const drawsOneGraphic = (el) => matches.call(el, GRAPHIC_SELECTOR) || graphicCounts.get(el) === 1;
+  // The closed paint-channel invariant is: a glyph-sized root has ink via background color/image, border, outline,
+  // box-shadow, text glyphs, generated ::before/::after content, or replaced content (SVG/image/canvas/role=img).
+  // Two conditions are needed: a glyph-sized box, since a bigger region's centre may miss its control, and visible
+  // paint on one of those channels, since an empty box is only a bare hit-target.
+  const ICON_BOX_MAX = 48, ICON_BOX_MIN = 6;
+  const opaquePaint = """
+    + _OPAQUE_PAINT_JS
+    + r""";
+  const visibleStyle = (cs) => cs && cs.display !== 'none' && cs.visibility === 'visible' && Number(cs.opacity) > 0;
+  const zeroOpacityFilter = (filter) => {
+    for (const match of String(filter || '').matchAll(/opacity\(\s*([^)]+?)\s*\)/gi)) {
+      if (Number(match[1].trim().replace(/%$/, '')) === 0) return true;
     }
-    return drawn === 1;
+    return false;
+  };
+  const visibleElement = (el) => {
+    try {
+      for (let current = el; current; current = flatParent(current)) {
+        if (nodeTypeOf.call(current) === 1 && zeroOpacityFilter(getComputedStyle(current).filter)) return false;
+      }
+      const cs = getComputedStyle(el);
+      const check = Element.prototype.checkVisibility;
+      return visibleStyle(cs)
+        && (!check || check.call(el, { opacityProperty: true, visibilityProperty: true, contentVisibilityAuto: true }));
+    } catch (e) { return false; }
+  };
+  const imagePaints = (image) => {
+    if (!image || image === 'none') return false;
+    const gradient = /gradient\(/i.test(image);
+    const colors = image.match(/url\([^)]*\)|(?:rgba?|hsla?)\([^)]*\)|#[\da-f]{3,8}\b|\btransparent\b/gi) || [];
+    for (const color of colors) {
+      if (/^url\(/i.test(color) || opaquePaint(color)) return true;
+    }
+    return !gradient;
+  };
+  const shadowPaints = (shadow) => {
+    if (!shadow || shadow === 'none') return false;
+    const colors = shadow.match(/(?:rgba?|hsla?)\([^)]*\)|#[\da-f]{3,8}\b|\btransparent\b/gi) || [];
+    if (colors.length && !colors.some(opaquePaint)) return false;
+    const lengths = shadow.replace(/(?:rgba?|hsla?)\([^)]*\)/gi, '').match(/-?(?:\d+\.?\d*|\.\d+)px/g) || [];
+    return lengths.some((length) => parseFloat(length) !== 0);
+  };
+  const textShadowPaints = (shadow) => {
+    if (!shadow || shadow === 'none') return false;
+    const colors = shadow.match(/(?:rgba?|hsla?)\([^)]*\)|#[\da-f]{3,8}\b|\btransparent\b/gi) || [];
+    return colors.some(opaquePaint);
+  };
+  const inked = (el, cs, pseudo = false) => {
+    if (!cs) return false;
+    for (const mask of [cs.maskImage, cs.webkitMaskImage]) {
+      if (mask && mask !== 'none' && !imagePaints(mask)) return false;
+    }
+    if (imagePaints(cs.backgroundImage)) return true;
+    if (textOf(el) && (opaquePaint(cs.webkitTextFillColor || cs.color) || textShadowPaints(cs.textShadow))) return true;
+    if (shadowPaints(cs.boxShadow) || (pseudo && glyphContent(cs.content) && textShadowPaints(cs.textShadow))) return true;
+    if (opaquePaint(cs.backgroundColor)) return true;
+    for (const side of ['Top', 'Right', 'Bottom', 'Left']) {
+      const style = cs['border' + side + 'Style'];
+      if (style !== 'none' && style !== 'hidden' && parseFloat(cs['border' + side + 'Width'] || '0') > 0
+          && opaquePaint(cs['border' + side + 'Color'])) return true;
+    }
+    if (cs.outlineStyle !== 'none' && cs.outlineStyle !== 'hidden' && parseFloat(cs.outlineWidth || '0') > 0
+        && opaquePaint(cs.outlineColor)) return true;
+    return false;
+  };
+  const glyphContent = (c) => !!c && c !== 'none' && c !== 'normal' && !/^(['"])\s*\1$/.test(c);
+  const generatedContent = (c) => !!c && c !== 'none' && c !== 'normal';
+  const clipHides = (target, cs, pseudo = false) => {
+    const clip = cs.clipPath || '';
+    const rect = bcr.call(target);
+    const extent = (axis, fallback, sides) => {
+      if (!pseudo) return fallback;
+      const size = parseFloat(cs[axis]);
+      if (!Number.isFinite(size)) return fallback;
+      if (cs.boxSizing === 'border-box') return size;
+      return size + sides.reduce((sum, side) => sum + parseFloat(cs[side] || '0'), 0);
+    };
+    const width = extent('width', rect.width, ['paddingLeft', 'paddingRight', 'borderLeftWidth', 'borderRightWidth']);
+    const height = extent('height', rect.height, ['paddingTop', 'paddingBottom', 'borderTopWidth', 'borderBottomWidth']);
+    const inset = clip.match(/^inset\(([^)]+)\)/i);
+    if (inset) {
+      const edges = inset[1].split(/\s+round\s+/i)[0].trim().split(/\s+/);
+      const [top, right = top, bottom = top, left = right] = edges;
+      const px = (value, size) => value.endsWith('%') ? parseFloat(value) * size / 100
+        : value.endsWith('px') ? parseFloat(value) : 0;
+      return px(top, height) + px(bottom, height) >= height
+        || px(right, width) + px(left, width) >= width;
+    }
+    const zero = (value) => /^[-+]?0(?:\.0*)?(?:px|%)?$/i.test(value);
+    const circle = clip.match(/^circle\(\s*([^\s)]+)/i);
+    if (circle && zero(circle[1])) return true;
+    const ellipse = clip.match(/^ellipse\(\s*([^\s)]+)\s+([^\s)]+)/i);
+    if (ellipse && (zero(ellipse[1]) || zero(ellipse[2]))) return true;
+    const polygon = clip.match(/^polygon\((.*)\)$/i);
+    if (polygon) {
+      const points = polygon[1].replace(/^\s*(?:evenodd|nonzero)\s*,/i, '').split(',').map((point) => {
+        const coords = point.trim().split(/\s+/);
+        if (coords.length !== 2) return null;
+        const length = (value, size) => {
+          const m = value.match(/^([-+]?(?:\d+\.?\d*|\.\d+))(px|%)?$/i);
+          if (!m || (!m[2] && Number(m[1]) !== 0)) return null;
+          return Number(m[1]) * (m[2] === '%' ? size / 100 : 1);
+        };
+        const x = length(coords[0], width), y = length(coords[1], height);
+        return x === null || y === null ? null : [x, y];
+      });
+      if (points.length >= 3 && points.every(Boolean)) {
+        const first = points[0];
+        const second = points.find((point) => point[0] !== first[0] || point[1] !== first[1]);
+        if (!second || points.every((point) => Math.abs((second[0] - first[0]) * (point[1] - first[1])
+          - (second[1] - first[1]) * (point[0] - first[0])) < 1e-7)) return true;
+      }
+    }
+    return false;
+  };
+  const clipContainsPoint = (el, cs, x, y) => {
+    const clip = String(cs.clipPath || '').trim();
+    if (!clip || clip === 'none') return true;
+    const shape = clip.match(/^(inset|circle|ellipse|polygon)\((.*)\)(?:\s+(.*))?$/i);
+    // shortcut: rounded insets, unsupported shapes/boxes, and transforms fail closed; extend if icon controls rely on them.
+    if (!shape || (shape[3] && shape[3].trim() !== 'border-box') || (cs.transform && cs.transform !== 'none')) return false;
+    const rect = bcr.call(el);
+    const length = (value, size) => {
+      const match = String(value).trim().match(/^([-+]?(?:\d+\.?\d*|\.\d+))(px|%)?$/i);
+      if (!match || (!match[2] && Number(match[1]) !== 0)) return null;
+      return Number(match[1]) * (match[2] === '%' ? size / 100 : 1);
+    };
+    if (/^inset$/i.test(shape[1])) {
+      if (/\s+round\s+/i.test(shape[2])) return false;
+      const edges = shape[2].trim().split(/\s+/);
+      if (edges.length > 4) return false;
+      const [top, right = top, bottom = top, left = right] = edges;
+      const t = length(top, rect.height), r = length(right, rect.width);
+      const b = length(bottom, rect.height), l = length(left, rect.width);
+      return t !== null && r !== null && b !== null && l !== null
+        && x >= rect.left + l && x <= rect.right - r && y >= rect.top + t && y <= rect.bottom - b;
+    }
+    if (/^polygon$/i.test(shape[1])) {
+      let body = shape[2].trim(), fill = 'nonzero';
+      const rule = body.match(/^(evenodd|nonzero)\s*,/i);
+      if (rule) { fill = rule[1].toLowerCase(); body = body.slice(rule[0].length); }
+      const points = body.split(',').map((point) => {
+        const coords = point.trim().split(/\s+/);
+        if (coords.length !== 2) return null;
+        const px = length(coords[0], rect.width), py = length(coords[1], rect.height);
+        return px === null || py === null ? null : [rect.left + px, rect.top + py];
+      });
+      if (points.length < 3 || points.some((point) => !point)) return false;
+      let crossings = 0, winding = 0;
+      for (let i = 0, j = points.length - 1; i < points.length; j = i++) {
+        const [xi, yi] = points[i], [xj, yj] = points[j];
+        if ((yi > y) !== (yj > y)) {
+          const crossingX = xi + (y - yi) * (xj - xi) / (yj - yi);
+          if (x < crossingX) crossings++;
+        }
+        const side = (xj - xi) * (y - yi) - (x - xi) * (yj - yi);
+        if (yi <= y && yj > y && side > 0) winding++;
+        else if (yi > y && yj <= y && side < 0) winding--;
+      }
+      return fill === 'evenodd' ? crossings % 2 === 1 : winding !== 0;
+    }
+    const parts = shape[2].trim().split(/\s+at\s+/i);
+    const radiusText = parts[0].trim() || 'closest-side';
+    const position = parts[1] ? parts[1].trim().split(/\s+/) : ['50%', '50%'];
+    if (position.length === 1) {
+      if (/^(top|bottom)$/i.test(position[0])) position.unshift('50%');
+      else position.push('50%');
+    }
+    if (position.length !== 2) return false;
+    if (/^(top|bottom)$/i.test(position[0]) && /^(left|right)$/i.test(position[1])) position.reverse();
+    const coordinate = (value, start, size) => {
+      if (/^(center)$/i.test(value)) return start + size / 2;
+      if (/^(left|top)$/i.test(value)) return start;
+      if (/^(right|bottom)$/i.test(value)) return start + size;
+      const offset = length(value, size);
+      return offset === null ? null : start + offset;
+    };
+    const cx = coordinate(position[0], rect.left, rect.width);
+    const cy = coordinate(position[1], rect.top, rect.height);
+    if (cx === null || cy === null) return false;
+    const radius = (value, size, axis) => {
+      if (value === 'closest-side') return Math.min(axis === 'x' ? cx - rect.left : cy - rect.top,
+        axis === 'x' ? rect.right - cx : rect.bottom - cy);
+      if (value === 'farthest-side') return Math.max(axis === 'x' ? cx - rect.left : cy - rect.top,
+        axis === 'x' ? rect.right - cx : rect.bottom - cy);
+      if (value === 'closest-corner' || value === 'farthest-corner') {
+        if (axis !== 'circle') return null;
+        const corners = [[rect.left, rect.top], [rect.right, rect.top], [rect.left, rect.bottom], [rect.right, rect.bottom]];
+        const distances = corners.map(([px, py]) => Math.hypot(px - cx, py - cy));
+        return value === 'closest-corner' ? Math.min(...distances) : Math.max(...distances);
+      }
+      if (axis === 'circle') {
+        const match = String(value).match(/^([-+]?(?:\d+\.?\d*|\.\d+))(px|%)?$/i);
+        if (!match || (!match[2] && Number(match[1]) !== 0)) return null;
+        return Number(match[1]) * (match[2] === '%' ? Math.hypot(rect.width, rect.height) / Math.SQRT2 / 100 : 1);
+      }
+      return length(value, size);
+    };
+    let rx, ry;
+    if (/^circle$/i.test(shape[1])) {
+      rx = ry = radius(radiusText, rect.width, 'circle');
+    } else {
+      const radii = radiusText.split(/\s+/);
+      if (radii.length > 2) return false;
+      rx = radius(radii[0] || 'closest-side', rect.width, 'x');
+      ry = radius(radii[1] || radii[0] || 'closest-side', rect.height, 'y');
+    }
+    return rx !== null && ry !== null && rx > 0 && ry > 0
+      && ((x - cx) / rx) ** 2 + ((y - cy) / ry) ** 2 <= 1;
+  };
+  const clipHidesBox = (el, cs = getComputedStyle(el), pseudo = false) => {
+    const rect = bcr.call(el), x = rect.left + rect.width / 2, y = rect.top + rect.height / 2;
+    if (!clipContainsPoint(el, cs, x, y) || clipHides(el, cs, pseudo)) return true;
+    // A pseudo-element is clipped by its originating element as well as by its own clip path.
+    if (pseudo) {
+      const own = getComputedStyle(el);
+      if (!clipContainsPoint(el, own, x, y) || clipHides(el, own)) return true;
+    }
+    // Ancestor clip paths constrain descendant ink at the same centre point the click targets.
+    for (let ancestor = flatParent(el), i = 0; ancestor && i < 64; ancestor = flatParent(ancestor), i++) {
+      if (nodeTypeOf.call(ancestor) === 1) {
+        const ancestorStyle = getComputedStyle(ancestor);
+        if (!clipContainsPoint(ancestor, ancestorStyle, x, y) || clipHides(ancestor, ancestorStyle)) return true;
+        const clipX = ancestorStyle.overflowX === 'hidden' || ancestorStyle.overflowX === 'clip';
+        const clipY = ancestorStyle.overflowY === 'hidden' || ancestorStyle.overflowY === 'clip';
+        if (clipX || clipY) {
+          const bounds = bcr.call(ancestor), width = (v) => parseFloat(v) || 0;
+          const clipAxisX = ancestorStyle.overflowX === 'clip';
+          const clipAxisY = ancestorStyle.overflowY === 'clip';
+          const marginText = clipAxisX || clipAxisY ? ancestorStyle.overflowClipMargin || '' : '';
+          const marginMatch = marginText.match(/(\d+(?:\.\d+)?)px/);
+          const margin = marginMatch ? parseFloat(marginMatch[1]) : 0;
+          const toBorderBox = marginText.includes('border-box');
+          const toContentBox = marginText.includes('content-box');
+          const inset = (isClip, border, padding) => !isClip ? width(border)
+            : toBorderBox ? 0 : width(border) + (toContentBox ? width(padding) : 0);
+          const left = bounds.left + inset(clipAxisX, ancestorStyle.borderLeftWidth, ancestorStyle.paddingLeft)
+            - (clipAxisX ? margin : 0);
+          const right = bounds.right - inset(clipAxisX, ancestorStyle.borderRightWidth, ancestorStyle.paddingRight)
+            + (clipAxisX ? margin : 0);
+          const top = bounds.top + inset(clipAxisY, ancestorStyle.borderTopWidth, ancestorStyle.paddingTop)
+            - (clipAxisY ? margin : 0);
+          const bottom = bounds.bottom - inset(clipAxisY, ancestorStyle.borderBottomWidth, ancestorStyle.paddingBottom)
+            + (clipAxisY ? margin : 0);
+          const outsideX = clipX && (x < left || x >= right);
+          const outsideY = clipY && (y < top || y >= bottom);
+          if (outsideX || outsideY) {
+            // `hidden` can recover a clipped target by scrolling; `clip` cannot. Preserve only points
+            // the remaining scroll range can actually bring inside, not merely any overflowing box.
+            let flow = null, scale = null;
+            const canScroll = (axis, before, distance) => {
+              const isX = axis === 'x';
+              if (ancestorStyle[isX ? 'overflowX' : 'overflowY'] !== 'hidden') return false;
+              const client = ancestor[isX ? 'clientWidth' : 'clientHeight'];
+              if (!client) return false;
+              if (!flow) flow = flowNegative(ancestorStyle);
+              if (!scale) scale = flowScale(ancestor);
+              const span = Math.max(0, ancestor[isX ? 'scrollWidth' : 'scrollHeight'] - client);
+              const inverted = flow[axis];
+              const min = inverted ? -span : 0, max = inverted ? 0 : span;
+              const offset = ancestor[isX ? 'scrollLeft' : 'scrollTop'];
+              const available = before ? offset - min : max - offset;
+              return before ? available >= distance / (scale[axis] || 1)
+                : available > distance / (scale[axis] || 1);
+            };
+            if ((outsideX && !canScroll('x', x < left, x < left ? left - x : x - right))
+                || (outsideY && !canScroll('y', y < top, y < top ? top - y : y - bottom))) return true;
+          }
+        }
+      }
+    }
+    return false;
+  };
+  const pseudoHasArea = (cs) => {
+    const dimension = (axis, sides) => {
+      const value = parseFloat(cs[axis]);
+      if (!Number.isFinite(value)) return null;
+      return cs.boxSizing === 'border-box' ? value
+        : value + sides.reduce((sum, side) => sum + (parseFloat(cs[side]) || 0), 0);
+    };
+    const width = dimension('width', ['paddingLeft', 'paddingRight', 'borderLeftWidth', 'borderRightWidth']);
+    const height = dimension('height', ['paddingTop', 'paddingBottom', 'borderTopWidth', 'borderBottomWidth']);
+    return (width === null || width > 0) && (height === null || height > 0);
+  };
+  const paintsPseudo = (el, pseudo) => {
+    const cs = getComputedStyle(el, pseudo);
+    if (!visibleElement(el) || clipHidesBox(el, cs, true) || !visibleStyle(cs) || zeroOpacityFilter(cs.filter)
+        || !generatedContent(cs.content) || (!glyphContent(cs.content) && !pseudoHasArea(cs))) return false;
+    if (inked(el, cs, true)) return true;
+    return glyphContent(cs.content) && (/^url\(/i.test(cs.content) || opaquePaint(cs.webkitTextFillColor || cs.color));
+  };
+  const paintCache = new WeakMap();
+  const ownPaint = (el) => {
+    const cached = paintCache.get(el);
+    if (cached !== undefined) return cached;
+    const paint = { visible: false, ink: false };
+    try {
+      paint.visible = visibleElement(el) && !clipHidesBox(el);
+      if (paint.visible) {
+        paint.ink = inked(el, getComputedStyle(el));
+        for (const pseudo of ['::before', '::after']) if (!paint.ink && paintsPseudo(el, pseudo)) paint.ink = true;
+      }
+    } catch (e) {}
+    paintCache.set(el, paint);
+    return paint;
+  };
+  const inkCache = new WeakMap();
+  const paintsInk = (el) => {
+    const cached = inkCache.get(el);
+    if (cached !== undefined) return cached;
+    let ink = false;
+    try {
+      const own = ownPaint(el);
+      if (!own.visible) {
+        inkCache.set(el, false);
+        return false;
+      }
+      ink = own.ink;
+      // The glyph is often painted by a child (three dot <span>s, a styled bar). Bounded: an icon's
+      // subtree is tiny, and the scan already walks up to 400 elements.
+      if (!ink) {
+        const rootRect = bcr.call(el);
+        for (const kid of firstDescendants(el, 32)) {
+          const rect = bcr.call(kid);
+          if (!(rect.width > 0 && rect.height > 0) || rect.right <= rootRect.left || rect.left >= rootRect.right
+              || rect.bottom <= rootRect.top || rect.top >= rootRect.bottom) continue;
+          const childPaint = ownPaint(kid);
+          if (childPaint.visible && childPaint.ink) { ink = true; break; }
+        }
+      }
+    } catch (e) { ink = false; }
+    inkCache.set(el, ink);
+    return ink;
+  };
+  const hasSeveralPointerInkChildren = (el) => {
+    let found = 0;
+    for (const kid of firstDescendants(el, 32)) {
+      const r = bcr.call(kid);
+      if (r.width < ICON_BOX_MIN || r.height < ICON_BOX_MIN) continue;
+      if (ownPointerCursor(kid) && (drawsOneGraphic(kid) || paintsInk(kid)) && ++found > 1) return true;
+    }
+    return false;
+  };
+  const iconKind = (el, r) => {
+    if (graphicCounts.get(el) > 1) return 'multiple';
+    const graphic = drawsOneGraphic(el);
+    if (graphic && clipHidesBox(el)) return null;
+    const cssSized = r.width >= ICON_BOX_MIN && r.height >= ICON_BOX_MIN
+      && r.width <= ICON_BOX_MAX && r.height <= ICON_BOX_MAX;
+    const ink = cssSized && paintsInk(el);
+    if ((graphic || ink) && hasSeveralPointerInkChildren(el)) return 'multiple';
+    if (graphic) return 'graphic';
+    return ink ? 'css' : null;
   };
   const shadowRootOf = getter(Element.prototype, 'shadowRoot');
   const closest = Element.prototype.closest;
   const matches = Element.prototype.matches;
   const qsa = Element.prototype.querySelectorAll;
+  const firstElementChildOf = getter(Element.prototype, 'firstElementChild');
+  const nextElementSiblingOf = getter(Element.prototype, 'nextElementSibling');
+  const firstDescendants = (el, limit) => {
+    const found = [];
+    let child = firstElementChildOf.call(el);
+    while (child && found.length < limit) {
+      found.push(child);
+      const first = firstElementChildOf.call(child);
+      if (first) { child = first; continue; }
+      while (child && child !== el) {
+        const next = nextElementSiblingOf.call(child);
+        if (next) { child = next; break; }
+        child = parentOf.call(child);
+      }
+      if (child === el) child = null;
+    }
+    return found;
+  };
   const getAttr = Element.prototype.getAttribute;
   const bcr = Element.prototype.getBoundingClientRect;
   const follows = Node.prototype.compareDocumentPosition;
@@ -1539,6 +2295,7 @@ _WITH_POINTER_ROOTS_JS = (
   // A component's wrapper around slotted light-DOM content that is already listed, as a root (it
   // inherits the cursor through the flat tree, and its root was walked first) or as a control.
   const heldBySlot = (el) => {
+    if (!hasSlotDescendant.has(el)) return false;
     for (const slot of qsa.call(el, 'slot')) {
       for (const a of slot.assignedElements({ flatten: true })) {
         if (state.roots.has(a) || inListable(a) || anyListable(qsa.call(a, q))) return true;
@@ -1595,8 +2352,59 @@ _WITH_POINTER_ROOTS_JS = (
     const clip = (n) => !!n && /hidden|clip/.test(getComputedStyle(n).overflowX);
     return clip(document.documentElement) || clip(document.body) || scrollWidthOf.call(se) <= window.innerWidth;
   };
+  const countNotIcon = (el) => {
+    for (let a = flatParent(el), i = 0; a && i < 64 && isPointer(a); a = flatParent(a), i++) {
+      if (state.notIconRoots.has(a)) return;
+    }
+    state.notIconRoots.add(el);
+    state.notIcon++;
+  };
+  const hasSlotDescendant = new WeakSet();
+  const hasListableDescendant = new WeakSet();
+  const listableElements = new WeakSet();
+  const namedElements = new WeakSet();
+  const hasNamedDescendant = new WeakSet();
+  const hasTextDescendant = new WeakSet();
   let all = [];
   try { all = root.querySelectorAll('*'); } catch (e) { all = []; }
+  try {
+    for (const slot of root.querySelectorAll('slot')) {
+      for (let parent = parentOf.call(slot); parent; parent = parentOf.call(parent)) hasSlotDescendant.add(parent);
+    }
+    for (const control of root.querySelectorAll(q)) {
+      if (listable(control)) {
+        listableElements.add(control);
+      }
+    }
+    for (const named of root.querySelectorAll('[aria-label],[title]')) namedElements.add(named);
+    const walker = createTreeWalker.call(document, root, NodeFilter.SHOW_TEXT);
+    for (let text = walker.nextNode(); text; text = walker.nextNode()) {
+      const parent = parentOf.call(text);
+      if (parent && String(textContentOf.call(text) || '').trim()) hasTextDescendant.add(parent);
+    }
+    for (let i = all.length - 1; i >= 0; i--) {
+      const el = all[i];
+      const parent = parentOf.call(el);
+      if (parent) {
+        if (listableElements.has(el) || hasListableDescendant.has(el)) hasListableDescendant.add(parent);
+        if (namedElements.has(el) || hasNamedDescendant.has(el)) hasNamedDescendant.add(parent);
+        if (hasTextDescendant.has(el)) hasTextDescendant.add(parent);
+      }
+    }
+  } catch (e) {}
+  try {
+    const checkVisibility = Element.prototype.checkVisibility;
+    for (const graphic of root.querySelectorAll(GRAPHIC_SELECTOR)) {
+      if (checkVisibility && !checkVisibility.call(graphic, { opacityProperty: true, visibilityProperty: true })) continue;
+      let outerGraphic = null;
+      for (let parent = parentOf.call(graphic); parent; parent = parentOf.call(parent)) {
+        if (matches.call(parent, GRAPHIC_SELECTOR)) { outerGraphic = parent; break; }
+      }
+      for (let parent = parentOf.call(graphic); parent && parent !== outerGraphic; parent = parentOf.call(parent)) {
+        graphicCounts.set(parent, (graphicCounts.get(parent) || 0) + 1);
+      }
+    }
+  } catch (e) {}
   // A failure here costs the pointer roots only, never the semantic list merged below.
   try {
     for (const el of all) {
@@ -1613,7 +2421,7 @@ _WITH_POINTER_ROOTS_JS = (
         // A control the reading drops is not a root, but its pointer children may be.
         if (matches.call(el, q)) { if (listable(el)) state.covered.add(el); continue; }
         const sr = shadowRootOf.call(el);
-        const holds = anyListable(qsa.call(el, q));
+        const holds = hasListableDescendant.has(el);
         if (inListable(parentOf.call(el)) || (sr && sr.nodeType === 11 && (holds || anyListable(fragQsa.call(sr, q))))
           || heldBySlot(el)
           // A label bound to a control names that control, which is listed (or skinned) on its own.
@@ -1628,18 +2436,23 @@ _WITH_POINTER_ROOTS_JS = (
         }
         // An icon in a pointer card is its own control (the card's trash), not a stand-in for the card, so a card
         // already represented still lists it.
-        const iconInCard = holder !== null && drawsOneGraphic(el) && !textOf(el);
-        if (holder && !iconInCard && (state.represented.has(holder) || state.heldCount >= state.heldCap)) {
+        const r = bcr.call(el);
+        if (!(r.width > 0 && r.height > 0)) continue;
+        if (getComputedStyle(el).visibility !== 'visible' || offCanvas(el, r)) continue;
+        if (!painted(el, r) || offRight(el, r)) continue;
+        const kind = iconKind(el, r);
+        const directPointer = kind === 'graphic' || ownPointerCursor(el);
+        const iconInCard = holder !== null && (kind === 'graphic' || (kind === 'css' && directPointer)) && !textOf(el);
+        if (holder && kind !== 'multiple' && !iconInCard && (state.represented.has(holder) || state.heldCount >= state.heldCap)) {
           state.covered.add(el);
           continue;
         }
         // A decorative child (an icon font's ligature) does not name the row.
         if (holder && closest.call(el, '[aria-hidden="true"]')) continue;
-        const r = bcr.call(el);
-        if (!(r.width > 0 && r.height > 0)) continue;
-        if (getComputedStyle(el).visibility !== 'visible' || offCanvas(el, r)) continue;
         let name = '';
-        try { name = String(innerTextOf.call(el) || '').trim(); } catch (e) { name = ''; }
+        if (hasTextDescendant.has(el)) {
+          try { name = String(innerTextOf.call(el) || '').trim(); } catch (e) { name = ''; }
+        }
         if (!name) name = String(getAttr.call(el, 'aria-label') || getAttr.call(el, 'title') || '').trim();
         // innerText stops at a <slot>, so a component's wrapper is named by the rendered text slotted in.
         if (!name) {
@@ -1660,15 +2473,20 @@ _WITH_POINTER_ROOTS_JS = (
             if (name) break;
           }
         }
-        const icon = !name && state.iconCount < state.ceiling && drawsOneGraphic(el)
-          && !qsa.call(el, '[aria-label],[title]').length;
-        if (!name && !icon) continue;
+        const iconCandidate = !name && (kind === 'graphic' || (kind === 'css' && (holder === null || directPointer)))
+          && !hasNamedDescendant.has(el);
+        const icon = iconCandidate && state.iconCount < state.ceiling;
+        if (!name && kind === 'multiple') continue;
+        // shortcut: cross-origin CSSOM hides cursor provenance, relax with a safe action-vs-decoration signal.
+        if (!name && holder && kind === 'css' && !directPointer) continue;
+        if (!name && iconCandidate && !icon) { state.iconOverflow++; state.covered.add(el); continue; }
+        // Only a distinct unnamed pointer root is a miss; its inherited-cursor descendants are one region.
+        if (!name && !icon) { countNotIcon(el); continue; }
         // A named child of a card is the card's stand-in, not its icon, so it keeps the represented and cap rule.
         if (iconInCard && !icon && (state.represented.has(holder) || state.heldCount >= state.heldCap)) {
           state.covered.add(el);
           continue;
         }
-        if (!painted(el, r) || offRight(el, r)) continue;
         // An icon names itself through its graphic (an <img alt>, an <svg><title>). Read only as the icon's label:
         // as a name it would move the icon out of the icon budget and into the 40 slots named roots share.
         let graphicName = '';
@@ -4640,8 +5458,11 @@ _TARGET_NAME_JS = (
   // from one.
   const textEntry = editable || tag === 'TEXTAREA' || _matches(el, '[role=textbox],[role=searchbox]')
     || (tag === 'INPUT' && ['button', 'submit', 'reset', 'image', 'checkbox', 'radio', 'file', 'range'].indexOf(type) === -1);
-  const name = nrm(_attr(el, 'aria-label')) || labelled() || labelledBy() || contents || caption
-    || nrm(_attr(el, 'alt')) || nrm(_attr(el, 'placeholder')) || (textEntry ? '' : nrm(_attr(el, 'title')));
+  const named = nrm(_attr(el, 'aria-label')) || labelled() || labelledBy() || contents || caption
+    || nrm(_attr(el, 'alt'));
+  // A placeholder is a hint, often a sample answer, not the question: the name says when it came from one.
+  const hint = named ? '' : nrm(_attr(el, 'placeholder'));
+  const name = named || hint || (textEntry ? '' : nrm(_attr(el, 'title')));
   // Refused here rather than truncated, and this is the only place that can be exact: `length` is
   // UTF-16 code units while Python counts code points, so a name whose bound falls on an astral
   // character (an emoji is one code point, two units) would arrive UNDER the Python cap and be
@@ -4681,7 +5502,7 @@ _TARGET_NAME_JS = (
       kind = 'textbox';
     }
   }
-  return { name: finalName, kind: kind };
+  return { name: finalName, kind: kind, placeholder: Boolean(hint) && finalName !== null };
 }"""
 )
 
@@ -4829,7 +5650,9 @@ _INTERACTIVE_HIT_SEL = (
     '[role~="scrollbar" i], [draggable="true" i]'
 )
 
-_PAINT_VISIBLE_JS = r"""
+_PAINT_VISIBLE_JS = (
+    _SCROLL_GEOMETRY_JS
+    + r"""
   // forPaint asks "would a person SEE this", not "could a person interact with it": a scrim with
   // pointer-events:none is still seen even though clicks pass through it, so the paint scan
   // (layerShowsPaint) passes forPaint=true to keep such a child in view. Every other caller omits it
@@ -4926,6 +5749,7 @@ _PAINT_VISIBLE_JS = r"""
     return true;
   };
 """
+)
 
 _OWN_LABEL_HIT_JS = (
     r"""
@@ -5101,114 +5925,6 @@ _TYPE_TARGET_PROBE_JS = (
   // offset and a diagnosis must not move the page it is about to describe -- checked against
   // assigned-scroll ground truth over the whole writing-mode x direction x display x flex-direction
   // x flex-wrap matrix.
-  const flowNegative = (cs) => {
-    const wm = cs.writingMode || 'horizontal-tb';
-    const rtl = cs.direction === 'rtl';
-    const vertical = wm.indexOf('horizontal') !== 0;
-    // `sideways-lr` is the one vertical mode whose inline axis runs bottom-to-top.
-    const inlineSign = vertical ? ((wm === 'sideways-lr') !== rtl ? -1 : 1) : (rtl ? -1 : 1);
-    const blockSign = vertical ? (/-rl$/.test(wm) ? -1 : 1) : 1;
-    const inlineIsX = !vertical;
-    let xSign = inlineIsX ? inlineSign : blockSign;
-    let ySign = inlineIsX ? blockSign : inlineSign;
-    const display = cs.display || '';
-    if (display === 'flex' || display === 'inline-flex') {
-      // A flex container lays content out along main/cross, not inline/block: `*-reverse` flips the
-      // main axis and `wrap-reverse` flips the cross axis.
-      const fd = cs.flexDirection || 'row';
-      const mainIsInline = fd.indexOf('row') === 0;
-      const mainSign = (mainIsInline ? inlineSign : blockSign) * (/-reverse$/.test(fd) ? -1 : 1);
-      const crossSign =
-        (mainIsInline ? blockSign : inlineSign) * (cs.flexWrap === 'wrap-reverse' ? -1 : 1);
-      const mainIsX = mainIsInline === inlineIsX;
-      xSign = mainIsX ? mainSign : crossSign;
-      ySign = mainIsX ? crossSign : mainSign;
-    }
-    return { x: xSign < 0, y: ySign < 0 };
-  };
-  // PER AXIS, the scale the ancestry applies to this container -- or `null` where the box ratio
-  // cannot express it. Rects are transformed viewport pixels; scroll offsets and computed lengths
-  // stay untransformed CSS units, and the conversion between them is only sound where the mapping
-  // is a positive, axis-aligned scale that actually changes scale. Each of the four answers this
-  // rules out is a way the ratio does harm rather than good:
-  //   scale 1        -- the two spaces COINCIDE, so the ratio carries only `offsetHeight`'s integer
-  //                     rounding: an untransformed 30.5px scroller reports 31, and that 1.6% names
-  //                     a collapsed panel for a control Playwright clicks. Composed, not remembered
-  //                     as a flag, because an outer `scale(2)` under an inner `scale(.5)` cancels.
-  //   per axis       -- a `scaleX(2)` ancestor leaves the VERTICAL spaces coinciding, so a shared
-  //                     answer would feed that same rounding into `scaleY`.
-  //   not axis-aligned -- under a rotation, a skew or a perspective the rect is an axis-aligned
-  //                     BOUND of the box, not a scaled copy: a 2deg tilt on a 600px strip reads
-  //                     1.52 at scale 1, which shrinks the distance asked for below a scroll-back
-  //                     that cannot reach the control.
-  //   reflected      -- `rect.width / offsetWidth` is unsigned, so a mirrored mapping would convert
-  //                     by the magnitude while the scroll that recovers the point runs the other
-  //                     way. `flowNegative` reverses flow, not geometry; nothing reverses this.
-  // Every `null` falls back to comparing the two spaces unconverted, which is what this branch did
-  // before the conversion existed -- a no-change, never a new guess.
-  const axisAligned = (m) =>
-    m.m12 === 0 && m.m13 === 0 && m.m14 === 0
-    && m.m21 === 0 && m.m23 === 0 && m.m24 === 0
-    && m.m31 === 0 && m.m32 === 0 && m.m34 === 0;
-  // An explicit `rotate: 0deg` is an identity an author writes to give a later transition something
-  // to animate from; excluded by the string alone it would disable the conversion for the whole
-  // chain.
-  const zeroAngle = (v) => {
-    const m = /(-?[0-9.]+)(deg|grad|rad|turn)\s*$/.exec(v || '');
-    return !!m && parseFloat(m[1]) === 0;
-  };
-  const flowScale = (start) => {
-    const none = { x: null, y: null };
-    const svgNs = 'http://www.w3.org/2000/svg';
-    let sx = 1, sy = 1;
-    for (
-      let p = start, hops = 0;
-      p && p !== document && hops < 60;
-      hops++, p = p.assignedSlot || p.parentNode || p.host || null
-    ) {
-      if (p.nodeType !== 1) continue;
-      // From a foreignObject up, the browser composes the whole mapping itself -- viewBox,
-      // `preserveAspectRatio`, nested viewports, `<g>` transforms and every CSS transform and `zoom`
-      // above the `<svg>` -- against the RENDERED viewport, which the `width` attribute is not once CSS
-      // sizes the `<svg>`. `getScreenCTM` is that whole product, so it ends the walk.
-      if (p.namespaceURI === svgNs && p.localName === 'foreignObject') {
-        let c;
-        try { c = p.getScreenCTM(); } catch (e) { return none; }
-        if (!c || c.b !== 0 || c.c !== 0) return none;
-        sx *= c.a;
-        sy *= c.d;
-        break;
-      }
-      let ps;
-      try { ps = getComputedStyle(p); } catch (e) { return none; }
-      // `zoom` DOES apply on inline and `display: contents` boxes, so it is read before the skip.
-      const z = parseFloat(ps.zoom);
-      if (Number.isFinite(z) && z > 0) { sx *= z; sy *= z; }
-      // A boxless element is not in the mapping, yet Chromium still reports its `rotate`/`scale` (a
-      // `display: contents` wrapper's `rotate: 45deg` would refuse a control under a real `scale(2)`).
-      // Inline `<svg>`/`<g>` transforms DO apply, hence the namespace.
-      if (ps.display === 'contents' || (ps.display === 'inline' && p.namespaceURI !== svgNs)) continue;
-      if (ps.rotate && ps.rotate !== 'none' && !zeroAngle(ps.rotate)) return none;
-      if (ps.scale && ps.scale !== 'none') {
-        const parts = String(ps.scale).trim().split(/\s+/).map((v) => parseFloat(v));
-        if (!parts.length || parts.some((v) => !Number.isFinite(v))) return none;
-        sx *= parts[0];
-        sy *= parts.length > 1 ? parts[1] : parts[0];
-      }
-      if (ps.transform && ps.transform !== 'none') {
-        let m;
-        try { m = new DOMMatrix(ps.transform); } catch (e) { return none; }
-        if (!axisAligned(m)) return none;
-        // A homogeneous matrix scales by `m11 / m44`: `matrix3d(1,0,0,0, 0,1,0,0, 0,0,1,0, 0,0,0,.5)`
-        // doubles everything while its `m11` reads 1.
-        if (!(m.m44 > 0)) return none;
-        sx *= m.m11 / m.m44;
-        sy *= m.m22 / m.m44;
-      }
-    }
-    const usable = (v) => (v > 0 && Math.abs(v - 1) > 1e-9 ? v : null);
-    return { x: usable(sx), y: usable(sy) };
-  };
   // A native control's own <label> is a sibling, not an ancestor, so related()'s composed walk never
   // reaches it on its own -- check the control's genuine labels (and the reverse, a LABEL's genuine
   // control), resolved by nativeLabelsOf/nativeControlOf rather than trusting `.labels`/`.control`.
@@ -5565,18 +6281,9 @@ _TYPE_TARGET_PROBE_JS = (
     };
     // Does an element draw a surface a person can see -- a non-transparent background, an image, a
     // border, or a shadow? The alpha-0 forms of a color (`transparent`, `rgba(...,0)`) paint nothing.
-    // A color is invisible only when its ALPHA is zero -- parse the alpha channel, never a trailing
-    // ",0)", which also matches an opaque color whose blue channel is 0 (rgb(0,0,0), rgb(255,0,0)).
-    // A form we can't parse is treated as paint, so the failure mode is under-suppression, not over.
-    const opaquePaint = (color) => {
-      const c = (color || '').replace(/\s+/g, '');
-      if (!c || c === 'transparent') return false;
-      const m = c.match(/^rgba?\(([\d.,-]+)\)$/);
-      if (!m) return true;
-      const comps = m[1].split(',');
-      const alpha = comps.length >= 4 ? parseFloat(comps[3]) : 1;
-      return !(alpha === 0);
-    };
+    const opaquePaint = """
+    + _OPAQUE_PAINT_JS
+    + r""";
     // A replaced/embedded element paints pixels with no CSS surface of its own -- an icon-only spinner
     // or logo (img/svg/canvas/video/iframe) is plainly visible even though backgroundColor/border are
     // empty, so it must count as paint or such a layer reads as an invisible ghost. The caller filters
@@ -8490,6 +9197,62 @@ async (__tv3TextArgs) => {
     } catch (e) { /* fail open: the record keeps today's shape */ }
     return '';
   };
+  // Pressable buttons that set a form value -- a wrapper holding only pressable buttons and the checkbox, radio
+  // or hidden input they write (a Yes/No pair) -- answer one question, the way a radio group does. Without that
+  // input they are page controls (a save, view or font toggle) that their own labels name.
+  const _isToggleChoice = (el) => {
+    try {
+      const own = el.getAttribute('aria-pressed');
+      if (own !== 'true' && own !== 'false') return false;
+      const parent = _parentOf.call(el);
+      if (!parent) return false;
+      const buttons = _qsa.call(parent, 'button,[role=button]');
+      if (buttons.length < 2) return false;
+      for (const b of buttons) {
+        const p = b.getAttribute('aria-pressed');
+        if (p !== 'true' && p !== 'false') return false;
+      }
+      const inputs = _qsa.call(parent, 'input,select,textarea');
+      if (!inputs.length) return false;
+      for (const i of inputs) {
+        const t = (i.getAttribute('type') || '').toLowerCase();
+        if (t !== 'checkbox' && t !== 'radio' && t !== 'hidden') return false;
+      }
+      return true;
+    } catch (e) { return false; }
+  };
+  // A toggle pair's question is the label or legend before it in its entry, past any description or hint between
+  // them: two questions sharing one hint ("answer for this role's location") would otherwise read the same. Only a
+  // label beside that text outranks it; climbing past the first level with text or a control would reach a section
+  // legend, so the nearest text decides there.
+  const _toggleQuestion = (el) => {
+    try {
+      let node = _parentOf.call(el);
+      for (let depth = 0; node && depth < 3; depth++) {
+        let scanned = 0;
+        let stop = false;
+        for (let s = _prevOf.call(node); s && scanned < 8; s = _prevOf.call(s), scanned++) {
+          const kind = _nodeTypeOf.call(s);
+          if (kind === 3) { if (_normText(_contentOf.call(s)).length >= 2) stop = true; continue; }
+          if (kind !== 1) continue;
+          if (_matches.call(s, _CTRL_SEL) || _qs.call(s, _CTRL_SEL)) { stop = true; break; }
+          if (_unseen(s)) continue;
+          const t = _visibleText(s, 0);
+          if (t.length < 2) continue;
+          // A label is often wrapped in a title box of its own; a sibling holding no control can only caption.
+          const lab = _matches.call(s, 'label,legend') ? s : _qs.call(s, 'label,legend');
+          if (lab && !_unseen(lab)) {
+            const lt = lab === s ? t : _visibleText(lab, 0);
+            if (lt.length >= 2) return lt;
+          }
+          stop = true;
+        }
+        if (stop) break;
+        node = _parentOf.call(node);
+      }
+    } catch (e) { /* fall back to the nearest text */ }
+    return _groupText(el, false);
+  };
   // A choice group's question: the legacy text for this member when it names more than the options,
   // else what the page declares for the group, resolved once per group.
   const _choiceGroupText = (el) => {
@@ -9131,7 +9894,7 @@ async (__tv3TextArgs) => {
   const _screenListable = (el) => {
     try { return _screen(el, false).why === null; } catch (e) { return false; }
   };
-  const _pointerState = { pointer: new Map(), covered: new Set(), roots: new Map(), holders: new Set(), represented: new Set(), held: new Set(), icons: new Set(), iconCount: 0, heldCount: 0, heldCap: """
+  const _pointerState = { pointer: new Map(), covered: new Set(), roots: new Map(), holders: new Set(), represented: new Set(), held: new Set(), icons: new Set(), iconCount: 0, iconOverflow: 0, notIcon: 0, notIconRoots: new Set(), heldCount: 0, heldCap: """
     + str(OBSERVE_POINTER_ROOT_CAP)
     + r""", count: 0, retain: _RETAIN_WIDTH, ceiling: """
     + str(_POINTER_ROOT_SCAN_CEILING)
@@ -9354,6 +10117,24 @@ async (__tv3TextArgs) => {
   const safeTag = (el) => {
     const t = String(el.tagName || '').toLowerCase();
     return /^[a-z][a-z0-9_-]*$/.test(t) ? t : null;
+  };
+  // A handle-only record's line-to-handle binding: its child position at every step up to the document,
+  // crossing each shadow root at its host. Playwright's engine reads it at act time outside the page's
+  // realm, as it does a named record's selector, so a page that swaps the elements behind two lines is refused.
+  const positionPath = (el) => {
+    const steps = [];
+    try {
+      for (let n = el; n && n.nodeType === 1; ) {
+        const t = safeTag(n);
+        if (!t) return '';
+        let k = 1;
+        for (let s = n.previousElementSibling; s; s = s.previousElementSibling) k++;
+        steps.push(t + ':nth-child(' + k + ')');
+        const p = n.parentNode;
+        n = p && p.nodeType === 11 ? p.host : p;
+      }
+    } catch (e) { return ''; }
+    return steps.reverse().join(' > ');
   };
   // Where the page itself puts a control, for a renderer that has found two element lines rendering
   // the same bytes. Nearest first: the control's own identity, then each enclosing element carrying
@@ -9690,26 +10471,22 @@ async (__tv3TextArgs) => {
   // Naming a host is paid once per walk: the same anchor serves every control under it, and a
   // marker written for the first is reused, not re-minted, for the rest.
   const anchorByHost = new Map();
-  // Anchoring is bounded per walk. A control that cannot be named does not spend the element
-  // budget, so without this a page of thousands of unnameable component controls would spend the
-  // evaluate's whole time bound on tails that all fail.
+  // Anchoring is bounded per walk. An unnamed pointer-styled control does not spend the element
+  // budget, so without this a page of thousands of them would spend the evaluate's whole time bound
+  // on tails that all fail.
   let anchorAttempts = 0;
   const _ANCHOR_ATTEMPTS = 3000;
   const _ANCHORED_MAX_LEN = 400;
-  // Set when the LAST refusal was ours (a budget) rather than the page's, so the omission is
-  // reported as such and not as a claim about the control.
-  let anchorRefusedByBudget = false;
   // The host and tail of the last selector hostAnchored composed, kept so the record can be
   // re-resolved under its host later (a composed selector straddles a root; only scoped counting sees it).
   let lastAnchor = null;
   const hostAnchored = (el, host, depth) => {
     depth = depth || 0;
-    if (depth === 0) anchorRefusedByBudget = false;
     if (!host) return null;
-    if (depth > 8) { anchorRefusedByBudget = true; return null; }
+    if (depth > 8) return null;
     // A host already named this walk costs a lookup, not an attempt; the budget is charged for
     // naming a host, which is the part that walks the page.
-    if (!anchorByHost.has(host) && ++anchorAttempts > _ANCHOR_ATTEMPTS) { anchorRefusedByBudget = true; return null; }
+    if (!anchorByHost.has(host) && ++anchorAttempts > _ANCHOR_ATTEMPTS) return null;
     let tails = [];
     if (el.id) {
       const raw = String(el.id);
@@ -9728,9 +10505,7 @@ async (__tv3TextArgs) => {
       const cached = anchorByHost.get(host);
       hostSel = cached.sel;
       hostTrail = cached.trail;
-      if (!hostSel && cached.budget) anchorRefusedByBudget = true;
     } else {
-      const budgetBefore = anchorRefusedByBudget;
       // naturalSelector reports its cause through shared state; the control's own cause is already
       // settled by the time we get here and must survive naming the host.
       const why = naturalWhy;
@@ -9774,9 +10549,8 @@ async (__tv3TextArgs) => {
       naturalWhy = why;
       checkInconclusive = inconclusive;
       // A refusal reached through the recursion may be the depth bound, which a control whose own
-      // host this is would not hit; only a top-level or successful answer is worth remembering. A
-      // refusal that was a budget stays a budget on every later hit.
-      if (hostSel || depth === 0) anchorByHost.set(host, { sel: hostSel, trail: hostTrail, budget: !hostSel && anchorRefusedByBudget && !budgetBefore });
+      // host this is would not hit; only a top-level or successful answer is worth remembering.
+      if (hostSel || depth === 0) anchorByHost.set(host, { sel: hostSel, trail: hostTrail });
     }
     if (!hostSel) return null;
     // Naming the host may have written to it, and a component can re-render its root on any
@@ -9784,7 +10558,7 @@ async (__tv3TextArgs) => {
     // or a replacement control would inherit this one's label and state.
     if (!scopedResolvesTo(host, ctrl, el)) return null;
     const sel = hostSel + ' ' + ctrl;
-    if (sel.length > _ANCHORED_MAX_LEN) { anchorRefusedByBudget = true; return null; }
+    if (sel.length > _ANCHORED_MAX_LEN) return null;
     // The whole chain that produced the selector, each link verified where it was taken, so the
     // record can be re-validated link by link: the tail under its host, and the host by its own name.
     lastAnchor = { sel: sel, trail: [{ scope: host, ctrl: ctrl, target: el }].concat(hostTrail) };
@@ -9817,8 +10591,7 @@ async (__tv3TextArgs) => {
     if (!textOnly) return '';
     return String(host.innerText || '').replace(/\s+/g, ' ').trim().slice(0, _RETAIN_WIDTH);
   };
-  // Controls inside a component that we could not name, split by CAUSE: these need different
-  // fixes, and one merged tally would send the follow-up after the wrong one.
+  // Why naturalSelector could not name a control inside a component:
   //   anonymous    -- no id/name/data-testid at all
   //   duplicated   -- has one, but shadow encapsulation lets every instance reuse it, so the
   //                   cross-root count is >1 and no unscoped selector can single this one out
@@ -9854,11 +10627,6 @@ async (__tv3TextArgs) => {
   // the host's marker after the walk drops each of those controls, not the host.
   const anchorsMinted = [];
   const anchorRecords = [];
-  let unnamedAnonymous = 0;
-  let unnamedBudget = 0;
-  let unnamedDuplicated = 0;
-  let unnamedUnverifiable = 0;
-  let unnamedUnsafe = 0;
   let i = 0;
   let dropped = 0;
   // Two counters, deliberately: hiddenKept bounds the retention work and is spent the moment a
@@ -9923,6 +10691,7 @@ async (__tv3TextArgs) => {
     return false;
   };
   let lastGroup = '';
+  let lastGroupToggle = false;
   let groupTotal = 0;
   let radioGroupsMissing = 0;
   const _a11yRemoved = """
@@ -10149,19 +10918,13 @@ async (__tv3TextArgs) => {
     }
     if (pointerRoot && pointerListed + (_pointerState.held.has(el) ? pointerReserved : 0) >= _POINTER_ROOT_CAP) { pointerCapped++; continue; }
     let selector = naturalSelector(el);
+    let bind = '';
     if (!selector) {
-      // We do not write inside a shadow root. Setting a marker there is a mutation of the
-      // component's own subtree, and every mechanism that wrote one and then tried to manage the
-      // consequences failed: the mark provokes the re-render that destroys it, and because the mark
-      // IS the handle we hand out it cannot move off-DOM. Verifying it needed a wait, every clock
-      // belongs to the page, and a fixed wait was accurate under 50 ms and silently wrong past it.
-      // Worse, a marker that churns every observe makes the payload differ every turn, which
-      // defeats the loop's perception-stall terminator -- so the page burned the whole budget where
-      // the base engine terminated cleanly. Not writing restores that behavior exactly. A control
-      // with an id, name or data-testid of its own is unaffected, which is the ordinary case.
+      // Observe never writes inside a shadow root: a mark there provokes the re-render that destroys
+      // it. A control no verified selector names is listed by its live handle alone, so a replaced
+      // node goes stale instead of being re-found.
       if (host) {
         anchorsMinted.length = 0;
-        anchorRefusedByBudget = false;
         lastAnchor = null;
         if (naturalWhy === 'duplicated' || naturalWhy === 'anonymous') selector = hostAnchored(el, host);
         // A host marked during this attempt is accounted for whether or not the attempt produced a
@@ -10171,12 +10934,9 @@ async (__tv3TextArgs) => {
           for (const a of anchorRecords) { if (selector.indexOf(attr('data-tv3', a.m)) === 0) { a.ctrls.push({ el: el, rec: null }); anchorRecs.push(a); } }
         } else {
           if (pointerRoot) { pointerDropped++; continue; }
-          if (anchorRefusedByBudget) unnamedBudget++;
-          else if (naturalWhy === 'duplicated') unnamedDuplicated++;
-          else if (naturalWhy === 'unverifiable') unnamedUnverifiable++;
-          else if (naturalWhy === 'unsafe') unnamedUnsafe++;
-          else unnamedAnonymous++;
-          continue;
+          selector = '';
+          bind = positionPath(el);
+          if (!bind) { dropped++; continue; }
         }
       } else {
         const writtenBefore = markersWritten;
@@ -10206,6 +10966,7 @@ async (__tv3TextArgs) => {
     // provenance before the display cap lands. A tighter cap here would truncate the URL past
     // recognition and leak its signing tail.
     const rec = { i, tag: el.tagName.toLowerCase(), type: (_typed && el.type) || null, selector, label: label.slice(0, _RETAIN_WIDTH) };
+    if (bind) rec.bind = bind;
     if (pointerRoot) rec.pointerRoot = true;
     if (iconRoot) rec.icon = true;
     if (pointerRoot && _pointerState.held.has(el)) rec.pointerHeld = true;
@@ -10234,6 +10995,8 @@ async (__tv3TextArgs) => {
     Object.assign(rec, _stateFields(el));
     if (el.getAttribute('aria-required') === 'true' || el.required) rec.required = true;
     const isChoice = el.type === 'checkbox' || el.type === 'radio' || role === 'checkbox' || role === 'radio';
+    const isToggle = !isChoice && _isToggleChoice(el);
+    if (isToggle) rec.toggle_choice = true;
     // Read .validity, never checkValidity(): that dispatches an 'invalid' event and perception must
     // not mutate the page. Checkbox/radio .value is the static attribute ("on"), so they are excluded.
     const ai = el.getAttribute('aria-invalid');
@@ -10251,7 +11014,7 @@ async (__tv3TextArgs) => {
     // answer without fetching raw HTML. Deduped against the previous element to keep grouped
     // options compact; capped per page so a long form cannot turn this into a second DOM dump.
     // A pointer root is named by its own content; a short caption ('?') would borrow a stranger's text.
-    if (!pointerRoot && (isChoice || strongLabel.length < 3)) {
+    if (!pointerRoot && (isChoice || isToggle || strongLabel.length < 3)) {
       // The description is the last rung: it is routinely a per-field hint ("This field is
       // required") shared by every field, which would name nothing and dedupe to nothing.
       // The record carries the text at the masking width; the budget, the dedupe and the
@@ -10260,9 +11023,9 @@ async (__tv3TextArgs) => {
       // that only acts it names the wrong target, as a date heading read as the name of the arrow beside it.
       const takesValue = isChoice || _isFieldControl(el) || rec.autocomplete === true
         || el.hasAttribute('aria-checked') || el.hasAttribute('aria-pressed');
-      const ownGroup = takesValue ? _groupText(el, isChoice) : '';
+      const ownGroup = !takesValue ? '' : isToggle ? _toggleQuestion(el) : _groupText(el, isChoice);
       // Every member keeps its group's question, though the digest prints it on the first member only.
-      if (isChoice && ownGroup) rec.question = ownGroup.slice(0, _RETAIN_WIDTH);
+      if ((isChoice || isToggle) && ownGroup) rec.question = ownGroup.slice(0, _RETAIN_WIDTH);
       const gtFull = (ownGroup || byId('aria-describedby')).slice(0, _RETAIN_WIDTH);
       const gt = gtFull.slice(0, 200);
       // A slotted caption is compared at the 140 width it used to be stored at. A drawn shadow caption
@@ -10277,13 +11040,19 @@ async (__tv3TextArgs) => {
         if (!g.entry.shown && groupTotal + gt.length <= _GROUP_TEXT_TOTAL_CAP) {
           rec.group = gtFull;
           lastGroup = gt;
+          lastGroupToggle = false;
           groupTotal += gt.length;
         }
         g.entry.shown = true;
       } else if (gt && gt.length > nameLength && gt !== lastGroup && groupTotal + gt.length <= _GROUP_TEXT_TOTAL_CAP) {
         rec.group = gtFull;
         lastGroup = gt;
+        lastGroupToggle = isToggle;
         groupTotal += gt.length;
+      } else if (isToggle && lastGroupToggle && gt && gt === lastGroup) {
+        // Every button of a pair prints its question: one printed only on its neighbour reads as answering the
+        // question beside it. The repeat is not charged, as the budget bounds distinct question text.
+        rec.group = gtFull;
       }
       // Every member carries its group's number, so the digest can say once per group that no
       // question was found; checkboxes are left out, being mostly self-describing consents.
@@ -10451,7 +11220,7 @@ async (__tv3TextArgs) => {
           if (link.ctrl) { if (!scopedResolvesTo(link.scope, link.ctrl, link.target)) { ok = false; break; } }
           else { checkInconclusive = false; if (!resolvesTo(link.sel, link.target) && !checkInconclusive) { ok = false; break; } }
         }
-      } else { checkInconclusive = false; ok = resolvesTo(rec.selector, el) || checkInconclusive; }
+      } else if (rec.selector) { checkInconclusive = false; ok = resolvesTo(rec.selector, el) || checkInconclusive; }
     }
     if (!ok) {
       // Dropped from the digest, but the control can still BE there -- a page that changes a second
@@ -10982,7 +11751,7 @@ async (__tv3TextArgs) => {
   } catch (e) { /* a count the page broke is not worth the reading */ }
   let readyState = '';
   try { readyState = String(_getter(Document.prototype, 'readyState').call(document)); } catch (e) { readyState = ''; }
-  const payload = _ownStringify({ textDelta: textDelta, refsFresh: refsFresh, flutter: __OBSERVE_FLUTTER__, url: location.href, title: document.title, text: texts, textFull: texts.map((t) => { const f = fullText.get(t); return f && f !== t ? f : null; }), textTruncated: textFull, textDropped: textDropped, iframes: iframeInfo, frameCensus: frameCensus, dropped: dropped, truncated: truncated, iconsTruncated: iconsTruncated, truncatedInComponents: truncatedInComponents, pointerCapped: pointerCapped, pointerTruncated: pointerTruncated, pointerDropped: pointerDropped, pointerListed: pointerListed, pointerScanStopped: _pointerState.scanStopped ? 1 : 0, pointerScanFailed: _pointerState.scanFailed ? 1 : 0, unnamedAnonymous: unnamedAnonymous, unnamedBudget: unnamedBudget, unnamedDuplicated: unnamedDuplicated, unnamedUnverifiable: unnamedUnverifiable, unnamedUnsafe: unnamedUnsafe, unreadableRoot: sawUnreadableRoot, undiscoveredRoots: undiscoveredRoots, rootCount: allRoots.length - 1, hiddenListed: hiddenListed, hiddenDropped: hiddenDropped, hiddenDroppedOffCanvas: hiddenDroppedOffCanvas, hiddenDroppedVisibility: hiddenDroppedVisibility, hiddenDroppedZeroRect: hiddenDroppedZeroRect, hiddenDroppedOffViewport: hiddenDroppedOffViewport, offViewportUnreachableUnnamed: offViewportUnreachableUnnamed, offViewportUnnamedHostExempt: offViewportUnnamedHostExempt, phantomDropped: phantomDropped, markersMinted: markersWritten, markersReused: markersReused, pageMutated: mutated, modalOpen: modalOpen, modalListed: modalListed, modalTruncated: modalTruncated, readyState: readyState, elements: out });
+  const payload = _ownStringify({ textDelta: textDelta, refsFresh: refsFresh, unnamedNotIcon: _pointerState.notIcon, flutter: __OBSERVE_FLUTTER__, url: location.href, title: document.title, text: texts, textFull: texts.map((t) => { const f = fullText.get(t); return f && f !== t ? f : null; }), textTruncated: textFull, textDropped: textDropped, iframes: iframeInfo, frameCensus: frameCensus, dropped: dropped, truncated: truncated, iconsTruncated: iconsTruncated + _pointerState.iconOverflow, truncatedInComponents: truncatedInComponents, pointerCapped: pointerCapped, pointerTruncated: pointerTruncated, pointerDropped: pointerDropped, pointerListed: pointerListed, pointerScanStopped: _pointerState.scanStopped ? 1 : 0, pointerScanFailed: _pointerState.scanFailed ? 1 : 0, unreadableRoot: sawUnreadableRoot, undiscoveredRoots: undiscoveredRoots, rootCount: allRoots.length - 1, hiddenListed: hiddenListed, hiddenDropped: hiddenDropped, hiddenDroppedOffCanvas: hiddenDroppedOffCanvas, hiddenDroppedVisibility: hiddenDroppedVisibility, hiddenDroppedZeroRect: hiddenDroppedZeroRect, hiddenDroppedOffViewport: hiddenDroppedOffViewport, offViewportUnreachableUnnamed: offViewportUnreachableUnnamed, offViewportUnnamedHostExempt: offViewportUnnamedHostExempt, phantomDropped: phantomDropped, markersMinted: markersWritten, markersReused: markersReused, pageMutated: mutated, modalOpen: modalOpen, modalListed: modalListed, modalTruncated: modalTruncated, readyState: readyState, elements: out });
   return __OBSERVE_RETURN__;
 }
 """
@@ -12329,6 +13098,7 @@ _OBSERVE_SUMMED_KEYS = (
     "dropped",
     "truncated",
     "iconsTruncated",
+    "unnamedNotIcon",
     "truncatedInComponents",
     "pointerCapped",
     "pointerTruncated",
@@ -12336,11 +13106,6 @@ _OBSERVE_SUMMED_KEYS = (
     "pointerListed",
     "pointerScanStopped",
     "pointerScanFailed",
-    "unnamedAnonymous",
-    "unnamedBudget",
-    "unnamedDuplicated",
-    "unnamedUnverifiable",
-    "unnamedUnsafe",
     "undiscoveredRoots",
     "rootCount",
     "hiddenListed",
@@ -12541,9 +13306,7 @@ async def _probe_evaluate(target: Any, js: str, selector: str, arg: dict[str, An
 
 # Never echoes the placeholder, the vault marker, or a code: it reaches the model verbatim.
 NO_ONE_TIME_CODE_SOURCE = (
-    "this credential has no usable one-time-code (TOTP) secret, so no verification code can be generated "
-    "for it. Call get_verification_code if it is offered; otherwise finish as failed and state that a "
-    "verification code source is missing. Never invent or guess a code."
+    "no code source is configured for this credential: no one-time code can be fetched or generated for it."
 )
 ONE_TIME_CODE_PLACEHOLDER_NOT_ALONE = (
     "a one-time-code placeholder must be typed alone as the whole text; it cannot be combined with other "
@@ -12653,7 +13416,7 @@ def build_browser_tools(
             return
         # Re-keyed to the code: check_release groups owners by secret value, so marker-valued
         # alternatives would form a second group that must be authorized on its own.
-        entries = [ArmedSecret(code, entry.allowed_url, parameter_key) for entry in owned]
+        entries = [dataclasses.replace(entry, secret_value=code) for entry in owned]
         credential_release_guard.check_release(
             entries[0],
             await _field_release_url(page, selector),
@@ -13131,6 +13894,7 @@ def build_browser_tools(
                 "handle": handles[_idx],
                 "tag": _tag,
                 "selector": e.get("selector") or "",
+                "binding": "" if e.get("selector") else str(e.get("bind") or ""),
                 # The frame this element was read from, and the document that frame was showing. Both
                 # server-held: nothing frame-shaped is ever put in a selector, so the model has nothing
                 # frame-shaped to mistranscribe.
@@ -13139,32 +13903,9 @@ def build_browser_tools(
                 # A radio or checkbox's question and caption as observe read them, for a click's answer.
                 "question": _mask_refs(str(e.get("question") or "")),
                 "option": _mask_refs(str(e.get("label") or "")),
-                "choice": next((c for c in (e.get("role"), e.get("type")) if c in ("radio", "checkbox")), ""),
+                "choice": next((c for c in (e.get("role"), e.get("type")) if c in ("radio", "checkbox")), "")
+                or ("toggle" if e.get("toggle_choice") else ""),
             }
-        omitted_anonymous = data.get("unnamedAnonymous") or 0
-        omitted_duplicated = data.get("unnamedDuplicated") or 0
-        omitted_unverifiable = data.get("unnamedUnverifiable") or 0
-        omitted_unsafe = data.get("unnamedUnsafe") or 0
-        omitted_budget = data.get("unnamedBudget") or 0
-        omitted_in_components = (
-            omitted_anonymous + omitted_duplicated + omitted_unverifiable + omitted_unsafe + omitted_budget
-        )
-        if omitted_in_components:
-            # Sizes the capability this deliberately gives up, split by cause because the causes have
-            # different fixes: `duplicated` is answered by host-anchored selectors with executor-side
-            # verification (the SKY-14710 family), `anonymous` only by that same path, and neither by
-            # another in-root identity mechanism. Merging them would over-report one and under-report
-            # the other, and the follow-up would be chosen off the wrong number.
-            LOG.info(
-                "taskv3 observe omitted component controls it could not name",
-                omitted_in_components=omitted_in_components,
-                omitted_anonymous=omitted_anonymous,
-                omitted_duplicated=omitted_duplicated,
-                omitted_unverifiable=omitted_unverifiable,
-                omitted_unsafe=omitted_unsafe,
-                omitted_budget=omitted_budget,
-                listed=len(elements),
-            )
         # Compact rendering keeps the persistent-conversation prefix small (cost is ~linear in it).
         raw_url = _mask_refs(str(data.get("url") or ""))
         # Stripping forgery chars is not truncation: only the cap changes what the URL points at, so
@@ -13313,12 +14054,10 @@ def build_browser_tools(
             # a page that genuinely has no controls.
             lines.append(f"note: {dropped} element(s) could not be described and are not listed below")
         if data.get("unreadableRoot"):
-            # The condition itself, not just its consequences: a root that throws makes uniqueness
-            # unverifiable everywhere, so unnamed elements are dropped rather than given a name we
-            # could not check. Left unsaid, that reads as a page with fewer controls than it has.
+            # The condition itself, not just its consequences: a root that throws makes selector
+            # uniqueness unverifiable everywhere on the page.
             lines.append(
-                "note: part of this page could not be queried, so selector uniqueness could not be "
-                "verified here; elements we could not name are not listed"
+                "note: part of this page could not be queried, so selector uniqueness could not be verified here"
             )
         if data.get("textTruncated"):
             # Every other cap in this payload names itself. This one binds far more often now that
@@ -13354,31 +14093,6 @@ def build_browser_tools(
             count = f"{unlisted}{'+' if pointer_scan_stopped else ''} " if unlisted else ""
             lines.append(
                 f"note: {count}more pointer-styled element(s) without a control role are not listed: {'; '.join(why)}"
-            )
-        if omitted_in_components:
-            # A statement about OUR limitation, not about the page: naming these would mean writing
-            # into the component's own root, which provokes the re-render that destroys the mark. No
-            # remedy is offered because there is none the model can perform — re-observing returns
-            # the same omission. Split by cause: saying "no id of their own" about a control that has
-            # one, and whose id is merely reused by a sibling instance, tells the model something
-            # false about the page to describe a limitation of ours.
-            why = []
-            if omitted_anonymous:
-                why.append(f"{omitted_anonymous} have no id, name or data-testid of their own")
-            if omitted_duplicated:
-                why.append(
-                    f"{omitted_duplicated} have one that is reused by another instance of the same "
-                    "component, so it does not identify a single element"
-                )
-            if omitted_unverifiable:
-                why.append(f"{omitted_unverifiable} could not be verified because a component root was unreadable")
-            if omitted_unsafe:
-                why.append(f"{omitted_unsafe} carry an identifier we cannot render safely")
-            if omitted_budget:
-                why.append(f"{omitted_budget} exceeded the naming budget for this page")
-            lines.append(
-                f"note: {omitted_in_components} control(s) inside components are not listed because we "
-                f"have no selector that identifies them: {'; '.join(why)}"
             )
 
         bodies: list[str] = []
@@ -13556,7 +14270,7 @@ def build_browser_tools(
             "phantom_dropped": phantom_dropped,
             "iframes_in_component_roots": iframe_info.get("inComponents") or 0,
             "undiscovered_roots": data.get("undiscoveredRoots") or 0,
-            "omitted_unnameable": omitted_in_components,
+            "listed_by_handle_only": sum(1 for e in elements if not e.get("selector")),
             "invalid_fields": sum(1 for e in elements if e.get("invalid")),
             "markers_minted": data.get("markersMinted") or 0,
             "markers_reused": data.get("markersReused") or 0,
@@ -13594,6 +14308,8 @@ def build_browser_tools(
             "icons_listed": sum(1 for e in elements if e.get("icon")),
             # Icons the budget left over cut, apart from `elements_truncated`, whose denominator leaves icons out.
             "icons_truncated": int(data.get("iconsTruncated") or 0),
+            # Distinct unnamed pointer roots rejected by the icon heuristic, separate from budget and selector drops.
+            "unnamed_not_icon": int(data.get("unnamedNotIcon") or 0),
             "pointer_roots_listed": sum(1 for e in elements if e.get("pointerRoot")),
             "pointer_capped": int(data.get("pointerCapped") or 0),
             "pointer_truncated": int(data.get("pointerTruncated") or 0),
@@ -14235,13 +14951,22 @@ def build_browser_tools(
                     section += "\n" + shown
                     if cut and since is not None:
                         _defer(page, [risen[i][0] for i in cut], prior, since)
+                    left_out = set(cut)
+                    # Rank 0 is a held line rising again: the page before this call, not this call's own read.
+                    shown_fresh = sum(1 for i, (_, rank) in enumerate(risen) if rank != 0 and i not in left_out)
+                else:
+                    shown_fresh = 0
                 if not section:
                     record_text_delta(time.monotonic() - started, 0)
                     return result
                 returned = sum(1 for _, rank in risen if rank == 0)
                 earlier = len(before) + held + returned - pending_held
                 record_text_delta(
-                    time.monotonic() - started, earlier + len(risen) - returned, len(section), pending=earlier
+                    time.monotonic() - started,
+                    earlier + len(risen) - returned,
+                    len(section),
+                    pending=earlier,
+                    shown_fresh=shown_fresh,
                 )
                 return _with_delta_section(result, section)
 
@@ -14597,6 +15322,7 @@ def build_browser_tools(
             selector = args.get("selector")
             name: str | None = None
             kind: str | None = None
+            from_placeholder = False
             # The page comes from the preflight handoff, read and not popped -- the handler's own
             # _resolve_page consumes it. Never page_provider(): a second must_get_working_page can
             # recover or relaunch a page, and a label is not worth a side effect. Every labelled tool
@@ -14634,6 +15360,7 @@ def build_browser_tools(
                     name = raw_name if isinstance(raw_name, str) and raw_name.strip() else None
                     raw_kind = raw.get("kind")
                     kind = raw_kind if isinstance(raw_kind, str) and raw_kind else None
+                    from_placeholder = raw.get("placeholder") is True
             result = await handler(args)
             # Only a call that acted carries a name/kind. The probe resolves the selector on its own,
             # so on a refusal the two can disagree about which element the selector meant -- a cloned
@@ -14646,6 +15373,8 @@ def build_browser_tools(
             data = {**(result.data or {})}
             if name is not None:
                 data[TARGET_LABEL_DATA_KEY] = name
+                if from_placeholder:
+                    data[TARGET_LABEL_IS_PLACEHOLDER_DATA_KEY] = True
             if kind is not None:
                 data[TARGET_KIND_DATA_KEY] = kind
             # `replace`, not a positional rebuild: this carries every field the result already has,
@@ -15170,8 +15899,8 @@ def build_browser_tools(
                 skin_probe = await _probe_evaluate(page, _SKINNED_CHECKBOX_PROBE_JS, selector, pre_click_arg)
             except Exception:
                 skin_probe = None
-            # Every toggle answer carries `radio`. The browser engine's own enabled check decides (Playwright reads
-            # aria-disabled only on roles that take it), so the label click below is never looser than a plain click.
+            # Every toggle answer carries `radio`. The browser engine's own enabled check decides, whatever its
+            # aria-disabled rule is on this driver, so the label click below is never looser than a plain click.
             if not (isinstance(skin_probe, dict) and "radio" in skin_probe):
                 break
             if await _engine_enabled(page, selector):
@@ -20947,12 +21676,17 @@ def build_browser_tools(
                 f"selected on {selector} — {reason}, so the selection could not be verified; re-observe "
                 "before relying on it"
             )
+        # The visible text of what is now selected: a call by value names only an internal code.
+        shown = readback.get("selectedLabels" if is_multi else "selectedLabel") if isinstance(readback, dict) else None
+        shown = ", ".join(x for x in shown if isinstance(x, str)) if isinstance(shown, list) else shown
+        data = {PICKED_OPTION_DATA_KEY: shown} if isinstance(shown, str) and shown.strip() else None
         if is_multi:
             return ToolResult.ok(
-                f"selected on {selector} — it now holds {len(held)} option(s): {_selection_report(held)}"
+                f"selected on {selector} — it now holds {len(held)} option(s): {_selection_report(held)}", data=data
             )
         return ToolResult.ok(
-            f"selected on {selector} (hidden native select, set directly)" if force else f"selected on {selector}"
+            f"selected on {selector} (hidden native select, set directly)" if force else f"selected on {selector}",
+            data=data,
         )
 
     async def press_key(args: dict[str, Any]) -> ToolResult:
@@ -21816,16 +22550,20 @@ def build_browser_tools(
             # act time on count()==1 with no comparison of the resolved node to what the model was
             # shown -- the same class, with none of the three checks here. Pinned by
             # test_a_coupled_transposition_is_the_one_form_still_open_and_this_pins_it.
-            if not remembered:
+            #
+            # A ref listed by its handle alone is held to its child-position path instead. That path is
+            # never used to find a node to act on, so a replaced node still goes stale.
+            binding = remembered or str(entry.get("binding") or "")
+            if not binding:
                 return True
             try:
-                if await _holders(realm, f"{remembered}{act_selector}") == 1:
+                if await _holders(realm, f"{binding}{act_selector}") == 1:
                     return True
                 # A remembered selector that names NOTHING is simply stale -- a marker the page moved
                 # or rolled back, an id it dropped. It is not evidence about the handle, which is live
                 # and alone, so the handle stands. Only a selector naming something that is NOT this
                 # handle is evidence of a swap.
-                return await _holders(realm, remembered) == 0
+                return await _holders(realm, binding) == 0
             except Exception:
                 return False
 
@@ -22103,7 +22841,9 @@ def build_browser_tools(
                 # In place, for the same reason act-by-mark does it: the persisted action's element_id,
                 # the submit watch, the repeat guard's key and the nudge all read this dict AFTER dispatch.
                 args["selector"] = resolved
-                durable = str((_observe_manifest.get(ref) or {}).get("selector") or "")
+                _entry = _observe_manifest.get(ref) or {}
+                # A handle-only ref hands back its child-position path; nothing that reads it acts on it.
+                durable = str(_entry.get("selector") or "") or str(_entry.get("binding") or "")
                 # Handed on for the same reason the typed-selector branch does it: the ref was validated
                 # against THIS page, and letting preflight resolve again lets a popup that became the working
                 # page in between become the one acted on. Cleared in the finally, so it cannot outlive the
@@ -22238,13 +22978,14 @@ def build_browser_tools(
         _with_ref_resolution("answer_probe", _with_selector_guard(_answer_target))
     )
 
-    async def _answer_field(args: dict[str, Any]) -> tuple[str, str, str]:
+    async def _answer_field(args: dict[str, Any]) -> tuple[str, str, str, bool]:
         resolved = dict(args)
         try:
             data = (await _resolve_answer_target(resolved)).data or {}
         except Exception:
-            return "", "", ""
-        return str(resolved.get("selector") or ""), str(data.get("name") or ""), str(data.get("kind") or "")
+            return "", "", "", False
+        name, kind = str(data.get("name") or ""), str(data.get("kind") or "")
+        return str(resolved.get("selector") or ""), name, kind, data.get("placeholder") is True
 
     tools = [
         _spec(
@@ -22831,11 +23572,26 @@ class DownloadFailureWatch:
     """Records, on a download block, xhr/fetch requests and documents a call started that came back 4xx/5xx or failed,
     and browser downloads the interceptor could not save, into `facts` for the next tool result to report."""
 
-    def __init__(self, page_provider: PageProvider, opaque_refs: OpaqueUrlRefs | None = None) -> None:
-        self.facts = DownloadFailureFacts(refresh=self._read_tally)
+    def __init__(
+        self,
+        page_provider: PageProvider,
+        opaque_refs: OpaqueUrlRefs | None = None,
+        *,
+        native_download_attempt: NativeDownloadAttempt | None = None,
+    ) -> None:
+        self.facts = DownloadFailureFacts(
+            refresh=self._read_tally,
+            held_candidates=lambda: replay_candidates_for_context(self._context),
+            resolve_candidates=lambda accepted: resolve_replay_candidates_for_context(self._context, accepted),
+            attach=self.attach,
+        )
+        self._native_download_attempt = native_download_attempt
+        self._native_failures_seen = (0, 0)
         self._page_provider = page_provider
         self._opaque_refs = opaque_refs
         self._context: BrowserContext | None = None
+        # The run may already hold candidates on its context; only a hold this watch began is its to end.
+        self._owns_candidate_mode = False
         self._open_calls = 0
         self._call_seq = 0
         self._unattached_logged = False
@@ -22937,6 +23693,13 @@ class DownloadFailureWatch:
         self.facts.add(f"Request failed: {self._describe(request)} {what}", repeat=self._live[request] is not None)
 
     def _read_tally(self) -> None:
+        attempt = self._native_download_attempt
+        if attempt is not None and not attempt.closed and attempt.observer.context is self._context:
+            if attempt.interrupted > self._native_failures_seen[0]:
+                self.facts.add("Browser download interrupted before completion.", repeat=True)
+            if attempt.cancelled_by_skyvern > self._native_failures_seen[1]:
+                self.facts.add("Browser download cancelled at the configured download timeout.", repeat=True)
+            self._native_failures_seen = (attempt.interrupted, attempt.cancelled_by_skyvern)
         tally = download_tally_for_context(self._context)
         if tally is None:
             return
@@ -22952,6 +23715,8 @@ class DownloadFailureWatch:
                     f"Browser download not saved ({_DOWNLOAD_NOTICE_SANITIZE_RE.sub('', reason)[:80]}): {unsaved}",
                     repeat=True,
                 )
+        for fact in replay_candidates_for_context(self._context).values():
+            self.facts.add(fact, repeat=False)
 
     async def begin(self) -> int:
         try:
@@ -22961,6 +23726,8 @@ class DownloadFailureWatch:
                 if context is not self._context:
                     self.close()
                     self._context = context
+                    # Inside a run's scope the scope ends this hold, after the task's cleanup rather than at close().
+                    self._owns_candidate_mode = begin_replay_candidate_hold(context)
                     self._tally_generation = None
                     self._read_tally()
                     for event, hook in self._hooks.items():
@@ -22980,12 +23747,16 @@ class DownloadFailureWatch:
     def end(self) -> None:
         self._open_calls = max(0, self._open_calls - 1)
 
+    async def attach(self) -> None:
+        await self.begin()
+        self.end()
+
     def _unanswered(self, call: int) -> list[Request]:
         return [
             request for request, started in self._live.items() if started == call and request not in self._responded
         ]
 
-    async def settle(self, call: int, *, wait: bool) -> list[str]:
+    async def settle(self, call: int, *, wait: bool, deliver: bool = True) -> list[str]:
         """Waits, boundedly and only when `wait`, for the requests call `call` started, then hands out the
         undelivered facts and the requests still unanswered."""
         deadline = time.monotonic() + _DOWNLOAD_FAILURE_SETTLE_SECONDS
@@ -23010,7 +23781,7 @@ class DownloadFailureWatch:
                     await asyncio.wait_for(self._changed.wait(), remaining)
         finally:
             self.end()
-        return self.facts.deliver() + pending
+        return (self.facts.deliver() if deliver else []) + pending
 
     def close(self) -> None:
         for working_page in list(self._named_pages):
@@ -23024,6 +23795,10 @@ class DownloadFailureWatch:
         for event, hook in self._hooks.items():
             with contextlib.suppress(Exception):
                 self._context.remove_listener(event, hook)
+        if self._owns_candidate_mode:
+            # Ends the hold: whatever the run did not select is discarded, never saved.
+            set_replay_candidate_mode_for_context(self._context, False)
+        self._owns_candidate_mode = False
         self._context = None
         self._live.clear()
         self._responded.clear()
@@ -23198,7 +23973,7 @@ def _apply_download_signal(
             failures: list[str] = []
             page_names: Mapping[str, str] = {}
             if failure_watch is not None:
-                failures = await failure_watch.settle(call, wait=_may_submit(_tool_name, args))
+                failures = await failure_watch.settle(call, wait=_may_submit(_tool_name, args), deliver=False)
             # A file a tool staged itself (file_upload) is not a download to wait for.
             staged = bool((result.data or {}).get("staged_download"))
             if download_wait is not None and ((_billable and not staged) or _list_split()[1]):
@@ -23206,7 +23981,11 @@ def _apply_download_signal(
                     await download_wait()
                 except Exception:
                     LOG.warning("taskv3 download wait failed", tool=_tool_name, exc_info=True)
+                if failure_watch is not None:
+                    # A replay the wait saw held belongs in this call's result, before the model's next choice.
+                    failures.extend(failure_watch.facts.deliver())
             if failure_watch is not None:
+                failures = failure_watch.facts.deliver() + failures
                 landed = [name for name in _list_split()[0] if name not in seen_completed]
                 if landed:
                     page_names = await failure_watch.page_names(landed)

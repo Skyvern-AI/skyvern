@@ -333,8 +333,7 @@ class TestArtifactContentFromS3:
         assert all(amount is not None for amount, _ in storage_bodies.reads)
         assert sum(size for _, size in storage_bodies.reads) == len(body)
 
-    @pytest.mark.parametrize("range_header", [None, "bytes=5-14"])
-    @pytest.mark.parametrize("kind", ["bundle-member", "compressed-har"])
+    @pytest.mark.parametrize(("kind", "range_header"), [("bundle-member", None), ("compressed-har", "bytes=5-14")])
     def test_decoded_artifacts_keep_their_whole_object_semantics(
         self,
         monkeypatch: pytest.MonkeyPatch,

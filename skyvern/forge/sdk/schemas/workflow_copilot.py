@@ -26,7 +26,6 @@ from skyvern.forge.sdk.schemas.copilot_turn_outcome import (
     PersistedCopilotComposerMode,
     TurnOutcome,
 )
-from skyvern.services.browser_recording.evidence import RecordingEvidencePacket
 from skyvern.utils.secret_headers import mask_header_values
 from skyvern.utils.yaml_loader import dump_workflow_yaml, safe_load_no_dates
 
@@ -505,13 +504,12 @@ class WorkflowCopilotChatRequest(BaseModel):
             "a new proposal, so the client can keep rendering an actionable review gate."
         ),
     )
-    product_action: Literal["test_end_to_end", "diagnose_run", "refine_recording", "demonstrate"] | None = Field(
+    product_action: Literal["test_end_to_end", "diagnose_run", "demonstrate"] | None = Field(
         None,
         description=(
             "Structured product action for this turn, dispatched by the server instead of the agent. "
             "'test_end_to_end' runs every block of the pending proposal in a browser session minted "
             "for that run. 'diagnose_run' opens repair on the finished run named by workflow_run_id. "
-            "'refine_recording' infers a reusable workflow from recording_evidence. "
             "'demonstrate' replays a completed browser demonstration before the first model call."
         ),
     )
@@ -519,28 +517,6 @@ class WorkflowCopilotChatRequest(BaseModel):
     demonstration_insertion: WorkflowCopilotDemonstrationInsertion | None = Field(
         None,
         description="Optional placement bounds for blocks authored after a demonstration.",
-    )
-    recording_evidence: RecordingEvidencePacket | None = Field(
-        None,
-        description=(
-            "Observation-only projection of a browser recording, required by the 'refine_recording' "
-            "action. Reaches the model as untrusted evidence, never as part of the turn's message."
-        ),
-    )
-    recording_in_progress: bool = Field(
-        False,
-        description=(
-            "Set on an ordinary chat turn while a browser recording is capturing. The server attaches its own "
-            "redacted projection of that recording as untrusted evidence; the client sends no recording content."
-        ),
-    )
-    recording_deleted_step_ids: list[Annotated[str, StringConstraints(max_length=128)]] = Field(
-        default_factory=list,
-        max_length=500,
-        description=(
-            "Draft step ids the user deleted in the recording panel. The server drops them from its own "
-            "draft before projecting live recording evidence; unknown ids are ignored."
-        ),
     )
     eval_entrypoint_url: str | None = Field(
         None,

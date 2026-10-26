@@ -15,7 +15,6 @@ import { useCacheKeyValuesQuery } from "@/routes/workflows/hooks/useCacheKeyValu
 import { useWorkflowQuery } from "@/routes/workflows/hooks/useWorkflowQuery";
 import { useCacheKeyValueStore } from "@/store/CacheKeyValueStore";
 import { useDebugStore } from "@/store/useDebugStore";
-import { useRecordingStore } from "@/store/useRecordingStore";
 import { useShowAllCodeStore } from "@/store/ShowAllCodeStore";
 import { useWorkflowPanelStore } from "@/store/WorkflowPanelStore";
 
@@ -34,7 +33,6 @@ function CodeSubmenu() {
   const cacheKey = workflow?.cache_key ?? "";
 
   const isDebugMode = useDebugStore().isDebugMode;
-  const isRecording = useRecordingStore((s) => s.isRecording);
   const showAllCode = useShowAllCodeStore((s) => s.showAllCode);
   const toggleCodeView = useToggleCodeView();
 
@@ -59,7 +57,7 @@ function CodeSubmenu() {
   const values = cacheKeyValues?.values ?? [];
   const totalCount = cacheKeyValues?.total_count ?? 0;
 
-  if (isRecording || isGeneratingCode || totalCount === 0) {
+  if (isGeneratingCode || totalCount === 0) {
     return null;
   }
 

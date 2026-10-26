@@ -29,6 +29,7 @@ from skyvern.exceptions import (
     BitwardenCreateCollectionError,
     BitwardenCreateCreditCardItemError,
     BitwardenCreateLoginItemError,
+    BitwardenCredentialsRejectedError,
     BitwardenGetItemError,
     BitwardenListItemsError,
     BitwardenLoginError,
@@ -39,6 +40,7 @@ from skyvern.exceptions import (
 )
 from skyvern.forge.sdk.api.aws import get_aws_client
 from skyvern.forge.sdk.core.aiohttp_helper import aiohttp_delete, aiohttp_get_json, aiohttp_post
+from skyvern.forge.sdk.credential_site_policy import LoginSite
 from skyvern.forge.sdk.schemas.credentials import (
     BitwardenItemOverview,
     CredentialItem,
@@ -69,9 +71,11 @@ def _login_timeout_seconds(timeout: int) -> int:
     return max(timeout, settings.BITWARDEN_LOGIN_TIMEOUT_SECONDS)
 
 
-def _attempt_deadline_seconds(timeout: int) -> int:
-    """One attempt is a login plus the reads behind it, so it gets both budgets rather than twice one."""
-    return _login_timeout_seconds(timeout) + timeout
+def _attempt_deadline_seconds(timeout: int, identity: "_VaultIdentity") -> int:
+    """One attempt is a cold session plus the reads behind it. An API-key session pays a cold unlock on
+    top of its login, so it gets a second cold budget; an email login prints a key it can unlock with."""
+    cold = _login_timeout_seconds(timeout)
+    return cold + timeout if identity.uses_email_auth else 2 * cold + timeout
 
 
 # The CLI keeps its login state, tokens and encrypted vault copy in one data directory. Pointing each
@@ -115,6 +119,24 @@ _USER_KEY_ID_BACKFILL_ADVISORY = re.compile(
     r"needs migration: KeyIdBackfillError: User key is not available in key store$",
     re.IGNORECASE,
 )
+
+# How `bw login` reports the server rejecting the account's credentials, as opposed to not answering: the
+# email-login message CLI 2026.x prints, the server wording older CLIs passed through, and the API-key message.
+_REJECTED_CREDENTIALS_MARKERS = (
+    "invalid master password.",
+    "username or password is incorrect.",
+    "client_id or client_secret is incorrect.",
+)
+
+
+def _login_failure(stderr: str) -> BitwardenLoginError:
+    lowered = stderr.lower()
+    error_class = (
+        BitwardenCredentialsRejectedError
+        if any(marker in lowered for marker in _REJECTED_CREDENTIALS_MARKERS)
+        else BitwardenLoginError
+    )
+    return error_class(f"Failed to log in. stderr: {stderr}")
 
 
 def _contains_decryption_failure(value: Any) -> bool:
@@ -592,27 +614,24 @@ def get_bitwarden_item_overview_from_bitwarden_item(
     )
     login = item.get("login")
     uris = login.get("uris") if isinstance(login, dict) else []
-    url = next(
-        (
-            uri.get("uri")
-            for uri in uris or []
-            if isinstance(uri, dict) and isinstance(uri.get("uri"), str) and uri.get("uri")
-        ),
-        None,
-    )
+    urls = [
+        uri["uri"] for uri in uris or [] if isinstance(uri, dict) and isinstance(uri.get("uri"), str) and uri["uri"]
+    ]
 
     return BitwardenItemOverview(
         item_id=item_id,
         title=title,
         collection_id=collection_id,
         credential_type=credential_type,
-        url=url,
+        url=urls[0] if urls else None,
+        urls=urls,
     )
 
 
 # Bitwarden's per-URI match mode, as the vault stores it. A user who narrowed a URI below its default
 # is saying the credential does not belong to the whole site, and `never` says not to offer it at all.
 _BITWARDEN_URI_MATCH_DOMAIN = 0
+_BITWARDEN_URI_MATCH_HOST = 1
 
 
 def _whole_site_login_uris(login_item: dict[str, Any]) -> list[str]:
@@ -624,6 +643,30 @@ def _whole_site_login_uris(login_item: dict[str, Any]) -> list[str]:
         and uri.get("uri")
         and (uri.get("match") is None or uri.get("match") == _BITWARDEN_URI_MATCH_DOMAIN)
     ]
+
+
+def _connected_vault_login_sites(login_item: dict[str, Any]) -> list[LoginSite]:
+    """A Default (null) URI follows the account's own default match setting, which the item does not carry
+    and which may be narrower than Base domain, so it is read as Host."""
+    sites: list[LoginSite] = []
+    for uri in login_item.get("uris") or []:
+        if not (isinstance(uri, dict) and uri.get("uri")):
+            continue
+        if uri.get("match") == _BITWARDEN_URI_MATCH_DOMAIN:
+            sites.append(LoginSite(uri["uri"], whole_site=True))
+        elif uri.get("match") in (None, _BITWARDEN_URI_MATCH_HOST):
+            sites.append(LoginSite(uri["uri"], whole_site=False))
+    return sites
+
+
+def _require_in_vault_scope(
+    item: dict[str, Any], bw_organization_id: str | None, bw_collection_ids: list[str] | None
+) -> None:
+    """The same organization and collection scope list_item_overviews applies."""
+    if bw_organization_id and item.get("organizationId") != bw_organization_id:
+        raise BitwardenAccessDeniedError()
+    if bw_collection_ids and not set(item.get("collectionIds") or []) & set(bw_collection_ids):
+        raise BitwardenAccessDeniedError()
 
 
 def is_valid_email(email: str | None) -> bool:
@@ -662,9 +705,21 @@ class BitwardenConstants(StrEnum):
     SKYVERN_AUTH_BITWARDEN_CLIENT_SECRET = "SKYVERN_AUTH_BITWARDEN_CLIENT_SECRET"
 
 
+class BitwardenLoginSecret(dict[str, str]):
+    """A login's fields, carrying the sites its item is saved for."""
+
+    def __init__(self, fields: dict[str, str], login_sites: list[LoginSite]) -> None:
+        super().__init__(fields)
+        self.login_sites = login_sites
+
+
 class BitwardenQueryResult(BaseModel):
     credential: dict[str, str]
     uris: list[str]
+    login_sites: list[LoginSite]
+
+    def secret(self) -> BitwardenLoginSecret:
+        return BitwardenLoginSecret(self.credential, self.login_sites)
 
 
 class RunCommandResult(BaseModel):
@@ -814,8 +869,11 @@ class BitwardenService:
         if identity.uses_email_auth and trust_login_key and login_key:
             session.session_key = login_key
         else:
+            # Under a batch the cold unlock after an API-key login runs as long as the login itself, so it
+            # gets the login's budget. An email fallback unlock keeps the read budget.
+            unlock_timeout = timeout if identity.uses_email_auth else login_timeout or timeout
             session.session_key = await BitwardenService.unlock(
-                identity.master_password, timeout=timeout, appdata_dir=session.appdata_dir
+                identity.master_password, timeout=unlock_timeout, appdata_dir=session.appdata_dir
             )
         if verify_sync:
             # The sync inside `bw login` swallows its own failure; `bw sync` reports one.
@@ -1121,6 +1179,34 @@ class BitwardenService:
             )
 
     @staticmethod
+    async def get_login_item_sites(
+        client_id: str | None,
+        client_secret: str | None,
+        master_password: str,
+        bw_organization_id: str | None,
+        bw_collection_ids: list[str] | None,
+        item_id: str,
+        email: str | None = None,
+        timeout: int = settings.BITWARDEN_TIMEOUT_SECONDS,
+    ) -> list[LoginSite]:
+        """The sites one login item is saved for; its secret fields are read and dropped here."""
+        if not is_uuid(item_id):
+            raise BitwardenGetItemError(f"Invalid item ID: {item_id}. Check if the item ID is correct")
+
+        async def fetch(session: _CliSession) -> list[LoginSite]:
+            command = ["bw", "get", "item", item_id, "--session", session.session_key or ""]
+            item_result = await BitwardenService.run_command(command, additional_env=session.env, timeout=timeout)
+            item = BitwardenService._parse_fetched_item(item_result, item_id)
+            _require_in_vault_scope(item, bw_organization_id, bw_collection_ids)
+            if item["type"] != BitwardenItemType.LOGIN:
+                raise BitwardenGetItemError("Bitwarden item is not a login type")
+            return _connected_vault_login_sites(item["login"])
+
+        identity = _VaultIdentity.resolve(client_id, client_secret, email, master_password)
+        async with asyncio.timeout(timeout):
+            return await BitwardenService._with_cli_session(identity, timeout=timeout, run=fetch)
+
+    @staticmethod
     async def get_secret_value_from_url(
         client_id: str | None,
         client_secret: str | None,
@@ -1147,12 +1233,15 @@ class BitwardenService:
 
         await BitwardenService._apply_jitter()
         login_timeout = _login_timeout_seconds(timeout)
+        attempt_deadline = _attempt_deadline_seconds(
+            timeout, _VaultIdentity.resolve(client_id, client_secret, email, master_password)
+        )
         for attempt in range(max_retries):
             try:
-                # A cold login gets `login_timeout` and every other CLI command gets `timeout`; the attempt
-                # as a whole gets both, so one slow step cannot consume the other's budget and a dead vault
-                # still fails in bounded time.
-                async with asyncio.timeout(_attempt_deadline_seconds(timeout)):
+                # A cold login (and an API-key unlock) gets `login_timeout` and every other CLI command gets
+                # `timeout`; the attempt as a whole gets all of them, so one slow step cannot consume
+                # another's budget and a dead vault still fails in bounded time.
+                async with asyncio.timeout(attempt_deadline):
                     return await BitwardenService._get_secret_value_from_url(
                         client_id=client_id,
                         client_secret=client_secret,
@@ -1233,17 +1322,21 @@ class BitwardenService:
                 command = ["bw", "get", "item", item_id, "--session", session_key]
                 item_result = await BitwardenService.run_command(command, additional_env=session.env, timeout=timeout)
                 item = BitwardenService._parse_fetched_item(item_result, item_id)
+                _require_in_vault_scope(item, bw_organization_id, bw_collection_ids)
                 if item["type"] != BitwardenItemType.LOGIN:
                     raise BitwardenGetItemError("Bitwarden item is not a login type")
 
                 login = item["login"]
                 totp = BitwardenService.normalize_totp_config(login.get("totp") or "")
 
-                return {
-                    BitwardenConstants.USERNAME: login.get("username") or "",
-                    BitwardenConstants.PASSWORD: login.get("password") or "",
-                    BitwardenConstants.TOTP: totp,
-                }
+                return BitwardenLoginSecret(
+                    {
+                        BitwardenConstants.USERNAME: login.get("username") or "",
+                        BitwardenConstants.PASSWORD: login.get("password") or "",
+                        BitwardenConstants.TOTP: totp,
+                    },
+                    _connected_vault_login_sites(login),
+                )
             elif not url:
                 # if item_id is not provided, we need a url to search for items
                 raise BitwardenGetItemError("No url or item ID provided")
@@ -1306,6 +1399,7 @@ class BitwardenService:
                             BitwardenConstants.TOTP: totp,
                         },
                         uris=[uri.get("uri") for uri in login.get("uris") or [] if uri.get("uri")],
+                        login_sites=_connected_vault_login_sites(login),
                     )
                 )
 
@@ -1313,7 +1407,7 @@ class BitwardenService:
                 return {}
 
             if len(bitwarden_result) == 1:
-                return bitwarden_result[0].credential
+                return bitwarden_result[0].secret()
 
             # Choose multiple credentials according to the defined rule,
             # if no cred matches the rule, return the first one.
@@ -1324,9 +1418,9 @@ class BitwardenService:
                     for uri in single_result.uris:
                         # check if the register_domain is the same
                         if extract_url.registered_domain == tldextract.extract(uri).registered_domain:
-                            return single_result.credential
+                            return single_result.secret()
             LOG.warning("No credential in Bitwarden matches the rule, returning the first match")
-            return bitwarden_result[0].credential
+            return bitwarden_result[0].secret()
 
         identity = _VaultIdentity.resolve(client_id, client_secret, email, master_password)
         return await BitwardenService._with_cli_session(
@@ -1356,7 +1450,8 @@ class BitwardenService:
         if not fail_reasons:
             await BitwardenService._apply_jitter()
         try:
-            async with asyncio.timeout(_attempt_deadline_seconds(timeout)):
+            vault_identity = _VaultIdentity.resolve(client_id, client_secret, email, master_password)
+            async with asyncio.timeout(_attempt_deadline_seconds(timeout, vault_identity)):
                 return await BitwardenService._get_sensitive_information_from_identity(
                     client_id=client_id,
                     client_secret=client_secret,
@@ -1507,10 +1602,10 @@ class BitwardenService:
         # Never quote stdout in an error: a successful email login prints the vault session key there,
         # even when stderr carries something unexpected.
         if login_result.stdout and "You are logged in!" not in login_result.stdout:
-            raise BitwardenLoginError(f"Failed to log in. stderr: {login_result.stderr}")
+            raise _login_failure(login_result.stderr)
 
         if login_result.stderr and not BitwardenService._is_ignorable_login_stderr(login_result.stderr):
-            raise BitwardenLoginError(f"Failed to log in. stderr: {login_result.stderr}")
+            raise _login_failure(login_result.stderr)
 
         LOG.info("Bitwarden login successful")
         return BitwardenService._extract_session_key(login_result.stdout)
@@ -1672,7 +1767,9 @@ class BitwardenService:
         if not fail_reasons:
             await BitwardenService._apply_jitter()
         try:
-            async with asyncio.timeout(_attempt_deadline_seconds(settings.BITWARDEN_TIMEOUT_SECONDS)):
+            timeout = settings.BITWARDEN_TIMEOUT_SECONDS
+            vault_identity = _VaultIdentity.resolve(client_id, client_secret, email, master_password)
+            async with asyncio.timeout(_attempt_deadline_seconds(timeout, vault_identity)):
                 return await BitwardenService._get_credit_card_data(
                     client_id=client_id,
                     client_secret=client_secret,
@@ -1682,7 +1779,8 @@ class BitwardenService:
                     collection_id=collection_id,
                     item_id=item_id,
                     email=email,
-                    login_timeout=_login_timeout_seconds(settings.BITWARDEN_TIMEOUT_SECONDS),
+                    timeout=timeout,
+                    login_timeout=_login_timeout_seconds(timeout),
                 )
         except BitwardenAccessDeniedError as e:
             raise e

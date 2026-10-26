@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from collections.abc import Callable
 from contextlib import AbstractAsyncContextManager
 from dataclasses import dataclass
 from typing import Protocol
@@ -34,6 +35,7 @@ class BrowserManager(Protocol):
         navigate: bool = True,
         browser_session_runnable_id: str | None = None,
         browser_session_runnable_generation_id: str | None = None,
+        before_navigation: Callable[[BrowserState], None] | None = None,
     ) -> BrowserState: ...
 
     async def cleanup_for_task(

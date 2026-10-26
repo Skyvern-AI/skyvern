@@ -35,7 +35,7 @@ async def test_download_file_accepts_run_local_absolute_path(tmp_path: Path, mon
 
 
 @pytest.mark.asyncio
-async def test_download_file_absolute_path_outside_run_dir_recovers(
+async def test_download_file_absolute_path_outside_run_dir_fails_cleanly(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     run_id = "wr_upload"
@@ -53,7 +53,8 @@ async def test_download_file_absolute_path_outside_run_dir_recovers(
     download_mock = AsyncMock(side_effect=AssertionError("remote download must not be called"))
     monkeypatch.setattr(handler_utils, "download_file_api", download_mock)
 
-    result = await handler_utils.download_file(str(outside_file), action={"action_type": "upload_file"})
+    with pytest.raises(handler_utils.UploadFileDownloadError) as error:
+        await handler_utils.download_file(str(outside_file), action={"action_type": "upload_file"})
 
-    assert result == []
+    assert isinstance(error.value.__cause__, PermissionError)
     download_mock.assert_not_awaited()

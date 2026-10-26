@@ -20,6 +20,7 @@ from skyvern.forge.sdk.schemas.credentials import (
     Credential,
     CredentialType,
     CredentialVaultType,
+    TotpType,
 )
 from skyvern.forge.sdk.schemas.organization_bitwarden_collections import OrganizationBitwardenCollection
 from skyvern.schemas.proxy_pinning import generate_proxy_session_id, should_generate_proxy_session_id
@@ -82,6 +83,7 @@ class CredentialRepository(BaseRepository):
         proxy_session_id: str | None = None,
         created_by: str | None = None,
         vault_id: str | None = None,
+        is_passkey_setup_pending: bool | None = None,
     ) -> Credential:
         proxy_location, proxy_session_id = normalize_proxy_pin_for_create(
             proxy_location=proxy_location,
@@ -107,6 +109,7 @@ class CredentialRepository(BaseRepository):
                 proxy_location=serialized_proxy_location,
                 proxy_session_id=proxy_session_id,
                 created_by=created_by,
+                is_passkey_setup_pending=is_passkey_setup_pending,
             )
             session.add(credential)
             await session.flush()
@@ -561,6 +564,8 @@ class CredentialRepository(BaseRepository):
         proxy_location: ProxyLocationInput | object = _UNSET,
         proxy_session_id: str | None | object = _UNSET,
         rotate_proxy_session_id: bool = False,
+        is_test_login_temporary: bool | None = None,
+        is_passkey_setup_pending: bool | None = None,
     ) -> Credential:
         async with self.Session() as session:
             credential = (
@@ -591,6 +596,10 @@ class CredentialRepository(BaseRepository):
                 credential.auto_profile_disabled = auto_profile_disabled
             if run_sequentially is not None:
                 credential.run_sequentially = run_sequentially
+            if is_test_login_temporary is not None:
+                credential.is_test_login_temporary = is_test_login_temporary
+            if is_passkey_setup_pending is not None:
+                credential.is_passkey_setup_pending = is_passkey_setup_pending
             apply_proxy_pin_to_model(
                 credential,
                 entity_id=credential_id,
@@ -683,6 +692,12 @@ class CredentialRepository(BaseRepository):
             credential.credential_type = credential_type
             credential.username = username
             credential.totp_type = totp_type
+            if credential.is_test_login_temporary is True:
+                credential.is_test_login_temporary = False
+            if credential.is_passkey_setup_pending is True and (
+                credential_type != CredentialType.PASSWORD or totp_type != TotpType.PASSKEY
+            ):
+                credential.is_passkey_setup_pending = False
             credential.totp_identifier = totp_identifier
             if has_totp_seed is not None:
                 credential.has_totp_seed = has_totp_seed

@@ -1,5 +1,6 @@
 import asyncio
 import hashlib
+from collections.abc import Mapping
 from contextvars import ContextVar
 from dataclasses import dataclass
 from enum import StrEnum
@@ -44,6 +45,9 @@ class BearerIdentity:
     org_role: str | None = None
     org_role_claim: str | None = None
     token_has_organization_claim: bool | None = None
+    app_role: str | None = None
+    app_role_is_authoritative: bool = False
+    impersonator_user_id: str | None = None
 
 
 @dataclass(frozen=True)
@@ -62,6 +66,16 @@ class RequestPrincipal:
     token_has_organization_claim: bool | None = None
     # Last, so callers that build a principal positionally as (organization, kind, user, role) keep their meaning.
     api_key_token_id: str | None = None
+    app_role: str | None = None
+    app_role_is_authoritative: bool = False
+    impersonator_user_id: str | None = None
+
+
+def extract_clerk_impersonator_user_id(payload: Mapping[str, object]) -> str | None:
+    """Extract Clerk's ``act.sub`` from a signature-verified payload."""
+    act_claim = payload.get("act")
+    user_id = act_claim.get("sub") if isinstance(act_claim, Mapping) else None
+    return user_id if isinstance(user_id, str) and user_id else None
 
 
 def synthetic_user_id(organization_id: str) -> str:
@@ -175,6 +189,9 @@ def _build_request_principal(
         token_has_organization_claim=(
             True if member_key else (identity.token_has_organization_claim if identity else None)
         ),
+        app_role=identity.app_role if identity else None,
+        app_role_is_authoritative=identity.app_role_is_authoritative if identity else False,
+        impersonator_user_id=identity.impersonator_user_id if identity else None,
     )
 
 

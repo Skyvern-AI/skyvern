@@ -11,6 +11,8 @@ import structlog
 from playwright.async_api import Page
 from pydantic import BaseModel, PrivateAttr
 
+from skyvern.webeye.native_downloads import NativeDownloads
+
 LOG = structlog.get_logger()
 
 
@@ -124,6 +126,14 @@ class BrowserArtifacts(BaseModel):
     _requested_graphics_flags: tuple[str, ...] | None = PrivateAttr(default=None)
     # Whether the creator started this browser's process on this host itself, rather than dialing one.
     _spawned_local_browser: bool = PrivateAttr(default=False)
+    _native_downloads: NativeDownloads | None = PrivateAttr(default=None)
+
+    @property
+    def native_downloads(self) -> NativeDownloads | None:
+        return self._native_downloads
+
+    def attach_native_downloads(self, observer: NativeDownloads | None) -> None:
+        self._native_downloads = observer
 
     def local_paths(self) -> list[str]:
         """Files and folders on this host that the browser writes to: recordings, HAR, traces, profile, console log."""

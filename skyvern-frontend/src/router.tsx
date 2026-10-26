@@ -40,6 +40,8 @@ import { RecipesPage } from "@/routes/recipes/RecipesPage";
 import { RunRouter } from "@/routes/runs/RunRouter";
 import { SchedulesRoute } from "@/routes/schedules/SchedulesRoute";
 import { ScheduleDetailRoute } from "@/routes/schedules/ScheduleDetailRoute";
+import { OidcCallback } from "@/routes/auth/OidcCallback";
+import { OrganizationMembers } from "@/routes/settings/OrganizationMembers";
 
 const recipeComingSoonRoutes = [
   {
@@ -107,6 +109,10 @@ const recipeComingSoonRoutes = [
 }));
 
 const router = createBrowserRouter([
+  {
+    path: "/oidc/callback",
+    element: <OidcCallback />,
+  },
   {
     path: "browser-session/:browserSessionId",
     element: <BrowserSession />,
@@ -329,6 +335,10 @@ const router = createBrowserRouter([
           {
             path: "labels",
             element: <LabelManagement />,
+          },
+          {
+            path: "members",
+            element: <OrganizationMembers />,
           },
         ],
       },
