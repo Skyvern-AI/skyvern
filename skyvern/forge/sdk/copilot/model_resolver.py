@@ -357,6 +357,9 @@ def resolve_model_config(
     provider = CopilotLitellmProvider(base_url=base_url, api_key=api_key)
 
     run_config = RunConfig(
+        # A model instance, unlike a bare gpt-5* name, gets no SDK default ModelSettings; those carry their own
+        # reasoning effort, which LitellmModel sends instead of the configured one in extra_args.
+        model=provider.get_model(config.model_name),
         model_provider=provider,
         model_settings=model_settings,
         tracing_disabled=not is_tracing_enabled(),

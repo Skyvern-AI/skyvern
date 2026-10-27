@@ -214,7 +214,7 @@ from .discovery import _discovery_detect_login_wall as _discovery_detect_login_w
 from .discovery import _discovery_resolve_href as _discovery_resolve_href
 from .discovery import _discovery_walk as _discovery_walk
 from .discovery import _resolve_discovery_entry_url as _resolve_discovery_entry_url
-from .errors import copilot_tool_failure, reporting_withheld_browser
+from .errors import copilot_tool_failure, register_argument_models, reporting_withheld_browser
 from .frontier import _CANONICAL_WORKFLOW_SETTING_FIELDS as _CANONICAL_WORKFLOW_SETTING_FIELDS
 from .frontier import _JINJA_LITERAL_ROOTS as _JINJA_LITERAL_ROOTS
 from .frontier import _JINJA_RUNTIME_GLOBAL_ROOTS as _JINJA_RUNTIME_GLOBAL_ROOTS
@@ -2445,6 +2445,7 @@ NATIVE_TOOLS = [
     delete_saved_credentials_tool,
     reply_tool,
 ]
+register_argument_models(NATIVE_TOOLS)
 
 
 # Not advertised without browser authority: these drive a run, the scouting tab or a live page.

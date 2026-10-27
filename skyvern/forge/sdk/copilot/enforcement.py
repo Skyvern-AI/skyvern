@@ -17,17 +17,19 @@ from typing import TYPE_CHECKING, Any, TypeVar
 from urllib.parse import urlparse
 
 import structlog
-from agents.exceptions import MaxTurnsExceeded, ModelBehaviorError
+from agents.exceptions import MaxTurnsExceeded, ModelBehaviorError, OutputGuardrailTripwireTriggered
 from agents.items import TResponseInputItem
 from agents.memory.session import Session
 from agents.run import Runner
 from agents.run_config import RunConfig
 from agents.run_context import RunContextWrapper
+from agents.run_error_handlers import RunErrorHandlerInput, RunErrorHandlerResult, RunErrorHandlers
 from agents.tool import Tool
 from openai.types.responses import ResponseFunctionToolCall
 from PIL import Image
 
 from skyvern.config import settings
+from skyvern.forge.sdk.agents.context import get_agent_message_field
 from skyvern.forge.sdk.copilot import streaming_adapter
 from skyvern.forge.sdk.copilot.ask_user import ACCOUNT_GROUP_SUBMIT_TOOL_NAME
 from skyvern.forge.sdk.copilot.budget_expiry import (
@@ -1372,6 +1374,33 @@ def _accumulate_usage(result: RunResultStreaming, ctx: Any) -> None:
     ctx.total_tokens_used = (ctx.total_tokens_used or 0) + total_tokens
 
 
+def _refusal_ends_run_empty(_: RunErrorHandlerInput[Any]) -> RunErrorHandlerResult:
+    # The model telemetry already recorded the refusal or content-filter stop, which sends an empty run to the turn's
+    # empty-completion exit.
+    return RunErrorHandlerResult(final_output="", include_in_history=False)
+
+
+_RUN_ERROR_HANDLERS: RunErrorHandlers[Any] = {"model_refusal": _refusal_ends_run_empty}
+
+
+async def _drop_withheld_response(session: Session | None, ctx: Any) -> None:
+    """The SDK keeps a blocked turn's tool calls in the session so a re-run sees their side effects. The only blocked
+    turn here is a ``reply``, which ends the turn alone, so its call carries the very text the guardrail withheld."""
+    response = ctx.last_model_response
+    if session is None or response is None:
+        return
+    call_ids = {item.call_id for item in response.output if isinstance(item, ResponseFunctionToolCall)}
+    items = await session.get_items()
+    kept = len(items)
+    while kept and get_agent_message_field(items[kept - 1], "call_id") in call_ids:
+        kept -= 1
+    # A reasoning item without the call that follows it is rejected by the Responses API.
+    while kept < len(items) and kept and get_agent_message_field(items[kept - 1], "type") == "reasoning":
+        kept -= 1
+    for _ in range(len(items) - kept):
+        await session.pop_item()
+
+
 async def _run_streamed_with_deadline(
     agent: Agent,
     current_input: str | list,
@@ -1404,7 +1433,14 @@ async def _run_streamed_with_deadline(
         TOTAL_TIMEOUT_SECONDS + HARD_BACKSTOP_ALLOWANCE_SECONDS - elapsed,
     )
     with pending_operation("turn.stream", span=True):
-        result = Runner.run_streamed(agent, input=current_input, context=ctx, session=session, **runner_kwargs)
+        result = Runner.run_streamed(
+            agent,
+            input=current_input,
+            context=ctx,
+            session=session,
+            error_handlers=_RUN_ERROR_HANDLERS,
+            **runner_kwargs,
+        )
 
         def check_model_work_deadline() -> None:
             if _elapsed_run_seconds(ctx, start_time) >= TOTAL_TIMEOUT_SECONDS:
@@ -1419,6 +1455,9 @@ async def _run_streamed_with_deadline(
                 async with asyncio.timeout(remaining) as deadline:
                     ctx.model_stream_deadline = deadline
                     await streaming_adapter.stream_to_sse(result, tracked_stream, ctx)
+            except OutputGuardrailTripwireTriggered:
+                await _drop_withheld_response(session, ctx)
+                raise
             finally:
                 if steer_watcher is not None:
                     steer_watcher.cancel()

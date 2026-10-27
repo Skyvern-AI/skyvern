@@ -427,6 +427,9 @@ class _ProgressGuardedStream:
     def __aiter__(self) -> _ProgressGuardedStream:
         return self
 
+    async def aclose(self) -> None:
+        await LitellmModel._maybe_aclose(self._stream)
+
     async def __anext__(self) -> ChatCompletionChunk:
         timeout = asyncio.timeout_at(self._last_progress + _STREAM_PROGRESS_TIMEOUT_SECONDS)
         try:
@@ -469,6 +472,9 @@ class _UsageCapturingStream:
 
     def __aiter__(self) -> _UsageCapturingStream:
         return self
+
+    async def aclose(self) -> None:
+        await LitellmModel._maybe_aclose(self._stream)
 
     async def __anext__(self) -> ChatCompletionChunk:
         chunk = await self._iterator.__anext__()
@@ -707,19 +713,22 @@ class CopilotLitellmModel(LitellmModel):
             model=self.model,
             base_url=self.base_url,
         ):
-            async for event in super().stream_response(
-                system_instructions,
-                input,
-                model_settings,
-                tools,
-                output_schema,
-                handoffs,
-                tracing,
-                previous_response_id,
-                conversation_id,
-                prompt,
-            ):
-                yield event
+            async with contextlib.aclosing(
+                super().stream_response(
+                    system_instructions,
+                    input,
+                    model_settings,
+                    tools,
+                    output_schema,
+                    handoffs,
+                    tracing,
+                    previous_response_id,
+                    conversation_id,
+                    prompt,
+                )
+            ) as events:
+                async for event in events:
+                    yield event
 
     @overload
     async def _fetch_response(

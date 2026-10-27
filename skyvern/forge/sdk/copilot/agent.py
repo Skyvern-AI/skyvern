@@ -5846,8 +5846,8 @@ async def _run_copilot_turn_impl(
         )
 
     async def _reask_after_withheld_secret_reply(exc: OutputGuardrailTripwireTriggered) -> AgentResult:
-        # The SDK saves a final reply to the session only after its output guardrail passes, so the withheld reply
-        # never enters history; the re-ask adds only an observation naming the flagged label. A second hit refuses.
+        # Enforcement drops the withheld reply from the session, so the re-ask adds only an observation naming the
+        # flagged label. A second hit refuses.
         if _output_policy_verdict_from_guardrail_exception(exc).reason_codes != [OutputPolicyReason.RAW_SECRET_LEAK]:
             return _output_policy_blocked(exc)
         LOG.info("copilot_raw_secret_reply_reasked")

@@ -9,8 +9,8 @@ import posixpath
 import re
 import time
 import unicodedata
-from collections.abc import AsyncIterator, Awaitable, Callable
-from contextlib import AsyncExitStack, asynccontextmanager
+from collections.abc import AsyncIterator, Awaitable, Callable, Iterator
+from contextlib import AsyncExitStack, asynccontextmanager, contextmanager
 from contextvars import ContextVar
 from copy import deepcopy
 from dataclasses import dataclass, field, replace
@@ -19,6 +19,7 @@ from typing import TYPE_CHECKING, Any, Literal, NotRequired, Protocol, TypedDict
 from urllib.parse import urlsplit, urlunsplit
 
 import structlog
+from agents import default_tool_error_function
 from agents.agent import AgentBase
 from agents.mcp import MCPToolMetaContext
 from agents.mcp.server import MCPServer
@@ -1713,6 +1714,36 @@ def _owning_tool_call_meta(context: MCPToolMetaContext) -> dict[str, Any] | None
     return {_TOOL_CALL_ID_META_KEY: run_context.tool_call_id} if isinstance(run_context, ToolContext) else None
 
 
+def _mcp_tool_failure(ctx: RunContextWrapper[Any], error: Exception) -> str:
+    # The SDK drops the JSONDecodeError behind "Invalid JSON input for tool X" unless tool-data logging is on, and
+    # its formatter reports the parse position only when that error is the cause.
+    if isinstance(ctx, ToolContext) and error.__cause__ is None:
+        try:
+            json.loads(ctx.tool_arguments or "{}")
+        except json.JSONDecodeError as exc:
+            error.__cause__ = exc
+    return default_tool_error_function(ctx, error)
+
+
+@contextmanager
+def _reporting_lifecycle_failure(phase: Literal["connect", "cleanup"]) -> Iterator[None]:
+    # MCPServerManager logs these failures without their cause unless tool-data logging is on.
+    started = time.monotonic()
+    try:
+        yield
+    except asyncio.CancelledError:
+        # The manager's lifecycle timeout reaches the server as a cancellation.
+        LOG.warning(
+            "copilot_mcp_server_lifecycle_cancelled",
+            phase=phase,
+            elapsed_seconds=round(time.monotonic() - started, 1),
+        )
+        raise
+    except Exception:
+        LOG.exception("copilot_mcp_server_lifecycle_failed", phase=phase)
+        raise
+
+
 class SkyvernOverlayMCPServer(MCPServer):
     """MCP server that wraps a FastMCP transport with schema overlays and
     copilot-specific dispatch logic (loop detection, browser injection, hooks).
@@ -1730,7 +1761,11 @@ class SkyvernOverlayMCPServer(MCPServer):
         enforce_dispatch_allowlist: bool = False,
         page_state_reader: PageStateReader | None = None,
     ) -> None:
-        super().__init__(use_structured_content=False, tool_meta_resolver=_owning_tool_call_meta)
+        super().__init__(
+            use_structured_content=False,
+            failure_error_function=_mcp_tool_failure,
+            tool_meta_resolver=_owning_tool_call_meta,
+        )
         self._transport = transport
         self._overlays = overlays
         self._page_state_reader = page_state_reader
@@ -1749,26 +1784,28 @@ class SkyvernOverlayMCPServer(MCPServer):
         return "skyvern"
 
     async def connect(self) -> None:
-        ctx = self._context_provider()
-        if not ctx.api_key:
-            raise RuntimeError("Copilot agent context missing api_key")
-        stack = AsyncExitStack()
-        await stack.__aenter__()
-        client = Client(self._transport)
-        # The in-process transport's server task copies context vars once, at client entry, so a
-        # per-call override never reaches tool bodies; without this they authenticate as the server key.
-        override_token = set_api_key_override(ctx.api_key)
-        try:
-            with request_session_scope(ctx.organization_id):
-                await stack.enter_async_context(client)
-        finally:
-            reset_api_key_override(override_token)
-        self._client = client
-        self._exit_stack = stack
+        with _reporting_lifecycle_failure("connect"):
+            ctx = self._context_provider()
+            if not ctx.api_key:
+                raise RuntimeError("Copilot agent context missing api_key")
+            stack = AsyncExitStack()
+            await stack.__aenter__()
+            client = Client(self._transport)
+            # The in-process transport's server task copies context vars once, at client entry, so a
+            # per-call override never reaches tool bodies; without this they authenticate as the server key.
+            override_token = set_api_key_override(ctx.api_key)
+            try:
+                with request_session_scope(ctx.organization_id):
+                    await stack.enter_async_context(client)
+            finally:
+                reset_api_key_override(override_token)
+            self._client = client
+            self._exit_stack = stack
 
     async def cleanup(self) -> None:
         if self._exit_stack:
-            await self._exit_stack.__aexit__(None, None, None)
+            with _reporting_lifecycle_failure("cleanup"):
+                await self._exit_stack.__aexit__(None, None, None)
         self._client = None
         self._exit_stack = None
         self._cached_raw_tools = None
