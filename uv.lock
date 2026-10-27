@@ -39,7 +39,7 @@ overrides = [
     { name = "aiohttp", specifier = ">=3.14.0" },
     { name = "httpx", extras = ["socks"], specifier = ">=0.26.0" },
     { name = "jsonschema", specifier = ">=4.23.0" },
-    { name = "openai", specifier = ">=2.24.0" },
+    { name = "openai", specifier = ">=2.45.0,<3" },
     { name = "python-dotenv", specifier = ">=1.0.0" },
 ]
 
@@ -4287,7 +4287,7 @@ wheels = [
 
 [[package]]
 name = "openai"
-version = "2.33.0"
+version = "2.54.0"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "anyio" },
@@ -4299,14 +4299,14 @@ dependencies = [
     { name = "tqdm" },
     { name = "typing-extensions" },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/f0/ee/d056c82f63c05f06baac0cffb4a90952d8274f90c49dfe244f20497b9bbd/openai-2.33.0.tar.gz", hash = "sha256:f850c435e2a4685bba3295bd54912dd26315d9c1b7733068186134d6e0599f9a", size = 693254, upload-time = "2026-04-28T14:04:42.428Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/50/9a/8c75e8c8a5b407a0586faeb2afac91674ff955c191ecc1d6d3b6669f6788/openai-2.54.0.tar.gz", hash = "sha256:e3e6f8bc1ba30ddf381ace1a14340eed381cb984a1a59bd0f34b5be3b5d49cfa", size = 1100285, upload-time = "2026-08-11T18:46:59.035Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/7d/32/37734d769bc8b42e4938785313cc05aade6cb0fa72479d3220a0d61a4e78/openai-2.33.0-py3-none-any.whl", hash = "sha256:03ac37d70e8c9e3a8124214e3afa785e2cbc12e627fbd98177a086ef2fd87ad5", size = 1162695, upload-time = "2026-04-28T14:04:40.482Z" },
+    { url = "https://files.pythonhosted.org/packages/64/a8/bb76c7356de8ad57f59d5ff993d434df0607f07f08bcc9c9a5c275e399c0/openai-2.54.0-py3-none-any.whl", hash = "sha256:89089789197ccdb87f173a03145ed1598d00795220c93e96cf712b1cbf5e5f2b", size = 1660351, upload-time = "2026-08-11T18:46:56.684Z" },
 ]
 
 [[package]]
 name = "openai-agents"
-version = "0.14.8"
+version = "0.19.4"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "griffelib" },
@@ -4314,13 +4314,12 @@ dependencies = [
     { name = "openai" },
     { name = "pydantic" },
     { name = "requests" },
-    { name = "types-requests" },
     { name = "typing-extensions" },
     { name = "websockets" },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/d5/8a/d36ab647f05e790ec97dda9e4c0eb39d8840269d6a5194887b5dec92bd0d/openai_agents-0.14.8.tar.gz", hash = "sha256:fe1cb58b4150a07292a94f15d8fd5217ee9195bd6bcd8a6a46fdb1d9b08a70b7", size = 5314520, upload-time = "2026-04-29T03:40:07.6Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/ff/ea/a8cae2dadf798f369be5f9cb544a169f5f6aecc096a80f1a209dddc4c00f/openai_agents-0.19.4.tar.gz", hash = "sha256:fe21778ee1e8216c9cdb775fa86d11b08be68c0184e14023993088d3f812c0be", size = 5784063, upload-time = "2026-08-05T02:59:12.939Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/af/6e/1e9adcedcde7b163579b88a68f765a4915be4ead0713270386d9432cfd2f/openai_agents-0.14.8-py3-none-any.whl", hash = "sha256:2937ef582ccaa45d59e89839ed8948cb2a6d808bc9940f0881793c21f37f7776", size = 817332, upload-time = "2026-04-29T03:40:05.68Z" },
+    { url = "https://files.pythonhosted.org/packages/90/d8/98925e1e4888e58d7694ba71af2ba93b94540f481c45ee8b7f7be7e30fcd/openai_agents-0.19.4-py3-none-any.whl", hash = "sha256:12e0372fae9698fe6f78e05aaeb4ccdb229602f7ef99b8195a7d68dc82869f51", size = 968498, upload-time = "2026-08-05T02:59:11.191Z" },
 ]
 
 [[package]]
@@ -7144,7 +7143,7 @@ requires-dist = [
     { name = "onepassword-sdk", marker = "extra == 'server'", specifier = "==0.4.1" },
     { name = "openai", marker = "extra == 'local'", specifier = ">=1.68.2" },
     { name = "openai", marker = "extra == 'server'", specifier = ">=1.68.2" },
-    { name = "openai-agents", marker = "extra == 'server'", specifier = ">=0.10.5,<0.15" },
+    { name = "openai-agents", marker = "extra == 'server'", specifier = ">=0.19.4,<0.20" },
     { name = "opentelemetry-api", marker = "extra == 'local'", specifier = ">=1.45.1,<2" },
     { name = "opentelemetry-api", marker = "extra == 'server'", specifier = ">=1.45.1,<2" },
     { name = "orjson", specifier = ">=3.12.0,<4" },
@@ -7222,7 +7221,7 @@ cloud = [
     { name = "fpdf2", specifier = ">=2.8.8,<3" },
     { name = "guarddog", specifier = ">=3.0.2,<3.1" },
     { name = "kr8s", specifier = ">=0.20.14,<1" },
-    { name = "openai-agents", specifier = ">=0.14.8,<0.15" },
+    { name = "openai-agents", specifier = ">=0.19.4,<0.20" },
     { name = "opentelemetry-distro", specifier = ">=0.60b1,<1" },
     { name = "opentelemetry-exporter-otlp-proto-grpc", specifier = ">=1.41.1,<2" },
     { name = "opentelemetry-exporter-otlp-proto-http", specifier = ">=1.41.1,<2" },
