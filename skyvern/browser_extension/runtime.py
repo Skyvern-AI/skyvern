@@ -9,14 +9,16 @@ import sys
 import time
 from collections.abc import Callable
 from contextlib import suppress
+from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Protocol, cast
+from typing import TYPE_CHECKING, Any, Literal, Protocol, cast
 from weakref import WeakKeyDictionary, WeakSet
 
 import structlog
 
 from skyvern.browser_extension.auth import load_or_create_pairing_token
 from skyvern.browser_extension.broker_client import BrokerClient
+from skyvern.browser_extension.cdp_adapter import TabReconnectEvent
 from skyvern.browser_extension.errors import BrowserExtensionError
 from skyvern.browser_extension.event_order import EventHold
 from skyvern.browser_extension.relay import ExtensionRelayServer
@@ -25,11 +27,24 @@ from skyvern.utils.contained_effects import contained_effect
 
 LOG = structlog.get_logger(__name__)
 
+if TYPE_CHECKING:
+    from playwright.async_api import BrowserContext, Page
+
 _PORT_ENV = "SKYVERN_BROWSER_EXTENSION_PORT"
 _BROKER_ENV = "SKYVERN_BROWSER_EXTENSION_BROKER"
 _DEFAULT_PORT = 19777
 _PAIRING_BUSY_WAIT_SECONDS = 30.0
 _PAGE_TARGET_ACQUISITION_TIMEOUT_SECONDS = 2.0
+_RECONNECT_RECORD_TTL_SECONDS = 60.0
+_MAX_RECONNECT_RECORDS = 64
+
+
+@dataclass
+class TabReconnectRecord:
+    state: Literal["pending", "done", "failed"]
+    new_target_id: str | None = None
+    outcome: asyncio.Event = field(default_factory=asyncio.Event)
+    timestamp: float = field(default_factory=time.monotonic)
 
 
 class _Adapter(Protocol):
@@ -47,6 +62,8 @@ class _Adapter(Protocol):
     def target_attachment_snapshot(self, target_id: str) -> bool: ...
 
     def scoped_tab_id_for_target(self, target_id: str) -> int | None: ...
+
+    def set_tab_reconnect_listener(self, listener: Callable[[TabReconnectEvent], None] | None) -> None: ...
 
 
 class _Relay(Protocol):
@@ -98,8 +115,12 @@ class BrowserExtensionRuntime:
         self._adapter = adapter
         self._stopped = False
         self._page_target_ids: WeakKeyDictionary[Any, str] = WeakKeyDictionary()
+        self._last_page_target_ids: WeakKeyDictionary[Page, str] = WeakKeyDictionary()
+        self._tab_reconnects: dict[str, TabReconnectRecord] = {}
+        self._reconnect_replacement_pages: WeakSet[Page] = WeakSet()
         self._page_target_binding_tasks: WeakKeyDictionary[Any, asyncio.Task[str | None]] = WeakKeyDictionary()
         self._page_close_hooks: WeakSet[Any] = WeakSet()
+        adapter.set_tab_reconnect_listener(self._on_tab_reconnect)
 
     @classmethod
     async def get_or_start(cls, port: int | None = None) -> BrowserExtensionRuntime:
@@ -127,6 +148,7 @@ class BrowserExtensionRuntime:
                 broker = BrokerClient(resolved_port, handle_broker_event, on_broker_disconnect)
                 broker_adapter = _create_adapter(registry, broker)
                 broker_adapter_holder.append(broker_adapter)
+                runtime = cls(broker, broker_adapter)
                 try:
                     await broker_adapter.start()
                     await broker.start()
@@ -134,7 +156,6 @@ class BrowserExtensionRuntime:
                     await _cleanup_failed_start(broker, broker_adapter)
                     raise
 
-                runtime = cls(broker, broker_adapter)
                 cls._instance = runtime
                 return runtime
 
@@ -151,6 +172,7 @@ class BrowserExtensionRuntime:
             relay = _relay_factory(token, resolved_port, handle_event, on_disconnect, order_debugger_events=True)
             adapter = _create_adapter(registry, relay)
             adapter_holder.append(adapter)
+            runtime = cls(relay, adapter)
 
             try:
                 await adapter.start()
@@ -168,7 +190,6 @@ class BrowserExtensionRuntime:
                 await _cleanup_failed_start(relay, adapter)
                 raise
 
-            runtime = cls(relay, adapter)
             cls._instance = runtime
             return runtime
 
@@ -186,6 +207,73 @@ class BrowserExtensionRuntime:
 
     async def wait_for_extension(self, timeout: float = 10.0) -> bool:
         return await self._relay.wait_connected(timeout)
+
+    def _prune_tab_reconnects(self) -> None:
+        cutoff = time.monotonic() - _RECONNECT_RECORD_TTL_SECONDS
+        for target_id, record in list(self._tab_reconnects.items()):
+            if record.timestamp < cutoff or len(self._tab_reconnects) > _MAX_RECONNECT_RECORDS:
+                self._tab_reconnects.pop(target_id)
+                record.state = "failed"
+                record.outcome.set()
+
+    def _on_tab_reconnect(self, event: TabReconnectEvent) -> None:
+        record = self._tab_reconnects.get(event.target_id)
+        if event.state == "pending" or record is None:
+            if record is not None:
+                record.state = "failed"
+                record.outcome.set()
+            self._tab_reconnects.pop(event.target_id, None)
+            record = TabReconnectRecord(state=event.state)
+            self._tab_reconnects[event.target_id] = record
+        record.state = event.state
+        record.new_target_id = event.new_target_id
+        record.timestamp = time.monotonic()
+        if event.state != "pending":
+            record.outcome.set()
+        self._prune_tab_reconnects()
+
+    async def page_target_id(self, page: Page) -> str | None:
+        try:
+            return await self._target_id_for_page(page)
+        except Exception as exc:  # noqa: BLE001 - Identity lookup must not fail an otherwise usable tool.
+            LOG.debug("browser_extension_page_identity_failed", error_type=type(exc).__name__)
+            return None
+
+    def last_page_target_id(self, page: Page) -> str | None:
+        return self._last_page_target_ids.get(page)
+
+    def tab_reconnect(self, target_id: str) -> TabReconnectRecord | None:
+        self._prune_tab_reconnects()
+        return self._tab_reconnects.get(target_id)
+
+    async def wait_for_tab_reconnect(self, record: TabReconnectRecord, timeout: float) -> None:
+        await asyncio.wait_for(record.outcome.wait(), timeout=timeout)
+
+    async def find_page_for_target(self, context: BrowserContext, target_id: str) -> Page | None:
+        pages = [page for page in context.pages if not page.is_closed()]
+        for page in pages:
+            if self._page_target_ids.get(page) == target_id:
+                return page
+        target_ids = await asyncio.gather(*(self.page_target_id(page) for page in pages))
+        return next(
+            (page for page, identity in zip(pages, target_ids) if identity == target_id and not page.is_closed()),
+            None,
+        )
+
+    async def is_reconnect_replacement(self, page: Page) -> bool:
+        if page in self._reconnect_replacement_pages:
+            return True
+        self._prune_tab_reconnects()
+        if not self._tab_reconnects:
+            return False
+        target_id = await self.page_target_id(page)
+        replacement = target_id is not None and any(
+            record.state in {"pending", "done"} and target_id in {old_target_id, record.new_target_id}
+            for old_target_id, record in self._tab_reconnects.items()
+        )
+        if replacement:
+            self._reconnect_replacement_pages.add(page)
+        return replacement
 
     async def page_debugger_attached(self, page: Any) -> bool:
         if self._page_is_closed(page) or not self._runtime_is_connected():
@@ -234,6 +322,7 @@ class BrowserExtensionRuntime:
             raise
         if target_id is not None and not self._page_is_closed(page) and self._runtime_is_connected():
             self._page_target_ids[page] = target_id
+            self._last_page_target_ids[page] = target_id
         return target_id
 
     async def _bind_page_target(self, page: Any) -> str | None:

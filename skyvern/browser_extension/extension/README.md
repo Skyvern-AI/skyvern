@@ -73,9 +73,47 @@ short reconnect window before session creation opens the one-click pairing page 
 drain the daemon and release the configured port.
 
 The extension records broker-created root tabs and popups in Chrome session storage while it owns them. When a tab
-leaves scope, including after an external debugger detach, the extension gives up that ownership and leaves the tab
+leaves scope after an unshare or an unrecovered debugger detach, the extension gives up ownership and leaves the tab
 open. Later reset cleanup cannot close a handed-back tab. Controlling it again requires the operator to share it again.
 Explicit removal of an actively scoped tab and cleanup of incomplete tab creation still close those tabs.
+
+When another extension loads its own frame inside a controlled tab, Chrome can end the debugger session with
+`target_closed`. The bridge attempts recovery only while connected and authenticated, with no release pending.
+The tab must still be open, scoped, not discarded or quarantined, and on a permitted HTTP(S) URL.
+User cancellation, restricted URLs, closed tabs, and failed recovery keep the hand-back behavior above.
+
+Recovery emits `debugger.detached`, removes foreign extension frames, attaches again, then emits `scope.tabAdded`
+for the same Chrome tab. It checks the tab and its controlled group again before announcing success.
+The adapter closes the old Playwright page and announces a fresh page. Failure emits `scope.tabRemoved` and ungroups the tab.
+Commands and fixed DOM operations return `DEBUGGER_DETACHED` during recovery.
+Only a client `debugger.attach` received after the new announcement lifts this command fence.
+An attach request queued before the announcement cannot lift it.
+
+While the indicator reports agent control, the script removes foreign frames on insertion or a frame's `src` change.
+After removing a frame, it removes the outermost empty shadow host before the first ancestor with content; reinserted hosts are checked again.
+Whitespace, metadata, empty containers, and foreign frames do not count as content; checks stop after 200 elements and preserve the host.
+The first insertion still cuts the debugger session off once because Chrome starts navigation before the script can remove the frame.
+Observation stops when agent control ends; it covers at most 200 document and shadow roots in total, pruning detached roots when full.
+
+Each tab allows eight recovery starts in any ten seconds, across page changes.
+Each recovery allows three attach attempts within three seconds, with a two-second timeout per attach.
+Only errors naming a foreign extension URL get another attempt, after 100 ms.
+Before each attempt, a packaged script removes the foreign frames and checks their shadow hosts for content.
+The worker waits up to 300 ms for removal; its request expires after 500 ms.
+Missing scripts, timeouts, and invalid replies count as zero removals. Reload a tab opened before an extension update to install the script.
+The script visits at most 5,000 elements and five levels of same-origin child documents, including closed shadow roots.
+
+A step interrupted by the cut-off fails once. After successful recovery, the next step can use the fresh page.
+Scripts holding the old `Page`, frame, or element references must obtain new ones.
+Page routes and other page-scoped state do not carry over. Recovery does not retry the interrupted action.
+Context init scripts can run again in the unchanged document.
+Existing limits for nested frames inside an out-of-process frame still apply.
+
+The script cannot reach cross-origin child documents or identify foreign frames with a concealed destination URL.
+Other extensions' in-page frames and their hosts disappear; their toolbar pop-ups remain available.
+It does not undo other page changes, such as elements made `inert` by another extension.
+An extension that keeps creating new frames can exhaust the recovery budget.
+Chrome can show its debugger information bar again after attachment.
 
 To opt into the legacy embedded relay on POSIX, set exactly:
 

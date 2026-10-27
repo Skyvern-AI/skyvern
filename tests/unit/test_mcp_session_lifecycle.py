@@ -1829,6 +1829,7 @@ async def test_get_page_reports_selection_lost_after_implicit_extension_session_
     recovered_browser.get_working_page = AsyncMock(return_value=recovered_page)
 
     runtime = MagicMock()
+    runtime.page_target_id = AsyncMock(return_value=None)
     fake_skyvern = MagicMock()
     fake_skyvern.connect_to_browser_extension = AsyncMock(side_effect=[initial_browser, recovered_browser])
     monkeypatch.setattr(BrowserExtensionRuntime, "instance", classmethod(lambda _cls: runtime))

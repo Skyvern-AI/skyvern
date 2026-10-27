@@ -2077,7 +2077,7 @@ async def test_tab_new_reports_a_navigate_that_never_answered_as_a_timeout(
         lambda *args, **kwargs: browser_ops.do_navigate(page, HANGING_PAGE_URL, timeout=HANGING_BOUND_MS),
     )
     browser = SimpleNamespace(_browser_context=SimpleNamespace(pages=[page], new_page=AsyncMock(return_value=page)))
-    state = SimpleNamespace(
+    state = session_manager.SessionState(
         _active_page=page,
         _implicit_page=None,
         _working_frame=None,

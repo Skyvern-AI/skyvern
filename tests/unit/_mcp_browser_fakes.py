@@ -281,12 +281,12 @@ def patch_tab_session(
     new_page: Callable[..., Awaitable[object]] | None = None,
     action_timeout_ms: int = HANGING_BOUND_MS,
     headroom_ms: int = HANGING_HEADROOM_MS,
-) -> SimpleNamespace:
+) -> SessionState:
     """Route the tab tools at ``pages`` under a budget small enough for real loop time."""
     browser = SimpleNamespace(
         _browser_context=SimpleNamespace(pages=pages, new_page=new_page or AsyncMock(return_value=pages[0]))
     )
-    state = SimpleNamespace(
+    state = make_session_state(
         browser=browser,
         _active_page=None,
         _implicit_page=None,
