@@ -217,7 +217,7 @@ No `/v1` endpoint is deprecated today, so these headers are not present on any c
 
 - Pin the version prefix (`/v1/`), not a specific SDK patch release.
 - Parse responses leniently: ignore unknown fields, default unknown enum values to a safe branch.
-- Log any response carrying a `Deprecation` or `Sunset` header, and alert on it — that header is the earliest programmatic signal you will get.
+- Log any response carrying a `Deprecation` or `Sunset` header, and alert on it. That header is the earliest programmatic signal you will get.
 - Watch the [changelog](/changelog) for announcements, and diff the [OpenAPI specification](/api-reference/openapi.json) in CI if you generate your own client.
 
 #### Where changes are announced
@@ -232,9 +232,9 @@ Questions about a migration: [support@skyvern.com](mailto:support@skyvern.com).
 
 ## Billing and credits
 
-Open **Settings → Billing**. On the Free and Hobby plans, the **Upgrade plan** link at the bottom of the sidebar opens the same page; on other plans it reads **Plan & usage**.
+Open **Settings → Billing**. On the Trial and Hobby plans, the **Upgrade plan** link at the bottom of the sidebar opens the same page; on other plans it reads **Plan & usage**.
 
-<img src="/images/cloud/settings-billing-overview.png" alt="Billing page with the Choose a Plan cards for Free, Hobby, Pro and Enterprise, and the Credit Usage meter" />
+<img src="/images/cloud/settings-billing-overview.png" alt="Billing page with a current Free plan card, Hobby, Pro, and Enterprise plan cards, and a Credit Usage meter showing 3,948 of 5,000 one-time credits used" />
 
 ### How credits are used
 
@@ -255,16 +255,20 @@ Under **Credit Usage** you see credits used and remaining for the current period
 Specific prompts use fewer actions. "Extract the monthly price from the pricing table on /pricing" goes straight there; "Find information about pricing" makes the AI explore.
 </Tip>
 
+### Your 14-day trial
+
+New accounts start with a 14-day trial: 30,000 credits and Hobby plan limits. When you sign up, pick the plan you want after the trial, Hobby ($29/month) or Pro ($149/month), and add a card. Nothing is charged during the trial. On day 14 we charge the plan you picked and it renews monthly. To switch plans, start your plan early, or cancel, open Settings → Billing. Cancelling ends the trial straight away and you are not charged.
+
 ### Plans
 
 | Plan | Price | Credits | Concurrent runs |
 |---|---|---|---|
-| **Free** | $0 | 5,000 one time (about 165 actions) | 1 |
+| **Trial** | $0 for 14 days | 30,000 for the trial (about 1,000 actions) | 10 |
 | **Hobby** | $29/month | 30,000/month (about 1,000 actions) | 10 |
 | **Pro** | $149/month | 150,000/month (about 5,000 actions) | 25 |
 | **Enterprise** | Custom | Unlimited | Unlimited |
 
-Free credits are a one-time grant and don't reset. Click **Subscribe** on the Hobby or Pro card to start a plan. Once you're subscribed, the cards read **Upgrade** or **Downgrade** and the page shows your current plan, with **Manage Subscription** to change or cancel it. For Enterprise, click **Book a Demo**. For a full feature comparison, see [skyvern.com/pricing](https://www.skyvern.com/pricing).
+Trial credits don't reset and end with the trial. Click **Subscribe** on the Hobby or Pro card to start a plan. Once you're subscribed, the cards read **Upgrade** or **Downgrade** and the page shows your current plan, with **Manage Subscription** to change or cancel it. For Enterprise, click **Book a Demo**. For a full feature comparison, see [skyvern.com/pricing](https://www.skyvern.com/pricing).
 
 ### Extra credits and payment
 
@@ -301,9 +305,9 @@ When someone leaves, remove them here and [rotate the API key](#rotate-your-key)
 
   | Setting | What it does | Range |
   |---|---|---|
-  | **Max Steps Per Block** | Steps Skyvern takes inside one task or navigation block before stopping it | 1–150 |
-  | **Max Steps Per Run** | Total steps across all blocks in an agent run. Blank means no run-level cap. | 1–1,000 |
-  | **Artifact URL Expiry (minutes)** | How long download links for PDFs and exported files stay valid. Blank means 720 minutes (12 hours). Screenshot and recording links always expire after 1 hour. | 60–10,080 (7 days) |
+  | **Max Steps Per Block** | Steps Skyvern takes inside one task or navigation block before stopping it | 1-150 |
+  | **Max Steps Per Run** | Total steps across all blocks in an agent run. Blank means no run-level cap. | 1-1,000 |
+  | **Artifact URL Expiry (minutes)** | How long download links for PDFs and exported files stay valid. Blank means 720 minutes (12 hours). Screenshot and recording links always expire after 1 hour. | 60-10,080 (7 days) |
 
 - **Models** has two cards. **Custom LLMs** adds your own OpenAI-compatible, Ollama or OpenRouter models. **Default Models** picks the **Smart LLM** and **Fast LLM** your runs use, or **Skyvern Default**.
 - **Labels** appears when labels are turned on for your organization.
