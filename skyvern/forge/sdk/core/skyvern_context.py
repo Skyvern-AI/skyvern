@@ -733,6 +733,8 @@ class SkyvernContext:
     # keyed by task id. Keyed rather than last-one-wins because one browser state serves every block
     # in a run: a later block that fails without navigating must not inherit an earlier block's code.
     task_nav_error_codes: dict[str, str] = field(default_factory=dict)
+    download_failure_reasons: dict[str, list[str]] = field(default_factory=dict)
+    download_failure_reasons_by_key: dict[str, dict[str, list[str]]] = field(default_factory=dict, repr=False)
     navigation_goal: str | None = None
     navigation_payload: dict[str, Any] | list | str | None = None
     complete_criterion_is_untrusted: bool = False
@@ -1579,6 +1581,30 @@ class SkyvernContext:
 
     def cleanup_downloads_recorded(self, task_id: str) -> bool:
         return task_id in self.cleanup_downloads_recorded_task_ids
+
+    def record_download_failure(self, task_id: str, reason: str, failure_key: str | None = None) -> None:
+        if failure_key is not None:
+            self.download_failure_reasons_by_key.setdefault(task_id, {}).setdefault(failure_key, []).append(reason)
+            return
+        reasons = self.download_failure_reasons.setdefault(task_id, [])
+        if reason not in reasons:
+            reasons.append(reason)
+
+    def resolve_download_failure(self, task_id: str, failure_key: str) -> None:
+        reasons = self.download_failure_reasons_by_key.get(task_id)
+        if reasons is not None:
+            outstanding = reasons.get(failure_key)
+            if outstanding:
+                outstanding.pop()
+                if not outstanding:
+                    reasons.pop(failure_key, None)
+            if not reasons:
+                self.download_failure_reasons_by_key.pop(task_id, None)
+
+    def consume_download_failures(self, task_id: str) -> list[str]:
+        reasons = self.download_failure_reasons.pop(task_id, [])
+        keyed_reasons = self.download_failure_reasons_by_key.pop(task_id, {})
+        return list(dict.fromkeys([*reasons, *(reason for values in keyed_reasons.values() for reason in values)]))
 
     def flush_feature_flags(self) -> None:
         if not self.feature_flag_entries:

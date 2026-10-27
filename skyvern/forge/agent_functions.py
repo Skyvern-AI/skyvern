@@ -980,6 +980,12 @@ OnePasswordTelemetryErrorClass = Literal["invalid_token", "rate_limited", "timeo
 
 
 class AgentFunction:
+    def report_download_failure(self, reason: str, *, failure_key: str | None = None) -> None:
+        return None
+
+    def resolve_download_failure(self, failure_key: str) -> None:
+        return None
+
     def should_log_request_bodies(self, organization_id: str) -> bool:
         return True
 

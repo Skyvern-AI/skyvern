@@ -22,12 +22,15 @@ from structlog.testing import capture_logs
 
 import skyvern.webeye.cdp_download_interceptor as mod
 from skyvern.config import settings
+from skyvern.forge.sdk.core import skyvern_context
 from skyvern.forge.sdk.core.http_request_authorization import RunScopedRedirectHopAuthorizer
+from skyvern.forge.sdk.core.skyvern_context import SkyvernContext
 from skyvern.webeye.cdp_download_interceptor import (
     CDPDownloadInterceptor,
     _is_stale_interception_error,
     _redacted_request_origin,
     extract_filename,
+    finish_requested_download_for_context,
     is_download_response,
 )
 
@@ -5620,6 +5623,212 @@ def test_requested_duplicate_is_satisfied_but_different_bytes_still_fails(tmp_pa
     assert outcome is not None
     assert outcome["error_code"] == "BROWSER_DOWNLOAD_FAILED"
     assert first.read_bytes() == payload
+
+
+def test_requested_download_failure_is_recorded_for_cleanup(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    interceptor = _make_interceptor(output_dir=str(tmp_path))
+    error = {
+        "error_code": "BROWSER_DOWNLOAD_FAILED",
+        "reasoning": "The requested browser download could not be saved.",
+        "error_type": "SYSTEM_DEFINED_ERROR",
+    }
+    interceptor.finish_requested_download = MagicMock(return_value=error)  # type: ignore[method-assign]
+    browser_context = MagicMock(_skyvern_cdp_download_interceptor=interceptor)
+    context = SkyvernContext(task_id="task-download")
+    monkeypatch.setattr(skyvern_context, "current", lambda: context)
+
+    assert finish_requested_download_for_context(browser_context, 1) == error
+    assert context.consume_download_failures("task-download") == [error["reasoning"]]
+    assert context.consume_download_failures("task-download") == []
+
+
+def test_requested_download_retry_resolves_only_matching_failure(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    interceptor = _make_interceptor(output_dir=str(tmp_path))
+    browser_context = MagicMock(_skyvern_cdp_download_interceptor=interceptor)
+    context = SkyvernContext(task_id="task-download")
+    monkeypatch.setattr(skyvern_context, "current", lambda: context)
+
+    first_token = interceptor.begin_requested_download()
+    failed_key = mod._download_failure_key("report.pdf", "https://files.example/report.pdf?signature=old")
+    sibling_key = mod._download_failure_key("other.pdf", "https://files.example/other.pdf?signature=old")
+    failed_attempt = interceptor._new_download_attempt(failure_key=failed_key)
+    sibling_attempt = interceptor._new_download_attempt(failure_key=sibling_key)
+    assert failed_key is not None and sibling_key is not None
+    assert failed_attempt is not None and sibling_attempt is not None
+    interceptor._record_download_failure(failed_attempt, "capture_failed")
+    interceptor._record_download_failure(sibling_attempt, "capture_failed")
+
+    error = finish_requested_download_for_context(browser_context, first_token)
+    assert error is not None
+    assert "_failure_keys" not in error
+    assert set(context.download_failure_reasons_by_key["task-download"]) == {failed_key, sibling_key}
+
+    retry_token = interceptor.begin_requested_download()
+    retry_key = mod._download_failure_key("report.pdf", "https://files.example/report.pdf?signature=rotated")
+    retry_attempt = interceptor._new_download_attempt(failure_key=retry_key)
+    assert retry_key == failed_key
+    assert retry_attempt is not None
+    interceptor._record_download_saved(retry_attempt)
+
+    assert context.consume_download_failures("task-download") == ["The requested browser download could not be saved."]
+    assert interceptor.finish_requested_download(retry_token) is None
+
+
+@pytest.mark.parametrize(
+    ("failed_url", "rotated_url"),
+    [
+        (
+            "https://files.example/report.pdf?signature=old",
+            "https://files.example/report.pdf?signature=rotated",
+        ),
+        (
+            "https://files.example/report.pdf?Policy=A&Signature=X&Key-Pair-Id=K",
+            "https://files.example/report.pdf?Policy=B&Signature=Y&Key-Pair-Id=K",
+        ),
+    ],
+    ids=["signed-url", "cloudfront-custom-policy"],
+)
+def test_requested_download_same_key_failures_require_matching_successes_after_signed_url_rotation(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, failed_url: str, rotated_url: str
+) -> None:
+    interceptor = _make_interceptor(output_dir=str(tmp_path))
+    browser_context = MagicMock(_skyvern_cdp_download_interceptor=interceptor)
+    context = SkyvernContext(task_id="task-download")
+    monkeypatch.setattr(skyvern_context, "current", lambda: context)
+
+    first_token = interceptor.begin_requested_download()
+    failed_key = mod._download_failure_key("report.pdf", failed_url)
+    assert failed_key is not None
+    for _ in range(2):
+        failed_attempt = interceptor._new_download_attempt(failure_key=failed_key)
+        assert failed_attempt is not None
+        interceptor._record_download_failure(failed_attempt, "capture_failed")
+    assert finish_requested_download_for_context(browser_context, first_token) is not None
+    assert len(context.download_failure_reasons_by_key["task-download"][failed_key]) == 2
+
+    for remaining in (1, 0):
+        retry_token = interceptor.begin_requested_download()
+        rotated_key = mod._download_failure_key("report.pdf", rotated_url)
+        assert rotated_key == failed_key
+        retry_attempt = interceptor._new_download_attempt(failure_key=rotated_key)
+        assert retry_attempt is not None
+        interceptor._record_download_saved(retry_attempt)
+        assert interceptor.finish_requested_download(retry_token) is None
+        if remaining:
+            assert len(context.download_failure_reasons_by_key["task-download"][failed_key]) == remaining
+        else:
+            assert "task-download" not in context.download_failure_reasons_by_key
+
+    assert context.consume_download_failures("task-download") == []
+
+
+def test_requested_download_success_decrements_only_one_interleaved_failure(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    interceptor = _make_interceptor(output_dir=str(tmp_path))
+    browser_context = MagicMock(_skyvern_cdp_download_interceptor=interceptor)
+    context = SkyvernContext(task_id="task-download")
+    monkeypatch.setattr(skyvern_context, "current", lambda: context)
+    failure_key = mod._download_failure_key("report.pdf", "https://files.example/report.pdf")
+    assert failure_key is not None
+
+    first_token = interceptor.begin_requested_download()
+    first_failure = interceptor._new_download_attempt(failure_key=failure_key)
+    assert first_failure is not None
+    interceptor._record_download_failure(first_failure, "capture_failed")
+    assert finish_requested_download_for_context(browser_context, first_token) is not None
+
+    second_token = interceptor.begin_requested_download()
+    second_failure = interceptor._new_download_attempt(failure_key=failure_key)
+    assert second_failure is not None
+    interceptor._record_download_failure(second_failure, "capture_failed")
+    success = interceptor._new_download_attempt(failure_key=failure_key)
+    assert success is not None
+    interceptor._record_download_saved(success)
+
+    assert interceptor.finish_requested_download(second_token) is None
+    assert context.consume_download_failures("task-download") == ["The requested browser download could not be saved."]
+
+
+def test_download_failure_key_hashes_large_urls_in_bounded_chunks(monkeypatch: pytest.MonkeyPatch) -> None:
+    update_lengths: list[int] = []
+
+    class _Digest:
+        def update(self, value: bytes) -> None:
+            update_lengths.append(len(value))
+
+        def hexdigest(self) -> str:
+            return "digest"
+
+    monkeypatch.setattr(mod.hashlib, "sha256", _Digest)
+
+    key = mod._download_failure_key("report.pdf", f"data:application/pdf;base64,{('a' * 100_000)}")
+
+    assert key == "cdp:digest"
+    assert max(update_lengths) <= 8192
+
+
+@pytest.mark.parametrize(
+    ("failed_url", "sibling_url"),
+    [
+        ("data:application/pdf;base64,first", "data:application/pdf;base64,second"),
+        (
+            "https://files.example/report.pdf?file=first",
+            "https://files.example/report.pdf?file=second",
+        ),
+        (
+            "https://files.example/report.pdf?policy=A",
+            "https://files.example/report.pdf?policy=B",
+        ),
+        (
+            "https://files.example/report.pdf?key-pair-id=A",
+            "https://files.example/report.pdf?key-pair-id=B",
+        ),
+    ],
+    ids=["data-url", "query-string", "cloudfront-policy-only", "cloudfront-key-pair-only"],
+)
+def test_same_name_different_source_success_does_not_clear_failed_download(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, failed_url: str, sibling_url: str
+) -> None:
+    interceptor = _make_interceptor(output_dir=str(tmp_path))
+    browser_context = MagicMock(_skyvern_cdp_download_interceptor=interceptor)
+    context = SkyvernContext(task_id="task-download")
+    monkeypatch.setattr(skyvern_context, "current", lambda: context)
+
+    first_token = interceptor.begin_requested_download()
+    failed_key = mod._download_failure_key("report.pdf", failed_url)
+    failed_attempt = interceptor._new_download_attempt(failure_key=failed_key)
+    assert failed_key is not None and failed_attempt is not None
+    interceptor._record_download_failure(failed_attempt, "capture_failed")
+    assert finish_requested_download_for_context(browser_context, first_token) is not None
+
+    sibling_token = interceptor.begin_requested_download()
+    sibling_key = mod._download_failure_key("report.pdf", sibling_url)
+    sibling_attempt = interceptor._new_download_attempt(failure_key=sibling_key)
+    assert sibling_key is not None and sibling_key != failed_key and sibling_attempt is not None
+    interceptor._record_download_saved(sibling_attempt)
+
+    assert context.consume_download_failures("task-download") == ["The requested browser download could not be saved."]
+    assert interceptor.finish_requested_download(sibling_token) is None
+
+
+def test_unsolicited_capture_does_not_resolve_requested_failure(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    interceptor = _make_interceptor(output_dir=str(tmp_path))
+    context = SkyvernContext(task_id="task-download")
+    monkeypatch.setattr(skyvern_context, "current", lambda: context)
+    failure_key = mod._download_failure_key("report.pdf", "https://files.example/report.pdf")
+    assert failure_key is not None
+    context.record_download_failure("task-download", "The requested browser download could not be saved.", failure_key)
+
+    unsolicited_attempt = interceptor._new_download_attempt(failure_key=failure_key)
+    assert unsolicited_attempt is not None and unsolicited_attempt.intent == "unsolicited"
+    interceptor._record_download_saved(unsolicited_attempt)
+
+    assert context.consume_download_failures("task-download") == ["The requested browser download could not be saved."]
 
 
 def test_dedupe_does_not_follow_a_destination_symlink(tmp_path: Path) -> None:

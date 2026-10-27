@@ -331,10 +331,18 @@ def is_truncated_response(response: litellm.ModelResponse) -> bool:
     if not response.choices:
         return False
     choice = response.choices[0]
-    return (
-        getattr(choice, "finish_reason", None) == "length"
-        and getattr(getattr(choice, "message", None), "content", None) is None
-    )
+    message = getattr(choice, "message", None)
+    if getattr(message, "content", None) is not None:
+        return False
+    # A tool call is the answer, so an empty content field alongside one is complete, not truncated.
+    if getattr(message, "tool_calls", None):
+        return False
+    # A model that spent its completion budget reasoning returns no answer at all, and upstreams
+    # label that two ways: `length` where the cap is counted against the reply, `stop` where the
+    # reasoning stream reads as a normal completion. Only `length` used to be recognised, so the
+    # `stop` form skipped the retry below and failed as an unexplained JSON parse error
+    # (SKY-19198). `content_filter` is a refusal with its own recovery path and must not land here.
+    return getattr(choice, "finish_reason", None) in ("length", "stop")
 
 
 def is_content_filtered_response(response: litellm.ModelResponse) -> bool:
@@ -368,6 +376,7 @@ def parse_api_response(
             prompt_tokens=prompt_tokens,
             completion_tokens=completion_tokens,
             reasoning_tokens=reasoning_tokens,
+            finish_reason=getattr(response.choices[0], "finish_reason", None) if response.choices else None,
         )
 
     content = None

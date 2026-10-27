@@ -266,7 +266,7 @@ async def test_openrouter_deepseek_v4_flash_sends_provider_ignore_on_the_wire(
             llm_config = _pin_deepseek_v4_flash_at(server, monkeypatch)
             assert llm_config.litellm_params is not None
             assert llm_config.litellm_params["extra_body"] == {
-                "provider": {"ignore": ["open-inference"]},
+                "provider": {"ignore": ["open-inference", "cloudflare"]},
                 "reasoning": {"max_tokens": 49152},
             }
             await LLMAPIHandlerFactory.get_llm_api_handler("OPENROUTER_DEEPSEEK_V4_FLASH")(prompt="hello")
@@ -274,7 +274,7 @@ async def test_openrouter_deepseek_v4_flash_sends_provider_ignore_on_the_wire(
             server.shutdown()
             thread.join(timeout=5)
 
-    assert captured["body"]["provider"] == {"ignore": ["open-inference"]}
+    assert captured["body"]["provider"] == {"ignore": ["open-inference", "cloudflare"]}
     assert captured["body"]["reasoning"] == {"max_tokens": 49152}
     assert captured["body"]["max_completion_tokens"] == 65536
 

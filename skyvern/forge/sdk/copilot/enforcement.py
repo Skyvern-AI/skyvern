@@ -1053,21 +1053,26 @@ def unread_tool_output_indices(items: Sequence[Any]) -> set[int]:
     return unread
 
 
-def stable_prefix_anchors(items: Sequence[TResponseInputItem]) -> list[int]:
-    """Return, oldest first, the index of every tool output or real user message that precedes both the compaction
-    window and every unpruned screenshot. Later model calls resend every item up to the last of them unchanged."""
+def stable_prefix_anchors(items: Sequence[TResponseInputItem], *, append_only: bool = False) -> list[int]:
+    """Return, oldest first, the index of every tool output or real user message that later model calls resend
+    unchanged: all of them when nothing rewrites the input, else those before both the compaction window and every
+    unpruned screenshot."""
     fc_indices = [i for i, item in enumerate(items) if _item_field(item, "type") == "function_call"]
     fco_indices = [i for i, item in enumerate(items) if _item_field(item, "type") == "function_call_output"]
-    unstable = {
-        *fc_indices[-KEEP_RECENT_TOOL_OUTPUTS:],
-        *fco_indices[-KEEP_RECENT_TOOL_OUTPUTS:],
-        *unread_tool_output_indices(items),
-        *(
-            i
-            for i, item in enumerate(items)
-            if is_screenshot_message(item) and _item_field(item, "content") != SCREENSHOT_PLACEHOLDER
-        ),
-    }
+    unstable = (
+        set()
+        if append_only
+        else {
+            *fc_indices[-KEEP_RECENT_TOOL_OUTPUTS:],
+            *fco_indices[-KEEP_RECENT_TOOL_OUTPUTS:],
+            *unread_tool_output_indices(items),
+            *(
+                i
+                for i, item in enumerate(items)
+                if is_screenshot_message(item) and _item_field(item, "content") != SCREENSHOT_PLACEHOLDER
+            ),
+        }
+    )
     return [
         index
         for index, item in enumerate(items[: min(unstable, default=len(items))])

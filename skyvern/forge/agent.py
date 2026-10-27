@@ -368,9 +368,11 @@ from skyvern.webeye.browser_errors import (
 )
 from skyvern.webeye.browser_state import BrowserState, get_browser_connection_loss, get_browser_state_diagnostic
 from skyvern.webeye.cdp_download_interceptor import (
+    DownloadTally,
     begin_replay_candidate_hold,
     consume_unsolicited_download_error_for_context,
     download_filename_from_suffix,
+    download_tally_for_context,
     has_download_interceptor_for_context,
     record_download_artifact_outcome_for_context,
     replay_candidate_holds,
@@ -4930,21 +4932,19 @@ class ForgeAgent:
                     # opened so the next task does not select one as its working page.
                     await self._close_credited_download_popups(task, browser_state)
                     last_step = await self.update_step(step, is_last=True)
-                    completed_task = await self.update_task(
-                        task,
-                        status=TaskStatus.completed,
-                    )
                     await app.ARTIFACT_MANAGER.flush_step_archive(step.step_id)
                     # Skip per-step video sync: clean_up_task performs the authoritative final upload.
                     # Do not pass download finalization inputs into cleanup here:
                     # the early complete_on_download path already finalized files
                     # against the pre-step baseline and cleanup must not do it again.
                     await self.clean_up_task(
-                        task=completed_task,
+                        task=task,
                         last_step=last_step,
                         api_key=api_key,
                         close_browser_on_completion=close_browser_on_completion,
                         browser_session_id=browser_session_id,
+                        download_completion_pending=True,
+                        completion_extracted_information=task.extracted_information,
                     )
                     return last_step, detailed_output, None
 
@@ -9821,10 +9821,15 @@ class ForgeAgent:
         download_suffix: str | None = None,
         list_files_before: list[str] | None = None,
         bundle_step_archives: bool = False,
-    ) -> None:
+        download_completion_pending: bool = False,
+        completion_extracted_information: dict[str, Any] | list | str | None = None,
+        download_completion_feedback: list[str] | None = None,
+        download_artifact_baseline_count: int | None = 0,
+        download_tally_baseline: DownloadTally | None = None,
+    ) -> Task:
         cleanup_context = skyvern_context.current()
         try:
-            await self._clean_up_task(
+            return await self._clean_up_task(
                 task,
                 last_step,
                 api_key,
@@ -9835,9 +9840,15 @@ class ForgeAgent:
                 download_suffix,
                 list_files_before,
                 bundle_step_archives=bundle_step_archives,
+                download_completion_pending=download_completion_pending,
+                completion_extracted_information=completion_extracted_information,
+                download_completion_feedback=download_completion_feedback,
+                download_artifact_baseline_count=download_artifact_baseline_count,
+                download_tally_baseline=download_tally_baseline,
             )
         finally:
             if cleanup_context is not None:
+                cleanup_context.consume_download_failures(task.task_id)
                 cleanup_context.clear_download_popup_claims(task.task_id)
                 # Workflow diagnostics are retained later, while the workflow context still owns the masking state.
                 if task.workflow_run_id is None:
@@ -9856,7 +9867,12 @@ class ForgeAgent:
         download_suffix: str | None = None,
         list_files_before: list[str] | None = None,
         bundle_step_archives: bool = False,
-    ) -> None:
+        download_completion_pending: bool = False,
+        completion_extracted_information: dict[str, Any] | list | str | None = None,
+        download_completion_feedback: list[str] | None = None,
+        download_artifact_baseline_count: int | None = 0,
+        download_tally_baseline: DownloadTally | None = None,
+    ) -> Task:
         # Keep the capture window alive through settle/finalize; only durable credit permits closing reservations.
         # The outer finally releases ownership on every terminal exit.
         _claim_context = skyvern_context.current()
@@ -9900,10 +9916,12 @@ class ForgeAgent:
         # This allows multiple tasks with the same llm_key to share the same cache
 
         # log the task status as an event
-        analytics.capture("skyvern-oss-agent-task-status", {"status": task.status})
+        if not download_completion_pending:
+            analytics.capture("skyvern-oss-agent-task-status", {"status": task.status})
 
         # Add task completion tag to trace
-        otel_trace.get_current_span().set_attribute("task.completion_status", task.status.value)
+        if not download_completion_pending:
+            otel_trace.get_current_span().set_attribute("task.completion_status", task.status.value)
         if need_final_screenshot:
             # Take one last screenshot and create an artifact before closing the browser to see the final state
             # We don't need the artifacts and send the webhook response directly only when there is an issue with the browser
@@ -9935,6 +9953,10 @@ class ForgeAgent:
                 except Exception:
                     LOG.exception("Failed to take screenshot before sending task response")
 
+        artifact_outcome: Literal["registered", "partial", "failed", "unknown"] = "unknown"
+        artifact_error: str | None = None
+        artifact_failure_details: list[str] = []
+        captured_file_count = 0
         if task.organization_id:
             _tracer = otel_trace.get_tracer("skyvern")
             with traced_span(_tracer, "skyvern.agent.cleanup.save_downloaded_files") as _cl_save_span:
@@ -9947,8 +9969,6 @@ class ForgeAgent:
                     resolve_run_download_id(context, fallback_run_id=task.workflow_run_id) or task.task_id
                 )
                 registered_file_count = 0
-                artifact_outcome: Literal["registered", "partial", "failed", "unknown"] = "unknown"
-                artifact_error: str | None = None
                 try:
                     # Keep both finalize and save inside a single timeout budget so a hung
                     # finalize call cannot block persistence forever; accept the trade-off
@@ -9995,6 +10015,10 @@ class ForgeAgent:
                             )
                             artifact_outcome = "partial"
                             artifact_error = "storage_partial"
+                            artifact_failure_details.extend(
+                                f"Downloaded file {Path(file).name!r} could not be saved or registered."
+                                for file in exc.skipped_files
+                            )
                         # Reconcile session-scoped DOWNLOAD rows the watcher left unbound, so
                         # GET /v1/runs/{id} surfaces them (see
                         # cloud_docs/BROWSER_SESSION_DOWNLOAD_ARTIFACTS.md).
@@ -10030,10 +10054,18 @@ class ForgeAgent:
                                     organization_id=task.organization_id,
                                     artifact_type=ArtifactType.DOWNLOAD,
                                 )
-                                registered_file_count = len(download_artifacts)
+                                if download_artifact_baseline_count is None:
+                                    artifact_outcome = artifact_outcome if artifact_outcome != "unknown" else "failed"
+                                    artifact_error = artifact_error or "artifact_baseline_lookup_failed"
+                                else:
+                                    registered_file_count = max(
+                                        0, len(download_artifacts) - download_artifact_baseline_count
+                                    )
                                 if artifact_outcome == "unknown":
                                     artifact_outcome = "registered"
                             except Exception:
+                                if artifact_outcome == "unknown":
+                                    artifact_outcome = "failed"
                                 artifact_error = artifact_error or "artifact_lookup_failed"
                                 LOG.warning(
                                     "Failed to read registered download artifact count",
@@ -10064,12 +10096,20 @@ class ForgeAgent:
                     # is a no-op there; on every other path it expires without a destructive close.
                     _take_download_popup_state()
                     if track_download_outcome:
-                        record_download_artifact_outcome_for_context(
+                        download_tally = download_tally_for_context(browser_context)
+                        captured_file_count = download_tally.saved if download_tally is not None else 0
+                        if download_tally is not None and download_tally_baseline is not None:
+                            if download_tally.generation == download_tally_baseline.generation:
+                                captured_file_count = max(0, captured_file_count - download_tally_baseline.saved)
+                        recorded_outcome = record_download_artifact_outcome_for_context(
                             browser_context,
                             registered_file_count=registered_file_count,
                             outcome=artifact_outcome,
                             error=artifact_error,
+                            captured_file_count=captured_file_count,
                         )
+                        if recorded_outcome is not None:
+                            artifact_outcome, artifact_error = recorded_outcome
                         unsolicited_download_error = consume_unsolicited_download_error_for_context(browser_context)
                         if unsolicited_download_error is not None:
                             try:
@@ -10084,6 +10124,72 @@ class ForgeAgent:
                                     task_id=task.task_id,
                                     workflow_run_id=task.workflow_run_id,
                                 )
+
+        download_context = skyvern_context.current()
+        download_failure_reasons = (
+            download_context.consume_download_failures(task.task_id) if download_context is not None else []
+        )
+        if download_completion_pending and task.status == TaskStatus.running:
+            if artifact_outcome == "partial":
+                if artifact_error == "artifact_count_mismatch":
+                    download_failure_reasons.append(
+                        f"Only {registered_file_count} of {captured_file_count} captured downloads were registered "
+                        "as artifacts."
+                    )
+                elif artifact_error == "storage_partial":
+                    download_failure_reasons.extend(
+                        artifact_failure_details or ["One or more downloaded files could not be saved to storage."]
+                    )
+                elif artifact_error == "session_claim_failed":
+                    download_failure_reasons.append("One or more downloaded files could not be registered.")
+                else:
+                    download_failure_reasons.append("One or more downloaded files could not be saved or registered.")
+            elif artifact_outcome == "failed":
+                if artifact_error == "artifact_baseline_lookup_failed":
+                    download_failure_reasons.append(
+                        "Could not establish the task's starting download-artifact baseline."
+                    )
+                elif artifact_error == "storage_timeout":
+                    download_failure_reasons.append("Timed out while saving downloaded files.")
+                else:
+                    download_failure_reasons.append("Failed to save downloaded files.")
+            download_failure_reasons = list(dict.fromkeys(download_failure_reasons))
+            failure_reason = "; ".join(download_failure_reasons) if download_failure_reasons else None
+            if failure_reason and download_completion_feedback is not None:
+                download_completion_feedback.extend(download_failure_reasons)
+            else:
+                completion_status = TaskStatus.failed if failure_reason else TaskStatus.completed
+                completion_updates: dict[str, Any] = {}
+                extracted_information = (
+                    completion_extracted_information
+                    if completion_extracted_information is not None
+                    else task.extracted_information
+                )
+                if extracted_information is not None:
+                    completion_updates["extracted_information"] = extracted_information
+                if failure_reason:
+                    completion_updates["failure_reason"] = failure_reason
+                    completion_updates["failure_category"] = classify_from_failure_reason(
+                        failure_reason, fallback_to_unknown=True
+                    )
+                try:
+                    task = await self.update_task(
+                        task,
+                        status=completion_status,
+                        **completion_updates,
+                    )
+                except (TaskAlreadyTimeout, TaskAlreadyCanceled, InvalidTaskStatusTransition):
+                    LOG.info(
+                        "Download completion was finalized externally; keeping the existing task status",
+                        task_id=task.task_id,
+                    )
+                    refreshed_task = await app.DATABASE.tasks.get_task(
+                        task_id=task.task_id, organization_id=task.organization_id
+                    )
+                    if refreshed_task:
+                        task = refreshed_task
+                analytics.capture("skyvern-oss-agent-task-status", {"status": task.status})
+                otel_trace.get_current_span().set_attribute("task.completion_status", task.status.value)
 
         # Terminal-expiry backstop for the org-less path (the credited/finally take above runs only inside the
         # `if task.organization_id:` block): detach the listener and expire any claims/candidates. Idempotent.
@@ -10109,7 +10215,7 @@ class ForgeAgent:
                 task_id=task.task_id,
                 workflow_run_id=task.workflow_run_id,
             )
-            return
+            return task
 
         await self.async_operation_pool.remove_task(task.task_id)
 
@@ -10138,6 +10244,8 @@ class ForgeAgent:
             with traced_span(_tracer, "skyvern.agent.cleanup.webhook") as _cl_wh_span:
                 apply_context_attrs(_cl_wh_span)
                 await self.execute_task_webhook(task=task, api_key=api_key)
+
+        return task
 
     async def execute_task_webhook(
         self,

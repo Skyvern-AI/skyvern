@@ -2481,6 +2481,7 @@ class LLMAPIHandlerFactory:
                                 reasoning_tokens=(
                                     (getattr(_fb_detail, "reasoning_tokens", 0) or 0) if _fb_detail else 0
                                 ),
+                                finish_reason=_response_finish_reason(response),
                             )
 
                     # A content_filter response with empty content is a valid ModelResponse,
@@ -4511,6 +4512,9 @@ class LLMCaller:
             prompt_tokens=getattr(usage, "prompt_tokens", None),
             completion_tokens=getattr(usage, "completion_tokens", None),
             reasoning_tokens=getattr(usage_detail, "reasoning_tokens", None),
+            # Splits the two labels upstreams give the same answer-less reply, so the share arriving
+            # as `stop` is readable without the exception text.
+            finish_reason=_response_finish_reason(response),
             # False means the request declared no reasoning budget to lower, so this call fails as it
             # did before. Read with retried_reasoning_budget to tell a recovery from a bare report.
             retried=retry_parameters is not None,

@@ -172,11 +172,18 @@ async def test_history_prunes_old_image_blocks_before_appending_tiff_pages(messa
     assert messages[0]["content"] == [{"type": "text", "text": "earlier context"}]
 
 
-def _make_response(finish_reason: str, content: str | None, model: str = "gemini-3-flash-preview") -> MagicMock:
+def _make_response(
+    finish_reason: str,
+    content: str | None,
+    model: str = "gemini-3-flash-preview",
+    tool_calls: list[Any] | None = None,
+) -> MagicMock:
     """Build a minimal litellm.ModelResponse mock."""
     choice = MagicMock()
     choice.finish_reason = finish_reason
     choice.message.content = content
+    # A MagicMock would make every absent tool_calls field truthy, which reads as a tool-call reply.
+    choice.message.tool_calls = tool_calls
 
     usage = MagicMock()
     usage.prompt_tokens = 64000
@@ -203,8 +210,20 @@ class TestIsTruncatedResponse:
         resp = _make_response(finish_reason="stop", content='{"result": "ok"}')
         assert is_truncated_response(resp) is False
 
-    def test_stop_finish_with_none_content(self) -> None:
+    def test_stop_finish_with_none_content_is_truncated(self) -> None:
+        """The same answer-less spend upstreams label `length`; recognising only `length` sent this
+        form to the JSON parser, where it failed with no model, reason or token counts (SKY-19198)."""
         resp = _make_response(finish_reason="stop", content=None)
+        assert is_truncated_response(resp) is True
+
+    def test_stop_finish_with_none_content_and_a_tool_call_is_not_truncated(self) -> None:
+        """A tool call is the answer, so retrying it with less reasoning would discard a usable reply."""
+        resp = _make_response(finish_reason="stop", content=None, tool_calls=[{"id": "call_1"}])
+        assert is_truncated_response(resp) is False
+
+    def test_content_filter_finish_with_none_content_is_not_truncated(self) -> None:
+        """A refusal has its own non-Gemini escape path; claiming it here would strand that (SKY-11766)."""
+        resp = _make_response(finish_reason="content_filter", content=None)
         assert is_truncated_response(resp) is False
 
     def test_empty_choices(self) -> None:
@@ -279,6 +298,16 @@ class TestParseApiResponseTruncation:
             parse_api_response(resp)
         assert exc_info.value.model == "gemini-3-flash-preview"
         assert exc_info.value.prompt_tokens == 64000
+        assert exc_info.value.reasoning_tokens == 62000
+        assert exc_info.value.finish_reason == "length"
+
+    def test_answer_less_stop_response_reports_its_own_finish_reason(self) -> None:
+        """Both labels now raise here, so a hardcoded reason would misreport which one arrived."""
+        resp = _make_response(finish_reason="stop", content=None)
+        with pytest.raises(LLMOutputTruncatedError) as exc_info:
+            parse_api_response(resp)
+        assert exc_info.value.finish_reason == "stop"
+        assert "finish_reason=stop" in str(exc_info.value)
         assert exc_info.value.reasoning_tokens == 62000
 
     def test_normal_response_parses_successfully(self) -> None:
