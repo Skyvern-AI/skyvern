@@ -38,6 +38,7 @@ from skyvern.forge import app
 from skyvern.forge.agent import ForgeAgent
 from skyvern.forge.agent_functions import AgentFunction
 from skyvern.forge.sdk.artifact.manager import ArtifactManager
+from skyvern.forge.sdk.artifact.models import ArtifactType
 from skyvern.forge.sdk.core import skyvern_context
 from skyvern.forge.sdk.core.skyvern_context import EnrichTreeMode, SkyvernContext
 from skyvern.forge.sdk.credential_site_policy import LoginSite
@@ -4769,6 +4770,50 @@ async def test_execute_task_v3_writes_a_step_per_turn_beside_the_billed_block_st
     assert [(row.step_id, row.step_order) for row in rows] == [("turn-1", 0), ("turn-2", 0)]
     assert step.step_id == "step-v3" and step.status == StepStatus.completed
     assert post_step.await_args.args[1] is step
+
+
+@pytest.mark.asyncio
+async def test_every_look_image_is_stored_on_the_block_step_before_a_later_judge_frame(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # The Copilot's at-failure frame is the block step's newest screenshot_llm, which follows member order.
+    manager = ArtifactManager()
+    monkeypatch.setattr(agent_module.app, "ARTIFACT_MANAGER", manager)
+
+    async def fake_create_step(**kwargs: Any) -> Any:
+        return SimpleNamespace(step_id=f"turn-{kwargs['order']}", task_id="tsk-looks")
+
+    monkeypatch.setattr("skyvern.forge.agent.app.DATABASE.tasks.create_step", fake_create_step)
+    monkeypatch.setattr("skyvern.forge.agent.app.DATABASE.tasks.finish_step", AsyncMock())
+    stored: dict[str, list[bytes]] = {}
+
+    async def drive_turns(kwargs: dict[str, Any]) -> None:
+        await kwargs["on_turn_start"](1)
+        kwargs["on_look_screenshots"]([b"look-1"])
+        kwargs["on_look_screenshots"]([b"look-2"])
+        manager.accumulate_screenshot_to_step_archive(
+            step=kwargs["step"], screenshots=[b"judge"], artifact_type=ArtifactType.SCREENSHOT_LLM
+        )
+        stored.update(
+            {
+                step_id: [
+                    acc.entries[name] for kind, name, _ in acc.member_types if kind == ArtifactType.SCREENSHOT_LLM
+                ]
+                for step_id, acc in manager._step_archives.items()
+            }
+        )
+
+    step, *_ = await _run_execute_task_v3(
+        monkeypatch,
+        LoopOutcome(status="completed", reason="done", billable_actions=[]),
+        on_loop_async=drive_turns,
+        data_extraction_goal=None,
+        extracted_information_schema=None,
+    )
+
+    assert {step_id: images for step_id, images in stored.items() if images} == {
+        step.step_id: [b"look-1", b"look-2", b"judge"]
+    }
 
 
 @pytest.mark.asyncio

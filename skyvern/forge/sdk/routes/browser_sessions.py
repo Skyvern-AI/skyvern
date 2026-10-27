@@ -20,6 +20,7 @@ from skyvern.exceptions import (
 from skyvern.forge import app
 from skyvern.forge.agent_functions import STANDALONE_BROWSER_SESSION_FEATURE_NAME
 from skyvern.forge.sdk.artifact.models import Artifact, ArtifactType
+from skyvern.forge.sdk.core.permissions.permission_checker_factory import PermissionCheckerFactory
 from skyvern.forge.sdk.db.datetime_utils import naive_utc_now
 from skyvern.forge.sdk.routes.code_samples import (
     CLOSE_BROWSER_SESSION_CODE_SAMPLE_PYTHON,
@@ -344,6 +345,7 @@ async def create_browser_session(
             detail="proxy_session_id is only supported with RESIDENTIAL_ISP proxy_location",
         )
 
+    await PermissionCheckerFactory.get_instance().check_browser_session_access(current_org)
     await app.AGENT_FUNCTION.validate_enterprise_feature_access(
         organization_id=current_org.organization_id,
         feature_names={STANDALONE_BROWSER_SESSION_FEATURE_NAME},
