@@ -335,6 +335,47 @@ async def test_finish_terminates_with_status_and_output() -> None:
     assert observe_calls == [("observe", {})]
 
 
+@pytest.mark.asyncio
+async def test_accepted_finish_answers_trailing_batched_tool_calls_for_history() -> None:
+    observe_calls: list[tuple[str, dict[str, Any]]] = []
+    finish = make_finish_tool(max_settle_deferrals=0)
+    observe = _recording_tool("observe", observe_calls)
+    outcome, _ = await _run(
+        [[("finish", {"status": "completed", "reason": "goal met"}), ("observe", {})]],
+        [finish, observe],
+    )
+
+    assistant_calls = next(message["tool_calls"] for message in outcome.messages if message.get("tool_calls"))
+    tool_results = {message["tool_call_id"]: message for message in outcome.messages if message.get("role") == "tool"}
+    assert [call["id"] for call in assistant_calls] == list(tool_results)
+    assert tool_results["call_1"]["content"] == "skipped: finish was accepted"
+    assert observe_calls == []
+
+
+@pytest.mark.asyncio
+async def test_loop_can_resume_from_existing_conversation() -> None:
+    caller = _ScriptedCaller([[("finish", {"status": "completed", "reason": "goal still met"})]])
+    history = [
+        {"role": "system", "content": "original system"},
+        {"role": "user", "content": "original goal"},
+        {"role": "assistant", "content": "I clicked download."},
+        {"role": "user", "content": "Final storage result: timeout."},
+    ]
+
+    outcome = await run_agent_tool_loop(
+        llm_caller=caller,
+        system_prompt="not used when history is supplied",
+        user_prompt="not used when history is supplied",
+        initial_messages=history,
+        tools=[make_finish_tool()],
+        max_turns=1,
+        max_tool_calls=1,
+    )
+
+    assert outcome.status == "completed"
+    assert caller.message_history[: len(history)] == history
+
+
 _UNMAPPED_FINISH_SCHEMA_SHA256 = "7d3bd060a60aa326dedb4cd5474b0bf4b9e7f25ea19ea60ddfb9f19375cd8d33"
 
 
@@ -15456,7 +15497,11 @@ def _candidate_facts(interceptor: cdp_module.CDPDownloadInterceptor) -> Download
 
 
 def _finish_contents(outcome: Any) -> list[str]:
-    return [m["content"] for m in outcome.messages if m.get("role") == "tool" and m.get("name") == "finish"]
+    return [
+        m["content"]
+        for m in outcome.messages
+        if m.get("role") == "tool" and m.get("name") == "finish" and m.get("content") != "skipped: finish was accepted"
+    ]
 
 
 @pytest.mark.asyncio
