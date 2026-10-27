@@ -387,40 +387,56 @@ async def test_a_hung_rescue_stage_ends_inside_the_capture_deadline(
     monkeypatch: pytest.MonkeyPatch, stage: str, primary_stalled: bool
 ) -> None:
     _production_rescue_timeouts(monkeypatch)
+    spent: list[float] = []
+    bounds = _recorded_bounds(spent)
+    # The page module's loop clock advances only as its bounds expire, so the stage bounds it derives from the deadline
+    # and the time the capture ends at do not depend on runner speed.
+    bounds.get_running_loop = lambda: SimpleNamespace(time=lambda: sum(spent))
+    monkeypatch.setattr(page_module, "asyncio", bounds)
     page = _page()
     session = page.context.new_cdp_session.return_value
+    release = asyncio.Event()
     working_send = session.send.side_effect
 
     async def attach(*_args: object) -> AsyncMock:
         if stage == "attach":
-            await asyncio.Event().wait()
+            await release.wait()
         return session
 
     async def send(method: str, params: dict) -> dict:
         if stage == "geometry" or (stage == "capture" and method == "Page.captureScreenshot"):
-            await asyncio.Event().wait()
+            await release.wait()
         return await working_send(method, params)
 
     async def hang() -> None:
-        await asyncio.Event().wait()
+        await release.wait()
 
     page.context.new_cdp_session.side_effect = attach
     session.send.side_effect = send
     if stage == "detach":
         session.detach.side_effect = hang
-    loop = asyncio.get_running_loop()
-    capture = page_module._CaptureDeadline(at=loop.time() + 1, primary_stalled=primary_stalled)
+    capture = page_module._CaptureDeadline(at=1.0, primary_stalled=primary_stalled)
     existing_tasks = asyncio.all_tasks()
 
     with skyvern_context.scoped(SkyvernContext()) as context:
-        if stage == "detach":
-            assert await _current_viewpoint_screenshot_helper(page, timeout=1000, capture=capture)
-        else:
-            with pytest.raises(FailedToTakeScreenshot):
-                await _current_viewpoint_screenshot_helper(page, timeout=1000, capture=capture)
+        call = asyncio.create_task(_current_viewpoint_screenshot_helper(page, timeout=1000, capture=capture))
+        try:
+            # A hang guard only: the stand-in never expires a timeout_at or a bound above the stage bounds.
+            await asyncio.wait({call}, timeout=30)
+            assert call.done(), f"no bound ended the hung {stage} stage"
+            assert not (asyncio.all_tasks() - existing_tasks)
+        finally:
+            release.set()
+            call.cancel()
+            await asyncio.gather(call, return_exceptions=True)
 
-    assert loop.time() < capture.at
-    assert not (asyncio.all_tasks() - existing_tasks)
+    if stage == "detach":
+        assert call.result()
+    else:
+        with pytest.raises(FailedToTakeScreenshot):
+            call.result()
+    assert spent
+    assert sum(spent) < capture.at
     if stage != "detach":
         assert context.browser_health.stuck_operations == {BrowserOperation.SCREENSHOT}
         assert context.browser_health.consecutive_timeouts == 1
