@@ -44,6 +44,7 @@ from skyvern.forge.sdk.experimentation.workflow_block_engine import (
     workflow_block_engine_override,
 )
 from skyvern.forge.sdk.schemas.tasks import TaskStatus
+from skyvern.forge.sdk.workflow.models.agent_step_block import AgentStepBlock
 from skyvern.forge.sdk.workflow.models.block import (
     ActionBlock,
     BaseTaskBlock,
@@ -812,6 +813,13 @@ def _pinned_engine_blocks() -> list[BaseTaskBlock]:
     return [eligible, pinned]
 
 
+def _agent_step_blocks() -> list[Block]:
+    agent = AgentStepBlock(
+        label="agent", output_parameter=_make_output_parameter("agent"), prompt="Find it.", data_schema={}
+    )
+    return [_make_block(TaskBlock, label="ok"), agent]
+
+
 def _unsupported_block_type_blocks() -> list[BaseTaskBlock]:
     # No shipped BaseTaskBlock subclass declares an unsupported, non-inert block_type today, so
     # force one to exercise the branch _task_block_supports_v3 exists to guard.
@@ -883,6 +891,7 @@ def _jinja_condition_while_loop_blocks() -> list[Block]:
     ("blocks_factory", "expected_reason"),
     [
         (_pinned_engine_blocks, V3AbIneligibleReason.pinned_engine),
+        (_agent_step_blocks, V3AbIneligibleReason.pinned_engine),
         (_unsupported_block_type_blocks, V3AbIneligibleReason.unsupported_block),
         (_download_gated_validation_blocks, V3AbIneligibleReason.unsupported_block),
         (_totp_blocks, None),
@@ -895,6 +904,7 @@ def _jinja_condition_while_loop_blocks() -> list[Block]:
     ],
     ids=[
         "pinned_engine",
+        "agent_step_runs_v3_browser_work_in_both_arms",
         "unsupported_block_type",
         "unsupported_block_validation_download",
         "totp_verification_url_is_admitted",

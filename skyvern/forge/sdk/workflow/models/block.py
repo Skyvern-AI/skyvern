@@ -29,7 +29,7 @@ import unicodedata
 import uuid
 import zipfile
 from collections import defaultdict, deque
-from collections.abc import AsyncIterator, Coroutine, Iterator, Mapping, Sequence
+from collections.abc import AsyncIterator, Coroutine, Iterable, Iterator, Mapping, Sequence
 from contextvars import ContextVar
 from dataclasses import dataclass, replace
 from datetime import UTC, date, datetime, time
@@ -954,6 +954,8 @@ class Block(BaseModel, abc.ABC):
     # failure handler tell a value recorded during THIS execution apart from a stale
     # value left by a prior for-loop iteration.
     _output_recorded_this_execution: bool = PrivateAttr(default=False)
+    # Fields a model wrote at run time; rendering them as Jinja would let model text read the run's values.
+    _prerendered_fields: frozenset[str] = PrivateAttr(default=frozenset())
 
     # Fields this class renders as Jinja. Declared per class; the effective set is the
     # union over the MRO, so a subclass never shadows what its base renders.
@@ -962,6 +964,9 @@ class Block(BaseModel, abc.ABC):
     # Whether continue_on_failure / next_loop_on_failure may carry the run past this block's
     # failures. False for blocks whose job is to stop the run.
     FAILURE_IS_CONTINUABLE: ClassVar[bool] = True
+
+    def mark_fields_prerendered(self, fields: Iterable[str]) -> None:
+        self._prerendered_fields = self._prerendered_fields | frozenset(fields)
 
     @classmethod
     def templatable_fields(cls) -> frozenset[str]:
@@ -986,7 +991,7 @@ class Block(BaseModel, abc.ABC):
     ) -> str:
         if field not in type(self).model_fields:
             raise ValueError(f"{type(self).__name__} has no field named {field!r}")
-        if field not in self.templatable_fields():
+        if field not in self.templatable_fields() or field in self._prerendered_fields:
             LOG.debug("Skipping Jinja render for a non-templatable field", block_label=self.label, field=field)
             return value
         LOG.debug("Rendering templatable field", block_label=self.label, field=field)
@@ -20526,6 +20531,9 @@ def v3_ab_ineligibility_reason(blocks: list[BlockTypeVar]) -> V3AbIneligibleReas
             if isinstance(block.condition, PromptBranchCriteria):
                 reroutable_blocks += 1
             continue
+        if block.block_type == BlockType.AGENT_STEP:
+            # Its browser tools build task blocks pinned to v3 at run time, where this check cannot see them.
+            return V3AbIneligibleReason.pinned_engine
         if not isinstance(block, BaseTaskBlock):
             continue
         if block.block_type in _ENGINE_INERT_BLOCK_TYPES:
@@ -20602,6 +20610,7 @@ def get_all_blocks(blocks: list[BlockTypeVar]) -> list[BlockTypeVar]:
 
 
 # Late import: google_sheets_blocks imports Block from this module, so top-level import would cycle.
+from skyvern.forge.sdk.workflow.models.agent_step_block import AgentStepBlock  # noqa: E402
 from skyvern.forge.sdk.workflow.models.data_export_block import DataExportBlock  # noqa: E402
 from skyvern.forge.sdk.workflow.models.email_inbox_block import EmailInboxBlock  # noqa: E402
 from skyvern.forge.sdk.workflow.models.google_sheets_blocks import (  # noqa: E402
@@ -20647,6 +20656,7 @@ BlockSubclasses = Union[
     SplitPdfBlock,
     DataExportBlock,
     TerminateBlock,
+    AgentStepBlock,
 ]
 BlockTypeVar = Annotated[BlockSubclasses, Field(discriminator="block_type")]
 

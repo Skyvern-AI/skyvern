@@ -532,6 +532,7 @@ class BlockType(StrEnum):
     EMAIL_INBOX = "email_inbox"
     DATA_EXPORT = "data_export"
     TERMINATE = "terminate"
+    AGENT_STEP = "agent_step"
 
 
 class AIFallbackMode(StrEnum):
@@ -1468,6 +1469,29 @@ class TerminateBlockYAML(BlockYAML):
         return value
 
 
+class AgentStepBlockYAML(BlockYAML):
+    block_type: Literal[BlockType.AGENT_STEP] = BlockType.AGENT_STEP  # type: ignore
+
+    prompt: str
+    data_schema: dict[str, Any] = Field(
+        default_factory=lambda: {"type": "object", "properties": {"answer": {"type": "string"}}, "required": ["answer"]}
+    )
+    max_turns: int = Field(default=25, ge=1, le=200)
+    parameter_keys: list[str] | None = None
+
+    @field_validator("data_schema")
+    @classmethod
+    def validate_data_schema(cls, value: dict[str, Any]) -> dict[str, Any]:
+        try:
+            Draft202012Validator.check_schema(value)
+        except SchemaError as exc:
+            raise ValueError(f"data_schema is not a valid JSON Schema: {exc.message.rstrip('.')}.") from exc
+        # The schema becomes the finish tool's parameters, and tool parameters must be an object.
+        if value.get("type") != "object":
+            raise ValueError('data_schema must describe an object ("type": "object").')
+        return value
+
+
 class FileDownloadBlockYAML(BlockYAML):
     block_type: Literal[BlockType.FILE_DOWNLOAD] = BlockType.FILE_DOWNLOAD  # type: ignore
 
@@ -1763,6 +1787,7 @@ BLOCK_YAML_SUBCLASSES = (
     | FileDownloadBlockYAML
     | DataExportBlockYAML
     | TerminateBlockYAML
+    | AgentStepBlockYAML
     | UrlBlockYAML
     | PDFParserBlockYAML
     | TaskV2BlockYAML

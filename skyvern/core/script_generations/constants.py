@@ -33,6 +33,7 @@ _ENGINE_ONLY_LOOP_CHILD_TYPES = {
     BlockType.PDF_FILL,
     BlockType.PRINT_PAGE,
     BlockType.SPLIT_PDF,
+    BlockType.AGENT_STEP,
 }
 
 
