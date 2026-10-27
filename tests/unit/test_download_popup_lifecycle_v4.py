@@ -23,6 +23,7 @@ import pytest
 import skyvern.forge.sdk.core.skyvern_context as _skvctx
 from skyvern.exceptions import ExternalBrowserUnavailable
 from skyvern.forge.agent import ForgeAgent
+from skyvern.forge.sdk.api.files import wait_for_download_finished
 from skyvern.forge.sdk.core.skyvern_context import SkyvernContext
 from skyvern.forge.sdk.models import StepStatus
 from skyvern.forge.sdk.schemas.persistent_browser_sessions import lost_external_browser_error
@@ -43,6 +44,7 @@ from skyvern.webeye.actions.responses import ActionAbort, ActionFailure, ActionS
 from skyvern.webeye.cdp_download_interceptor import CDPDownloadInterceptor
 from tests.unit._external_cdp_fakes import ORG_A, external_browser_state
 from tests.unit.helpers import make_organization, make_step, make_task
+from tests.unit.scoped_asyncio import ScopedAsyncio
 
 _HANDLER = "skyvern.webeye.actions.handler"
 _AGENT = "skyvern.forge.agent"
@@ -128,6 +130,19 @@ class _FakePage:
         self._closed = True
         self.close_terminal = True
         self._events.append(f"{self._label}:close_terminal")
+
+
+class _ScopedTime:
+    """``time`` stand-in bound to one module: ``monotonic`` reads ``now``, every other attribute is real."""
+
+    def __init__(self) -> None:
+        self.now = 0.0
+
+    def monotonic(self) -> float:
+        return self.now
+
+    def __getattr__(self, name: str) -> object:
+        return getattr(time, name)
 
 
 async def _spin(task: asyncio.Task[Any], turns: int = 300) -> bool:
@@ -591,42 +606,61 @@ async def test_non_download_popup_returns_within_start_grace_not_download_timeou
 @pytest.mark.asyncio
 async def test_file_start_and_finalization_share_one_overall_deadline(tmp_path: Path) -> None:
     """P2: file-start detection and finalization must share one overall budget, not stack two full timeouts.
-    A ``.crdownload`` lands ~0.8s post-action and never settles under download_timeout=1.0. On the unfixed
-    head detection (~0.8s) plus a fresh 1.0s finalization wait is ~1.8s; the fix caps the total at the 1.0s
-    overall budget. No durable file => no credit, no close."""
+    On a handler clock advanced only by its sleeps and finalization waits, a ``.crdownload`` landing at 0.8s
+    that never settles under download_timeout=1.0 must end within 1.0s, uncredited and unclosed."""
     task, step, scraped_page, ctx, events = _make_env(download_timeout=1.0)
     context = _FakeContext()
     opener = _FakePage(context, "http://origin/", events, "opener")
     context.pages.append(opener)
     action = ClickAction(element_id="dl-link", download=False)
+    partial = tmp_path / "statement.pdf.crdownload"
 
     extra_pages: list[_FakePage] = []
+    clock = _ScopedTime()
+    action_at: list[float] = []
+    finalize_waits: list[tuple[float, float]] = []
 
-    async def _land_partial_then_never_settle() -> None:
-        await asyncio.sleep(0.8)
-        (tmp_path / "statement.pdf.crdownload").write_bytes(b"partial")
+    async def _handler_sleep(delay: float, result: Any = None) -> Any:
+        clock.now += delay
+        if action_at and not partial.exists() and clock.now - action_at[0] >= 0.8:
+            partial.write_bytes(b"partial")
+        await asyncio.sleep(0)
+        return result
+
+    async def _record_finalize_wait(*, downloading_files: list[str], timeout: float) -> None:
+        finalize_waits.append((clock.now - action_at[0], timeout))
+        try:
+            await wait_for_download_finished(downloading_files=downloading_files, timeout=timeout)
+        finally:
+            clock.now += timeout
 
     async def inner(*_args: object, **_kwargs: object) -> list[ActionSuccess]:
         extra = _FakePage(context, "http://origin/doc", events, "popup")
         context.pages.append(extra)
         extra_pages.append(extra)
-        asyncio.ensure_future(_land_partial_then_never_settle())
+        action_at.append(clock.now)
         return [ActionSuccess()]
 
     app_mock = _app_mock(action)
-    started = time.monotonic()
     with ExitStack() as stack:
         _enter_patches(stack, app_mock, ctx, tmp_path, inner)
         stack.enter_context(patch(f"{_HANDLER}.DOWNLOAD_IN_FLIGHT_POLL_INTERVAL_SECONDS", 0.05))
+        stack.enter_context(patch(f"{_HANDLER}.time", clock))
+        stack.enter_context(patch(f"{_HANDLER}.asyncio", ScopedAsyncio(sleep=_handler_sleep)))
+        stack.enter_context(patch(f"{_HANDLER}.wait_for_download_finished", _record_finalize_wait))
         await asyncio.wait_for(
             ActionHandler.handle_action(
                 scraped_page, task, step, opener, action, file_download_false_click_eligible=True
             ),
             timeout=5.0,
         )
-    elapsed = time.monotonic() - started
 
-    assert elapsed < 1.5, f"detection + finalization must share one overall budget; elapsed={elapsed:.2f}s"
+    assert finalize_waits, "a landed .crdownload must reach the finalization wait"
+    handler_seconds = clock.now - action_at[0]
+    assert handler_seconds <= 1.0 + 1e-9, (
+        f"detection + finalization must share one overall budget; handler clock={handler_seconds:.2f}s, "
+        f"finalization waits (started at, budget)={finalize_waits}"
+    )
     assert not extra_pages[0].is_closed(), "an unsettled .crdownload must not authorize a close"
     assert action.download_triggered is not True, "an unsettled .crdownload must not be credited"
 
