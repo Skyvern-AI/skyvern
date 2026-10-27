@@ -4250,7 +4250,7 @@ class ForgeAgent:
                 values_delivered=verification_state.values_delivered,
             )
         # Only when the reason recorded carries that status: a vetoed completion or a missing extraction failed for
-        # its own. Persisted below the block's own codes, never here.
+        # its own. Persisted below, and only when the block's own mapping produced no code of its own.
         missing_totp_source = verification_state.last_status == NO_ONE_TIME_CODE_SOURCE and NO_ONE_TIME_CODE_SOURCE in (
             failure_reason or ""
         )
@@ -4289,6 +4289,9 @@ class ForgeAgent:
             except Exception:
                 LOG.warning("task_v3 error code on finish gate failed", task_id=task.task_id, exc_info=True)
         detector_codes: list[str] | None = None
+        # Set only once a write landed: contained_effect and the detector's handler both swallow, and a
+        # suppression below must not be claimed on behalf of a code that never reached the column.
+        block_code_persisted = False
         if model_answer_used and outcome.error_code:
             with contained_effect("task_v3 model-chosen error code persist", task_id=task.task_id):
                 code_reasoning = outcome.reason
@@ -4305,6 +4308,7 @@ class ForgeAgent:
                         ).model_dump()
                     ],
                 )
+                block_code_persisted = True
         elif model_answer_used and outcome.error_code_declined:
             # An explicit "none of these" is the model's judgment, so the page guess must not override it.
             LOG.info("task_v3 user-defined error code declined by the model", task_id=task.task_id)
@@ -4338,6 +4342,7 @@ class ForgeAgent:
                         organization_id=task.organization_id,
                         errors=[error.model_dump() for error in detected_errors],
                     )
+                    block_code_persisted = True
                 detector_codes = [error.error_code for error in detected_errors]
             except Exception:
                 LOG.warning("task_v3 user-defined error detection failed", task_id=task.task_id, exc_info=True)
@@ -4354,16 +4359,23 @@ class ForgeAgent:
                 detector_error_codes=detector_codes,
                 model_answer_used=model_answer_used,
             )
-        # Last, because `errors` appends in call order and customers route on `errors[0]`: a code Skyvern
-        # attached itself must never displace the one the block's own error_code_mapping produced.
+        # A fallback for a run that has no code of its own: `errors` appends, and every entry reports
+        # error_type USER_DEFINED_ERROR, so a code Skyvern attached itself beside the block's own reads to
+        # a caller as a second failure it must route on. The attribution stays in failure_reason and here.
         if missing_totp_source:
-            LOG.info("task_v3 attributed to a missing TOTP source", task_id=task.task_id, task_status=task_status)
-            with contained_effect("task_v3 missing TOTP source error persist", task_id=task.task_id):
-                await app.DATABASE.tasks.update_task(
-                    task_id=task.task_id,
-                    organization_id=task.organization_id,
-                    errors=[MissingTOTPSourceError().to_user_defined_error().model_dump()],
-                )
+            LOG.info(
+                "task_v3 attributed to a missing TOTP source",
+                task_id=task.task_id,
+                task_status=task_status,
+                suppressed_by_block_code=block_code_persisted,
+            )
+            if not block_code_persisted:
+                with contained_effect("task_v3 missing TOTP source error persist", task_id=task.task_id):
+                    await app.DATABASE.tasks.update_task(
+                        task_id=task.task_id,
+                        organization_id=task.organization_id,
+                        errors=[MissingTOTPSourceError().to_user_defined_error().model_dump()],
+                    )
         need_call_webhook = True
         try:
             task = await self.update_task(
