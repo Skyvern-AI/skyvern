@@ -483,7 +483,7 @@ async def test_stream_capture_preserves_events_order_and_backpressure(monkeypatc
     assert adapter_events == base_events
     assert [event.type for event in adapter_events] == [event.type for event in base_events]
     assert telemetry_seen[-1] == (9, 47)
-    assert streams[1].closed == streams[0].closed is False
+    assert streams[1].closed is streams[0].closed is True
     assert current_model_call_telemetry() is None
 
 
@@ -1155,7 +1155,7 @@ async def test_stream_cancellation_resets_context_without_changing_stream_owners
     await events.aclose()
 
     assert current_model_call_telemetry() is None
-    assert stream.closed is False
+    assert stream.closed is True
 
 
 @pytest.mark.parametrize(
@@ -2574,7 +2574,8 @@ async def test_explicit_responses_request_forwards_every_setting_the_sdk_sends_t
         )
 
     assert set(sent) == {"chat", "responses"}
-    chat = {key: value for key, value in sent["chat"].items() if value is not None}
+    # acompletion pops this LiteLLM-internal flag; aresponses routes to its MCP gateway only for "mcp"-type tools.
+    chat = {key: value for key, value in sent["chat"].items() if value is not None and key != "_skip_mcp_handler"}
     responses = sent["responses"]
     for key, value in chat.items():
         name = _RESPONSES_KWARG_NAMES.get(key, key)

@@ -15,6 +15,7 @@ from urllib.parse import quote, urlparse
 import pytest
 import yaml
 from agents import FunctionTool
+from agents.mcp import MCPServerManager
 from agents.mcp.util import MCPUtil
 from agents.tool_context import ToolContext
 from fastmcp import FastMCP
@@ -3758,6 +3759,71 @@ async def test_a_frame_staged_inside_a_tool_names_the_call_that_staged_it() -> N
     stage(30)
 
     assert [frame.tool_call_id for frame in ctx.pending_chat_screenshots] == ["call-mcp", "call-native", None]
+
+
+class _HangingClient:
+    def __init__(self, _transport: object) -> None:
+        pass
+
+    async def __aenter__(self) -> None:
+        await asyncio.Event().wait()
+
+    async def __aexit__(self, *_args: object) -> None:
+        return None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("api_key", "event", "detail"),
+    [
+        pytest.param(None, "copilot_mcp_server_lifecycle_failed", "exc_info", id="error"),
+        pytest.param("sk-test", "copilot_mcp_server_lifecycle_cancelled", "elapsed_seconds", id="connect_timeout"),
+    ],
+)
+async def test_an_mcp_server_that_fails_to_connect_logs_why(
+    monkeypatch: pytest.MonkeyPatch, api_key: str | None, event: str, detail: str
+) -> None:
+    monkeypatch.setattr(mcp_adapter, "Client", _HangingClient)
+    ctx = make_copilot_ctx(api_key=api_key)
+    server = SkyvernOverlayMCPServer(
+        transport=MagicMock(),
+        overlays={},
+        alias_map={},
+        allowlist=frozenset(),
+        context_provider=lambda: ctx,
+    )
+
+    with capture_logs() as logs:
+        async with MCPServerManager([server], connect_timeout_seconds=0.05) as manager:
+            assert manager.active_servers == []
+
+    (failure,) = (log for log in logs if log["event"] == event)
+    assert failure["phase"] == "connect"
+    assert detail in failure
+
+
+@pytest.mark.asyncio
+async def test_malformed_mcp_tool_arguments_tell_the_model_where_the_json_broke() -> None:
+    ctx = make_copilot_ctx()
+    server = SkyvernOverlayMCPServer(
+        transport=MagicMock(),
+        overlays={},
+        alias_map={},
+        allowlist=frozenset(),
+        context_provider=lambda: ctx,
+    )
+    tool = MCPUtil.to_function_tool(
+        MCPTool(name="click", inputSchema={"type": "object", "properties": {}}),
+        server,
+        convert_schemas_to_strict=False,
+    )
+    arguments = '{"selector": '
+
+    output = await tool.on_invoke_tool(
+        ToolContext(context=ctx, tool_name="click", tool_call_id="call-1", tool_arguments=arguments), arguments
+    )
+
+    assert "Expecting value: line 1 column 14" in str(output)
 
 
 _ModelCall = Callable[[str, dict[str, Any]], Awaitable[dict[str, Any]]]

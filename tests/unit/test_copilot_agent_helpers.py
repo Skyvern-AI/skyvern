@@ -45,6 +45,9 @@ from agents.model_settings import ModelSettings
 from agents.result import RunResultStreaming
 from agents.run_context import RunContextWrapper
 from litellm.exceptions import NotFoundError as LiteLLMNotFoundError
+from openai.types.chat import ChatCompletionChunk
+from openai.types.chat.chat_completion_chunk import Choice as ChunkChoice
+from openai.types.chat.chat_completion_chunk import ChoiceDelta
 from openai.types.responses import Response, ResponseCompletedEvent, ResponseFunctionToolCall
 from openai.types.responses.response_prompt_param import ResponsePromptParam
 from pydantic import BaseModel
@@ -131,6 +134,7 @@ from skyvern.forge.sdk.copilot.interruption import (
     INTERRUPTED_TERMINAL_RETRY,
     INTERRUPTED_TERMINAL_SUPERSEDED_HEADLINE,
 )
+from skyvern.forge.sdk.copilot.model_resolver import CopilotLitellmProvider
 from skyvern.forge.sdk.copilot.model_telemetry import current_model_attempt_telemetry
 from skyvern.forge.sdk.copilot.output_policy import OutputPolicyReason, OutputPolicyVerdict, evaluate_output_policy
 from skyvern.forge.sdk.copilot.recoverable_failure import build_recoverable_failure
@@ -198,6 +202,7 @@ from skyvern.webeye.actions.action_types import ActionType
 from skyvern.webeye.actions.actions import Action, ActionStatus
 from tests.unit._copilot_workflow_fakes import fake_workflow
 from tests.unit.copilot_route_test_support import narrative_payload_with_run
+from tests.unit.copilot_test_helpers import FakeCopilotStream
 from tests.unit.copilot_test_helpers import make_copilot_ctx as _ctx
 from tests.unit.copilot_test_helpers import make_verified_goal_contract as _verified_goal_contract
 from tests.unit.copilot_test_helpers import origin_run_input, passing_run, stub_copilot_agent_loop
@@ -2566,6 +2571,78 @@ async def _run_tool_bearing_empty_completion_turn(
         config=CopilotConfig(fallback_llm_key=fallback_llm_key),
     )
     return _ToolBearingEmptyCompletionTurn(result, seen_ctx[0], run_with_enforcement, drain_calls)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("delta", "finish_reason"),
+    [
+        pytest.param(ChoiceDelta(role="assistant", refusal="I can't help with that."), "stop", id="refusal"),
+        pytest.param(ChoiceDelta(role="assistant", content=""), "content_filter", id="empty_content_filter"),
+    ],
+)
+async def test_a_refusal_or_content_filter_stop_ends_the_turn_with_the_empty_completion_reply(
+    monkeypatch: pytest.MonkeyPatch, delta: ChoiceDelta, finish_reason: str
+) -> None:
+    class Manager:
+        def __init__(self, _servers: object) -> None:
+            self.active_servers: list[object] = []
+
+        async def __aenter__(self) -> Self:
+            return self
+
+        async def __aexit__(self, *_args: object) -> None:
+            return None
+
+    def chunk(choice_delta: ChoiceDelta, reason: str | None = None) -> ChatCompletionChunk:
+        return ChatCompletionChunk(
+            id="chatcmpl-stop",
+            created=0,
+            model="claude-sonnet-5-5",
+            object="chat.completion.chunk",
+            choices=[ChunkChoice(index=0, delta=choice_delta, finish_reason=reason)],
+        )
+
+    async def stream() -> AsyncIterator[ChatCompletionChunk]:
+        yield chunk(delta)
+        yield chunk(ChoiceDelta(), finish_reason)
+
+    async def fake_acompletion(**_kwargs: object) -> AsyncIterator[ChatCompletionChunk]:
+        return stream()
+
+    run_config = RunConfig(model_provider=CopilotLitellmProvider(), tracing_disabled=True)
+    monkeypatch.setattr("litellm.acompletion", fake_acompletion)
+    monkeypatch.setattr(
+        "skyvern.forge.sdk.copilot.model_resolver.resolve_model_config",
+        lambda _handler, **_kwargs: ("anthropic/claude-sonnet-5-5", run_config, "PRIMARY", False),
+    )
+    monkeypatch.setattr(agent_module, "_resolve_live_browser_session_id", AsyncMock(return_value=None))
+    monkeypatch.setattr(agent_module, "schedule_agent_naming", lambda *_args: None)
+    monkeypatch.setattr("agents.mcp.MCPServerManager", Manager)
+
+    result = await agent_module.run_copilot_agent(
+        stream=FakeCopilotStream(),
+        organization_id="org-1",
+        chat_request=WorkflowCopilotChatRequest(
+            message="Build a workflow that downloads my invoices.",
+            workflow_id="wf-1",
+            workflow_permanent_id="wfp-1",
+            workflow_copilot_chat_id="chat-1",
+            workflow_yaml="",
+        ),
+        chat_history=[],
+        global_llm_context=None,
+        llm_api_handler=SimpleNamespace(llm_key="PRIMARY"),
+        raw_secret_safety_handler=AsyncMock(
+            return_value={"version": "1", "state": "clean", "handling": "none", "citations": []}
+        ),
+        api_key="sk-test",
+        config=CopilotConfig(),
+    )
+
+    assert result.user_response == agent_module.EMPTY_COMPLETION_TERMINAL_MESSAGE
+    assert result.turn_outcome is not None
+    assert result.turn_outcome.terminal_reason == "empty_completion"
 
 
 def _chat_request(*, product_action: str | None = None) -> SimpleNamespace:
