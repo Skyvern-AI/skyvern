@@ -45647,3 +45647,250 @@ async def test_a_replay_from_an_earlier_hold_is_offered_unowned_once_the_watch_i
         for fact in delivered
     ), delivered
     watch.close()
+
+
+# A one-time-code field that drops a key arriving too soon after the previous one: keystroke entry lands a partial code.
+_OTP_DROPPING_HTML = (
+    '<input id="code" type="text" maxlength="8" {ac}>'
+    "<script>let last = 0; document.getElementById('code').addEventListener('keydown', (e) => {"
+    " const now = performance.now(); if (now - last < 40) e.preventDefault(); else last = now; });</script>"
+)
+_OTP_FIELD = '<input id="code" type="text" autocomplete="one-time-code">'
+_OTP_TRUNCATING_HTML = (
+    _OTP_FIELD + "<script>document.getElementById('code').addEventListener('input', (e) => {"
+    " e.target.value = e.target.value.slice(0, 3); });</script>"
+)
+
+
+def _no_code_digits(content: str, code: str) -> bool:
+    return not any(code[i : i + 3] in content for i in range(len(code) - 2))
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+async def test_a_one_time_code_field_that_drops_keys_ends_holding_the_whole_code() -> None:
+    async with _content_page(_OTP_DROPPING_HTML.replace("{ac}", 'autocomplete="one-time-code"')) as page:
+        with skyvern_context.scoped(SkyvernContext(task_id="tsk_v3", runtime_secret_values={"482913"})):
+            tools = build_browser_tools(_fixed_page_provider(page))
+            r = await _tool(tools, "type").handler({"selector": "#code", "text": "482913"})
+        assert await page.eval_on_selector("#code", "el => el.value") == "482913"
+    assert r.status == "ok" and r.ok_class is None and not r.entry_unconfirmed, r.content
+    assert _no_code_digits(r.content, "482913"), r.content
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+async def test_a_one_time_code_field_that_keeps_truncating_fails_closed_without_echoing() -> None:
+    async with _content_page(_OTP_TRUNCATING_HTML) as page:
+        tools = build_browser_tools(_fixed_page_provider(page))
+        with capture_logs() as logs:
+            r = await _tool(tools, "type").handler({"selector": "#code", "text": "012345"})
+    assert (r.status, r.error_class) == ("error", "text_not_held"), (r.status, r.ok_class, r.content)
+    assert _no_code_digits(r.content, "012345") and "012" not in r.content, r.content
+    assert "012" not in json.dumps(logs, default=str)
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+async def test_a_one_time_code_field_rewritten_after_the_write_settles_fails_closed() -> None:
+    html = _OTP_FIELD + "<script>document.getElementById('code').addEventListener('input', (e) => {"
+    html += (
+        " if (e.target.value.length === 6) setTimeout(() => { e.target.value = e.target.value.slice(0, 3); }, 100); });"
+    )
+    html += "</script>"
+    async with _content_page(html) as page:
+        tools = build_browser_tools(_fixed_page_provider(page))
+        r = await _tool(tools, "type").handler({"selector": "#code", "text": "482913"})
+    assert (r.status, r.error_class) == ("error", "text_not_held"), (r.status, r.ok_class, r.content)
+    assert _no_code_digits(r.content, "482913"), r.content
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+async def test_a_one_time_code_field_that_unmounts_itself_is_not_reported_entered() -> None:
+    html = '<div id="wrap">' + _OTP_FIELD + "</div><script>document.getElementById('code').addEventListener('input',"
+    html += " (e) => { if (e.target.value.length >= 3) document.getElementById('wrap').innerHTML = '<span>Checking</span>'; });"
+    html += "</script>"
+    async with _content_page(html) as page:
+        tools = build_browser_tools(_fixed_page_provider(page))
+        r = await _tool(tools, "type").handler({"selector": "#code", "text": "482913"})
+    assert r.status == "error" and _no_code_digits(r.content, "482913"), (r.status, r.ok_class, r.content)
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+async def test_a_literal_one_time_code_with_a_leading_zero_lands_exactly_and_is_never_shown() -> None:
+    async with _content_page(_OTP_FIELD) as page:
+        tools = build_browser_tools(_fixed_page_provider(page))
+        with capture_logs() as logs:
+            r = await _tool(tools, "type").handler({"selector": "#code", "text": "012345"})
+            observed = await _tool(tools, "observe").handler({})
+        assert await page.eval_on_selector("#code", "el => el.value") == "012345"
+    assert r.status == "ok" and r.ok_class is None and not r.entry_unconfirmed, r.content
+    assert "12345" not in r.content and "12345" not in observed.content, observed.content
+    assert "12345" not in json.dumps(logs, default=str)
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+async def test_a_one_time_code_field_too_short_for_the_code_keeps_the_ordinary_entry() -> None:
+    async with _content_page('<input id="code" type="text" maxlength="4" autocomplete="one-time-code">') as page:
+        tools = build_browser_tools(_fixed_page_provider(page))
+        r = await _tool(tools, "type").handler({"selector": "#code", "text": "482913"})
+        assert await page.eval_on_selector("#code", "el => el.value") == "4829"
+    assert r.ok_class == "held_differs", r.content
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+async def test_ordinary_text_in_a_key_dropping_field_keeps_reporting_what_it_holds() -> None:
+    async with _content_page(_OTP_DROPPING_HTML.replace("{ac}", "")) as page:
+        tools = build_browser_tools(_fixed_page_provider(page))
+        r = await _tool(tools, "type").handler({"selector": "#code", "text": "123456"})
+        held = await page.eval_on_selector("#code", "el => el.value")
+    assert held != "123456" and r.ok_class == "held_differs", (held, r.content)
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+async def test_a_one_time_code_the_field_will_not_hold_withholds_the_verify_click_in_its_batch() -> None:
+    html = (
+        _OTP_TRUNCATING_HTML
+        + '<button id="verify" onclick="window.verified = (window.verified || 0) + 1">Verify</button>'
+    )
+    async with _content_page(html) as page:
+        tools = build_browser_tools(_fixed_page_provider(page))
+        script = [
+            [("type", {"selector": "#code", "text": "012345"}), ("click", {"selector": "#verify"})],
+            [("finish", {"status": "failed", "reason": "code not entered"})],
+        ]
+        outcome = await taskv3_loop.run_agent_tool_loop(
+            llm_caller=_ScriptedCaller(script),
+            system_prompt="sys",
+            user_prompt="goal",
+            tools=tools + [taskv3_loop.make_finish_tool()],
+            max_turns=10,
+            max_tool_calls=20,
+        )
+        verified = await page.evaluate("window.verified || 0")
+    assert verified == 0
+    messages = [m for m in outcome.messages if m.get("role") == "tool"]
+    assert any(m.get("name") == "click" and "skipped" in m["content"] for m in messages), messages
+    assert all("012" not in m["content"] for m in messages), messages
+
+
+_TRUNCATE_TO_3_JS = (
+    "<script>document.getElementById('code').addEventListener('input', (e) => {"
+    " e.target.value = e.target.value.slice(0, 3); });</script>"
+)
+# A field too small for a click to reach, so the type tool can only focus it; it also drops fast keys.
+_FOCUS_ONLY_DROPPING_HTML = (
+    '<input id="code" type="text" {ac} style="position:fixed;left:-200px;top:10px;width:120px">'
+    "<script>let last = 0; document.getElementById('code').addEventListener('keydown', (e) => {"
+    " const now = performance.now(); if (now - last < 40) e.preventDefault(); else last = now; });</script>"
+)
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+async def test_a_tel_one_time_code_field_that_keeps_truncating_fails_closed_without_echoing() -> None:
+    html = '<input id="code" type="tel" autocomplete="one-time-code">' + _TRUNCATE_TO_3_JS
+    async with _content_page(html) as page:
+        tools = build_browser_tools(_fixed_page_provider(page))
+        r = await _tool(tools, "type").handler({"selector": "#code", "text": "012345"})
+    assert (r.status, r.error_class) == ("error", "text_not_held"), (r.status, r.ok_class, r.content)
+    assert _no_code_digits(r.content, "012345") and "012" not in r.content, r.content
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+async def test_a_literal_tel_one_time_code_lands_exactly_and_is_never_shown() -> None:
+    async with _content_page('<input id="code" type="tel" autocomplete="one-time-code">') as page:
+        tools = build_browser_tools(_fixed_page_provider(page))
+        r = await _tool(tools, "type").handler({"selector": "#code", "text": "012345"})
+        observed = await _tool(tools, "observe").handler({})
+        assert await page.eval_on_selector("#code", "el => el.value") == "012345"
+    assert r.status == "ok" and r.ok_class is None and not r.entry_unconfirmed, r.content
+    assert "12345" not in r.content and "12345" not in observed.content, observed.content
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+async def test_an_ordinary_tel_field_that_truncates_keeps_reporting_what_it_holds() -> None:
+    async with _content_page('<input id="code" type="tel">' + _TRUNCATE_TO_3_JS) as page:
+        tools = build_browser_tools(_fixed_page_provider(page))
+        r = await _tool(tools, "type").handler({"selector": "#code", "text": "5551234"})
+    assert r.ok_class == "held_differs" and "'555'" in r.content, r.content
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+async def test_a_one_time_code_field_reached_only_by_focus_that_drops_keys_ends_holding_the_whole_code() -> None:
+    async with _content_page(_FOCUS_ONLY_DROPPING_HTML.replace("{ac}", 'autocomplete="one-time-code"')) as page:
+        tools = build_browser_tools(_fixed_page_provider(page))
+        r = await _tool(tools, "type").handler({"selector": "#code", "text": "482913"})
+        assert await page.eval_on_selector("#code", "el => el.value") == "482913"
+    assert r.status == "ok" and r.ok_class is None and not r.entry_unconfirmed, r.content
+    assert _no_code_digits(r.content, "482913"), r.content
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+async def test_ordinary_text_reached_only_by_focus_that_drops_keys_is_reported_as_changed() -> None:
+    async with _content_page(_FOCUS_ONLY_DROPPING_HTML.replace("{ac}", "")) as page:
+        tools = build_browser_tools(_fixed_page_provider(page))
+        r = await _tool(tools, "type").handler({"selector": "#code", "text": "123456"})
+        held = await page.eval_on_selector("#code", "el => el.value")
+    assert held != "123456" and (r.status, r.error_class) == ("error", "value_changed_by_page"), (held, r.content)
+
+
+# A form that never submits, recording every Enter it receives, around one field; `{field}` is the input's markup.
+_ENTER_FORM_HTML = (
+    '<form onsubmit="event.preventDefault()">{field}</form>'
+    "<script>window.enters = 0; document.addEventListener('keydown', (e) => { if (e.key === 'Enter') window.enters++; });"
+    "{script}</script>"
+)
+_TRUNCATE_LATER_JS = (
+    "document.getElementById('code').addEventListener('input', (e) => { if (e.target.value.length >= 6)"
+    " setTimeout(() => { e.target.value = e.target.value.slice(0, 3); }, 100); });"
+)
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+async def test_a_literal_one_time_code_typed_with_enter_lands_exactly_is_never_shown_and_presses_enter() -> None:
+    field = '<input id="code" type="text" autocomplete="one-time-code">'
+    async with _content_page(_ENTER_FORM_HTML.replace("{field}", field).replace("{script}", "")) as page:
+        tools = build_browser_tools(_fixed_page_provider(page))
+        r = await _tool(tools, "type").handler({"selector": "#code", "text": "012345", "press_enter": True})
+        observed = await _tool(tools, "observe").handler({})
+        assert await page.eval_on_selector("#code", "el => el.value") == "012345"
+        assert await page.evaluate("window.enters") == 1
+    assert r.status == "ok" and r.ok_class is None and not r.entry_unconfirmed, r.content
+    assert "12345" not in r.content and "12345" not in observed.content, observed.content
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+async def test_a_one_time_code_typed_with_enter_that_the_page_truncates_later_withholds_enter() -> None:
+    field = '<input id="code" type="text" autocomplete="one-time-code">'
+    html = _ENTER_FORM_HTML.replace("{field}", field).replace("{script}", _TRUNCATE_LATER_JS)
+    async with _content_page(html) as page:
+        tools = build_browser_tools(_fixed_page_provider(page))
+        r = await _tool(tools, "type").handler({"selector": "#code", "text": "012345", "press_enter": True})
+        enters = await page.evaluate("window.enters")
+    assert (r.status, r.error_class, enters) == ("error", "text_not_held", 0), (r.status, r.ok_class, enters, r.content)
+    assert "012" not in r.content and "345" not in r.content, r.content
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+@pytest.mark.parametrize("field_type", ["text", "tel"])
+async def test_an_ordinary_field_typed_with_enter_keeps_its_immediate_read_back(field_type: str) -> None:
+    field = f'<input id="code" type="{field_type}">'
+    html = _ENTER_FORM_HTML.replace("{field}", field).replace("{script}", _TRUNCATE_LATER_JS)
+    async with _content_page(html) as page:
+        tools = build_browser_tools(_fixed_page_provider(page))
+        r = await _tool(tools, "type").handler({"selector": "#code", "text": "555123", "press_enter": True})
+        enters = await page.evaluate("window.enters")
+    assert (r.status, r.ok_class, enters) == ("ok", None, 1), (r.status, r.ok_class, enters, r.content)

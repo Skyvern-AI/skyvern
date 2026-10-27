@@ -7029,6 +7029,8 @@ _Reach = Literal["click", "focus", "press"]
 
 
 _CHANGED_VALUE_ECHO_MAX = 80
+# How long a one-time-code field is watched after a write, so a page that rewrites it a beat later is caught.
+_ONE_TIME_CODE_SETTLE_S = 0.3
 _ISO_DATE_TEXT_RE = re.compile(r"\d{4}-\d{2}-\d{2}")
 
 
@@ -19227,6 +19229,11 @@ def build_browser_tools(
         # field, check whether the page REACTED with a suggestion list and, if so, commit the best match
         # here. Detection is behavioral (no per-site rules), so this holds across ATSes; non-text inputs
         # and append/enter typing skip it and fill normally (fast path, no polling).
+        # A tel field, and a text field typed with Enter, skip the typeahead path below and take the native fill.
+        native_one_time_code = bool(
+            text and clear and not box_text and (field_type == "tel" or (press_enter and field_type == "text"))
+        ) and (await _is_one_time_code_field(page, selector, text))
+        native_release_url = await _field_release_url(page, selector) if native_one_time_code else None
         if text and clear and not press_enter and not box_text and field_type not in _NON_TYPEAHEAD_TYPES:
             # A non-typeable anchor (a button/div, not an <input>/<textarea>/contenteditable) can never
             # take page.fill()'s keystrokes — but one that declares list semantics is a click-to-open
@@ -19336,7 +19343,9 @@ def build_browser_tools(
                 error_class="text_not_held",
             )
         entry = (
-            await _entry_read_back(
+            await _one_time_code_read_back(page, selector, written, native_release_url)
+            if native_one_time_code
+            else await _entry_read_back(
                 page,
                 selector,
                 written,
@@ -19749,6 +19758,55 @@ def build_browser_tools(
         except Exception:
             return False
 
+    async def _is_one_time_code_field(page: Any, selector: str, text: str) -> bool:
+        # Only the page's own one-time-code marking on a single editable input that can hold the whole code. An
+        # eligible field is marked as a code box so observe and read-back stop echoing what it holds.
+        try:
+            return (
+                await page.locator(selector).first.evaluate(
+                    "(el, n) => { if (!(el instanceof HTMLInputElement) || el.readOnly || el.disabled"
+                    " || !(el.getAttribute('autocomplete') || '').toLowerCase().split(/\\s+/).includes('one-time-code')"
+                    " || (el.maxLength >= 0 && el.maxLength < n)) return false;"
+                    " el.setAttribute('data-skyvern-otp-box', '1'); return true; }",
+                    len(text),
+                    timeout=2000,
+                )
+                is True
+            )
+        except Exception:
+            return False
+
+    async def _one_time_code_read_back(page: Any, selector: str, text: str, release_url: str | None) -> ToolResult:
+        # Keys typed into a one-time-code field can drop while the page re-renders: a shorter value gets one atomic
+        # rewrite, on the same single field in the document the code was released to. Only a value that still
+        # matches exactly after the page settles is entered; a code is never echoed.
+        record_entry_variant("one_time_code")
+        not_entered = ToolResult.error(
+            f"typed a one-time code into {selector}, but the field does not hold it afterwards, so the code is NOT "
+            "entered. Re-observe the field before trying again.",
+            error_class="text_not_held",
+        )
+        held = await _read_field_value(page, selector)
+        if held == text:
+            await asyncio.sleep(_ONE_TIME_CODE_SETTLE_S)
+            held = await _read_field_value(page, selector)
+        if held == text:
+            return entry_outcome(selector, EntryMatch.SAME, shown=None)
+        if held is None or len(held) >= len(text):
+            return not_entered
+        await _require_single_target(page, selector)
+        if not await _is_one_time_code_field(page, selector, text) or (
+            await _field_release_url(page, selector) != release_url
+        ):
+            return not_entered
+        await input_dispatch.fill(page, selector, text, timeout=_ACTION_TIMEOUT_MS)
+        await asyncio.sleep(_ONE_TIME_CODE_SETTLE_S)
+        return (
+            entry_outcome(selector, EntryMatch.SAME, shown=None)
+            if await _read_field_value(page, selector) == text
+            else not_entered
+        )
+
     async def _entry_read_back(
         page: Any, selector: str, text: str, *, variant: str, echo: bool, before: str | None = None
     ) -> ToolResult:
@@ -19805,6 +19863,8 @@ def build_browser_tools(
     ) -> ToolResult:
         # keystroke-type (via _type_and_commit) so a widget that fetches suggestions on key events —
         # not just on a single `input` from fill — still surfaces them, then commit the best match.
+        one_time_code = await _is_one_time_code_field(page, selector, text)
+        release_url = await _field_release_url(page, selector) if one_time_code else None
         collateral: list[list[str]] = []
         try:
             pick, pre_value, pre_own, reach = await _type_and_commit(
@@ -19833,6 +19893,8 @@ def build_browser_tools(
                 # its assembled value only on blur, so a read-back taken before the Tab reads it empty.
                 await asyncio.sleep(0.3)
                 reacted = await _find_suggestion_rows(page, selector, text, any_region=True) is not None
+            if not reacted and one_time_code and date_group is None:
+                return await _one_time_code_read_back(page, selector, text, release_url)
             if not reacted:
                 if (navigated := await _commit_with_tab(page, selector)) is not None:
                     return navigated
@@ -20012,6 +20074,8 @@ def build_browser_tools(
             date_error, *_ = await _settle_date_group(page, selector, text.strip(), date_group, echo=not text_is_secret)
             if date_error is not None:
                 return date_error
+        if one_time_code and not date_group:
+            return await _one_time_code_read_back(page, selector, text, release_url)
         # No suggestion list surfaced. The finder pierces open shadow roots, so it can see a list
         # inside one -- but not one the widget portals elsewhere in the page or renders in a
         # closed root, so inside a component this is still not evidence of absence. Saying
