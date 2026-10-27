@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import json
 import time
-from collections.abc import AsyncIterator, Callable, Collection, Sequence
+from collections.abc import AsyncIterator, Awaitable, Callable, Collection, Sequence
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from datetime import datetime, timedelta
@@ -108,7 +108,8 @@ from skyvern.forge.sdk.db.utils import (
 from skyvern.forge.sdk.log_artifacts import save_workflow_run_logs, workflow_log_attempt
 from skyvern.forge.sdk.schemas.persistent_browser_sessions import FORCED_WORKFLOW_SESSION_RUNNABLE_TYPE, is_final_status
 from skyvern.forge.sdk.schemas.tasks import Task
-from skyvern.forge.sdk.services.request_principal import api_key_actor_id, get_request_principal
+from skyvern.forge.sdk.services.audit_events import record_run_cancel_audit
+from skyvern.forge.sdk.services.request_principal import RequestPrincipal, api_key_actor_id, get_request_principal
 from skyvern.forge.sdk.workflow.constants import INTERIM_OUTPUT_SNAPSHOT_MAX_BYTES
 from skyvern.forge.sdk.workflow.credential_selection import clear_credential_selections_for_retry
 from skyvern.forge.sdk.workflow.models.parameter import WorkflowParameter
@@ -1466,6 +1467,8 @@ class WorkflowRunsRepository(BaseRepository):
         depends_on_workflow_run_id: str | None = None,
         workflow_definition_sha256: str | None = None,
         require_latest_attempt_number: int | None = None,
+        audit_actor: RequestPrincipal | None = None,
+        on_transition: Callable[[], Awaitable[None]] | None = None,
     ) -> WorkflowRun | None:
         """One conditional UPDATE to ``status`` from a non-terminal state (``only_from`` narrows it), so a late
         cancel cannot clobber a finalization; None when the row was terminal or missing. Timestamps follow
@@ -1551,6 +1554,12 @@ class WorkflowRunsRepository(BaseRepository):
             await session.commit()
             if workflow_run_result is None:
                 return None
+            if status == WorkflowRunStatus.canceled and audit_actor is not None:
+                await record_run_cancel_audit(
+                    audit_actor, workflow_run_result.organization_id, "workflow_run", workflow_run_id
+                )
+            if status == WorkflowRunStatus.canceled and on_transition is not None:
+                await on_transition()
             await save_workflow_run_logs(workflow_run_id)
             return workflow_run_result
 

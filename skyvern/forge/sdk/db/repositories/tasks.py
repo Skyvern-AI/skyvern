@@ -35,6 +35,8 @@ from skyvern.forge.sdk.db.utils import (
 from skyvern.forge.sdk.models import TASK_V3_TURN_STEP_CREATED_BY, Step, StepStatus
 from skyvern.forge.sdk.schemas.runs import Run
 from skyvern.forge.sdk.schemas.tasks import OrderBy, SortDirection, Task, TaskStatus
+from skyvern.forge.sdk.services.audit_events import record_run_cancel_audit
+from skyvern.forge.sdk.services.request_principal import RequestPrincipal
 from skyvern.forge.sdk.trace import traced
 from skyvern.forge.sdk.utils.sanitization import sanitize_postgres_text
 from skyvern.schemas.runs import ProxyLocationInput, RunStatus, RunType
@@ -687,6 +689,58 @@ class TasksRepository(BaseRepository):
             failure_category=failure_category,
             keep_final_status=keep_final_status,
         )
+
+    @db_operation("update_task_and_claim_finish_for_cancel")
+    async def update_task_and_claim_finish_for_cancel(
+        self, task_id: str, organization_id: str, audit_actor: RequestPrincipal | None = None
+    ) -> tuple[Task, bool, bool]:
+        finish_claimed = False
+        async with self.Session() as session:
+            task = (
+                await session.scalars(
+                    select(TaskModel).filter_by(task_id=task_id, organization_id=organization_id).with_for_update()
+                )
+            ).first()
+            if task is None:
+                raise NotFoundError("Task not found")
+            if TaskStatus(task.status).is_final():
+                return convert_to_task(task, debug_enabled=self.debug_enabled), False, False
+
+            finish_claimed = task.finished_at is None
+            result = await session.execute(
+                update(TaskModel)
+                .where(TaskModel.task_id == task_id)
+                .where(TaskModel.organization_id == organization_id)
+                .where(TaskModel.status.not_in([status.value for status in TaskStatus if status.is_final()]))
+                .values(
+                    status=TaskStatus.canceled.value,
+                    finished_at=func.coalesce(TaskModel.finished_at, naive_utc_now()),
+                )
+                .returning(TaskModel)
+                .execution_options(populate_existing=True)
+            )
+            updated_model = result.scalar_one_or_none()
+            status_changed = updated_model is not None
+            updated_task = convert_to_task(updated_model or task, debug_enabled=self.debug_enabled)
+            await session.commit()
+
+            if status_changed and audit_actor is not None:
+                await record_run_cancel_audit(audit_actor, organization_id, "task", task_id)
+
+            if status_changed:
+                bg = asyncio.create_task(
+                    self.sync_task_run_status(
+                        organization_id=updated_task.organization_id or "",
+                        run_id=updated_task.task_id,
+                        status=TaskStatus.canceled.value,
+                        started_at=updated_task.started_at,
+                        finished_at=updated_task.finished_at,
+                    )
+                )
+                self._background_tasks.add(bg)
+                bg.add_done_callback(self._background_tasks.discard)
+
+            return updated_task, finish_claimed and status_changed, status_changed
 
     async def _update_task_with_finish_claim(
         self,

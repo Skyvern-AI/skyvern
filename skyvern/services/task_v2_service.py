@@ -4,6 +4,7 @@ import copy
 import json
 import string
 import textwrap
+from collections.abc import Awaitable, Callable
 from contextlib import nullcontext
 from datetime import UTC, datetime
 from typing import Any
@@ -63,6 +64,7 @@ from skyvern.forge.sdk.schemas.task_v2 import (
     ThoughtType,
 )
 from skyvern.forge.sdk.schemas.workflow_runs import WorkflowRunTimeline, WorkflowRunTimelineType
+from skyvern.forge.sdk.services.request_principal import RequestPrincipal
 from skyvern.forge.sdk.trace import traced
 from skyvern.forge.sdk.workflow.exceptions import InsecureCodeDetected
 from skyvern.forge.sdk.workflow.models.block import (
@@ -2480,8 +2482,12 @@ async def mark_task_v2_as_canceled(
     task_v2_id: str,
     workflow_run_id: str | None = None,
     organization_id: str | None = None,
+    on_transition: Callable[[], Awaitable[None]] | None = None,
+    audit_actor: RequestPrincipal | None = None,
 ) -> TaskV2:
     current = await app.DATABASE.observer.get_task_v2(task_v2_id, organization_id=organization_id)
+    transitioned = False
+    task_v2: TaskV2 | None = None
     if current is not None and current.status.is_final() and current.status != TaskV2Status.canceled:
         LOG.info(
             "Rejecting cancel: task v2 already in a different terminal state",
@@ -2493,21 +2499,57 @@ async def mark_task_v2_as_canceled(
             await app.WORKFLOW_SERVICE.mark_workflow_run_as_canceled(workflow_run_id)
         return current
 
-    task_v2 = await _update_task_v2_status(
-        task_v2_id,
-        organization_id=organization_id,
-        status=TaskV2Status.canceled,
-    )
-    if _task_v2_final_write_refused(task_v2, TaskV2Status.canceled):
+    if current is not None and current.status != TaskV2Status.canceled:
+        transitioned = await app.DATABASE.observer.update_task_v2_status_if_not_final(
+            task_v2_id=task_v2_id,
+            organization_id=current.organization_id,
+            status=TaskV2Status.canceled,
+            audit_actor=audit_actor,
+        )
+        if not transitioned:
+            task_v2 = await app.DATABASE.observer.get_task_v2(task_v2_id, organization_id=organization_id)
+            if task_v2 is None:
+                raise TaskV2NotFound(task_v2_id=task_v2_id)
+        if not transitioned and task_v2 is not None and task_v2.status != TaskV2Status.canceled:
+            if task_v2.status.is_final() and workflow_run_id:
+                await app.WORKFLOW_SERVICE.mark_workflow_run_as_canceled(workflow_run_id)
+            return task_v2
+    else:
+        task_v2 = await _update_task_v2_status(
+            task_v2_id,
+            organization_id=organization_id,
+            status=TaskV2Status.canceled,
+        )
+        if _task_v2_final_write_refused(task_v2, TaskV2Status.canceled):
+            return task_v2
+
+    async def _finish_cancel() -> TaskV2:
+        nonlocal task_v2
+        if transitioned and on_transition is not None:
+            try:
+                await on_transition()
+            except asyncio.CancelledError:
+                pass
+        if task_v2 is None:
+            task_v2 = await app.DATABASE.observer.get_task_v2(task_v2_id, organization_id=organization_id)
+            if task_v2 is None:
+                raise TaskV2NotFound(task_v2_id=task_v2_id)
+        if workflow_run_id:
+            await app.WORKFLOW_SERVICE.mark_workflow_run_as_canceled(workflow_run_id)
+
+        otel_trace.get_current_span().set_attribute("task.completion_status", "canceled")
+        await send_task_v2_webhook(task_v2)
         return task_v2
-    if workflow_run_id:
-        await app.WORKFLOW_SERVICE.mark_workflow_run_as_canceled(workflow_run_id)
 
-    # Add task canceled tag to trace
-    otel_trace.get_current_span().set_attribute("task.completion_status", "canceled")
-
-    await send_task_v2_webhook(task_v2)
-    return task_v2
+    if transitioned:
+        # The task row is committed; finish propagating cancellation before honoring a request disconnect.
+        completion = asyncio.create_task(_finish_cancel())
+        try:
+            return await asyncio.shield(completion)
+        except asyncio.CancelledError:
+            await asyncio.shield(completion)
+            raise
+    return await _finish_cancel()
 
 
 async def mark_task_v2_as_terminated(
