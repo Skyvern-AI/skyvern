@@ -346,6 +346,18 @@ def test_finish_schema_is_unchanged_for_a_task_without_error_codes() -> None:
     assert make_finish_tool(error_code_mapping={}).parameters == spec.parameters
 
 
+_ERROR_CODE_FIELD_GUIDANCE_SHA256 = "d5cd09e0225a45b48968b8a41a0263afd795df15e8e25ca41fbdf621cfdf8836"
+
+
+def test_error_code_guidance_is_the_replay_validated_text() -> None:
+    # The wording was chosen by an offline replay of production finish turns; a change needs a new replay.
+    guidance = loop_module.ERROR_CODE_FIELD_GUIDANCE
+    assert hashlib.sha256(guidance.encode()).hexdigest() == _ERROR_CODE_FIELD_GUIDANCE_SHA256
+    assert len(guidance) < 700
+    spec = make_finish_tool(error_code_mapping={"invalid_credentials": "The site rejected the password."})
+    assert spec.parameters["properties"]["error_code"]["description"].startswith(guidance + "\n")
+
+
 def test_finish_offers_exactly_the_users_codes_plus_none_of_these() -> None:
     mapping = {"invalid_credentials": "The site rejected the username or password.", "account_locked": "Locked."}
     spec = make_finish_tool(error_code_mapping=mapping)
@@ -519,6 +531,89 @@ async def test_n_looks_add_exactly_n_images_total() -> None:
     assert total_images == 2
     # And no single request ever carries more than the one image just produced.
     assert max(caller.image_blocks_per_call) == 1
+
+
+def _numbered_look_tool(sink: list[bytes]) -> ToolSpec:
+    async def handler(args: dict[str, Any]) -> ToolResult:
+        sink.append(f"\x89PNG-look-{len(sink)}".encode())
+        return ToolResult.ok("[1] button 'Next'", data={"marks_renumbered": True}, screenshots=[sink[-1]])
+
+    return ToolSpec(name="look", description="look", parameters={"type": "object", "properties": {}}, handler=handler)
+
+
+async def _run_with_look_hook(
+    caller: _ScriptedCaller, tools: list[ToolSpec], on_look_screenshots: Callable[[list[bytes]], None]
+) -> Any:
+    return await run_agent_tool_loop(
+        llm_caller=caller,
+        system_prompt="sys",
+        user_prompt="goal",
+        tools=tools,
+        max_turns=20,
+        max_tool_calls=100,
+        on_look_screenshots=on_look_screenshots,
+    )
+
+
+@pytest.mark.asyncio
+async def test_every_look_is_handed_to_the_hook_and_only_the_latest_is_sent() -> None:
+    images: list[bytes] = []
+    hooked: list[list[bytes]] = []
+    caller = _ScriptedCaller(
+        [
+            [("look", {}), ("look", {})],
+            [("click", {"mark": 1})],
+            [("look", {}), ("finish", {"status": "completed", "reason": "ok"})],
+        ]
+    )
+    outcome = await _run_with_look_hook(
+        caller, [_numbered_look_tool(images), _recording_tool("click", []), make_finish_tool()], hooked.append
+    )
+
+    assert outcome.status == "completed"
+    # The superseded first look and the final look no later call carries are handed over too.
+    assert hooked == [[image] for image in images] and len(images) == 3
+    assert caller.screenshots_per_call == [None, hooked[1], None]
+
+
+@pytest.mark.asyncio
+async def test_look_hook_fires_at_capture_before_a_later_tool_in_the_batch() -> None:
+    # A later tool in the same batch stands for the in-loop judge, which writes its frame immediately.
+    images: list[bytes] = []
+    events: list[Any] = []
+
+    async def judge(args: dict[str, Any]) -> ToolResult:
+        events.append("judge")
+        return ToolResult.ok("judged")
+
+    judge_tool = ToolSpec(
+        name="judge", description="judge", parameters={"type": "object", "properties": {}}, handler=judge
+    )
+    caller = _ScriptedCaller([[("look", {}), ("judge", {})], [("finish", {"status": "completed", "reason": "ok"})]])
+    await _run_with_look_hook(caller, [_numbered_look_tool(images), judge_tool, make_finish_tool()], events.extend)
+
+    assert events == [images[0], "judge"]
+
+
+@pytest.mark.asyncio
+async def test_a_raising_look_hook_does_not_change_the_run() -> None:
+    def raising_hook(screenshots: list[bytes]) -> None:
+        raise RuntimeError("archive unavailable")
+
+    images: list[bytes] = []
+    caller = _ScriptedCaller([[("look", {})], [("finish", {"status": "completed", "reason": "ok"})]])
+    with capture_logs() as logs:
+        outcome = await _run_with_look_hook(caller, [_numbered_look_tool(images), make_finish_tool()], raising_hook)
+
+    assert outcome.status == "completed"
+    assert caller.screenshots_per_call == [None, images]
+    assert any(log["event"] == "taskv3 on_look_screenshots callback failed" for log in logs)
+
+
+def test_loop_takes_no_screenshot_of_its_own() -> None:
+    # The look image is stored from bytes the tool already captured; the loop itself never captures.
+    source = Path(loop_module.__file__).read_text()
+    assert re.findall(r"\.screenshot\(|take_screenshot", source) == []
 
 
 @pytest.mark.asyncio
