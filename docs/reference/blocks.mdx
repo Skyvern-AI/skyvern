@@ -376,6 +376,23 @@ Execute custom Python code. Input parameters are available as global variables. 
 | **Code** | code editor | Python code to execute |
 | **Input Parameters** | select | Parameters available as globals in the code |
 
+Code can import `asyncio`, `datetime`, `html`, `json` and `re`. Each one binds the
+sandbox's own version of the module, which carries part of the standard library and
+loads nothing. The same names are already available without an import.
+
+| Module | What it provides |
+|---|---|
+| `asyncio` | `sleep` |
+| `datetime` | `datetime`, `date`, `timedelta`, `timezone`, `UTC` |
+| `html` | `escape` |
+| `json` | `dumps`, `loads` |
+| `re` | `match`, `search`, `findall`, `finditer`, `fullmatch`, `sub`, `compile`, `split`, `escape`, and the `I`, `S`, `IGNORECASE`, `MULTILINE` and `DOTALL` flags |
+
+Every other module is refused, as is `import *` from an allowed module and a name
+that starts with an underscore. Saving an agent whose new or changed code holds a
+refused import returns `422` and names the block; code that is already saved stays
+saveable. A name an import binds is left out of the block's output.
+
 Password credential input parameters expose plaintext fields such as
 `login_credential.username` and `login_credential.password`. These values are
 readable by Python code inside the runner; they are not opaque handles. Use them

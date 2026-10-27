@@ -5217,6 +5217,334 @@
         ]
       }
     },
+    "/v1/integrations/twilio/phone-numbers/enable": {
+      "post": {
+        "tags": [
+          "Credentials"
+        ],
+        "summary": "Enable Twilio phone number",
+        "description": "Enable SMS forwarding for a Twilio phone number in the current organization.",
+        "operationId": "enable_twilio_phone_number_v1_integrations_twilio_phone_numbers_enable_post",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/EnablePhoneNumberRequest"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/OrganizationPhoneNumberResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "The Twilio credential or phone number selection is invalid"
+          },
+          "404": {
+            "description": "Twilio SMS is unavailable or the phone number was not found"
+          },
+          "409": {
+            "description": "The phone number requires takeover confirmation or changed during setup"
+          },
+          "422": {
+            "description": "Request validation failed"
+          },
+          "502": {
+            "description": "The Twilio provider request failed"
+          },
+          "503": {
+            "description": "The Twilio provider rate limit was reached"
+          }
+        },
+        "x-fern-sdk-group-name": "twilio",
+        "x-fern-sdk-method-name": "enable_phone_number",
+        "security": [
+          {
+            "ApiKeyAuth": []
+          }
+        ]
+      }
+    },
+    "/v1/integrations/twilio/credentials": {
+      "post": {
+        "tags": [
+          "Credentials"
+        ],
+        "summary": "Connect Twilio credentials",
+        "description": "Validate and store Twilio credentials for the current organization.",
+        "operationId": "create_twilio_credential_v1_integrations_twilio_credentials_post",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/CreateTwilioCredentialRequest"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/TwilioCredentialResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "The Twilio credentials are invalid"
+          },
+          "404": {
+            "description": "Twilio SMS is unavailable or the account was not found"
+          },
+          "409": {
+            "description": "Connected phone numbers must be disabled before changing accounts"
+          },
+          "422": {
+            "description": "Request validation failed"
+          },
+          "502": {
+            "description": "The Twilio provider request failed"
+          },
+          "503": {
+            "description": "The Twilio provider rate limit was reached"
+          }
+        },
+        "x-fern-sdk-group-name": "twilio",
+        "x-fern-sdk-method-name": "create_credentials",
+        "security": [
+          {
+            "ApiKeyAuth": []
+          }
+        ]
+      },
+      "get": {
+        "tags": [
+          "Credentials"
+        ],
+        "summary": "Get Twilio credentials",
+        "description": "Get the safe Twilio credential metadata for the current organization.",
+        "operationId": "get_twilio_credential_v1_integrations_twilio_credentials_get",
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/TwilioCredentialResponse"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Twilio SMS is unavailable"
+          },
+          "422": {
+            "description": "Request validation failed"
+          }
+        },
+        "x-fern-sdk-group-name": "twilio",
+        "x-fern-sdk-method-name": "get_credentials",
+        "security": [
+          {
+            "ApiKeyAuth": []
+          }
+        ]
+      },
+      "delete": {
+        "tags": [
+          "Credentials"
+        ],
+        "summary": "Disconnect Twilio credentials",
+        "description": "Remove the stored Twilio credentials after connected phone numbers are disabled.",
+        "operationId": "delete_twilio_credential_v1_integrations_twilio_credentials_delete",
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "additionalProperties": {
+                    "type": "boolean"
+                  },
+                  "title": "Response Delete Twilio Credential V1 Integrations Twilio Credentials Delete"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Twilio SMS is unavailable"
+          },
+          "409": {
+            "description": "Connected phone numbers must be disabled before disconnecting Twilio"
+          },
+          "422": {
+            "description": "Request validation failed"
+          }
+        },
+        "x-fern-sdk-group-name": "twilio",
+        "x-fern-sdk-method-name": "delete_credentials",
+        "security": [
+          {
+            "ApiKeyAuth": []
+          }
+        ]
+      }
+    },
+    "/v1/integrations/twilio/phone-number-registry": {
+      "get": {
+        "tags": [
+          "Credentials"
+        ],
+        "summary": "List registered phone numbers",
+        "description": "List the current organization's phone numbers registered for SMS forwarding.",
+        "operationId": "list_registered_phone_numbers_v1_integrations_twilio_phone_number_registry_get",
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "array",
+                  "items": {
+                    "$ref": "#/components/schemas/OrganizationPhoneNumberResponse"
+                  },
+                  "title": "Response List Registered Phone Numbers V1 Integrations Twilio Phone Number Registry Get"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Twilio SMS is unavailable"
+          },
+          "422": {
+            "description": "Request validation failed"
+          }
+        },
+        "x-fern-sdk-group-name": "twilio",
+        "x-fern-sdk-method-name": "list_registered_phone_numbers",
+        "security": [
+          {
+            "ApiKeyAuth": []
+          }
+        ]
+      }
+    },
+    "/v1/integrations/twilio/phone-numbers": {
+      "get": {
+        "tags": [
+          "Credentials"
+        ],
+        "summary": "List Twilio phone numbers",
+        "description": "List SMS-capable phone numbers available in the connected Twilio account.",
+        "operationId": "list_twilio_phone_numbers_v1_integrations_twilio_phone_numbers_get",
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "array",
+                  "items": {
+                    "$ref": "#/components/schemas/TwilioPhoneNumberInfo"
+                  },
+                  "title": "Response List Twilio Phone Numbers V1 Integrations Twilio Phone Numbers Get"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "The Twilio credentials are invalid"
+          },
+          "404": {
+            "description": "Twilio SMS is unavailable or the phone number was not found"
+          },
+          "422": {
+            "description": "Request validation failed"
+          },
+          "502": {
+            "description": "The Twilio provider request failed"
+          },
+          "503": {
+            "description": "The Twilio provider rate limit was reached"
+          }
+        },
+        "x-fern-sdk-group-name": "twilio",
+        "x-fern-sdk-method-name": "list_phone_numbers",
+        "security": [
+          {
+            "ApiKeyAuth": []
+          }
+        ]
+      }
+    },
+    "/v1/integrations/twilio/phone-numbers/disable": {
+      "post": {
+        "tags": [
+          "Credentials"
+        ],
+        "summary": "Disable Twilio phone number",
+        "description": "Disable SMS forwarding for a phone number registered in the current organization.",
+        "operationId": "disable_twilio_phone_number_v1_integrations_twilio_phone_numbers_disable_post",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/DisablePhoneNumberRequest"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/OrganizationPhoneNumberResponse"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "The phone number was not found"
+          },
+          "409": {
+            "description": "The phone number changed during the disable operation"
+          },
+          "422": {
+            "description": "Request validation failed"
+          },
+          "502": {
+            "description": "The Twilio provider request failed"
+          },
+          "503": {
+            "description": "The Twilio provider rate limit was reached"
+          }
+        },
+        "x-fern-sdk-group-name": "twilio",
+        "x-fern-sdk-method-name": "disable_phone_number",
+        "security": [
+          {
+            "ApiKeyAuth": []
+          }
+        ]
+      }
+    },
     "/v1/agents/{workflow_permanent_id}/folder": {
       "put": {
         "tags": [
@@ -7552,6 +7880,245 @@
           }
         ]
       }
+    },
+    "/v1/sms-numbers": {
+      "get": {
+        "tags": [
+          "Credentials"
+        ],
+        "summary": "List managed SMS numbers",
+        "description": "List the Skyvern-managed SMS numbers for the authenticated organization.",
+        "operationId": "list_managed_numbers_v1_sms_numbers_get",
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "array",
+                  "items": {
+                    "$ref": "#/components/schemas/OrganizationPhoneNumberResponse"
+                  },
+                  "title": "Response List Managed Numbers V1 Sms Numbers Get"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Managed SMS numbers are not enabled for the organization"
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        },
+        "x-fern-sdk-method-name": "list_managed_sms_numbers",
+        "security": [
+          {
+            "ApiKeyAuth": []
+          }
+        ]
+      },
+      "post": {
+        "tags": [
+          "Credentials"
+        ],
+        "summary": "Provision managed SMS number",
+        "description": "Purchase and configure a Skyvern-managed SMS number for the authenticated organization.",
+        "operationId": "provision_managed_number_v1_sms_numbers_post",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ProvisionManagedNumberRequest"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/OrganizationPhoneNumberResponse"
+                }
+              }
+            }
+          },
+          "402": {
+            "description": "Payment was declined or the billing account is ineligible or delinquent"
+          },
+          "403": {
+            "description": "Managed SMS numbers are not enabled, the plan is not entitled, or the number cap is reached"
+          },
+          "409": {
+            "description": "Another SMS number operation is in progress; retry later"
+          },
+          "502": {
+            "description": "The phone number provider request failed"
+          },
+          "503": {
+            "description": "Billing configuration or Stripe is unavailable, or the payment outcome could not be confirmed"
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        },
+        "x-fern-sdk-method-name": "provision_managed_sms_number",
+        "security": [
+          {
+            "ApiKeyAuth": []
+          }
+        ]
+      }
+    },
+    "/v1/sms-numbers/available": {
+      "get": {
+        "tags": [
+          "Credentials"
+        ],
+        "summary": "Search available managed SMS numbers",
+        "description": "Search for available US Skyvern-managed SMS numbers, optionally by area code.",
+        "operationId": "search_available_numbers_v1_sms_numbers_available_get",
+        "parameters": [
+          {
+            "name": "area_code",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string",
+                  "minLength": 3,
+                  "maxLength": 3,
+                  "pattern": "^[2-9][0-9]{2}$"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Area Code"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "array",
+                  "items": {
+                    "$ref": "#/components/schemas/AvailableManagedPhoneNumber"
+                  },
+                  "title": "Response Search Available Numbers V1 Sms Numbers Available Get"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Managed SMS numbers are not enabled or the plan is not entitled"
+          },
+          "502": {
+            "description": "The phone number provider request failed"
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        },
+        "x-fern-sdk-method-name": "search_managed_sms_numbers",
+        "security": [
+          {
+            "ApiKeyAuth": []
+          }
+        ]
+      }
+    },
+    "/v1/sms-numbers/{phone_number_id}/release": {
+      "post": {
+        "tags": [
+          "Credentials"
+        ],
+        "summary": "Release managed SMS number",
+        "description": "For billing-exempt numbers, forwarding stops immediately. For numbers with a subscription, billing and forwarding continue until the current billing period ends. Skyvern then holds the number for 30 days before it can be reassigned.",
+        "operationId": "release_managed_number_v1_sms_numbers__phone_number_id__release_post",
+        "parameters": [
+          {
+            "name": "phone_number_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "title": "Phone Number Id"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/OrganizationPhoneNumberResponse"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Managed SMS numbers are not enabled for the organization"
+          },
+          "404": {
+            "description": "The managed SMS number was not found"
+          },
+          "409": {
+            "description": "The managed SMS number cannot be released in its current state"
+          },
+          "502": {
+            "description": "The phone number provider cleanup request failed"
+          },
+          "503": {
+            "description": "Billing configuration, managed SMS configuration, or Stripe is unavailable"
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        },
+        "x-fern-sdk-method-name": "release_managed_sms_number",
+        "security": [
+          {
+            "ApiKeyAuth": []
+          }
+        ]
+      }
     }
   },
   "components": {
@@ -9249,6 +9816,68 @@
           "detail"
         ],
         "title": "AuditExportDenialResponse"
+      },
+      "AvailableManagedPhoneNumber": {
+        "properties": {
+          "phone_number": {
+            "type": "string",
+            "title": "Phone Number"
+          },
+          "friendly_name": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Friendly Name"
+          },
+          "locality": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Locality"
+          },
+          "region": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Region"
+          },
+          "iso_country": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Iso Country"
+          },
+          "monthly_price_cents": {
+            "type": "integer",
+            "title": "Monthly Price Cents"
+          }
+        },
+        "type": "object",
+        "required": [
+          "phone_number",
+          "monthly_price_cents"
+        ],
+        "title": "AvailableManagedPhoneNumber"
       },
       "AzureSecretParameter": {
         "properties": {
@@ -12254,6 +12883,18 @@
         ],
         "title": "CreateScriptResponse"
       },
+      "CreateTwilioCredentialRequest": {
+        "properties": {
+          "credential": {
+            "$ref": "#/components/schemas/TwilioCredential"
+          }
+        },
+        "type": "object",
+        "required": [
+          "credential"
+        ],
+        "title": "CreateTwilioCredentialRequest"
+      },
       "CredentialParameter": {
         "properties": {
           "parameter_type": {
@@ -13355,6 +13996,19 @@
         "title": "DeployScriptRequest",
         "description": "Request model for deploying a script with updated files."
       },
+      "DisablePhoneNumberRequest": {
+        "properties": {
+          "phone_number_id": {
+            "type": "string",
+            "title": "Phone Number Id"
+          }
+        },
+        "type": "object",
+        "required": [
+          "phone_number_id"
+        ],
+        "title": "DisablePhoneNumberRequest"
+      },
       "DownloadFilesRequest": {
         "properties": {
           "url": {
@@ -14087,6 +14741,35 @@
           "gmail"
         ],
         "title": "EmailTransport"
+      },
+      "EnablePhoneNumberRequest": {
+        "properties": {
+          "phone_number_sid": {
+            "type": "string",
+            "title": "Phone Number Sid"
+          },
+          "confirm_takeover": {
+            "type": "boolean",
+            "title": "Confirm Takeover",
+            "default": false
+          },
+          "credential_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Credential Id"
+          }
+        },
+        "type": "object",
+        "required": [
+          "phone_number_sid"
+        ],
+        "title": "EnablePhoneNumberRequest"
       },
       "ExtendBrowserSessionRequest": {
         "properties": {
@@ -21066,6 +21749,131 @@
         ],
         "title": "OneTimeDispatchStatus"
       },
+      "OrganizationPhoneNumberResponse": {
+        "properties": {
+          "phone_number_id": {
+            "type": "string",
+            "title": "Phone Number Id"
+          },
+          "organization_id": {
+            "type": "string",
+            "title": "Organization Id"
+          },
+          "sms_config_id": {
+            "type": "string",
+            "title": "Sms Config Id"
+          },
+          "phone_number": {
+            "type": "string",
+            "title": "Phone Number"
+          },
+          "provider": {
+            "type": "string",
+            "title": "Provider"
+          },
+          "credential_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Credential Id"
+          },
+          "price_cents": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Price Cents"
+          },
+          "billing_exempt": {
+            "type": "boolean",
+            "title": "Billing Exempt",
+            "default": false
+          },
+          "status": {
+            "type": "string",
+            "enum": [
+              "active",
+              "disabled",
+              "released",
+              "quarantined",
+              "provisioning",
+              "quarantining",
+              "releasing",
+              "surrendering",
+              "reversal_pending"
+            ],
+            "title": "Status"
+          },
+          "cancel_at": {
+            "anyOf": [
+              {
+                "type": "string",
+                "format": "date-time"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Cancel At"
+          },
+          "quarantined_until": {
+            "anyOf": [
+              {
+                "type": "string",
+                "format": "date-time"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Quarantined Until"
+          },
+          "created_at": {
+            "type": "string",
+            "format": "date-time",
+            "title": "Created At"
+          },
+          "modified_at": {
+            "type": "string",
+            "format": "date-time",
+            "title": "Modified At"
+          },
+          "deleted_at": {
+            "anyOf": [
+              {
+                "type": "string",
+                "format": "date-time"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Deleted At"
+          }
+        },
+        "type": "object",
+        "required": [
+          "phone_number_id",
+          "organization_id",
+          "sms_config_id",
+          "phone_number",
+          "provider",
+          "status",
+          "created_at",
+          "modified_at"
+        ],
+        "title": "OrganizationPhoneNumberResponse",
+        "description": "Safe phone-number metadata without provider routing or cost secrets."
+      },
       "OrganizationScheduleItem": {
         "properties": {
           "workflow_schedule_id": {
@@ -22200,6 +23008,20 @@
         ],
         "title": "PromptBranchCriteria",
         "description": "Natural language branch criteria."
+      },
+      "ProvisionManagedNumberRequest": {
+        "properties": {
+          "phone_number": {
+            "type": "string",
+            "minLength": 1,
+            "title": "Phone Number"
+          }
+        },
+        "type": "object",
+        "required": [
+          "phone_number"
+        ],
+        "title": "ProvisionManagedNumberRequest"
       },
       "ProxyLocation": {
         "type": "string",
@@ -27192,6 +28014,157 @@
         ],
         "title": "TotpType",
         "description": "Type of 2FA/TOTP method used."
+      },
+      "TwilioCredential": {
+        "properties": {
+          "account_sid": {
+            "type": "string",
+            "title": "Account Sid"
+          },
+          "api_key_sid": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Api Key Sid"
+          },
+          "api_key_secret": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Api Key Secret"
+          },
+          "auth_token": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Auth Token"
+          }
+        },
+        "type": "object",
+        "required": [
+          "account_sid"
+        ],
+        "title": "TwilioCredential"
+      },
+      "TwilioCredentialResponse": {
+        "properties": {
+          "credential": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/TwilioCredentialSafe"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          }
+        },
+        "type": "object",
+        "title": "TwilioCredentialResponse"
+      },
+      "TwilioCredentialSafe": {
+        "properties": {
+          "account_sid": {
+            "type": "string",
+            "title": "Account Sid"
+          },
+          "api_key_sid": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Api Key Sid"
+          },
+          "has_api_key_secret": {
+            "type": "boolean",
+            "title": "Has Api Key Secret"
+          },
+          "has_auth_token": {
+            "type": "boolean",
+            "title": "Has Auth Token"
+          }
+        },
+        "type": "object",
+        "required": [
+          "account_sid",
+          "has_api_key_secret",
+          "has_auth_token"
+        ],
+        "title": "TwilioCredentialSafe"
+      },
+      "TwilioPhoneNumberInfo": {
+        "properties": {
+          "sid": {
+            "type": "string",
+            "title": "Sid"
+          },
+          "phone_number": {
+            "type": "string",
+            "title": "Phone Number"
+          },
+          "friendly_name": {
+            "type": "string",
+            "title": "Friendly Name"
+          },
+          "sms_capable": {
+            "type": "boolean",
+            "title": "Sms Capable"
+          },
+          "current_sms_url": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Current Sms Url"
+          },
+          "enabled": {
+            "type": "boolean",
+            "title": "Enabled"
+          },
+          "phone_number_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Phone Number Id"
+          }
+        },
+        "type": "object",
+        "required": [
+          "sid",
+          "phone_number",
+          "friendly_name",
+          "sms_capable",
+          "enabled"
+        ],
+        "title": "TwilioPhoneNumberInfo"
       },
       "UpdateBrowserProfileRequest": {
         "properties": {
@@ -33354,10 +34327,11 @@
           "webhook",
           "event",
           "job_recipe_extract",
-          "job_recipe_apply"
+          "job_recipe_apply",
+          "seo_recipe_submit"
         ],
         "title": "WorkflowRunTriggerType",
-        "description": "How a workflow run was initiated.\n\n- manual: User clicked \"Run\" in the UI\n- mcp: First-party MCP client or Skyvern CLI request\n- api: Direct API call to the run endpoint\n- scheduled: Triggered by a cron schedule\n- webhook: Triggered by an external system via the webhook endpoint\n- event: Triggered by an external event source\n- job_recipe_extract: Launched by a job recipe extract request\n- job_recipe_apply: Launched by a job recipe apply request"
+        "description": "How a workflow run was initiated.\n\n- manual: User clicked \"Run\" in the UI\n- mcp: First-party MCP client or Skyvern CLI request\n- api: Direct API call to the run endpoint\n- scheduled: Triggered by a cron schedule\n- webhook: Triggered by an external system via the webhook endpoint\n- event: Triggered by an external event source\n- job_recipe_extract: Launched by a job recipe extract request\n- job_recipe_apply: Launched by a job recipe apply request\n- seo_recipe_submit: Launched by an SEO recipe directory submission"
       },
       "WorkflowSchedule": {
         "properties": {
