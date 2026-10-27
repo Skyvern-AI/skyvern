@@ -9,12 +9,15 @@ import {
   waitFor,
   within,
 } from "@testing-library/react";
+import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { useEffect, useState } from "react";
 import { MemoryRouter } from "react-router-dom";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import { CredentialAuthenticatorSupportProvider } from "./CredentialAuthenticatorSupportContext";
 import { PasswordCredentialContent } from "./PasswordCredentialContent";
+import { CredentialsModal } from "./CredentialsModal";
+import { CredentialModalTypes } from "./useCredentialModalState";
 
 const mockEmailCredentials = vi.hoisted(() => ({
   google: vi.fn(),
@@ -38,6 +41,47 @@ vi.mock("@/hooks/useMicrosoftOAuthCredentials", async (importActual) => {
     useMicrosoftOAuthCredentials: mockEmailCredentials.microsoft,
   };
 });
+
+const mockRegisteredNumbers = vi.hoisted(() =>
+  vi.fn(
+    (): {
+      phone_number_id: string;
+      phone_number: string;
+      status: string;
+    }[] => [],
+  ),
+);
+
+vi.mock("@/hooks/useTwilioIntegration", () => ({
+  useTwilioCredentialQuery: () => ({
+    data: { available: false, credential: null },
+    isLoading: false,
+    isError: false,
+  }),
+  useTwilioPhoneNumbersQuery: () => ({
+    data: [],
+    isLoading: false,
+    isError: false,
+  }),
+  useRegisteredPhoneNumbersQuery: () => ({
+    data: mockRegisteredNumbers(),
+    isLoading: false,
+    isError: false,
+  }),
+}));
+
+vi.mock("@/hooks/useCredentialGetter", () => ({
+  useCredentialGetter: () => null,
+}));
+vi.mock("@/hooks/useCustomCredentialServiceConfig", () => ({
+  useCustomCredentialServiceConfig: () => ({ parsedConfig: null }),
+}));
+vi.mock("@/routes/workflows/hooks/useCredentialsQuery", () => ({
+  useCredentialsQuery: () => ({ data: [] }),
+}));
+vi.mock("@/hooks/useFeatureFlag", () => ({
+  useFeatureFlag: () => false,
+}));
 
 type Values = {
   name: string;
@@ -119,6 +163,79 @@ function installEmailCredentialHooks() {
     isFetching: false,
   });
 }
+
+describe("PasswordCredentialContent — saved authenticator precedence", () => {
+  it("shows saved authenticator precedence in the modal for a text credential", async () => {
+    installEmailCredentialHooks();
+    render(
+      <QueryClientProvider client={new QueryClient()}>
+        <MemoryRouter>
+          <CredentialsModal
+            isOpen
+            onOpenChange={vi.fn()}
+            overrideType={CredentialModalTypes.PASSWORD}
+            editingCredential={{
+              credential_id: "cred_text",
+              credential_type: "password",
+              name: "Text login",
+              credential: {
+                username: "user@example.com",
+                totp_type: "text",
+                totp_identifier: "+15551234567",
+                has_totp: true,
+              },
+            }}
+          />
+        </MemoryRouter>
+      </QueryClientProvider>,
+    );
+    expect(await screen.findByText(/Authenticator key present/)).toBeTruthy();
+  });
+
+  it.each(["text", "email"])(
+    "shows saved authenticator precedence on the %s tab",
+    (totp_type) => {
+      installEmailCredentialHooks();
+      render(
+        <MemoryRouter>
+          <PasswordCredentialContent
+            values={{ ...INITIAL_VALUES, totp_type }}
+            hasTotp
+            onChange={vi.fn()}
+            editMode
+            editingGroups={{ name: false, values: true }}
+          />
+        </MemoryRouter>,
+      );
+
+      expect(screen.getByText(/Authenticator key present/)).toBeTruthy();
+    },
+  );
+
+  it.each([
+    { hasTotp: true, totp: "" },
+    { hasTotp: true, totp: "JBSWY3DPEHPK3PXP" },
+    { hasTotp: false, totp: "" },
+    { hasTotp: false, totp: "JBSWY3DPEHPK3PXP" },
+  ])("uses has_totp=$hasTotp when totp='$totp'", ({ hasTotp, totp }) => {
+    render(
+      <MemoryRouter>
+        <PasswordCredentialContent
+          values={{ ...INITIAL_VALUES, totp_type: "authenticator", totp }}
+          hasTotp={hasTotp}
+          onChange={vi.fn()}
+          editMode
+          editingGroups={{ name: false, values: true }}
+        />
+      </MemoryRouter>,
+    );
+
+    expect(screen.getByText("Authenticator Key")).toBeTruthy();
+    expect(Boolean(screen.queryByText(/Authenticator key present/))).toBe(
+      hasTotp,
+    );
+  });
+});
 
 describe("PasswordCredentialContent — additional two-factor methods", () => {
   const additionalMethod = {
@@ -437,6 +554,56 @@ describe("PasswordCredentialContent — edit-mode hydration (SKY-9864 regression
         totp_identifier: "manual@example.test",
       }),
     );
+  });
+
+  it("switches from the SMS picker to manual entry without duplicate controls", async () => {
+    mockRegisteredNumbers.mockReturnValue([
+      {
+        phone_number_id: "phone_1",
+        phone_number: "+15551234567",
+        status: "active",
+      },
+    ]);
+    const onChangeSpy = vi.fn();
+    try {
+      render(
+        <ModalLikeHarness
+          appliedValues={{
+            ...SAVED_VALUES,
+            totp_type: "text",
+            totp_identifier: "+15551234567",
+          }}
+          onChangeSpy={onChangeSpy}
+          editingValues
+        />,
+      );
+      const picker = await screen.findByRole("combobox");
+      expect(picker).toBeTruthy();
+      const field = screen
+        .getByText("TOTP Identifier (Phone)")
+        .closest(".flex") as HTMLElement;
+      expect(field.querySelector("input")).toBeNull();
+      fireEvent.click(
+        screen.getByRole("button", { name: "Enter number manually" }),
+      );
+      expect(screen.queryByRole("combobox")).toBeNull();
+      const input = field.querySelector("input");
+      expect(input).toBeTruthy();
+      fireEvent.change(input!, { target: { value: "+15557654321" } });
+      expect(onChangeSpy).toHaveBeenLastCalledWith(
+        expect.objectContaining({
+          totp_type: "text",
+          totp_identifier: "+15557654321",
+        }),
+      );
+      fireEvent.click(
+        screen.getByRole("button", { name: "Choose a connected number" }),
+      );
+      expect(screen.getByRole("combobox")).toBeTruthy();
+      expect(field.querySelector("input")).toBeNull();
+    } finally {
+      mockRegisteredNumbers.mockReturnValue([]);
+    }
   });
 
   it("enables editing from a locked connected account picker", async () => {

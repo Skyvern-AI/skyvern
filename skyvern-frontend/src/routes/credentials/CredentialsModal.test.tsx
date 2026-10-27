@@ -1502,6 +1502,90 @@ describe("CredentialsModal run-sequentially toggle", () => {
   }, 10_000);
 });
 
+describe("CredentialsModal save-browser-session toggle", () => {
+  const saveSessionLabel = /Save browser session for future logins/i;
+
+  const noIntentNoSession: CredentialApiResponse = {
+    ...editingPasswordCredential,
+    browser_profile_id: null,
+    save_browser_session_intent: false,
+  };
+  const intentWithoutSession: CredentialApiResponse = {
+    ...editingPasswordCredential,
+    browser_profile_id: null,
+    save_browser_session_intent: true,
+  };
+
+  it("persists the intent via PATCH when the checkbox is the only change", async () => {
+    patchMock.mockResolvedValueOnce({
+      data: { credential_id: "real-cred-id", name: "Acme Login" },
+    });
+    renderEditPasswordCredentialsModal(noIntentNoSession);
+    fireEvent.click(await screen.findByLabelText(saveSessionLabel));
+    fireEvent.click(screen.getByRole("button", { name: "Update" }));
+
+    await waitFor(() => {
+      expect(patchMock).toHaveBeenCalledWith(
+        "/credentials/real-cred-id",
+        expect.objectContaining({ save_browser_session_intent: true }),
+      );
+    });
+    await waitFor(() => {
+      expect(toastMock).toHaveBeenCalledWith(
+        expect.objectContaining({ title: "Credential saved" }),
+      );
+    });
+  }, 10_000);
+
+  it("persists the cleared intent when the checkbox is unticked", async () => {
+    patchMock.mockResolvedValueOnce({
+      data: { credential_id: "real-cred-id", name: "Acme Login" },
+    });
+    renderEditPasswordCredentialsModal(intentWithoutSession);
+    const checkbox = await screen.findByLabelText(saveSessionLabel);
+    expect(checkbox.getAttribute("aria-checked")).toBe("true");
+    fireEvent.click(checkbox);
+    fireEvent.click(screen.getByRole("button", { name: "Update" }));
+
+    await waitFor(() => {
+      expect(patchMock).toHaveBeenCalledWith(
+        "/credentials/real-cred-id",
+        expect.objectContaining({ save_browser_session_intent: false }),
+      );
+    });
+  }, 10_000);
+
+  it("tells the user a ticked box alone has not saved a session", async () => {
+    renderEditPasswordCredentialsModal(intentWithoutSession);
+    await screen.findByLabelText(saveSessionLabel);
+    expect(screen.getByText(/No session is saved yet/i)).toBeTruthy();
+
+    cleanup();
+    renderEditPasswordCredentialsModal(editingPasswordCredential);
+    await screen.findByLabelText(saveSessionLabel);
+    expect(screen.queryByText(/No session is saved yet/i)).toBeNull();
+  }, 10_000);
+
+  // A saved profile ticks the box even with the intent flag unset, so the change
+  // check has to compare against that same hydrated value or every bare Update
+  // would issue a no-op PATCH.
+  it("sends no request when a credential with a saved session is closed untouched", async () => {
+    renderEditPasswordCredentialsModal({
+      ...editingPasswordCredential,
+      save_browser_session_intent: false,
+    });
+    const checkbox = await screen.findByLabelText(saveSessionLabel);
+    expect(checkbox.getAttribute("aria-checked")).toBe("true");
+    fireEvent.click(screen.getByRole("button", { name: "Update" }));
+
+    await waitFor(() => {
+      expect(toastMock).not.toHaveBeenCalled();
+    });
+    expect(patchMock).not.toHaveBeenCalled();
+    expect(postMock).not.toHaveBeenCalled();
+  }, 10_000);
+});
+
 describe("CredentialsModal record-browser defaults", () => {
   function renderRecordingModal(opts: {
     overrideType?: (typeof CredentialModalTypes)[keyof typeof CredentialModalTypes];

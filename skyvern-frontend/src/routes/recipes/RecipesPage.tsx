@@ -46,6 +46,11 @@ const recipes = [
     description: "Automate job applications with agents.",
     to: "/recipes/job-apps",
   },
+  {
+    title: "SEO",
+    description: "Submit your product to web directories.",
+    to: "/recipes/seo",
+  },
 ];
 
 function RecipesPage() {

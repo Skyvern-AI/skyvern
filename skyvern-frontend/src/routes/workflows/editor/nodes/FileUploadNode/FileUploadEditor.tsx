@@ -15,6 +15,7 @@ import {
 import { GOOGLE_DRIVE_REQUIRED_SCOPES } from "@/util/googleScopes";
 
 import { helpTooltips } from "../../helpContent";
+import { SftpPrivateKeyField } from "../components/SftpPrivateKeyField";
 import { type FileUploadNode, type FileUploadNodeData } from "./types";
 import { useUpdate } from "../../useUpdate";
 
@@ -390,11 +391,12 @@ function FileUploadEditorBody({
               </Label>
               <HelpTooltip content="PEM private key for key-based auth. Leave blank if using a password. Reference a secret parameter for security." />
             </div>
-            <WorkflowBlockInputTextarea
-              name="sftpPrivateKey"
+            <SftpPrivateKeyField
+              key={blockId}
               nodeId={blockId}
               onChange={(value) => update({ sftpPrivateKey: value })}
               value={sftpPrivateKey ?? ""}
+              disabled={!editable}
               className="nopan text-xs"
             />
           </div>

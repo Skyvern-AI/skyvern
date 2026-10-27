@@ -36,6 +36,7 @@ import { type AppNode } from "..";
 import { DisableCache } from "../DisableCache";
 import { IgnoreWorkflowSystemPrompt } from "../IgnoreWorkflowSystemPrompt";
 import { BlockExecutionOptions } from "../components/BlockExecutionOptions";
+import { SftpPrivateKeyField } from "../components/SftpPrivateKeyField";
 import { type FileDownloadNode, type FileDownloadNodeData } from "./types";
 import { useSelectedCredentialTotpIdentifier } from "../../hooks/useSelectedCredentialTotpIdentifier";
 import {
@@ -547,11 +548,12 @@ function FileDownloadEditorBody({
               label="Private Key"
               help="PEM private key for key-based auth. Leave blank if using a password. Reference a secret parameter for security."
             >
-              <WorkflowBlockInputTextarea
-                name="sftpPrivateKey"
+              <SftpPrivateKeyField
+                key={blockId}
                 nodeId={blockId}
                 onChange={(value) => update({ sftpPrivateKey: value })}
                 value={sftpPrivateKey ?? ""}
+                disabled={!editable}
                 className="nopan text-xs"
               />
             </DestinationField>
