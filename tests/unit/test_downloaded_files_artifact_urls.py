@@ -1366,3 +1366,72 @@ async def test_partial_bytes_are_neither_published_nor_returned(tmp_path, monkey
     infos = await storage.get_downloaded_files(organization_id="o_1", run_id=run_id)
     assert [info.filename for info in infos] == ["extensionless"]
     assert (directory / "unconfirmed.crdownload").read_bytes() == b"partial"
+
+
+@pytest.mark.asyncio
+async def test_substitute_artifact_urls_awaits_only_container_children() -> None:
+    service = WorkflowService()
+    value = {"rows": [{"id": 1, "name": "a"}, {"tags": ["x", "y"], "ok": True}], "note": "n", "empty": None}
+    real = service._substitute_artifact_urls
+    calls: list[object] = []
+
+    async def counting(child, *args, **kwargs):
+        calls.append(child)
+        return await real(child, *args, **kwargs)
+
+    with patch.object(service, "_substitute_artifact_urls", side_effect=counting):
+        result = await service._substitute_artifact_urls(value, {}, {}, "wr_1", None)
+
+    assert result is value
+    assert value == {"rows": [{"id": 1, "name": "a"}, {"tags": ["x", "y"], "ok": True}], "note": "n", "empty": None}
+    assert all(isinstance(child, (dict, list)) for child in calls)
+    assert len(calls) == 5
+
+
+@pytest.mark.asyncio
+async def test_substitute_artifact_urls_reassigns_every_child_through_container_setitem() -> None:
+    writes: list[tuple[str, object]] = []
+
+    class RecordingDict(dict):
+        def __setitem__(self, key, item):
+            writes.append(("dict", key))
+            super().__setitem__(key, item)
+
+    class RecordingList(list):
+        def __setitem__(self, index, item):
+            writes.append(("list", index))
+            super().__setitem__(index, item)
+
+    class RejectingDict(dict):
+        def __setitem__(self, key, item):
+            if key == "b":
+                raise KeyError(key)
+            super().__setitem__(key, item)
+
+    value = RecordingDict(a=1, b=RecordingList([1, "x", {"task_screenshot_artifact_ids": ["a1"]}]), c=None)
+    await WorkflowService()._substitute_artifact_urls(value, {"a1": "https://example.com/a1"}, {}, "wr_1", None)
+
+    assert writes == [("dict", "a"), ("list", 0), ("list", 1), ("list", 2), ("dict", "b"), ("dict", "c")]
+    assert value["b"][2]["task_screenshots"] == ["https://example.com/a1"]
+
+    rejecting = RejectingDict()
+    dict.update(rejecting, a=[1], b=2, c={"task_screenshot_artifact_ids": ["a1"]})
+    with pytest.raises(KeyError):
+        await WorkflowService()._substitute_artifact_urls(rejecting, {"a1": "https://example.com/a1"}, {}, "wr_1", None)
+    assert "task_screenshots" not in rejecting["c"]
+
+
+@pytest.mark.asyncio
+async def test_substitute_artifact_urls_keeps_legacy_screenshot_lookup_beside_scalar_siblings() -> None:
+    service = WorkflowService()
+    value = {
+        "outputs": [7, {"task_id": "tsk_1", "task_screenshots": ["stale"], "extracted_information": {"k": "v"}}, "s"]
+    }
+
+    with patch.object(service, "get_recent_task_screenshot_urls", AsyncMock(return_value=["fresh"])) as lookup:
+        await service._substitute_artifact_urls(value, {}, {}, "wr_1", "o_1")
+
+    lookup.assert_awaited_once_with(organization_id="o_1", task_id="tsk_1")
+    assert value == {
+        "outputs": [7, {"task_id": "tsk_1", "task_screenshots": ["fresh"], "extracted_information": {"k": "v"}}, "s"]
+    }
