@@ -117,7 +117,10 @@ globalThis.chrome = {{
     async set(values) {{ Object.assign(stored, structuredClone(values)); }},
     async remove(keys) {{ for (const key of keys) delete stored[key]; }},
   }} }},
-  debugger: {{ onEvent: listener, onDetach: listener }},
+  debugger: {{
+    onEvent: listener, onDetach: listener,
+    async attach() {{ throw new Error("Recovery deliberately unavailable"); }},
+  }},
 }};
 {_WINDOW_GROUP_FAKES}
 installWindowGroupFakes(chrome, tabs, updates);
@@ -127,6 +130,7 @@ const scope = new TabScope({{ sendEvent: (event, params) => events.push({{ event
 await scope.initialize();
 const router = new DebuggerRouter({{
   tabScope: scope, sendEvent: () => undefined, onAttachedChange: () => undefined,
+  isTransportConnected: () => true,
 }});
 scope.setDebuggerRouter(router);
 const {{ tabId }} = await scope.create({{ url: "https://handoff.example.test" }});
@@ -482,10 +486,12 @@ Object.defineProperty(globalThis, "chrome", {{
     throw new Error("DOM evaluation must not access Chrome");
   }},
 }});
-const unreadable = new Proxy({{}}, {{
-  get() {{
+const scope = {{ debuggerRouter: {{ async assertCanSend() {{}} }} }};
+const unreadable = new Proxy({{ tabId: 7 }}, {{
+  get(target, key) {{
+    if (key === "tabId") return target.tabId;
     argumentAccesses += 1;
-    throw new Error("DOM evaluation must not read its arguments");
+    throw new Error("DOM evaluation must not read caller source");
   }},
   ownKeys() {{
     argumentAccesses += 1;
@@ -497,7 +503,7 @@ for (const args of [
   unreadable,
   undefined,
 ]) {{
-  await assert.rejects(evaluateDom(unreadable, args), (error) => {{
+  await assert.rejects(evaluateDom(scope, args), (error) => {{
     assert(error instanceof ProtocolError);
     assert.equal(error.code, ERROR_CODES.OP_NOT_ALLOWED);
     assert.equal(error.message,
