@@ -31,6 +31,7 @@ from skyvern.forge.sdk.workflow.exceptions import (
 )
 from skyvern.forge.sdk.workflow.models.block import (
     ActionBlock,
+    AgentStepBlock,
     BlockTypeVar,
     BranchCondition,
     CodeBlock,
@@ -894,6 +895,15 @@ def block_yaml_to_block(
 
     elif block_yaml.block_type == BlockType.TERMINATE:
         return TerminateBlock(**base_kwargs, reason=block_yaml.reason, error_code=block_yaml.error_code)
+
+    elif block_yaml.block_type == BlockType.AGENT_STEP:
+        return AgentStepBlock(
+            **base_kwargs,
+            prompt=block_yaml.prompt,
+            data_schema=block_yaml.data_schema,
+            max_turns=block_yaml.max_turns,
+            parameters=_resolve_block_parameters(block_yaml, parameters),
+        )
 
     elif block_yaml.block_type == BlockType.FILE_DOWNLOAD:
         file_download_block_parameters = _resolve_block_parameters(block_yaml, parameters)
