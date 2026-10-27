@@ -67,6 +67,7 @@ from skyvern.exceptions import (
     FailedToTakeScreenshot,
     FailToClick,
     FailToHover,
+    FailToOpenLink,
     FailToSelectByIndex,
     FailToSelectByLabel,
     FailToSelectByValue,
@@ -12574,11 +12575,12 @@ async def chain_click(
 
     except Exception as e:
         if otp_single_dispatch.get():
-            # Only an actionability timeout is known to precede the click; anything else may follow it.
+            # Only an actionability timeout is known to precede the click; anything else may follow
+            # it. A failed link hop is the other known-before case: it dispatched nothing at all.
             post_dispatch = is_post_dispatch_click_timeout(e, engine_selection)
             if post_dispatch:
                 otp_dispatch_effect.set("dispatched")
-            elif is_engine_timeout_error(e, engine_selection):
+            elif isinstance(e, FailToOpenLink) or is_engine_timeout_error(e, engine_selection):
                 otp_dispatch_effect.set(None)
             return [ActionSuccess()] if post_dispatch else [ActionFailure(FailToClick(action.element_id, msg=str(e)))]
         if is_post_dispatch_click_timeout(e, engine_selection):

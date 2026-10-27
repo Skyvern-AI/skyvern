@@ -119,6 +119,9 @@ async def _maybe_start_credential_fallback_retry(workflow_run: WorkflowRun, orga
     if workflow_run.status not in RETRYABLE_STATUSES:
         return None
 
+    if await app.AGENT_FUNCTION.get_workflow_run_retry_refusal(workflow_run) is not None:
+        return None
+
     # copilot_session_id marks a Copilot-scoped test run: it supplies block_labels directly without
     # the debug block-run marker checked below, so guard on it too or a Copilot test would spawn a
     # detached full-workflow run (real credits, real side effects) outside the test.

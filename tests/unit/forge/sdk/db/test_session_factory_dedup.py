@@ -7,6 +7,7 @@ from sqlalchemy import event, text
 from sqlalchemy.ext.asyncio import AsyncSession, create_async_engine
 
 from skyvern.forge.sdk.db.base_alchemy_db import BaseAlchemyDB
+from skyvern.forge.sdk.db.models import OrganizationModel
 
 
 @pytest.mark.asyncio
@@ -137,3 +138,63 @@ async def test_released_block_gives_repository_calls_their_own_session_and_retur
 
     assert checked_out_between_reads == [0, 0, 0]
     assert rows == [1, 2]
+
+
+@pytest.mark.asyncio
+async def test_reading_scope_shares_one_checkout_and_released_hands_it_back(tmp_path: Path) -> None:
+    db = BaseAlchemyDB(create_async_engine(f"sqlite+aiosqlite:///{tmp_path / 'reading.db'}"))
+    pool = db.engine.sync_engine.pool
+    async with db.engine.begin() as connection:
+        await connection.execute(text("CREATE TABLE runs (id INTEGER)"))
+        await connection.execute(text("INSERT INTO runs VALUES (1)"))
+    checkouts: list[Any] = []
+    event.listen(pool, "checkout", lambda *args: checkouts.append(args))
+
+    async with db.Session.reading() as session:
+        for _ in range(3):
+            async with db.Session() as repository_session:
+                assert repository_session is session
+                await repository_session.execute(text("SELECT count(*) FROM runs"))
+        checkouts_for_reads = len(checkouts)
+        async with db.Session.released():
+            checked_out_while_released = pool.checkedout()
+            async with db.Session() as repository_session:
+                assert repository_session is not session
+        # The session stays usable after the block, on a new checkout.
+        rows_after_release = (await session.execute(text("SELECT count(*) FROM runs"))).scalar_one()
+        assert db.Session.current() is session
+
+    checked_out_after_scope = pool.checkedout()
+    await db.engine.dispose()
+
+    assert checkouts_for_reads == 1
+    assert checked_out_while_released == 0
+    assert rows_after_release == 1
+    assert checked_out_after_scope == 0
+
+
+@pytest.mark.asyncio
+async def test_released_never_drops_uncommitted_writes(tmp_path: Path) -> None:
+    db = BaseAlchemyDB(create_async_engine(f"sqlite+aiosqlite:///{tmp_path / 'writes.db'}"))
+    async with db.engine.begin() as connection:
+        await connection.execute(text("CREATE TABLE runs (id INTEGER)"))
+
+    async with db.Session() as session:
+        await session.execute(text("INSERT INTO runs VALUES (1)"))
+        # A status build called from a caller's open transaction joins it, so its release must leave the write alone.
+        async with db.Session.reading():
+            async with db.Session.released():
+                pass
+        await session.commit()
+
+    async with db.Session.reading() as session:
+        session.add(OrganizationModel(organization_name="pending"))
+        with pytest.raises(RuntimeError, match="pending ORM changes"):
+            async with db.Session.released():
+                pass
+
+    async with db.engine.connect() as reader:
+        rows = (await reader.execute(text("SELECT id FROM runs"))).scalars().all()
+    await db.engine.dispose()
+
+    assert rows == [1]

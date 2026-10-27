@@ -9849,6 +9849,7 @@ async def wrapper({default_args}):
                 credential_release_guard=credential_release_guard if credential_release_guard.is_armed else None,
                 strategy_aware_typing=strategy_aware_typing,
                 playwright_input_defaults=playwright_input_defaults,
+                engine_selection=browser_state.engine_selection,
             )
             if credential_release_guard.is_armed:
                 credential_release_guard.log_armed()

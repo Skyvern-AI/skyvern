@@ -20,7 +20,9 @@ from skyvern.constants import (
     BROWSER_INTERCEPTOR_DISABLE_TIMEOUT,
     BROWSER_PAGE_CLOSE_TIMEOUT,
     CRASHED_PAGE_CLOSE_ATTEMPTS,
+    NAV_ERROR_MAX_BROWSER_DRAWS,
     NAVIGATION_MAX_RETRY_TIME,
+    PROXY_TRANSPORT_NAV_MAX_BROWSER_DRAWS,
 )
 from skyvern.exceptions import (
     BROWSER_CONNECTION_LOST_ERROR_CODE,
@@ -70,7 +72,12 @@ from skyvern.webeye.driver_connection import (
     kill_driver_process,
 )
 from skyvern.webeye.main_world_eval import default_evaluate_to_main_world
-from skyvern.webeye.navigation import driver_nav_error_code, is_permanent_navigation_error, navigate_with_retry
+from skyvern.webeye.navigation import (
+    driver_nav_error_code,
+    is_permanent_navigation_error,
+    is_proxy_transport_navigation_error,
+    navigate_with_retry,
+)
 from skyvern.webeye.scraper import scraper
 from skyvern.webeye.scraper.scraped_page import CleanupElementTreeFunc, ScrapedPage, ScrapeExcludeFunc
 from skyvern.webeye.session_cookies import persist_session_cookies
@@ -104,6 +111,8 @@ class _RuntimeEndObservation:
     evidence: DisconnectEvidence
     close_requested: bool
     run_phase: RunPhase
+    # Captured from the observed generation's own artifacts so deferred emission never reads a replacement's id.
+    provider_session_id: str | None = None
 
 
 def browser_context_stopped_reason(context: BrowserContext | None) -> str | None:
@@ -1093,71 +1102,75 @@ class RealBrowserState(BrowserState):
         if page is not None:
             return page
 
-        try:
-            await self.check_and_fix_state(
-                url=url,
-                proxy_location=proxy_location,
-                task_id=task_id,
-                workflow_run_id=workflow_run_id,
-                workflow_permanent_id=workflow_permanent_id,
-                script_id=script_id,
-                organization_id=organization_id,
-                extra_http_headers=extra_http_headers,
-                cdp_connect_headers=cdp_connect_headers,
-                browser_address=browser_address,
-                browser_profile_id=browser_profile_id,
-                browser_session_id=browser_session_id,
-                before_navigation=before_navigation,
-            )
-        except Exception as e:
-            # Recreating the context draws a different proxy node, and no proxy node can invent an
-            # address record for a host that has none.
-            if isinstance(e, UnresolvableNavigationHost):
-                raise
-            error_message = e.error_message if isinstance(e, FailedToNavigateToUrl) else str(e)
-            if is_permanent_navigation_error(error_message):
-                raise
-            if "net::ERR" not in error_message:
-                raise
-            if not await self.close_current_open_page():
-                LOG.warning("Failed to close the current open page")
-                raise
-            await self.check_and_fix_state(
-                url=url,
-                proxy_location=proxy_location,
-                task_id=task_id,
-                workflow_run_id=workflow_run_id,
-                workflow_permanent_id=workflow_permanent_id,
-                script_id=script_id,
-                organization_id=organization_id,
-                extra_http_headers=extra_http_headers,
-                cdp_connect_headers=cdp_connect_headers,
-                browser_address=browser_address,
-                browser_profile_id=browser_profile_id,
-                browser_session_id=browser_session_id,
-                before_navigation=before_navigation,
-            )
+        abandoned_cleanup: BrowserCleanupFunc = None
+
+        async def fix_state() -> None:
+            nonlocal abandoned_cleanup
+            try:
+                await self.check_and_fix_state(
+                    url=url,
+                    proxy_location=proxy_location,
+                    task_id=task_id,
+                    workflow_run_id=workflow_run_id,
+                    workflow_permanent_id=workflow_permanent_id,
+                    script_id=script_id,
+                    organization_id=organization_id,
+                    extra_http_headers=extra_http_headers,
+                    cdp_connect_headers=cdp_connect_headers,
+                    browser_address=browser_address,
+                    browser_profile_id=browser_profile_id,
+                    browser_session_id=browser_session_id,
+                    before_navigation=before_navigation,
+                )
+            finally:
+                # A draw we walked away from owns a browser, an egress proxy and extension copies, and the
+                # rebuild below replaces browser_cleanup with the new launch's. The run makes one cleanup
+                # pass, so the abandoned launch's teardown has to ride on the replacement's or it never runs.
+                if abandoned_cleanup is not None:
+                    self.browser_cleanup = _chain_browser_cleanups(abandoned_cleanup, self.browser_cleanup)
+                    abandoned_cleanup = None
+
+        draw = 1
+        while True:
+            try:
+                await fix_state()
+                break
+            except Exception as e:
+                # Recreating the context draws a different proxy node, and no proxy node can invent an
+                # address record for a host that has none.
+                if isinstance(e, UnresolvableNavigationHost):
+                    raise
+                error_message = e.error_message if isinstance(e, FailedToNavigateToUrl) else str(e)
+                if is_permanent_navigation_error(error_message):
+                    raise
+                if "net::ERR" not in error_message:
+                    raise
+                draws_allowed = (
+                    PROXY_TRANSPORT_NAV_MAX_BROWSER_DRAWS
+                    if is_proxy_transport_navigation_error(error_message)
+                    else NAV_ERROR_MAX_BROWSER_DRAWS
+                )
+                if draw >= draws_allowed:
+                    raise
+                if not await self.close_current_open_page():
+                    LOG.warning("Failed to close the current open page")
+                    raise
+                abandoned_cleanup = _chain_browser_cleanups(abandoned_cleanup, self.browser_cleanup)
+                LOG.info(
+                    "Navigation failed before a page was ready; drawing another browser",
+                    draw=draw,
+                    draws_allowed=draws_allowed,
+                    nav_error_code=driver_nav_error_code(error_message),
+                )
+                draw += 1
         page = await self.__assert_page()
 
         if not await self.validate_browser_context(await self.get_working_page()):
             if not await self.close_current_open_page():
                 LOG.warning("Failed to close the current open page, going to skip the browser context validation")
                 return page
-            await self.check_and_fix_state(
-                url=url,
-                proxy_location=proxy_location,
-                task_id=task_id,
-                workflow_run_id=workflow_run_id,
-                workflow_permanent_id=workflow_permanent_id,
-                script_id=script_id,
-                organization_id=organization_id,
-                extra_http_headers=extra_http_headers,
-                cdp_connect_headers=cdp_connect_headers,
-                browser_address=browser_address,
-                browser_profile_id=browser_profile_id,
-                browser_session_id=browser_session_id,
-                before_navigation=before_navigation,
-            )
+            abandoned_cleanup = self.browser_cleanup
+            await fix_state()
             page = await self.__assert_page()
         return page
 
@@ -1422,6 +1435,7 @@ class RealBrowserState(BrowserState):
             event=event,
             observation_source=observation_source,
             disconnect_evidence=disconnect_evidence,
+            provider_session_id=self.browser_artifacts.provider_session_id if self.browser_artifacts else None,
         )
         # Before the first-diagnostic dedupe: a probe failure may already have latched the diagnostic.
         self._latch_connection_loss(observation)
@@ -1451,6 +1465,7 @@ class RealBrowserState(BrowserState):
         event: str = "browser_context_disconnected",
         observation_source: Literal["liveness_probe", "browser_event", "driver_event"] = "liveness_probe",
         disconnect_evidence: DisconnectEvidence = "liveness_state",
+        provider_session_id: str | None = None,
     ) -> _RuntimeEndObservation:
         disconnect_observed_at = datetime.now(UTC)
         diagnostic = BrowserStateDiagnostic(
@@ -1487,6 +1502,7 @@ class RealBrowserState(BrowserState):
             evidence=disconnect_evidence,
             close_requested=close_requested,
             run_phase=self._run_phase,
+            provider_session_id=provider_session_id if observation_source == "browser_event" and not expected else None,
         )
 
     def _replay_deferred_runtime_end(self) -> None:
@@ -1538,7 +1554,7 @@ class RealBrowserState(BrowserState):
             disconnect_observed_at=diagnostic.disconnect_observed_at.isoformat(),
             disconnect_observation_source=observation.source,
             close_requested=observation.close_requested,
-            remote_browser_session_id=diagnostic.browser_session_id,
+            remote_browser_session_id=diagnostic.browser_session_id or observation.provider_session_id,
         )
 
     def get_browser_state_diagnostic(self) -> BrowserStateDiagnostic | None:
@@ -1776,6 +1792,7 @@ class RealBrowserState(BrowserState):
                 close_requested=stale_close_requested,
                 event=event,
                 observation_source=source,
+                provider_session_id=stale_browser_artifacts.provider_session_id if stale_browser_artifacts else None,
             )
 
         try:

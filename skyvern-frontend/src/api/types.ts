@@ -577,6 +577,70 @@ export interface GoogleSheetsReconnectRequiredError {
   missing_scope: string | null;
 }
 
+export interface TwilioCredentialSafe {
+  account_sid: string;
+  api_key_sid: string | null;
+  has_api_key_secret: boolean;
+  has_auth_token: boolean;
+}
+
+export interface TwilioCredentialResponse {
+  credential: TwilioCredentialSafe | null;
+}
+
+export interface TwilioCredentialRequest {
+  account_sid: string;
+  api_key_sid?: string | null;
+  api_key_secret?: string | null;
+  auth_token: string;
+}
+
+export interface TwilioPhoneNumberInfo {
+  sid: string;
+  phone_number: string;
+  friendly_name: string;
+  sms_capable: boolean;
+  current_sms_url: string | null;
+  enabled: boolean;
+  phone_number_id: string | null;
+}
+
+export interface OrganizationPhoneNumber {
+  phone_number_id: string;
+  organization_id: string;
+  sms_config_id: string;
+  phone_number: string;
+  provider: string;
+  credential_id: string | null;
+  price_cents: number | null;
+  billing_exempt: boolean;
+  status:
+    | "active"
+    | "disabled"
+    | "provisioning"
+    | "quarantining"
+    | "reversal_pending"
+    | "quarantined"
+    | "surrendering"
+    | "releasing"
+    | "released";
+  quarantined_until: string | null;
+  cancel_at?: string | null;
+  created_at: string;
+  modified_at: string;
+  deleted_at: string | null;
+}
+
+export interface EnablePhoneNumberRequest {
+  phone_number_sid: string;
+  confirm_takeover?: boolean;
+  credential_id?: string | null;
+}
+
+export interface DisablePhoneNumberRequest {
+  phone_number_id: string;
+}
+
 export interface BitwardenCredential {
   email: string;
   master_password: string;
@@ -1133,6 +1197,7 @@ export type BrowserProfileUsage = {
 
 export type PasswordCredentialApiResponse = {
   username: string;
+  has_totp?: boolean;
   totp_type: "authenticator" | "email" | "text" | "passkey" | "none";
   totp_identifier?: string | null;
 };

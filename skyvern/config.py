@@ -597,7 +597,8 @@ class Settings(BaseSettings):
     # Force-on term only: runs are randomized per run by the flag of the same name (DEAD_END_RETURN_FLAG).
     TASK_V3_DEAD_END_RETURN: bool = False
     # Store the error code v3's model chose on finish instead of the post-run page guess. Off: the guess is stored
-    # as before. Retry policies match on stored codes, so turning this on can change which runs retry.
+    # as before. Force-on term only: where it is off, organizations are gated by the flag of the same name.
+    # Retry policies match on stored codes, so turning this on can change which runs retry.
     TASK_V3_ERROR_CODE_ON_FINISH: bool = False
     # Kill switch for the hold on a Task V3 run's first terminated verdict that asks for what prevents the task.
     # On: every terminated verdict stands as the model gave it.
@@ -775,6 +776,12 @@ class Settings(BaseSettings):
     AZURE_GPT6_1_SOL_API_KEY: str | None = None
     AZURE_GPT6_1_SOL_API_BASE: str | None = None
     AZURE_GPT6_1_SOL_API_VERSION: str = "2025-04-01-preview"
+
+    ENABLE_AZURE_GPT6_1_TERRA: bool = False
+    AZURE_GPT6_1_TERRA_DEPLOYMENT: str = "gpt-6.1-terra"
+    AZURE_GPT6_1_TERRA_API_KEY: str | None = None
+    AZURE_GPT6_1_TERRA_API_BASE: str | None = None
+    AZURE_GPT6_1_TERRA_API_VERSION: str = "2025-04-01-preview"
 
     ENABLE_AZURE_GPT6_LUNA: bool = False
     AZURE_GPT6_LUNA_DEPLOYMENT: str = "gpt-6-luna"

@@ -1629,7 +1629,9 @@ async def test_navigate_action_lifecycle_bounds_a_page_that_never_settles(
     close_session = AsyncMock()
     monkeypatch.setattr(session_manager, "_close_session_state", close_session)
     strikes: list[object] = []
-    monkeypatch.setattr(js_dispatch.skyvern_context, "record_browser_timeout", strikes.append)
+    monkeypatch.setattr(
+        js_dispatch.skyvern_context, "record_browser_timeout", lambda operation, **_: strikes.append(operation)
+    )
 
     loop = asyncio.get_running_loop()
     started = loop.time()
@@ -2045,7 +2047,9 @@ async def test_navigate_action_lifecycle_reports_a_driver_that_goes_dark_after_c
     page = _navigate_page(monkeypatch, HangingDriverCall(hangs=False))
     page.wait_for_load_state = HangingDriverCall()
     strikes: list[object] = []
-    monkeypatch.setattr(js_dispatch.skyvern_context, "record_browser_timeout", strikes.append)
+    monkeypatch.setattr(
+        js_dispatch.skyvern_context, "record_browser_timeout", lambda operation, **_: strikes.append(operation)
+    )
 
     loop = asyncio.get_running_loop()
     started = loop.time()
@@ -2244,7 +2248,9 @@ async def test_model_path_verbs_share_the_action_lifecycle(
     close_session = AsyncMock()
     monkeypatch.setattr(session_manager, "_close_session_state", close_session)
     strikes: list[object] = []
-    monkeypatch.setattr(js_dispatch.skyvern_context, "record_browser_timeout", strikes.append)
+    monkeypatch.setattr(
+        js_dispatch.skyvern_context, "record_browser_timeout", lambda operation, **_: strikes.append(operation)
+    )
 
     loop = asyncio.get_running_loop()
     started = loop.time()

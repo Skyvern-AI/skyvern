@@ -12,6 +12,7 @@ import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { Separator } from "@/components/ui/separator";
 import { useFeatureFlag } from "@/hooks/useFeatureFlag";
+import { TwilioPhoneNumberPicker } from "@/routes/integrations/twilio/TwilioPhoneNumberPicker";
 import { cn } from "@/util/utils";
 import {
   CheckIcon,
@@ -54,6 +55,7 @@ type PasswordCredentialContentValues = {
 
 type Props = {
   values: PasswordCredentialContentValues;
+  hasTotp?: boolean;
   onChange: (values: PasswordCredentialContentValues) => void;
   /** Login page URL value — when onUrlChange is provided, a URL field is rendered after Name */
   url?: string;
@@ -245,6 +247,7 @@ function AdditionalTwoFactorMethodFields({
 
 function PasswordCredentialContent({
   values,
+  hasTotp = false,
   onChange,
   url,
   onUrlChange,
@@ -465,6 +468,13 @@ function PasswordCredentialContent({
       setAuthenticatorTypeDetectionSource("backend");
     }
   }, [authenticatorTypeOptionIds, enterpriseUpgradeError?.vendor]);
+
+  const authenticatorPrecedenceNotice = hasTotp ? (
+    <p className="text-sm text-muted-foreground">
+      Authenticator key present — Skyvern uses authenticator codes instead of
+      SMS or email codes while a key is set.
+    </p>
+  ) : null;
 
   const prevUsernameRef = useRef(username);
   const totpIdentifierLabel =
@@ -996,6 +1006,7 @@ function PasswordCredentialContent({
               )}
               {(totpMethod === "text" || totpMethod === "email") && (
                 <>
+                  {authenticatorPrecedenceNotice}
                   <div className="space-y-2">
                     <div className="flex items-center gap-12">
                       <div className="w-40 shrink-0">
@@ -1045,17 +1056,28 @@ function PasswordCredentialContent({
                           </div>
                         ) : (
                           <div className="relative w-full">
-                            <Input
-                              value={totp_identifier}
-                              onChange={(event) =>
+                            <TwilioPhoneNumberPicker
+                              value={totp_identifier || null}
+                              onChange={(value) =>
                                 updateValues({
-                                  totp_identifier: event.target.value,
+                                  totp_identifier: value ?? "",
                                 })
                               }
-                              readOnly={valuesReadOnly}
-                              className={cn({
-                                "pr-9 opacity-70": valuesReadOnly,
-                              })}
+                              disabled={valuesReadOnly}
+                              renderManualInput={() => (
+                                <Input
+                                  value={totp_identifier}
+                                  onChange={(event) =>
+                                    updateValues({
+                                      totp_identifier: event.target.value,
+                                    })
+                                  }
+                                  readOnly={valuesReadOnly}
+                                  className={cn({
+                                    "pr-9 opacity-70": valuesReadOnly,
+                                  })}
+                                />
+                              )}
                             />
                             {valuesReadOnly && (
                               <button
@@ -1185,6 +1207,7 @@ function PasswordCredentialContent({
                       )}
                     </div>
                   )}
+                  {authenticatorPrecedenceNotice}
                   {enterpriseUpgradeError && (
                     <div
                       id={enterpriseUpgradeErrorId}

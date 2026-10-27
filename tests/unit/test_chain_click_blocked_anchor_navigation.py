@@ -17,7 +17,13 @@ import pytest
 from playwright.async_api import TimeoutError as PlaywrightTimeoutError
 
 from skyvern.config import settings
-from skyvern.exceptions import BlockedHost, BlockedNavigationDestination, InvalidUrl, SkyvernHTTPException
+from skyvern.exceptions import (
+    BlockedHost,
+    BlockedNavigationDestination,
+    FailToOpenLink,
+    InvalidUrl,
+    SkyvernHTTPException,
+)
 from skyvern.utils.url_validators import validate_fetch_url
 from skyvern.webeye.utils import dom as dom_module
 from skyvern.webeye.utils.dom import InteractiveElement, SkyvernElement
@@ -409,6 +415,37 @@ async def test_dom_navigate_to_a_href_rejects_loopback(monkeypatch: pytest.Monke
     page.goto.assert_not_awaited()
 
 
+@pytest.mark.parametrize(
+    ("url_after_failure", "expected_clause"),
+    [
+        ("https://portal.example.com/results", "The current page is unchanged."),
+        ("chrome-error://chromewebdata/", "no longer on the page it was on before"),
+    ],
+    ids=["navigation_never_committed", "navigation_committed_an_error_page"],
+)
+@pytest.mark.asyncio
+async def test_failed_cross_origin_href_reports_the_page_state_it_measured(
+    url_after_failure: str, expected_clause: str
+) -> None:
+    """A failed goto can still commit an error page, so the page state must be read, not assumed.
+
+    Claiming "unchanged" when the tab did move would hide from the planner that it is now off-site.
+    """
+    elem = _make_anchor_element(href="https://external.example.test/profile", target="_blank")
+    page = _make_page("https://portal.example.com/results")
+
+    async def _fail_and_land(*_: object, **__: object) -> None:
+        page.url = url_after_failure
+        raise RuntimeError("Page.goto: net::ERR_TUNNEL_CONNECTION_FAILED at https://external.example.test/profile")
+
+    page.goto = AsyncMock(side_effect=_fail_and_land)
+
+    with pytest.raises(FailToOpenLink) as raised:
+        await elem.navigate_to_a_href(page=page)
+
+    assert expected_clause in str(raised.value)
+
+
 class TestChainClickBlockedAnchorNavigation:
     """Integration tests: chain_click must call the new helper only in the
     ``blocking_element is None and blocked=True`` branch, and only for anchors
@@ -426,6 +463,7 @@ class TestChainClickBlockedAnchorNavigation:
         action_y: int | None = None,
         action_download: bool = False,
         navigate_result: str | None = "https://portal.example.com/billpay",
+        href_navigation_error: BaseException | None = None,
         is_checkbox: bool = False,
         is_checkbox_mock: AsyncMock | None = None,
         checked_states: list[bool | None] | None = None,
@@ -480,7 +518,9 @@ class TestChainClickBlockedAnchorNavigation:
         # ``__init__`` here, seed the name-mangled attribute directly.
         elem._SkyvernElement__static_element = {"id": "AAA3", "tagName": tag}  # type: ignore[attr-defined]
         elem.locator = MagicMock()
-        elem.navigate_to_a_href = AsyncMock(return_value=None)  # type: ignore[method-assign]
+        elem.navigate_to_a_href = AsyncMock(  # type: ignore[method-assign]
+            side_effect=href_navigation_error, return_value=None
+        )
         elem.find_bound_label_by_attr_id = AsyncMock(return_value=None)  # type: ignore[method-assign]
         elem.find_bound_label_by_direct_parent = AsyncMock(return_value=None)  # type: ignore[method-assign]
         elem.is_visible = AsyncMock(return_value=True)  # type: ignore[method-assign]
@@ -541,6 +581,26 @@ class TestChainClickBlockedAnchorNavigation:
             skyvern_element=elem,
         )
         return results, elem.coordinate_click, try_navigate
+
+    @pytest.mark.asyncio
+    async def test_failed_href_navigation_reaches_the_action_history_without_its_destination(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """chain_click is where the failure becomes the planner's own CLICK result, so assert there.
+
+        A third-party URL in that text reads as the agent having left the site its goal pinned it to.
+        """
+        results, _coord_click, _navigate = await self._run_chain_click(
+            monkeypatch,
+            blocked=False,
+            tag=InteractiveElement.A,
+            href="https://external.example.test/profile",
+            href_navigation_error=FailToOpenLink(page_moved=False),
+        )
+
+        message = results[0].exception_message or ""
+        assert "external.example.test" not in message
+        assert "The current page is unchanged." in message
 
     @pytest.mark.asyncio
     async def test_blocked_anchor_navigates_via_href_and_skips_coordinate_click(

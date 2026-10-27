@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import asyncio
 from collections.abc import Awaitable, Callable
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from skyvern.exceptions import SkyvernPageAnalysisTimeout
 from skyvern.forge.sdk.core import skyvern_context
@@ -14,7 +14,10 @@ from skyvern.webeye.action_deadline import (
     record_browser_timeout,
     under_action_deadline,
 )
-from skyvern.webeye.browser_health import BrowserOperation
+from skyvern.webeye.browser_health import BrowserOperation, frame_kind_of
+
+if TYPE_CHECKING:
+    from skyvern.webeye.browser_health import FrameTarget
 
 __all__ = [
     "ACTION_DEADLINE_HEADROOM_MS",
@@ -71,13 +74,13 @@ def deadline_ended_the_call(exc: Exception, deadline: float) -> bool:
     return isinstance(exc, SkyvernPageAnalysisTimeout) or deadline_reached(deadline)
 
 
-def record_unreported_timeout(exc: Exception) -> None:
-    """Tally the browser-health strike the engine records inside its own timeout handlers.
+def record_unreported_timeout(exc: Exception, frame: FrameTarget) -> None:
+    """Tally the browser-health strike the engine records inside its own timeout handlers, against ``frame``.
 
     A driver error raised as the deadline cancelled the call never reaches one, so without this the
     hang never counts toward marking the browser degraded."""
     if not isinstance(exc, SkyvernPageAnalysisTimeout):
-        skyvern_context.record_browser_timeout(BrowserOperation.EVALUATE)
+        skyvern_context.record_browser_timeout(BrowserOperation.EVALUATE, frame_kind=frame_kind_of(frame))
 
 
 def cancel_aware(dispatch: Callable[[], Awaitable[Any]]) -> Callable[[], Awaitable[Any]]:

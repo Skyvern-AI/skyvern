@@ -1214,7 +1214,7 @@ def evaluate(
             original = unwrap_caller_js_error(exc)
             if isinstance(original, SkyvernPageAnalysisTimeout) or not deadline_ended_the_call(original, deadline):
                 raise
-            record_unreported_timeout(original)
+            record_unreported_timeout(original, page.page)
             raise SkyvernPageAnalysisTimeout(str(original)) from original
         return {"result": result}
 

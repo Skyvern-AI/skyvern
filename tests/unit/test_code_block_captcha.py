@@ -2291,3 +2291,41 @@ async def test_failure_on_a_sign_in_form_is_recorded_without_changing_any_other_
     # Decisions, attribution and run tags read these entries (ADR 0028), so they must be what the run records today.
     assert run_category[:-1] == WorkflowService._classify_workflow_terminal_failure(run_status, run_reason)
     assert ("AUTH_FAILURE" in {entry["category"] for entry in run_category}) is (page_title == "Enter your password")
+
+
+_API2_ANCHOR = "https://www.google.com/recaptcha/api2/anchor?ar=1&k=key-a&size="
+_ENTERPRISE_ANCHOR = "https://www.recaptcha.net/recaptcha/enterprise/anchor?ar=1&k=key-a&size="
+
+
+@pytest.mark.parametrize(
+    ("anchor_url", "expected"),
+    (
+        (_API2_ANCHOR + "normal", "recaptcha_v2_checkbox"),
+        (_ENTERPRISE_ANCHOR + "compact", "recaptcha_enterprise"),
+        ("https://www.google.com/recaptcha/api2/anchor?k=key-a", "unknown"),
+    ),
+)
+@pytest.mark.asyncio
+async def test_the_anchor_arm_reports_the_variant_of_the_frame_it_clicked(
+    monkeypatch: pytest.MonkeyPatch, anchor_url: str, expected: str
+) -> None:
+    agent_function = type(
+        "AgentFunctionStub",
+        (AgentFunction,),
+        {
+            "auto_solve_captchas": AsyncMock(return_value=False),
+            "solve_recaptcha_token": AsyncMock(return_value=False),
+        },
+    )()
+    monkeypatch.setattr(app, "AGENT_FUNCTION", agent_function)
+    parent_frame = FakePage(token_values=["", "opaque-token"])
+    frame = FakeFrame(url=anchor_url, anchor=FakeLocator(count=1), parent_frame=parent_frame)
+
+    outcome = await solve_challenge(FakePage(recaptcha=True, frames=[frame]))
+
+    assert (outcome.status, outcome.arm, outcome.recaptcha_target) == (
+        ChallengeStatus.SOLVED,
+        "recaptcha_anchor_frame",
+        expected,
+    )
+    assert set(outcome.receipt()) == {"status", "vendor", "arm", "page_state"}

@@ -29,7 +29,7 @@ from skyvern.forge.sdk.schemas.organizations import Organization
 from skyvern.forge.sdk.schemas.persistent_browser_sessions import FORCED_WORKFLOW_SESSION_RUNNABLE_TYPE
 from skyvern.forge.sdk.schemas.task_v2 import TaskV2Status
 from skyvern.forge.sdk.schemas.tasks import TaskStatus
-from skyvern.forge.sdk.workflow.models.workflow import Workflow, WorkflowRunStatus
+from skyvern.forge.sdk.workflow.models.workflow import Workflow, WorkflowRun, WorkflowRunStatus
 from skyvern.forge.sdk.workflow.retry_policy import (
     LEASE_TAKEOVER_SECONDS,
     RetryDecision,
@@ -816,8 +816,10 @@ class BackgroundTaskExecutor(AsyncExecutor):
         browser_session_id: str | None,
         block_labels: list[str] | None,
         block_outputs: dict[str, Any] | None,
-        # Unused: this executor never reads the workflow before scheduling, so it has no lookup to skip.
+        # Unused: this executor reads the run itself and looks up neither the workflow nor its parameters.
         resolved_workflow: Workflow | None = None,
+        resolved_workflow_run: WorkflowRun | None = None,
+        run_parameter_values: dict[str, Any] | None = None,
         **kwargs: dict,
     ) -> None:
         LOG.info(

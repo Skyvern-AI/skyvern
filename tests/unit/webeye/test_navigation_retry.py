@@ -9,6 +9,7 @@ from unittest.mock import AsyncMock, MagicMock
 import pytest
 import structlog.testing
 
+from skyvern.constants import NAV_ERROR_MAX_BROWSER_DRAWS, PROXY_TRANSPORT_NAV_MAX_BROWSER_DRAWS
 from skyvern.exceptions import (
     BlockedHost,
     BlockedNavigationDestination,
@@ -234,6 +235,103 @@ async def test_get_or_create_page_retries_retriable_failed_navigation() -> None:
     assert browser_state.check_and_fix_state.await_count == 2
     browser_state.close_current_open_page.assert_awaited_once()
     browser_state.validate_browser_context.assert_awaited_once_with(page)
+
+
+def _tunnel_refusal() -> FailedToNavigateToUrl:
+    # The shape the driver reports when the proxy hop answers CONNECT with a non-200 (SKY-19080).
+    return FailedToNavigateToUrl(
+        url="http://example.com",
+        error_message="Page.goto: net::ERR_TUNNEL_CONNECTION_FAILED at http://example.com",
+    )
+
+
+@pytest.mark.asyncio
+async def test_get_or_create_page_keeps_drawing_proxies_through_tunnel_refusals() -> None:
+    # A refusal by the proxy hop is a property of the draw, not of the route or the target, so a run
+    # that gets only one extra draw dies whenever two draws in a row are refused.
+    page = AsyncMock()
+    browser_state = RealBrowserState(pw=AsyncMock())
+    browser_state.get_working_page = AsyncMock(side_effect=[None, page])
+    browser_state.check_and_fix_state = AsyncMock(
+        side_effect=[_tunnel_refusal(), _tunnel_refusal(), _tunnel_refusal(), None]
+    )
+    browser_state.close_current_open_page = AsyncMock(return_value=True)
+    browser_state.validate_browser_context = AsyncMock(return_value=True)
+    browser_state._RealBrowserState__assert_page = AsyncMock(return_value=page)
+
+    result = await browser_state.get_or_create_page(url="http://example.com")
+
+    assert result is page
+    assert browser_state.check_and_fix_state.await_count == 4
+
+
+@pytest.mark.asyncio
+async def test_get_or_create_page_stops_drawing_proxies_after_the_last_tunnel_refusal() -> None:
+    browser_state = RealBrowserState(pw=AsyncMock())
+    browser_state.get_working_page = AsyncMock(return_value=None)
+
+    async def refuse(**_: object) -> None:
+        raise _tunnel_refusal()
+
+    browser_state.check_and_fix_state = AsyncMock(side_effect=refuse)
+    browser_state.close_current_open_page = AsyncMock(return_value=True)
+
+    with pytest.raises(FailedToNavigateToUrl):
+        await browser_state.get_or_create_page(url="http://example.com")
+
+    assert browser_state.check_and_fix_state.await_count == PROXY_TRANSPORT_NAV_MAX_BROWSER_DRAWS
+
+
+@pytest.mark.asyncio
+async def test_get_or_create_page_draws_once_more_for_an_error_the_target_reported() -> None:
+    # Only the proxy hop's own refusal earns the wider budget; everything else keeps the single
+    # historical recovery, so a site that resets every connection cannot cost four browser launches.
+    browser_state = RealBrowserState(pw=AsyncMock())
+    browser_state.get_working_page = AsyncMock(return_value=None)
+
+    async def reset_connection(**_: object) -> None:
+        raise FailedToNavigateToUrl(url="http://example.com", error_message="net::ERR_CONNECTION_RESET")
+
+    browser_state.check_and_fix_state = AsyncMock(side_effect=reset_connection)
+    browser_state.close_current_open_page = AsyncMock(return_value=True)
+
+    with pytest.raises(FailedToNavigateToUrl):
+        await browser_state.get_or_create_page(url="http://example.com")
+
+    assert browser_state.check_and_fix_state.await_count == NAV_ERROR_MAX_BROWSER_DRAWS
+
+
+@pytest.mark.asyncio
+async def test_get_or_create_page_tears_down_every_browser_an_abandoned_draw_left() -> None:
+    # Each draw owns a browser, an egress proxy and extension copies, and the rebuild replaces
+    # browser_cleanup with the new launch's. Without carrying the abandoned one forward, every extra
+    # draw leaks its egress proxy for the life of the worker.
+    page = AsyncMock()
+    browser_state = RealBrowserState(pw=AsyncMock())
+    browser_state.get_working_page = AsyncMock(side_effect=[None, page])
+    torn_down: list[str] = []
+    pending_launches = ["first", "second", "third"]
+
+    async def fix_state(**_: object) -> None:
+        name = pending_launches.pop(0)
+
+        async def cleanup() -> None:
+            torn_down.append(name)
+
+        browser_state.browser_cleanup = cleanup
+        if pending_launches:
+            raise _tunnel_refusal()
+
+    browser_state.check_and_fix_state = AsyncMock(side_effect=fix_state)
+    browser_state.close_current_open_page = AsyncMock(return_value=True)
+    browser_state.validate_browser_context = AsyncMock(return_value=True)
+    browser_state._RealBrowserState__assert_page = AsyncMock(return_value=page)
+    browser_state.browser_context = MagicMock()
+
+    await browser_state.get_or_create_page(url="http://example.com")
+    await browser_state._run_browser_cleanup_bounded()
+
+    assert torn_down == ["first", "second", "third"]
 
 
 _DEAD_URL = "https://gone.example.com/search"

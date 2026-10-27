@@ -2,7 +2,7 @@
 
 Covers the scraper blank predicate, the scrape-ladder blank-evidence preservation, the
 handle_completed_step ActionBlock/max-step guards for a recovery-only step, the download-popup
-claim read, and the cached-script generation marker filter.
+claim read, and the cached-script tab-close skip.
 """
 
 from __future__ import annotations
@@ -312,7 +312,7 @@ def test_has_download_popup_claim_is_identity_based() -> None:
     assert context.has_download_popup_claim("other-task", claimed) is False
 
 
-# ---- Case 8: cached-script generation skips the recovery marker ------------------------------
+# ---- Case 8: cached-script generation skips the recovery marker -----------------------------
 
 
 def test_generate_script_skips_internal_recovery_close_action() -> None:
@@ -321,8 +321,6 @@ def test_generate_script_skips_internal_recovery_close_action() -> None:
     recovery_action = {"action_type": "close_page", "is_internal_recovery": True}
     block = {"block_type": "navigation", "label": "b", "actions": [recovery_action]}
 
-    # The recovery close has no ACTION_MAP entry; without the marker filter _action_to_stmt raises
-    # KeyError and aborts whole-script generation. The filter must drop it so generation succeeds.
     fn = _build_block_fn(block, actions=[recovery_action])
     assert fn is not None
 

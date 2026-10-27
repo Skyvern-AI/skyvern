@@ -74,17 +74,24 @@ vi.mock("@/components/WorkflowBlockInputTextarea", () => ({
     aiImprove?: { useCase?: string };
     name?: string;
     "aria-required"?: boolean;
+    disabled?: boolean;
   }) => {
     // The useCase string is `workflow_editor.<block>.<field>` so we can
     // route assertions for AI-improved fields by field. For non-AI fields
     // we fall back to placeholder as a stable disambiguator.
     const aiField = props.aiImprove?.useCase?.split(".").pop();
-    const testId = aiField ? `wbi-${aiField}` : `wbi-ph-${props.placeholder}`;
+    const testId =
+      props.name === "sftpPrivateKey"
+        ? "wbi-private-key"
+        : aiField
+          ? `wbi-${aiField}`
+          : `wbi-ph-${props.placeholder}`;
     return (
       <textarea
         data-testid={testId}
         name={props.name}
         aria-required={props["aria-required"]}
+        disabled={props.disabled}
         value={props.value}
         onChange={(event) => props.onChange(event.target.value)}
       />
@@ -254,6 +261,7 @@ vi.mock("@/components/ui/accordion", () => {
 
 import { useSidebarSaveStateStore } from "@/store/SidebarSaveStateStore";
 import { usePendingCommitsStore } from "@/store/PendingCommitsStore";
+import { useWorkflowYamlEditorStore } from "@/store/WorkflowYamlEditorStore";
 import { errorMappingExampleValue } from "../../nodes/types";
 import { FileDownloadBlockForm } from "./FileDownloadBlockForm";
 
@@ -267,6 +275,7 @@ beforeEach(() => {
 });
 
 afterEach(() => {
+  useWorkflowYamlEditorStore.getState().setCommitInProgress(false);
   vi.useRealTimers();
   cleanup();
 });
@@ -348,6 +357,163 @@ describe("FileDownloadBlockForm (SKY-9361)", () => {
     expect(screen.queryByText("Storage Account Name")).toBeNull();
     expect(screen.queryByText("Google Account")).toBeNull();
     expect(screen.queryByText("SFTP Host")).toBeNull();
+  });
+
+  test("hides a saved SFTP private key and preserves it when saving untouched", async () => {
+    const privateKey = "saved-synthetic-key-marker";
+    setFileDownloadNode("d1", {
+      downloadTarget: "sftp",
+      sftpPrivateKey: privateKey,
+    });
+    render(<FileDownloadBlockForm blockId="d1" />);
+
+    expect(
+      screen.getByText("A private key is saved and hidden."),
+    ).toBeDefined();
+    expect(document.body.textContent).not.toContain(privateKey);
+    expect(screen.queryByTestId("wbi-private-key")).toBeNull();
+    expect(updateNodeData).not.toHaveBeenCalled();
+
+    const { getWorkflowBlocks } = await vi.importActual<
+      typeof WorkflowEditorUtilsModule
+    >("../../workflowEditorUtils");
+    const [savedBlock] = getWorkflowBlocks(
+      [mockNodes.get("d1") as unknown as FileDownloadNode],
+      [],
+    );
+    expect(savedBlock).toHaveProperty("sftp_private_key", privateKey);
+  });
+
+  test("keeps SFTP private-key parameter references editable", () => {
+    setFileDownloadNode("d1", {
+      downloadTarget: "sftp",
+      sftpPrivateKey: "{{ sftp_key }}",
+    });
+    render(<FileDownloadBlockForm blockId="d1" />);
+
+    expect(
+      (screen.getByTestId("wbi-private-key") as HTMLTextAreaElement).value,
+    ).toBe("{{ sftp_key }}");
+    expect(screen.queryByText("A private key is saved and hidden.")).toBeNull();
+  });
+
+  test("allows replacing a saved SFTP private key explicitly", () => {
+    setFileDownloadNode("d1", {
+      downloadTarget: "sftp",
+      sftpPrivateKey: "saved-key",
+    });
+    const { rerender } = render(<FileDownloadBlockForm blockId="d1" />);
+
+    fireEvent.click(screen.getByRole("button", { name: "Replace key" }));
+    const keyField = screen.getByTestId(
+      "wbi-private-key",
+    ) as HTMLTextAreaElement;
+    expect(keyField.value).toBe("");
+    expect(updateNodeData).not.toHaveBeenCalled();
+
+    updateNodeData.mockImplementationOnce(
+      (id: string, updates: Record<string, unknown>) => {
+        const node = mockNodes.get(id);
+        if (node) node.data = { ...node.data, ...updates };
+      },
+    );
+    fireEvent.change(keyField, { target: { value: "replacement-key" } });
+    expect(updateNodeData).toHaveBeenCalledWith("d1", {
+      sftpPrivateKey: "replacement-key",
+    });
+
+    rerender(<FileDownloadBlockForm blockId="d1" />);
+    expect(
+      (screen.getByTestId("wbi-private-key") as HTMLTextAreaElement).value,
+    ).toBe("replacement-key");
+  });
+
+  test("resets the private-key draft when switching between download blocks", () => {
+    setFileDownloadNode("d1", {
+      downloadTarget: "sftp",
+      sftpPrivateKey: "block-a-saved-key",
+    });
+    setFileDownloadNode("d2", {
+      downloadTarget: "sftp",
+      sftpPrivateKey: "block-b-saved-key",
+    });
+    const { rerender } = render(<FileDownloadBlockForm blockId="d1" />);
+
+    fireEvent.click(screen.getByRole("button", { name: "Replace key" }));
+    fireEvent.change(screen.getByTestId("wbi-private-key"), {
+      target: { value: "block-a-replacement-draft" },
+    });
+
+    rerender(<FileDownloadBlockForm blockId="d2" />);
+    expect(
+      screen.getByText("A private key is saved and hidden."),
+    ).toBeDefined();
+    expect(screen.queryByTestId("wbi-private-key")).toBeNull();
+    expect(document.body.textContent).not.toContain(
+      "block-a-replacement-draft",
+    );
+
+    rerender(<FileDownloadBlockForm blockId="d1" />);
+    expect(
+      screen.getByText("A private key is saved and hidden."),
+    ).toBeDefined();
+    expect(screen.queryByTestId("wbi-private-key")).toBeNull();
+    expect(document.body.textContent).not.toContain(
+      "block-a-replacement-draft",
+    );
+  });
+
+  test("resets the private-key draft after an external value change", () => {
+    setFileDownloadNode("d1", {
+      downloadTarget: "sftp",
+      sftpPrivateKey: "saved-key",
+    });
+    const { rerender } = render(<FileDownloadBlockForm blockId="d1" />);
+
+    fireEvent.click(screen.getByRole("button", { name: "Replace key" }));
+    fireEvent.change(screen.getByTestId("wbi-private-key"), {
+      target: { value: "local-replacement-draft" },
+    });
+
+    setFileDownloadNode("d1", {
+      downloadTarget: "sftp",
+      sftpPrivateKey: "restored-key",
+    });
+    rerender(<FileDownloadBlockForm blockId="d1" />);
+
+    expect(
+      screen.getByText("A private key is saved and hidden."),
+    ).toBeDefined();
+    expect(screen.queryByTestId("wbi-private-key")).toBeNull();
+    expect(document.body.textContent).not.toContain("local-replacement-draft");
+  });
+
+  test("allows removing a saved SFTP private key explicitly", () => {
+    setFileDownloadNode("d1", {
+      downloadTarget: "sftp",
+      sftpPrivateKey: "saved-key",
+    });
+    render(<FileDownloadBlockForm blockId="d1" />);
+
+    fireEvent.click(screen.getByRole("button", { name: "Remove key" }));
+    expect(updateNodeData).toHaveBeenCalledWith("d1", { sftpPrivateKey: "" });
+  });
+
+  test("keeps a saved key hidden when removal is rejected during a YAML commit", () => {
+    setFileDownloadNode("d1", {
+      downloadTarget: "sftp",
+      sftpPrivateKey: "saved-key",
+    });
+    render(<FileDownloadBlockForm blockId="d1" />);
+    useWorkflowYamlEditorStore.getState().setCommitInProgress(true);
+
+    fireEvent.click(screen.getByRole("button", { name: "Remove key" }));
+
+    expect(
+      screen.getByText("A private key is saved and hidden."),
+    ).toBeDefined();
+    expect(screen.queryByTestId("wbi-private-key")).toBeNull();
+    expect(updateNodeData).not.toHaveBeenCalled();
   });
 
   test("warns that a first block with no URL has nowhere to download from", () => {

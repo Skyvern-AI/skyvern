@@ -26,7 +26,7 @@ import { ToastAction } from "@/components/ui/toast";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { AxiosError } from "axios";
 import { useState } from "react";
-import { useForm, useFormState } from "react-hook-form";
+import { useForm, useFormState, Resolver } from "react-hook-form";
 import { Link, useParams } from "react-router-dom";
 import { stringify as convertToYAML } from "yaml";
 import { MAX_STEPS_DEFAULT } from "../constants";
@@ -143,7 +143,7 @@ function SavedTaskForm({ initialValues }: Props) {
   const organization = organizations?.[0];
 
   const form = useForm<SavedTaskFormValues>({
-    resolver: zodResolver(savedTaskFormSchema),
+    resolver: zodResolver(savedTaskFormSchema) as Resolver<SavedTaskFormValues>,
     defaultValues: {
       ...initialValues,
       maxStepsOverride: initialValues.maxStepsOverride ?? null,

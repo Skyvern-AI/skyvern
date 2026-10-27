@@ -44,7 +44,7 @@ from skyvern.forge.taskv3 import tools as taskv3_tools_module
 from skyvern.forge.taskv3.answer_basis_audit import ANSWER_BASIS_MAX_HOLDS, RecordedAnswer, apply_answer_basis_audit
 from skyvern.forge.taskv3.auth_tools import _MAX_GIVEUP_DEFERRALS, VerificationFailure, VerificationState
 from skyvern.forge.taskv3.engine import MAX_TOKENS_CEILING, MAX_TOKENS_PER_ACTION_STEP, taskv3_runaway_backstops
-from skyvern.forge.taskv3.goal_check import GoalVerdict, ToolTrail, UnlistedReask, run_goal_check
+from skyvern.forge.taskv3.goal_check import GoalVerdict, NonCompletedStatus, ToolTrail, UnlistedReask, run_goal_check
 from skyvern.forge.taskv3.handoff_redaction import ELIDED_URL_PATH, caller_known_published_urls
 from skyvern.forge.taskv3.intercepted_submission import InterceptedSubmission, SubmissionOutcome
 from skyvern.forge.taskv3.loop import (
@@ -7460,6 +7460,78 @@ async def test_submission_hold_negatives_leave_the_verdict_alone() -> None:
         ]
         outcome, _ = await _run(script, tools, activity=activity)
         assert (setup, outcome.status, outcome.turns) == (setup, status, 3)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("during_reask", "held_ids", "would_hold_ids", "turns"),
+    [
+        ("delivered", [[1]], [], 5),
+        ("rejected", [[1]], [], None),
+        ("nothing", [], [], 3),
+        ("covered", [], [], 3),
+        ("no_headroom", [], [[1]], 3),
+    ],
+)
+async def test_a_submission_answered_while_the_reask_runs_is_held_once_before_the_verdict_stands(
+    during_reask: str, held_ids: list[list[int]], would_hold_ids: list[list[int]], turns: int | None
+) -> None:
+    # The finish's own check ran before the re-ask; only a record that response hold would take may hold the exit.
+    submissions, activity = _FakeSubmissions(), ActivityRecency()
+    if during_reask == "covered":
+        submissions.deliver(ago=5.0)
+
+    async def unlisted_reask(original: NonCompletedStatus, reason: str) -> UnlistedReask:
+        if during_reask in ("delivered", "no_headroom"):
+            submissions.deliver()
+        elif during_reask == "rejected":
+            submissions.deliver(outcome=SubmissionOutcome.REJECTED_BY_SITE)
+        if during_reask == "no_headroom":
+            activity.final_turn_active = True
+        return UnlistedReask(original_status=original, converts=False, skipped_reason=None, latency_s=0.0)
+
+    tools = _submission_tools(submissions, activity, unlisted_reask=unlisted_reask)
+    script = [
+        [("observe", {})],
+        [("click", {"selector": "#submit"})],
+        [("finish", {"status": "terminated", "reason": "r1"})],
+        [("observe", {})],
+        [("finish", {"status": "terminated", "reason": "r2"})],
+        [("finish", {"status": "terminated", "reason": "r3"})],
+    ]
+    with capture_logs() as logs:
+        outcome, _ = await _run(script, tools, activity=activity)
+    held = [e["record_ids"] for e in logs if e["event"] == "taskv3 finish held on an unseen submission response"]
+    would_hold = [
+        e["record_ids"] for e in logs if e["event"] == "taskv3 finish would hold on an unseen submission response"
+    ]
+    assert (held, would_hold, outcome.status) == (held_ids, would_hold_ids, "terminated")
+    if turns is not None:
+        assert outcome.turns == turns
+
+
+@pytest.mark.asyncio
+async def test_a_cancel_seen_while_waiting_on_a_request_sent_during_the_reask_never_ends_the_run_negative() -> None:
+    # The wait spends the headroom a hold needs, so only the cancel it saw can keep the verdict from standing.
+    submissions, activity = _FakeSubmissions(), ActivityRecency()
+    cancel_checks = [False]
+
+    async def should_cancel() -> bool:
+        return cancel_checks.pop(0) if cancel_checks else True
+
+    async def unlisted_reask(original: NonCompletedStatus, reason: str) -> UnlistedReask:
+        submissions.hold()
+        return UnlistedReask(original_status=original, converts=False, skipped_reason=None, latency_s=0.0)
+
+    finish = make_finish_tool(
+        activity=activity,
+        intercepted_submissions=submissions,
+        should_cancel=should_cancel,
+        unlisted_reask=unlisted_reask,
+        deadline_at=time.monotonic() + FAILURE_EVIDENCE_MIN_DEADLINE_HEADROOM_SECONDS + 0.2,
+    )
+    result = await finish.handler({"status": "terminated", "reason": "r"})
+    assert (result.status, result.data) == ("error", None)
 
 
 @pytest.mark.asyncio

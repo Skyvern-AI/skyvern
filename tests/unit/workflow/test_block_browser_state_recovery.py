@@ -416,14 +416,18 @@ def _probe_timeout(state: RealBrowserState, context: MagicMock, browser: MagicMo
         ),
     ],
 )
+@pytest.mark.parametrize("legacy_session_id", [None, "direct-session"])
 def test_browser_connection_loss_is_only_an_unexpected_active_native_event(
-    events: list, terminal: bool, monkeypatch: pytest.MonkeyPatch
+    events: list, terminal: bool, legacy_session_id: str | None, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     monkeypatch.setattr(app.AGENT_FUNCTION, "on_browser_run_released", MagicMock())
     state, context, browser = _bound_state()
+    state.browser_artifacts = BrowserArtifacts(remote_browser_session_id=legacy_session_id)
+    state.browser_artifacts.note_provider_session_id("provider-session")
 
-    for event in events:
-        event(state, context, browser)
+    with capture_logs() as logs:
+        for event in events:
+            event(state, context, browser)
 
     loss = state.get_browser_connection_loss()
     if terminal:
@@ -431,6 +435,16 @@ def test_browser_connection_loss_is_only_an_unexpected_active_native_event(
         assert loss.observation_source == "browser_event"
     else:
         assert loss is None
+    # The provider id is log-only: it never reaches the diagnostic, and only unexpected native records fall back to it.
+    diagnostic = state.get_browser_state_diagnostic()
+    assert diagnostic is None or diagnostic.browser_session_id == legacy_session_id
+    ended = [entry for entry in logs if entry.get("browser_runtime_event") == "runtime_ended"]
+    assert ended
+    for entry in ended:
+        native_loss = entry["observation_source"] == "browser_event" and entry["expected"] is False
+        assert entry["remote_browser_session_id"] == (
+            legacy_session_id or ("provider-session" if native_loss else None)
+        )
 
 
 def test_browser_connection_loss_ignores_a_stale_generation() -> None:
@@ -2405,6 +2419,50 @@ async def test_runtime_disconnect_successful_reconnect_resets_driver_observer(
             await asyncio.sleep(0)
     events = [entry for entry in logs if entry.get("browser_runtime_event") == "runtime_ended"]
     assert [entry["disconnect_kind"] for entry in events] == ["connection_unusable", "driver_transport_loss"]
+
+
+@pytest.mark.asyncio
+async def test_runtime_disconnect_retired_native_loss_keeps_its_own_provider_session_id(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    state, old_context, _ = _transport_observed_state()
+    replacement, new_context, _ = _transport_observed_state()
+    replacement.browser_context = None
+    state.browser_artifacts = BrowserArtifacts()
+    state.browser_artifacts.note_provider_session_id("retired-provider-session")
+    new_artifacts = BrowserArtifacts()
+    new_artifacts.note_provider_session_id("replacement-provider-session")
+    page = _crashable_page()
+    page.url = "about:blank"
+    page.context = new_context
+    new_context.pages = [page]
+    # A retained egress guard keeps the stale driver alive until the replacement is ready, so its close is unexpected.
+    monkeypatch.setattr(app.AGENT_FUNCTION, "has_retained_browser_egress_guard", AsyncMock(return_value=True))
+    monkeypatch.setattr(
+        real_browser_state_module,
+        "async_playwright",
+        lambda: SimpleNamespace(start=AsyncMock(return_value=replacement.pw)),
+    )
+    monkeypatch.setattr(
+        real_browser_state_module.BrowserContextFactory,
+        "create_browser_context",
+        AsyncMock(return_value=(new_context, new_artifacts, None)),
+    )
+
+    async def working_page() -> MagicMock:
+        # The retiring generation closes natively while its replacement is still being set up.
+        state._on_browser_context_closed(old_context)
+        return page
+
+    state.get_working_page = working_page
+    with capture_logs() as logs:
+        await state.reconnect(browser_address="ws://example.invalid", stale_context_is_unusable=True)
+    assert state.browser_artifacts is new_artifacts
+    assert state.get_browser_state_diagnostic() is None
+    events = [entry for entry in logs if entry.get("browser_runtime_event") == "runtime_ended"]
+    assert [
+        (entry["observation_source"], entry["expected"], entry["remote_browser_session_id"]) for entry in events
+    ] == [("browser_event", False, "retired-provider-session")]
 
 
 @pytest.mark.asyncio

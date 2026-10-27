@@ -81,7 +81,7 @@ from skyvern.forge.sdk.core.security import generate_skyvern_signature
 from skyvern.forge.sdk.db.datetime_utils import naive_utc_now, to_naive_utc
 from skyvern.forge.sdk.db.enums import (
     OrganizationAuthTokenType,
-    is_job_recipe_workflow_run_trigger_type,
+    is_recipe_billing_workflow_run_trigger_type,
 )
 from skyvern.forge.sdk.db.exceptions import RunsListSearchCanceled
 from skyvern.forge.sdk.db.repositories.folders import FolderWorkflowSetChangedError
@@ -4515,6 +4515,10 @@ async def retry_workflow_run(
             detail="Only terminal workflow runs can be retried",
         )
 
+    refusal = await app.AGENT_FUNCTION.get_workflow_run_retry_refusal(original_workflow_run)
+    if refusal is not None:
+        raise HTTPException(status_code=http_status.HTTP_409_CONFLICT, detail=refusal)
+
     is_block_scoped_run = await app.AGENT_FUNCTION.is_block_scoped_workflow_run(original_workflow_run)
     if not is_block_scoped_run:
         is_block_scoped_run = await app.DATABASE.debug.has_block_run_for_workflow_run(
@@ -4576,7 +4580,7 @@ async def retry_workflow_run(
     original_trigger_type = getattr(original_workflow_run, "trigger_type", None)
     trigger_type = (
         original_trigger_type
-        if is_job_recipe_workflow_run_trigger_type(original_trigger_type)
+        if is_recipe_billing_workflow_run_trigger_type(original_trigger_type)
         else workflow_run_trigger_type_from_user_agent(x_user_agent)
     )
     async with run_submission_slot(current_org.organization_id):
@@ -5838,19 +5842,19 @@ async def get_workflow_run_with_workflow_id(
 async def _build_workflow_run_with_workflow_id(
     organization_id: str, workflow_id: str, workflow_run_id: str, cap_output_values: bool
 ) -> dict[str, Any]:
-    workflow_run_status_response = await app.WORKFLOW_SERVICE.build_workflow_run_status_response(
-        workflow_permanent_id=workflow_id,
-        workflow_run_id=workflow_run_id,
-        organization_id=organization_id,
-        include_cost=True,
-        cap_output_values=cap_output_values,
-    )
-    return_dict = workflow_run_status_response.model_dump(by_alias=True)
-
+    async with app.DATABASE.Session.reading():
+        workflow_run_status_response = await app.WORKFLOW_SERVICE.build_workflow_run_status_response(
+            workflow_permanent_id=workflow_id,
+            workflow_run_id=workflow_run_id,
+            organization_id=organization_id,
+            include_cost=True,
+            cap_output_values=cap_output_values,
+        )
     browser_session = await app.DATABASE.browser_sessions.get_persistent_browser_session_by_runnable_id(
         runnable_id=workflow_run_id,
         organization_id=organization_id,
     )
+    return_dict = workflow_run_status_response.model_dump(by_alias=True)
 
     browser_session_id = browser_session.persistent_browser_session_id if browser_session else None
 
@@ -5887,26 +5891,27 @@ async def get_workflow_and_run_from_workflow_run_id(
 async def _build_workflow_and_run_from_workflow_run_id(
     organization_id: str, workflow_run_id: str, cap_output_values: bool
 ) -> WorkflowRunWithWorkflowResponse:
-    workflow = await app.WORKFLOW_SERVICE.get_workflow_by_workflow_run_id(
-        workflow_run_id=workflow_run_id,
-        organization_id=organization_id,
-        filter_deleted=False,
-    )
+    async with app.DATABASE.Session.reading():
+        workflow = await app.WORKFLOW_SERVICE.get_workflow_by_workflow_run_id(
+            workflow_run_id=workflow_run_id,
+            organization_id=organization_id,
+            filter_deleted=False,
+        )
 
-    workflow_run_status_response = await app.WORKFLOW_SERVICE.build_workflow_run_status_response(
-        workflow_permanent_id=workflow.workflow_permanent_id,
-        workflow_run_id=workflow_run_id,
-        organization_id=organization_id,
-        include_cost=True,
-        allow_deleted=True,
-        cap_output_values=cap_output_values,
-    )
-    workflow_run_status_api_response = workflow_run_status_response.model_dump(by_alias=True)
+        workflow_run_status_response = await app.WORKFLOW_SERVICE.build_workflow_run_status_response(
+            workflow_permanent_id=workflow.workflow_permanent_id,
+            workflow_run_id=workflow_run_id,
+            organization_id=organization_id,
+            include_cost=True,
+            allow_deleted=True,
+            cap_output_values=cap_output_values,
+        )
 
     browser_session = await app.DATABASE.browser_sessions.get_persistent_browser_session_by_runnable_id(
         runnable_id=workflow_run_id,
         organization_id=organization_id,
     )
+    workflow_run_status_api_response = workflow_run_status_response.model_dump(by_alias=True)
     browser_session_id = browser_session.persistent_browser_session_id if browser_session else None
     workflow_run_status_api_response["browser_session_id"] = browser_session_id or workflow_run_status_api_response.get(
         "browser_session_id"
@@ -5972,11 +5977,12 @@ async def get_workflow_run(
 async def _build_workflow_run(
     organization_id: str, workflow_run_id: str, cap_output_values: bool
 ) -> WorkflowRunResponseBase:
-    return await app.WORKFLOW_SERVICE.build_workflow_run_status_response_by_workflow_id(
-        workflow_run_id=workflow_run_id,
-        organization_id=organization_id,
-        cap_output_values=cap_output_values,
-    )
+    async with app.DATABASE.Session.reading():
+        return await app.WORKFLOW_SERVICE.build_workflow_run_status_response_by_workflow_id(
+            workflow_run_id=workflow_run_id,
+            organization_id=organization_id,
+            cap_output_values=cap_output_values,
+        )
 
 
 @legacy_base_router.get(
@@ -6651,6 +6657,7 @@ async def update_organization(
         ) from exc
 
     org_auth_service.invalidate_cached_org(current_org.organization_id)
+    app.ARTIFACT_MANAGER.invalidate_cached_artifact_url_expiry(current_org.organization_id)
     if changed_fields:
         await record_request_audit_event(
             current_org.organization_id,

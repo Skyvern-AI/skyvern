@@ -317,8 +317,8 @@ class ClosePageAction(Action):
     # When set, close the open tab at this index in the open-tabs list instead of the current tab.
     tab_index: int | None = None
     # Set only when the agent synthesized this close to recover from a dead blank working page.
-    # Persists into action_json via model_dump; gates the recovery recheck, the completed-step
-    # guards, and the cached-script marker filter.
+    # Persists into action_json via model_dump; gates recovery rechecks, completed-step guards, and
+    # cached-script support checks.
     is_internal_recovery: bool = False
 
 

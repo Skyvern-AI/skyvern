@@ -921,9 +921,11 @@ async def _page_cursor_binding(
     session_identity = (ctx.mode, resolved_id)
     epoch_js = "() => performance.timeOrigin"
     deadline = asyncio.get_running_loop().time() + DEFAULT_ACTION_TIMEOUT_MS / 1000
+    scope = None
     try:
+        scope = page.locator_scope
         document_epoch = await SkyvernFrame._evaluate_expression(
-            frame=page.locator_scope,
+            frame=scope,
             expression=epoch_js,
             evaluate_expression=lambda: page.locator_scope.evaluate(epoch_js),
             timeout_ms=DEFAULT_ACTION_TIMEOUT_MS,
@@ -936,7 +938,7 @@ async def _page_cursor_binding(
         # content read: a slow read must not be reported as the identity check timing out.
         if isinstance(exc, SkyvernPageAnalysisTimeout) or not deadline_ended_the_call(exc, deadline):
             raise
-        record_unreported_timeout(exc)
+        record_unreported_timeout(exc, scope)
         raise SkyvernPageAnalysisTimeout(str(exc)) from exc
     raise_if_cancelled()
     # Read after the epoch: it is the only await here, and navigation recovery can retry it against a

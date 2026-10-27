@@ -35,6 +35,7 @@ from skyvern.constants import (
     BROWSER_PAGE_CLOSE_TIMEOUT,
     DEFAULT_MAX_SCREENSHOT_SCROLLS,
     DEFAULT_MAX_TOKENS,
+    ERROR_CODE_REASONING_MAX_LENGTH,
     GET_DOWNLOADED_FILES_TIMEOUT,
     SAVE_DOWNLOADED_FILES_TIMEOUT,
     SCRAPE_TYPE_ORDER,
@@ -352,6 +353,7 @@ from skyvern.webeye.actions.parse_actions import (
 )
 from skyvern.webeye.actions.responses import STALE_TARGET_TOOL_RESULT, ActionFailure, ActionResult, ActionSuccess
 from skyvern.webeye.browser_artifacts import DownloadBinding
+from skyvern.webeye.browser_diagnostics import collect_degraded_browser_diagnostics
 from skyvern.webeye.browser_driver_errors import is_driver_error
 from skyvern.webeye.browser_engine import BrowserEngineSelection, is_any_engine_error
 from skyvern.webeye.browser_errors import (
@@ -1760,6 +1762,28 @@ def _task_v3_run_secret_values(task: Task) -> set[str]:
         if app.WORKFLOW_CONTEXT_MANAGER.artifact_redaction_enabled(task.workflow_run_id)
         else app.WORKFLOW_CONTEXT_MANAGER.runtime_secret_values_for_artifacts()
     )
+
+
+def _redacted_user_defined_errors(task: Task, errors: list[UserDefinedError]) -> list[dict[str, Any]]:
+    """Serialize errors for the appending ``tasks.errors`` column, scrubbing run secrets first.
+
+    The codes come from a page read, so a redacted input does not make the output safe: a secret
+    typed into the form can come back in the reasoning, and this column leaves over the customer
+    webhook.
+    """
+    run_secrets = _task_v3_run_secret_values(task)
+    if not run_secrets:
+        return [error.model_dump() for error in errors]
+    return [
+        error.model_copy(
+            update={
+                # model_copy skips the reasoning field validator, and redaction can LENGTHEN the
+                # string, so re-apply the model's own bound rather than trusting what went in.
+                "reasoning": redact_secrets_from_text(error.reasoning, run_secrets)[:ERROR_CODE_REASONING_MAX_LENGTH]
+            }
+        ).model_dump()
+        for error in errors
+    ]
 
 
 def _is_transient_page_read_refusal(exc: BaseException) -> bool:
@@ -4219,17 +4243,10 @@ class ForgeAgent:
                 values_delivered=verification_state.values_delivered,
             )
         # Only when the reason recorded carries that status: a vetoed completion or a missing extraction failed for
-        # its own.
-        if verification_state.last_status == NO_ONE_TIME_CODE_SOURCE and NO_ONE_TIME_CODE_SOURCE in (
+        # its own. Persisted below the block's own codes, never here.
+        missing_totp_source = verification_state.last_status == NO_ONE_TIME_CODE_SOURCE and NO_ONE_TIME_CODE_SOURCE in (
             failure_reason or ""
-        ):
-            LOG.info("task_v3 attributed to a missing TOTP source", task_id=task.task_id, task_status=task_status)
-            with contained_effect("task_v3 missing TOTP source error persist", task_id=task.task_id):
-                await app.DATABASE.tasks.update_task(
-                    task_id=task.task_id,
-                    organization_id=task.organization_id,
-                    errors=[MissingTOTPSourceError().to_user_defined_error().model_dump()],
-                )
+        )
         if outcome.cap_trip is not None:
             # The typed fact a budget cap tripped this run, independent of whether the model went on
             # to finish on the granted final turn (a completed/failed/terminated verdict) or the loop
@@ -4330,6 +4347,16 @@ class ForgeAgent:
                 detector_error_codes=detector_codes,
                 model_answer_used=model_answer_used,
             )
+        # Last, because `errors` appends in call order and customers route on `errors[0]`: a code Skyvern
+        # attached itself must never displace the one the block's own error_code_mapping produced.
+        if missing_totp_source:
+            LOG.info("task_v3 attributed to a missing TOTP source", task_id=task.task_id, task_status=task_status)
+            with contained_effect("task_v3 missing TOTP source error persist", task_id=task.task_id):
+                await app.DATABASE.tasks.update_task(
+                    task_id=task.task_id,
+                    organization_id=task.organization_id,
+                    errors=[MissingTOTPSourceError().to_user_defined_error().model_dump()],
+                )
         need_call_webhook = True
         try:
             task = await self.update_task(
@@ -8503,17 +8530,27 @@ class ForgeAgent:
             # Probed between steps, not inside the ladder below: the ladder's RELOAD rung is what
             # rescues a page whose own JS wedged the renderer, so it keeps every attempt it has.
             if context and context.browser_health.is_degraded:
+                consecutive_timeouts = context.browser_health.consecutive_timeouts
                 stuck_operations = context.browser_health.describe_stuck_operations()
-                LOG.error(
-                    "Browser session stopped responding; failing the run instead of starting another step",
-                    consecutive_timeouts=context.browser_health.consecutive_timeouts,
-                    stuck_operations=stuck_operations,
-                    step_order=step.order,
-                    step_retry=step.retry_index,
-                    url=task.url,
-                )
+                stall_diagnostics: dict[str, Any] = {
+                    **context.browser_health.stall_fields(),
+                    "renderer_metrics": "cancelled",
+                }
+                try:
+                    stall_diagnostics |= await collect_degraded_browser_diagnostics(browser_state)
+                finally:
+                    with contained_effect("stalled-browser guard log", task_id=task.task_id):
+                        LOG.error(
+                            "Browser session stopped responding; failing the run instead of starting another step",
+                            consecutive_timeouts=consecutive_timeouts,
+                            stuck_operations=stuck_operations,
+                            step_order=step.order,
+                            step_retry=step.retry_index,
+                            url=task.url,
+                            **stall_diagnostics,
+                        )
                 raise BrowserSessionDegraded(
-                    consecutive_timeouts=context.browser_health.consecutive_timeouts,
+                    consecutive_timeouts=consecutive_timeouts,
                     stuck_operations=stuck_operations,
                 )
             blank_page_error: ScrapingFailedBlankPage | None = None
@@ -12041,6 +12078,27 @@ class ForgeAgent:
                 )
                 last_step = await self.update_step(step, is_last=True)
                 failure_category = classify_from_failure_reason(failure_reason)
+                # handle_terminate_action already resolved the block's error_code_mapping against the
+                # page and left the codes on the action. Persist them, as the sibling terminal paths
+                # (terminate_check_goal, max_retries, max_steps) do: without this a mapped
+                # termination reaches the customer webhook with an empty `errors`, indistinguishable
+                # from an unmapped one, so the code is their only status-independent signal.
+                task_errors = None
+                if terminate_action and terminate_action.errors:
+                    redacted_errors = _redacted_user_defined_errors(task, terminate_action.errors)
+                    # execute_step already appends these errors, and update_task appends again.
+                    existing_errors = {
+                        (error.get("error_code"), error.get("reasoning"))
+                        for error in (task.errors or [])
+                        if isinstance(error, dict)
+                    }
+                    new_errors = [
+                        error
+                        for error in redacted_errors
+                        if (error["error_code"], error["reasoning"]) not in existing_errors
+                    ]
+                    if new_errors:
+                        task_errors = new_errors
                 LOG.info(
                     "Task failure classified",
                     task_id=task.task_id,
@@ -12051,11 +12109,15 @@ class ForgeAgent:
                     primary_failure_category=failure_category[0].get("category") if failure_category else None,
                     failure_category_source="code_level",
                     failure_category_path="terminate_extract_action",
+                    error_codes=[error.error_code for error in terminate_action.errors]
+                    if terminate_action and terminate_action.errors
+                    else [],
                 )
                 await self.update_task(
                     task,
                     status=TaskStatus.terminated,
                     failure_reason=failure_reason,
+                    errors=task_errors,
                     failure_category=failure_category,
                 )
                 return False, last_step, None
@@ -12555,7 +12617,8 @@ class ForgeAgent:
     ) -> Task:
         task_errors = task.errors
         step_errors = detailed_step_output.extract_errors() or []
-        task_errors.extend([error.model_dump() for error in step_errors])
+        if step_errors:
+            task_errors.extend(_redacted_user_defined_errors(task, step_errors))
 
         return await app.DATABASE.tasks.update_task(
             task_id=task.task_id,

@@ -112,6 +112,7 @@ async def test_completion_tags_write_final_status_execution_mode_and_primary_fai
             "skyvern.failure_category": "PARAMETER_BINDING_ERROR",
         },
         caller_id="system:completion-tagging",
+        known_run=workflow_run,
     )
 
 
@@ -133,6 +134,7 @@ async def test_completion_tags_write_status_and_execution_mode_for_completed_run
         organization_id="org_abc",
         sets={"skyvern.status": "completed", "skyvern.execution_mode": "agent"},
         caller_id="system:completion-tagging",
+        known_run=workflow_run,
     )
 
 

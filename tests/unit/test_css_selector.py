@@ -1,5 +1,7 @@
 """Tests for compute_stable_selector, compute_selector_options, and _looks_dynamic."""
 
+import pytest
+
 from skyvern.utils.css_selector import _looks_dynamic, compute_selector_options, compute_stable_selector
 
 
@@ -164,6 +166,40 @@ class TestComputeSelectorOptions:
         }
         options = compute_selector_options(elem)
         assert ('button:has-text("Apply Filters")', "visible text") in options
+
+    @pytest.mark.parametrize(
+        "elem_id, expected",
+        [
+            # Bare "#<id>" only parses for CSS identifiers.
+            ("signOnButton", "#signOnButton"),
+            ("field-1", "#field-1"),
+            ("_private", "#_private"),
+            ("-dashed", "#-dashed"),
+            # A CSS identifier cannot start with a digit: "#123abc" is an invalid selector.
+            ("123abc", '[id="123abc"]'),
+            ("-1abc", '[id="-1abc"]'),
+            # Whitespace would make "#a b" parse as "#a" descendant "b" — a different element.
+            ("a b", '[id="a b"]'),
+            # Punctuation needs escaping under "#", so use the attribute form instead.
+            ("foo.bar", '[id="foo.bar"]'),
+            ("a:b", '[id="a:b"]'),
+            ('quo"te', '[id="quo\\"te"]'),
+            ("back\\slash", '[id="back\\\\slash"]'),
+        ],
+    )
+    def test_id_selector_is_a_parseable_selector_for_that_id(self, elem_id, expected):
+        """Ids that aren't CSS identifiers must use [id="..."], not "#<id>"."""
+        options = compute_selector_options({"tagName": "div", "text": "", "attributes": {"id": elem_id}})
+        assert [s for s, _ in options] == [expected]
+
+    def test_dynamic_id_also_uses_attribute_form_when_not_an_identifier(self):
+        """The auto-generated-id branch builds its selector the same way as the stable one."""
+        elem = {"tagName": "div", "text": "", "attributes": {"id": "1234abcdef"}}
+        options = compute_selector_options(elem)
+        assert len(options) == 1
+        selector, description = options[0]
+        assert selector == '[id="1234abcdef"]'
+        assert "auto-generated" in description
 
     def test_input61_case(self):
         """The exact case that motivated this change — input61 with a name attribute."""

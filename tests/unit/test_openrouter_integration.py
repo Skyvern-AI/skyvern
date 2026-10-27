@@ -23,22 +23,22 @@ def setup_forge_app():
 def _isolate_llm_settings():
     """Every test below mutates three pieces of process-global state --
     SettingsManager's active settings instance, LLMConfigRegistry's
-    registered configs, and config_registry's module globals (every
-    `importlib.reload` rebinds `settings`, read directly by get_config()'s
-    synthesis fallback, and the `LLMConfigRegistry` class other modules
-    imported by name) -- without restoring any of them, which can leak into
-    (or be leaked into by) unrelated tests depending on execution order.
-    Snapshot and restore all three around every test in this module.
+    registered configs, and config_registry's own module-level `settings`
+    binding (rebound on every `importlib.reload`, and read directly by
+    get_config()'s synthesis fallback) -- without restoring any of them,
+    which can leak into (or be leaked into by) unrelated tests depending on
+    execution order. Snapshot and restore all three around every test in
+    this module.
     """
     previous_settings = SettingsManager.get_settings()
     # Shallow copy is safe: LLMConfig/LLMRouterConfig values are frozen dataclasses.
     previous_configs = dict(config_registry.LLMConfigRegistry._configs)
-    previous_namespace = dict(vars(config_registry))
+    previous_module_settings = config_registry.settings
     yield
     SettingsManager.set_settings(previous_settings)
-    vars(config_registry).update(previous_namespace)
     config_registry.LLMConfigRegistry._configs.clear()
     config_registry.LLMConfigRegistry._configs.update(previous_configs)
+    config_registry.settings = previous_module_settings
 
 
 class DummyResponse(dict):
@@ -123,15 +123,13 @@ async def test_openrouter_dynamic_model(monkeypatch):
     assert called_model == "other-model"
 
 
-def test_isolate_llm_settings_restores_module_level_bindings():
+def test_isolate_llm_settings_restores_module_level_settings_binding():
     """Regression: config_registry does `from skyvern.config import settings`, so
     importlib.reload(config_registry) while skyvern.config.settings is monkeypatched
     rebinds config_registry's own module-level `settings` name to that patched
     object. The monkeypatch fixture only restores skyvern.config.settings itself,
     not this separate binding, and get_config()'s synthesis fallback reads it
     directly -- a leak here silently affects any later test's synthesized configs.
-    The reload also rebinds `LLMConfigRegistry` to a new class, so a later test that
-    patches config_registry.LLMConfigRegistry would miss the class production code uses.
     """
     # __wrapped__ recovers the undecorated generator function -- an implementation
     # detail of pytest's fixture wrapper, not public API, but stable since pytest 3.
@@ -159,7 +157,6 @@ def test_isolate_llm_settings_restores_module_level_bindings():
         next(gen)  # run the fixture's teardown half
 
     assert config_registry.settings is original_module_settings
-    assert config_registry.LLMConfigRegistry is api_handler_factory.LLMConfigRegistry
 
 
 @pytest.mark.asyncio

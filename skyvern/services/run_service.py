@@ -75,12 +75,21 @@ async def get_run_response_coalesced(run_id: str, organization_id: str, cap_outp
 async def get_run_response(
     run_id: str, organization_id: str | None = None, cap_output_values: bool = False
 ) -> RunResponse | None:
-    run = await app.DATABASE.tasks.get_run(run_id, organization_id=organization_id)
-    if not run:
-        # try to see if it's a workflow run id for task v2
-        task_v2 = await app.DATABASE.observer.get_task_v2_by_workflow_run_id(run_id, organization_id=organization_id)
-        if task_v2:
-            run = await app.DATABASE.tasks.get_run(task_v2.observer_cruise_id, organization_id=organization_id)
+    # Task responses are built outside this scope because they read storage between queries, which would hold its
+    # connection; the workflow status build hands the connection back before its own storage reads.
+    async with app.DATABASE.Session.reading():
+        run = await app.DATABASE.tasks.get_run(run_id, organization_id=organization_id)
+        if not run:
+            # try to see if it's a workflow run id for task v2
+            task_v2 = await app.DATABASE.observer.get_task_v2_by_workflow_run_id(
+                run_id, organization_id=organization_id
+            )
+            if task_v2:
+                run = await app.DATABASE.tasks.get_run(task_v2.observer_cruise_id, organization_id=organization_id)
+        if run and run.task_run_type == RunType.workflow_run:
+            return await workflow_service.get_workflow_run_response(
+                run.run_id, organization_id=organization_id, cap_output_values=cap_output_values
+            )
 
     if not run:
         return None
@@ -159,10 +168,6 @@ async def get_run_response(
         if not task_v2:
             return None
         return await task_v2_service.build_task_v2_run_response(task_v2, cap_output_values=cap_output_values)
-    elif run.task_run_type == RunType.workflow_run:
-        return await workflow_service.get_workflow_run_response(
-            run.run_id, organization_id=organization_id, cap_output_values=cap_output_values
-        )
     raise ValueError(f"Invalid task run type: {run.task_run_type}")
 
 

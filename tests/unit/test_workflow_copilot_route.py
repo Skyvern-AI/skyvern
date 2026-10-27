@@ -7028,8 +7028,7 @@ async def test_browser_allocation_recorder_requires_admitted_request_override(
     copilot_stream: MagicMock,
     override_header: str | None,
 ) -> None:
-    from skyvern.forge.sdk.api.llm.config_registry import LLMConfigRegistry
-    from skyvern.forge.sdk.copilot.eval_llm_overrides import EVAL_LLM_OVERRIDES_HEADER
+    from skyvern.forge.sdk.copilot import eval_llm_overrides
     from skyvern.schemas.llm import LLMConfig
 
     captured = install_fake_create(monkeypatch)
@@ -7046,12 +7045,12 @@ async def test_browser_allocation_recorder_requires_admitted_request_override(
     )
     monkeypatch.setattr(settings, "WORKFLOW_COPILOT_EVAL_LLM_OVERRIDES_ORGANIZATION_IDS", ["org-1"])
     monkeypatch.setattr(
-        LLMConfigRegistry,
+        eval_llm_overrides.LLMConfigRegistry,
         "_configs",
         {"EVAL_CONFIG": LLMConfig("openai/eval-model", [], supports_vision=True, add_assistant_prefix=False)},
     )
     if override_header is not None:
-        api_key_request.headers[EVAL_LLM_OVERRIDES_HEADER] = override_header
+        api_key_request.headers[eval_llm_overrides.EVAL_LLM_OVERRIDES_HEADER] = override_header
     recorded = AsyncMock()
     workflow_params.record_copilot_browser_allocation = recorded
     calls = []

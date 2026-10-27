@@ -32,6 +32,8 @@ class ChallengeSolveRecord:
     extension_solved: bool | None = None
     unsolved: bool = False
     observations: list[ChallengeObservation] = field(default_factory=list)
+    # (producer, variant): the reCAPTCHA variant a solver route found on the widget it targeted.
+    recaptcha_target: tuple[str, str] | None = None
 
 
 # Set by a caller that reaches another client's solve boundary, so the recorded row names the caller instead.

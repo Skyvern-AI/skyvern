@@ -31,6 +31,7 @@ from playwright.async_api import Frame, Locator, Page
 from skyvern.config import settings
 from skyvern.forge import app
 from skyvern.webeye.utils.challenge_signature import ChallengeVendor, rendered_challenge_vendor
+from skyvern.webeye.utils.recaptcha_variant import RecaptchaTarget, recaptcha_anchor_target
 
 if TYPE_CHECKING:
     from skyvern.forge.sdk.workflow.models.code_block_recorder import RecordingPage
@@ -59,12 +60,14 @@ ChallengePageState = Literal["clear", "challenged", "not_rechecked"]
 @dataclass(frozen=True)
 class ChallengeOutcome:
     """What a solve found and did. ``vendor`` is a ``ChallengeVendor`` value or a challenge-signature literal, never
-    page text, and ``page_state`` is what a look at the page after the last arm showed."""
+    page text, and ``page_state`` is what a look at the page after the last arm showed. ``recaptcha_target`` is the
+    variant of the widget the anchor arm solved; the receipt leaves it out."""
 
     status: ChallengeStatus
     vendor: str | None = None
     arm: ChallengeArm | None = None
     page_state: ChallengePageState = "not_rechecked"
+    recaptcha_target: RecaptchaTarget | None = None
 
     def receipt(self) -> dict[str, str | None]:
         return {"status": self.status.value, "vendor": self.vendor, "arm": self.arm, "page_state": self.page_state}
@@ -382,7 +385,7 @@ async def solve_challenge(
             # The arms are each bounded to fit the budget from ``start``; a vendor handler that spent most of it
             # would otherwise let the remaining unclamped probes and arms run past the caller's ceiling.
             async with asyncio.timeout(_LADDER_BUDGET_SECONDS - (time.monotonic() - start)):
-                arm = await _solve_challenge_ladder_impl(
+                solved = await _solve_challenge_ladder_impl(
                     page,
                     start=start,
                     organization_id=organization_id,
@@ -400,8 +403,9 @@ async def solve_challenge(
             if rendered in _UNSUPPORTED_FRAME_VENDORS:
                 return ChallengeOutcome(ChallengeStatus.UNSUPPORTED, rendered, page_state="challenged")
             return ChallengeOutcome(ChallengeStatus.UNSOLVED, rendered)
-        if arm is not None:
-            return ChallengeOutcome(ChallengeStatus.SOLVED, arm=arm)
+        if solved is not None:
+            arm, recaptcha_target = solved
+            return ChallengeOutcome(ChallengeStatus.SOLVED, arm=arm, recaptcha_target=recaptcha_target)
         rendered = await _rendered_frame_vendor(page)
         if rendered is not None:
             status = ChallengeStatus.UNSUPPORTED if rendered in _UNSUPPORTED_FRAME_VENDORS else ChallengeStatus.UNSOLVED
@@ -471,9 +475,10 @@ async def _solve_challenge_ladder_impl(
     probe_child_frames: bool = False,
     click: ChallengeClick = _click_directly,
     click_handle: ChallengeHandleClick = _click_directly,
-) -> ChallengeArm | None:
-    """The arm that solved a detected widget, or None when the cheap probes find none and no solver is called.
-    Raises CaptchaChallengeUnsolvedError when no arm, each clamped to the budget left since ``start``, clears it."""
+) -> tuple[ChallengeArm, RecaptchaTarget | None] | None:
+    """The arm that solved a detected widget and, for the anchor arm, the variant of the widget it clicked; None when
+    the cheap probes find none and no solver is called. Raises CaptchaChallengeUnsolvedError when no arm, each
+    clamped to the budget left since ``start``, clears it."""
     checkbox = page.locator(_CAPTCHA_CHECKBOX_SELECTOR)
     marker = page.locator(_CAPTCHA_MARKER_SELECTOR)
     # A challenge nested in a child frame only widens this presence check: the DOM-checkbox arm below
@@ -504,11 +509,11 @@ async def _solve_challenge_ladder_impl(
                             await click(continuation_candidate)
                             await page.wait_for_timeout(100)
                             if await _bounded_locator_count(checkbox) == 0:
-                                return "dom_checkbox"
+                                return "dom_checkbox", None
                     else:
                         # Checkbox challenges commonly complete on the checkbox
                         # interaction itself and expose no associated continuation.
-                        return "dom_checkbox"
+                        return "dom_checkbox", None
         except Exception:
             LOG.info("CAPTCHA checkbox arm did not solve", arm="dom_checkbox")
 
@@ -531,6 +536,7 @@ async def _solve_challenge_ladder_impl(
                 if not _is_trusted_recaptcha_anchor_url(frame.url):
                     continue
                 token_scope = frame.parent_frame or page
+                target = recaptcha_anchor_target(frame.url)
                 token_was_populated = await _recaptcha_token_populated(token_scope)
                 if await candidate.get_attribute("aria-checked") == "true":
                     break
@@ -541,7 +547,7 @@ async def _solve_challenge_ladder_impl(
                 await page.wait_for_timeout(_RECAPTCHA_ANCHOR_SETTLE_MS)
                 if frame.is_detached() and urlparse(page.url)._replace(fragment="").geturl() != page_url_before_click:
                     LOG.info("CAPTCHA anchor frame solved after navigation", arm="recaptcha_anchor_frame")
-                    return "recaptcha_anchor_frame"
+                    return "recaptcha_anchor_frame", target
                 token_is_populated = await _recaptcha_token_populated(token_scope)
                 if (
                     await candidate.get_attribute("aria-checked") == "true"
@@ -550,7 +556,7 @@ async def _solve_challenge_ladder_impl(
                     and await app.AGENT_FUNCTION.is_captcha_solver_completion_confirmed(page, default_result=True)
                 ):
                     LOG.info("CAPTCHA anchor frame solved", arm="recaptcha_anchor_frame")
-                    return "recaptcha_anchor_frame"
+                    return "recaptcha_anchor_frame", target
                 # An inconclusive baseline fails the test above even when the click earned a token,
                 # so read the widget rather than the verdict before deciding a reset is free.
                 anchor_left_token = token_is_populated is True
@@ -593,7 +599,7 @@ async def _solve_challenge_ladder_impl(
         try:
             async with asyncio.timeout(extension_timeout):
                 if await app.AGENT_FUNCTION.auto_solve_captchas(page):
-                    return "extension"
+                    return "extension", None
         except Exception:
             LOG.info("CAPTCHA extension arm did not solve", arm="extension")
 
@@ -612,7 +618,7 @@ async def _solve_challenge_ladder_impl(
                         workflow_run_id=workflow_run_id,
                         browser_session_id=browser_session_id,
                     ):
-                        return "token"
+                        return "token", None
             except Exception:
                 LOG.info("CAPTCHA token arm did not solve", arm="token")
 

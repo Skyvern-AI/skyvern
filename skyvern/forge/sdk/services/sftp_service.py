@@ -198,6 +198,9 @@ async def download_file(
                     except OSError as exc:
                         raise SFTPDownloadError(SFTPDownloadErrorCategory.TRANSFER_FAILED, byte_count) from exc
 
+            if attributes.size is not None and byte_count != attributes.size:
+                raise SFTPDownloadError(SFTPDownloadErrorCategory.TRANSFER_FAILED, byte_count)
+
             try:
                 published_path = publish_unique_download(temporary_path, output_dir_path, filename)
             except OSError as exc:

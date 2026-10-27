@@ -24,7 +24,7 @@ from pydantic import AnyHttpUrl, TypeAdapter, ValidationError
 from skyvern.config import settings
 from skyvern.schemas.run_enums import RunEngine
 from skyvern.webeye.actions.action_types import ActionType
-from skyvern.webeye.browser_health import BrowserHealth, BrowserOperation
+from skyvern.webeye.browser_health import BrowserHealth, BrowserOperation, FrameKind
 
 if TYPE_CHECKING:
     from playwright.async_api import FileChooser, Frame, Page
@@ -1670,12 +1670,12 @@ def ensure_context() -> SkyvernContext:
     return context
 
 
-def record_browser_timeout(operation: BrowserOperation) -> None:
+def record_browser_timeout(operation: BrowserOperation, *, frame_kind: FrameKind | None = None) -> None:
     """Note that a browser-protocol operation went unanswered. Outside a run there is nothing to
     tally against, and callers are hot paths, so a missing context is silently a no-op."""
     context = current()
     if context is not None:
-        context.browser_health.record_timeout(operation)
+        context.browser_health.record_timeout(operation, frame_kind=frame_kind)
 
 
 def record_browser_success() -> None:

@@ -19,7 +19,7 @@ from skyvern.forge.sdk.workflow.models.workflow import (
     WorkflowStatus,
 )
 from skyvern.forge.sdk.workflow.service import WorkflowService
-from tests.unit.force_stub_app import make_workflow_run_attempts_fake
+from tests.unit.force_stub_app import make_workflow_run_attempts_fake, released_session_stub
 
 TEMPLATE_ORG_ID = "o_template"
 CALLER_ORG_ID = "o_caller"
@@ -72,6 +72,7 @@ def template_run_db(monkeypatch: pytest.MonkeyPatch) -> tuple[AsyncMock, AsyncMo
         app,
         "DATABASE",
         SimpleNamespace(
+            Session=released_session_stub(),
             workflows=SimpleNamespace(
                 get_workflow_for_workflow_run=get_by_run,
                 get_workflow_by_permanent_id=get_by_wpid,

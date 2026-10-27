@@ -3001,8 +3001,9 @@ def make_finish_tool(
             )
         ]
 
-    async def _released_submissions() -> list[InterceptedSubmission]:
-        """The records once no unheld-before one is still held, waiting at most SUBMISSION_HELD_WAIT_MAX_SECONDS."""
+    async def _released_submissions() -> tuple[list[InterceptedSubmission], bool]:
+        """The records once no unheld-before one is still held, waiting at most SUBMISSION_HELD_WAIT_MAX_SECONDS, and
+        whether the run was canceled during the wait."""
         records = _read_submissions()
         cap_at = time.monotonic() + SUBMISSION_HELD_WAIT_MAX_SECONDS
         while any(
@@ -3019,11 +3020,11 @@ def make_finish_tool(
             await asyncio.sleep(wait)
             try:
                 if should_cancel is not None and await should_cancel():
-                    break
+                    return records, True
             except Exception:
                 break
             records = _read_submissions()
-        return records
+        return records, False
 
     async def _bounded_fingerprint() -> str | None:
         """page_fingerprint(), timed out against whatever is left of the run's deadline instead of
@@ -3188,6 +3189,75 @@ def make_finish_tool(
             },
         )
 
+    async def _submission_hold(status: str) -> ToolResult | None:
+        nonlocal failure_deferrals, submission_hold_turn, submission_hold_message, retry_granted_on
+        if status not in ("failed", "terminated") or intercepted_submissions is None or activity is None:
+            return None
+        if submission_hold_turn == activity.turn:
+            if retry_granted_on is not None and _submission_state() != retry_granted_on:
+                return ToolResult.error(
+                    "verdict held: a submission was made after the retry offer in this same batch, so that "
+                    "offer is spent. Do not submit again; re-observe the page and finish on what it shows."
+                )
+            return ToolResult.error(submission_hold_message)
+        unseen = _unseen_submissions(_read_submissions())
+        can_hold = bool(unseen) and _has_hold_headroom(activity, deadline_at)
+        if can_hold:
+            records, canceled = await _released_submissions()
+            unseen = _unseen_submissions(records)
+            # The wait spent deadline, so the hold must still have the headroom it asks the model to spend.
+            can_hold = bool(unseen) and _has_hold_headroom(activity, deadline_at)
+            if canceled and not can_hold:
+                # Defer: the loop's cancellation check persists `canceled` before another turn.
+                return ToolResult.error("the run was canceled while the verdict was being checked.")
+        if unseen and not can_hold:
+            new = [r.record_id for r in unseen if r.record_id not in submission_would_holds]
+            if new:
+                submission_would_holds.update(new)
+                LOG.info(
+                    "taskv3 finish would hold on an unseen submission response",
+                    status=status,
+                    record_ids=new,
+                    turn=activity.turn,
+                )
+        elif unseen:
+            for r in unseen:
+                if r.outcome is SubmissionOutcome.HELD:
+                    submission_held_pending.add(r.record_id)
+                else:
+                    submission_holds.add(r.record_id)
+            if status == "failed":
+                # The failure-evidence hold below asks for the same re-observe; one is enough.
+                failure_deferrals = max_failure_deferrals
+            now = time.monotonic()
+            LOG.info(
+                "taskv3 finish held on an unseen submission response",
+                status=status,
+                record_ids=[r.record_id for r in unseen],
+                outcomes=[str(r.outcome) for r in unseen],
+                seconds_since_response=[None if r.effect_at is None else round(now - r.effect_at, 2) for r in unseen],
+                read_age_seconds=None if activity.read_started_at is None else round(now - activity.read_started_at, 2),
+                turn=activity.turn,
+            )
+            still_held = any(r.outcome is SubmissionOutcome.HELD for r in unseen)
+            submission_hold_turn = activity.turn
+            # A plain hold, not the retry offer: a later finish in this batch gets it unchanged.
+            retry_granted_on = None
+            submission_hold_message = (
+                "verdict held once: a form submission on this page "
+                + (
+                    "is still waiting for the site's response"
+                    if still_held
+                    else "got the site's response after your last look at the page"
+                )
+                + ", so the page may no longer show what this verdict describes. That response is not by "
+                "itself a confirmation or a rejection. Re-observe the page (waiting briefly first if it may "
+                "still be processing) and finish on what it shows now: status=completed only on a positive "
+                "confirmation of the goal; otherwise finish again with your verdict and it will stand."
+            )
+            return ToolResult.error(submission_hold_message)
+        return None
+
     async def handler(args: dict[str, Any]) -> ToolResult:
         nonlocal deferrals, stale_holds, failure_deferrals, reask_asked, premise_checks
         nonlocal submission_hold_turn, submission_hold_message
@@ -3348,70 +3418,8 @@ def make_finish_tool(
                 if not gate_passed:
                     LOG.info("taskv3 completed verdict refused by the completion gate")
                     return ToolResult.error(COMPLETION_GATE_REFUSAL)
-        if status in ("failed", "terminated") and intercepted_submissions is not None and activity is not None:
-            if submission_hold_turn == activity.turn:
-                if retry_granted_on is not None and _submission_state() != retry_granted_on:
-                    return ToolResult.error(
-                        "verdict held: a submission was made after the retry offer in this same batch, so that "
-                        "offer is spent. Do not submit again; re-observe the page and finish on what it shows."
-                    )
-                return ToolResult.error(submission_hold_message)
-            unseen = _unseen_submissions(_read_submissions())
-            can_hold = bool(unseen) and _has_hold_headroom(activity, deadline_at)
-            if can_hold:
-                unseen = _unseen_submissions(await _released_submissions())
-                # The wait spent deadline, so the hold must still have the headroom it asks the model to spend.
-                can_hold = bool(unseen) and _has_hold_headroom(activity, deadline_at)
-            if unseen and not can_hold:
-                new = [r.record_id for r in unseen if r.record_id not in submission_would_holds]
-                if new:
-                    submission_would_holds.update(new)
-                    LOG.info(
-                        "taskv3 finish would hold on an unseen submission response",
-                        status=status,
-                        record_ids=new,
-                        turn=activity.turn,
-                    )
-            elif unseen:
-                for r in unseen:
-                    if r.outcome is SubmissionOutcome.HELD:
-                        submission_held_pending.add(r.record_id)
-                    else:
-                        submission_holds.add(r.record_id)
-                if status == "failed":
-                    # The failure-evidence hold below asks for the same re-observe; one is enough.
-                    failure_deferrals = max_failure_deferrals
-                now = time.monotonic()
-                LOG.info(
-                    "taskv3 finish held on an unseen submission response",
-                    status=status,
-                    record_ids=[r.record_id for r in unseen],
-                    outcomes=[str(r.outcome) for r in unseen],
-                    seconds_since_response=[
-                        None if r.effect_at is None else round(now - r.effect_at, 2) for r in unseen
-                    ],
-                    read_age_seconds=None
-                    if activity.read_started_at is None
-                    else round(now - activity.read_started_at, 2),
-                    turn=activity.turn,
-                )
-                still_held = any(r.outcome is SubmissionOutcome.HELD for r in unseen)
-                submission_hold_turn = activity.turn
-                # A plain hold, not the retry offer: a later finish in this batch gets it unchanged.
-                retry_granted_on = None
-                submission_hold_message = (
-                    "verdict held once: a form submission on this page "
-                    + (
-                        "is still waiting for the site's response"
-                        if still_held
-                        else "got the site's response after your last look at the page"
-                    )
-                    + ", so the page may no longer show what this verdict describes. That response is not by "
-                    "itself a confirmation or a rejection. Re-observe the page (waiting briefly first if it may "
-                    "still be processing) and finish on what it shows now: status=completed only on a positive "
-                    "confirmation of the goal; otherwise finish again with your verdict and it will stand."
-                )
-                return ToolResult.error(submission_hold_message)
+        if (hold := await _submission_hold(status)) is not None:
+            return hold
         if status in ("failed", "terminated") and intercepted_submissions is not None and activity is not None:
             records = _read_submissions()
             rejection = (
@@ -3587,6 +3595,9 @@ def make_finish_tool(
                 return ToolResult.error("the run was canceled while the verdict was being checked.")
             if converted is not None:
                 return converted
+            # A submission the page sent while the re-ask ran postdates the check above.
+            if (hold := await _submission_hold(status)) is not None:
+                return hold
         candidates = download_facts if status == "completed" and download_settle is not None else None
         if candidates is not None and (candidates.held_candidates is None or candidates.resolve_candidates is None):
             candidates = None

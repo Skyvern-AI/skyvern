@@ -20,12 +20,14 @@ GPT6_MODEL_NAMES: dict[str, str] = {
     "astra": "gpt-6-astra",
     "sol": "gpt-6-sol",
     "1_sol": "gpt-6.1-sol",
+    "1_terra": "gpt-6.1-terra",
     "luna": "gpt-6-luna",
 }
 GPT6_REASONING_EFFORT: dict[str, str] = {
     "astra": "xhigh",
     "sol": "medium",
     "1_sol": "medium",
+    "1_terra": "medium",
     "luna": settings.GPT6_LUNA_REASONING_EFFORT,
 }
 XAI_GROK_4_5_MODEL = "xai/grok-4.5"

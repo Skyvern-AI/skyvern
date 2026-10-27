@@ -24,7 +24,7 @@ from skyvern.forge.sdk.workflow.models.workflow import WorkflowRun, WorkflowRunS
 from skyvern.forge.sdk.workflow.service import WorkflowService
 from skyvern.schemas.workflows import BlockResult, BlockStatus
 from skyvern.services import webhook_service
-from tests.unit.force_stub_app import make_workflow_run_attempts_fake
+from tests.unit.force_stub_app import make_workflow_run_attempts_fake, released_session_stub
 
 LONG_CREDENTIAL = "templated-password-very-long-13668"
 SHORT_CREDENTIAL = "12"
@@ -110,6 +110,7 @@ async def _status_response_from_captured_output(
         app,
         "DATABASE",
         SimpleNamespace(
+            Session=released_session_stub(),
             workflows=SimpleNamespace(get_workflow_for_workflow_run=AsyncMock(return_value=workflow)),
             observer=SimpleNamespace(get_task_v2_by_workflow_run_id=AsyncMock(return_value=None)),
             tasks=SimpleNamespace(get_tasks_by_workflow_run_id=AsyncMock(return_value=[])),

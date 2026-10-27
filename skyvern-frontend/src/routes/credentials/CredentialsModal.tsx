@@ -528,6 +528,14 @@ function CredentialsModal({
   const attachAgentCount = attachUsage?.workflows?.length ?? 0;
   // Test & Save Browser Profile state
   const [testAndSave, setTestAndSave] = useState(false);
+  // An already-saved profile ticks the box even without the intent flag, so both
+  // form initialization and change detection must read it from here; comparing
+  // the checkbox against the raw flag would make every bare Update on such a
+  // credential issue a no-op PATCH.
+  const savedBrowserSessionIntent = Boolean(
+    editingCredential?.save_browser_session_intent ||
+    editingCredential?.browser_profile_id,
+  );
   const [testUrl, setTestUrl] = useState("");
   const [userContext, setUserContext] = useState("");
   const [pinResidentialIspProxy, setPinResidentialIspProxy] = useState(false);
@@ -719,10 +727,7 @@ function CredentialsModal({
       if (editingCredential.tested_url) {
         setTestUrl(editingCredential.tested_url);
       }
-      if (
-        editingCredential.save_browser_session_intent ||
-        !!editingCredential.browser_profile_id
-      ) {
+      if (savedBrowserSessionIntent) {
         setTestAndSave(true);
       }
       setBrowserProfileId(editingCredential.browser_profile_id ?? null);
@@ -1416,6 +1421,14 @@ function CredentialsModal({
       isEditMode &&
       runSequentially !== (editingCredential?.run_sequentially ?? false);
 
+    // The save-session checkbox is togglable without touching the secrets, so it
+    // has to count as an edit on its own — otherwise a checkbox-only save closed
+    // the modal without sending anything.
+    const saveBrowserSessionIntentChanged =
+      isEditMode &&
+      supportsInlineTest &&
+      testAndSave !== savedBrowserSessionIntent;
+
     // In edit mode, use editingGroups to determine what changed (type-agnostic)
     if (isEditMode && editingCredential) {
       if (
@@ -1423,7 +1436,8 @@ function CredentialsModal({
         !editingGroups.values &&
         !proxyPinChanged &&
         !bmChanged &&
-        !runSequentiallyChanged
+        !runSequentiallyChanged &&
+        !saveBrowserSessionIntentChanged
       ) {
         // Nothing was edited — close silently
         reset();
@@ -1438,6 +1452,9 @@ function CredentialsModal({
           ...bmPatch,
           ...(runSequentiallyChanged
             ? { run_sequentially: runSequentially }
+            : {}),
+          ...(saveBrowserSessionIntentChanged
+            ? { save_browser_session_intent: testAndSave }
             : {}),
         });
         return;
@@ -2026,6 +2043,7 @@ function CredentialsModal({
       return (
         <PasswordCredentialContent
           values={passwordCredentialValues}
+          hasTotp={editingPasswordCredentialData?.has_totp}
           onChange={handlePasswordCredentialChange}
           url={testUrl}
           onUrlChange={setTestUrl}
@@ -2093,6 +2111,21 @@ function CredentialsModal({
                     method.
                   </p>
                 )}
+
+                {/* Ticking the box only records the preference; the session comes
+                  from a login test, which this path doesn't run. */}
+                {isEditMode &&
+                  !editingGroups.values &&
+                  supportsInlineTest &&
+                  testAndSave &&
+                  !editingCredential?.browser_profile_id &&
+                  testStatus === "idle" && (
+                    <p className="pl-7 text-sm text-muted-foreground">
+                      No session is saved yet. Skyvern saves one the next time
+                      this login is tested — start a test with the retry button
+                      on this credential in the list.
+                    </p>
+                  )}
 
                 {supportsInlineTest && testAndSave && (
                   <div className="space-y-1 pl-7">
