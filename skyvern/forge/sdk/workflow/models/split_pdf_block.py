@@ -13,7 +13,7 @@ from pypdf import PdfReader, PdfWriter
 
 from skyvern.config import settings
 from skyvern.constants import MAX_FILE_PARSE_INPUT_TOKENS
-from skyvern.exceptions import PDFParsingError
+from skyvern.exceptions import PDFParsingError, SplitPdfTooManyPages
 from skyvern.forge import app
 from skyvern.forge.prompts import prompt_engine
 from skyvern.forge.sdk.api.files import (
@@ -43,11 +43,14 @@ from skyvern.forge.sdk.workflow.models.block import (
 )
 from skyvern.forge.sdk.workflow.models.parameter import PARAMETER_TYPE
 from skyvern.schemas.workflows import BlockResult, BlockStatus, BlockType
-from skyvern.utils.token_counter import count_tokens
+from skyvern.utils.token_counter import decode_tokens, encode_tokens
 
 LOG = structlog.get_logger()
 
 MIN_PER_PAGE_TOKENS = 256
+# A longer PDF cannot give every page MIN_PER_PAGE_TOKENS of text, the least the planner needs to
+# assign a page to a document, so the block rejects it rather than split from unusable excerpts.
+MAX_PLANNABLE_PAGES = MAX_FILE_PARSE_INPUT_TOKENS // MIN_PER_PAGE_TOKENS
 
 
 class SplitPdfBlock(Block):
@@ -175,19 +178,39 @@ class SplitPdfBlock(Block):
             )
         return parsed
 
-    def _build_page_texts(self, reader: PdfReader) -> list[dict[str, int | str]]:
+    @staticmethod
+    def _build_page_texts(reader: PdfReader) -> list[dict[str, int | str]]:
         # Give every page a slice of the budget and truncate over-long pages, instead of blanking
         # all pages once a running total is hit: the planner needs some text from every page to
         # assign it to a document, and a single huge page must not blank everything after it.
+        # total_pages * (budget // total_pages) <= budget, so the excerpts always fit in aggregate.
         total_pages = len(reader.pages) or 1
-        per_page_token_budget = max(MIN_PER_PAGE_TOKENS, MAX_FILE_PARSE_INPUT_TOKENS // total_pages)
+        per_page_token_budget = MAX_FILE_PARSE_INPUT_TOKENS // total_pages
+        if per_page_token_budget < MIN_PER_PAGE_TOKENS:
+            raise SplitPdfTooManyPages(
+                total_pages=total_pages,
+                max_pages=MAX_PLANNABLE_PAGES,
+                min_per_page_tokens=MIN_PER_PAGE_TOKENS,
+            )
         page_texts: list[dict[str, int | str]] = []
+        truncated_pages = 0
         for page_index, page in enumerate(reader.pages):
             text = page.extract_text() or ""
-            if text and count_tokens(text) > per_page_token_budget:
-                # ~4 chars/token heuristic; document-type/boundary cues sit near the top of a page.
-                text = text[: per_page_token_budget * 4]
+            tokens = encode_tokens(text)
+            if len(tokens) > per_page_token_budget:
+                # Slice tokens, not characters: a chars-per-token estimate understates dense text
+                # such as identifier columns. Keep the head — document-type and boundary cues sit
+                # near the top of a page.
+                text = decode_tokens(tokens[:per_page_token_budget])
+                truncated_pages += 1
             page_texts.append({"page_number": page_index + 1, "text": text})
+        if truncated_pages:
+            LOG.info(
+                "Truncated SplitPdfBlock page excerpts to fit the planner input budget",
+                total_pages=total_pages,
+                truncated_pages=truncated_pages,
+                per_page_token_budget=per_page_token_budget,
+            )
         return page_texts
 
     async def _request_split_plan(
@@ -541,6 +564,14 @@ class SplitPdfBlock(Block):
                     status=BlockStatus.completed,
                     workflow_run_block_id=workflow_run_block_id,
                     organization_id=organization_id,
+                )
+            except SplitPdfTooManyPages as e:
+                return await self._record_failure(
+                    workflow_run_context,
+                    workflow_run_id,
+                    workflow_run_block_id,
+                    organization_id,
+                    str(e),
                 )
             except Exception as e:
                 return await self._record_failure(

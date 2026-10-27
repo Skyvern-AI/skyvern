@@ -46,7 +46,9 @@ def encode_tokens(text: str) -> list[int]:
     encoding = _get_encoding()
     if encoding is None:
         return [ord(char) for char in text]
-    return encoding.encode(text)
+    # Matches count_tokens: encoded text is data, never control, so special-token spellings
+    # like "<|endoftext|>" must encode as ordinary text instead of raising.
+    return encoding.encode(text, disallowed_special=())
 
 
 def decode_tokens(tokens: list[int]) -> str:
