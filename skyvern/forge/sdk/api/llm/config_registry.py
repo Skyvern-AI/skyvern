@@ -41,8 +41,13 @@ XAI_GROK_4_5_MAX_OUTPUT_TOKENS = 128_000
 # recognize in `ignore` is skipped silently rather than rejected.
 OPENINFERENCE_PROVIDER_SLUG = "open-inference"
 # OpenRouter routes by provider SLUG and skips an unrecognised one silently, so a name here
-# that no longer matches enforces nothing. Both are asserted in tests for that reason.
+# that no longer matches enforces nothing. All three are asserted in tests for that reason.
 AMAZON_BEDROCK_PROVIDER_SLUG = "amazon-bedrock"
+# Serves DeepSeek V4 Flash without enforcing either token cap: measured reasoning spend reached
+# 131K tokens against a 65,536 completion cap and a 49,152 reasoning budget, leaving the answer no
+# room and returning it empty. 20% of its calls overran the budget against 0.5% elsewhere, so the
+# model is excluded from it rather than retried on it (SKY-19198).
+CLOUDFLARE_PROVIDER_SLUG = "cloudflare"
 # A completion cap bounds reasoning and answer together, so a reasoning model can spend the whole
 # cap thinking and stop at finish_reason=length with no content at all (SKY-18857). Reserve this
 # much of the cap for the answer and give reasoning the rest.
@@ -60,6 +65,14 @@ def openrouter_reasoning_budget(max_completion_tokens: int) -> dict[str, int]:
     return {
         "max_tokens": max(max_completion_tokens - OPENROUTER_ANSWER_TOKEN_RESERVE, max_completion_tokens // 2),
     }
+
+
+def deepseek_v4_flash_provider_routing() -> dict[str, dict[str, list[str]]]:
+    """Shared by every OpenRouter config serving this model, so the exclusions cannot drift apart.
+
+    A fresh dict per config: litellm_params are shallow-merged into per-call parameters.
+    """
+    return {"provider": {"ignore": [OPENINFERENCE_PROVIDER_SLUG, CLOUDFLARE_PROVIDER_SLUG]}}
 
 
 @dataclass(frozen=True)
@@ -2083,7 +2096,7 @@ if settings.ENABLE_OPENROUTER:
                 api_version=None,
                 model_info={"model_name": "openrouter/deepseek/deepseek-v4-flash"},
                 extra_body={
-                    "provider": {"ignore": [OPENINFERENCE_PROVIDER_SLUG]},
+                    **deepseek_v4_flash_provider_routing(),
                     "reasoning": openrouter_reasoning_budget(DEEPSEEK_V4_FLASH_MAX_COMPLETION_TOKENS),
                 },
             ),
@@ -2107,6 +2120,9 @@ if settings.ENABLE_OPENROUTER:
                     # Bounds reasoning by effort, not by openrouter_reasoning_budget: upstream treats
                     # the two as mutually exclusive, and effort is this config's reason for existing.
                     "reasoning_effort": "high",
+                    # Serves no traffic today. Whoever revives it should know this order leads with
+                    # the upstream deepseek_v4_flash_provider_routing excludes, and pins it with no
+                    # fallback, so every call would land on the one that caps nothing (SKY-19198).
                     "provider": {
                         "order": ["cloudflare", "parasail"],
                         "allow_fallbacks": False,

@@ -2,14 +2,12 @@ from __future__ import annotations
 
 import asyncio
 import json
-import re
 import uuid
 from collections.abc import AsyncIterator, Awaitable, Callable
 from contextlib import asynccontextmanager, suppress
 from dataclasses import asdict, dataclass, field
 from datetime import UTC, datetime
 from typing import TYPE_CHECKING, Any
-from urllib.parse import urlsplit
 
 from agents import (
     Agent,
@@ -30,6 +28,7 @@ from agents.models.interface import Model
 from agents.tool_context import ToolContext
 from openai.types.responses import ResponseFunctionToolCall, ResponseOutputMessage, ResponseOutputRefusal
 from openai.types.shared import Reasoning
+from pydantic import ValidationError
 
 from skyvern.cli.mcp_tools.blocks import BLOCK_SUMMARIES
 from skyvern.forge import app
@@ -37,6 +36,11 @@ from skyvern.forge.sdk.api.llm.config_registry import LLMConfigRegistry
 from skyvern.forge.sdk.api.llm.copilot_model_usage import copilot_usage_observer
 from skyvern.forge.sdk.copilot.cache_envelope import CacheableSystemInstructions
 from skyvern.forge.sdk.copilot.model_resolver import resolve_model_config
+from skyvern.forge.sdk.copilot.model_telemetry import (
+    CopilotLitellmModel,
+    current_model_attempt_telemetry,
+    model_attempt_telemetry_scope,
+)
 from skyvern.forge.sdk.core import skyvern_context
 from skyvern.forge.sdk.models import Step, StepStatus
 from skyvern.forge.sdk.schemas.tasks import Task, TaskStatus
@@ -51,7 +55,6 @@ from skyvern.forge.sdk.workflow.models.parameter import (
     is_sensitive_workflow_parameter,
 )
 from skyvern.forge.sdk.workflow.workflow_definition_converter import block_yaml_to_block
-from skyvern.schemas.google_sheets import extract_spreadsheet_id
 from skyvern.schemas.run_enums import RunEngine
 from skyvern.schemas.workflows import (
     BlockResult,
@@ -87,7 +90,6 @@ if TYPE_CHECKING:
     from skyvern.core.script_generations.script_skyvern_page import ScriptSkyvernPage
 
 _MAX_TOOL_RESULT_CHARS = 20_000
-_NESTED_AGENT_MAX_STEPS = 25
 _MASK = "*****"
 
 _INSTRUCTIONS = (
@@ -103,17 +105,6 @@ _NESTED_AGENT = (
 )
 
 
-def _host(url: str | None) -> str | None:
-    return (urlsplit(url).hostname or url) if url else None
-
-
-def _spreadsheet(url_or_id: str) -> str:
-    try:
-        return extract_spreadsheet_id(url_or_id)
-    except ValueError:
-        return url_or_id
-
-
 @dataclass(frozen=True)
 class _BlockTool:
     yaml_class: type[BlockYAML]
@@ -122,9 +113,6 @@ class _BlockTool:
     tool_name: str | None = None
     description: str | None = None
     nested_agent: bool = False
-    # Where the call sends run data; each must appear in the run's inputs.
-    destinations: Callable[[Any], list[str | None]] | None = None
-    required: tuple[str, ...] = ()
 
 
 _CONTROL_FLOW = (
@@ -137,11 +125,10 @@ _OVERLAPS = "Covered by browser_task or the page commands; overlapping tools mak
 AGENT_BLOCK_TOOLS: dict[BlockType, _BlockTool | str] = {
     BlockType.TASK: _BlockTool(
         TaskBlockYAML,
-        ("url", "navigation_goal", "data_extraction_goal", "data_schema", "max_steps_per_run"),
+        ("url", "navigation_goal", "data_extraction_goal", "data_schema"),
         tool_name="browser_task",
         description="Act on this run's browser: open url if given, work toward navigation_goal, and return data "
-        f"matching data_schema when data_extraction_goal is set. Uses at most {_NESTED_AGENT_MAX_STEPS} steps."
-        + _NESTED_AGENT,
+        "matching data_schema when data_extraction_goal is set." + _NESTED_AGENT,
         nested_agent=True,
     ),
     BlockType.LOGIN: _BlockTool(
@@ -150,9 +137,6 @@ AGENT_BLOCK_TOOLS: dict[BlockType, _BlockTool | str] = {
         tool_name="login",
         description="Sign in at url with one of this run's credentials." + _NESTED_AGENT,
         nested_agent=True,
-        # The nested agent types the credential wherever it signs in, so that site is checked like a send.
-        destinations=lambda y: [_host(y.url)],
-        required=("url",),
     ),
     BlockType.WEB_SEARCH: _BlockTool(
         WebSearchBlockYAML,
@@ -195,13 +179,6 @@ AGENT_BLOCK_TOOLS: dict[BlockType, _BlockTool | str] = {
             "path",
         ),
         description="Upload this run's downloaded files to S3, Azure Blob, Google Drive or SFTP",
-        destinations=lambda y: [
-            y.s3_bucket,
-            _host(y.endpoint_url),
-            y.azure_storage_account_name,
-            y.google_drive_folder_id,
-            y.sftp_host,
-        ],
     ),
     BlockType.SEND_EMAIL: _BlockTool(
         SendEmailBlockYAML,
@@ -217,8 +194,6 @@ AGENT_BLOCK_TOOLS: dict[BlockType, _BlockTool | str] = {
             "cc",
             "bcc",
         ),
-        # The SMTP path Bccs the sender.
-        destinations=lambda y: [y.sender, *y.recipients, *y.cc, *y.bcc],
     ),
     BlockType.FILE_URL_PARSER: _BlockTool(FileParserBlockYAML, ("file_url", "file_type", "json_schema", "worksheet")),
     BlockType.WAIT: _BlockTool(WaitBlockYAML, ("wait_sec",)),
@@ -242,7 +217,6 @@ AGENT_BLOCK_TOOLS: dict[BlockType, _BlockTool | str] = {
             "download_filename",
             "save_response_as_file",
         ),
-        destinations=lambda y: [_host(y.url)],
     ),
     BlockType.HUMAN_INTERACTION: _BlockTool(
         HumanInteractionBlockYAML,
@@ -255,7 +229,6 @@ AGENT_BLOCK_TOOLS: dict[BlockType, _BlockTool | str] = {
             "subject",
             "body",
         ),
-        destinations=lambda y: y.recipients,
     ),
     BlockType.PRINT_PAGE: _BlockTool(
         PrintPageBlockYAML, ("include_timestamp", "custom_filename", "format", "landscape", "print_background")
@@ -275,7 +248,6 @@ AGENT_BLOCK_TOOLS: dict[BlockType, _BlockTool | str] = {
             "column_mapping",
             "create_sheet_if_missing",
         ),
-        destinations=lambda y: [_spreadsheet(y.spreadsheet_url)],
     ),
     BlockType.PDF_FILL: _BlockTool(PdfFillBlockYAML, ("file_url", "prompt", "payload")),
     BlockType.SPLIT_PDF: _BlockTool(SplitPdfBlockYAML, ("file_url", "prompt")),
@@ -334,9 +306,6 @@ class _RunState:
     organization_id: str | None
     browser_session_id: str | None
     run_context: WorkflowRunContext
-    # The prompt as the author wrote it and the workflow parameter values: the only text an outbound destination may
-    # come from. The rendered prompt can carry earlier block outputs, which may be text read off a page.
-    inputs: str
     credential_keys: list[str]
     ignore_workflow_system_prompt: bool
     calls: list[dict[str, Any]] = field(default_factory=list)
@@ -408,6 +377,10 @@ class _LoopHooks(RunHooks[Any]):
             for part in item.content
             if isinstance(part, ResponseOutputRefusal)
         ]
+        stops = current_model_attempt_telemetry()
+        # LiteLLM keeps a refusal that came with text as plain text; only the content_filter finish reason marks it.
+        if not refusals and stops and stops.latest_stop_metadata.content_filter:
+            refusals = ["The provider's content filter stopped the response."]
         if refusals:
             raise _Refused(" ".join(refusals))
 
@@ -421,9 +394,13 @@ def _record_call(state: _RunState, written: object, **call: str) -> None:
 
 def resolve_agent_model(llm_key: str) -> tuple[str | Model, RunConfig]:
     model_name, copilot_run_config, _, _ = resolve_model_config(None, llm_key_override=llm_key)
-    # Copilot's RunConfig also carries session callbacks that read its chat context.
+    model = copilot_run_config.model
+    # Copilot's RunConfig also carries session callbacks that read its chat context, and an input filter that rewrites
+    # recent tool outputs. Without that filter this history only grows, so its newest tool output can be cached.
+    if isinstance(model, CopilotLitellmModel):
+        model.history_append_only = True
     return model_name, RunConfig(
-        model=copilot_run_config.model,
+        model=model,
         model_provider=copilot_run_config.model_provider,
         model_settings=copilot_run_config.model_settings,
         tracing_disabled=True,
@@ -459,22 +436,27 @@ def _arguments_schema(tool: _BlockTool, state: _RunState) -> dict[str, Any]:
     params: dict[str, Any] = {
         "type": "object",
         "properties": {name: schema["properties"][name] for name in tool.fields if name != "credential"},
-        "required": [name for name in tool.fields if name in schema.get("required", []) or name in tool.required],
+        "required": [name for name in tool.fields if name in schema.get("required", [])],
         "additionalProperties": False,
     }
     if "credential" in tool.fields:
         params["properties"]["credential"] = {"type": "string", "enum": state.credential_keys}
         params["required"].append("credential")
-    if "$defs" in schema:
-        params["$defs"] = schema["$defs"]
+    # Only the definitions a kept field reaches; the rest describe fields the model never sees.
+    defs = schema.get("$defs", {})
+    used: dict[str, Any] = {}
+    reached = json.dumps(params["properties"])
+    while names := [name for name in defs if name not in used and f'"#/$defs/{name}"' in reached]:
+        used |= {name: defs[name] for name in names}
+        reached = json.dumps([defs[name] for name in names])
+    if used:
+        params["$defs"] = used
     return params
 
 
 def _yaml_arguments(tool: _BlockTool, written: dict[str, Any], state: _RunState) -> dict[str, Any]:
     if unknown := sorted(set(written) - set(tool.fields)):
         raise ValueError(f"Unknown arguments {unknown}; the allowed arguments are {list(tool.fields)}.")
-    if missing := [name for name in tool.required if not written.get(name)]:
-        raise ValueError(f"Missing required arguments {missing}.")
     arguments = dict(written)
     if "credential" in tool.fields:
         credential = arguments.pop("credential", None)
@@ -482,22 +464,8 @@ def _yaml_arguments(tool: _BlockTool, written: dict[str, Any], state: _RunState)
             raise ValueError(f"credential must be one of {state.credential_keys}.")
         arguments["parameter_keys"] = [credential]
     if tool.nested_agent:
-        steps = arguments.get("max_steps_per_run")
-        arguments |= {
-            "engine": RunEngine.skyvern_v3,
-            "engine_pinned": True,
-            "max_steps_per_run": min(steps, _NESTED_AGENT_MAX_STEPS)
-            if isinstance(steps, int) and steps > 0
-            else _NESTED_AGENT_MAX_STEPS,
-        }
+        arguments |= {"engine": RunEngine.skyvern_v3, "engine_pinned": True}
     return arguments
-
-
-def _in_inputs(destination: str, inputs: str) -> bool:
-    # Whole-token match, so an input naming example.com.au, devops@example.com, team+ops@example.com or
-    # o'ps@example.com does not admit example.com or ps@example.com.
-    pattern = rf"(?<![\w.+@-])(?<!\w'){re.escape(destination)}(?![\w-]|\.\w)"
-    return re.search(pattern, inputs, re.IGNORECASE) is not None
 
 
 def _dedicated_tool(block_type: BlockType, tool: _BlockTool, state: _RunState) -> FunctionTool:
@@ -777,9 +745,6 @@ async def _run_child_block(
             label=label,
             ignore_workflow_system_prompt=state.ignore_workflow_system_prompt,
         )
-        destinations = (
-            [d.strip() for d in tool.destinations(block_yaml) if d and d.strip()] if tool.destinations else []
-        )
         # The send-email converter adds the platform SMTP parameters to this dict.
         parameters = {**state.run_context.parameters, output_parameter.key: output_parameter}
         child = block_yaml_to_block(block_yaml, parameters)  # type: ignore[arg-type]
@@ -787,27 +752,21 @@ async def _run_child_block(
         report = {
             "status": "invalid_arguments",
             "output": None,
-            "error": str(e),
+            # Pydantic's text repeats the whole input, including fields the model never wrote, and a docs URL.
+            "error": "; ".join(
+                f"{'.'.join(map(str, error['loc'])) or 'arguments'}: {error['msg']}"
+                for error in e.errors(include_url=False, include_input=False)
+            )
+            if isinstance(e, ValidationError)
+            else str(e),
             "argument_schema": _arguments_schema(tool, state),
         }
     else:
-        # send_email swaps a recipient that names a run parameter for that parameter's value.
-        run_context = state.run_context
-        resolved = (str(run_context.get_value_or_none(d)) if run_context.has_parameter(d) else d for d in destinations)
-        if outside := next((d for d in resolved if not _in_inputs(d, state.inputs)), None):
-            report = {
-                "status": "refused",
-                "output": None,
-                "error": f"{outside!r} is not in this run's inputs, and {block_type.value} may only send to a "
-                "destination written in a workflow parameter value or in this agent block's prompt. Use one "
-                f"of those, or report that the workflow author must add {outside!r} to them.",
-            }
-        else:
-            # A run resolves its secret parameters when it starts, before the converter added these.
-            for parameter in parameters.values():
-                if isinstance(parameter, AWSSecretParameter) and not run_context.has_parameter(parameter.key):
-                    await run_context.register_aws_secret_parameter_value(parameter)
-            report = await _execute_child(child, written, state)
+        # A run resolves its secret parameters when it starts, before the converter added these.
+        for parameter in parameters.values():
+            if isinstance(parameter, AWSSecretParameter) and not state.run_context.has_parameter(parameter.key):
+                await state.run_context.register_aws_secret_parameter_value(parameter)
+        report = await _execute_child(child, written, state)
     _record_call(state, written, tool=tool_name, block_type=block_type.value, label=label, status=report["status"])
     return _tool_text(report, state.run_context)
 
@@ -823,15 +782,6 @@ async def _execute_child(child: Block, written: dict[str, Any], state: _RunState
             browser_session_id=state.browser_session_id,
         )
     return {"status": result.status, "output": result.output_parameter_value, "error": result.failure_reason}
-
-
-def _run_inputs(prompt: str, run_context: WorkflowRunContext) -> str:
-    values = [
-        run_context.values.get(key)
-        for key, parameter in run_context.parameters.items()
-        if parameter.parameter_type == ParameterType.WORKFLOW
-    ]
-    return "\n".join([prompt, *(json.dumps(value, default=str, ensure_ascii=False) for value in values)])
 
 
 def _credential_keys(run_context: WorkflowRunContext) -> list[str]:
@@ -861,7 +811,6 @@ async def run_agent_step(
         organization_id=organization_id,
         browser_session_id=browser_session_id,
         run_context=run_context,
-        inputs=_run_inputs(block.prompt, run_context),
         credential_keys=_credential_keys(run_context),
         ignore_workflow_system_prompt=block.ignore_workflow_system_prompt,
     )
@@ -872,9 +821,11 @@ async def run_agent_step(
         name=block.label,
         # LiteLLM's chat-to-Responses bridge drops the served service tier, which leaves GPT calls unpriced;
         # Copilot's cacheable instructions take its direct Responses path, which keeps it.
+        # web_search needs today's date, which follows the cached prefix and stays fixed for the run.
         instructions=CacheableSystemInstructions(
             _INSTRUCTIONS,
-            f"\n\n{block.workflow_system_prompt}" if block.workflow_system_prompt else "",
+            f"\n\nCurrent UTC datetime: {datetime.now(UTC).isoformat(timespec='seconds')}"
+            + (f"\n\n{block.workflow_system_prompt}" if block.workflow_system_prompt else ""),
             cache_namespace=workflow_run_block_id,
         ),
         tools=[*_tools(state), finish],
@@ -929,7 +880,7 @@ async def run_agent_step(
         await block.record_output_parameter_value(run_context, workflow_run_id, value)
 
     try:
-        with copilot_usage_observer(lambda event: costs.append(event.cost or 0.0)):
+        with copilot_usage_observer(lambda event: costs.append(event.cost or 0.0)), model_attempt_telemetry_scope():
             result = await Runner.run(
                 agent,
                 prompt,

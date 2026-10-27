@@ -679,6 +679,9 @@ def drop_tool_schema_titles(tools: list[_ToolT], model: str, model_settings: Mod
 
 
 class CopilotLitellmModel(LitellmModel):
+    # True for a caller without Copilot's call_model_input_filter: nothing rewrites its recent tool outputs.
+    history_append_only = False
+
     def __init__(
         self,
         model: str,
@@ -809,7 +812,7 @@ class CopilotLitellmModel(LitellmModel):
         input = _escape_ref_tool_outputs_for_gemini(input, self.model, model_settings)
         tools = drop_tool_schema_titles(tools, self.model, model_settings)
         attach_tool_surface_to_pending_capture(tools)
-        anchors = stable_prefix_anchors(input) if isinstance(input, list) else []
+        anchors = stable_prefix_anchors(input, append_only=self.history_append_only) if isinstance(input, list) else []
         anchor = anchors[-1] if anchors else None
         explicit_cache_envelope = build_explicit_cache_envelope(
             model=self.model,
@@ -860,8 +863,8 @@ class CopilotLitellmModel(LitellmModel):
                         model=self.model,
                         should_replay_reasoning_content=self.should_replay_reasoning_content,
                     )
-                    # The recent tool window is rewritten and frames are later replaced by a placeholder, so the marker
-                    # sits on the anchor before them; the count mirrors the SDK's tool-call split, with system at 0.
+                    # The marker sits on the newest anchor, before any content a later call rewrites; the count mirrors
+                    # the SDK's tool-call split, with system at 0.
                     rolling_index = len(self._fix_tool_message_ordering(anchor_messages))
                     model_settings = replace(
                         model_settings,

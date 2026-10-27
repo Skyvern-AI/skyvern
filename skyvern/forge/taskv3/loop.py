@@ -15,6 +15,7 @@ core can be unit-tested with scripted fakes.
 from __future__ import annotations
 
 import asyncio
+import copy
 import dataclasses
 import hashlib
 import json
@@ -4214,6 +4215,7 @@ async def run_agent_tool_loop(
     action_effect_fingerprint: Callable[[], Awaitable[str | None]] | None = None,
     unseen_text: UnseenPageText | None = None,
     anthropic_cache_markers: bool = False,
+    initial_messages: list[dict[str, Any]] | None = None,
 ) -> LoopOutcome:
     tool_by_name = {tool.name: tool for tool in tools}
     st = LoopState(
@@ -4222,7 +4224,9 @@ async def run_agent_tool_loop(
         max_action_steps=max_action_steps,
         max_tokens=max_tokens,
         original_action_steps=max_action_steps,
-        messages=[
+        messages=copy.deepcopy(initial_messages)
+        if initial_messages is not None
+        else [
             {"role": "system", "content": system_prompt},
             {"role": "user", "content": user_prompt},
         ],
@@ -6087,6 +6091,7 @@ async def run_agent_tool_loop(
                     # cap_trip just records the fact that a cap forced this to be the last turn.
                     cap_trip=st.cap_trip_pending if st.final_turn_granted else None,
                 )
+                _append_skipped_tool_results(st.messages, tool_calls[idx + 1 :], "finish was accepted")
                 break
 
             if result.status == "ok" and result_data.get("readiness_incomplete"):

@@ -42,7 +42,7 @@ from contextvars import ContextVar
 from dataclasses import dataclass
 from pathlib import Path
 from typing import IO, TYPE_CHECKING, Any, Literal, NamedTuple
-from urllib.parse import unquote, urlparse
+from urllib.parse import parse_qsl, unquote, urlencode, urlparse, urlsplit, urlunsplit
 
 import aiohttp
 import structlog
@@ -56,6 +56,7 @@ from skyvern.constants import (
 from skyvern.errors.errors import BROWSER_DOWNLOAD_PARTIAL_FAILURE_CODE
 from skyvern.exceptions import DownloadFileMaxSizeExceeded, redact_cdp_endpoint_urls
 from skyvern.forge.sdk.api import files as file_api
+from skyvern.forge.sdk.core import skyvern_context
 from skyvern.forge.sdk.core.hashing import diagnostic_fingerprint
 from skyvern.forge.sdk.core.http_request_authorization import (
     RunScopedRedirectHopAuthorizer,
@@ -95,6 +96,70 @@ def _own_detached_task(task: asyncio.Task[None], *, event: str, phase: str | Non
             _DETACHED_DISABLE_TASKS.discard(task)
 
     task.add_done_callback(retrieve)
+
+
+_SIGNED_URL_QUERY_PARAMS = {
+    "signature",
+    "sig",
+    "awsaccesskeyid",
+    "x-amz-algorithm",
+    "x-amz-credential",
+    "x-amz-date",
+    "x-amz-expires",
+    "x-amz-signedheaders",
+    "x-amz-signature",
+    "x-amz-security-token",
+    "x-goog-algorithm",
+    "x-goog-credential",
+    "x-goog-date",
+    "x-goog-expires",
+    "x-goog-signedheaders",
+    "x-goog-signature",
+    "expires",
+}
+_CLOUDFRONT_COMPANION_QUERY_PARAMS = {"policy", "key-pair-id"}
+_AZURE_SAS_QUERY_PARAMS = {
+    "sp",
+    "st",
+    "se",
+    "spr",
+    "sv",
+    "sr",
+    "si",
+    "sip",
+    "srt",
+    "ss",
+    "skoid",
+    "sktid",
+    "skt",
+    "ske",
+    "sks",
+    "skv",
+}
+
+
+def _download_failure_key(filename: str, url: str = "", *, content_digest: str = "") -> str | None:
+    if not filename:
+        return None
+    if url[:7].lower() == "http://" or url[:8].lower() == "https://":
+        parsed = urlsplit(url)
+        query = parse_qsl(parsed.query, keep_blank_values=True)
+        query_names = {name.casefold() for name, _ in query}
+        if query_names & _SIGNED_URL_QUERY_PARAMS:
+            rotating_params = _SIGNED_URL_QUERY_PARAMS
+            if "sig" in query_names:
+                rotating_params = rotating_params | _AZURE_SAS_QUERY_PARAMS
+            if {"signature", "key-pair-id"} <= query_names:
+                rotating_params = rotating_params | _CLOUDFRONT_COMPANION_QUERY_PARAMS
+            # Signed URLs rotate credentials and expiry without changing the file; retain content-bearing params.
+            stable_query = sorted((name, value) for name, value in query if name.casefold() not in rotating_params)
+            url = urlunsplit((parsed.scheme, parsed.netloc, parsed.path, urlencode(stable_query), ""))
+    digest = hashlib.sha256()
+    for component in (filename.casefold(), url, content_digest):
+        for offset in range(0, len(component), 8192):
+            digest.update(component[offset : offset + 8192].encode())
+        digest.update(b"\0")
+    return f"cdp:{digest.hexdigest()}"
 
 
 def _own_detached_disable(task: asyncio.Task[None]) -> None:
@@ -199,6 +264,7 @@ class _DownloadAttempt:
     number: int
     intent: Literal["requested", "unsolicited"]
     request_tokens: tuple[int, ...]
+    failure_key: str | None = None
 
 
 # Resource types that should NEVER be treated as downloads.
@@ -1073,6 +1139,8 @@ class CDPDownloadInterceptor:
         self._active_download_attempts: dict[int, _DownloadAttempt] = {}
         self._browser_download_attempt: _DownloadAttempt | None = None
         self._active_requested_downloads: dict[int, set[str]] = {}
+        self._active_requested_download_key_reasons: dict[int, dict[str, list[str]]] = {}
+        self._active_requested_download_unkeyed_failures: dict[int, set[str]] = {}
         self._unsolicited_download_failures: dict[str, int] = {}
         self._artifact_outcome_recorded = False
 
@@ -1080,26 +1148,39 @@ class CDPDownloadInterceptor:
         self._download_request_counter += 1
         token = self._download_request_counter
         self._active_requested_downloads[token] = set()
+        self._active_requested_download_key_reasons[token] = {}
+        self._active_requested_download_unkeyed_failures[token] = set()
         return token
 
-    def finish_requested_download(self, token: int) -> dict[str, Any] | None:
+    def finish_requested_download(self, token: int, *, include_failure_keys: bool = False) -> dict[str, Any] | None:
         failures = self._active_requested_downloads.pop(token, set())
-        has_in_flight_attempt = any(
-            token in attempt.request_tokens for attempt in self._active_download_attempts.values()
-        )
+        keyed_failures = self._active_requested_download_key_reasons.pop(token, {})
+        unkeyed_failures = self._active_requested_download_unkeyed_failures.pop(token, set())
+        in_flight = [attempt for attempt in self._active_download_attempts.values() if token in attempt.request_tokens]
+        failure_keys = [key for key, reasons in keyed_failures.items() for _ in reasons]
+        failure_keys.extend(attempt.failure_key for attempt in in_flight if attempt.failure_key is not None)
+        has_unkeyed_failure = bool(unkeyed_failures) or any(attempt.failure_key is None for attempt in in_flight)
+        has_in_flight_attempt = bool(in_flight)
         if not failures and not has_in_flight_attempt:
             return None
         if any(reason.endswith("_limit") for reason in failures):
-            return {
+            error: dict[str, Any] = {
                 "error_code": "BROWSER_DOWNLOAD_LIMIT_EXCEEDED",
                 "reasoning": "The requested browser download exceeded the configured limit.",
                 "error_type": "SYSTEM_DEFINED_ERROR",
             }
-        return {
-            "error_code": "BROWSER_DOWNLOAD_FAILED",
-            "reasoning": "The requested browser download could not be saved.",
-            "error_type": "SYSTEM_DEFINED_ERROR",
-        }
+        else:
+            error = {
+                "error_code": "BROWSER_DOWNLOAD_FAILED",
+                "reasoning": "The requested browser download could not be saved.",
+                "error_type": "SYSTEM_DEFINED_ERROR",
+            }
+        if include_failure_keys:
+            if failure_keys:
+                error["_failure_keys"] = sorted(failure_keys)
+            if has_unkeyed_failure:
+                error["_has_unkeyed_failure"] = True
+        return error
 
     def consume_unsolicited_download_error(self) -> dict[str, Any] | None:
         # States only what this call observed: whether the run ends up with a file is unknown here,
@@ -1131,34 +1212,40 @@ class CDPDownloadInterceptor:
         registered_file_count: int,
         outcome: Literal["registered", "partial", "failed", "unknown"],
         error: str | None = None,
-    ) -> None:
-        if self._artifact_outcome_recorded:
-            return
-        self._artifact_outcome_recorded = True
-        if outcome == "registered" and registered_file_count < self._captured_download_count:
+        captured_file_count: int | None = None,
+    ) -> tuple[Literal["registered", "partial", "failed", "unknown"], str | None]:
+        captured_file_count = self._captured_download_count if captured_file_count is None else captured_file_count
+        if outcome == "registered" and registered_file_count < captured_file_count:
             outcome = "partial"
             error = error or "artifact_count_mismatch"
+        if self._artifact_outcome_recorded:
+            return outcome, error
+        self._artifact_outcome_recorded = True
         LOG.info(
             "browser.download_artifact_outcome",
             run_id=self.download_scope,
             browser_session_id=self._telemetry_browser_session_id,
             provider=self._telemetry_provider,
             attempt_counter=self._download_attempt_counter,
-            captured_file_count=self._captured_download_count,
+            captured_file_count=captured_file_count,
             registered_file_count=registered_file_count,
             artifact_outcome=outcome,
             error=error,
             run_file_count=self._run_download_file_count,
             run_download_bytes=self._run_download_bytes,
         )
+        return outcome, error
 
-    def _new_download_attempt(self, content_length: int | None = None) -> _DownloadAttempt | None:
+    def _new_download_attempt(
+        self, content_length: int | None = None, *, failure_key: str | None = None
+    ) -> _DownloadAttempt | None:
         self._download_attempt_counter += 1
         request_tokens = tuple(self._active_requested_downloads)
         attempt = _DownloadAttempt(
             number=self._download_attempt_counter,
             intent="requested" if request_tokens else "unsolicited",
             request_tokens=request_tokens,
+            failure_key=failure_key,
         )
         if self._run_download_file_count >= MAX_DOWNLOAD_FILES_PER_RUN:
             self._record_download_failure(attempt, "file_count_limit", reserved=False)
@@ -1204,7 +1291,31 @@ class CDPDownloadInterceptor:
             return
         del self._active_download_attempts[attempt.number]
         self._captured_download_count += 1
+        self._resolve_download_failure(attempt)
         self._log_download_attempt(attempt, capture_outcome="saved", artifact_outcome="pending", error=None)
+
+    def _resolve_download_failure(self, attempt: _DownloadAttempt) -> None:
+        if attempt.intent != "requested" or attempt.failure_key is None:
+            return
+        resolved_active_failure = False
+        for token in attempt.request_tokens:
+            keyed_failures = self._active_requested_download_key_reasons.get(token)
+            if keyed_failures is None:
+                continue
+            reasons = keyed_failures.get(attempt.failure_key)
+            if reasons and not resolved_active_failure:
+                reasons.pop()
+                resolved_active_failure = True
+                if not reasons:
+                    keyed_failures.pop(attempt.failure_key, None)
+            failures = self._active_requested_downloads.get(token)
+            if failures is not None:
+                failures.clear()
+                failures.update(self._active_requested_download_unkeyed_failures.get(token, set()))
+                failures.update(reason for reasons in keyed_failures.values() for reason in reasons)
+        context = skyvern_context.current()
+        if not resolved_active_failure and context is not None and context.task_id:
+            context.resolve_download_failure(context.task_id, attempt.failure_key)
 
     def _release_download_file_slot(self, attempt: _DownloadAttempt) -> bool:
         if self._active_download_attempts.get(attempt.number) is not attempt:
@@ -1254,7 +1365,8 @@ class CDPDownloadInterceptor:
 
     def _discard_duplicate_download(self, attempt: _DownloadAttempt) -> None:
         """Release the duplicate's file slot with no capture failure; its bytes stay charged to the run budget so identical replays still hit MAX_RUN_DOWNLOAD_BYTES."""
-        self._release_download_file_slot(attempt)
+        if self._release_download_file_slot(attempt):
+            self._resolve_download_failure(attempt)
 
     def publish_download_bytes(
         self,
@@ -1263,7 +1375,10 @@ class CDPDownloadInterceptor:
         content_type: str = "",
     ) -> Path | None:
         """Admit and atomically publish bytes captured outside the CDP response handlers."""
-        attempt = self._new_download_attempt(len(data))
+        attempt = self._new_download_attempt(
+            len(data),
+            failure_key=_download_failure_key(suggested_filename, content_digest=hashlib.sha256(data).hexdigest()),
+        )
         if attempt is None:
             return None
         if self._output_dir is None or not self._reserve_download_bytes(attempt, len(data)):
@@ -1296,6 +1411,12 @@ class CDPDownloadInterceptor:
                 failures = self._active_requested_downloads.get(token)
                 if failures is not None:
                     failures.add(reason)
+                    if attempt.failure_key is None:
+                        self._active_requested_download_unkeyed_failures.setdefault(token, set()).add(reason)
+                    else:
+                        self._active_requested_download_key_reasons.setdefault(token, {}).setdefault(
+                            attempt.failure_key, []
+                        ).append(reason)
         else:
             self._unsolicited_download_failures[reason] = self._unsolicited_download_failures.get(reason, 0) + 1
             self._unsolicited_download_failure_totals[reason] = (
@@ -1946,7 +2067,7 @@ class CDPDownloadInterceptor:
                 LOG.debug("URL already captured via Fetch, skipping direct download")
                 return
 
-            attempt = self._new_download_attempt()
+            attempt = self._new_download_attempt(failure_key=_download_failure_key(suggested_filename, url))
             if attempt is None:
                 return
             self._browser_download_attempt = attempt
@@ -1999,7 +2120,7 @@ class CDPDownloadInterceptor:
     ) -> bool:
         attempt = self._browser_download_attempt
         if attempt is None:
-            attempt = self._new_download_attempt()
+            attempt = self._new_download_attempt(failure_key=_download_failure_key(suggested_filename, url))
             if attempt is None:
                 return False
         if not self._output_dir:
@@ -2241,7 +2362,7 @@ class CDPDownloadInterceptor:
             candidate_epoch = self._current_candidate_epoch()
         attempt = self._browser_download_attempt
         if attempt is None:
-            attempt = self._new_download_attempt()
+            attempt = self._new_download_attempt(failure_key=_download_failure_key(suggested_filename, url))
             if attempt is None:
                 return
         if not self._output_dir:
@@ -2511,7 +2632,7 @@ class CDPDownloadInterceptor:
         """
         attempt = self._browser_download_attempt
         if attempt is None:
-            attempt = self._new_download_attempt()
+            attempt = self._new_download_attempt(failure_key=_download_failure_key(suggested_filename, url))
             if attempt is None:
                 return
         if not self._output_dir or self._browser_context is None:
@@ -3053,7 +3174,8 @@ class CDPDownloadInterceptor:
         # Mark before any cap fast-fail so Browser.downloadWillBegin cannot race to re-fetch the same body.
         self._downloaded_urls.add(url)
         content_length = _parse_content_length(headers)
-        attempt = self._new_download_attempt(content_length)
+        raw_filename = extract_filename(headers, url)
+        attempt = self._new_download_attempt(content_length, failure_key=_download_failure_key(raw_filename, url))
         if attempt is None:
             await self._fail_request(cdp_session, request_id, url=url)
             return
@@ -3064,7 +3186,6 @@ class CDPDownloadInterceptor:
             return
 
         content_type = _normalized_content_type(headers.get("content-type", ""))
-        raw_filename = extract_filename(headers, url)
         try:
             save_path, filename = self._resolve_save_path(raw_filename, content_type)
         except (OSError, ValueError) as error:
@@ -3545,7 +3666,19 @@ def finish_requested_download_for_context(
     if browser_context is None or token is None:
         return None
     interceptor = getattr(browser_context, "_skyvern_cdp_download_interceptor", None)
-    return interceptor.finish_requested_download(token) if isinstance(interceptor, CDPDownloadInterceptor) else None
+    if not isinstance(interceptor, CDPDownloadInterceptor):
+        return None
+    error = interceptor.finish_requested_download(token, include_failure_keys=True)
+    context = skyvern_context.current()
+    if error is not None:
+        failure_keys = error.pop("_failure_keys", [])
+        has_unkeyed_failure = error.pop("_has_unkeyed_failure", False)
+        if context is not None and context.task_id:
+            for failure_key in failure_keys:
+                context.record_download_failure(context.task_id, error["reasoning"], failure_key)
+            if not failure_keys or has_unkeyed_failure:
+                context.record_download_failure(context.task_id, error["reasoning"])
+    return error
 
 
 def consume_unsolicited_download_error_for_context(browser_context: BrowserContext | None) -> dict[str, Any] | None:
@@ -3629,16 +3762,19 @@ def record_download_artifact_outcome_for_context(
     registered_file_count: int,
     outcome: Literal["registered", "partial", "failed", "unknown"],
     error: str | None = None,
-) -> None:
+    captured_file_count: int | None = None,
+) -> tuple[Literal["registered", "partial", "failed", "unknown"], str | None] | None:
     interceptor = (
         getattr(browser_context, "_skyvern_cdp_download_interceptor", None) if browser_context is not None else None
     )
     if isinstance(interceptor, CDPDownloadInterceptor):
-        interceptor.record_artifact_outcome(
+        return interceptor.record_artifact_outcome(
             registered_file_count=registered_file_count,
             outcome=outcome,
             error=error,
+            captured_file_count=captured_file_count,
         )
+    return None
 
 
 async def disable_download_interceptor_for_context(browser_context: BrowserContext | None) -> None:
