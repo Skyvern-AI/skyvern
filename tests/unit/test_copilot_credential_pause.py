@@ -2395,7 +2395,7 @@ async def _announce_ask(ctx: CopilotContext) -> None:
 
 async def _invoke_ask_tool(ctx: CopilotContext, login_page_url: str) -> None:
     await tools_module.request_credential_tool.on_invoke_tool(
-        SimpleNamespace(context=ctx, tool_name="request_credential"),  # type: ignore[arg-type]
+        SimpleNamespace(context=ctx, tool_name="request_credential", run_config=None),  # type: ignore[arg-type]
         json.dumps({"login_page_url": login_page_url, "reason": "This site needs a sign-in."}),
     )
 
@@ -2430,7 +2430,9 @@ async def test_a_run_tool_scheduled_ahead_of_the_ask_in_one_response_still_waits
     }[tool_name]
 
     async def run() -> None:
-        await tool.on_invoke_tool(SimpleNamespace(context=ctx, tool_name=tool_name), json.dumps(arguments))  # type: ignore[arg-type]
+        await tool.on_invoke_tool(
+            SimpleNamespace(context=ctx, tool_name=tool_name, run_config=None), json.dumps(arguments)
+        )  # type: ignore[arg-type]
         finished.append("run")
 
     async def ask() -> None:
@@ -2589,7 +2591,7 @@ def _answer_each_card(
 
 async def _call_ask_tool(ctx: CopilotContext, **arguments: object) -> dict[str, Any]:
     raw = await tools_module.request_credential_tool.on_invoke_tool(
-        SimpleNamespace(context=ctx, tool_name="request_credential"),  # type: ignore[arg-type]
+        SimpleNamespace(context=ctx, tool_name="request_credential", run_config=None),  # type: ignore[arg-type]
         json.dumps({"login_page_url": "https://portal.example.com/login", "reason": "Needs 2FA.", **arguments}),
     )
     return json.loads(raw)
@@ -4272,8 +4274,20 @@ async def test_registration_ask_with_a_charset_outside_the_enum_returns_an_error
 ) -> None:
     ctx = _tool_ctx(monkeypatch)
     ctx.client_supports_credential_generation = True
+    arguments = json.dumps(
+        {
+            "login_page_url": "https://portal.example.com/login",
+            "reason": "Needs 2FA.",
+            "registration": {**_REGISTRATION, "charset": "letters_and_spaces"},
+        }
+    )
 
-    result = await _call_ask_tool(ctx, registration={**_REGISTRATION, "charset": "letters_and_spaces"})
+    result = json.loads(
+        await tools_module.request_credential_tool.on_invoke_tool(
+            ToolContext(context=ctx, tool_name="request_credential", tool_call_id="call-ask", tool_arguments=arguments),
+            arguments,
+        )
+    )
 
     assert result["ok"] is False
     assert "registration.charset" in result["error"]

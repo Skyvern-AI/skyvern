@@ -2,14 +2,27 @@
 
 from __future__ import annotations
 
+import base64
+import copy
 import hashlib
 import json
+import random
+from collections.abc import AsyncIterator
 from pathlib import Path
 from types import SimpleNamespace
-from typing import Any
+from typing import Any, cast
 
 import pytest
+from agents import Agent, RunConfig, Runner, function_tool
+from agents.items import ReasoningItem
 from agents.run_config import ModelInputData
+from openai.types.chat import ChatCompletionChunk
+from openai.types.chat.chat_completion_chunk import Choice as ChunkChoice
+from openai.types.chat.chat_completion_chunk import (
+    ChoiceDelta,
+    ChoiceDeltaToolCall,
+    ChoiceDeltaToolCallFunction,
+)
 from structlog.testing import capture_logs
 
 from skyvern.forge.sdk.copilot.ask_user import (
@@ -21,6 +34,7 @@ from skyvern.forge.sdk.copilot.ask_user import (
 )
 from skyvern.forge.sdk.copilot.config import SCREENSHOT_DROPPED_NUDGE, BlockAuthoringPolicy
 from skyvern.forge.sdk.copilot.enforcement import NUDGE_SENTINEL, estimate_tokens, pending_screenshot_message
+from skyvern.forge.sdk.copilot.model_resolver import CopilotLitellmProvider
 from skyvern.forge.sdk.copilot.screenshot_utils import (
     ScreenshotActionRelation,
     ScreenshotEntry,
@@ -105,7 +119,7 @@ class TestFirstTurnCompaction:
                         "call_id": f"call-{i}",
                         "output": json.dumps({"ok": True, "data": {"blob": large_output}}),
                     },
-                    {"type": "reasoning", "summary": []},
+                    {"type": "reasoning", "summary": [{"type": "summary_text", "text": "Read it."}]},
                 )
             ),
         ]
@@ -227,7 +241,7 @@ class TestFirstTurnCompaction:
             {"role": "user", "content": "please build me a workflow"},
             *({"type": "function_call_output", "call_id": f"call-{i}", "output": "x" * 5000} for i in range(3)),
             {"type": "function_call_output", "call_id": "call-small", "output": "ok"},
-            {"type": "reasoning", "summary": []},
+            {"type": "reasoning", "summary": [{"type": "summary_text", "text": "Read it."}]},
         ]
         tight_filter = make_copilot_call_model_input_filter(token_budget=200)
         with structlog.testing.capture_logs() as logs:
@@ -826,3 +840,61 @@ class TestStagedScreenshotBinding:
         ]
         assert len(notices) == 1
         assert notices[0].startswith("[copilot:nudge] ")
+
+
+@pytest.mark.asyncio
+async def test_signature_only_claude_thinking_does_not_use_up_the_model_input_budget(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    page_text = "page text " * 1500
+    signature = base64.b64encode(random.Random(0).randbytes(30_000)).decode()
+    requests: list[list[dict[str, Any]]] = []
+
+    def chunk(delta: ChoiceDelta, finish_reason: str | None = None) -> ChatCompletionChunk:
+        return ChatCompletionChunk(
+            id="chatcmpl-thinking",
+            created=0,
+            model="claude-sonnet-5-5",
+            object="chat.completion.chunk",
+            choices=[ChunkChoice(index=0, delta=delta, finish_reason=finish_reason)],
+        )
+
+    async def reply(first: bool) -> AsyncIterator[ChatCompletionChunk]:
+        yield chunk(ChoiceDelta(thinking_blocks=[{"type": "thinking", "thinking": "", "signature": signature}]))
+        if first:
+            call = ChoiceDeltaToolCall(
+                index=0,
+                id="toolu_read",
+                type="function",
+                function=ChoiceDeltaToolCallFunction(name="read_page", arguments="{}"),
+            )
+            yield chunk(ChoiceDelta(tool_calls=[call]))
+            yield chunk(ChoiceDelta(), "tool_calls")
+        else:
+            yield chunk(ChoiceDelta(content="done"))
+            yield chunk(ChoiceDelta(), "stop")
+
+    async def fake_acompletion(**kwargs: object) -> AsyncIterator[ChatCompletionChunk]:
+        requests.append(copy.deepcopy(cast(list[dict[str, Any]], kwargs["messages"])))
+        return reply(first=len(requests) == 1)
+
+    @function_tool
+    def read_page() -> str:
+        return page_text
+
+    monkeypatch.setattr("litellm.acompletion", fake_acompletion)
+    agent = Agent(name="workflow-copilot", model="anthropic/claude-sonnet-5-5", tools=[read_page])
+    run_config = RunConfig(
+        model_provider=CopilotLitellmProvider(),
+        tracing_disabled=True,
+        call_model_input_filter=make_copilot_call_model_input_filter(estimate_tokens([page_text]) + 2_000),
+    )
+
+    result = Runner.run_streamed(agent, input="Read the page.", run_config=run_config)
+    async for _ in result.stream_events():
+        pass
+
+    assert any(isinstance(item, ReasoningItem) for item in result.new_items)
+    second_request = json.dumps(requests[1])
+    assert json.dumps(page_text) in second_request
+    assert signature not in second_request

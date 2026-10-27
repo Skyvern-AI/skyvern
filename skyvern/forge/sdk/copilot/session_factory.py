@@ -10,6 +10,7 @@ from pathlib import Path
 from typing import Any
 
 import structlog
+from agents.items import TResponseInputItem
 from agents.memory.sqlite_session import SQLiteSession
 from agents.run_config import CallModelData, ModelInputData
 from agents.run_context import RunContextWrapper
@@ -223,9 +224,17 @@ def _run_context(data: CallModelData[Any]) -> Any:
     return data.context.context if isinstance(data.context, RunContextWrapper) else data.context
 
 
+def _is_unsent_reasoning(item: TResponseInputItem) -> bool:
+    # Copilot never sets ModelSettings.reasoning, so a reasoning item reaches the request only as replayed summary
+    # text; a signature-only one (Claude's default thinking display) sends nothing and must not use up the budget.
+    if get_agent_message_field(item, "type") != "reasoning":
+        return False
+    return not any(get_agent_message_field(part, "text") for part in get_agent_message_field(item, "summary") or [])
+
+
 def _copilot_call_model_input_filter(data: CallModelData[Any], *, token_budget: int) -> ModelInputData:
     # Compacted up front so the sharp-copy budget check below sees the input the budget filter will.
-    items = _compact_tool_items(list(data.model_data.input))
+    items = _compact_tool_items([item for item in data.model_data.input if not _is_unsent_reasoning(item)])
     ctx = _run_context(data)
     # Read-only peek: the end-of-turn drain in enforcement stays the only clear, so a provider
     # retry or model fallback re-running this filter still carries the frame.
