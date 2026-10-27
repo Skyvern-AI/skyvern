@@ -158,6 +158,7 @@ from skyvern.forge.sdk.core.skyvern_context import (
     ExternalOTPUse,
     MultiFieldTotpAttempt,
     MultiFieldTotpRejection,
+    RunArm,
     SkyvernContext,
     UnconsumedOTPCode,
     action_for_multi_field_totp_persistence,
@@ -192,6 +193,7 @@ from skyvern.forge.sdk.schemas.persistent_browser_sessions import (
 from skyvern.forge.sdk.schemas.tasks import Task, TaskRequest, TaskResponse, TaskStatus
 from skyvern.forge.sdk.schemas.totp_codes import OTPType
 from skyvern.forge.sdk.services.credentials import parse_totp_config
+from skyvern.forge.sdk.services.request_principal import RequestPrincipal
 from skyvern.forge.sdk.submission import shadow as submission_shadow
 from skyvern.forge.sdk.trace import VerificationTrigger, apply_context_attrs, traced, traced_span
 from skyvern.forge.sdk.workflow.context_manager import NON_SECRET_CREDENTIAL_FIELDS, WorkflowRunContext
@@ -234,7 +236,9 @@ from skyvern.forge.taskv3.run_arms import (
     DATE_SEGMENT_AIM_FLAG,
     DEAD_END_RETURN_FLAG,
     LOGIN_PACE_FLAG,
+    TURN_DOM_FLAG,
     resolve_run_arm,
+    run_arm_enabled,
 )
 from skyvern.forge.taskv3.target_label import compose_target_intention
 from skyvern.forge.taskv3.turn_dom import TurnDomCapture
@@ -2854,6 +2858,7 @@ class ForgeAgent:
         ):
             parameters = workflow_run_context.represent_plaintext_secrets_as_placeholders(parameters)
         context = skyvern_context.current()
+        turn_dom_arm: RunArm = "unrandomized"
         if context:
             # Once for the whole run, before anything reads it: the tool list is built from these reads,
             # and a value that could change afterwards would leave it describing a different run than the
@@ -2879,6 +2884,13 @@ class ForgeAgent:
                 distinct_id=task.workflow_run_id or task.task_id,
                 organization_id=task.organization_id,
                 forced=settings.TASK_V3_DEAD_END_RETURN,
+            )
+            turn_dom_arm = await resolve_run_arm(
+                context,
+                TURN_DOM_FLAG,
+                distinct_id=task.workflow_run_id or task.task_id,
+                organization_id=task.organization_id,
+                forced=False,
             )
         page_free_validation = bool(
             task_block is not None
@@ -3402,16 +3414,20 @@ class ForgeAgent:
         # action rows it wrote land on it. `step` keeps the run's status, billing and step-budget unit.
         v3_turn_step: Step | None = None
         v3_turn_step_open = False
-        # Salted so this sample is independent of the pre-submit one, which buckets the same run key.
+        # A randomized arm decides; an unrandomized run (self-hosted, a failed evaluation) falls back to the env
+        # rate, salted so this sample is independent of the pre-submit one, which buckets the same run key.
+        turn_dom_sampled = run_arm_enabled(TURN_DOM_FLAG, forced=False) or (
+            turn_dom_arm == "unrandomized"
+            and is_run_sampled(
+                f"turn_dom:{task.workflow_run_id or task.task_id}", settings.TASK_V3_TURN_DOM_SAMPLE_RATE
+            )
+        )
         turn_dom = (
             TurnDomCapture(
                 functools.partial(_read_page_html, browser_state),
                 app.ARTIFACT_MANAGER.accumulate_html_scrape_to_archive,
             )
-            if not page_free_validation
-            and is_run_sampled(
-                f"turn_dom:{task.workflow_run_id or task.task_id}", settings.TASK_V3_TURN_DOM_SAMPLE_RATE
-            )
+            if not page_free_validation and turn_dom_sampled
             else None
         )
 
@@ -10599,6 +10615,40 @@ class ForgeAgent:
         errors: list[dict[str, Any]] | None = None,
         failure_category: list[dict[str, Any]] | None = None,
     ) -> Task:
+        updated_task, _ = await self._update_task_and_return_transition(
+            task,
+            status,
+            extracted_information=extracted_information,
+            failure_reason=failure_reason,
+            webhook_failure_reason=webhook_failure_reason,
+            errors=errors,
+            failure_category=failure_category,
+        )
+        return updated_task
+
+    async def update_task_for_cancel(
+        self,
+        task: Task,
+        audit_actor: RequestPrincipal | None = None,
+        on_transition: Callable[[], Awaitable[None]] | None = None,
+    ) -> tuple[Task, bool]:
+        return await self._update_task_and_return_transition(
+            task, TaskStatus.canceled, audit_actor=audit_actor, on_transition=on_transition
+        )
+
+    async def _update_task_and_return_transition(
+        self,
+        task: Task,
+        status: TaskStatus,
+        extracted_information: dict[str, Any] | list | str | None = None,
+        failure_reason: str | None = None,
+        webhook_failure_reason: str | None = None,
+        errors: list[dict[str, Any]] | None = None,
+        failure_category: list[dict[str, Any]] | None = None,
+        *,
+        audit_actor: RequestPrincipal | None = None,
+        on_transition: Callable[[], Awaitable[None]] | None = None,
+    ) -> tuple[Task, bool]:
         # refresh task from db to get the latest status
         task_from_db = await app.DATABASE.tasks.get_task(task_id=task.task_id, organization_id=task.organization_id)
         if task_from_db:
@@ -10667,16 +10717,32 @@ class ForgeAgent:
         registered_run_id = task.workflow_run_id or task.task_id
         lease_lost = await run_lease_lost(registered_run_id)
         if lease_lost and not status.is_final():
-            return await app.DATABASE.tasks.get_task(task_id=task.task_id, organization_id=task.organization_id) or task
-        updated_task, finish_claimed = await app.DATABASE.tasks.update_task_and_claim_finish(
-            task.task_id,
-            organization_id=task.organization_id,
-            keep_final_status=lease_lost,
-            **updates,
-        )
+            latest_task = await app.DATABASE.tasks.get_task(task_id=task.task_id, organization_id=task.organization_id)
+            return latest_task or task, False
+        if status == TaskStatus.canceled:
+            completion = asyncio.create_task(
+                app.DATABASE.tasks.update_task_and_claim_finish_for_cancel(
+                    task.task_id, organization_id=task.organization_id, audit_actor=audit_actor
+                )
+            )
+            try:
+                updated_task, finish_claimed, status_changed = await asyncio.shield(completion)
+            except CancelledError:
+                await asyncio.shield(completion)
+                raise
+            if status_changed and on_transition is not None:
+                await on_transition()
+        else:
+            updated_task, finish_claimed = await app.DATABASE.tasks.update_task_and_claim_finish(
+                task.task_id,
+                organization_id=task.organization_id,
+                keep_final_status=lease_lost,
+                **updates,
+            )
+            status_changed = False
         if lease_lost and updated_task.status != status:
             note_run_finalized(task.task_id)
-            return updated_task
+            return updated_task, status_changed
         if status.is_final():
             note_run_finalized(task.task_id)
         # Minutes emit only when THIS write atomically flipped finished_at from NULL
@@ -10711,7 +10777,7 @@ class ForgeAgent:
                     task_id=updated_task.task_id,
                     status=updated_task.status,
                 )
-        return updated_task
+        return updated_task, status_changed
 
     async def _maybe_retry_multi_field_totp_after_rejection(
         self,

@@ -901,7 +901,19 @@ async def cancel_run(
 ) -> None:
     analytics.capture("skyvern-oss-agent-cancel-run")
 
-    await run_service.cancel_run(run_id, organization_id=current_org.organization_id, api_key=x_api_key)
+    completion = asyncio.create_task(
+        run_service.cancel_run(
+            run_id,
+            organization_id=current_org.organization_id,
+            api_key=x_api_key,
+            audit_actor=get_request_principal(),
+        )
+    )
+    try:
+        await asyncio.shield(completion)
+    except asyncio.CancelledError:
+        await asyncio.shield(completion)
+        raise
 
 
 @base_router.post(
@@ -932,9 +944,21 @@ async def bulk_cancel_runs(
         get_request_principal(), "workflow_run.cancel", data.run_ids
     )
 
-    return await run_service.bulk_cancel_runs(
-        data.run_ids, organization_id=current_org.organization_id, api_key=x_api_key
-    )
+    async def _cancel_runs() -> BulkCancelRunsResponse:
+        result, _ = await run_service.bulk_cancel_runs_with_types(
+            data.run_ids,
+            organization_id=current_org.organization_id,
+            api_key=x_api_key,
+            audit_actor=get_request_principal(),
+        )
+        return result
+
+    completion = asyncio.create_task(_cancel_runs())
+    try:
+        return await asyncio.shield(completion)
+    except asyncio.CancelledError:
+        await asyncio.shield(completion)
+        raise
 
 
 @legacy_base_router.post(
@@ -4373,12 +4397,26 @@ async def cancel_task(
             status_code=http_status.HTTP_404_NOT_FOUND,
             detail=f"Task not found {task_id}",
         )
-    task = await app.agent.update_task(task_obj, status=TaskStatus.canceled)
-    # retry the webhook
-    await app.agent.execute_task_webhook(task=task, api_key=x_api_key)
+
+    async def _cancel_task() -> None:
+        task, _ = await app.agent.update_task_for_cancel(task_obj, audit_actor=get_request_principal())
+        # Retry the webhook after the status transition has been audited.
+        await app.agent.execute_task_webhook(task=task, api_key=x_api_key)
+
+    completion = asyncio.create_task(_cancel_task())
+    try:
+        await asyncio.shield(completion)
+    except asyncio.CancelledError:
+        await asyncio.shield(completion)
+        raise
 
 
-async def _cancel_workflow_run(workflow_run_id: str, organization_id: str, x_api_key: str | None = None) -> None:
+async def _cancel_workflow_run(
+    workflow_run_id: str,
+    organization_id: str,
+    x_api_key: str | None = None,
+    audit_actor: RequestPrincipal | None = None,
+) -> None:
     workflow_run = await app.DATABASE.workflow_runs.get_workflow_run(
         workflow_run_id=workflow_run_id,
         organization_id=organization_id,
@@ -4403,11 +4441,19 @@ async def _cancel_workflow_run(workflow_run_id: str, organization_id: str, x_api
             expected_runnable_id=workflow_run.workflow_run_id,
         )
 
-    await run_service.cancel_workflow_run(
-        workflow_run_id,
-        organization_id=organization_id,
-        api_key=x_api_key,
+    completion = asyncio.create_task(
+        run_service.cancel_workflow_run(
+            workflow_run_id,
+            organization_id=organization_id,
+            api_key=x_api_key,
+            audit_actor=audit_actor,
+        )
     )
+    try:
+        await asyncio.shield(completion)
+    except asyncio.CancelledError:
+        await asyncio.shield(completion)
+        raise
 
 
 async def _continue_workflow_run(workflow_run_id: str, organization_id: str) -> None:
@@ -4659,7 +4705,9 @@ async def cancel_workflow_run(
     current_org: Organization = Depends(org_auth_service.get_current_org),
     x_api_key: Annotated[str | None, Header()] = None,
 ) -> None:
-    await _cancel_workflow_run(workflow_run_id, current_org.organization_id, x_api_key)
+    await _cancel_workflow_run(
+        workflow_run_id, current_org.organization_id, x_api_key, audit_actor=get_request_principal()
+    )
 
 
 @base_router.post(
@@ -4688,7 +4736,9 @@ async def cancel_persistent_browser_session_workflow_run(
     current_org: Organization = Depends(org_auth_service.get_current_org),
     x_api_key: Annotated[str | None, Header()] = None,
 ) -> None:
-    await _cancel_workflow_run(workflow_run_id, current_org.organization_id, x_api_key)
+    await _cancel_workflow_run(
+        workflow_run_id, current_org.organization_id, x_api_key, audit_actor=get_request_principal()
+    )
 
 
 @legacy_base_router.post(
@@ -4930,6 +4980,10 @@ async def _parse_and_gate_tag_filter_terms(
 _RUNS_LIST_TIMEOUT_RETRY_AFTER_SECONDS = 15
 _RUNS_LIST_SEARCH_TIMEOUT_DETAIL = (
     "Free-text run search exceeded its time limit. Try an exact browser profile or session ID, or a complete run ID."
+)
+_WORKFLOW_RUNS_SEARCH_MAX_RESULT_WINDOW_DETAIL = (
+    f"Unindexed free-text workflow-run searches are limited to the first {MAX_SEARCH_FETCH_LIMIT:,} results. "
+    "Split the search into narrower created_at windows or use a complete run/task ID."
 )
 _WORKFLOW_RUNS_SEARCH_TIMEOUT_DETAIL = (
     "Free-text run search exceeded its time limit. Retry with a created_at_start/created_at_end "
@@ -5563,6 +5617,8 @@ _WORKFLOW_RUNS_BY_ID_DESCRIPTION = (
     "List runs for a specific workflow.\n\n"
     "Supports filtering by **status**, **search_key**, and **error_code**. "
     "All filters are combined with **AND** logic.\n\n"
+    f"Unindexed free-text searches can paginate only through the first {MAX_SEARCH_FETCH_LIMIT:,} matching runs. "
+    "Split larger exports into narrower `created_at_start`/`created_at_end` windows or use a complete run/task ID.\n\n"
     "### search_key\n\n" + _WORKFLOW_RUN_SEARCH_KEY_DESCRIPTION + "\n\n"
     "### error_code\n\n"
     "Exact-match filter on the `error_code` field inside each task's `errors` JSON array. "
@@ -5593,6 +5649,17 @@ async def _get_workflow_runs_by_id(
     run_tags: Sequence[tuple[str | None, str | None]] | None = None,
 ) -> list[WorkflowRun]:
     analytics.capture("skyvern-oss-agent-workflow-runs-get")
+    if (
+        search_key
+        and not is_indexed_runs_list_search_key(search_key)
+        # Check the page end, not just its offset, so a large page_size cannot bypass the cap.
+        and (page - 1) * page_size + page_size > MAX_SEARCH_FETCH_LIMIT
+    ):
+        raise HTTPException(
+            status_code=http_status.HTTP_400_BAD_REQUEST,
+            detail=_WORKFLOW_RUNS_SEARCH_MAX_RESULT_WINDOW_DETAIL,
+        )
+
     try:
         return await app.WORKFLOW_SERVICE.get_workflow_runs_for_workflow_permanent_id(
             workflow_permanent_id=workflow_id,

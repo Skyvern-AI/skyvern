@@ -46,7 +46,7 @@ from skyvern.forge.sdk.db.enums import TaskType, WorkflowRunTriggerType
 from skyvern.forge.sdk.db.exceptions import NotFoundError
 from skyvern.forge.sdk.db.utils import hydrate_action
 from skyvern.forge.sdk.experimentation.billing_tier import BillingTier
-from skyvern.forge.sdk.experimentation.providers import BaseExperimentationProvider
+from skyvern.forge.sdk.experimentation.providers import BaseExperimentationProvider, NoOpExperimentationProvider
 from skyvern.forge.sdk.experimentation.workflow_block_engine import DISABLE_TASK_V3_FLAG
 from skyvern.forge.sdk.models import TASK_V3_TURN_STEP_CREATED_BY, Step, StepStatus
 from skyvern.forge.sdk.schemas.tasks import Task, TaskStatus
@@ -104,6 +104,7 @@ from skyvern.forge.taskv3.run_arms import (
     DATE_SEGMENT_AIM_FLAG,
     DEAD_END_RETURN_FLAG,
     LOGIN_PACE_FLAG,
+    TURN_DOM_FLAG,
     run_arm_enabled,
 )
 from skyvern.forge.taskv3.tools import NO_ONE_TIME_CODE_SOURCE, PageProvider, _record_frame_work
@@ -4949,6 +4950,87 @@ async def test_a_sampled_v3_block_saves_each_turns_page_on_that_turn_and_flushes
         ]
     else:
         assert (saved, flushed, page_doms) == ([], [], [None, None])
+
+
+async def _run_with_turn_dom_probe(
+    monkeypatch: pytest.MonkeyPatch, workflow_run_id: str, rate: float, **overrides: Any
+) -> tuple[bool, Any]:
+    created: list[bool] = []
+    _step, _task, loop_mock, _post = await _run_execute_task_v3(
+        monkeypatch,
+        LoopOutcome(status="completed", reason="done", billable_actions=[]),
+        on_loop=lambda kwargs: created.append(kwargs.get("turn_dom") is not None),
+        turn_dom_rate=rate,
+        workflow_run_id=workflow_run_id,
+        data_extraction_goal=None,
+        extracted_information_schema=None,
+        **overrides,
+    )
+    [was_created] = created
+    return was_created, loop_mock
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("variant", "arm", "rate", "workflow_run_id", "sampled"),
+    [
+        ("treatment", "treatment", 0.0, "wr_turn_dom_0", True),
+        ("control", "control", 1.0, "wr_turn_dom_3", False),
+        # Unrandomized keeps the env rate's hash bucket: wr_turn_dom_3 falls inside 0.25, wr_turn_dom_0 does not.
+        (None, "unrandomized", 0.0, "wr_turn_dom_3", False),
+        (None, "unrandomized", 0.25, "wr_turn_dom_3", True),
+        (None, "unrandomized", 0.25, "wr_turn_dom_0", False),
+        (None, "unrandomized", 1.0, "wr_turn_dom_0", True),
+    ],
+)
+async def test_execute_task_v3_turn_dom_arm_decides_the_sample_and_unrandomized_keeps_the_env_rate(
+    monkeypatch: pytest.MonkeyPatch, variant: str | None, arm: str, rate: float, workflow_run_id: str, sampled: bool
+) -> None:
+    provider = AsyncMock(side_effect=lambda flag, *_a, **_k: variant if flag == TURN_DOM_FLAG else None)
+    monkeypatch.setattr(app.EXPERIMENTATION_PROVIDER, "get_value_cached", provider)
+
+    created, loop_mock = await _run_with_turn_dom_probe(monkeypatch, workflow_run_id, rate)
+
+    assert created is sampled
+    assert loop_mock.context.run_arms[TURN_DOM_FLAG] == (workflow_run_id, arm)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("provider_kind", ["noop", "raises"])
+@pytest.mark.parametrize("rate", [0.0, 1.0])
+async def test_execute_task_v3_turn_dom_without_a_usable_provider_samples_by_the_env_rate(
+    monkeypatch: pytest.MonkeyPatch, provider_kind: str, rate: float
+) -> None:
+    if provider_kind == "noop":
+        monkeypatch.setattr(app, "EXPERIMENTATION_PROVIDER", NoOpExperimentationProvider())
+    else:
+        monkeypatch.setattr(
+            app.EXPERIMENTATION_PROVIDER, "get_value_cached", AsyncMock(side_effect=RuntimeError("posthog down"))
+        )
+
+    created, loop_mock = await _run_with_turn_dom_probe(monkeypatch, "wr_turn_dom_fallback", rate)
+
+    assert created is (rate == 1.0)
+    assert loop_mock.context.run_arms[TURN_DOM_FLAG] == ("wr_turn_dom_fallback", "unrandomized")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("variant", ["treatment", "control", None])
+async def test_execute_task_v3_page_free_validation_captures_no_turn_dom_in_any_arm(
+    monkeypatch: pytest.MonkeyPatch, variant: str | None
+) -> None:
+    monkeypatch.setattr(app.EXPERIMENTATION_PROVIDER, "get_value_cached", AsyncMock(return_value=variant))
+
+    created, _loop_mock = await _run_with_turn_dom_probe(
+        monkeypatch,
+        "wr_turn_dom_page_free",
+        1.0,
+        task_block=_make_block(ValidationBlock, complete_criterion="The data is consistent"),
+        validation_without_page_information=True,
+        task_type=TaskType.validation,
+    )
+
+    assert created is False
 
 
 @pytest.mark.asyncio

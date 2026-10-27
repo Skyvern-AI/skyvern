@@ -487,6 +487,30 @@ async def test_get_workflow_runs_by_id_child_filter_depends_on_route(
 
 
 @pytest.mark.asyncio
+async def test_get_workflow_runs_by_id_rejects_unindexed_search_beyond_result_window(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    mock_service = SimpleNamespace(
+        get_workflow_runs_for_workflow_permanent_id=AsyncMock(return_value=[]),
+    )
+    monkeypatch.setattr(agent_protocol.app, "WORKFLOW_SERVICE", mock_service)
+    monkeypatch.setattr(agent_protocol.analytics, "capture", lambda *args, **kwargs: None)
+
+    with pytest.raises(HTTPException) as exc_info:
+        await agent_protocol.get_workflow_runs_by_id(
+            workflow_id="wpid_123",
+            page=11,
+            page_size=100,
+            search_key="free-text-term",
+            current_org=SimpleNamespace(organization_id="org_123"),
+        )
+
+    assert exc_info.value.status_code == 400
+    assert "first 1,000 results" in exc_info.value.detail
+    mock_service.get_workflow_runs_for_workflow_permanent_id.assert_not_awaited()
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize(
     ("indexed_search", "expected_status", "expected_detail_fragment"),
     [

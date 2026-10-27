@@ -672,7 +672,9 @@ async def test_create_task_leaves_started_at_unset_for_other_statuses(monkeypatc
 
 
 @pytest.mark.asyncio
-async def test_task_finish_claim_is_exactly_once_across_racing_finalizers(sqlite_engine: AsyncEngine):
+async def test_task_finish_claim_is_exactly_once_across_racing_finalizers(
+    sqlite_engine: AsyncEngine, monkeypatch: pytest.MonkeyPatch
+):
     """Two finalizers landing on one task must produce exactly one finish claim.
 
     The arbitration is the finished_at NULL->set flip: bulk_update_tasks' status
@@ -685,9 +687,14 @@ async def test_task_finish_claim_is_exactly_once_across_racing_finalizers(sqlite
     """
     factory = async_sessionmaker(sqlite_engine, expire_on_commit=False)
     repo = TasksRepository(session_factory=factory, debug_enabled=False)
+    from skyvern.forge.sdk.db.repositories import tasks as tasks_repository
+
+    audit_actor = SimpleNamespace()
+    record_cancel_audit = AsyncMock()
+    monkeypatch.setattr(tasks_repository, "record_run_cancel_audit", record_cancel_audit)
     started = datetime.now(timezone.utc).replace(tzinfo=None)
 
-    async def _seed(task_id: str) -> None:
+    async def _seed(task_id: str, finished_at: datetime | None = None) -> None:
         async with factory() as session:
             session.add(
                 TaskModel(
@@ -696,6 +703,7 @@ async def test_task_finish_claim_is_exactly_once_across_racing_finalizers(sqlite
                     status=TaskStatus.running.value,
                     url="https://example.test/",
                     started_at=started,
+                    finished_at=finished_at,
                     errors=[],
                 )
             )
@@ -734,8 +742,117 @@ async def test_task_finish_claim_is_exactly_once_across_racing_finalizers(sqlite
     )
     assert (first, second) == (True, False)
 
+    await _seed("tsk_cancel_race")
+    await repo.update_task_and_claim_finish("tsk_cancel_race", status=TaskStatus.completed, organization_id="o_race")
+    canceled, finish_claimed, status_changed = await repo.update_task_and_claim_finish_for_cancel(
+        "tsk_cancel_race", organization_id="o_race", audit_actor=audit_actor
+    )
+    assert canceled.status == TaskStatus.completed
+    assert finish_claimed is False
+    assert status_changed is False
+
+    await _seed("tsk_cancel_transition", finished_at=started)
+    canceled, finish_claimed, status_changed = await repo.update_task_and_claim_finish_for_cancel(
+        "tsk_cancel_transition", organization_id="o_race", audit_actor=audit_actor
+    )
+    assert canceled.status == TaskStatus.canceled
+    assert finish_claimed is False
+    assert status_changed is True
+    record_cancel_audit.assert_awaited_once_with(audit_actor, "o_race", "task", "tsk_cancel_transition")
+
     for background_sync in list(repo._background_tasks):
         await background_sync
+
+
+@pytest.mark.asyncio
+async def test_task_v2_cancel_repository_audits_only_a_winning_transition(monkeypatch: pytest.MonkeyPatch) -> None:
+    from skyvern.forge.sdk.db.repositories import observer as observer_repository
+    from skyvern.forge.sdk.db.repositories.observer import ObserverRepository
+    from skyvern.forge.sdk.schemas.task_v2 import TaskV2Status
+
+    events: list[str] = []
+    results = ["tsk_v2_cancel", None]
+
+    class Session:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_: object) -> bool:
+            return False
+
+        async def execute(self, _: object):
+            value = results.pop(0)
+            return SimpleNamespace(scalar_one_or_none=lambda: value)
+
+        async def commit(self) -> None:
+            events.append("commit")
+
+    actor = SimpleNamespace()
+
+    async def record_audit(*_: object) -> None:
+        events.append("audit")
+
+    monkeypatch.setattr(observer_repository, "record_run_cancel_audit", record_audit)
+    repo = ObserverRepository(session_factory=Session, debug_enabled=False)
+
+    assert await repo.update_task_v2_status_if_not_final(
+        "tsk_v2_cancel", "org_cancel", TaskV2Status.canceled, audit_actor=actor
+    )
+    assert not await repo.update_task_v2_status_if_not_final(
+        "tsk_v2_cancel", "org_cancel", TaskV2Status.canceled, audit_actor=actor
+    )
+    assert events == ["commit", "audit", "commit"]
+
+
+@pytest.mark.asyncio
+async def test_workflow_cancel_repository_audits_before_log_flush(monkeypatch: pytest.MonkeyPatch) -> None:
+    from skyvern.forge.sdk.db.repositories import workflow_runs as workflow_runs_repository
+    from skyvern.forge.sdk.db.repositories.workflow_runs import WorkflowRunsRepository
+    from skyvern.forge.sdk.workflow.models.workflow import WorkflowRunStatus
+
+    events: list[str] = []
+
+    class Session:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_: object) -> bool:
+            return False
+
+        async def execute(self, _: object):
+            return SimpleNamespace(scalar_one_or_none=lambda: object())
+
+        async def commit(self) -> None:
+            events.append("commit")
+
+    async def record_audit(*_: object) -> None:
+        events.append("audit")
+
+    async def save_logs(_: str) -> None:
+        events.append("logs")
+        raise RuntimeError("artifact flush failed")
+
+    async def on_transition() -> None:
+        events.append("transition")
+
+    monkeypatch.setattr(
+        workflow_runs_repository,
+        "convert_to_workflow_run",
+        lambda _: SimpleNamespace(organization_id="org_cancel"),
+    )
+    monkeypatch.setattr(workflow_runs_repository, "record_run_cancel_audit", record_audit)
+    monkeypatch.setattr(workflow_runs_repository, "save_workflow_run_logs", save_logs)
+    repo = WorkflowRunsRepository(session_factory=Session, debug_enabled=False)
+
+    with pytest.raises(RuntimeError, match="artifact flush failed"):
+        await repo.update_workflow_run_if_not_final(
+            "wr_cancel",
+            WorkflowRunStatus.canceled,
+            audit_actor=SimpleNamespace(),
+            on_transition=on_transition,
+        )
+
+    assert events == ["commit", "audit", "transition", "logs"]
 
 
 @pytest.mark.asyncio

@@ -32,6 +32,8 @@ from skyvern.forge.sdk.db.utils import (
 )
 from skyvern.forge.sdk.schemas.task_v2 import TaskV2, TaskV2Status, Thought, ThoughtType
 from skyvern.forge.sdk.schemas.workflow_runs import WorkflowRunBlock
+from skyvern.forge.sdk.services.audit_events import record_run_cancel_audit
+from skyvern.forge.sdk.services.request_principal import RequestPrincipal
 from skyvern.forge.sdk.utils.sanitization import sanitize_postgres_text
 from skyvern.schemas.runs import ProxyLocationInput, RunEngine, ScriptRunResponse
 from skyvern.schemas.workflows import BlockStatus, BlockType
@@ -356,6 +358,7 @@ class ObserverRepository(BaseRepository):
         status: TaskV2Status,
         *,
         failure_category: list[dict[str, Any]] | None = None,
+        audit_actor: RequestPrincipal | None = None,
     ) -> bool:
         now = naive_utc_now()
         values: dict[str, Any] = {"status": status.value, "modified_at": now}
@@ -376,6 +379,8 @@ class ObserverRepository(BaseRepository):
             )
             won = result.scalar_one_or_none() is not None
             await session.commit()
+            if won and status == TaskV2Status.canceled and audit_actor is not None:
+                await record_run_cancel_audit(audit_actor, organization_id, "task", task_v2_id)
             return won
 
     @db_operation("update_task_v2")

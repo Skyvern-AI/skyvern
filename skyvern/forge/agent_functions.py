@@ -74,6 +74,7 @@ from skyvern.forge.sdk.services import (
     microsoft_oauth_service,
     sftp_service,
 )
+from skyvern.forge.sdk.services.audit_events import AuditEvent
 from skyvern.forge.sdk.services.credentials import AuthenticatorTotpParseResult
 from skyvern.forge.sdk.services.request_principal import (
     BearerIdentityResolution,
@@ -127,21 +128,6 @@ if TYPE_CHECKING:
     from skyvern.webeye.browser_state import BrowserState
 
 LOG = structlog.get_logger()
-
-
-@dataclass(frozen=True)
-class AuditEvent:
-    """Resource identifiers and field names for an audited write; never secrets or request bodies."""
-
-    organization_id: str
-    action: str
-    resource_type: str
-    resource_id: str | None
-    changed_fields: tuple[str, ...] = ()
-    related_resource_ids: tuple[str, ...] = ()
-    auth_kind: str | None = None
-    oauth_client_id: str | None = None
-    app_role: str | None = None
 
 
 async def record_request_audit_event(
