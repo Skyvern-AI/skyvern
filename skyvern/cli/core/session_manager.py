@@ -15,6 +15,7 @@ from typing import TYPE_CHECKING, Any, AsyncIterator, Callable, Iterator, TypedD
 import httpx
 import structlog
 
+from skyvern.browser_extension.runtime import BrowserExtensionRuntime
 from skyvern.config import settings
 from skyvern.exceptions import get_user_facing_exception_message, is_stalled_attach_handshake
 from skyvern.forge.sdk.copilot.turn_origin import is_self_heal_session_id
@@ -29,11 +30,11 @@ from .trajectory_store import delete_session_trajectories
 LOG = structlog.get_logger(__name__)
 
 _BODY_SEMAPHORE_LIMIT = 5  # concurrent CDP body downloads (worst case: 5 * 10s timeout = 50s backlog)
+_TAB_RECONNECT_ADOPTION_TIMEOUT_SECONDS = 10.0
 
 if TYPE_CHECKING:
     from playwright.async_api import Frame, Page, Playwright, Request
 
-    from skyvern.browser_extension.runtime import BrowserExtensionRuntime
     from skyvern.library.skyvern_browser import SkyvernBrowser
     from skyvern.library.skyvern_browser_page import SkyvernBrowserPage
     from skyvern.webeye.browser_engine import EngineFrame
@@ -128,6 +129,11 @@ class SessionState:
     _active_page: Page | None = None
     _implicit_page: Page | None = None
     selection_lost: bool = False
+    _selection_generation: int = 0
+    _selection_adoption_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
+    _reconnect_request_failures: weakref.WeakKeyDictionary[Page, list[RequestFailure]] = field(
+        default_factory=weakref.WeakKeyDictionary
+    )
     # -- Page event buffer for tab_wait_for_new --
     _page_events: deque[dict[str, Any]] = field(default_factory=lambda: deque(maxlen=100))
     _page_event_signal: asyncio.Event = field(default_factory=lambda: asyncio.Event())
@@ -143,6 +149,7 @@ class SessionState:
     _body_store: dict[int, str] = field(default_factory=dict)
     _body_semaphore: asyncio.Semaphore = field(default_factory=lambda: asyncio.Semaphore(_BODY_SEMAPHORE_LIMIT))
     _pending_tasks: set[asyncio.Task[None]] = field(default_factory=set)
+    _page_pending_tasks: dict[int, set[asyncio.Task[None]]] = field(default_factory=dict)
     # Routes keyed by page id — Playwright registers routes per-page, so tracking must match.
     active_routes: dict[int, set[str]] = field(default_factory=dict)
     # -- Iframe frame context --
@@ -892,8 +899,6 @@ async def _reconnect_extension_session(
     current: SessionState,
     active_api_key_hash: str | None,
 ) -> tuple[SkyvernBrowser, BrowserContext] | None:
-    from skyvern.browser_extension.runtime import BrowserExtensionRuntime
-
     runtime = BrowserExtensionRuntime.instance()
     if runtime is None:
         return None
@@ -944,6 +949,8 @@ async def _close_session_state(current: SessionState, *, close_via_active_client
                     session_id=current.context.session_id,
                     exc_info=True,
                 )
+        if current.context is not None and current.context.mode == "extension":
+            current._page_event_listener_installed = False
         # Cancel pending body-capture tasks before closing the browser to avoid
         # "target closed" noise from CDP calls against a defunct context.
         for task in current._pending_tasks:
@@ -1007,6 +1014,95 @@ async def close_all_sessions() -> None:
         raise errors[0][1]
 
 
+async def reconcile_extension_selection(browser: SkyvernBrowser, ctx: BrowserContext) -> bool:
+    """Return True when the caller must resolve the session and selection again."""
+    if ctx.mode != "extension" or (runtime := BrowserExtensionRuntime.instance()) is None:
+        return False
+    state = get_current_session()
+    if state.selection_lost:
+        return False
+    explicit = state._active_page is not None
+    selected = state._active_page if explicit else state._implicit_page
+    if selected is None:
+        return False
+    context = browser._browser_context
+    session_context = state.context
+    generation = state._selection_generation
+
+    def selection_is_current() -> bool:
+        return (
+            get_current_session() is state
+            and state.browser is browser
+            and state.context is session_context
+            and browser._browser_context is context
+            and (state._active_page if explicit else state._implicit_page) is selected
+            and (explicit or state._active_page is None)
+            and state._selection_generation == generation
+            and not state.selection_lost
+        )
+
+    if not selected.is_closed():
+        await runtime.page_target_id(selected)
+        return not selection_is_current()
+
+    target_id = runtime.last_page_target_id(selected)
+    record = runtime.tab_reconnect(target_id) if target_id is not None else None
+    if target_id is not None and record is not None and record.state in {"pending", "done"}:
+        deadline = asyncio.get_running_loop().time() + _TAB_RECONNECT_ADOPTION_TIMEOUT_SECONDS
+        try:
+            async with asyncio.timeout_at(deadline):
+                async with state._selection_adoption_lock:
+                    while True:
+                        if not selection_is_current():
+                            return True
+                        record = runtime.tab_reconnect(target_id)
+                        if record is None or record.state == "failed":
+                            break
+                        if record.state == "pending":
+                            await runtime.wait_for_tab_reconnect(record, deadline - asyncio.get_running_loop().time())
+                            continue
+                        if record.new_target_id is None:
+                            await asyncio.sleep(0.05)
+                            continue
+                        replacement = await runtime.find_page_for_target(context, record.new_target_id)
+                        if not selection_is_current():
+                            return True
+                        if runtime.tab_reconnect(target_id) is not record or record.state != "done":
+                            continue
+                        if replacement is None:
+                            await asyncio.sleep(0.05)
+                            continue
+                        if explicit:
+                            state._active_page = replacement
+                        else:
+                            state._implicit_page = replacement
+                        state.selection_lost = False
+                        state._working_frame = None
+                        clear_session_ref_map(session_id=ctx.session_id, cdp_url=ctx.cdp_url)
+                        state.active_routes.pop(id(selected), None)
+                        for task in state._page_pending_tasks.pop(id(selected), set()):
+                            task.cancel()
+                        for failure in state._reconnect_request_failures.pop(selected, []):
+                            state.request_failures.append({**failure, "tab_id": str(id(replacement))})
+                        state._page_events = deque(
+                            (event for event in state._page_events if event["page"] is not replacement),
+                            maxlen=state._page_events.maxlen,
+                        )
+                        state._selection_generation += 1
+                        ensure_browser_hooks(browser)
+                        return True
+        except TimeoutError:
+            pass
+
+    if not selection_is_current():
+        return True
+    if not explicit:
+        state._implicit_page = None
+        state.selection_lost = True
+        state._selection_generation += 1
+    return False
+
+
 async def get_page(
     session_id: str | None = None,
     cdp_url: str | None = None,
@@ -1020,6 +1116,8 @@ async def get_page(
     change this page selection.
     """
     browser, ctx = await resolve_browser(session_id=session_id, cdp_url=cdp_url)
+    while await reconcile_extension_selection(browser, ctx):
+        browser, ctx = await resolve_browser(session_id=session_id, cdp_url=cdp_url)
     state = get_current_session()
 
     if state.selection_lost:
@@ -1062,6 +1160,11 @@ async def get_page(
             page = await browser.get_working_page()
             context_pages = browser._browser_context.pages
             state._implicit_page = context_pages[-1] if context_pages else None
+            if ctx.mode == "extension" and (runtime := BrowserExtensionRuntime.instance()) is not None:
+                state._implicit_page = page.page
+                state._selection_generation += 1
+                if state._implicit_page is not None:
+                    await runtime.page_target_id(state._implicit_page)
     except Exception as exc:
         # The connect above can succeed and the target still die before this command
         # reaches it -- same failure family as resolve_browser's connect attempt.
@@ -1122,6 +1225,36 @@ def _install_page_event_listener(state: SessionState, browser: SkyvernBrowser) -
         event = {**event_data, "page": page}
         state._page_events.append(event)
         state._page_event_signal.set()
+
+        if (
+            state.context is not None
+            and state.context.mode == "extension"
+            and state._page_event_listener_installed
+            and state.browser is browser
+            and (runtime := BrowserExtensionRuntime.instance()) is not None
+        ):
+            event_context = state.context
+
+            async def discard_replacement_event() -> None:
+                try:
+                    await runtime.page_target_id(page)
+                    replacement = await runtime.is_reconnect_replacement(page)
+                    if (
+                        replacement
+                        and state._page_event_listener_installed
+                        and state.context is event_context
+                        and state.browser is browser
+                    ):
+                        state._page_events = deque(
+                            (e for e in state._page_events if e is not event),
+                            maxlen=state._page_events.maxlen,
+                        )
+                except Exception as exc:
+                    LOG.debug("browser_extension_page_event_identity_failed", error_type=type(exc).__name__)
+
+            task = asyncio.create_task(discard_replacement_event())
+            state._pending_tasks.add(task)
+            task.add_done_callback(state._pending_tasks.discard)
 
         # Eagerly clean up when the page closes
         def _on_close() -> None:

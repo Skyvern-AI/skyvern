@@ -15,7 +15,12 @@ function assertWebTab(tab) {
   }
 }
 
-export async function evaluateDom() {
+export async function evaluateDom(tabScope, args) {
+  if (args?.tabId !== undefined) {
+    await tabScope?.debuggerRouter?.assertCanSend(requireTabId(args.tabId), {
+      fenceOnly: true,
+    });
+  }
   throw new ProtocolError(
     ERROR_CODES.OP_NOT_ALLOWED,
     "Direct JavaScript evaluation is unavailable in extension mode. Use skyvern_observe, skyvern_get_html, skyvern_find, or skyvern_get_value to inspect the page. Use skyvern_click or skyvern_type to interact.",
@@ -79,6 +84,9 @@ export async function authorizeDomFill(tabScope, message, sender) {
       pending.tabId,
       pending.lease,
     );
+    await tabScope.debuggerRouter?.assertCanSend(pending.tabId, {
+      fenceOnly: true,
+    });
     pending.lease.assertCurrent();
     if (
       pendingFormFills.get(message.requestId) !== pending ||
@@ -130,6 +138,7 @@ export async function fillDomInput(tabScope, args) {
     );
   }
   const tabId = requireTabId(values.tabId);
+  await tabScope.debuggerRouter?.assertCanSend(tabId, { fenceOnly: true });
   const requestId = crypto.randomUUID();
   const pending = { tabId, ready: false, authorized: false };
   let deadlineTimer;
@@ -144,6 +153,9 @@ export async function fillDomInput(tabScope, args) {
           );
         }
         const tab = await tabScope.assertControllableLocked(tabId, lease);
+        await tabScope.debuggerRouter?.assertCanSend(tabId, {
+          fenceOnly: true,
+        });
         assertWebTab(tab);
         const url = tab.pendingUrl || tab.url;
         try {
@@ -153,6 +165,9 @@ export async function fillDomInput(tabScope, args) {
             { frameId: 0 },
           );
           lease.assertCurrent();
+          await tabScope.debuggerRouter?.assertCanSend(tabId, {
+            fenceOnly: true,
+          });
           const currentTab = await tabScope.assertControllableLocked(
             tabId,
             lease,
@@ -196,6 +211,9 @@ export async function fillDomInput(tabScope, args) {
           );
           lease.assertCurrent();
           assertWebTab(await tabScope.assertControllableLocked(tabId, lease));
+          await tabScope.debuggerRouter?.assertCanSend(tabId, {
+            fenceOnly: true,
+          });
           if (
             response?.ok !== true ||
             response.textLength !== values.text.length
