@@ -9900,9 +9900,7 @@ class ForgeAgent:
         # This allows multiple tasks with the same llm_key to share the same cache
 
         # log the task status as an event
-        analytics.capture(
-            "skyvern-oss-agent-task-status", {"status": task.status}, organization_id=task.organization_id
-        )
+        analytics.capture("skyvern-oss-agent-task-status", {"status": task.status})
 
         # Add task completion tag to trace
         otel_trace.get_current_span().set_attribute("task.completion_status", task.status.value)
