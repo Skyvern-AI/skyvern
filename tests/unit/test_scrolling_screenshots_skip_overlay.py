@@ -72,7 +72,7 @@ async def test_scrolling_helper_skips_overlay_when_draw_boxes_false() -> None:
     engine_selection = MagicMock(spec=BrowserEngineSelection)
     captured_selections: list[BrowserEngineSelection | None] = []
 
-    async def _fake_screenshot(page, mode, engine_selection=None):  # noqa: ANN001, D401, ARG001
+    async def _fake_screenshot(page, mode, engine_selection=None, capture=None):  # noqa: ANN001, D401, ARG001
         captured_selections.append(engine_selection)
         return b"snap"
 
@@ -117,7 +117,7 @@ async def test_scrolling_helper_non_scrollable_page_skips_overlay() -> None:
     engine_selection = MagicMock(spec=BrowserEngineSelection)
     captured_selections: list[BrowserEngineSelection | None] = []
 
-    async def _fake_screenshot(page, mode, engine_selection=None):  # noqa: ANN001, D401, ARG001
+    async def _fake_screenshot(page, mode, engine_selection=None, capture=None):  # noqa: ANN001, D401, ARG001
         captured_selections.append(engine_selection)
         return b"snap"
 

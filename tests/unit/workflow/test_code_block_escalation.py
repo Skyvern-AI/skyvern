@@ -1072,7 +1072,7 @@ async def _execute_inline_failure_with_download_output(
     context = context or _make_context()
     fake_page = MagicMock()
     fake_browser_state = SimpleNamespace(
-        get_working_page=AsyncMock(return_value=fake_page), browser_artifacts=BrowserArtifacts()
+        get_working_page=AsyncMock(return_value=fake_page), engine_selection=None, browser_artifacts=BrowserArtifacts()
     )
     _patch_execute_chokepoint_environment(
         monkeypatch,
@@ -1125,7 +1125,7 @@ async def test_rendered_error_code_misuse_returns_and_records_failed_result(monk
     context.values["arguments"] = "code='A', reasoning='why'"
     fake_page = MagicMock()
     fake_browser_state = SimpleNamespace(
-        get_working_page=AsyncMock(return_value=fake_page), browser_artifacts=BrowserArtifacts()
+        get_working_page=AsyncMock(return_value=fake_page), engine_selection=None, browser_artifacts=BrowserArtifacts()
     )
     _patch_execute_chokepoint_environment(
         monkeypatch,
@@ -1768,6 +1768,7 @@ async def test_executed_block_lists_its_literal_fill_but_never_a_rendered_parame
     context.values["contact_name"] = "Grace Param"
     fake_browser_state = SimpleNamespace(
         get_working_page=AsyncMock(return_value=MagicMock()),
+        engine_selection=None,
         browser_artifacts=BrowserArtifacts(),
         navigate_to_url=AsyncMock(return_value=None),
     )
@@ -3791,7 +3792,7 @@ async def test_legacy_heal_success_skips_failed_write_and_ends_completed(
     context = _make_context()
     fake_page = MagicMock()
     fake_browser_state = SimpleNamespace(
-        get_working_page=AsyncMock(return_value=fake_page), browser_artifacts=BrowserArtifacts()
+        get_working_page=AsyncMock(return_value=fake_page), engine_selection=None, browser_artifacts=BrowserArtifacts()
     )
     _patch_execute_chokepoint_environment(
         monkeypatch,
@@ -3965,7 +3966,7 @@ async def test_heal_output_write_failure_does_not_finalize_completed(
     context = _make_context()
     fake_page = MagicMock()
     fake_browser_state = SimpleNamespace(
-        get_working_page=AsyncMock(return_value=fake_page), browser_artifacts=BrowserArtifacts()
+        get_working_page=AsyncMock(return_value=fake_page), engine_selection=None, browser_artifacts=BrowserArtifacts()
     )
     _patch_execute_chokepoint_environment(
         monkeypatch,
@@ -4018,7 +4019,7 @@ async def test_secure_heal_success_skips_failed_write_and_ends_completed(
     context = _make_context()
     fake_page = MagicMock()
     fake_browser_state = SimpleNamespace(
-        get_working_page=AsyncMock(return_value=fake_page), browser_artifacts=BrowserArtifacts()
+        get_working_page=AsyncMock(return_value=fake_page), engine_selection=None, browser_artifacts=BrowserArtifacts()
     )
     _patch_execute_chokepoint_environment(
         monkeypatch,
@@ -4090,7 +4091,7 @@ async def test_legacy_heal_declined_writes_failed_once(
     context = _make_context()
     fake_page = MagicMock()
     fake_browser_state = SimpleNamespace(
-        get_working_page=AsyncMock(return_value=fake_page), browser_artifacts=BrowserArtifacts()
+        get_working_page=AsyncMock(return_value=fake_page), engine_selection=None, browser_artifacts=BrowserArtifacts()
     )
     _patch_execute_chokepoint_environment(
         monkeypatch,
@@ -4130,7 +4131,7 @@ async def test_secure_heal_declined_writes_failed_once(
     context = _make_context()
     fake_page = MagicMock()
     fake_browser_state = SimpleNamespace(
-        get_working_page=AsyncMock(return_value=fake_page), browser_artifacts=BrowserArtifacts()
+        get_working_page=AsyncMock(return_value=fake_page), engine_selection=None, browser_artifacts=BrowserArtifacts()
     )
     _patch_execute_chokepoint_environment(
         monkeypatch,
@@ -4202,7 +4203,7 @@ async def test_secure_failure_records_a_sign_in_form_only_on_the_page_it_failed_
     fake_page = MagicMock()
     fake_page.evaluate = AsyncMock(return_value=True)
     fake_browser_state = SimpleNamespace(
-        get_working_page=AsyncMock(return_value=fake_page), browser_artifacts=BrowserArtifacts()
+        get_working_page=AsyncMock(return_value=fake_page), engine_selection=None, browser_artifacts=BrowserArtifacts()
     )
     _patch_execute_chokepoint_environment(
         monkeypatch, context=_make_context(), fake_browser_state=fake_browser_state, use_codeblock_runner=True
@@ -4303,7 +4304,9 @@ async def test_secure_proxy_transport_failure_skips_the_ai_fallback(
     block = _make_code_block()
     context = _make_context()
     fake_browser_state = SimpleNamespace(
-        get_working_page=AsyncMock(return_value=MagicMock()), browser_artifacts=BrowserArtifacts()
+        get_working_page=AsyncMock(return_value=MagicMock()),
+        engine_selection=None,
+        browser_artifacts=BrowserArtifacts(),
     )
     _patch_execute_chokepoint_environment(
         monkeypatch,
@@ -4370,7 +4373,9 @@ async def test_secure_failure_emits_operation_attribution(
     block = _make_code_block()
     context = _make_context()
     fake_browser_state = SimpleNamespace(
-        get_working_page=AsyncMock(return_value=MagicMock()), browser_artifacts=BrowserArtifacts()
+        get_working_page=AsyncMock(return_value=MagicMock()),
+        engine_selection=None,
+        browser_artifacts=BrowserArtifacts(),
     )
     _patch_execute_chokepoint_environment(
         monkeypatch,
@@ -4439,7 +4444,7 @@ async def test_secure_accepted_typed_failure_preserves_adapter_block_result(monk
     context = _make_context()
     fake_page = MagicMock()
     fake_browser_state = SimpleNamespace(
-        get_working_page=AsyncMock(return_value=fake_page), browser_artifacts=BrowserArtifacts()
+        get_working_page=AsyncMock(return_value=fake_page), engine_selection=None, browser_artifacts=BrowserArtifacts()
     )
     _patch_execute_chokepoint_environment(
         monkeypatch,
@@ -4519,7 +4524,7 @@ async def test_secure_runner_missing_block_result_returns_generic_failure(
     context = _make_context()
     fake_page = MagicMock()
     fake_browser_state = SimpleNamespace(
-        get_working_page=AsyncMock(return_value=fake_page), browser_artifacts=BrowserArtifacts()
+        get_working_page=AsyncMock(return_value=fake_page), engine_selection=None, browser_artifacts=BrowserArtifacts()
     )
     _patch_execute_chokepoint_environment(
         monkeypatch,
@@ -4562,7 +4567,7 @@ async def test_secure_infra_failure_without_metadata_finalizes_failed_and_record
     context = _make_context()
     fake_page = MagicMock()
     fake_browser_state = SimpleNamespace(
-        get_working_page=AsyncMock(return_value=fake_page), browser_artifacts=BrowserArtifacts()
+        get_working_page=AsyncMock(return_value=fake_page), engine_selection=None, browser_artifacts=BrowserArtifacts()
     )
     _patch_execute_chokepoint_environment(
         monkeypatch,
@@ -4883,6 +4888,7 @@ async def test_executed_block_keeps_its_screened_driver_nav_code_through_a_faile
     context = _make_context(with_secret=True)
     fake_browser_state = SimpleNamespace(
         get_working_page=AsyncMock(return_value=MagicMock()),
+        engine_selection=None,
         browser_artifacts=BrowserArtifacts(),
         navigate_to_url=AsyncMock(return_value=None),
     )
@@ -4954,6 +4960,7 @@ async def _execute_signed_out_block(
     )
     fake_browser_state = SimpleNamespace(
         get_working_page=AsyncMock(return_value=MagicMock()),
+        engine_selection=None,
         browser_artifacts=BrowserArtifacts(),
         navigate_to_url=AsyncMock(return_value=None),
     )
@@ -5079,6 +5086,7 @@ async def test_no_persisted_block_row_keeps_a_nav_code_that_is_a_parameter_value
     block = _make_code_block(code="raise RuntimeError('navigation failed')")
     fake_browser_state = SimpleNamespace(
         get_working_page=AsyncMock(return_value=MagicMock()),
+        engine_selection=None,
         browser_artifacts=BrowserArtifacts(),
         navigate_to_url=AsyncMock(return_value=None),
     )

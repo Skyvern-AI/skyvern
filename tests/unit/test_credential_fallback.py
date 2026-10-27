@@ -299,6 +299,7 @@ async def _run_fallback_retry(
         mock_app.EXPERIMENTATION_PROVIDER.is_feature_enabled_cached = AsyncMock(
             side_effect=flag_error, return_value=flag_enabled
         )
+        mock_app.AGENT_FUNCTION.get_workflow_run_retry_refusal = AsyncMock(return_value=None)
         mock_app.AGENT_FUNCTION.is_block_scoped_workflow_run = AsyncMock(return_value=block_scoped)
         mock_app.AGENT_FUNCTION.strip_proxy_session_extra_http_headers = _strip_marker_header
         mock_app.DATABASE.debug.has_block_run_for_workflow_run = AsyncMock(return_value=False)

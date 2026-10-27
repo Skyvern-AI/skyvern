@@ -55,7 +55,7 @@ from skyvern.forge.sdk.workflow.models.tags import (
     TagSource,
     TagWriteContext,
 )
-from skyvern.forge.sdk.workflow.models.workflow import WorkflowDefinition, WorkflowRequestBody
+from skyvern.forge.sdk.workflow.models.workflow import WorkflowDefinition, WorkflowRequestBody, WorkflowRun
 from skyvern.forge.sdk.workflow.service import WorkflowService
 from skyvern.schemas.workflows import WorkflowCreateYAMLRequest
 from skyvern.services import workflow_service as workflow_service_module
@@ -88,7 +88,7 @@ def _make_service_with_mocks(
     browser_profile_id: str | None = None,
     cdp_connect_headers: dict[str, str] | None = None,
     definition_parameters: list | None = None,
-) -> tuple[WorkflowService, SimpleNamespace, SimpleNamespace]:
+) -> tuple[WorkflowService, SimpleNamespace, WorkflowRun]:
     """Helper to build a WorkflowService with mocked internals for setup_workflow_run tests."""
     service = WorkflowService()
     workflow = SimpleNamespace(
@@ -110,7 +110,7 @@ def _make_service_with_mocks(
         sequential_key=None,
         workflow_definition=WorkflowDefinition(blocks=[], parameters=definition_parameters or []),
     )
-    workflow_run = SimpleNamespace(workflow_run_id="wr_test", workflow_permanent_id="wpid_test")
+    workflow_run = WorkflowRun.model_construct(workflow_run_id="wr_test", workflow_permanent_id="wpid_test")
 
     service.get_workflow_by_permanent_id = AsyncMock(return_value=workflow)  # type: ignore[method-assign]
     service.create_workflow_run = AsyncMock(return_value=workflow_run)  # type: ignore[method-assign]
@@ -156,7 +156,7 @@ async def test_apply_initial_run_metadata_tags_uses_system_source_for_fallback_c
         mock_app.DATABASE.tags.apply_run_tag_changes = AsyncMock()
 
         await WorkflowService._apply_initial_run_metadata_tags(
-            workflow_run_id="wr_x",
+            workflow_run=WorkflowRun.model_construct(workflow_run_id="wr_x", organization_id="o_x"),
             organization_id="o_x",
             run_metadata={"env": "prod"},
             context=None,
@@ -167,7 +167,7 @@ async def test_apply_initial_run_metadata_tags_uses_system_source_for_fallback_c
         assert fallback_context.caller_type == CallerType.SYSTEM
 
         await WorkflowService._apply_initial_run_metadata_tags(
-            workflow_run_id="wr_x",
+            workflow_run=WorkflowRun.model_construct(workflow_run_id="wr_x", organization_id="o_x"),
             organization_id="o_x",
             run_metadata={"env": "prod"},
             context=explicit_context,
@@ -203,6 +203,7 @@ async def test_setup_workflow_run_writes_run_metadata_as_run_tags() -> None:
         sets={"env": "prod", "team": "growth"},
         deletes=set(),
         context=tag_context,
+        known_run=workflow_run,
     )
 
 
@@ -265,6 +266,7 @@ async def test_setup_workflow_run_writes_create_time_system_tags() -> None:
             "skyvern.platform": "known_platform",
         },
         caller_id="system:creation-tagging",
+        known_run=workflow_run,
     )
 
 
@@ -306,12 +308,13 @@ async def test_setup_workflow_run_defers_integration_platform_tag_to_post_dispat
             organization_id=organization.organization_id,
             sets={"skyvern.trigger": "api", INTEGRATION_PLATFORM_RUN_TAG_KEY: "zapier"},
             caller_id="system:creation-tagging",
+            known_run=workflow_run,
         )
 
 
 @pytest.mark.asyncio
 async def test_setup_workflow_run_writes_trigger_tag_when_target_domain_is_unavailable() -> None:
-    service, organization, _ = _make_service_with_mocks(workflow_parameters=[])
+    service, organization, workflow_run = _make_service_with_mocks(workflow_parameters=[])
 
     with (
         patch("skyvern.forge.sdk.workflow.service.app") as mock_app,
@@ -337,6 +340,7 @@ async def test_setup_workflow_run_writes_trigger_tag_when_target_domain_is_unava
         organization_id="org_test",
         sets={"skyvern.trigger": "api"},
         caller_id="system:creation-tagging",
+        known_run=workflow_run,
     )
 
 
@@ -400,6 +404,7 @@ async def test_setup_workflow_run_writes_provenance_tags_when_platform_detection
         organization_id="org_test",
         sets={"skyvern.trigger": "api", "skyvern.target_domain": "jobs.example.com"},
         caller_id="system:creation-tagging",
+        known_run=workflow_run,
     )
 
 

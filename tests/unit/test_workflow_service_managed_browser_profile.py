@@ -2607,6 +2607,7 @@ async def test_forced_session_assignment_precedes_required_pin(
     assert persisted_run is not None
     expected_session_id = None if failure_point == "assignment" else "pbs_forced"
     assert run.browser_session_id == persisted_run.browser_session_id == expected_session_id
+    assert run.row_write_unconfirmed is (failure_point == "assignment")
     attempts = await database.workflow_run_attempts.get_attempts(run.workflow_run_id)
     assert len(attempts) == 1
     assert attempts[0].pinned_browser_session_id is None

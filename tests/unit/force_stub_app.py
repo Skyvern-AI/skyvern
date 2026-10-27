@@ -17,8 +17,10 @@ def admit_block_dispatch(status: WorkflowRunStatus = WorkflowRunStatus.running) 
 
 
 def released_session_stub() -> SimpleNamespace:
-    """A ``Session`` stand-in whose ``released()`` is the no-op the real one is outside a pinned scope."""
-    return SimpleNamespace(released=MagicMock(side_effect=lambda: nullcontext()))
+    """A ``Session`` stand-in whose ``released()`` and ``reading()`` scopes do nothing, as for mocked repositories."""
+    return SimpleNamespace(
+        released=MagicMock(side_effect=lambda: nullcontext()), reading=MagicMock(side_effect=lambda: nullcontext())
+    )
 
 
 def version_write_transaction_stub() -> MagicMock:
@@ -35,8 +37,9 @@ def create_forge_stub_app() -> ForgeApp:
 
     fake_app_module = ForgeApp()
     fake_app_module.DATABASE = _LazyNamespace()
-    # Auto-mocked, Session.released() would hand `async with` a coroutine.
+    # Auto-mocked, Session.released() and Session.reading() would hand `async with` a coroutine.
     fake_app_module.DATABASE.workflow_runs.Session.released = released_session_stub().released
+    fake_app_module.DATABASE.Session = released_session_stub()
     # Same trap on the save path's version/definition transaction: no stub DB has an engine to
     # open one against, and the writes inside the block are mocked anyway.
     fake_app_module.DATABASE.workflows.version_write_transaction = version_write_transaction_stub()
@@ -73,6 +76,7 @@ def create_forge_stub_app() -> ForgeApp:
     fake_app_module.PERSISTENT_SESSIONS_MANAGER.supports_evict_and_reconnect = MagicMock(return_value=False)
     fake_app_module.ARTIFACT_MANAGER = _LazyNamespace()
     fake_app_module.AGENT_FUNCTION = _LazyNamespace()
+    fake_app_module.AGENT_FUNCTION.get_workflow_run_retry_refusal = AsyncMock(return_value=None)
     fake_app_module.AGENT_FUNCTION.is_block_scoped_workflow_run = AsyncMock(return_value=False)
     fake_app_module.AGENT_FUNCTION.validate_block_execution = AsyncMock()
     fake_app_module.AGENT_FUNCTION.validate_code_block = AsyncMock()
@@ -123,6 +127,7 @@ def create_forge_stub_app() -> ForgeApp:
     fake_app_module.AGENT_FUNCTION.resolve_api_key_profile = AsyncMock(return_value=("full_org", None, True))
     fake_app_module.AGENT_FUNCTION.get_mcp_request_organization_id = MagicMock(return_value=None)
     fake_app_module.AGENT_FUNCTION.schedule_workflow_run_group_advance = MagicMock(return_value=None)
+    fake_app_module.AGENT_FUNCTION.generate_root_workflow_run_id = base_agent_function.generate_root_workflow_run_id
     # Sync method returning a key or None — _LazyNamespace would auto-mock it as a truthy
     # AsyncMock and hijack the TextPromptBlock llm_key. Match the OSS no-op.
     fake_app_module.AGENT_FUNCTION.get_fallback_llm_key = MagicMock(return_value=None)

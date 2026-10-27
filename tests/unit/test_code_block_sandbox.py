@@ -1327,6 +1327,7 @@ async def wrapper({default_args}):
         class FakeBrowserState:
             def __init__(self) -> None:
                 self.browser_artifacts = BrowserArtifacts()
+                self.engine_selection = None
 
             async def get_working_page(self) -> object:
                 return SimpleNamespace(context=MagicMock())
@@ -1399,6 +1400,7 @@ async def wrapper({default_args}):
         class TablessBrowserState:
             def __init__(self) -> None:
                 self.browser_artifacts = BrowserArtifacts()
+                self.engine_selection = None
                 self.open_attempts = 0
                 self.created_pages = 0
 
@@ -1868,6 +1870,7 @@ async def _run_credential_code_block(monkeypatch: "pytest.MonkeyPatch", wrc, cod
     class FakeBrowserState:
         def __init__(self) -> None:
             self.browser_artifacts = BrowserArtifacts()
+            self.engine_selection = None
 
         async def get_working_page(self) -> object:
             return MagicMock()
@@ -3523,6 +3526,7 @@ class TestFailedReadinessWaitPropagates:
         class ReadyBrowserState:
             def __init__(self) -> None:
                 self.browser_artifacts = BrowserArtifacts()
+                self.engine_selection = None
 
             async def get_working_page(self) -> object:
                 return page
@@ -3701,6 +3705,7 @@ class TestDirectPathDialogPolicyBinding:
         class ReadyBrowserState:
             def __init__(self) -> None:
                 self.browser_artifacts = BrowserArtifacts()
+                self.engine_selection = None
 
             async def get_working_page(self) -> object:
                 return page
@@ -4022,6 +4027,7 @@ class TestOpenPageHelperBinding:
         root = SimpleNamespace(context=context, url="https://example.test/listing", is_closed=lambda: False)
         root.title = AsyncMock(return_value="Listing")
         browser_state = SimpleNamespace(
+            engine_selection=None,
             browser_artifacts=BrowserArtifacts(),
             get_working_page=AsyncMock(return_value=root),
             list_valid_pages=AsyncMock(return_value=[root]),
@@ -4113,6 +4119,7 @@ class TestOpenPageHelperBinding:
         )
         root.title = AsyncMock(return_value="Listing")
         browser_state = SimpleNamespace(
+            engine_selection=None,
             browser_artifacts=BrowserArtifacts(),
             get_working_page=AsyncMock(return_value=root),
             list_valid_pages=AsyncMock(return_value=[root]),

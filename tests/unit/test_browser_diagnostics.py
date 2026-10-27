@@ -3,19 +3,23 @@
 from __future__ import annotations
 
 import asyncio
+from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
-from playwright.async_api import Page
+from playwright.async_api import Page, async_playwright
 
 from skyvern.browser_extension.protocol import is_cdp_method_allowed
+from skyvern.webeye import browser_diagnostics
 from skyvern.webeye.browser_diagnostics import (
     _PENDING,
     PROBE_METHODS,
+    _driver_call,
     collect_control_endpoint_diagnostics,
     collect_page_memory_diagnostics,
+    collect_renderer_os_cpu,
     schedule_control_endpoint_diagnostics,
 )
 from skyvern.webeye.main_world_eval import clear_main_world_prefix, configure_main_world_prefix
@@ -138,6 +142,24 @@ async def test_scheduling_never_blocks_or_raises_into_the_caller() -> None:
     for task in scheduled:
         task.cancel()
     await asyncio.gather(*scheduled, return_exceptions=True)
+
+
+@pytest.mark.asyncio
+async def test_a_driver_call_that_never_answers_is_cancelled_instead_of_retained_forever(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A timed-out call is left running, so a driver that never answers would otherwise outlive its run."""
+    monkeypatch.setattr(browser_diagnostics, "SETTLE_DEADLINE_SECONDS", 0.01)
+    hung = asyncio.ensure_future(asyncio.Event().wait())
+
+    with pytest.raises(TimeoutError):
+        await _driver_call(hung, 0.01)
+    assert hung in _PENDING
+
+    await asyncio.wait({hung}, timeout=5)
+
+    assert hung.cancelled()
+    assert hung not in _PENDING
 
 
 @pytest.mark.asyncio
@@ -296,3 +318,29 @@ async def test_page_memory_probe_reports_ok_only_when_every_observer_stat_is_pre
     assert missing["observer_jobs"] == 3 and missing["observer_retained_nodes"] == 12
     # Unreported stats stay absent rather than appearing as a null that reads like a reported value.
     assert not {"observer_pending", "observer_depth_buckets", "observer_parsed", "observer_version"} & set(missing)
+
+
+@pytest.mark.asyncio
+async def test_a_persistent_context_launch_yields_a_renderer_cpu_reading(tmp_path: Path) -> None:
+    """The cloud factory launches with launch_persistent_context. The reading needs the context's Browser to open a
+    browser-level session, which a driver that returned None for a persistent context would turn into "unavailable"."""
+    async with async_playwright() as playwright:
+        if not Path(playwright.chromium.executable_path).exists():
+            pytest.skip("Playwright chromium is not installed")
+        context = await playwright.chromium.launch_persistent_context(
+            str(tmp_path), headless=True, args=["--use-mock-keychain", "--password-store=basic"]
+        )
+        try:
+            page = context.pages[0] if context.pages else await context.new_page()
+            await page.set_content("<p>stalled</p>")
+
+            fields = await collect_renderer_os_cpu(
+                SimpleNamespace(browser_context=context),  # type: ignore[arg-type]
+                window_seconds=0.05,
+                step_timeout=5.0,
+            )
+        finally:
+            await context.close()
+
+    assert fields["renderer_os_cpu"] == "process_info", fields
+    assert fields["renderer_os_processes"] >= 1

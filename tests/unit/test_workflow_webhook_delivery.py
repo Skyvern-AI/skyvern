@@ -53,6 +53,7 @@ from skyvern.schemas.workflows import WorkflowRetryPolicy
 from skyvern.services import run_service
 from skyvern.services import webhook_delivery as webhook_delivery_module
 from skyvern.services import webhook_service as replay_service
+from tests.unit.force_stub_app import released_session_stub
 from tests.unit.forge_log_capture import capture_runtime_logs
 from tests.unit.scoped_asyncio import ScopedAsyncio
 
@@ -2015,6 +2016,7 @@ async def test_attempt_failure_reason_uses_response_text_cap(
         service_module.app,
         "DATABASE",
         SimpleNamespace(
+            Session=released_session_stub(),
             workflows=SimpleNamespace(get_workflow_for_workflow_run=AsyncMock(return_value=workflow)),
             observer=SimpleNamespace(
                 get_task_v2_by_workflow_run_id=AsyncMock(return_value=None),
@@ -2573,6 +2575,7 @@ async def test_final_delivery_outcome_logs_exactly_one_bounded_line(
         "delivery_outcome",
         "http_status_class",
         "attempts",
+        "proxy_hop_retries",
         "delivery_seconds",
         "replay",
     }

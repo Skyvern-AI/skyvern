@@ -8,13 +8,14 @@ import re
 from datetime import UTC, datetime, timedelta, timezone
 from types import SimpleNamespace
 from typing import Any
-from unittest.mock import AsyncMock, MagicMock
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 import pytest_asyncio
 from sqlalchemy import event, select, text
 from sqlalchemy.exc import OperationalError
 from sqlalchemy.ext.asyncio import AsyncEngine, async_sessionmaker
+from sqlalchemy.sql.sqltypes import NullType
 from structlog.testing import capture_logs
 from structlog.types import EventDict
 
@@ -1503,6 +1504,217 @@ async def test_if_not_final_cas_loser_cannot_change_attribution(sqlite_db: Agent
 
     doc = await _read_failure_attribution(sqlite_db, "wr_attr_cas")
     assert doc["primary_infra_component"] == "proxy"
+
+
+@pytest.mark.asyncio
+async def test_if_not_final_queued_returns_the_written_row_on_one_checkout(
+    sqlite_db: AgentDB, sqlite_engine: AsyncEngine
+) -> None:
+    created_at = datetime(2026, 10, 1, 12, 0)
+    async with sqlite_db.Session() as session:
+        run = _workflow_run_model(
+            workflow_run_id="wr_returning_queued", queued_at=created_at, status=WorkflowRunStatus.created.value
+        )
+        run.queued_at = None
+        session.add(run)
+        await session.commit()
+
+    statements, on_execute = _capture_sql(sqlite_engine)
+    pool = sqlite_engine.sync_engine.pool
+    checkouts: list[object] = []
+
+    def on_checkout(*args: object) -> None:
+        checkouts.append(args)
+
+    event.listen(pool, "checkout", on_checkout)
+    try:
+        queued = await sqlite_db.workflow_runs.update_workflow_run_if_not_final(
+            "wr_returning_queued", WorkflowRunStatus.queued, job_id="job_returning"
+        )
+    finally:
+        event.remove(sqlite_engine.sync_engine, "before_cursor_execute", on_execute)
+        event.remove(pool, "checkout", on_checkout)
+
+    assert queued is not None
+    assert queued == await sqlite_db.workflow_runs.get_workflow_run("wr_returning_queued")
+    assert queued.status == WorkflowRunStatus.queued
+    assert queued.job_id == "job_returning"
+    assert queued.queued_at is not None
+    assert queued.modified_at > created_at
+    # Only the pre-read that decides queued_at selects the run; the result comes from the UPDATE itself.
+    assert sum(s.startswith("SELECT") and "FROM workflow_runs" in s for s in statements) == 1
+    assert len(checkouts) == 1
+
+
+@pytest.mark.asyncio
+async def test_if_not_final_returns_the_terminal_row_and_none_once_final(sqlite_db: AgentDB) -> None:
+    async with sqlite_db.Session() as session:
+        session.add(
+            _workflow_run_model(
+                workflow_run_id="wr_returning_final",
+                queued_at=_ATTR_QUEUED_AT,
+                status=WorkflowRunStatus.queued.value,
+            )
+        )
+        await session.commit()
+
+    running = await sqlite_db.workflow_runs.update_workflow_run_if_not_final(
+        "wr_returning_final", WorkflowRunStatus.running
+    )
+    assert running is not None
+    assert running == await sqlite_db.workflow_runs.get_workflow_run("wr_returning_final")
+    assert running.started_at is not None
+
+    # A caller's ambient session that already holds a stale copy of the row must not leak it into the result.
+    async with sqlite_db.Session() as session:
+        stale = await session.get(WorkflowRunModel, "wr_returning_final")
+        assert stale is not None and stale.failure_reason is None
+        # A Core write leaves the loaded copy untouched, as a concurrent writer would.
+        await session.execute(
+            text("UPDATE workflow_runs SET failure_reason = 'set elsewhere' WHERE workflow_run_id = :id"),
+            {"id": "wr_returning_final"},
+        )
+        failed = await sqlite_db.workflow_runs.update_workflow_run_if_not_final(
+            "wr_returning_final", WorkflowRunStatus.failed, failure_category=[{"category": "UNKNOWN"}]
+        )
+    fresh = await sqlite_db.workflow_runs.get_workflow_run("wr_returning_final")
+    assert failed is not None
+    assert failed == fresh
+    assert failed.status == WorkflowRunStatus.failed
+    assert failed.failure_reason == "set elsewhere"
+    assert failed.started_at == running.started_at
+    assert failed.finished_at is not None
+
+    assert (
+        await sqlite_db.workflow_runs.update_workflow_run_if_not_final("wr_returning_final", WorkflowRunStatus.canceled)
+        is None
+    )
+    assert await sqlite_db.workflow_runs.get_workflow_run("wr_returning_final") == fresh
+
+
+@pytest.mark.asyncio
+async def test_if_not_final_latest_attempt_guard_returns_the_row_only_for_the_latest_attempt(
+    sqlite_db: AgentDB,
+) -> None:
+    workflow_run_id = "wr_returning_attempts"
+    async with sqlite_db.Session() as session:
+        session.add(
+            _workflow_run_model(
+                workflow_run_id=workflow_run_id, queued_at=_ATTR_QUEUED_AT, status=WorkflowRunStatus.running.value
+            )
+        )
+        session.add_all(
+            WorkflowRunAttemptModel(
+                workflow_run_id=workflow_run_id,
+                attempt_number=attempt_number,
+                organization_id="org_test",
+                status=WorkflowRunStatus.running.value,
+            )
+            for attempt_number in (1, 2)
+        )
+        await session.commit()
+    before = await sqlite_db.workflow_runs.get_workflow_run(workflow_run_id)
+
+    superseded = await sqlite_db.workflow_runs.update_workflow_run_if_not_final(
+        workflow_run_id, WorkflowRunStatus.failed, require_latest_attempt_number=1
+    )
+    assert superseded is None
+    assert await sqlite_db.workflow_runs.get_workflow_run(workflow_run_id) == before
+
+    latest = await sqlite_db.workflow_runs.update_workflow_run_if_not_final(
+        workflow_run_id, WorkflowRunStatus.failed, require_latest_attempt_number=2
+    )
+    assert latest is not None
+    assert latest.status == WorkflowRunStatus.failed
+    assert latest == await sqlite_db.workflow_runs.get_workflow_run(workflow_run_id)
+
+
+def _make_repo_with_session(mock_workflow_run: MagicMock) -> tuple[WorkflowRunsRepository, AsyncMock]:
+    scalars_result = MagicMock()
+    scalars_result.one.return_value = mock_workflow_run
+
+    execute_result = MagicMock()
+    execute_result.scalar_one_or_none.return_value = mock_workflow_run.workflow_run_id
+
+    session = AsyncMock()
+    session.execute = AsyncMock(return_value=execute_result)
+    session.scalars = AsyncMock(return_value=scalars_result)
+    session.commit = AsyncMock()
+    session.refresh = AsyncMock()
+
+    repo = WorkflowRunsRepository(session_factory=lambda: _SessionContext(session))
+    return repo, session
+
+
+@pytest.mark.asyncio
+async def test_preexisting_timeout_finish_only_updates_unfinished_timeout() -> None:
+    mock_workflow_run = MagicMock()
+    mock_workflow_run.workflow_run_id = "wr_test"
+    repo, session = _make_repo_with_session(mock_workflow_run)
+
+    failure_category = [{"category": "TIMEOUT"}]
+    with (
+        patch(
+            "skyvern.forge.sdk.db.repositories.workflow_runs.save_workflow_run_logs",
+            new=AsyncMock(),
+        ),
+        patch(
+            "skyvern.forge.sdk.db.repositories.workflow_runs.convert_to_workflow_run",
+            return_value=MagicMock(),
+        ),
+    ):
+        await repo.finish_preexisting_timed_out_workflow_run(
+            workflow_run_id="wr_test",
+            failure_reason="workflow timed out",
+            failure_category=failure_category,
+        )
+
+    statement = session.execute.await_args.args[0]
+    statement_sql = str(statement)
+    compiled_statement = statement.compile()
+    statement_parameters = compiled_statement.params
+    assert WorkflowRunStatus.timed_out.value in statement_parameters.values()
+    assert "workflow_runs.finished_at IS NULL" in statement_sql
+    assert "coalesce(workflow_runs.failure_reason" in statement_sql
+    failure_category_binds = [bind for bind in compiled_statement.binds.values() if bind.value == failure_category]
+    assert failure_category_binds
+    assert all(not isinstance(bind.type, NullType) for bind in failure_category_binds)
+
+
+@pytest.mark.asyncio
+async def test_bulk_update_can_guard_status_and_returns_only_updated_ids() -> None:
+    execute_result = MagicMock()
+    execute_result.scalars.return_value.all.return_value = ["wr_running"]
+    session = AsyncMock()
+    session.execute = AsyncMock(return_value=execute_result)
+    session.commit = AsyncMock()
+    repo = WorkflowRunsRepository(session_factory=lambda: _SessionContext(session))
+
+    result = await repo.bulk_update_workflow_runs(
+        workflow_run_ids=["wr_running", "wr_completed"],
+        status=WorkflowRunStatus.timed_out,
+        only_if_status_in=[WorkflowRunStatus.running],
+    )
+
+    statement = session.execute.await_args.args[0]
+    statement_sql = str(statement)
+    statement_parameters = statement.compile().params
+    assert result == ["wr_running"]
+    assert "workflow_runs.status IN" in statement_sql
+    assert [WorkflowRunStatus.running.value] in statement_parameters.values()
+    assert statement_parameters["finished_at"] is None
+    assert statement_parameters["failure_reason"] is None
+    # failure_category is cleared with SQL NULL (null(), not a bound Python None that a JSON
+    # column stores as the token 'null'), so it renders as literal NULL and is not a bound param.
+    assert "failure_category" not in statement_parameters
+    assert "failure_category=NULL" in statement_sql.replace(" ", "")
+    # failure_attribution is persisted atomically as a bounded provisional (unattributed)
+    # document — not SQL NULL — so a stuck-run timeout never leaves permanent NULL if the per-run
+    # repair does not run. It is therefore a bound parameter carrying that document.
+    persisted_attribution = [
+        v for v in statement_parameters.values() if isinstance(v, dict) and "primary_infra_component" in v
+    ]
+    assert persisted_attribution and persisted_attribution[0]["primary_infra_component"] == "unattributed"
 
 
 @pytest.mark.asyncio

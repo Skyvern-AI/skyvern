@@ -189,7 +189,8 @@ class FakePage:
         self.keyboard = FakeKeyboard()
         self.url = "about:blank"
         self.autocompleted: list[str] = []
-        self.context = SimpleNamespace()
+        self.context = SimpleNamespace(browser=None)
+        self.viewport_size = {"width": 80, "height": 60}
         self.default_timeout = PLAYWRIGHT_DEFAULT_TIMEOUT_MS
 
     def set_default_timeout(self, timeout: float) -> None:
@@ -1335,6 +1336,7 @@ def _patch_execute_environment(
     class FakeBrowserState:
         def __init__(self) -> None:
             self.browser_artifacts = BrowserArtifacts()
+            self.engine_selection = None
 
         async def get_working_page(self):  # noqa: ANN201
             return page

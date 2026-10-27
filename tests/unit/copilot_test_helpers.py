@@ -9,9 +9,7 @@ import json
 from collections.abc import AsyncIterator, Awaitable, Callable, Mapping, Sequence
 from contextlib import asynccontextmanager, suppress
 from datetime import UTC, datetime, timedelta
-from functools import cache
 from itertools import count
-from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, Protocol, TypeVar
 from unittest.mock import AsyncMock, MagicMock
@@ -32,7 +30,6 @@ from openai.types.responses.response import Response
 from openai.types.responses.response_function_tool_call import ResponseFunctionToolCall
 from PIL import Image
 from playwright.async_api import Page, Route, async_playwright
-from playwright.sync_api import sync_playwright
 
 from skyvern.forge import app as forge_app
 from skyvern.forge.sdk.api.llm import api_handler_factory
@@ -112,6 +109,7 @@ from skyvern.schemas.workflows import BlockType
 from skyvern.services import workflow_service as workflow_service_module
 from skyvern.webeye.actions.action_types import ActionType
 from skyvern.webeye.actions.actions import ActionStatus
+from tests.unit.conftest import requires_chromium
 
 DISPATCHED_LOGIN_GATE_HTML = (
     "<html><head><title>Sign in</title></head><body><main>"
@@ -1001,20 +999,7 @@ def page_with_unprobeable_vendor_embedder() -> SimpleNamespace:
     )
 
 
-@cache
-def _has_playwright_browser() -> bool:
-    try:
-        with sync_playwright() as playwright:
-            return Path(playwright.chromium.executable_path).exists()
-    except Exception:
-        return False
-
-
-def skip_no_browser(test: T) -> T:
-    return pytest.mark.skipif(
-        not _has_playwright_browser(),
-        reason="Requires Playwright browsers installed (run: playwright install chromium)",
-    )(test)
+skip_no_browser = requires_chromium
 
 
 async def _fulfill_challenge(route: Route) -> None:

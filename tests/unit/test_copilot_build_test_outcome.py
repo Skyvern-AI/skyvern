@@ -5376,6 +5376,7 @@ async def _execute_code_block(monkeypatch: pytest.MonkeyPatch, code: str) -> dic
     class FakeBrowserState:
         def __init__(self) -> None:
             self.browser_artifacts = BrowserArtifacts()
+            self.engine_selection = None
 
         async def get_working_page(self) -> object:
             return _CheckoutPage()

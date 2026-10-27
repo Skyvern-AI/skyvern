@@ -5324,13 +5324,20 @@ async def test_execute_task_v3_the_models_finish_answer_replaces_the_page_guess(
 
 
 @pytest.mark.asyncio
-async def test_execute_task_v3_a_missing_code_source_and_the_models_code_are_both_stored(
-    monkeypatch: pytest.MonkeyPatch,
+@pytest.mark.parametrize("from_model", [True, False], ids=["model_chose_the_code", "detector_chose_the_code"])
+async def test_execute_task_v3_a_missing_code_source_is_stored_after_the_blocks_own_code(
+    monkeypatch: pytest.MonkeyPatch, from_model: bool
 ) -> None:
+    # errors is append-only and callers route on errors[0], so the block's own code leads whichever source
+    # produced it, and the MISSING_TOTP_SOURCE Skyvern attaches itself follows it.
     monkeypatch.setattr(
-        "skyvern.forge.agent.app.AGENT_FUNCTION.task_v3_error_code_on_finish", AsyncMock(return_value=True)
+        "skyvern.forge.agent.app.AGENT_FUNCTION.task_v3_error_code_on_finish", AsyncMock(return_value=from_model)
     )
-    detect_mock = AsyncMock(return_value=[])
+    detect_mock = AsyncMock(
+        return_value=[]
+        if from_model
+        else [UserDefinedError(error_code="incompleteTOTP", reasoning="page guess", confidence_float=0.5)]
+    )
     monkeypatch.setattr("skyvern.forge.agent.detect_user_defined_errors_for_task", detect_mock)
     errors_update = AsyncMock()
     monkeypatch.setattr("skyvern.forge.agent.app.DATABASE.tasks.update_task", errors_update)
@@ -5338,19 +5345,24 @@ async def test_execute_task_v3_a_missing_code_source_and_the_models_code_are_bot
     def _no_source(kwargs: dict[str, Any]) -> None:
         kwargs["verification_blocker"].__self__.last_status = NO_ONE_TIME_CODE_SOURCE
 
+    block_code = "COVERAGE_NOT_ACTIVE" if from_model else "incompleteTOTP"
     await _run_execute_task_v3(
         monkeypatch,
-        LoopOutcome(status="terminated", reason="no code was delivered", error_code="COVERAGE_NOT_ACTIVE"),
+        LoopOutcome(
+            status="terminated",
+            reason="no code was delivered",
+            error_code="COVERAGE_NOT_ACTIVE" if from_model else None,
+        ),
         task_block=_make_block(NavigationBlock, navigation_goal="Sign in"),
         on_loop=_no_source,
-        error_code_mapping={"COVERAGE_NOT_ACTIVE": "x"},
+        error_code_mapping={block_code: "x"},
         data_extraction_goal=None,
         extracted_information_schema=None,
     )
 
     written = [error for call in errors_update.await_args_list for error in call.kwargs.get("errors") or []]
-    assert [error["error_code"] for error in written] == ["MISSING_TOTP_SOURCE", "COVERAGE_NOT_ACTIVE"]
-    assert detect_mock.await_count == 0
+    assert [error["error_code"] for error in written] == [block_code, "MISSING_TOTP_SOURCE"]
+    assert detect_mock.await_count == (0 if from_model else 1)
 
 
 @pytest.mark.asyncio

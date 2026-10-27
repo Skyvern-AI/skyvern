@@ -3,6 +3,7 @@
 # -- begin speed up unit tests
 import asyncio
 import contextlib
+import functools
 import hashlib
 import itertools
 import logging
@@ -15,9 +16,10 @@ from collections.abc import AsyncGenerator, AsyncIterator, Awaitable, Callable, 
 from contextlib import AbstractAsyncContextManager, asynccontextmanager
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
+from io import BytesIO
 from pathlib import Path
 from types import SimpleNamespace
-from typing import Any, TypeVar
+from typing import Any, NoReturn, TypeVar
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -27,8 +29,13 @@ from opentelemetry import trace as otel_trace
 from opentelemetry.sdk.trace import TracerProvider
 from opentelemetry.sdk.trace.export import SimpleSpanProcessor
 from opentelemetry.sdk.trace.export.in_memory_span_exporter import InMemorySpanExporter
-from playwright.async_api import Download
+from PIL import Image
+from playwright.async_api import BrowserContext, Download
 from playwright.async_api import Error as PlaywrightError
+from playwright.async_api import Page
+from playwright.async_api import TimeoutError as PlaywrightTimeoutError
+from playwright.async_api import async_playwright
+from playwright.sync_api import sync_playwright
 from sqlalchemy import Engine, create_engine, func, select
 from sqlalchemy.engine import URL, make_url
 from sqlalchemy.ext.asyncio import AsyncEngine, create_async_engine
@@ -65,6 +72,7 @@ from skyvern.forge.sdk.workflow.models.parameter import OutputParameter, Workflo
 from skyvern.forge.sdk.workflow.models.workflow import WorkflowDefinition, WorkflowRunStatus
 from skyvern.forge.sdk.workflow.service import WorkflowService
 from skyvern.services import workflow_run_group_service as group_service
+from skyvern.webeye.browser_engine import SKYCDP_ENGINE_NAME, BrowserEngineMetadata, BrowserEngineSelection
 from skyvern.webeye.utils import page as page_module
 from skyvern.webeye.utils.page import ScreenshotMode
 from tests.unit._fingerprint_expectations import FINGERPRINT_TEST_SECRET_KEY
@@ -1318,3 +1326,109 @@ def org_vault(monkeypatch: pytest.MonkeyPatch) -> OrgVaultFake:
     monkeypatch.setattr(BitwardenService, "get_login_item_sites", fake.sites)
     monkeypatch.setattr(BitwardenService, "get_secret_value_from_url", fake.secret)
     return fake
+
+
+MARKER_RGB = (12, 200, 34)
+
+
+@functools.cache
+def chromium_available() -> bool:
+    try:
+        with sync_playwright() as playwright:
+            return Path(playwright.chromium.executable_path).exists()
+    except Exception:
+        return False
+
+
+def requires_chromium(test: _T) -> _T:
+    return pytest.mark.skipif(
+        not chromium_available(),
+        reason="Requires Playwright browsers installed (run: playwright install chromium)",
+    )(test)
+
+
+@asynccontextmanager
+async def chromium_context() -> AsyncIterator[BrowserContext]:
+    async with async_playwright() as playwright:
+        browser = await playwright.chromium.launch(headless=True)
+        try:
+            yield await browser.new_context()
+        finally:
+            await browser.close()
+
+
+@asynccontextmanager
+async def never_answering_origin() -> AsyncIterator[str]:
+    """An HTTP origin that accepts requests and never answers; a web font fetched from it holds ``page.screenshot``."""
+    release = asyncio.Event()
+
+    async def hold(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
+        await release.wait()
+        writer.close()
+
+    server = await asyncio.start_server(hold, "127.0.0.1", 0)
+    try:
+        yield f"http://127.0.0.1:{server.sockets[0].getsockname()[1]}"
+    finally:
+        release.set()
+        server.close()
+        await server.wait_closed()
+
+
+def stalled_font_css(origin: str, color: tuple[int, int, int]) -> str:
+    rgb = "rgb({},{},{})".format(*color)
+    return (
+        f"@font-face{{font-family:Never;src:url({origin}/never.woff2)}}"
+        f"html,body{{font-family:Never !important;background:{rgb} !important}}"
+    )
+
+
+async def open_marker_page(
+    context: BrowserContext,
+    color: tuple[int, int, int],
+    url: str,
+    *,
+    stall_origin: str | None = None,
+    height_px: int = 720,
+) -> Page:
+    """Serve ``url`` to this page only as one solid ``color``; ``stall_origin`` (same origin as ``url``) leaves a
+    web font loading forever."""
+    rgb = "rgb({},{},{})".format(*color)
+    css = stalled_font_css(stall_origin, color) if stall_origin else ""
+    html = (
+        f"<html><head><style>html,body{{margin:0;background:{rgb}}}{css}</style></head>"
+        f"<body><div style='height:{height_px}px'>marker</div></body></html>"
+    )
+    page = await context.new_page()
+    await page.route(url, lambda route: route.fulfill(body=html, content_type="text/html"))
+    await page.goto(url, wait_until="domcontentloaded")
+    if stall_origin:
+        await page.wait_for_function("document.fonts.status === 'loading'")
+    return page
+
+
+def png_background_colors(png: bytes) -> set[tuple[int, int, int]]:
+    """Colors of the right-edge column every 50 px, clear of the top-left marker text."""
+    with Image.open(BytesIO(png)) as image:
+        rgb = image.convert("RGB")
+        return {rgb.getpixel((rgb.width - 5, y)) for y in range(0, rgb.height, 50)}
+
+
+async def _never_start_driver() -> NoReturn:
+    raise AssertionError("driver startup is outside this test")
+
+
+def skycdp_engine_selection() -> BrowserEngineSelection:
+    return BrowserEngineSelection(
+        name=SKYCDP_ENGINE_NAME,
+        start_driver=_never_start_driver,
+        error_type=PlaywrightError,
+        timeout_error_type=PlaywrightTimeoutError,
+        metadata=BrowserEngineMetadata(name=SKYCDP_ENGINE_NAME, version="test"),
+        selection_reason="test",
+    )
+
+
+async def screenshot_stalls_until_its_own_timeout(*, timeout: float, **_kwargs: object) -> bytes:
+    await asyncio.sleep(timeout / 1000)
+    raise PlaywrightTimeoutError("waiting for fonts to load")

@@ -53,7 +53,7 @@ from skyvern.schemas.runs import RunType
 from skyvern.schemas.workflows import BlockType
 from skyvern.services import run_service, task_v2_service
 from skyvern.webeye.actions.actions import Action, InputTextAction
-from tests.unit.force_stub_app import make_workflow_run_attempts_fake
+from tests.unit.force_stub_app import make_workflow_run_attempts_fake, released_session_stub
 
 # ---------- Layer 1: truncate_oversized_jsonb_value ----------
 
@@ -401,6 +401,7 @@ async def _build_status_response(
         workflow_service_module.app,
         "DATABASE",
         SimpleNamespace(
+            Session=released_session_stub(),
             workflows=SimpleNamespace(get_workflow_for_workflow_run=AsyncMock(return_value=workflow)),
             observer=SimpleNamespace(get_task_v2_by_workflow_run_id=AsyncMock(return_value=None)),
             tasks=SimpleNamespace(get_tasks_by_workflow_run_id=AsyncMock(return_value=[])),
@@ -493,7 +494,7 @@ async def test_task_run_response_caps_failure_reason_only_when_opted_in(monkeypa
     monkeypatch.setattr(
         run_service.app,
         "DATABASE",
-        SimpleNamespace(tasks=SimpleNamespace(get_run=AsyncMock(return_value=run))),
+        SimpleNamespace(Session=released_session_stub(), tasks=SimpleNamespace(get_run=AsyncMock(return_value=run))),
     )
     monkeypatch.setattr(run_service.task_v1_service, "get_task_v1_response", AsyncMock(return_value=task_v1_response))
     monkeypatch.setattr(run_service, "TaskRunResponse", lambda **kwargs: SimpleNamespace(**kwargs))
@@ -1567,6 +1568,7 @@ async def test_run_detail_services_pass_capped_reads_to_real_repositories(
         workflow_service_module.app,
         "DATABASE",
         SimpleNamespace(
+            Session=released_session_stub(),
             workflows=SimpleNamespace(get_workflow_for_workflow_run=AsyncMock(return_value=workflow)),
             workflow_runs=workflow_runs,
             workflow_params=SimpleNamespace(get_workflow_output_parameters_by_ids=AsyncMock(return_value=[])),

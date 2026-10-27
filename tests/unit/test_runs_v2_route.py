@@ -726,6 +726,7 @@ async def test_workflow_service_forwards_created_at_bounds_to_the_repository(mon
 @pytest.mark.parametrize(
     ("original_trigger_type", "x_user_agent", "expected_trigger"),
     [
+        (WorkflowRunTriggerType.seo_recipe_submit, None, WorkflowRunTriggerType.seo_recipe_submit),
         (WorkflowRunTriggerType.api, None, WorkflowRunTriggerType.api),
         (WorkflowRunTriggerType.api, SKYVERN_UI_USER_AGENT, WorkflowRunTriggerType.manual),
         (WorkflowRunTriggerType.api, SKYVERN_MCP_USER_AGENT, WorkflowRunTriggerType.mcp),
@@ -816,6 +817,7 @@ async def test_retry_workflow_run_preserves_recipe_trigger_and_derives_ordinary_
     monkeypatch.setattr(agent_protocol.analytics, "capture", lambda *args, **kwargs: None)
     monkeypatch.setattr(agent_protocol.skyvern_context, "ensure_context", lambda: SimpleNamespace(request_id="req_123"))
     mock_agent_function = SimpleNamespace(
+        get_workflow_run_retry_refusal=AsyncMock(return_value=None),
         is_block_scoped_workflow_run=AsyncMock(return_value=False),
         on_run_created=AsyncMock(),
     )
@@ -923,7 +925,10 @@ async def test_retry_workflow_run_rejects_block_scoped_run(monkeypatch: pytest.M
     monkeypatch.setattr(
         app_instance,
         "AGENT_FUNCTION",
-        SimpleNamespace(is_block_scoped_workflow_run=AsyncMock(return_value=False)),
+        SimpleNamespace(
+            get_workflow_run_retry_refusal=AsyncMock(return_value=None),
+            is_block_scoped_workflow_run=AsyncMock(return_value=False),
+        ),
         raising=False,
     )
     monkeypatch.setattr(agent_protocol.analytics, "capture", lambda *args, **kwargs: None)
@@ -1012,6 +1017,7 @@ async def test_retry_workflow_run_replays_template_runs_as_templates(monkeypatch
         app_instance,
         "AGENT_FUNCTION",
         SimpleNamespace(
+            get_workflow_run_retry_refusal=AsyncMock(return_value=None),
             is_block_scoped_workflow_run=AsyncMock(return_value=False),
             on_run_created=AsyncMock(),
         ),
@@ -1081,7 +1087,10 @@ async def test_retry_workflow_run_rejects_missing_workflow(monkeypatch: pytest.M
     monkeypatch.setattr(
         app_instance,
         "AGENT_FUNCTION",
-        SimpleNamespace(is_block_scoped_workflow_run=AsyncMock(return_value=False)),
+        SimpleNamespace(
+            get_workflow_run_retry_refusal=AsyncMock(return_value=None),
+            is_block_scoped_workflow_run=AsyncMock(return_value=False),
+        ),
         raising=False,
     )
     monkeypatch.setattr(

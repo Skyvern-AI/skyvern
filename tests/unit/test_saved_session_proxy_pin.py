@@ -92,8 +92,8 @@ def _workflow_run(
     *,
     proxy_location: ProxyLocation | str | None = ProxyLocation.RESIDENTIAL_ISP,
     browser_profile_id: str | None = None,
-) -> SimpleNamespace:
-    return SimpleNamespace(
+) -> WorkflowRun:
+    return WorkflowRun.model_construct(
         workflow_run_id="wr_test",
         workflow_permanent_id="wpid_test",
         organization_id="org_test",
@@ -215,7 +215,7 @@ async def _prepare_profile(
     monkeypatch: pytest.MonkeyPatch,
     *,
     workflow: SimpleNamespace | None = None,
-    workflow_run: SimpleNamespace | None = None,
+    workflow_run: WorkflowRun | None = None,
     profile: SimpleNamespace | None = None,
     update_profile: AsyncMock | None = None,
     parameter_values: dict[str, object] | None = None,
@@ -230,13 +230,13 @@ async def _prepare_profile(
         AsyncMock(return_value=(profile, False)),
     )
     monkeypatch.setattr(app.DATABASE.browser_sessions, "update_browser_profile", update_profile)
-    updated_run = SimpleNamespace(**{**vars(workflow_run), "browser_profile_id": profile.browser_profile_id})
+    updated_run = workflow_run.model_copy(update={"browser_profile_id": profile.browser_profile_id})
     monkeypatch.setattr(app.DATABASE.workflow_runs, "update_workflow_run", AsyncMock(return_value=updated_run))
     _mock_storage(monkeypatch)
 
     return await WorkflowService()._ensure_managed_browser_profile(
         workflow=workflow,  # type: ignore[arg-type]
-        workflow_run=workflow_run,  # type: ignore[arg-type]
+        workflow_run=workflow_run,
         parameter_values=parameter_values or {"credential_id": "cred_a"},
     )
 
@@ -247,11 +247,11 @@ async def _setup_profile_with_reconcile_failure(
     workflow: SimpleNamespace,
     workflow_request: WorkflowRequestBody | None = None,
     profile: SimpleNamespace | None = None,
-) -> tuple[WorkflowService, SimpleNamespace, AsyncMock, AsyncMock, Exception | None]:
+) -> tuple[WorkflowService, WorkflowRun, AsyncMock, AsyncMock, Exception | None]:
     workflow_request = workflow_request or WorkflowRequestBody()
     profile = profile or _profile(proxy_session_id=None)
     workflow_run = _workflow_run(proxy_location=workflow_request.proxy_location or workflow.proxy_location)
-    updated_run = SimpleNamespace(**{**vars(workflow_run), "browser_profile_id": profile.browser_profile_id})
+    updated_run = workflow_run.model_copy(update={"browser_profile_id": profile.browser_profile_id})
     service = WorkflowService()
     service.get_workflow_by_permanent_id = AsyncMock(return_value=workflow)  # type: ignore[method-assign]
     service.create_workflow_run = AsyncMock(return_value=workflow_run)  # type: ignore[method-assign]
