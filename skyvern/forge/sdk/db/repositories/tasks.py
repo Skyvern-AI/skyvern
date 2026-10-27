@@ -692,7 +692,14 @@ class TasksRepository(BaseRepository):
 
     @db_operation("update_task_and_claim_finish_for_cancel")
     async def update_task_and_claim_finish_for_cancel(
-        self, task_id: str, organization_id: str, audit_actor: RequestPrincipal | None = None
+        self,
+        task_id: str,
+        organization_id: str,
+        audit_actor: RequestPrincipal | None = None,
+        failure_reason: str | None = None,
+        errors: list[dict[str, Any]] | None = None,
+        extracted_information: dict[str, Any] | list | str | None = None,
+        webhook_failure_reason: str | None = None,
     ) -> tuple[Task, bool, bool]:
         finish_claimed = False
         async with self.Session() as session:
@@ -707,15 +714,25 @@ class TasksRepository(BaseRepository):
                 return convert_to_task(task, debug_enabled=self.debug_enabled), False, False
 
             finish_claimed = task.finished_at is None
+            values: dict[str, Any] = {
+                "status": TaskStatus.canceled.value,
+                "finished_at": func.coalesce(TaskModel.finished_at, naive_utc_now()),
+            }
+            if failure_reason is not None:
+                values["failure_reason"] = failure_reason
+            if errors is not None:
+                values["errors"] = (task.errors or []) + errors
+            if extracted_information is not None:
+                values["extracted_information"] = extracted_information
+            if webhook_failure_reason is not None:
+                values["webhook_failure_reason"] = webhook_failure_reason
+
             result = await session.execute(
                 update(TaskModel)
                 .where(TaskModel.task_id == task_id)
                 .where(TaskModel.organization_id == organization_id)
                 .where(TaskModel.status.not_in([status.value for status in TaskStatus if status.is_final()]))
-                .values(
-                    status=TaskStatus.canceled.value,
-                    finished_at=func.coalesce(TaskModel.finished_at, naive_utc_now()),
-                )
+                .values(**values)
                 .returning(TaskModel)
                 .execution_options(populate_existing=True)
             )

@@ -947,6 +947,11 @@ def is_download_response(headers: dict[str, str], status_code: int, resource_typ
     if status_code >= 300:
         return False
 
+    return has_download_response_headers(headers, resource_type)
+
+
+def has_download_response_headers(headers: dict[str, str], resource_type: str = "") -> bool:
+    """Check whether response headers identify a downloadable body, without considering status."""
     if resource_type in NON_DOWNLOAD_RESOURCE_TYPES:
         return False
 
