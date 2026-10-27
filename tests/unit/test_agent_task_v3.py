@@ -5369,19 +5369,33 @@ async def test_execute_task_v3_the_models_finish_answer_replaces_the_page_guess(
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("from_model", [True, False], ids=["model_chose_the_code", "detector_chose_the_code"])
-async def test_execute_task_v3_a_missing_code_source_is_stored_after_the_blocks_own_code(
-    monkeypatch: pytest.MonkeyPatch, from_model: bool
+@pytest.mark.parametrize(
+    ("gate_on", "model_code", "declined", "detected", "expected"),
+    [
+        (True, "COVERAGE_NOT_ACTIVE", False, [], ["COVERAGE_NOT_ACTIVE"]),
+        (False, None, False, ["incompleteTOTP"], ["incompleteTOTP"]),
+        (True, None, True, [], ["MISSING_TOTP_SOURCE"]),
+        (False, None, False, [], ["MISSING_TOTP_SOURCE"]),
+    ],
+    ids=["model_chose_a_code", "detector_chose_a_code", "model_declined_every_code", "detector_found_nothing"],
+)
+async def test_execute_task_v3_reports_the_built_in_missing_code_source_only_without_the_blocks_own_code(
+    monkeypatch: pytest.MonkeyPatch,
+    gate_on: bool,
+    model_code: str | None,
+    declined: bool,
+    detected: list[str],
+    expected: list[str],
 ) -> None:
-    # errors is append-only and callers route on errors[0], so the block's own code leads whichever source
-    # produced it, and the MISSING_TOTP_SOURCE Skyvern attaches itself follows it.
+    # errors appends and every entry reports USER_DEFINED_ERROR, so the MISSING_TOTP_SOURCE Skyvern attaches
+    # itself is a fallback: written only when neither the model nor the detector produced the block's own code.
     monkeypatch.setattr(
-        "skyvern.forge.agent.app.AGENT_FUNCTION.task_v3_error_code_on_finish", AsyncMock(return_value=from_model)
+        "skyvern.forge.agent.app.AGENT_FUNCTION.task_v3_error_code_on_finish", AsyncMock(return_value=gate_on)
     )
     detect_mock = AsyncMock(
-        return_value=[]
-        if from_model
-        else [UserDefinedError(error_code="incompleteTOTP", reasoning="page guess", confidence_float=0.5)]
+        return_value=[
+            UserDefinedError(error_code=code, reasoning="page guess", confidence_float=0.5) for code in detected
+        ]
     )
     monkeypatch.setattr("skyvern.forge.agent.detect_user_defined_errors_for_task", detect_mock)
     errors_update = AsyncMock()
@@ -5390,24 +5404,26 @@ async def test_execute_task_v3_a_missing_code_source_is_stored_after_the_blocks_
     def _no_source(kwargs: dict[str, Any]) -> None:
         kwargs["verification_blocker"].__self__.last_status = NO_ONE_TIME_CODE_SOURCE
 
-    block_code = "COVERAGE_NOT_ACTIVE" if from_model else "incompleteTOTP"
-    await _run_execute_task_v3(
+    _step, task, _loop_mock, _post = await _run_execute_task_v3(
         monkeypatch,
         LoopOutcome(
             status="terminated",
             reason="no code was delivered",
-            error_code="COVERAGE_NOT_ACTIVE" if from_model else None,
+            error_code=model_code,
+            error_code_declined=declined,
         ),
         task_block=_make_block(NavigationBlock, navigation_goal="Sign in"),
         on_loop=_no_source,
-        error_code_mapping={block_code: "x"},
+        error_code_mapping={"COVERAGE_NOT_ACTIVE": "x", "incompleteTOTP": "y"},
         data_extraction_goal=None,
         extracted_information_schema=None,
     )
 
     written = [error for call in errors_update.await_args_list for error in call.kwargs.get("errors") or []]
-    assert [error["error_code"] for error in written] == [block_code, "MISSING_TOTP_SOURCE"]
-    assert detect_mock.await_count == (0 if from_model else 1)
+    assert [error["error_code"] for error in written] == expected
+    assert detect_mock.await_count == (0 if gate_on else 1)
+    # Suppressing the code does not drop the attribution: the status stays readable on the run.
+    assert NO_ONE_TIME_CODE_SOURCE in (task.failure_reason or "")
 
 
 @pytest.mark.asyncio
