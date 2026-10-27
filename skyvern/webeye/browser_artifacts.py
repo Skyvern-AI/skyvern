@@ -127,6 +127,9 @@ class BrowserArtifacts(BaseModel):
     # Whether the creator started this browser's process on this host itself, rather than dialing one.
     _spawned_local_browser: bool = PrivateAttr(default=False)
     _native_downloads: NativeDownloads | None = PrivateAttr(default=None)
+    # Log-only provider session id for runtime events. Unlike remote_browser_session_id it must not drive
+    # page selection, downloads or any other behavior.
+    _provider_session_id: str | None = PrivateAttr(default=None)
 
     @property
     def native_downloads(self) -> NativeDownloads | None:
@@ -155,6 +158,13 @@ class BrowserArtifacts(BaseModel):
     @property
     def requested_graphics_flags(self) -> tuple[str, ...] | None:
         return self._requested_graphics_flags
+
+    def note_provider_session_id(self, session_id: str | None) -> None:
+        self._provider_session_id = session_id or None
+
+    @property
+    def provider_session_id(self) -> str | None:
+        return self._provider_session_id
 
     def note_spawned_local_browser(self) -> None:
         self._spawned_local_browser = True

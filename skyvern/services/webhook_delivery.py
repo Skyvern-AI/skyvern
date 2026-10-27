@@ -7,7 +7,9 @@ import errno
 import random
 import socket
 import ssl
-from collections.abc import Iterator
+import time
+from collections.abc import AsyncIterator, Iterator
+from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from email.utils import parsedate_to_datetime
@@ -40,6 +42,9 @@ _LOCAL_RESOURCE_ERRNOS: frozenset[int] = frozenset({errno.EMFILE, errno.ENFILE, 
 WEBHOOK_DELIVERY_MAX_ATTEMPTS = 3
 WEBHOOK_DELIVERY_RETRY_BASE_DELAY_SECONDS = 1.0
 WEBHOOK_DELIVERY_MAX_RETRY_AFTER_SECONDS = 30.0
+# The share of the workflow webhook grace (retry_policy.WEBHOOK_FALLBACK_GRACE_SECONDS) that one delivery's retries may
+# use; bound_webhook_request lets the request in flight run one request window past it, which the grace leaves room for.
+WEBHOOK_DELIVERY_BUDGET_SECONDS = 150.0
 
 
 # The paths that send a run's final webhook without an attempt claim; a skipped send logs which one it was.
@@ -76,6 +81,30 @@ class PreparedWorkflowWebhook:
 @dataclass
 class WebhookDeliveryAttempts:
     count: int = 0
+    # Connects to a relay in front of the target (the cloud NAT egress proxy) retried without spending an attempt.
+    proxy_hop_retries: int = 0
+    # time.monotonic() by which every retry, including relay hop retries, must fit, and after which a request in flight
+    # gets one more request window; set by deliver_webhook_with_retries.
+    deadline: float | None = None
+
+    def has_budget_for(self, seconds: float) -> bool:
+        return self.deadline is None or time.monotonic() + seconds <= self.deadline
+
+
+@asynccontextmanager
+async def bound_webhook_request(
+    attempts: WebhookDeliveryAttempts | None, request_window_seconds: float
+) -> AsyncIterator[None]:
+    # httpx timeouts are per operation, so a response dripped just under them never times out on its own.
+    if attempts is None or attempts.deadline is None:
+        yield
+        return
+    cap = max(attempts.deadline + request_window_seconds - time.monotonic(), 0.0)
+    try:
+        async with asyncio.timeout(cap):
+            yield
+    except TimeoutError as exc:
+        raise httpx.ReadTimeout(f"Webhook request did not finish before its delivery deadline ({cap:.0f}s)") from exc
 
 
 def is_retryable_status(status_code: int) -> bool:
@@ -199,6 +228,7 @@ def log_workflow_webhook_delivery_finalized(
     attempts: int,
     finished_at: datetime | None,
     replay: bool = False,
+    proxy_hop_retries: int = 0,
 ) -> None:
     delivery_seconds = None
     if finished_at is not None:
@@ -210,6 +240,7 @@ def log_workflow_webhook_delivery_finalized(
         delivery_outcome=delivery_outcome.value,
         http_status_class=http_status_class(status_code),
         attempts=attempts,
+        proxy_hop_retries=proxy_hop_retries,
         delivery_seconds=delivery_seconds,
         replay=replay,
     )
@@ -269,12 +300,14 @@ async def deliver_webhook_with_retries(
         # httpx.UnsupportedProtocol from the transport.
         raise InvalidUrl(url)
 
+    if attempts is None:
+        attempts = WebhookDeliveryAttempts()
+    attempts.deadline = time.monotonic() + WEBHOOK_DELIVERY_BUDGET_SECONDS
     last_response: httpx.Response | None = None
     last_exc: Exception | None = None
 
     for attempt in range(max_attempts):
-        if attempts is not None:
-            attempts.count = attempt + 1
+        attempts.count = attempt + 1
         try:
             validated_url, resolved_ips = await asyncio.to_thread(validate_fetch_url_with_resolved_ips, url)
             response = await app.AGENT_FUNCTION.deliver_webhook(
@@ -285,6 +318,7 @@ async def deliver_webhook_with_retries(
                 organization_id=organization_id,
                 run_id=run_id,
                 resolved_ips=resolved_ips,
+                attempts=attempts,
             )
             last_response = response
             last_exc = None
@@ -318,6 +352,21 @@ async def deliver_webhook_with_retries(
                 error_reason = format_no_response_failure_reason(last_exc)
             else:
                 error_reason = None
+            if not attempts.has_budget_for(delay + timeout_seconds):
+                LOG.info(
+                    "Not retrying webhook delivery; its time budget cannot fit another attempt",
+                    url=url,
+                    run_id=run_id,
+                    organization_id=organization_id,
+                    attempt=attempt + 1,
+                    max_attempts=max_attempts,
+                    status_code=status_code,
+                    error=describe_delivery_error(last_exc) if last_exc is not None else None,
+                    error_reason=error_reason,
+                    budget_seconds=WEBHOOK_DELIVERY_BUDGET_SECONDS,
+                    proxy_hop_retries=attempts.proxy_hop_retries,
+                )
+                break
             log_fn = LOG.warning if status_code == 403 else LOG.info
             log_fn(
                 "Retrying webhook delivery after transient failure",

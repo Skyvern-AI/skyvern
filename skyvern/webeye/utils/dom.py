@@ -22,6 +22,7 @@ from skyvern.constants import SKYVERN_ID_ATTR
 from skyvern.exceptions import (
     ElementIsNotLabel,
     ElementOutOfCurrentViewport,
+    FailToOpenLink,
     FrameChainLoop,
     InteractWithDisabledElement,
     InvalidElementForTextInput,
@@ -1660,10 +1661,11 @@ class SkyvernElement:
 
         href = await asyncio.to_thread(validate_fetch_url, href)
 
+        origin_url = page.url
         LOG.info(
             "Trying to navigate to the <a> href link instead of clicking",
             href=href,
-            current_url=page.url,
+            current_url=origin_url,
         )
         try:
             response = await page.goto(href, timeout=settings.BROWSER_LOADING_TIMEOUT_MS)
@@ -1679,7 +1681,7 @@ class SkyvernElement:
                 return href
 
             LOG.warning("Failed to navigate to the <a> href link", exc_info=True, href=href, current_url=page.url)
-            raise
+            raise FailToOpenLink(page_moved=page.url != origin_url) from e
 
         await revalidate_redirect_chain(response, validate_fetch_url, page.goto)
         return href

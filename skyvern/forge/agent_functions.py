@@ -86,6 +86,7 @@ from skyvern.forge.sdk.workflow.retry_policy import WORKFLOW_WEBHOOK_HTTP_TIMEOU
 from skyvern.schemas.run_enums import RunEngine, RunType
 from skyvern.schemas.workflows import BlockResult, CodeBlockFailureKind, FileStorageType, FileUploadDestination
 from skyvern.services.otp_email import EmailOTPSearchError, EmailOTPVerificationContext, build_email_otp_sources
+from skyvern.services.webhook_delivery import WebhookDeliveryAttempts, bound_webhook_request
 from skyvern.services.workflow_run_group_service import schedule_advance_after_terminal
 from skyvern.utils.email_validation import normalize_identifier_if_email
 from skyvern.utils.url_validators import pinned_ip_client
@@ -1180,7 +1181,7 @@ class AgentFunction:
         return BillingTier.UNKNOWN
 
     # Whether the error code v3's model chose on finish is stored in place of the post-run page guess. The model is
-    # offered the codes either way; cloud gates this per organization.
+    # offered the codes either way. The setting forces it on; where it is off, cloud gates this per organization.
     async def task_v3_error_code_on_finish(self, *, organization_id: str) -> bool:
         return settings.TASK_V3_ERROR_CODE_ON_FINISH
 
@@ -1940,6 +1941,9 @@ class AgentFunction:
         if not can_execute:
             raise StepUnableToExecuteError(step_id=step.step_id, reason=f"Cannot execute step. Reasons: {reasons}")
 
+    async def get_workflow_run_retry_refusal(self, workflow_run: WorkflowRun) -> str | None:
+        return None
+
     async def before_workflow_run_start(
         self,
         workflow_run: WorkflowRun,
@@ -1951,6 +1955,10 @@ class AgentFunction:
 
     async def should_defer_workflow_browser_creation(self, workflow_run: WorkflowRun) -> bool:
         return False
+
+    def generate_root_workflow_run_id(self, trigger_type: WorkflowRunTriggerType | None) -> str | None:
+        """Return the ID for a new root workflow run; None keeps the default ``wr_`` ID."""
+        return None
 
     async def admit_recipe_step_attempt(
         self,
@@ -2906,16 +2914,18 @@ class AgentFunction:
         organization_id: str | None = None,
         run_id: str | None = None,
         resolved_ips: tuple[str, ...] | None = None,
+        attempts: WebhookDeliveryAttempts | None = None,
     ) -> httpx.Response:
         """Deliver a webhook POST request to *url*.
 
         Returns the upstream ``httpx.Response``.  Cloud override routes NAT-org
-        traffic through the egress proxy so it egresses from a static IP.
+        traffic through the egress proxy so it egresses from a static IP, and
+        records the proxy-hop connects it retries on ``attempts``.
 
         ``resolved_ips`` pins the connection to addresses the caller already validated,
         closing the DNS-rebinding window between validation and connect.
         """
-        async with pinned_ip_client(resolved_ips) as client:
+        async with bound_webhook_request(attempts, timeout_seconds), pinned_ip_client(resolved_ips) as client:
             return await client.post(
                 url,
                 content=payload,

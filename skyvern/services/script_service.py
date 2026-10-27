@@ -61,7 +61,7 @@ from skyvern.forge.sdk.artifact.models import ArtifactType
 from skyvern.forge.sdk.artifact.storage.base import get_download_retry_started_at, is_file_from_retry_attempt
 from skyvern.forge.sdk.core import skyvern_context
 from skyvern.forge.sdk.core.hashing import diagnostic_fingerprint
-from skyvern.forge.sdk.db.enums import TaskType, is_job_recipe_workflow_run_trigger_type
+from skyvern.forge.sdk.db.enums import TaskType, is_recipe_billing_workflow_run_trigger_type
 from skyvern.forge.sdk.executor.run_liveness import run_lease_lost, run_lease_tasks_enabled
 from skyvern.forge.sdk.experimentation.workflow_block_engine import run_honors_chosen_engine
 from skyvern.forge.sdk.models import Step, StepStatus
@@ -776,7 +776,7 @@ async def _create_workflow_block_run_and_task(
                 )
                 raise e from trigger_lookup_error
             trigger_type = workflow_run.trigger_type if workflow_run else None
-        if is_job_recipe_workflow_run_trigger_type(trigger_type):
+        if is_recipe_billing_workflow_run_trigger_type(trigger_type):
             raise e
         LOG.warning(
             "Failed to create workflow block run and task",

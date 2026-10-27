@@ -13,6 +13,7 @@ from skyvern.config import settings
 from skyvern.constants import (
     EGRESS_ATTRIBUTABLE_NAV_ERRORS,
     PERMANENT_NAV_ERRORS,
+    PROXY_TRANSPORT_NAV_ERRORS,
     SKIP_INNER_NAV_RETRY_ERRORS,
 )
 from skyvern.exceptions import (
@@ -166,6 +167,16 @@ def is_skip_inner_retry_error(error_message: str) -> bool:
 
 def is_permanent_navigation_error(error_message: str) -> bool:
     return any(pattern in error_message for pattern in PERMANENT_NAV_ERRORS)
+
+
+def is_proxy_transport_navigation_error(error_message: str) -> bool:
+    """Whether the proxy hop itself refused the navigation, before the target was contacted.
+
+    Narrower than ``is_egress_attributable_navigation_error``, which also answers for a name that did
+    not resolve and for an untrusted certificate issuer. Callers that redraw a proxy to recover want
+    this one: those two are not cleared by another draw.
+    """
+    return any(pattern in error_message for pattern in PROXY_TRANSPORT_NAV_ERRORS)
 
 
 def is_egress_attributable_navigation_error(error_message: str) -> bool:

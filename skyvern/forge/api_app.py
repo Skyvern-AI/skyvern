@@ -553,9 +553,8 @@ def create_api_app() -> FastAPI:
         include_in_schema=False,
         dependencies=[ROUTE_AUTHORIZATION_DEPENDENCY],
     )
-    # Twilio SMS 2FA: public inbound receiver (secret-URL + signature auth inside
-    # the handler) and the org-scoped integration management routes. Same
-    # dual-prefix + include_in_schema=False pattern as the OAuth routers above.
+    # Inbound SMS uses secret-URL and signature authentication. Only the canonical
+    # organization-scoped integration routes appear in the public schema.
     fastapi_app.include_router(
         sms_inbound_router, prefix="/v1/sms", include_in_schema=False, dependencies=[ROUTE_AUTHORIZATION_DEPENDENCY]
     )
@@ -565,7 +564,6 @@ def create_api_app() -> FastAPI:
     fastapi_app.include_router(
         twilio_integration_router,
         prefix="/v1/integrations/twilio",
-        include_in_schema=False,
         dependencies=[ROUTE_AUTHORIZATION_DEPENDENCY],
     )
     fastapi_app.include_router(

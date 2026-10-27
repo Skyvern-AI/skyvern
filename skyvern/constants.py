@@ -53,6 +53,13 @@ PROXY_TRANSPORT_NAV_ERRORS = (
     "net::ERR_SOCKS_CONNECTION_FAILED",
     "net::ERR_SOCKS_CONNECTION_HOST_UNREACHABLE",
 )
+# Browser-context draws allowed for one navigation. A generic net::ERR keeps the single historical
+# recovery. A refusal by the proxy hop gets more because that refusal is a property of the draw rather
+# than of the route or the target -- a run minutes or seconds away reaches the same target fine -- so
+# independent draws are the only thing that clears it. Each draw relaunches the browser, which already
+# spaces them by seconds, and only a run that would otherwise have failed outright pays for them.
+NAV_ERROR_MAX_BROWSER_DRAWS = 2
+PROXY_TRANSPORT_NAV_MAX_BROWSER_DRAWS = 4
 PROXY_SENSITIVE_NAV_ERRORS = (
     "net::ERR_NAME_NOT_RESOLVED",
     "net::ERR_NAME_RESOLUTION_FAILED",

@@ -2449,8 +2449,23 @@ async def get_credential_totp_code(
         credential_id=credential_id,
         now=now,
     )
-    if cached_response is not None:
-        return cached_response
+    audit_recorded = False
+    # Keep a one-second margin beyond the audit writer's bound; this countdown is integer-valued.
+    if cached_response is not None and cached_response.seconds_remaining > 2:
+        cached_expires_at = now + cached_response.seconds_remaining
+        await record_request_audit_event(
+            current_org.organization_id,
+            "credential.totp_code.read",
+            "credential",
+            credential_id,
+        )
+        audit_recorded = True
+        now = int(time.time())
+        if now < cached_expires_at:
+            return CredentialTotpCodeResponse(
+                code=cached_response.code,
+                seconds_remaining=cached_expires_at - now,
+            )
 
     vault_type = credential.vault_type or CredentialVaultType.BITWARDEN
     credential_service = await _get_credential_vault_service(vault_type_override=vault_type)
@@ -2506,8 +2521,19 @@ async def get_credential_totp_code(
         )
         raise
 
+    now = int(time.time())
     expires_at = ((now // totp.interval) + 1) * totp.interval
     code = totp.at(now)
+    if not audit_recorded:
+        await record_request_audit_event(
+            current_org.organization_id,
+            "credential.totp_code.read",
+            "credential",
+            credential_id,
+        )
+        now = int(time.time())
+        expires_at = ((now // totp.interval) + 1) * totp.interval
+        code = totp.at(now)
     _cache_totp_code_preview(
         organization_id=current_org.organization_id,
         credential_id=credential_id,

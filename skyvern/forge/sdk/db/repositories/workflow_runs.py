@@ -44,7 +44,12 @@ from sqlalchemy.orm import aliased, load_only, undefer
 from sqlalchemy.sql.compiler import SQLCompiler
 from sqlalchemy.sql.selectable import CompoundSelect, Join
 
-from skyvern.exceptions import WorkflowAttemptDispatchSuperseded, WorkflowParameterNotFound, WorkflowRunNotFound
+from skyvern.exceptions import (
+    InvalidWorkflowParameter,
+    WorkflowAttemptDispatchSuperseded,
+    WorkflowParameterNotFound,
+    WorkflowRunNotFound,
+)
 from skyvern.forge import app
 from skyvern.forge.failure_classifier import derive_failure_attribution
 from skyvern.forge.sdk.artifact.models import Artifact, ArtifactType
@@ -1533,20 +1538,21 @@ class WorkflowRunsRepository(BaseRepository):
                     WorkflowRunModel.status.in_(non_terminal),
                 )
                 .values(**values)
-                .returning(WorkflowRunModel.workflow_run_id)
+                .returning(WorkflowRunModel)
+                # The queued path (or a caller's ambient session) already holds this row in the identity map. The UPDATE
+                # autoflushes pending changes first, so only changes left unflushed (no_autoflush) are overwritten.
+                .execution_options(populate_existing=True)
             )
-            affected = result.scalar_one_or_none()
+            updated = result.scalar_one_or_none()
+            # Converted before the commits (this one and the one in save_workflow_run_logs) expire the row, so the
+            # result is the UPDATE-time snapshot. A later concurrent write such as a cancel is not in it;
+            # _execute_single_block reloads the run before each block.
+            workflow_run_result = convert_to_workflow_run(updated) if updated is not None else None
             await session.commit()
-            if affected is None:
+            if workflow_run_result is None:
                 return None
-            refreshed = (
-                await session.scalars(select(WorkflowRunModel).filter_by(workflow_run_id=workflow_run_id))
-            ).one()
             await save_workflow_run_logs(workflow_run_id)
-            # save_workflow_run_logs reuses this session and commits, expiring `refreshed`.
-            # Refresh before convert_to_workflow_run to avoid a greenlet-less lazy-load (MissingGreenlet).
-            await session.refresh(refreshed)
-            return convert_to_workflow_run(refreshed)
+            return workflow_run_result
 
     @asynccontextmanager
     async def admit_workflow_run_block_dispatch(self, workflow_run_id: str) -> AsyncIterator[WorkflowRun]:
@@ -3741,12 +3747,14 @@ class WorkflowRunsRepository(BaseRepository):
             await session.commit()
             return converted
 
-    @db_operation("create_workflow_run_parameters")
+    @db_operation("create_workflow_run_parameters", expected_errors=(InvalidWorkflowParameter,))
     async def create_workflow_run_parameters(
         self,
         workflow_run_id: str,
         workflow_parameter_values: list[tuple[WorkflowParameter, Any]],
     ) -> list[WorkflowRunParameter]:
+        """The created parameters as get_workflow_run_parameters returns them, converted from the stored text, so a
+        stored value that a read cannot convert raises InvalidWorkflowParameter here too, after the commit."""
         if not workflow_parameter_values:
             return []
 
@@ -3764,15 +3772,23 @@ class WorkflowRunsRepository(BaseRepository):
         async with self.Session() as session:
             # One multi-VALUES statement. An ORM add_all + flush has no RETURNING here, so on psycopg it
             # becomes a pipelined executemany that waits on the event loop once per row.
-            await session.execute(insert(WorkflowRunParameterModel).values(rows))
-            converted = [
-                convert_to_workflow_run_parameter(
-                    WorkflowRunParameterModel(**row), workflow_parameter, self.debug_enabled
-                )
-                for row, (workflow_parameter, _) in zip(rows, workflow_parameter_values, strict=True)
-            ]
+            stored = await session.execute(
+                insert(WorkflowRunParameterModel)
+                .values(rows)
+                .returning(WorkflowRunParameterModel.workflow_parameter_id, WorkflowRunParameterModel.value)
+            )
+            stored_values = dict(stored.tuples().all())
             await session.commit()
-            return converted
+        # The value column is text and the driver renders a bool or number into it, so only the stored text converts
+        # as a read of it does.
+        return [
+            convert_to_workflow_run_parameter(
+                WorkflowRunParameterModel(**{**row, "value": stored_values[row["workflow_parameter_id"]]}),
+                workflow_parameter,
+                self.debug_enabled,
+            )
+            for row, (workflow_parameter, _) in zip(rows, workflow_parameter_values, strict=True)
+        ]
 
     @db_operation("get_workflow_run_parameters")
     async def get_workflow_run_parameters(

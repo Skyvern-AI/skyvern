@@ -1457,6 +1457,24 @@ class FailToClick(SkyvernException):
         super().__init__(f"Failed to click({anchor}). element_id={element_id}, error_msg={msg}")
 
 
+class FailToOpenLink(SkyvernException):
+    """A cross-origin link followed as a same-tab navigation that failed.
+
+    Withholds the driver's error, which names a third-party URL the planner never asked to visit and
+    so reads in the action history as the agent having left the site its goal told it to stay on.
+    """
+
+    def __init__(self, page_moved: bool) -> None:
+        # Every clause here is either true by construction (the destination is cross-origin) or
+        # measured (page_moved); a failed goto can still commit an error page, so it is never assumed.
+        landed = (
+            "The browser is no longer on the page it was on before this action."
+            if page_moved
+            else "The current page is unchanged."
+        )
+        super().__init__(f"Failed to open the link: its destination is on another site. {landed}")
+
+
 class FailToHover(SkyvernException):
     def __init__(self, element_id: str, msg: str):
         super().__init__(f"Failed to hover. element_id={element_id}, error_msg={msg}")

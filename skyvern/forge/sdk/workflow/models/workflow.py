@@ -413,6 +413,9 @@ class WorkflowRun(BaseModel):
     created_by: str | None = Field(default=None, description="ID of the user who started the run")
     credits_used: int = 0
     cached_credits_used: int = 0
+    # Set when a write to this run's row failed and the caller carried on, so a commit may have landed that this
+    # object does not show. A model re-read from the row after the failure no longer carries it.
+    _row_write_unconfirmed: bool = PrivateAttr(default=False)
 
     @field_validator("run_with", mode="before")
     @classmethod
@@ -435,6 +438,13 @@ class WorkflowRun(BaseModel):
     @property
     def is_debug_session(self) -> bool:
         return self.debug_session_id is not None
+
+    @property
+    def row_write_unconfirmed(self) -> bool:
+        return self._row_write_unconfirmed
+
+    def mark_row_write_unconfirmed(self) -> None:
+        self._row_write_unconfirmed = True
 
 
 # Stored when attempts of one run executed different definitions; it never equals a real digest.

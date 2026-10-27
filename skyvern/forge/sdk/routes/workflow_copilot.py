@@ -330,7 +330,7 @@ DIAGNOSE_RUN_TURN_MESSAGE = "Diagnose run {run_id} and repair the workflow."
 
 # The id is interpolated into a row the transcript renders as a product utterance, so anything
 # that could read as prose is refused rather than echoed.
-_WORKFLOW_RUN_ID_RE = re.compile(r"\Awr_[A-Za-z0-9]{1,40}\Z")
+_WORKFLOW_RUN_ID_RE = re.compile(r"\Awr_(?:[A-Za-z0-9]{1,40}|sched_[0-9a-f]{20,32}|recipe_[0-9]{1,40})\Z")
 
 _UNUSABLE_DIAGNOSE_RUN_REFUSALS = frozenset(
     {

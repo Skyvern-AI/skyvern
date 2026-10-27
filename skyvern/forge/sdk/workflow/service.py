@@ -13,7 +13,7 @@ import time
 import unicodedata
 import uuid
 from collections import Counter, deque
-from collections.abc import AsyncIterator, Awaitable, Callable, Iterable, Sequence
+from collections.abc import AsyncIterator, Awaitable, Callable, Iterable, Mapping, Sequence
 from contextlib import ExitStack, asynccontextmanager, suppress
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
@@ -2124,7 +2124,7 @@ class WorkflowService:
     @staticmethod
     async def _apply_initial_run_metadata_tags(
         *,
-        workflow_run_id: str,
+        workflow_run: WorkflowRun,
         organization_id: str,
         run_metadata: dict[str, str] | None,
         context: TagWriteContext | None,
@@ -2140,11 +2140,12 @@ class WorkflowService:
         for attempt in range(2):
             try:
                 await app.DATABASE.tags.apply_run_tag_changes(
-                    workflow_run_id=workflow_run_id,
+                    workflow_run_id=workflow_run.workflow_run_id,
                     organization_id=organization_id,
                     sets=run_metadata,
                     deletes=set(),
                     context=write_context,
+                    known_run=workflow_run,
                 )
                 break
             except IntegrityError:
@@ -2157,12 +2158,13 @@ class WorkflowService:
     async def _apply_creation_run_tags_best_effort(
         *,
         workflow: Workflow,
-        workflow_run_id: str,
+        workflow_run: WorkflowRun,
         organization_id: str,
         parameters: dict[str, Any],
         trigger_type: WorkflowRunTriggerType,
         integration_platform: str | None = None,
     ) -> None:
+        workflow_run_id = workflow_run.workflow_run_id
         try:
             tags = {TRIGGER_RUN_TAG_KEY: trigger_type.value}
             if integration_platform is not None:
@@ -2188,6 +2190,7 @@ class WorkflowService:
                 organization_id=organization_id,
                 sets=tags,
                 caller_id=CREATION_RUN_TAG_CALLER_ID,
+                known_run=workflow_run,
             )
         except Exception:
             LOG.warning(
@@ -2214,6 +2217,7 @@ class WorkflowService:
                 organization_id=workflow_run.organization_id,
                 sets=tags,
                 caller_id=COMPLETION_RUN_TAG_CALLER_ID,
+                known_run=workflow_run,
             )
         except Exception:
             LOG.warning(
@@ -2222,6 +2226,7 @@ class WorkflowService:
                 organization_id=workflow_run.organization_id,
                 exc_info=True,
             )
+            await _roll_back_after_swallowed_write()
 
     @staticmethod
     async def _start_credential_fallback_retry_best_effort(workflow_run: WorkflowRun) -> None:
@@ -3401,6 +3406,7 @@ class WorkflowService:
         workflow: Workflow | None = None,
         post_dispatch_effects: list[Callable[[], Awaitable[None]]] | None = None,
         integration_platform: str | None = None,
+        run_parameter_values: dict[str, dict[str, Any]] | None = None,
     ) -> WorkflowRun:
         """
         Create a workflow run and its parameters. Validate the workflow and the organization. If there are missing
@@ -3417,6 +3423,9 @@ class WorkflowService:
         :param workflow: The version resolve_workflow_for_run already returned for these arguments; skips the lookup.
         :param post_dispatch_effects: When given, the best-effort creation tags are appended here for the caller
             to write after it submits the run, instead of being written now.
+        :param run_parameter_values: When given, the run's parameter values are put here under its id, as a read of
+            them would return them. Left unset when the batch insert fell back to per-row inserts or a stored value
+            does not convert.
         :return: The created workflow run.
         """
         async with app.DATABASE.workflow_runs.Session() as outer_session:
@@ -3573,7 +3582,7 @@ class WorkflowService:
             )
             try:
                 await self._apply_initial_run_metadata_tags(
-                    workflow_run_id=workflow_run.workflow_run_id,
+                    workflow_run=workflow_run,
                     organization_id=organization.organization_id,
                     run_metadata=workflow_request.run_metadata,
                     context=tag_write_context,
@@ -3767,13 +3776,15 @@ class WorkflowService:
                     ),
                 )
 
+                created_run_parameters: list[WorkflowRunParameter] | None = []
                 if workflow_parameter_values:
                     try:
-                        await self.create_workflow_run_parameters(
+                        created_run_parameters = await self.create_workflow_run_parameters(
                             workflow_run_id=workflow_run.workflow_run_id,
                             workflow_parameter_values=workflow_parameter_values,
                         )
                     except SQLAlchemyError as batch_error:
+                        created_run_parameters = None
                         # Roll back the failed transaction so the per-parameter fallback
                         # (and any later mark_workflow_run_as_failed) can reuse the outer session.
                         await outer_session.rollback()
@@ -3798,10 +3809,18 @@ class WorkflowService:
                             workflow_run_id=workflow_run.workflow_run_id,
                             batch_error=str(batch_error),
                         )
+                if run_parameter_values is not None and created_run_parameters is not None:
+                    keys = {
+                        parameter.workflow_parameter_id: parameter.key for parameter, _ in workflow_parameter_values
+                    }
+                    run_parameter_values[workflow_run.workflow_run_id] = {
+                        keys[run_parameter.workflow_parameter_id]: run_parameter.value
+                        for run_parameter in created_run_parameters
+                    }
                 apply_creation_tags = partial(
                     self._apply_creation_run_tags_best_effort,
                     workflow=workflow,
-                    workflow_run_id=workflow_run.workflow_run_id,
+                    workflow_run=workflow_run,
                     organization_id=organization.organization_id,
                     parameters=parameter_values,
                     trigger_type=resolved_trigger_type,
@@ -3855,6 +3874,7 @@ class WorkflowService:
                         workflow_run_id=workflow_run.workflow_run_id,
                         error_type=type(error).__name__,
                     )
+                    workflow_run.mark_row_write_unconfirmed()
 
             return workflow_run
 
@@ -4381,6 +4401,7 @@ class WorkflowService:
                 workflow_run_id=workflow_run.workflow_run_id,
                 exc_info=True,
             )
+            workflow_run.mark_row_write_unconfirmed()
             return workflow_run
 
     async def _ensure_managed_browser_profile(
@@ -5214,8 +5235,10 @@ class WorkflowService:
         workflow: Workflow,
         workflow_run: WorkflowRun,
         effective_reuse: bool,
+        run_parameter_values: Mapping[str, Any] | None = None,
     ) -> tuple[WorkflowRun, bool]:
-        """Resolve and persist the authoritative browser-reuse admission decision."""
+        """Resolve and persist the authoritative browser-reuse admission decision, reading the run's parameter values
+        unless the caller passes them as a read of them returns them."""
         reuse_bound_key = (
             workflow_run.reuse_bound_key if workflow_run.reuse_bound_key is not None else REUSE_ADMISSION_OFF_DISABLED
         )
@@ -5235,13 +5258,15 @@ class WorkflowService:
             effective_reuse = bool(workflow_run.reuse_browser_session)
         elif effective_reuse:
             try:
-                parameter_tuples = await app.DATABASE.workflow_runs.get_workflow_run_parameters(
-                    workflow_run_id=workflow_run.workflow_run_id,
-                )
-                parameter_values = {
-                    workflow_parameter.key: run_parameter.value
-                    for workflow_parameter, run_parameter in parameter_tuples
-                }
+                parameter_values = run_parameter_values
+                if parameter_values is None:
+                    parameter_tuples = await app.DATABASE.workflow_runs.get_workflow_run_parameters(
+                        workflow_run_id=workflow_run.workflow_run_id,
+                    )
+                    parameter_values = {
+                        workflow_parameter.key: run_parameter.value
+                        for workflow_parameter, run_parameter in parameter_tuples
+                    }
                 persisted_selections = await app.DATABASE.workflow_run_credential_selections.get_selections_for_run(
                     workflow_run.workflow_run_id
                 )
@@ -12289,6 +12314,8 @@ class WorkflowService:
         if workflow is None:
             workflow = await self.get_workflow(workflow_id=workflow_id)
         definition_sha256 = workflow_definition_sha256(workflow.workflow_definition)
+        if workflow_run_id is None and parent_workflow_run_id is None:
+            workflow_run_id = app.AGENT_FUNCTION.generate_root_workflow_run_id(trigger_type)
 
         # Sample the kill switch exactly once, before request-time precedence. This persisted
         # admission decision is authoritative: later flag changes stop new runs but never revoke an
@@ -12603,6 +12630,7 @@ class WorkflowService:
                         workflow_run_id=workflow_run.workflow_run_id,
                         exc_info=True,
                     )
+                    workflow_run.mark_row_write_unconfirmed()
                     return workflow_run
 
                 retirement_claimed = False
@@ -14847,16 +14875,21 @@ class WorkflowService:
         self,
         workflow_run_id: str,
         workflow_parameter_values: list[tuple[WorkflowParameter, Any]],
-    ) -> list[WorkflowRunParameter]:
+    ) -> list[WorkflowRunParameter] | None:
+        """The created parameters as a read of them returns them, or None when a read could not convert them either."""
         serialized_workflow_parameter_values = [
             (workflow_parameter, self._serialize_workflow_run_parameter_value(workflow_parameter, value))
             for workflow_parameter, value in workflow_parameter_values
         ]
 
-        return await app.DATABASE.workflow_runs.create_workflow_run_parameters(
-            workflow_run_id=workflow_run_id,
-            workflow_parameter_values=serialized_workflow_parameter_values,
-        )
+        try:
+            return await app.DATABASE.workflow_runs.create_workflow_run_parameters(
+                workflow_run_id=workflow_run_id,
+                workflow_parameter_values=serialized_workflow_parameter_values,
+            )
+        except InvalidWorkflowParameter:
+            # The rows are committed and the run goes ahead; every later read of them raises the same way.
+            return None
 
     @staticmethod
     def _serialize_workflow_run_parameter_value(workflow_parameter: WorkflowParameter, value: Any) -> Any:
@@ -15440,46 +15473,59 @@ class WorkflowService:
                     self._successor_attempt_boundary(attempt_rows, current_attempt),
                 )
 
-        # Batch 2: fetches that depend on batch 1 results, all run concurrently.
-        (
-            screenshot_urls_raw,
-            output_parameter_tuples,
-            (recording_urls, recording_archived),
-            (downloaded_files, downloaded_file_urls),
-            retried_by_workflow_run_id,
-        ) = await asyncio.gather(
-            self.get_recent_workflow_screenshot_urls(
-                workflow_run_id=workflow_run_id,
-                organization_id=organization_id,
-                workflow_run_tasks=screenshot_tasks,
-                historical_artifacts=current_attempt_artifacts,
-            ),
-            self.get_output_parameter_workflow_run_output_parameter_tuples(
-                workflow_id=workflow_run.workflow_id,
-                workflow_run_id=workflow_run_id,
-                workflow=workflow,
-                workflow_run_output_parameters=historical_outputs,
-                prefer_capped=cap_output_values,
-            ),
-            self._fetch_recording_urls(
-                workflow_run,
-                task_v2,
-                organization_id,
-                historical_artifacts=historical_artifacts,
-                current_attempt_artifacts=current_attempt_artifacts,
-            ),
-            self._fetch_downloaded_files(
-                workflow_run,
-                task_v2,
-                attempt_rows=attempt_rows,
-                attempt_number=current_attempt,
-                historical_artifacts=historical_artifacts,
-            ),
-            app.DATABASE.workflow_runs.get_workflow_run_retried_by(
-                workflow_run_id=workflow_run_id,
-                organization_id=workflow_run.organization_id,
-            ),
-        )
+        scoped_tasks = [
+            task
+            for task in workflow_run_tasks
+            if (task.attempt_number is None and current_attempt == 1) or task.attempt_number == current_attempt
+        ]
+        total_steps: int | None = None
+        if include_step_count or include_cost:
+            total_steps, _ = await app.DATABASE.tasks.get_step_counts_by_task_ids(
+                task_ids=[task.task_id for task in scoped_tasks], organization_id=organization_id
+            )
+
+        # Batch 2: fetches that depend on batch 1 results, all run concurrently. It and the output URL refresh can
+        # wait on storage, so a caller's shared read session hands its connection back for them.
+        async with app.DATABASE.Session.released():
+            (
+                screenshot_urls_raw,
+                output_parameter_tuples,
+                (recording_urls, recording_archived),
+                (downloaded_files, downloaded_file_urls),
+                retried_by_workflow_run_id,
+            ) = await asyncio.gather(
+                self.get_recent_workflow_screenshot_urls(
+                    workflow_run_id=workflow_run_id,
+                    organization_id=organization_id,
+                    workflow_run_tasks=screenshot_tasks,
+                    historical_artifacts=current_attempt_artifacts,
+                ),
+                self.get_output_parameter_workflow_run_output_parameter_tuples(
+                    workflow_id=workflow_run.workflow_id,
+                    workflow_run_id=workflow_run_id,
+                    workflow=workflow,
+                    workflow_run_output_parameters=historical_outputs,
+                    prefer_capped=cap_output_values,
+                ),
+                self._fetch_recording_urls(
+                    workflow_run,
+                    task_v2,
+                    organization_id,
+                    historical_artifacts=historical_artifacts,
+                    current_attempt_artifacts=current_attempt_artifacts,
+                ),
+                self._fetch_downloaded_files(
+                    workflow_run,
+                    task_v2,
+                    attempt_rows=attempt_rows,
+                    attempt_number=current_attempt,
+                    historical_artifacts=historical_artifacts,
+                ),
+                app.DATABASE.workflow_runs.get_workflow_run_retried_by(
+                    workflow_run_id=workflow_run_id,
+                    organization_id=workflow_run.organization_id,
+                ),
+            )
         screenshot_urls: list[str] | None = screenshot_urls_raw or None
         # Preserve legacy singular contract: last element is the newest.
         recording_url = recording_urls[-1] if recording_urls else None
@@ -15512,15 +15558,16 @@ class WorkflowService:
             }
             outputs[EXTRACTED_INFORMATION_KEY] = _cap(extracted_information, EXTRACTED_INFORMATION_KEY)
             # Refresh any expired presigned screenshot URLs in the outputs
-            outputs = await self._refresh_output_urls(
-                outputs,
-                historical_artifacts=historical_artifacts,
-                current_attempt_artifacts=current_attempt_artifacts,
-                organization_id=organization_id,
-                workflow_run_id=workflow_run_id,
-                attempt_rows=attempt_rows,
-                attempt_number=current_attempt,
-            )
+            async with app.DATABASE.Session.released():
+                outputs = await self._refresh_output_urls(
+                    outputs,
+                    historical_artifacts=historical_artifacts,
+                    current_attempt_artifacts=current_attempt_artifacts,
+                    organization_id=organization_id,
+                    workflow_run_id=workflow_run_id,
+                    attempt_rows=attempt_rows,
+                    attempt_number=current_attempt,
+                )
             # The refresh expands artifact IDs into presigned URLs and FileInfo objects —
             # ~25x on an ID-dense value — so a value that fit before it can exceed the cap
             # after. Gating this on artifact IDs is not safe: the legacy `has_old_format`
@@ -15537,11 +15584,6 @@ class WorkflowService:
                 "omitted_output_count": omitted_output_count,
             }
 
-        scoped_tasks = [
-            task
-            for task in workflow_run_tasks
-            if (task.attempt_number is None and current_attempt == 1) or task.attempt_number == current_attempt
-        ]
         task_errors: list[dict[str, Any]] = []
         for task in scoped_tasks:
             task_errors.extend(task.errors)
@@ -15572,15 +15614,10 @@ class WorkflowService:
 
         parameters_with_value = {wfp.key: wfrp.value for wfp, wfrp in workflow_parameter_tuples}
 
-        total_steps = None
         total_cost: float | None = None
-        if include_step_count or include_cost:
-            step_count, _ = await app.DATABASE.tasks.get_step_counts_by_task_ids(
-                task_ids=[task.task_id for task in scoped_tasks], organization_id=organization_id
-            )
-            total_steps = step_count
-
-            if include_cost:
+        if include_cost:
+            # The cost lookup can swallow a failed read, which would leave a shared read session unusable.
+            async with app.DATABASE.Session.released():
                 total_cost = await app.AGENT_FUNCTION.calculate_workflow_run_total_cost(
                     organization_id=organization_id,
                     credits_used=workflow_run.credits_used,
@@ -16549,6 +16586,7 @@ class WorkflowService:
                     status_code=status_code,
                     attempts=attempts.count,
                     finished_at=webhook.execution_finished_at,
+                    proxy_hop_retries=attempts.proxy_hop_retries,
                 )
 
         # An attempt row's reservation already claims a policy run's send. Any other final send of an exact

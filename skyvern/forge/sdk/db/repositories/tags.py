@@ -31,6 +31,7 @@ from skyvern.forge.sdk.workflow.models.validators import (
     normalize_tag_value,
     random_tag_color,
 )
+from skyvern.forge.sdk.workflow.models.workflow import WorkflowRun
 
 LOG = structlog.get_logger()
 
@@ -175,8 +176,10 @@ class TagsRepository(BaseRepository):
         label_sets: list[str] | None = None,
         label_deletes: list[str] | None = None,
         colors: dict[str, str] | None = None,
+        known_run: WorkflowRun | None = None,
     ) -> list[TagChange]:
-        """Atomically apply SET/DELETE tag events to a workflow run."""
+        """Atomically apply SET/DELETE tag events to a workflow run. ``known_run`` is as in
+        ``apply_system_run_tag_changes``."""
         return await self._apply_tag_changes(
             event_model=WorkflowRunTagEventModel,
             entity_id_name="workflow_run_id",
@@ -191,6 +194,7 @@ class TagsRepository(BaseRepository):
             colors=colors,
             max_tags=MAX_TAGS_PER_RUN,
             max_system_tags=MAX_SYSTEM_TAGS_PER_RUN,
+            known_run=known_run,
         )
 
     @db_operation("apply_system_run_tag_changes")
@@ -202,12 +206,15 @@ class TagsRepository(BaseRepository):
         caller_id: str = SYSTEM_TAG_CALLER_ID,
         deletes: set[str] | None = None,
         set_at: datetime | None = None,
+        known_run: WorkflowRun | None = None,
     ) -> list[TagChange]:
         """Write Skyvern-owned run tags in the reserved namespace.
 
         Public API schemas reject ``skyvern.*`` keys. Internal writers should use
         this helper so provenance is always ``source=system`` and
-        ``caller_type=system``.
+        ``caller_type=system``. A ``known_run`` the caller already holds for this run and
+        organization stands in for reading the run row to check its organization; it must be a
+        model read from or just written to the database, never one built from request input.
         """
         normalized_sets = _normalize_system_tag_sets(sets)
         normalized_deletes = _normalize_system_tag_deletes(deletes or set())
@@ -231,6 +238,7 @@ class TagsRepository(BaseRepository):
             colors=None,
             max_tags=MAX_TAGS_PER_RUN,
             max_system_tags=MAX_SYSTEM_TAGS_PER_RUN,
+            known_run=known_run,
         )
 
     async def _apply_tag_changes(
@@ -249,6 +257,7 @@ class TagsRepository(BaseRepository):
         colors: dict[str, str] | None,
         max_tags: int,
         max_system_tags: int,
+        known_run: WorkflowRun | None = None,
     ) -> list[TagChange]:
         label_sets = label_sets or []
         label_deletes = label_deletes or []
@@ -263,8 +272,13 @@ class TagsRepository(BaseRepository):
         if event_model is not WorkflowRunTagEventModel and not has_changes:
             return []
 
+        run_organization_known = (
+            known_run is not None
+            and known_run.workflow_run_id == entity_id
+            and known_run.organization_id == organization_id
+        )
         async with self.Session() as session:
-            if event_model is WorkflowRunTagEventModel:
+            if event_model is WorkflowRunTagEventModel and not run_organization_known:
                 await self._validate_workflow_run_org(
                     session,
                     workflow_run_id=entity_id,
