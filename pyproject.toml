@@ -95,10 +95,8 @@ server = [
     "google-cloud-storage>=3.13.1,<4",
     "openai>=1.68.2",
     "yutori>=0.8.1",
-    # Plain pip sees LiteLLM's exact openai pin and therefore resolves this
-    # range to openai-agents 0.10.x. Cloud/source installs include the cloud
-    # group below, where uv overrides let the newer 0.14.x SDK resolve.
-    "openai-agents>=0.10.5,<0.15",
+    # The server imports Copilot at startup, and Copilot uses names added after 0.14 (run error handlers).
+    "openai-agents>=0.19.4,<0.20",
     "python-dotenv==1.2.2",
     "sqlalchemy[mypy]>=2.0.29,<3",
     "aiohttp>=3.14.3,<4",
@@ -175,10 +173,7 @@ cloud = [
     # Remote-browser vendor SDKs used only by cloud-side factories.
     "browser-use-sdk>=3.11.0,<4",
     "anchorbrowser>=0.11,<0.12",
-    # Keep workflow-copilot on the newer Agents SDK for cloud/source installs.
-    # uv's override-dependencies below relax LiteLLM's exact transitive pins,
-    # but those overrides do not ship in public wheel metadata.
-    "openai-agents>=0.14.8,<0.15",
+    "openai-agents>=0.19.4,<0.20",
     "stripe>=15.5.0,<16",
     "temporalio[opentelemetry]>=1.6.0,<2",
     "temporalio>=1.6.0,<2",
@@ -276,10 +271,12 @@ include = [
 # exclude-newer = "7 days"
 override-dependencies = [
     # litellm 1.83.7+ pins these exactly; relax so they coexist with our deps
-    # (openai-agents needs openai>=2.26, fastmcp needs python-dotenv>=1.1).
+    # (fastmcp needs python-dotenv>=1.1).
     "jsonschema>=4.23.0",
     "python-dotenv>=1.0.0",
-    "openai>=2.24.0",
+    # An override replaces every package's openai requirement, the SDK's and LiteLLM's
+    # included, so it carries openai-agents 0.19's floor and LiteLLM's <3 cap itself.
+    "openai>=2.45.0,<3",
     # yutori SDK pins httpx<0.28 but skyvern's fastmcp needs >=0.28.1
     "httpx[socks]>=0.26.0",
     # litellm exact-pins aiohttp; relax so the security-patched
