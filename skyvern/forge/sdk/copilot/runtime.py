@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import time
+import uuid
 from collections.abc import AsyncIterator, Awaitable, Callable, Iterable, Iterator, Mapping
 from contextlib import asynccontextmanager, contextmanager, suppress
 from contextvars import ContextVar
@@ -806,6 +807,7 @@ class AgentContext:
     # reachable by this turn alone and are closed when it ends rather than left to bill out their
     # budgets. A run left to its owner takes its browser out of the ledger.
     minted_browser_sessions: dict[str, str | None] = field(default_factory=dict)
+    browser_allocation_recorder: Callable[[str, str | None], Awaitable[None]] | None = None
 
     # Set by tool gates / loop guards / tool-side error branches when a tool
     # dispatch is blocked. The finalization shim in agent.py reads this at
@@ -1823,6 +1825,9 @@ async def acquire_fresh_exit_browser_session(
     if denial is not None:
         return _browser_session_acquisition_failure_result(denial)
     try:
+        allocation_id = uuid.uuid4().hex
+        if ctx.browser_allocation_recorder is not None:
+            await ctx.browser_allocation_recorder(allocation_id, None)
         receipt = await app.PERSISTENT_SESSIONS_MANAGER.create_fresh_exit_session(
             organization_id=ctx.organization_id,
             prior_browser_session_id=prior_browser_session_id,
@@ -1832,6 +1837,8 @@ async def acquire_fresh_exit_browser_session(
         )
         if receipt.new_browser_session_id:
             ctx.minted_browser_sessions.setdefault(receipt.new_browser_session_id, None)
+            if ctx.browser_allocation_recorder is not None:
+                await ctx.browser_allocation_recorder(allocation_id, receipt.new_browser_session_id)
         return receipt
     except BrowserSessionCreditAdmissionRefusal:
         return _browser_session_acquisition_failure_result(
@@ -1932,6 +1939,9 @@ async def _provision_browser_session(
     session = None
     installed_session_id: str | None = None
     try:
+        allocation_id = uuid.uuid4().hex
+        if ctx.browser_allocation_recorder is not None:
+            await ctx.browser_allocation_recorder(allocation_id, None)
         with copilot_span("browser_session_create", data={"organization_id": ctx.organization_id}):
             creation_kwargs = _seeded_create_session_kwargs(seed)
             if proxy_location is not None:
@@ -1947,6 +1957,8 @@ async def _provision_browser_session(
                 created_for_workflow_permanent_id=ctx.workflow_permanent_id,
                 **creation_kwargs,
             )
+        if ctx.browser_allocation_recorder is not None:
+            await ctx.browser_allocation_recorder(allocation_id, session.persistent_browser_session_id)
         if ctx.browser_session_id:
             # A sibling call installed a session while this create was in flight. Adopt theirs and
             # close ours: assigning over it would leave a live browser referenced by nobody until
