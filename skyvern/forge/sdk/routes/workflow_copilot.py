@@ -164,7 +164,12 @@ from skyvern.forge.sdk.routes.browser_profiles import (
 )
 from skyvern.forge.sdk.routes.credentials import delete_organization_credential
 from skyvern.forge.sdk.routes.routers import base_router
-from skyvern.forge.sdk.schemas.copilot_turn_outcome import PersistedCopilotComposerMode, ResponseKind, TurnOutcome
+from skyvern.forge.sdk.schemas.copilot_turn_outcome import (
+    CopilotRequestBrowserAllocations,
+    PersistedCopilotComposerMode,
+    ResponseKind,
+    TurnOutcome,
+)
 from skyvern.forge.sdk.schemas.credentials import (
     CreateCredentialRequest,
     Credential,
@@ -1339,6 +1344,10 @@ async def _persist_turn_messages(
             if pending is not None:
                 pending_user_message_id = pending.user_message_id
                 request_cancel_token = pending.cancel_token or request_cancel_token
+                if turn_outcome is not None and pending.request_browser_allocations is not None:
+                    turn_outcome = turn_outcome.model_copy(
+                        update={"request_browser_allocations": pending.request_browser_allocations}
+                    )
                 if pending.question_interactions:
                     if narrative_payload is None:
                         narrative_payload = _make_error_narrative_payload(turn_id, None, assistant_content)
@@ -2884,6 +2893,18 @@ async def _new_copilot_chat_post(
                         turn_id=turn_id,
                         started_at=datetime.now(UTC),
                         cancel_token=chat_request.cancel_token,
+                        request_browser_allocations=CopilotRequestBrowserAllocations(
+                            organization_id=organization.organization_id,
+                            workflow_permanent_id=chat.workflow_permanent_id,
+                            workflow_copilot_chat_id=chat.workflow_copilot_chat_id,
+                            turn_id=turn_id,
+                            request_cancel_token=chat_request.cancel_token,
+                            allocations=[],
+                            recording_incomplete=False,
+                            truncated=False,
+                        )
+                        if eval_llm_overrides is not None
+                        else None,
                         pre_turn_workflow=original_workflow.model_dump(mode="json"),
                         pre_turn_proposed_workflow=proposed_workflow_at_turn_start,
                         keep_pending_proposal=chat_request.keep_pending_proposal,
@@ -2983,6 +3004,17 @@ async def _new_copilot_chat_post(
                     artifacts=artifacts,
                 )
 
+            async def persist_browser_allocation(allocation_id: str, browser_session_id: str | None) -> None:
+                await app.DATABASE.workflow_params.record_copilot_browser_allocation(
+                    organization_id=organization.organization_id,
+                    workflow_copilot_chat_id=chat.workflow_copilot_chat_id,
+                    workflow_permanent_id=chat.workflow_permanent_id,
+                    turn_id=turn_id,
+                    request_cancel_token=chat_request.cancel_token,
+                    allocation_id=allocation_id,
+                    browser_session_id=browser_session_id,
+                )
+
             with _bind_copilot_session_id(chat):
                 agent_result = await run_copilot_agent(
                     stream=stream,
@@ -3006,6 +3038,9 @@ async def _new_copilot_chat_post(
                     persist_unsafe_video_file_ids=persist_unsafe_video_file_ids,
                     persist_too_long_video_file_ids=persist_too_long_video_file_ids,
                     persist_video_evidence_artifacts=persist_video_evidence_artifacts,
+                    browser_allocation_recorder=(
+                        persist_browser_allocation if eval_llm_overrides is not None else None
+                    ),
                     persisted_workflow_yaml=persisted_workflow_yaml,
                     opening_workflow_title=original_workflow.title,
                     prior_executed_block_fingerprints=prior_executed_block_fingerprints,
@@ -4072,6 +4107,30 @@ async def workflow_copilot_chat_history(
                 ),
                 None,
             )
+    request_browser_allocations = None
+    if chat is not None and request_turn_id is not None and request_cancel_token is not None:
+        pending_entry = chat.pending_turns.get(request_turn_id)
+        if pending_entry is not None:
+            candidate = pending_entry.request_browser_allocations
+        else:
+            candidate = next(
+                (
+                    message.turn_outcome.request_browser_allocations
+                    for message in reversed(chat_messages)
+                    if message.turn_outcome is not None
+                    and message.turn_outcome.copilot_turn_id == request_turn_id
+                    and message.turn_outcome.request_cancel_token == request_cancel_token
+                ),
+                None,
+            )
+        if candidate is not None and (
+            candidate.organization_id == organization.organization_id
+            and candidate.workflow_permanent_id == chat.workflow_permanent_id
+            and candidate.workflow_copilot_chat_id == chat.workflow_copilot_chat_id
+            and candidate.turn_id == request_turn_id
+            and candidate.request_cancel_token == request_cancel_token
+        ):
+            request_browser_allocations = candidate
     pending_credentials = (
         await pending_credential_requests(
             organization.organization_id,
@@ -4166,6 +4225,7 @@ async def workflow_copilot_chat_history(
         pending_credential_requests=pending_credentials,
         workflow_copilot_chat_id=chat.workflow_copilot_chat_id if chat else None,
         request_turn_id=request_turn_id,
+        request_browser_allocations=request_browser_allocations,
         question_interactions=question_interactions,
         pending_question_cancel_token=next(
             (

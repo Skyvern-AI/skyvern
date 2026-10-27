@@ -5021,6 +5021,7 @@ async def run_copilot_agent(
     auto_accept: bool | None = None,
     private_workflow_settings: dict[str, Any] | None = None,
     ctx_sink: list[CopilotContext] | None = None,
+    browser_allocation_recorder: Callable[[str, str | None], Awaitable[None]] | None = None,
 ) -> AgentResult:
     # One id per turn — passed to every downstream AgentResult and
     # CopilotContext so the envelope and terminal frames correlate. The
@@ -5074,6 +5075,7 @@ async def run_copilot_agent(
                     eval_entrypoint_url=eval_entrypoint_url,
                     auto_accept=auto_accept,
                     private_workflow_settings=private_workflow_settings,
+                    browser_allocation_recorder=browser_allocation_recorder,
                 )
                 return result
             except DemonstrationRejection:
@@ -5212,6 +5214,7 @@ async def _run_copilot_turn_impl(
     eval_entrypoint_url: str | None = None,
     auto_accept: bool | None = None,
     private_workflow_settings: dict[str, Any] | None = None,
+    browser_allocation_recorder: Callable[[str, str | None], Awaitable[None]] | None = None,
 ) -> AgentResult:
     copilot_config = config or CopilotConfig(security_rules=security_rules)
     copilot_config = config_for_eval_mode(copilot_config, eval_mode)
@@ -5279,6 +5282,7 @@ async def _run_copilot_turn_impl(
         user_message=chat_request.message,
         workflow_copilot_chat_id=chat_request.workflow_copilot_chat_id,
         copilot_cancel_token=chat_request.cancel_token,
+        browser_allocation_recorder=browser_allocation_recorder,
         auto_accept=auto_accept,
         eval_capture_case_id=eval_capture_case_id,
         eval_mode=eval_mode,
