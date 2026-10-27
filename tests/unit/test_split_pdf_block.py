@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+import io
+import random
+import string
 from datetime import UTC, datetime
 from pathlib import Path
 from types import SimpleNamespace
@@ -7,13 +10,17 @@ from typing import Any
 
 import pytest
 from pypdf import PdfReader, PdfWriter
+from pypdf.generic import DecodedStreamObject, DictionaryObject, NameObject
 
 from skyvern.config import settings
+from skyvern.constants import MAX_FILE_PARSE_INPUT_TOKENS
+from skyvern.exceptions import SplitPdfTooManyPages
 from skyvern.forge.sdk.api import files
 from skyvern.forge.sdk.workflow.models.parameter import OutputParameter
-from skyvern.forge.sdk.workflow.models.split_pdf_block import SplitPdfBlock
+from skyvern.forge.sdk.workflow.models.split_pdf_block import MAX_PLANNABLE_PAGES, SplitPdfBlock
 from skyvern.forge.sdk.workflow.workflow_definition_converter import block_yaml_to_block
 from skyvern.schemas.workflows import BlockType, SplitPdfBlockYAML
+from skyvern.utils.token_counter import count_tokens
 
 
 def _make_output_parameter(label: str = "split_pdf") -> OutputParameter:
@@ -33,6 +40,42 @@ def _write_blank_pdf(path: Path, page_count: int) -> None:
         writer.add_blank_page(width=300, height=400)
     with path.open("wb") as f:
         writer.write(f)
+
+
+def _pdf_reader_with_page_text(lines: list[str], page_count: int) -> PdfReader:
+    """An in-memory PDF whose every page renders the same extractable lines."""
+    writer = PdfWriter()
+    font_ref = writer._add_object(
+        DictionaryObject(
+            {
+                NameObject("/Type"): NameObject("/Font"),
+                NameObject("/Subtype"): NameObject("/Type1"),
+                NameObject("/BaseFont"): NameObject("/Helvetica"),
+            }
+        )
+    )
+    content = ("BT /F1 8 Tf 10 TL 24 760 Td " + " ".join(f"({line}) Tj T*" for line in lines) + " ET").encode("ascii")
+    for _ in range(page_count):
+        page = writer.add_blank_page(width=612, height=792)
+        page[NameObject("/Resources")] = DictionaryObject(
+            {NameObject("/Font"): DictionaryObject({NameObject("/F1"): font_ref})}
+        )
+        stream = DecodedStreamObject()
+        stream.set_data(content)
+        page[NameObject("/Contents")] = writer._add_object(stream)
+    buffer = io.BytesIO()
+    writer.write(buffer)
+    buffer.seek(0)
+    return PdfReader(buffer)
+
+
+def _dense_identifier_lines(line_count: int = 60) -> list[str]:
+    """Lines of random identifiers, which tokenize at far fewer than 4 characters per token."""
+    rng = random.Random(7)
+    return [
+        " ".join("".join(rng.choices(string.ascii_letters + string.digits, k=16)) for _ in range(4))
+        for _ in range(line_count)
+    ]
 
 
 def _write_pdf_with_page_widths(path: Path, widths: list[int]) -> None:
@@ -189,6 +232,46 @@ def test_write_split_documents_does_not_overwrite_duplicate_names_without_source
     assert [path.name for path in output_paths] == ["duplicate.pdf", "duplicate_2.pdf"]
     assert [PdfReader(path).pages[0].mediabox.width for path in output_paths] == [300, 500]
     assert all(path.read_bytes() == pdf_bytes for path, (_, pdf_bytes) in zip(output_paths, written))
+
+
+def test_build_page_texts_keeps_dense_pages_within_the_input_budget() -> None:
+    reader = _pdf_reader_with_page_text(_dense_identifier_lines(), page_count=300)
+
+    pages = SplitPdfBlock._build_page_texts(reader)
+
+    # Truncating by a chars-per-token estimate used to keep ~2.7x the per-page allocation here.
+    assert sum(count_tokens(str(page["text"])) for page in pages) <= MAX_FILE_PARSE_INPUT_TOKENS
+    # Every page keeps some text: the planner cannot place a boundary on a page it cannot read.
+    assert [page["page_number"] for page in pages] == list(range(1, 301))
+    assert all(page["text"] for page in pages)
+
+
+def test_build_page_texts_preserves_text_and_numbering_when_the_pdf_fits() -> None:
+    reader = _pdf_reader_with_page_text(["Invoice 12", "Amount 100"], page_count=2)
+
+    pages = SplitPdfBlock._build_page_texts(reader)
+
+    assert [page["page_number"] for page in pages] == [1, 2]
+    assert all(page["text"] == reader.pages[0].extract_text() for page in pages)
+
+
+@pytest.mark.parametrize(
+    ("page_count", "rejected"),
+    [(MAX_PLANNABLE_PAGES, False), (MAX_PLANNABLE_PAGES + 1, True)],
+)
+def test_build_page_texts_rejects_more_pages_than_it_can_excerpt(page_count: int, rejected: bool) -> None:
+    # Past this page count no per-page allocation leaves enough text to assign a page to a
+    # document, so the block fails instead of silently planning from unusably thin excerpts.
+    reader = _pdf_reader_with_page_text(["Invoice 12"], page_count=page_count)
+
+    if rejected:
+        with pytest.raises(SplitPdfTooManyPages):
+            SplitPdfBlock._build_page_texts(reader)
+        return
+
+    pages = SplitPdfBlock._build_page_texts(reader)
+    assert len(pages) == page_count
+    assert sum(count_tokens(str(page["text"])) for page in pages) <= MAX_FILE_PARSE_INPUT_TOKENS
 
 
 def test_split_pdf_yaml_to_block_conversion() -> None:

@@ -2200,6 +2200,19 @@ class PDFParsingError(SkyvernException):
         )
 
 
+class SplitPdfTooManyPages(SkyvernException):
+    """Raised when a PDF has more pages than the split planner can excerpt within its input budget."""
+
+    def __init__(self, total_pages: int, max_pages: int, min_per_page_tokens: int) -> None:
+        self.total_pages = total_pages
+        self.max_pages = max_pages
+        super().__init__(
+            f"Cannot plan a split of a {total_pages}-page PDF: the planner reads at most {max_pages} pages, so that "
+            f"every page keeps the {min_per_page_tokens} tokens of text it needs to be assigned to a document. "
+            "Split the source PDF into smaller files first."
+        )
+
+
 class ImaginarySecretValue(SkyvernException):
     def __init__(self, value: str) -> None:
         super().__init__(
