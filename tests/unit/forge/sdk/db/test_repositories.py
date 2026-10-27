@@ -765,6 +765,44 @@ async def test_task_finish_claim_is_exactly_once_across_racing_finalizers(
 
 
 @pytest.mark.asyncio
+async def test_task_cancel_claim_persists_requested_fields(sqlite_engine: AsyncEngine, monkeypatch: pytest.MonkeyPatch):
+    factory = async_sessionmaker(sqlite_engine, expire_on_commit=False)
+    repo = TasksRepository(session_factory=factory, debug_enabled=False)
+    monkeypatch.setattr(repo, "sync_task_run_status", AsyncMock())
+
+    async with factory() as session:
+        session.add(
+            TaskModel(
+                task_id="tsk_cancel_fields",
+                organization_id="o_cancel_fields",
+                status=TaskStatus.running.value,
+                url="https://example.test/",
+                errors=[{"error_code": "existing"}],
+            )
+        )
+        await session.commit()
+
+    canceled, finish_claimed, status_changed = await repo.update_task_and_claim_finish_for_cancel(
+        "tsk_cancel_fields",
+        organization_id="o_cancel_fields",
+        failure_reason="The task stopped.",
+        errors=[{"error_code": "cancelled"}],
+        extracted_information={"result": "partial"},
+        webhook_failure_reason="Webhook delivery failed.",
+    )
+
+    assert canceled.status == TaskStatus.canceled
+    assert canceled.failure_reason == "The task stopped."
+    assert canceled.errors == [{"error_code": "existing"}, {"error_code": "cancelled"}]
+    assert canceled.extracted_information == {"result": "partial"}
+    assert canceled.webhook_failure_reason == "Webhook delivery failed."
+    assert finish_claimed is True
+    assert status_changed is True
+    for background_sync in list(repo._background_tasks):
+        await background_sync
+
+
+@pytest.mark.asyncio
 async def test_task_v2_cancel_repository_audits_only_a_winning_transition(monkeypatch: pytest.MonkeyPatch) -> None:
     from skyvern.forge.sdk.db.repositories import observer as observer_repository
     from skyvern.forge.sdk.db.repositories.observer import ObserverRepository
