@@ -541,6 +541,12 @@ _TASKV3_TOOL_ACTION_TYPES = {
 }
 
 
+def _store_look_screenshots(step: Step, screenshots: list[bytes]) -> None:
+    app.ARTIFACT_MANAGER.accumulate_screenshot_to_step_archive(
+        step=step, screenshots=screenshots, artifact_type=ArtifactType.SCREENSHOT_LLM
+    )
+
+
 def _taskv3_label_secret_values(task: Task, secret_values: Collection[str] = ()) -> set[str]:
     """Drop-only: the set that decides whether a page-supplied element name is dropped from text that
     leaves the run. Unfloored and blind to the mask-secrets opt-in on purpose -- it reaches no redaction
@@ -3926,6 +3932,7 @@ class ForgeAgent:
                 on_turn_end=_on_turn_end,
                 turn_dom=turn_dom,
                 on_pre_action=pre_submit_ring.capture if pre_submit_ring is not None else None,
+                on_look_screenshots=functools.partial(_store_look_screenshots, step),
                 # A code status the model has moved past is no longer what the run ends on.
                 on_page_action=verification_state.page_engaged,
                 extra_tools=auth_tools + captcha_tools,

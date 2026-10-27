@@ -8,6 +8,9 @@ class PermissionChecker(abc.ABC):
     async def check(self, organization: Organization, browser_session_id: str | None = None) -> None:
         pass
 
+    async def check_browser_session_access(self, organization: Organization) -> None:
+        return
+
 
 class NoopPermissionChecker(PermissionChecker):
     async def check(self, organization: Organization, browser_session_id: str | None = None) -> None:

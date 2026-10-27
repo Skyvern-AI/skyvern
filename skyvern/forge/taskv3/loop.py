@@ -2810,6 +2810,14 @@ def _non_completed(status: object) -> NonCompletedStatus | None:
 NO_MATCHING_ERROR_CODE = "NONE_OF_THESE"
 # Each customer description is cut here; the enum always carries every code.
 _ERROR_CODE_DESCRIPTION_MAX_CHARS = 1000
+ERROR_CODE_FIELD_GUIDANCE = (
+    "Required when status is failed or terminated; ignored when completed. If the task text assigns a code to "
+    "what happened, use it, and never use a code the task text rules out for it. Otherwise use the most "
+    "specific code whose description's condition is met, judged on the condition and not on the code's name; "
+    "use a catch-all code only when no other fits. Codes differing only in letter case are different: use the "
+    f"spelling the task text gives. Answer {NO_MATCHING_ERROR_CODE} only when neither the task text nor any "
+    "description covers what happened."
+)
 
 
 def _offerable_code(code: str) -> bool:
@@ -2837,11 +2845,7 @@ def _error_code_schema(error_code_mapping: dict[str, str]) -> dict[str, Any]:
     return {
         "type": "string",
         "enum": [*sorted(error_code_mapping), NO_MATCHING_ERROR_CODE],
-        "description": (
-            "Required when status is failed or terminated; ignored when completed. The user's code whose "
-            f"description is what actually happened, or {NO_MATCHING_ERROR_CODE} when none of them describes it."
-            f"\nThe user's codes:\n{codes}"
-        ),
+        "description": f"{ERROR_CODE_FIELD_GUIDANCE}\nThe user's codes:\n{codes}",
     }
 
 
@@ -4134,6 +4138,8 @@ async def run_agent_tool_loop(
     # Awaited after each successful model call, before the turn touches the page.
     on_model_returned: Callable[[], Awaitable[None]] | None = None,
     on_pre_action: Callable[[str, dict[str, Any]], Awaitable[None]] | None = None,
+    # Called with every look's images as the tool returns them, superseded ones included.
+    on_look_screenshots: Callable[[list[bytes]], None] | None = None,
     # Called before each page-touching tool call is dispatched.
     on_page_action: Callable[[], None] | None = None,
     max_tokens: int | None = None,
@@ -5850,6 +5856,11 @@ async def run_agent_tool_loop(
             # ones), so re-sending the stale image would just hand the model a dead numbering.
             if result.screenshots:
                 st.pending_screenshots = list(result.screenshots)
+                if on_look_screenshots is not None:
+                    try:
+                        on_look_screenshots(list(result.screenshots))
+                    except Exception:
+                        LOG.warning("taskv3 on_look_screenshots callback failed", tool=tool_name, exc_info=True)
             result_data = result.data or {}
             batch_entry_unconfirmed = batch_entry_unconfirmed or (result.status == "ok" and result.entry_unconfirmed)
             # The page-state stall detector (SKY-15265) re-baselines on these flags. Keeps the FIRST
