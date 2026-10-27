@@ -64,6 +64,7 @@ from skyvern.forge.sdk.schemas.credentials import (
 )
 from skyvern.forge.sdk.schemas.feedback import AgentFeedback, FeedbackEvent
 from skyvern.forge.sdk.schemas.files import FileInfo
+from skyvern.forge.sdk.schemas.har_evidence import HarEvidence, HarEvidenceAvailability
 from skyvern.forge.sdk.schemas.organizations import Organization
 from skyvern.forge.sdk.schemas.tasks import Task, TaskRequest, TaskStatus
 from skyvern.forge.sdk.services import (
@@ -1906,9 +1907,11 @@ class AgentFunction:
         task_id: str | None,
         browser_session_id: str | None,
         attempt_number: int | None = None,
-    ) -> None:
+    ) -> HarEvidence:
         """A finished run's redacted HAR is in hand at cleanup, before it is archived. Cleanup awaits this, so an
-        override should do only bounded work, must not raise, and must let cancellation propagate. OSS no-op."""
+        override should do only bounded work, must not raise, and must let cancellation propagate. OSS collects
+        nothing."""
+        return HarEvidence.unavailable(HarEvidenceAvailability.not_collected)
 
     async def validate_step_execution(
         self,
