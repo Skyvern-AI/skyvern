@@ -37,7 +37,7 @@ from litellm.utils import CustomStreamWrapper
 from openai import AsyncStream, omit
 from openai.types.chat import ChatCompletionChunk
 from openai.types.completion_usage import CompletionUsage
-from openai.types.responses import Response
+from openai.types.responses import Response, ResponseCompletedEvent, ResponseReasoningItem
 from openai.types.responses.response_function_call_output_item_list_param import (
     ResponseFunctionCallOutputItemListParam,
 )
@@ -136,6 +136,8 @@ class CopilotModelCallTelemetry:
     incomplete_details: dict[str, str] | None = None
     refusal: bool | None = None
     content_filter: bool | None = None
+    # The provider's encrypted reasoning for this call, which the SDK's chat conversion drops from its output.
+    returned_reasoning: list[ResponseReasoningItem] = field(default_factory=list)
 
     def capture(self, usage: Any | None) -> None:
         if usage is None:
@@ -490,12 +492,32 @@ class _UsageCapturingStream:
         return chunk
 
 
-class _ResponsesUsageCapturingStream:
-    """Capture raw Responses usage before LiteLLM drops cache-write tokens."""
+def _encrypted_reasoning(output: list[Any] | None, model: str) -> list[ResponseReasoningItem]:
+    return [
+        ResponseReasoningItem.model_validate(
+            {**(item if isinstance(item, dict) else item.model_dump()), "provider_data": {"model": model}}
+        )
+        for item in output or []
+        if _usage_field(item, "type") == "reasoning" and _usage_field(item, "encrypted_content")
+    ]
 
-    def __init__(self, stream: AsyncIterator[Any], telemetry: CopilotModelCallTelemetry) -> None:
+
+def _with_returned_reasoning(output: list[Any], reasoning: list[ResponseReasoningItem]) -> list[Any]:
+    # The SDK's own reasoning item carries only summary text, so the provider's item takes its place.
+    if not reasoning:
+        return output
+    return [*reasoning, *(item for item in output if not isinstance(item, ResponseReasoningItem))]
+
+
+class _ResponsesUsageCapturingStream:
+    """Capture raw Responses usage before LiteLLM drops cache-write tokens, and the encrypted reasoning it drops."""
+
+    def __init__(
+        self, stream: AsyncIterator[Any], telemetry: CopilotModelCallTelemetry, reasoning_model: str | None = None
+    ) -> None:
         self._iterator = stream.__aiter__()
         self._telemetry = telemetry
+        self._reasoning_model = reasoning_model
 
     def __aiter__(self) -> _ResponsesUsageCapturingStream:
         return self
@@ -512,6 +534,10 @@ class _ResponsesUsageCapturingStream:
         if response is not None:
             _capture_served_provider(self._telemetry, response)
             _capture_responses_stop_metadata(self._telemetry, response)
+            if self._reasoning_model and _usage_field(event, "type") == "response.completed":
+                self._telemetry.returned_reasoning = _encrypted_reasoning(
+                    _usage_field(response, "output"), self._reasoning_model
+                )
         if _usage_field(event, "type") in {"response.refusal.delta", "response.refusal.done"}:
             self._telemetry.refusal = True
         return event
@@ -681,8 +707,8 @@ class CopilotLitellmModel(LitellmModel):
             self.next_model_call_index(),
             model=self.model,
             base_url=self.base_url,
-        ):
-            return await super().get_response(
+        ) as telemetry:
+            response = await super().get_response(
                 system_instructions,
                 input,
                 model_settings,
@@ -694,6 +720,8 @@ class CopilotLitellmModel(LitellmModel):
                 conversation_id,
                 prompt,
             )
+            response.output = _with_returned_reasoning(response.output, telemetry.returned_reasoning)
+            return response
 
     async def stream_response(
         self,
@@ -712,7 +740,7 @@ class CopilotLitellmModel(LitellmModel):
             self.next_model_call_index(),
             model=self.model,
             base_url=self.base_url,
-        ):
+        ) as telemetry:
             async with contextlib.aclosing(
                 super().stream_response(
                     system_instructions,
@@ -728,6 +756,11 @@ class CopilotLitellmModel(LitellmModel):
                 )
             ) as events:
                 async for event in events:
+                    # The runner builds the turn's items from this event's output.
+                    if isinstance(event, ResponseCompletedEvent):
+                        event.response.output = _with_returned_reasoning(
+                            event.response.output, telemetry.returned_reasoning
+                        )
                     yield event
 
     @overload
@@ -789,6 +822,7 @@ class CopilotLitellmModel(LitellmModel):
             reasoning_effort=self._get_reasoning_effort(model_settings),
             anchors=anchors,
             should_replay_reasoning_content=self.should_replay_reasoning_content,
+            api_key=self.api_key,
         )
         if explicit_cache_envelope is not None:
             telemetry = current_model_call_telemetry()
@@ -1006,7 +1040,9 @@ class CopilotLitellmModel(LitellmModel):
         if stream:
             raw_stream = _typed_stream_errors(cast(AsyncIterator[Any], raw_response), served_model, served_provider)
             if telemetry is not None:
-                raw_stream = _ResponsesUsageCapturingStream(raw_stream, telemetry)
+                raw_stream = _ResponsesUsageCapturingStream(
+                    raw_stream, telemetry, self.model if envelope.replays_reasoning else None
+                )
             response_stream = responses_api_bridge.transformation_handler.get_model_response_iterator(
                 raw_stream,
                 sync_stream=False,
@@ -1035,6 +1071,8 @@ class CopilotLitellmModel(LitellmModel):
             _capture_served_provider(telemetry, raw_response)
             _capture_usage(telemetry, raw_response.usage)
             _capture_responses_stop_metadata(telemetry, raw_response)
+            if envelope.replays_reasoning:
+                telemetry.returned_reasoning = _encrypted_reasoning(raw_response.output, self.model)
         model_response = responses_api_bridge.transformation_handler.transform_response(
             model=served_model,
             raw_response=raw_response,
