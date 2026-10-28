@@ -81,6 +81,7 @@ from skyvern.forge.sdk.services.request_principal import (
     BearerIdentityStatus,
     RequestPrincipal,
     get_request_principal,
+    human_user_id,
 )
 from skyvern.forge.sdk.trace import traced
 from skyvern.forge.sdk.workflow.models.block import BaseTaskBlock, BlockTypeVar
@@ -2408,28 +2409,53 @@ class AgentFunction:
         connection_id: str | None = None,
         initiating_user_id: str | None = None,
         custody_mode: str | None = None,
+        *,
+        scope_profile: str | None = None,
+        principal: RequestPrincipal | None = None,
+        force_refresh: bool = False,
     ) -> str | None:
+        del force_refresh  # The SDK implementation has no access-token cache.
+        powerbi_profile = microsoft_oauth_service.MICROSOFT_OAUTH_SCOPE_PROFILE_POWERBI_DATASET_READ
+        if scope_profile not in (
+            None,
+            microsoft_oauth_service.MICROSOFT_OAUTH_SCOPE_PROFILE_OUTLOOK_MAIL,
+            powerbi_profile,
+        ):
+            return None
+        is_powerbi = scope_profile == powerbi_profile
+        authenticated_user_id = human_user_id(principal, organization_id) if is_powerbi else None
+        if is_powerbi and (
+            authenticated_user_id is None or (connection_id is not None and connection_id != credential_id)
+        ):
+            return None
+        scopes_to_require = list(required_scopes or [])
+        if is_powerbi and not microsoft_oauth_service.has_required_scopes(scopes_to_require, ["Dataset.Read.All"]):
+            scopes_to_require.append("Dataset.Read.All")
         try:
             secrets = await microsoft_oauth_service.load_credential_secrets(
                 organization_id=organization_id,
                 credential_id=credential_id,
+                scope_profile=scope_profile,
+                authenticated_user_id=authenticated_user_id,
             )
-            if required_scopes and not microsoft_oauth_service.has_required_scopes(secrets.scopes, required_scopes):
+            if scopes_to_require and not microsoft_oauth_service.has_required_scopes(secrets.scopes, scopes_to_require):
                 LOG.info(
                     "Microsoft OAuth credential missing required scopes",
                     organization_id=organization_id,
                     credential_id=credential_id,
-                    required_scopes=required_scopes,
+                    required_scopes=scopes_to_require,
                 )
                 return None
             return await microsoft_oauth_service.refresh_and_rotate(
                 organization_id=organization_id,
                 credential_id=credential_id,
                 credential_secrets=secrets,
-                connection_id=connection_id,
-                initiating_user_id=initiating_user_id,
-                custody_mode=custody_mode,
+                connection_id=None if is_powerbi else connection_id,
+                initiating_user_id=None if is_powerbi else initiating_user_id,
+                custody_mode=None if is_powerbi else custody_mode,
             )
+        except microsoft_oauth_service.MicrosoftOAuthAccessDenied:
+            return None
         except Exception:
             LOG.exception(
                 "Failed to get Microsoft credentials",

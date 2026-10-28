@@ -26,7 +26,7 @@ from skyvern.schemas.steps import AgentStepOutput
 from skyvern.webeye.action_deadline import cancellation_pending
 from skyvern.webeye.actions.actions import Action, ActionStatus, ActionType
 from skyvern.webeye.browser_diagnostics import schedule_control_endpoint_diagnostics
-from skyvern.webeye.utils.page import ScreenshotMode, SkyvernFrame
+from skyvern.webeye.utils.page import ScreenshotMode, SkyvernFrame, screenshot_failure_outcome
 
 if TYPE_CHECKING:
     from playwright.async_api import Page
@@ -276,11 +276,13 @@ class CodeBlockActionRecording:
                 animations="allow",
                 record_health=False,
             )
-        except Exception:
+        except Exception as e:
+            # A fixed label, never the exception's class name: user code can raise a class named after a parameter.
             LOG.warning(
                 "Code block screenshot capture failed",
                 workflow_run_block_id=self._workflow_run_block_id,
                 page_closed=_page_closed(self._page),
+                outcome=screenshot_failure_outcome(e, self._engine_selection),
             )
             # Only a failed capture says anything about the browser; a database error above
             # would otherwise emit probe fields describing a browser that is perfectly fine.
