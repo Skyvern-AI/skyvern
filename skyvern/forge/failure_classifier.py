@@ -659,12 +659,15 @@ SITE_THROTTLE_REASON_CODE = "site_throttle"
 EXTERNAL_SERVICE_THROTTLE_REASON_CODE = "external_service_throttle"
 SIGN_IN_FORM_VISIBLE_REASON_CODE = "sign_in_form_visible"
 SAVED_PROFILE_SIGNED_OUT_REASON_CODE = "saved_profile_signed_out"
+HAR_ANTI_BOT_DIAGNOSTIC_REASON_CODE = "har_anti_bot_diagnostic"
+# Task, workflow run and task v2 statuses a final diagnostic may annotate; never completed or canceled.
+DIAGNOSABLE_FAILURE_STATUSES = frozenset({"failed", "terminated", "timed_out"})
 
 # ANTI_BOT_DETECTION entries carrying one of these are labels only: runtime consumers must treat the
 # failure exactly as they did before it was labeled anti-bot. Code that acts on a failure_category it
 # reads (or hands to a model) must go through without_output_only_labels or skip these entries.
 OUTPUT_ONLY_ANTI_BOT_REASON_CODES = frozenset(
-    {UNSOLVED_CAPTCHA_BEFORE_BROWSER_LOSS_REASON_CODE, SITE_THROTTLE_REASON_CODE}
+    {UNSOLVED_CAPTCHA_BEFORE_BROWSER_LOSS_REASON_CODE, SITE_THROTTLE_REASON_CODE, HAR_ANTI_BOT_DIAGNOSTIC_REASON_CODE}
 )
 # Entries of any category carrying one of these are labels for the run page; the same scrub hides them.
 OUTPUT_ONLY_LABEL_REASON_CODES = frozenset({SIGN_IN_FORM_VISIBLE_REASON_CODE, SAVED_PROFILE_SIGNED_OUT_REASON_CODE})
@@ -704,6 +707,23 @@ def with_saved_profile_signed_out(categories: list[dict] | None) -> list[dict] |
         "reasoning": "The run started from a saved browser profile no credential backs, and stopped at a sign-in",
     }
     return tagged
+
+
+def with_diagnostic_entry(categories: list | None, entry: dict[str, Any]) -> list:
+    """``categories`` with ``entry`` replacing any earlier entry of its reason code, so a repeated cleanup leaves one;
+    appended, so the primary entry every runtime reader uses is unchanged."""
+    kept = [c for c in categories or [] if not (isinstance(c, dict) and c.get("reason_code") == entry["reason_code"])]
+    return [*kept, entry]
+
+
+def has_classifier_primary(categories: object) -> bool:
+    """Whether ``categories[0]`` is a classifier entry; an output-only label there is not a primary to follow."""
+    return (
+        isinstance(categories, list)
+        and bool(categories)
+        and isinstance(categories[0], dict)
+        and not is_output_only_entry(categories[0])
+    )
 
 
 def is_output_only_entry(category: object) -> bool:
@@ -775,6 +795,7 @@ _REASON_CODE_LITERALS = frozenset(
         WORKER_CONTAINER_RESTARTED_REASON_CODE,
         SIGN_IN_FORM_VISIBLE_REASON_CODE,
         SAVED_PROFILE_SIGNED_OUT_REASON_CODE,
+        HAR_ANTI_BOT_DIAGNOSTIC_REASON_CODE,
     }
 )
 

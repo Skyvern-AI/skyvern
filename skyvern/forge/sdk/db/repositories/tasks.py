@@ -9,6 +9,7 @@ from typing import Any
 import structlog
 from sqlalchemy import and_, delete, func, or_, select, tuple_, update
 
+from skyvern.forge.failure_classifier import DIAGNOSABLE_FAILURE_STATUSES, has_classifier_primary, with_diagnostic_entry
 from skyvern.forge.sdk.db._error_handling import db_operation
 from skyvern.forge.sdk.db.base_alchemy_db import read_retry
 from skyvern.forge.sdk.db.base_repository import BaseRepository
@@ -844,6 +845,34 @@ class TasksRepository(BaseRepository):
                 return updated_task, finish_claimed
             else:
                 raise NotFoundError("Task not found")
+
+    @db_operation("set_final_failure_diagnostic")
+    async def set_final_failure_diagnostic(
+        self, task_id: str, organization_id: str, finished_at: datetime | None, entry: dict[str, Any]
+    ) -> Task | None:
+        """Add a reporting-only failure_category entry to the failed execution that produced it; None when the task
+        has since been reset, rerun or was never a failure, so a late cleanup cannot write onto a newer execution, and
+        when it has no classifier primary, which the entry would otherwise become."""
+        async with self.Session() as session:
+            task = (
+                await session.scalars(
+                    select(TaskModel)
+                    .filter_by(task_id=task_id, organization_id=organization_id)
+                    .with_for_update()
+                    .execution_options(populate_existing=True)
+                )
+            ).first()
+            if (
+                task is None
+                or task.status not in DIAGNOSABLE_FAILURE_STATUSES
+                or task.finished_at != finished_at
+                or not has_classifier_primary(task.failure_category)
+            ):
+                return None
+            task.failure_category = with_diagnostic_entry(task.failure_category, entry)
+            await session.commit()
+            await session.refresh(task)
+            return convert_to_task(task, debug_enabled=self.debug_enabled)
 
     @traced(name="skyvern.db.reset_task_for_rerun")
     @db_operation("reset_task_for_rerun")

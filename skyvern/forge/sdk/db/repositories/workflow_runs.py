@@ -51,7 +51,12 @@ from skyvern.exceptions import (
     WorkflowRunNotFound,
 )
 from skyvern.forge import app
-from skyvern.forge.failure_classifier import derive_failure_attribution
+from skyvern.forge.failure_classifier import (
+    DIAGNOSABLE_FAILURE_STATUSES,
+    derive_failure_attribution,
+    has_classifier_primary,
+    with_diagnostic_entry,
+)
 from skyvern.forge.sdk.artifact.models import Artifact, ArtifactType
 from skyvern.forge.sdk.db._error_handling import db_operation
 from skyvern.forge.sdk.db.base_alchemy_db import read_retry
@@ -1385,6 +1390,47 @@ class WorkflowRunsRepository(BaseRepository):
                 return convert_to_workflow_run(workflow_run)
             else:
                 raise WorkflowRunNotFound(workflow_run_id)
+
+    @db_operation("set_final_failure_diagnostic")
+    async def set_final_failure_diagnostic(
+        self,
+        workflow_run_id: str,
+        organization_id: str,
+        finished_at: datetime | None,
+        attempt_number: int,
+        entry: dict[str, Any],
+    ) -> WorkflowRun | None:
+        """Add a reporting-only failure_category entry to the failed attempt that produced it; None once the run was
+        reset or a newer attempt exists, so a late cleanup cannot write onto a newer execution, and when the run has no
+        classifier primary, which the entry would otherwise become."""
+        async with self.Session() as session:
+            run = (
+                await session.scalars(
+                    select(WorkflowRunModel)
+                    .filter_by(workflow_run_id=workflow_run_id, organization_id=organization_id)
+                    .with_for_update()
+                    .execution_options(populate_existing=True)
+                )
+            ).first()
+            if (
+                run is None
+                or run.status not in DIAGNOSABLE_FAILURE_STATUSES
+                or run.finished_at != finished_at
+                or not has_classifier_primary(run.failure_category)
+            ):
+                return None
+            newer_attempt = await session.scalar(
+                select(WorkflowRunAttemptModel.attempt_number)
+                .where(WorkflowRunAttemptModel.workflow_run_id == workflow_run_id)
+                .where(WorkflowRunAttemptModel.attempt_number > attempt_number)
+                .limit(1)
+            )
+            if newer_attempt is not None:
+                return None
+            run.failure_category = with_diagnostic_entry(run.failure_category, entry)
+            await session.commit()
+            await session.refresh(run)
+            return convert_to_workflow_run(run)
 
     @db_operation("compare_and_set_reuse_admission")
     async def compare_and_set_reuse_admission(

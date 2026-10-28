@@ -5,6 +5,7 @@ import structlog
 
 from skyvern.forge import app
 from skyvern.forge.failure_classifier import WORKER_CONTAINER_RESTARTED_REASON_CODE, classify_from_failure_reason
+from skyvern.forge.final_failure_diagnostic import log_diagnostic_unavailable
 from skyvern.forge.sdk.db.datetime_utils import naive_utc_now
 from skyvern.forge.sdk.db.repositories.run_execution_leases import RunExecutionLease
 from skyvern.forge.sdk.executor.background_task_executor import BackgroundTaskExecutor
@@ -41,6 +42,7 @@ async def _api_key(organization_id: str) -> str | None:
 
 
 async def _workflow_side_effects(run: WorkflowRun, attempt_number: int | None, has_attempts: bool) -> None:
+    log_diagnostic_unavailable(run.workflow_run_id, "orphan_reaper")
     if has_attempts:
         decision = await get_recorded_decision(run.workflow_run_id, attempt_number=attempt_number)
         if decision is None:
@@ -109,12 +111,14 @@ async def _sync_task_run(task: Task) -> None:
 
 
 async def _task_v2_side_effects(run: WorkflowRun, task: TaskV2) -> None:
+    log_diagnostic_unavailable(run.workflow_run_id, "orphan_reaper")
     task = await _reload_task_v2(run.workflow_run_id, task)
     await uploaded_file_service.delete_files_attached_to_run(run_id=run.workflow_run_id)
     await task_v2_service.send_task_v2_webhook(task)
 
 
 async def _task_side_effects(task: Task) -> None:
+    log_diagnostic_unavailable(task.task_id, "orphan_reaper")
     task = await _reload_task(task)
     await uploaded_file_service.delete_files_attached_to_run(run_id=task.task_id)
     api_key = await _api_key(task.organization_id)

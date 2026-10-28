@@ -106,6 +106,7 @@ from skyvern.forge.failure_classifier import (
     classify_from_failure_reason,
     is_captcha_solve_failure,
 )
+from skyvern.forge.final_failure_diagnostic import annotate_failed_task
 from skyvern.forge.prompts import prompt_engine
 from skyvern.forge.sdk.api.aws import get_aws_client
 from skyvern.forge.sdk.api.files import (
@@ -187,6 +188,7 @@ from skyvern.forge.sdk.forge_log import exception_log_fields
 from skyvern.forge.sdk.log_artifacts import save_step_logs, save_task_logs
 from skyvern.forge.sdk.models import TASK_V3_TURN_STEP_CREATED_BY, SpeculativeLLMMetadata, Step, StepStatus
 from skyvern.forge.sdk.schemas.files import FileInfo
+from skyvern.forge.sdk.schemas.har_evidence import HarEvidence, HarEvidenceAvailability
 from skyvern.forge.sdk.schemas.organizations import Organization
 from skyvern.forge.sdk.schemas.persistent_browser_sessions import (
     external_browser_failure_reason,
@@ -10280,9 +10282,16 @@ class ForgeAgent:
         _tracer = otel_trace.get_tracer("skyvern")
         with traced_span(_tracer, "skyvern.agent.cleanup.browser_and_artifacts") as _cl_br_span:
             apply_context_attrs(_cl_br_span)
-            await self.cleanup_browser_and_create_artifacts(
+            har_evidence = await self.cleanup_browser_and_create_artifacts(
                 close_browser_on_completion, last_step, task, browser_session_id=browser_session_id
             )
+        # After the HAR closes and before the webhook, which rebuilds its payload from this task.
+        diagnostic_cancelled = False
+        try:
+            task = await annotate_failed_task(task, har_evidence)
+        except asyncio.CancelledError:
+            # The diagnostic is optional; the terminal webhook below still goes out before the cancellation does.
+            diagnostic_cancelled = True
 
         # Wait for all tasks to complete before generating the links for the artifacts
         with traced_span(_tracer, "skyvern.agent.cleanup.wait_for_upload") as _cl_wait_span:
@@ -10302,6 +10311,8 @@ class ForgeAgent:
             with traced_span(_tracer, "skyvern.agent.cleanup.webhook") as _cl_wh_span:
                 apply_context_attrs(_cl_wh_span)
                 await self.execute_task_webhook(task=task, api_key=api_key)
+        if diagnostic_cancelled:
+            raise asyncio.CancelledError
 
         return task
 
@@ -10554,7 +10565,7 @@ class ForgeAgent:
         last_step: Step,
         task: Task,
         browser_session_id: str | None = None,
-    ) -> None:
+    ) -> HarEvidence:
         """
         Developer notes: we should not expect any exception to be raised here.
         This function should handle exceptions gracefully.
@@ -10674,9 +10685,10 @@ class ForgeAgent:
                     task=task,
                     browser_session_id=browser_session_id,
                 )
+            har_evidence = HarEvidence.unavailable(HarEvidenceAvailability.har_missing)
             if har_data:
                 try:
-                    await app.AGENT_FUNCTION.on_run_har_captured(
+                    har_evidence = await app.AGENT_FUNCTION.on_run_har_captured(
                         browser_state=browser_state,
                         har_data=har_data,
                         organization_id=task.organization_id,
@@ -10685,6 +10697,7 @@ class ForgeAgent:
                         browser_session_id=browser_session_id or task.browser_session_id,
                     )
                 except Exception:
+                    har_evidence = HarEvidence.unavailable(HarEvidenceAvailability.parse_error)
                     LOG.warning("Failed to hand the run HAR to post-run processing", exc_info=True)
             LOG.debug("Uploading har data", har_size=len(har_data))
 
@@ -10716,11 +10729,12 @@ class ForgeAgent:
                     step=last_step,
                     entries=task_archive_entries,
                 )
-        else:
-            LOG.warning(
-                "BrowserState is missing before sending response to webhook_callback_url",
-                web_hook_url=task.webhook_callback_url,
-            )
+            return har_evidence
+        LOG.warning(
+            "BrowserState is missing before sending response to webhook_callback_url",
+            web_hook_url=task.webhook_callback_url,
+        )
+        return HarEvidence.unavailable(HarEvidenceAvailability.not_collected)
 
     async def update_step(
         self,

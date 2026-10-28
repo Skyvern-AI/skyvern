@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from datetime import datetime
 from typing import TYPE_CHECKING, Any, Callable
 
 import structlog
@@ -7,6 +8,7 @@ from sqlalchemy import and_, delete, func, select, update
 from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.orm import aliased
 
+from skyvern.forge.failure_classifier import DIAGNOSABLE_FAILURE_STATUSES, has_classifier_primary, with_diagnostic_entry
 from skyvern.forge.sdk.db._error_handling import db_operation
 from skyvern.forge.sdk.db.base_alchemy_db import read_retry
 from skyvern.forge.sdk.db.base_repository import BaseRepository
@@ -20,6 +22,7 @@ from skyvern.forge.sdk.db.models import (
     TaskV2Model,
     ThoughtModel,
     WorkflowRunBlockModel,
+    WorkflowRunModel,
 )
 from skyvern.forge.sdk.db.protocols import TaskReader
 from skyvern.forge.sdk.db.utils import (
@@ -441,6 +444,52 @@ class ObserverRepository(BaseRepository):
                 await session.refresh(task_v2)
                 return convert_to_task_v2(task_v2, debug_enabled=self.debug_enabled)
             raise NotFoundError(f"TaskV2 {task_v2_id} not found")
+
+    @db_operation("set_task_v2_final_failure_diagnostic")
+    async def set_final_failure_diagnostic(
+        self,
+        task_v2_id: str,
+        organization_id: str,
+        workflow_run_id: str,
+        entry: dict[str, Any],
+        workflow_run_finished_at: datetime,
+    ) -> TaskV2 | None:
+        """Mirror the workflow run's diagnostic onto its failed task v2; None when the task v2 is not that run's
+        failure, has no classifier primary, which the entry would otherwise become, or the run is no longer the
+        execution that finished at ``workflow_run_finished_at``."""
+        async with self.Session() as session:
+            # Parent first, held shared to commit: a reset rewriting the run's finish waits for, or beats, this copy.
+            run = (
+                await session.scalars(
+                    select(WorkflowRunModel.workflow_run_id)
+                    .filter_by(workflow_run_id=workflow_run_id, organization_id=organization_id)
+                    .where(WorkflowRunModel.finished_at == workflow_run_finished_at)
+                    .where(WorkflowRunModel.status.in_(DIAGNOSABLE_FAILURE_STATUSES))
+                    .with_for_update(read=True)
+                )
+            ).first()
+            if run is None:
+                return None
+            task_v2 = (
+                await session.scalars(
+                    select(TaskV2Model)
+                    .filter_by(
+                        observer_cruise_id=task_v2_id, organization_id=organization_id, workflow_run_id=workflow_run_id
+                    )
+                    .with_for_update()
+                    .execution_options(populate_existing=True)
+                )
+            ).first()
+            if (
+                task_v2 is None
+                or task_v2.status not in DIAGNOSABLE_FAILURE_STATUSES
+                or not has_classifier_primary(task_v2.failure_category)
+            ):
+                return None
+            task_v2.failure_category = with_diagnostic_entry(task_v2.failure_category, entry)
+            await session.commit()
+            await session.refresh(task_v2)
+            return convert_to_task_v2(task_v2, debug_enabled=self.debug_enabled)
 
     @db_operation("create_workflow_run_block")
     async def create_workflow_run_block(
