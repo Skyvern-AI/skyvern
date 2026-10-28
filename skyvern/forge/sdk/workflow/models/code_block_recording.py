@@ -11,7 +11,7 @@ import structlog
 from skyvern.config import settings
 from skyvern.forge import app
 from skyvern.forge.sdk.artifact.models import ArtifactType
-from skyvern.forge.sdk.executor.run_liveness import run_lease_final_write_blocked
+from skyvern.forge.sdk.executor.run_liveness import run_lease_final_write_blocked, run_write_authority
 from skyvern.forge.sdk.models import StepStatus
 from skyvern.forge.sdk.schemas.tasks import TaskStatus
 from skyvern.forge.sdk.workflow.models.code_block_recorder import (
@@ -386,6 +386,7 @@ class CodeBlockActionRecording:
                     output=AgentStepOutput(action_results=[]) if success else None,
                     is_last=True,
                     organization_id=self._organization_id,
+                    write_authority_for_run=run_write_authority,
                 )
         except Exception:
             LOG.warning(

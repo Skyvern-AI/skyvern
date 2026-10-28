@@ -15,35 +15,43 @@ async function loadEnv(apiKey: string | null = null, streamingMode = "") {
   return import("./env");
 }
 
-describe("getCredentialParam", () => {
+describe("getWebSocketProtocols", () => {
   afterEach(() => {
     vi.unstubAllEnvs();
     vi.resetModules();
     window.sessionStorage.clear();
   });
 
-  it("includes the runtime API key even when a token getter returns a token", async () => {
-    const { getCredentialParam, persistRuntimeApiKey } =
+  it("carries the runtime API key and the bearer token as subprotocols", async () => {
+    const { getWebSocketProtocols, persistRuntimeApiKey } =
       await loadEnv("ignored-build-key");
-    persistRuntimeApiKey("local+api/key");
+    persistRuntimeApiKey("eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiJvXzEifQ.sig-_1");
 
-    const params = new URLSearchParams(
-      await getCredentialParam(async () => "clerk token"),
-    );
-
-    expect(params.get("apikey")).toBe("local+api/key");
-    expect(params.get("token")).toBe("Bearer clerk token");
+    expect(
+      await getWebSocketProtocols(async () => "eyJ0eXAiOiJKV1QifQ.e30.c2ln"),
+    ).toEqual([
+      "skyvern.v1",
+      "apikey.eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiJvXzEifQ.sig-_1",
+      "bearer.eyJ0eXAiOiJKV1QifQ.e30.c2ln",
+    ]);
   });
 
-  it("uses the token when no runtime API key is available", async () => {
-    const { getCredentialParam } = await loadEnv();
+  it("offers only the stream subprotocol when no credential is available", async () => {
+    const { getWebSocketProtocols, hasWebSocketCredential } = await loadEnv();
 
-    const params = new URLSearchParams(
-      await getCredentialParam(async () => "clerk token"),
-    );
+    const protocols = await getWebSocketProtocols(async () => null);
 
-    expect(params.has("apikey")).toBe(false);
-    expect(params.get("token")).toBe("Bearer clerk token");
+    expect(protocols).toEqual(["skyvern.v1"]);
+    expect(hasWebSocketCredential(protocols)).toBe(false);
+  });
+
+  it("drops a credential that is not a valid subprotocol token", async () => {
+    const { getWebSocketProtocols, persistRuntimeApiKey } = await loadEnv();
+    persistRuntimeApiKey("local+api/key");
+
+    expect(await getWebSocketProtocols(async () => "clerk token")).toEqual([
+      "skyvern.v1",
+    ]);
   });
 });
 
@@ -69,14 +77,12 @@ describe("getRuntimeApiKey", () => {
     expect(window.sessionStorage.getItem("skyvern.apiKey")).toBe(null);
   });
 
-  it("does not expose the build-time API key through credential params", async () => {
-    const { getCredentialParam } = await loadEnv(
+  it("does not expose the build-time API key through stream subprotocols", async () => {
+    const { getWebSocketProtocols } = await loadEnv(
       "build-time-key-must-stay-server-side",
     );
 
-    const params = new URLSearchParams(await getCredentialParam(null));
-
-    expect(params.has("apikey")).toBe(false);
+    expect(await getWebSocketProtocols(null)).toEqual(["skyvern.v1"]);
   });
 
   it("persists and clears a runtime API key and expiry in sessionStorage", async () => {

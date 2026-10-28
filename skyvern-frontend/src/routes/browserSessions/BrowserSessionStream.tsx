@@ -1,7 +1,7 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { useCredentialGetter } from "@/hooks/useCredentialGetter";
 import { useLogging } from "@/hooks/useLogging";
-import { newWssBaseUrl, getCredentialParam } from "@/util/env";
+import { newWssBaseUrl, getWebSocketProtocols } from "@/util/env";
 import { useCdpInput } from "@/routes/streaming/useCdpInput";
 import {
   useRecordingMessageChannel,
@@ -388,15 +388,15 @@ function BrowserSessionStream({
     };
 
     async function connect() {
-      const credentialParam = await getCredentialParam(credentialGetter);
+      const protocols = await getWebSocketProtocols(credentialGetter);
       if (cancelled) {
         return;
       }
 
-      const url = `${newWssBaseUrl}/stream/browser_sessions/${browserSessionId}?${credentialParam}${forceCdp ? "&force_cdp=true" : ""}`;
+      const url = `${newWssBaseUrl}/stream/browser_sessions/${browserSessionId}${forceCdp ? "?force_cdp=true" : ""}`;
 
       socketRef.current?.close();
-      const socket = new WebSocket(url);
+      const socket = new WebSocket(url, protocols);
       socketRef.current = socket;
 
       const isCurrentSocket = () => !cancelled && socketRef.current === socket;

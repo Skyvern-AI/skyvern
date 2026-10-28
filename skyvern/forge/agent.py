@@ -172,7 +172,12 @@ from skyvern.forge.sdk.core.skyvern_context import (
 from skyvern.forge.sdk.db.datetime_utils import naive_utc_now
 from skyvern.forge.sdk.db.enums import TaskType
 from skyvern.forge.sdk.db.exceptions import NotFoundError
-from skyvern.forge.sdk.executor.run_liveness import note_run_finalized, run_lease_final_write_blocked, run_lease_lost
+from skyvern.forge.sdk.executor.run_liveness import (
+    note_run_finalized,
+    run_lease_final_write_blocked,
+    run_lease_lost,
+    run_write_authority,
+)
 from skyvern.forge.sdk.experimentation.enrich_tree import resolve_enrich_tree_for_context
 from skyvern.forge.sdk.experimentation.llm_prompt_config import resolve_check_user_goal_handler
 from skyvern.forge.sdk.experimentation.slim_llm_output import get_slim_output_template_value
@@ -3568,6 +3573,7 @@ class ForgeAgent:
                         task_id=task.task_id,
                         step_id=v3_turn_step.step_id,
                         organization_id=task.organization_id,
+                        write_authority_for_run=run_write_authority,
                         status=status,
                         output=AgentStepOutput(
                             llm_seconds=record.llm_seconds if record else None,
@@ -10889,6 +10895,7 @@ class ForgeAgent:
             task_id=step.task_id,
             step_id=step.step_id,
             organization_id=step.organization_id,
+            write_authority_for_run=run_write_authority,
             **updates,
         )
 
