@@ -1027,7 +1027,7 @@ async def test_runtime_secret_bridge_encrypts_shared_cache_payload(monkeypatch: 
         plaintext = value
         return "opaque-ciphertext"
 
-    async def fake_decrypt(_value: str, _method: object) -> str:
+    async def fake_decrypt_unlabeled(_value: str) -> str:
         assert plaintext is not None
         return plaintext
 
@@ -1035,7 +1035,7 @@ async def test_runtime_secret_bridge_encrypts_shared_cache_payload(monkeypatch: 
     monkeypatch.setattr(
         runtime_secret_bridge,
         "encryptor",
-        SimpleNamespace(encrypt=fake_encrypt, decrypt=fake_decrypt),
+        SimpleNamespace(encrypt=fake_encrypt, decrypt_unlabeled=fake_decrypt_unlabeled),
     )
     workflow_run_context = SimpleNamespace(
         secrets={"password": "private-pass", "runtime": "654321"},

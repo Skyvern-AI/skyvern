@@ -58,6 +58,8 @@ from skyvern.forge.sdk.db.agent_db import AgentDB
 from skyvern.forge.sdk.db.enums import OrganizationAuthTokenType
 from skyvern.forge.sdk.db.models import Base, CredentialModel, WorkflowModel
 from skyvern.forge.sdk.db.utils import _custom_json_serializer
+from skyvern.forge.sdk.encrypt import encryptor
+from skyvern.forge.sdk.encrypt.bootstrap import register_aes_encryptor
 from skyvern.forge.sdk.executor.async_executor import AsyncExecutor
 from skyvern.forge.sdk.executor.factory import AsyncExecutorFactory
 from skyvern.forge.sdk.schemas.credentials import BitwardenItemOverview, CredentialType
@@ -457,6 +459,14 @@ def gpt56_litellm_models() -> Iterator[None]:
 # We build the schema once per session into a template SQLite file and clone that
 # file per test — a byte copy is orders of magnitude cheaper than re-emitting the
 # DDL, and each test still gets its own isolated database.
+
+
+@pytest.fixture
+def registered_encryption() -> Iterator[None]:
+    """The real AES-CBC and AES-GCM encryptors, registered as a deployment with ENABLE_ENCRYPTION would."""
+    with patch.dict(encryptor._methods, clear=True):
+        register_aes_encryptor(secret_key="registered-encryption-test-key")
+        yield
 
 
 @pytest.fixture(scope="session")

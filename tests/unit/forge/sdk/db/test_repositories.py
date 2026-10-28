@@ -14,8 +14,10 @@ from sqlalchemy.ext.asyncio import AsyncEngine, async_sessionmaker
 
 from skyvern.forge.sdk.artifact.models import ArtifactType
 from skyvern.forge.sdk.db.agent_db import AgentDB
+from skyvern.forge.sdk.db.enums import OrganizationAuthTokenType
 from skyvern.forge.sdk.db.id import generate_artifact_id
 from skyvern.forge.sdk.db.models import (
+    OrganizationAuthTokenModel,
     OrganizationModel,
     PersistentBrowserSessionModel,
     ScriptBlockModel,
@@ -27,6 +29,8 @@ from skyvern.forge.sdk.db.models import (
 from skyvern.forge.sdk.db.repositories.organizations import OrganizationsRepository
 from skyvern.forge.sdk.db.repositories.scripts import ScriptsRepository
 from skyvern.forge.sdk.db.repositories.tasks import TasksRepository
+from skyvern.forge.sdk.encrypt import encryptor
+from skyvern.forge.sdk.encrypt.base import EncryptMethod
 from skyvern.forge.sdk.models import Step
 from skyvern.forge.sdk.schemas.tasks import TaskStatus
 from skyvern.forge.sdk.schemas.totp_codes import OTPType, RawTOTPCode, TOTPCode
@@ -261,6 +265,50 @@ async def test_organizations_repository_persists_and_clears_default_llm_keys(sql
         assert stored is not None
         assert stored.default_llm_key is None
         assert stored.default_secondary_llm_key is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.usefixtures("registered_encryption")
+async def test_validate_org_auth_token_matches_by_decrypting_each_row(sqlite_engine: AsyncEngine) -> None:
+    session_factory = async_sessionmaker(sqlite_engine, expire_on_commit=False)
+    legacy_ciphertext = await encryptor.encrypt("key-on-cbc", EncryptMethod.AES)
+    async with session_factory() as session:
+        session.add(OrganizationModel(organization_id="o_keys", organization_name="Keys Org"))
+        session.add(
+            OrganizationAuthTokenModel(
+                organization_id="o_keys",
+                token_type=OrganizationAuthTokenType.api,
+                token="",
+                encrypted_token=legacy_ciphertext,
+                encrypted_method=EncryptMethod.AES.value,
+            )
+        )
+        session.add(
+            OrganizationAuthTokenModel(
+                organization_id="o_keys",
+                token_type=OrganizationAuthTokenType.api,
+                token="revoked-plaintext-key",
+                encrypted_token="",
+                encrypted_method="",
+                valid=False,
+            )
+        )
+        await session.commit()
+    repo = OrganizationsRepository(session_factory=session_factory, debug_enabled=False)
+    gcm_key = await repo.create_org_auth_token(
+        "o_keys", OrganizationAuthTokenType.api, "key-on-gcm", encrypted_method=EncryptMethod.AES_GCM
+    )
+
+    for plaintext in ("key-on-cbc", "key-on-gcm"):
+        found = await repo.validate_org_auth_token("o_keys", OrganizationAuthTokenType.api, plaintext)
+        assert found is not None and found.token == plaintext
+    assert (await repo.validate_org_auth_token("o_keys", OrganizationAuthTokenType.api, "key-on-gcm")).id == gcm_key.id
+    assert await repo.validate_org_auth_token("o_keys", OrganizationAuthTokenType.api, "unknown-key") is None
+    assert await repo.validate_org_auth_token("o_keys", OrganizationAuthTokenType.api, "revoked-plaintext-key") is None
+    revoked = await repo.validate_org_auth_token(
+        "o_keys", OrganizationAuthTokenType.api, "revoked-plaintext-key", valid=None
+    )
+    assert revoked is not None and revoked.valid is False
 
 
 def test_schedules_repository_instantiation():

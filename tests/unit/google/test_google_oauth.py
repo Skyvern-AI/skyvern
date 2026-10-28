@@ -15,7 +15,7 @@ from sqlalchemy.sql.elements import BindParameter
 from skyvern.exceptions import DownloadFileMaxSizeExceeded
 from skyvern.forge.agent_functions import AgentFunction
 from skyvern.forge.sdk.db.enums import OrganizationAuthTokenType
-from skyvern.forge.sdk.encrypt.base import EncryptMethod
+from skyvern.forge.sdk.encrypt.base import DEFAULT_ENCRYPT_METHOD, EncryptMethod
 from skyvern.forge.sdk.routes import google_oauth as google_oauth_routes
 from skyvern.forge.sdk.schemas.google_oauth import (
     CreateGoogleOAuthAuthorizeRequest,
@@ -2118,7 +2118,7 @@ async def test_save_client_config_requires_org_config_enabled(monkeypatch: pytes
 
 
 @pytest.mark.asyncio
-async def test_save_client_config_uses_aes(monkeypatch: pytest.MonkeyPatch) -> None:
+async def test_save_client_config_uses_aes_gcm(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(
         google_oauth_service.SettingsManager,
         "get_settings",
@@ -2143,7 +2143,7 @@ async def test_save_client_config_uses_aes(monkeypatch: pytest.MonkeyPatch) -> N
     assert resolved.source == "organization"
     assert resolved.config == config
     replace_mock.assert_awaited_once()
-    assert replace_mock.await_args.kwargs["encrypted_method"] is EncryptMethod.AES
+    assert replace_mock.await_args.kwargs["encrypted_method"] is DEFAULT_ENCRYPT_METHOD
     mark_mock.assert_awaited_once()
     assert mark_mock.await_args.kwargs["organization_id"] == "org_1"
     assert mark_mock.await_args.kwargs["new_client_id"] == "cid"
@@ -2902,14 +2902,14 @@ async def test_promote_pending_credential_encrypts_and_calls_repo(monkeypatch: p
     )
 
     assert result is promoted_schema
-    encrypt_mock.assert_awaited_once_with("rt-plain", EncryptMethod.AES)
+    encrypt_mock.assert_awaited_once_with("rt-plain", DEFAULT_ENCRYPT_METHOD)
     promote_mock.assert_awaited_once()
     kwargs = promote_mock.await_args.kwargs
     assert kwargs["organization_id"] == "org_1"
     assert kwargs["nonce"] == oauth_consent.consent_nonce("state-xyz", "user_1")
     assert kwargs["nonce"] != "state-xyz"
     assert kwargs["encrypted_refresh_token"] == "ENC::rt"
-    assert kwargs["encrypted_method"] == EncryptMethod.AES
+    assert kwargs["encrypted_method"] == DEFAULT_ENCRYPT_METHOD
     assert kwargs["scopes_granted"] == ["https://a", "https://b"]
     # A re-auth reuses the credential id, so a token cached before rotation must be dropped.
     fake_cache.set.assert_awaited_once()
@@ -3462,7 +3462,7 @@ async def test_refresh_and_rotate_persists_google_refresh_token(
     )
 
     assert result.access_token == "at-refreshed"
-    encrypt.assert_awaited_once_with("rt-rotated", EncryptMethod.AES)
+    encrypt.assert_awaited_once_with("rt-rotated", DEFAULT_ENCRYPT_METHOD)
     assert update_active_refresh_token.await_args is not None
     assert update_active_refresh_token.await_args.kwargs["expected_encrypted_refresh_token"] == "encrypted-rt-original"
     assert result.credential_version == update_active_refresh_token.await_args.kwargs["now"]
