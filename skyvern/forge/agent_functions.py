@@ -7,7 +7,7 @@ import os
 import time
 from collections.abc import AsyncIterator, Mapping, Sequence
 from contextlib import AbstractAsyncContextManager, AbstractContextManager, asynccontextmanager, nullcontext
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import datetime, timedelta, timezone
 from typing import TYPE_CHECKING, Any, Callable, Literal, TypedDict
 
@@ -3078,6 +3078,10 @@ class AgentFunction:
         del organization_id
         return None if settings.WORKFLOW_COPILOT_CODE_BLOCK_MODE else False
 
+    async def copilot_agent_step_enabled(self, organization_id: str | None) -> bool:
+        del organization_id
+        return False
+
     async def _resolve_copilot_requested_code_block_mode(
         self,
         organization_id: str | None,
@@ -3115,7 +3119,18 @@ class AgentFunction:
         config = self.get_copilot_config(effective_code_block_mode)
         if config is None:
             return None
-        config.authoring_capability = authoring_capability_for_request(code_block_mode, has_code_block_access)
+        try:
+            agent_step_enabled = await self.copilot_agent_step_enabled(organization_id)
+        except Exception:
+            LOG.warning(
+                "Failed to resolve Copilot agent_step access; leaving it unavailable",
+                organization_id=organization_id,
+                exc_info=True,
+            )
+            agent_step_enabled = False
+        config.authoring_capability = replace(
+            authoring_capability_for_request(code_block_mode, has_code_block_access), agent_step=agent_step_enabled
+        )
         config.code_block_available = has_code_block_access
         config.effective_code_block_mode = effective_code_block_mode
         return config

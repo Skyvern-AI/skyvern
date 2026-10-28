@@ -9,7 +9,7 @@ from collections.abc import AsyncIterator, Awaitable, Callable, Iterable, Iterat
 from contextlib import asynccontextmanager, contextmanager, suppress
 from contextvars import ContextVar
 from copy import deepcopy
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from enum import StrEnum
 from types import MappingProxyType
 from typing import TYPE_CHECKING, Any, Literal, NotRequired, TypeAlias, TypedDict, cast
@@ -614,6 +614,7 @@ class AgentContext:
     # Wire and persisted-metadata spelling of authoring_capability; authoring surfaces read the
     # capability, never this field.
     block_authoring_policy: BlockAuthoringPolicy = BlockAuthoringPolicy.TASK_V3_PURE
+    agent_step_available: bool = False
     effective_workflow_proxy_location: ProxyLocationInput = None
     # The proxy the last dispatched run acted through, which is the attached session's whenever it
     # declares one. Kept apart from the declared location above, which the repair levers read.
@@ -831,11 +832,14 @@ class AgentContext:
 
     @property
     def authoring_capability(self) -> AuthoringCapability:
-        return authoring_capability_from_policy(self.block_authoring_policy)
+        return replace(
+            authoring_capability_from_policy(self.block_authoring_policy), agent_step=self.agent_step_available
+        )
 
     @authoring_capability.setter
     def authoring_capability(self, capability: AuthoringCapability) -> None:
         self.block_authoring_policy = block_authoring_policy_from_capability(capability)
+        self.agent_step_available = capability.agent_step
 
 
 def mcp_to_copilot(mcp_result: dict[str, Any]) -> dict[str, Any]:
