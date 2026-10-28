@@ -9,6 +9,7 @@ import time
 from collections.abc import AsyncIterator, Callable
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
+from datetime import datetime
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
@@ -22,6 +23,7 @@ from structlog.testing import capture_logs
 from skyvern.cli.core.browser_ops import ScreenshotResult
 from skyvern.config import settings
 from skyvern.forge import app
+from skyvern.forge.agent_functions import AgentFunction
 from skyvern.forge.sdk.copilot import tools as tools_module
 from skyvern.forge.sdk.copilot.build_test_connect_failure import SUPERSEDED_BY_NEWER_TEST_REASON
 from skyvern.forge.sdk.copilot.code_block_synthesis import synthesize_code_block
@@ -50,6 +52,8 @@ from skyvern.forge.sdk.copilot.tools import (
 )
 from skyvern.forge.sdk.copilot.tools import scouting as scouting_module
 from skyvern.forge.sdk.copilot.tools.credential_fill import _fill_observed_effects
+from skyvern.forge.sdk.copilot.tools.credentials import _latest_listing_google_sheet_ids
+from skyvern.forge.sdk.copilot.tools.integrations import _list_integrations
 from skyvern.forge.sdk.copilot.tools.mcp_hooks import (
     ScoutReadbackOutcome,
     _scout_readback_outcome,
@@ -64,9 +68,13 @@ from skyvern.forge.sdk.copilot.tools.scouting import (
 )
 from skyvern.forge.sdk.copilot.tools.workflow_update import proposal_workflow_fingerprint
 from skyvern.forge.sdk.copilot.turn_halt import CopilotTurnHalt, TurnHaltKind
+from skyvern.forge.sdk.integrations import catalog
+from skyvern.forge.sdk.schemas.google_oauth import GoogleOAuthCredentialBase
+from skyvern.forge.sdk.schemas.microsoft_oauth import MicrosoftOAuthCredentialBase
+from skyvern.forge.sdk.services import google_oauth_service
 from skyvern.webeye.persistent_sessions_manager import BrowserOperation, BrowserRetirement
 from skyvern.webeye.utils import challenge_signature as challenge_signature_module
-from tests.unit.copilot_test_helpers import make_copilot_ctx
+from tests.unit.copilot_test_helpers import fake_tool, make_copilot_ctx
 from tests.unit.scoped_asyncio import ScopedAsyncio
 
 READBACK_OUTCOME_CASES = yaml.safe_load((Path(__file__).parent / "credential_readback_outcome_cases.yaml").read_text())[
@@ -180,12 +188,6 @@ class _ListenerPage:
 _UNUSED = MagicMock()
 
 
-def _fake_tool(name: str) -> MagicMock:
-    tool = MagicMock()
-    tool.name = name
-    return tool
-
-
 def _mcp_text_output(payload: dict[str, Any]) -> list[dict[str, str]]:
     """Shape that `parse_tool_output` expects from FastMCP tool calls."""
     return [{"type": "text", "text": json.dumps(payload)}]
@@ -197,7 +199,7 @@ async def test_on_tool_end_appends_generic_tool_entry() -> None:
     hooks = CopilotRunHooks(ctx)
 
     output = _mcp_text_output({"ok": True, "data": {"url": "https://example.com"}})
-    await hooks.on_tool_end(_UNUSED, _UNUSED, _fake_tool("navigate_browser"), output)
+    await hooks.on_tool_end(_UNUSED, _UNUSED, fake_tool("navigate_browser"), output)
 
     assert len(ctx.tool_activity) == 1
     entry = ctx.tool_activity[0]
@@ -213,7 +215,7 @@ async def test_on_tool_end_logs_copilot_turn_identifiers() -> None:
 
     output = _mcp_text_output({"ok": True, "data": {"url": "https://example.com"}})
     with capture_logs() as logs:
-        await hooks.on_tool_end(_UNUSED, _UNUSED, _fake_tool("navigate_browser"), output)
+        await hooks.on_tool_end(_UNUSED, _UNUSED, fake_tool("navigate_browser"), output)
 
     completed = next(log for log in logs if log["event"] == "copilot tool completed")
     assert completed["workflow_permanent_id"] == "wpid_example"
@@ -237,7 +239,7 @@ async def test_on_tool_end_whitelisted_tool_produces_output_preview() -> None:
             },
         }
     )
-    await hooks.on_tool_end(_UNUSED, _UNUSED, _fake_tool("run_blocks_and_collect_debug"), output)
+    await hooks.on_tool_end(_UNUSED, _UNUSED, fake_tool("run_blocks_and_collect_debug"), output)
 
     entry = ctx.tool_activity[0]
     assert entry["tool"] == "run_blocks_and_collect_debug"
@@ -253,7 +255,7 @@ async def test_on_tool_end_truncates_output_preview_at_500_chars() -> None:
 
     huge_output = {"values": ["x" * 1000]}
     output = _mcp_text_output({"ok": True, "data": {"blocks": [{"label": "big", "output": huge_output}]}})
-    await hooks.on_tool_end(_UNUSED, _UNUSED, _fake_tool("get_run_results"), output)
+    await hooks.on_tool_end(_UNUSED, _UNUSED, fake_tool("get_run_results"), output)
 
     entry = ctx.tool_activity[0]
     preview = entry["output_preview"]
@@ -268,7 +270,7 @@ async def test_on_tool_end_whitelisted_tool_without_block_outputs_skips_preview(
     hooks = CopilotRunHooks(ctx)
 
     output = _mcp_text_output({"ok": True, "data": {"blocks": [{"label": "noop"}]}})
-    await hooks.on_tool_end(_UNUSED, _UNUSED, _fake_tool("update_and_run_blocks"), output)
+    await hooks.on_tool_end(_UNUSED, _UNUSED, fake_tool("update_and_run_blocks"), output)
 
     entry = ctx.tool_activity[0]
     assert entry["tool"] == "update_and_run_blocks"
@@ -281,7 +283,7 @@ async def test_on_tool_end_failed_whitelisted_tool_skips_preview() -> None:
     hooks = CopilotRunHooks(ctx)
 
     output = _mcp_text_output({"ok": False, "error": "workflow exploded"})
-    await hooks.on_tool_end(_UNUSED, _UNUSED, _fake_tool("run_blocks_and_collect_debug"), output)
+    await hooks.on_tool_end(_UNUSED, _UNUSED, fake_tool("run_blocks_and_collect_debug"), output)
 
     entry = ctx.tool_activity[0]
     assert "output_preview" not in entry
@@ -304,13 +306,93 @@ async def test_on_tool_end_list_credentials_records_resolved_ids() -> None:
             },
         }
     )
-    await hooks.on_tool_end(_UNUSED, _UNUSED, _fake_tool("list_credentials"), output)
+    await hooks.on_tool_end(_UNUSED, _UNUSED, fake_tool("list_credentials"), output)
 
     entry = ctx.tool_activity[0]
     assert entry["credentials"] == [
         {"credential_id": "cred_amazon", "name": "Amazon"},
         {"credential_id": "cred_quicken", "name": "Quicken Classic"},
     ]
+
+
+def _listed_google_credential(
+    *,
+    credential_id: str,
+    scopes_requested: list[str] | None = None,
+    scopes_granted: list[str] | None = None,
+    state: str = "active",
+) -> GoogleOAuthCredentialBase:
+    sheets_scope = ["https://www.googleapis.com/auth/spreadsheets"]
+    return GoogleOAuthCredentialBase(
+        id=credential_id,
+        organization_id="org-1",
+        credential_name="Google account",
+        state=state,
+        scopes_requested=sheets_scope if scopes_requested is None else scopes_requested,
+        scopes_granted=sheets_scope if scopes_granted is None else scopes_granted,
+        created_at=datetime(2026, 6, 19),
+        modified_at=datetime(2026, 6, 19),
+    )
+
+
+@pytest.mark.asyncio
+async def test_on_tool_end_list_integrations_keeps_the_sheets_connections_a_flat_listing_admitted(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    sheets_scope = "https://www.googleapis.com/auth/spreadsheets"
+    drive_metadata_scope = "https://www.googleapis.com/auth/drive.metadata.readonly"
+    drive_scope = "https://www.googleapis.com/auth/drive"
+    gmail_read_scope = "https://www.googleapis.com/auth/gmail.readonly"
+    google_credentials = [
+        _listed_google_credential(
+            credential_id="goac_requested_sheets_only", scopes_requested=[sheets_scope], scopes_granted=[sheets_scope]
+        ),
+        _listed_google_credential(
+            credential_id="goac_full_sheets",
+            scopes_requested=[sheets_scope, drive_metadata_scope],
+            scopes_granted=[sheets_scope],
+        ),
+        _listed_google_credential(
+            credential_id="goac_drive_and_sheets",
+            scopes_requested=[drive_scope],
+            scopes_granted=[drive_scope, sheets_scope],
+        ),
+        _listed_google_credential(credential_id="goac_expired_sheets", state="error"),
+        _listed_google_credential(
+            credential_id="goac_gmail", scopes_requested=[gmail_read_scope], scopes_granted=[gmail_read_scope]
+        ),
+    ]
+    outlook = MicrosoftOAuthCredentialBase(
+        id="msoac_1",
+        organization_id="org-1",
+        credential_name="Outlook account",
+        state="active",
+        scopes_requested=["Mail.Read"],
+        scopes_granted=["Mail.Read"],
+        created_at=datetime(2026, 6, 19),
+        modified_at=datetime(2026, 6, 19),
+    )
+    monkeypatch.setattr(
+        catalog.google_oauth_service, "get_visible_credentials_for_org", AsyncMock(return_value=google_credentials)
+    )
+    monkeypatch.setattr(catalog.microsoft_oauth_service, "get_credentials_for_org", AsyncMock(return_value=[outlook]))
+    monkeypatch.setattr(app.DATABASE.organizations, "has_valid_org_auth_token", AsyncMock(return_value=True))
+    monkeypatch.setattr(app, "AGENT_FUNCTION", AgentFunction())
+    ctx = make_copilot_ctx()
+    result = await _list_integrations({}, ctx)
+
+    await CopilotRunHooks(ctx).on_tool_end(_UNUSED, _UNUSED, fake_tool("list_integrations"), json.dumps(result))
+
+    [activity] = ctx.tool_activity
+    assert sorted(row["connection_id"] for row in activity["integrations"]) == sorted(
+        [credential.id for credential in google_credentials] + ["msoac_1"]
+    )
+    assert _latest_listing_google_sheet_ids(ctx.tool_activity) == {
+        credential.id
+        for credential in google_credentials
+        if credential.state == "active"
+        and google_oauth_service.has_required_scopes(credential.scopes_granted, [sheets_scope])
+    }
 
 
 @pytest.mark.asyncio
@@ -327,7 +409,7 @@ async def test_on_tool_end_exact_credential_preserves_identity_for_structured_co
             },
         }
     )
-    await hooks.on_tool_end(_UNUSED, _UNUSED, _fake_tool("list_credentials"), output)
+    await hooks.on_tool_end(_UNUSED, _UNUSED, fake_tool("list_credentials"), output)
 
     structured_context = StructuredContext()
     structured_context.merge_turn_summary(ctx.tool_activity)
@@ -346,7 +428,7 @@ async def test_on_tool_end_list_credentials_empty_skips_field() -> None:
     hooks = CopilotRunHooks(ctx)
 
     output = _mcp_text_output({"ok": True, "data": {"credentials": [], "count": 0}})
-    await hooks.on_tool_end(_UNUSED, _UNUSED, _fake_tool("list_credentials"), output)
+    await hooks.on_tool_end(_UNUSED, _UNUSED, fake_tool("list_credentials"), output)
 
     assert "credentials" not in ctx.tool_activity[0]
 
@@ -355,31 +437,44 @@ async def test_on_tool_end_list_credentials_empty_skips_field() -> None:
 async def test_on_tool_end_list_integrations_records_server_owned_binding_evidence() -> None:
     ctx = _FakeContext()
     hooks = CopilotRunHooks(ctx)
+    sheets_account = {
+        "connection_id": "goac_sheets",
+        "provider": "google",
+        "name": "Sheets account",
+        "state": "active",
+        "scopes_granted": ["https://www.googleapis.com/auth/spreadsheets"],
+    }
     output = _mcp_text_output(
         {
             "ok": True,
             "data": {
                 "integrations": [
+                    {"id": "google_sheets", "accounts": [sheets_account]},
+                    {"id": "google_drive", "accounts": [sheets_account]},
                     {
-                        "connection_id": "goac_sheets",
-                        "provider": "google",
-                        "name": "Sheets account",
-                        "state": "active",
-                        "scopes_granted": ["https://www.googleapis.com/auth/spreadsheets"],
+                        "id": "outlook",
+                        "accounts": [
+                            {
+                                "connection_id": "msoac_mail",
+                                "provider": "microsoft",
+                                "name": "Mail account",
+                                "state": "active",
+                                "scopes_granted": [],
+                            }
+                        ],
                     },
+                    {"id": "bitwarden", "accounts": [{"provider": "bitwarden", "state": "active"}]},
                     {
-                        "connection_id": "msoac_mail",
-                        "provider": "microsoft",
-                        "name": "Mail account",
-                        "state": "active",
-                        "scopes_granted": [],
+                        "id": "skyvern-sms-number",
+                        "accounts": [{"connection_id": "pn_1", "provider": "skyvern", "state": "active"}],
                     },
+                    {"id": "mcp", "accounts": None},
                 ]
             },
         }
     )
 
-    await hooks.on_tool_end(_UNUSED, _UNUSED, _fake_tool("list_integrations"), output)
+    await hooks.on_tool_end(_UNUSED, _UNUSED, fake_tool("list_integrations"), output)
 
     assert ctx.tool_activity[0]["integrations"] == [
         {
@@ -410,8 +505,8 @@ async def test_on_tool_end_swallows_unserializable_output() -> None:
 
     payload = {"ok": True, "data": {"blocks": [{"label": "bad", "output": _Unserializable()}]}}
     with capture_logs() as logs:
-        await hooks.on_tool_start(_UNUSED, _UNUSED, _fake_tool("run_blocks_and_collect_debug"))
-        await hooks.on_tool_end(_UNUSED, _UNUSED, _fake_tool("run_blocks_and_collect_debug"), payload)
+        await hooks.on_tool_start(_UNUSED, _UNUSED, fake_tool("run_blocks_and_collect_debug"))
+        await hooks.on_tool_end(_UNUSED, _UNUSED, fake_tool("run_blocks_and_collect_debug"), payload)
 
     # The recording path raised inside json.dumps before append. The guard
     # swallowed it, so the invariant is "the run did not crash" -- and the
@@ -974,7 +1069,7 @@ class TestMCPToolOverlayCompleteness:
         from skyvern.forge.sdk.copilot.tools import _build_skyvern_mcp_overlays
 
         overlays = _build_skyvern_mcp_overlays()
-        for name in {"click", "type_text", "select_option", "press_key"}:
+        for name in ("click", "type_text", "select_option", "press_key"):
             hidden = overlays[name].hide_params or frozenset()
             assert "intent" in hidden, f"{name} should hide intent"
 
@@ -2803,7 +2898,7 @@ class TestScoutedInteractionCapture:
                 started.set()
             try:
                 await asyncio.wait_for(started.wait(), timeout=0.5)
-            except asyncio.TimeoutError:
+            except TimeoutError:
                 pass
             in_flight -= 1
             return 1.0
@@ -3989,7 +4084,7 @@ async def test_a_superseded_build_test_run_stops_the_turn_before_it_can_dispatch
         workflow_run_id="wr_this_turn",
     )
     output = _mcp_text_output({"ok": False, "data": {"workflow_run_id": "wr_this_turn"}})
-    tool = _fake_tool("run_blocks_and_collect_debug")
+    tool = fake_tool("run_blocks_and_collect_debug")
 
     if not expected_halt:
         await CopilotRunHooks(ctx).on_tool_end(_UNUSED, _UNUSED, tool, output)

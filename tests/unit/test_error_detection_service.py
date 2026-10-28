@@ -4,14 +4,17 @@ Unit tests for error_detection_service module.
 Tests the user-defined error detection functionality for failed tasks.
 """
 
-from datetime import datetime
+from datetime import UTC, datetime
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 from structlog.testing import capture_logs
 
+from skyvern.forge.sdk.core import skyvern_context
+from skyvern.forge.sdk.core.skyvern_context import SkyvernContext
 from skyvern.forge.sdk.models import Step, StepStatus
 from skyvern.services.error_detection_service import detect_user_defined_errors_for_task
+from skyvern.webeye.utils.challenge_solve_record import ChallengeSolveReceipt
 from tests.unit.helpers import make_organization, make_task
 
 
@@ -425,3 +428,37 @@ async def test_every_empty_detection_path_falls_back_to_a_single_code_the_reason
         )
 
     assert [error.error_code for error in detected] == expected
+
+
+@pytest.mark.asyncio
+async def test_the_context_detector_reads_this_tasks_unresolved_solves_in_its_one_call(mock_step):
+    now = datetime(2026, 8, 1)
+    task = make_task(now, make_organization(now), error_code_mapping={"bot_check": "A bot check blocked the form"})
+    task.started_at = now
+    prompts: list[str] = []
+
+    async def handler(*, prompt: str, **_: object) -> dict:
+        prompts.append(prompt)
+        return {"errors": [{"error_code": "bot_check", "reasoning": "unsolved check", "confidence_float": 0.8}]}
+
+    with (
+        patch("skyvern.services.error_detection_service.app") as mock_app,
+        skyvern_context.scoped(SkyvernContext(task_id=task.task_id)) as context,
+    ):
+        mock_app.EXTRACTION_LLM_API_HANDLER = handler
+        context.challenge_solve_receipts.extend(
+            [
+                ChallengeSolveReceipt(
+                    task.task_id, datetime(2026, 8, 1, 0, 1, tzinfo=UTC), "hcaptcha", "unsolved", "x"
+                ),
+                ChallengeSolveReceipt(task.task_id, datetime(2026, 8, 1, 0, 2, tzinfo=UTC), "hcaptcha", "solved", "x"),
+            ]
+        )
+        detected = await detect_user_defined_errors_for_task(
+            task=task, step=mock_step, browser_state=None, failure_reason="Navigation timeout"
+        )
+
+    # A later solve of the same service cleared the hCaptcha challenge, and the prompt says so; still one call.
+    [prompt] = prompts
+    assert '"service": "hcaptcha", "outcome": "unsolved", "page_state": "x", "unresolved": false' in prompt
+    assert [error.error_code for error in detected] == ["bot_check"]

@@ -16,6 +16,7 @@ from skyvern.core.script_generations.skyvern_page import RunContext
 from skyvern.exceptions import BROWSER_CONNECTION_LOST_ERROR_CODE, MissingBrowserState, ScriptTerminationException
 from skyvern.forge import app
 from skyvern.forge.sdk.core import skyvern_context
+from skyvern.forge.sdk.core.skyvern_context import SkyvernContext
 from skyvern.forge.sdk.schemas.tasks import TaskStatus
 from skyvern.forge.sdk.workflow.context_manager import BlockOutcome, WorkflowRunContext
 from skyvern.forge.sdk.workflow.models.block import (
@@ -35,6 +36,7 @@ from skyvern.forge.sdk.workflow.models.block import (
 from skyvern.forge.sdk.workflow.models.workflow import WorkflowRunStatus
 from skyvern.schemas.workflows import BlockResult, BlockStatus, BlockType
 from skyvern.services import script_service
+from skyvern.webeye.utils.challenge_solve_record import ChallengeSolveReceipt
 from tests.unit._task_block_fakes import run_bound_browser_state
 from tests.unit.conftest import make_block_output_parameter
 from tests.unit.helpers import make_organization, make_task
@@ -627,3 +629,36 @@ async def test_outcome_record_failure_does_not_skip_cached_output(monkeypatch: p
     await script_service._update_workflow_block("wrb_cached", BlockStatus.completed, label="cached")
 
     record_output.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_the_script_user_error_call_reads_the_tasks_recorded_solves_in_its_one_call(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    now = datetime(2026, 8, 1)
+    task = make_task(now, make_organization(now), error_code_mapping={"BOT_WALL": "A bot check blocked the form"})
+    task.started_at = now
+    scraped = MagicMock(url="https://site.test/form", screenshots=[], build_element_tree=lambda *_: "<form/>")
+    run_context = MagicMock()
+    run_context.page.scraped_page.refresh = AsyncMock(return_value=scraped)
+    monkeypatch.setattr(script_service.script_run_context_manager, "ensure_run_context", lambda: run_context)
+    prompts: list[str] = []
+
+    async def handler(*, prompt: str, **_: Any) -> dict[str, Any]:
+        prompts.append(prompt)
+        return {"errors": [{"error_code": "BOT_WALL", "reasoning": "unsolved check", "confidence_float": 0.8}]}
+
+    monkeypatch.setattr(app, "EXTRACTION_LLM_API_HANDLER", handler)
+    receipt = ChallengeSolveReceipt(
+        task.task_id, datetime(2026, 8, 1, 0, 1, tzinfo=timezone.utc), "hcaptcha", "unsolved", "unknown", task.task_id
+    )
+
+    with skyvern_context.scoped(SkyvernContext(task_id=task.task_id)) as context:
+        context.challenge_solve_receipts.append(receipt)
+        errors = await script_service._detect_user_defined_errors(
+            task, MagicMock(), "wr_1", task.error_code_mapping or {}
+        )
+
+    [prompt] = prompts
+    assert '"service": "hcaptcha", "outcome": "unsolved", "page_state": "unknown", "unresolved": true' in prompt
+    assert [error.error_code for error in errors] == ["BOT_WALL"]

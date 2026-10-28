@@ -1218,6 +1218,12 @@ def install_origin_run(
     )
 
 
+def fake_tool(name: str) -> MagicMock:
+    tool = MagicMock()
+    tool.name = name
+    return tool
+
+
 def make_copilot_ctx(**overrides: object) -> CopilotContext:
     defaults: dict[str, object] = dict(
         organization_id="org-1",

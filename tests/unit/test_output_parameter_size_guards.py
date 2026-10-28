@@ -364,6 +364,8 @@ async def _build_status_response(
     refresh_output_urls: Any = None,
     failure_reason: str | None = None,
     precomputed_extracted_information: list[Any] | None = None,
+    failure_category: list[dict[str, Any]] | None = None,
+    task_v2: Any = None,
 ) -> WorkflowRunResponseBase:
     now = datetime.now(timezone.utc)
     workflow = Workflow(
@@ -385,6 +387,7 @@ async def _build_status_response(
         organization_id="o_1",
         status=WorkflowRunStatus.failed if failure_reason else WorkflowRunStatus.completed,
         failure_reason=failure_reason,
+        failure_category=failure_category,
         created_at=now,
         modified_at=now,
     )
@@ -403,7 +406,7 @@ async def _build_status_response(
         SimpleNamespace(
             Session=released_session_stub(),
             workflows=SimpleNamespace(get_workflow_for_workflow_run=AsyncMock(return_value=workflow)),
-            observer=SimpleNamespace(get_task_v2_by_workflow_run_id=AsyncMock(return_value=None)),
+            observer=SimpleNamespace(get_task_v2_by_workflow_run_id=AsyncMock(return_value=task_v2)),
             tasks=SimpleNamespace(get_tasks_by_workflow_run_id=AsyncMock(return_value=[])),
             workflow_runs=SimpleNamespace(
                 get_workflow_run_parameters=AsyncMock(return_value=[]),
