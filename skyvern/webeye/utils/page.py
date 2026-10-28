@@ -856,6 +856,19 @@ def _is_screenshot_target_closed(
     return _is_engine_error(error, engine_selection) and _SCREENSHOT_TARGET_CLOSED_MESSAGE in str(error)
 
 
+def screenshot_failure_outcome(
+    exc: BaseException, engine_selection: BrowserEngineSelection | None
+) -> ScreenshotFailureOutcome:
+    failure = exc.__cause__ if isinstance(exc, FailedToTakeScreenshot) and exc.__cause__ else exc
+    # The checks read str(error), which an arbitrary exception can make raise.
+    with contextlib.suppress(Exception):
+        if isinstance(exc, ScreenshotTargetClosed) or _is_screenshot_target_closed(failure, engine_selection):
+            return "target_closed"
+        if isinstance(failure, (TimeoutError, ActionDeadlineExceeded)) or is_engine_timeout(failure, engine_selection):
+            return "timeout"
+    return "other_error"
+
+
 def _load_cursor_overlay_js() -> str:
     path = f"{SKYVERN_DIR}/webeye/scraper/cursorOverlay.js"
     with open(path, encoding="utf-8") as f:
@@ -2598,19 +2611,11 @@ class SkyvernFrame:
             # Observe only the terminal request, after local timeout conversion and all fallbacks;
             # caller-owned cancellation bypasses this handler, and telemetry cannot replace the error.
             with contextlib.suppress(Exception):
-                outcome: ScreenshotFailureOutcome = "other_error"
-                failure = exc.__cause__ if isinstance(exc, FailedToTakeScreenshot) and exc.__cause__ else exc
-                if isinstance(exc, ScreenshotTargetClosed) or _is_screenshot_target_closed(failure, engine_selection):
-                    outcome = "target_closed"
-                elif isinstance(failure, (TimeoutError, ActionDeadlineExceeded)) or is_engine_timeout(
-                    failure, engine_selection
-                ):
-                    outcome = "timeout"
                 if record_health:
                     log_screenshot_failure(
                         LOG,
                         context=context.with_browser_dimensions_of(runtime_context),
-                        outcome=outcome,
+                        outcome=screenshot_failure_outcome(exc, engine_selection),
                         timeout_ms=timeout,
                         elapsed_ms=(_monotonic() - started) * 1000,
                     )

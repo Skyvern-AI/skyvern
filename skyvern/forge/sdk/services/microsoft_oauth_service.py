@@ -36,8 +36,12 @@ MICROSOFT_TOKEN_ENDPOINT_TEMPLATE = "https://login.microsoftonline.com/{tenant}/
 
 MICROSOFT_OAUTH_SCOPE_PROFILE_OUTLOOK_MAIL = "outlook_mail"
 OUTLOOK_MAIL_SCOPES = ("Mail.Read", "offline_access", "openid", "profile", "User.Read")
+MICROSOFT_OAUTH_SCOPE_PROFILE_POWERBI_DATASET_READ = "powerbi_dataset_read"
+POWERBI_DATASET_READ_SCOPE = "https://analysis.windows.net/powerbi/api/Dataset.Read.All"
+POWERBI_DATASET_READ_SCOPES = (POWERBI_DATASET_READ_SCOPE, "offline_access", "openid", "profile")
 MICROSOFT_OAUTH_SCOPE_PROFILES: dict[str, tuple[str, ...]] = {
     MICROSOFT_OAUTH_SCOPE_PROFILE_OUTLOOK_MAIL: OUTLOOK_MAIL_SCOPES,
+    MICROSOFT_OAUTH_SCOPE_PROFILE_POWERBI_DATASET_READ: POWERBI_DATASET_READ_SCOPES,
 }
 
 CONSENT_TTL_SECONDS = 600
@@ -70,6 +74,10 @@ class InvalidAppOriginError(ValueError):
 
 
 class UnsupportedScopeProfileError(ValueError):
+    pass
+
+
+class MicrosoftOAuthAccessDenied(PermissionError):
     pass
 
 
@@ -160,6 +168,70 @@ def has_required_scopes(
 ) -> bool:
     granted = {_scope_segment(scope) for scope in (granted_scopes or [])}
     return all(_scope_segment(scope) in granted for scope in required_scopes)
+
+
+def is_powerbi_connection(
+    scopes_requested: list[str] | tuple[str, ...] | None,
+    scopes_granted: list[str] | tuple[str, ...] | None,
+) -> bool:
+    return has_required_scopes(scopes_requested, ["Dataset.Read.All"]) or has_required_scopes(
+        scopes_granted, ["Dataset.Read.All"]
+    )
+
+
+def has_powerbi_dataset_read_scope(scopes: list[str] | tuple[str, ...] | None) -> bool:
+    return any(
+        isinstance(scope, str) and scope in {"Dataset.Read.All", POWERBI_DATASET_READ_SCOPE} for scope in scopes or []
+    )
+
+
+def normalize_powerbi_scopes(scopes: list[str] | tuple[str, ...]) -> list[str]:
+    return [POWERBI_DATASET_READ_SCOPE if scope == "Dataset.Read.All" else scope for scope in scopes]
+
+
+def is_powerbi_scope_profile(
+    scopes_requested: list[str] | tuple[str, ...] | None,
+    scopes_granted: list[str] | tuple[str, ...] | None,
+) -> bool:
+    return _matches_scope_profile(
+        MICROSOFT_OAUTH_SCOPE_PROFILE_POWERBI_DATASET_READ,
+        scopes_requested,
+        scopes_granted,
+    )
+
+
+def _matches_scope_profile(
+    scope_profile: str | None,
+    scopes_requested: list[str] | tuple[str, ...] | None,
+    scopes_granted: list[str] | tuple[str, ...] | None,
+) -> bool:
+    requested_powerbi = has_powerbi_dataset_read_scope(scopes_requested)
+    granted_powerbi = has_powerbi_dataset_read_scope(scopes_granted)
+    requested_mail = has_required_scopes(scopes_requested, ["Mail.Read"])
+    granted_mail = has_required_scopes(scopes_granted, ["Mail.Read"])
+
+    if scope_profile == MICROSOFT_OAUTH_SCOPE_PROFILE_POWERBI_DATASET_READ:
+        allowed_requested = {*POWERBI_DATASET_READ_SCOPES, "Dataset.Read.All"}
+        allowed_granted = {*allowed_requested, "email"}
+        requested = set(scopes_requested or [])
+        granted = set(scopes_granted or [])
+        return (
+            requested_powerbi
+            and granted_powerbi
+            and not requested_mail
+            and not granted_mail
+            and requested <= allowed_requested
+            and granted <= allowed_granted
+        )
+    if scope_profile in (None, MICROSOFT_OAUTH_SCOPE_PROFILE_OUTLOOK_MAIL):
+        return not is_powerbi_connection(scopes_requested, scopes_granted)
+    return False
+
+
+def scope_profile_from_scopes(scopes: list[str] | tuple[str, ...] | None) -> str:
+    if has_required_scopes(scopes, ["Dataset.Read.All"]):
+        return MICROSOFT_OAUTH_SCOPE_PROFILE_POWERBI_DATASET_READ
+    return MICROSOFT_OAUTH_SCOPE_PROFILE_OUTLOOK_MAIL
 
 
 def email_from_id_token(id_token: str) -> str | None:
@@ -455,6 +527,9 @@ async def refresh_access_token(refresh_token: str, scopes: str | list[str] | tup
 async def load_credential_secrets(
     organization_id: str,
     credential_id: str,
+    *,
+    scope_profile: str | None = None,
+    authenticated_user_id: str | None = None,
 ) -> MicrosoftCredentialSecrets:
     payload = await app.DATABASE.microsoft_oauth.load_active_ciphertext(
         organization_id=organization_id,
@@ -462,6 +537,19 @@ async def load_credential_secrets(
     )
     if payload is None:
         raise ValueError(f"No active Microsoft OAuth credential found: {credential_id}")
+    if not _matches_scope_profile(scope_profile, payload.scopes_requested, payload.scopes_granted):
+        raise MicrosoftOAuthAccessDenied("Microsoft OAuth credential does not match the requested profile")
+    if scope_profile == MICROSOFT_OAUTH_SCOPE_PROFILE_POWERBI_DATASET_READ and (
+        not authenticated_user_id
+        or payload.initiating_user_id != authenticated_user_id
+        or payload.connection_id != credential_id
+    ):
+        raise MicrosoftOAuthAccessDenied("Power BI connection is not owned by the authenticated user")
+    granted_scopes = (
+        normalize_powerbi_scopes(payload.scopes_granted)
+        if scope_profile == MICROSOFT_OAUTH_SCOPE_PROFILE_POWERBI_DATASET_READ
+        else payload.scopes_granted
+    )
     if secret_encryption.is_encrypted_secret(payload.encrypted_refresh_token):
         if not secret_encryption.encryption_available():
             raise EncryptionNotConfiguredError("Microsoft OAuth token encryption is not configured")
@@ -478,9 +566,34 @@ async def load_credential_secrets(
         )
     return MicrosoftCredentialSecrets(
         refresh_token=refresh_token,
-        scopes=payload.scopes_granted,
+        scopes=granted_scopes,
         encrypted_refresh_token=payload.encrypted_refresh_token,
     )
+
+
+async def validate_credential_access(
+    organization_id: str,
+    credential_id: str,
+    *,
+    scope_profile: str | None = None,
+    authenticated_user_id: str | None = None,
+) -> list[str]:
+    """Check an active credential's persisted profile/owner before a cached token can be returned."""
+    metadata = await app.DATABASE.microsoft_oauth.load_active_access_metadata(
+        organization_id=organization_id,
+        credential_id=credential_id,
+    )
+    if metadata is None:
+        raise MicrosoftOAuthAccessDenied("Microsoft OAuth credential is not active")
+    if not _matches_scope_profile(scope_profile, metadata.scopes_requested, metadata.scopes_granted):
+        raise MicrosoftOAuthAccessDenied("Microsoft OAuth credential does not match the requested profile")
+    if scope_profile == MICROSOFT_OAUTH_SCOPE_PROFILE_POWERBI_DATASET_READ and (
+        not authenticated_user_id
+        or metadata.initiating_user_id != authenticated_user_id
+        or metadata.connection_id != credential_id
+    ):
+        raise MicrosoftOAuthAccessDenied("Power BI connection is not owned by the authenticated user")
+    return metadata.scopes_granted
 
 
 async def access_token_from_secrets(credential_secrets: MicrosoftCredentialSecrets) -> str:
@@ -559,8 +672,13 @@ async def refresh_and_rotate(
     return access_token
 
 
-async def get_credentials_for_org(organization_id: str) -> list[MicrosoftOAuthCredentialBase]:
-    return await app.DATABASE.microsoft_oauth.list_active_for_org(organization_id=organization_id)
+async def get_credentials_for_org(
+    organization_id: str,
+    user_id: str | None = None,
+) -> list[MicrosoftOAuthCredentialBase]:
+    if user_id is None:
+        return await app.DATABASE.microsoft_oauth.list_active_for_org(organization_id=organization_id)
+    return await app.DATABASE.microsoft_oauth.list_active_for_org(organization_id=organization_id, user_id=user_id)
 
 
 async def update_email_address(
@@ -582,7 +700,14 @@ async def rename_credential(
     organization_id: str,
     credential_id: str,
     credential_name: str,
+    requesting_user_id: str | None = None,
 ) -> MicrosoftOAuthCredentialBase | None:
+    if not await app.DATABASE.microsoft_oauth.can_manage_credential(
+        organization_id=organization_id,
+        credential_id=credential_id,
+        user_id=requesting_user_id,
+    ):
+        return None
     now = datetime.datetime.now(datetime.UTC).replace(tzinfo=None)
     return await app.DATABASE.microsoft_oauth.rename_active(
         organization_id=organization_id,
@@ -592,7 +717,17 @@ async def rename_credential(
     )
 
 
-async def revoke_credential(organization_id: str, credential_id: str) -> bool:
+async def revoke_credential(
+    organization_id: str,
+    credential_id: str,
+    requesting_user_id: str | None = None,
+) -> bool:
+    if not await app.DATABASE.microsoft_oauth.can_manage_credential(
+        organization_id=organization_id,
+        credential_id=credential_id,
+        user_id=requesting_user_id,
+    ):
+        return False
     payload = await app.DATABASE.microsoft_oauth.load_ciphertext_for_revoke(
         organization_id=organization_id,
         credential_id=credential_id,
