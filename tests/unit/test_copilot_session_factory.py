@@ -545,10 +545,21 @@ class TestModelInputCapture:
         copilot_call_model_input_filter(
             _mk_input_data(items, context=make_copilot_ctx(block_authoring_policy=BlockAuthoringPolicy.STANDARD))
         )
+        copilot_call_model_input_filter(
+            _mk_input_data(
+                items,
+                context=make_copilot_ctx(
+                    block_authoring_policy=BlockAuthoringPolicy.STANDARD, agent_step_available=True
+                ),
+            )
+        )
         copilot_call_model_input_filter(_mk_input_data(items))
 
-        unified, context_less = (json.loads(path.read_text()) for path in sorted(tmp_path.glob("call-*.json")))
-        assert unified["authoring_capability"] == {"code_blocks": True, "agent_blocks": True}
+        unified, agent_step, context_less = (
+            json.loads(path.read_text()) for path in sorted(tmp_path.glob("call-*.json"))
+        )
+        assert unified["authoring_capability"] == {"code_blocks": True, "agent_blocks": True, "agent_step": False}
+        assert agent_step["authoring_capability"] == {"code_blocks": True, "agent_blocks": True, "agent_step": True}
         assert context_less["authoring_capability"] is None
 
     def test_capture_records_a_call_whichever_shape_carries_the_context(
