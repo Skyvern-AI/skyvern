@@ -455,6 +455,7 @@ async def test_cleanup_after_cancellation_emits_only_canceled_webhook(monkeypatc
     conditional_finalize.assert_awaited_once_with(
         workflow_run_id=running_run.workflow_run_id,
         status=WorkflowRunStatus.completed,
+        _on_terminal_write=None,
     )
     assert finalized_run is canceled_run
     assert webhook_statuses == [WorkflowRunStatus.canceled]

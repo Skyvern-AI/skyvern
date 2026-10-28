@@ -499,7 +499,7 @@ async def test_execute_workflow_with_attempt_row_still_records_final_webhook(
     webhook = AsyncMock(side_effect=lambda *a, **k: order.append("webhook"))
     monkeypatch.setattr(svc, "execute_workflow_webhook", webhook)
 
-    attempt = SimpleNamespace(attempt_number=1, retry_decision=RETRY_DECISION_FINAL)
+    attempt = SimpleNamespace(attempt_number=1, retry_decision=RETRY_DECISION_FINAL, started_at=None)
     service_module.app.DATABASE.workflow_run_attempts.get_attempts = AsyncMock(return_value=[attempt])
     monkeypatch.setattr(
         service_module.app.DATABASE.workflow_run_attempts,
@@ -650,7 +650,7 @@ async def test_execute_workflow_abandons_retry_for_non_retry_aware_caller(
     webhook = AsyncMock(side_effect=lambda *a, **k: order.append("webhook"))
     monkeypatch.setattr(svc, "execute_workflow_webhook", webhook)
 
-    attempt = SimpleNamespace(attempt_number=1, retry_decision=RETRY_DECISION_RETRY)
+    attempt = SimpleNamespace(attempt_number=1, retry_decision=RETRY_DECISION_RETRY, started_at=None)
     service_module.app.DATABASE.workflow_run_attempts.get_attempts = AsyncMock(return_value=[attempt])
     monkeypatch.setattr(
         service_module.app.DATABASE.workflow_run_attempts,
@@ -1209,7 +1209,7 @@ async def _assert_policy_definition_uses_legacy_cleanup_for_ineligible_run(
 ) -> None:
     svc = WorkflowService()
     workflow = _execute_workflow(retry_policy=WorkflowRetryPolicy(max_retries=1, retry_on=[{"status": "failed"}]))
-    attempt = SimpleNamespace(attempt_number=1, retry_decision=RETRY_DECISION_FINAL)
+    attempt = SimpleNamespace(attempt_number=1, retry_decision=RETRY_DECISION_FINAL, started_at=None)
     terminal_hook = AsyncMock()
     delete_attachments = AsyncMock()
     legacy_webhook = AsyncMock()
@@ -3568,3 +3568,254 @@ async def test_guarded_binding_clear_uses_and_commits_held_dispatch_session(monk
         "workflow_run",
         "gen_previous",
     )
+
+
+def _patch_terminal_write(
+    monkeypatch: pytest.MonkeyPatch, svc: WorkflowService, written: SimpleNamespace | None, current: SimpleNamespace
+) -> SimpleNamespace:
+    """The conditional UPDATE … RETURNING either returns this caller's own row (``written``) or nothing, in which case
+    the refused paths hand back another execution's ``current`` row."""
+    database = SimpleNamespace(
+        workflow_runs=SimpleNamespace(
+            update_workflow_run_if_not_final=AsyncMock(return_value=written),
+            update_workflow_run=AsyncMock(return_value=current),
+            get_workflow_run=AsyncMock(return_value=current),
+        ),
+        workflow_run_attempts=SimpleNamespace(get_attempts=AsyncMock(return_value=[])),
+    )
+    monkeypatch.setattr(service_module.app, "DATABASE", database)
+    monkeypatch.setattr(service_module, "run_lease_lost", AsyncMock(return_value=False))
+    monkeypatch.setattr(service_module, "on_terminal_transition", AsyncMock())
+    monkeypatch.setattr(svc, "get_workflow_run", AsyncMock(return_value=current))
+    monkeypatch.setattr(svc, "_after_workflow_run_status_write", AsyncMock())
+    return database
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("lease", [True, False], ids=["lease", "no-lease"])
+@pytest.mark.parametrize("won", [True, False], ids=["own-write", "refused"])
+async def test_only_a_won_conditional_terminal_write_hands_its_own_snapshot_to_the_capture(
+    monkeypatch: pytest.MonkeyPatch, lease: bool, won: bool
+) -> None:
+    svc = WorkflowService()
+    own, newer = _execute_workflow_run(WorkflowRunStatus.failed), _execute_workflow_run(WorkflowRunStatus.failed)
+    _patch_terminal_write(monkeypatch, svc, own if won else None, newer)
+    monkeypatch.setattr(service_module, "run_lease_tasks_enabled", lambda: lease)
+    captured: list[Any] = []
+
+    result = await svc.mark_workflow_run_as_failed(
+        "wr_test", "failed", require_latest_attempt_number=1, _on_terminal_write=captured.append
+    )
+
+    # A refused write returns the newer execution's same-status row, which owns nothing for this caller.
+    assert result is (own if won else newer)
+    assert captured == ([own] if won else [])
+
+
+@pytest.mark.asyncio
+async def test_a_failing_capture_never_blocks_the_terminal_write_or_its_bookkeeping(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    svc = WorkflowService()
+    own = _execute_workflow_run(WorkflowRunStatus.failed)
+    _patch_terminal_write(monkeypatch, svc, own, _execute_workflow_run(WorkflowRunStatus.failed))
+
+    def broken(_: Any) -> None:
+        raise RuntimeError("capture failed")
+
+    result = await svc.mark_workflow_run_as_failed_if_not_final("wr_test", "failed", _on_terminal_write=broken)
+
+    assert result is own
+    service_module.on_terminal_transition.assert_awaited_once()  # type: ignore[attr-defined]
+    svc._after_workflow_run_status_write.assert_awaited_once()  # type: ignore[attr-defined]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("transitioned", [True, False], ids=["transitioned", "already-final-or-repaired"])
+async def test_a_dispatch_finalize_owns_its_frozen_snapshot_only_when_it_transitioned(
+    monkeypatch: pytest.MonkeyPatch, transitioned: bool
+) -> None:
+    svc = WorkflowService()
+    frozen = _execute_workflow_run(WorkflowRunStatus.failed)
+    result = WorkflowRunDispatchFinalization("accepted", frozen, 1, None, False, transitioned, not transitioned)  # type: ignore[arg-type]
+    monkeypatch.setattr(svc, "finalize_workflow_run_for_dispatch", AsyncMock(return_value=result))
+    captured: list[Any] = []
+
+    returned = await svc._mark_workflow_run_as_failed_for_dispatch(
+        workflow_run_id="wr_test",
+        organization_id="o_test",
+        attempt_number=1,
+        dispatch_claim_started_at=None,
+        failure_reason="failed",
+        _on_terminal_write=captured.append,
+    )
+
+    assert returned is frozen and captured == ([frozen] if transitioned else [])
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("won", [True, False], ids=["own-write", "refused"])
+async def test_a_failing_block_hands_its_own_conditional_write_to_the_invocation(
+    monkeypatch: pytest.MonkeyPatch, won: bool
+) -> None:
+    """The real block step, failure handler, marker and seam; only the block body and the database are stand-ins."""
+    svc = WorkflowService()
+    running, own, newer = (
+        _execute_workflow_run(WorkflowRunStatus.running),
+        _execute_workflow_run(WorkflowRunStatus.failed),
+        _execute_workflow_run(WorkflowRunStatus.failed),
+    )
+    database = _patch_terminal_write(monkeypatch, svc, own if won else None, newer)
+    database.workflow_runs.get_workflow_run = AsyncMock(return_value=running)
+    monkeypatch.setattr(service_module, "run_lease_tasks_enabled", lambda: False)
+    monkeypatch.setattr(svc, "_current_row_after_lost_finalize", AsyncMock(return_value=newer))
+    block = SimpleNamespace(
+        block_type=BlockType.TASK, label="b", get_all_parameters=Mock(side_effect=RuntimeError("block body raised"))
+    )
+    captured: list[Any] = []
+
+    workflow_run, *_ = await svc._execute_single_block(
+        workflow=SimpleNamespace(),
+        block=block,  # type: ignore[arg-type]
+        block_idx=0,
+        blocks_cnt=1,
+        workflow_run=running,  # type: ignore[arg-type]
+        organization=SimpleNamespace(organization_id="o_test"),  # type: ignore[arg-type]
+        workflow_run_id="wr_test",
+        browser_session_id=None,
+        script_blocks_by_label={},
+        loaded_script_module=None,
+        is_script_run=False,
+        blocks_to_update=set(),
+        _on_terminal_write=captured.append,
+    )
+
+    assert workflow_run is (own if won else newer)
+    assert captured == ([own] if won else [])
+
+
+def _patch_owned_terminal_write(
+    monkeypatch: pytest.MonkeyPatch, svc: WorkflowService, status: WorkflowRunStatus, won: bool
+) -> tuple[SimpleNamespace, SimpleNamespace]:
+    """Rows stay running until this invocation's conditional write; every later reload sees another execution's row."""
+    own, newer = _execute_workflow_run(status), _execute_workflow_run(status)
+    rows = {"current": _execute_workflow_run(WorkflowRunStatus.running)}
+
+    async def conditional_write(*_: Any, **__: Any) -> SimpleNamespace | None:
+        rows["current"] = newer
+        return own if won else None
+
+    async def current_row(*_: Any, **__: Any) -> SimpleNamespace:
+        return rows["current"]
+
+    database = service_module.app.DATABASE
+    database.workflow_runs.update_workflow_run_if_not_final = AsyncMock(side_effect=conditional_write)
+    database.workflow_runs.get_workflow_run = AsyncMock(side_effect=current_row)
+    monkeypatch.setattr(service_module, "run_lease_tasks_enabled", lambda: False)
+    monkeypatch.setattr(service_module, "run_lease_lost", AsyncMock(return_value=False))
+    monkeypatch.setattr(service_module, "on_terminal_transition", AsyncMock())
+    monkeypatch.setattr(svc, "_after_workflow_run_status_write", AsyncMock())
+    monkeypatch.setattr(svc, "_cascade_child_entities_on_terminal", AsyncMock())
+    monkeypatch.setattr(svc, "_current_row_after_lost_finalize", AsyncMock(side_effect=current_row))
+    monkeypatch.setattr(svc, "_finish_preexisting_timed_out_workflow_run", AsyncMock(side_effect=current_row))
+    return own, newer
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("version", [1, 2], ids=["sequential", "dag"])
+@pytest.mark.parametrize("won", [True, False], ids=["own-write", "refused"])
+async def test_execute_workflow_keeps_its_own_block_failure_snapshot_as_the_diagnostic_owner_across_reloads(
+    monkeypatch: pytest.MonkeyPatch, version: int, won: bool
+) -> None:
+    """The real block executors, failure handler, marker and seam; only the block body and the database are stand-ins."""
+    workflow = _execute_workflow()
+    block = SimpleNamespace(
+        block_type=BlockType.TASK,
+        label="b",
+        next_block_label=None,
+        get_all_parameters=Mock(side_effect=RuntimeError("block body raised")),
+    )
+    workflow.workflow_definition.blocks = [block]
+    workflow.run_with = workflow.code_version = workflow.status = None
+    workflow.workflow_definition.version = version
+    workflow.workflow_definition.model_dump = lambda **_: {"version": version}
+    svc = WorkflowService()
+    _patch_execute_workflow_deps(monkeypatch, svc, workflow, _execute_workflow_run(WorkflowRunStatus.running))
+    monkeypatch.delattr(svc, "_execute_workflow_blocks")
+    running = _execute_workflow_run(WorkflowRunStatus.running)
+    running.ai_fallback = running.trigger_type = None
+    monkeypatch.setattr(svc, "mark_workflow_run_as_running", AsyncMock(return_value=running))
+    own, newer = _patch_owned_terminal_write(monkeypatch, svc, WorkflowRunStatus.failed, won)
+    _patch_browser_cleanup(monkeypatch, svc, [])
+    _patch_finalize(monkeypatch, svc, [], newer)
+    cleanup = AsyncMock()
+    monkeypatch.setattr(svc, "clean_up_workflow", cleanup)
+
+    await _run_execute_workflow(svc)
+
+    block.get_all_parameters.assert_called_once()
+    assert cleanup.await_args.kwargs["final_diagnostic_owner"] is (own if won else None)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("deadline", ["exhausted", "expires"])
+@pytest.mark.parametrize("won", [True, False], ids=["own-write", "refused"])
+async def test_a_post_run_elapsed_timeout_this_run_wrote_owns_the_diagnostic(
+    monkeypatch: pytest.MonkeyPatch, deadline: str, won: bool
+) -> None:
+    workflow = _execute_workflow()
+    svc = WorkflowService()
+    _patch_execute_workflow_deps(monkeypatch, svc, workflow, _execute_workflow_run(WorkflowRunStatus.running))
+    own, newer = _patch_owned_terminal_write(monkeypatch, svc, WorkflowRunStatus.timed_out, won)
+    blocks_done = (_execute_workflow_run(WorkflowRunStatus.running), set())
+    monkeypatch.setattr(svc, "_execute_workflow_blocks", AsyncMock(return_value=blocks_done))
+    # Post-run work that never finishes: the budget is either already spent or runs out while it is parked.
+    timeouts = iter([10.0, 0.0001 if deadline == "exhausted" else 0.01])
+    monkeypatch.setattr(service_module, "_get_workflow_run_max_elapsed_timeout_seconds", lambda _: next(timeouts))
+
+    async def parked(**_: Any) -> None:
+        await asyncio.Event().wait()
+
+    monkeypatch.setattr(svc, "generate_script_if_needed", parked)
+    _patch_browser_cleanup(monkeypatch, svc, [])
+    _patch_finalize(monkeypatch, svc, [], newer)
+    cleanup = AsyncMock()
+    monkeypatch.setattr(svc, "clean_up_workflow", cleanup)
+
+    await _run_execute_workflow(svc)
+
+    service_module.app.DATABASE.workflow_runs.update_workflow_run_if_not_final.assert_awaited_once()
+    assert cleanup.await_args.kwargs["final_diagnostic_owner"] is (own if won else None)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("won", [True, False], ids=["own-write", "refused"])
+async def test_the_cancelled_post_run_timeout_fallback_write_still_hands_over_its_own_snapshot(
+    monkeypatch: pytest.MonkeyPatch, won: bool
+) -> None:
+    svc = WorkflowService()
+    monkeypatch.setattr(service_module.app, "DATABASE", SimpleNamespace(workflow_runs=SimpleNamespace()))
+    own, _ = _patch_owned_terminal_write(monkeypatch, svc, WorkflowRunStatus.timed_out, won)
+    monkeypatch.setattr(svc, "get_workflow_run", service_module.app.DATABASE.workflow_runs.get_workflow_run)
+    outer = asyncio.current_task()
+    assert outer is not None
+
+    async def fail_after_cancellation(**_: Any) -> None:
+        outer.cancel()
+        await asyncio.sleep(0)
+        raise RuntimeError("status write failed")
+
+    monkeypatch.setattr(svc, "_handle_post_run_elapsed_timeout", fail_after_cancellation)
+    captured: list[Any] = []
+
+    await svc._shield_post_run_elapsed_timeout(
+        workflow_run_id="wr_test",
+        organization_id="o_test",
+        workflow_run=_execute_workflow_run(WorkflowRunStatus.running),  # type: ignore[arg-type]
+        pre_finally_status=None,
+        pre_finally_failure_reason=None,
+        timeout_failure_reason="timed out",
+        _on_terminal_write=captured.append,
+    )
+
+    assert captured == ([own] if won else [])

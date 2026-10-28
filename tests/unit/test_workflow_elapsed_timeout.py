@@ -687,6 +687,7 @@ async def test_shield_post_run_elapsed_timeout_waits_for_status_write_after_canc
         workflow_run_id="wr_1",
         failure_reason="timed out",
         fallback_workflow_run=running_run,
+        _on_terminal_write=None,
     )
 
 
@@ -726,6 +727,7 @@ async def test_shield_post_run_elapsed_timeout_falls_back_when_handler_fails_aft
         workflow_run_id="wr_1",
         failure_reason="timed out",
         fallback_workflow_run=running_run,
+        _on_terminal_write=None,
     )
 
 
