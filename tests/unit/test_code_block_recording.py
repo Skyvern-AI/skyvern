@@ -749,6 +749,8 @@ async def test_ineligible_stalled_sink_capture_gives_up_after_one_timeout(
     assert health_calls == []
     loud = [log["event"] for log in logs if log["log_level"] not in {"debug", "info"} or log.get("exc_info")]
     assert [event for event in loud if "screenshot" in event.lower()] == ["Code block screenshot capture failed"]
+    warning = next(log for log in logs if log["event"] == "Code block screenshot capture failed")
+    assert warning["outcome"] == "timeout"
 
 
 @pytest.mark.asyncio
