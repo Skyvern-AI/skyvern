@@ -23,7 +23,7 @@ from skyvern.forge.sdk.db.repositories.microsoft_oauth import (  # noqa: F401
     PendingConsentContext,
 )
 from skyvern.forge.sdk.encrypt import encryptor
-from skyvern.forge.sdk.encrypt.base import EncryptMethod
+from skyvern.forge.sdk.encrypt.base import DEFAULT_ENCRYPT_METHOD, EncryptMethod
 from skyvern.forge.sdk.schemas.microsoft_oauth import MicrosoftOAuthCredentialBase
 from skyvern.forge.sdk.services import oauth_consent
 from skyvern.forge.sdk.workflow import secret_encryption
@@ -354,7 +354,7 @@ async def promote_pending_credential(
         organization_id=organization_id,
         nonce=oauth_consent.consent_nonce(state, initiator_id),
         encrypted_refresh_token=encrypted_token,
-        encrypted_method=EncryptMethod.AES,
+        encrypted_method=DEFAULT_ENCRYPT_METHOD,
         scopes_granted=_coerce_scopes(scopes_granted),
         initiating_user_id=initiator_id,
         tenant_id=tenant_id,
@@ -526,7 +526,7 @@ async def refresh_and_rotate(
             organization_id=organization_id,
             credential_id=credential_id,
             encrypted_refresh_token=encrypted_refresh_token,
-            encrypted_method=EncryptMethod.AES,
+            encrypted_method=DEFAULT_ENCRYPT_METHOD,
             expected_encrypted_refresh_token=credential_secrets.encrypted_refresh_token,
             tenant_id=tenant_id,
             object_id=object_id,

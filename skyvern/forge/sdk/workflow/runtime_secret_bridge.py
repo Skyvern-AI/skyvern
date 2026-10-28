@@ -13,7 +13,7 @@ import structlog
 
 from skyvern.forge import app
 from skyvern.forge.sdk.encrypt import encryptor
-from skyvern.forge.sdk.encrypt.base import EncryptMethod
+from skyvern.forge.sdk.encrypt.base import DEFAULT_ENCRYPT_METHOD
 from skyvern.forge.sdk.workflow.context_manager import RANDOM_SECRET_ID_PREFIX
 from skyvern.utils.secret_redaction import collect_secret_values_at_any_length
 
@@ -83,7 +83,7 @@ async def publish_copilot_runtime_secret_values(
     )
     try:
         if app.CACHE.is_shared:
-            stored = _ENCRYPTED_PREFIX + await encryptor.encrypt(payload, EncryptMethod.AES)
+            stored = _ENCRYPTED_PREFIX + await encryptor.encrypt(payload, DEFAULT_ENCRYPT_METHOD)
         else:
             stored = _LOCAL_PREFIX + payload
         await app.CACHE.set(_cache_key(organization_id, workflow_run_id), stored, ex=_CACHE_TTL_SECONDS)
@@ -117,7 +117,7 @@ async def consume_copilot_runtime_secret_values(
             if not isinstance(stored, str) or stored == _CLEAR_SENTINEL:
                 return None
             if stored.startswith(_ENCRYPTED_PREFIX):
-                payload = await encryptor.decrypt(stored[len(_ENCRYPTED_PREFIX) :], EncryptMethod.AES)
+                payload = await encryptor.decrypt_unlabeled(stored[len(_ENCRYPTED_PREFIX) :])
             elif stored.startswith(_LOCAL_PREFIX) and not app.CACHE.is_shared:
                 payload = stored[len(_LOCAL_PREFIX) :]
             else:
