@@ -84,7 +84,7 @@ describe("BLOCK_FORMS dispatcher", () => {
     }
   });
 
-  test("contains the 32 expected node.type keys", () => {
+  test("contains the 33 expected node.type keys", () => {
     expect(new Set(BLOCK_FORM_KEYS)).toEqual(
       new Set([
         "task",
@@ -118,10 +118,11 @@ describe("BLOCK_FORMS dispatcher", () => {
         "splitPdf",
         "dataExport",
         "terminate",
+        "agentStep",
         "emailInbox",
       ]),
     );
-    expect(BLOCK_FORM_KEYS).toHaveLength(32);
+    expect(BLOCK_FORM_KEYS).toHaveLength(33);
   });
 
   test("conditional routes to a sidebar form that shows branch prompts", () => {

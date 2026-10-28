@@ -218,6 +218,7 @@ export type WorkflowBlock =
   | LoginBlock
   | WaitBlock
   | TerminateBlock
+  | AgentStepBlock
   | FileDownloadBlock
   | PDFParserBlock
   | Taskv2Block
@@ -253,6 +254,7 @@ export const WorkflowBlockTypes = {
   Login: "login",
   Wait: "wait",
   Terminate: "terminate",
+  AgentStep: "agent_step",
   FileDownload: "file_download",
   PDFParser: "pdf_parser",
   Taskv2: "task_v2",
@@ -620,6 +622,14 @@ export type TerminateBlock = WorkflowBlockBase & {
   block_type: "terminate";
   reason: string;
   error_code?: string | null;
+};
+
+export type AgentStepBlock = WorkflowBlockBase & {
+  block_type: "agent_step";
+  prompt: string;
+  data_schema: Record<string, unknown>;
+  max_turns: number;
+  parameters: Array<WorkflowParameter>;
 };
 
 export type FileDownloadBlock = WorkflowBlockBase & {

@@ -371,6 +371,77 @@ describe("terminate block error code round trip", () => {
   });
 });
 
+describe("agent block load and save", () => {
+  const dataSchema = {
+    type: "object",
+    properties: { plan_name: { type: "string" } },
+    required: ["plan_name"],
+  };
+  const agentStepBlock = {
+    block_type: "agent_step",
+    label: "find_plan",
+    continue_on_failure: false,
+    next_loop_on_failure: false,
+    model: null,
+    ignore_workflow_system_prompt: false,
+    prompt: "Find the plan for {{ account_number }}",
+    data_schema: dataSchema,
+    max_turns: 40,
+    parameters: [{ key: "account_number" }],
+  } as unknown as WorkflowBlock;
+  const savedFields = {
+    label: "find_plan",
+    block_type: "agent_step",
+    prompt: "Find the plan for {{ account_number }}",
+    data_schema: dataSchema,
+    max_turns: 40,
+    parameter_keys: ["account_number"],
+  };
+
+  test("an existing block saves unchanged from the canvas and from an export", () => {
+    const { nodes, edges } = getElements([agentStepBlock], SETTINGS, true);
+
+    expect(getWorkflowErrors(nodes)).toEqual([]);
+    expect(getWorkflowBlocks(nodes, edges)[0]).toMatchObject(savedFields);
+    const source = {
+      title: "Source",
+      description: null,
+      is_saved_task: false,
+      status: null,
+      run_with: "agent",
+      workflow_definition: { parameters: [], blocks: [agentStepBlock] },
+    } as unknown as WorkflowApiResponse;
+    expect(convert(source).workflow_definition.blocks[0]).toMatchObject(
+      savedFields,
+    );
+  });
+
+  test.each([
+    ["a half-typed schema", { dataSchema: '{"type": "obj' }, "not valid JSON"],
+    [
+      "a non-object schema",
+      { dataSchema: '{"type": "array"}' },
+      '"type": "object"',
+    ],
+    ["an empty prompt", { prompt: "  " }, "Prompt is required."],
+  ])(
+    "%s does not throw on serialize and blocks the save",
+    (_, draft, message) => {
+      const { nodes, edges } = getElements([agentStepBlock], SETTINGS, true);
+      const edited = nodes.map((node) =>
+        node.type === "agentStep"
+          ? { ...node, data: { ...node.data, ...draft } }
+          : node,
+      ) as Array<AppNode>;
+
+      expect(() => getWorkflowBlocks(edited, edges)).not.toThrow();
+      expect(getWorkflowErrors(edited)).toEqual([
+        expect.stringContaining(message),
+      ]);
+    },
+  );
+});
+
 function loadAndSave(
   stored: { engine?: RunEngine; engine_pinned?: boolean },
   effectiveDefaultEngine: RunEngine | null | undefined,
