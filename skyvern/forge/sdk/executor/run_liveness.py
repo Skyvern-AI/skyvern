@@ -124,6 +124,23 @@ def is_run_registered(run_id: str) -> bool:
     return run_id in _registry
 
 
+@dataclass(frozen=True)
+class RunWriteAuthority:
+    owner_id: str
+    attempt_number: int | None
+    lease_acquired: bool
+
+
+def run_write_authority(run_id: str) -> RunWriteAuthority | None:
+    """This process's claim on the run for outcome writes, or None when such writes are not fenced."""
+    if not _enabled:
+        return None
+    entry = _registry.get(run_id)
+    if entry is None:
+        return None
+    return RunWriteAuthority(owner_id(), entry.attempt_number, entry.acquired or entry.lost)
+
+
 def note_run_finalized(run_id: str) -> None:
     entry = _registry.get(run_id)
     if entry is not None:

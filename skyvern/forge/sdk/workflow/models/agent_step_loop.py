@@ -42,6 +42,7 @@ from skyvern.forge.sdk.copilot.model_telemetry import (
     model_attempt_telemetry_scope,
 )
 from skyvern.forge.sdk.core import skyvern_context
+from skyvern.forge.sdk.executor.run_liveness import run_write_authority
 from skyvern.forge.sdk.models import Step, StepStatus
 from skyvern.forge.sdk.schemas.tasks import Task, TaskStatus
 from skyvern.forge.sdk.workflow.context_manager import WorkflowRunContext
@@ -921,6 +922,7 @@ async def run_agent_step(
             task_id=state.task.task_id,
             step_id=state.step.step_id,
             organization_id=organization_id,
+            write_authority_for_run=run_write_authority,
             status={BlockStatus.completed: StepStatus.completed, BlockStatus.failed: StepStatus.failed}.get(
                 status, StepStatus.canceled
             ),

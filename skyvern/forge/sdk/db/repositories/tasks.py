@@ -1,10 +1,10 @@
 from __future__ import annotations
 
 import asyncio
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from datetime import datetime, timedelta
 from decimal import Decimal
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import structlog
 from sqlalchemy import and_, delete, func, or_, select, tuple_, update
@@ -18,6 +18,7 @@ from skyvern.forge.sdk.db.enums import TaskType
 from skyvern.forge.sdk.db.exceptions import NotFoundError
 from skyvern.forge.sdk.db.models import (
     ActionModel,
+    RunExecutionLeaseModel,
     StepModel,
     TaskModel,
     TaskRunModel,
@@ -44,6 +45,9 @@ from skyvern.schemas.runs import ProxyLocationInput, RunStatus, RunType
 from skyvern.schemas.steps import AgentStepOutput
 from skyvern.webeye.actions.action_types import ActionType
 from skyvern.webeye.actions.actions import Action
+
+if TYPE_CHECKING:
+    from skyvern.forge.sdk.executor.run_liveness import RunWriteAuthority
 
 LOG = structlog.get_logger()
 
@@ -545,6 +549,7 @@ class TasksRepository(BaseRepository):
         incremental_cached_tokens: int | None = None,
         created_by: str | None = None,
         last_llm_model: str | None = None,
+        write_authority_for_run: Callable[[str], RunWriteAuthority | None] | None = None,
     ) -> Step:
         values: dict[str, Any] = {}
         if status is not None:
@@ -571,7 +576,9 @@ class TasksRepository(BaseRepository):
         if last_llm_model is not None:
             values["last_llm_model"] = last_llm_model
 
-        if values:
+        if values and write_authority_for_run is not None and (status, output, is_last) != (None, None, None):
+            await self._write_step_outcome(task_id, step_id, organization_id, values, write_authority_for_run)
+        elif values:
             await self._write_step(task_id, step_id, organization_id, values)
 
         updated_step = await self.get_step(step_id, organization_id)
@@ -590,10 +597,14 @@ class TasksRepository(BaseRepository):
         organization_id: str | None,
         status: StepStatus,
         output: AgentStepOutput,
+        write_authority_for_run: Callable[[str], RunWriteAuthority | None] | None = None,
     ) -> None:
         """`update_step`'s status and output write without reading the row back, for a caller that has no use for it."""
         values = {**_step_status_values(status), "output": output.model_dump(exclude_none=True)}
-        await self._write_step(task_id, step_id, organization_id, values)
+        if write_authority_for_run is not None:
+            await self._write_step_outcome(task_id, step_id, organization_id, values, write_authority_for_run)
+        else:
+            await self._write_step(task_id, step_id, organization_id, values)
 
     async def _write_step(
         self, task_id: str, step_id: str, organization_id: str | None, values: dict[str, Any]
@@ -608,6 +619,74 @@ class TasksRepository(BaseRepository):
             )
             if result.rowcount == 0:
                 raise NotFoundError("Step not found")
+            await session.commit()
+
+    async def _write_step_outcome(
+        self,
+        task_id: str,
+        step_id: str,
+        organization_id: str | None,
+        values: dict[str, Any],
+        write_authority_for_run: Callable[[str], RunWriteAuthority | None],
+    ) -> None:
+        """Write a step outcome; once its execution no longer owns the run, a terminal step is left as it is."""
+        async with self.Session() as session:
+            task = (
+                await session.execute(
+                    select(TaskModel.workflow_run_id, TaskModel.attempt_number)
+                    .filter_by(task_id=task_id)
+                    .filter_by(organization_id=organization_id)
+                )
+            ).one_or_none()
+            run_id = (task.workflow_run_id if task is not None else None) or task_id
+            owns = True
+            if task is not None and write_authority_for_run(run_id) is not None:
+                # Lease row before step row: a reaper claim waits for this write, and its cascade then skips the
+                # terminal step.
+                lease = (
+                    await session.execute(
+                        select(RunExecutionLeaseModel.owner_id, RunExecutionLeaseModel.attempt_number)
+                        .where(RunExecutionLeaseModel.run_id == run_id)
+                        .with_for_update(read=True)
+                    )
+                ).one_or_none()
+                # Read again after the lock wait, during which a same-process successor attempt can register. The
+                # task row fixes the step's attempt, so a successor's registration (even one still acquiring its
+                # lease) does not authorize the earlier attempt's step.
+                authority = write_authority_for_run(run_id)
+                attempt = task.attempt_number or 1
+                owns = (
+                    authority is not None
+                    and (authority.attempt_number or 1) == attempt
+                    and (
+                        not authority.lease_acquired
+                        or (
+                            lease is not None
+                            and lease.owner_id == authority.owner_id
+                            and (lease.attempt_number or 1) == attempt
+                        )
+                    )
+                )
+            statement = (
+                update(StepModel)
+                .where(StepModel.task_id == task_id)
+                .where(StepModel.step_id == step_id)
+                .where(StepModel.organization_id == organization_id)
+                .values(values)
+            )
+            if not owns:
+                terminal = [step_status.value for step_status in StepStatus if step_status.is_terminal()]
+                statement = statement.where(StepModel.status.not_in(terminal))
+            result = await session.execute(statement)
+            if result.rowcount == 0:
+                stored = None if owns else await self.get_step(step_id, organization_id)
+                if stored is None or stored.task_id != task_id:
+                    raise NotFoundError("Step not found")
+                LOG.info(
+                    "Kept a terminal step written by an execution that no longer owns the run",
+                    task_id=task_id,
+                    step_id=step_id,
+                )
             await session.commit()
 
     @db_operation("clear_task_failure_reason")

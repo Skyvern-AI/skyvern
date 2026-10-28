@@ -66,6 +66,7 @@ from skyvern.forge.sdk.executor.run_liveness import (
     run_lease_lost,
     run_lease_state,
     run_lease_tasks_enabled,
+    run_write_authority,
 )
 from skyvern.forge.sdk.experimentation.workflow_block_engine import run_honors_chosen_engine
 from skyvern.forge.sdk.models import Step, StepStatus
@@ -834,6 +835,7 @@ async def _create_workflow_block_run_and_task(
                     task_id=task.task_id,
                     organization_id=organization_id,
                     status=StepStatus.running,
+                    write_authority_for_run=run_write_authority,
                 )
             await _create_video_artifact(
                 task=task,
@@ -1044,6 +1046,7 @@ async def _update_workflow_block(
                         status=step_status,
                         is_last=is_last,
                         output=step_output,
+                        write_authority_for_run=run_write_authority,
                     )
             if lease_lost and not task_status.is_final():
                 updated_task = await app.DATABASE.tasks.get_task(task_id, context.organization_id)
@@ -1068,6 +1071,7 @@ async def _update_workflow_block(
                     status=step_status,
                     is_last=is_last,
                     output=step_output,
+                    write_authority_for_run=run_write_authority,
                 )
             if run_lease_tasks_enabled() and (lease_lost or final_write_refused):
                 return
@@ -1612,6 +1616,7 @@ async def _fallback_to_ai_run(
             task_id=task_id,
             organization_id=organization_id,
             status=StepStatus.failed,
+            write_authority_for_run=run_write_authority,
         )
         if get_browser_connection_loss(app.BROWSER_MANAGER.get_for_workflow_run(workflow_run_id)) is not None:
             LOG.warning("Browser connection lost: script failure will not be retried by agent", cache_key=cache_key)
