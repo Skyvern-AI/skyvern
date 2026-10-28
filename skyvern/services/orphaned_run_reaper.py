@@ -143,7 +143,7 @@ async def _reap_workflow(lease: RunExecutionLease, reason: str, category: list[d
                 return False
             if not task_v2.status.is_final():
                 return False
-            finalized = await app.DATABASE.workflow_runs.update_workflow_run_if_not_final(
+            finalized = await app.WORKFLOW_SERVICE._update_workflow_run_status_if_not_final(
                 lease.run_id,
                 WorkflowRunStatus(task_v2.status.value),
                 only_from=[WorkflowRunStatus.running, WorkflowRunStatus.paused],
@@ -183,7 +183,8 @@ async def _reap_workflow(lease: RunExecutionLease, reason: str, category: list[d
                     "Reaped workflow status committed before finalizer failed", run_id=lease.run_id, exc_info=True
                 )
             if finalized is None:
-                return False
+                # The task v2 write already committed `failed`, so its webhook and runs-list sync must still go out.
+                finalized = run
         schedule_side_effects(partial(_task_v2_side_effects, finalized, task_v2))
         outcome = "task_v2_webhook"
     else:
