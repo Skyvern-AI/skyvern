@@ -62,7 +62,11 @@ from skyvern.forge.sdk.artifact.storage.base import get_download_retry_started_a
 from skyvern.forge.sdk.core import skyvern_context
 from skyvern.forge.sdk.core.hashing import diagnostic_fingerprint
 from skyvern.forge.sdk.db.enums import TaskType, is_recipe_billing_workflow_run_trigger_type
-from skyvern.forge.sdk.executor.run_liveness import run_lease_lost, run_lease_tasks_enabled
+from skyvern.forge.sdk.executor.run_liveness import (
+    run_lease_lost,
+    run_lease_state,
+    run_lease_tasks_enabled,
+)
 from skyvern.forge.sdk.experimentation.workflow_block_engine import run_honors_chosen_engine
 from skyvern.forge.sdk.models import Step, StepStatus
 from skyvern.forge.sdk.schemas.files import FileInfo
@@ -1011,7 +1015,9 @@ async def _update_workflow_block(
 
         final_output = output
         if task_id:
-            lease_lost = await run_lease_lost(context.workflow_run_id)
+            lease_state = await run_lease_state(context.workflow_run_id)
+            lease_lost = lease_state == "lost"
+            final_write_blocked = lease_state != "held" if task_status.is_final() else lease_lost
             if step_id:
                 # Build step output from script actions similar to agent flow
                 step_output = None
@@ -1030,7 +1036,7 @@ async def _update_workflow_block(
                         errors=errors,
                     )
 
-                if not lease_lost:
+                if not final_write_blocked:
                     await app.DATABASE.tasks.update_step(
                         step_id=step_id,
                         task_id=task_id,
@@ -1051,8 +1057,9 @@ async def _update_workflow_block(
                     failure_reason=failure_reason,
                     extracted_information=output,
                     errors=[error.model_dump() for error in user_defined_errors] if user_defined_errors else None,
-                    keep_final_status=lease_lost,
+                    keep_final_status=final_write_blocked,
                 )
+            final_write_refused = final_write_blocked and updated_task.status != task_status
             if lease_lost and step_id and updated_task.status == task_status:
                 await app.DATABASE.tasks.update_step(
                     step_id=step_id,
@@ -1062,7 +1069,7 @@ async def _update_workflow_block(
                     is_last=is_last,
                     output=step_output,
                 )
-            if run_lease_tasks_enabled() and lease_lost:
+            if run_lease_tasks_enabled() and (lease_lost or final_write_refused):
                 return
             downloaded_files: list[FileInfo] | None = None
             try:

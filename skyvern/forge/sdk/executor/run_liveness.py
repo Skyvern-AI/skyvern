@@ -9,7 +9,7 @@ from collections.abc import Awaitable, Callable, Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import timedelta
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, Literal
 
 import structlog
 
@@ -171,21 +171,21 @@ async def acquire_run_lease(run_id: str) -> bool:
         return _registry.get(run_id) is entry and entry.attempt_number == attempt and not entry.lost
 
 
-async def run_lease_lost(run_id: str) -> bool:
+async def run_lease_state(run_id: str) -> Literal["held", "lost", "unknown"]:
     if not _enabled:
-        return False
+        return "held"
     entry = _registry.get(run_id)
     if entry is None or (not entry.acquired and not entry.lost):
-        return False
+        return "held"
     if entry.lost:
-        return True
+        return "lost"
     try:
         renewed = await app.DATABASE.run_execution_leases.renew(owner_id(), [run_id])
     except Exception:
         LOG.warning("Run lease check failed before status write", run_id=run_id, exc_info=True)
-        return False
+        return "unknown"
     if run_id in renewed:
-        return False
+        return "held"
     LOG.warning(
         "Run lease lost before status write",
         run_id=run_id,
@@ -193,7 +193,16 @@ async def run_lease_lost(run_id: str) -> bool:
         attempt_number=entry.attempt_number,
         owner_id=owner_id(),
     )
-    return True
+    return "lost"
+
+
+async def run_lease_lost(run_id: str) -> bool:
+    return await run_lease_state(run_id) == "lost"
+
+
+async def run_lease_final_write_blocked(run_id: str) -> bool:
+    # A failed lease check must not let a final write replace a final row another server may have committed.
+    return await run_lease_state(run_id) != "held"
 
 
 def _cancel_lost_runs(entries: list[_Registration]) -> None:
