@@ -578,7 +578,9 @@ def _body_starts_with_html(data: bytes) -> bool:
     return head.startswith(b"<!doctype html") or bool(_HTML_START_TAG_RE.match(head))
 
 
-def _payload_is_html_login_masquerade(data: bytes, content_type: str, filename: str) -> bool:
+def _payload_is_html_login_masquerade(
+    data: bytes, content_type: str, filename: str, *, allow_typed_extensionless_html: bool = False
+) -> bool:
     """True when a download's bytes are an HTML document but the download does not claim to be HTML.
 
     A session-gated download endpoint fetched without the browser's auth cookies answers with its
@@ -595,19 +597,21 @@ def _payload_is_html_login_masquerade(data: bytes, content_type: str, filename: 
         return False
     if suffix:
         return True
+    normalized_ct = _normalized_content_type(content_type)
+    if allow_typed_extensionless_html and "html" in normalized_ct:
+        return False
     if filename:
         return True
     # Nameless download: an HTML body only masquerades if the Content-Type still claims a
     # non-HTML (binary) type. A nameless HTML-or-typeless response makes no binary claim, so
     # saving the HTML is honest, not corrupt.
-    normalized_ct = _normalized_content_type(content_type)
     return bool(normalized_ct) and "html" not in normalized_ct
 
 
 # Signatures / container structure that identify each validated download type. A body lacking them
 # cannot be that type, so saving it under the claimed name yields an unopenable "successful" file.
-_PDF_HEADER = b"%PDF-"
-_UTF8_BOM = b"\xef\xbb\xbf"
+_PDF_HEADER_RE = re.compile(rb"%PDF-\d\.\d")
+_PDF_HEADER_SEARCH_BYTES = 1024
 _OLE_COMPOUND_FILE_MAGIC = b"\xd0\xcf\x11\xe0\xa1\xb1\x1a\xe1"  # legacy Excel .xls and other OLE docs
 
 # Exactly one canonical format per download; the filename extension wins over Content-Type. Only
@@ -625,20 +629,24 @@ _CANDIDATE_EPOCH_AT_ENTRY = -1
 _DOWNLOAD_FORMAT_BY_CONTENT_TYPE = {
     "application/pdf": "pdf",
     "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet": "xlsx",
-    "application/vnd.ms-excel": "xls",
     "application/zip": "zip",
     "application/x-zip-compressed": "zip",
 }
+# application/vnd.ms-excel also labels text exports, so only a .xls filename claims legacy XLS.
 
 
 def _looks_like_pdf(data: bytes) -> bool:
-    """True when the ``%PDF-`` header is at the start, after an optional single UTF-8 BOM.
+    """True when a versioned PDF header starts within the first 1024 bytes.
 
-    Anchored rather than a substring scan, so an HTML or JSON error page that merely mentions the
-    marker is rejected. Mirrors skyvern/webeye/actions/handler.py ``_looks_like_pdf``.
+    PDF readers permit a short binary preamble before the header, but printable prose before it is
+    not a valid preamble and can otherwise make an error body that quotes the marker look like PDF.
     """
-    header = data[len(_UTF8_BOM) :] if data[: len(_UTF8_BOM)] == _UTF8_BOM else data
-    return header[: len(_PDF_HEADER)] == _PDF_HEADER
+    match = _PDF_HEADER_RE.search(data[: _PDF_HEADER_SEARCH_BYTES + 7])
+    return (
+        match is not None
+        and match.start() < _PDF_HEADER_SEARCH_BYTES
+        and all(byte <= 0x20 or byte >= 0x7F for byte in data[: match.start()])
+    )
 
 
 def _is_valid_zip(data: bytes) -> bool:
@@ -750,7 +758,9 @@ def _replay_candidate_facts(handle: str, observations: str, admission: str | Non
 _NOT_JSON = object()
 
 
-def _payload_contradicts_claimed_type(data: bytes, content_type: str, filename: str) -> bool:
+def _payload_contradicts_claimed_type(
+    data: bytes, content_type: str, filename: str, *, allow_typed_extensionless_html: bool = False
+) -> bool:
     """True when a download's bytes cannot be the type it claims to be.
 
     Catches masquerades that would otherwise be written as a "successful" but unopenable file: an
@@ -760,12 +770,40 @@ def _payload_contradicts_claimed_type(data: bytes, content_type: str, filename: 
     bytes satisfy the claim, is left untouched so ordinary downloads and honestly-typed files are
     unaffected. CSV is intentionally not validated (no reliable signature).
     """
-    if _payload_is_html_login_masquerade(data, content_type, filename):
+    if _payload_is_html_login_masquerade(
+        data, content_type, filename, allow_typed_extensionless_html=allow_typed_extensionless_html
+    ):
         return True
     fmt = _claimed_download_format(content_type, filename)
     if fmt is None:
         return False
+    # Encrypted OOXML is an OLE container; accept its signature without parsing streams.
+    if fmt == "xlsx" and data.startswith(_OLE_COMPOUND_FILE_MAGIC):
+        return False
+    # Some servers label OOXML workbooks as legacy Excel; recognize the buffered workbook structure.
+    if fmt == "xls" and data.startswith(_OLE_COMPOUND_FILE_MAGIC):
+        return False
+    if fmt == "xls" and _is_valid_xlsx(data):
+        return False
     return not _DOWNLOAD_FORMAT_VALIDATORS[fmt](data)
+
+
+def _streamed_payload_contradicts_claimed_type(payload: IO[bytes], content_type: str, filename: str) -> bool:
+    payload.seek(0)
+    prefix = payload.read(4096)
+    payload.seek(0)
+    fmt = _claimed_download_format(content_type, filename)
+    zip_signature_matches = True
+    if fmt in {"zip", "xls", "xlsx"}:
+        # is_zipfile checks the bounded EOCD tail without enumerating or decompressing members.
+        zip_signature_matches = zipfile.is_zipfile(payload)
+        payload.seek(0)
+    return _payload_is_html_login_masquerade(prefix, content_type, filename, allow_typed_extensionless_html=True) or (
+        (fmt == "pdf" and not _looks_like_pdf(prefix))
+        or (fmt == "xls" and not (prefix.startswith(_OLE_COMPOUND_FILE_MAGIC) or zip_signature_matches))
+        or (fmt == "zip" and not zip_signature_matches)
+        or (fmt == "xlsx" and not (zip_signature_matches or prefix.startswith(_OLE_COMPOUND_FILE_MAGIC)))
+    )
 
 
 def normalize_download_filename(filename: str, content_type: str = "") -> str:
@@ -1329,8 +1367,15 @@ class CDPDownloadInterceptor:
         self._run_download_file_count -= 1
         return True
 
-    def _existing_file_is_identical(self, save_path: Path, data: bytes | bytearray) -> bool:
-        """True when ``save_path`` is a single-link regular file inside the pinned directory whose size and bytes both match ``data``.
+    def _existing_file_is_identical(
+        self,
+        save_path: Path,
+        data: bytes | bytearray,
+        *,
+        content_type: str | None = None,
+        claimed_filename: str | None = None,
+    ) -> bool:
+        """True when a pinned single-link file matches ``data`` and, when claims are supplied, passes the publication type guard.
 
         Opened O_NOFOLLOW; a symlink, hard link, or size mismatch is rejected before any content read, and
         the read is bounded to ``len(data)`` so an oversized collision can't bypass the size limit —
@@ -1362,7 +1407,18 @@ class CDPDownloadInterceptor:
                     or existing_stat.st_size != len(data)
                 ):
                     return False
-                return existing.read(len(data)) == bytes(data)
+                if existing.read(len(data)) != bytes(data):
+                    return False
+                if content_type is None and claimed_filename is None:
+                    return True
+                validation_filename = save_path.name if claimed_filename is None else claimed_filename
+                if existing_stat.st_size >= STREAM_TO_DISK_THRESHOLD_BYTES:
+                    return not _streamed_payload_contradicts_claimed_type(
+                        existing, content_type or "", validation_filename
+                    )
+                return not _payload_contradicts_claimed_type(
+                    bytes(data), content_type or "", validation_filename, allow_typed_extensionless_html=True
+                )
         except OSError:
             return False
         finally:
@@ -1391,9 +1447,15 @@ class CDPDownloadInterceptor:
                 self._record_download_failure(attempt, "capture_failed")
             return None
         try:
-            save_path, _ = self._resolve_save_path(suggested_filename, content_type)
+            save_path, filename = self._resolve_save_path(suggested_filename, content_type)
             scope_active = self._artifact_scope_is_active(self._artifact_scope_generation)
-            if scope_active and self._existing_file_is_identical(save_path, data):
+            claimed_filename = filename if suggested_filename else ""
+            if scope_active and self._existing_file_is_identical(
+                save_path,
+                data,
+                content_type=content_type,
+                claimed_filename=claimed_filename,
+            ):
                 self._discard_duplicate_download(attempt)
                 LOG.info(
                     "CDP download deduplicated; identical file already saved",
@@ -1401,7 +1463,13 @@ class CDPDownloadInterceptor:
                     size=len(data),
                 )
                 return save_path
-            self._atomically_write_bytes(save_path, data, self._artifact_scope_generation)
+            self._atomically_write_bytes(
+                save_path,
+                data,
+                self._artifact_scope_generation,
+                content_type,
+                claimed_filename=claimed_filename,
+            )
         except (OSError, ValueError, _DownloadScopeInvalidated):
             self._record_download_failure(attempt, "capture_failed")
             return None
@@ -1586,12 +1654,23 @@ class CDPDownloadInterceptor:
         if not self._artifact_scope_is_active(candidate.scope_generation):
             return "discard"
         save_path, filename = self._resolve_save_path(candidate.filename, candidate.content_type)
-        if self._existing_file_is_identical(save_path, candidate.data):
+        if self._existing_file_is_identical(
+            save_path,
+            candidate.data,
+            content_type=candidate.content_type,
+            claimed_filename=filename if candidate.filename else "",
+        ):
             del self._replay_candidates[handle]
             self._discard_duplicate_download(candidate.attempt)
             return "saved"
         try:
-            self._atomically_write_bytes(save_path, candidate.data, candidate.scope_generation)
+            self._atomically_write_bytes(
+                save_path,
+                candidate.data,
+                candidate.scope_generation,
+                candidate.content_type,
+                claimed_filename=filename if candidate.filename else "",
+            )
         except _DownloadScopeInvalidated:
             return "discard"
         except (OSError, ValueError) as exc:
@@ -2153,6 +2232,9 @@ class CDPDownloadInterceptor:
                 save_path,
                 data,
                 artifact_scope_generation,
+                content_type,
+                None,
+                filename if suggested_filename else "",
             )
             # A rebind may have cleared the dedupe set and repointed _output_dir while this write
             # was off-loop. The file published into save_path's dir; only record its identity if
@@ -2249,11 +2331,32 @@ class CDPDownloadInterceptor:
         )
 
     @staticmethod
-    def _publish_confined_temporary_file(temporary_file: _ConfinedTemporaryFile, filename: str) -> None:
+    def _publish_confined_temporary_file(
+        temporary_file: _ConfinedTemporaryFile,
+        filename: str,
+        content_type: str = "",
+        status_code: int | None = None,
+        claimed_filename: str | None = None,
+        streamed: bool = False,
+    ) -> None:
         temporary_file.handle.flush()
         source_stat = os.fstat(temporary_file.handle.fileno())
         if not stat.S_ISREG(source_stat.st_mode) or source_stat.st_nlink != 1:
             raise OSError(errno.EPERM, "download temporary file must be a regular single-link file")
+        if isinstance(status_code, int) and not isinstance(status_code, bool) and status_code >= 400:
+            raise ValueError("download response has an error status")
+        validation_filename = filename if claimed_filename is None else claimed_filename
+        if streamed or source_stat.st_size >= STREAM_TO_DISK_THRESHOLD_BYTES:
+            if _streamed_payload_contradicts_claimed_type(temporary_file.handle, content_type, validation_filename):
+                raise ValueError("download payload contradicts its claimed type")
+        else:
+            temporary_file.handle.seek(0)
+            payload = temporary_file.handle.read()
+            temporary_file.handle.seek(0)
+            if _payload_contradicts_claimed_type(
+                payload, content_type, validation_filename, allow_typed_extensionless_html=True
+            ):
+                raise ValueError("download payload contradicts its claimed type")
         os.link(
             temporary_file.name,
             filename,
@@ -2302,17 +2405,25 @@ class CDPDownloadInterceptor:
         save_path: Path,
         data: bytes | bytearray,
         artifact_scope_generation: int | None = None,
+        content_type: str = "",
+        status_code: int | None = None,
+        claimed_filename: str | None = None,
     ) -> None:
         temporary_file = self._open_confined_temporary_file(save_path)
         try:
             temporary_file.handle.write(data)
+            streamed = len(data) >= STREAM_TO_DISK_THRESHOLD_BYTES
             if artifact_scope_generation is None:
-                self._publish_confined_temporary_file(temporary_file, save_path.name)
+                self._publish_confined_temporary_file(
+                    temporary_file, save_path.name, content_type, status_code, claimed_filename, streamed
+                )
             else:
                 with self._artifact_scope_lock:
                     if not self._artifact_scope_is_active(artifact_scope_generation):
                         raise _DownloadScopeInvalidated
-                    self._publish_confined_temporary_file(temporary_file, save_path.name)
+                    self._publish_confined_temporary_file(
+                        temporary_file, save_path.name, content_type, status_code, claimed_filename, streamed
+                    )
         finally:
             self._cleanup_confined_temporary_file(temporary_file)
 
@@ -2437,11 +2548,16 @@ class CDPDownloadInterceptor:
             LOG.error("Guarded direct download returned an invalid response")
             self._record_download_failure(attempt, "capture_failed")
             return
+        response_status = response.status
+        if not isinstance(response_status, int) or isinstance(response_status, bool):
+            response_status = None
         if not self._reserve_download_bytes(attempt, len(data)):
             return
 
-        normalized_filename = normalize_download_filename(response_filename, content_type)
-        if _payload_contradicts_claimed_type(data, content_type, normalized_filename):
+        normalized_filename = _validated_download_basename(response_filename, content_type)
+        if (response_status is not None and response_status >= 400) or _payload_contradicts_claimed_type(
+            data, content_type, normalized_filename
+        ):
             # A browser-context fetch preserves same-origin session/request state; retain the
             # guard if recovery is unavailable or also contradicts the claimed type.
             if artifact_scope_generation is None:
@@ -2463,8 +2579,13 @@ class CDPDownloadInterceptor:
                     attempt, recovered, suggested_filename, "", artifact_scope_generation, candidate_epoch, None, None
                 ):
                     return
-                save_path, filename = self._resolve_save_path(suggested_filename)
-                if self._existing_file_is_identical(save_path, recovered):
+                save_path, filename = self._resolve_save_path(response_filename, content_type)
+                if self._existing_file_is_identical(
+                    save_path,
+                    recovered,
+                    content_type=content_type,
+                    claimed_filename=filename if response_filename else "",
+                ):
                     self._discard_duplicate_download(attempt)
                     LOG.info(
                         "CDP download deduplicated; identical file already saved",
@@ -2474,7 +2595,13 @@ class CDPDownloadInterceptor:
                         download_index=self._download_index,
                     )
                     return
-                self._atomically_write_bytes(save_path, recovered, artifact_scope_generation)
+                self._atomically_write_bytes(
+                    save_path,
+                    recovered,
+                    artifact_scope_generation,
+                    content_type,
+                    claimed_filename=filename if response_filename else "",
+                )
                 LOG.info(
                     "CDP download saved (in-page same-origin fetch)",
                     filename_fp=diagnostic_fingerprint(filename),
@@ -2507,13 +2634,18 @@ class CDPDownloadInterceptor:
             artifact_scope_generation,
             candidate_epoch,
             content_type,
-            response.status,
+            response_status,
         ):
             return
 
         save_path, filename = self._resolve_save_path(response_filename, content_type)
         scope_active = self._artifact_scope_is_active(artifact_scope_generation)
-        if scope_active and self._existing_file_is_identical(save_path, data):
+        if scope_active and self._existing_file_is_identical(
+            save_path,
+            data,
+            content_type=content_type,
+            claimed_filename=filename if response_filename else "",
+        ):
             self._discard_duplicate_download(attempt)
             LOG.info(
                 "CDP download deduplicated; identical file already saved",
@@ -2524,7 +2656,14 @@ class CDPDownloadInterceptor:
             )
             return
 
-        self._atomically_write_bytes(save_path, data, artifact_scope_generation)
+        self._atomically_write_bytes(
+            save_path,
+            data,
+            artifact_scope_generation,
+            content_type,
+            response_status,
+            filename if response_filename else "",
+        )
 
         elapsed_ms = (time.monotonic() - t0) * 1000
         LOG.info(
@@ -2565,8 +2704,8 @@ class CDPDownloadInterceptor:
         """Read bytes through a same-origin HTTPS browser-context fetch, failing closed.
 
         Returns the first page whose body satisfies the download's claimed type (the same predicate
-        the save guard applies), so when a download click opened a popup, a page still showing an
-        error envelope does not mask the real file another page holds.
+        the save guard applies), so when a download click opened a popup, an HTML gate page does not
+        mask the real file another page holds.
         """
         if self._browser_context is None:
             return None
@@ -2652,15 +2791,17 @@ class CDPDownloadInterceptor:
         # probe=True: this fans out over every open page as a best-effort fallback, so the
         # shared reader must not emit ERROR logs for pages that don't own the blob's origin.
         data: bytes | None = None
+        content_type = ""
         for page in list(self._browser_context.pages):
             try:
-                data = await SkyvernFrame.read_blob_url_bytes(
+                blob_result = await SkyvernFrame.read_blob_url_bytes_and_content_type(
                     page=page, blob_url=url, max_size_bytes=MAX_FILE_SIZE_BYTES, probe=True, raise_too_large=True
                 )
             except BlobTooLargeError:
                 self._record_download_failure(attempt, "file_size_limit")
                 return
-            if data is not None:
+            if blob_result is not None:
+                data, content_type = blob_result
                 break
 
         if data is None:
@@ -2690,7 +2831,12 @@ class CDPDownloadInterceptor:
         if artifact_scope_generation is None:
             artifact_scope_generation = self._artifact_scope_generation
         scope_active = self._artifact_scope_is_active(artifact_scope_generation)
-        if scope_active and self._existing_file_is_identical(save_path, data):
+        if scope_active and self._existing_file_is_identical(
+            save_path,
+            data,
+            content_type=content_type,
+            claimed_filename=filename if suggested_filename else "",
+        ):
             self._discard_duplicate_download(attempt)
             LOG.info(
                 "CDP download deduplicated; identical file already saved",
@@ -2700,7 +2846,13 @@ class CDPDownloadInterceptor:
                 download_index=self._download_index,
             )
             return
-        self._atomically_write_bytes(save_path, data, artifact_scope_generation)
+        self._atomically_write_bytes(
+            save_path,
+            data,
+            artifact_scope_generation,
+            content_type,
+            claimed_filename=filename if suggested_filename else "",
+        )
         self._downloaded_urls.add(url)
         LOG.info(
             "CDP download saved (blob)",
@@ -3193,6 +3345,7 @@ class CDPDownloadInterceptor:
         content_type = _normalized_content_type(headers.get("content-type", ""))
         try:
             save_path, filename = self._resolve_save_path(raw_filename, content_type)
+            claimed_filename = filename if raw_filename else ""
         except (OSError, ValueError) as error:
             LOG.error("Unsafe CDP download output path", error_type=type(error).__name__)
             self._downloaded_urls.add(url)
@@ -3236,6 +3389,9 @@ class CDPDownloadInterceptor:
                         cdp_session,
                         request_id,
                         save_path,
+                        content_type=content_type,
+                        status_code=response_status,
+                        claimed_filename=claimed_filename,
                         start_on_disk=start_on_disk,
                         artifact_scope_generation=artifact_scope_generation,
                         max_size_bytes=stream_max_bytes,
@@ -3298,6 +3454,9 @@ class CDPDownloadInterceptor:
                     outcome,
                     save_path,
                     filename,
+                    content_type,
+                    response_status,
+                    claimed_filename,
                     url,
                     t0,
                     artifact_scope_generation,
@@ -3402,6 +3561,9 @@ class CDPDownloadInterceptor:
         outcome: _StreamOutcome,
         save_path: Path,
         filename: str,
+        content_type: str,
+        status_code: int,
+        claimed_filename: str,
         url: str,
         t0: float,
         artifact_scope_generation: int,
@@ -3419,6 +3581,9 @@ class CDPDownloadInterceptor:
                     save_path,
                     data,
                     artifact_scope_generation,
+                    content_type,
+                    status_code,
+                    claimed_filename,
                 )
             except _DownloadScopeInvalidated:
                 LOG.warning("CDP download scope changed before buffered publication; failing request")
@@ -3491,6 +3656,9 @@ class CDPDownloadInterceptor:
         request_id: str,
         save_path: Path,
         *,
+        content_type: str,
+        status_code: int,
+        claimed_filename: str,
         start_on_disk: bool,
         artifact_scope_generation: int,
         max_size_bytes: int | None = None,
@@ -3578,7 +3746,9 @@ class CDPDownloadInterceptor:
                 with self._artifact_scope_lock:
                     if not self._artifact_scope_is_active(artifact_scope_generation):
                         raise _DownloadScopeInvalidated
-                    self._publish_confined_temporary_file(temp_file, save_path.name)
+                    self._publish_confined_temporary_file(
+                        temp_file, save_path.name, content_type, status_code, claimed_filename, streamed=True
+                    )
                 return _StreamOutcome(mode="streamed", data=None, save_path=save_path, total_bytes=total)
             return _StreamOutcome(mode="buffered", data=b"".join(buffer or []), save_path=None, total_bytes=total)
         finally:
