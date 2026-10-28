@@ -2820,6 +2820,29 @@ async def test_execute_task_v3_download_block_records_the_file_that_landed(
 
 
 @pytest.mark.asyncio
+async def test_task_v3_native_finalizer_keeps_existing_file_behavior(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    error_page = b"<!DOCTYPE html><html><head><title>Error</title></head><body><h1>Session expired</h1></body></html>"
+
+    async def _download_then_finish(kwargs: dict[str, Any], captured: dict[str, Any]) -> LoopOutcome:
+        (tmp_path / "report.pdf").write_bytes(error_page)
+        captured["probe_reason"] = await kwargs["download_settle"](frozenset())
+        return LoopOutcome(status="completed", reason=captured["probe_reason"], billable_actions=["click"])
+
+    captured = await _run_execute_task_v3_download(
+        monkeypatch,
+        tmp_path,
+        drop_file=False,
+        loop_fn=_download_then_finish,
+    )
+
+    assert captured["probe_reason"] == "download completed (1 new file(s))"
+    assert captured["task"].status == TaskStatus.completed
+    assert (tmp_path / "invoice.pdf").read_bytes() == error_page
+
+
+@pytest.mark.asyncio
 async def test_execute_task_v3_download_settle_returns_none_when_wait_reports_cancellation(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
