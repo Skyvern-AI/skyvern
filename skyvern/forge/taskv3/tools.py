@@ -138,7 +138,11 @@ from skyvern.webeye.cdp_download_interceptor import (
 )
 from skyvern.webeye.native_downloads import NativeDownloadAttempt
 from skyvern.webeye.navigation import driver_nav_error_code, record_task_nav_error_code, redact_url_secrets
-from skyvern.webeye.utils.challenge_signature import CHALLENGE_VENDOR_FRAME_URL, CHALLENGE_VENDOR_SIGNATURE
+from skyvern.webeye.utils.challenge_signature import (
+    CHALLENGE_VENDOR_FRAME_URL,
+    CHALLENGE_VENDOR_SIGNATURE,
+    rendered_challenge_vendor_reading,
+)
 from skyvern.webeye.utils.flutter_semantics import (
     FLUTTER_STATE_JS,
     FLUTTER_TEXT_FIELD_JS,
@@ -6691,6 +6695,23 @@ _OTHER_CLICK_BLOCKERS = ("intercepts pointer events", "not visible", "not stable
 # A page that enables its submit once a tick or keystroke settles does so within this window, so the
 # click still lands as it did under Playwright's own wait; a control still disabled after it fails fast.
 _DISABLED_CLICK_GRACE_SECONDS = 2.0
+
+
+async def _disabled_click_refusal(page: Any, selector: str) -> ToolResult:
+    message = f"{selector} is disabled — it cannot be clicked until the page enables it"
+    # The model reads no pixels and observe cannot list a cross-origin widget, so a gate drawn by a challenge frame
+    # is invisible to it. Only a frame measured as rendered is named; an unmeasured one is no evidence of a challenge.
+    try:
+        vendor, _unmeasured = await rendered_challenge_vendor_reading(
+            [frame for frame in page.frames if frame.parent_frame is not None]
+        )
+    except Exception:
+        LOG.info("taskv3 disabled-click challenge probe failed", exc_info=True)
+        vendor = None
+    if vendor:
+        # An observation, not a diagnosis: the frame and the disabled control can be unrelated.
+        message += f". A challenge frame ({vendor}) is rendered on screen. solve_captcha acts on it."
+    return ToolResult.error(message, error_class="disabled")
 
 
 async def _engine_enabled(realm: input_dispatch.Realm, selector: str) -> bool:
@@ -15910,10 +15931,7 @@ def build_browser_tools(
 
         while await _gate_refuses():
             if time.monotonic() >= enable_deadline:
-                return ToolResult.error(
-                    f"{selector} is disabled — it cannot be clicked until the page enables it",
-                    error_class="disabled",
-                )
+                return await _disabled_click_refusal(_current_page(), selector)
             await asyncio.sleep(0.1)
             try:
                 reach_pre = await _probe_evaluate(
