@@ -116,10 +116,7 @@ class _BlockTool:
     nested_agent: bool = False
 
 
-_CONTROL_FLOW = (
-    "Control flow: the loop already repeats and decides, and the author places a Conditional or Terminate "
-    "after the block."
-)
+_CONTROL_FLOW = "Control flow: the step's own loop already repeats and decides."
 _OVERLAPS = "Covered by browser_task or the page commands; overlapping tools make tool choice worse."
 
 # Every BlockType is a tool here or says why not, so a new block type cannot silently join or miss the tool set.
@@ -286,6 +283,15 @@ _RUN_BLOCK_TYPES: dict[str, tuple[BlockType, _BlockTool]] = {
     for block_type, tool in AGENT_BLOCK_TOOLS.items()
     if isinstance(tool, _BlockTool) and tool.tool_name is None
 }
+_RUN_BLOCK_DESCRIPTION = (
+    "Run one workflow block in this run and return its status, output and error. arguments holds "
+    "that block's fields; bad arguments return the block's argument schema. Block types:\n"
+    + "\n".join(
+        f"- {name}({', '.join(tool.fields)}): {(tool.description or BLOCK_SUMMARIES[name]).rstrip('.')}"
+        for name, (_, tool) in _RUN_BLOCK_TYPES.items()
+    )
+)
+_FINISH_DESCRIPTION = "Return this step's answer. The arguments are the answer."
 
 
 class _RunEnded(Exception):
@@ -424,7 +430,7 @@ def _finish_tool(schema: dict[str, Any], state: _RunState) -> FunctionTool:
 
     return FunctionTool(
         name="finish",
-        description="Return this step's answer. The arguments are the answer.",
+        description=_FINISH_DESCRIPTION,
         params_json_schema=schema,
         on_invoke_tool=_in_turn(state, invoke),
         # Strict mode would make every optional property required.
@@ -489,11 +495,6 @@ def _dedicated_tool(block_type: BlockType, tool: _BlockTool, state: _RunState) -
 
 
 def _run_block_tool(state: _RunState) -> FunctionTool:
-    lines = [
-        f"- {name}({', '.join(tool.fields)}): {(tool.description or BLOCK_SUMMARIES[name]).rstrip('.')}"
-        for name, (_, tool) in _RUN_BLOCK_TYPES.items()
-    ]
-
     async def invoke(arguments: str) -> str:
         try:
             call = json.loads(arguments or "{}")
@@ -504,8 +505,7 @@ def _run_block_tool(state: _RunState) -> FunctionTool:
 
     return FunctionTool(
         name="run_block",
-        description="Run one workflow block in this run and return its status, output and error. arguments holds "
-        "that block's fields; bad arguments return the block's argument schema. Block types:\n" + "\n".join(lines),
+        description=_RUN_BLOCK_DESCRIPTION,
         params_json_schema={
             "type": "object",
             "properties": {
@@ -675,8 +675,58 @@ async def _page_extract(
         return await page.extract(prompt=_template_literal(prompt), schema=schema, **opt_out)
 
 
+_TEXT = {"type": "string"}
+_RUN_TOOLS: tuple[tuple[str, str, dict[str, Any], list[str], Callable[..., Awaitable[Any]]], ...] = (
+    (
+        "read_run_data",
+        "Read what this run already has. Without name: the names of its workflow parameters, its earlier blocks "
+        "with their status, and its downloaded files. With name: that parameter's value, that block's output and "
+        "outcome, or that file's URL. Secret values are masked.",
+        {"name": _TEXT},
+        [],
+        _read_run_data,
+    ),
+    ("page_goto", "Open url in this run's browser.", {"url": _TEXT}, ["url"], _page_goto),
+    (
+        "page_click",
+        "Click the element prompt describes." + _NO_SECOND_AGENT,
+        {"prompt": _TEXT},
+        ["prompt"],
+        _page_click,
+    ),
+    (
+        "page_fill",
+        "Type value into the field prompt describes." + _NO_SECOND_AGENT,
+        {"prompt": _TEXT, "value": _TEXT},
+        ["prompt", "value"],
+        _page_fill,
+    ),
+    (
+        "page_extract",
+        "Read what prompt asks for from the page, shaped by schema, a JSON schema. For a yes/no check, pass "
+        '{"type": "boolean"}.' + _NO_SECOND_AGENT,
+        {"prompt": _TEXT, "schema": {"type": "object"}},
+        ["prompt"],
+        _page_extract,
+    ),
+)
+
+
+def tool_descriptions() -> dict[str, str]:
+    """Every tool an agent step can be given, by name; login only when the run has a credential."""
+    return {
+        **{
+            tool.tool_name: tool.description or BLOCK_SUMMARIES[block_type.value]
+            for block_type, tool in AGENT_BLOCK_TOOLS.items()
+            if isinstance(tool, _BlockTool) and tool.tool_name
+        },
+        "run_block": _RUN_BLOCK_DESCRIPTION,
+        **{name: description for name, description, *_ in _RUN_TOOLS},
+        "finish": _FINISH_DESCRIPTION,
+    }
+
+
 def _tools(state: _RunState) -> list[FunctionTool]:
-    text = {"type": "string"}
     return [
         *(
             _dedicated_tool(block_type, tool, state)
@@ -686,42 +736,7 @@ def _tools(state: _RunState) -> list[FunctionTool]:
             and ("credential" not in tool.fields or state.credential_keys)
         ),
         _run_block_tool(state),
-        _run_tool(
-            "read_run_data",
-            "Read what this run already has. Without name: the names of its workflow parameters, its earlier blocks "
-            "with their status, and its downloaded files. With name: that parameter's value, that block's output and "
-            "outcome, or that file's URL. Secret values are masked.",
-            {"name": text},
-            [],
-            _read_run_data,
-            state,
-        ),
-        _run_tool("page_goto", "Open url in this run's browser.", {"url": text}, ["url"], _page_goto, state),
-        _run_tool(
-            "page_click",
-            "Click the element prompt describes." + _NO_SECOND_AGENT,
-            {"prompt": text},
-            ["prompt"],
-            _page_click,
-            state,
-        ),
-        _run_tool(
-            "page_fill",
-            "Type value into the field prompt describes." + _NO_SECOND_AGENT,
-            {"prompt": text, "value": text},
-            ["prompt", "value"],
-            _page_fill,
-            state,
-        ),
-        _run_tool(
-            "page_extract",
-            "Read what prompt asks for from the page, shaped by schema, a JSON schema. For a yes/no check, pass "
-            '{"type": "boolean"}.' + _NO_SECOND_AGENT,
-            {"prompt": text, "schema": {"type": "object"}},
-            ["prompt"],
-            _page_extract,
-            state,
-        ),
+        *(_run_tool(*spec, state) for spec in _RUN_TOOLS),
     ]
 
 

@@ -10,7 +10,17 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 import pytest_asyncio
-from agents import Agent, ModelResponse, ModelSettings, RunConfig, Runner, Tool, TResponseInputItem, Usage
+from agents import (
+    Agent,
+    FunctionTool,
+    ModelResponse,
+    ModelSettings,
+    RunConfig,
+    Runner,
+    Tool,
+    TResponseInputItem,
+    Usage,
+)
 from agents.items import TResponseOutputItem
 from agents.models.interface import Model
 from agents.tool_context import ToolContext
@@ -67,6 +77,7 @@ class _ScriptedModel(Model):
         self.script = script
         self.inputs: list[list[str | list[TResponseInputItem] | None]] = []
         self.tool_names: list[list[str]] = []
+        self.tool_descriptions: list[dict[str, str]] = []
 
     async def get_response(
         self,
@@ -79,6 +90,7 @@ class _ScriptedModel(Model):
     ) -> ModelResponse:
         self.inputs.append([system_instructions, input])
         self.tool_names.append([tool.name for tool in tools])
+        self.tool_descriptions.append({tool.name: tool.description for tool in tools if isinstance(tool, FunctionTool)})
         _observe_copilot_model_usage(CopilotModelUsageEvent(request_model="scripted", cost=MODEL_CALL_COST))
         return ModelResponse(output=self.script[len(self.inputs) - 1], usage=Usage(requests=1), response_id=None)
 
@@ -273,6 +285,20 @@ async def test_agent_block_runs_tools_as_child_blocks_until_a_valid_finish(
         )
     assert len(model.inputs) == len(model.script)
     assert float(llm_cost) == pytest.approx(len(model.script) * MODEL_CALL_COST)
+
+
+@pytest.mark.asyncio
+async def test_authors_are_shown_exactly_the_tools_the_step_gets(
+    monkeypatch: pytest.MonkeyPatch, database: AgentDB
+) -> None:
+    monkeypatch.setitem(LLMConfigRegistry._configs, LUNA_MEDIUM, _pinned("medium"))
+    model = _ScriptedModel([VALID_FINISH])
+
+    await _run_agent_block(monkeypatch, LUNA_MEDIUM, model)
+
+    # This run has no credential parameter, so the step is not given login.
+    shown = {name: text for name, text in agent_step_loop.tool_descriptions().items() if name != "login"}
+    assert model.tool_descriptions == [shown]
 
 
 @pytest.mark.asyncio

@@ -398,12 +398,16 @@ async def _get_block_schema_pre_hook(
             },
         }
     if normalized == "agent_step" and normalized not in _copilot_banned_block_types(ctx):
+        # Imported here because agent_step_loop imports Copilot's model resolver, which imports this module.
+        from skyvern.forge.sdk.workflow.models.agent_step_loop import tool_descriptions
+
         return {
             "ok": True,
             "data": {
                 "block_type": "agent_step",
                 "summary": AGENT_STEP_BLOCK_SUMMARY,
                 "schema": AgentStepBlockYAML.model_json_schema(),
+                "tools_the_step_can_call": tool_descriptions(),
             },
         }
     policy_entry = _copilot_block_policy(normalized, ctx)

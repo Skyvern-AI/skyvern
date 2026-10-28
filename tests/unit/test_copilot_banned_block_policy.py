@@ -1709,7 +1709,11 @@ async def test_agent_step_is_served_listed_and_saved_only_with_the_org_grant_and
     assert write["ok"] is authorable
     if authorable:
         assert schema["data"]["summary"] == AGENT_STEP_BLOCK_SUMMARY
-        assert {"prompt", "data_schema", "max_turns"} <= set(schema["data"]["schema"]["properties"])
+        fields = schema["data"]["schema"]["properties"]
+        assert all(fields[name].get("description") for name in ("prompt", "data_schema", "max_turns", "parameter_keys"))
+        step_tools = schema["data"]["tools_the_step_can_call"]
+        assert {"browser_task", "web_search", "run_block", "finish"} <= set(step_tools)
+        assert "file_download" in step_tools["run_block"] and "http_request" in step_tools["run_block"]
         assert ctx.workflow_yaml == _AGENT_STEP_THEN_BRANCH
     else:
         assert "check_page (agent_step, block_type_unavailable)" in write["error"]

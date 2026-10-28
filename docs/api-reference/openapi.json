@@ -9554,18 +9554,21 @@
           },
           "prompt": {
             "type": "string",
-            "title": "Prompt"
+            "title": "Prompt",
+            "description": "What the step must work out or get done. Rendered as a Jinja template against the run's parameters and earlier block outputs before the step starts."
           },
           "data_schema": {
             "additionalProperties": true,
             "type": "object",
-            "title": "Data Schema"
+            "title": "Data Schema",
+            "description": "JSON Schema (type object) of the answer the step returns through its finish tool. Later blocks read the answer as {{ <label>_output.output }}."
           },
           "max_turns": {
             "type": "integer",
             "maximum": 200.0,
             "minimum": 1.0,
             "title": "Max Turns",
+            "description": "Model turns the step may take. When they run out, the step gets one more turn in which only finish runs.",
             "default": 25
           },
           "parameter_keys": {
@@ -9580,7 +9583,8 @@
                 "type": "null"
               }
             ],
-            "title": "Parameter Keys"
+            "title": "Parameter Keys",
+            "description": "Keys of the workflow parameters and earlier block outputs the step uses."
           }
         },
         "type": "object",

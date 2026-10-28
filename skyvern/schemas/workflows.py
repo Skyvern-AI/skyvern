@@ -1472,12 +1472,29 @@ class TerminateBlockYAML(BlockYAML):
 class AgentStepBlockYAML(BlockYAML):
     block_type: Literal[BlockType.AGENT_STEP] = BlockType.AGENT_STEP  # type: ignore
 
-    prompt: str
-    data_schema: dict[str, Any] = Field(
-        default_factory=lambda: {"type": "object", "properties": {"answer": {"type": "string"}}, "required": ["answer"]}
+    prompt: str = Field(
+        description="What the step must work out or get done. Rendered as a Jinja template against the run's "
+        "parameters and earlier block outputs before the step starts."
     )
-    max_turns: int = Field(default=25, ge=1, le=200)
-    parameter_keys: list[str] | None = None
+    data_schema: dict[str, Any] = Field(
+        default_factory=lambda: {
+            "type": "object",
+            "properties": {"answer": {"type": "string"}},
+            "required": ["answer"],
+        },
+        description="JSON Schema (type object) of the answer the step returns through its finish tool. Later blocks "
+        "read the answer as {{ <label>_output.output }}.",
+    )
+    max_turns: int = Field(
+        default=25,
+        ge=1,
+        le=200,
+        description="Model turns the step may take. When they run out, the step gets one more turn in which only "
+        "finish runs.",
+    )
+    parameter_keys: list[str] | None = Field(
+        default=None, description="Keys of the workflow parameters and earlier block outputs the step uses."
+    )
 
     @field_validator("data_schema")
     @classmethod

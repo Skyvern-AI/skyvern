@@ -219,8 +219,8 @@ CODE_BLOCK_SUMMARY = (
     "and transforms data it already holds"
 )
 AGENT_STEP_BLOCK_SUMMARY = (
-    "one model-driven step that runs workflow blocks and acts on the run's browser page until it can "
-    "return an answer matching its data_schema"
+    "one model-driven step that decides and acts with this run's blocks, with or without the browser, "
+    "then returns fields matching its data_schema"
 )
 _AGENT_FAMILY_BLOCK_TYPES: frozenset[str] = frozenset(AGENT_FAMILY_BLOCK_SUMMARIES)
 _AGENT_FAMILY_BLOCK_LIST = join_phrases([f"`{block_type}`" for block_type in AGENT_FAMILY_BLOCK_SUMMARIES], "and")
