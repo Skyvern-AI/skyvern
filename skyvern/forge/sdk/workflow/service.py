@@ -170,6 +170,7 @@ from skyvern.forge.sdk.schemas.persistent_browser_sessions import (
 from skyvern.forge.sdk.schemas.tasks import Task, TaskStatus
 from skyvern.forge.sdk.schemas.workflow_runs import WorkflowRunBlock, WorkflowRunTimeline, WorkflowRunTimelineType
 from skyvern.forge.sdk.schemas.workflow_schedules import OneTimeDispatchStatus
+from skyvern.forge.sdk.services.org_auth_token_service import get_valid_org_api_token
 from skyvern.forge.sdk.services.request_principal import RequestPrincipal, get_request_principal
 from skyvern.forge.sdk.streaming.registries import mark_stream_closing
 from skyvern.forge.sdk.submission import shadow as submission_shadow
@@ -1645,13 +1646,10 @@ def _browser_lease_failure_category(exc: Exception, workflow_run: WorkflowRun) -
 async def _get_recovery_api_key(organization_id: str) -> str | None:
     organizations = getattr(app.DATABASE, "organizations", None)
     get_valid_org_auth_token = getattr(organizations, "get_valid_org_auth_token", None)
-    if get_valid_org_auth_token is None:
+    if organizations is None or get_valid_org_auth_token is None:
         return None
     try:
-        org_auth_token = await get_valid_org_auth_token(
-            organization_id=organization_id,
-            token_type=OrganizationAuthTokenType.api.value,
-        )
+        org_auth_token = await get_valid_org_api_token(organizations, organization_id)
     except Exception:
         LOG.exception(
             "Failed to load organization API token for workflow retry recovery", organization_id=organization_id

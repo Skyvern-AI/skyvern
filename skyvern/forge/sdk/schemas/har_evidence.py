@@ -3,10 +3,11 @@ from __future__ import annotations
 from datetime import datetime
 from enum import StrEnum
 
-from pydantic import BaseModel, ConfigDict
+from pydantic import BaseModel, ConfigDict, field_validator
 
 MAX_EVIDENCE_VISITS = 20
 MAX_EVIDENCE_EVENTS = 50
+EVENT_HOST_CLASSES = frozenset({"site", "third_party", "vendor_cdn", "vendor_api", "unknown"})
 
 
 class HarEvidenceAvailability(StrEnum):
@@ -40,6 +41,13 @@ class HarEvidenceEvent(BaseModel):
     retry_after_s: int | None = None
     resource_fail_class: str | None = None
     vendor_path_class: str | None = None
+    # The event's host relative to the visited site; an observation, not proof of who blocked the page.
+    host_class: str = "unknown"
+
+    @field_validator("host_class", mode="before")
+    @classmethod
+    def _known_host_class(cls, value: object) -> str:
+        return value if isinstance(value, str) and value in EVENT_HOST_CLASSES else "unknown"
 
 
 class HarEvidenceVisit(BaseModel):

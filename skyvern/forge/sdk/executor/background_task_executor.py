@@ -18,7 +18,6 @@ from skyvern.forge.sdk.api.llm.custom_llm_registry import prepare_org_llm_runtim
 from skyvern.forge.sdk.core import skyvern_context
 from skyvern.forge.sdk.core.skyvern_context import SkyvernContext
 from skyvern.forge.sdk.db.datetime_utils import naive_utc_now, to_naive_utc
-from skyvern.forge.sdk.db.enums import OrganizationAuthTokenType
 from skyvern.forge.sdk.db.repositories.workflow_run_attempts import (
     ATTEMPT_RECOVERY_BATCH_SIZE,
     ATTEMPT_RECOVERY_MAX_PAGES,
@@ -29,6 +28,7 @@ from skyvern.forge.sdk.schemas.organizations import Organization
 from skyvern.forge.sdk.schemas.persistent_browser_sessions import FORCED_WORKFLOW_SESSION_RUNNABLE_TYPE
 from skyvern.forge.sdk.schemas.task_v2 import TaskV2Status
 from skyvern.forge.sdk.schemas.tasks import TaskStatus
+from skyvern.forge.sdk.services.org_auth_token_service import get_valid_org_api_token
 from skyvern.forge.sdk.workflow.models.workflow import Workflow, WorkflowRun, WorkflowRunStatus
 from skyvern.forge.sdk.workflow.retry_policy import (
     LEASE_TAKEOVER_SECONDS,
@@ -372,12 +372,9 @@ class BackgroundTaskExecutor(AsyncExecutor):
     async def _get_valid_api_key(self, organization_id: str) -> str | None:
         organizations = getattr(app.DATABASE, "organizations", None)
         get_valid_org_auth_token = getattr(organizations, "get_valid_org_auth_token", None)
-        if get_valid_org_auth_token is None:
+        if organizations is None or get_valid_org_auth_token is None:
             return None
-        org_auth_token = await get_valid_org_auth_token(
-            organization_id=organization_id,
-            token_type=OrganizationAuthTokenType.api.value,
-        )
+        org_auth_token = await get_valid_org_api_token(organizations, organization_id)
         return org_auth_token.token if org_auth_token else None
 
     async def _initialize_retry_resume(self, attempt: Any, *, prepared: bool) -> tuple[Organization, str] | None:

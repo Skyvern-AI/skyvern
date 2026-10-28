@@ -6,7 +6,6 @@ import structlog
 from skyvern.forge import app
 from skyvern.forge.failure_classifier import WORKER_CONTAINER_RESTARTED_REASON_CODE, classify_from_failure_reason
 from skyvern.forge.sdk.db.datetime_utils import naive_utc_now
-from skyvern.forge.sdk.db.enums import OrganizationAuthTokenType
 from skyvern.forge.sdk.db.repositories.run_execution_leases import RunExecutionLease
 from skyvern.forge.sdk.executor.background_task_executor import BackgroundTaskExecutor
 from skyvern.forge.sdk.executor.factory import AsyncExecutorFactory
@@ -19,6 +18,7 @@ from skyvern.forge.sdk.executor.run_liveness import (
 from skyvern.forge.sdk.models import StepStatus
 from skyvern.forge.sdk.schemas.task_v2 import TaskV2, TaskV2Status
 from skyvern.forge.sdk.schemas.tasks import Task, TaskStatus
+from skyvern.forge.sdk.services.org_auth_token_service import get_valid_org_api_token
 from skyvern.forge.sdk.workflow.models.workflow import WorkflowRun, WorkflowRunStatus
 from skyvern.forge.sdk.workflow.retry_policy import get_recorded_decision
 from skyvern.services import task_v2_service, uploaded_file_service
@@ -27,10 +27,7 @@ LOG = structlog.get_logger()
 
 
 async def _api_key(organization_id: str) -> str | None:
-    token = await app.DATABASE.organizations.get_valid_org_auth_token(
-        organization_id,
-        OrganizationAuthTokenType.api.value,
-    )
+    token = await get_valid_org_api_token(app.DATABASE.organizations, organization_id)
     if token is None:
         LOG.warning("Orphaned run webhook skipped: no API key", organization_id=organization_id)
         return None
