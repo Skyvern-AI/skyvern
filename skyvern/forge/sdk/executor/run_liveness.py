@@ -22,6 +22,7 @@ if TYPE_CHECKING:
 
 LOG = structlog.get_logger()
 INTERVAL_SECONDS = 60
+HEARTBEAT_ERROR_RETRY_SECONDS = 1
 SHUTDOWN_DRAIN_SECONDS = 15
 _pid: int | None = None
 _owner_id: str | None = None
@@ -275,6 +276,8 @@ async def _heartbeat(repository: RunExecutionLeasesRepository) -> None:
             _kept_leases.intersection_update(_held)
         except Exception:
             LOG.exception("Run lease heartbeat failed", owner_id=owner_id())
+            # A failing release runs before `last_renew` advances, so an overdue renewal would otherwise retry at once.
+            await asyncio.sleep(HEARTBEAT_ERROR_RETRY_SECONDS)
         try:
             remaining = max(0.0, min(INTERVAL_SECONDS, INTERVAL_SECONDS - (time.monotonic() - last_renew)))
             async with asyncio.timeout(remaining):
