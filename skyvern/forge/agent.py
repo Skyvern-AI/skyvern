@@ -99,6 +99,7 @@ from skyvern.exceptions import (
 )
 from skyvern.experimentation.wait_utils import get_or_create_wait_config, get_wait_time
 from skyvern.forge import app
+from skyvern.forge.antibot_evidence import prompt_evidence_str
 from skyvern.forge.async_operations import AgentPhase, AsyncOperationPool
 from skyvern.forge.failure_classifier import (
     FailureCategory,
@@ -12014,6 +12015,7 @@ class ForgeAgent:
                 navigation_payload=task.navigation_payload,
                 steps=steps_results,
                 error_code_mapping_str=(json.dumps(task.error_code_mapping) if task.error_code_mapping else None),
+                antibot_evidence_str=prompt_evidence_str(task) if task.error_code_mapping else None,
                 local_datetime=datetime.now(skyvern_context.ensure_context().tz_info).isoformat(),
             )
             json_response = await get_org_aware_primary_llm_api_handler(default=app.LLM_API_HANDLER)(
@@ -12174,6 +12176,7 @@ class ForgeAgent:
                 page_html=html,
                 max_retries=max_retries,
                 error_code_mapping_str=(json.dumps(task.error_code_mapping) if task.error_code_mapping else None),
+                antibot_evidence_str=prompt_evidence_str(task) if task.error_code_mapping else None,
                 local_datetime=datetime.now(skyvern_context.ensure_context().tz_info).isoformat(),
             )
             json_response = await get_org_aware_secondary_llm_api_handler(default=app.SECONDARY_LLM_API_HANDLER)(

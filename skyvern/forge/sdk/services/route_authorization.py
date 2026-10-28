@@ -186,6 +186,7 @@ ROUTE_ACTIONS: Mapping[str, str] = {
     "skyvern.forge.sdk.routes.google_sheets.get_spreadsheet_headers": "google_sheet.list",
     "skyvern.forge.sdk.routes.google_sheets.get_spreadsheet_tabs": "google_sheet.list",
     "skyvern.forge.sdk.routes.google_sheets.list_spreadsheets": "google_sheet.list",
+    "skyvern.forge.sdk.routes.integrations.list_integrations": "integration.list",
     "skyvern.forge.sdk.routes.internal_auth.auth_status": "auth_session.read",
     "skyvern.forge.sdk.routes.internal_llms.llm_status": "model.read",
     "skyvern.forge.sdk.routes.microsoft_oauth.delete_microsoft_oauth_credential": "microsoft_oauth.delete",

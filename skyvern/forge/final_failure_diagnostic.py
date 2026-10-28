@@ -1,13 +1,15 @@
-"""A failed run's final anti-bot diagnostic: the run HAR's class-level evidence, the failure facts persisted when the
-run failed, and the author's own error-code descriptions, read together once cleanup has the closed recording.
+"""A failed run's final anti-bot diagnostic: the run HAR's class-level evidence, the run's challenge-solve receipts and
+the failure facts persisted when the run failed, read together once cleanup has the closed recording. Pure code: no
+model is asked.
 
-The result is an output-only failure_category entry (HAR_ANTI_BOT_DIAGNOSTIC_REASON_CODE). It never touches errors[],
-status, retry, credential fallback or attribution, all of which have already read the run before this runs."""
+The result is an output-only failure_category entry (HAR_ANTI_BOT_DIAGNOSTIC_REASON_CODE) carrying the anti-bot system
+errors qualified evidence supports. A standalone task also appends those to its errors[]; a workflow run's response
+projects them from the entry. Status, retry, credential fallback and attribution have already read the run before
+this runs."""
 
 from __future__ import annotations
 
 import asyncio
-import json
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime, timedelta
 from enum import StrEnum
@@ -15,13 +17,18 @@ from typing import Any
 
 import structlog
 
+from skyvern.errors.errors import (
+    ANTI_BOT_SYSTEM_ERROR_CODES,
+    ErrorType,
+    anti_bot_system_errors,
+)
 from skyvern.forge import app
+from skyvern.forge.antibot_evidence import run_solve_receipts, unresolved_challenges
 from skyvern.forge.failure_classifier import (
     DIAGNOSABLE_FAILURE_STATUSES,
     HAR_ANTI_BOT_DIAGNOSTIC_REASON_CODE,
     FailureCategory,
 )
-from skyvern.forge.prompts import prompt_engine
 from skyvern.forge.sdk.schemas.har_evidence import (
     HarEvidence,
     HarEvidenceAvailability,
@@ -36,9 +43,7 @@ LOG = structlog.get_logger(__name__)
 
 # Requests recorded just after the failure write still belong to the failing attempt.
 _LATE_GRACE = timedelta(seconds=5)
-MATCH_TIMEOUT_S = 15.0
 _MAX_FACT_TEXT = 300
-_MAX_FACTS = 40
 # The HAR names no action, frame or initiator, so nothing recorded ties an enforcement event to the operation that
 # failed: whether it caused the failure stays unknown, however close in time it was.
 CONTRIBUTION_UNKNOWN = "unknown"
@@ -75,7 +80,8 @@ class FailureContext:
     finished_at: datetime | None
     failure_reason: str | None
     failed_action: FailedActionFacts | None
-    error_code_mapping: dict[str, str]
+    # The runs whose challenge-solve receipts belong to this failure.
+    run_ids: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -88,7 +94,7 @@ class FinalDiagnostic:
     http_status: int | None = None
     url_class: str | None = None
     evidence_refs: tuple[str, ...] = ()
-    error_code: str | None = None
+    system_errors: tuple[dict[str, Any], ...] = ()
 
 
 def _utc(at: datetime | None) -> datetime | None:
@@ -109,7 +115,7 @@ async def freeze_failure_context(
     finished_at: datetime | None,
     window_start: datetime | None,
     attempt_number: int | None,
-    error_code_mapping: dict[str, str] | None,
+    run_ids: tuple[str, ...] = (),
 ) -> FailureContext:
     failed_action: FailedActionFacts | None = None
     if task is not None:
@@ -138,7 +144,7 @@ async def freeze_failure_context(
         finished_at=_utc(finished_at),
         failure_reason=_bounded(failure_reason),
         failed_action=failed_action,
-        error_code_mapping={str(k): str(v) for k, v in (error_code_mapping or {}).items()},
+        run_ids=run_ids,
     )
 
 
@@ -222,109 +228,46 @@ def diagnose(evidence: HarEvidence, context: FailureContext) -> tuple[FinalDiagn
     )
 
 
-# A widget frame loading on the page shows the vendor is present, not that it challenged or blocked anything.
-_PASSIVE_WIDGET_EVENTS = frozenset({"recaptcha_observed", "hcaptcha_observed"})
-
-
-def _facts(context: FailureContext, visits: list[HarEvidenceVisit]) -> dict[str, dict[str, Any]]:
-    """Grounded facts the matcher may cite by id. Presence-only facts are marked so they cannot carry a match alone."""
-    facts: dict[str, dict[str, Any]] = {}
-    if context.failure_reason:
-        facts["failure_reason"] = {"text": context.failure_reason}
-    if context.failed_action is not None:
-        facts["failed_action"] = {
-            "type": context.failed_action.action_type,
-            "status": context.failed_action.status,
-            "agent_intention": context.failed_action.agent_intention,
-        }
-    vendors = sorted(_attempt_vendors(visits, context))
-    if vendors:
-        facts["vendors_present"] = {"vendors": vendors, "presence_only": True}
-    for visit in visits:
-        for index, event in enumerate(visit.events):
-            if len(facts) >= _MAX_FACTS or not _in_attempt(_utc(event.event_at), context):
-                continue
-            facts[_ref(visit, index)] = {
-                "event_type": event.event_type,
-                "vendor": event.vendor,
-                "challenge_type": event.challenge_type,
-                "http_status": event.http_status,
-                "url_class": event.url_class,
-            }
-            if event.event_type in _PASSIVE_WIDGET_EVENTS:
-                facts[_ref(visit, index)]["presence_only"] = True
-    return facts
-
-
-async def match_configured_error_code(
-    context: FailureContext, visits: list[HarEvidenceVisit], diagnostic: FinalDiagnostic
-) -> tuple[str | None, tuple[str, ...]]:
-    """One of the author's own codes whose description is a bot-protection block that the grounded failure fits, or
-    None. Only a recording that saw a protection vendor or its enforcement is asked about, so an ordinary error on an
-    unprotected site is never relabeled; a match must cite a fact beyond vendor presence."""
-    if not context.error_code_mapping:
-        return None, ()
-    if not diagnostic.vendors_observed and diagnostic.enforcement == Enforcement.none_observed:
-        return None, ()
-    facts = _facts(context, visits)
-    if not any(not fact.get("presence_only") for fact in facts.values()):
-        return None, ()
-    prompt = prompt_engine.load_prompt(
-        "final-anti-bot-error-code-match",
-        error_code_mapping_str=json.dumps(context.error_code_mapping),
-        facts_str=json.dumps(facts, default=str),
-        enforcement=diagnostic.enforcement.value,
-    )
-    async with asyncio.timeout(MATCH_TIMEOUT_S):
-        response = await app.SECONDARY_LLM_API_HANDLER(
-            prompt=prompt,
-            prompt_name="final-anti-bot-error-code-match",
-            organization_id=context.organization_id,
+def anti_bot_services(evidence: HarEvidence, context: FailureContext) -> list[str | None]:
+    """The service of each qualified failure in the attempt: a HAR event the extractor marked as enforcement, and an
+    unresolved presented challenge from the run's own solves. A widget, asset or vendor merely present is none."""
+    services: list[str | None] = []
+    if evidence.availability == HarEvidenceAvailability.available:
+        services.extend(
+            event.service
+            for visit in evidence.visits
+            for event in visit.events
+            if event.failure_signal and _in_attempt(_utc(event.event_at), context)
         )
-    if not isinstance(response, dict):
-        return None, ()
-    code = response.get("error_code")
-    refs = response.get("evidence_refs")
-    if not isinstance(code, str) or code not in context.error_code_mapping or not isinstance(refs, list):
-        return None, ()
-    grounded = tuple(ref for ref in refs if isinstance(ref, str) and ref in facts)
-    if not any(not facts[ref].get("presence_only") for ref in grounded):
-        return None, ()
-    return code, grounded
+    receipts = [
+        receipt
+        for receipt in run_solve_receipts(context.run_ids, context.window_start)
+        if _in_attempt(_utc(receipt.ended_at), context)
+    ]
+    services.extend(receipt.service for receipt in unresolved_challenges(receipts))
+    return services
 
 
 async def final_failure_diagnostic(evidence: HarEvidence, context: FailureContext) -> FinalDiagnostic:
-    diagnostic, visits = diagnose(evidence, context)
-    try:
-        code, refs = await match_configured_error_code(context, visits, diagnostic)
-    except asyncio.CancelledError:
-        raise
-    except Exception:
-        # A matcher timeout or model error leaves the recorded observation standing.
-        LOG.warning("Final diagnostic error-code match failed", exc_info=True)
-        code, refs = None, ()
-    if code is not None:
-        diagnostic = replace(
-            diagnostic, error_code=code, evidence_refs=tuple(dict.fromkeys((*diagnostic.evidence_refs, *refs)))
-        )
+    diagnostic, _ = diagnose(evidence, context)
+    system_errors = tuple(error.model_dump() for error in anti_bot_system_errors(anti_bot_services(evidence, context)))
     LOG.info(
         "Final anti-bot diagnostic",
         task_id=context.task_id,
         attempt_number=context.attempt_number,
         har_availability=diagnostic.availability.value,
         enforcement=diagnostic.enforcement.value,
-        matched_error_code=code is not None,
+        system_error_codes=[error["error_code"] for error in system_errors],
     )
-    return diagnostic
+    return replace(diagnostic, system_errors=system_errors)
 
 
 def diagnostic_entry(diagnostic: FinalDiagnostic, context: FailureContext) -> dict[str, Any] | None:
     """The failure_category entry to persist, or None when there is nothing to report beyond the log line."""
-    if diagnostic.enforcement == Enforcement.none_observed and diagnostic.error_code is None:
+    if diagnostic.enforcement == Enforcement.none_observed and not diagnostic.system_errors:
         return None
-    if diagnostic.error_code is not None:
-        # The author's own description, never model text.
-        reasoning = f"{diagnostic.error_code}: {context.error_code_mapping[diagnostic.error_code]}"
+    if diagnostic.enforcement == Enforcement.none_observed:
+        reasoning = "A challenge was left unresolved during the failed attempt; it is not known to have caused it"
     else:
         vendor = diagnostic.enforcing_vendor or "Bot protection"
         reasoning = f"{vendor} enforcement was recorded during the failed attempt; it is not known to have caused it"
@@ -351,11 +294,33 @@ def diagnostic_entry(diagnostic: FinalDiagnostic, context: FailureContext) -> di
             "failed_screenshot_artifact_id": (
                 context.failed_action.screenshot_artifact_id if context.failed_action else None
             ),
+            "system_errors": list(diagnostic.system_errors),
         },
     }
-    if diagnostic.error_code is not None:
-        entry["error_code"] = diagnostic.error_code
     return entry
+
+
+def diagnostic_system_errors(categories: object, attempt_number: int | None) -> list[dict[str, Any]]:
+    """The anti-bot system errors the run's diagnostic entry recorded for ``attempt_number``, re-validated so only
+    the code-authored system rows this module writes can come out."""
+    if not isinstance(categories, list):
+        return []
+    for category in categories:
+        if not isinstance(category, dict) or category.get("reason_code") != HAR_ANTI_BOT_DIAGNOSTIC_REASON_CODE:
+            continue
+        anti_bot = category.get("anti_bot")
+        if not isinstance(anti_bot, dict) or anti_bot.get("attempt_number") != attempt_number:
+            return []
+        rows = anti_bot.get("system_errors")
+        return [
+            {"error_code": row["error_code"], "reasoning": row["reasoning"], "error_type": row["error_type"]}
+            for row in (rows if isinstance(rows, list) else [])
+            if isinstance(row, dict)
+            and row.get("error_type") == ErrorType.SYSTEM_DEFINED_ERROR.value
+            and row.get("error_code") in ANTI_BOT_SYSTEM_ERROR_CODES
+            and isinstance(row.get("reasoning"), str)
+        ]
+    return []
 
 
 async def annotate_failed_task(task: Task, evidence: HarEvidence) -> Task:
@@ -371,13 +336,14 @@ async def annotate_failed_task(task: Task, evidence: HarEvidence) -> Task:
             finished_at=task.finished_at,
             window_start=task.started_at or task.created_at,
             attempt_number=task.attempt_number,
-            error_code_mapping=task.error_code_mapping,
+            run_ids=(task.task_id,),
         )
-        entry = diagnostic_entry(await final_failure_diagnostic(evidence, context), context)
+        diagnostic = await final_failure_diagnostic(evidence, context)
+        entry = diagnostic_entry(diagnostic, context)
         if entry is None:
             return task
         updated = await app.DATABASE.tasks.set_final_failure_diagnostic(
-            task.task_id, task.organization_id, task.finished_at, entry
+            task.task_id, task.organization_id, task.finished_at, entry, system_errors=list(diagnostic.system_errors)
         )
         return updated or task
     except asyncio.CancelledError:
@@ -404,11 +370,9 @@ async def annotate_failed_workflow_run(
     *,
     attempt_number: int,
     attempt_started_at: datetime | None,
-    error_code_mapping: dict[str, str] | None = None,
 ) -> WorkflowRun:
     """``workflow_run``, the snapshot its own terminal write returned, with its final diagnostic persisted onto that
-    execution's failed attempt, or unchanged. Raises only cancellation. ``error_code_mapping`` is the run's own
-    configuration, used when the failing task carries none."""
+    execution's failed attempt, or unchanged. Raises only cancellation."""
     status = WorkflowRunStatus(workflow_run.status)
     if status.value not in DIAGNOSABLE_FAILURE_STATUSES or workflow_run.finished_at is None:
         return workflow_run
@@ -443,7 +407,7 @@ async def annotate_failed_workflow_run(
             finished_at=failing.finished_at if failing and failing.finished_at else workflow_run.finished_at,
             window_start=attempt_started_at or workflow_run.started_at or workflow_run.created_at,
             attempt_number=attempt_number,
-            error_code_mapping=(failing.error_code_mapping if failing else None) or error_code_mapping,
+            run_ids=(current.workflow_run_id,),
         )
         entry = diagnostic_entry(await final_failure_diagnostic(evidence, context), context)
         if entry is None:

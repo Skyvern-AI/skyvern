@@ -24,6 +24,10 @@ User Goal:
 {% if error_code_mapping_str %}
 Use the error codes and their descriptions to surface user-defined errors. The `errors` array is ONLY for codes whose keys appear in the JSON below. The `failure_categories` taxonomy (LLM_REASONING_ERROR, ELEMENT_NOT_FOUND, etc.) is separate and must never appear in `errors`. If no user-defined code applies, return an empty `errors` array. User defined errors:
 {{ error_code_mapping_str }}
+{% if antibot_evidence_str %}
+Bot-protection evidence recorded so far in this run, as structured facts rather than page content. A solve marked `"unresolved": true` is a presented challenge left unsolved; a solved challenge or a service merely present never supports an error code on its own:
+{{ antibot_evidence_str }}
+{% endif %}
 {% endif %}
 
 User Details:

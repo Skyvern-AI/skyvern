@@ -9,7 +9,13 @@ from typing import TYPE_CHECKING, Any
 import structlog
 from sqlalchemy import and_, delete, func, or_, select, tuple_, update
 
-from skyvern.forge.failure_classifier import DIAGNOSABLE_FAILURE_STATUSES, has_classifier_primary, with_diagnostic_entry
+from skyvern.errors.errors import is_anti_bot_system_error
+from skyvern.forge.failure_classifier import (
+    DIAGNOSABLE_FAILURE_STATUSES,
+    HAR_ANTI_BOT_DIAGNOSTIC_REASON_CODE,
+    has_classifier_primary,
+    with_diagnostic_entry,
+)
 from skyvern.forge.sdk.db._error_handling import db_operation
 from skyvern.forge.sdk.db.base_alchemy_db import read_retry
 from skyvern.forge.sdk.db.base_repository import BaseRepository
@@ -57,6 +63,10 @@ def _step_status_values(status: StepStatus) -> dict[str, Any]:
     if status.is_terminal():
         values["finished_at"] = func.coalesce(StepModel.finished_at, naive_utc_now())
     return values
+
+
+def _is_diagnostic_entry(category: object) -> bool:
+    return isinstance(category, dict) and category.get("reason_code") == HAR_ANTI_BOT_DIAGNOSTIC_REASON_CODE
 
 
 class TasksRepository(BaseRepository):
@@ -927,11 +937,17 @@ class TasksRepository(BaseRepository):
 
     @db_operation("set_final_failure_diagnostic")
     async def set_final_failure_diagnostic(
-        self, task_id: str, organization_id: str, finished_at: datetime | None, entry: dict[str, Any]
+        self,
+        task_id: str,
+        organization_id: str,
+        finished_at: datetime | None,
+        entry: dict[str, Any],
+        system_errors: Sequence[dict[str, Any]] = (),
     ) -> Task | None:
-        """Add a reporting-only failure_category entry to the failed execution that produced it; None when the task
-        has since been reset, rerun or was never a failure, so a late cleanup cannot write onto a newer execution, and
-        when it has no classifier primary, which the entry would otherwise become."""
+        """Add a reporting-only failure_category entry and the system errors it supports to the failed execution that
+        produced them; None when the task has since been reset, rerun or was never a failure, so a late cleanup cannot
+        write onto a newer execution. The entry is skipped without a classifier primary, which it would otherwise
+        become; the errors are appended regardless, each only when no row of its type and code is already there."""
         async with self.Session() as session:
             task = (
                 await session.scalars(
@@ -941,14 +957,17 @@ class TasksRepository(BaseRepository):
                     .execution_options(populate_existing=True)
                 )
             ).first()
-            if (
-                task is None
-                or task.status not in DIAGNOSABLE_FAILURE_STATUSES
-                or task.finished_at != finished_at
-                or not has_classifier_primary(task.failure_category)
-            ):
+            if task is None or task.status not in DIAGNOSABLE_FAILURE_STATUSES or task.finished_at != finished_at:
                 return None
-            task.failure_category = with_diagnostic_entry(task.failure_category, entry)
+            present = {(e.get("error_type"), e.get("error_code")) for e in task.errors or [] if isinstance(e, dict)}
+            missing = [e for e in system_errors if (e["error_type"], e["error_code"]) not in present]
+            with_entry = has_classifier_primary(task.failure_category)
+            if not with_entry and not missing:
+                return None
+            if with_entry:
+                task.failure_category = with_diagnostic_entry(task.failure_category, entry)
+            if missing:
+                task.errors = [*(task.errors or []), *missing]
             await session.commit()
             await session.refresh(task)
             return convert_to_task(task, debug_enabled=self.debug_enabled)
@@ -977,6 +996,12 @@ class TasksRepository(BaseRepository):
                 task.started_at = None
                 task.finished_at = None
                 task.task_queue = None
+                # The last execution's anti-bot report, its errors and the diagnostic entry carrying them, describes
+                # that execution, not the rerun.
+                if any(is_anti_bot_system_error(error) for error in task.errors or []):
+                    task.errors = [error for error in task.errors if not is_anti_bot_system_error(error)]
+                if any(_is_diagnostic_entry(category) for category in task.failure_category or []):
+                    task.failure_category = [c for c in task.failure_category if not _is_diagnostic_entry(c)]
                 await session.commit()
                 await session.refresh(task)
                 reset_task = convert_to_task(task, debug_enabled=self.debug_enabled)

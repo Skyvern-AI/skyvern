@@ -108,6 +108,7 @@ if TYPE_CHECKING:
 
     from skyvern.forge.sdk.db.enums import WorkflowRunTriggerType
     from skyvern.forge.sdk.db.models import FolderModel
+    from skyvern.forge.sdk.integrations.catalog import AccountsById, IntegrationEntry
     from skyvern.forge.sdk.schemas.totp_codes import OTPType
     from skyvern.forge.sdk.services.credential.credential_vault_service import CredentialVaultService
     from skyvern.forge.sdk.workflow.code_block_authorized_files import (
@@ -1290,6 +1291,12 @@ class AgentFunction:
 
     async def is_onepassword_instance_default_allowed(self, organization_id: str) -> bool:
         return True
+
+    def get_cloud_integration_entries(self) -> list[IntegrationEntry]:
+        return []
+
+    async def get_cloud_integration_accounts(self, organization_id: str) -> AccountsById:
+        return {}
 
     def onepassword_instance_default_policy_mode(self) -> str:
         return "unrestricted"

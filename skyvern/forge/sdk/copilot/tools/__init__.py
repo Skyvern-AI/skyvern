@@ -1267,17 +1267,25 @@ async def set_work_plan_tool(ctx: ToolContext[CopilotContext], items: list[str])
 
 @function_tool(failure_error_function=copilot_tool_failure, name_override="list_integrations")
 async def list_integrations_tool(ctx: RunContextWrapper) -> str:
-    """List the organization's connected Google and Microsoft accounts. Each entry
-    is one connection's metadata, never its tokens.
+    """List every integration on the Integrations page with this organization's
+    connected accounts. Each entry has its `id`, `name`, `category`, `status`
+    (`live` or `comingSoon`), `kind` (how it connects) and, for OAuth entries, the
+    scopes it needs. `accounts` holds each connection's metadata, never its tokens
+    or secrets: `[]` means nothing is connected and `null` means the entry has no
+    per-organization connection. When `accounts` is `null` because the accounts are
+    unknown, `accounts_unavailable` says why: `not_enabled` (the feature is off for
+    this organization) or `read_failed` (the read failed or timed out). One Google
+    account can appear under several Google entries.
 
-    These are OAuth connections made on the Integrations page, NOT the stored
-    login credentials returned by `list_credentials` — the two lists are disjoint,
-    so check this one before concluding the user has no Google or Microsoft access.
+    Google and Microsoft accounts are OAuth connections made on the Integrations
+    page, NOT the stored login credentials returned by `list_credentials` — the two
+    lists are disjoint, so check this one before concluding the user has no Google
+    or Microsoft access.
     Prefer a purpose-built native integration block over automating that connected
     service through its browser UI. For Google Sheets, author a `google_sheets_read`
     or `google_sheets_write` block and pass an active compatible connection's
     `connection_id` as its `credential_id`. Not paginated; one call returns every
-    connection.
+    entry and connection.
 
     Match on `scopes_granted`, not on `provider` alone: connections are granted per
     product, so a Sheets connection cannot read Gmail and binding it to a mail block

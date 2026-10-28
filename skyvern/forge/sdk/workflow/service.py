@@ -91,13 +91,14 @@ from skyvern.forge.failure_classifier import (
     BROWSER_SESSION_CLOSED_REASON_CODE,
     BROWSER_SESSION_EXPIRED_BEFORE_RUN_REASON_CODE,
     BROWSER_SESSION_STARTUP_TIMEOUT_REASON_CODE,
+    TASK_V2_ROOT_USER_ERRORS_REASON_CODE,
     FailureCategory,
     classify_from_failure_reason,
     derive_failure_attribution,
     with_saved_profile_signed_out,
     with_sign_in_form_visible,
 )
-from skyvern.forge.final_failure_diagnostic import annotate_failed_workflow_run
+from skyvern.forge.final_failure_diagnostic import annotate_failed_workflow_run, diagnostic_system_errors
 from skyvern.forge.prompts import prompt_engine
 from skyvern.forge.sdk.api.files import is_temp_working_dir, resolve_run_download_id
 from skyvern.forge.sdk.artifact.models import Artifact, ArtifactType
@@ -550,6 +551,42 @@ def _strict_user_defined_error_payload(value: Any) -> dict[str, Any] | None:
     ):
         return None
     return dict(value)
+
+
+def _with_diagnostic_system_errors(
+    errors: list[dict[str, Any]], categories: object, attempt_number: int
+) -> list[dict[str, Any]]:
+    """``errors`` plus the attempt's anti-bot system errors its final diagnostic recorded, each once per type and
+    code, within the response's 100-row bound."""
+    present = {(error.get("error_type"), error.get("error_code")) for error in errors}
+    missing = [
+        row
+        for row in diagnostic_system_errors(categories, attempt_number)
+        if (row["error_type"], row["error_code"]) not in present
+    ]
+    return [*errors, *missing][: max(len(errors), 100)]
+
+
+def _with_root_user_errors(
+    errors: list[dict[str, Any]], categories: object, error_code_mapping: dict[str, str] | None
+) -> list[dict[str, Any]]:
+    """``errors`` plus the user errors a task v2 root's own summary matched, re-validated against that root's
+    mapping, each once per type and code, within the response's 100-row bound."""
+    if not error_code_mapping or not isinstance(categories, list):
+        return errors
+    present = {(error.get("error_type"), error.get("error_code")) for error in errors}
+    missing: list[dict[str, Any]] = []
+    for category in categories:
+        if not isinstance(category, dict) or category.get("reason_code") != TASK_V2_ROOT_USER_ERRORS_REASON_CODE:
+            continue
+        rows = category.get("user_errors")
+        for row in rows if isinstance(rows, list) else []:
+            valid = _strict_user_defined_error_payload(row)
+            if valid is not None and valid["error_code"] in error_code_mapping:
+                if (valid["error_type"], valid["error_code"]) not in present:
+                    present.add((valid["error_type"], valid["error_code"]))
+                    missing.append(valid)
+    return [*errors, *missing][: max(len(errors), 100)]
 
 
 def _merge_workflow_run_errors(
@@ -3672,6 +3709,7 @@ class WorkflowService:
                     # Shared, not copied: a parent run can keep executing in this context (a loop block's
                     # task), so its solve attempt numbers must continue rather than restart.
                     challenge_solve_attempts=context.challenge_solve_attempts if context else {},
+                    challenge_solve_receipts=context.challenge_solve_receipts if context else [],
                 )
             )
 
@@ -15745,6 +15783,10 @@ class WorkflowService:
         )
         # After the merge so a code copied onto a block's error_codes is filtered too.
         errors = drop_unsolicited_download_errors(errors, downloaded_files=downloaded_files)
+        errors = _with_root_user_errors(
+            errors, workflow_run.failure_category, task_v2.error_code_mapping if task_v2 else None
+        )
+        errors = _with_diagnostic_system_errors(errors, workflow_run.failure_category, current_attempt)
 
         parameters_with_value = {wfp.key: wfrp.value for wfp, wfrp in workflow_parameter_tuples}
 
@@ -16247,7 +16289,6 @@ class WorkflowService:
         schedule_credential_fallback_retry: bool = True,
         attempt_number: int = 1,
         owned_browser_session_id: str | None = None,
-        final_diagnostic_error_code_mapping: dict[str, str] | None = None,
         # The snapshot this run's own terminal write returned; without one the optional diagnostic is skipped.
         final_diagnostic_owner: WorkflowRun | None = None,
     ) -> None:
@@ -16399,7 +16440,6 @@ class WorkflowService:
                         har_evidence,
                         attempt_number=attempt_number,
                         attempt_started_at=current_attempt.started_at if current_attempt is not None else None,
-                        error_code_mapping=final_diagnostic_error_code_mapping,
                     )
             except asyncio.CancelledError:
                 # The diagnostic is optional: deliver the terminal effects below, then restore the cancellation.

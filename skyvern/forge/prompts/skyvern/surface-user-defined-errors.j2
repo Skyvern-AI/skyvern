@@ -16,6 +16,10 @@ User defined errors:
 ```
 {{ error_code_mapping_str }}
 ```
+{% if antibot_evidence_str %}
+Bot-protection evidence recorded so far in this run, as structured facts rather than page content. A solve marked `"unresolved": true` is a presented challenge left unsolved; a solved challenge or a service merely present never supports an error code on its own:
+{{ antibot_evidence_str }}
+{% endif %}
 
 User Goal:
 ```

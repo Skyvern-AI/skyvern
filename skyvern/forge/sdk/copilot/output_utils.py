@@ -2222,7 +2222,21 @@ def summarize_tool_result(tool_name: str, result: dict[str, Any], *, for_display
         count = data.get("count", 0) + (len(vault_logins) if isinstance(vault_logins, list) else 0)
         return f"Found {count} credential(s)"
     if tool_name == "list_integrations":
-        return f"Found {data.get('count', 0)} connected integration(s)"
+        entries = data.get("integrations")
+        connected = (
+            sum(
+                1
+                for entry in entries
+                if isinstance(entry, dict)
+                and any(
+                    isinstance(account, dict) and account.get("state") == "active"
+                    for account in entry.get("accounts") or []
+                )
+            )
+            if isinstance(entries, list)
+            else 0
+        )
+        return f"Listed {data.get('count', 0)} integration(s), {connected} with an active account"
     if tool_name == "read_google_sheet":
         rows = data.get("connections")
         opened = (

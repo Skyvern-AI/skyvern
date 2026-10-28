@@ -18,6 +18,7 @@ from sqlalchemy.exc import OperationalError
 
 from skyvern.config import settings
 from skyvern.constants import MINI_GOAL_TEMPLATE
+from skyvern.errors.errors import UserDefinedError, filter_to_user_defined_codes
 from skyvern.exceptions import (
     BROWSER_CONNECTION_LOST_ERROR_CODE,
     BrowserSessionNotFound,
@@ -30,10 +31,12 @@ from skyvern.exceptions import (
     get_user_facing_exception_message,
 )
 from skyvern.forge import app
+from skyvern.forge.antibot_evidence import run_prompt_evidence_str
 from skyvern.forge.failure_classifier import (
     HAR_ANTI_BOT_DIAGNOSTIC_REASON_CODE,
     bounded_failure_categories,
     classify_from_failure_reason,
+    with_root_user_errors,
 )
 from skyvern.forge.prompts import prompt_engine
 from skyvern.forge.sdk.api.llm.api_handler_factory import (
@@ -74,6 +77,7 @@ from skyvern.forge.sdk.schemas.task_v2 import (
 from skyvern.forge.sdk.schemas.workflow_runs import WorkflowRunTimeline, WorkflowRunTimelineType
 from skyvern.forge.sdk.services.request_principal import RequestPrincipal
 from skyvern.forge.sdk.trace import traced
+from skyvern.forge.sdk.workflow.context_manager import WorkflowRunContext
 from skyvern.forge.sdk.workflow.exceptions import InsecureCodeDetected
 from skyvern.forge.sdk.workflow.models.block import (
     BlockTypeVar,
@@ -226,19 +230,19 @@ def _generate_data_extraction_schema_for_loop(loop_values_key: str) -> dict:
 
 async def _summarize_max_steps_failure_reason(
     task_v2: TaskV2, organization_id: str, browser_state: BrowserState | None
-) -> tuple[str, list[dict] | None]:
+) -> tuple[str, list[dict] | None, list[UserDefinedError]]:
     """
-    Summarize the failure reason for the task v2.
+    Summarize the failure reason for the task v2, and the root's own error codes that match it.
     """
     try:
         assert task_v2.workflow_run_id is not None
 
         if browser_state is None:
-            return "Failed to start browser", None
+            return "Failed to start browser", None, []
 
         page = await browser_state.get_working_page()
         if page is None:
-            return "Failed to get the current browser page", None
+            return "Failed to get the current browser page", None, []
 
         screenshots = await SkyvernFrame.take_split_screenshots(
             page=page,
@@ -270,6 +274,13 @@ async def _summarize_max_steps_failure_reason(
             block_cnt=len(run_blocks),
             navigation_goal=task_v2.prompt,
             history=history,
+            # The root's own codes only; the blocks it generated never receive them.
+            error_code_mapping_str=json.dumps(task_v2.error_code_mapping) if task_v2.error_code_mapping else None,
+            antibot_evidence_str=(
+                run_prompt_evidence_str(task_v2.workflow_run_id, task_v2.started_at or task_v2.created_at)
+                if task_v2.error_code_mapping
+                else None
+            ),
             local_datetime=datetime.now(context.tz_info).isoformat(),
         )
 
@@ -280,10 +291,51 @@ async def _summarize_max_steps_failure_reason(
             thought=thought,
             system_prompt=task_v2.workflow_system_prompt,
         )
-        return json_response.get("reasoning", ""), bounded_failure_categories(json_response.get("failure_categories"))
+        return (
+            json_response.get("reasoning", ""),
+            bounded_failure_categories(json_response.get("failure_categories")),
+            _root_user_errors(task_v2, json_response.get("errors")),
+        )
     except Exception:
         LOG.warning("Failed to summarize the failure reason for task v2", exc_info=True)
-        return "", None
+        return "", None, []
+
+
+def _root_user_errors(task_v2: TaskV2, raw: object) -> list[UserDefinedError]:
+    if not task_v2.error_code_mapping or not isinstance(raw, list):
+        return []
+    parsed: list[UserDefinedError] = []
+    for error in raw:
+        try:
+            parsed.append(UserDefinedError.model_validate(error))
+        except Exception:
+            LOG.warning("Dropped a malformed root user-defined error", task_v2_id=task_v2.observer_cruise_id)
+    kept, dropped = filter_to_user_defined_codes(parsed, task_v2.error_code_mapping)
+    if dropped:
+        LOG.warning(
+            "Dropped LLM-returned error codes not in the root's error_code_mapping",
+            task_v2_id=task_v2.observer_cruise_id,
+            dropped_count=len(dropped),
+        )
+    # Masked with the run's registered secrets, as the errors[] aggregation masks them, before the rows are
+    # stored: the finalized webhook and API read them after the run's context is gone.
+    run_id = task_v2.workflow_run_id
+    run_context = app.WORKFLOW_CONTEXT_MANAGER.workflow_run_contexts.get(run_id) if run_id else None
+    if not isinstance(run_context, WorkflowRunContext):
+        return kept
+    return [
+        UserDefinedError.model_validate({**error.model_dump(), "reasoning": _masked(error.reasoning, run_context)})
+        for error in kept
+    ]
+
+
+def _masked(reasoning: str, run_context: WorkflowRunContext) -> str:
+    masked = str(run_context.mask_secrets_in_data(reasoning))
+    # mask_secrets_in_data leaves a short secret embedded in longer text; the aggregation replaces those too.
+    secrets = {value for value in run_context.secrets.values() if isinstance(value, str) and value}
+    for secret in sorted(secrets, key=len, reverse=True):
+        masked = masked.replace(secret, "[redacted]")
+    return masked or "[redacted]"
 
 
 async def _handle_task_v2_termination(
@@ -741,8 +793,6 @@ async def run_task_v2(
                         browser_session_id=browser_session_id,
                         close_browser_on_completion=browser_session_id is None and not workflow_run.browser_address,
                         need_call_webhook=False,
-                        # Task V2 keeps its error codes on its own row, never on the blocks it generates.
-                        final_diagnostic_error_code_mapping=task_v2.error_code_mapping,
                         final_diagnostic_owner=deferred[task_v2_id].workflow_run,
                     )
                 else:
@@ -1586,7 +1636,7 @@ async def run_task_v2_helper(
         )
         if total_step_count >= max_steps:
             LOG.info("Task v2 failed - run out of steps", max_steps=max_steps, workflow_run_id=workflow_run_id)
-            failure_reason, llm_failure_categories = await _summarize_max_steps_failure_reason(
+            failure_reason, llm_failure_categories, root_user_errors = await _summarize_max_steps_failure_reason(
                 task_v2, organization_id, browser_state
             )
             full_failure_reason = (
@@ -1619,7 +1669,10 @@ async def run_task_v2_helper(
                 workflow_run_id=workflow_run_id,
                 organization_id=organization_id,
                 failure_reason=full_failure_reason,
-                failure_category=failure_category,
+                # An output-only entry after the primary: readers of the primary or the category set are unchanged.
+                failure_category=with_root_user_errors(
+                    failure_category, [error.model_dump(mode="json") for error in root_user_errors]
+                ),
                 summary=summary_description,
                 output=summarized_output,
             )
