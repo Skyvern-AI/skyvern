@@ -698,17 +698,20 @@ class ArtifactsRepository(BaseRepository):
         browser_session_id: str,
         organization_id: str,
         run_started_at: datetime.datetime,
+        excluded_uris: list[str] | None = None,
     ) -> int:
         """Reconcile in-window session-scoped DOWNLOAD rows the watcher left unbound onto ``run_id``,
         returning the number updated. Idempotent: an already-stamped row is never re-stamped, so a
         retry after success is a no-op."""
         async with self.Session() as session:
-            result = await session.execute(
+            query = (
                 update(ArtifactModel)
                 .where(*_session_download_scope_filters(browser_session_id, organization_id, run_started_at))
                 .where(ArtifactModel.run_id.is_(None))
-                .values(run_id=run_id)
             )
+            if excluded_uris:
+                query = query.where(ArtifactModel.uri.not_in(excluded_uris))
+            result = await session.execute(query.values(run_id=run_id))
             await session.commit()
             return result.rowcount or 0
 
