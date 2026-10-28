@@ -372,7 +372,10 @@ from skyvern.webeye.browser_errors import (
 )
 from skyvern.webeye.browser_state import BrowserState, get_browser_connection_loss, get_browser_state_diagnostic
 from skyvern.webeye.cdp_download_interceptor import (
+    STREAM_TO_DISK_THRESHOLD_BYTES,
     DownloadTally,
+    _payload_contradicts_claimed_type,
+    _streamed_payload_contradicts_claimed_type,
     begin_replay_candidate_hold,
     consume_unsolicited_download_error_for_context,
     download_filename_from_suffix,
@@ -2175,12 +2178,14 @@ class ForgeAgent:
         randomize_if_missing: bool,
         attempt_started_at: datetime | None = None,
         recorded_into: list[str] | None = None,
+        rejected_into: list[str] | None = None,
+        validate_claimed_type: bool = True,
     ) -> list[str]:
         """Rename newly downloaded files for a task before persistence.
 
         Returns the list of pre-rename file names discovered as new since
         ``list_files_before``, for logging continuity with the legacy inline
-        path. ``recorded_into``, when given, receives each recorded file's run-directory path after renaming.
+        path. ``recorded_into`` and ``rejected_into`` receive paths recorded or rejected by this call.
         """
         if not task.workflow_run_id:
             return []
@@ -2204,6 +2209,49 @@ class ForgeAgent:
         ]
         if not files_to_rename:
             return []
+        if validate_claimed_type:
+            requested_download_failure_reason = "The requested browser download could not be saved."
+            valid_files_to_rename = []
+            for file in files_to_rename:
+                if file.startswith(("s3://", "gs://")):
+                    valid_files_to_rename.append(file)
+                    continue
+                file_path = Path(workflow_download_directory, file)
+                if not file_path.exists():
+                    valid_files_to_rename.append(file)
+                    continue
+                original_filename = (
+                    context.download_suffix_applied_files.get(file_path.name, (file_path.name, ""))[0]
+                    if context
+                    else file_path.name
+                )
+
+                def _contradicts_claimed_type() -> bool:
+                    with file_path.open("rb") as payload:
+                        if os.fstat(payload.fileno()).st_size >= STREAM_TO_DISK_THRESHOLD_BYTES:
+                            return _streamed_payload_contradicts_claimed_type(payload, "", original_filename)
+                        return _payload_contradicts_claimed_type(
+                            payload.read(), "", original_filename, allow_typed_extensionless_html=True
+                        )
+
+                try:
+                    contradicts_claimed_type = await asyncio.to_thread(_contradicts_claimed_type)
+                except FileNotFoundError:
+                    continue
+                if not contradicts_claimed_type:
+                    valid_files_to_rename.append(file)
+                    continue
+                LOG.warning(
+                    "Rejected downloaded file whose content contradicts its claimed type",
+                    task_id=task.task_id,
+                    workflow_run_id=task.workflow_run_id,
+                )
+                if context is not None:
+                    context.record_download_failure(task.task_id, requested_download_failure_reason)
+                if rejected_into is not None:
+                    rejected_into.append(file)
+                file_path.unlink(missing_ok=True)
+            files_to_rename = valid_files_to_rename
         # A persistent-session download lands in the session dir and, for blob: URLs, is also written to
         # the run dir by the eager carve-out; dedupe the session copy by content so FileUploadBlock uploads
         # one file, not two (SKY-14276). Seed the snapshot only from local paths newly discovered for this
@@ -2221,6 +2269,8 @@ class ForgeAgent:
                     # A listed file that can't be read (vanished mid-finalization, permissions) just
                     # doesn't participate in dedupe — fail open toward materializing, never toward dropping.
                     continue
+        rejected_session_downloads: set[str] = set()
+        uncredited_session_downloads: set[str] = set()
         for file in files_to_rename:
             local_file_name = file
             if file.startswith(("s3://", "gs://")):
@@ -2228,13 +2278,34 @@ class ForgeAgent:
                     file_data = await get_aws_client().download_file(file, log_exception=False)
                 else:
                     file_data = await get_gcs_client().download_file(file, log_exception=False)
-                if not file_data:
+                if file_data is None:
+                    if validate_claimed_type:
+                        uncredited_session_downloads.add(file)
                     continue
+                if not file_data and not validate_claimed_type:
+                    continue
+                local_file_name = file.split("/")[-1]
+                if validate_claimed_type:
+                    applied_download = context.download_suffix_applied_files.get(local_file_name) if context else None
+                    original_filename = applied_download[0] if applied_download else local_file_name
+                    if _payload_contradicts_claimed_type(
+                        file_data, "", original_filename, allow_typed_extensionless_html=True
+                    ):
+                        LOG.warning(
+                            "Rejected downloaded file whose content contradicts its claimed type",
+                            task_id=task.task_id,
+                            workflow_run_id=task.workflow_run_id,
+                        )
+                        if context is not None:
+                            context.record_download_failure(task.task_id, requested_download_failure_reason)
+                        if rejected_into is not None:
+                            rejected_into.append(file)
+                        rejected_session_downloads.add(file)
+                        continue
                 candidate_checksum = hashlib.sha256(file_data).hexdigest()
                 if candidate_checksum in run_dir_checksums:
                     continue
                 run_dir_checksums.add(candidate_checksum)
-                local_file_name = file.split("/")[-1]
                 with open(os.path.join(workflow_download_directory, local_file_name), "wb") as f:
                     f.write(file_data)
 
@@ -2323,7 +2394,11 @@ class ForgeAgent:
             if recorded_into is not None:
                 recorded_into.append(recorded_path)
 
-        return files_to_rename
+        return [
+            file
+            for file in files_to_rename
+            if file not in rejected_session_downloads and file not in uncredited_session_downloads
+        ]
 
     async def _close_claimed_download_popups(
         self,
@@ -3234,6 +3309,7 @@ class ForgeAgent:
                         randomize_if_missing=True,
                         attempt_started_at=attempt_started_at,
                         recorded_into=recorded_now,
+                        validate_claimed_type=False,
                     )
                     if later:
                         recorded_files = [*recorded_files, *_kept_after_recording(later, recorded_now)]
@@ -3275,6 +3351,7 @@ class ForgeAgent:
                     randomize_if_missing=True,
                     attempt_started_at=attempt_started_at,
                     recorded_into=recorded_now,
+                    validate_claimed_type=False,
                 )
                 if not new_files:
                     return None
@@ -4512,6 +4589,7 @@ class ForgeAgent:
             download_suffix=task_block.download_suffix if task_block else None,
             list_files_before=cleanup_list_files_before,
             bundle_step_archives=True,
+            validate_claimed_type=False,
         )
         return step, task
 
@@ -4630,6 +4708,7 @@ class ForgeAgent:
                 close_browser_on_completion=close_browser_on_completion,
                 download_suffix=task_block.download_suffix if task_block else None,
                 list_files_before=download_baseline_files,
+                validate_claimed_type=engine != RunEngine.skyvern_v3,
             )
             return step, None, None
 
@@ -4940,6 +5019,7 @@ class ForgeAgent:
                     task, task_block, organization.organization_id, attempt_started_at=attempt_started_at
                 )
 
+                rejected_downloads: list[str] = []
                 files_to_rename = await self._finalize_downloaded_files_for_task(
                     task,
                     organization_id=organization.organization_id,
@@ -4947,18 +5027,20 @@ class ForgeAgent:
                     list_files_before=list_files_before,
                     randomize_if_missing=True,
                     attempt_started_at=attempt_started_at,
+                    rejected_into=rejected_downloads,
                 )
-                if files_to_rename:
-                    LOG.info(
-                        "Task marked as completed due to download",
-                        task_id=task.task_id,
-                        num_files_before=len(list_files_before),
-                        num_files_after=len(list_files_before) + len(files_to_rename),
-                        new_files=files_to_rename,
-                    )
-                    # The download is durably credited now; close the popup(s) the download action
-                    # opened so the next task does not select one as its working page.
-                    await self._close_credited_download_popups(task, browser_state)
+                if files_to_rename or rejected_downloads:
+                    if files_to_rename:
+                        LOG.info(
+                            "Task marked as completed due to download",
+                            task_id=task.task_id,
+                            num_files_before=len(list_files_before),
+                            num_files_after=len(list_files_before) + len(files_to_rename),
+                            new_files=files_to_rename,
+                        )
+                        # The download is durably credited now; close the popup(s) the download action
+                        # opened so the next task does not select one as its working page.
+                        await self._close_credited_download_popups(task, browser_state)
                     last_step = await self.update_step(step, is_last=True)
                     await app.ARTIFACT_MANAGER.flush_step_archive(step.step_id)
                     # Skip per-step video sync: clean_up_task performs the authoritative final upload.
@@ -4973,6 +5055,7 @@ class ForgeAgent:
                         browser_session_id=browser_session_id,
                         download_completion_pending=True,
                         completion_extracted_information=task.extracted_information,
+                        download_rejections=rejected_downloads,
                     )
                     return last_step, detailed_output, None
 
@@ -5075,6 +5158,13 @@ class ForgeAgent:
                         browser_session_id=browser_session_id,
                         download_suffix=task_block.download_suffix if task_block else None,
                         list_files_before=list_files_before,
+                        download_completion_pending=bool(
+                            is_task_completed
+                            and task_block
+                            and task_block.complete_on_download
+                            and task.workflow_run_id
+                        ),
+                        completion_extracted_information=task.extracted_information,
                     )
                     return last_step, detailed_output, None
                 elif maybe_next_step:
@@ -9886,6 +9976,8 @@ class ForgeAgent:
         download_completion_feedback: list[str] | None = None,
         download_artifact_baseline_count: int | None = 0,
         download_tally_baseline: DownloadTally | None = None,
+        validate_claimed_type: bool = True,
+        download_rejections: list[str] | None = None,
     ) -> Task:
         cleanup_context = skyvern_context.current()
         try:
@@ -9905,6 +9997,8 @@ class ForgeAgent:
                 download_completion_feedback=download_completion_feedback,
                 download_artifact_baseline_count=download_artifact_baseline_count,
                 download_tally_baseline=download_tally_baseline,
+                validate_claimed_type=validate_claimed_type,
+                download_rejections=download_rejections,
             )
         finally:
             if cleanup_context is not None:
@@ -9932,11 +10026,14 @@ class ForgeAgent:
         download_completion_feedback: list[str] | None = None,
         download_artifact_baseline_count: int | None = 0,
         download_tally_baseline: DownloadTally | None = None,
+        validate_claimed_type: bool = True,
+        download_rejections: list[str] | None = None,
     ) -> Task:
         # Keep the capture window alive through settle/finalize; only durable credit permits closing reservations.
         # The outer finally releases ownership on every terminal exit.
         _claim_context = skyvern_context.current()
         _download_popup_state_taken = False
+        rejected_downloads = list(download_rejections or [])
 
         def _take_download_popup_state() -> tuple[list[Page], list[Page]]:
             """Exactly-once: detach the task listener and pop this task's strong claims + late candidates."""
@@ -10036,7 +10133,9 @@ class ForgeAgent:
                     async with asyncio.timeout(SAVE_DOWNLOADED_FILES_TIMEOUT):
                         async with settle_browser_downloads_for_context(browser_context):
                             pass
-                        if download_suffix and list_files_before is not None:
+                        if list_files_before is not None and (
+                            download_suffix or (validate_claimed_type and download_completion_pending)
+                        ):
                             attempt_started_at = await get_download_retry_started_at(
                                 task.organization_id, finalization_run_id
                             )
@@ -10047,6 +10146,8 @@ class ForgeAgent:
                                 list_files_before=list_files_before,
                                 randomize_if_missing=False,
                                 attempt_started_at=attempt_started_at,
+                                validate_claimed_type=validate_claimed_type and download_completion_pending,
+                                rejected_into=rejected_downloads,
                             )
                             # Cleanup finalization is the second durable-credit seam: only when it proves a new
                             # file did the download land, so only then take the claims/late-candidates (now that
@@ -10085,11 +10186,19 @@ class ForgeAgent:
                         browser_session_id = context.browser_session_id if context else None
                         if browser_session_id and task.organization_id and finalization_run_id:
                             try:
+                                rejected_session_uris = [
+                                    uri for uri in rejected_downloads if uri.startswith(("s3://", "gs://"))
+                                ]
+                                claim_arguments: dict[str, Any] = {
+                                    "run_id": finalization_run_id,
+                                    "browser_session_id": browser_session_id,
+                                    "organization_id": task.organization_id,
+                                    "run_started_at": task.created_at,
+                                }
+                                if rejected_session_uris:
+                                    claim_arguments["excluded_uris"] = rejected_session_uris
                                 claimed = await app.DATABASE.artifacts.claim_session_download_artifacts_for_run(
-                                    run_id=finalization_run_id,
-                                    browser_session_id=browser_session_id,
-                                    organization_id=task.organization_id,
-                                    run_started_at=task.created_at,
+                                    **claim_arguments
                                 )
                                 if claimed:
                                     LOG.debug(
@@ -12291,18 +12400,22 @@ class ForgeAgent:
             goal_achieved = False
         if goal_achieved:
             LOG.info(
-                "Step completed and goal achieved, marking task as completed",
+                "Step completed and goal achieved",
                 step_order=step.order,
                 step_retry=step.retry_index,
                 **llm_response_log_metadata(step.output.model_dump() if step.output is not None else None),
             )
             last_step = await self.update_step(step, is_last=True)
             extracted_information = await self.get_extracted_information_for_task(task)
-            await self.update_task(
-                task,
-                status=TaskStatus.completed,
-                extracted_information=extracted_information,
-            )
+            if task_completes_on_download:
+                # Cleanup is the last chance to validate a native download before completion.
+                task.extracted_information = extracted_information
+            else:
+                await self.update_task(
+                    task,
+                    status=TaskStatus.completed,
+                    extracted_information=extracted_information,
+                )
             return True, last_step, None
         if step.is_terminated():
             terminate_action = (
