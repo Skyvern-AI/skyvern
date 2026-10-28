@@ -392,6 +392,9 @@ _COVERED_LAYER: ContextVar[dict[str, Any] | None] = ContextVar("taskv3_covered_l
 _TYPE_REACH: ContextVar[dict[str, bool] | None] = ContextVar("taskv3_type_reach", default=None)
 # A click that raised after the page received it (a slow submit whose navigation had not committed).
 _CLICK_DISPATCHED: ContextVar[bool] = ContextVar("taskv3_click_dispatched", default=False)
+# How a token click went: locator, handle (the resolver's element, after the locator never resolved),
+# handle_failed (that fallback raised), or stale (the node was gone or no longer held the token).
+_CLICK_PATH: ContextVar[str | None] = ContextVar("taskv3_click_path", default=None)
 # Which field shape a field-entry read-back judged (field_commit), so an unconfirmed entry is countable per variant.
 _ENTRY_RECORD: ContextVar[dict[str, Any] | None] = ContextVar("taskv3_entry_record", default=None)
 # The text-delta read's cost and yield for the one tool call this context covers.
@@ -499,6 +502,10 @@ def record_type_reach(*, acted_in_frame: bool, probe_scrolled: bool, hit_on_docu
 
 def record_click_dispatched() -> None:
     _CLICK_DISPATCHED.set(True)
+
+
+def record_click_path(path: str) -> None:
+    _CLICK_PATH.set(path)
 
 
 def record_entry_variant(variant: str) -> None:
@@ -2455,6 +2462,7 @@ _TOOL_CALL_RECORD_FIELDS = frozenset(
         "snapshot_digest",
         "probe_first_time",
         "hit_class",
+        "click_path",
         "hit_needed",
         "hit_probe_seconds",
         "hit_probe_isolated",
@@ -5500,6 +5508,7 @@ async def run_agent_tool_loop(
             _COVERED_LAYER.set(None)
             _TYPE_REACH.set(None)
             _CLICK_DISPATCHED.set(False)
+            _CLICK_PATH.set(None)
             _ENTRY_RECORD.set(None)
             _TEXT_DELTA.set(None)
             _TEXT_DELTA_SHOWN_FRESH.set(0)
@@ -5669,6 +5678,7 @@ async def run_agent_tool_loop(
             if spec is not None and tool_name == "click":
                 hit = _HIT_CLASS.get() or {}
                 cost_fields["hit_class"] = hit.get("hit_class") or "unknown"
+                cost_fields["click_path"] = _CLICK_PATH.get() or "none"
                 # Known for every click whether or not the probe ran, so it stays total alongside the
                 # class. The two qualifiers below are NOT total by design: they describe a reading
                 # that happened, and a fabricated `false` would be indistinguishable from a measured
