@@ -57,11 +57,13 @@ from skyvern.errors.errors import (
 )
 from skyvern.exceptions import (
     BROWSER_CONNECTION_LOST_ERROR_CODE,
+    RUN_FINALIZED_ELSEWHERE_REASON,
     BrowserSessionAlreadyOccupiedError,
     BrowserSessionClosed,
     BrowserSessionDegraded,
     BrowserSessionNotFound,
     BrowserSessionOwnershipConflict,
+    ChildStartRefusedAfterLeaseLoss,
     CompletionGateTerminationError,
     DownloadFileMaxWaitingTime,
     DownloadSaveIncompleteError,
@@ -2617,15 +2619,15 @@ class ForgeAgent:
             task_order=task_order,
             task_retry=task_retry,
         )
-        # Update task status to running
         if await run_lease_lost(workflow_run.workflow_run_id):
-            task = await app.DATABASE.tasks.get_task(task.task_id, task.organization_id) or task
-        else:
-            task = await app.DATABASE.tasks.update_task(
-                task_id=task.task_id,
-                organization_id=task.organization_id,
-                status=TaskStatus.running,
-            )
+            await self.fail_child_task_after_lease_loss(task)
+            raise ChildStartRefusedAfterLeaseLoss(task.task_id)
+        # Update task status to running
+        task = await app.DATABASE.tasks.update_task(
+            task_id=task.task_id,
+            organization_id=task.organization_id,
+            status=TaskStatus.running,
+        )
 
         step = await app.DATABASE.tasks.create_step(
             task.task_id,
@@ -2642,6 +2644,19 @@ class ForgeAgent:
             retry_index=step.retry_index,
         )
         return task, step
+
+    async def fail_child_task_after_lease_loss(self, task: Task) -> None:
+        # Another process owns the run now, so the child this process just created must not stay open.
+        try:
+            await app.DATABASE.tasks.update_task(
+                task_id=task.task_id,
+                organization_id=task.organization_id,
+                status=TaskStatus.failed,
+                failure_reason=RUN_FINALIZED_ELSEWHERE_REASON,
+                keep_final_status=True,
+            )
+        except Exception:
+            LOG.warning("Failed to fail child task after run lease loss", task_id=task.task_id, exc_info=True)
 
     async def create_task_and_step_from_code_block(
         self,
@@ -2667,19 +2682,21 @@ class ForgeAgent:
                 retry=task_retry,
             )
             if await run_lease_lost(workflow_run_id):
-                task = await app.DATABASE.tasks.get_task(task.task_id, organization_id) or task
-            else:
-                task = await app.DATABASE.tasks.update_task(
-                    task_id=task.task_id,
-                    organization_id=organization_id,
-                    status=TaskStatus.running,
-                )
+                await self.fail_child_task_after_lease_loss(task)
+                raise ChildStartRefusedAfterLeaseLoss(task.task_id)
+            task = await app.DATABASE.tasks.update_task(
+                task_id=task.task_id,
+                organization_id=organization_id,
+                status=TaskStatus.running,
+            )
             step = await app.DATABASE.tasks.create_step(
                 task.task_id,
                 order=0,
                 retry_index=0,
                 organization_id=organization_id,
             )
+        except ChildStartRefusedAfterLeaseLoss:
+            raise
         except Exception:
             if task is not None:
                 with contextlib.suppress(Exception):

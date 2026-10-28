@@ -1,4 +1,4 @@
-from datetime import timedelta
+from datetime import datetime, timedelta
 from functools import partial
 
 import structlog
@@ -24,6 +24,12 @@ from skyvern.forge.sdk.workflow.retry_policy import get_recorded_decision
 from skyvern.services import task_v2_service, uploaded_file_service
 
 LOG = structlog.get_logger()
+
+EXPIRED_SCAN_LIMIT = 500
+# One traversal walks the leases already expired when it started, page by page in (heartbeat_at, run_id) order.
+# None for both starts a new traversal from the oldest expired lease.
+_scan_cutoff: datetime | None = None
+_scan_after: tuple[datetime, str] | None = None
 
 
 async def _api_key(organization_id: str) -> str | None:
@@ -260,8 +266,18 @@ async def reap_orphaned_runs_once() -> None:
         exception_name=WORKER_CONTAINER_RESTARTED_REASON_CODE,
         fallback_to_unknown=True,
     )
+    global _scan_after, _scan_cutoff
     repository = app.DATABASE.run_execution_leases
-    expired = await repository.get_expired(naive_utc_now() - timedelta(minutes=timeout), limit=500)
+    if _scan_cutoff is None:
+        _scan_cutoff = naive_utc_now() - timedelta(minutes=timeout)
+    expired = await repository.get_expired(_scan_cutoff, limit=EXPIRED_SCAN_LIMIT, after=_scan_after)
+    # Leases this pass cannot reap (registered here, lost claims, failing reaps) stay expired; resuming after this
+    # page keeps them from hiding younger expired leases. The cutoff stays fixed for the traversal, so leases that
+    # expire meanwhile wait for the next one instead of keeping every page full; a short page starts a new traversal.
+    if len(expired) == EXPIRED_SCAN_LIMIT:
+        _scan_after = (expired[-1].heartbeat_at, expired[-1].run_id)
+    else:
+        _scan_after = _scan_cutoff = None
     reaper_id = owner_id() + ":reaper"
     for lease in expired:
         if is_run_registered(lease.run_id):
