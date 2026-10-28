@@ -57,30 +57,39 @@ async def _workflow_side_effects(run: WorkflowRun, attempt_number: int | None, h
         await app.WORKFLOW_SERVICE.execute_workflow_webhook(run, api_key, claim_kind=None, finalizer="orphan_reaper")
 
 
-async def _task_v2_side_effects(run: WorkflowRun, task: TaskV2) -> None:
+async def _reload_task_v2(run_id: str, task: TaskV2) -> TaskV2:
     try:
-        task = await app.DATABASE.observer.get_task_v2(task.observer_cruise_id, task.organization_id) or task
+        return await app.DATABASE.observer.get_task_v2(task.observer_cruise_id, task.organization_id) or task
     except Exception:
-        LOG.warning("Failed to reload reaped task v2", run_id=run.workflow_run_id, exc_info=True)
+        LOG.warning("Failed to reload reaped task v2", run_id=run_id, exc_info=True)
+        return task
+
+
+async def _reload_task(task: Task) -> Task:
+    try:
+        return await app.DATABASE.tasks.get_task(task.task_id, task.organization_id) or task
+    except Exception:
+        LOG.warning("Failed to reload reaped task", run_id=task.task_id, exc_info=True)
+        return task
+
+
+# The runs list is synced before effects are queued: a saturated or cancelled effect queue must not leave it running.
+async def _sync_task_v2_run(run_id: str, organization_id: str, task: TaskV2) -> None:
+    task = await _reload_task_v2(run_id, task)
     try:
         await app.DATABASE.tasks.sync_task_run_status(
-            organization_id=run.organization_id,
+            organization_id=organization_id,
             run_id=task.observer_cruise_id,
             status=task.status.value,
             started_at=task.started_at,
             finished_at=task.finished_at,
         )
     except Exception:
-        LOG.warning("Failed to sync reaped task v2", run_id=run.workflow_run_id, exc_info=True)
-    await uploaded_file_service.delete_files_attached_to_run(run_id=run.workflow_run_id)
-    await task_v2_service.send_task_v2_webhook(task)
+        LOG.warning("Failed to sync reaped task v2", run_id=run_id, exc_info=True)
 
 
-async def _task_side_effects(task: Task) -> None:
-    try:
-        task = await app.DATABASE.tasks.get_task(task.task_id, task.organization_id) or task
-    except Exception:
-        LOG.warning("Failed to reload reaped task", run_id=task.task_id, exc_info=True)
+async def _sync_task_run(task: Task) -> None:
+    task = await _reload_task(task)
     try:
         await app.DATABASE.tasks.sync_task_run_status(
             organization_id=task.organization_id,
@@ -91,6 +100,16 @@ async def _task_side_effects(task: Task) -> None:
         )
     except Exception:
         LOG.warning("Failed to sync reaped task", run_id=task.task_id, exc_info=True)
+
+
+async def _task_v2_side_effects(run: WorkflowRun, task: TaskV2) -> None:
+    task = await _reload_task_v2(run.workflow_run_id, task)
+    await uploaded_file_service.delete_files_attached_to_run(run_id=run.workflow_run_id)
+    await task_v2_service.send_task_v2_webhook(task)
+
+
+async def _task_side_effects(task: Task) -> None:
+    task = await _reload_task(task)
     await uploaded_file_service.delete_files_attached_to_run(run_id=task.task_id)
     api_key = await _api_key(task.organization_id)
     if api_key:
@@ -126,6 +145,7 @@ async def _reap_workflow(lease: RunExecutionLease, reason: str, category: list[d
             )
             if finalized is None:
                 return False
+            await _sync_task_v2_run(lease.run_id, run.organization_id, task_v2)
         else:
             task_v2 = task_v2.model_copy(
                 update={
@@ -134,6 +154,7 @@ async def _reap_workflow(lease: RunExecutionLease, reason: str, category: list[d
                     "finished_at": task_v2.finished_at or naive_utc_now(),
                 }
             )
+            await _sync_task_v2_run(lease.run_id, run.organization_id, task_v2)
             try:
                 finalized = await app.WORKFLOW_SERVICE.mark_workflow_run_as_failed_if_not_final(
                     lease.run_id,
@@ -216,6 +237,7 @@ async def _reap_task(lease: RunExecutionLease, reason: str) -> bool:
         )
     except Exception:
         LOG.warning("Failed to finalize steps for reaped task", run_id=lease.run_id, exc_info=True)
+    await _sync_task_run(task)
     schedule_side_effects(partial(_task_side_effects, task))
     LOG.info(
         "Reaped orphaned task",
