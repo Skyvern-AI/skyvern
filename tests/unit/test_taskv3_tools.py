@@ -45894,3 +45894,247 @@ async def test_an_ordinary_field_typed_with_enter_keeps_its_immediate_read_back(
         r = await _tool(tools, "type").handler({"selector": "#code", "text": "555123", "press_enter": True})
         enters = await page.evaluate("window.enters")
     assert (r.status, r.ok_class, enters) == ("ok", None, 1), (r.status, r.ok_class, enters, r.content)
+
+
+_MORE_BUTTON = "<button onclick='document.body.dataset.hit=1'>See more results</button>"
+_FRAMED_MORE_PAGE = (
+    "<!doctype html><html><body><h1>results</h1>"
+    + "".join(
+        f'<iframe srcdoc="<p>panel {i}</p><button>Open {i}</button>" width="400" height="80"></iframe>' for i in (1, 2)
+    )
+    + f'<iframe srcdoc="<p>panel 3</p>{_MORE_BUTTON}" width="400" height="80"></iframe></body></html>'
+)
+# The target two frames deep, below the fold, on a page that scrolls smoothly.
+_NESTED_SMOOTH_PAGE = (
+    "<!doctype html><html style='scroll-behavior:smooth'><body><h1>results</h1><div style='height:1400px'></div>"
+    "<iframe width='500' height='200' style='border:7px solid;padding:9px' srcdoc=\"<p>outer</p>"
+    "<iframe width='400' height='120' style='margin-left:40px' srcdoc='<p>inner</p>"
+    "<button onclick=&quot;document.body.dataset.hit=1&quot;>See more results</button>'></iframe>\"></iframe>"
+    "</body></html>"
+)
+
+
+def _transformed_frame_page(frame_style: str) -> str:
+    # A 400x200 frame whose target sits at (300, 100), with other controls at (200, 50) and (100, 100).
+    controls = (
+        "<button style='position:absolute;left:180px;top:40px;width:40px;height:20px' "
+        "onclick='document.body.dataset.hit=2'>Open other</button>"
+        "<button style='position:absolute;left:80px;top:90px;width:40px;height:20px' "
+        "onclick='document.body.dataset.hit=3'>Open mirrored</button>"
+        "<button style='position:absolute;left:280px;top:90px;width:40px;height:20px' "
+        "onclick='document.body.dataset.hit=1'>See more results</button>"
+    )
+    return (
+        "<!doctype html><html><body style='margin:0'><div style='height:250px'></div>"
+        f"<iframe width='400' height='200' style='border:0;{frame_style}' "
+        f'srcdoc="<body style=&quot;margin:0&quot;>{controls}"></iframe></body></html>'
+    )
+
+
+async def _framed_more_ref(tools: list[Any]) -> str:
+    observed = await _tool(tools, "observe").handler({})
+    match = re.search(r"^ref=(\d+) .*See more results", observed.content, re.MULTILINE)
+    assert match, observed.content
+    return f"ref={match.group(1)}"
+
+
+async def _hits(page: Any) -> list[str]:
+    return [h for h in [await frame.evaluate("() => document.body.dataset.hit || ''") for frame in page.frames] if h]
+
+
+def _driver_click_failure(monkeypatch: pytest.MonkeyPatch, call_log: str, before: Any = None) -> None:
+    # The driver's selector engine failing on a marker the resolver counts once, which offline Chromium never
+    # produces on its own; every other dispatch goes through unchanged.
+    real_click = input_dispatch.click
+
+    async def click(realm: Any, target: Any, **options: Any) -> None:
+        if isinstance(target, str) and target.startswith('[data-tv3-act="'):
+            if before is not None:
+                await before(realm, target)
+            raise _PlaywrightTimeout(
+                f'Timeout 15000ms exceeded.\nCall log:\n  - waiting for locator("{target}")\n{call_log}'
+            )
+        await real_click(realm, target, **options)
+
+    monkeypatch.setattr(input_dispatch, "click", click)
+
+
+def _spy_click_handle(monkeypatch: pytest.MonkeyPatch) -> list[Any]:
+    calls: list[Any] = []
+    real_click_handle = input_dispatch.click_handle
+
+    async def click_handle(realm: Any, handle: Any, **options: Any) -> None:
+        calls.append(handle)
+        await real_click_handle(realm, handle, **options)
+
+    monkeypatch.setattr(input_dispatch, "click_handle", click_handle)
+    return calls
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "html",
+    [
+        _FRAMED_MORE_PAGE,
+        _NESTED_SMOOTH_PAGE,
+        _transformed_frame_page("transform:rotate(90deg);transform-origin:0 0;margin-left:300px"),
+        _transformed_frame_page("transform:scale(0.6);transform-origin:0 0"),
+        f"<!doctype html><html><body>{_MORE_BUTTON}</body></html>",
+    ],
+    ids=["child_frame", "nested_smooth_scroll", "rotated_frame", "scaled_frame", "main_frame"],
+)
+async def test_a_marker_the_driver_locator_cannot_find_is_clicked_through_its_live_handle(
+    monkeypatch: pytest.MonkeyPatch, html: str
+) -> None:
+    _driver_click_failure(monkeypatch, "")
+    handle_clicks = _spy_click_handle(monkeypatch)
+    async with _live_page(html) as page:
+        tools = build_browser_tools(_fixed_page_provider(page))
+        ref = await _framed_more_ref(tools)
+        started = time.monotonic()
+        result = await _tool(tools, "click").handler({"selector": ref})
+        elapsed = time.monotonic() - started
+        assert result.status == "ok", result.content
+        assert await _hits(page) == ["1"]
+    assert taskv3_loop._CLICK_PATH.get() == "handle"
+    assert len(handle_clicks) == 1
+    assert elapsed < 5
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+async def test_a_mark_the_driver_locator_cannot_find_is_clicked_through_its_live_handle(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _driver_click_failure(monkeypatch, "")
+    handle_clicks = _spy_click_handle(monkeypatch)
+    async with _live_page(f"<!doctype html><html><body>{_MORE_BUTTON}</body></html>") as page:
+        tools = build_browser_tools(_fixed_page_provider(page))
+        await _tool(tools, "look").handler({})
+        result = await _tool(tools, "click").handler({"mark": 1})
+        assert result.status == "ok", result.content
+        assert await _hits(page) == ["1"]
+    assert (taskv3_loop._CLICK_PATH.get(), len(handle_clicks)) == ("handle", 1)
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+async def test_a_node_that_lost_its_token_before_the_fallback_is_stale_and_never_clicked(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def strip_token(realm: Any, target: str) -> None:
+        await realm.evaluate("(sel) => document.querySelector(sel).removeAttribute('data-tv3-act')", target)
+
+    _driver_click_failure(monkeypatch, "", before=strip_token)
+    handle_clicks = _spy_click_handle(monkeypatch)
+    async with _live_page(_FRAMED_MORE_PAGE) as page:
+        tools = build_browser_tools(_fixed_page_provider(page))
+        result = await _tool(tools, "click").handler({"selector": await _framed_more_ref(tools)})
+        assert await _hits(page) == []
+    assert result.error_class == "stale_selector", result.content
+    assert handle_clicks == []
+
+
+async def _cover_marker(realm: Any, target: str) -> None:
+    await realm.evaluate(
+        "(sel) => { const r = document.querySelector(sel).getBoundingClientRect();"
+        " const d = document.createElement('div');"
+        " d.style.cssText = `position:fixed;left:${r.left - 4}px;top:${r.top - 4}px;"
+        "width:${r.width + 8}px;height:${r.height + 8}px;z-index:9`; document.body.appendChild(d); }",
+        target,
+    )
+
+
+async def _cover_hosting_frame_in_parent(realm: Any, target: str) -> None:
+    await realm.page.evaluate(
+        "() => { const r = document.querySelectorAll('iframe')[2].getBoundingClientRect();"
+        " const d = document.createElement('div');"
+        " d.style.cssText = `position:fixed;left:${r.left}px;top:${r.top}px;"
+        "width:${r.width}px;height:${r.height}px;z-index:9`; document.body.appendChild(d); }"
+    )
+
+
+async def _disable_marker(realm: Any, target: str) -> None:
+    await realm.evaluate("(sel) => { document.querySelector(sel).disabled = true; }", target)
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "obstruct",
+    [_cover_marker, _cover_hosting_frame_in_parent, _disable_marker],
+    ids=["in_frame", "in_parent", "disabled"],
+)
+async def test_the_handle_fallback_clicks_nothing_the_driver_would_not_click(
+    monkeypatch: pytest.MonkeyPatch, obstruct: Any
+) -> None:
+    monkeypatch.setattr(taskv3_tools, "_ACTION_TIMEOUT_MS", 800)
+    _driver_click_failure(monkeypatch, "", before=obstruct)
+    async with _live_page(_FRAMED_MORE_PAGE) as page:
+        tools = build_browser_tools(_fixed_page_provider(page))
+        ref = await _framed_more_ref(tools)
+        try:
+            result = await _tool(tools, "click").handler({"selector": ref})
+        except _PlaywrightTimeout:
+            result = None
+        assert result is None or result.status == "error", result.content
+        assert await _hits(page) == []
+    assert taskv3_loop._CLICK_PATH.get() == "handle_failed"
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+async def test_a_cover_whose_text_says_not_attached_reads_as_covered_not_stale(monkeypatch: pytest.MonkeyPatch) -> None:
+    async def cover_with_text(realm: Any, target: str) -> None:
+        await _cover_marker(realm, target)
+        await realm.evaluate("() => { document.body.lastElementChild.textContent = 'Resume not attached'; }")
+
+    monkeypatch.setattr(taskv3_tools, "_ACTION_TIMEOUT_MS", 800)
+    _driver_click_failure(monkeypatch, "", before=cover_with_text)
+    async with _live_page(_FRAMED_MORE_PAGE) as page:
+        tools = build_browser_tools(_fixed_page_provider(page))
+        result = await _tool(tools, "click").handler({"selector": await _framed_more_ref(tools)})
+    assert result.status == "error" and result.error_class != "stale_selector", result.content
+    assert taskv3_loop._CLICK_PATH.get() == "handle_failed"
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+async def test_a_marker_whose_element_is_gone_fails_fast_as_stale(monkeypatch: pytest.MonkeyPatch) -> None:
+    async def remove(realm: Any, target: str) -> None:
+        await realm.evaluate("(sel) => document.querySelector(sel).remove()", target)
+
+    _driver_click_failure(monkeypatch, "", before=remove)
+    async with _live_page(_FRAMED_MORE_PAGE) as page:
+        tools = build_browser_tools(_fixed_page_provider(page))
+        gone = await _tool(tools, "click").handler({"selector": await _framed_more_ref(tools)})
+    assert gone.error_class == "stale_selector", gone.content
+    assert taskv3_loop._CLICK_PATH.get() == "stale"
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+async def test_an_actionability_timeout_never_takes_the_handle_fallback(monkeypatch: pytest.MonkeyPatch) -> None:
+    _driver_click_failure(
+        monkeypatch,
+        "  - locator resolved to <button>See more results</button>\n  - waiting for element to be visible\n",
+    )
+    async with _live_page(_FRAMED_MORE_PAGE) as page:
+        tools = build_browser_tools(_fixed_page_provider(page))
+        with pytest.raises(_PlaywrightTimeout):
+            await _tool(tools, "click").handler({"selector": await _framed_more_ref(tools)})
+        assert await _hits(page) == []
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+async def test_the_fallback_trigger_reads_the_installed_driver_call_log() -> None:
+    # The trigger matches call-log text, which is not driver API: this reds when a driver upgrade rewords it.
+    async with _live_page("<button style='display:none'>hidden</button>") as page:
+        with pytest.raises(_PlaywrightTimeout) as missing:
+            await page.click('[data-tv3-act="absent"]', timeout=300)
+        with pytest.raises(_PlaywrightTimeout) as hidden:
+            await page.click("button", timeout=300)
+    assert taskv3_tools._locator_never_resolved(missing.value)
+    assert not taskv3_tools._locator_never_resolved(hidden.value)
