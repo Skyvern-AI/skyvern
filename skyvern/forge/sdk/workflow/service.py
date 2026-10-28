@@ -97,6 +97,7 @@ from skyvern.forge.failure_classifier import (
     with_saved_profile_signed_out,
     with_sign_in_form_visible,
 )
+from skyvern.forge.final_failure_diagnostic import annotate_failed_workflow_run
 from skyvern.forge.prompts import prompt_engine
 from skyvern.forge.sdk.api.files import is_temp_working_dir, resolve_run_download_id
 from skyvern.forge.sdk.artifact.models import Artifact, ArtifactType
@@ -154,6 +155,7 @@ from skyvern.forge.sdk.models import Step, StepStatus
 from skyvern.forge.sdk.schemas.browser_profiles import BrowserProfile
 from skyvern.forge.sdk.schemas.credentials import Credential, credential_auto_profile_disabled
 from skyvern.forge.sdk.schemas.files import FileInfo
+from skyvern.forge.sdk.schemas.har_evidence import HarEvidence, HarEvidenceAvailability
 from skyvern.forge.sdk.schemas.organizations import Organization
 from skyvern.forge.sdk.schemas.persistent_browser_sessions import (
     API_BROWSER_SESSION_CREATED_BY,
@@ -1015,6 +1017,14 @@ def _workflow_block_engine_attribution_for_duration_log(workflow_run_id: str) ->
 
 def _run_lease_attempt_kwargs(key: str, attempt_number: int | None) -> dict[str, Any]:
     return {key: attempt_number} if run_lease_tasks_enabled() else {}
+
+
+def _record_terminal_write(on_terminal_write: Callable[[WorkflowRun], None] | None, workflow_run: WorkflowRun) -> None:
+    """Hands a caller the snapshot its own conditional terminal write returned; a failing capture never blocks
+    the terminal bookkeeping that follows."""
+    if on_terminal_write is not None:
+        with suppress(Exception):
+            on_terminal_write(workflow_run)
 
 
 def _get_workflow_run_max_elapsed_timeout_seconds(workflow_run: WorkflowRun) -> float:
@@ -6285,6 +6295,7 @@ class WorkflowService:
         pre_finally_failure_reason: str | None,
         timeout_failure_reason: str,
         require_latest_attempt_number: int | None = None,
+        _on_terminal_write: Callable[[WorkflowRun], None] | None = None,
     ) -> tuple[WorkflowRun, WorkflowRunStatus | None, str | None]:
         if pre_finally_status is None or not pre_finally_status.is_final():
             if refreshed_workflow_run := await app.DATABASE.workflow_runs.get_workflow_run(
@@ -6307,6 +6318,7 @@ class WorkflowService:
                 failure_reason=timeout_failure_reason,
                 fallback_workflow_run=workflow_run,
                 **_run_lease_attempt_kwargs("require_latest_attempt_number", require_latest_attempt_number),
+                _on_terminal_write=_on_terminal_write,
             )
             pre_finally_status = WorkflowRunStatus.timed_out
             pre_finally_failure_reason = timeout_failure_reason
@@ -6322,6 +6334,7 @@ class WorkflowService:
         pre_finally_failure_reason: str | None,
         timeout_failure_reason: str,
         require_latest_attempt_number: int | None = None,
+        _on_terminal_write: Callable[[WorkflowRun], None] | None = None,
     ) -> tuple[WorkflowRun, WorkflowRunStatus | None, str | None]:
         handle_timeout_task = asyncio.create_task(
             self._handle_post_run_elapsed_timeout(
@@ -6332,6 +6345,7 @@ class WorkflowService:
                 pre_finally_failure_reason=pre_finally_failure_reason,
                 timeout_failure_reason=timeout_failure_reason,
                 **_run_lease_attempt_kwargs("require_latest_attempt_number", require_latest_attempt_number),
+                _on_terminal_write=_on_terminal_write,
             ),
             name=f"post_run_elapsed_timeout_{workflow_run_id}",
         )
@@ -6355,6 +6369,7 @@ class WorkflowService:
                         failure_reason=timeout_failure_reason,
                         fallback_workflow_run=workflow_run,
                         **_run_lease_attempt_kwargs("require_latest_attempt_number", require_latest_attempt_number),
+                        _on_terminal_write=_on_terminal_write,
                     )
                 )
                 return fallback_workflow_run, WorkflowRunStatus.timed_out, timeout_failure_reason
@@ -6956,6 +6971,14 @@ class WorkflowService:
         attempt_fence_kwargs: dict[str, Any] = (
             {"require_latest_attempt_number": attempt_number} if run_lease_tasks_enabled() else {}
         )
+        # The snapshot this invocation's own conditional terminal write returned owns the final diagnostic; a
+        # reload or a refused write never does.
+        final_diagnostic_owner: WorkflowRun | None = None
+
+        def capture_owner(written: WorkflowRun) -> None:
+            nonlocal final_diagnostic_owner
+            if written.workflow_run_id == workflow_run_id and written.organization_id == organization_id:
+                final_diagnostic_owner = written
 
         LOG.info(
             "Executing workflow",
@@ -7001,9 +7024,13 @@ class WorkflowService:
                     attempt_number=attempt_number,
                     dispatch_claim_started_at=dispatch_claim_started_at,
                     failure_reason=failure_reason,
+                    _on_terminal_write=capture_owner,
                 )
             return await self.mark_workflow_run_as_failed(
-                workflow_run_id=workflow_run_id, failure_reason=failure_reason, **attempt_fence_kwargs
+                workflow_run_id=workflow_run_id,
+                failure_reason=failure_reason,
+                **attempt_fence_kwargs,
+                _on_terminal_write=capture_owner,
             )
 
         if not workflow.workflow_definition.blocks:
@@ -7027,6 +7054,7 @@ class WorkflowService:
                 close_browser_on_completion=close_browser_on_completion,
                 need_call_webhook=need_call_webhook,
                 attempt_number=attempt_number,
+                final_diagnostic_owner=final_diagnostic_owner,
             )
             return workflow_run
 
@@ -7059,6 +7087,7 @@ class WorkflowService:
                     close_browser_on_completion=close_browser_on_completion,
                     need_call_webhook=need_call_webhook,
                     attempt_number=attempt_number,
+                    final_diagnostic_owner=final_diagnostic_owner,
                 )
                 return workflow_run
 
@@ -7087,6 +7116,7 @@ class WorkflowService:
                 close_browser_on_completion=close_browser_on_completion,
                 need_call_webhook=need_call_webhook,
                 attempt_number=attempt_number,
+                final_diagnostic_owner=final_diagnostic_owner,
             )
             return workflow_run
 
@@ -7109,6 +7139,7 @@ class WorkflowService:
                 attempt_number=attempt_number,
                 dispatch_claim_started_at=dispatch_claim_started_at,
                 failure_reason=get_user_facing_exception_message(error),
+                _on_terminal_write=capture_owner,
             )
             if failed_run is None:
                 return await self.get_workflow_run(workflow_run_id=workflow_run_id, organization_id=organization_id)
@@ -7121,6 +7152,7 @@ class WorkflowService:
                 close_browser_on_completion=close_browser_on_completion,
                 need_call_webhook=need_call_webhook,
                 attempt_number=attempt_number,
+                final_diagnostic_owner=final_diagnostic_owner,
             )
             return workflow_run
 
@@ -7336,6 +7368,7 @@ class WorkflowService:
                 attempt_number=attempt_number,
                 dispatch_claim_started_at=dispatch_claim_started_at,
                 failure_reason=failure_reason,
+                _on_terminal_write=capture_owner,
             )
             if failed_run is None:
                 return await self.get_workflow_run(workflow_run_id=workflow_run_id, organization_id=organization_id)
@@ -7348,6 +7381,7 @@ class WorkflowService:
                 close_browser_on_completion=close_browser_on_completion,
                 need_call_webhook=need_call_webhook,
                 attempt_number=attempt_number,
+                final_diagnostic_owner=final_diagnostic_owner,
             )
             return workflow_run
 
@@ -7390,13 +7424,17 @@ class WorkflowService:
                         attempt_number=attempt_number,
                         dispatch_claim_started_at=dispatch_claim_started_at,
                         failure_reason=failure_reason,
+                        _on_terminal_write=capture_owner,
                     )
                     if failed is None:
                         return await self.get_workflow_run(workflow_run_id, organization_id)
                     workflow_run = failed
                 else:
                     workflow_run = await self.mark_workflow_run_as_failed(
-                        workflow_run_id=workflow_run_id, failure_reason=failure_reason, **attempt_fence_kwargs
+                        workflow_run_id=workflow_run_id,
+                        failure_reason=failure_reason,
+                        **attempt_fence_kwargs,
+                        _on_terminal_write=capture_owner,
                     )
                 await self.clean_up_workflow(
                     workflow=workflow,
@@ -7406,6 +7444,7 @@ class WorkflowService:
                     close_browser_on_completion=False,
                     need_call_webhook=need_call_webhook,
                     attempt_number=attempt_number,
+                    final_diagnostic_owner=final_diagnostic_owner,
                 )
                 return workflow_run
 
@@ -7493,6 +7532,7 @@ class WorkflowService:
                         dispatch_claim_started_at=dispatch_claim_started_at,
                         failure_reason=failure_reason,
                         failure_category=lease_failure_category,
+                        _on_terminal_write=capture_owner,
                     )
                     if failed is None:
                         return await self.get_workflow_run(workflow_run_id, organization_id)
@@ -7503,6 +7543,7 @@ class WorkflowService:
                         failure_reason=failure_reason,
                         failure_category=lease_failure_category,
                         **attempt_fence_kwargs,
+                        _on_terminal_write=capture_owner,
                     )
                 await self.clean_up_workflow(
                     workflow=workflow,
@@ -7513,6 +7554,7 @@ class WorkflowService:
                     need_call_webhook=need_call_webhook,
                     attempt_number=attempt_number,
                     owned_browser_session_id=owned_browser_session_id,
+                    final_diagnostic_owner=final_diagnostic_owner,
                 )
                 return workflow_run
             # Start background task to periodically renew the browser session
@@ -7599,6 +7641,7 @@ class WorkflowService:
                     script=workflow_script,
                     script_is_pinned=script_is_pinned,
                     **attempt_fence_kwargs,
+                    _on_terminal_write=capture_owner,
                 )
 
             if max_elapsed_timeout_seconds <= 0:
@@ -7610,6 +7653,7 @@ class WorkflowService:
                     failure_reason=pre_finally_failure_reason,
                     fallback_workflow_run=workflow_run,
                     **attempt_fence_kwargs,
+                    _on_terminal_write=capture_owner,
                 )
                 pre_finally_status = WorkflowRunStatus.timed_out
                 pre_finally_browser_persistence_status = pre_finally_status
@@ -7633,6 +7677,7 @@ class WorkflowService:
                         failure_reason=pre_finally_failure_reason,
                         fallback_workflow_run=workflow_run,
                         **attempt_fence_kwargs,
+                        _on_terminal_write=capture_owner,
                     )
                     pre_finally_status = WorkflowRunStatus.timed_out
                     pre_finally_browser_persistence_status = pre_finally_status
@@ -7652,6 +7697,7 @@ class WorkflowService:
                     pre_finally_failure_reason=pre_finally_failure_reason,
                     timeout_failure_reason=_require_elapsed_timeout_failure_reason(timeout_failure_reason),
                     **attempt_fence_kwargs,
+                    _on_terminal_write=capture_owner,
                 )
                 pre_finally_browser_persistence_status = pre_finally_status
                 return workflow_run
@@ -7823,6 +7869,7 @@ class WorkflowService:
                                 pre_finally_status=status_before_finally_result,
                                 pre_finally_failure_reason=failure_reason_before_finally_result,
                                 defer_status_write=True,
+                                _on_terminal_write=capture_owner,
                             )
             except TimeoutError:
                 if not post_run_timeout_context.expired():
@@ -7839,6 +7886,7 @@ class WorkflowService:
                     pre_finally_failure_reason=pre_finally_failure_reason,
                     timeout_failure_reason=_require_elapsed_timeout_failure_reason(timeout_failure_reason),
                     **attempt_fence_kwargs,
+                    _on_terminal_write=capture_owner,
                 )
                 if pre_finally_browser_persistence_status is None:
                     # A timeout before the body outcome was captured must retain
@@ -7965,6 +8013,7 @@ class WorkflowService:
                             run_minutes_recorded_through=run_minutes_recorded_through,
                             lost_external_browser=run_lost_external_browser,
                             attempt_number=attempt_number if run_lease_tasks_enabled() else None,
+                            _on_terminal_write=capture_owner,
                         )
                     )
                 except BaseException:
@@ -8017,6 +8066,7 @@ class WorkflowService:
                             dispatch_claim_started_at=dispatch_claim_started_at,
                             failure_reason=failure_reason,
                             failure_category=failure_category,
+                            _on_terminal_write=capture_owner,
                         )
                         if browser_dispatch
                         else self.mark_workflow_run_as_failed_if_not_final(
@@ -8025,6 +8075,7 @@ class WorkflowService:
                             failure_category=failure_category,
                             cascade_children=True,
                             **attempt_fence_kwargs,
+                            _on_terminal_write=capture_owner,
                         )
                     )
                     while not finalize_task.done():
@@ -8088,6 +8139,7 @@ class WorkflowService:
                 skip_browser_session_write_back=browser_write_back_exhausted,
                 schedule_credential_fallback_retry=not finally_block_set_terminal_outcome,
                 owned_browser_session_id=owned_browser_session_id,
+                final_diagnostic_owner=final_diagnostic_owner,
             )
 
         return workflow_run
@@ -8153,6 +8205,7 @@ class WorkflowService:
         script: Script | None = None,
         script_is_pinned: bool = False,
         require_latest_attempt_number: int | None = None,
+        _on_terminal_write: Callable[[WorkflowRun], None] | None = None,
     ) -> tuple[WorkflowRun, set[str]]:
         organization_id = organization.organization_id
         workflow_run_id = workflow_run.workflow_run_id
@@ -8546,6 +8599,7 @@ class WorkflowService:
                 blocks_to_update=blocks_to_update,
                 denied_cached_labels=denied_cached_labels,
                 **attempt_fence_kwargs,
+                _on_terminal_write=_on_terminal_write,
             )
 
         #
@@ -8574,6 +8628,7 @@ class WorkflowService:
                 blocks_to_update=blocks_to_update,
                 denied_cached_labels=denied_cached_labels,
                 **attempt_fence_kwargs,
+                _on_terminal_write=_on_terminal_write,
             )
 
             if should_stop:
@@ -8760,6 +8815,7 @@ class WorkflowService:
         blocks_to_update: set[str],
         denied_cached_labels: frozenset[str] = frozenset(),
         require_latest_attempt_number: int | None = None,
+        _on_terminal_write: Callable[[WorkflowRun], None] | None = None,
     ) -> tuple[WorkflowRun, set[str]]:
         attempt_fence_kwargs: dict[str, Any] = (
             {"require_latest_attempt_number": require_latest_attempt_number} if run_lease_tasks_enabled() else {}
@@ -8785,6 +8841,7 @@ class WorkflowService:
                 workflow_run_id=workflow_run.workflow_run_id,
                 failure_reason=str(exc),
                 **attempt_fence_kwargs,
+                _on_terminal_write=_on_terminal_write,
             )
             return workflow_run, blocks_to_update
 
@@ -8810,6 +8867,7 @@ class WorkflowService:
                     workflow_run_id=workflow_run.workflow_run_id,
                     failure_reason=f"Unable to find block with label {current_label}",
                     **attempt_fence_kwargs,
+                    _on_terminal_write=_on_terminal_write,
                 )
                 break
 
@@ -8844,6 +8902,7 @@ class WorkflowService:
                 parent_workflow_run_block_id=parent_wrb_id,
                 denied_cached_labels=denied_cached_labels,
                 **attempt_fence_kwargs,
+                _on_terminal_write=_on_terminal_write,
             )
 
             # Track conditional workflow_run_block_ids so branch targets
@@ -8895,6 +8954,7 @@ class WorkflowService:
                     workflow_run_id=workflow_run.workflow_run_id,
                     failure_reason=f"Next block label {next_label} not found in workflow definition",
                     **attempt_fence_kwargs,
+                    _on_terminal_write=_on_terminal_write,
                 )
                 break
 
@@ -8911,6 +8971,7 @@ class WorkflowService:
                     workflow_run_id=workflow_run.workflow_run_id,
                     failure_reason=f"Cycle detected while traversing workflow definition at block {next_label}",
                     **attempt_fence_kwargs,
+                    _on_terminal_write=_on_terminal_write,
                 )
                 break
 
@@ -8937,6 +8998,7 @@ class WorkflowService:
         parent_workflow_run_block_id: str | None = None,
         denied_cached_labels: frozenset[str] = frozenset(),
         require_latest_attempt_number: int | None = None,
+        _on_terminal_write: Callable[[WorkflowRun], None] | None = None,
     ) -> tuple[WorkflowRun, set[str], BlockResult | None, bool, dict[str, Any] | None]:
         attempt_fence_kwargs: dict[str, Any] = (
             {"require_latest_attempt_number": require_latest_attempt_number} if run_lease_tasks_enabled() else {}
@@ -9078,7 +9140,10 @@ class WorkflowService:
                 else:
                     no_block_result_reason = "Block result is None"
                 updated_workflow_run = await self.mark_workflow_run_as_failed_if_not_final(
-                    workflow_run_id=workflow_run_id, failure_reason=no_block_result_reason, **attempt_fence_kwargs
+                    workflow_run_id=workflow_run_id,
+                    failure_reason=no_block_result_reason,
+                    **attempt_fence_kwargs,
+                    _on_terminal_write=_on_terminal_write,
                 )
                 workflow_run = updated_workflow_run or await self._current_row_after_lost_finalize(
                     workflow_run_id, workflow_run
@@ -9114,6 +9179,7 @@ class WorkflowService:
                 workflow_run=workflow_run,
                 workflow_run_id=workflow_run_id,
                 **attempt_fence_kwargs,
+                _on_terminal_write=_on_terminal_write,
             )
 
             # Generate pending script after block completes successfully
@@ -9136,7 +9202,10 @@ class WorkflowService:
 
             failure_reason = f"{block.block_type} block failed. failure reason: {exception_message}"
             updated_workflow_run = await self.mark_workflow_run_as_failed_if_not_final(
-                workflow_run_id=workflow_run_id, failure_reason=failure_reason, **attempt_fence_kwargs
+                workflow_run_id=workflow_run_id,
+                failure_reason=failure_reason,
+                **attempt_fence_kwargs,
+                _on_terminal_write=_on_terminal_write,
             )
             workflow_run = updated_workflow_run or await self._current_row_after_lost_finalize(
                 workflow_run_id, workflow_run
@@ -10527,6 +10596,7 @@ class WorkflowService:
         workflow_run: WorkflowRun,
         workflow_run_id: str,
         require_latest_attempt_number: int | None = None,
+        _on_terminal_write: Callable[[WorkflowRun], None] | None = None,
     ) -> tuple[WorkflowRun, bool]:
         attempt_fence_kwargs: dict[str, Any] = (
             {"require_latest_attempt_number": require_latest_attempt_number} if run_lease_tasks_enabled() else {}
@@ -10648,6 +10718,7 @@ class WorkflowService:
                 failure_reason=failure_reason,
                 failure_category=task_failure_category,
                 **attempt_fence_kwargs,
+                _on_terminal_write=_on_terminal_write,
             )
             workflow_run = updated_workflow_run or await self._current_row_after_lost_finalize(
                 workflow_run_id, workflow_run
@@ -10658,6 +10729,7 @@ class WorkflowService:
                 failure_reason=failure_reason,
                 failure_category=task_failure_category,
                 **attempt_fence_kwargs,
+                _on_terminal_write=_on_terminal_write,
             )
             workflow_run = updated_workflow_run or await self._current_row_after_lost_finalize(
                 workflow_run_id, workflow_run
@@ -10730,6 +10802,7 @@ class WorkflowService:
         pre_finally_status: WorkflowRunStatus,
         pre_finally_failure_reason: str | None,
         defer_status_write: bool = False,
+        _on_terminal_write: Callable[[WorkflowRun], None] | None = None,
     ) -> tuple[WorkflowRun, WorkflowRunStatus, str | None]:
         if pre_finally_status.is_final():
             return workflow_run, pre_finally_status, pre_finally_failure_reason
@@ -10761,6 +10834,7 @@ class WorkflowService:
             status=target_status,
             failure_reason=failure_reason,
             failure_category=failure_category,
+            _on_terminal_write=_on_terminal_write,
         )
         if updated_workflow_run is not None:
             otel_trace.get_current_span().set_attribute("task.completion_status", target_status)
@@ -13699,6 +13773,7 @@ class WorkflowService:
         ai_fallback: bool | None = None,
         failure_category: list[dict] | None = None,
         require_latest_attempt_number: int | None = None,
+        _on_terminal_write: Callable[[WorkflowRun], None] | None = None,
     ) -> WorkflowRun:
         failure_category = self._with_saved_profile_signed_out(workflow_run_id, status, failure_category)
         flipped_to_final = False
@@ -13718,6 +13793,7 @@ class WorkflowService:
             )
             flipped_to_final = workflow_run is not None
             if workflow_run is not None:
+                _record_terminal_write(_on_terminal_write, workflow_run)
                 # The terminal row is committed; its bookkeeping runs even when decision recording fails.
                 try:
                     await on_terminal_transition(
@@ -13763,6 +13839,7 @@ class WorkflowService:
         only_from: Sequence[WorkflowRunStatus] | None = None,
         worker_container_restarted: bool = False,
         require_latest_attempt_number: int | None = None,
+        _on_terminal_write: Callable[[WorkflowRun], None] | None = None,
     ) -> WorkflowRun | None:
         """:meth:`_update_workflow_run_status` for writers that must lose a race against the
         run's own finalizer. Returns ``None`` when the row was already terminal."""
@@ -13781,6 +13858,7 @@ class WorkflowService:
         )
         if workflow_run is None:
             return None
+        _record_terminal_write(_on_terminal_write, workflow_run)
         try:
             await on_terminal_transition(
                 workflow_run,
@@ -14043,6 +14121,7 @@ class WorkflowService:
         workflow: Workflow | None = None,
         lost_external_browser: bool = False,
         attempt_number: int | None = None,
+        _on_terminal_write: Callable[[WorkflowRun], None] | None = None,
     ) -> WorkflowRun:
         """
         Set final workflow run status based on pre-finally state.
@@ -14056,6 +14135,7 @@ class WorkflowService:
         attempt_fence_kwargs: dict[str, Any] = (
             {"require_latest_attempt_number": attempt_number} if run_lease_tasks_enabled() else {}
         )
+        attempt_fence_kwargs["_on_terminal_write"] = _on_terminal_write
         if pre_finally_status not in (
             WorkflowRunStatus.canceled,
             WorkflowRunStatus.failed,
@@ -14306,6 +14386,7 @@ class WorkflowService:
         failure_category: list[dict] | None = None,
         cascade_children: bool = False,
         require_latest_attempt_number: int | None = None,
+        _on_terminal_write: Callable[[WorkflowRun], None] | None = None,
     ) -> WorkflowRun:
         LOG.info(
             f"Marking workflow run {workflow_run_id} as failed",
@@ -14341,6 +14422,7 @@ class WorkflowService:
                 run_with=run_with,
                 failure_category=failure_category,
                 require_latest_attempt_number=require_latest_attempt_number,
+                _on_terminal_write=_on_terminal_write,
             )
             if workflow_run is None:
                 return await self.get_workflow_run(workflow_run_id)
@@ -14351,6 +14433,7 @@ class WorkflowService:
                 failure_reason=failure_reason,
                 run_with=run_with,
                 failure_category=failure_category,
+                _on_terminal_write=_on_terminal_write,
             )
         if cascade_children and not (run_lease_tasks_enabled() and await run_lease_lost(workflow_run_id)):
             # Opt-in: run-level failures normally leave child rows to their own executors,
@@ -14422,6 +14505,7 @@ class WorkflowService:
         dispatch_claim_started_at: datetime | None,
         failure_reason: str | None,
         failure_category: list[dict] | None = None,
+        _on_terminal_write: Callable[[WorkflowRun], None] | None = None,
     ) -> WorkflowRun | None:
         result = await self.finalize_workflow_run_for_dispatch(
             workflow_run_id=workflow_run_id,
@@ -14434,6 +14518,9 @@ class WorkflowService:
         )
         if result.disposition == "denied":
             raise WorkflowAttemptDispatchSuperseded(workflow_run_id, attempt_number)
+        if result.transitioned and result.workflow_run is not None:
+            # Only this call's own transition owns its frozen snapshot; recovery or an earlier terminal row does not.
+            _record_terminal_write(_on_terminal_write, result.workflow_run)
         return result.workflow_run if result.disposition == "accepted" else None
 
     @asynccontextmanager
@@ -14465,6 +14552,7 @@ class WorkflowService:
         only_from: Sequence[WorkflowRunStatus] | None = None,
         worker_container_restarted: bool = False,
         require_latest_attempt_number: int | None = None,
+        _on_terminal_write: Callable[[WorkflowRun], None] | None = None,
     ) -> WorkflowRun | None:
         """Conditional failure finalize that no-ops when the run has already reached a terminal
         state. Out-of-band finalizers (the interrupted-activity backstop) run concurrently with
@@ -14486,6 +14574,7 @@ class WorkflowService:
             only_from=only_from,
             require_latest_attempt_number=require_latest_attempt_number,
             worker_container_restarted=worker_container_restarted,
+            _on_terminal_write=_on_terminal_write,
         )
         if workflow_run is None:
             return None
@@ -14558,6 +14647,7 @@ class WorkflowService:
         run_with: str | None = None,
         failure_category: list[dict] | None = None,
         require_latest_attempt_number: int | None = None,
+        _on_terminal_write: Callable[[WorkflowRun], None] | None = None,
     ) -> WorkflowRun:
         LOG.info(
             f"Marking workflow run {workflow_run_id} as terminated",
@@ -14594,6 +14684,7 @@ class WorkflowService:
             run_with=run_with,
             failure_category=failure_category,
             **_run_lease_attempt_kwargs("require_latest_attempt_number", require_latest_attempt_number),
+            _on_terminal_write=_on_terminal_write,
         )
         return workflow_run
 
@@ -14603,6 +14694,7 @@ class WorkflowService:
         failure_reason: str | None,
         failure_category: list[dict] | None = None,
         require_latest_attempt_number: int | None = None,
+        _on_terminal_write: Callable[[WorkflowRun], None] | None = None,
     ) -> WorkflowRun | None:
         if failure_category is None:
             failure_category = self._classify_workflow_terminal_failure(
@@ -14616,6 +14708,7 @@ class WorkflowService:
             failure_reason=failure_reason,
             failure_category=failure_category,
             **_run_lease_attempt_kwargs("require_latest_attempt_number", require_latest_attempt_number),
+            _on_terminal_write=_on_terminal_write,
         )
         if workflow_run is None:
             return None
@@ -14773,6 +14866,7 @@ class WorkflowService:
         fallback_workflow_run: WorkflowRun | None = None,
         finalized_by: str | None = None,
         require_latest_attempt_number: int | None = None,
+        _on_terminal_write: Callable[[WorkflowRun], None] | None = None,
     ) -> WorkflowRun:
         LOG.info(
             f"Marking workflow run {workflow_run_id} as timed out",
@@ -14800,6 +14894,7 @@ class WorkflowService:
             failure_category=failure_category,
             finalized_by=finalized_by,
             **_run_lease_attempt_kwargs("require_latest_attempt_number", require_latest_attempt_number),
+            _on_terminal_write=_on_terminal_write,
         )
         if updated_workflow_run is None:
             if run_lease_tasks_enabled() and (
@@ -16137,6 +16232,9 @@ class WorkflowService:
         schedule_credential_fallback_retry: bool = True,
         attempt_number: int = 1,
         owned_browser_session_id: str | None = None,
+        final_diagnostic_error_code_mapping: dict[str, str] | None = None,
+        # The snapshot this run's own terminal write returned; without one the optional diagnostic is skipped.
+        final_diagnostic_owner: WorkflowRun | None = None,
     ) -> None:
         # Direct cleanup callers can enter with a terminal row. When browser cleanup is still
         # pending, install the tombstone before the first awaited terminal hook. A pre-finalization
@@ -16249,13 +16347,14 @@ class WorkflowService:
         all_workflow_task_ids = browser_cleanup_result.all_workflow_task_ids
         child_workflow_run_ids = browser_cleanup_result.child_workflow_run_ids
         close_browser_on_completion = browser_cleanup_result.close_browser_on_completion
+        har_evidence = HarEvidence.unavailable(HarEvidenceAvailability.not_collected)
         try:
             if browser_state:
                 await self.persist_video_data(
                     browser_state, workflow, workflow_run, close_browser_on_completion=close_browser_on_completion
                 )
                 if tasks:
-                    await self.persist_debug_artifacts(
+                    har_evidence = await self.persist_debug_artifacts(
                         browser_state,
                         tasks[-1],
                         workflow,
@@ -16277,6 +16376,19 @@ class WorkflowService:
                         workflow_run_status=browser_persistence_status,
                     )
 
+            # The retry decision above already read this run; the webhook below re-reads it from the database.
+            try:
+                if final_diagnostic_owner is not None:
+                    await annotate_failed_workflow_run(
+                        final_diagnostic_owner,
+                        har_evidence,
+                        attempt_number=attempt_number,
+                        attempt_started_at=current_attempt.started_at if current_attempt is not None else None,
+                        error_code_mapping=final_diagnostic_error_code_mapping,
+                    )
+            except asyncio.CancelledError:
+                # The diagnostic is optional: deliver the terminal effects below, then restore the cancellation.
+                caller_cancelled = True
             await app.ARTIFACT_MANAGER.wait_for_upload_aiotasks(all_workflow_task_ids)
 
             try:
@@ -17155,14 +17267,14 @@ class WorkflowService:
         workflow_run: WorkflowRun,
         browser_session_id: str | None = None,
         attempt_number: int | None = None,
-    ) -> None:
+    ) -> HarEvidence:
         last_step = await app.DATABASE.tasks.get_latest_step(
             task_id=last_task.task_id, organization_id=last_task.organization_id
         )
         if not last_step:
-            return
+            return HarEvidence.unavailable(HarEvidenceAvailability.not_collected)
 
-        await self._persist_debug_artifacts_bundled(
+        return await self._persist_debug_artifacts_bundled(
             browser_state,
             last_step,
             workflow,
@@ -17179,7 +17291,7 @@ class WorkflowService:
         workflow_run: WorkflowRun,
         browser_session_id: str | None = None,
         attempt_number: int | None = None,
-    ) -> None:
+    ) -> HarEvidence:
         """Bundle HAR, browser console log, and trace into a single task archive ZIP."""
         task_archive_entries: dict[str, tuple[ArtifactType, bytes]] = {}
 
@@ -17217,9 +17329,10 @@ class WorkflowService:
                 last_step=last_step,
                 workflow_run=workflow_run,
             )
+        har_evidence = HarEvidence.unavailable(HarEvidenceAvailability.har_missing)
         if har_data:
             try:
-                await app.AGENT_FUNCTION.on_run_har_captured(
+                har_evidence = await app.AGENT_FUNCTION.on_run_har_captured(
                     browser_state=browser_state,
                     har_data=har_data,
                     organization_id=workflow_run.organization_id,
@@ -17229,6 +17342,7 @@ class WorkflowService:
                     attempt_number=attempt_number,
                 )
             except Exception:
+                har_evidence = HarEvidence.unavailable(HarEvidenceAvailability.parse_error)
                 LOG.warning("Failed to hand the run HAR to post-run processing", exc_info=True)
         LOG.debug("Persisting har data (bundled)", har_size=len(har_data))
         if har_data:
@@ -17249,6 +17363,7 @@ class WorkflowService:
                 entries=task_archive_entries,
                 workflow_run_id=workflow_run.workflow_run_id,
             )
+        return har_evidence
 
     @staticmethod
     def _regenerate_dispatch_draft_parameter_ids(definition: WorkflowDefinition, workflow_id: str) -> None:

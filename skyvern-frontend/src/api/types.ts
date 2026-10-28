@@ -170,6 +170,8 @@ export type FailureCategory = {
   confidence_float: number;
   reasoning: string;
   reason_code?: string | null;
+  error_code?: string | null;
+  anti_bot?: { contribution?: string | null } | null;
 };
 
 export type TaskApiResponse = {

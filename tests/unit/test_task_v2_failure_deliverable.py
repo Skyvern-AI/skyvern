@@ -5,7 +5,7 @@ from __future__ import annotations
 
 import asyncio
 from types import SimpleNamespace
-from unittest.mock import AsyncMock, MagicMock
+from unittest.mock import ANY, AsyncMock, MagicMock
 
 import pytest
 
@@ -276,7 +276,7 @@ async def test_mark_task_v2_as_failed_redrive_keeps_termination_metadata(monkeyp
     )
 
     terminate_run.assert_awaited_once_with(
-        "wr_test", "late failure", failure_category=[{"category": "unreachable_goal"}]
+        "wr_test", "late failure", failure_category=[{"category": "unreachable_goal"}], _on_terminal_write=ANY
     )
 
 

@@ -2,7 +2,7 @@
 
 from types import SimpleNamespace
 from typing import Any, cast
-from unittest.mock import AsyncMock, Mock, call
+from unittest.mock import ANY, AsyncMock, Mock, call
 
 import pytest
 from sqlalchemy.ext.asyncio import AsyncEngine
@@ -129,6 +129,7 @@ async def test_execute_workflow_fails_empty_definition_before_marking_running(
     mark_workflow_run_as_failed.assert_awaited_once_with(
         workflow_run_id=workflow_run.workflow_run_id,
         failure_reason="Workflow has no executable blocks.",
+        _on_terminal_write=ANY,
     )
     clean_up_workflow.assert_awaited_once_with(
         workflow=workflow,
@@ -138,6 +139,7 @@ async def test_execute_workflow_fails_empty_definition_before_marking_running(
         close_browser_on_completion=True,
         need_call_webhook=True,
         attempt_number=1,
+        final_diagnostic_owner=None,
     )
     mark_workflow_run_as_running.assert_not_awaited()
 

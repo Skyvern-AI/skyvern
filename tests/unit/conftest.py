@@ -1084,6 +1084,30 @@ async def settle_or_fail(coro: Awaitable[_T], wait_seconds: float = 2.0) -> tupl
     return task, elapsed
 
 
+async def cancel_once_parked(
+    coro: Awaitable[_T], parked: asyncio.Event, release: asyncio.Event, wait_seconds: float = 5.0
+) -> asyncio.Task[_T]:
+    """Run ``coro``, cancel it once it reaches a collaborator parked on ``release``, and fail if it does not finish
+    within ``wait_seconds`` of that cancel, so work re-entered after cancellation fails instead of hanging. The
+    parked collaborator is always released and the task's outcome retrieved before returning."""
+    task = asyncio.ensure_future(coro)
+    try:
+        reached = asyncio.ensure_future(parked.wait())
+        await asyncio.wait({task, reached}, timeout=wait_seconds, return_when=asyncio.FIRST_COMPLETED)
+        reached.cancel()
+        if not parked.is_set():
+            pytest.fail(f"never reached the parked collaborator within {wait_seconds}s")
+        task.cancel()
+        await settle_or_fail(task, wait_seconds)
+        return task
+    finally:
+        release.set()
+        if not task.done():
+            await asyncio.wait({task}, timeout=wait_seconds)
+        if task.done() and not task.cancelled():
+            task.exception()
+
+
 class DriverReplyProbe:
     """A driver call that keeps its protocol reply the way playwright and patchright do.
 
