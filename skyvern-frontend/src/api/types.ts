@@ -36,6 +36,11 @@ export const TriggerType = {
   Mcp: "mcp",
   Api: "api",
   Scheduled: "scheduled",
+  Webhook: "webhook",
+  Event: "event",
+  JobRecipeExtract: "job_recipe_extract",
+  JobRecipeApply: "job_recipe_apply",
+  SeoRecipeSubmit: "seo_recipe_submit",
 } as const;
 
 export type TriggerType = (typeof TriggerType)[keyof typeof TriggerType];

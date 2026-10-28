@@ -30,6 +30,26 @@ const triggerTypeDropdownItems: Array<TriggerTypeDropdownItem> = [
     label: "Scheduled",
     value: TriggerType.Scheduled,
   },
+  {
+    label: "Webhook",
+    value: TriggerType.Webhook,
+  },
+  {
+    label: "Event",
+    value: TriggerType.Event,
+  },
+  {
+    label: "Job recipe extract",
+    value: TriggerType.JobRecipeExtract,
+  },
+  {
+    label: "Job recipe apply",
+    value: TriggerType.JobRecipeApply,
+  },
+  {
+    label: "SEO recipe submit",
+    value: TriggerType.SeoRecipeSubmit,
+  },
 ];
 
 type Props = {

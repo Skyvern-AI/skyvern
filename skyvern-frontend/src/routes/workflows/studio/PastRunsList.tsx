@@ -2,6 +2,7 @@ import { CheckIcon, ReloadIcon } from "@radix-ui/react-icons";
 import { Link } from "react-router-dom";
 
 import { TriggerType } from "@/api/types";
+import { getTriggerTypeLabel } from "@/components/TriggerTypeBadge";
 import { StatusBadge } from "@/components/StatusBadge";
 import { WorkflowRunAttemptChip } from "@/components/WorkflowRunAttemptChip";
 import { useWorkflowPermanentId } from "@/routes/workflows/WorkflowPermanentIdContext";
@@ -19,11 +20,6 @@ import { useStudioInspectedRun } from "./useStudioInspectedRun";
 const PAGE_SIZE = 20;
 // Manual is the common case and reads as noise on every row; the rest answer
 // "why did this run happen?" with something the user did not do by hand.
-const TRIGGER_LABEL: Partial<Record<TriggerType, string>> = {
-  [TriggerType.Scheduled]: "Scheduled",
-  [TriggerType.Api]: "API",
-  [TriggerType.Mcp]: "MCP",
-};
 // While the popover is open, poll past the app-wide 5-minute staleTime so an
 // in-flight run's badge and runs started elsewhere surface without a refocus.
 const REFRESH_INTERVAL_MS = 10_000;
@@ -106,9 +102,10 @@ export function PastRunsList({
               const ago = getRunAgoLabel(run, now);
               const absolute = getRunAbsoluteTime(run);
               const duration = getRunDurationLabel(run);
-              const trigger = run.trigger_type
-                ? TRIGGER_LABEL[run.trigger_type]
-                : undefined;
+              const trigger =
+                run.trigger_type && run.trigger_type !== TriggerType.Manual
+                  ? getTriggerTypeLabel(run.trigger_type)
+                  : undefined;
               return (
                 <li key={run.workflow_run_id}>
                   <button
