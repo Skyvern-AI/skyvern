@@ -107,6 +107,7 @@ from skyvern.forge.taskv3.loop import (
     current_tool_call_seq,
     mark_is_filler,
     record_click_dispatched,
+    record_click_path,
     record_covered_layer,
     record_entry_enter_withheld,
     record_entry_variant,
@@ -4676,6 +4677,14 @@ _SELECTOR_EXISTS_JS = (
   } catch (e) { return true; }
 }"""
 )
+
+
+def _locator_never_resolved(exc: Exception) -> bool:
+    # Matched by class name to cover both Playwright's and Patchright's TimeoutError. The actionability waits
+    # all log "locator resolved to ..." first, so only a never-found element lacks it.
+    text = str(exc)
+    return type(exc).__name__ == "TimeoutError" and "waiting for locator(" in text and "resolved to" not in text
+
 
 # How many distinct elements a minted marker resolves to across open shadow roots: a re-render that
 # CLONES the marked node copies the attribute, and a non-strict click would land on the first match.
@@ -13545,6 +13554,9 @@ def build_browser_tools(
     # concern. Threading a realm through forty call sites is how a concern gets scattered into the
     # tools, and each site becomes a place to forget it.
     _acted_realm: list[Any] = []
+    # The live element handle the ref or mark resolved to, for the same single call, so a click can fall back to it
+    # when the driver's selector engine cannot see the marker the resolver just wrote.
+    _acted_handle: list[Any] = []
 
     async def _resolve_page() -> tuple[Any, ToolResult | None]:
         # Single-use handoff from the preflight wrapper so a preflighted call resolves the page
@@ -15735,6 +15747,35 @@ def build_browser_tools(
             # Unreadable: the click proceeds as it did before this check, through the marker path's own errors.
             return False
 
+    async def _click_marker(realm: Any, selector: str, *, force: bool) -> str:
+        """Click through the driver's locator; for an act marker it never resolved, click the resolver's live handle,
+        as v1's click chain degrades to the element itself."""
+        try:
+            await input_dispatch.click(realm, selector, timeout=_ACTION_TIMEOUT_MS, force=True if force else None)
+            return "locator"
+        except Exception as exc:
+            if not (selector.startswith(_ACT_SELECTOR_PREFIX) and _acted_handle and _locator_never_resolved(exc)):
+                raise
+        # Page.click(selector) only clicks the node that still carries the token; a handle has no such check, so
+        # a node that lost the token since the pre-check (a markup morph onto kept nodes) is stale, not clicked.
+        try:
+            held = await _acted_handle[0].get_attribute("data-tv3-act")
+        except Exception:
+            held = None
+        if held is None or selector != f'{_ACT_SELECTOR_PREFIX}{held}"]':
+            return "stale"
+        try:
+            await input_dispatch.click_handle(
+                realm, _acted_handle[0], timeout=_ACTION_TIMEOUT_MS, force=True if force else None
+            )
+        except Exception as exc:
+            # The summary line only: the call log quotes the covering element's text, which can say anything.
+            if "not attached" in str(exc).split("\n", 1)[0]:
+                return "stale"
+            record_click_path("handle_failed")
+            raise
+        return "handle"
+
     async def click(args: dict[str, Any]) -> ToolResult:
         page, error = await _resolve_page()
         if error is not None:
@@ -16037,14 +16078,12 @@ def build_browser_tools(
                 await page.evaluate(_CLICK_SAME_DOC_PLANT_JS)
             except Exception:
                 marker_armed = False
+            click_path = "locator"
             try:
-                if label_over_control:
-                    # The probe already answered: the only thing "over" this control is its own label
-                    # (slotted, or a sibling for=id), which the driver's containment check would wait
-                    # 15s to reject.
-                    await input_dispatch.click(page, selector, timeout=_ACTION_TIMEOUT_MS, force=True)
-                else:
-                    await input_dispatch.click(page, selector, timeout=_ACTION_TIMEOUT_MS)
+                # With label_over_control the probe already answered: the only thing "over" this control is
+                # its own label (slotted, or a sibling for=id), which the driver's containment check would
+                # wait 15s to reject.
+                click_path = await _click_marker(page, selector, force=bool(label_over_control))
             except Exception as e:
                 await _note_click_dispatch(page, marker_armed=marker_armed)
                 gone = False
@@ -16124,6 +16163,14 @@ def build_browser_tools(
                         raise e from None
                 else:
                     raise
+            record_click_path(click_path)
+            if click_path == "stale":
+                return ToolResult.error(
+                    f"click on {selector} failed: the element no longer exists on the page — it was likely "
+                    "removed by a re-render. Re-observe and act on fresh selectors.",
+                    data={"page_state_changed": True},
+                    error_class="stale_selector",
+                )
             base = f"clicked {selector} — now at {await _url(page)}"
 
         # url_after vs url_before is the real page-transition signal the shadow net-progress ledger
@@ -22510,6 +22557,8 @@ def build_browser_tools(
                 # -- the persisted action's element_id, the submit watch, the repeat guard's key and the
                 # nudge's target -- and a copy leaves every one of them seeing only `mark`.
                 args["selector"] = selector
+                if (_look_manifest.get(mark_int) or {}).get("handle") is not None:
+                    _acted_handle[:] = [_look_manifest[mark_int]["handle"]]
                 # The THIRD caller with this shape, found by checking rather than by being told about it: the
                 # mark was resolved against THIS page, so letting preflight resolve again lets a popup that
                 # became the working page in between be the one acted on.
@@ -22522,6 +22571,7 @@ def build_browser_tools(
                 return await handler(args)
             finally:
                 _prefetched_page.clear()
+                _acted_handle.clear()
 
         return wrapped
 
@@ -22915,6 +22965,8 @@ def build_browser_tools(
                 _prefetched_page.append(page)
                 if _owner is not None:
                     _acted_realm[:] = [_owner]
+                if _entry.get("handle") is not None:
+                    _acted_handle[:] = [_entry["handle"]]
                 # Resolution ends here, before the act. The latch makes this the reading the phase
                 # guard below reports, so the handler's own time is never billed to resolution.
                 record()
@@ -22929,6 +22981,7 @@ def build_browser_tools(
                     return result
                 finally:
                     _acted_realm.clear()
+                    _acted_handle.clear()
                     _prefetched_page.clear()
                     # ...but those readers run turns LATER, and the act token is a stamp on one node: a
                     # control the page REPLACES after the act -- a submit button swapped for its
