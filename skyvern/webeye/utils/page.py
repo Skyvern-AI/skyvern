@@ -1695,6 +1695,7 @@ async (args) => {
         if (!response.ok) {
             return { ok: false, status: response.status };
         }
+        const contentType = response.headers.get('content-type') || '';
         if (!response.body) return { ok: false, error: 'no_readable_stream' };
         const reader = response.body.getReader();
         const chunks = [];
@@ -1721,7 +1722,7 @@ async (args) => {
                     resolve({ ok: false, error: 'no_data_url_payload' });
                     return;
                 }
-                resolve({ ok: true, base64: result.substring(comma + 1) });
+                resolve({ ok: true, base64: result.substring(comma + 1), contentType });
             };
             reader.onerror = () => resolve({ ok: false, error: 'file_reader_error' });
             reader.readAsDataURL(blob);
@@ -2353,6 +2354,27 @@ class SkyvernFrame:
         probe: bool = False,
         raise_too_large: bool = False,
     ) -> bytes | None:
+        """Read Blob bytes for existing callers that do not need the media type."""
+        result = await SkyvernFrame.read_blob_url_bytes_and_content_type(
+            page=page,
+            blob_url=blob_url,
+            workflow_run_id=workflow_run_id,
+            max_size_bytes=max_size_bytes,
+            probe=probe,
+            raise_too_large=raise_too_large,
+        )
+        return result[0] if result is not None else None
+
+    @staticmethod
+    async def read_blob_url_bytes_and_content_type(
+        page: Page,
+        blob_url: str,
+        workflow_run_id: str | None = None,
+        max_size_bytes: int | None = None,
+        probe: bool = False,
+        raise_too_large: bool = False,
+    ) -> tuple[bytes, str] | None:
+        """Read Blob bytes and the media type exposed by its fetch response."""
         # probe=True is for best-effort multi-page fallback where the caller tries every open
         # page; expected misses on non-owning pages shouldn't spam ERROR/WARN logs, so downgrade
         # give-up/retry logging to debug. The final failure signal stays with the caller.
@@ -2417,8 +2439,11 @@ class SkyvernFrame:
                     workflow_run_id=workflow_run_id,
                 )
                 continue
+            content_type = result.get("contentType", "")
+            if not isinstance(content_type, str):
+                content_type = ""
             try:
-                return base64.b64decode(b64_payload, validate=True)
+                return base64.b64decode(b64_payload, validate=True), content_type
             except Exception:
                 retry_log(
                     "blob URL in-frame fetch payload was not valid base64; trying next frame if any",
