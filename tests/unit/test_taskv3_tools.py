@@ -116,6 +116,7 @@ from skyvern.forge.taskv3.tools import (
 )
 from skyvern.webeye.actions.handler import get_actual_value_of_parameter_if_secret_with_task
 from skyvern.webeye.cdp_download_interceptor import CDPDownloadInterceptor
+from tests.unit.copilot_test_helpers import page_with_unprobeable_vendor_embedder
 from tests.unit.scoped_asyncio import ScopedAsyncio
 from tests.unit.test_taskv3_loop import _ScriptedCaller
 
@@ -23946,6 +23947,71 @@ async def _mount_challenge_frame(
     await page.route(f"{_CHALLENGE_FRAME_URL}*", _fulfill)
     async with page.expect_event("framenavigated", lambda f: _CHALLENGE_FRAME_URL in (f.url or "")):
         await realm.eval_on_selector(host_selector, _MOUNT_CLOSED_SHADOW_FRAMES_JS, {"srcs": srcs, "style": style})
+
+
+_DISABLED_SUBMIT_UNDER_WIDGET_HTML = """
+<!doctype html><html><body style="margin:0">
+<div id="widget" style="position:absolute;left:40px;top:120px;width:300px;height:65px"></div>
+<button id="submit" disabled style="position:absolute;left:40px;top:220px;width:120px;height:40px">Submit</button>
+<button id="other" style="position:absolute;left:200px;top:220px;width:120px;height:40px">Other</button>
+</body></html>
+"""
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("widget_style", "hinted"),
+    [
+        ("width:300px;height:65px;border:0", True),
+        # A preloaded or invisible widget is merely present, which is no evidence it gates anything.
+        ("width:1px;height:1px;border:0", False),
+        (None, False),
+    ],
+    ids=["rendered", "placeholder", "absent"],
+)
+async def test_disabled_click_refusal_names_only_a_rendered_challenge_frame(
+    widget_style: str | None, hinted: bool
+) -> None:
+    async with _content_page(_DISABLED_SUBMIT_UNDER_WIDGET_HTML, extra_args=["--site-per-process"]) as page:
+        if widget_style is not None:
+            await _mount_challenge_frame(page, page, "#widget", style=widget_style)
+        click = _tool(build_browser_tools(_fixed_page_provider(page)), "click").handler
+        refused = await click({"selector": "#submit"})
+        clicked = await click({"selector": "#other"})
+    unhinted = "#submit is disabled — it cannot be clicked until the page enables it"
+    assert refused.error_class == "disabled", refused.content
+    if hinted:
+        assert refused.content == (
+            f"{unhinted}. A challenge frame (challenges.cloudflare) is rendered on screen. solve_captcha acts on it."
+        )
+    else:
+        assert refused.content == unhinted
+    assert clicked.status == "ok", clicked.content
+    assert "solve_captcha" not in clicked.content
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+async def test_disabled_click_refusal_in_a_child_frame_names_the_challenge_frame_beside_it() -> None:
+    shell_html = (
+        '<!doctype html><html><body style="margin:0"><iframe id="shell" srcdoc=\''
+        + _DISABLED_SUBMIT_UNDER_WIDGET_HTML.replace("'", "&apos;").replace("\n", "")
+        + '\' style="position:absolute;left:0;top:0;width:1000px;height:880px;border:0"></iframe></body></html>'
+    )
+    async with _content_page(shell_html, extra_args=["--site-per-process"]) as page:
+        await page.frame_locator("#shell").locator("#widget").wait_for(state="attached")
+        child = next(f for f in page.frames if f.parent_frame is page.main_frame)
+        await _mount_challenge_frame(child, page, "#widget")
+        refused = await _tool(build_browser_tools(_fixed_page_provider(page)), "click").handler({"selector": "#submit"})
+    assert refused.error_class == "disabled", refused.content
+    assert "A challenge frame (challenges.cloudflare) is rendered on screen." in refused.content, refused.content
+
+
+@pytest.mark.asyncio
+async def test_disabled_click_refusal_names_no_challenge_frame_it_could_not_measure() -> None:
+    refused = await taskv3_tools._disabled_click_refusal(page_with_unprobeable_vendor_embedder(), "#submit")
+    assert refused.content == "#submit is disabled — it cannot be clicked until the page enables it"
 
 
 @pytest.mark.usefixtures("expected_action_timeout")
