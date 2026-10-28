@@ -94,7 +94,7 @@
               },
               {
                 "sdk": "typescript",
-                "code": "import { SkyvernClient } from \"@skyvern/client\";\n\nconst skyvern = new SkyvernClient({ apiKey: \"YOUR_API_KEY\" });\nawait skyvern.runTask({\n    body: {\n        prompt: \"Find the top 3 posts on Hacker News.\"\n    }\n})\n"
+                "code": "import { SkyvernClient } from \"@skyvern/client\";\n\nconst skyvern = new SkyvernClient({ apiKey: \"YOUR_API_KEY\" });\nawait skyvern.runTask({\n    prompt: \"Find the top 3 posts on Hacker News.\"\n})\n"
               }
             ]
           }
@@ -225,7 +225,7 @@
               },
               {
                 "sdk": "typescript",
-                "code": "import { SkyvernClient } from \"@skyvern/client\";\n\nconst skyvern = new SkyvernClient({ apiKey: \"YOUR_API_KEY\" });\nawait skyvern.runWorkflow({\n    body: {\n        workflow_id: \"wpid_123\",\n        parameters: { parameter1: \"value1\", parameter2: \"value2\" }\n    }\n});\n"
+                "code": "import { SkyvernClient } from \"@skyvern/client\";\n\nconst skyvern = new SkyvernClient({ apiKey: \"YOUR_API_KEY\" });\nawait skyvern.runWorkflow({\n    agent_id: \"wpid_123\",\n    parameters: { parameter1: \"value1\", parameter2: \"value2\" }\n});\n"
               }
             ]
           }
@@ -4025,6 +4025,31 @@
                 }
               }
             }
+          },
+          "429": {
+            "description": "Too many browser sessions are starting for this organization at once. Retry after the number of seconds in the Retry-After header.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "required": [
+                    "detail",
+                    "error_code"
+                  ],
+                  "properties": {
+                    "detail": {
+                      "type": "string"
+                    },
+                    "error_code": {
+                      "type": "string",
+                      "enum": [
+                        "too_many_starting_browser_sessions"
+                      ]
+                    }
+                  }
+                }
+              }
+            }
           }
         },
         "x-fern-sdk-method-name": "create_browser_session",
@@ -4783,10 +4808,10 @@
                   "type": "null"
                 }
               ],
-              "description": "Case-insensitive search across credential name, username, secret label, and card details",
+              "description": "Case-insensitive search across credential name, username, secret label, and card details, or an exact credential ID",
               "title": "Search"
             },
-            "description": "Case-insensitive search across credential name, username, secret label, and card details"
+            "description": "Case-insensitive search across credential name, username, secret label, and card details, or an exact credential ID"
           },
           {
             "name": "x-api-key",
@@ -6117,6 +6142,439 @@
         }
       }
     },
+    "/v1/integrations/twilio/phone-numbers/enable": {
+      "post": {
+        "tags": [
+          "Credentials"
+        ],
+        "summary": "Enable Twilio phone number",
+        "description": "Enable SMS forwarding for a Twilio phone number in the current organization.",
+        "operationId": "enable_twilio_phone_number_v1_integrations_twilio_phone_numbers_enable_post",
+        "parameters": [
+          {
+            "name": "x-api-key",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "Skyvern API key for authentication. API key can be found at https://app.skyvern.com/settings.",
+              "title": "X-Api-Key"
+            },
+            "description": "Skyvern API key for authentication. API key can be found at https://app.skyvern.com/settings."
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/EnablePhoneNumberRequest"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/OrganizationPhoneNumberResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "The Twilio credential or phone number selection is invalid"
+          },
+          "404": {
+            "description": "Twilio SMS is unavailable or the phone number was not found"
+          },
+          "409": {
+            "description": "The phone number requires takeover confirmation or changed during setup"
+          },
+          "422": {
+            "description": "Request validation failed"
+          },
+          "502": {
+            "description": "The Twilio provider request failed"
+          },
+          "503": {
+            "description": "The Twilio provider rate limit was reached"
+          }
+        },
+        "x-fern-sdk-group-name": "twilio",
+        "x-fern-sdk-method-name": "enable_phone_number"
+      }
+    },
+    "/v1/integrations/twilio/credentials": {
+      "post": {
+        "tags": [
+          "Credentials"
+        ],
+        "summary": "Connect Twilio credentials",
+        "description": "Validate and store Twilio credentials for the current organization.",
+        "operationId": "create_twilio_credential_v1_integrations_twilio_credentials_post",
+        "parameters": [
+          {
+            "name": "x-api-key",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "Skyvern API key for authentication. API key can be found at https://app.skyvern.com/settings.",
+              "title": "X-Api-Key"
+            },
+            "description": "Skyvern API key for authentication. API key can be found at https://app.skyvern.com/settings."
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/CreateTwilioCredentialRequest"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/TwilioCredentialResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "The Twilio credentials are invalid"
+          },
+          "404": {
+            "description": "Twilio SMS is unavailable or the account was not found"
+          },
+          "409": {
+            "description": "Connected phone numbers must be disabled before changing accounts"
+          },
+          "422": {
+            "description": "Request validation failed"
+          },
+          "502": {
+            "description": "The Twilio provider request failed"
+          },
+          "503": {
+            "description": "The Twilio provider rate limit was reached"
+          }
+        },
+        "x-fern-sdk-group-name": "twilio",
+        "x-fern-sdk-method-name": "create_credentials"
+      },
+      "get": {
+        "tags": [
+          "Credentials"
+        ],
+        "summary": "Get Twilio credentials",
+        "description": "Get the safe Twilio credential metadata for the current organization.",
+        "operationId": "get_twilio_credential_v1_integrations_twilio_credentials_get",
+        "parameters": [
+          {
+            "name": "x-api-key",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "Skyvern API key for authentication. API key can be found at https://app.skyvern.com/settings.",
+              "title": "X-Api-Key"
+            },
+            "description": "Skyvern API key for authentication. API key can be found at https://app.skyvern.com/settings."
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/TwilioCredentialResponse"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Twilio SMS is unavailable"
+          },
+          "422": {
+            "description": "Request validation failed"
+          }
+        },
+        "x-fern-sdk-group-name": "twilio",
+        "x-fern-sdk-method-name": "get_credentials"
+      },
+      "delete": {
+        "tags": [
+          "Credentials"
+        ],
+        "summary": "Disconnect Twilio credentials",
+        "description": "Remove the stored Twilio credentials after connected phone numbers are disabled.",
+        "operationId": "delete_twilio_credential_v1_integrations_twilio_credentials_delete",
+        "parameters": [
+          {
+            "name": "x-api-key",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "Skyvern API key for authentication. API key can be found at https://app.skyvern.com/settings.",
+              "title": "X-Api-Key"
+            },
+            "description": "Skyvern API key for authentication. API key can be found at https://app.skyvern.com/settings."
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "additionalProperties": {
+                    "type": "boolean"
+                  },
+                  "title": "Response Delete Twilio Credential V1 Integrations Twilio Credentials Delete"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Twilio SMS is unavailable"
+          },
+          "409": {
+            "description": "Connected phone numbers must be disabled before disconnecting Twilio"
+          },
+          "422": {
+            "description": "Request validation failed"
+          }
+        },
+        "x-fern-sdk-group-name": "twilio",
+        "x-fern-sdk-method-name": "delete_credentials"
+      }
+    },
+    "/v1/integrations/twilio/phone-number-registry": {
+      "get": {
+        "tags": [
+          "Credentials"
+        ],
+        "summary": "List registered phone numbers",
+        "description": "List the current organization's phone numbers registered for SMS forwarding.",
+        "operationId": "list_registered_phone_numbers_v1_integrations_twilio_phone_number_registry_get",
+        "parameters": [
+          {
+            "name": "x-api-key",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "Skyvern API key for authentication. API key can be found at https://app.skyvern.com/settings.",
+              "title": "X-Api-Key"
+            },
+            "description": "Skyvern API key for authentication. API key can be found at https://app.skyvern.com/settings."
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "array",
+                  "items": {
+                    "$ref": "#/components/schemas/OrganizationPhoneNumberResponse"
+                  },
+                  "title": "Response List Registered Phone Numbers V1 Integrations Twilio Phone Number Registry Get"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Twilio SMS is unavailable"
+          },
+          "422": {
+            "description": "Request validation failed"
+          }
+        },
+        "x-fern-sdk-group-name": "twilio",
+        "x-fern-sdk-method-name": "list_registered_phone_numbers"
+      }
+    },
+    "/v1/integrations/twilio/phone-numbers": {
+      "get": {
+        "tags": [
+          "Credentials"
+        ],
+        "summary": "List Twilio phone numbers",
+        "description": "List SMS-capable phone numbers available in the connected Twilio account.",
+        "operationId": "list_twilio_phone_numbers_v1_integrations_twilio_phone_numbers_get",
+        "parameters": [
+          {
+            "name": "x-api-key",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "Skyvern API key for authentication. API key can be found at https://app.skyvern.com/settings.",
+              "title": "X-Api-Key"
+            },
+            "description": "Skyvern API key for authentication. API key can be found at https://app.skyvern.com/settings."
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "array",
+                  "items": {
+                    "$ref": "#/components/schemas/TwilioPhoneNumberInfo"
+                  },
+                  "title": "Response List Twilio Phone Numbers V1 Integrations Twilio Phone Numbers Get"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "The Twilio credentials are invalid"
+          },
+          "404": {
+            "description": "Twilio SMS is unavailable or the phone number was not found"
+          },
+          "422": {
+            "description": "Request validation failed"
+          },
+          "502": {
+            "description": "The Twilio provider request failed"
+          },
+          "503": {
+            "description": "The Twilio provider rate limit was reached"
+          }
+        },
+        "x-fern-sdk-group-name": "twilio",
+        "x-fern-sdk-method-name": "list_phone_numbers"
+      }
+    },
+    "/v1/integrations/twilio/phone-numbers/disable": {
+      "post": {
+        "tags": [
+          "Credentials"
+        ],
+        "summary": "Disable Twilio phone number",
+        "description": "Disable SMS forwarding for a phone number registered in the current organization.",
+        "operationId": "disable_twilio_phone_number_v1_integrations_twilio_phone_numbers_disable_post",
+        "parameters": [
+          {
+            "name": "x-api-key",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "Skyvern API key for authentication. API key can be found at https://app.skyvern.com/settings.",
+              "title": "X-Api-Key"
+            },
+            "description": "Skyvern API key for authentication. API key can be found at https://app.skyvern.com/settings."
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/DisablePhoneNumberRequest"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/OrganizationPhoneNumberResponse"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "The phone number was not found"
+          },
+          "409": {
+            "description": "The phone number changed during the disable operation"
+          },
+          "422": {
+            "description": "Request validation failed"
+          },
+          "502": {
+            "description": "The Twilio provider request failed"
+          },
+          "503": {
+            "description": "The Twilio provider rate limit was reached"
+          }
+        },
+        "x-fern-sdk-group-name": "twilio",
+        "x-fern-sdk-method-name": "disable_phone_number"
+      }
+    },
     "/v1/agents/{workflow_permanent_id}/folder": {
       "put": {
         "tags": [
@@ -6670,7 +7128,7 @@
           "Runs"
         ],
         "summary": "Get all runs",
-        "description": "List workflow runs across all workflows for the current organization.\n\nResults are paginated and can be filtered by **status**, **search_key**, and **error_code**. All filters are combined with **AND** logic — a run must match every supplied filter to be returned.\n\n### search_key\n\nA case-insensitive substring search that matches against **any** of the following fields:\n\n| Searched field | Description |\n|---|---|\n| `workflow_run_id` | The unique run identifier (e.g. `wr_123…`) |\n| `workflow_permanent_id` | The permanent ID of the workflow that ran (e.g. `wpid_123…`) |\n| Workflow **title** | The title of the workflow that ran |\n| Parameter **key** | The `key` of any workflow parameter definition associated with the run |\n| Parameter **description** | The `description` of any workflow parameter definition |\n| Run parameter **value** | The actual value supplied for any parameter when the run was created |\n| `extra_http_headers` | Extra HTTP headers attached to the run (searched as raw JSON text) |\n| `webhook_callback_url` | The webhook URL the run posts its result to |\n\nSoft-deleted parameter definitions are excluded from key/description matching. A run is returned if **any** of the fields above contain the search term.\n\nA **complete** identifier also matches the run that used it, by exact equality:\n\n| Identifier | Description |\n|---|---|\n| `browser_profile_id` | The browser profile the run used (e.g. `bp_123…`) |\n| `browser_session_id` | The browser session the run used (e.g. `pbs_123…`) |\n| **Credential id** | A credential the run used (e.g. `cred_123…`) |\n| `workflow_run_id` | The run itself (e.g. `wr_123…`) |\n| **Task id** | The workflow run the task ran in, when that run is top-level (e.g. `tsk_123…`) |\n\nA complete browser profile, browser session, workflow run or task id is matched against those identifiers only, not the text fields above. A credential id matches a run when it is the run's sequential credential, the credential the run selected from a pool or fell back to, or the credential bound by a credential parameter on the run's workflow version when the run was created and the run recorded no selection for that parameter. Other pool and fallback members the run did not use do not match.\n\n### error_code\n\nAn **exact-match** filter against the `error_code` field inside each task's `errors` JSON array. A run matches if **any** of its tasks contains an error object with a matching `error_code` value. Error codes are user-defined strings set during workflow execution (e.g. `INVALID_CREDENTIALS`, `LOGIN_FAILED`, `CAPTCHA_DETECTED`).\n\n### Combining filters\n\nAll query parameters use AND logic:\n- `?status=failed` — only failed runs\n- `?status=failed&error_code=LOGIN_FAILED` — failed runs **and** have a LOGIN_FAILED error\n- `?status=failed&error_code=LOGIN_FAILED&search_key=prod_credential` — all three conditions must match",
+        "description": "List workflow runs across all workflows for the current organization.\n\nResults are paginated and can be filtered by **status**, **search_key**, and **error_code**. All filters are combined with **AND** logic — a run must match every supplied filter to be returned.\n\n### search_key\n\nA case-insensitive substring search that matches against **any** of the following fields:\n\n| Searched field | Description |\n|---|---|\n| `workflow_run_id` | The unique run identifier (e.g. `wr_123…`) |\n| `workflow_permanent_id` | The permanent ID of the workflow that ran (e.g. `wpid_123…`) |\n| Workflow **title** | The title of the workflow that ran |\n| Parameter **key** | The `key` of any workflow parameter definition associated with the run |\n| Parameter **description** | The `description` of any workflow parameter definition |\n| Run parameter **value** | The actual value supplied for any parameter when the run was created |\n| `extra_http_headers` | Extra HTTP headers attached to the run (searched as raw JSON text) |\n| `webhook_callback_url` | The webhook URL the run posts its result to |\n\nSoft-deleted parameter definitions are excluded from key/description matching. A run is returned if **any** of the fields above contain the search term.\n\nA **complete** identifier also matches the run that used it, by exact equality:\n\n| Identifier | Description |\n|---|---|\n| `browser_profile_id` | The browser profile the run used (e.g. `bp_123…`) |\n| `browser_session_id` | The browser session the run used (e.g. `pbs_123…`) |\n| **Credential id** | A credential the run used (e.g. `cred_123…`) |\n| `workflow_run_id` | The run itself (e.g. `wr_123…`) |\n| **Task id** | The workflow run the task ran in, when that run is top-level (e.g. `tsk_123…`) |\n\nA complete browser profile, browser session, workflow run or task id is matched against those identifiers only, not the text fields above. A credential id matches a run when it is the run's sequential credential, the credential the run selected from a pool or fell back to, or the credential bound by a credential parameter on the run's workflow version when the run was created and the run recorded no selection for that parameter. Other pool and fallback members the run did not use do not match.\n\n### Default search window\n\nA `search_key` other than a complete browser profile, browser session, workflow run or task id is matched only against runs created in the **30 days before `created_at_end`** (or before now) unless the request supplies `created_at_start`. This includes complete credential ids. Supply `created_at_start` (and optionally `created_at_end`) to search a different range. Explicit bounds apply to every search, complete ids included. Listings without `search_key` are not windowed. To fetch one run by its id, use `GET /v1/runs/{run_id}`.\n\n### created_at_start / created_at_end\n\nOptional ISO 8601 bounds on the run's creation time: `created_at_start` is inclusive and `created_at_end` is exclusive. A timestamp without an offset is read as UTC.\n\n### error_code\n\nAn **exact-match** filter against the `error_code` field inside each task's `errors` JSON array. A run matches if **any** of its tasks contains an error object with a matching `error_code` value. Error codes are user-defined strings set during workflow execution (e.g. `INVALID_CREDENTIALS`, `LOGIN_FAILED`, `CAPTCHA_DETECTED`).\n\n### Combining filters\n\nAll query parameters use AND logic:\n- `?status=failed` — only failed runs\n- `?status=failed&error_code=LOGIN_FAILED` — failed runs **and** have a LOGIN_FAILED error\n- `?status=failed&error_code=LOGIN_FAILED&search_key=prod_credential` — all three conditions must match (searched over the last 30 days)\n- `?search_key=prod_credential&created_at_start=2026-01-01T00:00:00Z&created_at_end=2026-02-01T00:00:00Z` — search one explicit month",
         "operationId": "get_workflow_runs_v1_workflows_runs_get",
         "parameters": [
           {
@@ -6734,7 +7192,7 @@
                   "type": "null"
                 }
               ],
-              "description": "Case-insensitive substring search across: workflow run ID, parameter key, parameter description, run parameter value, extra HTTP headers and webhook callback URL. A run is returned if any of these fields match. Soft-deleted parameter definitions are excluded from key/description matching. A complete browser profile ID, browser session ID or credential ID matches the run that used it exactly (no substring match). A complete workflow run ID matches that run. A complete task ID matches the workflow run the task ran in, when this list includes that run, or the standalone task itself where standalone tasks are listed. A complete browser profile, browser session, workflow run or task ID is matched against those identifiers only, not the text fields. A credential ID matches when it is the run's sequential credential, the credential the run selected from a pool or fell back to, or the credential bound by a credential parameter on the run's workflow version when the run was created and the run recorded no selection for it. The workflow title and workflow permanent ID are matched as well.",
+              "description": "Case-insensitive substring search across: workflow run ID, parameter key, parameter description, run parameter value, extra HTTP headers and webhook callback URL. A run is returned if any of these fields match. Soft-deleted parameter definitions are excluded from key/description matching. A complete browser profile ID, browser session ID or credential ID matches the run that used it exactly (no substring match). A complete workflow run ID matches that run. A complete task ID matches the workflow run the task ran in, when this list includes that run, or the standalone task itself where standalone tasks are listed. A complete browser profile, browser session, workflow run or task ID is matched against those identifiers only, not the text fields. A credential ID matches when it is the run's sequential credential, the credential the run selected from a pool or fell back to, or the credential bound by a credential parameter on the run's workflow version when the run was created and the run recorded no selection for it. The workflow title and workflow permanent ID are matched as well. Without created_at_start, a search other than a complete browser profile, browser session, workflow run or task ID covers only runs created in the 30 days before created_at_end (or before now).",
               "examples": [
                 "login_url",
                 "wr_abc123",
@@ -6743,7 +7201,7 @@
               ],
               "title": "Search Key"
             },
-            "description": "Case-insensitive substring search across: workflow run ID, parameter key, parameter description, run parameter value, extra HTTP headers and webhook callback URL. A run is returned if any of these fields match. Soft-deleted parameter definitions are excluded from key/description matching. A complete browser profile ID, browser session ID or credential ID matches the run that used it exactly (no substring match). A complete workflow run ID matches that run. A complete task ID matches the workflow run the task ran in, when this list includes that run, or the standalone task itself where standalone tasks are listed. A complete browser profile, browser session, workflow run or task ID is matched against those identifiers only, not the text fields. A credential ID matches when it is the run's sequential credential, the credential the run selected from a pool or fell back to, or the credential bound by a credential parameter on the run's workflow version when the run was created and the run recorded no selection for it. The workflow title and workflow permanent ID are matched as well."
+            "description": "Case-insensitive substring search across: workflow run ID, parameter key, parameter description, run parameter value, extra HTTP headers and webhook callback URL. A run is returned if any of these fields match. Soft-deleted parameter definitions are excluded from key/description matching. A complete browser profile ID, browser session ID or credential ID matches the run that used it exactly (no substring match). A complete workflow run ID matches that run. A complete task ID matches the workflow run the task ran in, when this list includes that run, or the standalone task itself where standalone tasks are listed. A complete browser profile, browser session, workflow run or task ID is matched against those identifiers only, not the text fields. A credential ID matches when it is the run's sequential credential, the credential the run selected from a pool or fell back to, or the credential bound by a credential parameter on the run's workflow version when the run was created and the run recorded no selection for it. The workflow title and workflow permanent ID are matched as well. Without created_at_start, a search other than a complete browser profile, browser session, workflow run or task ID covers only runs created in the 30 days before created_at_end (or before now)."
           },
           {
             "name": "error_code",
@@ -6768,6 +7226,50 @@
               "title": "Error Code"
             },
             "description": "Exact-match filter on the error_code field inside each task's errors JSON array. A run matches if any of its tasks contains an error with a matching error_code. Error codes are user-defined strings set during workflow execution."
+          },
+          {
+            "name": "created_at_start",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string",
+                  "format": "date-time"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "Only include runs created at or after this timestamp (ISO 8601; a value without an offset is read as UTC). Supplying it replaces the 30-day default window of a free-text search_key.",
+              "examples": [
+                "2026-01-01T00:00:00Z"
+              ],
+              "title": "Created At Start"
+            },
+            "description": "Only include runs created at or after this timestamp (ISO 8601; a value without an offset is read as UTC). Supplying it replaces the 30-day default window of a free-text search_key."
+          },
+          {
+            "name": "created_at_end",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string",
+                  "format": "date-time"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "Only include runs created strictly before this timestamp (ISO 8601; a value without an offset is read as UTC). Without created_at_start, a free-text search_key covers the 30 days before this timestamp.",
+              "examples": [
+                "2026-02-01T00:00:00Z"
+              ],
+              "title": "Created At End"
+            },
+            "description": "Only include runs created strictly before this timestamp (ISO 8601; a value without an offset is read as UTC). Without created_at_start, a free-text search_key covers the 30 days before this timestamp."
           },
           {
             "name": "x-api-key",
@@ -6823,7 +7325,7 @@
           "Runs"
         ],
         "summary": "Get all runs by agent",
-        "description": "List runs for a specific workflow.\n\nSupports filtering by **status**, **search_key**, and **error_code**. All filters are combined with **AND** logic.\n\n### search_key\n\nCase-insensitive substring search across: workflow run ID, parameter key, parameter description, run parameter value, extra HTTP headers and webhook callback URL. A run is returned if any of these fields match. Soft-deleted parameter definitions are excluded from key/description matching. A complete browser profile ID, browser session ID or credential ID matches the run that used it exactly (no substring match). A complete workflow run ID matches that run. A complete task ID matches the workflow run the task ran in, when this list includes that run, or the standalone task itself where standalone tasks are listed. A complete browser profile, browser session, workflow run or task ID is matched against those identifiers only, not the text fields. A credential ID matches when it is the run's sequential credential, the credential the run selected from a pool or fell back to, or the credential bound by a credential parameter on the run's workflow version when the run was created and the run recorded no selection for it. The workflow title and workflow permanent ID are matched as well.\n\n### error_code\n\nExact-match filter on the `error_code` field inside each task's `errors` JSON array. A run matches if any of its tasks contains an error with a matching `error_code`.\n\n### include_child_runs\n\nChild runs — runs this workflow started from inside another workflow run — are **excluded by default**, so the history shows only top-level runs. Pass `include_child_runs=true` to list them as well; every run carries a `parent_workflow_run_id` that is `null` for top-level runs.",
+        "description": "List runs for a specific workflow.\n\nSupports filtering by **status**, **search_key**, and **error_code**. All filters are combined with **AND** logic.\n\nUnindexed free-text searches can paginate only through the first 1,000 matching runs. Split larger exports into narrower `created_at_start`/`created_at_end` windows or use a complete run/task ID.\n\n### search_key\n\nCase-insensitive substring search across: workflow run ID, parameter key, parameter description, run parameter value, extra HTTP headers and webhook callback URL. A run is returned if any of these fields match. Soft-deleted parameter definitions are excluded from key/description matching. A complete browser profile ID, browser session ID or credential ID matches the run that used it exactly (no substring match). A complete workflow run ID matches that run. A complete task ID matches the workflow run the task ran in, when this list includes that run, or the standalone task itself where standalone tasks are listed. A complete browser profile, browser session, workflow run or task ID is matched against those identifiers only, not the text fields. A credential ID matches when it is the run's sequential credential, the credential the run selected from a pool or fell back to, or the credential bound by a credential parameter on the run's workflow version when the run was created and the run recorded no selection for it. The workflow title and workflow permanent ID are matched as well.\n\n### error_code\n\nExact-match filter on the `error_code` field inside each task's `errors` JSON array. A run matches if any of its tasks contains an error with a matching `error_code`.\n\n### include_child_runs\n\nChild runs — runs this workflow started from inside another workflow run — are **excluded by default**, so the history shows only top-level runs. Pass `include_child_runs=true` to list them as well; every run carries a `parent_workflow_run_id` that is `null` for top-level runs.",
         "operationId": "get_workflow_runs_by_id_v1_workflows__workflow_id__runs_get",
         "parameters": [
           {
@@ -7856,6 +8358,41 @@
             "application/json": {
               "schema": {
                 "properties": {
+                  "webhook_url": {
+                    "anyOf": [
+                      {
+                        "type": "string"
+                      },
+                      {
+                        "type": "null"
+                      }
+                    ],
+                    "format": "uri",
+                    "title": "Webhook Url",
+                    "description": "After a run is finished, send an update to this URL. Refer to https://www.skyvern.com/docs/running-tasks/webhooks-faq for more details.",
+                    "examples": [
+                      "https://my-site.com/webhook"
+                    ]
+                  },
+                  "proxy_location": {
+                    "anyOf": [
+                      {
+                        "$ref": "#/components/schemas/ProxyLocation"
+                      },
+                      {
+                        "$ref": "#/components/schemas/GeoTarget"
+                      },
+                      {
+                        "additionalProperties": true,
+                        "type": "object"
+                      },
+                      {
+                        "type": "null"
+                      }
+                    ],
+                    "title": "Proxy Location",
+                    "description": "Geographic Proxy location to route the browser traffic through. This is only available in Skyvern Cloud.\n\nAvailable geotargeting options:\n- RESIDENTIAL: the default value. Skyvern Cloud uses a random US residential proxy.\n- RESIDENTIAL_ES: Spain\n- RESIDENTIAL_IE: Ireland\n- RESIDENTIAL_GB: United Kingdom\n- RESIDENTIAL_IN: India\n- RESIDENTIAL_JP: Japan\n- RESIDENTIAL_FR: France\n- RESIDENTIAL_DE: Germany\n- RESIDENTIAL_NZ: New Zealand\n- RESIDENTIAL_PH: Philippines\n- RESIDENTIAL_KR: South Korea\n- RESIDENTIAL_SA: Saudi Arabia\n- RESIDENTIAL_ZA: South Africa\n- RESIDENTIAL_AR: Argentina\n- RESIDENTIAL_AU: Australia\n- RESIDENTIAL_BR: Brazil\n- RESIDENTIAL_TR: Turkey\n- RESIDENTIAL_CA: Canada\n- RESIDENTIAL_MX: Mexico\n- RESIDENTIAL_IT: Italy\n- RESIDENTIAL_NL: Netherlands\n- RESIDENTIAL_ISP: ISP proxy\n- US-CA: California (deprecated, routes through RESIDENTIAL_ISP)\n- US-NY: New York (deprecated, routes through RESIDENTIAL_ISP)\n- US-TX: Texas (deprecated, routes through RESIDENTIAL_ISP)\n- US-FL: Florida (deprecated, routes through RESIDENTIAL_ISP)\n- US-WA: Washington (deprecated, routes through RESIDENTIAL_ISP)\n- NONE: No proxy\n\nFor self-hosted deployments, you can pass a custom proxy URL as a dict: {\"url\": \"http://user:password@proxy.example.com:8080\"}. This routes the browser through your own proxy server and takes precedence over any globally configured proxy pool. Can also be a GeoTarget object for granular city/state targeting: {\"country\": \"US\", \"subdivision\": \"CA\", \"city\": \"San Francisco\"}. Omit it or send null to use the default; Skyvern Cloud then uses RESIDENTIAL."
+                  },
                   "job_url": {
                     "type": "string",
                     "format": "uri",
@@ -7921,6 +8458,41 @@
             "application/json": {
               "schema": {
                 "properties": {
+                  "webhook_url": {
+                    "anyOf": [
+                      {
+                        "type": "string"
+                      },
+                      {
+                        "type": "null"
+                      }
+                    ],
+                    "format": "uri",
+                    "title": "Webhook Url",
+                    "description": "After a run is finished, send an update to this URL. Refer to https://www.skyvern.com/docs/running-tasks/webhooks-faq for more details.",
+                    "examples": [
+                      "https://my-site.com/webhook"
+                    ]
+                  },
+                  "proxy_location": {
+                    "anyOf": [
+                      {
+                        "$ref": "#/components/schemas/ProxyLocation"
+                      },
+                      {
+                        "$ref": "#/components/schemas/GeoTarget"
+                      },
+                      {
+                        "additionalProperties": true,
+                        "type": "object"
+                      },
+                      {
+                        "type": "null"
+                      }
+                    ],
+                    "title": "Proxy Location",
+                    "description": "Geographic Proxy location to route the browser traffic through. This is only available in Skyvern Cloud.\n\nAvailable geotargeting options:\n- RESIDENTIAL: the default value. Skyvern Cloud uses a random US residential proxy.\n- RESIDENTIAL_ES: Spain\n- RESIDENTIAL_IE: Ireland\n- RESIDENTIAL_GB: United Kingdom\n- RESIDENTIAL_IN: India\n- RESIDENTIAL_JP: Japan\n- RESIDENTIAL_FR: France\n- RESIDENTIAL_DE: Germany\n- RESIDENTIAL_NZ: New Zealand\n- RESIDENTIAL_PH: Philippines\n- RESIDENTIAL_KR: South Korea\n- RESIDENTIAL_SA: Saudi Arabia\n- RESIDENTIAL_ZA: South Africa\n- RESIDENTIAL_AR: Argentina\n- RESIDENTIAL_AU: Australia\n- RESIDENTIAL_BR: Brazil\n- RESIDENTIAL_TR: Turkey\n- RESIDENTIAL_CA: Canada\n- RESIDENTIAL_MX: Mexico\n- RESIDENTIAL_IT: Italy\n- RESIDENTIAL_NL: Netherlands\n- RESIDENTIAL_ISP: ISP proxy\n- US-CA: California (deprecated, routes through RESIDENTIAL_ISP)\n- US-NY: New York (deprecated, routes through RESIDENTIAL_ISP)\n- US-TX: Texas (deprecated, routes through RESIDENTIAL_ISP)\n- US-FL: Florida (deprecated, routes through RESIDENTIAL_ISP)\n- US-WA: Washington (deprecated, routes through RESIDENTIAL_ISP)\n- NONE: No proxy\n\nFor self-hosted deployments, you can pass a custom proxy URL as a dict: {\"url\": \"http://user:password@proxy.example.com:8080\"}. This routes the browser through your own proxy server and takes precedence over any globally configured proxy pool. Can also be a GeoTarget object for granular city/state targeting: {\"country\": \"US\", \"subdivision\": \"CA\", \"city\": \"San Francisco\"}. Omit it or send null to use the default; Skyvern Cloud then uses RESIDENTIAL."
+                  },
                   "job_url": {
                     "type": "string",
                     "format": "uri",
@@ -8041,6 +8613,31 @@
                     "type": "string",
                     "format": "binary",
                     "title": "Resume File"
+                  },
+                  "webhook_url": {
+                    "anyOf": [
+                      {
+                        "type": "string"
+                      },
+                      {
+                        "type": "null"
+                      }
+                    ],
+                    "format": "uri",
+                    "title": "Webhook Url",
+                    "description": "After a run is finished, send an update to this URL. Refer to https://www.skyvern.com/docs/running-tasks/webhooks-faq for more details."
+                  },
+                  "proxy_location": {
+                    "anyOf": [
+                      {
+                        "type": "string"
+                      },
+                      {
+                        "type": "null"
+                      }
+                    ],
+                    "title": "Proxy Location",
+                    "description": "A ProxyLocation name such as RESIDENTIAL_GB, or JSON text for a GeoTarget or custom proxy object. Omit it or send blank text to use the default; Skyvern Cloud then uses RESIDENTIAL."
                   },
                   "other_information": {
                     "anyOf": [
@@ -8291,6 +8888,54 @@
             }
           },
           {
+            "name": "action",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Action"
+            }
+          },
+          {
+            "name": "actor_user_id",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Actor User Id"
+            }
+          },
+          {
+            "name": "resource_type",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Resource Type"
+            }
+          },
+          {
             "name": "limit",
             "in": "query",
             "required": false,
@@ -8388,6 +9033,444 @@
           }
         },
         "x-fern-sdk-method-name": "export_audit_events"
+      }
+    },
+    "/v1/audit-events/runs/export": {
+      "get": {
+        "tags": [
+          "Server"
+        ],
+        "summary": "Export workflow run activity",
+        "description": "Export top-level workflow runs for the authenticated organization as JSON or CSV. Only organization admins and full API keys may export. The default window is the last 90 days, with timezone-aware since/until bounds, newest-first keyset pagination, and a maximum page size of 500. CSV output uses fixed columns and is protected from spreadsheet formula execution.",
+        "operationId": "export_run_activity_v1_audit_events_runs_export_get",
+        "parameters": [
+          {
+            "name": "since",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string",
+                  "format": "date-time"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Since"
+            }
+          },
+          {
+            "name": "until",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string",
+                  "format": "date-time"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Until"
+            }
+          },
+          {
+            "name": "limit",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "maximum": 500,
+              "minimum": 1,
+              "default": 100,
+              "title": "Limit"
+            }
+          },
+          {
+            "name": "cursor",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Cursor"
+            }
+          },
+          {
+            "name": "format",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "enum": [
+                "json",
+                "csv"
+              ],
+              "type": "string",
+              "default": "json",
+              "title": "Format"
+            }
+          },
+          {
+            "name": "x-api-key",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Api-Key"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "A page of workflow run activity as JSON, or a CSV download when format=csv.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RunActivityExportResponse"
+                }
+              },
+              "text/csv": {
+                "schema": {
+                  "type": "string",
+                  "format": "binary"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "The caller must be an organization admin or use a full API key.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AuditExportDenialResponse"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        },
+        "x-fern-sdk-method-name": "export_run_activity"
+      }
+    },
+    "/v1/sms-numbers": {
+      "get": {
+        "tags": [
+          "Credentials"
+        ],
+        "summary": "List managed SMS numbers",
+        "description": "List the Skyvern-managed SMS numbers for the authenticated organization.",
+        "operationId": "list_managed_numbers_v1_sms_numbers_get",
+        "parameters": [
+          {
+            "name": "x-api-key",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "Skyvern API key for authentication. API key can be found at https://app.skyvern.com/settings.",
+              "title": "X-Api-Key"
+            },
+            "description": "Skyvern API key for authentication. API key can be found at https://app.skyvern.com/settings."
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "array",
+                  "items": {
+                    "$ref": "#/components/schemas/OrganizationPhoneNumberResponse"
+                  },
+                  "title": "Response List Managed Numbers V1 Sms Numbers Get"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Managed SMS numbers are not enabled for the organization"
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        },
+        "x-fern-sdk-method-name": "list_managed_sms_numbers"
+      },
+      "post": {
+        "tags": [
+          "Credentials"
+        ],
+        "summary": "Provision managed SMS number",
+        "description": "Purchase and configure a Skyvern-managed SMS number for the authenticated organization.",
+        "operationId": "provision_managed_number_v1_sms_numbers_post",
+        "parameters": [
+          {
+            "name": "x-api-key",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "Skyvern API key for authentication. API key can be found at https://app.skyvern.com/settings.",
+              "title": "X-Api-Key"
+            },
+            "description": "Skyvern API key for authentication. API key can be found at https://app.skyvern.com/settings."
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ProvisionManagedNumberRequest"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/OrganizationPhoneNumberResponse"
+                }
+              }
+            }
+          },
+          "402": {
+            "description": "Payment was declined or the billing account is ineligible or delinquent"
+          },
+          "403": {
+            "description": "Managed SMS numbers are not enabled, the plan is not entitled, or the number cap is reached"
+          },
+          "409": {
+            "description": "Another SMS number operation is in progress; retry later"
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          },
+          "502": {
+            "description": "The phone number provider request failed"
+          },
+          "503": {
+            "description": "Billing configuration or Stripe is unavailable, or the payment outcome could not be confirmed"
+          }
+        },
+        "x-fern-sdk-method-name": "provision_managed_sms_number"
+      }
+    },
+    "/v1/sms-numbers/available": {
+      "get": {
+        "tags": [
+          "Credentials"
+        ],
+        "summary": "Search available managed SMS numbers",
+        "description": "Search for available US Skyvern-managed SMS numbers, optionally by area code.",
+        "operationId": "search_available_numbers_v1_sms_numbers_available_get",
+        "parameters": [
+          {
+            "name": "area_code",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string",
+                  "minLength": 3,
+                  "maxLength": 3,
+                  "pattern": "^[2-9][0-9]{2}$"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Area Code"
+            }
+          },
+          {
+            "name": "x-api-key",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "Skyvern API key for authentication. API key can be found at https://app.skyvern.com/settings.",
+              "title": "X-Api-Key"
+            },
+            "description": "Skyvern API key for authentication. API key can be found at https://app.skyvern.com/settings."
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "array",
+                  "items": {
+                    "$ref": "#/components/schemas/AvailableManagedPhoneNumber"
+                  },
+                  "title": "Response Search Available Numbers V1 Sms Numbers Available Get"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Managed SMS numbers are not enabled or the plan is not entitled"
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          },
+          "502": {
+            "description": "The phone number provider request failed"
+          }
+        },
+        "x-fern-sdk-method-name": "search_managed_sms_numbers"
+      }
+    },
+    "/v1/sms-numbers/{phone_number_id}/release": {
+      "post": {
+        "tags": [
+          "Credentials"
+        ],
+        "summary": "Release managed SMS number",
+        "description": "For billing-exempt numbers, forwarding stops immediately. For numbers with a subscription, billing and forwarding continue until the current billing period ends. Skyvern then holds the number for 30 days before it can be reassigned.",
+        "operationId": "release_managed_number_v1_sms_numbers__phone_number_id__release_post",
+        "parameters": [
+          {
+            "name": "phone_number_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "title": "Phone Number Id"
+            }
+          },
+          {
+            "name": "x-api-key",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "Skyvern API key for authentication. API key can be found at https://app.skyvern.com/settings.",
+              "title": "X-Api-Key"
+            },
+            "description": "Skyvern API key for authentication. API key can be found at https://app.skyvern.com/settings."
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/OrganizationPhoneNumberResponse"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Managed SMS numbers are not enabled for the organization"
+          },
+          "404": {
+            "description": "The managed SMS number was not found"
+          },
+          "409": {
+            "description": "The managed SMS number cannot be released in its current state"
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          },
+          "502": {
+            "description": "The phone number provider cleanup request failed"
+          },
+          "503": {
+            "description": "Billing configuration, managed SMS configuration, or Stripe is unavailable"
+          }
+        },
+        "x-fern-sdk-method-name": "release_managed_sms_number"
       }
     }
   },
@@ -8830,6 +9913,18 @@
               }
             ],
             "title": "File Url"
+          },
+          "download_url": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Download Url",
+            "description": "Origin URL recorded by a download action."
           },
           "download": {
             "anyOf": [
@@ -9616,6 +10711,238 @@
         ],
         "title": "ActionType"
       },
+      "AgentStepBlock": {
+        "properties": {
+          "label": {
+            "type": "string",
+            "title": "Label",
+            "description": "Author-facing identifier for a block; unique within a workflow."
+          },
+          "next_block_label": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Next Block Label",
+            "description": "Optional pointer to the next block label when constructing a DAG. Defaults to sequential order when omitted."
+          },
+          "block_type": {
+            "type": "string",
+            "const": "agent_step",
+            "title": "Block Type",
+            "default": "agent_step"
+          },
+          "output_parameter": {
+            "$ref": "#/components/schemas/OutputParameter"
+          },
+          "continue_on_failure": {
+            "type": "boolean",
+            "title": "Continue On Failure",
+            "default": false
+          },
+          "model": {
+            "anyOf": [
+              {
+                "additionalProperties": true,
+                "type": "object"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Model"
+          },
+          "disable_cache": {
+            "type": "boolean",
+            "title": "Disable Cache",
+            "default": false
+          },
+          "ignore_workflow_system_prompt": {
+            "type": "boolean",
+            "title": "Ignore Workflow System Prompt",
+            "default": false
+          },
+          "next_loop_on_failure": {
+            "type": "boolean",
+            "title": "Next Loop On Failure",
+            "default": false
+          },
+          "prompt": {
+            "type": "string",
+            "title": "Prompt"
+          },
+          "data_schema": {
+            "additionalProperties": true,
+            "type": "object",
+            "title": "Data Schema"
+          },
+          "max_turns": {
+            "type": "integer",
+            "title": "Max Turns",
+            "default": 25
+          },
+          "parameters": {
+            "items": {
+              "oneOf": [
+                {
+                  "$ref": "#/components/schemas/WorkflowParameter"
+                },
+                {
+                  "$ref": "#/components/schemas/ContextParameter"
+                },
+                {
+                  "$ref": "#/components/schemas/AWSSecretParameter"
+                },
+                {
+                  "$ref": "#/components/schemas/AzureSecretParameter"
+                },
+                {
+                  "$ref": "#/components/schemas/BitwardenLoginCredentialParameter"
+                },
+                {
+                  "$ref": "#/components/schemas/BitwardenSensitiveInformationParameter"
+                },
+                {
+                  "$ref": "#/components/schemas/BitwardenCreditCardDataParameter"
+                },
+                {
+                  "$ref": "#/components/schemas/OnePasswordCredentialParameter"
+                },
+                {
+                  "$ref": "#/components/schemas/AzureVaultCredentialParameter"
+                },
+                {
+                  "$ref": "#/components/schemas/OutputParameter"
+                },
+                {
+                  "$ref": "#/components/schemas/CredentialParameter"
+                }
+              ],
+              "discriminator": {
+                "propertyName": "parameter_type",
+                "mapping": {
+                  "aws_secret": "#/components/schemas/AWSSecretParameter",
+                  "azure_secret": "#/components/schemas/AzureSecretParameter",
+                  "azure_vault_credential": "#/components/schemas/AzureVaultCredentialParameter",
+                  "bitwarden_credit_card_data": "#/components/schemas/BitwardenCreditCardDataParameter",
+                  "bitwarden_login_credential": "#/components/schemas/BitwardenLoginCredentialParameter",
+                  "bitwarden_sensitive_information": "#/components/schemas/BitwardenSensitiveInformationParameter",
+                  "context": "#/components/schemas/ContextParameter",
+                  "credential": "#/components/schemas/CredentialParameter",
+                  "onepassword": "#/components/schemas/OnePasswordCredentialParameter",
+                  "output": "#/components/schemas/OutputParameter",
+                  "workflow": "#/components/schemas/WorkflowParameter"
+                }
+              }
+            },
+            "type": "array",
+            "title": "Parameters",
+            "default": []
+          }
+        },
+        "type": "object",
+        "required": [
+          "label",
+          "output_parameter",
+          "prompt",
+          "data_schema"
+        ],
+        "title": "AgentStepBlock"
+      },
+      "AgentStepBlockYAML": {
+        "properties": {
+          "block_type": {
+            "type": "string",
+            "const": "agent_step",
+            "title": "Block Type",
+            "default": "agent_step"
+          },
+          "label": {
+            "type": "string",
+            "title": "Label",
+            "description": "Author-facing identifier; must be unique per workflow."
+          },
+          "next_block_label": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Next Block Label",
+            "description": "Optional pointer to the label of the next block. When omitted, it will default to sequential order. See [[s-4bnl]]."
+          },
+          "continue_on_failure": {
+            "type": "boolean",
+            "title": "Continue On Failure",
+            "default": false
+          },
+          "model": {
+            "anyOf": [
+              {
+                "additionalProperties": true,
+                "type": "object"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Model"
+          },
+          "ignore_workflow_system_prompt": {
+            "type": "boolean",
+            "title": "Ignore Workflow System Prompt",
+            "default": false
+          },
+          "next_loop_on_failure": {
+            "type": "boolean",
+            "title": "Next Loop On Failure",
+            "default": false
+          },
+          "prompt": {
+            "type": "string",
+            "title": "Prompt"
+          },
+          "data_schema": {
+            "additionalProperties": true,
+            "type": "object",
+            "title": "Data Schema"
+          },
+          "max_turns": {
+            "type": "integer",
+            "maximum": 200,
+            "minimum": 1,
+            "title": "Max Turns",
+            "default": 25
+          },
+          "parameter_keys": {
+            "anyOf": [
+              {
+                "items": {
+                  "type": "string"
+                },
+                "type": "array"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Parameter Keys"
+          }
+        },
+        "type": "object",
+        "required": [
+          "label",
+          "prompt"
+        ],
+        "title": "AgentStepBlockYAML"
+      },
       "Artifact": {
         "properties": {
           "created_at": {
@@ -9909,6 +11236,17 @@
             ],
             "title": "Actor User Id"
           },
+          "impersonated_by": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Impersonated By"
+          },
           "auth_kind": {
             "type": "string",
             "title": "Auth Kind"
@@ -9966,6 +11304,7 @@
           "created_at",
           "organization_id",
           "actor_user_id",
+          "impersonated_by",
           "auth_kind",
           "org_role",
           "action",
@@ -10016,6 +11355,28 @@
           "next_action": {
             "type": "string",
             "title": "Next Action"
+          },
+          "role": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Role"
+          },
+          "action": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Action"
           }
         },
         "type": "object",
@@ -10040,6 +11401,68 @@
           "detail"
         ],
         "title": "AuditExportDenialResponse"
+      },
+      "AvailableManagedPhoneNumber": {
+        "properties": {
+          "phone_number": {
+            "type": "string",
+            "title": "Phone Number"
+          },
+          "friendly_name": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Friendly Name"
+          },
+          "locality": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Locality"
+          },
+          "region": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Region"
+          },
+          "iso_country": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Iso Country"
+          },
+          "monthly_price_cents": {
+            "type": "integer",
+            "title": "Monthly Price Cents"
+          }
+        },
+        "type": "object",
+        "required": [
+          "phone_number",
+          "monthly_price_cents"
+        ],
+        "title": "AvailableManagedPhoneNumber"
       },
       "AzureSecretParameter": {
         "properties": {
@@ -10807,7 +12230,8 @@
           "split_pdf",
           "email_inbox",
           "data_export",
-          "terminate"
+          "terminate",
+          "agent_step"
         ],
         "title": "BlockType"
       },
@@ -11533,6 +12957,28 @@
             ],
             "title": "Warning",
             "description": "Advisory message about how the request was adjusted, if it was. Set when a requested timeout above the maximum was capped at creation, when an extension was granted less than it asked for, or when an extension was accepted but not yet confirmed; null otherwise."
+          },
+          "source": {
+            "type": "string",
+            "enum": [
+              "managed",
+              "external"
+            ],
+            "title": "Source",
+            "description": "\"external\" for a browser the caller registered and runs itself; \"managed\" for one Skyvern runs.",
+            "default": "managed"
+          },
+          "remaining_lifetime_seconds": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Remaining Lifetime Seconds",
+            "description": "Seconds left before a registered external browser's fixed deadline. Null for managed sessions and once the session has ended."
           }
         },
         "type": "object",
@@ -13023,6 +14469,18 @@
         ],
         "title": "CreateScriptResponse"
       },
+      "CreateTwilioCredentialRequest": {
+        "properties": {
+          "credential": {
+            "$ref": "#/components/schemas/TwilioCredential"
+          }
+        },
+        "type": "object",
+        "required": [
+          "credential"
+        ],
+        "title": "CreateTwilioCredentialRequest"
+      },
       "CredentialParameter": {
         "properties": {
           "parameter_type": {
@@ -13275,6 +14733,43 @@
             ],
             "description": "Which vault stores this credential (e.g., 'skyvern', 'bitwarden', 'azure_vault', 'custom')"
           },
+          "vault_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Vault Id",
+            "description": "1Password vault ID for linked credentials"
+          },
+          "item_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Item Id",
+            "description": "1Password item ID for linked credentials"
+          },
+          "upstream_missing_at": {
+            "anyOf": [
+              {
+                "type": "string",
+                "format": "date-time"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Upstream Missing At",
+            "description": "When the linked 1Password item was last found missing upstream"
+          },
           "browser_profile_id": {
             "anyOf": [
               {
@@ -13432,7 +14927,8 @@
           "bitwarden",
           "azure_vault",
           "gcp",
-          "custom"
+          "custom",
+          "onepassword"
         ],
         "title": "CredentialVaultType"
       },
@@ -14085,6 +15581,19 @@
         ],
         "title": "DeployScriptRequest",
         "description": "Request model for deploying a script with updated files."
+      },
+      "DisablePhoneNumberRequest": {
+        "properties": {
+          "phone_number_id": {
+            "type": "string",
+            "title": "Phone Number Id"
+          }
+        },
+        "type": "object",
+        "required": [
+          "phone_number_id"
+        ],
+        "title": "DisablePhoneNumberRequest"
       },
       "DownloadFilesRequest": {
         "properties": {
@@ -14786,6 +16295,7 @@
           "download_attachments": {
             "type": "boolean",
             "title": "Download Attachments",
+            "description": "Download non-inline attachments from matched emails for downstream blocks.",
             "default": false
           },
           "parameter_keys": {
@@ -14809,6 +16319,43 @@
           "email_client"
         ],
         "title": "EmailInboxBlockYAML"
+      },
+      "EmailTransport": {
+        "type": "string",
+        "enum": [
+          "smtp",
+          "gmail"
+        ],
+        "title": "EmailTransport"
+      },
+      "EnablePhoneNumberRequest": {
+        "properties": {
+          "phone_number_sid": {
+            "type": "string",
+            "title": "Phone Number Sid"
+          },
+          "confirm_takeover": {
+            "type": "boolean",
+            "title": "Confirm Takeover",
+            "default": false
+          },
+          "credential_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Credential Id"
+          }
+        },
+        "type": "object",
+        "required": [
+          "phone_number_sid"
+        ],
+        "title": "EnablePhoneNumberRequest"
       },
       "ExtendBrowserSessionRequest": {
         "properties": {
@@ -16007,6 +17554,17 @@
           "download_target": {
             "$ref": "#/components/schemas/FileDownloadTarget",
             "default": "website"
+          },
+          "sftp_source_path": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Sftp Source Path"
           }
         },
         "type": "object",
@@ -16269,6 +17827,17 @@
               }
             ],
             "title": "Sftp Host Key"
+          },
+          "sftp_source_path": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Sftp Source Path"
           },
           "path": {
             "anyOf": [
@@ -16693,6 +18262,12 @@
               }
             ],
             "title": "Worksheet"
+          },
+          "force_ocr": {
+            "type": "boolean",
+            "title": "Force Ocr",
+            "description": "PDF only: ignore the PDF's embedded text layer and read the pages with vision OCR instead. Use it when a PDF's text layer is unreadable in a way Skyvern does not detect on its own. OCR reads at most the first 50 pages, so a longer PDF loses the rest; leave this off unless the text layer is unusable.",
+            "default": false
           }
         },
         "type": "object",
@@ -16785,6 +18360,12 @@
               }
             ],
             "title": "Worksheet"
+          },
+          "force_ocr": {
+            "type": "boolean",
+            "title": "Force Ocr",
+            "description": "PDF only: ignore the PDF's embedded text layer and read the pages with vision OCR instead. Use it when a PDF's text layer is unreadable in a way Skyvern does not detect on its own. OCR reads at most the first 50 pages, so a longer PDF loses the rest; leave this off unless the text layer is unusable.",
+            "default": false
           }
         },
         "type": "object",
@@ -17691,12 +19272,16 @@
                 },
                 {
                   "$ref": "#/components/schemas/TerminateBlock"
+                },
+                {
+                  "$ref": "#/components/schemas/AgentStepBlock"
                 }
               ],
               "discriminator": {
                 "propertyName": "block_type",
                 "mapping": {
                   "action": "#/components/schemas/ActionBlock",
+                  "agent_step": "#/components/schemas/AgentStepBlock",
                   "code": "#/components/schemas/CodeBlock",
                   "conditional": "#/components/schemas/ConditionalBlock",
                   "data_export": "#/components/schemas/DataExportBlock",
@@ -17950,6 +19535,9 @@
                 },
                 {
                   "$ref": "#/components/schemas/TerminateBlockYAML"
+                },
+                {
+                  "$ref": "#/components/schemas/AgentStepBlockYAML"
                 },
                 {
                   "$ref": "#/components/schemas/UrlBlockYAML"
@@ -21754,6 +23342,131 @@
         ],
         "title": "OneTimeDispatchStatus"
       },
+      "OrganizationPhoneNumberResponse": {
+        "properties": {
+          "phone_number_id": {
+            "type": "string",
+            "title": "Phone Number Id"
+          },
+          "organization_id": {
+            "type": "string",
+            "title": "Organization Id"
+          },
+          "sms_config_id": {
+            "type": "string",
+            "title": "Sms Config Id"
+          },
+          "phone_number": {
+            "type": "string",
+            "title": "Phone Number"
+          },
+          "provider": {
+            "type": "string",
+            "title": "Provider"
+          },
+          "credential_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Credential Id"
+          },
+          "price_cents": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Price Cents"
+          },
+          "billing_exempt": {
+            "type": "boolean",
+            "title": "Billing Exempt",
+            "default": false
+          },
+          "status": {
+            "type": "string",
+            "enum": [
+              "active",
+              "disabled",
+              "released",
+              "quarantined",
+              "provisioning",
+              "quarantining",
+              "releasing",
+              "surrendering",
+              "reversal_pending"
+            ],
+            "title": "Status"
+          },
+          "cancel_at": {
+            "anyOf": [
+              {
+                "type": "string",
+                "format": "date-time"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Cancel At"
+          },
+          "quarantined_until": {
+            "anyOf": [
+              {
+                "type": "string",
+                "format": "date-time"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Quarantined Until"
+          },
+          "created_at": {
+            "type": "string",
+            "format": "date-time",
+            "title": "Created At"
+          },
+          "modified_at": {
+            "type": "string",
+            "format": "date-time",
+            "title": "Modified At"
+          },
+          "deleted_at": {
+            "anyOf": [
+              {
+                "type": "string",
+                "format": "date-time"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Deleted At"
+          }
+        },
+        "type": "object",
+        "required": [
+          "phone_number_id",
+          "organization_id",
+          "sms_config_id",
+          "phone_number",
+          "provider",
+          "status",
+          "created_at",
+          "modified_at"
+        ],
+        "title": "OrganizationPhoneNumberResponse",
+        "description": "Safe phone-number metadata without provider routing or cost secrets."
+      },
       "OrganizationScheduleItem": {
         "properties": {
           "workflow_schedule_id": {
@@ -22889,6 +24602,20 @@
         "title": "PromptBranchCriteria",
         "description": "Natural language branch criteria."
       },
+      "ProvisionManagedNumberRequest": {
+        "properties": {
+          "phone_number": {
+            "type": "string",
+            "minLength": 1,
+            "title": "Phone Number"
+          }
+        },
+        "type": "object",
+        "required": [
+          "phone_number"
+        ],
+        "title": "ProvisionManagedNumberRequest"
+      },
       "ProxyLocation": {
         "type": "string",
         "enum": [
@@ -22940,6 +24667,118 @@
         },
         "type": "object",
         "title": "RetryRunWebhookRequest"
+      },
+      "RunActivityExportResponse": {
+        "properties": {
+          "rows": {
+            "items": {
+              "$ref": "#/components/schemas/RunActivityExportRow"
+            },
+            "type": "array",
+            "title": "Rows"
+          },
+          "next": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Next"
+          }
+        },
+        "type": "object",
+        "required": [
+          "rows",
+          "next"
+        ],
+        "title": "RunActivityExportResponse"
+      },
+      "RunActivityExportRow": {
+        "properties": {
+          "workflow_run_id": {
+            "type": "string",
+            "title": "Workflow Run Id"
+          },
+          "created_at": {
+            "type": "string",
+            "format": "date-time",
+            "title": "Created At"
+          },
+          "workflow_permanent_id": {
+            "type": "string",
+            "title": "Workflow Permanent Id"
+          },
+          "trigger_type": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Trigger Type"
+          },
+          "created_by": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Created By"
+          },
+          "requested_by": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Requested By"
+          },
+          "workflow_schedule_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Workflow Schedule Id"
+          },
+          "retried_from_workflow_run_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Retried From Workflow Run Id"
+          }
+        },
+        "type": "object",
+        "required": [
+          "workflow_run_id",
+          "created_at",
+          "workflow_permanent_id",
+          "trigger_type",
+          "created_by",
+          "requested_by",
+          "workflow_schedule_id",
+          "retried_from_workflow_run_id"
+        ],
+        "title": "RunActivityExportRow"
       },
       "RunEngine": {
         "type": "string",
@@ -23775,6 +25614,43 @@
               }
             ],
             "title": "Custom Smtp Password"
+          },
+          "transport": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/EmailTransport"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "credential_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Credential Id"
+          },
+          "cc": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array",
+            "title": "Cc",
+            "default": []
+          },
+          "bcc": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array",
+            "title": "Bcc",
+            "default": []
           }
         },
         "type": "object",
@@ -23936,7 +25812,9 @@
           },
           "sender": {
             "type": "string",
-            "title": "Sender"
+            "title": "Sender",
+            "description": "From address. Required unless transport is 'gmail'.",
+            "default": ""
           },
           "recipients": {
             "items": {
@@ -23970,12 +25848,50 @@
               }
             ],
             "title": "File Attachments"
+          },
+          "transport": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/EmailTransport"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "How the email is sent. Omit for SMTP. 'gmail' sends from the connected Google account named by credential_id; sender and the SMTP settings are then unused."
+          },
+          "credential_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Credential Id",
+            "description": "ID of a connected Google account that has send permission. Used only with transport 'gmail'."
+          },
+          "cc": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array",
+            "title": "Cc",
+            "description": "Cc recipients. Only with transport 'gmail'."
+          },
+          "bcc": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array",
+            "title": "Bcc",
+            "description": "Bcc recipients. Only with transport 'gmail'."
           }
         },
         "type": "object",
         "required": [
           "label",
-          "sender",
           "recipients",
           "subject",
           "body"
@@ -25886,7 +27802,7 @@
               }
             ],
             "title": "Totp Identifier",
-            "description": "\nIdentifier for the TOTP/2FA/MFA code when the code is pushed to Skyvern. Refer to https://www.skyvern.com/docs/credentials/totp#option-3-push-code-to-skyvern for more details.\n",
+            "description": "\nIdentifier for the TOTP/2FA/MFA code when the code is pushed to Skyvern. Refer to https://www.skyvern.com/docs/credentials#push-a-code for more details.\n",
             "examples": [
               "john.doe@example.com",
               "4155555555",
@@ -25903,7 +27819,7 @@
               }
             ],
             "title": "Totp Url",
-            "description": "\nURL that serves TOTP/2FA/MFA codes for Skyvern to use during the workflow run. Refer to https://www.skyvern.com/docs/credentials/totp#option-2-get-code-from-your-endpoint for more details.\n",
+            "description": "\nURL that serves TOTP/2FA/MFA codes for Skyvern to use during the workflow run. Refer to https://www.skyvern.com/docs/credentials#let-skyvern-fetch-codes-from-your-endpoint for more details.\n",
             "examples": [
               "https://my-totp-service.com/totp"
             ]
@@ -26227,7 +28143,7 @@
               }
             ],
             "title": "Totp Identifier",
-            "description": "\nIdentifier for the TOTP/2FA/MFA code when the code is pushed to Skyvern. Refer to https://www.skyvern.com/docs/credentials/totp#option-3-push-code-to-skyvern for more details.\n",
+            "description": "\nIdentifier for the TOTP/2FA/MFA code when the code is pushed to Skyvern. Refer to https://www.skyvern.com/docs/credentials#push-a-code for more details.\n",
             "examples": [
               "john.doe@example.com",
               "4155555555",
@@ -26244,7 +28160,7 @@
               }
             ],
             "title": "Totp Url",
-            "description": "\nURL that serves TOTP/2FA/MFA codes for Skyvern to use during the workflow run. Refer to https://www.skyvern.com/docs/credentials/totp#option-2-get-code-from-your-endpoint for more details.\n",
+            "description": "\nURL that serves TOTP/2FA/MFA codes for Skyvern to use during the workflow run. Refer to https://www.skyvern.com/docs/credentials#let-skyvern-fetch-codes-from-your-endpoint for more details.\n",
             "examples": [
               "https://my-totp-service.com/totp"
             ]
@@ -27691,6 +29607,157 @@
         ],
         "title": "TotpType",
         "description": "Type of 2FA/TOTP method used."
+      },
+      "TwilioCredential": {
+        "properties": {
+          "account_sid": {
+            "type": "string",
+            "title": "Account Sid"
+          },
+          "api_key_sid": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Api Key Sid"
+          },
+          "api_key_secret": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Api Key Secret"
+          },
+          "auth_token": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Auth Token"
+          }
+        },
+        "type": "object",
+        "required": [
+          "account_sid"
+        ],
+        "title": "TwilioCredential"
+      },
+      "TwilioCredentialResponse": {
+        "properties": {
+          "credential": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/TwilioCredentialSafe"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          }
+        },
+        "type": "object",
+        "title": "TwilioCredentialResponse"
+      },
+      "TwilioCredentialSafe": {
+        "properties": {
+          "account_sid": {
+            "type": "string",
+            "title": "Account Sid"
+          },
+          "api_key_sid": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Api Key Sid"
+          },
+          "has_api_key_secret": {
+            "type": "boolean",
+            "title": "Has Api Key Secret"
+          },
+          "has_auth_token": {
+            "type": "boolean",
+            "title": "Has Auth Token"
+          }
+        },
+        "type": "object",
+        "required": [
+          "account_sid",
+          "has_api_key_secret",
+          "has_auth_token"
+        ],
+        "title": "TwilioCredentialSafe"
+      },
+      "TwilioPhoneNumberInfo": {
+        "properties": {
+          "sid": {
+            "type": "string",
+            "title": "Sid"
+          },
+          "phone_number": {
+            "type": "string",
+            "title": "Phone Number"
+          },
+          "friendly_name": {
+            "type": "string",
+            "title": "Friendly Name"
+          },
+          "sms_capable": {
+            "type": "boolean",
+            "title": "Sms Capable"
+          },
+          "current_sms_url": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Current Sms Url"
+          },
+          "enabled": {
+            "type": "boolean",
+            "title": "Enabled"
+          },
+          "phone_number_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Phone Number Id"
+          }
+        },
+        "type": "object",
+        "required": [
+          "sid",
+          "phone_number",
+          "friendly_name",
+          "sms_capable",
+          "enabled"
+        ],
+        "title": "TwilioPhoneNumberInfo"
       },
       "UpdateBrowserProfileRequest": {
         "properties": {
@@ -29752,12 +31819,16 @@
                 },
                 {
                   "$ref": "#/components/schemas/TerminateBlock"
+                },
+                {
+                  "$ref": "#/components/schemas/AgentStepBlock"
                 }
               ],
               "discriminator": {
                 "propertyName": "block_type",
                 "mapping": {
                   "action": "#/components/schemas/ActionBlock",
+                  "agent_step": "#/components/schemas/AgentStepBlock",
                   "code": "#/components/schemas/CodeBlock",
                   "conditional": "#/components/schemas/ConditionalBlock",
                   "data_export": "#/components/schemas/DataExportBlock",
@@ -29939,6 +32010,9 @@
                 },
                 {
                   "$ref": "#/components/schemas/TerminateBlockYAML"
+                },
+                {
+                  "$ref": "#/components/schemas/AgentStepBlockYAML"
                 },
                 {
                   "$ref": "#/components/schemas/UrlBlockYAML"
@@ -30324,6 +32398,17 @@
             ],
             "title": "Edited By"
           },
+          "build_source": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/WorkflowBuildSource"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Which surface wrote this version: ui, copilot, mcp, cli, api, or internal. Null before tracking began."
+          },
           "copilot_authored": {
             "type": "boolean",
             "title": "Copilot Authored",
@@ -30408,6 +32493,19 @@
           "agent_id"
         ],
         "title": "Workflow"
+      },
+      "WorkflowBuildSource": {
+        "type": "string",
+        "enum": [
+          "ui",
+          "copilot",
+          "mcp",
+          "cli",
+          "api",
+          "internal"
+        ],
+        "title": "WorkflowBuildSource",
+        "description": "Which surface wrote a workflow version.\n\n- ui: the Skyvern app\n- copilot: the workflow copilot\n- mcp: a first-party MCP client\n- cli: the Skyvern CLI\n- api: any other API or SDK caller\n- internal: a workflow Skyvern creates for its own runs (task v2, login, credential tests)"
       },
       "WorkflowCreateYAMLRequest": {
         "properties": {
@@ -30876,12 +32974,16 @@
                 },
                 {
                   "$ref": "#/components/schemas/TerminateBlock"
+                },
+                {
+                  "$ref": "#/components/schemas/AgentStepBlock"
                 }
               ],
               "discriminator": {
                 "propertyName": "block_type",
                 "mapping": {
                   "action": "#/components/schemas/ActionBlock",
+                  "agent_step": "#/components/schemas/AgentStepBlock",
                   "code": "#/components/schemas/CodeBlock",
                   "conditional": "#/components/schemas/ConditionalBlock",
                   "data_export": "#/components/schemas/DataExportBlock",
@@ -31129,6 +33231,9 @@
                   "$ref": "#/components/schemas/TerminateBlockYAML"
                 },
                 {
+                  "$ref": "#/components/schemas/AgentStepBlockYAML"
+                },
+                {
                   "$ref": "#/components/schemas/UrlBlockYAML"
                 },
                 {
@@ -31172,6 +33277,7 @@
                 "propertyName": "block_type",
                 "mapping": {
                   "action": "#/components/schemas/ActionBlockYAML",
+                  "agent_step": "#/components/schemas/AgentStepBlockYAML",
                   "code": "#/components/schemas/CodeBlockYAML",
                   "conditional": "#/components/schemas/ConditionalBlockYAML",
                   "data_export": "#/components/schemas/DataExportBlockYAML",
@@ -32835,7 +34941,7 @@
               }
             ],
             "title": "Totp Url",
-            "description": "\nURL that serves TOTP/2FA/MFA codes for Skyvern to use during the workflow run. Refer to https://www.skyvern.com/docs/credentials/totp#option-2-get-code-from-your-endpoint for more details.\n",
+            "description": "\nURL that serves TOTP/2FA/MFA codes for Skyvern to use during the workflow run. Refer to https://www.skyvern.com/docs/credentials#let-skyvern-fetch-codes-from-your-endpoint for more details.\n",
             "examples": [
               "https://my-totp-service.com/totp"
             ]
@@ -32850,7 +34956,7 @@
               }
             ],
             "title": "Totp Identifier",
-            "description": "\nIdentifier for the TOTP/2FA/MFA code when the code is pushed to Skyvern. Refer to https://www.skyvern.com/docs/credentials/totp#option-3-push-code-to-skyvern for more details.\n",
+            "description": "\nIdentifier for the TOTP/2FA/MFA code when the code is pushed to Skyvern. Refer to https://www.skyvern.com/docs/credentials#push-a-code for more details.\n",
             "examples": [
               "john.doe@example.com",
               "4155555555",
@@ -33134,7 +35240,7 @@
               }
             ],
             "title": "Totp Url",
-            "description": "\nURL that serves TOTP/2FA/MFA codes for Skyvern to use during the workflow run. Refer to https://www.skyvern.com/docs/credentials/totp#option-2-get-code-from-your-endpoint for more details.\n",
+            "description": "\nURL that serves TOTP/2FA/MFA codes for Skyvern to use during the workflow run. Refer to https://www.skyvern.com/docs/credentials#let-skyvern-fetch-codes-from-your-endpoint for more details.\n",
             "examples": [
               "https://my-totp-service.com/totp"
             ]
@@ -33149,7 +35255,7 @@
               }
             ],
             "title": "Totp Identifier",
-            "description": "\nIdentifier for the TOTP/2FA/MFA code when the code is pushed to Skyvern. Refer to https://www.skyvern.com/docs/credentials/totp#option-3-push-code-to-skyvern for more details.\n",
+            "description": "\nIdentifier for the TOTP/2FA/MFA code when the code is pushed to Skyvern. Refer to https://www.skyvern.com/docs/credentials#push-a-code for more details.\n",
             "examples": [
               "john.doe@example.com",
               "4155555555",
@@ -33829,10 +35935,11 @@
           "webhook",
           "event",
           "job_recipe_extract",
-          "job_recipe_apply"
+          "job_recipe_apply",
+          "seo_recipe_submit"
         ],
         "title": "WorkflowRunTriggerType",
-        "description": "How a workflow run was initiated.\n\n- manual: User clicked \"Run\" in the UI\n- mcp: First-party MCP client request\n- api: Direct API call to the run endpoint\n- scheduled: Triggered by a cron schedule\n- webhook: Triggered by an external system via the webhook endpoint\n- event: Triggered by an external event source\n- job_recipe_extract: Launched by a job recipe extract request\n- job_recipe_apply: Launched by a job recipe apply request"
+        "description": "How a workflow run was initiated.\n\n- manual: User clicked \"Run\" in the UI\n- mcp: First-party MCP client or Skyvern CLI request\n- api: Direct API call to the run endpoint\n- scheduled: Triggered by a cron schedule\n- webhook: Triggered by an external system via the webhook endpoint\n- event: Triggered by an external event source\n- job_recipe_extract: Launched by a job recipe extract request\n- job_recipe_apply: Launched by a job recipe apply request\n- seo_recipe_submit: Launched by an SEO recipe directory submission"
       },
       "WorkflowSchedule": {
         "properties": {
@@ -33967,6 +36074,18 @@
               }
             ],
             "title": "Description"
+          },
+          "created_by": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Created By",
+            "description": "Who the schedule runs as; null for schedules created before owners were recorded."
           },
           "created_at": {
             "type": "string",
