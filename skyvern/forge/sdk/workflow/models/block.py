@@ -191,7 +191,11 @@ from skyvern.forge.sdk.db.enums import TaskType
 from skyvern.forge.sdk.db.exceptions import NotFoundError
 from skyvern.forge.sdk.db.id import generate_action_id, generate_workflow_run_id
 from skyvern.forge.sdk.db.repositories.google_oauth import DISPATCH_ACCEPTED, DISPATCH_FAILED, GmailSendDispatch
-from skyvern.forge.sdk.executor.run_liveness import run_lease_lost, run_lease_tasks_enabled
+from skyvern.forge.sdk.executor.run_liveness import (
+    run_lease_final_write_blocked,
+    run_lease_lost,
+    run_lease_tasks_enabled,
+)
 from skyvern.forge.sdk.experimentation.code_block_ai_fallback import code_block_ai_fallback_flag_enabled
 from skyvern.forge.sdk.experimentation.llm_prompt_config import get_llm_handler_for_prompt_type
 from skyvern.forge.sdk.experimentation.workflow_block_engine import (
@@ -2400,12 +2404,16 @@ class BaseTaskBlock(Block):
         if failure_reason and run_secrets:
             failure_reason = redact_secrets_from_text(failure_reason, run_secrets)
 
-        await app.DATABASE.tasks.update_task(
+        final_write_blocked = await run_lease_final_write_blocked(task.workflow_run_id or task.task_id)
+        updated_task = await app.DATABASE.tasks.update_task(
             task.task_id,
             status=TaskStatus.failed,
             organization_id=organization_id,
             failure_reason=failure_reason,
+            keep_final_status=final_write_blocked,
         )
+        if final_write_blocked and updated_task.status != TaskStatus.failed:
+            return
         # Detect user-defined errors if error_code_mapping is provided
         if self.error_code_mapping:
             try:

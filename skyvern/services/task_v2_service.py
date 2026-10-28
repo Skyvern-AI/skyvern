@@ -55,6 +55,7 @@ from skyvern.forge.sdk.db.enums import OrganizationAuthTokenType, WorkflowBuildS
 from skyvern.forge.sdk.executor.run_liveness import (
     acquire_run_lease,
     note_run_finalized,
+    run_lease_final_write_blocked,
     run_lease_lost,
     run_lease_tasks_enabled,
     track_run,
@@ -2435,10 +2436,14 @@ async def _update_task_v2_status(
     keep_final_status = False
     if run_lease_tasks_enabled():
         current = await app.DATABASE.observer.get_task_v2(task_v2_id, organization_id=organization_id)
-        if current is not None and current.workflow_run_id and await run_lease_lost(current.workflow_run_id):
+        if current is not None and current.workflow_run_id:
             if not status.is_final():
-                return await app.DATABASE.observer.get_task_v2(task_v2_id, organization_id=organization_id) or current
-            keep_final_status = True
+                if await run_lease_lost(current.workflow_run_id):
+                    return (
+                        await app.DATABASE.observer.get_task_v2(task_v2_id, organization_id=organization_id) or current
+                    )
+            elif await run_lease_final_write_blocked(current.workflow_run_id):
+                keep_final_status = True
     task_v2 = await app.DATABASE.observer.update_task_v2(
         task_v2_id,
         organization_id=organization_id,
