@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import secrets
+from collections.abc import Callable
 from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import UTC, datetime
@@ -20,6 +21,7 @@ from skyvern.forge.sdk.api.llm import api_handler_factory
 from skyvern.forge.sdk.api.llm.config_registry import LLMConfigRegistry
 from skyvern.forge.sdk.api.llm.models import LLMRouterConfig, LLMRouterModelConfig
 from skyvern.forge.sdk.db.enums import TaskType
+from skyvern.forge.sdk.executor.run_liveness import RunWriteAuthority
 from skyvern.forge.sdk.models import Step, StepStatus
 from skyvern.forge.sdk.schemas.organizations import Organization
 from skyvern.forge.sdk.schemas.tasks import Task, TaskStatus
@@ -475,7 +477,15 @@ class InMemoryTaskStepRepo:
             task.webhook_failure_reason = webhook_failure_reason
         return task, finish_claimed, True
 
-    async def update_step(self, task_id: str, step_id: str, organization_id: str | None = None, **updates: Any) -> Step:
+    async def update_step(
+        self,
+        task_id: str,
+        step_id: str,
+        organization_id: str | None = None,
+        *,
+        write_authority_for_run: Callable[[str], RunWriteAuthority | None] | None = None,
+        **updates: Any,
+    ) -> Step:
         assert self.step is not None and self.step.step_id == step_id, f"no step {step_id}"
         for key, value in updates.items():
             if key in _STEP_COUNTER_COLUMNS:
