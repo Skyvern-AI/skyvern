@@ -48,6 +48,7 @@ describe("nodeTypes composition order", () => {
         "splitPdf",
         "dataExport",
         "terminate",
+        "agentStep",
         "emailInbox",
       ]),
     );

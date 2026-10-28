@@ -230,6 +230,15 @@ export const helpTooltips = {
     errorCode:
       "Optional. A code recorded with the run, so a retry rule, the run list filter, or a webhook can tell this stop apart. Other parameters and earlier block outputs can be referenced. Credentials and secrets cannot be referenced; a template that references one is dropped. Leave empty for no code.",
   },
+  agentStep: {
+    ...baseHelpTooltipContent,
+    prompt:
+      "What the agent should find out or do. A model calls this run's blocks as tools until it can return the data schema's fields. Use {{ parameter_name }} to reference an input value.",
+    dataSchema:
+      "The fields the agent returns, as a JSON object schema. A Conditional block after this one can branch on them.",
+    maxTurns:
+      "The most model turns the agent may take before the block fails. Between 1 and 200.",
+  },
   wait: {
     ...baseHelpTooltipContent,
     waitInSeconds:

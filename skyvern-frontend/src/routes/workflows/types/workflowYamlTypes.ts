@@ -170,6 +170,7 @@ export type BlockYAML =
   | LoginBlockYAML
   | WaitBlockYAML
   | TerminateBlockYAML
+  | AgentStepBlockYAML
   | FileDownloadBlockYAML
   | PDFParserBlockYAML
   | Taskv2BlockYAML
@@ -344,6 +345,14 @@ export type TerminateBlockYAML = BlockYAMLBase & {
   block_type: "terminate";
   reason: string;
   error_code: string | null;
+};
+
+export type AgentStepBlockYAML = BlockYAMLBase & {
+  block_type: "agent_step";
+  prompt: string;
+  data_schema: Record<string, unknown> | string | null;
+  max_turns: number;
+  parameter_keys?: Array<string> | null;
 };
 
 export type FileDownloadBlockYAML = BlockYAMLBase & {

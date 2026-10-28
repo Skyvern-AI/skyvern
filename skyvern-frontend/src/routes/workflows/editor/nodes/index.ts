@@ -38,6 +38,8 @@ import { WaitNode } from "./WaitNode/types";
 import { WaitNode as WaitNodeComponent } from "./WaitNode/WaitNode";
 import { TerminateNode } from "./TerminateNode/types";
 import { TerminateNode as TerminateNodeComponent } from "./TerminateNode/TerminateNode";
+import { AgentStepNode } from "./AgentStepNode/types";
+import { AgentStepNode as AgentStepNodeComponent } from "./AgentStepNode/AgentStepNode";
 import { FileDownloadNode } from "./FileDownloadNode/types";
 import { FileDownloadNode as FileDownloadNodeComponent } from "./FileDownloadNode/FileDownloadNode";
 import { PDFParserNode } from "./PDFParserNode/types";
@@ -95,6 +97,7 @@ export type WorkflowBlockNode =
   | LoginNode
   | WaitNode
   | TerminateNode
+  | AgentStepNode
   | FileDownloadNode
   | PDFParserNode
   | Taskv2Node
@@ -181,6 +184,7 @@ export const nodeTypes = {
   login: wrapBlock(LoginNodeComponent),
   wait: wrapBlock(WaitNodeComponent),
   terminate: wrapBlock(TerminateNodeComponent),
+  agentStep: wrapBlock(AgentStepNodeComponent),
   fileDownload: wrapBlock(FileDownloadNodeComponent),
   pdfParser: wrapBlock(PDFParserNodeComponent),
   taskv2: wrapBlock(Taskv2NodeComponent),

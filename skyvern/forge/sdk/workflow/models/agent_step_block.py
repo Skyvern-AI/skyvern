@@ -16,6 +16,17 @@ LOG = structlog.get_logger()
 LLM_FLAG = "AGENT_BLOCK_LLM_NAME"
 
 
+def usable_agent_llm_key(variant: str | None) -> bool:
+    if not variant:
+        return False
+    config = LLMConfigRegistry.get_config(variant) if LLMConfigRegistry.is_registered(variant) else None
+    return (
+        not is_custom_llm_key(variant)
+        and config is not None
+        and bool(config.pin_reasoning_effort and config.reasoning_effort)
+    )
+
+
 async def read_flag_llm_key(workflow_run_id: str, organization_id: str | None, workflow_permanent_id: str) -> str:
     """Raises ValueError naming the flag unless it gives a registered platform key with a pinned effort."""
     try:
@@ -29,8 +40,7 @@ async def read_flag_llm_key(workflow_run_id: str, organization_id: str | None, w
         raise ValueError(f"The agent block could not read {LLM_FLAG}.") from e
     if not isinstance(variant, str) or not variant:
         raise ValueError(f"The agent block is not enabled for this run: {LLM_FLAG} has no variant for it.")
-    config = LLMConfigRegistry.get_config(variant) if LLMConfigRegistry.is_registered(variant) else None
-    if is_custom_llm_key(variant) or config is None or not (config.pin_reasoning_effort and config.reasoning_effort):
+    if not usable_agent_llm_key(variant):
         LOG.warning("Agent block flag variant is not usable", flag=LLM_FLAG, variant=variant)
         raise ValueError(
             f"{LLM_FLAG} variant {variant!r} is not a registered platform llm_key that pins a reasoning effort."

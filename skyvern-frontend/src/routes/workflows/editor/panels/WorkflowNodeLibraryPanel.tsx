@@ -7,6 +7,8 @@ import { WorkflowBlockNode } from "../nodes";
 import { WorkflowBlockIcon } from "../nodes/WorkflowBlockIcon";
 import { AddNodeProps } from "../Workspace";
 import { Input } from "@/components/ui/input";
+import { useFeatureFlag } from "@/hooks/useFeatureFlag";
+import { AGENT_BLOCK_FLAG } from "@/util/featureFlags";
 
 const enableCodeBlock =
   import.meta.env.VITE_ENABLE_CODE_BLOCK?.toLowerCase() === "true";
@@ -262,6 +264,17 @@ const nodeLibraryItems: Array<{
     description: "End the run as terminated with a reason",
   },
   {
+    nodeType: "agentStep",
+    icon: (
+      <WorkflowBlockIcon
+        workflowBlockType={WorkflowBlockTypes.AgentStep}
+        className="size-6"
+      />
+    ),
+    title: "Agent",
+    description: "Call this run's blocks as tools until it can answer",
+  },
+  {
     nodeType: "web_search",
     icon: (
       <WorkflowBlockIcon
@@ -377,6 +390,7 @@ function WorkflowNodeLibraryPanel({ onNodeClick }: Props) {
   const closeWorkflowPanel = useWorkflowPanelStore(
     (state) => state.closeWorkflowPanel,
   );
+  const enableAgentBlock = useFeatureFlag(AGENT_BLOCK_FLAG) === true;
   const [search, setSearch] = useState("");
   const inputRef = useRef<HTMLInputElement>(null);
 
@@ -416,6 +430,9 @@ function WorkflowNodeLibraryPanel({ onNodeClick }: Props) {
       return false;
     }
     if (!enableCodeBlock && item.nodeType === "codeBlock") {
+      return false;
+    }
+    if (!enableAgentBlock && item.nodeType === "agentStep") {
       return false;
     }
 

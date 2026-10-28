@@ -51,6 +51,7 @@ import {
 } from "../types/workflowTypes";
 import {
   ActionBlockYAML,
+  AgentStepBlockYAML,
   BlockYAML,
   CodeBlockYAML,
   ConditionalBlockYAML,
@@ -160,6 +161,10 @@ import {
   isTerminateNode,
   terminateNodeDefaultData,
 } from "./nodes/TerminateNode/types";
+import {
+  agentStepNodeDefaultData,
+  isAgentStepNode,
+} from "./nodes/AgentStepNode/types";
 import { isWaitNode, waitNodeDefaultData } from "./nodes/WaitNode/types";
 import {
   fileDownloadNodeDefaultData,
@@ -1059,6 +1064,20 @@ function convertToNode(
           ...commonData,
           reason: block.reason,
           errorCode: block.error_code ?? "",
+        },
+      };
+    }
+    case "agent_step": {
+      return {
+        ...identifiers,
+        ...common,
+        type: "agentStep",
+        data: {
+          ...commonData,
+          prompt: block.prompt,
+          dataSchema: JSON.stringify(block.data_schema, null, 2),
+          maxTurns: block.max_turns,
+          parameterKeys: (block.parameters ?? []).map((p) => p.key),
         },
       };
     }
@@ -2921,6 +2940,17 @@ function createNode(
         },
       };
     }
+    case "agentStep": {
+      return {
+        ...identifiers,
+        ...common,
+        type: "agentStep",
+        data: {
+          ...agentStepNodeDefaultData,
+          label,
+        },
+      };
+    }
     case "fileDownload": {
       return {
         ...identifiers,
@@ -3554,6 +3584,16 @@ function getWorkflowBlock(
         block_type: "terminate",
         reason: node.data.reason,
         error_code: node.data.errorCode.trim() || null,
+      };
+    }
+    case "agentStep": {
+      return {
+        ...base,
+        block_type: "agent_step",
+        prompt: node.data.prompt,
+        data_schema: JSONSafeOrString(node.data.dataSchema),
+        max_turns: node.data.maxTurns,
+        parameter_keys: node.data.parameterKeys,
       };
     }
     case "fileDownload": {
@@ -5174,6 +5214,17 @@ function convertBlocksToBlockYAML(
         };
         return blockYaml;
       }
+      case "agent_step": {
+        const blockYaml: AgentStepBlockYAML = {
+          ...base,
+          block_type: "agent_step",
+          prompt: block.prompt,
+          data_schema: block.data_schema,
+          max_turns: block.max_turns,
+          parameter_keys: (block.parameters ?? []).map((p) => p.key),
+        };
+        return blockYaml;
+      }
       case "file_download": {
         const blockYaml: FileDownloadBlockYAML = {
           ...base,
@@ -6023,6 +6074,33 @@ function getWorkflowErrors(nodes: Array<AppNode>): Array<string> {
           node.data.jsonSchema,
           error,
         )}`,
+      );
+    }
+  });
+
+  nodes.filter(isAgentStepNode).forEach((node) => {
+    if (node.data.prompt.trim().length === 0) {
+      errors.push(`${node.data.label}: Prompt is required.`);
+    }
+    let dataSchema: unknown;
+    try {
+      dataSchema = JSON.parse(node.data.dataSchema);
+    } catch (error) {
+      errors.push(
+        `${node.data.label}: Data schema is not valid JSON: ${getJsonParseErrorDetail(
+          node.data.dataSchema,
+          error,
+        )}`,
+      );
+      return;
+    }
+    if (
+      typeof dataSchema !== "object" ||
+      dataSchema === null ||
+      (dataSchema as { type?: unknown }).type !== "object"
+    ) {
+      errors.push(
+        `${node.data.label}: Data schema must describe an object ("type": "object").`,
       );
     }
   });

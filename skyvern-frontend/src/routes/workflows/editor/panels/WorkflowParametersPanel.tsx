@@ -298,6 +298,7 @@ function WorkflowParametersPanel({ onMouseDownCapture }: Props) {
                         if (
                           node.type === "task" ||
                           node.type === "textPrompt" ||
+                          node.type === "agentStep" ||
                           node.type === "login" ||
                           node.type === "navigation" ||
                           node.type === "extraction" ||

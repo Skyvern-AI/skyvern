@@ -63,6 +63,7 @@ const NODE_TYPE_TO_BLOCK_TYPE: Record<
   login: "login",
   wait: "wait",
   terminate: "terminate",
+  agentStep: "agent_step",
   fileDownload: "file_download",
   pdfParser: "pdf_parser",
   taskv2: "task_v2",

@@ -20,13 +20,16 @@ from __future__ import annotations
 
 import json
 import re
+from dataclasses import replace
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 import yaml
 
+from skyvern.config import settings
 from skyvern.forge import app
+from skyvern.forge.agent_functions import AgentFunction
 from skyvern.forge.sdk.copilot.config import (
     AGENT_BLOCKS_ONLY,
     ALL_BLOCK_FAMILIES,
@@ -51,6 +54,7 @@ from skyvern.forge.sdk.copilot.tools.banned_blocks import (
     _AGENT_FAMILY_BLOCK_TYPES,
     _CODE_BLOCKS_ONLY_BANNED_BLOCK_TYPES,
     _IMAGE_CAPTCHA_GUIDANCE,
+    AGENT_STEP_BLOCK_SUMMARY,
     AUTHORING_FAMILY_GUIDANCE,
     CODE_BLOCK_SUMMARY,
     CREDENTIAL_CODE_ACCESSORS,
@@ -63,11 +67,13 @@ from skyvern.forge.sdk.copilot.tools.banned_blocks import (
     authoring_turn_summary,
 )
 from skyvern.forge.sdk.copilot.tools.mcp_hooks import (
+    _build_skyvern_mcp_overlays,
     _normalized_authoring_capability,
     _validate_block_pre_hook,
 )
 from skyvern.forge.sdk.workflow.models.block import _TASK_V3_SUPPORTED_BLOCK_TYPES
 from skyvern.schemas.runs import ProxyLocation
+from tests.unit.copilot_test_helpers import make_copilot_ctx
 
 _CODE_ONLY_UNAVAILABLE = tuple(
     "action browser_task extraction file_download file_upload goto_url login navigation print_page task task_v2 validation".split()
@@ -1562,7 +1568,8 @@ async def test_every_authoring_surface_agrees_with_the_two_booleans(capability: 
 
 
 def test_banned_sets_shrink_as_families_are_added() -> None:
-    assert _banned_block_types_for_capability(ALL_BLOCK_FAMILIES) == {"task_v2"}
+    assert _banned_block_types_for_capability(ALL_BLOCK_FAMILIES) == {"task_v2", "agent_step"}
+    assert _banned_block_types_for_capability(_AGENT_STEP_GRANTED) == {"task_v2"}
     assert "code" in _banned_block_types_for_capability(AGENT_BLOCKS_ONLY)
     assert "code" not in _banned_block_types_for_capability(CODE_BLOCKS_ONLY)
     assert _AGENT_FAMILY_BLOCK_TYPES <= _banned_block_types_for_capability(CODE_BLOCKS_ONLY)
@@ -1617,3 +1624,133 @@ def test_a_policy_string_nobody_recognises_authors_no_code() -> None:
     for unrecognised in ("", "standrad", "code_only", "CODE_ONLY_BROWSER"):
         assert authoring_capability_from_policy(unrecognised) == AGENT_BLOCKS_ONLY
         assert _copilot_authoring_capability(SimpleNamespace(block_authoring_policy=unrecognised)) == AGENT_BLOCKS_ONLY
+
+
+_AGENT_STEP_GRANTED = replace(ALL_BLOCK_FAMILIES, agent_step=True)
+_AGENT_STEP_THEN_BRANCH = _yaml(
+    {
+        "block_type": "agent_step",
+        "label": "check_page",
+        "prompt": "Open https://example.com and answer yes if it says Example Domain, otherwise no.",
+    },
+    {
+        "block_type": "conditional",
+        "label": "branch_on_answer",
+        "branch_conditions": [
+            {
+                "criteria": {
+                    "criteria_type": "jinja2_template",
+                    "expression": "{{ check_page_output.answer == 'yes' }}",
+                },
+                "next_block_label": None,
+            },
+            {"is_default": True, "next_block_label": None},
+        ],
+    },
+)
+
+
+async def _update_with_stubbed_save(submitted: str, ctx: MagicMock) -> dict:
+    fake_workflow = MagicMock()
+    for attr in (
+        "title",
+        "description",
+        "workflow_definition",
+        "proxy_location",
+        "webhook_callback_url",
+        "persist_browser_session",
+        "model",
+        "max_screenshot_scrolls",
+        "extra_http_headers",
+        "run_with",
+        "ai_fallback",
+        "cache_key",
+        "run_sequentially",
+        "sequential_key",
+    ):
+        setattr(fake_workflow, attr, None)
+    with (
+        patch("skyvern.forge.sdk.copilot.tools.workflow_update._process_workflow_yaml", return_value=fake_workflow),
+        patch("skyvern.forge.sdk.copilot.tools.workflow_update.app") as mock_app,
+    ):
+        mock_app.WORKFLOW_SERVICE.get_workflow = AsyncMock(return_value=None)
+        mock_app.WORKFLOW_SERVICE.update_workflow_definition = AsyncMock()
+        return await _update_workflow({"workflow_yaml": submitted}, ctx)
+
+
+@pytest.mark.parametrize(
+    ("capability", "authorable"),
+    [
+        (_AGENT_STEP_GRANTED, True),
+        (replace(AGENT_BLOCKS_ONLY, agent_step=True), True),
+        (ALL_BLOCK_FAMILIES, False),
+        (AGENT_BLOCKS_ONLY, False),
+        (replace(CODE_BLOCKS_ONLY, agent_step=True), False),
+    ],
+)
+@pytest.mark.asyncio
+async def test_agent_step_is_served_listed_and_saved_only_with_the_org_grant_and_agent_blocks(
+    capability: AuthoringCapability, authorable: bool
+) -> None:
+    ctx = _ctx()
+    ctx.authoring_capability = capability
+
+    schema = await _get_block_schema_pre_hook({"block_type": "agent_step"}, ctx)
+    listing = await _get_block_schema_post_hook(
+        {"ok": True, "data": {"block_types": {"navigation": "Take actions on a page"}, "count": 1}}, raw={}, ctx=ctx
+    )
+    write = await _update_with_stubbed_save(_AGENT_STEP_THEN_BRANCH, ctx)
+    schema_tool_note = _build_skyvern_mcp_overlays(capability)["get_block_schema"].description_suffix
+
+    assert schema is not None
+    assert schema["ok"] is authorable
+    assert ("agent_step" in listing["data"]["block_types"]) is authorable
+    assert (AGENT_STEP_BLOCK_SUMMARY in schema_tool_note) is authorable
+    assert write["ok"] is authorable
+    if authorable:
+        assert schema["data"]["summary"] == AGENT_STEP_BLOCK_SUMMARY
+        assert {"prompt", "data_schema", "max_turns"} <= set(schema["data"]["schema"]["properties"])
+        assert ctx.workflow_yaml == _AGENT_STEP_THEN_BRANCH
+    else:
+        assert "check_page (agent_step, block_type_unavailable)" in write["error"]
+        for refusal in (schema["error"], write["error"]):
+            assert "not enabled for this organization" in refusal
+            assert "`conditional`" in refusal
+
+
+@pytest.mark.asyncio
+async def test_the_agent_step_grant_survives_from_the_request_config_to_the_turn_context(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(settings, "WORKFLOW_COPILOT_CODE_BLOCK_MODE", True)
+    agent_function = AgentFunction()
+    monkeypatch.setattr(agent_function, "has_code_block_access", AsyncMock(return_value=True))
+    monkeypatch.setattr(agent_function, "copilot_agent_step_enabled", AsyncMock(return_value=True))
+
+    config = await agent_function.get_copilot_config_for_request("o_test")
+    assert config is not None
+    ctx = make_copilot_ctx(
+        block_authoring_policy=config.block_authoring_policy,
+        agent_step_available=config.agent_step_available,
+        copilot_config=config,
+    )
+    ctx.authoring_capability = ctx.authoring_capability
+
+    assert config.authoring_capability == _AGENT_STEP_GRANTED
+    assert ctx.authoring_capability == _AGENT_STEP_GRANTED
+    assert _copilot_authoring_capability(ctx) == _AGENT_STEP_GRANTED
+
+
+@pytest.mark.parametrize("hook", [None, AsyncMock(side_effect=RuntimeError("flag provider down"))])
+@pytest.mark.asyncio
+async def test_agent_step_stays_unavailable_without_a_grant_or_when_the_lookup_fails(
+    monkeypatch: pytest.MonkeyPatch, hook: AsyncMock | None
+) -> None:
+    agent_function = AgentFunction()
+    if hook is not None:
+        monkeypatch.setattr(agent_function, "copilot_agent_step_enabled", hook)
+
+    config = await agent_function.get_copilot_config_for_request("o_test", code_block_mode=False)
+
+    assert config is not None
+    assert config.authoring_capability == AGENT_BLOCKS_ONLY

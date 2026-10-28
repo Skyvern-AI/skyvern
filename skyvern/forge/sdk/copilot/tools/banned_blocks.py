@@ -78,6 +78,7 @@ class CopilotBlockPolicyScope(StrEnum):
     ALWAYS = "always"
     WITHOUT_AGENT_BLOCKS = "without_agent_blocks"
     WITHOUT_CODE_BLOCKS = "without_code_blocks"
+    WITHOUT_AGENT_STEP = "without_agent_step"
 
 
 @dataclass(frozen=True)
@@ -92,6 +93,7 @@ _P = CopilotBlockPolicy
 _ALWAYS = CopilotBlockPolicyScope.ALWAYS
 _WITHOUT_AGENT_BLOCKS = CopilotBlockPolicyScope.WITHOUT_AGENT_BLOCKS
 _WITHOUT_CODE_BLOCKS = CopilotBlockPolicyScope.WITHOUT_CODE_BLOCKS
+_WITHOUT_AGENT_STEP = CopilotBlockPolicyScope.WITHOUT_AGENT_STEP
 _BANNED = CopilotBlockPolicyStatus.BANNED
 _PENDING = CopilotBlockPolicyStatus.CODE_NATIVE_PENDING
 _AI_LEAF = CopilotBlockPolicyStatus.DECLARED_AI_LEAF
@@ -168,6 +170,15 @@ _COPILOT_BLOCK_TYPE_POLICIES: dict[str, CopilotBlockPolicy] = {
             "has no code-only route yet."
         ),
     ),
+    "agent_step": _P(
+        _BANNED,
+        _WITHOUT_AGENT_STEP,
+        "an organization with the agent_step block enabled, in a turn that may author agent blocks",
+        (
+            "It is not enabled for this organization or this turn; build the step from `web_search`, `navigation` "
+            "or `extraction` blocks followed by a `conditional` on their output."
+        ),
+    ),
 }
 
 
@@ -176,6 +187,8 @@ def _scope_applies(scope: CopilotBlockPolicyScope, capability: AuthoringCapabili
         return True
     if scope == CopilotBlockPolicyScope.WITHOUT_AGENT_BLOCKS:
         return not capability.agent_blocks
+    if scope == CopilotBlockPolicyScope.WITHOUT_AGENT_STEP:
+        return not (capability.agent_step and capability.agent_blocks)
     return not capability.code_blocks
 
 
@@ -204,6 +217,10 @@ AGENT_FAMILY_BLOCK_SUMMARIES: dict[str, str] = {
 CODE_BLOCK_SUMMARY = (
     "Python that drives the browser directly with Playwright when the steps are the same every run, "
     "and transforms data it already holds"
+)
+AGENT_STEP_BLOCK_SUMMARY = (
+    "one model-driven step that runs workflow blocks and acts on the run's browser page until it can "
+    "return an answer matching its data_schema"
 )
 _AGENT_FAMILY_BLOCK_TYPES: frozenset[str] = frozenset(AGENT_FAMILY_BLOCK_SUMMARIES)
 _AGENT_FAMILY_BLOCK_LIST = join_phrases([f"`{block_type}`" for block_type in AGENT_FAMILY_BLOCK_SUMMARIES], "and")

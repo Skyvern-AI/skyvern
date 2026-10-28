@@ -16,6 +16,7 @@ import {
   LockOpen1Icon,
   MagnifyingGlassIcon,
   StopwatchIcon,
+  TargetIcon,
   UpdateIcon,
   Share1Icon,
   UploadIcon,
@@ -92,6 +93,9 @@ function WorkflowBlockIcon({ workflowBlockType, className }: Props) {
     }
     case "terminate": {
       return <CrossCircledIcon className={className} />;
+    }
+    case "agent_step": {
+      return <TargetIcon className={className} />;
     }
     case "pdf_parser": {
       return <FileTextIcon className={className} />;

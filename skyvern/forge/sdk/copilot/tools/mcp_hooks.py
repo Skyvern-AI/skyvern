@@ -87,7 +87,7 @@ from skyvern.forge.sdk.workflow.models.block import (
 from skyvern.forge.sdk.workflow.models.workflow import WorkflowRunStatus
 from skyvern.forge.sdk.workflow.schedules import MIN_SCHEDULE_INTERVAL_SECONDS
 from skyvern.forge.sdk.workflow.web_search import WEB_SEARCH_HELPER_CONTRACT
-from skyvern.schemas.workflows import TaskBlockYAML
+from skyvern.schemas.workflows import AgentStepBlockYAML, TaskBlockYAML
 from skyvern.utils.secret_headers import SECRET_HEADER_MASK
 from skyvern.webeye.dialog_handler import DIALOG_POLICY_HELPER_CONTRACT
 
@@ -102,6 +102,7 @@ from .banned_blocks import (
     _CODE_ONLY_TARGET_EVIDENCE_KEYS,
     _TASK_V3_ENGINE,
     AGENT_FAMILY_BLOCK_SUMMARIES,
+    AGENT_STEP_BLOCK_SUMMARY,
     AUTHORING_FAMILY_GUIDANCE,
     CODE_BLOCK_SUMMARY,
     _authoring_violation_reject_message,
@@ -396,6 +397,15 @@ async def _get_block_schema_pre_hook(
                 "agent_block_guidance": _agent_block_schema_guidance(),
             },
         }
+    if normalized == "agent_step" and normalized not in _copilot_banned_block_types(ctx):
+        return {
+            "ok": True,
+            "data": {
+                "block_type": "agent_step",
+                "summary": AGENT_STEP_BLOCK_SUMMARY,
+                "schema": AgentStepBlockYAML.model_json_schema(),
+            },
+        }
     policy_entry = _copilot_block_policy(normalized, ctx)
     if policy_entry is None:
         return None
@@ -606,11 +616,14 @@ async def _get_block_schema_post_hook(
         if isinstance(block_types, dict):
             # The server's hint names its own tool and a block type this turn may not author.
             data.pop("hint", None)
-            for banned in _copilot_banned_block_types(ctx):
+            banned_types = _copilot_banned_block_types(ctx)
+            for banned in banned_types:
                 block_types.pop(banned, None)
             if capability.agent_blocks:
                 for agent_block_type, summary in AGENT_FAMILY_BLOCK_SUMMARIES.items():
                     block_types[agent_block_type] = summary
+            if "agent_step" not in banned_types:
+                block_types["agent_step"] = AGENT_STEP_BLOCK_SUMMARY
             if capability.code_blocks and "code" in block_types:
                 block_types["code"] = CODE_BLOCK_SUMMARY
             if capability.code_blocks and capability.agent_blocks:
@@ -2408,13 +2421,17 @@ def _workflow_knowledge_description(capability: AuthoringCapability) -> str:
     )
 
 
-def _block_schema_banned_types_note(
+def _block_schema_availability_note(
     capability: AuthoringCapability | BlockAuthoringPolicy | str | None = None,
 ) -> str:
     """Name the rejected types from the same table the schema pre-hook rejects on. The set depends on
     the turn's authoring capability, which a static prompt line cannot track."""
     banned = _banned_block_types_for_capability(_normalized_authoring_capability(capability))
-    return f"Unavailable for this turn and rejected on request: {', '.join(sorted(banned))}."
+    note = f"Unavailable for this turn and rejected on request: {', '.join(sorted(banned))}."
+    if "agent_step" in banned:
+        return note
+    # agent_step is in no model's training data, so a turn that never lists block types would not know it exists.
+    return f"{note} Also available this turn: `agent_step`, {AGENT_STEP_BLOCK_SUMMARY}."
 
 
 def _build_skyvern_mcp_overlays(
@@ -2423,7 +2440,7 @@ def _build_skyvern_mcp_overlays(
     overlays = {
         "get_workflow_knowledge": SchemaOverlay(
             description=_workflow_knowledge_description(_normalized_authoring_capability(capability)),
-            description_suffix=_block_schema_banned_types_note(capability),
+            description_suffix=_block_schema_availability_note(capability),
             param_patches={"topics": _WORKFLOW_KNOWLEDGE_TOPICS_PATCH},
             pre_hook=_get_workflow_knowledge_pre_hook,
             post_hook=_get_workflow_knowledge_post_hook,
@@ -2432,7 +2449,7 @@ def _build_skyvern_mcp_overlays(
             description=(
                 "Get the schema for a workflow block type, or list the available types when block_type is omitted."
             ),
-            description_suffix=_block_schema_banned_types_note(capability),
+            description_suffix=_block_schema_availability_note(capability),
             pre_hook=_get_block_schema_pre_hook,
             post_hook=_get_block_schema_post_hook,
         ),

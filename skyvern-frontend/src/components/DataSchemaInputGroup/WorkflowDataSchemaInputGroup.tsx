@@ -44,6 +44,7 @@ type Props = {
   suggestionContext: Record<string, unknown>;
   exampleValue: Record<string, unknown>;
   helpTooltip?: string;
+  hideEnableToggle?: boolean;
 };
 
 function WorkflowDataSchemaInputGroup({
@@ -53,6 +54,7 @@ function WorkflowDataSchemaInputGroup({
   suggestionContext,
   exampleValue,
   helpTooltip,
+  hideEnableToggle = false,
 }: Props) {
   const credentialGetter = useCredentialGetter();
   const workflowId = useWorkflowScopeId();
@@ -65,6 +67,8 @@ function WorkflowDataSchemaInputGroup({
   const [generateWithAIActive, setGenerateWithAIActive] = useState(false);
   const [generateWithAIPrompt, setGenerateWithAIPrompt] = useState("");
   const [pendingSchema, setPendingSchema] = useState<string | null>(null);
+  // Without the toggle nothing can bring the editor back, so a typed "null" must not hide it.
+  const schemaEnabled = hideEnableToggle || value !== "null";
 
   const resetAIState = useCallback(() => {
     setPendingSchema(null);
@@ -89,7 +93,7 @@ function WorkflowDataSchemaInputGroup({
       );
     },
     onSuccess: (response) => {
-      if (value === "null") {
+      if (!schemaEnabled) {
         return;
       }
       setPendingSchema(JSON.stringify(response.data.output, null, 2));
@@ -114,20 +118,22 @@ function WorkflowDataSchemaInputGroup({
               content={helpTooltip ?? helpTooltips["task"]["dataSchema"]}
             />
           </div>
-          <Checkbox
-            checked={value !== "null"}
-            disabled={locked}
-            onCheckedChange={(checked) => {
-              if (!checked) {
-                resetAIState();
-              }
-              onChange(
-                checked ? JSON.stringify(exampleValue, null, 2) : "null",
-              );
-            }}
-          />
+          {!hideEnableToggle && (
+            <Checkbox
+              checked={value !== "null"}
+              disabled={locked}
+              onCheckedChange={(checked) => {
+                if (!checked) {
+                  resetAIState();
+                }
+                onChange(
+                  checked ? JSON.stringify(exampleValue, null, 2) : "null",
+                );
+              }}
+            />
+          )}
         </div>
-        {value !== "null" && !generateWithAIActive && !locked && (
+        {schemaEnabled && !generateWithAIActive && !locked && (
           <Button
             variant="tertiary"
             className="h-7 text-xs"
@@ -141,7 +147,7 @@ function WorkflowDataSchemaInputGroup({
         )}
       </div>
 
-      {value !== "null" && (
+      {schemaEnabled && (
         <div className="space-y-2">
           {generateWithAIActive ? (
             <div className="flex w-full items-center rounded-xl border px-4">
@@ -210,7 +216,7 @@ function WorkflowDataSchemaInputGroup({
           )}
         </div>
       )}
-      {value !== "null" && (
+      {schemaEnabled && (
         <Dialog
           open={pendingSchema !== null}
           onOpenChange={(open) => {

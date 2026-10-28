@@ -70,6 +70,7 @@ const BLOCK_TYPE_TO_NODE_TYPE: Record<string, string> = {
   login: "login",
   wait: "wait",
   terminate: "terminate",
+  agent_step: "agentStep",
   file_download: "fileDownload",
   code: "codeBlock",
   send_email: "sendEmail",

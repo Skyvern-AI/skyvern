@@ -312,7 +312,11 @@ def _captured_authoring_capability(ctx: AgentContext | None) -> dict[str, bool] 
     if ctx is None:
         return None
     capability = _copilot_authoring_capability(ctx)
-    return {"code_blocks": capability.code_blocks, "agent_blocks": capability.agent_blocks}
+    return {
+        "code_blocks": capability.code_blocks,
+        "agent_blocks": capability.agent_blocks,
+        "agent_step": capability.agent_step,
+    }
 
 
 def _maybe_dump_model_input(data: CallModelData[Any], model_data: ModelInputData) -> None:
