@@ -2,7 +2,7 @@ from collections.abc import Collection, Mapping
 from dataclasses import dataclass
 from datetime import datetime
 
-from sqlalchemy import delete, or_, select, update
+from sqlalchemy import delete, or_, select, tuple_, update
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.dialects.sqlite import insert as sqlite_insert
 
@@ -87,14 +87,16 @@ class RunExecutionLeasesRepository(BaseRepository):
             await session.commit()
 
     @db_operation("get_expired_run_execution_leases")
-    async def get_expired(self, heartbeat_before: datetime, limit: int = 500) -> list[RunExecutionLease]:
+    async def get_expired(
+        self, heartbeat_before: datetime, limit: int = 500, after: tuple[datetime, str] | None = None
+    ) -> list[RunExecutionLease]:
+        query = select(RunExecutionLeaseModel).where(RunExecutionLeaseModel.heartbeat_at < heartbeat_before)
+        if after is not None:
+            query = query.where(tuple_(RunExecutionLeaseModel.heartbeat_at, RunExecutionLeaseModel.run_id) > after)
         async with self.Session() as session:
             rows = (
                 await session.scalars(
-                    select(RunExecutionLeaseModel)
-                    .where(RunExecutionLeaseModel.heartbeat_at < heartbeat_before)
-                    .order_by(RunExecutionLeaseModel.heartbeat_at)
-                    .limit(limit)
+                    query.order_by(RunExecutionLeaseModel.heartbeat_at, RunExecutionLeaseModel.run_id).limit(limit)
                 )
             ).all()
             return [

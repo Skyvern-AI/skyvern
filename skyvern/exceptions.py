@@ -1512,6 +1512,15 @@ class EmptySelect(SkyvernException):
         )
 
 
+RUN_FINALIZED_ELSEWHERE_REASON = "Another server already finalized this run"
+
+
+class ChildStartRefusedAfterLeaseLoss(SkyvernException):
+    def __init__(self, task_id: str) -> None:
+        self.task_id = task_id
+        super().__init__(RUN_FINALIZED_ELSEWHERE_REASON)
+
+
 class TaskAlreadyCanceled(SkyvernHTTPException):
     def __init__(self, new_status: str, task_id: str):
         super().__init__(

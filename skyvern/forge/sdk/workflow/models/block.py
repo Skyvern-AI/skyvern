@@ -99,11 +99,13 @@ from skyvern.constants import (
 from skyvern.errors.errors import UserDefinedError
 from skyvern.exceptions import (
     BROWSER_CONNECTION_LOST_ERROR_CODE,
+    RUN_FINALIZED_ELSEWHERE_REASON,
     AzureConfigurationError,
     BlockedHost,
     BlockedNavigationDestination,
     BlockTerminationError,
     BranchEvaluationContextTooLargeError,
+    ChildStartRefusedAfterLeaseLoss,
     CodeBlockRunnerSelectionError,
     ConditionalBranchEvaluationError,
     ContextParameterValueNotFound,
@@ -2581,14 +2583,26 @@ class BaseTaskBlock(Block):
         while will_retry:
             task_order, task_retry = next_task_order or await self.get_task_order(workflow_run_id, current_retry)
             is_first_task = task_order == 0
-            task, step = await app.agent.create_task_and_step_from_block(
-                task_block=self,
-                workflow=workflow,
-                workflow_run=workflow_run,
-                workflow_run_context=workflow_run_context,
-                task_order=task_order,
-                task_retry=task_retry,
-            )
+            try:
+                task, step = await app.agent.create_task_and_step_from_block(
+                    task_block=self,
+                    workflow=workflow,
+                    workflow_run=workflow_run,
+                    workflow_run_context=workflow_run_context,
+                    task_order=task_order,
+                    task_retry=task_retry,
+                )
+            except ChildStartRefusedAfterLeaseLoss as refused:
+                # Another server owns the run, so no loop may continue past this block or into another iteration.
+                return await self.build_block_result(
+                    success=False,
+                    failure_reason=refused.message,
+                    output_parameter_value=None,
+                    status=BlockStatus.failed,
+                    workflow_run_block_id=workflow_run_block_id,
+                    organization_id=organization_id,
+                    can_continue_after_failure=False,
+                )
             workflow_run_block = await app.DATABASE.observer.update_workflow_run_block(
                 workflow_run_block_id=workflow_run_block_id,
                 task_id=task.task_id,
@@ -8421,15 +8435,21 @@ async def wrapper({default_args}):
             elif failed_nav_error_code and not escalation_navigated:
                 skyvern_context.ensure_context().task_nav_error_codes[escalation_task.task_id] = failed_nav_error_code
             if await run_lease_lost(workflow_run_id):
-                escalation_task = (
-                    await app.DATABASE.tasks.get_task(escalation_task.task_id, organization_id) or escalation_task
-                )
-            else:
-                escalation_task = await app.DATABASE.tasks.update_task(
-                    task_id=escalation_task.task_id,
+                await app.agent.fail_child_task_after_lease_loss(escalation_task)
+                return await self.build_block_result(
+                    success=False,
+                    failure_reason=block_failure_reason(RUN_FINALIZED_ELSEWHERE_REASON),
+                    output_parameter_value=None,
+                    status=BlockStatus.failed,
+                    workflow_run_block_id=workflow_run_block_id,
                     organization_id=organization_id,
-                    status=TaskStatus.running,
+                    can_continue_after_failure=False,
                 )
+            escalation_task = await app.DATABASE.tasks.update_task(
+                task_id=escalation_task.task_id,
+                organization_id=organization_id,
+                status=TaskStatus.running,
+            )
             escalation_step = await app.DATABASE.tasks.create_step(
                 escalation_task.task_id,
                 order=0,
@@ -9315,6 +9335,7 @@ async def wrapper({default_args}):
                             workflow_run_block_id=workflow_run_block_id,
                             organization_id=organization_id,
                             error_codes=result.error_codes or None,
+                            can_continue_after_failure=result.can_continue_after_failure,
                         )
                     result = with_failure_kind(result)
                 result = _redact_codeblock_result(result, resolved_redaction_parameters)
