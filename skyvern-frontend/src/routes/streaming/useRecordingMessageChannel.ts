@@ -293,11 +293,11 @@ export function useRecordingMessageChannel(
     };
 
     const connect = async () => {
-      const wsParams = await getWebSocketParams();
+      const { params, protocols } = await getWebSocketParams();
       if (cancelled) return;
-      const messageUrl = `${socketUrl ?? `${newWssBaseUrl}/stream/messages/browser_session/${browserSessionId}`}?${wsParams}`;
+      const messageUrl = `${socketUrl ?? `${newWssBaseUrl}/stream/messages/browser_session/${browserSessionId}`}?${params}`;
 
-      ws = new WebSocket(messageUrl);
+      ws = new WebSocket(messageUrl, protocols);
 
       ws.onopen = () => {
         if (cancelled) return;

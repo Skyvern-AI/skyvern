@@ -4,7 +4,10 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { useRecordingMessageChannel } from "./useRecordingMessageChannel";
 
 const mocks = vi.hoisted(() => ({
-  getWebSocketParams: vi.fn(async () => "client_id=client-test"),
+  getWebSocketParams: vi.fn(async () => ({
+    params: "client_id=client-test",
+    protocols: ["skyvern.v1", "bearer.test"],
+  })),
 }));
 
 vi.mock("./webSocketParams", () => ({
@@ -91,9 +94,11 @@ describe("useRecordingMessageChannel", () => {
   });
 
   it("does not construct a socket after credential loading is cancelled", async () => {
-    let resolveParams: ((params: string) => void) | undefined;
+    let resolveParams:
+      | ((params: { params: string; protocols: string[] }) => void)
+      | undefined;
     mocks.getWebSocketParams.mockReturnValueOnce(
-      new Promise<string>((resolve) => {
+      new Promise((resolve) => {
         resolveParams = resolve;
       }),
     );
@@ -107,7 +112,7 @@ describe("useRecordingMessageChannel", () => {
 
     unmount();
     await act(async () => {
-      resolveParams?.("client_id=late");
+      resolveParams?.({ params: "client_id=late", protocols: ["skyvern.v1"] });
       await Promise.resolve();
     });
 

@@ -8,7 +8,7 @@ import { ZoomableImage } from "@/components/ZoomableImage";
 import { useCostCalculator } from "@/hooks/useCostCalculator";
 import { useCredentialGetter } from "@/hooks/useCredentialGetter";
 import { useStreamTransport } from "@/hooks/useRuntimeConfig";
-import { getCredentialParam } from "@/util/env";
+import { getWebSocketProtocols } from "@/util/env";
 import {
   EXTERNAL_BROWSER_DIAGNOSTIC,
   STREAM_STARTING_DIAGNOSTIC,
@@ -142,7 +142,7 @@ function TaskActions() {
     let cancelled = false;
 
     async function run() {
-      const credentialParam = await getCredentialParam(credentialGetter);
+      const protocols = await getWebSocketProtocols(credentialGetter);
       if (cancelled) {
         return;
       }
@@ -151,7 +151,8 @@ function TaskActions() {
         socketRef.current.close();
       }
       socketRef.current = new WebSocket(
-        `${wssBaseUrl}/stream/tasks/${taskId}?${credentialParam}`,
+        `${wssBaseUrl}/stream/tasks/${taskId}`,
+        protocols,
       );
 
       socketRef.current.addEventListener("open", () => {
