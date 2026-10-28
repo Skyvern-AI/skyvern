@@ -446,6 +446,35 @@ class InMemoryTaskStepRepo:
                 setattr(task, key, value)
         return task, finish_claimed
 
+    async def update_task_and_claim_finish_for_cancel(
+        self,
+        task_id: str,
+        organization_id: str | None,
+        audit_actor: Any = None,
+        failure_reason: str | None = None,
+        errors: list[dict[str, Any]] | None = None,
+        extracted_information: dict[str, Any] | list | str | None = None,
+        webhook_failure_reason: str | None = None,
+    ) -> tuple[Task, bool, bool]:
+        task = self.task
+        assert task is not None and task.task_id == task_id, f"no task {task_id}"
+        if task.status.is_final():
+            return task, False, False
+
+        finish_claimed = task.finished_at is None
+        task.status = TaskStatus.canceled
+        if finish_claimed:
+            task.finished_at = datetime.now(UTC)
+        if failure_reason is not None:
+            task.failure_reason = failure_reason
+        if errors is not None:
+            task.errors = [*(task.errors or []), *errors]
+        if extracted_information is not None:
+            task.extracted_information = extracted_information
+        if webhook_failure_reason is not None:
+            task.webhook_failure_reason = webhook_failure_reason
+        return task, finish_claimed, True
+
     async def update_step(self, task_id: str, step_id: str, organization_id: str | None = None, **updates: Any) -> Step:
         assert self.step is not None and self.step.step_id == step_id, f"no step {step_id}"
         for key, value in updates.items():
@@ -477,6 +506,7 @@ class InMemoryTaskStepRepo:
             "get_task",
             "update_task",
             "update_task_and_claim_finish",
+            "update_task_and_claim_finish_for_cancel",
             "update_step",
             "get_first_step",
             "get_task_steps",

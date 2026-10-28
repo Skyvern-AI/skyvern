@@ -4857,6 +4857,15 @@ class ForgeAgent:
                     attempt_started_at=attempt_started_at,
                     list_files_before=list_files_before,
                 )
+            # update_step returns a database-reloaded step, which cannot retain this private marker.
+            download_failure_status = None
+            if isinstance(task_block, FileDownloadBlock) and task_block.complete_on_download and task.workflow_run_id:
+                download_failure_status = self._latest_download_failure_status(
+                    [step.model_copy(update={"output": detailed_output.to_agent_step_output()})]
+                    if detailed_output
+                    else [step],
+                    attributed_only=True,
+                )
             await app.AGENT_FUNCTION.post_step_execution(task, step)
             task = await self.update_task_errors_from_detailed_output(task, detailed_output)  # type: ignore
             # Shadow-only loop-stall observability; never raises, never terminates (see shadow.py).
@@ -4955,6 +4964,35 @@ class ForgeAgent:
                 release_context = skyvern_context.current()
                 if release_context is not None:
                     release_context.apply_pending_download_reservation_release(task.task_id)
+
+            if (
+                isinstance(task_block, FileDownloadBlock)
+                and task_block.complete_on_download
+                and task.workflow_run_id
+                and download_failure_status is not None
+                and 500 <= download_failure_status < 600
+            ):
+                failure_reason = (
+                    f"The site's main or targeted frame returned HTTP {download_failure_status} "
+                    "and no file was received."
+                )
+                step = await self.update_step(step, is_last=True)
+                is_task_marked_as_failed = await self.fail_task(task, step, failure_reason, browser_state)
+                if is_task_marked_as_failed:
+                    await app.ARTIFACT_MANAGER.flush_step_archive(step.step_id)
+                    await self.clean_up_task(
+                        task=task,
+                        last_step=step,
+                        api_key=api_key,
+                        close_browser_on_completion=close_browser_on_completion,
+                        browser_session_id=browser_session_id,
+                        download_suffix=task_block.download_suffix,
+                        list_files_before=list_files_before,
+                    )
+                else:
+                    LOG.warning("Task isn't marked as failed after a download HTTP failure. NOT clean up the task")
+                    cleanup_skipped_by_handler = True
+                return step, detailed_output, None
 
             # If the step failed, mark the step as failed and retry
             if step.status == StepStatus.failed:
@@ -5441,17 +5479,19 @@ class ForgeAgent:
                 download_timeout_context.download_timeout = prev_download_timeout
 
     @staticmethod
-    def _latest_download_failure_status(steps: list[Step]) -> int | None:
+    def _latest_download_failure_status(steps: list[Step], *, attributed_only: bool = False) -> int | None:
         """The failure status carried by the run's latest download-intent action, folded across steps.
 
         Walks every persisted step with output in execution order, and every action within a step in
         order. A download-intent action is one whose result recorded a download outcome
-        (``download_triggered`` set) or a stamped failure status. Each later download-intent action
+        (``download_triggered`` set) or a diagnostic failure status. Each later download-intent action
         supersedes earlier evidence: a later action that actually saved a file (non-empty
         ``downloaded_files``), or a later download that received no file and observed no status, clears
-        an earlier status. A triggered-but-empty or aborted action that carries a status keeps it —
-        ``download_triggered=True`` alone is only a credited signal, not proof a file was saved. Ordinary
-        non-download actions never clear it. Returns the surviving status, or None.
+        an earlier status. With ``attributed_only``, only a Document 5xx from the main or action-target
+        frame is returned; passive observations remain available for diagnostic enrichment. A triggered-but-empty
+        or aborted action that carries a status keeps it — ``download_triggered=True`` alone is only a
+        credited signal, not proof a file was saved. Ordinary non-download actions never clear it. Returns
+        the surviving status, or None.
         """
         latest_status: int | None = None
         for step in steps:
@@ -5468,8 +5508,9 @@ class ForgeAgent:
                 if any(result.downloaded_files for result in results):
                     latest_status = None
                     continue
+                status_attr = "attributed_download_failure_status" if attributed_only else "download_failure_status"
                 latest_status = next(
-                    (result.download_failure_status for result in reversed(results) if result.download_failure_status),
+                    (status for result in reversed(results) if (status := getattr(result, status_attr, None))),
                     None,
                 )
         return latest_status
@@ -10828,7 +10869,13 @@ class ForgeAgent:
         if status == TaskStatus.canceled:
             completion = asyncio.create_task(
                 app.DATABASE.tasks.update_task_and_claim_finish_for_cancel(
-                    task.task_id, organization_id=task.organization_id, audit_actor=audit_actor
+                    task.task_id,
+                    organization_id=task.organization_id,
+                    audit_actor=audit_actor,
+                    failure_reason=failure_reason,
+                    errors=errors,
+                    extracted_information=extracted_information,
+                    webhook_failure_reason=webhook_failure_reason,
                 )
             )
             try:
