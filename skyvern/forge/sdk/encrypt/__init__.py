@@ -1,6 +1,6 @@
 from pydantic import BaseModel
 
-from skyvern.forge.sdk.encrypt.base import BaseEncryptor, EncryptMethod
+from skyvern.forge.sdk.encrypt.base import BaseEncryptor, EncryptMethod, TokenDecryptionError
 
 
 class Encryptor(BaseModel):
@@ -21,6 +21,16 @@ class Encryptor(BaseModel):
             raise ValueError(f"encrypt method not registered: {method}")
 
         return await self._methods[method].decrypt(ciphertext)
+
+    async def decrypt_unlabeled(self, ciphertext: str) -> str:
+        """Decrypt a value stored without its method, trying GCM first: its tag rejects CBC data, not vice versa."""
+        if EncryptMethod.AES_GCM in self._methods:
+            try:
+                return await self._methods[EncryptMethod.AES_GCM].decrypt(ciphertext)
+            except TokenDecryptionError:
+                if EncryptMethod.AES not in self._methods:
+                    raise
+        return await self.decrypt(ciphertext, EncryptMethod.AES)
 
 
 encryptor = Encryptor()

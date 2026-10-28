@@ -12,7 +12,7 @@ from skyvern.forge import app
 from skyvern.forge.agent_functions import record_request_audit_event
 from skyvern.forge.sdk.db.enums import OrganizationAuthTokenType
 from skyvern.forge.sdk.db.repositories.sms import SMSLifecycleLockTimeout
-from skyvern.forge.sdk.encrypt.base import EncryptMethod
+from skyvern.forge.sdk.encrypt.base import DEFAULT_ENCRYPT_METHOD
 from skyvern.forge.sdk.routes.sms_inbound import SMS_SIGNING_URL_UNAVAILABLE
 from skyvern.forge.sdk.schemas.organizations import (
     CreateTwilioCredentialRequest,
@@ -638,7 +638,7 @@ async def create_twilio_credential(
             organization_id=organization_id,
             token_type=OrganizationAuthTokenType.twilio_credential,
             token=request.credential,
-            encrypted_method=EncryptMethod.AES,
+            encrypted_method=DEFAULT_ENCRYPT_METHOD,
         )
         await record_request_audit_event(
             organization_id,

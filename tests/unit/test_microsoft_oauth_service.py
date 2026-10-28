@@ -301,7 +301,7 @@ async def test_promote_pending_credential_stores_refresh_token_as_gcm(monkeypatc
 
     persisted = promote_pending_to_active.await_args.kwargs
     assert persisted["encrypted_refresh_token"].startswith("skyvern_enc:aesgcm-v1:")
-    assert persisted["encrypted_method"] == microsoft_oauth_service.EncryptMethod.AES
+    assert persisted["encrypted_method"] == microsoft_oauth_service.DEFAULT_ENCRYPT_METHOD
     assert (
         await microsoft_oauth_service.secret_encryption.decrypt_secret_field_value(
             persisted["encrypted_refresh_token"],
@@ -381,7 +381,7 @@ async def test_refresh_and_rotate_persists_rotated_refresh_token(monkeypatch: py
         )
         == "rt-rotated"
     )
-    assert kwargs["encrypted_method"] == microsoft_oauth_service.EncryptMethod.AES
+    assert kwargs["encrypted_method"] == microsoft_oauth_service.DEFAULT_ENCRYPT_METHOD
     assert isinstance(kwargs["now"], datetime.datetime)
 
 
@@ -646,7 +646,7 @@ async def test_legacy_cbc_credential_refreshes_and_is_rewritten_as_gcm(
     refresh.assert_awaited_once_with("rt-legacy", ["Mail.Read"])
     update_active_refresh_token.assert_awaited_once()
     persisted = update_active_refresh_token.await_args.kwargs
-    assert persisted["encrypted_method"] == microsoft_oauth_service.EncryptMethod.AES
+    assert persisted["encrypted_method"] == microsoft_oauth_service.DEFAULT_ENCRYPT_METHOD
     assert persisted["encrypted_refresh_token"].startswith("skyvern_enc:aesgcm-v1:")
     assert persisted["connection_id"] == "cred-1"
     assert persisted["initiating_user_id"] == "user-1"

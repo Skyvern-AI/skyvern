@@ -1,5 +1,7 @@
+import hmac
 import json
 import typing
+from collections.abc import Iterable
 from typing import TYPE_CHECKING, Any
 
 import pydantic
@@ -36,7 +38,7 @@ from skyvern.forge.sdk.db.models import (
     WorkflowScheduleModel,
 )
 from skyvern.forge.sdk.encrypt import encryptor
-from skyvern.forge.sdk.encrypt.base import EncryptMethod
+from skyvern.forge.sdk.encrypt.base import EncryptMethod, TokenDecryptionError
 from skyvern.forge.sdk.models import Step, StepStatus
 from skyvern.forge.sdk.schemas.copilot_turn_outcome import TurnOutcome
 from skyvern.forge.sdk.schemas.organizations import (
@@ -612,6 +614,22 @@ def convert_to_organization(org_model: OrganizationModel) -> Organization:
         created_at=org_model.created_at,
         modified_at=org_model.modified_at,
     )
+
+
+async def rows_with_secret(rows: Iterable[OrganizationAuthTokenModel], secret: str) -> list[OrganizationAuthTokenModel]:
+    """The rows whose stored token, decrypted when encrypted, equals ``secret``; undecryptable rows never match."""
+    matches = []
+    for row in rows:
+        stored = row.token
+        if row.encrypted_token and row.encrypted_method:
+            try:
+                stored = await encryptor.decrypt(row.encrypted_token, EncryptMethod(row.encrypted_method))
+            except (TokenDecryptionError, ValueError):
+                LOG.debug("Skipping undecryptable organization auth token", token_id=row.id)
+                continue
+        if stored and hmac.compare_digest(stored.encode("utf-8"), secret.encode("utf-8")):
+            matches.append(row)
+    return matches
 
 
 async def convert_to_organization_auth_token(

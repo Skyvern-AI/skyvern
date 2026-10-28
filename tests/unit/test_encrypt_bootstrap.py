@@ -1,10 +1,11 @@
+import base64
 from typing import Iterator
 
 import pytest
 
 from skyvern.forge.sdk.encrypt import encryptor
 from skyvern.forge.sdk.encrypt.aes import AES, default_iv, default_salt
-from skyvern.forge.sdk.encrypt.base import EncryptMethod
+from skyvern.forge.sdk.encrypt.base import EncryptMethod, TokenDecryptionError
 from skyvern.forge.sdk.encrypt.bootstrap import PLACEHOLDER_SECRET_KEY, register_aes_encryptor
 
 SECRET_KEY = "self-hosted-secret-key-000"
@@ -85,3 +86,40 @@ async def test_derivation_is_scoped_to_the_secret_key() -> None:
     register_aes_encryptor(secret_key=f"{SECRET_KEY}-other")
     with pytest.raises(Exception, match="Failed to decrypt token"):
         await encryptor.decrypt(ciphertext, EncryptMethod.AES)
+
+
+@pytest.mark.asyncio
+async def test_register_aes_encryptor_adds_gcm_with_a_fresh_nonce_per_encryption() -> None:
+    register_aes_encryptor(secret_key=SECRET_KEY)
+
+    first = await encryptor.encrypt("refresh-token", EncryptMethod.AES_GCM)
+    second = await encryptor.encrypt("refresh-token", EncryptMethod.AES_GCM)
+
+    assert first != second
+    assert await encryptor.decrypt(first, EncryptMethod.AES_GCM) == "refresh-token"
+    assert await encryptor.decrypt(second, EncryptMethod.AES_GCM) == "refresh-token"
+
+
+@pytest.mark.asyncio
+async def test_gcm_rejects_tampered_ciphertext_and_other_deployment_keys() -> None:
+    register_aes_encryptor(secret_key=SECRET_KEY)
+    ciphertext = await encryptor.encrypt("refresh-token", EncryptMethod.AES_GCM)
+    raw = bytearray(base64.b64decode(ciphertext))
+    raw[-1] ^= 1
+
+    with pytest.raises(TokenDecryptionError):
+        await encryptor.decrypt(base64.b64encode(bytes(raw)).decode(), EncryptMethod.AES_GCM)
+
+    register_aes_encryptor(secret_key=f"{SECRET_KEY}-other")
+    with pytest.raises(TokenDecryptionError):
+        await encryptor.decrypt(ciphertext, EncryptMethod.AES_GCM)
+
+
+@pytest.mark.asyncio
+async def test_decrypt_unlabeled_reads_gcm_and_legacy_cbc_values() -> None:
+    register_aes_encryptor(secret_key=SECRET_KEY)
+    legacy = await encryptor.encrypt("ws://legacy", EncryptMethod.AES)
+    current = await encryptor.encrypt("ws://current", EncryptMethod.AES_GCM)
+
+    assert await encryptor.decrypt_unlabeled(legacy) == "ws://legacy"
+    assert await encryptor.decrypt_unlabeled(current) == "ws://current"
