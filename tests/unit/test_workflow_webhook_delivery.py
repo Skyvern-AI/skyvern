@@ -3544,7 +3544,8 @@ async def test_canceled_run_gets_one_final_webhook_from_a_sender_that_is_sure_to
 
     monkeypatch.setattr(service_module.app.AGENT_FUNCTION, "deliver_webhook", AsyncMock(side_effect=endpoint))
 
-    async def cancel_row(workflow_run_id: str) -> WorkflowRun:
+    async def cancel_row(workflow_run_id: str, *, requested_externally: bool = False) -> WorkflowRun:
+        assert requested_externally is True
         if finishes_before_cancel:
             await runs.update_workflow_run_if_not_final(workflow_run_id, WorkflowRunStatus.completed)
         canceled = await runs.update_workflow_run_if_not_final(workflow_run_id, WorkflowRunStatus.canceled)
