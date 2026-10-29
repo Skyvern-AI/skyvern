@@ -98,6 +98,122 @@ export function containsJinjaReference(text: string, key: string): boolean {
   return regex.test(text);
 }
 
+const PYTHON_STRING_OR_COMMENT =
+  /("""|''')[\s\S]*?(?:\1|$)|"(?:[^"\\\n]|\\.)*"?|'(?:[^'\\\n]|\\.)*'?|#[^\n]*/g;
+
+export function stripPythonComments(code: string): string {
+  return code.replace(PYTHON_STRING_OR_COMMENT, (match) =>
+    match.startsWith("#") ? "" : match,
+  );
+}
+
+const JINJA_RAW_BLOCK =
+  /\{%[-+]?\s*raw\s*[-+]?%\}[\s\S]*?(?:\{%[-+]?\s*endraw\s*[-+]?%\}|$)/g;
+const JINJA_SPAN = /\{\{([\s\S]*?)\}\}|\{%([\s\S]*?)%\}/g;
+const QUOTED_STRING = /"(?:[^"\\]|\\.)*"|'(?:[^'\\]|\\.)*'/g;
+const JINJA_KEYWORDS = new Set([
+  "and",
+  "or",
+  "not",
+  "in",
+  "is",
+  "if",
+  "else",
+  "recursive",
+  "true",
+  "false",
+  "none",
+  "True",
+  "False",
+  "None",
+]);
+// A name read as a value: not an attribute, filter, test or keyword-argument name.
+const JINJA_ROOT_NAME =
+  /(?<!\w)(?<!\.\s*)(?<!\|\s*)(?<!\bis\s+)(?<!\bis\s+not\s+)[A-Za-z_]\w*(?!\w)(?!\s*=(?!=))/g;
+const FOR_TAG = /^for\s+([\w\s,()]+?)\s+in\b/;
+const SET_TAG = /^set\s+([\w\s,]+?)\s*(?:=[\s\S]*)?$/;
+
+function splitNames(targets: string): Array<string> {
+  return targets
+    .replace(/[()]/g, "")
+    .split(",")
+    .map((name) => name.trim())
+    .filter(Boolean);
+}
+
+// Lists names read inside {{ }} only, matching what the AI fallback receives. Control flow is not
+// simulated: a for target is bound until its endfor, and a set binds from its tag onward only
+// outside any if/for, since inside one it may never run.
+export function codeBlockUses(
+  parameterKeys: ReadonlyArray<string>,
+  code: string,
+): Array<string> {
+  const names: Array<string> = [...parameterKeys];
+  const scopes: Array<{ tag: "for" | "if"; names: Array<string> }> = [];
+  const topLevelSets = new Set<string>();
+  for (const [, output, tag] of stripPythonComments(code)
+    .replace(JINJA_RAW_BLOCK, "")
+    .matchAll(JINJA_SPAN)) {
+    if (output !== undefined) {
+      const bound = new Set([
+        ...topLevelSets,
+        ...scopes.flatMap((scope) => scope.names),
+      ]);
+      for (const name of output
+        .replace(QUOTED_STRING, '""')
+        .match(JINJA_ROOT_NAME) ?? []) {
+        if (!JINJA_KEYWORDS.has(name) && !bound.has(name)) {
+          names.push(name);
+        }
+      }
+      continue;
+    }
+    const statement = (tag ?? "")
+      .replace(QUOTED_STRING, '""')
+      .trim()
+      .replace(/^[-+]|[-+]$/g, "")
+      .trim();
+    const keyword = statement.match(/^\w+/)?.[0];
+    if (keyword === "for") {
+      scopes.push({
+        tag: "for",
+        names: [...splitNames(FOR_TAG.exec(statement)?.[1] ?? ""), "loop"],
+      });
+    } else if (keyword === "if") {
+      scopes.push({ tag: "if", names: [] });
+    } else if (keyword === "endfor" || keyword === "endif") {
+      const open = scopes
+        .map((scope) => scope.tag)
+        .lastIndexOf(keyword === "endfor" ? "for" : "if");
+      if (open >= 0) {
+        scopes.length = open;
+      }
+    } else if (keyword === "set") {
+      const match = SET_TAG.exec(statement);
+      if (match && scopes.length === 0) {
+        splitNames(match[1] ?? "").forEach((name) => topLevelSets.add(name));
+      }
+    }
+  }
+  return Array.from(new Set(names));
+}
+
+export type CodeBlockUseKind = "input" | "block" | "neither";
+
+export function classifyUse(
+  name: string,
+  inputKeys: ReadonlySet<string>,
+  blockLabels: ReadonlySet<string>,
+): CodeBlockUseKind {
+  if (inputKeys.has(name)) {
+    return "input";
+  }
+  if (blockLabels.has(name) || blockLabels.has(name.replace(/_output$/, ""))) {
+    return "block";
+  }
+  return "neither";
+}
+
 /**
  * Recursively checks if any string field in an object contains a jinja
  * reference to a key. Mirrors the shape used by the editor's existing ref

@@ -11,6 +11,8 @@ import { afterEach, beforeEach, describe, expect, test, vi } from "vitest";
 
 import { WorkflowScopeContext } from "@/routes/workflows/editor/WorkflowScopeContext";
 import { useCopilotActionStore } from "@/store/useCopilotActionStore";
+import { useWorkflowParametersStore } from "@/store/WorkflowParametersStore";
+import { WorkflowParameterValueType } from "@/routes/workflows/types/workflowTypes";
 import {
   beginCopilotAcceptance,
   beginSaveTransaction,
@@ -55,6 +57,8 @@ const node = {
 
 const updateNodeData = vi.fn();
 let workflowErrorCodeMapping: Record<string, string> | null = null;
+let extraNodes: Array<{ id: string; type: string; data: { label: string } }> =
+  [];
 
 vi.mock("@xyflow/react", () => ({
   useNodes: () => [
@@ -63,6 +67,7 @@ vi.mock("@xyflow/react", () => ({
       type: "start",
       data: { errorCodeMapping: workflowErrorCodeMapping },
     },
+    ...extraNodes,
     node,
   ],
   useReactFlow: () => ({
@@ -154,6 +159,8 @@ beforeEach(() => {
   );
   useCopilotActionStore.setState(useCopilotActionStore.getInitialState());
   node.data = { ...baseData };
+  extraNodes = [];
+  useWorkflowParametersStore.setState({ parameters: [] });
   updateNodeData.mockClear();
   workflowErrorCodeMapping = null;
 });
@@ -1030,7 +1037,9 @@ describe("CodeBlockEditor for a block without a goal", () => {
     fireEvent.click(screen.getByRole("button", { name: "Plain" }));
 
     expect(screen.getByText("Goal")).toBeTruthy();
-    expect(screen.getByText(/No steps yet/)).toBeTruthy();
+    expect(
+      screen.getByText("No browser steps found in this code."),
+    ).toBeTruthy();
   });
 
   test("opens on the code even when a goal-less block carries derived steps", () => {
@@ -1085,35 +1094,121 @@ describe("CodeBlockEditor view toggle", () => {
     expect(screen.getByText("Goal")).toBeTruthy();
   });
 
-  test("shows an empty hint in the plain view when there are no steps", () => {
+  test("says no browser steps were found and offers Regenerate when the code has none", () => {
     node.data = { ...baseData, ...codeFirstData, steps: [] };
     renderEditor(false);
 
     expect(screen.getByText("Goal")).toBeTruthy();
-    expect(screen.getByText(/No steps yet/)).toBeTruthy();
+    expect(
+      screen.getByText("No browser steps found in this code."),
+    ).toBeTruthy();
+    expect(screen.queryByText(/No steps yet/)).toBeNull();
+    expect(
+      screen.getByRole("button", { name: "Regenerate block" }).textContent,
+    ).toContain("Regenerate");
     expect(screen.queryByTestId("code-editor")).toBeNull();
+  });
+
+  test("keeps the not-generated hint and Generate for a block with no code", () => {
+    node.data = { ...baseData, ...codeFirstData, code: "  \n", steps: null };
+    renderEditor(false);
+
+    expect(
+      screen.getByText(
+        "No steps yet. Steps appear once Skyvern generates them.",
+      ),
+    ).toBeTruthy();
+    expect(
+      screen.getByRole("button", { name: "Generate block" }).textContent,
+    ).toContain("Generate");
+  });
+});
+
+describe("CodeBlockEditor Uses row", () => {
+  function usedNames() {
+    return screen
+      .getAllByRole("listitem")
+      .filter((item) => item.hasAttribute("data-kind"))
+      .map((item) => [item.firstChild?.textContent, item.dataset.kind]);
+  }
+
+  test("lists declared inputs and {{ }} reads under the Goal, marked input, block or neither", () => {
+    extraNodes = [
+      { id: "b0", type: "codeBlock", data: { label: "Fetch_Rows" } },
+    ];
+    useWorkflowParametersStore.setState({
+      parameters: [
+        {
+          key: "region",
+          parameterType: "workflow",
+          dataType: WorkflowParameterValueType.String,
+          defaultValue: null,
+        },
+      ],
+    });
+    node.data = {
+      ...baseData,
+      prompt: "Filter the rows to the ones due this week",
+      parameterKeys: ["region"],
+      code: "rows = {{ Fetch_Rows_output.rows }}\nkeep = {{ Not_A_Block }}\nprint({{ region }})",
+      steps: [],
+    };
+    renderEditor();
+
+    expect(
+      screen.getByRole("list", { name: "Names this code reads" }),
+    ).toBeTruthy();
+    expect(usedNames()).toEqual([
+      ["region", "input"],
+      ["Fetch_Rows_output", "block"],
+      ["Not_A_Block", "neither"],
+    ]);
+    expect(screen.queryByRole("textbox", { name: /Uses/ })).toBeNull();
+  });
+
+  test("shows a block read even when the Goal does not mention it", () => {
+    extraNodes = [{ id: "b0", type: "codeBlock", data: { label: "Lookup" } }];
+    node.data = {
+      ...baseData,
+      prompt: "Return the region totals",
+      code: "totals = {{ Lookup }}",
+      steps: [],
+    };
+    renderEditor();
+
+    expect(usedNames()).toEqual([["Lookup", "block"]]);
+  });
+
+  test("renders no Uses row when the code reads nothing", () => {
+    node.data = { ...baseData, ...codeFirstData };
+    renderEditor();
+
+    expect(
+      screen.queryByRole("list", { name: "Names this code reads" }),
+    ).toBeNull();
   });
 });
 
 describe("CodeBlockEditor generate gating", () => {
   test.each([
-    { lock: "save", generated: false },
-    { lock: "save", generated: true },
-    { lock: "copilot", generated: false },
-    { lock: "copilot", generated: true },
+    { lock: "save", hasCode: false },
+    { lock: "save", hasCode: true },
+    { lock: "copilot", hasCode: false },
+    { lock: "copilot", hasCode: true },
   ] as const)(
-    "disables block generation during a $lock transaction (generated=$generated)",
-    ({ lock, generated }) => {
+    "disables block generation during a $lock transaction (hasCode=$hasCode)",
+    ({ lock, hasCode }) => {
       node.data = {
         ...baseData,
         prompt: "Read the page title",
-        steps: generated ? codeFirstData.steps! : null,
+        code: hasCode ? baseData.code : "",
+        steps: null,
       };
       const owner = createYamlCommitOwner("w");
       registerEditorOwner(owner);
       renderEditor();
       const button = screen.getByRole<HTMLButtonElement>("button", {
-        name: generated ? "Regenerate block" : "Generate block",
+        name: hasCode ? "Regenerate block" : "Generate block",
       });
       expect(button.disabled).toBe(false);
       let reservation: symbol | null = null;
@@ -1163,7 +1258,7 @@ describe("CodeBlockEditor generate gating", () => {
   });
 
   test("disables generate when the node is not editable", () => {
-    node.data = { ...baseData, prompt: "Do a thing", steps: null };
+    node.data = { ...baseData, prompt: "Do a thing", code: "", steps: null };
     node.data.editable = false;
     renderEditor(false);
 

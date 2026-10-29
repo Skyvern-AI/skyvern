@@ -50,6 +50,7 @@ import {
   ActionItem,
   WorkflowRunOverviewActiveElement,
 } from "./WorkflowRunOverview";
+import { isTruncationMarker } from "./responseValueCaps";
 import { ThoughtCard } from "./ThoughtCard";
 import {
   aggregateIterationStatus,
@@ -375,18 +376,8 @@ function getWebSearchResultSummary(block: WorkflowRunBlock): string | null {
   if ("prompt_output" in output && Array.isArray(output.prompt_output)) {
     let itemCount = output.prompt_output.length;
     const lastItem: unknown = output.prompt_output[itemCount - 1];
-    if (
-      lastItem &&
-      typeof lastItem === "object" &&
-      "truncated" in lastItem &&
-      lastItem.truncated === true &&
-      "reason" in lastItem &&
-      lastItem.reason === "exceeded_max_run_response_value_size"
-    ) {
-      if (
-        !("original_count" in lastItem) ||
-        typeof lastItem.original_count !== "number"
-      ) {
+    if (isTruncationMarker(lastItem)) {
+      if (typeof lastItem.original_count !== "number") {
         return summary;
       }
       itemCount = lastItem.original_count;

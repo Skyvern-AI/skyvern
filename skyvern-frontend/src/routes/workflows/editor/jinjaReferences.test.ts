@@ -1,6 +1,8 @@
 import { describe, expect, test } from "vitest";
 
 import {
+  classifyUse,
+  codeBlockUses,
   containsJinjaReference,
   removeJinjaReference,
   replaceJinjaReference,
@@ -85,5 +87,101 @@ describe("containsJinjaReference", () => {
 
   test("matches a reference with a filter expression", () => {
     expect(containsJinjaReference("hi {{ key | upper }}", "key")).toBe(true);
+  });
+});
+
+describe("codeBlockUses", () => {
+  test("lists declared inputs first, then {{ }} names in order of first use", () => {
+    expect(
+      codeBlockUses(
+        ["region", "start_date"],
+        "rows = {{ fetch_rows_output.rows }}\nfor r in {{ fetch_rows | tojson }}:\n    print({{ region }}, {{ cutoff }})",
+      ),
+    ).toEqual([
+      "region",
+      "start_date",
+      "fetch_rows_output",
+      "fetch_rows",
+      "cutoff",
+    ]);
+  });
+
+  test("keeps root names only: no attributes, filters, tests, kwargs or strings", () => {
+    expect(
+      codeBlockUses(
+        [],
+        "{{ a.b }} {{ c | default(d, boolean=true) }} {{ e['key'] }} {{ f is defined }} {{ 'g' ~ \"h\" }}",
+      ),
+    ).toEqual(["a", "c", "d", "e", "f"]);
+  });
+
+  test("skips names read only by a tag, as the AI fallback does", () => {
+    expect(
+      codeBlockUses(
+        [],
+        "{% if tax_id %}x{% endif %}{% for tax_id in [1] %}{{ tax_id }}{% endfor %}{{ real }}",
+      ),
+    ).toEqual(["real"]);
+  });
+
+  test("binds a for target until its endfor", () => {
+    expect(
+      codeBlockUses(
+        [],
+        "{{ rows }}{% for rows in other %}{{ rows }}{{ loop.index }}{% endfor %}{{ rows }}",
+      ),
+    ).toEqual(["rows"]);
+  });
+
+  test("a top-level set binds from its tag onward", () => {
+    expect(
+      codeBlockUses([], "{{ total }}{%- set total = base + 1 -%}{{ total }}"),
+    ).toEqual(["total"]);
+  });
+
+  test("a set inside an if or for does not bind", () => {
+    expect(
+      codeBlockUses(
+        [],
+        "{% if false %}{% set rows = [] %}{% endif %}{{ rows }}",
+      ),
+    ).toEqual(["rows"]);
+    expect(
+      codeBlockUses(
+        [],
+        "{% for x in xs %}{% set count = 1 %}{% endfor %}{{ count }}",
+      ),
+    ).toEqual(["count"]);
+  });
+
+  test("ignores names inside a raw block", () => {
+    expect(
+      codeBlockUses(
+        [],
+        "{% raw %}{{ inside_raw }}{% endraw %}{{ real }}{%- raw -%}{{ also_raw }}{%- endraw %}",
+      ),
+    ).toEqual(["real"]);
+  });
+
+  test("ignores Jinja inside Python comments but not inside Python strings", () => {
+    expect(codeBlockUses([], "# old {{ old_input }}")).toEqual([]);
+    expect(
+      codeBlockUses(
+        [],
+        'url = "https://example.com/#{{ page }}"  # was {{ legacy }}',
+      ),
+    ).toEqual(["page"]);
+  });
+});
+
+describe("classifyUse", () => {
+  const inputs = new Set(["region"]);
+  const blocks = new Set(["fetch_rows"]);
+
+  test("marks inputs, block labels and <label>_output, and neither", () => {
+    expect(classifyUse("region", inputs, blocks)).toBe("input");
+    expect(classifyUse("fetch_rows", inputs, blocks)).toBe("block");
+    expect(classifyUse("fetch_rows_output", inputs, blocks)).toBe("block");
+    expect(classifyUse("Not_A_Block", inputs, blocks)).toBe("neither");
   });
 });
