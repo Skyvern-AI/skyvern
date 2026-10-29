@@ -64,6 +64,7 @@ from skyvern.forge.sdk.core import skyvern_context
 from skyvern.forge.sdk.core.hashing import diagnostic_fingerprint
 from skyvern.forge.sdk.db.enums import TaskType, is_recipe_billing_workflow_run_trigger_type
 from skyvern.forge.sdk.executor.run_liveness import (
+    block_outcome_authority,
     run_lease_lost,
     run_lease_state,
     run_lease_tasks_enabled,
@@ -1159,6 +1160,7 @@ async def _update_workflow_block(
             output=final_output,
             ai_fallback_triggered=ai_fallback_triggered,
             error_codes=[BROWSER_CONNECTION_LOST_ERROR_CODE] if browser_connection_lost else None,
+            outcome_authority_for_run=block_outcome_authority,
         )
 
         # The row carries the block label even when the caller passed none (a cached wait block).
