@@ -74,6 +74,7 @@ from skyvern.forge.sdk.schemas.microsoft_oauth import MicrosoftOAuthCredentialBa
 from skyvern.forge.sdk.services import google_oauth_service
 from skyvern.webeye.persistent_sessions_manager import BrowserOperation, BrowserRetirement
 from skyvern.webeye.utils import challenge_signature as challenge_signature_module
+from tests.unit._mcp_browser_fakes import crash_free_browser_state
 from tests.unit.copilot_test_helpers import fake_tool, make_copilot_ctx
 from tests.unit.scoped_asyncio import ScopedAsyncio
 
@@ -865,7 +866,7 @@ class TestMCPFailedStepLoopDetection:
             _impl_obj=SimpleNamespace(_close_was_called=False, _closed=False),
             browser=SimpleNamespace(is_connected=lambda: True),
         )
-        browser_state = SimpleNamespace(
+        browser_state = crash_free_browser_state(
             browser_context=browser_context,
             get_working_page=AsyncMock(return_value=None),
         )

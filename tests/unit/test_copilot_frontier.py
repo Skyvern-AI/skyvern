@@ -184,6 +184,8 @@ class _FakePage:
 
 
 class _FakeBrowserState:
+    page_crash_records = ()
+
     def __init__(self, page: _FakePage | None) -> None:
         self._page = page
 

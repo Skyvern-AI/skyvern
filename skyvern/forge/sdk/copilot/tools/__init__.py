@@ -63,7 +63,7 @@ from skyvern.forge.sdk.copilot.credential_pause import (
 )
 from skyvern.forge.sdk.copilot.enforcement import requested_output_paths_for_derivation
 from skyvern.forge.sdk.copilot.loop_detection import record_tool_step_result_for_ctx
-from skyvern.forge.sdk.copilot.mcp_adapter import HeldRequestFailures, stamp_page_facts
+from skyvern.forge.sdk.copilot.mcp_adapter import HeldPageFacts, stamp_page_facts
 from skyvern.forge.sdk.copilot.output_extraction_plan import (
     requested_output_designation_capability,
     value_designation_probe_expression,
@@ -2535,7 +2535,8 @@ def _with_page_state(tool: FunctionTool) -> FunctionTool:
                 binding=binding,
                 custody_lock=browser_session_turn(copilot_ctx, session_id=binding.session_id_for(copilot_ctx)),
             )
-            stamped = stamp_page_facts(copilot_ctx, HeldRequestFailures(), result, page_state, page)
+            held = None if binding.unavailable_reason else HeldPageFacts()
+            stamped = stamp_page_facts(copilot_ctx, held, result, page_state, page)
         return json.dumps(stamped)
 
     return dataclasses.replace(tool, on_invoke_tool=invoke_with_page_state)

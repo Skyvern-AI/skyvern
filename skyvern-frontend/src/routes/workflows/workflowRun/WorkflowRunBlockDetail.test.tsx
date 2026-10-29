@@ -1,8 +1,9 @@
 // @vitest-environment jsdom
 
-const { getSpy, runQuerySpy } = vi.hoisted(() => ({
+const { getSpy, runQuerySpy, mockedRun } = vi.hoisted(() => ({
   getSpy: vi.fn(),
   runQuerySpy: vi.fn(),
+  mockedRun: { current: null as unknown },
 }));
 
 vi.mock("@/api/AxiosClient", () => ({
@@ -14,8 +15,13 @@ vi.mock("@/hooks/useCredentialGetter", () => ({
 vi.mock("../hooks/useWorkflowRunWithWorkflowQuery", () => ({
   useWorkflowRunWithWorkflowQuery: (options?: { workflowRunId?: string }) => {
     runQuerySpy(options);
-    return { data: null };
+    return { data: mockedRun.current };
   },
+}));
+vi.mock("@/routes/workflows/components/CodeEditor", () => ({
+  CodeEditor: ({ value }: { value: string }) => (
+    <pre data-testid="code-editor">{value}</pre>
+  ),
 }));
 vi.mock("../hooks/useWorkflowRunTimelineQuery", () => ({
   useWorkflowRunTimelineQuery: () => ({ data: [], isLoading: false }),
@@ -42,13 +48,14 @@ import {
 } from "@testing-library/react";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { MemoryRouter } from "react-router-dom";
-import { afterEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import {
   ActionTypes,
   ArtifactType,
   Status,
   type ActionsApiResponse,
+  type WorkflowRunStatusApiResponseWithWorkflow,
 } from "@/api/types";
 import type {
   WorkflowRunBlock,
@@ -156,6 +163,7 @@ afterEach(() => {
   cleanup();
   getSpy.mockReset();
   runQuerySpy.mockReset();
+  mockedRun.current = null;
 });
 
 describe("WorkflowRunBlockDetail router", () => {
@@ -948,5 +956,177 @@ describe("WorkflowRunBlockDetail run resolution", () => {
     for (const [options] of runQuerySpy.mock.calls) {
       expect(options).toEqual({ workflowRunId: undefined });
     }
+  });
+});
+
+describe("WorkflowRunBlockDetail code block", () => {
+  const capMarker = {
+    truncated: true,
+    reason: "exceeded_max_run_response_value_size",
+    original_size_bytes: 3_000_000,
+    limit_bytes: 2_097_152,
+  };
+
+  beforeEach(() => {
+    mockedRun.current = {
+      workflow_run_id: "wr_code",
+      status: Status.Completed,
+      parameters: { region: "west" },
+      workflow: {
+        workflow_definition: {
+          parameters: [
+            { parameter_type: "workflow", key: "region" },
+            { parameter_type: "output", key: "Fetch_Rows_output" },
+          ],
+          blocks: [
+            { block_type: "http_request", label: "Fetch_Rows" },
+            { block_type: "text_prompt", label: "Summarize" },
+            {
+              block_type: "code",
+              label: "Filter_Rows",
+              code: "rows = {{ Fetch_Rows_output }}\nsummary = {{ Summarize }}\nkeep = {{ Not_A_Block }}",
+              parameters: [{ parameter_type: "workflow", key: "region" }],
+              prompt: "Keep the rows due this week",
+              steps: [],
+            },
+          ],
+        },
+      },
+    } as unknown as WorkflowRunStatusApiResponseWithWorkflow;
+  });
+
+  function renderCodeBlock(
+    selected: WorkflowRunBlock,
+    others: Array<WorkflowRunBlock>,
+  ) {
+    render(
+      <WorkflowRunBlockDetail
+        workflowRunId="wr_code"
+        activeItem={selected}
+        timeline={[selected, ...others].map(buildBlockItem)}
+      />,
+    );
+  }
+
+  function codeRun(id: string, createdAt: string) {
+    return buildBlock({
+      workflow_run_block_id: id,
+      block_type: "code",
+      label: "Filter_Rows",
+      created_at: createdAt,
+    });
+  }
+
+  function upstreamValue(name: string) {
+    const list = screen.getByRole("list", {
+      name: "Upstream outputs before this execution",
+    });
+    const item = Array.from(list.children).find(
+      (child) => child.firstElementChild?.textContent === name,
+    );
+    return item?.textContent ?? "";
+  }
+
+  it("shows the run's code, its inputs with values, and what it uses", () => {
+    renderCodeBlock(codeRun("wrb_filter", "2026-01-01T00:00:02Z"), [
+      buildBlock({
+        workflow_run_block_id: "wrb_fetch",
+        label: "Fetch_Rows",
+        created_at: "2026-01-01T00:00:01Z",
+        output: { rows: [{ id: 1 }] },
+      }),
+    ]);
+
+    expect(screen.getByTestId("code-editor").textContent).toContain(
+      "{{ Fetch_Rows_output }}",
+    );
+    expect(screen.getByText("Keep the rows due this week")).toBeDefined();
+    const uses = screen.getByRole("list", { name: "Names this code reads" });
+    expect(
+      Array.from(uses.children).map((item) => [
+        item.firstElementChild?.textContent,
+        item.getAttribute("data-kind"),
+      ]),
+    ).toEqual([
+      ["region", "input"],
+      ["Fetch_Rows_output", "block"],
+      ["Summarize", "block"],
+      ["Not_A_Block", "neither"],
+    ]);
+    expect(uses.children[0]!.textContent).toContain('"west"');
+    expect(upstreamValue("Fetch_Rows_output")).toContain('"id": 1');
+    expect(upstreamValue("Summarize")).toContain("not available for this run");
+  });
+
+  it("never shows the selected execution's own output or a later one", () => {
+    renderCodeBlock(codeRun("wrb_filter_1", "2026-01-01T00:00:02Z"), [
+      buildBlock({
+        workflow_run_block_id: "wrb_fetch_0",
+        label: "Fetch_Rows",
+        created_at: "2026-01-01T00:00:01Z",
+        output: { batch: "first" },
+      }),
+      buildBlock({
+        workflow_run_block_id: "wrb_fetch_1",
+        label: "Fetch_Rows",
+        created_at: "2026-01-01T00:00:03Z",
+        output: { batch: "second" },
+      }),
+      buildBlock({
+        workflow_run_block_id: "wrb_summary_later",
+        label: "Summarize",
+        created_at: "2026-01-01T00:00:04Z",
+        output: { extracted_information: "later" },
+      }),
+    ]);
+
+    expect(upstreamValue("Fetch_Rows_output")).toContain('"first"');
+    expect(upstreamValue("Fetch_Rows_output")).not.toContain('"second"');
+    expect(upstreamValue("Summarize")).toContain("not available for this run");
+  });
+
+  it("adds output for a bare label read, as the run context does", () => {
+    renderCodeBlock(codeRun("wrb_filter", "2026-01-01T00:00:02Z"), [
+      buildBlock({
+        workflow_run_block_id: "wrb_summary",
+        label: "Summarize",
+        created_at: "2026-01-01T00:00:01Z",
+        output: { extracted_information: { total: 3 } },
+      }),
+    ]);
+
+    expect(upstreamValue("Summarize")).toMatch(
+      /"extracted_information"[\s\S]*"output": \{\s*"total": 3/,
+    );
+  });
+
+  it("labels an upstream output the run capped", () => {
+    renderCodeBlock(codeRun("wrb_filter", "2026-01-01T00:00:02Z"), [
+      buildBlock({
+        workflow_run_block_id: "wrb_fetch",
+        label: "Fetch_Rows",
+        created_at: "2026-01-01T00:00:01Z",
+        output: { rows: [{ id: 1 }, capMarker], count: 2 },
+      }),
+    ]);
+
+    expect(upstreamValue("Fetch_Rows_output")).toContain("Capped by the run");
+    expect(upstreamValue("Fetch_Rows_output")).toContain('"count": 2');
+  });
+
+  it("falls back to the generic detail when the run's definition has no such code block", () => {
+    renderCodeBlock(
+      buildBlock({
+        workflow_run_block_id: "wrb_renamed",
+        block_type: "code",
+        label: "Renamed_Block",
+      }),
+      [],
+    );
+
+    expect(screen.queryByTestId("code-editor")).toBeNull();
+    expect(
+      screen.queryByRole("list", { name: "Names this code reads" }),
+    ).toBeNull();
   });
 });

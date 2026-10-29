@@ -51,6 +51,7 @@ from skyvern.forge.sdk.copilot.tools import (
 from skyvern.forge.sdk.copilot.tools._shared import TOTAL_TIMEOUT_SECONDS as shared_total_timeout_seconds
 from skyvern.forge.sdk.copilot.tools.workflow_update import _PERSISTENCE_MESSAGES
 from skyvern.forge.sdk.copilot.verification_evidence import WorkflowVerificationEvidence
+from tests.unit._mcp_browser_fakes import page_crash_entry
 from tests.unit.copilot_test_helpers import make_copilot_ctx
 
 
@@ -1070,6 +1071,9 @@ _BOUNDED_PAGE_STATE = {
 }
 
 
+_PAGE_CRASHES = [page_crash_entry(url="https://shop.example.com/orders/new")]
+
+
 @pytest.mark.parametrize(
     ("data", "page_state", "expected"),
     [
@@ -1086,7 +1090,7 @@ _BOUNDED_PAGE_STATE = {
 def test_an_evicted_browser_result_keeps_a_bounded_page_state(
     data: dict[str, Any], page_state: dict[str, Any], expected: dict[str, Any]
 ) -> None:
-    old_output = json.dumps({"page_state": page_state, "ok": True, "data": data})
+    old_output = json.dumps({"page_state": page_state, "page_crashes": _PAGE_CRASHES, "ok": True, "data": data})
     items = [_fco("c_old", old_output), _reasoning()] + [
         _fco(f"c{i}", '{"ok":true}') for i in range(KEEP_RECENT_TOOL_OUTPUTS)
     ]
@@ -1095,6 +1099,7 @@ def test_an_evicted_browser_result_keeps_a_bounded_page_state(
 
     assert pruned[0]["output"] != old_output, "the summarizer must have run"
     assert json.loads(pruned[0]["output"])["page_state"] == expected
+    assert json.loads(pruned[0]["output"])["page_crashes"] == _PAGE_CRASHES
 
 
 def test_page_facts_alone_do_not_push_a_short_result_into_compaction() -> None:
@@ -1113,7 +1118,9 @@ def test_page_facts_alone_do_not_push_a_short_result_into_compaction() -> None:
         "challenge_vendor": None,
     }
     failures = [{"method": "POST", "resource_type": "xhr", "failure_text": "net::ERR_EMPTY_RESPONSE", "url": "/r"}]
-    old_output = json.dumps({"page_state": page_state, "page_request_failures": failures, **solved})
+    old_output = json.dumps(
+        {"page_state": page_state, "page_request_failures": failures, "page_crashes": _PAGE_CRASHES, **solved}
+    )
     assert len(json.dumps(solved)) <= 300 < len(old_output)
     items = [_fco("c_old", old_output), _reasoning()] + [
         _fco(f"c{i}", '{"ok":true}') for i in range(KEEP_RECENT_TOOL_OUTPUTS)
