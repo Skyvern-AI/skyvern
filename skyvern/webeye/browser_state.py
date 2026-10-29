@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from collections.abc import Sequence
+from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import TYPE_CHECKING, Awaitable, Callable, Literal, Protocol
 from urllib.parse import urlparse
@@ -21,6 +23,16 @@ if TYPE_CHECKING:
 # URLs a tab reports when it holds no document — including ":" , which Chrome reports for a tab
 # whose only navigation turned into a download.
 BLANK_PAGE_URLS = {"about:blank", ":"}
+
+
+# Compared and hashed by identity, so a reader can remember a record it has already reported.
+@dataclass(eq=False)
+class PageCrashRecord:
+    crashed_at: datetime
+    crashed_url: str
+    cause: Literal["page_crash", "page_lost"]
+    # True once a replacement tab opened and the crashed page's non-blank URL was restored in it.
+    reopened: bool = False
 
 
 def is_selectable_page_url(url: str) -> bool:
@@ -90,6 +102,9 @@ class BrowserState(Protocol):
     def get_browser_state_diagnostic(self) -> BrowserStateDiagnostic | None: ...
 
     def get_browser_connection_loss(self) -> BrowserStateDiagnostic | None: ...
+
+    @property
+    def page_crash_records(self) -> Sequence[PageCrashRecord]: ...
 
     @property
     def active_run_owner(self) -> str | None: ...

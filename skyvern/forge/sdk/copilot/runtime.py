@@ -5,7 +5,7 @@ from __future__ import annotations
 import asyncio
 import time
 import uuid
-from collections.abc import AsyncIterator, Awaitable, Callable, Iterable, Iterator, Mapping
+from collections.abc import AsyncIterator, Awaitable, Callable, Iterable, Iterator, Mapping, Sequence
 from contextlib import asynccontextmanager, contextmanager, suppress
 from contextvars import ContextVar
 from copy import deepcopy
@@ -79,7 +79,7 @@ from skyvern.webeye.browser_errors import (
     is_target_closed_message,
 )
 from skyvern.webeye.browser_retirement import BrowserOperationRejected, BrowserRetirement, BrowserRetirementReason
-from skyvern.webeye.browser_state import BrowserState
+from skyvern.webeye.browser_state import BrowserState, PageCrashRecord
 from skyvern.webeye.persistent_session_errors import BrowserSessionCreditAdmissionRefusal
 
 if TYPE_CHECKING:
@@ -494,6 +494,8 @@ class AgentContext:
     # Shared by this turn's per-dispatch SessionStates, whose page listeners keep writing between calls. Those listeners
     # keep a log alive past the turn, but only this turn reads it.
     request_failure_logs_by_browser_session: dict[str, RequestFailureLog] = field(default_factory=dict)
+    # The live record list of the browser state each session last resolved to.
+    page_crash_records_by_browser_session: dict[str, Sequence[PageCrashRecord]] = field(default_factory=dict)
     browser_session_recovery_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
     browser_session_recovery_owner: asyncio.Task[Any] | None = field(default=None, init=False, repr=False)
     browser_session_recovery_depth: int = field(default=0, init=False, repr=False)
@@ -1165,6 +1167,7 @@ async def resolve_browser_state_for_context(
                     resolved_session_id=_resolved_session_id,
                     organization_id=ctx.organization_id,
                 )
+            track_page_crashes(ctx, _resolved_session_id, injected_state)
             return injected_state
         except HealAdoptionFailed:
             return None
@@ -1176,6 +1179,7 @@ async def resolve_browser_state_for_context(
         # Only this branch's state lives in the pod's cache; the self-heal branch above returns the
         # healer's injected state, which the turn-exit release would look for and never find.
         record_attached_browser_driver(ctx, resolved_session_id, browser_state)
+        track_page_crashes(ctx, resolved_session_id, browser_state)
     return browser_state
 
 
@@ -1364,6 +1368,10 @@ def _discard_finished_driver_release(task: asyncio.Task[bool] | asyncio.Task[Non
 def _hold_attached_browser_driver(session_id: str, browser_state: BrowserState, *, new_holder: bool) -> None:
     turns, _ = _ATTACHED_TURNS_PER_SESSION.get(session_id, (0, browser_state))
     _ATTACHED_TURNS_PER_SESSION[session_id] = (turns + 1 if new_holder else turns, browser_state)
+
+
+def track_page_crashes(ctx: AgentContext, session_id: str, browser_state: BrowserState) -> None:
+    ctx.page_crash_records_by_browser_session[session_id] = browser_state.page_crash_records
 
 
 def record_attached_browser_driver(ctx: AgentContext, session_id: str, browser_state: BrowserState) -> None:
@@ -1594,6 +1602,7 @@ async def _mcp_browser_context_impl(
                 browser_session_id, RequestFailureLog()
             ),
         )
+        track_page_crashes(ctx, browser_session_id, browser_state)
         if working_page is not None:
             # The browser state's pin outlives this per-call SessionState, so every tool call
             # starts on the page the last tab operation selected instead of pages[-1].

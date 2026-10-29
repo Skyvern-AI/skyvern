@@ -40,7 +40,7 @@ from skyvern.forge.sdk.copilot.enforcement import (
 from skyvern.forge.sdk.copilot.mcp_adapter import (
     BROWSER_TARGET_PARAM,
     BROWSER_TARGET_PARAM_NAME,
-    POST_HOOK_HELD_REQUEST_FAILURES,
+    POST_HOOK_HELD_PAGE_FACTS,
     PreHook,
     SchemaOverlay,
     scrub_model_facing_tool_result,
@@ -1101,7 +1101,7 @@ async def _navigate_post_hook(
         page_state, page = await read_page_state_on_page(
             ctx, tool_name="navigate_browser", result=navigated, binding=None, settle=True
         )
-        return stamp_page_facts(ctx, POST_HOOK_HELD_REQUEST_FAILURES.get(), navigated, page_state, page)
+        return stamp_page_facts(ctx, POST_HOOK_HELD_PAGE_FACTS.get(), navigated, page_state, page)
     finally:
         ctx.pending_scout_challenge_frames = []
         ctx.pending_scout_challenge_prior_frames = []

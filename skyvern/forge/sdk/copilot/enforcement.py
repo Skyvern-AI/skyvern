@@ -128,6 +128,7 @@ from skyvern.forge.sdk.copilot.turn_halt import (
     stash_turn_halt_from_blocker_signal,
 )
 from skyvern.forge.sdk.copilot.unrecoverable_tool_error import (
+    PAGE_CRASHES_KEY,
     PAGE_FACT_KEYS,
     PAGE_REQUEST_FAILURES_KEY,
 )
@@ -877,9 +878,10 @@ def _summarize_tool_output(output: str) -> str:
         synopsis["error"] = str(parsed["error"])[:200]
     if isinstance(parsed.get("page_state"), dict):
         synopsis["page_state"] = _summarize_page_state(parsed["page_state"])
-    request_failures = parsed.get(PAGE_REQUEST_FAILURES_KEY)
-    if isinstance(request_failures, list) and request_failures:
-        synopsis[PAGE_REQUEST_FAILURES_KEY] = request_failures
+    for page_fact_key in (PAGE_REQUEST_FAILURES_KEY, PAGE_CRASHES_KEY):
+        page_facts = parsed.get(page_fact_key)
+        if isinstance(page_facts, list) and page_facts:
+            synopsis[page_fact_key] = page_facts
 
     data = parsed.get("data")
     # Session continuation can compact the same output again. Re-bound the

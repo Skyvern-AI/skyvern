@@ -29,7 +29,7 @@ import unicodedata
 import uuid
 import zipfile
 from collections import defaultdict, deque
-from collections.abc import AsyncIterator, Coroutine, Iterable, Iterator, Mapping, Sequence
+from collections.abc import AsyncIterator, Collection, Coroutine, Iterable, Iterator, Mapping, Sequence
 from contextvars import ContextVar
 from dataclasses import dataclass, replace
 from datetime import UTC, date, datetime, time
@@ -70,6 +70,7 @@ from jinja2 import StrictUndefined, TemplateSyntaxError, UndefinedError
 from jinja2 import meta as jinja2_meta
 from jinja2 import nodes
 from jinja2.sandbox import SandboxedEnvironment
+from jinja2.visitor import NodeTransformer
 from jsonschema import Draft202012Validator
 from jsonschema.exceptions import ValidationError
 from opentelemetry import trace as otel_trace
@@ -359,6 +360,7 @@ from skyvern.utils.prompt_engine import PROMPT_HARD_CEILING_TOKENS
 from skyvern.utils.secret_redaction import (
     MIN_NUMERIC_SECRET_LENGTH,
     MIN_SECRET_LENGTH,
+    expand_secret_encodings,
     redact_secrets_from_text,
 )
 from skyvern.utils.strings import generate_random_string
@@ -632,9 +634,12 @@ def _exception_in_cause_chain(exc: BaseException, exc_type: type[_ExcT]) -> _Exc
     return cause
 
 
+def _find_template_roots(env: SandboxedEnvironment, source: str) -> set[str]:
+    return jinja2_meta.find_undeclared_variables(env.parse(source))
+
+
 def _absent_template_roots(env: SandboxedEnvironment, source: str, template_data: Mapping[str, object]) -> list[str]:
-    roots = jinja2_meta.find_undeclared_variables(env.parse(source))
-    return sorted(roots - template_data.keys() - env.globals.keys())
+    return sorted(_find_template_roots(env, source) - template_data.keys() - env.globals.keys())
 
 
 def _missing_reference_suffix(exc: BaseException) -> str:
@@ -664,6 +669,51 @@ else:
 CURRENT_DATE_FORMAT = "%Y-%m-%d"
 
 jinja_sandbox_env.filters["json"] = _json_type_filter
+
+# Jinja's analysis hides roots named like a global. Unlike _absent_template_roots, this keeps them, so an author
+# value named `range` or `dict` still resolves.
+_globals_free_jinja_env = jinja_sandbox_env.overlay()
+_globals_free_jinja_env.globals = {}
+
+
+def _is_secret_or_credential_parameter(parameter: PARAMETER_TYPE) -> bool:
+    return parameter.parameter_type.is_secret_or_credential() or (
+        isinstance(parameter, WorkflowParameter)
+        and parameter.workflow_parameter_type is not None
+        and parameter.workflow_parameter_type.is_credential_type()
+    )
+
+
+def _holds_mfa_like_key(name: str, value: object) -> bool:
+    """Whether `otp_service.iter_totp_from_navigation_inputs` could read an inline code from this payload entry."""
+    pending: list[object] = [{name: value}]
+    while pending:
+        item = pending.pop()
+        if isinstance(item, dict):
+            if any(otp_service._is_mfa_like_parameter_key(key) for key in item):
+                return True
+            pending.extend(item.values())
+        elif isinstance(item, list):
+            pending.extend(item)
+    return False
+
+
+class _TagReadsToConst(NodeTransformer):
+    def visit_Output(self, node: nodes.Output) -> nodes.Output:
+        return node
+
+    def visit_Name(self, node: nodes.Name) -> nodes.Node:
+        return nodes.Const(None) if node.ctx == "load" else node
+
+
+def referenced_template_roots(code: str) -> frozenset[str]:
+    """Undeclared roots read inside `{{ }}`; a name read only by a `{% %}` tag is not rendered into the code."""
+    masked_code, _ = mask_jinja_in_python_comments(code)
+    try:
+        template = _TagReadsToConst().visit(_globals_free_jinja_env.parse(masked_code))
+    except TemplateSyntaxError:
+        return frozenset()
+    return frozenset(jinja2_meta.find_undeclared_variables(template))
 
 
 # Mapping from TaskV2Status to the corresponding BlockStatus. Declared once at
@@ -1562,6 +1612,7 @@ class Block(BaseModel, abc.ABC):
         force_include_secrets: bool = False,
         copy_block_metadata: bool = False,
         include_workflow_run_summary: bool = True,
+        include_credential_entries: bool = True,
     ) -> dict[str, Any]:
         """Build the same namespace used to render this block's parameter templates."""
         # Security: only allow real secret values for non-LLM blocks (HttpRequestBlock, CodeBlock)
@@ -1581,7 +1632,7 @@ class Block(BaseModel, abc.ABC):
         if include_secrets and not is_safe_block_for_secrets:
             include_secrets = False
 
-        if include_secrets:
+        if include_secrets and include_credential_entries:
             # parameters is declared per block type, not on the Block base; get_all_parameters
             # is not a plain accessor (some overrides resolve run context) so read the field.
             declared_parameters: list[PARAMETER_TYPE] = getattr(self, "parameters", None) or []
@@ -6995,6 +7046,11 @@ class CodeBlock(Block):
 
     TEMPLATABLE_FIELDS: ClassVar[frozenset[str]] = frozenset({"code", "error_code_mapping", "prompt", "data_schema"})
 
+    _REFERENCED_FALLBACK_VALUE_MAX_CHARS: ClassVar[int] = 20_000
+    _REFERENCED_FALLBACK_TOTAL_MAX_CHARS: ClassVar[int] = 40_000
+
+    _template_roots: frozenset[str] = PrivateAttr(default=frozenset())
+
     def validate_code_template(self) -> None:
         masked_code, _ = mask_jinja_in_python_comments(self.code)
         try:
@@ -7355,6 +7411,7 @@ async def wrapper({default_args}):
         """Render `code` in place and return its inert-slot reference, rendered from a snapshot of the template
         inputs taken before the real render so a stateful `{% set %}` is not evaluated twice against live data."""
         persisted_code = self.code
+        self._template_roots = referenced_template_roots(persisted_code)
         try:
             reference_context: WorkflowRunContext | None = _template_context_snapshot(workflow_run_context)
         except Exception:
@@ -8280,6 +8337,55 @@ async def wrapper({default_args}):
                 task_id=escalation_task.task_id,
             )
 
+    def _referenced_fallback_values(
+        self, workflow_run_context: WorkflowRunContext, declared_keys: Collection[str]
+    ) -> dict[str, Any]:
+        roots = self._template_roots - set(declared_keys)
+        if not roots:
+            return {}
+        namespace = self._build_block_parameter_template_data(
+            workflow_run_context,
+            copy_block_metadata=True,
+            include_workflow_run_summary="workflow_run_summary" in roots,
+            include_credential_entries=False,
+        )
+        # Unfloored, so a short secret such as a PIN drops a root that merely contains it (fail closed). Each
+        # encoding is also JSON-escaped, which catches a secret inside an upstream value that is itself a JSON string.
+        encoded_secrets = {
+            variant
+            for secret in (*self._registered_secret_values(workflow_run_context), *workflow_run_context.secrets)
+            for variant in (*expand_secret_encodings(secret), repr(secret)[1:-1])
+        }
+        escaped_secrets = encoded_secrets | {
+            json.dumps(variant, ensure_ascii=False)[1:-1] for variant in encoded_secrets
+        }
+        values: dict[str, Any] = {}
+        budget = self._REFERENCED_FALLBACK_TOTAL_MAX_CHARS
+        over_budget: list[str] = []
+        for root in sorted(roots):
+            parameter = workflow_run_context.parameters.get(root)
+            if root not in namespace or (parameter is not None and _is_secret_or_credential_parameter(parameter)):
+                continue
+            try:
+                blob = json.dumps(namespace[root], default=str, ensure_ascii=False)
+            except (TypeError, ValueError, RecursionError):
+                continue
+            if any(secret in blob for secret in escaped_secrets):
+                LOG.warning("Left a secret-bearing referenced value out of the AI fallback payload", root=root)
+                continue
+            value = json.loads(blob)
+            if _holds_mfa_like_key(root, value):
+                LOG.info("Left an MFA-like referenced value out of the AI fallback payload", root=root)
+                continue
+            if len(blob) > min(self._REFERENCED_FALLBACK_VALUE_MAX_CHARS, budget):
+                over_budget.append(root)
+                continue
+            values[root] = value
+            budget -= len(blob)
+        if over_budget:
+            LOG.info("Left referenced values out of the AI fallback payload over the size budget", roots=over_budget)
+        return values
+
     async def _attempt_self_heal(
         self,
         *,
@@ -8351,6 +8457,7 @@ async def wrapper({default_args}):
             navigation_payload = {
                 parameter.key: workflow_run_context.get_value_or_none(parameter.key) for parameter in self.parameters
             }
+            navigation_payload.update(self._referenced_fallback_values(workflow_run_context, navigation_payload.keys()))
             # Login-typed only, not the task-block path's `is_registered_credential_parameter_key`: that
             # one also admits card and sensitive-information parameters, so a block carrying a login and
             # a card would yield two keys and lose the single-credential pin.
@@ -8368,14 +8475,7 @@ async def wrapper({default_args}):
             # Every secret the payload exposes, not just the login one: the resolver replaces any
             # registered placeholder, so a card or vault secret would otherwise reach a page unchecked.
             recovery_release_parameter_keys = [
-                parameter.key
-                for parameter in self.parameters
-                if parameter.parameter_type.is_secret_or_credential()
-                or (
-                    isinstance(parameter, WorkflowParameter)
-                    and parameter.workflow_parameter_type is not None
-                    and parameter.workflow_parameter_type.is_credential_type()
-                )
+                parameter.key for parameter in self.parameters if _is_secret_or_credential_parameter(parameter)
             ]
             recovery_enforce_vault_sites = await self._workflow_copilot_lineage(workflow_run_context) is not False
 
