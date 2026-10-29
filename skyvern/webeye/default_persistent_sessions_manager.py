@@ -456,6 +456,9 @@ class DefaultPersistentSessionsManager(PersistentSessionsManager):
     def can_probe_registered_browser_state(self) -> bool:
         return True
 
+    def launches_browser_on_create(self) -> bool:
+        return settings.BROWSER_STREAMING_MODE == "cdp" or settings.BROWSER_TYPE == "cdp-connect"
+
     def supports_evict_and_reconnect(self) -> bool:
         # ``get_browser_state`` is a pure dict lookup against ``_browser_sessions``; it
         # does not reconnect after eviction. Callers must not run the evict-and-reconnect
@@ -851,8 +854,7 @@ class DefaultPersistentSessionsManager(PersistentSessionsManager):
         # screencast/CDP input endpoints can connect. Triggered both by the
         # in-process CDP streaming mode and by cdp-connect, which forwards to a
         # remote browser and still needs a registered BrowserState locally.
-        should_launch = settings.BROWSER_STREAMING_MODE == "cdp" or settings.BROWSER_TYPE == "cdp-connect"
-        if should_launch and runnable_id is None:
+        if self.launches_browser_on_create() and runnable_id is None:
             session_id = session.persistent_browser_session_id
             task = asyncio.create_task(
                 self._launch_browser_for_session(session_id, organization_id, proxy_location, url)

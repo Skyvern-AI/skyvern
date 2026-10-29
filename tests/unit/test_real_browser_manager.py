@@ -26,11 +26,16 @@ from skyvern.exceptions import (
     MissingBrowserStateForBrowserSession,
 )
 from skyvern.forge import app as forge_app
+from skyvern.forge.failure_classifier import SAVED_PROFILE_SIGNED_OUT_REASON_CODE, SIGN_IN_FORM_VISIBLE_REASON_CODE
 from skyvern.forge.sdk.artifact.storage.recording_test_helpers import fake_prepared_recording
 from skyvern.forge.sdk.core import skyvern_context
 from skyvern.forge.sdk.core.skyvern_context import SkyvernContext
 from skyvern.forge.sdk.streaming import registries
+from skyvern.forge.sdk.workflow import service as workflow_service_module
+from skyvern.forge.sdk.workflow.models.workflow import WorkflowRunStatus
+from skyvern.forge.sdk.workflow.service import WorkflowService
 from skyvern.schemas.browser_settings import BrowserSettings, BrowserSettingsSource, build_timezone_receipt
+from skyvern.schemas.runs import ProxyLocationInput
 from skyvern.webeye import browser_settings_receipts, dialog_handler, real_browser_manager
 from skyvern.webeye import real_browser_state as real_browser_state_module
 from skyvern.webeye.browser_acquisition_sample import note_browser_runtime
@@ -1076,11 +1081,16 @@ def make_task(
     return task
 
 
-def make_session(proxy_location: object = None, proxy_session_id: str | None = None) -> MagicMock:
+def make_session(
+    proxy_location: ProxyLocationInput | str | None = None,
+    proxy_session_id: str | None = None,
+    profile_read_only: bool = False,
+) -> MagicMock:
     session = MagicMock()
     session.proxy_location = proxy_location
     session.proxy_session_id = proxy_session_id
     session.browser_settings = None
+    session.profile_read_only = profile_read_only
     return session
 
 
@@ -1329,6 +1339,98 @@ async def test_workflow_run_browser_inherits_session_proxy_pin_when_no_browser_s
     assert new_browser_state.get_or_create_page.await_args.kwargs["extra_http_headers"] == expected_headers
     assert new_browser_state.get_or_create_page.await_args.kwargs["browser_session_id"] == "pbs_456"
     assert workflow_run.extra_http_headers == {"X-Test": "1"}
+
+
+@pytest.mark.asyncio
+async def test_workflow_run_browser_opens_read_only_profile_of_read_only_session() -> None:
+    manager = RealBrowserManager()
+    workflow_run = make_workflow_run("wfr_read_only")
+    new_browser_state = MagicMock()
+    new_browser_state.get_or_create_page = AsyncMock()
+
+    with patch_browser_manager_app() as mock_app:
+        configure_browser_context_acquired_hook(mock_app)
+        mock_app.PERSISTENT_SESSIONS_MANAGER.get_browser_state = AsyncMock(return_value=None)
+        mock_app.PERSISTENT_SESSIONS_MANAGER.get_session = AsyncMock(return_value=make_session(profile_read_only=True))
+        mock_app.PERSISTENT_SESSIONS_MANAGER.set_browser_state = AsyncMock()
+
+        with patch.object(
+            manager, "_create_browser_state", new=AsyncMock(return_value=new_browser_state)
+        ) as mock_create:
+            await manager.get_or_create_for_workflow_run(
+                workflow_run=workflow_run,
+                url="https://example.com",
+                browser_session_id="pbs_456",
+                browser_profile_id="bp_user",
+            )
+
+    assert mock_create.await_args.kwargs["profile_read_only"] is True
+    assert mock_create.await_args.kwargs["browser_profile_id"] == "bp_user"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("created_for_workflow_run_id", "profile_read_only", "browser_profile_loaded", "session_profile_id", "tagged"),
+    [
+        pytest.param("wfr_attach", True, True, "bp_user", True, id="run-owned-read-only-session"),
+        pytest.param("wfr_attach", False, True, "bp_user", False, id="writable-session"),
+        pytest.param(None, True, True, "bp_user", False, id="session-not-created-for-run"),
+        pytest.param("wfr_attach", True, False, "bp_user", False, id="profile-not-loaded"),
+        pytest.param("wfr_attach", True, True, "bp_other", False, id="session-holds-other-profile"),
+    ],
+)
+async def test_sign_in_failure_on_attached_session_is_signed_out_only_for_its_run_owned_profile(
+    monkeypatch: pytest.MonkeyPatch,
+    created_for_workflow_run_id: str | None,
+    profile_read_only: bool,
+    browser_profile_loaded: bool,
+    session_profile_id: str,
+    tagged: bool,
+) -> None:
+    manager = RealBrowserManager()
+    workflow_run = make_workflow_run("wfr_attach", browser_profile_id="bp_user")
+    workflow_run.browser_sink_profile_id = "bp_user"
+    attached_state = MagicMock()
+    attached_state.browser_artifacts = BrowserArtifacts(browser_session_dir="/tmp/attached-connect-dir")
+    attached_state.get_working_page = AsyncMock(return_value=None)
+    attached_state.get_or_create_page = AsyncMock()
+    session = SimpleNamespace(
+        created_for_workflow_run_id=created_for_workflow_run_id,
+        profile_read_only=profile_read_only,
+        browser_profile_loaded=browser_profile_loaded,
+        browser_profile_id=session_profile_id,
+    )
+
+    with patch_browser_manager_app() as mock_app:
+        configure_browser_context_acquired_hook(mock_app)
+        mock_app.PERSISTENT_SESSIONS_MANAGER.get_browser_state = AsyncMock(return_value=attached_state)
+        mock_app.PERSISTENT_SESSIONS_MANAGER.get_session = AsyncMock(return_value=session)
+        await manager.get_or_create_for_workflow_run(
+            workflow_run=workflow_run, url="https://example.com", browser_session_id="pbs_auto"
+        )
+
+    monkeypatch.setattr(forge_app.BROWSER_MANAGER, "get_for_workflow_run", manager.get_for_workflow_run)
+    monkeypatch.setattr(
+        workflow_service_module,
+        "_SAVED_PROFILE_WITHOUT_CREDENTIAL",
+        {"wfr_attach": workflow_service_module._SavedProfileWithoutCredential("bp_user", None, object())},
+    )
+    sign_in = {"category": "WRONG_PAGE_STATE", "confidence_float": 0.9, "reason_code": SIGN_IN_FORM_VISIBLE_REASON_CODE}
+
+    categories = WorkflowService._with_saved_profile_signed_out("wfr_attach", WorkflowRunStatus.failed, [sign_in])
+
+    assert categories is not None
+    assert (categories[0]["reason_code"] == SAVED_PROFILE_SIGNED_OUT_REASON_CODE) is tagged
+
+    store_browser_profile = AsyncMock()
+    monkeypatch.setattr(workflow_service_module.app.STORAGE, "store_browser_profile", store_browser_profile)
+    await WorkflowService()._persist_run_sink_profile_if_needed(
+        workflow_run=workflow_run,
+        browser_state=attached_state,
+        close_browser_on_completion=True,
+        effective_workflow_run_status=WorkflowRunStatus.completed,
+    )
+    store_browser_profile.assert_not_awaited()
 
 
 @pytest.mark.asyncio

@@ -1,11 +1,11 @@
 from __future__ import annotations
 
 import asyncio
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Callable
 from contextlib import asynccontextmanager
 from datetime import UTC, datetime, timedelta, tzinfo
 from types import SimpleNamespace
-from typing import Any
+from typing import Any, TypedDict
 from unittest.mock import AsyncMock, Mock
 
 import pytest
@@ -13,7 +13,7 @@ import pytest_asyncio
 from sqlalchemy import select, update
 from sqlalchemy.ext.asyncio import AsyncEngine
 
-from skyvern.exceptions import BrowserSessionExpired
+from skyvern.exceptions import BrowserSessionExpired, BrowserSessionStartupTimeout, MissingBrowserAddressError
 from skyvern.forge import app
 from skyvern.forge.agent import ForgeAgent
 from skyvern.forge.sdk.core import skyvern_context
@@ -41,7 +41,7 @@ from skyvern.forge.sdk.workflow.browser_profile_key import (
     build_browser_profile_key_digest,
     build_workflow_browser_session_storage_key,
 )
-from skyvern.forge.sdk.workflow.models.block import BlockType
+from skyvern.forge.sdk.workflow.models.block import BlockType, LoginBlock
 from skyvern.forge.sdk.workflow.models.workflow import Workflow, WorkflowRequestBody, WorkflowRun, WorkflowRunStatus
 from skyvern.forge.sdk.workflow.retry_policy import (
     RETRY_DECISION_FINAL,
@@ -54,6 +54,7 @@ from skyvern.forge.sdk.workflow.service import (
     WorkflowService,
 )
 from skyvern.schemas.browser_session_kind import BrowserSessionKind
+from skyvern.schemas.runs import ProxyLocation, ProxyLocationInput
 from skyvern.schemas.workflows import BlockStatus, WorkflowRetryPolicy
 from skyvern.webeye.persistent_session_errors import BrowserSessionCreditAdmissionRefusal
 from skyvern.webeye.real_browser_manager import RealBrowserManager
@@ -116,6 +117,8 @@ def _execute_workflow_run(status: WorkflowRunStatus) -> SimpleNamespace:
         browser_profile_id="bp_managed",
         browser_seed_source=BrowserSeedSource.own_memory,
         browser_address=None,
+        extra_http_headers=None,
+        cdp_connect_headers=None,
         browser_settings=None,
         start_fresh_browser=None,
         reuse_browser_session=None,
@@ -198,6 +201,7 @@ def _patch_execute_workflow_deps(
 
     monkeypatch.setattr(app.AGENT_FUNCTION, "before_workflow_run_start", AsyncMock())
     monkeypatch.setattr(app.AGENT_FUNCTION, "should_defer_workflow_browser_creation", AsyncMock(return_value=False))
+    monkeypatch.setattr(app.AGENT_FUNCTION, "is_browser_memory_engine_enabled", AsyncMock(return_value=False))
     monkeypatch.setattr(svc, "get_workflow_run", AsyncMock(return_value=created_run))
     monkeypatch.setattr(svc, "get_workflow_by_workflow_run_id", AsyncMock(return_value=workflow))
     monkeypatch.setattr(svc, "bind_browser_action_policy", AsyncMock(return_value=None))
@@ -207,7 +211,7 @@ def _patch_execute_workflow_deps(
     monkeypatch.setattr(svc, "get_workflow_output_parameters", AsyncMock(return_value=[]))
     monkeypatch.setattr(svc, "_collect_inherited_workflow_system_prompt", AsyncMock(return_value=None))
     monkeypatch.setattr(svc, "auto_create_browser_session_if_needed", AsyncMock(return_value=None))
-    monkeypatch.setattr(svc, "_browser_profile_is_managed", AsyncMock(return_value=False))
+    monkeypatch.setattr(svc, "_get_run_browser_profile", AsyncMock(return_value=None))
     monkeypatch.setattr(svc, "_execute_workflow_blocks", AsyncMock(return_value=(refreshed_run, set())))
     monkeypatch.setattr(svc, "generate_script_if_needed", AsyncMock())
     monkeypatch.setattr(svc, "should_run_script", AsyncMock(return_value=False))
@@ -398,11 +402,8 @@ async def test_auto_create_browser_session_for_human_interaction_loads_managed_p
 ) -> None:
     create_session = AsyncMock(return_value=SimpleNamespace(persistent_browser_session_id="pbs_test"))
     monkeypatch.setattr(app.PERSISTENT_SESSIONS_MANAGER, "create_session", create_session)
-    workflow = SimpleNamespace(
-        workflow_definition=SimpleNamespace(
-            blocks=[SimpleNamespace(block_type=BlockType.HUMAN_INTERACTION, timeout_seconds=60)]
-        )
-    )
+    human_interaction = SimpleNamespace(block_type=BlockType.HUMAN_INTERACTION, timeout_seconds=60)
+    workflow = SimpleNamespace(workflow_definition=SimpleNamespace(blocks=[human_interaction]))
 
     browser_session = await WorkflowService().auto_create_browser_session_if_needed(
         "o_test",
@@ -415,39 +416,13 @@ async def test_auto_create_browser_session_for_human_interaction_loads_managed_p
         organization_id="o_test",
         timeout_minutes=61,
         browser_profile_id="bp_managed",
+        profile_read_only=False,
         proxy_location=None,
         inherit_profile_proxy=True,
         session_kind=BrowserSessionKind.workflow_run,
         browser_settings=None,
         created_for_workflow_run_id=None,
     )
-
-
-@pytest.mark.asyncio
-async def test_browser_profile_is_managed_distinguishes_user_profiles(monkeypatch: pytest.MonkeyPatch) -> None:
-    get_browser_profile = AsyncMock(return_value=SimpleNamespace(is_managed=False))
-    monkeypatch.setattr(app.DATABASE.browser_sessions, "get_browser_profile", get_browser_profile)
-
-    is_managed = await WorkflowService()._browser_profile_is_managed(
-        organization_id="o_test",
-        browser_profile_id="bp_user",
-    )
-
-    assert is_managed is False
-    get_browser_profile.assert_awaited_once_with(profile_id="bp_user", organization_id="o_test")
-
-
-@pytest.mark.asyncio
-async def test_browser_profile_is_managed_detects_managed_profile(monkeypatch: pytest.MonkeyPatch) -> None:
-    get_browser_profile = AsyncMock(return_value=SimpleNamespace(is_managed=True))
-    monkeypatch.setattr(app.DATABASE.browser_sessions, "get_browser_profile", get_browser_profile)
-
-    is_managed = await WorkflowService()._browser_profile_is_managed(
-        organization_id="o_test",
-        browser_profile_id="bp_managed",
-    )
-
-    assert is_managed is True
 
 
 @pytest.mark.asyncio
@@ -1736,7 +1711,13 @@ async def test_execute_workflow_finalizes_when_pre_status_browser_cleanup_fails(
     assert svc._clean_up_workflow_browser.await_count == 2
 
 
-def _patch_session_backed_run(monkeypatch: pytest.MonkeyPatch, svc: WorkflowService) -> AsyncMock:
+def _patch_session_backed_run(
+    monkeypatch: pytest.MonkeyPatch,
+    svc: WorkflowService,
+    *,
+    loaded_browser_profile_id: str = "bp_managed",
+    launches_browser_on_create: bool = True,
+) -> AsyncMock:
     monkeypatch.setattr(
         service_module.skyvern_context,
         "ensure_context",
@@ -1747,6 +1728,17 @@ def _patch_session_backed_run(monkeypatch: pytest.MonkeyPatch, svc: WorkflowServ
         ),
     )
     monkeypatch.setattr(app.PERSISTENT_SESSIONS_MANAGER, "begin_session", AsyncMock(return_value="lease_1"))
+    monkeypatch.setattr(
+        app.PERSISTENT_SESSIONS_MANAGER, "launches_browser_on_create", lambda: launches_browser_on_create
+    )
+    monkeypatch.setattr(app.PERSISTENT_SESSIONS_MANAGER, "get_browser_address", AsyncMock(return_value="ws://pbs"))
+    monkeypatch.setattr(
+        app.PERSISTENT_SESSIONS_MANAGER,
+        "get_session",
+        AsyncMock(
+            return_value=SimpleNamespace(browser_profile_id=loaded_browser_profile_id, browser_profile_loaded=True)
+        ),
+    )
     close_session = AsyncMock()
     monkeypatch.setattr(app.PERSISTENT_SESSIONS_MANAGER, "close_session", close_session)
     monkeypatch.setattr(svc, "persist_video_data", AsyncMock())
@@ -1777,8 +1769,11 @@ async def test_execute_workflow_does_not_close_caller_supplied_session(
 
 def _patch_human_interaction_session(monkeypatch: pytest.MonkeyPatch, svc: WorkflowService) -> AsyncMock:
     close_session = _patch_session_backed_run(monkeypatch, svc)
-    # The fixture run carries a browser profile; the auto-create only runs for managed profiles.
-    monkeypatch.setattr(svc, "_browser_profile_is_managed", AsyncMock(return_value=True))
+    monkeypatch.setattr(
+        svc,
+        "_get_run_browser_profile",
+        AsyncMock(return_value=SimpleNamespace(is_managed=False, source_browser_type=None)),
+    )
     monkeypatch.setattr(
         svc,
         "auto_create_browser_session_if_needed",
@@ -1788,7 +1783,10 @@ def _patch_human_interaction_session(monkeypatch: pytest.MonkeyPatch, svc: Workf
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("terminal_status", [WorkflowRunStatus.completed, WorkflowRunStatus.failed])
+@pytest.mark.parametrize(
+    "terminal_status",
+    [WorkflowRunStatus.completed, WorkflowRunStatus.failed, WorkflowRunStatus.terminated, WorkflowRunStatus.canceled],
+)
 async def test_execute_workflow_closes_auto_created_human_interaction_session(
     monkeypatch: pytest.MonkeyPatch,
     terminal_status: WorkflowRunStatus,
@@ -1988,6 +1986,367 @@ async def test_execute_workflow_closes_owned_session_when_cancelled_mid_run(
         await _run_execute_workflow(svc)
 
     close_session.assert_awaited_once_with("o_test", "pbs_human", reason=BrowserSessionCloseReason.run_ended)
+
+
+def _human_interaction_workflow() -> SimpleNamespace:
+    workflow = _execute_workflow()
+    workflow.workflow_definition.blocks = [SimpleNamespace(block_type=BlockType.HUMAN_INTERACTION, timeout_seconds=60)]
+    return workflow
+
+
+class _RunShape(TypedDict, total=False):
+    is_managed: bool
+    proxy_location: ProxyLocationInput
+    browser_sink_profile_id: str | None
+    browser_address: str | None
+    extra_http_headers: dict[str, str] | None
+    cdp_connect_headers: dict[str, str] | None
+    engine_enabled: bool
+    parent_workflow_run_id: str | None
+    browser_type: str | None
+    profile_source_browser_type: str | None
+    launches_browser_on_create: bool
+
+
+def _patch_real_session_factory(
+    monkeypatch: pytest.MonkeyPatch,
+    svc: WorkflowService,
+    workflow: SimpleNamespace,
+    *,
+    is_managed: bool = False,
+    proxy_location: ProxyLocationInput = None,
+    browser_sink_profile_id: str | None = None,
+    browser_address: str | None = None,
+    extra_http_headers: dict[str, str] | None = None,
+    cdp_connect_headers: dict[str, str] | None = None,
+    engine_enabled: bool = False,
+    parent_workflow_run_id: str | None = None,
+    browser_type: str | None = None,
+    profile_source_browser_type: str | None = None,
+    launches_browser_on_create: bool = True,
+) -> tuple[AsyncMock, AsyncMock, list[tuple[str | None, bool, str | None, str | None]]]:
+    _patch_execute_workflow_deps(monkeypatch, svc, workflow, _execute_workflow_run(WorkflowRunStatus.running))
+    close_session = _patch_session_backed_run(
+        monkeypatch,
+        svc,
+        loaded_browser_profile_id="bp_user",
+        launches_browser_on_create=launches_browser_on_create,
+    )
+    for run in (svc.get_workflow_run.return_value, svc.mark_workflow_run_as_running.return_value):
+        run.browser_profile_id = "bp_user"
+        run.proxy_location = proxy_location
+        run.browser_sink_profile_id = browser_sink_profile_id
+        run.browser_address = browser_address
+        run.extra_http_headers = extra_http_headers
+        run.cdp_connect_headers = cdp_connect_headers
+        run.parent_workflow_run_id = parent_workflow_run_id
+        run.browser_type = browser_type
+    monkeypatch.setattr(app.AGENT_FUNCTION, "is_browser_memory_engine_enabled", AsyncMock(return_value=engine_enabled))
+    monkeypatch.delattr(svc, "auto_create_browser_session_if_needed")
+    monkeypatch.setattr(
+        svc,
+        "_get_run_browser_profile",
+        AsyncMock(return_value=SimpleNamespace(is_managed=is_managed, source_browser_type=profile_source_browser_type)),
+    )
+    create_session = AsyncMock(return_value=SimpleNamespace(persistent_browser_session_id="pbs_auto"))
+    monkeypatch.setattr(app.PERSISTENT_SESSIONS_MANAGER, "create_session", create_session)
+
+    run_context = app.WORKFLOW_CONTEXT_MANAGER.get_workflow_run_context("wr_test")
+    update_run = app.DATABASE.workflow_runs.update_workflow_run
+    begin_session = app.PERSISTENT_SESSIONS_MANAGER.begin_session
+    blocks_result: tuple[SimpleNamespace, set[str]] = svc._execute_workflow_blocks.return_value
+    bound_at_first_block: list[tuple[str | None, bool, str | None, str | None]] = []
+
+    async def execute_blocks(*_args: object, **kwargs: Any) -> tuple[SimpleNamespace, set[str]]:
+        bound_at_first_block.append(
+            (
+                run_context.browser_session_id,
+                any(call.kwargs.get("browser_session_id") == "pbs_auto" for call in update_run.await_args_list),
+                begin_session.await_args.kwargs["browser_session_id"] if begin_session.await_args else None,
+                kwargs["browser_profile_id"],
+            )
+        )
+        return blocks_result
+
+    svc._execute_workflow_blocks.side_effect = execute_blocks
+    return create_session, close_session, bound_at_first_block
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("run_shape", "expected_read_only", "expected_browser_type"),
+    [
+        pytest.param(_RunShape(), True, None, id="ordinary-profile"),
+        pytest.param(
+            _RunShape(cdp_connect_headers={"Authorization": "Bearer t"}),
+            True,
+            None,
+            id="cdp-connect-headers-without-browser-address",
+        ),
+        pytest.param(
+            _RunShape(browser_sink_profile_id="bp_sink"), True, None, id="ordinary-profile-with-sink-engine-off"
+        ),
+        pytest.param(
+            _RunShape(browser_type="msedge", profile_source_browser_type="msedge"),
+            True,
+            "msedge",
+            id="run-engine-matches-profile-engine",
+        ),
+        pytest.param(_RunShape(browser_type="chrome"), True, "chrome", id="profile-without-engine"),
+        pytest.param(_RunShape(profile_source_browser_type="msedge"), True, "msedge", id="run-without-engine"),
+        pytest.param(
+            _RunShape(is_managed=True, profile_source_browser_type="msedge"), False, None, id="managed-profile"
+        ),
+    ],
+)
+async def test_human_interaction_run_boots_session_from_its_profile_before_first_block(
+    monkeypatch: pytest.MonkeyPatch,
+    run_shape: _RunShape,
+    expected_read_only: bool,
+    expected_browser_type: str | None,
+) -> None:
+    svc = WorkflowService()
+    create_session, close_session, bound_at_first_block = _patch_real_session_factory(
+        monkeypatch, svc, _human_interaction_workflow(), **run_shape
+    )
+    completed_run = _execute_workflow_run(WorkflowRunStatus.completed)
+    _patch_browser_cleanup(monkeypatch, svc, [])
+    _patch_finalize(monkeypatch, svc, [], completed_run)
+
+    assert await _run_execute_workflow(svc) is completed_run
+
+    creation = create_session.await_args.kwargs
+    assert (
+        creation["browser_profile_id"],
+        creation["profile_read_only"],
+        creation["inherit_profile_proxy"],
+        creation.get("browser_type"),
+    ) == ("bp_user", expected_read_only, True, expected_browser_type)
+    assert bound_at_first_block == [("pbs_auto", True, "pbs_auto", "bp_user")]
+    close_session.assert_awaited_once_with("o_test", "pbs_auto", reason=BrowserSessionCloseReason.run_ended)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("is_managed", "expected_inherit"),
+    [pytest.param(False, False, id="ordinary-profile"), pytest.param(True, True, id="managed-profile")],
+)
+async def test_human_interaction_run_without_proxy_skips_profile_proxy_only_for_ordinary_profile(
+    monkeypatch: pytest.MonkeyPatch,
+    is_managed: bool,
+    expected_inherit: bool,
+) -> None:
+    svc = WorkflowService()
+    create_session, _close_session, _bound = _patch_real_session_factory(
+        monkeypatch, svc, _human_interaction_workflow(), is_managed=is_managed, proxy_location=ProxyLocation.NONE
+    )
+    _patch_browser_cleanup(monkeypatch, svc, [])
+    _patch_finalize(monkeypatch, svc, [], _execute_workflow_run(WorkflowRunStatus.completed))
+
+    await _run_execute_workflow(svc)
+
+    creation = create_session.await_args.kwargs
+    assert (creation["proxy_location"], creation["inherit_profile_proxy"]) == (ProxyLocation.NONE, expected_inherit)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("workflow_shape", "run_shape", "browser_session_id"),
+    [
+        pytest.param(
+            "hi", _RunShape(proxy_location={"url": "http://proxy.internal:8080"}), None, id="custom-proxy-url"
+        ),
+        pytest.param("hi", _RunShape(engine_enabled=True), None, id="browser-memory-engine-on"),
+        pytest.param("hi", _RunShape(browser_address="http://127.0.0.1:9222"), None, id="pinned-browser-address"),
+        pytest.param("hi", _RunShape(extra_http_headers={"x-proxy-session": "pinned"}), None, id="extra-http-headers"),
+        pytest.param("hi", _RunShape(parent_workflow_run_id="wr_parent"), None, id="child-run-shares-parent-browser"),
+        pytest.param(
+            "hi", _RunShape(launches_browser_on_create=False), None, id="sessions-manager-launches-browser-lazily"
+        ),
+        pytest.param("hi+nested-login", _RunShape(), None, id="nested-login-block"),
+        pytest.param(
+            "hi",
+            _RunShape(browser_type="chrome", profile_source_browser_type="msedge"),
+            None,
+            id="run-engine-differs-from-profile-engine",
+        ),
+        pytest.param("no-hi", _RunShape(), None, id="no-human-interaction-block"),
+        pytest.param("hi", _RunShape(), "pbs_caller", id="caller-supplied-session"),
+    ],
+)
+async def test_ordinary_profile_run_keeps_its_browser_when_no_session_applies(
+    monkeypatch: pytest.MonkeyPatch,
+    workflow_shape: str,
+    run_shape: _RunShape,
+    browser_session_id: str | None,
+) -> None:
+    workflow = _execute_workflow() if workflow_shape == "no-hi" else _human_interaction_workflow()
+    if workflow_shape == "hi+nested-login":
+        workflow.workflow_definition.blocks.append(
+            SimpleNamespace(block_type=BlockType.FOR_LOOP, loop_blocks=[LoginBlock.model_construct()])
+        )
+    svc = WorkflowService()
+    create_session, close_session, bound_at_first_block = _patch_real_session_factory(
+        monkeypatch, svc, workflow, **run_shape
+    )
+    completed_run = _execute_workflow_run(WorkflowRunStatus.completed)
+    _patch_browser_cleanup(monkeypatch, svc, [])
+    _patch_finalize(monkeypatch, svc, [], completed_run)
+
+    assert await _run_execute_workflow(svc, browser_session_id=browser_session_id) is completed_run
+
+    create_session.assert_not_awaited()
+    assert bound_at_first_block == [(browser_session_id, False, browser_session_id, "bp_user")]
+    close_session.assert_not_awaited()
+
+
+def _retirement_denied_error() -> RuntimeError:
+    error = RuntimeError("retirement denied")
+    error.add_note(service_module.BROWSER_RETIREMENT_DENIED_NOTE)
+    return error
+
+
+_PROVISIONING_ERRORS_THAT_ESCAPE = [
+    pytest.param(lambda: service_module.WorkflowAttemptDispatchSuperseded("wr_test", 1), id="superseded"),
+    pytest.param(_retirement_denied_error, id="retirement-denied"),
+]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("make_error", "escapes", "expected_reason_code"),
+    [
+        pytest.param(lambda: RuntimeError("session boot failed"), False, None, id="boot-error"),
+        pytest.param(
+            lambda: BrowserSessionStartupTimeout("pbs_auto"),
+            False,
+            service_module.BROWSER_SESSION_STARTUP_TIMEOUT_REASON_CODE,
+            id="startup-timeout",
+        ),
+        *[pytest.param(*param.values, True, None, id=param.id) for param in _PROVISIONING_ERRORS_THAT_ESCAPE],
+        pytest.param(BrowserSessionCreditAdmissionRefusal, True, None, id="credit-refusal"),
+    ],
+)
+async def test_human_interaction_run_runs_no_block_when_profile_session_creation_fails(
+    monkeypatch: pytest.MonkeyPatch,
+    make_error: Callable[[], Exception],
+    escapes: bool,
+    expected_reason_code: str | None,
+) -> None:
+    svc = WorkflowService()
+    create_session, _close_session, bound_at_first_block = _patch_real_session_factory(
+        monkeypatch, svc, _human_interaction_workflow()
+    )
+    error = make_error()
+    create_session.side_effect = error
+    failed_run = _execute_workflow_run(WorkflowRunStatus.failed)
+    mark_failed = AsyncMock(return_value=failed_run)
+    monkeypatch.setattr(svc, "mark_workflow_run_as_failed", mark_failed)
+    clean_up = AsyncMock()
+    monkeypatch.setattr(svc, "clean_up_workflow", clean_up)
+
+    if escapes:
+        with pytest.raises(type(error)):
+            await _run_execute_workflow(svc)
+        mark_failed.assert_not_awaited()
+    else:
+        assert await _run_execute_workflow(svc) is failed_run
+        assert str(error) in mark_failed.await_args.kwargs["failure_reason"]
+        category = mark_failed.await_args.kwargs["failure_category"]
+        assert (category[0]["reason_code"] if category else None) == expected_reason_code
+        assert clean_up.await_args.kwargs["workflow_run"] is failed_run
+
+    assert create_session.await_args.kwargs["browser_profile_id"] == "bp_user"
+    assert bound_at_first_block == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("started_session", "address_error", "expected_reason"),
+    [
+        pytest.param(
+            SimpleNamespace(browser_profile_id="bp_user", browser_profile_loaded=False),
+            None,
+            "could not be loaded",
+            id="profile-not-loaded",
+        ),
+        pytest.param(
+            SimpleNamespace(browser_profile_id="bp_other", browser_profile_loaded=True),
+            None,
+            "could not be loaded",
+            id="different-profile-loaded",
+        ),
+        pytest.param(None, MissingBrowserAddressError("pbs_auto"), "did not start", id="session-never-started"),
+    ],
+)
+async def test_ordinary_profile_run_runs_no_block_when_its_session_did_not_load_the_profile(
+    monkeypatch: pytest.MonkeyPatch,
+    started_session: SimpleNamespace | None,
+    address_error: Exception | None,
+    expected_reason: str,
+) -> None:
+    svc = WorkflowService()
+    _create_session, _close_session, bound_at_first_block = _patch_real_session_factory(
+        monkeypatch, svc, _human_interaction_workflow()
+    )
+    monkeypatch.setattr(app.PERSISTENT_SESSIONS_MANAGER, "get_session", AsyncMock(return_value=started_session))
+    if address_error:
+        monkeypatch.setattr(
+            app.PERSISTENT_SESSIONS_MANAGER, "get_browser_address", AsyncMock(side_effect=address_error)
+        )
+    failed_run = _execute_workflow_run(WorkflowRunStatus.failed)
+    mark_failed = AsyncMock(return_value=failed_run)
+    monkeypatch.setattr(svc, "mark_workflow_run_as_failed", mark_failed)
+    clean_up = AsyncMock()
+    monkeypatch.setattr(svc, "clean_up_workflow", clean_up)
+
+    assert await _run_execute_workflow(svc) is failed_run
+
+    assert expected_reason in mark_failed.await_args.kwargs["failure_reason"]
+    assert clean_up.await_args.kwargs["owned_browser_session_id"] == "pbs_auto"
+    assert bound_at_first_block == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("make_error", "escapes"),
+    [
+        *[pytest.param(*param.values, True, id=param.id) for param in _PROVISIONING_ERRORS_THAT_ESCAPE],
+        pytest.param(BrowserSessionCreditAdmissionRefusal, False, id="credit-refusal"),
+    ],
+)
+@pytest.mark.parametrize("path", ["reusable-acquisition", "lease"])
+async def test_pre_block_browser_provisioning_finalizes_only_errors_it_owns(
+    monkeypatch: pytest.MonkeyPatch,
+    path: str,
+    make_error: Callable[[], Exception],
+    escapes: bool,
+) -> None:
+    svc = WorkflowService()
+    _create_session, _close_session, bound_at_first_block = _patch_real_session_factory(
+        monkeypatch, svc, _execute_workflow()
+    )
+    error = make_error()
+    supplied_session_id = None
+    if path == "reusable-acquisition":
+        for run in (svc.get_workflow_run.return_value, svc.mark_workflow_run_as_running.return_value):
+            run.reuse_browser_session = True
+        monkeypatch.setattr(svc, "_acquire_and_stamp_reused_session", AsyncMock(side_effect=error))
+    else:
+        supplied_session_id = "pbs_caller"
+        monkeypatch.setattr(app.PERSISTENT_SESSIONS_MANAGER, "begin_session", AsyncMock(side_effect=error))
+    failed_run = _execute_workflow_run(WorkflowRunStatus.failed)
+    mark_failed = AsyncMock(return_value=failed_run)
+    monkeypatch.setattr(svc, "mark_workflow_run_as_failed", mark_failed)
+    monkeypatch.setattr(svc, "clean_up_workflow", AsyncMock())
+
+    if escapes:
+        with pytest.raises(type(error)):
+            await _run_execute_workflow(svc, browser_session_id=supplied_session_id)
+        mark_failed.assert_not_awaited()
+    else:
+        assert await _run_execute_workflow(svc, browser_session_id=supplied_session_id) is failed_run
+    assert bound_at_first_block == []
 
 
 @pytest.mark.asyncio

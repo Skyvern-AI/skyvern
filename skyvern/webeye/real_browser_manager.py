@@ -272,6 +272,28 @@ async def _rebind_pbs_download_dir(
         )
 
 
+async def _record_session_profile_receipt(
+    browser_state: BrowserState,
+    *,
+    browser_session_id: str,
+    workflow_run: WorkflowRun,
+    browser_profile_id: str,
+) -> None:
+    if browser_state.browser_artifacts.applied_browser_profile_id is not None:
+        return
+    session = await app.PERSISTENT_SESSIONS_MANAGER.get_session(browser_session_id, workflow_run.organization_id)
+    # Kept out of applied_browser_profile_id because whole-dir write-back trusts that field and this state's
+    # local dir does not hold the remote profile; only sign-in failure tagging reads this receipt.
+    if (
+        session is not None
+        and session.created_for_workflow_run_id == workflow_run.workflow_run_id
+        and session.profile_read_only
+        and session.browser_profile_loaded
+        and session.browser_profile_id == browser_profile_id
+    ):
+        browser_state.browser_artifacts.session_loaded_browser_profile_id = browser_profile_id
+
+
 def _retain_run_dialog_answers(
     browser_state: BrowserState,
     workflow_run_id: str | None,
@@ -1409,6 +1431,7 @@ class RealBrowserManager(BrowserManager):
                         self.pages.pop(stale_key, None)
                 browser_state = None
 
+        session_backed_state = False
         if browser_session_id:
             expected_runnable_generation_id = browser_session_runnable_generation_id or (
                 context.browser_session_runnable_generation_id if context else None
@@ -1464,6 +1487,7 @@ class RealBrowserManager(BrowserManager):
                     "Browser state not found in persistent sessions manager", browser_session_id=browser_session_id
                 )
             else:
+                session_backed_state = True
                 # Register before the first goto, as the creation path below does: a navigation
                 # failure here raises past the registry write at the end of this method, and every
                 # later block of the run would then find an empty registry and report a missing
@@ -1557,6 +1581,7 @@ class RealBrowserManager(BrowserManager):
         proxy_location = workflow_run.proxy_location
         extra_http_headers = workflow_run.extra_http_headers
         launched_session: PersistentBrowserSession | None = None
+        profile_read_only = False
         if browser_state is None:
             LOG.info(
                 "Creating browser state for workflow run",
@@ -1582,6 +1607,7 @@ class RealBrowserManager(BrowserManager):
                     extra_http_headers = _merge_proxy_session_headers(extra_http_headers, session.proxy_session_id)
                     launch_timezone_id = requested_timezone_id(session.browser_settings)
                     launched_session = session
+                    profile_read_only = session.profile_read_only
             browser_state = await self._create_browser_state(
                 proxy_location=proxy_location,
                 url=url,
@@ -1592,6 +1618,7 @@ class RealBrowserManager(BrowserManager):
                 cdp_connect_headers=workflow_run.cdp_connect_headers,
                 browser_address=workflow_run.browser_address,
                 browser_profile_id=browser_profile_id,
+                profile_read_only=profile_read_only,
                 browser_session_id=browser_session_id,
                 user_browser_type=read_browser_type(workflow_run),
                 timezone_id=launch_timezone_id,
@@ -1603,6 +1630,13 @@ class RealBrowserManager(BrowserManager):
                     browser_state,
                     organization_id=workflow_run.organization_id,
                 )
+        elif session_backed_state and browser_session_id and browser_profile_id:
+            await _record_session_profile_receipt(
+                browser_state,
+                browser_session_id=browser_session_id,
+                workflow_run=workflow_run,
+                browser_profile_id=browser_profile_id,
+            )
 
         self.pages[workflow_run_id] = browser_state
         # Only sync the parent's entry when the child is sharing the parent's

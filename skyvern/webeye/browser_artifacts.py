@@ -92,6 +92,8 @@ class BrowserArtifacts(BaseModel):
     # None when none was requested or the chosen creator could not load one (remote/vendor browsers,
     # storage miss, corruption fallback) — consumers must treat None as "profile not applied".
     applied_browser_profile_id: str | None = None
+    # The saved profile an attached persistent session reports it loaded remotely; never read by whole-dir write-back.
+    session_loaded_browser_profile_id: str | None = None
     local_display_recording_eligible: bool = False
     # ((input_w, input_h), (output_w, output_h)) for the whole-display recorder, resolved from the final
     # launch --window-size at the configure seam and carried to the acquire seam. None → fixed full screen.
