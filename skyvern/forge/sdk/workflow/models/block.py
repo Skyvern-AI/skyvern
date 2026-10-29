@@ -617,6 +617,42 @@ def unbound_download_output(result: Any) -> dict[str, Any]:
     return payload
 
 
+_MAX_NAMED_MISSING_REFERENCES = 5
+_MAX_MISSING_REFERENCE_LENGTH = 128
+
+
+_ExcT = TypeVar("_ExcT", bound=BaseException)
+
+
+def _exception_in_cause_chain(exc: BaseException, exc_type: type[_ExcT]) -> _ExcT | None:
+    cause: BaseException | None = exc
+    while cause is not None and not isinstance(cause, exc_type):
+        cause = cause.__cause__
+    return cause
+
+
+def _absent_template_roots(env: SandboxedEnvironment, source: str, template_data: Mapping[str, object]) -> list[str]:
+    roots = jinja2_meta.find_undeclared_variables(env.parse(source))
+    return sorted(roots - template_data.keys() - env.globals.keys())
+
+
+def _missing_reference_suffix(exc: BaseException) -> str:
+    cause = _exception_in_cause_chain(exc, FailedToFormatJinjaStyleParameter) or _exception_in_cause_chain(
+        exc, MissingJinjaVariables
+    )
+    if cause is None:
+        return ""
+    total = len(cause.missing_references)
+    shown = [name for name in cause.missing_references if len(name) <= _MAX_MISSING_REFERENCE_LENGTH]
+    shown = shown[:_MAX_NAMED_MISSING_REFERENCES]
+    if not shown:
+        return ""
+    label = "Missing reference" if total == 1 else "Missing references"
+    hidden = total - len(shown)
+    more = f", and {hidden} more" if hidden else ""
+    return f" {label}: {', '.join(shown)}{more}."
+
+
 if settings.WORKFLOW_TEMPLATING_STRICTNESS == "strict":
     jinja_sandbox_env = SandboxedEnvironment(undefined=StrictUndefined)
 else:
@@ -1211,10 +1247,8 @@ class Block(BaseModel, abc.ABC):
             else {"failure_reason": failure_reason}
         )
         # Blocks that re-raise a formatting error as another exception type keep the original on __cause__.
-        format_exc: BaseException | None = exc
-        while format_exc is not None and not isinstance(format_exc, FailedToFormatJinjaStyleParameter):
-            format_exc = format_exc.__cause__
-        if isinstance(format_exc, FailedToFormatJinjaStyleParameter) and format_exc.available_keys:
+        format_exc = _exception_in_cause_chain(exc, FailedToFormatJinjaStyleParameter)
+        if format_exc is not None and format_exc.available_keys:
             failure_output["available_keys"] = [
                 self._redact_registered_secrets(key, workflow_run_context) for key in format_exc.available_keys
             ]
@@ -1486,6 +1520,9 @@ class Block(BaseModel, abc.ABC):
                 raise MissingJinjaVariables(
                     template=potential_template,
                     variables=missing_variables,
+                    missing_references=_absent_template_roots(
+                        env or jinja_sandbox_env, potential_template, template_data
+                    ),
                 )
 
         try:
@@ -1493,10 +1530,21 @@ class Block(BaseModel, abc.ABC):
         except SkyvernException:
             raise
         except Exception as exc:
+            # Only Jinja's own "'X' is undefined" names a root, so a default-guarded absent root is never blamed.
+            missing_references = (
+                [
+                    root
+                    for root in _absent_template_roots(env or jinja_sandbox_env, potential_template, template_data)
+                    if str(exc) == f"{root!r} is undefined"
+                ]
+                if isinstance(exc, UndefinedError)
+                else []
+            )
             raise FailedToFormatJinjaStyleParameter(
                 potential_template,
                 str(exc),
                 available_keys=get_available_keys(potential_template, template_data),
+                missing_references=missing_references,
             ) from exc
         register_secret_derived_output(
             workflow_run_context.secrets, template, potential_template, template_data, rendered
@@ -9701,7 +9749,7 @@ async def wrapper({default_args}):
                 download_log.close()
                 return await self._template_format_failure_result(
                     e,
-                    "Failed to format CodeBlock parameters.",
+                    "Failed to format CodeBlock parameters." + _missing_reference_suffix(e),
                     workflow_run_context,
                     workflow_run_id,
                     workflow_run_block_id,
