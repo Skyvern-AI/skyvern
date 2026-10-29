@@ -3,6 +3,7 @@ import { describe, expect, it } from "vitest";
 import {
   ActivityLog,
   callRollup,
+  condenseCalls,
   deriveActivityLog,
   kindOf,
   summarizeFinishedTurn,
@@ -1566,6 +1567,25 @@ describe("deriveActivityLog — append only", () => {
           .every((row) => row.reason === null),
       ).toBe(true);
     }
+  });
+});
+
+describe("condenseCalls", () => {
+  it("keeps two identical-reading runs apart when they dispatched different runs", () => {
+    const run = (id: string, workflowRunId: string) =>
+      entry({
+        id,
+        kind: "tool_result",
+        toolName: "run_blocks_and_collect_debug",
+        text: "Test completed",
+        success: true,
+        workflowRunId,
+      });
+    const condensed = condenseCalls([run("r1", "wr_1"), run("r2", "wr_2")]);
+    expect(condensed.map((c) => [c.entry.workflowRunId, c.count])).toEqual([
+      ["wr_1", 1],
+      ["wr_2", 1],
+    ]);
   });
 });
 

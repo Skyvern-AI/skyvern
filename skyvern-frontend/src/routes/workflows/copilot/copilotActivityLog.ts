@@ -459,7 +459,8 @@ export function condenseCalls(entries: ActivityEntry[]): CondensedCall[] {
       previous.entry.success !== false &&
       entry.toolName === previous.entry.toolName &&
       callLabel(entry) === callLabel(previous.entry) &&
-      entry.text === previous.entry.text
+      entry.text === previous.entry.text &&
+      entry.workflowRunId === previous.entry.workflowRunId
     ) {
       previous.count += 1;
       continue;

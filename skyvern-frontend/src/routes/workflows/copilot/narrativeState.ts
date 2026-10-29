@@ -10,6 +10,8 @@ import {
   ConnectedAccountChoice,
   CopilotResponseType,
   CopilotSteerMessage,
+  type CopilotTestInput,
+  type CopilotTestInputSource,
   DeliveredOutputFile,
   ProposalDisposition,
   RunOutcomeRole,
@@ -363,6 +365,10 @@ export interface ActivityEntry {
   // A successful run_browser_code result's operations as display phrases,
   // in order. Absent on every other row.
   browserSteps?: string[];
+  // The run a block-running result dispatched, and where each of its inputs
+  // came from. Absent on every other row.
+  workflowRunId?: string;
+  testInputs?: CopilotTestInput[];
   // Stable per-event id used as React key.
   id: string;
   // Consecutive same-tool retries folded into this row by
@@ -650,6 +656,32 @@ function parseTurnWorkPlan(value: unknown): TurnWorkPlan | null {
   return typeof o.toolCallId === "string" && o.toolCallId && items
     ? { toolCallId: o.toolCallId, items }
     : null;
+}
+
+const TEST_INPUT_SOURCES: ReadonlySet<string> = new Set<CopilotTestInputSource>(
+  ["copilot", "page", "earlier_run", "default", "placeholder"],
+);
+
+export function parseTestInputs(
+  value: unknown,
+): CopilotTestInput[] | undefined {
+  if (!Array.isArray(value)) return undefined;
+  const inputs: CopilotTestInput[] = [];
+  for (const item of value) {
+    if (!item || typeof item !== "object") continue;
+    const row = item as Record<string, unknown>;
+    if (typeof row.key !== "string" || typeof row.source !== "string") {
+      continue;
+    }
+    if (!TEST_INPUT_SOURCES.has(row.source)) continue;
+    inputs.push({
+      key: row.key,
+      source: row.source as CopilotTestInputSource,
+      sourceRunId:
+        typeof row.sourceRunId === "string" ? row.sourceRunId : undefined,
+    });
+  }
+  return inputs.length > 0 ? inputs : undefined;
 }
 
 export function parseCodeDiffs(value: unknown): CodeWriteDiff[] | undefined {
@@ -992,6 +1024,8 @@ function buildActivityFromToolResult(
     detail: event.detail || undefined,
     codeDiffs: parseCodeDiffs(event.code_diffs),
     browserSteps: parseStringList(event.browser_steps) ?? undefined,
+    workflowRunId: event.workflow_run_id || undefined,
+    testInputs: parseTestInputs(event.test_inputs),
     reason: actionReason(event.reason),
     activityBucket: parseActivityBucket(event.activity_bucket),
     activityStartedAt: event.activity_started_at ?? undefined,
@@ -1807,6 +1841,11 @@ function normalizeActivityEntries(raw: unknown): ActivityEntry[] {
       success: typeof o.success === "boolean" ? o.success : undefined,
       codeDiffs: parseCodeDiffs(o.codeDiffs),
       browserSteps: parseStringList(o.browserSteps) ?? undefined,
+      workflowRunId:
+        typeof o.workflowRunId === "string" && o.workflowRunId
+          ? o.workflowRunId
+          : undefined,
+      testInputs: parseTestInputs(o.testInputs),
       id: o.id,
       reason: actionReason(o.reason),
       activityBucket: parseActivityBucket(o.activityBucket),

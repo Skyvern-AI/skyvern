@@ -701,7 +701,23 @@ export interface WorkflowCopilotToolResultUpdate {
   // A successful run_browser_code call's operations as display phrases.
   browser_steps?: string[] | null;
   detail?: string | null;
+  workflow_run_id?: string | null;
+  // Keys and sources only; values are read from the run itself.
+  test_inputs?: CopilotTestInput[] | null;
   timestamp?: string | null;
+}
+
+export type CopilotTestInputSource =
+  | "copilot"
+  | "page"
+  | "earlier_run"
+  | "default"
+  | "placeholder";
+
+export interface CopilotTestInput {
+  key: string;
+  source: CopilotTestInputSource;
+  sourceRunId?: string;
 }
 
 export interface WorkflowCopilotCondensingUpdate {

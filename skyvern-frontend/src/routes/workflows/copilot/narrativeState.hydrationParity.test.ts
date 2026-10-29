@@ -131,6 +131,38 @@ describe("activity timestamp parity across hydration", () => {
     }
   });
 
+  it("rehydrates each run row's test input sources exactly as they streamed", () => {
+    const runRows = (turn: TurnNarrativeState) =>
+      turn.designActivity
+        .filter((entry) => entry.kind === "tool_result")
+        .map(({ id, workflowRunId, testInputs }) => ({
+          id,
+          workflowRunId,
+          testInputs,
+        }));
+    const live = runRows(replayLive());
+    expect(runRows(hydrateNarrativeFromPayload(persistedPayload)!)).toEqual(
+      live,
+    );
+    expect(live).toContainEqual({
+      id: "tr-run-first",
+      workflowRunId: "wr_first",
+      testInputs: undefined,
+    });
+    expect(live).toContainEqual({
+      id: "tr-call_test_end_to_end_turn-replay",
+      workflowRunId: "wr_button",
+      testInputs: [{ key: "login", source: "default", sourceRunId: undefined }],
+    });
+    expect(
+      live.find((row) => row.id === "tr-run-retry")?.testInputs,
+    ).toContainEqual({
+      key: "session_token",
+      source: "earlier_run",
+      sourceRunId: "wr_origin",
+    });
+  });
+
   it("renders the same grouped duration live and after a hydrated reload", () => {
     const liveDuration = groupedDuration(replayLive().designActivity);
     const hydratedDuration = groupedDuration(
