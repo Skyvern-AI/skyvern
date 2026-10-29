@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import uuid
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Callable
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
@@ -714,16 +714,24 @@ class DefaultPersistentSessionsManager(PersistentSessionsManager):
         return None
 
     async def set_browser_state(
-        self, session_id: str, browser_state: BrowserState, organization_id: str | None = None
-    ) -> None:
+        self,
+        session_id: str,
+        browser_state: BrowserState,
+        organization_id: str | None = None,
+        *,
+        may_publish: Callable[[], bool] | None = None,
+    ) -> bool:
         current = self._browser_sessions.get(session_id)
         if current is not None and current.browser_state is browser_state:
             current.organization_id = organization_id
-            return
+            return True
+        if may_publish is not None and not may_publish():
+            return False
         if current is not None:
             self._retire_browser_session(session_id, expected=current)
         browser_session = BrowserSession(browser_state=browser_state, organization_id=organization_id)
         self._browser_sessions[session_id] = browser_session
+        return True
 
     async def evict_cached_browser_state(
         self,

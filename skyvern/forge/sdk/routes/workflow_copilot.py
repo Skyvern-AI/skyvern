@@ -3,6 +3,7 @@ import contextlib
 import contextvars
 import hashlib
 import hmac
+import io
 import json
 import re
 import time
@@ -3601,6 +3602,16 @@ async def _validate_copilot_audio_artifact_id(
     return audio_artifact_id
 
 
+def _has_audio_container_signature(data: bytes) -> bool:
+    """The declared content type is client-controlled, so the bytes must open as a container browsers record into."""
+    return (
+        data.startswith((b"\x1a\x45\xdf\xa3", b"OggS", b"ID3", b"fLaC"))
+        or (data[:4] == b"RIFF" and data[8:12] == b"WAVE")
+        or data[4:8] == b"ftyp"
+        or (len(data) > 1 and data[0] == 0xFF and data[1] & 0xE0 == 0xE0)
+    )
+
+
 @base_router.post("/workflow/copilot/chat-audio", include_in_schema=False)
 async def workflow_copilot_chat_audio(
     workflow_permanent_id: str = Form(...),
@@ -3632,6 +3643,14 @@ async def workflow_copilot_chat_audio(
             status_code=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE,
             detail=f"Audio file exceeds the maximum allowed size ({max_upload_bytes / 1024 / 1024:.0f} MB)",
         )
+
+    if not _has_audio_container_signature(audio_bytes):
+        raise HTTPException(
+            status_code=status.HTTP_415_UNSUPPORTED_MEDIA_TYPE, detail="File content is not a supported audio format"
+        )
+    await asyncio.to_thread(
+        uploaded_file_service.validate_upload_type, UploadFile(file=io.BytesIO(audio_bytes), filename=file.filename)
+    )
 
     chat = await _get_or_create_workflow_copilot_chat(
         organization_id=organization.organization_id,
@@ -4914,7 +4933,10 @@ async def workflow_copilot_demonstration_upload(
             status_code=status.HTTP_409_CONFLICT,
             detail=f"A demonstration can attach at most {MAX_ATTACHED_FILES_PER_MESSAGE} files",
         )
-    await uploaded_file_service.validate_file_size(file, max_size_bytes=app.SETTINGS_MANAGER.MAX_UPLOAD_FILE_SIZE)
+    # Demonstrations replay the user's own file into the target site, so any type that site accepts must pass.
+    await uploaded_file_service.validate_passthrough_upload(
+        file, max_size_bytes=app.SETTINGS_MANAGER.MAX_UPLOAD_FILE_SIZE, purpose="copilot_demonstration"
+    )
     try:
         uploaded, _ = await uploaded_file_service.save_uploaded_file(
             file=file, organization_id=organization.organization_id

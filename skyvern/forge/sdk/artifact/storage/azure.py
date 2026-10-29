@@ -174,6 +174,9 @@ class AzureStorage(BaseStorage):
             presign_sensitive=lambda uris: self.async_client.create_sas_urls(
                 uris, expiry_hours=SENSITIVE_SHARE_URL_EXPIRY_HOURS
             ),
+            presign_download=lambda uris: self.async_client.create_sas_urls(
+                uris, attachment_filenames=[None] * len(uris)
+            ),
         )
 
     async def store_artifact_from_path(self, artifact: Artifact, path: str) -> None:
@@ -400,18 +403,17 @@ class AzureStorage(BaseStorage):
                 content_length = object_info.get("ContentLength")
 
             # Create FileInfo object
-            filename = os.path.basename(key)
+            filename = metadata.get("original_filename", os.path.basename(key)) if metadata else os.path.basename(key)
             checksum = metadata.get("sha256_checksum") if metadata else None
 
-            # Get SAS URL
-            sas_urls = await self.async_client.create_sas_urls([key])
+            sas_urls = await self.async_client.create_sas_urls([key], attachment_filenames=[filename])
             if not sas_urls:
                 continue
 
             file_info = FileInfo(
                 url=sas_urls[0],
                 checksum=checksum,
-                filename=metadata.get("original_filename", filename) if metadata else filename,
+                filename=filename,
                 file_size=content_length,
                 modified_at=modified_at,
             )
@@ -740,7 +742,7 @@ class AzureStorage(BaseStorage):
             display_name = metadata.get("original_filename", filename) if metadata else filename
             artifact = artifacts_by_uri.get(object_uri)
 
-            sas_urls = await self.async_client.create_sas_urls([object_uri])
+            sas_urls = await self.async_client.create_sas_urls([object_uri], attachment_filenames=[display_name])
             if not sas_urls:
                 continue
 
@@ -797,7 +799,7 @@ class AzureStorage(BaseStorage):
             uploaded_uri=uploaded_uri,
         )
         # Generate a SAS URL for the uploaded file
-        sas_urls = await self.async_client.create_sas_urls([uploaded_uri])
+        sas_urls = await self.async_client.create_sas_urls([uploaded_uri], attachment_filenames=[None])
         if not sas_urls:
             LOG.error(
                 "Failed to create SAS URL for uploaded file",

@@ -25,6 +25,7 @@ from skyvern.forge.sdk.copilot.context import (
     CopilotTestInput,
     ProposalDisposition,
     ResponseType,
+    SkippedPrefixBlock,
     TurnNarrativePayload,
 )
 from skyvern.forge.sdk.copilot.run_outcome import RunOutcomeReasonCode, RunOutcomeRole, RunOutcomeVerdict
@@ -973,6 +974,10 @@ class WorkflowCopilotRunStartedUpdate(BaseModel):
         WorkflowCopilotStreamMessageType.RUN_STARTED, description="Message type"
     )
     workflow_run_id: str = Field(..., description="Run id, emitted once the run row exists and before it produces work")
+    skipped_prefix: list[SkippedPrefixBlock] = Field(
+        default_factory=list,
+        description="Requested blocks before the run's start that it will not execute; shown before its first block",
+    )
     timestamp: datetime = Field(..., description="Server timestamp")
 
 

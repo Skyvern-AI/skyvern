@@ -179,7 +179,13 @@ class BrowserState(Protocol):
         """Wait, until at most the monotonic ``deadline``, for ``page``'s in-flight main-frame navigation to settle."""
         ...
 
-    async def close(self, close_browser_on_completion: bool = True, release_driver: bool | None = None) -> bool: ...
+    async def close(
+        self,
+        close_browser_on_completion: bool = True,
+        release_driver: bool | None = None,
+        *,
+        persist_session_state: bool = True,
+    ) -> bool: ...
 
     async def detach_remote_driver(self) -> None:
         """Disable local CDP interception and stop only this process's Playwright driver."""

@@ -2102,7 +2102,13 @@ class RealBrowserState(BrowserState):
             navigation_deadline=navigation_deadline,
         )
 
-    async def close(self, close_browser_on_completion: bool = True, release_driver: bool | None = None) -> bool:
+    async def close(
+        self,
+        close_browser_on_completion: bool = True,
+        release_driver: bool | None = None,
+        *,
+        persist_session_state: bool = True,
+    ) -> bool:
         if self.external_browser:
             # A keep-alive close (both controls off) leaves the pages to a later run, which still needs them tracked.
             if close_browser_on_completion or release_driver is not False:
@@ -2170,7 +2176,7 @@ class RealBrowserState(BrowserState):
                 nonlocal teardown_active, teardown_settled
                 teardown_active = True
                 try:
-                    await self._teardown_context()
+                    await self._teardown_context(persist_session_state=persist_session_state)
                 finally:
                     teardown_active = False
                     teardown_settled = True
@@ -2297,19 +2303,22 @@ class RealBrowserState(BrowserState):
 
         task.add_done_callback(_retrieve)
 
-    async def _teardown_context(self) -> None:
+    async def _teardown_context(self, *, persist_session_state: bool = True) -> None:
         # Only fire on-close observers on a real teardown. Shared / parent-child close calls pass
         # ``close_browser_on_completion=False`` to leave the browser alive for another run; firing
         # callbacks then would stop the surviving run's publisher and freeze its livestream.
-        await self._run_on_close_callbacks()
+        # A superseded attempt's close skips them and the cookie write: it must not touch its successor's state.
+        if persist_session_state:
+            await self._run_on_close_callbacks()
         if self.browser_context is None:
             return
         LOG.info("Closing browser context and its pages")
-        session_dir = self.browser_artifacts.browser_session_dir if self.browser_artifacts else None
-        try:
-            await persist_session_cookies(self.browser_context, session_dir)
-        except Exception:
-            LOG.warning("Failed to persist session cookies during teardown", exc_info=True)
+        if persist_session_state:
+            session_dir = self.browser_artifacts.browser_session_dir if self.browser_artifacts else None
+            try:
+                await persist_session_cookies(self.browser_context, session_dir)
+            except Exception:
+                LOG.warning("Failed to persist session cookies during teardown", exc_info=True)
         await self.browser_context.close()
         self._sessionless_init_script_registrations = []
         LOG.info("Main browser context and all its pages are closed")

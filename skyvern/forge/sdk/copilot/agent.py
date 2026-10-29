@@ -124,6 +124,7 @@ from skyvern.forge.sdk.copilot.context import (
     record_approved_credentials_in_global_llm_context,
     record_proposed_credential_in_global_llm_context,
     sanitize_global_llm_context_for_prompt,
+    skipped_prefix_anchor,
     tool_recorded_context_fields,
 )
 from skyvern.forge.sdk.copilot.credential_pause import (
@@ -2196,6 +2197,11 @@ def _build_narrative_payload(
                 continue
             block_labels.append(label)
     left_run_ids = ctx.budget_expiry_state.leavable_run_ids if ctx.budget_expiry_state.hard_backstop_reached else []
+    skipped_before_by_attempt_id = {
+        anchor: skipped
+        for run_id, skipped in ctx.skipped_prefix_by_run_id.items()
+        if (anchor := skipped_prefix_anchor(ctx.narrative_block_attempts, run_id)) is not None
+    }
     for attempt in ctx.narrative_block_attempts.values():
         block_state = _block_ui_state(attempt["rawStatus"], drafted_fallback=False)
         if block_state == "running" and attempt["workflowRunId"] in left_run_ids:
@@ -2216,6 +2222,9 @@ def _build_narrative_payload(
             block_entry["outcomeRole"] = attempt["outcomeRole"]
         if "outcomeReason" in attempt:
             block_entry["outcomeReason"] = attempt["outcomeReason"]
+        skipped_before = skipped_before_by_attempt_id.get(attempt["workflowRunBlockId"])
+        if skipped_before:
+            block_entry["skippedBefore"] = list(skipped_before)
         blocks.append(block_entry)
     draft: NarrativeDraft | None = (
         {"blockCount": len(block_labels), "blockLabels": block_labels, "summary": None}

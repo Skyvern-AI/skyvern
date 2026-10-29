@@ -135,6 +135,7 @@ from skyvern.forge.sdk.db.repositories.workflow_runs import (
 from skyvern.forge.sdk.enterprise_features import collect_enterprise_gated_run_features
 from skyvern.forge.sdk.executor.run_liveness import (
     RunExecution,
+    RunOwner,
     acquire_run_lease,
     current_execution,
     note_internal_cancel_won,
@@ -142,6 +143,7 @@ from skyvern.forge.sdk.executor.run_liveness import (
     run_lease_lost,
     run_lease_state,
     run_lease_tasks_enabled,
+    run_owner,
     track_run,
 )
 from skyvern.forge.sdk.experimentation.enrich_tree import resolve_enrich_tree_for_context
@@ -179,7 +181,10 @@ from skyvern.forge.sdk.schemas.workflow_runs import WorkflowRunBlock, WorkflowRu
 from skyvern.forge.sdk.schemas.workflow_schedules import OneTimeDispatchStatus
 from skyvern.forge.sdk.services.org_auth_token_service import get_valid_org_api_token
 from skyvern.forge.sdk.services.request_principal import RequestPrincipal, get_request_principal
-from skyvern.forge.sdk.streaming.registries import mark_stream_closing
+from skyvern.forge.sdk.streaming.registries import (
+    claim_stream_closing,
+    release_stream_closing,
+)
 from skyvern.forge.sdk.submission import shadow as submission_shadow
 from skyvern.forge.sdk.trace import traced
 from skyvern.forge.sdk.workflow.browser_action_policy_enrollment import bind_policy_to_context, rejection_reasons
@@ -435,6 +440,7 @@ from skyvern.utils.url_validators import validate_webhook_url
 from skyvern.webeye.actions.action_types import ActionType
 from skyvern.webeye.actions.actions import Action, InputTextAction, VerificationCodeAction
 from skyvern.webeye.actions.responses import ActionResult
+from skyvern.webeye.browser_manager import SupersededRunClaim
 from skyvern.webeye.browser_state import BrowserState, get_browser_connection_loss
 from skyvern.webeye.persistent_session_errors import BrowserSessionCreditAdmissionRefusal
 from skyvern.webeye.persistent_sessions_manager import BROWSER_RETIREMENT_DENIED_NOTE
@@ -6977,6 +6983,9 @@ class WorkflowService:
         attempt_number: int,
         on_finalization_denied: Callable[[], None] | None,
         renewal_task: asyncio.Task[None] | None,
+        execution_owner: RunOwner | None,
+        workflow_run_context: WorkflowRunContext | None,
+        stream_tombstone: Any = None,
     ) -> None:
         if not run_lease_tasks_enabled():
             return
@@ -6993,8 +7002,9 @@ class WorkflowService:
         if any(attempt.attempt_number > attempt_number for attempt in attempts):
             if on_finalization_denied is not None:
                 on_finalization_denied()
-            if renewal_task is not None:
-                renewal_task.cancel()
+            await self._dispose_superseded_attempt(
+                workflow_run_id, execution_owner, workflow_run_context, renewal_task, stream_tombstone
+            )
             with contained_effect("record superseded workflow attempt"):
                 LOG.info(
                     "Workflow attempt superseded; skipping finalization and cleanup",
@@ -7002,6 +7012,69 @@ class WorkflowService:
                     attempt_number=attempt_number,
                 )
             raise WorkflowAttemptDispatchSuperseded(workflow_run_id, attempt_number)
+
+    async def _dispose_superseded_attempt(
+        self,
+        workflow_run_id: str,
+        execution_owner: RunOwner | None,
+        workflow_run_context: WorkflowRunContext | None,
+        renewal_task: asyncio.Task[None] | None,
+        stream_tombstone: Any = None,
+    ) -> None:
+        # Everything this execution still owns is unpublished before the first await, so a successor that
+        # adopts afterwards cannot receive a resource that is being disposed of. Supersession is already decided,
+        # so a fault in one step must neither replace that outcome nor skip the remaining steps and settlement.
+        claim: SupersededRunClaim | None = None
+        if execution_owner is not None:
+            with contained_effect("claim superseded workflow attempt resources", workflow_run_id=workflow_run_id):
+                claim = app.BROWSER_MANAGER.claim_superseded_run_resources(workflow_run_id, execution_owner)
+        if workflow_run_context is not None:
+            with contained_effect("remove superseded workflow run context", workflow_run_id=workflow_run_id):
+                app.WORKFLOW_CONTEXT_MANAGER.remove_workflow_run_context_if_current(
+                    workflow_run_id, workflow_run_context
+                )
+        if stream_tombstone is not None:
+            with contained_effect("release superseded stream tombstone", workflow_run_id=workflow_run_id):
+                release_stream_closing(workflow_run_id, stream_tombstone)
+        settle = asyncio.ensure_future(self._settle_superseded_attempt(workflow_run_id, renewal_task, claim))
+        cancelled = False
+        # The detached resources have no other owner, so the teardown finishes before a cancel propagates.
+        while not settle.done():
+            try:
+                await asyncio.shield(settle)
+            except asyncio.CancelledError:
+                cancelled = True
+        if cancelled:
+            raise asyncio.CancelledError
+
+    async def _settle_superseded_attempt(
+        self,
+        workflow_run_id: str,
+        renewal_task: asyncio.Task[None] | None,
+        claim: SupersededRunClaim | None,
+    ) -> None:
+        if renewal_task is not None and not renewal_task.done():
+            renewal_task.cancel()
+            await asyncio.gather(renewal_task, return_exceptions=True)
+        browser_close_returned = False
+        if claim is not None:
+            try:
+                browser_close_returned = await app.BROWSER_MANAGER.release_superseded_run_resources(
+                    workflow_run_id, claim
+                )
+            except Exception:
+                LOG.warning(
+                    "Failed to release a superseded workflow attempt's browser",
+                    workflow_run_id=workflow_run_id,
+                    exc_info=True,
+                )
+        LOG.info(
+            "Superseded workflow attempt released its local resources",
+            workflow_run_id=workflow_run_id,
+            browser_claimed=claim is not None and claim.browser_state is not None,
+            browser_close_requested=claim is not None and claim.close,
+            browser_close_returned=browser_close_returned,
+        )
 
     async def _execute_workflow(
         self,
@@ -7029,6 +7102,8 @@ class WorkflowService:
         both sync and async (Temporal-dispatched) trigger modes.
         """
         organization_id = organization.organization_id
+        execution_owner = run_owner(workflow_run_id)
+        initialized_workflow_run_context: WorkflowRunContext | None = None
         attempt_fence_kwargs: dict[str, Any] = (
             {"require_latest_attempt_number": attempt_number} if run_lease_tasks_enabled() else {}
         )
@@ -7393,7 +7468,7 @@ class WorkflowService:
                     await session.commit()
                     workflow_run.reuse_bound_key = consumed_key
 
-            await app.WORKFLOW_CONTEXT_MANAGER.initialize_workflow_run_context(
+            initialized_workflow_run_context = await app.WORKFLOW_CONTEXT_MANAGER.initialize_workflow_run_context(
                 organization,
                 workflow_run_id,
                 workflow.title,
@@ -7481,6 +7556,7 @@ class WorkflowService:
                 attempt_number=attempt_number,
                 owned_browser_session_id=owned_browser_session_id,
                 final_diagnostic_owner=final_diagnostic_owner,
+                workflow_run_context=initialized_workflow_run_context,
             )
             return failed_run
 
@@ -7502,6 +7578,9 @@ class WorkflowService:
                         browser_dispatch["expected_browser_session_id"] = browser_session_id
                     close_browser_on_completion = False
             except WorkflowAttemptDispatchSuperseded:
+                await self._dispose_superseded_attempt(
+                    workflow_run_id, execution_owner, initialized_workflow_run_context, None
+                )
                 raise
             except Exception as e:
                 if BROWSER_RETIREMENT_DENIED_NOTE in getattr(e, "__notes__", ()):
@@ -7660,6 +7739,9 @@ class WorkflowService:
                     browser_session_id=browser_session_id,
                 )
             except WorkflowAttemptDispatchSuperseded:
+                await self._dispose_superseded_attempt(
+                    workflow_run_id, execution_owner, initialized_workflow_run_context, None
+                )
                 raise
             except Exception as e:
                 if BROWSER_RETIREMENT_DENIED_NOTE in getattr(e, "__notes__", ()):
@@ -7715,6 +7797,7 @@ class WorkflowService:
                     need_call_webhook=need_call_webhook,
                     attempt_number=attempt_number,
                     owned_browser_session_id=owned_browser_session_id,
+                    workflow_run_context=initialized_workflow_run_context,
                     final_diagnostic_owner=final_diagnostic_owner,
                 )
                 return workflow_run
@@ -8064,24 +8147,34 @@ class WorkflowService:
             # completed), there's no captured intent to restore and we skip.
             escaped_error = sys.exc_info()[1]
             self._forget_saved_profile_without_credential(workflow_run_id, saved_profile_owner)
-            if isinstance(escaped_error, WorkflowAttemptDispatchSuperseded) or (
-                BROWSER_RETIREMENT_DENIED_NOTE in getattr(escaped_error, "__notes__", ())
-            ):
+            retirement_denied = BROWSER_RETIREMENT_DENIED_NOTE in getattr(escaped_error, "__notes__", ())
+            if isinstance(escaped_error, WorkflowAttemptDispatchSuperseded) or retirement_denied:
                 if on_finalization_denied is not None:
                     on_finalization_denied()
-                if renewal_task is not None:
-                    renewal_task.cancel()
+                # A denied retirement may never have established ownership, so it disposes of nothing.
+                if retirement_denied:
+                    if renewal_task is not None:
+                        renewal_task.cancel()
+                else:
+                    await self._dispose_superseded_attempt(
+                        workflow_run_id, execution_owner, initialized_workflow_run_context, renewal_task
+                    )
                 assert escaped_error is not None
                 raise escaped_error
             await self._leave_if_attempt_superseded(
-                workflow_run_id, attempt_number, on_finalization_denied, renewal_task
+                workflow_run_id,
+                attempt_number,
+                on_finalization_denied,
+                renewal_task,
+                execution_owner,
+                initialized_workflow_run_context,
             )
             browser_cleanup_result: WorkflowBrowserCleanupResult | None = None
             browser_persistence_status: WorkflowRunStatus | None = None
             browser_write_back_exhausted = False
             # Install the no-await tombstone before any final status becomes observable. Trusted
             # stale-owner release must defer from this point until browser teardown releases it.
-            mark_stream_closing(workflow_run_id)
+            stream_tombstone = claim_stream_closing(workflow_run_id)
             if pre_finally_status is not None:
                 # Browser cleanup evicts the run's browser, so whether it was lost must be read before it.
                 run_lost_external_browser = self._lost_external_browser(workflow_run)
@@ -8119,6 +8212,7 @@ class WorkflowService:
                                     workflow_run=workflow_run,
                                     close_browser_on_completion=close_browser_on_completion,
                                     browser_session_id=browser_session_id,
+                                    stream_tombstone=stream_tombstone,
                                 )
                             except BaseException:
                                 LOG.warning(
@@ -8263,7 +8357,13 @@ class WorkflowService:
                     )
 
             await self._leave_if_attempt_superseded(
-                workflow_run_id, attempt_number, on_finalization_denied, renewal_task
+                workflow_run_id,
+                attempt_number,
+                on_finalization_denied,
+                renewal_task,
+                execution_owner,
+                initialized_workflow_run_context,
+                stream_tombstone,
             )
 
             if getattr(workflow_run, "copilot_session_id", None):
@@ -8300,6 +8400,8 @@ class WorkflowService:
                 skip_browser_session_write_back=browser_write_back_exhausted,
                 schedule_credential_fallback_retry=not finally_block_set_terminal_outcome,
                 owned_browser_session_id=owned_browser_session_id,
+                workflow_run_context=initialized_workflow_run_context,
+                stream_tombstone=stream_tombstone,
                 final_diagnostic_owner=final_diagnostic_owner,
             )
 
@@ -16095,6 +16197,7 @@ class WorkflowService:
         workflow_run: WorkflowRun,
         close_browser_on_completion: bool = True,
         browser_session_id: str | None = None,
+        stream_tombstone: Any = None,
     ) -> WorkflowBrowserCleanupResult:
         tasks = await self.get_tasks_by_workflow_run_id(workflow_run.workflow_run_id)
 
@@ -16129,6 +16232,7 @@ class WorkflowService:
             browser_session_id=browser_session_id,
             organization_id=workflow_run.organization_id,
             child_workflow_run_ids=child_workflow_run_ids,
+            stream_tombstone=stream_tombstone,
         )
         return WorkflowBrowserCleanupResult(
             browser_state=browser_cleanup_result.browser_state,
@@ -16525,6 +16629,8 @@ class WorkflowService:
         schedule_credential_fallback_retry: bool = True,
         attempt_number: int = 1,
         owned_browser_session_id: str | None = None,
+        workflow_run_context: WorkflowRunContext | None = None,
+        stream_tombstone: Any = None,
         # The snapshot this run's own terminal write returned; without one the optional diagnostic is skipped.
         final_diagnostic_owner: WorkflowRun | None = None,
     ) -> None:
@@ -16532,7 +16638,10 @@ class WorkflowService:
         # pending, install the tombstone before the first awaited terminal hook. A pre-finalization
         # cleanup result has already reached complete_stream_teardown and must not be tombstoned again.
         if browser_cleanup_result is None:
-            mark_stream_closing(workflow_run.workflow_run_id)
+            # Owned only when installed here, so a superseded hand-over can release it; an existing marker is not ours.
+            claimed_tombstone = claim_stream_closing(workflow_run.workflow_run_id)
+            if stream_tombstone is None:
+                stream_tombstone = claimed_tombstone
         policy_run: bool | None
         try:
             policy_run = await is_retry_eligible_run(
@@ -16632,6 +16741,7 @@ class WorkflowService:
                 workflow_run=workflow_run,
                 close_browser_on_completion=close_browser_on_completion,
                 browser_session_id=browser_session_id,
+                stream_tombstone=stream_tombstone,
             )
 
         browser_state = browser_cleanup_result.browser_state
@@ -16765,7 +16875,13 @@ class WorkflowService:
                 for task_id in all_workflow_task_ids:
                     cleanup_context.clear_multi_field_totp_state(task_id)
                     cleanup_context.clear_multi_field_totp_rejection(task_id)
-            app.WORKFLOW_CONTEXT_MANAGER.remove_workflow_run_context(workflow_run.workflow_run_id)
+            # A caller that knows its own context evicts only that one; a successor may have replaced it.
+            if workflow_run_context is None:
+                app.WORKFLOW_CONTEXT_MANAGER.remove_workflow_run_context(workflow_run.workflow_run_id)
+            else:
+                app.WORKFLOW_CONTEXT_MANAGER.remove_workflow_run_context_if_current(
+                    workflow_run.workflow_run_id, workflow_run_context
+                )
             for child_workflow_run_id in child_workflow_run_ids:
                 app.WORKFLOW_CONTEXT_MANAGER.remove_workflow_run_context(child_workflow_run_id)
 

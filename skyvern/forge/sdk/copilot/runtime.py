@@ -642,6 +642,8 @@ class AgentContext:
     last_artifact_health_blocker_labels: list[str] = field(default_factory=list)
     last_artifact_health_failure_classes: list[str] = field(default_factory=list)
     last_run_blocks_block_ids: list[str] = field(default_factory=list)
+    # The subset of last_run_blocks_block_ids that carries the run verdict.
+    last_run_outcome_block_ids: list[str] = field(default_factory=list)
     last_run_blocks_block_labels: list[str] = field(default_factory=list)
     last_run_outcome: RecordedRunOutcome | None = None
     latest_recorded_build_test_outcome: RecordedBuildTestOutcome | None = None

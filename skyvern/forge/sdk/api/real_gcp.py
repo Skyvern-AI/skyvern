@@ -5,6 +5,7 @@
 """
 
 import asyncio
+import os
 import threading
 from datetime import timedelta
 from mimetypes import add_type, guess_type
@@ -25,6 +26,7 @@ from skyvern.forge.sdk.api.gcp import (
     GcpClientFactory,
     GcsUri,
 )
+from skyvern.utils.content_disposition import build_attachment_disposition
 
 # Match the custom mime types registered for the Azure client.
 add_type("application/json", ".har")
@@ -193,7 +195,13 @@ class RealAsyncGcsStorageClient(AsyncGcsStorageClient):
         creds.refresh(GoogleAuthRequest())
         return {"service_account_email": settings.GCS_SIGNER_SA_EMAIL, "access_token": creds.token}
 
-    def _create_signed_url(self, uri: str, expiry_hours: int = 24, signing_kwargs: dict | None = None) -> str | None:
+    def _create_signed_url(
+        self,
+        uri: str,
+        expiry_hours: int = 24,
+        signing_kwargs: dict | None = None,
+        attachment_filename: str | None = None,
+    ) -> str | None:
         # Private + synchronous: does blocking signing I/O (and, under Workload
         # Identity, a token refresh). Call only from create_signed_urls, which
         # runs it inside asyncio.to_thread so the event loop isn't blocked.
@@ -201,24 +209,44 @@ class RealAsyncGcsStorageClient(AsyncGcsStorageClient):
         # passes it in once rather than refreshing per URL.
         if signing_kwargs is None:
             signing_kwargs = self._signing_kwargs()
+        response_overrides: dict[str, str] = {}
+        if attachment_filename is not None:
+            response_overrides = {
+                "response_disposition": build_attachment_disposition(attachment_filename),
+                "response_type": "application/octet-stream",
+            }
         try:
             blob = self._get_blob(uri)
             return blob.generate_signed_url(
                 version="v4",
                 expiration=timedelta(hours=expiry_hours),
                 method="GET",
+                **response_overrides,
                 **signing_kwargs,
             )
         except Exception:
             LOG.exception("Failed to create signed URL", uri=uri)
             return None
 
-    async def create_signed_urls(self, uris: list[str], expiry_hours: int = 24) -> list[str] | None:
+    async def create_signed_urls(
+        self,
+        uris: list[str],
+        expiry_hours: int = 24,
+        attachment_filenames: list[str | None] | None = None,
+    ) -> list[str] | None:
+        if attachment_filenames is not None and len(attachment_filenames) != len(uris):
+            raise ValueError("attachment_filenames must have one entry per uri")
+
         def _do() -> list[str] | None:
             signing_kwargs = self._signing_kwargs()
             signed_urls: list[str] = []
-            for uri in uris:
-                url = self._create_signed_url(uri, expiry_hours, signing_kwargs=signing_kwargs)
+            for index, uri in enumerate(uris):
+                attachment_filename = None
+                if attachment_filenames is not None:
+                    attachment_filename = attachment_filenames[index] or os.path.basename(GcsUri(uri).object_path)
+                url = self._create_signed_url(
+                    uri, expiry_hours, signing_kwargs=signing_kwargs, attachment_filename=attachment_filename
+                )
                 if url is None:
                     LOG.warning("Signed URL generation failed, aborting batch", failed_uri=uri, uris=uris)
                     return None

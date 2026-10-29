@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+from collections.abc import Callable
 from contextlib import AbstractAsyncContextManager
 from dataclasses import dataclass
 from datetime import datetime
@@ -179,9 +180,16 @@ class PersistentSessionsManager(Protocol):
         ...
 
     async def set_browser_state(
-        self, session_id: str, browser_state: BrowserState, organization_id: str | None = None
-    ) -> None:
-        """Set the browser state, or raise when the session has stopped accepting generations."""
+        self,
+        session_id: str,
+        browser_state: BrowserState,
+        organization_id: str | None = None,
+        *,
+        may_publish: Callable[[], bool] | None = None,
+    ) -> bool:
+        """Set the browser state, or raise when the session has stopped accepting generations.
+
+        Returns False, caching and retiring nothing, when ``may_publish`` refuses at the cache mutation itself."""
         ...
 
     async def get_session(
