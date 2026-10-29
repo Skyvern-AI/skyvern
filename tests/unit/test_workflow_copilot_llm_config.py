@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+from collections.abc import Awaitable, Callable
 from datetime import UTC, datetime
 from types import SimpleNamespace
 from typing import Any
@@ -21,6 +22,7 @@ from unittest.mock import AsyncMock
 import pytest
 from fastapi import HTTPException, Response
 from starlette.requests import Request
+from structlog.testing import capture_logs
 
 from skyvern.config import Settings, settings
 from skyvern.forge.sdk.api.llm.config_registry import LLMConfigRegistry
@@ -33,6 +35,7 @@ from skyvern.forge.sdk.copilot.eval_llm_overrides import (
     current_eval_llm_overrides,
     eval_llm_override_scope,
 )
+from skyvern.forge.sdk.copilot.request_policy import _RawSecretSafetyScreen
 from skyvern.forge.sdk.routes import workflow_copilot as workflow_copilot_route
 from skyvern.forge.sdk.schemas.workflow_copilot import (
     WorkflowCopilotChatRequest,
@@ -464,14 +467,12 @@ async def test_terminal_cost_export_requires_explicit_authority_even_with_inheri
     assert current_copilot_cost() is None
 
 
-@pytest.mark.asyncio
-@pytest.mark.parametrize("surface", ["question", "steer"])
-@pytest.mark.parametrize("organization_id", ["org_eval", "org_other"])
-async def test_followup_safety_cost_receipts_require_evaluation_org(
-    surface: str, organization_id: str, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    monkeypatch.setattr(settings, "WORKFLOW_COPILOT_EVAL_COST_ENABLED", True)
-    monkeypatch.setattr(settings, "WORKFLOW_COPILOT_EVAL_COST_ORGANIZATION_IDS", ["org_eval"])
+async def _answer_followup(
+    surface: str,
+    organization_id: str,
+    screen: Callable[..., Awaitable[_RawSecretSafetyScreen]],
+    monkeypatch: pytest.MonkeyPatch,
+) -> Response:
     chat = SimpleNamespace(workflow_copilot_chat_id="chat_eval", workflow_permanent_id="wpid_eval")
     params = SimpleNamespace(
         get_workflow_copilot_chat_by_id=AsyncMock(return_value=chat),
@@ -486,14 +487,6 @@ async def test_followup_safety_cost_receipts_require_evaluation_org(
         SimpleNamespace(DATABASE=SimpleNamespace(workflow_params=params), CACHE=SimpleNamespace(set=AsyncMock())),
     )
     monkeypatch.setattr(workflow_copilot_route, "resolve_raw_secret_safety_handler", AsyncMock(return_value=object()))
-
-    async def screen(text: str, _handler: object, **_kwargs: object) -> SimpleNamespace:
-        _emit_copilot_model_usage(
-            CopilotModelUsageEvent(request_model="openai/eval-safety", cost=0.12, cost_source="litellm_estimate"),
-            logger=SimpleNamespace(info=lambda *_args, **_kwargs: None),
-        )
-        return SimpleNamespace(status="safe", canonical_user_message=text)
-
     monkeypatch.setattr(workflow_copilot_route, "screen_raw_secret_safety", screen)
     request = Request({"type": "http", "headers": []})
     http_response = Response()
@@ -519,6 +512,26 @@ async def test_followup_safety_cost_receipts_require_evaluation_org(
             ),
             organization,
         )
+    return http_response
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("surface", ["question", "steer"])
+@pytest.mark.parametrize("organization_id", ["org_eval", "org_other"])
+async def test_followup_safety_cost_receipts_require_evaluation_org(
+    surface: str, organization_id: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(settings, "WORKFLOW_COPILOT_EVAL_COST_ENABLED", True)
+    monkeypatch.setattr(settings, "WORKFLOW_COPILOT_EVAL_COST_ORGANIZATION_IDS", ["org_eval"])
+
+    async def screen(text: str, _handler: object, **_kwargs: object) -> _RawSecretSafetyScreen:
+        _emit_copilot_model_usage(
+            CopilotModelUsageEvent(request_model="openai/eval-safety", cost=0.12, cost_source="litellm_estimate"),
+            logger=SimpleNamespace(info=lambda *_args, **_kwargs: None),
+        )
+        return _RawSecretSafetyScreen(status="clean", canonical_user_message=text)
+
+    http_response = await _answer_followup(surface, organization_id, screen, monkeypatch)
     if organization_id == "org_eval":
         receipt = json.loads(http_response.headers["X-Copilot-Eval-LLM-Cost"])
         assert len(receipt["receipt_id"]) == 32
@@ -527,3 +540,34 @@ async def test_followup_safety_cost_receipts_require_evaluation_org(
     else:
         assert "X-Copilot-Eval-LLM-Cost" not in http_response.headers
     assert current_copilot_cost() is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(("surface", "caller"), [("question", "question_response"), ("steer", "steer")])
+@pytest.mark.parametrize(
+    "screened",
+    [
+        _RawSecretSafetyScreen(status="blocked", canonical_user_message="Safe reply", failure_kind="timeout"),
+        _RawSecretSafetyScreen(
+            status="clean", canonical_user_message="Safe reply", answered_by="fallback", hedged=True
+        ),
+    ],
+    ids=["blocked", "clean"],
+)
+async def test_followup_surfaces_log_the_safety_screen(
+    surface: str, caller: str, screened: _RawSecretSafetyScreen, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    async def screen(_text: str, _handler: object, **_kwargs: object) -> _RawSecretSafetyScreen:
+        return screened
+
+    with capture_logs() as logs:
+        if screened.status == "blocked":
+            with pytest.raises(HTTPException) as raised:
+                await _answer_followup(surface, "org_other", screen, monkeypatch)
+            assert raised.value.status_code == 503
+        else:
+            await _answer_followup(surface, "org_other", screen, monkeypatch)
+
+    screen_lines = [entry for entry in logs if entry["event"] == "raw-secret safety screen"]
+    assert [entry["caller"] for entry in screen_lines] == [caller]
+    assert {"status", "failure_kind", "latency_ms", "answered_by", "hedged"} <= screen_lines[0].keys()

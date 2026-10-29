@@ -24,6 +24,7 @@ from skyvern.forge.sdk.copilot.request_policy import (
     RequestPolicy,
     SteerMessageSiteURLSource,
     _ground_user_provided_sites,
+    _RawSecretSafetyScreen,
 )
 from skyvern.forge.sdk.routes.workflow_copilot import _persist_turn_messages
 from skyvern.forge.sdk.schemas.workflow_copilot import WorkflowCopilotChatHistoryResponse, WorkflowCopilotChatSender
@@ -414,9 +415,9 @@ async def test_messages_keep_their_send_order_when_screens_finish_out_of_order(s
     monkeypatch.setattr(app, "CACHE", LocalCache())
     screened = {"first": asyncio.Event(), "second": asyncio.Event()}
 
-    async def screen_when_released(text: str, *_args: object, **_kwargs: object) -> SimpleNamespace:
+    async def screen_when_released(text: str, *_args: object, **_kwargs: object) -> _RawSecretSafetyScreen:
         await screened[text].wait()
-        return SimpleNamespace(status="clean", canonical_user_message=text)
+        return _RawSecretSafetyScreen(status="clean", canonical_user_message=text)
 
     monkeypatch.setattr(routes, "screen_raw_secret_safety", screen_when_released)
     body = {"workflow_copilot_chat_id": ctx.workflow_copilot_chat_id, "cancel_token": "stop"}
