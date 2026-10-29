@@ -2181,7 +2181,7 @@ class TestFileParserTelemetryLogs:
     @staticmethod
     def _patch_extraction(mp: pytest.MonkeyPatch, handler: AsyncMock) -> None:
         # A real key, so `llm_key` assertions discriminate: an AsyncMock's auto-attribute is not a
-        # str, so `_handler_llm_key` would return None and a null assertion would prove nothing.
+        # str, so `handler_llm_key` would return None and a null assertion would prove nothing.
         handler.llm_key = "test-llm-key"
         mp.setattr(FileParserBlock, "_resolve_file_parser_handler", AsyncMock(return_value=handler))
         mp.setattr(

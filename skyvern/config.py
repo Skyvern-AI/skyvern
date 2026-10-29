@@ -267,6 +267,8 @@ class Settings(BaseSettings):
     LOG_SAMPLING_RATE: float = 1.0
     LOG_SAMPLING_ORG_IDS: list[str] = []
     COPILOT_RAW_SECRET_SAFETY_TIMEOUT_SECONDS: float = 12.0
+    COPILOT_RAW_SECRET_SAFETY_HEDGE_ENABLED: bool = True
+    COPILOT_RAW_SECRET_SAFETY_HEDGE_DELAY_SECONDS: float = 3.0
     COPILOT_COMPLETION_JUDGE_TIMEOUT_SECONDS: float = 12.0
     COPILOT_OUTPUT_DESIGNATION_TIMEOUT_SECONDS: float = 12.0
     # A capture that runs out of time yields no page evidence at all, so the scout falls back to

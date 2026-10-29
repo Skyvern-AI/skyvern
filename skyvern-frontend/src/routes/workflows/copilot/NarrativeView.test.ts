@@ -2,7 +2,7 @@ import { createElement } from "react";
 import { render, fireEvent, cleanup } from "@testing-library/react";
 import { renderToStaticMarkup } from "react-dom/server";
 import { NarrativeView } from "./NarrativeView";
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 
 import {
   ActivityEntry,
@@ -29,6 +29,43 @@ import {
   WorkflowCopilotTurnStartUpdate,
   WorkflowCopilotWorkflowDraftUpdate,
 } from "./workflowCopilotTypes";
+
+const testRun = vi.hoisted(() => ({
+  workflow_run_id: "wr_test",
+  status: "completed",
+  parameters: {
+    search_term: "copilot-value",
+    city: "page-value",
+    session_token: "reused-token",
+    region: "default-region",
+    notes: "",
+    login: "cred_saved_login",
+    backup_login: { username: "someone", password: "hunter2-secret" },
+  },
+  workflow: {
+    workflow_definition: {
+      parameters: [
+        {
+          parameter_type: "workflow",
+          key: "login",
+          workflow_parameter_type: "credential_id",
+        },
+        {
+          parameter_type: "workflow",
+          key: "backup_login",
+          workflow_parameter_type: "credential_id",
+        },
+      ],
+    },
+  },
+}));
+
+vi.mock("../hooks/useWorkflowRunQuery", () => ({
+  useWorkflowRunByIdQuery: (workflowRunId: string | undefined) => ({
+    data: workflowRunId === testRun.workflow_run_id ? testRun : undefined,
+    isError: false,
+  }),
+}));
 
 describe("terminalNarrativeText — budget expiry", () => {
   it("keeps authored drain text unchanged", () => {
@@ -1536,5 +1573,112 @@ describe("actor reason rendered projection", () => {
     const html = renderToStaticMarkup(createElement(NarrativeView, { turn }));
     expect(html).toContain("Test the booking before saving it");
     expect(html).toContain("Booking");
+  });
+});
+
+describe("test run inputs under the run row", () => {
+  const runEntry: ActivityEntry = {
+    id: "tr-run",
+    kind: "tool_result",
+    toolName: "run_blocks_and_collect_debug",
+    iteration: 0,
+    text: "Test completed",
+    success: true,
+    activityStartedAt: "2026-01-01T00:00:01Z",
+    timestamp: "2026-01-01T00:00:05Z",
+    workflowRunId: "wr_test",
+    testInputs: [
+      { key: "search_term", source: "copilot" },
+      { key: "city", source: "page" },
+      { key: "session_token", source: "earlier_run", sourceRunId: "wr_origin" },
+      { key: "region", source: "default" },
+      { key: "notes", source: "placeholder" },
+      { key: "login", source: "copilot" },
+      { key: "backup_login", source: "copilot" },
+    ],
+  };
+  const turnWith = (
+    blocks: TurnNarrativeState["blocks"],
+  ): TurnNarrativeState => ({
+    ...EMPTY_NARRATIVE,
+    turnId: "run-inputs",
+    turnIndex: 0,
+    designStarted: true,
+    designActivity: [runEntry],
+    blocks,
+  });
+  const openInputs = (turn: TurnNarrativeState): string => {
+    const view = render(createElement(NarrativeView, { turn }));
+    const fold = view.container.querySelector<HTMLButtonElement>(
+      "[data-activity-fold]",
+    );
+    if (fold) fireEvent.click(fold);
+    fireEvent.click(view.getByRole("button", { name: "Test inputs (7)" }));
+    const html = view.container.innerHTML;
+    cleanup();
+    return html;
+  };
+
+  it.each([
+    ["a plain run row", []],
+    [
+      "a run row shown as block cards",
+      [
+        {
+          workflowRunBlockId: "wrb_search",
+          label: "search",
+          blockType: "code",
+          state: "completed" as const,
+          lastSeenIteration: 0,
+          activity: [],
+          startedAt: "2026-01-01T00:00:02Z",
+          endedAt: "2026-01-01T00:00:04Z",
+        },
+      ],
+    ],
+  ])("lists each value and where it came from on %s", (_name, blocks) => {
+    const html = openInputs(turnWith(blocks));
+    for (const text of [
+      "copilot-value",
+      "set by Copilot",
+      "page-value",
+      "from the page",
+      "reused-token",
+      'reused from run <a class="underline hover:text-foreground" href="/runs/wr_origin"',
+      "default-region",
+      "workflow default",
+      "left blank",
+      "cred_saved_login",
+      "hidden",
+    ]) {
+      expect(html).toContain(text);
+    }
+    expect(html).not.toContain("hunter2-secret");
+    expect(html).not.toContain("someone");
+  });
+
+  it("puts a failed run's inputs indented under its failure detail", () => {
+    const failedRun: ActivityEntry = {
+      ...runEntry,
+      success: false,
+      text: "The search block timed out.",
+    };
+    const view = render(
+      createElement(NarrativeView, {
+        turn: { ...turnWith([]), designActivity: [failedRun] },
+      }),
+    );
+    const fold = view.container.querySelector<HTMLButtonElement>(
+      "[data-activity-fold]",
+    );
+    if (fold) fireEvent.click(fold);
+    const html = view.container.innerHTML;
+    const disclosure = view.container.querySelector("[data-test-inputs]");
+    cleanup();
+    expect(disclosure?.classList.contains("ml-[18px]")).toBe(true);
+    expect(html.indexOf("The search block timed out.")).toBeGreaterThan(-1);
+    expect(html.indexOf("The search block timed out.")).toBeLessThan(
+      html.indexOf("data-test-inputs"),
+    );
   });
 });

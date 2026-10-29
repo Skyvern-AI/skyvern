@@ -1,7 +1,14 @@
 from __future__ import annotations
 
+import json
+from collections.abc import AsyncIterator
 from datetime import datetime, timezone
 from types import SimpleNamespace
+from typing import Any
+from unittest.mock import MagicMock
+
+import pytest
+from agents.stream_events import RunItemStreamEvent
 
 from skyvern.forge.sdk.copilot.agent import _build_narrative_payload
 from skyvern.forge.sdk.copilot.blocker_signal import clear_active_run_evidence_on_workflow_edit
@@ -25,14 +32,27 @@ from skyvern.forge.sdk.copilot.narration import (
     build_tool_result_activity,
     tool_activity_display_label,
 )
-from skyvern.forge.sdk.copilot.output_utils import format_tool_result_for_user
+from skyvern.forge.sdk.copilot.output_utils import format_tool_result_for_user, sanitize_tool_result_for_llm
 from skyvern.forge.sdk.copilot.review_gate import workflow_block_fingerprints
 from skyvern.forge.sdk.copilot.run_outcome import RecordedRunOutcome
+from skyvern.forge.sdk.copilot.streaming_adapter import stream_to_sse
 from skyvern.forge.sdk.copilot.tools.run_execution import (
     _reconcile_narrative_block_attempts,
+    _run_blocks_and_collect_debug,
     _stash_recorded_run_outcome,
 )
+from skyvern.forge.sdk.schemas.workflow_copilot import WorkflowCopilotStreamMessageType
 from skyvern.forge.sdk.schemas.workflow_runs import WorkflowRunBlock
+from skyvern.services import workflow_service as workflow_service_module
+from tests.unit.copilot_test_helpers import (
+    FakeCopilotStream,
+    install_run_blocks_harness,
+    make_copilot_ctx,
+    origin_run_input,
+    terminal_extraction_block,
+    tool_called_event,
+    tool_output_event,
+)
 
 _SURGICAL_EDIT_TOOLS = ("edit_block", "delete_block")
 
@@ -929,3 +949,83 @@ def test_a_tool_result_without_diffs_carries_no_code_diffs_key() -> None:
     )
     assert with_diffs is not None
     assert with_diffs["codeDiffs"] == [{"label": "step", "added": 2, "removed": 1}]
+
+
+_MODEL_SENTINEL = "model-value-sentinel-7f3a"
+_DEFAULT_SENTINEL = "default-value-sentinel-91c2"
+_ORIGIN_SENTINEL = "s3://origin-sentinel-bucket/earlier-run-sentinel-4d8e.pdf"
+_SENTINEL_INPUTS_WORKFLOW_YAML = f"""
+title: inputs with sentinel values
+workflow_definition:
+  parameters:
+    - parameter_type: workflow
+      workflow_parameter_type: string
+      key: search_term
+    - parameter_type: workflow
+      workflow_parameter_type: string
+      key: region
+      default_value: {_DEFAULT_SENTINEL}
+    - parameter_type: workflow
+      workflow_parameter_type: file_url
+      key: resume
+  blocks:
+    - block_type: extraction
+      label: extract_heading
+      url: https://example.com
+      data_extraction_goal: Extract the page heading.
+      parameter_keys:
+        - search_term
+        - region
+        - resume
+"""
+
+
+async def _one_tool_round(call_id: str, tool_name: str, output: dict[str, Any]) -> AsyncIterator[RunItemStreamEvent]:
+    yield tool_called_event(call_id, tool_name)
+    yield tool_output_event(call_id, output)
+
+
+@pytest.mark.asyncio
+async def test_dispatched_input_values_never_reach_the_run_row_or_its_frame(monkeypatch: pytest.MonkeyPatch) -> None:
+    harness = await install_run_blocks_harness(
+        monkeypatch,
+        workflow_yaml=_SENTINEL_INPUTS_WORKFLOW_YAML,
+        polled_status="failed",
+        terminal_blocks=[terminal_extraction_block("failed")],
+    )
+    stream = FakeCopilotStream()
+    ctx = make_copilot_ctx(browser_session_id="pbs_chat", stream=stream)
+    ctx.staged_workflow = harness["workflow"]
+    ctx.frontier_resume_session_id = "pbs_run"
+    ctx.repair_origin_input_values = (origin_run_input("resume", _ORIGIN_SENTINEL),)
+
+    result = await _run_blocks_and_collect_debug(
+        {"block_labels": ["extract_heading"], "parameters": {"search_term": _MODEL_SENTINEL}}, ctx
+    )
+    dispatched = workflow_service_module.prepare_workflow.call_args.kwargs["workflow_request"].data
+    assert (dispatched["search_term"], dispatched["region"], dispatched["resume"]) == (
+        _MODEL_SENTINEL,
+        _DEFAULT_SENTINEL,
+        _ORIGIN_SENTINEL,
+    )
+    model_facing = sanitize_tool_result_for_llm("run_blocks_and_collect_debug", result)
+    assert "test_inputs" not in json.dumps(model_facing)
+
+    run_stream = MagicMock()
+    run_stream.stream_events = lambda: _one_tool_round("run_1", "run_blocks_and_collect_debug", model_facing)
+    await stream_to_sse(run_stream, stream, ctx)
+
+    frame = next(f for f in stream.sent if getattr(f, "type", None) == WorkflowCopilotStreamMessageType.TOOL_RESULT)
+    payload = _build_narrative_payload(ctx, terminal="response", terminal_message="done", narrative_summary="done")
+    row = next(entry for entry in payload["designActivity"] if entry["id"] == "tr-run_1")
+    expected = [
+        {"key": "search_term", "source": "copilot"},
+        {"key": "region", "source": "default"},
+        {"key": "resume", "source": "earlier_run", "sourceRunId": "wr_origin"},
+    ]
+    assert (frame.workflow_run_id, frame.test_inputs) == ("wr_paused", expected)
+    assert (row["workflowRunId"], row["testInputs"]) == ("wr_paused", expected)
+    for serialized in (frame.model_dump_json(), json.dumps(row)):
+        for sentinel in (_MODEL_SENTINEL, _DEFAULT_SENTINEL, _ORIGIN_SENTINEL):
+            assert sentinel not in serialized
+    assert ctx.pending_test_inputs == {}

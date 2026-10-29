@@ -19,7 +19,7 @@ from skyvern.forge.sdk.copilot.ask_user import (
 from skyvern.forge.sdk.copilot.context import CopilotContext
 from skyvern.forge.sdk.copilot.human_input_wait import HumanInputWait, pause_human_input
 from skyvern.forge.sdk.copilot.output_utils import summarize_tool_result
-from skyvern.forge.sdk.copilot.request_policy import RequestPolicy
+from skyvern.forge.sdk.copilot.request_policy import RequestPolicy, _RawSecretSafetyScreen
 from skyvern.forge.sdk.db.base_alchemy_db import BaseAlchemyDB
 from skyvern.forge.sdk.db.repositories.workflow_parameters import WorkflowParametersRepository
 from skyvern.forge.sdk.schemas.workflow_copilot import CopilotPendingTurn
@@ -722,7 +722,7 @@ async def test_question_reply_persists_raw_secret_detection(sqlite_engine, monke
         routes,
         "screen_raw_secret_safety",
         AsyncMock(
-            return_value=SimpleNamespace(
+            return_value=_RawSecretSafetyScreen(
                 status="detected",
                 canonical_user_message="https://portal.example.com/login [REDACTED]",
             )
@@ -841,7 +841,7 @@ async def test_near_expiry_reply_renews_client_presence_and_rechecks_cancel(
         # Simulate the actual owner polling while the provider is processing.
         recorded = await repo.poll_copilot_question("org", ctx.workflow_copilot_chat_id, question.interaction_id)
         assert recorded.status == ("cancelled" if cancel_during_screen else "pending")
-        return SimpleNamespace(status="clean", canonical_user_message=text)
+        return _RawSecretSafetyScreen(status="clean", canonical_user_message=text)
 
     monkeypatch.setattr(routes, "screen_raw_secret_safety", screen)
     async with client:

@@ -5821,6 +5821,7 @@ async def test_candidate_run_bind_refusal_logs_its_reason_and_dispatches_nothing
     assert (result["ok"], result.get("conflict_reason")) == (False, reason if reason == "bytes_changed" else None)
     assert result["data"] == {"run_dispatched": False, "proposal_bind_refused": True}
     assert forge_app.WORKFLOW_SERVICE.execute_workflow.call_count == 0
+    assert ctx.pending_test_inputs == {}
     bind_logs = [entry for entry in logs if entry["event"].startswith("copilot candidate run bind")]
     assert [(entry["event"], entry["reason"]) for entry in bind_logs] == [(event, reason)]
     assert (await _stored_candidate(repo, chat_id))[1].workflow_run_id is None

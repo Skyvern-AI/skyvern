@@ -32,6 +32,7 @@ from skyvern.forge.sdk.copilot.context import (
     REPLY_TOOL_NAME,
     USER_FACING_REASON_PARAM,
     CopilotContext,
+    CopilotTestInput,
     InFlightStreamToolCall,
     NarrativeActivityEntry,
     normalize_action_reason,
@@ -121,6 +122,12 @@ def _drain_code_write_diffs(ctx: CopilotContext, tool_name: str, call_id: str) -
         return None
     diffs = ctx.pending_code_write_diffs.pop(call_id, None)
     return diffs or None
+
+
+def _drain_test_inputs(ctx: CopilotContext, workflow_run_id: str | None) -> list[CopilotTestInput] | None:
+    if workflow_run_id is None:
+        return None
+    return ctx.pending_test_inputs.pop(workflow_run_id, None) or None
 
 
 async def _store_chat_screenshot(organization_id: str, chat_id: str, frame: ChatScreenshotFrame) -> str:
@@ -535,6 +542,8 @@ async def stream_to_sse(
                                 break
                     tool_result_ts = datetime.now(timezone.utc)
                     code_diffs = _drain_code_write_diffs(ctx, tool_name, call_id)
+                    workflow_run_id = _tool_result_workflow_run_id(tool_name, parsed)
+                    test_inputs = _drain_test_inputs(ctx, workflow_run_id)
                     work_plan = _tool_result_work_plan(tool_name, parsed)
                     browser_steps = browser_code_steps_for_user(tool_name, parsed)
                     narrator_state.record_activity(
@@ -549,6 +558,8 @@ async def stream_to_sse(
                                 display_label=result_label,
                                 code_diffs=code_diffs,
                                 browser_steps=browser_steps,
+                                workflow_run_id=workflow_run_id,
+                                test_inputs=test_inputs,
                             ),
                             presentation,
                         )
@@ -573,7 +584,8 @@ async def stream_to_sse(
                                 work_plan=work_plan,
                                 browser_steps=browser_steps,
                                 detail=detail,
-                                workflow_run_id=_tool_result_workflow_run_id(tool_name, parsed),
+                                workflow_run_id=workflow_run_id,
+                                test_inputs=test_inputs,
                                 executed_source_reference=_tool_result_executed_source_reference(tool_name, parsed),
                                 timestamp=tool_result_ts,
                             )
@@ -692,6 +704,53 @@ async def flush_goal_satisfied_tool_result(stream: EventSourceStream, ctx: Copil
     await _send_pending_tool_result(stream, ctx, pending, parsed, client_gone=client_gone)
 
 
+async def emit_test_end_to_end_activity(
+    stream: EventSourceStream,
+    ctx: CopilotContext,
+    *,
+    call_id: str,
+    started_at: datetime,
+    result: dict[str, Any],
+) -> None:
+    """Record and send the Test button's run as one call/result row; that call never streams from the model."""
+    narrator_state = ctx.narrator_state or NarratorState()
+    ctx.narrator_state = narrator_state
+    client_gone = await stream.is_disconnected()
+    if not client_gone:
+        await maybe_emit_design_start(stream, ctx)
+    tool_name = "run_blocks_and_collect_debug"
+    presentation = InFlightStreamToolCall(
+        call_id=call_id,
+        tool_name=tool_name,
+        iteration=0,
+        display_label=tool_activity_display_label(tool_name),
+        started_at=started_at,
+        activity_bucket=narrator_state.activity_bucket(),
+    )
+    narrator_state.record_activity(
+        _present_activity(
+            build_tool_call_activity(
+                tool_name, 0, call_id, timestamp=started_at, display_label=presentation.display_label
+            ),
+            presentation,
+        )
+    )
+    if not client_gone:
+        await stream.send(
+            WorkflowCopilotToolCallUpdate(
+                type=WorkflowCopilotStreamMessageType.TOOL_CALL,
+                tool_name=tool_name,
+                display_label=presentation.display_label,
+                activity_bucket=presentation.activity_bucket,
+                tool_input={},
+                iteration=0,
+                tool_call_id=call_id,
+                timestamp=started_at,
+            )
+        )
+    await _send_pending_tool_result(stream, ctx, presentation, result, client_gone=client_gone)
+
+
 async def close_unrun_tool_calls(stream: EventSourceStream, ctx: CopilotContext, call_ids: Iterable[str]) -> None:
     """Emit the TOOL_RESULT frame for calls the SDK rejected before running any of them.
     Their ``tool_called`` frames may already be on screen, and no ``tool_output`` event follows."""
@@ -722,6 +781,8 @@ async def _send_pending_tool_result(
     display_label = pending.display_label or tool_activity_display_label(pending.tool_name)
     flush_ts = datetime.now(timezone.utc)
     code_diffs = _drain_code_write_diffs(ctx, pending.tool_name, pending.call_id)
+    workflow_run_id = _tool_result_workflow_run_id(pending.tool_name, parsed)
+    test_inputs = _drain_test_inputs(ctx, workflow_run_id)
     work_plan = _tool_result_work_plan(pending.tool_name, parsed)
     browser_steps = browser_code_steps_for_user(pending.tool_name, parsed)
     narrator_state = ctx.narrator_state
@@ -738,6 +799,8 @@ async def _send_pending_tool_result(
                     display_label=display_label,
                     code_diffs=code_diffs,
                     browser_steps=browser_steps,
+                    workflow_run_id=workflow_run_id,
+                    test_inputs=test_inputs,
                 ),
                 pending,
             )
@@ -764,7 +827,8 @@ async def _send_pending_tool_result(
             detail=summarize_tool_result_detail(
                 parsed, tool_name=pending.tool_name, blocker_signal=blocker_signals, success=success
             ),
-            workflow_run_id=_tool_result_workflow_run_id(pending.tool_name, parsed),
+            workflow_run_id=workflow_run_id,
+            test_inputs=test_inputs,
             executed_source_reference=_tool_result_executed_source_reference(pending.tool_name, parsed),
             timestamp=flush_ts,
         )

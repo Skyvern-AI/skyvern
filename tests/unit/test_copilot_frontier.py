@@ -83,7 +83,7 @@ from skyvern.forge.sdk.copilot.tools.run_execution import (
     run_workflow_end_to_end,
     terminal_ready_for_latch,
 )
-from skyvern.forge.sdk.schemas.workflow_copilot import WorkflowCopilotChatRequest
+from skyvern.forge.sdk.schemas.workflow_copilot import WorkflowCopilotChatRequest, WorkflowCopilotStreamMessageType
 from skyvern.forge.sdk.schemas.workflow_runs import WorkflowRunBlock
 from skyvern.forge.sdk.workflow.models.parameter import RESERVED_PARAMETER_KEYS
 from skyvern.forge.sdk.workflow.models.workflow import (
@@ -101,6 +101,7 @@ from tests.unit.copilot_test_helpers import (
     ORIGIN_OUTPUT_SENTINEL,
     ORIGIN_RUN_ID,
     REPAIRED_APPROVAL_WORKFLOW_YAML,
+    FakeCopilotStream,
     inert_approval_workflow,
     install_named_runs,
     install_origin_run,
@@ -4320,6 +4321,74 @@ async def test_test_end_to_end_provider_input_excludes_target_controlled_action_
     packet = json.loads(provider_input)["data"]["build_test_packet"]
     assert packet["action_observations"] == ["click completed"]
     assert hostile not in provider_input
+
+
+@pytest.mark.asyncio
+async def test_test_end_to_end_run_gets_its_own_row_carrying_its_input_sources(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    sources = [
+        {"key": "query", "source": "earlier_run", "sourceRunId": "wr_origin"},
+        {"key": "login", "source": "placeholder"},
+    ]
+    run_result = {
+        "ok": True,
+        "data": {
+            "workflow_run_id": "wr_button",
+            "overall_status": "completed",
+            "requested_block_labels": ["inspect_result"],
+            "executed_block_labels": ["inspect_result"],
+        },
+    }
+
+    async def _dispatch(ctx: CopilotContext, workflow_yaml: str, *, seed_like_normal_run: bool) -> dict[str, Any]:
+        ctx.pending_test_inputs["wr_button"] = copy.deepcopy(sources)
+        return copy.deepcopy(run_result)
+
+    monkeypatch.setattr(agent_module, "run_workflow_end_to_end", _dispatch)
+    stream = FakeCopilotStream()
+    ctx = _make_ctx(workflow_permanent_id="wpid_button", turn_id="turn_1", stream=stream)
+
+    handoff = await agent_module._run_end_to_end_test_turn(ctx, workflow_yaml=ctx.workflow_yaml)
+
+    call_id = "call_test_end_to_end_turn_1"
+    assert [frame.type for frame in stream.sent] == [
+        WorkflowCopilotStreamMessageType.DESIGN_START,
+        WorkflowCopilotStreamMessageType.TOOL_CALL,
+        WorkflowCopilotStreamMessageType.TOOL_RESULT,
+    ]
+    result_frame = stream.sent[2]
+    assert (result_frame.tool_call_id, result_frame.success) == (call_id, True)
+    assert (result_frame.workflow_run_id, result_frame.test_inputs) == ("wr_button", sources)
+    assert ctx.narrator_state is not None
+    rows = {row["id"]: row for row in ctx.narrator_state.design_activity}
+    assert set(rows) == {f"tc-{call_id}", f"tr-{call_id}"}
+    assert (rows[f"tr-{call_id}"]["workflowRunId"], rows[f"tr-{call_id}"]["testInputs"]) == ("wr_button", sources)
+    assert ctx.pending_test_inputs == {}
+
+    monkeypatch.setattr(agent_module, "emit_test_end_to_end_activity", AsyncMock())
+    without_row = await agent_module._run_end_to_end_test_turn(
+        _make_ctx(workflow_permanent_id="wpid_button", turn_id="turn_1"), workflow_yaml=ctx.workflow_yaml
+    )
+    assert handoff == without_row
+
+
+@pytest.mark.asyncio
+async def test_test_end_to_end_setup_failure_row_has_no_run_or_inputs(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(agent_module, "run_workflow_end_to_end", AsyncMock(side_effect=RuntimeError("boom")))
+    stream = FakeCopilotStream()
+    ctx = _make_ctx(workflow_permanent_id="wpid_button", turn_id="turn_2", stream=stream)
+
+    await agent_module._run_end_to_end_test_turn(ctx, workflow_yaml=ctx.workflow_yaml)
+
+    result_frame = stream.sent[-1]
+    assert result_frame.type == WorkflowCopilotStreamMessageType.TOOL_RESULT
+    assert (result_frame.success, result_frame.workflow_run_id, result_frame.test_inputs) == (False, None, None)
+    assert ctx.narrator_state is not None
+    row = ctx.narrator_state.design_activity[-1]
+    assert row["id"] == "tr-call_test_end_to_end_turn_2"
+    assert "workflowRunId" not in row and "testInputs" not in row
+    assert ctx.pending_test_inputs == {}
 
 
 @pytest.mark.asyncio

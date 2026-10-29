@@ -152,7 +152,7 @@ from skyvern.forge.sdk.api.files import (
     validate_local_file_path,
     wait_for_download_finished,
 )
-from skyvern.forge.sdk.api.llm.api_handler import LLMAPIHandler
+from skyvern.forge.sdk.api.llm.api_handler import LLMAPIHandler, handler_llm_key
 from skyvern.forge.sdk.api.llm.api_handler_factory import (
     LLMAPIHandlerFactory,
     get_org_aware_primary_llm_api_handler,
@@ -11259,13 +11259,6 @@ def _response_key_facts(response: Any, json_schema: dict[str, Any]) -> dict[str,
     }
 
 
-def _handler_llm_key(handler: LLMAPIHandler) -> str | None:
-    # Handlers are plain callables: the factory attaches .llm_key dynamically, and bound LLMCaller
-    # methods carry it on __self__ (mirrors LLMAPIHandlerFactory._maybe_get_flex_handler).
-    key = getattr(handler, "llm_key", None) or getattr(getattr(handler, "__self__", None), "llm_key", None)
-    return key if isinstance(key, str) else None
-
-
 _LOG_URL_PATTERN = re.compile(r"\w+://\S+")
 _LOG_QUOTED_PATTERN = re.compile(r'"[^"]*"')
 _FAILURE_FAMILY_CHARS = 60
@@ -14730,7 +14723,7 @@ class FileParserBlock(Block):
         llm_api_handler = LLMAPIHandlerFactory.get_override_llm_api_handler(
             self.override_llm_key_for_organization(organization_id), default=default_handler
         )
-        llm_key = _handler_llm_key(llm_api_handler)
+        llm_key = handler_llm_key(llm_api_handler)
         semaphore = asyncio.Semaphore(PDF_OCR_PAGE_CONCURRENCY)
 
         async def _ocr_page(page_image: bytes) -> str:
@@ -14877,7 +14870,7 @@ class FileParserBlock(Block):
             llm_api_handler = LLMAPIHandlerFactory.get_override_llm_api_handler(
                 self.override_llm_key_for_organization(organization_id), default=default_handler
             )
-            llm_key = _handler_llm_key(llm_api_handler)
+            llm_key = handler_llm_key(llm_api_handler)
             # OCR transcription intentionally skips system_prompt — see
             # _parse_pdf_file_with_vision_ocr for rationale.
             prompt_for_attempt = llm_prompt
@@ -15240,7 +15233,7 @@ class FileParserBlock(Block):
         )
         llm_api_handler = LLMAPIHandlerFactory.get_override_llm_api_handler(llm_key, default=default_handler)
         telemetry = self._telemetry
-        telemetry.llm_key = _handler_llm_key(llm_api_handler)
+        telemetry.llm_key = handler_llm_key(llm_api_handler)
         last_failure_class: str | None = None
 
         prompt_for_attempt = llm_prompt
@@ -15749,7 +15742,7 @@ class PDFParserBlock(Block):
 
         llm_response: dict[str, Any] | list | str | None = None
         llm_api_handler = get_org_aware_primary_llm_api_handler(default=app.LLM_API_HANDLER)
-        llm_key = _handler_llm_key(llm_api_handler)
+        llm_key = handler_llm_key(llm_api_handler)
         prompt_for_attempt = llm_prompt
         for attempt in range(self.schema_validation_max_attempts):
             try:

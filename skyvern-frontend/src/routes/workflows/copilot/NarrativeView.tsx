@@ -46,7 +46,10 @@ import {
 } from "./copilotActivityLog";
 import { TURN_ROW_INSET, TURN_ROW_OUTSET } from "./cards/cardLayout";
 import { showPhaseChecklist } from "./copilotPhases";
-import { CodeWriteDiff } from "./workflowCopilotTypes";
+import { CodeWriteDiff, CopilotTestInput } from "./workflowCopilotTypes";
+import { useWorkflowRunByIdQuery } from "../hooks/useWorkflowRunQuery";
+import { RunFieldValue } from "../studio/runview/RunFieldValue";
+import { WorkflowParameterValueType } from "../types/workflowTypes";
 import {
   ActivityEntry,
   BlockState,
@@ -1604,6 +1607,117 @@ function FFittedSteps({ steps }: { steps: string[] }) {
   );
 }
 
+function TestInputSource({ input }: { input: CopilotTestInput }) {
+  switch (input.source) {
+    case "copilot":
+      return <>set by Copilot</>;
+    case "page":
+      return <>from the page</>;
+    case "earlier_run":
+      return input.sourceRunId ? (
+        <>
+          {"reused from run "}
+          <a
+            className="underline hover:text-foreground"
+            href={`/runs/${input.sourceRunId}`}
+            target="_blank"
+            rel="noopener noreferrer"
+          >
+            {input.sourceRunId}
+          </a>
+        </>
+      ) : (
+        <>reused from an earlier run</>
+      );
+    case "default":
+      return <>workflow default</>;
+    case "placeholder":
+      return <>left blank</>;
+  }
+}
+
+function TestInputValues({
+  workflowRunId,
+  inputs,
+}: {
+  workflowRunId: string;
+  inputs: CopilotTestInput[];
+}) {
+  const { data: run, isError } = useWorkflowRunByIdQuery(workflowRunId, true);
+  if (run === undefined) {
+    return (
+      <p className="ml-[18px] text-[12px] text-muted-foreground">
+        {isError ? "Could not load these values." : "Loading…"}
+      </p>
+    );
+  }
+  const credentialKeys = new Set(
+    (run.workflow?.workflow_definition?.parameters ?? []).flatMap((p) =>
+      p.parameter_type === "workflow" &&
+      p.workflow_parameter_type === WorkflowParameterValueType.CredentialId
+        ? [p.key]
+        : [],
+    ),
+  );
+  const values = run.parameters ?? {};
+  return (
+    <dl className="ml-[18px] mt-0.5 flex flex-col gap-1.5 border-l border-border pl-2 text-[12px]">
+      {inputs.map((input) => {
+        const raw = values[input.key];
+        // A credential shows only its saved reference, never a resolved value.
+        const hidden = credentialKeys.has(input.key) && typeof raw !== "string";
+        return (
+          <div key={input.key} data-test-input-key={input.key}>
+            <dt className="flex flex-wrap items-baseline gap-x-1.5">
+              <span className="font-mono text-[11.5px] text-foreground">
+                {input.key}
+              </span>
+              <span className="text-muted-foreground">
+                <TestInputSource input={input} />
+              </span>
+            </dt>
+            <dd>
+              {hidden ? (
+                <span className="text-xs text-muted-foreground">hidden</span>
+              ) : (
+                <RunFieldValue value={raw} label={input.key} />
+              )}
+            </dd>
+          </div>
+        );
+      })}
+    </dl>
+  );
+}
+
+function TestInputsDisclosure({
+  entry,
+  className,
+}: {
+  entry: ActivityEntry;
+  className?: string;
+}) {
+  const [open, setOpen] = useState(false);
+  const inputs = entry.testInputs;
+  if (!entry.workflowRunId || !inputs?.length) return null;
+  return (
+    <div data-test-inputs className={className}>
+      <button
+        type="button"
+        aria-expanded={open}
+        className={`flex items-center gap-1.5 py-px text-left text-[12px] leading-[1.5] ${STEP_TEXT} hover:text-foreground`}
+        onClick={() => setOpen(!open)}
+      >
+        <Chevron open={open} />
+        {`Test inputs (${inputs.length})`}
+      </button>
+      {open ? (
+        <TestInputValues workflowRunId={entry.workflowRunId} inputs={inputs} />
+      ) : null}
+    </div>
+  );
+}
+
 // One call in an expanded step. A result reads inline beside the call and
 // opens to its full text; an error opens as its own box.
 function FCallItem({
@@ -1710,6 +1824,7 @@ function FCallItem({
       ) : null}
       {evidence}
       {open && detail !== null ? <FDetailBox>{detail}</FDetailBox> : null}
+      <TestInputsDisclosure entry={entry} className="ml-[18px]" />
     </li>
   );
 }
@@ -2038,6 +2153,12 @@ function FActivityLogRow({
       // call keeps its own row above the cards.
       if (result !== null && !hosted.some((b) => b.state === "failed")) {
         items.push(callItem);
+      } else if (entry.testInputs?.length) {
+        items.push(
+          <li key={`inputs-${toolCallIdOf(entry) ?? entry.id}`}>
+            <TestInputsDisclosure entry={entry} />
+          </li>,
+        );
       }
       flushItems();
       hosted.forEach((block) => carded.add(block));

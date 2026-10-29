@@ -156,7 +156,7 @@ from skyvern.forge.sdk.copilot.hooks import FinalReplyRunHooks
 from skyvern.forge.sdk.copilot.interruption import INTERRUPTED_TERMINAL_SUPERSEDED_HEADLINE
 from skyvern.forge.sdk.copilot.llm_errors import CopilotEmptyCompletionError
 from skyvern.forge.sdk.copilot.llm_errors import is_retriable_llm_error as _is_retriable_llm_error
-from skyvern.forge.sdk.copilot.model_resolver import copilot_token_budget, router_fallback_llm_key
+from skyvern.forge.sdk.copilot.model_resolver import copilot_token_budget
 from skyvern.forge.sdk.copilot.model_telemetry import (
     CopilotModelStopMetadata,
     model_attempt_telemetry_scope,
@@ -214,6 +214,7 @@ from skyvern.forge.sdk.copilot.review_gate import (
     build_review_projection,
     serialize_execution_receipts,
 )
+from skyvern.forge.sdk.copilot.router_fallback import router_fallback_llm_key
 from skyvern.forge.sdk.copilot.run_outcome import (
     RecordedRunOutcome,
     is_interim_run_outcome,
@@ -239,6 +240,7 @@ from skyvern.forge.sdk.copilot.runtime_authoring_repair import (
 from skyvern.forge.sdk.copilot.secret_redaction import redact_raw_secrets_for_structured_prompt
 from skyvern.forge.sdk.copilot.secret_scrub import registered_scrub_values, scrub_secrets_from_structure
 from skyvern.forge.sdk.copilot.streaming_adapter import (
+    emit_test_end_to_end_activity,
     emit_turn_start,
     emit_workflow_draft,
     flush_goal_satisfied_tool_result,
@@ -2373,6 +2375,7 @@ async def _run_end_to_end_test_turn(
     *,
     workflow_yaml: str,
 ) -> list[dict[str, str]]:
+    started_at = datetime.now(UTC)
     try:
         result = await run_workflow_end_to_end(ctx, workflow_yaml, seed_like_normal_run=True)
     except Exception as exc:
@@ -2467,6 +2470,10 @@ async def _run_end_to_end_test_turn(
         separators=(",", ":"),
     )
     call_id = f"call_test_end_to_end_{ctx.turn_id}"
+    try:
+        await emit_test_end_to_end_activity(ctx.stream, ctx, call_id=call_id, started_at=started_at, result=sanitized)
+    except Exception as emit_err:  # noqa: BLE001 - narrative emission is best-effort; the model handoff still runs.
+        LOG.warning("copilot_test_end_to_end_activity_emit_failed", error=str(emit_err))
     LOG.info(
         "copilot_test_end_to_end_turn_finished",
         workflow_permanent_id=ctx.workflow_permanent_id,

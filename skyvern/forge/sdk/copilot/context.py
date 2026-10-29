@@ -118,6 +118,15 @@ class BlockActivityBucket(TypedDict):
 ActivityBucket = DesignActivityBucket | BlockActivityBucket
 
 
+CopilotTestInputSource = Literal["copilot", "page", "earlier_run", "default", "placeholder"]
+
+
+class CopilotTestInput(TypedDict):
+    key: str
+    source: CopilotTestInputSource
+    sourceRunId: NotRequired[str]
+
+
 # Shape must match the FE ``ActivityEntry`` in narrativeState.ts; toolName is
 # present only for tool_call/tool_result and success only for tool_result.
 class NarrativeActivityEntry(TypedDict):
@@ -134,6 +143,8 @@ class NarrativeActivityEntry(TypedDict):
     outcomeLabel: NotRequired[str]
     codeDiffs: NotRequired[list[CodeWriteDiff]]
     browserSteps: NotRequired[list[str]]
+    workflowRunId: NotRequired[str]
+    testInputs: NotRequired[list[CopilotTestInput]]
     id: str
     # Server clock read for the event this entry describes, shared with the SSE
     # update so a rehydrated row renders the same elapsed the live row did.
@@ -1399,6 +1410,8 @@ class CopilotContext(AgentContext):
     # Runs this turn actually dispatched. ``last_run_blocks_workflow_run_id`` cannot answer that:
     # a repair turn is seeded with the run it was opened about, which this turn never dispatched.
     dispatched_run_ids_this_turn: set[str] = field(default_factory=set)
+    # Keyed by run id and drained by that run's own tool result, so a parallel sibling never shows these.
+    pending_test_inputs: dict[str, list[CopilotTestInput]] = field(default_factory=dict)
     # Whether the latest recorded run-tool result created a run row; None until one is recorded.
     last_test_run_started: bool | None = None
     # The files the last recorded worker run published, keyed by that run's id.

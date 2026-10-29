@@ -17,9 +17,10 @@ from urllib.parse import urlparse
 
 import pytest
 from agents import Agent, FunctionTool, OutputGuardrail, RunConfig, SQLiteSession
-from agents.items import ModelResponse, TResponseInputItem
+from agents.items import ModelResponse, RunItem, TResponseInputItem
 from agents.models.interface import Model, ModelProvider
 from agents.result import RunResultStreaming
+from agents.stream_events import RunItemStreamEvent
 from openai.types.responses import (
     ResponseCompletedEvent,
     ResponseOutputItemDoneEvent,
@@ -1720,6 +1721,22 @@ def install_org_secondary_llm_override(monkeypatch: pytest.MonkeyPatch, handler:
     monkeypatch.setattr(api_handler_factory, "is_custom_llm_owned_by_organization", lambda _id, _org: True)
     monkeypatch.setattr(api_handler_factory.LLMConfigRegistry, "is_registered", lambda _key: True)
     monkeypatch.setattr(api_handler_factory.LLMAPIHandlerFactory, "get_llm_api_handler", lambda _key: handler)
+
+
+def tool_called_event(
+    call_id: str, name: str, arguments: str = "{}", agent: Agent[Any] | None = None
+) -> RunItemStreamEvent:
+    call_item = MagicMock(spec=RunItem)
+    call_item.raw_item = {"call_id": call_id, "name": name, "arguments": arguments}
+    call_item.agent = agent or Agent(name="no-tools")
+    return RunItemStreamEvent(name="tool_called", item=call_item)
+
+
+def tool_output_event(call_id: str, payload: dict[str, Any]) -> RunItemStreamEvent:
+    out_item = MagicMock(spec=RunItem)
+    out_item.raw_item = {"call_id": call_id}
+    out_item.output = [{"type": "text", "text": json.dumps(payload)}]
+    return RunItemStreamEvent(name="tool_output", item=out_item)
 
 
 class FakeCopilotStream:
