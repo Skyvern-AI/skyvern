@@ -192,6 +192,7 @@ from skyvern.forge.sdk.db.exceptions import NotFoundError
 from skyvern.forge.sdk.db.id import generate_action_id, generate_workflow_run_id
 from skyvern.forge.sdk.db.repositories.google_oauth import DISPATCH_ACCEPTED, DISPATCH_FAILED, GmailSendDispatch
 from skyvern.forge.sdk.executor.run_liveness import (
+    block_outcome_authority,
     run_lease_final_write_blocked,
     run_lease_lost,
     run_lease_tasks_enabled,
@@ -1304,6 +1305,7 @@ class Block(BaseModel, abc.ABC):
                 executed_branch_result=executed_branch_result,
                 executed_branch_next_block=executed_branch_next_block,
                 error_codes=error_codes,
+                outcome_authority_for_run=block_outcome_authority,
             )
         return BlockResult(
             success=success,
@@ -2087,6 +2089,7 @@ class Block(BaseModel, abc.ABC):
                 organization_id=organization_id,
                 status=BlockStatus.failed,
                 error_codes=error_codes,
+                outcome_authority_for_run=block_outcome_authority,
             )
         return replace(result, status=BlockStatus.failed, error_codes=error_codes, can_continue_after_failure=False)
 
@@ -8235,6 +8238,7 @@ async def wrapper({default_args}):
                 status=status,
                 failure_reason=failure_reason,
                 error_codes=error_codes,
+                outcome_authority_for_run=block_outcome_authority,
             )
         except Exception:
             LOG.warning(

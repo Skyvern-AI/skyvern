@@ -200,6 +200,24 @@ def run_write_authority(run_id: str) -> RunWriteAuthority | None:
     return RunWriteAuthority(owner_id(), entry.attempt_number, entry.acquired or entry.lost)
 
 
+class BlockOutcomeAuthority(NamedTuple):
+    """The registered execution that may write a run's block outcomes from this process."""
+
+    owner_id: str
+    attempt_number: int | None
+    lease_acquired: bool
+
+
+def block_outcome_authority(run_id: str) -> BlockOutcomeAuthority | None:
+    """Who may write this run's block outcomes, or None when such writes are not guarded."""
+    if not _enabled:
+        return None
+    entry = _registry.get(run_id)
+    if entry is None:
+        return None
+    return BlockOutcomeAuthority(owner_id(), entry.attempt_number, entry.acquired or entry.lost)
+
+
 def note_run_finalized(run_id: str) -> None:
     entry = _registry.get(run_id)
     if entry is not None:

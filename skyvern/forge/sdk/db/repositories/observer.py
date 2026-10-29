@@ -17,8 +17,10 @@ from skyvern.forge.sdk.db.exceptions import NotFoundError
 
 if TYPE_CHECKING:
     from skyvern.forge.sdk.db.base_alchemy_db import _SessionFactory
+    from skyvern.forge.sdk.executor.run_liveness import BlockOutcomeAuthority
 
 from skyvern.forge.sdk.db.models import (
+    RunExecutionLeaseModel,
     TaskV2Model,
     ThoughtModel,
     WorkflowRunBlockModel,
@@ -42,6 +44,16 @@ from skyvern.schemas.runs import ProxyLocationInput, RunEngine, ScriptRunRespons
 from skyvern.schemas.workflows import BlockStatus, BlockType
 
 LOG = structlog.get_logger()
+
+
+def _lease_authorizes_block(lease_row: Any, expected_owner: str, block_attempt_number: int | None) -> bool:
+    # Attempt identity: an unset attempt on either side is attempt 1, so a same-process successor attempt's lease
+    # cannot authorize the earlier attempt's row.
+    return (
+        lease_row is not None
+        and lease_row.owner_id == expected_owner
+        and (lease_row.attempt_number or 1) == (block_attempt_number or 1)
+    )
 
 
 class ObserverRepository(BaseRepository):
@@ -599,6 +611,7 @@ class ObserverRepository(BaseRepository):
         executed_branch_expression: str | None = None,
         executed_branch_result: bool | None = None,
         executed_branch_next_block: str | None = None,
+        outcome_authority_for_run: Callable[[str], BlockOutcomeAuthority | None] | None = None,
     ) -> WorkflowRunBlock:
         # Read before truncation: the jsonb storage guard strips downloaded_files from
         # oversized payloads, which would zero out an otherwise-real count.
@@ -608,14 +621,63 @@ class ObserverRepository(BaseRepository):
             context={"workflow_run_block_id": workflow_run_block_id},
         )
         async with self.Session() as session:
-            workflow_run_block = (
-                await session.scalars(
-                    select(WorkflowRunBlockModel)
-                    .filter_by(workflow_run_block_id=workflow_run_block_id)
-                    .filter_by(organization_id=organization_id)
+            block_query = (
+                select(WorkflowRunBlockModel)
+                .filter_by(workflow_run_block_id=workflow_run_block_id)
+                .filter_by(organization_id=organization_id)
+            )
+            expected_owner: str | None = None
+            attempt_superseded = False
+            lease_row = None
+            target = None
+            if outcome_authority_for_run is not None:
+                target = (
+                    await session.execute(
+                        select(WorkflowRunBlockModel.workflow_run_id, WorkflowRunBlockModel.attempt_number)
+                        .filter_by(workflow_run_block_id=workflow_run_block_id)
+                        .filter_by(organization_id=organization_id)
+                    )
+                ).one_or_none()
+                authority = outcome_authority_for_run(target.workflow_run_id) if target is not None else None
+                if authority is not None:
+                    # A row belongs to one attempt; a registration for another attempt (even one still acquiring
+                    # its lease) is a successor, so the older row is fenced off.
+                    attempt_superseded = (authority.attempt_number or 1) != (target.attempt_number or 1)
+                    if not attempt_superseded and authority.lease_acquired:
+                        expected_owner = authority.owner_id
+                        # Lease row first, then block row: a reaper claim (lease UPDATE) waits for this write to
+                        # commit, and a later cleanup cascade waits on the block row and then skips the final status.
+                        lease_row = (
+                            await session.execute(
+                                select(RunExecutionLeaseModel.owner_id, RunExecutionLeaseModel.attempt_number)
+                                .where(RunExecutionLeaseModel.run_id == target.workflow_run_id)
+                                .with_for_update(read=True)
+                            )
+                        ).one_or_none()
+                        block_query = block_query.with_for_update()
+            workflow_run_block = (await session.scalars(block_query)).first()
+            if outcome_authority_for_run is not None and target is not None:
+                # Re-resolve after the lock waits with no await before the commit's flush: another attempt may have
+                # registered while this write waited, before its lease acquisition reached the row.
+                current = outcome_authority_for_run(target.workflow_run_id)
+                attempt_superseded = attempt_superseded or (
+                    current is not None and (current.attempt_number or 1) != (target.attempt_number or 1)
                 )
-            ).first()
-            if workflow_run_block:
+            refused = workflow_run_block is not None and (
+                attempt_superseded
+                or (
+                    expected_owner is not None
+                    and not _lease_authorizes_block(lease_row, expected_owner, workflow_run_block.attempt_number)
+                )
+            )
+            if refused and workflow_run_block is not None:
+                LOG.info(
+                    "Refused a block outcome write from an execution that no longer owns the run",
+                    workflow_run_block_id=workflow_run_block_id,
+                    workflow_run_id=workflow_run_block.workflow_run_id,
+                    block_attempt_number=workflow_run_block.attempt_number,
+                )
+            elif workflow_run_block:
                 if status:
                     workflow_run_block.status = status
                 if output:
