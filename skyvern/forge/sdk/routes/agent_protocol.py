@@ -5,13 +5,12 @@ import json
 import random
 import re
 import time
-import unicodedata
 from collections.abc import AsyncIterator, Sequence
 from dataclasses import asdict, dataclass
 from datetime import UTC, datetime, timedelta
 from enum import Enum
 from typing import Annotated, Any
-from urllib.parse import parse_qs, quote, urlparse
+from urllib.parse import parse_qs, urlparse
 
 import orjson
 import structlog
@@ -261,6 +260,7 @@ from skyvern.services import (
     workflow_service,
 )
 from skyvern.services.pdf_import_service import pdf_import_service
+from skyvern.utils.content_disposition import build_attachment_disposition
 from skyvern.utils.organization_slug import is_org_slug_unique_violation
 from skyvern.utils.url_validators import validate_webhook_url
 from skyvern.utils.yaml_loader import format_yaml_error, safe_load_no_dates
@@ -1278,8 +1278,8 @@ async def create_workflow_from_prompt(
     return workflow.model_dump(by_alias=True)
 
 
-async def _validate_file_size(file: UploadFile) -> UploadFile:
-    return await uploaded_file_service.validate_file_size(
+async def _validate_upload(file: UploadFile) -> UploadFile:
+    return await uploaded_file_service.validate_upload(
         file,
         max_size_bytes=app.SETTINGS_MANAGER.MAX_UPLOAD_FILE_SIZE,
     )
@@ -1307,6 +1307,7 @@ async def _validate_file_size(file: UploadFile) -> UploadFile:
     responses={
         200: {"description": "Successfully imported workflow from PDF"},
         400: {"description": "Invalid PDF file or no content found"},
+        415: {"description": "File content is not a PDF"},
         422: {"description": "Failed to convert SOP to workflow"},
         500: {"description": "Internal server error during processing"},
     },
@@ -1318,7 +1319,7 @@ async def _validate_file_size(file: UploadFile) -> UploadFile:
 )
 async def import_workflow_from_pdf(
     background_tasks: BackgroundTasks,
-    file: UploadFile = Depends(_validate_file_size),
+    file: UploadFile = Depends(_validate_upload),
     folder_id: str | None = Query(None, description="Optional folder ID to assign the imported workflow to"),
     current_org: Organization = Depends(org_auth_service.get_current_org),
     user_id: str | None = Depends(org_auth_service.get_current_user_id_or_none),
@@ -3420,64 +3421,6 @@ _VIDEO_CONTENT_TYPES_BY_EXTENSION = {
 }
 
 
-def _sanitize_header_filename(name: str) -> str:
-    """Strip characters that would break or inject into a Content-Disposition header.
-
-    The artifact URI basename is derived from a user-controlled S3 key. Rejects:
-
-    - C0 (<0x20), DEL (0x7F), C1 (0x80-0x9F) — RFC 7230 violations.
-    - ``"`` and ``\\`` — would terminate or escape the quoted value.
-    - Unicode *format* (Cf) and *separator-line/paragraph* (Zl/Zp) chars —
-      includes bidi overrides (U+202E), ZWSP (U+200B), ZWNBSP (U+FEFF);
-      these enable filename spoofing in the browser download UI.
-    """
-    cleaned = []
-    for ch in name:
-        code = ord(ch)
-        if code < 0x20 or code == 0x7F or 0x80 <= code <= 0x9F:
-            continue
-        if ch in ('"', "\\"):
-            continue
-        if unicodedata.category(ch) in {"Cf", "Zl", "Zp"}:
-            continue
-        cleaned.append(ch)
-    return "".join(cleaned) or "download"
-
-
-def _ascii_fallback_filename(name: str) -> str:
-    """Best-effort ASCII form of ``name`` for the ``filename=`` parameter.
-
-    NFKD-normalizes and drops combining marks first so accented Latin
-    characters survive as their base letters (``fïlè.pdf`` → ``file.pdf``)
-    instead of being stripped entirely. The RFC 5987 ``filename*=UTF-8''...``
-    form still carries the full name for modern clients.
-
-    If the ASCII stem ends up empty (e.g. pure CJK or emoji names),
-    prepend ``download`` so legacy clients don't save a bare ``.pdf``
-    hidden file.
-    """
-    normalized = unicodedata.normalize("NFKD", name)
-    ascii_only = normalized.encode("ascii", "ignore").decode("ascii")
-    sanitized = _sanitize_header_filename(ascii_only)
-    stem, dot, ext = sanitized.rpartition(".")
-    if dot and not stem:
-        return f"download.{ext}"
-    return sanitized
-
-
-def _build_attachment_disposition(filename: str) -> str:
-    """Build a Content-Disposition header that survives non-ASCII filenames.
-
-    Emits both ``filename="<ascii>"`` (for legacy clients) and
-    ``filename*=UTF-8''<pct-encoded>`` (RFC 5987, for everything modern).
-    Ensures the header value is Latin-1 encodable so Starlette doesn't 500.
-    """
-    safe = _sanitize_header_filename(filename)
-    ascii_part = _ascii_fallback_filename(safe)
-    encoded = quote(safe, safe="")
-    return f"attachment; filename=\"{ascii_part}\"; filename*=UTF-8''{encoded}"
-
-
 def _artifact_response_config(artifact: Artifact) -> tuple[str, str]:
     """Return (media_type, Content-Disposition) for the artifact content response.
 
@@ -3495,7 +3438,7 @@ def _artifact_response_config(artifact: Artifact) -> tuple[str, str]:
     else:
         media_type = _ARTIFACT_CONTENT_TYPES.get(artifact.artifact_type, _ARTIFACT_CONTENT_TYPE_DEFAULT)
     if artifact.artifact_type == ArtifactType.DOWNLOAD:
-        return media_type, _build_attachment_disposition(raw_name)
+        return media_type, build_attachment_disposition(raw_name)
     return media_type, "inline"
 
 
@@ -6815,7 +6758,7 @@ async def get_api_keys(
 @legacy_base_router.post("/upload_file", include_in_schema=False)
 @legacy_base_router.post("/upload_file/", include_in_schema=False)
 async def upload_file(
-    file: UploadFile = Depends(_validate_file_size),
+    file: UploadFile = Depends(_validate_upload),
     retention_days: Annotated[
         int | None,
         Form(

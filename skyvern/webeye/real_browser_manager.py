@@ -4,11 +4,12 @@ import asyncio
 import functools
 import os
 import time
+import weakref
 from collections.abc import AsyncIterator, Callable, Iterable
 from contextlib import asynccontextmanager, suppress
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime
-from typing import TYPE_CHECKING, TypedDict
+from typing import TYPE_CHECKING, NoReturn, TypedDict
 
 import structlog
 
@@ -20,11 +21,20 @@ from skyvern.exceptions import (
     MissingBrowserStateForBrowserSession,
     MissingOrganizationForBrowserSession,
     SkyvernException,
+    WorkflowAttemptDispatchSuperseded,
 )
 from skyvern.forge import app
 from skyvern.forge.sdk.api.files import resolve_run_download_id
 from skyvern.forge.sdk.core import skyvern_context
 from skyvern.forge.sdk.db.id import WORKFLOW_RUN_PREFIX
+from skyvern.forge.sdk.executor.run_liveness import (
+    RunOwner,
+    is_displaced_owner,
+    is_newer_live_owner,
+    is_registered_owner,
+    is_superseded_owner,
+    run_owner,
+)
 from skyvern.forge.sdk.schemas.persistent_browser_sessions import (
     PersistentBrowserSession,
     is_external_cdp_session,
@@ -32,8 +42,12 @@ from skyvern.forge.sdk.schemas.persistent_browser_sessions import (
 )
 from skyvern.forge.sdk.schemas.tasks import Task
 from skyvern.forge.sdk.streaming.registries import (
+    _ClosingStreamState,
+    complete_owned_stream_teardown,
     complete_stream_teardown,
     mark_stream_closing,
+    pending_deferred_close_params,
+    release_stream_closing,
     set_deferred_close_params,
     stream_ref_active,
 )
@@ -53,7 +67,7 @@ from skyvern.webeye.browser_engine import (
     resolve_browser_engine,
 )
 from skyvern.webeye.browser_factory import BrowserContextFactory, rebind_download_dir
-from skyvern.webeye.browser_manager import BrowserCleanupResult, BrowserManager
+from skyvern.webeye.browser_manager import BrowserCleanupResult, BrowserManager, SupersededRunClaim
 from skyvern.webeye.browser_runtime_events import (
     AcquireMode,
     BrowserRuntimeLogContext,
@@ -449,6 +463,17 @@ class _EngineSelectionOwner:
         self.terminal = False
 
 
+@dataclass(eq=False)
+class _RunPublication:
+    browser_state: BrowserState
+    # The execution that published or last adopted this run's lookup entry; None when unknown.
+    owner: RunOwner | None
+    # This execution created the browser for the run alone, so it may close it, not only unpublish it.
+    exclusive: bool
+    # Task keys aliased to this browser for this run, so a shared browser's other run keeps its own aliases.
+    task_ids: set[str] = field(default_factory=set)
+
+
 @dataclass(frozen=True)
 class _PersistentSessionLease:
     session_id: str
@@ -471,6 +496,14 @@ class RealBrowserManager(BrowserManager):
         # The runnable identity accepted by begin_session, carried unchanged into teardown. Cleanup
         # reads this lease instead of reconstructing identity from Task/Workflow fields.
         self._persistent_session_leases: dict[str, _PersistentSessionLease] = {}
+        # The execution that published or last adopted each run's browser entry, and that stored each run's lease.
+        # A superseded execution may dispose of only what it still owns here; an unknown owner disposes nothing.
+        self._run_publications: dict[str, _RunPublication] = {}
+        # Exclusive browsers a registered successor published over; only their own superseded owner claims them.
+        self._displaced_run_publications: dict[str, list[_RunPublication]] = {}
+        self._session_lease_owners: dict[str, tuple[_PersistentSessionLease, RunOwner | None]] = {}
+        # Browsers a superseded execution is closing, so an acquisition holding one across an await cannot republish it.
+        self._retired_browser_states: weakref.WeakSet[BrowserState] = weakref.WeakSet()
         # Runnables between begin_session and their lease, refcounted by runnable id. Occupancy is
         # published first and occupy does not extend the session's timeout, so without this a
         # reused-but-expired session is unprotected for the whole attach. Refcounts keep overlapping
@@ -541,6 +574,9 @@ class RealBrowserManager(BrowserManager):
         if lease is not None and self._persistent_session_leases.get(run_id) is lease:
             self._persistent_session_leases.pop(run_id, None)
             self._released_session_ids.discard(lease.session_id)
+        lease_owner = self._session_lease_owners.get(run_id)
+        if lease_owner is not None and lease_owner[0] is lease:
+            del self._session_lease_owners[run_id]
 
     @asynccontextmanager
     async def acquiring_session_runnable(self, runnable_id: str | None) -> AsyncIterator[None]:
@@ -560,7 +596,12 @@ class RealBrowserManager(BrowserManager):
                     acquiring_runnables.pop(runnable_id, None)
 
     def _store_session_lease(self, run_id: str, lease: _PersistentSessionLease) -> None:
+        owner = run_owner(run_id)
+        # A superseded execution resuming from acquisition keeps its successor's lease; its publication is rejected.
+        if is_superseded_owner(run_id, owner) or is_displaced_owner(owner):
+            return
         self._persistent_session_leases[run_id] = lease
+        self._session_lease_owners[run_id] = (lease, owner)
         self._released_session_ids.discard(lease.session_id)
         self._start_session_activity_renewal()
 
@@ -687,8 +728,18 @@ class RealBrowserManager(BrowserManager):
         stream_key = _resolve_stream_key(workflow_run_id=workflow_run_id, task_id=task_id)
         if not stream_key or not organization_id:
             return
+        obsolete: CDPFramePublisher | None = None
+        run_key = workflow_run_id or task_id or ""
         async with self._publisher_lock:
-            if stream_key in self._frame_publishers:
+            existing = self._frame_publishers.get(stream_key)
+            current_page = self.pages.get(run_key)
+            was_current = current_page is browser_state
+            # A run already mapped to another browser is not this caller's to publish, even before any publisher
+            # exists. Only the run's current browser may replace a publisher left for a different browser; a repeated
+            # or untracked start leaves the running publisher alone.
+            if current_page is not None and not was_current:
+                return
+            if existing is not None and (not was_current or existing.browser_state is browser_state):
                 return
             try:
                 publisher = CDPFramePublisher(
@@ -697,7 +748,13 @@ class RealBrowserManager(BrowserManager):
                     organization_id=organization_id,
                 )
                 await publisher.start()
-                self._frame_publishers[stream_key] = publisher
+                if was_current and self.pages.get(run_key) is not browser_state:
+                    # The run moved to another browser during start, so this publisher lost and is never registered.
+                    obsolete = publisher
+                else:
+                    if self._frame_publishers.get(stream_key) is existing:
+                        obsolete = existing
+                    self._frame_publishers[stream_key] = publisher
             except Exception:
                 LOG.warning(
                     "Failed to start CDP frame publisher; livestream may be unavailable",
@@ -717,9 +774,9 @@ class RealBrowserManager(BrowserManager):
                 # the lock — it awaits the task's exit and must not block
                 # other publishers from starting.
                 async with self._publisher_lock:
-                    pub = self._frame_publishers.pop(captured_stream_key, None)
-                if pub is None:
-                    return
+                    if self._frame_publishers.get(captured_stream_key) is not publisher:
+                        return
+                    pub = self._frame_publishers.pop(captured_stream_key)
                 try:
                     await pub.stop()
                 except Exception:
@@ -729,21 +786,29 @@ class RealBrowserManager(BrowserManager):
                         exc_info=True,
                     )
 
-            browser_state.add_on_close(_on_browser_state_close)
+            if obsolete is not publisher:
+                browser_state.add_on_close(_on_browser_state_close)
+        if obsolete is not None:
+            try:
+                await obsolete.stop()
+            except Exception:
+                LOG.debug("Obsolete CDP frame publisher stop raised; ignored", stream_key=stream_key, exc_info=True)
 
     async def _stop_frame_publisher(
         self,
         *,
         workflow_run_id: str | None = None,
         task_id: str | None = None,
+        browser_state: BrowserState | None = None,
     ) -> None:
-        """Best-effort: stop the publisher matching this entity. Idempotent."""
+        """Best-effort: stop the publisher matching this entity, and only one for ``browser_state`` when given."""
         stream_key = _resolve_stream_key(workflow_run_id=workflow_run_id, task_id=task_id)
         if not stream_key:
             return
-        publisher = self._frame_publishers.pop(stream_key, None)
-        if publisher is None:
+        publisher = self._frame_publishers.get(stream_key)
+        if publisher is None or (browser_state is not None and publisher.browser_state is not browser_state):
             return
+        del self._frame_publishers[stream_key]
         try:
             await publisher.stop()
         except Exception:
@@ -1041,10 +1106,281 @@ class RealBrowserManager(BrowserManager):
             return state
 
     def evict_page(self, page_id: str) -> None:
-        self.pages.pop(page_id, None)
+        browser_state = self.pages.pop(page_id, None)
+        if browser_state is not None:
+            self._forget_run_publication(page_id, browser_state)
+
+    def _publish_run_browser(self, workflow_run_id: str, browser_state: BrowserState, *, exclusive: bool) -> bool:
+        # A superseded execution never publishes over the registration that replaced it, even after that one exits.
+        owner = run_owner(workflow_run_id)
+        if is_superseded_owner(workflow_run_id, owner) or is_displaced_owner(owner):
+            return False
+        previous = self._run_publications.get(workflow_run_id)
+        if (
+            previous is not None
+            and previous.exclusive
+            and previous.browser_state is not browser_state
+            and previous.owner is not None
+            and not previous.owner.is_same(owner)
+        ):
+            self._displaced_run_publications.setdefault(workflow_run_id, []).append(previous)
+        self.pages[workflow_run_id] = browser_state
+        task_ids = previous.task_ids if previous is not None and previous.browser_state is browser_state else set()
+        self._run_publications[workflow_run_id] = _RunPublication(browser_state, owner, exclusive, task_ids)
+        return True
+
+    def _alias_task(self, task_id: str, workflow_run_id: str | None, browser_state: BrowserState) -> None:
+        self.pages[task_id] = browser_state
+        publication = self._run_publications.get(workflow_run_id) if workflow_run_id else None
+        if publication is not None and publication.browser_state is browser_state:
+            publication.task_ids.add(task_id)
+
+    def _session_publication_guard(self, workflow_run_id: str | None) -> Callable[[], bool] | None:
+        # The same fence _publish_run_browser applies, evaluated by the session cache at its own mutation.
+        if not workflow_run_id:
+            return None
+        owner = run_owner(workflow_run_id)
+        return lambda: not (is_superseded_owner(workflow_run_id, owner) or is_displaced_owner(owner))
+
+    async def _reject_stale_session_browser(self, workflow_run_id: str, browser_state: BrowserState) -> NoReturn:
+        # The session's remote browser, cookies and occupancy now serve the successor; only this local driver goes.
+        # Nothing else owns this never-published wrapper, so its bounded detach finishes before a cancel propagates.
+        detach = asyncio.ensure_future(browser_state.detach_remote_driver())
+        cancelled = False
+        while not detach.done():
+            try:
+                await asyncio.wait({detach})
+            except asyncio.CancelledError:
+                cancelled = True
+        if not detach.cancelled() and (error := detach.exception()) is not None:
+            LOG.warning(
+                "Failed to detach a superseded session browser", workflow_run_id=workflow_run_id, exc_info=error
+            )
+        if cancelled:
+            raise asyncio.CancelledError
+        await self._reject_superseded_publication(workflow_run_id, browser_state, exclusive=False)
+
+    async def _reject_superseded_publication(
+        self, workflow_run_id: str, browser_state: BrowserState, *, exclusive: bool
+    ) -> NoReturn:
+        if exclusive:
+            await self._close_unpublished(browser_state)
+        owner = run_owner(workflow_run_id)
+        attempt_number = owner.registration.attempt_number if owner is not None else None
+        raise WorkflowAttemptDispatchSuperseded(workflow_run_id, attempt_number or 1)
+
+    async def _close_unpublished(self, browser_state: BrowserState) -> None:
+        # Nothing else owns an unpublished browser, so its close finishes before a cancel propagates.
+        close = asyncio.ensure_future(
+            browser_state.close(close_browser_on_completion=True, persist_session_state=False)
+        )
+        cancelled = False
+        while not close.done():
+            try:
+                await asyncio.wait({close})
+            except asyncio.CancelledError:
+                cancelled = True
+        if cancelled:
+            raise asyncio.CancelledError
+        close.result()
+
+    def _select_displaced_for_close(self, run_key: str, entries: Iterable[_RunPublication]) -> list[BrowserState]:
+        # Drops only the displaced owner's own aliases; a browser another live run still uses is left to that run.
+        selected: list[BrowserState] = []
+        for entry in entries:
+            state = entry.browser_state
+            for task_id in entry.task_ids:
+                if self.pages.get(task_id) is state:
+                    del self.pages[task_id]
+            if self._shared_with_another_workflow_run(run_key, state) or is_external_browser_state(state):
+                continue
+            self._retired_browser_states.add(state)
+            selected.append(state)
+        return selected
+
+    async def _close_displaced(self, workflow_run_id: str, browser_states: Iterable[BrowserState]) -> None:
+        for displaced_state in browser_states:
+            try:
+                await displaced_state.close(close_browser_on_completion=True, persist_session_state=False)
+            except Exception:
+                LOG.warning(
+                    "Failed to close a displaced superseded browser", workflow_run_id=workflow_run_id, exc_info=True
+                )
+
+    def _forget_run_publication(self, run_id: str, browser_state: BrowserState) -> None:
+        publication = self._run_publications.get(run_id)
+        if publication is not None and publication.browser_state is browser_state:
+            del self._run_publications[run_id]
+
+    def inherit_deferred_session_lease(
+        self,
+        workflow_run_id: str,
+        *,
+        session_id: str,
+        organization_id: str,
+        runnable_id: str,
+        runnable_generation_id: str | None,
+        browser_state: BrowserState,
+    ) -> None:
+        # A lease the run already holds is newer than the deferral's and stays.
+        if workflow_run_id in self._persistent_session_leases:
+            return
+        lease = _PersistentSessionLease(
+            session_id=session_id,
+            organization_id=organization_id,
+            runnable_id=runnable_id,
+            browser_state=browser_state,
+            runnable_generation_id=runnable_generation_id,
+        )
+        self._store_session_lease(workflow_run_id, lease)
+        if self._persistent_session_leases.get(workflow_run_id) is not lease:
+            return
+        # Owned by the registered execution that already adopted this browser, never by the finalizer's context; a
+        # successor that has not looked it up yet takes the lease over on its adoption.
+        publication = self._run_publications.get(workflow_run_id)
+        adopter = (
+            publication.owner
+            if publication is not None
+            and publication.browser_state is browser_state
+            and is_registered_owner(workflow_run_id, publication.owner)
+            else None
+        )
+        self._session_lease_owners[workflow_run_id] = (lease, adopter)
+
+    def is_held_by_newer_adopter(self, workflow_run_id: str, owner: RunOwner, browser_state: BrowserState) -> bool:
+        # A rebind revoking the adopter's authority leaves its disposal duty: its cleanup claims this record by identity.
+        publication = self._run_publications.get(workflow_run_id)
+        return (
+            publication is not None
+            and publication.browser_state is browser_state
+            and is_newer_live_owner(workflow_run_id, owner, publication.owner)
+        )
+
+    def _adopt_run_resources(self, workflow_run_id: str, browser_state: BrowserState) -> None:
+        # Runs before the adopter's first await, so a superseded execution's claim either precedes it or loses.
+        # A superseded execution touching the cache must not take ownership back from its registered successor.
+        owner = run_owner(workflow_run_id)
+        if not is_registered_owner(workflow_run_id, owner):
+            return
+        publication = self._run_publications.get(workflow_run_id)
+        if publication is not None and publication.browser_state is browser_state:
+            publication.owner = owner
+        lease_owner = self._session_lease_owners.get(workflow_run_id)
+        if lease_owner is not None and lease_owner[0].browser_state is browser_state:
+            self._session_lease_owners[workflow_run_id] = (lease_owner[0], owner)
+        # A deferred close still holds this browser's session lease: the adopter takes it now, before its own cleanup
+        # can re-arm that deferral without it.
+        params = pending_deferred_close_params(workflow_run_id)
+        if (
+            params is not None
+            and params.expected_browser_state is browser_state
+            and params.browser_session_id is not None
+            and params.organization_id is not None
+            and params.expected_runnable_id is not None
+        ):
+            self.inherit_deferred_session_lease(
+                workflow_run_id,
+                session_id=params.browser_session_id,
+                organization_id=params.organization_id,
+                runnable_id=params.expected_runnable_id,
+                runnable_generation_id=params.expected_runnable_generation_id,
+                browser_state=browser_state,
+            )
+
+    def claim_superseded_run_resources(self, workflow_run_id: str, owner: RunOwner) -> SupersededRunClaim:
+        lease_owner = self._session_lease_owners.get(workflow_run_id)
+        if lease_owner is not None and owner.is_same(lease_owner[1]):
+            self._discard_session_lease(workflow_run_id, lease_owner[0])
+        # A successor registered in this process keeps using the run's pinned engine.
+        engine_owner = self._engine_owners.get(workflow_run_id) if is_registered_owner(workflow_run_id, owner) else None
+        displaced = self._displaced_run_publications.get(workflow_run_id, [])
+        remaining = [entry for entry in displaced if not owner.is_same(entry.owner)]
+        if remaining:
+            self._displaced_run_publications[workflow_run_id] = remaining
+        else:
+            self._displaced_run_publications.pop(workflow_run_id, None)
+        displaced_states = self._select_displaced_for_close(
+            workflow_run_id, [entry for entry in displaced if owner.is_same(entry.owner)]
+        )
+        publication = self._run_publications.get(workflow_run_id)
+        if publication is None or not owner.is_same(publication.owner):
+            return SupersededRunClaim(
+                owner=owner, engine_owner=engine_owner, displaced_browser_states=tuple(displaced_states)
+            )
+        del self._run_publications[workflow_run_id]
+        browser_state = publication.browser_state
+        if self.pages.get(workflow_run_id) is not browser_state:
+            return SupersededRunClaim(
+                owner=owner, engine_owner=engine_owner, displaced_browser_states=tuple(displaced_states)
+            )
+        shared = self._shared_with_another_workflow_run(workflow_run_id, browser_state)
+        # Drop this run's own entries; another live run's entries for a shared browser stay.
+        own_keys = (
+            [
+                workflow_run_id,
+                *(task_id for task_id in publication.task_ids if self.pages.get(task_id) is browser_state),
+            ]
+            if shared
+            else [
+                page_id
+                for page_id, state in self.pages.items()
+                if state is browser_state
+                and (page_id == workflow_run_id or not page_id.startswith(_WORKFLOW_RUN_KEY_PREFIX))
+            ]
+        )
+        for page_id in own_keys:
+            del self.pages[page_id]
+        close = publication.exclusive and not shared and not is_external_browser_state(browser_state)
+        if close:
+            self._retired_browser_states.add(browser_state)
+        return SupersededRunClaim(
+            owner=owner,
+            browser_state=browser_state,
+            close=close,
+            engine_owner=engine_owner,
+            displaced_browser_states=tuple(displaced_states),
+        )
+
+    async def release_superseded_run_resources(self, workflow_run_id: str, claim: SupersededRunClaim) -> bool:
+        # A successor registered in this process after the claim keeps using the run's pinned engine.
+        if (
+            claim.engine_owner is not None
+            and self._engine_owners.get(workflow_run_id) is claim.engine_owner
+            and not is_superseded_owner(workflow_run_id, claim.owner)
+        ):
+            await self._drop_engine_owner(workflow_run_id)
+        await self._close_displaced(workflow_run_id, claim.displaced_browser_states)
+        browser_state = claim.browser_state
+        # The displaced closes skip on-close callbacks, so their publisher is retired here like the claimed state's.
+        retiring = [*claim.displaced_browser_states, *([browser_state] if browser_state is not None else [])]
+        stream_key = _resolve_stream_key(workflow_run_id=workflow_run_id, task_id=None)
+        async with self._publisher_lock:
+            publisher = self._frame_publishers.get(stream_key) if stream_key else None
+            # The claim removed this execution's record, so a record for the same state is a successor's adoption.
+            successor = self._run_publications.get(workflow_run_id)
+            if (
+                publisher is not None
+                and stream_key is not None
+                and any(publisher.browser_state is state for state in retiring)
+                and not (successor is not None and successor.browser_state is publisher.browser_state)
+            ):
+                del self._frame_publishers[stream_key]
+            else:
+                publisher = None
+        if publisher is not None:
+            try:
+                await publisher.stop()
+            except Exception:
+                LOG.debug("CDP frame publisher stop raised; ignored", stream_key=stream_key, exc_info=True)
+        if browser_state is None or not claim.close:
+            return False
+        await browser_state.close(close_browser_on_completion=True, persist_session_state=False)
+        return True
 
     def get_for_task(self, task_id: str, workflow_run_id: str | None = None) -> BrowserState | None:
         if task_id in self.pages:
+            if workflow_run_id:
+                self._adopt_run_resources(workflow_run_id, self.pages[task_id])
             return self.pages[task_id]
 
         if workflow_run_id and workflow_run_id in self.pages:
@@ -1054,7 +1390,8 @@ class RealBrowserManager(BrowserManager):
                 task_id=task_id,
                 workflow_run_id=workflow_run_id,
             )
-            self.pages[task_id] = self.pages[workflow_run_id]
+            self._alias_task(task_id, workflow_run_id, self.pages[workflow_run_id])
+            self._adopt_run_resources(workflow_run_id, self.pages[task_id])
             return self.pages[task_id]
 
         return None
@@ -1089,6 +1426,7 @@ class RealBrowserManager(BrowserManager):
                 for stale_key in (task.task_id, task.workflow_run_id):
                     if stale_key and self.pages.get(stale_key) is browser_state:
                         self.pages.pop(stale_key, None)
+                        self._forget_run_publication(stale_key, browser_state)
                 browser_state = None
             else:
                 return await _on_browser_state_acquired(
@@ -1197,7 +1535,9 @@ class RealBrowserManager(BrowserManager):
 
         proxy_location = task.proxy_location
         extra_http_headers = task.extra_http_headers
+        created_exclusive_browser = False
         if browser_state is None:
+            created_exclusive_browser = not browser_session_id and not task.browser_address
             LOG.info("Creating browser state for task", task_id=task.task_id)
             session_timezone_id: str | None = None
             if browser_session_id and task.organization_id:
@@ -1230,15 +1570,22 @@ class RealBrowserManager(BrowserManager):
             )
 
             if browser_session_id:
-                await app.PERSISTENT_SESSIONS_MANAGER.set_browser_state(
+                published = await app.PERSISTENT_SESSIONS_MANAGER.set_browser_state(
                     browser_session_id,
                     browser_state,
                     organization_id=task.organization_id,
+                    may_publish=self._session_publication_guard(task.workflow_run_id),
                 )
+                if not published and task.workflow_run_id:
+                    await self._reject_stale_session_browser(task.workflow_run_id, browser_state)
 
-        self.pages[task.task_id] = browser_state
-        if task.workflow_run_id:
-            self.pages[task.workflow_run_id] = browser_state
+        if task.workflow_run_id and not self._publish_run_browser(
+            task.workflow_run_id, browser_state, exclusive=created_exclusive_browser
+        ):
+            await self._reject_superseded_publication(
+                task.workflow_run_id, browser_state, exclusive=created_exclusive_browser
+            )
+        self._alias_task(task.task_id, task.workflow_run_id, browser_state)
 
         # The URL here is only used when creating a new page, and not when using an existing page.
         # This will make sure browser_state.page is not None.
@@ -1334,9 +1681,11 @@ class RealBrowserManager(BrowserManager):
                 )
                 if self.pages.get(workflow_run_id) is browser_state:
                     self.pages.pop(workflow_run_id, None)
+                    self._forget_run_publication(workflow_run_id, browser_state)
                 browser_state = None
             else:
                 LOG.debug("Returning cached browser state for workflow run", workflow_run_id=workflow_run_id)
+                self._adopt_run_resources(workflow_run_id, browser_state)
                 return await _on_browser_state_acquired(
                     browser_state,
                     workflow_run_id,
@@ -1390,9 +1739,10 @@ class RealBrowserManager(BrowserManager):
                     working_page = await browser_state.get_working_page()
                 if browser_state.active_run_owner is not None:
                     raise_if_browser_connection_lost(browser_state, workflow_run_id=workflow_run_id)
-                if working_page is not None:
+                if working_page is not None and browser_state not in self._retired_browser_states:
                     # always keep the browser state for the workflow run and the parent workflow run synced
-                    self.pages[workflow_run_id] = browser_state
+                    if not self._publish_run_browser(workflow_run_id, browser_state, exclusive=False):
+                        await self._reject_superseded_publication(workflow_run_id, browser_state, exclusive=False)
                     if parent_workflow_run_id:
                         self.pages[parent_workflow_run_id] = browser_state
                     # The workflow-run streaming endpoint reads ``{workflow_run_id}.png``, so the
@@ -1418,6 +1768,7 @@ class RealBrowserManager(BrowserManager):
                     except MissingBrowserState:
                         if self.pages.get(workflow_run_id) is browser_state:
                             self.pages.pop(workflow_run_id, None)
+                            self._forget_run_publication(workflow_run_id, browser_state)
                         raise
                 # The inherited state is genuinely torn down (disconnected and page-less).
                 # Drop the stale entry and fall through to create a fresh browser for this run.
@@ -1429,6 +1780,7 @@ class RealBrowserManager(BrowserManager):
                 for stale_key in (workflow_run_id, parent_workflow_run_id):
                     if stale_key and self.pages.get(stale_key) is browser_state:
                         self.pages.pop(stale_key, None)
+                        self._forget_run_publication(stale_key, browser_state)
                 browser_state = None
 
         session_backed_state = False
@@ -1492,7 +1844,8 @@ class RealBrowserManager(BrowserManager):
                 # failure here raises past the registry write at the end of this method, and every
                 # later block of the run would then find an empty registry and report a missing
                 # browser instead of the navigation failure.
-                self.pages[workflow_run_id] = browser_state
+                if not self._publish_run_browser(workflow_run_id, browser_state, exclusive=False):
+                    await self._reject_superseded_publication(workflow_run_id, browser_state, exclusive=False)
                 page = await browser_state.get_working_page()
                 if page:
                     if url and navigate:
@@ -1525,6 +1878,7 @@ class RealBrowserManager(BrowserManager):
                             # the run once the reconnect below replaces or fails to replace it.
                             if self.pages.get(workflow_run_id) is browser_state:
                                 self.pages.pop(workflow_run_id, None)
+                                self._forget_run_publication(workflow_run_id, browser_state)
                             browser_state = await app.PERSISTENT_SESSIONS_MANAGER.get_browser_state(
                                 browser_session_id,
                                 organization_id=workflow_run.organization_id,
@@ -1539,7 +1893,10 @@ class RealBrowserManager(BrowserManager):
                             )
                             if browser_state is None:
                                 raise
-                            self.pages[workflow_run_id] = browser_state
+                            if not self._publish_run_browser(workflow_run_id, browser_state, exclusive=False):
+                                await self._reject_superseded_publication(
+                                    workflow_run_id, browser_state, exclusive=False
+                                )
                             _retain_run_dialog_answers(
                                 browser_state,
                                 workflow_run_id,
@@ -1581,8 +1938,10 @@ class RealBrowserManager(BrowserManager):
         proxy_location = workflow_run.proxy_location
         extra_http_headers = workflow_run.extra_http_headers
         launched_session: PersistentBrowserSession | None = None
+        created_exclusive_browser = False
         profile_read_only = False
         if browser_state is None:
+            created_exclusive_browser = not browser_session_id and not workflow_run.browser_address
             LOG.info(
                 "Creating browser state for workflow run",
                 sampling=True,
@@ -1625,11 +1984,14 @@ class RealBrowserManager(BrowserManager):
             )
 
             if browser_session_id:
-                await app.PERSISTENT_SESSIONS_MANAGER.set_browser_state(
+                published = await app.PERSISTENT_SESSIONS_MANAGER.set_browser_state(
                     browser_session_id,
                     browser_state,
                     organization_id=workflow_run.organization_id,
+                    may_publish=self._session_publication_guard(workflow_run_id),
                 )
+                if not published:
+                    await self._reject_stale_session_browser(workflow_run_id, browser_state)
         elif session_backed_state and browser_session_id and browser_profile_id:
             await _record_session_profile_receipt(
                 browser_state,
@@ -1638,7 +2000,10 @@ class RealBrowserManager(BrowserManager):
                 browser_profile_id=browser_profile_id,
             )
 
-        self.pages[workflow_run_id] = browser_state
+        if not self._publish_run_browser(workflow_run_id, browser_state, exclusive=created_exclusive_browser):
+            await self._reject_superseded_publication(
+                workflow_run_id, browser_state, exclusive=created_exclusive_browser
+            )
         # Only sync the parent's entry when the child is sharing the parent's
         # browser.  When an explicit browser_session_id is provided the child
         # has its own browser, and overwriting the parent's entry would break
@@ -1697,6 +2062,8 @@ class RealBrowserManager(BrowserManager):
             return self.pages[parent_workflow_run_id]
 
         if workflow_run_id in self.pages:
+            # Any lookup by the run's registered execution takes the entry over, so a superseded one cannot close it.
+            self._adopt_run_resources(workflow_run_id, self.pages[workflow_run_id])
             return self.pages[workflow_run_id]
 
         return None
@@ -1889,6 +2256,9 @@ class RealBrowserManager(BrowserManager):
         for browser_state in self.pages.values():
             await browser_state.close()
         self.pages = dict()
+        self._run_publications.clear()
+        self._displaced_run_publications.clear()
+        self._session_lease_owners.clear()
         for run_key in list(self._engine_owners):
             await self._drop_engine_owner(run_key)
         LOG.info("BrowserManger is closed")
@@ -1996,8 +2366,44 @@ class RealBrowserManager(BrowserManager):
         browser_session_id: str | None = None,
         organization_id: str | None = None,
         child_workflow_run_ids: list[str] | None = None,
+        stream_tombstone: _ClosingStreamState | None = None,
     ) -> BrowserCleanupResult:
         LOG.info("Cleaning up for workflow run", sampling=True)
+        # Captured before any await. Once a successor registers here, the run's entries are its own, so this
+        # cleanup disposes of only what this execution still owns; each later step re-checks with no await between.
+        execution_owner = run_owner(workflow_run_id)
+
+        def superseded() -> bool:
+            return is_superseded_owner(workflow_run_id, execution_owner) or is_displaced_owner(execution_owner)
+
+        async def hand_over(recording_finalized: bool) -> BrowserCleanupResult:
+            # Only what this execution still owns is claimed, with no await; the successor's entries, task aliases
+            # and stream tombstone stay. The claimed teardown has no other owner, so it finishes before a cancel.
+            cancelled = False
+            if execution_owner is not None:
+                claim = self.claim_superseded_run_resources(workflow_run_id, execution_owner)
+                release = asyncio.ensure_future(self.release_superseded_run_resources(workflow_run_id, claim))
+                while not release.done():
+                    try:
+                        await asyncio.shield(release)
+                    except asyncio.CancelledError:
+                        cancelled = True
+                    except Exception:
+                        LOG.warning(
+                            "Failed to release a superseded run's browser during cleanup",
+                            workflow_run_id=workflow_run_id,
+                            exc_info=True,
+                        )
+            # The caller's own closing tombstone (never a successor's) stops blocking the successor's streams, also
+            # when a cancel arrived during the release above.
+            if stream_tombstone is not None:
+                release_stream_closing(workflow_run_id, stream_tombstone)
+            if cancelled:
+                raise asyncio.CancelledError
+            return BrowserCleanupResult(browser_state=None, recording_finalized=recording_finalized)
+
+        if superseded():
+            return await hand_over(False)
         # No await before the tombstone: a concurrent stream attach either increments first and is
         # observed below, or sees CLOSING. The tombstone also holds the session lease immediately,
         # before deferred-close parameters exist, until complete_stream_teardown releases it.
@@ -2005,12 +2411,24 @@ class RealBrowserManager(BrowserManager):
         clear_run_dialog_policies((workflow_run_id, *(child_workflow_run_ids or ())))
         browser_state_to_close = self.pages.get(workflow_run_id)
         session_lease = self._persistent_session_leases.get(workflow_run_id)
+        displaced_states: list[BrowserState] = []
+        for run_key in (workflow_run_id, *(child_workflow_run_ids or ())):
+            # The run's own record is retired below with its page entry, so a successor adopting meanwhile keeps it.
+            if run_key != workflow_run_id:
+                self._run_publications.pop(run_key, None)
+            displaced_states.extend(
+                self._select_displaced_for_close(run_key, self._displaced_run_publications.pop(run_key, ()))
+            )
+        # A displaced owner that never claimed (a denied retirement) leaves nothing once the run ends.
+        await self._close_displaced(workflow_run_id, displaced_states)
         recording_finalized = False
         finalization_attempted = False
 
         # Drop the run's pinned engine — the run is ending, so no further browser resource will be
         # created for it. Covers the run, its inherited children, and its tasks.
         for run_key in (workflow_run_id, *(child_workflow_run_ids or ()), *task_ids):
+            if run_key == workflow_run_id and superseded():
+                continue
             await self._drop_engine_owner(run_key)
 
         # Pop child workflow_run entries first — these are orphaned because child
@@ -2033,7 +2451,14 @@ class RealBrowserManager(BrowserManager):
         # Owners whose close was EFFECTIVE (not suppressed by cross-run sharing); only these are swept below.
         sweep_owner_ids: set[str] = set()
 
+        if superseded():
+            return await hand_over(recording_finalized)
         if browser_state_to_close:
+            if not streams_active:
+                # Unpublished before the awaits below, so a successor cannot adopt a browser this cleanup closes.
+                if self.pages.get(workflow_run_id) is browser_state_to_close:
+                    del self.pages[workflow_run_id]
+                self._forget_run_publication(workflow_run_id, browser_state_to_close)
             # If another workflow run still references this browser state (e.g. a
             # parent whose in-memory browser was shared via use_parent_browser_session),
             # skip closing the browser so the parent can continue using it.
@@ -2069,6 +2494,9 @@ class RealBrowserManager(BrowserManager):
                     browser_state_to_close.browser_context,
                     browser_state_to_close.browser_artifacts.browser_session_dir,
                 )
+                # The run's browser stays published while streams are attached, so a successor may have adopted it.
+                if superseded():
+                    return await hand_over(recording_finalized)
                 shared_after_cleanup = self._shared_with_another_workflow_run(workflow_run_id, browser_state_to_close)
                 deferred_close = close_browser_on_completion and not shared_after_cleanup
                 release_driver = False if (shared_after_cleanup or browser_session_id) else None
@@ -2082,6 +2510,8 @@ class RealBrowserManager(BrowserManager):
                         workflow_run_id,
                         deferred_close,
                         release_driver=release_driver,
+                        deferred_browser_state=browser_state_to_close,
+                        owner=execution_owner,
                     )
                 else:
                     streams_active = set_deferred_close_params(
@@ -2093,10 +2523,16 @@ class RealBrowserManager(BrowserManager):
                         expected_runnable_id=owner.runnable_id,
                         expected_runnable_generation_id=owner.runnable_generation_id,
                         expected_browser_state=owner.browser_state,
+                        deferred_browser_state=browser_state_to_close,
+                        owner=execution_owner,
                     )
                 if not streams_active:
                     effective_close = deferred_close
                     shared = shared_after_cleanup
+                    # The streams drained meanwhile, so the close is inline: unpublish before its awaits, as above.
+                    if self.pages.get(workflow_run_id) is browser_state_to_close:
+                        del self.pages[workflow_run_id]
+                    self._forget_run_publication(workflow_run_id, browser_state_to_close)
                 elif owner is not None:
                     # The tombstone now owns the immutable lease until its finalizer succeeds.
                     self._discard_session_lease(workflow_run_id, session_lease)
@@ -2115,7 +2551,7 @@ class RealBrowserManager(BrowserManager):
             else:
                 # Detach the publisher's CDP session before the Playwright context
                 # closes; otherwise the stale session can race the teardown.
-                await self._stop_frame_publisher(workflow_run_id=workflow_run_id)
+                await self._stop_frame_publisher(workflow_run_id=workflow_run_id, browser_state=browser_state_to_close)
                 close_succeeded = await browser_state_to_close.close(
                     close_browser_on_completion=effective_close,
                     release_driver=False if (shared or browser_session_id) else None,
@@ -2125,9 +2561,15 @@ class RealBrowserManager(BrowserManager):
                 if effective_close:
                     sweep_owner_ids.add(workflow_run_id)
 
-        if not streams_active:
+        # A deferred close keeps the page and its record published until the finalizer retires both, so a successor
+        # adopts the record or displaces this execution's exclusive browser into its own claim.
+        if not superseded() and not streams_active:
+            self._run_publications.pop(workflow_run_id, None)
             self.pages.pop(workflow_run_id, None)
         for task_id in task_ids:
+            # The task list is read by run id, so once superseded it may name a successor's tasks.
+            if superseded() and self.pages.get(task_id) is not browser_state_to_close:
+                continue
             task_browser_state = self.pages.pop(task_id, None)
             if task_browser_state is None or streams_active:
                 continue
@@ -2174,6 +2616,8 @@ class RealBrowserManager(BrowserManager):
         sweep_cancelled = False
         if not streams_active:
             for sweep_owner_id in sweep_owner_ids:
+                if sweep_owner_id == workflow_run_id and superseded():
+                    continue
                 try:
                     await stop_display_recorders_for_owner(sweep_owner_id)
                 except asyncio.CancelledError:
@@ -2182,7 +2626,8 @@ class RealBrowserManager(BrowserManager):
                     sweep_cancelled = True
 
         release_complete = True
-        if browser_session_id and not streams_active:
+        # A successor that adopted this run's session holds its lease now.
+        if browser_session_id and not streams_active and not superseded():
             if organization_id:
                 # Child runs skip their own cleanup, so a lease a nested run took would otherwise keep renewing.
                 for child_id in child_workflow_run_ids or ():
@@ -2208,7 +2653,10 @@ class RealBrowserManager(BrowserManager):
                 )
 
         if not streams_active and release_complete:
-            complete_stream_teardown(workflow_run_id)
+            if not superseded():
+                complete_stream_teardown(workflow_run_id)
+            elif stream_tombstone is not None:
+                complete_owned_stream_teardown(workflow_run_id, stream_tombstone)
 
         if sweep_cancelled:
             raise asyncio.CancelledError()

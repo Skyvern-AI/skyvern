@@ -1833,6 +1833,9 @@ class AgentFunction:
         """
         return None
 
+    async def is_mcp_oauth_token_signed_out(self, user_id: str, issued_at: float) -> bool:
+        return False
+
     def build_mcp_auth_db(self, database_string: str, *, debug_enabled: bool) -> Any:
         """Return the DB instance used by MCP auth middleware.
 

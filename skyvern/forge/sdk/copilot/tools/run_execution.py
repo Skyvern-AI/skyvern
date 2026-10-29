@@ -12,7 +12,7 @@ import tempfile
 import time
 import uuid
 from collections import defaultdict
-from collections.abc import Mapping, Sequence
+from collections.abc import Collection, Mapping, Sequence
 from dataclasses import dataclass
 from dataclasses import field as dataclass_field
 from dataclasses import replace
@@ -129,6 +129,7 @@ from skyvern.forge.sdk.copilot.context import (
     CopilotContext,
     CopilotTestInput,
     PageObstruction,
+    SkippedPrefixBlock,
     upsert_narrative_block_attempt,
 )
 from skyvern.forge.sdk.copilot.cost_telemetry import exclude_workflow_block_cost
@@ -4078,6 +4079,7 @@ async def _run_blocks_and_collect_debug(
     ctx.last_executed_block_labels = list(labels_to_execute)
     ctx.last_frontier_start_label = frontier_start_label
     ctx.last_run_blocks_block_ids = []
+    ctx.last_run_outcome_block_ids = []
     ctx.last_run_blocks_block_labels = []
     # Only a dispatched run sets this below; cleared here so a turn that bails before dispatch
     # cannot label its recorded failure with the previous run's proxy.
@@ -4962,6 +4964,16 @@ async def _run_blocks_and_collect_debug(
         seeded_only_labels = frozenset(block_outputs_to_seed) - frozenset(labels_that_may_execute)
         if seeded_only_labels:
             ctx.seeded_only_labels_by_run_id[workflow_run.workflow_run_id] = seeded_only_labels
+        skipped_prefix = _skipped_prefix_blocks(
+            _executable_workflow_block_labels(workflow.workflow_definition),
+            requested_labels=block_labels,
+            labels_that_may_execute=labels_that_may_execute,
+            frontier_start_label=frontier_start_label,
+            seeded_labels=block_outputs_to_seed.keys(),
+            output_sources=execution.selected_output_sources,
+        )
+        if skipped_prefix:
+            ctx.skipped_prefix_by_run_id[workflow_run.workflow_run_id] = skipped_prefix
         # The browser session the run attaches overrides the run row's proxy in the browser layer,
         # so the proxy this run acts through is the session's whenever it declares one.
         session_made_hop, run_session_proxy_location = await browser_session_hop_proxy(ctx, run_session_id)
@@ -5447,6 +5459,7 @@ async def _run_blocks_and_collect_debug(
         ctx.last_run_blocks_block_ids = list(
             dict.fromkeys(block.workflow_run_block_id for block in run_block_rows if block.workflow_run_block_id)
         )
+        ctx.last_run_outcome_block_ids = _outcome_stamp_block_ids(run_block_rows)
         ctx.last_run_blocks_block_labels = list(dict.fromkeys(block.label for block in run_block_rows if block.label))
 
         actions_by_task = await _attach_action_traces(blocks, results, ctx.organization_id, include_completed=True)
@@ -6942,6 +6955,52 @@ def _record_run_blocks_result(
 
 
 _EXECUTED_BLOCK_STATUSES = frozenset(status.value for status in BlockStatus if status != BlockStatus.skipped)
+_RUN_FAILURE_BLOCK_STATUSES = frozenset(
+    {BlockStatus.failed, BlockStatus.terminated, BlockStatus.canceled, BlockStatus.timed_out}
+)
+
+
+def _outcome_stamp_block_ids(rows: Sequence[WorkflowRunBlock]) -> list[str]:
+    """Run-block ids the run verdict belongs to. Once a row failed, rows that completed or were skipped
+    keep their own status rather than the failure's verdict and reason."""
+    run_failed = any(row.status in _RUN_FAILURE_BLOCK_STATUSES for row in rows)
+    return list(
+        dict.fromkeys(
+            row.workflow_run_block_id
+            for row in rows
+            if row.workflow_run_block_id
+            and not (run_failed and row.status in (BlockStatus.completed, BlockStatus.skipped))
+        )
+    )
+
+
+def _skipped_prefix_blocks(
+    workflow_labels: Sequence[str],
+    *,
+    requested_labels: Sequence[str],
+    labels_that_may_execute: Sequence[str],
+    frontier_start_label: str | None,
+    seeded_labels: Collection[str],
+    output_sources: Mapping[str, SelectedOutputSource],
+) -> list[SkippedPrefixBlock]:
+    """Requested blocks before the frontier that this run will not execute, in workflow order."""
+    if frontier_start_label not in workflow_labels:
+        return []
+    requested = set(requested_labels)
+    may_execute = set(labels_that_may_execute)
+    skipped: list[SkippedPrefixBlock] = []
+    for label in workflow_labels[: workflow_labels.index(frontier_start_label)]:
+        if label not in requested or label in may_execute:
+            continue
+        if label not in seeded_labels:
+            skipped.append({"label": label, "kind": "not_run"})
+            continue
+        entry: SkippedPrefixBlock = {"label": label, "kind": "reused"}
+        source = output_sources.get(label)
+        if source is not None:
+            entry["sourceWorkflowRunId"] = source.workflow_run_id
+        skipped.append(entry)
+    return skipped
 
 
 def _preserved_driver_nav_codes(copilot_ctx: CopilotContext, result: dict[str, Any]) -> list[tuple[int, int, str]]:
@@ -7130,7 +7189,7 @@ def _stash_recorded_run_outcome(copilot_ctx: CopilotContext, outcome: RecordedRu
         if last_run_id is not None and last_run_id in copilot_ctx.dispatched_run_ids_this_turn:
             outcome = replace(outcome, workflow_run_id=last_run_id)
     copilot_ctx.last_run_outcome = outcome
-    for workflow_run_block_id in copilot_ctx.last_run_blocks_block_ids:
+    for workflow_run_block_id in copilot_ctx.last_run_outcome_block_ids:
         attempt = copilot_ctx.narrative_block_attempts.get(workflow_run_block_id)
         if attempt is None or (
             outcome.workflow_run_id is not None and attempt["workflowRunId"] != outcome.workflow_run_id
@@ -7173,6 +7232,7 @@ async def _send_run_started_update(copilot_ctx: CopilotContext, workflow_run_id:
             WorkflowCopilotRunStartedUpdate(
                 type=WorkflowCopilotStreamMessageType.RUN_STARTED,
                 workflow_run_id=workflow_run_id,
+                skipped_prefix=list(copilot_ctx.skipped_prefix_by_run_id.get(workflow_run_id, [])),
                 timestamp=datetime.now(UTC),
             )
         )
@@ -7181,7 +7241,7 @@ async def _send_run_started_update(copilot_ctx: CopilotContext, workflow_run_id:
 
 
 async def _send_run_outcome_update(
-    copilot_ctx: Any,
+    copilot_ctx: CopilotContext,
     result: dict[str, Any],
     *,
     verdict: RunOutcomeVerdict,
@@ -7189,7 +7249,7 @@ async def _send_run_outcome_update(
     display_reason: str | None,
     role: RunOutcomeRole = "recorded",
 ) -> None:
-    stream = getattr(copilot_ctx, "stream", None)
+    stream = copilot_ctx.stream
     if stream is None:
         return
     data = result.get("data")
@@ -7199,15 +7259,15 @@ async def _send_run_outcome_update(
     control_signal = data.get("control_signal") if isinstance(data, dict) else None
     control_kind = control_signal.get("kind") if isinstance(control_signal, dict) else None
     terminal_disposition = control_kind if isinstance(control_kind, str) else overall_status
-    narrator_state = getattr(copilot_ctx, "narrator_state", None)
+    narrator_state = copilot_ctx.narrator_state
     iteration = narrator_state.current_iteration if narrator_state is not None else 0
     try:
         await stream.send(
             WorkflowCopilotRunOutcomeUpdate(
                 type=WorkflowCopilotStreamMessageType.RUN_OUTCOME,
                 workflow_run_id=run_id if isinstance(run_id, str) else "",
-                workflow_run_block_ids=list(getattr(copilot_ctx, "last_run_blocks_block_ids", []) or []),
-                block_labels=list(getattr(copilot_ctx, "last_run_blocks_block_labels", []) or []),
+                workflow_run_block_ids=list(copilot_ctx.last_run_outcome_block_ids),
+                block_labels=list(copilot_ctx.last_run_blocks_block_labels),
                 verdict=verdict,
                 role=role,
                 reason_code=reason_code,

@@ -47,16 +47,101 @@ _interrupted: weakref.WeakSet[asyncio.Task[Any]] = weakref.WeakSet()
 class _Registration:
     run_type: str
     attempt_number: int | None
-    count: int = 0
     task: asyncio.Task[Any] | None = None
+    # (task, binding) of every execution still registered here, in registration order. Identity is membership in
+    # this list, not the last registrant: a same-attempt sibling that departs leaves `task` at its own dead task,
+    # so the last-registrant test alone would report a live execution as superseded.
+    live: list[tuple[asyncio.Task[Any] | None, int]] = field(default_factory=list)
     acquired: bool = False
     lost: bool = False
     finalized: bool = False
+    # A different attempt replaced this registration while it was live; its executions stay displaced after exits.
+    displaced: bool = False
+    # Advanced when the same attempt rebinds to another task, so earlier task bindings stay revoked.
+    binding: int = 0
     # Registrations open where this one was entered: an inline child's task is awaited by its parent's.
     enclosing: tuple[_Registration, ...] = field(default=(), repr=False)
     cancel_seen: bool = False
     # This execution's own conditional write set the run canceled; delivery must not interrupt its cleanup.
     internal_cancel_won: bool = False
+
+    @property
+    def count(self) -> int:
+        # How many executions hold this registration; one source of truth with the live bindings above.
+        return len(self.live)
+
+
+@dataclass(frozen=True, eq=False)
+class RunOwner:
+    """One execution's claim on a run in this process: the live registration and the task bound to it."""
+
+    registration: _Registration
+    task: asyncio.Task[Any] | None
+    binding: int = 0
+
+    def is_same(self, other: RunOwner | None) -> bool:
+        # A same-attempt re-registration keeps the entry but rebinds its task, so registration, task and binding
+        # must all match; a task that rebinds back later is a new binding.
+        return (
+            other is not None
+            and other.registration is self.registration
+            and other.task is self.task
+            and other.binding == self.binding
+        )
+
+
+# Captured when track_run registers, so a coroutine keeps its own execution's owner after a successor registers.
+_execution_owners: ContextVar[dict[str, RunOwner] | None] = ContextVar("run_execution_owners", default=None)
+
+
+def run_owner(run_id: str) -> RunOwner | None:
+    return (_execution_owners.get() or {}).get(run_id)
+
+
+def is_registered_owner(run_id: str, owner: RunOwner | None) -> bool:
+    # Current execution authority: the newest binding this registration issued, still live and never displaced.
+    # Adoption, lease hand-over and engine ownership must follow this, never mere membership — an older binding a
+    # rebind revoked, or a binding a departed sibling left behind, stays revoked.
+    if owner is None:
+        return False
+    entry = _registry.get(run_id)
+    if entry is None or entry is not owner.registration:
+        return False
+    return entry.binding == owner.binding and not entry.displaced and (owner.task, owner.binding) in entry.live
+
+
+def is_superseded_owner(run_id: str, owner: RunOwner | None) -> bool:
+    # True only when a viable successor holds the run: the newest binding this registration issued is still live and
+    # is not this owner's. A departed sibling, an older remaining binding, and a live binding that an even newer one
+    # already revoked all fail that test — none of them can adopt or claim what would be handed over.
+    if owner is None:
+        return False
+    entry = _registry.get(run_id)
+    if entry is None:
+        return False
+    # Only the newest binding this registration issued can adopt and finish the run's disposal, so a deferral may be
+    # handed over only while THAT binding is live; every other case leaves the deferral with its own execution.
+    if entry.binding not in {binding for _task, binding in entry.live}:
+        return False
+    if entry is not owner.registration:
+        return True
+    return entry.binding > owner.binding
+
+
+def is_newer_live_owner(run_id: str, owner: RunOwner | None, other: RunOwner | None) -> bool:
+    # `other` is another execution still registered in its own registration, even after a rebind revoked its
+    # authority or another attempt replaced that registration: disposal protection only, never execution authority.
+    if owner is None or other is None or other.is_same(owner):
+        return False
+    if (other.task, other.binding) not in other.registration.live:
+        return False
+    return other.registration is not owner.registration or other.binding > owner.binding
+
+
+def is_displaced_owner(owner: RunOwner | None) -> bool:
+    # Permanent for this execution's binding, unlike supersession: it stays true after the successor exits. A normal
+    # release is not displacement, and an unregistered or untracked caller (no owner) is never displaced.
+    return owner is not None and (owner.registration.displaced or owner.registration.binding != owner.binding)
 
 
 class RunExecution(NamedTuple):
@@ -106,16 +191,21 @@ def _register(
     _kept_leases.discard(run_id)
     entry = _registry.get(run_id)
     if entry is None or entry.attempt_number != attempt_number:
+        if entry is not None:
+            entry.displaced = True
         entry = _Registration(run_type, attempt_number, enclosing=_open_entries())
         _registry[run_id] = entry
-    entry.count += 1
+    elif entry.task is not task:
+        entry.binding += 1
     if entry.task is not task:
         entry.cancel_seen = False
         entry.internal_cancel_won = False
         if task is not None:
             # A held run's scope is where it executes: the dispatcher that held it may be another live run.
             entry.enclosing = _open_entries()
+    binding = entry.binding
     entry.task = task
+    entry.live.append((task, binding))
     _wake.set()
     released = False
 
@@ -124,8 +214,11 @@ def _register(
         if released:
             return
         released = True
-        entry.count -= 1
-        if entry.count == 0 and _registry.get(run_id) is entry:
+        try:
+            entry.live.remove((task, binding))
+        except ValueError:
+            pass
+        if not entry.live and _registry.get(run_id) is entry:
             if cancelled:
                 _kept_leases.add(run_id)
             del _registry[run_id]
@@ -143,6 +236,11 @@ def track_run(run_id: str, run_type: str, attempt_number: int | None = None) -> 
     release = _register(run_id, run_type, attempt_number, task)
     enclosing = _open_executions.get()
     entry = _registry.get(run_id) if _enabled else None
+    owners_token = (
+        _execution_owners.set({**(_execution_owners.get() or {}), run_id: RunOwner(entry, entry.task, entry.binding)})
+        if entry is not None
+        else None
+    )
     if entry is not None:
         _open_executions.set((*enclosing, RunExecution(entry, entry.task, entry.attempt_number)))
     cancelled = False
@@ -154,6 +252,8 @@ def track_run(run_id: str, run_type: str, attempt_number: int | None = None) -> 
     finally:
         _open_executions.set(enclosing)
         release(cancelled)
+        if owners_token is not None:
+            _execution_owners.reset(owners_token)
 
 
 def _open_entries() -> tuple[_Registration, ...]:

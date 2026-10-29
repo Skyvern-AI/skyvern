@@ -1,5 +1,6 @@
 import { getClient } from "@/api/AxiosClient";
 import { useCredentialGetter } from "@/hooks/useCredentialGetter";
+import { getErrorDetail } from "@/util/getErrorDetail";
 import { cn } from "@/util/utils";
 import { Cross2Icon, FileIcon, ReloadIcon } from "@radix-ui/react-icons";
 import { useMutation } from "@tanstack/react-query";
@@ -71,7 +72,7 @@ function FileUpload({ value, onChange, required }: Props) {
       toast({
         variant: "destructive",
         title: "Failed to upload file",
-        description: `An error occurred while uploading the file: ${error.message}`,
+        description: `An error occurred while uploading the file: ${getErrorDetail(error)}`,
       });
     },
   });

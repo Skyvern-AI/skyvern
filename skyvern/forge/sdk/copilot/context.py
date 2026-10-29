@@ -151,6 +151,12 @@ class NarrativeActivityEntry(TypedDict):
     timestamp: NotRequired[str]
 
 
+class SkippedPrefixBlock(TypedDict):
+    label: str
+    kind: Literal["reused", "not_run"]
+    sourceWorkflowRunId: NotRequired[str]
+
+
 class NarrativeBlock(TypedDict):
     label: str
     workflowRunBlockId: NotRequired[str]
@@ -163,6 +169,7 @@ class NarrativeBlock(TypedDict):
     outcome: NotRequired[str]
     outcomeReason: NotRequired[str]
     outcomeRole: NotRequired[RunOutcomeRole]
+    skippedBefore: NotRequired[list[SkippedPrefixBlock]]
 
 
 # A loop body mints fresh run-block ids every iteration, so the identity-keyed archive
@@ -182,6 +189,14 @@ class NarrativeBlockAttempt(TypedDict):
     outcome: NotRequired[str]
     outcomeReason: NotRequired[str]
     outcomeRole: NotRequired[RunOutcomeRole]
+
+
+def skipped_prefix_anchor(archive: dict[str, NarrativeBlockAttempt], workflow_run_id: str) -> str | None:
+    """The run's earliest surviving attempt, which the run's skipped-prefix rows render before."""
+    return next(
+        (attempt_id for attempt_id, attempt in archive.items() if attempt["workflowRunId"] == workflow_run_id),
+        None,
+    )
 
 
 def upsert_narrative_block_attempt(
@@ -1418,6 +1433,7 @@ class CopilotContext(AgentContext):
     delivered_output_files: tuple[str, list[DeliveredOutputFile]] | None = None
     # Producers a dispatched run was seeded with and never ran; their values belong to another run.
     seeded_only_labels_by_run_id: dict[str, frozenset[str]] = field(default_factory=dict)
+    skipped_prefix_by_run_id: dict[str, list[SkippedPrefixBlock]] = field(default_factory=dict)
     # The browser session the last run actually executed in. On the fresh-session replay path this
     # is not ctx.browser_session_id, which stays pointed at the debug/scout browser.
     last_run_blocks_browser_session_id: str | None = None

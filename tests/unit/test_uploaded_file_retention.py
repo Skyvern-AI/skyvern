@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import io
 import os
+import zipfile
 from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -379,7 +380,7 @@ class TestStorageUriUniqueness:
                 return _client().post(
                     "/v1/upload_file",
                     headers={"x-api-key": "key"},
-                    files={"file": ("dir/report.pdf", io.BytesIO(b"data"), "application/pdf")},
+                    files={"file": ("dir/report.pdf", io.BytesIO(b"%PDF-1.7 data"), "application/pdf")},
                 )
 
             first, second = upload(), upload()
@@ -389,6 +390,117 @@ class TestStorageUriUniqueness:
             assert storage_keys[0] != storage_keys[1]
             assert first.json()["s3_uri"] != second.json()["s3_uri"]  # type: ignore[attr-defined]
             assert first.json()["file_id"] != second.json()["file_id"]  # type: ignore[attr-defined]
+
+
+def _zip_bytes(*member_names: str) -> bytes:
+    buffer = io.BytesIO()
+    with zipfile.ZipFile(buffer, "w") as archive:
+        for name in member_names:
+            archive.writestr(name, b"x")
+    return buffer.getvalue()
+
+
+def _ole_bytes(*entry_names: str, body: bytes = b"") -> bytes:
+    """A compound file whose directory sector sits past the sniff window, after ``body``."""
+    entries = b""
+    for name in entry_names:
+        encoded = (name + "\0").encode("utf-16-le")
+        entries += encoded.ljust(64, b"\x00") + len(encoded).to_bytes(2, "little") + b"\x02".ljust(62, b"\x00")
+    header = b"\xd0\xcf\x11\xe0\xa1\xb1\x1a\xe1".ljust(512, b"\x00")
+    return header + body.ljust(16 * 1024, b"\x00") + entries
+
+
+_PE_HEAD = b"MZ" + b"\x90" * 58 + (64).to_bytes(4, "little") + b"PE\x00\x00" + b"\x00" * 64
+_OOXML_MEMBERS = ("[Content_Types].xml", "word/document.xml")
+
+
+class TestUploadTypeRestrictions:
+    """Executables, scripts and browser-renderable markup are refused by name and by content; anything else passes."""
+
+    @pytest.mark.parametrize(
+        ("filename", "content", "expected_status"),
+        [
+            ("tool.exe", _PE_HEAD, 415),
+            ("invoice.pdf.exe", b"%PDF-1.7", 415),
+            ("setup.EXE. ", b"anything", 415),
+            ("page.html", b"hello", 415),
+            ("macro.docm", _zip_bytes(*_OOXML_MEMBERS), 415),
+            ("script.py", b"print(1)", 415),
+            ("report.txt", _PE_HEAD, 415),
+            ("notes.txt", b"\xef\xbb\xbf  <!DOCTYPE html><html></html>", 415),
+            ("logo.png", b'<?xml version="1.0"?>\n<svg xmlns="http://www.w3.org/2000/svg"></svg>', 415),
+            ("run.dat", b"#!/bin/sh\nrm -rf /", 415),
+            ("saved.dat", b"<!-- saved from url -->\n<!--x--><html><body></body></html>", 415),
+            ("icon.dat", b'<?xml version="1.0"?><?xml-stylesheet href="a.css"?><!--c--><svg></svg>', 415),
+            ("utf16.dat", "\ufeff<html><script></script></html>".encode("utf-16-le"), 415),
+            ("padded.txt", b" " * 9000 + b"<html></html>", 415),
+            ("comment.txt", b"<!--" + b"x" * 9000 + b"--><svg></svg>", 415),
+            ("page.shtml", b"hello", 415),
+            ("split_tag.txt", b" " * 8185 + b"<script>alert(1)</script>", 415),
+            ("split_comment.txt", b" " * 8189 + b"<!--x--><script></script>", 415),
+            ("split_doctype.txt", b" " * 8180 + b"<!doctype    html><p></p>", 415),
+            ("saved.bin", b"MIME-Version: 1.0\r\nContent-Type: multipart/related; boundary=x", 415),
+            ("binary.data", b"\x7fELF\x02\x01\x01", 415),
+            ("statement.pdf", b"<html>not a pdf</html>", 415),
+            ("statement.pdf", b"plain text", 415),
+            ("photo.jpg", b"not an image", 415),
+            ("budget.xlsx", _zip_bytes("[Content_Types].xml", "xl/vbaProject.bin"), 415),
+            ("bundle.zip", _zip_bytes("META-INF/MANIFEST.MF", "com/example/Main.class"), 415),
+            ("bundle.zip", _zip_bytes("AndroidManifest.xml", "classes.dex"), 415),
+            ("legacy.doc", _ole_bytes("Root Entry", "WordDocument", "Macros", "VBA", "_VBA_PROJECT"), 415),
+            ("ledger.xls", _ole_bytes("Workbook", "_VBA_PROJECT_CUR", "VBA", "_VBA_PROJECT"), 415),
+            ("renamed.docx", _ole_bytes("Root Entry", "WordDocument"), 415),
+            ("shortcut.lnk", b"anything", 415),
+            ("invoice.txt", b"L\x00\x00\x00\x01\x14\x02\x00\x00\x00\x00\x00\xc0\x00\x00\x00\x00\x00\x00F", 415),
+            ("report.weirdext", bytes(range(256)) * 16, 200),
+            ("no_extension", b"plain bytes", 200),
+            ("statement.pdf", b"%PDF-1.7\n%binary", 200),
+            ("letter.docx", _zip_bytes(*_OOXML_MEMBERS), 200),
+            ("locked.docx", _ole_bytes("Root Entry", "EncryptedInfo", "EncryptedPackage"), 200),
+            ("ledger.xls", _ole_bytes("Workbook", body=b"\x00" + "_VBA_PROJECT\0".encode("utf-16-le")), 200),
+            ("data.csv", b"name,email\nada,ada@example.com\n", 200),
+            ("forwarded.eml", b"MIME-Version: 1.0\r\nContent-Type: multipart/related; boundary=x", 200),
+            ("archive.zip", _zip_bytes("docs/readme.txt", "docs/tool.exe"), 200),
+            ("readme.md", b"# Title\n<p>inline html in markdown</p>", 200),
+            ("notes.md", b"<!-- generated -->\n# Title\n", 200),
+            ("indented.txt", b" " * 9000 + b"plain text", 200),
+            ("split_lt.txt", b" " * 8190 + b"<3 plain text", 200),
+            ("utf16.csv", "\ufeffname,email\n".encode("utf-16-le"), 200),
+        ],
+        ids=lambda value: value if isinstance(value, str) else None,
+    )
+    def test_upload_type_is_enforced_at_the_upload_route(
+        self, filename: str, content: bytes, expected_status: int
+    ) -> None:
+        with (
+            patch("skyvern.forge.sdk.routes.agent_protocol.app") as app_module,
+            patch("skyvern.services.uploaded_file_service.app", app_module),
+            patch(
+                "skyvern.forge.sdk.services.org_auth_service.get_current_org_cached",
+                new=AsyncMock(return_value=_make_org(VICTIM_ORG_ID)),
+            ),
+        ):
+            app_module.SETTINGS_MANAGER.MAX_UPLOAD_FILE_SIZE = settings.MAX_UPLOAD_FILE_SIZE
+
+            async def fake_create_uploaded_file(**kwargs: object) -> UploadedFile:
+                now = datetime.now(timezone.utc)
+                return UploadedFile(created_at=now, modified_at=now, **kwargs)  # type: ignore[arg-type]
+
+            app_module.STORAGE.save_legacy_file = AsyncMock(
+                return_value=("https://presigned.example/x", _uri(VICTIM_ORG_ID, "stored"))
+            )
+            app_module.DATABASE.uploaded_files.create_uploaded_file = AsyncMock(side_effect=fake_create_uploaded_file)
+
+            resp = _client().post(
+                "/v1/upload_file",
+                headers={"x-api-key": "key"},
+                files={"file": (filename, io.BytesIO(content), "application/octet-stream")},
+            )
+
+            assert resp.status_code == expected_status, resp.text
+            if expected_status == 415:
+                assert resp.json()["detail"].startswith("File type not allowed: ")
+            assert app_module.STORAGE.save_legacy_file.await_count == (0 if expected_status == 415 else 1)
 
 
 class TestExpirySweep:

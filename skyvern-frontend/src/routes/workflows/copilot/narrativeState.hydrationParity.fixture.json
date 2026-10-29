@@ -32,14 +32,24 @@
     },
     "blocks": [
       {
+        "label": "block_18",
+        "workflowRunBlockId": "wrb_upstream",
+        "blockType": "task",
+        "state": "completed",
+        "lastSeenIteration": 0,
+        "activity": [],
+        "startedAt": "2026-10-29T19:54:41.137564+00:00",
+        "endedAt": "2026-10-29T19:54:41.137583+00:00"
+      },
+      {
         "label": "block_19",
         "workflowRunBlockId": "wrb_first",
         "blockType": "task",
         "state": "failed",
         "lastSeenIteration": 0,
         "activity": [],
-        "startedAt": "2026-10-29T16:37:51.334975+00:00",
-        "endedAt": "2026-10-29T16:37:51.334990+00:00",
+        "startedAt": "2026-10-29T19:54:41.137593+00:00",
+        "endedAt": "2026-10-29T19:54:41.137601+00:00",
         "outcome": "not_demonstrated",
         "outcomeRole": "recorded",
         "outcomeReason": "The first attempt failed."
@@ -51,10 +61,16 @@
         "state": "completed",
         "lastSeenIteration": 0,
         "activity": [],
-        "startedAt": "2026-10-29T16:37:51.335640+00:00",
-        "endedAt": "2026-10-29T16:37:51.335651+00:00",
+        "startedAt": "2026-10-29T19:54:41.144103+00:00",
+        "endedAt": "2026-10-29T19:54:41.144113+00:00",
         "outcome": "not_evaluated",
-        "outcomeRole": "recorded"
+        "outcomeRole": "recorded",
+        "skippedBefore": [
+          {
+            "label": "block_18",
+            "kind": "reused"
+          }
+        ]
       }
     ],
     "terminal": "response",
@@ -69,8 +85,8 @@
         "toolName": "run_blocks_and_collect_debug",
         "displayLabel": "Testing workflow",
         "id": "tc-call_test_end_to_end_turn-replay",
-        "timestamp": "2026-10-29T16:37:51.333885+00:00",
-        "activityStartedAt": "2026-10-29T16:37:51.333885+00:00",
+        "timestamp": "2026-10-29T19:54:41.136674+00:00",
+        "activityStartedAt": "2026-10-29T19:54:41.136674+00:00",
         "activityBucket": {
           "kind": "design"
         }
@@ -83,7 +99,7 @@
         "displayLabel": "Testing workflow",
         "success": true,
         "id": "tr-call_test_end_to_end_turn-replay",
-        "timestamp": "2026-10-29T16:37:51.334108+00:00",
+        "timestamp": "2026-10-29T19:54:41.136754+00:00",
         "workflowRunId": "wr_button",
         "testInputs": [
           {
@@ -91,7 +107,7 @@
             "source": "default"
           }
         ],
-        "activityStartedAt": "2026-10-29T16:37:51.333885+00:00",
+        "activityStartedAt": "2026-10-29T19:54:41.136674+00:00",
         "activityBucket": {
           "kind": "design"
         }
@@ -103,8 +119,8 @@
         "toolName": "edit_block",
         "displayLabel": "Editing block \"Block 19\"",
         "id": "tc-author-1",
-        "timestamp": "2026-10-29T16:37:51.334611+00:00",
-        "activityStartedAt": "2026-10-29T16:37:51.334611+00:00",
+        "timestamp": "2026-10-29T19:54:41.137259+00:00",
+        "activityStartedAt": "2026-10-29T19:54:41.137259+00:00",
         "activityBucket": {
           "kind": "design"
         }
@@ -117,8 +133,8 @@
         "displayLabel": "Editing block \"Block 19\"",
         "success": true,
         "id": "tr-author-1",
-        "timestamp": "2026-10-29T16:37:51.334680+00:00",
-        "activityStartedAt": "2026-10-29T16:37:51.334611+00:00",
+        "timestamp": "2026-10-29T19:54:41.137334+00:00",
+        "activityStartedAt": "2026-10-29T19:54:41.137259+00:00",
         "activityBucket": {
           "kind": "design"
         }
@@ -130,8 +146,8 @@
         "toolName": "update_and_run_blocks",
         "displayLabel": "Testing workflow",
         "id": "tc-run-first",
-        "timestamp": "2026-10-29T16:37:51.334950+00:00",
-        "activityStartedAt": "2026-10-29T16:37:51.334950+00:00",
+        "timestamp": "2026-10-29T19:54:41.137533+00:00",
+        "activityStartedAt": "2026-10-29T19:54:41.137533+00:00",
         "activityBucket": {
           "kind": "design"
         }
@@ -144,9 +160,9 @@
         "displayLabel": "Testing workflow",
         "success": false,
         "id": "tr-run-first",
-        "timestamp": "2026-10-29T16:37:51.335106+00:00",
+        "timestamp": "2026-10-29T19:54:41.137753+00:00",
         "workflowRunId": "wr_first",
-        "activityStartedAt": "2026-10-29T16:37:51.334950+00:00",
+        "activityStartedAt": "2026-10-29T19:54:41.137533+00:00",
         "activityBucket": {
           "kind": "design"
         }
@@ -158,8 +174,8 @@
         "toolName": "edit_block",
         "displayLabel": "Editing block \"Block 19\"",
         "id": "tc-author-2",
-        "timestamp": "2026-10-29T16:37:51.335395+00:00",
-        "activityStartedAt": "2026-10-29T16:37:51.335395+00:00",
+        "timestamp": "2026-10-29T19:54:41.138088+00:00",
+        "activityStartedAt": "2026-10-29T19:54:41.138088+00:00",
         "activityBucket": {
           "kind": "design"
         }
@@ -168,8 +184,8 @@
         "kind": "narration",
         "text": "Refining the workflow's code",
         "iteration": 0,
-        "id": "n-0-2026-10-29T16:37:51.335421+00:00",
-        "timestamp": "2026-10-29T16:37:51.335421+00:00"
+        "id": "n-0-2026-10-29T19:54:41.138119+00:00",
+        "timestamp": "2026-10-29T19:54:41.138119+00:00"
       },
       {
         "kind": "tool_call",
@@ -178,8 +194,8 @@
         "toolName": "update_and_run_blocks",
         "displayLabel": "Testing workflow",
         "id": "tc-run-retry",
-        "timestamp": "2026-10-29T16:37:51.335617+00:00",
-        "activityStartedAt": "2026-10-29T16:37:51.335617+00:00",
+        "timestamp": "2026-10-29T19:54:41.144045+00:00",
+        "activityStartedAt": "2026-10-29T19:54:41.144045+00:00",
         "activityBucket": {
           "kind": "design"
         }
@@ -192,7 +208,7 @@
         "displayLabel": "Testing workflow",
         "success": true,
         "id": "tr-run-retry",
-        "timestamp": "2026-10-29T16:37:51.335696+00:00",
+        "timestamp": "2026-10-29T19:54:41.144226+00:00",
         "workflowRunId": "wr_retry",
         "testInputs": [
           {
@@ -209,14 +225,14 @@
             "source": "placeholder"
           }
         ],
-        "activityStartedAt": "2026-10-29T16:37:51.335617+00:00",
+        "activityStartedAt": "2026-10-29T19:54:41.144045+00:00",
         "activityBucket": {
           "kind": "design"
         }
       }
     ],
     "startedAt": null,
-    "endedAt": "2026-10-29T16:37:51.335717+00:00",
+    "endedAt": "2026-10-29T19:54:41.144255+00:00",
     "testedBlockFingerprints": {}
   },
   "updates": [
@@ -224,13 +240,13 @@
       "type": "turn_start",
       "turn_id": "turn-replay",
       "turn_index": 0,
-      "timestamp": "2026-10-29T16:37:51.333862Z",
+      "timestamp": "2026-10-29T19:54:41.136658Z",
       "prior_block_count": 20,
       "workflow_copilot_chat_id": null
     },
     {
       "type": "design_start",
-      "timestamp": "2026-10-29T16:37:51.333900Z"
+      "timestamp": "2026-10-29T19:54:41.136687Z"
     },
     {
       "reason": null,
@@ -243,10 +259,10 @@
       "tool_input": {},
       "iteration": 0,
       "tool_call_id": "call_test_end_to_end_turn-replay",
-      "timestamp": "2026-10-29T16:37:51.333885Z"
+      "timestamp": "2026-10-29T19:54:41.136674Z"
     },
     {
-      "activity_started_at": "2026-10-29T16:37:51.333885Z",
+      "activity_started_at": "2026-10-29T19:54:41.136674Z",
       "reason": null,
       "activity_bucket": {
         "kind": "design"
@@ -270,7 +286,7 @@
         }
       ],
       "executed_source_reference": null,
-      "timestamp": "2026-10-29T16:37:51.334108Z"
+      "timestamp": "2026-10-29T19:54:41.136754Z"
     },
     {
       "reason": null,
@@ -285,10 +301,10 @@
       },
       "iteration": 0,
       "tool_call_id": "author-1",
-      "timestamp": "2026-10-29T16:37:51.334611Z"
+      "timestamp": "2026-10-29T19:54:41.137259Z"
     },
     {
-      "activity_started_at": "2026-10-29T16:37:51.334611Z",
+      "activity_started_at": "2026-10-29T19:54:41.137259Z",
       "reason": null,
       "activity_bucket": {
         "kind": "design"
@@ -307,7 +323,7 @@
       "workflow_run_id": null,
       "test_inputs": null,
       "executed_source_reference": null,
-      "timestamp": "2026-10-29T16:37:51.334680Z"
+      "timestamp": "2026-10-29T19:54:41.137334Z"
     },
     {
       "type": "workflow_draft",
@@ -335,7 +351,7 @@
         "block_20"
       ],
       "summary": null,
-      "timestamp": "2026-10-29T16:37:51.334708Z",
+      "timestamp": "2026-10-29T19:54:41.137366Z",
       "workflow": null,
       "code_diffs": null,
       "tool_call_id": "author-1"
@@ -351,7 +367,27 @@
       "tool_input": {},
       "iteration": 0,
       "tool_call_id": "run-first",
-      "timestamp": "2026-10-29T16:37:51.334950Z"
+      "timestamp": "2026-10-29T19:54:41.137533Z"
+    },
+    {
+      "type": "block_progress",
+      "workflow_run_block_id": "wrb_upstream",
+      "workflow_run_id": "wr_first",
+      "block_label": "block_18",
+      "block_type": "task",
+      "status": "running",
+      "iteration": 0,
+      "timestamp": "2026-10-29T19:54:41.137564Z"
+    },
+    {
+      "type": "block_progress",
+      "workflow_run_block_id": "wrb_upstream",
+      "workflow_run_id": "wr_first",
+      "block_label": "block_18",
+      "block_type": "task",
+      "status": "completed",
+      "iteration": 0,
+      "timestamp": "2026-10-29T19:54:41.137583Z"
     },
     {
       "type": "block_progress",
@@ -361,7 +397,7 @@
       "block_type": "task",
       "status": "running",
       "iteration": 0,
-      "timestamp": "2026-10-29T16:37:51.334975Z"
+      "timestamp": "2026-10-29T19:54:41.137593Z"
     },
     {
       "type": "block_progress",
@@ -371,7 +407,7 @@
       "block_type": "task",
       "status": "failed",
       "iteration": 0,
-      "timestamp": "2026-10-29T16:37:51.334990Z"
+      "timestamp": "2026-10-29T19:54:41.137601Z"
     },
     {
       "type": "run_outcome",
@@ -380,6 +416,7 @@
         "wrb_first"
       ],
       "block_labels": [
+        "block_18",
         "block_19"
       ],
       "verdict": "not_demonstrated",
@@ -387,16 +424,16 @@
       "reason_code": null,
       "display_reason": "The first attempt failed.",
       "browser_session_id": null,
-      "workflow_permanent_id": null,
-      "turn_id": null,
+      "workflow_permanent_id": "wfp",
+      "turn_id": "turn-replay",
       "workflow_copilot_chat_id": null,
       "continuity_source": "workflow_run",
       "terminal_disposition": null,
       "iteration": 0,
-      "timestamp": "2026-10-29T16:37:51.335078Z"
+      "timestamp": "2026-10-29T19:54:41.137725Z"
     },
     {
-      "activity_started_at": "2026-10-29T16:37:51.334950Z",
+      "activity_started_at": "2026-10-29T19:54:41.137533Z",
       "reason": null,
       "activity_bucket": {
         "kind": "design"
@@ -415,7 +452,7 @@
       "workflow_run_id": "wr_first",
       "test_inputs": null,
       "executed_source_reference": null,
-      "timestamp": "2026-10-29T16:37:51.335106Z"
+      "timestamp": "2026-10-29T19:54:41.137753Z"
     },
     {
       "reason": null,
@@ -430,7 +467,7 @@
       },
       "iteration": 0,
       "tool_call_id": "author-2",
-      "timestamp": "2026-10-29T16:37:51.335395Z"
+      "timestamp": "2026-10-29T19:54:41.138088Z"
     },
     {
       "type": "narration",
@@ -438,7 +475,7 @@
       "active_label": null,
       "outcome_label": null,
       "iteration": 0,
-      "timestamp": "2026-10-29T16:37:51.335421Z"
+      "timestamp": "2026-10-29T19:54:41.138119Z"
     },
     {
       "type": "workflow_draft",
@@ -466,7 +503,7 @@
         "block_20"
       ],
       "summary": null,
-      "timestamp": "2026-10-29T16:37:51.335442Z",
+      "timestamp": "2026-10-29T19:54:41.138136Z",
       "workflow": null,
       "code_diffs": null,
       "tool_call_id": "author-2"
@@ -482,7 +519,18 @@
       "tool_input": {},
       "iteration": 0,
       "tool_call_id": "run-retry",
-      "timestamp": "2026-10-29T16:37:51.335617Z"
+      "timestamp": "2026-10-29T19:54:41.144045Z"
+    },
+    {
+      "type": "run_started",
+      "workflow_run_id": "wr_retry",
+      "skipped_prefix": [
+        {
+          "label": "block_18",
+          "kind": "reused"
+        }
+      ],
+      "timestamp": "2026-10-29T19:54:41.144091Z"
     },
     {
       "type": "block_progress",
@@ -492,7 +540,7 @@
       "block_type": "task",
       "status": "running",
       "iteration": 0,
-      "timestamp": "2026-10-29T16:37:51.335640Z"
+      "timestamp": "2026-10-29T19:54:41.144103Z"
     },
     {
       "type": "block_progress",
@@ -502,7 +550,7 @@
       "block_type": "task",
       "status": "completed",
       "iteration": 0,
-      "timestamp": "2026-10-29T16:37:51.335651Z"
+      "timestamp": "2026-10-29T19:54:41.144113Z"
     },
     {
       "type": "run_outcome",
@@ -518,16 +566,16 @@
       "reason_code": null,
       "display_reason": null,
       "browser_session_id": null,
-      "workflow_permanent_id": null,
-      "turn_id": null,
+      "workflow_permanent_id": "wfp",
+      "turn_id": "turn-replay",
       "workflow_copilot_chat_id": null,
       "continuity_source": "workflow_run",
       "terminal_disposition": null,
       "iteration": 0,
-      "timestamp": "2026-10-29T16:37:51.335688Z"
+      "timestamp": "2026-10-29T19:54:41.144206Z"
     },
     {
-      "activity_started_at": "2026-10-29T16:37:51.335617Z",
+      "activity_started_at": "2026-10-29T19:54:41.144045Z",
       "reason": null,
       "activity_bucket": {
         "kind": "design"
@@ -560,7 +608,7 @@
         }
       ],
       "executed_source_reference": null,
-      "timestamp": "2026-10-29T16:37:51.335696Z"
+      "timestamp": "2026-10-29T19:54:41.144226Z"
     }
   ]
 }

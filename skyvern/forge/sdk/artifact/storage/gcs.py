@@ -178,6 +178,9 @@ class GcsStorage(BaseStorage):
             presign_sensitive=lambda uris: self.async_client.create_signed_urls(
                 uris, expiry_hours=SENSITIVE_SHARE_URL_EXPIRY_HOURS
             ),
+            presign_download=lambda uris: self.async_client.create_signed_urls(
+                uris, attachment_filenames=[None] * len(uris)
+            ),
         )
 
     async def store_artifact_from_path(self, artifact: Artifact, path: str) -> None:
@@ -419,18 +422,17 @@ class GcsStorage(BaseStorage):
                 content_length = object_info.get("ContentLength")
 
             # Create FileInfo object
-            filename = os.path.basename(key)
+            filename = metadata.get("original_filename", os.path.basename(key)) if metadata else os.path.basename(key)
             checksum = metadata.get("sha256_checksum") if metadata else None
 
-            # Get signed URL
-            signed_urls = await self.async_client.create_signed_urls([key])
+            signed_urls = await self.async_client.create_signed_urls([key], attachment_filenames=[filename])
             if not signed_urls:
                 continue
 
             file_info = FileInfo(
                 url=signed_urls[0],
                 checksum=checksum,
-                filename=metadata.get("original_filename", filename) if metadata else filename,
+                filename=filename,
                 file_size=content_length,
                 modified_at=modified_at,
             )
@@ -754,7 +756,7 @@ class GcsStorage(BaseStorage):
             display_name = metadata.get("original_filename", filename) if metadata else filename
             artifact = artifacts_by_uri.get(object_uri)
 
-            signed_urls = await self.async_client.create_signed_urls([object_uri])
+            signed_urls = await self.async_client.create_signed_urls([object_uri], attachment_filenames=[display_name])
             if not signed_urls:
                 continue
 
@@ -815,7 +817,7 @@ class GcsStorage(BaseStorage):
             uploaded_uri=uploaded_uri,
         )
         # Generate a signed URL for the uploaded file
-        signed_urls = await self.async_client.create_signed_urls([uploaded_uri])
+        signed_urls = await self.async_client.create_signed_urls([uploaded_uri], attachment_filenames=[None])
         if not signed_urls:
             LOG.error(
                 "Failed to create signed URL for uploaded file",

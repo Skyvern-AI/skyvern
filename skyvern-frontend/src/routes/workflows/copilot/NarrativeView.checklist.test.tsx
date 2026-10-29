@@ -666,6 +666,70 @@ describe("NarrativeView — activity log", () => {
     expect(screen.getAllByRole("button", { name: /Block 2/ })).toHaveLength(1);
   });
 
+  it("a rerun shows the blocks it skipped before its first card, in workflow order", () => {
+    const turn = repairLoopTurn();
+    turn.blocks = [
+      runningBlock({
+        state: "completed",
+        endedAt: "2026-06-10T00:00:10Z",
+        skippedBefore: [
+          {
+            label: "load_records",
+            kind: "reused",
+            sourceWorkflowRunId: "wr_0",
+          },
+          { label: "open_search", kind: "not_run" },
+        ],
+      }),
+    ];
+    render(<NarrativeView turn={turn} />);
+    openFold();
+    fireEvent.click(stepLines()[1]!);
+
+    const rows = screen.getAllByTestId(
+      /^copilot-(skipped-prefix-row|test-card)$/,
+    );
+    expect(rows.map((row) => visibleText(row))).toEqual([
+      expect.stringContaining("Load Records · Reused from an earlier test"),
+      expect.stringContaining("Open Search · Not run in this test"),
+      expect.stringContaining("Block 1"),
+    ]);
+    expect(rows[0]!.dataset.kind).toBe("reused");
+    expect(rows[1]!.dataset.kind).toBe("not_run");
+  });
+
+  it("the latest run's failed card owns the unconfirmed outcome over an earlier run's row", () => {
+    const turn = repairLoopTurn();
+    turn.blocks = [
+      runningBlock({
+        state: "completed",
+        endedAt: "2026-06-10T00:00:10Z",
+        outcome: "not_demonstrated",
+        outcomeRole: "recorded",
+        outcomeReason: "The first run left the form unsubmitted.",
+      }),
+      runningBlock({
+        workflowRunBlockId: "wrb_2",
+        label: "block_2",
+        state: "failed",
+        endedAt: "2026-06-10T00:00:12Z",
+        outcome: "not_demonstrated",
+        outcomeRole: "recorded",
+        outcomeReason: "The second run timed out.",
+      }),
+    ];
+    render(<NarrativeView turn={turn} />);
+    openFold();
+    fireEvent.click(stepLines()[1]!);
+
+    const failedCard = screen
+      .getAllByTestId("copilot-test-card")
+      .find((card) => card.dataset.tone === "failed")!;
+    expect(visibleText(failedCard)).toContain(
+      "Outcome not confirmed — The second run timed out.",
+    );
+  });
+
   const titledFailedRun = (): TurnNarrativeState => ({
     ...EMPTY_NARRATIVE,
     turnId: "turn-1",

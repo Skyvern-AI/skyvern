@@ -1147,6 +1147,55 @@ describe("deriveActivityLog", () => {
     );
   });
 
+  it("keeps a block first seen already finished on its own run row as later runs start", () => {
+    const live = (["first_attempt", "second_attempt"] as const).reduce(
+      (turn, label, i) =>
+        applyNarrativeEvent(turn, {
+          type: "block_progress",
+          workflow_run_block_id: `wrb_${label}`,
+          block_label: label,
+          block_type: "code",
+          status: i === 0 ? "failed" : "completed",
+          iteration: 0,
+          timestamp: at(i === 0 ? 3 : 6),
+        }),
+      turnWith(repairLoopActivity()),
+    );
+    const reloaded = applyNarrativeEvent(
+      live,
+      terminalResponse({
+        turnId: "turn-1",
+        turnIndex: 0,
+        terminal: "response",
+        designActivity: repairLoopActivity(),
+        blocks: [
+          payloadBlock("first_attempt", {
+            workflowRunBlockId: "wrb_first_attempt",
+            state: "failed",
+            startedAt: at(3),
+          }),
+          payloadBlock("second_attempt", {
+            workflowRunBlockId: "wrb_second_attempt",
+            startedAt: at(6),
+          }),
+        ],
+      }),
+    );
+
+    expect(live.blocks.map((b) => b.startedAt)).toEqual([null, null]);
+    expect(labelsPerRow(deriveActivityLog(live))).toEqual([
+      [],
+      [],
+      ["first_attempt"],
+      [],
+      [],
+      ["second_attempt"],
+    ]);
+    expect(labelsPerRow(deriveActivityLog(reloaded))).toEqual(
+      labelsPerRow(deriveActivityLog(live)),
+    );
+  });
+
   it("drops a legacy row with no persisted evidence", () => {
     const reloaded = applyNarrativeEvent(
       twoRunTurn(),

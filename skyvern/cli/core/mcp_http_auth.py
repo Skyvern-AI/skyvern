@@ -9,7 +9,7 @@ import re
 import time
 from collections import OrderedDict
 from collections.abc import Awaitable, Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from threading import RLock
 from typing import Any, cast
 from urllib.parse import urlsplit, urlunsplit
@@ -97,6 +97,7 @@ class _OAuthResolution:
     validation: MCPAPIKeyValidation
     api_key_token_id: str | None = None
     user_id: str | None = None
+    issued_at: float | None = None
 
 
 class MissingOrgContextError(HTTPException):
@@ -514,6 +515,18 @@ def _oauth_cache_key(bearer_token: str) -> str:
 
 
 async def validate_mcp_oauth_token(bearer_token: str) -> _OAuthResolution:
+    resolution = await _validate_mcp_oauth_token(bearer_token)
+    # Checked on every call, cache hits included: a sign-out must stop a token the cache already holds.
+    if (
+        resolution.user_id
+        and resolution.issued_at is not None
+        and await app.AGENT_FUNCTION.is_mcp_oauth_token_signed_out(resolution.user_id, resolution.issued_at)
+    ):
+        raise HTTPException(status_code=401, detail="Session has been signed out")
+    return resolution
+
+
+async def _validate_mcp_oauth_token(bearer_token: str) -> _OAuthResolution:
     """Validate a Clerk-issued Bearer token and resolve the caller's org API key.
 
     Flow:
@@ -611,6 +624,9 @@ async def validate_mcp_oauth_token(bearer_token: str) -> _OAuthResolution:
             raise HTTPException(status_code=401, detail="Opaque Bearer tokens are not supported")
 
         resolution = await _resolve_oauth_subject_to_org(payload, db)
+        issued_at = payload.get("iat")
+        if isinstance(issued_at, (int, float)) and not isinstance(issued_at, bool):
+            resolution = replace(resolution, issued_at=float(issued_at))
     except HTTPException as exc:
         if exc.status_code in {401, 403} and not isinstance(exc, MCPOrgRoleRequiredError):
             _cache_negative_oauth(key)

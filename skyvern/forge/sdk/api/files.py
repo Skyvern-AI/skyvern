@@ -227,8 +227,10 @@ def _determine_download_filename(
 
     file_name = ""
     file_suffix = ""
+    header_stem = ""
     try:
-        file_name, file_suffix = get_file_name_and_suffix_from_headers(response_headers)
+        header_stem, file_suffix = get_file_name_and_suffix_from_headers(response_headers)
+        file_name = header_stem
         if not file_suffix:
             LOG.warning("No extension name retrieved from HTTP headers")
     except Exception:
@@ -242,7 +244,8 @@ def _determine_download_filename(
         LOG.info("No file name retrieved from HTTP headers, using the file name from the URL")
         file_name = os.path.basename(urlparse(url).path) or "download"
 
-    if not is_valid_mime_type(file_name) and file_suffix:
+    # A Content-Disposition stem never carries its own suffix, even a lookalike ("data.csv" of "data.csv.pdf").
+    if file_suffix and ((header_stem and file_name == header_stem) or not is_valid_mime_type(file_name)):
         LOG.info("No file extension detected, adding the extension from HTTP headers")
         file_name = file_name + file_suffix
 

@@ -169,19 +169,28 @@ async def presign_with_sensitive_cap(
     artifacts: list[Artifact],
     presign: Callable[[list[str]], Awaitable[list[str] | None]],
     presign_sensitive: Callable[[list[str]], Awaitable[list[str] | None]],
+    presign_download: Callable[[list[str]], Awaitable[list[str] | None]] | None = None,
 ) -> list[str] | None:
     """Batch-presign artifact URIs, routing screenshots/recordings through the
-    TTL-capped variant (SKY-12527). Order-preserving; None when any underlying
-    call fails, matching the clients' all-or-nothing batch contract.
+    TTL-capped variant (SKY-12527) and downloaded files through ``presign_download``
+    when given. Order-preserving; None when any underlying call fails, matching the
+    clients' all-or-nothing batch contract.
     """
-    sensitive = [i for i, artifact in enumerate(artifacts) if artifact.artifact_type in SENSITIVE_ARTIFACT_TYPES]
-    if not sensitive:
-        return await presign([artifact.uri for artifact in artifacts])
-    other = [i for i, artifact in enumerate(artifacts) if artifact.artifact_type not in SENSITIVE_ARTIFACT_TYPES]
+
+    def mint_for(artifact: Artifact) -> Callable[[list[str]], Awaitable[list[str] | None]]:
+        if artifact.artifact_type in SENSITIVE_ARTIFACT_TYPES:
+            return presign_sensitive
+        if presign_download is not None and artifact.artifact_type == ArtifactType.DOWNLOAD:
+            return presign_download
+        return presign
+
+    groups: dict[Callable[[list[str]], Awaitable[list[str] | None]], list[int]] = {}
+    for index, artifact in enumerate(artifacts):
+        groups.setdefault(mint_for(artifact), []).append(index)
+    if len(groups) <= 1:
+        return await next(iter(groups), presign)([artifact.uri for artifact in artifacts])
     urls: list[str | None] = [None] * len(artifacts)
-    for indices, mint in ((sensitive, presign_sensitive), (other, presign)):
-        if not indices:
-            continue
+    for mint, indices in groups.items():
         minted = await mint([artifacts[i].uri for i in indices])
         if minted is None:
             return None

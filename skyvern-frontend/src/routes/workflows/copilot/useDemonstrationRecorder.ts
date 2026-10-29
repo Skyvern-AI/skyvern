@@ -5,6 +5,7 @@ import { getClient } from "@/api/AxiosClient";
 import { getSseClient } from "@/api/sse";
 import { toast } from "@/components/ui/use-toast";
 import { useCredentialGetter } from "@/hooks/useCredentialGetter";
+import { getErrorDetail } from "@/util/getErrorDetail";
 
 import type {
   CopilotAttachedFile,
@@ -386,8 +387,7 @@ export function useDemonstrationRecorder({
         setAwaitingFileOutcome(false);
         toast({
           title: "Could not upload the file",
-          description:
-            error instanceof Error ? error.message : "Please try again.",
+          description: getErrorDetail(error) ?? "Please try again.",
           variant: "destructive",
         });
       } finally {

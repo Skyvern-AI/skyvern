@@ -15,12 +15,14 @@ import {
   DeliveredOutputFile,
   ProposalDisposition,
   RunOutcomeRole,
+  SkippedPrefixBlock,
   WorkflowCopilotBlockProgressUpdate,
   WorkflowCopilotCodegenProgressUpdate,
   WorkflowCopilotDesignEndUpdate,
   WorkflowCopilotDesignStartUpdate,
   WorkflowCopilotNarrationUpdate,
   WorkflowCopilotRunOutcomeUpdate,
+  WorkflowCopilotRunStartedUpdate,
   WorkflowCopilotScreenshotUpdate,
   WorkflowCopilotStreamErrorUpdate,
   WorkflowCopilotStreamResponseUpdate,
@@ -125,6 +127,7 @@ export type NarrativeEvent =
   | WorkflowCopilotWorkflowDraftUpdate
   | WorkflowCopilotBlockProgressUpdate
   | WorkflowCopilotRunOutcomeUpdate
+  | WorkflowCopilotRunStartedUpdate
   | WorkflowCopilotStreamResponseUpdate
   | WorkflowCopilotStreamErrorUpdate
   | WorkflowCopilotNarrationUpdate
@@ -310,6 +313,8 @@ export interface BlockState {
   outcome?: BlockOutcome;
   outcomeReason?: string;
   outcomeRole?: RunOutcomeRole;
+  // Requested blocks the run did not execute, shown before this, the run's first card.
+  skippedBefore?: SkippedPrefixBlock[];
   lastSeenIteration: number;
   // Tool calls and results emitted while this block was running are
   // appended here so the expanded card shows what the agent did.
@@ -484,6 +489,8 @@ export interface TurnNarrativeState {
   steerMessages: CopilotSteerMessage[];
   // Browser frames captured for the agent this turn, in capture order.
   screenshots: TurnScreenshot[];
+  // Live-only: a started run's skipped prefix, keyed by run id until the run's first block arrives.
+  pendingSkippedPrefix: Record<string, SkippedPrefixBlock[]>;
 }
 
 export interface TurnScreenshot {
@@ -545,6 +552,7 @@ export const EMPTY_NARRATIVE: TurnNarrativeState = Object.freeze({
   budgetExpiry: null,
   steerMessages: [],
   screenshots: [],
+  pendingSkippedPrefix: {},
 }) as TurnNarrativeState;
 
 // Caps to keep long-running narrations from unbounded growth (and to keep
@@ -1517,6 +1525,11 @@ export function applyNarrativeEvent(
       // terminal event take the latest wall clock so a retry-then-succeed
       // sequence reflects the final completion time, not the first failure.
       const endedAt = isTerminal ? eventTs : null;
+      const runId = event.workflow_run_id;
+      const pendingSkipped =
+        previousBlock === null && runId
+          ? prev.pendingSkippedPrefix[runId]
+          : undefined;
       const baseEntry: BlockState = {
         workflowRunBlockId: event.workflow_run_block_id,
         label: event.block_label,
@@ -1528,6 +1541,7 @@ export function applyNarrativeEvent(
         outcome: previousBlock?.outcome,
         outcomeReason: previousBlock?.outcomeReason,
         outcomeRole: previousBlock?.outcomeRole,
+        skippedBefore: previousBlock?.skippedBefore ?? pendingSkipped,
         recordedActions: previousBlock?.recordedActions,
         recordedActionsAt: previousBlock?.recordedActionsAt,
         lastSeenIteration: event.iteration,
@@ -1542,9 +1556,26 @@ export function applyNarrativeEvent(
       }
       return {
         ...prev,
+        pendingSkippedPrefix: pendingSkipped
+          ? Object.fromEntries(
+              Object.entries(prev.pendingSkippedPrefix).filter(
+                ([id]) => id !== runId,
+              ),
+            )
+          : prev.pendingSkippedPrefix,
         blocks: [...prev.blocks, baseEntry].slice(-MAX_BLOCK_ATTEMPTS),
       };
     }
+
+    case "run_started":
+      if (!event.skipped_prefix?.length) return prev;
+      return {
+        ...prev,
+        pendingSkippedPrefix: {
+          ...prev.pendingSkippedPrefix,
+          [event.workflow_run_id]: event.skipped_prefix,
+        },
+      };
 
     case "run_outcome": {
       // Apply the recorded verdict by run-block id only — no label fallback, so
@@ -1939,6 +1970,28 @@ function parseReviewProjection(raw: unknown): ReviewProjection | null {
   return { blocks, duplicateWrites };
 }
 
+function parseSkippedPrefix(raw: unknown): SkippedPrefixBlock[] | undefined {
+  if (!Array.isArray(raw)) return undefined;
+  const entries = raw.flatMap((item): SkippedPrefixBlock[] => {
+    const obj = item as Record<string, unknown>;
+    if (
+      typeof obj?.label !== "string" ||
+      (obj.kind !== "reused" && obj.kind !== "not_run")
+    )
+      return [];
+    return [
+      typeof obj.sourceWorkflowRunId === "string"
+        ? {
+            label: obj.label,
+            kind: obj.kind,
+            sourceWorkflowRunId: obj.sourceWorkflowRunId,
+          }
+        : { label: obj.label, kind: obj.kind },
+    ];
+  });
+  return entries.length > 0 ? entries : undefined;
+}
+
 export function hydrateNarrativeFromPayload(
   payload: Record<string, unknown> | null | undefined,
 ): TurnNarrativeState | undefined {
@@ -2020,6 +2073,7 @@ export function hydrateNarrativeFromPayload(
         outcomeRole,
         outcomeReason:
           typeof obj.outcomeReason === "string" ? obj.outcomeReason : undefined,
+        skippedBefore: parseSkippedPrefix(obj.skippedBefore),
         state: ((): BlockState["state"] => {
           const s = obj.state;
           if (

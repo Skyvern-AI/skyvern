@@ -2458,6 +2458,14 @@ class WorkflowContextManager:
     def remove_workflow_run_context(self, workflow_run_id: str) -> None:
         self.workflow_run_contexts.pop(workflow_run_id, None)
 
+    def remove_workflow_run_context_if_current(
+        self, workflow_run_id: str, workflow_run_context: WorkflowRunContext
+    ) -> bool:
+        if self.workflow_run_contexts.get(workflow_run_id) is not workflow_run_context:
+            return False
+        del self.workflow_run_contexts[workflow_run_id]
+        return True
+
     def has_workflow_run_context(self, workflow_run_id: str) -> bool:
         """Whether a run is live in THIS process. Initialized before any browser is acquired and
         removed in clean_up_workflow, so it is a faithful per-process run-liveness signal — used to

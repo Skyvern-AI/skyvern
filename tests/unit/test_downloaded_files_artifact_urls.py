@@ -524,7 +524,7 @@ def test_content_endpoint_download_non_ascii_filename_does_not_crash_header_enco
 def test_sanitize_header_filename_strips_crlf_and_quotes_directly():
     """Direct unit test on _sanitize_header_filename so we know the function works
     even when urlparse isn't part of the chain (defense in depth)."""
-    from skyvern.forge.sdk.routes.agent_protocol import _sanitize_header_filename
+    from skyvern.utils.content_disposition import sanitize_header_filename as _sanitize_header_filename
 
     assert _sanitize_header_filename('evil"pdf') == "evilpdf"
     assert _sanitize_header_filename("hello\r\nworld.pdf") == "helloworld.pdf"
@@ -544,7 +544,7 @@ def test_content_endpoint_download_filename_preserves_question_and_hash():
 def test_sanitize_header_filename_strips_bidi_and_format_characters():
     """Unicode bidi overrides and format chars (ZWSP, RLO, ZWNBSP) enable filename
     spoofing in the browser's download UI (``invoice\\u202efdp.exe`` -> ``invoice.exe.pdf``)."""
-    from skyvern.forge.sdk.routes.agent_protocol import _sanitize_header_filename
+    from skyvern.utils.content_disposition import sanitize_header_filename as _sanitize_header_filename
 
     assert "\u202e" not in _sanitize_header_filename("invoice\u202efdp.exe")
     assert "\u200b" not in _sanitize_header_filename("stealth\u200b.pdf")
@@ -554,7 +554,7 @@ def test_sanitize_header_filename_strips_bidi_and_format_characters():
 def test_ascii_fallback_filename_preserves_stem_for_pure_unicode_names():
     """Pure non-ASCII names (e.g. CJK, emoji) must not reduce to a bare ``.pdf`` hidden
     dotfile after the NFKD strip; fall back to a ``download`` stem instead."""
-    from skyvern.forge.sdk.routes.agent_protocol import _ascii_fallback_filename
+    from skyvern.utils.content_disposition import ascii_fallback_filename as _ascii_fallback_filename
 
     assert _ascii_fallback_filename("文档.pdf") == "download.pdf"
     assert _ascii_fallback_filename("🎉.pdf") == "download.pdf"
@@ -564,7 +564,7 @@ def test_ascii_fallback_filename_preserves_stem_for_pure_unicode_names():
 
 def test_sanitize_header_filename_strips_control_characters():
     """NUL/DEL/C1 control chars are valid Latin-1 bytes but violate RFC 7230 header syntax."""
-    from skyvern.forge.sdk.routes.agent_protocol import _sanitize_header_filename
+    from skyvern.utils.content_disposition import sanitize_header_filename as _sanitize_header_filename
 
     assert "\x00" not in _sanitize_header_filename("evil\x00.pdf")
     assert "\x7f" not in _sanitize_header_filename("evil\x7f.pdf")
@@ -824,7 +824,7 @@ async def test_retry_downloads_preserve_attempt_objects_and_rows(
     async def get_object_info(uri: str):
         return object_info[uri]
 
-    async def sign_urls(uris: list[str]):
+    async def sign_urls(uris: list[str], **_: object):
         return [f"https://storage.example{urlparse(uri).path}?signature=test" for uri in uris]
 
     async def find(*, uri: str, **kwargs):
@@ -1343,7 +1343,7 @@ async def test_partial_bytes_are_neither_published_nor_returned(tmp_path, monkey
     setattr(
         storage.async_client,
         signing,
-        AsyncMock(side_effect=lambda uris: ["https://storage.example/file" for _ in uris]),
+        AsyncMock(side_effect=lambda uris, **_: ["https://storage.example/file" for _ in uris]),
     )
     monkeypatch.setattr(
         manager,

@@ -171,6 +171,7 @@ def _patch_execute_workflow_deps(
         has_workflow_run_context=lambda _workflow_run_id: True,
         get_workflow_run_context=lambda _workflow_run_id: workflow_run_context,
         remove_workflow_run_context=lambda _workflow_run_id: None,
+        remove_workflow_run_context_if_current=lambda _workflow_run_id, _workflow_run_context: True,
     )
     database = SimpleNamespace(
         workflow_runs=SimpleNamespace(
@@ -939,6 +940,7 @@ async def test_cleanup_claims_session_downloads_from_retry_attempt_start(
         "WORKFLOW_CONTEXT_MANAGER",
         SimpleNamespace(
             remove_workflow_run_context=lambda _workflow_run_id: None,
+            remove_workflow_run_context_if_current=lambda _workflow_run_id, _workflow_run_context: True,
             has_workflow_run_context=lambda _workflow_run_id: False,
         ),
     )
