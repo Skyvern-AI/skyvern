@@ -154,7 +154,7 @@ from skyvern.webeye.utils.flutter_semantics import (
 )
 from skyvern.webeye.utils.page import (
     OTP_INPUT_PRIVACY_JS,
-    OTP_SAFE_FRAGMENT_HTML_JS,
+    OTP_SAFE_ELEMENT_HTML_JS,
     SkyvernFrame,
     mask_otp_values_in_html,
 )
@@ -15084,14 +15084,12 @@ def build_browser_tools(
             # Falling through to markup would hand back the whole-page dump the prompt forbids, on a
             # typo the model cannot see. The enum is advisory: the spec is not emitted strict.
             return ToolResult.error(f'unknown format {args.get("format")!r}: use "html" or "text"')
-        # Whether the requested element's OWN start tag is in the answer, rather than only its
-        # descendants': `inner` markup opens with a child, which is a different element.
         if selector:
             el = await page.query_selector(selector)
             if el is None:
                 return ToolResult.error(f"no element for selector {selector!r}", error_class="stale_selector")
             try:
-                html = mask_otp_values_in_html(await el.evaluate(OTP_SAFE_FRAGMENT_HTML_JS))
+                html = mask_otp_values_in_html(await el.evaluate(OTP_SAFE_ELEMENT_HTML_JS))
             except Exception:
                 # A navigation between the two reads must not turn "" into a tool error.
                 html = ""
@@ -23131,7 +23129,8 @@ def build_browser_tools(
         ),
         _spec(
             "get_html",
-            "Get raw outer/inner HTML of the page or a specific element (for detail beyond observe), or "
+            "Get the raw HTML of the page, or with a selector that element's own markup: its tag and "
+            "attributes plus everything inside it (for detail beyond observe). Or "
             'with format "text" its rendered visible text instead - what a user sees, no markup. Both '
             f"are capped at {HTML_MAX_CHARS} chars per call; a cut result reports the total size and the "
             "offset that continues the read, so a page larger than one call is read in parts.",

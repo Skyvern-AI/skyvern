@@ -353,6 +353,7 @@ def _reset_all_verified_trust(copilot_ctx: Any) -> None:
     evidence = copilot_ctx.workflow_verification_evidence
     copilot_ctx.verified_prefix_labels = []
     copilot_ctx.composition_verified_labels = []
+    copilot_ctx.untaken_branch_labels = {}
     copilot_ctx.verified_block_outputs = {}
     copilot_ctx.verified_prefix_block_end_urls = {}
     copilot_ctx.verified_prefix_block_end_session_id = None
@@ -482,7 +483,11 @@ def _apply_verified_state_invalidation(
             _reset_all_verified_trust(copilot_ctx)
         return
     prior_labels = _workflow_definition_block_labels(prior_definition)
-    trusted = set(copilot_ctx.verified_prefix_labels or []) | set(evidence.block_verified or [])
+    trusted = (
+        set(copilot_ctx.verified_prefix_labels or [])
+        | set(evidence.block_verified or [])
+        | set(copilot_ctx.untaken_branch_labels)
+    )
 
     invalidated: set[str] = set()
     if trusted:
@@ -508,6 +513,11 @@ def _apply_verified_state_invalidation(
         copilot_ctx.verified_prefix_labels = [
             label for label in copilot_ctx.verified_prefix_labels if label not in invalidated
         ]
+        copilot_ctx.untaken_branch_labels = {
+            label: conditional_label
+            for label, conditional_label in copilot_ctx.untaken_branch_labels.items()
+            if label not in invalidated and conditional_label not in invalidated
+        }
         # Composition credit is an ordered prefix, so an invalidated block ends it there: the
         # labels after it were only composed by way of the block that just changed.
         credited = list(copilot_ctx.composition_verified_labels or [])
@@ -525,14 +535,15 @@ def _apply_verified_state_invalidation(
     # a reorder or upstream insertion breaks that (set-membership trust is
     # order-blind), so fail closed when it no longer is.
     current_labels = _workflow_definition_block_labels(new_definition)
+    settled = set(copilot_ctx.untaken_branch_labels)
     remaining = list(copilot_ctx.verified_prefix_labels or [])
-    if remaining and remaining != current_labels[: len(remaining)]:
+    if remaining and remaining != [label for label in current_labels if label not in settled][: len(remaining)]:
         _reset_all_verified_trust(copilot_ctx)
         return
 
     # The end-to-end claim survives only an identical block list whose every block
     # is still verified, so append/removal/reorder/config edits all drop it.
-    verified = set(remaining) | set(evidence.block_verified or [])
+    verified = set(remaining) | set(evidence.block_verified or []) | settled
     if not (current_labels == prior_labels and all(label in verified for label in current_labels)):
         evidence.full_workflow_verified = False
         copilot_ctx.last_full_workflow_test_ok = False

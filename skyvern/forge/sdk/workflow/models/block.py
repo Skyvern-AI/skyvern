@@ -20729,3 +20729,30 @@ def resolve_conditional_merge_edges(
                         changed = True
                         break
                     cur = nxt
+
+
+def labels_only_on_untaken_branches(
+    conditional: ConditionalBlock,
+    taken_label: str | None,
+    label_to_block: dict[str, BlockTypeVar],
+    default_next_map: dict[str, str | None],
+) -> set[str]:
+    """A nested conditional counts as reaching every branch target, since it has not chosen one yet."""
+
+    def reachable(start_labels: set[str | None]) -> set[str]:
+        seen: set[str] = set()
+        pending = list(start_labels)
+        while pending:
+            label = pending.pop()
+            if label is None or label in seen or label not in label_to_block:
+                continue
+            seen.add(label)
+            block = label_to_block[label]
+            if isinstance(block, ConditionalBlock):
+                pending.extend(branch.next_block_label for branch in block.ordered_branches)
+            pending.append(default_next_map.get(label))
+        return seen
+
+    own_next = default_next_map.get(conditional.label)
+    targets = {branch.next_block_label or own_next for branch in conditional.ordered_branches}
+    return reachable(targets - {taken_label}) - reachable({taken_label})
