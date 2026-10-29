@@ -753,6 +753,7 @@ export interface WorkflowCopilotBlockProgressUpdate {
 export interface WorkflowCopilotRunStartedUpdate {
   type: "run_started";
   workflow_run_id: string;
+  skipped_prefix?: SkippedPrefixBlock[];
   timestamp: string;
 }
 
@@ -763,6 +764,12 @@ export type WorkflowCopilotRunOutcomeVerdict =
   | "not_evaluated";
 
 export type RunOutcomeRole = "recorded" | "adjudicated" | "interim_build_test";
+
+export interface SkippedPrefixBlock {
+  label: string;
+  kind: "reused" | "not_run";
+  sourceWorkflowRunId?: string;
+}
 
 export interface WorkflowCopilotRunOutcomeUpdate {
   type: "run_outcome";

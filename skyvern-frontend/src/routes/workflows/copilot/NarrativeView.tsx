@@ -46,7 +46,11 @@ import {
 } from "./copilotActivityLog";
 import { TURN_ROW_INSET, TURN_ROW_OUTSET } from "./cards/cardLayout";
 import { showPhaseChecklist } from "./copilotPhases";
-import { CodeWriteDiff, CopilotTestInput } from "./workflowCopilotTypes";
+import {
+  CodeWriteDiff,
+  CopilotTestInput,
+  SkippedPrefixBlock,
+} from "./workflowCopilotTypes";
 import { useWorkflowRunByIdQuery } from "../hooks/useWorkflowRunQuery";
 import { RunFieldValue } from "../studio/runview/RunFieldValue";
 import { WorkflowParameterValueType } from "../types/workflowTypes";
@@ -150,17 +154,9 @@ function outcomeNotConfirmedOwnerKey(turn: TurnNarrativeState): string | null {
   for (let i = turn.blocks.length - 1; i >= 0; i -= 1) {
     const block = turn.blocks[i]!;
     if (
-      block.state === "completed" &&
-      block.outcome === "not_demonstrated" &&
-      !isInterimOutcome(block.outcomeRole)
-    ) {
-      return blockIdentity(block);
-    }
-  }
-
-  for (let i = turn.blocks.length - 1; i >= 0; i -= 1) {
-    const block = turn.blocks[i]!;
-    if (
+      (block.state === "completed" &&
+        block.outcome === "not_demonstrated" &&
+        !isInterimOutcome(block.outcomeRole)) ||
       block.state === "failed" ||
       block.state === "stopped" ||
       block.state === "unfinished"
@@ -1328,6 +1324,48 @@ function FCardActionRow({
 
 // One card per block run of a test. The header says where the block stands;
 // the body holds the code change that block got and the steps its run took.
+const SKIPPED_PREFIX_NOTE: Record<SkippedPrefixBlock["kind"], string> = {
+  reused: "Reused from an earlier test",
+  not_run: "Not run in this test",
+};
+
+function FSkippedPrefixRow({
+  skipped,
+  onSelect,
+}: {
+  skipped: SkippedPrefixBlock;
+  onSelect?: (label: string) => void;
+}) {
+  const tone = TEST_CARD_TONE.neutral;
+  return (
+    <div
+      data-testid="copilot-skipped-prefix-row"
+      data-kind={skipped.kind}
+      className={`overflow-hidden rounded-lg border ${tone.card}`}
+    >
+      <button
+        type="button"
+        className="flex w-full min-w-0 items-start gap-2 px-3 py-[11px] text-left text-[12.5px] leading-5"
+        title={`Highlight ${skipped.label} on canvas`}
+        onClick={() => onSelect?.(skipped.label)}
+      >
+        <span
+          className={`flex h-5 w-3.5 shrink-0 items-center justify-center text-[12px] font-bold ${tone.glyph}`}
+          aria-hidden="true"
+        >
+          {skipped.kind === "reused" ? "↺" : "–"}
+        </span>
+        <span className="min-w-0 flex-1 break-words">
+          <span className="text-foreground">
+            {humanizeBlockLabel(skipped.label)}
+          </span>
+          <span className="text-muted-foreground">{`${SEP}${SKIPPED_PREFIX_NOTE[skipped.kind]}`}</span>
+        </span>
+      </button>
+    </div>
+  );
+}
+
 function FTestRunCard({
   block,
   diff,
@@ -1936,7 +1974,7 @@ function FActivityLogRow({
         ? outcomeReasonFallback
         : null;
     const cardIsOpen = isCardOpen(block);
-    return (
+    const card = (
       <FTestRunCard
         key={key}
         block={block}
@@ -1957,6 +1995,19 @@ function FActivityLogRow({
         onToggle={() => onCardToggle(key, cardIsOpen)}
         onSelect={onBlockSelect}
       />
+    );
+    if (!block.skippedBefore) return card;
+    return (
+      <Fragment key={key}>
+        {block.skippedBefore.map((skipped) => (
+          <FSkippedPrefixRow
+            key={`${key}-skipped-${skipped.label}`}
+            skipped={skipped}
+            onSelect={onBlockSelect}
+          />
+        ))}
+        {card}
+      </Fragment>
     );
   };
   const diffNodes = row.codeDiffs
@@ -2687,14 +2738,22 @@ function DetailView({
         {!showChecklist && hasBlocks ? (
           <div className={`flex flex-col gap-1 ${TURN_ROW_INSET}`}>
             {observedBlocks.map((b) => (
-              <FBlockRun
-                key={b.workflowRunBlockId || b.label}
-                block={b}
-                turnEnded={turn.terminal !== null}
-                onSelect={onBlockSelect}
-                outcomeReasonFallback={collapsedOutcomeReason}
-                ownsOutcomeNotConfirmed={blockIdentity(b) === outcomeOwnerKey}
-              />
+              <Fragment key={blockIdentity(b)}>
+                {(b.skippedBefore ?? []).map((skipped) => (
+                  <FSkippedPrefixRow
+                    key={`${blockIdentity(b)}-skipped-${skipped.label}`}
+                    skipped={skipped}
+                    onSelect={onBlockSelect}
+                  />
+                ))}
+                <FBlockRun
+                  block={b}
+                  turnEnded={turn.terminal !== null}
+                  onSelect={onBlockSelect}
+                  outcomeReasonFallback={collapsedOutcomeReason}
+                  ownsOutcomeNotConfirmed={blockIdentity(b) === outcomeOwnerKey}
+                />
+              </Fragment>
             ))}
           </div>
         ) : null}

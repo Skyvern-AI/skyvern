@@ -89,6 +89,7 @@ import {
   WorkflowApiResponse,
   WorkflowSettings,
 } from "@/routes/workflows/types/workflowTypes";
+import { getUploadTypeRejection } from "@/util/getErrorDetail";
 import { parseHeaderJson } from "@/util/secretHeaders";
 import { canvasWorkflowVersionFromSaveData } from "@/routes/workflows/editor/workflowVersionFromSaveData";
 import { describeRecordedAction } from "@/routes/workflows/workflowBlockUtils";
@@ -5867,13 +5868,16 @@ export function WorkflowCopilotChat({
           },
         ]);
       } catch (error) {
+        const typeRejection = getUploadTypeRejection(error);
         setPendingAttachments((prev) =>
           prev.map((item) =>
             item.localId === localId
               ? {
                   ...item,
                   status: "error",
-                  error: "upload failed",
+                  error: typeRejection
+                    ? "file type not allowed"
+                    : "upload failed",
                 }
               : item,
           ),
@@ -5881,7 +5885,9 @@ export function WorkflowCopilotChat({
         toast({
           variant: "destructive",
           title: "Upload failed",
-          description: `Could not attach ${file.name}. Try again.`,
+          description: typeRejection
+            ? `Could not attach ${file.name}. ${typeRejection}`
+            : `Could not attach ${file.name}. Try again.`,
         });
       }
     },
@@ -8584,6 +8590,7 @@ export function WorkflowCopilotChat({
                 applyStoredNarrativeEvent(payload);
                 return false;
               case "run_started":
+                applyStoredNarrativeEvent(payload);
                 focusTurnRun(payload.workflow_run_id);
                 return false;
               case "block_progress":

@@ -107,7 +107,22 @@ type UISessionResponse = {
 
 type UISessionRetryConfig = InternalAxiosRequestConfig & {
   uiSessionRetry?: boolean;
+  signedOutRetry?: boolean;
 };
+
+// Must match SIGNED_OUT_DETAIL in cloud/core/authentication.py.
+const SIGNED_OUT_DETAIL = "Session has been signed out";
+let freshCredentialGetter: CredentialGetter | null = null;
+
+// A sign-out on one device refuses every token the user minted before it, including the one
+// another live session still has cached; that session retries once with a newly minted token.
+// Clerk stamps iat in whole seconds and the API refuses iat <= its cutoff, so a token minted in the
+// sign-out's own second is refused too. Waiting a second guarantees the new token's iat is past it.
+const SIGNED_OUT_REMINT_DELAY_MS = 1_000;
+
+export function setFreshCredentialGetter(getter: CredentialGetter | null) {
+  freshCredentialGetter = getter;
+}
 
 const UI_SESSION_REQUEST_TIMEOUT_MS = 10_000;
 
@@ -307,6 +322,28 @@ clients.forEach((instance) => {
           getResponseErrorCode(error.response?.data) ===
           "organization_admin_required";
         const retryConfig = error.config as UISessionRetryConfig | undefined;
+        if (
+          statusCode === 403 &&
+          detail === SIGNED_OUT_DETAIL &&
+          retryConfig &&
+          !retryConfig.signedOutRetry &&
+          freshCredentialGetter
+        ) {
+          retryConfig.signedOutRetry = true;
+          await new Promise((resolve) =>
+            setTimeout(resolve, SIGNED_OUT_REMINT_DELAY_MS),
+          );
+          // A sign-out clears the getter; one during the wait or the mint must not install a token past its cutoff.
+          const getFreshCredential = freshCredentialGetter;
+          const credential = getFreshCredential
+            ? await getFreshCredential().catch(() => null)
+            : null;
+          if (credential && freshCredentialGetter === getFreshCredential) {
+            setAuthorizationHeader(credential);
+            retryConfig.headers.set("Authorization", `Bearer ${credential}`);
+            return await instance.request(retryConfig);
+          }
+        }
         if (
           (statusCode === 401 ||
             (statusCode === 403 && !isOrganizationAdminDenial)) &&

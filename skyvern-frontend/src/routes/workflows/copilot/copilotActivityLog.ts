@@ -134,7 +134,9 @@ function anchorRunRow(
     return undefined;
   }
   const timedRows = runRows.map((row) => ({ row, started: runStartedMs(row) }));
-  const blockStartedMs = parseUtcIsoMs(block.startedAt);
+  // A short block can be first polled finished, so live it has no start time
+  // while its reloaded payload does; its end still falls inside its own run.
+  const blockStartedMs = parseUtcIsoMs(block.startedAt ?? block.endedAt);
   if (blockStartedMs === null) {
     return (
       timedRows.reduce<ActivityRow | undefined>((latest, candidate) => {

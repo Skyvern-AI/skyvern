@@ -102,17 +102,30 @@ describe("activity timestamp parity across hydration", () => {
 
     expect(live.draft?.blockCount).toBe(20);
     expect(live.blocks.map((block) => block.workflowRunBlockId)).toEqual([
+      "wrb_upstream",
       "wrb_first",
       "wrb_retry",
     ]);
     expect(live.blocks.map((block) => block.label)).toEqual([
+      "block_18",
       "block_19",
       "block_19",
     ]);
+    // The failed run's completed upstream row keeps its own state, not the failure's verdict.
     expect(live.blocks.map((block) => block.outcome)).toEqual([
+      undefined,
       "not_demonstrated",
       "not_evaluated",
     ]);
+    expect(live.blocks[0]!.outcomeReason).toBeUndefined();
+    expect(live.blocks.map((block) => block.skippedBefore)).toEqual([
+      undefined,
+      undefined,
+      [{ label: "block_18", kind: "reused" }],
+    ]);
+    const rowFacts = (turn: TurnNarrativeState) =>
+      turn.blocks.map((b) => [b.outcome, b.outcomeReason, b.skippedBefore]);
+    expect(rowFacts(hydrated)).toEqual(rowFacts(live));
     expect(terminal.blocks).toEqual(hydrated.blocks);
   });
 
