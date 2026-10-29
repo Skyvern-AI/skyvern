@@ -215,6 +215,7 @@ async def cancel_task_v2(
         organization_id=organization_id,
         on_transition=_on_transition,
         audit_actor=audit_actor,
+        requested_externally=True,
     )
     # A task v2's attachments are bound to the workflow run it executes as, not to task_id.
     if task_v2.workflow_run_id:
@@ -268,7 +269,9 @@ async def cancel_workflow_run(
             WorkflowRunStatus.paused,
         ]:
             continue
-        await app.WORKFLOW_SERVICE.mark_workflow_run_as_canceled(child_workflow_run.workflow_run_id)
+        await app.WORKFLOW_SERVICE.mark_workflow_run_as_canceled(
+            child_workflow_run.workflow_run_id, requested_externally=True
+        )
 
     attempt_rows = await app.DATABASE.workflow_run_attempts.get_attempts(workflow_run_id)
     if workflow_run.status.is_final() and attempt_rows:
@@ -292,7 +295,9 @@ async def cancel_workflow_run(
         cancel_kwargs["on_transition"] = on_transition
     if audit_actor is not None:
         cancel_kwargs["audit_actor"] = audit_actor
-    workflow_run = await app.WORKFLOW_SERVICE.mark_workflow_run_as_canceled(workflow_run_id, **cancel_kwargs)
+    workflow_run = await app.WORKFLOW_SERVICE.mark_workflow_run_as_canceled(
+        workflow_run_id, requested_externally=True, **cancel_kwargs
+    )
     attempt_rows = await app.DATABASE.workflow_run_attempts.get_attempts(workflow_run_id)
     if attempt_rows:
         decision = await get_recorded_decision(workflow_run_id)

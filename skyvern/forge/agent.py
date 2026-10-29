@@ -11044,7 +11044,6 @@ class ForgeAgent:
             )
             status_changed = False
         if final_write_blocked and updated_task.status != status:
-            note_run_finalized(task.task_id)
             return updated_task, status_changed
         if status.is_final():
             note_run_finalized(task.task_id)

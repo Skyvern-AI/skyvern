@@ -1515,10 +1515,11 @@ class WorkflowRunsRepository(BaseRepository):
         require_latest_attempt_number: int | None = None,
         audit_actor: RequestPrincipal | None = None,
         on_transition: Callable[[], Awaitable[None]] | None = None,
+        on_committed: Callable[[], None] | None = None,
     ) -> WorkflowRun | None:
         """One conditional UPDATE to ``status`` from a non-terminal state (``only_from`` narrows it), so a late
         cancel cannot clobber a finalization; None when the row was terminal or missing. Timestamps follow
-        :meth:`update_workflow_run`."""
+        :meth:`update_workflow_run`. ``on_committed`` runs synchronously once this write has won and committed."""
         non_terminal = [
             s.value for s in WorkflowRunStatus if not s.is_final() and (only_from is None or s in only_from)
         ]
@@ -1600,6 +1601,9 @@ class WorkflowRunsRepository(BaseRepository):
             await session.commit()
             if workflow_run_result is None:
                 return None
+            if on_committed is not None:
+                # Before every await below: the cancel audit, the transition hook and the log save.
+                on_committed()
             if status == WorkflowRunStatus.canceled and audit_actor is not None:
                 await record_run_cancel_audit(
                     audit_actor, workflow_run_result.organization_id, "workflow_run", workflow_run_id

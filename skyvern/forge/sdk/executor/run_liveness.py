@@ -5,11 +5,13 @@ import os
 import socket
 import time
 import uuid
+import weakref
 from collections.abc import Awaitable, Callable, Iterator
 from contextlib import contextmanager
-from dataclasses import dataclass
+from contextvars import ContextVar
+from dataclasses import dataclass, field
 from datetime import timedelta
-from typing import TYPE_CHECKING, Any, Literal
+from typing import TYPE_CHECKING, Any, Literal, NamedTuple
 
 import structlog
 
@@ -35,6 +37,8 @@ _held: set[str] = set()
 _tasks: set[asyncio.Task[None]] = set()
 _side_effect_tasks: set[asyncio.Task[None]] = set()
 _side_effect_limit = asyncio.Semaphore(10)
+# Tasks this module already cancelled; a second cancellation would interrupt the cleanup the first one started.
+_interrupted: weakref.WeakSet[asyncio.Task[Any]] = weakref.WeakSet()
 
 
 @dataclass
@@ -46,6 +50,30 @@ class _Registration:
     acquired: bool = False
     lost: bool = False
     finalized: bool = False
+    # Registrations open where this one was entered: an inline child's task is awaited by its parent's.
+    enclosing: tuple[_Registration, ...] = field(default=(), repr=False)
+    cancel_seen: bool = False
+    # This execution's own conditional write set the run canceled; delivery must not interrupt its cleanup.
+    internal_cancel_won: bool = False
+
+
+class RunExecution(NamedTuple):
+    """A registration as bound when an execution entered it; the registration itself is re-bound in place."""
+
+    entry: _Registration
+    task: asyncio.Task[Any] | None
+    attempt_number: int | None
+
+    def is_current(self, run_id: str) -> bool:
+        return (
+            self.task is not None
+            and _registry.get(run_id) is self.entry
+            and self.entry.task is self.task
+            and self.entry.attempt_number == self.attempt_number
+        )
+
+
+_open_executions: ContextVar[tuple[RunExecution, ...]] = ContextVar("run_liveness_open_executions", default=())
 
 
 def owner_id() -> str:
@@ -76,9 +104,15 @@ def _register(
     _kept_leases.discard(run_id)
     entry = _registry.get(run_id)
     if entry is None or entry.attempt_number != attempt_number:
-        entry = _Registration(run_type, attempt_number)
+        entry = _Registration(run_type, attempt_number, enclosing=_open_entries())
         _registry[run_id] = entry
     entry.count += 1
+    if entry.task is not task:
+        entry.cancel_seen = False
+        entry.internal_cancel_won = False
+        if task is not None:
+            # A held run's scope is where it executes: the dispatcher that held it may be another live run.
+            entry.enclosing = _open_entries()
     entry.task = task
     _wake.set()
     released = False
@@ -105,6 +139,10 @@ def track_run(run_id: str, run_type: str, attempt_number: int | None = None) -> 
     except RuntimeError:
         task = None
     release = _register(run_id, run_type, attempt_number, task)
+    enclosing = _open_executions.get()
+    entry = _registry.get(run_id) if _enabled else None
+    if entry is not None:
+        _open_executions.set((*enclosing, RunExecution(entry, entry.task, entry.attempt_number)))
     cancelled = False
     try:
         yield
@@ -112,7 +150,28 @@ def track_run(run_id: str, run_type: str, attempt_number: int | None = None) -> 
         cancelled = True
         raise
     finally:
+        _open_executions.set(enclosing)
         release(cancelled)
+
+
+def _open_entries() -> tuple[_Registration, ...]:
+    return tuple(scope.entry for scope in _open_executions.get())
+
+
+def current_execution(run_id: str) -> RunExecution | None:
+    """The caller's own execution of the run, if the registration is still bound as that execution entered it."""
+    return next((scope for scope in _open_executions.get() if scope.is_current(run_id)), None)
+
+
+def note_internal_cancel_won(run_id: str, execution: RunExecution | None) -> None:
+    """Record that the execution captured before its canceled write won that write, if it is still the same one."""
+    if execution is not None and execution.is_current(run_id):
+        execution.entry.internal_cancel_won = True
+
+
+def start_independent_run_scope() -> None:
+    """Detach a fire-and-forget run from the registrations of the run that dispatched it."""
+    _open_executions.set(())
 
 
 def hold_run(run_id: str, run_type: str) -> Callable[[], None]:
@@ -226,10 +285,66 @@ def _cancel_lost_runs(entries: list[_Registration]) -> None:
     # Repeated cancellation would interrupt the cleanup started by the first cancellation.
     lost_targets = {entry.task for entry in entries if entry.task is not None and not entry.finalized}
     for target in lost_targets:
-        if not target.done() and all(
-            entry.lost and not entry.finalized for entry in _registry.values() if entry.task is target
+        if (
+            not target.done()
+            and target not in _interrupted
+            and all(entry.lost and not entry.finalized for entry in _registry.values() if entry.task is target)
         ):
+            _interrupted.add(target)
             target.cancel()
+
+
+async def _deliver_accepted_cancels() -> None:
+    """Cancel this process's execution of a run whose row an accepted cancel has set to canceled.
+
+    Unlike lease loss, a finalized registration is not exempt. A run is cancelled once, after its row was seen
+    canceled on two consecutive passes, so an execution that notices the row at its next block finishes on its own.
+    """
+    # Snapshot the task and attempt too: a registration can be re-bound to a new task while the query awaits.
+    observed = {
+        run_id: (entry, entry.task, entry.attempt_number)
+        for run_id, entry in _registry.items()
+        if entry.run_type == "workflow_run" and entry.task is not None
+    }
+    if not observed:
+        return
+    rows = await app.DATABASE.workflow_runs.get_workflow_runs_by_ids(list(observed))
+    canceled = {row.workflow_run_id for row in rows if row.status == "canceled"}
+
+    def unchanged(run_id: str, entry: _Registration) -> bool:
+        snapshot = observed.get(run_id)
+        return (
+            snapshot is not None
+            and snapshot[0] is entry
+            and _registry.get(run_id) is entry
+            and entry.task is snapshot[1]
+            and entry.attempt_number == snapshot[2]
+        )
+
+    registered = {id(entry) for entry in _registry.values()}
+    for run_id, (entry, target, _) in observed.items():
+        if not unchanged(run_id, entry):
+            continue
+        if run_id not in canceled:
+            entry.cancel_seen = False
+            continue
+        if not entry.cancel_seen:
+            entry.cancel_seen = True
+            continue
+        if target is None or target.done() or target in _interrupted:
+            continue
+        # An inline child's task is awaited by an enclosing run, which is cancelled through its own registration.
+        if any(id(outer) in registered for outer in entry.enclosing):
+            continue
+        sharing = [(other_id, other) for other_id, other in _registry.items() if other.task is target]
+        # A run that set itself canceled is finishing its own cleanup.
+        if any(other.internal_cancel_won for _, other in sharing):
+            continue
+        # Every run executing on the task must be one observed canceled in this pass.
+        if all(other_id in canceled and unchanged(other_id, other) for other_id, other in sharing):
+            _interrupted.add(target)
+            target.cancel()
+            LOG.info("Cancelled the execution of a canceled run", run_id=run_id, attempt_number=entry.attempt_number)
 
 
 async def _heartbeat(repository: RunExecutionLeasesRepository) -> None:
@@ -268,6 +383,10 @@ async def _heartbeat(repository: RunExecutionLeasesRepository) -> None:
                         owner_id=owner_id(),
                     )
                 _cancel_lost_runs(newly_lost)
+                try:
+                    await _deliver_accepted_cancels()
+                except Exception:
+                    LOG.warning("Failed to check for canceled runs", owner_id=owner_id(), exc_info=True)
             async with _lease_write_lock:
                 acquiring = {
                     key: (entry, entry.attempt_number)
