@@ -41,6 +41,7 @@ if TYPE_CHECKING:
     # must not pull a service module at import time. String annotation below.
     from skyvern.services.script_reviewer_v3.budget import RunBudget
     from skyvern.webeye.actions.actions import Action
+    from skyvern.webeye.utils.challenge_solve_record import ChallengeSolveReceipt
 
 
 @dataclass
@@ -1036,6 +1037,8 @@ class SkyvernContext:
     captcha_solve_latch_key: str | None = None
     # Challenge-solve calls recorded per run id in this run's context; the solve ledger's attempt number.
     challenge_solve_attempts: dict[str, int] = field(default_factory=dict)
+    # The latest finished solve calls' receipts, oldest first, capped by the solve ledger.
+    challenge_solve_receipts: list[ChallengeSolveReceipt] = field(default_factory=list)
 
     # Browser dialogs captured since the last agent prompt build, surfaced into the
     # next extract-action prompt so the LLM can react to validation rejections.

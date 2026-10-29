@@ -1,14 +1,18 @@
 import asyncio
 import json
 from collections.abc import Callable
+from dataclasses import dataclass, field
 from datetime import datetime
 from types import SimpleNamespace
+from typing import Any
+from unittest.mock import AsyncMock
 
 import httpx
 import pytest
 
 from skyvern.cli.mcp_tools import mcp as skyvern_mcp
 from skyvern.forge import app
+from skyvern.forge.agent_functions import AgentFunction
 from skyvern.forge.sdk.copilot.agent import _make_agent_result, _reshow_unselected_google_setup
 from skyvern.forge.sdk.copilot.browser_ablation import (
     REPAIR_PROBE_MODES,
@@ -31,18 +35,24 @@ from skyvern.forge.sdk.copilot.tools.integrations import (
     _list_integrations,
     _read_google_sheet,
     _request_google_connection,
-    _serialize,
 )
 from skyvern.forge.sdk.copilot.turn_outcome import connected_account_choice_context
+from skyvern.forge.sdk.db.enums import OrganizationAuthTokenType
+from skyvern.forge.sdk.integrations import catalog
+from skyvern.forge.sdk.integrations.catalog import integrations_for_org, page_payload, serialize_oauth_account
 from skyvern.forge.sdk.schemas.copilot_turn_outcome import ResponseKind, TurnOutcome
 from skyvern.forge.sdk.schemas.google_oauth import GoogleOAuthCredentialBase
 from skyvern.forge.sdk.schemas.microsoft_oauth import MicrosoftOAuthCredentialBase
+from skyvern.forge.sdk.schemas.organizations import BitwardenCredential, BitwardenOrganizationAuthToken
+from skyvern.forge.sdk.settings_manager import SettingsManager
 from tests.unit.copilot_test_helpers import make_copilot_ctx
 
 ORGANIZATION_ID = "o_test_org"
 SHEETS_SCOPE = "https://www.googleapis.com/auth/spreadsheets"
 GMAIL_READ_SCOPE = "https://www.googleapis.com/auth/gmail.readonly"
 GMAIL_SEND_SCOPE = "https://www.googleapis.com/auth/gmail.send"
+DRIVE_SCOPE = "https://www.googleapis.com/auth/drive"
+DRIVE_METADATA_SCOPE = "https://www.googleapis.com/auth/drive.metadata.readonly"
 
 TOKEN_FIELD_NAMES = (
     "access_token",
@@ -83,64 +93,222 @@ def _microsoft(**overrides: object) -> MicrosoftOAuthCredentialBase:
     return MicrosoftOAuthCredentialBase(**{**defaults, **overrides})
 
 
+SKYVERN_ENTRY_IDS = [
+    "google_sheets",
+    "gmail",
+    "outlook",
+    "twilio",
+    "google_drive",
+    "mcp",
+    "onepassword",
+    "bitwarden",
+    "azure_key_vault",
+    "custom_credential_service",
+]
+SENTINELS = (
+    "SENTINEL-gmail-access-token",
+    "SENTINEL-gmail-refresh-token",
+    "SENTINEL-bitwarden-master-password",
+    "SENTINEL-instance-onepassword-token",
+)
+
+
+class _TokenBearingGoogleCredential(GoogleOAuthCredentialBase):
+    access_token: str
+    refresh_token: str
+
+
+@dataclass
+class _OrgState:
+    google: list[GoogleOAuthCredentialBase] = field(default_factory=list)
+    microsoft: list[MicrosoftOAuthCredentialBase] = field(default_factory=list)
+    configured: set[OrganizationAuthTokenType] = field(default_factory=set)
+    stored_tokens: dict[OrganizationAuthTokenType, BitwardenOrganizationAuthToken] = field(default_factory=dict)
+    failing: set[str] = field(default_factory=set)
+    stalled: set[str] = field(default_factory=set)
+
+
 @pytest.fixture
-def patched_services(monkeypatch: pytest.MonkeyPatch):
-    def _apply(google: list[GoogleOAuthCredentialBase], microsoft: list[MicrosoftOAuthCredentialBase]) -> None:
-        async def fake_google(organization_id: str) -> list[GoogleOAuthCredentialBase]:
-            assert organization_id == ORGANIZATION_ID
-            return google
+def org(monkeypatch: pytest.MonkeyPatch) -> _OrgState:
+    state = _OrgState()
+    never_set = asyncio.Event()
 
-        async def fake_microsoft(organization_id: str) -> list[MicrosoftOAuthCredentialBase]:
-            assert organization_id == ORGANIZATION_ID
-            return microsoft
+    async def google(organization_id: str) -> list[GoogleOAuthCredentialBase]:
+        assert organization_id == ORGANIZATION_ID
+        if "google" in state.failing:
+            raise RuntimeError("google listing failed")
+        return state.google
 
-        monkeypatch.setattr(
-            "skyvern.forge.sdk.copilot.tools.integrations.google_oauth_service.get_visible_credentials_for_org",
-            fake_google,
-        )
-        monkeypatch.setattr(
-            "skyvern.forge.sdk.copilot.tools.integrations.microsoft_oauth_service.get_credentials_for_org",
-            fake_microsoft,
-        )
+    async def microsoft(organization_id: str) -> list[MicrosoftOAuthCredentialBase]:
+        assert organization_id == ORGANIZATION_ID
+        if "microsoft" in state.failing:
+            raise RuntimeError("microsoft listing failed")
+        if "microsoft" in state.stalled:
+            await never_set.wait()
+        return state.microsoft
 
-    return _apply
+    async def has_valid(organization_id: str, token_type: OrganizationAuthTokenType) -> bool:
+        return token_type in state.configured or token_type in state.stored_tokens
+
+    async def get_valid(organization_id: str, token_type: str) -> BitwardenOrganizationAuthToken | None:
+        return state.stored_tokens.get(OrganizationAuthTokenType(token_type))
+
+    monkeypatch.setattr(catalog.google_oauth_service, "get_visible_credentials_for_org", google)
+    monkeypatch.setattr(catalog.microsoft_oauth_service, "get_credentials_for_org", microsoft)
+    monkeypatch.setattr(app.DATABASE.organizations, "has_valid_org_auth_token", has_valid)
+    monkeypatch.setattr(app.DATABASE.organizations, "get_valid_org_auth_token", get_valid)
+    monkeypatch.setattr(catalog.settings, "OP_SERVICE_ACCOUNT_TOKEN", None)
+    monkeypatch.setattr(app, "AGENT_FUNCTION", AgentFunction())
+    monkeypatch.setattr(app.AGENT_FUNCTION, "is_onepassword_instance_default_allowed", AsyncMock(return_value=False))
+    monkeypatch.setattr(SettingsManager.get_settings(), "TWILIO_SMS_2FA_ENABLED", False)
+    monkeypatch.setattr(catalog, "ACCOUNT_READ_TIMEOUT_SECONDS", 0.05)
+    return state
 
 
-@pytest.mark.asyncio
-async def test_lists_both_providers_with_the_fields_the_agent_needs(patched_services) -> None:
-    patched_services([_google()], [_microsoft()])
-    ctx = SimpleNamespace(organization_id=ORGANIZATION_ID)
-
-    result = await _list_integrations({}, ctx)
-
-    assert result["ok"] is True
-    assert result["data"]["count"] == 2
-    google_entry, microsoft_entry = result["data"]["integrations"]
-    assert google_entry == {
-        "connection_id": "goac_1",
-        "provider": "google",
-        "name": "Sheets account",
-        "state": "active",
-        "scopes_granted": ["https://www.googleapis.com/auth/spreadsheets"],
-    }
-    assert microsoft_entry == {
-        "connection_id": "msoac_1",
-        "provider": "microsoft",
-        "name": "Outlook account",
-        "state": "active",
-        "scopes_granted": ["Mail.Send"],
-    }
+def _by_id(result: dict[str, Any]) -> dict[str, dict[str, Any]]:
+    return {entry["id"]: entry for entry in result["data"]["integrations"]}
 
 
 @pytest.mark.asyncio
-async def test_reports_no_integrations_without_erroring(patched_services) -> None:
-    patched_services([], [])
-    ctx = SimpleNamespace(organization_id=ORGANIZATION_ID)
+async def test_lists_every_entry_with_gmail_and_bitwarden_accounts_and_no_secret(
+    org: _OrgState, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    org.google = [
+        _TokenBearingGoogleCredential(
+            id="goac_gmail",
+            organization_id=ORGANIZATION_ID,
+            credential_name="Inbox",
+            email_address="inbox@example.com",
+            state="active",
+            scopes_requested=[GMAIL_READ_SCOPE],
+            scopes_granted=[GMAIL_READ_SCOPE],
+            created_at=datetime(2026, 6, 19),
+            modified_at=datetime(2026, 6, 19),
+            access_token="SENTINEL-gmail-access-token",
+            refresh_token="SENTINEL-gmail-refresh-token",
+        )
+    ]
+    org.stored_tokens = {
+        OrganizationAuthTokenType.bitwarden_credential: BitwardenOrganizationAuthToken(
+            id="oat_bitwarden",
+            organization_id=ORGANIZATION_ID,
+            token_type=OrganizationAuthTokenType.bitwarden_credential,
+            valid=True,
+            created_at=datetime(2026, 6, 19),
+            modified_at=datetime(2026, 6, 19),
+            credential=BitwardenCredential(
+                email="vault@example.com", master_password="SENTINEL-bitwarden-master-password"
+            ),
+        )
+    }
+    monkeypatch.setattr(catalog.settings, "OP_SERVICE_ACCOUNT_TOKEN", "SENTINEL-instance-onepassword-token")
 
-    result = await _list_integrations({}, ctx)
+    result = await _list_integrations({}, SimpleNamespace(organization_id=ORGANIZATION_ID))
+    page = [page_payload(entry) for entry in await integrations_for_org(ORGANIZATION_ID)]
 
-    assert result["ok"] is True
-    assert result["data"] == {"integrations": [], "count": 0}
+    entries = _by_id(result)
+    assert list(entries) == SKYVERN_ENTRY_IDS
+    assert result["data"]["count"] == len(SKYVERN_ENTRY_IDS)
+    assert entries["gmail"]["accounts"] == [
+        {
+            "connection_id": "goac_gmail",
+            "provider": "google",
+            "name": "Inbox",
+            "email_address": "inbox@example.com",
+            "state": "active",
+            "scopes_granted": [GMAIL_READ_SCOPE],
+        }
+    ]
+    assert entries["bitwarden"]["accounts"] == [{"provider": "bitwarden", "state": "active"}]
+    assert entries["google_sheets"]["accounts"] == []
+    assert entries["azure_key_vault"]["accounts"] == []
+    assert entries["mcp"]["accounts"] is None
+    for serialized in (json.dumps(result), json.dumps(page)):
+        for sentinel in SENTINELS:
+            assert sentinel not in serialized
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("org_token", "instance_token", "allowed", "expected"),
+    [
+        (True, "instance-token", True, [{"provider": "onepassword", "state": "active", "source": "organization"}]),
+        (False, "instance-token", True, [{"provider": "onepassword", "state": "active", "source": "instance_default"}]),
+        (False, "instance-token", False, []),
+        (False, None, True, []),
+    ],
+)
+async def test_onepassword_reports_the_token_the_status_route_would_use(
+    org: _OrgState,
+    monkeypatch: pytest.MonkeyPatch,
+    org_token: bool,
+    instance_token: str | None,
+    allowed: bool,
+    expected: list[dict[str, str]],
+) -> None:
+    if org_token:
+        org.configured = {OrganizationAuthTokenType.onepassword_service_account}
+    monkeypatch.setattr(catalog.settings, "OP_SERVICE_ACCOUNT_TOKEN", instance_token)
+    monkeypatch.setattr(app.AGENT_FUNCTION, "is_onepassword_instance_default_allowed", AsyncMock(return_value=allowed))
+
+    result = await _list_integrations({}, SimpleNamespace(organization_id=ORGANIZATION_ID))
+
+    assert _by_id(result)["onepassword"]["accounts"] == expected
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("failure", ["failing", "stalled"])
+async def test_a_failing_or_stalled_account_source_marks_only_its_own_entries(org: _OrgState, failure: str) -> None:
+    org.google = [_google()]
+    setattr(org, failure, {"microsoft"})
+
+    entries = _by_id(await _list_integrations({}, SimpleNamespace(organization_id=ORGANIZATION_ID)))
+
+    assert entries["outlook"]["accounts"] is None
+    assert entries["outlook"]["accounts_unavailable"] == "read_failed"
+    assert [account["connection_id"] for account in entries["google_sheets"]["accounts"]] == ["goac_1"]
+    assert "accounts_unavailable" not in entries["google_sheets"]
+
+
+@pytest.mark.parametrize(
+    ("requested", "granted", "expected_entries"),
+    [
+        ([SHEETS_SCOPE], [SHEETS_SCOPE], {"google_sheets"}),
+        ([SHEETS_SCOPE, DRIVE_METADATA_SCOPE], [], {"google_sheets"}),
+        ([], [SHEETS_SCOPE], {"google_sheets"}),
+        ([GMAIL_READ_SCOPE], [GMAIL_READ_SCOPE], {"gmail"}),
+        ([GMAIL_SEND_SCOPE, "openid", "email"], [], {"gmail"}),
+        ([DRIVE_SCOPE], [DRIVE_SCOPE, SHEETS_SCOPE], {"google_drive"}),
+        (["openid"], ["openid"], set()),
+    ],
+)
+def test_a_google_account_belongs_to_the_entries_the_page_shows_it_under(
+    requested: list[str], granted: list[str], expected_entries: set[str]
+) -> None:
+    credential = _google(scopes_requested=requested, scopes_granted=granted)
+    google_entries = [entry for entry in catalog.SKYVERN_INTEGRATIONS if entry.oauth_provider == "google"]
+
+    assert catalog.google_entry_ids_for_credential(credential, google_entries) == expected_entries
+
+
+@pytest.mark.asyncio
+async def test_reports_unconnected_entries_as_empty_without_erroring(org: _OrgState) -> None:
+    entries = _by_id(await _list_integrations({}, SimpleNamespace(organization_id=ORGANIZATION_ID)))
+
+    assert {entry_id for entry_id, entry in entries.items() if entry["accounts"] == []} == {
+        "google_sheets",
+        "gmail",
+        "outlook",
+        "google_drive",
+        "onepassword",
+        "bitwarden",
+        "azure_key_vault",
+        "custom_credential_service",
+    }
+    assert entries["twilio"]["accounts"] is None
+    assert entries["twilio"]["accounts_unavailable"] == "not_enabled"
+    assert entries["mcp"]["accounts"] is None
+    assert "accounts_unavailable" not in entries["mcp"]
 
 
 def test_serializer_is_an_allowlist_so_a_new_token_field_cannot_leak() -> None:
@@ -153,7 +321,7 @@ def test_serializer_is_an_allowlist_so_a_new_token_field_cannot_leak() -> None:
         **{name: f"SECRET_{name}" for name in TOKEN_FIELD_NAMES},
     )
 
-    entry = _serialize(leaky_google, "google")
+    entry = serialize_oauth_account(leaky_google, "google")
 
     assert set(entry) == {"connection_id", "provider", "name", "state", "scopes_granted", "email_address"}
     for name in TOKEN_FIELD_NAMES:
@@ -162,29 +330,12 @@ def test_serializer_is_an_allowlist_so_a_new_token_field_cannot_leak() -> None:
 
 
 @pytest.mark.asyncio
-async def test_surfaces_the_mailbox_address_so_the_agent_can_bind_an_identifier(patched_services) -> None:
-    patched_services(
-        [_google(email_address="inbox@example.com")],
-        [_microsoft(email_address="outlook@example.com")],
-    )
-    ctx = SimpleNamespace(organization_id=ORGANIZATION_ID)
+async def test_lists_a_google_connection_whose_grant_expired(org: _OrgState) -> None:
+    org.google = [_google(state="error")]
 
-    result = await _list_integrations({}, ctx)
+    entries = _by_id(await _list_integrations({}, SimpleNamespace(organization_id=ORGANIZATION_ID)))
 
-    google_entry, microsoft_entry = result["data"]["integrations"]
-    assert google_entry["email_address"] == "inbox@example.com"
-    assert microsoft_entry["email_address"] == "outlook@example.com"
-
-
-@pytest.mark.asyncio
-async def test_lists_a_google_connection_whose_grant_expired(patched_services) -> None:
-    patched_services([_google(state="error")], [])
-    ctx = SimpleNamespace(organization_id=ORGANIZATION_ID)
-
-    result = await _list_integrations({}, ctx)
-
-    assert result["data"]["count"] == 1
-    assert result["data"]["integrations"][0]["state"] == "error"
+    assert [account["state"] for account in entries["google_sheets"]["accounts"]] == ["error"]
 
 
 def test_tool_description_states_facts_without_prescribing_dialogue() -> None:
@@ -539,9 +690,9 @@ def _setup_rows() -> list[GoogleOAuthCredentialBase]:
 
 @pytest.mark.asyncio
 async def test_request_google_connection_offers_one_unbound_card_per_profile_without_touching_the_workflow(
-    patched_services,
+    org: _OrgState,
 ) -> None:
-    patched_services([], [])
+    org.google = []
     ctx = make_copilot_ctx(organization_id=ORGANIZATION_ID, workflow_yaml="title: untouched\n")
 
     gmail = await _request_google_connection("gmail", None, ctx)
@@ -605,7 +756,7 @@ async def test_request_google_connection_offers_one_unbound_card_per_profile_wit
     ],
 )
 async def test_request_google_connection_reconnects_only_a_same_profile_row(
-    patched_services,
+    org: _OrgState,
     scope_profile: str,
     connection_id: str | None,
     card: str,
@@ -613,7 +764,7 @@ async def test_request_google_connection_reconnects_only_a_same_profile_row(
     ignored_id: str | None,
     choice_ids: list[str] | None,
 ) -> None:
-    patched_services(_setup_rows(), [])
+    org.google = _setup_rows()
     ctx = make_copilot_ctx(organization_id=ORGANIZATION_ID)
 
     result = await _request_google_connection(scope_profile, connection_id, ctx)
@@ -708,12 +859,12 @@ def _persisted_offer_turn(ctx: CopilotContext) -> TurnOutcome:
 
 @pytest.mark.asyncio
 async def test_picking_one_setup_card_offers_its_unpicked_sibling_again_on_the_selection_turn(
-    patched_services,
+    org: _OrgState,
 ) -> None:
     gmail_row = _google(
         id="goac_mail", credential_name="Mail", scopes_requested=[GMAIL_READ_SCOPE], scopes_granted=[GMAIL_READ_SCOPE]
     )
-    patched_services([gmail_row, _google(id="goac_sheets")], [])
+    org.google = [gmail_row, _google(id="goac_sheets")]
     offer_ctx = make_copilot_ctx(organization_id=ORGANIZATION_ID)
     await _request_google_connection("gmail", None, offer_ctx)
     await _request_google_connection("google_sheets", None, offer_ctx)

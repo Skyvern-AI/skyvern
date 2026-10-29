@@ -17,9 +17,8 @@ from skyvern.forge.sdk.copilot.google_connection_notice import (
 from skyvern.forge.sdk.copilot.request_policy import RequestPolicy
 from skyvern.forge.sdk.copilot.runtime import AgentContext
 from skyvern.forge.sdk.copilot.secret_scrub import scrub_secrets_from_structure
-from skyvern.forge.sdk.schemas.google_oauth import GoogleOAuthCredentialBase
-from skyvern.forge.sdk.schemas.microsoft_oauth import MicrosoftOAuthCredentialBase
-from skyvern.forge.sdk.services import google_oauth_service, google_sheets_service, microsoft_oauth_service
+from skyvern.forge.sdk.integrations.catalog import copilot_payload, integrations_for_org, serialize_oauth_account
+from skyvern.forge.sdk.services import google_oauth_service, google_sheets_service
 from skyvern.schemas.google_sheets import (
     GoogleSheetsAPIError,
     build_a1,
@@ -46,40 +45,9 @@ _SHEET_VALUES_FIELDS = "sheets(data(rowData(values(formattedValue))))"
 SheetConnectionStatus = Literal["opened", "no_access", "token_unavailable", "error"]
 
 
-def _serialize(
-    credential: GoogleOAuthCredentialBase | MicrosoftOAuthCredentialBase,
-    provider: str,
-) -> dict[str, Any]:
-    # Allowlist rather than a model dump: both source models are token-free today,
-    # so a dump would start leaking the day either one gains a token field.
-    result: dict[str, Any] = {
-        "connection_id": credential.id,
-        "provider": provider,
-        "name": credential.credential_name,
-        "state": credential.state,
-        "scopes_granted": list(credential.scopes_granted),
-    }
-    if credential.email_address:
-        result["email_address"] = credential.email_address
-    return result
-
-
 async def _list_integrations(params: dict[str, Any], ctx: AgentContext) -> dict[str, Any]:
-    # Each provider is read through whatever its own Integrations page shows, so a connection the
-    # user can see is never reported as absent. Google surfaces expired grants as state=error;
-    # Microsoft has no such listing, so active is all it can offer.
-    google_credentials = await google_oauth_service.get_visible_credentials_for_org(ctx.organization_id)
-    microsoft_credentials = await microsoft_oauth_service.get_credentials_for_org(ctx.organization_id)
-    integrations = [_serialize(credential, "google") for credential in google_credentials] + [
-        _serialize(credential, "microsoft") for credential in microsoft_credentials
-    ]
-    return {
-        "ok": True,
-        "data": {
-            "integrations": integrations,
-            "count": len(integrations),
-        },
-    }
+    integrations = [copilot_payload(entry) for entry in await integrations_for_org(ctx.organization_id)]
+    return {"ok": True, "data": {"integrations": integrations, "count": len(integrations)}}
 
 
 async def _request_google_connection(
@@ -96,7 +64,8 @@ async def _request_google_connection(
         "scope_profile": scope_profile,
         "card": "reconnect" if notice.connectionId else "connect",
         "compatible_connections": [
-            _serialize(credential, "google") for credential in google_setup_ready_connections(scope_profile, visible)
+            serialize_oauth_account(credential, "google")
+            for credential in google_setup_ready_connections(scope_profile, visible)
         ],
     }
     if notice.connectionId:

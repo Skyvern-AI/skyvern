@@ -32,6 +32,7 @@ import structlog
 
 from skyvern.config import settings
 from skyvern.forge import app
+from skyvern.forge.antibot_evidence import prompt_evidence_str
 from skyvern.forge.sdk.schemas.tasks import Task
 from skyvern.forge.taskv3 import input_dispatch
 from skyvern.forge.taskv3.loop import REF_SELECTOR_RE, ToolResult, ToolSpec, current_tool_call_seq
@@ -365,13 +366,16 @@ def build_captcha_tools(
                 "captcha solve failed unexpectedly; re-observe the page and continue.", error_class="solve_raised"
             )
         record(outcome.receipt())
+        # When the run can report its own error codes, the model reads the recorded solve outcomes at finish.
+        evidence = prompt_evidence_str(task) if task.error_code_mapping else None
+        recorded = f"\nRecorded challenge solves for this task: {evidence}" if evidence else ""
 
         if outcome.status in (ChallengeStatus.UNSOLVED, ChallengeStatus.UNSUPPORTED):
             failed_attempts += 1
             unsolved = (
                 "a captcha challenge is present but could not be solved this attempt; wait briefly and "
                 "re-check, or report the captcha as blocking if it persists."
-            )
+            ) + recorded
             # Three literal returns rather than one with a computed class: the error-class census reads literals.
             if outcome.status is ChallengeStatus.UNSUPPORTED:
                 return ToolResult.error(unsolved, error_class="challenge_unsupported")
@@ -383,7 +387,7 @@ def build_captcha_tools(
             # A real solve is progress; clear the failure streak so a later genuine captcha isn't disabled.
             failed_attempts = 0
             return ToolResult.ok(
-                "captcha solved; re-observe the page and continue (e.g. retry submit).",
+                "captcha solved; re-observe the page and continue (e.g. retry submit)." + recorded,
                 ok_class="solved",
             )
         # Absent: no challenge is presented, including a widget the page loaded but never showed. No solver

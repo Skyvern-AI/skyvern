@@ -1,5 +1,6 @@
 import asyncio
-from collections.abc import AsyncIterator
+import json
+from collections.abc import AsyncIterator, Iterator
 from datetime import UTC, datetime, timedelta
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -11,17 +12,21 @@ from sqlalchemy import delete, select, text, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from skyvern.config import settings
+from skyvern.errors.errors import anti_bot_system_errors
 from skyvern.forge import final_failure_diagnostic as ffd
 from skyvern.forge.agent import ForgeAgent
 from skyvern.forge.failure_classifier import (
     HAR_ANTI_BOT_DIAGNOSTIC_REASON_CODE,
     derive_failure_attribution,
     is_output_only_entry,
+    with_root_user_errors,
     without_output_only_categories,
 )
 from skyvern.forge.sdk.copilot.challenge_evidence import is_carrier_backed_category_entry
+from skyvern.forge.sdk.core import skyvern_context
 from skyvern.forge.sdk.core.skyvern_context import SkyvernContext
 from skyvern.forge.sdk.db.agent_db import AgentDB
+from skyvern.forge.sdk.db.enums import OrganizationAuthTokenType
 from skyvern.forge.sdk.db.models import (
     TaskModel,
     TaskV2Model,
@@ -36,7 +41,13 @@ from skyvern.forge.sdk.schemas.har_evidence import (
     HarEvidenceEvent,
     HarEvidenceVisit,
 )
+from skyvern.forge.sdk.schemas.task_v2 import TaskV2, TaskV2Status
+from skyvern.forge.sdk.workflow.context_manager import WorkflowRunContext
+from skyvern.forge.sdk.workflow.service import WorkflowService, _with_diagnostic_system_errors
+from skyvern.services import task_v2_service
+from skyvern.webeye.utils.challenge_solve_record import ChallengeSolveReceipt
 from tests.unit.conftest import cancel_once_parked
+from tests.unit.test_output_parameter_size_guards import _build_status_response
 
 FAILED_AT = datetime(2026, 8, 1, 0, 10, tzinfo=UTC)
 PRIMARY = {"category": "NAVIGATION_FAILURE", "confidence_float": 0.9, "reasoning": "page did not load"}
@@ -75,9 +86,7 @@ def _evidence(*visits: HarEvidenceVisit) -> HarEvidence:
     return HarEvidence(availability=HarEvidenceAvailability.available, visits=visits)
 
 
-def _context(
-    mapping: dict[str, str] | None = None, failure_reason: str | None = "The page did not load"
-) -> ffd.FailureContext:
+def _context(failure_reason: str | None = "The page did not load") -> ffd.FailureContext:
     return ffd.FailureContext(
         organization_id="o_ffd",
         task_id="tsk_ffd",
@@ -94,27 +103,26 @@ def _context(
             screenshot_artifact_id="art_1",
             agent_intention="Click the search button",
         ),
-        error_code_mapping=mapping or {},
+        run_ids=("tsk_ffd",),
     )
 
 
-class FakeMatcher:
-    def __init__(self, response: Any = None, delay: float = 0) -> None:
-        self.response = response
-        self.delay = delay
-        self.prompts: list[str] = []
+class NoModel:
+    """Every model handler the reporting could reach; any call is a contract break."""
 
-    async def __call__(self, *, prompt: str, **_: Any) -> Any:
-        self.prompts.append(prompt)
-        if self.delay:
-            await asyncio.sleep(self.delay)
-        return self.response
+    def __init__(self) -> None:
+        self.prompt_names: list[str] = []
+
+    async def __call__(self, *, prompt_name: str = "", **_: Any) -> Any:
+        self.prompt_names.append(prompt_name)
+        raise AssertionError(f"unexpected model call: {prompt_name}")
 
 
 @pytest.fixture
-def matcher(monkeypatch: pytest.MonkeyPatch) -> FakeMatcher:
-    fake = FakeMatcher()
-    monkeypatch.setattr(ffd.app, "SECONDARY_LLM_API_HANDLER", fake, raising=False)
+def no_model(monkeypatch: pytest.MonkeyPatch) -> NoModel:
+    fake = NoModel()
+    for handler in ("LLM_API_HANDLER", "SECONDARY_LLM_API_HANDLER", "EXTRACTION_LLM_API_HANDLER"):
+        monkeypatch.setattr(ffd.app, handler, fake, raising=False)
     return fake
 
 
@@ -193,7 +201,7 @@ def test_no_enforcement_is_reported_as_the_cause_of_the_failure(event: HarEviden
 
 
 @pytest.mark.asyncio
-async def test_a_page_block_becomes_an_output_only_entry_naming_its_evidence(matcher: FakeMatcher) -> None:
+async def test_a_page_block_becomes_an_output_only_entry_naming_its_evidence(no_model: NoModel) -> None:
     context = _context()
     diagnostic = await ffd.final_failure_diagnostic(_evidence(_visit((AKAMAI_BLOCK,), vendors=("akamai",))), context)
     entry = ffd.diagnostic_entry(diagnostic, context)
@@ -210,8 +218,8 @@ async def test_a_page_block_becomes_an_output_only_entry_naming_its_evidence(mat
         "failed_action_id": "a_1",
         "failed_screenshot_artifact_id": "art_1",
     }
-    # No mapping, so no model call; the entry is a label every runtime reader skips.
-    assert matcher.prompts == []
+    # The entry is a label every runtime reader skips.
+    assert no_model.prompt_names == []
     categories = [PRIMARY, entry]
     assert is_output_only_entry(entry) and without_output_only_categories(categories) == [PRIMARY]
     assert not is_carrier_backed_category_entry(entry)
@@ -223,93 +231,184 @@ async def test_a_page_block_becomes_an_output_only_entry_naming_its_evidence(mat
     [a for a in HarEvidenceAvailability if a != HarEvidenceAvailability.available],
 )
 @pytest.mark.asyncio
-async def test_unavailable_evidence_reports_nothing_without_a_grounded_match(
-    availability: HarEvidenceAvailability, matcher: FakeMatcher
-) -> None:
-    context = _context({"BOT_BLOCK": "The site blocked the bot"}, failure_reason=None)
+async def test_unavailable_evidence_reports_nothing(availability: HarEvidenceAvailability, no_model: NoModel) -> None:
+    context = _context(failure_reason=None)
     diagnostic = await ffd.final_failure_diagnostic(HarEvidence.unavailable(availability), context)
 
     assert diagnostic.availability == availability and ffd.diagnostic_entry(diagnostic, context) is None
 
 
-@pytest.mark.asyncio
-async def test_a_loop_with_no_vendor_or_enforcement_does_not_ask_the_matcher(matcher: FakeMatcher) -> None:
-    context = _context({"ACCESS_DENIED": "Akamai Access Denied page"}, failure_reason=None)
-    context = ffd.FailureContext(**{**context.__dict__, "failed_action": None})
-    diagnostic = await ffd.final_failure_diagnostic(_evidence(_visit(domain="login.example.net")), context)
-
-    assert matcher.prompts == [] and ffd.diagnostic_entry(diagnostic, context) is None
-
-
-MAPPING = {"ACCESS_DENIED": "The site shows an unusual-activity or access denied page", "BAD_LOGIN": "Wrong password"}
-UNUSUAL = "The page says unusual activity was detected from this browser"
-
-
-@pytest.mark.asyncio
-async def test_an_unusual_page_with_no_known_marker_still_reaches_the_configured_descriptions(
-    matcher: FakeMatcher,
-) -> None:
-    matcher.response = {"error_code": "ACCESS_DENIED", "evidence_refs": ["failure_reason", "vendors_present"]}
-    context = _context(MAPPING, failure_reason=UNUSUAL)
-    diagnostic = await ffd.final_failure_diagnostic(_evidence(_visit((AKAMAI_ASSET,), vendors=("akamai",))), context)
-    entry = ffd.diagnostic_entry(diagnostic, context)
-
-    assert len(matcher.prompts) == 1 and "BAD_LOGIN" in matcher.prompts[0] and "presence_only" in matcher.prompts[0]
-    assert entry is not None and entry["error_code"] == "ACCESS_DENIED"
-    assert entry["reasoning"] == f"ACCESS_DENIED: {MAPPING['ACCESS_DENIED']}"
-    assert entry["anti_bot"]["enforcement"] == "none_observed" and entry["anti_bot"]["contribution"] == "unknown"
-    assert entry["anti_bot"]["evidence_refs"] == ["failure_reason", "vendors_present"]
+def _qualified(service: str | None, before: float = 10) -> HarEvidenceEvent:
+    return _event(
+        "explicit_block",
+        before,
+        vendor="cloudflare" if service and service.startswith("cloudflare") else service,
+        http_status=403,
+        url_class="document",
+        failure_signal="block",
+        service=service,
+    )
 
 
-@pytest.mark.asyncio
-async def test_an_ordinary_error_on_an_unprotected_site_never_reaches_the_matcher(matcher: FakeMatcher) -> None:
-    matcher.response = {"error_code": "BAD_LOGIN", "evidence_refs": ["failure_reason"]}
-    context = _context(MAPPING, failure_reason="The password was rejected")
-    diagnostic = await ffd.final_failure_diagnostic(_evidence(_visit()), context)
+def _receipt(
+    service: str | None,
+    outcome: str = "unsolved",
+    before: float = 10,
+    page_state: str = "unknown",
+    run_id: str = "tsk_ffd",
+    owner_id: str | None = None,
+) -> ChallengeSolveReceipt:
+    return ChallengeSolveReceipt(
+        run_id=run_id,
+        ended_at=_at(before),
+        service=service,
+        outcome=outcome,
+        page_state=page_state,
+        owner_id=owner_id or run_id,
+    )
 
-    assert matcher.prompts == [] and ffd.diagnostic_entry(diagnostic, context) is None
+
+@pytest.fixture
+def run_context() -> Iterator[SkyvernContext]:
+    with skyvern_context.scoped(SkyvernContext(task_id="tsk_ffd")) as context:
+        yield context
+
+
+def _codes(diagnostic: ffd.FinalDiagnostic) -> list[str]:
+    assert all(error["error_type"] == "SYSTEM_DEFINED_ERROR" for error in diagnostic.system_errors)
+    return [error["error_code"] for error in diagnostic.system_errors]
 
 
 @pytest.mark.parametrize(
-    "response",
+    ("events", "receipts", "codes"),
     [
-        pytest.param({"error_code": "ACCESS_DENIED", "evidence_refs": ["vendors_present"]}, id="presence-only"),
-        pytest.param({"error_code": "ACCESS_DENIED", "evidence_refs": ["made_up"]}, id="ungrounded-ref"),
-        pytest.param({"error_code": "NOT_CONFIGURED", "evidence_refs": ["failure_reason"]}, id="unknown-code"),
-        pytest.param({"error_code": None, "evidence_refs": []}, id="model-abstains"),
-        pytest.param("not json", id="malformed"),
+        pytest.param((_qualified("cloudflare"),), (), ["ANTI_BOT_ERROR", "CLOUDFLARE_ERROR"], id="cloudflare-block"),
+        pytest.param((), (_receipt("cloudflare"),), ["ANTI_BOT_ERROR", "CLOUDFLARE_ERROR"], id="cloudflare-solve"),
+        pytest.param((_qualified("akamai"),), (), ["ANTI_BOT_ERROR"], id="other-vendor-generic"),
+        pytest.param((_qualified(None),), (), ["ANTI_BOT_ERROR"], id="unknown-service"),
+        pytest.param((), (_receipt("recaptcha"),), ["ANTI_BOT_ERROR", "RECAPTCHA_ERROR"], id="recaptcha"),
+        pytest.param((), (_receipt("hcaptcha"),), ["ANTI_BOT_ERROR", "HCAPTCHA_ERROR"], id="hcaptcha"),
+        pytest.param(
+            (), (_receipt("cloudflare_turnstile"),), ["ANTI_BOT_ERROR", "CLOUDFLARE_TURNSTILE_ERROR"], id="turnstile"
+        ),
+        pytest.param((), (_receipt("other"),), ["ANTI_BOT_ERROR"], id="presented-unknown-challenge"),
+        pytest.param(
+            (_qualified("cloudflare"), _qualified("cloudflare", before=5)),
+            (_receipt("hcaptcha"), _receipt("recaptcha", before=4)),
+            ["ANTI_BOT_ERROR", "CLOUDFLARE_ERROR", "HCAPTCHA_ERROR", "RECAPTCHA_ERROR"],
+            id="mixed-each-once",
+        ),
+        # A success clears only the same owner's challenge of the same known service.
+        pytest.param(
+            (),
+            (_receipt("hcaptcha"), _receipt("recaptcha", "solved", 5)),
+            ["ANTI_BOT_ERROR", "HCAPTCHA_ERROR"],
+            id="another-services-solve-keeps-it",
+        ),
+        pytest.param(
+            (),
+            (_receipt("hcaptcha"), _receipt(None, "solved", 5)),
+            ["ANTI_BOT_ERROR", "HCAPTCHA_ERROR"],
+            id="unidentified-solve-keeps-it",
+        ),
+        pytest.param(
+            (),
+            (_receipt("hcaptcha", owner_id="tsk_a"), _receipt("hcaptcha", "solved", 5, owner_id="tsk_b")),
+            ["ANTI_BOT_ERROR", "HCAPTCHA_ERROR"],
+            id="another-owners-solve-keeps-it",
+        ),
     ],
 )
 @pytest.mark.asyncio
-async def test_a_configured_code_needs_a_grounded_non_presence_fact(matcher: FakeMatcher, response: Any) -> None:
-    matcher.response = response
-    context = _context(MAPPING, failure_reason=UNUSUAL)
-    diagnostic = await ffd.final_failure_diagnostic(_evidence(_visit((AKAMAI_ASSET,), vendors=("akamai",))), context)
-
-    assert diagnostic.error_code is None and ffd.diagnostic_entry(diagnostic, context) is None
-
-
-@pytest.mark.asyncio
-async def test_a_slow_matcher_times_out_and_leaves_the_deterministic_block(
-    matcher: FakeMatcher, monkeypatch: pytest.MonkeyPatch
+async def test_qualified_evidence_reports_the_general_and_supported_service_codes(
+    run_context: SkyvernContext,
+    no_model: NoModel,
+    events: tuple[HarEvidenceEvent, ...],
+    receipts: tuple[ChallengeSolveReceipt, ...],
+    codes: list[str],
 ) -> None:
-    monkeypatch.setattr(ffd, "MATCH_TIMEOUT_S", 0.01)
-    matcher.delay = 1
-    context = _context(MAPPING)
-    diagnostic = await ffd.final_failure_diagnostic(_evidence(_visit((AKAMAI_BLOCK,))), context)
+    run_context.challenge_solve_receipts.extend(receipts)
 
-    assert diagnostic.enforcement.value == "explicit_block" and diagnostic.error_code is None
+    diagnostic = await ffd.final_failure_diagnostic(_evidence(_visit(events)), _context())
+
+    assert _codes(diagnostic) == codes and no_model.prompt_names == []
+
+
+@pytest.mark.parametrize(
+    ("events", "receipts"),
+    [
+        pytest.param((_event("recaptcha_observed", 10, vendor="recaptcha"),), (), id="passive-recaptcha-widget"),
+        pytest.param((_event("hcaptcha_observed", 10, vendor="hcaptcha"),), (), id="passive-hcaptcha-widget"),
+        pytest.param(
+            (_event("challenge_issued", 10, vendor="cloudflare", challenge_type="turnstile"),), (), id="turnstile-asset"
+        ),
+        pytest.param(
+            (_event("challenge_resource_failed", 10, vendor="cloudflare", resource_fail_class="canceled"),),
+            (),
+            id="aborted-challenge-resource",
+        ),
+        pytest.param((AKAMAI_BLOCK,), (), id="block-the-extractor-did-not-qualify"),
+        pytest.param((_qualified("cloudflare", before=3600),), (), id="block-in-an-earlier-attempt"),
+        pytest.param(
+            (), (_receipt("recaptcha"), _receipt("recaptcha", outcome="solved", before=5)), id="later-solve-clears"
+        ),
+        pytest.param((), (_receipt(None),), id="unsolved-without-a-presented-challenge"),
+        pytest.param((), (_receipt("hcaptcha", page_state="challenge_gone"),), id="challenge-gone"),
+        pytest.param((), (_receipt("recaptcha", outcome="unknown"),), id="timed-out-solve"),
+        pytest.param((), (_receipt("recaptcha", before=3600),), id="solve-in-an-earlier-attempt"),
+        pytest.param((), (_receipt("recaptcha", run_id="tsk_other"),), id="another-runs-solve"),
+    ],
+)
+@pytest.mark.asyncio
+async def test_presence_and_out_of_scope_evidence_report_no_system_error(
+    run_context: SkyvernContext,
+    no_model: NoModel,
+    events: tuple[HarEvidenceEvent, ...],
+    receipts: tuple[ChallengeSolveReceipt, ...],
+) -> None:
+    run_context.challenge_solve_receipts.extend(receipts)
+    context = _context()
+
+    diagnostic = await ffd.final_failure_diagnostic(_evidence(_visit(events)), context)
+
+    assert diagnostic.system_errors == () and no_model.prompt_names == []
+    entry = ffd.diagnostic_entry(diagnostic, context)
+    assert entry is None or entry["anti_bot"]["system_errors"] == []
 
 
 @pytest.mark.asyncio
-async def test_cancellation_during_the_match_propagates(matcher: FakeMatcher) -> None:
-    matcher.delay = 5
-    run = asyncio.ensure_future(ffd.final_failure_diagnostic(_evidence(_visit((AKAMAI_BLOCK,))), _context(MAPPING)))
-    await asyncio.sleep(0.01)
-    run.cancel()
+async def test_unresolved_solves_report_even_when_the_recording_is_unavailable(
+    run_context: SkyvernContext, no_model: NoModel
+) -> None:
+    run_context.challenge_solve_receipts.append(_receipt("recaptcha"))
+    context = _context()
 
-    with pytest.raises(asyncio.CancelledError):
-        await run
+    diagnostic = await ffd.final_failure_diagnostic(HarEvidence.unavailable(HarEvidenceAvailability.timeout), context)
+    entry = ffd.diagnostic_entry(diagnostic, context)
+
+    assert _codes(diagnostic) == ["ANTI_BOT_ERROR", "RECAPTCHA_ERROR"]
+    assert entry is not None and entry["anti_bot"]["enforcement"] == "none_observed"
+    assert ffd.diagnostic_system_errors([PRIMARY, entry], 1) == list(diagnostic.system_errors)
+    assert ffd.diagnostic_system_errors([PRIMARY, entry], 2) == []
+
+
+def test_the_projection_only_releases_code_authored_system_rows() -> None:
+    entry = {
+        "reason_code": HAR_ANTI_BOT_DIAGNOSTIC_REASON_CODE,
+        "anti_bot": {
+            "attempt_number": 1,
+            "system_errors": [
+                {"error_code": "ANTI_BOT_ERROR", "reasoning": "r", "error_type": "SYSTEM_DEFINED_ERROR", "x": 1},
+                {"error_code": "ACCESS_DENIED", "reasoning": "r", "error_type": "SYSTEM_DEFINED_ERROR"},
+                {"error_code": "RECAPTCHA_ERROR", "reasoning": "r", "error_type": "USER_DEFINED_ERROR"},
+                "RECAPTCHA_ERROR",
+            ],
+        },
+    }
+
+    assert ffd.diagnostic_system_errors([PRIMARY, entry], 1) == [
+        {"error_code": "ANTI_BOT_ERROR", "reasoning": "r", "error_type": "SYSTEM_DEFINED_ERROR"}
+    ]
 
 
 # Persisted rows: guarded writes against a real database.
@@ -390,6 +489,145 @@ async def test_a_completed_reset_or_foreign_task_is_left_alone(database: AgentDB
     assert await database.tasks.set_final_failure_diagnostic(rerun, f"{org}_other", finished, _entry()) is None
     assert (await database.tasks.get_task(completed, organization_id=org)).failure_category is None  # type: ignore[union-attr]
     assert (await database.tasks.get_task(rerun, organization_id=org)).failure_category == [PRIMARY]  # type: ignore[union-attr]
+
+
+REACH_MAX_STEPS = {
+    "error_code": "REACH_MAX_STEPS",
+    "reasoning": "The agent has reached the maximum number of steps.",
+    "error_type": "SYSTEM_DEFINED_ERROR",
+}
+# A customer's own code that happens to share a system code's name stays a separate user row.
+USER_ANTI_BOT = {
+    "error_code": "ANTI_BOT_ERROR",
+    "reasoning": "The portal showed its bot page",
+    "confidence_float": 0.9,
+    "error_type": "USER_DEFINED_ERROR",
+}
+ANTI_BOT_ROWS = [error.model_dump() for error in anti_bot_system_errors(["recaptcha"])]
+
+
+async def _set_errors(database: AgentDB, task_id: str, errors: list[dict[str, Any]]) -> None:
+    async with database.Session() as session:
+        await session.execute(TaskModel.__table__.update().where(TaskModel.task_id == task_id).values(errors=errors))
+        await session.commit()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("categories", [[PRIMARY], None], ids=["primary", "no-primary"])
+async def test_system_errors_are_appended_once_after_every_existing_row(
+    database: AgentDB, org: str, categories: list | None
+) -> None:
+    task_id, finished = await _task(database, org, "failed")
+    await _set_errors(database, task_id, [REACH_MAX_STEPS, USER_ANTI_BOT])
+    async with database.Session() as session:
+        await session.execute(
+            TaskModel.__table__.update().where(TaskModel.task_id == task_id).values(failure_category=categories)
+        )
+        await session.commit()
+
+    first, repeat = [
+        await database.tasks.set_final_failure_diagnostic(task_id, org, finished, _entry(), system_errors=ANTI_BOT_ROWS)
+        for _ in range(2)
+    ]
+    stored = await database.tasks.get_task(task_id, organization_id=org)
+
+    # A repeat with nothing left to add writes nothing.
+    assert first is not None and (repeat is None) == (categories is None)
+    assert stored is not None and stored.status.value == "failed"
+    assert stored.errors == [REACH_MAX_STEPS, USER_ANTI_BOT, *ANTI_BOT_ROWS]
+    assert [e["error_code"] for e in ANTI_BOT_ROWS] == ["ANTI_BOT_ERROR", "RECAPTCHA_ERROR"]
+    # Errors do not need a classifier primary; the category entry still does.
+    assert stored.failure_category == ([PRIMARY, _entry()] if categories else None)
+    assert stored.to_task_response().errors == stored.errors
+
+
+@pytest.mark.asyncio
+async def test_a_stale_or_foreign_cleanup_appends_no_system_error(database: AgentDB, org: str) -> None:
+    completed, finished = await _task(database, org, "completed")
+    rerun, _ = await _task(database, org, "failed")
+    write = database.tasks.set_final_failure_diagnostic
+
+    assert await write(completed, org, finished, _entry(), system_errors=ANTI_BOT_ROWS) is None
+    assert await write(rerun, org, finished - timedelta(hours=1), _entry(), system_errors=ANTI_BOT_ROWS) is None
+    assert await write(rerun, f"{org}_other", finished, _entry(), system_errors=ANTI_BOT_ROWS) is None
+    for task_id in (completed, rerun):
+        assert (await database.tasks.get_task(task_id, organization_id=org)).errors == []  # type: ignore[union-attr]
+
+
+@pytest.mark.asyncio
+async def test_a_reset_drops_only_the_last_executions_anti_bot_system_errors(database: AgentDB, org: str) -> None:
+    task_id, finished = await _task(database, org, "failed")
+    await _set_errors(database, task_id, [REACH_MAX_STEPS, USER_ANTI_BOT])
+    await database.tasks.set_final_failure_diagnostic(task_id, org, finished, _entry(), system_errors=ANTI_BOT_ROWS)
+
+    reset = await database.tasks.reset_task_for_rerun(task_id, org)
+    # The old execution's cleanup arriving after the reset cannot restore them.
+    late = await database.tasks.set_final_failure_diagnostic(
+        task_id, org, finished, _entry(), system_errors=ANTI_BOT_ROWS
+    )
+
+    assert reset.errors == [REACH_MAX_STEPS, USER_ANTI_BOT] and late is None
+    stored = await database.tasks.get_task(task_id, organization_id=org)
+    assert stored is not None and stored.errors == [REACH_MAX_STEPS, USER_ANTI_BOT]
+
+
+@pytest.mark.asyncio
+async def test_a_failed_standalone_task_reports_its_unresolved_solve_without_a_model(
+    database: AgentDB, org: str, monkeypatch: pytest.MonkeyPatch, no_model: NoModel
+) -> None:
+    monkeypatch.setattr(ffd.app, "DATABASE", database, raising=False)
+    task_id, _ = await _task(database, org, "failed")
+    await _set_errors(database, task_id, [REACH_MAX_STEPS])
+    async with database.Session() as session:
+        await session.execute(
+            TaskModel.__table__.update()
+            .where(TaskModel.task_id == task_id)
+            .values(error_code_mapping={"ACCESS_DENIED": "The portal refused access"})
+        )
+        await session.commit()
+    task = await database.tasks.get_task(task_id, organization_id=org)
+    assert task is not None
+    receipts = [
+        # Solved in an earlier execution of this task: before its start, so not this attempt's.
+        ChallengeSolveReceipt(task_id, datetime(2026, 7, 31, 23, 0, tzinfo=UTC), "hcaptcha", "unsolved", "unknown"),
+        ChallengeSolveReceipt(task_id, datetime(2026, 8, 1, 0, 5, tzinfo=UTC), "recaptcha", "unsolved", "unknown"),
+    ]
+
+    with skyvern_context.scoped(SkyvernContext(task_id=task_id)) as context:
+        context.challenge_solve_receipts.extend(receipts)
+        for _ in range(2):
+            task = await ffd.annotate_failed_task(task, HarEvidence.unavailable(HarEvidenceAvailability.timeout))
+
+    assert task.errors == [REACH_MAX_STEPS, *ANTI_BOT_ROWS] and no_model.prompt_names == []
+    assert task.failure_category is not None and task.failure_category[0] == PRIMARY
+    assert task.status.value == "failed"
+
+
+@pytest.mark.asyncio
+async def test_a_reset_after_real_annotation_serializes_no_trace_of_the_last_executions_anti_bot_report(
+    database: AgentDB, org: str, monkeypatch: pytest.MonkeyPatch, no_model: NoModel
+) -> None:
+    monkeypatch.setattr(ffd.app, "DATABASE", database, raising=False)
+    task_id, finished = await _task(database, org, "failed")
+    await _set_errors(database, task_id, [REACH_MAX_STEPS, USER_ANTI_BOT])
+    task = await database.tasks.get_task(task_id, organization_id=org)
+    assert task is not None
+    block = _event("explicit_block", 30, vendor="akamai", http_status=403, url_class="document")
+    evidence = _evidence(_visit((block.model_copy(update={"failure_signal": "block", "service": "akamai"}),)))
+    annotated = await ffd.annotate_failed_task(task, evidence)
+    assert [c.get("reason_code") for c in annotated.failure_category or []] == [
+        None,
+        HAR_ANTI_BOT_DIAGNOSTIC_REASON_CODE,
+    ]
+
+    reset = await database.tasks.reset_task_for_rerun(task_id, org)
+    late = await database.tasks.set_final_failure_diagnostic(
+        task_id, org, finished, _entry(), system_errors=ANTI_BOT_ROWS
+    )
+
+    response = reset.to_task_response()
+    assert response.errors == [REACH_MAX_STEPS, USER_ANTI_BOT] and late is None
+    assert response.failure_category == [PRIMARY]
 
 
 async def _workflow_run(database: AgentDB, org: str, attempts: int) -> tuple[str, datetime]:
@@ -478,7 +716,7 @@ async def test_the_task_v2_row_mirrors_only_its_own_failed_run(database: AgentDB
 
 @pytest.mark.asyncio
 async def test_a_failed_workflow_run_is_annotated_from_its_failing_block_only(
-    database: AgentDB, org: str, monkeypatch: pytest.MonkeyPatch, matcher: FakeMatcher
+    database: AgentDB, org: str, monkeypatch: pytest.MonkeyPatch, no_model: NoModel
 ) -> None:
     monkeypatch.setattr(ffd.app, "DATABASE", database, raising=False)
     evidence = _evidence(_visit((AKAMAI_BLOCK,), vendors=("akamai",)))
@@ -527,44 +765,204 @@ async def test_a_failed_workflow_run_is_annotated_from_its_failing_block_only(
     assert rows[continued].failure_category[1]["anti_bot"]["failed_task_id"] is None  # type: ignore[union-attr,index]
     non_task_diagnostic = rows[non_task].failure_category[1]  # type: ignore[union-attr,index]
     assert non_task_diagnostic["anti_bot"]["failed_task_id"] is None and "error_code" not in non_task_diagnostic
-    assert matcher.prompts == []
+    assert no_model.prompt_names == []
     assert rows[completed].failure_category is None and rows[failing_block].status.value == "failed"  # type: ignore[union-attr]
 
 
 @pytest.mark.asyncio
-async def test_a_root_mapping_reaches_the_matcher_when_the_generated_task_has_none(
-    database: AgentDB, org: str, monkeypatch: pytest.MonkeyPatch, matcher: FakeMatcher
+@pytest.mark.parametrize("categories", [[PRIMARY], None], ids=["primary", "no-primary"])
+async def test_a_workflow_runs_system_errors_reach_its_response_errors_from_the_diagnostic_entry(
+    database: AgentDB, org: str, monkeypatch: pytest.MonkeyPatch, no_model: NoModel, categories: list | None
 ) -> None:
     monkeypatch.setattr(ffd.app, "DATABASE", database, raising=False)
-    evidence = _evidence(_visit((AKAMAI_ASSET,), vendors=("akamai",)))
-    annotated = {}
-    for name, response in (
-        ("matching", {"error_code": "ACCESS_DENIED", "evidence_refs": ["failure_reason", "vendors_present"]}),
-        ("unrelated", {"error_code": None, "evidence_refs": []}),
-    ):
-        matcher.response = response
-        run_id, _ = await _workflow_run(database, org, attempts=1)
-        task_id, _ = await _task(database, org, "failed", workflow_run_id=run_id)
-        await _block(database, org, run_id, "task", 0, task_id=task_id)
-        async with database.Session() as session:
-            await session.execute(
-                WorkflowRunModel.__table__.update()
-                .where(WorkflowRunModel.workflow_run_id == run_id)
-                .values(failure_reason=UNUSUAL)
-            )
-            await session.commit()
-        run = await database.workflow_runs.get_workflow_run(run_id, organization_id=org)
-        assert run is not None
-        await ffd.annotate_failed_workflow_run(
-            run, evidence, attempt_number=1, attempt_started_at=None, error_code_mapping=MAPPING
+    run_id, _ = await _workflow_run(database, org, attempts=1)
+    async with database.Session() as session:
+        await session.execute(
+            WorkflowRunModel.__table__.update()
+            .where(WorkflowRunModel.workflow_run_id == run_id)
+            .values(failure_category=categories)
         )
-        annotated[name] = (await database.workflow_runs.get_workflow_run(run_id, organization_id=org)).failure_category  # type: ignore[union-attr]
+        await session.commit()
+    run = await database.workflow_runs.get_workflow_run(run_id, organization_id=org)
+    assert run is not None
+    block = _event("repeat_block_after_challenge", 10, vendor="cloudflare", http_status=403, url_class="document")
+    evidence = _evidence(_visit((block.model_copy(update={"failure_signal": "block", "service": "cloudflare"}),)))
 
-    assert len(matcher.prompts) == 2 and all("BAD_LOGIN" in prompt for prompt in matcher.prompts)
-    matching = annotated["matching"][1]
-    assert matching["error_code"] == "ACCESS_DENIED" and matching["anti_bot"]["contribution"] == "unknown"
-    # Vendor presence alone is not evidence, so an unmatched description leaves only the primary category.
-    assert annotated["matching"][0] == PRIMARY and annotated["unrelated"] == [PRIMARY]
+    with skyvern_context.scoped(SkyvernContext(workflow_run_id=run_id)) as context:
+        context.challenge_solve_receipts.append(
+            ChallengeSolveReceipt(
+                run_id, datetime(2026, 8, 1, 0, 5, tzinfo=UTC), "hcaptcha", "unsolved", "unknown", owner_id="tsk_w"
+            )
+        )
+        await ffd.annotate_failed_workflow_run(run, evidence, attempt_number=1, attempt_started_at=None)
+    stored = await database.workflow_runs.get_workflow_run(run_id, organization_id=org)
+    assert stored is not None and no_model.prompt_names == []
+    existing = [REACH_MAX_STEPS, USER_ANTI_BOT]
+
+    projected = _with_diagnostic_system_errors(existing, stored.failure_category, 1)
+
+    if categories is None:
+        # A run-level failure with no classifier primary keeps abstaining: no carrier, so no system rows.
+        assert stored.failure_category is None and projected == existing
+        return
+    assert [e["error_code"] for e in projected] == [
+        "REACH_MAX_STEPS",
+        "ANTI_BOT_ERROR",
+        "ANTI_BOT_ERROR",
+        "CLOUDFLARE_ERROR",
+        "HCAPTCHA_ERROR",
+    ]
+    assert [e["error_type"] for e in projected[2:]] == ["SYSTEM_DEFINED_ERROR"] * 3
+    assert _with_diagnostic_system_errors(projected, stored.failure_category, 1) == projected
+    # Another attempt's response, and a response already at its row bound, gain nothing.
+    assert _with_diagnostic_system_errors(existing, stored.failure_category, 2) == existing
+    full = [{**USER_ANTI_BOT, "error_code": f"CODE_{n}"} for n in range(100)]
+    assert _with_diagnostic_system_errors(full, stored.failure_category, 1) == full
+
+
+@pytest.mark.asyncio
+async def test_the_workflow_status_response_and_webhook_payload_carry_the_projected_system_errors(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    rows = [error.model_dump() for error in anti_bot_system_errors(["cloudflare"])]
+    entry = {**_entry(), "anti_bot": {"attempt_number": 1, "system_errors": rows}}
+
+    response = await _build_status_response(
+        monkeypatch, cap=1024, cap_output_values=False, failure_reason="blocked", failure_category=[PRIMARY, entry]
+    )
+
+    assert response.errors == rows
+
+
+ROOT_MAPPING = {"BOT_WALL": "The site's bot wall blocked the run"}
+
+
+@pytest.mark.asyncio
+async def test_the_task_v2_roots_own_matched_codes_reach_the_response_as_user_rows_beside_system_rows(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    user_rows = [
+        {"error_code": "BOT_WALL", "reasoning": "blocked", "confidence_float": 0.8, "error_type": "USER_DEFINED_ERROR"},
+        {"error_code": "NOT_MAPPED", "reasoning": "x", "confidence_float": 0.8, "error_type": "USER_DEFINED_ERROR"},
+        {
+            "error_code": "ANTI_BOT_ERROR",
+            "reasoning": "x",
+            "confidence_float": 1.0,
+            "error_type": "SYSTEM_DEFINED_ERROR",
+        },
+    ]
+    categories = with_root_user_errors([PRIMARY], user_rows)
+    system_rows = [error.model_dump() for error in anti_bot_system_errors(["hcaptcha"])]
+    diagnostic = {**_entry(), "anti_bot": {"attempt_number": 1, "system_errors": system_rows}}
+    now = datetime.now(UTC)
+    task_v2 = TaskV2(
+        task_id="oc_ffd",
+        status=TaskV2Status.failed,
+        organization_id="o_1",
+        workflow_run_id="wr_1",
+        error_code_mapping=ROOT_MAPPING,
+        created_at=now,
+        modified_at=now,
+    )
+
+    response = await _build_status_response(
+        monkeypatch,
+        cap=1024,
+        cap_output_values=False,
+        failure_reason="blocked",
+        failure_category=[*categories, diagnostic],
+        task_v2=task_v2,
+    )
+
+    # The root entry never leads and carries no new category name, so primary-reading and category-set readers
+    # (attribution, credential fallback) see the same run.
+    assert categories[0] == PRIMARY and {c["category"] for c in categories} == {PRIMARY["category"]}
+    assert is_output_only_entry(categories[1]) and derive_failure_attribution(categories) == derive_failure_attribution(
+        [PRIMARY]
+    )
+    assert response.errors == [user_rows[0], *system_rows]
+
+
+SECRET_VALUE = "pw-SYNTHETIC-4e1d9c"
+
+
+@pytest.mark.asyncio
+async def test_a_task_v2_roots_matched_code_is_stored_and_served_with_its_run_secret_masked(
+    database: AgentDB, org: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(ffd.app, "DATABASE", database, raising=False)
+    service = WorkflowService()
+    for name, value in (
+        ("get_recent_workflow_screenshot_urls", []),
+        ("get_output_parameter_workflow_run_output_parameter_tuples", []),
+        ("_fetch_recording_urls", ([], False)),
+        ("_fetch_downloaded_files", ([], None)),
+    ):
+        # Storage transports only; the repositories and terminal writers are real.
+        monkeypatch.setattr(service, name, AsyncMock(return_value=value))
+    monkeypatch.setattr(ffd.app, "WORKFLOW_SERVICE", service, raising=False)
+    run_id, _ = await _workflow_run(database, org, attempts=1)
+    task_v2_id = await _linked_task_v2(database, org, run_id)
+    async with database.Session() as session:
+        await session.execute(
+            WorkflowRunModel.__table__.update()
+            .where(WorkflowRunModel.workflow_run_id == run_id)
+            .values(status="running", finished_at=None, failure_category=None)
+        )
+        await session.execute(
+            TaskV2Model.__table__.update()
+            .where(TaskV2Model.observer_cruise_id == task_v2_id)
+            .values(status="running", failure_category=None, error_code_mapping=ROOT_MAPPING, prompt="goal")
+        )
+        await session.commit()
+    run_context = WorkflowRunContext("ffd", f"w_{run_id}", f"wpid_{run_id}", run_id, aws_client=MagicMock())
+    run_context.secrets["portal_password"] = SECRET_VALUE
+    monkeypatch.setitem(ffd.app.WORKFLOW_CONTEXT_MANAGER.workflow_run_contexts, run_id, run_context)
+    calls: list[dict[str, Any]] = []
+
+    async def handler(**kwargs: Any) -> dict[str, Any]:
+        calls.append(kwargs)
+        error = {"error_code": "BOT_WALL", "reasoning": f"blocked after {SECRET_VALUE}", "confidence_float": 0.9}
+        return {"reasoning": "blocked", "failure_categories": [PRIMARY], "errors": [error]}
+
+    monkeypatch.setattr(task_v2_service, "_get_task_v2_llm_api_handler", lambda task_v2: handler)
+    monkeypatch.setattr(task_v2_service.SkyvernFrame, "take_split_screenshots", AsyncMock(return_value=[]))
+    task_v2 = await database.observer.get_task_v2(task_v2_id, organization_id=org)
+    assert task_v2 is not None
+    browser = MagicMock(get_working_page=AsyncMock(return_value=MagicMock()), engine_selection=None)
+
+    with skyvern_context.scoped(SkyvernContext(organization_id=org, workflow_run_id=run_id)):
+        _, categories, user_errors = await task_v2_service._summarize_max_steps_failure_reason(task_v2, org, browser)
+    # Built exactly as the max-steps call site builds it, then written by the real terminal writers.
+    await task_v2_service.mark_task_v2_as_failed(
+        task_v2_id,
+        workflow_run_id=run_id,
+        organization_id=org,
+        failure_reason="Reached the max number of steps.",
+        failure_category=with_root_user_errors(categories, [error.model_dump(mode="json") for error in user_errors]),
+    )
+    del ffd.app.WORKFLOW_CONTEXT_MANAGER.workflow_run_contexts[run_id]
+    stored = await database.observer.get_task_v2(task_v2_id, organization_id=org)
+    run = await database.workflow_runs.get_workflow_run(run_id, organization_id=org)
+    assert stored is not None and run is not None
+    api = await task_v2_service.build_task_v2_run_response(stored)
+    await database.organizations.create_org_auth_token(org, OrganizationAuthTokenType.api, "tok_ffd")
+    deliver = AsyncMock(return_value=MagicMock(status_code=200, text=""))
+    monkeypatch.setattr(task_v2_service, "deliver_webhook_with_retries", deliver)
+    await task_v2_service.send_task_v2_webhook(stored.model_copy(update={"webhook_callback_url": "https://h.test/x"}))
+
+    assert len(calls) == 1 and run.failure_category == stored.failure_category
+    assert stored.failure_category[0] == PRIMARY and stored.status.value == "failed"
+    assert [(e["error_code"], e["error_type"]) for e in api.errors or []] == [("BOT_WALL", "USER_DEFINED_ERROR")]
+    payload = deliver.await_args.kwargs["payload"]
+    for served in (
+        json.dumps(stored.failure_category),
+        json.dumps(run.failure_category),
+        api.model_dump_json(),
+        payload,
+    ):
+        assert SECRET_VALUE not in served
+    assert "BOT_WALL" in payload
 
 
 @pytest.mark.asyncio
@@ -717,26 +1115,24 @@ def _shared_visit(*events: HarEvidenceEvent, start: float | None = EARLIER, trun
         pytest.param(_shared_visit(truncated=True), id="truncated"),
     ],
 )
-async def test_a_vendor_seen_only_outside_this_attempt_never_reaches_the_matcher(
-    matcher: FakeMatcher, evidence: HarEvidence
+async def test_a_vendor_seen_only_outside_this_attempt_reports_nothing(
+    no_model: NoModel, evidence: HarEvidence
 ) -> None:
     # The recording abstains for want of current evidence; that is not a finding that protection was absent.
-    matcher.response = {"error_code": "ACCESS_DENIED", "evidence_refs": ["failure_reason"]}
-    context = _context(MAPPING, failure_reason=UNUSUAL)
+    context = _context()
 
     diagnostic = await ffd.final_failure_diagnostic(evidence, context)
 
-    assert matcher.prompts == [] and diagnostic.vendors_observed == ()
+    assert diagnostic.vendors_observed == () and diagnostic.system_errors == ()
     assert diagnostic.enforcement.value == "none_observed" and ffd.diagnostic_entry(diagnostic, context) is None
 
 
 @pytest.mark.asyncio
-async def test_only_the_vendor_this_attempt_saw_is_reported_and_offered_to_the_matcher(matcher: FakeMatcher) -> None:
-    matcher.response = {"error_code": None, "evidence_refs": []}
+async def test_only_the_vendor_this_attempt_saw_is_reported(no_model: NoModel) -> None:
     earlier = _event("challenge_issued", EARLIER, vendor="akamai")
     current = _event("explicit_block", 10, vendor="cloudflare", http_status=403, url_class="document")
     visit = _visit((earlier, current), start=EARLIER, vendors=("akamai", "cloudflare"))
-    context = _context(MAPPING, failure_reason=UNUSUAL)
+    context = _context()
 
     diagnostic = await ffd.final_failure_diagnostic(_evidence(visit), context)
 
@@ -744,58 +1140,30 @@ async def test_only_the_vendor_this_attempt_saw_is_reported_and_offered_to_the_m
     assert diagnostic.enforcement.value == "explicit_block" and diagnostic.enforcing_vendor == "cloudflare"
     # The block keeps its index in the recorded events, so an earlier excluded event does not shift its reference.
     assert diagnostic.evidence_refs == ("har:t1/1/1",)
-    [prompt] = matcher.prompts
-    assert '"vendors_present": {"vendors": ["cloudflare"], "presence_only": true}' in prompt and "akamai" not in prompt
 
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("timed", [True, False], ids=["current-event", "aggregate-only"])
-async def test_current_vendor_presence_reaches_the_matcher_but_aggregate_presence_does_not(
-    matcher: FakeMatcher, timed: bool
+async def test_current_vendor_presence_is_observed_but_aggregate_presence_is_not(
+    no_model: NoModel, timed: bool
 ) -> None:
-    matcher.response = {"error_code": None, "evidence_refs": []}
     # Endpoints inside the attempt do not prove an untimed entry was too, so only a timed event counts.
     visit = _visit((AKAMAI_ASSET,) if timed else (), vendors=("akamai",))
-    context = _context(MAPPING, failure_reason=UNUSUAL)
+    context = _context()
 
     diagnostic = await ffd.final_failure_diagnostic(_evidence(visit), context)
 
     assert diagnostic.vendors_observed == (("akamai",) if timed else ())
-    assert len(matcher.prompts) == (1 if timed else 0) and diagnostic.enforcement.value == "none_observed"
+    assert diagnostic.enforcement.value == "none_observed" and diagnostic.system_errors == ()
 
 
 @pytest.mark.asyncio
-async def test_a_widget_vendor_outside_the_recorded_vendors_opens_nothing(matcher: FakeMatcher) -> None:
+async def test_a_widget_vendor_outside_the_recorded_vendors_opens_nothing(no_model: NoModel) -> None:
     widget = _event("recaptcha_observed", 10, vendor="recaptcha")
-    context = _context(MAPPING, failure_reason=UNUSUAL)
 
-    diagnostic = await ffd.final_failure_diagnostic(_evidence(_visit((widget,))), context)
+    diagnostic = await ffd.final_failure_diagnostic(_evidence(_visit((widget,))), _context())
 
-    assert diagnostic.vendors_observed == () and matcher.prompts == []
-
-
-@pytest.mark.parametrize(
-    ("event_type", "vendor"), [("recaptcha_observed", "recaptcha"), ("hcaptcha_observed", "hcaptcha")]
-)
-@pytest.mark.parametrize(
-    ("refs", "code"),
-    [
-        pytest.param(["har:t1/1/1"], None, id="passive-only"),
-        pytest.param(["har:t1/1/0", "har:t1/1/1"], "ACCESS_DENIED", id="with-block"),
-    ],
-)
-@pytest.mark.asyncio
-async def test_a_passive_widget_event_cannot_carry_a_configured_code_alone(
-    matcher: FakeMatcher, event_type: str, vendor: str, refs: list[str], code: str | None
-) -> None:
-    block = _event("explicit_block", 20, vendor="cloudflare", http_status=403, url_class="document")
-    visit = _visit((block, _event(event_type, 10, vendor=vendor)), vendors=("cloudflare", vendor))
-    matcher.response = {"error_code": "ACCESS_DENIED", "evidence_refs": refs}
-    context = _context(MAPPING, failure_reason=UNUSUAL)
-
-    diagnostic = await ffd.final_failure_diagnostic(_evidence(visit), context)
-
-    assert diagnostic.enforcement.value == "explicit_block" and diagnostic.error_code == code
+    assert diagnostic.vendors_observed == () and diagnostic.system_errors == ()
 
 
 NEW_FINISH = datetime(2026, 8, 1, 0, 20)
@@ -837,7 +1205,7 @@ async def _reset_and_fail_again(database: AgentDB, org: str, run_id: str, attemp
 @pytest.mark.parametrize("attempts", [0, 1, 2])
 @pytest.mark.parametrize("reset", [True, False])
 async def test_only_the_execution_that_wrote_the_owner_snapshot_can_annotate_the_run(
-    database: AgentDB, org: str, monkeypatch: pytest.MonkeyPatch, matcher: FakeMatcher, attempts: int, reset: bool
+    database: AgentDB, org: str, monkeypatch: pytest.MonkeyPatch, no_model: NoModel, attempts: int, reset: bool
 ) -> None:
     monkeypatch.setattr(ffd.app, "DATABASE", database, raising=False)
     run_id, _ = await _workflow_run(database, org, attempts=attempts)
@@ -870,7 +1238,7 @@ async def test_only_the_execution_that_wrote_the_owner_snapshot_can_annotate_the
 
 @pytest.mark.asyncio
 async def test_a_reset_after_the_owner_check_but_before_the_write_is_refused(
-    database: AgentDB, org: str, monkeypatch: pytest.MonkeyPatch, matcher: FakeMatcher
+    database: AgentDB, org: str, monkeypatch: pytest.MonkeyPatch, no_model: NoModel
 ) -> None:
     monkeypatch.setattr(ffd.app, "DATABASE", database, raising=False)
     run_id, _ = await _workflow_run(database, org, attempts=1)

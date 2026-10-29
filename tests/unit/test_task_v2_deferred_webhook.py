@@ -199,7 +199,8 @@ async def test_the_task_v2_row_mirrors_the_diagnostic_with_or_without_a_callback
 
     returned = await task_v2_service.run_task_v2(ORGANIZATION, "oc_1")  # type: ignore[arg-type]
 
-    assert harness.cleanup_kwargs["final_diagnostic_error_code_mapping"] == ROOT_MAPPING
+    # The root mapping is no longer matched at cleanup; no model call reconsiders it there.
+    assert "final_diagnostic_error_code_mapping" not in harness.cleanup_kwargs
     assert harness.task_v2.failure_category == [PRIMARY, DIAGNOSTIC]
     assert returned.model_dump(by_alias=True)["failure_category"] == [PRIMARY, DIAGNOSTIC]
     assert harness.order == (["terminal_write", "cleanup", "webhook"] if callback else ["terminal_write", "cleanup"])

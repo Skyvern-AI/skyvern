@@ -43,6 +43,10 @@ class HarEvidenceEvent(BaseModel):
     vendor_path_class: str | None = None
     # The event's host relative to the visited site; an observation, not proof of who blocked the page.
     host_class: str = "unknown"
+    # Set only by the deployment's extractor for an event it qualifies as enforcement (a block, not a widget or asset
+    # load), with the service that event identifies, or None when it names none the reporting knows.
+    failure_signal: str | None = None
+    service: str | None = None
 
     @field_validator("host_class", mode="before")
     @classmethod

@@ -659,6 +659,9 @@ SITE_THROTTLE_REASON_CODE = "site_throttle"
 EXTERNAL_SERVICE_THROTTLE_REASON_CODE = "external_service_throttle"
 SIGN_IN_FORM_VISIBLE_REASON_CODE = "sign_in_form_visible"
 SAVED_PROFILE_SIGNED_OUT_REASON_CODE = "saved_profile_signed_out"
+# The user-defined errors a task v2 root's own failure summary matched, carried for the run's errors[] output.
+TASK_V2_ROOT_USER_ERRORS_REASON_CODE = "task_v2_root_user_errors"
+_MAX_ROOT_USER_ERRORS = 10
 HAR_ANTI_BOT_DIAGNOSTIC_REASON_CODE = "har_anti_bot_diagnostic"
 # Task, workflow run and task v2 statuses a final diagnostic may annotate; never completed or canceled.
 DIAGNOSABLE_FAILURE_STATUSES = frozenset({"failed", "terminated", "timed_out"})
@@ -670,7 +673,9 @@ OUTPUT_ONLY_ANTI_BOT_REASON_CODES = frozenset(
     {UNSOLVED_CAPTCHA_BEFORE_BROWSER_LOSS_REASON_CODE, SITE_THROTTLE_REASON_CODE, HAR_ANTI_BOT_DIAGNOSTIC_REASON_CODE}
 )
 # Entries of any category carrying one of these are labels for the run page; the same scrub hides them.
-OUTPUT_ONLY_LABEL_REASON_CODES = frozenset({SIGN_IN_FORM_VISIBLE_REASON_CODE, SAVED_PROFILE_SIGNED_OUT_REASON_CODE})
+OUTPUT_ONLY_LABEL_REASON_CODES = frozenset(
+    {SIGN_IN_FORM_VISIBLE_REASON_CODE, SAVED_PROFILE_SIGNED_OUT_REASON_CODE, TASK_V2_ROOT_USER_ERRORS_REASON_CODE}
+)
 
 
 def with_sign_in_form_visible(categories: list[dict] | None) -> list[dict]:
@@ -714,6 +719,21 @@ def with_diagnostic_entry(categories: list | None, entry: dict[str, Any]) -> lis
     appended, so the primary entry every runtime reader uses is unchanged."""
     kept = [c for c in categories or [] if not (isinstance(c, dict) and c.get("reason_code") == entry["reason_code"])]
     return [*kept, entry]
+
+
+def with_root_user_errors(categories: list[dict] | None, user_errors: list[dict[str, Any]]) -> list[dict] | None:
+    """``categories`` with the root's matched user errors appended after every entry. The entry repeats the primary's
+    category, so readers of the category set (credential fallback) see the same run."""
+    if not categories or not user_errors:
+        return categories
+    entry = {
+        "category": categories[0].get("category"),
+        "confidence_float": categories[0].get("confidence_float"),
+        "reason_code": TASK_V2_ROOT_USER_ERRORS_REASON_CODE,
+        "reasoning": "User-defined errors the run's failure summary matched",
+        "user_errors": user_errors[:_MAX_ROOT_USER_ERRORS],
+    }
+    return [*categories, entry]
 
 
 def has_classifier_primary(categories: object) -> bool:

@@ -43,6 +43,7 @@ from skyvern.exceptions import (
     WorkflowRunNotFound,
 )
 from skyvern.forge import app
+from skyvern.forge.antibot_evidence import prompt_evidence_str
 from skyvern.forge.prompts import prompt_engine
 from skyvern.forge.sdk.api.files import (
     check_downloading_files_and_wait_for_download_to_complete,
@@ -1487,6 +1488,7 @@ async def _detect_user_defined_errors(
             elements=elements,
             current_url=current_url,
             action_history=[],
+            antibot_evidence_str=prompt_evidence_str(task),
             local_datetime=datetime.now(tz_info).isoformat(),
             reasoning=None,
         )

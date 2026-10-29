@@ -12,6 +12,7 @@ from playwright.async_api import async_playwright
 from structlog.testing import capture_logs
 
 from skyvern.forge.sdk.copilot import demonstration_tap as tap_module
+from skyvern.forge.sdk.copilot.composition_browser_expressions import scout_accessible_role_name_expression
 from skyvern.forge.sdk.copilot.demonstration_tap import PageTap, TapEvent
 from tests.unit.copilot_test_helpers import skip_no_browser
 from tests.unit.scoped_asyncio import ScopedAsyncio
@@ -1118,3 +1119,68 @@ async def test_page_tap_records_element_drags_and_a_gap_per_freehand_stroke() ->
     finally:
         if tap is not None:
             await tap.stop()
+
+
+@skip_no_browser
+@pytest.mark.asyncio
+async def test_page_tap_click_name_matches_the_browser_accessible_name() -> None:
+    tap: PageTap | None = None
+    async with async_playwright() as playwright:
+        browser = await playwright.chromium.launch(headless=True)
+        context = await browser.new_context()
+        page = await context.new_page()
+        await page.set_content(
+            """<div role="tablist">
+              <div role="tab" id="step-1"><div style="display:inline-flex">1</div>
+                <span aria-hidden="true" style="font-size:0">person</span><div>Client Info</div></div>
+              <div role="tab" id="step-2"><div style="display:inline-flex">2</div>
+                <span aria-hidden="true" style="font-size:0">assignment</span><div>Policy Info</div></div>
+            </div>
+            <button id="split">Sub<span>mit</span> order</button>
+            <button id="contents">Save<span style="display:contents">draft</span></button>
+            <span id="hidden-ref" hidden>Archive <b>item</b></span>
+            <button id="labelled" aria-labelledby="hidden-ref">x</button>
+            <button id="hidden-gap">Send<span hidden>icon</span>now</button>
+            <button id="icon-inline">Open<span aria-hidden="true">icon</span>file</button>
+            <label hidden for="account">Account <span hidden>number</span></label><input id="account">
+            <style>.shown { display: inline; }</style>
+            <button id="hidden-shown">Keep<span hidden class="shown">going</span></button>
+            <button id="child-ref">Print <span aria-labelledby="suffix"></span>
+              <span id="suffix" hidden>receipt</span></button>
+            <a href="#" id="child-label">Open <i aria-label="settings"></i></a>
+            <button id="visible-ref">Print <span aria-labelledby="visible-suffix"></span>
+              <span id="visible-suffix">slip</span></button>
+            <button id="self-labelled-ref">Copy <span aria-labelledby="named-ref">x</span></button>
+            <span id="named-ref" aria-label="link">internal</span>"""
+        )
+        try:
+            tap = PageTap(context)
+            await tap.start([page])
+            await page.click("#step-2")
+            click, _ = await _wait_for_event(tap, kind="click", selector="#step-2")
+            tab_name = click.payload["packet"]["role_name"]["accessible_name"]
+            assert "assignment" not in tab_name
+            assert await page.get_by_role("tab", name=tab_name, exact=True).count() == 1
+
+            for selector in (
+                "#split",
+                "#contents",
+                "#labelled",
+                "#hidden-gap",
+                "#icon-inline",
+                "#account",
+                "#hidden-shown",
+                "#child-ref",
+                "#child-label",
+                "#visible-ref",
+                "#self-labelled-ref",
+            ):
+                role_name = await page.evaluate(scout_accessible_role_name_expression(selector))
+                assert (
+                    await page.get_by_role(role_name["role"], name=role_name["accessible_name"], exact=True).count()
+                    == 1
+                )
+        finally:
+            if tap is not None:
+                await tap.stop()
+            await browser.close()
