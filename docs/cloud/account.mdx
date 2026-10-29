@@ -38,7 +38,7 @@ Everything in Skyvern (agents, runs, credentials, API keys, credits) belongs to 
 
 ## API keys
 
-Your API key authenticates every API, SDK, CLI and MCP request for your organization.
+Your API key authenticates every API, SDK, CLI and MCP request for your organization. Only an Admin can open this page; a Member who follows a link to it sees **Organization admin access is required**.
 
 <Steps>
   <Step title="Open API keys">
@@ -141,7 +141,7 @@ Each person in an organization is an **Admin** or a **Member**, set on [Members]
 | Role | What it can do |
 |---|---|
 | **Admin** | Everything in the organization, including the admin-only actions below. |
-| **Member** | All day-to-day work: build, run and edit agents, manage credentials, and view runs and results. Members can also change the plan and payment details, and can reveal, copy and rotate the organization API key. |
+| **Member** | All day-to-day work: build, run and edit agents, manage credentials, and view runs and results. The app hides **Billing** and **API keys** from Members; opening either page shows **Organization admin access is required**. |
 
 These actions are refused for Members with `403`:
 
@@ -157,7 +157,7 @@ An API key can't manage API keys, event triggers or member roles, so a leaked ke
 Members who open the Azure Key Vault or Custom Credential Service connection see its secret masked.
 
 <Warning>
-Every Admin and Member can get the organization API key, from **Settings → API keys** or by signing in to the CLI, and the key can do everything an Admin can except manage API keys, event triggers and member roles. Treat every Admin and Member as able to use the API with full access, and use separate organizations where people must be kept apart.
+Every Admin and Member can get the organization API key: an Admin from **Settings → API keys**, a Member by signing in to the CLI. The key can do everything an Admin can except manage API keys, event triggers and member roles. Treat every Admin and Member as able to use the API with full access, and use separate organizations where people must be kept apart.
 </Warning>
 
 ### API versions and deprecations
@@ -260,7 +260,7 @@ Questions about a migration: [support@skyvern.com](mailto:support@skyvern.com).
 
 ## Billing and credits
 
-Open **Settings → Billing**. On the Trial and Hobby plans, the **Upgrade plan** link at the bottom of the sidebar opens the same page; on other plans it reads **Plan & usage**.
+Open **Settings → Billing**. On the Trial and Hobby plans, the **Upgrade plan** link at the bottom of the sidebar opens the same page; on other plans it reads **Plan & usage**. Billing is Admin-only: a Member sees neither the **Billing** page in Settings nor that sidebar link.
 
 <img src="/images/cloud/settings-billing-overview.png" alt="Billing page with a current Free plan card, Hobby, Pro, and Enterprise plan cards, and a Credit Usage meter showing 3,948 of 5,000 one-time credits used" />
 
