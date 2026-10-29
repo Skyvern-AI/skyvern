@@ -7,7 +7,7 @@ from decimal import Decimal
 from typing import TYPE_CHECKING, Any
 
 import structlog
-from sqlalchemy import and_, delete, func, or_, select, tuple_, update
+from sqlalchemy import ColumnElement, and_, delete, func, or_, select, tuple_, update
 
 from skyvern.errors.errors import is_anti_bot_system_error
 from skyvern.forge.failure_classifier import (
@@ -56,6 +56,13 @@ if TYPE_CHECKING:
     from skyvern.forge.sdk.executor.run_liveness import RunWriteAuthority
 
 LOG = structlog.get_logger()
+
+
+def _task_attempt_filter(attempt_number: int | None) -> tuple[ColumnElement[bool], ...]:
+    # Child rows written before attempts existed carry no attempt_number, so they belong to every attempt.
+    if attempt_number is None:
+        return ()
+    return (or_(TaskModel.attempt_number == attempt_number, TaskModel.attempt_number.is_(None)),)
 
 
 def _step_status_values(status: StepStatus) -> dict[str, Any]:
@@ -1112,6 +1119,7 @@ class TasksRepository(BaseRepository):
         new_status: TaskStatus,
         only_if_status_in: list[TaskStatus],
         failure_reason: str | None = None,
+        attempt_number: int | None = None,
     ) -> int:
         """Cascade-update child tasks of the given workflow_runs.
 
@@ -1133,6 +1141,7 @@ class TasksRepository(BaseRepository):
                 update(TaskModel)
                 .where(TaskModel.workflow_run_id.in_(workflow_run_ids))
                 .where(TaskModel.status.in_([s.value for s in only_if_status_in]))
+                .where(*_task_attempt_filter(attempt_number))
                 .values(**update_values)
             )
             result = await session.execute(update_stmt)
@@ -1145,13 +1154,17 @@ class TasksRepository(BaseRepository):
         workflow_run_ids: list[str],
         new_status: StepStatus,
         only_if_status_in: list[StepStatus],
+        attempt_number: int | None = None,
     ) -> int:
         # No failure_reason parameter: StepModel has no failure_reason column.
         if not workflow_run_ids or not only_if_status_in:
             return 0
 
         task_id_subquery = (
-            select(TaskModel.task_id).where(TaskModel.workflow_run_id.in_(workflow_run_ids)).scalar_subquery()
+            select(TaskModel.task_id)
+            .where(TaskModel.workflow_run_id.in_(workflow_run_ids))
+            .where(*_task_attempt_filter(attempt_number))
+            .scalar_subquery()
         )
         update_values: dict[str, Any] = {"status": new_status.value}
         if new_status.is_terminal():

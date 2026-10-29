@@ -30,11 +30,13 @@ _pid: int | None = None
 _owner_id: str | None = None
 _enabled = False
 _wake = asyncio.Event()
+_stop = asyncio.Event()
 _lease_write_lock = asyncio.Lock()
 _registry: dict[str, _Registration] = {}
 _kept_leases: set[str] = set()
 _held: set[str] = set()
 _tasks: set[asyncio.Task[None]] = set()
+_reaper_task: asyncio.Task[None] | None = None
 _side_effect_tasks: set[asyncio.Task[None]] = set()
 _side_effect_limit = asyncio.Semaphore(10)
 # Tasks this module already cancelled; a second cancellation would interrupt the cleanup the first one started.
@@ -451,7 +453,15 @@ async def _heartbeat(repository: RunExecutionLeasesRepository) -> None:
 
 async def _reaper_loop(reap_once: Callable[[], Awaitable[None]]) -> None:
     while True:
-        await asyncio.sleep(INTERVAL_SECONDS)
+        try:
+            async with asyncio.timeout(INTERVAL_SECONDS):
+                await _stop.wait()
+            return
+        except TimeoutError:
+            pass
+        # The interval can expire in the same turn a stop is requested; no pass may start once it is.
+        if _stop.is_set():
+            return
         try:
             await reap_once()
             LOG.debug("Orphaned run reaper pass completed")
@@ -473,26 +483,32 @@ def schedule_side_effects(effect: Callable[[], Awaitable[None]]) -> None:
 
 
 def start_run_lease_tasks(reap_once: Callable[[], Awaitable[None]]) -> None:
-    global _enabled, _wake, _side_effect_limit, _lease_write_lock
+    global _enabled, _wake, _stop, _reaper_task, _side_effect_limit, _lease_write_lock
     if _enabled or settings.RUN_HEARTBEAT_TIMEOUT_MINUTES <= 0:
         return
     _enabled = True
     _wake = asyncio.Event()
+    _stop = asyncio.Event()
     _lease_write_lock = asyncio.Lock()
     _held.clear()
     _side_effect_limit = asyncio.Semaphore(10)
     _tasks.add(asyncio.create_task(_heartbeat(app.DATABASE.run_execution_leases), name="run-lease-heartbeat"))
-    _tasks.add(asyncio.create_task(_reaper_loop(reap_once), name="orphaned-run-reaper"))
+    _reaper_task = asyncio.create_task(_reaper_loop(reap_once), name="orphaned-run-reaper")
+    _tasks.add(_reaper_task)
     LOG.info("Run lease tasks started", owner_id=owner_id(), timeout_minutes=effective_timeout_minutes())
 
 
 async def stop_run_lease_tasks() -> None:
-    global _enabled
+    global _enabled, _reaper_task
     _enabled = False
-    # Stop the producers before collecting effects so a pass cannot enqueue work during shutdown.
+    _stop.set()
+    # Stop the producers before collecting effects so a pass cannot enqueue work during shutdown. An active reaper
+    # pass is awaited, not cancelled: it schedules its effects only after its lease release commits.
     for task in _tasks:
-        task.cancel()
+        if task is not _reaper_task:
+            task.cancel()
     await asyncio.gather(*_tasks, return_exceptions=True)
+    _reaper_task = None
     _tasks.clear()
     effects = list(_side_effect_tasks)
     if not effects:
