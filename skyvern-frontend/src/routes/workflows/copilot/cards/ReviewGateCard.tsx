@@ -186,6 +186,9 @@ interface ReviewGateCardProps {
   gateId?: string;
   // Transient highlight when the pending-proposal chip scrolls to this gate.
   flash?: boolean;
+  // The newest turn's terminal cause, null when that turn recorded none. A Test turn keeps the
+  // proposal's owner, so a start it refused is recorded on a later turn than `turn`.
+  latestTurnCause: string | null;
 }
 
 type ChangeRow = {
@@ -523,6 +526,7 @@ export function ReviewGateCard({
   onRetry,
   gateId,
   flash = false,
+  latestTurnCause,
 }: ReviewGateCardProps) {
   const [confirmingTest, setConfirmingTest] = useState(false);
   const runTestRef = useRef<HTMLButtonElement>(null);
@@ -597,13 +601,18 @@ export function ReviewGateCard({
     : accepting
       ? GATE_STATUS.accepting
       : null;
-  const startFailureCause = tested ? null : turn?.turnFacts?.terminalCause;
+  // A turn that records a cause never tests clean, so a cause on the newest turn postdates any tested
+  // verdict and outranks it.
+  const startFailureCause = latestTurnCause;
   const billingCreditRefusal =
     startFailureCause === "billing_credit_admission_refusal";
+  const unsavedProfilePick =
+    startFailureCause === "unsaved_browser_profile_pick";
   const testFailed = !tested && Boolean(turn && hasFailedTestBlock(turn));
   const showActions = actionsShown && hasProposal;
   const connectFailure = isBuildTestConnectFailureState(startFailureCause);
-  const canTest = Boolean(onTestEndToEnd) && !billingCreditRefusal;
+  const canTest =
+    Boolean(onTestEndToEnd) && !billingCreditRefusal && !unsavedProfilePick;
   const testLabel = connectFailure
     ? "Retry in a fresh session"
     : "Test end-to-end";
@@ -819,6 +828,12 @@ export function ReviewGateCard({
                     Go to Billing
                   </a>
                   .
+                </p>
+              ) : null}
+              {unsavedProfilePick ? (
+                <p className="pb-2 text-[11px] leading-snug text-muted-foreground">
+                  No run started: this proposal changes the browser profile.
+                  Accept it to let the test load that profile.
                 </p>
               ) : null}
               {confirmingTest && canTest ? (

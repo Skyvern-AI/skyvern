@@ -9910,6 +9910,18 @@ export function WorkflowCopilotChat({
     ? findLastIndexOfTurn(messages, gateOwnerTurnId)
     : -1;
   const gateIndex = gateOwnerIndex >= 0 ? gateOwnerIndex : lastTurnIndex;
+  let latestTurnCause: string | null = null;
+  for (
+    let index = messages.length - 1;
+    index >= Math.max(gateOwnerIndex, 0);
+    index -= 1
+  ) {
+    const narrative = messages[index]?.narrative;
+    if (narrative?.turnId) {
+      latestTurnCause = narrative.turnFacts?.terminalCause ?? null;
+      break;
+    }
+  }
   const gateOwnerMessage = messages[gateIndex];
   const gateOwnerNarrative = gateOwnerMessage?.narrative;
   const gateOwnerRendersInline = Boolean(
@@ -10686,6 +10698,9 @@ export function WorkflowCopilotChat({
                             flash={
                               turnId !== null && turnId === gateFlashTurnId
                             }
+                            latestTurnCause={
+                              index === gateIndex ? latestTurnCause : null
+                            }
                           />
                         </div>
                       ) : null}
@@ -10787,6 +10802,7 @@ export function WorkflowCopilotChat({
                                   ? retryGateFailure
                                   : undefined
                               }
+                              latestTurnCause={latestTurnCause}
                             />
                           ) : null}
                           {feedbackControl}
@@ -10890,6 +10906,7 @@ export function WorkflowCopilotChat({
                   accepting={isAccepting}
                   failure={gateFailureKind}
                   onRetry={gateFailureRetryable ? retryGateFailure : undefined}
+                  latestTurnCause={latestTurnCause}
                 />
               </div>
             ) : null}
