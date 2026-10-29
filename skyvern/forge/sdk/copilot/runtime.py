@@ -738,6 +738,7 @@ class AgentContext:
     frontier_selected_output_sources: dict[str, SelectedOutputSource] = field(default_factory=dict, repr=False)
     frontier_origin_reused_labels: list[str] = field(default_factory=list)
     frontier_origin_output_refusal: OriginOutputRefusalDetail | None = None
+    frontier_named_output_refusal: OriginOutputRefusalDetail | None = None
     # Source page of an in-flight scout action, captured before it may navigate away.
     pending_scout_source_url: str | None = None
     pending_scout_selector_candidates: list[ScoutedSelectorCandidate] | None = None

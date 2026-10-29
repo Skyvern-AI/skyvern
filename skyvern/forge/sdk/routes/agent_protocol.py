@@ -183,6 +183,7 @@ from skyvern.forge.sdk.workflow.models.workflow import (
     WorkflowRunWithWorkflowResponse,
 )
 from skyvern.forge.sdk.workflow.retry_policy import is_retry_pending
+from skyvern.forge.sdk.workflow.secret_encryption import mask_workflow_for_api
 from skyvern.forge.sdk.workflow.service import (
     cap_action_payloads,
     capped_task_v1_response,
@@ -1029,7 +1030,7 @@ async def create_workflow_legacy(
                     else (),
                 ),
             )
-        return workflow
+        return mask_workflow_for_api(workflow)
     except WorkflowDefinitionValidationException as e:
         raise e
     except (HTTPException, SkyvernHTTPException, ValidationError) as e:
@@ -1135,7 +1136,7 @@ async def create_workflow(
             else:
                 # Idempotency keys are org-scoped, so a replay must not hand back a workflow from a hidden folder.
                 await _enforce_folder_access("workflow.read", {"workflow_permanent_id": workflow_permanent_id})
-                return existing
+                return mask_workflow_for_api(existing)
             resolved_title = await app.WORKFLOW_SERVICE.resolve_workflow_creation_title(
                 current_org.organization_id,
                 workflow_definition,
@@ -1171,7 +1172,7 @@ async def create_workflow(
                     related_resource_ids=(workflow_definition.folder_id,) if workflow_definition.folder_id else (),
                 ),
             )
-        return workflow
+        return mask_workflow_for_api(workflow)
     except yaml.YAMLError as exc:
         raise HTTPException(status_code=422, detail=format_yaml_error(exc))
     except WorkflowCreationLockTimeout as exc:
@@ -1546,7 +1547,7 @@ async def update_workflow_legacy(
             ),
         )
     await _redact_inaccessible_workflow_credential_ids([workflow])
-    return workflow
+    return mask_workflow_for_api(workflow)
 
 
 @base_router.post(
@@ -1652,7 +1653,7 @@ async def update_workflow(
             ),
         )
     await _redact_inaccessible_workflow_credential_ids([workflow])
-    return workflow
+    return mask_workflow_for_api(workflow)
 
 
 @legacy_base_router.delete(
@@ -2076,7 +2077,7 @@ async def update_workflow_folder(
             related_resource_ids=(workflow.folder_id,) if workflow.folder_id else (),
         )
         await _redact_inaccessible_workflow_credential_ids([workflow])
-        return workflow
+        return mask_workflow_for_api(workflow)
     except ValueError as e:
         raise HTTPException(status_code=http_status.HTTP_400_BAD_REQUEST, detail=str(e)) from e
 
@@ -5948,6 +5949,7 @@ async def get_workflow_and_run_from_workflow_run_id(
     )
     response = response.model_copy(update={"workflow": response.workflow.model_copy(deep=True)})
     await _redact_inaccessible_workflow_credential_ids([response.workflow])
+    response = response.model_copy(update={"workflow": mask_workflow_for_api(response.workflow)})
     return response
 
 
@@ -6160,7 +6162,7 @@ async def get_workflows(
             statuses=effective_statuses,
         )
         await _redact_inaccessible_workflow_credential_ids(workflows)
-        return workflows
+        return [mask_workflow_for_api(workflow) for workflow in workflows]
 
     if only_saved_tasks and only_workflows:
         raise HTTPException(
@@ -6181,7 +6183,7 @@ async def get_workflows(
         workflow_tags=workflow_tags or None,
     )
     await _redact_inaccessible_workflow_credential_ids(workflows)
-    return workflows
+    return [mask_workflow_for_api(workflow) for workflow in workflows]
 
 
 async def _redact_inaccessible_workflow_credential_ids(workflows: Sequence[Workflow]) -> None:
@@ -6313,7 +6315,7 @@ async def get_workflow_templates() -> list[Workflow]:
     )
 
     await _redact_inaccessible_workflow_credential_ids(workflows)
-    return workflows
+    return [mask_workflow_for_api(workflow) for workflow in workflows]
 
 
 @legacy_base_router.get(
@@ -6364,7 +6366,7 @@ async def get_workflow(
             await effective_default_engine(workflow_permanent_id, current_org.organization_id)
         )
     await _redact_inaccessible_workflow_credential_ids([workflow])
-    return workflow
+    return mask_workflow_for_api(workflow)
 
 
 @legacy_base_router.get(
@@ -6403,7 +6405,7 @@ async def get_workflow_versions(
         organization_id=None if template else current_org.organization_id,
     )
     await _redact_inaccessible_workflow_credential_ids(workflows)
-    return workflows
+    return [mask_workflow_for_api(workflow) for workflow in workflows]
 
 
 @base_router.post(

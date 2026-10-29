@@ -1,3 +1,4 @@
+from copy import deepcopy
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 from enum import StrEnum
@@ -27,13 +28,15 @@ from skyvern.forge.sdk.schemas.copilot_turn_outcome import (
     PersistedCopilotComposerMode,
     TurnOutcome,
 )
+from skyvern.forge.sdk.workflow.secret_encryption import mask_workflow_definition_secrets
 from skyvern.utils.secret_headers import mask_header_values
 from skyvern.utils.yaml_loader import dump_workflow_yaml, safe_load_no_dates
 
 
 def client_visible_proposed_workflow(proposal: dict[str, Any]) -> dict[str, Any]:
-    visible = dict(proposal)
+    visible = deepcopy(proposal)
     visible.pop(COPILOT_PRIVATE_SETTINGS_KEY, None)
+    mask_workflow_definition_secrets(visible.get("workflow_definition"))
     if "cdp_connect_headers" in visible:
         headers = visible["cdp_connect_headers"]
         visible["cdp_connect_headers"] = mask_header_values(headers) if isinstance(headers, dict) else None
@@ -44,10 +47,13 @@ def client_visible_proposed_workflow(proposal: dict[str, Any]) -> dict[str, Any]
                 visible.pop("_copilot_yaml")
             else:
                 changed = False
+                if isinstance(document.get("workflow_definition"), dict):
+                    changed = mask_workflow_definition_secrets(document["workflow_definition"])
                 if "cdp_connect_headers" in document:
                     headers = document["cdp_connect_headers"]
-                    document["cdp_connect_headers"] = mask_header_values(headers) if isinstance(headers, dict) else None
-                    changed = True
+                    masked_headers = mask_header_values(headers) if isinstance(headers, dict) else None
+                    changed = changed or masked_headers != headers
+                    document["cdp_connect_headers"] = masked_headers
                 if changed:
                     visible["_copilot_yaml"] = dump_workflow_yaml(document)
         except Exception:  # noqa: BLE001 - Malformed legacy YAML must never bypass redaction.

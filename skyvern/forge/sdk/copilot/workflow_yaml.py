@@ -40,6 +40,11 @@ from skyvern.forge.sdk.workflow.private_settings import (
     resolve_totp_verification_url,
     resolve_webhook_callback_url,
 )
+from skyvern.forge.sdk.workflow.secret_encryption import (
+    definition_has_inline_secret_fields,
+    mask_workflow_definition_secrets,
+    preserve_workflow_definition_secrets,
+)
 from skyvern.forge.sdk.workflow.workflow_definition_converter import convert_workflow_definition
 from skyvern.schemas.proxy_location import GeoTarget
 from skyvern.schemas.runs import ProxyLocation, RunEngine
@@ -309,6 +314,7 @@ def _copilot_yaml_workflow_definition(persisted_definition: dict[str, Any]) -> d
 def workflow_to_copilot_yaml(workflow: Workflow) -> str:
     workflow_data = workflow.model_dump(mode="json", exclude_none=True)
     strip_private_workflow_settings(workflow_data)
+    mask_workflow_definition_secrets(workflow_data.get("workflow_definition"))
     workflow_definition = _copilot_yaml_workflow_definition(workflow_data.get("workflow_definition") or {})
 
     request_data = {
@@ -887,6 +893,13 @@ async def _process_workflow_yaml(
         return saved_rows[0]
 
     current_workflow = settings_fallback_workflow
+    if definition_has_inline_secret_fields(workflow_yaml_request.workflow_definition):
+        current_workflow = current_workflow or await saved_workflow()
+        preserve_workflow_definition_secrets(
+            updated_workflow_definition,
+            current_workflow.workflow_definition if current_workflow is not None else None,
+            workflow_yaml_request.workflow_definition,
+        )
     if enable_self_healing is None or mask_secrets is None or pin_saved_session_ip is None:
         current_workflow = await saved_workflow()
     if enable_self_healing is None:

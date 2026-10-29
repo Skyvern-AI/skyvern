@@ -75,6 +75,7 @@ from skyvern.forge.sdk.copilot.output_utils import (
     sanitize_tool_result_for_llm,
 )
 from skyvern.forge.sdk.copilot.pending_operation import pending_operation
+from skyvern.forge.sdk.copilot.repair_origin_run import use_named_output_source
 from skyvern.forge.sdk.copilot.runtime import (
     bound_call_browser_session,
     browser_session_recovery,
@@ -221,13 +222,15 @@ from .frontier import _JINJA_RUNTIME_GLOBAL_ROOTS as _JINJA_RUNTIME_GLOBAL_ROOTS
 from .frontier import _JINJA_SPECIAL_CONTEXT_ROOTS as _JINJA_SPECIAL_CONTEXT_ROOTS
 from .frontier import _SKYVERN_TEMPLATE_CONTEXT_ROOTS as _SKYVERN_TEMPLATE_CONTEXT_ROOTS
 from .frontier import _TEMPLATE_BUILTIN_ROOTS as _TEMPLATE_BUILTIN_ROOTS
+from .frontier import (
+    FrontierRequest,
+)
 from .frontier import _detect_stale_block_metadata as _detect_stale_block_metadata
 from .frontier import _find_invalidated_labels as _find_invalidated_labels
 from .frontier import _frontier_runtime_page_url as _frontier_runtime_page_url
 from .frontier import _get_prior_workflow as _get_prior_workflow
 from .frontier import _get_prior_workflow_definition as _get_prior_workflow_definition
 from .frontier import _invalidate_verified_state_on_edit as _invalidate_verified_state_on_edit
-from .frontier import _plan_frontier as _plan_frontier
 from .frontier import _referenced_output_labels as _referenced_output_labels
 from .frontier import _stale_block_metadata_message as _stale_block_metadata_message
 from .frontier import _unknown_jinja_roots as _unknown_jinja_roots
@@ -601,6 +604,7 @@ async def edit_block_and_run_tool(
     executed_source_reference: str | None = None,
     block_labels: list[str] | None = None,
     parameters: dict[str, Any] | None = None,
+    reuse_outputs_from_run_id: str | None = None,
 ) -> str:
     """Apply one exact code edit and immediately test the affected frontier.
 
@@ -619,6 +623,13 @@ async def edit_block_and_run_tool(
 
     Pass current non-secret values for runtime workflow parameters in ``parameters``. For a raw
     secret value (for example, a password), do NOT pass an inline value; do not build or run with the raw value.
+
+    `reuse_outputs_from_run_id` names a finished run of this workflow, including an earlier Copilot test run.
+    For this call only, its recorded block outputs are the first source for the outputs of blocks this
+    test does not run, under the same checks as any reused output: unchanged upstream blocks, equal
+    inputs and execution settings. The result's `reused_block_outputs` lists each output used and its
+    source run; `origin_output_not_reused` names a producer the other sources could not supply and why, and
+    `named_output_not_reused` the first output the named run could not supply and why.
     """
     copilot_ctx = ctx.context
     await await_pending_credential_pause(copilot_ctx)
@@ -636,6 +647,7 @@ async def edit_block_and_run_tool(
         "parameters": runtime_parameters,
         "has_code_edit": True,
         "edit_source": "executed_source_reference" if reference_route else "anchored_replacement",
+        "reuse_outputs_from_run_id": reuse_outputs_from_run_id,
     }
 
     def fail_before_run(result: dict[str, Any]) -> str:
@@ -791,6 +803,7 @@ async def edit_block_and_run_tool(
         block_labels=requested_labels,
         parameters=runtime_parameters,
         handler_start=handler_start,
+        reuse_outputs_from_run_id=reuse_outputs_from_run_id,
     )
 
 
@@ -1449,6 +1462,7 @@ async def run_blocks_tool(
     block_labels: list[str],
     parameters: dict[str, Any] | None = None,
     new_exit: bool = False,
+    reuse_outputs_from_run_id: str | None = None,
 ) -> Any:
     """Run one or more blocks of the current workflow, wait for completion,
     and return compact debug output (status, failure reason, visible elements).
@@ -1477,58 +1491,71 @@ async def run_blocks_tool(
     from the one the previous build test in this chat used; the result's
     `new_exit` receipt says whether that happened or why no different exit
     was available, in which case nothing runs.
+
+    `reuse_outputs_from_run_id` names a finished run of this workflow, including an earlier Copilot test run.
+    For this call only, its recorded block outputs are the first source for the outputs of blocks this
+    test does not run, under the same checks as any reused output: unchanged upstream blocks, equal
+    inputs and execution settings. The result's `reused_block_outputs` lists each output used and its
+    source run; `origin_output_not_reused` names a producer the other sources could not supply and why, and
+    `named_output_not_reused` the first output the named run could not supply and why.
     """
     copilot_ctx = ctx.context
     await await_pending_credential_pause(copilot_ctx)
     copilot_ctx.completion_verification_result = None
     handler_start = time.monotonic()
-    arguments = {"block_labels": block_labels, "parameters": parameters or {}, "new_exit": new_exit}
+    arguments = {
+        "block_labels": block_labels,
+        "parameters": parameters or {},
+        "new_exit": new_exit,
+        "reuse_outputs_from_run_id": reuse_outputs_from_run_id,
+    }
     authority_error = _authority_tool_error(copilot_ctx, "run_blocks_and_collect_debug")
     if authority_error:
         return _diagnosis_repair_tool_error(copilot_ctx, "run_blocks_and_collect_debug", authority_error)
 
-    prior_definition = await _get_prior_workflow_definition(copilot_ctx)
-    labels_to_execute, block_outputs_to_seed, frontier_start_label, start_provenance = _plan_frontier(
-        copilot_ctx,
-        block_labels,
-        prior_definition,
-        prior_definition,
-        await _frontier_runtime_page_url(copilot_ctx),
-    )
-    copilot_ctx.frontier_start_provenance = start_provenance
-    with copilot_span(
-        "run_blocks",
-        data=_run_blocks_span_data(
-            block_labels,
-            labels_to_execute,
-            frontier_start_label,
-            block_outputs_to_seed,
-            copilot_ctx,
-        ),
-    ):
-        with pending_operation("tool.run_blocks_and_collect_debug"):
-            result = await _run_blocks_and_collect_debug(
-                arguments,
+    async with use_named_output_source(copilot_ctx, reuse_outputs_from_run_id):
+        prior_definition = await _get_prior_workflow_definition(copilot_ctx)
+        frontier_request = FrontierRequest(
+            list(block_labels), prior_definition, prior_definition, await _frontier_runtime_page_url(copilot_ctx)
+        )
+        labels_to_execute, block_outputs_to_seed, frontier_start_label, start_provenance = frontier_request.plan(
+            copilot_ctx
+        )
+        copilot_ctx.frontier_start_provenance = start_provenance
+        with copilot_span(
+            "run_blocks",
+            data=_run_blocks_span_data(
+                block_labels,
+                labels_to_execute,
+                frontier_start_label,
+                block_outputs_to_seed,
                 copilot_ctx,
-                labels_to_execute=labels_to_execute,
-                block_outputs_to_seed=block_outputs_to_seed,
-                frontier_start_label=frontier_start_label,
-                new_exit=new_exit,
+            ),
+        ):
+            with pending_operation("tool.run_blocks_and_collect_debug"):
+                result = await _run_blocks_and_collect_debug(
+                    arguments,
+                    copilot_ctx,
+                    labels_to_execute=labels_to_execute,
+                    block_outputs_to_seed=block_outputs_to_seed,
+                    frontier_start_label=frontier_start_label,
+                    new_exit=new_exit,
+                    frontier_request=frontier_request,
+                )
+            recorded_outcome = await _verify_and_record_run_blocks_result(copilot_ctx, result, handler_start)
+            _carry_prior_attempt_change_identity_into_result(copilot_ctx, result, "run_blocks_and_collect_debug")
+            record_tool_step_result_for_ctx(copilot_ctx, "run_blocks_and_collect_debug", arguments, result)
+            finalize_build_test_result(
+                copilot_ctx,
+                source_tool="run_blocks_and_collect_debug",
+                result=result,
+                recorded_outcome=recorded_outcome,
             )
-        recorded_outcome = await _verify_and_record_run_blocks_result(copilot_ctx, result, handler_start)
-        _carry_prior_attempt_change_identity_into_result(copilot_ctx, result, "run_blocks_and_collect_debug")
-        record_tool_step_result_for_ctx(copilot_ctx, "run_blocks_and_collect_debug", arguments, result)
-        finalize_build_test_result(
-            copilot_ctx,
-            source_tool="run_blocks_and_collect_debug",
-            result=result,
-            recorded_outcome=recorded_outcome,
-        )
-        enqueue_screenshot_from_result(
-            copilot_ctx,
-            result,
-            provenance=_run_result_screenshot_provenance(result, source_tool="run_blocks_and_collect_debug"),
-        )
+            enqueue_screenshot_from_result(
+                copilot_ctx,
+                result,
+                provenance=_run_result_screenshot_provenance(result, source_tool="run_blocks_and_collect_debug"),
+            )
 
     sanitized = _stamp_turn_budget_on_result(
         copilot_ctx, sanitize_tool_result_for_llm("run_blocks_and_collect_debug", result)
@@ -1699,6 +1726,7 @@ async def update_and_run_blocks_tool(
     code_artifact_metadata: list[CodeArtifactMetadata] | None = None,
     parameters: dict[str, Any] | None = None,
     executed_source_references: dict[str, str] | None = None,
+    reuse_outputs_from_run_id: str | None = None,
 ) -> Any:
     """Update the workflow and immediately run the specified blocks in one step.
     Pass the complete workflow as a `workflow` object with the same keys as the workflow YAML, as in
@@ -1740,6 +1768,13 @@ async def update_and_run_blocks_tool(
     `observation_step` returned by inspect_page_for_composition (or another
     page read) for the page that block acts on.
     For authored code blocks, include `code_artifact_metadata`.
+
+    `reuse_outputs_from_run_id` names a finished run of this workflow, including an earlier Copilot test run.
+    For this call only, its recorded block outputs are the first source for the outputs of blocks this
+    test does not run, under the same checks as any reused output: unchanged upstream blocks, equal
+    inputs and execution settings. The result's `reused_block_outputs` lists each output used and its
+    source run; `origin_output_not_reused` names a producer the other sources could not supply and why, and
+    `named_output_not_reused` the first output the named run could not supply and why.
     """
     workflow_yaml = dump_workflow_yaml(workflow)
     copilot_ctx = ctx.context
@@ -1755,6 +1790,7 @@ async def update_and_run_blocks_tool(
         "code_artifact_metadata": serialized_code_artifact_metadata,
         "parameters": parameters or {},
         "executed_source_labels": sorted(executed_source_references or {}),
+        "reuse_outputs_from_run_id": reuse_outputs_from_run_id,
     }
     skip_run_after_update = _update_and_run_requires_skipped_run(copilot_ctx, "update_and_run_blocks")
     # Cleared unconditionally up front and only set True at the actual skip
@@ -1827,6 +1863,7 @@ async def update_and_run_blocks_tool(
         block_labels=block_labels,
         parameters=parameters or {},
         handler_start=handler_start,
+        reuse_outputs_from_run_id=reuse_outputs_from_run_id,
     )
 
 
@@ -1880,52 +1917,56 @@ async def _run_updated_workflow_blocks(
     block_labels: list[str],
     parameters: dict[str, Any],
     handler_start: float,
+    reuse_outputs_from_run_id: str | None = None,
 ) -> str:
     """Run a just-persisted definition through the shared frontier and debug-evidence seam."""
-    new_definition = copilot_ctx.last_workflow.workflow_definition if copilot_ctx.last_workflow is not None else None
+    async with use_named_output_source(copilot_ctx, reuse_outputs_from_run_id):
+        new_definition = (
+            copilot_ctx.last_workflow.workflow_definition if copilot_ctx.last_workflow is not None else None
+        )
 
-    labels_to_execute, block_outputs_to_seed, frontier_start_label, start_provenance = _plan_frontier(
-        copilot_ctx,
-        block_labels,
-        prior_definition,
-        new_definition,
-        await _frontier_runtime_page_url(copilot_ctx),
-    )
-    copilot_ctx.frontier_start_provenance = start_provenance
-    with copilot_span(
-        "run_blocks",
-        data=_run_blocks_span_data(
-            block_labels,
-            labels_to_execute,
-            frontier_start_label,
-            block_outputs_to_seed,
-            copilot_ctx,
-        ),
-    ):
-        with pending_operation("tool.update_and_run_blocks"):
-            run_result = await _run_blocks_and_collect_debug(
-                {"block_labels": block_labels, "parameters": parameters},
+        frontier_request = FrontierRequest(
+            list(block_labels), prior_definition, new_definition, await _frontier_runtime_page_url(copilot_ctx)
+        )
+        labels_to_execute, block_outputs_to_seed, frontier_start_label, start_provenance = frontier_request.plan(
+            copilot_ctx
+        )
+        copilot_ctx.frontier_start_provenance = start_provenance
+        with copilot_span(
+            "run_blocks",
+            data=_run_blocks_span_data(
+                block_labels,
+                labels_to_execute,
+                frontier_start_label,
+                block_outputs_to_seed,
                 copilot_ctx,
-                labels_to_execute=labels_to_execute,
-                block_outputs_to_seed=block_outputs_to_seed,
-                frontier_start_label=frontier_start_label,
+            ),
+        ):
+            with pending_operation("tool.update_and_run_blocks"):
+                run_result = await _run_blocks_and_collect_debug(
+                    {"block_labels": block_labels, "parameters": parameters},
+                    copilot_ctx,
+                    labels_to_execute=labels_to_execute,
+                    block_outputs_to_seed=block_outputs_to_seed,
+                    frontier_start_label=frontier_start_label,
+                    frontier_request=frontier_request,
+                )
+            recorded_outcome = await _verify_and_record_run_blocks_result(copilot_ctx, run_result, handler_start)
+            run_result = carry_author_time_findings(update_result, run_result)
+            _carry_prior_attempt_change_identity_into_result(copilot_ctx, run_result, tool_name)
+            record_tool_step_result_for_ctx(copilot_ctx, tool_name, arguments, run_result)
+            finalize_build_test_result(
+                copilot_ctx,
+                source_tool=tool_name,
+                result=run_result,
+                workflow_updated=True,
+                recorded_outcome=recorded_outcome,
             )
-        recorded_outcome = await _verify_and_record_run_blocks_result(copilot_ctx, run_result, handler_start)
-        run_result = carry_author_time_findings(update_result, run_result)
-        _carry_prior_attempt_change_identity_into_result(copilot_ctx, run_result, tool_name)
-        record_tool_step_result_for_ctx(copilot_ctx, tool_name, arguments, run_result)
-        finalize_build_test_result(
-            copilot_ctx,
-            source_tool=tool_name,
-            result=run_result,
-            workflow_updated=True,
-            recorded_outcome=recorded_outcome,
-        )
-        enqueue_screenshot_from_result(
-            copilot_ctx,
-            run_result,
-            provenance=_run_result_screenshot_provenance(run_result, source_tool=tool_name),
-        )
+            enqueue_screenshot_from_result(
+                copilot_ctx,
+                run_result,
+                provenance=_run_result_screenshot_provenance(run_result, source_tool=tool_name),
+            )
     sanitized = _stamp_turn_budget_on_result(
         copilot_ctx, sanitize_tool_result_for_llm("run_blocks_and_collect_debug", run_result)
     )

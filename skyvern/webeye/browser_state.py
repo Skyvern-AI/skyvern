@@ -229,6 +229,20 @@ def get_browser_connection_loss(browser_state: BrowserState | None) -> BrowserSt
     return loss if isinstance(loss, BrowserStateDiagnostic) else None
 
 
+BROWSER_CONNECTION_LOST_USER_MESSAGE = (
+    "Skyvern lost its connection to the browser partway through this run, so the run stopped where it was. "
+    "Anything the run had already submitted in that browser may or may not have gone through. Check the site "
+    "before running this again, because a new run repeats the steps from the beginning."
+)
+
+
+def browser_connection_lost_reason(browser_state: BrowserState | None) -> str | None:
+    """The failure reason a run records once it has lost its own browser; None while it still holds one."""
+    if get_browser_connection_loss(browser_state) is None:
+        return None
+    return BROWSER_CONNECTION_LOST_USER_MESSAGE
+
+
 def raise_if_browser_connection_lost(
     browser_state: BrowserState | None, *, task_id: str | None = None, workflow_run_id: str | None = None
 ) -> None:

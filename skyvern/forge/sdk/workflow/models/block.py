@@ -380,6 +380,7 @@ from skyvern.webeye.browser_factory import rebind_download_dir
 from skyvern.webeye.browser_object_predicates import is_page_like
 from skyvern.webeye.browser_state import (
     BrowserState,
+    browser_connection_lost_reason,
     get_browser_connection_loss,
     get_browser_state_diagnostic,
     raise_if_browser_connection_lost,
@@ -2036,7 +2037,9 @@ class Block(BaseModel, abc.ABC):
                     block_label=self.label,
                     block_type=self.block_type,
                 )
-                failure_reason = get_user_facing_exception_message(e)
+                failure_reason = browser_connection_lost_reason(
+                    app.BROWSER_MANAGER.get_for_workflow_run(workflow_run_id)
+                ) or get_user_facing_exception_message(e)
                 if isinstance(e, MissingBrowserState):
                     # Nothing hands a later block a browser once the run has lost its own, so
                     # continuing only replays this failure for every remaining block or loop
