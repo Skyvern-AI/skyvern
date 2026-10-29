@@ -8401,6 +8401,7 @@ class WorkflowService:
                     else 0
                 ),
                 would_be_code=is_script_run,
+                copilot_test_copy=workflow.created_by == COPILOT_TEST_WORKFLOW_CREATOR,
             )
         else:
             LOG.warning(
