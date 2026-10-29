@@ -32,6 +32,7 @@ from skyvern.forge.sdk.copilot.build_test_outcome import BuildTestFailedOperatio
 from skyvern.forge.sdk.copilot.code_block_synthesis import synthesize_goto_code_block
 from skyvern.forge.sdk.copilot.config import DEFAULT_TOKEN_BUDGET, BlockAuthoringPolicy, CopilotConfig
 from skyvern.forge.sdk.copilot.context import CopilotContext, upsert_narrative_block_attempt
+from skyvern.forge.sdk.copilot.enforcement import TOTAL_TIMEOUT_SECONDS
 from skyvern.forge.sdk.copilot.mcp_adapter import SkyvernOverlayMCPServer
 from skyvern.forge.sdk.copilot.model_resolver import make_copilot_call_model_input_filter
 from skyvern.forge.sdk.copilot.output_utils import (
@@ -81,7 +82,7 @@ from skyvern.forge.sdk.workflow.models.workflow import (
     WorkflowRunStatus,
 )
 from skyvern.forge.sdk.workflow.workflow_definition_converter import convert_workflow_definition
-from skyvern.schemas.workflows import WorkflowCreateYAMLRequest
+from skyvern.schemas.workflows import BlockType, WorkflowCreateYAMLRequest
 from tests.unit.copilot_test_helpers import (
     INERT_APPROVAL_WORKFLOW_YAML,
     ORIGIN_OUTPUT_SENTINEL,
@@ -89,6 +90,7 @@ from tests.unit.copilot_test_helpers import (
     REPAIRED_APPROVAL_WORKFLOW_YAML,
     inert_approval_workflow,
     install_origin_run,
+    install_run_blocks_harness,
     make_copilot_ctx,
     merge_origin_rows,
     origin_block_rows,
@@ -2165,6 +2167,242 @@ def test_summarize_tool_result_reflects_executed_frontier_with_cache_note() -> N
     assert "skipped prefix from cache" in summary
 
 
+_BRANCHING_WORKFLOW_YAML = """
+title: branching example
+workflow_definition:
+  parameters: []
+  blocks:
+    - block_type: conditional
+      label: route
+      branch_conditions:
+        - criteria:
+            expression: "{{ true }}"
+          next_block_label: take_branch
+        - is_default: true
+          next_block_label: other_branch
+    - block_type: extraction
+      label: take_branch
+      url: https://example.com
+      data_extraction_goal: Extract the page heading.
+    - block_type: extraction
+      label: other_branch
+      url: https://example.com
+      data_extraction_goal: Extract the page footer.
+"""
+
+
+_LINEAR_WORKFLOW_YAML = _BRANCHING_WORKFLOW_YAML.replace(
+    """    - block_type: conditional
+      label: route
+      branch_conditions:
+        - criteria:
+            expression: "{{ true }}"
+          next_block_label: take_branch
+        - is_default: true
+          next_block_label: other_branch
+""",
+    """    - block_type: extraction
+      label: route
+      url: https://example.com
+      data_extraction_goal: Extract the page title.
+""",
+)
+
+
+_MERGING_WORKFLOW_YAML = (
+    _BRANCHING_WORKFLOW_YAML.replace(
+        "      label: route\n",
+        "      label: route\n      next_block_label: merge\n",
+    )
+    + """    - block_type: extraction
+      label: merge
+      url: https://example.com
+      data_extraction_goal: Extract the page summary.
+"""
+)
+
+
+_FINALLY_BRANCH_WORKFLOW_YAML = """
+title: branch into finally example
+workflow_definition:
+  parameters: []
+  finally_block_label: cleanup
+  blocks:
+    - block_type: conditional
+      label: route
+      next_block_label: merge
+      branch_conditions:
+        - criteria:
+            expression: "{{ true }}"
+          next_block_label: take_branch
+        - is_default: true
+          next_block_label: other_branch
+    - block_type: extraction
+      label: take_branch
+      next_block_label: cleanup
+      url: https://example.com
+      data_extraction_goal: Extract the page heading.
+    - block_type: extraction
+      label: other_branch
+      url: https://example.com
+      data_extraction_goal: Extract the page footer.
+    - block_type: extraction
+      label: merge
+      url: https://example.com
+      data_extraction_goal: Extract the page summary.
+    - block_type: extraction
+      label: cleanup
+      url: https://example.com
+      data_extraction_goal: Extract the page title.
+"""
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("workflow_yaml", "route_type", "planned", "credited", "settled"),
+    [
+        (
+            _BRANCHING_WORKFLOW_YAML,
+            BlockType.CONDITIONAL,
+            ["route", "take_branch", "other_branch"],
+            ["route", "take_branch"],
+            {"other_branch": "route"},
+        ),
+        (_MERGING_WORKFLOW_YAML, BlockType.CONDITIONAL, ["route", "take_branch", "other_branch", "merge"], [], {}),
+        (
+            _FINALLY_BRANCH_WORKFLOW_YAML,
+            BlockType.CONDITIONAL,
+            ["route", "take_branch", "other_branch", "merge"],
+            [],
+            {},
+        ),
+        (_LINEAR_WORKFLOW_YAML, BlockType.EXTRACTION, ["route", "take_branch", "other_branch"], [], {}),
+    ],
+    ids=[
+        "branch_not_taken",
+        "block_after_merge_missing",
+        "merge_missing_after_branch_into_finally",
+        "linear_block_missing",
+    ],
+)
+async def test_completed_run_credits_only_blocks_that_ran_and_settles_only_the_untaken_branch(
+    monkeypatch: pytest.MonkeyPatch,
+    workflow_yaml: str,
+    route_type: BlockType,
+    planned: list[str],
+    credited: list[str],
+    settled: dict[str, str],
+) -> None:
+    started = datetime(2026, 4, 21, 12, 5, tzinfo=UTC)
+
+    def row(label: str, block_type: BlockType, seconds: int) -> WorkflowRunBlock:
+        return WorkflowRunBlock(
+            label=label,
+            block_type=block_type,
+            status="completed",
+            workflow_run_block_id=f"wrb_{label}",
+            workflow_run_id="wr_paused",
+            organization_id="org-1",
+            created_at=started,
+            modified_at=started + timedelta(seconds=seconds),
+            executed_branch_next_block="take_branch" if block_type == BlockType.CONDITIONAL else None,
+        )
+
+    harness = await install_run_blocks_harness(
+        monkeypatch,
+        workflow_yaml=workflow_yaml,
+        polled_status="completed",
+        terminal_blocks=[row("take_branch", BlockType.EXTRACTION, 41), row("route", route_type, 1)],
+    )
+    ctx = make_copilot_ctx(browser_session_id="pbs_chat")
+    ctx.staged_workflow = harness["workflow"]
+    ctx.frontier_resume_session_id = "pbs_run"
+
+    result = await run_execution_module._run_blocks_and_collect_debug({"block_labels": planned, "parameters": {}}, ctx)
+
+    data = result["data"]
+    assert data["executed_block_labels"] == ["route", "take_branch"]
+    assert data["not_run_block_labels"] == [label for label in planned if label not in {"route", "take_branch"}]
+    assert {block["label"]: block["duration_seconds"] for block in data["blocks"]} == {"route": 1, "take_branch": 41}
+    assert ctx.verified_prefix_labels == credited
+    assert ctx.untaken_branch_labels == settled
+
+
+@pytest.mark.asyncio
+async def test_a_conditional_that_runs_again_drops_what_it_routed_around_before(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    started = datetime(2026, 4, 21, 12, 5, tzinfo=UTC)
+    route = WorkflowRunBlock(
+        label="route",
+        block_type=BlockType.CONDITIONAL,
+        status="completed",
+        workflow_run_block_id="wrb_route",
+        workflow_run_id="wr_paused",
+        organization_id="org-1",
+        created_at=started,
+        modified_at=started + timedelta(seconds=1),
+        executed_branch_next_block="other_branch",
+    )
+    harness = await install_run_blocks_harness(
+        monkeypatch, workflow_yaml=_BRANCHING_WORKFLOW_YAML, polled_status="completed", terminal_blocks=[route]
+    )
+    ctx = make_copilot_ctx(browser_session_id="pbs_chat")
+    ctx.staged_workflow = harness["workflow"]
+    ctx.frontier_resume_session_id = "pbs_run"
+    ctx.verified_prefix_labels = ["route", "take_branch"]
+    ctx.untaken_branch_labels = {"other_branch": "route"}
+
+    await run_execution_module._run_blocks_and_collect_debug(
+        {"block_labels": ["route", "other_branch"], "parameters": {}}, ctx
+    )
+
+    assert ctx.untaken_branch_labels == {}
+    assert ctx.verified_prefix_labels == ["route", "take_branch"]
+
+
+@pytest.mark.parametrize(
+    ("settled", "tested"),
+    [({"other_branch": "route"}, True), ({}, False)],
+    ids=["branch_not_taken", "nothing_settled"],
+)
+def test_completed_run_is_tested_when_only_a_settled_branch_did_not_run(settled: dict[str, str], tested: bool) -> None:
+    definition = _wf_def(
+        ("open", "goto_url", {"url": "https://example.com"}),
+        ("route", "conditional", {}),
+        ("take_branch", "goto_url", {"url": "https://example.com/a"}),
+        ("other_branch", "goto_url", {"url": "https://example.com/b"}),
+    )
+    labels = ["open", "route", "take_branch", "other_branch"]
+    ctx = _make_ctx()
+    ctx.last_workflow = _FakeWorkflow(definition)
+    ctx.last_workflow_yaml = "workflow: yaml"
+    ctx.verified_prefix_labels = ["open", "route", "take_branch"]
+    ctx.composition_verified_labels = ["open", "route", "take_branch"]
+    ctx.untaken_branch_labels = settled
+
+    _record_run_blocks_result(
+        ctx,
+        {
+            "ok": True,
+            "data": {
+                "workflow_run_id": "wr_branch_taken",
+                "requested_block_labels": labels,
+                "planned_block_labels": labels,
+                "executed_block_labels": ["open", "route", "take_branch"],
+                "not_run_block_labels": ["other_branch"],
+                "blocks": [
+                    {"label": "open", "block_type": "GOTO_URL", "status": "completed"},
+                    {"label": "route", "block_type": "CONDITIONAL", "status": "completed"},
+                    {"label": "take_branch", "block_type": "GOTO_URL", "status": "completed"},
+                ],
+            },
+        },
+    )
+
+    assert ctx.last_full_workflow_test_ok is tested
+
+
 # --------------------------------------------------------------------------- #
 # Repeated-failure state + enforcement                                        #
 # --------------------------------------------------------------------------- #
@@ -2802,6 +3040,27 @@ def test_edit_unverified_upstream_invalidates_downstream_verified() -> None:
     assert "extract" not in ctx.verified_prefix_labels
     assert "extract" not in ctx.workflow_verification_evidence.block_verified
     assert "open" in ctx.verified_prefix_labels
+
+
+def test_edit_after_a_branch_keeps_credit_up_to_it_and_the_untaken_branch_settled() -> None:
+    def definition(merge_prompt: str) -> _FakeDefinition:
+        return _wf_def(
+            ("open", "goto_url", {"url": "https://example.com"}),
+            ("route", "conditional", {}),
+            ("take_branch", "extraction", {"prompt": "extract a"}),
+            ("other_branch", "extraction", {"prompt": "extract b"}),
+            ("merge", "extraction", {"prompt": merge_prompt}),
+        )
+
+    ctx = _make_ctx()
+    ctx.verified_prefix_labels = ["open", "route", "other_branch", "merge"]
+    ctx.composition_verified_labels = ["open", "route", "other_branch", "merge"]
+    ctx.untaken_branch_labels = {"take_branch": "route"}
+
+    _invalidate_verified_state_on_edit(ctx, definition("summarize"), definition("summarize CHANGED"))
+
+    assert ctx.verified_prefix_labels == ["open", "route", "other_branch"]
+    assert ctx.untaken_branch_labels == {"take_branch": "route"}
 
 
 def test_chokepoint_uses_passed_prior_when_last_workflow_absent() -> None:
@@ -3984,7 +4243,7 @@ workflow_definition:
     assert packet["registered_outputs"][0]["output"] == "prefix [REDACTED_SECRET] suffix"
     assert any("registered_outputs redacted" in notice for notice in packet["omission_notices"])
     assert MCP_RESULT_PROVENANCE_KEY not in output
-    assert set(output) == {"ok", "data"}
+    assert set(output) == {"ok", "data", "turn_seconds_remaining"}
     assert set(output["data"]) == {"build_test_packet", "workflow_run_id", "overall_status"}
     assert "blocks" not in output["data"]
     assert "registered_output_parameter_values" not in output["data"]
@@ -4076,6 +4335,46 @@ async def test_test_end_to_end_handoff_keeps_prior_attempt_change_identity(
 
     provider_input = json.loads(handoff[1]["output"])
     assert provider_input["data"]["prior_attempt_change_identity"] == change_identity
+
+
+@pytest.mark.asyncio
+async def test_test_end_to_end_handoff_reports_run_time_and_turn_time_left(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        agent_module,
+        "run_workflow_end_to_end",
+        AsyncMock(
+            return_value={
+                "ok": True,
+                "data": {
+                    "workflow_run_id": "wr_slow_full_test",
+                    "overall_status": "completed",
+                    "requested_block_labels": ["route", "take_branch", "other_branch"],
+                    "executed_block_labels": ["route", "take_branch"],
+                    "not_run_block_labels": ["other_branch"],
+                    "run_duration_seconds": 612,
+                    "blocks": [
+                        {"label": "route", "status": "completed", "duration_seconds": 1},
+                        {"label": "take_branch", "status": "completed", "duration_seconds": 598},
+                    ],
+                },
+            }
+        ),
+    )
+    ctx = _make_ctx(workflow_permanent_id="wpid_slow_full_test")
+
+    handoff = await agent_module._run_end_to_end_test_turn(ctx, workflow_yaml=ctx.workflow_yaml)
+
+    provider_input = json.loads(handoff[1]["output"])
+    data = provider_input["data"]
+    assert data["run_duration_seconds"] == 612
+    assert data["not_run_block_labels"] == ["other_branch"]
+    assert {row["label"]: row["duration_seconds"] for row in data["block_durations"]} == {
+        "route": 1,
+        "take_branch": 598,
+    }
+    assert provider_input["turn_seconds_remaining"] == TOTAL_TIMEOUT_SECONDS
 
 
 @pytest.mark.asyncio
@@ -6077,8 +6376,6 @@ async def test_materialized_parameter_drift_rechecks_the_full_request_before_dis
     fresh_preparation: bool,
     source_kind: str,
 ) -> None:
-    from tests.unit.copilot_test_helpers import install_run_blocks_harness
-
     harness = await install_run_blocks_harness(
         monkeypatch, workflow_yaml=REPAIRED_APPROVAL_WORKFLOW_YAML, polled_status="failed"
     )
@@ -6215,7 +6512,6 @@ async def test_same_turn_receipt_rechecks_actual_run_facts_before_dispatch(
 ) -> None:
     from skyvern.forge.sdk.copilot.repair_origin_run import OriginExecutionSettings
     from skyvern.schemas.proxy_location import ProxyLocation
-    from tests.unit.copilot_test_helpers import install_run_blocks_harness
 
     await install_run_blocks_harness(
         monkeypatch, workflow_yaml=REPAIRED_APPROVAL_WORKFLOW_YAML, polled_status="failed", dispatch_to_worker=True

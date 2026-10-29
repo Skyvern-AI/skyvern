@@ -408,6 +408,7 @@ def _fresh_ctx_for_record() -> SimpleNamespace:
         last_executed_block_labels=[],
         last_full_workflow_test_ok=False,
         last_unverified_block_labels=[],
+        untaken_branch_labels={},
         last_failure_signature=None,
         last_frontier_fingerprint=None,
         repeated_failure_streak_count=0,
