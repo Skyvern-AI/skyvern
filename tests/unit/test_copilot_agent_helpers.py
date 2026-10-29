@@ -3029,7 +3029,7 @@ workflow_definition:
         )
 
         expected = tools_module.sanitize_tool_result_for_llm("run_blocks_and_collect_debug", run_result)
-        assert json.loads(result) == expected
+        assert json.loads(result) == {**expected, "turn_seconds_remaining": None}
         assert captured["update_calls"] == 1
         assert captured["run_calls"] == 1
         assert isinstance(captured["persisted_yaml"], str)

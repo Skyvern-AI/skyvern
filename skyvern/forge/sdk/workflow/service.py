@@ -231,6 +231,7 @@ from skyvern.forge.sdk.workflow.models.block import (
     WorkflowTriggerBlock,
     compute_conditional_scopes,
     get_all_blocks,
+    labels_only_on_untaken_branches,
     pinned_v1_block_count,
     resolve_conditional_merge_edges,
     running_after_browser_loss,
@@ -8641,17 +8642,37 @@ class WorkflowService:
                 _on_terminal_write=_on_terminal_write,
             )
 
-        #
-        # Execute workflow blocks
+        label_to_block: dict[str, BlockTypeVar] = {}
+        default_next_map: dict[str, str | None] = {}
+        conditional_scopes: dict[str, str] = {}
+        if workflow_version >= 2 and any(isinstance(block, ConditionalBlock) for block in blocks):
+            workflow_run, graph = await self._build_run_graph_or_fail_run(
+                workflow=workflow,
+                workflow_run=workflow_run,
+                organization=organization,
+                listed_labels={block.label for block in blocks},
+                **attempt_fence_kwargs,
+                _on_terminal_write=_on_terminal_write,
+            )
+            if graph is None:
+                return workflow_run, blocks_to_update
+            _, label_to_block, default_next_map = graph
+            conditional_scopes = compute_conditional_scopes(label_to_block, default_next_map)
+        conditional_wrb_ids: dict[str, str] = {}
+        skipped_labels: set[str] = set()
+
         blocks_cnt = len(blocks)
         block_result = None
         for block_idx, block in enumerate(blocks):
+            if block.label in skipped_labels:
+                continue
+            scope_label = conditional_scopes.get(block.label)
             (
                 workflow_run,
                 blocks_to_update,
                 block_result,
                 should_stop,
-                _,
+                branch_metadata,
             ) = await self._execute_single_block(
                 workflow=workflow,
                 block=block,
@@ -8665,6 +8686,7 @@ class WorkflowService:
                 loaded_script_module=loaded_script_module,
                 is_script_run=is_script_run,
                 blocks_to_update=blocks_to_update,
+                parent_workflow_run_block_id=conditional_wrb_ids.get(scope_label) if scope_label else None,
                 denied_cached_labels=denied_cached_labels,
                 **attempt_fence_kwargs,
                 _on_terminal_write=_on_terminal_write,
@@ -8672,6 +8694,28 @@ class WorkflowService:
 
             if should_stop:
                 break
+            graph_conditional = label_to_block.get(block.label)
+            if not isinstance(graph_conditional, ConditionalBlock):
+                continue
+            if block_result and block_result.workflow_run_block_id:
+                conditional_wrb_ids[block.label] = block_result.workflow_run_block_id
+            # The graph drops edges into the finally block, so a branch aimed there continues at the merge point.
+            taken_label = (branch_metadata or {}).get("next_block_label")
+            if taken_label not in label_to_block:
+                taken_label = default_next_map.get(block.label)
+            untaken_labels = labels_only_on_untaken_branches(
+                graph_conditional, taken_label, label_to_block, default_next_map
+            )
+            for later_block in blocks[block_idx + 1 :]:
+                if later_block.label in untaken_labels and later_block.label not in skipped_labels:
+                    skipped_labels.add(later_block.label)
+                    LOG.info(
+                        "Skipping listed block on a branch the conditional did not take",
+                        workflow_run_id=workflow_run_id,
+                        conditional_label=block.label,
+                        taken_label=taken_label,
+                        skipped_label=later_block.label,
+                    )
         return workflow_run, blocks_to_update
 
     async def _record_fallback_episode(
@@ -8859,30 +8903,16 @@ class WorkflowService:
         attempt_fence_kwargs: dict[str, Any] = (
             {"require_latest_attempt_number": require_latest_attempt_number} if run_lease_tasks_enabled() else {}
         )
-        finally_block_label = workflow.workflow_definition.finally_block_label
-        dag_blocks = workflow.workflow_definition.blocks
-        if finally_block_label:
-            dag_blocks = self._strip_finally_block_references(dag_blocks, finally_block_label)
-
-        try:
-            start_label, label_to_block, default_next_map = self._build_workflow_graph(dag_blocks)
-        except InvalidWorkflowDefinition as exc:
-            LOG.error(
-                "DAG execution failed: workflow graph validation error",
-                workflow_run_id=workflow_run.workflow_run_id,
-                workflow_permanent_id=workflow.workflow_permanent_id,
-                organization_id=organization.organization_id,
-                workflow_id=workflow.workflow_id,
-                error=str(exc),
-                exc_info=True,
-            )
-            workflow_run = await self.mark_workflow_run_as_failed(
-                workflow_run_id=workflow_run.workflow_run_id,
-                failure_reason=str(exc),
-                **attempt_fence_kwargs,
-                _on_terminal_write=_on_terminal_write,
-            )
+        workflow_run, graph = await self._build_run_graph_or_fail_run(
+            workflow=workflow,
+            workflow_run=workflow_run,
+            organization=organization,
+            **attempt_fence_kwargs,
+            _on_terminal_write=_on_terminal_write,
+        )
+        if graph is None:
             return workflow_run, blocks_to_update
+        start_label, label_to_block, default_next_map = graph
 
         conditional_scopes = compute_conditional_scopes(label_to_block, default_next_map)
         conditional_wrb_ids: dict[str, str] = {}
@@ -9018,6 +9048,54 @@ class WorkflowService:
             current_label = next_label
 
         return workflow_run, blocks_to_update
+
+    async def _build_run_graph_or_fail_run(
+        self,
+        *,
+        workflow: Workflow,
+        workflow_run: WorkflowRun,
+        organization: Organization,
+        listed_labels: Iterable[str] = (),
+        require_latest_attempt_number: int | None = None,
+        _on_terminal_write: Callable[[WorkflowRun], None] | None = None,
+    ) -> tuple[WorkflowRun, tuple[str, dict[str, BlockTypeVar], dict[str, str | None]] | None]:
+        attempt_fence_kwargs: dict[str, Any] = (
+            {"require_latest_attempt_number": require_latest_attempt_number} if run_lease_tasks_enabled() else {}
+        )
+        finally_block_label = workflow.workflow_definition.finally_block_label
+        dag_blocks = workflow.workflow_definition.blocks
+        if finally_block_label:
+            dag_blocks = self._strip_finally_block_references(dag_blocks, finally_block_label)
+
+        listed = set(listed_labels)
+        try:
+            start_label, label_to_block, default_next_map = self._build_workflow_graph(dag_blocks)
+            # A listed conditional inside a loop is routed by that loop body's graph, which the top-level graph omits.
+            for loop_block in get_all_blocks(workflow.workflow_definition.blocks):
+                if isinstance(loop_block, ForLoopBlock | WhileLoopBlock) and any(
+                    isinstance(inner, ConditionalBlock) and inner.label in listed for inner in loop_block.loop_blocks
+                ):
+                    _, body_label_to_block, body_next_map = loop_block._build_loop_graph(loop_block.loop_blocks)
+                    label_to_block |= body_label_to_block
+                    default_next_map |= body_next_map
+            return workflow_run, (start_label, label_to_block, default_next_map)
+        except InvalidWorkflowDefinition as exc:
+            LOG.error(
+                "DAG execution failed: workflow graph validation error",
+                workflow_run_id=workflow_run.workflow_run_id,
+                workflow_permanent_id=workflow.workflow_permanent_id,
+                organization_id=organization.organization_id,
+                workflow_id=workflow.workflow_id,
+                error=str(exc),
+                exc_info=True,
+            )
+            workflow_run = await self.mark_workflow_run_as_failed(
+                workflow_run_id=workflow_run.workflow_run_id,
+                failure_reason=str(exc),
+                **attempt_fence_kwargs,
+                _on_terminal_write=_on_terminal_write,
+            )
+            return workflow_run, None
 
     async def _execute_single_block(
         self,

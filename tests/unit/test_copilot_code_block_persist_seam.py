@@ -15,6 +15,7 @@ from typing import Any, NoReturn
 from unittest.mock import AsyncMock
 
 import pytest
+from agents import FunctionTool
 
 from skyvern.forge import app
 from skyvern.forge.agent_functions import AgentFunction
@@ -1598,3 +1599,64 @@ async def test_a_write_that_waited_on_a_sibling_write_diffs_against_what_it_repl
     assert result["ok"] is True
     assert result["data"]["dropped_prior_blocks"] == ["added_by_sibling"]
     assert result["data"]["block_type_changes"] == _RETYPED_BY_SINGLE_CODE_WRITE
+
+
+@pytest.mark.asyncio
+async def test_block_edits_sent_in_one_response_compose_on_each_other(monkeypatch: pytest.MonkeyPatch) -> None:
+    async def _process(**kwargs: object) -> SimpleNamespace:
+        # Yield mid-persist, as a real save does, so the sibling calls overlap.
+        await asyncio.sleep(0)
+        return fake_workflow(workflow_definition=SimpleNamespace(blocks=[]))
+
+    async def _prior(_ctx: CopilotContext) -> None:
+        return None
+
+    monkeypatch.setattr(workflow_update_module, "_process_workflow_yaml", _process)
+    monkeypatch.setattr(workflow_update_module, "_get_prior_workflow", _prior)
+    monkeypatch.setattr(tools_module, "_get_prior_workflow_definition", AsyncMock(return_value=None))
+    ctx = _ctx(
+        _yaml(
+            """
+            title: Search
+            workflow_definition:
+              blocks:
+              - block_type: code
+                label: first
+                code: |
+                  return {"output": {"step": "first"}}
+              - block_type: code
+                label: second
+                code: |
+                  return {"output": {"step": "second"}}
+            """
+        ),
+        policy=BlockAuthoringPolicy.STANDARD,
+    )
+
+    async def invoke(tool: FunctionTool, arguments: dict[str, object]) -> dict[str, object]:
+        raw = await tool.on_invoke_tool(SimpleNamespace(context=ctx, tool_name=tool.name), json.dumps(arguments))
+        return json.loads(raw)
+
+    results = await asyncio.gather(
+        invoke(
+            tools_module.add_block_tool,
+            {
+                "after_label": "second",
+                "block": {"block_type": "code", "label": "third", "code": 'return {"output": {"step": "third"}}'},
+            },
+        ),
+        invoke(
+            tools_module.edit_block_tool, {"label": "first", "expected_code": '"first"', "replacement_code": '"one"'}
+        ),
+        invoke(
+            tools_module.edit_block_tool, {"label": "second", "expected_code": '"second"', "replacement_code": '"two"'}
+        ),
+    )
+
+    assert [result["ok"] for result in results] == [True, True, True], results
+    stored = {
+        block["label"]: str(block["code"]) for block in workflow_blocks(parse_workflow_yaml(ctx.last_workflow_yaml))
+    }
+    assert list(stored) == ["first", "second", "third"]
+    assert '"one"' in stored["first"]
+    assert '"two"' in stored["second"]

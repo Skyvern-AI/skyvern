@@ -136,6 +136,7 @@ from skyvern.forge.sdk.copilot.demonstration_recorder import DemonstrationReject
 from skyvern.forge.sdk.copilot.demonstration_replay import replay_demonstration
 from skyvern.forge.sdk.copilot.enforcement import (
     FINAL_REPLY_OBSERVATION,
+    TOTAL_TIMEOUT_SECONDS,
     CopilotNonRetriableNavError,
     _elapsed_run_seconds,
     artifact_health_blocked,
@@ -244,6 +245,7 @@ from skyvern.forge.sdk.copilot.streaming_adapter import (
     maybe_emit_design_end,
 )
 from skyvern.forge.sdk.copilot.tools import reply_ends_turn
+from skyvern.forge.sdk.copilot.tools._shared import _copilot_seconds_remaining
 from skyvern.forge.sdk.copilot.tools.blockers import _goal_value_paths_for_code_block
 from skyvern.forge.sdk.copilot.tools.browser_code import close_browser_code_session
 from skyvern.forge.sdk.copilot.tools.credential_fill import raw_secret_connected_credential
@@ -2479,10 +2481,25 @@ async def _run_end_to_end_test_turn(
     }
     if control_kind in watchdog_control_kinds:
         handoff_data["control_signal"] = {"kind": control_kind}
+    if isinstance(sanitized_data, dict):
+        for key in ("run_duration_seconds", "not_run_block_labels"):
+            if key in sanitized_data:
+                handoff_data[key] = sanitized_data[key]
+        rows = sanitized_data.get("blocks")
+        block_durations: list[JsonValue] = [
+            {"label": row.get("label"), "duration_seconds": row["duration_seconds"]}
+            for row in (rows if isinstance(rows, list) else [])
+            if isinstance(row, dict) and "duration_seconds" in row
+        ]
+        if block_durations:
+            handoff_data["block_durations"] = block_durations
     attempted_labels = packet.get("attempted_block_labels") if isinstance(packet, dict) else None
+    # The turn clock starts with the model loop, after this run, so an unstarted clock leaves the whole budget.
+    seconds_remaining = _copilot_seconds_remaining(ctx)
     handoff_result: dict[str, JsonValue] = {
         "ok": sanitized.get("ok") is True,
         "data": handoff_data,
+        "turn_seconds_remaining": TOTAL_TIMEOUT_SECONDS if seconds_remaining is None else seconds_remaining,
     }
     if (control_kind in watchdog_control_kinds or setup_error_for_llm is not None) and isinstance(
         sanitized.get("error"), str

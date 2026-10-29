@@ -435,29 +435,30 @@ async def update_workflow_tool(
     }
     credential_deferred_draft = _credential_deferred_draft_requires_skipped_run(copilot_ctx)
 
-    prior_definition = await _get_prior_workflow_definition(copilot_ctx)
-    with copilot_span("update_workflow", data={"yaml_length": len(workflow_yaml)}):
-        result = await _update_workflow(
-            {
-                **arguments,
-                "raw_code_artifact_metadata": code_artifact_metadata,
-            },
-            copilot_ctx,
-            allow_missing_credentials=credential_deferred_draft
-            or getattr(copilot_ctx, "allow_untested_workflow_draft", False) is True,
-            originating_call_id=_originating_call_id(ctx),
-        )
-        if credential_deferred_draft and result.get("ok"):
-            _mark_credential_deferred_draft(copilot_ctx, result)
-        _record_workflow_update_result(copilot_ctx, result, prior_definition)
-        record_tool_step_result_for_ctx(copilot_ctx, "update_workflow", arguments, result)
-        finalize_build_test_result(
-            copilot_ctx,
-            source_tool="update_workflow",
-            result=result,
-            workflow_updated=result.get("ok") is True,
-            diagnosis_shadow_eligible=result.get("ok") is False,
-        )
+    async with copilot_ctx.block_edit_lock:
+        prior_definition = await _get_prior_workflow_definition(copilot_ctx)
+        with copilot_span("update_workflow", data={"yaml_length": len(workflow_yaml)}):
+            result = await _update_workflow(
+                {
+                    **arguments,
+                    "raw_code_artifact_metadata": code_artifact_metadata,
+                },
+                copilot_ctx,
+                allow_missing_credentials=credential_deferred_draft
+                or getattr(copilot_ctx, "allow_untested_workflow_draft", False) is True,
+                originating_call_id=_originating_call_id(ctx),
+            )
+            if credential_deferred_draft and result.get("ok"):
+                _mark_credential_deferred_draft(copilot_ctx, result)
+            _record_workflow_update_result(copilot_ctx, result, prior_definition)
+            record_tool_step_result_for_ctx(copilot_ctx, "update_workflow", arguments, result)
+            finalize_build_test_result(
+                copilot_ctx,
+                source_tool="update_workflow",
+                result=result,
+                workflow_updated=result.get("ok") is True,
+                diagnosis_shadow_eligible=result.get("ok") is False,
+            )
     sanitized = sanitize_tool_result_for_llm("update_workflow", result)
     return json.dumps(sanitized)
 
@@ -556,33 +557,34 @@ async def edit_block_tool(
             diagnosis_shadow_eligible=False,
         )
         return json.dumps(sanitize_tool_result_for_llm("edit_block", result))
-    try:
-        workflow_yaml = apply_block_edit(
-            _stored_workflow_yaml(copilot_ctx),
-            label,
-            expected_code=expected_code,
-            replacement_code=replacement_code,
-            fields=fields,
-        )
-    except BlockEditError as exc:
-        result = {"ok": False, "error": str(exc)}
-        record_tool_step_result_for_ctx(copilot_ctx, "edit_block", arguments, result)
-        finalize_build_test_result(
+    async with copilot_ctx.block_edit_lock:
+        try:
+            workflow_yaml = apply_block_edit(
+                _stored_workflow_yaml(copilot_ctx),
+                label,
+                expected_code=expected_code,
+                replacement_code=replacement_code,
+                fields=fields,
+            )
+        except BlockEditError as exc:
+            result = {"ok": False, "error": str(exc)}
+            record_tool_step_result_for_ctx(copilot_ctx, "edit_block", arguments, result)
+            finalize_build_test_result(
+                copilot_ctx,
+                source_tool="edit_block",
+                result=result,
+                diagnosis_shadow_eligible=False,
+            )
+            return json.dumps(sanitize_tool_result_for_llm("edit_block", result))
+        return await _persist_block_scoped_edit(
             copilot_ctx,
-            source_tool="edit_block",
-            result=result,
-            diagnosis_shadow_eligible=False,
+            "edit_block",
+            workflow_yaml,
+            arguments,
+            originating_call_id=_originating_call_id(ctx),
+            rebuilt_block_labels=[label] if replacement_code is not None or "code" in (fields or {}) else None,
+            edited_label=label,
         )
-        return json.dumps(sanitize_tool_result_for_llm("edit_block", result))
-    return await _persist_block_scoped_edit(
-        copilot_ctx,
-        "edit_block",
-        workflow_yaml,
-        arguments,
-        originating_call_id=_originating_call_id(ctx),
-        rebuilt_block_labels=[label] if replacement_code is not None or "code" in (fields or {}) else None,
-        edited_label=label,
-    )
 
 
 @function_tool(
@@ -687,31 +689,59 @@ async def edit_block_and_run_tool(
     skip_run_after_update = _update_and_run_requires_skipped_run(copilot_ctx, "edit_block_and_run")
     _clear_pending_browser_interaction_observation(copilot_ctx)
 
-    try:
-        if executed_source_reference is not None:
-            async with browser_session_recovery(copilot_ctx):
-                resolution = resolve_executed_browser_code_source(copilot_ctx, executed_source_reference)
-                if resolution.status != "valid" or resolution.source is None:
-                    return fail_before_run(
-                        {
-                            "ok": False,
-                            "error": (
-                                f"The executed source reference became {resolution.status} before persistence. "
-                                "Run the complete candidate again and use its new reference."
-                            ),
-                            "error_code": "invalid_executed_source_reference",
-                            "reference_status": resolution.status,
-                        }
+    async with copilot_ctx.block_edit_lock:
+        try:
+            if executed_source_reference is not None:
+                async with browser_session_recovery(copilot_ctx):
+                    resolution = resolve_executed_browser_code_source(copilot_ctx, executed_source_reference)
+                    if resolution.status != "valid" or resolution.source is None:
+                        return fail_before_run(
+                            {
+                                "ok": False,
+                                "error": (
+                                    f"The executed source reference became {resolution.status} before persistence. "
+                                    "Run the complete candidate again and use its new reference."
+                                ),
+                                "error_code": "invalid_executed_source_reference",
+                                "reference_status": resolution.status,
+                            }
+                        )
+                    stored_yaml = _stored_workflow_yaml(copilot_ctx)
+                    current_code = stored_block_code(stored_yaml, label, allow_empty=True)
+                    if current_code is None:
+                        raise BlockEditError(f"Block {label!r} has no code to replace.")
+                    workflow_yaml = apply_block_edit(
+                        stored_yaml,
+                        label,
+                        expected_code=current_code,
+                        replacement_code=resolution.source,
                     )
-                stored_yaml = _stored_workflow_yaml(copilot_ctx)
-                current_code = stored_block_code(stored_yaml, label, allow_empty=True)
-                if current_code is None:
-                    raise BlockEditError(f"Block {label!r} has no code to replace.")
+                    prior_definition = await _get_prior_workflow_definition(copilot_ctx)
+                    workflow_yaml = preserve_untouched_block_configuration(
+                        workflow_yaml, prior_definition, edited_label=label
+                    )
+                    with copilot_span("edit_block_and_run.update", data={"yaml_length": len(workflow_yaml)}):
+                        update_result = await _update_workflow(
+                            {
+                                "workflow_yaml": workflow_yaml,
+                                "_preserve_code_block_associations": True,
+                                "_expected_exact_code_by_label": {label: resolution.source},
+                                "_rebuilt_block_labels": [label],
+                            },
+                            copilot_ctx,
+                            allow_missing_credentials=skip_run_after_update,
+                            originating_call_id=_originating_call_id(ctx),
+                            block_scoped_authoring_prior_yaml=preserve_untouched_block_configuration(
+                                _stored_workflow_yaml(copilot_ctx), prior_definition, edited_label=label
+                            ),
+                        )
+                        _record_workflow_update_result(copilot_ctx, update_result, prior_definition)
+            else:
                 workflow_yaml = apply_block_edit(
-                    stored_yaml,
+                    _stored_workflow_yaml(copilot_ctx),
                     label,
-                    expected_code=current_code,
-                    replacement_code=resolution.source,
+                    expected_code=expected_code,
+                    replacement_code=replacement_code,
                 )
                 prior_definition = await _get_prior_workflow_definition(copilot_ctx)
                 workflow_yaml = preserve_untouched_block_configuration(
@@ -722,7 +752,6 @@ async def edit_block_and_run_tool(
                         {
                             "workflow_yaml": workflow_yaml,
                             "_preserve_code_block_associations": True,
-                            "_expected_exact_code_by_label": {label: resolution.source},
                             "_rebuilt_block_labels": [label],
                         },
                         copilot_ctx,
@@ -733,32 +762,8 @@ async def edit_block_and_run_tool(
                         ),
                     )
                     _record_workflow_update_result(copilot_ctx, update_result, prior_definition)
-        else:
-            workflow_yaml = apply_block_edit(
-                _stored_workflow_yaml(copilot_ctx),
-                label,
-                expected_code=expected_code,
-                replacement_code=replacement_code,
-            )
-            prior_definition = await _get_prior_workflow_definition(copilot_ctx)
-            workflow_yaml = preserve_untouched_block_configuration(workflow_yaml, prior_definition, edited_label=label)
-            with copilot_span("edit_block_and_run.update", data={"yaml_length": len(workflow_yaml)}):
-                update_result = await _update_workflow(
-                    {
-                        "workflow_yaml": workflow_yaml,
-                        "_preserve_code_block_associations": True,
-                        "_rebuilt_block_labels": [label],
-                    },
-                    copilot_ctx,
-                    allow_missing_credentials=skip_run_after_update,
-                    originating_call_id=_originating_call_id(ctx),
-                    block_scoped_authoring_prior_yaml=preserve_untouched_block_configuration(
-                        _stored_workflow_yaml(copilot_ctx), prior_definition, edited_label=label
-                    ),
-                )
-                _record_workflow_update_result(copilot_ctx, update_result, prior_definition)
-    except BlockEditError as exc:
-        return fail_before_run({"ok": False, "error": str(exc)})
+        except BlockEditError as exc:
+            return fail_before_run({"ok": False, "error": str(exc)})
     if not update_result.get("ok"):
         _carry_prior_attempt_change_identity_into_result(copilot_ctx, update_result, "edit_block_and_run")
         record_tool_step_result_for_ctx(copilot_ctx, "edit_block_and_run", arguments, update_result)
@@ -830,32 +835,33 @@ async def add_block_tool(
             diagnosis_shadow_eligible=False,
         )
         return json.dumps(sanitize_tool_result_for_llm("add_block", result))
-    try:
-        workflow_yaml = add_block_to_workflow(
-            _stored_workflow_yaml(copilot_ctx),
-            after_label,
-            block_yaml,
-            parameters=parameters,
-        )
-    except BlockEditError as exc:
-        result = {"ok": False, "error": str(exc)}
-        record_tool_step_result_for_ctx(copilot_ctx, "add_block", arguments, result)
-        finalize_build_test_result(
+    async with copilot_ctx.block_edit_lock:
+        try:
+            workflow_yaml = add_block_to_workflow(
+                _stored_workflow_yaml(copilot_ctx),
+                after_label,
+                block_yaml,
+                parameters=parameters,
+            )
+        except BlockEditError as exc:
+            result = {"ok": False, "error": str(exc)}
+            record_tool_step_result_for_ctx(copilot_ctx, "add_block", arguments, result)
+            finalize_build_test_result(
+                copilot_ctx,
+                source_tool="add_block",
+                result=result,
+                diagnosis_shadow_eligible=False,
+            )
+            return json.dumps(sanitize_tool_result_for_llm("add_block", result))
+        return await _persist_block_scoped_edit(
             copilot_ctx,
-            source_tool="add_block",
-            result=result,
-            diagnosis_shadow_eligible=False,
+            "add_block",
+            workflow_yaml,
+            arguments,
+            code_artifact_metadata=code_artifact_metadata,
+            block_observation_refs=block_observation_refs,
+            originating_call_id=_originating_call_id(ctx),
         )
-        return json.dumps(sanitize_tool_result_for_llm("add_block", result))
-    return await _persist_block_scoped_edit(
-        copilot_ctx,
-        "add_block",
-        workflow_yaml,
-        arguments,
-        code_artifact_metadata=code_artifact_metadata,
-        block_observation_refs=block_observation_refs,
-        originating_call_id=_originating_call_id(ctx),
-    )
 
 
 @function_tool(failure_error_function=copilot_tool_failure, name_override="delete_block")
@@ -877,21 +883,22 @@ async def delete_block_tool(ctx: RunContextWrapper, label: str) -> str:
             diagnosis_shadow_eligible=False,
         )
         return json.dumps(sanitize_tool_result_for_llm("delete_block", result))
-    try:
-        workflow_yaml = delete_block_from_workflow(_stored_workflow_yaml(copilot_ctx), label)
-    except BlockEditError as exc:
-        result = {"ok": False, "error": str(exc)}
-        record_tool_step_result_for_ctx(copilot_ctx, "delete_block", arguments, result)
-        finalize_build_test_result(
-            copilot_ctx,
-            source_tool="delete_block",
-            result=result,
-            diagnosis_shadow_eligible=False,
+    async with copilot_ctx.block_edit_lock:
+        try:
+            workflow_yaml = delete_block_from_workflow(_stored_workflow_yaml(copilot_ctx), label)
+        except BlockEditError as exc:
+            result = {"ok": False, "error": str(exc)}
+            record_tool_step_result_for_ctx(copilot_ctx, "delete_block", arguments, result)
+            finalize_build_test_result(
+                copilot_ctx,
+                source_tool="delete_block",
+                result=result,
+                diagnosis_shadow_eligible=False,
+            )
+            return json.dumps(sanitize_tool_result_for_llm("delete_block", result))
+        return await _persist_block_scoped_edit(
+            copilot_ctx, "delete_block", workflow_yaml, arguments, originating_call_id=_originating_call_id(ctx)
         )
-        return json.dumps(sanitize_tool_result_for_llm("delete_block", result))
-    return await _persist_block_scoped_edit(
-        copilot_ctx, "delete_block", workflow_yaml, arguments, originating_call_id=_originating_call_id(ctx)
-    )
 
 
 SUPERSEDED_BY_VALUE_WITNESS = "superseded-by-value-witness"
@@ -1522,7 +1529,9 @@ async def run_blocks_tool(
             provenance=_run_result_screenshot_provenance(result, source_tool="run_blocks_and_collect_debug"),
         )
 
-    sanitized = sanitize_tool_result_for_llm("run_blocks_and_collect_debug", result)
+    sanitized = _stamp_turn_budget_on_result(
+        copilot_ctx, sanitize_tool_result_for_llm("run_blocks_and_collect_debug", result)
+    )
     return json.dumps(sanitized)
 
 
@@ -1535,7 +1544,7 @@ async def run_blocks_tool(
 async def test_workflow_from_blank_browser_tool(
     ctx: RunContextWrapper, parameters: dict[str, Any] | None = None
 ) -> str:
-    """Test every block of the staged candidate, or current canonical workflow, in order.
+    """Test the staged candidate, or current canonical workflow, end to end.
 
     Uses a separate blank browser with no scouting state and no restored saved browser profile.
     This tests code-established prerequisites, not configured authenticated-profile behavior;
@@ -1554,7 +1563,8 @@ async def test_workflow_from_blank_browser_tool(
         result,
         provenance=_run_result_screenshot_provenance(result, source_tool="test_workflow_from_blank_browser"),
     )
-    return json.dumps(sanitize_tool_result_for_llm("test_workflow_from_blank_browser", result))
+    sanitized = sanitize_tool_result_for_llm("test_workflow_from_blank_browser", result)
+    return json.dumps(_stamp_turn_budget_on_result(copilot_ctx, sanitized))
 
 
 _GET_RUN_RESULTS_DESCRIPTION = f"""Fetch results from a previous workflow run.
@@ -1758,34 +1768,35 @@ async def update_and_run_blocks_tool(
 
     _clear_pending_browser_interaction_observation(copilot_ctx)
 
-    # Snapshot the prior workflow definition BEFORE _update_workflow saves
-    # the new one — we need the pre-update state to diff against.
-    prior_definition = await _get_prior_workflow_definition(copilot_ctx)
+    async with copilot_ctx.block_edit_lock:
+        # Snapshot the prior workflow definition BEFORE _update_workflow saves
+        # the new one — we need the pre-update state to diff against.
+        prior_definition = await _get_prior_workflow_definition(copilot_ctx)
 
-    # Step 1: Update the workflow
-    update_params: dict[str, Any] = {
-        "workflow_yaml": workflow_yaml,
-        "block_observation_refs": normalized_block_observation_refs,
-        "code_artifact_metadata": serialized_code_artifact_metadata,
-        "raw_code_artifact_metadata": code_artifact_metadata,
-        "block_labels": block_labels,
-        "parameters": parameters or {},
-    }
-    # Held across the write like edit_block_and_run's promotion: a reference is only valid for the
-    # browser continuity it was minted in, and recovery must not change that between resolve and save.
-    async with browser_session_recovery(copilot_ctx) if executed_source_references else nullcontext():
-        promotion_error = _promote_executed_sources(copilot_ctx, update_params, executed_source_references)
-        if promotion_error is None:
-            with copilot_span("update_workflow", data={"yaml_length": len(update_params["workflow_yaml"])}):
-                update_result = await _update_workflow(
-                    update_params,
-                    copilot_ctx,
-                    allow_missing_credentials=skip_run_after_update,
-                    originating_call_id=_originating_call_id(ctx),
-                )
-                _record_workflow_update_result(copilot_ctx, update_result, prior_definition)
-        else:
-            update_result = promotion_error
+        # Step 1: Update the workflow
+        update_params: dict[str, Any] = {
+            "workflow_yaml": workflow_yaml,
+            "block_observation_refs": normalized_block_observation_refs,
+            "code_artifact_metadata": serialized_code_artifact_metadata,
+            "raw_code_artifact_metadata": code_artifact_metadata,
+            "block_labels": block_labels,
+            "parameters": parameters or {},
+        }
+        # Held across the write like edit_block_and_run's promotion: a reference is only valid for the
+        # browser continuity it was minted in, and recovery must not change that between resolve and save.
+        async with browser_session_recovery(copilot_ctx) if executed_source_references else nullcontext():
+            promotion_error = _promote_executed_sources(copilot_ctx, update_params, executed_source_references)
+            if promotion_error is None:
+                with copilot_span("update_workflow", data={"yaml_length": len(update_params["workflow_yaml"])}):
+                    update_result = await _update_workflow(
+                        update_params,
+                        copilot_ctx,
+                        allow_missing_credentials=skip_run_after_update,
+                        originating_call_id=_originating_call_id(ctx),
+                    )
+                    _record_workflow_update_result(copilot_ctx, update_result, prior_definition)
+            else:
+                update_result = promotion_error
 
     if not update_result.get("ok"):
         _carry_prior_attempt_change_identity_into_result(copilot_ctx, update_result, "update_and_run_blocks")
@@ -1914,7 +1925,9 @@ async def _run_updated_workflow_blocks(
             run_result,
             provenance=_run_result_screenshot_provenance(run_result, source_tool=tool_name),
         )
-    sanitized = sanitize_tool_result_for_llm("run_blocks_and_collect_debug", run_result)
+    sanitized = _stamp_turn_budget_on_result(
+        copilot_ctx, sanitize_tool_result_for_llm("run_blocks_and_collect_debug", run_result)
+    )
     return json.dumps(sanitized)
 
 

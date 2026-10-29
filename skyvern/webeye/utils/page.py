@@ -397,7 +397,7 @@ JS_FUNCTION_DEFS = load_js_script()
 OTP_INPUT_PRIVACY_JS = JS_FUNCTION_DEFS.split("// BEGIN OTP INPUT PRIVACY\n", 1)[1].split(
     "// END OTP INPUT PRIVACY", 1
 )[0]
-OTP_SAFE_FRAGMENT_HTML_JS = "(element) => {" + OTP_INPUT_PRIVACY_JS + "return otpSafeHtml(element, true);}"
+OTP_SAFE_ELEMENT_HTML_JS = "(element) => {" + OTP_INPUT_PRIVACY_JS + "return otpSafeHtml(element);}"
 
 
 class _DomUtilsExpression(str):

@@ -264,9 +264,12 @@ from skyvern.forge.sdk.utils.pdf_parser import extract_pdf_file
 from skyvern.forge.sdk.workflow.models.block import (
     BlockTypeVar,
     CodeBlock,
+    ConditionalBlock,
     ForLoopBlock,
     WhileLoopBlock,
     get_all_blocks,
+    labels_only_on_untaken_branches,
+    resolve_conditional_merge_edges,
 )
 from skyvern.forge.sdk.workflow.models.code_block_recorder import RECORDED_FAILURE_RESPONSE_MAX_CHARS
 from skyvern.forge.sdk.workflow.models.parameter import (
@@ -278,6 +281,7 @@ from skyvern.forge.sdk.workflow.models.parameter import (
 from skyvern.forge.sdk.workflow.models.workflow import (
     COPILOT_TEST_WORKFLOW_CREATOR,
     Workflow,
+    WorkflowDefinition,
     WorkflowRun,
     WorkflowRunOutputParameter,
     WorkflowRunParameter,
@@ -1037,6 +1041,41 @@ def _resolve_run_screenshot_b64(
     return screenshot if isinstance(screenshot, str) else None
 
 
+def _untaken_branch_labels(
+    definition: WorkflowDefinition, rows: list[WorkflowRunBlock], planned_labels: list[str]
+) -> dict[str, str]:
+    """Planned blocks with no row that sit only behind a branch a conditional in this run completed without taking,
+    each mapped to that conditional."""
+    finally_label = definition.finally_block_label
+    blocks = [block for block in definition.blocks if block.label != finally_label]
+    label_to_block: dict[str, BlockTypeVar] = {block.label: block for block in blocks}
+    # The engine drops edges into the finally block before resolving merge points, so a branch block aimed there
+    # continues at the merge point.
+    default_next_map = {
+        block.label: None if block.next_block_label == finally_label else block.next_block_label for block in blocks
+    }
+    resolve_conditional_merge_edges(blocks, label_to_block, default_next_map)
+    labels_with_rows = {row.label for row in rows}
+    untaken: dict[str, str] = {}
+    for row in rows:
+        conditional = label_to_block.get(row.label or "")
+        if row.status != BlockStatus.completed.value or not isinstance(conditional, ConditionalBlock):
+            continue
+        # A branch with no target, or aimed at the finally block, continues at the merge point, as the engine runs it.
+        taken = row.executed_branch_next_block
+        if taken not in label_to_block:
+            taken = default_next_map.get(conditional.label)
+        for label in labels_only_on_untaken_branches(conditional, taken, label_to_block, default_next_map):
+            if label in planned_labels and label not in labels_with_rows:
+                untaken[label] = conditional.label
+    return untaken
+
+
+def _block_duration_seconds(block: WorkflowRunBlock) -> int:
+    # The row's duration field times only its linked task, which for some block types is not the whole block.
+    return round((block.modified_at - block.created_at).total_seconds())
+
+
 async def _recorded_watchdog_block_receipts(
     workflow_run_id: str, organization_id: str
 ) -> tuple[list[WorkflowRunBlock], list[dict[str, Any]]]:
@@ -1048,7 +1087,9 @@ async def _recorded_watchdog_block_receipts(
     # The same projection a normal run's receipts get: a block that failed before the watchdog exit
     # failed for a reason, and dropping it here left that failure with no identity to repair.
     recorded = [block for block in blocks if block.status]
-    results = [_recorded_run_block_result(block) for block in recorded]
+    results = [
+        {**_recorded_run_block_result(block), "duration_seconds": _block_duration_seconds(block)} for block in recorded
+    ]
     await _attach_action_traces(recorded, results, organization_id, include_completed=True)
     return recorded, results
 
@@ -3576,14 +3617,15 @@ def _credit_composition_verified_labels(
     and executed exactly the workflow labels following the credit already earned."""
     if start_provenance == "unanchored":
         return
-    workflow_labels = _current_executable_workflow_block_labels(ctx)
+    # A block a conditional routed around holds no place in the chain it took.
+    settled = set(ctx.untaken_branch_labels)
+    workflow_labels = [label for label in _current_executable_workflow_block_labels(ctx) if label not in settled]
     if not workflow_labels:
         return
     # A full run carries the finally block in its label list while the workflow's own order leaves
     # it out, so comparing the two unfiltered would reject the very run that proves the body.
     finally_label = _current_finally_block_label(ctx)
-    if finally_label:
-        labels_to_execute = [label for label in labels_to_execute if label != finally_label]
+    labels_to_execute = [label for label in labels_to_execute if label != finally_label and label not in settled]
     credited = list(ctx.composition_verified_labels or [])
     # Credit is an ordered contiguous prefix, so a workflow that no longer opens with it has to
     # re-earn the whole chain rather than keep set membership that says nothing about order.
@@ -5199,6 +5241,7 @@ async def _run_blocks_and_collect_debug(
                         # scout-sourced page post-run identity on exactly the fresh-session path.
                         "browser_session_id": run_session_id,
                         "blocks": watchdog_blocks,
+                        "run_duration_seconds": round(time.monotonic() - started_monotonic),
                     },
                 }
                 _attach_run_session_facts(
@@ -5336,6 +5379,7 @@ async def _run_blocks_and_collect_debug(
         block_outputs_by_label: dict[str, Any] = {}
         for block in blocks:
             block_result = _recorded_run_block_result(block)
+            block_result["duration_seconds"] = _block_duration_seconds(block)
             if hasattr(block, "output") and block.output:
                 block_result["extracted_data"] = redact_totp_runtime_values(_screened_failure_output(block.output))
                 if block.label is not None:
@@ -5343,6 +5387,9 @@ async def _run_blocks_and_collect_debug(
             results.append(block_result)
 
         run_block_rows = blocks
+        ran_labels = {block.label for block in blocks if block.status in _EXECUTED_BLOCK_STATUSES}
+        executed_block_labels = [label for label in labels_to_execute if label in ran_labels]
+        ctx.last_executed_block_labels = list(executed_block_labels)
         ctx.last_run_blocks_block_ids = list(
             dict.fromkeys(block.workflow_run_block_id for block in run_block_rows if block.workflow_run_block_id)
         )
@@ -5394,7 +5441,7 @@ async def _run_blocks_and_collect_debug(
             "overall_status": final_status,
             "requested_block_labels": list(block_labels),
             "planned_block_labels": list(labels_to_execute),
-            "executed_block_labels": list(labels_to_execute),
+            "executed_block_labels": executed_block_labels,
             "frontier_start_label": frontier_start_label,
             "blocks": results,
             SOLVER_ATTEMPT_KEY: solver_attempt,
@@ -5402,6 +5449,9 @@ async def _run_blocks_and_collect_debug(
             "failing_code_line": failing_code_line,
             "action_observations": action_observations,
         }
+        if run_ok and (not_run_block_labels := [label for label in labels_to_execute if label not in ran_labels]):
+            result_data["not_run_block_labels"] = not_run_block_labels
+        result_data["run_duration_seconds"] = round(time.monotonic() - started_monotonic)
         if runtime_frontier_anchor_url is not None:
             result_data["runtime_frontier_anchor_url"] = runtime_frontier_anchor_url
         if runtime_frontier_starter_url_seeded:
@@ -5456,22 +5506,44 @@ async def _run_blocks_and_collect_debug(
             if result_row.get("status") == "completed"
             if isinstance((label := result_row.get("label")), str)
         }
+        untaken_branch_labels = _untaken_branch_labels(
+            snapshot.workflow.workflow_definition, run_block_rows, labels_to_execute
+        )
         run_fully_completed = (
             run_ok
             and bool(labels_to_execute)
-            and set(labels_to_execute).issubset(completed_result_labels)
+            and (set(labels_to_execute) - set(untaken_branch_labels)).issubset(completed_result_labels)
             and all(result_row.get("status") == "completed" for result_row in results)
         )
+        if execution.source_is_current(ctx):
+            # A conditional that ran here chose again, so what it routed around before no longer holds.
+            ctx.untaken_branch_labels = {
+                label: conditional_label
+                for label, conditional_label in ctx.untaken_branch_labels.items()
+                if conditional_label not in ran_labels
+            }
         if run_fully_completed and execution.source_is_current(ctx):
             # Credit belongs to a browser, not to the workflow. A run given its own browser proves
             # only what it ran there; blocks proven in the browser this one replaced never touched
             # it, and keeping them would let a later continuation resume here expecting their state.
             existing_prefix = [] if used_fresh_run_session else list(ctx.verified_prefix_labels or [])
+            settled = {
+                label: conditional_label
+                for label, conditional_label in ctx.untaken_branch_labels.items()
+                if label not in completed_result_labels
+            }
+            settled.update(untaken_branch_labels)
+            # A conditional that switched branches leaves blocks credited off the path it now takes, so the
+            # chain is re-earned from this run rather than kept with a hole in it.
+            if set(settled) & (set(existing_prefix) | set(ctx.composition_verified_labels or [])):
+                existing_prefix = []
+                ctx.composition_verified_labels = []
             existing_set = set(existing_prefix)
             for label in labels_to_execute:
-                if label not in existing_set:
+                if label not in existing_set and label not in settled:
                     existing_prefix.append(label)
                     existing_set.add(label)
+            ctx.untaken_branch_labels = settled
             ctx.verified_prefix_labels = existing_prefix
             _credit_composition_verified_labels(ctx, labels_to_execute, start_provenance)
 
@@ -6707,6 +6779,7 @@ def _record_run_blocks_result(
             ]
         if not planned_labels and not planned_labels_are_recorded and not isinstance(executed_block_labels, list):
             planned_labels = [label for label in completed_block_labels if label in current_label_set]
+        planned_labels = [label for label in planned_labels if label not in copilot_ctx.untaken_branch_labels]
         executed_label_set = (
             {label for label in executed_block_labels if isinstance(label, str)}
             if isinstance(executed_block_labels, list)

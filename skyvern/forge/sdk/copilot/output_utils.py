@@ -2264,9 +2264,10 @@ def summarize_tool_result(tool_name: str, result: dict[str, Any], *, for_display
         executed = _joined_block_labels(raw_executed, block_label, cap=for_display)
         status = data.get("overall_status", "?")
         requested = data.get("requested_block_labels") or []
-        if requested and raw_executed and list(raw_executed) != list(requested):
+        planned = data.get("planned_block_labels") or raw_executed
+        if requested and planned and list(planned) != list(requested):
             skipped = _joined_block_labels(
-                [label for label in requested if label not in set(raw_executed)], block_label, cap=for_display
+                [label for label in requested if label not in set(planned)], block_label, cap=for_display
             )
             suffix = f" (skipped prefix from cache: {skipped})" if skipped else ""
             return f"Run {executed}: {status}{suffix}"

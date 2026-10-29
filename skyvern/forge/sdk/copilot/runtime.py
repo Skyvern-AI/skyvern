@@ -551,6 +551,9 @@ class AgentContext:
     # Labels whose last successful run started from a provable composition state. Distinct from
     # verified_prefix_labels, which drives frontier advancement and must stay per-label.
     composition_verified_labels: list[str] = field(default_factory=list)
+    # Blocks a credited run's conditional routed around, keyed to that conditional. They count as settled for the
+    # tested check and the frontier, but never as verified: they did not run.
+    untaken_branch_labels: dict[str, str] = field(default_factory=dict)
     last_full_workflow_test_ok: bool = False
     last_unverified_block_labels: list[str] = field(default_factory=list)
     workflow_verification_evidence: WorkflowVerificationEvidence = field(default_factory=WorkflowVerificationEvidence)

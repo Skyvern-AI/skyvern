@@ -7465,23 +7465,25 @@ async def test_label_readback_agrees_with_the_driver_across_whitespace_forms() -
             assert "did NOT commit" not in r.content, (dom_text, r.content)
 
 
+@_skip_no_browser
 @pytest.mark.asyncio
-async def test_get_html_falls_back_to_outer_html_for_empty_leaf() -> None:
-    # inner_html of a void/leaf element ("", e.g. <input>) used to return ok("") — no signal at all.
-    # The element's own tag+attributes are the useful answer for a leaf.
-    class _LeafElement(_FakeElement):
-        async def inner_html(self) -> str:
-            return ""
+async def test_get_html_on_one_element_returns_its_own_tag_and_attributes() -> None:
+    # A link's destination and a date's full timestamp live only in the element's own attributes;
+    # its children show neither.
+    async with _content_page(
+        '<a href="https://example.com/releases/download/v1.2.0/tool.tar.gz"><span>tool.tar.gz</span></a>'
+        '<relative-time datetime="2026-07-15T16:26:10Z">15 Jul</relative-time>'
+        '<input id="email" type="email">'
+    ) as page:
+        tools = build_browser_tools(_fixed_page_provider(page))
+        get_html = _tool(tools, "get_html").handler
+        link_ref = _ref_line((await _tool(tools, "observe").handler({})).content, "tool.tar.gz")
 
-        async def evaluate(self, js: str) -> dict:
-            return '<input id="email" type="email">'
-
-    page = _FakePage()
-    page.element = _LeafElement()
-    tools = build_browser_tools(_fixed_page_provider(page))
-    r = await _tool(tools, "get_html").handler({"selector": "#email"})
-    assert r.status == "ok"
-    assert r.content == '<input id="email" type="email">'
+        link = await get_html({"selector": link_ref})
+        assert 'href="https://example.com/releases/download/v1.2.0/tool.tar.gz"' in link.content, link.content
+        date = await get_html({"selector": "relative-time"})
+        assert 'datetime="2026-07-15T16:26:10Z"' in date.content, date.content
+        assert (await get_html({"selector": "#email"})).content == '<input id="email" type="email">'
 
 
 @pytest.mark.asyncio

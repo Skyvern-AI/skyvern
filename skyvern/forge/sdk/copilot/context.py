@@ -1489,6 +1489,9 @@ class CopilotContext(AgentContext):
     # A single in-process writer at a time; the row-level CAS below this lock is the
     # cross-process fence. The token is replaced only after a durable publication.
     proposal_mutation_lock: asyncio.Lock = field(default_factory=asyncio.Lock, repr=False)
+    # Held from reading the stored draft through publishing the edit, so tool calls sent in one model
+    # response compose in order. Separate from proposal_mutation_lock, which the publish takes inside it.
+    block_edit_lock: asyncio.Lock = field(default_factory=asyncio.Lock, repr=False)
     proposal_owner_turn_id: str | None = None
     proposal_revision: int | None = None
     # A token this turn adopted but did not author never authorizes a turn-end write.
