@@ -14015,6 +14015,8 @@ class WorkflowService:
             )
             flipped_to_final = workflow_run is not None
             if workflow_run is not None:
+                # Mark before awaiting bookkeeping so a lease lost meanwhile does not cancel the winning writer.
+                note_run_finalized(workflow_run_id)
                 _record_terminal_write(_on_terminal_write, workflow_run)
                 # The terminal row is committed; its bookkeeping runs even when decision recording fails.
                 try:
@@ -14094,6 +14096,8 @@ class WorkflowService:
         )
         if workflow_run is None:
             return None
+        if status.is_final():
+            note_run_finalized(workflow_run_id)
         _record_terminal_write(_on_terminal_write, workflow_run)
         try:
             await on_terminal_transition(
@@ -14129,6 +14133,7 @@ class WorkflowService:
         )
         if workflow_run is None:
             return None
+        note_run_finalized(workflow_run_id)
         # Bulk stuck-run cleanup writes only the status. Complete that deferred
         # terminal transition exactly once, when ``finished_at`` is still null.
         try:
@@ -14713,6 +14718,8 @@ class WorkflowService:
         run = result.workflow_run
         if result.disposition == "denied" or run is None:
             return result
+        if result.transitioned or result.repaired:
+            note_run_finalized(workflow_run_id)
         try:
             # Recovery does no new work; only a real transition can extend a recorded finish time.
             await on_terminal_transition(
@@ -15076,6 +15083,7 @@ class WorkflowService:
         )
         if updated is None:
             return None
+        note_run_finalized(workflow_run_id)
         LOG.info(
             f"Marked workflow run {workflow_run_id} as canceled (conditional)",
             workflow_run_id=workflow_run_id,
