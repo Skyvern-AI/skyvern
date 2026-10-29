@@ -114,6 +114,7 @@ from skyvern.forge.taskv3.loop import (
     record_hit_class,
     record_resolve_seconds,
     record_text_delta,
+    record_type_caret_held,
     record_type_reach,
     set_driver_timeout_predicate,
 )
@@ -7113,8 +7114,9 @@ _COLLATERAL_VALUES_JS = (
 )
 
 
-# How type put the caret in a field: a checked click, or focus() alone.
-_Reach = Literal["click", "focus", "press"]
+# How type put the caret in a field: a checked click, focus() alone, or a caret the field already held ("held",
+# which clicks nothing to keep it but leaves the rows it reveals as clickable as after a checked click).
+_Reach = Literal["click", "focus", "press", "held"]
 
 
 _CHANGED_VALUE_ECHO_MAX = 80
@@ -16581,6 +16583,17 @@ def build_browser_tools(
         # field raise a false "covered by <the field's own list>" message on a field that was reachable.
         return True, occluded, None
 
+    async def _caret_held_past_invisible_layer(page: Any, selector: str, occluder: dict[str, Any] | None) -> bool:
+        # Typing needs the caret, not the pointer. A layer that paints nothing and holds no control (the probe's
+        # invisible reading) stops only clicks, so a person whose caret is already in the field types straight on;
+        # a visible layer, a challenge frame or the field's own container is something they would deal with first.
+        if _covered_branch(occluder) != "invisible":
+            return False
+        try:
+            return await page.evaluate(_ACTIVE_IS_JS, await _probe_arg(page, selector)) is True
+        except Exception:
+            return False
+
     async def _declares_a_list(page: Any, selector: str) -> bool:
         # Fail-closed toward "declares": on the focus-only path a wrong "no" would let the raw query in
         # a suggestion field read back as a fill.
@@ -16686,6 +16699,11 @@ def build_browser_tools(
         field -- nothing the page did in response to a click has been seen."""
         reachable, occluded, occluder = await _reachable_for_typing(page, selector)
         if not reachable:
+            if await _caret_held_past_invisible_layer(page, selector, occluder):
+                # Any click here lands on the layer (a list's click-outside catcher closes the list), so keep
+                # the caret where it is and type.
+                record_type_caret_held()
+                return True, None, "held"
             return False, occluder, "click"
         if focus_fallback:
             pressed = await _press_date_segment_part(page, selector)
@@ -17954,9 +17972,9 @@ def build_browser_tools(
         typed = query or value
         if selector in _live_row_offers:
             _live_row_offers[selector].typed.extend(["", typed])
-        if collateral is not None and reach != "click":
+        if collateral is not None and reach not in ("click", "held"):
             # Only a field the click could not reach can misroute its keys, and only that path restores.
-            # A checked click leaves the page untagged and pays nothing.
+            # A checked click, or a caret the field was confirmed to hold, leaves the page untagged and pays nothing.
             collateral.extend(await _capture_collateral(page, selector))
         try:
             skip_clear = pre_value == "" and (
@@ -17969,11 +17987,12 @@ def build_browser_tools(
             await _clear_and_type(page, selector, typed, clear=await _read_field_value(page, selector) != "")
         if collateral:
             collateral[:] = await _collateral_moved_while_typing(page, collateral)
-        if not presnapshot_ok or reach != "click":
+        if not presnapshot_ok or reach not in ("click", "held"):
             # Without the pre-snapshot the reaction-gate can't tell a new suggestion from static page
             # text, so don't run the finder ungated (it could click unrelated content) — leave the typed
             # value and let the caller re-observe. A field no click can reach gets no suggestion clicks
-            # either; the caller looks for reacting rows and reads its value back instead.
+            # either; the caller looks for reacting rows and reads its value back instead. A held caret
+            # is not that case: only the field sits under the layer, and each row click is hit-tested itself.
             verdict = (
                 ToolResult.error(
                     f"typed {typed!r} into {selector} but did not press Enter: its search results could not "
@@ -19496,7 +19515,9 @@ def build_browser_tools(
         except _FieldNotEditable as exc:
             return _not_editable_error(exc)
         if not reachable:
-            return _covered_error(selector, occluder)
+            if not await _caret_held_past_invisible_layer(page, selector, occluder):
+                return _covered_error(selector, occluder)
+            record_type_caret_held()
         written = text
         flutter_field = bool(clear and text and not box_text) and await _is_flutter_text_field(page, selector)
         if clear:
@@ -20121,7 +20142,7 @@ def build_browser_tools(
             # Nothing was picked either way, so the typed query comes back out and its list closes.
             await _restore_pre_type_value(page, selector, pre_value, [text])
             return pick.verdict
-        if reach != "click":
+        if reach not in ("click", "held"):
             # focus() without a click cannot show the field took the keystrokes: a segmented control
             # may move the caret to a sibling segment or drop the keys. So only a read-back that holds
             # the typed text counts as filled; anything else, including an unreadable field, is an

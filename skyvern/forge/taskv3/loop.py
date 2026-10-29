@@ -497,7 +497,12 @@ def record_type_reach(*, acted_in_frame: bool, probe_scrolled: bool, hit_on_docu
         "probe_scrolled": probe_scrolled,
         "hit_on_document_root": hit_on_document_root,
     }
-    _TYPE_REACH.set({key: value or seen.get(key, False) for key, value in new.items()})
+    _TYPE_REACH.set({**seen, **{key: value or seen.get(key, False) for key, value in new.items()}})
+
+
+def record_type_caret_held() -> None:
+    """Record that a typing call typed into the caret its field already held. Telemetry only."""
+    _TYPE_REACH.set({**(_TYPE_REACH.get() or {}), "caret_held": True})
 
 
 def record_click_dispatched() -> None:
@@ -2487,6 +2492,7 @@ _TOOL_CALL_RECORD_FIELDS = frozenset(
         "acted_in_frame",
         "probe_scrolled",
         "hit_on_document_root",
+        "caret_held",
         "page_state_stall_rounds",
         "page_state_judged",
     }
