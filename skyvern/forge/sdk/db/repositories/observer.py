@@ -4,7 +4,7 @@ from datetime import datetime
 from typing import TYPE_CHECKING, Any, Callable
 
 import structlog
-from sqlalchemy import and_, delete, func, select, update
+from sqlalchemy import and_, delete, func, or_, select, update
 from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.orm import aliased
 
@@ -781,6 +781,7 @@ class ObserverRepository(BaseRepository):
         only_if_status_in: list[str],
         failure_reason: str | None = None,
         organization_id: str | None = None,
+        attempt_number: int | None = None,
     ) -> int:
         if not only_if_status_in:
             return 0
@@ -796,6 +797,13 @@ class ObserverRepository(BaseRepository):
             # rather than the `IS NULL` a filter_by would generate.
             if organization_id is not None:
                 stmt = stmt.where(WorkflowRunBlockModel.organization_id == organization_id)
+            if attempt_number is not None:
+                stmt = stmt.where(
+                    or_(
+                        WorkflowRunBlockModel.attempt_number == attempt_number,
+                        WorkflowRunBlockModel.attempt_number.is_(None),
+                    )
+                )
             stmt = stmt.where(WorkflowRunBlockModel.status.in_(only_if_status_in)).values(**update_values)
             result = await session.execute(stmt)
             await session.commit()
