@@ -36995,6 +36995,135 @@ async def test_type_row_shape_classification(shape: str) -> None:
             assert got == outcome, r.content
 
 
+# A transparent layer the typing reveals covers the list ("on"), or covers it until the field is emptied.
+# __ROW_CLICK__: "commit" commits and closes, "inert" writes nothing, "revert_on_escape" commits and Escape reverts.
+_UNLANDED_CLICK_HTML = """
+<!doctype html><html><body style="margin:0;font:14px sans-serif">
+<label for="q">Code</label>
+<input id="q" type="text" autocomplete="off"
+       style="position:absolute;top:100px;left:40px;width:340px;height:26px">
+<div id="dd" __LIST__ style="position:absolute;top:132px;left:40px;width:340px;background:#fff"></div>
+<div id="shield" style="position:absolute;top:128px;left:0;width:600px;height:400px;display:none"></div>
+<script>
+var DATA = ['Alpha Ridge, North Unit, 1001', 'Alpha Ridge, South Unit, 1002', 'Birch Hollow, East Unit, 2001'];
+var SHIELD = '__SHIELD__';
+var ROW_CLICK = '__ROW_CLICK__';
+var TABLE = __TABLE__;
+var shieldGone = SHIELD === 'off';
+var input = document.getElementById('q');
+var dd = document.getElementById('dd');
+var shield = document.getElementById('shield');
+function commit(d) {
+  input.value = d;
+  input.setAttribute('data-committed', d);
+  if (ROW_CLICK === 'commit') { dd.innerHTML = ''; input.setAttribute('aria-expanded', 'false'); }
+}
+input.addEventListener('keydown', function (e) {
+  if (e.key === 'Escape' && ROW_CLICK === 'revert_on_escape') {
+    input.value = 'Birch Hollow';
+    dd.innerHTML = '';
+    input.setAttribute('aria-expanded', 'false');
+  }
+});
+input.addEventListener('input', function () {
+  var q = input.value.trim().toLowerCase();
+  dd.innerHTML = '';
+  if (!q) {
+    if (SHIELD === 'until_clear') shieldGone = true;
+    shield.style.display = 'none';
+    return;
+  }
+  shield.style.display = shieldGone ? 'none' : 'block';
+  var body = dd;
+  if (TABLE) {
+    dd.innerHTML = '<table style="width:100%;border-collapse:collapse"><tbody></tbody></table>';
+    body = dd.querySelector('tbody');
+  }
+  DATA.filter(function (d) { return d.toLowerCase().indexOf(q) === 0; }).forEach(function (d) {
+    var wrap = document.createElement(TABLE ? 'tbody' : 'div');
+    wrap.innerHTML = __ROW__;
+    var row = wrap.firstElementChild;
+    row.addEventListener('click', function () { if (ROW_CLICK !== 'inert') commit(d); });
+    body.appendChild(row);
+  });
+  input.setAttribute('aria-expanded', 'true');
+});
+</script>
+</body></html>
+"""
+
+_UNLANDED_ROWS: dict[str, tuple[str, dict[str, str]]] = {
+    "tr-onclick": (
+        "'<tr onclick=\"void 0\" style=\"cursor:pointer;height:24px;background:#eee\"><td>' + d + '</td></tr>'",
+        {"table": "true"},
+    ),
+    "role-option": (
+        "'<div role=\"option\" style=\"cursor:pointer;height:24px;background:#eee\">' + d + '</div>'",
+        {"table": "false", "list": 'role="listbox"'},
+    ),
+}
+
+_UNLANDED_TARGET = "Alpha Ridge, North Unit, 1001"
+
+
+def _unlanded_click_html(rows: str, *, shield: str, row_click: str = "commit") -> str:
+    row_js, opts = _UNLANDED_ROWS[rows]
+    return (
+        _UNLANDED_CLICK_HTML.replace("__ROW__", row_js)
+        .replace("__TABLE__", opts["table"])
+        .replace("__LIST__", opts.get("list", ""))
+        .replace("__SHIELD__", shield)
+        .replace("__ROW_CLICK__", row_click)
+    )
+
+
+_UNLANDED_TOOL_ARGS = {
+    "type": {"selector": "#q", "text": _UNLANDED_TARGET},
+    "select_option": {"selector": "#q", "label": _UNLANDED_TARGET},
+    "select_combobox": {"selector": "#q", "value": _UNLANDED_TARGET},
+}
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+@pytest.mark.parametrize("shield", ["on", "off"])
+@pytest.mark.parametrize("rows", list(_UNLANDED_ROWS))
+@pytest.mark.parametrize("tool", list(_UNLANDED_TOOL_ARGS))
+async def test_a_suggestion_click_that_never_lands_is_not_reported_as_selected(
+    tool: str, rows: str, shield: str
+) -> None:
+    async with _live_page(_unlanded_click_html(rows, shield=shield)) as page:
+        tools = build_browser_tools(_fixed_page_provider(page))
+        r = await _tool(tools, tool).handler(_UNLANDED_TOOL_ARGS[tool])
+        committed = await page.eval_on_selector("#q", "el => el.getAttribute('data-committed')")
+    content = _without_delta(r)
+    if shield == "off":
+        assert (r.status, committed) == ("ok", _UNLANDED_TARGET), content
+        return
+    assert r.error_class == "click_failed", content
+    assert committed is None, content
+    assert repr(_UNLANDED_TARGET) in content, content
+    assert "did not land" in content, content
+    assert "nothing was selected" in content, content
+    assert "clicked suggestion" not in content, content
+    assert "selected suggestion" not in content, content
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("row_click", "error_class"), [("inert", "did_not_commit"), ("revert_on_escape", "commit_reverted")]
+)
+async def test_a_coarser_query_click_that_lands_reports_its_own_outcome(row_click: str, error_class: str) -> None:
+    # The first click is intercepted; the shield drops when the field is cleared, so the coarser
+    # query's row click lands and its own commit outcome is the one to report.
+    async with _live_page(_unlanded_click_html("role-option", shield="until_clear", row_click=row_click)) as page:
+        tools = build_browser_tools(_fixed_page_provider(page))
+        r = await _tool(tools, "select_combobox").handler(_UNLANDED_TOOL_ARGS["select_combobox"])
+    assert r.error_class == error_class, r.content
+    assert "did not land" not in r.content, r.content
+
+
 # A declared grid-combobox (aria-controls -> role=grid of role=gridcell rows) whose row click writes
 # the value back into the input and re-renders its own list OPEN, covering the field below it.
 _DECLARED_LIST_LINGERS_HTML = """
