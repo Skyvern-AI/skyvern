@@ -5150,6 +5150,8 @@ class WorkflowService:
         expected_browser_session_id: str | None = None,
         browser_settings: BrowserSettings | None = None,
         created_for_workflow_run_id: str | None = None,
+        profile_read_only: bool = False,
+        inherit_profile_proxy: bool = True,
     ) -> PersistentBrowserSession | None:
         browser_dispatch: dict[str, Any] = (
             {}
@@ -5181,8 +5183,9 @@ class WorkflowService:
                 organization_id=organization_id,
                 timeout_minutes=timeout_seconds // 60,
                 browser_profile_id=browser_profile_id,
+                profile_read_only=profile_read_only,
                 proxy_location=proxy_location,
-                inherit_profile_proxy=True,
+                inherit_profile_proxy=inherit_profile_proxy,
                 session_kind=BrowserSessionKind.workflow_run,
                 **browser_type_kwargs,
                 browser_settings=browser_settings,
@@ -5193,14 +5196,15 @@ class WorkflowService:
 
         return None
 
-    async def _browser_profile_is_managed(self, *, organization_id: str, browser_profile_id: str | None) -> bool:
+    async def _get_run_browser_profile(
+        self, *, organization_id: str, browser_profile_id: str | None
+    ) -> BrowserProfile | None:
         if not browser_profile_id:
-            return False
-        profile = await app.DATABASE.browser_sessions.get_browser_profile(
+            return None
+        return await app.DATABASE.browser_sessions.get_browser_profile(
             profile_id=browser_profile_id,
             organization_id=organization_id,
         )
-        return bool(profile and profile.is_managed)
 
     @staticmethod
     async def _close_reused_session_best_effort(
@@ -7425,6 +7429,44 @@ class WorkflowService:
             )
             return workflow_run
 
+        async def fail_run_before_blocks(
+            failure_reason: str, error: Exception | None, *, owned_browser_session_id: str | None = None
+        ) -> WorkflowRun:
+            failure_category = _browser_lease_failure_category(error, workflow_run) if error else None
+            if browser_dispatch:
+                failed = await self._mark_workflow_run_as_failed_for_dispatch(
+                    workflow_run_id=workflow_run_id,
+                    organization_id=organization_id,
+                    attempt_number=attempt_number,
+                    dispatch_claim_started_at=dispatch_claim_started_at,
+                    failure_reason=failure_reason,
+                    failure_category=failure_category,
+                    _on_terminal_write=capture_owner,
+                )
+                if failed is None:
+                    return await self.get_workflow_run(workflow_run_id, organization_id)
+                failed_run = failed
+            else:
+                failed_run = await self.mark_workflow_run_as_failed(
+                    workflow_run_id=workflow_run_id,
+                    failure_reason=failure_reason,
+                    failure_category=failure_category,
+                    **attempt_fence_kwargs,
+                    _on_terminal_write=capture_owner,
+                )
+            await self.clean_up_workflow(
+                workflow=workflow,
+                workflow_run=failed_run,
+                api_key=api_key,
+                browser_session_id=browser_session_id,
+                close_browser_on_completion=False,
+                need_call_webhook=need_call_webhook,
+                attempt_number=attempt_number,
+                owned_browser_session_id=owned_browser_session_id,
+                final_diagnostic_owner=final_diagnostic_owner,
+            )
+            return failed_run
+
         if should_acquire_reused_session(
             browser_session_id=browser_session_id,
             start_fresh_browser=workflow_run.start_fresh_browser,
@@ -7453,61 +7495,85 @@ class WorkflowService:
                     organization_id=organization_id,
                     workflow_permanent_id=workflow.workflow_permanent_id,
                 )
-                failure_reason = (
+                return await fail_run_before_blocks(
                     f"Failed to acquire reusable browser session for workflow run: "
-                    f"{get_user_facing_exception_message(e)}"
+                    f"{get_user_facing_exception_message(e)}",
+                    e,
                 )
-                if browser_dispatch:
-                    failed = await self._mark_workflow_run_as_failed_for_dispatch(
-                        workflow_run_id=workflow_run_id,
-                        organization_id=organization_id,
-                        attempt_number=attempt_number,
-                        dispatch_claim_started_at=dispatch_claim_started_at,
-                        failure_reason=failure_reason,
-                        _on_terminal_write=capture_owner,
-                    )
-                    if failed is None:
-                        return await self.get_workflow_run(workflow_run_id, organization_id)
-                    workflow_run = failed
-                else:
-                    workflow_run = await self.mark_workflow_run_as_failed(
-                        workflow_run_id=workflow_run_id,
-                        failure_reason=failure_reason,
-                        **attempt_fence_kwargs,
-                        _on_terminal_write=capture_owner,
-                    )
-                await self.clean_up_workflow(
-                    workflow=workflow,
-                    workflow_run=workflow_run,
-                    api_key=api_key,
-                    browser_session_id=browser_session_id,
-                    close_browser_on_completion=False,
-                    need_call_webhook=need_call_webhook,
-                    attempt_number=attempt_number,
-                    final_diagnostic_owner=final_diagnostic_owner,
-                )
-                return workflow_run
 
         browser_session = None
         owned_browser_session_id: str | None = None
-        using_managed_browser_profile = await self._browser_profile_is_managed(
+        run_browser_profile = await self._get_run_browser_profile(
             organization_id=organization.organization_id,
             browser_profile_id=browser_profile_id,
         )
-        if not browser_profile_id or using_managed_browser_profile:
-            browser_run_kwargs: dict[str, Any] = {"workflow_run_id": workflow_run_id} if browser_dispatch else {}
-            browser_session = await self.auto_create_browser_session_if_needed(
-                organization.organization_id,
-                workflow,
-                browser_session_id=browser_session_id,
-                browser_profile_id=browser_profile_id if using_managed_browser_profile else None,
-                proxy_location=workflow_run.proxy_location,
-                browser_type=read_browser_type(workflow_run),
-                browser_settings=workflow_run.browser_settings,
-                created_for_workflow_run_id=workflow_run_id,
-                **browser_dispatch,
-                **browser_run_kwargs,
+        using_managed_browser_profile = bool(run_browser_profile and run_browser_profile.is_managed)
+        run_proxy_location = workflow_run.proxy_location
+        run_browser_type = read_browser_type(workflow_run)
+        requested_session_browser_type = to_persistent_session_browser_type(run_browser_type)
+        profile_session_browser_type = to_persistent_session_browser_type(
+            run_browser_profile.source_browser_type if run_browser_profile else None
+        )
+        # The profile seed must be applied by the run-owned session browser, and v2 sessions cannot carry a URL proxy.
+        # Headers, a pinned or parent browser, a login proxy pin or a conflicting profile engine would be lost too.
+        using_ordinary_browser_profile = bool(
+            browser_profile_id
+            and not using_managed_browser_profile
+            and app.PERSISTENT_SESSIONS_MANAGER.launches_browser_on_create()
+            and not (
+                requested_session_browser_type
+                and profile_session_browser_type
+                and requested_session_browser_type != profile_session_browser_type
             )
+            and not workflow_run.parent_workflow_run_id
+            and not workflow_run.browser_address
+            and not (
+                isinstance(run_proxy_location, dict)
+                and "url" in run_proxy_location
+                and "country" not in run_proxy_location
+            )
+            and not workflow_run.extra_http_headers
+            and not any(isinstance(block, LoginBlock) for block in get_all_blocks(workflow.workflow_definition.blocks))
+            and not await app.AGENT_FUNCTION.is_browser_memory_engine_enabled(workflow_run)
+        )
+        if not browser_profile_id or using_managed_browser_profile or using_ordinary_browser_profile:
+            browser_run_kwargs: dict[str, Any] = {"workflow_run_id": workflow_run_id} if browser_dispatch else {}
+            try:
+                browser_session = await self.auto_create_browser_session_if_needed(
+                    organization.organization_id,
+                    workflow,
+                    browser_session_id=browser_session_id,
+                    browser_profile_id=browser_profile_id,
+                    profile_read_only=using_ordinary_browser_profile,
+                    inherit_profile_proxy=not (
+                        using_ordinary_browser_profile and run_proxy_location == ProxyLocation.NONE
+                    ),
+                    proxy_location=run_proxy_location,
+                    browser_type=run_browser_type
+                    or (
+                        run_browser_profile.source_browser_type
+                        if using_ordinary_browser_profile and run_browser_profile
+                        else None
+                    ),
+                    browser_settings=workflow_run.browser_settings,
+                    created_for_workflow_run_id=workflow_run_id,
+                    **browser_dispatch,
+                    **browser_run_kwargs,
+                )
+            except (WorkflowAttemptDispatchSuperseded, BrowserSessionCreditAdmissionRefusal):
+                raise
+            except Exception as e:
+                if BROWSER_RETIREMENT_DENIED_NOTE in getattr(e, "__notes__", ()):
+                    raise
+                LOG.exception(
+                    "Failed to create browser session for workflow run",
+                    workflow_run_id=workflow_run_id,
+                    organization_id=organization_id,
+                    browser_profile_id=browser_profile_id,
+                )
+                return await fail_run_before_blocks(
+                    f"Failed to create browser session for workflow run: {get_user_facing_exception_message(e)}", e
+                )
 
         if browser_session:
             browser_session_id = browser_session.persistent_browser_session_id
@@ -7521,6 +7587,44 @@ class WorkflowService:
                     workflow_run_id=workflow_run.workflow_run_id,
                     browser_session_id=browser_session_id,
                 )
+            if using_ordinary_browser_profile:
+                # The profile-loaded flag defaults to True and is only settled once the browser is up, so wait for
+                # the address first; a profile that failed to load must not run as a fresh browser.
+                try:
+                    await app.PERSISTENT_SESSIONS_MANAGER.get_browser_address(
+                        browser_session_id, organization.organization_id
+                    )
+                    started_session = await app.PERSISTENT_SESSIONS_MANAGER.get_session(
+                        browser_session_id, organization.organization_id
+                    )
+                except Exception as e:
+                    LOG.exception(
+                        "Browser session for workflow run did not start",
+                        workflow_run_id=workflow_run_id,
+                        browser_session_id=browser_session_id,
+                    )
+                    return await fail_run_before_blocks(
+                        f"Browser session for workflow run did not start: {get_user_facing_exception_message(e)}",
+                        e,
+                        owned_browser_session_id=owned_browser_session_id,
+                    )
+                if not (
+                    started_session
+                    and started_session.browser_profile_id == browser_profile_id
+                    and started_session.browser_profile_loaded
+                ):
+                    LOG.warning(
+                        "Browser session for workflow run did not load its saved profile",
+                        workflow_run_id=workflow_run_id,
+                        browser_session_id=browser_session_id,
+                        browser_profile_id=browser_profile_id,
+                    )
+                    return await fail_run_before_blocks(
+                        f"The browser profile {browser_profile_id} could not be loaded into this run's browser, "
+                        "so no block ran.",
+                        None,
+                        owned_browser_session_id=owned_browser_session_id,
+                    )
 
         # Make browser_session_id available in Jinja templates via {{ browser_session_id }}.
         # IMPORTANT: This must happen before _execute_workflow_blocks, which is where
@@ -13872,9 +13976,9 @@ class WorkflowService:
             browser_state = app.BROWSER_MANAGER.get_for_workflow_run(
                 workflow_run_id, saved_profile.parent_workflow_run_id
             )
-            loaded = (
-                browser_state is not None
-                and browser_state.browser_artifacts.applied_browser_profile_id == saved_profile.profile_id
+            loaded = browser_state is not None and saved_profile.profile_id in (
+                browser_state.browser_artifacts.applied_browser_profile_id,
+                browser_state.browser_artifacts.session_loaded_browser_profile_id,
             )
         except Exception:
             LOG.warning("Failed to read which browser profile a run loaded", workflow_run_id=workflow_run_id)

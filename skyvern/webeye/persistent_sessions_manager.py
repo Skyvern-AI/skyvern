@@ -69,6 +69,11 @@ class PersistentSessionsManager(Protocol):
 
     def can_probe_registered_browser_state(self) -> bool: ...
 
+    def launches_browser_on_create(self) -> bool:
+        """Whether ``create_session`` starts the session's browser itself, rather than leaving the launch to the
+        first block that needs it."""
+        ...
+
     def supports_evict_and_reconnect(self) -> bool:
         """Whether ``evict_cached_browser_state`` followed by ``get_browser_state`` can
         yield a fresh, reconnected ``BrowserState`` for the same ``session_id``.
