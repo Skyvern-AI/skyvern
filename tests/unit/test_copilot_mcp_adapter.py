@@ -84,7 +84,13 @@ from skyvern.forge.sdk.copilot.secret_scrub import (
     register_secret_scrub_value,
     register_secret_scrub_values_from_structure,
 )
-from skyvern.forge.sdk.copilot.tools import NATIVE_TOOLS, _with_action_reason, mcp_hooks, run_execution
+from skyvern.forge.sdk.copilot.tools import (
+    NATIVE_TOOLS,
+    _with_action_reason,
+    _with_page_state,
+    mcp_hooks,
+    run_execution,
+)
 from skyvern.forge.sdk.copilot.tools import scouting as scouting_module
 from skyvern.forge.sdk.copilot.tools._shared import _composition_get_structured_evidence_result, on_working_page
 from skyvern.forge.sdk.copilot.tools.banned_blocks import _block_authoring_violations
@@ -98,6 +104,7 @@ from skyvern.forge.sdk.copilot.tools.mcp_hooks import (
 )
 from skyvern.forge.sdk.copilot.turn_origin import TurnOrigin
 from skyvern.forge.sdk.workflow.models.workflow import WorkflowRunStatus
+from skyvern.webeye.browser_state import PageCrashRecord
 from skyvern.webeye.persistent_sessions_manager import (
     BrowserOperation,
     BrowserRetirement,
@@ -107,6 +114,8 @@ from tests.unit._mcp_browser_fakes import (
     logged_request_failures,
     make_request_failure,
     make_session_state,
+    page_crash_entry,
+    seed_page_crash,
     seed_request_failures,
 )
 from tests.unit._socket_closing_fixture import BODY_SENTINEL, socket_closing_fixture_page
@@ -4140,6 +4149,236 @@ def _working_tab_with_failures(
     return seed_request_failures(ctx, "pbs_failures", *[make_request_failure(working_tab, path) for path in paths])
 
 
+def _redact_within_budget(value: Any, _parameters: dict[str, Any], **_budget: int | None) -> Any:
+    return value if len(json.dumps(value)) <= 1_500 else None
+
+
+def _cap_redaction_budget(monkeypatch: pytest.MonkeyPatch, ctx: AgentContext) -> None:
+    ctx.codeblock_redaction_parameters = {"token": "unused-value"}
+    monkeypatch.setattr(mcp_adapter.app.AGENT_FUNCTION, "redact_codeblock_parameter_values", _redact_within_budget)
+
+
+def _form_tab_with_crash(
+    monkeypatch: pytest.MonkeyPatch, ctx: AgentContext, *, reopened: bool = True
+) -> PageCrashRecord:
+    patch_browser_tabs(monkeypatch, FakeTabbedBrowserState(_tab("Form")))
+    return seed_page_crash(ctx, "pbs_failures", reopened=reopened)
+
+
+class TestPageCrashes:
+    @pytest.fixture(autouse=True)
+    def _fresh_scrub_values(self) -> Iterator[None]:
+        clear_session_scrub_values("pbs_failures")
+        yield
+        clear_session_scrub_values("pbs_failures")
+
+    @pytest.mark.usefixtures("_stub_browser_session")
+    @pytest.mark.asyncio
+    async def test_a_crash_surfaces_on_the_next_result_and_again_only_once_its_tab_is_reopened(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        ctx = make_copilot_ctx(browser_session_id="pbs_failures")
+        record = _form_tab_with_crash(monkeypatch, ctx, reopened=False)
+        server = _evaluate_browser_server(ctx, {"ok": True})
+
+        before_reopen = await _evaluate_result(server)
+        record.reopened = True
+        after_reopen = await _evaluate_result(server)
+        drained = await _evaluate_result(server)
+
+        assert before_reopen["page_crashes"] == [page_crash_entry(reopened=False)]
+        assert after_reopen["page_crashes"] == [page_crash_entry()]
+        assert list(after_reopen).index("page_crashes") == list(after_reopen).index("page_state") + 1
+        assert "page_crashes" not in drained
+
+    @pytest.mark.usefixtures("_stub_browser_session")
+    @pytest.mark.asyncio
+    async def test_a_crash_a_withheld_result_cannot_show_goes_back(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        ctx = make_copilot_ctx(browser_session_id="pbs_failures")
+        _form_tab_with_crash(monkeypatch, ctx)
+        register_secret_scrub_value(ctx, "ok")
+
+        withheld = await _evaluate_result(_evaluate_browser_server(ctx, {"ok": True}))
+
+        assert "page_crashes" not in withheld
+        assert len(mcp_adapter.HeldPageFacts().take_page_crashes(ctx)) == 1
+
+    @pytest.mark.usefixtures("_stub_browser_session")
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "pre_hook",
+        [None, _refuse],
+        ids=["dispatched", "refused-before-dispatch"],
+    )
+    async def test_a_crash_a_cancelled_call_took_goes_back(
+        self, monkeypatch: pytest.MonkeyPatch, pre_hook: mcp_adapter.PreHook | None
+    ) -> None:
+        ctx = make_copilot_ctx(browser_session_id="pbs_failures")
+        _form_tab_with_crash(monkeypatch, ctx)
+        monkeypatch.setattr(mcp_adapter, "mcp_browser_context", _scope_exiting_with(asyncio.CancelledError()))
+        overlay = SchemaOverlay(requires_browser=True, timeout=1, pre_hook=pre_hook)
+
+        with pytest.raises(asyncio.CancelledError):
+            await _evaluate_result(_evaluate_browser_server(ctx, {"ok": True}, overlay=overlay))
+
+        assert mcp_adapter.HeldPageFacts().take_page_crashes(ctx) == [page_crash_entry()]
+
+    @pytest.mark.usefixtures("_stub_browser_session")
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ("result_chars", "reported"),
+        [(_RECENT_TOOL_OUTPUT_CHAR_CAP - 200, False), (_RECENT_TOOL_OUTPUT_CHAR_CAP, True)],
+        ids=["fits-without-it", "past-the-cap-anyway"],
+    )
+    async def test_a_crash_never_pushes_a_result_past_the_recent_output_cap(
+        self, monkeypatch: pytest.MonkeyPatch, result_chars: int, reported: bool
+    ) -> None:
+        ctx = make_copilot_ctx(browser_session_id="pbs_failures")
+        _form_tab_with_crash(monkeypatch, ctx)
+
+        result = await _evaluate_result(
+            _evaluate_browser_server(ctx, {"ok": True, "data": {"result": "x" * result_chars}})
+        )
+
+        assert ("page_crashes" in result) is reported
+        assert len(mcp_adapter.HeldPageFacts().take_page_crashes(ctx)) == (0 if reported else 1)
+
+    @pytest.mark.usefixtures("_stub_browser_session")
+    @pytest.mark.asyncio
+    async def test_a_crash_past_the_redaction_budget_goes_back(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        ctx = make_copilot_ctx(browser_session_id="pbs_failures")
+        _cap_redaction_budget(monkeypatch, ctx)
+        _form_tab_with_crash(monkeypatch, ctx)
+
+        result = await _evaluate_result(_evaluate_browser_server(ctx, {"ok": True, "data": {"result": "x" * 1_250}}))
+
+        assert result["ok"] is True and result["data"] == {"result": "x" * 1_250}
+        assert "page_crashes" not in result
+        assert len(mcp_adapter.HeldPageFacts().take_page_crashes(ctx)) == 1
+
+    @pytest.mark.usefixtures("_stub_browser_session")
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ("redaction_budget", "result_chars"),
+        [(False, _RECENT_TOOL_OUTPUT_CHAR_CAP - 700), (True, 1_000)],
+        ids=["recent-output-cap", "redaction-budget"],
+    )
+    async def test_a_crash_that_fits_without_the_request_failures_is_kept(
+        self, monkeypatch: pytest.MonkeyPatch, redaction_budget: bool, result_chars: int
+    ) -> None:
+        ctx = make_copilot_ctx(browser_session_id="pbs_failures")
+        if redaction_budget:
+            _cap_redaction_budget(monkeypatch, ctx)
+        log = _working_tab_with_failures(monkeypatch, ctx, *[f"/{n}" for n in range(5)])
+        seed_page_crash(ctx, "pbs_failures")
+
+        result = await _evaluate_result(
+            _evaluate_browser_server(ctx, {"ok": True, "data": {"result": "x" * result_chars}})
+        )
+
+        assert result["page_crashes"] == [page_crash_entry()]
+        assert "page_request_failures" not in result
+        assert len(logged_request_failures(log)) == 5
+        assert mcp_adapter.HeldPageFacts().take_page_crashes(ctx) == []
+
+    @pytest.mark.usefixtures("_stub_browser_session")
+    @pytest.mark.asyncio
+    async def test_a_failed_native_inspection_whose_page_read_also_failed_carries_the_crash(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        ctx = make_copilot_ctx(browser_session_id="pbs_failures")
+        _form_tab_with_crash(monkeypatch, ctx)
+        monkeypatch.setattr(scouting_module, "_read_live_page_state", AsyncMock(return_value="no_page"))
+        failure = {"ok": False, "error": "inspect_page_for_composition could not capture page evidence"}
+
+        async def inspect(_tool_ctx: ToolContext[AgentContext], _arguments: str) -> str:
+            return json.dumps(failure)
+
+        tool = _with_page_state(
+            FunctionTool(
+                name="inspect_page_for_composition",
+                description="",
+                params_json_schema={"type": "object", "properties": {}},
+                on_invoke_tool=inspect,
+            )
+        )
+        call = ToolContext(context=ctx, tool_name=tool.name, tool_call_id="call-inspect", tool_arguments="{}")
+
+        result = json.loads(await tool.on_invoke_tool(call, "{}"))
+        again = json.loads(await tool.on_invoke_tool(call, "{}"))
+
+        assert result["page_state"]["read"] == "failed"
+        assert result["page_crashes"] == [page_crash_entry()]
+        assert {key: result[key] for key in failure} == failure
+        assert "page_crashes" not in again
+
+    @pytest.mark.usefixtures("_stub_browser_session")
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ("raw_result", "raw_secret"),
+        [
+            pytest.param({"ok": True}, True, id="raw-secret-denied"),
+            pytest.param(TimeoutError(), False, id="timed-out-without-a-read"),
+            pytest.param(CopilotBrowserSessionUnavailable("pbs_failures"), False, id="session-unavailable"),
+        ],
+    )
+    async def test_a_result_whose_page_was_not_read_still_carries_the_crash(
+        self, monkeypatch: pytest.MonkeyPatch, raw_result: dict[str, Any] | Exception, raw_secret: bool
+    ) -> None:
+        ctx = make_copilot_ctx(browser_session_id="pbs_failures")
+        _form_tab_with_crash(monkeypatch, ctx)
+        monkeypatch.setattr(mcp_adapter, "_browser_session_error_disposition", AsyncMock(return_value="failed"))
+        ctx.request_policy = RequestPolicy(raw_secret_detected=True) if raw_secret else None
+
+        unread = await _evaluate_result(_evaluate_browser_server(ctx, raw_result))
+        ctx.request_policy = None
+        read = await _evaluate_result(_evaluate_browser_server(ctx, {"ok": True}))
+
+        assert unread["page_state"]["read"] == "failed"
+        assert unread["page_crashes"] == [page_crash_entry()]
+        assert "page_crashes" not in read
+
+    @pytest.mark.usefixtures("_stub_browser_session")
+    @pytest.mark.asyncio
+    async def test_a_call_aimed_at_an_unavailable_browser_leaves_the_crash_for_the_next_read(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        ctx = make_copilot_ctx(browser_session_id="pbs_failures")
+        _form_tab_with_crash(monkeypatch, ctx)
+        server = _evaluate_browser_server(ctx, {"ok": True})
+
+        refused = json.loads(
+            (await server.call_tool("evaluate", {"expression": "1", "target": "elsewhere"})).content[0].text
+        )
+        read = await _evaluate_result(server)
+
+        assert "page_crashes" not in refused
+        assert read["page_crashes"] == [page_crash_entry()]
+
+    @pytest.mark.usefixtures("_stub_browser_session")
+    @pytest.mark.asyncio
+    async def test_a_navigate_whose_page_read_failed_still_carries_the_crash(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        ctx = make_copilot_ctx(browser_session_id="pbs_failures")
+        monkeypatch.setattr(mcp_hooks, "_bind_login_credential_for_observed_url", AsyncMock())
+        monkeypatch.setattr(mcp_hooks, "_capture_post_interaction_screenshot", AsyncMock(return_value=False))
+        _form_tab_with_crash(monkeypatch, ctx)
+        navigate = SchemaOverlay(requires_browser=True, timeout=1, post_hook=mcp_hooks._navigate_post_hook)
+        read_live_page_state = scouting_module._read_live_page_state
+        monkeypatch.setattr(scouting_module, "_read_live_page_state", AsyncMock(return_value="no_page"))
+
+        unread = await _evaluate_result(
+            _evaluate_browser_server(ctx, {"ok": True, "data": {"url": "https://app.test/form"}}, overlay=navigate)
+        )
+        monkeypatch.setattr(scouting_module, "_read_live_page_state", read_live_page_state)
+        read = await _evaluate_result(_evaluate_browser_server(ctx, {"ok": True}))
+
+        assert unread["page_state"]["read"] == "failed"
+        assert unread["page_crashes"] == [page_crash_entry()]
+        assert "page_crashes" not in read
+
+
 class TestPageRequestFailures:
     @pytest.fixture(autouse=True)
     def _fresh_scrub_values(self) -> Iterator[None]:
@@ -4441,12 +4680,7 @@ class TestPageRequestFailures:
     @pytest.mark.asyncio
     async def test_failures_past_the_redaction_budget_go_back(self, monkeypatch: pytest.MonkeyPatch) -> None:
         ctx = make_copilot_ctx(browser_session_id="pbs_failures")
-        ctx.codeblock_redaction_parameters = {"token": "unused-value"}
-
-        def redact_within_budget(value: Any, _parameters: dict[str, Any], **_budget: object) -> Any:
-            return value if len(json.dumps(value)) <= 1_500 else None
-
-        monkeypatch.setattr(mcp_adapter.app.AGENT_FUNCTION, "redact_codeblock_parameter_values", redact_within_budget)
+        _cap_redaction_budget(monkeypatch, ctx)
         log = _working_tab_with_failures(monkeypatch, ctx, *[f"/{n}" for n in range(5)])
 
         result = await _evaluate_result(_evaluate_browser_server(ctx, {"ok": True, "data": {"result": "x" * 1_000}}))

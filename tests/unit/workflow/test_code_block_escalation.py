@@ -7,7 +7,9 @@ selector heals even when no step covers the failing line (the common case).
 from __future__ import annotations
 
 import asyncio
+import html
 import json
+import urllib.parse
 from collections.abc import Callable
 from datetime import datetime, timezone
 from enum import Enum, auto
@@ -41,7 +43,11 @@ from skyvern.forge.sdk.core.skyvern_context import SkyvernContext
 from skyvern.forge.sdk.db.repositories.workflow_runs import WorkflowRunsRepository
 from skyvern.forge.sdk.schemas.files import FileInfo
 from skyvern.forge.sdk.schemas.tasks import Task, TaskStatus
-from skyvern.forge.sdk.workflow.context_manager import WorkflowContextManager, WorkflowRunContext
+from skyvern.forge.sdk.workflow.context_manager import (
+    RANDOM_SECRET_ID_PREFIX,
+    WorkflowContextManager,
+    WorkflowRunContext,
+)
 from skyvern.forge.sdk.workflow.models.block import (
     _OPERATION_ATTRIBUTION_ALLOWLIST,
     BlockResult,
@@ -71,6 +77,7 @@ from skyvern.forge.taskv3.goal_composition import (
 )
 from skyvern.schemas.runs import RunEngine
 from skyvern.schemas.self_heal import HealClassification, HealSkipReason, HealStatus
+from skyvern.services import otp_service
 from skyvern.webeye.actions.action_types import ActionType
 from skyvern.webeye.actions.actions import Action
 from skyvern.webeye.browser_artifacts import BrowserArtifacts
@@ -1818,6 +1825,351 @@ async def test_executed_block_lists_its_literal_fill_but_never_a_rendered_parame
         (1, "#contact-email", "ada@example.test")
     ]
     assert "Grace Param" not in render_code_progress_section(record)
+
+
+async def _fallback_payload_after_failing_execute(
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    code: str,
+    context: WorkflowRunContext,
+    parameters: list[Parameter] | None = None,
+) -> tuple[dict[str, Any], list[dict[str, Any]]]:
+    state = _install_db_fakes(monkeypatch, final_status=TaskStatus.failed)
+    block = _make_code_block(code=code)
+    block.parameters = parameters or []
+    fake_browser_state = SimpleNamespace(
+        get_working_page=AsyncMock(return_value=MagicMock()),
+        engine_selection=None,
+        browser_artifacts=BrowserArtifacts(),
+        navigate_to_url=AsyncMock(return_value=None),
+    )
+    _patch_execute_chokepoint_environment(
+        monkeypatch,
+        context=context,
+        fake_browser_state=fake_browser_state,
+        use_codeblock_runner=False,
+        format_templates=True,
+    )
+    monkeypatch.setattr(app.AGENT_FUNCTION, "execute_code_block_override", AsyncMock(return_value=None))
+    monkeypatch.setattr(CodeBlock, "_is_healable_page_failure", MagicMock(return_value=True))
+    monkeypatch.setattr(CodeBlock, "record_output_parameter_value", AsyncMock(return_value=None))
+    FakeRecorder.reset(last_recorded_exception=None)
+    monkeypatch.setattr("skyvern.forge.sdk.workflow.models.block.CodeBlockActionRecording", FakeRecorder)
+
+    with capture_logs() as logs:
+        with skyvern_context.scoped(SkyvernContext(organization_id="o_test", workflow_run_id="wr_test")):
+            await block.execute(
+                workflow_run_id="wr_test",
+                workflow_run_block_id="wrb_test",
+                organization_id="o_test",
+                browser_session_id="pbs_test",
+            )
+
+    assert state["create_task_kwargs"] is not None
+    return state["create_task_kwargs"], logs
+
+
+@pytest.mark.asyncio
+async def test_fallback_receives_the_upstream_value_the_code_reads_without_declaring_it(
+    monkeypatch: pytest.MonkeyPatch, ai_fallback_flag: Callable[[str | None], None]
+) -> None:
+    ai_fallback_flag("o_test")
+    context = _make_context()
+    context.register_block_reference_variable("Upstream", {"id": "row-17", "status": "open"})
+
+    create_kwargs, _ = await _fallback_payload_after_failing_execute(
+        monkeypatch,
+        code="row_id = '{{ Upstream.id }}'\nawait page.click(f'#row-{row_id}')\n",
+        context=context,
+    )
+
+    assert create_kwargs["navigation_payload"] == {"Upstream": {"id": "row-17", "status": "open"}}
+
+
+@pytest.mark.asyncio
+async def test_fallback_never_receives_an_input_read_only_inside_template_tags(
+    monkeypatch: pytest.MonkeyPatch, ai_fallback_flag: Callable[[str | None], None]
+) -> None:
+    ai_fallback_flag("o_test")
+    tax_id = WorkflowParameter(
+        workflow_parameter_id="wp_tax_id",
+        workflow_id="w_test",
+        key="tax_id",
+        workflow_parameter_type=WorkflowParameterType.STRING,
+        created_at=datetime.now(timezone.utc),
+        modified_at=datetime.now(timezone.utc),
+    )
+    context = _make_context()
+    context.parameters[tax_id.key] = tax_id
+    context.values[tax_id.key] = "12-3456789"
+    context.register_block_reference_variable("Upstream", {"id": "row-17"})
+
+    create_kwargs, _ = await _fallback_payload_after_failing_execute(
+        monkeypatch,
+        code=(
+            "{% if tax_id %}flagged = True{% endif %}\n"
+            "{% for tax_id in [1] %}n = {{ tax_id }}\n{% endfor %}"
+            "row_id = '{{ Upstream.id }}'\nawait page.click(f'#row-{row_id}')\n"
+        ),
+        context=context,
+    )
+
+    assert create_kwargs["navigation_payload"] == {"Upstream": {"id": "row-17"}}
+
+
+@pytest.mark.asyncio
+async def test_fallback_inside_a_loop_receives_the_current_item_the_code_reads(
+    monkeypatch: pytest.MonkeyPatch, ai_fallback_flag: Callable[[str | None], None]
+) -> None:
+    ai_fallback_flag("o_test")
+    context = _make_context()
+    context.update_block_metadata("code_1", {"current_item": {"x": "item-3"}, "current_index": 2})
+
+    create_kwargs, _ = await _fallback_payload_after_failing_execute(
+        monkeypatch,
+        code="await page.fill('#search', '{{ current_item.x }}')\n",
+        context=context,
+    )
+
+    assert create_kwargs["navigation_payload"] == {"current_item": {"x": "item-3"}}
+
+
+@pytest.mark.asyncio
+async def test_declared_inputs_keep_their_payload_and_win_over_a_referenced_name(
+    monkeypatch: pytest.MonkeyPatch, ai_fallback_flag: Callable[[str | None], None]
+) -> None:
+    ai_fallback_flag("o_test")
+    region = WorkflowParameter(
+        workflow_parameter_id="wp_region",
+        workflow_id="w_test",
+        key="region",
+        workflow_parameter_type=WorkflowParameterType.STRING,
+        created_at=datetime.now(timezone.utc),
+        modified_at=datetime.now(timezone.utc),
+    )
+    context = _make_context()
+    context.parameters[region.key] = region
+    context.values[region.key] = "eu-west"
+
+    create_kwargs, _ = await _fallback_payload_after_failing_execute(
+        monkeypatch,
+        code="await page.fill('#region', '{{ region }}')\n",
+        context=context,
+        parameters=[region],
+    )
+
+    assert json.dumps(create_kwargs["navigation_payload"]) == json.dumps({"region": "eu-west"})
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "secret",
+    [
+        pytest.param(f"{RANDOM_SECRET_ID_PREFIX}ab12", id="placeholder_token"),
+        pytest.param("4821", id="four_digit_pin"),
+        pytest.param('pa"ss-word', id="quote"),
+        pytest.param("c:\\vault\\key", id="backslash"),
+        pytest.param("pässwörd-ü", id="non_ascii"),
+    ],
+)
+async def test_fallback_never_receives_a_referenced_value_carrying_a_secret(
+    monkeypatch: pytest.MonkeyPatch, ai_fallback_flag: Callable[[str | None], None], secret: str
+) -> None:
+    ai_fallback_flag("o_test")
+    context = _make_context()
+    if secret.startswith(RANDOM_SECRET_ID_PREFIX):
+        context.secrets[secret] = SECRET_VALUE
+    else:
+        context.secrets["k_secret"] = secret
+    context.register_block_reference_variable("Upstream", {"id": "row-17", "note": f"code {secret} on file"})
+    context.register_block_reference_variable("Other", {"id": "row-18"})
+
+    create_kwargs, logs = await _fallback_payload_after_failing_execute(
+        monkeypatch,
+        code="row_id = '{{ Upstream.id }}'\nother = '{{ Other.id }}'\nawait page.click(f'#row-{row_id}')\n",
+        context=context,
+    )
+
+    assert create_kwargs["navigation_payload"] == {"Other": {"id": "row-18"}}
+    assert secret not in json.dumps(create_kwargs, default=str, ensure_ascii=False)
+    assert secret not in json.dumps(logs, default=str, ensure_ascii=False)
+
+
+_URL_SECRET = "pa ss/w&rd"
+_HTML_SECRET = 'pa<ss>&"rd'
+_QUOTE_BACKSLASH_SECRET = 'pa"ss\\wd'
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("secret", "upstream_value"),
+    [
+        pytest.param(_URL_SECRET, {"link": f"/login?pw={urllib.parse.quote(_URL_SECRET, safe='')}"}, id="url_quoted"),
+        pytest.param(_HTML_SECRET, {"cell": f"<td>{html.escape(_HTML_SECRET)}</td>"}, id="html_escaped"),
+        pytest.param(
+            _QUOTE_BACKSLASH_SECRET,
+            {"raw": json.dumps({"pw": _QUOTE_BACKSLASH_SECRET})},
+            id="double_escaped_in_json_string",
+        ),
+    ],
+)
+async def test_fallback_never_receives_a_referenced_value_carrying_an_encoded_secret(
+    monkeypatch: pytest.MonkeyPatch,
+    ai_fallback_flag: Callable[[str | None], None],
+    secret: str,
+    upstream_value: dict[str, str],
+) -> None:
+    ai_fallback_flag("o_test")
+    context = _make_context()
+    context.secrets["k_secret"] = secret
+    context.register_block_reference_variable("Upstream", {"id": "row-17", **upstream_value})
+    context.register_block_reference_variable("Other", {"id": "row-18"})
+
+    create_kwargs, _ = await _fallback_payload_after_failing_execute(
+        monkeypatch,
+        code="row = '{{ Upstream.id }}'\nother = '{{ Other.id }}'\nawait page.click('#go')\n",
+        context=context,
+    )
+
+    assert create_kwargs["navigation_payload"] == {"Other": {"id": "row-18"}}
+
+
+@pytest.mark.asyncio
+async def test_fallback_never_receives_an_undeclared_credential_parameter(
+    monkeypatch: pytest.MonkeyPatch, ai_fallback_flag: Callable[[str | None], None]
+) -> None:
+    ai_fallback_flag("o_test")
+    credential = _credential_parameter()
+    context = _make_context()
+    context.parameters[credential.key] = credential
+    context.values[credential.key] = {"username": "login_name", "password": "login_pass"}
+
+    create_kwargs, _ = await _fallback_payload_after_failing_execute(
+        monkeypatch,
+        code="await page.fill('#user', '{{ portal_credential.username }}')\n",
+        context=context,
+    )
+
+    assert create_kwargs["navigation_payload"] == {}
+
+
+@pytest.mark.asyncio
+async def test_fallback_leaves_out_an_oversized_referenced_value_instead_of_cutting_it(
+    monkeypatch: pytest.MonkeyPatch, ai_fallback_flag: Callable[[str | None], None]
+) -> None:
+    ai_fallback_flag("o_test")
+    context = _make_context()
+    context.register_block_reference_variable("Upstream", {"id": "row-17", "rows": ["r" * 100] * 1000})
+    context.register_block_reference_variable("Other", {"id": "row-18"})
+
+    create_kwargs, _ = await _fallback_payload_after_failing_execute(
+        monkeypatch,
+        code="row_id = '{{ Upstream.id }}'\nother = '{{ Other.id }}'\nawait page.click(f'#row-{row_id}')\n",
+        context=context,
+    )
+
+    assert create_kwargs["navigation_payload"] == {"Other": {"id": "row-18"}}
+
+
+@pytest.mark.asyncio
+async def test_fallback_drops_referenced_values_past_the_total_budget_and_logs_only_their_names(
+    monkeypatch: pytest.MonkeyPatch, ai_fallback_flag: Callable[[str | None], None]
+) -> None:
+    ai_fallback_flag("o_test")
+    context = _make_context()
+    for label in ("Alpha", "Bravo", "Charlie"):
+        context.register_block_reference_variable(label, {"rows": [f"{label}-row-value"] * 800})
+
+    create_kwargs, logs = await _fallback_payload_after_failing_execute(
+        monkeypatch,
+        code="a = '{{ Alpha.rows }}'\nb = '{{ Bravo.rows }}'\nc = '{{ Charlie.rows }}'\nawait page.click('#go')\n",
+        context=context,
+    )
+
+    payload = create_kwargs["navigation_payload"]
+    assert payload == {label: {"rows": [f"{label}-row-value"] * 800} for label in ("Alpha", "Bravo")}
+    over_budget = [entry for entry in logs if entry.get("roots") == ["Charlie"]]
+    assert over_budget
+    assert "Charlie-row-value" not in json.dumps(logs, default=str)
+
+
+@pytest.mark.asyncio
+async def test_self_heal_payload_carries_the_undeclared_upstream_value_but_no_secret_or_inline_code(
+    monkeypatch: pytest.MonkeyPatch, ai_fallback_flag: Callable[[str | None], None]
+) -> None:
+    ai_fallback_flag("o_test")
+    context = _make_context()
+    context.secrets["k_secret"] = SECRET_VALUE
+    context.register_block_reference_variable("Upstream", {"x": "row-17"})
+    context.register_block_reference_variable("Vault_Note", {"note": f"pw {SECRET_VALUE}"})
+    login_output = {"result": {"otp_code": "123456"}}
+    context.register_block_reference_variable("Login_Step", login_output)
+    monkeypatch.setattr(otp_service, "try_generate_totp_from_credential", lambda *_args, **_kwargs: None)
+
+    def task_with(payload: dict[str, Any]) -> SimpleNamespace:
+        return SimpleNamespace(
+            task_id="tsk_escalation",
+            workflow_run_id="wr_test",
+            organization_id="o_test",
+            navigation_payload=payload,
+            totp_verification_url=None,
+            totp_identifier=None,
+        )
+
+    assert await otp_service.resolve_otp_value(task_with({"Login_Step": login_output}))
+
+    create_kwargs, _ = await _fallback_payload_after_failing_execute(
+        monkeypatch,
+        code=(
+            "row_id = '{{ Upstream.x }}'\nnote = '{{ Vault_Note.note }}'\nlogin = '{{ Login_Step.result }}'\n"
+            "await page.click(f'#row-{row_id}')\n"
+        ),
+        context=context,
+    )
+
+    payload = create_kwargs["navigation_payload"]
+    assert payload == {"Upstream": {"x": "row-17"}}
+    assert await otp_service.resolve_otp_value(task_with(payload)) is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("referenced", [False, True], ids=["unreferenced", "referenced"])
+async def test_referenced_values_build_the_run_summary_only_when_the_code_reads_it(
+    monkeypatch: pytest.MonkeyPatch, referenced: bool
+) -> None:
+    summary = MagicMock(return_value={"blocks": []})
+    monkeypatch.setattr(WorkflowRunContext, "build_workflow_run_summary", summary)
+    context = _make_context()
+    context.register_block_reference_variable("Upstream", {"x": "row-17"})
+    block = _make_code_block(code="")
+    block._template_roots = frozenset({"Upstream", "workflow_run_summary"} if referenced else {"Upstream"})
+
+    values = block._referenced_fallback_values(context, [])
+
+    assert summary.called is referenced
+    assert ("workflow_run_summary" in values) is referenced
+
+
+@pytest.mark.asyncio
+async def test_fallback_never_receives_a_real_credential_template_entry(
+    monkeypatch: pytest.MonkeyPatch, ai_fallback_flag: Callable[[str | None], None]
+) -> None:
+    ai_fallback_flag("o_test")
+    context = _make_context()
+    context.include_secrets_in_templates = True
+    monkeypatch.setattr(
+        WorkflowRunContext,
+        "credential_template_entries",
+        lambda *_args, **_kwargs: {"portal_real_password": "unregistered-raw-value"},
+    )
+
+    create_kwargs, _ = await _fallback_payload_after_failing_execute(
+        monkeypatch,
+        code="await page.fill('#password', '{{ portal_real_password }}')\n",
+        context=context,
+    )
+
+    assert create_kwargs["navigation_payload"] == {}
 
 
 @pytest.mark.parametrize("prompt", [None, ""], ids=["absent_goal", "empty_goal"])

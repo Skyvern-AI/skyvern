@@ -39,7 +39,12 @@ from skyvern.forge.sdk.copilot.build_test_connect_failure import (
 from skyvern.forge.sdk.copilot.build_test_outcome import connect_failure_from_run_blocks_result
 from skyvern.forge.sdk.copilot.config import CopilotConfig
 from skyvern.forge.sdk.copilot.enforcement import TOTAL_TIMEOUT_SECONDS
-from skyvern.forge.sdk.copilot.mcp_adapter import SchemaOverlay
+from skyvern.forge.sdk.copilot.mcp_adapter import (
+    HeldPageFacts,
+    ReportedPageCrash,
+    SchemaOverlay,
+    stamp_page_facts,
+)
 from skyvern.forge.sdk.copilot.request_policy import RequestPolicy
 from skyvern.forge.sdk.copilot.runtime import (
     BROWSER_TOOLS_UNAVAILABLE_ERROR,
@@ -56,7 +61,11 @@ from skyvern.forge.sdk.copilot.runtime import (
     replace_browser_session,
 )
 from skyvern.forge.sdk.copilot.tools import mcp_hooks, run_execution
-from skyvern.forge.sdk.copilot.unrecoverable_tool_error import _is_unrecoverable_browser_session_error
+from skyvern.forge.sdk.copilot.tools.scouting import PageState
+from skyvern.forge.sdk.copilot.unrecoverable_tool_error import (
+    PAGE_CRASHES_KEY,
+    _is_unrecoverable_browser_session_error,
+)
 from skyvern.forge.sdk.schemas.persistent_browser_sessions import PersistentBrowserSession, export_profile_storage_id
 from skyvern.forge.sdk.workflow.models.workflow import WorkflowRunStatus
 from skyvern.forge.sdk.workflow.service import BROWSER_SESSION_RENEWAL_INTERVAL_SECONDS
@@ -75,6 +84,7 @@ from skyvern.webeye.persistent_sessions_manager import (
     BrowserSessionCreditAdmissionRefusal,
 )
 from skyvern.webeye.real_browser_state import RealBrowserState
+from tests.unit._mcp_browser_fakes import page_crash_entry
 from tests.unit.copilot_test_helpers import (
     TURN_EXIT_PATHS,
     make_copilot_ctx,
@@ -1026,6 +1036,11 @@ def test_a_page_titled_like_a_lost_session_does_not_read_as_session_loss() -> No
     }
 
     assert not _is_unrecoverable_browser_session_error("evaluate", output)
+    crash_only = {
+        "ok": False,
+        PAGE_CRASHES_KEY: [page_crash_entry(url="https://app.test/no browser context")],
+    }
+    assert not _is_unrecoverable_browser_session_error("evaluate", crash_only)
     nested = {"ok": False, "error": "evaluate failed", "data": {"page_state": {"reason": "Browser session not found"}}}
     assert _is_unrecoverable_browser_session_error("evaluate", nested)
 
@@ -3173,3 +3188,158 @@ async def test_self_heal_turn_keeps_a_switched_tab_for_the_next_call(monkeypatch
     acted_on, active_tab_id = await _page_next_call_acts_on(ctx)
     assert acted_on is first
     assert active_tab_id == str(id(first))
+
+
+_READ_PAGE_STATE: PageState = {"read": "ok", "url": "https://form.test/new", "title": "New", "challenge_vendor": None}
+
+
+def _next_page_crashes(ctx: AgentContext) -> list[ReportedPageCrash] | None:
+    read_from = MagicMock()
+    return stamp_page_facts(ctx, HeldPageFacts(), {"ok": True}, _READ_PAGE_STATE, read_from).get(PAGE_CRASHES_KEY)
+
+
+async def _crash(browser_state: RealBrowserState, page: MagicMock) -> None:
+    page.context = browser_state.browser_context
+    browser_state._on_page_crashed(page)
+    await asyncio.gather(*list(browser_state._detached_teardown_tasks))
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("restore_error", "external_browser", "reopened"),
+    [(None, False, True), (RuntimeError("Page.goto: timeout"), False, False), (None, True, False)],
+    ids=["reopened-and-restored", "restore-failed", "external-browser"],
+)
+async def test_a_crash_the_turn_saw_reaches_the_next_result_once(
+    monkeypatch: pytest.MonkeyPatch, restore_error: Exception | None, external_browser: bool, reopened: bool
+) -> None:
+    ctx, browser_state, context = _install_tabbed_session(monkeypatch, "https://form.test/new?draft=1")
+    browser_state.external_browser = external_browser
+    monkeypatch.setattr(browser_state, "navigate_to_url", AsyncMock(side_effect=restore_error))
+    crashed = context.pages[0]
+    async with mcp_browser_context(ctx):
+        pass
+
+    await _crash(browser_state, crashed)
+
+    (record,) = browser_state.page_crash_records
+    assert (record.crashed_url, record.reopened) == ("https://form.test/new?draft=1", reopened)
+    assert (crashed not in context.pages) is not external_browser
+    (entry,) = _next_page_crashes(ctx) or []
+    assert entry == {
+        "crashed_at": record.crashed_at.isoformat(timespec="seconds"),
+        "cause": "page_crash",
+        "reopened": reopened,
+        "url": "https://form.test/new",
+    }
+    assert _next_page_crashes(ctx) is None
+
+
+@pytest.mark.asyncio
+async def test_a_crash_read_before_its_reopen_is_reported_again_once_the_tab_is_reopened(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    ctx, browser_state, context = _install_tabbed_session(monkeypatch, "https://form.test/new")
+    monkeypatch.setattr(browser_state, "navigate_to_url", AsyncMock())
+    lost = context.pages[0]
+    context.pages.remove(lost)
+    assert await browser_state._reopen_lost_working_page() is not None
+    assert [(record.cause, record.reopened) for record in browser_state.page_crash_records] == [("page_lost", True)]
+    async with mcp_browser_context(ctx):
+        pass
+    crashed = context.pages[0]
+    crashed.url = "https://form.test/new"
+    crashed.context = context
+    real_new_page = context.new_page
+    monkeypatch.setattr(context, "new_page", AsyncMock(side_effect=RuntimeError("Target.createTarget failed")))
+
+    browser_state._on_page_crashed(crashed)
+    await asyncio.gather(*list(browser_state._detached_teardown_tasks))
+    before_reopen = _next_page_crashes(ctx)
+    monkeypatch.setattr(context, "new_page", real_new_page)
+    assert await browser_state._reopen_lost_working_page() is not None
+
+    assert [(entry["cause"], entry["reopened"]) for entry in before_reopen or []] == [
+        ("page_lost", True),
+        ("page_crash", False),
+    ]
+    assert [(entry["cause"], entry["reopened"]) for entry in _next_page_crashes(ctx) or []] == [("page_crash", True)]
+    assert _next_page_crashes(ctx) is None
+
+
+@pytest.mark.asyncio
+async def test_a_lost_blank_tab_is_recorded_but_not_marked_reopened(monkeypatch: pytest.MonkeyPatch) -> None:
+    _, browser_state, context = _install_tabbed_session(monkeypatch, "about:blank")
+    context.pages.remove(context.pages[0])
+
+    assert await browser_state._reopen_lost_working_page() is not None
+
+    assert [(record.cause, record.reopened) for record in browser_state.page_crash_records] == [("page_lost", False)]
+
+
+async def _resolve_turn(session_id: str) -> AgentContext:
+    turn = _make_ctx()
+    turn.browser_session_id = session_id
+    async with mcp_browser_context(turn):
+        pass
+    return turn
+
+
+@pytest.mark.asyncio
+async def test_a_crash_after_the_turn_attached_is_stamped_once(monkeypatch: pytest.MonkeyPatch) -> None:
+    ctx, browser_state, context = _install_tabbed_session(monkeypatch, "https://form.test/new")
+    monkeypatch.setattr(browser_state, "navigate_to_url", AsyncMock())
+    async with mcp_browser_context(ctx):
+        pass
+
+    await _crash(browser_state, context.pages[0])
+    async with mcp_browser_context(ctx):
+        pass
+
+    assert [(entry["reopened"], entry.get("url")) for entry in _next_page_crashes(ctx) or []] == [
+        (True, "https://form.test/new")
+    ]
+    assert _next_page_crashes(ctx) is None
+    assert _next_page_crashes(await _resolve_turn("pbs_tabbed")) is None
+
+
+@pytest.mark.asyncio
+async def test_a_session_made_mid_turn_reports_a_crash_from_before_its_first_attach(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    turn = _make_ctx()
+    _, browser_state, context = _install_tabbed_session(monkeypatch, "https://form.test/new")
+    monkeypatch.setattr(browser_state, "navigate_to_url", AsyncMock())
+    turn.browser_session_id = "pbs_tabbed"
+
+    await _crash(browser_state, context.pages[0])
+    async with mcp_browser_context(turn):
+        pass
+
+    assert len(_next_page_crashes(turn) or []) == 1
+
+
+@pytest.mark.asyncio
+async def test_a_crash_between_turns_reaches_the_next_turn_once_its_tab_is_reopened(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    ctx, browser_state, context = _install_tabbed_session(monkeypatch, "https://form.test/new")
+    monkeypatch.setattr(browser_state, "navigate_to_url", AsyncMock())
+    real_new_page = context.new_page
+    monkeypatch.setattr(context, "new_page", AsyncMock(side_effect=RuntimeError("Target.createTarget failed")))
+    async with mcp_browser_context(ctx):
+        pass
+    await _crash(browser_state, context.pages[0])
+    next_turn = _make_ctx()
+    next_turn.browser_session_id = ctx.browser_session_id
+    async with mcp_browser_context(next_turn):
+        pass
+
+    monkeypatch.setattr(context, "new_page", real_new_page)
+    assert await browser_state._reopen_lost_working_page() is not None
+
+    assert [(entry["cause"], entry["reopened"]) for entry in _next_page_crashes(next_turn) or []] == [
+        ("page_crash", True)
+    ]
+    assert _next_page_crashes(next_turn) is None
+    assert _next_page_crashes(await _resolve_turn("pbs_tabbed")) is None
