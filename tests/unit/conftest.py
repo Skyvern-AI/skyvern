@@ -551,6 +551,7 @@ def make_input_element_mock(*, element_id: str = "AADC", attrs: dict[str, object
     el.has_attr = AsyncMock(return_value=False)
     el.is_spinbtn_input = AsyncMock(return_value=False)
     el.is_editable = AsyncMock(return_value=True)
+    el.accepts_text_fill = AsyncMock(return_value=True)
     el.supports_text_input = AsyncMock(return_value=True)
     el.is_visible = AsyncMock(return_value=True)
     el.is_raw_input = AsyncMock(return_value=False)
