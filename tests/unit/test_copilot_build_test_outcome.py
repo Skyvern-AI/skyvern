@@ -4380,9 +4380,9 @@ workflow_definition:
     monkeypatch.setattr(tools_module, "_get_prior_workflow_definition", AsyncMock(return_value=None))
     monkeypatch.setattr(tools_module, "_frontier_runtime_page_url", AsyncMock(return_value=None))
     monkeypatch.setattr(
-        tools_module,
-        "_plan_frontier",
-        lambda *args: (["collect_failure_rate"], {}, "collect_failure_rate", "initial"),
+        tools_module.FrontierRequest,
+        "plan",
+        lambda self, ctx: (["collect_failure_rate"], {}, "collect_failure_rate", "initial"),
     )
     monkeypatch.setattr(tools_module, "_update_workflow", persist_workflow)
     monkeypatch.setattr(tools_module, "_run_blocks_and_collect_debug", test_persisted_workflow)
@@ -5770,7 +5770,7 @@ async def test_candidate_run_bind_and_publish_stay_refused_while_an_accept_claim
     monkeypatch.setattr(run_execution_module, "_authority_tool_error", lambda *_args: None)
     monkeypatch.setattr(tools_module, "_get_prior_workflow_definition", AsyncMock(return_value=None))
     monkeypatch.setattr(
-        tools_module, "_plan_frontier", lambda *_args: (["extract_heading"], {}, "extract_heading", "initial")
+        tools_module.FrontierRequest, "plan", lambda self, ctx: (["extract_heading"], {}, "extract_heading", "initial")
     )
     workflow_service_module.prepare_workflow.return_value = SimpleNamespace(
         workflow_run_id="wr_refused",
