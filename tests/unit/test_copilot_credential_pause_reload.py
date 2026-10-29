@@ -16,7 +16,9 @@ from skyvern.forge.sdk.core import skyvern_context
 from skyvern.forge.sdk.core.skyvern_context import SkyvernContext
 from skyvern.forge.sdk.routes import workflow_copilot as routes
 from skyvern.forge.sdk.schemas.browser_profiles import BrowserProfile
+from skyvern.forge.sdk.schemas.credentials import PasswordCredential
 from skyvern.forge.sdk.schemas.workflow_copilot import CredentialRegistration
+from tests.unit.copilot_test_helpers import wire_credential_vault
 from tests.unit.test_copilot_ask_user import setup_question_chat
 from tests.unit.test_copilot_credential_pause import (
     _REGISTRATION,
@@ -332,6 +334,60 @@ async def test_signing_in_survives_a_reload_and_done_resumes_the_same_call_with_
     assert ctx.request_policy.credential_draft_deferred_explicitly is False
     assert ctx.request_policy.resolved_credentials == []
     assert any(entry["event"] == "copilot_credential_pause_signed_in" for entry in logs)
+
+
+@pytest.mark.asyncio
+async def test_an_update_card_restores_its_sign_in_after_a_reload_and_done_answers_it(sqlite_engine, monkeypatch):
+    _, client, ctx, _ = await setup_question_chat(sqlite_engine, monkeypatch)
+    monkeypatch.setattr(app, "CACHE", _FakeCache())
+    monkeypatch.setattr(pauses, "CREDENTIAL_RESPONSE_POLL_SECONDS", 0.01)
+    monkeypatch.setattr(
+        routes, "create_profile_from_running_session", AsyncMock(return_value=(_signed_in_profile(), 2))
+    )
+    emitted = _sign_in_card_context(ctx, recovery=True)
+    credential = wire_credential_vault(monkeypatch, PasswordCredential(username="u", password="p", totp="seed"))
+    ctx.request_policy.resolved_credentials = [credential]
+    ctx.request_policy.auto_bound_credentials = [credential]
+    client._transport.app.add_api_route(
+        "/credential-response", routes.workflow_copilot_credential_response, methods=["POST"]
+    )
+    headers = {"X-Copilot-Credential-Recovery-Token": "a" * 64}
+    params = {"workflow_copilot_chat_id": ctx.workflow_copilot_chat_id}
+    async with client:
+        invocation = asyncio.create_task(
+            _request_credential("https://portal.example.com/login", "Login", ctx, "cred_1", rejected_by_site=True)
+        )
+        try:
+            await asyncio.wait_for(emitted.wait(), 1)
+            card = ctx.stream.send.await_args.args[0]
+            body = {
+                "workflow_copilot_chat_id": card.workflow_copilot_chat_id,
+                "turn_id": card.turn_id,
+                "resume_token": card.resume_token,
+            }
+            started = await client.post("/credential-response", json={**body, "action": "signing_in"})
+            assert started.status_code == 200
+
+            reloaded = (await client.get("/history", params=params, headers=headers)).json()
+            [restored] = reloaded["pending_credential_requests"]
+            assert (restored["reason"], restored["signing_in"], restored["credential_binding"]) == (
+                "credential_rejected_by_site",
+                True,
+                "matched_by_saved_url",
+            )
+            assert restored["sign_in_browser_session_id"] == "pbs_debug"
+
+            done = await client.post("/credential-response", json={**body, "action": "signed_in"})
+            result = await asyncio.wait_for(invocation, 1)
+        finally:
+            if not invocation.done():
+                invocation.cancel()
+                await asyncio.gather(invocation, return_exceptions=True)
+
+    assert done.json()["result"] == "signed_in"
+    assert (result["status"], result["browser_profile_id"]) == ("signed_in", "bp_signed_in")
+    assert ctx.credential_pause_outcome == "signed_in"
+    assert ctx.request_policy.credential_pause_signed_in_profile_id == "bp_signed_in"
 
 
 @pytest.mark.asyncio

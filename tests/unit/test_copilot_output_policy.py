@@ -754,7 +754,7 @@ def test_allows_workflow_delivery_language_after_failed_workflow_attempt() -> No
     verdict = evaluate_output_policy(
         request_policy=_policy(),
         response_type="REPLY",
-        user_response="I created a draft workflow and tested it, but the test failed.",
+        user_response="I tested the draft, but the test failed: Login rejected.",
         has_workflow_proposal=False,
         workflow_attempted=True,
     )
@@ -1493,6 +1493,31 @@ workflow_definition:
     assert verdict.allowed
     assert diagnostics["raw_output_kind"] == "workflow_draft_proposal"
     assert diagnostics["final_output_kind"] == "workflow_draft_proposal"
+
+
+def test_final_output_policy_checks_the_unbound_credential_lead_without_a_done_placeholder(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    ctx = _ctx(request_policy=_policy(clarification_reason="workflow_credential_inputs_unbound"))
+    ctx.last_run_skipped_unbound_credentials = True
+    ctx.last_workflow = object()
+    ctx.last_update_block_count = 2
+    ctx.last_workflow_yaml = _COVERED_DRAFT_YAML
+    checked_replies: list[str] = []
+    real_evaluate = agent_module.evaluate_output_policy
+
+    def recording_evaluate(**kwargs: Any) -> OutputPolicyVerdict:
+        checked_replies.append(kwargs["user_response"])
+        return real_evaluate(**kwargs)
+
+    monkeypatch.setattr(agent_module, "evaluate_output_policy", recording_evaluate)
+
+    agent_module._evaluate_copilot_final_output_policy(ctx, "ASK_QUESTION:")
+
+    assert checked_replies == [
+        "I applied your requested change as a draft, but I couldn't test it because I couldn't find "
+        "the required credentials. Add them in Credentials, then I can try again."
+    ]
 
 
 def test_translation_surfaces_untested_draft_when_agent_asks_after_drafting() -> None:
