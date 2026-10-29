@@ -57,7 +57,9 @@ from skyvern.forge.sdk.copilot.output_utils import (
 from skyvern.forge.sdk.copilot.page_identity import safe_page_origin
 from skyvern.forge.sdk.copilot.reached_download_target import download_claim_helper_contract
 from skyvern.forge.sdk.copilot.request_policy import (
+    CREDENTIAL_BINDING_FACTS,
     RequestPolicy,
+    credential_binding,
     live_page_credentials_admissible,
     resolve_credential_for_live_page,
 )
@@ -1073,6 +1075,9 @@ async def _bind_login_credential_for_observed_url(ctx: AgentContext, url: str, r
         await record_signed_out_page_observation(ctx, url)
         credential = record.candidates[0]
         result["resolved_login_credential_id"] = credential.credential_id
+        result["resolved_login_credential_binding"] = CREDENTIAL_BINDING_FACTS[
+            credential_binding(policy, credential.credential_id)
+        ]
         result["resolved_login_credential_name"] = credential.name
         result["resolved_login_credential_totp_type"] = str(credential.totp_type)
         # The observation may name a placeholder while the match ran against the page read after it,

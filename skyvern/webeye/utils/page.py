@@ -1078,7 +1078,8 @@ async def _control_screenshot(
     engine_selection: BrowserEngineSelection | None,
     capture: _CaptureDeadline | None = None,
 ) -> bytes:
-    """Playwright-first, raw-CDP rescue on timeout for the eligible path."""
+    """Playwright-first, raw-CDP rescue on timeout for the eligible path; a stalled or health-silent eligible
+    capture starts on raw CDP instead."""
     record_health = _records_health(capture)
     # Only a rescuable capture gives up part of its budget to leave the rescue a tail.
     split_capture = (
@@ -1088,7 +1089,8 @@ async def _control_screenshot(
         == ScreenshotEligibility.ELIGIBLE
         else None
     )
-    if split_capture is not None and split_capture.primary_stalled:
+    # On a slow-compositing page a raw capture needs most of the deadline, which the rescue's tail never leaves it.
+    if split_capture is not None and (split_capture.primary_stalled or not record_health):
         rescued = await _cdp_rescue_screenshot(
             page=page, file_path=file_path, engine_selection=engine_selection, capture=split_capture
         )
@@ -1096,6 +1098,13 @@ async def _control_screenshot(
             if record_health:
                 skyvern_context.record_browser_recovery(BrowserOperation.SCREENSHOT)
             return rescued
+        if not record_health:
+            # Playwright is slower than the raw capture, so it only follows a raw attempt that ended early.
+            if isinstance(rescued, _RescueTimedOut):
+                raise ActionDeadlineExceeded("The raw CDP screenshot timed out")
+            return await _bounded_page_screenshot(
+                page, file_path, full_page, split_capture.remaining_ms(), animations=split_capture.animations
+            )
     primary_timeout = split_capture.primary_budget_ms() if split_capture is not None else timeout
     try:
         return await _bounded_page_screenshot(
@@ -1134,7 +1143,7 @@ async def _control_screenshot(
                 if split_capture is not None:
                     split_capture.primary_stalled = True
                 return rescued
-            if rescued is None:
+            if not isinstance(rescued, _RescueDeclined):
                 raise
         # An unsplit retry of a capture that already allowed animations repeats the first attempt on a fresh full
         # timeout. A split retry only gets what is left of the deadline, and the page may have finished loading.
@@ -1283,6 +1292,8 @@ CDP_RESCUE_SESSION_TIMEOUT_SECONDS = 5
 CDP_RESCUE_CAPTURE_TIMEOUT_SECONDS = 5
 CDP_RESCUE_DETACH_TIMEOUT_SECONDS = 2
 _CDP_RESCUE_MIN_WORK_SECONDS = 0.1
+# A raw-first capture reserves only the measured 210-412ms detach up front; detach later gets what the deadline leaves.
+_CDP_RESCUE_RAW_FIRST_DETACH_RESERVE_SECONDS = 0.5
 # Left after the rescue's detach so the caller's terminal mapping still runs inside the capture deadline.
 _CDP_RESCUE_DEADLINE_MARGIN_SECONDS = 0.1
 _PNG_SIGNATURE = b"\x89PNG\r\n\x1a\n"
@@ -1295,15 +1306,23 @@ class _RescueDeclined:
 _RESCUE_DECLINED = _RescueDeclined()
 
 
+class _RescueTimedOut:
+    """A rescue stage ran out of its time."""
+
+
+_RESCUE_TIMED_OUT = _RescueTimedOut()
+
+
 async def _cdp_rescue_screenshot(
     page: Page,
     file_path: str | None,
     *,
     engine_selection: BrowserEngineSelection | None = None,
     capture: _CaptureDeadline | None = None,
-) -> bytes | _RescueDeclined | None:
-    """Return PNG bytes, a scaled-viewport decline, or None after a failed rescue. With a ``capture`` deadline,
-    every stage including detach ends before it, and a window too short for work plus detach is skipped."""
+) -> bytes | _RescueDeclined | _RescueTimedOut | None:
+    """Return PNG bytes, a scaled-viewport decline, a timeout, or None after another failed or skipped rescue. With
+    a ``capture`` deadline, every stage including detach ends before it, and a window too short for work plus detach
+    is skipped."""
     session = None
     stage = ScreenshotStage.ATTACH
     start = time.time()
@@ -1328,7 +1347,10 @@ async def _cdp_rescue_screenshot(
     if capture is not None:
         cleanup_end = capture.at - _CDP_RESCUE_DEADLINE_MARGIN_SECONDS
         detach_timeout = min(detach_timeout, (cleanup_end - loop.time()) / 2)
-        work_end = cleanup_end - detach_timeout
+        detach_reserve = (
+            detach_timeout if record_health else min(detach_timeout, _CDP_RESCUE_RAW_FIRST_DETACH_RESERVE_SECONDS)
+        )
+        work_end = cleanup_end - detach_reserve
         if work_end - loop.time() < _CDP_RESCUE_MIN_WORK_SECONDS:
             LOG.info(
                 "Raw CDP rescue screenshot skipped; the capture deadline leaves no room for it",
@@ -1386,7 +1408,7 @@ async def _cdp_rescue_screenshot(
             exc_info=record_health,
             **_fields(stage, outcome),
         )
-        return None
+        return _RESCUE_TIMED_OUT if outcome == ScreenshotOutcome.TIMEOUT else None
     finally:
         # Owned cleanup: detach is synchronously awaited on its reserved bound. Cancelling it sooner would leave a
         # wedged session open browser-side.

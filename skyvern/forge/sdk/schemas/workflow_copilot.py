@@ -1082,6 +1082,9 @@ class WorkflowCopilotCredentialRegistration(CredentialRegistration):
     outcome: Literal["rejected", "unknown"] | None = Field(None, description="Why an attempt did not connect")
 
 
+CredentialBinding = Literal["saved_workflow", "matched_by_saved_url", "not_bound"]
+
+
 class WorkflowCopilotCredentialRequiredUpdate(BaseModel):
     type: WorkflowCopilotStreamMessageType = Field(
         WorkflowCopilotStreamMessageType.CREDENTIAL_REQUIRED, description="Message type"
@@ -1113,6 +1116,9 @@ class WorkflowCopilotCredentialRequiredUpdate(BaseModel):
         None, description="The live browser the user may sign in to themselves; absent when the card does not offer it"
     )
     signing_in: bool = Field(False, description="The user has started signing in themselves")
+    credential_binding: CredentialBinding | None = Field(
+        None, description="How the credential an update card names is bound; absent on other cards"
+    )
     registration: WorkflowCopilotCredentialRegistration | None = Field(
         None, description="Account details a Generate and save answer would store; never a password"
     )

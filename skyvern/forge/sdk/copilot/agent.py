@@ -1637,17 +1637,8 @@ def _normalize_failure_reason(failure_reason: str | None) -> str:
     return normalized or "The workflow test run failed."
 
 
-_FAILURE_FOLLOW_UP = {
-    "NAVIGATION_FAILURE": " Can you confirm the URL is correct?",
-    "PROXY_ERROR": " Want me to re-test?",
-    "PAGE_LOAD_TIMEOUT": " Can you confirm the URL and try again in a moment?",
-    "ANTI_BOT_DETECTION": " Want me to retry?",
-    "AUTH_FAILURE": " The site rejected the login — is the stored password still valid?",
-    "CREDENTIAL_ERROR": " I couldn't find a credential to use — can you link one in Settings?",
-}
-# A chat affirmative re-tests on the browser session the turn already holds, so neither offer may
-# promise a different proxy node.
-_SKYVERN_EGRESS_FOLLOW_UP = " That failure was in Skyvern's own proxy hop — want me to re-test?"
+def _sentence_end(reason: str) -> str:
+    return reason if reason.endswith("...") else reason.rstrip(".") + "."
 
 
 _RAW_SECRET_CARD_NOT_CONNECTED = {
@@ -1666,7 +1657,11 @@ def _rewrite_failed_test_response(user_response: str, ctx: CopilotContext) -> st
     )
     keep_draft_affordance = " Keep the draft to iterate on, or discard." if has_keepable_draft else ""
     block_count = ctx.last_update_block_count if isinstance(ctx.last_update_block_count, int) else None
-    positive_block_count = block_count if block_count is not None and block_count > 0 else None
+    reply = user_response.strip()
+
+    # The model reply is appended unfiltered on purpose; the lead alone carries the recorded outcome.
+    def lead_then_reply(lead: str) -> str:
+        return f"{lead} {reply}{keep_draft_affordance}" if reply else lead
 
     policy = ctx.request_policy if isinstance(ctx.request_policy, RequestPolicy) else None
     if (
@@ -1675,66 +1670,28 @@ def _rewrite_failed_test_response(user_response: str, ctx: CopilotContext) -> st
         and ctx.last_workflow is not None
         and block_count is not None
     ):
-        if positive_block_count is None:
-            draft_phrase = "a draft workflow"
-        else:
-            block_word = "block" if positive_block_count == 1 else "blocks"
-            draft_phrase = f"a draft workflow with {positive_block_count} {block_word}"
-        return (
-            f"I applied your requested change as {draft_phrase}. "
-            f"I couldn't test the modified workflow because I couldn't find the required credentials — "
-            f"please add them via the Credentials UI, then I can try again.{keep_draft_affordance}"
+        return lead_then_reply(
+            "I applied your requested change as a draft, but I couldn't test it because I couldn't find "
+            "the required credentials. Add them in Credentials, then I can try again."
         )
 
     if ctx.last_test_ok is False and block_count is not None:
-        if positive_block_count is None:
-            draft_phrase = "a draft workflow"
-        else:
-            block_word = "block" if positive_block_count == 1 else "blocks"
-            draft_phrase = f"a draft workflow with {positive_block_count} {block_word}"
-
         connect_failure = _terminal_connect_failure(ctx)
         if connect_failure is not None and connect_failure.state == "billing_credit_admission_refusal":
-            return (
-                f"I created {draft_phrase}, but I couldn't start a test. "
-                f"{build_test_connect_failure_sentence(connect_failure)} "
-                f"The draft is untested.{keep_draft_affordance}"
-            )
+            sentence = build_test_connect_failure_sentence(connect_failure)
+            return lead_then_reply(f"I couldn't start a test. {sentence} The draft is untested.")
 
         # No run row means nothing executed, so claiming the draft was tested is false.
         if (
             ctx.last_failure_category_top == "UNRECOVERABLE_TOOL_ERROR" and not ctx.dispatched_run_ids_this_turn
         ) or ctx.last_test_run_started is False:
-            not_started_reason = _normalize_failure_reason(ctx.last_test_failure_reason)
-            if not not_started_reason.endswith("..."):
-                not_started_reason = not_started_reason.rstrip(".")
-            return (
-                f"I created {draft_phrase}, but I couldn't start a test run: "
-                f"{not_started_reason}. "
-                f"Nothing was executed, so the draft is unverified.{keep_draft_affordance}"
+            not_started_reason = _sentence_end(_normalize_failure_reason(ctx.last_test_failure_reason))
+            return lead_then_reply(
+                f"I couldn't start a test run: {not_started_reason} Nothing was executed, so the draft is unverified."
             )
 
-        raw_failure_reason = ctx.last_test_failure_reason
-        failure_summary = _normalize_failure_reason(raw_failure_reason)
-        if not failure_summary.endswith("..."):
-            failure_summary = failure_summary.rstrip(".")
-        follow_up = _FAILURE_FOLLOW_UP.get(ctx.last_failure_category_top or "", "")
-        # Only the predicate tells Skyvern's own hop apart from a page that says "proxy error"; the
-        # classifier category on its own gets the target-neutral ask.
-        if raw_failure_reason and ctx.last_test_proxy_owned_failure:
-            follow_up = _SKYVERN_EGRESS_FOLLOW_UP
-        contract = ctx.latest_diagnosis_repair_contract
-        recorded_run = f"I created {draft_phrase} and tested it, but the test failed. Failure: {failure_summary}."
-        if contract is not None and contract.levers:
-            # The packet carried the wall's effects and levers, so the model's own reply names what
-            # the product can do; the harness only keeps the recorded-run sentence in front of it,
-            # which states the failure before anything the model wrote. Judging that prose for
-            # contradictions is the model's jurisdiction and the eval's bar, not a harness matcher.
-            model_reply = user_response.strip()
-            if model_reply:
-                return f"{recorded_run} {model_reply}".rstrip() + keep_draft_affordance
-            return f"{recorded_run}{follow_up}{keep_draft_affordance}"
-        return f"{recorded_run}{follow_up}{keep_draft_affordance}"
+        failure_summary = _sentence_end(_normalize_failure_reason(ctx.last_test_failure_reason))
+        return lead_then_reply(f"I tested the draft, but the test failed: {failure_summary}")
 
     if ctx.last_test_ok is None and block_count is not None and ctx.last_workflow is not None:
         if policy is not None and policy.raw_secret_redacted_draft:
@@ -3693,7 +3650,7 @@ async def _translate_to_agent_result(
         return _build_budget_expiry_exit_result(ctx, global_llm_context)
     if final_reply and (not isinstance(raw_user_response, str) or not raw_user_response.strip()):
         return _build_empty_completion_exit_result(ctx, global_llm_context)
-    user_response = raw_user_response or "Done."
+    user_response = raw_user_response or ""
 
     def _with_inline_reject_note(response: str, detail: str) -> str:
         note = detail if not contains_internal_machinery_leak(detail) else _INLINE_REJECT_NOTE_FALLBACK
@@ -3715,7 +3672,7 @@ async def _translate_to_agent_result(
     if not budget_drain:
         normalized_scaffolding = normalize_response_scaffolding(resp_type, str(user_response))
         resp_type = normalized_scaffolding.response_type
-        user_response = normalized_scaffolding.user_response or "Done."
+        user_response = normalized_scaffolding.user_response
     model_authored_ask = resp_type == "ASK_QUESTION"
 
     # Bind the signal to a local so the proposal-cascade gating below can't
@@ -3962,6 +3919,7 @@ async def _translate_to_agent_result(
         and not direct_test_handoff
     ):
         user_response = _rewrite_failed_test_response(str(user_response), ctx)
+    user_response = str(user_response).lstrip() or "Done."
     verified_workflow, verified_yaml = _verified_workflow_or_none(ctx)
     last_workflow = None
     last_workflow_yaml = None
@@ -4631,7 +4589,7 @@ def _final_output_policy_reply(agent_output: Any) -> tuple[dict[str, Any], str, 
     normalized_scaffolding = normalize_response_scaffolding(
         response_type, str(action_data.get("user_response") or text)
     )
-    return action_data, normalized_scaffolding.response_type, normalized_scaffolding.user_response or "Done."
+    return action_data, normalized_scaffolding.response_type, normalized_scaffolding.user_response or ""
 
 
 def _evaluate_copilot_final_output_policy(
@@ -4657,6 +4615,7 @@ def _evaluate_copilot_final_output_policy(
     policy_response_type = "REPLY" if surface_untested_draft else response_type
     if surface_untested_draft:
         policy_user_response = _rewrite_failed_test_response(policy_user_response, ctx)
+    policy_user_response = policy_user_response or "Done."
     updated_workflow_for_kind = (
         candidate_workflow if candidate_workflow is not None else WORKFLOW_PRESENT_SENTINEL if workflow_yaml else None
     )
