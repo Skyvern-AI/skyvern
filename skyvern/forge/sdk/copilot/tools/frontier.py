@@ -8,7 +8,7 @@ import re
 import textwrap
 from collections import Counter
 from copy import deepcopy
-from dataclasses import asdict, fields, replace
+from dataclasses import asdict, dataclass, fields, replace
 from typing import Any, Protocol, runtime_checkable
 from urllib.parse import urlparse
 
@@ -47,8 +47,12 @@ from skyvern.forge.sdk.copilot.repair_origin_run import (
     OriginOutputRefusal,
     OriginOutputRefusalDetail,
     OriginOutputSnapshot,
+    OutputSourceKind,
+    RefusedOutputSource,
     RunOutputCarrier,
     SelectedOutputSource,
+    current_named_output_source,
+    drop_named_output_source,
     origin_snapshot,
 )
 from skyvern.forge.sdk.copilot.runtime import (
@@ -81,7 +85,22 @@ from ._shared import (
 LOG = structlog.get_logger()
 
 
+UnanchoredPlan = tuple[list[str], dict[str, Any], str | None]
 FrontierPlan = tuple[list[str], dict[str, Any], str | None, FrontierStartProvenance]
+
+
+@dataclass(frozen=True, slots=True)
+class FrontierRequest:
+    requested_labels: list[str]
+    old_definition: WorkflowDefinition | None
+    new_definition: WorkflowDefinition | None
+    runtime_page_url: str | None
+
+    def plan(self, ctx: AgentContext) -> FrontierPlan:
+        return _plan_frontier(
+            ctx, list(self.requested_labels), self.old_definition, self.new_definition, self.runtime_page_url
+        )
+
 
 _BLOCK_TYPES_STATE_ESTABLISHER = frozenset({"navigation", "login", "goto_url"})
 
@@ -1085,7 +1104,7 @@ def _storage_order_is_traversal_order(new_definition: object | None, before_labe
 
 def _anchored_plan(
     ctx: AgentContext,
-    plan: tuple[list[str], dict[str, Any], str | None],
+    plan: UnanchoredPlan,
     new_definition: object | None,
     runtime_page_url: str | None,
     requested_labels: list[str] | None = None,
@@ -1161,6 +1180,7 @@ def _plan_frontier(
     plan = _plan_frontier_uncaptured(ctx, requested_labels, old_definition, new_definition, runtime_page_url)
     labels_to_execute, seed, frontier_start_label, start_provenance = plan
     refusal = ctx.frontier_origin_output_refusal
+    named_refusal = ctx.frontier_named_output_refusal
     write_packet(
         "frontier",
         {
@@ -1179,6 +1199,7 @@ def _plan_frontier(
                     source.as_payload() for source in ctx.frontier_selected_output_sources.values()
                 ],
                 "origin_output_refusal": refusal.as_payload() if refusal is not None else None,
+                "named_output_refusal": named_refusal.as_payload() if named_refusal is not None else None,
             },
         },
     )
@@ -1192,11 +1213,36 @@ def _plan_frontier_uncaptured(
     new_definition: WorkflowDefinition | None,
     runtime_page_url: str | None = None,
 ) -> FrontierPlan:
+    plan = _plan_frontier_from_sources(ctx, requested_labels, old_definition, new_definition, runtime_page_url)
+    if current_named_output_source() is None or any(
+        source.source == "named" for source in ctx.frontier_selected_output_sources.values()
+    ):
+        return plan
+    # A named run that supplies no producer leaves the call planned exactly as one that names no run.
+    drop_named_output_source()
+    named_refusal = ctx.frontier_named_output_refusal
+    plan = _plan_frontier_from_sources(ctx, requested_labels, old_definition, new_definition, runtime_page_url)
+    ctx.frontier_named_output_refusal = named_refusal
+    return plan
+
+
+def _plan_frontier_from_sources(
+    ctx: AgentContext,
+    requested_labels: list[str],
+    old_definition: WorkflowDefinition | None,
+    new_definition: WorkflowDefinition | None,
+    runtime_page_url: str | None,
+) -> FrontierPlan:
     ctx.frontier_origin_reused_labels = []
     ctx.frontier_origin_output_refusal = None
+    ctx.frontier_named_output_refusal = None
     ctx.frontier_selected_output_sources = {}
     carrier = ctx.repair_origin_outputs
-    if isinstance(carrier, RunOutputCarrier) and carrier.sources and new_definition is not None and requested_labels:
+    if (
+        ((isinstance(carrier, RunOutputCarrier) and carrier.sources) or current_named_output_source() is not None)
+        and new_definition is not None
+        and requested_labels
+    ):
         old_shapes = (
             _cross_version_block_shapes(old_definition, ctx.workflow_id) if old_definition is not None else None
         )
@@ -1240,35 +1286,69 @@ def _plan_frontier_uncaptured(
             if not ctx.frontier_selected_output_sources:
                 base = _plan_frontier_base(ctx, requested_labels, old_definition, new_definition, runtime_page_url)
                 return _fill_seed_from_origin(ctx, base, new_definition, requested_labels)
-            plan = _anchored_plan(
-                ctx,
-                (labels, seed, start),
-                new_definition,
-                runtime_page_url,
-                requested_labels,
-                # A failed run's completed outputs are parameter facts, not browser-position
-                # evidence. Actual verified prefix evidence still requires its matching browser.
-                include_recorded_failed_prefix=not bool(ctx.frontier_selected_output_sources),
+            return _anchor_selected_suffix(
+                ctx, (labels, seed, start), labels, new_definition, runtime_page_url, requested_labels
             )
-            if ctx.frontier_resume_session_id and ctx.frontier_origin_reused_labels:
-                ctx.frontier_resume_session_id = None
-                ctx.frontier_requires_own_browser = False
-                ctx.frontier_selected_output_sources = {}
-                ctx.frontier_origin_reused_labels = []
-                return _anchored_plan(
-                    ctx,
-                    (list(requested_labels), {}, requested_labels[0]),
-                    new_definition,
-                    runtime_page_url,
-                    requested_labels,
-                )
-            if plan[0] != labels:
-                ctx.frontier_selected_output_sources = {}
-                ctx.frontier_origin_reused_labels = []
-                return _fill_seed_from_origin(ctx, plan, new_definition, requested_labels)
-            return plan
     plan = _plan_frontier_base(ctx, requested_labels, old_definition, new_definition, runtime_page_url)
     return _fill_seed_from_origin(ctx, plan, new_definition, requested_labels)
+
+
+def _anchor_selected_suffix(
+    ctx: AgentContext,
+    resolved: UnanchoredPlan,
+    selected_for_labels: list[str],
+    definition: WorkflowDefinition,
+    runtime_page_url: str | None,
+    requested_labels: list[str],
+) -> FrontierPlan:
+    plan = _anchored_plan(
+        ctx,
+        resolved,
+        definition,
+        runtime_page_url,
+        requested_labels,
+        # A failed run's completed outputs are parameter facts, not browser-position
+        # evidence. Actual verified prefix evidence still requires its matching browser.
+        include_recorded_failed_prefix=not bool(ctx.frontier_selected_output_sources),
+    )
+    if ctx.frontier_resume_session_id and ctx.frontier_origin_reused_labels:
+        ctx.frontier_resume_session_id = None
+        ctx.frontier_requires_own_browser = False
+        ctx.frontier_selected_output_sources = {}
+        ctx.frontier_origin_reused_labels = []
+        return _anchored_plan(
+            ctx,
+            (list(requested_labels), {}, requested_labels[0]),
+            definition,
+            runtime_page_url,
+            requested_labels,
+        )
+    if plan[0] != selected_for_labels:
+        # Outputs were selected for other labels, so the anchored labels need their own.
+        ctx.frontier_selected_output_sources = {}
+        ctx.frontier_origin_reused_labels = []
+        ctx.frontier_origin_output_refusal = None
+        ctx.frontier_named_output_refusal = None
+        return _fill_seed_from_origin(ctx, plan, definition, requested_labels)
+    return plan
+
+
+def replan_without_named_source(
+    ctx: AgentContext,
+    request: FrontierRequest | None,
+    refusal: OriginOutputRefusalDetail,
+    selected: dict[str, SelectedOutputSource],
+) -> FrontierPlan | None:
+    """When a dispatch recheck refuses an output the named run supplied, drop that run for the rest of the call and
+    plan it as a call that names no run, leaving the plan on the context for the re-entry."""
+    source = selected.get(refusal.block_label)
+    if request is None or source is None or source.source != "named":
+        return None
+    drop_named_output_source()
+    plan = request.plan(ctx)
+    ctx.frontier_named_output_refusal = refusal
+    ctx.frontier_start_provenance = plan[3]
+    return plan
 
 
 def _without_per_version_parameter_ids(value: JsonValue) -> JsonValue:
@@ -1432,13 +1512,7 @@ def _select_output_source(
     definition: WorkflowDefinition,
 ) -> SelectedOutputSource | OriginOutputRefusalDetail:
     carrier = ctx.repair_origin_outputs
-    workflow_labels = _executable_workflow_block_labels(definition)
-    if (
-        producer not in workflow_labels
-        or first_label not in workflow_labels
-        or workflow_labels.index(producer) >= workflow_labels.index(first_label)
-        or not _storage_order_is_traversal_order(definition, first_label)
-    ):
+    if not _reuse_order_provable(producer, first_label, definition):
         return OriginOutputRefusalDetail(
             OriginOutputRefusal.ORDER_UNPROVABLE, producer, ctx.repair_origin_outputs_run_id
         )
@@ -1460,29 +1534,14 @@ def _select_output_source(
             carrier.sources.values(), key=lambda source: (source.created_at, source.workflow_run_id), reverse=True
         )
         for source in sources:
-            observed = source.snapshot.outputs.get(producer)
-            if observed is None:
+            if producer not in source.snapshot.outputs:
                 continue
-            if not _storage_order_is_traversal_order(source.snapshot.definition, producer):
-                refused_reason = OriginOutputRefusal.ORDER_UNPROVABLE
-                continue
-            source_shapes = _cross_version_block_shapes(source.snapshot.definition, ctx.workflow_id)
-            if (
-                candidate_shapes is None
-                or source_shapes is None
-                or _producer_definition_changed(
-                    producer, source.snapshot.definition, definition, source_shapes, candidate_shapes
-                )
-            ):
-                refused_reason = OriginOutputRefusal.CHANGED_PRODUCER
-                continue
-            if observed.status != BlockStatus.completed:
-                refused_reason = OriginOutputRefusal.UPSTREAM_FAILED
-                continue
-            if not observed.has_value or observed.value == SCRUBBED_VALUE:
-                refused_reason = OriginOutputRefusal.OUTPUT_UNAVAILABLE
-                continue
-            return SelectedOutputSource(producer, source.workflow_run_id, "banked", source.snapshot)
+            reason = _recorded_source_refusal(
+                producer, source.snapshot, definition, candidate_shapes, ctx.workflow_id, source="banked"
+            )
+            if reason is None:
+                return SelectedOutputSource(producer, source.workflow_run_id, "banked", source.snapshot)
+            refused_reason = reason
     snapshot = origin_snapshot(carrier)
     if snapshot is not None:
         shapes = (
@@ -1497,6 +1556,74 @@ def _select_output_source(
         if isinstance(snapshot, OriginOutputSnapshot) and ctx.repair_origin_outputs_run_id is not None:
             return SelectedOutputSource(producer, ctx.repair_origin_outputs_run_id, "origin", snapshot)
     return OriginOutputRefusalDetail(refused_reason, producer, ctx.repair_origin_outputs_run_id)
+
+
+def _reuse_order_provable(producer: str, first_label: str, definition: WorkflowDefinition) -> bool:
+    workflow_labels = _executable_workflow_block_labels(definition)
+    return (
+        producer in workflow_labels
+        and first_label in workflow_labels
+        and workflow_labels.index(producer) < workflow_labels.index(first_label)
+        and _storage_order_is_traversal_order(definition, first_label)
+    )
+
+
+def _named_output_source(
+    ctx: AgentContext, producer: str, first_label: str, definition: WorkflowDefinition
+) -> SelectedOutputSource | OriginOutputRefusalDetail | None:
+    named = current_named_output_source()
+    if named is None:
+        return None
+    if isinstance(named, RefusedOutputSource):
+        owned = named.reason is not OriginOutputRefusal.FOREIGN_OR_MISMATCHED_ORIGIN
+        return OriginOutputRefusalDetail(named.reason, producer, named.workflow_run_id if owned else None)
+    if producer not in named.snapshot.outputs:
+        reason: OriginOutputRefusal | None = OriginOutputRefusal.OUTPUT_UNAVAILABLE
+    elif not _reuse_order_provable(producer, first_label, definition):
+        reason = OriginOutputRefusal.ORDER_UNPROVABLE
+    else:
+        reason = _recorded_source_refusal(
+            producer,
+            named.snapshot,
+            definition,
+            _cross_version_block_shapes(definition, ctx.workflow_id),
+            ctx.workflow_id,
+            source="named",
+        )
+    if reason is not None:
+        return OriginOutputRefusalDetail(reason, producer, named.workflow_run_id)
+    return SelectedOutputSource(producer, named.workflow_run_id, "named", named.snapshot)
+
+
+def _recorded_source_refusal(
+    producer: str,
+    snapshot: OriginOutputSnapshot,
+    definition: WorkflowDefinition,
+    candidate_shapes: dict[str, JsonValue] | None,
+    workflow_id: str,
+    *,
+    source: OutputSourceKind,
+) -> OriginOutputRefusal | None:
+    observed = snapshot.outputs[producer]
+    if not _storage_order_is_traversal_order(snapshot.definition, producer):
+        return OriginOutputRefusal.ORDER_UNPROVABLE
+    source_shapes = _cross_version_block_shapes(snapshot.definition, workflow_id)
+    if (
+        candidate_shapes is None
+        or source_shapes is None
+        or _producer_definition_changed(producer, snapshot.definition, definition, source_shapes, candidate_shapes)
+    ):
+        return OriginOutputRefusal.CHANGED_PRODUCER
+    if observed.status != BlockStatus.completed:
+        return OriginOutputRefusal.UPSTREAM_FAILED
+    if _recorded_output_unusable(observed, source):
+        return OriginOutputRefusal.OUTPUT_UNAVAILABLE
+    return None
+
+
+def _recorded_output_unusable(observed: OriginBlockOutput, source: OutputSourceKind) -> bool:
+    # A run read back from storage keeps no scrub marker on a completed run with no inputs, so its null is unproven.
+    return not observed.has_value or observed.value == SCRUBBED_VALUE or (source == "named" and observed.value is None)
 
 
 def selected_output_definition_refusal(
@@ -1514,7 +1641,7 @@ def selected_output_definition_refusal(
             producer, source.snapshot.definition, definition, source_shapes, candidate_shapes
         ):
             reason = OriginOutputRefusal.CHANGED_PRODUCER
-        elif observed is None or not observed.has_value or observed.value == SCRUBBED_VALUE:
+        elif observed is None or _recorded_output_unusable(observed, source.source):
             reason = OriginOutputRefusal.OUTPUT_UNAVAILABLE
         elif observed.status != BlockStatus.completed:
             reason = OriginOutputRefusal.UPSTREAM_FAILED
@@ -1545,6 +1672,13 @@ def resolve_suffix_outputs(
     for producer in producer_order:
         if producer not in missing:
             continue
+        named = _named_output_source(ctx, producer, labels[0], definition)
+        if isinstance(named, SelectedOutputSource):
+            selected[producer] = named
+            seed[producer] = deepcopy(named.value)
+            continue
+        if named is not None and ctx.frontier_named_output_refusal is None:
+            ctx.frontier_named_output_refusal = logged_origin_refusal(named, source="named")
         carrier = ctx.repair_origin_outputs
         if producer in (ctx.verified_block_outputs or {}) and (
             not isinstance(carrier, RunOutputCarrier) or producer not in carrier.verified_sources
@@ -1571,7 +1705,12 @@ def _fill_seed_from_origin(
     requested_labels: list[str] | None = None,
 ) -> FrontierPlan:
     labels, seed, start, provenance = plan
-    if ctx.repair_origin_outputs is None or new_definition is None or ctx.frontier_resume_session_id or not labels:
+    if (
+        (ctx.repair_origin_outputs is None and current_named_output_source() is None)
+        or new_definition is None
+        or ctx.frontier_resume_session_id
+        or not labels
+    ):
         return plan
     resolved_labels, resolved_seed, resolved_start = resolve_suffix_outputs(
         ctx, labels, new_definition, requested_labels or labels
@@ -1622,6 +1761,7 @@ def origin_input_refusal(
     resolved_inputs: dict[str, Any],
     *,
     require_recorded_inputs: bool = False,
+    source: OutputSourceKind | None = None,
 ) -> OriginOutputRefusalDetail | None:
     """Refuse a reused origin output when the producer or a block before it would read a different input
     in this test run than in the origin run, or when the origin input cannot be proven."""
@@ -1662,7 +1802,8 @@ def origin_input_refusal(
                         block_label=producer,
                         origin_workflow_run_id=origin_run_id,
                         parameter_key=key,
-                    )
+                    ),
+                    source=source,
                 )
     return None
 
@@ -1680,7 +1821,7 @@ def selected_output_run_refusal(
     """Recheck recorded producer facts without assigning browser or composition credit."""
     refusal = selected_output_definition_refusal(selected, workflow.workflow_definition, ctx.workflow_id)
     if refusal is not None:
-        return logged_origin_refusal(refusal)
+        return logged_origin_refusal(refusal, source=selected[refusal.block_label].source)
     for producer, source in selected.items():
         source_ctx = replace(
             ctx, repair_origin_outputs=source.snapshot, repair_origin_outputs_run_id=source.workflow_run_id
@@ -1707,7 +1848,8 @@ def selected_output_run_refusal(
                         producer,
                         source.workflow_run_id,
                         changed_settings=changed,
-                    )
+                    ),
+                    source=source.source,
                 )
         refusal = origin_input_refusal(
             source_ctx,
@@ -1715,6 +1857,7 @@ def selected_output_run_refusal(
             workflow.workflow_definition,
             resolved_inputs,
             require_recorded_inputs=source.source != "origin",
+            source=source.source,
         )
         if refusal is not None:
             return refusal
@@ -1742,8 +1885,10 @@ def origin_definition_refusal(
     return None
 
 
-def logged_origin_refusal(detail: OriginOutputRefusalDetail) -> OriginOutputRefusalDetail:
-    LOG.info("copilot_frontier_origin_output_refused", **detail.as_payload())
+def logged_origin_refusal(
+    detail: OriginOutputRefusalDetail, *, source: OutputSourceKind | None = None
+) -> OriginOutputRefusalDetail:
+    LOG.info("copilot_frontier_origin_output_refused", **detail.as_payload(), **({"source": source} if source else {}))
     return detail
 
 

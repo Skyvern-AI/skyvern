@@ -239,6 +239,10 @@ from skyvern.forge.sdk.services.request_principal import get_request_principal
 from skyvern.forge.sdk.services.route_authorization import require_request_actions
 from skyvern.forge.sdk.workflow.exceptions import BaseWorkflowHTTPException, WorkflowVersionConflict
 from skyvern.forge.sdk.workflow.models.workflow import Workflow
+from skyvern.forge.sdk.workflow.secret_encryption import (
+    mask_workflow_for_api,
+    preserve_workflow_definition_secrets,
+)
 from skyvern.forge.sdk.workflow.service import workflow_changed_fields
 from skyvern.forge.sdk.workflow.workflow_definition_converter import convert_workflow_definition
 from skyvern.schemas.browser_session_close import BrowserSessionCloseReason
@@ -2079,6 +2083,10 @@ async def _commit_staged_workflow(
     canonical = await app.DATABASE.workflows.get_workflow_by_permanent_id(
         workflow_permanent_id=workflow_permanent_id,
         organization_id=organization_id,
+    )
+    preserve_workflow_definition_secrets(
+        staged_workflow.workflow_definition,
+        canonical.workflow_definition if canonical is not None else None,
     )
     title = _accepted_workflow_title(staged_workflow.title, canonical, metadata)
     # Auto-accept saves without the update route, so the staged definition gets the same reference check.
@@ -5433,7 +5441,7 @@ async def workflow_copilot_apply_proposed_workflow(
                 changed_fields=changed_fields,
             ),
         )
-    return new_workflow
+    return mask_workflow_for_api(new_workflow)
 
 
 async def _history_with_resolved_attachments(

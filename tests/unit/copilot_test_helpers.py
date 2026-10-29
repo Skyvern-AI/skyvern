@@ -1218,6 +1218,70 @@ def install_origin_run(
     )
 
 
+def recorded_session(
+    session_id: str,
+    *,
+    organization_id: str = "org-1",
+    proxy_location: ProxyLocationInput = None,
+    browser_profile_id: str | None = None,
+    browser_profile_loaded: bool = False,
+) -> PersistentBrowserSession:
+    return PersistentBrowserSession(
+        persistent_browser_session_id=session_id,
+        organization_id=organization_id,
+        created_at=ORIGIN_RUN_CREATED_AT,
+        modified_at=ORIGIN_RUN_CREATED_AT,
+        proxy_location=proxy_location,
+        browser_profile_id=browser_profile_id,
+        browser_profile_loaded=browser_profile_loaded,
+    )
+
+
+def install_named_runs(
+    monkeypatch: pytest.MonkeyPatch,
+    runs: Sequence[tuple[WorkflowRun, Workflow, tuple[list[WorkflowRunBlock], list[WorkflowRunOutputParameter]]]],
+    *,
+    parameters: Mapping[str, list[tuple[WorkflowParameter, WorkflowRunParameter]]] | None = None,
+    sessions: Sequence[PersistentBrowserSession] = (),
+) -> None:
+    """Serve each run, its version (deleted or not) and its rows by run id."""
+    by_id = {run.workflow_run_id: (run, workflow, rows) for run, workflow, rows in runs}
+    sessions_by_id = {session.persistent_browser_session_id: session for session in sessions}
+
+    async def get_workflow_run(*, workflow_run_id: str, organization_id: str | None = None) -> WorkflowRun | None:
+        return by_id[workflow_run_id][0] if workflow_run_id in by_id else None
+
+    async def get_workflow_for_workflow_run(
+        *, workflow_run_id: str, organization_id: str | None = None, filter_deleted: bool = True
+    ) -> Workflow | None:
+        workflow = by_id[workflow_run_id][1] if workflow_run_id in by_id else None
+        return None if workflow is None or (filter_deleted and workflow.deleted_at is not None) else workflow
+
+    monkeypatch.setattr(forge_app.WORKFLOW_SERVICE, "get_workflow_run", get_workflow_run)
+    monkeypatch.setattr(forge_app.DATABASE.workflows, "get_workflow_for_workflow_run", get_workflow_for_workflow_run)
+    monkeypatch.setattr(
+        forge_app.DATABASE.workflow_runs,
+        "get_workflow_run_parameters",
+        AsyncMock(side_effect=lambda *, workflow_run_id: list((parameters or {}).get(workflow_run_id, []))),
+    )
+    monkeypatch.setattr(
+        forge_app.DATABASE.observer,
+        "get_workflow_run_blocks",
+        AsyncMock(side_effect=lambda *, workflow_run_id, organization_id=None: list(by_id[workflow_run_id][2][0])),
+    )
+    monkeypatch.setattr(
+        forge_app.DATABASE.workflow_runs,
+        "get_workflow_run_output_parameters",
+        AsyncMock(side_effect=lambda *, workflow_run_id: list(by_id[workflow_run_id][2][1])),
+    )
+    monkeypatch.setattr(
+        forge_app.PERSISTENT_SESSIONS_MANAGER,
+        "get_session",
+        AsyncMock(side_effect=lambda session_id, organization_id: sessions_by_id.get(session_id)),
+        raising=False,
+    )
+
+
 def fake_tool(name: str) -> MagicMock:
     tool = MagicMock()
     tool.name = name

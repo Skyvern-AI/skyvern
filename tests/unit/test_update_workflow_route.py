@@ -22,6 +22,8 @@ from skyvern.forge.sdk.db.repositories.workflows import WorkflowCreationLockTime
 from skyvern.forge.sdk.routes.routers import base_router, legacy_base_router
 from skyvern.forge.sdk.schemas.organizations import Organization
 from skyvern.forge.sdk.services import org_auth_service
+from skyvern.forge.sdk.workflow.models.block import FileDownloadBlock
+from skyvern.forge.sdk.workflow.models.parameter import OutputParameter
 from skyvern.forge.sdk.workflow.models.workflow import Workflow, WorkflowDefinition
 from skyvern.schemas.runs import RunEngine
 
@@ -102,6 +104,55 @@ def _stored_workflow() -> Workflow:
         created_at=now,
         modified_at=now,
     )
+
+
+def test_workflow_detail_masks_inline_secrets_without_mutating_stored_workflow(client: TestClient) -> None:
+    now = dt.datetime.now(dt.timezone.utc)
+    output = OutputParameter(
+        output_parameter_id="op_download",
+        workflow_id="w_test",
+        key="download_output",
+        created_at=now,
+        modified_at=now,
+    )
+    private_key = "synthetic-private-key-for-api-read"
+    workflow = Workflow(
+        workflow_id="w_test",
+        organization_id=ORG_ID,
+        title="t",
+        workflow_permanent_id="wpid_test",
+        version=1,
+        is_saved_task=False,
+        workflow_definition=WorkflowDefinition(
+            parameters=[output],
+            blocks=[
+                FileDownloadBlock(
+                    label="download",
+                    output_parameter=output,
+                    sftp_private_key=private_key,
+                    sftp_password="synthetic-password-for-api-read",
+                    sftp_host_key="public-host-key",
+                )
+            ],
+        ),
+        created_at=now,
+        modified_at=now,
+    )
+    mock_app = MagicMock()
+    mock_app.WORKFLOW_SERVICE.get_workflow_by_permanent_id = AsyncMock(return_value=workflow)
+    mock_app.DATABASE.workflows.is_workflow_copilot_authored = AsyncMock(return_value=False)
+    with (
+        patch("skyvern.forge.sdk.routes.agent_protocol.app", mock_app),
+        patch("skyvern.forge.sdk.routes.agent_protocol.effective_default_engine", AsyncMock(return_value=None)),
+    ):
+        response = client.get("/v1/workflows/wpid_test")
+
+    assert response.status_code == 200, response.text
+    visible_block = response.json()["workflow_definition"]["blocks"][0]
+    assert visible_block["sftp_private_key"] == "[REDACTED]"
+    assert visible_block["sftp_password"] == "[REDACTED]"
+    assert visible_block["sftp_host_key"] == "public-host-key"
+    assert workflow.workflow_definition.blocks[0].sftp_private_key == private_key
 
 
 @pytest.mark.parametrize("computed", [None, RunEngine.skyvern_v3])

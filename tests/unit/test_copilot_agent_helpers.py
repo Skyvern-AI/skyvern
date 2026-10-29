@@ -2870,7 +2870,9 @@ workflow_definition:
         monkeypatch.setattr(tools_module, "_authority_tool_error", lambda *args, **kwargs: None)
         monkeypatch.setattr(tools_module, "_get_prior_workflow_definition", AsyncMock(return_value=None))
         monkeypatch.setattr(tools_module, "_update_workflow", fake_update_workflow)
-        monkeypatch.setattr(tools_module, "_plan_frontier", lambda *args: (["submit"], {}, "submit", "initial"))
+        monkeypatch.setattr(
+            tools_module.FrontierRequest, "plan", lambda self, ctx: (["submit"], {}, "submit", "initial")
+        )
         monkeypatch.setattr(tools_module, "_run_blocks_and_collect_debug", fake_run_blocks)
         monkeypatch.setattr(tools_module, "_record_diagnosis_repair_contract", lambda *args, **kwargs: None)
         monkeypatch.setattr(tools_module, "enqueue_screenshot_from_result", lambda *args, **kwargs: None)
@@ -2937,7 +2939,9 @@ workflow_definition:
         monkeypatch.setattr(tools_module, "_authority_tool_error", lambda *args, **kwargs: None)
         monkeypatch.setattr(tools_module, "_get_prior_workflow_definition", AsyncMock(return_value=None))
         monkeypatch.setattr(tools_module, "_update_workflow", fake_update_workflow)
-        monkeypatch.setattr(tools_module, "_plan_frontier", lambda *args: (["ｓubmit"], {}, "ｓubmit", "initial"))
+        monkeypatch.setattr(
+            tools_module.FrontierRequest, "plan", lambda self, ctx: (["ｓubmit"], {}, "ｓubmit", "initial")
+        )
         monkeypatch.setattr(tools_module, "_run_blocks_and_collect_debug", fake_run_blocks)
         monkeypatch.setattr(tools_module, "_record_diagnosis_repair_contract", lambda *args, **kwargs: None)
         monkeypatch.setattr(tools_module, "enqueue_screenshot_from_result", lambda *args, **kwargs: None)
@@ -3034,7 +3038,9 @@ workflow_definition:
         )
         monkeypatch.setattr(tools_module, "_update_workflow", fake_update_workflow)
         monkeypatch.setattr(tools_module, "_frontier_runtime_page_url", AsyncMock(return_value=None))
-        monkeypatch.setattr(tools_module, "_plan_frontier", lambda *args: (["read_total"], {}, "read_total", "initial"))
+        monkeypatch.setattr(
+            tools_module.FrontierRequest, "plan", lambda self, ctx: (["read_total"], {}, "read_total", "initial")
+        )
         monkeypatch.setattr(tools_module, "_run_blocks_and_collect_debug", fake_run_blocks)
         monkeypatch.setattr(tools_module, "_verify_and_record_run_blocks_result", AsyncMock())
         monkeypatch.setattr(tools_module, "_record_workflow_update_result", lambda *args, **kwargs: None)
@@ -3275,7 +3281,9 @@ workflow_definition:
             AsyncMock(return_value=WorkflowDefinition(parameters=[], blocks=[])),
         )
         monkeypatch.setattr(tools_module, "_frontier_runtime_page_url", AsyncMock(return_value=None))
-        monkeypatch.setattr(tools_module, "_plan_frontier", lambda *args: (["read_total"], {}, "read_total", "initial"))
+        monkeypatch.setattr(
+            tools_module.FrontierRequest, "plan", lambda self, ctx: (["read_total"], {}, "read_total", "initial")
+        )
         monkeypatch.setattr(tools_module, "_update_workflow", fake_update_workflow)
         monkeypatch.setattr(tools_module, "_record_workflow_update_result", fake_record_update)
         monkeypatch.setattr(tools_module, "_run_blocks_and_collect_debug", fake_run_blocks)

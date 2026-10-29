@@ -325,7 +325,10 @@ from skyvern.forge.sdk.workflow.runtime_completion import (
     parse_completion_contract,
 )
 from skyvern.forge.sdk.workflow.runtime_secret_bridge import publish_copilot_runtime_secret_values
-from skyvern.forge.sdk.workflow.secret_encryption import encrypt_workflow_definition_secrets
+from skyvern.forge.sdk.workflow.secret_encryption import (
+    encrypt_workflow_definition_secrets,
+    preserve_workflow_definition_secrets,
+)
 from skyvern.forge.sdk.workflow.sequential_key import (
     REUSE_ADMISSION_OFF_DISABLED,
     REUSE_ADMISSION_OFF_KILL_SWITCH,
@@ -17895,6 +17898,7 @@ class WorkflowService:
             workflow_definition_yaml=request.workflow_definition,
             workflow_id=workflow_id,
         )
+        preserve_workflow_definition_secrets(workflow_definition, None, request.workflow_definition)
         workflow_definition.validate()
         self.validate_workflow_block_graph(workflow_definition)
         self._validate_payload_templates(workflow_definition)
@@ -18123,6 +18127,11 @@ class WorkflowService:
                 allocated_workflow = await insert_version_row(version)
                 built_definition = await self.make_workflow_definition(
                     allocated_workflow.workflow_id,
+                    request.workflow_definition,
+                )
+                preserve_workflow_definition_secrets(
+                    built_definition,
+                    existing_latest_workflow.workflow_definition if existing_latest_workflow is not None else None,
                     request.workflow_definition,
                 )
 

@@ -1,4 +1,5 @@
-from datetime import datetime, timezone
+from datetime import UTC, datetime
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 import yaml
@@ -9,15 +10,20 @@ from skyvern.forge.sdk.copilot.context import CopilotContext
 from skyvern.forge.sdk.copilot.tools.run_execution import _workflow_from_prior_draft
 from skyvern.forge.sdk.copilot.tools.workflow_update import strip_copilot_yaml_headers
 from skyvern.forge.sdk.copilot.workflow_yaml import (
+    _process_workflow_yaml,
     strip_private_workflow_settings,
     workflow_to_copilot_yaml,
 )
 from skyvern.forge.sdk.routes.workflow_copilot import (
     _blockless_submission_fallback,
+    _commit_staged_workflow,
     _ensure_copilot_workflow_yaml,
     _prior_copilot_workflow_yaml,
 )
-from skyvern.forge.sdk.schemas.workflow_copilot import WorkflowCopilotChatRequest
+from skyvern.forge.sdk.schemas.workflow_copilot import (
+    WorkflowCopilotChatRequest,
+    client_visible_proposed_workflow,
+)
 from skyvern.forge.sdk.workflow.models.block import CodeBlock, FileDownloadBlock
 from skyvern.forge.sdk.workflow.models.parameter import OutputParameter, WorkflowParameter, WorkflowParameterType
 from skyvern.forge.sdk.workflow.models.workflow import Workflow, WorkflowDefinition
@@ -85,7 +91,7 @@ def _output_parameter(now: datetime) -> OutputParameter:
 
 
 def _saved_workflow() -> Workflow:
-    now = datetime.now(timezone.utc)
+    now = datetime.now(UTC)
     invoice_date = WorkflowParameter(
         workflow_parameter_id="wp_invoice_date",
         workflow_id="w_saved",
@@ -142,6 +148,91 @@ def test_workflow_to_copilot_yaml_keeps_saved_blocks_without_runtime_fields() ->
     assert "output_parameter" not in blocks[0]
     assert "parameters" not in blocks[0]
     assert all(parameter["parameter_type"] != "output" for parameter in parsed["workflow_definition"]["parameters"])
+
+
+def test_copilot_workflow_outputs_mask_inline_secrets_without_mutating_proposal() -> None:
+    secret = "synthetic-copilot-private-key"
+    proposal = {
+        "workflow_definition": {
+            "blocks": [{"block_type": "file_download", "label": "download", "sftp_private_key": secret}]
+        },
+        "_copilot_yaml": (
+            "workflow_definition:\n  blocks:\n  - block_type: file_download\n"
+            f"    label: download\n    sftp_private_key: {secret}\n"
+        ),
+    }
+
+    visible = client_visible_proposed_workflow(proposal)
+
+    assert visible["workflow_definition"]["blocks"][0]["sftp_private_key"] == "[REDACTED]"
+    assert (
+        yaml.safe_load(visible["_copilot_yaml"])["workflow_definition"]["blocks"][0]["sftp_private_key"] == "[REDACTED]"
+    )
+    assert proposal["workflow_definition"]["blocks"][0]["sftp_private_key"] == secret
+    assert yaml.safe_load(proposal["_copilot_yaml"])["workflow_definition"]["blocks"][0]["sftp_private_key"] == secret
+
+
+def test_workflow_to_copilot_yaml_masks_inline_secrets() -> None:
+    workflow = _saved_workflow()
+    workflow.workflow_definition.blocks[0].sftp_private_key = "synthetic-copilot-yaml-private-key"
+
+    block = yaml.safe_load(workflow_to_copilot_yaml(workflow))["workflow_definition"]["blocks"][0]
+
+    assert block["sftp_private_key"] == "[REDACTED]"
+    assert workflow.workflow_definition.blocks[0].sftp_private_key == "synthetic-copilot-yaml-private-key"
+
+
+@pytest.mark.asyncio
+async def test_copilot_staging_restores_masked_secrets_from_saved_workflow() -> None:
+    saved = _saved_workflow()
+    secret = "synthetic-copilot-staging-private-key"
+    saved.workflow_definition.blocks[0].sftp_private_key = secret
+    saved.workflow_definition.blocks[0].sftp_source_path = "/synthetic/invoice.pdf"
+    client_visible_yaml = workflow_to_copilot_yaml(saved)
+    assert yaml.safe_load(client_visible_yaml)["workflow_definition"]["blocks"][0]["sftp_private_key"] == "[REDACTED]"
+
+    with patch(
+        "skyvern.forge.sdk.copilot.workflow_yaml.app.WORKFLOW_SERVICE.get_workflow_by_permanent_id",
+        AsyncMock(return_value=saved),
+    ):
+        staged = await _process_workflow_yaml(
+            workflow_id=saved.workflow_id,
+            workflow_permanent_id=saved.workflow_permanent_id,
+            organization_id=saved.organization_id,
+            workflow_yaml=client_visible_yaml,
+            settings_fallback_workflow=saved,
+        )
+
+    assert staged.workflow_definition.blocks[0].sftp_private_key == secret
+
+
+@pytest.mark.asyncio
+async def test_copilot_auto_accept_preserves_masked_inline_secrets() -> None:
+    canonical = _saved_workflow()
+    secret = "synthetic-auto-accept-private-key"
+    canonical.workflow_definition.blocks[0].sftp_private_key = secret
+    canonical.workflow_definition.blocks[0].sftp_source_path = "/synthetic/invoice.pdf"
+    staged = canonical.model_copy(deep=True)
+    staged.workflow_definition.blocks[0].sftp_private_key = "[REDACTED]"
+    mock_app = MagicMock()
+    mock_app.DATABASE.workflows.get_workflow_by_permanent_id = AsyncMock(return_value=canonical)
+    mock_app.AGENT_FUNCTION.enforce_folder_access_for_references = AsyncMock()
+    update_workflow = AsyncMock(return_value=canonical)
+    mock_app.WORKFLOW_SERVICE.update_workflow_definition = update_workflow
+
+    with (
+        patch("skyvern.forge.sdk.routes.workflow_copilot.app", mock_app),
+        patch("skyvern.forge.sdk.routes.workflow_copilot.get_request_principal", return_value=None),
+    ):
+        await _commit_staged_workflow(
+            organization_id=canonical.organization_id,
+            workflow_id=canonical.workflow_id,
+            workflow_permanent_id=canonical.workflow_permanent_id,
+            staged_workflow=staged,
+        )
+
+    saved_definition = update_workflow.await_args.kwargs["workflow_definition"]
+    assert saved_definition.blocks[0].sftp_private_key == secret
 
 
 def test_ensure_copilot_workflow_yaml_uses_persisted_workflow_when_request_has_no_blocks() -> None:
@@ -231,7 +322,7 @@ def _code_block_yaml(*, manifest: object = ...) -> str:
 
 
 def test_a_saved_user_owned_goal_reaches_the_copilot_yaml_the_next_turn_reads() -> None:
-    now = datetime.now(timezone.utc)
+    now = datetime.now(UTC)
     workflow = Workflow(
         workflow_id="w_saved",
         organization_id="o_test",

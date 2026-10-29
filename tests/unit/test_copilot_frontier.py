@@ -6,7 +6,8 @@ import asyncio
 import copy
 import json
 from collections.abc import Callable
-from dataclasses import replace
+from contextvars import ContextVar
+from dataclasses import fields, replace
 from datetime import UTC, datetime, timedelta
 from itertools import pairwise
 from pathlib import Path
@@ -26,6 +27,7 @@ from openai.types.responses import Response, ResponseCompletedEvent, ResponseOut
 from skyvern.constants import SCRUBBED_VALUE
 from skyvern.forge import app
 from skyvern.forge.sdk.copilot import agent as agent_module
+from skyvern.forge.sdk.copilot import repair_origin_run as repair_origin_run_module
 from skyvern.forge.sdk.copilot import tools
 from skyvern.forge.sdk.copilot.agent import _verified_workflow_or_none
 from skyvern.forge.sdk.copilot.build_test_connect_failure import BuildTestConnectFailureState
@@ -42,12 +44,20 @@ from skyvern.forge.sdk.copilot.output_utils import (
     summarize_tool_result,
 )
 from skyvern.forge.sdk.copilot.repair_origin_run import (
+    CompletedOutputSource,
+    OriginExecutionSettings,
     OriginOutputRefusal,
+    OriginOutputRefusalDetail,
     OriginOutputSnapshot,
+    OutputSourceKind,
+    RefusedOutputSource,
     RunOutputCarrier,
     SelectedOutputSource,
     bank_completed_outputs,
+    current_named_output_source,
+    origin_block_outputs_from_rows,
     seed_repair_origin_run,
+    use_named_output_source,
 )
 from skyvern.forge.sdk.copilot.request_policy import RequestPolicy
 from skyvern.forge.sdk.copilot.review_gate import workflow_block_fingerprints
@@ -56,7 +66,6 @@ from skyvern.forge.sdk.copilot.session_factory import copilot_session_input_call
 from skyvern.forge.sdk.copilot.tools import (
     _find_invalidated_labels,
     _invalidate_verified_state_on_edit,
-    _plan_frontier,
     _record_workflow_update_result,
     _referenced_output_labels,
 )
@@ -66,6 +75,7 @@ from skyvern.forge.sdk.copilot.tools._shared import (
     _composition_unverified_current_workflow_labels,
     _unverified_current_workflow_labels,
 )
+from skyvern.forge.sdk.copilot.tools.frontier import _plan_frontier
 from skyvern.forge.sdk.copilot.tools.run_execution import (
     _credit_composition_verified_labels,
     _record_run_blocks_result,
@@ -77,12 +87,14 @@ from skyvern.forge.sdk.schemas.workflow_copilot import WorkflowCopilotChatReques
 from skyvern.forge.sdk.schemas.workflow_runs import WorkflowRunBlock
 from skyvern.forge.sdk.workflow.models.parameter import RESERVED_PARAMETER_KEYS
 from skyvern.forge.sdk.workflow.models.workflow import (
+    COPILOT_TEST_WORKFLOW_CREATOR,
     Workflow,
     WorkflowDefinition,
     WorkflowRunOutputParameter,
     WorkflowRunStatus,
 )
 from skyvern.forge.sdk.workflow.workflow_definition_converter import convert_workflow_definition
+from skyvern.schemas.proxy_location import ProxyLocation
 from skyvern.schemas.workflows import BlockType, WorkflowCreateYAMLRequest
 from tests.unit.copilot_test_helpers import (
     INERT_APPROVAL_WORKFLOW_YAML,
@@ -90,12 +102,15 @@ from tests.unit.copilot_test_helpers import (
     ORIGIN_RUN_ID,
     REPAIRED_APPROVAL_WORKFLOW_YAML,
     inert_approval_workflow,
+    install_named_runs,
     install_origin_run,
     install_run_blocks_harness,
     make_copilot_ctx,
     merge_origin_rows,
     origin_block_rows,
+    origin_run_input,
     origin_run_row,
+    recorded_session,
 )
 
 
@@ -6613,9 +6628,11 @@ async def test_same_turn_receipt_rechecks_actual_run_facts_before_dispatch(
     refusals = []
     original_log = frontier_module.logged_origin_refusal
 
-    def record_refusal(detail: Any) -> Any:
+    def record_refusal(
+        detail: OriginOutputRefusalDetail, *, source: OutputSourceKind | None = None
+    ) -> OriginOutputRefusalDetail:
         refusals.append(detail)
-        return original_log(detail)
+        return original_log(detail, source=source)
 
     monkeypatch.setattr(frontier_module, "logged_origin_refusal", record_refusal)
     await run_execution_module._run_blocks_and_collect_debug(
@@ -6688,3 +6705,562 @@ async def test_selected_producer_receipts_share_banked_snapshot_but_seed_is_deta
     seed["approval"]["rows"][0][0] = "mutated"
     value["rows"][0][1] = "caller-mutated"
     assert selected.value["rows"][0][:2] == ["large-output", "large-output"]
+
+
+_CUSTODY_WORKFLOW_YAML = """
+title: task value entry
+workflow_definition:
+  parameters:
+    - parameter_type: workflow
+      workflow_parameter_type: string
+      key: bearer_token
+  blocks:
+    - block_type: navigation
+      label: Open_Tasks
+      url: https://portal.example.com/tasks
+      navigation_goal: Open the task list.
+    - block_type: http_request
+      label: API_call
+      method: GET
+      url: https://api.example.com/tasks
+      headers:
+        Authorization: "Bearer {{ bearer_token }}"
+    - block_type: code
+      label: Filter_Company_Tasks
+      code: |
+        result = {"tasks": json.loads(r'''{{ API_call | tojson }}''')}
+    - block_type: code
+      label: Map_Tasks
+      code: |
+        filtered = json.loads(r'''{{ Filter_Company_Tasks | tojson }}''')
+        result = {"tasks": [{"amount": task["flat_amount"]} for task in filtered["tasks"]]}
+    - block_type: code
+      label: Select_Test_Task
+      code: |
+        result = {"task": json.loads(r'''{{ Map_Tasks | tojson }}''')["tasks"][0]}
+    - block_type: code
+      label: People_Tab
+      code: |
+        task = json.loads(r'''{{ Select_Test_Task.task | tojson }}''')
+        await page.goto("https://portal.example.com/people")
+    - block_type: navigation
+      label: Fill_and_Save
+      navigation_goal: "Enter the value {{ Select_Test_Task.task.amount }} and save it."
+"""
+_CUSTODY_SUFFIX = ["People_Tab", "Fill_and_Save"]
+_SELECTED_TASK = {"task": {"amount": 141}}
+_NAMED_AT = datetime(2026, 10, 28, 19, 48, 44, tzinfo=UTC)
+
+
+def _run_rows(workflow: Workflow, run_id: str, statuses: dict[str, str], value: dict[str, Any]) -> OriginRows:
+    rows = [
+        origin_block_rows(workflow, label, status=status, value=value if label == "Select_Test_Task" else {"ok": 1})
+        for label, status in statuses.items()
+    ]
+    blocks, outputs = merge_origin_rows(*rows)
+    return (
+        [
+            row.model_copy(update={"workflow_run_id": run_id, "created_at": _NAMED_AT + timedelta(seconds=index)})
+            for index, row in enumerate(blocks)
+        ],
+        [row.model_copy(update={"workflow_run_id": run_id}) for row in outputs],
+    )
+
+
+async def _custody_turn(monkeypatch: pytest.MonkeyPatch) -> tuple[CopilotContext, Workflow]:
+    """A Copilot test that seeded Filter_Company_Tasks and ran the edited mapping, and the user's run of the
+    version before the edit; the new turn inherits neither."""
+    monkeypatch.setattr(app.WORKFLOW_SERVICE, "get_workflow_by_permanent_id", AsyncMock(return_value=None))
+    candidate = await inert_approval_workflow(_CUSTODY_WORKFLOW_YAML, workflow_id="w_candidate")
+    test_copy = await inert_approval_workflow(_CUSTODY_WORKFLOW_YAML, workflow_id="w_test_copy")
+    deleted_at = _NAMED_AT + timedelta(seconds=46)
+    test_copy = test_copy.model_copy(
+        update={
+            "created_by": COPILOT_TEST_WORKFLOW_CREATOR,
+            "created_at": _NAMED_AT - timedelta(seconds=1),
+            "deleted_at": deleted_at,
+            "modified_at": deleted_at + timedelta(milliseconds=3),
+        }
+    )
+    user_version = await inert_approval_workflow(
+        _CUSTODY_WORKFLOW_YAML.replace('task["flat_amount"]', 'task["amount"]'), workflow_id="w_user_version"
+    )
+    test_run = origin_run_row(
+        workflow_run_id="wr_named_test",
+        workflow_id=test_copy.workflow_id,
+        copilot_session_id="wcc_chat",
+        browser_session_id="pbs_chat",
+        status=WorkflowRunStatus.failed,
+        created_at=_NAMED_AT,
+    )
+    user_run = origin_run_row(
+        workflow_run_id="wr_user", workflow_id=user_version.workflow_id, browser_session_id="pbs_user"
+    )
+    token = origin_run_input("bearer_token", "token-digest")
+    install_named_runs(
+        monkeypatch,
+        [
+            (
+                test_run,
+                test_copy,
+                _run_rows(
+                    test_copy,
+                    test_run.workflow_run_id,
+                    {"Map_Tasks": "completed", "Select_Test_Task": "completed", "People_Tab": "failed"},
+                    _SELECTED_TASK,
+                ),
+            ),
+            (
+                user_run,
+                user_version,
+                _run_rows(
+                    user_version,
+                    user_run.workflow_run_id,
+                    dict.fromkeys(
+                        ["API_call", "Filter_Company_Tasks", "Map_Tasks", "Select_Test_Task", "People_Tab"],
+                        "completed",
+                    ),
+                    {"task": {"amount": 0}},
+                ),
+            ),
+        ],
+        parameters={"wr_named_test": [token], "wr_user": [token]},
+        sessions=[recorded_session("pbs_chat", proxy_location="RESIDENTIAL"), recorded_session("pbs_user")],
+    )
+    return make_copilot_ctx(workflow_id="w_candidate", browser_session_id="pbs_chat"), candidate
+
+
+@pytest.mark.parametrize("named_run_id", ["wr_named_test", "wr_user", None])
+@pytest.mark.asyncio
+async def test_a_new_turn_tests_downstream_blocks_on_outputs_from_the_run_it_names(
+    monkeypatch: pytest.MonkeyPatch, named_run_id: str | None
+) -> None:
+    ctx, candidate = await _custody_turn(monkeypatch)
+    definition = candidate.workflow_definition
+
+    async with use_named_output_source(ctx, named_run_id):
+        named = current_named_output_source()
+        if named_run_id == "wr_named_test":
+            assert isinstance(named, CompletedOutputSource)
+            assert "Filter_Company_Tasks" not in named.snapshot.outputs
+        labels, seed, start, _ = _plan_frontier(ctx, list(_CUSTODY_SUFFIX), definition, definition)
+        selected = dict(ctx.frontier_selected_output_sources)
+        candidate_settings = await run_execution_module.browser_execution_settings(candidate, ctx, "pbs_chat")
+        dispatch_refusal = frontier_module.selected_output_run_refusal(
+            ctx,
+            selected,
+            candidate,
+            {"bearer_token": "token-digest"},
+            labels[0],
+            execution_settings=candidate_settings,
+        )
+
+    refusal = ctx.frontier_named_output_refusal
+    assert ctx.frontier_origin_output_refusal is None
+    assert (labels, start) == (_CUSTODY_SUFFIX, "People_Tab")
+    assert ctx.frontier_requires_own_browser is False and ctx.frontier_resume_session_id is None
+    if named_run_id == "wr_named_test":
+        assert seed == {"Select_Test_Task": _SELECTED_TASK}
+        assert [source.as_payload() for source in selected.values()] == [
+            {
+                "block_label": "Select_Test_Task",
+                "source_workflow_run_id": "wr_named_test",
+                "source": "named",
+            }
+        ]
+        assert dispatch_refusal is None and ctx.frontier_origin_reused_labels == []
+    else:
+        assert seed == {} and selected == {}
+    if named_run_id == "wr_user":
+        assert refusal is not None
+        assert (refusal.reason, refusal.block_label, refusal.origin_workflow_run_id) == (
+            OriginOutputRefusal.CHANGED_PRODUCER,
+            "Select_Test_Task",
+            "wr_user",
+        )
+    assert (
+        ctx.verified_prefix_labels,
+        ctx.verified_block_outputs,
+        ctx.composition_verified_labels,
+        ctx.untaken_branch_labels,
+    ) == ([], {}, [], {})
+    assert ctx.repair_origin_outputs is None
+    labels, seed, _, _ = _plan_frontier(ctx, list(_CUSTODY_SUFFIX), definition, definition)
+    assert seed == {} and ctx.frontier_selected_output_sources == {}
+
+
+@pytest.mark.asyncio
+async def test_a_run_one_parallel_call_names_is_not_offered_to_its_sibling(monkeypatch: pytest.MonkeyPatch) -> None:
+    ctx, candidate = await _custody_turn(monkeypatch)
+    definition = candidate.workflow_definition
+    named_call_holds_its_run = asyncio.Event()
+    sibling_planned = asyncio.Event()
+
+    async def named_call() -> dict[str, Any]:
+        async with use_named_output_source(ctx, "wr_named_test"):
+            named_call_holds_its_run.set()
+            await sibling_planned.wait()
+            return _plan_frontier(ctx, list(_CUSTODY_SUFFIX), definition, definition)[1]
+
+    async def sibling_call() -> dict[str, Any]:
+        await named_call_holds_its_run.wait()
+        seed = _plan_frontier(ctx, list(_CUSTODY_SUFFIX), definition, definition)[1]
+        sibling_planned.set()
+        return seed
+
+    # The SDK runs each tool call of one model response in its own task, as gather does.
+    named_seed, sibling_seed = await asyncio.gather(named_call(), sibling_call())
+
+    assert named_seed == {"Select_Test_Task": _SELECTED_TASK}
+    assert sibling_seed == {}
+
+
+def _name_output_source(monkeypatch: pytest.MonkeyPatch, source: CompletedOutputSource | RefusedOutputSource) -> None:
+    monkeypatch.setattr(repair_origin_run_module, "_named_output_source", ContextVar("named", default=source))
+
+
+def _approval_source(workflow: Workflow, run_id: str, value: dict[str, Any] | None) -> CompletedOutputSource:
+    rows, outputs = origin_block_rows(workflow, "approval", value=value)
+    snapshot = origin_block_outputs_from_rows(
+        workflow.workflow_definition,
+        [row.model_copy(update={"workflow_run_id": run_id}) for row in rows],
+        [row.model_copy(update={"workflow_run_id": run_id}) for row in outputs],
+    )
+    return CompletedOutputSource(run_id, datetime(2026, 9, 1, tzinfo=UTC), snapshot)
+
+
+@pytest.mark.parametrize(
+    ("named", "banked", "expected_source", "expected_refusal"),
+    [
+        ("value", True, "wr_named", None),
+        ("absent", True, "wr_banked", None),
+        ("refused", True, "wr_banked", None),
+        ("null", True, "wr_banked", None),
+        ("null", False, None, OriginOutputRefusal.OUTPUT_UNAVAILABLE),
+        ("refused", False, None, OriginOutputRefusal.ORIGIN_UNSETTLED),
+    ],
+)
+@pytest.mark.asyncio
+async def test_the_named_run_is_tried_first_and_a_producer_it_cannot_supply_falls_through(
+    monkeypatch: pytest.MonkeyPatch,
+    named: str,
+    banked: bool,
+    expected_source: str | None,
+    expected_refusal: OriginOutputRefusal | None,
+) -> None:
+    monkeypatch.setattr(app.WORKFLOW_SERVICE, "get_workflow_by_permanent_id", AsyncMock(return_value=None))
+    source = await inert_approval_workflow(INERT_APPROVAL_WORKFLOW_YAML, workflow_id="w_source")
+    candidate = await inert_approval_workflow(REPAIRED_APPROVAL_WORKFLOW_YAML, workflow_id="w_candidate")
+    carrier = RunOutputCarrier()
+    if banked:
+        carrier.sources["wr_banked"] = _approval_source(source, "wr_banked", {"from": "banked"})
+    named_sources: dict[str, CompletedOutputSource | RefusedOutputSource] = {
+        "value": _approval_source(source, "wr_named", {"from": "named"}),
+        "null": _approval_source(source, "wr_named", None),
+        "absent": CompletedOutputSource(
+            "wr_named",
+            datetime(2026, 9, 1, tzinfo=UTC),
+            origin_block_outputs_from_rows(source.workflow_definition, [], []),
+        ),
+        "refused": RefusedOutputSource("wr_named", OriginOutputRefusal.ORIGIN_UNSETTLED),
+    }
+    unnamed_ctx = make_copilot_ctx()
+    unnamed_ctx.repair_origin_outputs = replace(carrier, sources=dict(carrier.sources))
+    requested = ["approval", "source_status"]
+    unnamed = _plan_frontier(unnamed_ctx, requested, source.workflow_definition, candidate.workflow_definition)
+    _name_output_source(monkeypatch, named_sources[named])
+    ctx = make_copilot_ctx()
+    ctx.repair_origin_outputs = carrier
+
+    plan = _plan_frontier(ctx, requested, source.workflow_definition, candidate.workflow_definition)
+    labels, seed, start, _ = plan
+
+    if expected_source is not None:
+        assert (labels, start) == (["source_status"], "source_status")
+        assert ctx.frontier_selected_output_sources["approval"].workflow_run_id == expected_source
+        assert seed == {"approval": {"from": expected_source.removeprefix("wr_")}}
+    else:
+        assert plan == unnamed and ctx.frontier_selected_output_sources == {}
+        refusal = ctx.frontier_named_output_refusal
+        assert refusal is not None and (refusal.reason, refusal.origin_workflow_run_id) == (
+            expected_refusal,
+            "wr_named",
+        )
+
+
+@pytest.mark.parametrize(
+    ("run_overrides", "changed"),
+    [
+        ({"browser_session_id": "pbs_named"}, ()),
+        ({"browser_session_id": None, "browser_profile_id": "bp_1"}, ()),
+        ({"browser_session_id": "pbs_named_unloaded", "browser_profile_id": "bp_1"}, ("browser_profile_id",)),
+        ({"browser_session_id": "pbs_named_isp", "proxy_location": ProxyLocation.RESIDENTIAL}, ("proxy_location",)),
+        ({"browser_session_id": "pbs_gone"}, tuple(field.name for field in fields(OriginExecutionSettings))),
+        ({"browser_session_id": "pbs_named", "extra_http_headers": {"X-Env": "one"}}, ("extra_http_headers",)),
+    ],
+    ids=[
+        "same_settings",
+        "no_recorded_session",
+        "named_browser_did_not_load_the_runs_profile",
+        "named_browser_ran_through_another_proxy",
+        "named_browser_row_gone",
+        "header_override",
+    ],
+)
+@pytest.mark.asyncio
+async def test_a_named_runs_settings_are_read_from_its_browser_and_version(
+    monkeypatch: pytest.MonkeyPatch, run_overrides: dict[str, object], changed: tuple[str, ...]
+) -> None:
+    monkeypatch.setattr(app.WORKFLOW_SERVICE, "get_workflow_by_permanent_id", AsyncMock(return_value=None))
+    source = await inert_approval_workflow(INERT_APPROVAL_WORKFLOW_YAML, workflow_id="w_source")
+    candidate = await inert_approval_workflow(REPAIRED_APPROVAL_WORKFLOW_YAML, workflow_id="w_candidate")
+    candidate = candidate.model_copy(update={"extra_http_headers": {"X-Env": "zero"}})
+    source = source.model_copy(update={"extra_http_headers": {"X-Env": "zero"}})
+    run = origin_run_row(workflow_run_id="wr_named", workflow_id="w_source", **run_overrides)
+    install_named_runs(
+        monkeypatch,
+        [(run, source, _run_approval_rows(source, "wr_named"))],
+        parameters={"wr_named": [origin_run_input("request_id", "req-1")]},
+        sessions=[
+            recorded_session("pbs_chat", browser_profile_id="bp_1", browser_profile_loaded=True),
+            recorded_session(
+                "pbs_named", proxy_location="RESIDENTIAL", browser_profile_id="bp_1", browser_profile_loaded=True
+            ),
+            recorded_session("pbs_named_unloaded", proxy_location="RESIDENTIAL", browser_profile_id="bp_1"),
+            recorded_session(
+                "pbs_named_isp",
+                proxy_location=ProxyLocation.RESIDENTIAL_ISP,
+                browser_profile_id="bp_1",
+                browser_profile_loaded=True,
+            ),
+        ],
+    )
+    ctx = make_copilot_ctx(workflow_id="w_candidate", browser_session_id="pbs_chat")
+
+    async with use_named_output_source(ctx, "wr_named"):
+        _plan_frontier(ctx, ["approval", "source_status"], source.workflow_definition, candidate.workflow_definition)
+        refusal = frontier_module.selected_output_run_refusal(
+            ctx,
+            dict(ctx.frontier_selected_output_sources),
+            candidate,
+            {"request_id": "req-1"},
+            "source_status",
+            execution_settings=await run_execution_module.browser_execution_settings(candidate, ctx, "pbs_chat"),
+        )
+
+    assert ctx.frontier_selected_output_sources["approval"].source == "named"
+    if not changed:
+        assert refusal is None
+    else:
+        assert refusal is not None and refusal.as_payload() == {
+            "reason": "changed_execution_settings",
+            "block_label": "approval",
+            "output_key": "approval_output",
+            "origin_workflow_run_id": "wr_named",
+            "changed_settings": list(changed),
+        }
+
+
+def _run_approval_rows(workflow: Workflow, run_id: str) -> OriginRows:
+    rows, outputs = origin_block_rows(workflow, "approval", value={"authorized": True})
+    return (
+        [row.model_copy(update={"workflow_run_id": run_id}) for row in rows],
+        [row.model_copy(update={"workflow_run_id": run_id}) for row in outputs],
+    )
+
+
+@pytest.mark.parametrize(
+    "requested", [_CUSTODY_SUFFIX, ["Select_Test_Task", *_CUSTODY_SUFFIX]], ids=["suffix", "producer_and_suffix"]
+)
+@pytest.mark.parametrize("verified", ["none", "outputs", "prefix_browser"])
+@pytest.mark.parametrize("origin", ["no_carrier", "empty_carrier"])
+@pytest.mark.asyncio
+async def test_a_named_output_demoted_at_dispatch_is_replanned_as_the_call_without_the_name(
+    monkeypatch: pytest.MonkeyPatch, origin: str, verified: str, requested: list[str]
+) -> None:
+    prefix = ["Open_Tasks", "API_call", "Filter_Company_Tasks", "Map_Tasks", "Select_Test_Task"]
+
+    async def turn() -> tuple[CopilotContext, frontier_module.FrontierRequest]:
+        ctx, candidate = await _custody_turn(monkeypatch)
+        definition = candidate.workflow_definition
+        if verified != "none":
+            ctx.verified_prefix_labels = list(prefix)
+            ctx.verified_block_outputs = {"Map_Tasks": {"tasks": [_SELECTED_TASK["task"]]}}
+        if verified == "prefix_browser":
+            _prefix_ran_in(ctx, "pbs_prefix_run", {label: "https://portal.example.com/tasks" for label in prefix})
+        if origin == "empty_carrier":
+            ctx.repair_origin_outputs = RunOutputCarrier()
+        return ctx, frontier_module.FrontierRequest(
+            list(requested), definition, definition, "https://portal.example.com/tasks"
+        )
+
+    def planned(ctx: CopilotContext, plan: frontier_module.FrontierPlan) -> tuple[object, ...]:
+        return (
+            *plan,
+            ctx.frontier_resume_session_id,
+            ctx.frontier_requires_own_browser,
+            [source.as_payload() for source in ctx.frontier_selected_output_sources.values()],
+        )
+
+    unnamed_ctx, request = await turn()
+    unnamed = planned(unnamed_ctx, request.plan(unnamed_ctx))
+
+    ctx, request = await turn()
+    async with use_named_output_source(ctx, "wr_named_test"):
+        plan = request.plan(ctx)
+        selected = dict(ctx.frontier_selected_output_sources)
+        named_label = next(label for label, source in selected.items() if source.source == "named")
+        assert planned(ctx, plan) != unnamed
+        refusal = OriginOutputRefusalDetail(
+            OriginOutputRefusal.CHANGED_INPUT, named_label, "wr_named_test", parameter_key="bearer_token"
+        )
+        replanned_plan = frontier_module.replan_without_named_source(ctx, request, refusal, selected)
+        assert replanned_plan is not None
+        replanned = planned(ctx, replanned_plan)
+        reported = ctx.frontier_named_output_refusal
+
+    assert replanned == unnamed
+    assert reported == refusal
+    labels, seed, _, _ = replanned_plan
+    if "Select_Test_Task" in requested:
+        assert "Select_Test_Task" in labels or "Select_Test_Task" in seed
+    assert all(receipt["source"] != "named" for receipt in replanned[-1])
+
+
+@pytest.mark.parametrize("named", ["value", "refused"])
+@pytest.mark.asyncio
+async def test_a_named_run_is_consulted_before_legacy_verified_outputs(
+    monkeypatch: pytest.MonkeyPatch, named: str
+) -> None:
+    monkeypatch.setattr(app.WORKFLOW_SERVICE, "get_workflow_by_permanent_id", AsyncMock(return_value=None))
+    source = await inert_approval_workflow(INERT_APPROVAL_WORKFLOW_YAML, workflow_id="w_source")
+    candidate = await inert_approval_workflow(REPAIRED_APPROVAL_WORKFLOW_YAML, workflow_id="w_candidate")
+    requested = ["approval", "source_status"]
+
+    def legacy_ctx() -> CopilotContext:
+        ctx = make_copilot_ctx()
+        ctx.verified_block_outputs["approval"] = {"from": "legacy"}
+        return ctx
+
+    unnamed = legacy_ctx()
+    unnamed.repair_origin_outputs = RunOutputCarrier()
+    unnamed_plan = _plan_frontier(unnamed, requested, source.workflow_definition, candidate.workflow_definition)
+    ctx = legacy_ctx()
+    _name_output_source(
+        monkeypatch,
+        RefusedOutputSource("wr_named", OriginOutputRefusal.ORIGIN_UNSETTLED)
+        if named == "refused"
+        else _approval_source(source, "wr_named", {"from": "named"}),
+    )
+    ctx.repair_origin_outputs = RunOutputCarrier()
+
+    labels, seed, _, _ = _plan_frontier(ctx, requested, source.workflow_definition, candidate.workflow_definition)
+
+    refusal = ctx.frontier_named_output_refusal
+    if named == "refused":
+        assert (labels, seed) == (unnamed_plan[0], unnamed_plan[1])
+        assert ctx.frontier_selected_output_sources == {}
+        assert refusal is not None and (refusal.reason, refusal.block_label, refusal.origin_workflow_run_id) == (
+            OriginOutputRefusal.ORIGIN_UNSETTLED,
+            "approval",
+            "wr_named",
+        )
+    else:
+        assert (labels, seed) == (["source_status"], {"approval": {"from": "named"}}) and refusal is None
+        assert ctx.frontier_selected_output_sources["approval"].source == "named"
+
+
+@pytest.mark.parametrize("recheck", ["input", "settings"])
+@pytest.mark.parametrize("named", [True, False])
+@pytest.mark.asyncio
+async def test_a_named_output_refused_at_dispatch_falls_back_to_the_plan_without_it(
+    monkeypatch: pytest.MonkeyPatch, recheck: str, named: bool
+) -> None:
+    await install_run_blocks_harness(
+        monkeypatch, workflow_yaml=REPAIRED_APPROVAL_WORKFLOW_YAML, polled_status="failed", dispatch_to_worker=True
+    )
+    monkeypatch.setattr(app.WORKFLOW_SERVICE, "get_workflow_by_permanent_id", AsyncMock(return_value=None))
+    source = await inert_approval_workflow(INERT_APPROVAL_WORKFLOW_YAML, workflow_id="w_source")
+    candidate = await inert_approval_workflow(REPAIRED_APPROVAL_WORKFLOW_YAML, workflow_id="w_candidate")
+    source.workflow_definition.blocks[0].data_extraction_goal = "Approve {{ request_id }}"
+    candidate.workflow_definition.blocks[0].data_extraction_goal = "Approve {{ request_id }}"
+    ctx = make_copilot_ctx()
+    ctx.browser_session_id = "pbs_chat"
+    rows, outputs = origin_block_rows(source, "approval", value=_APPROVAL_VALUE)
+    carrier = bank_completed_outputs(
+        None,
+        workflow_run_id=ORIGIN_RUN_ID,
+        created_at=datetime(2026, 9, 1, tzinfo=UTC),
+        definition=source.workflow_definition,
+        run_blocks=rows,
+        output_parameter_rows=outputs,
+        seeded_only_labels=frozenset(),
+    )
+    settings = replace(OriginExecutionSettings.of(source), proxy_location=ProxyLocation.RESIDENTIAL_ZA)
+    banked = carrier.sources[ORIGIN_RUN_ID]
+    banked = replace(
+        banked,
+        snapshot=replace(
+            banked.snapshot,
+            definition=source.workflow_definition,
+            input_values={"request_id": "recorded"},
+            settings=settings,
+        ),
+    )
+    carrier.sources[ORIGIN_RUN_ID] = banked
+    if named:
+        _name_output_source(
+            monkeypatch,
+            CompletedOutputSource(
+                "wr_named",
+                datetime(2026, 9, 2, tzinfo=UTC),
+                replace(
+                    banked.snapshot,
+                    input_values={"request_id": "stale" if recheck == "input" else "recorded"},
+                    settings=replace(settings, proxy_location=ProxyLocation.RESIDENTIAL)
+                    if recheck == "settings"
+                    else settings,
+                ),
+            ),
+        )
+    ctx.repair_origin_outputs = carrier
+    request = frontier_module.FrontierRequest(
+        ["approval", "source_status"], source.workflow_definition, candidate.workflow_definition, None
+    )
+    labels, seed, start, _ = request.plan(ctx)
+    assert labels == ["source_status"]
+    assert ctx.frontier_selected_output_sources["approval"].source == ("named" if named else "banked")
+    app.WORKFLOW_SERVICE.create_copilot_dispatch_draft_version.return_value = candidate
+    monkeypatch.setattr(run_execution_module, "acquire_build_test_browser_session", AsyncMock(return_value=None))
+    checked_labels: list[list[str]] = []
+
+    def check_security(_workflow: Workflow, **kwargs: Any) -> dict[str, Any] | None:
+        checked_labels.append(kwargs["labels_to_execute"])
+        return None
+
+    monkeypatch.setattr(run_execution_module, "_runtime_code_security_failure_for_selected_labels", check_security)
+
+    result = await run_execution_module._run_blocks_and_collect_debug(
+        {"block_labels": ["approval", "source_status"], "parameters": {"request_id": "recorded"}},
+        ctx,
+        labels_to_execute=labels,
+        block_outputs_to_seed=seed,
+        frontier_start_label=start,
+        execution_snapshot=run_execution_module._declared_execution_snapshot(candidate),
+        frontier_request=request,
+    )
+
+    data = result["data"]
+    assert checked_labels[-1] == ["source_status"]
+    assert data["reused_block_outputs"] == [
+        {"block_label": "approval", "source_workflow_run_id": ORIGIN_RUN_ID, "source": "banked"}
+    ]
+    assert "origin_output_not_reused" not in data
+    if named:
+        expected = (
+            OriginOutputRefusal.CHANGED_INPUT if recheck == "input" else OriginOutputRefusal.CHANGED_EXECUTION_SETTINGS
+        ).value
+        assert data["named_output_not_reused"]["reason"] == expected
+        assert data["named_output_not_reused"]["origin_workflow_run_id"] == "wr_named"
+    else:
+        assert "named_output_not_reused" not in data

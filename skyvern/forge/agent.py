@@ -376,7 +376,12 @@ from skyvern.webeye.browser_errors import (
     is_context_lost_message,
     is_target_closed_message,
 )
-from skyvern.webeye.browser_state import BrowserState, get_browser_connection_loss, get_browser_state_diagnostic
+from skyvern.webeye.browser_state import (
+    BrowserState,
+    browser_connection_lost_reason,
+    get_browser_connection_loss,
+    get_browser_state_diagnostic,
+)
 from skyvern.webeye.cdp_download_interceptor import (
     STREAM_TO_DISK_THRESHOLD_BYTES,
     DownloadTally,
@@ -494,6 +499,21 @@ async def lost_external_browser_reason(
     return external_browser_failure_reason(
         row, browser_connected=browser_state is not None and browser_state.is_connected()
     )
+
+
+def run_browser_connection_lost_reason(task: Task, browser_state: BrowserState | None) -> str | None:
+    """The run's loss fact, looked up by run id when the caller never bound its own reference.
+
+    ``initialize_execution_state`` raises the already-gone browser out of ``execute_step`` before its
+    ``browser_state`` local is assigned, so that step's failure reason has only the run id to go on.
+    """
+    if browser_state is None:
+        browser_state = (
+            app.BROWSER_MANAGER.get_for_workflow_run(task.workflow_run_id)
+            if task.workflow_run_id
+            else app.BROWSER_MANAGER.get_for_task(task.task_id)
+        )
+    return browser_connection_lost_reason(browser_state)
 
 
 def fail_step_if_browser_already_gone(task: Task, step: Step, browser_state: BrowserState) -> None:
@@ -5448,6 +5468,7 @@ class ForgeAgent:
                 task,
                 step,
                 await lost_external_browser_reason(task.organization_id, browser_session_id, browser_state)
+                or run_browser_connection_lost_reason(task, browser_state)
                 or get_user_facing_exception_message(e),
                 browser_state,
                 exception=e,

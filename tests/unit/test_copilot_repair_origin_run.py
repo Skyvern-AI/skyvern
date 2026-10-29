@@ -7,6 +7,7 @@ would look exactly like a real one.
 
 from __future__ import annotations
 
+import contextlib
 import json
 from dataclasses import dataclass, field, fields
 from datetime import UTC, datetime, timedelta
@@ -24,13 +25,18 @@ from skyvern.forge import app
 from skyvern.forge.sdk.copilot.agent import run_copilot_agent
 from skyvern.forge.sdk.copilot.output_utils import sanitize_tool_result_for_llm
 from skyvern.forge.sdk.copilot.repair_origin_run import (
+    CompletedOutputSource,
     OriginExecutionSettings,
     OriginOutputRefusal,
     OriginOutputSnapshot,
+    RefusedOutputSource,
     RepairOriginRefusal,
+    RunOutputCarrier,
+    current_named_output_source,
     origin_block_outputs_from_rows,
     resolve_repair_origin_binding,
     seed_repair_origin_run,
+    use_named_output_source,
 )
 from skyvern.forge.sdk.copilot.tools import _record_run_blocks_result, get_run_results_tool, run_execution
 from skyvern.forge.sdk.db.agent_db import AgentDB
@@ -39,23 +45,28 @@ from skyvern.forge.sdk.db.models import WorkflowModel, WorkflowRunModel
 from skyvern.forge.sdk.schemas.workflow_copilot import WorkflowCopilotChatRequest
 from skyvern.forge.sdk.workflow.models.parameter import WorkflowParameter
 from skyvern.forge.sdk.workflow.models.workflow import (
+    COPILOT_TEST_WORKFLOW_CREATOR,
     Workflow,
     WorkflowRun,
     WorkflowRunParameter,
     WorkflowRunStatus,
+    workflow_definition_sha256,
 )
 from skyvern.schemas.runs import ProxyLocation
 from tests.unit.copilot_test_helpers import (
     HARNESS_RUN_CREATED_AT,
     INERT_APPROVAL_WORKFLOW_YAML,
     ORIGIN_OUTPUT_SENTINEL,
+    ORIGIN_RUN_CREATED_AT,
     harness_run,
     inert_approval_workflow,
     install_get_run_results_harness,
+    install_named_runs,
     merge_origin_rows,
     origin_block_rows,
     origin_run_input,
     origin_run_row,
+    recorded_session,
     run_result_block_row,
     stub_copilot_agent_loop,
 )
@@ -77,7 +88,7 @@ class _Ctx:
     last_run_binding_unavailable_reason: str | None = None
     repair_origin_input_values: tuple[tuple[WorkflowParameter, WorkflowRunParameter], ...] = field(default=())
     repair_origin_is_copilot_run: bool = False
-    repair_origin_outputs: OriginOutputSnapshot | OriginOutputRefusal | None = None
+    repair_origin_outputs: RunOutputCarrier | OriginOutputSnapshot | OriginOutputRefusal | None = None
     repair_origin_outputs_run_id: str | None = None
 
 
@@ -1112,3 +1123,150 @@ def test_every_workflow_field_is_compared_across_origin_and_test_or_classified_a
 
     assert compared <= set(Workflow.model_fields)
     assert set(Workflow.model_fields) - compared - _WORKFLOW_FIELDS_NOT_COMPARED == set()
+
+
+_NAMED_RUN_CREATED_AT = ORIGIN_RUN_CREATED_AT + timedelta(days=1)
+
+
+def _named_run(**overrides: object) -> WorkflowRun:
+    return origin_run_row(**{"workflow_id": "w_origin", "created_at": _NAMED_RUN_CREATED_AT, **overrides})
+
+
+async def _saved_version(monkeypatch: pytest.MonkeyPatch) -> Workflow:
+    monkeypatch.setattr(app.WORKFLOW_SERVICE, "get_workflow_by_permanent_id", AsyncMock(return_value=None))
+    return await inert_approval_workflow(INERT_APPROVAL_WORKFLOW_YAML, workflow_id="w_origin")
+
+
+def _soft_deleted_test_copy(workflow: Workflow, edited_after_delete: timedelta = timedelta(milliseconds=3)) -> Workflow:
+    deleted_at = _NAMED_RUN_CREATED_AT + timedelta(seconds=45)
+    return workflow.model_copy(
+        update={
+            "created_by": COPILOT_TEST_WORKFLOW_CREATOR,
+            "deleted_at": deleted_at,
+            "modified_at": deleted_at + edited_after_delete,
+        }
+    )
+
+
+@pytest.mark.parametrize(
+    ("run_overrides", "version", "expected"),
+    [
+        ({"copilot_session_id": "wcc_chat"}, "test_copy", None),
+        ({"copilot_session_id": "wcc_chat"}, "test_copy_edited_after_delete", OriginOutputRefusal.OUTPUT_UNAVAILABLE),
+        ({"copilot_session_id": "wcc_chat", "workflow_definition_sha256": "digest"}, "profile_stamped_test_copy", None),
+        (
+            {"copilot_session_id": "wcc_chat", "browser_session_id": None},
+            "profile_stamped_then_soft_deleted_test_copy",
+            None,
+        ),
+        ({"workflow_definition_sha256": "digest"}, "edited_after_run", None),
+        ({"workflow_definition_sha256": "0" * 64}, "saved", OriginOutputRefusal.CHANGED_PRODUCER),
+        ({}, "soft_deleted_saved_version", OriginOutputRefusal.OUTPUT_UNAVAILABLE),
+        ({"debug_session_id": "ds_debugger"}, "saved", None),
+        ({}, "edited_after_run", OriginOutputRefusal.OUTPUT_UNAVAILABLE),
+        ({"workflow_permanent_id": "wfp-other"}, "saved", OriginOutputRefusal.FOREIGN_OR_MISMATCHED_ORIGIN),
+        ({"organization_id": "org-other"}, "saved", OriginOutputRefusal.FOREIGN_OR_MISMATCHED_ORIGIN),
+        ({"status": WorkflowRunStatus.running}, "saved", OriginOutputRefusal.ORIGIN_UNSETTLED),
+        ({"failure_reason": SCRUBBED_VALUE}, "saved", OriginOutputRefusal.OUTPUT_UNAVAILABLE),
+        ({"script_run": {"script_id": "s_cached"}}, "saved", OriginOutputRefusal.CHANGED_EXECUTION_SETTINGS),
+        ({"parent_workflow_run_id": "wr_parent"}, "saved", OriginOutputRefusal.CHANGED_EXECUTION_SETTINGS),
+    ],
+    ids=[
+        "soft_deleted_copilot_test_copy",
+        "test_copy_changed_after_its_soft_delete",
+        "test_copy_another_runs_link_stamped_a_profile_on",
+        "browserless_test_copy_stamped_before_its_soft_delete_hid_the_stamp",
+        "saved_version_settings_edited_after_the_run",
+        "recorded_digest_mismatch",
+        "soft_deleted_saved_version",
+        "debugger_run",
+        "saved_version_edited_after_the_run",
+        "another_workflow",
+        "another_organization",
+        "unfinished",
+        "retention_scrubbed",
+        "cached_script",
+        "child_run",
+    ],
+)
+@pytest.mark.asyncio
+async def test_a_named_run_is_loaded_under_the_origin_rules_for_one_call(
+    monkeypatch: pytest.MonkeyPatch,
+    run_overrides: dict[str, object],
+    version: str,
+    expected: OriginOutputRefusal | None,
+) -> None:
+    saved = await _saved_version(monkeypatch)
+    workflow = {
+        "saved": saved,
+        "test_copy": _soft_deleted_test_copy(saved),
+        "profile_stamped_test_copy": saved.model_copy(
+            update={
+                "created_by": COPILOT_TEST_WORKFLOW_CREATOR,
+                "browser_profile_id": "bp_stamped",
+                "modified_at": _NAMED_RUN_CREATED_AT + timedelta(seconds=30),
+            }
+        ),
+        "profile_stamped_then_soft_deleted_test_copy": _soft_deleted_test_copy(saved).model_copy(
+            update={"browser_profile_id": "bp_stamped"}
+        ),
+        "test_copy_edited_after_delete": _soft_deleted_test_copy(saved, edited_after_delete=timedelta(seconds=1)),
+        "soft_deleted_saved_version": _soft_deleted_test_copy(saved).model_copy(update={"created_by": None}),
+        "edited_after_run": saved.model_copy(update={"modified_at": _NAMED_RUN_CREATED_AT + timedelta(seconds=1)}),
+    }[version]
+    if run_overrides.get("workflow_definition_sha256") == "digest":
+        run_overrides = {
+            **run_overrides,
+            "workflow_definition_sha256": workflow_definition_sha256(saved.workflow_definition),
+        }
+    run = _named_run(**run_overrides)
+    install_named_runs(
+        monkeypatch,
+        [(run, workflow, origin_block_rows(saved, "approval", value={"authorized": True}))],
+        parameters={run.workflow_run_id: [origin_run_input("request_id", "req-1")]},
+        sessions=[recorded_session("pbs_origin")],
+    )
+    ctx = _Ctx(organization_id="org-1", workflow_permanent_id="wfp-1")
+
+    async with use_named_output_source(ctx, run.workflow_run_id):
+        named = current_named_output_source()
+        if expected is None:
+            assert isinstance(named, CompletedOutputSource)
+            assert named.workflow_run_id == run.workflow_run_id
+            assert named.snapshot.outputs["approval"].value == {"authorized": True}
+            assert named.snapshot.input_values == {"request_id": "req-1"}
+            settings = named.snapshot.settings
+            assert (settings is None) == (
+                version
+                in ("profile_stamped_test_copy", "profile_stamped_then_soft_deleted_test_copy", "edited_after_run")
+            )
+            assert settings is None or settings.browser_profile_id is None
+        else:
+            assert named == RefusedOutputSource(run.workflow_run_id, expected)
+        assert ctx.repair_origin_outputs is None
+    assert ctx.repair_origin_outputs is None
+    assert ctx.repair_origin_outputs_run_id is None
+
+
+@pytest.mark.parametrize("raises", [False, True])
+@pytest.mark.asyncio
+async def test_a_named_run_never_outlives_the_call_that_named_it(monkeypatch: pytest.MonkeyPatch, raises: bool) -> None:
+    saved = await _saved_version(monkeypatch)
+    run = _named_run()
+    install_named_runs(monkeypatch, [(run, saved, origin_block_rows(saved, "approval", value={"authorized": True}))])
+    inherited = origin_block_outputs_from_rows(saved.workflow_definition, *origin_block_rows(saved, "approval"))
+    banked = RunOutputCarrier(origin=inherited)
+    banked.sources["wr_banked"] = CompletedOutputSource("wr_banked", _NAMED_RUN_CREATED_AT, inherited)
+
+    for previous in (None, inherited, banked):
+        ctx = _Ctx(organization_id="org-1", workflow_permanent_id="wfp-1", repair_origin_outputs=previous)
+        with pytest.raises(RuntimeError) if raises else contextlib.nullcontext():
+            async with use_named_output_source(ctx, run.workflow_run_id):
+                assert ctx.repair_origin_outputs is previous
+                assert isinstance(current_named_output_source(), CompletedOutputSource)
+                if raises:
+                    raise RuntimeError("the dispatch failed")
+        assert ctx.repair_origin_outputs is previous and current_named_output_source() is None
+        assert ctx.repair_origin_outputs_run_id is None
+        if previous is banked:
+            assert set(banked.sources) == {"wr_banked"}

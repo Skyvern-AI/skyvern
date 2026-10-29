@@ -176,6 +176,7 @@ from skyvern.forge.sdk.copilot.repair_origin_run import (
     RunOutputCarrier,
     SelectedOutputSource,
     bank_completed_outputs,
+    browser_session_settings,
 )
 from skyvern.forge.sdk.copilot.review_gate import workflow_block_fingerprints
 from skyvern.forge.sdk.copilot.run_outcome import (
@@ -250,7 +251,6 @@ from skyvern.forge.sdk.schemas.credentials import CredentialVaultType
 from skyvern.forge.sdk.schemas.persistent_browser_sessions import (
     FreshExitOutcome,
     FreshExitReceipt,
-    PersistentBrowserSession,
 )
 from skyvern.forge.sdk.schemas.workflow_copilot import (
     WorkflowCopilotRunOutcomeUpdate,
@@ -344,11 +344,13 @@ from .credentials import (
     _server_verified_google_account_choices,
 )
 from .frontier import (
+    FrontierRequest,
     _anchored_plan,
     _workflow_with_runtime_block_goal_context,
     _workflow_with_runtime_frontier_anchor,
     _workflow_with_runtime_frontier_starter_url_seed,
     logged_origin_refusal,
+    replan_without_named_source,
     selected_output_run_refusal,
 )
 from .guardrails import (
@@ -2238,6 +2240,7 @@ class _RunExecution:
     reused_origin_output_labels: list[str] = dataclass_field(default_factory=list)
     origin_workflow_run_id: str | None = None
     origin_output_not_reused: OriginOutputRefusalDetail | None = None
+    named_output_not_reused: OriginOutputRefusalDetail | None = None
     proposal_owner_turn_id: str | None = None
     proposal_revision: int | None = None
     outcome: RecordedRunOutcome | None = None
@@ -3684,28 +3687,13 @@ def _build_test_seed_preview_run(workflow: Workflow, organization_id: str) -> Wo
     )
 
 
-async def _browser_execution_settings(
+async def browser_execution_settings(
     workflow: Workflow, ctx: AgentContext, session_id: str | None
 ) -> OriginExecutionSettings | None:
     """Actual session settings; absent or unreadable session facts remain unproven."""
     if session_id is None:
         return None
-    try:
-        session = await app.PERSISTENT_SESSIONS_MANAGER.get_session(session_id, ctx.organization_id)
-    except Exception as exc:  # noqa: BLE001 - unavailable observations are unproven, never authored defaults.
-        LOG.info("copilot_output_session_settings_unavailable", error_type=type(exc).__name__)
-        return None
-    if (
-        not isinstance(session, PersistentBrowserSession)
-        or session.organization_id != ctx.organization_id
-        or session.persistent_browser_session_id != session_id
-    ):
-        return None
-    return replace(
-        OriginExecutionSettings.of(workflow),
-        proxy_location=runtime_proxy_location(session.proxy_location),
-        browser_profile_id=session.browser_profile_id if session.browser_profile_loaded else None,
-    )
+    return await browser_session_settings(workflow, ctx.organization_id, session_id)
 
 
 async def _seed_profile_applied(organization_id: str, session_id: str, browser_profile_id: str) -> bool:
@@ -3997,6 +3985,11 @@ def _attach_reused_origin_outputs(data: dict[str, Any], execution: _RunExecution
         data["origin_workflow_run_id"] = execution.origin_workflow_run_id
     if execution.origin_output_not_reused is not None:
         data["origin_output_not_reused"] = execution.origin_output_not_reused.as_payload()
+    if (
+        execution.named_output_not_reused is not None
+        and execution.named_output_not_reused != execution.origin_output_not_reused
+    ):
+        data["named_output_not_reused"] = execution.named_output_not_reused.as_payload()
 
 
 async def _run_blocks_and_collect_debug(
@@ -4014,6 +4007,7 @@ async def _run_blocks_and_collect_debug(
     new_exit: bool = False,
     verified_new_exit: FreshExitReceipt | None = None,
     chat_browser_opened_before_retry: bool = False,
+    frontier_request: FrontierRequest | None = None,
 ) -> dict[str, Any]:
     """With ``new_exit``, run in a browser whose network exit is verified to differ from the most recent build
     test's; the model cannot choose or verify an exit, so the platform supplies it or says why it cannot."""
@@ -4041,6 +4035,7 @@ async def _run_blocks_and_collect_debug(
         "initial" if explicit_blank else ctx.frontier_start_provenance or "unanchored"
     )
     origin_output_refusal = None if explicit_blank else ctx.frontier_origin_output_refusal
+    named_output_refusal = None if explicit_blank else ctx.frontier_named_output_refusal
     selected_output_sources = {} if explicit_blank else dict(ctx.frontier_selected_output_sources)
     reused_origin_output_labels = [] if explicit_blank else list(ctx.frontier_origin_reused_labels)
     if not explicit_blank:
@@ -4048,6 +4043,7 @@ async def _run_blocks_and_collect_debug(
         ctx.frontier_requires_own_browser = False
         ctx.frontier_start_provenance = None
         ctx.frontier_origin_output_refusal = None
+        ctx.frontier_named_output_refusal = None
         ctx.frontier_origin_reused_labels = []
         ctx.frontier_selected_output_sources = {}
 
@@ -4150,6 +4146,30 @@ async def _run_blocks_and_collect_debug(
             execution_settings=None,
             check_settings=False,
         )
+        if (
+            origin_output_refusal is not None
+            and (
+                replanned := replan_without_named_source(
+                    ctx, frontier_request, origin_output_refusal, selected_output_sources
+                )
+            )
+            is not None
+        ):
+            return await _run_blocks_and_collect_debug(
+                params,
+                ctx,
+                labels_to_execute=replanned[0],
+                block_outputs_to_seed=replanned[1],
+                frontier_start_label=replanned[2],
+                force_fresh_session=force_fresh_session,
+                execution_snapshot=snapshot,
+                explicit_blank=explicit_blank,
+                use_ephemeral_inputs=use_ephemeral_inputs,
+                new_exit=new_exit,
+                verified_new_exit=verified_new_exit,
+                chat_browser_opened_before_retry=chat_browser_opened_before_retry,
+                frontier_request=frontier_request,
+            )
     if origin_output_refusal is not None and selected_output_sources:
         execution.selected_output_sources = {}
         execution.reused_origin_output_labels = []
@@ -4166,6 +4186,7 @@ async def _run_blocks_and_collect_debug(
         ctx.last_executed_block_labels = list(labels_to_execute)
         ctx.last_frontier_start_label = frontier_start_label
     execution.origin_output_not_reused = origin_output_refusal
+    execution.named_output_not_reused = named_output_refusal
 
     workflow_definition = workflow.workflow_definition
     finally_block_label = (
@@ -4568,7 +4589,7 @@ async def _run_blocks_and_collect_debug(
     # happen before this call's own cancellation is delivered.
     turn_deadline = ctx.model_stream_deadline
     try:
-        execution.recorded_settings = await _browser_execution_settings(workflow, ctx, run_session_id)
+        execution.recorded_settings = await browser_execution_settings(workflow, ctx, run_session_id)
 
         seeded_runtime_workflow = await _workflow_with_runtime_frontier_starter_url_seed(
             runtime_workflow,
@@ -4689,7 +4710,12 @@ async def _run_blocks_and_collect_debug(
                         else execution.origin_workflow_run_id
                     ),
                     parameter_key=unchecked_parameter_keys[0],
-                )
+                ),
+                source=(
+                    next(iter(execution.selected_output_sources.values())).source
+                    if execution.selected_output_sources
+                    else None
+                ),
             )
         if refusal is not None:
             # Persistence follows the browser-derived starter URL. Nothing has executed yet:
@@ -4707,11 +4733,19 @@ async def _run_blocks_and_collect_debug(
             ctx.frontier_origin_reused_labels = []
             ctx.frontier_resume_session_id = None
             ctx.frontier_requires_own_browser = False
-            requested_labels, requested_seed, requested_start, requested_provenance = _anchored_plan(
-                ctx, (list(block_labels), {}, block_labels[0]), workflow.workflow_definition, None, list(block_labels)
-            )
-            ctx.frontier_start_provenance = requested_provenance
-            ctx.frontier_origin_output_refusal = refusal
+            replanned = replan_without_named_source(ctx, frontier_request, refusal, execution.selected_output_sources)
+            if replanned is None:
+                replanned = _anchored_plan(
+                    ctx,
+                    (list(block_labels), {}, block_labels[0]),
+                    workflow.workflow_definition,
+                    None,
+                    list(block_labels),
+                )
+                ctx.frontier_start_provenance = replanned[3]
+                ctx.frontier_origin_output_refusal = refusal
+                ctx.frontier_named_output_refusal = execution.named_output_not_reused
+            requested_labels, requested_seed, requested_start, _ = replanned
             return await _run_blocks_and_collect_debug(
                 params,
                 ctx,
@@ -4726,6 +4760,7 @@ async def _run_blocks_and_collect_debug(
                 new_exit=new_exit,
                 verified_new_exit=new_exit_receipt,
                 chat_browser_opened_before_retry=chat_browser_opened_for_run,
+                frontier_request=frontier_request,
             )
 
         execution.dispatched_input_values = copy.deepcopy(data)

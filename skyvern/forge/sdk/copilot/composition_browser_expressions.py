@@ -635,7 +635,12 @@ const renderedText = (el) => {
   const own = String(el.textContent || '');
   let scripts; try { scripts = Array.from(el.querySelectorAll('script,style')); } catch (e) { scripts = []; }
   let text = own;
-  for (const dead of scripts) text = text.split(String(dead.textContent || '')).join(' ');
+  // An empty separator splits per character, so join(' ') would double the text once per empty script or
+  // style until the renderer itself crashes, which no try/catch here can catch.
+  for (const dead of scripts) {
+    const deadText = String(dead.textContent || '');
+    if (deadText) text = text.split(deadText).join(' ');
+  }
   return (text + parts).split(/\s+/).join(' ').trim();
 };
 const untruncatedText = renderedText;

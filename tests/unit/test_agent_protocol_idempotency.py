@@ -73,11 +73,15 @@ class IdempotencyLab:
     organization: Organization
     calls: dict[str, int] = field(default_factory=dict)
 
-    async def create(self, key: str | None = None) -> httpx.Response:
+    async def create(
+        self,
+        key: str | None = None,
+        payload: dict[str, Any] = WORKFLOW_CREATE_PAYLOAD,
+    ) -> httpx.Response:
         # Raw latin-1 bytes: httpx refuses non-ASCII str header values, but the ASGI layer decodes
         # header bytes as latin-1, so this reproduces exactly what reaches the route on the wire.
         headers = [] if key is None else [(b"Idempotency-Key", key.encode("latin-1"))]
-        return await self.client.post("/v1/agents", headers=headers, json=WORKFLOW_CREATE_PAYLOAD)
+        return await self.client.post("/v1/agents", headers=headers, json=payload)
 
     async def count_workflows(self) -> int | None:
         async with self.database.Session() as session:
@@ -248,6 +252,38 @@ async def test_create_workflow_accepts_idempotency_key_within_bounds(
             assert await lab.count_workflows() == 1
             # Counters the rejection tests assert are empty; an accepted key must trip every one.
             assert set(lab.calls) == {"analytics", "hash", "lookup", "title", "lock", "create"}
+
+
+@pytest.mark.asyncio
+async def test_idempotent_create_rejects_masked_inline_secrets(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    payload = {
+        "json_definition": {
+            "title": "Masked secret import",
+            "workflow_definition": {
+                "parameters": [],
+                "blocks": [
+                    {
+                        "label": "download_file",
+                        "block_type": "file_download",
+                        "navigation_goal": "Download the file",
+                        "download_target": "sftp",
+                        "sftp_host": "sftp.example.invalid",
+                        "sftp_username": "synthetic-user",
+                        "sftp_private_key": "[REDACTED]",
+                    }
+                ],
+            },
+        }
+    }
+    async with idempotency_lab(monkeypatch, tmp_path / "masked-secret-create.db") as lab:
+        response = await lab.create("masked-secret-key", payload)
+
+        assert response.status_code == 422
+        assert "Re-enter the secret" in response.json()["detail"]
+        assert await lab.count_workflows() == 0
 
 
 @pytest.mark.asyncio

@@ -19,10 +19,12 @@ logs, though a test run's own output can echo one like any run input.
 
 from __future__ import annotations
 
-from collections.abc import Iterable
+from collections.abc import AsyncIterator, Iterable
+from contextlib import asynccontextmanager
+from contextvars import ContextVar
 from copy import deepcopy
 from dataclasses import dataclass, field, replace
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from enum import StrEnum
 from typing import Any, Literal, Protocol
 
@@ -33,15 +35,18 @@ from skyvern.exceptions import WorkflowRunNotFound
 from skyvern.forge import app
 from skyvern.forge.failure_classifier import without_output_only_labels
 from skyvern.forge.sdk.api.files import is_uploaded_file_id
+from skyvern.forge.sdk.schemas.persistent_browser_sessions import PersistentBrowserSession
 from skyvern.forge.sdk.schemas.workflow_runs import WorkflowRunBlock
 from skyvern.forge.sdk.workflow.models.parameter import WorkflowParameter
 from skyvern.forge.sdk.workflow.models.workflow import (
+    COPILOT_TEST_WORKFLOW_CREATOR,
     Workflow,
     WorkflowDefinition,
     WorkflowRun,
     WorkflowRunOutputParameter,
     WorkflowRunParameter,
     WorkflowRunStatus,
+    workflow_definition_sha256,
 )
 from skyvern.schemas.proxy_location import ResolvedProxyLocationInput, runtime_proxy_location
 from skyvern.services.uploaded_file_service import resolve_file_reference
@@ -148,11 +153,14 @@ class CompletedOutputSource:
     snapshot: OriginOutputSnapshot = field(repr=False)
 
 
+OutputSourceKind = Literal["verified", "banked", "origin", "named"]
+
+
 @dataclass(frozen=True, slots=True)
 class SelectedOutputSource:
     block_label: str
     workflow_run_id: str
-    source: Literal["verified", "banked", "origin"]
+    source: OutputSourceKind
     snapshot: OriginOutputSnapshot = field(repr=False)
 
     @property
@@ -167,11 +175,32 @@ class SelectedOutputSource:
         }
 
 
+@dataclass(frozen=True, slots=True)
+class RefusedOutputSource:
+    workflow_run_id: str
+    reason: OriginOutputRefusal
+
+
 @dataclass(slots=True)
 class RunOutputCarrier:
     origin: OriginOutputSnapshot | OriginOutputRefusal | None = field(default=None, repr=False)
     sources: dict[str, CompletedOutputSource] = field(default_factory=dict, repr=False)
     verified_sources: dict[str, SelectedOutputSource] = field(default_factory=dict, repr=False)
+
+
+# Task-local rather than on the shared turn context: the SDK runs each parallel tool call in its own task, so a
+# run one call names is never offered to a sibling. Never banked or credited.
+_named_output_source: ContextVar[CompletedOutputSource | RefusedOutputSource | None] = ContextVar(
+    "copilot_named_output_source", default=None
+)
+
+
+def current_named_output_source() -> CompletedOutputSource | RefusedOutputSource | None:
+    return _named_output_source.get()
+
+
+def drop_named_output_source() -> None:
+    _named_output_source.set(None)
 
 
 OutputCarrier = RunOutputCarrier | OriginOutputSnapshot | OriginOutputRefusal | None
@@ -403,12 +432,81 @@ def _as_utc(value: datetime) -> datetime:
     return value if value.tzinfo is not None else value.replace(tzinfo=UTC)
 
 
+# soft_delete_workflow_by_id stamps deleted_at in the same UPDATE whose onupdate stamps modified_at.
+_SOFT_DELETE_STAMP_TOLERANCE = timedelta(milliseconds=50)
+
+
+def _row_unchanged_since_run(run_workflow: Workflow, run: WorkflowRun) -> bool:
+    run_created_at = _as_utc(run.created_at)
+    modified_at = _as_utc(run_workflow.modified_at)
+    if modified_at <= run_created_at:
+        return True
+    return (
+        run_workflow.created_by == COPILOT_TEST_WORKFLOW_CREATOR
+        and run_workflow.deleted_at is not None
+        and _as_utc(run_workflow.deleted_at) > run_created_at
+        and abs(modified_at - _as_utc(run_workflow.deleted_at)) <= _SOFT_DELETE_STAMP_TOLERANCE
+    )
+
+
+def _named_version_refusal(run_workflow: Workflow, run: WorkflowRun) -> OriginOutputRefusal | None:
+    """The digest the run recorded proves its definition; without one, a test version's soft delete must be
+    its only change after the run."""
+    if run.workflow_definition_sha256 is not None:
+        current = workflow_definition_sha256(run_workflow.workflow_definition)
+        return None if current == run.workflow_definition_sha256 else OriginOutputRefusal.CHANGED_PRODUCER
+    return None if _row_unchanged_since_run(run_workflow, run) else OriginOutputRefusal.OUTPUT_UNAVAILABLE
+
+
+async def browser_session_settings(
+    workflow: Workflow, organization_id: str, session_id: str, run: WorkflowRun | None = None
+) -> OriginExecutionSettings | None:
+    """The proxy and loaded profile of the browser itself; absent or unreadable session facts remain unproven."""
+    try:
+        session = await app.PERSISTENT_SESSIONS_MANAGER.get_session(session_id, organization_id)
+    except Exception as exc:  # noqa: BLE001 - unavailable observations are unproven, never authored defaults.
+        LOG.info("copilot_output_session_settings_unavailable", error_type=type(exc).__name__)
+        return None
+    if (
+        not isinstance(session, PersistentBrowserSession)
+        or session.organization_id != organization_id
+        or session.persistent_browser_session_id != session_id
+    ):
+        return None
+    return replace(
+        OriginExecutionSettings.of(workflow, run),
+        proxy_location=runtime_proxy_location(session.proxy_location),
+        browser_profile_id=session.browser_profile_id if session.browser_profile_loaded else None,
+    )
+
+
+async def _named_run_settings(
+    run_workflow: Workflow, run: WorkflowRun, organization_id: str
+) -> OriginExecutionSettings | None:
+    # The digest proves only the definition; the version's settings columns can be rewritten in place.
+    if not _row_unchanged_since_run(run_workflow, run):
+        return None
+    # A session-bound run's row repeats the version's proxy, not the one its browser was launched with.
+    if run.browser_session_id is not None:
+        return await browser_session_settings(run_workflow, organization_id, run.browser_session_id, run)
+    # link_workflow_browser_profile_if_unset stamps only live versions, so a test version's stamp always lands
+    # before its soft delete, which then hides it; a version profile the run row did not record is unproven.
+    if (
+        run.browser_profile_id is None
+        and run_workflow.browser_profile_id is not None
+        and _as_utc(run_workflow.modified_at) > _as_utc(run.created_at)
+    ):
+        return None
+    return OriginExecutionSettings.of(run_workflow, run)
+
+
 async def _load_origin_outputs(
     binding: RepairOriginBinding,
     *,
     workflow_run_id: str,
     organization_id: str,
     run_parameters: list[tuple[WorkflowParameter, WorkflowRunParameter]] | None,
+    named: bool = False,
 ) -> OriginOutputSnapshot | OriginOutputRefusal:
     if binding.refusal is not None and binding.refusal is not RepairOriginRefusal.NO_RECORDED_BROWSER:
         return _BINDING_REFUSAL_TO_OUTPUT_REFUSAL.get(binding.refusal, OriginOutputRefusal.OUTPUT_UNAVAILABLE)
@@ -423,12 +521,23 @@ async def _load_origin_outputs(
     ):
         return OriginOutputRefusal.OUTPUT_UNAVAILABLE
     try:
-        origin_workflow = await app.DATABASE.workflows.get_workflow(
-            workflow_id=binding.run.workflow_id, organization_id=organization_id
+        # A Copilot test version is soft-deleted once its run ends, so a named run reads its version deleted or not.
+        origin_workflow = (
+            await app.DATABASE.workflows.get_workflow_for_workflow_run(
+                workflow_run_id=workflow_run_id, organization_id=organization_id, filter_deleted=False
+            )
+            if named
+            else await app.DATABASE.workflows.get_workflow(
+                workflow_id=binding.run.workflow_id, organization_id=organization_id
+            )
         )
+        if origin_workflow is None:
+            return OriginOutputRefusal.OUTPUT_UNAVAILABLE
+        if named and (version_refusal := _named_version_refusal(origin_workflow, binding.run)) is not None:
+            return version_refusal
         # Auto-accept overwrites a version in place, so a row changed after the run started may no
         # longer be the definition the run executed.
-        if origin_workflow is None or _as_utc(origin_workflow.modified_at) > _as_utc(binding.run.created_at):
+        if not named and _as_utc(origin_workflow.modified_at) > _as_utc(binding.run.created_at):
             return OriginOutputRefusal.OUTPUT_UNAVAILABLE
         # A test of selected blocks never loads a cached script, so an output a script produced is not
         # what the test's agent run of the same block would produce. `script_run` records that a script
@@ -450,7 +559,11 @@ async def _load_origin_outputs(
             run_blocks,
             output_parameter_rows,
             input_values={parameter.key: run_parameter.value for parameter, run_parameter in run_parameters},
-            settings=OriginExecutionSettings.of(origin_workflow, binding.run),
+            settings=(
+                await _named_run_settings(origin_workflow, binding.run, organization_id)
+                if named
+                else OriginExecutionSettings.of(origin_workflow, binding.run)
+            ),
         )
     except Exception as exc:
         # No exc_info: a row that fails to parse is quoted in its own exception message.
@@ -460,6 +573,60 @@ async def _load_origin_outputs(
             error_type=type(exc).__name__,
         )
         return OriginOutputRefusal.OUTPUT_UNAVAILABLE
+
+
+async def _load_named_output_source(
+    ctx: RepairTurnContext, workflow_run_id: str
+) -> CompletedOutputSource | RefusedOutputSource:
+    try:
+        binding = await resolve_repair_origin_binding(
+            workflow_run_id=workflow_run_id,
+            organization_id=ctx.organization_id,
+            workflow_permanent_id=ctx.workflow_permanent_id,
+        )
+        run_parameters = (
+            await app.DATABASE.workflow_runs.get_workflow_run_parameters(workflow_run_id=workflow_run_id)
+            if binding.refusal in (None, RepairOriginRefusal.NO_RECORDED_BROWSER)
+            else None
+        )
+    except Exception as exc:
+        LOG.warning(
+            "copilot_named_output_source_unavailable", workflow_run_id=workflow_run_id, error_type=type(exc).__name__
+        )
+        return RefusedOutputSource(workflow_run_id, OriginOutputRefusal.OUTPUT_UNAVAILABLE)
+    loaded = await _load_origin_outputs(
+        binding,
+        workflow_run_id=workflow_run_id,
+        organization_id=ctx.organization_id,
+        run_parameters=run_parameters,
+        named=True,
+    )
+    if isinstance(loaded, OriginOutputRefusal) or binding.run is None:
+        return RefusedOutputSource(
+            workflow_run_id,
+            loaded if isinstance(loaded, OriginOutputRefusal) else OriginOutputRefusal.OUTPUT_UNAVAILABLE,
+        )
+    return CompletedOutputSource(workflow_run_id, _as_utc(binding.run.created_at), loaded)
+
+
+@asynccontextmanager
+async def use_named_output_source(ctx: RepairTurnContext, workflow_run_id: str | None) -> AsyncIterator[None]:
+    """Offer a run the model named as the first output source for the duration of one tool call."""
+    if not workflow_run_id:
+        yield
+        return
+    named = await _load_named_output_source(ctx, workflow_run_id)
+    LOG.info(
+        "copilot_named_output_source",
+        workflow_run_id=workflow_run_id,
+        refusal=named.reason.value if isinstance(named, RefusedOutputSource) else None,
+        output_labels=sorted(named.snapshot.outputs) if isinstance(named, CompletedOutputSource) else [],
+    )
+    token = _named_output_source.set(named)
+    try:
+        yield
+    finally:
+        _named_output_source.reset(token)
 
 
 async def seed_repair_origin_run(ctx: RepairTurnContext, *, workflow_run_id: str | None) -> RepairOriginBinding:
