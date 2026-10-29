@@ -32,6 +32,7 @@ from skyvern.forge.sdk.copilot.credential_generation import (
 from skyvern.forge.sdk.copilot.credential_pause import (
     RAW_SECRET_CONNECTED_NEXT,
     CredentialPauseResolution,
+    SignedInProfile,
     credential_pause_transport_ready,
     defang_card_text,
     raw_secret_card_origin,
@@ -49,6 +50,7 @@ from skyvern.forge.sdk.copilot.credential_resolution import (
 from skyvern.forge.sdk.copilot.loop_detection import record_tool_step_result_for_ctx
 from skyvern.forge.sdk.copilot.page_identity import safe_page_origin
 from skyvern.forge.sdk.copilot.request_policy import (
+    CREDENTIAL_BINDING_FACTS,
     DemonstrationNavigationSiteURLSource,
     QuestionResponseSiteURLSource,
     RequestPolicy,
@@ -57,6 +59,7 @@ from skyvern.forge.sdk.copilot.request_policy import (
     UserMessageSiteURLSource,
     admit_connected_vault_login_for_live_page,
     admit_credential_for_live_page,
+    credential_binding,
     loggable_origin,
 )
 from skyvern.forge.sdk.copilot.runtime import (
@@ -767,7 +770,11 @@ async def _request_credential(
             "next": "A credential card is already open; its answer returns on the call that opened it.",
         }
     if update_ask and copilot_ctx.credential_totp_update_asked:
-        return {"ok": True, "status": "already_asked", "next": "Continue without re-asking this turn."}
+        return {
+            "ok": True,
+            "status": "already_asked",
+            "detail": "An update card was already shown this turn; another one cannot open until the next turn.",
+        }
 
     config = copilot_ctx.copilot_config
     if config is None or not credential_pause_transport_ready(copilot_ctx, config):
@@ -814,10 +821,17 @@ async def _request_credential(
             _decline_credential_origin_recovery(copilot_ctx, recovery, "error")
         raise
     credential = resolution.credential if resolution is not None else None
-    if update_name is not None and site_rejected:
-        return _rejected_credential_ask_outcome(credential, update_name, answered=resolution)
-    if update_name is not None:
-        return await _missing_totp_ask_outcome(copilot_ctx, credential, update_name, answered=resolution)
+    if update_name is not None and credential_id:
+        if resolution is not None and resolution.signed_in is not None:
+            signed_in = _signed_in_result(resolution.signed_in)
+            binding = CREDENTIAL_BINDING_FACTS[credential_binding(policy, credential_id)]
+            signed_in["detail"] += f" {defang_card_text(update_name)} was not updated. {binding}"
+            return signed_in
+        if site_rejected:
+            return _rejected_credential_ask_outcome(credential, update_name, credential_id, policy, answered=resolution)
+        return await _missing_totp_ask_outcome(
+            copilot_ctx, credential, update_name, credential_id, policy, answered=resolution
+        )
     if recovery is not None:
         bound_origin = (
             canonicalize_origin(policy.live_page_admitted_urls.get(credential.credential_id))
@@ -859,16 +873,7 @@ async def _request_credential(
             )
         return unanswered
     if resolution.signed_in is not None:
-        return {
-            "ok": True,
-            "status": "signed_in",
-            "site": resolution.signed_in.site,
-            "browser_profile_id": resolution.signed_in.browser_profile_id,
-            "browser_profile_name": defang_card_text(resolution.signed_in.profile_name),
-            "cookie_count": resolution.signed_in.cookie_count,
-            "credential_provided": False,
-            "detail": signed_in_facts(resolution.signed_in),
-        }
+        return _signed_in_result(resolution.signed_in)
     if resolution.action == "connected" and credential is None:
         return {
             "ok": True,
@@ -906,21 +911,37 @@ async def _request_credential(
     return connected
 
 
+def _signed_in_result(signed_in: SignedInProfile) -> dict[str, Any]:
+    return {
+        "ok": True,
+        "status": "signed_in",
+        "site": signed_in.site,
+        "browser_profile_id": signed_in.browser_profile_id,
+        "browser_profile_name": defang_card_text(signed_in.profile_name),
+        "cookie_count": signed_in.cookie_count,
+        "credential_provided": False,
+        "detail": signed_in_facts(signed_in),
+    }
+
+
 async def _missing_totp_ask_outcome(
     copilot_ctx: CopilotContext,
     credential: Credential | None,
     credential_name: str,
+    credential_id: str,
+    policy: RequestPolicy,
     *,
     answered: CredentialPauseResolution | None,
 ) -> dict[str, Any]:
     """Report the update card from the saved record, never from the answer alone: a save can leave 2FA unset."""
-    not_added_next = (
-        f"{defang_card_text(credential_name)} still has no authenticator. Keep it as the workflow's credential "
-        "and do not ask again this turn. The verification step needs an authenticator on that credential "
-        "before a run can pass it."
-    )
+    name = defang_card_text(credential_name)
+    binding = CREDENTIAL_BINDING_FACTS[credential_binding(policy, credential_id)]
     if credential is None:
-        return {"ok": True, "status": "unanswered" if answered is None else "skipped", "next": not_added_next}
+        return {
+            "ok": True,
+            "status": "unanswered" if answered is None else "skipped",
+            "detail": f"{name} was not updated. It still has no authenticator. {binding}",
+        }
     still_missing_name, rechecked = await _update_ask_target(copilot_ctx, credential.credential_id)
     if rechecked is None:
         return {
@@ -928,37 +949,40 @@ async def _missing_totp_ask_outcome(
             "status": "saved_without_authenticator",
             "credential_id": credential.credential_id,
             "credential_name": still_missing_name,
-            "next": not_added_next,
+            "detail": f"{name} was saved but still has no authenticator. {binding}",
         }
     if rechecked.get("status") != "has_code_method":
         return rechecked
     return {
         **rechecked,
         "status": "authenticator_added",
-        "detail": "The saved credential now has a one-time-code method.",
+        "detail": f"The saved credential now has a one-time-code method. {binding}",
         "credential_id": credential.credential_id,
         "credential_name": credential.name,
     }
 
 
 def _rejected_credential_ask_outcome(
-    credential: Credential | None, credential_name: str, *, answered: CredentialPauseResolution | None
+    credential: Credential | None,
+    credential_name: str,
+    credential_id: str,
+    policy: RequestPolicy,
+    *,
+    answered: CredentialPauseResolution | None,
 ) -> dict[str, Any]:
+    binding = CREDENTIAL_BINDING_FACTS[credential_binding(policy, credential_id)]
     if credential is None:
         return {
             "ok": True,
             "status": "unanswered" if answered is None else "skipped",
-            "next": (
-                f"{defang_card_text(credential_name)} was not updated. Keep it as the workflow's credential and "
-                "do not ask again this turn. The workflow keeps its saved sign-in."
-            ),
+            "detail": f"{defang_card_text(credential_name)} was not updated. {binding}",
         }
     return {
         "ok": True,
         "status": "updated",
         "credential_id": credential.credential_id,
         "credential_name": credential.name,
-        "next": "The user saved this credential. Re-run the sign-in block to test the updated values.",
+        "detail": f"The user saved new values for {defang_card_text(credential.name)}. {binding}",
     }
 
 
@@ -1209,8 +1233,8 @@ def _missing_authenticator_fill_error(
     already_asked = isinstance(copilot_ctx, CopilotContext) and copilot_ctx.credential_totp_update_asked
     if already_asked:
         next_step = (
-            "The user was already asked this turn to update this credential. Do not call "
-            "`request_credential` again; say the verification step needs an authenticator on it."
+            "The user was already shown an update card for this credential this turn; another one cannot open "
+            "until the next turn."
         )
     else:
         next_step = (

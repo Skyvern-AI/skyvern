@@ -2807,8 +2807,12 @@ export function WorkflowCopilotChat({
             ? prev
             : withCappedResolution(prev, frame.resume_token, resolution),
         );
-        // An update card fixes the credential the turn already chose, so the turn's answer stays put.
-        if (!UPDATE_ASK_REASONS.includes(frame.reason)) {
+        // An update card fixes the credential the turn already chose, so the turn's answer stays put
+        // unless the user signed in themselves, which the server records as the turn's answer.
+        if (
+          !UPDATE_ASK_REASONS.includes(frame.reason) ||
+          resolution.outcome === "signed_in"
+        ) {
           setCredentialResolutions((prev) =>
             withCappedResolution(prev, frame.turn_id, resolution),
           );

@@ -1933,7 +1933,7 @@ class TestParseFinalResponse:
     def test_recovery_tier_skipped_when_prose_quotes_both_markers(self) -> None:
         # Prose discussing the envelope format (both quoted `"type": "REPLY"`
         # and `"user_response"` substrings present, no leading `{`) must not
-        # degrade to "Done." — the user's actual prose has to survive.
+        # degrade to an empty reply — the user's actual prose has to survive.
         text = 'I see "type": "REPLY" mentioned, but cannot find "user_response" anywhere.'
         parsed = parse_final_response(text)
         assert parsed == {"type": "REPLY", "user_response": text}
@@ -1968,12 +1968,11 @@ class TestParseFinalResponse:
         assert parsed["type"] == "REPLY"
         assert parsed["user_response"] == "updated your workflow"
 
-    def test_envelope_shaped_unparseable_with_no_recoverable_user_response_returns_done(self) -> None:
+    def test_envelope_shaped_unparseable_with_no_recoverable_user_response_returns_empty(self) -> None:
         envelope = '{"type": "REPLY", "user_response": "broken'
         parsed = parse_final_response(envelope)
-        assert parsed["user_response"] == "Done."
+        assert parsed["user_response"] == ""
         assert parsed["type"] == "REPLY"
-        assert "broken" not in parsed["user_response"]
 
     def test_non_envelope_unparseable_text_still_falls_back_to_text(self) -> None:
         text = "I'm not sure how to help with that."

@@ -1067,7 +1067,8 @@ async def request_credential_tool(
     authenticator for, so the card asks the user to add one to it instead of picking a login.
     Pass `credential_id` with `rejected_by_site=true` when the run and page evidence show the site
     refused that bound credential's saved password or code; a failed run's `credential_update` lever
-    names the one credential bound to its failed block. The card asks the user to update it.
+    names the one credential bound to its failed block. The card asks the user to update it; like the
+    pick card it can also offer signing in themselves, which returns `signed_in`.
     When the user asked you to create one new account and the sign-up form needs a password, pass
     `registration` with the sign-up page as `login_page_url`: the card offers to generate a password
     and save it with that username and credential name, and you only ever get the credential's id.

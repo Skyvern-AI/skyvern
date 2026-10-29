@@ -61,8 +61,6 @@ from skyvern.forge.sdk.copilot import enforcement as enforcement_module
 from skyvern.forge.sdk.copilot import runtime as runtime_module
 from skyvern.forge.sdk.copilot import tools as tools_module
 from skyvern.forge.sdk.copilot.agent import (
-    _FAILURE_FOLLOW_UP,
-    _SKYVERN_EGRESS_FOLLOW_UP,
     _build_goal_satisfied_exit_result,
     _format_chat_history,
     _last_recorded_run_id,
@@ -337,16 +335,6 @@ def _challenge_effects_contract() -> DiagnosisRepairContract:
             basis="run_wall", kind="captcha", solver_available=True, solver_attempted=True, solver_result="failed"
         ),
         levers=[Lever(mechanism="human_interaction", knowledge_topic="human_interaction_block")],
-    )
-
-
-def _frame_only_challenge_contract() -> DiagnosisRepairContract:
-    return DiagnosisRepairContract(
-        diagnosis_input=DiagnosisInput(source_tool="update_and_run_blocks"),
-        diagnosis_result=DiagnosisResult(),
-        repair_decision=RepairDecision(next_action=RepairNextAction.NO_CHANGE),
-        verification_result=VerificationResult(user_goal_satisfied=False, completion_contract_satisfied=False),
-        challenge=ChallengeEffects(basis="page_frames", frame_hosts=["challenges.cloudflare.com"]),
     )
 
 
@@ -679,8 +667,6 @@ async def test_demonstrate_product_action_triggers_replay(monkeypatch: pytest.Mo
 
 class TestFailedTestResponseNormalization:
     def test_paused_run_reply_is_not_rewritten_into_a_failed_test(self) -> None:
-        from skyvern.forge.sdk.copilot.agent import _rewrite_failed_test_response
-
         ctx = _ctx(
             last_update_block_count=2,
             last_test_ok=None,
@@ -700,8 +686,8 @@ class TestFailedTestResponseNormalization:
         rewritten = _rewrite_failed_test_response(model_reply, ctx)
 
         assert rewritten == (
-            "I created a draft workflow with 2 blocks and tested it, but the test failed. "
-            f"Failure: Verify you are human. {model_reply} Keep the draft to iterate on, or discard."
+            "I tested the draft, but the test failed: Verify you are human. "
+            f"{model_reply} Keep the draft to iterate on, or discard."
         )
         assert "proxy location?" not in rewritten
 
@@ -727,20 +713,17 @@ class TestFailedTestResponseNormalization:
             ),
         )
 
-        rewritten = _rewrite_failed_test_response("I tested the workflow, but it failed.", ctx)
+        rewritten = _rewrite_failed_test_response("Credits ran out before the run started.", ctx)
 
         assert rewritten == (
-            "I created a draft workflow with 1 block, but I couldn't start a test. "
+            "I couldn't start a test. "
             "Build test did not start because credits are exhausted. No browser or run started. "
             "Upgrade your plan in Billing. The draft is untested. "
+            "Credits ran out before the run started. "
             "Keep the draft to iterate on, or discard."
         )
-        assert "tested it" not in rewritten
-        assert "test failed" not in rewritten
 
     def test_a_proxy_hop_failure_keeps_its_label_when_the_page_also_detected_a_challenge(self) -> None:
-        # The challenge path returns before the follow-up, so the label has to be on the
-        # recorded-run sentence itself or a walled page silently hides who owned the failure.
         ctx = _challenge_failure_ctx()
         ctx.effective_workflow_proxy_location = ProxyLocation.RESIDENTIAL_ES
         _record_failed_navigation_run(ctx, _PROXY_HOP_NAVIGATION_FAILURE, ["net::ERR_TUNNEL_CONNECTION_FAILED"])
@@ -764,25 +747,85 @@ class TestFailedTestResponseNormalization:
 
         assert "Skyvern proxy hop failed" not in rewritten
 
-    def test_without_challenge_effects_the_base_follow_up_template_is_unchanged(self) -> None:
-        no_contract_ctx = _challenge_failure_ctx()
-        empty_recourse_ctx = _challenge_failure_ctx()
-        empty_recourse_ctx.latest_diagnosis_repair_contract = _unverified_no_repair_contract()
-        frame_only_ctx = _challenge_failure_ctx()
-        frame_only_ctx.latest_diagnosis_repair_contract = _frame_only_challenge_contract()
+    def test_a_truncated_reason_keeps_its_ellipsis_without_a_fourth_dot(self) -> None:
+        ctx = _challenge_failure_ctx()
+        ctx.last_test_failure_reason = "Timed out " + "waiting " * 60
 
-        expected = (
-            "I created a draft workflow with 2 blocks and tested it, but the test failed. "
-            "Failure: Verify you are human. Want me to retry?"
-            " Keep the draft to iterate on, or discard."
+        rewritten = _rewrite_failed_test_response("", ctx)
+
+        assert rewritten.endswith("...")
+        assert "...." not in rewritten
+
+    def test_without_challenge_effects_the_model_reply_still_follows_the_lead(self) -> None:
+        ctx = _challenge_failure_ctx()
+        ctx.latest_diagnosis_repair_contract = _unverified_no_repair_contract()
+
+        assert _rewrite_failed_test_response("The site blocked me.", ctx) == (
+            "I tested the draft, but the test failed: Verify you are human. "
+            "The site blocked me. Keep the draft to iterate on, or discard."
         )
-        assert _rewrite_failed_test_response("The site blocked me.", no_contract_ctx) == expected
-        assert _rewrite_failed_test_response("The site blocked me.", empty_recourse_ctx) == expected
-        assert _rewrite_failed_test_response("The site blocked me.", frame_only_ctx) == expected
+
+    @pytest.mark.parametrize(
+        ("branch", "lead"),
+        [
+            (
+                "credentials_unbound",
+                "I applied your requested change as a draft, but I couldn't test it because I couldn't find "
+                "the required credentials. Add them in Credentials, then I can try again.",
+            ),
+            (
+                "billing",
+                "I couldn't start a test. Build test did not start because credits are exhausted. "
+                "No browser or run started. Upgrade your plan in Billing. The draft is untested.",
+            ),
+            (
+                "not_started",
+                "I couldn't start a test run: Run never dispatched. Nothing was executed, so the draft is unverified.",
+            ),
+            ("failed", "I tested the draft, but the test failed: Login rejected."),
+        ],
+    )
+    @pytest.mark.parametrize("model_reply", ["", "  Block one passed; block two failed on login.  "])
+    def test_every_test_reporting_branch_puts_the_lead_before_the_model_reply(
+        self, branch: str, lead: str, model_reply: str
+    ) -> None:
+        ctx = _ctx(
+            last_workflow=object(),
+            last_workflow_yaml="workflow: yes",
+            last_update_block_count=13,
+            last_test_ok=False,
+            last_failure_category_top="AUTH_FAILURE",
+            last_test_failure_reason="Login rejected.",
+            last_test_proxy_owned_failure=True,
+        )
+        if branch == "credentials_unbound":
+            ctx.last_test_ok = None
+            ctx.request_policy = RequestPolicy(clarification_reason="workflow_credential_inputs_unbound")
+        elif branch == "billing":
+            ctx.latest_recorded_build_test_outcome = RecordedBuildTestOutcome(
+                phase="persisted_block_run",
+                attempted_tool="update_and_run_blocks",
+                verdict="not_authoritative",
+                reason_code="unrecoverable_tool_error",
+                connect_failure=BuildTestConnectFailure(state="billing_credit_admission_refusal", retry_action=None),
+            )
+            ctx.last_test_failure_reason = "Build test did not start because credits are exhausted."
+        elif branch == "not_started":
+            ctx.last_test_run_started = False
+            ctx.last_test_failure_reason = "Run never dispatched."
+
+        rewritten = _rewrite_failed_test_response(model_reply, ctx)
+
+        if model_reply:
+            assert rewritten == f"{lead} {model_reply.strip()} Keep the draft to iterate on, or discard."
+        else:
+            assert rewritten == lead
+        assert "I created" not in rewritten
+        assert "13" not in rewritten
+        assert "stored password" not in rewritten
+        assert "re-test" not in rewritten
 
     def test_rewrite_failed_test_response_avoids_success_language(self) -> None:
-        from skyvern.forge.sdk.copilot.agent import _rewrite_failed_test_response
-
         ctx = _ctx(
             last_update_block_count=2,
             last_test_ok=False,
@@ -793,9 +836,11 @@ class TestFailedTestResponseNormalization:
         )
         rewritten = _rewrite_failed_test_response("The workflow was successfully created.", ctx)
 
-        assert "successfully created" not in rewritten.lower()
-        assert "draft workflow with 2 blocks" in rewritten
-        assert "test failed" in rewritten.lower()
+        assert rewritten.startswith(
+            "I tested the draft, but the test failed: "
+            "Failed to navigate to url https://bad.example. Error: net::ERR_NAME_NOT_RESOLVED. "
+        )
+        assert "2 blocks" not in rewritten
         assert "Call log:" not in rewritten
 
     @pytest.mark.parametrize("failure_category", ["NAVIGATION_FAILURE", "PAGE_LOAD_TIMEOUT"])
@@ -818,8 +863,6 @@ class TestFailedTestResponseNormalization:
         assert "confirm the URL" not in rewritten
         assert "Can you confirm the URL is correct?" not in rewritten
         assert "Skyvern proxy hop failed (proxy_location=RESIDENTIAL_ES)" in rewritten
-        assert _SKYVERN_EGRESS_FOLLOW_UP.strip() in rewritten
-        assert _FAILURE_FOLLOW_UP["PROXY_ERROR"].strip() not in rewritten
 
     def test_failed_run_does_not_clear_last_workflow_state(self) -> None:
         sentinel_workflow = object()
@@ -930,9 +973,7 @@ workflow_definition:
 
         assert trace["per_tool_budget_on_block_count"] == 0
 
-    def test_rewrite_includes_navigation_follow_up_when_category_matches(self) -> None:
-        from skyvern.forge.sdk.copilot.agent import _rewrite_failed_test_response
-
+    def test_rewrite_keeps_the_model_reply_instead_of_a_category_follow_up(self) -> None:
         ctx = _ctx(
             last_update_block_count=1,
             last_test_ok=False,
@@ -941,12 +982,11 @@ workflow_definition:
         )
         rewritten = _rewrite_failed_test_response("done", ctx)
 
-        assert "test failed" in rewritten.lower()
-        assert "confirm the url" in rewritten.lower()
+        assert rewritten == (
+            "I tested the draft, but the test failed: Failed to navigate to url https://bad.example. done"
+        )
 
     def test_rewrite_untested_edit_preserves_model_report(self) -> None:
-        from skyvern.forge.sdk.copilot.agent import _rewrite_failed_test_response
-
         sentinel_workflow = object()
         ctx = _ctx(
             last_update_block_count=1,
@@ -958,15 +998,11 @@ workflow_definition:
         assert rewritten == "Here's the updated YAML."
 
     def test_rewrite_passes_through_when_no_update_or_failure(self) -> None:
-        from skyvern.forge.sdk.copilot.agent import _rewrite_failed_test_response
-
         ctx = _ctx()
         original = "Let me know what you want to build."
         assert _rewrite_failed_test_response(original, ctx) == original
 
     def test_rewrite_preserves_the_models_factual_completed_run_report(self) -> None:
-        from skyvern.forge.sdk.copilot.agent import _rewrite_failed_test_response
-
         ctx = _ctx(
             last_workflow=object(),
             last_workflow_yaml="title: resale lookup",
@@ -992,8 +1028,6 @@ workflow_definition:
         assert _rewrite_failed_test_response(factual_report, ctx) == factual_report
 
     def test_rewrite_untested_draft_request_surfaces_explicit_unverified_copy(self) -> None:
-        from skyvern.forge.sdk.copilot.agent import _rewrite_failed_test_response
-
         ctx = _ctx(
             allow_untested_workflow_draft=True,
             last_workflow=object(),
@@ -1008,9 +1042,6 @@ workflow_definition:
         assert "successful" not in rewritten.lower()
 
     def test_rewrite_redacted_secret_draft_points_to_saved_credentials(self) -> None:
-        from skyvern.forge.sdk.copilot.agent import _rewrite_failed_test_response
-        from skyvern.forge.sdk.copilot.request_policy import RequestPolicy
-
         ctx = _ctx(
             allow_untested_workflow_draft=True,
             last_workflow=object(),
@@ -1133,9 +1164,6 @@ workflow_definition:
         assert _should_surface_untested_draft_despite_question(ctx, "REPLY") is False
 
     def test_rewrite_uses_credential_framing_when_policy_flags_unbound_inputs(self) -> None:
-        from skyvern.forge.sdk.copilot.agent import _rewrite_failed_test_response
-        from skyvern.forge.sdk.copilot.request_policy import RequestPolicy
-
         ctx = _ctx(
             last_workflow=object(),
             last_workflow_yaml="title: drafted",
@@ -1149,10 +1177,11 @@ workflow_definition:
         )
         rewritten = _rewrite_failed_test_response("agent text", ctx)
 
-        assert rewritten.startswith("I applied your requested change as a draft workflow with 12 blocks.")
-        assert "I couldn't find the required credentials" in rewritten
-        assert "add them via the Credentials UI" in rewritten
-        assert "Keep the draft to iterate on, or discard." in rewritten
+        assert rewritten == (
+            "I applied your requested change as a draft, but I couldn't test it because I couldn't find "
+            "the required credentials. Add them in Credentials, then I can try again. agent text "
+            "Keep the draft to iterate on, or discard."
+        )
 
     def test_runtime_repair_context_prompt_exposes_literal_page_location(self) -> None:
         repair_context = CodeAuthoringRepairContext(
@@ -3829,6 +3858,40 @@ class TestTranslateToAgentResultGating:
         assert agent_result.response_type == "ASK_QUESTION"
         assert agent_result.user_response == "Which account should I use?"
 
+    @pytest.mark.parametrize(
+        "final_output",
+        [json.dumps({"type": "REPLY", "user_response": ""}), "REPLY:", '{"type": "REPLY", "user_response": "brok'],
+        ids=["empty_reply", "label_only_reply", "unrecoverable_envelope"],
+    )
+    def test_failed_test_with_no_model_reply_returns_the_lead_alone(self, final_output: str) -> None:
+        ctx = _ctx(
+            last_update_block_count=2,
+            last_test_ok=False,
+            last_test_failure_reason="Verify you are human",
+            last_workflow=object(),
+            last_workflow_yaml="title: drafted",
+        )
+        result = SimpleNamespace(final_output=final_output, new_items=[])
+
+        agent_result = asyncio.run(
+            agent_module._translate_to_agent_result(
+                result, ctx, global_llm_context=None, chat_request=_chat_request(), organization_id="org-1"
+            )
+        )
+
+        assert agent_result.user_response == "I tested the draft, but the test failed: Verify you are human."
+
+    def test_empty_reply_without_a_failed_test_still_falls_back_to_done(self) -> None:
+        result = _fake_run_result({"type": "REPLY", "user_response": ""})
+
+        agent_result = asyncio.run(
+            agent_module._translate_to_agent_result(
+                result, _ctx(), global_llm_context=None, chat_request=_chat_request(), organization_id="org-1"
+            )
+        )
+
+        assert agent_result.user_response == "Done."
+
     def test_request_policy_actuation_claim_does_not_rewrite_model_reply(self) -> None:
         ctx = _ctx(
             request_policy=RequestPolicy(
@@ -5094,8 +5157,10 @@ workflow_definition:
             )
         )
 
-        assert "test failed" in agent_result.user_response.lower()
-        assert "All done" not in agent_result.user_response
+        assert agent_result.user_response == (
+            "I tested the draft, but the test failed: Failed to navigate to url https://bad.example. "
+            "All done — your workflow is ready."
+        )
         assert agent_result.updated_workflow is None
         assert agent_result.proposal_disposition == "no_proposal"
 
@@ -9362,15 +9427,6 @@ class TestTheModelOwnsItsClaim:
         assert agent_result.updated_workflow is wf
 
 
-def test_an_element_state_timeout_does_not_send_the_user_to_check_the_url() -> None:
-    # The page loaded; an element never reached the state the block waited for. Copilot repairs that
-    # itself, so the reply carries no follow-up rather than a misdirecting one.
-    from skyvern.forge.sdk.copilot.agent import _FAILURE_FOLLOW_UP
-
-    assert _FAILURE_FOLLOW_UP.get("ELEMENT_STATE_TIMEOUT", "") == ""
-    assert "confirm the URL" in _FAILURE_FOLLOW_UP["PAGE_LOAD_TIMEOUT"]
-
-
 def test_rewrite_names_the_sandbox_outage_when_the_runner_was_unreachable() -> None:
     ctx = _ctx(
         last_update_block_count=1,
@@ -9384,8 +9440,8 @@ def test_rewrite_names_the_sandbox_outage_when_the_runner_was_unreachable() -> N
     rewritten = _rewrite_failed_test_response("All set — the workflow is ready.", ctx)
 
     assert rewritten == (
-        "I created a draft workflow with 1 block and tested it, but the test failed. "
-        "Failure: Secure CodeBlock runner is unavailable. Please retry."
+        "I tested the draft, but the test failed: Secure CodeBlock runner is unavailable. Please retry. "
+        "All set — the workflow is ready."
     )
 
 

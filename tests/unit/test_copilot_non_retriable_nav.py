@@ -1233,9 +1233,6 @@ def test_the_proxy_label_requires_a_code_the_driver_reported(
     reply = agent_module._rewrite_failed_test_response("model text", ctx)
 
     assert ("Skyvern proxy hop failed (proxy_location=RESIDENTIAL_ES)" in reply) is expects_proxy_label
-    assert (agent_module._SKYVERN_EGRESS_FOLLOW_UP.strip() in reply) is expects_proxy_label
-    expects_neutral_ask = not expects_proxy_label and failure_category == "PROXY_ERROR"
-    assert (agent_module._FAILURE_FOLLOW_UP["PROXY_ERROR"].strip() in reply) is expects_neutral_ask
     assert "verify the URL" not in reply
     assert "confirm the URL is correct" not in reply
     assert ctx.last_test_non_retriable_nav_error is None

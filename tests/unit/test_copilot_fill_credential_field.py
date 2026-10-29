@@ -37,6 +37,7 @@ from skyvern.forge.sdk.copilot.context import CopilotContext
 from skyvern.forge.sdk.copilot.credential_resolution import connected_vault_credential, load_connected_vault
 from skyvern.forge.sdk.copilot.mcp_adapter import SkyvernOverlayMCPServer
 from skyvern.forge.sdk.copilot.request_policy import (
+    CREDENTIAL_BINDING_FACTS,
     RequestPolicy,
     _build_request_policy_bootstrap,
     _ground_user_provided_sites,
@@ -1968,7 +1969,7 @@ class TestCredentialFillLivePageAdmission:
             ),
             WorkflowCopilotChatHistoryMessage(
                 sender=WorkflowCopilotChatSender.AI,
-                content="I created a draft workflow with 1 block and tested it, but the test failed.",
+                content="I tested the draft, but the test failed: Login rejected.",
                 created_at=datetime.now(UTC),
             ),
         ]
@@ -2208,8 +2209,14 @@ class TestObservationSeamCredentialBinding:
         return result, load_mock
 
     @pytest.mark.asyncio
-    async def test_navigating_to_a_matched_login_page_binds_and_surfaces_the_id(self) -> None:
-        policy = RequestPolicy()
+    @pytest.mark.parametrize(
+        ("persisted_ids", "binding"),
+        [([], "matched_by_saved_url"), (["cred_analytics"], "saved_workflow")],
+    )
+    async def test_navigating_to_a_matched_login_page_binds_and_surfaces_the_id(
+        self, persisted_ids: list[str], binding: str
+    ) -> None:
+        policy = RequestPolicy(persisted_workflow_credential_ids=persisted_ids)
         ctx = _ctx(request_policy=policy)
 
         result, _ = await self._observe_navigate(
@@ -2223,6 +2230,7 @@ class TestObservationSeamCredentialBinding:
         )
 
         assert result["resolved_login_credential_id"] == "cred_analytics"
+        assert result["resolved_login_credential_binding"] == CREDENTIAL_BINDING_FACTS[binding]
         assert result["resolved_login_credential_name"] == "analytics"
         assert "candidate_login_credentials" not in result
 

@@ -235,7 +235,7 @@ def _last_envelope_in(text: str) -> dict[str, Any] | None:
 def _text_looks_envelope_shaped(text: str) -> bool:
     # require leading `{` so prose that merely quotes the field names (e.g.,
     # "I see \"type\": \"REPLY\" but cannot find \"user_response\"") falls
-    # through to the plain-text tier instead of degrading to "Done."
+    # through to the plain-text tier instead of degrading to an empty reply.
     return text.startswith("{") and '"user_response"' in text and bool(_TYPE_VALUE_RE.search(text))
 
 
@@ -281,7 +281,7 @@ def parse_final_response(text: str) -> dict[str, Any]:
                 value = None
             if isinstance(value, str):
                 return {"type": sniffed_type, "user_response": value}
-        return {"type": sniffed_type, "user_response": "Done."}
+        return {"type": sniffed_type, "user_response": ""}
 
     return {"type": "REPLY", "user_response": text}
 

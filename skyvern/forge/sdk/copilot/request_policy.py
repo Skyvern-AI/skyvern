@@ -68,6 +68,7 @@ from skyvern.forge.sdk.schemas.google_oauth import STATE_ACTIVE
 from skyvern.forge.sdk.schemas.workflow_copilot import (
     TURN_OPENER_SENDERS,
     CopilotSteerMessage,
+    CredentialBinding,
     WorkflowCopilotChatHistoryMessage,
     WorkflowCopilotChatSender,
 )
@@ -964,8 +965,8 @@ class RequestPolicy:
     completion_contract: str | None = None
     completion_criteria: list[CompletionCriterion] = field(default_factory=list)
     resolved_credentials: list[Credential] = field(default_factory=list)
-    # Credentials bound this turn without a user ask (deterministic URL/urlless resolution + live-page
-    # sole-match); read-only telemetry for the auto-bind receipt, never a run-authority source.
+    # Credentials bound this turn without a user ask (a live page's sole match, or a carried proposal
+    # seed); read-only telemetry for the auto-bind receipt, never a run-authority source.
     auto_bound_credentials: list[Credential] = field(default_factory=list)
     # credential_id -> the login page URL that granted it, so each later fill can confirm the
     # browser has not left that site and a redirect cannot inherit the grant.
@@ -976,6 +977,8 @@ class RequestPolicy:
     # turn admitted. Without it the recorder cannot tell its own hydration from fresh evidence and
     # re-mints the carry every turn, so it never expires.
     seeded_proposal_credential_ids: set[str] = field(default_factory=set)
+    # Seeds whose saved URL matched the page; a seed from an executed fill only says a fill ran there.
+    seeded_url_matched_credential_ids: set[str] = field(default_factory=set)
     # Ids whose citation passed on the carry this turn. Whether that stands as the user's answer is
     # settled at turn end. Kept apart from current_turn_named_credential_ids, whose claim is that
     # the user wrote the identifier out themselves.
@@ -1298,6 +1301,31 @@ def _defer_authoring_durable_fill_criterion() -> CompletionCriterion:
         method_mandated=True,
         level="run",
     )
+
+
+CREDENTIAL_BINDING_FACTS: dict[CredentialBinding, str] = {
+    "saved_workflow": "The saved workflow binds this credential.",
+    "matched_by_saved_url": (
+        "The saved workflow does not bind this credential; it was matched to this sign-in page by its saved URL."
+    ),
+    "not_bound": "The saved workflow does not bind this credential.",
+}
+
+
+def credential_binding(policy: RequestPolicy, credential_id: str) -> CredentialBinding:
+    if credential_id in policy.persisted_workflow_credential_ids:
+        return "saved_workflow"
+    chosen_by_user = policy.current_turn_named_credential_ids | policy.credential_pause_connected_credential_ids
+    if credential_id in chosen_by_user or not any(
+        credential.credential_id == credential_id for credential in policy.auto_bound_credentials
+    ):
+        return "not_bound"
+    if (
+        credential_id not in policy.seeded_proposal_credential_ids
+        or credential_id in policy.seeded_url_matched_credential_ids
+    ):
+        return "matched_by_saved_url"
+    return "not_bound"
 
 
 def credential_prompt_reason(policy: RequestPolicy | None) -> str | None:
@@ -4446,6 +4474,8 @@ async def _seed_proposed_credential(
     policy.live_page_admitted_urls.setdefault(seed.credential_id, seed.admitted_url)
     policy.carried_credential_urls.setdefault(seed.credential_id, seed.admitted_url)
     policy.seeded_proposal_credential_ids.add(seed.credential_id)
+    if seed.origin_arm == "live_page_admitted":
+        policy.seeded_url_matched_credential_ids.add(seed.credential_id)
     # The server bound this and the user did not name it, so it enters through the auto-bound record:
     # a write to current_turn_named_credential_ids would refuse the user's own later answer.
     if seed.credential_id not in {item.credential_id for item in policy.auto_bound_credentials}:
