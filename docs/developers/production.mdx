@@ -298,6 +298,21 @@ Each mapped error looks like `{"error_code": "login_failed", "reasoning": "...",
 
 Skyvern also adds its own codes to `errors`: `REACH_MAX_STEPS`, `REACH_MAX_RETRIES`, `OTP_ERROR`, `OTP_TIMEOUT`, `OTP_EXPIRED`, and `MISSING_TOTP_SOURCE`.
 
+When a failed run recorded a bot-protection block or an unresolved challenge, Skyvern adds `ANTI_BOT_ERROR` to `errors`. Skyvern adds one more entry for each protection service it identified:
+
+| `error_code` | Service |
+|---|---|
+| `RECAPTCHA_ERROR` | reCAPTCHA |
+| `HCAPTCHA_ERROR` | hCaptcha |
+| `CLOUDFLARE_TURNSTILE_ERROR` | Cloudflare Turnstile |
+| `CLOUDFLARE_ERROR` | Cloudflare, when the specific product or rule is unknown |
+
+Skyvern reports these codes from the run's recorded evidence without a model call, so they have no `confidence_float`. Each entry has `error_type` set to `SYSTEM_DEFINED_ERROR`:
+
+```json
+{"error_code": "ANTI_BOT_ERROR", "reasoning": "A bot-protection block or unresolved challenge was recorded during this failed attempt.", "error_type": "SYSTEM_DEFINED_ERROR"}
+```
+
 ### Failure categories
 
 Agent runs that end in `failed`, `terminated`, or `timed_out` get a `failure_category` list. Each entry has a `category`, a `confidence_float`, and `reasoning`. The first entry is the most likely cause. The app shows it as a badge on the run.
@@ -332,7 +347,7 @@ When a site still blocks runs, work down this list:
 
 <img src="/images/cloud/run-take-control.png" alt="Live browser view with the Take control button over the stream" />
 
-To count blocked runs, look for `ANTI_BOT_DETECTION` in `failure_category`.
+To count blocked runs, look for `ANTI_BOT_DETECTION` in `failure_category`, or `ANTI_BOT_ERROR` in `errors`. See [Map failures to your own codes](#map-failures-to-your-own-codes) for the service-specific codes.
 
 <Note>
 Self-hosted Skyvern does not solve CAPTCHAs. When the agent sees one, it waits 30 seconds so you can solve it in the browser window, then continues. Self-hosted servers can load Chrome extensions with the `EXTENSIONS` and `EXTENSIONS_BASE_PATH` settings. See [browser settings](/reference/configuration#browser-settings).
