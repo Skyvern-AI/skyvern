@@ -127,6 +127,7 @@ from skyvern.forge.sdk.copilot.composition_evidence import (
 )
 from skyvern.forge.sdk.copilot.context import (
     CopilotContext,
+    CopilotTestInput,
     PageObstruction,
     upsert_narrative_block_attempt,
 )
@@ -289,6 +290,7 @@ from skyvern.forge.sdk.workflow.models.workflow import (
     workflow_definition_sha256,
 )
 from skyvern.forge.sdk.workflow.runtime_secret_bridge import consume_copilot_runtime_secret_values
+from skyvern.forge.sdk.workflow.service import WorkflowService
 from skyvern.schemas.browser_session_close import BrowserSessionCloseReason
 from skyvern.schemas.proxy_location import ProxyLocationInput, runtime_proxy_location
 from skyvern.schemas.self_heal import HealEpisodeDetail, HealStatus
@@ -3305,29 +3307,45 @@ def _resolve_run_data_and_unbound_keys(
     ephemeral_input_values: Mapping[str, Any] | None = None,
     origin_parameters: Sequence[tuple[WorkflowParameter, WorkflowRunParameter]] = (),
     origin_is_copilot_run: bool = False,
-) -> tuple[dict[str, Any], list[str], list[str]]:
+) -> tuple[dict[str, Any], list[str], list[str], list[CopilotTestInput]]:
     data: dict[str, Any] = {}
     unbound: list[str] = []
     reused: list[str] = []
+    sources: list[CopilotTestInput] = []
     origin_by_key = _origin_by_key(origin_parameters)
     for wp in all_workflow_params:
         if wp.key in user_params:
-            data[wp.key] = user_params[wp.key]
+            value = user_params[wp.key]
+            data[wp.key] = value
+            # Labels follow what prepare_workflow stores for this value, not the request shape.
+            if value is None and wp.default_value is not None:
+                sources.append({"key": wp.key, "source": "default"})
+            elif WorkflowService._is_optional_credential_parameter(wp) and WorkflowService._is_missing_required_value(
+                wp, value
+            ):
+                sources.append({"key": wp.key, "source": "placeholder"})
+            else:
+                sources.append({"key": wp.key, "source": "copilot"})
             continue
         if ephemeral_input_values is not None and wp.key in ephemeral_input_values:
             data[wp.key] = ephemeral_input_values[wp.key]
+            sources.append({"key": wp.key, "source": "page"})
             continue
         origin_value = _reusable_origin_value(wp, origin_by_key, origin_is_copilot_run=origin_is_copilot_run)
         if origin_value is not None:
             data[wp.key] = origin_value
             reused.append(wp.key)
+            sources.append(
+                {"key": wp.key, "source": "earlier_run", "sourceRunId": origin_by_key[wp.key][1].workflow_run_id}
+            )
             continue
         if wp.default_value is not None and wp.default_value != "":
             data[wp.key] = wp.default_value
+            sources.append({"key": wp.key, "source": "default"})
             continue
-        # An at-will credential (credential_id type, no default) is optional for
-        # the test run and therefore gets neither a placeholder nor an unbound marker.
-        if wp.workflow_parameter_type == WorkflowParameterType.CREDENTIAL_ID and wp.default_value is None:
+        sources.append({"key": wp.key, "source": "placeholder"})
+        # An at-will credential is optional for the test run, so it gets neither a placeholder nor an unbound marker.
+        if WorkflowService._is_optional_credential_parameter(wp):
             continue
         placeholder = _placeholder_for_parameter_type(wp.workflow_parameter_type)
         if placeholder is not None:
@@ -3338,7 +3356,7 @@ def _resolve_run_data_and_unbound_keys(
                 parameter_type=str(wp.workflow_parameter_type),
             )
         unbound.append(wp.key)
-    return data, unbound, reused
+    return data, unbound, reused, sources
 
 
 async def _bind_origin_run_redaction_registry(
@@ -4122,7 +4140,7 @@ async def _run_blocks_and_collect_debug(
             return {"ok": False, "error": f"Block label not found in saved workflow: {label!r}"}
 
     # Resolved once: the origin-input check must compare exactly what gets dispatched.
-    origin_checked_resolution: tuple[dict[str, Any], list[str], list[str]] | None = None
+    origin_checked_resolution: tuple[dict[str, Any], list[str], list[str], list[CopilotTestInput]] | None = None
     origin_checked_parameter_keys: set[str] = set()
     if selected_output_sources:
         origin_checked_parameter_keys = {parameter.key for parameter in snapshot.workflow_parameters}
@@ -4391,7 +4409,7 @@ async def _run_blocks_and_collect_debug(
         if use_ephemeral_inputs
         else {}
     )
-    data, unbound_required_parameter_keys, reused_origin_input_keys = (
+    data, unbound_required_parameter_keys, reused_origin_input_keys, test_input_sources = (
         origin_checked_resolution
         or _resolve_run_data_and_unbound_keys(
             list(snapshot.workflow_parameters),
@@ -4939,6 +4957,7 @@ async def _run_blocks_and_collect_debug(
                     "data": {"run_dispatched": False, _PROPOSAL_BIND_REFUSED_KEY: True},
                 }
         ctx.dispatched_run_ids_this_turn.add(workflow_run.workflow_run_id)
+        ctx.pending_test_inputs[workflow_run.workflow_run_id] = test_input_sources
         # A seeded producer's value belongs to the run that produced it, never to this one.
         seeded_only_labels = frozenset(block_outputs_to_seed) - frozenset(labels_that_may_execute)
         if seeded_only_labels:

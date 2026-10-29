@@ -112,7 +112,7 @@ from skyvern.forge.sdk.copilot.recoverable_failure import (
     merge_failure_into_context,
 )
 from skyvern.forge.sdk.copilot.repair_origin_run import RepairOriginRefusal, resolve_repair_origin_binding
-from skyvern.forge.sdk.copilot.request_policy import screen_raw_secret_safety
+from skyvern.forge.sdk.copilot.request_policy import raw_secret_safety_log_fields, screen_raw_secret_safety
 from skyvern.forge.sdk.copilot.review_gate import parse_execution_receipts, serialize_execution_receipts
 from skyvern.forge.sdk.copilot.runtime import close_browser_session_quietly
 from skyvern.forge.sdk.copilot.steer import STEER_DOORBELL_TTL, copilot_steer_key
@@ -4304,6 +4304,7 @@ async def workflow_copilot_question_response(
 
             async def screen_text(text: str) -> str:
                 safety = await screen_raw_secret_safety(text, handler, organization_id=organization.organization_id)
+                LOG.info("raw-secret safety screen", **raw_secret_safety_log_fields(safety, "question_response"))
                 if safety.status == "blocked":
                     raise HTTPException(
                         status_code=503,
@@ -4505,6 +4506,7 @@ async def workflow_copilot_steer(
             safety = await screen_raw_secret_safety(
                 steer_request.message, handler, organization_id=organization.organization_id
             )
+            LOG.info("raw-secret safety screen", **raw_secret_safety_log_fields(safety, "steer"))
         cost_headers = _copilot_eval_cost_headers(ledger)
         http_response.headers.update(cost_headers)
         if safety.status == "blocked":

@@ -8,7 +8,7 @@ import re
 import time
 from collections.abc import Awaitable, Callable, Sequence
 from dataclasses import dataclass, field, replace
-from typing import Any, Literal, cast, get_args
+from typing import Any, Literal, NamedTuple, cast, get_args
 
 import structlog
 from pydantic import BaseModel, ConfigDict, ValidationError
@@ -16,7 +16,8 @@ from pydantic import BaseModel, ConfigDict, ValidationError
 from skyvern.config import settings
 from skyvern.forge.log_redaction import redact_sensitive_fields
 from skyvern.forge.prompts import prompt_engine
-from skyvern.forge.sdk.api.llm.api_handler import LLMAPIHandler
+from skyvern.forge.sdk.api.llm.api_handler import LLMAPIHandler, handler_llm_key
+from skyvern.forge.sdk.api.llm.api_handler_factory import LLMAPIHandlerFactory
 from skyvern.forge.sdk.copilot.ask_user import QuestionInteraction
 from skyvern.forge.sdk.copilot.config import CopilotConfig
 from skyvern.forge.sdk.copilot.context import ProposedCredential, StructuredContext
@@ -38,6 +39,8 @@ from skyvern.forge.sdk.copilot.credential_resolution import (
     unresolved_page_url_for_log,
 )
 from skyvern.forge.sdk.copilot.credential_resolution import url_parts as _url_parts
+from skyvern.forge.sdk.copilot.eval_llm_overrides import current_eval_llm_overrides
+from skyvern.forge.sdk.copilot.llm_config import WORKFLOW_COPILOT_RAW_SECRET_SAFETY_PROMPT_TYPE
 from skyvern.forge.sdk.copilot.reached_download_target import REGISTERED_DOWNLOAD_REQUESTED_OUTPUT_PATHS
 from skyvern.forge.sdk.copilot.request_slots import (
     CanonicalRequestSlotV1,
@@ -47,6 +50,7 @@ from skyvern.forge.sdk.copilot.request_slots import (
     request_slot_source_text,
     request_slot_sources,
 )
+from skyvern.forge.sdk.copilot.router_fallback import router_fallback_llm_key
 from skyvern.forge.sdk.copilot.secret_redaction import (
     RAW_SECRET_PATTERNS,
     contains_email_password_pair,
@@ -146,6 +150,7 @@ RawSecretSafetyFailureKind = Literal[
     "contradictory_verdict",
     "invalid_citation",
 ]
+RawSecretSafetyAnsweredBy = Literal["primary", "fallback", "none"]
 _RAW_SECRET_SAFETY_PROMPT_NAME = "workflow-copilot-raw-secret-safety"
 _RAW_SECRET_SAFETY_UNAVAILABLE_TURN = "[INPUT_UNAVAILABLE_SAFETY_SCREEN_INCOMPLETE]"
 _REDACTED_SECRET_PLACEHOLDER = "[REDACTED_SECRET]"
@@ -170,6 +175,8 @@ class _RawSecretSafetyScreen:
     exonerated_citation_count: int = 0
     failure_kind: RawSecretSafetyFailureKind = "none"
     latency_ms: float = 0.0
+    answered_by: RawSecretSafetyAnsweredBy = "none"
+    hedged: bool = False
 
 
 def _raw_secret_safety_verdict(raw: object) -> RawSecretSafetyVerdict | None:
@@ -208,6 +215,8 @@ def _validate_raw_secret_safety_verdict(
 def _screen_unavailable(
     failure_kind: RawSecretSafetyFailureKind,
     latency_ms: float = 0.0,
+    answered_by: RawSecretSafetyAnsweredBy = "none",
+    hedged: bool = False,
 ) -> _RawSecretSafetyScreen:
     return _RawSecretSafetyScreen(
         status="blocked",
@@ -215,6 +224,8 @@ def _screen_unavailable(
         handling="block",
         failure_kind=failure_kind,
         latency_ms=latency_ms,
+        answered_by=answered_by,
+        hedged=hedged,
     )
 
 
@@ -423,6 +434,101 @@ def _redact_cited_secrets(message: str, citations: list[str]) -> str:
     return "".join(pieces)
 
 
+def _raw_secret_safety_fallback_key(handler: LLMAPIHandler) -> str | None:
+    llm_key = handler_llm_key(handler)
+    overrides = current_eval_llm_overrides()
+    if (
+        not settings.COPILOT_RAW_SECRET_SAFETY_HEDGE_ENABLED
+        or llm_key is None
+        or (overrides is not None and handler is overrides.handlers.get(WORKFLOW_COPILOT_RAW_SECRET_SAFETY_PROMPT_TYPE))
+    ):
+        return None
+    fallback_key = router_fallback_llm_key(llm_key)
+    return fallback_key if fallback_key != llm_key else None
+
+
+class _RawSecretSafetyRace(NamedTuple):
+    verdict: RawSecretSafetyVerdict | None
+    failure_kind: RawSecretSafetyFailureKind
+    answered_by: RawSecretSafetyAnsweredBy
+    hedged: bool
+    latency_ms: float
+
+
+async def _race_raw_secret_safety(prompt: str, handler: LLMAPIHandler) -> _RawSecretSafetyRace:
+    started_at = time.monotonic()
+    deadline = started_at + settings.COPILOT_RAW_SECRET_SAFETY_TIMEOUT_SECONDS
+    hedge_at = started_at + settings.COPILOT_RAW_SECRET_SAFETY_HEDGE_DELAY_SECONDS
+    fallback_key = _raw_secret_safety_fallback_key(handler)
+
+    async def _ask(leg_handler: LLMAPIHandler) -> object:
+        return await leg_handler(prompt=prompt, prompt_name=_RAW_SECRET_SAFETY_PROMPT_NAME)
+
+    primary = asyncio.create_task(_ask(handler))
+    legs: dict[asyncio.Task[object], RawSecretSafetyAnsweredBy] = {primary: "primary"}
+    pending: set[asyncio.Task[object]] = {primary}
+    hedged = False
+    failure_kind: RawSecretSafetyFailureKind = "timeout"
+    try:
+        while True:
+            if fallback_key is not None and (not pending or time.monotonic() >= hedge_at):
+                try:
+                    fallback_handler = LLMAPIHandlerFactory.get_llm_api_handler(fallback_key)
+                except Exception as exc:
+                    LOG.warning("raw-secret safety provider failed", exception_type=type(exc).__name__, leg="fallback")
+                    failure_kind = "provider_error"
+                else:
+                    fallback = asyncio.create_task(_ask(fallback_handler))
+                    legs[fallback] = "fallback"
+                    pending.add(fallback)
+                    hedged = True
+                fallback_key = None
+            if not pending:
+                return _RawSecretSafetyRace(None, failure_kind, "none", hedged, (time.monotonic() - started_at) * 1000)
+            wake_at = deadline if fallback_key is None else min(hedge_at, deadline)
+            done, pending = await asyncio.wait(
+                pending, timeout=max(0.0, wake_at - time.monotonic()), return_when=asyncio.FIRST_COMPLETED
+            )
+            if not done and time.monotonic() >= deadline:
+                return _RawSecretSafetyRace(None, "timeout", "none", hedged, (time.monotonic() - started_at) * 1000)
+            # A primary verdict that lands in the same wake-up as the fallback's wins.
+            for task in sorted(done, key=lambda finished: legs[finished] != "primary"):
+                leg_error = task.exception()
+                if leg_error is not None:
+                    LOG.warning(
+                        "raw-secret safety provider failed", exception_type=type(leg_error).__name__, leg=legs[task]
+                    )
+                    failure_kind = "provider_error"
+                    continue
+                verdict = _raw_secret_safety_verdict(task.result())
+                if verdict is not None:
+                    return _RawSecretSafetyRace(
+                        verdict, "none", legs[task], hedged, (time.monotonic() - started_at) * 1000
+                    )
+                failure_kind = "malformed_output"
+    finally:
+        for task in legs:
+            task.cancel()
+        await asyncio.gather(*legs, return_exceptions=True)
+
+
+def raw_secret_safety_log_fields(
+    screen: _RawSecretSafetyScreen, caller: Literal["chat_turn", "question_response", "steer"]
+) -> dict[str, str | int | float | bool]:
+    # Each caller logs these itself so the record keeps the caller's func_name.
+    return {
+        "status": screen.status,
+        "failure_kind": screen.failure_kind,
+        "citation_count": screen.citation_count,
+        "exonerated_citation_count": screen.exonerated_citation_count,
+        "handling": screen.handling,
+        "latency_ms": round(screen.latency_ms, 3),
+        "answered_by": screen.answered_by,
+        "hedged": screen.hedged,
+        "caller": caller,
+    }
+
+
 async def screen_raw_secret_safety(
     user_message: str,
     handler: LLMAPIHandler | None,
@@ -440,29 +546,17 @@ async def screen_raw_secret_safety(
     except Exception:
         return _screen_unavailable("malformed_output")
 
-    started_at = time.monotonic()
-    try:
-        raw = await asyncio.wait_for(
-            handler(prompt=prompt, prompt_name=_RAW_SECRET_SAFETY_PROMPT_NAME),
-            timeout=settings.COPILOT_RAW_SECRET_SAFETY_TIMEOUT_SECONDS,
-        )
-    except TimeoutError:
-        return _screen_unavailable("timeout", (time.monotonic() - started_at) * 1000)
-    except Exception as exc:
-        LOG.warning("raw-secret safety provider failed", exception_type=type(exc).__name__)
-        return _screen_unavailable("provider_error", (time.monotonic() - started_at) * 1000)
-
-    latency_ms = (time.monotonic() - started_at) * 1000
-    verdict = _raw_secret_safety_verdict(raw)
+    race = await _race_raw_secret_safety(prompt, handler)
+    verdict, answered_by, hedged, latency_ms = race.verdict, race.answered_by, race.hedged, race.latency_ms
     if verdict is None:
-        return _screen_unavailable("malformed_output", latency_ms)
+        return _screen_unavailable(race.failure_kind, latency_ms, answered_by, hedged)
     failure_kind = _validate_raw_secret_safety_verdict(
         verdict,
         original_user_message=user_message,
         screened_user_message=deterministic_safe_message,
     )
     if failure_kind != "none":
-        return _screen_unavailable(failure_kind, latency_ms)
+        return _screen_unavailable(failure_kind, latency_ms, answered_by, hedged)
 
     if verdict.state == "detected":
         cited = await _exonerate_saved_credential_citations(verdict.citations, organization_id)
@@ -475,6 +569,8 @@ async def screen_raw_secret_safety(
                 citation_count=len(cited),
                 exonerated_citation_count=exonerated,
                 latency_ms=latency_ms,
+                answered_by=answered_by,
+                hedged=hedged,
             )
         return _RawSecretSafetyScreen(
             status="clean",
@@ -482,6 +578,8 @@ async def screen_raw_secret_safety(
             handling="none",
             exonerated_citation_count=exonerated,
             latency_ms=latency_ms,
+            answered_by=answered_by,
+            hedged=hedged,
         )
 
     return _RawSecretSafetyScreen(
@@ -490,6 +588,8 @@ async def screen_raw_secret_safety(
         handling="none",
         citation_count=len(verdict.citations),
         latency_ms=latency_ms,
+        answered_by=answered_by,
+        hedged=hedged,
     )
 
 
@@ -996,6 +1096,8 @@ class RequestPolicy:
     raw_secret_safety_citation_count: int = 0
     raw_secret_safety_exonerated_citation_count: int = 0
     raw_secret_safety_latency_ms: float = 0.0
+    raw_secret_safety_answered_by: RawSecretSafetyAnsweredBy = "none"
+    raw_secret_safety_hedged: bool = False
     clarification_reason: ClarificationReason = "none"
     # The validated login URLs the credential card asked the user to select a login for. The
     # connected resume falls back to classifier-authored login_page_urls when this is empty.
@@ -1157,6 +1259,8 @@ class RequestPolicy:
             "raw_secret_safety_exonerated_citation_count": self.raw_secret_safety_exonerated_citation_count,
             "named_login_not_found": self.named_login_not_found,
             "raw_secret_safety_latency_ms": round(self.raw_secret_safety_latency_ms, 3),
+            "raw_secret_safety_answered_by": self.raw_secret_safety_answered_by,
+            "raw_secret_safety_hedged": self.raw_secret_safety_hedged,
             "classifier_status": self.classifier_status,
             "classifier_failure_kind": self.classifier_failure_kind,
             "classifier_retry_count": self.classifier_retry_count,
@@ -5081,6 +5185,8 @@ async def build_request_policy_trust_floor(
         raw_secret_safety_citation_count=safety.citation_count,
         raw_secret_safety_exonerated_citation_count=safety.exonerated_citation_count,
         raw_secret_safety_latency_ms=safety.latency_ms,
+        raw_secret_safety_answered_by=safety.answered_by,
+        raw_secret_safety_hedged=safety.hedged,
         requires_user_clarification=safety_blocked,
         allow_update_workflow=not safety_blocked,
         allow_run_blocks=not safety_blocked,
@@ -5102,13 +5208,5 @@ async def build_request_policy_trust_floor(
         selected_connected_account_id=selected_connected_account_id,
         _preclassified_policy=policy,
     )
-    LOG.info(
-        "raw-secret safety screen",
-        status=policy.raw_secret_safety_status,
-        failure_kind=policy.raw_secret_safety_failure_kind,
-        citation_count=policy.raw_secret_safety_citation_count,
-        exonerated_citation_count=policy.raw_secret_safety_exonerated_citation_count,
-        handling=policy.raw_secret_handling,
-        latency_ms=round(policy.raw_secret_safety_latency_ms, 3),
-    )
+    LOG.info("raw-secret safety screen", **raw_secret_safety_log_fields(safety, "chat_turn"))
     return policy

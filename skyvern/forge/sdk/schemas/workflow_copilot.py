@@ -20,7 +20,13 @@ from pydantic import (
 
 from skyvern.forge.sdk.copilot.ask_user import AccountGroupDecision, QuestionInteraction, QuestionResponse
 from skyvern.forge.sdk.copilot.code_write_diff import CodeWriteDiff
-from skyvern.forge.sdk.copilot.context import ActivityBucket, ProposalDisposition, ResponseType, TurnNarrativePayload
+from skyvern.forge.sdk.copilot.context import (
+    ActivityBucket,
+    CopilotTestInput,
+    ProposalDisposition,
+    ResponseType,
+    TurnNarrativePayload,
+)
 from skyvern.forge.sdk.copilot.run_outcome import RunOutcomeReasonCode, RunOutcomeRole, RunOutcomeVerdict
 from skyvern.forge.sdk.schemas.copilot_turn_outcome import (
     CopilotCancelSource,
@@ -899,6 +905,10 @@ class WorkflowCopilotToolResultUpdate(BaseModel):
             "(update_and_run_blocks / run_blocks_and_collect_debug). Present whether the run "
             "passed or failed; None for non-run tools."
         ),
+    )
+    test_inputs: list[CopilotTestInput] | None = Field(
+        None,
+        description="Where each input of the run this result dispatched came from. Keys and sources only, never values",
     )
     executed_source_reference: str | None = Field(
         None,
