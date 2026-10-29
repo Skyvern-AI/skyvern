@@ -76,6 +76,7 @@ from skyvern.exceptions import (
     IllegitComplete,
     ImaginaryFileUrl,
     ImaginarySecretValue,
+    InputElementCoveredByUntypeableElement,
     InputToInvisibleElement,
     InputToReadonlyElement,
     InteractWithDisabledElement,
@@ -10150,6 +10151,26 @@ async def _handle_input_text_action(
             dom=dom, incremental_page=incremental_scraped
         )
         if blocking_element and exist and await blocking_element.is_editable():
+            # is_editable() answers for a <label>'s control, so a pop-up's radio label covering the
+            # field reports editable while every fill routed through it is rejected by type. Refuse
+            # only on a positive read, so an unreadable blocker keeps the long-standing retarget.
+            if await blocking_element.accepts_text_fill() is False:
+                blocking_tag_name = blocking_element.get_tag_name().lower()
+                LOG.info(
+                    "The element is covered by a blocking element that can't take text; not typing into it",
+                    element_id=skyvern_element.get_id(),
+                    blocking_element_id=blocking_element.get_id(),
+                    blocking_tag_name=blocking_tag_name,
+                )
+                return [
+                    ActionFailure(
+                        InputElementCoveredByUntypeableElement(
+                            element_id=skyvern_element.get_id(),
+                            blocking_element_id=blocking_element.get_id(),
+                            blocking_tag_name=blocking_tag_name,
+                        )
+                    )
+                ]
             LOG.warning(
                 "Find a blocking element to the current element, going to input on the blocking element",
             )
