@@ -20582,8 +20582,11 @@ def v3_ab_ineligibility_reason(blocks: list[BlockTypeVar]) -> V3AbIneligibleReas
     Eligibility is a property of the RUN, not of a block: a run whose blocks disagreed about the
     engine would drive one browser session with two engines, so no per-run outcome would be
     attributable to either arm. One participating block v3 cannot execute therefore disqualifies
-    the run, and so does one block pinned to a non-default engine -- that block is honored
-    as-authored in both arms, but it would leave the control arm mixed.
+    the run, and so does a block pinned to skyvern-1.0 or to an engine other than v3 -- that block is
+    honored as-authored in both arms, but it would leave the run mixed in at least one arm. A skyvern-3.0
+    block v3 can run is honored too and does not disqualify the run: it leaves the control arm mixed, but
+    control stays the author's own definition, so the read is still the author's definition against
+    all-v3. A skyvern-3.0 block v3 cannot run still disqualifies it, since dispatch runs it on the step engine.
 
     ``blocks`` must be the flattened definition (``get_all_blocks``), i.e. the superset of task
     blocks the run could reach. A ``block_labels`` re-run executes only a whitelisted subset of
@@ -20618,6 +20621,10 @@ def v3_ab_ineligibility_reason(blocks: list[BlockTypeVar]) -> V3AbIneligibleReas
         if not isinstance(block, BaseTaskBlock):
             continue
         if block.block_type in _ENGINE_INERT_BLOCK_TYPES:
+            continue
+        if block.engine == RunEngine.skyvern_v3 and _task_block_supports_v3(block):
+            # Explicit v3 that v3 can run executes v3 in both arms, so it neither disqualifies the run nor
+            # counts as rerouted. One v3 cannot run falls back to the step engine at dispatch, so it falls through.
             continue
         if block.engine not in (None, RunEngine.skyvern_v1) or _pins_v1(block):
             return V3AbIneligibleReason.pinned_engine

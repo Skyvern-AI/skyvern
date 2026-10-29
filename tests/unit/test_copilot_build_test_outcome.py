@@ -32,7 +32,10 @@ from skyvern.forge.sdk.copilot.agent import (
     _review_projection_for,
     _translate_to_agent_result,
 )
-from skyvern.forge.sdk.copilot.build_test_connect_failure import build_test_connect_failure_sentence
+from skyvern.forge.sdk.copilot.build_test_connect_failure import (
+    BuildTestConnectFailureState,
+    build_test_connect_failure_sentence,
+)
 from skyvern.forge.sdk.copilot.build_test_outcome import (
     BLOCK_FACT_SCREEN_NOTICE_MAX_CHARS,
     BLOCK_FACT_URL_MAX_CHARS,
@@ -507,7 +510,7 @@ def test_billing_credit_refusal_schema_requires_no_retry_or_new_identity() -> No
         "retry_action": None,
     }
     with pytest.raises(ValidationError):
-        BuildTestConnectFailure(state="billing_credit_admission_refusal")
+        BuildTestConnectFailure(state="billing_credit_admission_refusal", retry_action="test_end_to_end")
     with pytest.raises(ValidationError):
         BuildTestConnectFailure(
             state="billing_credit_admission_refusal",
@@ -516,6 +519,24 @@ def test_billing_credit_refusal_schema_requires_no_retry_or_new_identity() -> No
         )
     with pytest.raises(ValidationError):
         BuildTestConnectFailure(state="already_closed", retry_action=None)
+
+
+@pytest.mark.parametrize(
+    "state",
+    [
+        "billing_credit_admission_refusal",
+        "saved_profile_unresolved",
+        "saved_profile_not_applied",
+        "unsaved_browser_profile_pick",
+    ],
+)
+def test_no_retry_connect_failure_survives_an_exclude_none_round_trip(state: BuildTestConnectFailureState) -> None:
+    failure = BuildTestConnectFailure(state=state, retry_action=None)
+
+    dumped = failure.model_dump(mode="json", exclude_none=True)
+
+    assert "retry_action" not in dumped
+    assert BuildTestConnectFailure.model_validate(dumped) == failure
 
 
 def test_billing_refusal_preserves_prior_run_evidence_and_repair_context() -> None:

@@ -180,6 +180,7 @@ describe("ReviewGateCard — untested proposals stay actionable", () => {
   it("keeps Accept and Always accept enabled with an untested verdict", () => {
     render(
       <ReviewGateCard
+        latestTurnCause={null}
         turn={turn({ proposalDisposition: "review_untested" })}
         pending
         verdict="untested"
@@ -208,6 +209,7 @@ describe("ReviewGateCard — Test end-to-end recourse", () => {
   it("labels the typed connection-failure action as a fresh-session retry", () => {
     render(
       <ReviewGateCard
+        latestTurnCause="already_closed"
         turn={turn({
           proposalDisposition: "review_untested",
           turnFacts: {
@@ -243,6 +245,7 @@ describe("ReviewGateCard — Test end-to-end recourse", () => {
     let testRuns = 0;
     render(
       <ReviewGateCard
+        latestTurnCause="billing_credit_admission_refusal"
         turn={turn({
           proposalDisposition: "review_untested",
           turnFacts: {
@@ -289,10 +292,45 @@ describe("ReviewGateCard — Test end-to-end recourse", () => {
     expect(testRuns).toBe(0);
   });
 
+  it("ignores the owner turn's refusal when the newest turn recorded no cause", () => {
+    render(
+      <ReviewGateCard
+        latestTurnCause={null}
+        turn={turn({
+          proposalDisposition: "review_untested",
+          turnFacts: {
+            factsAvailable: true,
+            evaluationState: null,
+            runId: null,
+            runCompleted: null,
+            terminalCause: "unsaved_browser_profile_pick",
+            blocksRunThisTurn: 0,
+            ranCleanOnCurrentSource: false,
+            authoredBlockCount: 1,
+            matchingSourceBlockCount: 0,
+          },
+        })}
+        pending
+        verdict="untested"
+        actionsEnabled
+        hasProposal
+        onAccept={noop}
+        onAlwaysAccept={noop}
+        onReject={noop}
+        onReview={noop}
+        onTestEndToEnd={noop}
+      />,
+    );
+
+    expect(screen.queryByText(/No run started/)).toBeNull();
+    expect(screen.getByRole("button", { name: "More actions" })).not.toBeNull();
+  });
+
   it("keeps Accept working on an untested proposal that never ran end-to-end", () => {
     let accepted = 0;
     render(
       <ReviewGateCard
+        latestTurnCause={null}
         turn={turn({ proposalDisposition: "review_untested" })}
         pending
         verdict="untested"
@@ -317,6 +355,7 @@ describe("ReviewGateCard — Test end-to-end recourse", () => {
   it("does not claim every step was tested when one of them never ran", () => {
     render(
       <ReviewGateCard
+        latestTurnCause={null}
         turn={turn({
           proposalDisposition: "review_untested",
           blocks: [
@@ -343,6 +382,7 @@ describe("ReviewGateCard — Test end-to-end recourse", () => {
     let testRuns = 0;
     render(
       <ReviewGateCard
+        latestTurnCause={null}
         turn={turn({ proposalDisposition: "review_untested", blocks: [] })}
         pending
         verdict="untested"
@@ -402,6 +442,7 @@ describe("ReviewGateCard — Test end-to-end recourse", () => {
     let rejects = 0;
     render(
       <ReviewGateCard
+        latestTurnCause={null}
         turn={turn({ proposalDisposition: "review_untested", blocks: [] })}
         pending
         verdict="untested"
@@ -430,6 +471,7 @@ describe("ReviewGateCard — Test end-to-end recourse", () => {
   it("drops an open confirmation and locks More actions when the gate locks", () => {
     const gate = (failure: "reload" | null) => (
       <ReviewGateCard
+        latestTurnCause={null}
         turn={turn({ proposalDisposition: "review_untested", blocks: [] })}
         pending
         verdict="untested"
@@ -467,6 +509,7 @@ describe("ReviewGateCard — Test end-to-end recourse", () => {
   it("withholds the every-step claim when the proposal could not be projected", () => {
     render(
       <ReviewGateCard
+        latestTurnCause={null}
         turn={turn({ blocks: [completedBlock], review: null })}
         pending
         verdict="untested"
@@ -490,6 +533,7 @@ describe("ReviewGateCard — Test end-to-end recourse", () => {
   it("withholds the every-step claim when the proposal still holds an untested step", () => {
     render(
       <ReviewGateCard
+        latestTurnCause={null}
         turn={turn({
           blocks: [completedBlock],
           review: {
@@ -527,6 +571,7 @@ describe("ReviewGateCard — Test end-to-end recourse", () => {
   it("states that steps were tested alone, not together, and that the run acts on the site", () => {
     render(
       <ReviewGateCard
+        latestTurnCause={null}
         turn={turn({
           proposalDisposition: "review_untested",
           blocks: [completedBlock],
@@ -571,6 +616,7 @@ describe("ReviewGateCard — block label humanization", () => {
   it("renders legacy proposals neutrally while keeping the raw label in a title attribute", () => {
     render(
       <ReviewGateCard
+        latestTurnCause={null}
         turn={turn({
           draft: {
             blockCount: 1,
@@ -619,6 +665,7 @@ describe("ReviewGateCard — recorded review projection", () => {
   it("renders all change classes, never-tested markers, and duplicate notes without disabling Accept", () => {
     render(
       <ReviewGateCard
+        latestTurnCause={null}
         turn={turn({
           review: {
             blocks: [
@@ -697,6 +744,7 @@ describe("ReviewGateCard — recorded review projection", () => {
   it("never folds a removed block behind Show more, so a deletion is not accepted unseen", () => {
     render(
       <ReviewGateCard
+        latestTurnCause={null}
         turn={turn({
           review: {
             blocks: [
@@ -763,6 +811,7 @@ describe("ReviewGateCard — answered proposals collapse", () => {
   it("shrinks an accepted proposal to one line whose pill leads with the worst note", () => {
     render(
       <ReviewGateCard
+        latestTurnCause={null}
         turn={turn({
           blocks: [failedBlock],
           review: {
@@ -821,6 +870,7 @@ describe("ReviewGateCard — source coverage", () => {
   it("separates a block run against different source from one never run", () => {
     render(
       <ReviewGateCard
+        latestTurnCause={null}
         turn={turn({
           review: {
             blocks: [
@@ -860,6 +910,7 @@ describe("ReviewGateCard — source coverage", () => {
   it("says a renamed block is untested under this name, not that it failed", () => {
     render(
       <ReviewGateCard
+        latestTurnCause={null}
         turn={turn({
           review: {
             blocks: [

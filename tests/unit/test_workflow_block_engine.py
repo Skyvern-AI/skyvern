@@ -207,15 +207,46 @@ async def test_explicit_block_engine_is_never_overridden_by_treatment_arm(scoped
     assert v2_block.resolve_engine("wr_pinned") == RunEngine.skyvern_v2
 
 
-@pytest.mark.parametrize("pinned_engine", [RunEngine.openai_cua, RunEngine.skyvern_v3])
+@pytest.mark.parametrize("pinned_engine", [RunEngine.openai_cua, RunEngine.skyvern_v2])
 def test_pinned_non_default_engine_block_disqualifies_the_run(pinned_engine: RunEngine) -> None:
     eligible = _make_block(TaskBlock, label="ok")
-    # Pinned as-authored in both arms, but that leaves control mixed-engine, so it
-    # disqualifies the whole run rather than being skipped. A v3 pin is the user opting
-    # in explicitly, not a treatment exposure.
     pinned = _make_block(NavigationBlock, label="pinned", navigation_goal="Apply to the job", engine=pinned_engine)
 
     assert run_is_eligible_for_v3_ab([eligible, pinned]) is False
+
+
+def _mixed_v3_and_stored_v1_blocks() -> list[BaseTaskBlock]:
+    return [
+        _make_block(TaskBlock, label="unset"),
+        _make_block(
+            NavigationBlock, label="stored_v1", navigation_goal="Apply to the job", engine=RunEngine.skyvern_v1
+        ),
+        _make_block(
+            NavigationBlock, label="chosen_v3", navigation_goal="Apply to the job", engine=RunEngine.skyvern_v3
+        ),
+    ]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("treatment", "expected"),
+    [
+        (True, [RunEngine.skyvern_v3, RunEngine.skyvern_v3, RunEngine.skyvern_v3]),
+        (False, [RunEngine.skyvern_v1, RunEngine.skyvern_v1, RunEngine.skyvern_v3]),
+    ],
+    ids=["treatment_routes_unpinned_blocks_to_v3", "control_keeps_stored_engines"],
+)
+async def test_mixed_definition_with_an_explicit_v3_block_follows_the_arm(
+    scoped_context: SkyvernContext, treatment: bool, expected: list[RunEngine]
+) -> None:
+    blocks = _mixed_v3_and_stored_v1_blocks()
+    reason = v3_ab_ineligibility_reason(blocks)
+    assert reason is None
+
+    provider = FakeExperimentationProvider({WORKFLOW_TASK_V3_AB_FLAG: treatment})
+    await resolve_arm(scoped_context, provider, workflow_run_id="wr_mixed", ineligibility_reason=reason)
+
+    assert [block.resolve_engine("wr_mixed") for block in blocks] == expected
 
 
 @pytest.mark.asyncio
@@ -844,6 +875,31 @@ def _pinned_engine_blocks() -> list[BaseTaskBlock]:
     return [eligible, pinned]
 
 
+def _explicit_v3_only_blocks() -> list[BaseTaskBlock]:
+    return [_make_block(TaskBlock, label="chosen_v3", engine=RunEngine.skyvern_v3)]
+
+
+def _explicit_v3_with_pinned_v1_blocks() -> list[BaseTaskBlock]:
+    pinned_v1 = _make_block(TaskBlock, label="pinned_v1", engine=RunEngine.skyvern_v1)
+    pinned_v1.engine_pinned = True
+    return [_make_block(TaskBlock, label="chosen_v3", engine=RunEngine.skyvern_v3), pinned_v1]
+
+
+def _explicit_v3_with_cua_blocks() -> list[BaseTaskBlock]:
+    return [
+        _make_block(TaskBlock, label="chosen_v3", engine=RunEngine.skyvern_v3),
+        _make_block(TaskBlock, label="unset"),
+        _make_block(TaskBlock, label="cua", engine=RunEngine.anthropic_cua),
+    ]
+
+
+def _explicit_v3_on_a_block_v3_cannot_run_blocks() -> list[BaseTaskBlock]:
+    return [
+        _make_block(ValidationBlock, label="dlv", complete_on_download=True, engine=RunEngine.skyvern_v3),
+        _make_block(TaskBlock, label="unset"),
+    ]
+
+
 def _agent_step_blocks() -> list[Block]:
     agent = AgentStepBlock(
         label="agent", output_parameter=_make_output_parameter("agent"), prompt="Find it.", data_schema={}
@@ -922,6 +978,11 @@ def _jinja_condition_while_loop_blocks() -> list[Block]:
     ("blocks_factory", "expected_reason"),
     [
         (_pinned_engine_blocks, V3AbIneligibleReason.pinned_engine),
+        (_mixed_v3_and_stored_v1_blocks, None),
+        (_explicit_v3_only_blocks, V3AbIneligibleReason.no_reroutable_blocks),
+        (_explicit_v3_with_pinned_v1_blocks, V3AbIneligibleReason.pinned_engine),
+        (_explicit_v3_with_cua_blocks, V3AbIneligibleReason.pinned_engine),
+        (_explicit_v3_on_a_block_v3_cannot_run_blocks, V3AbIneligibleReason.pinned_engine),
         (_agent_step_blocks, V3AbIneligibleReason.pinned_engine),
         (_unsupported_block_type_blocks, V3AbIneligibleReason.unsupported_block),
         (_download_gated_validation_blocks, V3AbIneligibleReason.unsupported_block),
@@ -935,6 +996,11 @@ def _jinja_condition_while_loop_blocks() -> list[Block]:
     ],
     ids=[
         "pinned_engine",
+        "explicit_v3_with_unpinned_v1_is_eligible",
+        "explicit_v3_only_has_nothing_to_reroute",
+        "explicit_v3_with_pinned_v1",
+        "explicit_v3_with_cua",
+        "explicit_v3_on_a_block_v3_cannot_run",
         "agent_step_runs_v3_browser_work_in_both_arms",
         "unsupported_block_type",
         "unsupported_block_validation_download",

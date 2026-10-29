@@ -112,6 +112,7 @@ TerminalCause = Literal[
     "billing_credit_admission_refusal",
     "saved_profile_unresolved",
     "saved_profile_not_applied",
+    "unsaved_browser_profile_pick",
 ]
 BuildTestPacketLocatorUnobservedReason = Literal[
     "worker_owned_run",

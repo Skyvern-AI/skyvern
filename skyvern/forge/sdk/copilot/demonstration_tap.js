@@ -508,6 +508,7 @@
   let press = null;
   let nativeDrag = null;
   let suppressClick = false;
+  let labelControl = null;
   let typing = null;
   let selectStart = null;
   let stopped = false;
@@ -916,6 +917,7 @@
     press = null;
     nativeDrag = null;
     suppressClick = false;
+    labelControl = null;
     if (event.button !== 0) return;
     const select = nativeSelect(raw);
     if (select) {
@@ -1015,6 +1017,15 @@
   });
   add(globalThis, "click", (event) => {
     if (!event.isTrusted) return;
+    // A label's activation click on its control shares the label click's gesture (same pointerId, timeStamp and
+    // detail), so it is recognised by target until the next pointerdown or keydown starts a new gesture.
+    const forwarded = labelControl;
+    const clicked = eventElement(event);
+    labelControl =
+      clicked && clicked.closest
+        ? clicked.closest("label")?.control || null
+        : null;
+    if (forwarded && clicked === forwarded) return;
     if (suppressClick) {
       suppressClick = false;
       return;
@@ -1126,6 +1137,7 @@
   });
   add(globalThis, "keydown", (event) => {
     if (!event.isTrusted || event.repeat) return;
+    labelControl = null;
     if (event.key === "Enter" || event.key === " ") watchEventRoots(event);
     const raw = eventElement(event);
     const target = clickElement(raw);

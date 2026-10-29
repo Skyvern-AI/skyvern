@@ -8462,6 +8462,16 @@ def test_the_hold_text_is_generic() -> None:
     assert (on.description, on.parameters) == (off.description, off.parameters)
 
 
+def test_the_hold_lets_the_goal_text_set_the_refinish_status() -> None:
+    # A goal can give the stopping outcome its own status ("no record found: mark as complete"); the hold
+    # must not fix the re-finish to terminated when the rule the model quotes says otherwise.
+    assert "status=terminated" not in loop_module.JUSTIFY_HOLD_MESSAGE
+    assert (
+        "finish again with the status the goal's text gives this outcome (terminated if it gives none)"
+        in loop_module.JUSTIFY_HOLD_MESSAGE
+    )
+
+
 @pytest.mark.asyncio
 async def test_a_missing_fact_stop_restated_after_the_hold_stands_as_terminated() -> None:
     activity = ActivityRecency()

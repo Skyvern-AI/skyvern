@@ -28,6 +28,7 @@ from skyvern.forge import app
 from skyvern.forge.sdk.copilot import agent as agent_module
 from skyvern.forge.sdk.copilot import tools
 from skyvern.forge.sdk.copilot.agent import _verified_workflow_or_none
+from skyvern.forge.sdk.copilot.build_test_connect_failure import BuildTestConnectFailureState
 from skyvern.forge.sdk.copilot.build_test_outcome import BuildTestFailedOperation, RecordedBuildTestOutcome
 from skyvern.forge.sdk.copilot.code_block_synthesis import synthesize_goto_code_block
 from skyvern.forge.sdk.copilot.config import DEFAULT_TOKEN_BUDGET, BlockAuthoringPolicy, CopilotConfig
@@ -4060,6 +4061,7 @@ async def test_test_end_to_end_runs_every_label_from_a_run_owned_browser(monkeyp
         force_fresh_session: bool = False,
         execution_snapshot: Any = None,
         explicit_blank: bool = False,
+        seed_like_normal_run: bool = False,
         use_ephemeral_inputs: bool = True,
     ) -> dict[str, Any]:
         captured["requested"] = list(params["block_labels"])
@@ -4068,6 +4070,7 @@ async def test_test_end_to_end_runs_every_label_from_a_run_owned_browser(monkeyp
         captured["frontier_start_label"] = frontier_start_label
         captured["force_fresh_session"] = force_fresh_session
         captured["explicit_blank"] = explicit_blank
+        captured["seed_like_normal_run"] = seed_like_normal_run
         return {"ok": True, "data": {}}
 
     async def _fake_verify(copilot_ctx: Any, result: dict[str, Any], handler_start: float) -> None:
@@ -4089,6 +4092,7 @@ async def test_test_end_to_end_runs_every_label_from_a_run_owned_browser(monkeyp
     assert captured["force_fresh_session"] is True
     assert captured["has_staged_proposal"] is True
     assert captured["explicit_blank"] is True
+    assert captured["seed_like_normal_run"] is False
 
 
 @pytest.mark.asyncio
@@ -4250,7 +4254,7 @@ workflow_definition:
     assert "sensitive-target" not in handoff[1]["output"]
     assert "customer-secret" not in handoff[1]["output"]
     assert "Every step completed" not in handoff[1]["output"]
-    run.assert_awaited_once_with(ctx, workflow_yaml)
+    run.assert_awaited_once_with(ctx, workflow_yaml, seed_like_normal_run=True)
 
 
 @pytest.mark.asyncio
@@ -4545,11 +4549,41 @@ async def test_test_end_to_end_hands_noncompleted_results_to_the_model(
         assert packet["run"].get("status") == (run_result.get("data") or {}).get("overall_status")
     control_signal = (run_result.get("data") or {}).get("control_signal")
     if control_signal:
-        assert output["error"] == run_result["error"]
         assert output["data"]["control_signal"] == {"kind": control_signal["kind"]}
+    if control_signal or (run_result.get("error") and not (run_result.get("data") or {}).get("workflow_run_id")):
+        assert output["error"] == run_result["error"]
     else:
         assert "error" not in output
     assert "Every step completed" not in handoff[1]["output"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "state", ["unsaved_browser_profile_pick", "saved_profile_unresolved", "saved_profile_not_applied"]
+)
+async def test_test_end_to_end_records_a_typed_start_refusal_and_forwards_its_error(
+    monkeypatch: pytest.MonkeyPatch,
+    state: BuildTestConnectFailureState,
+) -> None:
+    refusal = run_execution_module._saved_profile_start_failure(state, requested_block_labels=["inspect_result"])
+
+    async def _fake_process(**kwargs: Any) -> _FakeWorkflow:
+        return _FakeWorkflow(_wf_def(("inspect_result", "code", {"code": "return {}"})))
+
+    monkeypatch.setattr(run_execution_module, "_process_workflow_yaml", _fake_process)
+    monkeypatch.setattr(
+        run_execution_module, "_run_blocks_and_collect_debug", AsyncMock(return_value=copy.deepcopy(refusal))
+    )
+    ctx = _make_ctx(workflow_permanent_id="wpid_typed_refusal")
+
+    handoff = await agent_module._run_end_to_end_test_turn(ctx, workflow_yaml="workflow: yaml")
+
+    output = json.loads(handoff[1]["output"])
+    assert output["ok"] is False
+    assert output["error"] == refusal["error"]
+    assert output["data"]["build_test_packet"]["failure"]["connect_failure"]["state"] == state
+    assert "build_test_packet_omitted" not in output["data"]
+    assert agent_module._terminal_cause_for_context(ctx) == state
 
 
 @pytest.mark.asyncio
@@ -5107,7 +5141,7 @@ async def test_completed_test_result_handoff_uses_ordinary_acting_agent_surface(
         call_model_input_filter=make_copilot_call_model_input_filter(DEFAULT_TOKEN_BUDGET),
     )
 
-    async def fake_run(ctx: CopilotContext, actual_workflow_yaml: str) -> dict[str, Any]:
+    async def fake_run(ctx: CopilotContext, actual_workflow_yaml: str, *, seed_like_normal_run: bool) -> dict[str, Any]:
         assert actual_workflow_yaml == workflow_yaml
         definition = _wf_def(("inspect_result", "code", {"code": 'return {"count": 3}'}))
         ctx.last_workflow = _FakeWorkflow(definition)

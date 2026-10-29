@@ -2268,18 +2268,18 @@ class _ExecutionResult(dict[str, Any]):
             execution.snapshot.workflow,
             provenance=execution.snapshot.provenance,
         )
-        if execution.explicit_blank:
-            data["browser_start"] = {
-                "kind": "separate_blank_context",
-                "restored_saved_profile": False,
-                "inherited_browser_state": False,
-            }
-        elif execution.browser_seed_source is not None:
+        if execution.browser_seed_source is not None:
             data["browser_start"] = {
                 "kind": "separate_saved_profile_context",
                 "restored_saved_profile": True,
                 "inherited_browser_state": False,
                 "seed_source": execution.browser_seed_source.value,
+            }
+        elif execution.explicit_blank:
+            data["browser_start"] = {
+                "kind": "separate_blank_context",
+                "restored_saved_profile": False,
+                "inherited_browser_state": False,
             }
 
 
@@ -3669,13 +3669,6 @@ async def acquire_build_test_browser_session(
         )
 
 
-_UNSAVED_BROWSER_PROFILE_PICK_ERROR = (
-    "Saved browser profile approval blocked this Copilot run before dispatch. "
-    "Reason codes: unsaved_browser_profile_pick. The workflow draft selects a saved browser profile that the "
-    "saved workflow does not use, so it cannot seed a test until the workflow is saved with it."
-)
-
-
 def _build_test_seed_preview_run(workflow: Workflow, organization_id: str) -> WorkflowRun:
     now = datetime.now(UTC)
     return WorkflowRun(
@@ -3751,10 +3744,12 @@ async def run_workflow_end_to_end(
     ctx: CopilotContext,
     workflow_yaml: str | None = None,
     parameters: dict[str, Any] | None = None,
+    *,
+    seed_like_normal_run: bool = False,
 ) -> dict[str, Any]:
-    """Run every block of a candidate workflow in one browser minted for this run. Frontier
-    selection is bypassed and the provenance stamped so a clean result earns composition credit
-    for the whole chain rather than for one label."""
+    """Run every block of a candidate workflow, frontier bypassed, in one browser minted for this run so a
+    clean result earns composition credit for the whole chain. ``seed_like_normal_run`` loads the saved
+    profile a normal run would load; otherwise the browser starts blank."""
     authority_error = _authority_tool_error(ctx, "run_blocks_and_collect_debug")
     if authority_error:
         return {"ok": False, "error": authority_error}
@@ -3796,10 +3791,11 @@ async def run_workflow_end_to_end(
         {"block_labels": labels, "parameters": parameters or {}},
         ctx,
         labels_to_execute=labels,
-        frontier_start_label=labels[0],
+        frontier_start_label=(_executable_workflow_block_labels(workflow.workflow_definition) or labels)[0],
         force_fresh_session=True,
         execution_snapshot=snapshot,
         explicit_blank=True,
+        seed_like_normal_run=seed_like_normal_run,
         use_ephemeral_inputs=workflow_yaml is not None,
     )
     recorded_outcome = await _verify_and_record_run_blocks_result(ctx, result, time.monotonic())
@@ -4013,6 +4009,7 @@ async def _run_blocks_and_collect_debug(
     force_fresh_session: bool = False,
     execution_snapshot: CopilotExecutionSnapshot | None = None,
     explicit_blank: bool = False,
+    seed_like_normal_run: bool = False,
     use_ephemeral_inputs: bool = True,
     new_exit: bool = False,
     verified_new_exit: FreshExitReceipt | None = None,
@@ -4388,7 +4385,7 @@ async def _run_blocks_and_collect_debug(
     if (
         use_fresh_session
         and starts_at_workflow_head
-        and not explicit_blank
+        and (not explicit_blank or seed_like_normal_run)
         and ctx.turn_origin != TurnOrigin.code_block_ai_fallback
     ):
         # Previewed on the authored workflow, before the copy that turns off saving, so the profile is the
@@ -4434,7 +4431,7 @@ async def _run_blocks_and_collect_debug(
                 else set()
             )
             if preview[0] not in settled_picks:
-                return {"ok": False, "error": _UNSAVED_BROWSER_PROFILE_PICK_ERROR}
+                return _saved_profile_start_failure("unsaved_browser_profile_pick", requested_block_labels=block_labels)
         if preview is not None:
             seed_profile_id, browser_seed_source = preview
             proxy_session_id = (
@@ -4520,7 +4517,7 @@ async def _run_blocks_and_collect_debug(
         if explicit_blank and (
             not isinstance(run_session_id, str) or not run_session_id or run_session_id == debug_session_id
         ):
-            return {"ok": False, "error": "A separate blank browser was not acquired; execution was not started."}
+            return {"ok": False, "error": "A separate browser was not acquired; execution was not started."}
         used_fresh_run_session = True
         run_detached_from_chat = True
         LOG.info(
@@ -4724,6 +4721,7 @@ async def _run_blocks_and_collect_debug(
                 force_fresh_session=force_fresh_session,
                 execution_snapshot=execution.snapshot,
                 explicit_blank=explicit_blank,
+                seed_like_normal_run=seed_like_normal_run,
                 use_ephemeral_inputs=use_ephemeral_inputs,
                 new_exit=new_exit,
                 verified_new_exit=new_exit_receipt,
@@ -4789,14 +4787,16 @@ async def _run_blocks_and_collect_debug(
         if explicit_blank and workflow_run.browser_session_id != run_session_id:
             await app.WORKFLOW_SERVICE.mark_workflow_run_as_failed_if_not_final(
                 workflow_run_id=workflow_run.workflow_run_id,
-                failure_reason="The prepared run did not retain the requested blank browser; execution was not started.",
+                failure_reason=(
+                    "The prepared run did not retain the requested separate browser; execution was not started."
+                ),
             )
             if dispatch_draft_workflow_id is not None:
                 await _delete_dispatch_draft(dispatch_draft_workflow_id, ctx.organization_id)
                 dispatch_draft_workflow_id = None
             return {
                 "ok": False,
-                "error": "The prepared run did not retain the requested blank browser; execution was not started.",
+                "error": "The prepared run did not retain the requested separate browser; execution was not started.",
             }
         if browser_seed is not None:
             # A session-bound run skips the engine's own seed stamp; its mid-run login handling reads this one.
