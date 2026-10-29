@@ -2373,9 +2373,8 @@ async def _run_end_to_end_test_turn(
     *,
     workflow_yaml: str,
 ) -> list[dict[str, str]]:
-    setup_error_for_llm: str | None = None
     try:
-        result = await run_workflow_end_to_end(ctx, workflow_yaml)
+        result = await run_workflow_end_to_end(ctx, workflow_yaml, seed_like_normal_run=True)
     except Exception as exc:
         LOG.warning(
             "copilot_test_end_to_end_run_failed_before_result",
@@ -2384,13 +2383,13 @@ async def _run_end_to_end_test_turn(
             error=str(exc),
             exc_info=True,
         )
-        setup_error_for_llm = "The end-to-end test could not be started."
-        result = {"ok": False, "error": setup_error_for_llm}
+        result = {"ok": False, "error": "The end-to-end test could not be started."}
     result_data = result.get("data")
     if not isinstance(result_data, dict):
         result_data = {}
         result["data"] = result_data
-    if result.get("ok") is False and not result_data.get("workflow_run_id"):
+    refused_before_run = result.get("ok") is False and not result_data.get("workflow_run_id")
+    if refused_before_run:
         result_data.setdefault("overall_status", "setup_failed")
     if BUILD_TEST_PACKET_KEY not in result_data:
         finalize_build_test_result(
@@ -2458,9 +2457,7 @@ async def _run_end_to_end_test_turn(
         "data": handoff_data,
         "turn_seconds_remaining": TOTAL_TIMEOUT_SECONDS if seconds_remaining is None else seconds_remaining,
     }
-    if (control_kind in watchdog_control_kinds or setup_error_for_llm is not None) and isinstance(
-        sanitized.get("error"), str
-    ):
+    if (control_kind in watchdog_control_kinds or refused_before_run) and isinstance(sanitized.get("error"), str):
         handoff_result["error"] = sanitized["error"]
     arguments = json.dumps(
         {

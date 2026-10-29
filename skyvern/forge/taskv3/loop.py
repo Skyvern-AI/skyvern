@@ -728,9 +728,9 @@ def _candidate_hold_message(held: dict[str, str]) -> str:
 _CANDIDATE_HOLD_SKIP = "queued before the held download facts above were shown; decide on them, then finish again"
 JUSTIFY_HOLD_MESSAGE = (
     "verdict held once: a terminated verdict needs a rule written in the goal, its criteria or these instructions, "
-    "or text on the page, that prevents the task. If you can quote it, finish again with status=terminated and the "
-    "verdict will stand. If you cannot, nothing prevents the task: continue it. If a field the form requires has no "
-    "value in the data, finish again and name that field."
+    "or text on the page, that prevents the task. If you can quote it, finish again with the status the goal's text "
+    "gives this outcome (terminated if it gives none) and the verdict will stand. If you cannot, nothing prevents "
+    "the task: continue it. If a field the form requires has no value in the data, finish again and name that field."
 )
 _JUSTIFY_HOLD_SKIP = "queued after a finish that was held; read the hold above, then decide"
 # Telemetry only: the loop never reads it, so no verdict depends on a model's wording.

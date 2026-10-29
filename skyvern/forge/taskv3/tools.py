@@ -33,7 +33,7 @@ from contextvars import ContextVar
 from datetime import datetime
 from types import MappingProxyType
 from typing import TYPE_CHECKING, Any, Awaitable, Callable, Literal, NamedTuple, TypeVar
-from urllib.parse import urlparse
+from urllib.parse import unquote, urlparse
 
 import structlog
 from PIL import Image, ImageDraw
@@ -3550,6 +3550,42 @@ def _shows_omitted_note(count: int) -> str:
     )
 
 
+# Where a link goes (path on the same origin, host plus path off it, never the query or fragment), printed unless
+# the label and the path's last segment already name each other (either holds the other as whole words, or as one
+# run of letters): two links can carry labels that both fit an instruction while only the destination tells them apart.
+LINK_DESTINATION_MAX = 60
+# Per reading across every frame, framing included; what it leaves off is reported, never silent.
+LINK_DESTINATION_TOTAL_CAP = 1200
+_LINK_EXTENSION_RE = re.compile(r"\.[a-z0-9]{1,5}$", re.IGNORECASE)
+
+
+def _words(text: str) -> list[str]:
+    return re.findall(r"[^\W_]+", text.casefold())
+
+
+def _holds_words(outer: list[str], inner: list[str]) -> bool:
+    return any(outer[i : i + len(inner)] == inner for i in range(len(outer) - len(inner) + 1))
+
+
+def _link_destination_adds(destination: str, label: str) -> bool:
+    path = destination if destination.startswith("/") else destination.partition("/")[2]
+    segments = [seg for seg in path.split("/") if seg]
+    if not segments and destination.startswith("/"):
+        return False
+    last = _words(_LINK_EXTENSION_RE.sub("", unquote(segments[-1])) if segments else destination.partition("/")[0])
+    named = _words(label)
+    if not last or not named:
+        return True
+    run_last, run_named = "".join(last), "".join(named)
+    return not (
+        _holds_words(named, last) or _holds_words(last, named) or run_last in run_named or run_named in run_last
+    )
+
+
+def _link_destination_omitted_note(count: int) -> str:
+    return f"(to= left off {count} more link destination(s): this reading's budget for it ran out.)"
+
+
 _SHOWN_TEXT_JS = (
     r"""((el, printed) => {
   try {
@@ -4965,6 +5001,12 @@ _ACT_SELECTOR_PREFIX = '[data-tv3-act="'
 _ACT_WRITE_HANDLE_JS = (
     "(el, t) => { try { el.setAttribute('data-tv3-act', t); } catch (e) { return false; } return el.isConnected; }"
 )
+# Whether the element holds its document's caret, through open shadow roots.
+_HOLDS_CARET_JS = r"""(el) => {
+  let a = document.activeElement;
+  while (a && a.shadowRoot && a.shadowRoot.activeElement) a = a.shadowRoot.activeElement;
+  return a === el;
+}"""
 
 
 def _annotate_screenshot(png_bytes: bytes, elements: list[dict[str, Any]], vw: int, *, max_width: int = 1024) -> bytes:
@@ -6648,6 +6690,23 @@ _TYPING_READONLY_JS = (
     + _NATIVE_LABEL_JS
     + _TARGET_READONLY_JS
     + r"""  return { exists: true, readOnly };
+}"""
+)
+
+# Whether the caret is in the field and the field is empty, read after the focus click: a widget can write text into
+# its input on focus, and a field that lost the caret must not be typed into without the clear's actionability wait.
+_CARET_IN_EMPTY_FIELD_JS = (
+    r"""(arg) => {
+  const _q = """
+    + _ROOT_QUERY_JS
+    + r""";
+  const el = _q.find(arg.sel);
+  if (!el) return false;
+  let root = null;
+  try { root = Node.prototype.getRootNode.call(el); } catch (e) { root = null; }
+  const active = root && root.activeElement ? root.activeElement : document.activeElement;
+  if (el.readOnly || el.disabled) return false;
+  return active === el && (el.isContentEditable ? el.textContent : el.value) === '';
 }"""
 )
 
@@ -9127,6 +9186,21 @@ async (__tv3TextArgs) => {
   const _shownText = """
     + _SHOWN_TEXT_JS
     + r""";
+  // Resolved against the link's own document; http(s) only, query and fragment dropped. A link to the page it
+  // is on (href="#", "#section") names no destination.
+  const _linkDestination = (el) => {
+    try {
+      if (String(el.tagName).toUpperCase() !== 'A') return '';
+      const raw = Element.prototype.getAttribute.call(el, 'href');
+      if (!raw) return '';
+      const u = new URL(raw, el.baseURI);
+      if (u.protocol !== 'http:' && u.protocol !== 'https:') return '';
+      let own = null;
+      try { own = new URL(el.ownerDocument.URL); } catch (e) {}
+      if (!own || u.origin !== own.origin) return u.host + u.pathname;
+      return u.pathname === own.pathname ? '' : u.pathname;
+    } catch (e) { return ''; }
+  };
   // Read through the prototypes: the walk below crosses the control's <form>, whose named controls
   // shadow its own properties (<input name="matches"> makes form.matches that input).
   const _getter = (proto, name) => {
@@ -11005,6 +11079,8 @@ async (__tv3TextArgs) => {
     if (placeholder && placeholder !== label) rec.placeholder = placeholder.slice(0, _RETAIN_WIDTH);
     const shows = _shownText(el, label);
     if (shows) rec.shows = shows;
+    const to = _linkDestination(el);
+    if (to) rec.to = to.slice(0, _RETAIN_WIDTH);
     if (hidden) rec.hidden = true;
     if (removedBy) rec.a11yRemoved = removedBy;
     // A widget role is what the element IS -- a <div role="switch"> renders as a bare div otherwise,
@@ -13578,6 +13654,9 @@ def build_browser_tools(
     # The live element handle the ref or mark resolved to, for the same single call, so a click can fall back to it
     # when the driver's selector engine cannot see the marker the resolver just wrote.
     _acted_handle: list[Any] = []
+    # For a ref, the selector observe recorded for it, the tag the model was shown and the document it was read in, for
+    # the same single call.
+    _acted_rebind: list[tuple[str, str, str, dict[str, Any]]] = []
 
     async def _resolve_page() -> tuple[Any, ToolResult | None]:
         # Single-use handoff from the preflight wrapper so a preflighted call resolves the page
@@ -14145,6 +14224,8 @@ def build_browser_tools(
 
         shows_left = SHOWN_TEXT_TOTAL_CAP
         shows_omitted = 0
+        to_left = LINK_DESTINATION_TOTAL_CAP
+        to_omitted = 0
         for _render_idx, e in enumerate(elements):
             extra = ""
             if e.get("shows"):
@@ -14156,6 +14237,14 @@ def build_browser_tools(
                     extra += shows_part
                 else:
                     shows_omitted += 1
+            if e.get("to") and _link_destination_adds(str(e["to"]), str(e.get("label", ""))):
+                to_part = f" to={_field(e['to'], LINK_DESTINATION_MAX)}"
+                # As with shows=, once one is left off every later one is too, so the note's count is a tail.
+                if not to_omitted and len(to_part) <= to_left:
+                    to_left -= len(to_part)
+                    extra += to_part
+                else:
+                    to_omitted += 1
             if e.get("value"):
                 extra += f" value={_field(e['value'], OBSERVE_DISPLAY_WIDTHS['value'])}"
             if e.get("placeholder"):
@@ -14289,6 +14378,8 @@ def build_browser_tools(
             )
         if shows_omitted:
             lines.append(_shows_omitted_note(shows_omitted))
+        if to_omitted:
+            lines.append(_link_destination_omitted_note(to_omitted))
         # Counts only, for the per-call log record: every perception change that alters only what
         # this function renders is otherwise invisible to production telemetry.
         frame_census = data.get("frameCensus") or {}
@@ -16655,6 +16746,9 @@ def build_browser_tools(
             focused = None
         # None is "could not tell" -- a selector document.querySelector cannot parse, or a probe that
         # threw. Only an explicit False is evidence the caret went somewhere else.
+        if focused is None:
+            # A marker that matches nothing after the click: the field may have re-mounted into the caret's node.
+            await _follow_replaced_field(page, selector)
         if focused is False:
             # focus() needs no hit target, so it repairs a skin that swallowed the click without
             # forwarding it. Typing then goes to the field rather than wherever the caret was.
@@ -17730,6 +17824,85 @@ def build_browser_tools(
 
         return wrapped
 
+    async def _caret_in_empty_field(page: Any, selector: str) -> bool:
+        try:
+            return bool(await page.evaluate(_CARET_IN_EMPTY_FIELD_JS, {"sel": selector}))
+        except Exception:
+            return False
+
+    async def _clear_and_type(page: Any, selector: str, typed: str, *, clear: bool) -> None:
+        # An empty field has nothing to clear, and fill("") on one still sends Delete: a multi-value input drops its
+        # last chip, and a widget can re-mount its input on the key.
+        if clear:
+            await input_dispatch.clear(page, selector, timeout=_ACTION_TIMEOUT_MS)
+        await input_dispatch.type_keys(page, selector, typed, delay=15, timeout=_typing_timeout_ms(typed))
+
+    async def _follow_replaced_field(page: Any, selector: str) -> bool:
+        # A framework that re-mounts its input on focus or on a key leaves the act marker on a detached node. The
+        # replacement takes the marker over by _resolve_ref's re-resolve rule (the ref's recorded selector names
+        # exactly one element, of the tag the model was shown) and only if that element also holds the caret;
+        # anything else, a typed selector or a mark included, fails as before.
+        if not (selector.startswith(_ACT_SELECTOR_PREFIX) and _acted_rebind):
+            return False
+        remembered, expected_tag, recorded_document, entry = _acted_rebind[0]
+        token = selector[len(_ACT_SELECTOR_PREFIX) : -2]
+        realm = _acted_realm[0] if _acted_realm else page
+        original_connected = False
+        if _acted_handle:
+            # A handle in a document that is gone throws here; the document check below refuses that case.
+            with contextlib.suppress(Exception):
+                original_connected = bool(await _acted_handle[0].evaluate("(el) => el.isConnected"))
+        if original_connected:
+            return False
+        matches: list[Any] = []
+        adopted = None
+        written = False
+        try:
+            if await _holders(realm, selector) != 0:
+                return False
+            if recorded_document and (
+                _document_unidentifiable(recorded_document) or recorded_document != await _realm_document_id(realm)
+            ):
+                return False
+            matches = await realm.query_selector_all(remembered)
+            if len(matches) != 1:
+                return False
+            node = matches[0]
+            if expected_tag and str(await node.evaluate("(el) => el.tagName") or "").lower() != expected_tag:
+                return False
+            if await node.get_attribute("data-tv3-act") is not None or not await node.evaluate(_HOLDS_CARET_JS):
+                return False
+            written = True
+            if (
+                not await node.evaluate(_ACT_WRITE_HANDLE_JS, token)
+                or await node.get_attribute("data-tv3-act") != token
+                or await _holders(realm, selector) != 1
+            ):
+                return False
+            adopted = node
+        except Exception:
+            LOG.debug("taskv3 replaced-field follow failed", selector=selector, exc_info=True)
+            return False
+        finally:
+            if written and adopted is None:
+                # The page may have put the write on another element; a marker left there would take the typing.
+                with contextlib.suppress(Exception):
+                    await realm.eval_on_selector_all(
+                        selector, "(els) => els.forEach((el) => el.removeAttribute('data-tv3-act'))"
+                    )
+            for spare in matches:
+                if spare is not adopted:
+                    with contextlib.suppress(Exception):
+                        await spare.dispose()
+        for original in _acted_handle:
+            with contextlib.suppress(Exception):
+                await original.dispose()
+        _acted_handle[:] = [adopted]
+        # Held by the ref's entry, as _resolve_ref's re-resolve does, so the next observe disposes it.
+        entry["handle"] = adopted
+        LOG.info("taskv3 typing followed a re-mounted field", selector=selector)
+        return True
+
     async def _type_and_commit(
         page: Any,
         selector: str,
@@ -17785,10 +17958,15 @@ def build_browser_tools(
             # Only a field the click could not reach can misroute its keys, and only that path restores.
             # A checked click leaves the page untagged and pays nothing.
             collateral.extend(await _capture_collateral(page, selector))
-        # Clearing an empty multi-value input sends Delete, which removes the field's last chip.
-        if not (pre_value == "" and await _holds_own_chips(page, selector)):
-            await input_dispatch.clear(page, selector, timeout=_ACTION_TIMEOUT_MS)
-        await input_dispatch.type_keys(page, selector, typed, delay=15, timeout=_typing_timeout_ms(typed))
+        try:
+            skip_clear = pre_value == "" and (
+                await _caret_in_empty_field(page, selector) or await _holds_own_chips(page, selector)
+            )
+            await _clear_and_type(page, selector, typed, clear=not skip_clear)
+        except Exception as exc:
+            if not (_locator_never_resolved(exc) and await _follow_replaced_field(page, selector)):
+                raise
+            await _clear_and_type(page, selector, typed, clear=await _read_field_value(page, selector) != "")
         if collateral:
             collateral[:] = await _collateral_moved_while_typing(page, collateral)
         if not presnapshot_ok or reach != "click":
@@ -22993,6 +23171,15 @@ def build_browser_tools(
                     _acted_realm[:] = [_owner]
                 if _entry.get("handle") is not None:
                     _acted_handle[:] = [_entry["handle"]]
+                if _entry.get("selector"):
+                    _acted_rebind[:] = [
+                        (
+                            str(_entry["selector"]),
+                            str(_entry.get("tag") or "").lower(),
+                            str(_entry.get("document") or ""),
+                            _entry,
+                        )
+                    ]
                 # Resolution ends here, before the act. The latch makes this the reading the phase
                 # guard below reports, so the handler's own time is never billed to resolution.
                 record()
@@ -23008,6 +23195,7 @@ def build_browser_tools(
                 finally:
                     _acted_realm.clear()
                     _acted_handle.clear()
+                    _acted_rebind.clear()
                     _prefetched_page.clear()
                     # ...but those readers run turns LATER, and the act token is a stamp on one node: a
                     # control the page REPLACES after the act -- a submit button swapped for its
