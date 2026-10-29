@@ -23561,6 +23561,90 @@ async def test_type_into_an_open_combobox_is_not_blocked_by_its_own_listbox() ->
         assert await page.eval_on_selector("#src", "el => el.value") == "Applicant Referral"
 
 
+# A searchable picker with no ARIA state: clicking the field opens its rows together with a transparent,
+# view-sized click-outside layer laid over the field itself. The caret stays in the field, so a person types
+# straight on; the rows filter into fresh nodes, and clicking one commits it and removes the layer.
+_FOCUSED_FIELD_UNDER_ITS_CLICK_OUTSIDE_LAYER_HTML = """
+<label for="acct" style="display:block">Account number</label>
+<input id="acct" type="text" autocomplete="off" style="width:240px;height:30px">
+<div id="rows" style="position:relative;z-index:2;width:240px;background:#fff"></div>
+<script>
+  const ACCOUNTS = ["(AC) 10000001", "(AC) 10000002", "(AC) 10000003", "(AC) 62017710"];
+  const input = document.querySelector("#acct");
+  const rows = document.querySelector("#rows");
+  let layer = null;
+  function close() {
+    rows.replaceChildren();
+    if (layer) layer.remove();
+    layer = null;
+  }
+  function render() {
+    const query = input.value.replace(/\\D/g, "");
+    const shown = query ? ACCOUNTS.filter((a) => a.replace(/\\D/g, "").includes(query)) : ACCOUNTS.slice(0, 3);
+    rows.replaceChildren(...shown.map((label) => {
+      const row = document.createElement("span");
+      row.textContent = label;
+      row.style.cssText = "display:block;padding:4px;cursor:pointer";
+      row.addEventListener("click", () => { input.value = label; close(); });
+      return row;
+    }));
+  }
+  input.addEventListener("click", () => {
+    if (layer) return;
+    layer = document.createElement("div");
+    layer.style.cssText = "position:fixed;left:0;top:0;width:100%;height:100%;z-index:1";
+    layer.addEventListener("click", close);
+    document.body.append(layer);
+    render();
+  });
+  input.addEventListener("input", render);
+</script>
+"""
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+async def test_type_into_a_focused_field_under_its_own_click_outside_layer_picks_the_row() -> None:
+    # The click that opened the list left the caret in the field, so the invisible layer over it stops only the
+    # pointer. Refusing the field as covered sent the model to Escape and reloads in a loop.
+    async with _content_page(_FOCUSED_FIELD_UNDER_ITS_CLICK_OUTSIDE_LAYER_HTML) as page:
+        tools = build_browser_tools(_fixed_page_provider(page))
+        opened = await _tool(tools, "click").handler({"selector": "#acct"})
+        assert opened.status == "ok", opened.content
+        r = await _tool(tools, "type").handler({"selector": "#acct", "text": "62017710"})
+        assert r.status == "ok", r.content
+        assert await page.eval_on_selector("#acct", "el => el.value") == "(AC) 62017710"
+        assert taskv3_loop._TYPE_REACH.get()["caret_held"] is True
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+async def test_type_into_a_focused_plain_field_under_an_invisible_layer_fills_it() -> None:
+    # The fill path (no typeahead probe) takes the same rule: the keys reach the field that holds the caret.
+    async with _content_page(_INVISIBLE_RESIDUAL_BACKDROP_HTML.replace('type="text"', 'type="email"')) as page:
+        await page.focus("#city")
+        tools = build_browser_tools(_fixed_page_provider(page))
+        r = await _tool(tools, "type").handler({"selector": "#city", "text": "ada@example.com"})
+        assert r.status == "ok", r.content
+        assert await page.eval_on_selector("#city", "el => el.value") == "ada@example.com"
+        assert taskv3_loop._TYPE_REACH.get()["caret_held"] is True
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+async def test_type_into_a_focused_field_under_a_visible_wall_is_still_refused() -> None:
+    # Holding the caret does not license typing under a layer a person can SEE: that wall is what they would
+    # deal with first, so the refusal and its named controls stand.
+    async with _content_page(_CONSENT_WALL_HTML) as page:
+        await page.focus("#city")
+        tools = build_browser_tools(_fixed_page_provider(page))
+        r = await _tool(tools, "type").handler({"selector": "#city", "text": "Iowa City"})
+        assert r.status == "error", r.content
+        assert "Privacy Preference Center" in r.content, r.content
+        assert await page.eval_on_selector("#city", "el => el.value") == ""
+        assert "caret_held" not in (taskv3_loop._TYPE_REACH.get() or {})
+
+
 _SKINNED_COMBOBOX_BESIDE_A_FREE_FIELD_HTML = (
     _OPEN_COMBOBOX_OWN_LISTBOX_HTML
     + '<input id="free" type="text" style="position:absolute;left:400px;top:0;width:200px;height:30px">'
