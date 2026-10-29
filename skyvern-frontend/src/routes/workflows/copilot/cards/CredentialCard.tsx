@@ -45,6 +45,7 @@ import {
   type AttentionTrayPresentation,
 } from "./AttentionTray";
 import { TURN_ROW_INSET } from "./cardLayout";
+import type { CredentialBinding } from "../workflowCopilotTypes";
 import { useDemoLoginGuide } from "@/hooks/useDemoLoginGuide";
 
 // Union of the request-policy reason tokens and the run-derived pause reasons. `type`/`reason` are the
@@ -83,6 +84,7 @@ export interface CredentialRequiredFrame {
   timeout_seconds?: number;
   expires_at?: string;
   signing_in?: boolean;
+  credential_binding?: CredentialBinding | null;
   registration?: CredentialRegistrationDetails | null;
   timestamp?: string;
 }
@@ -159,6 +161,8 @@ export interface ManualSignInOffer {
   onDone: () => void;
 }
 
+const URL_MATCHED_UPDATE_WHY_LINE =
+  "Copilot chose this saved login because its saved URL matches this page. Updating it changes it everywhere it is used.";
 const SIGN_IN_WHY_LINE =
   "So it can sign in on your behalf when this workflow runs — stored encrypted, never shown in chat.";
 
@@ -217,10 +221,16 @@ const SKIP_OUTCOME = {
   meta: "test may stop at login",
   detail: "Credential setup skipped — test run may stop at the login step.",
 };
-const UPDATE_SKIP_OUTCOME = {
+const UPDATE_SKIP_OUTCOME = { title: "Credential not updated" };
+const BOUND_UPDATE_SKIP_OUTCOME = {
   title: "Credential not updated",
   meta: "keeps its saved sign-in",
   detail: "Credential not updated — the workflow keeps its saved sign-in.",
+};
+const UNBOUND_UPDATE_SKIP_OUTCOME = {
+  title: "Credential not updated",
+  meta: "not used by the saved workflow",
+  detail: "Credential not updated. The saved workflow does not use it.",
 };
 const SIGNED_IN_DETAIL =
   "For this test · later runs usually won't stay signed in · no password stored";
@@ -524,12 +534,14 @@ function CredentialUpdateAsk({
   onUpdateCredential,
   onSkip,
   tray,
+  signIn,
 }: {
   frame: CredentialRequiredFrame;
   credentialId: string;
   onUpdateCredential?: (credential: CredentialApiResponse) => void;
   onSkip: () => void;
   tray?: AttentionTrayPresentation;
+  signIn?: ManualSignInOffer;
 }) {
   const { remainingMs, expired } = useCountdown(frame.expires_at ?? "", true);
   const [rootRef, insideLiveRegion] = useInsideLiveRegion();
@@ -545,7 +557,35 @@ function CredentialUpdateAsk({
       : "Couldn't load this saved login."
     : null;
   const status = credential ? "" : (loadFailure ?? "Loading saved login…");
+  const signingIn = Boolean(signIn && frame.signing_in);
+  const updateButton = (
+    <Button
+      type="button"
+      size="sm"
+      variant={signingIn ? "outline" : "default"}
+      disabled={expired || !credential || !onUpdateCredential}
+      onClick={() => credential && onUpdateCredential?.(credential)}
+    >
+      {rejected ? "Update credential" : "Add 2FA method"}
+    </Button>
+  );
 
+  if (signIn && signingIn) {
+    return (
+      <ManualSignInAsk
+        frame={frame}
+        site={site}
+        tray={tray}
+        countdown={
+          <PauseCountdown remainingMs={remainingMs} expired={expired} />
+        }
+        disabled={expired}
+        signIn={signIn}
+        onCancel={onSkip}
+        alternative={updateButton}
+      />
+    );
+  }
   return (
     <AskChrome
       tray={tray}
@@ -564,19 +604,22 @@ function CredentialUpdateAsk({
           key="why"
           className="text-[11px] leading-relaxed text-muted-foreground"
         >
-          {CREDENTIAL_WHY_LINE_BY_REASON[frame.reason]}
+          {frame.credential_binding === "matched_by_saved_url"
+            ? URL_MATCHED_UPDATE_WHY_LINE
+            : CREDENTIAL_WHY_LINE_BY_REASON[frame.reason]}
         </span>,
+        ...(signIn
+          ? [
+              <SignInScopeLine
+                key="sign-in-scope"
+                remedy="update the saved login"
+              />,
+            ]
+          : []),
       ]}
       footer={
         <>
-          <Button
-            type="button"
-            size="sm"
-            disabled={expired || !credential || !onUpdateCredential}
-            onClick={() => credential && onUpdateCredential?.(credential)}
-          >
-            {rejected ? "Update credential" : "Add 2FA method"}
-          </Button>
+          {updateButton}
           {status ? (
             <span className="min-w-0 text-xs text-muted-foreground">
               {status}
@@ -592,6 +635,9 @@ function CredentialUpdateAsk({
             >
               Retry
             </Button>
+          ) : null}
+          {signIn ? (
+            <SignInMyselfButton signIn={signIn} disabled={expired} />
           ) : null}
           <div className="ml-auto">
             <SkipButton onSkip={onSkip} disabled={expired} />
@@ -773,6 +819,7 @@ export function CredentialCard(props: Readonly<CredentialCardProps>) {
         onUpdateCredential={props.onUpdateCredential}
         onSkip={props.onSkip}
         tray={props.tray}
+        signIn={props.signIn}
       />
     );
   }
@@ -981,9 +1028,13 @@ function CredentialAskCard({
         return (
           <ResolvedCredentialCard
             tone="warn"
-            {...(frame.reason === "credential_rejected_by_site"
-              ? UPDATE_SKIP_OUTCOME
-              : SKIP_OUTCOME)}
+            {...(frame.reason !== "credential_rejected_by_site"
+              ? SKIP_OUTCOME
+              : frame.credential_binding === "saved_workflow"
+                ? BOUND_UPDATE_SKIP_OUTCOME
+                : frame.credential_binding
+                  ? UNBOUND_UPDATE_SKIP_OUTCOME
+                  : UPDATE_SKIP_OUTCOME)}
           />
         );
       case "timeout":
@@ -1168,69 +1219,19 @@ function CredentialAskCard({
     </Button>
   );
   if (signIn && frame.signing_in) {
-    const notFound = signIn.saveFailed
-      ? "Couldn't save your sign-in. Click Done to try again, or connect a credential."
-      : signIn.notFoundHost
-        ? `No sign-in found for ${signIn.notFoundHost}. Sign in, then click Done again.`
-        : "";
     return (
-      <AskChrome
+      <ManualSignInAsk
+        frame={frame}
+        site={site}
         tray={tray}
-        rootRef={rootRef}
-        message={frame.message}
-        title={`Sign in to ${site} in the browser`}
         countdown={
           <PauseCountdown remainingMs={remainingMs} expired={expired} />
         }
-        lines={[
-          <span
-            key="how"
-            className="text-[11px] leading-relaxed text-muted-foreground"
-          >
-            {
-              "Use the browser to sign in, including any verification code, then click Done. This sign-in is for this test; later runs usually won't stay signed in. No password is stored."
-            }
-          </span>,
-          ...(notFound
-            ? [
-                <span key="not-found" className="text-[11px] font-medium">
-                  {notFound}
-                </span>,
-              ]
-            : []),
-        ]}
-        footer={
-          <>
-            <Button
-              type="button"
-              size="sm"
-              disabled={disabled || signIn.busy}
-              onClick={signIn.onDone}
-            >
-              {signIn.busy ? "Saving sign-in…" : "Done"}
-            </Button>
-            {offerCredentials ? connectButton : null}
-            <div className="ml-auto">
-              <Button
-                type="button"
-                size="sm"
-                variant="outline"
-                onClick={() => onSkip()}
-                disabled={disabled || signIn.busy}
-              >
-                Cancel
-              </Button>
-            </div>
-          </>
-        }
-        announcer={
-          <span
-            className="sr-only"
-            role={insideLiveRegion ? undefined : "status"}
-          >
-            {insideLiveRegion ? "" : notFound}
-          </span>
-        }
+        disabled={disabled}
+        signIn={signIn}
+        onCancel={onSkip}
+        alternative={offerCredentials ? connectButton : null}
+        saveFailedFallback=", or connect a credential"
       />
     );
   }
@@ -1269,18 +1270,7 @@ function CredentialAskCard({
               </span>,
             ]
           : []),
-        ...(signIn
-          ? [
-              <span
-                key="sign-in-scope"
-                className="text-[11px] leading-relaxed text-muted-foreground"
-              >
-                {
-                  "Signing in yourself works for this test. Later runs usually won't stay signed in — connect a credential so every run can sign in."
-                }
-              </span>,
-            ]
-          : []),
+        ...(signIn ? [<SignInScopeLine key="sign-in-scope" />] : []),
         ...(mode === "terminal"
           ? [
               <span
@@ -1353,16 +1343,7 @@ function CredentialAskCard({
             </>
           ) : null}
           {signIn ? (
-            <Button
-              type="button"
-              size="sm"
-              variant="link"
-              className="text-blue-600 dark:text-blue-400"
-              disabled={disabled || signIn.busy}
-              onClick={signIn.onStart}
-            >
-              Sign in myself (this test only)
-            </Button>
+            <SignInMyselfButton signIn={signIn} disabled={disabled} />
           ) : null}
           <div className="ml-auto">
             <SkipButton onSkip={onSkip} disabled={disabled} />
@@ -1387,6 +1368,127 @@ function CredentialAskCard({
                 : offerCredentials && orgCredentials.status === "error"
                   ? "Couldn't load your saved logins."
                   : ""}
+        </span>
+      }
+    />
+  );
+}
+
+function SignInScopeLine({
+  remedy = "connect a credential",
+}: {
+  remedy?: string;
+}) {
+  return (
+    <span className="text-[11px] leading-relaxed text-muted-foreground">
+      {`Signing in yourself works for this test. Later runs usually won't stay signed in — ${remedy} so every run can sign in.`}
+    </span>
+  );
+}
+
+function SignInMyselfButton({
+  signIn,
+  disabled,
+}: {
+  signIn: ManualSignInOffer;
+  disabled: boolean;
+}) {
+  return (
+    <Button
+      type="button"
+      size="sm"
+      variant="link"
+      className="text-blue-600 dark:text-blue-400"
+      disabled={disabled || signIn.busy}
+      onClick={signIn.onStart}
+    >
+      Sign in myself (this test only)
+    </Button>
+  );
+}
+
+// The card while the user signs in to the live browser themselves; Cancel answers the card as a skip.
+function ManualSignInAsk({
+  frame,
+  site,
+  tray,
+  countdown,
+  disabled,
+  signIn,
+  onCancel,
+  alternative,
+  saveFailedFallback = "",
+}: {
+  frame: CredentialRequiredFrame;
+  site: string;
+  tray?: AttentionTrayPresentation;
+  countdown: ReactNode;
+  disabled: boolean;
+  signIn: ManualSignInOffer;
+  onCancel: () => void;
+  alternative?: ReactNode;
+  saveFailedFallback?: string;
+}) {
+  const [rootRef, insideLiveRegion] = useInsideLiveRegion();
+  const notFound = signIn.saveFailed
+    ? `Couldn't save your sign-in. Click Done to try again${saveFailedFallback}.`
+    : signIn.notFoundHost
+      ? `No sign-in found for ${signIn.notFoundHost}. Sign in, then click Done again.`
+      : "";
+  return (
+    <AskChrome
+      tray={tray}
+      rootRef={rootRef}
+      message={frame.message}
+      title={`Sign in to ${site} in the browser`}
+      countdown={countdown}
+      lines={[
+        <span
+          key="how"
+          className="text-[11px] leading-relaxed text-muted-foreground"
+        >
+          {
+            "Use the browser to sign in, including any verification code, then click Done. This sign-in is for this test; later runs usually won't stay signed in. No password is stored."
+          }
+        </span>,
+        ...(notFound
+          ? [
+              <span key="not-found" className="text-[11px] font-medium">
+                {notFound}
+              </span>,
+            ]
+          : []),
+      ]}
+      footer={
+        <>
+          <Button
+            type="button"
+            size="sm"
+            disabled={disabled || signIn.busy}
+            onClick={signIn.onDone}
+          >
+            {signIn.busy ? "Saving sign-in…" : "Done"}
+          </Button>
+          {alternative}
+          <div className="ml-auto">
+            <Button
+              type="button"
+              size="sm"
+              variant="outline"
+              onClick={() => onCancel()}
+              disabled={disabled || signIn.busy}
+            >
+              Cancel
+            </Button>
+          </div>
+        </>
+      }
+      announcer={
+        <span
+          className="sr-only"
+          role={insideLiveRegion ? undefined : "status"}
+        >
+          {insideLiveRegion ? "" : notFound}
         </span>
       }
     />

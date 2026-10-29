@@ -499,6 +499,11 @@ export interface WorkflowCopilotTitleUpdate {
   timestamp: string;
 }
 
+export type CredentialBinding =
+  | "saved_workflow"
+  | "matched_by_saved_url"
+  | "not_bound";
+
 // Mid-build pause frame: the turn stays open (SSE alive) while the client
 // surfaces a credential card. reason stays a raw string here — CredentialCard
 // tolerates unknown reason tokens, so a newer backend can't break the wiring.
@@ -520,6 +525,8 @@ export interface WorkflowCopilotCredentialRequiredUpdate {
   // The live browser the user may sign in to themselves; absent when the card does not offer it.
   sign_in_browser_session_id?: string | null;
   signing_in?: boolean;
+  // Set on update cards only: how the credential they name is bound.
+  credential_binding?: CredentialBinding | null;
   // Present on a card that offers Generate and save; never carries a password.
   registration?: {
     username: string;
