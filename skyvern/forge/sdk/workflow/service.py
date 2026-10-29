@@ -134,7 +134,10 @@ from skyvern.forge.sdk.db.repositories.workflow_runs import (
 )
 from skyvern.forge.sdk.enterprise_features import collect_enterprise_gated_run_features
 from skyvern.forge.sdk.executor.run_liveness import (
+    RunExecution,
     acquire_run_lease,
+    current_execution,
+    note_internal_cancel_won,
     note_run_finalized,
     run_lease_lost,
     run_lease_state,
@@ -1052,6 +1055,13 @@ def _workflow_block_engine_attribution_for_duration_log(workflow_run_id: str) ->
         # A failed read is attribution-loss, not "never entered the A/B" — same bucket as the
         # out-of-band finalizers.
         return ARM_ATTRIBUTION_LOST
+
+
+def _internal_cancel_proof(workflow_run_id: str, execution: RunExecution | None) -> dict[str, Any]:
+    """Record the winning execution's proof as soon as its canceled write commits, before any later await."""
+    if execution is None:
+        return {}
+    return {"on_committed": partial(note_internal_cancel_won, workflow_run_id, execution)}
 
 
 def _run_lease_attempt_kwargs(key: str, attempt_number: int | None) -> dict[str, Any]:
@@ -14002,7 +14012,6 @@ class WorkflowService:
         workflow_run: WorkflowRun | None = None
         if status.is_final():
             if run_lease_tasks_enabled() and await run_lease_lost(workflow_run_id):
-                note_run_finalized(workflow_run_id)
                 return await self.get_workflow_run(workflow_run_id)
             workflow_run = await app.DATABASE.workflow_runs.update_workflow_run_if_not_final(
                 workflow_run_id=workflow_run_id,
@@ -14038,8 +14047,6 @@ class WorkflowService:
         if workflow_run is None:
             lease_state = await run_lease_state(workflow_run_id)
             if lease_state == "lost":
-                if status.is_final():
-                    note_run_finalized(workflow_run_id)
                 return await self.get_workflow_run(workflow_run_id)
             if lease_state == "unknown" and status.is_final():
                 # A failed lease check must not let this write replace another finalizer's row.
@@ -14083,8 +14090,8 @@ class WorkflowService:
         run's own finalizer. Returns ``None`` when the row was already terminal."""
         failure_category = self._with_saved_profile_signed_out(workflow_run_id, status, failure_category)
         if run_lease_tasks_enabled() and status.is_final() and await run_lease_lost(workflow_run_id):
-            note_run_finalized(workflow_run_id)
             return None
+        execution = current_execution(workflow_run_id) if status == WorkflowRunStatus.canceled else None
         workflow_run = await app.DATABASE.workflow_runs.update_workflow_run_if_not_final(
             workflow_run_id=workflow_run_id,
             status=status,
@@ -14093,6 +14100,7 @@ class WorkflowService:
             failure_category=failure_category,
             only_from=only_from,
             require_latest_attempt_number=require_latest_attempt_number,
+            **_internal_cancel_proof(workflow_run_id, execution),
         )
         if workflow_run is None:
             return None
@@ -14157,10 +14165,12 @@ class WorkflowService:
         finalized_by: str | None = None,
         run_minutes_recorded_through: datetime | None = None,
         attempt_number: int | None = None,
+        mark_finalized: bool = True,
     ) -> None:
         workflow_run_id = workflow_run.workflow_run_id
         if status.is_final():
-            note_run_finalized(workflow_run_id)
+            if mark_finalized:
+                note_run_finalized(workflow_run_id)
             # Free extraction-cache entries for this run.
             extraction_cache.clear_workflow_run(workflow_run_id)
             now = datetime.now(UTC)
@@ -14970,6 +14980,8 @@ class WorkflowService:
         require_latest_attempt_number: int | None = None,
         on_transition: Callable[[], Awaitable[None]] | None = None,
         audit_actor: RequestPrincipal | None = None,
+        *,
+        requested_externally: bool = False,
     ) -> WorkflowRun:
         """Cancel a workflow run, rejecting the transition if the run has already
         reached a terminal state.
@@ -14993,6 +15005,7 @@ class WorkflowService:
         updated = await self.mark_workflow_run_as_canceled_if_not_final(
             workflow_run_id=workflow_run_id,
             **cancel_kwargs,
+            requested_externally=requested_externally,
             **_run_lease_attempt_kwargs("require_latest_attempt_number", require_latest_attempt_number),
         )
         if updated is not None:
@@ -15005,7 +15018,8 @@ class WorkflowService:
             raise WorkflowRunNotFound(workflow_run_id)
 
         if run_lease_tasks_enabled() and (
-            require_latest_attempt_number is not None or await run_lease_lost(workflow_run_id)
+            require_latest_attempt_number is not None
+            or (not requested_externally and await run_lease_lost(workflow_run_id))
         ):
             return current
 
@@ -15034,6 +15048,7 @@ class WorkflowService:
                     updated = await self.mark_workflow_run_as_canceled_if_not_final(
                         workflow_run_id=workflow_run_id,
                         **cancel_kwargs,
+                        requested_externally=requested_externally,
                     )
                     if updated is not None:
                         return updated
@@ -15060,15 +15075,18 @@ class WorkflowService:
         require_latest_attempt_number: int | None = None,
         on_transition: Callable[[], Awaitable[None]] | None = None,
         audit_actor: RequestPrincipal | None = None,
+        *,
+        requested_externally: bool = False,
     ) -> WorkflowRun | None:
         """Conditional cancel that is a no-op when the run has already reached a
         terminal state. Safe to call from cancellation cleanup paths (e.g. the
         copilot tool's timeout branch) that race with the run's own
         ``_finalize_workflow_run_status`` writes.
         """
-        if run_lease_tasks_enabled() and await run_lease_lost(workflow_run_id):
-            note_run_finalized(workflow_run_id)
+        # An external cancel is authorized by the request, not by this process's execution lease.
+        if run_lease_tasks_enabled() and not requested_externally and await run_lease_lost(workflow_run_id):
             return None
+        execution = None if requested_externally else current_execution(workflow_run_id)
         update_kwargs: dict[str, Any] = {}
         if audit_actor is not None:
             update_kwargs["audit_actor"] = audit_actor
@@ -15080,10 +15098,12 @@ class WorkflowService:
             failure_reason=failure_reason,
             **update_kwargs,
             **_run_lease_attempt_kwargs("require_latest_attempt_number", require_latest_attempt_number),
+            **_internal_cancel_proof(workflow_run_id, execution),
         )
         if updated is None:
             return None
-        note_run_finalized(workflow_run_id)
+        if not requested_externally:
+            note_run_finalized(workflow_run_id)
         LOG.info(
             f"Marked workflow run {workflow_run_id} as canceled (conditional)",
             workflow_run_id=workflow_run_id,
@@ -15099,7 +15119,10 @@ class WorkflowService:
                 **_run_lease_attempt_kwargs("attempt_number", require_latest_attempt_number),
             )
         finally:
-            await self._after_workflow_run_status_write(updated, WorkflowRunStatus.canceled)
+            # Finalized protection belongs to the execution that finalizes the run, not to an external canceler.
+            await self._after_workflow_run_status_write(
+                updated, WorkflowRunStatus.canceled, mark_finalized=not requested_externally
+            )
         return updated
 
     async def mark_workflow_run_as_timed_out(

@@ -23,7 +23,13 @@ from skyvern.forge.sdk.db.repositories.workflow_run_attempts import (
     ATTEMPT_RECOVERY_MAX_PAGES,
 )
 from skyvern.forge.sdk.executor.async_executor import AsyncExecutor
-from skyvern.forge.sdk.executor.run_liveness import acquire_run_lease, hold_run, run_lease_lost, track_run
+from skyvern.forge.sdk.executor.run_liveness import (
+    acquire_run_lease,
+    hold_run,
+    run_lease_lost,
+    start_independent_run_scope,
+    track_run,
+)
 from skyvern.forge.sdk.schemas.organizations import Organization
 from skyvern.forge.sdk.schemas.persistent_browser_sessions import FORCED_WORKFLOW_SESSION_RUNNABLE_TYPE
 from skyvern.forge.sdk.schemas.task_v2 import TaskV2Status
@@ -64,6 +70,7 @@ async def _run_with_own_context(
     assigns task_id/step_id — and clobber each other. Shallow-copy so scalar writes stay local
     while inherited values survive.
     """
+    start_independent_run_scope()
     parent = skyvern_context.current()
     if parent is not None:
         # The download-popup lifecycle registries are context-owned and destructively torn down at

@@ -10,7 +10,7 @@ from contextlib import nullcontext
 from contextvars import ContextVar
 from dataclasses import dataclass
 from datetime import UTC, datetime
-from typing import Any
+from typing import Any, TypedDict
 
 import structlog
 from opentelemetry import trace as otel_trace
@@ -57,7 +57,6 @@ from skyvern.forge.sdk.core.skyvern_context import SkyvernContext
 from skyvern.forge.sdk.db.enums import OrganizationAuthTokenType, WorkflowBuildSource, WorkflowRunTriggerType
 from skyvern.forge.sdk.executor.run_liveness import (
     acquire_run_lease,
-    note_run_finalized,
     run_lease_final_write_blocked,
     run_lease_lost,
     run_lease_tasks_enabled,
@@ -2507,8 +2506,6 @@ async def _update_task_v2_status(
         keep_final_status=keep_final_status,
     )
     if keep_final_status and task_v2.status != status:
-        if task_v2.workflow_run_id:
-            note_run_finalized(task_v2.workflow_run_id)
         return task_v2
     if status in [TaskV2Status.completed, TaskV2Status.failed, TaskV2Status.terminated]:
         start_time = (
@@ -2628,13 +2625,20 @@ async def mark_task_v2_as_completed(
     return task_v2
 
 
+class _CancelRunKwargs(TypedDict, total=False):
+    requested_externally: bool
+
+
 async def mark_task_v2_as_canceled(
     task_v2_id: str,
     workflow_run_id: str | None = None,
     organization_id: str | None = None,
     on_transition: Callable[[], Awaitable[None]] | None = None,
     audit_actor: RequestPrincipal | None = None,
+    *,
+    requested_externally: bool = False,
 ) -> TaskV2:
+    cancel_kwargs: _CancelRunKwargs = {"requested_externally": True} if requested_externally else {}
     current = await app.DATABASE.observer.get_task_v2(task_v2_id, organization_id=organization_id)
     transitioned = False
     task_v2: TaskV2 | None = None
@@ -2646,7 +2650,7 @@ async def mark_task_v2_as_canceled(
             task_v2_status=current.status,
         )
         if workflow_run_id:
-            await app.WORKFLOW_SERVICE.mark_workflow_run_as_canceled(workflow_run_id)
+            await app.WORKFLOW_SERVICE.mark_workflow_run_as_canceled(workflow_run_id, **cancel_kwargs)
         return current
 
     if current is not None and current.status != TaskV2Status.canceled:
@@ -2662,7 +2666,7 @@ async def mark_task_v2_as_canceled(
                 raise TaskV2NotFound(task_v2_id=task_v2_id)
         if not transitioned and task_v2 is not None and task_v2.status != TaskV2Status.canceled:
             if task_v2.status.is_final() and workflow_run_id:
-                await app.WORKFLOW_SERVICE.mark_workflow_run_as_canceled(workflow_run_id)
+                await app.WORKFLOW_SERVICE.mark_workflow_run_as_canceled(workflow_run_id, **cancel_kwargs)
             return task_v2
     else:
         task_v2 = await _update_task_v2_status(
@@ -2685,7 +2689,7 @@ async def mark_task_v2_as_canceled(
             if task_v2 is None:
                 raise TaskV2NotFound(task_v2_id=task_v2_id)
         if workflow_run_id:
-            await app.WORKFLOW_SERVICE.mark_workflow_run_as_canceled(workflow_run_id)
+            await app.WORKFLOW_SERVICE.mark_workflow_run_as_canceled(workflow_run_id, **cancel_kwargs)
 
         otel_trace.get_current_span().set_attribute("task.completion_status", "canceled")
         await send_task_v2_webhook(task_v2)
