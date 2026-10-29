@@ -8,6 +8,31 @@ _READ_LOCATOR_IS_CONTENT_EDITABLE = "element => element.isContentEditable"
 _READ_RESOLVED_ANCHOR_HREF = "(element) => element instanceof HTMLAnchorElement ? element.href : null"
 _READ_WHETHER_LINK_OR_BUTTON = "(element) => element.matches('a[href], button')"
 
+# Mirrors the driver's own label-following retarget plus fill()'s type allowlist, so this answers for the
+# node a fill()/clear() would really land on. An editability check follows a <label> to its control too,
+# which is why a radio/checkbox/file label reports editable while the typing it gates is always rejected.
+_READ_LOCATOR_ACCEPTS_TEXT_FILL = """
+(element) => {
+  const FILLABLE_INPUT_TYPES = new Set([
+    '', 'color', 'date', 'datetime-local', 'email', 'month', 'number',
+    'password', 'range', 'search', 'tel', 'text', 'time', 'url', 'week',
+  ]);
+  let node = element;
+  if (!node.matches('input, textarea, select') && !node.isContentEditable) {
+    node = node.closest('button, [role=button], [role=checkbox], [role=radio]') || node;
+  }
+  const retargeted = 'a, input, textarea, button, select, [role=link], [role=button], [role=checkbox], [role=radio]';
+  if (!node.matches(retargeted) && !node.isContentEditable) {
+    const label = node.closest('label');
+    if (label !== null && label.control) { node = label.control; }
+  }
+  const tag = (node.tagName || '').toLowerCase();
+  if (tag === 'input') { return FILLABLE_INPUT_TYPES.has((node.type || '').toLowerCase()); }
+  if (tag === 'textarea') { return true; }
+  return node.isContentEditable === true;
+}
+"""
+
 # One generic, live observable of a control's selected/checked state. Mirrors agent-side resolvers in
 # skyvern/webeye/actions/handler.py so a cached replay and an agent run reach the same decision on the same DOM
 _READ_LOCATOR_SELECTED_STATE = """
@@ -197,6 +222,11 @@ async def read_locator_selected_state(locator: Locator, *, timeout: float | None
 
 async def read_static_listbox_option_snapshot(frame: Page | Frame, element: ElementHandle) -> object:
     return await SkyvernFrame.evaluate(frame=frame, expression=_READ_STATIC_LISTBOX_OPTION_SNAPSHOT, arg=element)
+
+
+async def read_locator_accepts_text_fill(locator: Locator, *, timeout: float | None = None) -> bool | None:
+    value = await locator.evaluate(_READ_LOCATOR_ACCEPTS_TEXT_FILL, timeout=timeout)
+    return value if isinstance(value, bool) else None
 
 
 async def read_locator_is_content_editable(locator: Locator, *, timeout: float | None = None) -> bool | None:

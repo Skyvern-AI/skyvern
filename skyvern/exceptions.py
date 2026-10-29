@@ -1413,6 +1413,15 @@ class InvalidElementForTextInput(SkyvernException):
         super().__init__(message)
 
 
+class InputElementCoveredByUntypeableElement(SkyvernException):
+    def __init__(self, element_id: str, blocking_element_id: str, blocking_tag_name: str):
+        super().__init__(
+            f"The element with id={element_id} is covered by the {blocking_tag_name} element with "
+            f"id={blocking_element_id}, which doesn't support text input. Dismiss or answer the pop-up "
+            f"that owns id={blocking_element_id} first, then type into id={element_id} again."
+        )
+
+
 class FailedToClearInputField(SkyvernException):
     def __init__(self, element_id: str, tag_name: str):
         super().__init__(
