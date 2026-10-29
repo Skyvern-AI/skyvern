@@ -20071,9 +20071,14 @@ def build_browser_tools(
             )
         if pick.suggestion:
             suggestion = _model_text(pick.suggestion, 60)
+            if not pick.clicked:
+                return ToolResult.error(
+                    f"typed into {selector}; matched suggestion {suggestion!r} but the click on it did not land "
+                    "— nothing was selected",
+                    error_class="click_failed",
+                )
             verdict, matches = await _typeahead_commit_verdict(page, selector, pick.committed, pick.readable)
-            if pick.clicked:
-                _log_committed_pick(pick.suggestion, text, verdict, "type", pick.tier)
+            _log_committed_pick(pick.suggestion, text, verdict, "type", pick.tier)
             if verdict is CommitStatus.OK:
                 if pick.declared:
                     closed = await _close_lingering_typeahead_list(
@@ -20125,8 +20130,6 @@ def build_browser_tools(
                 f"clicked suggestion {suggestion!r} for {selector} but it did not commit — the field is NOT "
                 "filled; re-observe and retry, do not proceed"
             )
-            if not pick.clicked:
-                return ToolResult.error(message, error_class="click_failed")
             if verdict is CommitStatus.UNVERIFIED:
                 return ToolResult.error(message, error_class="commit_unread")
             return ToolResult.error(message, error_class="did_not_commit")
@@ -21267,9 +21270,14 @@ def build_browser_tools(
             clicked: bool,
             tier: Tier | None = None,
         ) -> ToolResult:
+            if not clicked:
+                return ToolResult.error(
+                    f"matched suggestion {_model_text(opt_txt, 60)!r} for {selector} but the click on it did not "
+                    "land — nothing was selected",
+                    error_class="click_failed",
+                )
             verdict, matches = await _typeahead_commit_verdict(page, selector, committed, readable)
-            if clicked:
-                _log_committed_pick(opt_txt, value, verdict, "typeahead", tier)
+            _log_committed_pick(opt_txt, value, verdict, "typeahead", tier)
             opt_txt = _model_text(opt_txt, 60)
             if verdict is CommitStatus.OK:
                 if declared:
@@ -21303,8 +21311,6 @@ def build_browser_tools(
                         "re-observe to confirm the value before relying on it"
                     )
             message = f"selected suggestion {opt_txt!r} but {selector} did not commit a value"
-            if not clicked:
-                return ToolResult.error(message, error_class="click_failed")
             if verdict is CommitStatus.UNVERIFIED:
                 return ToolResult.error(message, error_class="commit_unread")
             return ToolResult.error(message, error_class="did_not_commit")
@@ -21357,12 +21363,13 @@ def build_browser_tools(
         # with that row, which is what makes a retry converge on a widget that searches something
         # other than the text it renders.
         ladder_rung: str | None = None
+        ladder_click_landed = False
 
         async def _reduced_query_ladder() -> ToolResult | list[dict[str, Any]]:
             # Walk the rungs until one renders rows. A row whose whole label IS the requested value
             # commits; anything else is reported, never guessed — the rows a looser query revealed are
             # the field's own vocabulary, which is what a caller needs to name the right label.
-            nonlocal ladder_rung
+            nonlocal ladder_rung, ladder_click_landed
             for rung in _reduced_queries():
                 typed_queries.append(rung)
                 if selector in _live_row_offers:
@@ -21388,6 +21395,7 @@ def build_browser_tools(
                     await _restore_pre_type_value(page, selector, pre_value, typed_queries)
                     return rung_pick.verdict
                 if rung_pick.suggestion is not None:
+                    ladder_click_landed = rung_pick.clicked
                     return await _typeahead_verdict_result(
                         rung_pick.suggestion,
                         rung_pick.committed,
@@ -21646,6 +21654,8 @@ def build_browser_tools(
                 ):
                     return laddered
                 await _restore_pre_type_value(page, selector, pre_value, typed_queries)
+                if isinstance(laddered, ToolResult) and ladder_click_landed:
+                    return laddered
             verdict = with_tier_note(
                 await _typeahead_verdict_result(
                     pick.suggestion,
