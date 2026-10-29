@@ -10,7 +10,9 @@ from sqlalchemy.ext.asyncio import AsyncEngine
 from skyvern.exceptions import WorkflowNotFoundForWorkflowRun, WorkflowRetryAttemptLookupError
 from skyvern.forge.sdk.db.agent_db import AgentDB
 from skyvern.forge.sdk.db.models import WorkflowModel, WorkflowRunAttemptModel, WorkflowRunModel
+from skyvern.forge.sdk.streaming import registries
 from skyvern.forge.sdk.workflow import service as service_module
+from skyvern.forge.sdk.workflow.context_manager import WorkflowContextManager
 from skyvern.forge.sdk.workflow.models.workflow import WorkflowRunStatus
 from skyvern.forge.sdk.workflow.retry_policy import RetryDecision
 from skyvern.forge.sdk.workflow.service import WorkflowService
@@ -167,7 +169,7 @@ async def test_cleanup_derives_ownership_when_eligibility_lookup_fails(
     monkeypatch.setattr(
         service_module, "is_retry_eligible_run", AsyncMock(side_effect=RuntimeError("read unavailable"))
     )
-    monkeypatch.setattr(service_module, "mark_stream_closing", Mock())
+    monkeypatch.setattr(service_module, "claim_stream_closing", Mock(return_value=None))
     monkeypatch.setattr(service_module.analytics, "capture", Mock())
     monkeypatch.setattr(
         service_module, "get_recorded_decision", AsyncMock(return_value=RetryDecision(False, 1, 0, True, "matched"))
@@ -202,7 +204,7 @@ async def test_retry_entry_lookup_transient_failure_preserves_cleanup_decision(m
     monkeypatch.setattr(service_module.app.DATABASE.workflow_run_attempts, "get_attempts", get_attempts)
     monkeypatch.setattr(service_module.app.DATABASE.workflow_runs, "get_workflow_run", AsyncMock(return_value=run))
     monkeypatch.setattr(service_module, "is_retry_eligible_run", AsyncMock(return_value=True))
-    monkeypatch.setattr(service_module, "mark_stream_closing", Mock())
+    monkeypatch.setattr(service_module, "claim_stream_closing", Mock(return_value=None))
     monkeypatch.setattr(service_module.analytics, "capture", Mock())
     monkeypatch.setattr(
         service_module.app.AGENT_FUNCTION, "on_workflow_run_terminal", AsyncMock(side_effect=_StopForTest)
@@ -349,3 +351,28 @@ async def test_retry_execution_rejects_missing_pinned_version(
     assert run is not None
     assert run.status == WorkflowRunStatus.queued
     assert run.workflow_id == "wf_missing"
+
+
+@pytest.mark.asyncio
+async def test_superseded_disposal_survives_a_claim_fault_and_keeps_the_successors_context(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    workflow_run_id = "wr_superseded_disposal"
+    stale_context, successor_context = Mock(), Mock()
+    contexts = object.__new__(WorkflowContextManager)
+    contexts.workflow_run_contexts = {workflow_run_id: successor_context}
+    browsers = SimpleNamespace(
+        claim_superseded_run_resources=Mock(side_effect=RuntimeError("claim failed")),
+        release_superseded_run_resources=AsyncMock(),
+    )
+    monkeypatch.setattr(service_module.app, "BROWSER_MANAGER", browsers)
+    monkeypatch.setattr(service_module.app, "WORKFLOW_CONTEXT_MANAGER", contexts)
+    tombstone = registries.claim_stream_closing(workflow_run_id)
+    assert tombstone is not None
+
+    await WorkflowService()._dispose_superseded_attempt(
+        workflow_run_id, Mock(), stale_context, None, stream_tombstone=tombstone
+    )
+
+    assert contexts.workflow_run_contexts[workflow_run_id] is successor_context
+    assert workflow_run_id not in registries._closing_streams

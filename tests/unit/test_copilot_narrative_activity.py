@@ -378,7 +378,7 @@ def test_build_narrative_payload_preserves_retry_order_and_binds_each_outcome() 
         ended_at="2026-01-01T00:00:05+00:00",
     )
     ctx.last_run_blocks_workflow_run_id = "wr_first"
-    ctx.last_run_blocks_block_ids = ["wrb_first"]
+    ctx.last_run_outcome_block_ids = ["wrb_first"]
     ctx.last_run_blocks_block_labels = ["step_1"]
     _stash_recorded_run_outcome(
         ctx,
@@ -403,7 +403,7 @@ def test_build_narrative_payload_preserves_retry_order_and_binds_each_outcome() 
         ended_at="2026-01-01T00:00:09+00:00",
     )
     ctx.last_run_blocks_workflow_run_id = "wr_retry"
-    ctx.last_run_blocks_block_ids = ["wrb_retry"]
+    ctx.last_run_outcome_block_ids = ["wrb_retry"]
     ctx.last_run_blocks_block_labels = ["step_1"]
     _stash_recorded_run_outcome(
         ctx,

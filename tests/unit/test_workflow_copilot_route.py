@@ -2037,8 +2037,9 @@ async def test_chat_audio_upload_stores_artifact_for_existing_chat(monkeypatch: 
     )
     monkeypatch.setattr(app, "ARTIFACT_MANAGER", artifact_manager)
     file = SimpleNamespace(
+        filename="dictation.webm",
         content_type="audio/webm",
-        read=AsyncMock(return_value=b"audio-bytes"),
+        read=AsyncMock(return_value=b"\x1a\x45\xdf\xa3webm-audio-bytes"),
         close=AsyncMock(),
     )
 
@@ -2078,6 +2079,35 @@ async def test_chat_audio_upload_rejects_unsupported_audio_content_type() -> Non
     assert exc_info.value.detail == "Unsupported audio format"
     file.read.assert_not_awaited()
     file.close.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("filename", "content_type", "data"),
+    [
+        ("note.webm", "audio/webm", b"<html><script>alert(1)</script></html>"),
+        ("payload.js", "audio/mpeg", b"ID3:alert(1);"),
+    ],
+)
+async def test_chat_audio_upload_rejects_restricted_content_declared_as_audio(
+    filename: str, content_type: str, data: bytes
+) -> None:
+    file = SimpleNamespace(
+        filename=filename,
+        content_type=content_type,
+        read=AsyncMock(return_value=data),
+        close=AsyncMock(),
+    )
+
+    with pytest.raises(HTTPException) as exc_info:
+        await workflow_copilot_chat_audio(
+            workflow_permanent_id="wpid-1",
+            workflow_copilot_chat_id="chat-1",
+            file=file,
+            organization=SimpleNamespace(organization_id="org-1"),
+        )
+
+    assert exc_info.value.status_code == 415
 
 
 @pytest.mark.asyncio

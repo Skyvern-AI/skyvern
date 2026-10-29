@@ -421,6 +421,7 @@ def _fresh_ctx_for_record() -> SimpleNamespace:
         workflow_verification_evidence=WorkflowVerificationEvidence(),
         last_run_blocks_workflow_run_id=None,
         last_run_blocks_block_ids=[],
+        last_run_outcome_block_ids=[],
         last_run_blocks_block_labels=[],
         last_run_outcome=None,
         narrative_block_attempts={},
