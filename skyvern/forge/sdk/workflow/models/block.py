@@ -248,9 +248,16 @@ from skyvern.forge.sdk.workflow.code_block_authorized_files import (
     unbound_attach_authorized_file,
 )
 from skyvern.forge.sdk.workflow.code_block_safety import BLOCKED_ATTRS as CODE_BLOCK_BLOCKED_ATTRS
-from skyvern.forge.sdk.workflow.code_block_safety import SANDBOX_MODULES_GLOBAL, BindSandboxModuleImports
+from skyvern.forge.sdk.workflow.code_block_safety import (
+    SANDBOX_MODULES_GLOBAL,
+    BindSandboxModuleImports,
+)
 from skyvern.forge.sdk.workflow.code_block_safety import is_safe_code as _shared_is_safe_code
-from skyvern.forge.sdk.workflow.code_block_safety import json_safe_default, module_shims, safe_builtins
+from skyvern.forge.sdk.workflow.code_block_safety import (
+    json_safe_default,
+    module_shims,
+    safe_builtins,
+)
 from skyvern.forge.sdk.workflow.constants import OUTPUT_PARAMETER_MAX_VALUE_BYTES
 from skyvern.forge.sdk.workflow.context_manager import (
     NON_SECRET_CREDENTIAL_FIELDS,
@@ -20873,6 +20880,7 @@ from skyvern.forge.sdk.workflow.models.google_sheets_blocks import (  # noqa: E4
     GoogleSheetsWriteBlock,
 )
 from skyvern.forge.sdk.workflow.models.pdf_fill_block import PdfFillBlock  # noqa: E402
+from skyvern.forge.sdk.workflow.models.powerbi_query_block import PowerBIQueryBlock  # noqa: E402
 from skyvern.forge.sdk.workflow.models.split_pdf_block import SplitPdfBlock  # noqa: E402
 from skyvern.forge.sdk.workflow.models.terminate_block import TerminateBlock  # noqa: E402
 from skyvern.forge.sdk.workflow.models.web_search_block import WebSearchBlock  # noqa: E402
@@ -20907,6 +20915,7 @@ BlockSubclasses = Union[
     GoogleSheetsReadBlock,
     EmailInboxBlock,
     GoogleSheetsWriteBlock,
+    PowerBIQueryBlock,
     PdfFillBlock,
     SplitPdfBlock,
     DataExportBlock,

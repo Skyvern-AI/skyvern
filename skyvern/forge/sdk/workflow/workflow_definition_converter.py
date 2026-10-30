@@ -88,6 +88,7 @@ from skyvern.forge.sdk.workflow.models.parameter import (
     WorkflowParameterType,
 )
 from skyvern.forge.sdk.workflow.models.pdf_fill_block import PdfFillBlock
+from skyvern.forge.sdk.workflow.models.powerbi_query_block import PowerBIQueryBlock
 from skyvern.forge.sdk.workflow.models.split_pdf_block import SplitPdfBlock
 from skyvern.forge.sdk.workflow.models.terminate_block import TerminateBlock
 from skyvern.forge.sdk.workflow.models.web_search_block import WebSearchBlock
@@ -1084,6 +1085,16 @@ def block_yaml_to_block(
             column_mapping=block_yaml.column_mapping,
             create_sheet_if_missing=block_yaml.create_sheet_if_missing,
             parameters=google_sheets_write_parameters,
+        )
+    elif block_yaml.block_type == BlockType.POWERBI_QUERY:
+        powerbi_query_parameters = _resolve_block_parameters(block_yaml, parameters)
+        return PowerBIQueryBlock(
+            **base_kwargs,
+            connection_id=block_yaml.connection_id,
+            dataset_id=block_yaml.dataset_id,
+            query=block_yaml.query,
+            max_rows=block_yaml.max_rows,
+            parameters=powerbi_query_parameters,
         )
 
     raise ValueError(f"Invalid block type {block_yaml.block_type}")

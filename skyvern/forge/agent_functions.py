@@ -2478,6 +2478,23 @@ class AgentFunction:
             )
             return None
 
+    async def execute_powerbi_query_for_run(
+        self,
+        *,
+        organization_id: str,
+        workflow_run_id: str,
+        workflow_run_block_id: str,
+        connection_id: str,
+        dataset_id: str,
+        query: str,
+        max_rows: int = 1_000,
+    ) -> list[dict[str, object]]:
+        """Power BI reads require Cloud's persisted-run identity and audited execution facade."""
+        raise NotImplementedError("Power BI workflow queries are only supported in Skyvern Cloud")
+
+    async def ensure_powerbi_queries_available(self) -> None:
+        raise NotImplementedError("Power BI workflow queries are only supported in Skyvern Cloud")
+
     async def get_google_workspace_credentials(
         self,
         organization_id: str,
