@@ -9,6 +9,7 @@ from skyvern.forge.sdk.api.llm.exceptions import (
     InvalidLLMConfigError,
     MissingLLMProviderEnvVarsError,
 )
+from skyvern.forge.sdk.api.llm.nace_decision_llm_caller import nace_model_supports_images
 from skyvern.forge.sdk.forge_log import _generated_log_value
 from skyvern.schemas.llm import LiteLLMParams, LLMConfig, LLMRouterConfig
 
@@ -1451,6 +1452,27 @@ if settings.ENABLE_YUTORI:
             max_completion_tokens=4096,
         ),
     )
+
+if settings.ENABLE_NACE:
+    # A decision model answered through nace_decision_llm_caller, never through litellm; see
+    # LLMCaller._call_nace_decision. Screenshots only go to models that read images (drex-max).
+    _nace_config = LLMConfig(
+        settings.NACE_MODEL,
+        ["NACE_API_KEY"],
+        supports_vision=nace_model_supports_images(settings.NACE_MODEL),
+        add_assistant_prefix=False,
+        temperature=None,
+    )
+    if _nace_missing_env_vars := _nace_config.get_missing_env_vars():
+        # Never fail import over this opt-in: create_forge_app warns and the prompts keep their
+        # default handlers.
+        LLMConfigRegistry.record_config_issue(
+            "NACE_DREX_MAX",
+            _nace_missing_env_vars,
+            MissingLLMProviderEnvVarsError("NACE_DREX_MAX", _nace_missing_env_vars).args[0],
+        )
+    else:
+        _register_builtin_config("NACE_DREX_MAX", _nace_config)
 
 if settings.ENABLE_GEMINI:
     _register_builtin_config(

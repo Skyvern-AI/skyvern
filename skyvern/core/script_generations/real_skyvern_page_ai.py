@@ -19,8 +19,11 @@ from skyvern.forge.prompts import prompt_engine
 from skyvern.forge.sdk.api.files import validate_download_url
 from skyvern.forge.sdk.api.llm.api_handler import LLMAPIHandler
 from skyvern.forge.sdk.api.llm.api_handler_factory import (
+    get_decision_llm_api_handler,
     get_org_aware_primary_llm_api_handler,
     get_org_aware_secondary_llm_api_handler,
+    nace_decision_active,
+    with_explicit_llm_override,
 )
 from skyvern.forge.sdk.api.llm.schema_validator import validate_and_fill_extraction_result
 from skyvern.forge.sdk.api.llm.utils import llm_response_log_metadata
@@ -87,6 +90,23 @@ async def _resolve_assist_llm_handler(prompt_type: str, default: LLMAPIHandler) 
     if not context or not distinct_id:
         return org_aware_default
     return await resolve_prompt_type_handler(prompt_type, distinct_id, context.organization_id, org_aware_default)
+
+
+async def _page_classify_llm_handler() -> LLMAPIHandler:
+    """The handler for page-classify.
+
+    Precedence: run override, organization default, Nace opt-in, platform default.
+    """
+    context = skyvern_context.current()
+    organization_id = context.organization_id if context else None
+    run_task = None
+    if nace_decision_active() and context and context.task_id and organization_id:
+        run_task = await app.DATABASE.tasks.get_task(context.task_id, organization_id)
+    decision_default = get_decision_llm_api_handler(app.SECONDARY_LLM_API_HANDLER)
+    return with_explicit_llm_override(
+        run_task.llm_key if run_task else None,
+        get_org_aware_secondary_llm_api_handler(default=decision_default),
+    )
 
 
 async def _get_element_id_by_selector(selector: str, page: Page) -> str | None:
@@ -897,7 +917,8 @@ class RealSkyvernPageAi(SkyvernPageAi):
             )
 
         try:
-            json_response = await get_org_aware_secondary_llm_api_handler(default=app.SECONDARY_LLM_API_HANDLER)(
+            classify_handler = await _page_classify_llm_handler()
+            json_response = await classify_handler(
                 prompt=classify_prompt,
                 prompt_name="page-classify",
                 step=step,
@@ -1824,9 +1845,11 @@ class RealSkyvernPageAi(SkyvernPageAi):
             navigation_goal=prompt,
         )
 
-        infer_llm_handler = await _resolve_assist_llm_handler(
-            "infer-action-type", app.SINGLE_INPUT_AGENT_LLM_API_HANDLER
+        infer_default = with_explicit_llm_override(
+            task.llm_key,
+            get_decision_llm_api_handler(app.SINGLE_INPUT_AGENT_LLM_API_HANDLER),
         )
+        infer_llm_handler = await _resolve_assist_llm_handler("infer-action-type", infer_default)
         json_response = await infer_llm_handler(
             prompt=infer_action_type_prompt,
             prompt_name="infer-action-type",

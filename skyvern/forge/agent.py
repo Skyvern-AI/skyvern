@@ -125,6 +125,7 @@ from skyvern.forge.sdk.api.llm.api_handler_factory import (
     LLMAPIHandlerFactory,
     LLMCaller,
     LLMCallerManager,
+    get_decision_llm_api_handler,
     get_org_aware_primary_llm_api_handler,
     get_org_aware_secondary_llm_api_handler,
 )
@@ -7932,9 +7933,13 @@ class ForgeAgent:
             )
 
         if use_check_user_goal_handler:
-            default_handler = get_org_aware_secondary_llm_api_handler(default=app.CHECK_USER_GOAL_LLM_API_HANDLER)
+            default_handler = get_org_aware_secondary_llm_api_handler(
+                default=get_decision_llm_api_handler(app.CHECK_USER_GOAL_LLM_API_HANDLER)
+            )
         else:
-            default_handler = get_org_aware_primary_llm_api_handler(default=app.LLM_API_HANDLER)
+            default_handler = get_org_aware_primary_llm_api_handler(
+                default=get_decision_llm_api_handler(app.LLM_API_HANDLER)
+            )
 
         distinct_id_for_override = task.workflow_run_id if task.workflow_run_id else task.task_id
         default_handler = await resolve_check_user_goal_handler(
@@ -9225,7 +9230,10 @@ class ForgeAgent:
                 "infer-action-type", navigation_goal=prompt_kwargs["navigation_goal"], prompt_name="infer-action-type"
             )
             llm_api_handler = LLMAPIHandlerFactory.get_override_llm_api_handler(
-                task.llm_key, default=get_org_aware_primary_llm_api_handler()
+                task.llm_key,
+                default=get_org_aware_primary_llm_api_handler(
+                    default=get_decision_llm_api_handler(app.LLM_API_HANDLER)
+                ),
             )
             json_response = await llm_api_handler(
                 prompt=prompt, step=step, prompt_name="infer-action-type", system_prompt=task.workflow_system_prompt
