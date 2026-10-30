@@ -1148,14 +1148,41 @@ def test_rewriting_a_legacy_block_engine_off_v3_rejects_it() -> None:
 def test_renaming_a_legacy_block_is_not_a_re_authoring() -> None:
     """A rename asks for a new label, not new content. Refusing it pushes the model to migrate a
     working block's engine to recover, which is a change the user never asked for."""
+    prior = _yaml(
+        {
+            "block_type": "navigation",
+            "label": "legacy_nav",
+            "navigation_goal": "old",
+            "engine": "skyvern-1.0",
+            "notes": "Existing runtime instruction.",
+        },
+        {"block_type": "extraction", "label": "legacy_extract", "data_extraction_goal": "old", "engine": "skyvern-1.0"},
+    )
     submitted = _yaml(
         {"block_type": "navigation", "label": "sign_in_step", "navigation_goal": "old", "engine": "skyvern-1.0"},
         {"block_type": "extraction", "label": "legacy_extract", "data_extraction_goal": "old", "engine": "skyvern-1.0"},
     )
 
-    validation = _accepted(AGENT_BLOCKS_ONLY, submitted, _LEGACY_AGENT_WORKFLOW)
+    validation = _accepted(CODE_BLOCKS_ONLY, submitted, prior)
 
     assert validation.reject is None
+
+
+@pytest.mark.parametrize("note_field", ["notes", "trailing_notes"])
+def test_renaming_a_legacy_block_while_adding_notes_is_refused(note_field: str) -> None:
+    prior = _yaml(
+        {**_GOAL, "engine": "skyvern-1.0"},
+        {"block_type": "extraction", "label": "legacy_extract", "data_extraction_goal": "old", "engine": "skyvern-1.0"},
+    )
+    submitted = _yaml(
+        {**_GOAL, "label": "sign_in_step", "engine": "skyvern-1.0", note_field: "New runtime instruction."},
+        {"block_type": "extraction", "label": "legacy_extract", "data_extraction_goal": "old", "engine": "skyvern-1.0"},
+    )
+
+    validation = _accepted(CODE_BLOCKS_ONLY, submitted, prior)
+
+    assert validation.reject is not None
+    assert "sign_in_step" in validation.reject.error
 
 
 def test_replacing_a_legacy_block_with_an_unrelated_one_of_the_same_type_is_not_a_rename() -> None:
@@ -1208,6 +1235,17 @@ def test_rewriting_a_legacy_code_block_is_refused_without_code_access() -> None:
 
     assert validation.reject is not None
     assert "scrape" in validation.reject.error
+
+
+@pytest.mark.parametrize("note_field", ["notes", "trailing_notes"])
+def test_editing_only_notes_on_a_grandfathered_banned_block_is_refused(note_field: str) -> None:
+    prior = _yaml({**_GOAL, "engine": "skyvern-1.0"})
+    submitted = _yaml({**_GOAL, "engine": "skyvern-1.0", note_field: "New runtime instruction."})
+
+    validation = _accepted(CODE_BLOCKS_ONLY, submitted, prior)
+
+    assert validation.reject is not None
+    assert "navigate" in validation.reject.error
 
 
 @pytest.mark.parametrize("resent_code", ["return {'a': 1}", "return {'a': 1}\n"])

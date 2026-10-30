@@ -58,6 +58,9 @@ class FakeWorkflowRunContext:
     def record_block_workflow_system_prompt(self, label: str, value: str | None) -> None:
         return None
 
+    def resolve_block_notes_section(self, label: str) -> str | None:
+        return None
+
     def has_value(self, key: str) -> bool:
         return key in self.values
 

@@ -32,7 +32,7 @@ from skyvern.cli.core.result import ErrorCode, make_error
 from skyvern.cli.core.session_manager import RequestFailureLog, get_current_session
 from skyvern.cli.mcp_tools import mcp
 from skyvern.cli.mcp_tools._element_state import action_deadline_error, element_state_error
-from skyvern.cli.mcp_tools.blocks import skyvern_block_validate, skyvern_workflow_knowledge
+from skyvern.cli.mcp_tools.blocks import skyvern_block_schema, skyvern_block_validate, skyvern_workflow_knowledge
 from skyvern.cli.mcp_tools.inspection import ensure_hooks_on_all_pages
 from skyvern.cli.mcp_tools.workflow import skyvern_workflow_get
 from skyvern.forge.sdk.cache.base import NoopLock
@@ -3840,14 +3840,14 @@ _ModelCall = Callable[[str, dict[str, Any]], Awaitable[dict[str, Any]]]
 
 @asynccontextmanager
 async def _real_server_tools(
-    capability: AuthoringCapability, *names: str
+    capability: AuthoringCapability, *names: str, doc_editor_enabled: bool = False
 ) -> AsyncIterator[tuple[dict[str, MCPTool], _ModelCall]]:
-    ctx = make_copilot_ctx(api_key="in-process-test-key")
+    ctx = make_copilot_ctx(api_key="in-process-test-key", doc_editor_enabled=doc_editor_enabled)
     ctx.authoring_capability = capability
     aliases = get_skyvern_mcp_alias_map()
     server = SkyvernOverlayMCPServer(
         transport=mcp,
-        overlays=_build_skyvern_mcp_overlays(capability),
+        overlays=_build_skyvern_mcp_overlays(capability, notes_visible=doc_editor_enabled),
         alias_map={name: aliases[name] for name in names},
         allowlist=frozenset(aliases[name] for name in names),
         context_provider=lambda: ctx,
@@ -3910,10 +3910,14 @@ def _enums_in(schema: object) -> list[list[str]]:
     return []
 
 
+@pytest.mark.parametrize("doc_editor_enabled", [False, True])
 @pytest.mark.asyncio
-async def test_closed_value_parameters_carry_the_enforced_values_as_a_schema_enum() -> None:
+async def test_closed_value_parameters_carry_the_enforced_values_as_a_schema_enum(doc_editor_enabled: bool) -> None:
     overlay_tools = ("get_workflow_knowledge", "list_workflow_runs", "navigate_browser")
-    async with _real_server_tools(ALL_BLOCK_FAMILIES, *overlay_tools) as (tools, call):
+    async with _real_server_tools(ALL_BLOCK_FAMILIES, *overlay_tools, doc_editor_enabled=doc_editor_enabled) as (
+        tools,
+        call,
+    ):
         served_topics = (await call("get_workflow_knowledge", {}))["data"]["topics"]
     schemas = {name: tool.inputSchema for name, tool in tools.items()}
     schemas |= {tool.name: tool.params_json_schema for tool in NATIVE_TOOLS if tool.name == "fill_credential_field"}
@@ -3932,6 +3936,56 @@ async def test_closed_value_parameters_carry_the_enforced_values_as_a_schema_enu
         ("navigate_browser", "wait_until"): [list(VALID_WAIT_UNTIL)],
         ("fill_credential_field", "field"): [list(CREDENTIAL_FILL_FIELD_NAMES)],
     }
+
+
+_NOTE_FIELDS = {"notes", "trailing_notes", "description"}
+
+
+def _saved_workflow_with_notes() -> dict[str, Any]:
+    child = {"label": "open", "block_type": "navigation", "notes": "use the left menu", "description": "people only"}
+    loop = {"label": "each", "block_type": "for_loop", "loop_blocks": [child], "trailing_notes": "stop at ten"}
+    return {
+        "ok": True,
+        "data": {"description": "workflow summary", "workflow_definition": {"parameters": [], "blocks": [loop]}},
+    }
+
+
+@pytest.mark.parametrize("doc_editor_enabled", [False, True])
+@pytest.mark.asyncio
+async def test_copilot_reads_notes_only_with_the_doc_editor(doc_editor_enabled: bool) -> None:
+    public = (await skyvern_block_schema(block_type="navigation"))["data"]["schema"]["properties"]
+    assert _NOTE_FIELDS.isdisjoint(public)
+    async with _real_server_tools(
+        ALL_BLOCK_FAMILIES, "get_block_schema", "get_workflow_knowledge", doc_editor_enabled=doc_editor_enabled
+    ) as (tools, call):
+        catalog = (await call("get_workflow_knowledge", {}))["data"]["topics"]
+        asked = await call("get_workflow_knowledge", {"topics": ["notes_between_blocks", "for_loop_block"]})
+        asked_only_notes = await call("get_workflow_knowledge", {"topics": ["notes_between_blocks"]})
+        loop_schema = (await call("get_block_schema", {"block_type": "for_loop"}))["data"]["schema"]
+    saved = await _build_skyvern_mcp_overlays(ALL_BLOCK_FAMILIES, notes_visible=doc_editor_enabled)[
+        "get_org_workflow"
+    ].post_hook(_saved_workflow_with_notes(), {}, make_copilot_ctx(doc_editor_enabled=doc_editor_enabled))
+
+    block_property_maps = [
+        definition["properties"]
+        for definition in loop_schema["$defs"].values()
+        if {"label", "block_type"} <= set(definition.get("properties", {}))
+    ]
+    saved_loop = saved["data"]["workflow_definition"]["blocks"][0]
+    if doc_editor_enabled:
+        assert "notes_between_blocks" in catalog and "notes_between_blocks" in asked["data"]["sections"]
+        assert set(asked_only_notes["data"]["sections"]) == {"notes_between_blocks"}
+        assert all(_NOTE_FIELDS <= set(properties) for properties in block_property_maps)
+        assert saved_loop["trailing_notes"] == "stop at ten"
+        assert saved_loop["loop_blocks"][0]["notes"] == "use the left menu"
+    else:
+        assert "notes_between_blocks" not in catalog
+        assert "notes_between_blocks" not in json.dumps(tools["get_workflow_knowledge"].inputSchema)
+        assert set(asked["data"]["sections"]) == {"for_loop_block"}
+        assert "notes_between_blocks" not in json.dumps(asked_only_notes)
+        assert all(_NOTE_FIELDS.isdisjoint(properties) for properties in block_property_maps)
+        assert _NOTE_FIELDS.isdisjoint(saved_loop) and _NOTE_FIELDS.isdisjoint(saved_loop["loop_blocks"][0])
+        assert saved["data"]["description"] == "workflow summary"
 
 
 @pytest.mark.parametrize("capability", [ALL_BLOCK_FAMILIES, CODE_BLOCKS_ONLY, AGENT_BLOCKS_ONLY])

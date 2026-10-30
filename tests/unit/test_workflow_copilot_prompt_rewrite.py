@@ -10,7 +10,7 @@ from typing import Any
 
 import pytest
 
-from skyvern.cli.mcp_tools.blocks import skyvern_block_schema
+from skyvern.cli.mcp_tools.blocks import _parse_knowledge_topics, skyvern_block_schema
 from skyvern.forge import app
 from skyvern.forge.agent_functions import AgentFunction
 from skyvern.forge.sdk.copilot.agent import _build_dynamic_system_prompt, _build_tool_usage_guide
@@ -38,6 +38,7 @@ from skyvern.forge.sdk.copilot.tools.mcp_hooks import (
     _get_workflow_knowledge_post_hook,
 )
 from skyvern.schemas.workflows import CodeBlockYAML
+from tests.unit.copilot_test_helpers import make_copilot_ctx
 
 
 # _build_dynamic_system_prompt stamps the current time once per call, so two renders
@@ -181,6 +182,43 @@ async def test_choosing_a_block_carries_the_family_rule_only_when_both_families_
     )
     assert code_only["data"]["sections"]["choosing_a_block"]["content"] == "all block types"
     assert "active_policy_note" not in code_only["data"]
+
+
+def _knowledge_ctx(*, doc_editor_enabled: bool) -> CopilotContext:
+    ctx = make_copilot_ctx(doc_editor_enabled=doc_editor_enabled)
+    ctx.authoring_capability = CODE_BLOCKS_ONLY
+    return ctx
+
+
+@pytest.mark.asyncio
+async def test_workflow_knowledge_carries_the_notes_topic_only_with_the_doc_editor() -> None:
+    def payload() -> dict:
+        return {
+            "ok": True,
+            "data": {
+                "topics": ["workflow_execution_flow", "notes_between_blocks"],
+                "count": 2,
+                "sections": {
+                    "workflow_execution_flow": {"content": "flow"},
+                    "notes_between_blocks": {"content": "notes"},
+                },
+            },
+        }
+
+    off = await _get_workflow_knowledge_post_hook(payload(), {}, _knowledge_ctx(doc_editor_enabled=False))
+    on = await _get_workflow_knowledge_post_hook(payload(), {}, _knowledge_ctx(doc_editor_enabled=True))
+
+    assert set(off["data"]["sections"]) == {"workflow_execution_flow"}
+    assert off["data"]["topics"] == ["workflow_execution_flow"] and off["data"]["count"] == 1
+    assert set(on["data"]["sections"]) == {"workflow_execution_flow", "notes_between_blocks"}
+
+
+def test_notes_guidance_is_its_own_knowledge_topic() -> None:
+    topics = _parse_knowledge_topics()
+
+    assert "notes_between_blocks" in topics
+    assert "trailing_notes" in topics["notes_between_blocks"]["content"]
+    assert all("trailing_notes" not in t["content"] for name, t in topics.items() if name != "notes_between_blocks")
 
 
 def test_code_block_schema_guidance_states_the_runtime_without_prescribing_a_procedure() -> None:

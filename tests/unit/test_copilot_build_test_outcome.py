@@ -251,6 +251,41 @@ def test_registered_block_download_reaches_packet_without_parseable_artifact_evi
     assert [(download.artifact_id, download.file_name) for download in packet.downloads] == [("a_dl_9", None)]
 
 
+def test_packet_workflow_readback_hides_saved_notes_with_doc_editor_off() -> None:
+    ctx = make_copilot_ctx(doc_editor_enabled=False)
+    ctx.last_workflow_yaml = (
+        "title: Notes draft\n"
+        "workflow_definition:\n"
+        "  parameters: []\n"
+        "  blocks:\n"
+        "    - block_type: navigation\n"
+        "      label: open\n"
+        "      url: https://example.com\n"
+        "      navigation_goal: Open the page\n"
+        "      notes: SAVED_NOTE_TEXT\n"
+        "      trailing_notes: SAVED_TRAILING_TEXT\n"
+        "      description: SAVED_DESCRIPTION_TEXT\n"
+    )
+    result = {
+        "ok": True,
+        "data": {
+            "workflow_run_id": "wr_1",
+            "overall_status": "completed",
+            "requested_block_labels": ["open"],
+            "executed_block_labels": ["open"],
+            "blocks": [{"label": "open", "status": "completed"}],
+        },
+    }
+
+    packet = build_test_evidence_packet(ctx, result)
+
+    assert packet.canonical_workflow_yaml is not None
+    assert "label: open" in packet.canonical_workflow_yaml
+    for hidden in ("SAVED_NOTE_TEXT", "SAVED_TRAILING_TEXT", "SAVED_DESCRIPTION_TEXT"):
+        assert hidden not in packet.canonical_workflow_yaml
+    assert "SAVED_NOTE_TEXT" in ctx.last_workflow_yaml
+
+
 def test_packet_projects_every_recorded_block_output_in_row_order_and_scrubs_secrets() -> None:
     ctx = _locator_packet_ctx()
     ctx.browser_session_id = "pbs_recorded_outputs"

@@ -65,6 +65,11 @@ async def test_cached_script_container_task_stamps_started_at(monkeypatch: pytes
     database.tasks.update_task = AsyncMock(return_value=created_task)
     database.tasks.create_step = AsyncMock(return_value=step)
     monkeypatch.setattr(app, "DATABASE", database)
+    run_context = MagicMock(resolve_noted_block_system_prompt=MagicMock(return_value=None))
+    run_context.cancel_failure_evidence_capture = AsyncMock()
+    monkeypatch.setattr(
+        app, "WORKFLOW_CONTEXT_MANAGER", MagicMock(get_workflow_run_context=MagicMock(return_value=run_context))
+    )
     create_video_artifact = AsyncMock()
     take_screenshot = AsyncMock()
     monkeypatch.setattr("skyvern.services.script_service._create_video_artifact", create_video_artifact)
