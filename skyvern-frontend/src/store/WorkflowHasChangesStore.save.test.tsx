@@ -70,6 +70,7 @@ const mocks = vi.hoisted(() => ({
   put: vi.fn(),
   capture: vi.fn(),
   getNodes: vi.fn<() => AppNode[]>(() => []),
+  docEditorFlag: false,
 }));
 
 vi.mock("@xyflow/react", async (importOriginal) => ({
@@ -93,7 +94,10 @@ vi.mock("@/hooks/useCredentialGetter", () => ({
   useCredentialGetter: () => vi.fn(async () => "test-token"),
 }));
 vi.mock("posthog-js/react", () => ({
-  usePostHog: () => ({ capture: mocks.capture }),
+  usePostHog: () => ({
+    capture: mocks.capture,
+    isFeatureEnabled: () => mocks.docEditorFlag,
+  }),
 }));
 
 function wrapper({ children }: { children: ReactNode }) {
@@ -2089,6 +2093,25 @@ describe("Doc fields on save", () => {
         ({ ...saveData, blocks: [blockWithoutNotes] }) as WorkflowSaveData,
     });
   });
+  afterEach(() => {
+    mocks.docEditorFlag = false;
+  });
+
+  it.each([false, true])(
+    "with the Doc flag %s, a block without annotations omits unset fields",
+    async (flag) => {
+      mocks.docEditorFlag = flag;
+      const { result } = renderHook(() => useWorkflowSave(), { wrapper });
+
+      await act(() => result.current.mutateAsync(undefined));
+
+      const [block] = parseYaml(mocks.put.mock.calls[0]![1]).workflow_definition
+        .blocks;
+      for (const key of ["notes", "trailing_notes", "description"] as const) {
+        expect(block).not.toHaveProperty(key);
+      }
+    },
+  );
   it("a block without annotations omits unset fields from an actual Visual save", async () => {
     const { result } = renderHook(() => useWorkflowSave(), { wrapper });
 
