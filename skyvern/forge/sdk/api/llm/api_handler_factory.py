@@ -60,6 +60,11 @@ from skyvern.forge.sdk.api.llm.exceptions import (
 from skyvern.forge.sdk.api.llm.litellm_pricing import long_prompt_cost_multiplier
 from skyvern.forge.sdk.api.llm.litellm_transport import configure_litellm_transport
 from skyvern.forge.sdk.api.llm.litellm_usage import use_anthropic_reported_thinking_tokens
+from skyvern.forge.sdk.api.llm.nace_decision_llm_caller import (
+    NACE_DECISION_LLM_KEY,
+    call_nace_decision,
+    nace_decision_cost_usd,
+)
 from skyvern.forge.sdk.api.llm.ui_tars_response import UITarsResponse
 from skyvern.forge.sdk.api.llm.utils import (
     is_content_filtered_response,
@@ -2928,6 +2933,15 @@ class LLMAPIHandlerFactory:
                 LLMAPIHandlerFactory._handler_cache[llm_key] = (llm_config, handler)
             return handler
 
+        # Nace Drex Max is a decision API, not a chat completion: LLMCaller dispatches it to
+        # _call_nace_decision instead of litellm.
+        if llm_key == NACE_DECISION_LLM_KEY:
+            llm_caller = LLMCaller(llm_key=llm_key, base_parameters=base_parameters)
+            handler = llm_caller.call
+            if should_cache_handler:
+                LLMAPIHandlerFactory._handler_cache[llm_key] = (llm_config, handler)
+            return handler
+
         # For GitHub Copilot via OPENAI_COMPATIBLE, use LLMCaller for a custom header
         if llm_key == "OPENAI_COMPATIBLE" and LLMAPIHandlerFactory.is_github_copilot_endpoint():
             llm_caller = LLMCaller(llm_key=llm_key, base_parameters=base_parameters)
@@ -3769,6 +3783,39 @@ def get_org_aware_primary_llm_api_handler(default: LLMAPIHandler | None = None) 
     )
 
 
+def nace_decision_active() -> bool:
+    """Whether the Nace decision handler is built, i.e. ``ENABLE_NACE`` is on and a key is set."""
+    return bool(settings.ENABLE_NACE) and getattr(app, "DECISION_LLM_API_HANDLER", None) is not None
+
+
+def get_decision_llm_api_handler(default: LLMAPIHandler) -> LLMAPIHandler:
+    """The opt-in Nace Drex Max decision handler for a bounded-choice prompt, else ``default``.
+
+    Only the prompts in ``NACE_DECISION_PROMPT_NAMES`` may go through the returned handler; the
+    decision caller rejects any other prompt before making a request. Organization defaults and
+    explicit per-run overrides wrap the result at the call sites, so they still win over this
+    deployment-wide opt-in.
+    """
+    handler = getattr(app, "DECISION_LLM_API_HANDLER", None)
+    return handler if settings.ENABLE_NACE and handler is not None else default
+
+
+def with_explicit_llm_override(
+    override_llm_key: str | None,
+    handler: LLMAPIHandler,
+) -> LLMAPIHandler:
+    """Let an explicit per-run ``llm_key`` outrank the deployment-wide Nace opt-in.
+
+    Call sites that route a bounded-choice prompt through ``get_decision_llm_api_handler`` wrap
+    the result with this. It does nothing unless the Nace decision handler is actually active
+    (``ENABLE_NACE`` with a usable key), so deployments that never opted in, or opted in without a
+    key, get their handlers unchanged.
+    """
+    if not nace_decision_active() or not override_llm_key:
+        return handler
+    return LLMAPIHandlerFactory.get_override_llm_api_handler(override_llm_key, default=handler)
+
+
 class LLMCaller:
     """
     An LLMCaller instance defines the LLM configs and keeps the chat history if needed.
@@ -3895,7 +3942,8 @@ class LLMCaller:
                 )
             # Router configs reach the provider through litellm.Router and never these branches, so
             # this check has to sit below the router case exactly as it does in dispatch.
-            if any(marker in (self.llm_key or "") for marker in ("ANTHROPIC", "UI_TARS", "YUTORI")):
+            raw_provider_markers = ("ANTHROPIC", "UI_TARS", "YUTORI", "NACE_DREX")
+            if any(marker in (self.llm_key or "") for marker in raw_provider_markers):
                 return False
             return supports_tool_choice(model=self.llm_config.model_name)
         except Exception:
@@ -4090,6 +4138,13 @@ class LLMCaller:
                     message_pattern=message_pattern,
                 )
                 message_history_after_success = None
+            if system_prompt and self.llm_key == NACE_DECISION_LLM_KEY:
+                # Drex has no system role; the decision caller folds this into the System One state.
+                system_text = _redact_prompt_text(system_prompt, secret_values, placeholder_ids)
+                messages.insert(
+                    0,
+                    {"role": "system", "content": [{"type": "text", "text": system_text}]},
+                )
             llm_request_payload = {
                 "model": self.llm_key if openrouter_model_name and self.openai_client else self.llm_config.model_name,
                 "messages": messages,
@@ -4218,6 +4273,12 @@ class LLMCaller:
                 raise
             except Exception as e:
                 _llm_span.set_attribute("status", "error")
+                if isinstance(e, BaseLLMError) and self.llm_key == NACE_DECISION_LLM_KEY:
+                    # Keep the decision caller's own classification (e.g.
+                    # InvalidLLMResponseFormat), as the parse step below does for other providers.
+                    e.llm_key = self.llm_key
+                    e.prompt_name = prompt_name
+                    raise
                 LOG.exception("LLM request failed unexpectedly", llm_key=self.llm_key)
                 if not caller_owns_exhaustion_receipt:
                     self.emit_retry_chain_exhausted(e, prompt_name)
@@ -4711,6 +4772,10 @@ class LLMCaller:
         if self.llm_key and "YUTORI" in self.llm_key:
             return await self._call_yutori_navigator(messages, timeout, **active_parameters)
 
+        # Route Nace Drex Max to the System One decision API
+        if self.llm_key == NACE_DECISION_LLM_KEY:
+            return await self._call_nace_decision(messages, timeout, prompt_name=prompt_name)
+
         return await litellm.acompletion(
             model=self.llm_config.model_name,
             messages=messages,
@@ -4867,6 +4932,24 @@ class LLMCaller:
         response_dict = completion.model_dump()
         return litellm.ModelResponse(**response_dict)
 
+    async def _call_nace_decision(
+        self,
+        messages: list[dict[str, Any]],
+        timeout: float = settings.LLM_CONFIG_TIMEOUT,
+        prompt_name: str | None = None,
+    ) -> ModelResponse:
+        """Answer a bounded-choice prompt with Nace Drex Max through the System One decision API."""
+        if not app.NACE_CLIENT:
+            raise ValueError(
+                "NACE_CLIENT not initialized. Ensure ENABLE_NACE=true and NACE_API_KEY is set.",
+            )
+        return await call_nace_decision(
+            app.NACE_CLIENT,
+            messages,
+            prompt_name=prompt_name,
+            timeout=timeout,
+        )
+
     async def get_call_stats(
         self, response: ModelResponse | CustomStreamWrapper | AnthropicMessage | UITarsResponse
     ) -> LLMCallStats:
@@ -4883,6 +4966,20 @@ class LLMCaller:
                 output_tokens=output_tokens,
                 cached_tokens=cached_tokens,
                 reasoning_tokens=reasoning_tokens,
+            )
+
+        # Nace Drex Max bills input tokens only, by the model that served the call; litellm has no
+        # price entry for it.
+        if self.original_llm_key == NACE_DECISION_LLM_KEY and isinstance(response, ModelResponse):
+            input_tokens, output_tokens, _, _ = LLMAPIHandlerFactory._extract_token_counts(response)
+            nace_cost = nace_decision_cost_usd(input_tokens, getattr(response, "model", None))
+            return LLMCallStats(
+                llm_cost=nace_cost or 0,
+                llm_cost_available=nace_cost is not None,
+                input_tokens=input_tokens,
+                output_tokens=output_tokens,
+                cached_tokens=0,
+                reasoning_tokens=0,
             )
 
         # Handle UI-TARS response (UITarsResponse object from _call_ui_tars)

@@ -650,6 +650,14 @@ class Settings(BaseSettings):
     YUTORI_LLM_KEY: str = "YUTORI_NAVIGATOR"
     YUTORI_TOOL_SET: str = ""
 
+    # Nace Drex Max: opt-in decision model for Skyvern's bounded-choice prompts (goal
+    # verification, page classification, action-type inference, auto-completion choice).
+    # It does not replace LLM_KEY.
+    ENABLE_NACE: bool = False
+    NACE_API_KEY: str | None = None
+    NACE_API_BASE: str = "https://console.nace.ai"
+    NACE_MODEL: str = "drex-max"
+
     # OPENAI COMPATIBLE
     OPENAI_COMPATIBLE_MODEL_NAME: str | None = None
     OPENAI_COMPATIBLE_API_KEY: str | None = None
