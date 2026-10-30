@@ -7,7 +7,7 @@ from decimal import Decimal
 from typing import TYPE_CHECKING, Any
 
 import structlog
-from sqlalchemy import ColumnElement, and_, delete, func, or_, select, tuple_, update
+from sqlalchemy import ColumnElement, and_, delete, func, inspect, or_, select, tuple_, update
 
 from skyvern.errors.errors import is_anti_bot_system_error
 from skyvern.forge.failure_classifier import (
@@ -1394,6 +1394,20 @@ class TasksRepository(BaseRepository):
                 query = query.where(attempt_filter)
             tasks = (await session.scalars(query.order_by(TaskModel.created_at))).all()
             return [convert_to_task(task, debug_enabled=self.debug_enabled) for task in tasks]
+
+    @db_operation("get_tasks_for_workflow_run_status")
+    async def get_tasks_for_workflow_run_status(self, workflow_run_id: str) -> list[Task]:
+        # Run status never reads extracted_information, often the largest column, so it is neither fetched nor decoded.
+        columns = [
+            attr.class_attribute for attr in inspect(TaskModel).column_attrs if attr.key != "extracted_information"
+        ]
+        async with self.Session() as session:
+            query = select(*columns).where(TaskModel.workflow_run_id == workflow_run_id).order_by(TaskModel.created_at)
+            rows = (await session.execute(query)).all()
+        return [
+            convert_to_task(TaskModel(**row._mapping, extracted_information=None), debug_enabled=self.debug_enabled)
+            for row in rows
+        ]
 
     @db_operation("delete_task_steps")
     async def delete_task_steps(self, organization_id: str, task_id: str) -> None:
