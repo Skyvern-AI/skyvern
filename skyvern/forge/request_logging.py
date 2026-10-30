@@ -68,7 +68,9 @@ _SENSITIVE_ENDPOINTS = {
     "POST /api/v1/stripe_webhook",
 }
 _SIGNED_TRIGGER_RECEIVER_ENDPOINT = re.compile(r"^POST /(?:api/)?v1/triggers/[^/]+/events$")
+_AD_ATTRIBUTION_WITHDRAWAL_ENDPOINT = re.compile(r"^POST /(?:api/)?v1/ad-attribution/withdraw$")
 _SENSITIVE_ENDPOINT_PATTERNS = (
+    re.compile(r"^POST /(?:api/)?v1/ad-attribution(?:/withdraw)?$"),
     re.compile(r"^(?:POST|PUT) /(?:api/)?v1/credentials(?:/.*)?$"),
     # Twilio credentials and inbound SMS codes must stay opaque even with malformed bodies.
     re.compile(r"^(?:POST|PUT|PATCH|DELETE) /(?:api/)?v1/(?:integrations/twilio|sms)(?:/.*)?$"),
@@ -444,8 +446,10 @@ async def log_raw_request_middleware(request: Request, call_next: Callable[[Requ
                         return Response(status_code=413)
                     bounded.extend(chunk)
             body_bytes = bytes(bounded)
-        elif _SIGNED_TRIGGER_RECEIVER_ENDPOINT.fullmatch(f"{request.method.upper()} {request.url.path.rstrip('/')}"):
-            # The receiver's route-level size limit must see the unconsumed request stream.
+        elif _SIGNED_TRIGGER_RECEIVER_ENDPOINT.fullmatch(
+            endpoint := f"{request.method.upper()} {request.url.path.rstrip('/')}"
+        ) or _AD_ATTRIBUTION_WITHDRAWAL_ENDPOINT.fullmatch(endpoint):
+            # Route-level body limits must see the unconsumed request stream.
             body_bytes = b""
             body_buffered = False
         else:
