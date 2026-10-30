@@ -629,6 +629,7 @@ export type AgentStepBlock = WorkflowBlockBase & {
   prompt: string;
   data_schema: Record<string, unknown>;
   max_turns: number;
+  tools?: Array<string> | null;
   parameters: Array<WorkflowParameter>;
 };
 
