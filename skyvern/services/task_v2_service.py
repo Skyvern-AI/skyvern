@@ -323,18 +323,11 @@ def _root_user_errors(task_v2: TaskV2, raw: object) -> list[UserDefinedError]:
     if not isinstance(run_context, WorkflowRunContext):
         return kept
     return [
-        UserDefinedError.model_validate({**error.model_dump(), "reasoning": _masked(error.reasoning, run_context)})
+        UserDefinedError.model_validate(
+            {**error.model_dump(), "reasoning": run_context.mask_secrets_in_reasoning(error.reasoning)}
+        )
         for error in kept
     ]
-
-
-def _masked(reasoning: str, run_context: WorkflowRunContext) -> str:
-    masked = str(run_context.mask_secrets_in_data(reasoning))
-    # mask_secrets_in_data leaves a short secret embedded in longer text; the aggregation replaces those too.
-    secrets = {value for value in run_context.secrets.values() if isinstance(value, str) and value}
-    for secret in sorted(secrets, key=len, reverse=True):
-        masked = masked.replace(secret, "[redacted]")
-    return masked or "[redacted]"
 
 
 async def _handle_task_v2_termination(

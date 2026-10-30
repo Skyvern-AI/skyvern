@@ -1101,6 +1101,15 @@ class WorkflowRunContext:
             return [self.represent_plaintext_secrets_as_placeholders(item) for item in payload]
         return payload
 
+    def mask_secrets_in_reasoning(self, reasoning: str) -> str:
+        """``reasoning`` with every registered secret replaced, as the errors[] aggregation masks stored rows."""
+        masked = str(self.mask_secrets_in_data(reasoning))
+        # mask_secrets_in_data leaves a short secret embedded in longer text; the aggregation replaces those too.
+        secrets = {value for value in self.secrets.values() if isinstance(value, str) and value}
+        for secret in sorted(secrets, key=len, reverse=True):
+            masked = masked.replace(secret, "[redacted]")
+        return masked or "[redacted]"
+
     def mask_secrets_in_data(self, data: Any, mask: str = "*****") -> Any:
         """
         Recursively replace registered secret values in data with a mask.

@@ -54,8 +54,13 @@ from skyvern.forge import app
 from skyvern.forge.failure_classifier import (
     DIAGNOSABLE_FAILURE_STATUSES,
     derive_failure_attribution,
+    final_har_user_mapping_digest,
+    final_har_user_match_claimed,
+    final_har_user_match_spent,
     has_classifier_primary,
     with_diagnostic_entry,
+    with_final_har_user_match_claim,
+    with_final_har_user_match_result,
 )
 from skyvern.forge.sdk.artifact.models import Artifact, ArtifactType
 from skyvern.forge.sdk.db._error_handling import db_operation
@@ -1428,6 +1433,131 @@ class WorkflowRunsRepository(BaseRepository):
             if newer_attempt is not None:
                 return None
             run.failure_category = with_diagnostic_entry(run.failure_category, entry)
+            await session.commit()
+            await session.refresh(run)
+            return convert_to_workflow_run(run)
+
+    async def _locked_failed_attempt(
+        self,
+        session: Any,
+        workflow_run_id: str,
+        organization_id: str,
+        finished_at: datetime | None,
+        attempt_number: int,
+    ) -> WorkflowRunModel | None:
+        run = (
+            await session.scalars(
+                select(WorkflowRunModel)
+                .filter_by(workflow_run_id=workflow_run_id, organization_id=organization_id)
+                .with_for_update()
+                .execution_options(populate_existing=True)
+            )
+        ).first()
+        if run is None or run.status not in DIAGNOSABLE_FAILURE_STATUSES or run.finished_at != finished_at:
+            return None
+        newer_attempt = await session.scalar(
+            select(WorkflowRunAttemptModel.attempt_number)
+            .where(WorkflowRunAttemptModel.workflow_run_id == workflow_run_id)
+            .where(WorkflowRunAttemptModel.attempt_number > attempt_number)
+            .limit(1)
+        )
+        return None if newer_attempt is not None else run
+
+    async def _mapping_source_is_current(
+        self, session: Any, run: WorkflowRunModel, attempt_number: int, source: dict[str, Any]
+    ) -> bool:
+        """Whether the row the match read its mapping from still belongs to this failed attempt and still holds that
+        mapping. Locked after the run row, in the same order at claim and result."""
+        mapping: dict[str, str] | None = None
+        if source.get("kind") == "task":
+            task = (
+                await session.scalars(
+                    select(TaskModel)
+                    .filter_by(
+                        task_id=source.get("root"),
+                        organization_id=run.organization_id,
+                        workflow_run_id=run.workflow_run_id,
+                    )
+                    .with_for_update()
+                    .execution_options(populate_existing=True)
+                )
+            ).first()
+            # Attempt-1 tasks written before attempts were numbered carry no attempt number.
+            if (
+                task is None
+                or task.status not in DIAGNOSABLE_FAILURE_STATUSES
+                or not (task.attempt_number == attempt_number or (attempt_number == 1 and task.attempt_number is None))
+            ):
+                return False
+            mapping = task.error_code_mapping
+        elif source.get("kind") == "task_v2":
+            root = (
+                await session.scalars(
+                    select(TaskV2Model)
+                    .filter_by(
+                        observer_cruise_id=source.get("root"),
+                        organization_id=run.organization_id,
+                        workflow_run_id=run.workflow_run_id,
+                    )
+                    .with_for_update()
+                    .execution_options(populate_existing=True)
+                )
+            ).first()
+            if root is None:
+                return False
+            mapping = root.error_code_mapping
+        else:
+            return False
+        return mapping is not None and final_har_user_mapping_digest(mapping) == source.get("mapping")
+
+    @db_operation("claim_final_har_user_match")
+    async def claim_final_har_user_match(
+        self,
+        workflow_run_id: str,
+        organization_id: str,
+        finished_at: datetime | None,
+        attempt_number: int,
+        identity: dict[str, Any],
+        source: dict[str, Any],
+    ) -> bool:
+        """Spend the failed attempt's one final-recording match before its request; a run without a classifier
+        primary may hold it too, since the entry carries no category. False when spent, when the run moved on, or
+        when ``source`` no longer belongs to this attempt with that mapping."""
+        async with self.Session() as session:
+            run = await self._locked_failed_attempt(
+                session, workflow_run_id, organization_id, finished_at, attempt_number
+            )
+            if run is None or final_har_user_match_spent(run.failure_category, identity):
+                return False
+            if not await self._mapping_source_is_current(session, run, attempt_number, source):
+                return False
+            run.failure_category = with_final_har_user_match_claim(run.failure_category, identity, source)
+            await session.commit()
+            return True
+
+    @db_operation("record_final_har_user_match")
+    async def record_final_har_user_match(
+        self,
+        workflow_run_id: str,
+        organization_id: str,
+        finished_at: datetime | None,
+        attempt_number: int,
+        identity: dict[str, Any],
+        source: dict[str, Any],
+        user_errors: list[dict[str, Any]],
+    ) -> WorkflowRun | None:
+        """Store the claimed match's rows; None, leaving the claim spent, once the run or its mapping source moved."""
+        async with self.Session() as session:
+            run = await self._locked_failed_attempt(
+                session, workflow_run_id, organization_id, finished_at, attempt_number
+            )
+            if run is None or not final_har_user_match_claimed(run.failure_category, identity, source):
+                return None
+            if not await self._mapping_source_is_current(session, run, attempt_number, source):
+                return None
+            run.failure_category = with_final_har_user_match_result(
+                run.failure_category, identity, source, [], user_errors
+            )
             await session.commit()
             await session.refresh(run)
             return convert_to_workflow_run(run)

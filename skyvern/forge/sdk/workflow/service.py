@@ -91,6 +91,7 @@ from skyvern.forge.failure_classifier import (
     BROWSER_SESSION_CLOSED_REASON_CODE,
     BROWSER_SESSION_EXPIRED_BEFORE_RUN_REASON_CODE,
     BROWSER_SESSION_STARTUP_TIMEOUT_REASON_CODE,
+    DIAGNOSABLE_FAILURE_STATUSES,
     TASK_V2_ROOT_USER_ERRORS_REASON_CODE,
     FailureCategory,
     classify_from_failure_reason,
@@ -98,7 +99,13 @@ from skyvern.forge.failure_classifier import (
     with_saved_profile_signed_out,
     with_sign_in_form_visible,
 )
-from skyvern.forge.final_failure_diagnostic import annotate_failed_workflow_run, diagnostic_system_errors
+from skyvern.forge.final_failure_diagnostic import (
+    FailureBeforeFinally,
+    annotate_failed_workflow_run,
+    diagnostic_system_errors,
+    failure_before_finally,
+    final_har_user_errors,
+)
 from skyvern.forge.prompts import prompt_engine
 from skyvern.forge.sdk.api.files import is_temp_working_dir, resolve_run_download_id
 from skyvern.forge.sdk.artifact.models import Artifact, ArtifactType
@@ -162,7 +169,11 @@ from skyvern.forge.sdk.models import Step, StepStatus
 from skyvern.forge.sdk.schemas.browser_profiles import BrowserProfile
 from skyvern.forge.sdk.schemas.credentials import Credential, credential_auto_profile_disabled
 from skyvern.forge.sdk.schemas.files import FileInfo
-from skyvern.forge.sdk.schemas.har_evidence import HarEvidence, HarEvidenceAvailability
+from skyvern.forge.sdk.schemas.har_evidence import (
+    HarEvidence,
+    HarEvidenceAvailability,
+    without_final_har_user_match,
+)
 from skyvern.forge.sdk.schemas.organizations import Organization
 from skyvern.forge.sdk.schemas.persistent_browser_sessions import (
     API_BROWSER_SESSION_CREATED_BY,
@@ -577,6 +588,21 @@ def _with_diagnostic_system_errors(
         for row in diagnostic_system_errors(categories, attempt_number)
         if (row["error_type"], row["error_code"]) not in present
     ]
+    return [*errors, *missing][: max(len(errors), 100)]
+
+
+def _with_final_har_user_errors(
+    errors: list[dict[str, Any]], categories: object, attempt_number: int
+) -> list[dict[str, Any]]:
+    """``errors`` plus the user errors the attempt's final closed-recording match recorded, each once per type and
+    code, within the response's 100-row bound."""
+    present = {(error.get("error_type"), error.get("error_code")) for error in errors}
+    missing: list[dict[str, Any]] = []
+    for row in final_har_user_errors(categories, attempt_number):
+        valid = _strict_user_defined_error_payload(row)
+        if valid is not None and (valid["error_type"], valid["error_code"]) not in present:
+            present.add((valid["error_type"], valid["error_code"]))
+            missing.append(valid)
     return [*errors, *missing][: max(len(errors), 100)]
 
 
@@ -7110,6 +7136,7 @@ class WorkflowService:
         # The snapshot this invocation's own conditional terminal write returned owns the final diagnostic; a
         # reload or a refused write never does.
         final_diagnostic_owner: WorkflowRun | None = None
+        before_finally: FailureBeforeFinally | None = None
 
         def capture_owner(written: WorkflowRun) -> None:
             nonlocal final_diagnostic_owner
@@ -7963,6 +7990,15 @@ class WorkflowService:
                     pre_finally_status = workflow_run.status
                     pre_finally_failure_reason = workflow_run.failure_reason
                     pre_finally_browser_persistence_status = pre_finally_status
+                    if finally_block_label and pre_finally_status.value in DIAGNOSABLE_FAILURE_STATUSES:
+                        try:
+                            before_finally = await failure_before_finally(workflow_run, attempt_number)
+                        except Exception:
+                            LOG.warning(
+                                "Failed to read the failure's owner before the finally block",
+                                workflow_run_id=workflow_run_id,
+                                exc_info=True,
+                            )
 
                     # Statuses that always skip script generation
                     skip_statuses = {WorkflowRunStatus.canceled, WorkflowRunStatus.failed, WorkflowRunStatus.timed_out}
@@ -8403,6 +8439,7 @@ class WorkflowService:
                 workflow_run_context=initialized_workflow_run_context,
                 stream_tombstone=stream_tombstone,
                 final_diagnostic_owner=final_diagnostic_owner,
+                before_finally=before_finally,
             )
 
         return workflow_run
@@ -16125,6 +16162,7 @@ class WorkflowService:
             errors, workflow_run.failure_category, task_v2.error_code_mapping if task_v2 else None
         )
         errors = _with_diagnostic_system_errors(errors, workflow_run.failure_category, current_attempt)
+        errors = _with_final_har_user_errors(errors, workflow_run.failure_category, current_attempt)
 
         parameters_with_value = {wfp.key: wfrp.value for wfp, wfrp in workflow_parameter_tuples}
 
@@ -16150,7 +16188,7 @@ class WorkflowService:
                 if cap_output_values
                 else workflow_run.failure_reason
             ),
-            failure_category=workflow_run.failure_category,
+            failure_category=without_final_har_user_match(workflow_run.failure_category),
             retried_from_workflow_run_id=workflow_run.retried_from_workflow_run_id,
             retried_by_workflow_run_id=retried_by_workflow_run_id,
             proxy_location=workflow_run.proxy_location,
@@ -16633,6 +16671,7 @@ class WorkflowService:
         stream_tombstone: Any = None,
         # The snapshot this run's own terminal write returned; without one the optional diagnostic is skipped.
         final_diagnostic_owner: WorkflowRun | None = None,
+        before_finally: FailureBeforeFinally | None = None,
     ) -> None:
         # Direct cleanup callers can enter with a terminal row. When browser cleanup is still
         # pending, install the tombstone before the first awaited terminal hook. A pre-finalization
@@ -16786,6 +16825,7 @@ class WorkflowService:
                         har_evidence,
                         attempt_number=attempt_number,
                         attempt_started_at=current_attempt.started_at if current_attempt is not None else None,
+                        before_finally=before_finally,
                     )
             except asyncio.CancelledError:
                 # The diagnostic is optional: deliver the terminal effects below, then restore the cancellation.

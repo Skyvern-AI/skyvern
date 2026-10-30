@@ -11,6 +11,9 @@ from skyvern.exceptions import InvalidCredentialId, SkyvernHTTPException
 from skyvern.forge.sdk.core import skyvern_context
 from skyvern.forge.sdk.core.skyvern_context import SkyvernContext
 from skyvern.forge.sdk.db.enums import WorkflowRunTriggerType
+from skyvern.forge.sdk.schemas.har_evidence import (
+    FINAL_HAR_USER_MATCH_REASON_CODE,
+)
 from skyvern.forge.sdk.workflow.context_manager import WorkflowRunContext
 from skyvern.forge.sdk.workflow.credential_fallback import (
     ANY_FAILURE,
@@ -228,6 +231,17 @@ def test_credential_failure_trigger_ignores_noncredential_categories() -> None:
 
 def test_credential_failure_trigger_falls_back_to_failure_reason_classification() -> None:
     workflow_run = _workflow_run(failure_category=None, failure_reason="The password was incorrect during login")
+
+    assert _trigger_matches(workflow_run, CREDENTIAL_FAILURES)
+
+
+@pytest.mark.parametrize("categories", [[], [{"category": "AUTH_FAILURE"}]])
+def test_the_final_recording_match_claim_is_not_a_credential_category(categories: list) -> None:
+    # A run holding only the claim still falls back to its failure reason, as a run without categories does.
+    claim = {"reason_code": FINAL_HAR_USER_MATCH_REASON_CODE, "identity": {}, "state": "done"}
+    workflow_run = _workflow_run(
+        failure_category=[claim, *categories], failure_reason="The password was incorrect during login"
+    )
 
     assert _trigger_matches(workflow_run, CREDENTIAL_FAILURES)
 
