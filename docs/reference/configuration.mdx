@@ -527,6 +527,38 @@ Groq specializes in fast inference for open-source models. Response times are ty
 
 ---
 
+## Nace Drex Max (decision model)
+
+[Drex Max](https://console.nace.ai/docs/drex/guides/drex-max) is a decision model, not a chat model: it answers bounded questions (yes/no, pick one option) over text and screenshots with a probability per option. Skyvern can send its bounded-choice prompts to it while `LLM_KEY` keeps doing the action planning and extraction:
+
+- goal verification (`check-user-goal`, `check-user-goal-with-termination` and the after-click check)
+- page classification (`page-classify`)
+- action-type inference (`infer-action-type`)
+- auto-completion suggestion choice (`auto-completion-choose-option`)
+
+```bash .env
+ENABLE_NACE=true
+NACE_API_KEY=your-nace-api-key
+```
+
+`LLM_KEY` is still required; Drex Max never plans actions. Organization defaults and explicit per-run `llm_key` overrides still win for these prompts, and when `ENABLE_NACE` is off (or `NACE_API_KEY` is missing) the prompts keep their usual handlers.
+
+### Optional settings
+
+```bash .env
+# Use a custom API endpoint
+NACE_API_BASE=https://console.nace.ai
+# Model id. drex-max (default) and drex-max-v1.1 read screenshots, $0.03 per 1M input tokens.
+# drex-v2.0 and drex-latest are text only (no screenshots are sent), $0.06 per 1M input tokens.
+NACE_MODEL=drex-max
+```
+
+<Note>
+A workflow system prompt (`workflow_system_prompt`) is sent to Drex ahead of the prompt, so its constraints still apply to these decisions. Drex Max returns probabilities, not text, so the `thoughts`/`reasoning` fields of these prompts carry the decision and its probability. Validation-type tasks (`decisive-criterion-validate`) are answered by the `NACE_DREX_MAX` LLM key when a run selects it through its `llm_key` override; any other prompt sent to that key is rejected.
+</Note>
+
+---
+
 ## Using multiple models
 
 ### Primary and secondary models
