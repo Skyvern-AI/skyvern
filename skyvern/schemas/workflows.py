@@ -898,7 +898,7 @@ class ForLoopBlockYAML(BlockYAML):
     # to infer the type of the parameter_type attribute.
     block_type: Literal[BlockType.FOR_LOOP] = BlockType.FOR_LOOP  # type: ignore
 
-    loop_blocks: list["BLOCK_YAML_SUBCLASSES"]
+    loop_blocks: list["BLOCK_YAML_TYPES"]
     loop_over_parameter_key: str = ""
     loop_variable_reference: str | None = None
     complete_if_empty: bool = False
@@ -914,7 +914,7 @@ class BranchCriteriaYAML(BaseModel):
 class WhileLoopBlockYAML(BlockYAML):
     block_type: Literal[BlockType.WHILE_LOOP] = BlockType.WHILE_LOOP  # type: ignore
 
-    loop_blocks: list["BLOCK_YAML_SUBCLASSES"]
+    loop_blocks: list["BLOCK_YAML_TYPES"]
     condition: BranchCriteriaYAML
 
 
