@@ -13,8 +13,14 @@ from skyvern.errors.errors import is_anti_bot_system_error
 from skyvern.forge.failure_classifier import (
     DIAGNOSABLE_FAILURE_STATUSES,
     HAR_ANTI_BOT_DIAGNOSTIC_REASON_CODE,
+    final_har_user_mapping_digest,
+    final_har_user_match_claimed,
+    final_har_user_match_inserted,
+    final_har_user_match_spent,
     has_classifier_primary,
     with_diagnostic_entry,
+    with_final_har_user_match_claim,
+    with_final_har_user_match_result,
 )
 from skyvern.forge.sdk.db._error_handling import db_operation
 from skyvern.forge.sdk.db.base_alchemy_db import read_retry
@@ -41,6 +47,9 @@ from skyvern.forge.sdk.db.utils import (
     serialize_proxy_location,
 )
 from skyvern.forge.sdk.models import TASK_V3_TURN_STEP_CREATED_BY, Step, StepStatus
+from skyvern.forge.sdk.schemas.har_evidence import (
+    is_final_har_user_match_entry,
+)
 from skyvern.forge.sdk.schemas.runs import Run
 from skyvern.forge.sdk.schemas.tasks import OrderBy, SortDirection, Task, TaskStatus
 from skyvern.forge.sdk.services.audit_events import record_run_cancel_audit
@@ -74,6 +83,23 @@ def _step_status_values(status: StepStatus) -> dict[str, Any]:
 
 def _is_diagnostic_entry(category: object) -> bool:
     return isinstance(category, dict) and category.get("reason_code") == HAR_ANTI_BOT_DIAGNOSTIC_REASON_CODE
+
+
+def _is_reset_diagnostic(category: object) -> bool:
+    return _is_diagnostic_entry(category) or is_final_har_user_match_entry(category)
+
+
+def _without_inserted_user_errors(errors: list[dict[str, Any]], inserted: list[str]) -> list[dict[str, Any]]:
+    remaining = list(inserted)
+    kept: list[dict[str, Any]] = []
+    # From the end: the match appended its rows after every row the task already carried.
+    for error in reversed(errors):
+        code = error.get("error_code") if isinstance(error, dict) else None
+        if isinstance(error, dict) and error.get("error_type") == "USER_DEFINED_ERROR" and code in remaining:
+            remaining.remove(code)
+            continue
+        kept.append(error)
+    return list(reversed(kept))
 
 
 class TasksRepository(BaseRepository):
@@ -979,6 +1005,75 @@ class TasksRepository(BaseRepository):
             await session.refresh(task)
             return convert_to_task(task, debug_enabled=self.debug_enabled)
 
+    @db_operation("claim_final_har_user_match")
+    async def claim_final_har_user_match(
+        self,
+        task_id: str,
+        organization_id: str,
+        finished_at: datetime | None,
+        identity: dict[str, Any],
+        source: dict[str, Any],
+    ) -> bool:
+        """Spend this failed execution's one final-recording match: committed before the request, so a repeated or
+        concurrent cleanup finds it spent, whatever that request's outcome. False when already spent or the task has
+        moved on."""
+        async with self.Session() as session:
+            task = (
+                await session.scalars(
+                    select(TaskModel)
+                    .filter_by(task_id=task_id, organization_id=organization_id)
+                    .with_for_update()
+                    .execution_options(populate_existing=True)
+                )
+            ).first()
+            if task is None or task.status not in DIAGNOSABLE_FAILURE_STATUSES or task.finished_at != finished_at:
+                return False
+            if final_har_user_match_spent(task.failure_category, identity):
+                return False
+            if final_har_user_mapping_digest(task.error_code_mapping) != source.get("mapping"):
+                return False
+            task.failure_category = with_final_har_user_match_claim(task.failure_category, identity, source)
+            await session.commit()
+            return True
+
+    @db_operation("record_final_har_user_match")
+    async def record_final_har_user_match(
+        self,
+        task_id: str,
+        organization_id: str,
+        finished_at: datetime | None,
+        identity: dict[str, Any],
+        source: dict[str, Any],
+        user_errors: Sequence[dict[str, Any]],
+    ) -> Task | None:
+        """Append the claimed match's user errors that the task does not already carry, remembering which, so a reset
+        removes only those. None when the claim, the execution or its mapping is no longer this one."""
+        async with self.Session() as session:
+            task = (
+                await session.scalars(
+                    select(TaskModel)
+                    .filter_by(task_id=task_id, organization_id=organization_id)
+                    .with_for_update()
+                    .execution_options(populate_existing=True)
+                )
+            ).first()
+            if task is None or task.status not in DIAGNOSABLE_FAILURE_STATUSES or task.finished_at != finished_at:
+                return None
+            if not final_har_user_match_claimed(task.failure_category, identity, source):
+                return None
+            if final_har_user_mapping_digest(task.error_code_mapping) != source.get("mapping"):
+                return None
+            present = {(e.get("error_type"), e.get("error_code")) for e in task.errors or [] if isinstance(e, dict)}
+            inserted = [e for e in user_errors if (e["error_type"], e["error_code"]) not in present]
+            task.failure_category = with_final_har_user_match_result(
+                task.failure_category, identity, source, [e["error_code"] for e in inserted]
+            )
+            if inserted:
+                task.errors = [*(task.errors or []), *inserted]
+            await session.commit()
+            await session.refresh(task)
+            return convert_to_task(task, debug_enabled=self.debug_enabled)
+
     @traced(name="skyvern.db.reset_task_for_rerun")
     @db_operation("reset_task_for_rerun")
     async def reset_task_for_rerun(self, task_id: str, organization_id: str) -> Task:
@@ -1007,8 +1102,12 @@ class TasksRepository(BaseRepository):
                 # that execution, not the rerun.
                 if any(is_anti_bot_system_error(error) for error in task.errors or []):
                     task.errors = [error for error in task.errors if not is_anti_bot_system_error(error)]
-                if any(_is_diagnostic_entry(category) for category in task.failure_category or []):
-                    task.failure_category = [c for c in task.failure_category if not _is_diagnostic_entry(c)]
+                # Only the rows the final match itself inserted; an equal row the task already had stays.
+                inserted = final_har_user_match_inserted(task.failure_category)
+                if inserted:
+                    task.errors = _without_inserted_user_errors(task.errors or [], inserted)
+                if any(_is_reset_diagnostic(category) for category in task.failure_category or []):
+                    task.failure_category = [c for c in task.failure_category if not _is_reset_diagnostic(c)] or None
                 await session.commit()
                 await session.refresh(task)
                 reset_task = convert_to_task(task, debug_enabled=self.debug_enabled)

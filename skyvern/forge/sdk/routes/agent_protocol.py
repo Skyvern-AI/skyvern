@@ -4852,7 +4852,11 @@ async def get_runs(
         current_org.organization_id, page=page, page_size=page_size, status=status, search_key=search_key
     )
     await app.WORKFLOW_SERVICE._attach_latest_attempt_views([run for run in runs if isinstance(run, WorkflowRun)])
-    return ORJSONResponse([run.model_dump() for run in runs])
+    # failure_category takes its public JSON-mode form, as response_model serialization would give it; every other
+    # field keeps this route's existing encoding.
+    return ORJSONResponse(
+        [run.model_dump() | run.model_dump(mode="json", include={"failure_category"}) for run in runs]
+    )
 
 
 _MAX_TAG_FILTER_TERMS = 20

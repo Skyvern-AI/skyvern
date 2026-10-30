@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import hashlib
+import json
 import math
 import re
 from enum import StrEnum
@@ -12,6 +14,10 @@ from skyvern.exceptions import (
     NO_ADDRESS_RECORD_NAV_ERROR_MARKER,
     CaptchaSolveError,
     FailedToNavigateToUrl,
+)
+from skyvern.forge.sdk.schemas.har_evidence import (
+    FINAL_HAR_USER_MATCH_REASON_CODE,
+    is_final_har_user_match_entry,
 )
 
 LOG = structlog.get_logger(__name__)
@@ -674,7 +680,12 @@ OUTPUT_ONLY_ANTI_BOT_REASON_CODES = frozenset(
 )
 # Entries of any category carrying one of these are labels for the run page; the same scrub hides them.
 OUTPUT_ONLY_LABEL_REASON_CODES = frozenset(
-    {SIGN_IN_FORM_VISIBLE_REASON_CODE, SAVED_PROFILE_SIGNED_OUT_REASON_CODE, TASK_V2_ROOT_USER_ERRORS_REASON_CODE}
+    {
+        SIGN_IN_FORM_VISIBLE_REASON_CODE,
+        SAVED_PROFILE_SIGNED_OUT_REASON_CODE,
+        TASK_V2_ROOT_USER_ERRORS_REASON_CODE,
+        FINAL_HAR_USER_MATCH_REASON_CODE,
+    }
 )
 
 
@@ -754,6 +765,71 @@ def is_output_only_entry(category: object) -> bool:
         category.get("category") == FailureCategory.ANTI_BOT_DETECTION.value
         and reason_code in OUTPUT_ONLY_ANTI_BOT_REASON_CODES
     )
+
+
+def final_har_user_mapping_digest(error_code_mapping: dict[str, str] | None) -> str | None:
+    """A digest of the mapping a final match read, so a write can tell the mapping it answered is still current."""
+    if not error_code_mapping:
+        return None
+    return hashlib.sha256(json.dumps(error_code_mapping, sort_keys=True).encode()).hexdigest()
+
+
+def _final_har_user_match_entry(categories: object) -> dict[str, Any] | None:
+    for category in categories if isinstance(categories, list) else []:
+        if is_final_har_user_match_entry(category):
+            return category
+    return None
+
+
+def final_har_user_match_spent(categories: object, identity: dict[str, Any]) -> bool:
+    """Whether this execution's one match was already claimed. ``identity`` names the execution only, so a later
+    change of mapping or of the row it is read from never buys the execution another request."""
+    entry = _final_har_user_match_entry(categories)
+    return entry is not None and entry.get("identity") == identity
+
+
+def final_har_user_match_claimed(categories: object, identity: dict[str, Any], source: dict[str, Any]) -> bool:
+    entry = _final_har_user_match_entry(categories)
+    return (
+        entry is not None
+        and entry.get("identity") == identity
+        and entry.get("source") == source
+        and entry.get("state") == "claimed"
+    )
+
+
+def with_final_har_user_match_claim(categories: list | None, identity: dict[str, Any], source: dict[str, Any]) -> list:
+    return with_diagnostic_entry(
+        categories,
+        {"reason_code": FINAL_HAR_USER_MATCH_REASON_CODE, "identity": identity, "source": source, "state": "claimed"},
+    )
+
+
+def with_final_har_user_match_result(
+    categories: list | None,
+    identity: dict[str, Any],
+    source: dict[str, Any],
+    inserted: list[str],
+    user_errors: list[dict[str, Any]] | None = None,
+) -> list:
+    """The claim marked done. ``inserted`` names only the task rows the match itself added, which a reset removes;
+    ``user_errors`` holds a workflow run's matched rows, which its response projects."""
+    entry: dict[str, Any] = {
+        "reason_code": FINAL_HAR_USER_MATCH_REASON_CODE,
+        "identity": identity,
+        "source": source,
+        "state": "done",
+        "inserted": inserted,
+    }
+    if user_errors is not None:
+        entry["user_errors"] = user_errors
+    return with_diagnostic_entry(categories, entry)
+
+
+def final_har_user_match_inserted(categories: object) -> list[str]:
+    entry = _final_har_user_match_entry(categories)
+    inserted = entry.get("inserted") if entry else None
+    return [code for code in inserted if isinstance(code, str)] if isinstance(inserted, list) else []
 
 
 def without_output_only_categories(categories: list) -> list:
