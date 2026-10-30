@@ -355,6 +355,7 @@ def test_pdf_parser_block_forwards_system_prompt(monkeypatch) -> None:
     workflow_run_context.has_value = MagicMock(return_value=False)
     workflow_run_context.workflow = None
     workflow_run_context.resolve_effective_workflow_system_prompt = MagicMock(return_value=None)
+    workflow_run_context.resolve_block_notes_section = MagicMock(return_value=None)
 
     monkeypatch.setattr(
         PDFParserBlock,

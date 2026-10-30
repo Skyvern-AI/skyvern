@@ -42,6 +42,7 @@ import {
   type Parameter,
   type WorkflowApiResponse,
   type WorkflowBlock,
+  type WorkflowBlockDocFields,
   type WorkflowSettings,
   type ConditionalBlock,
   type ForLoopBlock,
@@ -242,7 +243,34 @@ export function inferBranchCriteriaTypeFromExpression(
   return BranchCriteriaTypes.Prompt;
 }
 
+// Loaded only when set, so a block without them (or with the server's null default)
+// saves exactly as it would without these fields.
+function docFieldsFromBlock(
+  block: WorkflowBlockDocFields,
+): Pick<NodeBaseData, "notes" | "trailingNotes" | "description"> {
+  return {
+    ...(block.notes != null && { notes: block.notes }),
+    ...(block.trailing_notes != null && {
+      trailingNotes: block.trailing_notes,
+    }),
+    ...(block.description != null && { description: block.description }),
+  };
+}
+
+function docFieldsFromNodeData(
+  data: Pick<NodeBaseData, "notes" | "trailingNotes" | "description">,
+): WorkflowBlockDocFields {
+  return {
+    ...(data.notes != null && { notes: data.notes }),
+    ...(data.trailingNotes != null && {
+      trailing_notes: data.trailingNotes,
+    }),
+    ...(data.description != null && { description: data.description }),
+  };
+}
+
 function buildWhileLoopBlockYAML(args: {
+  docFields: WorkflowBlockDocFields;
   label: string;
   continue_on_failure: boolean;
   next_loop_on_failure: boolean;
@@ -266,6 +294,7 @@ function buildWhileLoopBlockYAML(args: {
       expression: args.expression,
       description: args.description,
     },
+    ...args.docFields,
   };
 }
 
@@ -275,6 +304,7 @@ function serializeLoopNodeWhileBranchToYAML(
   nextBlockLabel: string | null,
 ): WhileLoopBlockYAML {
   return buildWhileLoopBlockYAML({
+    docFields: docFieldsFromNodeData(node.data),
     label: node.data.label,
     continue_on_failure: node.data.continueOnFailure,
     next_loop_on_failure: node.data.nextLoopOnFailure ?? false,
@@ -811,7 +841,11 @@ function convertToNode(
     nextLoopOnFailure: block.next_loop_on_failure,
     editable,
     model: block.model,
+    notes: block.notes ?? null,
+    trailingNotes: block.trailing_notes ?? null,
+    description: block.description ?? null,
     ignoreWorkflowSystemPrompt: block.ignore_workflow_system_prompt ?? false,
+    ...docFieldsFromBlock(block),
   };
   switch (block.block_type) {
     case "conditional": {
@@ -1593,6 +1627,7 @@ function serializeConditionalBlock(
     // conditional's own next_block_label when no branch target applies.
     next_block_label: mergeIsInferred ? null : mergeLabel,
     branch_conditions: branchConditions,
+    ...docFieldsFromNodeData(node.data),
   };
 }
 
@@ -3260,6 +3295,7 @@ function serializeLoopNodeToYAML(
     complete_if_empty: node.data.completeIfEmpty,
     data_schema: JSONSafeOrString(node.data.dataSchema),
     loop_over_parameter_key: node.data.loopValue ?? "",
+    ...docFieldsFromNodeData(node.data),
   };
 }
 
@@ -3381,6 +3417,7 @@ function getWorkflowBlock(
     next_block_label: nextBlockLabel,
     ignore_workflow_system_prompt:
       node.data.ignoreWorkflowSystemPrompt ?? false,
+    ...docFieldsFromNodeData(node.data),
   };
   switch (node.type) {
     case "task": {
@@ -5027,6 +5064,7 @@ function convertBlocksToBlockYAML(
       next_block_label: block.next_block_label,
       ignore_workflow_system_prompt:
         block.ignore_workflow_system_prompt ?? false,
+      ...docFieldsFromNodeData(docFieldsFromBlock(block)),
     };
     switch (block.block_type) {
       case "task": {

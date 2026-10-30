@@ -393,6 +393,43 @@ def test_destination_registry_stays_complete_for_every_data_write_type() -> None
     assert set(DESTINATION_ADAPTERS) == DATA_WRITE_BLOCK_TYPES
 
 
+def test_a_note_change_marks_both_neighbours_changed_and_untested_but_a_description_change_does_not() -> None:
+    def workflow(note: str, description: str) -> str:
+        return _workflow(f"""    - block_type: task
+      label: above
+      prompt: First
+      description: {description}
+    - block_type: task
+      label: below
+      prompt: Second
+      notes: {note}
+    - block_type: task
+      label: elsewhere
+      prompt: Third
+""")
+
+    tested = workflow("Old note", "Opens the site")
+    receipts = workflow_block_fingerprints(tested)
+
+    note_edit = build_review_projection(tested, workflow("New note", "Opens the site"), receipts)
+    description_edit = build_review_projection(tested, workflow("Old note", "Something else"), receipts)
+
+    assert note_edit is not None and description_edit is not None
+    assert [(block["label"], block["change"], block["neverTested"]) for block in note_edit["blocks"]] == [
+        ("above", "changed", True),
+        ("below", "changed", True),
+        ("elsewhere", "unchanged", False),
+    ]
+    assert all(block["change"] == "unchanged" and not block["neverTested"] for block in description_edit["blocks"])
+
+    empty_note = workflow("Old note", "Opens the site").replace(
+        "      description:", "      notes: null\n      description:"
+    )
+    empty_note_edit = build_review_projection(tested, empty_note, receipts)
+    assert empty_note_edit is not None
+    assert all(block["change"] == "unchanged" for block in empty_note_edit["blocks"])
+
+
 def test_sheets_identity_resolves_account_and_ignores_representational_url_query() -> None:
     parameters = """
     - key: sheets_account

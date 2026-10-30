@@ -3850,6 +3850,19 @@ def test_a_goal_note_names_the_block_when_the_label_is_ordinary() -> None:
     assert "export, login" in dropped_note
 
 
+def test_an_inline_replacement_that_drops_a_saved_note_tells_the_person_what_it_said() -> None:
+    saved = (
+        "workflow_definition:\n  parameters: []\n  blocks:\n"
+        "  - {block_type: navigation, label: open_page, url: 'https://example.com', navigation_goal: Go,"
+        " notes: Never click Delete.}\n"
+    )
+
+    message = agent_module._dropped_notes_message(["open_page"], None, saved)
+
+    assert "open_page" in message and "Never click Delete." in message
+    assert not agent_module.contains_internal_machinery_leak(message)
+
+
 class TestTranslateToAgentResultGating:
     """Covers the three SKY-9143 invariants that live in _translate_to_agent_result."""
 

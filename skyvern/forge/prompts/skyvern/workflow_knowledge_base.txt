@@ -1065,6 +1065,26 @@ blocks:
     label: verify_result
     next_block_label: null
 
+** NOTES BETWEEN BLOCKS **
+
+- `notes` on a block holds plain-text instructions written directly above it. `trailing_notes` on the last block
+  of a sequence (the workflow, a loop body or a branch) holds text written after it.
+- At run time a block reads its own `notes`, the `notes` of the next block in the same sequence, and its own
+  `trailing_notes`. No other block reads them, and child workflows don't inherit them. A conditional reads them
+  only for conditions the AI checks, not for exact {{ }} checks.
+- `description` is for people. The agent never reads it.
+- Saving a block that leaves the field out keeps its saved notes; null or an empty string deletes them. Notes
+  are capped at 2,000 characters; credential references are kept literal at run time.
+blocks:
+  - block_type: navigation
+    label: open_invoices
+    navigation_goal: "Open the invoices page"
+  - block_type: extraction
+    label: extract_invoices
+    notes: "Only invoices from the last 30 days matter; ignore drafts."
+    data_extraction_goal: "Extract every invoice number and amount"
+# Both open_invoices and extract_invoices read the note.
+
 ** BEST PRACTICES **
 
 * Naming Conventions:

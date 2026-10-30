@@ -63,6 +63,8 @@ from skyvern.forge.sdk.copilot.context import (
     CodeAuthoringRepairContext,
     CopilotContext,
     ProposalDisposition,
+    copilot_sees_notes,
+    record_kept_note_texts,
 )
 from skyvern.forge.sdk.copilot.credential_fill_fields import CredentialFillField
 from skyvern.forge.sdk.copilot.google_connection_notice import (
@@ -142,6 +144,11 @@ from skyvern.forge.sdk.copilot.workflow_yaml import (
 from skyvern.forge.sdk.db.exceptions import CopilotProposalConflictError, CopilotProposalConflictReason
 from skyvern.forge.sdk.schemas.workflow_copilot import COPILOT_PRIVATE_SETTINGS_KEY, copilot_proposal_metadata
 from skyvern.forge.sdk.services import google_oauth_service
+from skyvern.forge.sdk.workflow.block_notes import (
+    carry_block_notes_from_versions,
+    drop_submitted_note_fields,
+    stored_notes_for_labels,
+)
 from skyvern.forge.sdk.workflow.exceptions import BaseWorkflowHTTPException, InsecureCodeDetected
 from skyvern.forge.sdk.workflow.models.block import CodeBlock
 from skyvern.forge.sdk.workflow.models.workflow import Workflow, WorkflowDefinition
@@ -3910,6 +3917,11 @@ def carry_author_time_findings(update_result: dict[str, Any], result: dict[str, 
             "stored_goal_kept_message",
             "stored_goal_dropped",
             "stored_goal_dropped_message",
+            "stored_notes_kept",
+            "stored_notes_kept_message",
+            "stored_notes_dropped",
+            "stored_notes_dropped_text",
+            "stored_notes_dropped_message",
             "google_connection_resolution",
             "persistence",
             "persistence_message",
@@ -4014,9 +4026,10 @@ def copilot_workflow_yaml_matches(
             source_canvas = _normalized_canvas_for_proposal_restore(
                 sanitized_source, inherited_proxy_location=inherited_proxy_location
             )
+            submitted_with_notes, _, _ = carry_block_notes_from_versions(submitted_yaml, sanitized_source, None)
             if (
                 _normalized_canvas_for_proposal_restore(
-                    submitted_yaml,
+                    submitted_with_notes,
                     inherited_code_version=source_canvas.code_version,
                     inherited_proxy_location=inherited_proxy_location,
                 )
@@ -4051,6 +4064,9 @@ def _normalized_canvas_for_proposal_restore(
 
     def normalize_blocks(blocks: Sequence[BLOCK_YAML_SUBCLASSES]) -> None:
         for block in blocks:
+            block.notes = block.notes or None
+            block.trailing_notes = block.trailing_notes or None
+            block.description = block.description or None
             if isinstance(block, CodeBlockYAML):
                 block.steps = block.steps or None
                 block.parameter_keys = block.parameter_keys or None
@@ -4191,6 +4207,7 @@ async def _validated_pending_workflow_proposal(
             reason="canvas_custody_mismatch",
             workflow_permanent_id=ctx.workflow_permanent_id,
         )
+        ctx.canvas_rejected_proposal_yaml = sanitized_yaml
         return None
     return proposal, sanitized_yaml
 
@@ -4539,6 +4556,8 @@ def proposal_conflict_result(
     if adoption == "adopted":
         result["error"] = f"{lost} Another change replaced the pending proposal, and this turn now works on it."
         adopted_yaml = redact_raw_secrets_for_prompt(ctx.staged_workflow_yaml or "")
+        if not copilot_sees_notes(ctx):
+            adopted_yaml = drop_submitted_note_fields(adopted_yaml)
         if len(adopted_yaml) > _BUILD_TEST_WORKFLOW_MAX_CHARS:
             result["adopted_workflow_yaml"] = adopted_yaml[: _BUILD_TEST_WORKFLOW_MAX_CHARS - 3] + "..."
             result["next_step"] = (
@@ -4865,6 +4884,12 @@ async def _update_workflow(
             goal_rewritten_labels=goal_rewritten_labels,
         )
         workflow_yaml = goal_carry.workflow_yaml
+        if not copilot_sees_notes(ctx):
+            # Without the Doc editor the user cannot see notes, so Copilot keeps the saved ones untouched.
+            workflow_yaml = drop_submitted_note_fields(workflow_yaml)
+        workflow_yaml, kept_note_labels, dropped_note_labels = carry_block_notes_from_versions(
+            workflow_yaml, prior_yaml, ctx.persisted_workflow_yaml if isinstance(ctx, CopilotContext) else None
+        )
         # Ahead of both persistence and the context assignment below, so the row, the draft the
         # model reads back, and the bytes apply_block_edit anchors against are one string. Scrubbing
         # the payload alone would leave the model reading redacted code and anchoring on raw code.
@@ -5115,6 +5140,29 @@ async def _update_workflow(
         if block_type_changes:
             data["block_type_changes"] = block_type_changes
         data.update(user_owned_goal_carry_disclosure(goal_carry))
+        notes_visible = copilot_sees_notes(ctx)
+        if kept_note_labels and notes_visible:
+            data["stored_notes_kept"] = list(kept_note_labels)
+            data["stored_notes_kept_message"] = (
+                "The submitted YAML left out notes or descriptions on these blocks, so the values from the previous "
+                "draft or the saved workflow were kept. "
+                "A note or description sent as null or an empty string is deleted."
+            )
+            if isinstance(ctx, CopilotContext):
+                record_kept_note_texts(ctx, kept_note_labels, workflow_yaml)
+        if dropped_note_labels:
+            data["stored_notes_dropped"] = dropped_note_labels
+            data["stored_notes_dropped_message"] = (
+                "These blocks had notes but were removed or changed type in the accepted workflow, so their notes are gone: "
+                + ", ".join(dropped_note_labels)
+                + (". stored_notes_dropped_text has what they said." if notes_visible else ".")
+            )
+            if notes_visible:
+                data["stored_notes_dropped_text"] = stored_notes_for_labels(
+                    dropped_note_labels,
+                    prior_yaml,
+                    ctx.persisted_workflow_yaml if isinstance(ctx, CopilotContext) else None,
+                )
         if stored_code or stored_code_withheld:
             LOG.info(
                 "copilot write returned stored code",

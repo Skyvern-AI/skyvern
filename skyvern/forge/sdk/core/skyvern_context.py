@@ -888,9 +888,12 @@ class SkyvernContext:
     script_revision_id: str | None = None
     action_order: int = 0
     prompt: str | None = None
+    # Workflow block label of the cached block now running; step notes are keyed by it.
+    cached_block_label: str | None = None
     parent_workflow_run_block_id: str | None = None
     workflow_run_block_id: str | None = None
     loop_metadata: dict[str, Any] | None = None
+    active_loop_label: str | None = None
     loop_internal_state: dict[str, Any] | None = None
     loop_output_values: list[list[dict[str, Any]]] | None = None
     script_run_parameters: dict[str, Any] = field(default_factory=dict)

@@ -1337,6 +1337,8 @@ interface WorkflowCopilotChatProps {
   // The browser pane shows a run's browser, so a demonstration would record the hidden debug browser.
   runOwnsBrowser?: boolean;
   authoringUnavailableReason?: string | null;
+  /** Whether the caller is rendering the opted-in document editor. */
+  docEditorEnabled?: boolean;
   // Render as a docked panel (no float/drag/resize) instead of a floating window.
   docked?: boolean;
   // Render frameless — no border, background, or title; the header keeps only
@@ -1623,6 +1625,7 @@ export function WorkflowCopilotChat({
   canRecordTask = false,
   runOwnsBrowser = false,
   authoringUnavailableReason,
+  docEditorEnabled = false,
   docked = false,
   chromeless = false,
   portalTarget,
@@ -8518,6 +8521,7 @@ export function WorkflowCopilotChat({
             ),
             workflow_yaml: workflowYaml,
             mode: "build",
+            doc_editor_enabled: docEditorEnabled,
             cancel_token: cancelToken,
             idempotency_key: options.idempotencyKey ?? null,
             target_block_label: targetBlockLabel,
@@ -8926,6 +8930,7 @@ export function WorkflowCopilotChat({
       onWorkflowPersisted,
       onRecordTask,
       authoringUnavailableReason,
+      docEditorEnabled,
       reserveCopilotTurn,
       isCopilotTurnCurrent,
       isCopilotOwnerCurrent,
@@ -10659,6 +10664,7 @@ export function WorkflowCopilotChat({
                             />
                           ) : null}
                           <ReviewGateCard
+                            docEditorEnabled={docEditorEnabled}
                             turn={message.narrative}
                             pending={index === gateIndex && gateHasSubject}
                             verdict={
@@ -10776,6 +10782,7 @@ export function WorkflowCopilotChat({
                           ) : null}
                           {isGateOwnerOrLast || acceptedReceiptHere ? (
                             <ReviewGateCard
+                              docEditorEnabled={docEditorEnabled}
                               pending={isGateOwnerOrLast}
                               verdict={
                                 isGateOwnerOrLast
@@ -10883,6 +10890,7 @@ export function WorkflowCopilotChat({
                   />
                 ) : null}
                 <ReviewGateCard
+                  docEditorEnabled={docEditorEnabled}
                   pending={!detachedReceiptShown}
                   verdict={
                     detachedReceiptShown

@@ -6,6 +6,7 @@ import json
 import re
 import uuid
 from collections.abc import Mapping
+from contextvars import ContextVar
 from enum import StrEnum
 from typing import Any
 
@@ -16,7 +17,12 @@ from pydantic import JsonValue
 from skyvern.cli.core.guards import VALID_WAIT_UNTIL
 from skyvern.cli.core.js_dispatch import outer_cap_seconds
 from skyvern.cli.mcp_tools._element_state import DEFAULT_ACTION_TIMEOUT_MS, DEFAULT_DIRECT_ACTION_TIMEOUT_MS
-from skyvern.cli.mcp_tools.blocks import CODE_BLOCK_RUNTIME_TOPIC, WORKFLOW_KNOWLEDGE_TOPIC_HEADERS
+from skyvern.cli.mcp_tools.blocks import (
+    CODE_BLOCK_RUNTIME_TOPIC,
+    NOTES_KNOWLEDGE_TOPIC,
+    WORKFLOW_KNOWLEDGE_TOPIC_HEADERS,
+    _parse_knowledge_topics,
+)
 from skyvern.config import settings
 from skyvern.forge import app
 from skyvern.forge.sdk.copilot.block_type_aliases import normalize_copilot_block_type_alias
@@ -32,6 +38,7 @@ from skyvern.forge.sdk.copilot.context import (
     USER_FACING_REASON_SCHEMA,
     CopilotContext,
     advertises,
+    copilot_sees_notes,
 )
 from skyvern.forge.sdk.copilot.credential_resolution import is_resolved_page_url, load_credentials
 from skyvern.forge.sdk.copilot.enforcement import (
@@ -81,6 +88,7 @@ from skyvern.forge.sdk.copilot.secret_scrub import (
     scrub_secrets_from_structure,
 )
 from skyvern.forge.sdk.schemas.credentials import Credential
+from skyvern.forge.sdk.workflow.block_notes import CARRIED_FIELDS, remove_note_fields
 from skyvern.forge.sdk.workflow.models.agent_step_tools import tool_descriptions
 from skyvern.forge.sdk.workflow.models.block import (
     CLEAR_BROWSER_DATA_HELPER_CONTRACT,
@@ -376,7 +384,65 @@ def _bound_failed_click_result(ctx: AgentContext, result: dict[str, Any]) -> Non
         bound_enrichment_text(container, key, max(minimum_chars, len(value) // 2))
 
 
+def _without_note_fields(value: Any) -> Any:
+    if isinstance(value, dict):
+        properties = value.get("properties")
+        if isinstance(properties, dict):
+            for name in CARRIED_FIELDS:
+                if isinstance(properties.get(name), dict) and properties[name].get("x-internal"):
+                    del properties[name]
+        for child in value.values():
+            _without_note_fields(child)
+    elif isinstance(value, list):
+        for child in value:
+            _without_note_fields(child)
+    return value
+
+
+def _note_field_properties() -> dict[str, Any]:
+    properties = TaskBlockYAML.model_json_schema().get("properties", {})
+    return {name: properties[name] for name in CARRIED_FIELDS if isinstance(properties.get(name), dict)}
+
+
+def _block_property_maps(schema: dict[str, Any]) -> list[dict[str, Any]]:
+    # Loop schemas are a top-level $ref, and their body blocks live in $defs too.
+    candidates = [schema, *(schema.get("$defs") or {}).values()]
+    return [
+        properties
+        for candidate in candidates
+        if isinstance(candidate, dict)
+        and isinstance(properties := candidate.get("properties"), dict)
+        and "label" in properties
+        and "block_type" in properties
+    ]
+
+
+def _note_fields_for_doc_editor(result: dict[str, Any] | None, ctx: AgentContext) -> dict[str, Any] | None:
+    """The MCP block schema leaves note fields out for every client; Copilot sees them only with the Doc editor."""
+    if result is None:
+        return result
+    data = result.get("data")
+    schema = data.get("schema") if isinstance(data, dict) else None
+    if not isinstance(schema, dict):
+        return result
+    if not copilot_sees_notes(ctx):
+        _without_note_fields(schema)
+        return result
+    note_properties = _note_field_properties()
+    for properties in _block_property_maps(schema):
+        for name, prop in note_properties.items():
+            properties.setdefault(name, copy.deepcopy(prop))
+    return result
+
+
 async def _get_block_schema_pre_hook(
+    params: dict[str, Any],
+    ctx: AgentContext,
+) -> dict[str, Any] | None:
+    return _note_fields_for_doc_editor(await _block_schema_pre_hook_result(params, ctx), ctx)
+
+
+async def _block_schema_pre_hook_result(
     params: dict[str, Any],
     ctx: AgentContext,
 ) -> dict[str, Any] | None:
@@ -705,7 +771,7 @@ async def _get_block_schema_post_hook(
             demonstrated = _demonstrated_step_facts(ctx)
             if demonstrated:
                 data["demonstrated_steps"] = demonstrated
-    return result
+    return _note_fields_for_doc_editor(result, ctx) or result
 
 
 def _task_v3_pure_schema(schema: dict[str, JsonValue]) -> dict[str, JsonValue]:
@@ -740,6 +806,16 @@ def _agent_block_schema_guidance() -> list[str]:
 # The shared section bans `task` and points at navigation/extraction. Every authoring capability either
 # allows `task` or bans those two, so the section is false on every Copilot turn.
 _TASK_UNAVAILABLE_KNOWLEDGE_TOPIC = "task_block_task_not_available_in_workflow_copilot"
+_REQUESTED_WORKFLOW_KNOWLEDGE_TOPICS: ContextVar[list[Any] | None] = ContextVar(
+    "requested_workflow_knowledge_topics", default=None
+)
+
+
+def _hidden_knowledge_topics(ctx: AgentContext) -> set[str]:
+    hidden = {_TASK_UNAVAILABLE_KNOWLEDGE_TOPIC}
+    if not copilot_sees_notes(ctx):
+        hidden.add(NOTES_KNOWLEDGE_TOPIC)
+    return hidden
 
 
 async def _get_workflow_knowledge_pre_hook(
@@ -747,13 +823,11 @@ async def _get_workflow_knowledge_pre_hook(
     ctx: AgentContext,
 ) -> dict[str, Any] | None:
     topics = params.get("topics")
+    _REQUESTED_WORKFLOW_KNOWLEDGE_TOPICS.set(topics.copy() if isinstance(topics, list) else None)
     if not isinstance(topics, list):
         return None
-    kept = [
-        topic
-        for topic in topics
-        if not (isinstance(topic, str) and topic.strip().lower() == _TASK_UNAVAILABLE_KNOWLEDGE_TOPIC)
-    ]
+    hidden = _hidden_knowledge_topics(ctx) | {NOTES_KNOWLEDGE_TOPIC}
+    kept = [topic for topic in topics if not (isinstance(topic, str) and topic.strip().lower() in hidden)]
     if kept:
         params["topics"] = kept
     elif topics:
@@ -764,17 +838,34 @@ async def _get_workflow_knowledge_pre_hook(
 
 async def _get_workflow_knowledge_post_hook(
     result: dict[str, Any],
-    raw: dict[str, Any],
+    _raw: dict[str, Any],
     ctx: AgentContext,
 ) -> dict[str, Any]:
     capability = _copilot_authoring_capability(ctx)
     data = result.get("data")
     if isinstance(data, dict):
         catalog = data.get("topics")
-        if isinstance(catalog, list) and _TASK_UNAVAILABLE_KNOWLEDGE_TOPIC in catalog:
-            catalog.remove(_TASK_UNAVAILABLE_KNOWLEDGE_TOPIC)
+        hidden = _hidden_knowledge_topics(ctx)
+        if isinstance(catalog, list) and hidden & set(catalog):
+            catalog[:] = [topic for topic in catalog if topic not in hidden]
+        if isinstance(catalog, list) and copilot_sees_notes(ctx) and NOTES_KNOWLEDGE_TOPIC not in catalog:
+            catalog.append(NOTES_KNOWLEDGE_TOPIC)
+        if isinstance(catalog, list):
             data["count"] = len(catalog)
     sections = data.get("sections") if isinstance(data, dict) else None
+    requested_topics = _REQUESTED_WORKFLOW_KNOWLEDGE_TOPICS.get()
+    _REQUESTED_WORKFLOW_KNOWLEDGE_TOPICS.set(None)
+    requested_notes = isinstance(requested_topics, list) and any(
+        isinstance(topic, str) and topic.strip().lower() == NOTES_KNOWLEDGE_TOPIC for topic in requested_topics
+    )
+    if requested_notes and copilot_sees_notes(ctx) and isinstance(data, dict):
+        notes_section = _parse_knowledge_topics().get(NOTES_KNOWLEDGE_TOPIC)
+        if notes_section is not None:
+            if not isinstance(sections, dict):
+                data.pop("topics", None)
+                data.pop("count", None)
+                sections = data["sections"] = {}
+            sections[NOTES_KNOWLEDGE_TOPIC] = copy.deepcopy(notes_section)
     if not isinstance(sections, dict):
         return result
     for_loop = sections.get("for_loop_block")
@@ -784,6 +875,21 @@ async def _get_workflow_knowledge_post_hook(
         choosing = sections.get("choosing_a_block")
         if isinstance(choosing, dict) and isinstance(choosing.get("content"), str):
             choosing["content"] = f"{AUTHORING_FAMILY_GUIDANCE}\n\n{choosing['content']}"
+    if not copilot_sees_notes(ctx):
+        sections.pop(NOTES_KNOWLEDGE_TOPIC, None)
+    return result
+
+
+async def _get_org_workflow_post_hook(
+    result: dict[str, Any],
+    raw: dict[str, Any],
+    ctx: AgentContext,
+) -> dict[str, Any]:
+    data = result.get("data")
+    definition = data.get("workflow_definition") if isinstance(data, dict) else None
+    blocks = definition.get("blocks") if isinstance(definition, dict) else None
+    if isinstance(blocks, list) and not copilot_sees_notes(ctx):
+        remove_note_fields(blocks)
     return result
 
 
@@ -2383,17 +2489,32 @@ _EVALUATE_DESCRIPTION = (
     "so a change made through it leaves nothing to author from -- act with the browser action tools and "
     "read with this one."
 )
-_WORKFLOW_KNOWLEDGE_TOPIC_IDS = [
-    *(topic for topic in WORKFLOW_KNOWLEDGE_TOPIC_HEADERS if topic != _TASK_UNAVAILABLE_KNOWLEDGE_TOPIC),
-    CODE_BLOCK_RUNTIME_TOPIC,
-]
-_WORKFLOW_KNOWLEDGE_TOPICS_PATCH: dict[str, Any] = {
-    "anyOf": [
-        {"type": "array", "items": {"type": "string", "enum": _WORKFLOW_KNOWLEDGE_TOPIC_IDS}},
-        {"type": "null"},
-    ],
-    "description": "Knowledge topic IDs to retrieve. Omit to list every topic.",
-}
+
+
+def _workflow_knowledge_topics_patch(notes_visible: bool) -> dict[str, Any]:
+    hidden = (
+        {_TASK_UNAVAILABLE_KNOWLEDGE_TOPIC}
+        if notes_visible
+        else {_TASK_UNAVAILABLE_KNOWLEDGE_TOPIC, NOTES_KNOWLEDGE_TOPIC}
+    )
+    topic_ids = [
+        *(
+            topic
+            for topic in WORKFLOW_KNOWLEDGE_TOPIC_HEADERS
+            if topic not in hidden and topic != NOTES_KNOWLEDGE_TOPIC
+        ),
+        CODE_BLOCK_RUNTIME_TOPIC,
+        *([NOTES_KNOWLEDGE_TOPIC] if notes_visible else []),
+    ]
+    return {
+        "anyOf": [
+            {"type": "array", "items": {"type": "string", "enum": topic_ids}},
+            {"type": "null"},
+        ],
+        "description": "Knowledge topic IDs to retrieve. Omit to list every topic.",
+    }
+
+
 _ACTION_TIMEOUT_PATCH: dict[str, Any] = {
     "description": (
         "Max time to wait for the element in ms. "
@@ -2443,12 +2564,14 @@ def _block_schema_availability_note(
 
 def _build_skyvern_mcp_overlays(
     capability: AuthoringCapability | BlockAuthoringPolicy | str | None = None,
+    *,
+    notes_visible: bool = False,
 ) -> dict[str, SchemaOverlay]:
     overlays = {
         "get_workflow_knowledge": SchemaOverlay(
             description=_workflow_knowledge_description(_normalized_authoring_capability(capability)),
             description_suffix=_block_schema_availability_note(capability),
-            param_patches={"topics": _WORKFLOW_KNOWLEDGE_TOPICS_PATCH},
+            param_patches={"topics": _workflow_knowledge_topics_patch(notes_visible)},
             pre_hook=_get_workflow_knowledge_pre_hook,
             post_hook=_get_workflow_knowledge_post_hook,
         ),
@@ -2485,6 +2608,7 @@ def _build_skyvern_mcp_overlays(
                 "version. Use it to copy an existing workflow's structure into a new build. "
                 "Read-only; it does not change the current draft."
             ),
+            post_hook=_get_org_workflow_post_hook,
         ),
         "navigate_browser": SchemaOverlay(
             description=(

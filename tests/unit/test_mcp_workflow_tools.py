@@ -4903,3 +4903,13 @@ async def test_workflow_run_sends_max_steps_override_and_ai_fallback_to_the_api(
     assert json.loads(requests[0].content)["ai_fallback"] is False
     assert "max_steps_override=7" in result["data"]["sdk_equivalent"]
     assert "ai_fallback=False" in result["data"]["sdk_equivalent"]
+
+
+def test_notes_kept_by_server_names_blocks_whose_saved_note_the_submission_omitted() -> None:
+    def definition(*blocks: dict[str, object]) -> dict[str, object]:
+        return {"workflow_definition": {"blocks": list(blocks)}}
+
+    kept = definition({"block_type": "navigation", "label": "open", "notes": "Never click Delete."})
+    submitted = definition({"block_type": "navigation", "label": "open"})
+
+    assert workflow_tools._notes_kept_by_server(submitted, None, kept) == ["open"]

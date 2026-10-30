@@ -741,6 +741,46 @@ describe("ReviewGateCard — recorded review projection", () => {
     ).toBe(false);
   });
 
+  it.each([true, false])(
+    "lists the blocks whose saved notes and descriptions were kept only with the Doc view on (%s)",
+    (docEditorEnabled) => {
+      render(
+        <ReviewGateCard
+          turn={turn({
+            blocks: [completedBlock],
+            review: {
+              blocks: [
+                { label: "open_page", blockType: "task", change: "changed" },
+                { label: "read_total", blockType: "task", change: "unchanged" },
+              ],
+              duplicateWrites: [],
+              keptNotes: ["open_page", "read_total"],
+              keptDescriptions: ["read_total"],
+            },
+          })}
+          pending
+          verdict="untested"
+          actionsEnabled
+          hasProposal
+          onAccept={noop}
+          onAlwaysAccept={noop}
+          onReject={noop}
+          onReview={noop}
+          docEditorEnabled={docEditorEnabled}
+          latestTurnCause={null}
+        />,
+      );
+
+      expect(
+        screen.queryByText("Kept your notes on Open Page and Read Total.") !==
+          null,
+      ).toBe(docEditorEnabled);
+      expect(
+        screen.queryByText("Kept your descriptions on Read Total.") !== null,
+      ).toBe(docEditorEnabled);
+    },
+  );
+
   it("never folds a removed block behind Show more, so a deletion is not accepted unseen", () => {
     render(
       <ReviewGateCard

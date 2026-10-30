@@ -749,6 +749,7 @@ class TestPromptCriteriaEvaluation:
         )
         mock_context = MagicMock()
         mock_context.cancel_failure_evidence_capture = AsyncMock()
+        mock_context.resolve_block_notes_section.return_value = "Notes for this step:\nCheck recent dates."
 
         with patch(
             "skyvern.forge.sdk.workflow.models.block._evaluate_prompt_branch_conditions_batch",
@@ -765,6 +766,7 @@ class TestPromptCriteriaEvaluation:
 
             assert result is True
             mock_batch.assert_called_once()
+            assert mock_batch.await_args.kwargs["notes_section"] == ("Notes for this step:\nCheck recent dates.")
 
 
 # ---------------------------------------------------------------------------

@@ -186,6 +186,8 @@ interface ReviewGateCardProps {
   gateId?: string;
   // Transient highlight when the pending-proposal chip scrolls to this gate.
   flash?: boolean;
+  // Notes and descriptions exist only in the Doc view; off, the card matches a workflow without them.
+  docEditorEnabled?: boolean;
   // The newest turn's terminal cause, null when that turn recorded none. A Test turn keeps the
   // proposal's owner, so a start it refused is recorded on a later turn than `turn`.
   latestTurnCause: string | null;
@@ -297,11 +299,13 @@ function ChangeList({
   rows,
   limit,
   discarded,
+  docEditorEnabled,
 }: {
   turn: TurnNarrativeState | undefined;
   rows: ChangeRow[];
   limit?: number;
   discarded: boolean;
+  docEditorEnabled: boolean;
 }) {
   const [showAll, setShowAll] = useState(false);
   // A removal is never folded away, so a deletion cannot be accepted unseen.
@@ -319,7 +323,14 @@ function ChangeList({
   }
   const hiddenNeverTested = hidden.filter((row) => row.neverTested).length;
   const duplicateWrites = turn?.review?.duplicateWrites ?? [];
-  if (rows.length === 0 && duplicateWrites.length === 0) return null;
+  const kept = docEditorEnabled
+    ? [
+        { kind: "notes", labels: turn?.review?.keptNotes ?? [] },
+        { kind: "descriptions", labels: turn?.review?.keptDescriptions ?? [] },
+      ].filter((group) => group.labels.length > 0)
+    : [];
+  if (rows.length === 0 && duplicateWrites.length === 0 && kept.length === 0)
+    return null;
   return (
     <div>
       {visible.map((row) => (
@@ -374,6 +385,23 @@ function ChangeList({
           </span>
         </GutterRow>
       ))}
+      {kept.map((group) => (
+        <GutterRow
+          key={group.kind}
+          marker=""
+          markerClass="text-muted-foreground"
+        >
+          <span
+            className={
+              discarded
+                ? "text-muted-foreground line-through"
+                : "text-muted-foreground"
+            }
+          >
+            Kept your {group.kind} on {humanizedList(group.labels)}.
+          </span>
+        </GutterRow>
+      ))}
     </div>
   );
 }
@@ -424,6 +452,7 @@ function ResolvedReviewCard({
   title,
   gateId,
   flash,
+  docEditorEnabled,
 }: {
   turn: TurnNarrativeState | undefined;
   rows: ChangeRow[];
@@ -432,6 +461,7 @@ function ResolvedReviewCard({
   title: string;
   gateId?: string;
   flash: boolean;
+  docEditorEnabled: boolean;
 }) {
   const [expanded, setExpanded] = useState(false);
   const applied =
@@ -500,7 +530,12 @@ function ResolvedReviewCard({
       />
       {expanded ? (
         <CardBody>
-          <ChangeList turn={turn} rows={rows} discarded={rejected} />
+          <ChangeList
+            turn={turn}
+            rows={rows}
+            discarded={rejected}
+            docEditorEnabled={docEditorEnabled}
+          />
         </CardBody>
       ) : null}
     </CopilotCard>
@@ -526,6 +561,7 @@ export function ReviewGateCard({
   onRetry,
   gateId,
   flash = false,
+  docEditorEnabled = false,
   latestTurnCause,
 }: ReviewGateCardProps) {
   const [confirmingTest, setConfirmingTest] = useState(false);
@@ -592,6 +628,7 @@ export function ReviewGateCard({
         title={title}
         gateId={gateId}
         flash={flash}
+        docEditorEnabled={docEditorEnabled}
       />
     );
   }
@@ -757,6 +794,7 @@ export function ReviewGateCard({
             rows={rows}
             limit={PENDING_CHANGE_LIMIT}
             discarded={false}
+            docEditorEnabled={docEditorEnabled}
           />
           {showTestInBody ? (
             <GutterRow marker="▷" markerClass="text-sky-600 dark:text-sky-400">

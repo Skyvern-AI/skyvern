@@ -61,6 +61,7 @@ def test_file_upload_block_applies_workflow_system_prompt() -> None:
     block = _file_upload_block("Upload invoices.")
     workflow_run_context = MagicMock()
     workflow_run_context.resolve_effective_workflow_system_prompt.return_value = "Follow accounting policy."
+    workflow_run_context.resolve_block_notes_section.return_value = None
 
     with patch.object(
         FileUploadBlock,

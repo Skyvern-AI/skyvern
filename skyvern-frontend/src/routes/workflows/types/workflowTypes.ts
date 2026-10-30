@@ -314,7 +314,15 @@ export const WorkflowEditorParameterTypes = {
 export type WorkflowEditorParameterType =
   (typeof WorkflowEditorParameterTypes)[keyof typeof WorkflowEditorParameterTypes];
 
-export type WorkflowBlockBase = {
+// Text shown in the Doc view. `notes` sits above a block and `trailing_notes` after the last block of a sequence;
+// both are read by the agent at run time. `description` is for people only.
+export type WorkflowBlockDocFields = {
+  notes?: string | null;
+  trailing_notes?: string | null;
+  description?: string | null;
+};
+
+export type WorkflowBlockBase = WorkflowBlockDocFields & {
   label: string;
   block_type: WorkflowBlockType;
   output_parameter: OutputParameter;
@@ -323,6 +331,9 @@ export type WorkflowBlockBase = {
   model: WorkflowModel | null;
   next_block_label?: string | null;
   ignore_workflow_system_prompt?: boolean;
+  notes?: string | null;
+  trailing_notes?: string | null;
+  description?: string | null;
 };
 
 export const BranchCriteriaTypes = {

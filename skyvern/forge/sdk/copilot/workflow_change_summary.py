@@ -82,6 +82,9 @@ def summarize_user_workflow_change(
             structural_diff_unavailable=True,
         )
 
+    if prior == current:
+        return WorkflowChangeSummary(kind=WorkflowChangeKind.UNCHANGED_SINCE_LAST_TURN)
+
     prior_blocks, prior_duplicates = _index_blocks(prior)
     current_blocks, current_duplicates = _index_blocks(current)
     if prior_duplicates or current_duplicates:

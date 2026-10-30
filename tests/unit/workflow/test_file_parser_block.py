@@ -92,6 +92,7 @@ def _make_pdf_parser_block(file_url: str) -> PDFParserBlock:
 
 def _mock_workflow_run_context() -> MagicMock:
     ctx = MagicMock()
+    ctx.resolve_block_notes_section.return_value = None
     ctx.has_parameter.return_value = False
     ctx.has_value.return_value = False
     ctx.register_output_parameter_value_post_execution = AsyncMock()
@@ -744,6 +745,7 @@ class TestPDFParserSchemaValidation:
     @staticmethod
     def _patch_execute_dependencies(mp: pytest.MonkeyPatch, block: PDFParserBlock, handler: AsyncMock) -> AsyncMock:
         workflow_run_context = MagicMock()
+        workflow_run_context.resolve_block_notes_section.return_value = None
         workflow_run_context.has_parameter.return_value = False
         record_output_parameter_value = AsyncMock()
 

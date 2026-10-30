@@ -196,6 +196,153 @@ describe("apiWorkflowToSettings", () => {
 });
 
 describe("buildWorkflowYamlDocument", () => {
+  test("the save sends null only for annotations cleared from the loaded version", () => {
+    const draft = input();
+    draft.blocks = [
+      {
+        block_type: "code",
+        label: "kept",
+        code: "result = 1",
+        error_code_mapping: null,
+        parameter_keys: [],
+        notes: "Pick the cheapest option",
+      },
+      {
+        block_type: "for_loop",
+        label: "Loop",
+        loop_over_parameter_key: "items",
+        loop_variable_reference: "items",
+        complete_if_empty: false,
+        data_schema: null,
+        loop_blocks: [
+          {
+            block_type: "code",
+            label: "inner",
+            code: "result = 2",
+            error_code_mapping: null,
+            parameter_keys: [],
+          },
+        ],
+      },
+    ];
+    draft.workflow = {
+      ...workflow,
+      workflow_definition: {
+        parameters: [],
+        blocks: [
+          {
+            block_type: "code",
+            label: "kept",
+            code: "result = 1",
+            error_code_mapping: null,
+            parameters: [],
+            output_parameter: {
+              parameter_type: "output",
+              key: "kept_output",
+              description: null,
+              output_parameter_id: "output-kept",
+              workflow_id: "w_fixture",
+              created_at: "2026-01-01T00:00:00Z",
+              modified_at: "2026-01-01T00:00:00Z",
+              deleted_at: null,
+            },
+            continue_on_failure: false,
+            model: null,
+            notes: "Old note",
+            trailing_notes: "Old trailing note",
+            description: "Old description",
+          },
+          {
+            block_type: "for_loop",
+            label: "Loop",
+            loop_over: {
+              parameter_type: "workflow",
+              key: "items",
+              description: null,
+              workflow_id: "w_fixture",
+              workflow_parameter_id: "parameter-items",
+              workflow_parameter_type: "json",
+              default_value: [],
+              created_at: "2026-01-01T00:00:00Z",
+              modified_at: "2026-01-01T00:00:00Z",
+              deleted_at: null,
+            },
+            loop_variable_reference: "items",
+            complete_if_empty: false,
+            data_schema: null,
+            output_parameter: {
+              parameter_type: "output",
+              key: "Loop_output",
+              description: null,
+              output_parameter_id: "output-loop",
+              workflow_id: "w_fixture",
+              created_at: "2026-01-01T00:00:00Z",
+              modified_at: "2026-01-01T00:00:00Z",
+              deleted_at: null,
+            },
+            continue_on_failure: false,
+            model: null,
+            notes: "Old loop note",
+            loop_blocks: [
+              {
+                block_type: "code",
+                label: "inner",
+                code: "result = 2",
+                error_code_mapping: null,
+                parameters: [],
+                output_parameter: {
+                  parameter_type: "output",
+                  key: "inner_output",
+                  description: null,
+                  output_parameter_id: "output-inner",
+                  workflow_id: "w_fixture",
+                  created_at: "2026-01-01T00:00:00Z",
+                  modified_at: "2026-01-01T00:00:00Z",
+                  deleted_at: null,
+                },
+                continue_on_failure: false,
+                model: null,
+              },
+            ],
+          },
+        ],
+      },
+    };
+
+    const saved = buildWorkflowSaveRequest(
+      { ...draft, workflowDefinitionVersion: 2 },
+      { explicitDocFields: true },
+    ).workflow_definition.blocks;
+    const [kept, loop] = saved;
+    expect(kept).toMatchObject({
+      notes: "Pick the cheapest option",
+      trailing_notes: null,
+      description: null,
+    });
+    expect(loop).toHaveProperty("notes", null);
+    for (const key of ["trailing_notes", "description"] as const) {
+      expect(loop).not.toHaveProperty(key);
+    }
+    const inner =
+      loop && "loop_blocks" in loop ? loop.loop_blocks[0] : undefined;
+    expect(inner).toBeDefined();
+    for (const key of ["notes", "trailing_notes", "description"] as const) {
+      expect(inner).not.toHaveProperty(key);
+    }
+
+    const yamlBlocks = parse(stringify(buildWorkflowYamlDocument(draft)))
+      .workflow_definition.blocks;
+    expect(yamlBlocks[0]).toHaveProperty("notes", "Pick the cheapest option");
+    for (const key of ["trailing_notes", "description"]) {
+      expect(yamlBlocks[0]).not.toHaveProperty(key);
+      expect(yamlBlocks[1]).not.toHaveProperty(key);
+      expect(yamlBlocks[1].loop_blocks[0]).not.toHaveProperty(key);
+    }
+    expect(yamlBlocks[1]).not.toHaveProperty("notes");
+  });
+});
+
+describe("settings patch validation and merge", () => {
   test("round-trips a null proxy through YAML, canvas, save, and Copilot context", () => {
     const data = input();
     data.settings.proxyLocation = null;

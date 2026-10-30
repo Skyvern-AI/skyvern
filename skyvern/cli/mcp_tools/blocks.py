@@ -393,6 +393,7 @@ WORKFLOW_KNOWLEDGE_TOPIC_HEADERS: dict[str, str] = {
     "parameter_templating": "** PARAMETER TEMPLATING **",
     "error_handling_and_retries": "** ERROR HANDLING AND RETRIES **",
     "workflow_execution_flow": "** WORKFLOW EXECUTION FLOW **",
+    "notes_between_blocks": "** NOTES BETWEEN BLOCKS **",
     "best_practices": "** BEST PRACTICES **",
     "common_patterns": "** COMMON PATTERNS **",
     "validation_rules": "** VALIDATION RULES **",
@@ -403,6 +404,7 @@ _kb_cache: dict[str, dict[str, Any]] | None = None
 _knowledge_topic_cache: dict[str, dict[str, str]] | None = None
 
 CODE_BLOCK_RUNTIME_TOPIC = "code_block_runtime"
+NOTES_KNOWLEDGE_TOPIC = "notes_between_blocks"
 
 
 def _code_block_runtime_topic() -> dict[str, str]:
@@ -583,7 +585,9 @@ async def skyvern_workflow_knowledge(
     """
 
     action = "skyvern_workflow_knowledge"
-    knowledge = _parse_knowledge_topics()
+    knowledge = {
+        topic: section for topic, section in _parse_knowledge_topics().items() if topic != NOTES_KNOWLEDGE_TOPIC
+    }
     if not knowledge:
         return make_result(
             action,
@@ -692,11 +696,33 @@ async def skyvern_block_schema(
             "summary": BLOCK_SUMMARIES.get(normalized, ""),
             "description": kb_entry.get("description"),
             "use_cases": kb_entry.get("use_cases"),
-            "schema": cls.model_json_schema(),
+            "schema": _without_internal_properties(cls.model_json_schema()),
             "example": BLOCK_EXAMPLES.get(normalized),
         },
         warnings=warnings,
     )
+
+
+def _without_internal_properties(value: Any) -> Any:
+    """Drop ``x-internal`` properties anywhere in a JSON schema, as the public OpenAPI doc does."""
+    if isinstance(value, dict):
+        properties = value.get("properties")
+        internal = (
+            {name for name, prop in properties.items() if isinstance(prop, dict) and prop.get("x-internal")}
+            if isinstance(properties, dict)
+            else set()
+        )
+        cleaned = {key: _without_internal_properties(child) for key, child in value.items() if key != "properties"}
+        if isinstance(properties, dict):
+            cleaned["properties"] = {
+                name: _without_internal_properties(prop) for name, prop in properties.items() if name not in internal
+            }
+        if internal and isinstance(cleaned.get("required"), list):
+            cleaned["required"] = [name for name in cleaned["required"] if name not in internal]
+        return cleaned
+    if isinstance(value, list):
+        return [_without_internal_properties(child) for child in value]
+    return value
 
 
 # ---------------------------------------------------------------------------

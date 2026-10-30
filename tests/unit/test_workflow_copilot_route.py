@@ -274,6 +274,27 @@ async def test_demonstration_control_checks_the_demonstrations_workflow_before_a
     append.assert_not_awaited()
 
 
+@pytest.mark.parametrize("server_flag", [False, True])
+@pytest.mark.asyncio
+async def test_the_server_flag_decides_doc_editor_notes_not_the_client(
+    monkeypatch: pytest.MonkeyPatch,
+    api_key_request: MagicMock,
+    organization: SimpleNamespace,
+    server_flag: bool,
+) -> None:
+    flag = AsyncMock(return_value=server_flag)
+    monkeypatch.setattr(app.AGENT_FUNCTION, "workflow_doc_editor_enabled", flag)
+    turn = AsyncMock(return_value="sentinel")
+    monkeypatch.setattr(workflow_copilot_route, "_new_copilot_chat_post", turn)
+    chat_request = _make_chat_request()
+    chat_request.doc_editor_enabled = True
+
+    await workflow_copilot_chat_post(api_key_request, chat_request, organization, current_user_id="user-1")
+
+    flag.assert_awaited_once_with("org-1", "user-1")
+    assert turn.await_args.args[1].doc_editor_enabled is server_flag
+
+
 @pytest.mark.asyncio
 async def test_demonstration_done_requires_demonstration_id(
     monkeypatch: pytest.MonkeyPatch,

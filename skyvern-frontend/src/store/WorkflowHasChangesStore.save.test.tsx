@@ -2057,3 +2057,118 @@ describe("YAML draft dirtiness", () => {
     expect(useWorkflowYamlEditorStore.getState().revision).toBe(revision + 1);
   });
 });
+
+describe("Doc fields on save", () => {
+  const blockWithoutNotes = {
+    block_type: "code",
+    label: "read_total",
+    code: "result = 1",
+    parameter_keys: [],
+  };
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+    mocks.workflowId = "wpid-1";
+    useWorkflowHasChangesStore.setState(
+      useWorkflowHasChangesStore.getInitialState(),
+    );
+    useWorkflowYamlEditorStore.setState(
+      useWorkflowYamlEditorStore.getInitialState(),
+    );
+    registerEditorOwner(createYamlCommitOwner("wpid-1"));
+    mocks.getClient.mockResolvedValue({ put: mocks.put });
+    mocks.put.mockResolvedValue({
+      data: {
+        ...saveData.workflow,
+        title: saveData.title,
+        description: saveData.description,
+      },
+    });
+    useWorkflowHasChangesStore.setState({
+      getSaveData: () =>
+        ({ ...saveData, blocks: [blockWithoutNotes] }) as WorkflowSaveData,
+    });
+  });
+  it("a block without annotations omits unset fields from an actual Visual save", async () => {
+    const { result } = renderHook(() => useWorkflowSave(), { wrapper });
+
+    await act(() => result.current.mutateAsync(undefined));
+
+    const [block] = parseYaml(mocks.put.mock.calls[0]![1]).workflow_definition
+      .blocks;
+    for (const key of ["notes", "trailing_notes", "description"] as const) {
+      expect(block).not.toHaveProperty(key);
+    }
+  });
+
+  it("clears a just-saved note before the detail refetch arrives", async () => {
+    const queryClient = new QueryClient();
+    const queryKey = ["workflow", "wpid-1"];
+    const refetch = vi.fn(async () => saveData.workflow);
+    queryClient.setQueryData(queryKey, {
+      ...saveData.workflow,
+      effective_default_engine: "skyvern-3.0",
+      workflow_definition: {
+        ...saveData.workflow.workflow_definition,
+        blocks: [blockWithoutNotes],
+      },
+    });
+    function cacheWrapper({ children }: { children: ReactNode }) {
+      return (
+        <QueryClientProvider client={queryClient}>
+          {children}
+        </QueryClientProvider>
+      );
+    }
+    let notes: string | undefined = "Check the total";
+    mocks.put.mockImplementation(async (_url, yaml) => ({
+      data: {
+        ...saveData.workflow,
+        title: saveData.title,
+        description: saveData.description,
+        version: mocks.put.mock.calls.length + 1,
+        workflow_definition: parseYaml(yaml).workflow_definition,
+      },
+    }));
+    const { result } = renderHook(
+      () => {
+        const { data: workflow } = useQuery<WorkflowSaveData["workflow"]>({
+          queryKey,
+          queryFn: refetch,
+          enabled: false,
+        });
+        useEffect(() => {
+          useWorkflowHasChangesStore.setState({
+            getSaveData: () =>
+              ({
+                ...saveData,
+                workflow,
+                blocks: [{ ...blockWithoutNotes, notes }],
+              }) as WorkflowSaveData,
+          });
+        }, [workflow]);
+        return useWorkflowSave();
+      },
+      { wrapper: cacheWrapper },
+    );
+
+    await act(() => result.current.mutateAsync(undefined));
+    await waitFor(() =>
+      expect(
+        useWorkflowHasChangesStore.getState().getSaveData()?.workflow
+          .workflow_definition.blocks[0]?.notes,
+      ).toBe("Check the total"),
+    );
+    expect(queryClient.getQueryData(queryKey)).toMatchObject({
+      effective_default_engine: "skyvern-3.0",
+    });
+
+    notes = undefined;
+    await act(() => result.current.mutateAsync(undefined));
+
+    expect(refetch).not.toHaveBeenCalled();
+    expect(
+      parseYaml(mocks.put.mock.calls[1]![1]).workflow_definition.blocks[0],
+    ).toHaveProperty("notes", null);
+  });
+});

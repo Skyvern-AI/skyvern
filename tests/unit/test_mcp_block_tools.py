@@ -13,6 +13,7 @@ import pytest
 
 from skyvern.cli.mcp_tools.blocks import (
     CODE_BLOCK_RUNTIME_TOPIC,
+    NOTES_KNOWLEDGE_TOPIC,
     WORKFLOW_KNOWLEDGE_TOPIC_HEADERS,
     _parse_knowledge_topics,
     skyvern_block_schema,
@@ -28,11 +29,20 @@ from skyvern.forge.sdk.workflow.models.parameter import OutputParameter, Paramet
 @pytest.mark.asyncio
 async def test_workflow_knowledge_lists_available_topics_without_returning_the_document() -> None:
     result = await skyvern_workflow_knowledge()
+    public_topics = [topic for topic in WORKFLOW_KNOWLEDGE_TOPIC_HEADERS if topic != NOTES_KNOWLEDGE_TOPIC]
 
     assert result["ok"] is True
-    assert result["data"]["topics"] == [*WORKFLOW_KNOWLEDGE_TOPIC_HEADERS, CODE_BLOCK_RUNTIME_TOPIC]
-    assert result["data"]["count"] == len(WORKFLOW_KNOWLEDGE_TOPIC_HEADERS) + 1
+    assert result["data"]["topics"] == [*public_topics, CODE_BLOCK_RUNTIME_TOPIC]
+    assert result["data"]["count"] == len(public_topics) + 1
     assert "A Skyvern workflow is defined" not in json.dumps(result)
+
+
+@pytest.mark.asyncio
+async def test_workflow_knowledge_hides_doc_editor_topic_from_public_mcp() -> None:
+    result = await skyvern_workflow_knowledge(topics=[NOTES_KNOWLEDGE_TOPIC])
+
+    assert result["ok"] is False
+    assert NOTES_KNOWLEDGE_TOPIC not in result["error"]["hint"]
 
 
 @pytest.mark.asyncio
@@ -123,6 +133,15 @@ async def test_workflow_knowledge_rejects_an_incomplete_topic_source(
 
     assert result["ok"] is False
     assert result["error"]["code"] == "SDK_ERROR"
+
+
+@pytest.mark.asyncio
+async def test_block_schema_hides_internal_note_fields() -> None:
+    result = await skyvern_block_schema(block_type="navigation")
+
+    properties = result["data"]["schema"]["properties"]
+    assert "navigation_goal" in properties
+    assert not {"notes", "trailing_notes", "description"} & properties.keys()
 
 
 @pytest.mark.asyncio

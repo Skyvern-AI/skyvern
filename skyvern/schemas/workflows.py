@@ -14,12 +14,14 @@ from jsonschema.exceptions import SchemaError
 from pydantic import (
     BaseModel,
     Field,
+    SerializerFunctionWrapHandler,
     StrictInt,
     StringConstraints,
     TypeAdapter,
     ValidationError,
     field_serializer,
     field_validator,
+    model_serializer,
     model_validator,
 )
 
@@ -821,9 +823,40 @@ class OutputParameterYAML(ParameterYAML):
     parameter_type: Literal[ParameterType.OUTPUT] = ParameterType.OUTPUT  # type: ignore
 
 
+BLOCK_NOTE_MAX_LENGTH = 2000
+
+
 class BlockYAML(BaseModel, abc.ABC):
     block_type: BlockType
     label: str = Field(description="Author-facing identifier; must be unique per workflow.")
+    notes: str | None = Field(
+        default=None,
+        max_length=BLOCK_NOTE_MAX_LENGTH,
+        exclude_if=lambda value: value is None,
+        json_schema_extra={"x-internal": True},
+        description="Plain-text instructions written directly above this block. At run time the agent reads them "
+        "on this block and on the block before it in the same sequence. {{ }} references to parameters and loop values "
+        "render; references to page data, block outputs, values not yet available, and credentials are sent as "
+        "written. Omit to keep the saved notes; send null or an empty "
+        "string to delete them.",
+    )
+    trailing_notes: str | None = Field(
+        default=None,
+        max_length=BLOCK_NOTE_MAX_LENGTH,
+        exclude_if=lambda value: value is None,
+        json_schema_extra={"x-internal": True},
+        description="Plain-text instructions written after the last block of a sequence (the workflow, a loop body "
+        "or a branch). Only this block reads them at run time. Omit to keep the saved text; send null or an empty "
+        "string to delete it.",
+    )
+    description: str | None = Field(
+        default=None,
+        exclude_if=lambda value: value is None,
+        json_schema_extra={"x-internal": True},
+        description="What this block does, for people reading the workflow. The agent never reads it, and "
+        "changing it never clears cached scripts. Omitting it on an update keeps the saved description; send null "
+        "or an empty string to delete it.",
+    )
     next_block_label: str | None = Field(
         default=None,
         description="Optional pointer to the label of the next block. "
@@ -838,6 +871,15 @@ class BlockYAML(BaseModel, abc.ABC):
     # Only valid for blocks inside a for loop block
     # Whether to continue to the next iteration when the block fails
     next_loop_on_failure: bool = False
+
+    @model_serializer(mode="wrap")
+    def _preserve_explicit_note_clears(self, handler: SerializerFunctionWrapHandler):  # type: ignore[no-untyped-def]
+        data = handler(self)
+        if isinstance(data, dict):
+            for field in ("notes", "trailing_notes", "description"):
+                if field in self.model_fields_set and getattr(self, field) is None:
+                    data[field] = None
+        return data
 
     @field_validator("label")
     @classmethod
@@ -1092,9 +1134,13 @@ def _direct_code_block_error_code_raises(code: str) -> set[tuple[int, str]]:
             direct.add((node.lineno, code_node.value))
             accepted.add(id(call))
     for node in ast.walk(tree):
-        if isinstance(node, ast.Call) and isinstance(node.func, ast.Name) and node.func.id == "ErrorCode":
-            if id(node) not in accepted:
-                raise ValueError("ErrorCode must be constructed directly in a raise statement")
+        if (
+            isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Name)
+            and node.func.id == "ErrorCode"
+            and id(node) not in accepted
+        ):
+            raise ValueError("ErrorCode must be constructed directly in a raise statement")
         if isinstance(node, ast.Assign) and isinstance(node.value, ast.Name) and node.value.id == "ErrorCode":
             raise ValueError("ErrorCode aliases are not allowed")
     return direct

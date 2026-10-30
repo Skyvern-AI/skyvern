@@ -31,6 +31,7 @@ from skyvern.forge.sdk.copilot.context import CopilotContext
 from skyvern.forge.sdk.copilot.failure_tracking import (
     _blocks_by_label,
     _canonical_block_config,
+    _execution_block_config,
     block_shape_hashes_by_label,
 )
 from skyvern.forge.sdk.copilot.frontier_provenance_dump import (
@@ -62,6 +63,7 @@ from skyvern.forge.sdk.copilot.runtime import (
 )
 from skyvern.forge.sdk.copilot.turn_origin import TurnOrigin
 from skyvern.forge.sdk.copilot.workflow_yaml import _process_workflow_yaml, copilot_round_trip_definition
+from skyvern.forge.sdk.workflow.block_notes import definition_step_notes
 from skyvern.forge.sdk.workflow.models.block import BlockTypeVar, ForLoopBlock, get_all_blocks
 from skyvern.forge.sdk.workflow.models.parameter import (
     RESERVED_PARAMETER_KEYS,
@@ -330,6 +332,8 @@ def _find_invalidated_labels(
     """
     old_by_label = _blocks_by_label(old_definition)
     new_by_label = _blocks_by_label(new_definition)
+    old_notes = definition_step_notes(old_definition) if old_definition else {}
+    new_notes = definition_step_notes(new_definition) if new_definition else {}
     invalidated: set[str] = set()
     upstream_invalidated = False
     for label in requested_labels:
@@ -342,7 +346,7 @@ def _find_invalidated_labels(
             invalidated.add(label)
             upstream_invalidated = True
             continue
-        if _canonical_block_config(old_block) != _canonical_block_config(new_block):
+        if _execution_block_config(old_block, old_notes) != _execution_block_config(new_block, new_notes):
             invalidated.add(label)
             upstream_invalidated = True
     return invalidated

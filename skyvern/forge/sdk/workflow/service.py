@@ -198,6 +198,12 @@ from skyvern.forge.sdk.streaming.registries import (
 )
 from skyvern.forge.sdk.submission import shadow as submission_shadow
 from skyvern.forge.sdk.trace import traced
+from skyvern.forge.sdk.workflow.block_notes import (
+    annotate_notes_read,
+    carry_forward_block_notes,
+    definition_step_notes,
+    strip_inert_block_fields,
+)
 from skyvern.forge.sdk.workflow.browser_action_policy_enrollment import bind_policy_to_context, rejection_reasons
 from skyvern.forge.sdk.workflow.browser_profile_key import (
     build_browser_profile_key_digest,
@@ -254,6 +260,7 @@ from skyvern.forge.sdk.workflow.models.block import (
     pinned_v1_block_count,
     resolve_conditional_merge_edges,
     running_after_browser_loss,
+    strip_finally_block_references,
     takes_default_engine,
     v3_ab_ineligibility_reason,
 )
@@ -1498,8 +1505,9 @@ def _get_workflow_definition_core_data(
     workflow_definition: WorkflowDefinition, *, unset_engine_is_v1: bool = True
 ) -> dict[str, Any]:
     """Return the workflow definition without generated or script-inert fields."""
-    # Convert the workflow definition to a dictionary
-    workflow_dict = workflow_definition.model_dump(mode="json")
+    # Descriptions are for people; a note also changes the block before it, which reads it too.
+    workflow_dict = strip_inert_block_fields(workflow_definition.model_dump(mode="json"))
+    annotate_notes_read(workflow_dict.get("blocks") or [], definition_step_notes(workflow_definition))
     fields_to_remove = list(_WORKFLOW_DEFINITION_METADATA_FIELDS)
     # Graded at finalization, not executed: its presence must not invalidate cached scripts.
     fields_to_remove.extend(("completion_contract", "disable_cache", "next_block_label", "version", "model"))
@@ -11283,28 +11291,7 @@ class WorkflowService:
         blocks: list[BlockTypeVar],
         finally_block_label: str,
     ) -> list[BlockTypeVar]:
-        """Remove the finally block and nullify any edges that point to it.
-
-        This prevents _build_workflow_graph from raising InvalidWorkflowDefinition
-        when a block's next_block_label references the (now-excluded) finally block.
-        """
-        result: list[BlockTypeVar] = []
-        for block in blocks:
-            if block.label == finally_block_label:
-                continue
-            if isinstance(block, ConditionalBlock):
-                patched_branches = [
-                    branch.model_copy(update={"next_block_label": None})
-                    if branch.next_block_label == finally_block_label
-                    else branch
-                    for branch in block.branch_conditions
-                ]
-                if patched_branches != block.branch_conditions:
-                    block = block.model_copy(update={"branch_conditions": patched_branches})
-            if block.next_block_label == finally_block_label:
-                block = block.model_copy(update={"next_block_label": None})
-            result.append(block)
-        return result
+        return strip_finally_block_references(blocks, finally_block_label)
 
     def _build_workflow_graph(
         self,
@@ -18239,6 +18226,22 @@ class WorkflowService:
         preserved_credential_references = await self._preserve_redacted_credential_references(
             request.workflow_definition, existing_latest_workflow
         )
+        if existing_latest_workflow is not None:
+            # A REST update compares its submitted definition with the stored version, so a matching label and
+            # block type identifies an unchanged step for legacy clients that omit inert fields. Explicit null or
+            # "" still wins.
+            kept_note_labels = carry_forward_block_notes(
+                request.workflow_definition.blocks,
+                existing_latest_workflow.workflow_definition.blocks,
+                same_step_labels={block.label for block in get_all_blocks(request.workflow_definition.blocks)},
+            )
+            if kept_note_labels:
+                LOG.info(
+                    "Kept block notes or descriptions omitted from a workflow save",
+                    workflow_permanent_id=workflow_permanent_id,
+                    organization_id=organization_id,
+                    kept_note_labels=list(kept_note_labels),
+                )
         await self._validate_and_normalize_credential_rotation_parameters(
             request.workflow_definition.parameters,
             organization,

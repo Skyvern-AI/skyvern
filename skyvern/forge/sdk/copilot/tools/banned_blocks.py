@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import json
-from collections import Counter
 from collections.abc import Mapping
 from dataclasses import dataclass
 from enum import StrEnum
@@ -739,7 +738,7 @@ def _rewrites_a_banned_block(
 
 def _states_new_content(block: Mapping[str, object], prior_block: Mapping[str, object]) -> bool:
     return any(
-        key not in _RENAME_IGNORED_FIELDS and _stated_value(prior_block.get(key)) != _stated_value(value)
+        key not in _NEW_CONTENT_IGNORED_FIELDS and _stated_value(prior_block.get(key)) != _stated_value(value)
         for key, value in block.items()
     )
 
@@ -747,6 +746,13 @@ def _states_new_content(block: Mapping[str, object], prior_block: Mapping[str, o
 def _stated_value(value: object) -> object:
     # A `|` block scalar ends in a newline that `|-` does not, so trailing whitespace is YAML's, not an edit.
     return value.rstrip() if isinstance(value, str) else value
+
+
+def _rename_changes_notes(block: Mapping[str, object], prior_block: Mapping[str, object]) -> bool:
+    return any(
+        field in block and _stated_value(block[field]) != _stated_value(prior_block.get(field))
+        for field in ("notes", "trailing_notes")
+    )
 
 
 def _changed_blocks(
@@ -781,9 +787,10 @@ def _changed_blocks_in(
     surviving_labels = {label for label, _ in submitted_walk if label is not None}
     # A rename is matched on the whole block, not the validator's fingerprint: type and engine alone
     # would let a rewrite drop legacy block A and add an unrelated B of the same type past the pin.
-    vanished = Counter(
-        _rename_identity(block) for label, block in prior_blocks if label is not None and label not in surviving_labels
-    )
+    vanished: dict[str, list[Mapping[str, object]]] = {}
+    for label, block in prior_blocks:
+        if label is not None and label not in surviving_labels:
+            vanished.setdefault(_rename_identity(block), []).append(block)
     changed: list[tuple[str, Mapping[str, object]]] = []
     for label, block in submitted_walk:
         if label is None:
@@ -797,14 +804,23 @@ def _changed_blocks_in(
                 changed.append((label, block))
             continue
         identity = _rename_identity(block)
-        if vanished[identity]:
-            vanished[identity] -= 1
+        candidates = vanished.get(identity)
+        if candidates:
+            match_index = next(
+                (i for i, candidate in enumerate(candidates) if not _rename_changes_notes(block, candidate)), 0
+            )
+            prior_renamed_block = candidates.pop(match_index)
+            if _rename_changes_notes(block, prior_renamed_block):
+                changed.append((label, block))
             continue
         changed.append((label, block))
     return changed
 
 
-_RENAME_IGNORED_FIELDS = frozenset({"label", "next_block_label", "loop_blocks"})
+_RENAME_IGNORED_FIELDS = frozenset(
+    {"label", "next_block_label", "loop_blocks", "description", "notes", "trailing_notes"}
+)
+_NEW_CONTENT_IGNORED_FIELDS = frozenset({"label", "next_block_label", "loop_blocks", "description"})
 
 
 def _rename_identity(block: Mapping[str, object]) -> str:

@@ -39,6 +39,7 @@ from skyvern.forge.sdk.copilot.run_outcome import RunOutcomeRole
 from skyvern.forge.sdk.copilot.runtime import AgentContext
 from skyvern.forge.sdk.copilot.secret_redaction import redact_raw_secrets_for_structured_prompt
 from skyvern.forge.sdk.copilot.verification_evidence import WorkflowVerificationEvidence
+from skyvern.forge.sdk.workflow.block_notes import block_field_texts
 from skyvern.forge.sdk.workflow.models.workflow import Workflow
 from skyvern.schemas.proxy_location import ProxyLocationInput
 from skyvern.utils.strings import join_phrases
@@ -1309,6 +1310,7 @@ class CopilotContext(AgentContext):
     block_authoring_policy: BlockAuthoringPolicy = BlockAuthoringPolicy.TASK_V3_PURE
     target_block_label: str | None = None
     selected_block_label: str | None = None
+    doc_editor_enabled: bool = False
     turn_context_packet: TurnContextPacket | None = None
     prior_turn_outcome: TurnOutcome | None = None
     # Server-verified display data for recovering from a model-staged Google
@@ -1515,6 +1517,13 @@ class CopilotContext(AgentContext):
     staged_workflow_yaml: str | None = None
     staged_workflow: Workflow | None = None
     has_staged_proposal: bool = False
+    # Fields by label that a write this turn kept from the saved workflow because the submitted YAML omitted them.
+    # Label -> field -> the text Copilot left out and the save kept, from the previous draft or the saved row.
+    kept_note_labels: dict[str, dict[str, str]] = field(default_factory=dict)
+    # The pending proposal when only a canvas edit kept it from being restored this turn.
+    canvas_rejected_proposal_yaml: str | None = None
+    # Blocks whose notes in that proposal differ from the saved notes this turn reads.
+    unrestored_proposal_note_labels: list[str] = field(default_factory=list)
     # A single in-process writer at a time; the row-level CAS below this lock is the
     # cross-process fence. The token is replaced only after a durable publication.
     proposal_mutation_lock: asyncio.Lock = field(default_factory=asyncio.Lock, repr=False)
@@ -1610,3 +1619,16 @@ class CopilotContext(AgentContext):
 def advertises(ctx: CopilotContext | None, tool_name: str) -> bool:
     # A context that never resolved a tool surface advertises nothing.
     return ctx is not None and (tool_name in ctx.eval_native_tool_names or tool_name in ctx.eval_mcp_tool_names)
+
+
+def copilot_sees_notes(ctx: AgentContext | None) -> bool:
+    """Notes and step descriptions reach the Copilot model only with the Doc editor on; they stay saved either way."""
+    return isinstance(ctx, CopilotContext) and ctx.doc_editor_enabled
+
+
+def record_kept_note_texts(ctx: CopilotContext, kept_fields: Mapping[str, Sequence[str]], stored_yaml: str) -> None:
+    texts = block_field_texts(stored_yaml)
+    for label, fields in kept_fields.items():
+        for key in fields:
+            if text := texts.get(label, {}).get(key):
+                ctx.kept_note_labels.setdefault(label, {})[key] = text

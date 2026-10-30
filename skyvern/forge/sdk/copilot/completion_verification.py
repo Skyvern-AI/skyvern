@@ -36,6 +36,7 @@ from skyvern.forge.sdk.copilot.request_policy import (
     is_turn_unsatisfiable_fallback_degraded,
     redact_raw_secrets_for_prompt,
 )
+from skyvern.forge.sdk.workflow.block_notes import strip_inert_block_fields
 from skyvern.utils.strings import escape_code_fences
 
 LOG = structlog.get_logger()
@@ -1108,6 +1109,7 @@ def _workflow_parameter_reference_state(workflow_yaml: str | None) -> tuple[list
     ]
     blocks = definition.get("blocks")
     blocks = blocks if isinstance(blocks, list) else []
+    blocks = strip_inert_block_fields(blocks)
     referenced = [key for key in keys if _value_references_key(blocks, key, _moustache_reference_pattern(key))]
     return keys, referenced
 
