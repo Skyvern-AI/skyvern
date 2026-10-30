@@ -156,19 +156,25 @@ export function buildWorkflowSaveRequest(
   };
 }
 
-export function buildWorkflowYamlDocument(input: {
-  workflow: WorkflowApiResponse;
-  settings: WorkflowSettings;
-  title: string;
-  description: string | null;
-  parameters: ParameterYAML[];
-  blocks: BlockYAML[];
-  definitionVersion: number;
-}): WorkflowCreateYAMLRequest {
-  const document = buildWorkflowSaveRequest({
-    ...input,
-    workflowDefinitionVersion: input.definitionVersion,
-  });
+export function buildWorkflowYamlDocument(
+  input: {
+    workflow: WorkflowApiResponse;
+    settings: WorkflowSettings;
+    title: string;
+    description: string | null;
+    parameters: ParameterYAML[];
+    blocks: BlockYAML[];
+    definitionVersion: number;
+  },
+  opts?: { explicitDocFields?: boolean },
+): WorkflowCreateYAMLRequest {
+  const document = buildWorkflowSaveRequest(
+    {
+      ...input,
+      workflowDefinitionVersion: input.definitionVersion,
+    },
+    { explicitDocFields: opts?.explicitDocFields },
+  );
   delete document.is_saved_task;
   delete document.status;
   return {
@@ -281,14 +287,17 @@ export function buildWorkflowCopilotContext(
       return null;
     }
   };
-  const snapshot = buildWorkflowYamlDocument({
-    ...input,
-    settings: {
-      ...input.settings,
-      extraHttpHeaders: safeHeaders(input.settings.extraHttpHeaders),
-      cdpConnectHeaders: safeHeaders(input.settings.cdpConnectHeaders),
+  const snapshot = buildWorkflowYamlDocument(
+    {
+      ...input,
+      settings: {
+        ...input.settings,
+        extraHttpHeaders: safeHeaders(input.settings.extraHttpHeaders),
+        cdpConnectHeaders: safeHeaders(input.settings.cdpConnectHeaders),
+      },
     },
-  });
+    { explicitDocFields: true },
+  );
   const document = { ...snapshot };
   for (const field of withheldCopilotSettings) delete document[field];
   const proxy = document.proxy_location;

@@ -1,3 +1,6 @@
+import { useWorkflowDocEditorFlag } from "@/hooks/useWorkflowDocEditorFlag";
+import { useWorkflowPresentationStore } from "@/store/WorkflowPresentationStore";
+import { WorkflowDocEditor } from "./doc/WorkflowDocEditor";
 import {
   useWorkflowHasChangesStore,
   useWorkflowSave,
@@ -485,6 +488,31 @@ function FlowRenderer({
   paneLayoutKey,
   paneEntryKey,
 }: Props) {
+  const docEnabled = useWorkflowDocEditorFlag();
+  const presentation = useWorkflowPresentationStore(
+    (state) => state.presentation,
+  );
+  const presentationWorkflowId = useWorkflowPresentationStore(
+    (state) => state.workflowPermanentId,
+  );
+  const yamlActive = useWorkflowYamlEditorStore((state) => state.active);
+  const showDoc =
+    embedded &&
+    !readOnly &&
+    docEnabled &&
+    presentation === "doc" &&
+    presentationWorkflowId === workflow.workflow_permanent_id &&
+    nodes.some(
+      (node) => node.type === "start" && !node.parentId && node.data.editable,
+    ) &&
+    !yamlActive;
+  useEffect(() => {
+    if (embedded && !readOnly) {
+      useWorkflowPresentationStore
+        .getState()
+        .syncScope(workflow.workflow_permanent_id, docEnabled);
+    }
+  }, [embedded, readOnly, workflow.workflow_permanent_id, docEnabled]);
   const { blockLabel: targettedBlockLabel } = useParams();
   const reactFlowInstance = useReactFlow();
   const postHog = usePostHog();
@@ -515,7 +543,7 @@ function FlowRenderer({
   // entirely so an Escape press to dismiss compare/copilot UI cannot
   // mutate the main editor's shared selection store.
   useEffect(() => {
-    if (readOnly) return;
+    if (readOnly || showDoc) return;
     const handleKeyDown = (event: KeyboardEvent) => {
       if (event.key !== "Escape") {
         return;
@@ -526,7 +554,7 @@ function FlowRenderer({
     return () => {
       window.removeEventListener("keydown", handleKeyDown);
     };
-  }, [setSelectedBlockId, readOnly]);
+  }, [setSelectedBlockId, readOnly, showDoc]);
 
   // Programmatic viewport changes (e.g. `fitView`) animate via `setViewport`,
   // which fires `onMove`. Without this gate, `constrainPan` would clamp every
@@ -658,7 +686,7 @@ function FlowRenderer({
   // the user is typing in any text field so Cmd+- in a textarea still
   // moves the caret instead of zooming the canvas.
   useEffect(() => {
-    if (readOnly) return;
+    if (readOnly || showDoc) return;
     const isInsideEditableField = (target: EventTarget | null): boolean => {
       if (!(target instanceof HTMLElement)) return false;
       const tag = target.tagName;
@@ -693,7 +721,7 @@ function FlowRenderer({
     return () => {
       window.removeEventListener("keydown", handleKeyDown);
     };
-  }, [reactFlowInstance, readOnly]);
+  }, [reactFlowInstance, readOnly, showDoc]);
 
   useCanvasSelectionSync(selectedBlockId);
 
@@ -1187,7 +1215,8 @@ function FlowRenderer({
       pointerDownRef.current = false;
       markGesture();
     };
-    const onKeyDown = () => {
+    const onKeyDown = (event: KeyboardEvent) => {
+      if (showDoc && event.key === "Escape") return;
       markGesture();
       captureBaseline();
     };
@@ -1203,7 +1232,7 @@ function FlowRenderer({
       document.removeEventListener("keydown", onKeyDown, true);
       unsubscribeBufferedEdits();
     };
-  }, [embedded, readOnly]);
+  }, [embedded, readOnly, showDoc]);
 
   // Debounced for user edits: constructSaveData changes per-frame during a node
   // drag, and recomputing dirtiness serializes the whole graph — coalesce to
@@ -2172,7 +2201,7 @@ function FlowRenderer({
   const locateMountedRef = useRef(true);
 
   useEffect(() => {
-    if (readOnly || locateRequest === null) {
+    if (readOnly || showDoc || locateRequest === null) {
       return;
     }
     const { nodeId } = locateRequest;
@@ -2204,6 +2233,7 @@ function FlowRenderer({
   }, [
     locateRequest,
     readOnly,
+    showDoc,
     reactFlowInstance,
     focusBlockForSearch,
     clearLocate,
@@ -2678,6 +2708,7 @@ function FlowRenderer({
                 />
               ))}
               <ReactFlow
+                {...(showDoc ? { inert: "" } : {})}
                 ref={editorElementRef}
                 nodes={nodes}
                 edges={edges}
@@ -2862,7 +2893,7 @@ function FlowRenderer({
             entirely in read-only mode so comparison canvases never
             expose the editable block form.
           */}
-            {!readOnly && (
+            {!readOnly && !showDoc && (
               <BlockConfigSidebar onAddNode={onAddNode} embedded={embedded} />
             )}
             {!readOnly && (
@@ -2889,6 +2920,7 @@ function FlowRenderer({
               })()}
             </DragOverlay>
           </DndContext>
+          {showDoc && <WorkflowDocEditor nodes={nodes} edges={edges} />}
         </BlockActionContext.Provider>
       </div>
     </WorkflowScopeContext.Provider>

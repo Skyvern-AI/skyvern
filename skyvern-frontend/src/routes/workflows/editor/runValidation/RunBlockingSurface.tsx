@@ -5,7 +5,7 @@ import {
   DoubleArrowUpIcon,
   LockClosedIcon,
 } from "@radix-ui/react-icons";
-import { Fragment } from "react";
+import { Fragment, useEffect, useRef } from "react";
 
 import { cn } from "@/util/utils";
 
@@ -25,6 +25,7 @@ export const WORKFLOW_EDITOR_HEADER_TOP_VAR = "--workflow-editor-header-top";
 export const WORKFLOW_EDITOR_HEADER_HEIGHT_VAR =
   "--workflow-editor-header-height";
 export const RUN_BLOCKING_SURFACE_TOP_VAR = "--run-blocking-surface-top";
+export const RUN_BLOCKING_SURFACE_BOTTOM_VAR = "--run-blocking-surface-bottom";
 export const WORKFLOW_EDITOR_HEADER_TOP = "2rem";
 export const WORKFLOW_EDITOR_HEADER_HEIGHT = "5rem";
 export const RUN_BLOCKING_SURFACE_TOP = `calc(${[
@@ -35,6 +36,30 @@ export const RUN_BLOCKING_SURFACE_TOP = `calc(${[
 
 const ANCHOR_CLASS =
   "absolute left-6 top-[var(--run-blocking-surface-top,8.75rem)] z-50";
+
+// Publishes where the banner ends on its parent so full-bleed views (the Doc) can start below it.
+function useReportSurfaceBottom<T extends HTMLElement>() {
+  const ref = useRef<T>(null);
+  useEffect(() => {
+    const element = ref.current;
+    const parent = element?.parentElement;
+    if (!element || !parent) return;
+    const report = () =>
+      parent.style.setProperty(
+        RUN_BLOCKING_SURFACE_BOTTOM_VAR,
+        `${element.offsetTop + element.offsetHeight + 12}px`,
+      );
+    report();
+    const observer =
+      typeof ResizeObserver === "undefined" ? null : new ResizeObserver(report);
+    observer?.observe(element);
+    return () => {
+      observer?.disconnect();
+      parent.style.removeProperty(RUN_BLOCKING_SURFACE_BOTTOM_VAR);
+    };
+  }, []);
+  return ref;
+}
 
 function blockCountText(count: number): string {
   return `${count} block${count === 1 ? "" : "s"} need${count === 1 ? "s" : ""} fixing`;
@@ -109,8 +134,10 @@ function RunBlockingPill({
   count: number;
   onExpand: () => void;
 }) {
+  const reportBottom = useReportSurfaceBottom<HTMLButtonElement>();
   return (
     <button
+      ref={reportBottom}
       type="button"
       onClick={onExpand}
       aria-expanded={false}
@@ -136,8 +163,10 @@ function RunBlockingPanel({
   onLocate: (nodeId: string) => void;
   onCollapse: () => void;
 }) {
+  const reportBottom = useReportSurfaceBottom<HTMLDivElement>();
   return (
     <div
+      ref={reportBottom}
       className={cn(
         ANCHOR_CLASS,
         RUN_BLOCKING_PANEL_WIDTH_CLASS,

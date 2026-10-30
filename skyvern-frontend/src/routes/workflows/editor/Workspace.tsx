@@ -65,7 +65,7 @@ import { getClient } from "@/api/AxiosClient";
 import { isPaymentRequiredError } from "@/api/paymentRequired";
 import { DebugSessionApiResponse } from "@/api/types";
 import { useCredentialGetter } from "@/hooks/useCredentialGetter";
-import { useFeatureFlag } from "@/hooks/useFeatureFlag";
+import { useWorkflowDocEditorFlag } from "@/hooks/useWorkflowDocEditorFlag";
 import { useMountEffect } from "@/hooks/useMountEffect";
 import { useBrowserSessionRateLimit } from "../hooks/useBrowserSessionRateLimit";
 import { useActiveRunSessionQuery } from "../hooks/useActiveRunSessionQuery";
@@ -707,7 +707,7 @@ function Workspace({
   // "Make a Copy"), so the YAML editor must not open or commit for them.
   const isGlobalWorkflow = useIsGlobalWorkflow();
   const postHog = usePostHog();
-  const docEditorEnabled = useFeatureFlag("WORKFLOW_DOC_EDITOR") ?? false;
+  const docEditorEnabled = useWorkflowDocEditorFlag();
   const captureProductEvent = useCallback(
     (event: string, properties: Record<string, unknown>) =>
       postHog.capture(event, properties),

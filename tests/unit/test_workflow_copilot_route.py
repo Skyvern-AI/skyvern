@@ -274,12 +274,16 @@ async def test_demonstration_control_checks_the_demonstrations_workflow_before_a
     append.assert_not_awaited()
 
 
-@pytest.mark.parametrize("server_flag", [False, True])
+@pytest.mark.parametrize(
+    ("client_flag", "server_flag"),
+    [(False, False), (False, True), (True, False), (True, True)],
+)
 @pytest.mark.asyncio
-async def test_the_server_flag_decides_doc_editor_notes_not_the_client(
+async def test_the_client_can_only_disable_server_doc_editor_notes(
     monkeypatch: pytest.MonkeyPatch,
     api_key_request: MagicMock,
     organization: SimpleNamespace,
+    client_flag: bool,
     server_flag: bool,
 ) -> None:
     flag = AsyncMock(return_value=server_flag)
@@ -287,12 +291,12 @@ async def test_the_server_flag_decides_doc_editor_notes_not_the_client(
     turn = AsyncMock(return_value="sentinel")
     monkeypatch.setattr(workflow_copilot_route, "_new_copilot_chat_post", turn)
     chat_request = _make_chat_request()
-    chat_request.doc_editor_enabled = True
+    chat_request.doc_editor_enabled = client_flag
 
     await workflow_copilot_chat_post(api_key_request, chat_request, organization, current_user_id="user-1")
 
     flag.assert_awaited_once_with("org-1", "user-1")
-    assert turn.await_args.args[1].doc_editor_enabled is server_flag
+    assert turn.await_args.args[1].doc_editor_enabled is (client_flag and server_flag)
 
 
 @pytest.mark.asyncio

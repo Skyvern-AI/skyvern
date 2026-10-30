@@ -455,7 +455,7 @@ class WorkflowCopilotChatRequest(BaseModel):
     )
     doc_editor_enabled: bool = Field(
         False,
-        description="Ignored; the server decides from the caller's Doc editor flag.",
+        description="The client may opt out of Doc note-aware Copilot behavior; the server controls enablement.",
         json_schema_extra={"x-internal": True},
     )
     cancel_token: str | None = Field(

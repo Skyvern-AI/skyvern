@@ -6,6 +6,7 @@ import {
   CredentialSelectionStrategy,
   EmailBodyFormat,
   EmailTransport,
+  WorkflowBlockDocFields,
   WorkflowBlockType,
   WorkflowModel,
   WorkflowRetryPolicy,
@@ -185,7 +186,7 @@ export type BlockYAML =
   | PdfFillBlockYAML
   | SplitPdfBlockYAML;
 
-export type BlockYAMLBase = {
+export type BlockYAMLBase = WorkflowBlockDocFields & {
   block_type: WorkflowBlockType;
   label: string;
   continue_on_failure?: boolean;
