@@ -902,6 +902,7 @@ def block_yaml_to_block(
             prompt=block_yaml.prompt,
             data_schema=block_yaml.data_schema,
             max_turns=block_yaml.max_turns,
+            tools=block_yaml.tools,
             parameters=_resolve_block_parameters(block_yaml, parameters),
         )
 

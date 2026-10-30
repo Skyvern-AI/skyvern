@@ -3,6 +3,7 @@ from __future__ import annotations
 import base64
 import datetime
 import hashlib
+import hmac
 import json
 import secrets
 from dataclasses import dataclass, field
@@ -19,6 +20,7 @@ from skyvern.forge.sdk.db.repositories.microsoft_oauth import (  # noqa: F401
     STATE_ERROR,
     STATE_PENDING_CONSENT,
     STATE_REVOKED,
+    ActiveCredentialCiphertext,
     InvalidConsentNonceError,
     PendingConsentContext,
 )
@@ -524,6 +526,33 @@ async def refresh_access_token(refresh_token: str, scopes: str | list[str] | tup
     return token_data
 
 
+async def _decrypt_refresh_token(payload: ActiveCredentialCiphertext, organization_id: str) -> str:
+    if secret_encryption.is_encrypted_secret(payload.encrypted_refresh_token):
+        if not secret_encryption.encryption_available():
+            raise EncryptionNotConfiguredError("Microsoft OAuth token encryption is not configured")
+        return await secret_encryption.decrypt_secret_field_value(
+            payload.encrypted_refresh_token,
+            organization_id=organization_id,
+            field_name="microsoft_oauth_credentials.encrypted_refresh_token",
+        )
+    if payload.encrypted_method is None:
+        raise ValueError("Microsoft OAuth credential is missing its encryption method")
+    return await encryptor.decrypt(payload.encrypted_refresh_token, EncryptMethod(payload.encrypted_method))
+
+
+async def _ciphertext_if_token_unchanged(organization_id: str, credential_id: str, refresh_token: str) -> str | None:
+    payload = await app.DATABASE.microsoft_oauth.load_active_ciphertext(
+        organization_id=organization_id,
+        credential_id=credential_id,
+    )
+    if payload is None:
+        return None
+    stored_refresh_token = await _decrypt_refresh_token(payload, organization_id)
+    if not hmac.compare_digest(stored_refresh_token, refresh_token):
+        return None
+    return payload.encrypted_refresh_token
+
+
 async def load_credential_secrets(
     organization_id: str,
     credential_id: str,
@@ -550,20 +579,7 @@ async def load_credential_secrets(
         if scope_profile == MICROSOFT_OAUTH_SCOPE_PROFILE_POWERBI_DATASET_READ
         else payload.scopes_granted
     )
-    if secret_encryption.is_encrypted_secret(payload.encrypted_refresh_token):
-        if not secret_encryption.encryption_available():
-            raise EncryptionNotConfiguredError("Microsoft OAuth token encryption is not configured")
-        refresh_token = await secret_encryption.decrypt_secret_field_value(
-            payload.encrypted_refresh_token,
-            organization_id=organization_id,
-            field_name="microsoft_oauth_credentials.encrypted_refresh_token",
-        )
-    else:
-        if payload.encrypted_method is None:
-            raise ValueError("Microsoft OAuth credential is missing its encryption method")
-        refresh_token = await encryptor.decrypt(
-            payload.encrypted_refresh_token, EncryptMethod(payload.encrypted_method)
-        )
+    refresh_token = await _decrypt_refresh_token(payload, organization_id)
     return MicrosoftCredentialSecrets(
         refresh_token=refresh_token,
         scopes=granted_scopes,
@@ -635,19 +651,30 @@ async def refresh_and_rotate(
     try:
         encrypted_refresh_token = await _encrypt_refresh_token(refresh_token_to_store, organization_id)
         now = datetime.datetime.now(datetime.UTC).replace(tzinfo=None)
-        updated = await app.DATABASE.microsoft_oauth.update_active_refresh_token(
-            organization_id=organization_id,
-            credential_id=credential_id,
-            encrypted_refresh_token=encrypted_refresh_token,
-            encrypted_method=DEFAULT_ENCRYPT_METHOD,
-            expected_encrypted_refresh_token=credential_secrets.encrypted_refresh_token,
-            tenant_id=tenant_id,
-            object_id=object_id,
-            initiating_user_id=initiating_user_id,
-            connection_id=connection_id,
-            custody_mode=custody_mode,
-            now=now,
-        )
+
+        async def replace_refresh_token(expected_encrypted_refresh_token: str) -> bool:
+            return await app.DATABASE.microsoft_oauth.update_active_refresh_token(
+                organization_id=organization_id,
+                credential_id=credential_id,
+                encrypted_refresh_token=encrypted_refresh_token,
+                encrypted_method=DEFAULT_ENCRYPT_METHOD,
+                expected_encrypted_refresh_token=expected_encrypted_refresh_token,
+                tenant_id=tenant_id,
+                object_id=object_id,
+                initiating_user_id=initiating_user_id,
+                connection_id=connection_id,
+                custody_mode=custody_mode,
+                now=now,
+            )
+
+        updated = await replace_refresh_token(credential_secrets.encrypted_refresh_token)
+        if not updated:
+            # A re-encryption (e.g. the AES-GCM backfill) changes the ciphertext but not the token; retry once
+            # against the new ciphertext so a newly issued refresh token is not dropped.
+            current_ciphertext = await _ciphertext_if_token_unchanged(
+                organization_id, credential_id, credential_secrets.refresh_token
+            )
+            updated = current_ciphertext is not None and await replace_refresh_token(current_ciphertext)
         if not updated and any((tenant_id, object_id, initiating_user_id, connection_id, custody_mode)):
             await app.DATABASE.microsoft_oauth.update_active_refresh_token(
                 organization_id=organization_id,

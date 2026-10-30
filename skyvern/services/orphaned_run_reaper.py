@@ -26,6 +26,9 @@ from skyvern.forge.sdk.workflow.retry_policy import get_recorded_decision, on_te
 from skyvern.services import task_v2_service, uploaded_file_service
 
 LOG = structlog.get_logger()
+_STARTED = (WorkflowRunStatus.running, WorkflowRunStatus.paused)
+# A dispatcher can die after taking the lease but before its first running write.
+_NOT_STARTED = (WorkflowRunStatus.created, WorkflowRunStatus.queued)
 
 EXPIRED_SCAN_LIMIT = 500
 # One traversal walks the leases already expired when it started, page by page in (heartbeat_at, run_id) order.
@@ -160,9 +163,13 @@ async def _reap_workflow(
         and run.status == WorkflowRunStatus.failed
         and run.failure_reason == reason
     )
-    if not resuming and run.status not in (WorkflowRunStatus.running, WorkflowRunStatus.paused):
+    if not resuming and run.status not in (*_STARTED, *_NOT_STARTED):
         return False, None
     attempts = await app.DATABASE.workflow_run_attempts.get_attempts(lease.run_id)
+    # A not-started run with attempt rows belongs to retry recovery, which dispatches it again.
+    eligible = list(_STARTED) if attempts else [*_STARTED, *_NOT_STARTED]
+    if not resuming and run.status not in eligible:
+        return False, None
     if attempts and max(row.attempt_number for row in attempts) != lease.attempt_number:
         return False, None
     task_v2 = await app.DATABASE.observer.get_task_v2_by_workflow_run_id(lease.run_id, run.organization_id)
@@ -192,7 +199,7 @@ async def _reap_workflow(
             finalized = await app.WORKFLOW_SERVICE._update_workflow_run_status_if_not_final(
                 lease.run_id,
                 WorkflowRunStatus(task_v2.status.value),
-                only_from=[WorkflowRunStatus.running, WorkflowRunStatus.paused],
+                only_from=eligible,
                 require_latest_attempt_number=lease.attempt_number,
             )
             if finalized is None:
@@ -213,7 +220,7 @@ async def _reap_workflow(
                     reason,
                     category,
                     cascade_children=True,
-                    only_from=[WorkflowRunStatus.running, WorkflowRunStatus.paused],
+                    only_from=eligible,
                     require_latest_attempt_number=lease.attempt_number,
                     worker_container_restarted=True,
                 )
@@ -246,7 +253,7 @@ async def _reap_workflow(
                 reason,
                 category,
                 cascade_children=True,
-                only_from=[WorkflowRunStatus.running, WorkflowRunStatus.paused],
+                only_from=eligible,
                 require_latest_attempt_number=lease.attempt_number,
                 worker_container_restarted=True,
             )
@@ -272,13 +279,14 @@ async def _reap_workflow(
 
 async def _reap_task(lease: RunExecutionLease, reason: str) -> bool:
     task = await app.DATABASE.tasks.get_task(lease.run_id)
-    if task is None or task.workflow_run_id is not None or task.status != TaskStatus.running:
+    eligible = [TaskStatus.created, TaskStatus.queued, TaskStatus.running]
+    if task is None or task.workflow_run_id is not None or task.status not in eligible:
         return False
     claimed = await app.DATABASE.tasks.bulk_update_tasks(
         [lease.run_id],
         status=TaskStatus.failed,
         failure_reason=reason,
-        only_if_status_in=[TaskStatus.running],
+        only_if_status_in=eligible,
     )
     if not claimed:
         return False

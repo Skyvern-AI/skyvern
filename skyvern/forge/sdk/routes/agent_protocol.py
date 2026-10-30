@@ -169,6 +169,7 @@ from skyvern.forge.sdk.workflow.exceptions import (
     InvalidTemplateWorkflowPermanentId,
     WorkflowDefinitionValidationException,
 )
+from skyvern.forge.sdk.workflow.models.agent_step_tools import AgentStepToolOption, tool_options
 from skyvern.forge.sdk.workflow.models.parameter import CredentialParameter, WorkflowParameter, WorkflowParameterType
 from skyvern.forge.sdk.workflow.models.tags import CallerType, TagSource, TagWriteContext
 from skyvern.forge.sdk.workflow.models.validators import is_reserved_tag_key
@@ -1912,6 +1913,13 @@ async def get_browser_types(
     if not runtime_supports_browser_type_selection():
         return []
     return supported_browser_type_options()
+
+
+@legacy_base_router.get("/agent_step_tools", response_model=list[AgentStepToolOption], include_in_schema=False)
+async def get_agent_step_tools(
+    current_org: Organization = Depends(org_auth_service.get_current_org),
+) -> list[AgentStepToolOption]:
+    return tool_options()
 
 
 @legacy_base_router.put("/folders/{folder_id}", response_model=Folder, tags=["agent"], include_in_schema=False)

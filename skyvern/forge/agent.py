@@ -243,8 +243,10 @@ from skyvern.forge.taskv3.provider_downloads import (
     ProviderDownloadRecovery,
 )
 from skyvern.forge.taskv3.run_arms import (
+    ANSWER_AUDIT_LOG_ONLY_FLAG,
     DATE_SEGMENT_AIM_FLAG,
     DEAD_END_RETURN_FLAG,
+    LLM_ROUTE_FLAG,
     LOGIN_PACE_FLAG,
     TURN_DOM_FLAG,
     resolve_run_arm,
@@ -1771,16 +1773,31 @@ async def _read_task_v3_llm_name_override(
     return variant
 
 
-async def _resolve_task_v3_llm_key(task: Task) -> str:
-    """Resolve Task V3's LLM key, preserving explicit task keys and downgrading UI defaults."""
+async def _resolve_task_v3_llm_key(task: Task) -> tuple[str, RunArm | None]:
+    """Resolve Task V3's LLM key and the route arm applied to it; explicit keys keep their key and no arm."""
     if task.llm_key:
-        return task.llm_key
+        return task.llm_key, None
     # get_task builds Task without workflow_permanent_id; the run context is the reliable source.
     context = skyvern_context.current()
     workflow_permanent_id = task.workflow_permanent_id or (context.workflow_permanent_id if context else None)
     override = await _read_task_v3_llm_name_override(task.task_id, task.organization_id, workflow_permanent_id)
     resolved = override or settings.TASK_V3_LLM_KEY or settings.LLM_KEY
-    return LLMAPIHandlerFactory.resolve_non_flex_llm_key_for_manual_run(resolved) or resolved
+    treatment_key = app.AGENT_FUNCTION.get_task_v3_llm_route_treatment_key(resolved)
+    route_arm: RunArm | None = None
+    if context is not None and treatment_key:
+        # The arm is pinned per run, not the model: a later block with its own unpaired override keeps that key.
+        arm = await resolve_run_arm(
+            context,
+            LLM_ROUTE_FLAG,
+            distinct_id=task.workflow_run_id or task.task_id,
+            organization_id=task.organization_id,
+            forced=False,
+        )
+        if arm == "treatment":
+            resolved = treatment_key
+        if arm != "unrandomized":
+            route_arm = arm
+    return LLMAPIHandlerFactory.resolve_non_flex_llm_key_for_manual_run(resolved) or resolved, route_arm
 
 
 def _goal_judge_key_skip_reason(judge_key: str | None) -> str | None:
@@ -2966,7 +2983,8 @@ class ForgeAgent:
             # actions, so a lost page yields None and the verdict is accepted as-is.
             return await browser_state.get_working_page()
 
-        llm_caller = LLMCaller(llm_key=await _resolve_task_v3_llm_key(task))
+        llm_key, llm_route_arm = await _resolve_task_v3_llm_key(task)
+        llm_caller = LLMCaller(llm_key=llm_key)
         workflow_run_context = (
             app.WORKFLOW_CONTEXT_MANAGER.get_workflow_run_context(task.workflow_run_id)
             if task.workflow_run_id and app.WORKFLOW_CONTEXT_MANAGER.has_workflow_run_context(task.workflow_run_id)
@@ -3006,6 +3024,13 @@ class ForgeAgent:
                 distinct_id=task.workflow_run_id or task.task_id,
                 organization_id=task.organization_id,
                 forced=settings.TASK_V3_DEAD_END_RETURN,
+            )
+            await resolve_run_arm(
+                context,
+                ANSWER_AUDIT_LOG_ONLY_FLAG,
+                distinct_id=task.workflow_run_id or task.task_id,
+                organization_id=task.organization_id,
+                forced=False,
             )
             turn_dom_arm = await resolve_run_arm(
                 context,
@@ -4007,6 +4032,7 @@ class ForgeAgent:
 
             outcome = await run_task_v3_agent_loop(
                 page_provider=_page_provider,
+                llm_route_arm=llm_route_arm,
                 # Read through browser_state each time: a recovered browser brings a new context, and the old
                 # one's submissions still count.
                 intercepted_submissions=submissions_across_contexts(

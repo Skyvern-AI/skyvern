@@ -889,6 +889,32 @@ def _should_run_post_block_completion_check(
     return True
 
 
+async def settle_child_of_ended_parent(
+    task_v2: TaskV2, parent_workflow_run_id: str | None, organization_id: str
+) -> TaskV2 | None:
+    """The child's own rows, settled as canceled, when its parent run ended or lost its lease before the child
+    started; None when the child may proceed."""
+    if not parent_workflow_run_id:
+        return None
+    parent = await app.DATABASE.workflow_runs.get_workflow_run(parent_workflow_run_id, organization_id=organization_id)
+    if parent is not None and not parent.status.is_final() and not await run_lease_lost(parent_workflow_run_id):
+        return None
+    if task_v2.workflow_run_id:
+        # The workflow service runs the terminal bookkeeping (runs list, duration, terminal hooks) a direct write skips.
+        await app.WORKFLOW_SERVICE.mark_workflow_run_as_canceled_if_not_final(
+            task_v2.workflow_run_id, failure_reason="The parent run ended before this task v2 started"
+        )
+    # Only the writer that ends the task sends its callback.
+    won = await app.DATABASE.observer.update_task_v2_status_if_not_final(
+        task_v2_id=task_v2.observer_cruise_id, organization_id=organization_id, status=TaskV2Status.canceled
+    )
+    settled = await app.DATABASE.observer.get_task_v2(task_v2.observer_cruise_id, organization_id=organization_id)
+    settled = settled or task_v2
+    if won:
+        await send_task_v2_webhook(settled)
+    return settled
+
+
 async def run_task_v2_helper(
     organization: Organization,
     task_v2: TaskV2,
@@ -991,15 +1017,34 @@ async def run_task_v2_helper(
     if await run_lease_lost(workflow_run_id):
         current = await app.DATABASE.observer.get_task_v2(task_v2_id, organization_id=organization_id)
         return None, None, current or task_v2
+    # The lease check above can be stale by the time these writes land: another server may have finished the run.
     task_v2 = await app.DATABASE.observer.update_task_v2(
-        task_v2_id=task_v2_id, organization_id=organization_id, status=TaskV2Status.running
+        task_v2_id=task_v2_id, organization_id=organization_id, status=TaskV2Status.running, keep_final_status=True
     )
+    if task_v2.status.is_final():
+        return None, None, task_v2
     workflow = await app.WORKFLOW_SERVICE.get_workflow(workflow_id=workflow_run.workflow_id)
-    await app.WORKFLOW_SERVICE.mark_workflow_run_as_running(
+    workflow_run = await app.WORKFLOW_SERVICE.mark_workflow_run_as_running(
         workflow_run_id=workflow_run.workflow_run_id,
         workflow_definition_sha256=workflow_definition_sha256(workflow.workflow_definition),
     )
+    if workflow_run.status.is_final():
+        # Only the writer that ends the task sends its callback; a task finalizer that won first already sent one.
+        won = await app.DATABASE.observer.update_task_v2_status_if_not_final(
+            task_v2_id=task_v2_id,
+            organization_id=organization_id,
+            status=TaskV2Status(workflow_run.status.value),
+        )
+        task_v2 = await app.DATABASE.observer.get_task_v2(task_v2_id, organization_id=organization_id) or task_v2
+        if won:
+            await send_task_v2_webhook(task_v2)
+        return None, None, task_v2
     await _set_up_workflow_context(workflow, workflow_run_id, organization)
+    # The startup awaits above give the parent time to end; the child must not reach a browser after that.
+    settled = await settle_child_of_ended_parent(task_v2, workflow_run.parent_workflow_run_id, organization_id)
+    if settled is not None:
+        app.WORKFLOW_CONTEXT_MANAGER.remove_workflow_run_context(workflow_run_id)
+        return None, None, settled
 
     user_prompt = task_v2.prompt
     task_history: list[dict] = []
@@ -1019,6 +1064,11 @@ async def run_task_v2_helper(
         )
         context.browser_session_runnable_id = root_workflow_run_id
         context.browser_session_runnable_generation_id = lease_generation_id
+        # The session belongs to the root run, so a refusal here leaves it as it is.
+        settled = await settle_child_of_ended_parent(task_v2, workflow_run.parent_workflow_run_id, organization_id)
+        if settled is not None:
+            app.WORKFLOW_CONTEXT_MANAGER.remove_workflow_run_context(workflow_run_id)
+            return None, None, settled
 
     browser_state = await app.BROWSER_MANAGER.get_or_create_for_workflow_run(
         workflow_run=workflow_run,

@@ -25,6 +25,7 @@ from skyvern.forge.sdk.copilot.runtime import AgentContext
 from skyvern.forge.sdk.copilot.tracing_setup import copilot_span
 from skyvern.forge.sdk.copilot.workflow_yaml import dump_workflow_yaml
 from skyvern.forge.sdk.schemas.credentials import CredentialType, TotpType
+from skyvern.schemas.agent_step_tool_names import AGENT_STEP_TOOL_NAMES
 from skyvern.schemas.runs import RunEngine
 from skyvern.utils.strings import join_phrases
 from skyvern.utils.yaml_loader import safe_load_no_dates
@@ -696,6 +697,7 @@ def _validator_relevant_fingerprint(block: Mapping[str, object]) -> tuple[object
         condition.get("criteria_type", "jinja2_template") if isinstance(condition, Mapping) else None,
         branch_criteria_types,
         _has_goal_prompt(block),
+        block.get("tools"),
     )
 
 
@@ -839,20 +841,36 @@ def _legacy_engine_block_labels(
     )
 
 
-def _code_block_goal_findings(changed: list[tuple[str, Mapping[str, object]]]) -> list[str]:
+def _is_block_type(block: Mapping[str, object], block_type: str) -> bool:
+    raw_type = block.get("block_type")
+    return isinstance(raw_type, str) and normalize_copilot_block_type_alias(raw_type.strip().lower()) == block_type
+
+
+def _code_block_goal_findings(changed: list[tuple[str, Mapping[str, object]]]) -> list[dict[str, str]]:
     """Absent code_artifact_metadata is the normalizer's own finding; only the Goal is reported here."""
-    missing = [
-        label
-        for label, block in changed
-        if isinstance(block.get("block_type"), str)
-        and normalize_copilot_block_type_alias(str(block["block_type"]).strip().lower()) == "code"
-        and not _has_goal_prompt(block)
-    ]
+    missing = [label for label, block in changed if _is_block_type(block, "code") and not _has_goal_prompt(block)]
     if not missing:
         return []
     return [
-        f"Code blocks {', '.join(sorted(missing))} carry no `prompt`, which is the plain-language Goal "
-        "shown in the editor. Read get_block_schema with block_type `code` for what it must say."
+        {
+            "reason_code": "code_block_goal_incomplete",
+            "summary": f"Code blocks {', '.join(sorted(missing))} carry no `prompt`, which is the plain-language Goal "
+            "shown in the editor. Read get_block_schema with block_type `code` for what it must say.",
+        }
+    ]
+
+
+def _agent_step_tools_findings(changed: list[tuple[str, Mapping[str, object]]]) -> list[dict[str, str]]:
+    """A step with no list runs with every tool and succeeds, so a test run never shows the list is missing."""
+    missing = [label for label, block in changed if _is_block_type(block, "agent_step") and not block.get("tools")]
+    if not missing:
+        return []
+    return [
+        {
+            "reason_code": "agent_step_tools_missing",
+            "summary": f"Agent steps {', '.join(sorted(missing))} name no `tools`, so each is offered every tool. "
+            f"A step's `tools` takes names from: {', '.join(sorted(AGENT_STEP_TOOL_NAMES))}.",
+        }
     ]
 
 
@@ -860,7 +878,7 @@ def _code_block_goal_findings(changed: list[tuple[str, Mapping[str, object]]]) -
 class AuthoringValidation:
     reject: AuthorTimeBlock | None = None
     legacy_engine_blocks: tuple[str, ...] = ()
-    findings: tuple[str, ...] = ()
+    findings: tuple[dict[str, str], ...] = ()
     workflow_yaml: str = ""
 
 
@@ -988,7 +1006,7 @@ def reject_authoring_violations(
         _record_authored_families(ctx, changed + rewritten, prior_blocks)
         return AuthoringValidation(
             legacy_engine_blocks=legacy_engine_blocks,
-            findings=tuple(_code_block_goal_findings(changed)),
+            findings=(*_code_block_goal_findings(changed), *_agent_step_tools_findings(changed)),
             workflow_yaml=workflow_yaml,
         )
     for violation in violations:

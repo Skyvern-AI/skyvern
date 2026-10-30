@@ -10,7 +10,7 @@ from __future__ import annotations
 
 import asyncio
 import re
-from collections.abc import Awaitable, Callable
+from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass
 from typing import Any, Protocol
 
@@ -80,9 +80,17 @@ def _may_move_on(tool: str, args: dict[str, Any]) -> bool:
     return _may_submit(tool, args) and not (tool == "click" and _MENU_ROW.search(_selector(args)))
 
 
-def apply_answer_basis_audit(tools: list[ToolSpec], audit: AnswerBasisAudit | None) -> None:
+def apply_answer_basis_audit(
+    tools: list[ToolSpec],
+    audit: AnswerBasisAudit | None,
+    *,
+    log_only: bool = False,
+    log_fields: Mapping[str, str] | None = None,
+) -> None:
+    """``log_only`` logs each hold it would make and lets the call through, uncounted; what lands stays flagged."""
     if audit is None:
         return
+    extra = log_fields or {}
     # Each answer's audit starts when it is recorded, so the call overlaps the model's next turns instead of delaying
     # the moving click.
     pending: dict[Field, tuple[str, asyncio.Task[list[RecordedAnswer]]]] = {}
@@ -113,7 +121,7 @@ def apply_answer_basis_audit(tools: list[ToolSpec], audit: AnswerBasisAudit | No
 
     async def hold(
         spec: ToolSpec, args: dict[str, Any], entering: tuple[Field, str] | None = None, appends: bool = False
-    ) -> bool:
+    ) -> tuple[bool, dict[Field, str]]:
         """Refuse the moving action while a flagged answer is unchanged; True when it passes as that field's repair."""
         while pending:
             field, (value, task) = pending.popitem()
@@ -131,16 +139,27 @@ def apply_answer_basis_audit(tools: list[ToolSpec], audit: AnswerBasisAudit | No
                 shown[entering[0]] = entering[1]
                 untyped = entering[0]
         if not shown:
-            return False
+            return False, {}
         # A click cannot be told from a submit before it lands, so only the flagged field's own control, or a row of an
         # open list, goes through: that is the repair. A ref or mark is compared as the field was recorded, resolved.
         if spec.name == "click":
             selector, menu_row = await spec.address_probe(args) if spec.address_probe else (_selector(args), False)
             if menu_row or any(selector == field[1] for field in flagged):
-                return True
+                return True, {}
         nonlocal holds
+        if log_only:
+            LOG.info(
+                "taskv3 answer basis hold",
+                tool=spec.name,
+                flagged=len(shown),
+                holds=holds,
+                log_only=True,
+                would_hold=True,
+                **extra,
+            )
+            return False, shown
         holds += 1
-        LOG.info("taskv3 answer basis hold", tool=spec.name, flagged=len(shown), holds=holds)
+        LOG.info("taskv3 answer basis hold", tool=spec.name, flagged=len(shown), holds=holds, **extra)
         named = "; ".join(
             f"'{q}' with '{v}' (field {s}; not typed, nothing was entered or pressed)"
             if (q, s) == untyped
@@ -174,8 +193,10 @@ def apply_answer_basis_audit(tools: list[ToolSpec], audit: AnswerBasisAudit | No
             _tool = _spec.name
             entering: tuple[Field, str] | None = None
             text = str(args.get("text") or "")
+            adds_text = bool(text.strip())
+            appends = not args.get("clear", True)
             # Its own Enter can submit the form, so the text is judged first, appended (clear=false) or not.
-            enters = args.get("press_enter") and 0 < len(text.split()) <= _MAX_AUDITED_WORDS
+            enters = args.get("press_enter") and adds_text and len(text.split()) <= _MAX_AUDITED_WORDS
             if _spec.answer_probe is not None and enters:
                 selector, label, kind, from_placeholder = await _spec.answer_probe(args)
                 if label.strip() and kind in _FREE_TEXT_KINDS:
@@ -184,7 +205,7 @@ def apply_answer_basis_audit(tools: list[ToolSpec], audit: AnswerBasisAudit | No
                         placeholders.add(entering[0])
                 elif not selector:
                     LOG.info("taskv3 answer basis probe missed", tool=_tool)
-            repair = _may_move_on(_tool, args) and await hold(_spec, args, entering, not args.get("clear", True))
+            repair, kept = await hold(_spec, args, entering, appends) if _may_move_on(_tool, args) else (False, {})
             result = await _handler(args)
             data = _data(result)
             picked = str(data.get(PICKED_OPTION_DATA_KEY) or "") if _tool == "click" and result.status == "ok" else ""
@@ -211,6 +232,12 @@ def apply_answer_basis_audit(tools: list[ToolSpec], audit: AnswerBasisAudit | No
                 placeholders.discard(field)
             if entering is not None and field == entering[0]:
                 record(field, "")
+                # A flagged answer the log-only arm let land still holds, as the blocking arm would keep holding it.
+                if field in kept:
+                    flagged[field] = kept[field]
+                return result
+            # The blocking arm refused this call, so an append that adds no text leaves the flag it holds.
+            if field in kept and appends and not adds_text:
                 return result
             if _tool == "select_combobox":
                 record(field, str(args.get("value") or ""))
@@ -218,7 +245,8 @@ def apply_answer_basis_audit(tools: list[ToolSpec], audit: AnswerBasisAudit | No
                 record(field, str(data.get(PICKED_OPTION_DATA_KEY) or args.get("label") or args.get("value") or ""))
             elif _tool == "type" and str(data.get(TARGET_KIND_DATA_KEY) or "") in _FREE_TEXT_KINDS:
                 text = str(args.get("text") or "")
-                if len(text.split()) <= _MAX_AUDITED_WORDS:
+                # Appending nothing leaves the field's answer, and its flag, as they were.
+                if (text or args.get("clear", True)) and len(text.split()) <= _MAX_AUDITED_WORDS:
                     record(field, text)
             return result
 

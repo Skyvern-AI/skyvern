@@ -1391,6 +1391,10 @@ class AgentFunction:
         """Return a standard-tier twin for the given LLM key, or None if no twin exists."""
         return None
 
+    def get_task_v3_llm_route_treatment_key(self, llm_key: str) -> str | None:
+        """Return the registered key a Task V3 run on ``llm_key`` uses in the LLM route arm's treatment, or None."""
+        return None
+
     def get_fallback_llm_key(self, llm_key: str | None) -> str | None:
         """Return a provider-fallback router twin for the given LLM key, or None if none exists.
 
