@@ -8,6 +8,7 @@ from uuid import uuid4
 
 import pytest
 import pytest_asyncio
+from pydantic import TypeAdapter
 from sqlalchemy import delete, select, text, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -18,9 +19,16 @@ from skyvern.forge.agent import ForgeAgent
 from skyvern.forge.failure_classifier import (
     HAR_ANTI_BOT_DIAGNOSTIC_REASON_CODE,
     derive_failure_attribution,
+    has_classifier_primary,
     is_output_only_entry,
     with_root_user_errors,
     without_output_only_categories,
+)
+from skyvern.forge.sdk.api.llm import api_handler_factory
+from skyvern.forge.sdk.api.llm.custom_llm_registry import (
+    custom_llm_key,
+    deregister_custom_llm_config,
+    register_custom_llm_config,
 )
 from skyvern.forge.sdk.copilot.challenge_evidence import is_carrier_backed_category_entry
 from skyvern.forge.sdk.core import skyvern_context
@@ -35,15 +43,24 @@ from skyvern.forge.sdk.db.models import (
     WorkflowRunBlockModel,
     WorkflowRunModel,
 )
+from skyvern.forge.sdk.routes import agent_protocol
+from skyvern.forge.sdk.schemas.custom_llms import CustomLLMConfig, CustomLLMProvider
 from skyvern.forge.sdk.schemas.har_evidence import (
     HarEvidence,
     HarEvidenceAvailability,
     HarEvidenceEvent,
     HarEvidenceVisit,
+    HarHttpFailure,
+    without_final_har_user_match,
 )
 from skyvern.forge.sdk.schemas.task_v2 import TaskV2, TaskV2Status
-from skyvern.forge.sdk.workflow.context_manager import WorkflowRunContext
-from skyvern.forge.sdk.workflow.service import WorkflowService, _with_diagnostic_system_errors
+from skyvern.forge.sdk.workflow.context_manager import WorkflowContextManager, WorkflowRunContext
+from skyvern.forge.sdk.workflow.models.workflow import WorkflowRun, WorkflowRunStatus
+from skyvern.forge.sdk.workflow.service import (
+    WorkflowService,
+    _with_diagnostic_system_errors,
+    _with_final_har_user_errors,
+)
 from skyvern.services import task_v2_service
 from skyvern.webeye.utils.challenge_solve_record import ChallengeSolveReceipt
 from tests.unit.conftest import cancel_once_parked
@@ -86,23 +103,13 @@ def _evidence(*visits: HarEvidenceVisit) -> HarEvidence:
     return HarEvidence(availability=HarEvidenceAvailability.available, visits=visits)
 
 
-def _context(failure_reason: str | None = "The page did not load") -> ffd.FailureContext:
+def _context() -> ffd.FailureContext:
     return ffd.FailureContext(
-        organization_id="o_ffd",
         task_id="tsk_ffd",
         attempt_number=1,
         window_start=FAILED_AT - timedelta(minutes=30),
         finished_at=FAILED_AT,
-        failure_reason=failure_reason,
-        failed_action=ffd.FailedActionFacts(
-            action_id="a_1",
-            action_type="click",
-            status="failed",
-            step_id="stp_1",
-            step_order=3,
-            screenshot_artifact_id="art_1",
-            agent_intention="Click the search button",
-        ),
+        failed_action=ffd.FailedActionFacts(action_id="a_1", step_id="stp_1", screenshot_artifact_id="art_1"),
         run_ids=("tsk_ffd",),
     )
 
@@ -178,7 +185,7 @@ AKAMAI_ASSET = _event("explicit_block", 20, vendor="akamai", http_status=403, ur
     ],
 )
 def test_enforcement_observed_in_the_failed_attempt(visits: tuple[HarEvidenceVisit, ...], enforcement: str) -> None:
-    diagnostic, _ = ffd.diagnose(_evidence(*visits), _context())
+    diagnostic = ffd.diagnose(_evidence(*visits), _context())
 
     assert diagnostic.enforcement.value == enforcement
 
@@ -193,7 +200,7 @@ def test_enforcement_observed_in_the_failed_attempt(visits: tuple[HarEvidenceVis
 )
 def test_no_enforcement_is_reported_as_the_cause_of_the_failure(event: HarEvidenceEvent) -> None:
     context = _context()
-    diagnostic, _ = ffd.diagnose(_evidence(_visit((event,))), context)
+    diagnostic = ffd.diagnose(_evidence(_visit((event,))), context)
     entry = ffd.diagnostic_entry(diagnostic, context)
 
     assert entry is not None and entry["anti_bot"]["contribution"] == "unknown"
@@ -232,7 +239,7 @@ async def test_a_page_block_becomes_an_output_only_entry_naming_its_evidence(no_
 )
 @pytest.mark.asyncio
 async def test_unavailable_evidence_reports_nothing(availability: HarEvidenceAvailability, no_model: NoModel) -> None:
-    context = _context(failure_reason=None)
+    context = _context()
     diagnostic = await ffd.final_failure_diagnostic(HarEvidence.unavailable(availability), context)
 
     assert diagnostic.availability == availability and ffd.diagnostic_entry(diagnostic, context) is None
@@ -1335,3 +1342,448 @@ async def test_the_mirror_and_a_reset_serialize_on_the_run_row(
         assert mirrored is None and task_v2 is not None and task_v2.failure_category == [PRIMARY]
     else:
         assert mirrored is not None and task_v2 is not None and task_v2.failure_category == [PRIMARY, _entry()]
+
+
+MATCH_MAPPING = {"PAYMENT_API_DOWN": "The payment service answered with a server error when the order was submitted"}
+MATCHED = {"errors": [{"error_code": "PAYMENT_API_DOWN", "reasoning": "the order API failed", "confidence_float": 0.8}]}
+API_503 = HarEvidence(
+    availability=HarEvidenceAvailability.available,
+    http_failures=(HarHttpFailure(at=_at(30), status=503, method="POST", url_class="api"),),
+)
+
+
+class Matcher:
+    def __init__(self, answer: Any) -> None:
+        self.answer, self.prompts = answer, []
+
+    async def __call__(self, *, prompt: str, **_: Any) -> Any:
+        self.prompts.append(prompt)
+        if isinstance(self.answer, BaseException):
+            raise self.answer
+        return self.answer
+
+
+async def _map(database: AgentDB, model: Any, key: Any, row_id: str, **values: Any) -> None:
+    async with database.Session() as session:
+        await session.execute(model.__table__.update().where(key == row_id).values(**values))
+        await session.commit()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("categories", [[PRIMARY], None], ids=["primary", "no-primary"])
+@pytest.mark.parametrize("owner", ["failing-task", "task-v2-root"])
+async def test_a_failed_workflow_runs_final_recording_match_reaches_its_response_errors_once(
+    database: AgentDB, org: str, monkeypatch: pytest.MonkeyPatch, categories: list | None, owner: str
+) -> None:
+    matcher = Matcher(MATCHED)
+    monkeypatch.setattr(ffd.app, "DATABASE", database, raising=False)
+    monkeypatch.setattr(ffd.app, "SECONDARY_LLM_API_HANDLER", matcher, raising=False)
+    run_id, _ = await _workflow_run(database, org, attempts=1)
+    _registered_run_context(monkeypatch, run_id)
+    await _map(database, WorkflowRunModel, WorkflowRunModel.workflow_run_id, run_id, failure_category=categories)
+    task_id, _ = await _task(database, org, "failed", workflow_run_id=run_id)
+    await _block(database, org, run_id, "task", 0, task_id=task_id)
+    if owner == "failing-task":
+        await _map(database, TaskModel, TaskModel.task_id, task_id, error_code_mapping=MATCH_MAPPING)
+    else:
+        root_id = await _linked_task_v2(database, org, run_id)
+        await _map(database, TaskV2Model, TaskV2Model.observer_cruise_id, root_id, error_code_mapping=MATCH_MAPPING)
+    run = await database.workflow_runs.get_workflow_run(run_id, organization_id=org)
+    assert run is not None
+
+    for _ in range(2):
+        await ffd.annotate_failed_workflow_run(run, API_503, attempt_number=1, attempt_started_at=None)
+
+    stored = await database.workflow_runs.get_workflow_run(run_id, organization_id=org)
+    assert stored is not None and len(matcher.prompts) == 1 and '"http_status": 503' in matcher.prompts[0]
+    response = await _build_status_response(
+        monkeypatch, cap=1024, cap_output_values=False, failure_reason="x", failure_category=stored.failure_category
+    )
+    assert [e["error_code"] for e in response.errors] == ["PAYMENT_API_DOWN"]
+    assert response.failure_category == categories and stored.status.value == "failed"
+    # The claim is no category: every primary and category-set reader sees the run it saw before.
+    assert has_classifier_primary(stored.failure_category) == bool(categories)
+    assert derive_failure_attribution(stored.failure_category) == derive_failure_attribution(categories)
+    assert without_output_only_categories(stored.failure_category) == (categories or [])
+    assert _with_final_har_user_errors([], stored.failure_category, 2) == []
+
+
+@pytest.mark.asyncio
+async def test_concurrent_cleanups_spend_one_claim_and_a_reset_removes_only_what_the_match_inserted(
+    database: AgentDB, org: str
+) -> None:
+    task_id, finished = await _task(database, org, "failed")
+    legacy = {**USER_ANTI_BOT, "error_code": "PAYMENT_API_DOWN"}
+    await _set_errors(database, task_id, [legacy])
+    mapping = {**MATCH_MAPPING, "ORDER_REJECTED": "The order was rejected"}
+    await _map(database, TaskModel, TaskModel.task_id, task_id, error_code_mapping=mapping)
+    identity = ffd._match_identity(task_id, org, None, finished)
+    source = ffd._match_source("task", task_id, mapping)
+    rows = [
+        {"error_code": code, "reasoning": "r", "confidence_float": 0.8, "error_type": "USER_DEFINED_ERROR"}
+        for code in ("PAYMENT_API_DOWN", "ORDER_REJECTED")
+    ]
+
+    claims = await asyncio.gather(
+        *(database.tasks.claim_final_har_user_match(task_id, org, finished, identity, source) for _ in range(4))
+    )
+    changed = ffd._match_source("task", task_id, {"OTHER": "x"})
+    stale = await database.tasks.record_final_har_user_match(task_id, org, finished, identity, changed, rows)
+    recorded = await database.tasks.record_final_har_user_match(task_id, org, finished, identity, source, rows)
+    reset = await database.tasks.reset_task_for_rerun(task_id, org)
+
+    assert sorted(claims) == [False, False, False, True] and stale is None
+    assert recorded is not None and [e["error_code"] for e in recorded.errors] == ["PAYMENT_API_DOWN", "ORDER_REJECTED"]
+    # The equal row the task already carried survives the reset; only the inserted one and the claim go.
+    assert reset.errors == [legacy] and reset.failure_category == [PRIMARY]
+
+
+# A malformed answer still fails the existing parser after its reasoning is masked.
+MALFORMED = {"errors": [{"error_code": "PAYMENT_API_DOWN", "reasoning": None, "confidence_float": 0.8}]}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "failure", [asyncio.CancelledError(), TimeoutError(), RuntimeError("provider down"), MALFORMED]
+)
+async def test_a_failed_or_cancelled_match_is_never_asked_again(
+    database: AgentDB, org: str, monkeypatch: pytest.MonkeyPatch, failure: BaseException | dict[str, Any]
+) -> None:
+    monkeypatch.setattr(ffd.app, "DATABASE", database, raising=False)
+    task_id, _ = await _task(database, org, "failed")
+    await _map(database, TaskModel, TaskModel.task_id, task_id, error_code_mapping=MATCH_MAPPING)
+    task = await database.tasks.get_task(task_id, organization_id=org)
+    assert task is not None
+    failing, later = Matcher(failure), Matcher(MATCHED)
+
+    monkeypatch.setattr(ffd.app, "SECONDARY_LLM_API_HANDLER", failing, raising=False)
+    with skyvern_context.scoped(SkyvernContext(task_id=task_id)):
+        if isinstance(failure, asyncio.CancelledError):
+            with pytest.raises(asyncio.CancelledError):
+                await ffd.annotate_failed_task(task, API_503)
+        else:
+            assert await ffd.annotate_failed_task(task, API_503) == task
+        monkeypatch.setattr(ffd.app, "SECONDARY_LLM_API_HANDLER", later, raising=False)
+        after = await ffd.annotate_failed_task(task, API_503)
+
+    assert len(failing.prompts) == 1 and later.prompts == [] and after.errors == []
+    assert without_final_har_user_match(after.failure_category) == [PRIMARY]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("mapping", "evidence"),
+    [
+        pytest.param(None, API_503, id="no-mapping"),
+        pytest.param(MATCH_MAPPING, HarEvidence(availability=HarEvidenceAvailability.available), id="no-facts"),
+        pytest.param(MATCH_MAPPING, HarEvidence.unavailable(HarEvidenceAvailability.timeout), id="no-recording"),
+        pytest.param(
+            MATCH_MAPPING,
+            API_503.model_copy(
+                update={"http_failures": (API_503.http_failures[0].model_copy(update={"at": _at(3600)}),)}
+            ),
+            id="earlier-attempt",
+        ),
+    ],
+)
+async def test_nothing_to_match_asks_no_model_and_claims_nothing(
+    database: AgentDB,
+    org: str,
+    monkeypatch: pytest.MonkeyPatch,
+    no_model: NoModel,
+    mapping: dict | None,
+    evidence: HarEvidence,
+) -> None:
+    monkeypatch.setattr(ffd.app, "DATABASE", database, raising=False)
+    task_id, _ = await _task(database, org, "failed")
+    await _map(database, TaskModel, TaskModel.task_id, task_id, error_code_mapping=mapping)
+    task = await database.tasks.get_task(task_id, organization_id=org)
+    assert task is not None
+
+    after = await ffd.annotate_failed_task(task, evidence)
+
+    assert no_model.prompt_names == [] and after.failure_category == [PRIMARY]
+
+
+def _registered_run_context(monkeypatch: pytest.MonkeyPatch, run_id: str) -> None:
+    """The run's live context, as cleanup has it when the final match runs; the match masks with it."""
+    contexts = WorkflowContextManager.__new__(WorkflowContextManager)
+    contexts.workflow_run_contexts = {
+        run_id: WorkflowRunContext("ffd", f"w_{run_id}", f"wpid_{run_id}", run_id, aws_client=MagicMock())
+    }
+    monkeypatch.setattr(ffd.app, "WORKFLOW_CONTEXT_MANAGER", contexts, raising=False)
+
+
+async def _workflow_with_both_mappings(database: AgentDB, org: str) -> tuple[str, str, str]:
+    run_id, _ = await _workflow_run(database, org, attempts=1)
+    task_id, _ = await _task(database, org, "failed", workflow_run_id=run_id)
+    await _block(database, org, run_id, "task", 0, task_id=task_id)
+    root_id = await _linked_task_v2(database, org, run_id)
+    await _map(database, TaskModel, TaskModel.task_id, task_id, error_code_mapping=MATCH_MAPPING)
+    await _map(database, TaskV2Model, TaskV2Model.observer_cruise_id, root_id, error_code_mapping=MATCH_MAPPING)
+    return run_id, task_id, root_id
+
+
+@pytest.mark.asyncio
+async def test_a_mapping_source_switch_never_buys_the_same_execution_a_second_dispatch(
+    database: AgentDB, org: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    matcher = Matcher(MATCHED)
+    monkeypatch.setattr(ffd.app, "DATABASE", database, raising=False)
+    monkeypatch.setattr(ffd.app, "SECONDARY_LLM_API_HANDLER", matcher, raising=False)
+    run_id, task_id, _ = await _workflow_with_both_mappings(database, org)
+    _registered_run_context(monkeypatch, run_id)
+    run = await database.workflow_runs.get_workflow_run(run_id, organization_id=org)
+    assert run is not None
+
+    await ffd.annotate_failed_workflow_run(run, API_503, attempt_number=1, attempt_started_at=None)
+    first = await database.workflow_runs.get_workflow_run(run_id, organization_id=org)
+    # The failing task loses its mapping, so a repeated cleanup now selects the task v2 root's.
+    await _map(database, TaskModel, TaskModel.task_id, task_id, error_code_mapping=None)
+    await ffd.annotate_failed_workflow_run(run, API_503, attempt_number=1, attempt_started_at=None)
+    last = await database.workflow_runs.get_workflow_run(run_id, organization_id=org)
+
+    assert first is not None and last is not None and first.finished_at == last.finished_at
+    assert len(matcher.prompts) == 1 and last.failure_category == first.failure_category
+
+
+OTHER_MAPPING = {"ORDER_REJECTED": "The shop rejected the order"}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("gate", ["claim", "record"])
+@pytest.mark.parametrize("change", ["task-mapping", "task-moved", "root-mapping"])
+async def test_a_mapping_source_changed_just_before_a_guarded_write_neither_dispatches_nor_commits_stale_codes(
+    database: AgentDB, org: str, monkeypatch: pytest.MonkeyPatch, gate: str, change: str
+) -> None:
+    matcher = Matcher(MATCHED)
+    monkeypatch.setattr(ffd.app, "DATABASE", database, raising=False)
+    monkeypatch.setattr(ffd.app, "SECONDARY_LLM_API_HANDLER", matcher, raising=False)
+    run_id, task_id, root_id = await _workflow_with_both_mappings(database, org)
+    _registered_run_context(monkeypatch, run_id)
+    other_run, _ = await _workflow_run(database, org, attempts=1)
+    if change == "root-mapping":
+        await _map(database, TaskModel, TaskModel.task_id, task_id, error_code_mapping=None)
+    run = await database.workflow_runs.get_workflow_run(run_id, organization_id=org)
+    assert run is not None
+
+    async def concurrent_writer() -> None:
+        if change == "task-mapping":
+            await _map(database, TaskModel, TaskModel.task_id, task_id, error_code_mapping=OTHER_MAPPING)
+        elif change == "task-moved":
+            await _map(database, TaskModel, TaskModel.task_id, task_id, workflow_run_id=other_run)
+        else:
+            await _map(database, TaskV2Model, TaskV2Model.observer_cruise_id, root_id, error_code_mapping=OTHER_MAPPING)
+
+    # The writer commits after every read the matcher makes outside the guarded write, right before that write.
+    write = getattr(database.workflow_runs, f"{gate}_final_har_user_match")
+
+    async def gated(*args: Any, **kwargs: Any) -> Any:
+        await concurrent_writer()
+        return await write(*args, **kwargs)
+
+    monkeypatch.setattr(database.workflow_runs, f"{gate}_final_har_user_match", gated)
+
+    await ffd.annotate_failed_workflow_run(run, API_503, attempt_number=1, attempt_started_at=None)
+
+    stored = await database.workflow_runs.get_workflow_run(run_id, organization_id=org)
+    assert stored is not None and _with_final_har_user_errors([], stored.failure_category, 1) == []
+    claims = [c for c in stored.failure_category or [] if c.get("reason_code") == "final_har_user_match"]
+    if gate == "claim":
+        assert matcher.prompts == [] and claims == []
+    else:
+        # The dispatch happened and stays spent; its now-stale codes never land.
+        assert len(matcher.prompts) == 1 and [c["state"] for c in claims] == ["claimed"]
+
+
+FINAL_MATCH = {"reason_code": "final_har_user_match", "identity": {"owner": "wr_x"}, "state": "done", "user_errors": []}
+
+
+@pytest.mark.parametrize(
+    ("stored", "public"),
+    [
+        (None, None),
+        ([], []),
+        ([PRIMARY], [PRIMARY]),
+        ([PRIMARY, FINAL_MATCH], [PRIMARY]),
+        ([FINAL_MATCH], None),
+    ],
+    ids=["null", "empty", "primary", "primary-and-claim", "claim-only"],
+)
+def test_public_workflow_run_serialization_never_carries_the_final_match_bookkeeping(
+    stored: list | None, public: list | None
+) -> None:
+    now = datetime.now(UTC)
+    run = WorkflowRun(
+        workflow_run_id="wr_x",
+        workflow_id="w_x",
+        workflow_permanent_id="wpid_x",
+        organization_id="o_x",
+        status=WorkflowRunStatus.failed,
+        failure_category=stored,
+        created_at=now,
+        modified_at=now,
+    )
+
+    # As the run list routes serialize ``list[WorkflowRun]``.
+    listed = json.loads(TypeAdapter(list[WorkflowRun]).dump_json([run]))[0]
+
+    assert listed["failure_category"] == public
+    # The raw carrier stays readable in process, where the errors[] projection reads it.
+    assert run.failure_category == stored
+
+
+RESULT_MATCH = {**FINAL_MATCH, "user_errors": [{"error_code": "PAYMENT_API_DOWN", "reasoning": "r"}]}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("stored", "public"),
+    [
+        (None, None),
+        ([], []),
+        ([PRIMARY], [PRIMARY]),
+        ([PRIMARY, {**FINAL_MATCH, "state": "claimed"}], [PRIMARY]),
+        ([RESULT_MATCH], None),
+    ],
+    ids=["null", "empty", "primary", "primary-and-claim", "result-only"],
+)
+async def test_the_legacy_runs_route_sends_no_final_match_bookkeeping(
+    monkeypatch: pytest.MonkeyPatch, stored: list | None, public: list | None
+) -> None:
+    now = datetime.now(UTC)
+    run = WorkflowRun(
+        workflow_run_id="wr_x",
+        workflow_id="w_x",
+        workflow_permanent_id="wpid_x",
+        organization_id="o_x",
+        status=WorkflowRunStatus.failed,
+        failure_category=stored,
+        created_at=now,
+        modified_at=now,
+    )
+    monkeypatch.setattr(agent_protocol.analytics, "capture", MagicMock())
+    database = MagicMock(workflow_runs=MagicMock(get_all_runs=AsyncMock(return_value=[run])))
+    monkeypatch.setattr(ffd.app, "DATABASE", database, raising=False)
+    monkeypatch.setattr(ffd.app, "WORKFLOW_SERVICE", MagicMock(_attach_latest_attempt_views=AsyncMock()), raising=False)
+
+    response = await agent_protocol.get_runs(
+        current_org=MagicMock(organization_id="o_x"), page=1, page_size=10, status=None, search_key=None
+    )
+
+    [served] = json.loads(response.body)
+    assert served["workflow_run_id"] == "wr_x" and served["failure_category"] == public
+    assert "final_har_user_match" not in response.body.decode()
+    assert run.failure_category == stored
+
+
+@pytest.mark.asyncio
+async def test_the_configured_match_deadline_expires_and_the_claim_stays_spent(
+    database: AgentDB, org: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(ffd.app, "DATABASE", database, raising=False)
+    # The configured bound, shortened; the handler genuinely outlives it rather than raising.
+    monkeypatch.setattr(ffd, "_USER_MATCH_TIMEOUT_S", 0.05)
+    never = asyncio.Event()
+    prompts: list[str] = []
+
+    async def stalled(*, prompt: str, **_: Any) -> Any:
+        prompts.append(prompt)
+        await never.wait()
+
+    monkeypatch.setattr(ffd.app, "SECONDARY_LLM_API_HANDLER", stalled, raising=False)
+    task_id, _ = await _task(database, org, "failed")
+    await _map(database, TaskModel, TaskModel.task_id, task_id, error_code_mapping=MATCH_MAPPING)
+    task = await database.tasks.get_task(task_id, organization_id=org)
+    assert task is not None
+
+    with skyvern_context.scoped(SkyvernContext(task_id=task_id)):
+        started = asyncio.get_running_loop().time()
+        first = await ffd.annotate_failed_task(task, API_503)
+        elapsed = asyncio.get_running_loop().time() - started
+        second = await ffd.annotate_failed_task(task, API_503)
+
+    assert len(prompts) == 1 and 0.05 <= elapsed < 5 and first.errors == second.errors == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("path", "secondary", "recipient"),
+    [
+        ("task", "owned", "organization"),
+        ("workflow", "owned", "organization"),
+        ("task", None, "platform"),
+        ("task", "unregistered", "platform"),
+        ("task", "foreign", "platform"),
+        ("task", "no-organization", "platform"),
+    ],
+)
+async def test_the_final_match_asks_the_organizations_own_secondary_model(
+    database: AgentDB,
+    org: str,
+    monkeypatch: pytest.MonkeyPatch,
+    path: str,
+    secondary: str | None,
+    recipient: str,
+) -> None:
+    prompts: dict[str, list[str]] = {"platform": [], "organization": []}
+
+    def model(name: str) -> Any:
+        async def answer(*, prompt: str, **_: Any) -> Any:
+            prompts[name].append(prompt)
+            return MATCHED
+
+        return answer
+
+    custom_id = f"ffd_{uuid4().hex[:12]}"
+    owner = f"o_other_{uuid4().hex}" if secondary == "foreign" else org
+    config = CustomLLMConfig(
+        display_name="ffd",
+        provider=CustomLLMProvider.OPENAI_COMPATIBLE,
+        model_name="m",
+        api_base="http://model.invalid",
+        api_key="synthetic-not-a-key",
+    )
+    register_custom_llm_config(custom_id, owner, config)
+    key = {None: None, "unregistered": custom_llm_key(f"{custom_id}_gone")}.get(secondary, custom_llm_key(custom_id))
+    # The model boundary: the real resolver and ownership registry decide which configured key is asked.
+    monkeypatch.setattr(
+        api_handler_factory.LLMAPIHandlerFactory,
+        "get_llm_api_handler",
+        staticmethod(lambda llm_key, *_, **__: model("organization") if llm_key == custom_llm_key(custom_id) else None),
+    )
+    monkeypatch.setattr(ffd.app, "DATABASE", database, raising=False)
+    monkeypatch.setattr(ffd.app, "SECONDARY_LLM_API_HANDLER", model("platform"), raising=False)
+    try:
+        if path == "task":
+            task_id, _ = await _task(database, org, "failed")
+            await _map(database, TaskModel, TaskModel.task_id, task_id, error_code_mapping=MATCH_MAPPING)
+            task = await database.tasks.get_task(task_id, organization_id=org)
+            assert task is not None
+            context = SkyvernContext(
+                task_id=task_id,
+                organization_id=None if secondary == "no-organization" else org,
+                org_default_secondary_llm_key=key,
+            )
+            with skyvern_context.scoped(context):
+                await ffd.annotate_failed_task(task, API_503)
+            stored_task = await database.tasks.get_task(task_id, organization_id=org)
+            assert stored_task is not None
+            matched = [e["error_code"] for e in stored_task.errors or []]
+        else:
+            run_id, task_id, _ = await _workflow_with_both_mappings(database, org)
+            _registered_run_context(monkeypatch, run_id)
+            run = await database.workflow_runs.get_workflow_run(run_id, organization_id=org)
+            assert run is not None
+            context = SkyvernContext(workflow_run_id=run_id, organization_id=org, org_default_secondary_llm_key=key)
+            with skyvern_context.scoped(context):
+                await ffd.annotate_failed_workflow_run(run, API_503, attempt_number=1, attempt_started_at=None)
+            stored_run = await database.workflow_runs.get_workflow_run(run_id, organization_id=org)
+            assert stored_run is not None
+            matched = [e["error_code"] for e in _with_final_har_user_errors([], stored_run.failure_category, 1)]
+    finally:
+        deregister_custom_llm_config(custom_id)
+
+    [prompt] = prompts[recipient]
+    other = "platform" if recipient == "organization" else "organization"
+    assert '"http_status": 503' in prompt and prompts[other] == [] and matched == ["PAYMENT_API_DOWN"]

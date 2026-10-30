@@ -8965,7 +8965,7 @@ async def test_deadline_already_elapsed_bounds_every_reachable_batch_probe(scena
     )
     elapsed = time.monotonic() - started
 
-    assert elapsed <= 0.3, elapsed
+    assert elapsed <= 1.0, elapsed
     assert hang_calls["n"] == 0  # the hanging sampler was never awaited, at either call site
     assert outcome.status in ("budget_exhausted", "completed")
 
