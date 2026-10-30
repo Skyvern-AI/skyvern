@@ -407,7 +407,7 @@ async def _build_status_response(
             Session=released_session_stub(),
             workflows=SimpleNamespace(get_workflow_for_workflow_run=AsyncMock(return_value=workflow)),
             observer=SimpleNamespace(get_task_v2_by_workflow_run_id=AsyncMock(return_value=task_v2)),
-            tasks=SimpleNamespace(get_tasks_by_workflow_run_id=AsyncMock(return_value=[])),
+            tasks=SimpleNamespace(get_tasks_for_workflow_run_status=AsyncMock(return_value=[])),
             workflow_runs=SimpleNamespace(
                 get_workflow_run_parameters=AsyncMock(return_value=[]),
                 get_workflow_run_block_errors=AsyncMock(return_value=[]),
@@ -1393,6 +1393,9 @@ class _NoTasks:
     async def get_tasks_by_workflow_run_id(self, workflow_run_id: str) -> list[Any]:
         return []
 
+    async def get_tasks_for_workflow_run_status(self, workflow_run_id: str) -> list[Any]:
+        return []
+
 
 def _oversized_sheet_rows(cap: int) -> dict[str, Any]:
     """A sheet-read shape: many small rows, each with the per-cell formatting that drives size."""
@@ -1578,7 +1581,7 @@ async def test_run_detail_services_pass_capped_reads_to_real_repositories(
             workflow_run_attempts=make_workflow_run_attempts_fake(),
             observer=observer,
             tasks=SimpleNamespace(
-                get_tasks_by_workflow_run_id=AsyncMock(return_value=[]),
+                get_tasks_for_workflow_run_status=AsyncMock(return_value=[]),
                 get_tasks_actions=AsyncMock(return_value=[]),
             ),
         ),

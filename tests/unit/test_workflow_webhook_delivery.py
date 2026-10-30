@@ -2022,7 +2022,7 @@ async def test_attempt_failure_reason_uses_response_text_cap(
                 get_task_v2_by_workflow_run_id=AsyncMock(return_value=None),
                 get_workflow_run_blocks=AsyncMock(return_value=[]),
             ),
-            tasks=SimpleNamespace(get_tasks_by_workflow_run_id=AsyncMock(return_value=[])),
+            tasks=SimpleNamespace(get_tasks_for_workflow_run_status=AsyncMock(return_value=[])),
             workflow_runs=SimpleNamespace(
                 get_workflow_run_parameters=AsyncMock(return_value=[]),
                 get_workflow_run_block_errors=AsyncMock(return_value=[]),
