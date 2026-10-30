@@ -430,7 +430,7 @@ def _build_block_kwargs(
     block_yaml: BLOCK_YAML_TYPES,
     output_parameter: OutputParameter,
 ) -> dict[str, Any]:
-    return {
+    kwargs: dict[str, Any] = {
         "label": block_yaml.label,
         "next_block_label": block_yaml.next_block_label,
         "output_parameter": output_parameter,
@@ -439,6 +439,10 @@ def _build_block_kwargs(
         "model": block_yaml.model,
         "ignore_workflow_system_prompt": block_yaml.ignore_workflow_system_prompt,
     }
+    for field in ("notes", "trailing_notes", "description"):
+        if field in block_yaml.model_fields_set:
+            kwargs[field] = getattr(block_yaml, field)
+    return kwargs
 
 
 def block_yaml_to_block(

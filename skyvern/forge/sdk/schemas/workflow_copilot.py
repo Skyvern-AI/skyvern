@@ -453,6 +453,11 @@ class WorkflowCopilotChatRequest(BaseModel):
         None,
         description="Per-request code-block authoring selection. Omission means plain non-code Build.",
     )
+    doc_editor_enabled: bool = Field(
+        False,
+        description="Ignored; the server decides from the caller's Doc editor flag.",
+        json_schema_extra={"x-internal": True},
+    )
     cancel_token: str | None = Field(
         None,
         description=(

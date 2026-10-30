@@ -78,7 +78,15 @@ from playwright.async_api import BrowserContext, CDPSession, Download
 from playwright.async_api import Error as PlaywrightError
 from playwright.async_api import Frame, Locator, Page
 from playwright.async_api import TimeoutError as PlaywrightTimeoutError
-from pydantic import BaseModel, Field, PrivateAttr, field_validator, model_validator
+from pydantic import (
+    BaseModel,
+    Field,
+    PrivateAttr,
+    SerializerFunctionWrapHandler,
+    field_validator,
+    model_serializer,
+    model_validator,
+)
 from sqlalchemy.exc import InterfaceError, OperationalError, SQLAlchemyError
 
 from skyvern.config import settings
@@ -1021,6 +1029,24 @@ class Block(BaseModel, abc.ABC):
         description="Optional pointer to the next block label when constructing a DAG. "
         "Defaults to sequential order when omitted.",
     )
+    notes: str | None = Field(
+        default=None,
+        exclude_if=lambda value: value is None,
+        json_schema_extra={"x-internal": True},
+        description="Instructions written above this block; read at run time by this block and the one before it.",
+    )
+    trailing_notes: str | None = Field(
+        default=None,
+        exclude_if=lambda value: value is None,
+        json_schema_extra={"x-internal": True},
+        description="Instructions written after the last block of a sequence; read at run time by this block only.",
+    )
+    description: str | None = Field(
+        default=None,
+        exclude_if=lambda value: value is None,
+        json_schema_extra={"x-internal": True},
+        description="What this block does, for people. Never read by the agent.",
+    )
     block_type: BlockType
     output_parameter: OutputParameter
     continue_on_failure: bool = False
@@ -1050,6 +1076,8 @@ class Block(BaseModel, abc.ABC):
     _output_recorded_this_execution: bool = PrivateAttr(default=False)
     # Fields a model wrote at run time; rendering them as Jinja would let model text read the run's values.
     _prerendered_fields: frozenset[str] = PrivateAttr(default=frozenset())
+    # An inline block a cached step's script starts (ai_validate, ai_prompt) reads that step's notes.
+    _notes_label: str | None = PrivateAttr(default=None)
 
     # Fields this class renders as Jinja. Declared per class; the effective set is the
     # union over the MRO, so a subclass never shadows what its base renders.
@@ -1061,6 +1089,15 @@ class Block(BaseModel, abc.ABC):
 
     def mark_fields_prerendered(self, fields: Iterable[str]) -> None:
         self._prerendered_fields = self._prerendered_fields | frozenset(fields)
+
+    @model_serializer(mode="wrap")
+    def _preserve_explicit_note_clears(self, handler: SerializerFunctionWrapHandler):  # type: ignore[no-untyped-def]
+        data = handler(self)
+        if isinstance(data, dict):
+            for field in ("notes", "trailing_notes", "description"):
+                if field in self.model_fields_set and getattr(self, field) is None:
+                    data[field] = None
+        return data
 
     @classmethod
     def templatable_fields(cls) -> frozenset[str]:
@@ -1708,13 +1745,19 @@ class Block(BaseModel, abc.ABC):
         system default if none is set). The opt-out covers both this workflow's
         prompt and any inherited prompt from parent workflows.
         """
+        notes_section = workflow_run_context.resolve_block_notes_section(self._notes_label or self.label)
         if self.ignore_workflow_system_prompt:
             # Record the opt-out so the script path (``ai_extract``) reads the
             # same decision instead of re-resolving the flag from the
             # definition. See ``WorkflowRunContext.record_block_workflow_system_prompt``.
-            workflow_run_context.record_block_workflow_system_prompt(self.label, None)
+            # Notes belong to the step, not the workflow prompt, so the opt-out keeps them.
+            if notes_section:
+                self.workflow_system_prompt = notes_section
+            workflow_run_context.record_block_workflow_system_prompt(self.label, notes_section)
             return
         resolved = workflow_run_context.resolve_effective_workflow_system_prompt()
+        if notes_section:
+            resolved = "\n\n".join(part for part in (resolved, notes_section) if part)
         if resolved is not None:
             self.workflow_system_prompt = resolved
         workflow_run_context.record_block_workflow_system_prompt(self.label, resolved)
@@ -1762,6 +1805,7 @@ class Block(BaseModel, abc.ABC):
                     "workflow_run_id",
                     "parent_workflow_run_block_id",
                     "label",
+                    "description",
                     "status",
                     "output",
                     "continue_on_failure",
@@ -3871,6 +3915,7 @@ class ForLoopBlock(Block):
             data_schema=data_schema,
             output_parameter=output_param,
         )
+        extraction_block._notes_label = self.label
         extraction_block._exclude_from_engine_ab = True
         extraction_block.mark_internal_evaluation()
         return extraction_block
@@ -4773,6 +4818,7 @@ class WhileLoopBlock(Block):
                 browser_session_id=browser_session_id,
                 workflow_id=self.output_parameter.workflow_id,
                 extraction_description_suffix="while_loop condition",
+                notes_section=workflow_run_context.resolve_block_notes_section(self.label),
             )
             return results[0]
 
@@ -8487,6 +8533,8 @@ async def wrapper({default_args}):
                 if self.ignore_workflow_system_prompt
                 else workflow_run_context.resolve_effective_workflow_system_prompt()
             )
+            if notes_section := workflow_run_context.resolve_block_notes_section(self.label):
+                workflow_system_prompt = "\n\n".join(part for part in (workflow_system_prompt, notes_section) if part)
             task_order, task_retry = await BaseTaskBlock.get_task_order(workflow_run_id, 0)
             # Bound by the global default but never above the org's per-run cap — execute_step gives
             # task.max_steps_per_run precedence over organization.max_steps_per_run.
@@ -19463,6 +19511,7 @@ async def _evaluate_prompt_branch_conditions_batch(
     browser_session_id: str | None,
     workflow_id: str,
     extraction_description_suffix: str = "",
+    notes_section: str | None = None,
 ) -> tuple[list[bool], list[str], str | None, dict | None]:
     if organization_id is None:
         raise ValueError("organization_id is required to evaluate natural language branches")
@@ -19536,6 +19585,8 @@ async def _evaluate_prompt_branch_conditions_batch(
         conditions=rendered_expressions,
         context_json=context_json,
     )
+    if notes_section:
+        extraction_goal = f"{extraction_goal}\n\n{notes_section}"
 
     goal_token_count = count_tokens(extraction_goal)
     if goal_token_count > BRANCH_EVALUATION_GOAL_MAX_TOKENS:
@@ -19743,6 +19794,7 @@ class ConditionalBlock(Block):
             - extraction_goal: The prompt sent to the LLM (for UI display)
             - llm_response: The raw LLM response for debugging
         """
+        workflow_run_context = evaluation_context.workflow_run_context
         return await _evaluate_prompt_branch_conditions_batch(
             log_label=self.label,
             branches=branches,
@@ -19752,6 +19804,9 @@ class ConditionalBlock(Block):
             organization_id=organization_id,
             browser_session_id=browser_session_id,
             workflow_id=self.output_parameter.workflow_id,
+            notes_section=workflow_run_context.resolve_block_notes_section(self.label)
+            if workflow_run_context
+            else None,
             extraction_description_suffix=f"{len(branches)} conditions",
         )
 
@@ -20865,9 +20920,39 @@ BranchCriteriaSubclasses = Union[JinjaBranchCriteria, PromptBranchCriteria]
 BranchCriteriaTypeVar = Annotated[BranchCriteriaSubclasses, Field(discriminator="criteria_type")]
 
 
+def _workflow_block_field(block: Any, field: str) -> Any:
+    return block.get(field) if isinstance(block, Mapping) else getattr(block, field, None)
+
+
+def _copy_workflow_block(block: Any, updates: dict[str, Any]) -> Any:
+    return {**block, **updates} if isinstance(block, Mapping) else block.model_copy(update=updates)
+
+
+def strip_finally_block_references(blocks: Sequence[Any], finally_block_label: str) -> list[Any]:
+    """Remove the finally block and nullify edges that point to it before building the run graph."""
+    result: list[Any] = []
+    for block in blocks:
+        if _workflow_block_field(block, "label") == finally_block_label:
+            continue
+        if _workflow_block_field(block, "block_type") == BlockType.CONDITIONAL:
+            branches = _workflow_block_field(block, "branch_conditions") or []
+            patched_branches = [
+                _copy_workflow_block(branch, {"next_block_label": None})
+                if _workflow_block_field(branch, "next_block_label") == finally_block_label
+                else branch
+                for branch in branches
+            ]
+            if patched_branches != branches:
+                block = _copy_workflow_block(block, {"branch_conditions": patched_branches})
+        if _workflow_block_field(block, "next_block_label") == finally_block_label:
+            block = _copy_workflow_block(block, {"next_block_label": None})
+        result.append(block)
+    return result
+
+
 def resolve_conditional_merge_edges(
-    blocks: list[BlockTypeVar],
-    label_to_block: dict[str, BlockTypeVar],
+    blocks: Sequence[Any],
+    label_to_block: dict[str, Any],
     default_next_map: dict[str, str | None],
 ) -> None:
     """Point each conditional branch chain's terminal block at the conditional's successor (merge point).
@@ -20879,13 +20964,17 @@ def resolve_conditional_merge_edges(
     while changed:
         changed = False
         for block in blocks:
-            if not isinstance(block, ConditionalBlock):
+            if _workflow_block_field(block, "block_type") != BlockType.CONDITIONAL:
                 continue
-            successor = default_next_map.get(block.label)
+            label = _workflow_block_field(block, "label")
+            successor = default_next_map.get(label)
             if not successor:
                 continue
-            for branch in block.ordered_branches:
-                target = branch.next_block_label
+            branches = _workflow_block_field(block, "ordered_branches")
+            if branches is None:
+                branches = _workflow_block_field(block, "branch_conditions") or []
+            for branch in branches:
+                target = _workflow_block_field(branch, "next_block_label")
                 if not target or target == successor:
                     continue
                 cur: str | None = target

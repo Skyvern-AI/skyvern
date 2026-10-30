@@ -8,6 +8,7 @@ browser session.
 from __future__ import annotations
 
 import asyncio
+import copy
 import functools
 import inspect
 import json
@@ -21,6 +22,7 @@ from pydantic import Field
 
 from skyvern.client.errors import BadRequestError, NotFoundError
 from skyvern.forge.sdk.copilot.code_block_steps import derive_code_block_steps
+from skyvern.forge.sdk.workflow.block_notes import block_labels, carry_forward_block_notes
 from skyvern.forge.sdk.workflow.models.parameter import (
     ParameterType,
     WorkflowParameterType,
@@ -63,6 +65,25 @@ _SCREENSHOT_ARTIFACT_ID_KEYS = frozenset({"task_screenshot_artifact_ids", "workf
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
+
+
+def _notes_kept_by_server(json_def: dict[str, Any] | None, yaml_def: str | None, saved: dict[str, Any]) -> list[str]:
+    """Labels whose saved notes or description the server kept because the submitted definition omitted them."""
+    try:
+        submitted = json_def if json_def is not None else safe_load_no_dates(yaml_def or "")
+    except yaml.YAMLError:
+        return []
+    submitted_blocks = (
+        (submitted.get("workflow_definition") or {}).get("blocks") if isinstance(submitted, dict) else None
+    )
+    saved_blocks = (saved.get("workflow_definition") or {}).get("blocks")
+    if not isinstance(submitted_blocks, list) or not isinstance(saved_blocks, list):
+        return []
+    return list(
+        carry_forward_block_notes(
+            copy.deepcopy(submitted_blocks), saved_blocks, same_step_labels=block_labels(submitted_blocks)
+        )
+    )
 
 
 def _serialize_workflow(wf: Any) -> dict[str, Any]:
@@ -2039,6 +2060,12 @@ async def skyvern_workflow_update(
             )
 
     data = _serialize_workflow(workflow)
+    if notes_kept := _notes_kept_by_server(json_def, yaml_def, workflow):
+        data["notes_kept"] = notes_kept
+        data["notes_kept_message"] = (
+            "The definition omitted notes or descriptions on these blocks, so the saved ones were kept. "
+            "To delete one, send the field as null."
+        )
     fmt_label = "json_definition" if json_def is not None else "yaml_definition"
     data["sdk_equivalent"] = f"await skyvern.update_workflow({workflow_id!r}, {fmt_label}=<definition>)"
     if param_warnings:

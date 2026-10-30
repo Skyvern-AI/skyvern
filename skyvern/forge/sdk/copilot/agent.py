@@ -118,10 +118,12 @@ from skyvern.forge.sdk.copilot.context import (
     build_model_safe_global_llm_context,
     clear_proposed_credential,
     coerce_ask_subject,
+    copilot_sees_notes,
     finalize_observation_context,
     model_written_context_fields,
     parsed_ask_refs,
     record_approved_credentials_in_global_llm_context,
+    record_kept_note_texts,
     record_proposed_credential_in_global_llm_context,
     sanitize_global_llm_context_for_prompt,
     skipped_prefix_anchor,
@@ -330,6 +332,14 @@ from skyvern.forge.sdk.schemas.workflow_copilot import (
 )
 from skyvern.forge.sdk.services import google_oauth_service
 from skyvern.forge.sdk.trace import apply_context_attrs, record_span_exception, traced_span
+from skyvern.forge.sdk.workflow.block_notes import (
+    NOTE_FIELDS,
+    block_field_texts,
+    carry_block_notes_from_versions,
+    drop_submitted_note_fields,
+    labels_with_different_notes,
+    stored_notes_for_labels,
+)
 from skyvern.forge.sdk.workflow.exceptions import BaseWorkflowHTTPException
 from skyvern.forge.sdk.workflow.models.workflow import Workflow
 from skyvern.utils.strings import escape_code_fences
@@ -872,6 +882,11 @@ def _transcript_anchor_for_turn(packet: TurnContextPacket | None, chat_history_l
     return packet.transcript_context.earliest_user_turn
 
 
+def _workflow_yaml_for_prompt(ctx: CopilotContext, workflow_yaml: str | None) -> str:
+    safe_yaml = redact_raw_secrets_for_prompt(workflow_yaml or "")
+    return safe_yaml if copilot_sees_notes(ctx) else drop_submitted_note_fields(safe_yaml)
+
+
 def _store_turn_context_packet_on_context(
     ctx: CopilotContext,
     *,
@@ -886,8 +901,8 @@ def _store_turn_context_packet_on_context(
         TurnContextInputs(
             request_policy=request_policy,
             user_message=chat_request.message,
-            workflow_yaml=chat_request.workflow_yaml or "",
-            prior_workflow_yaml=prior_copilot_workflow_yaml or "",
+            workflow_yaml=_workflow_yaml_for_prompt(ctx, chat_request.workflow_yaml),
+            prior_workflow_yaml=_workflow_yaml_for_prompt(ctx, prior_copilot_workflow_yaml),
             prior_run_packet=prior_run_packet,
             chat_history=chat_history,
             attached_files=list(attached_files),
@@ -1808,11 +1823,20 @@ def _draft_ran_on_current_source(facts: NarrativeTurnFacts) -> bool:
 def _review_projection_for(ctx: CopilotContext, proposal_yaml: str | None) -> NarrativeReviewProjection | None:
     if not isinstance(proposal_yaml, str):
         return None
-    return build_review_projection(
+    review = build_review_projection(
         ctx.persisted_workflow_yaml or _EMPTY_REVIEW_BASELINE_YAML,
         proposal_yaml,
         ctx.executed_block_fingerprints,
     )
+    if review is None:
+        return None
+    kept_notes = _kept_unchanged_labels(ctx, proposal_yaml, NOTE_FIELDS)
+    if kept_notes:
+        review["keptNotes"] = kept_notes
+    kept_descriptions = _kept_unchanged_labels(ctx, proposal_yaml, ("description",))
+    if kept_descriptions:
+        review["keptDescriptions"] = kept_descriptions
+    return review
 
 
 def _tested_draft_reply(
@@ -2272,15 +2296,21 @@ def _build_narrative_payload(
     if ctx.demonstration_items:
         payload["demonstrationItems"] = list(ctx.demonstration_items)
     if ctx.staged_workflow_yaml is not None:
-        review = build_review_projection(
-            ctx.persisted_workflow_yaml or _EMPTY_REVIEW_BASELINE_YAML,
-            ctx.staged_workflow_yaml,
-            ctx.executed_block_fingerprints,
-        )
+        review = _review_projection_for(ctx, ctx.staged_workflow_yaml)
         if review is not None:
             payload["review"] = review
     payload["testedBlockFingerprints"] = serialize_execution_receipts(ctx.executed_block_fingerprints)
     return payload
+
+
+def _kept_unchanged_labels(ctx: CopilotContext, proposal_yaml: str, fields: tuple[str, ...]) -> list[str]:
+    # Compared with the kept text itself, which may be an unsaved draft edit rather than the saved row.
+    proposal = block_field_texts(proposal_yaml)
+    return sorted(
+        label
+        for label, kept in ctx.kept_note_labels.items()
+        if any(proposal.get(label, {}).get(key) == text for key, text in kept.items() if key in fields)
+    )
 
 
 def _log_output_policy_parity(ctx: CopilotContext, *, has_workflow_proposal: bool, workflow_attempted: bool) -> None:
@@ -2652,6 +2682,20 @@ _RAW_SECRET_LEAK_REFUSAL = (
     f"credential ID beginning with cred_. {RAW_SECRET_REFUSAL_SENTINEL}."
 )
 _SAVED_DRAFT_OUTPUT_POLICY_SUFFIX = "I only blocked the chat reply; the workflow draft is still saved."
+
+
+def _dropped_notes_message(labels: list[str], *source_yamls: str | None) -> str:
+    """Person-facing note for steps whose notes a replacement dropped, with their text so it can be re-added."""
+    said = "; ".join(
+        f"{label}: " + " / ".join(texts.values())
+        for label, texts in stored_notes_for_labels(labels, *source_yamls).items()
+    )
+    message = f"{', '.join(labels)} had notes and no longer exist, so those notes are gone."
+    if said:
+        message = f"{message} They said: {said}"
+    if contains_internal_machinery_leak(message):
+        return "Some steps that had notes no longer exist, so those notes are gone."
+    return message
 
 
 def _user_owned_goal_notes(kept: list[str], dropped: list[str]) -> list[str]:
@@ -3707,6 +3751,7 @@ async def _translate_to_agent_result(
 
     last_workflow = ctx.last_workflow
     last_workflow_yaml = ctx.last_workflow_yaml
+    dropped_notes_note: str | None = None
 
     if resp_type == "REPLACE_WORKFLOW" and ctx.eval_mode == CopilotEvalMode.BROWSER_ABLATION:
         LOG.warning("copilot browser ablation suppressed inline workflow replacement")
@@ -3813,6 +3858,20 @@ async def _translate_to_agent_result(
             workflow_yaml = goal_carry.workflow_yaml
             for goal_note in _user_owned_goal_notes(goal_carry.kept, goal_carry.dropped):
                 user_response = f"{user_response}\n\n(Note: {goal_note})"
+            if not copilot_sees_notes(ctx):
+                # Without the Doc editor the user cannot see notes, so the saved ones stay untouched.
+                workflow_yaml = drop_submitted_note_fields(workflow_yaml)
+            workflow_yaml, kept_note_labels, dropped_note_labels = carry_block_notes_from_versions(
+                workflow_yaml, ctx.last_workflow_yaml or ctx.workflow_yaml, ctx.persisted_workflow_yaml
+            )
+            # Note text is included only where the person can see it; labels remain useful either way.
+            if dropped_note_labels:
+                note_sources = (
+                    (ctx.last_workflow_yaml or ctx.workflow_yaml, ctx.persisted_workflow_yaml)
+                    if copilot_sees_notes(ctx)
+                    else ()
+                )
+                dropped_notes_note = _dropped_notes_message(dropped_note_labels, *note_sources)
             # Same seam as the update_workflow tool: redact before the row is written and before
             # the draft becomes the anchor, so both are the same string.
             workflow_yaml = redact_credentials_in_workflow_yaml(
@@ -3833,6 +3892,8 @@ async def _translate_to_agent_result(
                     prefer_live_title=ctx.agent_named_title is not None,
                 )
                 last_workflow_yaml = workflow_yaml
+                if copilot_sees_notes(ctx):
+                    record_kept_note_texts(ctx, kept_note_labels, workflow_yaml)
             except (yaml.YAMLError, ValidationError, BaseWorkflowHTTPException) as e:
                 LOG.warning("Failed to process final workflow YAML", error=str(e))
                 user_response = (
@@ -3879,6 +3940,8 @@ async def _translate_to_agent_result(
             else:
                 ctx.last_workflow = last_workflow
                 ctx.last_workflow_yaml = last_workflow_yaml
+                if dropped_notes_note:
+                    user_response = f"{user_response}\n\n(Note: {dropped_notes_note})"
                 ctx.runner_code_block_associations_by_label = runner_code_block_associations(last_workflow_yaml or "")
                 ctx.last_test_ok = None
                 ctx.last_full_workflow_test_ok = False
@@ -5285,6 +5348,7 @@ async def _run_copilot_turn_impl(
         copilot_config=copilot_config,
         target_block_label=getattr(chat_request, "target_block_label", None),
         selected_block_label=getattr(chat_request, "selected_block_label", None),
+        doc_editor_enabled=chat_request.doc_editor_enabled,
         client_supports_credential_pause=getattr(chat_request, "supports_credential_pause", False),
         client_supports_credential_pause_recovery=chat_request.supports_credential_pause_recovery,
         client_supports_credential_generation=chat_request.supports_credential_generation,
@@ -5315,9 +5379,14 @@ async def _run_copilot_turn_impl(
         )
     else:
         await restore_pending_workflow_proposal(ctx)
+    if copilot_sees_notes(ctx) and ctx.workflow_yaml and ctx.workflow_yaml != ctx.staged_workflow_yaml:
+        ctx.workflow_yaml, _, _ = carry_block_notes_from_versions(ctx.workflow_yaml, None, ctx.persisted_workflow_yaml)
+        ctx.unrestored_proposal_note_labels = labels_with_different_notes(
+            ctx.workflow_yaml, ctx.canvas_rejected_proposal_yaml
+        )
     await hydrate_work_plan(ctx)
     chat_request.workflow_yaml = ctx.workflow_yaml or ""
-    safe_workflow_yaml = redact_raw_secrets_for_prompt(ctx.workflow_yaml or "")
+    safe_workflow_yaml = _workflow_yaml_for_prompt(ctx, ctx.workflow_yaml)
     # Before the turn acts: a tool asked to look at ``last_run`` has something to look at from the
     # first call rather than only after this turn has run something itself.
     # The run the caller named wins; a restored candidate's exact run is the fallback.
@@ -5643,7 +5712,7 @@ async def _run_copilot_turn_impl(
         video_attachment_message = build_video_attachment_message(video_evidence)
 
     alias_map = get_skyvern_mcp_alias_map()
-    overlays = _build_skyvern_mcp_overlays(copilot_config.authoring_capability)
+    overlays = _build_skyvern_mcp_overlays(copilot_config.authoring_capability, notes_visible=copilot_sees_notes(ctx))
     registered_mcp_tools = (
         await skyvern_mcp.list_tools(run_middleware=False) if eval_mode == CopilotEvalMode.BROWSER_ABLATION else None
     )
@@ -5726,6 +5795,13 @@ async def _run_copilot_turn_impl(
     if prior_choice_context:
         scoped_global_llm_context = (
             f"{scoped_global_llm_context}\n\nCONNECTED ACCOUNT CHOICE FACTS:\n{prior_choice_context}"
+        ).strip()
+    if ctx.unrestored_proposal_note_labels:
+        scoped_global_llm_context = (
+            f"{scoped_global_llm_context}\n\nPENDING PROPOSAL NOTES FACT:\n"
+            "The canvas differs from the pending proposal, so the proposal was not reused this turn. The workflow "
+            "above has the saved notes, and on these blocks they differ from the proposal's notes: "
+            f"{', '.join(ctx.unrestored_proposal_note_labels)}."
         ).strip()
     if ctx.target_block_label:
         # Defang the user-supplied label before embedding it in the instruction: collapse

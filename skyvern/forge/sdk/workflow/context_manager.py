@@ -53,6 +53,11 @@ from skyvern.forge.sdk.services.credentials import (
     normalize_totp_config,
 )
 from skyvern.forge.sdk.services.onepassword_token_service import resolve_onepassword_token
+from skyvern.forge.sdk.workflow.block_notes import (
+    block_opts_out_of_workflow_prompt,
+    definition_step_notes,
+    format_notes_section,
+)
 from skyvern.forge.sdk.workflow.credential_fetch_outcome import CredentialFetch, record_credential_fetch
 from skyvern.forge.sdk.workflow.credential_selection import select_credential_for_run
 from skyvern.forge.sdk.workflow.exceptions import MissingJinjaVariables, OutputParameterKeyCollisionError
@@ -428,6 +433,9 @@ def _json_leaves(rendered: str) -> list[str] | None:
     return leaves
 
 
+_LOOP_TEMPLATE_KEYS = frozenset({"current_index", "current_item", "current_value"})
+
+
 class WorkflowRunContext:
     attempt_number: int = 1
 
@@ -605,6 +613,7 @@ class WorkflowRunContext:
         # — single source of truth, no re-resolving the opt-out from the
         # workflow definition in two places (SKY-9147).
         self._block_workflow_system_prompts: dict[str, str | None] = {}
+        self._step_notes_by_label: dict[str, str] | None = None
         self.blocks_metadata: dict[str, BlockMetadata] = {}
         # Kept apart from values and blocks_metadata so no template or branch-evaluation snapshot can see it.
         self.block_outcomes: dict[str, BlockOutcome] = {}
@@ -748,6 +757,7 @@ class WorkflowRunContext:
         # definition.
         self._effective_workflow_system_prompt_resolved = False
         self._effective_workflow_system_prompt_cache = None
+        self._step_notes_by_label = None
 
     def get_parameter(self, key: str) -> Parameter:
         return self.parameters[key]
@@ -828,6 +838,69 @@ class WorkflowRunContext:
         if label and label in self._block_workflow_system_prompts:
             return True, self._block_workflow_system_prompts[label]
         return False, None
+
+    def resolve_noted_block_system_prompt(self, label: str | None) -> str | None:
+        """The system prompt the block's non-cached run sends, only when the block has notes; else None."""
+        if not label:
+            return None
+        notes_section = self.resolve_block_notes_section(label)
+        if not notes_section:
+            return None
+        recorded, value = self.get_block_workflow_system_prompt(label)
+        if recorded:
+            return value
+        if self.workflow is not None and block_opts_out_of_workflow_prompt(
+            self.workflow.workflow_definition.blocks, label
+        ):
+            return notes_section
+        return "\n\n".join(part for part in (self.resolve_effective_workflow_system_prompt(), notes_section) if part)
+
+    def resolve_block_notes_section(self, label: str) -> str | None:
+        """Render the notes this block reads; child workflows never inherit them."""
+        if self._step_notes_by_label is None:
+            definition = self.workflow.workflow_definition if self.workflow is not None else None
+            self._step_notes_by_label = definition_step_notes(definition) if definition is not None else {}
+        raw = self._step_notes_by_label.get(label)
+        return format_notes_section(self._render_block_notes(raw, label) if raw else None)
+
+    def _render_block_notes(self, raw: str, label: str) -> str:
+        """Keep page data and credentials unrendered; a note must never fail its step."""
+        if "{" not in raw:
+            return raw
+        try:
+            template = jinja_sandbox_env.from_string(raw)
+            names = jinja2_meta.find_undeclared_variables(jinja_sandbox_env.parse(raw))
+            credential_keys = {
+                key
+                for key, parameter in self.parameters.items()
+                if parameter.parameter_type.is_secret_or_credential()
+                or (isinstance(parameter, WorkflowParameter) and parameter.workflow_parameter_type.is_credential_type())
+            }
+            if names & credential_keys or classify_roots(names, self, label, jinja_sandbox_env):
+                return raw
+            template_data: dict[str, Any] = self.values.copy()
+            template_data.setdefault("workflow_title", self.workflow_title)
+            template_data.setdefault("workflow_id", self.workflow_id)
+            template_data.setdefault("workflow_permanent_id", self.workflow_permanent_id)
+            template_data.setdefault("workflow_run_id", self.workflow_run_id)
+            template_data.setdefault("browser_session_id", self.browser_session_id or "")
+            template_data.setdefault("current_date", datetime.now(timezone.utc).strftime("%Y-%m-%d"))
+            template_data.update(
+                {key: value for key, value in self.get_block_metadata(label).items() if key in _LOOP_TEMPLATE_KEYS}
+            )
+            if names - template_data.keys():
+                return raw
+            rendered = template.render(template_data)
+            register_secret_derived_output(self.secrets, template, raw, template_data, rendered)
+            return rendered.strip() or raw
+        except Exception:
+            LOG.warning(
+                "Block notes did not render; sending them unrendered",
+                block_label=label,
+                workflow_run_id=self.workflow_run_id,
+                exc_info=True,
+            )
+            return raw
 
     def resolve_effective_workflow_system_prompt(self) -> str | None:
         """Return the effective workflow-level system prompt for this run.

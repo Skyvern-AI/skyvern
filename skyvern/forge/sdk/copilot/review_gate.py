@@ -11,6 +11,7 @@ from typing_extensions import NotRequired, TypedDict
 from skyvern.forge.sdk.copilot.data_write_defaults import DATA_WRITE_BLOCK_TYPES
 from skyvern.forge.sdk.copilot.workflow_credential_utils import parse_workflow_yaml, workflow_blocks
 from skyvern.forge.sdk.services import google_drive_service
+from skyvern.forge.sdk.workflow.block_notes import annotate_notes_read, definition_step_notes, strip_inert_block_fields
 from skyvern.schemas.google_sheets import extract_a1_sheet_prefix, extract_spreadsheet_id
 from skyvern.schemas.workflows import BlockType, FileStorageType
 
@@ -42,6 +43,8 @@ class NarrativeDuplicateWrite(TypedDict):
 class NarrativeReviewProjection(TypedDict):
     blocks: list[NarrativeReviewBlock]
     duplicateWrites: list[NarrativeDuplicateWrite]
+    keptNotes: NotRequired[list[str]]
+    keptDescriptions: NotRequired[list[str]]
 
 
 def _block_type(block: Mapping[str, Any]) -> str:
@@ -214,8 +217,24 @@ def _without_code_steps(value: Any) -> Any:
     return value
 
 
-def _comparison_value(block: Mapping[str, Any]) -> dict[str, Any]:
-    return {key: value for key, value in _without_code_steps(block).items() if key not in _IGNORED_COMPARISON_KEYS}
+def _execution_view(block: Mapping[str, Any], notes_by_label: Mapping[str, str]) -> dict[str, Any]:
+    """The block as a run sees it: without the people-only description, with the notes it reads."""
+    view = strip_inert_block_fields(block)
+    annotate_notes_read([view], notes_by_label)
+    return view
+
+
+def _workflow_step_notes(parsed: Mapping[str, Any]) -> dict[str, str]:
+    definition = parsed.get("workflow_definition")
+    return definition_step_notes(definition) if isinstance(definition, dict) else {}
+
+
+def _comparison_value(block: Mapping[str, Any], notes_by_label: Mapping[str, str]) -> dict[str, Any]:
+    return {
+        key: value
+        for key, value in _without_code_steps(_execution_view(block, notes_by_label)).items()
+        if key not in _IGNORED_COMPARISON_KEYS
+    }
 
 
 def _workflow_execution_inputs(parsed: Mapping[str, Any]) -> dict[str, Any]:
@@ -244,12 +263,16 @@ def _workflow_execution_inputs(parsed: Mapping[str, Any]) -> dict[str, Any]:
     }
 
 
-def _block_fingerprint(block: Mapping[str, Any], workflow_execution_inputs: Mapping[str, Any]) -> str:
+def _block_fingerprint(
+    block: Mapping[str, Any], workflow_execution_inputs: Mapping[str, Any], notes_by_label: Mapping[str, str]
+) -> str:
     # Ignore only the indexed block's own label. Nested labels and control-flow
     # links remain part of the exact version that a run exercised.
     value = {
         "block": {
-            key: item for key, item in _without_code_steps(block).items() if key not in _IGNORED_FINGERPRINT_KEYS
+            key: item
+            for key, item in _without_code_steps(_execution_view(block, notes_by_label)).items()
+            if key not in _IGNORED_FINGERPRINT_KEYS
         },
         "workflowExecutionInputs": workflow_execution_inputs,
     }
@@ -286,7 +309,8 @@ def workflow_block_fingerprints(workflow_yaml: str) -> dict[str, set[str]]:
         return {}
     blocks, _ = indexed
     execution_inputs = _workflow_execution_inputs(parsed)
-    return {block["label"]: {_block_fingerprint(block, execution_inputs)} for block in blocks}
+    notes_by_label = _workflow_step_notes(parsed)
+    return {block["label"]: {_block_fingerprint(block, execution_inputs, notes_by_label)} for block in blocks}
 
 
 def serialize_execution_receipts(receipts: Mapping[str, Collection[str]]) -> dict[str, list[str]]:
@@ -369,8 +393,10 @@ def build_review_projection(
     persisted_execution_inputs = _workflow_execution_inputs(persisted)
     staged_execution_inputs = _workflow_execution_inputs(staged)
     execution_inputs_unchanged = persisted_execution_inputs == staged_execution_inputs
+    persisted_notes = _workflow_step_notes(persisted)
+    staged_notes = _workflow_step_notes(staged)
     staged_fingerprints = {
-        block["label"]: _block_fingerprint(block, staged_execution_inputs) for block in staged_blocks
+        block["label"]: _block_fingerprint(block, staged_execution_inputs, staged_notes) for block in staged_blocks
     }
 
     if isinstance(executed_blocks, Mapping):
@@ -398,7 +424,7 @@ def build_review_projection(
             change: ReviewChange = "added"
         elif (
             execution_inputs_unchanged
-            and _comparison_value(prior) == _comparison_value(block)
+            and _comparison_value(prior, persisted_notes) == _comparison_value(block, staged_notes)
             and persisted_positions[label] == staged_positions[label]
             and _next_common_label(prior, persisted_by_label, common_labels)
             == _next_common_label(block, staged_by_label, common_labels)

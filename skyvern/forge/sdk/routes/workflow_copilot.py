@@ -3726,7 +3726,12 @@ async def workflow_copilot_chat_post(
     request: Request,
     chat_request: WorkflowCopilotChatRequest,
     organization: Organization = Depends(org_auth_service.get_current_org),
+    current_user_id: str | None = Depends(org_auth_service.get_current_user_id_or_none),
 ) -> EventSourceResponse:
+    # The client's value is accepted for old clients and never trusted: notes reach Copilot on the server's word.
+    chat_request.doc_editor_enabled = await app.AGENT_FUNCTION.workflow_doc_editor_enabled(
+        organization.organization_id, current_user_id
+    )
     eval_llm_overrides = admit_eval_llm_overrides(
         request.headers.get(EVAL_LLM_OVERRIDES_HEADER), organization.organization_id
     )

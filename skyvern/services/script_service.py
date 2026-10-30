@@ -40,6 +40,7 @@ from skyvern.exceptions import (
     ScriptTerminationException,
     StepTerminationError,
     TaskNotFound,
+    WorkflowRunContextNotInitialized,
     WorkflowRunNotFound,
 )
 from skyvern.forge import app
@@ -75,6 +76,7 @@ from skyvern.forge.sdk.models import Step, StepStatus
 from skyvern.forge.sdk.schemas.files import FileInfo
 from skyvern.forge.sdk.schemas.tasks import Task, TaskOutput, TaskStatus
 from skyvern.forge.sdk.schemas.workflow_runs import WorkflowRunBlock
+from skyvern.forge.sdk.workflow.block_notes import strip_inert_block_fields
 from skyvern.forge.sdk.workflow.code_block_safety import is_safe_script_code
 from skyvern.forge.sdk.workflow.context_manager import BlockMetadata, register_secret_derived_output
 from skyvern.forge.sdk.workflow.exceptions import (
@@ -122,6 +124,7 @@ from skyvern.forge.sdk.workflow.models.parameter import (
     ParameterType,
 )
 from skyvern.forge.sdk.workflow.models.workflow import Workflow, is_adaptive_caching
+from skyvern.forge.sdk.workflow.page_derived_templates import loop_source_is_page_derived
 from skyvern.schemas.emails import EmailBodyFormat, EmailTransport
 from skyvern.schemas.runs import RunEngine
 from skyvern.schemas.scripts import (
@@ -649,6 +652,21 @@ def _build_fallback_navigation_payload(context: skyvern_context.SkyvernContext) 
     return payload or None
 
 
+def _noted_block_system_prompt(workflow_run_id: str, label: str | None) -> str | None:
+    """Without notes the cached task keeps no system prompt, as before notes existed."""
+    try:
+        workflow_run_context = app.WORKFLOW_CONTEXT_MANAGER.get_workflow_run_context(workflow_run_id)
+        return workflow_run_context.resolve_noted_block_system_prompt(label)
+    except WorkflowRunContextNotInitialized:
+        return None
+    except Exception:
+        # A prompt that fails to render must not turn into a missing task/step row, which skips credit admission.
+        LOG.warning(
+            "Failed to resolve block notes system prompt", workflow_run_id=workflow_run_id, label=label, exc_info=True
+        )
+        return None
+
+
 async def _create_workflow_block_run_and_task(
     block_type: BlockType,
     prompt: str | None = None,
@@ -674,6 +692,10 @@ async def _create_workflow_block_run_and_task(
     if context.parent_workflow_run_block_id and context.loop_metadata and label:
         workflow_run_context = app.WORKFLOW_CONTEXT_MANAGER.get_workflow_run_context(workflow_run_id)
         workflow_run_context.update_block_metadata(label, context.loop_metadata)
+        if context.active_loop_label in workflow_run_context.page_derived_loop_labels:
+            workflow_run_context.page_derived_loop_labels.add(label)
+        else:
+            workflow_run_context.page_derived_loop_labels.discard(label)
 
     current_value_str = None
     current_index_val = None
@@ -742,6 +764,7 @@ async def _create_workflow_block_run_and_task(
                 model=model,
                 # always use the action history for validation in caching/script run
                 include_action_history_in_verification=True,
+                workflow_system_prompt=_noted_block_system_prompt(workflow_run_id, label),
             )
 
             task_id = task.task_id
@@ -2248,7 +2271,7 @@ async def _get_block_definition_by_label(
     final_dump = None
     for block in workflow.workflow_definition.blocks:
         if block.label == label:
-            final_dump = block.model_dump()
+            final_dump = strip_inert_block_fields(block.model_dump())
             break
     if not final_dump:
         return None
@@ -2465,6 +2488,7 @@ async def run_task(
         # set the prompt in the RunContext
         context = skyvern_context.ensure_context()
         context.prompt = prompt
+        context.cached_block_label = block_label
         try:
             # Navigate to the target URL before running cached code, just like
             # NavigationBlock does in the non-cached path.
@@ -2509,6 +2533,7 @@ async def run_task(
         finally:
             # clear the prompt in the RunContext
             context.prompt = None
+            context.cached_block_label = None
             _clear_cached_block_overrides(cache_key)
     else:
         block_validation_output = await _validate_and_get_output_parameter(label)
@@ -2755,6 +2780,7 @@ async def download(
 
         # set the prompt in the RunContext
         context.prompt = navigation_prompt
+        context.cached_block_label = cache_key
         download_run_id = resolve_run_download_id(context, fallback_run_id=context.workflow_run_id or "") or (
             context.workflow_run_id or ""
         )
@@ -3156,6 +3182,7 @@ async def download(
                     raise
         finally:
             context.prompt = None
+            context.cached_block_label = None
             context.download_suffix = previous_download_suffix
             _clear_cached_block_overrides(cache_key)
     else:
@@ -3220,6 +3247,7 @@ async def action(
         # set the prompt in the RunContext
         context = skyvern_context.ensure_context()
         context.prompt = prompt
+        context.cached_block_label = cache_key
 
         try:
             await _prepare_cached_block_inputs(cache_key, prompt)
@@ -3256,6 +3284,7 @@ async def action(
             _raise_if_browser_connection_lost(fallback_status)
         finally:
             context.prompt = None
+            context.cached_block_label = None
             _clear_cached_block_overrides(cache_key)
     else:
         block_validation_output = await _validate_and_get_output_parameter(label)
@@ -3318,6 +3347,7 @@ async def login(
         # set the prompt in the RunContext
         context = skyvern_context.ensure_context()
         context.prompt = prompt
+        context.cached_block_label = cache_key
         try:
             await _prepare_cached_block_inputs(cache_key, prompt)
             await _run_cached_function(cached_fn)
@@ -3352,6 +3382,7 @@ async def login(
             _raise_if_browser_connection_lost(fallback_status)
         finally:
             context.prompt = None
+            context.cached_block_label = None
             _clear_cached_block_overrides(cache_key)
     else:
         block_validation_output = await _validate_and_get_output_parameter(label)
@@ -3406,6 +3437,7 @@ async def extract(
         # set the prompt in the RunContext
         context = skyvern_context.ensure_context()
         context.prompt = prompt
+        context.cached_block_label = cache_key
         try:
             output = cast(dict[str, Any] | list | str | None, await _run_cached_function(cached_fn))
 
@@ -3437,6 +3469,7 @@ async def extract(
             raise
         finally:
             context.prompt = None
+            context.cached_block_label = None
     else:
         block_validation_output = await _validate_and_get_output_parameter(label)
         extraction_block = ExtractionBlock(
@@ -3549,6 +3582,7 @@ async def execute_validation(
     error_code_mapping: dict[str, str] | None,
     label: str | None = None,
     model: dict[str, Any] | None = None,
+    notes_label: str | None = None,
 ) -> BlockResult:
     block_validation_output = await _validate_and_get_output_parameter(label)
     validation_block = ValidationBlock(
@@ -3562,6 +3596,7 @@ async def execute_validation(
         max_steps_per_run=2,
         model=model,
     )
+    validation_block._notes_label = notes_label
     result = await validation_block.execute_safe(
         workflow_run_id=block_validation_output.workflow_run_id,
         parent_workflow_run_block_id=block_validation_output.context.parent_workflow_run_block_id,
@@ -4325,6 +4360,7 @@ async def prompt(
     label: str | None = None,
     parameters: list[str] | None = None,
     model: dict[str, Any] | None = None,
+    notes_label: str | None = None,
 ) -> dict[str, Any] | list | str | None:
     block_validation_output = await _validate_and_get_output_parameter(label, parameters)
     prompt = _render_template_with_label(prompt, label)
@@ -4336,6 +4372,7 @@ async def prompt(
         parameters=block_validation_output.input_parameters,
         model=model,
     )
+    prompt_block._notes_label = notes_label
     result = await prompt_block.execute_safe(
         workflow_run_id=block_validation_output.workflow_run_id,
         parent_workflow_run_block_id=block_validation_output.context.parent_workflow_run_block_id,
@@ -4351,7 +4388,13 @@ async def prompt(
     return result.output_parameter_value
 
 
-_LoopState = tuple[str | None, dict[str, Any] | None, dict[str, Any] | None, list[list[dict[str, Any]]] | None]
+_LoopState = tuple[
+    str | None,
+    dict[str, Any] | None,
+    dict[str, Any] | None,
+    list[list[dict[str, Any]]] | None,
+    str | None,
+]
 
 
 def _capture_loop_state(context: skyvern_context.SkyvernContext) -> _LoopState:
@@ -4360,6 +4403,7 @@ def _capture_loop_state(context: skyvern_context.SkyvernContext) -> _LoopState:
         context.loop_metadata,
         context.loop_internal_state,
         context.loop_output_values,
+        context.active_loop_label,
     )
 
 
@@ -4380,6 +4424,7 @@ def _restore_loop_state(
         context.loop_metadata,
         context.loop_internal_state,
         context.loop_output_values,
+        context.active_loop_label,
     ) = previous
     # A nested loop's output is one entry of the enclosing iteration, as ForLoopBlock.execute records it.
     _append_to_loop_output(finished_loop_output, label, output_parameter=output_parameter)
@@ -4461,10 +4506,23 @@ async def loop(
         )
         return
 
+    loop_is_page_derived = loop_source_is_page_derived(
+        loop_values,
+        loop_variable_reference,
+        workflow_run_context,
+        block_validation_output.label,
+        jinja_sandbox_env,
+    )
+    if loop_is_page_derived:
+        workflow_run_context.page_derived_loop_labels.add(block_validation_output.label)
+    else:
+        workflow_run_context.page_derived_loop_labels.discard(block_validation_output.label)
+
     # register the loop in the global context
     previous_loop_state = _capture_loop_state(block_validation_output.context)
     block_validation_output.context.parent_workflow_run_block_id = workflow_run_block_id
     block_validation_output.context.loop_output_values = []
+    block_validation_output.context.active_loop_label = block_validation_output.label
 
     # step 5. start the loop
     try:
@@ -4590,6 +4648,7 @@ async def while_loop(
     previous_loop_state = _capture_loop_state(block_validation_output.context)
     block_validation_output.context.parent_workflow_run_block_id = workflow_run_block_id
     block_validation_output.context.loop_output_values = []
+    block_validation_output.context.active_loop_label = block_validation_output.label
 
     loop_idx = 0
     try:

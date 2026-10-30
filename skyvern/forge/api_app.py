@@ -200,6 +200,19 @@ class ExecutionDatePlugin(Plugin):
         return datetime.now()
 
 
+def strip_internal_schema_properties(openapi_schema: dict) -> None:
+    """Drop component properties marked ``x-internal`` so they stay out of the public docs and the SDK."""
+    for schema in openapi_schema.get("components", {}).get("schemas", {}).values():
+        properties = schema.get("properties")
+        if not properties:
+            continue
+        internal = [name for name, prop in properties.items() if isinstance(prop, dict) and prop.get("x-internal")]
+        for name in internal:
+            del properties[name]
+        if internal and "required" in schema:
+            schema["required"] = [name for name in schema["required"] if name not in internal]
+
+
 def custom_openapi(app: FastAPI) -> dict:
     if app.openapi_schema:
         return app.openapi_schema
@@ -214,6 +227,7 @@ def custom_openapi(app: FastAPI) -> dict:
         {"url": "https://api-staging.skyvern.com", "x-fern-server-name": "Staging"},
         {"url": "http://localhost:8000", "x-fern-server-name": "Local"},
     ]
+    strip_internal_schema_properties(openapi_schema)
     app.openapi_schema = openapi_schema
     return app.openapi_schema
 

@@ -3122,6 +3122,11 @@ class AgentFunction:
         del organization_id
         return False
 
+    async def workflow_doc_editor_enabled(self, organization_id: str, user_id: str | None) -> bool:
+        """Whether this person has the Doc editor, which decides if notes reach Copilot and PDF import."""
+        del organization_id, user_id
+        return False
+
     async def _resolve_copilot_requested_code_block_mode(
         self,
         organization_id: str | None,

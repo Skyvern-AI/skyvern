@@ -130,6 +130,7 @@ from skyvern.forge.sdk.copilot.context import (
     CopilotTestInput,
     PageObstruction,
     SkippedPrefixBlock,
+    copilot_sees_notes,
     upsert_narrative_block_attempt,
 )
 from skyvern.forge.sdk.copilot.cost_telemetry import exclude_workflow_block_cost
@@ -263,6 +264,7 @@ from skyvern.forge.sdk.schemas.workflow_runs import WorkflowRunBlock
 from skyvern.forge.sdk.services.request_principal import get_request_principal, requesting_user_id
 from skyvern.forge.sdk.settings_manager import SettingsManager
 from skyvern.forge.sdk.utils.pdf_parser import extract_pdf_file
+from skyvern.forge.sdk.workflow.block_notes import drop_submitted_note_fields
 from skyvern.forge.sdk.workflow.models.block import (
     BlockTypeVar,
     CodeBlock,
@@ -7962,6 +7964,8 @@ def build_test_evidence_packet(
         workflow_yaml = result.execution.workflow_yaml
         workflow_source = f"{result.execution.snapshot.provenance}_execution_snapshot"
     workflow_yaml = strip_copilot_yaml_headers(workflow_yaml)
+    if workflow_yaml is not None and not copilot_sees_notes(copilot_ctx):
+        workflow_yaml = drop_submitted_note_fields(workflow_yaml)
     if workflow_yaml is None:
         omission_notices.append(
             "canonical_workflow_yaml omitted: no accepted or turn-start persistence readback exists."
