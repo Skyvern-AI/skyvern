@@ -18156,7 +18156,7 @@
           },
           "loop_blocks": {
             "items": {
-              "anyOf": [
+              "oneOf": [
                 {
                   "$ref": "#/components/schemas/TaskBlockYAML"
                 },
@@ -18259,7 +18259,46 @@
                 {
                   "$ref": "#/components/schemas/GoogleSheetsWriteBlockYAML"
                 }
-              ]
+              ],
+              "discriminator": {
+                "propertyName": "block_type",
+                "mapping": {
+                  "action": "#/components/schemas/ActionBlockYAML",
+                  "agent_step": "#/components/schemas/AgentStepBlockYAML",
+                  "code": "#/components/schemas/CodeBlockYAML",
+                  "conditional": "#/components/schemas/ConditionalBlockYAML",
+                  "data_export": "#/components/schemas/DataExportBlockYAML",
+                  "download_to_s3": "#/components/schemas/DownloadToS3BlockYAML",
+                  "email_inbox": "#/components/schemas/EmailInboxBlockYAML",
+                  "extraction": "#/components/schemas/ExtractionBlockYAML",
+                  "file_download": "#/components/schemas/FileDownloadBlockYAML",
+                  "file_upload": "#/components/schemas/FileUploadBlockYAML",
+                  "file_url_parser": "#/components/schemas/FileParserBlockYAML",
+                  "for_loop": "#/components/schemas/ForLoopBlockYAML",
+                  "google_sheets_read": "#/components/schemas/GoogleSheetsReadBlockYAML",
+                  "google_sheets_write": "#/components/schemas/GoogleSheetsWriteBlockYAML",
+                  "goto_url": "#/components/schemas/UrlBlockYAML",
+                  "http_request": "#/components/schemas/HttpRequestBlockYAML",
+                  "human_interaction": "#/components/schemas/HumanInteractionBlockYAML",
+                  "login": "#/components/schemas/LoginBlockYAML",
+                  "navigation": "#/components/schemas/NavigationBlockYAML",
+                  "pdf_fill": "#/components/schemas/PdfFillBlockYAML",
+                  "pdf_parser": "#/components/schemas/PDFParserBlockYAML",
+                  "print_page": "#/components/schemas/PrintPageBlockYAML",
+                  "send_email": "#/components/schemas/SendEmailBlockYAML",
+                  "split_pdf": "#/components/schemas/SplitPdfBlockYAML",
+                  "task": "#/components/schemas/TaskBlockYAML",
+                  "task_v2": "#/components/schemas/TaskV2BlockYAML",
+                  "terminate": "#/components/schemas/TerminateBlockYAML",
+                  "text_prompt": "#/components/schemas/TextPromptBlockYAML",
+                  "upload_to_s3": "#/components/schemas/UploadToS3BlockYAML",
+                  "validation": "#/components/schemas/ValidationBlockYAML",
+                  "wait": "#/components/schemas/WaitBlockYAML",
+                  "web_search": "#/components/schemas/WebSearchBlockYAML",
+                  "while_loop": "#/components/schemas/WhileLoopBlockYAML",
+                  "workflow_trigger": "#/components/schemas/WorkflowTriggerBlockYAML"
+                }
+              }
             },
             "type": "array",
             "title": "Loop Blocks"
@@ -30631,7 +30670,7 @@
           },
           "loop_blocks": {
             "items": {
-              "anyOf": [
+              "oneOf": [
                 {
                   "$ref": "#/components/schemas/TaskBlockYAML"
                 },
@@ -30734,7 +30773,46 @@
                 {
                   "$ref": "#/components/schemas/GoogleSheetsWriteBlockYAML"
                 }
-              ]
+              ],
+              "discriminator": {
+                "propertyName": "block_type",
+                "mapping": {
+                  "action": "#/components/schemas/ActionBlockYAML",
+                  "agent_step": "#/components/schemas/AgentStepBlockYAML",
+                  "code": "#/components/schemas/CodeBlockYAML",
+                  "conditional": "#/components/schemas/ConditionalBlockYAML",
+                  "data_export": "#/components/schemas/DataExportBlockYAML",
+                  "download_to_s3": "#/components/schemas/DownloadToS3BlockYAML",
+                  "email_inbox": "#/components/schemas/EmailInboxBlockYAML",
+                  "extraction": "#/components/schemas/ExtractionBlockYAML",
+                  "file_download": "#/components/schemas/FileDownloadBlockYAML",
+                  "file_upload": "#/components/schemas/FileUploadBlockYAML",
+                  "file_url_parser": "#/components/schemas/FileParserBlockYAML",
+                  "for_loop": "#/components/schemas/ForLoopBlockYAML",
+                  "google_sheets_read": "#/components/schemas/GoogleSheetsReadBlockYAML",
+                  "google_sheets_write": "#/components/schemas/GoogleSheetsWriteBlockYAML",
+                  "goto_url": "#/components/schemas/UrlBlockYAML",
+                  "http_request": "#/components/schemas/HttpRequestBlockYAML",
+                  "human_interaction": "#/components/schemas/HumanInteractionBlockYAML",
+                  "login": "#/components/schemas/LoginBlockYAML",
+                  "navigation": "#/components/schemas/NavigationBlockYAML",
+                  "pdf_fill": "#/components/schemas/PdfFillBlockYAML",
+                  "pdf_parser": "#/components/schemas/PDFParserBlockYAML",
+                  "print_page": "#/components/schemas/PrintPageBlockYAML",
+                  "send_email": "#/components/schemas/SendEmailBlockYAML",
+                  "split_pdf": "#/components/schemas/SplitPdfBlockYAML",
+                  "task": "#/components/schemas/TaskBlockYAML",
+                  "task_v2": "#/components/schemas/TaskV2BlockYAML",
+                  "terminate": "#/components/schemas/TerminateBlockYAML",
+                  "text_prompt": "#/components/schemas/TextPromptBlockYAML",
+                  "upload_to_s3": "#/components/schemas/UploadToS3BlockYAML",
+                  "validation": "#/components/schemas/ValidationBlockYAML",
+                  "wait": "#/components/schemas/WaitBlockYAML",
+                  "web_search": "#/components/schemas/WebSearchBlockYAML",
+                  "while_loop": "#/components/schemas/WhileLoopBlockYAML",
+                  "workflow_trigger": "#/components/schemas/WorkflowTriggerBlockYAML"
+                }
+              }
             },
             "type": "array",
             "title": "Loop Blocks"
