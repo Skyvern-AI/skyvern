@@ -723,3 +723,158 @@ describe("FileDownloadBlock SFTP source round trip", () => {
     expect(exportedBlock).not.toHaveProperty("sftp_remote_path");
   });
 });
+
+describe("block note metadata round trip", () => {
+  test("preserves notes and explicit clears through editor serialization", () => {
+    const noted = {
+      ...minimalTaskBlock(),
+      notes: "Read the saved plan first.",
+      trailing_notes: "Stop after confirming the result.",
+      description: "Only for the workflow author.",
+    } as WorkflowBlock;
+    const oldVersion = {
+      ...minimalTaskBlock(),
+      label: "old_version",
+    } as WorkflowBlock;
+    const { nodes, edges } = getElements([noted, oldVersion], SETTINGS, false);
+    const saved = getWorkflowBlocks(nodes, edges);
+
+    expect(saved.find((block) => block.label === "b1")).toMatchObject({
+      notes: "Read the saved plan first.",
+      trailing_notes: "Stop after confirming the result.",
+      description: "Only for the workflow author.",
+    });
+    const savedOldVersion = saved.find(
+      (block) => block.label === "old_version",
+    );
+    expect(savedOldVersion).toBeDefined();
+    for (const key of ["notes", "trailing_notes", "description"] as const) {
+      expect(savedOldVersion).not.toHaveProperty(key);
+    }
+  });
+
+  test.each([
+    [
+      "for_loop",
+      {
+        block_type: "for_loop",
+        loop_over: { key: "items" },
+        loop_variable_reference: "item",
+        complete_if_empty: false,
+        data_schema: null,
+      },
+    ],
+    [
+      "while_loop",
+      {
+        block_type: "while_loop",
+        condition: {
+          criteria_type: "jinja2_template",
+          expression: "{{ true }}",
+          description: null,
+        },
+      },
+    ],
+  ])("preserves metadata on %s blocks", (_type, typeFields) => {
+    const loop = {
+      label: "loop",
+      continue_on_failure: false,
+      next_loop_on_failure: false,
+      model: null,
+      ignore_workflow_system_prompt: false,
+      loop_blocks: [],
+      notes: "Use the saved notes.",
+      trailing_notes: "Finish after this loop.",
+      description: "Loop description.",
+      ...typeFields,
+    } as unknown as WorkflowBlock;
+    const { nodes, edges } = getElements([loop], SETTINGS, false);
+
+    expect(getWorkflowBlocks(nodes, edges)[0]).toMatchObject({
+      notes: "Use the saved notes.",
+      trailing_notes: "Finish after this loop.",
+      description: "Loop description.",
+    });
+  });
+
+  test("preserves conditional note metadata through save and copy/export serialization", () => {
+    const loopChild = {
+      ...minimalTaskBlock(),
+      label: "loop_child",
+      notes: "Read the loop value.",
+      trailing_notes: "Finish the loop step.",
+      description: "Loop child description.",
+    } as WorkflowBlock;
+    const conditional = {
+      block_type: "conditional",
+      label: "branch",
+      continue_on_failure: false,
+      next_block_label: null,
+      branch_conditions: [],
+      notes: "Read the plan before evaluating this branch.",
+      trailing_notes: "Confirm the selected path.",
+      description: "Only for the workflow author.",
+      model: null,
+      ignore_workflow_system_prompt: false,
+    } as unknown as WorkflowBlock;
+    const loop = {
+      block_type: "for_loop",
+      label: "loop",
+      continue_on_failure: false,
+      next_block_label: null,
+      loop_over: { key: "items" },
+      loop_variable_reference: null,
+      complete_if_empty: false,
+      data_schema: null,
+      loop_blocks: [loopChild],
+      model: null,
+      ignore_workflow_system_prompt: false,
+    } as unknown as WorkflowBlock;
+    const { nodes, edges } = getElements([conditional], SETTINGS, false);
+    const copiedBlocks = convert({
+      workflow_definition: {
+        version: 1,
+        parameters: [],
+        blocks: [conditional, loop],
+      },
+    } as unknown as WorkflowApiResponse).workflow_definition.blocks;
+
+    expect(getWorkflowBlocks(nodes, edges)[0]).toMatchObject({
+      notes: "Read the plan before evaluating this branch.",
+      trailing_notes: "Confirm the selected path.",
+      description: "Only for the workflow author.",
+    });
+    const [copiedConditional, copiedLoop] = copiedBlocks;
+    expect(copiedConditional).toMatchObject({
+      notes: "Read the plan before evaluating this branch.",
+      trailing_notes: "Confirm the selected path.",
+      description: "Only for the workflow author.",
+    });
+    expect(copiedLoop?.block_type).toBe("for_loop");
+    if (copiedLoop?.block_type === "for_loop") {
+      expect(copiedLoop.loop_blocks[0]).toMatchObject({
+        notes: "Read the loop value.",
+        trailing_notes: "Finish the loop step.",
+        description: "Loop child description.",
+      });
+    }
+  });
+
+  test("clears absent conditional note metadata when serializing a restored version", () => {
+    const conditional = {
+      block_type: "conditional",
+      label: "branch",
+      continue_on_failure: false,
+      next_block_label: null,
+      branch_conditions: [],
+      model: null,
+      ignore_workflow_system_prompt: false,
+    } as unknown as WorkflowBlock;
+    const { nodes, edges } = getElements([conditional], SETTINGS, false);
+
+    const saved = getWorkflowBlocks(nodes, edges)[0];
+    for (const key of ["notes", "trailing_notes", "description"] as const) {
+      expect(saved).not.toHaveProperty(key);
+    }
+  });
+});

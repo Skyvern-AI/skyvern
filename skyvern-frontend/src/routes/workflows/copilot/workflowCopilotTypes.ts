@@ -200,6 +200,8 @@ export interface WorkflowCopilotChatRequest {
   workflow_yaml: string;
   mode?: "build" | null;
   code_block?: boolean | null;
+  /** Internal capability: send only when the document editor is active. */
+  doc_editor_enabled?: boolean;
   cancel_token?: string;
   idempotency_key?: string | null;
   target_block_label?: string | null;

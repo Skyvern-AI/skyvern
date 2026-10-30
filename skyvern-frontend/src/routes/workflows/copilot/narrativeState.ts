@@ -302,6 +302,10 @@ export interface ReviewProjection {
     blockType: string;
     blockLabels: string[];
   }>;
+  // Blocks whose saved notes Copilot's YAML left out, so the saved notes were kept.
+  keptNotes?: string[];
+  // The same for descriptions.
+  keptDescriptions?: string[];
 }
 
 export interface BlockState {
@@ -1967,7 +1971,16 @@ function parseReviewProjection(raw: unknown): ReviewProjection | null {
       blockLabels: group.blockLabels,
     });
   }
-  return { blocks, duplicateWrites };
+  const labels = (raw: unknown): string[] =>
+    Array.isArray(raw)
+      ? raw.filter((label): label is string => typeof label === "string")
+      : [];
+  return {
+    blocks,
+    duplicateWrites,
+    keptNotes: labels(value.keptNotes),
+    keptDescriptions: labels(value.keptDescriptions),
+  };
 }
 
 function parseSkippedPrefix(raw: unknown): SkippedPrefixBlock[] | undefined {

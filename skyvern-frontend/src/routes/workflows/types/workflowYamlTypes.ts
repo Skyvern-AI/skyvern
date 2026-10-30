@@ -192,6 +192,9 @@ export type BlockYAMLBase = {
   next_loop_on_failure?: boolean;
   next_block_label?: string | null;
   ignore_workflow_system_prompt?: boolean;
+  notes?: string | null;
+  trailing_notes?: string | null;
+  description?: string | null;
 };
 
 export type TaskBlockYAML = BlockYAMLBase & {

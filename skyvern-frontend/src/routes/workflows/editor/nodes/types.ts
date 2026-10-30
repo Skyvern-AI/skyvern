@@ -15,6 +15,9 @@ export type NodeBaseData = {
   nextLoopOnFailure?: boolean;
   editable: boolean;
   model: WorkflowModel | null;
+  notes?: string | null;
+  trailingNotes?: string | null;
+  description?: string | null;
   // A person picked the block's engine; only task-like blocks read it.
   enginePinned?: boolean;
   showCode?: boolean;
