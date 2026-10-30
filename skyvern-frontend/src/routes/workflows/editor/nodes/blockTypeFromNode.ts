@@ -32,6 +32,7 @@ const REACT_FLOW_TYPE_TO_BLOCK_TYPE: Record<string, string> = {
   emailInbox: "email_inbox",
   googleSheetsRead: "google_sheets_read",
   googleSheetsWrite: "google_sheets_write",
+  powerBIQuery: "powerbi_query",
   pdfFill: "pdf_fill",
   splitPdf: "split_pdf",
 };

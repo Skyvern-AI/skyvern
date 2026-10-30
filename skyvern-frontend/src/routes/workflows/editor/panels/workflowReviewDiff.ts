@@ -89,6 +89,7 @@ const BLOCK_TYPE_TO_NODE_TYPE: Record<string, string> = {
   email_inbox: "emailInbox",
   google_sheets_read: "googleSheetsRead",
   google_sheets_write: "googleSheetsWrite",
+  powerbi_query: "powerBIQuery",
 };
 
 function blockIdentity(block: WorkflowBlock): string {

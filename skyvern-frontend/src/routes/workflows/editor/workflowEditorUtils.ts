@@ -86,6 +86,7 @@ import {
   EmailInboxBlockYAML,
   GoogleSheetsReadBlockYAML,
   GoogleSheetsWriteBlockYAML,
+  PowerBIQueryBlockYAML,
   PdfFillBlockYAML,
   SplitPdfBlockYAML,
 } from "../types/workflowYamlTypes";
@@ -209,6 +210,12 @@ import {
   isGoogleSheetsWriteNode,
 } from "./nodes/GoogleSheetsWriteNode/types";
 import { validateGoogleSheetsWriteNode } from "./nodes/GoogleSheetsWriteNode/validate";
+import {
+  POWERBI_QUERY_DEFAULT_MAX_ROWS,
+  isPowerBIQueryNode,
+  powerBIQueryNodeDefaultData,
+} from "./nodes/PowerBIQueryNode/types";
+import { validatePowerBIQueryNode } from "./nodes/PowerBIQueryNode/validate";
 import {
   isPdfFillNode,
   pdfFillNodeDefaultData,
@@ -1542,6 +1549,21 @@ function convertToNode(
           range: block.range ?? "",
           credentialId: block.credential_id ?? "",
           hasHeaderRow: block.has_header_row ?? true,
+          parameterKeys: (block.parameters ?? []).map((p) => p.key),
+        },
+      };
+    }
+    case "powerbi_query": {
+      return {
+        ...identifiers,
+        ...common,
+        type: "powerBIQuery",
+        data: {
+          ...commonData,
+          connectionId: block.connection_id ?? "",
+          datasetId: block.dataset_id ?? "",
+          query: block.query ?? "",
+          maxRows: block.max_rows ?? POWERBI_QUERY_DEFAULT_MAX_ROWS,
           parameterKeys: (block.parameters ?? []).map((p) => p.key),
         },
       };
@@ -3207,6 +3229,17 @@ function createNode(
         },
       };
     }
+    case "powerBIQuery": {
+      return {
+        ...identifiers,
+        ...common,
+        type: "powerBIQuery",
+        data: {
+          ...powerBIQueryNodeDefaultData,
+          label,
+        },
+      };
+    }
     case "googleSheetsWrite": {
       return {
         ...identifiers,
@@ -3991,6 +4024,17 @@ function getWorkflowBlock(
         range: node.data.range || null,
         credential_id: node.data.credentialId || null,
         has_header_row: node.data.hasHeaderRow,
+        parameter_keys: node.data.parameterKeys,
+      };
+    }
+    case "powerBIQuery": {
+      return {
+        ...base,
+        block_type: "powerbi_query",
+        connection_id: node.data.connectionId,
+        dataset_id: node.data.datasetId,
+        query: node.data.query,
+        max_rows: node.data.maxRows,
         parameter_keys: node.data.parameterKeys,
       };
     }
@@ -5622,6 +5666,18 @@ function convertBlocksToBlockYAML(
         };
         return blockYaml;
       }
+      case "powerbi_query": {
+        const blockYaml: PowerBIQueryBlockYAML = {
+          ...base,
+          block_type: "powerbi_query",
+          connection_id: block.connection_id,
+          dataset_id: block.dataset_id,
+          query: block.query,
+          max_rows: block.max_rows ?? POWERBI_QUERY_DEFAULT_MAX_ROWS,
+          parameter_keys: (block.parameters ?? []).map((p) => p.key),
+        };
+        return blockYaml;
+      }
       case "google_sheets_write": {
         const blockYaml: GoogleSheetsWriteBlockYAML = {
           ...base,
@@ -6259,6 +6315,9 @@ function getWorkflowErrors(nodes: Array<AppNode>): Array<string> {
   nodes
     .filter(isGoogleSheetsReadNode)
     .forEach((node) => errors.push(...validateGoogleSheetsReadNode(node)));
+  nodes
+    .filter(isPowerBIQueryNode)
+    .forEach((node) => errors.push(...validatePowerBIQueryNode(node)));
 
   nodes
     .filter(isEmailInboxNode)

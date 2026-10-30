@@ -513,10 +513,14 @@ export interface MicrosoftOAuthCredentialListResponse {
   credentials: MicrosoftOAuthCredential[];
 }
 
+export type MicrosoftOAuthScopeProfile =
+  | "outlook_mail"
+  | "powerbi_dataset_read";
+
 export interface CreateMicrosoftOAuthAuthorizeRequest {
   redirect_uri: string;
   credential_name?: string;
-  scope_profile?: "outlook_mail";
+  scope_profile?: MicrosoftOAuthScopeProfile;
   app_origin?: string;
 }
 

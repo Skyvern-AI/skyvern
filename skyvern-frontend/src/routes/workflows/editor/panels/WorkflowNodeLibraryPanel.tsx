@@ -9,6 +9,7 @@ import { AddNodeProps } from "../Workspace";
 import { Input } from "@/components/ui/input";
 import { useFeatureFlag } from "@/hooks/useFeatureFlag";
 import { AGENT_BLOCK_FLAG } from "@/util/featureFlags";
+import { useIntegrationCatalogQuery } from "@/hooks/useIntegrationCatalogQuery";
 
 const enableCodeBlock =
   import.meta.env.VITE_ENABLE_CODE_BLOCK?.toLowerCase() === "true";
@@ -364,6 +365,17 @@ const nodeLibraryItems: Array<{
     description: "Read data from a Google Sheet",
   },
   {
+    nodeType: "powerBIQuery",
+    icon: (
+      <WorkflowBlockIcon
+        workflowBlockType={WorkflowBlockTypes.PowerBIQuery}
+        className="size-6"
+      />
+    ),
+    title: "Power BI Query",
+    description: "Run a read-only DAX query against a dataset",
+  },
+  {
     nodeType: "googleSheetsWrite",
     icon: (
       <WorkflowBlockIcon
@@ -391,6 +403,7 @@ function WorkflowNodeLibraryPanel({ onNodeClick }: Props) {
     (state) => state.closeWorkflowPanel,
   );
   const enableAgentBlock = useFeatureFlag(AGENT_BLOCK_FLAG) === true;
+  const { data: integrationCatalog } = useIntegrationCatalogQuery();
   const [search, setSearch] = useState("");
   const inputRef = useRef<HTMLInputElement>(null);
 
@@ -426,6 +439,15 @@ function WorkflowNodeLibraryPanel({ onNodeClick }: Props) {
   }, [workflowPanelActive]);
 
   const filteredItems = nodeLibraryItems.filter((item) => {
+    if (
+      item.nodeType === "powerBIQuery" &&
+      !integrationCatalog?.some(
+        (integration) =>
+          integration.id === "powerbi" && integration.status === "live",
+      )
+    ) {
+      return false;
+    }
     if (workflowPanelData?.disableLoop && item.nodeType === "loop") {
       return false;
     }

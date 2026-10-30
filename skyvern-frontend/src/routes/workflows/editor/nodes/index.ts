@@ -64,6 +64,8 @@ import { GoogleSheetsReadNode } from "./GoogleSheetsReadNode/types";
 import { GoogleSheetsReadNode as GoogleSheetsReadNodeComponent } from "./GoogleSheetsReadNode/GoogleSheetsReadNode";
 import { GoogleSheetsWriteNode } from "./GoogleSheetsWriteNode/types";
 import { GoogleSheetsWriteNode as GoogleSheetsWriteNodeComponent } from "./GoogleSheetsWriteNode/GoogleSheetsWriteNode";
+import { PowerBIQueryNode } from "./PowerBIQueryNode/types";
+import { PowerBIQueryNode as PowerBIQueryNodeComponent } from "./PowerBIQueryNode/PowerBIQueryNode";
 import { PdfFillNode } from "./PdfFillNode/types";
 import { PdfFillNode as PdfFillNodeComponent } from "./PdfFillNode/PdfFillNode";
 import { SplitPdfNode } from "./SplitPdfNode/types";
@@ -109,6 +111,7 @@ export type WorkflowBlockNode =
   | EmailInboxNode
   | GoogleSheetsReadNode
   | GoogleSheetsWriteNode
+  | PowerBIQueryNode
   | PdfFillNode
   | SplitPdfNode
   | DataExportNode;
@@ -196,6 +199,7 @@ export const nodeTypes = {
   emailInbox: wrapBlock(EmailInboxNodeComponent),
   googleSheetsRead: wrapBlock(GoogleSheetsReadNodeComponent),
   googleSheetsWrite: wrapBlock(GoogleSheetsWriteNodeComponent),
+  powerBIQuery: wrapBlock(PowerBIQueryNodeComponent),
   pdfFill: wrapBlock(PdfFillNodeComponent),
   splitPdf: wrapBlock(SplitPdfNodeComponent),
   dataExport: wrapBlock(DataExportNodeComponent),

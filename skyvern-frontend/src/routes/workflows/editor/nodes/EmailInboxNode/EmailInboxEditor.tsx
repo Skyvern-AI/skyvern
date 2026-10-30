@@ -172,6 +172,7 @@ function EmailInboxEditorBody({
               value={data.credentialId}
               onChange={updateCredentialId}
               requiredScopes={MICROSOFT_MAIL_REQUIRED_SCOPES}
+              editable={data.editable}
             />
           )}
         </div>
