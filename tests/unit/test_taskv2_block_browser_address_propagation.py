@@ -73,6 +73,7 @@ async def test_taskv2_block_forwards_browser_connection_fields_to_child(
             workflow_runs=SimpleNamespace(
                 get_workflow_run=AsyncMock(side_effect=[outer_workflow_run, child_workflow_run]),
                 update_workflow_run=AsyncMock(),
+                update_workflow_run_if_not_final=AsyncMock(),
             ),
             observer=SimpleNamespace(
                 update_task_v2=AsyncMock(),
@@ -109,6 +110,7 @@ async def test_taskv2_block_forwards_browser_connection_fields_to_child(
         return completed_task_v2
 
     monkeypatch.setattr(task_v2_service, "run_task_v2", fake_run_task_v2)
+    monkeypatch.setattr(task_v2_service, "settle_child_of_ended_parent", AsyncMock(return_value=None))
 
     monkeypatch.setattr(
         TaskV2Block,
@@ -181,6 +183,7 @@ async def test_taskv2_block_settles_the_child_capture_when_the_runner_raises(
                     )
                 ),
                 update_workflow_run=AsyncMock(),
+                update_workflow_run_if_not_final=AsyncMock(),
             ),
             observer=SimpleNamespace(update_task_v2=AsyncMock(), update_workflow_run_block=AsyncMock()),
         ),
@@ -203,6 +206,7 @@ async def test_taskv2_block_settles_the_child_capture_when_the_runner_raises(
         raise RuntimeError("child finalization failed")
 
     monkeypatch.setattr(task_v2_service, "run_task_v2", exploding_run_task_v2)
+    monkeypatch.setattr(task_v2_service, "settle_child_of_ended_parent", AsyncMock(return_value=None))
     monkeypatch.setattr(
         TaskV2Block,
         "get_workflow_run_context",
@@ -263,7 +267,9 @@ async def test_taskv2_block_reports_a_child_browser_loss_from_the_child_run_entr
         DATABASE=SimpleNamespace(
             organizations=SimpleNamespace(get_organization=AsyncMock(return_value=SimpleNamespace())),
             workflow_runs=SimpleNamespace(
-                get_workflow_run=AsyncMock(return_value=workflow_run), update_workflow_run=AsyncMock()
+                get_workflow_run=AsyncMock(return_value=workflow_run),
+                update_workflow_run=AsyncMock(),
+                update_workflow_run_if_not_final=AsyncMock(),
             ),
             observer=SimpleNamespace(update_task_v2=AsyncMock(), update_workflow_run_block=update_block),
         ),
@@ -292,6 +298,7 @@ async def test_taskv2_block_reports_a_child_browser_loss_from_the_child_run_entr
     )
     monkeypatch.setattr(task_v2_service, "initialize_task_v2", AsyncMock(return_value=child))
     monkeypatch.setattr(task_v2_service, "run_task_v2", AsyncMock(return_value=child))
+    monkeypatch.setattr(task_v2_service, "settle_child_of_ended_parent", AsyncMock(return_value=None))
     monkeypatch.setattr(
         TaskV2Block,
         "get_workflow_run_context",
@@ -330,3 +337,305 @@ async def test_taskv2_block_reports_a_child_browser_loss_from_the_child_run_entr
         assert result.error_codes == []
         assert persisted_codes == set()
         assert retry == (True, "matched")
+
+
+class _ChildBodyStarted(BaseException):
+    """Raised where the child's browser would be acquired; a BaseException so no handler on the way absorbs it."""
+
+
+def _nested_rows(
+    monkeypatch: pytest.MonkeyPatch, *, on_child_created=None, on_child_running=None, on_session_begun=None
+) -> SimpleNamespace:
+    """Parent run plus the rows a nested task v2 creates, with conditional writes that honor their control kwargs."""
+    from datetime import UTC, datetime
+
+    from skyvern.services import task_v2_service
+
+    rows = SimpleNamespace(runs={}, tasks={}, browser_requests=[], started=[], sessions_begun=[])
+    rows.runs["wr_parent"] = SimpleNamespace(
+        workflow_run_id="wr_parent",
+        status=WorkflowRunStatus.running,
+        parent_workflow_run_id=None,
+        proxy_location=None,
+        max_screenshot_scrolls=None,
+        browser_address=None,
+        extra_http_headers=None,
+        cdp_connect_headers=None,
+        failure_reason=None,
+    )
+    organization = SimpleNamespace(
+        organization_id="org_1",
+        organization_name="Org 1",
+        default_llm_key=None,
+        default_secondary_llm_key=None,
+        created_at=datetime.now(UTC),
+    )
+
+    async def get_run(workflow_run_id: str, organization_id: str | None = None, **_: object) -> object:
+        return rows.runs.get(workflow_run_id)
+
+    async def update_run(workflow_run_id: str, status: WorkflowRunStatus, **_: object) -> object:
+        rows.runs[workflow_run_id].status = status
+        return rows.runs[workflow_run_id]
+
+    async def update_run_if_not_final(
+        workflow_run_id: str, status: WorkflowRunStatus, only_from: list | None = None, **_: object
+    ) -> object:
+        run = rows.runs[workflow_run_id]
+        if run.status.is_final() or (only_from is not None and run.status not in only_from):
+            return None
+        run.status = status
+        return run
+
+    async def cancel_through_service(workflow_run_id: str, **_: object) -> object:
+        # Only the workflow service's terminal path runs the run's terminal bookkeeping.
+        run = await update_run_if_not_final(workflow_run_id, WorkflowRunStatus.canceled)
+        if run is not None:
+            run.terminal_bookkeeping_done = True
+        return run
+
+    async def mark_running(workflow_run_id: str, **_: object) -> object:
+        rows.started.append(workflow_run_id)
+        if on_child_running is not None:
+            on_child_running(rows)
+        return await update_run_if_not_final(workflow_run_id, WorkflowRunStatus.running) or rows.runs[workflow_run_id]
+
+    async def update_task(
+        task_v2_id: str, status: TaskV2Status | None = None, keep_final_status: bool = False, **_: object
+    ) -> object:
+        task = rows.tasks[task_v2_id]
+        if status is not None and not (keep_final_status and task.status.is_final()):
+            task.status = status
+        return task
+
+    async def update_task_if_not_final(task_v2_id: str, status: TaskV2Status, **_: object) -> bool:
+        task = rows.tasks[task_v2_id]
+        if task.status.is_final():
+            return False
+        task.status = status
+        return True
+
+    async def get_task(task_v2_id: str, **_: object) -> object:
+        return rows.tasks.get(task_v2_id)
+
+    async def initialize_child(parent_workflow_run_id: str, **_: object) -> object:
+        rows.runs["wr_child"] = SimpleNamespace(
+            workflow_run_id="wr_child",
+            workflow_id="wf_child",
+            status=WorkflowRunStatus.created,
+            parent_workflow_run_id=parent_workflow_run_id,
+            browser_profile_id=None,
+            browser_address=None,
+            failure_reason=None,
+            terminal_bookkeeping_done=False,
+        )
+        rows.tasks["tsk_child"] = SimpleNamespace(
+            observer_cruise_id="tsk_child",
+            workflow_run_id="wr_child",
+            workflow_id="wf_child",
+            organization_id="org_1",
+            status=TaskV2Status.created,
+            prompt="do the thing",
+            url="https://example.com",
+            model=None,
+            webhook_callback_url=None,
+            max_screenshot_scrolls=None,
+            output=None,
+            summary=None,
+            failure_category=None,
+        )
+        if on_child_created is not None:
+            on_child_created(rows)
+        return rows.tasks["tsk_child"]
+
+    async def begin_session(browser_session_id: str, **_: object) -> str:
+        rows.sessions_begun.append(browser_session_id)
+        if on_session_begun is not None:
+            on_session_begun(rows)
+        return "gen_1"
+
+    async def acquire_child_browser(**kwargs: object) -> object:
+        rows.browser_requests.append(kwargs.get("workflow_run"))
+        raise _ChildBodyStarted
+
+    async def no_rows(*_: object, **__: object) -> list:
+        return []
+
+    workflow = SimpleNamespace(
+        workflow_id="wf_child", workflow_permanent_id="wpid_child", title="child", workflow_definition=None
+    )
+    fake_app = SimpleNamespace(
+        DATABASE=SimpleNamespace(
+            organizations=SimpleNamespace(get_organization=AsyncMock(return_value=organization)),
+            workflow_runs=SimpleNamespace(
+                get_workflow_run=get_run,
+                update_workflow_run=update_run,
+                update_workflow_run_if_not_final=update_run_if_not_final,
+            ),
+            observer=SimpleNamespace(
+                get_task_v2=get_task,
+                update_task_v2=update_task,
+                update_task_v2_status_if_not_final=update_task_if_not_final,
+                update_workflow_run_block=AsyncMock(),
+            ),
+        ),
+        WORKFLOW_SERVICE=SimpleNamespace(
+            get_workflow_run=get_run,
+            get_workflow=AsyncMock(return_value=workflow),
+            mark_workflow_run_as_running=mark_running,
+            mark_workflow_run_as_canceled_if_not_final=cancel_through_service,
+            get_workflow_run_parameter_tuples=no_rows,
+            get_workflow_output_parameters=no_rows,
+            get_recent_task_screenshot_artifacts=no_rows,
+            get_recent_workflow_screenshot_artifacts=no_rows,
+        ),
+        WORKFLOW_CONTEXT_MANAGER=SimpleNamespace(
+            initialize_workflow_run_context=AsyncMock(),
+            remove_workflow_run_context=lambda _run_id: None,
+            has_workflow_run_context=lambda _run_id: False,
+        ),
+        BROWSER_MANAGER=SimpleNamespace(
+            get_or_create_for_workflow_run=acquire_child_browser, get_for_workflow_run=lambda *_: None
+        ),
+        PERSISTENT_SESSIONS_MANAGER=SimpleNamespace(begin_session=begin_session),
+        STORAGE=SimpleNamespace(
+            get_current_attempt_downloaded_files=no_rows,
+            get_downloaded_file_signature_aliases=lambda _: [],
+        ),
+    )
+    monkeypatch.setattr(block_module, "app", fake_app)
+    monkeypatch.setattr(task_v2_service, "app", fake_app)
+    monkeypatch.setattr(task_v2_service, "initialize_task_v2", initialize_child)
+    monkeypatch.setattr(task_v2_service, "_validate_task_v2_model_for_org", AsyncMock())
+    monkeypatch.setattr(task_v2_service, "workflow_definition_sha256", lambda _definition: "sha")
+    monkeypatch.setattr(block_module, "capture_block_download_baseline", AsyncMock())
+    monkeypatch.setattr(TaskV2Block, "_settle_child_capture", AsyncMock())
+    monkeypatch.setattr(
+        TaskV2Block,
+        "get_workflow_run_context",
+        lambda self, workflow_run_id: SimpleNamespace(credential_totp_identifiers={}),
+    )
+    monkeypatch.setattr(TaskV2Block, "format_potential_template_parameters", lambda self, _: None)
+
+    async def keep_output(self: TaskV2Block, *_: object, **__: object) -> None:
+        return None
+
+    async def block_result(self: TaskV2Block, **kwargs: object) -> SimpleNamespace:
+        return SimpleNamespace(**kwargs)
+
+    monkeypatch.setattr(TaskV2Block, "record_output_parameter_value", keep_output)
+    monkeypatch.setattr(TaskV2Block, "build_block_result", block_result)
+    skyvern_context.set(
+        SkyvernContext(organization_id="org_1", workflow_run_id="wr_parent", run_id="wr_parent", org_age=1)
+    )
+    return rows
+
+
+async def _execute_nested_block(browser_session_id: str | None = None) -> SimpleNamespace:
+    block = TaskV2Block(
+        label="nested", output_parameter=_output_parameter("nested_output"), prompt="do the thing", url="https://e.com"
+    )
+    return await block.execute(
+        workflow_run_id="wr_parent",
+        workflow_run_block_id="wrb_1",
+        organization_id="org_1",
+        browser_session_id=browser_session_id,
+    )
+
+
+def _reap_parent(rows: SimpleNamespace) -> None:
+    rows.runs["wr_parent"].status = WorkflowRunStatus.failed
+
+
+@pytest.mark.asyncio
+async def test_child_of_a_parent_reaped_during_child_initialization_never_starts(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    rows = _nested_rows(monkeypatch, on_child_created=_reap_parent)
+
+    result = await _execute_nested_block()
+
+    assert rows.started == []
+    assert rows.browser_requests == []
+    assert rows.tasks["tsk_child"].status == TaskV2Status.canceled
+    assert rows.runs["wr_child"].status == WorkflowRunStatus.canceled
+    assert rows.runs["wr_child"].terminal_bookkeeping_done is True
+    assert result.success is False
+
+
+@pytest.mark.asyncio
+async def test_child_of_a_parent_reaped_during_child_startup_never_reaches_its_browser(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    rows = _nested_rows(monkeypatch, on_child_running=_reap_parent)
+
+    result = await _execute_nested_block()
+
+    assert rows.browser_requests == []
+    assert rows.tasks["tsk_child"].status == TaskV2Status.canceled
+    assert rows.runs["wr_child"].status == WorkflowRunStatus.canceled
+    assert rows.runs["wr_child"].terminal_bookkeeping_done is True
+    assert result.success is False
+
+
+@pytest.mark.asyncio
+async def test_child_on_a_shared_session_whose_parent_ended_while_the_session_began_never_reaches_its_browser(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    rows = _nested_rows(monkeypatch, on_session_begun=_reap_parent)
+
+    result = await _execute_nested_block(browser_session_id="pbs_shared")
+
+    assert rows.sessions_begun == ["pbs_shared"]
+    assert rows.browser_requests == []
+    assert rows.tasks["tsk_child"].status == TaskV2Status.canceled
+    assert rows.runs["wr_child"].status == WorkflowRunStatus.canceled
+    assert result.success is False
+
+
+@pytest.mark.asyncio
+async def test_child_of_a_parent_that_lost_its_run_lease_never_starts(monkeypatch: pytest.MonkeyPatch) -> None:
+    from skyvern.services import task_v2_service
+
+    lost: set[str] = set()
+    rows = _nested_rows(monkeypatch, on_child_created=lambda _rows: lost.add("wr_parent"))
+
+    async def lease_lost(run_id: str) -> bool:
+        return run_id in lost
+
+    monkeypatch.setattr(task_v2_service, "run_lease_lost", lease_lost)
+
+    result = await _execute_nested_block()
+
+    assert rows.started == []
+    assert rows.browser_requests == []
+    assert rows.runs["wr_parent"].status == WorkflowRunStatus.running
+    assert rows.tasks["tsk_child"].status == TaskV2Status.canceled
+    assert rows.runs["wr_child"].status == WorkflowRunStatus.canceled
+    assert result.success is False
+
+
+@pytest.mark.asyncio
+async def test_child_finished_elsewhere_before_queueing_is_not_queued_again(monkeypatch: pytest.MonkeyPatch) -> None:
+    def finish_child(rows: SimpleNamespace) -> None:
+        rows.tasks["tsk_child"].status = TaskV2Status.completed
+        rows.runs["wr_child"].status = WorkflowRunStatus.completed
+
+    rows = _nested_rows(monkeypatch, on_child_created=finish_child)
+
+    await _execute_nested_block()
+
+    assert rows.browser_requests == []
+    assert rows.tasks["tsk_child"].status == TaskV2Status.completed
+    assert rows.runs["wr_child"].status == WorkflowRunStatus.completed
+
+
+@pytest.mark.asyncio
+async def test_child_of_a_live_parent_reaches_its_browser(monkeypatch: pytest.MonkeyPatch) -> None:
+    rows = _nested_rows(monkeypatch)
+
+    with pytest.raises(_ChildBodyStarted):
+        await _execute_nested_block()
+
+    assert [run.workflow_run_id for run in rows.browser_requests] == ["wr_child"]
+    assert rows.runs["wr_parent"].status == WorkflowRunStatus.running

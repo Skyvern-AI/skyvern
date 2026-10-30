@@ -54,6 +54,7 @@ class AgentStepBlock(Block):
     prompt: str
     data_schema: dict[str, Any]
     max_turns: int = 25
+    tools: list[str] | None = None
     parameters: list[PARAMETER_TYPE] = []
 
     TEMPLATABLE_FIELDS: ClassVar[frozenset[str]] = frozenset({"prompt"})

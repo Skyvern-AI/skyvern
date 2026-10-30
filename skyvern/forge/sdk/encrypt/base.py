@@ -8,7 +8,7 @@ class EncryptMethod(Enum):
     AES_GCM = "aes_gcm"
 
 
-DEFAULT_ENCRYPT_METHOD = EncryptMethod.AES
+DEFAULT_ENCRYPT_METHOD = EncryptMethod.AES_GCM
 
 
 class TokenDecryptionError(Exception):

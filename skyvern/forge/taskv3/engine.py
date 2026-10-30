@@ -38,6 +38,7 @@ from skyvern.forge.sdk.api.llm.api_handler_factory import VISION_FALLBACK_PROMPT
 from skyvern.forge.sdk.api.llm.config_registry import LLMConfigRegistry
 from skyvern.forge.sdk.api.llm.exceptions import LLMProviderErrorRetryableTask
 from skyvern.forge.sdk.core import skyvern_context
+from skyvern.forge.sdk.core.skyvern_context import RunArm
 from skyvern.forge.sdk.workflow.models.credential_release import CredentialReleaseGuard
 from skyvern.forge.taskv3.answer_basis_audit import apply_answer_basis_audit
 from skyvern.forge.taskv3.code_surface import apply_surface, configured_surface
@@ -83,6 +84,7 @@ from skyvern.forge.taskv3.loop import (
     submissions_since,
 )
 from skyvern.forge.taskv3.opaque_refs import OpaqueUrlRefs, is_signed_url, mask_opaque_urls
+from skyvern.forge.taskv3.run_arms import ANSWER_AUDIT_LOG_ONLY_FLAG, current_run_arm, run_arm_enabled
 from skyvern.forge.taskv3.tools import (
     BlankWorkingPageGuard,
     DownloadFailureWatch,
@@ -258,6 +260,8 @@ async def run_task_v3_agent_loop(
     page_provider: PageProvider,
     llm_caller: Any,
     goal: str,
+    # The LLM route arm applied where the block's key was chosen; None when the key did not go through the arm.
+    llm_route_arm: RunArm | None = None,
     parameters: dict[str, Any] | None = None,
     starting_url: str | None = None,
     # The browser is already on `starting_url`, so the prompt must not present it as somewhere to go.
@@ -690,7 +694,13 @@ async def run_task_v3_agent_loop(
             step=step,
         )
     )
-    apply_answer_basis_audit(tools, answer_audit)
+    arm_fields = {"audit_mode_arm": current_run_arm(ANSWER_AUDIT_LOG_ONLY_FLAG)}
+    apply_answer_basis_audit(
+        tools,
+        answer_audit,
+        log_only=run_arm_enabled(ANSWER_AUDIT_LOG_ONLY_FLAG, forced=False),
+        log_fields=arm_fields,
+    )
     # Only the acting model gets typed rows: the judge and re-ask read `model_goal` on their own model, and an oversized
     # judge prompt fails open. Rows stay unminted because resolve_typed_text was chained to refs above.
     prompt_goal = model_goal
@@ -844,8 +854,11 @@ async def run_task_v3_agent_loop(
         age_default_reason=age_default_reason,
         application_defaults_rendered=bool(application_defaults_text),
         application_defaults_reason=application_defaults_reason,
+        **arm_fields,
+        answer_audit_active=answer_audit is not None,
         # The run's model, so exposure rates on this line split per model like the re-ask line's.
         llm_key=llm_caller.llm_key,
+        llm_route_arm=llm_route_arm,
         unlisted_reask=outcome.unlisted_reask,
         # The loop's progress signals ride here rather than on records of their own: this line
         # already fires exactly once per run and already carries block_type, so collapsing removes a

@@ -213,11 +213,130 @@ async def test_reads_add_no_audit_and_an_audit_that_raises_never_blocks() -> Non
     assert ("click", {"selector": "#next"}) in dispatched and len(audit.seen) == 1
 
 
-def test_no_audit_leaves_every_handler_untouched() -> None:
+@pytest.mark.parametrize("log_only", [False, True])
+def test_no_audit_leaves_every_handler_untouched(log_only: bool) -> None:
+    # The kill switch resolves the audit to None, which wins over the log-only arm.
     tools = _tools([])
     before = [t.handler for t in tools]
-    apply_answer_basis_audit(tools, None)
+    apply_answer_basis_audit(tools, None, log_only=log_only)
     assert [t.handler for t in tools] == before
+
+
+@pytest.mark.asyncio
+async def test_log_only_would_hold_exactly_the_calls_the_blocking_audit_refuses() -> None:
+    submit = {"selector": "#submit"}
+    sequence: list[tuple[str, dict[str, Any]]] = [
+        ("click", {"selector": "#q1"}),
+        ("click", {"selector": '[data-tv3-menu="2"]', "_row": "No"}),
+        ("click", submit),
+        ("click", {"selector": "ref=40"}),
+        ("press_key", {"key": "Enter"}),
+        ("drag", {"selector": "#slider", "target": "#end"}),
+        (CODE_TOOL_NAME, {"code": "await page.click('#submit')"}),
+        ("click", {"selector": "#q1"}),
+        ("click", {"selector": "ref=7", "_row": "I prefer not to answer"}),
+        ("click", submit),
+        # The flagged answer typed again with its own Enter: the log-only arm lets it land, and it stays flagged.
+        ("type", {"selector": "#work-auth", "text": "No", "_label": "Are you legally authorized to work?"}),
+        (
+            "type",
+            {
+                "selector": "#work-auth",
+                "text": "No",
+                "press_enter": True,
+                "_label": "Are you legally authorized to work?",
+            },
+        ),
+        ("click", submit),
+        # An Enter appended with no text leaves the flagged answer in the field.
+        ("type", {"selector": "#work-auth", "text": "No", "_label": "Are you legally authorized to work?"}),
+        (
+            "type",
+            {
+                "selector": "#work-auth",
+                "text": "",
+                "clear": False,
+                "press_enter": True,
+                "_label": "Are you legally authorized to work?",
+            },
+        ),
+        ("click", submit),
+    ]
+
+    blocking = _tools([])
+    apply_answer_basis_audit(blocking, _Audit(flag={"No"}))
+    refused = []
+    for name, args in sequence:
+        try:
+            await _by_name(blocking, name).handler(dict(args))
+            refused.append(False)
+        except ToolRefusal:
+            refused.append(True)
+
+    dispatched: list[tuple[str, dict[str, Any]]] = []
+    logged = _tools(dispatched)
+    apply_answer_basis_audit(logged, _Audit(flag={"No"}), log_only=True)
+    would_hold = []
+    for name, args in sequence:
+        with capture_logs() as logs:
+            await _by_name(logged, name).handler(dict(args))
+        would_hold.append(any(e.get("would_hold") for e in logs if e["event"] == "taskv3 answer basis hold"))
+
+    assert refused == would_hold and any(refused) and not all(refused)
+    assert refused[-2:] == [True, True]
+    assert len(dispatched) == len(sequence)
+
+
+_APPENDED = "Are you legally authorized to work?"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("text", "clear", "press_enter", "expected"),
+    [
+        ("", False, True, [False, True, True]),
+        (" ", False, True, [False, True, True]),
+        ("\t", False, True, [False, True, True]),
+        ("\n", False, True, [False, True, True]),
+        (" \t\n ", False, True, [False, True, True]),
+        ("", False, False, [False, False, True]),
+        # The blocking arm lets the submit through with the flagged answer still in the field.
+        (" ", False, False, None),
+        # A replacement the audit supports drops the flag.
+        ("I prefer not to answer", True, True, [False, False, False]),
+    ],
+)
+async def test_log_only_follows_the_blocking_arm_through_every_append_that_adds_no_text(
+    text: str, clear: bool, press_enter: bool, expected: list[bool] | None
+) -> None:
+    field = {"selector": "#work-auth", "_label": _APPENDED}
+    sequence: list[tuple[str, dict[str, Any]]] = [
+        ("type", {**field, "text": "No"}),
+        ("type", {**field, "text": text, "clear": clear, "press_enter": press_enter}),
+        ("click", {"selector": "#submit"}),
+    ]
+
+    blocking = _tools([])
+    apply_answer_basis_audit(blocking, _Audit(flag={"No"}))
+    refused = []
+    for name, args in sequence:
+        try:
+            await _by_name(blocking, name).handler(dict(args))
+            refused.append(False)
+        except ToolRefusal:
+            refused.append(True)
+
+    logged = _tools([])
+    apply_answer_basis_audit(logged, _Audit(flag={"No"}), log_only=True)
+    would_hold = []
+    for name, args in sequence:
+        with capture_logs() as logs:
+            await _by_name(logged, name).handler(dict(args))
+        would_hold.append(any(e.get("would_hold") for e in logs if e["event"] == "taskv3 answer basis hold"))
+
+    assert would_hold == refused
+    if expected is not None:
+        assert refused == expected
 
 
 WORK_AUTH = "Are you legally authorized to work in the United States?"

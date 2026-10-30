@@ -30,7 +30,6 @@ from openai.types.responses import ResponseFunctionToolCall, ResponseOutputMessa
 from openai.types.shared import Reasoning
 from pydantic import ValidationError
 
-from skyvern.cli.mcp_tools.blocks import BLOCK_SUMMARIES
 from skyvern.forge import app
 from skyvern.forge.sdk.api.llm.config_registry import LLMConfigRegistry
 from skyvern.forge.sdk.api.llm.copilot_model_usage import copilot_usage_observer
@@ -47,6 +46,15 @@ from skyvern.forge.sdk.models import Step, StepStatus
 from skyvern.forge.sdk.schemas.tasks import Task, TaskStatus
 from skyvern.forge.sdk.workflow.context_manager import WorkflowRunContext
 from skyvern.forge.sdk.workflow.models.agent_step_block import AgentStepBlock
+from skyvern.forge.sdk.workflow.models.agent_step_tools import (
+    DEDICATED_BLOCK_TOOLS,
+    FINISH_DESCRIPTION,
+    RUN_BLOCK_TYPES,
+    RUN_TOOL_DESCRIPTIONS,
+    BlockTool,
+    block_description,
+    run_block_description,
+)
 from skyvern.forge.sdk.workflow.models.block import Block, _validate_response_against_json_schema
 from skyvern.forge.sdk.workflow.models.parameter import (
     AWSSecretParameter,
@@ -57,34 +65,7 @@ from skyvern.forge.sdk.workflow.models.parameter import (
 )
 from skyvern.forge.sdk.workflow.workflow_definition_converter import block_yaml_to_block
 from skyvern.schemas.run_enums import RunEngine
-from skyvern.schemas.workflows import (
-    BlockResult,
-    BlockStatus,
-    BlockType,
-    BlockYAML,
-    CodeBlockYAML,
-    DataExportBlockYAML,
-    DownloadToS3BlockYAML,
-    EmailInboxBlockYAML,
-    FileDownloadBlockYAML,
-    FileParserBlockYAML,
-    FileUploadBlockYAML,
-    GoogleSheetsReadBlockYAML,
-    GoogleSheetsWriteBlockYAML,
-    HttpRequestBlockYAML,
-    HumanInteractionBlockYAML,
-    LoginBlockYAML,
-    PdfFillBlockYAML,
-    PDFParserBlockYAML,
-    PrintPageBlockYAML,
-    SendEmailBlockYAML,
-    SplitPdfBlockYAML,
-    TaskBlockYAML,
-    TextPromptBlockYAML,
-    UploadToS3BlockYAML,
-    WaitBlockYAML,
-    WebSearchBlockYAML,
-)
+from skyvern.schemas.workflows import BlockResult, BlockStatus, BlockType
 from skyvern.utils.secret_redaction import redact_secrets_from_text
 
 if TYPE_CHECKING:
@@ -98,200 +79,7 @@ _INSTRUCTIONS = (
     "Each tool other than finish runs a workflow block, reads this run's data or acts on this run's browser page, "
     "and returns its status, output and error. When you have the answer, call finish with it."
 )
-_NO_SECOND_AGENT = " Runs on this run's current page with no separate agent."
 _FINISH_ONLY = "Only finish can run now. Call finish with the best answer the tool results support."
-_NESTED_AGENT = (
-    " Each call starts a separate browser agent with its own loop, step budget, recording and run row, "
-    "and you get only its result, so a call is slow and costly."
-)
-
-
-@dataclass(frozen=True)
-class _BlockTool:
-    yaml_class: type[BlockYAML]
-    fields: tuple[str, ...]
-    # None: reached through run_block.
-    tool_name: str | None = None
-    description: str | None = None
-    nested_agent: bool = False
-
-
-_CONTROL_FLOW = "Control flow: the step's own loop already repeats and decides."
-_OVERLAPS = "Covered by browser_task or the page commands; overlapping tools make tool choice worse."
-
-# Every BlockType is a tool here or says why not, so a new block type cannot silently join or miss the tool set.
-AGENT_BLOCK_TOOLS: dict[BlockType, _BlockTool | str] = {
-    BlockType.TASK: _BlockTool(
-        TaskBlockYAML,
-        ("url", "navigation_goal", "data_extraction_goal", "data_schema"),
-        tool_name="browser_task",
-        description="Act on this run's browser: open url if given, work toward navigation_goal, and return data "
-        "matching data_schema when data_extraction_goal is set." + _NESTED_AGENT,
-        nested_agent=True,
-    ),
-    BlockType.LOGIN: _BlockTool(
-        LoginBlockYAML,
-        ("credential", "url"),
-        tool_name="login",
-        description="Sign in at url with one of this run's credentials." + _NESTED_AGENT,
-        nested_agent=True,
-    ),
-    BlockType.WEB_SEARCH: _BlockTool(
-        WebSearchBlockYAML,
-        ("query", "num_results", "prompt", "json_schema"),
-        tool_name="web_search",
-        description="Search the web. With prompt, and optionally json_schema, the results are read into an answer.",
-    ),
-    BlockType.CODE: _BlockTool(CodeBlockYAML, ("code",)),
-    BlockType.TEXT_PROMPT: _BlockTool(
-        TextPromptBlockYAML,
-        ("prompt", "json_schema"),
-        description="One LLM call with no browser and no tools; without json_schema the output is "
-        "{llm_response: <text>}",
-    ),
-    BlockType.DOWNLOAD_TO_S3: _BlockTool(DownloadToS3BlockYAML, ("url",)),
-    BlockType.UPLOAD_TO_S3: _BlockTool(UploadToS3BlockYAML, ("path",)),
-    BlockType.FILE_UPLOAD: _BlockTool(
-        FileUploadBlockYAML,
-        (
-            "storage_type",
-            "s3_bucket",
-            "aws_access_key_id",
-            "aws_secret_access_key",
-            "region_name",
-            "endpoint_url",
-            "azure_storage_account_name",
-            "azure_storage_account_key",
-            "azure_blob_container_name",
-            "google_credential_id",
-            "google_drive_folder_id",
-            "sftp_host",
-            "sftp_port",
-            "sftp_username",
-            "sftp_password",
-            "sftp_private_key",
-            "sftp_private_key_passphrase",
-            "sftp_remote_path",
-            "sftp_host_key",
-            "prompt",
-            "path",
-        ),
-        description="Upload this run's downloaded files to S3, Azure Blob, Google Drive or SFTP",
-    ),
-    BlockType.SEND_EMAIL: _BlockTool(
-        SendEmailBlockYAML,
-        (
-            "sender",
-            "recipients",
-            "subject",
-            "body",
-            "body_format",
-            "file_attachments",
-            "transport",
-            "credential_id",
-            "cc",
-            "bcc",
-        ),
-    ),
-    BlockType.FILE_URL_PARSER: _BlockTool(FileParserBlockYAML, ("file_url", "file_type", "json_schema", "worksheet")),
-    BlockType.WAIT: _BlockTool(WaitBlockYAML, ("wait_sec",)),
-    BlockType.FILE_DOWNLOAD: _BlockTool(
-        FileDownloadBlockYAML,
-        ("url", "navigation_goal", "download_timeout"),
-        description="Download a file from a page." + _NESTED_AGENT,
-        nested_agent=True,
-    ),
-    BlockType.PDF_PARSER: _BlockTool(PDFParserBlockYAML, ("file_url", "json_schema")),
-    BlockType.HTTP_REQUEST: _BlockTool(
-        HttpRequestBlockYAML,
-        (
-            "method",
-            "url",
-            "headers",
-            "body",
-            "files",
-            "timeout",
-            "follow_redirects",
-            "download_filename",
-            "save_response_as_file",
-        ),
-    ),
-    BlockType.HUMAN_INTERACTION: _BlockTool(
-        HumanInteractionBlockYAML,
-        (
-            "instructions",
-            "positive_descriptor",
-            "negative_descriptor",
-            "timeout_seconds",
-            "recipients",
-            "subject",
-            "body",
-        ),
-    ),
-    BlockType.PRINT_PAGE: _BlockTool(
-        PrintPageBlockYAML, ("include_timestamp", "custom_filename", "format", "landscape", "print_background")
-    ),
-    BlockType.GOOGLE_SHEETS_READ: _BlockTool(
-        GoogleSheetsReadBlockYAML, ("spreadsheet_url", "sheet_name", "range", "credential_id", "has_header_row")
-    ),
-    BlockType.GOOGLE_SHEETS_WRITE: _BlockTool(
-        GoogleSheetsWriteBlockYAML,
-        (
-            "spreadsheet_url",
-            "sheet_name",
-            "range",
-            "credential_id",
-            "write_mode",
-            "values",
-            "column_mapping",
-            "create_sheet_if_missing",
-        ),
-    ),
-    BlockType.PDF_FILL: _BlockTool(PdfFillBlockYAML, ("file_url", "prompt", "payload")),
-    BlockType.SPLIT_PDF: _BlockTool(SplitPdfBlockYAML, ("file_url", "prompt")),
-    BlockType.EMAIL_INBOX: _BlockTool(
-        EmailInboxBlockYAML,
-        (
-            "email_client",
-            "credential_id",
-            "folder",
-            "prompt",
-            "sender",
-            "subject",
-            "newer_than_days",
-            "max_results",
-            "include_body",
-            "download_attachments",
-        ),
-    ),
-    BlockType.DATA_EXPORT: _BlockTool(DataExportBlockYAML, ("data", "data_schema", "file_name")),
-    BlockType.FOR_LOOP: _CONTROL_FLOW,
-    BlockType.WHILE_LOOP: _CONTROL_FLOW,
-    BlockType.CONDITIONAL: _CONTROL_FLOW,
-    BlockType.TERMINATE: _CONTROL_FLOW,
-    BlockType.WORKFLOW_TRIGGER: "Starts a different run, which is outside this run.",
-    BlockType.TaskV2: _OVERLAPS,
-    BlockType.NAVIGATION: _OVERLAPS,
-    BlockType.ACTION: _OVERLAPS,
-    BlockType.EXTRACTION: _OVERLAPS,
-    BlockType.VALIDATION: _OVERLAPS,
-    BlockType.GOTO_URL: _OVERLAPS,
-    BlockType.AGENT_STEP: "No recursion.",
-}
-_RUN_BLOCK_TYPES: dict[str, tuple[BlockType, _BlockTool]] = {
-    block_type.value: (block_type, tool)
-    for block_type, tool in AGENT_BLOCK_TOOLS.items()
-    if isinstance(tool, _BlockTool) and tool.tool_name is None
-}
-_RUN_BLOCK_DESCRIPTION = (
-    "Run one workflow block in this run and return its status, output and error. arguments holds "
-    "that block's fields; bad arguments return the block's argument schema. Block types:\n"
-    + "\n".join(
-        f"- {name}({', '.join(tool.fields)}): {(tool.description or BLOCK_SUMMARIES[name]).rstrip('.')}"
-        for name, (_, tool) in _RUN_BLOCK_TYPES.items()
-    )
-)
-_FINISH_DESCRIPTION = "Return this step's answer. The arguments are the answer."
 
 
 class _RunEnded(Exception):
@@ -315,6 +103,8 @@ class _RunState:
     run_context: WorkflowRunContext
     credential_keys: list[str]
     ignore_workflow_system_prompt: bool
+    # None offers every tool.
+    tools: list[str] | None = None
     calls: list[dict[str, Any]] = field(default_factory=list)
     answer: dict[str, Any] | None = None
     drained: bool = False
@@ -430,7 +220,7 @@ def _finish_tool(schema: dict[str, Any], state: _RunState) -> FunctionTool:
 
     return FunctionTool(
         name="finish",
-        description=_FINISH_DESCRIPTION,
+        description=FINISH_DESCRIPTION,
         params_json_schema=schema,
         on_invoke_tool=_in_turn(state, invoke),
         # Strict mode would make every optional property required.
@@ -438,7 +228,7 @@ def _finish_tool(schema: dict[str, Any], state: _RunState) -> FunctionTool:
     )
 
 
-def _arguments_schema(tool: _BlockTool, state: _RunState) -> dict[str, Any]:
+def _arguments_schema(tool: BlockTool, state: _RunState) -> dict[str, Any]:
     schema = tool.yaml_class.model_json_schema()
     params: dict[str, Any] = {
         "type": "object",
@@ -461,7 +251,7 @@ def _arguments_schema(tool: _BlockTool, state: _RunState) -> dict[str, Any]:
     return params
 
 
-def _yaml_arguments(tool: _BlockTool, written: dict[str, Any], state: _RunState) -> dict[str, Any]:
+def _yaml_arguments(tool: BlockTool, written: dict[str, Any], state: _RunState) -> dict[str, Any]:
     if unknown := sorted(set(written) - set(tool.fields)):
         raise ValueError(f"Unknown arguments {unknown}; the allowed arguments are {list(tool.fields)}.")
     arguments = dict(written)
@@ -475,7 +265,7 @@ def _yaml_arguments(tool: _BlockTool, written: dict[str, Any], state: _RunState)
     return arguments
 
 
-def _dedicated_tool(block_type: BlockType, tool: _BlockTool, state: _RunState) -> FunctionTool:
+def _dedicated_tool(block_type: BlockType, tool: BlockTool, state: _RunState) -> FunctionTool:
     name = tool.tool_name or block_type.value
 
     async def invoke(arguments: str) -> str:
@@ -487,29 +277,31 @@ def _dedicated_tool(block_type: BlockType, tool: _BlockTool, state: _RunState) -
 
     return FunctionTool(
         name=name,
-        description=tool.description or BLOCK_SUMMARIES[block_type.value],
+        description=block_description(block_type, tool),
         params_json_schema=_arguments_schema(tool, state),
         on_invoke_tool=_in_turn(state, invoke),
         strict_json_schema=False,
     )
 
 
-def _run_block_tool(state: _RunState) -> FunctionTool:
+def _run_block_tool(state: _RunState, block_types: list[str]) -> FunctionTool:
     async def invoke(arguments: str) -> str:
         try:
             call = json.loads(arguments or "{}")
-            block_type, tool = _RUN_BLOCK_TYPES[call["block_type"]]
-        except (json.JSONDecodeError, KeyError, TypeError):
-            return f"Pass block_type, one of {list(_RUN_BLOCK_TYPES)}, and that block's arguments."
+        except json.JSONDecodeError:
+            call = None
+        if not isinstance(call, dict) or call.get("block_type") not in block_types:
+            return f"Pass block_type, one of {block_types}, and that block's arguments."
+        block_type, tool = RUN_BLOCK_TYPES[call["block_type"]]
         return await _run_child_block("run_block", block_type, tool, call.get("arguments") or {}, state)
 
     return FunctionTool(
         name="run_block",
-        description=_RUN_BLOCK_DESCRIPTION,
+        description=run_block_description(block_types),
         params_json_schema={
             "type": "object",
             "properties": {
-                "block_type": {"type": "string", "enum": list(_RUN_BLOCK_TYPES)},
+                "block_type": {"type": "string", "enum": block_types},
                 "arguments": {"type": "object"},
             },
             "required": ["block_type", "arguments"],
@@ -676,72 +468,41 @@ async def _page_extract(
 
 
 _TEXT = {"type": "string"}
-_RUN_TOOLS: tuple[tuple[str, str, dict[str, Any], list[str], Callable[..., Awaitable[Any]]], ...] = (
-    (
-        "read_run_data",
-        "Read what this run already has. Without name: the names of its workflow parameters, its earlier blocks "
-        "with their status, and its downloaded files. With name: that parameter's value, that block's output and "
-        "outcome, or that file's URL. Secret values are masked.",
-        {"name": _TEXT},
-        [],
-        _read_run_data,
-    ),
-    ("page_goto", "Open url in this run's browser.", {"url": _TEXT}, ["url"], _page_goto),
-    (
-        "page_click",
-        "Click the element prompt describes." + _NO_SECOND_AGENT,
-        {"prompt": _TEXT},
-        ["prompt"],
-        _page_click,
-    ),
-    (
-        "page_fill",
-        "Type value into the field prompt describes." + _NO_SECOND_AGENT,
-        {"prompt": _TEXT, "value": _TEXT},
-        ["prompt", "value"],
-        _page_fill,
-    ),
-    (
-        "page_extract",
-        "Read what prompt asks for from the page, shaped by schema, a JSON schema. For a yes/no check, pass "
-        '{"type": "boolean"}.' + _NO_SECOND_AGENT,
-        {"prompt": _TEXT, "schema": {"type": "object"}},
-        ["prompt"],
-        _page_extract,
-    ),
+_RUN_TOOLS: tuple[tuple[str, dict[str, Any], list[str], Callable[..., Awaitable[Any]]], ...] = (
+    ("read_run_data", {"name": _TEXT}, [], _read_run_data),
+    ("page_goto", {"url": _TEXT}, ["url"], _page_goto),
+    ("page_click", {"prompt": _TEXT}, ["prompt"], _page_click),
+    ("page_fill", {"prompt": _TEXT, "value": _TEXT}, ["prompt", "value"], _page_fill),
+    ("page_extract", {"prompt": _TEXT, "schema": {"type": "object"}}, ["prompt"], _page_extract),
 )
-
-
-def tool_descriptions() -> dict[str, str]:
-    """Every tool an agent step can be given, by name; login only when the run has a credential."""
-    return {
-        **{
-            tool.tool_name: tool.description or BLOCK_SUMMARIES[block_type.value]
-            for block_type, tool in AGENT_BLOCK_TOOLS.items()
-            if isinstance(tool, _BlockTool) and tool.tool_name
-        },
-        "run_block": _RUN_BLOCK_DESCRIPTION,
-        **{name: description for name, description, *_ in _RUN_TOOLS},
-        "finish": _FINISH_DESCRIPTION,
-    }
+if {name for name, *_ in _RUN_TOOLS} != set(RUN_TOOL_DESCRIPTIONS):
+    raise RuntimeError("_RUN_TOOLS and RUN_TOOL_DESCRIPTIONS must name the same tools.")
 
 
 def _tools(state: _RunState) -> list[FunctionTool]:
+    listed = None if state.tools is None else set(state.tools)
+
+    def offered(name: str) -> bool:
+        return listed is None or name in listed
+
+    block_types = [name for name in RUN_BLOCK_TYPES if offered(name)]
     return [
         *(
             _dedicated_tool(block_type, tool, state)
-            for block_type, tool in AGENT_BLOCK_TOOLS.items()
-            if isinstance(tool, _BlockTool)
-            and tool.tool_name
-            and ("credential" not in tool.fields or state.credential_keys)
+            for name, (block_type, tool) in DEDICATED_BLOCK_TOOLS.items()
+            if offered(name) and ("credential" not in tool.fields or state.credential_keys)
         ),
-        _run_block_tool(state),
-        *(_run_tool(*spec, state) for spec in _RUN_TOOLS),
+        *([_run_block_tool(state, block_types)] if block_types else []),
+        *(
+            _run_tool(name, RUN_TOOL_DESCRIPTIONS[name], properties, required, run, state)
+            for name, properties, required, run in _RUN_TOOLS
+            if offered(name)
+        ),
     ]
 
 
 async def _run_child_block(
-    tool_name: str, block_type: BlockType, tool: _BlockTool, written: object, state: _RunState
+    tool_name: str, block_type: BlockType, tool: BlockTool, written: object, state: _RunState
 ) -> str:
     label = f"{state.label}_{block_type.value}_{len(state.calls) + 1}"
     now = datetime.now(UTC)
@@ -829,6 +590,7 @@ async def run_agent_step(
         run_context=run_context,
         credential_keys=_credential_keys(run_context),
         ignore_workflow_system_prompt=block.ignore_workflow_system_prompt,
+        tools=block.tools,
     )
     effort = LLMConfigRegistry.get_config(llm_key).reasoning_effort
     model, run_config = resolve_agent_model(llm_key)

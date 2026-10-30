@@ -5140,13 +5140,7 @@ async def _update_workflow(
             code_block_diagnostics=advisory_labels,
             scanner_diagnostics=scanner_labels,
         )
-        findings = [
-            *findings,
-            *(
-                {"reason_code": "code_block_goal_incomplete", "summary": summary}
-                for summary in authoring_validation.findings
-            ),
-        ]
+        findings = [*findings, *authoring_validation.findings]
         if findings:
             data["findings"] = findings
         if authoring_validation.legacy_engine_blocks:

@@ -753,6 +753,11 @@ async def test_no_rotation_response_cannot_overwrite_concurrent_refresh_rotation
             return {"access_token": "at-after-rotation"}
         return {"access_token": "at-rotated", "refresh_token": "rt-rotated"}
 
+    async def load_active_ciphertext(**_: Any) -> ActiveCredentialCiphertext:
+        return ActiveCredentialCiphertext(
+            encrypted_refresh_token=stored_ciphertext, encrypted_method="aes_gcm", scopes_granted=["Mail.Read"]
+        )
+
     async def update_active_refresh_token(**kwargs: Any) -> bool:
         nonlocal stored_ciphertext
         if kwargs["expected_encrypted_refresh_token"] != stored_ciphertext:
@@ -765,7 +770,12 @@ async def test_no_rotation_response_cannot_overwrite_concurrent_refresh_rotation
     monkeypatch.setattr(
         microsoft_oauth_service.app,
         "DATABASE",
-        SimpleNamespace(microsoft_oauth=SimpleNamespace(update_active_refresh_token=update_active_refresh_token)),
+        SimpleNamespace(
+            microsoft_oauth=SimpleNamespace(
+                update_active_refresh_token=update_active_refresh_token,
+                load_active_ciphertext=load_active_ciphertext,
+            )
+        ),
     )
     secrets = microsoft_oauth_service.MicrosoftCredentialSecrets(
         refresh_token="rt-original",
@@ -820,6 +830,11 @@ async def test_refresh_returns_access_token_after_losing_token_cas(
         await winner_persisted.wait()
         return {"access_token": "at-loser", "refresh_token": losing_refresh_token}
 
+    async def load_active_ciphertext(**_: Any) -> ActiveCredentialCiphertext:
+        return ActiveCredentialCiphertext(
+            encrypted_refresh_token=stored_ciphertext, encrypted_method="aes_gcm", scopes_granted=["Mail.Read"]
+        )
+
     async def update_active_refresh_token(**kwargs: Any) -> bool:
         nonlocal stored_ciphertext
         if kwargs["expected_encrypted_refresh_token"] != stored_ciphertext:
@@ -832,7 +847,12 @@ async def test_refresh_returns_access_token_after_losing_token_cas(
     monkeypatch.setattr(
         microsoft_oauth_service.app,
         "DATABASE",
-        SimpleNamespace(microsoft_oauth=SimpleNamespace(update_active_refresh_token=update_active_refresh_token)),
+        SimpleNamespace(
+            microsoft_oauth=SimpleNamespace(
+                update_active_refresh_token=update_active_refresh_token,
+                load_active_ciphertext=load_active_ciphertext,
+            )
+        ),
     )
     secrets = microsoft_oauth_service.MicrosoftCredentialSecrets(
         refresh_token="rt-original",
@@ -864,6 +884,60 @@ async def test_refresh_returns_access_token_after_losing_token_cas(
         )
         == "rt-rotated"
     )
+
+
+@pytest.mark.asyncio
+@pytest.mark.usefixtures("registered_encryption")
+async def test_rotated_token_survives_backfill_reencrypting_the_row_mid_refresh(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(microsoft_oauth_service.settings, "ENABLE_ENCRYPTION", True, raising=False)
+    monkeypatch.setattr(microsoft_oauth_service.settings, "ENCRYPTOR_AES_SECRET_KEY", "gcm-test-key", raising=False)
+    monkeypatch.setattr(microsoft_oauth_service.settings, "ENCRYPTOR_AES_SALT", "gcm-test-salt", raising=False)
+    encrypt_method = microsoft_oauth_service.EncryptMethod
+    row = {
+        "ciphertext": await microsoft_oauth_service.encryptor.encrypt("rt-legacy", encrypt_method.AES),
+        "method": "aes",
+    }
+
+    async def load_active_ciphertext(**_: Any) -> ActiveCredentialCiphertext:
+        return ActiveCredentialCiphertext(
+            encrypted_refresh_token=row["ciphertext"], encrypted_method=row["method"], scopes_granted=["Mail.Read"]
+        )
+
+    async def update_active_refresh_token(**kwargs: Any) -> bool:
+        if kwargs["expected_encrypted_refresh_token"] != row["ciphertext"]:
+            return False
+        row.update(ciphertext=kwargs["encrypted_refresh_token"], method=kwargs["encrypted_method"].value)
+        return True
+
+    async def refresh_access_token(*_: Any, **__: Any) -> dict[str, str]:
+        # The GCM backfill rewrites the row after the refresh read it but before the refresh writes.
+        row.update(
+            ciphertext=await microsoft_oauth_service.encryptor.encrypt("rt-legacy", encrypt_method.AES_GCM),
+            method="aes_gcm",
+        )
+        return {"access_token": "at-fresh", "refresh_token": "rt-rotated"}
+
+    monkeypatch.setattr(
+        microsoft_oauth_service.app,
+        "DATABASE",
+        SimpleNamespace(
+            microsoft_oauth=SimpleNamespace(
+                load_active_ciphertext=load_active_ciphertext,
+                update_active_refresh_token=update_active_refresh_token,
+            )
+        ),
+    )
+    monkeypatch.setattr(microsoft_oauth_service, "refresh_access_token", refresh_access_token)
+
+    secrets = await microsoft_oauth_service.load_credential_secrets("org-1", "cred-1")
+    access_token = await microsoft_oauth_service.refresh_and_rotate(
+        organization_id="org-1", credential_id="cred-1", credential_secrets=secrets
+    )
+
+    assert access_token == "at-fresh"
+    assert (await microsoft_oauth_service.load_credential_secrets("org-1", "cred-1")).refresh_token == "rt-rotated"
 
 
 @pytest.mark.asyncio

@@ -1077,6 +1077,7 @@ function convertToNode(
           prompt: block.prompt,
           dataSchema: JSON.stringify(block.data_schema, null, 2),
           maxTurns: block.max_turns,
+          tools: block.tools ?? null,
           parameterKeys: (block.parameters ?? []).map((p) => p.key),
         },
       };
@@ -3593,6 +3594,7 @@ function getWorkflowBlock(
         prompt: node.data.prompt,
         data_schema: JSONSafeOrString(node.data.dataSchema),
         max_turns: node.data.maxTurns,
+        tools: node.data.tools,
         parameter_keys: node.data.parameterKeys,
       };
     }
@@ -5221,6 +5223,7 @@ function convertBlocksToBlockYAML(
           prompt: block.prompt,
           data_schema: block.data_schema,
           max_turns: block.max_turns,
+          tools: block.tools ?? null,
           parameter_keys: (block.parameters ?? []).map((p) => p.key),
         };
         return blockYaml;
@@ -6081,6 +6084,9 @@ function getWorkflowErrors(nodes: Array<AppNode>): Array<string> {
   nodes.filter(isAgentStepNode).forEach((node) => {
     if (node.data.prompt.trim().length === 0) {
       errors.push(`${node.data.label}: Prompt is required.`);
+    }
+    if (node.data.tools?.length === 0) {
+      errors.push(`${node.data.label}: Choose at least one tool.`);
     }
     let dataSchema: unknown;
     try {

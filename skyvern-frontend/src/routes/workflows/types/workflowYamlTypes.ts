@@ -352,6 +352,7 @@ export type AgentStepBlockYAML = BlockYAMLBase & {
   prompt: string;
   data_schema: Record<string, unknown> | string | null;
   max_turns: number;
+  tools?: Array<string> | null;
   parameter_keys?: Array<string> | null;
 };
 

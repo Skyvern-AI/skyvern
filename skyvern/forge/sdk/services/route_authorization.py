@@ -38,6 +38,7 @@ ROUTE_ACTIONS: Mapping[str, str] = {
     "skyvern.forge.sdk.routes.agent_protocol.delete_workflow_tag": "workflow.delete",
     "skyvern.forge.sdk.routes.agent_protocol.generate_task": "workflow.execute",
     "skyvern.forge.sdk.routes.agent_protocol.get_actions": "task.list",
+    "skyvern.forge.sdk.routes.agent_protocol.get_agent_step_tools": "workflow.read",
     "skyvern.forge.sdk.routes.agent_protocol.get_api_keys": "api_key.list",
     "skyvern.forge.sdk.routes.agent_protocol.get_artifact": "artifact.read",
     "skyvern.forge.sdk.routes.agent_protocol.get_artifact_content": "artifact.read",

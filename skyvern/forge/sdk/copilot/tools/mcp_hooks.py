@@ -81,6 +81,7 @@ from skyvern.forge.sdk.copilot.secret_scrub import (
     scrub_secrets_from_structure,
 )
 from skyvern.forge.sdk.schemas.credentials import Credential
+from skyvern.forge.sdk.workflow.models.agent_step_tools import tool_descriptions
 from skyvern.forge.sdk.workflow.models.block import (
     CLEAR_BROWSER_DATA_HELPER_CONTRACT,
     OPEN_PAGE_HELPER_CONTRACT,
@@ -400,9 +401,6 @@ async def _get_block_schema_pre_hook(
             },
         }
     if normalized == "agent_step" and normalized not in _copilot_banned_block_types(ctx):
-        # Imported here because agent_step_loop imports Copilot's model resolver, which imports this module.
-        from skyvern.forge.sdk.workflow.models.agent_step_loop import tool_descriptions
-
         return {
             "ok": True,
             "data": {

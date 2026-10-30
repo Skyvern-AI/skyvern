@@ -71,6 +71,7 @@ from skyvern.forge.sdk.copilot.tools.mcp_hooks import (
     _normalized_authoring_capability,
     _validate_block_pre_hook,
 )
+from skyvern.forge.sdk.copilot.workflow_yaml import _normalize_copilot_yaml
 from skyvern.forge.sdk.workflow.models.block import _TASK_V3_SUPPORTED_BLOCK_TYPES
 from skyvern.schemas.runs import ProxyLocation
 from tests.unit.copilot_test_helpers import make_copilot_ctx
@@ -1394,8 +1395,8 @@ def test_a_new_code_block_without_a_goal_is_a_finding_not_a_reject() -> None:
     validation = _accepted(ALL_BLOCK_FAMILIES, submitted, None)
 
     assert validation.reject is None
-    assert "open_site" in validation.findings[0]
-    assert "`prompt`" in validation.findings[0]
+    assert "open_site" in validation.findings[0]["summary"]
+    assert "`prompt`" in validation.findings[0]["summary"]
 
 
 def test_a_nested_prompt_criteria_conditional_is_rejected() -> None:
@@ -1632,6 +1633,7 @@ _AGENT_STEP_THEN_BRANCH = _yaml(
         "block_type": "agent_step",
         "label": "check_page",
         "prompt": "Open https://example.com and answer yes if it says Example Domain, otherwise no.",
+        "tools": ["browser_task", "page_extract"],
     },
     {
         "block_type": "conditional",
@@ -1710,10 +1712,13 @@ async def test_agent_step_is_served_listed_and_saved_only_with_the_org_grant_and
     if authorable:
         assert schema["data"]["summary"] == AGENT_STEP_BLOCK_SUMMARY
         fields = schema["data"]["schema"]["properties"]
-        assert all(fields[name].get("description") for name in ("prompt", "data_schema", "max_turns", "parameter_keys"))
+        assert all(
+            fields[name].get("description")
+            for name in ("prompt", "data_schema", "max_turns", "parameter_keys", "tools")
+        )
         step_tools = schema["data"]["tools_the_step_can_call"]
-        assert {"browser_task", "web_search", "run_block", "finish"} <= set(step_tools)
-        assert "file_download" in step_tools["run_block"] and "http_request" in step_tools["run_block"]
+        assert {"browser_task", "web_search", "file_download", "http_request", "finish"} <= set(step_tools)
+        assert "run_block" not in step_tools
         assert ctx.workflow_yaml == _AGENT_STEP_THEN_BRANCH
     else:
         assert "check_page (agent_step, block_type_unavailable)" in write["error"]
@@ -1758,3 +1763,42 @@ async def test_agent_step_stays_unavailable_without_a_grant_or_when_the_lookup_f
 
     assert config is not None
     assert config.authoring_capability == AGENT_BLOCKS_ONLY
+
+
+def test_copilot_normalization_keeps_an_agent_steps_tools() -> None:
+    workflow = yaml.safe_load(_AGENT_STEP_THEN_BRANCH)
+    workflow["workflow_definition"]["parameters"] = []
+
+    request = _normalize_copilot_yaml(yaml.safe_dump(workflow))
+
+    assert request.workflow_definition.blocks[0].tools == ["browser_task", "page_extract"]
+
+
+_STEP = {"block_type": "agent_step", "label": "check_page", "prompt": "Answer yes or no."}
+_LISTED = {**_STEP, "tools": ["http_request", "web_search"]}
+
+
+@pytest.mark.parametrize(
+    ("prior", "submitted", "reported"),
+    [
+        (None, _STEP, True),
+        (None, _LISTED, False),
+        (_LISTED, _STEP, True),
+        (_STEP, _STEP, False),
+        (_STEP, {**_STEP, "tools": ["web_search"]}, False),
+    ],
+)
+@pytest.mark.asyncio
+async def test_an_agent_step_copilot_saves_without_tools_is_saved_and_reported(
+    prior: dict[str, object] | None, submitted: dict[str, object], reported: bool
+) -> None:
+    ctx = _ctx(prior_yaml=_yaml(prior) if prior else None)
+    ctx.authoring_capability = _AGENT_STEP_GRANTED
+
+    write = await _update_with_stubbed_save(_yaml(submitted), ctx)
+
+    assert write["ok"] is True
+    findings = [f for f in write["data"].get("findings", []) if f["reason_code"] == "agent_step_tools_missing"]
+    assert bool(findings) is reported
+    if reported:
+        assert "check_page" in findings[0]["summary"] and "http_request" in findings[0]["summary"]

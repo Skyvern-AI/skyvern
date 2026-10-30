@@ -29,8 +29,14 @@ function AgentStepBlockFormBody({
       prompt: node.data.prompt,
       dataSchema: node.data.dataSchema,
       maxTurns: node.data.maxTurns,
+      tools: node.data.tools,
     }),
-    [node.data.prompt, node.data.dataSchema, node.data.maxTurns],
+    [
+      node.data.prompt,
+      node.data.dataSchema,
+      node.data.maxTurns,
+      node.data.tools,
+    ],
   );
   const { commit } = useDebouncedSidebarSave({ blockId, value });
 

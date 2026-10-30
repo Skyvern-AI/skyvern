@@ -65,7 +65,12 @@ interface MultiSelectProps
     value: string;
     /** Optional icon component to display alongside the option. */
     icon?: React.ComponentType<{ className?: string }>;
+    /** Optional text shown beside the label in the dropdown only. */
+    description?: string;
   }[];
+
+  /** Shown in place of the badges when every option is selected. */
+  allSelectedLabel?: string;
 
   /**
    * Callback function triggered when the selected values change.
@@ -112,6 +117,7 @@ export const MultiSelect = React.forwardRef<
       onValueChange,
       variant,
       value,
+      allSelectedLabel,
       placeholder = "Select options",
       maxCount = 3,
       modalPopover = false,
@@ -121,6 +127,10 @@ export const MultiSelect = React.forwardRef<
     ref,
   ) => {
     const [isPopoverOpen, setIsPopoverOpen] = React.useState(false);
+    const showAllSelectedLabel =
+      allSelectedLabel !== undefined &&
+      options.length > 0 &&
+      value.length === options.length;
 
     const handleInputKeyDown = (
       event: React.KeyboardEvent<HTMLInputElement>,
@@ -179,7 +189,7 @@ export const MultiSelect = React.forwardRef<
               className,
             )}
           >
-            {value.length > 0 ? (
+            {value.length > 0 && !showAllSelectedLabel ? (
               <div className="flex w-full items-center justify-between">
                 <div className="flex flex-wrap items-center">
                   {value.slice(0, maxCount).map((value) => {
@@ -193,7 +203,7 @@ export const MultiSelect = React.forwardRef<
                         {IconComponent && (
                           <IconComponent className="mr-2 h-4 w-4" />
                         )}
-                        {option?.label}
+                        {option?.label ?? value}
                         <CrossCircledIcon
                           className="ml-2 h-4 w-4 cursor-pointer"
                           onClick={(event) => {
@@ -239,8 +249,15 @@ export const MultiSelect = React.forwardRef<
               </div>
             ) : (
               <div className="mx-auto flex w-full items-center justify-between">
-                <span className="mx-2 text-xs font-normal text-muted-foreground">
-                  {placeholder}
+                <span
+                  className={cn(
+                    "mx-2 text-xs font-normal",
+                    showAllSelectedLabel
+                      ? "text-foreground"
+                      : "text-muted-foreground",
+                  )}
+                >
+                  {showAllSelectedLabel ? allSelectedLabel : placeholder}
                 </span>
                 <ChevronDownIcon className="mx-2 h-4 cursor-pointer text-muted-foreground" />
               </div>
@@ -299,6 +316,14 @@ export const MultiSelect = React.forwardRef<
                         <option.icon className="mr-2 h-4 w-4 text-muted-foreground" />
                       )}
                       <span>{option.label}</span>
+                      {option.description && (
+                        <span
+                          className="ml-2 max-w-72 truncate text-xs text-muted-foreground"
+                          title={option.description}
+                        >
+                          {option.description}
+                        </span>
+                      )}
                     </CommandItem>
                   );
                 })}

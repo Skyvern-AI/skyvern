@@ -24,6 +24,7 @@ from skyvern.forge.sdk.schemas.workflow_copilot import (
     WorkflowCopilotChatRequest,
     client_visible_proposed_workflow,
 )
+from skyvern.forge.sdk.workflow.models.agent_step_block import AgentStepBlock
 from skyvern.forge.sdk.workflow.models.block import CodeBlock, FileDownloadBlock
 from skyvern.forge.sdk.workflow.models.parameter import OutputParameter, WorkflowParameter, WorkflowParameterType
 from skyvern.forge.sdk.workflow.models.workflow import Workflow, WorkflowDefinition
@@ -148,6 +149,24 @@ def test_workflow_to_copilot_yaml_keeps_saved_blocks_without_runtime_fields() ->
     assert "output_parameter" not in blocks[0]
     assert "parameters" not in blocks[0]
     assert all(parameter["parameter_type"] != "output" for parameter in parsed["workflow_definition"]["parameters"])
+
+
+@pytest.mark.parametrize("tools", [["http_request"], None])
+def test_workflow_to_copilot_yaml_keeps_an_agent_steps_tools_list_or_its_absence(tools: list[str] | None) -> None:
+    workflow = _saved_workflow()
+    workflow.workflow_definition.blocks = [
+        AgentStepBlock(
+            label="agent",
+            output_parameter=_output_parameter(workflow.created_at),
+            prompt="Find the answer.",
+            data_schema={"type": "object"},
+            tools=tools,
+        )
+    ]
+
+    block = yaml.safe_load(workflow_to_copilot_yaml(workflow))["workflow_definition"]["blocks"][0]
+
+    assert block.get("tools") == tools
 
 
 def test_copilot_workflow_outputs_mask_inline_secrets_without_mutating_proposal() -> None:

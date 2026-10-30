@@ -17257,13 +17257,29 @@ class TaskV2Block(Block):
                 extra_http_headers=workflow_run.extra_http_headers,
                 cdp_connect_headers=workflow_run.cdp_connect_headers,
             )
+            # The parent's admission check ran before the awaited child initialization; recheck it before queueing.
+            settled = await task_v2_service.settle_child_of_ended_parent(task_v2, workflow_run_id, organization_id)
+            if settled is not None:
+                return await self.build_block_result(
+                    success=False,
+                    failure_reason="The parent run ended before this task v2 block started",
+                    output_parameter_value=None,
+                    status=BlockStatus.canceled,
+                    workflow_run_block_id=workflow_run_block_id,
+                    organization_id=organization_id,
+                )
+            # Another server may already have finished the child; never queue a final row again.
             await app.DATABASE.observer.update_task_v2(
-                task_v2.observer_cruise_id, status=TaskV2Status.queued, organization_id=organization_id
+                task_v2.observer_cruise_id,
+                status=TaskV2Status.queued,
+                organization_id=organization_id,
+                keep_final_status=True,
             )
             if task_v2.workflow_run_id:
-                await app.DATABASE.workflow_runs.update_workflow_run(
+                await app.DATABASE.workflow_runs.update_workflow_run_if_not_final(
                     workflow_run_id=task_v2.workflow_run_id,
                     status=WorkflowRunStatus.queued,
+                    only_from=[WorkflowRunStatus.created, WorkflowRunStatus.queued],
                 )
                 await app.DATABASE.observer.update_workflow_run_block(
                     workflow_run_block_id=workflow_run_block_id,

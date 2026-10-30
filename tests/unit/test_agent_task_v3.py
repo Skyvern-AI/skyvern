@@ -101,8 +101,10 @@ from skyvern.forge.taskv3.loop import (
     run_agent_tool_loop,
 )
 from skyvern.forge.taskv3.run_arms import (
+    ANSWER_AUDIT_LOG_ONLY_FLAG,
     DATE_SEGMENT_AIM_FLAG,
     DEAD_END_RETURN_FLAG,
+    LLM_ROUTE_FLAG,
     LOGIN_PACE_FLAG,
     TURN_DOM_FLAG,
     run_arm_enabled,
@@ -466,9 +468,8 @@ async def test_execute_task_v3_buckets_the_date_segment_aim_arm_per_run(monkeypa
     )
 
     assert loop_mock.date_segment_aim_enabled_during_loop is True
-    assert loop_mock.context.run_arms[DATE_SEGMENT_AIM_FLAG] == (task.workflow_run_id, "treatment")
-    assert loop_mock.context.run_arms[DEAD_END_RETURN_FLAG] == (task.workflow_run_id, "treatment")
-    for flag in (DATE_SEGMENT_AIM_FLAG, DEAD_END_RETURN_FLAG):
+    for flag in (DATE_SEGMENT_AIM_FLAG, DEAD_END_RETURN_FLAG, ANSWER_AUDIT_LOG_ONLY_FLAG):
+        assert loop_mock.context.run_arms[flag] == (task.workflow_run_id, "treatment")
         provider.assert_any_await(flag, task.workflow_run_id, properties={"organization_id": task.organization_id})
 
 
@@ -1279,9 +1280,18 @@ def stub_workflow_block_engine_app(mock_wbe_app: MagicMock, *, billing_tier: Bil
     mock_wbe_app.AGENT_FUNCTION.resolve_billing_tier = AsyncMock(return_value=billing_tier)
 
 
-def _v3_task(llm_key: str | None = None, workflow_permanent_id: str | None = None) -> SimpleNamespace:
+def _v3_task(
+    llm_key: str | None = None,
+    workflow_permanent_id: str | None = None,
+    workflow_run_id: str | None = None,
+    task_id: str = "tsk_x",
+) -> SimpleNamespace:
     return SimpleNamespace(
-        llm_key=llm_key, task_id="tsk_x", organization_id="o_test", workflow_permanent_id=workflow_permanent_id
+        llm_key=llm_key,
+        task_id=task_id,
+        organization_id="o_test",
+        workflow_permanent_id=workflow_permanent_id,
+        workflow_run_id=workflow_run_id,
     )
 
 
@@ -1292,7 +1302,7 @@ async def test_resolve_v3_llm_key_prefers_explicit_task_key(monkeypatch: pytest.
         "skyvern.forge.agent.app.EXPERIMENTATION_PROVIDER.get_value_cached",
         AsyncMock(side_effect=AssertionError("flag must not be read when task.llm_key is set")),
     )
-    assert await agent_module._resolve_task_v3_llm_key(_v3_task(llm_key="EXPLICIT_KEY")) == "EXPLICIT_KEY"
+    assert await agent_module._resolve_task_v3_llm_key(_v3_task(llm_key="EXPLICIT_KEY")) == ("EXPLICIT_KEY", None)
 
 
 @pytest.mark.asyncio
@@ -1303,7 +1313,11 @@ async def test_resolve_v3_llm_key_uses_posthog_override(monkeypatch: pytest.Monk
     )
     monkeypatch.setattr(agent_module.LLMConfigRegistry, "is_registered", lambda _k: True)
     monkeypatch.setattr(agent_module, "is_custom_llm_key", lambda _k: False)
-    assert await agent_module._resolve_task_v3_llm_key(_v3_task()) == "OPENAI_GPT5_6_LUNA"
+    assert await agent_module._resolve_task_v3_llm_key(_v3_task()) == ("OPENAI_GPT5_6_LUNA", None)
+
+
+def _llm_name_properties(reader: AsyncMock) -> dict[str, Any]:
+    return [c for c in reader.call_args_list if c.args[0] == "TASK_V3_LLM_NAME"][-1].kwargs["properties"]
 
 
 @pytest.mark.asyncio
@@ -1316,14 +1330,14 @@ async def test_resolve_v3_llm_key_sends_wpid_flag_property(monkeypatch: pytest.M
     monkeypatch.setattr(agent_module, "is_custom_llm_key", lambda _k: False)
 
     resolved = await agent_module._resolve_task_v3_llm_key(_v3_task(workflow_permanent_id="wpid_123"))
-    assert resolved == "FLAG_KEY"
-    assert reader.call_args.kwargs["properties"] == {
+    assert resolved == ("FLAG_KEY", None)
+    assert _llm_name_properties(reader) == {
         "organization_id": "o_test",
         "workflow_permanent_id": "wpid_123",
     }
 
     await agent_module._resolve_task_v3_llm_key(_v3_task())
-    assert reader.call_args.kwargs["properties"] == {
+    assert _llm_name_properties(reader) == {
         "organization_id": "o_test",
         "workflow_permanent_id": "not_workflow",
     }
@@ -1335,7 +1349,7 @@ async def test_resolve_v3_llm_key_sends_wpid_flag_property(monkeypatch: pytest.M
         await agent_module._resolve_task_v3_llm_key(_v3_task())
     finally:
         skyvern_context.reset()
-    assert reader.call_args.kwargs["properties"] == {
+    assert _llm_name_properties(reader) == {
         "organization_id": "o_test",
         "workflow_permanent_id": "wpid_from_ctx",
     }
@@ -1363,7 +1377,7 @@ async def test_resolve_v3_llm_key_ignores_unusable_flag_value(
     monkeypatch.setattr(agent_module, "is_custom_llm_key", lambda _k: False)
     monkeypatch.setattr(agent_module.settings, "TASK_V3_LLM_KEY", "")
     monkeypatch.setattr(agent_module.settings, "LLM_KEY", "DEFAULT_MODEL")
-    assert await agent_module._resolve_task_v3_llm_key(_v3_task()) == "DEFAULT_MODEL"
+    assert await agent_module._resolve_task_v3_llm_key(_v3_task()) == ("DEFAULT_MODEL", None)
 
 
 @pytest.mark.asyncio
@@ -1375,7 +1389,7 @@ async def test_resolve_v3_llm_key_falls_back_when_flag_read_raises(monkeypatch: 
     monkeypatch.setattr(agent_module.settings, "TASK_V3_LLM_KEY", "V3_DIRECT")
     monkeypatch.setattr(agent_module.settings, "LLM_KEY", "DEFAULT_MODEL")
     # TASK_V3_LLM_KEY set → used ahead of LLM_KEY.
-    assert await agent_module._resolve_task_v3_llm_key(_v3_task()) == "V3_DIRECT"
+    assert await agent_module._resolve_task_v3_llm_key(_v3_task()) == ("V3_DIRECT", None)
 
 
 @pytest.mark.asyncio
@@ -1407,7 +1421,7 @@ async def test_resolve_v3_llm_key_keeps_a_ui_run_off_flex(
 
     skyvern_context.set(SkyvernContext(trigger_type=trigger_type))
     try:
-        assert await agent_module._resolve_task_v3_llm_key(_v3_task()) == expected_key
+        assert await agent_module._resolve_task_v3_llm_key(_v3_task()) == (expected_key, None)
     finally:
         skyvern_context.reset()
 
@@ -1422,9 +1436,161 @@ async def test_resolve_v3_llm_key_honors_an_explicit_flex_key_on_a_ui_run(monkey
     )
     skyvern_context.set(SkyvernContext(trigger_type=WorkflowRunTriggerType.manual))
     try:
-        assert await agent_module._resolve_task_v3_llm_key(_v3_task(llm_key="FLEX_ROUTER")) == "FLEX_ROUTER"
+        assert await agent_module._resolve_task_v3_llm_key(_v3_task(llm_key="FLEX_ROUTER")) == ("FLEX_ROUTER", None)
     finally:
         skyvern_context.reset()
+
+
+def _route_flag_reader(route_variant: str | Exception | None) -> AsyncMock:
+    """No TASK_V3_LLM_NAME variant; ``route_variant`` for the LLM route arm."""
+
+    async def read(flag: str, _distinct_id: str, properties: dict[str, Any] | None = None) -> str | None:
+        if flag != LLM_ROUTE_FLAG:
+            return None
+        if isinstance(route_variant, Exception):
+            raise route_variant
+        return route_variant
+
+    return AsyncMock(side_effect=read)
+
+
+def _stub_llm_route(monkeypatch: pytest.MonkeyPatch, reader: AsyncMock, non_flex: dict[str, str] | None = None) -> None:
+    monkeypatch.setattr("skyvern.forge.agent.app.EXPERIMENTATION_PROVIDER.get_value_cached", reader)
+    monkeypatch.setattr(agent_module.settings, "TASK_V3_LLM_KEY", "CONTROL_ROUTE")
+    monkeypatch.setattr(
+        app.AGENT_FUNCTION,
+        "get_task_v3_llm_route_treatment_key",
+        lambda key: "TREATMENT_ROUTE" if key == "CONTROL_ROUTE" else None,
+        raising=False,
+    )
+    monkeypatch.setattr(app.AGENT_FUNCTION, "get_non_flex_llm_key", lambda key: (non_flex or {}).get(key))
+    monkeypatch.setattr(agent_module.LLMConfigRegistry, "is_registered", lambda _k: True)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("route_variant", "trigger_type", "expected"),
+    [
+        ("treatment", WorkflowRunTriggerType.api, ("TREATMENT_ROUTE", "treatment")),
+        ("control", WorkflowRunTriggerType.api, ("CONTROL_ROUTE", "control")),
+        (None, WorkflowRunTriggerType.api, ("CONTROL_ROUTE", None)),
+        (RuntimeError("flag service down"), WorkflowRunTriggerType.api, ("CONTROL_ROUTE", None)),
+        # A manual/MCP run still leaves flex on whichever route the arm picked, under the same label.
+        ("treatment", WorkflowRunTriggerType.manual, ("TREATMENT_STANDARD", "treatment")),
+        ("control", WorkflowRunTriggerType.manual, ("CONTROL_STANDARD", "control")),
+    ],
+)
+async def test_resolve_v3_llm_key_llm_route_arm_swaps_only_a_treatment_run(
+    monkeypatch: pytest.MonkeyPatch,
+    route_variant: str | Exception | None,
+    trigger_type: WorkflowRunTriggerType,
+    expected: tuple[str, str | None],
+) -> None:
+    _stub_llm_route(
+        monkeypatch,
+        _route_flag_reader(route_variant),
+        non_flex={"CONTROL_ROUTE": "CONTROL_STANDARD", "TREATMENT_ROUTE": "TREATMENT_STANDARD"},
+    )
+    skyvern_context.set(SkyvernContext(trigger_type=trigger_type))
+    try:
+        assert await agent_module._resolve_task_v3_llm_key(_v3_task(workflow_run_id="wr_1")) == expected
+    finally:
+        skyvern_context.reset()
+
+
+@pytest.mark.asyncio
+async def test_resolve_v3_llm_key_llm_route_arm_leaves_unmapped_and_explicit_keys(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _stub_llm_route(monkeypatch, _route_flag_reader("treatment"))
+    hook_keys: list[str] = []
+    monkeypatch.setattr(
+        app.AGENT_FUNCTION,
+        "get_task_v3_llm_route_treatment_key",
+        lambda key: hook_keys.append(key) or ("TREATMENT_ROUTE" if key == "CONTROL_ROUTE" else None),
+        raising=False,
+    )
+    # An arm that never applies is never resolved, so its exposure counts only runs it could change.
+    arm_resolver = AsyncMock(side_effect=AssertionError("the route arm must not be resolved"))
+    monkeypatch.setattr(agent_module, "resolve_run_arm", arm_resolver)
+    skyvern_context.set(SkyvernContext())
+    try:
+        explicit = await agent_module._resolve_task_v3_llm_key(_v3_task(llm_key="CONTROL_ROUTE"))
+        monkeypatch.setattr(agent_module.settings, "TASK_V3_LLM_KEY", "UNMAPPED_ROUTE")
+        unmapped = await agent_module._resolve_task_v3_llm_key(_v3_task())
+    finally:
+        skyvern_context.reset()
+    assert (explicit, unmapped) == (("CONTROL_ROUTE", None), ("UNMAPPED_ROUTE", None))
+    assert hook_keys == ["UNMAPPED_ROUTE"]
+    arm_resolver.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_resolve_v3_llm_key_llm_route_arm_is_unlabeled_without_a_run_context(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _stub_llm_route(monkeypatch, _route_flag_reader("treatment"))
+    assert await agent_module._resolve_task_v3_llm_key(_v3_task(workflow_run_id="wr_1")) == ("CONTROL_ROUTE", None)
+
+
+@pytest.mark.asyncio
+async def test_resolve_v3_llm_key_llm_route_arm_is_pinned_across_blocks_of_one_run(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    variants = iter(["treatment", "control"])
+    reader = _route_flag_reader(None)
+    reader.side_effect = lambda flag, *_a, **_k: next(variants) if flag == LLM_ROUTE_FLAG else None
+    _stub_llm_route(monkeypatch, reader)
+    skyvern_context.set(SkyvernContext())
+    try:
+        first = await agent_module._resolve_task_v3_llm_key(_v3_task(workflow_run_id="wr_1", task_id="tsk_1"))
+        second = await agent_module._resolve_task_v3_llm_key(_v3_task(workflow_run_id="wr_1", task_id="tsk_2"))
+    finally:
+        skyvern_context.reset()
+    assert (first, second) == (("TREATMENT_ROUTE", "treatment"), ("TREATMENT_ROUTE", "treatment"))
+    assert [c.args[:2] for c in reader.call_args_list if c.args[0] == LLM_ROUTE_FLAG] == [(LLM_ROUTE_FLAG, "wr_1")]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("route_variant", ["treatment", "control"])
+async def test_resolve_v3_llm_key_labels_only_blocks_whose_key_went_through_the_arm(
+    monkeypatch: pytest.MonkeyPatch, route_variant: str
+) -> None:
+    overrides = {"tsk_2": "UNPAIRED_ROUTE"}
+
+    async def read(flag: str, distinct_id: str, properties: dict[str, Any] | None = None) -> str | None:
+        return route_variant if flag == LLM_ROUTE_FLAG else overrides.get(distinct_id)
+
+    _stub_llm_route(monkeypatch, AsyncMock(side_effect=read))
+    skyvern_context.set(SkyvernContext())
+    try:
+        labels = [
+            (await agent_module._resolve_task_v3_llm_key(task))[1]
+            for task in (
+                _v3_task(workflow_run_id="wr_1", task_id="tsk_1"),
+                _v3_task(workflow_run_id="wr_1", task_id="tsk_2"),
+                # An explicit key equal to the control key is unlabeled under either pin.
+                _v3_task(llm_key="CONTROL_ROUTE", workflow_run_id="wr_1", task_id="tsk_3"),
+            )
+        ]
+    finally:
+        skyvern_context.reset()
+    assert labels == [route_variant, None, None]
+
+
+@pytest.mark.asyncio
+async def test_execute_task_v3_hands_the_loop_the_route_arm_recorded_with_the_key(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        agent_module, "_resolve_task_v3_llm_key", AsyncMock(return_value=("TREATMENT_ROUTE", "treatment"))
+    )
+    caller_factory = MagicMock()
+    _, _, loop_mock, _ = await _run_execute_task_v3(
+        monkeypatch, LoopOutcome(status="completed", reason="done"), llm_caller_factory=caller_factory
+    )
+    assert caller_factory.call_args.kwargs["llm_key"] == "TREATMENT_ROUTE"
+    assert loop_mock.await_args.kwargs["llm_route_arm"] == "treatment"
 
 
 @pytest.mark.asyncio
