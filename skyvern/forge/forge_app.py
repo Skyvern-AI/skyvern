@@ -19,6 +19,11 @@ from skyvern.forge.sdk.api.custom_credential_client import CustomCredentialAPICl
 from skyvern.forge.sdk.api.gcp import GcpClientFactory
 from skyvern.forge.sdk.api.llm.api_handler import LLMAPIHandler
 from skyvern.forge.sdk.api.llm.api_handler_factory import LLMAPIHandlerFactory
+from skyvern.forge.sdk.api.llm.config_registry import LLMConfigRegistry
+from skyvern.forge.sdk.api.llm.nace_decision_llm_caller import (
+    NACE_DECISION_LLM_KEY,
+    NaceDecisionClient,
+)
 from skyvern.forge.sdk.api.real_azure import RealAzureClientFactory
 from skyvern.forge.sdk.api.real_gcp import RealGcpClientFactory
 from skyvern.forge.sdk.artifact.manager import ArtifactManager
@@ -83,6 +88,7 @@ class ForgeApp:
     ANTHROPIC_CLIENT: AsyncAnthropic | AsyncAnthropicBedrock
     UI_TARS_CLIENT: AsyncOpenAI | None
     YUTORI_CLIENT: AsyncYutoriClient | None
+    NACE_CLIENT: NaceDecisionClient | None
     AZURE_CLIENT_FACTORY: AzureClientFactory
     GCP_CLIENT_FACTORY: GcpClientFactory
     SECONDARY_LLM_API_HANDLER: LLMAPIHandler
@@ -95,6 +101,7 @@ class ForgeApp:
     EXTRACTION_LLM_API_HANDLER: LLMAPIHandler
     CHECK_USER_GOAL_LLM_API_HANDLER: LLMAPIHandler
     AUTO_COMPLETION_LLM_API_HANDLER: LLMAPIHandler
+    DECISION_LLM_API_HANDLER: LLMAPIHandler | None
     SVG_CSS_CONVERTER_LLM_API_HANDLER: LLMAPIHandler | None
     SCRIPT_GENERATION_LLM_API_HANDLER: LLMAPIHandler
     SCRIPT_REVIEWER_LLM_API_HANDLER: LLMAPIHandler
@@ -193,6 +200,23 @@ def create_forge_app() -> ForgeApp:
             api_key=settings.YUTORI_API_KEY,
             base_url=settings.YUTORI_API_BASE,
         )
+
+    # Nace Drex Max answers only the bounded-choice prompts (see nace_decision_llm_caller); when
+    # it is off or misconfigured those prompts keep the handlers below.
+    app.NACE_CLIENT = None
+    app.DECISION_LLM_API_HANDLER = None
+    if settings.ENABLE_NACE:
+        if LLMConfigRegistry.get_config_issue(NACE_DECISION_LLM_KEY):
+            LOG.warning("ENABLE_NACE is set but NACE_API_KEY is missing; using default handlers")
+        else:
+            app.NACE_CLIENT = NaceDecisionClient(
+                api_key=settings.NACE_API_KEY,
+                base_url=settings.NACE_API_BASE,
+                model=settings.NACE_MODEL,
+            )
+            app.DECISION_LLM_API_HANDLER = LLMAPIHandlerFactory.get_llm_api_handler(
+                NACE_DECISION_LLM_KEY,
+            )
 
     app.SECONDARY_LLM_API_HANDLER = LLMAPIHandlerFactory.get_llm_api_handler(
         settings.SECONDARY_LLM_KEY if settings.SECONDARY_LLM_KEY else settings.LLM_KEY
