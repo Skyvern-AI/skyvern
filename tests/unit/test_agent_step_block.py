@@ -3,6 +3,8 @@ from __future__ import annotations
 import asyncio
 import json
 import re
+import subprocess
+import sys
 from datetime import UTC, datetime
 from types import SimpleNamespace
 from typing import Any, NoReturn, cast
@@ -25,6 +27,7 @@ from agents.items import TResponseOutputItem
 from agents.models.interface import Model
 from agents.tool_context import ToolContext
 from litellm.types.utils import ModelResponse as LitellmResponse
+from pydantic import ValidationError
 from sqlalchemy import select, update
 from sqlalchemy.ext.asyncio import AsyncEngine
 
@@ -42,8 +45,13 @@ from skyvern.forge.sdk.models import StepStatus
 from skyvern.forge.sdk.schemas.files import FileInfo
 from skyvern.forge.sdk.schemas.tasks import TaskStatus
 from skyvern.forge.sdk.workflow.context_manager import WorkflowContextManager, WorkflowRunContext
-from skyvern.forge.sdk.workflow.models import agent_step_loop
-from skyvern.forge.sdk.workflow.models.parameter import PLATFORM_SMTP_AWS_KEYS, AWSSecretParameter
+from skyvern.forge.sdk.workflow.models import agent_step_loop, agent_step_tools
+from skyvern.forge.sdk.workflow.models.parameter import (
+    PLATFORM_SMTP_AWS_KEYS,
+    AWSSecretParameter,
+    WorkflowParameter,
+    WorkflowParameterType,
+)
 from skyvern.forge.sdk.workflow.workflow_definition_converter import block_yaml_to_block
 from skyvern.schemas.llm import LLMConfig
 from skyvern.schemas.workflows import AgentStepBlockYAML, BlockResult, BlockStatus, BlockType
@@ -77,6 +85,7 @@ class _ScriptedModel(Model):
         self.script = script
         self.inputs: list[list[str | list[TResponseInputItem] | None]] = []
         self.tool_names: list[list[str]] = []
+        self.tools: list[list[Tool]] = []
         self.tool_descriptions: list[dict[str, str]] = []
 
     async def get_response(
@@ -90,6 +99,7 @@ class _ScriptedModel(Model):
     ) -> ModelResponse:
         self.inputs.append([system_instructions, input])
         self.tool_names.append([tool.name for tool in tools])
+        self.tools.append(tools)
         self.tool_descriptions.append({tool.name: tool.description for tool in tools if isinstance(tool, FunctionTool)})
         _observe_copilot_model_usage(CopilotModelUsageEvent(request_model="scripted", cost=MODEL_CALL_COST))
         return ModelResponse(output=self.script[len(self.inputs) - 1], usage=Usage(requests=1), response_id=None)
@@ -181,6 +191,7 @@ async def _run_agent_block(
     model: _ScriptedModel | None,
     max_turns: int = 25,
     prompt: str = "Find the answer.",
+    tools: list[str] | None = None,
     **block_fields: bool,
 ) -> tuple[BlockResult, _FlagProvider]:
     """With no model, the block resolves the variant's real model, which sends through litellm.acompletion."""
@@ -191,7 +202,7 @@ async def _run_agent_block(
             agent_step_loop, "resolve_agent_model", lambda _key: (model, RunConfig(tracing_disabled=True))
         )
     block = block_yaml_to_block(
-        AgentStepBlockYAML(label="agent", prompt=prompt, max_turns=max_turns, **block_fields),
+        AgentStepBlockYAML(label="agent", prompt=prompt, max_turns=max_turns, tools=tools, **block_fields),
         {"agent_output": make_block_output_parameter("agent_output")},
     )
     return await block.execute_safe(workflow_run_id=RUN, organization_id=ORG), provider
@@ -296,9 +307,113 @@ async def test_authors_are_shown_exactly_the_tools_the_step_gets(
 
     await _run_agent_block(monkeypatch, LUNA_MEDIUM, model)
 
+    shown = agent_step_tools.tool_descriptions()
+    (given,) = model.tool_descriptions
+    run_block = given.pop("run_block")
+    assert given == {name: shown[name] for name in given}
     # This run has no credential parameter, so the step is not given login.
-    shown = {name: text for name, text in agent_step_loop.tool_descriptions().items() if name != "login"}
-    assert model.tool_descriptions == [shown]
+    assert set(given) | set(agent_step_tools.RUN_BLOCK_TYPES) | {"login"} == set(shown)
+    assert all(shown[name].rstrip(".") in run_block for name in agent_step_tools.RUN_BLOCK_TYPES)
+
+
+def _credential_parameter() -> WorkflowParameter:
+    now = datetime.now(UTC)
+    return WorkflowParameter(
+        key="login_credential",
+        workflow_parameter_id="wp_credential",
+        workflow_parameter_type=WorkflowParameterType.CREDENTIAL_ID,
+        workflow_id="w_1",
+        created_at=now,
+        modified_at=now,
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("tools", "credential", "offered", "block_types"),
+    [
+        (["http_request", "web_search"], False, ["web_search", "run_block", "finish"], ["http_request"]),
+        (None, False, ALL_TOOLS, list(agent_step_tools.RUN_BLOCK_TYPES)),
+        (["web_search"], False, ["web_search", "finish"], None),
+        (["login", "page_goto"], False, ["page_goto", "finish"], None),
+        (["login", "page_goto"], True, ["login", "page_goto", "finish"], None),
+        (["finish"], False, ["finish"], None),
+    ],
+)
+async def test_a_step_is_offered_only_the_tools_it_lists_and_finish(
+    monkeypatch: pytest.MonkeyPatch,
+    database: AgentDB,
+    tools: list[str] | None,
+    credential: bool,
+    offered: list[str],
+    block_types: list[str] | None,
+) -> None:
+    monkeypatch.setitem(LLMConfigRegistry._configs, LUNA_MEDIUM, _pinned("medium"))
+    if credential:
+        app.WORKFLOW_CONTEXT_MANAGER.workflow_run_contexts[RUN].parameters["login_credential"] = _credential_parameter()
+    model = _ScriptedModel([VALID_FINISH])
+
+    await _run_agent_block(monkeypatch, LUNA_MEDIUM, model, tools=tools)
+
+    (given,) = model.tools
+    assert [tool.name for tool in given] == offered
+    run_block = next((tool for tool in given if isinstance(tool, FunctionTool) and tool.name == "run_block"), None)
+    if block_types is None:
+        assert run_block is None
+        return
+    assert run_block is not None
+    assert run_block.params_json_schema["properties"]["block_type"]["enum"] == block_types
+    described = {name for name in agent_step_tools.RUN_BLOCK_TYPES if f"- {name}(" in run_block.description}
+    assert described == set(block_types)
+
+
+@pytest.mark.asyncio
+async def test_a_run_block_call_for_an_unlisted_block_type_runs_no_child(
+    monkeypatch: pytest.MonkeyPatch, database: AgentDB, child_prompts: list[str]
+) -> None:
+    monkeypatch.setitem(LLMConfigRegistry._configs, LUNA_MEDIUM, _pinned("medium"))
+    model = _ScriptedModel(
+        [
+            [scripted_call("run_block", {"block_type": "text_prompt", "arguments": {"prompt": "Hi"}}, call_id="t")],
+            [scripted_call("finish", {"answer": "done"}, call_id="f")],
+        ]
+    )
+
+    await _run_agent_block(monkeypatch, LUNA_MEDIUM, model, tools=["http_request"])
+
+    rows = await database.observer.get_workflow_run_blocks(workflow_run_id=RUN, organization_id=ORG)
+    assert [row.block_type for row in rows] == [BlockType.AGENT_STEP]
+    assert child_prompts == []
+    assert "['http_request']" in tool_outputs_for(model.inputs[1][1], "t")[0]
+
+
+@pytest.mark.parametrize("name", ["run_block", "update_workflow", "create_schedule", "not_a_tool"])
+def test_a_tool_the_step_cannot_be_given_fails_at_save_and_the_error_lists_the_valid_tools(name: str) -> None:
+    with pytest.raises(ValidationError) as error:
+        AgentStepBlockYAML(label="agent", prompt="Find the answer.", tools=["http_request", name])
+
+    message = str(error.value)
+    assert f"Unknown tools [{name!r}]" in message
+    assert ", ".join(sorted(agent_step_tools.tool_descriptions())) in message
+
+
+def test_an_empty_tools_list_fails_at_save_because_no_list_means_every_tool() -> None:
+    with pytest.raises(ValidationError, match="at least 1 item"):
+        AgentStepBlockYAML(label="agent", prompt="Find the answer.", tools=[])
+
+    assert AgentStepBlockYAML(label="agent", prompt="Find the answer.").tools is None
+
+
+def test_a_tools_list_validates_without_openai_agents() -> None:
+    script = (
+        "import sys; sys.modules['agents'] = None; sys.modules['skyvern.cli.mcp_tools'] = None; "
+        "from skyvern.schemas.workflows import AgentStepBlockYAML; "
+        "print(AgentStepBlockYAML(label='a', prompt='p', tools=['http_request']).tools)"
+    )
+    result = subprocess.run([sys.executable, "-c", script], capture_output=True, text=True, check=False)
+
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.strip().endswith("['http_request']")
 
 
 @pytest.mark.asyncio
@@ -456,16 +571,16 @@ async def test_the_agent_block_sends_its_pinned_effort_on_a_bare_gpt_5_name(monk
 
 def test_every_block_tool_schema_defines_exactly_the_definitions_it_references() -> None:
     state = cast(agent_step_loop._RunState, SimpleNamespace(credential_keys=["login_credential"]))
-    for tool in agent_step_loop.AGENT_BLOCK_TOOLS.values():
-        if isinstance(tool, agent_step_loop._BlockTool):
+    for tool in agent_step_tools.AGENT_BLOCK_TOOLS.values():
+        if isinstance(tool, agent_step_tools.BlockTool):
             schema = agent_step_loop._arguments_schema(tool, state)
             references = set(re.findall(r'"#/\$defs/(\w+)"', json.dumps(schema)))
             assert references == set(schema.get("$defs", {})), tool.yaml_class.__name__
 
 
 def test_every_block_type_is_an_agent_tool_or_says_why_not() -> None:
-    assert set(agent_step_loop.AGENT_BLOCK_TOOLS) == set(BlockType)
-    for block_type, tool in agent_step_loop.AGENT_BLOCK_TOOLS.items():
+    assert set(agent_step_tools.AGENT_BLOCK_TOOLS) == set(BlockType)
+    for block_type, tool in agent_step_tools.AGENT_BLOCK_TOOLS.items():
         if isinstance(tool, str):
             assert tool
             continue

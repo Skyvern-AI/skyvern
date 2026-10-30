@@ -13069,6 +13069,45 @@ async def test_the_answer_audit_ends_a_run_it_keeps_holding_with_a_verdict_namin
     assert clicks == []
 
 
+@pytest.mark.asyncio
+async def test_log_only_answer_audit_logs_each_hold_and_never_blocks_or_ends_the_run() -> None:
+    clicks: list[tuple[str, dict[str, Any]]] = []
+
+    class _FlagsEverything:
+        async def unsupported(self, answers: list[RecordedAnswer]) -> list[RecordedAnswer]:
+            return answers
+
+    async def type_answer(args: dict[str, Any]) -> ToolResult:
+        return ToolResult.ok(
+            "typed", data={TARGET_LABEL_DATA_KEY: "Work authorization", TARGET_KIND_DATA_KEY: "textbox"}
+        )
+
+    tools = [
+        ToolSpec(name="type", description="t", parameters={}, handler=type_answer, billable=True),
+        _recording_tool("click", clicks, billable=True),
+        make_finish_tool(),
+    ]
+    apply_answer_basis_audit(tools, _FlagsEverything(), log_only=True, log_fields={"audit_mode_arm": "treatment"})
+    submits = [[("click", {"selector": f"#next{i}"})] for i in range(ANSWER_BASIS_MAX_HOLDS + 2)]
+    script = [
+        [("type", {"selector": "#auth", "text": "Yes"})],
+        *submits,
+        [("finish", {"status": "completed", "reason": "x"})],
+    ]
+    with capture_logs() as logs:
+        outcome, _caller = await _run(script, tools, max_turns=30)
+
+    assert (outcome.status, outcome.guard) == ("completed", None)
+    assert len(clicks) == len(submits)
+    holds = [e for e in logs if e["event"] == "taskv3 answer basis hold"]
+    assert len(holds) == len(submits)
+    assert all(
+        (e["log_only"], e["would_hold"], e["flagged"], e["holds"], e["audit_mode_arm"])
+        == (True, True, 1, 0, "treatment")
+        for e in holds
+    )
+
+
 def test_every_driver_timeout_type_installed_here_classifies_as_a_driver_timeout() -> None:
     # Written against the driver-type TABLE rather than a hard-coded package, because the hazard is
     # precisely that CI and production do not install the same driver: the browser image repoints

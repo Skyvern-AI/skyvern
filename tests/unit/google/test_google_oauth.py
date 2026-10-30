@@ -3522,18 +3522,30 @@ async def test_refresh_and_rotate_rejects_failed_google_token_persistence(
         AsyncMock(return_value=SimpleNamespace(token="at-refreshed", refresh_token="rt-rotated")),
     )
     update_active_refresh_token = AsyncMock(return_value=False)
+    # Another refresh already stored a different token, so the miss is a real conflict, not a re-encryption.
+    load_active_ciphertext = AsyncMock(
+        return_value=SimpleNamespace(
+            encrypted_refresh_token="encrypted-rt-other", encrypted_method=EncryptMethod.AES_GCM
+        )
+    )
     monkeypatch.setattr(
         google_oauth_service.app,
         "DATABASE",
         SimpleNamespace(
-            google_oauth=SimpleNamespace(update_active_refresh_token=update_active_refresh_token),
+            google_oauth=SimpleNamespace(
+                update_active_refresh_token=update_active_refresh_token,
+                load_active_ciphertext=load_active_ciphertext,
+            ),
         ),
         raising=False,
     )
     monkeypatch.setattr(
         google_oauth_service,
         "encryptor",
-        SimpleNamespace(encrypt=AsyncMock(return_value="encrypted-rt-rotated")),
+        SimpleNamespace(
+            encrypt=AsyncMock(return_value="encrypted-rt-rotated"),
+            decrypt=AsyncMock(return_value="rt-other"),
+        ),
     )
 
     with pytest.raises(

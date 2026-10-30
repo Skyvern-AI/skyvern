@@ -131,6 +131,9 @@ def create_forge_stub_app() -> ForgeApp:
     # Sync method returning a key or None — _LazyNamespace would auto-mock it as a truthy
     # AsyncMock and hijack the TextPromptBlock llm_key. Match the OSS no-op.
     fake_app_module.AGENT_FUNCTION.get_fallback_llm_key = MagicMock(return_value=None)
+    fake_app_module.AGENT_FUNCTION.get_task_v3_llm_route_treatment_key = (
+        base_agent_function.get_task_v3_llm_route_treatment_key
+    )
     fake_app_module.AGENT_FUNCTION.supports_image_captcha_ocr = base_agent_function.supports_image_captcha_ocr
     fake_app_module.AGENT_FUNCTION.challenge_solve_recording = base_agent_function.challenge_solve_recording
     # Credential write-lock gating — _LazyNamespace would auto-mock these as truthy AsyncMocks,
