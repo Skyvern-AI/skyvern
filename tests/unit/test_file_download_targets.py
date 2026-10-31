@@ -489,6 +489,41 @@ async def test_sftp_source_downloads_without_browser_and_binds_registered_file(t
     sftp_download.assert_awaited_once()
 
 
+@pytest.mark.asyncio
+async def test_sftp_source_partial_registration_still_delivers_file_for_finalization_retry(tmp_path: Path) -> None:
+    payload = b"id,value\n1,ok\n"
+    download_dir = tmp_path / "downloads"
+    block = _file_download_block(
+        FileDownloadTarget.WEBSITE,
+        sftp_host="sftp.example.test",
+        sftp_username="user",
+        sftp_password="password",
+        sftp_source_path="/reports/report.csv",
+    )
+
+    async def download_source(**kwargs: object) -> str:
+        path = Path(str(kwargs["output_dir"])) / "report.csv"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(payload)
+        return str(path)
+
+    with patch(
+        "skyvern.forge.sdk.workflow.models.block.sftp_service.download_file",
+        new_callable=AsyncMock,
+        side_effect=download_source,
+    ):
+        execution = await _execute_file_download(
+            block,
+            _browser_result(block),
+            download_dir,
+            storage_save_side_effect=DownloadSaveIncompleteError(["report.csv"]),
+        )
+
+    assert execution.result.success is True
+    assert execution.result.output_parameter_value == {"file_name": "report.csv"}
+    execution.browser_execute.assert_not_awaited()
+
+
 def test_file_download_sftp_source_is_optional_and_round_trips_yaml() -> None:
     base = {
         "block_type": BlockType.FILE_DOWNLOAD,
