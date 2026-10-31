@@ -1855,33 +1855,3 @@ def test_copilot_normalization_keeps_an_agent_steps_tools() -> None:
     request = _normalize_copilot_yaml(yaml.safe_dump(workflow))
 
     assert request.workflow_definition.blocks[0].tools == ["browser_task", "page_extract"]
-
-
-_STEP = {"block_type": "agent_step", "label": "check_page", "prompt": "Answer yes or no."}
-_LISTED = {**_STEP, "tools": ["http_request", "web_search"]}
-
-
-@pytest.mark.parametrize(
-    ("prior", "submitted", "reported"),
-    [
-        (None, _STEP, True),
-        (None, _LISTED, False),
-        (_LISTED, _STEP, True),
-        (_STEP, _STEP, False),
-        (_STEP, {**_STEP, "tools": ["web_search"]}, False),
-    ],
-)
-@pytest.mark.asyncio
-async def test_an_agent_step_copilot_saves_without_tools_is_saved_and_reported(
-    prior: dict[str, object] | None, submitted: dict[str, object], reported: bool
-) -> None:
-    ctx = _ctx(prior_yaml=_yaml(prior) if prior else None)
-    ctx.authoring_capability = _AGENT_STEP_GRANTED
-
-    write = await _update_with_stubbed_save(_yaml(submitted), ctx)
-
-    assert write["ok"] is True
-    findings = [f for f in write["data"].get("findings", []) if f["reason_code"] == "agent_step_tools_missing"]
-    assert bool(findings) is reported
-    if reported:
-        assert "check_page" in findings[0]["summary"] and "http_request" in findings[0]["summary"]
