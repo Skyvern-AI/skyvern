@@ -202,6 +202,48 @@ class WorkflowRunDispatchFinalization:
     repaired: bool = False
 
 
+async def _pin_first_attempt_browser_session(
+    session: AsyncSession,
+    *,
+    workflow_run_id: str,
+    organization_id: str,
+    browser_session_id: str,
+    attempt_number: int,
+) -> bool:
+    attempt = await session.scalar(
+        select(WorkflowRunAttemptModel)
+        .filter_by(
+            workflow_run_id=workflow_run_id,
+            organization_id=organization_id,
+            attempt_number=1,
+        )
+        .with_for_update()
+        .execution_options(populate_existing=True)
+    )
+    browser = await session.scalar(
+        select(PersistentBrowserSessionModel)
+        .filter_by(
+            persistent_browser_session_id=browser_session_id,
+            organization_id=organization_id,
+        )
+        .with_for_update()
+        .execution_options(populate_existing=True)
+    )
+    if (
+        attempt_number != 1
+        or attempt is None
+        or browser is None
+        or browser.deleted_at is not None
+        or browser.completed_at is not None
+        or browser.close_requested_at is not None
+        or is_final_status(browser.status)
+        or attempt.pinned_browser_session_id not in (None, browser_session_id)
+    ):
+        return False
+    attempt.pinned_browser_session_id = browser_session_id
+    return True
+
+
 async def lock_workflow_run_for_dispatch(
     session: AsyncSession,
     *,
@@ -731,6 +773,39 @@ class WorkflowRunsRepository(BaseRepository):
             ~active_workflow_exists,
         ).label("workflow_deleted")
 
+    async def link_browser_session_for_dispatch(
+        self,
+        *,
+        workflow_run_id: str,
+        organization_id: str,
+        browser_session_id: str,
+        attempt_number: int,
+        dispatch_claim_started_at: datetime | None,
+        expected_browser_session_id: str | None,
+        pin_first_attempt: bool,
+    ) -> bool:
+        async with self.Session() as session:
+            run = await lock_workflow_run_for_dispatch(
+                session,
+                workflow_run_id=workflow_run_id,
+                organization_id=organization_id,
+                attempt_number=attempt_number,
+                dispatch_claim_started_at=dispatch_claim_started_at,
+            )
+            if run is None or run.browser_session_id not in (browser_session_id, expected_browser_session_id):
+                return False
+            run.browser_session_id = browser_session_id
+            if pin_first_attempt and not await _pin_first_attempt_browser_session(
+                session,
+                workflow_run_id=workflow_run_id,
+                organization_id=organization_id,
+                browser_session_id=browser_session_id,
+                attempt_number=attempt_number,
+            ):
+                return False
+            await session.commit()
+            return True
+
     async def pin_browser_session_for_dispatch(
         self,
         *,
@@ -750,37 +825,14 @@ class WorkflowRunsRepository(BaseRepository):
             )
             if run is None or run.browser_session_id != browser_session_id:
                 return False
-            attempt = await session.scalar(
-                select(WorkflowRunAttemptModel)
-                .filter_by(
-                    workflow_run_id=workflow_run_id,
-                    organization_id=organization_id,
-                    attempt_number=1,
-                )
-                .with_for_update()
-                .execution_options(populate_existing=True)
-            )
-            browser = await session.scalar(
-                select(PersistentBrowserSessionModel)
-                .filter_by(
-                    persistent_browser_session_id=browser_session_id,
-                    organization_id=organization_id,
-                )
-                .with_for_update()
-                .execution_options(populate_existing=True)
-            )
-            if (
-                attempt_number != 1
-                or attempt is None
-                or browser is None
-                or browser.deleted_at is not None
-                or browser.completed_at is not None
-                or browser.close_requested_at is not None
-                or is_final_status(browser.status)
-                or attempt.pinned_browser_session_id not in (None, browser_session_id)
+            if not await _pin_first_attempt_browser_session(
+                session,
+                workflow_run_id=workflow_run_id,
+                organization_id=organization_id,
+                browser_session_id=browser_session_id,
+                attempt_number=attempt_number,
             ):
                 return False
-            attempt.pinned_browser_session_id = browser_session_id
             await session.commit()
             return True
 

@@ -23,6 +23,16 @@ def released_session_stub() -> SimpleNamespace:
     )
 
 
+def pending_stamp_session_stub(stamped_run_id: str | None = "wr_test") -> MagicMock:
+    """A callable ``Session`` whose session answers create_workflow_run's forced-session pending stamp."""
+    session = SimpleNamespace(scalar=AsyncMock(return_value=stamped_run_id), commit=AsyncMock())
+    factory = MagicMock(side_effect=lambda: nullcontext(session))
+    factory.released = MagicMock(side_effect=lambda: nullcontext())
+    factory.reading = MagicMock(side_effect=lambda: nullcontext())
+    factory.session = session
+    return factory
+
+
 def version_write_transaction_stub() -> MagicMock:
     """The save path's version/definition transaction, for workflow repositories faked without an engine."""
     return MagicMock(side_effect=lambda workflow_permanent_id=None: nullcontext())
@@ -201,7 +211,6 @@ def make_workflow_run_attempts_fake() -> SimpleNamespace:
     return SimpleNamespace(
         Session=MagicMock(return_value=session_context),
         create_attempt=AsyncMock(return_value=SimpleNamespace(attempt_number=1)),
-        pin_first_attempt_browser_session_if_unset=AsyncMock(),
         get_attempts=AsyncMock(return_value=[]),
         get_interim_payload_snapshot=AsyncMock(return_value={}),
         get_latest_attempts_for_runs=AsyncMock(return_value={}),

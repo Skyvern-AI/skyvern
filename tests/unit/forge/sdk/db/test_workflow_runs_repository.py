@@ -389,7 +389,9 @@ async def test_prepare_next_attempt_invalidates_only_rotated_credential_seed(
                     attempt_number=1,
                     status="failed",
                     retry_decision="retry",
-                    pinned_browser_session_id=retained_session_id if retained_session == "explicit" else None,
+                    pinned_browser_session_id=retained_session_id
+                    if retained_session in ("explicit", "forced")
+                    else None,
                 ),
                 WorkflowRunCredentialSelectionModel(
                     workflow_run_id="wr_seed",
@@ -412,12 +414,6 @@ async def test_prepare_next_attempt_invalidates_only_rotated_credential_seed(
         )
         await session.commit()
 
-    if retained_session == "forced":
-        await sqlite_db.workflow_run_attempts.pin_first_attempt_browser_session_if_unset(
-            workflow_run_id="wr_seed",
-            organization_id="org_test",
-            browser_session_id="pbs_retained",
-        )
     attempts = await sqlite_db.workflow_run_attempts.get_attempts("wr_seed")
     preparation = await sqlite_db.workflow_runs.prepare_next_attempt_atomic(
         workflow_run_id="wr_seed",
@@ -899,6 +895,50 @@ def _persistent_browser_session_model(
         runnable_type=runnable_type,
         created_at=now,
         modified_at=now,
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("pinned_elsewhere", [False, True])
+async def test_forced_session_link_commits_only_with_its_first_attempt_pin(
+    sqlite_db: AgentDB, pinned_elsewhere: bool
+) -> None:
+    async with sqlite_db.Session() as session:
+        session.add(
+            _workflow_run_model(
+                workflow_run_id="wr_forced",
+                queued_at=datetime(2026, 10, 30, tzinfo=timezone.utc),
+                status=WorkflowRunStatus.running.value,
+            )
+        )
+        session.add(
+            WorkflowRunAttemptModel(
+                workflow_run_id="wr_forced",
+                organization_id="org_test",
+                attempt_number=1,
+                status="running",
+                pinned_browser_session_id="pbs_other" if pinned_elsewhere else None,
+            )
+        )
+        session.add(_persistent_browser_session_model(persistent_browser_session_id="pbs_forced"))
+        await session.commit()
+
+    linked = await sqlite_db.workflow_runs.link_browser_session_for_dispatch(
+        workflow_run_id="wr_forced",
+        organization_id="org_test",
+        browser_session_id="pbs_forced",
+        attempt_number=1,
+        dispatch_claim_started_at=None,
+        expected_browser_session_id=None,
+        pin_first_attempt=True,
+    )
+
+    run = await sqlite_db.workflow_runs.get_workflow_run("wr_forced", "org_test")
+    (attempt,) = await sqlite_db.workflow_run_attempts.get_attempts("wr_forced")
+    # A linked run whose first attempt is unpinned would let a later retry drop its forced session.
+    assert run is not None
+    assert (linked, run.browser_session_id, attempt.pinned_browser_session_id) == (
+        (False, None, "pbs_other") if pinned_elsewhere else (True, "pbs_forced", "pbs_forced")
     )
 
 
