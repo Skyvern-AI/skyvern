@@ -538,4 +538,6 @@ async def get_workflow_run_response(
         ),
         errors=workflow_run_resp.errors,
         step_count=workflow_run_resp.total_steps,
+        total_cost=workflow_run_resp.total_cost,
+        credits_used=workflow_run_resp.credits_used,
     )
