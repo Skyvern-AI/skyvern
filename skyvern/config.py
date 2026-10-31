@@ -392,6 +392,8 @@ class Settings(BaseSettings):
     # Most page PNG data a pdfplumber child may hand back for OCR; text, word and page-count results have smaller caps
     # in pdf_parser. The parent holds a result outside the child's memory cap, so it reserves the decoded size.
     PDFPLUMBER_MAX_RESULT_BYTES: int = Field(default=256 * 1024 * 1024, gt=0)
+    # Server kill switch for notes in PDF imports; Copilot keeps reading saved notes because they still guide runs.
+    WORKFLOW_PDF_IMPORT_NOTES_ENABLED: bool = True
     PRESIGNED_URL_EXPIRATION: int = 60 * 60 * 24  # 24 hours
     # Ceiling on the retention_days a caller may request at upload time. A cap exists so a
     # retention period cannot be used to pin storage indefinitely; omitting retention_days

@@ -27,6 +27,7 @@ from unittest.mock import AsyncMock
 
 import pytest
 
+from skyvern.forge import app as forge_app
 from skyvern.forge.sdk.copilot.context import CopilotContext
 from skyvern.forge.sdk.copilot.runtime import browser_session_lock
 from skyvern.forge.sdk.copilot.tools import _cancel_run_task_if_not_final, _trusted_post_drain_status, run_execution
@@ -43,6 +44,8 @@ from tests.unit.copilot_test_helpers import (
     make_build_test_ctx,
     make_copilot_ctx,
     settle_cancelled_tools,
+    stamping_browser_manager,
+    stop_activity_renewer,
 )
 
 
@@ -499,6 +502,86 @@ async def test_minted_browser_closes_after_a_leased_run_becomes_idle(monkeypatch
     assert ctx.minted_browser_sessions == {}
     assert liveness.await_count == 2
     close.assert_awaited_once_with(ctx.organization_id, "pbs_minted", reason=BrowserSessionCloseReason.turn_ended)
+
+
+def _kept_run_reads(monkeypatch: pytest.MonkeyPatch, *, runs: dict[str, tuple[WorkflowRunStatus, str | None]]) -> None:
+    monkeypatch.setattr(
+        forge_app.PERSISTENT_SESSIONS_MANAGER, "get_session", AsyncMock(return_value=SimpleNamespace(runnable_id=None))
+    )
+
+    async def _children(*, parent_workflow_run_id: str, organization_id: str) -> list[SimpleNamespace]:
+        return [
+            SimpleNamespace(workflow_run_id=rid)
+            for rid, (_, parent) in runs.items()
+            if parent == parent_workflow_run_id
+        ]
+
+    monkeypatch.setattr(
+        forge_app.DATABASE,
+        "workflow_runs",
+        SimpleNamespace(
+            get_workflow_run=AsyncMock(
+                side_effect=lambda run_id, _org: SimpleNamespace(workflow_run_id=run_id, status=runs[run_id][0])
+            ),
+            get_workflow_runs_by_parent_workflow_run_id=AsyncMock(side_effect=_children),
+        ),
+    )
+
+
+@pytest.mark.asyncio
+async def test_a_kept_browser_stays_renewed_while_a_child_run_outlives_its_final_parent(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    manager = stamping_browser_manager(monkeypatch)
+    monkeypatch.setattr(forge_app, "BROWSER_MANAGER", manager)
+    monkeypatch.setattr(run_execution, "RUN_BLOCKS_POLL_INTERVAL_SECONDS", 0)
+    runs = {OWNED_RUN_ID: (WorkflowRunStatus.completed, None), "wr_child": (WorkflowRunStatus.running, OWNED_RUN_ID)}
+    _kept_run_reads(monkeypatch, runs=runs)
+    closed = asyncio.Event()
+
+    async def _close(*_args: object, **_kwargs: object) -> bool:
+        closed.set()
+        return True
+
+    monkeypatch.setattr(run_execution, "close_browser_session_quietly", _close)
+    ctx = make_copilot_ctx()
+    ctx.minted_browser_sessions["pbs_kept"] = OWNED_RUN_ID
+
+    try:
+        await run_execution.close_minted_browser_sessions(ctx)
+        for _ in range(20):
+            await asyncio.sleep(0)
+        assert not closed.is_set()
+        assert "pbs_kept" in manager._renewable_session_ids()
+
+        runs["wr_child"] = (WorkflowRunStatus.completed, OWNED_RUN_ID)
+        await asyncio.wait_for(closed.wait(), timeout=1)
+        for _ in range(5):
+            await asyncio.sleep(0)
+        assert "pbs_kept" not in manager._renewable_session_ids()
+    finally:
+        await stop_activity_renewer(manager)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("first_stamp_fails", [False, True])
+async def test_a_kept_browser_stops_renewing_at_the_cap(
+    monkeypatch: pytest.MonkeyPatch, first_stamp_fails: bool
+) -> None:
+    touch = AsyncMock(side_effect=[RuntimeError("db down"), None] if first_stamp_fails else None)
+    manager = stamping_browser_manager(monkeypatch, touch)
+    monkeypatch.setattr(forge_app, "BROWSER_MANAGER", manager)
+    monkeypatch.setattr(run_execution, "_KEPT_RUN_ACTIVITY_RENEWAL_CAP_SECONDS", 0.05)
+
+    renewal = asyncio.create_task(run_execution._renew_kept_browser_activity("pbs_kept"))
+    try:
+        await asyncio.sleep(0.01)
+        assert "pbs_kept" in manager._renewable_session_ids()
+        await asyncio.wait_for(renewal, timeout=1)
+        assert "pbs_kept" not in manager._renewable_session_ids()
+    finally:
+        renewal.cancel()
+        await stop_activity_renewer(manager)
 
 
 def test_a_build_test_acquisition_copy_records_into_the_turns_minted_browser_ledger() -> None:

@@ -1,0 +1,322 @@
+[
+  {
+    "name": "conditional-finally-list-order",
+    "definition": {
+      "blocks": [
+        {
+          "label": "a",
+          "block_type": "navigation",
+          "next_block_label": null
+        },
+        {
+          "label": "b",
+          "block_type": "navigation",
+          "next_block_label": null,
+          "notes": "B."
+        },
+        {
+          "label": "cleanup",
+          "block_type": "conditional",
+          "next_block_label": null,
+          "branch_conditions": [],
+          "notes": "Cleanup."
+        }
+      ],
+      "finally_block_label": "cleanup"
+    },
+    "expected": {
+      "a": "B.",
+      "b": "B.",
+      "cleanup": "Cleanup."
+    }
+  },
+  {
+    "name": "finally-incoming-list-order",
+    "definition": {
+      "blocks": [
+        {
+          "label": "a",
+          "block_type": "navigation",
+          "next_block_label": "cleanup"
+        },
+        {
+          "label": "cleanup",
+          "block_type": "navigation",
+          "next_block_label": null,
+          "notes": "Cleanup."
+        },
+        {
+          "label": "b",
+          "block_type": "navigation",
+          "next_block_label": null,
+          "notes": "B."
+        }
+      ],
+      "finally_block_label": "cleanup"
+    },
+    "expected": {
+      "a": "B.",
+      "b": "B.",
+      "cleanup": "Cleanup."
+    }
+  },
+  {
+    "name": "implicit-shared-tail",
+    "definition": {
+      "blocks": [
+        {
+          "label": "check",
+          "block_type": "conditional",
+          "next_block_label": "after",
+          "branch_conditions": [
+            {
+              "next_block_label": "left"
+            },
+            {
+              "next_block_label": "right"
+            }
+          ]
+        },
+        {
+          "label": "left",
+          "block_type": "navigation",
+          "next_block_label": "tail"
+        },
+        {
+          "label": "right",
+          "block_type": "navigation",
+          "next_block_label": "tail"
+        },
+        {
+          "label": "tail",
+          "block_type": "navigation",
+          "next_block_label": null,
+          "notes": "Tail."
+        },
+        {
+          "label": "after",
+          "block_type": "navigation",
+          "next_block_label": null,
+          "notes": "After."
+        }
+      ]
+    },
+    "expected": {
+      "check": "After.",
+      "left": "Tail.",
+      "right": "Tail.",
+      "tail": "Tail.\n\nAfter.",
+      "after": "After."
+    }
+  },
+  {
+    "name": "explicit-shared-tail",
+    "definition": {
+      "blocks": [
+        {
+          "label": "check",
+          "block_type": "conditional",
+          "next_block_label": "after",
+          "branch_conditions": [
+            {
+              "next_block_label": "left"
+            },
+            {
+              "next_block_label": "right"
+            }
+          ]
+        },
+        {
+          "label": "left",
+          "block_type": "navigation",
+          "next_block_label": "tail"
+        },
+        {
+          "label": "right",
+          "block_type": "navigation",
+          "next_block_label": "tail"
+        },
+        {
+          "label": "tail",
+          "block_type": "navigation",
+          "next_block_label": "after",
+          "notes": "Tail."
+        },
+        {
+          "label": "after",
+          "block_type": "navigation",
+          "next_block_label": null,
+          "notes": "After."
+        }
+      ]
+    },
+    "expected": {
+      "check": "After.",
+      "left": "Tail.",
+      "right": "Tail.",
+      "tail": "Tail.\n\nAfter.",
+      "after": "After."
+    }
+  },
+  {
+    "name": "finally-edges-before-branch-merge",
+    "definition": {
+      "blocks": [
+        {
+          "label": "check",
+          "block_type": "conditional",
+          "next_block_label": "after",
+          "branch_conditions": [
+            {
+              "next_block_label": "cleanup"
+            },
+            {
+              "next_block_label": "entry"
+            }
+          ]
+        },
+        {
+          "label": "entry",
+          "block_type": "navigation",
+          "next_block_label": "terminal"
+        },
+        {
+          "label": "terminal",
+          "block_type": "navigation",
+          "next_block_label": "cleanup",
+          "notes": "Terminal."
+        },
+        {
+          "label": "after",
+          "block_type": "navigation",
+          "next_block_label": null,
+          "notes": "After."
+        },
+        {
+          "label": "cleanup",
+          "block_type": "navigation",
+          "next_block_label": null,
+          "notes": "Cleanup."
+        }
+      ],
+      "finally_block_label": "cleanup"
+    },
+    "expected": {
+      "check": "After.",
+      "entry": "Terminal.",
+      "terminal": "Terminal.\n\nAfter.",
+      "after": "After.",
+      "cleanup": "Cleanup."
+    }
+  },
+  {
+    "name": "nested-conditional-merge-convergence",
+    "definition": {
+      "blocks": [
+        {
+          "label": "inner",
+          "block_type": "conditional",
+          "next_block_label": null,
+          "branch_conditions": [
+            {
+              "next_block_label": "left"
+            },
+            {
+              "next_block_label": "right"
+            }
+          ]
+        },
+        {
+          "label": "outer",
+          "block_type": "conditional",
+          "next_block_label": "after",
+          "branch_conditions": [
+            {
+              "next_block_label": "inner"
+            },
+            {
+              "next_block_label": "other"
+            }
+          ]
+        },
+        {
+          "label": "left",
+          "block_type": "navigation",
+          "next_block_label": null,
+          "notes": "Left."
+        },
+        {
+          "label": "right",
+          "block_type": "navigation",
+          "next_block_label": null,
+          "notes": "Right."
+        },
+        {
+          "label": "other",
+          "block_type": "navigation",
+          "next_block_label": null
+        },
+        {
+          "label": "after",
+          "block_type": "navigation",
+          "next_block_label": null,
+          "notes": "After."
+        }
+      ]
+    },
+    "expected": {
+      "outer": "After.",
+      "inner": "After.",
+      "left": "Left.\n\nAfter.",
+      "right": "Right.\n\nAfter.",
+      "other": "After.",
+      "after": "After."
+    }
+  },
+  {
+    "name": "loop-note-scope-and-trailing",
+    "definition": {
+      "blocks": [
+        {
+          "label": "a",
+          "block_type": "navigation",
+          "next_block_label": "loop"
+        },
+        {
+          "label": "loop",
+          "block_type": "for_loop",
+          "next_block_label": "after",
+          "notes": " Loop. ",
+          "trailing_notes": "Loop done.",
+          "loop_blocks": [
+            {
+              "label": "inside_a",
+              "block_type": "navigation",
+              "next_block_label": null
+            },
+            {
+              "label": "inside_b",
+              "block_type": "navigation",
+              "next_block_label": null,
+              "notes": "Inside.",
+              "trailing_notes": "Inside done."
+            }
+          ]
+        },
+        {
+          "label": "after",
+          "block_type": "navigation",
+          "next_block_label": null,
+          "notes": "After."
+        }
+      ]
+    },
+    "expected": {
+      "a": "Loop.",
+      "loop": "Loop.\n\nAfter.\n\nLoop done.",
+      "inside_a": "Inside.",
+      "inside_b": "Inside.\n\nInside done.",
+      "after": "After."
+    }
+  }
+]

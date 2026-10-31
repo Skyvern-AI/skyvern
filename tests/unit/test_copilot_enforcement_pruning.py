@@ -380,11 +380,13 @@ def _fresh_ctx_for_record() -> SimpleNamespace:
     so the stub populates the interesting fields without tripping AttributeError on
     the downstream update_repeated_failure_state call.
     """
+    dispatched_run_ids: set[str] = set()
     return SimpleNamespace(
         code_artifact_metadata={},
         composition_page_evidence=None,
         block_run_calls_this_turn=0,
-        dispatched_run_ids_this_turn=set(),
+        dispatched_run_ids_this_turn=dispatched_run_ids,
+        record_dispatched_run=dispatched_run_ids.add,
         unbound_required_parameter_keys=[],
         last_test_ok=True,
         last_test_failure_reason=None,

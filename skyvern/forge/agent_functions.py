@@ -2190,6 +2190,12 @@ class AgentFunction:
         """Billing seam for a code block's container task; called only after a successful execution."""
         return
 
+    async def post_agent_step_execution(
+        self, organization_id: str | None, workflow_run_id: str, workflow_run_block_id: str, decisions: int
+    ) -> None:
+        """Billing seam for an agent block's own tool calls, called once per block run; must not raise."""
+        return
+
     async def wait_for_challenge_solver(self, page: Page) -> None:
         """Wait for a cloud-managed challenge solver if one is attached to the page."""
         return None
@@ -2477,6 +2483,23 @@ class AgentFunction:
                 credential_id=credential_id,
             )
             return None
+
+    async def execute_powerbi_query_for_run(
+        self,
+        *,
+        organization_id: str,
+        workflow_run_id: str,
+        workflow_run_block_id: str,
+        connection_id: str,
+        dataset_id: str,
+        query: str,
+        max_rows: int = 1_000,
+    ) -> list[dict[str, object]]:
+        """Power BI reads require Cloud's persisted-run identity and audited execution facade."""
+        raise NotImplementedError("Power BI workflow queries are only supported in Skyvern Cloud")
+
+    async def ensure_powerbi_queries_available(self) -> None:
+        raise NotImplementedError("Power BI workflow queries are only supported in Skyvern Cloud")
 
     async def get_google_workspace_credentials(
         self,

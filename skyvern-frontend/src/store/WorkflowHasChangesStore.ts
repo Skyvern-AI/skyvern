@@ -20,6 +20,7 @@ import { applyYamlCommitMetadata } from "./WorkflowTitleStore";
 import { AxiosError } from "axios";
 import { useEffect, useRef } from "react";
 import { create } from "zustand";
+import { useCopilotProposalStore } from "@/store/CopilotProposalStore";
 import { useMutation, useQueryClient } from "@tanstack/react-query";
 import { stringify as convertToYAML } from "yaml";
 import { usePostHog } from "posthog-js/react";
@@ -95,6 +96,8 @@ interface WorkflowSaveOpts {
   status?: string;
 }
 
+const PROPOSAL_SAVE_MESSAGE = "Resolve the Copilot proposal before saving.";
+
 function assertWorkflowSaveAllowed(
   yamlCommit?: YamlCommitContext,
   saveOwner?: YamlCommitOwner | null,
@@ -107,6 +110,10 @@ function assertWorkflowSaveAllowed(
       variant: "destructive",
     });
     throw new YamlCommitError("workflow", blockedReason);
+  }
+  // Every save path lands here, so a staged Copilot proposal can only become durable through Accept.
+  if (useCopilotProposalStore.getState().proposal) {
+    throw new SaveRefusedError(PROPOSAL_SAVE_MESSAGE);
   }
   const state = useWorkflowYamlEditorStore.getState();
   if (state.authoringInProgress) {

@@ -127,23 +127,27 @@ def test_malformed_nested_workflow_yaml_validation_has_bounded_time() -> None:
 
     script = """
 import sys
+import time
 import yaml
 from pydantic import ValidationError
 from skyvern.schemas.workflows import WorkflowCreateYAMLRequest
 
+started = time.monotonic()
 try:
     WorkflowCreateYAMLRequest.model_validate(yaml.safe_load(sys.stdin.read()))
 except ValidationError:
     pass
 else:
     raise SystemExit("malformed workflow was accepted")
+if time.monotonic() - started > 5:
+    raise SystemExit("malformed workflow validation exceeded the 5-second bound")
 """
     try:
         subprocess.run(
-            [sys.executable, "-c", script], input=draft, text=True, capture_output=True, check=True, timeout=5
+            [sys.executable, "-c", script], input=draft, text=True, capture_output=True, check=True, timeout=15
         )
     except subprocess.TimeoutExpired:
-        pytest.fail("malformed nested workflow validation exceeded the 5-second bound")
+        pytest.fail("malformed nested workflow validation process exceeded the 15-second safety timeout")
 
 
 def test_nested_loops_and_conditionals_still_parse() -> None:

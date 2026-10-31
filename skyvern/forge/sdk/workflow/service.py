@@ -165,6 +165,7 @@ from skyvern.forge.sdk.experimentation.workflow_block_engine import (
     unset_engine_routes_as_v1,
 )
 from skyvern.forge.sdk.forge_log import exception_log_fields
+from skyvern.forge.sdk.integrations.catalog import integration_is_live
 from skyvern.forge.sdk.models import Step, StepStatus
 from skyvern.forge.sdk.schemas.browser_profiles import BrowserProfile
 from skyvern.forge.sdk.schemas.credentials import Credential, credential_auto_profile_disabled
@@ -247,6 +248,7 @@ from skyvern.forge.sdk.workflow.models.block import (
     NavigationBlock,
     PdfFillBlock,
     PDFParserBlock,
+    PowerBIQueryBlock,
     SplitPdfBlock,
     TaskV2Block,
     TextPromptBlock,
@@ -1275,6 +1277,75 @@ def _extract_blocks_info(blocks: list[BLOCK_YAML_TYPES]) -> list[dict[str, str]]
 
         blocks_info.append(info)
     return blocks_info
+
+
+async def _validate_powerbi_workflow_save(
+    organization_id: str,
+    workflow_definition: WorkflowDefinition,
+    *,
+    workflow_id: str | None = None,
+    workflow_permanent_id: str | None = None,
+) -> None:
+    powerbi_live = integration_is_live("powerbi")
+
+    if powerbi_live and workflow_permanent_id is None and workflow_id is not None:
+        if any(isinstance(block, WorkflowTriggerBlock) for block in get_all_blocks(workflow_definition.blocks)):
+            current_workflow = await app.DATABASE.workflows.get_workflow(workflow_id, organization_id=organization_id)
+            if current_workflow is None:
+                raise SkyvernHTTPException(
+                    "Could not verify Power BI workflow trigger sources.",
+                    status_code=HTTPStatus.BAD_REQUEST,
+                    error_code="trigger_parent_source_unconfirmed",
+                )
+            workflow_permanent_id = current_workflow.workflow_permanent_id
+
+    root_key = workflow_permanent_id
+    definitions: dict[str | None, WorkflowDefinition] = {root_key: workflow_definition}
+    direct_connection_ids: list[str] = []
+
+    async def collect_workflows(definition: WorkflowDefinition, depth: int = 0) -> None:
+        blocks = get_all_blocks(definition.blocks)
+        powerbi_blocks = [block for block in blocks if isinstance(block, PowerBIQueryBlock)]
+        direct_connection_ids.extend(block.connection_id for block in powerbi_blocks)
+        if not powerbi_live or depth >= WorkflowTriggerBlock.MAX_TRIGGER_DEPTH:
+            return
+        for block in blocks:
+            if not isinstance(block, WorkflowTriggerBlock):
+                continue
+            target = block.workflow_permanent_id
+            if not target or "{{" in target or "{%" in target:
+                continue
+            if target in definitions:
+                continue
+            workflow = await app.DATABASE.workflows.get_workflow_by_permanent_id(
+                workflow_permanent_id=target,
+                organization_id=organization_id,
+            )
+            if workflow is not None:
+                definitions[target] = workflow.workflow_definition
+                await collect_workflows(workflow.workflow_definition, depth + 1)
+
+    await collect_workflows(workflow_definition)
+
+    connection_ids = list(dict.fromkeys(direct_connection_ids))
+    if not connection_ids:
+        return
+    if any(
+        not isinstance(value, str) or not value.strip() or "{{" in value or "{%" in value for value in connection_ids
+    ):
+        raise SkyvernHTTPException(
+            "Power BI connection_id must be a literal credential ID.",
+            status_code=HTTPStatus.BAD_REQUEST,
+            error_code="invalid_powerbi_connection_id",
+        )
+    try:
+        await app.AGENT_FUNCTION.ensure_powerbi_queries_available()
+    except NotImplementedError as exc:
+        raise SkyvernHTTPException(
+            "Power BI queries are not supported in this runtime.",
+            status_code=HTTPStatus.FORBIDDEN,
+            error_code="powerbi_unavailable",
+        ) from exc
 
 
 async def generate_title_from_blocks_info(
@@ -4798,82 +4869,6 @@ class WorkflowService:
             values.update({key: value for key, value in workflow_request.data.items() if value is not None})
         return values
 
-    async def _resolve_managed_browser_profile_for_run_request(
-        self,
-        *,
-        workflow: Workflow,
-        organization_id: str,
-        workflow_request: WorkflowRequestBody,
-        effective_proxy_location: ProxyLocationInput,
-        extra_parameter_values: dict[str, str] | None = None,
-    ) -> str | None:
-        try:
-            if not workflow.persist_browser_session or workflow_request.browser_profile_id:
-                return None
-
-            parameter_values = self._profile_key_render_values(workflow, workflow_request)
-            if extra_parameter_values:
-                parameter_values.update(extra_parameter_values)
-
-            rendered_key = None
-            if workflow.browser_profile_key:
-                rendered_key = render_browser_profile_key(workflow.browser_profile_key, parameter_values)
-                if not rendered_key:
-                    return None
-
-            digest_key, credential_segment = self._managed_browser_profile_digest_key(
-                workflow, parameter_values, rendered_key
-            )
-            digest = build_browser_profile_key_digest(digest_key)
-            profile, created = await app.DATABASE.browser_sessions.get_or_create_managed_browser_profile(
-                organization_id=organization_id,
-                workflow_permanent_id=workflow.workflow_permanent_id,
-                browser_profile_key_digest=digest,
-                name=_build_managed_browser_profile_name(workflow.title, rendered_key or credential_segment),
-            )
-            # See _ensure_managed_browser_profile: a credential-segmented profile has no legacy
-            # counterpart, so seeding it from the un-credentialed archive would risk leaking a
-            # different credential's saved state onto it.
-            if created and not credential_segment:
-                try:
-                    await self._seed_managed_browser_profile_from_legacy_session(
-                        workflow=workflow,
-                        organization_id=organization_id,
-                        rendered_key=rendered_key,
-                        browser_profile_id=profile.browser_profile_id,
-                    )
-                except Exception:
-                    # Roll back the empty row so the next run re-attempts creation + seed;
-                    # this run degrades to the legacy session path instead of failing setup.
-                    LOG.warning(
-                        "Failed to seed managed browser profile from legacy session; rolling back and using legacy path",
-                        workflow_run_id=None,
-                        browser_profile_id=profile.browser_profile_id,
-                        exc_info=True,
-                    )
-                    await app.DATABASE.browser_sessions.hard_delete_browser_profile(
-                        profile_id=profile.browser_profile_id,
-                        organization_id=organization_id,
-                    )
-                    return None
-            await self._reconcile_managed_browser_profile_proxy_pin(
-                workflow=workflow,
-                profile=profile,
-                browser_profile_key_digest=digest,
-                organization_id=organization_id,
-                proxy_location=effective_proxy_location,
-                workflow_run_id=None,
-            )
-            return profile.browser_profile_id
-        except Exception:
-            LOG.warning(
-                "Failed to resolve managed browser profile for workflow run request",
-                organization_id=organization_id,
-                workflow_permanent_id=workflow.workflow_permanent_id,
-                exc_info=True,
-            )
-            return None
-
     async def _seed_managed_browser_profile_from_legacy_session(
         self,
         *,
@@ -7465,7 +7460,6 @@ class WorkflowService:
                     ),
                     has_attempt_row=bool(await app.DATABASE.workflow_run_attempts.get_attempts(workflow_run_id)),
                     attempt_number=attempt_number,
-                    use_resolved_run_seed=True,
                     dispatch_claim_started_at=dispatch_claim_started_at,
                     expected_browser_session_id=expected_browser_session_id,
                     on_finalization_denied=on_finalization_denied,
@@ -12201,6 +12195,7 @@ class WorkflowService:
             await self._read_overwritten_workflow(workflow_id, organization_id) if pinned_v1_blocks else None
         )
         if workflow_definition is not None:
+            await _validate_powerbi_workflow_save(organization_id or "", workflow_definition, workflow_id=workflow_id)
             if validate_code_block_templates:
                 self._validate_code_block_templates(workflow_definition)
             self._validate_block_engines(workflow_definition)
@@ -12800,10 +12795,7 @@ class WorkflowService:
             )
             if force_browser_session:
                 assert workflow is not None
-                # Forced session creation happens before setup_workflow_run persists
-                # run-level credential selections. This validates override inputs
-                # before best-effort profile-key rendering, then setup_workflow_run
-                # persists the same override after the workflow_run_id exists.
+                # Rejects invalid credential overrides before the run row exists; setup_workflow_run persists them.
                 self._get_run_credential_parameter_overrides(
                     workflow=workflow,
                     request_data=workflow_request.data,
@@ -12847,23 +12839,16 @@ class WorkflowService:
                 )
                 # A block run creates its block-run rows only after setup, so the caller's intent
                 # is the only block-scoped signal enrolment can see here.
-                has_attempt_row = False
                 if not block_scoped:
-                    has_attempt_row = await ensure_attempt_row(
+                    await ensure_attempt_row(
                         workflow_run=workflow_run,
                         requested_browser_session_id=requested_browser_session_id,
                         organization_id=organization_id,
                         workflow=workflow,
                     )
-                if await app.AGENT_FUNCTION.should_defer_workflow_browser_creation(workflow_run) is not True:
-                    workflow_run = await self._prepare_forced_browser_session(
-                        workflow=workflow,
-                        workflow_run=workflow_run,
-                        workflow_request=workflow_request,
-                        has_attempt_row=has_attempt_row,
-                    )
-
-                elif not workflow_request.browser_address:
+                # The session is created when the run starts. Created here, it would block this request until the
+                # browser started and idle out (60 min) while the run waited in a queue.
+                if not workflow_request.browser_address:
                     pending_key = "off:force_pending:" + (persisted_reuse_bound_key or REUSE_ADMISSION_OFF_DISABLED)
                     async with app.DATABASE.workflow_runs.Session() as session:
                         stamped = await session.scalar(
@@ -12939,7 +12924,6 @@ class WorkflowService:
         workflow_request: WorkflowRequestBody,
         has_attempt_row: bool,
         attempt_number: int = 1,
-        use_resolved_run_seed: bool = False,
         dispatch_claim_started_at: datetime | None = None,
         expected_browser_session_id: str | None = None,
         on_finalization_denied: Callable[[], None] | None = None,
@@ -12947,66 +12931,24 @@ class WorkflowService:
         organization_id = workflow_run.organization_id
         workflow_permanent_id = workflow.workflow_permanent_id
         workflow_id = workflow.workflow_id
-        browser_profile_id = workflow_run.browser_profile_id
         browser_session_id = workflow_run.browser_session_id
-        run_credential_parameter_overrides = self._get_run_credential_parameter_overrides(
-            workflow=workflow, request_data=workflow_request.data
-        )
         LOG.info(
             "Force-creating browser session for workflow run",
             workflow_permanent_id=workflow_permanent_id,
             workflow_run_id=workflow_run.workflow_run_id,
             organization_id=organization_id,
         )
-        forced_browser_profile_id = None
-        effective_proxy_location = workflow_request.proxy_location
-        pin_required = False
-        try:
-            # pin_required must be known before any awaited call that can raise, so the
-            # except path never falls through to creating an unprofiled pinned session.
-            effective_proxy_location = (
-                workflow_request.proxy_location
-                if workflow_request.proxy_location is not None
-                else workflow.proxy_location
-            )
-            pin_required = (
-                workflow.persist_browser_session
-                and workflow.pin_saved_session_ip
-                and should_generate_proxy_session_id(effective_proxy_location)
-            )
-            # Rotating credential profile keys need the persisted run id before rendering.
-            if use_resolved_run_seed:
-                # Deferred preparation follows setup (and retry seed resolution). That persisted
-                # seed already applies start_fresh and explicit-override precedence. None is also
-                # authoritative: resolving again could load memory into an intentionally fresh run.
-                forced_browser_profile_id = browser_profile_id
-            else:
-                rotating_credential_selections = await self._select_rotating_credential_parameters_for_render(
-                    workflow=workflow,
-                    workflow_run=workflow_run,
-                    organization_id=organization_id,
-                    credential_parameter_overrides=run_credential_parameter_overrides,
-                    parameter_values=self._profile_key_render_values(workflow, workflow_request),
-                )
-                # Ordinary forced preparation precedes setup. An explicit per-run override still
-                # wins over start_fresh; otherwise a fresh run must not load the managed profile.
-                if not resolve_start_fresh(workflow_request.start_fresh_browser, browser_profile_id):
-                    forced_browser_profile_id = await self._resolve_managed_browser_profile_for_run_request(
-                        workflow=workflow,
-                        organization_id=organization_id,
-                        workflow_request=workflow_request,
-                        effective_proxy_location=effective_proxy_location,
-                        extra_parameter_values=rotating_credential_selections,
-                    )
-        except Exception:
-            LOG.warning(
-                "Failed to resolve managed browser profile for forced browser session",
-                workflow_permanent_id=workflow_permanent_id,
-                workflow_id=workflow_id,
-                workflow_run_id=workflow_run.workflow_run_id,
-                organization_id=organization_id,
-                exc_info=True,
-            )
+        effective_proxy_location = (
+            workflow_request.proxy_location if workflow_request.proxy_location is not None else workflow.proxy_location
+        )
+        pin_required = (
+            workflow.persist_browser_session
+            and workflow.pin_saved_session_ip
+            and should_generate_proxy_session_id(effective_proxy_location)
+        )
+        # Preparation follows setup (and retry seed resolution), whose persisted seed already applies start_fresh and
+        # explicit-override precedence. None is authoritative too: resolving again could load memory into a fresh run.
+        forced_browser_profile_id = workflow_run.browser_profile_id
         if pin_required and forced_browser_profile_id is None:
             LOG.info(
                 "Skipping forced browser session without managed browser profile for pinned workflow",
@@ -13019,15 +12961,13 @@ class WorkflowService:
         else:
             try:
                 mapped_browser_type = to_persistent_session_browser_type(read_browser_type(workflow_run))
-                creation_options: dict[str, Any] = {}
+                creation_options: dict[str, Any] = dict(
+                    attempt_number=attempt_number,
+                    dispatch_claim_started_at=dispatch_claim_started_at,
+                    expected_browser_session_id=expected_browser_session_id,
+                )
                 if mapped_browser_type is not None:
                     creation_options["browser_type"] = mapped_browser_type
-                if use_resolved_run_seed:
-                    creation_options.update(
-                        attempt_number=attempt_number,
-                        dispatch_claim_started_at=dispatch_claim_started_at,
-                        expected_browser_session_id=expected_browser_session_id,
-                    )
                 # Creation waits for the browser to start, so a pinned setup's connection goes back to the pool.
                 async with app.DATABASE.workflow_runs.Session.released():
                     browser_session = await app.PERSISTENT_SESSIONS_MANAGER.create_session(
@@ -13059,24 +12999,8 @@ class WorkflowService:
             else:
                 try:
                     browser_session_id = browser_session.persistent_browser_session_id
-                    if use_resolved_run_seed:
-                        # Deferred creation persists the association before provisioning.
-                        workflow_run.browser_session_id = browser_session_id
-                    else:
-                        workflow_run = await app.DATABASE.workflow_runs.update_workflow_run(
-                            workflow_run_id=workflow_run.workflow_run_id,
-                            browser_session_id=browser_session_id,
-                        )
                 except Exception as error:
-                    if use_resolved_run_seed:
-                        raise BrowserSessionCreditAdmissionRefusal() from error
-                    LOG.warning(
-                        "Failed to assign forced browser session",
-                        workflow_run_id=workflow_run.workflow_run_id,
-                        exc_info=True,
-                    )
-                    workflow_run.mark_row_write_unconfirmed()
-                    return workflow_run
+                    raise BrowserSessionCreditAdmissionRefusal() from error
 
                 retirement_claimed = False
 
@@ -13123,87 +13047,49 @@ class WorkflowService:
                             on_finalization_denied()
                     return selected
 
-                # The run row cannot distinguish forced sessions from sessions leased during
-                # execution. Require its retry pin before setup can return the assigned run.
-                if has_attempt_row and attempt_number == 1:
-                    for pin_attempt in range(2):
-                        try:
-                            if use_resolved_run_seed:
-                                pinned = await app.DATABASE.workflow_runs.pin_browser_session_for_dispatch(
-                                    workflow_run_id=workflow_run.workflow_run_id,
-                                    organization_id=organization_id,
-                                    browser_session_id=browser_session_id,
-                                    attempt_number=attempt_number,
-                                    dispatch_claim_started_at=dispatch_claim_started_at,
-                                )
-                                if not pinned:
-                                    raise WorkflowAttemptDispatchSuperseded(
-                                        workflow_run.workflow_run_id, attempt_number
-                                    )
-                            else:
-                                await app.DATABASE.workflow_run_attempts.pin_first_attempt_browser_session_if_unset(
-                                    workflow_run_id=workflow_run.workflow_run_id,
-                                    organization_id=organization_id,
-                                    browser_session_id=browser_session_id,
-                                )
-                            break
-                        except (WorkflowAttemptDispatchSuperseded, asyncio.CancelledError) as error:
-                            if use_resolved_run_seed:
-                                selected = await finish_retirement(error)
-                                if selected is not error:
-                                    raise selected from error
-                            raise
-                        except Exception as pin_error:
-                            if pin_attempt == 0:
-                                LOG.warning(
-                                    "Retrying failed forced browser session pin",
-                                    workflow_run_id=workflow_run.workflow_run_id,
-                                    organization_id=organization_id,
-                                    browser_session_id=browser_session_id,
-                                    exc_info=True,
-                                )
-                                continue
-                            failure_reason = "Failed to pin forced browser session for workflow retry"
-                            LOG.exception(
-                                failure_reason,
+                # The run is linked only after its browser started, since a link to a browser that never started fails
+                # the run's dispatch guards. The row cannot tell forced sessions from leased ones, so a retryable run's
+                # first-attempt pin commits with the link.
+                for persist_attempt in range(2):
+                    try:
+                        persisted = await app.DATABASE.workflow_runs.link_browser_session_for_dispatch(
+                            workflow_run_id=workflow_run.workflow_run_id,
+                            organization_id=organization_id,
+                            browser_session_id=browser_session_id,
+                            attempt_number=attempt_number,
+                            dispatch_claim_started_at=dispatch_claim_started_at,
+                            expected_browser_session_id=expected_browser_session_id,
+                            pin_first_attempt=has_attempt_row and attempt_number == 1,
+                        )
+                        if not persisted:
+                            raise WorkflowAttemptDispatchSuperseded(workflow_run.workflow_run_id, attempt_number)
+                        break
+                    except (WorkflowAttemptDispatchSuperseded, asyncio.CancelledError) as error:
+                        selected = await finish_retirement(error)
+                        if selected is not error:
+                            raise selected from error
+                        raise
+                    except Exception as persist_error:
+                        if persist_attempt == 0:
+                            LOG.warning(
+                                "Retrying failed forced browser session link",
                                 workflow_run_id=workflow_run.workflow_run_id,
                                 organization_id=organization_id,
                                 browser_session_id=browser_session_id,
+                                exc_info=True,
                             )
-                            if use_resolved_run_seed:
-                                selected = await finish_retirement(pin_error)
-                                if selected is not pin_error:
-                                    raise selected from pin_error
-                                raise
-                            try:
-                                await finalize_abandoned_attempt(
-                                    workflow_run_id=workflow_run.workflow_run_id,
-                                    organization_id=organization_id,
-                                    attempt_number=1,
-                                    reason="forced_browser_session_pin_failed",
-                                    status=WorkflowRunStatus.failed,
-                                    failure_reason=failure_reason,
-                                    finished_at=datetime.now(UTC),
-                                )
-                                await self.mark_workflow_run_as_failed(
-                                    workflow_run.workflow_run_id, failure_reason=failure_reason
-                                )
-                            finally:
-                                try:
-                                    await app.PERSISTENT_SESSIONS_MANAGER.close_session(
-                                        organization_id,
-                                        browser_session_id,
-                                        reason=BrowserSessionCloseReason.aborted,
-                                    )
-                                except Exception:
-                                    with contained_effect("record forced browser session cleanup failure"):
-                                        LOG.warning(
-                                            "Failed to close forced browser session after pin failure",
-                                            workflow_run_id=workflow_run.workflow_run_id,
-                                            browser_session_id=browser_session_id,
-                                            exc_info=True,
-                                        )
-                            raise
+                            continue
+                        LOG.exception(
+                            "Failed to link forced browser session to workflow run",
+                            workflow_run_id=workflow_run.workflow_run_id,
+                            organization_id=organization_id,
+                            browser_session_id=browser_session_id,
+                        )
+                        selected = await finish_retirement(persist_error)
+                        if selected is not persist_error:
+                            raise selected from persist_error
+                        raise
+                workflow_run.browser_session_id = browser_session_id
                 LOG.info(
                     "Browser session created for workflow run",
                     workflow_permanent_id=workflow_permanent_id,
@@ -17856,9 +17742,11 @@ class WorkflowService:
                 workflow_id=runtime_workflow.workflow_id,
                 organization_id=organization_id,
             )
-            cdp_connect_headers = merge_masked_headers(
-                cdp_connect_headers, source.cdp_connect_headers if source is not None else None
-            )
+            if source is None:
+                # Do not persist unverified raw header values when their source version is unavailable.
+                cdp_connect_headers = None
+            else:
+                cdp_connect_headers = merge_masked_headers(cdp_connect_headers, source.cdp_connect_headers)
 
         async def insert_placeholder(version: int) -> Workflow:
             return await self.create_workflow(
@@ -18043,6 +17931,9 @@ class WorkflowService:
         )
         preserve_workflow_definition_secrets(workflow_definition, None, request.workflow_definition)
         workflow_definition.validate()
+        await _validate_powerbi_workflow_save(
+            organization_id, workflow_definition, workflow_permanent_id=workflow_permanent_id
+        )
         self.validate_workflow_block_graph(workflow_definition)
         self._validate_payload_templates(workflow_definition)
         self._validate_new_code_block_safety(workflow_definition, None)

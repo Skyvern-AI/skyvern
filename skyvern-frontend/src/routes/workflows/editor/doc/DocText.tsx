@@ -1,6 +1,7 @@
-import { Fragment } from "react";
+import { Fragment, useContext } from "react";
 import { cn } from "@/util/utils";
 import { splitJinjaReferences } from "./docTextUtils";
+import { WorkflowDocActionsContext } from "./WorkflowDocActionsContext";
 
 /** Plain text with each {{ reference }} shown as a grey pill. */
 export function DocText({
@@ -10,6 +11,7 @@ export function DocText({
   value: string;
   className?: string;
 }) {
+  const { missingReference } = useContext(WorkflowDocActionsContext);
   const parts = splitJinjaReferences(value);
   return (
     <span
@@ -21,8 +23,16 @@ export function DocText({
         ) : (
           <span
             key={i}
-            title={`{{ ${part.ref} }}`}
-            className="inline-block max-w-full rounded bg-muted px-[5px] font-[520] leading-[1.25] text-foreground"
+            title={
+              missingReference(part.ref)
+                ? `{{ ${part.ref} }}: missing reference`
+                : `{{ ${part.ref} }}`
+            }
+            className={cn(
+              "inline-block max-w-full rounded bg-muted px-[5px] font-[520] leading-[1.25] text-foreground",
+              missingReference(part.ref) &&
+                "bg-destructive/10 text-destructive",
+            )}
           >
             {part.ref}
           </span>

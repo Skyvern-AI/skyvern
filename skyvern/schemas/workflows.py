@@ -44,7 +44,10 @@ from skyvern.schemas.emails import EmailBodyFormat, EmailTransport
 from skyvern.schemas.runs import GeoTarget, ProxyLocation, RunEngine, normalize_browser_type
 from skyvern.utils.secret_headers import mask_header_values
 from skyvern.utils.strings import sanitize_identifier
-from skyvern.utils.templating import mask_jinja_control_blocks, replace_jinja_reference
+from skyvern.utils.templating import (
+    mask_jinja_control_blocks,
+    replace_jinja_reference,
+)
 
 LOG = structlog.get_logger()
 
@@ -530,6 +533,7 @@ class BlockType(StrEnum):
     WORKFLOW_TRIGGER = "workflow_trigger"
     GOOGLE_SHEETS_READ = "google_sheets_read"
     GOOGLE_SHEETS_WRITE = "google_sheets_write"
+    POWERBI_QUERY = "powerbi_query"
     PDF_FILL = "pdf_fill"
     SPLIT_PDF = "split_pdf"
     EMAIL_INBOX = "email_inbox"
@@ -1832,6 +1836,24 @@ class GoogleSheetsWriteBlockYAML(BlockYAML):
     parameter_keys: list[str] | None = None
 
 
+class PowerBIQueryBlockYAML(BlockYAML):
+    """Documented ahead of release; saves are unavailable until the Power BI catalog status is live."""
+
+    block_type: Literal[BlockType.POWERBI_QUERY] = BlockType.POWERBI_QUERY  # type: ignore
+    connection_id: str = Field(min_length=1, description="Microsoft OAuth credential ID for this user.")
+    dataset_id: str = Field(min_length=1)
+    query: str = Field(min_length=1, description="A single read-only DAX query.")
+    max_rows: int = Field(default=1_000, ge=1, le=100_000, strict=True)
+    parameter_keys: list[str] | None = None
+
+    @field_validator("connection_id")
+    @classmethod
+    def validate_literal_connection_id(cls, value: str) -> str:
+        if not value.strip() or _has_jinja_syntax(value):
+            raise ValueError("Power BI connection_id must be a literal credential ID.")
+        return value
+
+
 PARAMETER_YAML_SUBCLASSES = (
     AWSSecretParameterYAML
     | BitwardenLoginCredentialParameterYAML
@@ -1881,6 +1903,7 @@ BLOCK_YAML_SUBCLASSES = (
     | GoogleSheetsReadBlockYAML
     | EmailInboxBlockYAML
     | GoogleSheetsWriteBlockYAML
+    | PowerBIQueryBlockYAML
 )
 BLOCK_YAML_TYPES = Annotated[BLOCK_YAML_SUBCLASSES, Field(discriminator="block_type")]
 

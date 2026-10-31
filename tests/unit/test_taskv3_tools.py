@@ -34,7 +34,7 @@ from urllib.parse import urlparse
 import pyotp
 import pytest
 import pytest_asyncio
-from playwright.async_api import Browser, BrowserContext
+from playwright.async_api import Browser, BrowserContext, ElementHandle
 from playwright.async_api import Error as _PlaywrightError
 from playwright.async_api import Frame, Page, Playwright, Route
 from playwright.async_api import TimeoutError as _PlaywrightTimeout
@@ -43,6 +43,7 @@ from structlog.testing import capture_logs
 
 import skyvern.forge.taskv3.loop as taskv3_loop
 import skyvern.forge.taskv3.tools as taskv3_tools
+import skyvern.webeye.action_deadline as action_deadline
 import skyvern.webeye.cdp_download_interceptor as cdp_download_interceptor
 import skyvern.webeye.navigation as navigation_module
 from skyvern.config import settings
@@ -21110,6 +21111,123 @@ async def test_observe_lists_anonymous_menu_rows_inside_a_component_by_handle() 
         assert await page.evaluate("() => window.__clicked") == ["Download"]
 
 
+_REPLACEABLE_FRAME_HTML = """<iframe id="f" style="width:420px;height:160px"
+  srcdoc="<button style='width:120px;height:30px'>Frame Go</button><input aria-label='Frame Name' style='width:200px;height:24px'>">
+</iframe>"""
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("tool_name", "needle", "extra"), [("click", "Frame Go", {}), ("type", "Frame Name", {"text": "x"})]
+)
+async def test_a_ref_whose_document_was_replaced_is_stale_without_waiting_on_the_attribute_getter(
+    monkeypatch: pytest.MonkeyPatch, tool_name: str, needle: str, extra: dict[str, Any]
+) -> None:
+    # Patchright 1.61.2's ElementHandle.get_attribute polls ':scope' until the frame detaches once the
+    # handle's document was replaced, where stock Playwright raises at once; this getter stands in for it.
+    stock_get_attribute = ElementHandle.get_attribute
+
+    async def _getter_waiting_for_detach(self: ElementHandle, name: str) -> str | None:
+        try:
+            await self.evaluate("() => 0")
+        except _PlaywrightError:
+            await asyncio.Event().wait()
+        return await stock_get_attribute(self, name)
+
+    monkeypatch.setattr(ElementHandle, "get_attribute", _getter_waiting_for_detach)
+    async with _live_page(_REPLACEABLE_FRAME_HTML) as page:
+        await page.wait_for_function("() => !!document.getElementById('f').contentDocument?.querySelector('input')")
+        tools = build_browser_tools(_fixed_page_provider(page))
+        ref = _ref_line((await _tool(tools, "observe").handler({})).content, needle)
+        await page.evaluate("() => { document.getElementById('f').srcdoc = '<p>replaced</p>'; }")
+        await page.wait_for_function("() => !!document.getElementById('f').contentDocument?.querySelector('p')")
+        result = await asyncio.wait_for(_tool(tools, tool_name).handler({"selector": ref, **extra}), 10)
+    assert result.error_class == "stale_ref", result.content
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+@pytest.mark.parametrize("tool_name", ["click", "type"])
+async def test_a_click_or_type_whose_action_never_settles_ends_at_the_tool_deadline(
+    monkeypatch: pytest.MonkeyPatch, tool_name: str
+) -> None:
+    monkeypatch.setattr(taskv3_tools, "_ACT_TOOL_TIMEOUT_MS", 1000)
+    monkeypatch.setattr(action_deadline, "ACTION_DEADLINE_HEADROOM_MS", 0)
+
+    async def _never_settles(*args: Any, **kwargs: Any) -> None:
+        await asyncio.Event().wait()
+
+    for primitive in ("click", "fill", "type_keys"):
+        monkeypatch.setattr(taskv3_tools.input_dispatch, primitive, _never_settles)
+    async with _live_page(
+        "<button style='width:120px;height:30px'>Go</button><input aria-label='Name' style='width:200px;height:24px'>"
+    ) as page:
+        tools = build_browser_tools(_fixed_page_provider(page))
+        seen = (await _tool(tools, "observe").handler({})).content
+        args = (
+            {"selector": _ref_line(seen, "'Go'")}
+            if tool_name == "click"
+            else {"selector": _ref_line(seen, "'Name'"), "text": "x"}
+        )
+        result = await asyncio.wait_for(_tool(tools, tool_name).handler(args), 10)
+    assert (result.status, result.error_class, result.refused) == ("error", "timeout_other", False), result.content
+    if tool_name == "click":
+        # The press may already have reached the page, so the loop must treat it as possibly landed.
+        assert (result.data or {}).get(taskv3_loop.CLICK_DISPATCHED_DATA_KEY) is True
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("tool_name", "needle", "extra", "address"),
+    [("click", "'Go'", {}, "ref"), ("type", "'Name'", {"text": "x"}, "ref"), ("click", "'Go'", {}, "mark")],
+)
+async def test_an_address_whose_reads_swallow_the_deadline_is_still_refused_as_stale_at_the_resolve_bound(
+    monkeypatch: pytest.MonkeyPatch, tool_name: str, needle: str, extra: dict[str, Any], address: str
+) -> None:
+    monkeypatch.setattr(taskv3_tools, "_ADDRESS_RESOLVE_TIMEOUT_MS", 1000)
+    monkeypatch.setattr(action_deadline, "ACTION_DEADLINE_HEADROOM_MS", 0)
+    monkeypatch.setattr(action_deadline, "DEADLINE_REARM_INTERVAL_SECONDS", 0.05)
+
+    released = asyncio.Event()
+
+    async def _reports_its_cancel_as_an_error(handle: Any) -> str | None:
+        # A driver can surface a cancellation as an ordinary error, which the resolver swallows before its
+        # next read; only a deadline that cancels again ends that read too.
+        try:
+            await released.wait()
+        except asyncio.CancelledError:
+            raise _PlaywrightError("Target page, context or browser has been closed") from None
+        return None
+
+    monkeypatch.setattr(taskv3_tools, "_act_token", _reports_its_cancel_as_an_error)
+    async with _live_page(
+        "<button style='width:120px;height:30px'>Go</button><input aria-label='Name' style='width:200px;height:24px'>"
+    ) as page:
+        tools = build_browser_tools(_fixed_page_provider(page))
+        if address == "ref":
+            target: dict[str, Any] = {
+                "selector": _ref_line((await _tool(tools, "observe").handler({})).content, needle)
+            }
+        else:
+            looked = (await _tool(tools, "look").handler({})).content
+            found = re.search(rf"^\[(\d+)\][^\n]*{needle}", looked, re.M)
+            assert found, looked
+            target = {"mark": int(found.group(1))}
+        call = asyncio.ensure_future(_tool(tools, tool_name).handler({**target, **extra}))
+        # Not wait_for: its own cancellation is swallowed the same way, so a missing re-arm would hang the test
+        # instead of failing it. Releasing the reads lets a call that outlived the bound finish before teardown.
+        done, _ = await asyncio.wait({call}, timeout=10)
+        released.set()
+        await asyncio.wait({call}, timeout=5)
+    assert call in done, "the resolve bound did not end a read that swallowed its cancellation"
+    result = call.result()
+    # Nothing was dispatched, so this is a stale address to re-read, not an action that may have landed.
+    assert (result.error_class, result.refused) == (f"stale_{address}", True), result.content
+    assert not (result.data or {}).get(taskv3_loop.CLICK_DISPATCHED_DATA_KEY)
+
+
 @_skip_no_browser
 @pytest.mark.asyncio
 async def test_a_handle_only_control_survives_a_walk_the_page_mutated() -> None:
@@ -25984,6 +26102,50 @@ async def test_the_covered_record_separates_a_qualifying_layer_from_the_named_hi
             assert "no named controls" in r.content and "get_html of #wizard8" in r.content, r.content
             recorded = taskv3_loop._COVERED_LAYER.get() or {}
             assert recorded == {"branch": "named", "controls": 0, "layer_kind": "qualified"}, recorded
+
+
+# A closed <details> skips painting its content but still lays it out, so the field keeps a box and the hit test
+# lands on whatever is drawn there -- the next section. Nothing covers the field; it is not rendered.
+_FIELD_IN_A_CLOSED_DETAILS_HTML = """
+<details id="section"><summary>Address</summary><label for="city">City</label><input id="city" type="text"></details>
+<details><summary>Email</summary><input id="email" type="email"></details>
+"""
+_FIELD_IN_A_CONTENT_VISIBILITY_HIDDEN_BOX_HTML = """
+<div id="section" style="content-visibility:hidden;height:40px"><input id="city" type="text"></div>
+<button id="next" type="button">Next</button>
+"""
+
+
+@pytest.mark.usefixtures("expected_action_timeout")
+@_skip_no_browser
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("markup", "reveal"),
+    [
+        (_FIELD_IN_A_CLOSED_DETAILS_HTML, "document.getElementById('section').open = true"),
+        (
+            _FIELD_IN_A_CONTENT_VISIBILITY_HIDDEN_BOX_HTML,
+            "document.getElementById('section').style.contentVisibility = 'visible'",
+        ),
+    ],
+    ids=["closed_details", "content_visibility_hidden"],
+)
+async def test_type_into_a_field_the_browser_does_not_render_is_unreachable_not_covered(
+    markup: str, reveal: str
+) -> None:
+    async with _content_page(markup) as page:
+        type_tool = _tool(build_browser_tools(_fixed_page_provider(page)), "type")
+        taskv3_loop._COVERED_LAYER.set(None)
+        refused = await type_tool.handler({"selector": "#city", "text": "x"})
+        assert refused.status == "error" and refused.error_class == "unreachable", refused.content
+        assert "is not rendered" in refused.content and "covered by" not in refused.content, refused.content
+        assert taskv3_loop._COVERED_LAYER.get() is None
+        assert await page.evaluate("document.getElementById('city').value") == ""
+
+        await page.evaluate(reveal)
+        typed = await type_tool.handler({"selector": "#city", "text": "x"})
+        assert typed.status == "ok", typed.content
+        assert await page.evaluate("document.getElementById('city').value") == "x"
 
 
 _DISMISSIBLE_DIALOG_BESIDE_A_COVERED_ROW_HTML = """

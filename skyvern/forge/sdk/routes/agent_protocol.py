@@ -192,6 +192,14 @@ from skyvern.forge.sdk.workflow.service import (
     redact_one_time_code_actions,
     redact_one_time_code_step,
 )
+from skyvern.forge.sdk.workflow.validation import (
+    WorkflowProblem,
+    WorkflowValidationResult,
+    WorkflowValidationTooComplex,
+    ensure_workflow_validation_limits,
+    validate_stored_workflow,
+    validate_workflow_definition,
+)
 from skyvern.schemas.artifacts import EntityType, entity_type_to_param
 from skyvern.schemas.folders import Folder, FolderCreate, FolderUpdate, UpdateWorkflowFolderRequest
 from skyvern.schemas.runs import (
@@ -1043,6 +1051,105 @@ async def create_workflow_legacy(
 
 IDEMPOTENCY_KEY_MAX_BYTES = 255
 IDEMPOTENCY_KEY_CONTRACT = f"Idempotency-Key must contain 1 to {IDEMPOTENCY_KEY_MAX_BYTES} visible ASCII bytes."
+MAX_WORKFLOW_VALIDATION_DRAFT_BYTES = 100_000
+
+
+async def _validate_workflow_draft(request: Request) -> WorkflowValidationResult:
+    body = await request.body()
+    if len(body) > MAX_WORKFLOW_VALIDATION_DRAFT_BYTES:
+        raise HTTPException(
+            status_code=http_status.HTTP_413_CONTENT_TOO_LARGE,
+            detail=f"Workflow validation drafts must be at most {MAX_WORKFLOW_VALIDATION_DRAFT_BYTES} bytes.",
+        )
+    try:
+        data = await asyncio.to_thread(orjson.loads, body)
+        if not isinstance(data, dict):
+            raise ValueError("Workflow validation requires a JSON object.")
+        ensure_workflow_validation_limits(data)
+        return await asyncio.to_thread(validate_workflow_definition, data)
+    except WorkflowValidationTooComplex as exc:
+        return WorkflowValidationResult(
+            valid=False,
+            problems=[
+                WorkflowProblem(
+                    path="workflow_definition",
+                    code="validation_limit",
+                    message=str(exc),
+                )
+            ],
+        )
+    except (orjson.JSONDecodeError, RecursionError, ValueError) as exc:
+        return WorkflowValidationResult(
+            valid=False,
+            problems=[WorkflowProblem(path="body", code="invalid_draft", message=str(exc))],
+        )
+
+
+@legacy_base_router.post("/workflows/validate", include_in_schema=False)
+@base_router.post(
+    "/workflows/validate",
+    include_in_schema=False,
+)
+@base_router.post(
+    "/agents/validate",
+    include_in_schema=False,
+)
+async def validate_workflow(
+    request: Request,
+    current_org: Organization = Depends(org_auth_service.get_current_org),
+) -> WorkflowValidationResult:
+    del current_org
+    return await _validate_workflow_draft(request)
+
+
+@legacy_base_router.post("/workflows/validate/", include_in_schema=False)
+@base_router.post("/workflows/validate/", include_in_schema=False)
+@base_router.post("/agents/validate/", include_in_schema=False)
+async def validate_workflow_trailing_slash(
+    request: Request,
+    current_org: Organization = Depends(org_auth_service.get_current_org),
+) -> WorkflowValidationResult:
+    del current_org
+    return await _validate_workflow_draft(request)
+
+
+@legacy_base_router.post("/workflows/{workflow_permanent_id}/validate", include_in_schema=False)
+@base_router.post(
+    "/workflows/{workflow_permanent_id}/validate",
+    include_in_schema=False,
+)
+@base_router.post(
+    "/agents/{workflow_permanent_id}/validate",
+    include_in_schema=False,
+)
+async def validate_saved_workflow(
+    workflow_permanent_id: str,
+    current_org: Organization = Depends(org_auth_service.get_current_org),
+) -> WorkflowValidationResult:
+    await _enforce_folder_access("workflow.read", {"workflow_permanent_id": workflow_permanent_id})
+    workflow = await app.WORKFLOW_SERVICE.get_workflow_by_permanent_id(
+        workflow_permanent_id=workflow_permanent_id,
+        organization_id=current_org.organization_id,
+    )
+    try:
+        return await asyncio.to_thread(validate_stored_workflow, workflow)
+    except WorkflowValidationTooComplex as exc:
+        raise HTTPException(status_code=http_status.HTTP_422_UNPROCESSABLE_CONTENT, detail=str(exc)) from exc
+    except RecursionError as exc:
+        return WorkflowValidationResult(
+            valid=False,
+            problems=[WorkflowProblem(path="body", code="invalid_draft", message=str(exc))],
+        )
+
+
+@legacy_base_router.post("/workflows/{workflow_permanent_id}/validate/", include_in_schema=False)
+@base_router.post("/workflows/{workflow_permanent_id}/validate/", include_in_schema=False)
+@base_router.post("/agents/{workflow_permanent_id}/validate/", include_in_schema=False)
+async def validate_saved_workflow_trailing_slash(
+    workflow_permanent_id: str,
+    current_org: Organization = Depends(org_auth_service.get_current_org),
+) -> WorkflowValidationResult:
+    return await validate_saved_workflow(workflow_permanent_id, current_org)
 
 
 def validate_idempotency_key(
@@ -1328,6 +1435,8 @@ async def import_workflow_from_pdf(
 ) -> dict[str, Any]:
     """Import a workflow from a PDF file containing Standard Operating Procedures."""
     analytics.capture("skyvern-oss-workflow-import-pdf")
+    # Notes go into the import only for people the server finds on the Doc editor; a client-sent field is ignored.
+    doc_editor_enabled = await app.AGENT_FUNCTION.workflow_doc_editor_enabled(current_org.organization_id, user_id)
     build_source = workflow_build_source_from_user_agent(x_user_agent)
 
     # Read file and validate early (before creating import record)
@@ -1384,7 +1493,9 @@ async def import_workflow_from_pdf(
     async def process_pdf_import() -> None:
         try:
             # Create workflow from extracted text (LLM processing)
-            result = await pdf_import_service.create_workflow_from_sop_text(sop_text, current_org)
+            result = await pdf_import_service.create_workflow_from_sop_text(
+                sop_text, current_org, doc_editor_enabled=doc_editor_enabled
+            )
             imported = WorkflowCreateYAMLRequest.model_validate(result)
             await app.AGENT_FUNCTION.enforce_folder_access_for_references(
                 principal, "workflow.run", imported.model_dump(exclude={"folder_id"})
@@ -6971,7 +7082,18 @@ async def _flatten_workflow_run_timeline_recursive(
                     }
                 )
 
-            result.extend(inherit_attempt(item) for item in nested_timeline)
+            flattened = [inherit_attempt(item) for item in nested_timeline]
+            # One copy is enough to find the replaced block; thought rows never carry it. A nested task_v2
+            # already put its own block on that row, so the outer one is added after it.
+            first_block_row = next((index for index, item in enumerate(flattened) if item.block), None)
+            if first_block_row is not None:
+                row = flattened[first_block_row]
+                flattened[first_block_row] = row.model_copy(
+                    update={"task_v2_blocks": [*(row.task_v2_blocks or []), timeline.block]}
+                )
+            else:
+                flattened.append(timeline)
+            result.extend(flattened)
         else:
             LOG.warning(
                 "Block workflow run id is not set for task_v2 block",

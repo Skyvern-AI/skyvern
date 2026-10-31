@@ -30,42 +30,46 @@ type StreamCall = {
   reject: (error: unknown) => void;
 };
 
-vi.mock("posthog-js/react", () => ({
-  useFeatureFlagEnabled: () => {
-    throw new Error("WorkflowCopilotChat must not consult PostHog");
-  },
-}));
+const {
+  streamCalls,
+  postStreaming,
+  cancelPost,
+  historyResponse,
+  featureFlags,
+} = vi.hoisted(() => {
+  const calls: StreamCall[] = [];
+  const post = vi.fn().mockResolvedValue({});
+  const streaming = vi.fn(
+    (
+      _path: string,
+      body: StreamBody,
+      onMessage: (payload: unknown) => boolean,
+    ) =>
+      new Promise<void>((resolve, reject) => {
+        calls.push({ body, onMessage, resolve, reject });
+      }),
+  );
+  const history = {
+    data: {
+      workflow_copilot_chat_id: null as string | null,
+      chat_history: [] as unknown[],
+      proposed_workflow: null as Record<string, unknown> | null,
+      auto_accept: false,
+    },
+  };
+  return {
+    streamCalls: calls,
+    postStreaming: streaming,
+    cancelPost: post,
+    historyResponse: history,
+    featureFlags: { docEditor: false },
+  };
+});
 
-const { streamCalls, postStreaming, cancelPost, historyResponse } = vi.hoisted(
-  () => {
-    const calls: StreamCall[] = [];
-    const post = vi.fn().mockResolvedValue({});
-    const streaming = vi.fn(
-      (
-        _path: string,
-        body: StreamBody,
-        onMessage: (payload: unknown) => boolean,
-      ) =>
-        new Promise<void>((resolve, reject) => {
-          calls.push({ body, onMessage, resolve, reject });
-        }),
-    );
-    const history = {
-      data: {
-        workflow_copilot_chat_id: null as string | null,
-        chat_history: [] as unknown[],
-        proposed_workflow: null as Record<string, unknown> | null,
-        auto_accept: false,
-      },
-    };
-    return {
-      streamCalls: calls,
-      postStreaming: streaming,
-      cancelPost: post,
-      historyResponse: history,
-    };
-  },
-);
+vi.mock("posthog-js/react", () => ({
+  useFeatureFlagEnabled: (name: string) =>
+    name === "WORKFLOW_DOC_EDITOR" && featureFlags.docEditor,
+}));
 
 vi.mock("@/api/sse", () => ({
   getSseClient: vi.fn().mockResolvedValue({ postStreaming }),
@@ -239,6 +243,7 @@ beforeEach(() => {
   streamCalls.length = 0;
   postStreaming.mockClear();
   cancelPost.mockClear();
+  featureFlags.docEditor = false;
   useCopilotActionStore.setState({
     pendingBuild: null,
     generatingBlockLabel: null,
@@ -568,6 +573,7 @@ describe("WorkflowCopilotChat — unflagged S4 composer", () => {
       expect(screen.getByText("What should this agent do?")).toBeTruthy(),
     );
     expect(screen.getByText("Upload an SOP")).toBeTruthy();
+    expect(screen.queryByText("Paste an SOP")).toBeNull();
     expect(screen.getByText("Demonstrate task")).toBeTruthy();
     const actionLayout = screen.getByRole("button", {
       name: "Upload an SOP",

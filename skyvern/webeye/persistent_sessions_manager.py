@@ -247,6 +247,7 @@ class PersistentSessionsManager(Protocol):
         proxy_location: ProxyLocationInput,
         browser_profile_id: str | None,
         session_kind: BrowserSessionKind,
+        created_for_workflow_permanent_id: str | None = None,
     ) -> FreshExitReceipt:
         """Create one browser in the prior session's geography and profile scope on a verified different egress.
         A new browser whose exit is not verified distinct is closed, and the receipt says why no alternate exists."""

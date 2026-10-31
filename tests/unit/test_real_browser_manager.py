@@ -2111,6 +2111,24 @@ async def test_session_activity_cadence_is_not_reset_by_new_attaches() -> None:
                 await asyncio.gather(manager._session_activity_renewer, return_exceptions=True)
 
 
+@pytest.mark.asyncio
+async def test_a_failed_first_activity_stamp_still_starts_the_renewer() -> None:
+    manager = RealBrowserManager()
+    touch = AsyncMock(side_effect=[RuntimeError("database is down"), None])
+
+    with patch_browser_manager_app() as mock_app:
+        mock_app.DATABASE.browser_sessions.touch_last_activity = touch
+        try:
+            with pytest.raises(RuntimeError):
+                await manager.begin_session_activity_renewal("pbs_unstamped")
+            await _let_the_renewer_run()
+            assert touch.await_args_list == [call("pbs_unstamped"), call("pbs_unstamped")]
+        finally:
+            manager.end_session_activity_renewal("pbs_unstamped")
+            if manager._session_activity_renewer is not None:
+                await asyncio.gather(manager._session_activity_renewer, return_exceptions=True)
+
+
 def test_session_activity_renewer_recreates_event_for_a_new_loop() -> None:
     manager = RealBrowserManager()
     stamps: list[Any] = []

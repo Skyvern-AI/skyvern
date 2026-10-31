@@ -177,7 +177,9 @@ def private_workflow_settings_from_yaml(workflow_yaml: str | None) -> dict[str, 
         return {}
     if not isinstance(data, dict):
         return {}
-    return {key: data[key] for key in _PRIVATE_WORKFLOW_SETTINGS_FIELDS if key in data}
+    settings = {key: data[key] for key in _PRIVATE_WORKFLOW_SETTINGS_FIELDS if key in data}
+    _canonicalize_copilot_proxy_location(settings)
+    return settings
 
 
 def with_private_workflow_settings(
@@ -254,7 +256,7 @@ def runner_code_block_associations(
     return associations
 
 
-def _strip_runtime_block_fields(block: dict[str, Any]) -> dict[str, Any]:
+def strip_runtime_block_fields(block: dict[str, Any]) -> dict[str, Any]:
     cleaned = deepcopy(block)
     cleaned.pop("output_parameter", None)
     cleaned.pop("workflow_system_prompt", None)
@@ -280,7 +282,7 @@ def _strip_runtime_block_fields(block: dict[str, Any]) -> dict[str, Any]:
     loop_blocks = cleaned.get("loop_blocks")
     if isinstance(loop_blocks, list):
         cleaned["loop_blocks"] = [
-            _strip_runtime_block_fields(loop_block) if isinstance(loop_block, dict) else loop_block
+            strip_runtime_block_fields(loop_block) if isinstance(loop_block, dict) else loop_block
             for loop_block in loop_blocks
         ]
     return cleaned
@@ -306,7 +308,7 @@ def _copilot_yaml_workflow_definition(persisted_definition: dict[str, Any]) -> d
     blocks = workflow_definition.get("blocks")
     if isinstance(blocks, list):
         workflow_definition["blocks"] = [
-            _strip_runtime_block_fields(block) if isinstance(block, dict) else block for block in blocks
+            strip_runtime_block_fields(block) if isinstance(block, dict) else block for block in blocks
         ]
     return workflow_definition
 

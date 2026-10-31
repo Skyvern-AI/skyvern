@@ -2,9 +2,11 @@
 
 from __future__ import annotations
 
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 from skyvern.forge.sdk.copilot.context import ProposalDisposition
+from skyvern.forge.sdk.copilot.run_outcome import RecordedRunOutcomeVerdict
+from skyvern.utils.strings import join_phrases
 
 MINIMAL_CANCEL_STOP = "Stopped."
 # Only a Stop click is unambiguously the user asking. An Escape may be ambient, so it
@@ -54,19 +56,94 @@ class InterruptedTurnFacts(BaseModel):
     superseded_by_newer_test: bool = False
 
 
+_RUN_VERDICT_RECORDED: dict[RecordedRunOutcomeVerdict, str] = {
+    "demonstrated": "recorded the requested outcome",
+    "not_demonstrated": "did not record the requested outcome",
+    "not_evaluated": "recorded no outcome check",
+}
+
+
+class StoppedTurnFacts(BaseModel):
+    """What a stopped turn's own tools recorded before the stop. Edits and the run stay separate facts,
+    because a run started before a later edit never exercised that edit."""
+
+    edited_block_labels: list[str] = Field(default_factory=list)
+    run_id: str | None = None
+    run_started_before_last_edit: bool = False
+    run_result_recorded: bool = False
+    verdict: RecordedRunOutcomeVerdict | None = None
+    run_completed: bool | None = None
+    # (label, status) in run order; status is the runner's word for the row, not a verdict.
+    block_rows: list[tuple[str, str]] = Field(default_factory=list)
+    block_rows_omitted: int = 0
+    display_reason: str | None = None
+    # Blocks this turn changed after the draft it hands back, when that draft is an earlier tested one.
+    changes_not_in_draft: list[str] = Field(default_factory=list)
+
+
+def _recorded_run_sentence(run: str, stopped: StoppedTurnFacts) -> str:
+    if not stopped.run_result_recorded:
+        return f"{run} started and has no recorded result."
+    if stopped.block_rows:
+        rows = join_phrases([f"{label} {status}" for label, status in stopped.block_rows], "and")
+        return f"{run} recorded {rows}."
+    parts = [
+        part
+        for part in (
+            None if stopped.run_completed is None else ("finished" if stopped.run_completed else "did not finish"),
+            _RUN_VERDICT_RECORDED[stopped.verdict] if stopped.verdict is not None else None,
+        )
+        if part
+    ]
+    return f"{run} {join_phrases(parts, 'and')}." if parts else f"{run} has a recorded result."
+
+
+def _stopped_turn_sentences(stopped: StoppedTurnFacts, *, stop_button: bool) -> list[str]:
+    sentences: list[str] = []
+    if stopped.edited_block_labels:
+        sentences.append(f"I changed {join_phrases(stopped.edited_block_labels, 'and')}.")
+    if stopped.run_id:
+        run = f"test run {stopped.run_id}"
+        if stopped.run_started_before_last_edit:
+            run += ", which started before my last change,"
+        sentences.append(_recorded_run_sentence(run, stopped))
+        if stopped.block_rows and stopped.block_rows_omitted:
+            sentences.append(f"{stopped.block_rows_omitted} more block row(s) between them are not listed.")
+        if stopped.run_result_recorded and stopped.display_reason:
+            reason = f"Recorded reason: {stopped.display_reason.rstrip()}"
+            sentences.append(reason if reason.endswith((".", "!", "?")) else f"{reason}.")
+    if not sentences:
+        return []
+    opening = "Before you stopped," if stop_button else "Before the stop,"
+    sentences[0] = f"{opening} {sentences[0]}"
+    return [sentence[:1].upper() + sentence[1:] for sentence in sentences]
+
+
 def cancel_notice(
     *,
     base: str | None = None,
     stop_button: bool,
     preserved_draft: ProposalDisposition | None,
     canonical_rolled_back: bool,
+    stopped: StoppedTurnFacts | None = None,
 ) -> str:
-    """User-facing copy for a cancelled turn: whatever reply the turn already wrote, plus the facts
-    of the stop, with the stop opening used only when that reply is empty. ``preserved_draft`` is
+    """User-facing copy for a cancelled turn: whatever reply the turn already wrote (or the stop
+    opening when it is empty), then the ``stopped`` facts and the facts of the stop. ``preserved_draft`` is
     the disposition of the draft left on screen, or None when none awaits the user."""
     notice = (base or "").strip() or (CANCEL_STOP_AT_USER_REQUEST if stop_button else MINIMAL_CANCEL_STOP)
+    if stopped is not None:
+        for sentence in _stopped_turn_sentences(stopped, stop_button=stop_button):
+            notice = append_sentence(notice, sentence)
     if preserved_draft is not None:
-        notice = append_sentence(notice, f"{_CANCEL_DRAFT_PRESERVED[preserved_draft]} {CANCEL_ACCEPT_OR_DISCARD}")
+        omitted = stopped.changes_not_in_draft if stopped is not None else []
+        omitted_sentence = (
+            f" It does not include my later change{'s' if len(omitted) > 1 else ''} to {join_phrases(omitted, 'and')}."
+            if omitted
+            else ""
+        )
+        notice = append_sentence(
+            notice, f"{_CANCEL_DRAFT_PRESERVED[preserved_draft]}{omitted_sentence} {CANCEL_ACCEPT_OR_DISCARD}"
+        )
     if canonical_rolled_back:
         notice = append_sentence(notice, CANONICAL_ROLLED_BACK)
     return notice

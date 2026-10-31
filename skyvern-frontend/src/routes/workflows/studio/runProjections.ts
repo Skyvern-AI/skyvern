@@ -380,6 +380,7 @@ export function resolveLandingSelectionId(
 }
 
 export type BlockRunState = {
+  block: WorkflowRunBlock;
   status: Status | null;
   actionCount: number;
   failureReason: string | null;
@@ -392,25 +393,32 @@ export type BlockRunState = {
  */
 export function buildBlockStatusMap(
   timeline: WorkflowRunTimelineItem[] | undefined,
+  workflowRunId?: string,
 ): Record<string, BlockRunState> {
-  const byLabel: Record<string, BlockRunState> = {};
+  const byLabel: Record<string, BlockRunState> = Object.create(null);
 
+  const add = (block: WorkflowRunBlock) => {
+    // Timeline rows are newest-first; keep the first occurrence in the selected run.
+    if (
+      block.label &&
+      (!workflowRunId || block.workflow_run_id === workflowRunId) &&
+      !byLabel[block.label]
+    )
+      byLabel[block.label] = {
+        block,
+        status: block.status,
+        actionCount: block.actions?.length ?? 0,
+        failureReason: block.failure_reason,
+        duration: block.duration,
+      };
+  };
   const walk = (items: WorkflowRunTimelineItem[]): void => {
     for (const item of items) {
       if (isBlockItem(item)) {
-        const block = item.block;
-        if (block.label) {
-          byLabel[block.label] = {
-            status: block.status,
-            actionCount: block.actions?.length ?? 0,
-            failureReason: block.failure_reason,
-            duration: block.duration,
-          };
-        }
+        add(item.block);
+        item.task_v2_blocks?.forEach(add);
       }
-      if (item.children.length > 0) {
-        walk(item.children);
-      }
+      walk(item.children);
     }
   };
 

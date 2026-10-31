@@ -226,6 +226,7 @@ def test_email_from_id_token_prefers_email_claim() -> None:
 
 @pytest.mark.asyncio
 async def test_powerbi_authorization_requires_a_real_authenticated_user(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(microsoft_oauth_routes, "integration_is_live", lambda _: True)
     start = AsyncMock()
     monkeypatch.setattr(microsoft_oauth_routes.microsoft_oauth_service, "start_authorization", start)
 
@@ -244,7 +245,27 @@ async def test_powerbi_authorization_requires_a_real_authenticated_user(monkeypa
 
 
 @pytest.mark.asyncio
+async def test_powerbi_authorization_is_disabled_until_catalog_entry_is_live(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(microsoft_oauth_routes, "integration_is_live", lambda _: False)
+    start = AsyncMock()
+
+    with pytest.raises(HTTPException, match="Power BI connections are not currently available") as exc_info:
+        await microsoft_oauth_routes.microsoft_oauth_authorize(
+            CreateMicrosoftOAuthAuthorizeRequest(
+                redirect_uri="https://app/cb",
+                scope_profile="powerbi_dataset_read",
+            ),
+            SimpleNamespace(organization_id="org_1"),
+            "user-owner",
+        )
+
+    assert exc_info.value.status_code == 403
+    start.assert_not_awaited()
+
+
+@pytest.mark.asyncio
 async def test_powerbi_authorization_binds_the_authenticated_owner(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(microsoft_oauth_routes, "integration_is_live", lambda _: True)
     start = AsyncMock(return_value=SimpleNamespace(authorize_url="https://login.example.test", state="state"))
     monkeypatch.setattr(microsoft_oauth_routes.microsoft_oauth_service, "start_authorization", start)
 
@@ -272,6 +293,7 @@ async def test_powerbi_authorization_binds_the_authenticated_owner(monkeypatch: 
 async def test_powerbi_callback_requires_authenticated_consent_owner_before_exchange(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    monkeypatch.setattr(microsoft_oauth_routes, "integration_is_live", lambda _: True)
     monkeypatch.setattr(
         microsoft_oauth_routes.microsoft_oauth_service,
         "load_pending_consent_context",
@@ -299,9 +321,39 @@ async def test_powerbi_callback_requires_authenticated_consent_owner_before_exch
 
 
 @pytest.mark.asyncio
+async def test_powerbi_callback_is_disabled_until_catalog_entry_is_live(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(microsoft_oauth_routes, "integration_is_live", lambda _: False)
+    monkeypatch.setattr(
+        microsoft_oauth_routes.microsoft_oauth_service,
+        "load_pending_consent_context",
+        AsyncMock(
+            return_value=PendingConsentContext(
+                credential_id="cred_1",
+                consent_redirect_uri="https://app/cb",
+                consent_code_verifier="verifier",
+                scopes_requested=list(microsoft_oauth_service.POWERBI_DATASET_READ_SCOPES),
+            )
+        ),
+    )
+    exchange = AsyncMock()
+    monkeypatch.setattr(microsoft_oauth_routes.microsoft_oauth_service, "exchange_code_for_tokens", exchange)
+
+    with pytest.raises(HTTPException, match="Power BI connections are not currently available") as exc_info:
+        await microsoft_oauth_routes.microsoft_oauth_callback(
+            CreateMicrosoftOAuthCallbackRequest(code="code", state="state"),
+            SimpleNamespace(organization_id="org_1"),
+            "user-owner",
+        )
+
+    assert exc_info.value.status_code == 403
+    exchange.assert_not_awaited()
+
+
+@pytest.mark.asyncio
 async def test_powerbi_callback_promotes_only_the_restricted_owner_bound_grant(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    monkeypatch.setattr(microsoft_oauth_routes, "integration_is_live", lambda _: True)
     now = datetime.datetime.now(datetime.UTC).replace(tzinfo=None)
     requested_scopes = list(microsoft_oauth_service.POWERBI_DATASET_READ_SCOPES)
     credential = MicrosoftOAuthCredentialBase(

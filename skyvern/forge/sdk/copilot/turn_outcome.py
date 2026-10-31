@@ -78,7 +78,6 @@ def apply_repeated_reply_guard(
     blocked_signatures: Iterable[str],
     reason_code: str = "",
     terminal_reason: str | None = None,
-    tool_calls: Iterable[str] = (),
 ) -> tuple[str, TurnOutcome]:
     """Centralized post-output record. Returns ``(final_text, outcome)``.
 
@@ -95,7 +94,6 @@ def apply_repeated_reply_guard(
         final_text,
         response_kind=attempted_kind,
         reason_code=reason_code,
-        tool_calls=list(tool_calls),
         terminal_reason=terminal_reason,
         inherited_blocked_signatures=inherited,
     )

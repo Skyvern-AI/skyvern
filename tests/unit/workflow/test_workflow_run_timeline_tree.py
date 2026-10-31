@@ -300,3 +300,60 @@ async def test_flatten_task_v2_timeline_inherits_enclosing_attempt(monkeypatch: 
     assert result[1].type == WorkflowRunTimelineType.thought
     assert result[0].children[0].children[0].block == leaf.block
     assert [item.attempt for item in [loop, thought, conditional, leaf]] == [1, 1, 1, 1]
+    # The first block row that replaced the task_v2 block carries it once; the thought row does not.
+    assert [item.task_v2_blocks for item in result] == [[parent_block], None]
+
+
+@pytest.mark.asyncio
+async def test_flatten_task_v2_keeps_wrapper_when_child_has_no_block_rows(monkeypatch: pytest.MonkeyPatch) -> None:
+    base = datetime(2026, 5, 4, 12, 0, tzinfo=UTC)
+    parent_block = _block("wrb_parent", created_at=base, block_type=BlockType.TaskV2).model_copy(
+        update={"block_workflow_run_id": "wr_child"}
+    )
+    parent = WorkflowRunTimeline(
+        type=WorkflowRunTimelineType.block,
+        block=parent_block,
+        created_at=base,
+        modified_at=base,
+    )
+    thought = WorkflowRunTimeline(
+        type=WorkflowRunTimelineType.thought,
+        created_at=base,
+        modified_at=base,
+    )
+    monkeypatch.setattr(agent_protocol, "_flatten_workflow_run_timeline", AsyncMock(return_value=[thought]))
+
+    result = await agent_protocol._flatten_workflow_run_timeline_recursive(parent, organization_id="o_test")
+
+    assert [item.block for item in result] == [None, parent_block]
+
+
+@pytest.mark.asyncio
+async def test_flatten_nested_task_v2_keeps_both_replaced_blocks(monkeypatch: pytest.MonkeyPatch) -> None:
+    base = datetime(2026, 5, 4, 12, 0, tzinfo=UTC)
+
+    def task_v2_row(block_id: str, child_run_id: str) -> WorkflowRunTimeline:
+        block = _block(block_id, created_at=base, block_type=BlockType.TaskV2).model_copy(
+            update={"block_workflow_run_id": child_run_id}
+        )
+        return WorkflowRunTimeline(type=WorkflowRunTimelineType.block, block=block, created_at=base, modified_at=base)
+
+    outer, inner = task_v2_row("wrb_outer", "wr_outer_child"), task_v2_row("wrb_inner", "wr_inner_child")
+    leaf = WorkflowRunTimeline(
+        type=WorkflowRunTimelineType.block, block=_block("wrb_leaf", created_at=base), created_at=base, modified_at=base
+    )
+    runs = {"wr_outer_child": [inner], "wr_inner_child": [leaf]}
+
+    async def flatten_run(organization_id: str, workflow_run_id: str, cap_output_values: bool) -> list:
+        return [
+            row
+            for item in runs[workflow_run_id]
+            for row in await agent_protocol._flatten_workflow_run_timeline_recursive(item, organization_id)
+        ]
+
+    monkeypatch.setattr(agent_protocol, "_flatten_workflow_run_timeline", flatten_run)
+
+    result = await agent_protocol._flatten_workflow_run_timeline_recursive(outer, organization_id="o_test")
+
+    assert [item.block for item in result] == [leaf.block]
+    assert result[0].task_v2_blocks == [inner.block, outer.block]

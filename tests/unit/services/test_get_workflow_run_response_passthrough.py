@@ -208,6 +208,47 @@ async def test_get_workflow_run_response_echoes_fresh_and_drops_session() -> Non
     assert resp.browser_session_id == "pbs_forced"
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize("attachment", ["browser_session_id", "browser_address"])
+async def test_get_workflow_run_response_keeps_browser_type_for_server_attached_browser(attachment: str) -> None:
+    workflow_run = _fresh_run(start_fresh=False, session_id=None)
+    workflow_run.browser_type = "chrome"
+    if attachment == "browser_session_id":
+        workflow_run.browser_session_id = "pbs_forced"
+    else:
+        workflow_run.browser_address = "ws://10.0.0.5:9222"
+    status_resp = MagicMock(
+        outputs={},
+        downloaded_files=None,
+        recording_url=None,
+        screenshot_urls=None,
+        failure_reason=None,
+        workflow_title="T",
+        parameters={},
+        errors=None,
+        total_steps=1,
+    )
+    with (
+        patch(
+            "skyvern.services.workflow_service.app.DATABASE.workflow_runs.get_workflow_run",
+            new_callable=AsyncMock,
+            return_value=workflow_run,
+        ),
+        patch(
+            "skyvern.services.workflow_service.app.WORKFLOW_SERVICE.build_workflow_run_status_response_by_workflow_id",
+            new_callable=AsyncMock,
+            return_value=status_resp,
+        ),
+    ):
+        resp = await get_workflow_run_response("wr_f", organization_id="o_f")
+
+    assert resp is not None
+    assert resp.run_request is not None
+    assert resp.run_request.browser_type == "chrome"
+    assert getattr(resp.run_request, attachment) is None
+    assert resp.browser_session_id == workflow_run.browser_session_id
+
+
 @pytest.mark.parametrize("value", ["__untagged__", "__other__"])
 def test_retry_drops_legacy_reserved_metadata_instead_of_failing(value: str) -> None:
     # Runs tagged before the reserved-value rule still have to be retryable: the replay

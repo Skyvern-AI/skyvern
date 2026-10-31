@@ -41,6 +41,7 @@ from playwright.async_api import BrowserContext, Download, Page, Request, Respon
 
 from skyvern.config import settings
 from skyvern.constants import BROWSER_DOWNLOADING_SUFFIX
+from skyvern.exceptions import ActionDeadlineExceeded
 from skyvern.forge import app
 from skyvern.forge.sdk.api.files import resolve_run_download_id
 from skyvern.forge.sdk.artifact.storage.base import get_download_retry_started_at, is_file_from_retry_attempt
@@ -126,7 +127,7 @@ from skyvern.forge.taskv3.run_arms import (
 from skyvern.forge.taskv3.target_label import TARGET_KIND_TOKENS, TARGET_NAME_CAP
 from skyvern.utils.contained_effects import contained_effect
 from skyvern.utils.date_values import canonical_iso_date
-from skyvern.webeye.action_deadline import cancellable_driver_call
+from skyvern.webeye.action_deadline import cancellable_driver_call, under_action_deadline
 from skyvern.webeye.actions.key_names import normalize_key_chord
 from skyvern.webeye.browser_driver_errors import is_driver_error, is_driver_timeout_error
 from skyvern.webeye.browser_state import BLANK_PAGE_URLS, is_selectable_page_url
@@ -5378,6 +5379,11 @@ _TARGET_NAME_TIMEOUT_SECONDS = 2.0
 
 # How long a click/focus/hover/fill/type/select waits for Playwright actionability before it raises.
 _ACTION_TIMEOUT_MS = 15000
+# How long a ref or mark may take to resolve before it is reported stale. Successful resolutions stay well under it;
+# it ends an address read that never settles instead of letting it hold the tool call.
+_ADDRESS_RESOLVE_TIMEOUT_MS = 300_000
+# Whole-call ceiling for click and type: the resolve bound plus room for the action, its typing and its readback.
+_ACT_TOOL_TIMEOUT_MS = _ADDRESS_RESOLVE_TIMEOUT_MS + 180_000
 # Playwright's type() timeout covers every key. A slow rich-text editor was measured at ~80ms a key, including
 # the delay between keys, so a key gets ~3x that; the cap keeps a field that never takes keys from stalling the run.
 _PER_KEY_TIMEOUT_MS = 250
@@ -5929,6 +5935,9 @@ _TYPE_TARGET_PROBE_JS = (
   } catch (e) { /* best-effort */ }
   let r = el.getBoundingClientRect();
   if (r.width === 0 || r.height === 0) return out;
+  // A closed <details> (any content-visibility:hidden subtree) still lays its content out but never draws it,
+  // so the hit test below can only land on whatever is drawn over that box; the browser's own verdict is the fact.
+  try { if (el.checkVisibility && !el.checkVisibility()) out.unrendered = true; } catch (e) { /* best-effort */ }
   // elementFromPoint answers about the VIEWPORT, so a field below the fold returns null and would
   // read as unoccluded -- which is most fields on a real form. Playwright scrolls before it clicks,
   // so scrolling here asks about the same layout the click is about to meet.
@@ -7985,6 +7994,33 @@ async def _note_click_dispatch(page: Any, *, marker_armed: bool) -> None:
         seen = True
     if seen:
         record_click_dispatched()
+
+
+async def _act_token(handle: Any) -> str | None:
+    # Patchright 1.61's ElementHandle.get_attribute retries its ':scope' match until the frame detaches once the
+    # handle's document was replaced, while an evaluate on that handle raises at once, so the evaluate goes first.
+    # Each read runs in a task of its own, so a deadline that stops it also abandons the driver's pending reply.
+    await cancellable_driver_call(lambda: handle.evaluate("() => 0"))
+    return await cancellable_driver_call(lambda: handle.get_attribute("data-tv3-act"))
+
+
+def _with_act_deadline(tool_name: str, handler: ToolHandler) -> ToolHandler:
+    async def wrapped(args: dict[str, Any]) -> ToolResult:
+        try:
+            async with under_action_deadline(budget_ms=_ACT_TOOL_TIMEOUT_MS):
+                return await handler(args)
+        except ActionDeadlineExceeded:
+            pass
+        LOG.warning("taskv3 act tool deadline expired", tool=tool_name, deadline_ms=_ACT_TOOL_TIMEOUT_MS)
+        # A click stopped part-way may already have reached the page, so it reads as dispatched, the safe side.
+        return ToolResult.error(
+            f"{tool_name} did not finish within {_ACT_TOOL_TIMEOUT_MS // 1000} s and was stopped; it may already "
+            "have acted on the page. Observe the page before acting again.",
+            data={CLICK_DISPATCHED_DATA_KEY: True} if tool_name == "click" else None,
+            error_class="timeout_other",
+        )
+
+    return wrapped
 
 
 # Planted on window before an option click; a navigation clears window, so its absence afterwards is
@@ -15871,7 +15907,7 @@ def build_browser_tools(
         # Page.click(selector) only clicks the node that still carries the token; a handle has no such check, so
         # a node that lost the token since the pre-check (a markup morph onto kept nodes) is stale, not clicked.
         try:
-            held = await _acted_handle[0].get_attribute("data-tv3-act")
+            held = await _act_token(_acted_handle[0])
         except Exception:
             held = None
         if held is None or selector != f'{_ACT_SELECTOR_PREFIX}{held}"]':
@@ -16574,6 +16610,9 @@ def build_browser_tools(
                     deadline = time.monotonic() + _ACTION_TIMEOUT_MS / 1000
         occluded = bool(isinstance(probe, dict) and probe.get("occluded"))
         occluder = probe.get("occluder") if isinstance(probe, dict) else None
+        if occluded and probe.get("unrendered"):
+            # Whatever the hit test met is drawn where the undrawn field sits, so it covers nothing.
+            raise ToolRefusal.of(await _unreachable_error(selector))
         if occluded and not probe.get("skinned"):
             await _annotate_challenge_frame(page, _current_page(), occluder)
             return False, occluded, occluder
@@ -22635,7 +22674,7 @@ def build_browser_tools(
         # getAttribute or querySelectorAll cannot talk this into adopting a value it planted.
         token = ""
         try:
-            existing = await handle.get_attribute("data-tv3-act")
+            existing = await _act_token(handle)
         except Exception:
             existing = None
         if existing and _act_token_re.fullmatch(existing):
@@ -22662,7 +22701,7 @@ def build_browser_tools(
                 # but not sufficient -- the same trap can write it to a decoy AS WELL -- so the
                 # engine also has to agree the token has exactly one holder. This resolver must
                 # never hand back an ambiguous selector, whatever the callers downstream check.
-                if await handle.get_attribute("data-tv3-act") != minted:
+                if await _act_token(handle) != minted:
                     return None
                 if await _holders(target, f'{_ACT_SELECTOR_PREFIX}{minted}"]') != 1:
                     return None
@@ -22775,7 +22814,15 @@ def build_browser_tools(
                     return error
                 # A failed mark resolution spent real time looking; the phase guard reports it
                 # rather than hiding exactly the failure cost this field exists to price.
-                selector, mark_error = await _resolve_mark(page, mark_int)
+                try:
+                    async with under_action_deadline(budget_ms=_ADDRESS_RESOLVE_TIMEOUT_MS):
+                        selector, mark_error = await _resolve_mark(page, mark_int)
+                except ActionDeadlineExceeded:
+                    raise ToolRefusal(
+                        f"mark {mark_int} did not resolve within {_ADDRESS_RESOLVE_TIMEOUT_MS // 1000} s; the page "
+                        "may have navigated or stopped responding. Call look() again and act on a fresh number.",
+                        error_class="stale_mark",
+                    ) from None
                 if mark_error is not None:
                     raise ToolRefusal.of(mark_error)
                 # In place rather than into a copy: everything downstream reads this dict AFTER dispatch
@@ -23173,7 +23220,15 @@ def build_browser_tools(
                 if error is not None:
                     return error
                 ref = int(match.group(1))
-                resolved, ref_error = await _resolve_ref(page, ref)
+                try:
+                    async with under_action_deadline(budget_ms=_ADDRESS_RESOLVE_TIMEOUT_MS):
+                        resolved, ref_error = await _resolve_ref(page, ref)
+                except ActionDeadlineExceeded:
+                    raise ToolRefusal(
+                        f"ref={ref} did not resolve within {_ADDRESS_RESOLVE_TIMEOUT_MS // 1000} s; the page may have "
+                        "navigated or stopped responding. Call observe() again and act on a fresh ref.",
+                        error_class="stale_ref",
+                    ) from None
                 if ref_error is not None:
                     raise ToolRefusal.of(ref_error)
                 _owner = (_observe_manifest.get(ref) or {}).get("owner")
@@ -23587,6 +23642,9 @@ def build_browser_tools(
             _tool_spec.address_probe = _click_address
         elif _tool_spec.name == "type":
             _tool_spec.answer_probe = _answer_field
+        if _tool_spec.name in ("click", "type"):
+            # Inside the text-delta and download wrappers applied below, so it never cuts a download wait short.
+            _tool_spec.handler = _with_act_deadline(_tool_spec.name, _tool_spec.handler)
     # Inside the download signal, so download lines and failures follow the page-text delta.
     _apply_text_delta(tools)
     _apply_download_signal(tools, downloads_dir, download_failures, download_wait)

@@ -11,6 +11,7 @@ from unittest.mock import MagicMock
 
 import pytest
 
+from skyvern.cli.mcp_tools import blocks
 from skyvern.cli.mcp_tools.blocks import (
     CODE_BLOCK_RUNTIME_TOPIC,
     NOTES_KNOWLEDGE_TOPIC,
@@ -258,6 +259,61 @@ async def test_block_schema_no_type_lists_all() -> None:
     assert "pdf_fill" in block_types
     assert "task" not in block_types
     assert result["data"]["count"] > 0
+
+
+@pytest.mark.asyncio
+async def test_unavailable_powerbi_is_hidden_from_schema_and_nested_validation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(blocks, "_powerbi_queries_available", lambda: False)
+
+    listed = await skyvern_block_schema()
+    specific = await skyvern_block_schema(block_type="powerbi_query")
+    nested = await skyvern_block_validate(
+        block_json=json.dumps(
+            {
+                "block_type": "for_loop",
+                "label": "outer_loop",
+                "loop_over_parameter_key": "rows",
+                "loop_blocks": [
+                    {
+                        "block_type": "powerbi_query",
+                        "label": "read_powerbi",
+                        "connection_id": "moc_owner",
+                        "dataset_id": "{{ dataset_id }}",
+                        "query": "{{ dax_query }}",
+                    }
+                ],
+            }
+        )
+    )
+
+    assert "powerbi_query" not in listed["data"]["block_types"]
+    assert specific["ok"] is False
+    assert "Power BI queries are not currently available." in specific["error"]["message"]
+    assert nested["ok"] is False
+    assert "Power BI queries are not currently available." in nested["error"]["message"]
+
+
+@pytest.mark.asyncio
+async def test_unavailable_powerbi_does_not_match_trigger_payload_data(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(blocks, "_powerbi_queries_available", lambda: False)
+
+    result = await skyvern_block_validate(
+        block_json=json.dumps(
+            {
+                "block_type": "workflow_trigger",
+                "label": "trigger_workflow",
+                "workflow_permanent_id": "wpid_target",
+                "payload": {"metadata": {"block_type": "powerbi_query"}},
+            }
+        )
+    )
+
+    assert result["ok"] is True
+    assert result["data"]["valid"] is True
 
 
 @pytest.mark.asyncio

@@ -39,6 +39,7 @@ from skyvern.schemas.workflows import (
     NavigationBlockYAML,
     PdfFillBlockYAML,
     PDFParserBlockYAML,
+    PowerBIQueryBlockYAML,
     PrintPageBlockYAML,
     SendEmailBlockYAML,
     SplitPdfBlockYAML,
@@ -58,6 +59,25 @@ from skyvern.schemas.workflows import (
 from ._common import CODE_ONLY_FIELD_DESCRIPTION, CODE_ONLY_POLICY_HINT, ErrorCode, make_error, make_result
 
 LOG = structlog.get_logger(__name__)
+
+
+def _powerbi_queries_available() -> bool:
+    from skyvern.forge.sdk.integrations.catalog import integration_is_live  # noqa: PLC0415
+
+    return integration_is_live("powerbi")
+
+
+def _contains_powerbi_query(value: Any) -> bool:
+    if isinstance(value, list):
+        return any(_contains_powerbi_query(block) for block in value if isinstance(block, dict))
+    if not isinstance(value, dict):
+        return False
+    if value.get("block_type") == BlockType.POWERBI_QUERY.value:
+        return True
+    if value.get("block_type") not in {BlockType.FOR_LOOP.value, BlockType.WHILE_LOOP.value}:
+        return False
+    return _contains_powerbi_query(value.get("loop_blocks", []))
+
 
 # ---------------------------------------------------------------------------
 # Block type → YAML class mapping
@@ -97,6 +117,7 @@ BLOCK_TYPE_MAP: dict[str, type[BlockYAML]] = {
     BlockType.GOOGLE_SHEETS_READ.value: GoogleSheetsReadBlockYAML,
     BlockType.EMAIL_INBOX.value: EmailInboxBlockYAML,
     BlockType.GOOGLE_SHEETS_WRITE.value: GoogleSheetsWriteBlockYAML,
+    BlockType.POWERBI_QUERY.value: PowerBIQueryBlockYAML,
 }
 
 # ---------------------------------------------------------------------------
@@ -135,6 +156,7 @@ BLOCK_SUMMARIES: dict[str, str] = {
     "google_sheets_read": "Read rows from a Google Sheet as structured data (list of dicts)",
     "email_inbox": "Read matching messages from a Gmail or Outlook inbox",
     "google_sheets_write": "Write rows to a Google Sheet (append new rows or update existing cells)",
+    "powerbi_query": "Run one read-only DAX query against a user's authorized Power BI dataset",
 }
 
 # ---------------------------------------------------------------------------
@@ -651,11 +673,14 @@ async def skyvern_block_schema(
     action = "skyvern_block_schema"
 
     if block_type is None:
+        block_types = dict(BLOCK_SUMMARIES)
+        if not _powerbi_queries_available():
+            block_types.pop(BlockType.POWERBI_QUERY.value, None)
         return make_result(
             action,
             data={
-                "block_types": BLOCK_SUMMARIES,
-                "count": len(BLOCK_SUMMARIES),
+                "block_types": block_types,
+                "count": len(block_types),
                 "hint": "Call skyvern_block_schema(block_type='navigation') for the full schema of a specific type",
             },
         )
@@ -665,6 +690,19 @@ async def skyvern_block_schema(
     task_redirect = normalized in ("task", "task_v2")
     if task_redirect:
         normalized = "navigation"
+
+    if normalized == BlockType.POWERBI_QUERY.value and not _powerbi_queries_available():
+        available_types = dict(BLOCK_SUMMARIES)
+        available_types.pop(BlockType.POWERBI_QUERY.value, None)
+        return make_result(
+            action,
+            ok=False,
+            error=make_error(
+                ErrorCode.INVALID_INPUT,
+                "Power BI queries are not currently available.",
+                f"Available types: {', '.join(sorted(available_types))}.",
+            ),
+        )
 
     cls = BLOCK_TYPE_MAP.get(normalized)
     if cls is None:
@@ -781,6 +819,17 @@ async def skyvern_block_validate(
                 ErrorCode.INVALID_INPUT,
                 f"Expected a JSON object, got {type(raw).__name__}",
                 "Provide a JSON object with at least block_type and label fields",
+            ),
+        )
+
+    if not _powerbi_queries_available() and _contains_powerbi_query(raw):
+        return make_result(
+            action,
+            ok=False,
+            error=make_error(
+                ErrorCode.INVALID_INPUT,
+                "Power BI queries are not currently available.",
+                "Use a currently available block type from skyvern_block_schema.",
             ),
         )
 

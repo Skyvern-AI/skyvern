@@ -22,6 +22,7 @@ import {
   StopIcon,
 } from "@radix-ui/react-icons";
 import { useEffect, useRef, useState } from "react";
+import { useBlockPlayRegistry } from "@/store/BlockPlayRegistryStore";
 import { useLocation, useNavigate } from "react-router-dom";
 import { useWorkflowPermanentId } from "@/routes/workflows/WorkflowPermanentIdContext";
 import { useMutation, useQueryClient } from "@tanstack/react-query";
@@ -163,6 +164,9 @@ interface Props {
   disabled?: boolean;
   editable: boolean;
   extraActions?: React.ReactNode;
+  // Mounted by the Doc for a step the canvas does not render: runs and registers
+  // the play handle, and renders only the run dialogs.
+  headless?: boolean;
   // Driven by useSortable in the parent HOC; defaults to false so this
   // file ships a static affordance with no behavioural change at call sites.
   isDragging?: boolean;
@@ -263,6 +267,7 @@ function NodeHeader({
   disabled = false,
   editable,
   extraActions,
+  headless = false,
   isDragging = false,
   nodeId,
   totpIdentifier,
@@ -317,7 +322,7 @@ function NodeHeader({
     runStateIsLive &&
     workflowRun &&
     (statusIsRunningOrQueued(workflowRun) || runIsRetryWaiting(workflowRun));
-  useRunCompletionToast(runStateIsLive ? workflowRun : undefined);
+  useRunCompletionToast(runStateIsLive && !headless ? workflowRun : undefined);
   const { isRateLimited } = useBrowserSessionRateLimit(workflowPermanentId);
   const { data: debugSession } = useDebugSessionQuery({
     workflowPermanentId,
@@ -362,7 +367,7 @@ function NodeHeader({
   const { getAutoplay, setAutoplay } = useAutoplayStore();
 
   useEffect(() => {
-    if (!debugSession) {
+    if (!debugSession || headless) {
       return;
     }
 
@@ -950,6 +955,34 @@ function NodeHeader({
     debugSession === undefined ||
     Boolean(saveBlockedReason);
 
+  const playHandlers = useRef({ play: handleOnPlay, stop: handleOnCancel });
+  playHandlers.current = { play: handleOnPlay, stop: handleOnCancel };
+  const playingNow = Boolean(thisBlockIsPlaying);
+  const registerPlay = useBlockPlayRegistry((s) => s.register);
+  const unregisterPlay = useBlockPlayRegistry((s) => s.unregister);
+  useEffect(() => {
+    if (!isDebuggable) return;
+    registerPlay(nodeId, {
+      play: () => void playHandlers.current.play(),
+      stop: () => playHandlers.current.stop(),
+      inert: playInert || runBlock.isPending,
+      playing: playingNow,
+      stopping: cancelBlock.isPending,
+      source: headless ? "doc" : "canvas",
+    });
+    return () => unregisterPlay(nodeId, headless ? "doc" : "canvas");
+  }, [
+    headless,
+    isDebuggable,
+    nodeId,
+    playInert,
+    playingNow,
+    cancelBlock.isPending,
+    registerPlay,
+    runBlock.isPending,
+    unregisterPlay,
+  ]);
+
   const collapseToggleButton =
     isCollapsible &&
     (mode === "build" ||
@@ -987,6 +1020,49 @@ function NodeHeader({
         </Tooltip>
       </TooltipProvider>
     ) : null;
+
+  const runDialogs = (
+    <>
+      <BlockParametersDialog
+        open={showParamsDialog}
+        onOpenChange={setShowParamsDialog}
+        blockLabel={blockLabel}
+        parameters={parametersToPrompt}
+        initialValues={currentParamValues}
+        onSubmit={(values) => {
+          const numBlocksInWorkflow = (
+            workflow?.workflow_definition.blocks ?? []
+          ).length;
+          runBlock.mutate(
+            {
+              codeGen: numBlocksInWorkflow === 1,
+              parameterOverrides: values,
+            },
+            {
+              onSuccess: () => {
+                // Close dialog on success - navigation and last-run-value
+                // persistence happen in the mutation's onSuccess.
+                setShowParamsDialog(false);
+              },
+              // On error, dialog stays open so user can retry. Toast is shown by mutation's onError.
+            },
+          );
+        }}
+        isLoading={runBlock.isPending}
+      />
+      <DebugSessionProfileIncompatibleDialog
+        open={profileIncompatibilityReason !== null}
+        reason={profileIncompatibilityReason}
+        onContinue={() => {
+          setProfileIncompatibilityReason(null);
+          proceedWithPlay();
+        }}
+        onCancel={() => setProfileIncompatibilityReason(null)}
+      />
+    </>
+  );
+
+  if (headless) return runDialogs;
 
   return (
     <>
@@ -1227,42 +1303,7 @@ function NodeHeader({
 
       {blockReview ? <ReviewBlockChanges review={blockReview} /> : null}
 
-      <BlockParametersDialog
-        open={showParamsDialog}
-        onOpenChange={setShowParamsDialog}
-        blockLabel={blockLabel}
-        parameters={parametersToPrompt}
-        initialValues={currentParamValues}
-        onSubmit={(values) => {
-          const numBlocksInWorkflow = (
-            workflow?.workflow_definition.blocks ?? []
-          ).length;
-          runBlock.mutate(
-            {
-              codeGen: numBlocksInWorkflow === 1,
-              parameterOverrides: values,
-            },
-            {
-              onSuccess: () => {
-                // Close dialog on success - navigation and last-run-value
-                // persistence happen in the mutation's onSuccess.
-                setShowParamsDialog(false);
-              },
-              // On error, dialog stays open so user can retry. Toast is shown by mutation's onError.
-            },
-          );
-        }}
-        isLoading={runBlock.isPending}
-      />
-      <DebugSessionProfileIncompatibleDialog
-        open={profileIncompatibilityReason !== null}
-        reason={profileIncompatibilityReason}
-        onContinue={() => {
-          setProfileIncompatibilityReason(null);
-          proceedWithPlay();
-        }}
-        onCancel={() => setProfileIncompatibilityReason(null)}
-      />
+      {runDialogs}
     </>
   );
 }

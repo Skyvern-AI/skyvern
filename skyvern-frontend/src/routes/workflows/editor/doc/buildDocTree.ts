@@ -9,6 +9,8 @@ import {
   getOrderedBlockIdsAtScope,
   type SortableBlockScopeDescriptor,
 } from "../sortable/scope";
+import type { AppNode } from "../nodes";
+import { graphNoteReadings } from "./noteSequences";
 
 export type DocNoteItem = {
   kind: "note";
@@ -74,6 +76,29 @@ export function countDocSteps(items: DocItem[]): number {
           : 0;
     return count + 1 + nested;
   }, 0);
+}
+
+/**
+ * The note texts each step reads at run time, keyed by node id. Canvas markers and the Doc's
+ * "reads this" lines both use it, so they match the run (see noteSequences.ts).
+ */
+export function getDocNotesByNodeId(
+  nodes: Node[],
+  edges: Edge[],
+  finallyBlockLabel: string | null = null,
+): Map<string, Array<string>> {
+  const { textsByLabel } = graphNoteReadings(
+    nodes as AppNode[],
+    edges,
+    finallyBlockLabel,
+  );
+  const result = new Map<string, Array<string>>();
+  for (const node of nodes) {
+    const label = (node.data as { label?: unknown } | undefined)?.label;
+    const texts = typeof label === "string" ? textsByLabel.get(label) : null;
+    if (texts) result.set(node.id, texts);
+  }
+  return result;
 }
 
 /** A read-only projection of the live graph: never repairs or writes to it. */

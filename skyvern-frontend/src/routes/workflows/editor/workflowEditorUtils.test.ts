@@ -16,10 +16,14 @@ import {
   getElements,
   getWorkflowBlocks,
   getWorkflowErrors,
+  getUniqueLabelForExistingNode,
   pendingGoalChangesOf,
+  removeKeyFromNodesParameterKeys,
+  replaceJinjaReferenceInNodes,
   withGoalUndoRecordsFrom,
   workflowEffectiveDefaultEngine,
 } from "./workflowEditorUtils";
+import { removeJinjaReferenceFromNodes } from "./jinjaReferences";
 import { agentStepToolsFromSelection } from "./nodes/AgentStepNode/types";
 import { collectKnownErrorCodes } from "./nodes/StartNode/retryPolicyUtils";
 import { terminateNodeDefaultData } from "./nodes/TerminateNode/types";
@@ -724,8 +728,58 @@ describe("FileDownloadBlock SFTP source round trip", () => {
   });
 });
 
+describe("replaceJinjaReferenceInNodes", () => {
+  test("rename rewrites references inside a code block's code", () => {
+    const [renamed] = replaceJinjaReferenceInNodes(
+      [
+        {
+          id: "c",
+          type: "codeBlock",
+          position: { x: 0, y: 0 },
+          data: {
+            label: "Compute",
+            code: "rows = {{ region | tojson }}\nprint(region)\n",
+          },
+        },
+      ],
+      "region",
+      "area",
+    );
+    expect(renamed!.data.code).toBe(
+      "rows = {{ area | tojson }}\nprint(region)\n",
+    );
+  });
+});
+
+describe("removeKeyFromNodesParameterKeys", () => {
+  test("a block delete drops the declared output key and leaves the code unchanged", () => {
+    const [saved] = removeKeyFromNodesParameterKeys(
+      removeJinjaReferenceFromNodes(
+        [
+          {
+            id: "c",
+            type: "codeBlock",
+            position: { x: 0, y: 0 },
+            data: {
+              label: "Pick",
+              code: "first = Fetch_output[0]\n",
+              parameterKeys: ["Fetch_output"],
+            },
+          },
+        ],
+        ["Fetch_output", "Fetch"],
+      ),
+      "Fetch_output",
+    );
+    expect(saved!.data).toMatchObject({
+      code: "first = Fetch_output[0]\n",
+      parameterKeys: [],
+    });
+  });
+});
+
 describe("block note metadata round trip", () => {
-  test("preserves notes and explicit clears through editor serialization", () => {
+  test("preserves notes and omits unset fields through graph serialization", () => {
     const noted = {
       ...minimalTaskBlock(),
       notes: "Read the saved plan first.",
@@ -876,5 +930,15 @@ describe("block note metadata round trip", () => {
     for (const key of ["notes", "trailing_notes", "description"] as const) {
       expect(saved).not.toHaveProperty(key);
     }
+  });
+
+  test("generated label suffixes skip workflow parameter output keys", () => {
+    expect(
+      getUniqueLabelForExistingNode(
+        "email_inbox",
+        ["email_inbox"],
+        ["email_inbox_2_output"],
+      ),
+    ).toBe("email_inbox_3");
   });
 });

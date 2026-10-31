@@ -267,6 +267,7 @@ class NarrativeTurnFacts(TypedDict):
     matchingSourceBlockCount: NotRequired[int]
     # The tested claim is decided once, in _turn_fact_bundle, so no surface re-derives it.
     ranCleanOnCurrentSource: bool
+    editedBlockLabels: NotRequired[list[str]]
 
 
 class HistoricalNarrativeTurnFacts(TypedDict, total=False):
@@ -365,6 +366,7 @@ if TYPE_CHECKING:
     )
     from skyvern.forge.sdk.copilot.completion_criteria_store import CompletionCriteriaTurnState
     from skyvern.forge.sdk.copilot.diagnosis_repair_contract import DiagnosisRepairContract
+    from skyvern.forge.sdk.copilot.interruption import StoppedTurnFacts
     from skyvern.forge.sdk.copilot.narration import NarratorState
     from skyvern.forge.sdk.copilot.request_policy import RequestPolicy
     from skyvern.forge.sdk.copilot.run_outcome import RecordedRunOutcome
@@ -1208,6 +1210,7 @@ class AgentResult:
     cancellation_iteration: int | None = None
     cancellation_last_recorded_phase: str | None = None
     cancellation_workflow_run_id: str | None = None
+    cancellation_stopped_facts: StoppedTurnFacts | None = None
     # Controls whether the route may auto-apply the proposal or must force explicit review.
     proposal_disposition: ProposalDisposition = "auto_applicable"
     output_policy_diagnostics: dict[str, Any] | None = None
@@ -1429,6 +1432,11 @@ class CopilotContext(AgentContext):
     dispatched_run_ids_this_turn: set[str] = field(default_factory=set)
     # Keyed by run id and drained by that run's own tool result, so a parallel sibling never shows these.
     pending_test_inputs: dict[str, list[CopilotTestInput]] = field(default_factory=dict)
+    # Redacted, display-clamped labels of blocks this turn's writes changed, in first-write order.
+    edited_block_labels_this_turn: list[str] = field(default_factory=list)
+    # Counts every recorded block edit, repeats included, so a run can tell whether an edit followed it.
+    block_edits_recorded_this_turn: int = 0
+    block_edits_recorded_at_dispatch: dict[str, int] = field(default_factory=dict)
     # Whether the latest recorded run-tool result created a run row; None until one is recorded.
     last_test_run_started: bool | None = None
     # The files the last recorded worker run published, keyed by that run's id.
@@ -1598,6 +1606,21 @@ class CopilotContext(AgentContext):
         # Runs this turn dispatched, not ``last_run_blocks_workflow_run_id``: that one can hold a
         # run inherited from an earlier turn, which is not an attempt by this one.
         return bool(self.dispatched_run_ids_this_turn)
+
+    def record_edited_block_label(self, label: str) -> None:
+        if not label:
+            return
+        self.block_edits_recorded_this_turn += 1
+        if label not in self.edited_block_labels_this_turn:
+            self.edited_block_labels_this_turn.append(label)
+
+    def record_dispatched_run(self, workflow_run_id: str) -> None:
+        self.dispatched_run_ids_this_turn.add(workflow_run_id)
+        self.block_edits_recorded_at_dispatch.setdefault(workflow_run_id, self.block_edits_recorded_this_turn)
+
+    def edited_after_dispatch(self, workflow_run_id: str) -> bool:
+        # A run whose dispatch was never recorded is treated as preceding every edit, so it never vouches for one.
+        return self.block_edits_recorded_this_turn > self.block_edits_recorded_at_dispatch.get(workflow_run_id, 0)
 
     def google_connection_notice_payloads(self) -> list[GoogleConnectionNoticePayload]:
         return [notice.to_payload() for notice in (*self.google_setup_notices, *self.google_connection_notices)]

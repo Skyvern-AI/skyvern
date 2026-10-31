@@ -12,7 +12,9 @@ import { renderHook, act } from "@testing-library/react";
 import type { Edge } from "@xyflow/react";
 
 import { useWorkflowHasChangesStore } from "@/store/WorkflowHasChangesStore";
+import { useWorkflowParametersStore } from "@/store/WorkflowParametersStore";
 import type { AppNode } from "../nodes";
+import type { ParametersState } from "../types";
 import { useWorkflowHistory } from "./useWorkflowHistory";
 
 function makeNode(id: string, label = id, extra: Record<string, unknown> = {}) {
@@ -31,6 +33,7 @@ function resetStore() {
   while (useWorkflowHasChangesStore.getState().internalUpdateCount > 0) {
     s.endInternalUpdate();
   }
+  useWorkflowParametersStore.setState({ parameters: [] });
 }
 
 describe("useWorkflowHistory hook", () => {
@@ -126,6 +129,47 @@ describe("useWorkflowHistory hook", () => {
     });
     expect(hook.result.current.canUndo).toBe(true);
     expect(hook.result.current.canRedo).toBe(false);
+  });
+
+  it("undo and redo restore parameter changes with a block rename", () => {
+    const before: ParametersState = [
+      {
+        key: "source",
+        parameterType: "context",
+        sourceParameterKey: "old_output",
+      },
+    ];
+    const after: ParametersState = [
+      {
+        key: "source",
+        parameterType: "context",
+        sourceParameterKey: "new_output",
+      },
+    ];
+    useWorkflowParametersStore.setState({ parameters: before });
+    const { hook, rerender } = setup([makeNode("a", "old")]);
+
+    act(() => {
+      useWorkflowHasChangesStore.getState().setHasChanges(true);
+      rerender([makeNode("a", "new")], []);
+      useWorkflowParametersStore.setState({ parameters: after });
+    });
+    act(() => {
+      vi.advanceTimersByTime(500);
+    });
+
+    act(() => {
+      hook.result.current.undo();
+    });
+    expect(useWorkflowParametersStore.getState().parameters).toEqual(before);
+
+    act(() => {
+      rerender([makeNode("a", "old")], []);
+    });
+    act(() => {
+      hook.result.current.redo();
+    });
+    expect(useWorkflowParametersStore.getState().parameters).toEqual(after);
   });
 
   it("capture after undo clears the redo stack", () => {

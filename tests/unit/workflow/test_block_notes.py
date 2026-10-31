@@ -1,4 +1,6 @@
+import json
 from datetime import UTC, datetime
+from pathlib import Path
 from typing import Any
 from unittest.mock import MagicMock
 
@@ -66,6 +68,21 @@ def _prompts(definition: WorkflowDefinition) -> dict[str, str | None]:
         block._apply_workflow_system_prompt(context)
         prompts[block.label] = block.workflow_system_prompt
     return prompts
+
+
+@pytest.mark.boundary
+@pytest.mark.parametrize(
+    "case",
+    json.loads(
+        (
+            Path(__file__).resolve().parents[3]
+            / "skyvern-frontend/src/routes/workflows/editor/doc/workflow_note_readings.json"
+        ).read_text()
+    ),
+    ids=lambda case: case["name"],
+)
+def test_shared_canvas_note_readings_match_runtime(case: dict[str, Any]) -> None:
+    assert definition_step_notes(case["definition"]) == case["expected"]
 
 
 def test_a_note_reaches_only_the_steps_on_either_side_of_it() -> None:
