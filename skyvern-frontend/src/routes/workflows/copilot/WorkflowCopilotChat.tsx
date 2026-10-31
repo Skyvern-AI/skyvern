@@ -2185,7 +2185,7 @@ export function WorkflowCopilotChat({
   const lastFollowedLabelRef = useRef<string | null>(null);
   // Focusing the turn's run is the copilot acting for the user, not a
   // navigation they asked for, so it must not add a Back step.
-  const { resolveLivePanes } = useStudioPanes();
+  const { openPane, setOpenPanes, resolveLivePanes } = useStudioPanes();
   const { reopenEditor } = useStudioPaneDefaults();
   const switchStudioRun = useSwitchStudioRun({
     replace: true,
@@ -6547,6 +6547,17 @@ export function WorkflowCopilotChat({
   });
   const demonstrationUnavailable = demonstrationRecorder.unavailable;
   const isDemonstrating = demonstrationRecorder.phase !== "idle";
+  // Busy without an id is the gap before recording starts. Done's send keeps the
+  // id until Copilot's turn ends, and Editor should be back for that build.
+  const demonstrationActive =
+    isDemonstrating ||
+    (demonstrationRecorder.busy && !demonstrationRecorder.demonstrationId);
+  const editorHiddenForDemonstrationRef = useRef(false);
+  useEffect(() => {
+    if (demonstrationActive || !editorHiddenForDemonstrationRef.current) return;
+    editorHiddenForDemonstrationRef.current = false;
+    reopenEditor();
+  }, [demonstrationActive, reopenEditor]);
   useEffect(() => {
     if (
       !isDemonstrating ||
@@ -8950,6 +8961,10 @@ export function WorkflowCopilotChat({
     void handleSend(TEST_END_TO_END_PROMPT);
   }, [handleSend]);
 
+  // A ref, because openPane's identity moves with the URL: as a dependency it
+  // would re-register the launcher on every navigation.
+  const panesRef = useRef({ openPane, setOpenPanes, resolveLivePanes });
+  panesRef.current = { openPane, setOpenPanes, resolveLivePanes };
   const handleStartDemonstration = useCallback(
     ({
       insertion,
@@ -8973,6 +8988,19 @@ export function WorkflowCopilotChat({
         return;
       }
       void stopSpeech();
+      // The Edit layout leaves the Browser pane closed, so a demonstration would
+      // otherwise record into a browser the user cannot see or drive. Editor
+      // steps aside for the browser and returns when the recording ends.
+      // Copilot holds Done and Discard, so it opens too.
+      const panes = panesRef.current;
+      panes.openPane("browser");
+      if (!panes.resolveLivePanes().includes("copilot"))
+        panes.openPane("copilot");
+      const live = panes.resolveLivePanes();
+      if (live.includes("editor")) {
+        editorHiddenForDemonstrationRef.current = true;
+        panes.setOpenPanes(live.filter((id) => id !== "editor"));
+      }
       const messageId = `demonstration-${crypto.randomUUID()}`;
       demonstrationMessageIdRef.current = messageId;
       // Shown at start so the chat reads as the user's turn; Done replaces it with the sent message.
