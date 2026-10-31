@@ -1,6 +1,9 @@
 import type { Node } from "@xyflow/react";
 import { RunEngine } from "@/api/types";
-import type { WorkflowBlockType } from "../../types/workflowTypes";
+import {
+  debuggableWorkflowBlockTypes,
+  type WorkflowBlockType,
+} from "../../types/workflowTypes";
 import { blockTypeFromNode } from "../nodes/blockTypeFromNode";
 import { stripJinjaReferences } from "./docTextUtils";
 
@@ -37,6 +40,7 @@ const tagColors: Record<WorkflowBlockType, DocTagColor> = {
   http_request: "green",
   code: "green",
   data_export: "green",
+  powerbi_query: "green",
   for_loop: "purple",
   while_loop: "purple",
   conditional: "purple",
@@ -59,6 +63,11 @@ const tagColors: Record<WorkflowBlockType, DocTagColor> = {
 export function docBlockType(node: Node): WorkflowBlockType | null {
   if (node.type === "dataExport") return "data_export";
   return blockTypeFromNode(node) as WorkflowBlockType | null;
+}
+
+export function docStepCanRun(node: Node): boolean {
+  const blockType = docBlockType(node);
+  return !!blockType && debuggableWorkflowBlockTypes.has(blockType);
 }
 
 export function docTagColor(blockType: WorkflowBlockType | null): DocTagColor {
@@ -112,8 +121,10 @@ export function getDocStepSummary(node: Node): string {
   switch (node.type) {
     case "url":
       return text(node, "url") ? `Go to ${text(node, "url")}` : "Go to a URL";
-    case "wait":
-      return `Wait ${node.data.waitInSeconds ?? 0} seconds`;
+    case "wait": {
+      const seconds = node.data.waitInSeconds ?? 0;
+      return `Wait ${seconds} ${String(seconds) === "1" ? "second" : "seconds"}`;
+    }
     case "sendEmail":
       return text(node, "subject")
         ? `Send an email: ${text(node, "subject")}`
@@ -163,6 +174,25 @@ export function getDocStepSummary(node: Node): string {
     default:
       return "No instructions yet";
   }
+}
+
+// Steps whose summary line is a setting (a loop condition, a stop reason, a wait), not a fixed phrase.
+const SUMMARY_IS_SETTING = new Set([
+  "loop",
+  "terminate",
+  "wait",
+  "codeBlock",
+  "emailInbox",
+  "pdfFill",
+  "splitPdf",
+  "web_search",
+]);
+
+/** The summary to show under a step's description, so the description never hides the setting. */
+export function getDocSettingSummary(node: Node): string | null {
+  return SUMMARY_IS_SETTING.has(node.type ?? "")
+    ? getDocStepSummary(node)
+    : null;
 }
 
 export type DocKeyField = { key: string; label: string; value: string };
@@ -238,4 +268,20 @@ export function docStepTitle(node: Node): string {
 function clip(title: string): string {
   const plain = stripJinjaReferences(title);
   return plain.length > 60 ? `${plain.slice(0, 59)}…` : plain;
+}
+
+/** Ranks "Add a step" choices: a title match beats a word in a description. */
+export function docStepFilter(
+  title: string,
+  search: string,
+  keywords: string[] = [],
+): number {
+  const q = search.trim().toLowerCase();
+  if (!q) return 1;
+  const t = title.toLowerCase().replace(/ block$/, "");
+  if (t === q) return 1;
+  if (t.startsWith(q)) return 0.9;
+  if (t.split(/\s+/).some((word) => word.startsWith(q))) return 0.8;
+  if (t.includes(q)) return 0.6;
+  return keywords.some((k) => k.toLowerCase().includes(q)) ? 0.2 : 0;
 }

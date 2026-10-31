@@ -26,6 +26,47 @@ const STRUCTURAL_BLOCK_KEYS: ReadonlySet<string> = new Set([
   "loop_blocks",
 ]);
 
+const BASE_BLOCK_DEFAULTS: Record<string, unknown> = {
+  continue_on_failure: false,
+  disable_cache: false,
+  ignore_workflow_system_prompt: false,
+  next_loop_on_failure: false,
+};
+
+const TASK_BLOCK_TYPES = new Set([
+  "task",
+  "validation",
+  "human_interaction",
+  "action",
+  "navigation",
+  "extraction",
+  "login",
+  "file_download",
+  "goto_url",
+]);
+
+const TASK_BLOCK_DEFAULTS: Record<string, unknown> = {
+  max_retries: 0,
+  complete_on_download: false,
+  complete_verification: true,
+  include_action_history_in_verification: false,
+  include_extracted_text: true,
+};
+
+// Mirrors the backend block models and the per-type values workflow_definition_converter.py sets.
+const BLOCK_TYPE_DEFAULTS: Record<string, Record<string, unknown>> = {
+  action: { complete_verification: false },
+  extraction: { include_extracted_text: false, complete_verification: false },
+  goto_url: { complete_verification: false },
+  file_download: {
+    complete_on_download: true,
+    complete_verification: true,
+    include_action_history_in_verification: true,
+  },
+  task_v2: { max_iterations: 50 },
+  for_loop: { complete_if_empty: false },
+};
+
 function shouldOmitForComparison(key: string): boolean {
   return COMPARISON_OMIT_KEYS.has(key) || key.endsWith("_parameter_id");
 }
@@ -71,6 +112,22 @@ function diffRecordFields(
 // like `next_block_label`.
 function comparableBlock(block: WorkflowBlock): Record<string, unknown> {
   const record = { ...block } as Record<string, unknown>;
+  // Server model dumps include schema defaults that canvas save data can omit.
+  const blockType = record.block_type;
+  const defaults = {
+    ...BASE_BLOCK_DEFAULTS,
+    ...(typeof blockType === "string" && TASK_BLOCK_TYPES.has(blockType)
+      ? TASK_BLOCK_DEFAULTS
+      : {}),
+    ...(typeof blockType === "string"
+      ? (BLOCK_TYPE_DEFAULTS[blockType] ?? {})
+      : {}),
+  };
+  Object.entries(defaults).forEach(([key, value]) => {
+    if (record[key] === null || record[key] === undefined) {
+      record[key] = value;
+    }
+  });
   if (Array.isArray(record.parameters)) {
     record.parameters = record.parameters.map((parameter: unknown) =>
       parameter !== null &&

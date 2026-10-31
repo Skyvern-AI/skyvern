@@ -2,6 +2,7 @@ import type { Edge } from "@xyflow/react";
 import { describe, expect, it } from "vitest";
 
 import type { AppNode } from "./nodes";
+import { generateNodeLabel } from "./workflowEditorUtils";
 import { duplicateBlockBelow } from "./workflowDuplicate";
 
 function idGenerator(prefix = "new") {
@@ -75,6 +76,18 @@ function edge(
 }
 
 describe("duplicateBlockBelow", () => {
+  it("skips labels whose generated output collides with a workflow input", () => {
+    const result = duplicateBlockBelow({
+      nodes: [block("a", "original"), block("b", "block_2")],
+      edges: [edge("a-b", "a", "b")],
+      nodeId: "a",
+      generateId: idGenerator(),
+      generateLabel: (labels) =>
+        generateNodeLabel(labels, ["block_1_output", "block_3_output"]),
+    });
+    expect(result?.duplicatedLabel).toBe("block_4");
+  });
+
   it("copies a block below itself and rewires the execution edge", () => {
     const nodes = [block("a", "block_1"), block("b", "block_2")];
     const edges = [edge("a-b", "a", "b")];

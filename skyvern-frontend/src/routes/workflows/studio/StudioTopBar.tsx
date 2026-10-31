@@ -65,6 +65,7 @@ import {
 import { useSaveWorkflow } from "../editor/hooks/useSaveWorkflow";
 import { PendingGoalChangesDialog } from "../editor/PendingGoalChangesDialog";
 import { useCopilotActionStore } from "@/store/useCopilotActionStore";
+import { useCopilotProposalStore } from "@/store/CopilotProposalStore";
 import { useToggleHistoryPanel } from "../editor/hooks/useToggleHistoryPanel";
 import { getRunBlockingTooltipText } from "../editor/runValidation/runBlockingCopy";
 import { useRunValidationStore } from "../editor/runValidation/useRunValidationStore";
@@ -140,7 +141,11 @@ export function SaveButton() {
   const contentDirty = useWorkflowSnapshotStore((s) => s.contentDirty);
   const snapshot = useWorkflowSnapshotStore((s) => s.snapshot);
   const saveLockReason = useWorkflowYamlEditorStore(selectSaveLockReason);
-  const saveUnavailable = saveLockReason !== null;
+  const proposalPending = useCopilotProposalStore((s) => s.proposal !== null);
+  const saveUnavailable = saveLockReason !== null || proposalPending;
+  const saveUnavailableReason = proposalPending
+    ? "Resolve the Copilot proposal before saving."
+    : saveLockReason;
   const onSave = useSaveWorkflow();
   const [confirmOpen, setConfirmOpen] = useState(false);
   const pendingGoalChangeCount = useCopilotActionStore(
@@ -148,6 +153,7 @@ export function SaveButton() {
   );
   const [goalDialogOpen, setGoalDialogOpen] = useState(false);
   const saveOrConfirm = () => {
+    if (useCopilotProposalStore.getState().proposal) return;
     // Recompute dirtiness synchronously from the same source as the
     // summary (incl. the YAML draft). contentDirty is debounced and
     // canvas-only, so gating the confirmation on it would skip it for a
@@ -200,7 +206,7 @@ export function SaveButton() {
     <>
       <ControlTooltip
         content="Save workflow"
-        reason={saveBlockedReason ?? saveLockReason}
+        reason={saveBlockedReason ?? saveUnavailableReason}
         blocked={saveUnavailable}
       >
         <Button
@@ -262,8 +268,9 @@ export function SaveButton() {
               </Button>
             ) : (
               <Button
-                disabled={saving || saveLockReason !== null}
+                disabled={saving || saveUnavailable}
                 onClick={() => {
+                  if (useCopilotProposalStore.getState().proposal) return;
                   // Close only on success; a failed save (already toasted by
                   // onSave's onError) keeps the list open for retry, so swallow
                   // the rejection rather than leaving it unhandled.

@@ -35,6 +35,12 @@ import {
   type PillTone,
 } from "./cardChrome";
 import { ACCEPT_BUTTON_CLASS, REJECT_BUTTON_CLASS } from "./cardLayout";
+import {
+  DuplicateWriteRows,
+  ReviewCoverageBadge,
+  humanizedList,
+  reviewCoverageTag,
+} from "./ReviewEvidence";
 import { draftLanded, getDiffCardTitle } from "./diffCardTitle";
 
 export type ReviewGateVerdict = "tested" | "untested" | null;
@@ -242,10 +248,7 @@ function changeRows(
       review.blocks
         .filter((block) => block.change === section.change)
         .map((block) => {
-          const neverTested =
-            !tested &&
-            (block.coverage === "never_run" ||
-              (block.coverage === undefined && Boolean(block.neverTested)));
+          const coverageTag = reviewCoverageTag(block, tested);
           return {
             key: `${block.change}-${block.label}`,
             label: block.label,
@@ -254,16 +257,8 @@ function changeRows(
             markerClass: section.markerClass,
             struck: section.change === "removed",
             muted: section.change === "unchanged",
-            coverageTag: tested
-              ? null
-              : block.coverage === "different_source"
-                ? "Different source"
-                : block.coverage === "unknown"
-                  ? "Not tested under this name"
-                  : neverTested
-                    ? "Never tested"
-                    : null,
-            neverTested,
+            coverageTag,
+            neverTested: coverageTag === "Never tested",
           };
         }),
     );
@@ -285,13 +280,6 @@ function blockCountLabel(rows: ChangeRow[]): string | null {
   const count = changed > 0 ? changed : rows.length;
   if (count === 0) return null;
   return `${count} ${count === 1 ? "block" : "blocks"}`;
-}
-
-function humanizedList(labels: string[]): string {
-  const names = labels.map(humanizeBlockLabel);
-  if (names.length < 2) return names[0] ?? "";
-  if (names.length === 2) return `${names[0]} and ${names[1]}`;
-  return `${names.slice(0, -1).join(", ")}, and ${names[names.length - 1]}`;
 }
 
 function ChangeList({
@@ -352,11 +340,7 @@ function ChangeList({
           >
             {humanizeBlockLabel(row.label)}
           </span>
-          {row.coverageTag ? (
-            <span className="ml-2 whitespace-nowrap rounded-full bg-sky-500/10 px-1.5 py-0.5 text-[10px] font-medium text-sky-700 dark:text-sky-300">
-              {row.coverageTag}
-            </span>
-          ) : null}
+          <ReviewCoverageBadge label={row.coverageTag} />
         </GutterRow>
       ))}
       {hidden.length > 0 || showAll ? (
@@ -373,18 +357,7 @@ function ChangeList({
           </button>
         </div>
       ) : null}
-      {duplicateWrites.map((group) => (
-        <GutterRow
-          key={`${group.blockType}-${group.blockLabels.join("-")}`}
-          marker="!"
-          markerClass="font-bold text-amber-700 dark:text-amber-300"
-          srLabel="Warning"
-        >
-          <span className="text-amber-700 dark:text-amber-300">
-            {humanizedList(group.blockLabels)} write to the same destination.
-          </span>
-        </GutterRow>
-      ))}
+      <DuplicateWriteRows groups={duplicateWrites} />
       {kept.map((group) => (
         <GutterRow
           key={group.kind}

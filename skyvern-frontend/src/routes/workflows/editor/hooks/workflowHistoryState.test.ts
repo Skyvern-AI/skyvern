@@ -34,7 +34,7 @@ function makeEdge(id: string, source: string, target: string): Edge {
 }
 
 function snapshot(nodes: AppNode[], edges: Edge[] = []): WorkflowSnapshot {
-  return { nodes, edges };
+  return { nodes, edges, parameters: [] };
 }
 
 function snapshotWithLabel(id: string, label: string): WorkflowSnapshot {
@@ -134,6 +134,33 @@ describe("workflowHistoryState / snapshotsEqual", () => {
       snapshotsEqual(
         snapshotWithLabel("n1", "old"),
         snapshotWithLabel("n1", "new"),
+      ),
+    ).toBe(false);
+  });
+
+  it("returns false when workflow parameters differ", () => {
+    expect(
+      snapshotsEqual(
+        {
+          ...snapshot([]),
+          parameters: [
+            {
+              key: "input",
+              parameterType: "context",
+              sourceParameterKey: "old_output",
+            },
+          ],
+        },
+        {
+          ...snapshot([]),
+          parameters: [
+            {
+              key: "input",
+              parameterType: "context",
+              sourceParameterKey: "new_output",
+            },
+          ],
+        },
       ),
     ).toBe(false);
   });

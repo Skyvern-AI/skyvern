@@ -44,6 +44,7 @@ describe("nodeTypes composition order", () => {
         "workflowTrigger",
         "googleSheetsRead",
         "googleSheetsWrite",
+        "powerBIQuery",
         "pdfFill",
         "splitPdf",
         "dataExport",

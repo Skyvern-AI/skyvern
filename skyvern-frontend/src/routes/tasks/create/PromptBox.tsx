@@ -966,7 +966,7 @@ function PromptBoxImpl(
           ) : null}
           <StartFromCards
             className="mt-3.5"
-            labelClassName="text-left"
+            labelClassName="text-center"
             gridClassName="md:grid-cols-2"
             uploadSOP={{
               onFile: (file) => {

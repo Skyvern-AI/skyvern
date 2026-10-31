@@ -183,6 +183,7 @@ export type BlockYAML =
   | EmailInboxBlockYAML
   | GoogleSheetsReadBlockYAML
   | GoogleSheetsWriteBlockYAML
+  | PowerBIQueryBlockYAML
   | PdfFillBlockYAML
   | SplitPdfBlockYAML;
 
@@ -620,6 +621,15 @@ export type GoogleSheetsWriteBlockYAML = BlockYAMLBase & {
   values: string;
   column_mapping: Record<string, string> | null;
   create_sheet_if_missing?: boolean;
+  parameter_keys?: Array<string> | null;
+};
+
+export type PowerBIQueryBlockYAML = BlockYAMLBase & {
+  block_type: "powerbi_query";
+  connection_id: string;
+  dataset_id: string;
+  query: string;
+  max_rows: number;
   parameter_keys?: Array<string> | null;
 };
 

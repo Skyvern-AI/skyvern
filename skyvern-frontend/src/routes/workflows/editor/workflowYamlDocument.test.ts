@@ -59,7 +59,11 @@ import {
 } from "@/store/WorkflowTitleStore";
 
 import type { WorkflowApiResponse } from "../types/workflowTypes";
-import type { BlockYAML, ParameterYAML } from "../types/workflowYamlTypes";
+import type {
+  BlockYAML,
+  ParameterYAML,
+  PowerBIQueryBlockYAML,
+} from "../types/workflowYamlTypes";
 import { apiWorkflowToSettings } from "./apiWorkflowToSettings";
 import {
   applySettingsPatch,
@@ -339,6 +343,41 @@ describe("buildWorkflowYamlDocument", () => {
       expect(yamlBlocks[1].loop_blocks[0]).not.toHaveProperty(key);
     }
     expect(yamlBlocks[1]).not.toHaveProperty("notes");
+  });
+  test("Power BI fields are preserved in the workflow save API request", () => {
+    const powerBIBlock: PowerBIQueryBlockYAML = {
+      block_type: "powerbi_query",
+      label: "Query sales",
+      connection_id: "moac_user_owned",
+      dataset_id: "sales-model",
+      query: "EVALUATE 'Sales'",
+      max_rows: 250,
+      parameter_keys: ["region"],
+    };
+    const request = buildWorkflowSaveRequest({
+      ...input(),
+      blocks: [powerBIBlock],
+      workflowDefinitionVersion: 2,
+    });
+    const serialized = request.workflow_definition.blocks[0];
+
+    expect(serialized).toMatchObject({
+      block_type: "powerbi_query",
+      connection_id: "moac_user_owned",
+      dataset_id: "sales-model",
+      query: "EVALUATE 'Sales'",
+      max_rows: 250,
+      parameter_keys: ["region"],
+    });
+    for (const field of [
+      "credential_id",
+      "organization_id",
+      "user_id",
+      "workflow_run_id",
+      "workflow_run_block_id",
+    ]) {
+      expect(serialized).not.toHaveProperty(field);
+    }
   });
 });
 

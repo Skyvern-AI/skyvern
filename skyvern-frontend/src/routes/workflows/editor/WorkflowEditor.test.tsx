@@ -48,6 +48,7 @@ import {
   useDeferredLockedEdit,
 } from "@/hooks/useDeferredLockedEdit";
 
+import { useCopilotProposalStore } from "@/store/CopilotProposalStore";
 import * as workflowHasChangesModule from "@/store/WorkflowHasChangesStore";
 import { useWorkflowParametersStore } from "@/store/WorkflowParametersStore";
 import {
@@ -2699,6 +2700,70 @@ describe("save failures stop navigation and block runs", () => {
       expect(released.getAttribute("aria-disabled")).toBeNull();
       expect(released.getAttribute("aria-describedby")).toBeNull();
     } finally {
+      control.unmount();
+      client.clear();
+      saveHook.mockRestore();
+    }
+  });
+
+  const PROPOSAL_HOLD = "Resolve the Copilot proposal before saving.";
+  test("a pending Copilot proposal disables Save as Template and hides version history, so Accept stays the only way to save it", async () => {
+    useWorkflowYamlEditorStore.setState(
+      useWorkflowYamlEditorStore.getInitialState(),
+    );
+    useWorkflowHasChangesStore.setState(
+      useWorkflowHasChangesStore.getInitialState(),
+    );
+    workflowQueryMock.mockReturnValue({ data: liveWorkflow, isLoading: false });
+    const save = vi.fn<() => Promise<void>>().mockResolvedValue();
+    const saveHook = vi
+      .spyOn(saveWorkflowModule, "useSaveWorkflow")
+      .mockReturnValue(save);
+    const client = new QueryClient({
+      defaultOptions: { queries: { retry: false } },
+    });
+    useCopilotProposalStore.setState({ proposal: {} as never });
+    const control = render(
+      <QueryClientProvider client={client}>
+        <MemoryRouter>
+          <ReactFlowProvider>
+            <DebugStoreContext.Provider
+              value={{ isDebugMode: false, blockRunsEnabled: false }}
+            >
+              <EditorOverflowMenu />
+            </DebugStoreContext.Provider>
+          </ReactFlowProvider>
+        </MemoryRouter>
+      </QueryClientProvider>,
+    );
+    try {
+      fireEvent.keyDown(control.getByRole("button", { name: "More actions" }), {
+        key: "Enter",
+      });
+      // The name stays the action; the visible reason line is its description.
+      const held = await screen.findByRole("menuitem", {
+        name: "Save as Template",
+        description: PROPOSAL_HOLD,
+      });
+      expect(held.getAttribute("aria-disabled")).toBe("true");
+      expect(held.textContent).toContain(PROPOSAL_HOLD);
+      expect(
+        screen.queryByRole("menuitem", { name: "Version history" }),
+      ).toBeNull();
+      fireEvent.click(held);
+      expect(save).not.toHaveBeenCalled();
+
+      act(() => useCopilotProposalStore.setState({ proposal: null }));
+      expect(
+        screen.getByRole("menuitem", { name: "Version history" }),
+      ).toBeTruthy();
+      const released = screen.getByRole("menuitem", {
+        name: "Save as Template",
+      });
+      expect(released.getAttribute("aria-disabled")).toBeNull();
+      expect(released.getAttribute("aria-describedby")).toBeNull();
+    } finally {
+      useCopilotProposalStore.setState({ proposal: null });
       control.unmount();
       client.clear();
       saveHook.mockRestore();
