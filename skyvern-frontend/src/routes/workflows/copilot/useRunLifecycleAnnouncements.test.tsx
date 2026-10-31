@@ -2,25 +2,35 @@
 
 import { renderHook } from "@testing-library/react";
 import { MemoryRouter } from "react-router-dom";
-import { beforeEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import { Status } from "@/api/types";
 
 const workflowRunQueryMock = vi.hoisted(() => vi.fn());
+const watchedRunsById = vi.hoisted(() => new Map<string, unknown>());
+const watchedRunUpdatedAt = vi.hoisted(() => new Map<string, number>());
 
 vi.mock("../hooks/useWorkflowRunQuery", () => ({
   useWorkflowRunQuery: (options?: { workflowRunId?: string }) =>
     workflowRunQueryMock(options),
+  useWorkflowRunQueries: (ids: readonly string[]) =>
+    ids.map((id) => ({
+      data: watchedRunsById.get(id),
+      dataUpdatedAt: watchedRunUpdatedAt.get(id) ?? Date.now(),
+    })),
 }));
 
-import { useRunLifecycleAnnouncements } from "./useRunLifecycleAnnouncements";
+import {
+  useRunLifecycleAnnouncements,
+  type WatchedTurnRun,
+} from "./useRunLifecycleAnnouncements";
 
 type RunFixture = {
   workflow_run_id: string;
   status: Status;
   created_at: string;
   started_at: string | null;
-  finished_at: string;
+  finished_at: string | null;
   outputs: Record<string, unknown> | null;
   failure_reason: string | null;
 };
@@ -38,31 +48,34 @@ function makeRun(overrides: Partial<RunFixture> = {}): RunFixture {
   };
 }
 
+type LifecycleProps = {
+  workflowRunId: string | undefined;
+  turnInFlight: boolean;
+  watchedTurnRuns?: WatchedTurnRun[];
+};
+
 function renderLifecycle(initial: {
   workflowRunId: string | undefined;
   inFlight?: boolean;
   search?: string;
+  watchedTurnRuns?: WatchedTurnRun[];
 }) {
   const announce = vi.fn();
   const turnOwnedRunIds = { current: new Set<string>() };
-  const view = renderHook(
-    ({
-      workflowRunId,
-      turnInFlight,
-    }: {
-      workflowRunId: string | undefined;
-      turnInFlight: boolean;
-    }) =>
+  const view = renderHook<void, LifecycleProps>(
+    ({ workflowRunId, turnInFlight, watchedTurnRuns = NO_WATCHED_RUNS }) =>
       useRunLifecycleAnnouncements({
         workflowRunId,
         turnInFlight,
         turnOwnedRunIds,
+        watchedTurnRuns,
         announce,
       }),
     {
       initialProps: {
         workflowRunId: initial.workflowRunId,
         turnInFlight: initial.inFlight ?? false,
+        watchedTurnRuns: initial.watchedTurnRuns,
       },
       wrapper: ({ children }) => (
         <MemoryRouter initialEntries={[`/?${initial.search ?? ""}`]}>
@@ -74,8 +87,12 @@ function renderLifecycle(initial: {
   return { ...view, announce, turnOwnedRunIds };
 }
 
+const NO_WATCHED_RUNS: WatchedTurnRun[] = [];
+
 beforeEach(() => {
   workflowRunQueryMock.mockReset();
+  watchedRunsById.clear();
+  watchedRunUpdatedAt.clear();
 });
 
 describe("useRunLifecycleAnnouncements", () => {
@@ -388,5 +405,279 @@ describe("useRunLifecycleAnnouncements", () => {
     expect(announce.mock.calls[0]![0].content).toBe(
       "Block run started — watching it now.",
     );
+  });
+});
+
+const TEST_RUN = "wr_test";
+const REPLY_AT = "2026-10-30T16:50:32.751246";
+const AFTER_REPLY = "2026-10-30T16:50:44.159261";
+const INSIDE_TURN = "2026-10-30T16:50:30.000000";
+const FAILED_REASON = "RuntimeError: QA deliberate failure in the final block";
+
+function testRun(overrides: Partial<RunFixture> = {}): RunFixture {
+  return makeRun({
+    workflow_run_id: TEST_RUN,
+    status: Status.Paused,
+    started_at: "2026-10-30T16:50:18.670262",
+    finished_at: null,
+    ...overrides,
+  });
+}
+
+function failedAfterReply(): RunFixture {
+  return testRun({
+    status: Status.Failed,
+    finished_at: AFTER_REPLY,
+    failure_reason: FAILED_REASON,
+  });
+}
+
+function watched(restored = false): WatchedTurnRun[] {
+  return [{ runId: TEST_RUN, ownerCreatedAt: REPLY_AT, restored }];
+}
+
+describe("useRunLifecycleAnnouncements: the chat's own tests that end after their turn", () => {
+  beforeEach(() => {
+    vi.useFakeTimers({ toFake: ["Date"] });
+    workflowRunQueryMock.mockReturnValue({ data: undefined });
+  });
+
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
+  it("announces a test paused at turn end once it fails after approval", () => {
+    const watchedTurnRuns = watched();
+    watchedRunsById.set(TEST_RUN, testRun());
+    const { announce, rerender } = renderLifecycle({
+      workflowRunId: undefined,
+      watchedTurnRuns,
+    });
+    expect(announce).not.toHaveBeenCalled();
+
+    watchedRunsById.set(TEST_RUN, failedAfterReply());
+    rerender({
+      workflowRunId: undefined,
+      turnInFlight: false,
+      watchedTurnRuns,
+    });
+
+    expect(announce).toHaveBeenCalledTimes(1);
+    expect(announce.mock.calls[0]![0]).toMatchObject({
+      id: "run-lifecycle-wr_test-terminal",
+      kind: "run_lifecycle",
+      content: `Test run failed after 0:25 — ${FAILED_REASON}. Ask me to diagnose and fix it.`,
+    });
+
+    rerender({
+      workflowRunId: undefined,
+      turnInFlight: false,
+      watchedTurnRuns,
+    });
+    expect(announce).toHaveBeenCalledTimes(1);
+  });
+
+  it("announces a test that finished before the first poll after its turn", () => {
+    watchedRunsById.set(TEST_RUN, failedAfterReply());
+    const { announce } = renderLifecycle({
+      workflowRunId: undefined,
+      watchedTurnRuns: watched(),
+    });
+
+    expect(announce).toHaveBeenCalledTimes(1);
+    expect(announce.mock.calls[0]![0].id).toBe(
+      "run-lifecycle-wr_test-terminal",
+    );
+  });
+
+  it("stays silent when a late running response lands after the test already finished inside its turn", () => {
+    const watchedTurnRuns = watched();
+    watchedRunsById.set(TEST_RUN, testRun({ status: Status.Running }));
+    const { announce, rerender } = renderLifecycle({
+      workflowRunId: undefined,
+      watchedTurnRuns,
+    });
+
+    watchedRunsById.set(
+      TEST_RUN,
+      testRun({ status: Status.Failed, finished_at: INSIDE_TURN }),
+    );
+    rerender({
+      workflowRunId: undefined,
+      turnInFlight: false,
+      watchedTurnRuns,
+    });
+
+    expect(announce).not.toHaveBeenCalled();
+  });
+
+  it("announces while the studio pane is focused on a different run", () => {
+    workflowRunQueryMock.mockReturnValue({
+      data: makeRun({ workflow_run_id: "wr_user", status: Status.Failed }),
+    });
+    const watchedTurnRuns = watched();
+    watchedRunsById.set(TEST_RUN, testRun());
+    const { announce, rerender } = renderLifecycle({
+      workflowRunId: "wr_user",
+      watchedTurnRuns,
+    });
+    expect(announce).not.toHaveBeenCalled();
+
+    watchedRunsById.set(TEST_RUN, failedAfterReply());
+    rerender({
+      workflowRunId: "wr_user",
+      turnInFlight: false,
+      watchedTurnRuns,
+    });
+
+    expect(announce).toHaveBeenCalledTimes(1);
+    expect(announce.mock.calls[0]![0].id).toBe(
+      "run-lifecycle-wr_test-terminal",
+    );
+  });
+
+  it("announces while no run is focused and an unrelated turn is in flight", () => {
+    const watchedTurnRuns = watched();
+    watchedRunsById.set(TEST_RUN, testRun());
+    const { announce, rerender } = renderLifecycle({
+      workflowRunId: undefined,
+      inFlight: true,
+      watchedTurnRuns,
+    });
+
+    watchedRunsById.set(TEST_RUN, failedAfterReply());
+    rerender({ workflowRunId: undefined, turnInFlight: true, watchedTurnRuns });
+
+    expect(announce).toHaveBeenCalledTimes(1);
+  });
+
+  it("announces a test restored from history while still running once it ends", () => {
+    const watchedTurnRuns = watched(true);
+    watchedRunsById.set(TEST_RUN, testRun({ status: Status.Running }));
+    const { announce, rerender } = renderLifecycle({
+      workflowRunId: undefined,
+      watchedTurnRuns,
+    });
+    expect(announce).not.toHaveBeenCalled();
+
+    watchedRunsById.set(
+      TEST_RUN,
+      testRun({ status: Status.Completed, finished_at: AFTER_REPLY }),
+    );
+    rerender({
+      workflowRunId: undefined,
+      turnInFlight: false,
+      watchedTurnRuns,
+    });
+
+    expect(announce).toHaveBeenCalledTimes(1);
+    expect(announce.mock.calls[0]![0].content).toBe(
+      "Test run completed in 0:25. Want to review or change anything?",
+    );
+  });
+
+  it("stays silent for a test that ended inside its own turn", () => {
+    watchedRunsById.set(
+      TEST_RUN,
+      testRun({ status: Status.Failed, finished_at: INSIDE_TURN }),
+    );
+    const { announce } = renderLifecycle({
+      workflowRunId: undefined,
+      watchedTurnRuns: watched(),
+    });
+
+    expect(announce).not.toHaveBeenCalled();
+  });
+
+  it("does not replay a line for a restored test already final when first seen", () => {
+    const watchedTurnRuns = watched(true);
+    watchedRunsById.set(TEST_RUN, failedAfterReply());
+    const { announce, rerender } = renderLifecycle({
+      workflowRunId: undefined,
+      watchedTurnRuns,
+    });
+    rerender({
+      workflowRunId: undefined,
+      turnInFlight: false,
+      watchedTurnRuns,
+    });
+
+    expect(announce).not.toHaveBeenCalled();
+  });
+
+  it("does not count cached paused data as a restored test still running at load", () => {
+    const watchedTurnRuns = watched(true);
+    watchedRunsById.set(TEST_RUN, testRun());
+    watchedRunUpdatedAt.set(TEST_RUN, Date.now() - 60_000);
+    const { announce, rerender } = renderLifecycle({
+      workflowRunId: undefined,
+      watchedTurnRuns,
+    });
+
+    watchedRunsById.set(TEST_RUN, failedAfterReply());
+    watchedRunUpdatedAt.delete(TEST_RUN);
+    rerender({
+      workflowRunId: undefined,
+      turnInFlight: false,
+      watchedTurnRuns,
+    });
+
+    expect(announce).not.toHaveBeenCalled();
+  });
+
+  it("does not count cached paused data kept through a failed refetch", () => {
+    const watchedTurnRuns = watched(true);
+    watchedRunsById.set(TEST_RUN, testRun());
+    watchedRunUpdatedAt.set(TEST_RUN, Date.now() - 60_000);
+    const { announce, rerender } = renderLifecycle({
+      workflowRunId: undefined,
+      watchedTurnRuns,
+    });
+    vi.setSystemTime(Date.now() + 5_000);
+    rerender({
+      workflowRunId: undefined,
+      turnInFlight: false,
+      watchedTurnRuns,
+    });
+
+    watchedRunsById.set(TEST_RUN, failedAfterReply());
+    watchedRunUpdatedAt.delete(TEST_RUN);
+    rerender({
+      workflowRunId: undefined,
+      turnInFlight: false,
+      watchedTurnRuns,
+    });
+
+    expect(announce).not.toHaveBeenCalled();
+  });
+
+  it("stays silent for a final run with no finished_at", () => {
+    watchedRunsById.set(TEST_RUN, testRun({ status: Status.Failed }));
+    const { announce } = renderLifecycle({
+      workflowRunId: undefined,
+      watchedTurnRuns: watched(),
+    });
+
+    expect(announce).not.toHaveBeenCalled();
+  });
+
+  it("gives a test that is both focused and turn-owned exactly one terminal line", () => {
+    const watchedTurnRuns = watched();
+    workflowRunQueryMock.mockReturnValue({ data: testRun() });
+    watchedRunsById.set(TEST_RUN, testRun());
+    const { announce, rerender, turnOwnedRunIds } = renderLifecycle({
+      workflowRunId: TEST_RUN,
+      watchedTurnRuns,
+    });
+    turnOwnedRunIds.current.add(TEST_RUN);
+
+    workflowRunQueryMock.mockReturnValue({ data: failedAfterReply() });
+    watchedRunsById.set(TEST_RUN, failedAfterReply());
+    rerender({ workflowRunId: TEST_RUN, turnInFlight: false, watchedTurnRuns });
+
+    const terminalIds = announce.mock.calls
+      .map(([message]) => message.id)
+      .filter((id: string) => id.endsWith("-terminal"));
+    expect(terminalIds).toEqual(["run-lifecycle-wr_test-terminal"]);
   });
 });

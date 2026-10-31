@@ -1109,7 +1109,7 @@ function convertToNode(
           prompt: block.prompt,
           dataSchema: JSON.stringify(block.data_schema, null, 2),
           maxTurns: block.max_turns,
-          tools: block.tools ?? null,
+          tools: block.tools ?? [],
           parameterKeys: (block.parameters ?? []).map((p) => p.key),
         },
       };
@@ -6103,7 +6103,7 @@ function getWorkflowErrors(nodes: Array<AppNode>): Array<string> {
     if (node.data.prompt.trim().length === 0) {
       errors.push(`${node.data.label}: Prompt is required.`);
     }
-    if (node.data.tools?.length === 0) {
+    if (node.data.tools.length === 0) {
       errors.push(`${node.data.label}: Choose at least one tool.`);
     }
     let dataSchema: unknown;
