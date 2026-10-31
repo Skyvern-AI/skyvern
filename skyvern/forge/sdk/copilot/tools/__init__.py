@@ -1027,10 +1027,9 @@ before concluding no credential exists, keep incrementing `page` until
 `has_more` is `false` — otherwise you risk telling the user to create
 a credential they have already stored on a later page.
 
-Results report `connected_vault` (the organization's connected Bitwarden: its status and, when unreadable,
-what to check) and page its logins under `vault_logins` (`vault_login_id`, `title`, `site`).
-`fill_credential_field` accepts a `vault_login_id`; `exact_reference` takes a vault login's `title` and returns
-its `sites` (the websites Bitwarden saves it for) and the `workflow_parameter` that binds it at run time."""
+`vault_logins` pages logins from the organization's connected vaults that are not saved credentials yet. Use
+one's `credential_id` as a saved credential's; its first fill or binding saves it, and later steps use the
+saved id that returns."""
 
 
 @function_tool(

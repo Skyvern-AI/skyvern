@@ -87,7 +87,7 @@ class AgentStepBlock(Block):
             workflow_run_id=workflow_run_id,
             organization_id=organization_id,
         )
-        await app.DATABASE.observer.update_workflow_run_block(
+        block_row = await app.DATABASE.observer.update_workflow_run_block(
             workflow_run_block_id=workflow_run_block_id, organization_id=organization_id, prompt=self.prompt
         )
         try:
@@ -106,5 +106,12 @@ class AgentStepBlock(Block):
         from skyvern.forge.sdk.workflow.models.agent_step_loop import run_agent_step
 
         return await run_agent_step(
-            self, llm_key, prompt, workflow_run_id, workflow_run_block_id, organization_id, browser_session_id
+            self,
+            llm_key,
+            prompt,
+            workflow_run_id,
+            workflow_run_block_id,
+            organization_id,
+            browser_session_id,
+            block_row,
         )

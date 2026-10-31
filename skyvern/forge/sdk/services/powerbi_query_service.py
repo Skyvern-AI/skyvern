@@ -54,8 +54,16 @@ class PowerBIExecutionAudit:
 SAFE_AUDIT_FAILURE_REASONS = frozenset(
     {
         "execution_context_invalid",
+        "literal_connection_required",
+        "integration_unavailable",
         "principal_unavailable",
         "membership_unconfirmed",
+        "trigger_parent_owner_mismatch",
+        "trigger_parent_source_unconfirmed",
+        "unsafe_query_input_source",
+        "event_trigger_run",
+        "copilot_test_run_unsupported",
+        "workflow_owner_resave_required",
         "connection_unavailable",
         "credential_required",
         "dataset_required",
@@ -322,11 +330,15 @@ def _validate_audit_context(
         for value in (organization_id, workflow_run_id, workflow_run_block_id, connection_id)
     ):
         raise PowerBIQueryError("execution_context_required")
+    if "{{" in connection_id or "{%" in connection_id:
+        raise PowerBIQueryError("literal_connection_required")
 
 
 def _validate_query_inputs(credential_id: str, dataset_id: str, query: str, max_rows: int) -> None:
     if not isinstance(credential_id, str) or not credential_id.strip():
         raise PowerBIQueryError("credential_required")
+    if "{{" in credential_id or "{%" in credential_id:
+        raise PowerBIQueryError("literal_connection_required")
     if not isinstance(dataset_id, str) or len(dataset_id) != 36:
         raise PowerBIQueryError("dataset_required")
     try:

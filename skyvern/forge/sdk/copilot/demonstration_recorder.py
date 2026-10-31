@@ -31,6 +31,7 @@ from skyvern.forge.sdk.copilot.demonstration_tap import DEMONSTRATION_MAX_EVENTS
 from skyvern.forge.sdk.copilot.request_policy import RequestPolicy
 from skyvern.forge.sdk.copilot.runtime import (
     ScoutedInteraction,
+    end_minted_browser_renewals,
     record_attached_browser_driver,
     resolve_persistent_browser_state,
     start_browser_driver_release,
@@ -697,6 +698,8 @@ class DemonstrationRecorder:
                     next_refresh = time.monotonic() + DEMONSTRATION_OWNER_REFRESH_SECONDS
                 await asyncio.sleep(DEMONSTRATION_POLL_SECONDS)
         finally:
+            # A credential fill can mint a browser into this context, and no turn finally ends its renewal.
+            end_minted_browser_renewals(self.recording_ctx)
             await finish_shielded(self._stop(reason))
 
     async def _append_event(self, event: dict[str, Any]) -> int | None:

@@ -922,7 +922,8 @@ There are TWO types of references:
 
 2. BLOCK OUTPUTS - Reference output from a previous block by its label
    Syntax depends on the upstream block type; see below.
-   Requires: NOTHING - block outputs are automatically available, no parameter_keys needed
+   Requires: nothing in a `{{ }}` field - block outputs are available there, no parameter_keys needed.
+   A code block reads an earlier block's output as a Python value only when `<label>_output` is in its parameter_keys.
 
 IMPORTANT — block output shapes are NOT uniform across block types. Using the wrong shape either raises "dict object has no attribute 'output'" at render time or (worse) silently renders a None value into a URL field, producing `https://None` which fails with `net::ERR_NAME_NOT_RESOLVED`.
 
@@ -940,6 +941,13 @@ IMPORTANT — block output shapes are NOT uniform across block types. Using the 
   - Example: `{{ summarize_notes.summary }}` (NOT `{{ summarize_notes.output.summary }}`).
   - Writing `{{ summarize_notes.output.summary }}` raises "dict object has no attribute 'output'" because `summarize_notes` IS the dict.
 
+* Google Sheets read blocks (google_sheets_read):
+  - `{{ read_sheet['values'] }}` — the cells as a list of rows of formatted strings. `{{ read_sheet.rows }}` — one object per data row keyed by the header row when has_header_row is true, otherwise null.
+  - In `rows`, an empty header cell becomes `col_<n>` (n counts from 1 at the first column of the range read, not the sheet's column letter) and a repeated header name gets `_2`, `_3`, ... (`Amount`, `Amount_2`).
+  - `spreadsheet_id`, `range`, `sheet_id`, `sheet_title`, `start_row`, `start_column`, `cells` (Sheets CellData per cell) and `merges` sit beside them. A code block on the secure runner receives the read without `cells`.
+
+* A key named like a dict method (`values`, `items`, `keys`, `get`) reads with brackets: `{{ read_sheet['values'] }}`. `{{ read_sheet.values }}` is the dict's method, not the key.
+
 * HTTP request blocks (http_request):
   - `{{ fetch_metric.body }}` — the response body, parsed as JSON when the response is JSON; `{{ fetch_metric.status_code }}` and `{{ fetch_metric.headers }}` sit beside it.
   - Example: `{{ fetch_metric.body.metric }}`. The label itself has no `metric` key, only the recorded response fields.
@@ -956,7 +964,7 @@ parameter_keys: [search_term]
 navigation_goal: "Search for {{ product_name }} and filter by {{ category }}"
 parameter_keys: [product_name, category]
 
-Examples - Block Outputs (no parameter_keys needed):
+Examples - Block Outputs in `{{ }}` fields (no parameter_keys needed):
 
 * Send previous task-block output to webhook (task block → use .output):
 blocks:

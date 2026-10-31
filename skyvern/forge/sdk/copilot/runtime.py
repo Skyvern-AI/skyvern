@@ -44,12 +44,14 @@ from skyvern.forge.sdk.copilot.build_test_connect_failure import (
     build_test_connect_failure_sentence,
 )
 from skyvern.forge.sdk.copilot.config import (
+    TOTAL_TIMEOUT_SECONDS,
     AuthoringCapability,
     BlockAuthoringPolicy,
     CopilotConfig,
     authoring_capability_from_policy,
     block_authoring_policy_from_capability,
 )
+from skyvern.forge.sdk.copilot.human_input_wait import turn_clock_seconds
 from skyvern.forge.sdk.copilot.screenshot_utils import (
     ChatScreenshotFrame,
     PendingFrameLease,
@@ -66,6 +68,7 @@ from skyvern.forge.sdk.copilot.turn_origin import (
 )
 from skyvern.forge.sdk.copilot.verification_evidence import WorkflowVerificationEvidence
 from skyvern.forge.sdk.core import skyvern_context
+from skyvern.forge.sdk.credential_site_policy import LoginSite
 from skyvern.forge.sdk.schemas.credentials import Credential
 from skyvern.library.skyvern_browser import SkyvernBrowser
 from skyvern.schemas.browser_session_close import BrowserSessionCloseReason
@@ -720,6 +723,7 @@ class AgentContext:
     # Read once per turn: repeated fill attempts must not re-scan the org's credentials.
     org_credentials_for_turn: list[Credential] | None = None
     vault_login_uris_by_credential_id: dict[str, list[str]] = field(default_factory=dict)
+    scoped_login_sites_by_credential_id: dict[str, list[LoginSite]] = field(default_factory=dict)
     # Highest trajectory_index visible at the latest parsed evaluate observation and whether that page
     # showed a password-type control; orders page evidence against post-fill submits across evictions.
     last_scout_observation_trajectory_index: int | None = None
@@ -816,6 +820,7 @@ class AgentContext:
     # reachable by this turn alone and are closed when it ends rather than left to bill out their
     # budgets. A run left to its owner takes its browser out of the ledger.
     minted_browser_sessions: dict[str, str | None] = field(default_factory=dict)
+    minted_browser_renewal_checks: dict[str, asyncio.TimerHandle] = field(default_factory=dict)
     browser_allocation_recorder: Callable[[str, str | None], Awaitable[None]] | None = None
 
     # Set by tool gates / loop guards / tool-side error branches when a tool
@@ -1853,9 +1858,10 @@ async def acquire_fresh_exit_browser_session(
             proxy_location=proxy_location,
             browser_profile_id=browser_profile_id,
             session_kind=BrowserSessionKind.copilot,
+            created_for_workflow_permanent_id=ctx.workflow_permanent_id,
         )
         if receipt.new_browser_session_id:
-            ctx.minted_browser_sessions.setdefault(receipt.new_browser_session_id, None)
+            await _record_minted_browser(ctx, receipt.new_browser_session_id)
             if ctx.browser_allocation_recorder is not None:
                 await ctx.browser_allocation_recorder(allocation_id, receipt.new_browser_session_id)
         return receipt
@@ -1918,6 +1924,59 @@ def _seeded_create_session_kwargs(seed: BuildTestBrowserSeed | None) -> _SeededC
     return kwargs
 
 
+# A turn that hangs outside its model-stream deadline never reaches the turn-end release, so its live process would
+# stamp the browser up to the session cap. Measured on the turn's own clock, which a healthy turn cannot pass.
+MINTED_BROWSER_RENEWAL_TURN_SECONDS = TOTAL_TIMEOUT_SECONDS + 10 * 60
+MINTED_BROWSER_RENEWAL_CHECK_SECONDS = 60.0
+
+
+async def _record_minted_browser(ctx: AgentContext, session_id: str) -> None:
+    if session_id in ctx.minted_browser_sessions:
+        return
+    # Ledgered first: the turn ends renewal for every ledgered id, and begin takes its refcount before it can raise.
+    ctx.minted_browser_sessions[session_id] = None
+    _arm_minted_browser_renewal_check(ctx, session_id)
+    try:
+        await app.BROWSER_MANAGER.begin_session_activity_renewal(session_id)
+    except Exception:
+        LOG.warning(
+            "Failed to start activity renewal for a copilot browser session",
+            browser_session_id=session_id,
+            organization_id=ctx.organization_id,
+            exc_info=True,
+        )
+
+
+def _arm_minted_browser_renewal_check(ctx: AgentContext, session_id: str) -> None:
+    ctx.minted_browser_renewal_checks[session_id] = asyncio.get_running_loop().call_later(
+        MINTED_BROWSER_RENEWAL_CHECK_SECONDS, _check_minted_browser_renewal, ctx, session_id
+    )
+
+
+def _check_minted_browser_renewal(ctx: AgentContext, session_id: str) -> None:
+    started_at = ctx.copilot_run_start_monotonic
+    if (
+        started_at is not None
+        and turn_clock_seconds(ctx, started_at, time.monotonic()) >= MINTED_BROWSER_RENEWAL_TURN_SECONDS
+    ):
+        _end_minted_browser_renewal(ctx, session_id)
+    else:
+        _arm_minted_browser_renewal_check(ctx, session_id)
+
+
+def _end_minted_browser_renewal(ctx: AgentContext, session_id: str) -> None:
+    check = ctx.minted_browser_renewal_checks.pop(session_id, None)
+    if check is None:
+        return
+    check.cancel()
+    app.BROWSER_MANAGER.end_session_activity_renewal(session_id)
+
+
+def end_minted_browser_renewals(ctx: AgentContext) -> None:
+    for session_id in list(ctx.minted_browser_renewal_checks):
+        _end_minted_browser_renewal(ctx, session_id)
+
+
 async def _provision_browser_session(
     ctx: AgentContext, *, seed: BuildTestBrowserSeed | None = None, proxy_location: ProxyLocationInput = None
 ) -> BuildTestConnectFailure | None:
@@ -1965,9 +2024,7 @@ async def _provision_browser_session(
             creation_kwargs = _seeded_create_session_kwargs(seed)
             if proxy_location is not None:
                 creation_kwargs.setdefault("proxy_location", proxy_location)
-            # The session worker reuses a creation budget as its idle grace, so this budget is how
-            # long a browser nothing comes back for stays up and billable. The studio's own
-            # interactive budget is the one the renewal thresholds are calibrated against.
+            # The manager may apply a shorter budget for copilot-kind sessions.
             session = await app.PERSISTENT_SESSIONS_MANAGER.create_session(
                 organization_id=ctx.organization_id,
                 timeout_minutes=settings.DEBUG_SESSION_TIMEOUT_MINUTES,
@@ -1999,7 +2056,7 @@ async def _provision_browser_session(
             installed_session_id = ctx.browser_session_id
             # Recorded before the boot wait: a session that never became attachable is still a live
             # browser this turn is the only reader of.
-            ctx.minted_browser_sessions.setdefault(installed_session_id, None)
+            await _record_minted_browser(ctx, installed_session_id)
 
         # DefaultPersistentSessionsManager schedules chromium in a background
         # task and returns from create_session before browser_context is set,

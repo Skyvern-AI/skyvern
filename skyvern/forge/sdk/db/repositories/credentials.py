@@ -128,6 +128,7 @@ class CredentialRepository(BaseRepository):
         folder_id_is_null: bool = False,
         item_keys: Sequence[tuple[str, str]] | None = None,
         limit: int | None = None,
+        vault_type: CredentialVaultType = CredentialVaultType.ONEPASSWORD,
     ) -> list[Credential]:
         if item_keys is not None and not item_keys:
             return []
@@ -136,7 +137,7 @@ class CredentialRepository(BaseRepository):
                 select(CredentialModel)
                 .where(
                     CredentialModel.organization_id == organization_id,
-                    CredentialModel.vault_type == CredentialVaultType.ONEPASSWORD.value,
+                    CredentialModel.vault_type == vault_type.value,
                     CredentialModel.vault_id.is_not(None),
                     CredentialModel.item_id.is_not(None),
                     CredentialModel.deleted_at.is_(None),
@@ -175,6 +176,7 @@ class CredentialRepository(BaseRepository):
         set_folder_on_update: bool = True,
         authorize_update: Callable[[AsyncSession, str], Awaitable[None]] | None = None,
         commit: bool = True,
+        vault_type: CredentialVaultType = CredentialVaultType.ONEPASSWORD,
     ) -> tuple[Credential, bool]:
         async with self.Session() as session:
             insert = sqlite_insert if session.get_bind().dialect.name == "sqlite" else pg_insert
@@ -182,7 +184,7 @@ class CredentialRepository(BaseRepository):
                 insert(CredentialModel)
                 .values(
                     organization_id=organization_id,
-                    vault_type=CredentialVaultType.ONEPASSWORD.value,
+                    vault_type=vault_type.value,
                     vault_id=vault_id,
                     item_id=item_id,
                     name=name,
@@ -209,7 +211,7 @@ class CredentialRepository(BaseRepository):
                 select(CredentialModel)
                 .where(
                     CredentialModel.organization_id == organization_id,
-                    CredentialModel.vault_type == CredentialVaultType.ONEPASSWORD.value,
+                    CredentialModel.vault_type == vault_type.value,
                     CredentialModel.vault_id == vault_id,
                     CredentialModel.item_id == item_id,
                     CredentialModel.deleted_at.is_(None),

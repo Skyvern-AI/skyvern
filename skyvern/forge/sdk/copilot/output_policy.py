@@ -18,7 +18,6 @@ from skyvern.forge.sdk.copilot.secret_redaction import (
     SECRET_KEYWORD_LABEL_PATTERN,
 )
 from skyvern.forge.sdk.copilot.workflow_credential_utils import (
-    CONNECTED_VAULT_ID_PREFIX,
     block_credential_ids,
     credential_param_ids,
     parse_workflow_yaml,
@@ -92,8 +91,6 @@ _FINAL_OUTPUT_HARD_BLOCK_REASONS: frozenset[OutputPolicyReason] = frozenset(
     {
         OutputPolicyReason.RAW_SECRET_LEAK,
         OutputPolicyReason.CREDENTIAL_SCOPE_BROADENED,
-        OutputPolicyReason.CONNECTED_VAULT_LOGIN_OFF_SITE,
-        OutputPolicyReason.CONNECTED_VAULT_LOGIN_SITES_UNREAD,
         OutputPolicyReason.PERSISTENCE_STATE_MISMATCH,
         OutputPolicyReason.OUTPUT_POLICY_CONTEXT_MISSING,
     }
@@ -107,21 +104,8 @@ _FINAL_OUTPUT_HARD_BLOCK_REASONS: frozenset[OutputPolicyReason] = frozenset(
 _AUTHOR_TIME_HARD_BLOCK_REASONS: frozenset[OutputPolicyReason] = frozenset(
     {
         OutputPolicyReason.CREDENTIAL_SCOPE_BROADENED,
-        OutputPolicyReason.CONNECTED_VAULT_LOGIN_OFF_SITE,
-        OutputPolicyReason.CONNECTED_VAULT_LOGIN_SITES_UNREAD,
     }
 )
-
-_REASON_REMEDIES: dict[OutputPolicyReason, str] = {
-    OutputPolicyReason.CONNECTED_VAULT_LOGIN_OFF_SITE: (
-        "A connected Bitwarden login is bound at a block whose URL none of its saved websites covers; "
-        "the user can add that site to the login's websites in Bitwarden."
-    ),
-    OutputPolicyReason.CONNECTED_VAULT_LOGIN_SITES_UNREAD: (
-        "A connected Bitwarden login is bound before its websites were read this turn; resolve it with "
-        "`list_credentials` `exact_reference` set to its title, which reads them and returns its `sites`."
-    ),
-}
 
 
 def demote_author_time_steer_reasons(verdict: OutputPolicyVerdict) -> list[OutputPolicyReason]:
@@ -310,8 +294,7 @@ def evaluate_output_policy(
 def format_output_policy_tool_error(verdict: OutputPolicyVerdict) -> str:
     reasons = ", ".join(reason.value for reason in verdict.reason_codes) or "unknown"
     message = f"Output policy blocked this Copilot output before persistence. Reason codes: {reasons}."
-    remedies = [_REASON_REMEDIES[reason] for reason in verdict.reason_codes if reason in _REASON_REMEDIES]
-    return " ".join([message, *remedies])
+    return message
 
 
 def raw_secret_label(value: str | None) -> str | None:
@@ -457,40 +440,6 @@ def _apply_credential_policy(
         _existing_workflow_broadens_credential_scope(proposed_origins, request_policy)
     ):
         verdict.add(OutputPolicyReason.CREDENTIAL_SCOPE_BROADENED)
-    for reason in _connected_vault_placement_reasons(parsed_workflow, request_policy):
-        verdict.add(reason)
-
-
-def connected_vault_new_placements(
-    parsed_workflow: dict[str, Any], request_policy: RequestPolicy
-) -> dict[str, set[str]]:
-    """Block URLs each vault login is bound at that the existing workflow did not already bind it at."""
-    definition = parsed_workflow.get("workflow_definition")
-    params_by_key = credential_param_ids(definition.get("parameters")) if isinstance(definition, dict) else {}
-    placements: dict[str, set[str]] = {}
-    for block in workflow_blocks(parsed_workflow):
-        block_url = block.get("url")
-        if not isinstance(block_url, str) or not block_url.strip():
-            continue
-        for credential_id in block_credential_ids(block, params_by_key):
-            prior = request_policy.existing_workflow_credential_origins.get(credential_id, [])
-            if credential_id.startswith(CONNECTED_VAULT_ID_PREFIX) and url_origin(block_url) not in prior:
-                placements.setdefault(credential_id, set()).add(block_url.strip())
-    return placements
-
-
-def _connected_vault_placement_reasons(
-    parsed_workflow: dict[str, Any], request_policy: RequestPolicy
-) -> set[OutputPolicyReason]:
-    # A vault login's whole-site URIs stand where a saved credential's tested_url does.
-    reasons: set[OutputPolicyReason] = set()
-    for credential_id, urls in connected_vault_new_placements(parsed_workflow, request_policy).items():
-        sites = request_policy.connected_vault_sites.get(credential_id)
-        if sites is None:
-            reasons.add(OutputPolicyReason.CONNECTED_VAULT_LOGIN_SITES_UNREAD)
-        elif any(not any(site.admits(url) for site in sites) for url in urls):
-            reasons.add(OutputPolicyReason.CONNECTED_VAULT_LOGIN_OFF_SITE)
-    return reasons
 
 
 def _existing_workflow_credential_ids(request_policy: RequestPolicy) -> set[str]:
@@ -554,11 +503,7 @@ def _approved_origins_by_id(request_policy: RequestPolicy) -> dict[str, set[str]
     for credential in [*request_policy.resolved_credentials, *request_policy.discovered_credentials]:
         credential_id = getattr(credential, "credential_id", None)
         tested_url = getattr(credential, "tested_url", None)
-        if (
-            isinstance(credential_id, str)
-            and not credential_id.startswith(CONNECTED_VAULT_ID_PREFIX)
-            and isinstance(tested_url, str)
-        ):
+        if isinstance(credential_id, str) and isinstance(tested_url, str):
             origin = url_origin(tested_url)
             if origin:
                 origins.setdefault(credential_id, set()).add(origin)
