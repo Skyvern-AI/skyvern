@@ -16,6 +16,7 @@ from skyvern.forge.sdk.workflow.models.parameter import WorkflowParameter, Workf
 from skyvern.forge.sdk.workflow.service import WorkflowService
 from skyvern.schemas.workflows import (
     TaskBlockYAML,
+    WorkflowCreateYAMLRequest,
     WorkflowParameterYAML,
     sanitize_block_label,
     sanitize_parameter_key,
@@ -145,6 +146,43 @@ class TestReplaceJinjaReference:
 
 class TestSanitizeWorkflowYamlWithReferences:
     """Tests for the sanitize_workflow_yaml_with_references function."""
+
+    @pytest.mark.parametrize(
+        ("label", "target", "nested"),
+        [("extract_data", "extract_data_2", False), ("Ext Data", "Ext_Data_2", False), ("x", "x_2", True)],
+    )
+    def test_duplicate_labels_keep_shared_route_reference_resolution(
+        self, label: str, target: str, nested: bool
+    ) -> None:
+        producer = {"label": label, "block_type": "code", "code": "value = 1"}
+        repeated = (
+            {"label": "each", "block_type": "for_loop", "loop_over_parameter_key": "items", "loop_blocks": [producer]}
+            if nested
+            else producer
+        )
+        reference = "{{ " + label + "_output }}"
+        definition = {
+            "parameters": [
+                {"parameter_type": "workflow", "key": "items", "workflow_parameter_type": "json"},
+                {"parameter_type": "context", "key": "value", "source_parameter_key": label + "_output"},
+            ],
+            "blocks": [producer, repeated, {"label": "consume", "block_type": "code", "code": reference}],
+            "workflow_system_prompt": reference,
+            "error_code_mapping": {"example": reference},
+            **({"finally_block_label": label} if not nested else {}),
+        }
+
+        result = sanitize_workflow_yaml_with_references({"title": "Example", "workflow_definition": definition})
+
+        sanitized = result["workflow_definition"]
+        expected = "{{ " + target + "_output }}"
+        assert sanitized["blocks"][-1]["code"] == expected
+        assert sanitized["parameters"][1]["source_parameter_key"] == target + "_output"
+        assert sanitized["workflow_system_prompt"] == expected
+        assert sanitized["error_code_mapping"]["example"] == expected
+        if not nested:
+            assert sanitized["finally_block_label"] == target
+        WorkflowCreateYAMLRequest.model_validate(result)
 
     def test_sanitize_simple_block_label(self) -> None:
         """Test sanitizing a simple block label."""

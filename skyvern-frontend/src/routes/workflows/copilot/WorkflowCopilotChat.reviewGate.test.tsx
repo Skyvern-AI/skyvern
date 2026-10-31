@@ -65,6 +65,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { parse, stringify } from "yaml";
 import { useWorkflowParametersStore } from "@/store/WorkflowParametersStore";
 import { useCopilotHeaderStore } from "@/store/useCopilotHeaderStore";
+import { useCopilotProposalStore } from "@/store/CopilotProposalStore";
 import { useWorkflowTitleStore } from "@/store/WorkflowTitleStore";
 import {
   selectEditorMutationLocked,
@@ -204,6 +205,10 @@ vi.mock("@/hooks/useCredentialGetter", () => ({
 
 vi.mock("@/components/ui/use-toast", () => ({ toast: vi.fn() }));
 
+const docEditorFlag = vi.hoisted(() => ({ enabled: false }));
+vi.mock("@/hooks/useWorkflowDocEditorFlag", () => ({
+  useWorkflowDocEditorFlag: () => docEditorFlag.enabled,
+}));
 const speech = vi.hoisted(() => ({
   stop: vi.fn(),
   takeAudioBlob: vi.fn(),
@@ -1207,6 +1212,24 @@ describe("WorkflowCopilotChat — g2 review gate", () => {
       });
       expect(close).toHaveBeenCalledWith("close");
       expect(proposalWrites()).toBe(writesBefore);
+    },
+  );
+
+  it.each([true, false])(
+    "with the Doc editor %s, a staged proposal is published for the save guard even with no Doc view open",
+    async (docEditorEnabled) => {
+      useCopilotProposalStore.setState({ proposal: null });
+      docEditorFlag.enabled = docEditorEnabled;
+      try {
+        await stageProposalOn("extract_titles");
+
+        expect(useCopilotProposalStore.getState().proposal !== null).toBe(
+          docEditorEnabled,
+        );
+      } finally {
+        docEditorFlag.enabled = false;
+        useCopilotProposalStore.setState({ proposal: null });
+      }
     },
   );
 

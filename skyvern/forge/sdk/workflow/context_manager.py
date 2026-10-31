@@ -1411,6 +1411,8 @@ class WorkflowRunContext:
             credential_item=credential_item,
         )
         credential = credential_item.credential
+        if credential_item.login_sites is not None:
+            self.bitwarden_login_sites[parameter.key] = credential_item.login_sites
 
         credential_totp_identifier = db_credential.totp_identifier
         if not credential_totp_identifier and isinstance(credential, PasswordCredential):

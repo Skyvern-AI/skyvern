@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 from collections.abc import Awaitable, Callable, Collection, Sequence
+from functools import partial
 from typing import Any, Literal
 
 import structlog
@@ -21,7 +22,14 @@ LOG = structlog.get_logger()
 IntegrationStatus = Literal["live", "comingSoon"]
 IntegrationKind = Literal["oauth", "credential_form", "external", "internal"]
 IntegrationCategory = Literal[
-    "Workspace", "Communication", "Docs", "Payments", "CRM", "Automation", "Agent Orchestrators", "Credentials"
+    "Workspace",
+    "Communication",
+    "Docs",
+    "Payments",
+    "CRM",
+    "Automation",
+    "Agent Orchestrators",
+    "Credentials",
 ]
 OAuthProvider = Literal["google", "microsoft"]
 AccountsUnavailable = Literal["not_enabled", "read_failed"]
@@ -85,7 +93,10 @@ def oauth_account(
 
 
 def page_payload(entry: IntegrationEntry) -> dict[str, Any]:
-    return entry.model_dump(by_alias=True, exclude_none=True, exclude={"accounts", "accounts_unavailable"})
+    excluded = {"accounts", "accounts_unavailable"}
+    if entry.status == "comingSoon" and entry.kind == "oauth":
+        excluded.update({"oauth_provider", "oauth_scope_profile", "required_scopes"})
+    return entry.model_dump(by_alias=True, exclude_none=True, exclude=excluded)
 
 
 def copilot_payload(entry: IntegrationEntry) -> dict[str, Any]:
@@ -260,6 +271,20 @@ SKYVERN_INTEGRATIONS: tuple[IntegrationEntry, ...] = (
         credential_form_id="custom_credential_service",
         position=16,
     ),
+    IntegrationEntry(
+        id="powerbi",
+        name="Power BI",
+        category="Workspace",
+        description="Run read-only DAX queries against Power BI datasets.",
+        keywords=["microsoft", "dataset", "model", "dax", "analytics"],
+        status="comingSoon",
+        kind="oauth",
+        logo="powerbi",
+        oauth_provider="microsoft",
+        oauth_scope_profile=microsoft_oauth_service.MICROSOFT_OAUTH_SCOPE_PROFILE_POWERBI_DATASET_READ,
+        required_scopes=["Dataset.Read.All"],
+        position=17,
+    ),
 )
 
 AccountsById = dict[str, list[IntegrationAccount] | AccountsUnavailable]
@@ -318,8 +343,11 @@ async def _google_accounts(organization_id: str) -> AccountsById:
     }
 
 
-async def _microsoft_accounts(organization_id: str) -> AccountsById:
-    credentials = await microsoft_oauth_service.get_credentials_for_org(organization_id)
+async def _microsoft_accounts(organization_id: str, user_id: str | None = None) -> AccountsById:
+    entries = _entries_for_provider("microsoft")
+    if not entries:
+        return {}
+    credentials = await microsoft_oauth_service.get_credentials_for_org(organization_id, user_id=user_id)
     return {
         entry.id: [
             oauth_account(credential, "microsoft")
@@ -329,7 +357,7 @@ async def _microsoft_accounts(organization_id: str) -> AccountsById:
                 credential.scopes_requested or credential.scopes_granted, entry.required_scopes or []
             )
         ]
-        for entry in _entries_for_provider("microsoft")
+        for entry in entries
     }
 
 
@@ -363,7 +391,6 @@ async def _twilio_accounts(organization_id: str) -> AccountsById:
 
 _ACCOUNT_SOURCES: tuple[tuple[frozenset[str], AccountSource], ...] = (
     (frozenset(entry.id for entry in _entries_for_provider("google")), _google_accounts),
-    (frozenset(entry.id for entry in _entries_for_provider("microsoft")), _microsoft_accounts),
     (frozenset({"twilio"}), _twilio_accounts),
     (frozenset({"onepassword"}), _onepassword_accounts),
     (frozenset({"bitwarden"}), _vault_source("bitwarden", OrganizationAuthTokenType.bitwarden_credential)),
@@ -406,9 +433,20 @@ def integration_entries() -> list[IntegrationEntry]:
     )
 
 
-async def integrations_for_org(organization_id: str) -> list[IntegrationEntry]:
+def integration_is_live(integration_id: str) -> bool:
+    return any(entry.id == integration_id and entry.status == "live" for entry in SKYVERN_INTEGRATIONS)
+
+
+async def integrations_for_org(organization_id: str, user_id: str | None = None) -> list[IntegrationEntry]:
+    microsoft_entry_ids = frozenset(entry.id for entry in _entries_for_provider("microsoft"))
+    microsoft_reader = read_account_source(
+        organization_id,
+        microsoft_entry_ids,
+        partial(_microsoft_accounts, user_id=user_id),
+    )
     reads = await asyncio.gather(
         *(read_account_source(organization_id, entry_ids, source) for entry_ids, source in _ACCOUNT_SOURCES),
+        microsoft_reader,
         app.AGENT_FUNCTION.get_cloud_integration_accounts(organization_id),
     )
     accounts: AccountsById = {}

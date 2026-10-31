@@ -1201,6 +1201,13 @@ class TestSummarizeToolResult:
         )
         assert "Unknown error" in summary
 
+    def test_denied_result_names_its_reason(self) -> None:
+        summary = self._summarize(
+            "list_credentials",
+            {"ok": False, "data": {"status": "denied", "reason": "reference_not_literal_in_current_user_turn"}},
+        )
+        assert summary == "Failed: reference_not_literal_in_current_user_turn"
+
     def test_update_workflow(self) -> None:
         summary = self._summarize(
             "update_workflow",

@@ -1,5 +1,6 @@
 // @vitest-environment jsdom
 
+import { useCopilotProposalStore } from "@/store/CopilotProposalStore";
 import { AxiosError } from "axios";
 import { useEffect, useState, type ReactNode } from "react";
 import {
@@ -2036,6 +2037,30 @@ describe("blocked saves", () => {
     expect(mocks.put).not.toHaveBeenCalled();
     expect(useWorkflowHasChangesStore.getState().hasChanges).toBe(true);
     useWorkflowHasChangesStore.setState({ saveBlockedReason: null });
+  });
+
+  // Every Save button, the leave-page dialog, Save as Template and Save inputs go through this save.
+  it("refuses to write a staged Copilot proposal, so only Accept can make it durable", async () => {
+    mocks.put.mockClear();
+    mocks.getClient.mockResolvedValue({ put: mocks.put });
+    useWorkflowHasChangesStore.setState({
+      getSaveData: () => saveData,
+      hasChanges: true,
+    });
+    useCopilotProposalStore.setState({ proposal: {} as never });
+    const { result } = renderHook(() => useWorkflowSave(), { wrapper });
+
+    try {
+      await act(async () => {
+        await expect(result.current.mutateAsync(undefined)).rejects.toThrow(
+          "Resolve the Copilot proposal before saving.",
+        );
+      });
+      expect(mocks.put).not.toHaveBeenCalled();
+      expect(useWorkflowHasChangesStore.getState().hasChanges).toBe(true);
+    } finally {
+      useCopilotProposalStore.setState({ proposal: null });
+    }
   });
 });
 

@@ -625,6 +625,7 @@ def get_bitwarden_item_overview_from_bitwarden_item(
         credential_type=credential_type,
         url=urls[0] if urls else None,
         urls=urls,
+        sites=_connected_vault_login_sites(login) if isinstance(login, dict) else [],
     )
 
 
@@ -1177,34 +1178,6 @@ class BitwardenService:
                 run=list_overviews,
                 force_sync=True,
             )
-
-    @staticmethod
-    async def get_login_item_sites(
-        client_id: str | None,
-        client_secret: str | None,
-        master_password: str,
-        bw_organization_id: str | None,
-        bw_collection_ids: list[str] | None,
-        item_id: str,
-        email: str | None = None,
-        timeout: int = settings.BITWARDEN_TIMEOUT_SECONDS,
-    ) -> list[LoginSite]:
-        """The sites one login item is saved for; its secret fields are read and dropped here."""
-        if not is_uuid(item_id):
-            raise BitwardenGetItemError(f"Invalid item ID: {item_id}. Check if the item ID is correct")
-
-        async def fetch(session: _CliSession) -> list[LoginSite]:
-            command = ["bw", "get", "item", item_id, "--session", session.session_key or ""]
-            item_result = await BitwardenService.run_command(command, additional_env=session.env, timeout=timeout)
-            item = BitwardenService._parse_fetched_item(item_result, item_id)
-            _require_in_vault_scope(item, bw_organization_id, bw_collection_ids)
-            if item["type"] != BitwardenItemType.LOGIN:
-                raise BitwardenGetItemError("Bitwarden item is not a login type")
-            return _connected_vault_login_sites(item["login"])
-
-        identity = _VaultIdentity.resolve(client_id, client_secret, email, master_password)
-        async with asyncio.timeout(timeout):
-            return await BitwardenService._with_cli_session(identity, timeout=timeout, run=fetch)
 
     @staticmethod
     async def get_secret_value_from_url(

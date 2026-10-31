@@ -740,6 +740,16 @@ async def _get_block_schema_post_hook(
                             "schema whenever you rewrite the return."
                         ),
                     }
+                    properties["parameter_keys"] = {
+                        "type": ["array", "null"],
+                        "items": {"type": "string"},
+                        "description": (
+                            "Keys whose values this code reads as Python variables of the same name: workflow "
+                            "parameter keys, and earlier block outputs as `<label>_output`. A `{{ }}` reference in "
+                            "the code is rendered into the source as text before it runs; a key listed here arrives "
+                            "as the value itself."
+                        ),
+                    }
                     required = schema.get("required")
                     required_fields = required if isinstance(required, list) else []
                     schema["required"] = [
@@ -2374,11 +2384,7 @@ async def _schedule_parameters_credential_pre_hook(
         )
         tool_error = stash_blocker_signal(ctx, google_approval_blocker)
         return {"ok": False, "error": tool_error}
-    credential_approval_error = _credential_run_approval_error(
-        credential_ids,
-        ctx.request_policy,
-        workflow_definition=workflow.workflow_definition if workflow is not None else None,
-    )
+    credential_approval_error = _credential_run_approval_error(credential_ids, ctx.request_policy)
     if credential_approval_error is not None:
         return {"ok": False, "error": credential_approval_error}
     return None

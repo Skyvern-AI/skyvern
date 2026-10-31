@@ -45,6 +45,7 @@ from skyvern.webeye.cdp_download_interceptor import CDPDownloadInterceptor
 from tests.unit._external_cdp_fakes import ORG_A, external_browser_state
 from tests.unit.helpers import make_organization, make_step, make_task
 from tests.unit.scoped_asyncio import ScopedAsyncio
+from tests.unit.scoped_time import ScopedTime
 
 _HANDLER = "skyvern.webeye.actions.handler"
 _AGENT = "skyvern.forge.agent"
@@ -130,19 +131,6 @@ class _FakePage:
         self._closed = True
         self.close_terminal = True
         self._events.append(f"{self._label}:close_terminal")
-
-
-class _ScopedTime:
-    """``time`` stand-in bound to one module: ``monotonic`` reads ``now``, every other attribute is real."""
-
-    def __init__(self) -> None:
-        self.now = 0.0
-
-    def monotonic(self) -> float:
-        return self.now
-
-    def __getattr__(self, name: str) -> object:
-        return getattr(time, name)
 
 
 async def _spin(task: asyncio.Task[Any], turns: int = 300) -> bool:
@@ -616,7 +604,7 @@ async def test_file_start_and_finalization_share_one_overall_deadline(tmp_path: 
     partial = tmp_path / "statement.pdf.crdownload"
 
     extra_pages: list[_FakePage] = []
-    clock = _ScopedTime()
+    clock = ScopedTime()
     action_at: list[float] = []
     finalize_waits: list[tuple[float, float]] = []
 

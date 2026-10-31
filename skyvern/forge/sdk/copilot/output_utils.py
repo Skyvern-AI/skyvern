@@ -2014,9 +2014,9 @@ _HEADERS_BLOB_RE = re.compile(r"\s*headers:\s*\{[^{}]*\}\s*", re.IGNORECASE)
 _LARGE_DICT_BLOB_RE = re.compile(r"\{[^{}]{40,}\}")
 # Every credential-shaped id prefix in skyvern/forge/sdk/db/id.py, so a new one does
 # not quietly become renderable: cred, the vault/parameter kinds, folders, OAuth,
-# and run credential selections, plus Copilot's connected-vault login ids.
+# and run credential selections, plus Copilot's refs for vault logins not saved yet.
 _CREDENTIAL_ID_RE = re.compile(
-    r"`?\b(?:cred|cp|cfld|blc|bccd|bsi|opp|azcp|asp|goac|moac|wrcs|bwitem)_[A-Za-z0-9][A-Za-z0-9_-]*`?"
+    r"`?\b(?:cred|cp|cfld|blc|bccd|bsi|opp|azcp|asp|goac|moac|wrcs|vlogin)_[A-Za-z0-9][A-Za-z0-9_-]*`?"
 )
 # Punctuation an LLM-authored block label may keep. Everything outside this set and
 # the letter/digit categories becomes a space: a whitelist, because any quote-class
@@ -2190,7 +2190,11 @@ def summarize_tool_result(tool_name: str, result: dict[str, Any], *, for_display
     if _is_unconfirmed_extension(result):
         return "Requested more browser session time; not confirmed and not retried"
     if not result.get("ok", False):
-        return f"Failed: {_sanitize_failure_text(_extract_failure_message(result))}"
+        message = _extract_failure_message(result)
+        reason = _result_data(result).get("reason")
+        if message == _UNKNOWN_ERROR_SENTINEL and isinstance(reason, str) and reason:
+            message = reason
+        return f"Failed: {_sanitize_failure_text(message)}"
 
     raw_data = result.get("data")
     data = raw_data if isinstance(raw_data, dict) else {}
@@ -2210,9 +2214,9 @@ def summarize_tool_result(tool_name: str, result: dict[str, Any], *, for_display
         return ran
     if tool_name == "list_credentials":
         if data.get("status") == "resolved":
-            match = data.get("credential") or data.get("vault_login")
+            match = data.get("credential")
             if isinstance(match, dict):
-                name = match.get("name") or match.get("title")
+                name = match.get("name")
                 if isinstance(name, str) and name:
                     safe_name = sanitize_block_label_for_display(name)
                     if safe_name:

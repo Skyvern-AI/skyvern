@@ -616,9 +616,11 @@ class RealBrowserManager(BrowserManager):
             return
         self._prepare_session_activity_loop()
         self._driven_session_refcounts[session_id] = self._driven_session_refcounts.get(session_id, 0) + 1
-        await app.DATABASE.browser_sessions.touch_last_activity(session_id)
-        self._session_activity_last_stamped_at[session_id] = asyncio.get_running_loop().time()
-        self._start_session_activity_renewal()
+        try:
+            await app.DATABASE.browser_sessions.touch_last_activity(session_id)
+            self._session_activity_last_stamped_at[session_id] = asyncio.get_running_loop().time()
+        finally:
+            self._start_session_activity_renewal()
 
     def end_session_activity_renewal(self, session_id: str | None) -> None:
         if session_id is None:

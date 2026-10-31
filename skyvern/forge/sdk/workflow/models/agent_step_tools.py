@@ -214,6 +214,7 @@ AGENT_BLOCK_TOOLS: dict[BlockType, BlockTool | str] = {
     BlockType.EXTRACTION: _OVERLAPS,
     BlockType.VALIDATION: _OVERLAPS,
     BlockType.GOTO_URL: _OVERLAPS,
+    BlockType.POWERBI_QUERY: "Power BI queries require a user-authorized connection and are not available in agent-step authoring.",
     BlockType.AGENT_STEP: "No recursion.",
 }
 DEDICATED_BLOCK_TOOLS: dict[str, tuple[BlockType, BlockTool]] = {
@@ -229,7 +230,8 @@ RUN_BLOCK_TYPES: dict[str, tuple[BlockType, BlockTool]] = {
 RUN_TOOL_DESCRIPTIONS: dict[str, str] = {
     "read_run_data": "Read what this run already has. Without name: the names of its workflow parameters, its "
     "earlier blocks with their status, and its downloaded files. With name: that parameter's value, that block's "
-    "output and outcome, or that file's URL. Secret values are masked.",
+    "output and outcome, or that file's URL. Secret values are masked. With offset, a cut result from that "
+    "character on.",
     "page_goto": "Open url in this run's browser.",
     "page_click": "Click the element prompt describes." + _NO_SECOND_AGENT,
     "page_fill": "Type value into the field prompt describes." + _NO_SECOND_AGENT,

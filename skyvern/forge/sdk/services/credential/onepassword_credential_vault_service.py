@@ -1,22 +1,37 @@
+import asyncio
+
 from fastapi import HTTPException
 from onepassword import ItemFieldType
+from onepassword.client import Client as OnePasswordClient
 from onepassword.types import Item
 
 from skyvern.exceptions import CredentialItemNotFoundError, CredentialSourceNotConfiguredError
 from skyvern.forge import app
+from skyvern.forge.sdk.credential_site_policy import LoginSite
 from skyvern.forge.sdk.schemas.credentials import (
     CreateCredentialRequest,
     Credential,
     CredentialItem,
     CredentialType,
+    CredentialVaultType,
     CreditCardCredential,
     PasswordCredential,
     SecretCredential,
     TotpType,
 )
-from skyvern.forge.sdk.services.credential.credential_vault_service import CredentialVaultService
+from skyvern.forge.sdk.services.credential.credential_vault_service import CredentialVaultService, VaultLogin
 from skyvern.forge.sdk.services.credentials import fetch_onepassword_item, format_resolved_lookup_context
 from skyvern.forge.sdk.services.onepassword_token_service import resolve_onepassword_token
+
+ONEPASSWORD_LISTING_TIMEOUT_SECONDS = 20.0
+
+
+def onepassword_item_credential_type(item: Item) -> CredentialType | None:
+    category = "".join(character for character in item.category.value.casefold() if character.isalnum())
+    return {
+        "login": CredentialType.PASSWORD,
+        "creditcard": CredentialType.CREDIT_CARD,
+    }.get(category)
 
 
 def _normalize_field_name(value: str | None) -> str:
@@ -144,3 +159,39 @@ class OnePasswordCredentialVaultService(CredentialVaultService):
             lookup_context,
         )
         return _credential_from_item(db_credential, item)
+
+    async def list_logins(self, organization_id: str) -> list[VaultLogin] | None:
+        resolution = await resolve_onepassword_token(organization_id)
+        # Org-scoped only, like the item listing route: never the instance's global token.
+        if resolution.source != "organization" or resolution.token is None:
+            return None
+        client = await OnePasswordClient.authenticate(
+            auth=resolution.token, integration_name="Skyvern", integration_version="v1.0.0"
+        )
+        vaults = await client.vaults.list()
+        # One vault failing fails the listing: that vault could hold the page's login, so the rest is not complete.
+        listed = await asyncio.wait_for(
+            asyncio.gather(*(client.items.list(vault.id) for vault in vaults)),
+            timeout=ONEPASSWORD_LISTING_TIMEOUT_SECONDS,
+        )
+        logins: list[VaultLogin] = []
+        for vault, items in zip(vaults, listed, strict=True):
+            for item in items:
+                if onepassword_item_credential_type(item) != CredentialType.PASSWORD:
+                    continue
+                websites = tuple(website.url for website in item.websites or [] if website.url)
+                tested_url = websites[0] if websites else None
+                logins.append(
+                    VaultLogin(
+                        vault_type=CredentialVaultType.ONEPASSWORD,
+                        vault_id=vault.id,
+                        item_id=item.id,
+                        title=item.title,
+                        urls=websites,
+                        # An imported 1Password login fills only at its tested URL's origin, so it is not
+                        # placed anywhere wider before it is imported.
+                        sites=(LoginSite(tested_url, whole_site=False),) if tested_url else (),
+                        tested_url=tested_url,
+                    )
+                )
+        return logins

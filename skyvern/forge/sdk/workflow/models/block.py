@@ -194,7 +194,7 @@ from skyvern.forge.sdk.core import skyvern_context
 from skyvern.forge.sdk.core.aiohttp_helper import aiohttp_request
 from skyvern.forge.sdk.core.hashing import diagnostic_fingerprint
 from skyvern.forge.sdk.core.skyvern_context import SkyvernContext
-from skyvern.forge.sdk.credential_site_policy import describe_release_scope, origin_of, same_release_scope
+from skyvern.forge.sdk.credential_site_policy import LoginSite, describe_release_scope, origin_of
 from skyvern.forge.sdk.db.datetime_utils import naive_utc_now
 from skyvern.forge.sdk.db.enums import TaskType
 from skyvern.forge.sdk.db.exceptions import NotFoundError
@@ -248,9 +248,16 @@ from skyvern.forge.sdk.workflow.code_block_authorized_files import (
     unbound_attach_authorized_file,
 )
 from skyvern.forge.sdk.workflow.code_block_safety import BLOCKED_ATTRS as CODE_BLOCK_BLOCKED_ATTRS
-from skyvern.forge.sdk.workflow.code_block_safety import SANDBOX_MODULES_GLOBAL, BindSandboxModuleImports
+from skyvern.forge.sdk.workflow.code_block_safety import (
+    SANDBOX_MODULES_GLOBAL,
+    BindSandboxModuleImports,
+)
 from skyvern.forge.sdk.workflow.code_block_safety import is_safe_code as _shared_is_safe_code
-from skyvern.forge.sdk.workflow.code_block_safety import json_safe_default, module_shims, safe_builtins
+from skyvern.forge.sdk.workflow.code_block_safety import (
+    json_safe_default,
+    module_shims,
+    safe_builtins,
+)
 from skyvern.forge.sdk.workflow.constants import OUTPUT_PARAMETER_MAX_VALUE_BYTES
 from skyvern.forge.sdk.workflow.context_manager import (
     NON_SECRET_CREDENTIAL_FIELDS,
@@ -305,6 +312,7 @@ from skyvern.forge.sdk.workflow.models.code_block_recording import CodeBlockActi
 from skyvern.forge.sdk.workflow.models.credential_release import (
     CodeBlockCredentialReleaseError,
     CredentialReleaseGuard,
+    login_release_sites,
 )
 from skyvern.forge.sdk.workflow.models.parameter import (
     PARAMETER_TYPE,
@@ -1769,6 +1777,29 @@ class Block(BaseModel, abc.ABC):
     @staticmethod
     def get_workflow_run_context(workflow_run_id: str) -> WorkflowRunContext:
         return app.WORKFLOW_CONTEXT_MANAGER.get_workflow_run_context(workflow_run_id)
+
+    async def _workflow_copilot_lineage(self, workflow_run_context: WorkflowRunContext) -> bool | None:
+        """Whether Copilot wrote any version of this workflow, or None when the lookup failed."""
+        workflow = workflow_run_context.workflow
+        if workflow is None:
+            return False
+        if "copilot" in (workflow.created_by, workflow.edited_by):
+            return True
+        # User saves re-stamp both fields with the user id, so the current version alone is
+        # not durable; fall back to lineage (copilot stamps every version it writes). A lookup
+        # failure must never mask a block failure.
+        try:
+            copilot_authored = await app.DATABASE.workflows.is_workflow_copilot_authored(
+                workflow_permanent_id=workflow.workflow_permanent_id,
+                organization_id=workflow.organization_id,
+            )
+            return copilot_authored is True
+        except Exception:
+            LOG.warning(
+                "Copilot-lineage lookup failed; failing closed",
+                workflow_permanent_id=workflow.workflow_permanent_id,
+            )
+            return None
 
     @staticmethod
     def get_async_aws_client() -> AsyncAWSClient:
@@ -8239,29 +8270,6 @@ async def wrapper({default_args}):
     async def _workflow_is_copilot_authored(self, workflow_run_context: WorkflowRunContext) -> bool:
         return await self._workflow_copilot_lineage(workflow_run_context) is True
 
-    async def _workflow_copilot_lineage(self, workflow_run_context: WorkflowRunContext) -> bool | None:
-        """Whether Copilot wrote any version of this workflow, or None when the lookup failed."""
-        workflow = workflow_run_context.workflow
-        if workflow is None:
-            return False
-        if "copilot" in (workflow.created_by, workflow.edited_by):
-            return True
-        # User saves re-stamp both fields with the user id, so the current version alone is
-        # not durable; fall back to lineage (copilot stamps every version it writes). A lookup
-        # failure must never mask a block failure.
-        try:
-            copilot_authored = await app.DATABASE.workflows.is_workflow_copilot_authored(
-                workflow_permanent_id=workflow.workflow_permanent_id,
-                organization_id=workflow.organization_id,
-            )
-            return copilot_authored is True
-        except Exception:
-            LOG.warning(
-                "Copilot-lineage lookup failed; failing closed",
-                workflow_permanent_id=workflow.workflow_permanent_id,
-            )
-            return None
-
     async def _ai_fallback_enabled(self, workflow_run_context: WorkflowRunContext) -> bool:
         workflow = workflow_run_context.workflow
         if workflow is None or not await code_block_ai_fallback_flag_enabled(workflow.organization_id):
@@ -9009,10 +9017,13 @@ async def wrapper({default_args}):
             # Bounded here, in seconds, because the frame is optional evidence: on the healable
             # arm it is read before recovery runs, so an unbounded read would hold both the heal
             # and the failure fact behind a stalled screenshot.
+            # The current viewport, not a stitched full page: the repair model receives this frame fitted to
+            # 1600x1200, which leaves a long page's text unreadable.
             async with asyncio.timeout(settings.BROWSER_SCREENSHOT_TIMEOUT_MS / 1000):
                 return await SkyvernFrame.take_scrolling_screenshot(
                     page=page,
                     mode=ScreenshotMode.LITE,
+                    scrolling_number=0,
                     engine_selection=browser_state.engine_selection if browser_state is not None else None,
                 )
         except asyncio.CancelledError:
@@ -17546,7 +17557,8 @@ class HttpRequestBlock(Block):
     # Parameters for templating
     parameters: list[PARAMETER_TYPE] = []
 
-    _confined_references: list[tuple[str, str | None, str, str]] = PrivateAttr(default_factory=list)
+    _confined_references: list[tuple[str, str | None, str, tuple[LoginSite, ...]]] = PrivateAttr(default_factory=list)
+    _enforce_vault_sites: bool = PrivateAttr(default=True)
 
     TEMPLATABLE_FIELDS: ClassVar[frozenset[str]] = frozenset({"body", "download_filename", "files", "headers", "url"})
 
@@ -17642,8 +17654,8 @@ class HttpRequestBlock(Block):
                 # the file's own URL, so it is confined without an entry.
                 rendered_entry = _render_string("files", entry)
                 self._confined_references = [
-                    (field, rendered_entry if field == "files" and ref_entry == entry else ref_entry, key, tested_url)
-                    for field, ref_entry, key, tested_url in self._confined_references
+                    (field, rendered_entry if field == "files" and ref_entry == entry else ref_entry, key, sites)
+                    for field, ref_entry, key, sites in self._confined_references
                 ]
 
                 def _render_entry_value(text: str, entry: str = rendered_entry) -> str:
@@ -17669,10 +17681,15 @@ class HttpRequestBlock(Block):
         except Exception:
             return False
 
+    def _release_sites(self, workflow_run_context: WorkflowRunContext, key: str) -> tuple[LoginSite, ...] | None:
+        vault_sites = workflow_run_context.bitwarden_login_sites.get(key) if self._enforce_vault_sites else None
+        sites = login_release_sites(workflow_run_context.credential_tested_urls.get(key), vault_sites)
+        return None if sites is None else tuple(sites)
+
     def _confined_credential_references(
         self, workflow_run_context: WorkflowRunContext
-    ) -> list[tuple[str, str | None, str, str]]:
-        """(field, files entry, parameter key, tested_url) for every credential a raw template references whose
+    ) -> list[tuple[str, str | None, str, tuple[LoginSite, ...]]]:
+        """(field, files entry, parameter key, sites) for every credential a raw template references whose
         saved site confines it. Read from the templates, not the rendered text, so a value that
         merely resembles a credential field never counts and an unarmed credential sharing a value
         with an armed one is never misattributed."""
@@ -17697,7 +17714,7 @@ class HttpRequestBlock(Block):
                 if key in names or f"{key}_real_username" in names or f"{key}_real_password" in names
             }
 
-        references: list[tuple[str, str | None, str, str]] = []
+        references: list[tuple[str, str | None, str, tuple[LoginSite, ...]]] = []
         unarmed: set[str] = set()
         templates: list[tuple[str, str | None, object]] = [
             ("url", None, self.url),
@@ -17709,9 +17726,9 @@ class HttpRequestBlock(Block):
         for field, entry, value in templates:
             for template in _iter_template_strings(value):
                 for key in _referenced(template):
-                    tested_url = workflow_run_context.credential_tested_urls.get(key)
-                    if tested_url and describe_release_scope(tested_url) is not None:
-                        references.append((field, entry, key, tested_url))
+                    sites = self._release_sites(workflow_run_context, key)
+                    if sites is not None:
+                        references.append((field, entry, key, sites))
                     else:
                         unarmed.add(key)
         for key in sorted(unarmed):
@@ -17731,17 +17748,17 @@ class HttpRequestBlock(Block):
         for key, fields in workflow_run_context.values.items():
             if not isinstance(fields, dict) or "context" not in fields or token not in fields.values():
                 continue
-            tested_url = workflow_run_context.credential_tested_urls.get(key)
-            if tested_url and describe_release_scope(tested_url) is not None:
-                reference = (field, entry, key, tested_url)
+            sites = self._release_sites(workflow_run_context, key)
+            if sites is not None:
+                reference = (field, entry, key, sites)
                 if reference not in self._confined_references:
                     self._confined_references.append(reference)
             return
 
-    def _off_site_credential_release(self) -> tuple[str, str, str | None] | None:
-        """(parameter key, tested_url, destination) for the first confined credential this request
+    def _off_site_credential_release(self) -> tuple[str, tuple[LoginSite, ...], str | None] | None:
+        """(parameter key, sites, destination) for the first confined credential this request
         would send outside its site. Runs after rendering, so destinations are the real URLs."""
-        for field, entry, key, tested_url in self._confined_references:
+        for field, entry, key, sites in self._confined_references:
             destinations: list[str | None] = [self.url]
             if field == "files" and entry is not None:
                 # A file entry holding an http(s) URL is fetched from there, and the fetched
@@ -17750,20 +17767,20 @@ class HttpRequestBlock(Block):
                 if _is_remote_file_url(file_value):
                     destinations.append(file_value)
             for destination in destinations:
-                if not (destination and same_release_scope(destination, tested_url)):
-                    return key, tested_url, destination
+                if not (destination and any(site.admits(destination) for site in sites)):
+                    return key, sites, destination
         return None
 
     def _authorize_redirect(self, next_url: str) -> bool:
-        return all(same_release_scope(next_url, tested_url) for _, _, _, tested_url in self._confined_references)
+        return all(any(site.admits(next_url) for site in sites) for _, _, _, sites in self._confined_references)
 
     def _authorize_file_redirect(self, entry: str) -> Callable[[str], bool] | None:
-        tested_urls = [t for field, e, _, t in self._confined_references if field == "files" and e == entry]
-        if not tested_urls:
+        site_lists = [sites for field, e, _, sites in self._confined_references if field == "files" and e == entry]
+        if not site_lists:
             return None
 
         def authorize(next_url: str) -> bool:
-            return all(same_release_scope(next_url, tested_url) for tested_url in tested_urls)
+            return all(any(site.admits(next_url) for site in sites) for sites in site_lists)
 
         return authorize
 
@@ -17867,6 +17884,9 @@ class HttpRequestBlock(Block):
         """Execute the HTTP request and return the response"""
 
         workflow_run_context = self.get_workflow_run_context(workflow_run_id)
+        if workflow_run_context.bitwarden_login_sites:
+            # As on the code-block seam, vault sites bind only Copilot-written workflows; others keep the tested URL.
+            self._enforce_vault_sites = await self._workflow_copilot_lineage(workflow_run_context) is not False
 
         try:
             self.format_potential_template_parameters(workflow_run_context)
@@ -17913,8 +17933,13 @@ class HttpRequestBlock(Block):
 
         off_site_release = self._off_site_credential_release()
         if off_site_release is not None:
-            parameter_key, tested_url, destination = off_site_release
-            allowed_scope = describe_release_scope(tested_url) or "an unreadable saved login site"
+            parameter_key, sites, destination = off_site_release
+            allowed_scope = (
+                ", ".join(
+                    sorted({describe_release_scope(site.url, whole_site=site.whole_site) or site.url for site in sites})
+                )
+                or "no website a scope can be read from"
+            )
             actual_scope = describe_release_scope(destination) or "a destination whose site could not be identified"
             actual_origin = origin_of(destination)
             LOG.warning(
@@ -20873,6 +20898,7 @@ from skyvern.forge.sdk.workflow.models.google_sheets_blocks import (  # noqa: E4
     GoogleSheetsWriteBlock,
 )
 from skyvern.forge.sdk.workflow.models.pdf_fill_block import PdfFillBlock  # noqa: E402
+from skyvern.forge.sdk.workflow.models.powerbi_query_block import PowerBIQueryBlock  # noqa: E402
 from skyvern.forge.sdk.workflow.models.split_pdf_block import SplitPdfBlock  # noqa: E402
 from skyvern.forge.sdk.workflow.models.terminate_block import TerminateBlock  # noqa: E402
 from skyvern.forge.sdk.workflow.models.web_search_block import WebSearchBlock  # noqa: E402
@@ -20907,6 +20933,7 @@ BlockSubclasses = Union[
     GoogleSheetsReadBlock,
     EmailInboxBlock,
     GoogleSheetsWriteBlock,
+    PowerBIQueryBlock,
     PdfFillBlock,
     SplitPdfBlock,
     DataExportBlock,

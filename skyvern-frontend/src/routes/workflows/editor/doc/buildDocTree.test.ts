@@ -1,86 +1,17 @@
 import { describe, expect, test } from "vitest";
 
-import { ProxyLocation } from "@/api/types";
-
-import type {
-  WorkflowBlock,
-  WorkflowSettings,
-} from "../../types/workflowTypes";
+import type { WorkflowBlock } from "../../types/workflowTypes";
 import type { BlockYAML } from "../../types/workflowYamlTypes";
 import { isWorkflowBlockNode } from "../nodes";
 import { getElements, getWorkflowBlocks } from "../workflowEditorUtils";
 import {
   buildDocTree,
   countDocSteps,
+  getDocNotesByNodeId,
   type DocBranch,
   type DocItem,
 } from "./buildDocTree";
-
-const settings = (finallyBlockLabel: string | null = null) =>
-  ({
-    proxyLocation: ProxyLocation.Residential,
-    finallyBlockLabel,
-  }) as unknown as WorkflowSettings;
-
-type Extra = Record<string, unknown>;
-const block = (
-  block_type: string,
-  label: string,
-  next: string | null,
-  extra: Extra = {},
-) =>
-  ({
-    label,
-    block_type,
-    next_block_label: next,
-    continue_on_failure: false,
-    model: null,
-    output_parameter: {
-      parameter_type: "output",
-      key: `${label}_output`,
-      output_parameter_id: `op-${label}`,
-    },
-    ...extra,
-  }) as unknown as WorkflowBlock;
-const code = (label: string, next: string | null, extra: Extra = {}) =>
-  block("code", label, next, { code: "", parameters: [], ...extra });
-const forLoop = (
-  label: string,
-  next: string | null,
-  loopBlocks: WorkflowBlock[],
-  extra: Extra = {},
-) =>
-  block("for_loop", label, next, {
-    loop_over: { key: "items" },
-    loop_blocks: loopBlocks,
-    loop_variable_reference: "{{ items }}",
-    complete_if_empty: false,
-    ...extra,
-  });
-type Branch = { id: string; next: string | null; when?: string; exact?: true };
-const conditional = (
-  label: string,
-  next: string | null,
-  branches: Branch[],
-  extra: Extra = {},
-) =>
-  block("conditional", label, next, {
-    branch_conditions: branches.map((b) => ({
-      id: b.id,
-      description: null,
-      next_block_label: b.next,
-      is_default: b.when === undefined,
-      criteria:
-        b.when === undefined
-          ? null
-          : {
-              criteria_type: b.exact ? "jinja2_template" : "prompt",
-              expression: b.when,
-              description: null,
-            },
-    })),
-    ...extra,
-  });
+import { block, code, conditional, forLoop, settings } from "./docTestBlocks";
 
 function project(blocks: WorkflowBlock[], finallyLabel: string | null = null) {
   const { nodes, edges } = getElements(blocks, settings(finallyLabel), true);
@@ -153,6 +84,93 @@ const outline = (items: DocItem[], labelOf: Map<string, string>): unknown[] =>
   });
 
 describe("buildDocTree", () => {
+  test("gives each note to its step and to the step above it in a six-step sequence", () => {
+    const blocks = Array.from({ length: 6 }, (_, index) =>
+      code(`step_${index + 1}`, index === 5 ? null : `step_${index + 2}`, {
+        notes: `Note ${index + 1}`,
+      }),
+    );
+    const { nodes, edges } = getElements(blocks, settings(), true);
+
+    const notesByNodeId = getDocNotesByNodeId(nodes, edges);
+    const nodeIdByLabel = new Map(
+      nodes
+        .filter(isWorkflowBlockNode)
+        .map((node) => [node.data.label, node.id]),
+    );
+
+    expect(notesByNodeId).toEqual(
+      new Map(
+        Array.from({ length: 6 }, (_, index) => [
+          nodeIdByLabel.get(`step_${index + 1}`),
+          index === 5
+            ? [`Note ${index + 1}`]
+            : [`Note ${index + 1}`, `Note ${index + 2}`],
+        ]),
+      ),
+    );
+  });
+
+  test("lists a step's notes in the order the run reads them: own, next step's, trailing", () => {
+    const blocks = [
+      code("first", "second", {
+        notes: "Own note.",
+        trailing_notes: "Trailing note.",
+      }),
+      code("second", null, { notes: "Next step's note." }),
+    ];
+    const { nodes, edges } = getElements(blocks, settings(), true);
+    const first = nodes.find(
+      (node) => isWorkflowBlockNode(node) && node.data.label === "first",
+    )!;
+
+    expect(getDocNotesByNodeId(nodes, edges).get(first.id)).toEqual([
+      "Own note.",
+      "Next step's note.",
+      "Trailing note.",
+    ]);
+  });
+
+  test("omits a step that reads no note", () => {
+    const blocks = [
+      code("noted", "plain", { notes: "Visible only on noted." }),
+      code("plain", null),
+    ];
+    const { nodes, edges } = getElements(blocks, settings(), true);
+    const nodeIdByLabel = new Map(
+      nodes
+        .filter(isWorkflowBlockNode)
+        .map((node) => [node.data.label, node.id]),
+    );
+
+    const notesByNodeId = getDocNotesByNodeId(nodes, edges);
+
+    expect(notesByNodeId.get(nodeIdByLabel.get("noted")!)).toEqual([
+      "Visible only on noted.",
+    ]);
+    expect(notesByNodeId.has(nodeIdByLabel.get("plain")!)).toBe(false);
+  });
+
+  test("keeps the finally block's note on the finally block, as the run does", () => {
+    const blocks = [
+      code("work", "cleanup"),
+      code("cleanup", null, { notes: "Log out." }),
+    ];
+    const { nodes, edges } = getElements(blocks, settings("cleanup"), true);
+    const nodeIdByLabel = new Map(
+      nodes
+        .filter(isWorkflowBlockNode)
+        .map((node) => [node.data.label, node.id]),
+    );
+
+    const notesByNodeId = getDocNotesByNodeId(nodes, edges, "cleanup");
+
+    expect(notesByNodeId.get(nodeIdByLabel.get("cleanup")!)).toEqual([
+      "Log out.",
+    ]);
+    expect(notesByNodeId.has(nodeIdByLabel.get("work")!)).toBe(false);
+  });
+
   test("nests loops two deep and keeps their order", () => {
     const blocks = [
       code("first", "outer"),
@@ -298,6 +316,28 @@ describe("buildDocTree", () => {
     expect(JSON.stringify(outline(tree.items, labelOf))).toMatch(
       /read-only|unplaced/,
     );
+  });
+
+  test("an unplaced step keeps the note markers for its own notes", () => {
+    const blocks = [
+      forLoop("loop", "decide", [code("inside", "tail")]),
+      conditional("decide", null, [
+        { id: "go", next: "inside", when: "jump into the loop" },
+        { id: "else", next: null },
+      ]),
+      { ...code("tail", null), notes: "after the loop", trailing_notes: "end" },
+    ];
+    const { nodes, edges, tree } = project(blocks);
+    const unplaced = tree.items.flatMap((item) =>
+      item.kind === "unplaced" ? item.nodeIds : [],
+    );
+    const markers = getDocNotesByNodeId(nodes, edges);
+    const tail = nodes.find(
+      (n) => isWorkflowBlockNode(n) && n.data.label === "tail",
+    )!;
+
+    expect(unplaced).toContain(tail.id);
+    expect(markers.get(tail.id)).toEqual(["after the loop", "end"]);
   });
 
   test("shows legacy block types as ordinary steps", () => {

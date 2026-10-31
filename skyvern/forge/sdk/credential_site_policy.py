@@ -5,6 +5,7 @@ apply one policy (SKY-14103)."""
 
 from __future__ import annotations
 
+from collections.abc import Iterable
 from dataclasses import dataclass
 
 import tldextract
@@ -84,3 +85,8 @@ def describe_release_scope(url: str | None, *, whole_site: bool = True) -> str |
     if port is None or _DEFAULT_PORTS.get(scheme) == port:
         return f"{scheme}://{host}"
     return f"{scheme}://{host}:{port}"
+
+
+def describe_login_sites(sites: Iterable[LoginSite]) -> str:
+    scopes = {describe_release_scope(site.url, whole_site=site.whole_site) or site.url for site in sites}
+    return ", ".join(sorted(scopes)) or "no site"

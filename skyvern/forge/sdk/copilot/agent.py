@@ -77,6 +77,7 @@ from skyvern.forge.sdk.copilot.build_test_outcome import (
     RecordedBuildTestOutcome,
     TerminalCause,
     observed_value_extraction_scaffold_lines,
+    redacted_terminal_text,
 )
 from skyvern.forge.sdk.copilot.cache_envelope import CacheableSystemInstructions
 from skyvern.forge.sdk.copilot.code_block_steps import (
@@ -156,7 +157,7 @@ from skyvern.forge.sdk.copilot.entrypoint import (
 from skyvern.forge.sdk.copilot.failure_tracking import block_shape_hashes_by_label
 from skyvern.forge.sdk.copilot.google_connection_notice import google_setup_notice, unselected_google_setup_offers
 from skyvern.forge.sdk.copilot.hooks import FinalReplyRunHooks
-from skyvern.forge.sdk.copilot.interruption import INTERRUPTED_TERMINAL_SUPERSEDED_HEADLINE
+from skyvern.forge.sdk.copilot.interruption import INTERRUPTED_TERMINAL_SUPERSEDED_HEADLINE, StoppedTurnFacts
 from skyvern.forge.sdk.copilot.llm_errors import CopilotEmptyCompletionError
 from skyvern.forge.sdk.copilot.llm_errors import is_retriable_llm_error as _is_retriable_llm_error
 from skyvern.forge.sdk.copilot.model_resolver import copilot_token_budget
@@ -189,6 +190,7 @@ from skyvern.forge.sdk.copilot.output_utils import (
     extract_final_text,
     parse_final_response,
     project_direct_test_handoff_packet_for_llm,
+    sanitize_block_label_for_display,
     sanitize_tool_result_for_llm,
 )
 from skyvern.forge.sdk.copilot.recoverable_failure import (
@@ -229,6 +231,7 @@ from skyvern.forge.sdk.copilot.runtime import (
     BrowserProbeOutcome,
     _browser_context_attachability,
     close_browser_session_quietly,
+    end_minted_browser_renewals,
     record_attached_browser_driver,
     resolve_persistent_browser_state,
     start_browser_driver_release,
@@ -241,7 +244,11 @@ from skyvern.forge.sdk.copilot.runtime_authoring_repair import (
     RUNTIME_FAILURE_REASON_MAX_CHARS,
 )
 from skyvern.forge.sdk.copilot.secret_redaction import redact_raw_secrets_for_structured_prompt
-from skyvern.forge.sdk.copilot.secret_scrub import registered_scrub_values, scrub_secrets_from_structure
+from skyvern.forge.sdk.copilot.secret_scrub import (
+    registered_scrub_values,
+    scrub_secrets_from_structure,
+    scrub_secrets_from_text,
+)
 from skyvern.forge.sdk.copilot.streaming_adapter import (
     emit_test_end_to_end_activity,
     emit_turn_start,
@@ -254,7 +261,11 @@ from skyvern.forge.sdk.copilot.tools._shared import _copilot_seconds_remaining
 from skyvern.forge.sdk.copilot.tools.blockers import _goal_value_paths_for_code_block
 from skyvern.forge.sdk.copilot.tools.browser_code import close_browser_code_session
 from skyvern.forge.sdk.copilot.tools.credential_fill import raw_secret_connected_credential
-from skyvern.forge.sdk.copilot.tools.credentials import _server_verified_google_account_choices
+from skyvern.forge.sdk.copilot.tools.credentials import (
+    _server_verified_google_account_choices,
+    bitwarden_binding_change_error,
+    import_bound_vault_logins,
+)
 from skyvern.forge.sdk.copilot.tools.guardrails import _record_output_policy_guardrail_outcome
 from skyvern.forge.sdk.copilot.tools.run_execution import (
     WatchdogExitReason,
@@ -272,7 +283,10 @@ from skyvern.forge.sdk.copilot.tools.scouting import (
 )
 from skyvern.forge.sdk.copilot.tools.workflow_update import (
     _candidate_proposal_data,
+    display_block_label,
+    display_labels_changed_between,
     publish_workflow_candidate,
+    record_edited_block_labels,
     restore_pending_workflow_proposal,
 )
 from skyvern.forge.sdk.copilot.tracing_setup import _copilot_model_name, ensure_tracing_initialized, is_tracing_enabled
@@ -1847,7 +1861,7 @@ def _tested_draft_reply(
     unvalidated_reply: str,
 ) -> str:
     """The reply and the proposal disposition read one predicate, so prose cannot outrun the pill."""
-    tested = _turn_facts_for_context(ctx, _review_projection_for(ctx, proposal_yaml))["ranCleanOnCurrentSource"]
+    tested = turn_facts_for_context(ctx, _review_projection_for(ctx, proposal_yaml))["ranCleanOnCurrentSource"]
     return tested_reply if tested else unvalidated_reply
 
 
@@ -1884,16 +1898,24 @@ def _turn_fact_bundle(
     return facts
 
 
-def _turn_facts_for_context(
+def turn_facts_for_context(
     ctx: CopilotContext,
     review: NarrativeReviewProjection | None,
 ) -> NarrativeTurnFacts:
-    return _turn_fact_bundle(
+    facts = _turn_fact_bundle(
         review,
         select_run_outcome_anchor(_run_outcome_trace(ctx)),
         _terminal_cause_for_context(ctx),
         _blocks_run_this_turn(ctx),
     )
+    if ctx.edited_block_labels_this_turn:
+        facts["editedBlockLabels"] = list(ctx.edited_block_labels_this_turn)
+    return facts
+
+
+def completed_tool_names(ctx: CopilotContext) -> list[str]:
+    names = (entry.get("tool") or entry.get("name") for entry in ctx.tool_activity if isinstance(entry, dict))
+    return [str(name) for name in names if name]
 
 
 def _terminal_failed_operation(
@@ -1982,7 +2004,10 @@ def _make_agent_result(
         final_context = finalize_observation_context(ctx, global_llm_context)
         final_context = record_approved_credentials_in_global_llm_context(ctx, final_context)
     if ctx is not None and turn_outcome is not None:
-        turn_outcome = with_budget_expiry(turn_outcome, _budget_expiry_state_with_staged_draft(ctx))
+        turn_outcome = with_budget_expiry(
+            turn_outcome.model_copy(update={"tool_calls": completed_tool_names(ctx)}),
+            _budget_expiry_state_with_staged_draft(ctx),
+        )
         output_files = _turn_output_files(ctx)
         if output_files:
             turn_outcome = turn_outcome.model_copy(update={"output_files": output_files})
@@ -2021,7 +2046,7 @@ def _make_agent_result(
     review_projection: NarrativeReviewProjection | None = (
         narrative_payload.get("review") if isinstance(narrative_payload, dict) else None
     )
-    turn_facts = _turn_facts_for_context(ctx, review_projection) if ctx is not None else None
+    turn_facts = turn_facts_for_context(ctx, review_projection) if ctx is not None else None
     response_type = kwargs.get("response_type", "REPLY")
     response_type_value = response_type if isinstance(response_type, str) else "REPLY"
     if ctx is not None:
@@ -2575,11 +2600,6 @@ async def _build_goal_satisfied_exit_result(
         ),
         blocked_signatures=ctx.blocked_reply_signatures,
         terminal_reason=terminal_reason,
-        tool_calls=[
-            str(entry.get("tool") or entry.get("name") or "")
-            for entry in ctx.tool_activity
-            if isinstance(entry, dict) and (entry.get("tool") or entry.get("name"))
-        ],
     )
     structured = StructuredContext.from_json_str(global_llm_context)
     structured.merge_turn_summary(ctx.tool_activity)
@@ -3334,11 +3354,6 @@ def _build_budget_expiry_exit_result(ctx: CopilotContext, global_llm_context: st
         attempted_kind=stopped_exit_response_kind(terminal_reason),
         blocked_signatures=ctx.blocked_reply_signatures,
         terminal_reason=terminal_reason,
-        tool_calls=[
-            str(entry.get("tool") or entry.get("name") or "")
-            for entry in ctx.tool_activity
-            if isinstance(entry, dict) and (entry.get("tool") or entry.get("name"))
-        ],
     )
     staged_workflow = ctx.staged_workflow if ctx.has_staged_proposal else None
     staged_workflow_yaml = ctx.staged_workflow_yaml if staged_workflow is not None else None
@@ -3394,7 +3409,50 @@ def _build_cancelled_exit_result(ctx: CopilotContext, global_llm_context: str | 
     recorded = outcome if isinstance(outcome, RecordedBuildTestOutcome) else None
     result.cancellation_last_recorded_phase = recorded.phase if recorded is not None else None
     result.cancellation_workflow_run_id = recorded.workflow_run_id if recorded is not None else None
+    stopped = stopped_turn_facts(ctx)
+    # A stop can hand back the last tested draft instead of the latest one, so name what that draft leaves out.
+    if (
+        stopped is not None
+        and result.updated_workflow is not None
+        and result.updated_workflow is not ctx.last_workflow
+        and result.workflow_yaml
+        and ctx.last_workflow_yaml
+    ):
+        stopped.changes_not_in_draft = display_labels_changed_between(ctx, result.workflow_yaml, ctx.last_workflow_yaml)
+    result.cancellation_stopped_facts = stopped
     return result
+
+
+def stopped_turn_facts(ctx: CopilotContext) -> StoppedTurnFacts | None:
+    labels = list(ctx.edited_block_labels_this_turn)
+    anchor = select_run_outcome_anchor(_run_outcome_trace(ctx))
+    # A repair turn is seeded with the run it was opened about; only a run this turn dispatched is its test.
+    run_id = anchor.workflow_run_id if anchor is not None else None
+    run = anchor if run_id is not None and run_id in ctx.dispatched_run_ids_this_turn else None
+    if run is None or run_id is None:
+        return StoppedTurnFacts(edited_block_labels=labels) if labels else None
+    facts = StoppedTurnFacts(
+        edited_block_labels=labels,
+        run_id=run_id,
+        run_started_before_last_edit=bool(labels) and ctx.edited_after_dispatch(run_id),
+    )
+    if is_interim_run_outcome(run):
+        return facts
+    facts.run_result_recorded = True
+    facts.verdict = run.verdict
+    facts.run_completed = run.run_completed
+    if run.verdict == "not_demonstrated":
+        facts.display_reason = (
+            redacted_terminal_text(scrub_secrets_from_text(ctx, run.display_reason)) if run.display_reason else None
+        )
+    recorded = ctx.latest_recorded_build_test_outcome
+    if isinstance(recorded, RecordedBuildTestOutcome) and recorded.workflow_run_id == run.workflow_run_id:
+        facts.block_rows = [
+            (display_block_label(ctx, fact.label), sanitize_block_label_for_display(fact.status))
+            for fact in recorded.recorded_block_outcome_facts
+        ]
+        facts.block_rows_omitted = recorded.recorded_block_outcome_rows_omitted
+    return facts
 
 
 def _record_budget_drain_exhausted(ctx: CopilotContext) -> None:
@@ -3830,6 +3888,13 @@ async def _translate_to_agent_result(
                 )
                 user_response = _with_inline_reject_note(user_response, inline_code_safety_block.error)
                 workflow_yaml = ""
+            if workflow_yaml:
+                vault_login_error = bitwarden_binding_change_error(workflow_yaml, ctx.request_policy)
+                if vault_login_error is None:
+                    workflow_yaml, vault_login_error = await import_bound_vault_logins(workflow_yaml, ctx)
+                if vault_login_error is not None:
+                    user_response = _with_inline_reject_note(user_response, vault_login_error)
+                    workflow_yaml = ""
             # Stale metadata and missing page evidence are both authoring quality, not disclosure: a
             # later test-run is what settles whether the draft works. They surface as a finding and
             # clear the test credit, so the draft survives but cannot be reported as verified.
@@ -3864,14 +3929,11 @@ async def _translate_to_agent_result(
             workflow_yaml, kept_note_labels, dropped_note_labels = carry_block_notes_from_versions(
                 workflow_yaml, ctx.last_workflow_yaml or ctx.workflow_yaml, ctx.persisted_workflow_yaml
             )
-            # Note text is included only where the person can see it; labels remain useful either way.
-            if dropped_note_labels:
-                note_sources = (
-                    (ctx.last_workflow_yaml or ctx.workflow_yaml, ctx.persisted_workflow_yaml)
-                    if copilot_sees_notes(ctx)
-                    else ()
+            # Without the Doc editor the person never sees notes, so a lost one is not mentioned at all.
+            if dropped_note_labels and copilot_sees_notes(ctx):
+                dropped_notes_note = _dropped_notes_message(
+                    dropped_note_labels, ctx.last_workflow_yaml or ctx.workflow_yaml, ctx.persisted_workflow_yaml
                 )
-                dropped_notes_note = _dropped_notes_message(dropped_note_labels, *note_sources)
             # Same seam as the update_workflow tool: redact before the row is written and before
             # the draft becomes the anchor, so both are the same string.
             workflow_yaml = redact_credentials_in_workflow_yaml(
@@ -3913,6 +3975,7 @@ async def _translate_to_agent_result(
     if resp_type == "REPLACE_WORKFLOW" and last_workflow is not ctx.last_workflow and not blocker_active:
         async with ctx.proposal_mutation_lock:
             publication_conflict: CopilotProposalConflictError | None = None
+            prior_draft_yaml = ctx.last_workflow_yaml or ctx.workflow_yaml
             if last_workflow is not None and last_workflow_yaml is not None:
                 try:
                     last_workflow_yaml = await publish_workflow_candidate(
@@ -3938,6 +4001,8 @@ async def _translate_to_agent_result(
                 last_workflow = ctx.last_workflow
                 last_workflow_yaml = ctx.last_workflow_yaml
             else:
+                if last_workflow_yaml is not None:
+                    record_edited_block_labels(ctx, prior_draft_yaml, last_workflow_yaml)
                 ctx.last_workflow = last_workflow
                 ctx.last_workflow_yaml = last_workflow_yaml
                 if dropped_notes_note:
@@ -4094,15 +4159,11 @@ async def _translate_to_agent_result(
         has_workflow_attempt=ctx.has_genuine_workflow_attempt(),
         terminal_reason=None,
     )
-    tool_call_names = [
-        str(entry.get("tool") or entry.get("name") or "") for entry in ctx.tool_activity if isinstance(entry, dict)
-    ]
     final_user_response, turn_outcome = apply_repeated_reply_guard(
         final_text=final_user_response,
         attempted_kind=attempted_kind,
         blocked_signatures=ctx.blocked_reply_signatures,
         terminal_reason=None,
-        tool_calls=[name for name in tool_call_names if name],
     )
     if connected_account_choices:
         turn_outcome = turn_outcome.model_copy(update={"connected_account_choices": connected_account_choices})
@@ -4648,8 +4709,6 @@ def _copy_output_policy_verdict(verdict: OutputPolicyVerdict) -> OutputPolicyVer
 def _blocked_final_output_kind(verdict: OutputPolicyVerdict) -> CopilotOutputKind:
     clarification_reasons = {
         OutputPolicyReason.CREDENTIAL_SCOPE_BROADENED,
-        OutputPolicyReason.CONNECTED_VAULT_LOGIN_OFF_SITE,
-        OutputPolicyReason.CONNECTED_VAULT_LOGIN_SITES_UNREAD,
     }
     if any(reason in clarification_reasons for reason in verdict.reason_codes):
         return CopilotOutputKind.CLARIFICATION_REQUEST
@@ -4918,18 +4977,6 @@ def _build_output_policy_blocked_result(
             "workflow without a tracked URL, re-select it so Copilot can confirm its URL scope."
         )
         add_saved_draft_copy = True
-    elif OutputPolicyReason.CONNECTED_VAULT_LOGIN_OFF_SITE in verdict.reason_codes:
-        user_response = (
-            "A Bitwarden login in this workflow is used on a site that isn't one of the login's saved websites. "
-            "Add that site to the login's websites in Bitwarden, or change the block URL to one of them."
-        )
-        add_saved_draft_copy = True
-    elif OutputPolicyReason.CONNECTED_VAULT_LOGIN_SITES_UNREAD in verdict.reason_codes:
-        user_response = (
-            "I couldn't read which websites a Bitwarden login in this workflow is saved for, so I didn't use it. "
-            "Check the Bitwarden connection in Settings and try again."
-        )
-        add_saved_draft_copy = True
     elif preserved_workflow is not None:
         user_response = (
             "I could not safely return that chat reply, but the workflow draft is still saved. "
@@ -5167,6 +5214,10 @@ async def run_copilot_agent(
                 return error_result
             finally:
                 turn_end_ctx = ctx_sink[0] if ctx_sink else None
+                if turn_end_ctx is not None:
+                    # Synchronous and first, so no later cleanup step that raises or is cancelled can leave a
+                    # minted browser stamped for the life of this process.
+                    end_minted_browser_renewals(turn_end_ctx)
                 _log_authoring_turn_summary(turn_end_ctx)
                 finalize_outcome_verification_trace(turn_end_ctx, turn_span)
                 if turn_end_ctx is not None:

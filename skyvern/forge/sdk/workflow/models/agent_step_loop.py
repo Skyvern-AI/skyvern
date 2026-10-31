@@ -9,6 +9,8 @@ from dataclasses import asdict, dataclass, field
 from datetime import UTC, datetime
 from typing import TYPE_CHECKING, Any
 
+import pydantic_core
+import structlog
 from agents import (
     Agent,
     FunctionTool,
@@ -33,6 +35,7 @@ from pydantic import ValidationError
 from skyvern.forge import app
 from skyvern.forge.sdk.api.llm.config_registry import LLMConfigRegistry
 from skyvern.forge.sdk.api.llm.copilot_model_usage import copilot_usage_observer
+from skyvern.forge.sdk.artifact.models import ArtifactType
 from skyvern.forge.sdk.copilot.cache_envelope import CacheableSystemInstructions
 from skyvern.forge.sdk.copilot.model_resolver import resolve_model_config
 from skyvern.forge.sdk.copilot.model_telemetry import (
@@ -44,6 +47,7 @@ from skyvern.forge.sdk.core import skyvern_context
 from skyvern.forge.sdk.executor.run_liveness import run_write_authority
 from skyvern.forge.sdk.models import Step, StepStatus
 from skyvern.forge.sdk.schemas.tasks import Task, TaskStatus
+from skyvern.forge.sdk.schemas.workflow_runs import WorkflowRunBlock
 from skyvern.forge.sdk.workflow.context_manager import WorkflowRunContext
 from skyvern.forge.sdk.workflow.models.agent_step_block import AgentStepBlock
 from skyvern.forge.sdk.workflow.models.agent_step_tools import (
@@ -71,6 +75,7 @@ from skyvern.utils.secret_redaction import redact_secrets_from_text
 if TYPE_CHECKING:
     from skyvern.core.script_generations.script_skyvern_page import ScriptSkyvernPage
 
+LOG = structlog.get_logger()
 _MAX_TOOL_RESULT_CHARS = 20_000
 _MASK = "*****"
 
@@ -106,6 +111,8 @@ class _RunState:
     # None offers every tool.
     tools: list[str] | None = None
     calls: list[dict[str, Any]] = field(default_factory=list)
+    # The report each child block returned, by label, so read_run_data can page the text the model was shown.
+    results: dict[str, dict[str, Any]] = field(default_factory=dict)
     answer: dict[str, Any] | None = None
     drained: bool = False
     # The SDK starts one response's tool calls as concurrent tasks even with parallel_tool_calls=False, and providers
@@ -150,8 +157,9 @@ def _in_turn(
 
 class _LoopHooks(RunHooks[Any]):
     # Canceling a run only writes its row, so the loop re-reads the run before every model call and tool.
-    def __init__(self, state: _RunState) -> None:
+    def __init__(self, state: _RunState, block_row: WorkflowRunBlock) -> None:
         self.state = state
+        self.block_row = block_row
         # Per model call, so usage survives a run that raises and sums the retry and max-turns runs.
         self.usage = Usage()
 
@@ -163,9 +171,18 @@ class _LoopHooks(RunHooks[Any]):
         input_items: list[TResponseInputItem],
     ) -> None:
         await _raise_if_run_ended(self.state)
+        tools = [
+            {"name": tool.name, "description": tool.description, "parameters": tool.params_json_schema}
+            for tool in agent.tools
+            if isinstance(tool, FunctionTool)
+        ]
+        await self._store(
+            ArtifactType.LLM_REQUEST, {"system_prompt": system_prompt, "tools": tools, "input": input_items}
+        )
 
     async def on_llm_end(self, context: RunContextWrapper[Any], agent: Agent[Any], response: ModelResponse) -> None:
         self.usage.add(response.usage)
+        await self._store(ArtifactType.LLM_RESPONSE, {"output": response.output, "usage": response.usage})
         self.state.call_order = [item.call_id for item in response.output if isinstance(item, ResponseFunctionToolCall)]
         refusals = [
             part.refusal
@@ -180,6 +197,20 @@ class _LoopHooks(RunHooks[Any]):
             refusals = ["The provider's content filter stopped the response."]
         if refusals:
             raise _Refused(" ".join(refusals))
+
+    async def _store(self, artifact_type: ArtifactType, payload: dict[str, object]) -> None:
+        try:
+            data = json.dumps(pydantic_core.to_jsonable_python(payload)).encode("utf-8")
+            await app.ARTIFACT_MANAGER.create_workflow_run_block_artifacts(
+                workflow_run_block=self.block_row, artifacts=[(artifact_type, data)]
+            )
+        except Exception:
+            LOG.warning(
+                "Failed to store agent step model call",
+                artifact_type=artifact_type,
+                workflow_run_block_id=self.block_row.workflow_run_block_id,
+                exc_info=True,
+            )
 
 
 def _record_call(state: _RunState, written: object, **call: str) -> None:
@@ -312,11 +343,20 @@ def _run_block_tool(state: _RunState, block_types: list[str]) -> FunctionTool:
     )
 
 
-def _tool_text(report: dict[str, Any], run_context: WorkflowRunContext) -> str:
-    text = redact_secrets_from_text(
+def _masked_text(report: dict[str, Any], run_context: WorkflowRunContext) -> str:
+    return redact_secrets_from_text(
         json.dumps(run_context.mask_secrets_in_data(report), default=str), Block._registered_secret_values(run_context)
     )
-    return text if len(text) <= _MAX_TOOL_RESULT_CHARS else text[:_MAX_TOOL_RESULT_CHARS] + " ...[truncated]"
+
+
+def _window(text: str, offset: int = 0, name: str | None = None) -> str:
+    end = offset + _MAX_TOOL_RESULT_CHARS
+    if offset == 0 and end >= len(text):
+        return text
+    notice = f"characters {offset} to {min(end, len(text))} of {len(text)}."
+    if name is not None and end < len(text):
+        notice += f" read_run_data(name={json.dumps(name)}, offset={end}) returns the next ones."
+    return f"{text[offset:end]} ...[{notice}]"
 
 
 def _template_literal(text: str) -> str:
@@ -343,7 +383,10 @@ def _run_tool(
         except Exception as e:
             report = {"status": "failed", "output": None, "error": f"{type(e).__name__}: {e}"}
         _record_call(state, written, tool=name, status=report["status"])
-        return _tool_text(report, state.run_context)
+        # A read_run_data window is already masked text cut from a longer result.
+        if name == "read_run_data" and report["status"] == "completed":
+            return report["output"]
+        return _window(_masked_text(report, state.run_context))
 
     return FunctionTool(
         name=name,
@@ -388,6 +431,16 @@ async def _read_run_data(state: _RunState, name: str | None = None) -> object:
     if file := next((file for file in files if file.filename == name), None):
         return file.model_dump(mode="json")
     raise ValueError(f"Nothing in this run is named {name!r}. Call read_run_data without a name for the names.")
+
+
+async def _read_run_data_window(state: _RunState, name: str | None = None, offset: int = 0) -> str:
+    report = state.results.get(name) if name is not None else None
+    if report is None:
+        report = {"status": "completed", "output": await _read_run_data(state, name), "error": None}
+    text = _masked_text(report, state.run_context)
+    if not isinstance(offset, int) or not 0 <= offset < len(text):
+        raise ValueError(f"offset must be from 0 to {len(text) - 1} for this result.")
+    return _window(text, offset, name)
 
 
 @asynccontextmanager
@@ -469,7 +522,7 @@ async def _page_extract(
 
 _TEXT = {"type": "string"}
 _RUN_TOOLS: tuple[tuple[str, dict[str, Any], list[str], Callable[..., Awaitable[Any]]], ...] = (
-    ("read_run_data", {"name": _TEXT}, [], _read_run_data),
+    ("read_run_data", {"name": _TEXT, "offset": {"type": "integer", "minimum": 0}}, [], _read_run_data_window),
     ("page_goto", {"url": _TEXT}, ["url"], _page_goto),
     ("page_click", {"prompt": _TEXT}, ["prompt"], _page_click),
     ("page_fill", {"prompt": _TEXT, "value": _TEXT}, ["prompt", "value"], _page_fill),
@@ -479,24 +532,23 @@ if {name for name, *_ in _RUN_TOOLS} != set(RUN_TOOL_DESCRIPTIONS):
     raise RuntimeError("_RUN_TOOLS and RUN_TOOL_DESCRIPTIONS must name the same tools.")
 
 
+def _offers(state: _RunState, name: str) -> bool:
+    return state.tools is None or name in state.tools
+
+
 def _tools(state: _RunState) -> list[FunctionTool]:
-    listed = None if state.tools is None else set(state.tools)
-
-    def offered(name: str) -> bool:
-        return listed is None or name in listed
-
-    block_types = [name for name in RUN_BLOCK_TYPES if offered(name)]
+    block_types = [name for name in RUN_BLOCK_TYPES if _offers(state, name)]
     return [
         *(
             _dedicated_tool(block_type, tool, state)
             for name, (block_type, tool) in DEDICATED_BLOCK_TOOLS.items()
-            if offered(name) and ("credential" not in tool.fields or state.credential_keys)
+            if _offers(state, name) and ("credential" not in tool.fields or state.credential_keys)
         ),
         *([_run_block_tool(state, block_types)] if block_types else []),
         *(
             _run_tool(name, RUN_TOOL_DESCRIPTIONS[name], properties, required, run, state)
             for name, properties, required, run in _RUN_TOOLS
-            if offered(name)
+            if _offers(state, name)
         ),
     ]
 
@@ -545,7 +597,8 @@ async def _run_child_block(
                 await state.run_context.register_aws_secret_parameter_value(parameter)
         report = await _execute_child(child, written, state)
     _record_call(state, written, tool=tool_name, block_type=block_type.value, label=label, status=report["status"])
-    return _tool_text(report, state.run_context)
+    state.results[label] = report
+    return _window(_masked_text(report, state.run_context), 0, label if _offers(state, "read_run_data") else None)
 
 
 async def _execute_child(child: Block, written: dict[str, Any], state: _RunState) -> dict[str, Any]:
@@ -578,6 +631,7 @@ async def run_agent_step(
     workflow_run_block_id: str,
     organization_id: str | None,
     browser_session_id: str | None,
+    block_row: WorkflowRunBlock,
 ) -> BlockResult:
     run_context = block.get_workflow_run_context(workflow_run_id)
     state = _RunState(
@@ -615,7 +669,7 @@ async def run_agent_step(
             is_final_output=state.answer is not None, final_output=state.answer
         ),
     )
-    hooks = _LoopHooks(state)
+    hooks = _LoopHooks(state, block_row)
     costs: list[float] = []
     stop_reason, status = "completed", BlockStatus.completed
     failure_reason: str | None = None
@@ -651,11 +705,28 @@ async def run_agent_step(
         }
 
     async def save(value: dict[str, Any]) -> None:
-        if organization_id:
-            await app.DATABASE.observer.increment_workflow_run_block_llm_cost(
-                workflow_run_block_id=workflow_run_block_id, organization_id=organization_id, amount=sum(costs)
+        try:
+            if organization_id:
+                await app.DATABASE.observer.increment_workflow_run_block_llm_cost(
+                    workflow_run_block_id=workflow_run_block_id, organization_id=organization_id, amount=sum(costs)
+                )
+            await block.record_output_parameter_value(run_context, workflow_run_id, value)
+            # Shielded so a timeout during the normal exit does not cancel the model-call uploads still in flight.
+            try:
+                await asyncio.shield(app.ARTIFACT_MANAGER.wait_for_upload_aiotasks([workflow_run_block_id]))
+            except Exception:
+                LOG.warning(
+                    "Failed to upload agent step model calls",
+                    workflow_run_block_id=workflow_run_block_id,
+                    exc_info=True,
+                )
+        finally:
+            await app.AGENT_FUNCTION.post_agent_step_execution(
+                organization_id,
+                workflow_run_id,
+                workflow_run_block_id,
+                decisions=sum(1 for call in state.calls if call["tool"] != "finish"),
             )
-        await block.record_output_parameter_value(run_context, workflow_run_id, value)
 
     try:
         with copilot_usage_observer(lambda event: costs.append(event.cost or 0.0)), model_attempt_telemetry_scope():
@@ -693,23 +764,25 @@ async def run_agent_step(
                 else "The agent block ended without calling finish."
             )
 
-    if state.task and state.step:
-        await app.ARTIFACT_MANAGER.flush_step_archive(state.step.step_id)
-        await app.DATABASE.tasks.update_step(
-            task_id=state.task.task_id,
-            step_id=state.step.step_id,
-            organization_id=organization_id,
-            write_authority_for_run=run_write_authority,
-            status={BlockStatus.completed: StepStatus.completed, BlockStatus.failed: StepStatus.failed}.get(
-                status, StepStatus.canceled
-            ),
-        )
-        await app.DATABASE.tasks.update_task(
-            task_id=state.task.task_id, organization_id=organization_id, status=TaskStatus(status.value)
-        )
-
     value = output(stop_reason)
-    await save(value)
+    try:
+        await save(value)
+    finally:
+        if state.task and state.step:
+            await app.ARTIFACT_MANAGER.flush_step_archive(state.step.step_id)
+            await app.DATABASE.tasks.update_step(
+                task_id=state.task.task_id,
+                step_id=state.step.step_id,
+                organization_id=organization_id,
+                write_authority_for_run=run_write_authority,
+                status={BlockStatus.completed: StepStatus.completed, BlockStatus.failed: StepStatus.failed}.get(
+                    status, StepStatus.canceled
+                ),
+            )
+            await app.DATABASE.tasks.update_task(
+                task_id=state.task.task_id, organization_id=organization_id, status=TaskStatus(status.value)
+            )
+
     return await block.build_block_result(
         success=status == BlockStatus.completed,
         failure_reason=failure_reason

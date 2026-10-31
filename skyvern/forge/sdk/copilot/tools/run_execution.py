@@ -238,7 +238,7 @@ from skyvern.forge.sdk.copilot.turn_halt import (
     stash_turn_halt_from_blocker_signal,
 )
 from skyvern.forge.sdk.copilot.turn_origin import TurnOrigin
-from skyvern.forge.sdk.copilot.workflow_credential_utils import CONNECTED_VAULT_ID_PREFIX
+from skyvern.forge.sdk.copilot.workflow_credential_utils import LEGACY_BITWARDEN_PARAM_ID_PREFIX
 from skyvern.forge.sdk.copilot.workflow_yaml import (
     _process_workflow_yaml,
     runner_code_block_associations,
@@ -347,6 +347,7 @@ from .credentials import (
     _google_sheet_connection_bindings_from_workflow_definition,
     _retire_stale_google_connection_denial,
     _server_verified_google_account_choices,
+    run_input_vault_placement_error,
 )
 from .frontier import (
     FrontierRequest,
@@ -390,6 +391,8 @@ _ZIP_MAGIC_PREFIXES = (b"PK\x03\x04", b"PK\x05\x06", b"PK\x07\x08")
 
 # 5 s balances how quickly a terminal row is noticed against DB load (240 polls worst case at the safety ceiling).
 RUN_BLOCKS_POLL_INTERVAL_SECONDS = 5.0
+# Bounds how long this process stamps a kept browser whose run never reports final, after the turn that minted it.
+_KEPT_RUN_ACTIVITY_RENEWAL_CAP_SECONDS = 20 * 60
 
 COPILOT_SANDBOX_UNAVAILABLE_ERROR = "Sandboxed worker is unavailable; execution was not started."
 COPILOT_SNAPSHOT_PREPARATION_ERROR = "Unable to prepare the Copilot test-run snapshot; execution was not started."
@@ -3382,8 +3385,8 @@ async def _bind_origin_run_redaction_registry(
     awaiting_runtime_secret_values = False
     credential_parameters: dict[str, Any] = {}
     for index, credential_id in enumerate(credential_ids):
-        if credential_id.startswith(CONNECTED_VAULT_ID_PREFIX):
-            # The worker reads a connected-vault login itself, so its values arrive with the terminal handoff.
+        if credential_id.startswith(LEGACY_BITWARDEN_PARAM_ID_PREFIX):
+            # The worker reads a Bitwarden item itself, so its values arrive with the terminal handoff.
             sensitive_values_complete = False
             continue
         await app.AGENT_FUNCTION.enforce_credential_use(
@@ -3556,6 +3559,20 @@ async def _run_in_a_minted_browser_is_still_live(session_id: str, run_id: str, o
         return True
 
 
+async def _renew_kept_browser_activity(session_id: str) -> None:
+    # Ends when the deferred close cancels it, which waits out descendant runs too, or at the cap.
+    try:
+        try:
+            await app.BROWSER_MANAGER.begin_session_activity_renewal(session_id)
+        except Exception:
+            LOG.warning(
+                "Failed to start activity renewal for a kept browser", browser_session_id=session_id, exc_info=True
+            )
+        await asyncio.sleep(_KEPT_RUN_ACTIVITY_RENEWAL_CAP_SECONDS)
+    finally:
+        app.BROWSER_MANAGER.end_session_activity_renewal(session_id)
+
+
 async def close_minted_browser_sessions(ctx: CopilotContext) -> None:
     """Close the browsers this turn minted, at the end of the turn that is their only reader.
 
@@ -3573,8 +3590,12 @@ async def close_minted_browser_sessions(ctx: CopilotContext) -> None:
             LOG.info("copilot_minted_browser_kept_for_live_run", browser_session_id=session_id, run_id=run_id)
 
             async def _close_when_idle() -> None:
-                while await _run_in_a_minted_browser_is_still_live(session_id, run_id, ctx.organization_id):
-                    await asyncio.sleep(RUN_BLOCKS_POLL_INTERVAL_SECONDS)
+                renewal = asyncio.create_task(_renew_kept_browser_activity(session_id))
+                try:
+                    while await _run_in_a_minted_browser_is_still_live(session_id, run_id, ctx.organization_id):
+                        await asyncio.sleep(RUN_BLOCKS_POLL_INTERVAL_SECONDS)
+                finally:
+                    renewal.cancel()
                 await _close(session_id, None)
 
             task = asyncio.create_task(_close_when_idle())
@@ -4295,16 +4316,16 @@ async def _run_blocks_and_collect_debug(
         approval_credential_ids,
         ctx.request_policy,
         additional_approved_ids=dispatch_scoped_sheet_ids,
-        workflow_definition=workflow.workflow_definition,
     )
     if credential_approval_error is not None:
         return {"ok": False, "error": credential_approval_error}
 
-    credential_error = await _credential_ids_validation_error(
-        credential_ids, ctx, workflow_definition=workflow.workflow_definition
-    )
+    credential_error = await _credential_ids_validation_error(credential_ids, ctx)
     if credential_error is not None:
         return {"ok": False, "error": credential_error}
+    placement_error = await run_input_vault_placement_error(workflow.workflow_definition, params.get("parameters"), ctx)
+    if placement_error is not None:
+        return {"ok": False, "error": placement_error}
 
     from skyvern.forge.sdk.schemas.organizations import Organization
     from skyvern.forge.sdk.workflow.models.workflow import WorkflowRequestBody
@@ -4960,7 +4981,7 @@ async def _run_blocks_and_collect_debug(
                     **proposal_conflict_result(ctx, lost="The test was not run.", reason=reason, adoption=adoption),
                     "data": {"run_dispatched": False, _PROPOSAL_BIND_REFUSED_KEY: True},
                 }
-        ctx.dispatched_run_ids_this_turn.add(workflow_run.workflow_run_id)
+        ctx.record_dispatched_run(workflow_run.workflow_run_id)
         ctx.pending_test_inputs[workflow_run.workflow_run_id] = test_input_sources
         # A seeded producer's value belongs to the run that produced it, never to this one.
         seeded_only_labels = frozenset(block_outputs_to_seed) - frozenset(labels_that_may_execute)
@@ -6683,7 +6704,7 @@ def _record_run_blocks_result(
     run_id = data.get("workflow_run_id") if isinstance(data, dict) else None
     if isinstance(run_id, str) and run_id:
         copilot_ctx.block_run_calls_this_turn = _runs_this_turn(copilot_ctx) + 1
-        copilot_ctx.dispatched_run_ids_this_turn.add(run_id)
+        copilot_ctx.record_dispatched_run(run_id)
     # ADR-0025: interactive authoring has no post-run adjudicator. Keep the
     # argument temporarily for callers/tests while making it deliberately inert;
     # the unattended page-observation self-heal verifier remains a separate lane.

@@ -165,6 +165,7 @@ from skyvern.forge.sdk.experimentation.workflow_block_engine import (
     unset_engine_routes_as_v1,
 )
 from skyvern.forge.sdk.forge_log import exception_log_fields
+from skyvern.forge.sdk.integrations.catalog import integration_is_live
 from skyvern.forge.sdk.models import Step, StepStatus
 from skyvern.forge.sdk.schemas.browser_profiles import BrowserProfile
 from skyvern.forge.sdk.schemas.credentials import Credential, credential_auto_profile_disabled
@@ -247,6 +248,7 @@ from skyvern.forge.sdk.workflow.models.block import (
     NavigationBlock,
     PdfFillBlock,
     PDFParserBlock,
+    PowerBIQueryBlock,
     SplitPdfBlock,
     TaskV2Block,
     TextPromptBlock,
@@ -1275,6 +1277,75 @@ def _extract_blocks_info(blocks: list[BLOCK_YAML_TYPES]) -> list[dict[str, str]]
 
         blocks_info.append(info)
     return blocks_info
+
+
+async def _validate_powerbi_workflow_save(
+    organization_id: str,
+    workflow_definition: WorkflowDefinition,
+    *,
+    workflow_id: str | None = None,
+    workflow_permanent_id: str | None = None,
+) -> None:
+    powerbi_live = integration_is_live("powerbi")
+
+    if powerbi_live and workflow_permanent_id is None and workflow_id is not None:
+        if any(isinstance(block, WorkflowTriggerBlock) for block in get_all_blocks(workflow_definition.blocks)):
+            current_workflow = await app.DATABASE.workflows.get_workflow(workflow_id, organization_id=organization_id)
+            if current_workflow is None:
+                raise SkyvernHTTPException(
+                    "Could not verify Power BI workflow trigger sources.",
+                    status_code=HTTPStatus.BAD_REQUEST,
+                    error_code="trigger_parent_source_unconfirmed",
+                )
+            workflow_permanent_id = current_workflow.workflow_permanent_id
+
+    root_key = workflow_permanent_id
+    definitions: dict[str | None, WorkflowDefinition] = {root_key: workflow_definition}
+    direct_connection_ids: list[str] = []
+
+    async def collect_workflows(definition: WorkflowDefinition, depth: int = 0) -> None:
+        blocks = get_all_blocks(definition.blocks)
+        powerbi_blocks = [block for block in blocks if isinstance(block, PowerBIQueryBlock)]
+        direct_connection_ids.extend(block.connection_id for block in powerbi_blocks)
+        if not powerbi_live or depth >= WorkflowTriggerBlock.MAX_TRIGGER_DEPTH:
+            return
+        for block in blocks:
+            if not isinstance(block, WorkflowTriggerBlock):
+                continue
+            target = block.workflow_permanent_id
+            if not target or "{{" in target or "{%" in target:
+                continue
+            if target in definitions:
+                continue
+            workflow = await app.DATABASE.workflows.get_workflow_by_permanent_id(
+                workflow_permanent_id=target,
+                organization_id=organization_id,
+            )
+            if workflow is not None:
+                definitions[target] = workflow.workflow_definition
+                await collect_workflows(workflow.workflow_definition, depth + 1)
+
+    await collect_workflows(workflow_definition)
+
+    connection_ids = list(dict.fromkeys(direct_connection_ids))
+    if not connection_ids:
+        return
+    if any(
+        not isinstance(value, str) or not value.strip() or "{{" in value or "{%" in value for value in connection_ids
+    ):
+        raise SkyvernHTTPException(
+            "Power BI connection_id must be a literal credential ID.",
+            status_code=HTTPStatus.BAD_REQUEST,
+            error_code="invalid_powerbi_connection_id",
+        )
+    try:
+        await app.AGENT_FUNCTION.ensure_powerbi_queries_available()
+    except NotImplementedError as exc:
+        raise SkyvernHTTPException(
+            "Power BI queries are not supported in this runtime.",
+            status_code=HTTPStatus.FORBIDDEN,
+            error_code="powerbi_unavailable",
+        ) from exc
 
 
 async def generate_title_from_blocks_info(
@@ -12201,6 +12272,7 @@ class WorkflowService:
             await self._read_overwritten_workflow(workflow_id, organization_id) if pinned_v1_blocks else None
         )
         if workflow_definition is not None:
+            await _validate_powerbi_workflow_save(organization_id or "", workflow_definition, workflow_id=workflow_id)
             if validate_code_block_templates:
                 self._validate_code_block_templates(workflow_definition)
             self._validate_block_engines(workflow_definition)
@@ -17856,9 +17928,11 @@ class WorkflowService:
                 workflow_id=runtime_workflow.workflow_id,
                 organization_id=organization_id,
             )
-            cdp_connect_headers = merge_masked_headers(
-                cdp_connect_headers, source.cdp_connect_headers if source is not None else None
-            )
+            if source is None:
+                # Do not persist unverified raw header values when their source version is unavailable.
+                cdp_connect_headers = None
+            else:
+                cdp_connect_headers = merge_masked_headers(cdp_connect_headers, source.cdp_connect_headers)
 
         async def insert_placeholder(version: int) -> Workflow:
             return await self.create_workflow(
@@ -18043,6 +18117,9 @@ class WorkflowService:
         )
         preserve_workflow_definition_secrets(workflow_definition, None, request.workflow_definition)
         workflow_definition.validate()
+        await _validate_powerbi_workflow_save(
+            organization_id, workflow_definition, workflow_permanent_id=workflow_permanent_id
+        )
         self.validate_workflow_block_graph(workflow_definition)
         self._validate_payload_templates(workflow_definition)
         self._validate_new_code_block_safety(workflow_definition, None)

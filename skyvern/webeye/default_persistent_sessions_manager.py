@@ -1011,6 +1011,7 @@ class DefaultPersistentSessionsManager(PersistentSessionsManager):
         proxy_location: ProxyLocationInput,
         browser_profile_id: str | None,
         session_kind: BrowserSessionKind,
+        created_for_workflow_permanent_id: str | None = None,
     ) -> FreshExitReceipt:
         return FreshExitReceipt(
             outcome=FreshExitOutcome.no_alternate,
