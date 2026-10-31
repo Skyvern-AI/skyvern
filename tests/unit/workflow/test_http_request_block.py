@@ -12,6 +12,7 @@ from aiohttp import web
 from structlog.testing import capture_logs
 
 from skyvern.forge.sdk.core import aiohttp_helper
+from skyvern.forge.sdk.credential_site_policy import LoginSite
 from skyvern.forge.sdk.workflow.context_manager import RANDOM_SECRET_ID_PREFIX, WorkflowRunContext
 from skyvern.forge.sdk.workflow.models import block as block_module
 from skyvern.forge.sdk.workflow.models.block import (
@@ -44,6 +45,7 @@ def _make_context(
     context.browser_session_id = None
     context.mask_secrets = False
     context.credential_tested_urls = {}
+    context.bitwarden_login_sites = {}
     return context
 
 
@@ -1113,6 +1115,46 @@ class TestHttpRequestBlockCredentialSiteConfinement:
         result = await block.execute(workflow_run_id="wr-1", workflow_run_block_id="wrb-1")
 
         assert result.success is True
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("tested_url", [None, "https://app.example.com/login"])
+    @pytest.mark.parametrize(
+        ("url", "sent_expected"),
+        [
+            ("https://app.example.com/session", True),
+            ("https://other.example.com/session", False),
+            ("https://collector.example.net/ingest", False),
+        ],
+    )
+    async def test_execute_confines_a_vault_login_to_its_host_match_site(
+        self, monkeypatch: pytest.MonkeyPatch, tested_url: str | None, url: str, sent_expected: bool
+    ) -> None:
+        context = _context_with_credential(tested_url)
+        context.bitwarden_login_sites = {"login_credentials": [LoginSite("https://app.example.com", whole_site=False)]}
+        context.workflow = MagicMock(created_by="copilot", edited_by="copilot")
+        block = _http_block(url=url, body={"password": "{{ login_credentials.password }}"})
+        sent: dict[str, object] = {}
+
+        async def fake_aiohttp_request(**kwargs: object) -> tuple[int, dict[str, str], dict[str, object]]:
+            sent.update(kwargs)
+            return 200, {"Content-Type": "application/json"}, {"ok": True}
+
+        monkeypatch.setattr(HttpRequestBlock, "get_workflow_run_context", lambda _self, _workflow_run_id: context)
+        monkeypatch.setattr(block_module, "aiohttp_request", fake_aiohttp_request)
+        monkeypatch.setattr(block_module.app, "DATABASE", AsyncMock())
+
+        result = await block.execute(workflow_run_id="wr-1", workflow_run_block_id="wrb-1")
+
+        assert result.success is sent_expected
+        if not sent_expected:
+            assert result.failure_reason is not None
+            assert "login_credentials" in result.failure_reason
+            assert sent == {}
+            return
+        authorize = sent["authorize_redirect"]
+        assert callable(authorize)
+        assert authorize("https://app.example.com/next") is True
+        assert authorize("https://other.example.com/next") is False
 
     @pytest.mark.asyncio
     async def test_execute_sends_a_credential_without_a_tested_url(self, monkeypatch: pytest.MonkeyPatch) -> None:

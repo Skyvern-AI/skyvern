@@ -15,6 +15,7 @@ import { FileDownloadBlockForm } from "./BlockConfigForm/FileDownloadBlockForm";
 import { FileParserBlockForm } from "./BlockConfigForm/FileParserBlockForm";
 import { FileUploadBlockForm } from "./BlockConfigForm/FileUploadBlockForm";
 import { GoogleSheetsReadBlockForm } from "./BlockConfigForm/GoogleSheetsReadBlockForm";
+import { PowerBIQueryBlockForm } from "./BlockConfigForm/PowerBIQueryBlockForm";
 import { GoogleSheetsWriteBlockForm } from "./BlockConfigForm/GoogleSheetsWriteBlockForm";
 import { WebSearchBlockForm } from "./BlockConfigForm/WebSearchBlockForm";
 import { HttpRequestBlockForm } from "./BlockConfigForm/HttpRequestBlockForm";
@@ -34,6 +35,7 @@ import { URLBlockForm } from "./BlockConfigForm/URLBlockForm";
 import { UploadBlockForm } from "./BlockConfigForm/UploadBlockForm";
 import { ValidationBlockForm } from "./BlockConfigForm/ValidationBlockForm";
 import { TerminateBlockForm } from "./BlockConfigForm/TerminateBlockForm";
+import { AgentStepBlockForm } from "./BlockConfigForm/AgentStepBlockForm";
 import { WaitBlockForm } from "./BlockConfigForm/WaitBlockForm";
 import { WorkflowSettingsBlockForm } from "./BlockConfigForm/WorkflowSettingsBlockForm";
 import { WorkflowTriggerBlockForm } from "./BlockConfigForm/WorkflowTriggerBlockForm";
@@ -51,6 +53,7 @@ const BLOCK_FORMS: Record<WorkflowBlockNodeType, BlockFormComponent> = {
   login: LoginBlockForm,
   wait: WaitBlockForm,
   terminate: TerminateBlockForm,
+  agentStep: AgentStepBlockForm,
   loop: LoopBlockForm,
   conditional: ConditionalBlockForm,
   textPrompt: TextPromptBlockForm,
@@ -73,6 +76,7 @@ const BLOCK_FORMS: Record<WorkflowBlockNodeType, BlockFormComponent> = {
   workflowTrigger: WorkflowTriggerBlockForm,
   googleSheetsRead: GoogleSheetsReadBlockForm,
   googleSheetsWrite: GoogleSheetsWriteBlockForm,
+  powerBIQuery: PowerBIQueryBlockForm,
   splitPdf: SplitPdfBlockForm,
   dataExport: DataExportBlockForm,
 };

@@ -2,7 +2,7 @@ from collections.abc import Collection, Mapping
 from dataclasses import dataclass
 from datetime import datetime
 
-from sqlalchemy import delete, or_, select, update
+from sqlalchemy import and_, delete, not_, or_, select, tuple_, update
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.dialects.sqlite import insert as sqlite_insert
 
@@ -10,6 +10,9 @@ from skyvern.forge.sdk.db._error_handling import db_operation
 from skyvern.forge.sdk.db.base_repository import BaseRepository
 from skyvern.forge.sdk.db.datetime_utils import naive_utc_now
 from skyvern.forge.sdk.db.models import RunExecutionLeaseModel
+
+# The orphaned run reaper claims leases under its process owner id plus this suffix.
+REAPER_OWNER_SUFFIX = ":reaper"
 
 
 @dataclass(frozen=True)
@@ -48,15 +51,28 @@ class RunExecutionLeasesRepository(BaseRepository):
                             key: stmt.excluded[key]
                             for key in ("run_type", "owner_id", "attempt_number", "heartbeat_at")
                         },
+                        # A stale reaper-owned lease marks a failed run whose reaper repair is unfinished;
+                        # only another reaper (via claim) may take it over.
                         where=or_(
                             RunExecutionLeaseModel.owner_id == owner_id,
-                            RunExecutionLeaseModel.heartbeat_at < stale_before,
+                            and_(
+                                RunExecutionLeaseModel.heartbeat_at < stale_before,
+                                not_(RunExecutionLeaseModel.owner_id.endswith(REAPER_OWNER_SUFFIX)),
+                            ),
                         ),
                     ).returning(RunExecutionLeaseModel.run_id)
                 )
                 acquired.update(result.scalars().all())
             await session.commit()
             return acquired
+
+    @db_operation("has_reaper_run_execution_lease")
+    async def has_reaper_lease(self, run_id: str) -> bool:
+        async with self.Session() as session:
+            owner = await session.scalar(
+                select(RunExecutionLeaseModel.owner_id).where(RunExecutionLeaseModel.run_id == run_id)
+            )
+            return owner is not None and owner.endswith(REAPER_OWNER_SUFFIX)
 
     @db_operation("renew_run_execution_leases")
     async def renew(self, owner_id: str, run_ids: Collection[str]) -> set[str]:
@@ -87,14 +103,16 @@ class RunExecutionLeasesRepository(BaseRepository):
             await session.commit()
 
     @db_operation("get_expired_run_execution_leases")
-    async def get_expired(self, heartbeat_before: datetime, limit: int = 500) -> list[RunExecutionLease]:
+    async def get_expired(
+        self, heartbeat_before: datetime, limit: int = 500, after: tuple[datetime, str] | None = None
+    ) -> list[RunExecutionLease]:
+        query = select(RunExecutionLeaseModel).where(RunExecutionLeaseModel.heartbeat_at < heartbeat_before)
+        if after is not None:
+            query = query.where(tuple_(RunExecutionLeaseModel.heartbeat_at, RunExecutionLeaseModel.run_id) > after)
         async with self.Session() as session:
             rows = (
                 await session.scalars(
-                    select(RunExecutionLeaseModel)
-                    .where(RunExecutionLeaseModel.heartbeat_at < heartbeat_before)
-                    .order_by(RunExecutionLeaseModel.heartbeat_at)
-                    .limit(limit)
+                    query.order_by(RunExecutionLeaseModel.heartbeat_at, RunExecutionLeaseModel.run_id).limit(limit)
                 )
             ).all()
             return [

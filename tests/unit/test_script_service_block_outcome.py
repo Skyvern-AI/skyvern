@@ -10,12 +10,15 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 from playwright.async_api import Error as PlaywrightError
 
+from skyvern.core.script_generations import real_skyvern_page_ai
 from skyvern.core.script_generations.real_skyvern_page_ai import RealSkyvernPageAi
 from skyvern.core.script_generations.script_skyvern_page import ScriptRunContextManager, ScriptSkyvernPage
 from skyvern.core.script_generations.skyvern_page import RunContext
 from skyvern.exceptions import BROWSER_CONNECTION_LOST_ERROR_CODE, MissingBrowserState, ScriptTerminationException
 from skyvern.forge import app
+from skyvern.forge.prompts import prompt_engine
 from skyvern.forge.sdk.core import skyvern_context
+from skyvern.forge.sdk.core.skyvern_context import SkyvernContext
 from skyvern.forge.sdk.schemas.tasks import TaskStatus
 from skyvern.forge.sdk.workflow.context_manager import BlockOutcome, WorkflowRunContext
 from skyvern.forge.sdk.workflow.models.block import (
@@ -32,9 +35,11 @@ from skyvern.forge.sdk.workflow.models.block import (
     ValidationBlock,
     WhileLoopBlock,
 )
-from skyvern.forge.sdk.workflow.models.workflow import WorkflowRunStatus
-from skyvern.schemas.workflows import BlockResult, BlockStatus, BlockType
+from skyvern.forge.sdk.workflow.models.workflow import Workflow, WorkflowRunStatus
+from skyvern.forge.sdk.workflow.workflow_definition_converter import convert_workflow_definition
+from skyvern.schemas.workflows import BlockResult, BlockStatus, BlockType, WorkflowDefinitionYAML
 from skyvern.services import script_service
+from skyvern.webeye.utils.challenge_solve_record import ChallengeSolveReceipt
 from tests.unit._task_block_fakes import run_bound_browser_state
 from tests.unit.conftest import make_block_output_parameter
 from tests.unit.helpers import make_organization, make_task
@@ -627,3 +632,225 @@ async def test_outcome_record_failure_does_not_skip_cached_output(monkeypatch: p
     await script_service._update_workflow_block("wrb_cached", BlockStatus.completed, label="cached")
 
     record_output.assert_awaited_once()
+
+
+def _noted_workflow_context(
+    workflow_system_prompt: str | None = None, check_out_extra: dict[str, object] | None = None
+) -> WorkflowRunContext:
+    """`check_out` has a note; `open_page` sits above it and reads it too; `confirm` reads none."""
+    blocks = [
+        {"block_type": "navigation", "label": label, "url": "https://example.com", "navigation_goal": label, **extra}
+        for label, extra in (
+            ("open_page", {}),
+            ("check_out", {"notes": "Never click Delete.", **(check_out_extra or {})}),
+            ("confirm", {}),
+        )
+    ]
+    definition = convert_workflow_definition(
+        workflow_definition_yaml=WorkflowDefinitionYAML.model_validate(
+            {"parameters": [], "blocks": blocks, "workflow_system_prompt": workflow_system_prompt}
+        ),
+        workflow_id="wf",
+    )
+    now = datetime.now(timezone.utc)
+    workflow = Workflow(
+        workflow_id="wf",
+        organization_id="o_cached",
+        title="test",
+        workflow_permanent_id="wpid",
+        version=1,
+        is_saved_task=False,
+        workflow_definition=definition,
+        created_at=now,
+        modified_at=now,
+    )
+    return WorkflowRunContext(
+        workflow_title="test",
+        workflow_id="wf",
+        workflow_permanent_id="wpid",
+        workflow_run_id="wr_cached",
+        aws_client=AsyncMock(),
+        workflow=workflow,
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("helper", ["run_task", "action", "login"])
+async def test_cached_step_ai_calls_carry_its_notes_and_unnoted_steps_send_the_prompts_main_sends(
+    cached_run: SimpleNamespace, monkeypatch: pytest.MonkeyPatch, helper: str
+) -> None:
+    monkeypatch.setattr(
+        app.WORKFLOW_CONTEXT_MANAGER, "get_workflow_run_context", MagicMock(return_value=_noted_workflow_context())
+    )
+    classify_prompts: list[str] = []
+
+    async def secondary_llm(prompt: str, **_: object) -> dict[str, Any]:
+        classify_prompts.append(prompt)
+        return {"classification": "UNKNOWN"}
+
+    monkeypatch.setattr(real_skyvern_page_ai, "get_org_aware_secondary_llm_api_handler", lambda default: secondary_llm)
+    seen: dict[str, dict[str, str | None]] = {}
+
+    async def cached_step(page: object, context: object) -> None:
+        ai = RealSkyvernPageAi(SimpleNamespace(extracted_text="Order 42"), SimpleNamespace(url="https://example.com"))
+        monkeypatch.setattr(ai, "_refresh_scraped_page", AsyncMock())
+        monkeypatch.setattr(ai, "_record_branch_hit", AsyncMock())
+        await ai.ai_classify({"done": "Order placed"})
+        goal = skyvern_context.ensure_context().prompt
+        label = skyvern_context.ensure_context().cached_block_label or ""
+        seen[label] = {"goal": goal, "act_and_locate": ai._with_step_notes(goal), "classify": classify_prompts[-1]}
+
+    cached_helper = getattr(script_service, helper)
+    for label in ("check_out", "confirm"):
+        cached_run.manager.set_cached_fn(label, cached_step)
+        await cached_helper(prompt=f"Goal of {label}", label=label, cache_key=label)
+
+    assert seen["check_out"]["act_and_locate"] == "Goal of check_out\n\nNotes for this step:\nNever click Delete."
+    assert "Notes for this step:\nNever click Delete." in (seen["check_out"]["classify"] or "")
+
+    unnoted = seen["confirm"]
+    assert unnoted["act_and_locate"] == unnoted["goal"] == "Goal of confirm"
+    # The exact arguments main renders page-classify with: no goal, no notes.
+    assert unnoted["classify"] == prompt_engine.load_prompt(
+        template="page-classify",
+        current_url="https://example.com",
+        extracted_text="Order 42",
+        options={"done": "Order placed"},
+    )
+    assert cached_run.run_context.cached_block_label is None
+
+
+@pytest.mark.asyncio
+async def test_the_task_a_cached_step_falls_back_to_carries_its_notes_only_when_it_has_some(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The AI fallback runs the task created for the cached block, and the agent reads its workflow_system_prompt."""
+    monkeypatch.setattr(
+        app.WORKFLOW_CONTEXT_MANAGER,
+        "get_workflow_run_context",
+        MagicMock(return_value=_noted_workflow_context(workflow_system_prompt="Be careful.")),
+    )
+    now = datetime.now(timezone.utc)
+    organization = make_organization(now)
+    created: list[str | None] = []
+
+    async def create_task(**fields: Any) -> Any:
+        created.append(fields.get("workflow_system_prompt"))
+        return make_task(now, organization, task_id=f"tsk_{len(created)}")
+
+    monkeypatch.setattr(
+        app.DATABASE.observer,
+        "create_workflow_run_block",
+        AsyncMock(return_value=SimpleNamespace(workflow_run_block_id="wrb")),
+    )
+    monkeypatch.setattr(app.DATABASE.observer, "update_workflow_run_block", AsyncMock())
+    monkeypatch.setattr(app.DATABASE.tasks, "create_task", create_task)
+    monkeypatch.setattr(app.DATABASE.tasks, "create_step", AsyncMock(return_value=SimpleNamespace(step_id="stp")))
+    monkeypatch.setattr(script_service, "_resolve_block_termination_config", AsyncMock(return_value=(None, None)))
+    monkeypatch.setattr(app.AGENT_FUNCTION, "is_recipe_step_attempt", AsyncMock(return_value=False))
+    monkeypatch.setattr(app.AGENT_FUNCTION, "validate_step_execution", AsyncMock())
+    run_context = skyvern_context.SkyvernContext(
+        organization_id="o_cached", workflow_id="wf", workflow_run_id="wr_cached", script_mode=True
+    )
+
+    with skyvern_context.scoped(run_context):
+        for label in ("check_out", "confirm"):
+            await script_service._create_workflow_block_run_and_task(
+                block_type=BlockType.NAVIGATION, prompt=label, label=label
+            )
+
+    assert created == ["Be careful.\n\nNotes for this step:\nNever click Delete.", None]
+
+
+@pytest.mark.asyncio
+async def test_validate_and_prompt_inside_a_cached_step_read_its_notes_and_unnoted_steps_keep_mains_system_prompt(
+    cached_run: SimpleNamespace, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    workflow_context = _noted_workflow_context(workflow_system_prompt="Be careful.")
+    monkeypatch.setattr(
+        app.WORKFLOW_CONTEXT_MANAGER, "get_workflow_run_context", MagicMock(return_value=workflow_context)
+    )
+    system_prompts: dict[tuple[str, str], str | None] = {}
+
+    async def execute_safe(self: Block, **_: object) -> BlockResult:
+        # The block's own execute materializes the system prompt it sends; the agent and LLM edges stop here.
+        self._apply_workflow_system_prompt(workflow_context)
+        step = skyvern_context.ensure_context().cached_block_label or ""
+        system_prompts[(step, type(self).__name__)] = self.workflow_system_prompt
+        return BlockResult(
+            success=True,
+            output_parameter=self.output_parameter,
+            output_parameter_value={},
+            status=BlockStatus.completed,
+        )
+
+    monkeypatch.setattr(ValidationBlock, "execute_safe", execute_safe)
+    monkeypatch.setattr(TextPromptBlock, "execute_safe", execute_safe)
+
+    async def cached_step(page: object, context: object) -> None:
+        ai = RealSkyvernPageAi(MagicMock(), MagicMock())
+        await ai.ai_validate("The order is placed")
+        await ai.ai_prompt("Summarize the order")
+
+    for label in ("check_out", "confirm"):
+        cached_run.manager.set_cached_fn(label, cached_step)
+        await script_service.run_task(prompt=f"Goal of {label}", label=label, cache_key=label)
+
+    noted = "Be careful.\n\nNotes for this step:\nNever click Delete."
+    assert system_prompts == {
+        ("check_out", "ValidationBlock"): noted,
+        ("check_out", "TextPromptBlock"): noted,
+        ("confirm", "ValidationBlock"): "Be careful.",
+        ("confirm", "TextPromptBlock"): "Be careful.",
+    }
+
+
+def test_a_prompt_that_fails_to_render_does_not_fail_cached_step_creation(monkeypatch: pytest.MonkeyPatch) -> None:
+    context = MagicMock()
+    context.resolve_noted_block_system_prompt.side_effect = ZeroDivisionError
+    monkeypatch.setattr(app.WORKFLOW_CONTEXT_MANAGER, "get_workflow_run_context", MagicMock(return_value=context))
+
+    assert script_service._noted_block_system_prompt("wr_1", "check_out") is None
+
+
+def test_an_opted_out_block_on_the_cached_path_gets_only_its_notes() -> None:
+    context = _noted_workflow_context(
+        workflow_system_prompt="Be careful.", check_out_extra={"ignore_workflow_system_prompt": True}
+    )
+
+    prompt = context.resolve_noted_block_system_prompt("check_out")
+
+    assert prompt is not None and "Never click Delete." in prompt and "Be careful." not in prompt
+
+
+@pytest.mark.asyncio
+async def test_the_script_user_error_call_reads_the_tasks_recorded_solves_in_its_one_call(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    now = datetime(2026, 8, 1)
+    task = make_task(now, make_organization(now), error_code_mapping={"BOT_WALL": "A bot check blocked the form"})
+    task.started_at = now
+    scraped = MagicMock(url="https://site.test/form", screenshots=[], build_element_tree=lambda *_: "<form/>")
+    run_context = MagicMock()
+    run_context.page.scraped_page.refresh = AsyncMock(return_value=scraped)
+    monkeypatch.setattr(script_service.script_run_context_manager, "ensure_run_context", lambda: run_context)
+    prompts: list[str] = []
+
+    async def handler(*, prompt: str, **_: Any) -> dict[str, Any]:
+        prompts.append(prompt)
+        return {"errors": [{"error_code": "BOT_WALL", "reasoning": "unsolved check", "confidence_float": 0.8}]}
+
+    monkeypatch.setattr(app, "EXTRACTION_LLM_API_HANDLER", handler)
+    receipt = ChallengeSolveReceipt(
+        task.task_id, datetime(2026, 8, 1, 0, 1, tzinfo=timezone.utc), "hcaptcha", "unsolved", "unknown", task.task_id
+    )
+
+    with skyvern_context.scoped(SkyvernContext(task_id=task.task_id)) as context:
+        context.challenge_solve_receipts.append(receipt)
+        errors = await script_service._detect_user_defined_errors(
+            task, MagicMock(), "wr_1", task.error_code_mapping or {}
+        )
+
+    [prompt] = prompts
+    assert '"service": "hcaptcha", "outcome": "unsolved", "page_state": "unknown", "unresolved": true' in prompt
+    assert [error.error_code for error in errors] == ["BOT_WALL"]

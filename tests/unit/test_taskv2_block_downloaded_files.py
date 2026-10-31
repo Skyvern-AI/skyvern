@@ -123,6 +123,7 @@ async def test_taskv2_block_uses_pre_run_loop_state_for_download_filtering(
             workflow_runs=SimpleNamespace(
                 get_workflow_run=AsyncMock(side_effect=[outer_workflow_run, child_workflow_run]),
                 update_workflow_run=AsyncMock(),
+                update_workflow_run_if_not_final=AsyncMock(),
             ),
             observer=SimpleNamespace(
                 update_task_v2=AsyncMock(),
@@ -169,6 +170,7 @@ async def test_taskv2_block_uses_pre_run_loop_state_for_download_filtering(
         return completed_task_v2
 
     monkeypatch.setattr(task_v2_service, "run_task_v2", fake_run_task_v2)
+    monkeypatch.setattr(task_v2_service, "settle_child_of_ended_parent", AsyncMock(return_value=None))
 
     recorded_outputs: list[dict[str, object]] = []
     block = TaskV2Block(

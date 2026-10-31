@@ -76,6 +76,7 @@ from skyvern.exceptions import (
     IllegitComplete,
     ImaginaryFileUrl,
     ImaginarySecretValue,
+    InputElementCoveredByUntypeableElement,
     InputToInvisibleElement,
     InputToReadonlyElement,
     InteractWithDisabledElement,
@@ -109,6 +110,7 @@ from skyvern.exceptions import (
 )
 from skyvern.experimentation.wait_utils import get_or_create_wait_config, get_wait_time
 from skyvern.forge import app
+from skyvern.forge.antibot_evidence import prompt_evidence_str
 from skyvern.forge.prompts import prompt_engine
 from skyvern.forge.sdk.api.files import (
     GuardedFileFetchHopResult,
@@ -229,6 +231,7 @@ from skyvern.webeye.browser_factory import (
     resolve_artifact_path,
     was_download_cancelled_by_skyvern,
 )
+from skyvern.webeye.browser_object_predicates import is_page_like
 from skyvern.webeye.browser_state import BLANK_PAGE_URLS, BrowserState, get_browser_connection_loss
 from skyvern.webeye.cdp_download_interceptor import (
     BROWSER_DOWNLOAD_EVENT_ADMISSION_GRACE_SECONDS,
@@ -240,7 +243,7 @@ from skyvern.webeye.cdp_download_interceptor import (
     false_click_download_attribution_is_quiescent,
     finish_requested_download_for_context,
     has_download_interceptor_for_context,
-    is_download_response,
+    has_download_response_headers,
     normalize_download_filename,
     publish_download_bytes_for_context,
     redacted_exception_origin,
@@ -4603,14 +4606,14 @@ class AutoCompletionResult(BaseModel):
     action_result: ActionResult = ActionSuccess()
 
 
-# Upstream HTTP statuses that count as download-failure evidence; adjacent 5xx (501/505/507/...) are excluded.
+# Common XHR/fetch statuses retained for diagnostics; Document responses accept every HTTP 5xx for attribution.
 _OBSERVED_DOWNLOAD_FAILURE_STATUSES = frozenset({500, 502, 503, 504})
 # Hard cap on the per-action set of xhr/fetch requests eligible for passive status observation. Bounds
 # retained request-object references under a request storm; at the cap we stop tracking new requests
 # (logging once) instead of growing without limit.
 _MAX_STATUS_OBSERVATION_REQUESTS = 64
-# Grace after seal_in_flight_requests() during which a newly initiated xhr/fetch can still enter status
-# observation. Bounds the observation window to the action plus a JS-initiated second hop, so an unrelated
+# Grace after seal_in_flight_requests() during which a newly initiated xhr/fetch or Document can still enter
+# status observation. Bounds the observation window to the action plus a JS-initiated second hop, so an unrelated
 # heartbeat/poll fired minutes into the long download-wait loop can never stamp download_failure_status.
 _STATUS_OBSERVATION_POST_SEAL_GRACE_SECONDS = 2.0
 
@@ -4632,20 +4635,24 @@ class ScopedXhrDownloadCapture:
         download_dir: Path,
         timeout_seconds: float = BROWSER_DOWNLOAD_TIMEOUT,
         monotonic: Callable[[], float] = time.monotonic,
+        target_frame: Page | Frame | None = None,
     ) -> None:
         self._page = page
         self._download_dir = download_dir
         self._timeout_seconds = timeout_seconds
         self._monotonic = monotonic
+        self._attributable_frames = {page.main_frame}
+        if target_frame is not None:
+            self._attributable_frames.add(target_frame.main_frame if is_page_like(target_frame) else target_frame)
         self._saved: set[str] = set()
         self._extra_pages: list[Page] = []
         self._capture_responses = False
         self._active = False
         self._accept_new_requests = False
-        # Passive, site-agnostic status observation: records only a server 5xx integer status for any
-        # xhr/fetch request initiated during this download action's window. No URL, host, header, body,
-        # or other request detail is ever retained.
+        # XHR/fetch status remains diagnostic; only a 5xx Document response in the main or action-target
+        # frame is attributable without initiator instrumentation.
         self._observed_download_failure_status: int | None = None
+        self._attributed_download_failure_status: int | None = None
         # Response-body drain count is separate from request-lifecycle tracking for the bounded wait extension.
         self._in_flight = 0
         self._response_tasks: set[asyncio.Task[None]] = set()
@@ -4657,10 +4664,9 @@ class ScopedXhrDownloadCapture:
         # flight before this action (never seen by _on_request) is excluded. Bounded by
         # _MAX_STATUS_OBSERVATION_REQUESTS; never gates wait extension.
         self._status_observation_requests: set[Request] = set()
-        # Child pages whose bootstrap provenance was established while inside the observation window.
-        # A bootstrap hop on such a page stays observation-eligible after the deadline (proven
-        # action-owned); a child page first seen at/after the deadline is admitted for wait extension
-        # but never grants observation provenance, so its 5xx cannot become action-caused evidence.
+        # Child pages whose bootstrap provenance and main frame were established inside the observation
+        # window. A bootstrap hop on such a page stays observation-eligible after the deadline (proven
+        # action-owned); a child page first seen at/after the deadline never grants either attribution.
         self._status_observation_child_pages: set[Page] = set()
         self._status_observation_capped = False
         # Monotonic deadline for admitting NEW requests into status observation. None until seal, meaning
@@ -4681,6 +4687,10 @@ class ScopedXhrDownloadCapture:
     def observed_download_failure_status(self) -> int | None:
         return self._observed_download_failure_status
 
+    @property
+    def attributed_download_failure_status(self) -> int | None:
+        return self._attributed_download_failure_status
+
     def _within_status_observation_window(self) -> bool:
         deadline = self._status_observation_deadline
         if deadline is None:
@@ -4688,7 +4698,22 @@ class ScopedXhrDownloadCapture:
         return self._monotonic() < deadline
 
     def _on_request(self, request: Request) -> None:
-        if not self._active or request.resource_type not in ("xhr", "fetch"):
+        if not self._active:
+            return
+
+        resource_type = request.resource_type
+        if resource_type == "document":
+            # A Document request is evidence only if it began during this action window; it never extends
+            # the download wait, and its redirects retain the initiating request's observation scope.
+            if request.redirected_from is None and not self._within_status_observation_window():
+                return
+            self._maybe_observe_request(
+                request,
+                child_page_has_bootstrap_allowance=False,
+                bootstrap_provenance_in_window=False,
+            )
+            return
+        if resource_type not in ("xhr", "fetch"):
             return
 
         redirected_from_admitted_request = request.redirected_from in self._admitted_requests
@@ -4783,15 +4808,19 @@ class ScopedXhrDownloadCapture:
     def _is_xhr_download(self, headers: dict[str, str], status: int) -> bool:
         """Check if an XHR response carries a downloadable file body.
 
-        Reuses ``is_download_response`` for attachment cases. For inline
+        Uses the shared response-header classifier for attachment cases. For inline
         responses, additionally accepts download MIME + explicit filename
-        (the case ``is_download_response`` intentionally rejects for the
-        global CDP path to avoid false positives on PDF previews).
+        (the case the global CDP path intentionally rejects to avoid false positives
+        on PDF previews).
         """
-        if is_download_response(headers, status, resource_type="XHR"):
-            return True
-        if status >= 400:
+        if status >= 300:
             return False
+        return self._has_xhr_download_response_headers(headers)
+
+    @staticmethod
+    def _has_xhr_download_response_headers(headers: dict[str, str]) -> bool:
+        if has_download_response_headers(headers, resource_type="XHR"):
+            return True
         content_type = headers.get("content-type", "").split(";")[0].strip().lower()
         content_disposition = headers.get("content-disposition", "")
         if content_type not in DOWNLOAD_MIME_TYPES:
@@ -4809,20 +4838,30 @@ class ScopedXhrDownloadCapture:
         task.add_done_callback(self._on_response_done)
 
     def _observe_download_failure_status(self, response: Response) -> None:
-        """Record a server 5xx status for an xhr/fetch request initiated during this download action's window.
+        """Record scoped xhr/fetch failures for diagnostics and frame-scoped Document 5xx attribution.
 
         Runs on Playwright's event loop for every response while the capture is attached, including the
-        CDP-interceptor lane where response-body capture is off. Observation is scoped by window
-        membership (_status_observation_requests), NOT by wait-extension admission: a JS-initiated second
-        hop that starts after seal is still observed, while a request already in flight before this action
-        (never seen by _on_request) is excluded so it cannot become action-caused evidence. Stores only
-        the integer status — no URL, host, or header — and never raises into the event loop.
+        CDP-interceptor lane where response-body capture is off. XHR/fetch status remains diagnostic;
+        Document status is attributable only in the main or action-target frame. No URL, header, or body
+        data is retained, and this callback never raises into the event loop.
         """
         try:
             if response.request not in self._status_observation_requests:
                 return
             status = response.status
-            if not isinstance(status, int) or status not in _OBSERVED_DOWNLOAD_FAILURE_STATUSES:
+            if not isinstance(status, int):
+                return
+
+            resource_type = response.request.resource_type
+            if resource_type == "document":
+                if not 500 <= status < 600:
+                    return
+                self._observed_download_failure_status = status
+                if response.request.frame in self._attributable_frames:
+                    self._attributed_download_failure_status = status
+                return
+
+            if resource_type not in ("xhr", "fetch") or status not in _OBSERVED_DOWNLOAD_FAILURE_STATUSES:
                 return
             self._observed_download_failure_status = status
         except Exception:
@@ -5650,12 +5689,26 @@ class ActionHandler:
         staging_dir = Path(
             tempfile.mkdtemp(prefix="xhr_staging_", dir=get_run_temp_dir(task.organization_id, run_id or task.task_id))
         )
+        download_target_frame: Page | Frame | None = None
+        if isinstance(action, WebAction) and action.element_id:
+            target_frame_id = scraped_page.id_to_frame_dict.get(action.element_id)
+            target_css = scraped_page.id_to_css_dict.get(action.element_id)
+            if target_frame_id and target_frame_id != "main.frame" and target_css:
+                try:
+                    _, download_target_frame = await resolve_locator(scraped_page, page, target_frame_id, target_css)
+                except Exception:
+                    LOG.debug(
+                        "Could not resolve download action target frame for HTTP failure attribution",
+                        element_id=action.element_id,
+                        exc_info=True,
+                    )
         xhr_capture = ScopedXhrDownloadCapture(
             page,
             staging_dir,
             timeout_seconds=float(task.download_timeout)
             if task.download_timeout is not None
             else BROWSER_DOWNLOAD_TIMEOUT,
+            target_frame=download_target_frame,
         )
         download_triggered = False
         working_page_recovery_attempted = False
@@ -6254,6 +6307,8 @@ class ActionHandler:
                 observed_failure_status = xhr_capture.observed_download_failure_status
                 if observed_failure_status is not None:
                     results[-1].download_failure_status = observed_failure_status
+                if (attributed_failure_status := xhr_capture.attributed_download_failure_status) is not None:
+                    results[-1].mark_download_failure_attributed(attributed_failure_status)
             if browser_state is not None and download_triggered:
                 # get the page count after download
                 pages_after_download = await browser_state.list_valid_pages()
@@ -6292,11 +6347,14 @@ class ActionHandler:
             download_error = finish_requested_download_for_context(page.context, requested_download_token)
             if download_error is not None and "results" in locals() and results:
                 preserved_download_failure_status = results[-1].download_failure_status
+                preserved_attributed_failure_status = results[-1].attributed_download_failure_status
                 results[-1] = ActionFailure(
                     Exception(download_error["reasoning"]),
                     download_triggered=download_triggered,
                 )
                 results[-1].download_failure_status = preserved_download_failure_status
+                if preserved_attributed_failure_status is not None:
+                    results[-1].mark_download_failure_attributed(preserved_attributed_failure_status)
             if "results" in locals() and results:
                 action.status = _terminal_action_status(results)
             persisted_action = await app.DATABASE.workflow_params.create_action(
@@ -10093,6 +10151,26 @@ async def _handle_input_text_action(
             dom=dom, incremental_page=incremental_scraped
         )
         if blocking_element and exist and await blocking_element.is_editable():
+            # is_editable() answers for a <label>'s control, so a pop-up's radio label covering the
+            # field reports editable while every fill routed through it is rejected by type. Refuse
+            # only on a positive read, so an unreadable blocker keeps the long-standing retarget.
+            if await blocking_element.accepts_text_fill() is False:
+                blocking_tag_name = blocking_element.get_tag_name().lower()
+                LOG.info(
+                    "The element is covered by a blocking element that can't take text; not typing into it",
+                    element_id=skyvern_element.get_id(),
+                    blocking_element_id=blocking_element.get_id(),
+                    blocking_tag_name=blocking_tag_name,
+                )
+                return [
+                    ActionFailure(
+                        InputElementCoveredByUntypeableElement(
+                            element_id=skyvern_element.get_id(),
+                            blocking_element_id=blocking_element.get_id(),
+                            blocking_tag_name=blocking_tag_name,
+                        )
+                    )
+                ]
             LOG.warning(
                 "Find a blocking element to the current element, going to input on the blocking element",
             )
@@ -17370,6 +17448,7 @@ async def extract_user_defined_errors(
         current_url=scraped_page_refreshed.url,
         action_history=json.dumps(action_history),
         error_code_mapping_str=json.dumps(task.error_code_mapping) if task.error_code_mapping else "{}",
+        antibot_evidence_str=prompt_evidence_str(task),
         local_datetime=datetime.now(skyvern_context.ensure_context().tz_info).isoformat(),
         reasoning=reasoning,
     )

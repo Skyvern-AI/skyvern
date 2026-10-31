@@ -1,12 +1,14 @@
 from __future__ import annotations
 
+from datetime import datetime
 from typing import TYPE_CHECKING, Any, Callable
 
 import structlog
-from sqlalchemy import and_, delete, func, select, update
+from sqlalchemy import and_, delete, func, or_, select, update
 from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.orm import aliased
 
+from skyvern.forge.failure_classifier import DIAGNOSABLE_FAILURE_STATUSES, has_classifier_primary, with_diagnostic_entry
 from skyvern.forge.sdk.db._error_handling import db_operation
 from skyvern.forge.sdk.db.base_alchemy_db import read_retry
 from skyvern.forge.sdk.db.base_repository import BaseRepository
@@ -15,11 +17,14 @@ from skyvern.forge.sdk.db.exceptions import NotFoundError
 
 if TYPE_CHECKING:
     from skyvern.forge.sdk.db.base_alchemy_db import _SessionFactory
+    from skyvern.forge.sdk.executor.run_liveness import BlockOutcomeAuthority
 
 from skyvern.forge.sdk.db.models import (
+    RunExecutionLeaseModel,
     TaskV2Model,
     ThoughtModel,
     WorkflowRunBlockModel,
+    WorkflowRunModel,
 )
 from skyvern.forge.sdk.db.protocols import TaskReader
 from skyvern.forge.sdk.db.utils import (
@@ -32,11 +37,23 @@ from skyvern.forge.sdk.db.utils import (
 )
 from skyvern.forge.sdk.schemas.task_v2 import TaskV2, TaskV2Status, Thought, ThoughtType
 from skyvern.forge.sdk.schemas.workflow_runs import WorkflowRunBlock
+from skyvern.forge.sdk.services.audit_events import record_run_cancel_audit
+from skyvern.forge.sdk.services.request_principal import RequestPrincipal
 from skyvern.forge.sdk.utils.sanitization import sanitize_postgres_text
 from skyvern.schemas.runs import ProxyLocationInput, RunEngine, ScriptRunResponse
 from skyvern.schemas.workflows import BlockStatus, BlockType
 
 LOG = structlog.get_logger()
+
+
+def _lease_authorizes_block(lease_row: Any, expected_owner: str, block_attempt_number: int | None) -> bool:
+    # Attempt identity: an unset attempt on either side is attempt 1, so a same-process successor attempt's lease
+    # cannot authorize the earlier attempt's row.
+    return (
+        lease_row is not None
+        and lease_row.owner_id == expected_owner
+        and (lease_row.attempt_number or 1) == (block_attempt_number or 1)
+    )
 
 
 class ObserverRepository(BaseRepository):
@@ -356,6 +373,7 @@ class ObserverRepository(BaseRepository):
         status: TaskV2Status,
         *,
         failure_category: list[dict[str, Any]] | None = None,
+        audit_actor: RequestPrincipal | None = None,
     ) -> bool:
         now = naive_utc_now()
         values: dict[str, Any] = {"status": status.value, "modified_at": now}
@@ -376,6 +394,8 @@ class ObserverRepository(BaseRepository):
             )
             won = result.scalar_one_or_none() is not None
             await session.commit()
+            if won and status == TaskV2Status.canceled and audit_actor is not None:
+                await record_run_cancel_audit(audit_actor, organization_id, "task", task_v2_id)
             return won
 
     @db_operation("update_task_v2")
@@ -436,6 +456,52 @@ class ObserverRepository(BaseRepository):
                 await session.refresh(task_v2)
                 return convert_to_task_v2(task_v2, debug_enabled=self.debug_enabled)
             raise NotFoundError(f"TaskV2 {task_v2_id} not found")
+
+    @db_operation("set_task_v2_final_failure_diagnostic")
+    async def set_final_failure_diagnostic(
+        self,
+        task_v2_id: str,
+        organization_id: str,
+        workflow_run_id: str,
+        entry: dict[str, Any],
+        workflow_run_finished_at: datetime,
+    ) -> TaskV2 | None:
+        """Mirror the workflow run's diagnostic onto its failed task v2; None when the task v2 is not that run's
+        failure, has no classifier primary, which the entry would otherwise become, or the run is no longer the
+        execution that finished at ``workflow_run_finished_at``."""
+        async with self.Session() as session:
+            # Parent first, held shared to commit: a reset rewriting the run's finish waits for, or beats, this copy.
+            run = (
+                await session.scalars(
+                    select(WorkflowRunModel.workflow_run_id)
+                    .filter_by(workflow_run_id=workflow_run_id, organization_id=organization_id)
+                    .where(WorkflowRunModel.finished_at == workflow_run_finished_at)
+                    .where(WorkflowRunModel.status.in_(DIAGNOSABLE_FAILURE_STATUSES))
+                    .with_for_update(read=True)
+                )
+            ).first()
+            if run is None:
+                return None
+            task_v2 = (
+                await session.scalars(
+                    select(TaskV2Model)
+                    .filter_by(
+                        observer_cruise_id=task_v2_id, organization_id=organization_id, workflow_run_id=workflow_run_id
+                    )
+                    .with_for_update()
+                    .execution_options(populate_existing=True)
+                )
+            ).first()
+            if (
+                task_v2 is None
+                or task_v2.status not in DIAGNOSABLE_FAILURE_STATUSES
+                or not has_classifier_primary(task_v2.failure_category)
+            ):
+                return None
+            task_v2.failure_category = with_diagnostic_entry(task_v2.failure_category, entry)
+            await session.commit()
+            await session.refresh(task_v2)
+            return convert_to_task_v2(task_v2, debug_enabled=self.debug_enabled)
 
     @db_operation("create_workflow_run_block")
     async def create_workflow_run_block(
@@ -545,6 +611,7 @@ class ObserverRepository(BaseRepository):
         executed_branch_expression: str | None = None,
         executed_branch_result: bool | None = None,
         executed_branch_next_block: str | None = None,
+        outcome_authority_for_run: Callable[[str], BlockOutcomeAuthority | None] | None = None,
     ) -> WorkflowRunBlock:
         # Read before truncation: the jsonb storage guard strips downloaded_files from
         # oversized payloads, which would zero out an otherwise-real count.
@@ -554,14 +621,63 @@ class ObserverRepository(BaseRepository):
             context={"workflow_run_block_id": workflow_run_block_id},
         )
         async with self.Session() as session:
-            workflow_run_block = (
-                await session.scalars(
-                    select(WorkflowRunBlockModel)
-                    .filter_by(workflow_run_block_id=workflow_run_block_id)
-                    .filter_by(organization_id=organization_id)
+            block_query = (
+                select(WorkflowRunBlockModel)
+                .filter_by(workflow_run_block_id=workflow_run_block_id)
+                .filter_by(organization_id=organization_id)
+            )
+            expected_owner: str | None = None
+            attempt_superseded = False
+            lease_row = None
+            target = None
+            if outcome_authority_for_run is not None:
+                target = (
+                    await session.execute(
+                        select(WorkflowRunBlockModel.workflow_run_id, WorkflowRunBlockModel.attempt_number)
+                        .filter_by(workflow_run_block_id=workflow_run_block_id)
+                        .filter_by(organization_id=organization_id)
+                    )
+                ).one_or_none()
+                authority = outcome_authority_for_run(target.workflow_run_id) if target is not None else None
+                if authority is not None:
+                    # A row belongs to one attempt; a registration for another attempt (even one still acquiring
+                    # its lease) is a successor, so the older row is fenced off.
+                    attempt_superseded = (authority.attempt_number or 1) != (target.attempt_number or 1)
+                    if not attempt_superseded and authority.lease_acquired:
+                        expected_owner = authority.owner_id
+                        # Lease row first, then block row: a reaper claim (lease UPDATE) waits for this write to
+                        # commit, and a later cleanup cascade waits on the block row and then skips the final status.
+                        lease_row = (
+                            await session.execute(
+                                select(RunExecutionLeaseModel.owner_id, RunExecutionLeaseModel.attempt_number)
+                                .where(RunExecutionLeaseModel.run_id == target.workflow_run_id)
+                                .with_for_update(read=True)
+                            )
+                        ).one_or_none()
+                        block_query = block_query.with_for_update()
+            workflow_run_block = (await session.scalars(block_query)).first()
+            if outcome_authority_for_run is not None and target is not None:
+                # Re-resolve after the lock waits with no await before the commit's flush: another attempt may have
+                # registered while this write waited, before its lease acquisition reached the row.
+                current = outcome_authority_for_run(target.workflow_run_id)
+                attempt_superseded = attempt_superseded or (
+                    current is not None and (current.attempt_number or 1) != (target.attempt_number or 1)
                 )
-            ).first()
-            if workflow_run_block:
+            refused = workflow_run_block is not None and (
+                attempt_superseded
+                or (
+                    expected_owner is not None
+                    and not _lease_authorizes_block(lease_row, expected_owner, workflow_run_block.attempt_number)
+                )
+            )
+            if refused and workflow_run_block is not None:
+                LOG.info(
+                    "Refused a block outcome write from an execution that no longer owns the run",
+                    workflow_run_block_id=workflow_run_block_id,
+                    workflow_run_id=workflow_run_block.workflow_run_id,
+                    block_attempt_number=workflow_run_block.attempt_number,
+                )
+            elif workflow_run_block:
                 if status:
                     workflow_run_block.status = status
                 if output:
@@ -665,6 +781,7 @@ class ObserverRepository(BaseRepository):
         only_if_status_in: list[str],
         failure_reason: str | None = None,
         organization_id: str | None = None,
+        attempt_number: int | None = None,
     ) -> int:
         if not only_if_status_in:
             return 0
@@ -680,6 +797,13 @@ class ObserverRepository(BaseRepository):
             # rather than the `IS NULL` a filter_by would generate.
             if organization_id is not None:
                 stmt = stmt.where(WorkflowRunBlockModel.organization_id == organization_id)
+            if attempt_number is not None:
+                stmt = stmt.where(
+                    or_(
+                        WorkflowRunBlockModel.attempt_number == attempt_number,
+                        WorkflowRunBlockModel.attempt_number.is_(None),
+                    )
+                )
             stmt = stmt.where(WorkflowRunBlockModel.status.in_(only_if_status_in)).values(**update_values)
             result = await session.execute(stmt)
             await session.commit()

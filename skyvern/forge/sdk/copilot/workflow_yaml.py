@@ -40,12 +40,16 @@ from skyvern.forge.sdk.workflow.private_settings import (
     resolve_totp_verification_url,
     resolve_webhook_callback_url,
 )
+from skyvern.forge.sdk.workflow.secret_encryption import (
+    definition_has_inline_secret_fields,
+    mask_workflow_definition_secrets,
+    preserve_workflow_definition_secrets,
+)
 from skyvern.forge.sdk.workflow.workflow_definition_converter import convert_workflow_definition
 from skyvern.schemas.proxy_location import GeoTarget
 from skyvern.schemas.runs import ProxyLocation, RunEngine
 from skyvern.schemas.workflows import (
     BlockYAML,
-    BranchConditionYAML,
     ConditionalBlockYAML,
     ForLoopBlockYAML,
     LoginBlockYAML,
@@ -173,7 +177,9 @@ def private_workflow_settings_from_yaml(workflow_yaml: str | None) -> dict[str, 
         return {}
     if not isinstance(data, dict):
         return {}
-    return {key: data[key] for key in _PRIVATE_WORKFLOW_SETTINGS_FIELDS if key in data}
+    settings = {key: data[key] for key in _PRIVATE_WORKFLOW_SETTINGS_FIELDS if key in data}
+    _canonicalize_copilot_proxy_location(settings)
+    return settings
 
 
 def with_private_workflow_settings(
@@ -250,7 +256,7 @@ def runner_code_block_associations(
     return associations
 
 
-def _strip_runtime_block_fields(block: dict[str, Any]) -> dict[str, Any]:
+def strip_runtime_block_fields(block: dict[str, Any]) -> dict[str, Any]:
     cleaned = deepcopy(block)
     cleaned.pop("output_parameter", None)
     cleaned.pop("workflow_system_prompt", None)
@@ -276,7 +282,7 @@ def _strip_runtime_block_fields(block: dict[str, Any]) -> dict[str, Any]:
     loop_blocks = cleaned.get("loop_blocks")
     if isinstance(loop_blocks, list):
         cleaned["loop_blocks"] = [
-            _strip_runtime_block_fields(loop_block) if isinstance(loop_block, dict) else loop_block
+            strip_runtime_block_fields(loop_block) if isinstance(loop_block, dict) else loop_block
             for loop_block in loop_blocks
         ]
     return cleaned
@@ -302,7 +308,7 @@ def _copilot_yaml_workflow_definition(persisted_definition: dict[str, Any]) -> d
     blocks = workflow_definition.get("blocks")
     if isinstance(blocks, list):
         workflow_definition["blocks"] = [
-            _strip_runtime_block_fields(block) if isinstance(block, dict) else block for block in blocks
+            strip_runtime_block_fields(block) if isinstance(block, dict) else block for block in blocks
         ]
     return workflow_definition
 
@@ -310,6 +316,7 @@ def _copilot_yaml_workflow_definition(persisted_definition: dict[str, Any]) -> d
 def workflow_to_copilot_yaml(workflow: Workflow) -> str:
     workflow_data = workflow.model_dump(mode="json", exclude_none=True)
     strip_private_workflow_settings(workflow_data)
+    mask_workflow_definition_secrets(workflow_data.get("workflow_definition"))
     workflow_definition = _copilot_yaml_workflow_definition(workflow_data.get("workflow_definition") or {})
 
     request_data = {
@@ -426,90 +433,39 @@ def _canonicalize_copilot_block_type_aliases(value: Any) -> None:
 
 
 def _collect_reachable(
-    start_label: str,
+    start_label: str | None,
     label_to_block: dict[str, BlockYAML],
     reachable: set[str],
 ) -> None:
-    """Walk the next_block_label chain from start_label, collecting all reachable labels.
-
-    For conditional blocks, also follows branch target chains recursively.
-
-    The ``current not in reachable`` loop guard means the main-chain walk
-    stops early if we hit a node already collected via a branch recursion.
-    This is correct — those downstream nodes and their successors are
-    already in ``reachable`` — but callers should be aware of the coupling.
-    """
-    current: str | None = start_label
-    while current and current in label_to_block and current not in reachable:
+    pending = [start_label]
+    while pending:
+        current = pending.pop()
+        if not current or current not in label_to_block or current in reachable:
+            continue
         reachable.add(current)
         block = label_to_block[current]
         if isinstance(block, ConditionalBlockYAML):
-            for branch in block.branch_conditions:
-                if branch.next_block_label and branch.next_block_label not in reachable:
-                    _collect_reachable(branch.next_block_label, label_to_block, reachable)
-        current = block.next_block_label
+            pending.extend(branch.next_block_label for branch in block.branch_conditions)
+        pending.append(block.next_block_label)
 
 
 def _break_cycles(
     start_label: str,
     label_to_block: dict[str, BlockYAML],
 ) -> bool:
-    """Detect and break circular references in the block chain using DFS.
-
-    Uses a recursion stack to distinguish true back-edges (cycles) from merge
-    points (two branches converging on the same block).  When a back-edge is
-    found the offending ``next_block_label`` is set to ``None``, breaking the
-    cycle.  Handles both the main chain and conditional branch chains.
-
-    Note: this function operates on a single level of blocks.  It does **not**
-    recurse into ``ForLoopBlockYAML.loop_blocks``; nested loops are handled
-    by the recursive ``_repair_next_block_label_chain`` call in Phase 3.
-
-    Returns True if at least one cycle was broken.
-    """
+    """Cut the first next_block_label edge that points back to a block already on the chain."""
     visited: set[str] = set()
-    rec_stack: set[str] = set()
-    found_cycle = False
-
-    def _follow_edge(target: str | None, edge_owner: BlockYAML | BranchConditionYAML, parent_label: str) -> None:
-        """Follow an edge to *target*.  *edge_owner* is the object whose
-        ``next_block_label`` will be set to ``None`` when the target forms a
-        back-edge.  *parent_label* is the block label that owns this edge
-        for logging."""
-        nonlocal found_cycle
-        if not target or target not in label_to_block:
-            return
-        if target in rec_stack:
-            is_branch = hasattr(edge_owner, "criteria")
-            LOG.warning(
-                "Copilot produced circular block chain, breaking cycle",
-                cycle_target=target,
-                broken_at=parent_label,
-                is_branch_condition=is_branch,
-                branch_expression=getattr(getattr(edge_owner, "criteria", None), "expression", None),
-            )
-            edge_owner.next_block_label = None
-            found_cycle = True
-            return
+    current: str | None = start_label
+    while current and current in label_to_block:
+        visited.add(current)
+        block = label_to_block[current]
+        target = block.next_block_label
         if target in visited:
-            return  # merge point — not a cycle
-        _dfs(target)
-
-    def _dfs(label: str) -> None:
-        visited.add(label)
-        rec_stack.add(label)
-        block = label_to_block[label]
-
-        if isinstance(block, ConditionalBlockYAML):
-            for branch in block.branch_conditions:
-                _follow_edge(branch.next_block_label, branch, label)
-
-        _follow_edge(block.next_block_label, block, label)
-        rec_stack.discard(label)
-
-    if start_label in label_to_block:
-        _dfs(start_label)
-    return found_cycle
+            LOG.warning("Copilot produced circular block chain, breaking cycle", cycle_target=target, broken_at=current)
+            block.next_block_label = None
+            return True
+        current = target
+    return False
 
 
 def _find_terminal_label(
@@ -595,21 +551,32 @@ def _order_orphaned_blocks(
     return ordered
 
 
+def _chain_start_label(blocks: list[BlockYAML], label_to_block: dict[str, BlockYAML]) -> str:
+    """The first block listed, unless the list as written is one graph from another block nothing points to."""
+    targets: set[str | None] = set()
+    for block in blocks:
+        targets.add(block.next_block_label)
+        if isinstance(block, ConditionalBlockYAML):
+            targets.update(branch.next_block_label for branch in block.branch_conditions)
+    roots = [block.label for block in blocks if block.label not in targets]
+    if len(roots) == 1:
+        reachable: set[str] = set()
+        _collect_reachable(roots[0], label_to_block, reachable)
+        if reachable == set(label_to_block):
+            return roots[0]
+    return blocks[0].label
+
+
 def _repair_next_block_label_chain(blocks: list[BlockYAML]) -> None:
-    """Ensure all top-level blocks form a single acyclic chain from blocks[0].
+    """Stitch a block list into one acyclic chain from its start block in place, recursing into loop bodies.
 
-    Repairs two classes of LLM mistakes:
-    1. Circular references — breaks cycles so the chain has a proper terminal block.
-    2. Disconnected paths — stitches orphaned blocks onto the end of the reachable chain.
-
-    Recursively repairs nested loop block ``loop_blocks`` at all depths.
-    Mutates *blocks* in place.
+    Blocks reached only through a conditional's branches keep the places those branches give them.
     """
+    for block in blocks:
+        if isinstance(block, (ForLoopBlockYAML, WhileLoopBlockYAML)) and block.loop_blocks:
+            _repair_next_block_label_chain(block.loop_blocks)
+
     if len(blocks) <= 1:
-        # Still recurse into loop_blocks even for single-block lists
-        for block in blocks:
-            if isinstance(block, (ForLoopBlockYAML, WhileLoopBlockYAML)) and block.loop_blocks:
-                _repair_next_block_label_chain(block.loop_blocks)
         return
 
     # Warn on duplicate labels — the dict comprehension silently keeps the last
@@ -623,16 +590,26 @@ def _repair_next_block_label_chain(blocks: list[BlockYAML]) -> None:
     label_to_block: dict[str, BlockYAML] = {block.label: block for block in blocks}
     all_labels = set(label_to_block.keys())
 
-    # Phase 1: break any circular references reachable from the first block.
-    # Note: cycles among orphaned blocks (unreachable from blocks[0]) are handled
-    # implicitly by _order_orphaned_blocks via its visited set and re-linking logic.
-    _break_cycles(blocks[0].label, label_to_block)
+    start_label = _chain_start_label(blocks, label_to_block)
+    # Cycles among blocks unreachable from the start are handled by _order_orphaned_blocks's re-linking.
+    _break_cycles(start_label, label_to_block)
 
-    # Phase 2: find orphaned (unreachable) blocks and stitch them to the end.
     reachable: set[str] = set()
-    _collect_reachable(blocks[0].label, label_to_block, reachable)
+    _collect_reachable(start_label, label_to_block, reachable)
 
-    orphaned_labels = all_labels - reachable
+    # Branch targets are not in list order, so stitching them in list order chains one branch into the other.
+    # They join the chain through their conditional once it is linked; its merge point is stitched like any block.
+    branch_only: set[str] = set()
+    for block in blocks:
+        if isinstance(block, ConditionalBlockYAML):
+            in_branches: set[str] = set()
+            for branch in block.branch_conditions:
+                _collect_reachable(branch.next_block_label, label_to_block, in_branches)
+            after_merge: set[str] = set()
+            _collect_reachable(block.next_block_label, label_to_block, after_merge)
+            branch_only |= in_branches - after_merge
+
+    orphaned_labels = all_labels - reachable - branch_only
     if orphaned_labels:
         LOG.warning(
             "Copilot produced disconnected workflow blocks, repairing chain",
@@ -640,16 +617,11 @@ def _repair_next_block_label_chain(blocks: list[BlockYAML]) -> None:
             reachable_labels=sorted(reachable),
         )
 
-        terminal_label = _find_terminal_label(blocks[0].label, label_to_block, all_labels)
+        terminal_label = _find_terminal_label(start_label, label_to_block, all_labels)
         ordered_orphan_labels = _order_orphaned_blocks(orphaned_labels, label_to_block, all_labels, blocks)
 
         if terminal_label and ordered_orphan_labels:
             label_to_block[terminal_label].next_block_label = ordered_orphan_labels[0]
-
-    # Phase 3: recursively repair nested loop block ``loop_blocks``.
-    for block in blocks:
-        if isinstance(block, (ForLoopBlockYAML, WhileLoopBlockYAML)) and block.loop_blocks:
-            _repair_next_block_label_chain(block.loop_blocks)
 
 
 def _normalize_copilot_yaml(workflow_yaml: str) -> WorkflowCreateYAMLRequest:
@@ -923,6 +895,13 @@ async def _process_workflow_yaml(
         return saved_rows[0]
 
     current_workflow = settings_fallback_workflow
+    if definition_has_inline_secret_fields(workflow_yaml_request.workflow_definition):
+        current_workflow = current_workflow or await saved_workflow()
+        preserve_workflow_definition_secrets(
+            updated_workflow_definition,
+            current_workflow.workflow_definition if current_workflow is not None else None,
+            workflow_yaml_request.workflow_definition,
+        )
     if enable_self_healing is None or mask_secrets is None or pin_saved_session_ip is None:
         current_workflow = await saved_workflow()
     if enable_self_healing is None:

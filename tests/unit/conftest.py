@@ -58,12 +58,19 @@ from skyvern.forge.sdk.db.agent_db import AgentDB
 from skyvern.forge.sdk.db.enums import OrganizationAuthTokenType
 from skyvern.forge.sdk.db.models import Base, CredentialModel, WorkflowModel
 from skyvern.forge.sdk.db.utils import _custom_json_serializer
+from skyvern.forge.sdk.encrypt import encryptor
+from skyvern.forge.sdk.encrypt.bootstrap import register_aes_encryptor
 from skyvern.forge.sdk.executor.async_executor import AsyncExecutor
 from skyvern.forge.sdk.executor.factory import AsyncExecutorFactory
-from skyvern.forge.sdk.schemas.credentials import BitwardenItemOverview, CredentialType
+from skyvern.forge.sdk.schemas.credentials import BitwardenItemOverview, CredentialType, CredentialVaultType
 from skyvern.forge.sdk.schemas.files import FileInfo
 from skyvern.forge.sdk.schemas.organizations import BitwardenCredential, BitwardenOrganizationAuthToken, Organization
-from skyvern.forge.sdk.services.bitwarden import BitwardenConstants, BitwardenService
+from skyvern.forge.sdk.services.bitwarden import BitwardenConstants, BitwardenLoginSecret, BitwardenService
+from skyvern.forge.sdk.services.credential import credential_creation_service
+from skyvern.forge.sdk.services.credential.connected_bitwarden_credential_vault_service import (
+    ConnectedBitwardenCredentialVaultService,
+)
+from skyvern.forge.sdk.services.request_principal import AuthKind, RequestPrincipal
 from skyvern.forge.sdk.settings_manager import SettingsManager
 from skyvern.forge.sdk.workflow import web_search, web_search_client
 from skyvern.forge.sdk.workflow.context_manager import WorkflowContextManager
@@ -459,6 +466,14 @@ def gpt56_litellm_models() -> Iterator[None]:
 # DDL, and each test still gets its own isolated database.
 
 
+@pytest.fixture
+def registered_encryption() -> Iterator[None]:
+    """The real AES-CBC and AES-GCM encryptors, registered as a deployment with ENABLE_ENCRYPTION would."""
+    with patch.dict(encryptor._methods, clear=True):
+        register_aes_encryptor(secret_key="registered-encryption-test-key")
+        yield
+
+
 @pytest.fixture(scope="session")
 def sqlite_schema_template(tmp_path_factory: pytest.TempPathFactory) -> Path:
     template_path = tmp_path_factory.mktemp("sqlite_schema") / "schema.db"
@@ -541,6 +556,7 @@ def make_input_element_mock(*, element_id: str = "AADC", attrs: dict[str, object
     el.has_attr = AsyncMock(return_value=False)
     el.is_spinbtn_input = AsyncMock(return_value=False)
     el.is_editable = AsyncMock(return_value=True)
+    el.accepts_text_fill = AsyncMock(return_value=True)
     el.supports_text_input = AsyncMock(return_value=True)
     el.is_visible = AsyncMock(return_value=True)
     el.is_raw_input = AsyncMock(return_value=False)
@@ -1074,6 +1090,30 @@ async def settle_or_fail(coro: Awaitable[_T], wait_seconds: float = 2.0) -> tupl
     return task, elapsed
 
 
+async def cancel_once_parked(
+    coro: Awaitable[_T], parked: asyncio.Event, release: asyncio.Event, wait_seconds: float = 5.0
+) -> asyncio.Task[_T]:
+    """Run ``coro``, cancel it once it reaches a collaborator parked on ``release``, and fail if it does not finish
+    within ``wait_seconds`` of that cancel, so work re-entered after cancellation fails instead of hanging. The
+    parked collaborator is always released and the task's outcome retrieved before returning."""
+    task = asyncio.ensure_future(coro)
+    try:
+        reached = asyncio.ensure_future(parked.wait())
+        await asyncio.wait({task, reached}, timeout=wait_seconds, return_when=asyncio.FIRST_COMPLETED)
+        reached.cancel()
+        if not parked.is_set():
+            pytest.fail(f"never reached the parked collaborator within {wait_seconds}s")
+        task.cancel()
+        await settle_or_fail(task, wait_seconds)
+        return task
+    finally:
+        release.set()
+        if not task.done():
+            await asyncio.wait({task}, timeout=wait_seconds)
+        if task.done() and not task.cancelled():
+            task.exception()
+
+
 class DriverReplyProbe:
     """A driver call that keeps its protocol reply the way playwright and patchright do.
 
@@ -1251,10 +1291,10 @@ async def run_group_env(monkeypatch: pytest.MonkeyPatch, sqlite_engine: AsyncEng
 
 
 ORG_VAULT_ITEM_ID = "0f4a3a52-6f4e-4c43-9d37-8f6f2a1c9b10"
-ORG_VAULT_LOGIN_ID = f"bwitem_{ORG_VAULT_ITEM_ID}"
 ORG_VAULT_ACCOUNT_EMAIL = "vault-owner@example.com"
 ORG_VAULT_MASTER_PASSWORD = "ORG_VAULT_MASTER_SECRET"
 ORG_VAULT_LOGIN_PASSWORD = "ORG_VAULT_LOGIN_SECRET"
+ORG_VAULT_PORTAL_SITES = [LoginSite("https://portal.example.com", whole_site=False)]
 
 
 def org_vault_overview(**overrides: Any) -> BitwardenItemOverview:
@@ -1264,6 +1304,7 @@ def org_vault_overview(**overrides: Any) -> BitwardenItemOverview:
         "collection_id": "col_1",
         "credential_type": CredentialType.PASSWORD,
         "url": "https://portal.example.com/login",
+        "sites": ORG_VAULT_PORTAL_SITES,
         **overrides,
     }
     fields.setdefault("urls", [fields["url"]] if fields["url"] else [])
@@ -1273,17 +1314,21 @@ def org_vault_overview(**overrides: Any) -> BitwardenItemOverview:
 @dataclass
 class OrgVaultFake:
     listing: AsyncMock
-    sites: AsyncMock
     secret: AsyncMock
     org_token: AsyncMock
     folders_restricted: AsyncMock
     organization: Organization
+    database: AgentDB
+
+    async def imported_rows(self) -> list[CredentialModel]:
+        async with self.database.Session() as session:
+            return list((await session.scalars(select(CredentialModel))).all())
 
 
-@pytest.fixture
-def org_vault(monkeypatch: pytest.MonkeyPatch) -> OrgVaultFake:
+@pytest_asyncio.fixture
+async def org_vault(monkeypatch: pytest.MonkeyPatch, sqlite_engine: AsyncEngine) -> OrgVaultFake:
     """An organization with a connected Bitwarden account, faked only at the BitwardenService boundary and the
-    org-token read. It lists one login whose whole-site URI is portal.example.com."""
+    org-token read, over a real credentials table. It lists one login whose only site is portal.example.com."""
     now = datetime(2026, 1, 1, tzinfo=UTC)
     token = BitwardenOrganizationAuthToken(
         id="oat_org_vault",
@@ -1301,19 +1346,23 @@ def org_vault(monkeypatch: pytest.MonkeyPatch) -> OrgVaultFake:
         created_at=now,
         modified_at=now,
     )
+    database = AgentDB("sqlite+aiosqlite://", db_engine=sqlite_engine)
     fake = OrgVaultFake(
         listing=AsyncMock(return_value=[org_vault_overview()]),
-        sites=AsyncMock(return_value=[LoginSite("https://portal.example.com", whole_site=False)]),
         secret=AsyncMock(
-            return_value={
-                BitwardenConstants.USERNAME: "vault-user@example.com",
-                BitwardenConstants.PASSWORD: ORG_VAULT_LOGIN_PASSWORD,
-                BitwardenConstants.TOTP: "",
-            }
+            return_value=BitwardenLoginSecret(
+                {
+                    BitwardenConstants.USERNAME: "vault-user@example.com",
+                    BitwardenConstants.PASSWORD: ORG_VAULT_LOGIN_PASSWORD,
+                    BitwardenConstants.TOTP: "",
+                },
+                ORG_VAULT_PORTAL_SITES,
+            )
         ),
         org_token=AsyncMock(return_value=token),
         folders_restricted=AsyncMock(return_value=False),
         organization=organization,
+        database=database,
     )
     monkeypatch.setattr(
         app.DATABASE,
@@ -1321,9 +1370,21 @@ def org_vault(monkeypatch: pytest.MonkeyPatch) -> OrgVaultFake:
         SimpleNamespace(get_valid_org_auth_token=fake.org_token, get_organization=AsyncMock(return_value=organization)),
         raising=False,
     )
+    monkeypatch.setattr(app.DATABASE, "credentials", database.credentials, raising=False)
+    # `app` is an AppHolder proxy without __delattr__; patch the underlying instance so teardown can delete it.
+    monkeypatch.setattr(
+        object.__getattribute__(app, "_inst"),
+        "CREDENTIAL_VAULT_SERVICES",
+        {CredentialVaultType.BITWARDEN_CONNECTED: ConnectedBitwardenCredentialVaultService()},
+        raising=False,
+    )
     monkeypatch.setattr(app.AGENT_FUNCTION, "credential_folders_restricted", fake.folders_restricted)
+    monkeypatch.setattr(
+        credential_creation_service,
+        "get_request_principal",
+        lambda: RequestPrincipal("o_test_org", AuthKind.ui_session, user_id="u_org_vault"),
+    )
     monkeypatch.setattr(BitwardenService, "list_item_overviews", fake.listing)
-    monkeypatch.setattr(BitwardenService, "get_login_item_sites", fake.sites)
     monkeypatch.setattr(BitwardenService, "get_secret_value_from_url", fake.secret)
     return fake
 

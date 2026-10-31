@@ -263,6 +263,19 @@ async function submitPrompt(text: string) {
 }
 
 describe("PromptBox", () => {
+  test("offers Upload an SOP and Demonstrate, with no paste card", () => {
+    renderPromptBox(true);
+
+    const label = screen.getByText("Or start from");
+    expect(label.className).toContain("text-center");
+    expect(label.parentElement?.querySelector(".grid")?.className).toContain(
+      "md:grid-cols-2",
+    );
+    expect(screen.getByLabelText("Upload an SOP")).toBeTruthy();
+    expect(screen.getByLabelText("Demonstrate task")).toBeTruthy();
+    expect(screen.queryByLabelText("Paste an SOP")).toBeNull();
+  });
+
   test.each([
     ["legacy", false],
     ["redesigned", true],
@@ -971,6 +984,7 @@ describe("PromptBox", () => {
 
     renderPromptBox(true);
     expect(screen.queryByLabelText("Add files and more")).toBeNull();
+    expect(screen.queryByText("Paste an SOP")).toBeNull();
     fireEvent.change(screen.getByLabelText("Choose an SOP PDF"), {
       target: { files: [pdf] },
     });

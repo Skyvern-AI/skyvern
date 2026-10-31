@@ -4,7 +4,13 @@ Make sure to ONLY return the JSON object in this format with no additional text 
 ```json
 {
   "page_info": str, // Think step by step. Describe all the useful information in the page related to the user goal.
-  "reasoning": str, // Think step by step. Describe the reason you summarized based on 'page_info', screenshots, user goal and result of mini plans. Keep the reasoning short and to the point.
+  "reasoning": str, // Think step by step. Describe the reason you summarized based on 'page_info', screenshots, user goal and result of mini plans. Keep the reasoning short and to the point.{% if error_code_mapping_str %}
+  "errors": array // A list of errors. This is used to surface any errors that matches the current situation. If no error description suits the current situation on the screenshots or the mini plan results, return an empty list.
+    [{
+        "error_code": str, // The error code from the user's error code list
+        "reasoning": str, // The reasoning behind the error. Keep the reasoning short and to the point.
+        "confidence_float": float // The confidence of the error. Pick a number between 0.0 and 1.0
+    }],{% endif %}
   "failure_categories": array // Classify the root cause of this failure. Return one or more categories ordered by likelihood (highest first). Always return at least one. Categories: ANTI_BOT_DETECTION (CAPTCHA, Cloudflare challenge, bot detection), BROWSER_ERROR (crash, page closed), NAVIGATION_FAILURE (404, redirect), PAGE_LOAD_TIMEOUT (timeout), AUTH_FAILURE (login failed, MFA), LLM_REASONING_ERROR (wrong element, wrong action), CREDENTIAL_ERROR (missing credentials), ELEMENT_NOT_FOUND (target missing), WRONG_PAGE_STATE (unexpected page), DATA_EXTRACTION_FAILURE (extraction failed), MAX_STEPS_EXCEEDED (use only as secondary, always identify root cause as primary), WEBSITE_ERROR (the website's own server failed or is down: HTTP 5xx such as 500, 502 Bad Gateway, 503 Service Unavailable or 504, a CDN error page saying the site's host is down, an outage or maintenance page), INFRASTRUCTURE_ERROR (Skyvern's own platform failed: its workers, browser pool, proxies or network, or it ran out of memory; never a website's error page), UNKNOWN (cannot determine).
     [{
         "category": str, // The category from the list above
@@ -15,7 +21,14 @@ Make sure to ONLY return the JSON object in this format with no additional text 
 
 User Goal:
 {{ navigation_goal }}
-
+{% if error_code_mapping_str %}
+Use the error codes and their descriptions to surface user-defined errors. The `errors` array is ONLY for codes whose keys appear in the JSON below. The `failure_categories` taxonomy is separate and must never appear in `errors`. If no user-defined code applies, return an empty `errors` array. User defined errors:
+{{ error_code_mapping_str }}
+{% if antibot_evidence_str %}
+Bot-protection evidence recorded so far in this run, as structured facts rather than page content. A solve marked `"unresolved": true` is a presented challenge left unsolved; a solved challenge or a service merely present never supports an error code on its own:
+{{ antibot_evidence_str }}
+{% endif %}
+{% endif %}
 Mini plans and the results:
 {% for each_block in history %}{{ each_block }}
 {% endfor %}

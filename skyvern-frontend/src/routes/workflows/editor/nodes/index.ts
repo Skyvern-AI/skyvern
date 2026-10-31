@@ -38,6 +38,8 @@ import { WaitNode } from "./WaitNode/types";
 import { WaitNode as WaitNodeComponent } from "./WaitNode/WaitNode";
 import { TerminateNode } from "./TerminateNode/types";
 import { TerminateNode as TerminateNodeComponent } from "./TerminateNode/TerminateNode";
+import { AgentStepNode } from "./AgentStepNode/types";
+import { AgentStepNode as AgentStepNodeComponent } from "./AgentStepNode/AgentStepNode";
 import { FileDownloadNode } from "./FileDownloadNode/types";
 import { FileDownloadNode as FileDownloadNodeComponent } from "./FileDownloadNode/FileDownloadNode";
 import { PDFParserNode } from "./PDFParserNode/types";
@@ -62,6 +64,8 @@ import { GoogleSheetsReadNode } from "./GoogleSheetsReadNode/types";
 import { GoogleSheetsReadNode as GoogleSheetsReadNodeComponent } from "./GoogleSheetsReadNode/GoogleSheetsReadNode";
 import { GoogleSheetsWriteNode } from "./GoogleSheetsWriteNode/types";
 import { GoogleSheetsWriteNode as GoogleSheetsWriteNodeComponent } from "./GoogleSheetsWriteNode/GoogleSheetsWriteNode";
+import { PowerBIQueryNode } from "./PowerBIQueryNode/types";
+import { PowerBIQueryNode as PowerBIQueryNodeComponent } from "./PowerBIQueryNode/PowerBIQueryNode";
 import { PdfFillNode } from "./PdfFillNode/types";
 import { PdfFillNode as PdfFillNodeComponent } from "./PdfFillNode/PdfFillNode";
 import { SplitPdfNode } from "./SplitPdfNode/types";
@@ -73,6 +77,7 @@ import { withCollapsible } from "../collapse/withCollapsible";
 import { withSelectableBlock } from "../selection/withSelectableBlock";
 import { withRunValidationHighlight } from "../runValidation/withRunValidationHighlight";
 import { withReviewAnnotation } from "../review/withReviewAnnotation";
+import { withNoteReadMarker } from "./withNoteReadMarker";
 
 export type UtilityNode = StartNode | NodeAdderNode;
 
@@ -95,6 +100,7 @@ export type WorkflowBlockNode =
   | LoginNode
   | WaitNode
   | TerminateNode
+  | AgentStepNode
   | FileDownloadNode
   | PDFParserNode
   | Taskv2Node
@@ -106,6 +112,7 @@ export type WorkflowBlockNode =
   | EmailInboxNode
   | GoogleSheetsReadNode
   | GoogleSheetsWriteNode
+  | PowerBIQueryNode
   | PdfFillNode
   | SplitPdfNode
   | DataExportNode;
@@ -138,7 +145,7 @@ function wrapBlock<P extends NodeProps>(Component: ComponentType<P>) {
     withReviewAnnotation(
       withSortableBlock(
         withRunValidationHighlight(
-          withSelectableBlock(withCollapsible(Component)),
+          withSelectableBlock(withCollapsible(withNoteReadMarker(Component))),
         ),
       ),
     ),
@@ -154,7 +161,9 @@ function wrapContainerBlock<P extends NodeProps>(Component: ComponentType<P>) {
   return memo(
     withReviewAnnotation(
       withSortableBlock(
-        withRunValidationHighlight(withSelectableBlock(Component)),
+        withRunValidationHighlight(
+          withSelectableBlock(withNoteReadMarker(Component)),
+        ),
       ),
     ),
   );
@@ -181,6 +190,7 @@ export const nodeTypes = {
   login: wrapBlock(LoginNodeComponent),
   wait: wrapBlock(WaitNodeComponent),
   terminate: wrapBlock(TerminateNodeComponent),
+  agentStep: wrapBlock(AgentStepNodeComponent),
   fileDownload: wrapBlock(FileDownloadNodeComponent),
   pdfParser: wrapBlock(PDFParserNodeComponent),
   taskv2: wrapBlock(Taskv2NodeComponent),
@@ -192,6 +202,7 @@ export const nodeTypes = {
   emailInbox: wrapBlock(EmailInboxNodeComponent),
   googleSheetsRead: wrapBlock(GoogleSheetsReadNodeComponent),
   googleSheetsWrite: wrapBlock(GoogleSheetsWriteNodeComponent),
+  powerBIQuery: wrapBlock(PowerBIQueryNodeComponent),
   pdfFill: wrapBlock(PdfFillNodeComponent),
   splitPdf: wrapBlock(SplitPdfNodeComponent),
   dataExport: wrapBlock(DataExportNodeComponent),

@@ -12,6 +12,7 @@ import type { Edge } from "@xyflow/react";
 import { usePostHog } from "posthog-js/react";
 
 import { useWorkflowHasChangesStore } from "@/store/WorkflowHasChangesStore";
+import { useWorkflowParametersStore } from "@/store/WorkflowParametersStore";
 import type { AppNode } from "../nodes";
 import { isDndDragInFlight } from "../sortable/dndDragActivity";
 import {
@@ -20,6 +21,7 @@ import {
   cloneSnapshot,
   createInitialHistoryState,
   MAX_HISTORY_ENTRIES,
+  parametersEqual,
   pushSnapshot,
   redo as historyRedo,
   replacePresent,
@@ -77,10 +79,8 @@ type UseWorkflowHistoryResult = {
 /**
  * In-memory undo/redo for the workflow editor canvas.
  *
- * Watches `nodes`/`edges`, captures debounced snapshots onto a bounded
- * history stack, and exposes undo/redo callbacks that restore snapshots
- * via `setNodes`/`setEdges`. Not persisted - a browser refresh clears
- * the stack.
+ * Watches the workflow graph and parameters, captures debounced snapshots
+ * onto a bounded history stack, and restores them on undo/redo. Not persisted.
  */
 export function useWorkflowHistory({
   nodes,
@@ -91,6 +91,7 @@ export function useWorkflowHistory({
   setEdges,
 }: UseWorkflowHistoryParams): UseWorkflowHistoryResult {
   const posthog = usePostHog();
+  const parameters = useWorkflowParametersStore((state) => state.parameters);
   const historyRef = useRef<WorkflowHistoryState>(createInitialHistoryState());
   // One-shot: applySnapshot sets, capture effect consumes on next fire.
   const isApplyingRef = useRef(false);
@@ -114,6 +115,7 @@ export function useWorkflowHistory({
   const debounceTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const latestNodesRef = useRef(nodes);
   const latestEdgesRef = useRef(edges);
+  const latestParametersRef = useRef(parameters);
 
   const [flags, setFlags] = useState<{ canUndo: boolean; canRedo: boolean }>({
     canUndo: false,
@@ -132,6 +134,7 @@ export function useWorkflowHistory({
   useLayoutEffect(() => {
     latestNodesRef.current = nodes;
     latestEdgesRef.current = edges;
+    latestParametersRef.current = parameters;
   });
 
   const refreshFlags = useCallback(() => {
@@ -200,6 +203,7 @@ export function useWorkflowHistory({
       const snapshot = cloneSnapshot(
         latestNodesRef.current,
         latestEdgesRef.current,
+        latestParametersRef.current,
       );
       commitSnapshot(snapshot, options);
     },
@@ -212,7 +216,11 @@ export function useWorkflowHistory({
     if (historyRef.current.present === null) {
       historyRef.current = {
         past: [],
-        present: cloneSnapshot(latestNodesRef.current, latestEdgesRef.current),
+        present: cloneSnapshot(
+          latestNodesRef.current,
+          latestEdgesRef.current,
+          latestParametersRef.current,
+        ),
         future: [],
       };
       refreshFlags();
@@ -245,6 +253,7 @@ export function useWorkflowHistory({
           pendingSnapshotRef.current = cloneSnapshot(
             latestNodesRef.current,
             latestEdgesRef.current,
+            latestParametersRef.current,
           );
         }
       }
@@ -347,16 +356,35 @@ export function useWorkflowHistory({
         debounceTimerRef.current = null;
       }
     };
-  }, [nodes, edges, internalUpdateCount, captureIfChanged, commitSnapshot]);
+  }, [
+    nodes,
+    edges,
+    parameters,
+    internalUpdateCount,
+    captureIfChanged,
+    commitSnapshot,
+  ]);
 
   const applySnapshot = useCallback(
-    (snapshotNodes: AppNode[], snapshotEdges: Edge[]) => {
+    (snapshot: WorkflowSnapshot) => {
       // Fresh copies - downstream mutates node.data in place.
-      const cloned = cloneSnapshot(snapshotNodes, snapshotEdges);
+      const cloned = cloneSnapshot(
+        snapshot.nodes,
+        snapshot.edges,
+        snapshot.parameters,
+      );
       isApplyingRef.current = true;
       if (debounceTimerRef.current !== null) {
         clearTimeout(debounceTimerRef.current);
         debounceTimerRef.current = null;
+      }
+      const parameterStore = useWorkflowParametersStore.getState();
+      if (
+        !parametersEqual(parameterStore.parameters, cloned.parameters) &&
+        !parameterStore.setParameters(cloned.parameters)
+      ) {
+        isApplyingRef.current = false;
+        return false;
       }
       setNodes(cloned.nodes);
       setEdges(cloned.edges);
@@ -376,6 +404,7 @@ export function useWorkflowHistory({
       // position because `measured` is stripped from snapshots and the
       // dimension-change re-layout path can race the new render.
       setHistoryApplyTrigger((n) => n + 1);
+      return true;
     },
     [setNodes, setEdges],
   );
@@ -400,9 +429,8 @@ export function useWorkflowHistory({
     // Flush first so an edit still pending in the debounce window isn't dropped.
     flushPendingCapture();
     const result = historyUndo(historyRef.current);
-    if (result === null) return;
+    if (result === null || !applySnapshot(result.applied)) return;
     historyRef.current = result.state;
-    applySnapshot(result.applied.nodes, result.applied.edges);
     refreshFlags();
     posthog.capture("builder.undo_redo.used", {
       org_id: organizationId,
@@ -428,9 +456,8 @@ export function useWorkflowHistory({
     if (isDndDragInFlight()) return;
     flushPendingCapture();
     const result = historyRedo(historyRef.current);
-    if (result === null) return;
+    if (result === null || !applySnapshot(result.applied)) return;
     historyRef.current = result.state;
-    applySnapshot(result.applied.nodes, result.applied.edges);
     refreshFlags();
     posthog.capture("builder.undo_redo.used", {
       org_id: organizationId,

@@ -101,7 +101,13 @@ def test_responses_envelope_marks_only_the_stable_system_prefix() -> None:
 
 _ASSISTANT_TEXT_THEN_CALL: list[Any] = [
     {"role": "user", "content": [{"type": "input_text", "text": "hello"}]},
-    {"type": "message", "role": "assistant", "content": [{"type": "output_text", "text": "x", "annotations": []}]},
+    {
+        "id": "msg_1",
+        "type": "message",
+        "role": "assistant",
+        "status": "completed",
+        "content": [{"type": "output_text", "text": "x", "annotations": []}],
+    },
     {"type": "function_call", "call_id": "call_1", "name": "_first_tool", "arguments": "{}"},
     {"type": "function_call_output", "call_id": "call_1", "output": [{"type": "input_text", "text": "done"}]},
 ]

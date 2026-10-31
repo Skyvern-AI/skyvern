@@ -1,4 +1,5 @@
 import asyncio
+import dataclasses
 from abc import ABC, abstractmethod
 from typing import Any, Awaitable, Callable, TypedDict
 
@@ -6,6 +7,7 @@ import structlog
 
 from skyvern.exceptions import CredentialVaultShapeMismatchError
 from skyvern.forge import app
+from skyvern.forge.sdk.credential_site_policy import LoginSite
 from skyvern.forge.sdk.schemas.credentials import (
     CreateCredentialRequest,
     Credential,
@@ -17,8 +19,78 @@ from skyvern.forge.sdk.schemas.credentials import (
     PasswordCredential,
     TotpType,
 )
+from skyvern.forge.sdk.services.request_principal import get_request_principal
 
 LOG = structlog.get_logger()
+
+
+@dataclasses.dataclass(frozen=True)
+class VaultLogin:
+    """A login a vault lists, as metadata only; `credential_id` is the saved credential it was imported as."""
+
+    vault_type: CredentialVaultType
+    vault_id: str
+    item_id: str
+    title: str
+    # Every saved URI without its match mode: enough to say the login competes for a page, never to grant it.
+    urls: tuple[str, ...]
+    sites: tuple[LoginSite, ...]
+    tested_url: str | None = None
+    credential_id: str | None = None
+
+
+# The vaults whose logins are listed, and imported as metadata-only saved credentials.
+LISTED_VAULT_TYPES = frozenset({CredentialVaultType.BITWARDEN_CONNECTED, CredentialVaultType.ONEPASSWORD})
+
+
+@dataclasses.dataclass(frozen=True)
+class VaultLoginListing:
+    logins: tuple[VaultLogin, ...] = ()
+    unreadable: tuple[CredentialVaultType, ...] = ()
+    hidden: bool = False
+
+
+async def vault_logins_hidden(organization_id: str) -> bool:
+    """Vault items carry no credential folder, so only a principal no folder restricts may see them."""
+    principal = get_request_principal()
+    if principal is None:
+        return await app.AGENT_FUNCTION.credential_folders_restricted(organization_id)
+    return await app.AGENT_FUNCTION.accessible_credential_folder_ids(principal) is not None
+
+
+async def list_vault_logins(organization_id: str) -> VaultLoginListing:
+    if await vault_logins_hidden(organization_id):
+        return VaultLoginListing(hidden=True)
+    services = [(vault_type, service) for vault_type, service in app.CREDENTIAL_VAULT_SERVICES.items() if service]
+    listings = await asyncio.gather(
+        *(service.list_logins(organization_id) for _, service in services), return_exceptions=True
+    )
+    logins: list[VaultLogin] = []
+    unreadable: list[CredentialVaultType] = []
+    for (vault_type, _), listed in zip(services, listings, strict=True):
+        if isinstance(listed, BaseException):
+            # Vault errors can quote the account email, so only the type is logged.
+            LOG.warning(
+                "Vault logins unreadable",
+                organization_id=organization_id,
+                vault_type=vault_type,
+                error_type=type(listed).__name__,
+            )
+            unreadable.append(CredentialVaultType(vault_type))
+            continue
+        if not listed:
+            continue
+        imported = await app.DATABASE.credentials.get_onepassword_credentials(
+            organization_id,
+            vault_type=CredentialVaultType(vault_type),
+            item_keys=[(login.vault_id, login.item_id) for login in listed],
+        )
+        imported_ids = {(credential.vault_id, credential.item_id): credential.credential_id for credential in imported}
+        logins.extend(
+            dataclasses.replace(login, credential_id=imported_ids.get((login.vault_id, login.item_id)))
+            for login in listed
+        )
+    return VaultLoginListing(tuple(logins), tuple(unreadable))
 
 
 class _HasTotpSeedKwargs(TypedDict, total=False):
@@ -67,6 +139,10 @@ class CredentialVaultService(ABC):
     @abstractmethod
     async def get_credential_item(self, db_credential: Credential) -> CredentialItem:
         """Retrieve the full credential data from the vault."""
+
+    async def list_logins(self, organization_id: str) -> list[VaultLogin] | None:
+        """The organization's own logins in this vault, or None when it lists none for the organization."""
+        return None
 
     async def _enqueue_orphaned_vault_item_cleanup(
         self,

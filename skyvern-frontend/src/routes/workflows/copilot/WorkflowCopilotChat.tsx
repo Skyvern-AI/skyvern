@@ -27,6 +27,7 @@ import {
 import { ArtifactDownloadLink } from "@/components/ArtifactDownloadLink";
 import { Button } from "@/components/ui/button";
 import { StartFromCards } from "@/components/StartFromCards";
+import { useWorkflowDocEditorFlag } from "@/hooks/useWorkflowDocEditorFlag";
 import {
   Fragment,
   useState,
@@ -65,10 +66,7 @@ import {
 } from "@radix-ui/react-icons";
 import { createPortal } from "react-dom";
 import { stringify as convertToYAML } from "yaml";
-import {
-  useWorkflowHasChangesStore,
-  type WorkflowSaveData,
-} from "@/store/WorkflowHasChangesStore";
+import { useWorkflowHasChangesStore } from "@/store/WorkflowHasChangesStore";
 import { useWorkflowTitleStore } from "@/store/WorkflowTitleStore";
 import { useCopilotActionStore } from "@/store/useCopilotActionStore";
 import { useManualSignInStore } from "@/store/useManualSignInStore";
@@ -89,8 +87,8 @@ import {
   WorkflowApiResponse,
   WorkflowSettings,
 } from "@/routes/workflows/types/workflowTypes";
-import { parseHeaderJson } from "@/util/secretHeaders";
-import { canvasWorkflowVersionFromSaveData } from "@/routes/workflows/editor/workflowVersionFromSaveData";
+import { getUploadTypeRejection } from "@/util/getErrorDetail";
+import { reviewBaselineFromSaveData } from "@/routes/workflows/editor/workflowVersionFromSaveData";
 import { describeRecordedAction } from "@/routes/workflows/workflowBlockUtils";
 import {
   isBlockItem,
@@ -280,6 +278,7 @@ import { TooltipProvider } from "@/components/ui/tooltip";
 import { useLogging } from "@/hooks/useLogging";
 import { getCopilotFailureLogFields } from "./copilotFailureLogFields";
 import { captureChatScope, type ChatScopeRefs } from "./chatReadScope";
+import { useCopilotProposalStore } from "@/store/CopilotProposalStore";
 import { safeHttpUrl } from "@/util/httpUrl";
 import { useDemonstrationRecorder } from "./useDemonstrationRecorder";
 import {
@@ -1467,37 +1466,6 @@ type CanonicalRecovery = {
   yaml: { draft: string; entrySnapshot: string } | null;
 };
 
-const parseHeadersLenient = (
-  value: string | null | undefined,
-  label: string,
-): Record<string, string> | null => {
-  if (!value) {
-    return null;
-  }
-  try {
-    return parseHeaderJson(value);
-  } catch (error) {
-    console.error(`Error parsing ${label}:`, error);
-    return null;
-  }
-};
-
-// Header JSON that is mid-edit may not parse yet; the baseline omits those
-// headers rather than blocking the turn.
-const reviewBaselineFromSaveData = (
-  saveData: WorkflowSaveData,
-): WorkflowApiResponse =>
-  canvasWorkflowVersionFromSaveData(saveData, {
-    extraHttpHeaders: parseHeadersLenient(
-      saveData.settings.extraHttpHeaders,
-      "extra HTTP headers",
-    ),
-    cdpConnectHeaders: parseHeadersLenient(
-      saveData.settings.cdpConnectHeaders,
-      "CDP connect headers",
-    ),
-  });
-
 // eslint-disable-next-line react-refresh/only-export-components -- Recovery survives routed editors.
 export const canonicalRecoveriesByWorkflow = new Map<
   string,
@@ -1627,6 +1595,7 @@ export function WorkflowCopilotChat({
   portalTarget,
 }: WorkflowCopilotChatProps = {}) {
   const workflowPermanentId = useWorkflowPermanentId();
+  const docEditorEnabled = useWorkflowDocEditorFlag();
   const logging = useLogging();
   useLayoutEffect(() => {
     if (workflowPermanentId)
@@ -2807,8 +2776,12 @@ export function WorkflowCopilotChat({
             ? prev
             : withCappedResolution(prev, frame.resume_token, resolution),
         );
-        // An update card fixes the credential the turn already chose, so the turn's answer stays put.
-        if (!UPDATE_ASK_REASONS.includes(frame.reason)) {
+        // An update card fixes the credential the turn already chose, so the turn's answer stays put
+        // unless the user signed in themselves, which the server records as the turn's answer.
+        if (
+          !UPDATE_ASK_REASONS.includes(frame.reason) ||
+          resolution.outcome === "signed_in"
+        ) {
           setCredentialResolutions((prev) =>
             withCappedResolution(prev, frame.turn_id, resolution),
           );
@@ -5863,13 +5836,16 @@ export function WorkflowCopilotChat({
           },
         ]);
       } catch (error) {
+        const typeRejection = getUploadTypeRejection(error);
         setPendingAttachments((prev) =>
           prev.map((item) =>
             item.localId === localId
               ? {
                   ...item,
                   status: "error",
-                  error: "upload failed",
+                  error: typeRejection
+                    ? "file type not allowed"
+                    : "upload failed",
                 }
               : item,
           ),
@@ -5877,7 +5853,9 @@ export function WorkflowCopilotChat({
         toast({
           variant: "destructive",
           title: "Upload failed",
-          description: `Could not attach ${file.name}. Try again.`,
+          description: typeRejection
+            ? `Could not attach ${file.name}. ${typeRejection}`
+            : `Could not attach ${file.name}. Try again.`,
         });
       }
     },
@@ -6289,73 +6267,74 @@ export function WorkflowCopilotChat({
     gateLocked: isLoading || isLoadingHistory,
   };
 
-  const handleReviewWorkflow = (workflow: WorkflowApiResponse) => {
-    // The draft is already staged on the canvas, so the comparison needs the
-    // pre-submit snapshot (the same one Reject reverts to) as its baseline.
-    const baseline = getReviewBaseline(resolvePendingProposalTurnId());
+  // Accept and Reject from outside the chat (the comparison, the Doc view) settle here.
+  const settleProposalFromOutside = (workflow: WorkflowApiResponse) => {
     // The chat stays mounted beside the comparison, so History or New chat can
     // move it on before the user decides; the decision must not then settle
     // that other chat's proposal.
     const scope = captureChatScope(chatScopeRefs);
     const originToken = proposalTokenOf(pendingProposalMetadata);
-    onReviewWorkflow?.(
-      workflow,
-      async (decision) => {
-        if (scope.navigated()) {
-          toast({
-            title: "Review dismissed",
-            description:
-              "The chat changed while the comparison was open, so the proposal was left as is.",
-          });
-          return true;
-        }
-        const live = reviewSettleRef.current;
-        // A later turn can replace the proposal while the comparison still shows this one;
-        // the decision is about what was reviewed. Legacy proposals carry no token.
-        const sameProposal =
-          originToken !== null
-            ? live.proposalToken === originToken
-            : live.proposedWorkflow === workflow;
-        if (!sameProposal) {
-          toast({
-            title: "Review dismissed",
-            description:
-              "The proposal changed while the comparison was open. Review the current one.",
-          });
-          return true;
-        }
-        // Mirrors the gate card, whose actions wait out loading.
-        if (live.gateLocked) {
-          toast({
-            title: "Review dismissed",
-            description:
-              "Copilot is still working on this proposal. Its status is shown in the chat.",
-          });
-          return true;
-        }
-        // The comparison shows this hold as its lock reason, and the gate holds both decisions in
-        // the same states, including a proposal that could not be re-read.
-        if (live.holdReason !== null) {
-          toast({ title: live.holdReason, variant: "destructive" });
-          return false;
-        }
-        if (decision === "reject") {
-          return live.handleRejectWorkflow();
-        }
-        // The gate disables its accepts while Turn off is in flight.
-        if (!live.acceptsEnabled) {
-          return false;
-        }
-        // Accept refuses a locked editor without reporting back, so check first and
-        // keep the comparison open.
-        if (refuseMutationDuringYamlCommit()) {
-          return false;
-        }
-        live.handleAcceptWorkflow();
+    return async (decision: "approve" | "reject"): Promise<boolean> => {
+      if (scope.navigated()) {
+        toast({
+          title: "Review dismissed",
+          description:
+            "The chat changed while the comparison was open, so the proposal was left as is.",
+        });
         return true;
-      },
-      baseline,
-    );
+      }
+      const live = reviewSettleRef.current;
+      // A later turn can replace the proposal while the comparison still shows this one;
+      // the decision is about what was reviewed. Legacy proposals carry no token.
+      const sameProposal =
+        originToken !== null
+          ? live.proposalToken === originToken
+          : live.proposedWorkflow === workflow;
+      if (!sameProposal) {
+        toast({
+          title: "Review dismissed",
+          description:
+            "The proposal changed while the comparison was open. Review the current one.",
+        });
+        return true;
+      }
+      // Mirrors the gate card, whose actions wait out loading.
+      if (live.gateLocked) {
+        toast({
+          title: "Review dismissed",
+          description:
+            "Copilot is still working on this proposal. Its status is shown in the chat.",
+        });
+        return true;
+      }
+      // The comparison shows this hold as its lock reason, and the gate holds both decisions in
+      // the same states, including a proposal that could not be re-read.
+      if (live.holdReason !== null) {
+        toast({ title: live.holdReason, variant: "destructive" });
+        return false;
+      }
+      if (decision === "reject") {
+        return live.handleRejectWorkflow();
+      }
+      // The gate disables its accepts while Turn off is in flight.
+      if (!live.acceptsEnabled) {
+        return false;
+      }
+      // Accept refuses a locked editor without reporting back, so check first and
+      // keep the comparison open.
+      if (refuseMutationDuringYamlCommit()) {
+        return false;
+      }
+      live.handleAcceptWorkflow();
+      return true;
+    };
+  };
+
+  const handleReviewWorkflow = (workflow: WorkflowApiResponse) => {
+    // The draft is already staged on the canvas, so the comparison needs the
+    // pre-submit snapshot (the same one Reject reverts to) as its baseline.
+    const baseline = getReviewBaseline(resolvePendingProposalTurnId());
+    onReviewWorkflow?.(workflow, settleProposalFromOutside(workflow), baseline);
   };
 
   useEffect(() => {
@@ -8508,6 +8487,7 @@ export function WorkflowCopilotChat({
             ),
             workflow_yaml: workflowYaml,
             mode: "build",
+            doc_editor_enabled: docEditorEnabled,
             cancel_token: cancelToken,
             idempotency_key: options.idempotencyKey ?? null,
             target_block_label: targetBlockLabel,
@@ -8580,6 +8560,7 @@ export function WorkflowCopilotChat({
                 applyStoredNarrativeEvent(payload);
                 return false;
               case "run_started":
+                applyStoredNarrativeEvent(payload);
                 focusTurnRun(payload.workflow_run_id);
                 return false;
               case "block_progress":
@@ -8915,6 +8896,7 @@ export function WorkflowCopilotChat({
       onWorkflowPersisted,
       onRecordTask,
       authoringUnavailableReason,
+      docEditorEnabled,
       reserveCopilotTurn,
       isCopilotTurnCurrent,
       isCopilotOwnerCurrent,
@@ -9874,6 +9856,68 @@ export function WorkflowCopilotChat({
       </div>
     </div>
   ) : null;
+  // Mid-turn Accept would be clobbered by the in-flight turn's terminal restore, so the gate waits
+  // for idle. Another writer's claim holds the workflow, and an Accept now would only be refused.
+  const gateIdleAndUnclaimed =
+    !isLoading && !isLoadingHistory && !unattributedClaim;
+  // A different question from the one above, asked from its own subject: Accept, Reject and Test
+  // write over a staged proposal, so they need one in hand, they wait out an Accept whose outcome
+  // is unresolved, and they stay dark in the gates that may not write at all.
+  const gateActionable =
+    Boolean(proposedWorkflow) &&
+    gateIdleAndUnclaimed &&
+    !isAccepting &&
+    gateFailureAllowsAction(gateFailureKind);
+  const turningOffThisChat =
+    workflowCopilotChatId !== null &&
+    (turningOffCounts.get(workflowCopilotChatId) ?? 0) > 0;
+  // Only the two accepts wait for Turn off; Review and Reject write no auto_accept.
+  const gateAcceptsEnabled = !turningOffThisChat;
+  // The Doc view shows the pending proposal with the review its owning turn recorded.
+  const docProposalOwnerIndex = pendingProposalTurnId
+    ? findLastIndexOfTurn(messages, pendingProposalTurnId)
+    : -1;
+  const docProposalTurn =
+    docProposalOwnerIndex >= 0
+      ? messages[docProposalOwnerIndex]?.narrative
+      : undefined;
+  const docProposalReview = docProposalTurn?.review ?? null;
+  const docProposalTested =
+    getPendingReviewGateVerdict(
+      docProposalTurn,
+      proposedWorkflow,
+      pendingProposalMetadata,
+    ) === "tested";
+  const docProposalBaseline = proposedWorkflow
+    ? getReviewBaseline(resolvePendingProposalTurnId())
+    : null;
+  const settleFromOutsideRef = useRef(settleProposalFromOutside);
+  settleFromOutsideRef.current = settleProposalFromOutside;
+  useEffect(() => {
+    // Published whenever the Doc editor is on, not only while the Doc is shown, so the save guard
+    // still sees a staged proposal after the person switches to Visual or YAML.
+    if (!proposedWorkflow || !docEditorEnabled) return;
+    const { setProposal } = useCopilotProposalStore.getState();
+    setProposal({
+      proposed: proposedWorkflow,
+      baseline: docProposalBaseline,
+      review: docProposalReview,
+      tested: docProposalTested,
+      actionable: gateActionable,
+      acceptable: gateActionable && gateAcceptsEnabled,
+      decide: settleFromOutsideRef.current(proposedWorkflow),
+    });
+    return () => setProposal(null);
+  }, [
+    docEditorEnabled,
+    proposedWorkflow,
+    pendingProposalMetadata,
+    docProposalBaseline,
+    docProposalReview,
+    docProposalTested,
+    gateActionable,
+    gateAcceptsEnabled,
+  ]);
   if (!isOpen || (docked && !portalTarget)) {
     return recoveryBanner
       ? createPortal(
@@ -9906,6 +9950,18 @@ export function WorkflowCopilotChat({
     ? findLastIndexOfTurn(messages, gateOwnerTurnId)
     : -1;
   const gateIndex = gateOwnerIndex >= 0 ? gateOwnerIndex : lastTurnIndex;
+  let latestTurnCause: string | null = null;
+  for (
+    let index = messages.length - 1;
+    index >= Math.max(gateOwnerIndex, 0);
+    index -= 1
+  ) {
+    const narrative = messages[index]?.narrative;
+    if (narrative?.turnId) {
+      latestTurnCause = narrative.turnFacts?.terminalCause ?? null;
+      break;
+    }
+  }
   const gateOwnerMessage = messages[gateIndex];
   const gateOwnerNarrative = gateOwnerMessage?.narrative;
   const gateOwnerRendersInline = Boolean(
@@ -9931,19 +9987,7 @@ export function WorkflowCopilotChat({
     gateFailure?.kind === "saved" ||
     gateFailure?.kind === "recover" ||
     gateFailure?.kind === "changed";
-  // Mid-turn Accept would be clobbered by the in-flight turn's terminal restore, so the gate waits
-  // for idle. Another writer's claim holds the workflow, and an Accept now would only be refused.
-  const gateIdleAndUnclaimed =
-    !isLoading && !isLoadingHistory && !unattributedClaim;
   const gateActionsShown = gateHasSubject && gateIdleAndUnclaimed;
-  // A different question from the one above, asked from its own subject: Accept, Reject and Test
-  // write over a staged proposal, so they need one in hand, they wait out an Accept whose outcome
-  // is unresolved, and they stay dark in the gates that may not write at all.
-  const gateActionable =
-    Boolean(proposedWorkflow) &&
-    gateIdleAndUnclaimed &&
-    !isAccepting &&
-    gateFailureAllowsAction(gateFailureKind);
   // The chip jumps to the gate, so it waits for the gate's footer rather than pointing at a card
   // with nothing to click.
   const pendingChipVisible = Boolean(
@@ -9961,11 +10005,6 @@ export function WorkflowCopilotChat({
       : (gateOwnerMessage?.id ?? null);
   const detachedReceiptShown =
     !gateHasSubject && acceptReceiptAnchor === DETACHED_GATE_RECEIPT;
-  const turningOffThisChat =
-    workflowCopilotChatId !== null &&
-    (turningOffCounts.get(workflowCopilotChatId) ?? 0) > 0;
-  // Only the two accepts wait for Turn off; Review and Reject write no auto_accept.
-  const gateAcceptsEnabled = !turningOffThisChat;
   // A staged attachment counts as content: with only a file in the tray the button would
   // otherwise read as Stop during a turn, and clicking Send would cancel the turn instead.
   const hasComposerText =
@@ -10636,6 +10675,7 @@ export function WorkflowCopilotChat({
                             />
                           ) : null}
                           <ReviewGateCard
+                            docEditorEnabled={docEditorEnabled}
                             turn={message.narrative}
                             pending={index === gateIndex && gateHasSubject}
                             verdict={
@@ -10681,6 +10721,9 @@ export function WorkflowCopilotChat({
                             }
                             flash={
                               turnId !== null && turnId === gateFlashTurnId
+                            }
+                            latestTurnCause={
+                              index === gateIndex ? latestTurnCause : null
                             }
                           />
                         </div>
@@ -10750,6 +10793,7 @@ export function WorkflowCopilotChat({
                           ) : null}
                           {isGateOwnerOrLast || acceptedReceiptHere ? (
                             <ReviewGateCard
+                              docEditorEnabled={docEditorEnabled}
                               pending={isGateOwnerOrLast}
                               verdict={
                                 isGateOwnerOrLast
@@ -10783,6 +10827,7 @@ export function WorkflowCopilotChat({
                                   ? retryGateFailure
                                   : undefined
                               }
+                              latestTurnCause={latestTurnCause}
                             />
                           ) : null}
                           {feedbackControl}
@@ -10856,6 +10901,7 @@ export function WorkflowCopilotChat({
                   />
                 ) : null}
                 <ReviewGateCard
+                  docEditorEnabled={docEditorEnabled}
                   pending={!detachedReceiptShown}
                   verdict={
                     detachedReceiptShown
@@ -10886,6 +10932,7 @@ export function WorkflowCopilotChat({
                   accepting={isAccepting}
                   failure={gateFailureKind}
                   onRetry={gateFailureRetryable ? retryGateFailure : undefined}
+                  latestTurnCause={latestTurnCause}
                 />
               </div>
             ) : null}

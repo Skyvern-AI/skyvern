@@ -71,9 +71,18 @@ class LLMProviderErrorRetryableTask(LLMProviderError):
 
 
 class LLMOutputTruncatedError(InvalidLLMResponseFormat):
-    def __init__(self, model: str, prompt_tokens: int, completion_tokens: int, reasoning_tokens: int) -> None:
+    def __init__(
+        self,
+        model: str,
+        prompt_tokens: int,
+        completion_tokens: int,
+        reasoning_tokens: int,
+        finish_reason: str | None = None,
+    ) -> None:
+        # The reason is reported, not assumed: upstreams label an answer-less reply `length` or
+        # `stop` for the same underlying spend, and the two are only tellable apart here.
         super().__init__(
-            f"LLM output truncated (finish_reason=length, content=None). "
+            f"LLM output truncated (finish_reason={finish_reason}, content=None). "
             f"model={model}, prompt_tokens={prompt_tokens}, completion_tokens={completion_tokens}, "
             f"reasoning_tokens={reasoning_tokens}"
         )
@@ -81,6 +90,7 @@ class LLMOutputTruncatedError(InvalidLLMResponseFormat):
         self.prompt_tokens = prompt_tokens
         self.completion_tokens = completion_tokens
         self.reasoning_tokens = reasoning_tokens
+        self.finish_reason = finish_reason
 
 
 # A response-shape error rather than a provider error: the model answered, so callers that hold or re-ask on an

@@ -13,6 +13,10 @@ keywords:
 <div className="cl-page">
   <div className="cl-sidebar">
     <p className="cl-sidebar-title">TIMELINE</p>
+    <a href="#week-oct-26-2026" className="cl-sidebar-link">Week of Oct 26, 2026</a>
+    <a href="#week-oct-19-2026" className="cl-sidebar-link">Week of Oct 19, 2026</a>
+    <a href="#week-oct-12-2026" className="cl-sidebar-link">Week of Oct 12, 2026</a>
+    <a href="#week-oct-5-2026" className="cl-sidebar-link">Week of Oct 5, 2026</a>
     <a href="#week-sep-28-2026" className="cl-sidebar-link">Week of Sep 28, 2026</a>
     <a href="#week-sep-21-2026" className="cl-sidebar-link">Week of Sep 21, 2026</a>
     <a href="#week-sep-14-2026" className="cl-sidebar-link">Week of Sep 14, 2026</a>
@@ -50,6 +54,229 @@ keywords:
   <div className="cl-content">
     <h1 className="cl-title">Changelog</h1>
     <p className="cl-subtitle">New features, improvements, and fixes in Skyvern</p>
+
+<a id="week-oct-26-2026"></a>
+<Update label="Week of October 26, 2026" description="Reliability fix for browser extension tab recovery">
+
+## Bug fixes
+
+- Fixed an issue where another browser extension (such as a password manager) adding a frame to an agent's tab could cause Skyvern to lose that tab mid-task instead of recovering it automatically.
+
+</Update>
+
+<a id="week-oct-19-2026"></a>
+<Update label="Week of October 19, 2026" description="Drag-and-drop actions, Bitwarden logins in Copilot, runs list date filter, reliability fixes">
+
+## New features
+
+- **Drag-and-Drop Workflow Actions** — Copilot can now build workflows that perform drag-and-drop actions between elements in the browser.
+- **MCP Feedback Tool** — Added a feedback tool that lets agents using the Skyvern MCP report missing capabilities or unclear guidance directly to the Skyvern team.
+- **Copilot Access to Saved Bitwarden Logins** — Copilot can now find and use logins saved in your connected Bitwarden vault instead of asking you to re-enter credentials you already have stored. ([#9031](https://github.com/Skyvern-AI/skyvern/pull/9031))
+
+## Improvements
+
+- **Cleaner 1Password Import Categories** — The 1Password import dialog now only shows item categories that can actually be imported as credentials, instead of letting you pick items that always fail to import.
+- **In-Chat Google Account Connections** — Copilot can now connect Gmail (read-only) and Google Sheets accounts directly from the chat, without having to leave the page to visit Integrations.
+- **Runs List Date Filtering** — The runs list API now supports filtering by a creation date range and defaults free-text search to the last 30 days to avoid timeouts for large organizations.
+- **More Reliable Secondary AI Tasks** — Improved success rates and reduced costs for tasks like OTP parsing, image-to-shape conversion, and automatic title generation by upgrading the underlying secondary AI model.
+- **Cleaner My Agents List** — Job application runs no longer clutter your My Agents list with duplicate auto-generated workflow entries.
+- **Copilot Error Context** — Copilot can now use the recorded error from a page call that a completed block caught, helping it diagnose and repair workflows. ([#8970](https://github.com/Skyvern-AI/skyvern/pull/8970))
+- **More Reliable Model Fallback** — Improved task reliability by automatically retrying with a different model when a provider blocks or refuses a response, instead of letting the run fail. ([#8971](https://github.com/Skyvern-AI/skyvern/pull/8971))
+- **Faster Dropdown Selection** — Selecting an option from a long dropdown menu is now dramatically faster.
+- **Clearer Cloudflare Handling in New Sessions** — Changed how the Cloudflare challenge auto-solver behaves in new browser sessions to avoid conflicting with Skyvern's own Cloudflare handling.
+- **Clearer Proxy Failure Guidance** — Failure messages for interrupted downloads over a residential proxy now suggest trying an ISP proxy instead.
+- **Faster Terminated Tasks** — Tasks that end as terminated now finish noticeably faster, since a background check no longer delays the result.
+
+## Bug fixes
+
+- Fixed the workflow editor's Save button failing with an error when clicked while an authoring or Copilot action was still in progress; it's now disabled until it's safe. ([#8961](https://github.com/Skyvern-AI/skyvern/pull/8961))
+- Fixed the credential list showing a non-functional Edit option for read-only credentials imported from 1Password.
+- Fixed a bug where automated logins on certain web apps built with Flutter could submit an empty password field.
+- Fixed an issue where importing multiple 1Password items could leave some items partially imported if a later item in the same batch was denied.
+- Fixed a 1Password credential refresh failing entirely when one vault was inaccessible, instead of continuing to update credentials from accessible vaults.
+- Fixed reliability issues with automated form filling where a successfully submitted value could be incorrectly reported as failed on certain pages.
+- Fixed an issue where refreshing or re-importing a 1Password credential could overwrite its previously verified website URL.
+- Fixed download steps in AI-driven tasks so they finish correctly based on the files actually downloaded, instead of sometimes refusing to finish or crediting the wrong file.
+- Fixed Copilot generating broken download steps for files located inside iframes, which previously caused the download to time out.
+- Fixed an issue where unusually large or malformed PDFs could crash a workflow run; these files now fail quickly with a clear error instead.
+- Fixed scheduled workflow runs failing to start when retrieving credentials from Bitwarden under heavy load.
+- Fixed Copilot not being able to read the contents of SOP documents uploaded through the Upload SOP button or attached in chat.
+- Fixed captcha solving failing when the system mistakenly tried to read a small icon instead of the actual captcha image.
+- Fixed a bug where Skyvern could submit a form twice on slow-loading pages.
+- Fixed an issue where Copilot could get stuck and refuse to show a new sign-in prompt after the user had already signed in once earlier in the same session.
+- Fixed an issue where navigation blocks could save a blank model override, causing a misleading model indicator and inaccurate version comparisons in the workflow editor. ([#8979](https://github.com/Skyvern-AI/skyvern/pull/8979))
+- Fixed an issue where anti-bot protection could block automated browser workflows on certain websites.
+- Fixed an issue where a self-hosted run could incorrectly start or save partial results after another server had already taken over its lease, which could leave runs in an inconsistent state. ([#8982](https://github.com/Skyvern-AI/skyvern/pull/8982))
+- Fixed an issue where clicking an answer tile in a form could be incorrectly reported as failed or get toggled back off. ([#8983](https://github.com/Skyvern-AI/skyvern/pull/8983))
+- Fixed an issue where a valid phone number was flagged as incorrect when confirming the entered value, if the field displayed the digits with special spacing.
+- Fixed an issue where buttons inside certain embedded components, such as a download menu, were not detected by the agent, causing a task to finish without completing the intended action.
+- Fixed an issue where filling in an autocomplete field could take several minutes and could be reported as successful even when no value was actually selected.
+- Fixed an issue where an unresponsive page could cause an action to hang for several minutes instead of timing out. ([#8990](https://github.com/Skyvern-AI/skyvern/pull/8990))
+- Fixed an issue where a task could be forced to finish as failed upon reaching a verification code step, even when that wasn't the task's actual goal.
+- Fixed an issue where processing certain PDF files could crash a worker and disrupt other running tasks.
+- Fixed an issue where Skyvern could click the wrong element next to a small icon-only button instead of the button itself.
+- Fixed the browser failure message shown when a run's browser stopped responding not accurately describing what retrying will and won't fix.
+- Fixed an issue where a workflow block's configured download timeout was ignored, causing large file downloads to be cancelled too early.
+- Fixed an issue where Skyvern could treat an Arkose/FunCaptcha challenge as solved before it was actually cleared, causing login flows to stall.
+- Fixed workflow runs failing when retrieving a Bitwarden API-key credential took longer than expected, by giving the unlock step more time to complete.
+- Fixed an issue where Skyvern could give up waiting for a verification code too early because a normal "no code yet" response was misread as an error. ([#8997](https://github.com/Skyvern-AI/skyvern/pull/8997))
+- Fixed the "Browser error" tooltip promising a fresh browser on retry even when a run was reusing an existing browser session or connecting to your own browser.
+- Fixed workflow runs triggered by external events being permanently rejected after a temporary submission failure instead of being automatically retried. ([#8999](https://github.com/Skyvern-AI/skyvern/pull/8999))
+- Fixed an issue where a run's action history could show a download as completed even though it actually failed.
+- Fixed Skyvern giving up right as a site's acceptance response was about to arrive, causing false failures on job application workflows.
+- Fixed an issue where runs that successfully saved their file could still show an unrelated download error.
+- Fixed an issue where an unresolved CAPTCHA challenge on a page could block Skyvern from handling other CAPTCHA types also present on that page.
+- Fixed job application workflows not using their one permitted retry after a site rejected a submission, causing false failures. ([#9003](https://github.com/Skyvern-AI/skyvern/pull/9003))
+- Fixed an issue where canceling passkey setup before it finished could leave behind a credential that could never be deleted.
+- Fixed a bug where Copilot could get stuck on "checking for saved changes" and lock the chat after a change failed to save. ([#9006](https://github.com/Skyvern-AI/skyvern/pull/9006))
+- Fixed an issue where an interrupted file download during an automated task could be saved and treated as a completed file instead of being discarded. ([#9009](https://github.com/Skyvern-AI/skyvern/pull/9009))
+- Fixed an error that could prevent a completed data-extraction task from loading correctly or delivering its completion webhook. ([#9016](https://github.com/Skyvern-AI/skyvern/pull/9016))
+- Fixed an issue where solving certain captchas could hang a task run for hours instead of timing out properly.
+- Fixed an issue causing some automated task steps to fail when the AI model used its entire response budget on internal reasoning.
+- Fixed an issue where a failed page navigation in a persistent browser session could surface as a generic "browser unavailable" error instead of the real underlying error. ([#9020](https://github.com/Skyvern-AI/skyvern/pull/9020))
+- Fixed workflow runs continuing on after an unexpected browser disconnection and risking an unverified success instead of failing immediately. ([#9022](https://github.com/Skyvern-AI/skyvern/pull/9022))
+- Fixed an issue on pages with many frames where duplicate internal frame identifiers could cause automation to interact with the wrong element.
+- Fixed an issue where Skyvern kept re-entering the same externally supplied one-time passcode after a site rejected it instead of waiting for a new one. ([#9026](https://github.com/Skyvern-AI/skyvern/pull/9026))
+- Fixed an issue where a legitimately downloaded CSV file could be mistakenly rejected as an error page during a task run. ([#9029](https://github.com/Skyvern-AI/skyvern/pull/9029))
+- Fixed an issue where some task workflow runs were missing their final screenshot in the run details. ([#9030](https://github.com/Skyvern-AI/skyvern/pull/9030))
+- Fixed a race condition in anti-bot challenge handling that could cause a browser automation task to hang instead of properly timing out.
+- Fixed MCP tool calls with timeout values outside the allowed range being silently rejected or misread instead of returning a clear error message.
+- Fixed an issue where the analytics dashboard could incorrectly show zero activity for days that actually had completed runs.
+- Fixed an issue that caused every tool call from newer MCP clients, including Claude, to fail after the initial connection handshake.
+- Fixed tasks giving up early instead of retrying as configured when a failure was mistakenly flagged as anti-bot detection.
+- Fixed task runs repeatedly retrying against a dead browser instead of stopping and reporting failure immediately when the browser was lost.
+- Fixed an issue where Yes/No style question buttons on application forms could record the answer to the wrong question. ([#9037](https://github.com/Skyvern-AI/skyvern/pull/9037))
+
+</Update>
+
+<a id="week-oct-12-2026"></a>
+<Update label="Week of October 12, 2026" description="1Password credential import, event triggers, out-of-credit protection, reliability fixes">
+
+## New features
+
+- **Email Attachment Downloads** — Workflows can now optionally download email attachments found by the Email Inbox block, so later steps can use those files directly.
+- **Per-Block Analytics Breakdown** — The agent analytics page now shows a breakdown of which workflow block an agent's actions and failures come from, making it easier to pinpoint where an agent is slow or flaky. ([#8902](https://github.com/Skyvern-AI/skyvern/pull/8902))
+- **Event Triggers in Studio** — Added a Triggers panel in Studio for creating, managing, rotating, and monitoring signed event trigger integrations, including delivery history and replay. ([#8933](https://github.com/Skyvern-AI/skyvern/pull/8933))
+- **1Password Vault Import** — Added the ability to import selected items from an organization's 1Password vault into Skyvern credentials, with a dedicated import UI and support for keeping them refreshed. ([#8952](https://github.com/Skyvern-AI/skyvern/pull/8952), [#8953](https://github.com/Skyvern-AI/skyvern/pull/8953))
+
+## Improvements
+
+- **AWS WAF Captcha Solving** — Skyvern can now automatically solve AWS WAF "confirm you are human" captcha challenges, not just Cloudflare ones.
+- **Icon-Only Button Recognition** — Skyvern can now recognize and click icon-only buttons, such as edit or delete icons, that have no visible text label.
+- **Iframe Captcha Handling** — Improved captcha handling on privacy-request forms that embed a verification widget in an iframe, so legitimate submissions are no longer incorrectly flagged as bot traffic.
+- **Self-Hosted Intranet Access** — Self-hosted deployments can now disable URL validation for internal or intranet targets when their network policy requires it. ([#8881](https://github.com/Skyvern-AI/skyvern/pull/8881))
+- **Copilot Network Failure Detection** — Copilot can now detect and report when a page's own network request fails, instead of appearing to wait on it indefinitely.
+- **More Accurate Yes/No Question Detection** — Improved accuracy of Yes/No question detection on job application forms, reducing the chance of submitting an incorrect answer to questions like work authorization or sponsorship.
+- **More Reliable Job Application Sign-In** — Job application recipes now handle sign-in and emailed verification codes more reliably, improving how often automated applications complete successfully. ([#8897](https://github.com/Skyvern-AI/skyvern/pull/8897))
+- **Sharper Copilot Screenshots** — Copilot now sends screenshots at a sharper resolution with each message, improving its ability to read small text and fine details on a page. ([#8905](https://github.com/Skyvern-AI/skyvern/pull/8905))
+- **Clearer Copilot Sign-In Label** — Copilot's credential card now clearly labels "Sign in myself" as a one-time option for the current test, rather than implying it saves your sign-in for future runs.
+- **Cursor-Based Task List Pagination** — Added optional cursor-based pagination to the task list API for faster, more reliable paging through large task histories.
+- **Copilot Page-State Refresh** — Copilot now refreshes its view of the page after every browser automation step, so it builds and fixes workflows based on the page's current state instead of an outdated screenshot.
+- **Visible Run Error Codes** — The run Overview page now shows a failed run's error codes directly, without needing to open the Outputs tab.
+- **Up-to-Date Model for Older Workflows** — Workflows created before 2026 now run on the same up-to-date AI model as newer workflows instead of being held back on an older one.
+- **Faster Code Block Import Checks** — Workflow code blocks now catch disallowed imports immediately when you save them, and support common built-in imports, instead of failing partway through a run.
+- **Structured Expired-Session Errors** — Responses for expired browser sessions now include a structured error code, and run summaries show a clearer path to starting a new session.
+- **Faster Permanent Delivery Failure Reporting** — Event trigger deliveries that fail for a permanent reason, such as missing configuration, are now reported immediately instead of being retried repeatedly before failing.
+- **Faster Task and Run Listing** — Listing tasks and runs through the API now responds noticeably faster.
+- **Concurrent Webhook Delivery** — Webhook and event-trigger deliveries are now dispatched concurrently, reducing delivery delays during traffic bursts.
+- **Clearer 1Password Empty-Vault Guidance** — Added clearer in-app guidance on the Passwords tab when a connected 1Password account has no listable login items.
+- **Retryable Browser Session Limits** — Browser session creation now returns a quick, clearly retryable response instead of timing out when an organization starts too many sessions at once.
+- **Longer Copilot Conversation Memory** — Copilot can now retain more conversation history before trimming, reducing cases where it lost track of recent actions during long chats. ([#8958](https://github.com/Skyvern-AI/skyvern/pull/8958))
+
+## Bug fixes
+
+- Fixed an issue where a scrolling screenshot could be dropped entirely if the page scrolled backward near the end of the capture.
+- Fixed an issue where certain job-application workflow runs would fail to complete even when they did not actually require a saved credential.
+- Fixed an issue where Copilot would refuse every further action in a conversation after a single conflicting edit, instead of recovering automatically.
+- Fixed an issue where Copilot's scheduling and account tools could be blocked by a pending workflow draft the user could no longer see.
+- Fixed an issue where canceling a run could still let an in-progress dropdown selection complete and change the page afterward.
+- Fixed file parsing (PDF and image extraction) hanging indefinitely instead of failing with a clear error when an extraction call stalled.
+- Fixed large-document text extraction failing prematurely by increasing the allowed processing time. ([#8888](https://github.com/Skyvern-AI/skyvern/pull/8888))
+- Fixed Copilot sometimes ending a turn with no response at all when it reached its time limit.
+- Fixed job application runs sometimes being marked as a plain failure instead of correctly recognizing that a posting had been removed or closed.
+- Fixed scheduled runs, code blocks, cached steps, and SDK actions running first and being billed afterward instead of being blocked when an account was already out of credits. ([#8894](https://github.com/Skyvern-AI/skyvern/pull/8894))
+- Fixed Copilot marking test runs as stopped when a turn's time limit was reached, instead of clearly showing in chat that they were left running.
+- Fixed phone number fields that misread a national number as an international one, causing Skyvern to repeatedly retype the value instead of asking once, clearly, for the country code. ([#8896](https://github.com/Skyvern-AI/skyvern/pull/8896))
+- Fixed login flows occasionally losing an already-fetched emailed or texted verification code and getting stuck instead of reliably using it. ([#8898](https://github.com/Skyvern-AI/skyvern/pull/8898))
+- Fixed document extraction returning incorrect or inconsistent values when a PDF's text contained corrupted characters; it now falls back to image-based reading.
+- Fixed job application forms incorrectly flagging correct radio-button and checkbox answers, such as work authorization questions, as needing to be changed. ([#8899](https://github.com/Skyvern-AI/skyvern/pull/8899))
+- Fixed a race condition when starting a new Copilot chat while chat history was still loading; the "New chat" button is now disabled until loading finishes. ([#8900](https://github.com/Skyvern-AI/skyvern/pull/8900))
+- Fixed workflow runs waiting on a human interaction step either waiting out the full timeout or being marked successful incorrectly when the browser session was closed; they now end immediately with the correct status.
+- Fixed date-picker fields that take many steps to resolve getting stuck for 20-30 minutes; Skyvern now works through them within a fixed time budget.
+- Fixed searches of a workflow's run history occasionally timing out with a generic server error instead of returning quickly with a clear error.
+- Fixed an issue where Copilot could fail to confirm that a change you accepted was actually saved. ([#8906](https://github.com/Skyvern-AI/skyvern/pull/8906))
+- Fixed analytics breakdowns by workflow tag or metadata undercounting runs for the current day before data had fully landed.
+- Fixed a bug that could cause a run to use the wrong AI model when multiple runs executed on the same worker at once. ([#8908](https://github.com/Skyvern-AI/skyvern/pull/8908))
+- Fixed file-download workflow blocks failing to retrieve files when running through certain anti-bot-protected browser sessions.
+- Fixed large artifact downloads failing or timing out by streaming file content instead of loading it entirely into memory.
+- Fixed workflows getting stuck on TrustArc consent forms by automatically retrying the submission after a bot-check rejection.
+- Fixed Copilot sometimes reading a hidden duplicate of a value instead of the visible one when building a workflow.
+- Fixed new Google Cloud Marketplace purchases failing to get approved.
+- Fixed Copilot-built workflows breaking when a page's visual styling changed, by having Copilot identify repeated labels by their content instead of their styling.
+- Fixed Copilot occasionally proposing an untested workflow change when it ran out of time while building a response.
+- Fixed failed workflow runs showing a generic recovery error instead of the real underlying error when automatic recovery also failed.
+- Fixed performance slowdowns in browser automation caused by frequent pauses after multi-viewport screenshots.
+- Fixed Copilot-generated code failing with an execution-context error when reading a value immediately after a page navigation.
+- Fixed an issue where sensitive values from a run could appear in the self-heal recovery details when a code block's automatic fallback failed.
+- Fixed an issue where tasks targeting a city with no available proxy would fail outright instead of falling back to a proxy in the same country.
+- Fixed an issue where a Copilot conversation could hang indefinitely and never complete if the underlying model connection stalled.
+- Fixed a stopped Copilot task incorrectly reporting that it ran out of time instead of showing it was stopped at your request.
+- Fixed searches of your organization's runs hanging and failing after a long delay instead of returning a clear error quickly.
+- Fixed self-hosted deployments leaving runs stuck running forever after the server crashed or restarted, instead of failing and notifying callers. ([#8925](https://github.com/Skyvern-AI/skyvern/pull/8925))
+- Fixed an issue where Copilot chat messages could occasionally appear out of order in the conversation history.
+- Fixed Flutter web apps appearing blank or failing with a misleading page-load error; Skyvern can now see and interact with them normally. ([#8928](https://github.com/Skyvern-AI/skyvern/pull/8928))
+- Fixed an error that could cause workflow submissions using a shared browser session to fail unexpectedly when submission took longer than usual.
+- Fixed workflows that explicitly disable AI fallback still triggering an AI-powered recovery attempt when a code block failed.
+- Fixed plan tier and credit figures in Analytics failing to load for non-admin organization members.
+- Fixed an issue where runs started from the web app could occasionally be routed to a slower, lower-priority model tier, causing noticeable delays.
+- Fixed a bug in the workflow builder where opening and closing a loop or conditional block's editor panel incorrectly triggered an "Unsaved Changes" prompt. ([#8934](https://github.com/Skyvern-AI/skyvern/pull/8934))
+- Fixed an issue where filling in a form field could time out if the field briefly became read-only while automation was interacting with it.
+- Fixed a timed-out Search workflow block request immediately failing the entire run instead of being automatically retried.
+- Fixed an issue where checking on a very large workflow run could return no information at all, including losing the links needed to download completed files.
+- Fixed job application runs mislabeling being blocked by a site's bot protection as a genuine login failure, and vice versa. ([#8946](https://github.com/Skyvern-AI/skyvern/pull/8946))
+- Fixed repeated failures caused by a single bad browser connection; Skyvern now automatically takes a connection out of rotation after it repeatedly fails to load pages.
+- Fixed the Studio Triggers panel showing incorrect local times for deliveries and occasionally discarding unsaved trigger mapping edits on refresh.
+- Fixed an issue where saving an invalid 1Password token could silently break an already-working 1Password connection.
+- Fixed a bug where pages with looping iframes could hang a browser automation run; affected runs now fail cleanly instead of stalling indefinitely.
+- Fixed one-time verification codes failing to submit when a login page splits the code across multiple input boxes.
+- Fixed autocomplete on dropdown-based form fields stalling or submitting an incomplete value when no options were initially available.
+- Fixed an issue where a canceled workflow run could send its final webhook notification twice.
+- Fixed an issue where deleting a workflow or folder could leave its scheduled runs active, causing them to fail repeatedly.
+- Fixed imported 1Password credentials to show clearer, specific error messages when generating a one-time verification code fails. ([#8951](https://github.com/Skyvern-AI/skyvern/pull/8951))
+- Fixed an issue where Copilot could run two conflicting actions in the same chat at once after a dropped connection, page reload, or duplicate message. ([#8955](https://github.com/Skyvern-AI/skyvern/pull/8955))
+- Fixed an issue where Copilot could repeatedly request a new screenshot without ever actually seeing one during long conversations. ([#8956](https://github.com/Skyvern-AI/skyvern/pull/8956))
+
+</Update>
+
+<a id="week-oct-5-2026"></a>
+<Update label="Week of October 5, 2026" description="Job-application fixes, Copilot and billing reliability improvements">
+
+## Improvements
+
+- **Faster Large-Output Run Pages** — Run detail and timeline pages now load faster for runs with very large output values.
+- **Subscription Cancellation Email** — Customers now receive an email confirmation when they cancel their subscription, including their access end date.
+- **Copilot Selector Match Visibility** — Copilot now shows how many elements a selector matches and whether a click will actually reach a form control, helping it build more reliable automations.
+
+## Bug fixes
+
+- Fixed validation workflow steps reloading or navigating away from a page they were already on, causing false failures on session-ticket pages.
+- Fixed legal and compliance answers typed with Enter being submitted before they were checked for support, which could let an unsupported answer go through.
+- Fixed radio-button and checkbox answers to legal questions, like work authorization, not being checked for support before a form submitted, unlike typed answers.
+- Fixed workflow steps that successfully changed the page, such as toggles or filters, being incorrectly marked as failed.
+- Fixed contract-billed organizations getting stuck after a subscription cancellation and losing access to the Manage Subscription option; billing now repairs automatically.
+- Fixed the workflows list timing out while loading reliability badges for organizations with large numbers of historical runs.
+- Fixed a Copilot workflow build that recently failed testing still showing as Tested on later review turns.
+- Fixed the Tested indicator on a Copilot-reviewed workflow block showing an outdated test result instead of the most recent one.
+- Fixed the runs list timing out when filtering runs by error code.
+- Fixed the job-application session list reading "Submitted this session," which implied an application was received even when it had failed or was still starting; it now reads "Started this session."
+- Fixed free-text searches of the runs list timing out instead of failing fast with a clear error.
+- Fixed Copilot silently signing in with a different saved login when the one you named couldn't be found; it now asks for guidance instead.
+- Fixed runs sometimes incorrectly flagging a valid credential as rejected; invalid-credential results are now verified before being reported.
+- Fixed task agents judging a task complete before a page's content finished rendering, causing premature completions on pages that render content after load.
+- Fixed one-time login codes typed during a run being visible in action history and run details.
+- Fixed an issue where SDK-triggered browser actions could lose their session partway through if the action took a while to complete.
+
+</Update>
 
 <a id="week-sep-28-2026"></a>
 <Update label="Week of September 28, 2026" description="Copilot file downloads, live browser clipboard paste, Discover redesign, reliability fixes">

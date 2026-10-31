@@ -420,6 +420,11 @@ function CredentialItem({
               1Password
             </span>
           )}
+          {credential.vault_type === "bitwarden_connected" && (
+            <span className="inline-flex shrink-0 items-center rounded border border-sky-500/20 bg-sky-500/10 px-1.5 py-0.5 text-[10px] text-sky-700 dark:text-sky-300">
+              Bitwarden
+            </span>
+          )}
         </div>
         {credential.vault_type === "onepassword" &&
           credential.upstream_missing_at && (
@@ -556,24 +561,25 @@ function CredentialItem({
             </Tooltip>
           </TooltipProvider>
         )}
-        {credential.vault_type !== "onepassword" && (
-          <TooltipProvider>
-            <Tooltip>
-              <TooltipTrigger asChild>
-                <Button
-                  size="icon"
-                  variant="tertiary"
-                  className="h-8 w-9"
-                  onClick={() => setEditModalOpen(true)}
-                  aria-label="Edit credential"
-                >
-                  <Pencil1Icon className="size-5" />
-                </Button>
-              </TooltipTrigger>
-              <TooltipContent>Edit Credential</TooltipContent>
-            </Tooltip>
-          </TooltipProvider>
-        )}
+        {credential.vault_type !== "onepassword" &&
+          credential.vault_type !== "bitwarden_connected" && (
+            <TooltipProvider>
+              <Tooltip>
+                <TooltipTrigger asChild>
+                  <Button
+                    size="icon"
+                    variant="tertiary"
+                    className="h-8 w-9"
+                    onClick={() => setEditModalOpen(true)}
+                    aria-label="Edit credential"
+                  >
+                    <Pencil1Icon className="size-5" />
+                  </Button>
+                </TooltipTrigger>
+                <TooltipContent>Edit Credential</TooltipContent>
+              </Tooltip>
+            </TooltipProvider>
+          )}
         <DeleteCredentialButton credential={credential} />
       </div>
       <CredentialsModal

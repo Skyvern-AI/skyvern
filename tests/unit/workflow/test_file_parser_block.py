@@ -92,6 +92,7 @@ def _make_pdf_parser_block(file_url: str) -> PDFParserBlock:
 
 def _mock_workflow_run_context() -> MagicMock:
     ctx = MagicMock()
+    ctx.resolve_block_notes_section.return_value = None
     ctx.has_parameter.return_value = False
     ctx.has_value.return_value = False
     ctx.register_output_parameter_value_post_execution = AsyncMock()
@@ -744,6 +745,7 @@ class TestPDFParserSchemaValidation:
     @staticmethod
     def _patch_execute_dependencies(mp: pytest.MonkeyPatch, block: PDFParserBlock, handler: AsyncMock) -> AsyncMock:
         workflow_run_context = MagicMock()
+        workflow_run_context.resolve_block_notes_section.return_value = None
         workflow_run_context.has_parameter.return_value = False
         record_output_parameter_value = AsyncMock()
 
@@ -2181,7 +2183,7 @@ class TestFileParserTelemetryLogs:
     @staticmethod
     def _patch_extraction(mp: pytest.MonkeyPatch, handler: AsyncMock) -> None:
         # A real key, so `llm_key` assertions discriminate: an AsyncMock's auto-attribute is not a
-        # str, so `_handler_llm_key` would return None and a null assertion would prove nothing.
+        # str, so `handler_llm_key` would return None and a null assertion would prove nothing.
         handler.llm_key = "test-llm-key"
         mp.setattr(FileParserBlock, "_resolve_file_parser_handler", AsyncMock(return_value=handler))
         mp.setattr(

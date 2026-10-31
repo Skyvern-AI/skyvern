@@ -10,6 +10,7 @@ from pathlib import Path
 from typing import Any
 
 import structlog
+from agents.items import TResponseInputItem
 from agents.memory.sqlite_session import SQLiteSession
 from agents.run_config import CallModelData, ModelInputData
 from agents.run_context import RunContextWrapper
@@ -24,6 +25,7 @@ from skyvern.forge.sdk.agents.context import (
     replace_agent_message_field,
 )
 from skyvern.forge.sdk.copilot.browser_ablation import prompt_sha256
+from skyvern.forge.sdk.copilot.cache_envelope import is_replayable_reasoning
 from skyvern.forge.sdk.copilot.config import SCREENSHOT_DROPPED_NUDGE
 from skyvern.forge.sdk.copilot.enforcement import (
     _RECENT_TOOL_OUTPUT_CHAR_CAP,
@@ -223,9 +225,18 @@ def _run_context(data: CallModelData[Any]) -> Any:
     return data.context.context if isinstance(data.context, RunContextWrapper) else data.context
 
 
+def _is_unsent_reasoning(item: TResponseInputItem) -> bool:
+    # Copilot never sets ModelSettings.reasoning, so a reasoning item reaches the request only as replayed summary
+    # text or GPT's encrypted reasoning; a signature-only one (Claude's default thinking display) sends nothing and
+    # must not use up the budget.
+    if get_agent_message_field(item, "type") != "reasoning" or is_replayable_reasoning(item):
+        return False
+    return not any(get_agent_message_field(part, "text") for part in get_agent_message_field(item, "summary") or [])
+
+
 def _copilot_call_model_input_filter(data: CallModelData[Any], *, token_budget: int) -> ModelInputData:
     # Compacted up front so the sharp-copy budget check below sees the input the budget filter will.
-    items = _compact_tool_items(list(data.model_data.input))
+    items = _compact_tool_items([item for item in data.model_data.input if not _is_unsent_reasoning(item)])
     ctx = _run_context(data)
     # Read-only peek: the end-of-turn drain in enforcement stays the only clear, so a provider
     # retry or model fallback re-running this filter still carries the frame.
@@ -301,7 +312,11 @@ def _captured_authoring_capability(ctx: AgentContext | None) -> dict[str, bool] 
     if ctx is None:
         return None
     capability = _copilot_authoring_capability(ctx)
-    return {"code_blocks": capability.code_blocks, "agent_blocks": capability.agent_blocks}
+    return {
+        "code_blocks": capability.code_blocks,
+        "agent_blocks": capability.agent_blocks,
+        "agent_step": capability.agent_step,
+    }
 
 
 def _maybe_dump_model_input(data: CallModelData[Any], model_data: ModelInputData) -> None:

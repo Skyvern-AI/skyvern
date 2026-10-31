@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from collections.abc import Sequence
+from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import TYPE_CHECKING, Awaitable, Callable, Literal, Protocol
 from urllib.parse import urlparse
@@ -21,6 +23,16 @@ if TYPE_CHECKING:
 # URLs a tab reports when it holds no document — including ":" , which Chrome reports for a tab
 # whose only navigation turned into a download.
 BLANK_PAGE_URLS = {"about:blank", ":"}
+
+
+# Compared and hashed by identity, so a reader can remember a record it has already reported.
+@dataclass(eq=False)
+class PageCrashRecord:
+    crashed_at: datetime
+    crashed_url: str
+    cause: Literal["page_crash", "page_lost"]
+    # True once a replacement tab opened and the crashed page's non-blank URL was restored in it.
+    reopened: bool = False
 
 
 def is_selectable_page_url(url: str) -> bool:
@@ -90,6 +102,9 @@ class BrowserState(Protocol):
     def get_browser_state_diagnostic(self) -> BrowserStateDiagnostic | None: ...
 
     def get_browser_connection_loss(self) -> BrowserStateDiagnostic | None: ...
+
+    @property
+    def page_crash_records(self) -> Sequence[PageCrashRecord]: ...
 
     @property
     def active_run_owner(self) -> str | None: ...
@@ -164,7 +179,13 @@ class BrowserState(Protocol):
         """Wait, until at most the monotonic ``deadline``, for ``page``'s in-flight main-frame navigation to settle."""
         ...
 
-    async def close(self, close_browser_on_completion: bool = True, release_driver: bool | None = None) -> bool: ...
+    async def close(
+        self,
+        close_browser_on_completion: bool = True,
+        release_driver: bool | None = None,
+        *,
+        persist_session_state: bool = True,
+    ) -> bool: ...
 
     async def detach_remote_driver(self) -> None:
         """Disable local CDP interception and stop only this process's Playwright driver."""
@@ -212,6 +233,20 @@ def get_browser_connection_loss(browser_state: BrowserState | None) -> BrowserSt
     getter = getattr(browser_state, "get_browser_connection_loss", None)
     loss = getter() if callable(getter) else None
     return loss if isinstance(loss, BrowserStateDiagnostic) else None
+
+
+BROWSER_CONNECTION_LOST_USER_MESSAGE = (
+    "Skyvern lost its connection to the browser partway through this run, so the run stopped where it was. "
+    "Anything the run had already submitted in that browser may or may not have gone through. Check the site "
+    "before running this again, because a new run repeats the steps from the beginning."
+)
+
+
+def browser_connection_lost_reason(browser_state: BrowserState | None) -> str | None:
+    """The failure reason a run records once it has lost its own browser; None while it still holds one."""
+    if get_browser_connection_loss(browser_state) is None:
+        return None
+    return BROWSER_CONNECTION_LOST_USER_MESSAGE
 
 
 def raise_if_browser_connection_lost(

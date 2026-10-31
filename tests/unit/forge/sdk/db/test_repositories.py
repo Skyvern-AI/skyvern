@@ -14,8 +14,10 @@ from sqlalchemy.ext.asyncio import AsyncEngine, async_sessionmaker
 
 from skyvern.forge.sdk.artifact.models import ArtifactType
 from skyvern.forge.sdk.db.agent_db import AgentDB
+from skyvern.forge.sdk.db.enums import OrganizationAuthTokenType
 from skyvern.forge.sdk.db.id import generate_artifact_id
 from skyvern.forge.sdk.db.models import (
+    OrganizationAuthTokenModel,
     OrganizationModel,
     PersistentBrowserSessionModel,
     ScriptBlockModel,
@@ -27,6 +29,8 @@ from skyvern.forge.sdk.db.models import (
 from skyvern.forge.sdk.db.repositories.organizations import OrganizationsRepository
 from skyvern.forge.sdk.db.repositories.scripts import ScriptsRepository
 from skyvern.forge.sdk.db.repositories.tasks import TasksRepository
+from skyvern.forge.sdk.encrypt import encryptor
+from skyvern.forge.sdk.encrypt.base import EncryptMethod
 from skyvern.forge.sdk.models import Step
 from skyvern.forge.sdk.schemas.tasks import TaskStatus
 from skyvern.forge.sdk.schemas.totp_codes import OTPType, RawTOTPCode, TOTPCode
@@ -261,6 +265,50 @@ async def test_organizations_repository_persists_and_clears_default_llm_keys(sql
         assert stored is not None
         assert stored.default_llm_key is None
         assert stored.default_secondary_llm_key is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.usefixtures("registered_encryption")
+async def test_validate_org_auth_token_matches_by_decrypting_each_row(sqlite_engine: AsyncEngine) -> None:
+    session_factory = async_sessionmaker(sqlite_engine, expire_on_commit=False)
+    legacy_ciphertext = await encryptor.encrypt("key-on-cbc", EncryptMethod.AES)
+    async with session_factory() as session:
+        session.add(OrganizationModel(organization_id="o_keys", organization_name="Keys Org"))
+        session.add(
+            OrganizationAuthTokenModel(
+                organization_id="o_keys",
+                token_type=OrganizationAuthTokenType.api,
+                token="",
+                encrypted_token=legacy_ciphertext,
+                encrypted_method=EncryptMethod.AES.value,
+            )
+        )
+        session.add(
+            OrganizationAuthTokenModel(
+                organization_id="o_keys",
+                token_type=OrganizationAuthTokenType.api,
+                token="revoked-plaintext-key",
+                encrypted_token="",
+                encrypted_method="",
+                valid=False,
+            )
+        )
+        await session.commit()
+    repo = OrganizationsRepository(session_factory=session_factory, debug_enabled=False)
+    gcm_key = await repo.create_org_auth_token(
+        "o_keys", OrganizationAuthTokenType.api, "key-on-gcm", encrypted_method=EncryptMethod.AES_GCM
+    )
+
+    for plaintext in ("key-on-cbc", "key-on-gcm"):
+        found = await repo.validate_org_auth_token("o_keys", OrganizationAuthTokenType.api, plaintext)
+        assert found is not None and found.token == plaintext
+    assert (await repo.validate_org_auth_token("o_keys", OrganizationAuthTokenType.api, "key-on-gcm")).id == gcm_key.id
+    assert await repo.validate_org_auth_token("o_keys", OrganizationAuthTokenType.api, "unknown-key") is None
+    assert await repo.validate_org_auth_token("o_keys", OrganizationAuthTokenType.api, "revoked-plaintext-key") is None
+    revoked = await repo.validate_org_auth_token(
+        "o_keys", OrganizationAuthTokenType.api, "revoked-plaintext-key", valid=None
+    )
+    assert revoked is not None and revoked.valid is False
 
 
 def test_schedules_repository_instantiation():
@@ -672,7 +720,9 @@ async def test_create_task_leaves_started_at_unset_for_other_statuses(monkeypatc
 
 
 @pytest.mark.asyncio
-async def test_task_finish_claim_is_exactly_once_across_racing_finalizers(sqlite_engine: AsyncEngine):
+async def test_task_finish_claim_is_exactly_once_across_racing_finalizers(
+    sqlite_engine: AsyncEngine, monkeypatch: pytest.MonkeyPatch
+):
     """Two finalizers landing on one task must produce exactly one finish claim.
 
     The arbitration is the finished_at NULL->set flip: bulk_update_tasks' status
@@ -685,9 +735,14 @@ async def test_task_finish_claim_is_exactly_once_across_racing_finalizers(sqlite
     """
     factory = async_sessionmaker(sqlite_engine, expire_on_commit=False)
     repo = TasksRepository(session_factory=factory, debug_enabled=False)
+    from skyvern.forge.sdk.db.repositories import tasks as tasks_repository
+
+    audit_actor = SimpleNamespace()
+    record_cancel_audit = AsyncMock()
+    monkeypatch.setattr(tasks_repository, "record_run_cancel_audit", record_cancel_audit)
     started = datetime.now(timezone.utc).replace(tzinfo=None)
 
-    async def _seed(task_id: str) -> None:
+    async def _seed(task_id: str, finished_at: datetime | None = None) -> None:
         async with factory() as session:
             session.add(
                 TaskModel(
@@ -696,6 +751,7 @@ async def test_task_finish_claim_is_exactly_once_across_racing_finalizers(sqlite
                     status=TaskStatus.running.value,
                     url="https://example.test/",
                     started_at=started,
+                    finished_at=finished_at,
                     errors=[],
                 )
             )
@@ -734,8 +790,155 @@ async def test_task_finish_claim_is_exactly_once_across_racing_finalizers(sqlite
     )
     assert (first, second) == (True, False)
 
+    await _seed("tsk_cancel_race")
+    await repo.update_task_and_claim_finish("tsk_cancel_race", status=TaskStatus.completed, organization_id="o_race")
+    canceled, finish_claimed, status_changed = await repo.update_task_and_claim_finish_for_cancel(
+        "tsk_cancel_race", organization_id="o_race", audit_actor=audit_actor
+    )
+    assert canceled.status == TaskStatus.completed
+    assert finish_claimed is False
+    assert status_changed is False
+
+    await _seed("tsk_cancel_transition", finished_at=started)
+    canceled, finish_claimed, status_changed = await repo.update_task_and_claim_finish_for_cancel(
+        "tsk_cancel_transition", organization_id="o_race", audit_actor=audit_actor
+    )
+    assert canceled.status == TaskStatus.canceled
+    assert finish_claimed is False
+    assert status_changed is True
+    record_cancel_audit.assert_awaited_once_with(audit_actor, "o_race", "task", "tsk_cancel_transition")
+
     for background_sync in list(repo._background_tasks):
         await background_sync
+
+
+@pytest.mark.asyncio
+async def test_task_cancel_claim_persists_requested_fields(sqlite_engine: AsyncEngine, monkeypatch: pytest.MonkeyPatch):
+    factory = async_sessionmaker(sqlite_engine, expire_on_commit=False)
+    repo = TasksRepository(session_factory=factory, debug_enabled=False)
+    monkeypatch.setattr(repo, "sync_task_run_status", AsyncMock())
+
+    async with factory() as session:
+        session.add(
+            TaskModel(
+                task_id="tsk_cancel_fields",
+                organization_id="o_cancel_fields",
+                status=TaskStatus.running.value,
+                url="https://example.test/",
+                errors=[{"error_code": "existing"}],
+            )
+        )
+        await session.commit()
+
+    canceled, finish_claimed, status_changed = await repo.update_task_and_claim_finish_for_cancel(
+        "tsk_cancel_fields",
+        organization_id="o_cancel_fields",
+        failure_reason="The task stopped.",
+        errors=[{"error_code": "cancelled"}],
+        extracted_information={"result": "partial"},
+        webhook_failure_reason="Webhook delivery failed.",
+    )
+
+    assert canceled.status == TaskStatus.canceled
+    assert canceled.failure_reason == "The task stopped."
+    assert canceled.errors == [{"error_code": "existing"}, {"error_code": "cancelled"}]
+    assert canceled.extracted_information == {"result": "partial"}
+    assert canceled.webhook_failure_reason == "Webhook delivery failed."
+    assert finish_claimed is True
+    assert status_changed is True
+    for background_sync in list(repo._background_tasks):
+        await background_sync
+
+
+@pytest.mark.asyncio
+async def test_task_v2_cancel_repository_audits_only_a_winning_transition(monkeypatch: pytest.MonkeyPatch) -> None:
+    from skyvern.forge.sdk.db.repositories import observer as observer_repository
+    from skyvern.forge.sdk.db.repositories.observer import ObserverRepository
+    from skyvern.forge.sdk.schemas.task_v2 import TaskV2Status
+
+    events: list[str] = []
+    results = ["tsk_v2_cancel", None]
+
+    class Session:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_: object) -> bool:
+            return False
+
+        async def execute(self, _: object):
+            value = results.pop(0)
+            return SimpleNamespace(scalar_one_or_none=lambda: value)
+
+        async def commit(self) -> None:
+            events.append("commit")
+
+    actor = SimpleNamespace()
+
+    async def record_audit(*_: object) -> None:
+        events.append("audit")
+
+    monkeypatch.setattr(observer_repository, "record_run_cancel_audit", record_audit)
+    repo = ObserverRepository(session_factory=Session, debug_enabled=False)
+
+    assert await repo.update_task_v2_status_if_not_final(
+        "tsk_v2_cancel", "org_cancel", TaskV2Status.canceled, audit_actor=actor
+    )
+    assert not await repo.update_task_v2_status_if_not_final(
+        "tsk_v2_cancel", "org_cancel", TaskV2Status.canceled, audit_actor=actor
+    )
+    assert events == ["commit", "audit", "commit"]
+
+
+@pytest.mark.asyncio
+async def test_workflow_cancel_repository_audits_before_log_flush(monkeypatch: pytest.MonkeyPatch) -> None:
+    from skyvern.forge.sdk.db.repositories import workflow_runs as workflow_runs_repository
+    from skyvern.forge.sdk.db.repositories.workflow_runs import WorkflowRunsRepository
+    from skyvern.forge.sdk.workflow.models.workflow import WorkflowRunStatus
+
+    events: list[str] = []
+
+    class Session:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_: object) -> bool:
+            return False
+
+        async def execute(self, _: object):
+            return SimpleNamespace(scalar_one_or_none=lambda: object())
+
+        async def commit(self) -> None:
+            events.append("commit")
+
+    async def record_audit(*_: object) -> None:
+        events.append("audit")
+
+    async def save_logs(_: str) -> None:
+        events.append("logs")
+        raise RuntimeError("artifact flush failed")
+
+    async def on_transition() -> None:
+        events.append("transition")
+
+    monkeypatch.setattr(
+        workflow_runs_repository,
+        "convert_to_workflow_run",
+        lambda _: SimpleNamespace(organization_id="org_cancel"),
+    )
+    monkeypatch.setattr(workflow_runs_repository, "record_run_cancel_audit", record_audit)
+    monkeypatch.setattr(workflow_runs_repository, "save_workflow_run_logs", save_logs)
+    repo = WorkflowRunsRepository(session_factory=Session, debug_enabled=False)
+
+    with pytest.raises(RuntimeError, match="artifact flush failed"):
+        await repo.update_workflow_run_if_not_final(
+            "wr_cancel",
+            WorkflowRunStatus.canceled,
+            audit_actor=SimpleNamespace(),
+            on_transition=on_transition,
+        )
+
+    assert events == ["commit", "audit", "transition", "logs"]
 
 
 @pytest.mark.asyncio

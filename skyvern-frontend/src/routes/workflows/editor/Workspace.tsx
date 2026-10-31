@@ -65,6 +65,8 @@ import { getClient } from "@/api/AxiosClient";
 import { isPaymentRequiredError } from "@/api/paymentRequired";
 import { DebugSessionApiResponse } from "@/api/types";
 import { useCredentialGetter } from "@/hooks/useCredentialGetter";
+import { isEditableTarget } from "./editableTarget";
+import { useCopilotProposalStore } from "@/store/CopilotProposalStore";
 import { useMountEffect } from "@/hooks/useMountEffect";
 import { useBrowserSessionRateLimit } from "../hooks/useBrowserSessionRateLimit";
 import { useActiveRunSessionQuery } from "../hooks/useActiveRunSessionQuery";
@@ -182,7 +184,10 @@ import {
 import { useWorkflowHistory } from "./hooks/useWorkflowHistory";
 import { AppNode, isWorkflowBlockNode, WorkflowBlockNode } from "./nodes";
 import { blockTypeFromNode } from "./nodes/blockTypeFromNode";
-import { ConditionalNodeData } from "./nodes/ConditionalNode/types";
+import {
+  ConditionalNodeData,
+  isConditionalNode,
+} from "./nodes/ConditionalNode/types";
 import { WorkflowParametersPanel } from "./panels/WorkflowParametersPanel";
 import { WorkflowCacheKeyValuesPanel } from "./panels/WorkflowCacheKeyValuesPanel";
 import { WorkflowComparisonPanel } from "./panels/WorkflowComparisonPanel";
@@ -190,8 +195,8 @@ import {
   getElements,
   convert,
   useWorkflowGraphState,
+  blockDeleteTarget,
   getAffectedBlocks,
-  getOutputParameterKey,
   nodeAdderNode,
   createNode,
   defaultEdge,
@@ -278,6 +283,7 @@ import { YamlModeToggle } from "./YamlModeToggle";
 import { useWorkflowYamlEditorLifecycle } from "./hooks/useWorkflowYamlEditorLifecycle";
 import {
   canvasWorkflowVersionFromSaveData,
+  convertWorkflowReviewBaseline,
   type MetadataPatch,
   workflowVersionFromSaveData,
   yamlCommitInputs,
@@ -360,6 +366,9 @@ export type AddNodeProps = {
   parent?: string;
   connectingEdgeType: string;
   branch?: BranchContext;
+  // Used when free; otherwise a generated name.
+  label?: string;
+  select?: boolean;
 };
 
 interface Dom {
@@ -910,19 +919,35 @@ function Workspace({
   // Use a ref for the callback to avoid storing functions in state
   const deleteConfirmCallbackRef = useRef<(() => void) | null>(null);
 
+  const workflowParameters = useWorkflowParametersStore(
+    (state) => state.parameters,
+  );
+  const affectedBlocksForBlockDelete = useCallback(
+    (nodeId: string) => {
+      const target = blockDeleteTarget(
+        nodes,
+        nodeId,
+        new Set(workflowParameters.map((parameter) => parameter.key)),
+      );
+      return getAffectedBlocks(
+        nodes.filter((node) => !target.deletedIds.has(node.id)),
+        target,
+      );
+    },
+    [nodes, workflowParameters],
+  );
+
   const affectedBlocksForDelete = useMemo(() => {
-    if (!deleteBlockDialogState.nodeLabel) {
+    if (!deleteBlockDialogState.nodeId) {
       return [];
     }
-    const outputKey = getOutputParameterKey(deleteBlockDialogState.nodeLabel);
-    return getAffectedBlocks(nodes, outputKey);
-  }, [nodes, deleteBlockDialogState.nodeLabel]);
+    return affectedBlocksForBlockDelete(deleteBlockDialogState.nodeId);
+  }, [affectedBlocksForBlockDelete, deleteBlockDialogState.nodeId]);
 
   const handleRequestDeleteNode = useCallback(
     (nodeId: string, nodeLabel: string, confirmCallback: () => void) => {
       if (refuseMutationDuringYamlCommit()) return;
-      const outputKey = getOutputParameterKey(nodeLabel);
-      const affected = getAffectedBlocks(nodes, outputKey);
+      const affected = affectedBlocksForBlockDelete(nodeId);
       if (affected.length === 0) {
         confirmCallback();
         return;
@@ -934,7 +959,7 @@ function Workspace({
         nodeLabel,
       });
     },
-    [nodes],
+    [affectedBlocksForBlockDelete],
   );
 
   const [leftSideLayoutMode, setLeftSideLayoutMode] = useState<
@@ -980,19 +1005,6 @@ function Workspace({
   // Memoized so the platform sniff runs exactly once per mount.
   const isMac = useMemo(() => isMacPlatform(), []);
   useEffect(() => {
-    const isEditableTarget = (target: EventTarget | null): boolean => {
-      if (!(target instanceof HTMLElement)) return false;
-      const tag = target.tagName;
-      if (tag === "INPUT" || tag === "TEXTAREA" || tag === "SELECT") {
-        return true;
-      }
-      if (target.isContentEditable) return true;
-      // Monaco wraps its editor surface in a div with role="textbox"; let
-      // it keep native undo as well.
-      if (target.getAttribute("role") === "textbox") return true;
-      return false;
-    };
-
     const handleKeyDown = (event: KeyboardEvent) => {
       // IME composition (CJK, accents) fires keydown events we must not
       // intercept - those belong to the composition flow.
@@ -1902,14 +1914,24 @@ function Workspace({
     parent,
     connectingEdgeType,
     branch,
-  }: AddNodeProps) {
+    label,
+    select = true,
+  }: AddNodeProps): string | undefined {
     if (refuseMutationDuringYamlCommit()) return;
     const newNodes: Array<AppNode> = [];
     const newEdges: Array<Edge> = [];
     const id = nanoid();
     // Use global label tracking instead of just current nodes
     const existingLabels = Array.from(usedLabelsRef.current);
-    const newLabel = generateNodeLabel(existingLabels);
+    const newLabel =
+      label && !existingLabels.includes(label)
+        ? label
+        : generateNodeLabel(
+            existingLabels,
+            useWorkflowParametersStore
+              .getState()
+              .parameters.map((parameter) => parameter.key),
+          );
     const computedParentId = parent ?? branch?.conditionalNodeId;
     const node = createNode(
       { id, parentId: computedParentId },
@@ -2026,6 +2048,23 @@ function Workspace({
       });
     }
 
+    // The Doc adds into whichever branch it shows; on the canvas only the active branch is drawn.
+    const parentNode = computedParentId
+      ? nodes.find((n) => n.id === computedParentId)
+      : undefined;
+    const addedHidden =
+      Boolean(parentNode?.hidden) ||
+      Boolean(
+        branch &&
+        parentNode &&
+        isConditionalNode(parentNode) &&
+        parentNode.data.activeBranchId !== branch.branchId,
+      );
+    if (addedHidden) {
+      newNodes.forEach((n) => (n.hidden = true));
+      newEdges.forEach((e) => (e.hidden = true));
+    }
+
     const editedEdges = previous
       ? edges.filter((edge) =>
           shouldKeepExistingEdgeForInsertion(edge, { branch, next, previous }),
@@ -2050,7 +2089,8 @@ function Workspace({
       position: previousNodeIndex + 1,
     });
     doLayout(newNodesAfter, [...editedEdges, ...newEdges]);
-    useWorkflowPanelStore.getState().setSelectedBlockId(id);
+    if (select) useWorkflowPanelStore.getState().setSelectedBlockId(id);
+    return id;
   }
 
   const orderedBlockLabels = getOrderedBlockLabels(workflow);
@@ -2557,6 +2597,14 @@ function Workspace({
 
   const handleSelectState = (selectedVersion: WorkflowVersion) => {
     if (refuseMutationDuringYamlCommit()) return;
+    // A restore would replace the canvas a pending Copilot proposal is staged on.
+    if (useCopilotProposalStore.getState().proposal) {
+      toast({
+        title: "Resolve the Copilot proposal before restoring a version.",
+        variant: "destructive",
+      });
+      return;
+    }
     // Close panels
     setWorkflowPanelState({
       active: false,
@@ -3544,33 +3592,16 @@ function Workspace({
               // Both hold canvas (YAML-shaped) blocks; round-trip them through
               // the converter so they match the proposal's shape.
               const client = await getClient(credentialGetter, "sans-api-v1");
-              const baseConversion =
-                await client.post<WorkflowYAMLConversionResponse>(
-                  "/workflow/copilot/convert-yaml-to-blocks",
-                  {
-                    workflow_definition_yaml: convertToYAML({
-                      version: saveData.workflowDefinitionVersion,
-                      parameters: baseVersion.workflow_definition.parameters,
-                      blocks: baseVersion.workflow_definition.blocks,
-                      finally_block_label:
-                        baseVersion.workflow_definition.finally_block_label ??
-                        undefined,
-                      workflow_system_prompt:
-                        baseVersion.workflow_definition
-                          .workflow_system_prompt ?? undefined,
-                      error_code_mapping:
-                        baseVersion.workflow_definition.error_code_mapping ??
-                        undefined,
-                      retry_policy:
-                        baseVersion.workflow_definition.retry_policy ?? null,
-                    }),
-                    workflow_id: saveData.workflow.workflow_id,
+              const currentVersion = await convertWorkflowReviewBaseline(
+                client,
+                {
+                  ...baseVersion,
+                  workflow_definition: {
+                    ...baseVersion.workflow_definition,
+                    version: saveData.workflowDefinitionVersion,
                   },
-                );
-              const currentVersion: WorkflowVersion = {
-                ...baseVersion,
-                workflow_definition: baseConversion.data.workflow_definition,
-              };
+                },
+              );
 
               // Approve / Reject settle through the chat so the server-side
               // proposal is cleared (revision-checked) and the canvas updated

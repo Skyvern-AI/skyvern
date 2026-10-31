@@ -33,8 +33,10 @@ class _DisconnectedWebSocket:
     def __init__(self) -> None:
         self.sent: list[dict] = []
         self._disconnect_delivered = False
+        self.headers: dict[str, str] = {}
+        self.url = SimpleNamespace(path="/v1/stream/test")
 
-    async def accept(self) -> None:
+    async def accept(self, subprotocol: str | None = None) -> None:
         return None
 
     async def send_text(self, text: str) -> None:
@@ -104,8 +106,10 @@ class _WatchingWebSocket:
     def __init__(self, send_error: Exception | None = None) -> None:
         self.sent: list[dict] = []
         self._send_error = send_error
+        self.headers: dict[str, str] = {}
+        self.url = SimpleNamespace(path="/v1/stream/test")
 
-    async def accept(self) -> None:
+    async def accept(self, subprotocol: str | None = None) -> None:
         return None
 
     async def send_text(self, text: str) -> None:

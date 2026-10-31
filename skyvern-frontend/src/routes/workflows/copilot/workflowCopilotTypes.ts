@@ -200,6 +200,8 @@ export interface WorkflowCopilotChatRequest {
   workflow_yaml: string;
   mode?: "build" | null;
   code_block?: boolean | null;
+  /** Internal capability: send only when the document editor is active. */
+  doc_editor_enabled?: boolean;
   cancel_token?: string;
   idempotency_key?: string | null;
   target_block_label?: string | null;
@@ -499,6 +501,11 @@ export interface WorkflowCopilotTitleUpdate {
   timestamp: string;
 }
 
+export type CredentialBinding =
+  | "saved_workflow"
+  | "matched_by_saved_url"
+  | "not_bound";
+
 // Mid-build pause frame: the turn stays open (SSE alive) while the client
 // surfaces a credential card. reason stays a raw string here — CredentialCard
 // tolerates unknown reason tokens, so a newer backend can't break the wiring.
@@ -520,6 +527,8 @@ export interface WorkflowCopilotCredentialRequiredUpdate {
   // The live browser the user may sign in to themselves; absent when the card does not offer it.
   sign_in_browser_session_id?: string | null;
   signing_in?: boolean;
+  // Set on update cards only: how the credential they name is bound.
+  credential_binding?: CredentialBinding | null;
   // Present on a card that offers Generate and save; never carries a password.
   registration?: {
     username: string;
@@ -694,7 +703,23 @@ export interface WorkflowCopilotToolResultUpdate {
   // A successful run_browser_code call's operations as display phrases.
   browser_steps?: string[] | null;
   detail?: string | null;
+  workflow_run_id?: string | null;
+  // Keys and sources only; values are read from the run itself.
+  test_inputs?: CopilotTestInput[] | null;
   timestamp?: string | null;
+}
+
+export type CopilotTestInputSource =
+  | "copilot"
+  | "page"
+  | "earlier_run"
+  | "default"
+  | "placeholder";
+
+export interface CopilotTestInput {
+  key: string;
+  source: CopilotTestInputSource;
+  sourceRunId?: string;
 }
 
 export interface WorkflowCopilotCondensingUpdate {
@@ -730,6 +755,7 @@ export interface WorkflowCopilotBlockProgressUpdate {
 export interface WorkflowCopilotRunStartedUpdate {
   type: "run_started";
   workflow_run_id: string;
+  skipped_prefix?: SkippedPrefixBlock[];
   timestamp: string;
 }
 
@@ -740,6 +766,12 @@ export type WorkflowCopilotRunOutcomeVerdict =
   | "not_evaluated";
 
 export type RunOutcomeRole = "recorded" | "adjudicated" | "interim_build_test";
+
+export interface SkippedPrefixBlock {
+  label: string;
+  kind: "reused" | "not_run";
+  sourceWorkflowRunId?: string;
+}
 
 export interface WorkflowCopilotRunOutcomeUpdate {
   type: "run_outcome";

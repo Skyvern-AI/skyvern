@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock, PropertyMock, call
@@ -2168,3 +2169,56 @@ class TestSkyvernExecuteMCP:
         assert result["ok"] is True
         click_kwargs = mcp_browser.skyvern_click.call_args.kwargs
         assert click_kwargs["selector"] == "role=combobox >> nth=0"
+
+
+_ARIA_PAGE = (
+    "<h1>Quarterly Report</h1><p>Revenue grew.</p>"
+    '<label>Email <input value="secret@x.io"></label>'
+    '<input type="password" value="hunter2" aria-label="Pw"><button>Send</button>'
+    '<iframe srcdoc="<h2>Inner Frame Heading</h2>"></iframe>'
+    "<h2>Revenue: FY 2026</h2><h3>It's {ready}</h3><p>Price &#127; end</p>"
+    '<select aria-label="Pick"><option>A: B</option><option>It\'s {ready}</option></select>'
+    '<input aria-label="Note: x" value="top: secret">'
+    '<button aria-label="Back&#8;space">Go</button><p>Back&#8;space</p><h1>After</h1>'
+    "<code>npm install x</code><strong>Bold claim</strong><em>Stressed note</em>"
+)
+
+
+@pytest.mark.parametrize("engine", ["playwright", "patchright"])
+@pytest.mark.asyncio
+async def test_observe_keeps_static_semantics_without_page_accessibility(engine: str) -> None:
+    async_api = pytest.importorskip(f"{engine}.async_api")
+    async with async_api.async_playwright() as driver:
+        if not Path(driver.chromium.executable_path).exists():
+            pytest.skip("Requires an installed Chromium-based browser")
+        browser = await driver.chromium.launch(headless=True)
+        try:
+            page = await browser.new_page()
+            await page.set_content(_ARIA_PAGE)
+            await page.frames[1].wait_for_load_state()
+            assert getattr(page, "accessibility", None) is None
+
+            everything = await browser_ops.do_observe(page, interactive_only=False, max_elements=200)
+            scoped = await browser_ops.do_observe(page, selector="h1", interactive_only=False)
+            interactive = await browser_ops.do_observe(page, interactive_only=True)
+        finally:
+            await browser.close()
+
+    pairs = {(e.role, e.name) for e in everything.elements}
+    assert ("heading", "Quarterly Report") in pairs
+    assert ("text", "Revenue grew.") in pairs
+    assert ("heading", "Revenue: FY 2026") in pairs
+    assert ("heading", "It's {ready}") in pairs
+    assert ("text", "Price \x7f end") in pairs
+    assert ("button", "Back\x08space") in pairs
+    assert ("text", "Back\x08space") in pairs
+    assert ("heading", "After") in pairs
+    assert not any("Backbspace" in name for _, name in pairs)
+    assert {("text", "npm install x"), ("text", "Bold claim"), ("text", "Stressed note")} <= pairs
+    options = {option for e in everything.elements for option in (e.options or [])}
+    assert {"A: B", "It's {ready}"} <= options
+    names = " ".join(e.name for e in everything.elements)
+    assert "secret@x.io" not in names and "hunter2" not in names and "top: secret" not in names
+    assert "Inner Frame Heading" not in names
+    assert {(e.role, e.name) for e in scoped.elements} == {("heading", "Quarterly Report")}
+    assert all(e.role in browser_ops.INTERACTIVE_ROLES for e in interactive.elements)

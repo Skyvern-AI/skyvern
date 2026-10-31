@@ -56,14 +56,14 @@ def _wp(
 
 
 def test_model_authored_default_supplies_run_value() -> None:
-    data, unbound, reused = _resolve_run_data_and_unbound_keys([_wp("specialty", default_value="cardiology")], {})
+    data, unbound, reused, _ = _resolve_run_data_and_unbound_keys([_wp("specialty", default_value="cardiology")], {})
     assert data == {"specialty": "cardiology"}
     assert unbound == []
     assert reused == []
 
 
 def test_explicit_run_parameter_wins_over_model_authored_default() -> None:
-    data, unbound, reused = _resolve_run_data_and_unbound_keys(
+    data, unbound, reused, _ = _resolve_run_data_and_unbound_keys(
         [_wp("specialty", default_value="cardiology")],
         {"specialty": "neurology"},
     )
@@ -73,14 +73,14 @@ def test_explicit_run_parameter_wins_over_model_authored_default() -> None:
 
 
 def test_missing_model_owned_value_is_recorded_unbound() -> None:
-    data, unbound, reused = _resolve_run_data_and_unbound_keys([_wp("specialty")], {})
+    data, unbound, reused, _ = _resolve_run_data_and_unbound_keys([_wp("specialty")], {})
     assert data == {"specialty": ""}
     assert unbound == ["specialty"]
     assert reused == []
 
 
 def test_at_will_credential_is_omitted_without_placeholder_or_unbound() -> None:
-    data, unbound, reused = _resolve_run_data_and_unbound_keys(
+    data, unbound, reused, _ = _resolve_run_data_and_unbound_keys(
         [_wp("maybe_cred", ptype=WorkflowParameterType.CREDENTIAL_ID)], {}
     )
     assert "maybe_cred" not in data
@@ -104,7 +104,7 @@ def test_explicit_same_turn_input_binding_supplies_private_run_value() -> None:
     }
 
     private_values = _ephemeral_input_values_by_parameter_key(metadata, trajectory)
-    data, unbound, reused = _resolve_run_data_and_unbound_keys(
+    data, unbound, reused, _ = _resolve_run_data_and_unbound_keys(
         [_wp("specialty")], {}, ephemeral_input_values=private_values
     )
 
@@ -117,8 +117,51 @@ def test_explicit_same_turn_input_binding_supplies_private_run_value() -> None:
 _ORIGIN_FILE = "s3://origin-sentinel-bucket/uploads/resume-sentinel.pdf"
 
 
+def test_each_input_records_where_its_dispatched_value_came_from() -> None:
+    data, unbound, reused, sources = _resolve_run_data_and_unbound_keys(
+        [
+            _wp("model_key"),
+            _wp("page_key"),
+            _wp("origin_key", ptype=WorkflowParameterType.FILE_URL),
+            _wp("default_key", default_value="default-sentinel"),
+            _wp("null_key", default_value="default-sentinel"),
+            _wp("blank_key"),
+            _wp("at_will_cred", ptype=WorkflowParameterType.CREDENTIAL_ID),
+            _wp("whitespace_cred", ptype=WorkflowParameterType.CREDENTIAL_ID),
+            _wp("model_cred", ptype=WorkflowParameterType.CREDENTIAL_ID),
+        ],
+        {"model_key": "model-sentinel", "null_key": None, "whitespace_cred": "  ", "model_cred": "cred_model"},
+        ephemeral_input_values={"page_key": "page-sentinel"},
+        origin_parameters=[origin_run_input("origin_key", _ORIGIN_FILE)],
+    )
+
+    assert sources == [
+        {"key": "model_key", "source": "copilot"},
+        {"key": "page_key", "source": "page"},
+        {"key": "origin_key", "source": "earlier_run", "sourceRunId": "wr_origin"},
+        {"key": "default_key", "source": "default"},
+        {"key": "null_key", "source": "default"},
+        {"key": "blank_key", "source": "placeholder"},
+        {"key": "at_will_cred", "source": "placeholder"},
+        {"key": "whitespace_cred", "source": "placeholder"},
+        {"key": "model_cred", "source": "copilot"},
+    ]
+    assert data == {
+        "model_key": "model-sentinel",
+        "page_key": "page-sentinel",
+        "origin_key": _ORIGIN_FILE,
+        "default_key": "default-sentinel",
+        "null_key": None,
+        "blank_key": "",
+        "whitespace_cred": "  ",
+        "model_cred": "cred_model",
+    }
+    assert unbound == ["blank_key"]
+    assert reused == ["origin_key"]
+
+
 def test_origin_run_value_binds_a_required_input_with_no_default() -> None:
-    data, unbound, reused = _resolve_run_data_and_unbound_keys(
+    data, unbound, reused, _ = _resolve_run_data_and_unbound_keys(
         [_wp("resume", ptype=WorkflowParameterType.FILE_URL)],
         {},
         origin_parameters=[origin_run_input("resume", _ORIGIN_FILE)],
@@ -144,7 +187,7 @@ def test_origin_run_value_precedence(
     expected: str,
     expected_reused: list[str],
 ) -> None:
-    data, unbound, reused = _resolve_run_data_and_unbound_keys(
+    data, unbound, reused, _ = _resolve_run_data_and_unbound_keys(
         [_wp("resume", default_value=default_value, ptype=WorkflowParameterType.FILE_URL)],
         user_params,
         ephemeral_input_values=ephemeral,
@@ -156,7 +199,7 @@ def test_origin_run_value_precedence(
 
 
 def test_origin_run_value_of_another_type_is_not_reused() -> None:
-    data, unbound, reused = _resolve_run_data_and_unbound_keys(
+    data, unbound, reused, _ = _resolve_run_data_and_unbound_keys(
         [_wp("resume", ptype=WorkflowParameterType.FILE_URL)],
         {},
         origin_parameters=[origin_run_input("resume", _ORIGIN_FILE, ptype=WorkflowParameterType.STRING)],
@@ -174,7 +217,7 @@ def test_origin_run_value_of_another_type_is_not_reused() -> None:
 def test_origin_run_placeholder_is_absent_only_when_a_copilot_test_run_stored_it(
     origin_is_copilot_run: bool, expected_unbound: list[str], expected_reused: list[str]
 ) -> None:
-    data, unbound, reused = _resolve_run_data_and_unbound_keys(
+    data, unbound, reused, _ = _resolve_run_data_and_unbound_keys(
         [_wp("attempts", ptype=WorkflowParameterType.INTEGER)],
         {},
         origin_parameters=[origin_run_input("attempts", 0, ptype=WorkflowParameterType.INTEGER)],
@@ -186,7 +229,7 @@ def test_origin_run_placeholder_is_absent_only_when_a_copilot_test_run_stored_it
 
 
 def test_scrubbed_origin_file_is_not_reused() -> None:
-    data, unbound, reused = _resolve_run_data_and_unbound_keys(
+    data, unbound, reused, _ = _resolve_run_data_and_unbound_keys(
         [_wp("resume", ptype=WorkflowParameterType.FILE_URL)],
         {},
         origin_parameters=[origin_run_input("resume", SCRUBBED_VALUE)],
@@ -197,7 +240,7 @@ def test_scrubbed_origin_file_is_not_reused() -> None:
 
 
 def test_origin_run_credential_is_not_reused() -> None:
-    data, _, reused = _resolve_run_data_and_unbound_keys(
+    data, _, reused, _ = _resolve_run_data_and_unbound_keys(
         [_wp("login", ptype=WorkflowParameterType.CREDENTIAL_ID)],
         {},
         origin_parameters=[origin_run_input("login", "cred_origin", ptype=WorkflowParameterType.CREDENTIAL_ID)],
@@ -207,7 +250,7 @@ def test_origin_run_credential_is_not_reused() -> None:
 
 
 def test_origin_run_value_equal_to_its_own_default_is_not_reused() -> None:
-    data, unbound, reused = _resolve_run_data_and_unbound_keys(
+    data, unbound, reused, _ = _resolve_run_data_and_unbound_keys(
         [_wp("resume", default_value="current_default_file", ptype=WorkflowParameterType.FILE_URL)],
         {},
         origin_parameters=[origin_run_input("resume", "origin_default_file", default_value="origin_default_file")],
@@ -296,6 +339,10 @@ async def test_reused_origin_value_is_dispatched_but_only_its_key_reaches_the_mo
     assert ctx.unbound_required_parameter_keys == []
     assert '"reused_origin_input_keys": ["resume"]' in model_visible
     assert _ORIGIN_FILE not in model_visible
+    assert ctx.pending_test_inputs == {
+        "wr_paused": [{"key": "resume", "source": "earlier_run", "sourceRunId": "wr_origin"}]
+    }
+    assert "test_inputs" not in json.dumps(result)
 
 
 @pytest.mark.asyncio

@@ -17,17 +17,18 @@ from typing import TYPE_CHECKING, Any, TypeVar
 from urllib.parse import urlparse
 
 import structlog
-from agents.exceptions import MaxTurnsExceeded, ModelBehaviorError
+from agents.exceptions import MaxTurnsExceeded, ModelBehaviorError, OutputGuardrailTripwireTriggered
 from agents.items import TResponseInputItem
 from agents.memory.session import Session
 from agents.run import Runner
 from agents.run_config import RunConfig
 from agents.run_context import RunContextWrapper
+from agents.run_error_handlers import RunErrorHandlerInput, RunErrorHandlerResult, RunErrorHandlers
 from agents.tool import Tool
 from openai.types.responses import ResponseFunctionToolCall
 from PIL import Image
 
-from skyvern.config import settings
+from skyvern.forge.sdk.agents.context import get_agent_message_field
 from skyvern.forge.sdk.copilot import streaming_adapter
 from skyvern.forge.sdk.copilot.ask_user import ACCOUNT_GROUP_SUBMIT_TOOL_NAME
 from skyvern.forge.sdk.copilot.budget_expiry import (
@@ -65,13 +66,14 @@ from skyvern.forge.sdk.copilot.composition_evidence import (
 from skyvern.forge.sdk.copilot.config import (
     DEFAULT_ENFORCEMENT_NUDGES,
     DEFAULT_TOKEN_BUDGET,
+    TOTAL_TIMEOUT_SECONDS,
     CopilotConfig,
 )
 from skyvern.forge.sdk.copilot.context import BLOCK_RUNNING_TOOLS, REPLY_TOOL_NAME, WORKFLOW_MUTATION_TOOLS
 from skyvern.forge.sdk.copilot.credential_fill_fields import LIVE_SCOUT_CREDENTIAL_FIELDS
 from skyvern.forge.sdk.copilot.credential_pause import maybe_credential_pause, release_credential_pause_gate
 from skyvern.forge.sdk.copilot.diagnosis_repair_contract import RepairNextAction, effective_proxy_label
-from skyvern.forge.sdk.copilot.human_input_wait import HumanInputWait
+from skyvern.forge.sdk.copilot.human_input_wait import turn_clock_seconds
 from skyvern.forge.sdk.copilot.output_extraction_plan import (
     resolve_shape_expectations_by_path,
 )
@@ -126,6 +128,7 @@ from skyvern.forge.sdk.copilot.turn_halt import (
     stash_turn_halt_from_blocker_signal,
 )
 from skyvern.forge.sdk.copilot.unrecoverable_tool_error import (
+    PAGE_CRASHES_KEY,
     PAGE_FACT_KEYS,
     PAGE_REQUEST_FAILURES_KEY,
 )
@@ -149,7 +152,6 @@ if TYPE_CHECKING:
 
 LOG = structlog.get_logger()
 
-TOTAL_TIMEOUT_SECONDS = settings.WORKFLOW_COPILOT_TOTAL_TIMEOUT_SECONDS or 900
 BUDGET_DRAIN_HEADROOM = 4
 ToolT = TypeVar("ToolT", bound=Tool)
 BUDGET_DRAIN_EXCLUDED_TOOLS = WORKFLOW_MUTATION_TOOLS | BLOCK_RUNNING_TOOLS | {ACCOUNT_GROUP_SUBMIT_TOOL_NAME}
@@ -341,27 +343,8 @@ def _mark_copilot_total_timeout(ctx: Any, *, elapsed_seconds: float, iteration: 
 
 
 def _elapsed_run_seconds(ctx: Any, start_time: float) -> float:
-    """Wall-clock elapsed since ``start_time``, minus completed and active human-input waits.
-
-    Keeps TOTAL_TIMEOUT_SECONDS a budget over actual agent work, not real
-    time, so a paused-and-resumed turn isn't penalized for pause time.
-
-    ``pause_seconds`` is coerced defensively: tests commonly pass a bare
-    ``MagicMock()`` as ``ctx``, whose ``getattr(..., default)`` returns a
-    fresh Mock instead of the default (Mock never raises AttributeError).
-    """
-    pause_seconds = getattr(ctx, "copilot_credential_pause_seconds", 0.0)
-    if not isinstance(pause_seconds, (int, float)):
-        pause_seconds = 0.0
-    question_seconds = getattr(ctx, "copilot_question_pause_seconds", 0.0)
-    if not isinstance(question_seconds, (int, float)):
-        question_seconds = 0.0
-    now = time.monotonic()
-    wait = getattr(ctx, "human_input_wait", None)
-    # Overlapping waits credit their union only when the last waiter exits.
-    # Until then, exclude the active union at model/tool completion boundaries.
-    active_wait_seconds = now - wait.started_at if isinstance(wait, HumanInputWait) and wait.count > 0 else 0.0
-    return now - start_time - pause_seconds - question_seconds - active_wait_seconds
+    """Keeps TOTAL_TIMEOUT_SECONDS a budget over agent work, so a paused-and-resumed turn isn't charged pause time."""
+    return turn_clock_seconds(ctx, start_time, time.monotonic())
 
 
 def _record_copilot_cancellation(ctx: Any, start_time: float, iteration: int) -> None:
@@ -875,9 +858,10 @@ def _summarize_tool_output(output: str) -> str:
         synopsis["error"] = str(parsed["error"])[:200]
     if isinstance(parsed.get("page_state"), dict):
         synopsis["page_state"] = _summarize_page_state(parsed["page_state"])
-    request_failures = parsed.get(PAGE_REQUEST_FAILURES_KEY)
-    if isinstance(request_failures, list) and request_failures:
-        synopsis[PAGE_REQUEST_FAILURES_KEY] = request_failures
+    for page_fact_key in (PAGE_REQUEST_FAILURES_KEY, PAGE_CRASHES_KEY):
+        page_facts = parsed.get(page_fact_key)
+        if isinstance(page_facts, list) and page_facts:
+            synopsis[page_fact_key] = page_facts
 
     data = parsed.get("data")
     # Session continuation can compact the same output again. Re-bound the
@@ -1051,21 +1035,26 @@ def unread_tool_output_indices(items: Sequence[Any]) -> set[int]:
     return unread
 
 
-def stable_prefix_anchors(items: Sequence[TResponseInputItem]) -> list[int]:
-    """Return, oldest first, the index of every tool output or real user message that precedes both the compaction
-    window and every unpruned screenshot. Later model calls resend every item up to the last of them unchanged."""
+def stable_prefix_anchors(items: Sequence[TResponseInputItem], *, append_only: bool = False) -> list[int]:
+    """Return, oldest first, the index of every tool output or real user message that later model calls resend
+    unchanged: all of them when nothing rewrites the input, else those before both the compaction window and every
+    unpruned screenshot."""
     fc_indices = [i for i, item in enumerate(items) if _item_field(item, "type") == "function_call"]
     fco_indices = [i for i, item in enumerate(items) if _item_field(item, "type") == "function_call_output"]
-    unstable = {
-        *fc_indices[-KEEP_RECENT_TOOL_OUTPUTS:],
-        *fco_indices[-KEEP_RECENT_TOOL_OUTPUTS:],
-        *unread_tool_output_indices(items),
-        *(
-            i
-            for i, item in enumerate(items)
-            if is_screenshot_message(item) and _item_field(item, "content") != SCREENSHOT_PLACEHOLDER
-        ),
-    }
+    unstable = (
+        set()
+        if append_only
+        else {
+            *fc_indices[-KEEP_RECENT_TOOL_OUTPUTS:],
+            *fco_indices[-KEEP_RECENT_TOOL_OUTPUTS:],
+            *unread_tool_output_indices(items),
+            *(
+                i
+                for i, item in enumerate(items)
+                if is_screenshot_message(item) and _item_field(item, "content") != SCREENSHOT_PLACEHOLDER
+            ),
+        }
+    )
     return [
         index
         for index, item in enumerate(items[: min(unstable, default=len(items))])
@@ -1372,6 +1361,33 @@ def _accumulate_usage(result: RunResultStreaming, ctx: Any) -> None:
     ctx.total_tokens_used = (ctx.total_tokens_used or 0) + total_tokens
 
 
+def _refusal_ends_run_empty(_: RunErrorHandlerInput[Any]) -> RunErrorHandlerResult:
+    # The model telemetry already recorded the refusal or content-filter stop, which sends an empty run to the turn's
+    # empty-completion exit.
+    return RunErrorHandlerResult(final_output="", include_in_history=False)
+
+
+_RUN_ERROR_HANDLERS: RunErrorHandlers[Any] = {"model_refusal": _refusal_ends_run_empty}
+
+
+async def _drop_withheld_response(session: Session | None, ctx: Any) -> None:
+    """The SDK keeps a blocked turn's tool calls in the session so a re-run sees their side effects. The only blocked
+    turn here is a ``reply``, which ends the turn alone, so its call carries the very text the guardrail withheld."""
+    response = ctx.last_model_response
+    if session is None or response is None:
+        return
+    call_ids = {item.call_id for item in response.output if isinstance(item, ResponseFunctionToolCall)}
+    items = await session.get_items()
+    kept = len(items)
+    while kept and get_agent_message_field(items[kept - 1], "call_id") in call_ids:
+        kept -= 1
+    # A reasoning item without the call that follows it is rejected by the Responses API.
+    while kept < len(items) and kept and get_agent_message_field(items[kept - 1], "type") == "reasoning":
+        kept -= 1
+    for _ in range(len(items) - kept):
+        await session.pop_item()
+
+
 async def _run_streamed_with_deadline(
     agent: Agent,
     current_input: str | list,
@@ -1404,7 +1420,14 @@ async def _run_streamed_with_deadline(
         TOTAL_TIMEOUT_SECONDS + HARD_BACKSTOP_ALLOWANCE_SECONDS - elapsed,
     )
     with pending_operation("turn.stream", span=True):
-        result = Runner.run_streamed(agent, input=current_input, context=ctx, session=session, **runner_kwargs)
+        result = Runner.run_streamed(
+            agent,
+            input=current_input,
+            context=ctx,
+            session=session,
+            error_handlers=_RUN_ERROR_HANDLERS,
+            **runner_kwargs,
+        )
 
         def check_model_work_deadline() -> None:
             if _elapsed_run_seconds(ctx, start_time) >= TOTAL_TIMEOUT_SECONDS:
@@ -1419,6 +1442,9 @@ async def _run_streamed_with_deadline(
                 async with asyncio.timeout(remaining) as deadline:
                     ctx.model_stream_deadline = deadline
                     await streaming_adapter.stream_to_sse(result, tracked_stream, ctx)
+            except OutputGuardrailTripwireTriggered:
+                await _drop_withheld_response(session, ctx)
+                raise
             finally:
                 if steer_watcher is not None:
                     steer_watcher.cancel()

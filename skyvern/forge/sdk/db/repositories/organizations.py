@@ -23,9 +23,10 @@ from skyvern.forge.sdk.db.models import (
 from skyvern.forge.sdk.db.utils import (
     convert_to_organization,
     convert_to_organization_auth_token,
+    rows_with_secret,
 )
 from skyvern.forge.sdk.encrypt import encryptor
-from skyvern.forge.sdk.encrypt.base import EncryptMethod
+from skyvern.forge.sdk.encrypt.base import DEFAULT_ENCRYPT_METHOD, EncryptMethod
 from skyvern.forge.sdk.schemas.organizations import (
     AzureClientSecretCredential,
     AzureOrganizationAuthToken,
@@ -380,9 +381,9 @@ class OrganizationsRepository(BaseRepository):
             if not isinstance(token, TwilioCredential):
                 raise TypeError("Expected TwilioCredential for this token_type")
             if encrypted_method is None:
-                encrypted_method = EncryptMethod.AES
-            elif encrypted_method != EncryptMethod.AES:
-                raise ValueError("Twilio credentials must use AES encryption")
+                encrypted_method = DEFAULT_ENCRYPT_METHOD
+            elif encrypted_method != DEFAULT_ENCRYPT_METHOD:
+                raise ValueError(f"Twilio credentials must use {DEFAULT_ENCRYPT_METHOD.value} encryption")
             plaintext_token = token.model_dump_json()
         else:
             if not isinstance(token, str):
@@ -476,30 +477,22 @@ class OrganizationsRepository(BaseRepository):
         token_type: OrganizationAuthTokenType,
         token: str,
         valid: bool | None = True,
-        encrypted_method: EncryptMethod | None = None,
     ) -> OrganizationAuthToken | None:
-        encrypted_token = ""
-        if encrypted_method is not None:
-            encrypted_token = await encryptor.encrypt(token, encrypted_method)
-
         async with self.Session() as session:
             query = (
                 select(OrganizationAuthTokenModel)
                 .filter_by(organization_id=organization_id)
                 .filter_by(token_type=token_type)
             )
-            if encrypted_token:
-                query = query.filter_by(encrypted_token=encrypted_token)
-            else:
-                query = query.filter_by(token=token)
             if valid is not None:
                 query = query.filter_by(valid=valid)
             # Twin rows can share a token; a fixed order keeps every pod resolving the same row ID.
             query = query.order_by(OrganizationAuthTokenModel.created_at.desc(), OrganizationAuthTokenModel.id)
-            if token_obj := (await session.scalars(query)).first():
-                return await convert_to_organization_auth_token(token_obj, token_type)
-            else:
-                return None
+            candidates = (await session.scalars(query)).all()
+            # Ciphertext is randomized, so the presented token can only be matched by decrypting each candidate.
+            for row in await rows_with_secret(candidates, token):
+                return await convert_to_organization_auth_token(row, token_type)
+            return None
 
     @db_operation("create_org_auth_token")
     async def create_org_auth_token(

@@ -39,6 +39,7 @@ from skyvern.forge.sdk.copilot.workflow_yaml import workflow_to_copilot_yaml
 from skyvern.forge.sdk.core.permissions.permission_checker_factory import PermissionCheckerFactory
 from skyvern.forge.sdk.schemas.credentials import Credential
 from skyvern.forge.sdk.schemas.organizations import Organization
+from skyvern.forge.sdk.workflow.block_notes import strip_inert_block_fields
 from skyvern.forge.sdk.workflow.models.parameter import WorkflowParameter, WorkflowParameterType
 from skyvern.forge.sdk.workflow.models.workflow import Workflow
 from skyvern.schemas.workflow_run_groups import (
@@ -154,7 +155,7 @@ def account_group_submit_enabled() -> bool:
 
 
 def workflow_definition_hash(workflow: Workflow) -> str:
-    fields = workflow.model_dump(mode="json", include=set(_VERIFIED_WORKFLOW_FIELDS))
+    fields = strip_inert_block_fields(workflow.model_dump(mode="json", include=set(_VERIFIED_WORKFLOW_FIELDS)))
     # The model serializer masks every cdp_connect_headers value, so a changed header would hash the same.
     fields["cdp_connect_headers"] = workflow.cdp_connect_headers
     # Keyed because the digest leaves the server on the review card and covers raw header values.

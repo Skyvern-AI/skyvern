@@ -32,7 +32,10 @@ from skyvern.forge.sdk.copilot.agent import (
     _review_projection_for,
     _translate_to_agent_result,
 )
-from skyvern.forge.sdk.copilot.build_test_connect_failure import build_test_connect_failure_sentence
+from skyvern.forge.sdk.copilot.build_test_connect_failure import (
+    BuildTestConnectFailureState,
+    build_test_connect_failure_sentence,
+)
 from skyvern.forge.sdk.copilot.build_test_outcome import (
     BLOCK_FACT_SCREEN_NOTICE_MAX_CHARS,
     BLOCK_FACT_URL_MAX_CHARS,
@@ -246,6 +249,41 @@ def test_registered_block_download_reaches_packet_without_parseable_artifact_evi
     packet = build_test_evidence_packet(ctx, result)
 
     assert [(download.artifact_id, download.file_name) for download in packet.downloads] == [("a_dl_9", None)]
+
+
+def test_packet_workflow_readback_hides_saved_notes_with_doc_editor_off() -> None:
+    ctx = make_copilot_ctx(doc_editor_enabled=False)
+    ctx.last_workflow_yaml = (
+        "title: Notes draft\n"
+        "workflow_definition:\n"
+        "  parameters: []\n"
+        "  blocks:\n"
+        "    - block_type: navigation\n"
+        "      label: open\n"
+        "      url: https://example.com\n"
+        "      navigation_goal: Open the page\n"
+        "      notes: SAVED_NOTE_TEXT\n"
+        "      trailing_notes: SAVED_TRAILING_TEXT\n"
+        "      description: SAVED_DESCRIPTION_TEXT\n"
+    )
+    result = {
+        "ok": True,
+        "data": {
+            "workflow_run_id": "wr_1",
+            "overall_status": "completed",
+            "requested_block_labels": ["open"],
+            "executed_block_labels": ["open"],
+            "blocks": [{"label": "open", "status": "completed"}],
+        },
+    }
+
+    packet = build_test_evidence_packet(ctx, result)
+
+    assert packet.canonical_workflow_yaml is not None
+    assert "label: open" in packet.canonical_workflow_yaml
+    for hidden in ("SAVED_NOTE_TEXT", "SAVED_TRAILING_TEXT", "SAVED_DESCRIPTION_TEXT"):
+        assert hidden not in packet.canonical_workflow_yaml
+    assert "SAVED_NOTE_TEXT" in ctx.last_workflow_yaml
 
 
 def test_packet_projects_every_recorded_block_output_in_row_order_and_scrubs_secrets() -> None:
@@ -507,7 +545,7 @@ def test_billing_credit_refusal_schema_requires_no_retry_or_new_identity() -> No
         "retry_action": None,
     }
     with pytest.raises(ValidationError):
-        BuildTestConnectFailure(state="billing_credit_admission_refusal")
+        BuildTestConnectFailure(state="billing_credit_admission_refusal", retry_action="test_end_to_end")
     with pytest.raises(ValidationError):
         BuildTestConnectFailure(
             state="billing_credit_admission_refusal",
@@ -516,6 +554,24 @@ def test_billing_credit_refusal_schema_requires_no_retry_or_new_identity() -> No
         )
     with pytest.raises(ValidationError):
         BuildTestConnectFailure(state="already_closed", retry_action=None)
+
+
+@pytest.mark.parametrize(
+    "state",
+    [
+        "billing_credit_admission_refusal",
+        "saved_profile_unresolved",
+        "saved_profile_not_applied",
+        "unsaved_browser_profile_pick",
+    ],
+)
+def test_no_retry_connect_failure_survives_an_exclude_none_round_trip(state: BuildTestConnectFailureState) -> None:
+    failure = BuildTestConnectFailure(state=state, retry_action=None)
+
+    dumped = failure.model_dump(mode="json", exclude_none=True)
+
+    assert "retry_action" not in dumped
+    assert BuildTestConnectFailure.model_validate(dumped) == failure
 
 
 def test_billing_refusal_preserves_prior_run_evidence_and_repair_context() -> None:
@@ -4359,9 +4415,9 @@ workflow_definition:
     monkeypatch.setattr(tools_module, "_get_prior_workflow_definition", AsyncMock(return_value=None))
     monkeypatch.setattr(tools_module, "_frontier_runtime_page_url", AsyncMock(return_value=None))
     monkeypatch.setattr(
-        tools_module,
-        "_plan_frontier",
-        lambda *args: (["collect_failure_rate"], {}, "collect_failure_rate", "initial"),
+        tools_module.FrontierRequest,
+        "plan",
+        lambda self, ctx: (["collect_failure_rate"], {}, "collect_failure_rate", "initial"),
     )
     monkeypatch.setattr(tools_module, "_update_workflow", persist_workflow)
     monkeypatch.setattr(tools_module, "_run_blocks_and_collect_debug", test_persisted_workflow)
@@ -5749,7 +5805,7 @@ async def test_candidate_run_bind_and_publish_stay_refused_while_an_accept_claim
     monkeypatch.setattr(run_execution_module, "_authority_tool_error", lambda *_args: None)
     monkeypatch.setattr(tools_module, "_get_prior_workflow_definition", AsyncMock(return_value=None))
     monkeypatch.setattr(
-        tools_module, "_plan_frontier", lambda *_args: (["extract_heading"], {}, "extract_heading", "initial")
+        tools_module.FrontierRequest, "plan", lambda self, ctx: (["extract_heading"], {}, "extract_heading", "initial")
     )
     workflow_service_module.prepare_workflow.return_value = SimpleNamespace(
         workflow_run_id="wr_refused",
@@ -5800,6 +5856,7 @@ async def test_candidate_run_bind_refusal_logs_its_reason_and_dispatches_nothing
     assert (result["ok"], result.get("conflict_reason")) == (False, reason if reason == "bytes_changed" else None)
     assert result["data"] == {"run_dispatched": False, "proposal_bind_refused": True}
     assert forge_app.WORKFLOW_SERVICE.execute_workflow.call_count == 0
+    assert ctx.pending_test_inputs == {}
     bind_logs = [entry for entry in logs if entry["event"].startswith("copilot candidate run bind")]
     assert [(entry["event"], entry["reason"]) for entry in bind_logs] == [(event, reason)]
     assert (await _stored_candidate(repo, chat_id))[1].workflow_run_id is None

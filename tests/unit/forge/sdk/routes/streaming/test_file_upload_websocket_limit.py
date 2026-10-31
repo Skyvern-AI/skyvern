@@ -12,6 +12,7 @@ from websockets.asyncio.client import connect
 
 from skyvern.config import settings
 from skyvern.forge.payload_limits import max_file_upload_ws_message_size
+from skyvern.forge.sdk.routes.streaming.cdp_input import _dispatch_file_upload_event
 
 
 async def _receive_message_size(websocket: WebSocket) -> None:
@@ -66,3 +67,51 @@ async def test_uvicorn_sansio_accepts_25mb_file_upload_frame() -> None:
             await asyncio.wait_for(server_task, timeout=5)
         finally:
             server_socket.close()
+
+
+class _FileInputPage:
+    def __init__(self) -> None:
+        self.uploaded: list[dict] = []
+        outer = self
+
+        class _Locator:
+            async def count(self) -> int:
+                return 1
+
+            async def set_input_files(self, payload: dict) -> None:
+                outer.uploaded.append(payload)
+
+        self._locator = _Locator()
+
+    def locator(self, _selector: str) -> object:
+        return self._locator
+
+
+class _RecordingWebSocket:
+    def __init__(self) -> None:
+        self.sent: list[dict] = []
+
+    async def send_json(self, payload: dict) -> None:
+        self.sent.append(payload)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("size", "expected_kind"),
+    [
+        (settings.MAX_UPLOAD_FILE_SIZE, "file-upload-complete"),
+        (settings.MAX_UPLOAD_FILE_SIZE + 1, "file-upload-error"),
+    ],
+)
+async def test_live_session_file_upload_accepts_up_to_the_server_upload_cap(size: int, expected_kind: str) -> None:
+    page, websocket = _FileInputPage(), _RecordingWebSocket()
+    message = {
+        "fileName": "upload.bin",
+        "mimeType": "application/octet-stream",
+        "content": base64.b64encode(bytes(size)).decode("ascii"),
+    }
+
+    await _dispatch_file_upload_event(page, message, websocket)  # type: ignore[arg-type]
+
+    assert websocket.sent[-1]["kind"] == expected_kind
+    assert bool(page.uploaded) is (expected_kind == "file-upload-complete")

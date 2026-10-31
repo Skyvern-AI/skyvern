@@ -48,6 +48,7 @@ from skyvern.forge.sdk.artifact.storage.base import get_download_retry_started_a
 from skyvern.forge.sdk.core import skyvern_context
 from skyvern.forge.sdk.db.datetime_utils import naive_utc_now
 from skyvern.forge.sdk.db.utils import ACTION_TYPE_TO_CLASS
+from skyvern.forge.sdk.executor.run_liveness import run_write_authority
 from skyvern.forge.sdk.schemas.totp_codes import OTPType
 from skyvern.forge.sdk.services.credentials import generate_totp_code
 from skyvern.schemas.steps import AgentStepOutput
@@ -1377,6 +1378,7 @@ class ScriptSkyvernPage(SkyvernPage):
             task_id=context.task_id,
             organization_id=context.organization_id,
             output=step_output,
+            write_authority_for_run=run_write_authority,
         )
         LOG.info(
             "Updated step output with cached actions before complete validation",

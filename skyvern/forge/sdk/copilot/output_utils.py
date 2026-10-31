@@ -235,7 +235,7 @@ def _last_envelope_in(text: str) -> dict[str, Any] | None:
 def _text_looks_envelope_shaped(text: str) -> bool:
     # require leading `{` so prose that merely quotes the field names (e.g.,
     # "I see \"type\": \"REPLY\" but cannot find \"user_response\"") falls
-    # through to the plain-text tier instead of degrading to "Done."
+    # through to the plain-text tier instead of degrading to an empty reply.
     return text.startswith("{") and '"user_response"' in text and bool(_TYPE_VALUE_RE.search(text))
 
 
@@ -281,7 +281,7 @@ def parse_final_response(text: str) -> dict[str, Any]:
                 value = None
             if isinstance(value, str):
                 return {"type": sniffed_type, "user_response": value}
-        return {"type": sniffed_type, "user_response": "Done."}
+        return {"type": sniffed_type, "user_response": ""}
 
     return {"type": "REPLY", "user_response": text}
 
@@ -2014,9 +2014,9 @@ _HEADERS_BLOB_RE = re.compile(r"\s*headers:\s*\{[^{}]*\}\s*", re.IGNORECASE)
 _LARGE_DICT_BLOB_RE = re.compile(r"\{[^{}]{40,}\}")
 # Every credential-shaped id prefix in skyvern/forge/sdk/db/id.py, so a new one does
 # not quietly become renderable: cred, the vault/parameter kinds, folders, OAuth,
-# and run credential selections, plus Copilot's connected-vault login ids.
+# and run credential selections, plus Copilot's refs for vault logins not saved yet.
 _CREDENTIAL_ID_RE = re.compile(
-    r"`?\b(?:cred|cp|cfld|blc|bccd|bsi|opp|azcp|asp|goac|moac|wrcs|bwitem)_[A-Za-z0-9][A-Za-z0-9_-]*`?"
+    r"`?\b(?:cred|cp|cfld|blc|bccd|bsi|opp|azcp|asp|goac|moac|wrcs|vlogin)_[A-Za-z0-9][A-Za-z0-9_-]*`?"
 )
 # Punctuation an LLM-authored block label may keep. Everything outside this set and
 # the letter/digit categories becomes a space: a whitelist, because any quote-class
@@ -2190,7 +2190,11 @@ def summarize_tool_result(tool_name: str, result: dict[str, Any], *, for_display
     if _is_unconfirmed_extension(result):
         return "Requested more browser session time; not confirmed and not retried"
     if not result.get("ok", False):
-        return f"Failed: {_sanitize_failure_text(_extract_failure_message(result))}"
+        message = _extract_failure_message(result)
+        reason = _result_data(result).get("reason")
+        if message == _UNKNOWN_ERROR_SENTINEL and isinstance(reason, str) and reason:
+            message = reason
+        return f"Failed: {_sanitize_failure_text(message)}"
 
     raw_data = result.get("data")
     data = raw_data if isinstance(raw_data, dict) else {}
@@ -2210,9 +2214,9 @@ def summarize_tool_result(tool_name: str, result: dict[str, Any], *, for_display
         return ran
     if tool_name == "list_credentials":
         if data.get("status") == "resolved":
-            match = data.get("credential") or data.get("vault_login")
+            match = data.get("credential")
             if isinstance(match, dict):
-                name = match.get("name") or match.get("title")
+                name = match.get("name")
                 if isinstance(name, str) and name:
                     safe_name = sanitize_block_label_for_display(name)
                     if safe_name:
@@ -2222,7 +2226,21 @@ def summarize_tool_result(tool_name: str, result: dict[str, Any], *, for_display
         count = data.get("count", 0) + (len(vault_logins) if isinstance(vault_logins, list) else 0)
         return f"Found {count} credential(s)"
     if tool_name == "list_integrations":
-        return f"Found {data.get('count', 0)} connected integration(s)"
+        entries = data.get("integrations")
+        connected = (
+            sum(
+                1
+                for entry in entries
+                if isinstance(entry, dict)
+                and any(
+                    isinstance(account, dict) and account.get("state") == "active"
+                    for account in entry.get("accounts") or []
+                )
+            )
+            if isinstance(entries, list)
+            else 0
+        )
+        return f"Listed {data.get('count', 0)} integration(s), {connected} with an active account"
     if tool_name == "read_google_sheet":
         rows = data.get("connections")
         opened = (
@@ -2250,9 +2268,10 @@ def summarize_tool_result(tool_name: str, result: dict[str, Any], *, for_display
         executed = _joined_block_labels(raw_executed, block_label, cap=for_display)
         status = data.get("overall_status", "?")
         requested = data.get("requested_block_labels") or []
-        if requested and raw_executed and list(raw_executed) != list(requested):
+        planned = data.get("planned_block_labels") or raw_executed
+        if requested and planned and list(planned) != list(requested):
             skipped = _joined_block_labels(
-                [label for label in requested if label not in set(raw_executed)], block_label, cap=for_display
+                [label for label in requested if label not in set(planned)], block_label, cap=for_display
             )
             suffix = f" (skipped prefix from cache: {skipped})" if skipped else ""
             return f"Run {executed}: {status}{suffix}"

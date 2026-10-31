@@ -1,6 +1,7 @@
 import { useReactFlow } from "@xyflow/react";
 import { AppNode, isWorkflowBlockNode } from "../editor/nodes";
 import {
+  getLabelOutputParameterKeyCollision,
   getUniqueLabelForExistingNode,
   getUpdatedNodesAfterLabelUpdateForParameterKeys,
   getUpdatedParametersAfterLabelUpdateForSourceParameterKey,
@@ -100,7 +101,27 @@ function useNodeLabelChangeHandler({ id, initialValue }: Props) {
         });
       }
 
-      const newLabel = getUniqueLabelForExistingNode(sanitized, existingLabels);
+      const parameterKeys = workflowParameters.map(
+        (parameter) => parameter.key,
+      );
+      const outputCollision = getLabelOutputParameterKeyCollision(
+        sanitized,
+        parameterKeys,
+      );
+      if (outputCollision) {
+        toast({
+          title: "Block label conflicts with a workflow parameter",
+          description: `The generated output key "${outputCollision}" is already in use.`,
+          variant: "destructive",
+        });
+        return;
+      }
+
+      const newLabel = getUniqueLabelForExistingNode(
+        sanitized,
+        existingLabels,
+        parameterKeys,
+      );
       const oldLabel = nodes.find((node) => node.id === id)?.data.label;
       if (oldLabel && oldLabel !== newLabel) {
         useNodeCollapseStore

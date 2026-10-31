@@ -19,6 +19,9 @@ LOG = structlog.get_logger()
 DATE_SEGMENT_AIM_FLAG = "TASK_V3_DATE_SEGMENT_AIM"
 LOGIN_PACE_FLAG = "TASK_V3_LOGIN_PACE"
 DEAD_END_RETURN_FLAG = "TASK_V3_DEAD_END_RETURN"
+TURN_DOM_FLAG = "TASK_V3_TURN_DOM"
+LLM_ROUTE_FLAG = "TASK_V3_LLM_ROUTE"
+ANSWER_AUDIT_LOG_ONLY_FLAG = "TASK_V3_ANSWER_AUDIT_LOG_ONLY"
 
 # Person properties a flag is evaluated with beyond organization_id; resolve_run_arm drops any other key. The
 # PostHog preflight (scripts/check_run_arm_flags.py) reads this mapping to accept release conditions on them.
@@ -94,3 +97,10 @@ def run_arm_enabled(flag: str, forced: bool) -> bool:
         return False
     pin = context.run_arms.get(flag)
     return pin is not None and pin[1] == "treatment"
+
+
+def current_run_arm(flag: str) -> RunArm:
+    """The arm the current run pinned for ``flag``, for logging; a run that never resolved it reads unrandomized."""
+    context = skyvern_context.current()
+    pin = context.run_arms.get(flag) if context is not None else None
+    return pin[1] if pin is not None else "unrandomized"

@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import asyncio
 import datetime
+import hmac
 import secrets
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
@@ -44,7 +45,7 @@ from skyvern.forge.sdk.db.repositories.google_oauth import (  # noqa: F401
     PendingConsentContext,
 )
 from skyvern.forge.sdk.encrypt import encryptor
-from skyvern.forge.sdk.encrypt.base import EncryptMethod
+from skyvern.forge.sdk.encrypt.base import DEFAULT_ENCRYPT_METHOD
 from skyvern.forge.sdk.schemas.google_oauth import (
     GOOGLE_GMAIL_SEND_SCOPE,
     GoogleOAuthClientConfig,
@@ -358,7 +359,7 @@ async def save_client_config(
         organization_id=organization_id,
         token_type=OrganizationAuthTokenType.google_oauth_client_config,
         token=token_payload,
-        encrypted_method=EncryptMethod.AES,
+        encrypted_method=DEFAULT_ENCRYPT_METHOD,
     )
     now = datetime.datetime.now(datetime.UTC).replace(tzinfo=None)
     flipped = await app.DATABASE.google_oauth.mark_active_mismatched_client_as_error(
@@ -707,13 +708,13 @@ async def promote_pending_credential(
     """Encrypt the refresh token and promote the matching pending row to active."""
     nonce = oauth_consent.consent_nonce(state, initiator_id)
     _require_encryption()
-    encrypted_token = await encryptor.encrypt(refresh_token, EncryptMethod.AES)
+    encrypted_token = await encryptor.encrypt(refresh_token, DEFAULT_ENCRYPT_METHOD)
     now = datetime.datetime.now(datetime.UTC).replace(tzinfo=None)
     credential = await app.DATABASE.google_oauth.promote_pending_to_active(
         organization_id=organization_id,
         nonce=nonce,
         encrypted_refresh_token=encrypted_token,
-        encrypted_method=EncryptMethod.AES,
+        encrypted_method=DEFAULT_ENCRYPT_METHOD,
         scopes_granted=_coerce_scopes(scopes_granted),
         now=now,
         google_subject=identity.subject if identity else None,
@@ -1036,6 +1037,19 @@ async def credentials_from_secrets(
     return creds
 
 
+async def _ciphertext_if_token_unchanged(organization_id: str, credential_id: str, refresh_token: str) -> str | None:
+    payload = await app.DATABASE.google_oauth.load_active_ciphertext(
+        organization_id=organization_id,
+        credential_id=credential_id,
+    )
+    if payload is None:
+        return None
+    stored_refresh_token = await encryptor.decrypt(payload.encrypted_refresh_token, payload.encrypted_method)
+    if not hmac.compare_digest(stored_refresh_token, refresh_token):
+        return None
+    return payload.encrypted_refresh_token
+
+
 async def refresh_and_rotate(
     *,
     organization_id: str,
@@ -1057,16 +1071,27 @@ async def refresh_and_rotate(
         try:
             if credential_secrets.encrypted_refresh_token is None:
                 raise ValueError("Google OAuth credential is missing its encrypted refresh token")
-            encrypted_refresh_token = await encryptor.encrypt(new_refresh_token, EncryptMethod.AES)
+            encrypted_refresh_token = await encryptor.encrypt(new_refresh_token, DEFAULT_ENCRYPT_METHOD)
             now = datetime.datetime.now(datetime.UTC).replace(tzinfo=None)
-            updated = await app.DATABASE.google_oauth.update_active_refresh_token(
-                organization_id=organization_id,
-                credential_id=credential_id,
-                encrypted_refresh_token=encrypted_refresh_token,
-                encrypted_method=EncryptMethod.AES,
-                now=now,
-                expected_encrypted_refresh_token=credential_secrets.encrypted_refresh_token,
-            )
+
+            async def replace_refresh_token(expected_encrypted_refresh_token: str) -> bool:
+                return await app.DATABASE.google_oauth.update_active_refresh_token(
+                    organization_id=organization_id,
+                    credential_id=credential_id,
+                    encrypted_refresh_token=encrypted_refresh_token,
+                    encrypted_method=DEFAULT_ENCRYPT_METHOD,
+                    now=now,
+                    expected_encrypted_refresh_token=expected_encrypted_refresh_token,
+                )
+
+            updated = await replace_refresh_token(credential_secrets.encrypted_refresh_token)
+            if not updated:
+                # A re-encryption (e.g. the AES-GCM backfill) changes the ciphertext but not the token; retry once
+                # against the new ciphertext so the rotated token is not lost.
+                current_ciphertext = await _ciphertext_if_token_unchanged(
+                    organization_id, credential_id, credential_secrets.refresh_token
+                )
+                updated = current_ciphertext is not None and await replace_refresh_token(current_ciphertext)
             if not updated:
                 raise ValueError("Google OAuth credential changed during refresh-token rotation")
             credential_version = now

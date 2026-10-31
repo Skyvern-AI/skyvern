@@ -1,25 +1,35 @@
 from __future__ import annotations
 
 import asyncio
+import io
 import os
 import time
+import zipfile
 from datetime import UTC, datetime
+from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 from structlog.testing import capture_logs
 
-from skyvern.exceptions import DownloadFileMaxWaitingTime, TaskNotFound
+from skyvern.exceptions import DownloadFileMaxWaitingTime, DownloadSaveIncompleteError, TaskNotFound
 from skyvern.forge.agent import ForgeAgent
 from skyvern.forge.sdk.api.files import check_downloading_files_and_wait_for_download_to_complete
 from skyvern.forge.sdk.artifact.storage.base import get_download_retry_started_at
 from skyvern.forge.sdk.core.skyvern_context import SkyvernContext
 from skyvern.forge.sdk.models import StepStatus
+from skyvern.forge.sdk.schemas.tasks import TaskStatus
+from skyvern.forge.sdk.workflow.models.block import FileDownloadBlock
+from skyvern.forge.sdk.workflow.models.parameter import OutputParameter
 from skyvern.schemas.runs import RunEngine
+from skyvern.schemas.steps import AgentStepOutput
+from skyvern.webeye.actions.action_types import ActionType
+from skyvern.webeye.actions.actions import Action
 from skyvern.webeye.actions.handler import _download_target_path
 from skyvern.webeye.actions.models import DetailedAgentStepOutput
-from skyvern.webeye.cdp_download_interceptor import ORIGINAL_FILENAME_MARKER
+from skyvern.webeye.actions.responses import ActionSuccess
+from skyvern.webeye.cdp_download_interceptor import ORIGINAL_FILENAME_MARKER, CDPDownloadInterceptor
 from tests.unit._fingerprint_expectations import expected_fingerprint
 
 
@@ -30,6 +40,16 @@ def _keyed_fingerprint(fingerprint_secret_key: str) -> str:
 
 def _finalize_events(cap: list[dict]) -> list[dict]:
     return [e for e in cap if e.get("event") == "download_suffix_finalize_rename"]
+
+
+def _valid_zip_bytes() -> bytes:
+    buffer = io.BytesIO()
+    with zipfile.ZipFile(buffer, "w") as archive:
+        archive.writestr("report.txt", b"valid zip")
+    return buffer.getvalue()
+
+
+_VALID_TEST_PDF = b"%PDF-1.4\n1 0 obj<<>>endobj\ntrailer<<>>\n%%EOF\n"
 
 
 def _make_task(
@@ -108,7 +128,7 @@ async def test_finalize_preserves_explicit_suffix_extension(tmp_path) -> None:
     download_dir = tmp_path / "downloads"
     download_dir.mkdir()
     target_name = "custom.txt"
-    (download_dir / target_name).write_bytes(b"report")
+    (download_dir / target_name).write_bytes(_VALID_TEST_PDF)
     context = SkyvernContext(download_suffix=target_name)
     context.download_suffix_applied_files[target_name] = ("report.pdf", target_name)
 
@@ -126,6 +146,36 @@ async def test_finalize_preserves_explicit_suffix_extension(tmp_path) -> None:
 
     assert (download_dir / target_name).exists()
     assert not (download_dir / "custom.txt.pdf").exists()
+
+
+@pytest.mark.asyncio
+async def test_finalize_validates_suffix_renamed_file_against_original_filename(tmp_path) -> None:
+    agent = ForgeAgent()
+    task = _make_task()
+    download_dir = tmp_path / "downloads"
+    download_dir.mkdir()
+    target_name = "custom.txt"
+    (download_dir / target_name).write_bytes(
+        b"<!DOCTYPE html><html><head><title>Error</title></head><body><h1>Session expired</h1></body></html>"
+    )
+    context = SkyvernContext(task_id=task.task_id, download_suffix=target_name)
+    context.download_suffix_applied_files[target_name] = ("report.pdf", target_name)
+
+    with (
+        patch("skyvern.forge.agent.get_path_for_workflow_download_directory", return_value=download_dir),
+        patch("skyvern.forge.agent.skyvern_context.current", return_value=context),
+    ):
+        recorded = await agent._finalize_downloaded_files_for_task(
+            task,
+            organization_id=task.organization_id,
+            download_suffix=target_name,
+            list_files_before=[],
+            randomize_if_missing=False,
+        )
+
+    assert recorded == []
+    assert not (download_dir / target_name).exists()
+    assert context.consume_download_failures(task.task_id) == ["The requested browser download could not be saved."]
 
 
 @pytest.mark.asyncio
@@ -168,7 +218,7 @@ async def test_finalize_skips_rename_for_session_file_already_named_by_suffix(tm
     download_dir.mkdir()
 
     aws_client = MagicMock()
-    aws_client.download_file = AsyncMock(return_value=b"data")
+    aws_client.download_file = AsyncMock(return_value=_VALID_TEST_PDF)
     rename_mock = MagicMock()
 
     with (
@@ -208,7 +258,9 @@ async def test_finalize_dedupes_two_session_files_sharing_one_suffix(tmp_path) -
     download_dir.mkdir()
 
     aws_client = MagicMock()
-    aws_client.download_file = AsyncMock(side_effect=[b"a", b"b"])
+    aws_client.download_file = AsyncMock(
+        side_effect=[_VALID_TEST_PDF, b"%PDF-1.5\n1 0 obj<<>>endobj\ntrailer<<>>\n%%EOF\n"]
+    )
 
     with (
         patch("skyvern.forge.agent.get_path_for_workflow_download_directory", return_value=download_dir),
@@ -243,7 +295,7 @@ async def test_finalize_skips_rename_for_local_file_already_named_by_suffix(tmp_
     task = _make_task()
     download_dir = tmp_path / "downloads"
     download_dir.mkdir()
-    (download_dir / "req-123.pdf").write_bytes(b"x")
+    (download_dir / "req-123.pdf").write_bytes(_VALID_TEST_PDF)
 
     rename_mock = MagicMock()
     with (
@@ -371,6 +423,9 @@ async def test_cleanup_task_finalizes_downloads_before_saving(tmp_path) -> None:
     last_step = MagicMock()
     last_step.step_id = "step-1"
     call_order: list[str] = []
+    session_id = "pbs-cleanup"
+    rejected_uri = f"s3://bucket/browser_sessions/{session_id}/downloads/invoice.pdf"
+    context = SkyvernContext(task_id=task.task_id, browser_session_id=session_id)
 
     async def finalize_side_effect(*args, **kwargs):
         call_order.append("rename")
@@ -381,11 +436,13 @@ async def test_cleanup_task_finalizes_downloads_before_saving(tmp_path) -> None:
 
     with (
         patch("skyvern.forge.agent.analytics.capture"),
-        patch("skyvern.forge.agent.skyvern_context.current", return_value=None),
+        patch("skyvern.forge.agent.skyvern_context.current", return_value=context),
         patch.object(agent, "_finalize_downloaded_files_for_task", AsyncMock(side_effect=finalize_side_effect)),
         patch("skyvern.forge.agent.app") as mock_app,
     ):
         mock_app.DATABASE.tasks.get_task = AsyncMock(return_value=task)
+        mock_app.DATABASE.artifacts.claim_session_download_artifacts_for_run = AsyncMock(return_value=0)
+        mock_app.BROWSER_MANAGER.get_for_task = MagicMock(return_value=None)
         mock_app.STORAGE.save_downloaded_files = AsyncMock(side_effect=save_side_effect)
 
         await agent.clean_up_task(
@@ -394,9 +451,320 @@ async def test_cleanup_task_finalizes_downloads_before_saving(tmp_path) -> None:
             need_final_screenshot=False,
             download_suffix="req-123",
             list_files_before=[],
+            download_rejections=[rejected_uri],
         )
 
     assert call_order == ["rename", "save"]
+    assert mock_app.DATABASE.artifacts.claim_session_download_artifacts_for_run.await_args.kwargs["excluded_uris"] == [
+        rejected_uri
+    ]
+
+
+@pytest.mark.asyncio
+async def test_suffix_only_cleanup_does_not_reject_file_without_completion_verdict(tmp_path) -> None:
+    agent = ForgeAgent()
+    task = _make_task()
+    task.status = TaskStatus.completed
+    download_dir = tmp_path / "downloads"
+    download_dir.mkdir()
+    error_page = b"<!DOCTYPE html><html><body><h1>Session expired</h1></body></html>"
+    (download_dir / "invoice.pdf").write_bytes(error_page)
+    context = SkyvernContext(task_id=task.task_id)
+
+    with (
+        patch("skyvern.forge.agent.analytics.capture"),
+        patch("skyvern.forge.agent.skyvern_context.current", return_value=context),
+        patch("skyvern.forge.agent.get_path_for_workflow_download_directory", return_value=download_dir),
+        patch("skyvern.forge.agent.has_download_interceptor_for_context", return_value=False),
+        patch("skyvern.forge.agent.app") as mock_app,
+    ):
+        mock_app.DATABASE.tasks.get_task = AsyncMock(return_value=task)
+        mock_app.STORAGE.save_downloaded_files = AsyncMock()
+
+        await agent.clean_up_task(
+            task,
+            last_step=MagicMock(step_id="step-1"),
+            need_final_screenshot=False,
+            download_suffix="requested",
+            list_files_before=[],
+        )
+
+    assert (download_dir / "requested.pdf").read_bytes() == error_page
+    assert context.consume_download_failures(task.task_id) == []
+
+
+@pytest.mark.asyncio
+async def test_complete_on_download_fails_when_storage_save_is_partial() -> None:
+    agent = ForgeAgent()
+    task = _make_task()
+    task.status = TaskStatus.running
+    context = SkyvernContext(task_id=task.task_id)
+    update_task = AsyncMock(return_value=task)
+
+    with (
+        patch("skyvern.forge.agent.analytics.capture"),
+        patch("skyvern.forge.agent.skyvern_context.current", return_value=context),
+        patch.object(agent, "update_task", update_task),
+        patch("skyvern.forge.agent.app") as mock_app,
+    ):
+        mock_app.DATABASE.tasks.get_task = AsyncMock(return_value=task)
+        mock_app.STORAGE.save_downloaded_files = AsyncMock(side_effect=DownloadSaveIncompleteError(["file.pdf"]))
+
+        await agent.clean_up_task(
+            task,
+            last_step=MagicMock(step_id="step-1"),
+            need_final_screenshot=False,
+            download_completion_pending=True,
+        )
+
+    assert update_task.await_args.kwargs["status"] == TaskStatus.failed
+    assert "could not be saved" in update_task.await_args.kwargs["failure_reason"]
+
+
+@pytest.mark.asyncio
+async def test_task_v3_cleanup_returns_partial_save_result_without_finalizing() -> None:
+    agent = ForgeAgent()
+    task = _make_task()
+    task.status = TaskStatus.running
+    feedback: list[str] = []
+    update_task = AsyncMock(return_value=task)
+
+    with (
+        patch("skyvern.forge.agent.analytics.capture"),
+        patch("skyvern.forge.agent.skyvern_context.current", return_value=SkyvernContext(task_id=task.task_id)),
+        patch.object(agent, "update_task", update_task),
+        patch("skyvern.forge.agent.app") as mock_app,
+    ):
+        mock_app.DATABASE.tasks.get_task = AsyncMock(return_value=task)
+        mock_app.STORAGE.save_downloaded_files = AsyncMock(side_effect=DownloadSaveIncompleteError(["file.pdf"]))
+
+        await agent.clean_up_task(
+            task,
+            last_step=MagicMock(step_id="step-1"),
+            need_final_screenshot=False,
+            download_completion_pending=True,
+            download_completion_feedback=feedback,
+        )
+
+    assert task.status == TaskStatus.running
+    update_task.assert_not_awaited()
+    assert feedback == ["Downloaded file 'file.pdf' could not be saved or registered."]
+
+
+@pytest.mark.asyncio
+async def test_task_v3_cleanup_returns_artifact_count_mismatch_without_finalizing() -> None:
+    agent = ForgeAgent()
+    task = _make_task()
+    task.status = TaskStatus.running
+    interceptor = CDPDownloadInterceptor(network_egress_monitor=MagicMock(), redirect_hop_authorizer=MagicMock())
+    interceptor._captured_download_count = 1
+    browser_context = MagicMock()
+    browser_context._skyvern_cdp_download_interceptor = interceptor
+    browser_state = MagicMock(browser_context=browser_context)
+    context = SkyvernContext(task_id=task.task_id)
+    feedback: list[str] = []
+    update_task = AsyncMock(return_value=task)
+
+    with (
+        patch("skyvern.forge.agent.analytics.capture"),
+        patch("skyvern.forge.agent.skyvern_context.current", return_value=context),
+        patch.object(agent, "update_task", update_task),
+        patch("skyvern.forge.agent.app") as mock_app,
+    ):
+        mock_app.DATABASE.tasks.get_task = AsyncMock(return_value=task)
+        mock_app.DATABASE.artifacts.list_artifacts_for_run_by_type = AsyncMock(return_value=[])
+        mock_app.BROWSER_MANAGER.get_for_task.return_value = browser_state
+        mock_app.STORAGE.save_downloaded_files = AsyncMock()
+
+        await agent.clean_up_task(
+            task,
+            last_step=MagicMock(step_id="step-1"),
+            need_final_screenshot=False,
+            download_completion_pending=True,
+            download_completion_feedback=feedback,
+        )
+
+    assert task.status == TaskStatus.running
+    update_task.assert_not_awaited()
+    assert feedback == ["Only 0 of 1 captured downloads were registered as artifacts."]
+
+
+@pytest.mark.asyncio
+async def test_complete_on_download_fails_when_storage_save_times_out() -> None:
+    agent = ForgeAgent()
+    task = _make_task()
+    task.status = TaskStatus.running
+    update_task = AsyncMock(return_value=task)
+
+    with (
+        patch("skyvern.forge.agent.analytics.capture"),
+        patch("skyvern.forge.agent.skyvern_context.current", return_value=SkyvernContext(task_id=task.task_id)),
+        patch.object(agent, "update_task", update_task),
+        patch("skyvern.forge.agent.app") as mock_app,
+    ):
+        mock_app.DATABASE.tasks.get_task = AsyncMock(return_value=task)
+        mock_app.STORAGE.save_downloaded_files = AsyncMock(side_effect=asyncio.TimeoutError)
+
+        await agent.clean_up_task(
+            task,
+            last_step=MagicMock(step_id="step-1"),
+            need_final_screenshot=False,
+            download_completion_pending=True,
+        )
+
+    assert update_task.await_args.kwargs["status"] == TaskStatus.failed
+    assert update_task.await_args.kwargs["failure_reason"] == "Timed out while saving downloaded files."
+
+
+@pytest.mark.asyncio
+async def test_complete_on_download_fails_when_captured_file_is_missing_from_artifacts() -> None:
+    agent = ForgeAgent()
+    task = _make_task()
+    task.status = TaskStatus.running
+    interceptor = CDPDownloadInterceptor(network_egress_monitor=MagicMock(), redirect_hop_authorizer=MagicMock())
+    interceptor._captured_download_count = 1
+    browser_context = MagicMock()
+    browser_context._skyvern_cdp_download_interceptor = interceptor
+    browser_state = MagicMock(browser_context=browser_context)
+    update_task = AsyncMock(return_value=task)
+
+    with (
+        patch("skyvern.forge.agent.analytics.capture"),
+        patch("skyvern.forge.agent.skyvern_context.current", return_value=SkyvernContext(task_id=task.task_id)),
+        patch.object(agent, "update_task", update_task),
+        patch("skyvern.forge.agent.app") as mock_app,
+    ):
+        mock_app.DATABASE.tasks.get_task = AsyncMock(return_value=task)
+        mock_app.DATABASE.artifacts.list_artifacts_for_run_by_type = AsyncMock(return_value=[])
+        mock_app.BROWSER_MANAGER.get_for_task.return_value = browser_state
+        mock_app.STORAGE.save_downloaded_files = AsyncMock()
+
+        await agent.clean_up_task(
+            task,
+            last_step=MagicMock(step_id="step-1"),
+            need_final_screenshot=False,
+            download_completion_pending=True,
+        )
+
+    assert update_task.await_args.kwargs["status"] == TaskStatus.failed
+    assert update_task.await_args.kwargs["failure_reason"] == (
+        "Only 0 of 1 captured downloads were registered as artifacts."
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("same_generation", [True, False], ids=["reused-interceptor", "replacement-interceptor"])
+async def test_task_v3_cleanup_compares_artifacts_to_task_baseline_and_tally_generation(
+    same_generation: bool,
+) -> None:
+    agent = ForgeAgent()
+    task = _make_task()
+    task.status = TaskStatus.running
+    interceptor = CDPDownloadInterceptor(network_egress_monitor=MagicMock(), redirect_hop_authorizer=MagicMock())
+    interceptor._captured_download_count = 9 if same_generation else 2
+    tally = interceptor.download_tally()
+    download_tally_baseline = tally._replace(
+        generation=tally.generation if same_generation else "previous-generation",
+        saved=7,
+    )
+    browser_context = MagicMock()
+    browser_context._skyvern_cdp_download_interceptor = interceptor
+    browser_state = MagicMock(browser_context=browser_context)
+    feedback: list[str] = []
+    update_task = AsyncMock(return_value=task)
+
+    with (
+        patch("skyvern.forge.agent.analytics.capture"),
+        patch("skyvern.forge.agent.skyvern_context.current", return_value=SkyvernContext(task_id=task.task_id)),
+        patch.object(agent, "update_task", update_task),
+        patch("skyvern.forge.agent.app") as mock_app,
+    ):
+        mock_app.DATABASE.tasks.get_task = AsyncMock(return_value=task)
+        # Two old run artifacts plus one new artifact: the latter still leaves one of this task's
+        # two captured downloads unregistered, even though the interceptor was replaced/reset.
+        mock_app.DATABASE.artifacts.list_artifacts_for_run_by_type = AsyncMock(return_value=[MagicMock()] * 3)
+        mock_app.BROWSER_MANAGER.get_for_task.return_value = browser_state
+        mock_app.STORAGE.save_downloaded_files = AsyncMock()
+
+        await agent.clean_up_task(
+            task,
+            last_step=MagicMock(step_id="step-1"),
+            need_final_screenshot=False,
+            download_completion_pending=True,
+            download_completion_feedback=feedback,
+            download_artifact_baseline_count=2,
+            download_tally_baseline=download_tally_baseline,
+        )
+
+    assert task.status == TaskStatus.running
+    update_task.assert_not_awaited()
+    assert feedback == ["Only 1 of 2 captured downloads were registered as artifacts."]
+
+
+@pytest.mark.asyncio
+async def test_complete_on_download_fails_when_requested_download_failed() -> None:
+    agent = ForgeAgent()
+    task = _make_task()
+    task.status = TaskStatus.running
+    context = SkyvernContext(task_id=task.task_id)
+    reason = "The requested browser download could not be saved."
+    context.record_download_failure(task.task_id, reason)
+    update_task = AsyncMock(return_value=task)
+
+    with (
+        patch("skyvern.forge.agent.analytics.capture"),
+        patch("skyvern.forge.agent.skyvern_context.current", return_value=context),
+        patch("skyvern.forge.agent.has_download_interceptor_for_context", return_value=False),
+        patch.object(agent, "update_task", update_task),
+        patch("skyvern.forge.agent.app") as mock_app,
+    ):
+        mock_app.DATABASE.tasks.get_task = AsyncMock(return_value=task)
+        mock_app.STORAGE.save_downloaded_files = AsyncMock()
+
+        await agent.clean_up_task(
+            task,
+            last_step=MagicMock(step_id="step-1"),
+            need_final_screenshot=False,
+            download_completion_pending=True,
+        )
+
+    assert update_task.await_args.kwargs["status"] == TaskStatus.failed
+    assert update_task.await_args.kwargs["failure_reason"] == reason
+    assert context.consume_download_failures(task.task_id) == []
+
+
+@pytest.mark.asyncio
+async def test_complete_on_download_ignores_unsolicited_download_failures() -> None:
+    agent = ForgeAgent()
+    task = _make_task()
+    task.status = TaskStatus.running
+    browser_state = MagicMock(browser_context=MagicMock())
+    update_task = AsyncMock(return_value=task)
+    unsolicited_error = {"error_code": "BROWSER_DOWNLOAD_PARTIAL_FAILURE", "reasoning": "unrequested download"}
+
+    with (
+        patch("skyvern.forge.agent.analytics.capture"),
+        patch("skyvern.forge.agent.skyvern_context.current", return_value=SkyvernContext(task_id=task.task_id)),
+        patch("skyvern.forge.agent.has_download_interceptor_for_context", return_value=True),
+        patch("skyvern.forge.agent.consume_unsolicited_download_error_for_context", return_value=unsolicited_error),
+        patch.object(agent, "update_task", update_task),
+        patch("skyvern.forge.agent.app") as mock_app,
+    ):
+        mock_app.DATABASE.tasks.get_task = AsyncMock(return_value=task)
+        mock_app.DATABASE.tasks.update_task = AsyncMock(return_value=task)
+        mock_app.DATABASE.artifacts.list_artifacts_for_run_by_type = AsyncMock(return_value=[])
+        mock_app.BROWSER_MANAGER.get_for_task.return_value = browser_state
+        mock_app.STORAGE.save_downloaded_files = AsyncMock()
+
+        await agent.clean_up_task(
+            task,
+            last_step=MagicMock(step_id="step-1"),
+            need_final_screenshot=False,
+            download_completion_pending=True,
+        )
+
+    assert update_task.await_args.kwargs["status"] == TaskStatus.completed
+    assert "failure_reason" not in update_task.await_args.kwargs
 
 
 @pytest.mark.asyncio
@@ -502,13 +870,26 @@ async def test_cleanup_timeout_bounds_browser_download_handler_drain() -> None:
 
 
 @pytest.mark.asyncio
-async def test_execute_step_complete_on_download_does_not_double_finalize(tmp_path) -> None:
+@pytest.mark.parametrize(
+    "download_case",
+    [
+        "saved",
+        "rejected_only",
+        "transient_failure",
+        "cleanup_only_rejected",
+        "cleanup_only_rejected_no_suffix",
+        "terminal_download_block",
+    ],
+    ids=["saved", "rejected_only", "transient", "cleanup_only_rejected", "cleanup_only_no_suffix", "terminal"],
+)
+async def test_execute_step_complete_on_download_does_not_double_finalize(tmp_path, download_case: str) -> None:
     agent = ForgeAgent()
     download_dir = tmp_path / "downloads"
     download_dir.mkdir()
 
     task = _make_task()
-    task.status = SimpleNamespace(value="running")
+    context = SkyvernContext(task_id=task.task_id, workflow_run_id=task.workflow_run_id)
+    task.status = TaskStatus.running
     task.navigation_goal = "Download invoice"
     task.data_extraction_goal = None
     task.complete_criterion = None
@@ -533,13 +914,29 @@ async def test_execute_step_complete_on_download_does_not_double_finalize(tmp_pa
     task_block = MagicMock()
     task_block.complete_on_download = True
     task_block.download_timeout = None
-    task_block.download_suffix = "req-123"
+    task_block.download_suffix = None if download_case == "cleanup_only_rejected_no_suffix" else "req-123"
 
     browser_state = MagicMock()
     browser_state.get_working_page = AsyncMock(return_value=None)
 
+    agent_step_calls = 0
+
     async def agent_step_side_effect(*args, **kwargs):
-        (download_dir / "uuid-file.zip").write_text("dummy")
+        nonlocal agent_step_calls
+        agent_step_calls += 1
+        if download_case == "rejected_only":
+            (download_dir / "invoice.pdf").write_bytes(
+                b"<!DOCTYPE html><html><head><title>Error</title></head><body><h1>Session expired</h1></body></html>"
+            )
+        elif download_case == "saved":
+            (download_dir / "uuid-file.zip").write_bytes(_valid_zip_bytes())
+        elif download_case in ("cleanup_only_rejected", "cleanup_only_rejected_no_suffix", "terminal_download_block"):
+            step.status = StepStatus.completed
+        elif agent_step_calls == 1:
+            context.record_download_failure(task.task_id, "capture_failed")
+            step.status = StepStatus.failed
+        else:
+            step.status = StepStatus.created
         return step, DetailedAgentStepOutput(
             scraped_page=None,
             extract_action_prompt=None,
@@ -558,19 +955,47 @@ async def test_execute_step_complete_on_download_does_not_double_finalize(tmp_pa
         return step_obj
 
     async def update_task_side_effect(task_obj, *args, **kwargs):
+        events.append(("update_task", kwargs.get("status")))
         return task_obj
+
+    update_task = AsyncMock(side_effect=update_task_side_effect)
+    agent_step = AsyncMock(side_effect=agent_step_side_effect)
+    handle_failed_step = AsyncMock(return_value=step)
+    events: list[tuple[str, object]] = []
+    real_clean_up_task = agent.clean_up_task
+
+    async def clean_up_task_side_effect(*args, **kwargs):
+        events.append(("clean_up_task", kwargs.get("download_completion_pending")))
+        if download_case in ("cleanup_only_rejected", "cleanup_only_rejected_no_suffix"):
+            (download_dir / "invoice.pdf").write_bytes(
+                b"<!DOCTYPE html><html><head><title>Error</title></head><body><h1>Session expired</h1></body></html>"
+            )
+        return await real_clean_up_task(*args, **kwargs)
+
+    real_handle_completed_step = agent.handle_completed_step
+
+    async def handle_completed_step_side_effect(*args, **kwargs):
+        if download_case == "terminal_download_block":
+            task.status = TaskStatus.failed
+            return False, step, None
+        return await real_handle_completed_step(*args, **kwargs)
 
     with (
         patch("skyvern.forge.agent.analytics.capture"),
-        patch("skyvern.forge.agent.skyvern_context.ensure_context", return_value=MagicMock()),
-        patch("skyvern.forge.agent.skyvern_context.current", return_value=None),
+        patch("skyvern.forge.agent.skyvern_context.ensure_context", return_value=context),
+        patch("skyvern.forge.agent.skyvern_context.current", return_value=context),
         patch("skyvern.forge.agent.get_path_for_workflow_download_directory", return_value=download_dir),
         patch("skyvern.forge.agent.list_downloading_files_in_directory", return_value=[]),
         patch("skyvern.forge.agent.app") as mock_app,
         patch.object(agent, "initialize_execution_state", AsyncMock(return_value=(step, browser_state, None))),
-        patch.object(agent, "agent_step", AsyncMock(side_effect=agent_step_side_effect)),
+        patch.object(agent, "agent_step", agent_step),
         patch.object(agent, "update_step", AsyncMock(side_effect=update_step_side_effect)),
-        patch.object(agent, "update_task", AsyncMock(side_effect=update_task_side_effect)),
+        patch.object(agent, "update_task", update_task),
+        patch.object(agent, "get_extracted_information_for_task", AsyncMock(return_value=None)),
+        patch.object(agent, "handle_completed_step", AsyncMock(side_effect=handle_completed_step_side_effect)),
+        patch.object(agent, "clean_up_task", AsyncMock(side_effect=clean_up_task_side_effect)) as clean_up_task,
+        patch.object(agent, "handle_failed_step", handle_failed_step),
+        patch.object(agent, "_sync_video_artifact_after_step", AsyncMock()),
         patch.object(agent, "update_task_errors_from_detailed_output", AsyncMock(return_value=task)),
     ):
         mock_app.DATABASE.workflow_runs.get_workflow_run = AsyncMock(return_value=None)
@@ -578,6 +1003,7 @@ async def test_execute_step_complete_on_download_does_not_double_finalize(tmp_pa
         mock_app.DATABASE.tasks.update_task = AsyncMock(return_value=task)
         mock_app.AGENT_FUNCTION.validate_step_execution = AsyncMock()
         mock_app.AGENT_FUNCTION.post_step_execution = AsyncMock()
+        mock_app.AGENT_FUNCTION.gate_step_completion = AsyncMock(return_value=True)
         mock_app.ARTIFACT_MANAGER.flush_step_archive = AsyncMock()
         mock_app.BROWSER_MANAGER.get_for_task = MagicMock(return_value=None)
         mock_app.BROWSER_MANAGER.get_for_workflow_run = MagicMock(return_value=None)
@@ -594,9 +1020,35 @@ async def test_execute_step_complete_on_download_does_not_double_finalize(tmp_pa
             engine=RunEngine.skyvern_v1,
         )
 
-    assert (download_dir / "req-123.zip").exists()
-    assert not (download_dir / "req-123_1.zip").exists()
-    assert not (download_dir / "uuid-file.zip").exists()
+    if download_case == "rejected_only":
+        assert list(download_dir.iterdir()) == []
+        assert clean_up_task.await_args.kwargs["download_rejections"] == [str(download_dir / "invoice.pdf")]
+        assert any(
+            call.kwargs.get("status") == TaskStatus.failed
+            and "The requested browser download could not be saved." in call.kwargs.get("failure_reason", "")
+            for call in update_task.await_args_list
+        )
+    elif download_case in ("cleanup_only_rejected", "cleanup_only_rejected_no_suffix"):
+        assert list(download_dir.iterdir()) == []
+        assert not any(call.kwargs.get("status") == TaskStatus.completed for call in update_task.await_args_list)
+        assert any(
+            call.kwargs.get("status") == TaskStatus.failed
+            and "The requested browser download could not be saved." in call.kwargs.get("failure_reason", "")
+            for call in update_task.await_args_list
+        )
+    elif download_case == "terminal_download_block":
+        assert clean_up_task.await_args.kwargs["download_completion_pending"] is False
+    elif download_case == "saved":
+        assert (download_dir / "req-123.zip").exists()
+        assert not (download_dir / "req-123_1.zip").exists()
+        assert not (download_dir / "uuid-file.zip").exists()
+    else:
+        assert agent_step.await_count == 2
+        handle_failed_step.assert_awaited_once()
+        assert not any(call.kwargs.get("download_completion_pending") for call in clean_up_task.await_args_list)
+    if download_case in ("saved", "rejected_only", "cleanup_only_rejected", "cleanup_only_rejected_no_suffix"):
+        assert clean_up_task.await_args.kwargs["download_completion_pending"] is True
+        assert events[0] == ("clean_up_task", True)
 
 
 @pytest.mark.asyncio
@@ -646,7 +1098,7 @@ async def test_execute_step_reuses_initial_download_baseline_across_recursive_st
     async def agent_step_side_effect(*args, **kwargs):
         current_step = args[1]
         if current_step.step_id == "step-1":
-            _download_target_path(download_dir, "report.pdf").write_text("dummy")
+            _download_target_path(download_dir, "report.pdf").write_bytes(_VALID_TEST_PDF)
             step1.status = "completed"
             return step1, DetailedAgentStepOutput(
                 scraped_page=None,
@@ -842,7 +1294,7 @@ async def test_execute_step_complete_on_download_emits_finalize_lineage(tmp_path
     browser_state.get_working_page = AsyncMock(return_value=None)
 
     async def agent_step_side_effect(*args, **kwargs):
-        (download_dir / "uuid-file.zip").write_text("dummy")
+        (download_dir / "uuid-file.zip").write_bytes(_valid_zip_bytes())
         return step, DetailedAgentStepOutput(
             scraped_page=None,
             extract_action_prompt=None,
@@ -1145,7 +1597,7 @@ async def test_finalize_skips_session_copy_whose_bytes_already_in_run_dir(tmp_pa
 
     download_dir = tmp_path / "downloads"
     download_dir.mkdir()
-    statement_bytes = b"STATEMENT-BYTES-A"
+    statement_bytes = _VALID_TEST_PDF
     (download_dir / "run-copy.pdf").write_bytes(statement_bytes)  # the eager blob carve-out copy
 
     session_uri = "s3://bucket/browser_sessions/pbs-1/downloads/Statement.pdf"
@@ -1186,7 +1638,7 @@ async def test_finalize_materializes_session_download_when_run_dir_empty(tmp_pat
 
     session_uri = "s3://bucket/browser_sessions/pbs-2/downloads/OnlyStatement.pdf"
     aws_client = MagicMock()
-    aws_client.download_file = AsyncMock(return_value=b"ONLY-STATEMENT-BYTES")
+    aws_client.download_file = AsyncMock(return_value=_VALID_TEST_PDF)
 
     with (
         patch("skyvern.forge.agent.get_path_for_workflow_download_directory", return_value=download_dir),
@@ -1205,6 +1657,100 @@ async def test_finalize_materializes_session_download_when_run_dir_empty(tmp_pat
 
     remaining = sorted(p.name for p in download_dir.iterdir())
     assert remaining == ["OnlyStatement.pdf"], f"the single session download must be materialized, got {remaining}"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("scheme", ["s3", "gs"])
+async def test_finalize_rejects_contradictory_persistent_session_download(tmp_path, scheme: str) -> None:
+    agent = ForgeAgent()
+    task = _make_task(workflow_run_id="wr-reject-session-download")
+    task.browser_session_id = "pbs-reject"
+    download_dir = tmp_path / "downloads"
+    download_dir.mkdir()
+    session_uri = f"{scheme}://bucket/browser_sessions/pbs-reject/downloads/invoice.pdf"
+    error_page = b"<!DOCTYPE html><html><body><h1>Session expired</h1></body></html>"
+    context = SkyvernContext(task_id=task.task_id)
+    object_client = MagicMock()
+    object_client.download_file = AsyncMock(return_value=error_page)
+    rejected: list[str] = []
+
+    with (
+        patch("skyvern.forge.agent.get_path_for_workflow_download_directory", return_value=download_dir),
+        patch("skyvern.forge.agent.skyvern_context.current", return_value=context),
+        patch("skyvern.forge.agent.get_aws_client", return_value=object_client),
+        patch("skyvern.forge.agent.get_gcs_client", return_value=object_client),
+        patch("skyvern.forge.agent.app") as mock_app,
+    ):
+        mock_app.STORAGE.list_downloaded_files_in_browser_session = AsyncMock(return_value=[session_uri])
+        finalized = await agent._finalize_downloaded_files_for_task(
+            task,
+            organization_id=task.organization_id,
+            download_suffix=None,
+            list_files_before=[],
+            randomize_if_missing=False,
+            rejected_into=rejected,
+        )
+
+    assert finalized == []
+    assert rejected == [session_uri]
+    assert list(download_dir.iterdir()) == []
+    assert context.consume_download_failures(task.task_id) == ["The requested browser download could not be saved."]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("scheme", ["s3", "gs"])
+@pytest.mark.parametrize(
+    ("file_data", "validate_claimed_type", "expected_finalized", "expected_rejection"),
+    [
+        (None, True, False, False),
+        (b"", True, False, True),
+        (None, False, True, False),
+    ],
+    ids=["unreadable-retryable", "empty-pdf-rejected", "v3-behavior-unchanged"],
+)
+async def test_finalize_does_not_credit_unreadable_session_download(
+    tmp_path,
+    scheme: str,
+    file_data: bytes | None,
+    validate_claimed_type: bool,
+    expected_finalized: bool,
+    expected_rejection: bool,
+) -> None:
+    agent = ForgeAgent()
+    task = _make_task(workflow_run_id="wr-unreadable-session-download")
+    task.browser_session_id = "pbs-unreadable"
+    download_dir = tmp_path / "downloads"
+    download_dir.mkdir()
+    session_uri = f"{scheme}://bucket/browser_sessions/pbs-unreadable/downloads/invoice.pdf"
+    context = SkyvernContext(task_id=task.task_id)
+    object_client = MagicMock()
+    object_client.download_file = AsyncMock(return_value=file_data)
+    rejected: list[str] = []
+
+    with (
+        patch("skyvern.forge.agent.get_path_for_workflow_download_directory", return_value=download_dir),
+        patch("skyvern.forge.agent.skyvern_context.current", return_value=context),
+        patch("skyvern.forge.agent.get_aws_client", return_value=object_client),
+        patch("skyvern.forge.agent.get_gcs_client", return_value=object_client),
+        patch("skyvern.forge.agent.app") as mock_app,
+    ):
+        mock_app.STORAGE.list_downloaded_files_in_browser_session = AsyncMock(return_value=[session_uri])
+        finalized = await agent._finalize_downloaded_files_for_task(
+            task,
+            organization_id=task.organization_id,
+            download_suffix=None,
+            list_files_before=[],
+            randomize_if_missing=False,
+            validate_claimed_type=validate_claimed_type,
+            rejected_into=rejected,
+        )
+
+    assert finalized == ([session_uri] if expected_finalized else [])
+    assert list(download_dir.iterdir()) == []
+    assert rejected == ([session_uri] if expected_rejection else [])
+    assert context.consume_download_failures(task.task_id) == (
+        ["The requested browser download could not be saved."] if expected_rejection else []
+    )
 
 
 @pytest.mark.asyncio
@@ -1248,7 +1794,7 @@ async def test_finalize_materializes_session_download_matching_baseline_before(t
 
     download_dir = tmp_path / "downloads"
     download_dir.mkdir()
-    shared_bytes = b"SHARED-BYTES-BASELINE-AND-SESSION"
+    shared_bytes = _VALID_TEST_PDF
     baseline_path = download_dir / "baseline-from-earlier-task.pdf"
     baseline_path.write_bytes(shared_bytes)
 
@@ -1765,7 +2311,7 @@ async def test_execute_step_complete_on_download_closes_claimed_popup_before_han
     download_dir.mkdir()
 
     task = _make_task(task_id="task-outer")
-    task.status = SimpleNamespace(value="running")
+    task.status = TaskStatus.running
     task.navigation_goal = "Download invoice"
     task.data_extraction_goal = None
     task.complete_criterion = None
@@ -1810,7 +2356,7 @@ async def test_execute_step_complete_on_download_closes_claimed_popup_before_han
     ctx.record_download_popup_claim(task.task_id, marker)
 
     async def agent_step_side_effect(*args, **kwargs):
-        (download_dir / "uuid-file.zip").write_text("dummy")
+        (download_dir / "uuid-file.zip").write_bytes(_valid_zip_bytes())
         return step, DetailedAgentStepOutput(
             scraped_page=None,
             extract_action_prompt=None,
@@ -1831,6 +2377,12 @@ async def test_execute_step_complete_on_download_closes_claimed_popup_before_han
             order.append(f"update_task:{kwargs['status']}")
         return task_obj
 
+    real_clean_up_task = agent.clean_up_task
+
+    async def clean_up_task_side_effect(*args, **kwargs):
+        kwargs["need_final_screenshot"] = False
+        return await real_clean_up_task(*args, **kwargs)
+
     with (
         patch("skyvern.forge.agent.analytics.capture"),
         patch("skyvern.forge.agent.skyvern_context.ensure_context", return_value=ctx),
@@ -1843,7 +2395,7 @@ async def test_execute_step_complete_on_download_closes_claimed_popup_before_han
         patch.object(agent, "update_step", AsyncMock(side_effect=update_step_side_effect)),
         patch.object(agent, "update_task", AsyncMock(side_effect=update_task_side_effect)),
         patch.object(agent, "update_task_errors_from_detailed_output", AsyncMock(return_value=task)),
-        patch.object(agent, "clean_up_task", AsyncMock()),
+        patch.object(agent, "clean_up_task", AsyncMock(side_effect=clean_up_task_side_effect)),
     ):
         mock_app.DATABASE.workflow_runs.get_workflow_run = AsyncMock(return_value=None)
         mock_app.DATABASE.tasks.get_task = AsyncMock(return_value=task)
@@ -1976,6 +2528,195 @@ async def test_execute_step_no_credit_releases_deferred_dispatched_failure_reser
     assert not ctx.has_download_popup_claim(task.task_id, marker)
     assert task.task_id not in ctx.pending_download_reservation_release
     marker.close.assert_not_called()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    (
+        "status_code",
+        "successful_followup",
+        "files_to_finalize",
+        "complete_on_download",
+        "fail_task_succeeds",
+        "expected_status",
+    ),
+    [
+        pytest.param(500, False, [], True, True, TaskStatus.failed, id="5xx-no-file-fails"),
+        pytest.param(404, False, [], True, True, None, id="4xx-no-file-keeps-normal-flow"),
+        pytest.param(500, True, ["invoice.pdf"], True, True, TaskStatus.completed, id="5xx-followed-by-file-completes"),
+        pytest.param(
+            500,
+            False,
+            ["invoice.pdf"],
+            True,
+            True,
+            TaskStatus.completed,
+            id="file-arriving-during-wait-completes",
+        ),
+        pytest.param(500, False, [], False, True, None, id="5xx-without-complete-on-download-keeps-normal-flow"),
+        pytest.param(500, False, [], True, False, TaskStatus.failed, id="cancel-wins-before-fail-cleanup"),
+    ],
+)
+async def test_execute_step_handles_file_download_5xx_evidence(
+    tmp_path,
+    status_code: int,
+    successful_followup: bool,
+    files_to_finalize: list[str],
+    complete_on_download: bool,
+    fail_task_succeeds: bool,
+    expected_status: TaskStatus | None,
+) -> None:
+    agent = ForgeAgent()
+    download_dir = tmp_path / "downloads"
+    download_dir.mkdir()
+
+    task = _make_task(task_id="task-http-5xx")
+    task.status = SimpleNamespace(value="running")
+    task.navigation_goal = "Download invoice"
+    task.data_extraction_goal = None
+    task.complete_criterion = None
+    task.terminate_criterion = None
+    task.browser_address = None
+    task.max_steps_per_run = None
+    task.url = "https://example.com"
+    task.proxy_location = None
+    task.llm_key = None
+    task.task_type = "general"
+    task.error_code_mapping = None
+
+    now = datetime.now(UTC)
+    task_block = FileDownloadBlock(
+        label="download",
+        output_parameter=OutputParameter(
+            output_parameter_id="download-output-id",
+            workflow_id="workflow-id",
+            key="download_output",
+            created_at=now,
+            modified_at=now,
+        ),
+        navigation_goal="Download the requested file",
+        complete_on_download=complete_on_download,
+        download_suffix="invoice",
+    )
+    download_result = ActionSuccess(download_triggered=False)
+    download_result.download_failure_status = status_code
+    if status_code >= 500:
+        download_result.mark_download_failure_attributed(status_code)
+    actions_and_results = [(Action(action_type=ActionType.CLICK), [download_result])]
+    if successful_followup:
+        saved_file_result = ActionSuccess(download_triggered=True, downloaded_files=["invoice.pdf"])
+        actions_and_results.append((Action(action_type=ActionType.CLICK), [saved_file_result]))
+    step = MagicMock()
+    step.step_id = "step-http-5xx"
+    step.task_id = task.task_id
+    step.organization_id = task.organization_id
+    step.order = 0
+    step.retry_index = 0
+    step.status = StepStatus.completed
+    step.output = AgentStepOutput(
+        action_results=[
+            result for _, action_results_for_step in actions_and_results for result in action_results_for_step
+        ],
+        actions_and_results=actions_and_results,
+    )
+
+    organization = MagicMock()
+    organization.organization_id = task.organization_id
+    organization.max_steps_per_run = None
+    browser_state = MagicMock()
+    browser_state.get_working_page = AsyncMock(return_value=None)
+    next_step = MagicMock()
+    context = SkyvernContext(task_id=task.task_id)
+
+    async def update_step_side_effect(step_obj, status=None, output=None, is_last=None, **_kwargs):
+        if status is not None:
+            step_obj.status = status
+        if output is not None:
+            step_obj.output = output
+        if is_last is not None:
+            step_obj.is_last = is_last
+        return step_obj
+
+    async def fail_task_side_effect(*args, **kwargs):
+        if not fail_task_succeeds:
+            return False
+        return await ForgeAgent.fail_task(agent, *args, **kwargs)
+
+    fail_task_mock = AsyncMock(side_effect=fail_task_side_effect)
+    clean_up_task_mock = AsyncMock()
+
+    with (
+        patch("skyvern.forge.agent.analytics.capture"),
+        patch("skyvern.forge.agent.skyvern_context.ensure_context", return_value=context),
+        patch("skyvern.forge.agent.skyvern_context.current", return_value=context),
+        patch("skyvern.forge.agent.get_path_for_workflow_download_directory", return_value=download_dir),
+        patch("skyvern.forge.agent.list_files_in_directory", return_value=[]),
+        patch("skyvern.forge.agent.get_download_retry_started_at", AsyncMock(return_value=now)),
+        patch("skyvern.forge.agent.record_fail_fast_shadow", AsyncMock()),
+        patch.object(
+            type(__import__("skyvern.forge.agent", fromlist=["settings"]).settings),
+            "execute_all_steps",
+            return_value=False,
+        ),
+        patch("skyvern.forge.agent.app") as mock_app,
+        patch.object(agent, "initialize_execution_state", AsyncMock(return_value=(step, browser_state, None))),
+        patch.object(agent, "agent_step", AsyncMock(return_value=(step, None))),
+        patch.object(agent, "_wait_for_in_flight_downloads", AsyncMock()),
+        patch.object(agent, "_finalize_downloaded_files_for_task", AsyncMock(return_value=files_to_finalize)),
+        patch.object(agent, "_close_credited_download_popups", AsyncMock()),
+        patch.object(agent, "handle_completed_step", AsyncMock(return_value=(None, None, next_step))) as handle_step,
+        patch.object(agent, "_sync_video_artifact_after_step", AsyncMock()),
+        patch.object(agent, "update_step", AsyncMock(side_effect=update_step_side_effect)),
+        patch.object(agent, "update_task", AsyncMock(return_value=task)) as update_task,
+        patch.object(agent, "update_task_errors_from_detailed_output", AsyncMock(return_value=task)),
+        patch.multiple(agent, fail_task=fail_task_mock, clean_up_task=clean_up_task_mock),
+    ):
+        mock_app.DATABASE.workflow_runs.get_workflow_run = AsyncMock(return_value=None)
+        mock_app.DATABASE.tasks.get_task = AsyncMock(return_value=task)
+        mock_app.DATABASE.tasks.update_task = AsyncMock(return_value=task)
+        mock_app.AGENT_FUNCTION.validate_step_execution = AsyncMock()
+        mock_app.AGENT_FUNCTION.post_step_execution = AsyncMock()
+        mock_app.ARTIFACT_MANAGER.flush_step_archive = AsyncMock()
+        mock_app.BROWSER_MANAGER.get_for_task = MagicMock(return_value=None)
+        mock_app.BROWSER_MANAGER.get_for_workflow_run = MagicMock(return_value=None)
+        mock_app.WORKFLOW_CONTEXT_MANAGER.artifact_redaction_enabled.return_value = False
+        mock_app.WORKFLOW_CONTEXT_MANAGER.runtime_secret_values_for_artifacts.return_value = set()
+
+        result_step, _detailed_output, result_next_step = await agent.execute_step(
+            organization=organization,
+            task=task,
+            step=step,
+            task_block=task_block,
+            engine=RunEngine.skyvern_v1,
+        )
+
+    if expected_status == TaskStatus.failed:
+        assert result_next_step is None
+        assert result_step.is_last is True
+        handle_step.assert_not_awaited()
+        fail_task_mock.assert_awaited_once()
+        if fail_task_succeeds:
+            update_task.assert_awaited_once()
+            assert update_task.await_args.kwargs["status"] == TaskStatus.failed
+            assert "HTTP 500" in update_task.await_args.kwargs["failure_reason"]
+            clean_up_task_mock.assert_awaited_once()
+        else:
+            update_task.assert_not_awaited()
+            clean_up_task_mock.assert_awaited_once()
+            assert clean_up_task_mock.await_args.kwargs["need_call_webhook"] is False
+            assert clean_up_task_mock.await_args.kwargs["need_final_screenshot"] is False
+            assert clean_up_task_mock.await_args.kwargs["download_suffix"] is None
+    elif expected_status == TaskStatus.completed:
+        assert result_next_step is None
+        handle_step.assert_not_awaited()
+        fail_task_mock.assert_not_awaited()
+        update_task.assert_not_awaited()
+        clean_up_task_mock.assert_awaited_once()
+        assert clean_up_task_mock.await_args.kwargs["download_completion_pending"] is True
+    else:
+        assert result_next_step is next_step
+        handle_step.assert_awaited_once()
+        update_task.assert_not_awaited()
 
 
 @pytest.mark.asyncio
@@ -2269,3 +3010,90 @@ async def test_retry_waits_keep_unfiltered_fallback(tmp_path, attempt) -> None:
     if attempt == "lookup_error":
         assert any("Failed to resolve download attempt" in row["event"] for row in logs)
     assert stale.exists()
+
+
+@pytest.mark.asyncio
+async def test_finalize_does_not_record_html_error_page_saved_as_pdf(tmp_path) -> None:
+    agent = ForgeAgent()
+    task = _make_task()
+    download_dir = tmp_path / "downloads"
+    download_dir.mkdir()
+    (download_dir / "invoice.pdf").write_bytes(
+        b"<!DOCTYPE html><html><head><title>Error</title></head><body><h1>Session expired</h1></body></html>"
+    )
+    (download_dir / "statement.pdf").write_bytes(_VALID_TEST_PDF)
+    (download_dir / "report.csv").write_text("name,total\ninvoice,12\n")
+    with zipfile.ZipFile(download_dir / "workbook.xlsx", "w") as workbook:
+        workbook.writestr("[Content_Types].xml", b"<Types/>")
+        workbook.writestr("xl/workbook.xml", b"<workbook/>")
+    context = SkyvernContext(task_id=task.task_id)
+
+    with (
+        patch("skyvern.forge.agent.get_path_for_workflow_download_directory", return_value=download_dir),
+        patch("skyvern.forge.agent.skyvern_context.current", return_value=context),
+    ):
+        recorded = await agent._finalize_downloaded_files_for_task(
+            task,
+            organization_id=task.organization_id,
+            download_suffix=None,
+            list_files_before=[],
+            randomize_if_missing=False,
+        )
+
+    assert any(name.endswith("statement.pdf") for name in recorded)
+    assert any(name.endswith("report.csv") for name in recorded)
+    assert any(name.endswith("workbook.xlsx") for name in recorded)
+    assert not any(name.endswith("invoice.pdf") for name in recorded)
+    assert not (download_dir / "invoice.pdf").exists()
+    assert context.consume_download_failures(task.task_id) == ["The requested browser download could not be saved."]
+
+
+@pytest.mark.asyncio
+async def test_finalize_continues_when_download_moves_during_validation(tmp_path) -> None:
+    agent = ForgeAgent()
+    task = _make_task()
+    download_dir = tmp_path / "downloads"
+    download_dir.mkdir()
+    vanished_before_read = download_dir / "vanished.pdf"
+    vanished_before_unlink = download_dir / "rejected.pdf"
+    valid_file = download_dir / "statement.pdf"
+    vanished_before_read.write_bytes(_VALID_TEST_PDF)
+    vanished_before_unlink.write_bytes(
+        b"<!DOCTYPE html><html><head><title>Error</title></head><body><h1>Session expired</h1></body></html>"
+    )
+    valid_file.write_bytes(_VALID_TEST_PDF)
+    context = SkyvernContext(task_id=task.task_id)
+    rejected: list[str] = []
+    original_open = Path.open
+    original_unlink = Path.unlink
+
+    def _open_with_race(path: Path, *args, **kwargs):
+        if path == vanished_before_read:
+            original_unlink(path)
+        return original_open(path, *args, **kwargs)
+
+    def _unlink_with_race(path: Path, *args, **kwargs):
+        if path == vanished_before_unlink:
+            original_unlink(path)
+        return original_unlink(path, *args, **kwargs)
+
+    with (
+        patch("skyvern.forge.agent.get_path_for_workflow_download_directory", return_value=download_dir),
+        patch("skyvern.forge.agent.skyvern_context.current", return_value=context),
+        patch.object(Path, "open", new=_open_with_race),
+        patch.object(Path, "unlink", new=_unlink_with_race),
+    ):
+        recorded = await agent._finalize_downloaded_files_for_task(
+            task,
+            organization_id=task.organization_id,
+            download_suffix=None,
+            list_files_before=[],
+            randomize_if_missing=False,
+            rejected_into=rejected,
+        )
+
+    assert any(name.endswith("statement.pdf") for name in recorded)
+    assert [Path(name).name for name in rejected] == ["rejected.pdf"]
+    assert not vanished_before_read.exists()
+    assert not vanished_before_unlink.exists()
+    assert context.consume_download_failures(task.task_id) == ["The requested browser download could not be saved."]

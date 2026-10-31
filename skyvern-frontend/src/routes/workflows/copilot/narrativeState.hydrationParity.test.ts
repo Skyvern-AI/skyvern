@@ -102,17 +102,30 @@ describe("activity timestamp parity across hydration", () => {
 
     expect(live.draft?.blockCount).toBe(20);
     expect(live.blocks.map((block) => block.workflowRunBlockId)).toEqual([
+      "wrb_upstream",
       "wrb_first",
       "wrb_retry",
     ]);
     expect(live.blocks.map((block) => block.label)).toEqual([
+      "block_18",
       "block_19",
       "block_19",
     ]);
+    // The failed run's completed upstream row keeps its own state, not the failure's verdict.
     expect(live.blocks.map((block) => block.outcome)).toEqual([
+      undefined,
       "not_demonstrated",
       "not_evaluated",
     ]);
+    expect(live.blocks[0]!.outcomeReason).toBeUndefined();
+    expect(live.blocks.map((block) => block.skippedBefore)).toEqual([
+      undefined,
+      undefined,
+      [{ label: "block_18", kind: "reused" }],
+    ]);
+    const rowFacts = (turn: TurnNarrativeState) =>
+      turn.blocks.map((b) => [b.outcome, b.outcomeReason, b.skippedBefore]);
+    expect(rowFacts(hydrated)).toEqual(rowFacts(live));
     expect(terminal.blocks).toEqual(hydrated.blocks);
   });
 
@@ -129,6 +142,38 @@ describe("activity timestamp parity across hydration", () => {
       expect(twin, `no live entry for ${entry.id}`).toBeDefined();
       expect(Date.parse(entry.timestamp!)).toBe(Date.parse(twin!.timestamp!));
     }
+  });
+
+  it("rehydrates each run row's test input sources exactly as they streamed", () => {
+    const runRows = (turn: TurnNarrativeState) =>
+      turn.designActivity
+        .filter((entry) => entry.kind === "tool_result")
+        .map(({ id, workflowRunId, testInputs }) => ({
+          id,
+          workflowRunId,
+          testInputs,
+        }));
+    const live = runRows(replayLive());
+    expect(runRows(hydrateNarrativeFromPayload(persistedPayload)!)).toEqual(
+      live,
+    );
+    expect(live).toContainEqual({
+      id: "tr-run-first",
+      workflowRunId: "wr_first",
+      testInputs: undefined,
+    });
+    expect(live).toContainEqual({
+      id: "tr-call_test_end_to_end_turn-replay",
+      workflowRunId: "wr_button",
+      testInputs: [{ key: "login", source: "default", sourceRunId: undefined }],
+    });
+    expect(
+      live.find((row) => row.id === "tr-run-retry")?.testInputs,
+    ).toContainEqual({
+      key: "session_token",
+      source: "earlier_run",
+      sourceRunId: "wr_origin",
+    });
   });
 
   it("renders the same grouped duration live and after a hydrated reload", () => {

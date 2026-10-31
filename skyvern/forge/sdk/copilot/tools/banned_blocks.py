@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import json
-from collections import Counter
 from collections.abc import Mapping
 from dataclasses import dataclass
 from enum import StrEnum
@@ -25,6 +24,8 @@ from skyvern.forge.sdk.copilot.runtime import AgentContext
 from skyvern.forge.sdk.copilot.tracing_setup import copilot_span
 from skyvern.forge.sdk.copilot.workflow_yaml import dump_workflow_yaml
 from skyvern.forge.sdk.schemas.credentials import CredentialType, TotpType
+from skyvern.forge.sdk.workflow.models.block import resolve_conditional_merge_edges
+from skyvern.schemas.agent_step_tool_names import AGENT_STEP_TOOL_NAMES
 from skyvern.schemas.runs import RunEngine
 from skyvern.utils.strings import join_phrases
 from skyvern.utils.yaml_loader import safe_load_no_dates
@@ -78,6 +79,7 @@ class CopilotBlockPolicyScope(StrEnum):
     ALWAYS = "always"
     WITHOUT_AGENT_BLOCKS = "without_agent_blocks"
     WITHOUT_CODE_BLOCKS = "without_code_blocks"
+    WITHOUT_AGENT_STEP = "without_agent_step"
 
 
 @dataclass(frozen=True)
@@ -92,6 +94,7 @@ _P = CopilotBlockPolicy
 _ALWAYS = CopilotBlockPolicyScope.ALWAYS
 _WITHOUT_AGENT_BLOCKS = CopilotBlockPolicyScope.WITHOUT_AGENT_BLOCKS
 _WITHOUT_CODE_BLOCKS = CopilotBlockPolicyScope.WITHOUT_CODE_BLOCKS
+_WITHOUT_AGENT_STEP = CopilotBlockPolicyScope.WITHOUT_AGENT_STEP
 _BANNED = CopilotBlockPolicyStatus.BANNED
 _PENDING = CopilotBlockPolicyStatus.CODE_NATIVE_PENDING
 _AI_LEAF = CopilotBlockPolicyStatus.DECLARED_AI_LEAF
@@ -168,6 +171,15 @@ _COPILOT_BLOCK_TYPE_POLICIES: dict[str, CopilotBlockPolicy] = {
             "has no code-only route yet."
         ),
     ),
+    "agent_step": _P(
+        _BANNED,
+        _WITHOUT_AGENT_STEP,
+        "an organization with the agent_step block enabled, in a turn that may author agent blocks",
+        (
+            "It is not enabled for this organization or this turn; build the step from `web_search`, `navigation` "
+            "or `extraction` blocks followed by a `conditional` on their output."
+        ),
+    ),
 }
 
 
@@ -176,6 +188,8 @@ def _scope_applies(scope: CopilotBlockPolicyScope, capability: AuthoringCapabili
         return True
     if scope == CopilotBlockPolicyScope.WITHOUT_AGENT_BLOCKS:
         return not capability.agent_blocks
+    if scope == CopilotBlockPolicyScope.WITHOUT_AGENT_STEP:
+        return not (capability.agent_step and capability.agent_blocks)
     return not capability.code_blocks
 
 
@@ -191,19 +205,26 @@ _COPILOT_BANNED_BLOCK_TYPES: frozenset[str] = _banned_block_types_for_capability
 _CODE_BLOCKS_ONLY_BANNED_BLOCK_TYPES: frozenset[str] = _banned_block_types_for_capability(CODE_BLOCKS_ONLY)
 # The agent block family: every one of these must be pinned to the Task V3 engine.
 AGENT_FAMILY_BLOCK_SUMMARIES: dict[str, str] = {
-    "task": "one agent step that both acts and extracts; prefer navigation or extraction when the step does only one",
-    "navigation": "one agent step that acts on a page: fills forms, clicks, works through a multi-step flow",
-    "extraction": "one agent step that reads values off a page and returns them",
-    "action": "one agent step that performs a single interaction on a page",
-    "validation": "one agent step that checks a page shows the expected end state",
-    "login": "one agent step that signs in with a bound credential; a `code` block signs in with the same credential",
-    "file_download": "one agent step that downloads a file from a page",
+    "task": "a browser agent run by Task V3 that both acts and extracts; prefer navigation or extraction when the "
+    "block does only one",
+    "navigation": "a browser agent run by Task V3 that acts on a page: fills forms, clicks, works through a multi-step "
+    "flow",
+    "extraction": "a browser agent run by Task V3 that reads values off a page and returns them",
+    "action": "a browser agent run by Task V3 that performs a single interaction on a page",
+    "validation": "a browser agent run by Task V3 that checks a page shows the expected end state",
+    "login": "a browser agent run by Task V3 that signs in with a bound credential; a `code` block signs in with the "
+    "same credential",
+    "file_download": "a browser agent run by Task V3 that downloads a file from a page",
 }
 # Carries its own "when" clause so it still separates from `navigation` in a listing that
 # AUTHORING_FAMILY_GUIDANCE is absent from — ADR-0041 gives that constant a deletion trigger.
 CODE_BLOCK_SUMMARY = (
     "Python that drives the browser directly with Playwright when the steps are the same every run, "
     "and transforms data it already holds"
+)
+AGENT_STEP_BLOCK_SUMMARY = (
+    "one model-driven step that decides and acts with this run's blocks, with or without the browser, "
+    "then returns fields matching its data_schema"
 )
 _AGENT_FAMILY_BLOCK_TYPES: frozenset[str] = frozenset(AGENT_FAMILY_BLOCK_SUMMARIES)
 _AGENT_FAMILY_BLOCK_LIST = join_phrases([f"`{block_type}`" for block_type in AGENT_FAMILY_BLOCK_SUMMARIES], "and")
@@ -392,7 +413,7 @@ def _code_only_browser_schema_guidance(*, agent_blocks: bool = False, image_ocr:
     )
     return [
         "Use one focused code block per durable browser goal, such as open, search, submit, expand, or extract.",
-        "`code` is async Python with a Playwright `page` object and workflow parameters by key. Helper namespaces are pre-injected: no `import` statements, no dunder (`__name__`) names or attributes. Normalize parameter values before page inputs. Pass the complete workflow to update tools as a `workflow` object; multiline `code` is a plain JSON string.",
+        "`code` is async Python with a Playwright `page` object and, as Python values named by key, each entry of its `parameter_keys`: workflow parameter keys and earlier block outputs as `<label>_output`. A dict key named like a dict method (`values`, `items`, `keys`, `get`) reads with brackets, `x['values']`, in code and in `{{ }}`, because `x.values` is the method. Helper namespaces are pre-injected: no `import` statements, no dunder (`__name__`) names or attributes. Normalize parameter values before page inputs. Pass the complete workflow to update tools as a `workflow` object; multiline `code` is a plain JSON string.",
         WRAPPER_SCOPE_RUNTIME_FACT,
         f"A persisted code block must not use {' or '.join(f'page.{member}' for member in DENIED_PAGE_MEMBERS)}.",
         "For an extraction-intent `code` block, derive a typed `extraction_schema` from the goal and the scouted page, carry it as `code_artifact_metadata.extraction_schema`, and conform the block's `return` to it.",
@@ -679,6 +700,7 @@ def _validator_relevant_fingerprint(block: Mapping[str, object]) -> tuple[object
         condition.get("criteria_type", "jinja2_template") if isinstance(condition, Mapping) else None,
         branch_criteria_types,
         _has_goal_prompt(block),
+        block.get("tools"),
     )
 
 
@@ -720,7 +742,7 @@ def _rewrites_a_banned_block(
 
 def _states_new_content(block: Mapping[str, object], prior_block: Mapping[str, object]) -> bool:
     return any(
-        key not in _RENAME_IGNORED_FIELDS and _stated_value(prior_block.get(key)) != _stated_value(value)
+        key not in _NEW_CONTENT_IGNORED_FIELDS and _stated_value(prior_block.get(key)) != _stated_value(value)
         for key, value in block.items()
     )
 
@@ -728,6 +750,13 @@ def _states_new_content(block: Mapping[str, object], prior_block: Mapping[str, o
 def _stated_value(value: object) -> object:
     # A `|` block scalar ends in a newline that `|-` does not, so trailing whitespace is YAML's, not an edit.
     return value.rstrip() if isinstance(value, str) else value
+
+
+def _rename_changes_notes(block: Mapping[str, object], prior_block: Mapping[str, object]) -> bool:
+    return any(
+        field in block and _stated_value(block[field]) != _stated_value(prior_block.get(field))
+        for field in ("notes", "trailing_notes")
+    )
 
 
 def _changed_blocks(
@@ -762,9 +791,10 @@ def _changed_blocks_in(
     surviving_labels = {label for label, _ in submitted_walk if label is not None}
     # A rename is matched on the whole block, not the validator's fingerprint: type and engine alone
     # would let a rewrite drop legacy block A and add an unrelated B of the same type past the pin.
-    vanished = Counter(
-        _rename_identity(block) for label, block in prior_blocks if label is not None and label not in surviving_labels
-    )
+    vanished: dict[str, list[Mapping[str, object]]] = {}
+    for label, block in prior_blocks:
+        if label is not None and label not in surviving_labels:
+            vanished.setdefault(_rename_identity(block), []).append(block)
     changed: list[tuple[str, Mapping[str, object]]] = []
     for label, block in submitted_walk:
         if label is None:
@@ -778,14 +808,23 @@ def _changed_blocks_in(
                 changed.append((label, block))
             continue
         identity = _rename_identity(block)
-        if vanished[identity]:
-            vanished[identity] -= 1
+        candidates = vanished.get(identity)
+        if candidates:
+            match_index = next(
+                (i for i, candidate in enumerate(candidates) if not _rename_changes_notes(block, candidate)), 0
+            )
+            prior_renamed_block = candidates.pop(match_index)
+            if _rename_changes_notes(block, prior_renamed_block):
+                changed.append((label, block))
             continue
         changed.append((label, block))
     return changed
 
 
-_RENAME_IGNORED_FIELDS = frozenset({"label", "next_block_label", "loop_blocks"})
+_RENAME_IGNORED_FIELDS = frozenset(
+    {"label", "next_block_label", "loop_blocks", "description", "notes", "trailing_notes"}
+)
+_NEW_CONTENT_IGNORED_FIELDS = frozenset({"label", "next_block_label", "loop_blocks", "description"})
 
 
 def _rename_identity(block: Mapping[str, object]) -> str:
@@ -822,20 +861,36 @@ def _legacy_engine_block_labels(
     )
 
 
-def _code_block_goal_findings(changed: list[tuple[str, Mapping[str, object]]]) -> list[str]:
+def _is_block_type(block: Mapping[str, object], block_type: str) -> bool:
+    raw_type = block.get("block_type")
+    return isinstance(raw_type, str) and normalize_copilot_block_type_alias(raw_type.strip().lower()) == block_type
+
+
+def _code_block_goal_findings(changed: list[tuple[str, Mapping[str, object]]]) -> list[dict[str, str]]:
     """Absent code_artifact_metadata is the normalizer's own finding; only the Goal is reported here."""
-    missing = [
-        label
-        for label, block in changed
-        if isinstance(block.get("block_type"), str)
-        and normalize_copilot_block_type_alias(str(block["block_type"]).strip().lower()) == "code"
-        and not _has_goal_prompt(block)
-    ]
+    missing = [label for label, block in changed if _is_block_type(block, "code") and not _has_goal_prompt(block)]
     if not missing:
         return []
     return [
-        f"Code blocks {', '.join(sorted(missing))} carry no `prompt`, which is the plain-language Goal "
-        "shown in the editor. Read get_block_schema with block_type `code` for what it must say."
+        {
+            "reason_code": "code_block_goal_incomplete",
+            "summary": f"Code blocks {', '.join(sorted(missing))} carry no `prompt`, which is the plain-language Goal "
+            "shown in the editor. Read get_block_schema with block_type `code` for what it must say.",
+        }
+    ]
+
+
+def _agent_step_tools_findings(changed: list[tuple[str, Mapping[str, object]]]) -> list[dict[str, str]]:
+    """A step with no list runs with every tool and succeeds, so a test run never shows the list is missing."""
+    missing = [label for label, block in changed if _is_block_type(block, "agent_step") and not block.get("tools")]
+    if not missing:
+        return []
+    return [
+        {
+            "reason_code": "agent_step_tools_missing",
+            "summary": f"Agent steps {', '.join(sorted(missing))} name no `tools`, so each is offered every tool. "
+            f"A step's `tools` takes names from: {', '.join(sorted(AGENT_STEP_TOOL_NAMES))}.",
+        }
     ]
 
 
@@ -843,7 +898,7 @@ def _code_block_goal_findings(changed: list[tuple[str, Mapping[str, object]]]) -
 class AuthoringValidation:
     reject: AuthorTimeBlock | None = None
     legacy_engine_blocks: tuple[str, ...] = ()
-    findings: tuple[str, ...] = ()
+    findings: tuple[dict[str, str], ...] = ()
     workflow_yaml: str = ""
 
 
@@ -971,7 +1026,7 @@ def reject_authoring_violations(
         _record_authored_families(ctx, changed + rewritten, prior_blocks)
         return AuthoringValidation(
             legacy_engine_blocks=legacy_engine_blocks,
-            findings=tuple(_code_block_goal_findings(changed)),
+            findings=(*_code_block_goal_findings(changed), *_agent_step_tools_findings(changed)),
             workflow_yaml=workflow_yaml,
         )
     for violation in violations:
@@ -1041,21 +1096,68 @@ def _record_authored_families(
         entries.append({"block_type": block_type, "family": family, "after_failed_test": after_failed_test})
 
 
+def _agent_step_neighbours(blocks: list[Any]) -> dict[str, dict[str, list[str]]]:
+    """Each agent_step's label with the types of the blocks that run just before and after it, following the
+    run's edges (next_block_label, the sequential default, conditional branches and merge points) within the
+    list that holds it."""
+    listed = [block for block in blocks if isinstance(block, Mapping) and isinstance(block.get("label"), str)]
+    by_label: dict[str, Any] = {block["label"]: block for block in listed}
+    types: dict[str, str] = {}
+    for label, block in by_label.items():
+        raw_type = block.get("block_type")
+        types[label] = normalize_copilot_block_type_alias(raw_type.strip().lower()) if isinstance(raw_type, str) else ""
+    default_next: dict[str, str | None] = {
+        label: target if isinstance(target := block.get("next_block_label"), str) else None
+        for label, block in by_label.items()
+    }
+    if "conditional" not in types.values():
+        for current, following in zip(listed, listed[1:]):
+            default_next[current["label"]] = default_next[current["label"]] or following["label"]
+    resolve_conditional_merge_edges(listed, by_label, default_next)
+
+    successors: dict[str, set[str]] = {}
+    for label, block in by_label.items():
+        targets = (
+            [
+                branch.get("next_block_label") or default_next[label]
+                for branch in block.get("branch_conditions") or []
+                if isinstance(branch, Mapping)
+            ]
+            if types[label] == "conditional"
+            else [default_next[label]]
+        )
+        successors[label] = {target for target in targets if target in by_label}
+
+    neighbours: dict[str, dict[str, list[str]]] = {}
+    for label in by_label:
+        if types[label] == "agent_step":
+            neighbours[label] = {
+                "before": sorted({types[source] for source, targets in successors.items() if label in targets}),
+                "after": sorted({types[target] for target in successors[label]}),
+            }
+    for block in listed:
+        loop_blocks = block.get("loop_blocks")
+        if isinstance(loop_blocks, list):
+            neighbours.update(_agent_step_neighbours(loop_blocks))
+    return neighbours
+
+
 def authoring_turn_summary(
     turn_start_yaml: str | None,
     final_yaml: str | None,
     authored_block_families: Mapping[str, list[dict[str, object]]] | None = None,
-) -> dict[str, list[str] | dict[str, str] | dict[str, int]]:
+) -> dict[str, list[str] | dict[str, str] | dict[str, int] | dict[str, dict[str, list[str]]]]:
     """What the turn authored, by block family. Log-only."""
     prior = {
         label: block
         for label, block in _walk_labelled_blocks(_parse_workflow_blocks(turn_start_yaml) or [])
         if label is not None
     }
+    final_blocks = _parse_workflow_blocks(final_yaml) or []
     introduced_code: list[str] = []
     introduced_agent: dict[str, str] = {}
     type_changes: dict[str, str] = {}
-    for label, block in _walk_labelled_blocks(_parse_workflow_blocks(final_yaml) or []):
+    for label, block in _walk_labelled_blocks(final_blocks):
         raw_type = block.get("block_type")
         if label is None or not isinstance(raw_type, str):
             continue
@@ -1097,4 +1199,5 @@ def authoring_turn_summary(
         "mid_turn_family_switches": mid_turn_switches,
         "switches_after_failed_test": sorted(switches_after_failed_test),
         "same_family_rewrites_after_failed_test": same_family_rewrites_after_failed_test,
+        "agent_step_blocks": _agent_step_neighbours(final_blocks),
     }

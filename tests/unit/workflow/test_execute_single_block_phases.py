@@ -555,7 +555,9 @@ async def test_missing_block_result_marks_run_failed(monkeypatch: pytest.MonkeyP
 
     workflow_run, _, block_result, should_stop, _ = await _run_single_block(service, _navigation_block("nav"))
 
-    mark_failed.assert_awaited_once_with(workflow_run_id="wr_test", failure_reason="Block result is None")
+    mark_failed.assert_awaited_once_with(
+        workflow_run_id="wr_test", failure_reason="Block result is None", _on_terminal_write=None
+    )
     assert workflow_run is failed_run
     assert block_result is None
     assert should_stop is True
@@ -721,6 +723,7 @@ async def test_block_exception_marks_run_failed_with_block_type_reason(monkeypat
     mark_failed.assert_awaited_once_with(
         workflow_run_id="wr_test",
         failure_reason="navigation block failed. failure reason: Unexpected error: boom",
+        _on_terminal_write=None,
     )
     assert workflow_run is failed_run
     assert should_stop is True
@@ -765,6 +768,7 @@ async def test_ai_fallback_disabled_keeps_script_failure(monkeypatch: pytest.Mon
     mark_failed.assert_awaited_once_with(
         workflow_run_id="wr_test",
         failure_reason="Script error (ZeroDivisionError): division by zero",
+        _on_terminal_write=None,
     )
     assert workflow_run is failed_run
     assert should_stop is True

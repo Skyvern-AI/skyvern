@@ -6,6 +6,7 @@ from fastapi import status
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 from skyvern.exceptions import SkyvernHTTPException
+from skyvern.forge.sdk.credential_site_policy import LoginSite
 from skyvern.forge.sdk.schemas.organizations import OnePasswordTokenSource
 from skyvern.schemas.proxy_location import ProxyLocationInput
 from skyvern.schemas.proxy_pinning import parse_proxy_location_input, validate_proxy_session_id
@@ -19,6 +20,7 @@ class CredentialVaultType(StrEnum):
     GCP = "gcp"
     CUSTOM = "custom"
     ONEPASSWORD = "onepassword"
+    BITWARDEN_CONNECTED = "bitwarden_connected"
 
 
 class CredentialType(StrEnum):
@@ -231,6 +233,8 @@ class CredentialItem(BaseModel):
         default_factory=list,
         description="Sites the vault item itself names, as saved by the user who stored it",
     )
+    # Set only by a vault whose items scope each site by match mode; a fill or release must then match one.
+    login_sites: list[LoginSite] | None = Field(default=None, exclude=True)
 
 
 class CreateCredentialRequest(BaseModel):
@@ -429,6 +433,7 @@ class BitwardenItemOverview(BaseModel):
     credential_type: CredentialType = Field(..., description="The item's credential type")
     url: str | None = Field(default=None, description="The primary website URL associated with the item, if any")
     urls: list[str] = Field(default_factory=list, exclude=True, description="Every website URL saved on the item")
+    sites: list[LoginSite] = Field(default_factory=list, exclude=True, description="The sites the item is saved for")
 
 
 class BitwardenItemsResponse(BaseModel):

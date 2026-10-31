@@ -35,6 +35,12 @@ import {
   type PillTone,
 } from "./cardChrome";
 import { ACCEPT_BUTTON_CLASS, REJECT_BUTTON_CLASS } from "./cardLayout";
+import {
+  DuplicateWriteRows,
+  ReviewCoverageBadge,
+  humanizedList,
+  reviewCoverageTag,
+} from "./ReviewEvidence";
 import { draftLanded, getDiffCardTitle } from "./diffCardTitle";
 
 export type ReviewGateVerdict = "tested" | "untested" | null;
@@ -186,6 +192,11 @@ interface ReviewGateCardProps {
   gateId?: string;
   // Transient highlight when the pending-proposal chip scrolls to this gate.
   flash?: boolean;
+  // Notes and descriptions exist only in the Doc view; off, the card matches a workflow without them.
+  docEditorEnabled?: boolean;
+  // The newest turn's terminal cause, null when that turn recorded none. A Test turn keeps the
+  // proposal's owner, so a start it refused is recorded on a later turn than `turn`.
+  latestTurnCause: string | null;
 }
 
 type ChangeRow = {
@@ -237,10 +248,7 @@ function changeRows(
       review.blocks
         .filter((block) => block.change === section.change)
         .map((block) => {
-          const neverTested =
-            !tested &&
-            (block.coverage === "never_run" ||
-              (block.coverage === undefined && Boolean(block.neverTested)));
+          const coverageTag = reviewCoverageTag(block, tested);
           return {
             key: `${block.change}-${block.label}`,
             label: block.label,
@@ -249,16 +257,8 @@ function changeRows(
             markerClass: section.markerClass,
             struck: section.change === "removed",
             muted: section.change === "unchanged",
-            coverageTag: tested
-              ? null
-              : block.coverage === "different_source"
-                ? "Different source"
-                : block.coverage === "unknown"
-                  ? "Not tested under this name"
-                  : neverTested
-                    ? "Never tested"
-                    : null,
-            neverTested,
+            coverageTag,
+            neverTested: coverageTag === "Never tested",
           };
         }),
     );
@@ -282,23 +282,18 @@ function blockCountLabel(rows: ChangeRow[]): string | null {
   return `${count} ${count === 1 ? "block" : "blocks"}`;
 }
 
-function humanizedList(labels: string[]): string {
-  const names = labels.map(humanizeBlockLabel);
-  if (names.length < 2) return names[0] ?? "";
-  if (names.length === 2) return `${names[0]} and ${names[1]}`;
-  return `${names.slice(0, -1).join(", ")}, and ${names[names.length - 1]}`;
-}
-
 function ChangeList({
   turn,
   rows,
   limit,
   discarded,
+  docEditorEnabled,
 }: {
   turn: TurnNarrativeState | undefined;
   rows: ChangeRow[];
   limit?: number;
   discarded: boolean;
+  docEditorEnabled: boolean;
 }) {
   const [showAll, setShowAll] = useState(false);
   // A removal is never folded away, so a deletion cannot be accepted unseen.
@@ -316,7 +311,14 @@ function ChangeList({
   }
   const hiddenNeverTested = hidden.filter((row) => row.neverTested).length;
   const duplicateWrites = turn?.review?.duplicateWrites ?? [];
-  if (rows.length === 0 && duplicateWrites.length === 0) return null;
+  const kept = docEditorEnabled
+    ? [
+        { kind: "notes", labels: turn?.review?.keptNotes ?? [] },
+        { kind: "descriptions", labels: turn?.review?.keptDescriptions ?? [] },
+      ].filter((group) => group.labels.length > 0)
+    : [];
+  if (rows.length === 0 && duplicateWrites.length === 0 && kept.length === 0)
+    return null;
   return (
     <div>
       {visible.map((row) => (
@@ -338,11 +340,7 @@ function ChangeList({
           >
             {humanizeBlockLabel(row.label)}
           </span>
-          {row.coverageTag ? (
-            <span className="ml-2 whitespace-nowrap rounded-full bg-sky-500/10 px-1.5 py-0.5 text-[10px] font-medium text-sky-700 dark:text-sky-300">
-              {row.coverageTag}
-            </span>
-          ) : null}
+          <ReviewCoverageBadge label={row.coverageTag} />
         </GutterRow>
       ))}
       {hidden.length > 0 || showAll ? (
@@ -359,15 +357,21 @@ function ChangeList({
           </button>
         </div>
       ) : null}
-      {duplicateWrites.map((group) => (
+      <DuplicateWriteRows groups={duplicateWrites} />
+      {kept.map((group) => (
         <GutterRow
-          key={`${group.blockType}-${group.blockLabels.join("-")}`}
-          marker="!"
-          markerClass="font-bold text-amber-700 dark:text-amber-300"
-          srLabel="Warning"
+          key={group.kind}
+          marker=""
+          markerClass="text-muted-foreground"
         >
-          <span className="text-amber-700 dark:text-amber-300">
-            {humanizedList(group.blockLabels)} write to the same destination.
+          <span
+            className={
+              discarded
+                ? "text-muted-foreground line-through"
+                : "text-muted-foreground"
+            }
+          >
+            Kept your {group.kind} on {humanizedList(group.labels)}.
           </span>
         </GutterRow>
       ))}
@@ -421,6 +425,7 @@ function ResolvedReviewCard({
   title,
   gateId,
   flash,
+  docEditorEnabled,
 }: {
   turn: TurnNarrativeState | undefined;
   rows: ChangeRow[];
@@ -429,6 +434,7 @@ function ResolvedReviewCard({
   title: string;
   gateId?: string;
   flash: boolean;
+  docEditorEnabled: boolean;
 }) {
   const [expanded, setExpanded] = useState(false);
   const applied =
@@ -497,7 +503,12 @@ function ResolvedReviewCard({
       />
       {expanded ? (
         <CardBody>
-          <ChangeList turn={turn} rows={rows} discarded={rejected} />
+          <ChangeList
+            turn={turn}
+            rows={rows}
+            discarded={rejected}
+            docEditorEnabled={docEditorEnabled}
+          />
         </CardBody>
       ) : null}
     </CopilotCard>
@@ -523,6 +534,8 @@ export function ReviewGateCard({
   onRetry,
   gateId,
   flash = false,
+  docEditorEnabled = false,
+  latestTurnCause,
 }: ReviewGateCardProps) {
   const [confirmingTest, setConfirmingTest] = useState(false);
   const runTestRef = useRef<HTMLButtonElement>(null);
@@ -588,6 +601,7 @@ export function ReviewGateCard({
         title={title}
         gateId={gateId}
         flash={flash}
+        docEditorEnabled={docEditorEnabled}
       />
     );
   }
@@ -597,13 +611,18 @@ export function ReviewGateCard({
     : accepting
       ? GATE_STATUS.accepting
       : null;
-  const startFailureCause = tested ? null : turn?.turnFacts?.terminalCause;
+  // A turn that records a cause never tests clean, so a cause on the newest turn postdates any tested
+  // verdict and outranks it.
+  const startFailureCause = latestTurnCause;
   const billingCreditRefusal =
     startFailureCause === "billing_credit_admission_refusal";
+  const unsavedProfilePick =
+    startFailureCause === "unsaved_browser_profile_pick";
   const testFailed = !tested && Boolean(turn && hasFailedTestBlock(turn));
   const showActions = actionsShown && hasProposal;
   const connectFailure = isBuildTestConnectFailureState(startFailureCause);
-  const canTest = Boolean(onTestEndToEnd) && !billingCreditRefusal;
+  const canTest =
+    Boolean(onTestEndToEnd) && !billingCreditRefusal && !unsavedProfilePick;
   const testLabel = connectFailure
     ? "Retry in a fresh session"
     : "Test end-to-end";
@@ -748,6 +767,7 @@ export function ReviewGateCard({
             rows={rows}
             limit={PENDING_CHANGE_LIMIT}
             discarded={false}
+            docEditorEnabled={docEditorEnabled}
           />
           {showTestInBody ? (
             <GutterRow marker="▷" markerClass="text-sky-600 dark:text-sky-400">
@@ -819,6 +839,12 @@ export function ReviewGateCard({
                     Go to Billing
                   </a>
                   .
+                </p>
+              ) : null}
+              {unsavedProfilePick ? (
+                <p className="pb-2 text-[11px] leading-snug text-muted-foreground">
+                  No run started: this proposal changes the browser profile.
+                  Accept it to let the test load that profile.
                 </p>
               ) : null}
               {confirmingTest && canTest ? (

@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import ast
 import asyncio
+import time
 from collections.abc import AsyncIterator, Awaitable, Callable
 from contextlib import asynccontextmanager
 from datetime import UTC, datetime
@@ -30,6 +31,7 @@ from skyvern.cli.core import session_manager
 from skyvern.cli.mcp_tools import tabs as mcp_tabs
 from skyvern.config import settings
 from skyvern.forge.sdk.cache.local import LocalCache
+from skyvern.forge.sdk.copilot import agent as copilot_agent
 from skyvern.forge.sdk.copilot import mcp_adapter, runtime
 from skyvern.forge.sdk.copilot.build_test_connect_failure import (
     SUPERSEDED_BY_NEWER_TEST_REASON,
@@ -38,8 +40,14 @@ from skyvern.forge.sdk.copilot.build_test_connect_failure import (
 )
 from skyvern.forge.sdk.copilot.build_test_outcome import connect_failure_from_run_blocks_result
 from skyvern.forge.sdk.copilot.config import CopilotConfig
+from skyvern.forge.sdk.copilot.context import CopilotContext
 from skyvern.forge.sdk.copilot.enforcement import TOTAL_TIMEOUT_SECONDS
-from skyvern.forge.sdk.copilot.mcp_adapter import SchemaOverlay
+from skyvern.forge.sdk.copilot.mcp_adapter import (
+    HeldPageFacts,
+    ReportedPageCrash,
+    SchemaOverlay,
+    stamp_page_facts,
+)
 from skyvern.forge.sdk.copilot.request_policy import RequestPolicy
 from skyvern.forge.sdk.copilot.runtime import (
     BROWSER_TOOLS_UNAVAILABLE_ERROR,
@@ -56,7 +64,11 @@ from skyvern.forge.sdk.copilot.runtime import (
     replace_browser_session,
 )
 from skyvern.forge.sdk.copilot.tools import mcp_hooks, run_execution
-from skyvern.forge.sdk.copilot.unrecoverable_tool_error import _is_unrecoverable_browser_session_error
+from skyvern.forge.sdk.copilot.tools.scouting import PageState
+from skyvern.forge.sdk.copilot.unrecoverable_tool_error import (
+    PAGE_CRASHES_KEY,
+    _is_unrecoverable_browser_session_error,
+)
 from skyvern.forge.sdk.schemas.persistent_browser_sessions import PersistentBrowserSession, export_profile_storage_id
 from skyvern.forge.sdk.workflow.models.workflow import WorkflowRunStatus
 from skyvern.forge.sdk.workflow.service import BROWSER_SESSION_RENEWAL_INTERVAL_SECONDS
@@ -75,6 +87,7 @@ from skyvern.webeye.persistent_sessions_manager import (
     BrowserSessionCreditAdmissionRefusal,
 )
 from skyvern.webeye.real_browser_state import RealBrowserState
+from tests.unit._mcp_browser_fakes import page_crash_entry
 from tests.unit.copilot_test_helpers import (
     TURN_EXIT_PATHS,
     make_copilot_ctx,
@@ -82,6 +95,8 @@ from tests.unit.copilot_test_helpers import (
     run_turn_attaching_during_release,
     run_turn_cancelled_during_cleanup,
     run_turn_to_exit,
+    stamping_browser_manager,
+    stop_activity_renewer,
 )
 from tests.unit.test_copilot_secret_scrub import _make_server
 
@@ -326,6 +341,104 @@ async def test_fresh_exit_records_its_new_browser_before_returning_to_the_caller
     )
     assert result.new_browser_session_id == "pbs_88"
     assert records[0][0] == records[1][0] and records[1][1] == "pbs_88"
+
+
+async def _mint(path: str, ctx: AgentContext) -> str | None:
+    if path == "provision":
+        assert await ensure_browser_session(ctx) is None
+        return ctx.browser_session_id
+    receipt = await runtime.acquire_fresh_exit_browser_session(
+        ctx, prior_browser_session_id="pbs_prior", proxy_location=None, browser_profile_id=None
+    )
+    return receipt.new_browser_session_id
+
+
+def _minting_manager() -> MagicMock:
+    manager = _manager_reporting_fixed_deadline(None)
+    manager.create_fresh_exit_session = AsyncMock(return_value=SimpleNamespace(new_browser_session_id="pbs_fresh"))
+    return manager
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("path", ["provision", "fresh_exit"])
+async def test_a_minted_browser_is_renewed_from_mint(monkeypatch: pytest.MonkeyPatch, path: str) -> None:
+    manager = _minting_manager()
+    browser_manager = stamping_browser_manager(monkeypatch)
+    monkeypatch.setattr(
+        runtime, "app", SimpleNamespace(PERSISTENT_SESSIONS_MANAGER=manager, BROWSER_MANAGER=browser_manager)
+    )
+    ctx = _make_ctx()
+
+    try:
+        assert await _mint(path, ctx) == "pbs_fresh"
+        assert browser_manager._renewable_session_ids() == {"pbs_fresh"}
+        assert ctx.minted_browser_sessions == {"pbs_fresh": None}
+    finally:
+        browser_manager.end_session_activity_renewal("pbs_fresh")
+        await stop_activity_renewer(browser_manager)
+
+
+@pytest.mark.asyncio
+async def test_a_turn_waiting_on_a_person_keeps_renewing_its_browser(monkeypatch: pytest.MonkeyPatch) -> None:
+    browser_manager = stamping_browser_manager(monkeypatch)
+    monkeypatch.setattr(
+        runtime, "app", SimpleNamespace(PERSISTENT_SESSIONS_MANAGER=_minting_manager(), BROWSER_MANAGER=browser_manager)
+    )
+    monkeypatch.setattr(runtime, "MINTED_BROWSER_RENEWAL_CHECK_SECONDS", 0.01)
+    ctx = _make_ctx()
+    ctx.copilot_run_start_monotonic = time.monotonic() - 2 * runtime.MINTED_BROWSER_RENEWAL_TURN_SECONDS
+    ctx.copilot_credential_pause_seconds = 2 * runtime.MINTED_BROWSER_RENEWAL_TURN_SECONDS - 60
+
+    try:
+        assert await _mint("provision", ctx) == "pbs_fresh"
+        await asyncio.sleep(0.1)
+        assert browser_manager._renewable_session_ids() == {"pbs_fresh"}
+        runtime.end_minted_browser_renewals(ctx)
+        assert browser_manager._renewable_session_ids() == set()
+    finally:
+        await stop_activity_renewer(browser_manager)
+
+
+@pytest.mark.asyncio
+async def test_a_hung_turn_stops_renewing_its_browser_past_the_turn_clock(monkeypatch: pytest.MonkeyPatch) -> None:
+    browser_manager = stamping_browser_manager(monkeypatch)
+    monkeypatch.setattr(
+        runtime, "app", SimpleNamespace(PERSISTENT_SESSIONS_MANAGER=_minting_manager(), BROWSER_MANAGER=browser_manager)
+    )
+    monkeypatch.setattr(runtime, "MINTED_BROWSER_RENEWAL_CHECK_SECONDS", 0.01)
+    ctx = _make_ctx()
+    ctx.copilot_run_start_monotonic = time.monotonic() - runtime.MINTED_BROWSER_RENEWAL_TURN_SECONDS
+
+    try:
+        assert await _mint("provision", ctx) == "pbs_fresh"
+        async with asyncio.timeout(2):
+            while browser_manager._renewable_session_ids():
+                await asyncio.sleep(0.01)
+        # A later holder must keep its refcount when the turn-end release finally runs.
+        await browser_manager.begin_session_activity_renewal("pbs_fresh")
+        runtime.end_minted_browser_renewals(ctx)
+        assert browser_manager._renewable_session_ids() == {"pbs_fresh"}
+        browser_manager.end_session_activity_renewal("pbs_fresh")
+    finally:
+        await stop_activity_renewer(browser_manager)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("path", ["provision", "fresh_exit"])
+async def test_a_failed_first_stamp_does_not_fail_the_mint(monkeypatch: pytest.MonkeyPatch, path: str) -> None:
+    browser_manager = stamping_browser_manager(monkeypatch, AsyncMock(side_effect=[RuntimeError("db down"), None]))
+    monkeypatch.setattr(
+        runtime, "app", SimpleNamespace(PERSISTENT_SESSIONS_MANAGER=_minting_manager(), BROWSER_MANAGER=browser_manager)
+    )
+    ctx = _make_ctx()
+
+    try:
+        assert await _mint(path, ctx) == "pbs_fresh"
+        assert browser_manager._renewable_session_ids() == {"pbs_fresh"}
+        runtime.end_minted_browser_renewals(ctx)
+        assert browser_manager._renewable_session_ids() == set()
+    finally:
+        await stop_activity_renewer(browser_manager)
 
 
 @pytest.mark.asyncio
@@ -1026,6 +1139,11 @@ def test_a_page_titled_like_a_lost_session_does_not_read_as_session_loss() -> No
     }
 
     assert not _is_unrecoverable_browser_session_error("evaluate", output)
+    crash_only = {
+        "ok": False,
+        PAGE_CRASHES_KEY: [page_crash_entry(url="https://app.test/no browser context")],
+    }
+    assert not _is_unrecoverable_browser_session_error("evaluate", crash_only)
     nested = {"ok": False, "error": "evaluate failed", "data": {"page_state": {"reason": "Browser session not found"}}}
     assert _is_unrecoverable_browser_session_error("evaluate", nested)
 
@@ -2191,6 +2309,35 @@ async def test_turn_finalizer_closes_its_minted_browser_after_driver_release(
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("exit_path", TURN_EXIT_PATHS)
+async def test_no_minted_browser_is_renewed_after_its_turn_exits_even_when_cleanup_raises(
+    monkeypatch: pytest.MonkeyPatch, exit_path: str
+) -> None:
+    browser_manager = stamping_browser_manager(monkeypatch)
+    monkeypatch.setattr(run_execution, "close_browser_session_quietly", AsyncMock(return_value=True))
+    monkeypatch.setattr(copilot_agent, "_log_authoring_turn_summary", MagicMock(side_effect=RuntimeError("boom")))
+    renewable_at_mint: list[set[str]] = []
+
+    async def _mint_for_turn(ctx: CopilotContext) -> None:
+        runtime.app.BROWSER_MANAGER = browser_manager
+        await runtime._record_minted_browser(ctx, "pbs_minted")
+        renewable_at_mint.append(browser_manager._renewable_session_ids())
+
+    try:
+        await run_turn_to_exit(
+            monkeypatch,
+            manager=_release_manager(),
+            exit_path=exit_path,
+            browser_state=MagicMock(),
+            on_attached=_mint_for_turn,
+        )
+        assert renewable_at_mint == [{"pbs_minted"}]
+        assert browser_manager._renewable_session_ids() == set()
+    finally:
+        await stop_activity_renewer(browser_manager)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("exit_path", TURN_EXIT_PATHS)
 async def test_every_turn_exit_releases_a_click_listener_its_post_hook_never_reached(
     monkeypatch: pytest.MonkeyPatch, exit_path: str
 ) -> None:
@@ -3173,3 +3320,158 @@ async def test_self_heal_turn_keeps_a_switched_tab_for_the_next_call(monkeypatch
     acted_on, active_tab_id = await _page_next_call_acts_on(ctx)
     assert acted_on is first
     assert active_tab_id == str(id(first))
+
+
+_READ_PAGE_STATE: PageState = {"read": "ok", "url": "https://form.test/new", "title": "New", "challenge_vendor": None}
+
+
+def _next_page_crashes(ctx: AgentContext) -> list[ReportedPageCrash] | None:
+    read_from = MagicMock()
+    return stamp_page_facts(ctx, HeldPageFacts(), {"ok": True}, _READ_PAGE_STATE, read_from).get(PAGE_CRASHES_KEY)
+
+
+async def _crash(browser_state: RealBrowserState, page: MagicMock) -> None:
+    page.context = browser_state.browser_context
+    browser_state._on_page_crashed(page)
+    await asyncio.gather(*list(browser_state._detached_teardown_tasks))
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("restore_error", "external_browser", "reopened"),
+    [(None, False, True), (RuntimeError("Page.goto: timeout"), False, False), (None, True, False)],
+    ids=["reopened-and-restored", "restore-failed", "external-browser"],
+)
+async def test_a_crash_the_turn_saw_reaches_the_next_result_once(
+    monkeypatch: pytest.MonkeyPatch, restore_error: Exception | None, external_browser: bool, reopened: bool
+) -> None:
+    ctx, browser_state, context = _install_tabbed_session(monkeypatch, "https://form.test/new?draft=1")
+    browser_state.external_browser = external_browser
+    monkeypatch.setattr(browser_state, "navigate_to_url", AsyncMock(side_effect=restore_error))
+    crashed = context.pages[0]
+    async with mcp_browser_context(ctx):
+        pass
+
+    await _crash(browser_state, crashed)
+
+    (record,) = browser_state.page_crash_records
+    assert (record.crashed_url, record.reopened) == ("https://form.test/new?draft=1", reopened)
+    assert (crashed not in context.pages) is not external_browser
+    (entry,) = _next_page_crashes(ctx) or []
+    assert entry == {
+        "crashed_at": record.crashed_at.isoformat(timespec="seconds"),
+        "cause": "page_crash",
+        "reopened": reopened,
+        "url": "https://form.test/new",
+    }
+    assert _next_page_crashes(ctx) is None
+
+
+@pytest.mark.asyncio
+async def test_a_crash_read_before_its_reopen_is_reported_again_once_the_tab_is_reopened(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    ctx, browser_state, context = _install_tabbed_session(monkeypatch, "https://form.test/new")
+    monkeypatch.setattr(browser_state, "navigate_to_url", AsyncMock())
+    lost = context.pages[0]
+    context.pages.remove(lost)
+    assert await browser_state._reopen_lost_working_page() is not None
+    assert [(record.cause, record.reopened) for record in browser_state.page_crash_records] == [("page_lost", True)]
+    async with mcp_browser_context(ctx):
+        pass
+    crashed = context.pages[0]
+    crashed.url = "https://form.test/new"
+    crashed.context = context
+    real_new_page = context.new_page
+    monkeypatch.setattr(context, "new_page", AsyncMock(side_effect=RuntimeError("Target.createTarget failed")))
+
+    browser_state._on_page_crashed(crashed)
+    await asyncio.gather(*list(browser_state._detached_teardown_tasks))
+    before_reopen = _next_page_crashes(ctx)
+    monkeypatch.setattr(context, "new_page", real_new_page)
+    assert await browser_state._reopen_lost_working_page() is not None
+
+    assert [(entry["cause"], entry["reopened"]) for entry in before_reopen or []] == [
+        ("page_lost", True),
+        ("page_crash", False),
+    ]
+    assert [(entry["cause"], entry["reopened"]) for entry in _next_page_crashes(ctx) or []] == [("page_crash", True)]
+    assert _next_page_crashes(ctx) is None
+
+
+@pytest.mark.asyncio
+async def test_a_lost_blank_tab_is_recorded_but_not_marked_reopened(monkeypatch: pytest.MonkeyPatch) -> None:
+    _, browser_state, context = _install_tabbed_session(monkeypatch, "about:blank")
+    context.pages.remove(context.pages[0])
+
+    assert await browser_state._reopen_lost_working_page() is not None
+
+    assert [(record.cause, record.reopened) for record in browser_state.page_crash_records] == [("page_lost", False)]
+
+
+async def _resolve_turn(session_id: str) -> AgentContext:
+    turn = _make_ctx()
+    turn.browser_session_id = session_id
+    async with mcp_browser_context(turn):
+        pass
+    return turn
+
+
+@pytest.mark.asyncio
+async def test_a_crash_after_the_turn_attached_is_stamped_once(monkeypatch: pytest.MonkeyPatch) -> None:
+    ctx, browser_state, context = _install_tabbed_session(monkeypatch, "https://form.test/new")
+    monkeypatch.setattr(browser_state, "navigate_to_url", AsyncMock())
+    async with mcp_browser_context(ctx):
+        pass
+
+    await _crash(browser_state, context.pages[0])
+    async with mcp_browser_context(ctx):
+        pass
+
+    assert [(entry["reopened"], entry.get("url")) for entry in _next_page_crashes(ctx) or []] == [
+        (True, "https://form.test/new")
+    ]
+    assert _next_page_crashes(ctx) is None
+    assert _next_page_crashes(await _resolve_turn("pbs_tabbed")) is None
+
+
+@pytest.mark.asyncio
+async def test_a_session_made_mid_turn_reports_a_crash_from_before_its_first_attach(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    turn = _make_ctx()
+    _, browser_state, context = _install_tabbed_session(monkeypatch, "https://form.test/new")
+    monkeypatch.setattr(browser_state, "navigate_to_url", AsyncMock())
+    turn.browser_session_id = "pbs_tabbed"
+
+    await _crash(browser_state, context.pages[0])
+    async with mcp_browser_context(turn):
+        pass
+
+    assert len(_next_page_crashes(turn) or []) == 1
+
+
+@pytest.mark.asyncio
+async def test_a_crash_between_turns_reaches_the_next_turn_once_its_tab_is_reopened(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    ctx, browser_state, context = _install_tabbed_session(monkeypatch, "https://form.test/new")
+    monkeypatch.setattr(browser_state, "navigate_to_url", AsyncMock())
+    real_new_page = context.new_page
+    monkeypatch.setattr(context, "new_page", AsyncMock(side_effect=RuntimeError("Target.createTarget failed")))
+    async with mcp_browser_context(ctx):
+        pass
+    await _crash(browser_state, context.pages[0])
+    next_turn = _make_ctx()
+    next_turn.browser_session_id = ctx.browser_session_id
+    async with mcp_browser_context(next_turn):
+        pass
+
+    monkeypatch.setattr(context, "new_page", real_new_page)
+    assert await browser_state._reopen_lost_working_page() is not None
+
+    assert [(entry["cause"], entry["reopened"]) for entry in _next_page_crashes(next_turn) or []] == [
+        ("page_crash", True)
+    ]
+    assert _next_page_crashes(next_turn) is None
+    assert _next_page_crashes(await _resolve_turn("pbs_tabbed")) is None

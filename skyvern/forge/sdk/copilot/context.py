@@ -39,6 +39,7 @@ from skyvern.forge.sdk.copilot.run_outcome import RunOutcomeRole
 from skyvern.forge.sdk.copilot.runtime import AgentContext
 from skyvern.forge.sdk.copilot.secret_redaction import redact_raw_secrets_for_structured_prompt
 from skyvern.forge.sdk.copilot.verification_evidence import WorkflowVerificationEvidence
+from skyvern.forge.sdk.workflow.block_notes import block_field_texts
 from skyvern.forge.sdk.workflow.models.workflow import Workflow
 from skyvern.schemas.proxy_location import ProxyLocationInput
 from skyvern.utils.strings import join_phrases
@@ -118,6 +119,15 @@ class BlockActivityBucket(TypedDict):
 ActivityBucket = DesignActivityBucket | BlockActivityBucket
 
 
+CopilotTestInputSource = Literal["copilot", "page", "earlier_run", "default", "placeholder"]
+
+
+class CopilotTestInput(TypedDict):
+    key: str
+    source: CopilotTestInputSource
+    sourceRunId: NotRequired[str]
+
+
 # Shape must match the FE ``ActivityEntry`` in narrativeState.ts; toolName is
 # present only for tool_call/tool_result and success only for tool_result.
 class NarrativeActivityEntry(TypedDict):
@@ -134,10 +144,18 @@ class NarrativeActivityEntry(TypedDict):
     outcomeLabel: NotRequired[str]
     codeDiffs: NotRequired[list[CodeWriteDiff]]
     browserSteps: NotRequired[list[str]]
+    workflowRunId: NotRequired[str]
+    testInputs: NotRequired[list[CopilotTestInput]]
     id: str
     # Server clock read for the event this entry describes, shared with the SSE
     # update so a rehydrated row renders the same elapsed the live row did.
     timestamp: NotRequired[str]
+
+
+class SkippedPrefixBlock(TypedDict):
+    label: str
+    kind: Literal["reused", "not_run"]
+    sourceWorkflowRunId: NotRequired[str]
 
 
 class NarrativeBlock(TypedDict):
@@ -152,6 +170,7 @@ class NarrativeBlock(TypedDict):
     outcome: NotRequired[str]
     outcomeReason: NotRequired[str]
     outcomeRole: NotRequired[RunOutcomeRole]
+    skippedBefore: NotRequired[list[SkippedPrefixBlock]]
 
 
 # A loop body mints fresh run-block ids every iteration, so the identity-keyed archive
@@ -171,6 +190,14 @@ class NarrativeBlockAttempt(TypedDict):
     outcome: NotRequired[str]
     outcomeReason: NotRequired[str]
     outcomeRole: NotRequired[RunOutcomeRole]
+
+
+def skipped_prefix_anchor(archive: dict[str, NarrativeBlockAttempt], workflow_run_id: str) -> str | None:
+    """The run's earliest surviving attempt, which the run's skipped-prefix rows render before."""
+    return next(
+        (attempt_id for attempt_id, attempt in archive.items() if attempt["workflowRunId"] == workflow_run_id),
+        None,
+    )
 
 
 def upsert_narrative_block_attempt(
@@ -240,6 +267,7 @@ class NarrativeTurnFacts(TypedDict):
     matchingSourceBlockCount: NotRequired[int]
     # The tested claim is decided once, in _turn_fact_bundle, so no surface re-derives it.
     ranCleanOnCurrentSource: bool
+    editedBlockLabels: NotRequired[list[str]]
 
 
 class HistoricalNarrativeTurnFacts(TypedDict, total=False):
@@ -338,6 +366,7 @@ if TYPE_CHECKING:
     )
     from skyvern.forge.sdk.copilot.completion_criteria_store import CompletionCriteriaTurnState
     from skyvern.forge.sdk.copilot.diagnosis_repair_contract import DiagnosisRepairContract
+    from skyvern.forge.sdk.copilot.interruption import StoppedTurnFacts
     from skyvern.forge.sdk.copilot.narration import NarratorState
     from skyvern.forge.sdk.copilot.request_policy import RequestPolicy
     from skyvern.forge.sdk.copilot.run_outcome import RecordedRunOutcome
@@ -1181,6 +1210,7 @@ class AgentResult:
     cancellation_iteration: int | None = None
     cancellation_last_recorded_phase: str | None = None
     cancellation_workflow_run_id: str | None = None
+    cancellation_stopped_facts: StoppedTurnFacts | None = None
     # Controls whether the route may auto-apply the proposal or must force explicit review.
     proposal_disposition: ProposalDisposition = "auto_applicable"
     output_policy_diagnostics: dict[str, Any] | None = None
@@ -1283,6 +1313,7 @@ class CopilotContext(AgentContext):
     block_authoring_policy: BlockAuthoringPolicy = BlockAuthoringPolicy.TASK_V3_PURE
     target_block_label: str | None = None
     selected_block_label: str | None = None
+    doc_editor_enabled: bool = False
     turn_context_packet: TurnContextPacket | None = None
     prior_turn_outcome: TurnOutcome | None = None
     # Server-verified display data for recovering from a model-staged Google
@@ -1399,12 +1430,20 @@ class CopilotContext(AgentContext):
     # Runs this turn actually dispatched. ``last_run_blocks_workflow_run_id`` cannot answer that:
     # a repair turn is seeded with the run it was opened about, which this turn never dispatched.
     dispatched_run_ids_this_turn: set[str] = field(default_factory=set)
+    # Keyed by run id and drained by that run's own tool result, so a parallel sibling never shows these.
+    pending_test_inputs: dict[str, list[CopilotTestInput]] = field(default_factory=dict)
+    # Redacted, display-clamped labels of blocks this turn's writes changed, in first-write order.
+    edited_block_labels_this_turn: list[str] = field(default_factory=list)
+    # Counts every recorded block edit, repeats included, so a run can tell whether an edit followed it.
+    block_edits_recorded_this_turn: int = 0
+    block_edits_recorded_at_dispatch: dict[str, int] = field(default_factory=dict)
     # Whether the latest recorded run-tool result created a run row; None until one is recorded.
     last_test_run_started: bool | None = None
     # The files the last recorded worker run published, keyed by that run's id.
     delivered_output_files: tuple[str, list[DeliveredOutputFile]] | None = None
     # Producers a dispatched run was seeded with and never ran; their values belong to another run.
     seeded_only_labels_by_run_id: dict[str, frozenset[str]] = field(default_factory=dict)
+    skipped_prefix_by_run_id: dict[str, list[SkippedPrefixBlock]] = field(default_factory=dict)
     # The browser session the last run actually executed in. On the fresh-session replay path this
     # is not ctx.browser_session_id, which stays pointed at the debug/scout browser.
     last_run_blocks_browser_session_id: str | None = None
@@ -1486,9 +1525,19 @@ class CopilotContext(AgentContext):
     staged_workflow_yaml: str | None = None
     staged_workflow: Workflow | None = None
     has_staged_proposal: bool = False
+    # Fields by label that a write this turn kept from the saved workflow because the submitted YAML omitted them.
+    # Label -> field -> the text Copilot left out and the save kept, from the previous draft or the saved row.
+    kept_note_labels: dict[str, dict[str, str]] = field(default_factory=dict)
+    # The pending proposal when only a canvas edit kept it from being restored this turn.
+    canvas_rejected_proposal_yaml: str | None = None
+    # Blocks whose notes in that proposal differ from the saved notes this turn reads.
+    unrestored_proposal_note_labels: list[str] = field(default_factory=list)
     # A single in-process writer at a time; the row-level CAS below this lock is the
     # cross-process fence. The token is replaced only after a durable publication.
     proposal_mutation_lock: asyncio.Lock = field(default_factory=asyncio.Lock, repr=False)
+    # Held from reading the stored draft through publishing the edit, so tool calls sent in one model
+    # response compose in order. Separate from proposal_mutation_lock, which the publish takes inside it.
+    block_edit_lock: asyncio.Lock = field(default_factory=asyncio.Lock, repr=False)
     proposal_owner_turn_id: str | None = None
     proposal_revision: int | None = None
     # A token this turn adopted but did not author never authorizes a turn-end write.
@@ -1558,6 +1607,21 @@ class CopilotContext(AgentContext):
         # run inherited from an earlier turn, which is not an attempt by this one.
         return bool(self.dispatched_run_ids_this_turn)
 
+    def record_edited_block_label(self, label: str) -> None:
+        if not label:
+            return
+        self.block_edits_recorded_this_turn += 1
+        if label not in self.edited_block_labels_this_turn:
+            self.edited_block_labels_this_turn.append(label)
+
+    def record_dispatched_run(self, workflow_run_id: str) -> None:
+        self.dispatched_run_ids_this_turn.add(workflow_run_id)
+        self.block_edits_recorded_at_dispatch.setdefault(workflow_run_id, self.block_edits_recorded_this_turn)
+
+    def edited_after_dispatch(self, workflow_run_id: str) -> bool:
+        # A run whose dispatch was never recorded is treated as preceding every edit, so it never vouches for one.
+        return self.block_edits_recorded_this_turn > self.block_edits_recorded_at_dispatch.get(workflow_run_id, 0)
+
     def google_connection_notice_payloads(self) -> list[GoogleConnectionNoticePayload]:
         return [notice.to_payload() for notice in (*self.google_setup_notices, *self.google_connection_notices)]
 
@@ -1578,3 +1642,16 @@ class CopilotContext(AgentContext):
 def advertises(ctx: CopilotContext | None, tool_name: str) -> bool:
     # A context that never resolved a tool surface advertises nothing.
     return ctx is not None and (tool_name in ctx.eval_native_tool_names or tool_name in ctx.eval_mcp_tool_names)
+
+
+def copilot_sees_notes(ctx: AgentContext | None) -> bool:
+    """Notes and step descriptions reach the Copilot model only with the Doc editor on; they stay saved either way."""
+    return isinstance(ctx, CopilotContext) and ctx.doc_editor_enabled
+
+
+def record_kept_note_texts(ctx: CopilotContext, kept_fields: Mapping[str, Sequence[str]], stored_yaml: str) -> None:
+    texts = block_field_texts(stored_yaml)
+    for label, fields in kept_fields.items():
+        for key in fields:
+            if text := texts.get(label, {}).get(key):
+                ctx.kept_note_labels.setdefault(label, {})[key] = text

@@ -5,11 +5,11 @@ from __future__ import annotations
 import asyncio
 import time
 import uuid
-from collections.abc import AsyncIterator, Awaitable, Callable, Iterable, Iterator, Mapping
+from collections.abc import AsyncIterator, Awaitable, Callable, Iterable, Iterator, Mapping, Sequence
 from contextlib import asynccontextmanager, contextmanager, suppress
 from contextvars import ContextVar
 from copy import deepcopy
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from enum import StrEnum
 from types import MappingProxyType
 from typing import TYPE_CHECKING, Any, Literal, NotRequired, TypeAlias, TypedDict, cast
@@ -44,12 +44,14 @@ from skyvern.forge.sdk.copilot.build_test_connect_failure import (
     build_test_connect_failure_sentence,
 )
 from skyvern.forge.sdk.copilot.config import (
+    TOTAL_TIMEOUT_SECONDS,
     AuthoringCapability,
     BlockAuthoringPolicy,
     CopilotConfig,
     authoring_capability_from_policy,
     block_authoring_policy_from_capability,
 )
+from skyvern.forge.sdk.copilot.human_input_wait import turn_clock_seconds
 from skyvern.forge.sdk.copilot.screenshot_utils import (
     ChatScreenshotFrame,
     PendingFrameLease,
@@ -66,6 +68,7 @@ from skyvern.forge.sdk.copilot.turn_origin import (
 )
 from skyvern.forge.sdk.copilot.verification_evidence import WorkflowVerificationEvidence
 from skyvern.forge.sdk.core import skyvern_context
+from skyvern.forge.sdk.credential_site_policy import LoginSite
 from skyvern.forge.sdk.schemas.credentials import Credential
 from skyvern.library.skyvern_browser import SkyvernBrowser
 from skyvern.schemas.browser_session_close import BrowserSessionCloseReason
@@ -79,7 +82,7 @@ from skyvern.webeye.browser_errors import (
     is_target_closed_message,
 )
 from skyvern.webeye.browser_retirement import BrowserOperationRejected, BrowserRetirement, BrowserRetirementReason
-from skyvern.webeye.browser_state import BrowserState
+from skyvern.webeye.browser_state import BrowserState, PageCrashRecord
 from skyvern.webeye.persistent_session_errors import BrowserSessionCreditAdmissionRefusal
 
 if TYPE_CHECKING:
@@ -494,6 +497,8 @@ class AgentContext:
     # Shared by this turn's per-dispatch SessionStates, whose page listeners keep writing between calls. Those listeners
     # keep a log alive past the turn, but only this turn reads it.
     request_failure_logs_by_browser_session: dict[str, RequestFailureLog] = field(default_factory=dict)
+    # The live record list of the browser state each session last resolved to.
+    page_crash_records_by_browser_session: dict[str, Sequence[PageCrashRecord]] = field(default_factory=dict)
     browser_session_recovery_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
     browser_session_recovery_owner: asyncio.Task[Any] | None = field(default=None, init=False, repr=False)
     browser_session_recovery_depth: int = field(default=0, init=False, repr=False)
@@ -551,6 +556,9 @@ class AgentContext:
     # Labels whose last successful run started from a provable composition state. Distinct from
     # verified_prefix_labels, which drives frontier advancement and must stay per-label.
     composition_verified_labels: list[str] = field(default_factory=list)
+    # Blocks a credited run's conditional routed around, keyed to that conditional. They count as settled for the
+    # tested check and the frontier, but never as verified: they did not run.
+    untaken_branch_labels: dict[str, str] = field(default_factory=dict)
     last_full_workflow_test_ok: bool = False
     last_unverified_block_labels: list[str] = field(default_factory=list)
     workflow_verification_evidence: WorkflowVerificationEvidence = field(default_factory=WorkflowVerificationEvidence)
@@ -614,6 +622,7 @@ class AgentContext:
     # Wire and persisted-metadata spelling of authoring_capability; authoring surfaces read the
     # capability, never this field.
     block_authoring_policy: BlockAuthoringPolicy = BlockAuthoringPolicy.TASK_V3_PURE
+    agent_step_available: bool = False
     effective_workflow_proxy_location: ProxyLocationInput = None
     # The proxy the last dispatched run acted through, which is the attached session's whenever it
     # declares one. Kept apart from the declared location above, which the repair levers read.
@@ -636,6 +645,8 @@ class AgentContext:
     last_artifact_health_blocker_labels: list[str] = field(default_factory=list)
     last_artifact_health_failure_classes: list[str] = field(default_factory=list)
     last_run_blocks_block_ids: list[str] = field(default_factory=list)
+    # The subset of last_run_blocks_block_ids that carries the run verdict.
+    last_run_outcome_block_ids: list[str] = field(default_factory=list)
     last_run_blocks_block_labels: list[str] = field(default_factory=list)
     last_run_outcome: RecordedRunOutcome | None = None
     latest_recorded_build_test_outcome: RecordedBuildTestOutcome | None = None
@@ -712,6 +723,7 @@ class AgentContext:
     # Read once per turn: repeated fill attempts must not re-scan the org's credentials.
     org_credentials_for_turn: list[Credential] | None = None
     vault_login_uris_by_credential_id: dict[str, list[str]] = field(default_factory=dict)
+    scoped_login_sites_by_credential_id: dict[str, list[LoginSite]] = field(default_factory=dict)
     # Highest trajectory_index visible at the latest parsed evaluate observation and whether that page
     # showed a password-type control; orders page evidence against post-fill submits across evictions.
     last_scout_observation_trajectory_index: int | None = None
@@ -732,6 +744,7 @@ class AgentContext:
     frontier_selected_output_sources: dict[str, SelectedOutputSource] = field(default_factory=dict, repr=False)
     frontier_origin_reused_labels: list[str] = field(default_factory=list)
     frontier_origin_output_refusal: OriginOutputRefusalDetail | None = None
+    frontier_named_output_refusal: OriginOutputRefusalDetail | None = None
     # Source page of an in-flight scout action, captured before it may navigate away.
     pending_scout_source_url: str | None = None
     pending_scout_selector_candidates: list[ScoutedSelectorCandidate] | None = None
@@ -807,6 +820,7 @@ class AgentContext:
     # reachable by this turn alone and are closed when it ends rather than left to bill out their
     # budgets. A run left to its owner takes its browser out of the ledger.
     minted_browser_sessions: dict[str, str | None] = field(default_factory=dict)
+    minted_browser_renewal_checks: dict[str, asyncio.TimerHandle] = field(default_factory=dict)
     browser_allocation_recorder: Callable[[str, str | None], Awaitable[None]] | None = None
 
     # Set by tool gates / loop guards / tool-side error branches when a tool
@@ -831,11 +845,14 @@ class AgentContext:
 
     @property
     def authoring_capability(self) -> AuthoringCapability:
-        return authoring_capability_from_policy(self.block_authoring_policy)
+        return replace(
+            authoring_capability_from_policy(self.block_authoring_policy), agent_step=self.agent_step_available
+        )
 
     @authoring_capability.setter
     def authoring_capability(self, capability: AuthoringCapability) -> None:
         self.block_authoring_policy = block_authoring_policy_from_capability(capability)
+        self.agent_step_available = capability.agent_step
 
 
 def mcp_to_copilot(mcp_result: dict[str, Any]) -> dict[str, Any]:
@@ -1158,6 +1175,7 @@ async def resolve_browser_state_for_context(
                     resolved_session_id=_resolved_session_id,
                     organization_id=ctx.organization_id,
                 )
+            track_page_crashes(ctx, _resolved_session_id, injected_state)
             return injected_state
         except HealAdoptionFailed:
             return None
@@ -1169,6 +1187,7 @@ async def resolve_browser_state_for_context(
         # Only this branch's state lives in the pod's cache; the self-heal branch above returns the
         # healer's injected state, which the turn-exit release would look for and never find.
         record_attached_browser_driver(ctx, resolved_session_id, browser_state)
+        track_page_crashes(ctx, resolved_session_id, browser_state)
     return browser_state
 
 
@@ -1357,6 +1376,10 @@ def _discard_finished_driver_release(task: asyncio.Task[bool] | asyncio.Task[Non
 def _hold_attached_browser_driver(session_id: str, browser_state: BrowserState, *, new_holder: bool) -> None:
     turns, _ = _ATTACHED_TURNS_PER_SESSION.get(session_id, (0, browser_state))
     _ATTACHED_TURNS_PER_SESSION[session_id] = (turns + 1 if new_holder else turns, browser_state)
+
+
+def track_page_crashes(ctx: AgentContext, session_id: str, browser_state: BrowserState) -> None:
+    ctx.page_crash_records_by_browser_session[session_id] = browser_state.page_crash_records
 
 
 def record_attached_browser_driver(ctx: AgentContext, session_id: str, browser_state: BrowserState) -> None:
@@ -1587,6 +1610,7 @@ async def _mcp_browser_context_impl(
                 browser_session_id, RequestFailureLog()
             ),
         )
+        track_page_crashes(ctx, browser_session_id, browser_state)
         if working_page is not None:
             # The browser state's pin outlives this per-call SessionState, so every tool call
             # starts on the page the last tab operation selected instead of pages[-1].
@@ -1834,9 +1858,10 @@ async def acquire_fresh_exit_browser_session(
             proxy_location=proxy_location,
             browser_profile_id=browser_profile_id,
             session_kind=BrowserSessionKind.copilot,
+            created_for_workflow_permanent_id=ctx.workflow_permanent_id,
         )
         if receipt.new_browser_session_id:
-            ctx.minted_browser_sessions.setdefault(receipt.new_browser_session_id, None)
+            await _record_minted_browser(ctx, receipt.new_browser_session_id)
             if ctx.browser_allocation_recorder is not None:
                 await ctx.browser_allocation_recorder(allocation_id, receipt.new_browser_session_id)
         return receipt
@@ -1899,6 +1924,59 @@ def _seeded_create_session_kwargs(seed: BuildTestBrowserSeed | None) -> _SeededC
     return kwargs
 
 
+# A turn that hangs outside its model-stream deadline never reaches the turn-end release, so its live process would
+# stamp the browser up to the session cap. Measured on the turn's own clock, which a healthy turn cannot pass.
+MINTED_BROWSER_RENEWAL_TURN_SECONDS = TOTAL_TIMEOUT_SECONDS + 10 * 60
+MINTED_BROWSER_RENEWAL_CHECK_SECONDS = 60.0
+
+
+async def _record_minted_browser(ctx: AgentContext, session_id: str) -> None:
+    if session_id in ctx.minted_browser_sessions:
+        return
+    # Ledgered first: the turn ends renewal for every ledgered id, and begin takes its refcount before it can raise.
+    ctx.minted_browser_sessions[session_id] = None
+    _arm_minted_browser_renewal_check(ctx, session_id)
+    try:
+        await app.BROWSER_MANAGER.begin_session_activity_renewal(session_id)
+    except Exception:
+        LOG.warning(
+            "Failed to start activity renewal for a copilot browser session",
+            browser_session_id=session_id,
+            organization_id=ctx.organization_id,
+            exc_info=True,
+        )
+
+
+def _arm_minted_browser_renewal_check(ctx: AgentContext, session_id: str) -> None:
+    ctx.minted_browser_renewal_checks[session_id] = asyncio.get_running_loop().call_later(
+        MINTED_BROWSER_RENEWAL_CHECK_SECONDS, _check_minted_browser_renewal, ctx, session_id
+    )
+
+
+def _check_minted_browser_renewal(ctx: AgentContext, session_id: str) -> None:
+    started_at = ctx.copilot_run_start_monotonic
+    if (
+        started_at is not None
+        and turn_clock_seconds(ctx, started_at, time.monotonic()) >= MINTED_BROWSER_RENEWAL_TURN_SECONDS
+    ):
+        _end_minted_browser_renewal(ctx, session_id)
+    else:
+        _arm_minted_browser_renewal_check(ctx, session_id)
+
+
+def _end_minted_browser_renewal(ctx: AgentContext, session_id: str) -> None:
+    check = ctx.minted_browser_renewal_checks.pop(session_id, None)
+    if check is None:
+        return
+    check.cancel()
+    app.BROWSER_MANAGER.end_session_activity_renewal(session_id)
+
+
+def end_minted_browser_renewals(ctx: AgentContext) -> None:
+    for session_id in list(ctx.minted_browser_renewal_checks):
+        _end_minted_browser_renewal(ctx, session_id)
+
+
 async def _provision_browser_session(
     ctx: AgentContext, *, seed: BuildTestBrowserSeed | None = None, proxy_location: ProxyLocationInput = None
 ) -> BuildTestConnectFailure | None:
@@ -1946,9 +2024,7 @@ async def _provision_browser_session(
             creation_kwargs = _seeded_create_session_kwargs(seed)
             if proxy_location is not None:
                 creation_kwargs.setdefault("proxy_location", proxy_location)
-            # The session worker reuses a creation budget as its idle grace, so this budget is how
-            # long a browser nothing comes back for stays up and billable. The studio's own
-            # interactive budget is the one the renewal thresholds are calibrated against.
+            # The manager may apply a shorter budget for copilot-kind sessions.
             session = await app.PERSISTENT_SESSIONS_MANAGER.create_session(
                 organization_id=ctx.organization_id,
                 timeout_minutes=settings.DEBUG_SESSION_TIMEOUT_MINUTES,
@@ -1980,7 +2056,7 @@ async def _provision_browser_session(
             installed_session_id = ctx.browser_session_id
             # Recorded before the boot wait: a session that never became attachable is still a live
             # browser this turn is the only reader of.
-            ctx.minted_browser_sessions.setdefault(installed_session_id, None)
+            await _record_minted_browser(ctx, installed_session_id)
 
         # DefaultPersistentSessionsManager schedules chromium in a background
         # task and returns from create_session before browser_context is set,

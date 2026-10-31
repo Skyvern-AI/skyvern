@@ -832,7 +832,11 @@ async def test_a_workflow_whose_registered_browser_ended_mid_run_fails_at_finali
         service = WorkflowService()
 
         async def write_status(
-            *, workflow_run_id: str, status: WorkflowRunStatus, failure_reason: str | None = None
+            *,
+            workflow_run_id: str,
+            status: WorkflowRunStatus,
+            failure_reason: str | None = None,
+            _on_terminal_write=None,
         ) -> SimpleNamespace:
             return SimpleNamespace(status=status, failure_reason=failure_reason)
 

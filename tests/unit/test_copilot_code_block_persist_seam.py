@@ -15,6 +15,7 @@ from typing import Any, NoReturn
 from unittest.mock import AsyncMock
 
 import pytest
+from agents import FunctionTool
 
 from skyvern.forge import app
 from skyvern.forge.agent_functions import AgentFunction
@@ -23,6 +24,7 @@ from skyvern.forge.sdk.copilot.browser_code_contract import ExecutedBrowserCodeS
 from skyvern.forge.sdk.copilot.code_block_preflight import CodeBlockScanFinding
 from skyvern.forge.sdk.copilot.config import BlockAuthoringPolicy
 from skyvern.forge.sdk.copilot.context import CopilotContext
+from skyvern.forge.sdk.copilot.output_utils import sanitize_block_label_for_display
 from skyvern.forge.sdk.copilot.request_policy import (
     CompletionCriterion,
     RequestPolicy,
@@ -39,8 +41,10 @@ from skyvern.forge.sdk.copilot.tools.workflow_update import (
     _advisory_labels_by_diagnostic,
     _author_time_findings,
     _changed_code_blocks,
+    _labels_changed_between,
     _update_workflow,
     carry_author_time_findings,
+    record_edited_block_labels,
 )
 from skyvern.forge.sdk.copilot.workflow_credential_utils import parse_workflow_yaml, workflow_blocks
 from skyvern.forge.sdk.copilot.workflow_yaml import (
@@ -50,7 +54,9 @@ from skyvern.forge.sdk.copilot.workflow_yaml import (
     stored_block_code,
     stored_workflow_yaml,
 )
+from skyvern.forge.sdk.db.exceptions import CopilotProposalConflictError
 from skyvern.forge.sdk.services.google_oauth_service import GOOGLE_SHEETS_DATA_SCOPE
+from skyvern.forge.sdk.workflow.secret_encryption import WORKFLOW_SECRET_MASK
 from skyvern.utils.yaml_loader import safe_load_no_dates
 from tests.unit._copilot_workflow_fakes import fake_workflow
 
@@ -477,6 +483,226 @@ async def test_edit_block_clears_the_rebuild_only_when_it_replaces_the_code(monk
     result = await _edit_block(ctx, fields={"code": 'return {"output": {"status": "done"}}'})
     assert result["ok"] is True, result
     assert _staged_rebuild_flag(ctx) is False
+
+
+@pytest.mark.asyncio
+async def test_a_block_edit_whose_publish_is_refused_names_no_block(monkeypatch: pytest.MonkeyPatch) -> None:
+    _stub_successful_update(monkeypatch)
+    monkeypatch.setattr(tools_module, "_get_prior_workflow_definition", AsyncMock(return_value=None))
+    monkeypatch.setattr(
+        workflow_update_module,
+        "publish_workflow_candidate",
+        AsyncMock(side_effect=CopilotProposalConflictError("candidate changed", reason="token_changed")),
+    )
+    monkeypatch.setattr(workflow_update_module, "adopt_stored_workflow_candidate", AsyncMock(return_value="kept"))
+    ctx = _ctx(_code_yaml('return {"status": "pending"}'))
+
+    result = await _edit_block(ctx, expected_code='"pending"', replacement_code='"done"')
+
+    assert result["ok"] is False
+    assert ctx.edited_block_labels_this_turn == []
+
+
+@pytest.mark.asyncio
+async def test_a_stop_while_the_draft_is_announced_still_leaves_the_edit_recorded(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _stub_successful_update(monkeypatch)
+    monkeypatch.setattr(tools_module, "_get_prior_workflow_definition", AsyncMock(return_value=None))
+    monkeypatch.setattr(workflow_update_module, "maybe_emit_design_end", AsyncMock(side_effect=asyncio.CancelledError))
+    ctx = _ctx(_code_yaml('return {"status": "pending"}'))
+    ctx.stream = SimpleNamespace()
+
+    with pytest.raises(asyncio.CancelledError):
+        await _edit_block(ctx, expected_code='"pending"', replacement_code='"done"')
+
+    assert ctx.edited_block_labels_this_turn == ["submit_search"]
+
+
+@pytest.mark.asyncio
+async def test_a_recorded_block_label_never_carries_a_registered_secret(monkeypatch: pytest.MonkeyPatch) -> None:
+    _stub_successful_update(monkeypatch)
+    monkeypatch.setattr(tools_module, "_get_prior_workflow_definition", AsyncMock(return_value=None))
+    secret = "live-portal-password-9182"
+    ctx = _ctx(_code_yaml('return {"status": "pending"}', label=f"login_{secret}"))
+    register_secret_scrub_value(ctx, secret)
+
+    raw = await tools_module.edit_block_tool.on_invoke_tool(
+        SimpleNamespace(context=ctx, tool_name="edit_block"),
+        json.dumps({"label": f"login_{secret}", "expected_code": '"pending"', "replacement_code": '"done"'}),
+    )
+
+    assert json.loads(raw)["ok"] is True
+    assert ctx.edited_block_labels_this_turn == [
+        sanitize_block_label_for_display(f"login_{REDACTED_SECRET_PLACEHOLDER}")
+    ]
+
+
+def _code_blocks_yaml(code_by_label: dict[str, str]) -> str:
+    blocks = "".join(
+        f"  - block_type: code\n    label: {label}\n    code: |\n      {code}\n"
+        for label, code in code_by_label.items()
+    )
+    return f"title: Search\nworkflow_definition:\n  blocks:\n{blocks}"
+
+
+_PENDING_CODE = 'return {"status": "pending"}'
+_TWO_BLOCKS = _code_blocks_yaml({"open_page": 'return {"output": "opened"}', "submit_search": _PENDING_CODE})
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("opening_yaml", "write", "expected_labels"),
+    [
+        (_code_yaml(_PENDING_CODE), {"expected_code": '"pending"', "replacement_code": '"pending"'}, []),
+        (_TWO_BLOCKS, {"expected_code": '"pending"', "replacement_code": '"done"'}, ["submit_search"]),
+        (_code_yaml(_PENDING_CODE), _code_yaml(_PENDING_CODE), []),
+        (
+            _code_yaml(_PENDING_CODE),
+            _code_yaml(_PENDING_CODE, prompt="The page shows the saved row."),
+            ["submit_search"],
+        ),
+        (
+            _code_blocks_yaml(
+                {
+                    "open_page": 'return {"output": "opened"}',
+                    "fill_and_save": 'return {"output": "pending"}',
+                    "old_export": 'return {"output": "csv"}',
+                }
+            ),
+            _code_blocks_yaml(
+                {"open_page": 'return {"output": "opened"}', "fill_and_save": 'return {"output": "saved"}'}
+            ),
+            ["fill_and_save", "old_export"],
+        ),
+    ],
+    ids=[
+        "block-edit-no-op",
+        "block-edit-names-only-its-block",
+        "identical-resubmit",
+        "prompt-only-change",
+        "changed-and-dropped",
+    ],
+)
+async def test_a_write_names_exactly_the_blocks_it_changed(
+    monkeypatch: pytest.MonkeyPatch,
+    opening_yaml: str,
+    write: dict[str, str] | str,
+    expected_labels: list[str],
+) -> None:
+    _stub_successful_update(monkeypatch)
+    monkeypatch.setattr(tools_module, "_get_prior_workflow_definition", AsyncMock(return_value=None))
+    ctx = _ctx(opening_yaml)
+
+    if isinstance(write, str):
+        result = await _update_workflow(
+            {"workflow_yaml": write, "code_artifact_metadata": []}, ctx, allow_missing_credentials=True
+        )
+    else:
+        result = await _edit_block(ctx, **write)
+
+    assert result["ok"] is True
+    assert ctx.edited_block_labels_this_turn == expected_labels
+
+
+def _send_email_yaml(smtp_password: str, *, subject: str = "Report") -> str:
+    return (
+        "title: Search\n"
+        "workflow_definition:\n"
+        "  blocks:\n"
+        "  - block_type: send_email\n"
+        "    label: notify\n"
+        f"    subject: {subject}\n"
+        f"    custom_smtp_password: {json.dumps(smtp_password)}\n"
+    )
+
+
+def _navigation_yaml(block_fields: str) -> str:
+    return (
+        "title: Search\n"
+        "workflow_definition:\n"
+        "  blocks:\n"
+        "  - block_type: navigation\n"
+        "    label: open_statement\n"
+        "    url: https://example.com/statements\n"
+        "    navigation_goal: Open the latest statement\n"
+        f"{block_fields}"
+    )
+
+
+_FULL_NAVIGATION_PRIOR = _navigation_yaml(
+    "    next_block_label: read_statement\n"
+    "    output_parameter:\n"
+    "      key: open_statement_output\n"
+    "      parameter_type: output\n"
+    "    parameters:\n"
+    "    - key: account_number\n"
+    "      parameter_type: workflow\n"
+    "    model: null\n"
+    "    max_retries: 0\n"
+)
+_REQUEST_SHAPED_NAVIGATION = _navigation_yaml(
+    "    continue_on_failure: false\n    complete_verification: true\n    parameter_keys:\n    - account_number\n"
+)
+_FULL_CODE_PRIOR = _code_yaml(_PENDING_CODE).replace(
+    "    code: |\n",
+    "    output_parameter:\n      key: submit_search_output\n    parameters:\n    - key: x\n"
+    "    steps:\n    - action: click\n    user_owned_goal: false\n    code: |\n",
+)
+
+
+@pytest.mark.parametrize(
+    ("prior", "stored", "expected_labels"),
+    [
+        (_send_email_yaml(WORKFLOW_SECRET_MASK), _send_email_yaml(WORKFLOW_SECRET_MASK), []),
+        (_send_email_yaml(WORKFLOW_SECRET_MASK), _send_email_yaml("restored-smtp-password"), []),
+        (
+            _send_email_yaml(WORKFLOW_SECRET_MASK),
+            _send_email_yaml(WORKFLOW_SECRET_MASK, subject="Daily report"),
+            ["notify"],
+        ),
+        (_FULL_NAVIGATION_PRIOR, _REQUEST_SHAPED_NAVIGATION, []),
+        (
+            _FULL_NAVIGATION_PRIOR,
+            _REQUEST_SHAPED_NAVIGATION.replace("Open the latest statement", "Open the March statement"),
+            ["open_statement"],
+        ),
+        (_FULL_NAVIGATION_PRIOR, _navigation_yaml("    complete_verification: false\n"), ["open_statement"]),
+        (
+            _FULL_CODE_PRIOR,
+            _code_yaml(_PENDING_CODE).replace("    code: |\n", "    parameter_keys: [x]\n    code: |\n"),
+            [],
+        ),
+        (_FULL_CODE_PRIOR, _code_yaml(_PENDING_CODE, prompt="The page shows the saved row."), ["submit_search"]),
+    ],
+    ids=[
+        "masked-secret-unchanged",
+        "masked-secret-restored-by-save",
+        "masked-secret-block-edited",
+        "request-shape-resubmit",
+        "request-shape-goal-edit",
+        "request-shape-flag-edit",
+        "full-code-prior-resubmit",
+        "full-code-prior-prompt-edit",
+    ],
+)
+def test_save_normalization_names_no_block_but_a_real_edit_does(
+    prior: str, stored: str, expected_labels: list[str]
+) -> None:
+    assert _labels_changed_between(prior, stored) == expected_labels
+
+
+def test_a_save_that_changes_only_workflow_settings_still_follows_any_earlier_run() -> None:
+    opening = _code_yaml(_PENDING_CODE)
+    ctx = _ctx(opening)
+    ctx.record_dispatched_run("wr_before")
+
+    record_edited_block_labels(ctx, opening, opening)
+    assert not ctx.edited_after_dispatch("wr_before")
+
+    record_edited_block_labels(ctx, opening, opening.replace("title: Search", "title: Search v2"))
+    assert ctx.edited_block_labels_this_turn == []
+    assert ctx.edited_after_dispatch("wr_before")
 
 
 @pytest.mark.asyncio
@@ -1598,3 +1824,64 @@ async def test_a_write_that_waited_on_a_sibling_write_diffs_against_what_it_repl
     assert result["ok"] is True
     assert result["data"]["dropped_prior_blocks"] == ["added_by_sibling"]
     assert result["data"]["block_type_changes"] == _RETYPED_BY_SINGLE_CODE_WRITE
+
+
+@pytest.mark.asyncio
+async def test_block_edits_sent_in_one_response_compose_on_each_other(monkeypatch: pytest.MonkeyPatch) -> None:
+    async def _process(**kwargs: object) -> SimpleNamespace:
+        # Yield mid-persist, as a real save does, so the sibling calls overlap.
+        await asyncio.sleep(0)
+        return fake_workflow(workflow_definition=SimpleNamespace(blocks=[]))
+
+    async def _prior(_ctx: CopilotContext) -> None:
+        return None
+
+    monkeypatch.setattr(workflow_update_module, "_process_workflow_yaml", _process)
+    monkeypatch.setattr(workflow_update_module, "_get_prior_workflow", _prior)
+    monkeypatch.setattr(tools_module, "_get_prior_workflow_definition", AsyncMock(return_value=None))
+    ctx = _ctx(
+        _yaml(
+            """
+            title: Search
+            workflow_definition:
+              blocks:
+              - block_type: code
+                label: first
+                code: |
+                  return {"output": {"step": "first"}}
+              - block_type: code
+                label: second
+                code: |
+                  return {"output": {"step": "second"}}
+            """
+        ),
+        policy=BlockAuthoringPolicy.STANDARD,
+    )
+
+    async def invoke(tool: FunctionTool, arguments: dict[str, object]) -> dict[str, object]:
+        raw = await tool.on_invoke_tool(SimpleNamespace(context=ctx, tool_name=tool.name), json.dumps(arguments))
+        return json.loads(raw)
+
+    results = await asyncio.gather(
+        invoke(
+            tools_module.add_block_tool,
+            {
+                "after_label": "second",
+                "block": {"block_type": "code", "label": "third", "code": 'return {"output": {"step": "third"}}'},
+            },
+        ),
+        invoke(
+            tools_module.edit_block_tool, {"label": "first", "expected_code": '"first"', "replacement_code": '"one"'}
+        ),
+        invoke(
+            tools_module.edit_block_tool, {"label": "second", "expected_code": '"second"', "replacement_code": '"two"'}
+        ),
+    )
+
+    assert [result["ok"] for result in results] == [True, True, True], results
+    stored = {
+        block["label"]: str(block["code"]) for block in workflow_blocks(parse_workflow_yaml(ctx.last_workflow_yaml))
+    }
+    assert list(stored) == ["first", "second", "third"]
+    assert '"one"' in stored["first"]
+    assert '"two"' in stored["second"]

@@ -216,6 +216,14 @@ async def resolve_request_principal(
     return principal
 
 
+async def enforce_principal_role(principal: RequestPrincipal | None, action: str) -> RequestPrincipal:
+    """The role check the route auth dependency runs, for a write reached without that dependency."""
+    if principal is None:
+        raise HTTPException(status_code=403, detail="This action requires an authenticated requester")
+    await app.AGENT_FUNCTION.enforce_request_role(principal, action, _bearer_identity_status())
+    return principal
+
+
 def _bearer_identity_status() -> BearerIdentityStatus | None:
     request_state = get_request_principal_state()
     if request_state is not None and request_state.bearer_identity_status is not None:

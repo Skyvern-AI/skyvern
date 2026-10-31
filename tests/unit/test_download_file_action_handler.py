@@ -23,6 +23,11 @@ from skyvern.exceptions import BROWSER_CONNECTION_LOST_ERROR_CODE, BlockedHost, 
 from skyvern.forge.agent import ForgeAgent
 from skyvern.forge.sdk.core.skyvern_context import SkyvernContext
 from skyvern.forge.sdk.models import StepStatus
+from skyvern.forge.sdk.schemas.tasks import TaskStatus
+from skyvern.forge.sdk.workflow.models.block import FileDownloadBlock
+from skyvern.forge.sdk.workflow.models.parameter import OutputParameter
+from skyvern.schemas.runs import RunEngine
+from skyvern.schemas.steps import AgentStepOutput
 from skyvern.webeye import real_browser_state as real_browser_state_module
 from skyvern.webeye.actions.actions import (
     ActionStatus,
@@ -54,6 +59,7 @@ from skyvern.webeye.actions.handler import (
     _remove_download_listener,
     handle_download_file_action,
 )
+from skyvern.webeye.actions.models import DetailedAgentStepOutput
 from skyvern.webeye.actions.responses import ActionAbort, ActionFailure, ActionSuccess, StaleActionAbort
 from skyvern.webeye.browser_factory import (
     mark_download_cancelled_by_skyvern,
@@ -5596,6 +5602,7 @@ async def test_handle_action_adopted_session_xhr_staging_recovered_when_helper_f
             page,
             Path(staging_dir),
             timeout_seconds=download_timeout if download_timeout is not None else BROWSER_DOWNLOAD_TIMEOUT,
+            target_frame=None,
         )
         download.save_as.assert_awaited_once()
         fetch_file_bytes.assert_awaited_once_with(
@@ -7730,6 +7737,232 @@ async def test_download_not_triggered_without_observed_status_leaves_evidence_un
 
     assert not results[-1].download_triggered
     assert results[-1].download_failure_status is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("resource_type", "response_headers", "should_fail_fast", "targeted_frame", "popup_frame"),
+    [
+        pytest.param(
+            "xhr",
+            {"content-type": "application/json"},
+            False,
+            False,
+            False,
+            id="unrelated-xhr-503-keeps-next-interaction",
+        ),
+        pytest.param(
+            "xhr",
+            {
+                "content-type": "application/pdf",
+                "content-disposition": 'attachment; filename="export.pdf"',
+            },
+            False,
+            False,
+            False,
+            id="xhr-attachment-503-remains-diagnostic",
+        ),
+        pytest.param(
+            "document",
+            {"content-type": "application/json"},
+            True,
+            False,
+            False,
+            id="main-document-json-503-fails-fast",
+        ),
+        pytest.param(
+            "document",
+            {"content-type": "application/json"},
+            True,
+            True,
+            False,
+            id="target-frame-document-json-503-fails-fast",
+        ),
+        pytest.param(
+            "document",
+            {"content-type": "application/json"},
+            False,
+            False,
+            True,
+            id="popup-document-json-503-remains-diagnostic",
+        ),
+    ],
+)
+async def test_download_503_attribution_flows_from_capture_to_block_orchestration(
+    tmp_path: Path,
+    resource_type: str,
+    response_headers: dict[str, str],
+    should_fail_fast: bool,
+    targeted_frame: bool,
+    popup_frame: bool,
+) -> None:
+    now = datetime.now(UTC)
+    organization = make_organization(now)
+    task, step, page, browser_state, scraped_page, action = _make_download_click_context(
+        now=now, organization=organization, page_url="https://example.com/exports"
+    )
+    task = task.model_copy(update={"download_timeout": 0.01, "status": TaskStatus.running})
+    page.context._skyvern_cdp_download_active = False
+    page.evaluate = AsyncMock(return_value=[])
+    browser_state.get_working_page = AsyncMock(return_value=None)
+    browser_state.list_valid_pages = AsyncMock(return_value=[page])
+    action_target_frame = MagicMock()
+    if targeted_frame:
+        scraped_page.id_to_frame_dict[action.element_id] = "download-frame"
+        scraped_page.id_to_css_dict[action.element_id] = "[data-skyvern-id='download-link']"
+    popup_page = MagicMock()
+    popup_main_frame = MagicMock()
+    popup_page.main_frame = popup_main_frame
+
+    captures: list[ScopedXhrDownloadCapture] = []
+    real_capture_type = ScopedXhrDownloadCapture
+
+    def make_capture(*args, **kwargs):
+        capture = real_capture_type(*args, **kwargs)
+        captures.append(capture)
+        return capture
+
+    async def emit_503_from_action(*_args, **_kwargs) -> list[ActionSuccess]:
+        request = MagicMock(resource_type=resource_type, redirected_from=None)
+        if popup_frame:
+            captures[-1]._on_new_page(popup_page)
+            request.frame = popup_main_frame
+        else:
+            request.frame = action_target_frame if targeted_frame else page.main_frame
+        captures[-1]._on_request(request)
+        response = MagicMock(
+            status=503,
+            request=request,
+            headers=response_headers,
+            url="https://example.com/api/export",
+        )
+        response.body = AsyncMock(return_value=b"unavailable")
+        captures[-1]._on_response_event(response)
+        return [ActionSuccess()]
+
+    handler_app = MagicMock()
+    handler_app.BROWSER_MANAGER.get_for_task.return_value = browser_state
+    handler_app.DATABASE.workflow_params.create_action = AsyncMock(return_value=action)
+    handler_app.STORAGE = MagicMock()
+    download_dir = tmp_path / "downloads"
+    download_dir.mkdir()
+    run_dir = tmp_path / "run"
+    run_dir.mkdir()
+    with (
+        patch.object(ActionHandler, "_handle_action", side_effect=emit_503_from_action),
+        patch(
+            "skyvern.webeye.actions.handler.resolve_locator",
+            AsyncMock(return_value=(MagicMock(), action_target_frame)),
+        ) as resolve_target_frame,
+        patch("skyvern.webeye.actions.handler.ScopedXhrDownloadCapture", side_effect=make_capture),
+        patch("skyvern.webeye.actions.handler.get_download_dir", return_value=str(download_dir)),
+        patch("skyvern.webeye.actions.handler.get_run_temp_dir", return_value=str(run_dir)),
+        patch("skyvern.webeye.actions.handler.list_files_in_directory", return_value=[]),
+        patch("skyvern.webeye.actions.handler.skyvern_context.current", return_value=None),
+        patch("skyvern.webeye.actions.handler.app", handler_app),
+    ):
+        action_results = await ActionHandler.handle_action(
+            scraped_page=scraped_page,
+            task=task,
+            step=step,
+            page=page,
+            action=action,
+        )
+
+    if targeted_frame:
+        resolve_target_frame.assert_awaited_once()
+
+    assert action_results[-1].download_failure_status == 503
+    assert action_results[-1].attributed_download_failure_status == (503 if should_fail_fast else None)
+    assert "attributed_download_failure_status" not in action_results[-1].model_dump()
+    step.output = AgentStepOutput(
+        action_results=action_results,
+        actions_and_results=[(action, action_results)],
+    )
+    assert step.output.actions_and_results[0][1][-1].attributed_download_failure_status == (
+        503 if should_fail_fast else None
+    )
+    step.status = StepStatus.completed
+    detailed_output = DetailedAgentStepOutput(
+        scraped_page=None,
+        extract_action_prompt=None,
+        llm_response=None,
+        actions=[action],
+        action_results=action_results,
+        actions_and_results=[(action, action_results)],
+    )
+    persisted_step = step.model_copy(update={"output": AgentStepOutput.model_validate(step.output.model_dump())})
+    assert persisted_step.output.actions_and_results[0][1][-1].attributed_download_failure_status is None
+    task_block = FileDownloadBlock(
+        label="export",
+        output_parameter=OutputParameter(
+            output_parameter_id="export-output-id",
+            workflow_id="workflow-id",
+            key="export_output",
+            created_at=now,
+            modified_at=now,
+        ),
+        navigation_goal="Download the export",
+        complete_on_download=True,
+    )
+
+    agent = ForgeAgent()
+    context = SkyvernContext(task_id=task.task_id)
+    next_step = MagicMock()
+    agent_app = MagicMock()
+    agent_app.DATABASE.workflow_runs.get_workflow_run = AsyncMock(return_value=None)
+    agent_app.DATABASE.tasks.get_task = AsyncMock(return_value=task)
+    agent_app.DATABASE.tasks.update_task = AsyncMock(return_value=task)
+    agent_app.AGENT_FUNCTION.validate_step_execution = AsyncMock()
+    agent_app.AGENT_FUNCTION.post_step_execution = AsyncMock()
+    agent_app.ARTIFACT_MANAGER.flush_step_archive = AsyncMock()
+    agent_app.BROWSER_MANAGER.get_for_task = MagicMock(return_value=None)
+    agent_app.BROWSER_MANAGER.get_for_workflow_run = MagicMock(return_value=None)
+    agent_app.WORKFLOW_CONTEXT_MANAGER.artifact_redaction_enabled.return_value = False
+    agent_app.WORKFLOW_CONTEXT_MANAGER.runtime_secret_values_for_artifacts.return_value = set()
+
+    async def update_step_side_effect(step_obj, *, is_last=None, **_kwargs):
+        if is_last is not None:
+            step_obj.is_last = is_last
+        return step_obj
+
+    with (
+        patch("skyvern.forge.agent.analytics.capture"),
+        patch("skyvern.forge.agent.skyvern_context.ensure_context", return_value=context),
+        patch("skyvern.forge.agent.skyvern_context.current", return_value=context),
+        patch("skyvern.forge.agent.get_download_retry_started_at", AsyncMock(return_value=now)),
+        patch("skyvern.forge.agent.record_fail_fast_shadow", AsyncMock()),
+        patch.object(type(settings), "execute_all_steps", return_value=False),
+        patch("skyvern.forge.agent.app", agent_app),
+        patch.object(agent, "initialize_execution_state", AsyncMock(return_value=(step, browser_state, None))),
+        patch.object(agent, "agent_step", AsyncMock(return_value=(persisted_step, detailed_output))),
+        patch.object(agent, "_wait_for_in_flight_downloads", AsyncMock()),
+        patch.object(agent, "_finalize_downloaded_files_for_task", AsyncMock(return_value=[])),
+        patch.object(agent, "handle_completed_step", AsyncMock(return_value=(None, None, next_step))) as handle_step,
+        patch.object(agent, "update_step", AsyncMock(side_effect=update_step_side_effect)),
+        patch.object(agent, "update_task", AsyncMock(return_value=task)) as update_task,
+        patch.object(agent, "update_task_errors_from_detailed_output", AsyncMock(return_value=task)),
+        patch.object(agent, "clean_up_task", AsyncMock()),
+    ):
+        result_step, _detailed_output, result_next_step = await agent.execute_step(
+            organization=organization,
+            task=task,
+            step=step,
+            task_block=task_block,
+            engine=RunEngine.skyvern_v1,
+            download_baseline_files=[],
+        )
+
+    if should_fail_fast:
+        assert result_next_step is None
+        assert result_step.is_last is True
+        assert update_task.await_args.kwargs["status"] == TaskStatus.failed
+        assert "HTTP 503" in update_task.await_args.kwargs["failure_reason"]
+        handle_step.assert_not_awaited()
+    else:
+        assert result_next_step is next_step
+        update_task.assert_not_awaited()
+        handle_step.assert_awaited_once()
 
 
 @pytest.mark.asyncio

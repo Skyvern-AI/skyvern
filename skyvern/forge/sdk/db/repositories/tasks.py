@@ -1,14 +1,27 @@
 from __future__ import annotations
 
 import asyncio
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from datetime import datetime, timedelta
 from decimal import Decimal
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import structlog
-from sqlalchemy import and_, delete, func, or_, select, tuple_, update
+from sqlalchemy import ColumnElement, and_, delete, func, inspect, or_, select, tuple_, update
 
+from skyvern.errors.errors import is_anti_bot_system_error
+from skyvern.forge.failure_classifier import (
+    DIAGNOSABLE_FAILURE_STATUSES,
+    HAR_ANTI_BOT_DIAGNOSTIC_REASON_CODE,
+    final_har_user_mapping_digest,
+    final_har_user_match_claimed,
+    final_har_user_match_inserted,
+    final_har_user_match_spent,
+    has_classifier_primary,
+    with_diagnostic_entry,
+    with_final_har_user_match_claim,
+    with_final_har_user_match_result,
+)
 from skyvern.forge.sdk.db._error_handling import db_operation
 from skyvern.forge.sdk.db.base_alchemy_db import read_retry
 from skyvern.forge.sdk.db.base_repository import BaseRepository
@@ -17,6 +30,7 @@ from skyvern.forge.sdk.db.enums import TaskType
 from skyvern.forge.sdk.db.exceptions import NotFoundError
 from skyvern.forge.sdk.db.models import (
     ActionModel,
+    RunExecutionLeaseModel,
     StepModel,
     TaskModel,
     TaskRunModel,
@@ -33,8 +47,13 @@ from skyvern.forge.sdk.db.utils import (
     serialize_proxy_location,
 )
 from skyvern.forge.sdk.models import TASK_V3_TURN_STEP_CREATED_BY, Step, StepStatus
+from skyvern.forge.sdk.schemas.har_evidence import (
+    is_final_har_user_match_entry,
+)
 from skyvern.forge.sdk.schemas.runs import Run
 from skyvern.forge.sdk.schemas.tasks import OrderBy, SortDirection, Task, TaskStatus
+from skyvern.forge.sdk.services.audit_events import record_run_cancel_audit
+from skyvern.forge.sdk.services.request_principal import RequestPrincipal
 from skyvern.forge.sdk.trace import traced
 from skyvern.forge.sdk.utils.sanitization import sanitize_postgres_text
 from skyvern.schemas.runs import ProxyLocationInput, RunStatus, RunType
@@ -42,7 +61,17 @@ from skyvern.schemas.steps import AgentStepOutput
 from skyvern.webeye.actions.action_types import ActionType
 from skyvern.webeye.actions.actions import Action
 
+if TYPE_CHECKING:
+    from skyvern.forge.sdk.executor.run_liveness import RunWriteAuthority
+
 LOG = structlog.get_logger()
+
+
+def _task_attempt_filter(attempt_number: int | None) -> tuple[ColumnElement[bool], ...]:
+    # Child rows written before attempts existed carry no attempt_number, so they belong to every attempt.
+    if attempt_number is None:
+        return ()
+    return (or_(TaskModel.attempt_number == attempt_number, TaskModel.attempt_number.is_(None)),)
 
 
 def _step_status_values(status: StepStatus) -> dict[str, Any]:
@@ -50,6 +79,27 @@ def _step_status_values(status: StepStatus) -> dict[str, Any]:
     if status.is_terminal():
         values["finished_at"] = func.coalesce(StepModel.finished_at, naive_utc_now())
     return values
+
+
+def _is_diagnostic_entry(category: object) -> bool:
+    return isinstance(category, dict) and category.get("reason_code") == HAR_ANTI_BOT_DIAGNOSTIC_REASON_CODE
+
+
+def _is_reset_diagnostic(category: object) -> bool:
+    return _is_diagnostic_entry(category) or is_final_har_user_match_entry(category)
+
+
+def _without_inserted_user_errors(errors: list[dict[str, Any]], inserted: list[str]) -> list[dict[str, Any]]:
+    remaining = list(inserted)
+    kept: list[dict[str, Any]] = []
+    # From the end: the match appended its rows after every row the task already carried.
+    for error in reversed(errors):
+        code = error.get("error_code") if isinstance(error, dict) else None
+        if isinstance(error, dict) and error.get("error_type") == "USER_DEFINED_ERROR" and code in remaining:
+            remaining.remove(code)
+            continue
+        kept.append(error)
+    return list(reversed(kept))
 
 
 class TasksRepository(BaseRepository):
@@ -542,6 +592,7 @@ class TasksRepository(BaseRepository):
         incremental_cached_tokens: int | None = None,
         created_by: str | None = None,
         last_llm_model: str | None = None,
+        write_authority_for_run: Callable[[str], RunWriteAuthority | None] | None = None,
     ) -> Step:
         values: dict[str, Any] = {}
         if status is not None:
@@ -568,7 +619,9 @@ class TasksRepository(BaseRepository):
         if last_llm_model is not None:
             values["last_llm_model"] = last_llm_model
 
-        if values:
+        if values and write_authority_for_run is not None and (status, output, is_last) != (None, None, None):
+            await self._write_step_outcome(task_id, step_id, organization_id, values, write_authority_for_run)
+        elif values:
             await self._write_step(task_id, step_id, organization_id, values)
 
         updated_step = await self.get_step(step_id, organization_id)
@@ -587,10 +640,14 @@ class TasksRepository(BaseRepository):
         organization_id: str | None,
         status: StepStatus,
         output: AgentStepOutput,
+        write_authority_for_run: Callable[[str], RunWriteAuthority | None] | None = None,
     ) -> None:
         """`update_step`'s status and output write without reading the row back, for a caller that has no use for it."""
         values = {**_step_status_values(status), "output": output.model_dump(exclude_none=True)}
-        await self._write_step(task_id, step_id, organization_id, values)
+        if write_authority_for_run is not None:
+            await self._write_step_outcome(task_id, step_id, organization_id, values, write_authority_for_run)
+        else:
+            await self._write_step(task_id, step_id, organization_id, values)
 
     async def _write_step(
         self, task_id: str, step_id: str, organization_id: str | None, values: dict[str, Any]
@@ -605,6 +662,74 @@ class TasksRepository(BaseRepository):
             )
             if result.rowcount == 0:
                 raise NotFoundError("Step not found")
+            await session.commit()
+
+    async def _write_step_outcome(
+        self,
+        task_id: str,
+        step_id: str,
+        organization_id: str | None,
+        values: dict[str, Any],
+        write_authority_for_run: Callable[[str], RunWriteAuthority | None],
+    ) -> None:
+        """Write a step outcome; once its execution no longer owns the run, a terminal step is left as it is."""
+        async with self.Session() as session:
+            task = (
+                await session.execute(
+                    select(TaskModel.workflow_run_id, TaskModel.attempt_number)
+                    .filter_by(task_id=task_id)
+                    .filter_by(organization_id=organization_id)
+                )
+            ).one_or_none()
+            run_id = (task.workflow_run_id if task is not None else None) or task_id
+            owns = True
+            if task is not None and write_authority_for_run(run_id) is not None:
+                # Lease row before step row: a reaper claim waits for this write, and its cascade then skips the
+                # terminal step.
+                lease = (
+                    await session.execute(
+                        select(RunExecutionLeaseModel.owner_id, RunExecutionLeaseModel.attempt_number)
+                        .where(RunExecutionLeaseModel.run_id == run_id)
+                        .with_for_update(read=True)
+                    )
+                ).one_or_none()
+                # Read again after the lock wait, during which a same-process successor attempt can register. The
+                # task row fixes the step's attempt, so a successor's registration (even one still acquiring its
+                # lease) does not authorize the earlier attempt's step.
+                authority = write_authority_for_run(run_id)
+                attempt = task.attempt_number or 1
+                owns = (
+                    authority is not None
+                    and (authority.attempt_number or 1) == attempt
+                    and (
+                        not authority.lease_acquired
+                        or (
+                            lease is not None
+                            and lease.owner_id == authority.owner_id
+                            and (lease.attempt_number or 1) == attempt
+                        )
+                    )
+                )
+            statement = (
+                update(StepModel)
+                .where(StepModel.task_id == task_id)
+                .where(StepModel.step_id == step_id)
+                .where(StepModel.organization_id == organization_id)
+                .values(values)
+            )
+            if not owns:
+                terminal = [step_status.value for step_status in StepStatus if step_status.is_terminal()]
+                statement = statement.where(StepModel.status.not_in(terminal))
+            result = await session.execute(statement)
+            if result.rowcount == 0:
+                stored = None if owns else await self.get_step(step_id, organization_id)
+                if stored is None or stored.task_id != task_id:
+                    raise NotFoundError("Step not found")
+                LOG.info(
+                    "Kept a terminal step written by an execution that no longer owns the run",
+                    task_id=task_id,
+                    step_id=step_id,
+                )
             await session.commit()
 
     @db_operation("clear_task_failure_reason")
@@ -687,6 +812,75 @@ class TasksRepository(BaseRepository):
             failure_category=failure_category,
             keep_final_status=keep_final_status,
         )
+
+    @db_operation("update_task_and_claim_finish_for_cancel")
+    async def update_task_and_claim_finish_for_cancel(
+        self,
+        task_id: str,
+        organization_id: str,
+        audit_actor: RequestPrincipal | None = None,
+        failure_reason: str | None = None,
+        errors: list[dict[str, Any]] | None = None,
+        extracted_information: dict[str, Any] | list | str | None = None,
+        webhook_failure_reason: str | None = None,
+    ) -> tuple[Task, bool, bool]:
+        finish_claimed = False
+        async with self.Session() as session:
+            task = (
+                await session.scalars(
+                    select(TaskModel).filter_by(task_id=task_id, organization_id=organization_id).with_for_update()
+                )
+            ).first()
+            if task is None:
+                raise NotFoundError("Task not found")
+            if TaskStatus(task.status).is_final():
+                return convert_to_task(task, debug_enabled=self.debug_enabled), False, False
+
+            finish_claimed = task.finished_at is None
+            values: dict[str, Any] = {
+                "status": TaskStatus.canceled.value,
+                "finished_at": func.coalesce(TaskModel.finished_at, naive_utc_now()),
+            }
+            if failure_reason is not None:
+                values["failure_reason"] = failure_reason
+            if errors is not None:
+                values["errors"] = (task.errors or []) + errors
+            if extracted_information is not None:
+                values["extracted_information"] = extracted_information
+            if webhook_failure_reason is not None:
+                values["webhook_failure_reason"] = webhook_failure_reason
+
+            result = await session.execute(
+                update(TaskModel)
+                .where(TaskModel.task_id == task_id)
+                .where(TaskModel.organization_id == organization_id)
+                .where(TaskModel.status.not_in([status.value for status in TaskStatus if status.is_final()]))
+                .values(**values)
+                .returning(TaskModel)
+                .execution_options(populate_existing=True)
+            )
+            updated_model = result.scalar_one_or_none()
+            status_changed = updated_model is not None
+            updated_task = convert_to_task(updated_model or task, debug_enabled=self.debug_enabled)
+            await session.commit()
+
+            if status_changed and audit_actor is not None:
+                await record_run_cancel_audit(audit_actor, organization_id, "task", task_id)
+
+            if status_changed:
+                bg = asyncio.create_task(
+                    self.sync_task_run_status(
+                        organization_id=updated_task.organization_id or "",
+                        run_id=updated_task.task_id,
+                        status=TaskStatus.canceled.value,
+                        started_at=updated_task.started_at,
+                        finished_at=updated_task.finished_at,
+                    )
+                )
+                self._background_tasks.add(bg)
+                bg.add_done_callback(self._background_tasks.discard)
+
+            return updated_task, finish_claimed and status_changed, status_changed
 
     async def _update_task_with_finish_claim(
         self,
@@ -774,6 +968,112 @@ class TasksRepository(BaseRepository):
             else:
                 raise NotFoundError("Task not found")
 
+    @db_operation("set_final_failure_diagnostic")
+    async def set_final_failure_diagnostic(
+        self,
+        task_id: str,
+        organization_id: str,
+        finished_at: datetime | None,
+        entry: dict[str, Any],
+        system_errors: Sequence[dict[str, Any]] = (),
+    ) -> Task | None:
+        """Add a reporting-only failure_category entry and the system errors it supports to the failed execution that
+        produced them; None when the task has since been reset, rerun or was never a failure, so a late cleanup cannot
+        write onto a newer execution. The entry is skipped without a classifier primary, which it would otherwise
+        become; the errors are appended regardless, each only when no row of its type and code is already there."""
+        async with self.Session() as session:
+            task = (
+                await session.scalars(
+                    select(TaskModel)
+                    .filter_by(task_id=task_id, organization_id=organization_id)
+                    .with_for_update()
+                    .execution_options(populate_existing=True)
+                )
+            ).first()
+            if task is None or task.status not in DIAGNOSABLE_FAILURE_STATUSES or task.finished_at != finished_at:
+                return None
+            present = {(e.get("error_type"), e.get("error_code")) for e in task.errors or [] if isinstance(e, dict)}
+            missing = [e for e in system_errors if (e["error_type"], e["error_code"]) not in present]
+            with_entry = has_classifier_primary(task.failure_category)
+            if not with_entry and not missing:
+                return None
+            if with_entry:
+                task.failure_category = with_diagnostic_entry(task.failure_category, entry)
+            if missing:
+                task.errors = [*(task.errors or []), *missing]
+            await session.commit()
+            await session.refresh(task)
+            return convert_to_task(task, debug_enabled=self.debug_enabled)
+
+    @db_operation("claim_final_har_user_match")
+    async def claim_final_har_user_match(
+        self,
+        task_id: str,
+        organization_id: str,
+        finished_at: datetime | None,
+        identity: dict[str, Any],
+        source: dict[str, Any],
+    ) -> bool:
+        """Spend this failed execution's one final-recording match: committed before the request, so a repeated or
+        concurrent cleanup finds it spent, whatever that request's outcome. False when already spent or the task has
+        moved on."""
+        async with self.Session() as session:
+            task = (
+                await session.scalars(
+                    select(TaskModel)
+                    .filter_by(task_id=task_id, organization_id=organization_id)
+                    .with_for_update()
+                    .execution_options(populate_existing=True)
+                )
+            ).first()
+            if task is None or task.status not in DIAGNOSABLE_FAILURE_STATUSES or task.finished_at != finished_at:
+                return False
+            if final_har_user_match_spent(task.failure_category, identity):
+                return False
+            if final_har_user_mapping_digest(task.error_code_mapping) != source.get("mapping"):
+                return False
+            task.failure_category = with_final_har_user_match_claim(task.failure_category, identity, source)
+            await session.commit()
+            return True
+
+    @db_operation("record_final_har_user_match")
+    async def record_final_har_user_match(
+        self,
+        task_id: str,
+        organization_id: str,
+        finished_at: datetime | None,
+        identity: dict[str, Any],
+        source: dict[str, Any],
+        user_errors: Sequence[dict[str, Any]],
+    ) -> Task | None:
+        """Append the claimed match's user errors that the task does not already carry, remembering which, so a reset
+        removes only those. None when the claim, the execution or its mapping is no longer this one."""
+        async with self.Session() as session:
+            task = (
+                await session.scalars(
+                    select(TaskModel)
+                    .filter_by(task_id=task_id, organization_id=organization_id)
+                    .with_for_update()
+                    .execution_options(populate_existing=True)
+                )
+            ).first()
+            if task is None or task.status not in DIAGNOSABLE_FAILURE_STATUSES or task.finished_at != finished_at:
+                return None
+            if not final_har_user_match_claimed(task.failure_category, identity, source):
+                return None
+            if final_har_user_mapping_digest(task.error_code_mapping) != source.get("mapping"):
+                return None
+            present = {(e.get("error_type"), e.get("error_code")) for e in task.errors or [] if isinstance(e, dict)}
+            inserted = [e for e in user_errors if (e["error_type"], e["error_code"]) not in present]
+            task.failure_category = with_final_har_user_match_result(
+                task.failure_category, identity, source, [e["error_code"] for e in inserted]
+            )
+            if inserted:
+                task.errors = [*(task.errors or []), *inserted]
+            await session.commit()
+            await session.refresh(task)
+            return convert_to_task(task, debug_enabled=self.debug_enabled)
+
     @traced(name="skyvern.db.reset_task_for_rerun")
     @db_operation("reset_task_for_rerun")
     async def reset_task_for_rerun(self, task_id: str, organization_id: str) -> Task:
@@ -798,6 +1098,16 @@ class TasksRepository(BaseRepository):
                 task.started_at = None
                 task.finished_at = None
                 task.task_queue = None
+                # The last execution's anti-bot report, its errors and the diagnostic entry carrying them, describes
+                # that execution, not the rerun.
+                if any(is_anti_bot_system_error(error) for error in task.errors or []):
+                    task.errors = [error for error in task.errors if not is_anti_bot_system_error(error)]
+                # Only the rows the final match itself inserted; an equal row the task already had stays.
+                inserted = final_har_user_match_inserted(task.failure_category)
+                if inserted:
+                    task.errors = _without_inserted_user_errors(task.errors or [], inserted)
+                if any(_is_reset_diagnostic(category) for category in task.failure_category or []):
+                    task.failure_category = [c for c in task.failure_category if not _is_reset_diagnostic(c)] or None
                 await session.commit()
                 await session.refresh(task)
                 reset_task = convert_to_task(task, debug_enabled=self.debug_enabled)
@@ -908,6 +1218,7 @@ class TasksRepository(BaseRepository):
         new_status: TaskStatus,
         only_if_status_in: list[TaskStatus],
         failure_reason: str | None = None,
+        attempt_number: int | None = None,
     ) -> int:
         """Cascade-update child tasks of the given workflow_runs.
 
@@ -929,6 +1240,7 @@ class TasksRepository(BaseRepository):
                 update(TaskModel)
                 .where(TaskModel.workflow_run_id.in_(workflow_run_ids))
                 .where(TaskModel.status.in_([s.value for s in only_if_status_in]))
+                .where(*_task_attempt_filter(attempt_number))
                 .values(**update_values)
             )
             result = await session.execute(update_stmt)
@@ -941,13 +1253,17 @@ class TasksRepository(BaseRepository):
         workflow_run_ids: list[str],
         new_status: StepStatus,
         only_if_status_in: list[StepStatus],
+        attempt_number: int | None = None,
     ) -> int:
         # No failure_reason parameter: StepModel has no failure_reason column.
         if not workflow_run_ids or not only_if_status_in:
             return 0
 
         task_id_subquery = (
-            select(TaskModel.task_id).where(TaskModel.workflow_run_id.in_(workflow_run_ids)).scalar_subquery()
+            select(TaskModel.task_id)
+            .where(TaskModel.workflow_run_id.in_(workflow_run_ids))
+            .where(*_task_attempt_filter(attempt_number))
+            .scalar_subquery()
         )
         update_values: dict[str, Any] = {"status": new_status.value}
         if new_status.is_terminal():
@@ -1177,6 +1493,20 @@ class TasksRepository(BaseRepository):
                 query = query.where(attempt_filter)
             tasks = (await session.scalars(query.order_by(TaskModel.created_at))).all()
             return [convert_to_task(task, debug_enabled=self.debug_enabled) for task in tasks]
+
+    @db_operation("get_tasks_for_workflow_run_status")
+    async def get_tasks_for_workflow_run_status(self, workflow_run_id: str) -> list[Task]:
+        # Run status never reads extracted_information, often the largest column, so it is neither fetched nor decoded.
+        columns = [
+            attr.class_attribute for attr in inspect(TaskModel).column_attrs if attr.key != "extracted_information"
+        ]
+        async with self.Session() as session:
+            query = select(*columns).where(TaskModel.workflow_run_id == workflow_run_id).order_by(TaskModel.created_at)
+            rows = (await session.execute(query)).all()
+        return [
+            convert_to_task(TaskModel(**row._mapping, extracted_information=None), debug_enabled=self.debug_enabled)
+            for row in rows
+        ]
 
     @db_operation("delete_task_steps")
     async def delete_task_steps(self, organization_id: str, task_id: str) -> None:

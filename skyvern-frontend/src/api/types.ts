@@ -36,6 +36,11 @@ export const TriggerType = {
   Mcp: "mcp",
   Api: "api",
   Scheduled: "scheduled",
+  Webhook: "webhook",
+  Event: "event",
+  JobRecipeExtract: "job_recipe_extract",
+  JobRecipeApply: "job_recipe_apply",
+  SeoRecipeSubmit: "seo_recipe_submit",
 } as const;
 
 export type TriggerType = (typeof TriggerType)[keyof typeof TriggerType];
@@ -170,6 +175,8 @@ export type FailureCategory = {
   confidence_float: number;
   reasoning: string;
   reason_code?: string | null;
+  error_code?: string | null;
+  anti_bot?: { contribution?: string | null } | null;
 };
 
 export type TaskApiResponse = {
@@ -506,10 +513,14 @@ export interface MicrosoftOAuthCredentialListResponse {
   credentials: MicrosoftOAuthCredential[];
 }
 
+export type MicrosoftOAuthScopeProfile =
+  | "outlook_mail"
+  | "powerbi_dataset_read";
+
 export interface CreateMicrosoftOAuthAuthorizeRequest {
   redirect_uri: string;
   credential_name?: string;
-  scope_profile?: "outlook_mail";
+  scope_profile?: MicrosoftOAuthScopeProfile;
   app_origin?: string;
 }
 
@@ -1231,6 +1242,7 @@ export type CredentialApiResponse = {
     | "gcp"
     | "custom"
     | "onepassword"
+    | "bitwarden_connected"
     | null;
   vault_id?: string | null;
   item_id?: string | null;

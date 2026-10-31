@@ -20,13 +20,16 @@ from __future__ import annotations
 
 import json
 import re
+from dataclasses import replace
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 import yaml
 
+from skyvern.config import settings
 from skyvern.forge import app
+from skyvern.forge.agent_functions import AgentFunction
 from skyvern.forge.sdk.copilot.config import (
     AGENT_BLOCKS_ONLY,
     ALL_BLOCK_FAMILIES,
@@ -51,6 +54,7 @@ from skyvern.forge.sdk.copilot.tools.banned_blocks import (
     _AGENT_FAMILY_BLOCK_TYPES,
     _CODE_BLOCKS_ONLY_BANNED_BLOCK_TYPES,
     _IMAGE_CAPTCHA_GUIDANCE,
+    AGENT_STEP_BLOCK_SUMMARY,
     AUTHORING_FAMILY_GUIDANCE,
     CODE_BLOCK_SUMMARY,
     CREDENTIAL_CODE_ACCESSORS,
@@ -63,11 +67,14 @@ from skyvern.forge.sdk.copilot.tools.banned_blocks import (
     authoring_turn_summary,
 )
 from skyvern.forge.sdk.copilot.tools.mcp_hooks import (
+    _build_skyvern_mcp_overlays,
     _normalized_authoring_capability,
     _validate_block_pre_hook,
 )
+from skyvern.forge.sdk.copilot.workflow_yaml import _normalize_copilot_yaml
 from skyvern.forge.sdk.workflow.models.block import _TASK_V3_SUPPORTED_BLOCK_TYPES
 from skyvern.schemas.runs import ProxyLocation
+from tests.unit.copilot_test_helpers import make_copilot_ctx
 
 _CODE_ONLY_UNAVAILABLE = tuple(
     "action browser_task extraction file_download file_upload goto_url login navigation print_page task task_v2 validation".split()
@@ -1141,14 +1148,41 @@ def test_rewriting_a_legacy_block_engine_off_v3_rejects_it() -> None:
 def test_renaming_a_legacy_block_is_not_a_re_authoring() -> None:
     """A rename asks for a new label, not new content. Refusing it pushes the model to migrate a
     working block's engine to recover, which is a change the user never asked for."""
+    prior = _yaml(
+        {
+            "block_type": "navigation",
+            "label": "legacy_nav",
+            "navigation_goal": "old",
+            "engine": "skyvern-1.0",
+            "notes": "Existing runtime instruction.",
+        },
+        {"block_type": "extraction", "label": "legacy_extract", "data_extraction_goal": "old", "engine": "skyvern-1.0"},
+    )
     submitted = _yaml(
         {"block_type": "navigation", "label": "sign_in_step", "navigation_goal": "old", "engine": "skyvern-1.0"},
         {"block_type": "extraction", "label": "legacy_extract", "data_extraction_goal": "old", "engine": "skyvern-1.0"},
     )
 
-    validation = _accepted(AGENT_BLOCKS_ONLY, submitted, _LEGACY_AGENT_WORKFLOW)
+    validation = _accepted(CODE_BLOCKS_ONLY, submitted, prior)
 
     assert validation.reject is None
+
+
+@pytest.mark.parametrize("note_field", ["notes", "trailing_notes"])
+def test_renaming_a_legacy_block_while_adding_notes_is_refused(note_field: str) -> None:
+    prior = _yaml(
+        {**_GOAL, "engine": "skyvern-1.0"},
+        {"block_type": "extraction", "label": "legacy_extract", "data_extraction_goal": "old", "engine": "skyvern-1.0"},
+    )
+    submitted = _yaml(
+        {**_GOAL, "label": "sign_in_step", "engine": "skyvern-1.0", note_field: "New runtime instruction."},
+        {"block_type": "extraction", "label": "legacy_extract", "data_extraction_goal": "old", "engine": "skyvern-1.0"},
+    )
+
+    validation = _accepted(CODE_BLOCKS_ONLY, submitted, prior)
+
+    assert validation.reject is not None
+    assert "sign_in_step" in validation.reject.error
 
 
 def test_replacing_a_legacy_block_with_an_unrelated_one_of_the_same_type_is_not_a_rename() -> None:
@@ -1201,6 +1235,17 @@ def test_rewriting_a_legacy_code_block_is_refused_without_code_access() -> None:
 
     assert validation.reject is not None
     assert "scrape" in validation.reject.error
+
+
+@pytest.mark.parametrize("note_field", ["notes", "trailing_notes"])
+def test_editing_only_notes_on_a_grandfathered_banned_block_is_refused(note_field: str) -> None:
+    prior = _yaml({**_GOAL, "engine": "skyvern-1.0"})
+    submitted = _yaml({**_GOAL, "engine": "skyvern-1.0", note_field: "New runtime instruction."})
+
+    validation = _accepted(CODE_BLOCKS_ONLY, submitted, prior)
+
+    assert validation.reject is not None
+    assert "navigate" in validation.reject.error
 
 
 @pytest.mark.parametrize("resent_code", ["return {'a': 1}", "return {'a': 1}\n"])
@@ -1388,8 +1433,8 @@ def test_a_new_code_block_without_a_goal_is_a_finding_not_a_reject() -> None:
     validation = _accepted(ALL_BLOCK_FAMILIES, submitted, None)
 
     assert validation.reject is None
-    assert "open_site" in validation.findings[0]
-    assert "`prompt`" in validation.findings[0]
+    assert "open_site" in validation.findings[0]["summary"]
+    assert "`prompt`" in validation.findings[0]["summary"]
 
 
 def test_a_nested_prompt_criteria_conditional_is_rejected() -> None:
@@ -1428,6 +1473,51 @@ def test_authoring_turn_summary_names_what_the_turn_added() -> None:
         "mid_turn_family_switches": {},
         "switches_after_failed_test": [],
         "same_family_rewrites_after_failed_test": {},
+        "agent_step_blocks": {},
+    }
+
+
+def test_authoring_turn_summary_lists_each_agent_step_with_its_neighbours_in_the_same_block_list() -> None:
+    final = _yaml(
+        {"block_type": "goto_url", "label": "open", "url": "https://example.com"},
+        {
+            "block_type": "for_loop",
+            "label": "each_item",
+            "loop_over_parameter_key": "items",
+            "loop_blocks": [
+                {"block_type": "agent_step", "label": "inspect_item", "prompt": "p", "data_schema": {}},
+                {"block_type": "extraction", "label": "read_item", "data_extraction_goal": "g"},
+            ],
+        },
+        {"block_type": "agent_step", "label": "decide", "prompt": "p", "data_schema": {}},
+        {"block_type": "code", "label": "total", "code": "return {}"},
+    )
+
+    assert authoring_turn_summary(None, final)["agent_step_blocks"] == {
+        "inspect_item": {"before": [], "after": ["extraction"]},
+        "decide": {"before": ["for_loop"], "after": ["code"]},
+    }
+
+
+def test_agent_step_neighbours_follow_conditional_branches_not_list_order() -> None:
+    final = _yaml(
+        {"block_type": "agent_step", "label": "find", "next_block_label": "check", "prompt": "p", "data_schema": {}},
+        {"block_type": "code", "label": "check", "next_block_label": "route", "code": "return {}"},
+        {
+            "block_type": "conditional",
+            "label": "route",
+            "branch_conditions": [
+                {"criteria": {"expression": "{{ check.is_recent }}"}, "next_block_label": "download"},
+                {"is_default": True, "next_block_label": "read_notice"},
+            ],
+        },
+        {"block_type": "file_download", "label": "download", "navigation_goal": "g"},
+        {"block_type": "agent_step", "label": "read_notice", "prompt": "p", "data_schema": {}},
+    )
+
+    assert authoring_turn_summary(None, final)["agent_step_blocks"] == {
+        "find": {"before": [], "after": ["code"]},
+        "read_notice": {"before": ["conditional"], "after": []},
     }
 
 
@@ -1562,7 +1652,8 @@ async def test_every_authoring_surface_agrees_with_the_two_booleans(capability: 
 
 
 def test_banned_sets_shrink_as_families_are_added() -> None:
-    assert _banned_block_types_for_capability(ALL_BLOCK_FAMILIES) == {"task_v2"}
+    assert _banned_block_types_for_capability(ALL_BLOCK_FAMILIES) == {"task_v2", "agent_step"}
+    assert _banned_block_types_for_capability(_AGENT_STEP_GRANTED) == {"task_v2"}
     assert "code" in _banned_block_types_for_capability(AGENT_BLOCKS_ONLY)
     assert "code" not in _banned_block_types_for_capability(CODE_BLOCKS_ONLY)
     assert _AGENT_FAMILY_BLOCK_TYPES <= _banned_block_types_for_capability(CODE_BLOCKS_ONLY)
@@ -1617,3 +1708,180 @@ def test_a_policy_string_nobody_recognises_authors_no_code() -> None:
     for unrecognised in ("", "standrad", "code_only", "CODE_ONLY_BROWSER"):
         assert authoring_capability_from_policy(unrecognised) == AGENT_BLOCKS_ONLY
         assert _copilot_authoring_capability(SimpleNamespace(block_authoring_policy=unrecognised)) == AGENT_BLOCKS_ONLY
+
+
+_AGENT_STEP_GRANTED = replace(ALL_BLOCK_FAMILIES, agent_step=True)
+_AGENT_STEP_THEN_BRANCH = _yaml(
+    {
+        "block_type": "agent_step",
+        "label": "check_page",
+        "prompt": "Open https://example.com and answer yes if it says Example Domain, otherwise no.",
+        "tools": ["browser_task", "page_extract"],
+    },
+    {
+        "block_type": "conditional",
+        "label": "branch_on_answer",
+        "branch_conditions": [
+            {
+                "criteria": {
+                    "criteria_type": "jinja2_template",
+                    "expression": "{{ check_page_output.answer == 'yes' }}",
+                },
+                "next_block_label": None,
+            },
+            {"is_default": True, "next_block_label": None},
+        ],
+    },
+)
+
+
+async def _update_with_stubbed_save(submitted: str, ctx: MagicMock) -> dict:
+    fake_workflow = MagicMock()
+    for attr in (
+        "title",
+        "description",
+        "workflow_definition",
+        "proxy_location",
+        "webhook_callback_url",
+        "persist_browser_session",
+        "model",
+        "max_screenshot_scrolls",
+        "extra_http_headers",
+        "run_with",
+        "ai_fallback",
+        "cache_key",
+        "run_sequentially",
+        "sequential_key",
+    ):
+        setattr(fake_workflow, attr, None)
+    with (
+        patch("skyvern.forge.sdk.copilot.tools.workflow_update._process_workflow_yaml", return_value=fake_workflow),
+        patch("skyvern.forge.sdk.copilot.tools.workflow_update.app") as mock_app,
+    ):
+        mock_app.WORKFLOW_SERVICE.get_workflow = AsyncMock(return_value=None)
+        mock_app.WORKFLOW_SERVICE.update_workflow_definition = AsyncMock()
+        return await _update_workflow({"workflow_yaml": submitted}, ctx)
+
+
+@pytest.mark.parametrize(
+    ("capability", "authorable"),
+    [
+        (_AGENT_STEP_GRANTED, True),
+        (replace(AGENT_BLOCKS_ONLY, agent_step=True), True),
+        (ALL_BLOCK_FAMILIES, False),
+        (AGENT_BLOCKS_ONLY, False),
+        (replace(CODE_BLOCKS_ONLY, agent_step=True), False),
+    ],
+)
+@pytest.mark.asyncio
+async def test_agent_step_is_served_listed_and_saved_only_with_the_org_grant_and_agent_blocks(
+    capability: AuthoringCapability, authorable: bool
+) -> None:
+    ctx = _ctx()
+    ctx.authoring_capability = capability
+
+    schema = await _get_block_schema_pre_hook({"block_type": "agent_step"}, ctx)
+    listing = await _get_block_schema_post_hook(
+        {"ok": True, "data": {"block_types": {"navigation": "Take actions on a page"}, "count": 1}}, raw={}, ctx=ctx
+    )
+    write = await _update_with_stubbed_save(_AGENT_STEP_THEN_BRANCH, ctx)
+    schema_tool_note = _build_skyvern_mcp_overlays(capability)["get_block_schema"].description_suffix
+
+    assert schema is not None
+    assert schema["ok"] is authorable
+    assert ("agent_step" in listing["data"]["block_types"]) is authorable
+    assert (AGENT_STEP_BLOCK_SUMMARY in schema_tool_note) is authorable
+    assert write["ok"] is authorable
+    if authorable:
+        assert schema["data"]["summary"] == AGENT_STEP_BLOCK_SUMMARY
+        fields = schema["data"]["schema"]["properties"]
+        assert all(
+            fields[name].get("description")
+            for name in ("prompt", "data_schema", "max_turns", "parameter_keys", "tools")
+        )
+        step_tools = schema["data"]["tools_the_step_can_call"]
+        assert {"browser_task", "web_search", "file_download", "http_request", "finish"} <= set(step_tools)
+        assert "run_block" not in step_tools
+        assert ctx.workflow_yaml == _AGENT_STEP_THEN_BRANCH
+    else:
+        assert "check_page (agent_step, block_type_unavailable)" in write["error"]
+        for refusal in (schema["error"], write["error"]):
+            assert "not enabled for this organization" in refusal
+            assert "`conditional`" in refusal
+
+
+@pytest.mark.asyncio
+async def test_the_agent_step_grant_survives_from_the_request_config_to_the_turn_context(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(settings, "WORKFLOW_COPILOT_CODE_BLOCK_MODE", True)
+    agent_function = AgentFunction()
+    monkeypatch.setattr(agent_function, "has_code_block_access", AsyncMock(return_value=True))
+    monkeypatch.setattr(agent_function, "copilot_agent_step_enabled", AsyncMock(return_value=True))
+
+    config = await agent_function.get_copilot_config_for_request("o_test")
+    assert config is not None
+    ctx = make_copilot_ctx(
+        block_authoring_policy=config.block_authoring_policy,
+        agent_step_available=config.agent_step_available,
+        copilot_config=config,
+    )
+    ctx.authoring_capability = ctx.authoring_capability
+
+    assert config.authoring_capability == _AGENT_STEP_GRANTED
+    assert ctx.authoring_capability == _AGENT_STEP_GRANTED
+    assert _copilot_authoring_capability(ctx) == _AGENT_STEP_GRANTED
+
+
+@pytest.mark.parametrize("hook", [None, AsyncMock(side_effect=RuntimeError("flag provider down"))])
+@pytest.mark.asyncio
+async def test_agent_step_stays_unavailable_without_a_grant_or_when_the_lookup_fails(
+    monkeypatch: pytest.MonkeyPatch, hook: AsyncMock | None
+) -> None:
+    agent_function = AgentFunction()
+    if hook is not None:
+        monkeypatch.setattr(agent_function, "copilot_agent_step_enabled", hook)
+
+    config = await agent_function.get_copilot_config_for_request("o_test", code_block_mode=False)
+
+    assert config is not None
+    assert config.authoring_capability == AGENT_BLOCKS_ONLY
+
+
+def test_copilot_normalization_keeps_an_agent_steps_tools() -> None:
+    workflow = yaml.safe_load(_AGENT_STEP_THEN_BRANCH)
+    workflow["workflow_definition"]["parameters"] = []
+
+    request = _normalize_copilot_yaml(yaml.safe_dump(workflow))
+
+    assert request.workflow_definition.blocks[0].tools == ["browser_task", "page_extract"]
+
+
+_STEP = {"block_type": "agent_step", "label": "check_page", "prompt": "Answer yes or no."}
+_LISTED = {**_STEP, "tools": ["http_request", "web_search"]}
+
+
+@pytest.mark.parametrize(
+    ("prior", "submitted", "reported"),
+    [
+        (None, _STEP, True),
+        (None, _LISTED, False),
+        (_LISTED, _STEP, True),
+        (_STEP, _STEP, False),
+        (_STEP, {**_STEP, "tools": ["web_search"]}, False),
+    ],
+)
+@pytest.mark.asyncio
+async def test_an_agent_step_copilot_saves_without_tools_is_saved_and_reported(
+    prior: dict[str, object] | None, submitted: dict[str, object], reported: bool
+) -> None:
+    ctx = _ctx(prior_yaml=_yaml(prior) if prior else None)
+    ctx.authoring_capability = _AGENT_STEP_GRANTED
+
+    write = await _update_with_stubbed_save(_yaml(submitted), ctx)
+
+    assert write["ok"] is True
+    findings = [f for f in write["data"].get("findings", []) if f["reason_code"] == "agent_step_tools_missing"]
+    assert bool(findings) is reported
+    if reported:
+        assert "check_page" in findings[0]["summary"] and "http_request" in findings[0]["summary"]

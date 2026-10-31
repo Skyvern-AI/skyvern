@@ -16,6 +16,9 @@ if TYPE_CHECKING:
 
 MAX_ITEMS = 40
 MAX_ITEM_CHARS = 400
+# This header is measured, not prose: an imperative one took authoring from 12/20 to 0/20 in replay.
+# Re-measure with the arms in cloud_docs/workflow-copilot/architecture/offline-replay.md before editing.
+WORK_PLAN_HEADER = "\n\nYOUR WORK PLAN (your own notes, carried over from earlier in this chat):\n"
 
 
 class WorkPlanArguments(BaseModel):
@@ -42,9 +45,7 @@ def work_plan_prompt(items: Sequence[str] | None) -> str:
     if not items:
         return ""
     lines = "\n".join(f"- {_flatten(escape_code_fences(item))}" for item in items)
-    # This header is measured, not prose: an imperative one took authoring from 12/20 to 0/20 in replay.
-    # Re-measure with the arms in cloud_docs/workflow-copilot/architecture/offline-replay.md before editing.
-    return "\n\nYOUR WORK PLAN (your own notes, carried over from earlier in this chat):\n" + lines
+    return WORK_PLAN_HEADER + lines
 
 
 async def set_work_plan(ctx: CopilotContext, arguments: WorkPlanArguments) -> dict[str, Any]:

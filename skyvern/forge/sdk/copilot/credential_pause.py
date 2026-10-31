@@ -48,7 +48,7 @@ from skyvern.forge.sdk.copilot.credential_resolution import (
 )
 from skyvern.forge.sdk.copilot.diagnosis_repair_contract import DiagnosisFailureType, RepairNextAction
 from skyvern.forge.sdk.copilot.human_input_wait import pause_human_input
-from skyvern.forge.sdk.copilot.request_policy import RequestPolicy
+from skyvern.forge.sdk.copilot.request_policy import RequestPolicy, credential_binding
 from skyvern.forge.sdk.schemas.credentials import Credential
 from skyvern.forge.sdk.schemas.workflow_copilot import (
     CredentialPauseResolvedOutcome,
@@ -978,7 +978,7 @@ async def _seconds_left_on_pause(ctx: CopilotContext, resume_token: str) -> floa
 
 
 def _manual_sign_in_offer(ctx: CopilotContext, login_page_urls: list[str]) -> ManualSignIn | None:
-    """A pick card offers signing in yourself in the editor's live browser when there is one to sign in to."""
+    """A pick or update card offers signing in yourself in the editor's live browser when there is one."""
     policy = ctx.request_policy
     site = sign_in_site(login_page_urls)
     if (
@@ -1029,14 +1029,16 @@ async def _run_credential_pause(
         ctx.credential_pause_used = True
 
     def settle(outcome: str) -> None:
-        # An update card asks to fix a credential already chosen, so the turn keeps its pick card's state.
+        # An update card asks to fix a credential already chosen, so the turn keeps its pick card's state
+        # unless the user signed in themselves, which answers the turn's ask the way a pick card does.
         # Outcome and anchor change together, so a card cancelled mid-wait leaves the earlier card's receipt intact.
-        if not update_ask:
-            ctx.credential_pause_outcome = outcome
-            ctx.credential_pause_anchor_tool_call_id = anchor_tool_call_id
-            receipt = credential_pause_receipt(ctx)
-            if receipt is not None:
-                ctx.credential_pause_receipts.append(receipt)
+        if update_ask and outcome != "signed_in":
+            return
+        ctx.credential_pause_outcome = outcome
+        ctx.credential_pause_anchor_tool_call_id = anchor_tool_call_id
+        receipt = credential_pause_receipt(ctx)
+        if receipt is not None:
+            ctx.credential_pause_receipts.append(receipt)
 
     cache = getattr(app, "CACHE", None)
     if cache is None:
@@ -1097,7 +1099,7 @@ async def _run_credential_pause(
     turn_id = ctx.turn_id or ""
     resume_token = _new_resume_token()
     expires_at = now + timedelta(seconds=timeout_seconds)
-    manual_sign_in = None if update_ask or registration else _manual_sign_in_offer(ctx, login_page_urls)
+    manual_sign_in = None if registration else _manual_sign_in_offer(ctx, login_page_urls)
     if manual_sign_in is not None or registration is not None:
         # Signing in or saving a generated credential can outlast the tab, so the card must survive a reload.
         ctx.credential_recovery_armed = True
@@ -1120,6 +1122,9 @@ async def _run_credential_pause(
         expires_at=expires_at,
         anchor_tool_call_id=anchor_tool_call_id,
         sign_in_browser_session_id=manual_sign_in.browser_session_id if manual_sign_in else None,
+        credential_binding=credential_binding(policy, update_credential_id)
+        if update_credential_id is not None and isinstance(policy, RequestPolicy)
+        else None,
         registration=registration,
         timestamp=now,
     )
@@ -1274,9 +1279,12 @@ async def _run_credential_pause(
         return resolution
 
     if resolution.action == "signed_in":
-        if resolution.signed_in is None or update_ask:
+        if resolution.signed_in is None:
             settle("timeout")
             return None
+        if update_ask:
+            # The run-derived ask must not raise a pick card for a turn the user already signed in on.
+            ctx.credential_pause_used = True
         if isinstance(policy, RequestPolicy):
             _apply_signed_in_profile_to_policy(ctx, policy, resolution.signed_in)
         settle("signed_in")

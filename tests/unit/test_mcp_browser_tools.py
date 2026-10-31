@@ -2077,7 +2077,7 @@ async def test_tab_new_reports_a_navigate_that_never_answered_as_a_timeout(
         lambda *args, **kwargs: browser_ops.do_navigate(page, HANGING_PAGE_URL, timeout=HANGING_BOUND_MS),
     )
     browser = SimpleNamespace(_browser_context=SimpleNamespace(pages=[page], new_page=AsyncMock(return_value=page)))
-    state = SimpleNamespace(
+    state = session_manager.SessionState(
         _active_page=page,
         _implicit_page=None,
         _working_frame=None,
@@ -2896,7 +2896,9 @@ async def test_skyvern_click_native_option_selector_uses_parent_select(monkeypat
 
     assert result["ok"] is True
     page.click.assert_not_awaited()
-    select_option.assert_awaited_once_with(value="east", timeout=5000)
+    select_option.assert_awaited_once()
+    assert select_option.await_args.kwargs["value"] == "east"
+    assert 0 < select_option.await_args.kwargs["timeout"] <= 5000
     assert result["data"]["resolved_selector"] == "#region"
     assert result["data"]["selected_option"] == {
         "select_selector": "#region",
@@ -2917,8 +2919,14 @@ async def test_skyvern_click_native_option_selector_can_fall_back_to_label(
 
     assert result["ok"] is True
     page.click.assert_not_awaited()
-    assert select_option.await_args_list[0].kwargs == {"value": "east", "timeout": 5000}
-    assert select_option.await_args_list[1].kwargs == {"label": "East", "timeout": 5000}
+    assert [
+        call.kwargs["value"] if "value" in call.kwargs else call.kwargs["label"]
+        for call in select_option.await_args_list
+    ] == [
+        "east",
+        "East",
+    ]
+    assert all(0 < call.kwargs["timeout"] <= 5000 for call in select_option.await_args_list)
     assert result["data"]["selected_option"]["selected_by"] == "label"
     assert result["data"]["sdk_equivalent"] == "await page.select_option('#region', label='East')"
 
@@ -2936,7 +2944,9 @@ async def test_skyvern_click_native_option_selector_selects_by_index(monkeypatch
 
     assert result["ok"] is True
     page.click.assert_not_awaited()
-    select_option.assert_awaited_once_with(index=3, timeout=5000)
+    select_option.assert_awaited_once()
+    assert select_option.await_args.kwargs["index"] == 3
+    assert 0 < select_option.await_args.kwargs["timeout"] <= 5000
     assert result["data"]["selected_option"]["selected_by"] == "index"
     assert result["data"]["selected_option"]["index"] == 3
     assert result["data"]["sdk_equivalent"] == "await page.select_option('#region', index=3)"

@@ -219,8 +219,8 @@ async def test_task_v1_emission_reads_started_at_from_the_claim_not_the_entry_re
     monkeypatch.setattr(app.DATABASE.tasks, "get_task", AsyncMock(return_value=entry_task))
     monkeypatch.setattr(
         app.DATABASE.tasks,
-        "update_task_and_claim_finish",
-        AsyncMock(return_value=(claimed_task, True)),
+        "update_task_and_claim_finish_for_cancel",
+        AsyncMock(return_value=(claimed_task, True, True)),
     )
     monkeypatch.setattr(agent_module, "save_task_logs", AsyncMock())
 
@@ -230,6 +230,30 @@ async def test_task_v1_emission_reads_started_at_from_the_claim_not_the_entry_re
     kwargs = record_run_duration.await_args.kwargs
     assert kwargs.get("excluded_reason") is None
     assert kwargs["duration_seconds"] == pytest.approx(9 * 60, abs=5)
+
+
+@pytest.mark.asyncio
+async def test_task_v1_cancel_callback_uses_status_transition_not_finish_claim(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    now = datetime.now(UTC)
+    entry_task = _make_task(status=TaskStatus.running, started_at=now - timedelta(minutes=5), finished_at=now)
+    canceled_task = _make_task(status=TaskStatus.canceled, started_at=entry_task.started_at, finished_at=now)
+    cancel_update = AsyncMock(return_value=(canceled_task, False, True))
+    callback = AsyncMock()
+    monkeypatch.setattr(app.DATABASE.tasks, "get_task", AsyncMock(return_value=entry_task))
+    monkeypatch.setattr(app.DATABASE.tasks, "update_task_and_claim_finish_for_cancel", cancel_update)
+    monkeypatch.setattr(agent_module, "save_task_logs", AsyncMock())
+
+    result, status_changed = await ForgeAgent().update_task_for_cancel(
+        entry_task,
+        audit_actor=SimpleNamespace(),
+        on_transition=callback,
+    )
+
+    assert result is canceled_task
+    assert status_changed is True
+    callback.assert_awaited_once()
 
 
 FINALLY_BLOCK_SECONDS = 5 * 60
@@ -401,7 +425,7 @@ async def test_finally_block_re_finalization_records_only_the_minutes_it_added(
     monkeypatch.setattr(svc, "get_workflow_output_parameters", AsyncMock(return_value=[]))
     monkeypatch.setattr(svc, "_collect_inherited_workflow_system_prompt", AsyncMock(return_value=None))
     monkeypatch.setattr(svc, "auto_create_browser_session_if_needed", AsyncMock(return_value=None))
-    monkeypatch.setattr(svc, "_browser_profile_is_managed", AsyncMock(return_value=False))
+    monkeypatch.setattr(svc, "_get_run_browser_profile", AsyncMock(return_value=None))
     monkeypatch.setattr(svc, "_execute_workflow_blocks", AsyncMock(side_effect=terminalize_inside_body))
     monkeypatch.setattr(svc, "generate_script_if_needed", AsyncMock())
     monkeypatch.setattr(svc, "should_run_script", AsyncMock(return_value=False))

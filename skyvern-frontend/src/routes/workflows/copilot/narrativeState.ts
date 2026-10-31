@@ -10,15 +10,19 @@ import {
   ConnectedAccountChoice,
   CopilotResponseType,
   CopilotSteerMessage,
+  type CopilotTestInput,
+  type CopilotTestInputSource,
   DeliveredOutputFile,
   ProposalDisposition,
   RunOutcomeRole,
+  SkippedPrefixBlock,
   WorkflowCopilotBlockProgressUpdate,
   WorkflowCopilotCodegenProgressUpdate,
   WorkflowCopilotDesignEndUpdate,
   WorkflowCopilotDesignStartUpdate,
   WorkflowCopilotNarrationUpdate,
   WorkflowCopilotRunOutcomeUpdate,
+  WorkflowCopilotRunStartedUpdate,
   WorkflowCopilotScreenshotUpdate,
   WorkflowCopilotStreamErrorUpdate,
   WorkflowCopilotStreamResponseUpdate,
@@ -123,6 +127,7 @@ export type NarrativeEvent =
   | WorkflowCopilotWorkflowDraftUpdate
   | WorkflowCopilotBlockProgressUpdate
   | WorkflowCopilotRunOutcomeUpdate
+  | WorkflowCopilotRunStartedUpdate
   | WorkflowCopilotStreamResponseUpdate
   | WorkflowCopilotStreamErrorUpdate
   | WorkflowCopilotNarrationUpdate
@@ -297,6 +302,10 @@ export interface ReviewProjection {
     blockType: string;
     blockLabels: string[];
   }>;
+  // Blocks whose saved notes Copilot's YAML left out, so the saved notes were kept.
+  keptNotes?: string[];
+  // The same for descriptions.
+  keptDescriptions?: string[];
 }
 
 export interface BlockState {
@@ -308,6 +317,8 @@ export interface BlockState {
   outcome?: BlockOutcome;
   outcomeReason?: string;
   outcomeRole?: RunOutcomeRole;
+  // Requested blocks the run did not execute, shown before this, the run's first card.
+  skippedBefore?: SkippedPrefixBlock[];
   lastSeenIteration: number;
   // Tool calls and results emitted while this block was running are
   // appended here so the expanded card shows what the agent did.
@@ -363,6 +374,10 @@ export interface ActivityEntry {
   // A successful run_browser_code result's operations as display phrases,
   // in order. Absent on every other row.
   browserSteps?: string[];
+  // The run a block-running result dispatched, and where each of its inputs
+  // came from. Absent on every other row.
+  workflowRunId?: string;
+  testInputs?: CopilotTestInput[];
   // Stable per-event id used as React key.
   id: string;
   // Consecutive same-tool retries folded into this row by
@@ -478,6 +493,8 @@ export interface TurnNarrativeState {
   steerMessages: CopilotSteerMessage[];
   // Browser frames captured for the agent this turn, in capture order.
   screenshots: TurnScreenshot[];
+  // Live-only: a started run's skipped prefix, keyed by run id until the run's first block arrives.
+  pendingSkippedPrefix: Record<string, SkippedPrefixBlock[]>;
 }
 
 export interface TurnScreenshot {
@@ -539,6 +556,7 @@ export const EMPTY_NARRATIVE: TurnNarrativeState = Object.freeze({
   budgetExpiry: null,
   steerMessages: [],
   screenshots: [],
+  pendingSkippedPrefix: {},
 }) as TurnNarrativeState;
 
 // Caps to keep long-running narrations from unbounded growth (and to keep
@@ -650,6 +668,32 @@ function parseTurnWorkPlan(value: unknown): TurnWorkPlan | null {
   return typeof o.toolCallId === "string" && o.toolCallId && items
     ? { toolCallId: o.toolCallId, items }
     : null;
+}
+
+const TEST_INPUT_SOURCES: ReadonlySet<string> = new Set<CopilotTestInputSource>(
+  ["copilot", "page", "earlier_run", "default", "placeholder"],
+);
+
+export function parseTestInputs(
+  value: unknown,
+): CopilotTestInput[] | undefined {
+  if (!Array.isArray(value)) return undefined;
+  const inputs: CopilotTestInput[] = [];
+  for (const item of value) {
+    if (!item || typeof item !== "object") continue;
+    const row = item as Record<string, unknown>;
+    if (typeof row.key !== "string" || typeof row.source !== "string") {
+      continue;
+    }
+    if (!TEST_INPUT_SOURCES.has(row.source)) continue;
+    inputs.push({
+      key: row.key,
+      source: row.source as CopilotTestInputSource,
+      sourceRunId:
+        typeof row.sourceRunId === "string" ? row.sourceRunId : undefined,
+    });
+  }
+  return inputs.length > 0 ? inputs : undefined;
 }
 
 export function parseCodeDiffs(value: unknown): CodeWriteDiff[] | undefined {
@@ -992,6 +1036,8 @@ function buildActivityFromToolResult(
     detail: event.detail || undefined,
     codeDiffs: parseCodeDiffs(event.code_diffs),
     browserSteps: parseStringList(event.browser_steps) ?? undefined,
+    workflowRunId: event.workflow_run_id || undefined,
+    testInputs: parseTestInputs(event.test_inputs),
     reason: actionReason(event.reason),
     activityBucket: parseActivityBucket(event.activity_bucket),
     activityStartedAt: event.activity_started_at ?? undefined,
@@ -1483,6 +1529,11 @@ export function applyNarrativeEvent(
       // terminal event take the latest wall clock so a retry-then-succeed
       // sequence reflects the final completion time, not the first failure.
       const endedAt = isTerminal ? eventTs : null;
+      const runId = event.workflow_run_id;
+      const pendingSkipped =
+        previousBlock === null && runId
+          ? prev.pendingSkippedPrefix[runId]
+          : undefined;
       const baseEntry: BlockState = {
         workflowRunBlockId: event.workflow_run_block_id,
         label: event.block_label,
@@ -1494,6 +1545,7 @@ export function applyNarrativeEvent(
         outcome: previousBlock?.outcome,
         outcomeReason: previousBlock?.outcomeReason,
         outcomeRole: previousBlock?.outcomeRole,
+        skippedBefore: previousBlock?.skippedBefore ?? pendingSkipped,
         recordedActions: previousBlock?.recordedActions,
         recordedActionsAt: previousBlock?.recordedActionsAt,
         lastSeenIteration: event.iteration,
@@ -1508,9 +1560,26 @@ export function applyNarrativeEvent(
       }
       return {
         ...prev,
+        pendingSkippedPrefix: pendingSkipped
+          ? Object.fromEntries(
+              Object.entries(prev.pendingSkippedPrefix).filter(
+                ([id]) => id !== runId,
+              ),
+            )
+          : prev.pendingSkippedPrefix,
         blocks: [...prev.blocks, baseEntry].slice(-MAX_BLOCK_ATTEMPTS),
       };
     }
+
+    case "run_started":
+      if (!event.skipped_prefix?.length) return prev;
+      return {
+        ...prev,
+        pendingSkippedPrefix: {
+          ...prev.pendingSkippedPrefix,
+          [event.workflow_run_id]: event.skipped_prefix,
+        },
+      };
 
     case "run_outcome": {
       // Apply the recorded verdict by run-block id only — no label fallback, so
@@ -1807,6 +1876,11 @@ function normalizeActivityEntries(raw: unknown): ActivityEntry[] {
       success: typeof o.success === "boolean" ? o.success : undefined,
       codeDiffs: parseCodeDiffs(o.codeDiffs),
       browserSteps: parseStringList(o.browserSteps) ?? undefined,
+      workflowRunId:
+        typeof o.workflowRunId === "string" && o.workflowRunId
+          ? o.workflowRunId
+          : undefined,
+      testInputs: parseTestInputs(o.testInputs),
       id: o.id,
       reason: actionReason(o.reason),
       activityBucket: parseActivityBucket(o.activityBucket),
@@ -1897,7 +1971,38 @@ function parseReviewProjection(raw: unknown): ReviewProjection | null {
       blockLabels: group.blockLabels,
     });
   }
-  return { blocks, duplicateWrites };
+  const labels = (raw: unknown): string[] =>
+    Array.isArray(raw)
+      ? raw.filter((label): label is string => typeof label === "string")
+      : [];
+  return {
+    blocks,
+    duplicateWrites,
+    keptNotes: labels(value.keptNotes),
+    keptDescriptions: labels(value.keptDescriptions),
+  };
+}
+
+function parseSkippedPrefix(raw: unknown): SkippedPrefixBlock[] | undefined {
+  if (!Array.isArray(raw)) return undefined;
+  const entries = raw.flatMap((item): SkippedPrefixBlock[] => {
+    const obj = item as Record<string, unknown>;
+    if (
+      typeof obj?.label !== "string" ||
+      (obj.kind !== "reused" && obj.kind !== "not_run")
+    )
+      return [];
+    return [
+      typeof obj.sourceWorkflowRunId === "string"
+        ? {
+            label: obj.label,
+            kind: obj.kind,
+            sourceWorkflowRunId: obj.sourceWorkflowRunId,
+          }
+        : { label: obj.label, kind: obj.kind },
+    ];
+  });
+  return entries.length > 0 ? entries : undefined;
 }
 
 export function hydrateNarrativeFromPayload(
@@ -1981,6 +2086,7 @@ export function hydrateNarrativeFromPayload(
         outcomeRole,
         outcomeReason:
           typeof obj.outcomeReason === "string" ? obj.outcomeReason : undefined,
+        skippedBefore: parseSkippedPrefix(obj.skippedBefore),
         state: ((): BlockState["state"] => {
           const s = obj.state;
           if (

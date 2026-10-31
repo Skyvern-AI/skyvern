@@ -1,10 +1,7 @@
 import {
-  CheckCircledIcon,
   ChevronDownIcon,
   ChevronRightIcon,
   CrossCircledIcon,
-  MinusCircledIcon,
-  ReloadIcon,
 } from "@radix-ui/react-icons";
 import { type ReactNode, useEffect, useMemo, useRef, useState } from "react";
 
@@ -19,12 +16,13 @@ import { Collapsible, CollapsibleContent } from "@/components/ui/collapsible";
 import { InlineMarkdown } from "@/components/AgentMarkdown";
 import { statusIsFinalized } from "@/routes/tasks/types";
 import { formatDuration, toDuration } from "@/routes/workflows/utils";
+import { getWebSearchResultSummary } from "./blockResult";
+import { StatusDot } from "./StatusDot";
 import { cn } from "@/util/utils";
 import { workflowBlockTitle } from "../editor/nodes/types";
 import { WorkflowBlockIcon } from "../editor/nodes/WorkflowBlockIcon";
 import { actionTypeIcons as timelineActionIcons } from "../components/actionTypeIcons";
 import { getActionDisplayStatus } from "../components/actionStatus";
-import { TerminatedIcon, terminatedTone } from "@/components/terminatedVisual";
 import {
   isAction,
   isBlockItem,
@@ -135,67 +133,6 @@ function IndentRails({ depth }: { depth: number }) {
         </div>
       ))}
     </>
-  );
-}
-
-function StatusDot({
-  status,
-  isFinalized,
-}: {
-  status: Status | null;
-  isFinalized: boolean;
-}) {
-  const label = status
-    ? status.replace("_", " ")
-    : isFinalized
-      ? "did not execute"
-      : "not started";
-  const isCompleted = status === Status.Completed;
-  const isTerminated = status === Status.Terminated;
-  const isFailure =
-    status === Status.Failed ||
-    status === Status.TimedOut ||
-    status === Status.Canceled;
-  const isRunning = status === Status.Running && !isFinalized;
-
-  const glyph = (() => {
-    if (isCompleted) {
-      return <CheckCircledIcon className="size-3.5 shrink-0 text-success" />;
-    }
-    if (isTerminated) {
-      return (
-        <TerminatedIcon className={`size-3.5 shrink-0 ${terminatedTone}`} />
-      );
-    }
-    if (isFailure) {
-      return (
-        <CrossCircledIcon className="size-3.5 shrink-0 text-destructive" />
-      );
-    }
-    if (status === Status.Skipped) {
-      return (
-        <MinusCircledIcon className="size-3.5 shrink-0 text-muted-foreground" />
-      );
-    }
-    if (isRunning) {
-      return (
-        <ReloadIcon className="size-3.5 shrink-0 animate-spin text-sky-700 dark:text-sky-400" />
-      );
-    }
-    return (
-      <div className="size-2 shrink-0 rounded-full bg-muted-foreground dark:bg-slate-600" />
-    );
-  })();
-
-  return (
-    <span
-      title={label}
-      role="img"
-      aria-label={label}
-      className="flex shrink-0 items-center"
-    >
-      {glyph}
-    </span>
   );
 }
 
@@ -354,46 +291,6 @@ function getTimelineDescriptor(block: WorkflowRunBlock): string {
   }
 
   return `${workflowBlockTitle[block.block_type]} block`;
-}
-
-function getWebSearchResultSummary(block: WorkflowRunBlock): string | null {
-  const output = block.output;
-  if (
-    block.block_type !== "web_search" ||
-    block.status !== Status.Completed ||
-    !output ||
-    typeof output !== "object" ||
-    Array.isArray(output) ||
-    !("total_count" in output) ||
-    typeof output.total_count !== "number"
-  ) {
-    return null;
-  }
-
-  const count = output.total_count;
-  const summary = `${count} ${count === 1 ? "result" : "results"}`;
-  if ("prompt_output" in output && Array.isArray(output.prompt_output)) {
-    let itemCount = output.prompt_output.length;
-    const lastItem: unknown = output.prompt_output[itemCount - 1];
-    if (
-      lastItem &&
-      typeof lastItem === "object" &&
-      "truncated" in lastItem &&
-      lastItem.truncated === true &&
-      "reason" in lastItem &&
-      lastItem.reason === "exceeded_max_run_response_value_size"
-    ) {
-      if (
-        !("original_count" in lastItem) ||
-        typeof lastItem.original_count !== "number"
-      ) {
-        return summary;
-      }
-      itemCount = lastItem.original_count;
-    }
-    return `${summary} · Prompt returned ${itemCount} ${itemCount === 1 ? "item" : "items"}`;
-  }
-  return summary;
 }
 
 function getLoopIterationGroups(

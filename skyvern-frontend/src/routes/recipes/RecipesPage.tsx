@@ -1,4 +1,5 @@
 import { Link } from "react-router-dom";
+import { useSeoRecipeAccess } from "./useSeoRecipeAccess";
 
 const recipes = [
   {
@@ -54,6 +55,7 @@ const recipes = [
 ];
 
 function RecipesPage() {
+  const seoAccess = useSeoRecipeAccess();
   return (
     <div className="space-y-8">
       <div>
@@ -65,20 +67,24 @@ function RecipesPage() {
         </p>
       </div>
       <div className="grid gap-3 md:grid-cols-2 xl:grid-cols-3">
-        {recipes.map((recipe) => (
-          <Link
-            key={recipe.to}
-            to={recipe.to}
-            className="group rounded-lg border border-neutral-200 bg-white p-4 transition-colors duration-100 hover:border-neutral-300 hover:bg-neutral-50 dark:border-white/[0.08] dark:bg-neutral-950 dark:hover:border-white/[0.16] dark:hover:bg-white/[0.03]"
-          >
-            <div className="text-sm font-semibold text-neutral-950 group-hover:text-neutral-900 dark:text-neutral-100 dark:group-hover:text-white">
-              {recipe.title}
-            </div>
-            <div className="mt-2 text-sm leading-5 text-neutral-600 dark:text-neutral-400">
-              {recipe.description}
-            </div>
-          </Link>
-        ))}
+        {recipes
+          .filter(
+            (recipe) => recipe.to !== "/recipes/seo" || seoAccess !== "denied",
+          )
+          .map((recipe) => (
+            <Link
+              key={recipe.to}
+              to={recipe.to}
+              className="group rounded-lg border border-neutral-200 bg-white p-4 transition-colors duration-100 hover:border-neutral-300 hover:bg-neutral-50 dark:border-white/[0.08] dark:bg-neutral-950 dark:hover:border-white/[0.16] dark:hover:bg-white/[0.03]"
+            >
+              <div className="text-sm font-semibold text-neutral-950 group-hover:text-neutral-900 dark:text-neutral-100 dark:group-hover:text-white">
+                {recipe.title}
+              </div>
+              <div className="mt-2 text-sm leading-5 text-neutral-600 dark:text-neutral-400">
+                {recipe.description}
+              </div>
+            </Link>
+          ))}
       </div>
     </div>
   );

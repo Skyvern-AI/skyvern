@@ -267,6 +267,8 @@ class Settings(BaseSettings):
     LOG_SAMPLING_RATE: float = 1.0
     LOG_SAMPLING_ORG_IDS: list[str] = []
     COPILOT_RAW_SECRET_SAFETY_TIMEOUT_SECONDS: float = 12.0
+    COPILOT_RAW_SECRET_SAFETY_HEDGE_ENABLED: bool = True
+    COPILOT_RAW_SECRET_SAFETY_HEDGE_DELAY_SECONDS: float = 3.0
     COPILOT_COMPLETION_JUDGE_TIMEOUT_SECONDS: float = 12.0
     COPILOT_OUTPUT_DESIGNATION_TIMEOUT_SECONDS: float = 12.0
     # A capture that runs out of time yields no page evidence at all, so the scout falls back to
@@ -390,6 +392,8 @@ class Settings(BaseSettings):
     # Most page PNG data a pdfplumber child may hand back for OCR; text, word and page-count results have smaller caps
     # in pdf_parser. The parent holds a result outside the child's memory cap, so it reserves the decoded size.
     PDFPLUMBER_MAX_RESULT_BYTES: int = Field(default=256 * 1024 * 1024, gt=0)
+    # Server kill switch for notes in PDF imports; Copilot keeps reading saved notes because they still guide runs.
+    WORKFLOW_PDF_IMPORT_NOTES_ENABLED: bool = True
     PRESIGNED_URL_EXPIRATION: int = 60 * 60 * 24  # 24 hours
     # Ceiling on the retention_days a caller may request at upload time. A cap exists so a
     # retention period cannot be used to pin storage indefinitely; omitting retention_days
@@ -577,8 +581,8 @@ class Settings(BaseSettings):
     TASK_V3_PRE_SUBMIT_CAPTURE_SAMPLE_RATE: float = 0.25
     # Kill switch: one page DOM per Task V3 block, saved after the loop as html_action (v1 saves html_scrape).
     TASK_V3_BLOCK_END_DOM: bool = True
-    # Fraction of Task V3 runs (keyed like the pre-submit sample) that store the page DOM on every turn step and
-    # flush each turn's archive as the turn ends; the rest keep one archive ZIP per block. 0 disables.
+    # Fallback only: runs are randomized per run by the flag of the same name (TURN_DOM_FLAG). This is the fraction
+    # of the runs it leaves unrandomized (keyed like the pre-submit sample) that store the page DOM every turn.
     TASK_V3_TURN_DOM_SAMPLE_RATE: float = 0.05
     # Kill switch for the tier-1 semantic commit read (SKY-15322): decisive-accept-only ARIA/value
     # probe consulted before the shape heuristics, which remain the fallback either way.

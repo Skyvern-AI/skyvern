@@ -79,7 +79,7 @@ def template_run_db(monkeypatch: pytest.MonkeyPatch) -> tuple[AsyncMock, AsyncMo
             ),
             observer=SimpleNamespace(get_task_v2_by_workflow_run_id=AsyncMock(return_value=None)),
             tasks=SimpleNamespace(
-                get_tasks_by_workflow_run_id=AsyncMock(return_value=[]),
+                get_tasks_for_workflow_run_status=AsyncMock(return_value=[]),
                 get_step_counts_by_task_ids=AsyncMock(return_value=(0, 0)),
             ),
             browser_sessions=SimpleNamespace(

@@ -66,6 +66,7 @@ from skyvern.forge.taskv3.loop import (
     _ProgressEvidence,
 )
 from skyvern.forge.taskv3.opaque_refs import OpaqueUrlRefs, mask_opaque_urls
+from skyvern.forge.taskv3.run_arms import ANSWER_AUDIT_LOG_ONLY_FLAG
 from skyvern.forge.taskv3.tools import PAGE_UNAVAILABLE_ERROR, DownloadFailureWatch
 from skyvern.forge.taskv3.turn_dom import TurnDomCapture
 from skyvern.schemas.llm import LLMConfig, LLMRouterConfig, LLMRouterModelConfig
@@ -200,6 +201,20 @@ async def test_engine_exposes_browser_and_finish_tools_no_task_ecosystem() -> No
     sent = {t["function"]["name"] for t in (caller.sent_tools or [])}
     assert {"observe", "type", "click", "file_upload", "finish"} <= sent
     assert not ({"act", "extract", "validate", "run_task", "login"} & sent)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("llm_route_arm", ["treatment", "control", None])
+async def test_engine_finished_line_carries_the_llm_route_arm_the_caller_recorded(llm_route_arm: str | None) -> None:
+    caller = _ScriptedCaller([[("finish", {"status": "completed", "reason": "done"})]])
+    caller.llm_key = "ANY_ROUTE"
+    with capture_logs() as logs:
+        await run_task_v3_agent_loop(
+            page_provider=_fixed_page_provider(_FakePage()), llm_caller=caller, goal="x", llm_route_arm=llm_route_arm
+        )
+
+    finished = next(entry for entry in logs if entry["event"] == "taskv3 engine loop finished")
+    assert (finished["llm_key"], finished["llm_route_arm"]) == ("ANY_ROUTE", llm_route_arm)
 
 
 @pytest.mark.asyncio
@@ -1722,7 +1737,7 @@ async def test_the_answer_audit_wraps_the_run_tools_and_sees_the_instructions(mo
         hook_calls.append({"parameters": parameters, "goal": goal})
         return audit
 
-    def spy(tools: list[Any], answer_audit: Any) -> None:
+    def spy(tools: list[Any], answer_audit: Any, **_kwargs: Any) -> None:
         applied.append(([t.name for t in tools], answer_audit))
 
     monkeypatch.setattr(app.AGENT_FUNCTION, "task_v3_answer_basis_audit", hook)
@@ -1746,6 +1761,42 @@ async def test_the_answer_audit_wraps_the_run_tools_and_sees_the_instructions(mo
     assert "Apply." in hook_calls[0]["goal"] and "Answer citizenship from the resume." in hook_calls[0]["goal"]
     assert "click" in applied[0][0] and applied[0][1] is audit
     assert applied[1][1] is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("audit_installed", [True, False])
+@pytest.mark.parametrize("audit_arm", ["unrandomized", "control", "treatment"])
+async def test_the_log_only_arm_changes_the_run_only_on_treatment(
+    monkeypatch: pytest.MonkeyPatch, audit_arm: str, audit_installed: bool
+) -> None:
+    applied: list[dict[str, Any]] = []
+
+    async def hook(parameters: Any, *, goal: str, organization_id: Any, step: Any) -> object | None:
+        return object() if audit_installed else None
+
+    def spy(tools: list[Any], answer_audit: Any, **kwargs: Any) -> None:
+        applied.append(kwargs)
+
+    monkeypatch.setattr(app.AGENT_FUNCTION, "task_v3_answer_basis_audit", hook)
+    monkeypatch.setattr(engine_mod, "apply_answer_basis_audit", spy)
+    ctx = SkyvernContext()
+    ctx.run_arms = {ANSWER_AUDIT_LOG_ONLY_FLAG: ("wr_1", audit_arm)} if audit_arm != "unrandomized" else {}
+    skyvern_context.set(ctx)
+    try:
+        with capture_logs() as logs:
+            outcome = await run_task_v3_agent_loop(
+                page_provider=_fixed_page_provider(_FakePage()),
+                llm_caller=_ScriptedCaller([[("finish", {"status": "completed", "reason": "ok"})]]),
+                goal="Apply.",
+                parameters={"resume": "text"},
+            )
+    finally:
+        skyvern_context.reset()
+
+    assert outcome.status == "completed"
+    assert applied == [{"log_only": audit_arm == "treatment", "log_fields": {"audit_mode_arm": audit_arm}}]
+    terminal = next(e for e in logs if e.get("event") == "taskv3 engine loop finished")
+    assert (terminal["audit_mode_arm"], terminal["answer_audit_active"]) == (audit_arm, audit_installed)
 
 
 @pytest.mark.asyncio

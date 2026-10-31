@@ -24,6 +24,7 @@ from skyvern.forge.sdk.db.enums import (
     WorkflowRunTriggerType,
 )
 from skyvern.forge.sdk.schemas.files import FileInfo
+from skyvern.forge.sdk.schemas.har_evidence import without_final_har_user_match
 from skyvern.forge.sdk.schemas.task_v2 import TaskV2
 from skyvern.forge.sdk.workflow.exceptions import (
     InvalidFinallyBlockLabel,
@@ -428,6 +429,12 @@ class WorkflowRun(BaseModel):
     @field_serializer("cdp_connect_headers")
     def _mask_cdp_connect_headers(self, headers: dict[str, str] | None) -> dict[str, str] | None:
         return mask_header_values(headers)
+
+    # Every JSON payload of a run (list and detail routes, webhooks) omits the final match's bookkeeping; in-process
+    # readers keep the raw carrier, which the errors[] projection reads.
+    @field_serializer("failure_category", when_used="json")
+    def _public_failure_category(self, categories: list[dict[str, Any]] | None) -> list[dict[str, Any]] | None:
+        return without_final_har_user_match(categories)
 
     queued_at: datetime | None = None
     started_at: datetime | None = None

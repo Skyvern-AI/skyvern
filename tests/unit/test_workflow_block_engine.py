@@ -44,6 +44,7 @@ from skyvern.forge.sdk.experimentation.workflow_block_engine import (
     workflow_block_engine_override,
 )
 from skyvern.forge.sdk.schemas.tasks import TaskStatus
+from skyvern.forge.sdk.workflow.models.agent_step_block import AgentStepBlock
 from skyvern.forge.sdk.workflow.models.block import (
     ActionBlock,
     BaseTaskBlock,
@@ -206,15 +207,46 @@ async def test_explicit_block_engine_is_never_overridden_by_treatment_arm(scoped
     assert v2_block.resolve_engine("wr_pinned") == RunEngine.skyvern_v2
 
 
-@pytest.mark.parametrize("pinned_engine", [RunEngine.openai_cua, RunEngine.skyvern_v3])
+@pytest.mark.parametrize("pinned_engine", [RunEngine.openai_cua, RunEngine.skyvern_v2])
 def test_pinned_non_default_engine_block_disqualifies_the_run(pinned_engine: RunEngine) -> None:
     eligible = _make_block(TaskBlock, label="ok")
-    # Pinned as-authored in both arms, but that leaves control mixed-engine, so it
-    # disqualifies the whole run rather than being skipped. A v3 pin is the user opting
-    # in explicitly, not a treatment exposure.
     pinned = _make_block(NavigationBlock, label="pinned", navigation_goal="Apply to the job", engine=pinned_engine)
 
     assert run_is_eligible_for_v3_ab([eligible, pinned]) is False
+
+
+def _mixed_v3_and_stored_v1_blocks() -> list[BaseTaskBlock]:
+    return [
+        _make_block(TaskBlock, label="unset"),
+        _make_block(
+            NavigationBlock, label="stored_v1", navigation_goal="Apply to the job", engine=RunEngine.skyvern_v1
+        ),
+        _make_block(
+            NavigationBlock, label="chosen_v3", navigation_goal="Apply to the job", engine=RunEngine.skyvern_v3
+        ),
+    ]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("treatment", "expected"),
+    [
+        (True, [RunEngine.skyvern_v3, RunEngine.skyvern_v3, RunEngine.skyvern_v3]),
+        (False, [RunEngine.skyvern_v1, RunEngine.skyvern_v1, RunEngine.skyvern_v3]),
+    ],
+    ids=["treatment_routes_unpinned_blocks_to_v3", "control_keeps_stored_engines"],
+)
+async def test_mixed_definition_with_an_explicit_v3_block_follows_the_arm(
+    scoped_context: SkyvernContext, treatment: bool, expected: list[RunEngine]
+) -> None:
+    blocks = _mixed_v3_and_stored_v1_blocks()
+    reason = v3_ab_ineligibility_reason(blocks)
+    assert reason is None
+
+    provider = FakeExperimentationProvider({WORKFLOW_TASK_V3_AB_FLAG: treatment})
+    await resolve_arm(scoped_context, provider, workflow_run_id="wr_mixed", ineligibility_reason=reason)
+
+    assert [block.resolve_engine("wr_mixed") for block in blocks] == expected
 
 
 @pytest.mark.asyncio
@@ -644,6 +676,7 @@ async def _persisted_engine_from_execute_workflow_blocks(
     block: BaseTaskBlock | None = None,
     script: Any = None,
     code_gen: bool | None = None,
+    created_by: str | None = None,
 ) -> RunEngine:
     """Drives the real WorkflowService._execute_workflow_blocks -> _execute_single_block ->
     Block.execute_safe chain for a single eligible TaskBlock and returns the engine it persisted,
@@ -663,6 +696,7 @@ async def _persisted_engine_from_execute_workflow_blocks(
     workflow = MagicMock()
     workflow.workflow_definition = WorkflowDefinition(parameters=[], blocks=[block])
     workflow.status = workflow_status
+    workflow.created_by = created_by
 
     workflow_run = MagicMock()
     workflow_run.workflow_run_id = "wr_e2e"
@@ -796,6 +830,35 @@ async def test_execute_workflow_blocks_hands_the_resolver_the_runs_trigger_type(
     assert engine == expected_engine
 
 
+@pytest.mark.parametrize(
+    ("created_by", "expected_engine"),
+    [
+        (COPILOT_TEST_WORKFLOW_CREATOR, RunEngine.skyvern_v3),
+        ("some-user-id", RunEngine.skyvern_v1),
+    ],
+)
+@pytest.mark.asyncio
+async def test_execute_workflow_blocks_routes_a_copilot_test_copy_like_the_workflow_it_copies(
+    scoped_context: SkyvernContext,
+    monkeypatch: pytest.MonkeyPatch,
+    created_by: str,
+    expected_engine: RunEngine,
+) -> None:
+    monkeypatch.setattr(settings, "TASK_V3_CHOSEN_ENGINE_CUTOFF", CHOSEN_ENGINE_CUTOFF)
+    provider = FakeExperimentationProvider({WORKFLOW_TASK_V3_AB_FLAG: False})
+
+    engine = await _persisted_engine_from_execute_workflow_blocks(
+        monkeypatch,
+        provider,
+        workflow_status=WorkflowStatus.auto_generated,
+        billing_tier=BillingTier.ENTERPRISE,
+        first_version_created_at=_AFTER,
+        created_by=created_by,
+    )
+
+    assert engine == expected_engine
+
+
 def _eligible_mix_blocks() -> list[BaseTaskBlock]:
     return [
         _make_block(TaskBlock, label="t1"),
@@ -810,6 +873,38 @@ def _pinned_engine_blocks() -> list[BaseTaskBlock]:
         NavigationBlock, label="pinned", navigation_goal="Apply to the job", engine=RunEngine.skyvern_v2
     )
     return [eligible, pinned]
+
+
+def _explicit_v3_only_blocks() -> list[BaseTaskBlock]:
+    return [_make_block(TaskBlock, label="chosen_v3", engine=RunEngine.skyvern_v3)]
+
+
+def _explicit_v3_with_pinned_v1_blocks() -> list[BaseTaskBlock]:
+    pinned_v1 = _make_block(TaskBlock, label="pinned_v1", engine=RunEngine.skyvern_v1)
+    pinned_v1.engine_pinned = True
+    return [_make_block(TaskBlock, label="chosen_v3", engine=RunEngine.skyvern_v3), pinned_v1]
+
+
+def _explicit_v3_with_cua_blocks() -> list[BaseTaskBlock]:
+    return [
+        _make_block(TaskBlock, label="chosen_v3", engine=RunEngine.skyvern_v3),
+        _make_block(TaskBlock, label="unset"),
+        _make_block(TaskBlock, label="cua", engine=RunEngine.anthropic_cua),
+    ]
+
+
+def _explicit_v3_on_a_block_v3_cannot_run_blocks() -> list[BaseTaskBlock]:
+    return [
+        _make_block(ValidationBlock, label="dlv", complete_on_download=True, engine=RunEngine.skyvern_v3),
+        _make_block(TaskBlock, label="unset"),
+    ]
+
+
+def _agent_step_blocks() -> list[Block]:
+    agent = AgentStepBlock(
+        label="agent", output_parameter=_make_output_parameter("agent"), prompt="Find it.", data_schema={}
+    )
+    return [_make_block(TaskBlock, label="ok"), agent]
 
 
 def _unsupported_block_type_blocks() -> list[BaseTaskBlock]:
@@ -883,6 +978,12 @@ def _jinja_condition_while_loop_blocks() -> list[Block]:
     ("blocks_factory", "expected_reason"),
     [
         (_pinned_engine_blocks, V3AbIneligibleReason.pinned_engine),
+        (_mixed_v3_and_stored_v1_blocks, None),
+        (_explicit_v3_only_blocks, V3AbIneligibleReason.no_reroutable_blocks),
+        (_explicit_v3_with_pinned_v1_blocks, V3AbIneligibleReason.pinned_engine),
+        (_explicit_v3_with_cua_blocks, V3AbIneligibleReason.pinned_engine),
+        (_explicit_v3_on_a_block_v3_cannot_run_blocks, V3AbIneligibleReason.pinned_engine),
+        (_agent_step_blocks, V3AbIneligibleReason.pinned_engine),
         (_unsupported_block_type_blocks, V3AbIneligibleReason.unsupported_block),
         (_download_gated_validation_blocks, V3AbIneligibleReason.unsupported_block),
         (_totp_blocks, None),
@@ -895,6 +996,12 @@ def _jinja_condition_while_loop_blocks() -> list[Block]:
     ],
     ids=[
         "pinned_engine",
+        "explicit_v3_with_unpinned_v1_is_eligible",
+        "explicit_v3_only_has_nothing_to_reroute",
+        "explicit_v3_with_pinned_v1",
+        "explicit_v3_with_cua",
+        "explicit_v3_on_a_block_v3_cannot_run",
+        "agent_step_runs_v3_browser_work_in_both_arms",
         "unsupported_block_type",
         "unsupported_block_validation_download",
         "totp_verification_url_is_admitted",
@@ -1547,6 +1654,9 @@ async def _resolve_chosen_engine_run(
     workflow_status: WorkflowStatus = WorkflowStatus.published,
     values: dict[str, str] | None = None,
     strict_error_flags: set[str] | None = None,
+    trigger_type: WorkflowRunTriggerType | None = WorkflowRunTriggerType.api,
+    billing_tier: BillingTier = BillingTier.ENTERPRISE,
+    copilot_test_copy: bool = False,
 ) -> tuple[FakeExperimentationProvider, Any]:
     # Eligibility and the unset-engine fact are computed from the blocks by the same helpers the
     # workflow service calls, so a block-level regression in either reaches these assertions.
@@ -1562,9 +1672,11 @@ async def _resolve_chosen_engine_run(
         workflow_run_id=run_id,
         ineligibility_reason=v3_ab_ineligibility_reason(blocks),
         takes_default_engine=takes_default_engine(blocks),
-        billing_tier=BillingTier.ENTERPRISE,
+        billing_tier=billing_tier,
         first_version_created_at=born_at,
         workflow_status=workflow_status,
+        trigger_type=trigger_type,
+        copilot_test_copy=copilot_test_copy,
     )
     return provider, resolution
 
@@ -1770,6 +1882,92 @@ async def test_a_per_call_workflow_born_after_the_chosen_engine_cutoff_keeps_ab_
     assert block.resolve_engine("wr_per_call") == RunEngine.skyvern_v3
     assert resolution.log["route_reason"] == _R.flag_bucket_treatment
     resolution.birth_reads.assert_not_awaited()
+
+
+@pytest.mark.parametrize(
+    ("cutoff", "born_at", "pin_v3", "trigger_type", "billing_tier", "expected_engine", "expected_reason"),
+    [
+        (
+            CHOSEN_ENGINE_CUTOFF,
+            _AFTER,
+            True,
+            WorkflowRunTriggerType.api,
+            BillingTier.ENTERPRISE,
+            RunEngine.skyvern_v3,
+            _R.new_workflow_v3_default,
+        ),
+        (
+            CHOSEN_ENGINE_CUTOFF,
+            _AFTER,
+            False,
+            WorkflowRunTriggerType.api,
+            BillingTier.ENTERPRISE,
+            RunEngine.skyvern_v3,
+            _R.new_workflow_v3_default,
+        ),
+        (
+            CHOSEN_ENGINE_CUTOFF,
+            _BEFORE,
+            False,
+            WorkflowRunTriggerType.api,
+            BillingTier.ENTERPRISE,
+            RunEngine.skyvern_v1,
+            _R.flag_bucket_control,
+        ),
+        (
+            CHOSEN_ENGINE_CUTOFF,
+            _AFTER,
+            False,
+            WorkflowRunTriggerType.job_recipe_apply,
+            BillingTier.ENTERPRISE,
+            RunEngine.skyvern_v1,
+            _R.flag_bucket_control,
+        ),
+        (
+            None,
+            _AFTER,
+            False,
+            WorkflowRunTriggerType.api,
+            BillingTier.SELF_SERVE,
+            RunEngine.skyvern_v3,
+            _R.new_self_serve_workflow_default,
+        ),
+    ],
+    ids=["post-cutoff-v3-pin", "post-cutoff-no-pin", "pre-cutoff", "job-recipe", "self-serve-default"],
+)
+@pytest.mark.asyncio
+async def test_a_copilot_test_copy_routes_like_the_workflow_it_copies(
+    scoped_context: SkyvernContext,
+    monkeypatch: pytest.MonkeyPatch,
+    v3_default_cutoff: datetime,
+    cutoff: datetime | None,
+    born_at: datetime,
+    pin_v3: bool,
+    trigger_type: WorkflowRunTriggerType,
+    billing_tier: BillingTier,
+    expected_engine: RunEngine,
+    expected_reason: WorkflowBlockEngineRouteReason,
+) -> None:
+    unset = _make_block(NavigationBlock, label="unset", navigation_goal="Apply to the job")
+    blocks: list[BaseTaskBlock] = [unset]
+    if pin_v3:
+        blocks.append(_make_block(TaskBlock, label="chose_v3", engine=RunEngine.skyvern_v3))
+    _provider, resolution = await _resolve_chosen_engine_run(
+        scoped_context,
+        monkeypatch,
+        blocks,
+        run_id="wr_copilot_test",
+        cutoff=cutoff,
+        born_at=born_at,
+        flags={WORKFLOW_TASK_V3_AB_FLAG: False},
+        workflow_status=WorkflowStatus.auto_generated,
+        trigger_type=trigger_type,
+        billing_tier=billing_tier,
+        copilot_test_copy=True,
+    )
+
+    assert unset.resolve_engine("wr_copilot_test") == expected_engine
+    assert resolution.log["route_reason"] == expected_reason
 
 
 def test_an_omitted_engine_is_unset_and_a_stored_one_is_kept() -> None:

@@ -8,14 +8,24 @@ the shared SKY-8571 merge resolver at both the top level and inside loops.
 
 from __future__ import annotations
 
+import subprocess
+import sys
+
 import pytest
+import yaml
 from pydantic import ValidationError
 
 from skyvern.forge.sdk.workflow.service import WorkflowService
 from skyvern.forge.sdk.workflow.workflow_definition_converter import (
     convert_workflow_definition,
 )
-from skyvern.schemas.workflows import WorkflowCreateYAMLRequest
+from skyvern.schemas.workflows import (
+    ConditionalBlockYAML,
+    ForLoopBlockYAML,
+    NavigationBlockYAML,
+    WhileLoopBlockYAML,
+    WorkflowCreateYAMLRequest,
+)
 
 _MISSING = object()
 
@@ -106,6 +116,113 @@ def _validate_request(
     version: int | None | object = _MISSING,
 ) -> WorkflowCreateYAMLRequest:
     return WorkflowCreateYAMLRequest.model_validate(_request_payload(blocks, version))
+
+
+def test_malformed_nested_workflow_yaml_validation_has_bounded_time() -> None:
+    block: dict[str, object] = {"block_type": "unknown", "label": "invalid"}
+    for level in reversed(range(25)):
+        block = _for_loop_block(f"loop_{level}", [block])
+    draft = yaml.safe_dump(_request_payload([block]))
+    assert 4_000 <= len(draft.encode()) <= 6_000
+
+    script = """
+import sys
+import time
+import yaml
+from pydantic import ValidationError
+from skyvern.schemas.workflows import WorkflowCreateYAMLRequest
+
+started = time.monotonic()
+try:
+    WorkflowCreateYAMLRequest.model_validate(yaml.safe_load(sys.stdin.read()))
+except ValidationError:
+    pass
+else:
+    raise SystemExit("malformed workflow was accepted")
+if time.monotonic() - started > 5:
+    raise SystemExit("malformed workflow validation exceeded the 5-second bound")
+"""
+    try:
+        subprocess.run(
+            [sys.executable, "-c", script], input=draft, text=True, capture_output=True, check=True, timeout=15
+        )
+    except subprocess.TimeoutExpired:
+        pytest.fail("malformed nested workflow validation process exceeded the 15-second safety timeout")
+
+
+def test_nested_loops_and_conditionals_still_parse() -> None:
+    request = _validate_request(
+        [
+            _for_loop_block(
+                "outer_loop",
+                [
+                    {
+                        "block_type": "conditional",
+                        "label": "conditional",
+                        "branch_conditions": [
+                            {"criteria": {"expression": "true"}, "next_block_label": "inner_loop"},
+                            {"is_default": True},
+                        ],
+                    },
+                    {
+                        "block_type": "while_loop",
+                        "label": "inner_loop",
+                        "condition": {"expression": "true"},
+                        "loop_blocks": [_navigation_block("navigate")],
+                    },
+                ],
+            )
+        ]
+    )
+
+    outer_loop = request.workflow_definition.blocks[0]
+    assert isinstance(outer_loop, ForLoopBlockYAML)
+    conditional, inner_loop = outer_loop.loop_blocks
+    assert isinstance(conditional, ConditionalBlockYAML)
+    assert isinstance(inner_loop, WhileLoopBlockYAML)
+    assert isinstance(inner_loop.loop_blocks[0], NavigationBlockYAML)
+
+
+@pytest.mark.parametrize(
+    ("block", "error_type"),
+    [
+        ({"block_type": "not_a_block", "label": "unknown"}, "union_tag_invalid"),
+        ({"label": "missing_type"}, "union_tag_not_found"),
+    ],
+)
+def test_nested_blocks_require_a_known_block_type(block: dict[str, object], error_type: str) -> None:
+    with pytest.raises(ValidationError) as exc_info:
+        _validate_request([_for_loop_block("outer_loop", [block])])
+
+    error = exc_info.value.errors()[0]
+    assert error["type"] == error_type
+    assert "block_type" in error["msg"]
+
+
+@pytest.mark.parametrize(
+    ("block", "message"),
+    [
+        (
+            {
+                "block_type": "navigation",
+                "label": "navigate",
+                "url": "https://example.com",
+                "navigation_goal": 12,
+            },
+            "Input should be a valid string",
+        ),
+        ({"block_type": "for_loop", "label": "inner_loop"}, "Field required"),
+        (
+            {"block_type": "conditional", "label": "conditional"},
+            "Conditional blocks require at least one branch.",
+        ),
+    ],
+)
+def test_common_nested_block_errors_remain_actionable(block: dict[str, object], message: str) -> None:
+    with pytest.raises(ValidationError) as exc_info:
+        _validate_request([_for_loop_block("outer_loop", [block])])
+
+    assert message in str(exc_info.value)
 
 
 def test_omitted_version_defaults_to_one_for_sequential_workflows() -> None:

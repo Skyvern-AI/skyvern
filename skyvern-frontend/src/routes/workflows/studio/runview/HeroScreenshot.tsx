@@ -30,9 +30,11 @@ export type HeroSelection =
 export function HeroScreenshot({
   selection,
   running,
+  unavailableText = "Screenshot unavailable.",
 }: {
   selection: HeroSelection | null;
   running: boolean;
+  unavailableText?: string;
 }) {
   const [zoomed, setZoomed] = useState(false);
   const containerRef = useRef<HTMLDivElement>(null);
@@ -74,7 +76,7 @@ export function HeroScreenshot({
   if (!screenshot || screenshot.archived || imageFailed) {
     return (
       <div className="absolute inset-0 grid place-items-center text-sm text-muted-foreground">
-        Screenshot unavailable.
+        {!screenshot ? unavailableText : "Screenshot unavailable."}
       </div>
     );
   }

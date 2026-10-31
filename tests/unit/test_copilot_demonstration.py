@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import io
 import json
 from datetime import UTC, datetime, timedelta
 from types import SimpleNamespace
@@ -8,12 +9,14 @@ from typing import Any, ClassVar, Literal
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
+from fastapi import UploadFile
 
 from skyvern.exceptions import SkyvernHTTPException
 from skyvern.forge import app
 from skyvern.forge.sdk.cache.base import NoopLock
 from skyvern.forge.sdk.copilot import demonstration_recorder as recorder_module
 from skyvern.forge.sdk.copilot import demonstration_replay as replay_module
+from skyvern.forge.sdk.copilot import runtime as copilot_runtime
 from skyvern.forge.sdk.copilot.code_block_synthesis import synthesize_code_block
 from skyvern.forge.sdk.copilot.demonstration_recorder import (
     DemonstrationClaim,
@@ -39,9 +42,11 @@ from skyvern.forge.sdk.copilot.request_policy import RequestPolicy
 from skyvern.forge.sdk.copilot.secret_redaction import redact_raw_secrets_for_prompt
 from skyvern.forge.sdk.copilot.secret_scrub import register_secret_scrub_value
 from skyvern.forge.sdk.copilot.tools import _build_skyvern_mcp_overlays, get_skyvern_mcp_alias_map
+from skyvern.forge.sdk.routes import workflow_copilot as copilot_routes
 from skyvern.forge.sdk.schemas.credentials import Credential, CredentialType, CredentialVaultType
 from skyvern.forge.sdk.schemas.workflow_copilot import WorkflowCopilotDemonstrationControlRequest
-from tests.unit.copilot_test_helpers import make_copilot_ctx
+from skyvern.services import uploaded_file_service
+from tests.unit.copilot_test_helpers import make_copilot_ctx, stamping_browser_manager, stop_activity_renewer
 
 
 class _SharedCache:
@@ -1117,6 +1122,47 @@ async def test_client_upload_control_cannot_name_a_file() -> None:
 
 
 @pytest.mark.asyncio
+async def test_demonstration_upload_passes_a_restricted_type_through_to_the_recorder(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    cache = _SharedCache()
+    cache.store[demonstration_record_key("org-1", "demo-1")] = encode_demonstration_record(
+        DemonstrationRecord(
+            workflow_permanent_id="wfp-1",
+            browser_session_id="pbs-1",
+            status="recording",
+            event_count=0,
+            owner="owner-1",
+            owner_seen_at=datetime.now(UTC),
+            final_url=None,
+        )
+    )
+    cache.store[demonstration_controls_key("org-1", "demo-1")] = "[]"
+    monkeypatch.setattr(
+        copilot_routes,
+        "app",
+        SimpleNamespace(
+            CACHE=cache,
+            AGENT_FUNCTION=SimpleNamespace(enforce_folder_access=AsyncMock()),
+            SETTINGS_MANAGER=SimpleNamespace(MAX_UPLOAD_FILE_SIZE=1024 * 1024),
+        ),
+    )
+    save = AsyncMock(return_value=(SimpleNamespace(file_id="file-svg"), "https://storage.example/logo.svg"))
+    monkeypatch.setattr(uploaded_file_service, "save_uploaded_file", save)
+    svg = b'<svg xmlns="http://www.w3.org/2000/svg"><script>alert(1)</script></svg>'
+    file = UploadFile(file=io.BytesIO(svg), filename="logo.svg", size=len(svg))
+
+    result = await copilot_routes.workflow_copilot_demonstration_upload(
+        demonstration_id="demo-1", file=file, organization=SimpleNamespace(organization_id="org-1")
+    )
+
+    assert result.file_id == "file-svg"
+    assert save.await_args.kwargs["file"].file.read() == svg
+    controls = json.loads(cache.store[demonstration_controls_key("org-1", "demo-1")])
+    assert [control.get("file_id") for control in controls] == ["file-svg"]
+
+
+@pytest.mark.asyncio
 async def test_recorder_runs_controls_queued_before_stop(monkeypatch: pytest.MonkeyPatch) -> None:
     cache = _SharedCache()
     cache.store[demonstration_record_key("org-1", "demo-1")] = encode_demonstration_record(
@@ -1414,6 +1460,36 @@ async def test_resumed_recording_clears_prior_stop_reason_before_replay(monkeypa
     history = await replay_demonstration(ctx, SimpleNamespace(call_tool=AsyncMock()))  # type: ignore[arg-type]
 
     assert not any("ended because" in str(item.get("content")) for item in history)
+
+
+@pytest.mark.asyncio
+async def test_recorder_teardown_ends_renewal_for_a_browser_minted_into_its_context(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    browser_manager = stamping_browser_manager(monkeypatch)
+    monkeypatch.setattr(app, "BROWSER_MANAGER", browser_manager)
+    recorder = DemonstrationRecorder(
+        cache=_SharedCache(),  # type: ignore[arg-type]
+        organization_id="org-1",
+        workflow_permanent_id="wfp-1",
+        browser_session_id="pbs-1",
+        claim=DemonstrationClaim("demo-mint", "owner-1", False, 0),
+        stream=_Stream(),
+    )
+    renewable_at_mint: list[set[str]] = []
+
+    async def _mint_then_lose_browser(**_kwargs: str) -> None:
+        await copilot_runtime._record_minted_browser(recorder.recording_ctx, "pbs_minted")
+        renewable_at_mint.append(browser_manager._renewable_session_ids())
+
+    monkeypatch.setattr(recorder_module, "resolve_persistent_browser_state", _mint_then_lose_browser)
+
+    try:
+        await recorder.run()
+        assert renewable_at_mint == [{"pbs_minted"}]
+        assert browser_manager._renewable_session_ids() == set()
+    finally:
+        await stop_activity_renewer(browser_manager)
 
 
 @pytest.mark.asyncio

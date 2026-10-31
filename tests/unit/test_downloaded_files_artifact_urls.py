@@ -524,7 +524,7 @@ def test_content_endpoint_download_non_ascii_filename_does_not_crash_header_enco
 def test_sanitize_header_filename_strips_crlf_and_quotes_directly():
     """Direct unit test on _sanitize_header_filename so we know the function works
     even when urlparse isn't part of the chain (defense in depth)."""
-    from skyvern.forge.sdk.routes.agent_protocol import _sanitize_header_filename
+    from skyvern.utils.content_disposition import sanitize_header_filename as _sanitize_header_filename
 
     assert _sanitize_header_filename('evil"pdf') == "evilpdf"
     assert _sanitize_header_filename("hello\r\nworld.pdf") == "helloworld.pdf"
@@ -544,7 +544,7 @@ def test_content_endpoint_download_filename_preserves_question_and_hash():
 def test_sanitize_header_filename_strips_bidi_and_format_characters():
     """Unicode bidi overrides and format chars (ZWSP, RLO, ZWNBSP) enable filename
     spoofing in the browser's download UI (``invoice\\u202efdp.exe`` -> ``invoice.exe.pdf``)."""
-    from skyvern.forge.sdk.routes.agent_protocol import _sanitize_header_filename
+    from skyvern.utils.content_disposition import sanitize_header_filename as _sanitize_header_filename
 
     assert "\u202e" not in _sanitize_header_filename("invoice\u202efdp.exe")
     assert "\u200b" not in _sanitize_header_filename("stealth\u200b.pdf")
@@ -554,7 +554,7 @@ def test_sanitize_header_filename_strips_bidi_and_format_characters():
 def test_ascii_fallback_filename_preserves_stem_for_pure_unicode_names():
     """Pure non-ASCII names (e.g. CJK, emoji) must not reduce to a bare ``.pdf`` hidden
     dotfile after the NFKD strip; fall back to a ``download`` stem instead."""
-    from skyvern.forge.sdk.routes.agent_protocol import _ascii_fallback_filename
+    from skyvern.utils.content_disposition import ascii_fallback_filename as _ascii_fallback_filename
 
     assert _ascii_fallback_filename("文档.pdf") == "download.pdf"
     assert _ascii_fallback_filename("🎉.pdf") == "download.pdf"
@@ -564,7 +564,7 @@ def test_ascii_fallback_filename_preserves_stem_for_pure_unicode_names():
 
 def test_sanitize_header_filename_strips_control_characters():
     """NUL/DEL/C1 control chars are valid Latin-1 bytes but violate RFC 7230 header syntax."""
-    from skyvern.forge.sdk.routes.agent_protocol import _sanitize_header_filename
+    from skyvern.utils.content_disposition import sanitize_header_filename as _sanitize_header_filename
 
     assert "\x00" not in _sanitize_header_filename("evil\x00.pdf")
     assert "\x7f" not in _sanitize_header_filename("evil\x7f.pdf")
@@ -824,7 +824,7 @@ async def test_retry_downloads_preserve_attempt_objects_and_rows(
     async def get_object_info(uri: str):
         return object_info[uri]
 
-    async def sign_urls(uris: list[str]):
+    async def sign_urls(uris: list[str], **_: object):
         return [f"https://storage.example{urlparse(uri).path}?signature=test" for uri in uris]
 
     async def find(*, uri: str, **kwargs):
@@ -1343,7 +1343,7 @@ async def test_partial_bytes_are_neither_published_nor_returned(tmp_path, monkey
     setattr(
         storage.async_client,
         signing,
-        AsyncMock(side_effect=lambda uris: ["https://storage.example/file" for _ in uris]),
+        AsyncMock(side_effect=lambda uris, **_: ["https://storage.example/file" for _ in uris]),
     )
     monkeypatch.setattr(
         manager,
@@ -1366,3 +1366,72 @@ async def test_partial_bytes_are_neither_published_nor_returned(tmp_path, monkey
     infos = await storage.get_downloaded_files(organization_id="o_1", run_id=run_id)
     assert [info.filename for info in infos] == ["extensionless"]
     assert (directory / "unconfirmed.crdownload").read_bytes() == b"partial"
+
+
+@pytest.mark.asyncio
+async def test_substitute_artifact_urls_awaits_only_container_children() -> None:
+    service = WorkflowService()
+    value = {"rows": [{"id": 1, "name": "a"}, {"tags": ["x", "y"], "ok": True}], "note": "n", "empty": None}
+    real = service._substitute_artifact_urls
+    calls: list[object] = []
+
+    async def counting(child, *args, **kwargs):
+        calls.append(child)
+        return await real(child, *args, **kwargs)
+
+    with patch.object(service, "_substitute_artifact_urls", side_effect=counting):
+        result = await service._substitute_artifact_urls(value, {}, {}, "wr_1", None)
+
+    assert result is value
+    assert value == {"rows": [{"id": 1, "name": "a"}, {"tags": ["x", "y"], "ok": True}], "note": "n", "empty": None}
+    assert all(isinstance(child, (dict, list)) for child in calls)
+    assert len(calls) == 5
+
+
+@pytest.mark.asyncio
+async def test_substitute_artifact_urls_reassigns_every_child_through_container_setitem() -> None:
+    writes: list[tuple[str, object]] = []
+
+    class RecordingDict(dict):
+        def __setitem__(self, key, item):
+            writes.append(("dict", key))
+            super().__setitem__(key, item)
+
+    class RecordingList(list):
+        def __setitem__(self, index, item):
+            writes.append(("list", index))
+            super().__setitem__(index, item)
+
+    class RejectingDict(dict):
+        def __setitem__(self, key, item):
+            if key == "b":
+                raise KeyError(key)
+            super().__setitem__(key, item)
+
+    value = RecordingDict(a=1, b=RecordingList([1, "x", {"task_screenshot_artifact_ids": ["a1"]}]), c=None)
+    await WorkflowService()._substitute_artifact_urls(value, {"a1": "https://example.com/a1"}, {}, "wr_1", None)
+
+    assert writes == [("dict", "a"), ("list", 0), ("list", 1), ("list", 2), ("dict", "b"), ("dict", "c")]
+    assert value["b"][2]["task_screenshots"] == ["https://example.com/a1"]
+
+    rejecting = RejectingDict()
+    dict.update(rejecting, a=[1], b=2, c={"task_screenshot_artifact_ids": ["a1"]})
+    with pytest.raises(KeyError):
+        await WorkflowService()._substitute_artifact_urls(rejecting, {"a1": "https://example.com/a1"}, {}, "wr_1", None)
+    assert "task_screenshots" not in rejecting["c"]
+
+
+@pytest.mark.asyncio
+async def test_substitute_artifact_urls_keeps_legacy_screenshot_lookup_beside_scalar_siblings() -> None:
+    service = WorkflowService()
+    value = {
+        "outputs": [7, {"task_id": "tsk_1", "task_screenshots": ["stale"], "extracted_information": {"k": "v"}}, "s"]
+    }
+
+    with patch.object(service, "get_recent_task_screenshot_urls", AsyncMock(return_value=["fresh"])) as lookup:
+        await service._substitute_artifact_urls(value, {}, {}, "wr_1", "o_1")
+
+    lookup.assert_awaited_once_with(organization_id="o_1", task_id="tsk_1")
+    assert value == {
+        "outputs": [7, {"task_id": "tsk_1", "task_screenshots": ["fresh"], "extracted_information": {"k": "v"}}, "s"]
+    }

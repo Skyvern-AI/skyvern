@@ -15,7 +15,7 @@ from unittest.mock import AsyncMock, MagicMock
 import httpx
 import litellm
 import pytest
-from agents import ItemHelpers, ModelSettings, RunContextWrapper, function_tool
+from agents import Agent, ItemHelpers, ModelSettings, RunContextWrapper, Runner, function_tool
 from agents.extensions.models.litellm_model import LitellmModel
 from agents.items import TResponseInputItem
 from agents.mcp import MCPServer, MCPUtil
@@ -23,17 +23,20 @@ from agents.models.interface import ModelTracing
 from litellm.integrations.anthropic_cache_control_hook import AnthropicCacheControlHook
 from litellm.litellm_core_utils.fallback_utils import async_completion_with_fallbacks
 from litellm.llms.vertex_ai.gemini.transformation import _gemini_convert_messages_with_history
-from litellm.types.llms.openai import GenericEvent, ResponsesAPIResponse
+from litellm.types.llms.openai import GenericEvent
+from litellm.types.llms.openai import ResponseCompletedEvent as LiteLLMResponseCompletedEvent
+from litellm.types.llms.openai import ResponsesAPIResponse
 from litellm.types.utils import Delta
 from litellm.types.utils import ModelResponse as LiteLLMModelResponse
 from litellm.types.utils import ModelResponseStream, StreamingChoices, Usage
 from mcp.types import Tool as MCPTool
 from openai import AsyncStream
 from openai.types.chat import ChatCompletionChunk
-from openai.types.responses import ResponseFunctionToolCall
+from openai.types.responses import ResponseCompletedEvent, ResponseFunctionToolCall, ResponseReasoningItem
 from structlog.testing import capture_logs
 
 from skyvern.cli.mcp_tools.blocks import skyvern_block_schema
+from skyvern.forge.sdk.api.llm.config_registry import LLMConfigRegistry
 from skyvern.forge.sdk.copilot import agent as copilot_agent_module
 from skyvern.forge.sdk.copilot import cache_envelope as cache_envelope_module
 from skyvern.forge.sdk.copilot import enforcement as enforcement_module
@@ -50,6 +53,7 @@ from skyvern.forge.sdk.copilot.enforcement import (
 )
 from skyvern.forge.sdk.copilot.llm_errors import is_retriable_llm_error
 from skyvern.forge.sdk.copilot.mcp_adapter import _copilot_to_call_tool_result
+from skyvern.forge.sdk.copilot.model_resolver import resolve_model_config
 from skyvern.forge.sdk.copilot.model_telemetry import (
     CopilotLitellmModel,
     _model_call_telemetry_scope,
@@ -66,6 +70,7 @@ from skyvern.forge.sdk.copilot.pending_operation import (
 from skyvern.forge.sdk.copilot.recoverable_failure import build_recoverable_failure
 from skyvern.forge.sdk.copilot.session_factory import copilot_session_input_callback
 from skyvern.forge.sdk.schemas.workflow_copilot import WorkflowCopilotChatRequest
+from skyvern.schemas.llm import LLMConfig
 
 pytestmark = pytest.mark.usefixtures("gpt56_litellm_models")
 
@@ -126,13 +131,14 @@ def _completion() -> LiteLLMModelResponse:
     )
 
 
-def _responses_completion() -> ResponsesAPIResponse:
+def _responses_completion(*output: dict[str, Any]) -> ResponsesAPIResponse:
     return ResponsesAPIResponse(
         id="resp-test",
         created_at=1,
         model="gpt-5.6-sol",
         object="response",
-        output=[
+        output=list(output)
+        or [
             {
                 "id": "msg-test",
                 "type": "message",
@@ -483,7 +489,7 @@ async def test_stream_capture_preserves_events_order_and_backpressure(monkeypatc
     assert adapter_events == base_events
     assert [event.type for event in adapter_events] == [event.type for event in base_events]
     assert telemetry_seen[-1] == (9, 47)
-    assert streams[1].closed == streams[0].closed is False
+    assert streams[1].closed is streams[0].closed is True
     assert current_model_call_telemetry() is None
 
 
@@ -553,6 +559,95 @@ async def test_explicit_responses_stream_captures_raw_cache_write_before_convers
     assert requests[0]["prompt_cache_key"].startswith("copilot:")
     assert telemetry_seen[-1] == ("explicit", 31, 47)
     assert current_model_call_telemetry() is None
+
+
+_SEALED_REASONING = {"id": "rs_1", "type": "reasoning", "summary": [], "encrypted_content": "sealed"}
+_LOOKUP_CALL = {
+    "id": "fc_1",
+    "type": "function_call",
+    "call_id": "call_1",
+    "name": "_lookup_number",
+    "arguments": '{"name": "abc"}',
+    "status": "completed",
+}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("fallbacks", "sent_back"),
+    [
+        ([], True),
+        ([{"model": "gpt-5.6-sol", "service_tier": "flex"}], True),
+        (["gpt-5.6-terra"], False),
+    ],
+)
+async def test_gpt_reasoning_goes_back_before_its_tool_call_when_every_hop_can_read_it(
+    monkeypatch: pytest.MonkeyPatch, fallbacks: list[Any], sent_back: bool
+) -> None:
+    requests: list[dict[str, Any]] = []
+    replies = [_responses_completion(_SEALED_REASONING, _LOOKUP_CALL), _responses_completion()]
+
+    async def fake_aresponses(**kwargs: object) -> ResponsesAPIResponse:
+        requests.append(kwargs)
+        return replies[len(requests) - 1]
+
+    monkeypatch.setattr("litellm.aresponses", fake_aresponses)
+    monkeypatch.setitem(
+        LLMConfigRegistry._configs,
+        "GPT56_SOL_TEST",
+        LLMConfig("gpt-5.6-sol", [], supports_vision=False, add_assistant_prefix=False, reasoning_effort="medium"),
+    )
+    # Copilot's own RunConfig, so its input filter runs between the two calls.
+    _, run_config, _, _ = resolve_model_config(None, llm_key_override="GPT56_SOL_TEST")
+    agent = Agent(
+        name="copilot",
+        instructions=CacheableSystemInstructions("stable", "dynamic", cache_namespace="wcc-test"),
+        model_settings=ModelSettings(extra_args={"fallbacks": fallbacks}),
+        tools=[_lookup_number],
+    )
+
+    await Runner.run(agent, "Return 42", run_config=run_config)
+
+    reasoning = [("reasoning", "sealed")] if sent_back else []
+    assert [(item["type"], item.get("encrypted_content")) for item in requests[1]["input"]] == [
+        ("message", None),
+        ("message", None),
+        *reasoning,
+        ("function_call", None),
+        ("function_call_output", None),
+    ]
+
+
+@pytest.mark.asyncio
+async def test_a_streamed_gpt_turn_keeps_the_providers_encrypted_reasoning(monkeypatch: pytest.MonkeyPatch) -> None:
+    async def raw_stream() -> AsyncIterator[Any]:
+        yield LiteLLMResponseCompletedEvent(
+            type="response.completed", response=_responses_completion(_SEALED_REASONING, _LOOKUP_CALL)
+        )
+
+    async def fake_aresponses(**kwargs: object) -> AsyncIterator[Any]:
+        return raw_stream()
+
+    monkeypatch.setattr("litellm.aresponses", fake_aresponses)
+    model = CopilotLitellmModel(model="gpt-5.6-sol", next_model_call_index=lambda: 1)
+
+    outputs = [
+        event.response.output
+        async for event in model.stream_response(
+            system_instructions=CacheableSystemInstructions("stable", "dynamic", cache_namespace="wcc-test"),
+            input=[{"role": "user", "content": "Return 42"}],
+            model_settings=ModelSettings(include_usage=True, extra_args=_GPT_REASONING),
+            tools=[_lookup_number],
+            output_schema=None,
+            handoffs=[],
+            tracing=ModelTracing.DISABLED,
+        )
+        if isinstance(event, ResponseCompletedEvent)
+    ]
+
+    (output,) = outputs
+    assert isinstance(output[0], ResponseReasoningItem)
+    assert output[0].encrypted_content == "sealed"
 
 
 @pytest.mark.asyncio
@@ -1155,7 +1250,7 @@ async def test_stream_cancellation_resets_context_without_changing_stream_owners
     await events.aclose()
 
     assert current_model_call_telemetry() is None
-    assert stream.closed is False
+    assert stream.closed is True
 
 
 @pytest.mark.parametrize(
@@ -2574,7 +2669,8 @@ async def test_explicit_responses_request_forwards_every_setting_the_sdk_sends_t
         )
 
     assert set(sent) == {"chat", "responses"}
-    chat = {key: value for key, value in sent["chat"].items() if value is not None}
+    # acompletion pops this LiteLLM-internal flag; aresponses routes to its MCP gateway only for "mcp"-type tools.
+    chat = {key: value for key, value in sent["chat"].items() if value is not None and key != "_skip_mcp_handler"}
     responses = sent["responses"]
     for key, value in chat.items():
         name = _RESPONSES_KWARG_NAMES.get(key, key)

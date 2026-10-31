@@ -1413,6 +1413,15 @@ class InvalidElementForTextInput(SkyvernException):
         super().__init__(message)
 
 
+class InputElementCoveredByUntypeableElement(SkyvernException):
+    def __init__(self, element_id: str, blocking_element_id: str, blocking_tag_name: str):
+        super().__init__(
+            f"The element with id={element_id} is covered by the {blocking_tag_name} element with "
+            f"id={blocking_element_id}, which doesn't support text input. Dismiss or answer the pop-up "
+            f"that owns id={blocking_element_id} first, then type into id={element_id} again."
+        )
+
+
 class FailedToClearInputField(SkyvernException):
     def __init__(self, element_id: str, tag_name: str):
         super().__init__(
@@ -1510,6 +1519,15 @@ class EmptySelect(SkyvernException):
         super().__init__(
             f"nothing is selected, try to select again. element_id={element_id}",
         )
+
+
+RUN_FINALIZED_ELSEWHERE_REASON = "Another server already finalized this run"
+
+
+class ChildStartRefusedAfterLeaseLoss(SkyvernException):
+    def __init__(self, task_id: str) -> None:
+        self.task_id = task_id
+        super().__init__(RUN_FINALIZED_ELSEWHERE_REASON)
 
 
 class TaskAlreadyCanceled(SkyvernHTTPException):
@@ -2197,6 +2215,19 @@ class PDFParsingError(SkyvernException):
         self.pdfplumber_error = pdfplumber_error
         super().__init__(
             f"Failed to parse PDF '{file_identifier}'. pypdf error: {pypdf_error}; pdfplumber error: {pdfplumber_error}"
+        )
+
+
+class SplitPdfTooManyPages(SkyvernException):
+    """Raised when a PDF has more pages than the split planner can excerpt within its input budget."""
+
+    def __init__(self, total_pages: int, max_pages: int, min_per_page_tokens: int) -> None:
+        self.total_pages = total_pages
+        self.max_pages = max_pages
+        super().__init__(
+            f"Cannot plan a split of a {total_pages}-page PDF: the planner reads at most {max_pages} pages, so that "
+            f"every page keeps the {min_per_page_tokens} tokens of text it needs to be assigned to a document. "
+            "Split the source PDF into smaller files first."
         )
 
 

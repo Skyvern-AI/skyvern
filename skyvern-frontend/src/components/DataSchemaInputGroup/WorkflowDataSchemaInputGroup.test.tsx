@@ -62,7 +62,11 @@ afterEach(() => {
   );
 });
 
-function renderGroup(readOnly: boolean, workflowId: string | null = "w") {
+function renderGroup(
+  readOnly: boolean,
+  workflowId: string | null = "w",
+  { value = '{"type":"object"}', hideEnableToggle = false } = {},
+) {
   const client = new QueryClient({
     defaultOptions: { queries: { retry: false }, mutations: { retry: false } },
   });
@@ -71,10 +75,11 @@ function renderGroup(readOnly: boolean, workflowId: string | null = "w") {
     <QueryClientProvider client={client}>
       <WorkflowScopeContext.Provider value={{ workflowId, readOnly }}>
         <WorkflowDataSchemaInputGroup
-          value={'{"type":"object"}'}
+          value={value}
           onChange={onChange}
           suggestionContext={{}}
           exampleValue={{}}
+          hideEnableToggle={hideEnableToggle}
         />
       </WorkflowScopeContext.Provider>
     </QueryClientProvider>,
@@ -134,6 +139,15 @@ describe("WorkflowDataSchemaInputGroup in a read-only scope", () => {
     expect(
       screen.getByTestId("schema-editor").getAttribute("data-readonly"),
     ).toBe("true");
+  });
+});
+
+describe("WorkflowDataSchemaInputGroup without the enable toggle", () => {
+  test("keeps the editor and Generate with AI when the schema text is null", async () => {
+    renderGroup(false, "w", { value: "null", hideEnableToggle: true });
+    expect(screen.queryByRole("checkbox")).toBeNull();
+    expect(screen.getByTestId("schema-editor").textContent).toBe("null");
+    expect(await generateSchema()).not.toBeNull();
   });
 });
 

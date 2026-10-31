@@ -11,7 +11,7 @@ import structlog
 from skyvern.config import settings
 from skyvern.forge import app
 from skyvern.forge.sdk.artifact.models import ArtifactType
-from skyvern.forge.sdk.executor.run_liveness import run_lease_lost
+from skyvern.forge.sdk.executor.run_liveness import run_lease_final_write_blocked, run_write_authority
 from skyvern.forge.sdk.models import StepStatus
 from skyvern.forge.sdk.schemas.tasks import TaskStatus
 from skyvern.forge.sdk.workflow.models.code_block_recorder import (
@@ -26,7 +26,7 @@ from skyvern.schemas.steps import AgentStepOutput
 from skyvern.webeye.action_deadline import cancellation_pending
 from skyvern.webeye.actions.actions import Action, ActionStatus, ActionType
 from skyvern.webeye.browser_diagnostics import schedule_control_endpoint_diagnostics
-from skyvern.webeye.utils.page import ScreenshotMode, SkyvernFrame
+from skyvern.webeye.utils.page import ScreenshotMode, SkyvernFrame, screenshot_failure_outcome
 
 if TYPE_CHECKING:
     from playwright.async_api import Page
@@ -276,11 +276,13 @@ class CodeBlockActionRecording:
                 animations="allow",
                 record_health=False,
             )
-        except Exception:
+        except Exception as e:
+            # A fixed label, never the exception's class name: user code can raise a class named after a parameter.
             LOG.warning(
                 "Code block screenshot capture failed",
                 workflow_run_block_id=self._workflow_run_block_id,
                 page_closed=_page_closed(self._page),
+                outcome=screenshot_failure_outcome(e, self._engine_selection),
             )
             # Only a failed capture says anything about the browser; a database error above
             # would otherwise emit probe fields describing a browser that is perfectly fine.
@@ -369,14 +371,14 @@ class CodeBlockActionRecording:
         self._finalized = True
         try:
             status = TaskStatus.completed if success else TaskStatus.failed
-            lease_lost = await run_lease_lost(self._workflow_run_id)
+            final_write_blocked = await run_lease_final_write_blocked(self._workflow_run_id)
             task = await app.DATABASE.tasks.update_task(
                 task_id=self._task.task_id,
                 organization_id=self._organization_id,
                 status=status,
-                keep_final_status=lease_lost,
+                keep_final_status=final_write_blocked,
             )
-            if self._step is not None and (not lease_lost or task.status == status):
+            if self._step is not None and (not final_write_blocked or task.status == status):
                 await app.DATABASE.tasks.update_step(
                     task_id=self._task.task_id,
                     step_id=self._step.step_id,
@@ -384,6 +386,7 @@ class CodeBlockActionRecording:
                     output=AgentStepOutput(action_results=[]) if success else None,
                     is_last=True,
                     organization_id=self._organization_id,
+                    write_authority_for_run=run_write_authority,
                 )
         except Exception:
             LOG.warning(

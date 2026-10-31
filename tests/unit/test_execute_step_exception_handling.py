@@ -62,7 +62,9 @@ from skyvern.forge.sdk.models import Step, StepStatus
 from skyvern.forge.sdk.schemas.persistent_browser_sessions import PersistentBrowserSession
 from skyvern.forge.sdk.schemas.tasks import Task, TaskStatus
 from skyvern.webeye.browser_errors import BrowserTargetClosedError
+from skyvern.webeye.browser_state import BROWSER_CONNECTION_LOST_USER_MESSAGE
 from tests.unit._external_cdp_fakes import external_session_row
+from tests.unit._task_block_fakes import lost_browser_state, run_bound_browser_state
 from tests.unit.helpers import make_organization, make_step, make_task
 
 # ``clean_up_task``'s real signature defaults; handlers that omit these kwargs get them.
@@ -104,12 +106,13 @@ async def _drive_execute_step(
     *,
     fail_task_result: bool = True,
     browser_session_id: str | None = None,
+    workflow_run_id: str | None = None,
 ) -> ExecuteStepOutcome:
     """Run ``execute_step`` so that ``exc`` is raised at the first in-``try`` await."""
     agent = ForgeAgent()
     now = datetime.now(UTC)
     organization = make_organization(now)
-    task = make_task(now, organization)
+    task = make_task(now, organization, workflow_run_id=workflow_run_id)
     step = make_step(now, task, step_id="step-0", status=StepStatus.running, order=0, output=None)
 
     fail_task_mock = AsyncMock(return_value=fail_task_result)
@@ -906,3 +909,29 @@ async def test_a_lost_registered_browser_fails_the_step_with_the_registrations_f
         assert reason == get_user_facing_exception_message(exc)
     else:
         assert ("is no longer usable" if session == "external_closed" else "no longer reachable") in reason
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("workflow_run_id", [None, "wr_1"], ids=["standalone_task", "workflow_run"])
+@pytest.mark.parametrize("browser_lost", [True, False], ids=["lost", "healthy"])
+async def test_a_mid_run_browser_loss_names_itself_in_the_task_failure_reason(
+    monkeypatch: pytest.MonkeyPatch, workflow_run_id: str | None, browser_lost: bool
+) -> None:
+    """A run that lost its browser says so, instead of reporting the page as merely missing.
+
+    ``initialize_execution_state`` raises the already-gone browser before ``execute_step`` binds its
+    own ``browser_state``, so the handler has to read the latched loss off the run id. Without the
+    distinction the customer cannot tell a lost browser from an ordinary missing page, and retries a
+    run whose earlier submissions may already have gone through.
+    """
+    state = lost_browser_state("wr_1") if browser_lost else run_bound_browser_state("wr_1")[0]
+    monkeypatch.setattr(
+        "skyvern.forge.agent.app.BROWSER_MANAGER",
+        MagicMock(get_for_workflow_run=MagicMock(return_value=state), get_for_task=MagicMock(return_value=state)),
+    )
+    exc = MissingBrowserStatePage(task_id="task-123", workflow_run_id=workflow_run_id)
+
+    outcome = await _drive_execute_step(monkeypatch, exc, workflow_run_id=workflow_run_id)
+
+    reason = outcome.fail_task.await_args.args[2]
+    assert reason == (BROWSER_CONNECTION_LOST_USER_MESSAGE if browser_lost else get_user_facing_exception_message(exc))

@@ -25,6 +25,8 @@ PROVIDER_DOWNLOAD_WAIT_SECONDS = 30.0
 POLL_INTERVAL_SECONDS = 1.0
 # Lets a downloadWillBegin raised by the action that just returned reach the monitor's counter.
 EVENT_ADMISSION_GRACE_SECONDS = 0.25
+# Give provider cleanup time to finish before a second cancellation interrupts it.
+PROVIDER_POLL_CLEANUP_GRACE_SECONDS = 2.0
 
 
 class _DownloadMonitor(Protocol):
@@ -178,15 +180,25 @@ class ProviderDownloadRecovery:
 
 
 async def _join(poll: asyncio.Future[None]) -> None:
-    """Cancel ``poll`` and wait for its own (cooperative, not deadline-bound) cleanup before returning.
-    A cancellation of the caller while waiting is re-raised once the poll is done."""
+    """Cancel ``poll`` and wait for its cleanup before returning."""
     poll.cancel()
+    cleanup_deadline = time.monotonic() + PROVIDER_POLL_CLEANUP_GRACE_SECONDS
+    cleanup_grace_expired = False
     cancellation: asyncio.CancelledError | None = None
     while not poll.done():
         try:
-            await asyncio.wait({poll})
+            remaining = cleanup_deadline - time.monotonic()
+            if cleanup_grace_expired:
+                await asyncio.wait({poll}, timeout=POLL_INTERVAL_SECONDS)
+            else:
+                await asyncio.wait({poll}, timeout=max(0.0, remaining))
         except asyncio.CancelledError as caught:
             cancellation = caught
+            if cleanup_grace_expired:
+                poll.cancel()
+        if not poll.done() and (cleanup_grace_expired or time.monotonic() >= cleanup_deadline):
+            cleanup_grace_expired = True
+            poll.cancel()
     if not poll.cancelled() and (exc := poll.exception()) is not None:
         # A provider error can embed a secret-bearing presigned URL, so only its type is logged.
         LOG.warning("Task V3 provider download poll failed", error_type=type(exc).__name__)
