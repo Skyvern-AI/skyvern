@@ -23,6 +23,7 @@ from boto3.s3.transfer import TransferConfig
 from botocore.exceptions import ClientError, ProfileNotFound
 
 from skyvern.config import settings
+from skyvern.utils.content_disposition import build_attachment_disposition
 
 if TYPE_CHECKING:
     from types_boto3_batch.client import BatchClient
@@ -1450,18 +1451,33 @@ class AsyncAWSClient:
                 LOG.exception("S3 metadata retrieval failed", uri=uri)
             return None
 
-    async def create_presigned_urls(self, uris: list[str], expires_in: int | None = None) -> list[str] | None:
+    async def create_presigned_urls(
+        self,
+        uris: list[str],
+        expires_in: int | None = None,
+        attachment_filenames: list[str | None] | None = None,
+    ) -> list[str] | None:
+        """With ``attachment_filenames`` (one per uri, None for the key basename), the URLs force an
+        attachment download as octet-stream so stored user content never renders on the bucket origin."""
         # https://boto3.amazonaws.com/v1/documentation/api/latest/reference/services/s3/client/generate_presigned_url.html
         expiration = settings.PRESIGNED_URL_EXPIRATION if expires_in is None else expires_in
+        if attachment_filenames is not None and len(attachment_filenames) != len(uris):
+            raise ValueError("attachment_filenames must have one entry per uri")
 
         async def _op() -> list[str]:
             presigned_urls = []
             async with self._s3_client() as client:
-                for uri in uris:
+                for index, uri in enumerate(uris):
                     parsed_uri = S3Uri(uri)
+                    params = {"Bucket": parsed_uri.bucket, "Key": parsed_uri.key}
+                    if attachment_filenames is not None:
+                        filename = attachment_filenames[index] or os.path.basename(parsed_uri.key)
+                        # The agent's file fetcher takes the extension from this filename before Content-Type.
+                        params["ResponseContentDisposition"] = build_attachment_disposition(filename)
+                        params["ResponseContentType"] = "application/octet-stream"
                     url = await client.generate_presigned_url(
                         "get_object",
-                        Params={"Bucket": parsed_uri.bucket, "Key": parsed_uri.key},
+                        Params=params,
                         ExpiresIn=expiration,
                     )
                     presigned_urls.append(url)

@@ -100,6 +100,7 @@ from skyvern.forge.sdk.copilot.hooks import CopilotRunHooks
 from skyvern.forge.sdk.copilot.human_input_wait import HumanInputWait, pause_human_input
 from skyvern.forge.sdk.copilot.narration import NarratorState, build_tool_call_activity
 from skyvern.forge.sdk.copilot.request_policy import (
+    CREDENTIAL_BINDING_FACTS,
     RequestPolicy,
     _seed_prior_approved_credentials,
     _seed_proposed_credential,
@@ -2620,9 +2621,15 @@ async def test_a_credential_with_no_authenticator_raises_an_update_card_naming_i
     ctx = _tool_ctx(monkeypatch, cache)
     credential = wire_credential_vault(monkeypatch, PasswordCredential(username="u", password="p", totp=None))
     app.CREDENTIAL_VAULT_SERVICES[CredentialVaultType.SKYVERN].get_credential_item.side_effect = [
-        SimpleNamespace(name="authtest simple", credential=PasswordCredential(username="u", password="p", totp=None)),
         SimpleNamespace(
-            name="authtest simple", credential=PasswordCredential(username="u", password="p", totp=totp_after_save)
+            name="authtest simple",
+            credential=PasswordCredential(username="u", password="p", totp=None),
+            login_sites=None,
+        ),
+        SimpleNamespace(
+            name="authtest simple",
+            credential=PasswordCredential(username="u", password="p", totp=totp_after_save),
+            login_sites=None,
         ),
     ]
     ctx.request_policy.resolved_credentials = [credential]
@@ -3380,6 +3387,30 @@ async def test_a_site_rejected_credential_gets_an_update_card_after_a_pick_even_
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("vault_type", [CredentialVaultType.ONEPASSWORD, CredentialVaultType.BITWARDEN_CONNECTED])
+@pytest.mark.parametrize("rejected_by_site", [True, False])
+async def test_a_login_imported_from_an_external_vault_gets_no_update_card(
+    monkeypatch: pytest.MonkeyPatch, vault_type: CredentialVaultType, rejected_by_site: bool
+) -> None:
+    cache = _FakeCache()
+    ctx = _tool_ctx(monkeypatch, cache)
+    credential = wire_credential_vault(
+        monkeypatch, PasswordCredential(username="u", password="p", totp=None), vault_type=vault_type
+    )
+    ctx.request_policy.resolved_credentials = [credential]
+    ctx.latest_diagnosis_repair_contract = _repair_contract(
+        RepairNextAction.ASK, DiagnosisFailureType.MISSING_CREDENTIAL_OR_INIT
+    )
+    ctx.stream.send = AsyncMock(side_effect=_answer_each_card(cache, [("skip", None)]))
+
+    result = await _call_ask_tool(ctx, credential_id="cred_1", rejected_by_site=rejected_by_site)
+
+    assert result["ok"] is False
+    assert "updates it in" in result["error"]
+    assert _sent_cards(ctx) == []
+
+
+@pytest.mark.asyncio
 async def test_a_saved_workflow_binding_the_chat_never_named_can_open_the_update_card(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -3393,7 +3424,174 @@ async def test_a_saved_workflow_binding_the_chat_never_named_can_open_the_update
     update = await _call_ask_tool(ctx, credential_id="cred_1", rejected_by_site=True)
 
     assert update["status"] == "updated"
+    assert "next" not in update and update["detail"].endswith(CREDENTIAL_BINDING_FACTS["saved_workflow"])
     assert [card.reason for card in _sent_cards(ctx)] == ["credential_rejected_by_site"]
+
+
+_UPDATE_ASK_FORBIDDEN = ("do not ask again", "keep it as the workflow's credential", "keeps its saved sign-in")
+
+
+def _update_ask_binding_setup(policy: RequestPolicy, credential: Credential, binding_case: str) -> None:
+    login_url = "https://portal.example.com/login"
+    if binding_case == "saved_workflow":
+        policy.persisted_workflow_credential_ids = ["cred_1"]
+        policy.auto_bound_credentials = [credential]
+        policy.live_page_admitted_urls = {"cred_1": login_url}
+        return
+    policy.resolved_credentials = [credential]
+    policy.live_page_admitted_urls = {"cred_1": login_url}
+    if binding_case in ("matched_by_saved_url", "named"):
+        policy.auto_bound_credentials = [credential]
+    if binding_case == "named":
+        policy.current_turn_named_credential_ids = {"cred_1"}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("binding_case", "binding"),
+    [
+        ("saved_workflow", "saved_workflow"),
+        ("matched_by_saved_url", "matched_by_saved_url"),
+        ("named", "not_bound"),
+        ("picked", "not_bound"),
+    ],
+)
+@pytest.mark.parametrize(
+    ("rejected_by_site", "answer", "expected_status", "expected_detail"),
+    [
+        (True, ("skip", None), "skipped", "authtest simple was not updated. {binding}"),
+        (True, ("unanswered", None), "unanswered", "authtest simple was not updated. {binding}"),
+        (False, ("skip", None), "skipped", "authtest simple was not updated. It still has no authenticator. {binding}"),
+        (
+            False,
+            ("unanswered", None),
+            "unanswered",
+            "authtest simple was not updated. It still has no authenticator. {binding}",
+        ),
+        (
+            False,
+            ("connected", "cred_1"),
+            "saved_without_authenticator",
+            "authtest simple was saved but still has no authenticator. {binding}",
+        ),
+    ],
+    ids=["rejected_skip", "rejected_timeout", "totp_skip", "totp_timeout", "totp_saved_without_authenticator"],
+)
+async def test_an_update_card_left_unchanged_reports_how_the_credential_is_bound(
+    monkeypatch: pytest.MonkeyPatch,
+    binding_case: str,
+    binding: str,
+    rejected_by_site: bool,
+    answer: _CardAnswer,
+    expected_status: str,
+    expected_detail: str,
+) -> None:
+    cache = _FakeCache()
+    ctx = _tool_ctx(monkeypatch, cache)
+    ctx.browser_session_id = "pbs_debug"
+    ctx.copilot_config = CopilotConfig(credential_pause_enabled=True, credential_pause_timeout_seconds=1)
+    credential = wire_credential_vault(monkeypatch, PasswordCredential(username="u", password="p", totp=None))
+    _update_ask_binding_setup(ctx.request_policy, credential, binding_case)
+    ctx.stream.send = AsyncMock(side_effect=_answer_each_card(cache, [answer]))
+
+    result = await _call_ask_tool(ctx, credential_id="cred_1", rejected_by_site=rejected_by_site)
+
+    [card] = _sent_cards(ctx)
+    assert (card.credential_binding, card.sign_in_browser_session_id) == (binding, "pbs_debug")
+    assert result["status"] == expected_status
+    assert result["detail"] == expected_detail.format(binding=CREDENTIAL_BINDING_FACTS[binding])
+    serialized = json.dumps(result).lower()
+    assert not any(phrase in serialized for phrase in _UPDATE_ASK_FORBIDDEN)
+    assert (ctx.credential_pause_outcome, ctx.credential_pause_receipts) == (None, [])
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("origin_arm", "binding"),
+    [
+        ("live_page_admitted", "matched_by_saved_url"),
+        ("executed_credential_fill", "not_bound"),
+        (None, "not_bound"),
+    ],
+)
+async def test_an_update_card_on_a_carried_login_claims_a_url_match_only_when_a_page_matched_it(
+    monkeypatch: pytest.MonkeyPatch,
+    origin_arm: Literal["live_page_admitted", "executed_credential_fill"] | None,
+    binding: str,
+) -> None:
+    cache = _FakeCache()
+    ctx = _tool_ctx(monkeypatch, cache)
+    ctx.browser_session_id = "pbs_debug"
+    ctx.copilot_config = CopilotConfig(credential_pause_enabled=True, credential_pause_timeout_seconds=1)
+    wire_credential_vault(monkeypatch, PasswordCredential(username="u", password="p", totp=None))
+    earlier = StructuredContext(
+        proposed_credential=ProposedCredential(
+            credential_id="cred_1", admitted_url="https://portal.example.com/login", origin_arm=origin_arm
+        )
+    )
+    await _seed_proposed_credential(
+        ctx.request_policy, organization_id="org-1", global_llm_context=earlier.to_json_str()
+    )
+    ctx.stream.send = AsyncMock(side_effect=_answer_each_card(cache, [("skip", None)]))
+
+    result = await _call_ask_tool(ctx, credential_id="cred_1", rejected_by_site=True)
+
+    [card] = _sent_cards(ctx)
+    assert card.credential_binding == binding
+    assert result["detail"] == f"authtest simple was not updated. {CREDENTIAL_BINDING_FACTS[binding]}"
+
+
+@pytest.mark.asyncio
+async def test_a_registration_card_offers_no_sign_in_of_your_own(monkeypatch: pytest.MonkeyPatch) -> None:
+    cache = _FakeCache()
+    ctx = _tool_ctx(monkeypatch, cache)
+    ctx.browser_session_id = "pbs_debug"
+    ctx.client_supports_credential_generation = True
+    _registration_database(monkeypatch, _make_credential("cred_new", "Portal test account"))
+    ctx.stream.send = AsyncMock(side_effect=_answer_each_card(cache, [("skip", None)]))
+
+    await _call_ask_tool(ctx, registration=_REGISTRATION)
+
+    [card] = _sent_cards(ctx)
+    assert card.registration is not None
+    assert (card.sign_in_browser_session_id, card.credential_binding) == (None, None)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("rejected_by_site", [True, False])
+async def test_signing_in_on_an_update_card_answers_the_turn_like_a_pick_card(
+    monkeypatch: pytest.MonkeyPatch, rejected_by_site: bool
+) -> None:
+    cache = _FakeCache()
+    ctx = _tool_ctx(monkeypatch, cache)
+    ctx.browser_session_id = "pbs_debug"
+    credential = wire_credential_vault(monkeypatch, PasswordCredential(username="u", password="p", totp=None))
+    ctx.request_policy.resolved_credentials = [credential]
+    ctx.latest_diagnosis_repair_contract = _repair_contract(
+        RepairNextAction.ASK, DiagnosisFailureType.MISSING_CREDENTIAL_OR_INIT
+    )
+    ctx.stream.send = AsyncMock(side_effect=_answer_each_card(cache, [("signed_in", None)]))
+
+    result = await _call_ask_tool(ctx, credential_id="cred_1", rejected_by_site=rejected_by_site)
+
+    assert (result["status"], result["browser_profile_id"], result["credential_provided"]) == (
+        "signed_in",
+        "bp_signed_in",
+        False,
+    )
+    assert result["detail"] == (
+        f"{credential_pause_module.signed_in_facts(_SIGNED_IN_PORTAL)} authtest simple was not updated. "
+        f"{CREDENTIAL_BINDING_FACTS['not_bound']}"
+    )
+    assert ctx.request_policy.credential_pause_signed_in_profile_id == "bp_signed_in"
+    assert ctx.request_policy.resolved_credentials == [credential]
+    assert ctx.credential_pause_outcome == "signed_in"
+    assert [receipt["outcome"] for receipt in ctx.credential_pause_receipts] == ["signed_in"]
+    assert ctx.credential_pause_receipts[0]["browserProfileId"] == "bp_signed_in"
+    assert [resolved.outcome for resolved in _sent_resolutions(ctx)] == ["signed_in"]
+    assert credential_pause_module.credential_pause_reason(ctx) == "missing_credential_run_failure"
+    assert await maybe_credential_pause(ctx, _fake_result(), ctx.stream, ctx.copilot_config) is None
+    assert len(_sent_cards(ctx)) == 1
 
 
 _TERMINAL_SENTINEL = "Sentinel-Pw-7731"

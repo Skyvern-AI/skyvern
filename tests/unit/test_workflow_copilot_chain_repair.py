@@ -1,16 +1,19 @@
 """Tests for the copilot next_block_label chain repair logic.
 
-Ensures that _repair_next_block_label_chain correctly stitches orphaned blocks
-back into the reachable workflow chain when the LLM produces disconnected paths.
+Ensures that _repair_next_block_label_chain stitches orphaned blocks back into the
+reachable chain, without chaining the blocks a conditional's branches reach.
 """
 
 from skyvern.forge.sdk.copilot.workflow_yaml import (
     _break_cycles,
     _collect_reachable,
     _find_terminal_label,
+    _normalize_copilot_yaml,
     _order_orphaned_blocks,
     _repair_next_block_label_chain,
 )
+from skyvern.forge.sdk.workflow.service import WorkflowService
+from skyvern.forge.sdk.workflow.workflow_definition_converter import convert_workflow_definition
 from skyvern.schemas.workflows import (
     BranchConditionYAML,
     BranchCriteriaYAML,
@@ -23,6 +26,10 @@ from skyvern.schemas.workflows import (
 
 def _nav(label: str, next_label: str | None = None) -> NavigationBlockYAML:
     return NavigationBlockYAML(label=label, next_block_label=next_label, navigation_goal="test")
+
+
+def _loop(label: str, next_label: str | None, loop_blocks: list) -> ForLoopBlockYAML:
+    return ForLoopBlockYAML(label=label, next_block_label=next_label, loop_blocks=loop_blocks)
 
 
 class TestRepairChain:
@@ -142,36 +149,50 @@ class TestRepairChain:
 
 
 class TestConditionalBlocks:
-    """Tests for chain repair with conditional blocks."""
+    """Blocks a conditional's branches reach keep their places; the rest of the list is stitched as usual."""
 
-    def test_conditional_branch_targets_not_orphaned(self) -> None:
-        """Blocks reachable via conditional branches are not orphaned."""
-        cond = ConditionalBlockYAML(
-            label="cond",
-            next_block_label="merge_point",
-            branch_conditions=[
-                BranchConditionYAML(
-                    criteria=BranchCriteriaYAML(expression="{{ true }}"),
-                    next_block_label="branch_a",
-                ),
-                BranchConditionYAML(is_default=True, next_block_label="branch_b"),
-            ],
+    def test_conditional_workflow_links_the_blocks_before_it_and_saves(self) -> None:
+        workflow_yaml = """
+title: Release check
+workflow_definition:
+  version: 2
+  parameters: []
+  blocks:
+  - block_type: agent_step
+    label: find_release
+    prompt: Find the latest release.
+  - block_type: code
+    label: check_recency
+    code: "result = {'is_recent': True}"
+  - block_type: conditional
+    label: route
+    branch_conditions:
+    - criteria:
+        expression: "{{ check_recency_output.is_recent }}"
+      next_block_label: download_release
+    - is_default: true
+      next_block_label: read_notice
+  - block_type: file_download
+    label: download_release
+    url: https://example.com/releases
+    navigation_goal: Download the release archive.
+    next_block_label: null
+  - block_type: agent_step
+    label: read_notice
+    prompt: Read the README notice.
+    next_block_label: null
+"""
+        request = _normalize_copilot_yaml(workflow_yaml)
+        blocks = request.workflow_definition.blocks
+        assert [block.next_block_label for block in blocks] == ["check_recency", "route", None, None, None]
+        route = blocks[2]
+        assert isinstance(route, ConditionalBlockYAML)
+        assert [branch.next_block_label for branch in route.branch_conditions] == ["download_release", "read_notice"]
+        WorkflowService().validate_workflow_block_graph(
+            convert_workflow_definition(request.workflow_definition, workflow_id="wf_test")
         )
-        blocks = [
-            cond,
-            _nav("branch_a", "merge_point"),
-            _nav("branch_b", "merge_point"),
-            _nav("merge_point"),
-        ]
-        _repair_next_block_label_chain(blocks)
-        # All blocks should already be reachable; no stitching needed.
-        assert blocks[0].next_block_label == "merge_point"
-        assert blocks[1].next_block_label == "merge_point"
-        assert blocks[2].next_block_label == "merge_point"
-        assert blocks[3].next_block_label is None
 
-    def test_conditional_with_orphaned_block(self) -> None:
-        """An extra block not reachable from any branch or main chain gets stitched."""
+    def test_orphan_after_conditional_becomes_its_merge_point(self) -> None:
         cond = ConditionalBlockYAML(
             label="cond",
             next_block_label=None,
@@ -185,10 +206,63 @@ class TestConditionalBlocks:
         )
         blocks = [cond, _nav("branch_a"), _nav("orphan")]
         _repair_next_block_label_chain(blocks)
-        # The conditional's main chain ends at cond (next_block_label was None).
-        # orphan should be stitched after cond.
-        assert blocks[0].next_block_label == "orphan"
-        assert blocks[2].next_block_label is None
+        assert [block.next_block_label for block in blocks] == ["orphan", None, None]
+
+    def test_connected_graph_whose_start_is_not_listed_first_is_left_alone(self) -> None:
+        route = ConditionalBlockYAML(
+            label="route",
+            branch_conditions=[
+                BranchConditionYAML(
+                    criteria=BranchCriteriaYAML(expression="{{ true }}"), next_block_label="download_release"
+                ),
+                BranchConditionYAML(is_default=True, next_block_label="read_notice"),
+            ],
+        )
+        blocks = [_nav("download_release"), _nav("read_notice"), _nav("check_recency", "route"), route]
+        _repair_next_block_label_chain(blocks)
+        assert [block.next_block_label for block in blocks] == [None, None, "route", None]
+
+    def test_conditional_keeps_its_merge_point_when_linked(self) -> None:
+        cond = ConditionalBlockYAML(
+            label="cond",
+            next_block_label="merge",
+            branch_conditions=[
+                BranchConditionYAML(criteria=BranchCriteriaYAML(expression="{{ true }}"), next_block_label="a"),
+                BranchConditionYAML(is_default=True, next_block_label="b"),
+            ],
+        )
+        blocks = [_nav("start"), cond, _nav("a", "merge"), _nav("b"), _nav("merge")]
+        _repair_next_block_label_chain(blocks)
+        assert [block.next_block_label for block in blocks] == ["cond", "merge", "merge", None, None]
+
+    def test_branch_cycle_not_broken(self) -> None:
+        cond = ConditionalBlockYAML(
+            label="cond",
+            next_block_label=None,
+            branch_conditions=[
+                BranchConditionYAML(
+                    criteria=BranchCriteriaYAML(expression="{{ true }}"),
+                    next_block_label="a",
+                ),
+                BranchConditionYAML(is_default=True, next_block_label="b"),
+            ],
+        )
+        blocks = [_nav("a", "cond"), cond, _nav("b", "a")]
+        _repair_next_block_label_chain(blocks)
+        assert blocks[0].next_block_label == "cond"
+        assert blocks[2].next_block_label == "a"
+        assert [branch.next_block_label for branch in cond.branch_conditions] == ["a", "b"]
+
+    def test_loop_body_still_repaired_beside_conditional(self) -> None:
+        cond = ConditionalBlockYAML(
+            label="cond",
+            branch_conditions=[BranchConditionYAML(is_default=True, next_block_label="loop")],
+        )
+        inner = [_nav("l_a"), _nav("l_b")]
+        blocks = [cond, _loop("loop", None, inner), _nav("orphan")]
+        _repair_next_block_label_chain(blocks)
+        assert inner[0].next_block_label == "l_b"
+        assert blocks[1].next_block_label is None
 
 
 class TestCollectReachable:
@@ -287,116 +361,6 @@ class TestBreakCycles:
         assert label_to_block["b"].next_block_label == "c"
         assert label_to_block["c"].next_block_label is None
 
-    def test_cycle_through_conditional_branch(self) -> None:
-        """Conditional branch leads to a chain that cycles back to an ancestor.
-
-        fetch_token -> cond (branch -> nav -> reporting -> fetch_token)
-        The cycle through the branch should be broken at reporting.
-        """
-        cond = ConditionalBlockYAML(
-            label="cond",
-            next_block_label=None,
-            branch_conditions=[
-                BranchConditionYAML(
-                    criteria=BranchCriteriaYAML(expression="{{ true }}"),
-                    next_block_label="nav",
-                ),
-                BranchConditionYAML(is_default=True, next_block_label="nav"),
-            ],
-        )
-        blocks = [_nav("fetch_token", "cond"), cond, _nav("nav", "reporting"), _nav("reporting", "fetch_token")]
-        label_to_block = {b.label: b for b in blocks}
-        assert _break_cycles("fetch_token", label_to_block) is True
-        # The back-edge reporting -> fetch_token should be broken
-        assert label_to_block["reporting"].next_block_label is None
-        # Rest of chain intact
-        assert label_to_block["fetch_token"].next_block_label == "cond"
-        assert label_to_block["nav"].next_block_label == "reporting"
-
-    def test_multiple_branch_cycles_all_broken(self) -> None:
-        """Multiple conditional branches each cycle back — all should be broken.
-
-        Reproduces the AllianceHealth pattern:
-        fetch_token -> cond (branch1 -> b1 -> fetch_token,
-                             branch2 -> b2 -> fetch_token,
-                             default -> b3 -> fetch_token)
-        """
-        cond = ConditionalBlockYAML(
-            label="cond",
-            next_block_label=None,
-            branch_conditions=[
-                BranchConditionYAML(
-                    criteria=BranchCriteriaYAML(expression="{{ x == 1 }}"),
-                    next_block_label="b1",
-                ),
-                BranchConditionYAML(
-                    criteria=BranchCriteriaYAML(expression="{{ x == 0 }}"),
-                    next_block_label="b2",
-                ),
-                BranchConditionYAML(is_default=True, next_block_label="b3"),
-            ],
-        )
-        blocks = [
-            _nav("fetch_token", "cond"),
-            cond,
-            _nav("b1", "fetch_token"),
-            _nav("b2", "fetch_token"),
-            _nav("b3", "fetch_token"),
-        ]
-        label_to_block = {b.label: b for b in blocks}
-        assert _break_cycles("fetch_token", label_to_block) is True
-        # All three back-edges should be broken
-        assert label_to_block["b1"].next_block_label is None
-        assert label_to_block["b2"].next_block_label is None
-        assert label_to_block["b3"].next_block_label is None
-
-    def test_branch_directly_cycles_to_ancestor(self) -> None:
-        """A branch's next_block_label directly points to an ancestor.
-
-        A -> cond (branch -> A): the branch itself is the back-edge.
-        """
-        cond = ConditionalBlockYAML(
-            label="cond",
-            next_block_label=None,
-            branch_conditions=[
-                BranchConditionYAML(
-                    criteria=BranchCriteriaYAML(expression="{{ true }}"),
-                    next_block_label="a",
-                ),
-                BranchConditionYAML(is_default=True, next_block_label="a"),
-            ],
-        )
-        blocks = [_nav("a", "cond"), cond]
-        label_to_block = {b.label: b for b in blocks}
-        assert _break_cycles("a", label_to_block) is True
-        # The branch's next_block_label should be broken
-        assert cond.branch_conditions[0].next_block_label is None
-
-    def test_conditional_merge_point_not_broken(self) -> None:
-        """Branches converging on a merge point should NOT be treated as cycles.
-
-        A -> cond (branch1 -> B -> D, branch2 -> C -> D, main -> D)
-        D is a merge point, not a cycle target.
-        """
-        cond = ConditionalBlockYAML(
-            label="cond",
-            next_block_label="d",
-            branch_conditions=[
-                BranchConditionYAML(
-                    criteria=BranchCriteriaYAML(expression="{{ true }}"),
-                    next_block_label="b",
-                ),
-                BranchConditionYAML(is_default=True, next_block_label="c"),
-            ],
-        )
-        blocks = [_nav("a", "cond"), cond, _nav("b", "d"), _nav("c", "d"), _nav("d")]
-        label_to_block = {b.label: b for b in blocks}
-        assert _break_cycles("a", label_to_block) is False
-        # All pointers intact
-        assert label_to_block["b"].next_block_label == "d"
-        assert label_to_block["c"].next_block_label == "d"
-        assert cond.next_block_label == "d"
-
 
 class TestRepairChainWithCycles:
     """Tests for _repair_next_block_label_chain handling circular references."""
@@ -426,10 +390,6 @@ class TestRepairChainWithCycles:
         assert blocks[2].next_block_label == "x"
         assert blocks[3].next_block_label == "y"
         assert blocks[4].next_block_label is None
-
-
-def _loop(label: str, next_label: str | None, loop_blocks: list) -> ForLoopBlockYAML:
-    return ForLoopBlockYAML(label=label, next_block_label=next_label, loop_blocks=loop_blocks)
 
 
 class TestNestedForLoopRepair:

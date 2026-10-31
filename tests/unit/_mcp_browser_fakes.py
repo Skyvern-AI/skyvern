@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 from collections import deque
 from collections.abc import Awaitable, Callable
+from datetime import UTC, datetime
 from types import SimpleNamespace
 from typing import TYPE_CHECKING, Any
 from unittest.mock import AsyncMock, MagicMock
@@ -16,7 +17,9 @@ from skyvern.cli.mcp_tools import browser as mcp_browser
 from skyvern.cli.mcp_tools import tabs as mcp_tabs
 from skyvern.core.script_generations.skyvern_page import SkyvernPage
 from skyvern.exceptions import StaleFrameSelectionError
+from skyvern.forge.sdk.copilot.mcp_adapter import ReportedPageCrash
 from skyvern.webeye import action_deadline
+from skyvern.webeye.browser_state import PageCrashRecord
 
 if TYPE_CHECKING:
     from skyvern.forge.sdk.copilot.runtime import AgentContext
@@ -86,6 +89,28 @@ def seed_request_failures(ctx: AgentContext, session_id: str, *entries: RequestF
     for entry in entries:
         log.append(entry)
     return log
+
+
+SEEDED_CRASH_AT = datetime(2026, 10, 28, 20, 12, 45, tzinfo=UTC)
+
+
+def page_crash_entry(*, url: str = "https://app.test/form", reopened: bool = True) -> ReportedPageCrash:
+    return ReportedPageCrash(
+        crashed_at=SEEDED_CRASH_AT.isoformat(timespec="seconds"), cause="page_crash", reopened=reopened, url=url
+    )
+
+
+def crash_free_browser_state(**attrs: Any) -> SimpleNamespace:
+    return SimpleNamespace(page_crash_records=(), **attrs)
+
+
+def seed_page_crash(
+    ctx: AgentContext, session_id: str, *, url: str = "https://app.test/form?draft=1", reopened: bool = True
+) -> PageCrashRecord:
+    record = PageCrashRecord(crashed_at=SEEDED_CRASH_AT, crashed_url=url, cause="page_crash", reopened=reopened)
+    records = ctx.page_crash_records_by_browser_session.get(session_id, ())
+    ctx.page_crash_records_by_browser_session[session_id] = [*records, record]
+    return record
 
 
 def logged_request_failures(log: RequestFailureLog) -> list[RequestFailure]:

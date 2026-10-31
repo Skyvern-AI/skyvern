@@ -113,7 +113,7 @@ async def _status_response_from_captured_output(
             Session=released_session_stub(),
             workflows=SimpleNamespace(get_workflow_for_workflow_run=AsyncMock(return_value=workflow)),
             observer=SimpleNamespace(get_task_v2_by_workflow_run_id=AsyncMock(return_value=None)),
-            tasks=SimpleNamespace(get_tasks_by_workflow_run_id=AsyncMock(return_value=[])),
+            tasks=SimpleNamespace(get_tasks_for_workflow_run_status=AsyncMock(return_value=[])),
             workflow_runs=SimpleNamespace(
                 get_workflow_run_parameters=AsyncMock(return_value=[]),
                 get_workflow_run_block_errors=AsyncMock(

@@ -81,6 +81,7 @@ from skyvern.forge.sdk.services.request_principal import (
     BearerIdentityStatus,
     RequestPrincipal,
     get_request_principal,
+    human_user_id,
 )
 from skyvern.forge.sdk.trace import traced
 from skyvern.forge.sdk.workflow.models.block import BaseTaskBlock, BlockTypeVar
@@ -107,6 +108,7 @@ if TYPE_CHECKING:
 
     from skyvern.forge.sdk.db.enums import WorkflowRunTriggerType
     from skyvern.forge.sdk.db.models import FolderModel
+    from skyvern.forge.sdk.integrations.catalog import AccountsById, IntegrationEntry
     from skyvern.forge.sdk.schemas.totp_codes import OTPType
     from skyvern.forge.sdk.services.credential.credential_vault_service import CredentialVaultService
     from skyvern.forge.sdk.workflow.code_block_authorized_files import (
@@ -1290,6 +1292,12 @@ class AgentFunction:
     async def is_onepassword_instance_default_allowed(self, organization_id: str) -> bool:
         return True
 
+    def get_cloud_integration_entries(self) -> list[IntegrationEntry]:
+        return []
+
+    async def get_cloud_integration_accounts(self, organization_id: str) -> AccountsById:
+        return {}
+
     def onepassword_instance_default_policy_mode(self) -> str:
         return "unrestricted"
 
@@ -1381,6 +1389,10 @@ class AgentFunction:
 
     def get_standard_tier_twin_llm_key(self, llm_key: str | None) -> str | None:
         """Return a standard-tier twin for the given LLM key, or None if no twin exists."""
+        return None
+
+    def get_task_v3_llm_route_treatment_key(self, llm_key: str) -> str | None:
+        """Return the registered key a Task V3 run on ``llm_key`` uses in the LLM route arm's treatment, or None."""
         return None
 
     def get_fallback_llm_key(self, llm_key: str | None) -> str | None:
@@ -1825,6 +1837,9 @@ class AgentFunction:
         """
         return None
 
+    async def is_mcp_oauth_token_signed_out(self, user_id: str, issued_at: float) -> bool:
+        return False
+
     def build_mcp_auth_db(self, database_string: str, *, debug_enabled: bool) -> Any:
         """Return the DB instance used by MCP auth middleware.
 
@@ -2175,6 +2190,12 @@ class AgentFunction:
         """Billing seam for a code block's container task; called only after a successful execution."""
         return
 
+    async def post_agent_step_execution(
+        self, organization_id: str | None, workflow_run_id: str, workflow_run_block_id: str, decisions: int
+    ) -> None:
+        """Billing seam for an agent block's own tool calls, called once per block run; must not raise."""
+        return
+
     async def wait_for_challenge_solver(self, page: Page) -> None:
         """Wait for a cloud-managed challenge solver if one is attached to the page."""
         return None
@@ -2408,28 +2429,53 @@ class AgentFunction:
         connection_id: str | None = None,
         initiating_user_id: str | None = None,
         custody_mode: str | None = None,
+        *,
+        scope_profile: str | None = None,
+        principal: RequestPrincipal | None = None,
+        force_refresh: bool = False,
     ) -> str | None:
+        del force_refresh  # The SDK implementation has no access-token cache.
+        powerbi_profile = microsoft_oauth_service.MICROSOFT_OAUTH_SCOPE_PROFILE_POWERBI_DATASET_READ
+        if scope_profile not in (
+            None,
+            microsoft_oauth_service.MICROSOFT_OAUTH_SCOPE_PROFILE_OUTLOOK_MAIL,
+            powerbi_profile,
+        ):
+            return None
+        is_powerbi = scope_profile == powerbi_profile
+        authenticated_user_id = human_user_id(principal, organization_id) if is_powerbi else None
+        if is_powerbi and (
+            authenticated_user_id is None or (connection_id is not None and connection_id != credential_id)
+        ):
+            return None
+        scopes_to_require = list(required_scopes or [])
+        if is_powerbi and not microsoft_oauth_service.has_required_scopes(scopes_to_require, ["Dataset.Read.All"]):
+            scopes_to_require.append("Dataset.Read.All")
         try:
             secrets = await microsoft_oauth_service.load_credential_secrets(
                 organization_id=organization_id,
                 credential_id=credential_id,
+                scope_profile=scope_profile,
+                authenticated_user_id=authenticated_user_id,
             )
-            if required_scopes and not microsoft_oauth_service.has_required_scopes(secrets.scopes, required_scopes):
+            if scopes_to_require and not microsoft_oauth_service.has_required_scopes(secrets.scopes, scopes_to_require):
                 LOG.info(
                     "Microsoft OAuth credential missing required scopes",
                     organization_id=organization_id,
                     credential_id=credential_id,
-                    required_scopes=required_scopes,
+                    required_scopes=scopes_to_require,
                 )
                 return None
             return await microsoft_oauth_service.refresh_and_rotate(
                 organization_id=organization_id,
                 credential_id=credential_id,
                 credential_secrets=secrets,
-                connection_id=connection_id,
-                initiating_user_id=initiating_user_id,
-                custody_mode=custody_mode,
+                connection_id=None if is_powerbi else connection_id,
+                initiating_user_id=None if is_powerbi else initiating_user_id,
+                custody_mode=None if is_powerbi else custody_mode,
             )
+        except microsoft_oauth_service.MicrosoftOAuthAccessDenied:
+            return None
         except Exception:
             LOG.exception(
                 "Failed to get Microsoft credentials",
@@ -2437,6 +2483,23 @@ class AgentFunction:
                 credential_id=credential_id,
             )
             return None
+
+    async def execute_powerbi_query_for_run(
+        self,
+        *,
+        organization_id: str,
+        workflow_run_id: str,
+        workflow_run_block_id: str,
+        connection_id: str,
+        dataset_id: str,
+        query: str,
+        max_rows: int = 1_000,
+    ) -> list[dict[str, object]]:
+        """Power BI reads require Cloud's persisted-run identity and audited execution facade."""
+        raise NotImplementedError("Power BI workflow queries are only supported in Skyvern Cloud")
+
+    async def ensure_powerbi_queries_available(self) -> None:
+        raise NotImplementedError("Power BI workflow queries are only supported in Skyvern Cloud")
 
     async def get_google_workspace_credentials(
         self,
@@ -3080,6 +3143,11 @@ class AgentFunction:
 
     async def copilot_agent_step_enabled(self, organization_id: str | None) -> bool:
         del organization_id
+        return False
+
+    async def workflow_doc_editor_enabled(self, organization_id: str, user_id: str | None) -> bool:
+        """Whether this person has the Doc editor, which decides if notes reach Copilot and PDF import."""
+        del organization_id, user_id
         return False
 
     async def _resolve_copilot_requested_code_block_mode(

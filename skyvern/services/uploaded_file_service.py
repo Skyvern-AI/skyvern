@@ -10,8 +10,11 @@ from __future__ import annotations
 
 import asyncio
 import os
+import re
+import zipfile
 from datetime import datetime, timedelta, timezone
 
+import filetype
 import structlog
 from fastapi import HTTPException, UploadFile
 
@@ -111,6 +114,230 @@ async def validate_file_size(file: UploadFile, *, max_size_bytes: int | None = N
         raise HTTPException(
             status_code=413,
             detail=(f"File size exceeds the maximum allowed size ({max_size / 1024 / 1024} MB)"),
+        )
+    return file
+
+
+_SNIFF_BYTES = 8192
+
+# Anything the OS or a browser would execute; unknown and bespoke extensions are allowed on purpose.
+DENIED_UPLOAD_EXTENSIONS = frozenset(
+    {
+        "app", "apk", "bat", "cmd", "com", "cpl", "deb", "dll", "dmg", "docm", "exe", "hta", "htm", "html", "jar",
+        "js", "jse", "lnk", "msc", "mht", "mhtml", "msi", "php", "phtml", "pif", "pkg", "pptm", "ps1", "py", "reg",
+        "rpm", "scf", "scr", "sh", "shtml", "svg", "svgz", "url", "vbe", "vbs", "wsf", "wsh", "xht", "xhtml", "xlsm",
+    }
+)  # fmt: skip
+
+_DENIED_SNIFFED_MIME_TYPES = frozenset(
+    {
+        "application/x-msdownload",
+        "application/x-executable",
+        "application/x-deb",
+        "application/x-rpm",
+        "application/x-google-chrome-extension",
+        "application/x-shockwave-flash",
+    }
+)
+_MACHO_MAGICS = (
+    b"\xfe\xed\xfa\xce",
+    b"\xfe\xed\xfa\xcf",
+    b"\xce\xfa\xed\xfe",
+    b"\xcf\xfa\xed\xfe",
+    b"\xca\xfe\xba\xbe",
+)
+# Browsers render past leading comments, XML declarations and processing instructions.
+_MARKUP_PREAMBLE_RE = re.compile(rb"^(?:\s+|<\?.*?\?>|<!--.*?-->)*", re.DOTALL)
+# A preamble longer than the sniff window is read on up to this bound before the upload is refused.
+_MARKUP_PREAMBLE_LIMIT = 1 << 20
+_UNICODE_BOMS = (
+    (b"\xff\xfe\x00\x00", "utf-32-le"),
+    (b"\x00\x00\xfe\xff", "utf-32-be"),
+    (b"\xff\xfe", "utf-16-le"),
+    (b"\xfe\xff", "utf-16-be"),
+    (b"\xef\xbb\xbf", "utf-8"),
+)
+_BROWSER_MARKUP_RE = re.compile(rb"^<(!doctype\s+(html|svg)|html|head|body|script|iframe|svg)[\s>/]", re.IGNORECASE)
+_ZIP_MAGICS = (b"PK\x03\x04", b"PK\x05\x06")
+# Password-protected OOXML documents are stored as OLE compound files, not zips.
+_OLE_MAGIC = b"\xd0\xcf\x11\xe0\xa1\xb1\x1a\xe1"
+_OLE_DIRECTORY_ENTRY_SIZE = 128
+# Compound-file directory entries are 128-byte aligned: a NUL-terminated UTF-16 name, then its byte length at 64.
+_OLE_VBA_PROJECT_ENTRY = "_VBA_PROJECT\0".encode("utf-16-le")
+_OLE_ENCRYPTED_PACKAGE_ENTRY = "EncryptedPackage\0".encode("utf-16-le")
+_OLE_SCAN_CHUNK = 1 << 20
+_WINDOWS_SHORTCUT_MAGIC = b"L\x00\x00\x00\x01\x14\x02\x00\x00\x00\x00\x00\xc0\x00\x00\x00\x00\x00\x00F"
+_OOXML_EXTENSIONS = frozenset({"docx", "xlsx", "pptx"})
+_IMAGE_EXTENSIONS = frozenset({"png", "jpg", "jpeg", "gif", "webp"})
+
+
+def _upload_extension(filename: str | None) -> str:
+    # Windows drops trailing dots and spaces, so "x.exe. " opens as an .exe.
+    name = os.path.basename(filename or "").rstrip(" .")
+    return os.path.splitext(name)[1].lstrip(".").lower()
+
+
+def _is_pe(head: bytes) -> bool:
+    if not head.startswith(b"MZ"):
+        return False
+    if len(head) >= 0x40:
+        pe_offset = int.from_bytes(head[0x3C:0x40], "little")
+        if head[pe_offset : pe_offset + 4] == b"PE\x00\x00":
+            return True
+    # A PE header past the sniff window still leaves NUL padding in the DOS stub; text never has NULs.
+    return b"\x00" in head
+
+
+def _markup_text(head: bytes) -> bytes:
+    # Browsers honor a UTF-16 or UTF-32 BOM, so markup is matched after decoding it.
+    for bom, encoding in _UNICODE_BOMS:
+        if head.startswith(bom):
+            return head[len(bom) :].decode(encoding, errors="ignore").encode("utf-8").lstrip()
+    return head.lstrip()
+
+
+def _markup_preamble_unfinished(head: bytes) -> bool:
+    rest = _MARKUP_PREAMBLE_RE.sub(b"", _markup_text(head), count=1)
+    # A tag cut at the window edge (``<scr``, ``<!-``) only matches once the rest of it is read.
+    return not rest or rest.startswith((b"<!--", b"<?")) or (rest.startswith(b"<") and b">" not in rest)
+
+
+def _dangerous_content_reason(head: bytes, extension: str) -> str | None:
+    if _is_pe(head):
+        return "Windows executable content"
+    if head.startswith(b"\x7fELF") or head.startswith(_MACHO_MAGICS):
+        return "executable content"
+    if head.startswith(_WINDOWS_SHORTCUT_MAGIC):
+        return "Windows shortcut"
+    sniffed = filetype.guess(head)
+    if sniffed is not None and sniffed.mime in _DENIED_SNIFFED_MIME_TYPES:
+        return f"{sniffed.mime} content"
+    text = _markup_text(head)
+    if text.startswith(b"#!"):
+        return "script content"
+    if _BROWSER_MARKUP_RE.match(_MARKUP_PREAMBLE_RE.sub(b"", text, count=1)):
+        return "HTML or SVG content"
+    lowered = head.lower()
+    # Saved emails share the MHTML layout but are not rendered as pages.
+    if extension not in {"eml", "msg"} and b"mime-version:" in lowered and b"multipart/related" in lowered:
+        return "MHTML content"
+    return None
+
+
+def _zip_member_reason(file: UploadFile, extension: str) -> str | None:
+    # ZipFile reads only the central directory here, never member data.
+    try:
+        with zipfile.ZipFile(file.file) as archive:
+            names = archive.namelist()
+    except (zipfile.BadZipFile, OSError, ValueError):
+        return f"content does not match .{extension}" if extension in _OOXML_EXTENSIONS else None
+    finally:
+        file.file.seek(0)
+    if "[Content_Types].xml" in names and any(name.lower().endswith("vbaproject.bin") for name in names):
+        return "Office document with macros"
+    if "AndroidManifest.xml" in names and "classes.dex" in names:
+        return "Android package"
+    if "META-INF/MANIFEST.MF" in names and any(name.endswith(".class") for name in names):
+        return "Java archive"
+    return None
+
+
+def _ole_directory_entries(file: UploadFile, names: tuple[bytes, ...]) -> set[bytes]:
+    found: set[bytes] = set()
+    offset = 0
+    try:
+        file.file.seek(0)
+        while chunk := file.file.read(_OLE_SCAN_CHUNK):
+            for name in names:
+                start = 0
+                while (index := chunk.find(name, start)) != -1:
+                    aligned = (offset + index) % _OLE_DIRECTORY_ENTRY_SIZE == 0
+                    if aligned and chunk[index + 64 : index + 66] == len(name).to_bytes(2, "little"):
+                        found.add(name)
+                    start = index + 1
+            offset += len(chunk)
+    finally:
+        file.file.seek(0)
+    return found
+
+
+def _ole_reason(file: UploadFile, extension: str) -> str | None:
+    # Legacy .doc/.xls keep VBA in a _VBA_PROJECT stream; an OLE file named as OOXML must be an encrypted package.
+    entries = _ole_directory_entries(file, (_OLE_VBA_PROJECT_ENTRY, _OLE_ENCRYPTED_PACKAGE_ENTRY))
+    if _OLE_VBA_PROJECT_ENTRY in entries:
+        return "Office document with macros"
+    if extension in _OOXML_EXTENSIONS and _OLE_ENCRYPTED_PACKAGE_ENTRY not in entries:
+        return f"content does not match .{extension}"
+    return None
+
+
+def _declared_type_mismatch(head: bytes, extension: str) -> bool:
+    if extension == "pdf":
+        # Readers accept a PDF header anywhere in the first KiB.
+        return b"%PDF-" not in head[:1024]
+    if extension == "zip":
+        return not head.startswith(_ZIP_MAGICS)
+    if extension in _OOXML_EXTENSIONS:
+        return not head.startswith(_ZIP_MAGICS + (_OLE_MAGIC,))
+    if extension in _IMAGE_EXTENSIONS:
+        return not filetype.is_image(head)
+    return False
+
+
+def _upload_type_rejection_reason(file: UploadFile) -> str | None:
+    extension = _upload_extension(file.filename)
+    if extension in DENIED_UPLOAD_EXTENSIONS:
+        return f".{extension} files are not allowed"
+    try:
+        head = file.file.read(_SNIFF_BYTES)
+        if len(head) == _SNIFF_BYTES and _markup_preamble_unfinished(head):
+            head += file.file.read(_MARKUP_PREAMBLE_LIMIT - _SNIFF_BYTES)
+            if len(head) == _MARKUP_PREAMBLE_LIMIT and _markup_preamble_unfinished(head):
+                return "markup preamble too long to inspect"
+    finally:
+        file.file.seek(0)
+    if reason := _dangerous_content_reason(head, extension):
+        return reason
+    if _declared_type_mismatch(head, extension):
+        return f"content does not match .{extension}"
+    if head.startswith(_ZIP_MAGICS):
+        return _zip_member_reason(file, extension)
+    if head.startswith(_OLE_MAGIC):
+        return _ole_reason(file, extension)
+    return None
+
+
+def validate_upload_type(file: UploadFile) -> UploadFile:
+    """Reject executables, installers, scripts, browser-renderable markup and mislabeled documents.
+
+    A denylist rather than an allowlist: customers upload niche formats that must keep working.
+    """
+    reason = _upload_type_rejection_reason(file)
+    if reason is not None:
+        LOG.info("Rejected upload by file type", extension=_upload_extension(file.filename), reason=reason)
+        raise HTTPException(status_code=415, detail=f"File type not allowed: {reason}")
+    return file
+
+
+async def validate_upload(file: UploadFile, *, max_size_bytes: int | None = None) -> UploadFile:
+    await validate_file_size(file, max_size_bytes=max_size_bytes)
+    # The OLE macro scan reads the whole file, so it runs off the event loop.
+    return await asyncio.to_thread(validate_upload_type, file)
+
+
+async def validate_passthrough_upload(file: UploadFile, *, max_size_bytes: int | None, purpose: str) -> UploadFile:
+    """Size-check a file the agent hands to a third-party site, which may legitimately ask for any type.
+
+    The type rules are logged rather than enforced; the stored copy is only ever served as an attachment.
+    """
+    await validate_file_size(file, max_size_bytes=max_size_bytes)
+    reason = await asyncio.to_thread(_upload_type_rejection_reason, file)
+    if reason is not None:
+        LOG.info(
+            "Accepted a restricted file type for pass-through",
+            extension=_upload_extension(file.filename),
+            reason=reason,
+            purpose=purpose,
         )
     return file
 

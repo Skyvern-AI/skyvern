@@ -238,6 +238,8 @@ export const helpTooltips = {
       "The fields the agent returns, as a JSON object schema. A Conditional block after this one can branch on them.",
     maxTurns:
       "The most model turns the agent may take before the block fails. Between 1 and 200.",
+    tools:
+      "The tools the agent may call. It can always return its answer, and Login works only when the workflow has a credential parameter. Select all to give it every tool, including ones added later.",
   },
   wait: {
     ...baseHelpTooltipContent,

@@ -7783,3 +7783,42 @@ async def test_label_anchor_resolves_after_the_label_class_set_changes() -> None
     assert len(emitted["probe"]) == 1, emitted
     for selector, (count, text) in resolved.items():
         assert count == 1 and "10.2K" in text, f"{selector} resolves to {count} elements reading {text!r}"
+
+
+_EMPTY_SCRIPT_WRAPPER_FORM = (
+    "<html><body><form>"
+    '<div class="field"><script type="text/plain"></script><span>Reference code</span><input type="text"></div>'
+    '<div class="field"><span>Reference code</span><input type="text"></div>'
+    '<div class="field"><span>Account number</span><input type="text"></div>'
+    "</form></body></html>"
+)
+
+
+def _text_anchor_selectors(node: object) -> list[str]:
+    if isinstance(node, list):
+        return [selector for item in node for selector in _text_anchor_selectors(item)]
+    if not isinstance(node, dict):
+        return []
+    own = [node["selector"]] if node.get("source") == "text_anchor" else []
+    return own + [selector for value in node.values() for selector in _text_anchor_selectors(value)]
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+async def test_text_anchor_counts_a_competing_wrapper_that_holds_an_empty_script() -> None:
+    async with async_playwright() as playwright:
+        browser = await playwright.chromium.launch(headless=True)
+        try:
+            page = await browser.new_page()
+            await page.set_content(_EMPTY_SCRIPT_WRAPPER_FORM)
+            raw = await page.evaluate(COMPOSITION_STRUCTURED_EVIDENCE_EXPRESSION)
+            selectors = _text_anchor_selectors(json.loads(raw))
+            counts = {selector: await page.locator(selector).count() for selector in selectors}
+            ambiguous_count = await page.locator('div.field:has-text("Reference code") input').count()
+        finally:
+            await browser.close()
+
+    assert ambiguous_count == 2
+    assert 'div.field:has-text("Reference code") input' not in counts, counts
+    assert counts.get('div.field:has-text("Account number") input') == 1, counts
+    assert all(count == 1 for count in counts.values()), counts

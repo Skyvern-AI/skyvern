@@ -2022,7 +2022,7 @@ async def test_attempt_failure_reason_uses_response_text_cap(
                 get_task_v2_by_workflow_run_id=AsyncMock(return_value=None),
                 get_workflow_run_blocks=AsyncMock(return_value=[]),
             ),
-            tasks=SimpleNamespace(get_tasks_by_workflow_run_id=AsyncMock(return_value=[])),
+            tasks=SimpleNamespace(get_tasks_for_workflow_run_status=AsyncMock(return_value=[])),
             workflow_runs=SimpleNamespace(
                 get_workflow_run_parameters=AsyncMock(return_value=[]),
                 get_workflow_run_block_errors=AsyncMock(return_value=[]),
@@ -3544,7 +3544,8 @@ async def test_canceled_run_gets_one_final_webhook_from_a_sender_that_is_sure_to
 
     monkeypatch.setattr(service_module.app.AGENT_FUNCTION, "deliver_webhook", AsyncMock(side_effect=endpoint))
 
-    async def cancel_row(workflow_run_id: str) -> WorkflowRun:
+    async def cancel_row(workflow_run_id: str, *, requested_externally: bool = False) -> WorkflowRun:
+        assert requested_externally is True
         if finishes_before_cancel:
             await runs.update_workflow_run_if_not_final(workflow_run_id, WorkflowRunStatus.completed)
         canceled = await runs.update_workflow_run_if_not_final(workflow_run_id, WorkflowRunStatus.canceled)

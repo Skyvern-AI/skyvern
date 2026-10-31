@@ -9432,6 +9432,20 @@
             "title": "Max Turns",
             "default": 25
           },
+          "tools": {
+            "anyOf": [
+              {
+                "items": {
+                  "type": "string"
+                },
+                "type": "array"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Tools"
+          },
           "parameters": {
             "items": {
               "oneOf": [
@@ -9554,18 +9568,21 @@
           },
           "prompt": {
             "type": "string",
-            "title": "Prompt"
+            "title": "Prompt",
+            "description": "What the step must work out or get done. Rendered as a Jinja template against the run's parameters and earlier block outputs before the step starts."
           },
           "data_schema": {
             "additionalProperties": true,
             "type": "object",
-            "title": "Data Schema"
+            "title": "Data Schema",
+            "description": "JSON Schema (type object) of the answer the step returns through its finish tool. Later blocks read the answer as {{ <label>_output.output }}."
           },
           "max_turns": {
             "type": "integer",
             "maximum": 200.0,
             "minimum": 1.0,
             "title": "Max Turns",
+            "description": "Model turns the step may take. When they run out, the step gets one more turn in which only finish runs.",
             "default": 25
           },
           "parameter_keys": {
@@ -9580,7 +9597,24 @@
                 "type": "null"
               }
             ],
-            "title": "Parameter Keys"
+            "title": "Parameter Keys",
+            "description": "Keys of the workflow parameters and earlier block outputs the step uses."
+          },
+          "tools": {
+            "anyOf": [
+              {
+                "items": {
+                  "type": "string"
+                },
+                "type": "array",
+                "minItems": 1
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Tools",
+            "description": "The tools the step may call, at least one. A block it runs through run_block is named by its block type, such as http_request. finish is always offered, and login only when the run has a credential parameter. Without a list the step is offered every tool."
           }
         },
         "type": "object",
@@ -10873,6 +10907,7 @@
           "workflow_trigger",
           "google_sheets_read",
           "google_sheets_write",
+          "powerbi_query",
           "pdf_fill",
           "split_pdf",
           "email_inbox",
@@ -13575,7 +13610,8 @@
           "azure_vault",
           "gcp",
           "custom",
-          "onepassword"
+          "onepassword",
+          "bitwarden_connected"
         ],
         "title": "CredentialVaultType"
       },
@@ -17909,6 +17945,9 @@
                   "$ref": "#/components/schemas/GoogleSheetsWriteBlock"
                 },
                 {
+                  "$ref": "#/components/schemas/PowerBIQueryBlock"
+                },
+                {
                   "$ref": "#/components/schemas/PdfFillBlock"
                 },
                 {
@@ -17948,6 +17987,7 @@
                   "navigation": "#/components/schemas/NavigationBlock",
                   "pdf_fill": "#/components/schemas/PdfFillBlock",
                   "pdf_parser": "#/components/schemas/PDFParserBlock",
+                  "powerbi_query": "#/components/schemas/PowerBIQueryBlock",
                   "print_page": "#/components/schemas/PrintPageBlock",
                   "send_email": "#/components/schemas/SendEmailBlock",
                   "split_pdf": "#/components/schemas/SplitPdfBlock",
@@ -18122,7 +18162,7 @@
           },
           "loop_blocks": {
             "items": {
-              "anyOf": [
+              "oneOf": [
                 {
                   "$ref": "#/components/schemas/TaskBlockYAML"
                 },
@@ -18224,8 +18264,51 @@
                 },
                 {
                   "$ref": "#/components/schemas/GoogleSheetsWriteBlockYAML"
+                },
+                {
+                  "$ref": "#/components/schemas/PowerBIQueryBlockYAML"
                 }
-              ]
+              ],
+              "discriminator": {
+                "propertyName": "block_type",
+                "mapping": {
+                  "action": "#/components/schemas/ActionBlockYAML",
+                  "agent_step": "#/components/schemas/AgentStepBlockYAML",
+                  "code": "#/components/schemas/CodeBlockYAML",
+                  "conditional": "#/components/schemas/ConditionalBlockYAML",
+                  "data_export": "#/components/schemas/DataExportBlockYAML",
+                  "download_to_s3": "#/components/schemas/DownloadToS3BlockYAML",
+                  "email_inbox": "#/components/schemas/EmailInboxBlockYAML",
+                  "extraction": "#/components/schemas/ExtractionBlockYAML",
+                  "file_download": "#/components/schemas/FileDownloadBlockYAML",
+                  "file_upload": "#/components/schemas/FileUploadBlockYAML",
+                  "file_url_parser": "#/components/schemas/FileParserBlockYAML",
+                  "for_loop": "#/components/schemas/ForLoopBlockYAML",
+                  "google_sheets_read": "#/components/schemas/GoogleSheetsReadBlockYAML",
+                  "google_sheets_write": "#/components/schemas/GoogleSheetsWriteBlockYAML",
+                  "goto_url": "#/components/schemas/UrlBlockYAML",
+                  "http_request": "#/components/schemas/HttpRequestBlockYAML",
+                  "human_interaction": "#/components/schemas/HumanInteractionBlockYAML",
+                  "login": "#/components/schemas/LoginBlockYAML",
+                  "navigation": "#/components/schemas/NavigationBlockYAML",
+                  "pdf_fill": "#/components/schemas/PdfFillBlockYAML",
+                  "pdf_parser": "#/components/schemas/PDFParserBlockYAML",
+                  "powerbi_query": "#/components/schemas/PowerBIQueryBlockYAML",
+                  "print_page": "#/components/schemas/PrintPageBlockYAML",
+                  "send_email": "#/components/schemas/SendEmailBlockYAML",
+                  "split_pdf": "#/components/schemas/SplitPdfBlockYAML",
+                  "task": "#/components/schemas/TaskBlockYAML",
+                  "task_v2": "#/components/schemas/TaskV2BlockYAML",
+                  "terminate": "#/components/schemas/TerminateBlockYAML",
+                  "text_prompt": "#/components/schemas/TextPromptBlockYAML",
+                  "upload_to_s3": "#/components/schemas/UploadToS3BlockYAML",
+                  "validation": "#/components/schemas/ValidationBlockYAML",
+                  "wait": "#/components/schemas/WaitBlockYAML",
+                  "web_search": "#/components/schemas/WebSearchBlockYAML",
+                  "while_loop": "#/components/schemas/WhileLoopBlockYAML",
+                  "workflow_trigger": "#/components/schemas/WorkflowTriggerBlockYAML"
+                }
+              }
             },
             "type": "array",
             "title": "Loop Blocks"
@@ -22910,6 +22993,255 @@
           "stealth-chromium"
         ],
         "title": "PersistentBrowserType"
+      },
+      "PowerBIQueryBlock": {
+        "properties": {
+          "label": {
+            "type": "string",
+            "title": "Label",
+            "description": "Author-facing identifier for a block; unique within a workflow."
+          },
+          "next_block_label": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Next Block Label",
+            "description": "Optional pointer to the next block label when constructing a DAG. Defaults to sequential order when omitted."
+          },
+          "block_type": {
+            "type": "string",
+            "const": "powerbi_query",
+            "title": "Block Type",
+            "default": "powerbi_query"
+          },
+          "output_parameter": {
+            "$ref": "#/components/schemas/OutputParameter"
+          },
+          "continue_on_failure": {
+            "type": "boolean",
+            "title": "Continue On Failure",
+            "default": false
+          },
+          "model": {
+            "anyOf": [
+              {
+                "additionalProperties": true,
+                "type": "object"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Model"
+          },
+          "disable_cache": {
+            "type": "boolean",
+            "title": "Disable Cache",
+            "default": false
+          },
+          "ignore_workflow_system_prompt": {
+            "type": "boolean",
+            "title": "Ignore Workflow System Prompt",
+            "default": false
+          },
+          "next_loop_on_failure": {
+            "type": "boolean",
+            "title": "Next Loop On Failure",
+            "default": false
+          },
+          "connection_id": {
+            "type": "string",
+            "title": "Connection Id"
+          },
+          "dataset_id": {
+            "type": "string",
+            "title": "Dataset Id"
+          },
+          "query": {
+            "type": "string",
+            "title": "Query"
+          },
+          "max_rows": {
+            "type": "integer",
+            "maximum": 100000.0,
+            "minimum": 1.0,
+            "title": "Max Rows",
+            "default": 1000
+          },
+          "parameters": {
+            "items": {
+              "oneOf": [
+                {
+                  "$ref": "#/components/schemas/WorkflowParameter"
+                },
+                {
+                  "$ref": "#/components/schemas/ContextParameter"
+                },
+                {
+                  "$ref": "#/components/schemas/AWSSecretParameter"
+                },
+                {
+                  "$ref": "#/components/schemas/AzureSecretParameter"
+                },
+                {
+                  "$ref": "#/components/schemas/BitwardenLoginCredentialParameter"
+                },
+                {
+                  "$ref": "#/components/schemas/BitwardenSensitiveInformationParameter"
+                },
+                {
+                  "$ref": "#/components/schemas/BitwardenCreditCardDataParameter"
+                },
+                {
+                  "$ref": "#/components/schemas/OnePasswordCredentialParameter"
+                },
+                {
+                  "$ref": "#/components/schemas/AzureVaultCredentialParameter"
+                },
+                {
+                  "$ref": "#/components/schemas/OutputParameter"
+                },
+                {
+                  "$ref": "#/components/schemas/CredentialParameter"
+                }
+              ],
+              "discriminator": {
+                "propertyName": "parameter_type",
+                "mapping": {
+                  "aws_secret": "#/components/schemas/AWSSecretParameter",
+                  "azure_secret": "#/components/schemas/AzureSecretParameter",
+                  "azure_vault_credential": "#/components/schemas/AzureVaultCredentialParameter",
+                  "bitwarden_credit_card_data": "#/components/schemas/BitwardenCreditCardDataParameter",
+                  "bitwarden_login_credential": "#/components/schemas/BitwardenLoginCredentialParameter",
+                  "bitwarden_sensitive_information": "#/components/schemas/BitwardenSensitiveInformationParameter",
+                  "context": "#/components/schemas/ContextParameter",
+                  "credential": "#/components/schemas/CredentialParameter",
+                  "onepassword": "#/components/schemas/OnePasswordCredentialParameter",
+                  "output": "#/components/schemas/OutputParameter",
+                  "workflow": "#/components/schemas/WorkflowParameter"
+                }
+              }
+            },
+            "type": "array",
+            "title": "Parameters",
+            "default": []
+          }
+        },
+        "type": "object",
+        "required": [
+          "label",
+          "output_parameter",
+          "connection_id",
+          "dataset_id",
+          "query"
+        ],
+        "title": "PowerBIQueryBlock"
+      },
+      "PowerBIQueryBlockYAML": {
+        "properties": {
+          "block_type": {
+            "type": "string",
+            "const": "powerbi_query",
+            "title": "Block Type",
+            "default": "powerbi_query"
+          },
+          "label": {
+            "type": "string",
+            "title": "Label",
+            "description": "Author-facing identifier; must be unique per workflow."
+          },
+          "next_block_label": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Next Block Label",
+            "description": "Optional pointer to the label of the next block. When omitted, it will default to sequential order. See [[s-4bnl]]."
+          },
+          "continue_on_failure": {
+            "type": "boolean",
+            "title": "Continue On Failure",
+            "default": false
+          },
+          "model": {
+            "anyOf": [
+              {
+                "additionalProperties": true,
+                "type": "object"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Model"
+          },
+          "ignore_workflow_system_prompt": {
+            "type": "boolean",
+            "title": "Ignore Workflow System Prompt",
+            "default": false
+          },
+          "next_loop_on_failure": {
+            "type": "boolean",
+            "title": "Next Loop On Failure",
+            "default": false
+          },
+          "connection_id": {
+            "type": "string",
+            "minLength": 1,
+            "title": "Connection Id",
+            "description": "Microsoft OAuth credential ID for this user."
+          },
+          "dataset_id": {
+            "type": "string",
+            "minLength": 1,
+            "title": "Dataset Id"
+          },
+          "query": {
+            "type": "string",
+            "minLength": 1,
+            "title": "Query",
+            "description": "A single read-only DAX query."
+          },
+          "max_rows": {
+            "type": "integer",
+            "maximum": 100000.0,
+            "minimum": 1.0,
+            "title": "Max Rows",
+            "default": 1000
+          },
+          "parameter_keys": {
+            "anyOf": [
+              {
+                "items": {
+                  "type": "string"
+                },
+                "type": "array"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Parameter Keys"
+          }
+        },
+        "type": "object",
+        "required": [
+          "label",
+          "connection_id",
+          "dataset_id",
+          "query"
+        ],
+        "title": "PowerBIQueryBlockYAML",
+        "description": "Documented ahead of release; saves are unavailable until the Power BI catalog status is live."
       },
       "PrintPageBlock": {
         "properties": {
@@ -30456,6 +30788,9 @@
                   "$ref": "#/components/schemas/GoogleSheetsWriteBlock"
                 },
                 {
+                  "$ref": "#/components/schemas/PowerBIQueryBlock"
+                },
+                {
                   "$ref": "#/components/schemas/PdfFillBlock"
                 },
                 {
@@ -30495,6 +30830,7 @@
                   "navigation": "#/components/schemas/NavigationBlock",
                   "pdf_fill": "#/components/schemas/PdfFillBlock",
                   "pdf_parser": "#/components/schemas/PDFParserBlock",
+                  "powerbi_query": "#/components/schemas/PowerBIQueryBlock",
                   "print_page": "#/components/schemas/PrintPageBlock",
                   "send_email": "#/components/schemas/SendEmailBlock",
                   "split_pdf": "#/components/schemas/SplitPdfBlock",
@@ -30597,7 +30933,7 @@
           },
           "loop_blocks": {
             "items": {
-              "anyOf": [
+              "oneOf": [
                 {
                   "$ref": "#/components/schemas/TaskBlockYAML"
                 },
@@ -30699,8 +31035,51 @@
                 },
                 {
                   "$ref": "#/components/schemas/GoogleSheetsWriteBlockYAML"
+                },
+                {
+                  "$ref": "#/components/schemas/PowerBIQueryBlockYAML"
                 }
-              ]
+              ],
+              "discriminator": {
+                "propertyName": "block_type",
+                "mapping": {
+                  "action": "#/components/schemas/ActionBlockYAML",
+                  "agent_step": "#/components/schemas/AgentStepBlockYAML",
+                  "code": "#/components/schemas/CodeBlockYAML",
+                  "conditional": "#/components/schemas/ConditionalBlockYAML",
+                  "data_export": "#/components/schemas/DataExportBlockYAML",
+                  "download_to_s3": "#/components/schemas/DownloadToS3BlockYAML",
+                  "email_inbox": "#/components/schemas/EmailInboxBlockYAML",
+                  "extraction": "#/components/schemas/ExtractionBlockYAML",
+                  "file_download": "#/components/schemas/FileDownloadBlockYAML",
+                  "file_upload": "#/components/schemas/FileUploadBlockYAML",
+                  "file_url_parser": "#/components/schemas/FileParserBlockYAML",
+                  "for_loop": "#/components/schemas/ForLoopBlockYAML",
+                  "google_sheets_read": "#/components/schemas/GoogleSheetsReadBlockYAML",
+                  "google_sheets_write": "#/components/schemas/GoogleSheetsWriteBlockYAML",
+                  "goto_url": "#/components/schemas/UrlBlockYAML",
+                  "http_request": "#/components/schemas/HttpRequestBlockYAML",
+                  "human_interaction": "#/components/schemas/HumanInteractionBlockYAML",
+                  "login": "#/components/schemas/LoginBlockYAML",
+                  "navigation": "#/components/schemas/NavigationBlockYAML",
+                  "pdf_fill": "#/components/schemas/PdfFillBlockYAML",
+                  "pdf_parser": "#/components/schemas/PDFParserBlockYAML",
+                  "powerbi_query": "#/components/schemas/PowerBIQueryBlockYAML",
+                  "print_page": "#/components/schemas/PrintPageBlockYAML",
+                  "send_email": "#/components/schemas/SendEmailBlockYAML",
+                  "split_pdf": "#/components/schemas/SplitPdfBlockYAML",
+                  "task": "#/components/schemas/TaskBlockYAML",
+                  "task_v2": "#/components/schemas/TaskV2BlockYAML",
+                  "terminate": "#/components/schemas/TerminateBlockYAML",
+                  "text_prompt": "#/components/schemas/TextPromptBlockYAML",
+                  "upload_to_s3": "#/components/schemas/UploadToS3BlockYAML",
+                  "validation": "#/components/schemas/ValidationBlockYAML",
+                  "wait": "#/components/schemas/WaitBlockYAML",
+                  "web_search": "#/components/schemas/WebSearchBlockYAML",
+                  "while_loop": "#/components/schemas/WhileLoopBlockYAML",
+                  "workflow_trigger": "#/components/schemas/WorkflowTriggerBlockYAML"
+                }
+              }
             },
             "type": "array",
             "title": "Loop Blocks"
@@ -31611,6 +31990,9 @@
                   "$ref": "#/components/schemas/GoogleSheetsWriteBlock"
                 },
                 {
+                  "$ref": "#/components/schemas/PowerBIQueryBlock"
+                },
+                {
                   "$ref": "#/components/schemas/PdfFillBlock"
                 },
                 {
@@ -31650,6 +32032,7 @@
                   "navigation": "#/components/schemas/NavigationBlock",
                   "pdf_fill": "#/components/schemas/PdfFillBlock",
                   "pdf_parser": "#/components/schemas/PDFParserBlock",
+                  "powerbi_query": "#/components/schemas/PowerBIQueryBlock",
                   "print_page": "#/components/schemas/PrintPageBlock",
                   "send_email": "#/components/schemas/SendEmailBlock",
                   "split_pdf": "#/components/schemas/SplitPdfBlock",
@@ -31918,6 +32301,9 @@
                 },
                 {
                   "$ref": "#/components/schemas/GoogleSheetsWriteBlockYAML"
+                },
+                {
+                  "$ref": "#/components/schemas/PowerBIQueryBlockYAML"
                 }
               ],
               "discriminator": {
@@ -31944,6 +32330,7 @@
                   "navigation": "#/components/schemas/NavigationBlockYAML",
                   "pdf_fill": "#/components/schemas/PdfFillBlockYAML",
                   "pdf_parser": "#/components/schemas/PDFParserBlockYAML",
+                  "powerbi_query": "#/components/schemas/PowerBIQueryBlockYAML",
                   "print_page": "#/components/schemas/PrintPageBlockYAML",
                   "send_email": "#/components/schemas/SendEmailBlockYAML",
                   "split_pdf": "#/components/schemas/SplitPdfBlockYAML",

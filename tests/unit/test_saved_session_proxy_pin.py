@@ -22,6 +22,7 @@ from skyvern.schemas.browser_session_kind import BrowserSessionKind
 from skyvern.schemas.proxy_pinning import derive_proxy_session_id, is_proxy_session_id
 from skyvern.schemas.runs import ProxyLocation
 from tests.unit.conftest import MockAsyncSessionCtx
+from tests.unit.force_stub_app import pending_stamp_session_stub
 
 
 def _workflow(
@@ -134,19 +135,7 @@ def _mock_storage(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(app.STORAGE, "store_browser_profile", AsyncMock())
 
 
-async def _create_forced_workflow_run(
-    monkeypatch: pytest.MonkeyPatch,
-    *,
-    workflow: SimpleNamespace,
-    workflow_request: WorkflowRequestBody | None = None,
-    get_or_create_profile: AsyncMock | None = None,
-    update_profile: AsyncMock | None = None,
-    create_session: AsyncMock | None = None,
-) -> SimpleNamespace:
-    workflow_request = workflow_request or WorkflowRequestBody(proxy_location=ProxyLocation.RESIDENTIAL_ISP)
-    get_or_create_profile = get_or_create_profile or AsyncMock(return_value=(_profile(), False))
-    update_profile = update_profile or AsyncMock(return_value=_profile())
-    create_events: list[str] = []
+async def _create_forced_workflow_run(monkeypatch: pytest.MonkeyPatch, *, workflow: SimpleNamespace) -> AsyncMock:
     created_workflow_run = WorkflowRun.model_construct(
         workflow_run_id="wr_forced",
         workflow_id="wf_test",
@@ -155,60 +144,47 @@ async def _create_forced_workflow_run(
         debug_session_id=None,
         copilot_session_id=None,
     )
-
-    async def _create_workflow_run(**_: object) -> SimpleNamespace:
-        create_events.append("create_workflow_run")
-        return created_workflow_run
-
-    create_workflow_run = AsyncMock(side_effect=_create_workflow_run)
-    create_workflow_run.return_value = created_workflow_run
-    if create_session is None:
-        created_session = SimpleNamespace(persistent_browser_session_id="pbs_forced")
-
-        async def _create_session(**_: object) -> SimpleNamespace:
-            create_events.append("create_session")
-            return created_session
-
-        create_session = AsyncMock(side_effect=_create_session)
-        create_session.return_value = created_session
-    monkeypatch.setattr(
-        app.EXPERIMENTATION_PROVIDER,
-        "is_feature_enabled_cached",
-        AsyncMock(return_value=True),
-    )
-    monkeypatch.setattr(
-        app.DATABASE.browser_sessions,
-        "get_or_create_managed_browser_profile",
-        get_or_create_profile,
-    )
-    monkeypatch.setattr(app.DATABASE.browser_sessions, "update_browser_profile", update_profile)
-    monkeypatch.setattr(app.PERSISTENT_SESSIONS_MANAGER, "create_session", create_session)
+    create_workflow_run = AsyncMock(return_value=created_workflow_run)
+    monkeypatch.setattr(app.EXPERIMENTATION_PROVIDER, "is_feature_enabled_cached", AsyncMock(return_value=True))
     monkeypatch.setattr(app.DATABASE.workflow_runs, "create_workflow_run", create_workflow_run)
-    update_workflow_run = AsyncMock(
-        return_value=SimpleNamespace(workflow_run_id="wr_forced", browser_session_id="pbs_forced")
-    )
-    monkeypatch.setattr(app.DATABASE.workflow_runs, "update_workflow_run", update_workflow_run)
+    monkeypatch.setattr(app.DATABASE.workflow_runs, "Session", pending_stamp_session_stub("wr_forced"))
     service = WorkflowService()
     monkeypatch.setattr(service, "get_workflow", AsyncMock(return_value=workflow))
 
-    result = await service.create_workflow_run(
-        workflow_request=workflow_request,
+    await service.create_workflow_run(
+        workflow_request=WorkflowRequestBody(proxy_location=ProxyLocation.RESIDENTIAL_ISP),
         workflow_permanent_id="wpid_test",
         workflow_id="wf_test",
         organization_id="org_test",
     )
+    return create_workflow_run
 
-    if "create_session" in create_events:
-        assert create_events.index("create_workflow_run") < create_events.index("create_session")
 
-    return SimpleNamespace(
-        result=result,
-        create_session=create_session,
-        get_or_create_profile=get_or_create_profile,
-        update_profile=update_profile,
-        create_workflow_run=create_workflow_run,
-        update_workflow_run=update_workflow_run,
+async def _prepare_forced_session(
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    workflow: SimpleNamespace,
+    browser_profile_id: str | None,
+    create_session: AsyncMock | None = None,
+) -> tuple[WorkflowRun, AsyncMock, AsyncMock]:
+    create_session = create_session or AsyncMock(
+        return_value=SimpleNamespace(persistent_browser_session_id="pbs_forced")
     )
+    get_or_create_profile = AsyncMock(return_value=(_profile(), False))
+    monkeypatch.setattr(app.PERSISTENT_SESSIONS_MANAGER, "create_session", create_session)
+    monkeypatch.setattr(app.DATABASE.browser_sessions, "get_or_create_managed_browser_profile", get_or_create_profile)
+    monkeypatch.setattr(app.DATABASE.workflow_runs, "Session", pending_stamp_session_stub())
+    workflow_run = _workflow_run(browser_profile_id=browser_profile_id).model_copy(
+        update={"browser_settings": None, "browser_type": None}
+    )
+
+    run = await WorkflowService()._prepare_forced_browser_session(
+        workflow=workflow,  # type: ignore[arg-type]
+        workflow_run=workflow_run,
+        workflow_request=WorkflowRequestBody(proxy_location=ProxyLocation.RESIDENTIAL_ISP),
+        has_attempt_row=False,
+    )
+    return run, create_session, get_or_create_profile
 
 
 async def _prepare_profile(
@@ -315,476 +291,54 @@ def test_derive_proxy_session_id_supports_profile_segments() -> None:
 
 
 @pytest.mark.asyncio
-async def test_force_browser_session_passes_managed_profile_and_pins_proxy(
+@pytest.mark.parametrize(
+    ("browser_profile_id", "pin_saved_session_ip", "expected_profile_id"),
+    [("bp_managed", True, "bp_managed"), (None, True, None), (None, False, None)],
+    ids=["profiled", "pinned_without_profile", "unpinned_without_profile"],
+)
+async def test_forced_session_at_run_start_uses_the_runs_persisted_profile(
+    monkeypatch: pytest.MonkeyPatch,
+    browser_profile_id: str | None,
+    pin_saved_session_ip: bool,
+    expected_profile_id: str | None,
+) -> None:
+    run, create_session, get_or_create_profile = await _prepare_forced_session(
+        monkeypatch,
+        workflow=_workflow(pin_saved_session_ip=pin_saved_session_ip),
+        browser_profile_id=browser_profile_id,
+    )
+
+    # Setup already resolved the run's profile; run start never resolves it again.
+    get_or_create_profile.assert_not_awaited()
+    if browser_profile_id is None and pin_saved_session_ip:
+        # A pinned workflow's IP lives on its profile, so an unprofiled session would egress from another IP.
+        create_session.assert_not_awaited()
+        assert run.browser_session_id is None
+        return
+    kwargs = create_session.await_args.kwargs
+    assert (kwargs["browser_profile_id"], kwargs["proxy_location"], kwargs["inherit_profile_proxy"]) == (
+        expected_profile_id,
+        ProxyLocation.RESIDENTIAL_ISP,
+        True,
+    )
+    assert kwargs["runnable_type"] == FORCED_WORKFLOW_SESSION_RUNNABLE_TYPE
+    assert kwargs["session_kind"] == BrowserSessionKind.workflow_run
+    assert run.browser_session_id == "pbs_forced"
+
+
+@pytest.mark.asyncio
+async def test_forced_session_creation_failure_at_run_start_returns_the_run_without_a_session(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    update_profile = AsyncMock(return_value=_profile())
-    workflow = _workflow(
-        browser_profile_key="{{ credential_id }}",
-        parameters=[_workflow_parameter("credential_id", default_value="cred_default")],
-    )
-    request = WorkflowRequestBody(
-        data={"credential_id": "cred_request"},
-        proxy_location=ProxyLocation.RESIDENTIAL_ISP,
-    )
-
-    forced = await _create_forced_workflow_run(
+    run, create_session, _ = await _prepare_forced_session(
         monkeypatch,
-        workflow=workflow,
-        workflow_request=request,
-        update_profile=update_profile,
-    )
-
-    digest = build_browser_profile_key_digest("cred_request")
-    expected_pin = derive_proxy_session_id("org_test", "wpid_test", digest)
-    forced.get_or_create_profile.assert_awaited_once_with(
-        organization_id="org_test",
-        workflow_permanent_id="wpid_test",
-        browser_profile_key_digest=digest,
-        name="Workflow (auto-saved: cred_request)",
-    )
-    update_profile.assert_awaited_once_with(
-        profile_id="bp_managed",
-        organization_id="org_test",
-        proxy_location=ProxyLocation.RESIDENTIAL_ISP,
-        proxy_session_id=expected_pin,
-    )
-    forced.create_session.assert_awaited_once_with(
-        organization_id="org_test",
-        workflow_run_id="wr_forced",
-        proxy_location=ProxyLocation.RESIDENTIAL_ISP,
-        timeout_minutes=60,
-        runnable_type=FORCED_WORKFLOW_SESSION_RUNNABLE_TYPE,
+        workflow=_workflow(),
         browser_profile_id="bp_managed",
-        inherit_profile_proxy=True,
-        session_kind=BrowserSessionKind.workflow_run,
-        browser_settings=None,
-        created_for_workflow_run_id="wr_forced",
-    )
-    forced.create_workflow_run.assert_awaited_once()
-    assert forced.create_workflow_run.await_args.kwargs["browser_session_id"] is None
-    forced.update_workflow_run.assert_awaited_once_with(
-        workflow_run_id="wr_forced",
-        browser_session_id="pbs_forced",
-    )
-    assert forced.result is forced.update_workflow_run.return_value
-
-
-@pytest.mark.asyncio
-async def test_force_browser_session_rotating_profile_key_selects_after_run_create(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    select_credential_for_run = AsyncMock(return_value="cred_selected")
-    monkeypatch.setattr(
-        "skyvern.forge.sdk.workflow.service.select_credential_for_run",
-        select_credential_for_run,
-    )
-    update_profile = AsyncMock(return_value=_profile())
-    workflow = _workflow(
-        browser_profile_key="{{ login_cred }}",
-        parameters=[
-            _credential_parameter(
-                "login_cred",
-                credential_ids=["cred_a", "cred_selected"],
-                selection_strategy="round_robin",
-            )
-        ],
-    )
-
-    forced = await _create_forced_workflow_run(
-        monkeypatch,
-        workflow=workflow,
-        workflow_request=WorkflowRequestBody(
-            proxy_location=ProxyLocation.RESIDENTIAL_ISP,
-        ),
-        update_profile=update_profile,
-    )
-
-    digest = build_browser_profile_key_digest("cred_selected")
-    select_credential_for_run.assert_awaited_once_with(
-        workflow_run_id="wr_forced",
-        organization_id="org_test",
-        workflow_permanent_id="wpid_test",
-        parameter_key="login_cred",
-        credential_ids=["cred_a", "cred_selected"],
-        selection_strategy="round_robin",
-    )
-    forced.get_or_create_profile.assert_awaited_once_with(
-        organization_id="org_test",
-        workflow_permanent_id="wpid_test",
-        browser_profile_key_digest=digest,
-        name="Workflow (auto-saved: cred_selected)",
-    )
-    forced.create_session.assert_awaited_once_with(
-        organization_id="org_test",
-        workflow_run_id="wr_forced",
-        proxy_location=ProxyLocation.RESIDENTIAL_ISP,
-        timeout_minutes=60,
-        runnable_type=FORCED_WORKFLOW_SESSION_RUNNABLE_TYPE,
-        browser_profile_id="bp_managed",
-        inherit_profile_proxy=True,
-        session_kind=BrowserSessionKind.workflow_run,
-        browser_settings=None,
-        created_for_workflow_run_id="wr_forced",
-    )
-    forced.create_workflow_run.assert_awaited_once()
-    assert forced.create_workflow_run.await_args.kwargs["browser_session_id"] is None
-    forced.update_workflow_run.assert_awaited_once_with(
-        workflow_run_id="wr_forced",
-        browser_session_id="pbs_forced",
-    )
-    assert forced.result is forced.update_workflow_run.return_value
-
-
-@pytest.mark.asyncio
-async def test_force_browser_session_rotating_profile_key_uses_run_override(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    select_credential_for_run = AsyncMock(return_value="cred_selected")
-    monkeypatch.setattr(
-        "skyvern.forge.sdk.workflow.service.select_credential_for_run",
-        select_credential_for_run,
-    )
-    update_profile = AsyncMock(return_value=_profile())
-    workflow = _workflow(
-        browser_profile_key="{{ login_cred }}",
-        parameters=[
-            _credential_parameter(
-                "login_cred",
-                credential_ids=["cred_a", "cred_selected"],
-                selection_strategy="round_robin",
-            )
-        ],
-    )
-
-    forced = await _create_forced_workflow_run(
-        monkeypatch,
-        workflow=workflow,
-        workflow_request=WorkflowRequestBody(
-            data={"login_cred": "cred_selected"},
-            proxy_location=ProxyLocation.RESIDENTIAL_ISP,
-        ),
-        update_profile=update_profile,
-    )
-
-    digest = build_browser_profile_key_digest("cred_selected")
-    select_credential_for_run.assert_not_awaited()
-    forced.get_or_create_profile.assert_awaited_once_with(
-        organization_id="org_test",
-        workflow_permanent_id="wpid_test",
-        browser_profile_key_digest=digest,
-        name="Workflow (auto-saved: cred_selected)",
-    )
-    forced.create_session.assert_awaited_once()
-
-
-@pytest.mark.asyncio
-async def test_force_browser_session_rotating_profile_key_selection_failure_returns_run(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    select_credential_for_run = AsyncMock(side_effect=RuntimeError("selection failed"))
-    monkeypatch.setattr(
-        "skyvern.forge.sdk.workflow.service.select_credential_for_run",
-        select_credential_for_run,
-    )
-    workflow = _workflow(
-        browser_profile_key="{{ login_cred }}",
-        parameters=[_credential_parameter("login_cred", credential_ids=["cred_a", "cred_b"])],
-    )
-
-    forced = await _create_forced_workflow_run(
-        monkeypatch,
-        workflow=workflow,
-        workflow_request=WorkflowRequestBody(proxy_location=ProxyLocation.RESIDENTIAL_ISP),
-    )
-
-    assert forced.result.workflow_run_id == "wr_forced"
-    select_credential_for_run.assert_awaited_once()
-    forced.create_workflow_run.assert_awaited_once()
-    assert forced.create_workflow_run.await_args.kwargs["browser_session_id"] is None
-    forced.get_or_create_profile.assert_not_awaited()
-    forced.create_session.assert_not_awaited()
-    forced.update_workflow_run.assert_not_awaited()
-    assert forced.result is forced.create_workflow_run.return_value
-
-
-@pytest.mark.asyncio
-async def test_force_browser_session_created_profile_seeds_legacy_session(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    profile = _profile()
-    get_or_create_profile = AsyncMock(return_value=(profile, True))
-    retrieve_browser_session = AsyncMock(return_value="/tmp/legacy-session")
-    store_browser_profile = AsyncMock()
-    monkeypatch.setattr(app.STORAGE, "retrieve_browser_session", retrieve_browser_session)
-    monkeypatch.setattr(app.STORAGE, "store_browser_profile", store_browser_profile)
-
-    forced = await _create_forced_workflow_run(
-        monkeypatch,
-        workflow=_workflow(),
-        get_or_create_profile=get_or_create_profile,
-        update_profile=AsyncMock(return_value=profile),
-    )
-
-    retrieve_browser_session.assert_awaited_once_with("org_test", "wpid_test")
-    store_browser_profile.assert_awaited_once_with(
-        "org_test",
-        profile_id="bp_managed",
-        directory="/tmp/legacy-session",
-    )
-    forced.create_session.assert_awaited_once_with(
-        organization_id="org_test",
-        workflow_run_id="wr_forced",
-        proxy_location=ProxyLocation.RESIDENTIAL_ISP,
-        timeout_minutes=60,
-        runnable_type=FORCED_WORKFLOW_SESSION_RUNNABLE_TYPE,
-        browser_profile_id="bp_managed",
-        inherit_profile_proxy=True,
-        session_kind=BrowserSessionKind.workflow_run,
-        browser_settings=None,
-        created_for_workflow_run_id="wr_forced",
-    )
-    forced.create_workflow_run.assert_awaited_once()
-    assert forced.create_workflow_run.await_args.kwargs["browser_session_id"] is None
-    forced.update_workflow_run.assert_awaited_once_with(
-        workflow_run_id="wr_forced",
-        browser_session_id="pbs_forced",
-    )
-    assert forced.result is forced.update_workflow_run.return_value
-
-
-@pytest.mark.asyncio
-async def test_force_browser_session_created_profile_seed_failure_rolls_back_and_skips_session(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    profile = _profile()
-    get_or_create_profile = AsyncMock(return_value=(profile, True))
-    hard_delete = AsyncMock()
-    monkeypatch.setattr(app.STORAGE, "retrieve_browser_session", AsyncMock(return_value="/tmp/legacy-session"))
-    monkeypatch.setattr(app.STORAGE, "store_browser_profile", AsyncMock(side_effect=RuntimeError("storage down")))
-    monkeypatch.setattr(app.DATABASE.browser_sessions, "hard_delete_browser_profile", hard_delete)
-
-    forced = await _create_forced_workflow_run(
-        monkeypatch,
-        workflow=_workflow(),
-        get_or_create_profile=get_or_create_profile,
-    )
-
-    hard_delete.assert_awaited_once_with(profile_id="bp_managed", organization_id="org_test")
-    forced.update_profile.assert_not_awaited()
-    forced.create_session.assert_not_awaited()
-    forced.create_workflow_run.assert_awaited_once()
-    assert forced.create_workflow_run.await_args.kwargs["browser_session_id"] is None
-    forced.update_workflow_run.assert_not_awaited()
-    assert forced.result is forced.create_workflow_run.return_value
-
-
-@pytest.mark.asyncio
-async def test_force_browser_session_existing_profile_does_not_seed_legacy_session(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    retrieve_browser_session = AsyncMock()
-    store_browser_profile = AsyncMock()
-    monkeypatch.setattr(app.STORAGE, "retrieve_browser_session", retrieve_browser_session)
-    monkeypatch.setattr(app.STORAGE, "store_browser_profile", store_browser_profile)
-
-    forced = await _create_forced_workflow_run(
-        monkeypatch,
-        workflow=_workflow(),
-        get_or_create_profile=AsyncMock(return_value=(_profile(), False)),
-    )
-
-    retrieve_browser_session.assert_not_awaited()
-    store_browser_profile.assert_not_awaited()
-    forced.create_workflow_run.assert_awaited_once()
-    assert forced.create_workflow_run.await_args.kwargs["browser_session_id"] is None
-    forced.update_workflow_run.assert_awaited_once_with(
-        workflow_run_id="wr_forced",
-        browser_session_id="pbs_forced",
-    )
-    assert forced.result is forced.update_workflow_run.return_value
-
-
-@pytest.mark.asyncio
-async def test_force_browser_session_uses_workflow_proxy_default_for_profile_reconcile(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    update_profile = AsyncMock(return_value=_profile())
-
-    forced = await _create_forced_workflow_run(
-        monkeypatch,
-        workflow=_workflow(proxy_location=ProxyLocation.RESIDENTIAL_ISP),
-        workflow_request=WorkflowRequestBody(),
-        update_profile=update_profile,
-    )
-
-    expected_pin = derive_proxy_session_id("org_test", "wpid_test")
-    update_profile.assert_awaited_once_with(
-        profile_id="bp_managed",
-        organization_id="org_test",
-        proxy_location=ProxyLocation.RESIDENTIAL_ISP,
-        proxy_session_id=expected_pin,
-    )
-    forced.create_workflow_run.assert_awaited_once()
-    assert forced.create_workflow_run.await_args.kwargs["browser_session_id"] is None
-    forced.update_workflow_run.assert_awaited_once_with(
-        workflow_run_id="wr_forced",
-        browser_session_id="pbs_forced",
-    )
-    assert forced.result is forced.update_workflow_run.return_value
-
-
-@pytest.mark.asyncio
-async def test_force_browser_session_persist_off_does_not_pass_browser_profile(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    forced = await _create_forced_workflow_run(
-        monkeypatch,
-        workflow=_workflow(persist_browser_session=False),
-    )
-
-    forced.get_or_create_profile.assert_not_awaited()
-    forced.update_profile.assert_not_awaited()
-    forced.create_session.assert_awaited_once_with(
-        organization_id="org_test",
-        workflow_run_id="wr_forced",
-        proxy_location=ProxyLocation.RESIDENTIAL_ISP,
-        timeout_minutes=60,
-        runnable_type=FORCED_WORKFLOW_SESSION_RUNNABLE_TYPE,
-        browser_profile_id=None,
-        inherit_profile_proxy=True,
-        session_kind=BrowserSessionKind.workflow_run,
-        browser_settings=None,
-        created_for_workflow_run_id="wr_forced",
-    )
-    forced.update_workflow_run.assert_awaited_once_with(
-        workflow_run_id="wr_forced",
-        browser_session_id="pbs_forced",
-    )
-    forced.create_workflow_run.assert_awaited_once()
-    assert forced.create_workflow_run.await_args.kwargs["browser_session_id"] is None
-    assert forced.result is forced.update_workflow_run.return_value
-
-
-@pytest.mark.asyncio
-async def test_force_browser_session_pinned_unresolvable_profile_key_skips_forced_session(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    forced = await _create_forced_workflow_run(
-        monkeypatch,
-        workflow=_workflow(browser_profile_key="{{ credential_id }}"),
-        workflow_request=WorkflowRequestBody(data={}, proxy_location=ProxyLocation.RESIDENTIAL_ISP),
-    )
-
-    forced.get_or_create_profile.assert_not_awaited()
-    forced.update_profile.assert_not_awaited()
-    forced.create_session.assert_not_awaited()
-    forced.create_workflow_run.assert_awaited_once()
-    assert forced.create_workflow_run.await_args.kwargs["browser_session_id"] is None
-    forced.update_workflow_run.assert_not_awaited()
-    assert forced.result is forced.create_workflow_run.return_value
-
-
-@pytest.mark.asyncio
-async def test_force_browser_session_pinned_profile_resolution_failure_skips_forced_session(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    forced = await _create_forced_workflow_run(
-        monkeypatch,
-        workflow=_workflow(),
-        get_or_create_profile=AsyncMock(side_effect=RuntimeError("db down")),
-    )
-
-    forced.get_or_create_profile.assert_awaited_once()
-    forced.update_profile.assert_not_awaited()
-    forced.create_session.assert_not_awaited()
-    forced.create_workflow_run.assert_awaited_once()
-    assert forced.create_workflow_run.await_args.kwargs["browser_session_id"] is None
-    forced.update_workflow_run.assert_not_awaited()
-    assert forced.result is forced.create_workflow_run.return_value
-
-
-@pytest.mark.asyncio
-async def test_force_browser_session_non_pinned_profile_resolution_failure_still_creates_session(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    forced = await _create_forced_workflow_run(
-        monkeypatch,
-        workflow=_workflow(pin_saved_session_ip=False),
-        get_or_create_profile=AsyncMock(side_effect=RuntimeError("db down")),
-    )
-
-    forced.get_or_create_profile.assert_awaited_once()
-    forced.update_profile.assert_not_awaited()
-    forced.create_session.assert_awaited_once_with(
-        organization_id="org_test",
-        workflow_run_id="wr_forced",
-        proxy_location=ProxyLocation.RESIDENTIAL_ISP,
-        timeout_minutes=60,
-        runnable_type=FORCED_WORKFLOW_SESSION_RUNNABLE_TYPE,
-        browser_profile_id=None,
-        inherit_profile_proxy=True,
-        session_kind=BrowserSessionKind.workflow_run,
-        browser_settings=None,
-        created_for_workflow_run_id="wr_forced",
-    )
-    forced.create_workflow_run.assert_awaited_once()
-    assert forced.create_workflow_run.await_args.kwargs["browser_session_id"] is None
-    forced.update_workflow_run.assert_awaited_once_with(
-        workflow_run_id="wr_forced",
-        browser_session_id="pbs_forced",
-    )
-    assert forced.result is forced.update_workflow_run.return_value
-
-
-@pytest.mark.asyncio
-async def test_force_browser_session_non_pinned_unresolvable_profile_key_creates_unprofiled_session(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    forced = await _create_forced_workflow_run(
-        monkeypatch,
-        workflow=_workflow(browser_profile_key="{{ credential_id }}", pin_saved_session_ip=False),
-        workflow_request=WorkflowRequestBody(data={}, proxy_location=ProxyLocation.RESIDENTIAL_ISP),
-    )
-
-    forced.get_or_create_profile.assert_not_awaited()
-    forced.update_profile.assert_not_awaited()
-    forced.create_session.assert_awaited_once_with(
-        organization_id="org_test",
-        workflow_run_id="wr_forced",
-        proxy_location=ProxyLocation.RESIDENTIAL_ISP,
-        timeout_minutes=60,
-        runnable_type=FORCED_WORKFLOW_SESSION_RUNNABLE_TYPE,
-        browser_profile_id=None,
-        inherit_profile_proxy=True,
-        session_kind=BrowserSessionKind.workflow_run,
-        browser_settings=None,
-        created_for_workflow_run_id="wr_forced",
-    )
-    forced.create_workflow_run.assert_awaited_once()
-    assert forced.create_workflow_run.await_args.kwargs["browser_session_id"] is None
-    forced.update_workflow_run.assert_awaited_once_with(
-        workflow_run_id="wr_forced",
-        browser_session_id="pbs_forced",
-    )
-    assert forced.result is forced.update_workflow_run.return_value
-
-
-@pytest.mark.asyncio
-async def test_force_browser_session_creation_failure_returns_run_without_session(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    forced = await _create_forced_workflow_run(
-        monkeypatch,
-        workflow=_workflow(),
         create_session=AsyncMock(side_effect=RuntimeError("session creation failed")),
     )
 
-    forced.create_workflow_run.assert_awaited_once()
-    assert forced.create_workflow_run.await_args.kwargs["browser_session_id"] is None
-    forced.create_session.assert_awaited_once()
-    forced.update_workflow_run.assert_not_awaited()
-    assert forced.result is forced.create_workflow_run.return_value
+    create_session.assert_awaited_once()
+    assert run.browser_session_id is None
 
 
 @pytest.mark.asyncio
@@ -1239,7 +793,7 @@ async def test_create_persistent_browser_session_does_not_inherit_profile_pin_by
 async def test_a_created_run_records_the_digest_of_the_definition_it_runs(monkeypatch: pytest.MonkeyPatch) -> None:
     workflow = _workflow(parameters=[_workflow_parameter("credential_id", default_value="cred_default")])
 
-    created = await _create_forced_workflow_run(monkeypatch, workflow=workflow)
+    create_workflow_run = await _create_forced_workflow_run(monkeypatch, workflow=workflow)
 
-    recorded = created.create_workflow_run.await_args.kwargs["workflow_definition_sha256"]
+    recorded = create_workflow_run.await_args.kwargs["workflow_definition_sha256"]
     assert recorded == workflow_definition_sha256(workflow.workflow_definition)

@@ -93,7 +93,6 @@ import { useTagValuesQuery } from "./hooks/useTagValuesQuery";
 import { useWorkflowTagsBatchQuery } from "./hooks/useWorkflowTagsBatchQuery";
 import { useWorkflowsReliabilityBatchQuery } from "./hooks/useWorkflowsReliabilityBatchQuery";
 import { useActiveImportsPolling } from "./hooks/useActiveImportsPolling";
-import { WorkflowReliabilityBadge } from "./WorkflowReliabilityBadge";
 import { TagChipList } from "./components/tagging/TagChipList";
 import { WorkflowTagFilter } from "./components/tagging/WorkflowTagFilter";
 import {
@@ -1076,14 +1075,12 @@ function WorkflowsFlat() {
                                         </Tooltip>
                                       </TooltipProvider>
                                     )}
-                                    <WorkflowReliabilityBadge
+                                    <WorkflowFindingsButton
                                       reliability={
                                         workflowReliabilityMap[
                                           workflow.workflow_permanent_id
                                         ]
                                       }
-                                    />
-                                    <WorkflowFindingsButton
                                       workflowPermanentId={
                                         workflow.workflow_permanent_id
                                       }

@@ -41,6 +41,7 @@ from skyvern.forge.sdk.encrypt import encryptor
 from skyvern.forge.sdk.encrypt.base import EncryptMethod, TokenDecryptionError
 from skyvern.forge.sdk.models import Step, StepStatus
 from skyvern.forge.sdk.schemas.copilot_turn_outcome import TurnOutcome
+from skyvern.forge.sdk.schemas.har_evidence import without_final_har_user_match
 from skyvern.forge.sdk.schemas.organizations import (
     AzureClientSecretCredential,
     AzureOrganizationAuthToken,
@@ -494,7 +495,8 @@ def convert_to_task(task_obj: TaskModel, debug_enabled: bool = False, workflow_p
         browser_session_id=task_obj.browser_session_id,
         browser_address=task_obj.browser_address,
         download_timeout=task_obj.download_timeout,
-        failure_category=task_obj.failure_category,
+        # The final recording match's claim is row bookkeeping, read only by the task repository's guarded writers.
+        failure_category=without_final_har_user_match(task_obj.failure_category),
     )
     return task
 

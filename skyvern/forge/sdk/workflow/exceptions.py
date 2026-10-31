@@ -230,9 +230,17 @@ class InvalidWaitBlockTime(WorkflowDefinitionValidationException):
 
 
 class FailedToFormatJinjaStyleParameter(SkyvernException):
-    def __init__(self, template: str, msg: str, *, available_keys: list[str] | None = None) -> None:
+    def __init__(
+        self,
+        template: str,
+        msg: str,
+        *,
+        available_keys: list[str] | None = None,
+        missing_references: list[str] | None = None,
+    ) -> None:
         self.template = template
         self.available_keys = available_keys or []
+        self.missing_references = missing_references or []
         super().__init__(
             f"Failed to format Jinja style parameter '{template}'. "
             f"Reason: {msg}. "
@@ -280,8 +288,9 @@ class PayloadTemplateSyntaxError(WorkflowDefinitionValidationException):
 
 
 class MissingJinjaVariables(SkyvernException):
-    def __init__(self, template: str, variables: set[str]) -> None:
+    def __init__(self, template: str, variables: set[str], *, missing_references: list[str] | None = None) -> None:
         self.variables = variables
+        self.missing_references = missing_references or []
 
         super().__init__(
             f"Missing variables for '{template}'. Missing: {variables}. "

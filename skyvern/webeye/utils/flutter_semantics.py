@@ -1,4 +1,5 @@
-"""Switch on a Flutter web app's accessibility semantics so its canvas-drawn interface gets a DOM to read."""
+"""Switch on a canvas-drawn app's accessibility semantics, Flutter web or Uno Platform WebAssembly, so its interface gets a
+DOM to read."""
 
 from __future__ import annotations
 
@@ -40,21 +41,62 @@ _FIND_JS = """const roots = [document];
     return null;
   };"""
 
-# An expression rather than a function, so a reader can embed it in the script it already runs.
+# The shape Uno's WebAssembly runtime builds in #uno-body: an aria-hidden canvas, then its own "Enable accessibility"
+# control directly followed by the semantics root, which fills once the control is clicked and removes itself. Any
+# other shape is left alone, the runtime's #uno-root fallback container included, since its setup never adds them there.
+_UNO_FIND_JS = """const unoBody = document.getElementById('uno-body');
+  const unoChild = (id, name) => {
+    const el = unoBody !== null ? document.getElementById(id) : null;
+    return el !== null && el.parentNode === unoBody && el.localName === name ? el : null;
+  };
+  const unoCanvas = unoChild('uno-canvas', 'canvas');
+  const unoRoot = unoCanvas !== null && unoCanvas.getAttribute('aria-hidden') === 'true'
+    ? unoChild('uno-semantics-root', 'div') : null;
+  const unoEnable = unoRoot !== null ? unoChild('uno-enable-accessibility', 'div') : null;
+  const unoPlaceholder = unoEnable !== null && unoEnable.nextElementSibling === unoRoot
+    && unoEnable.getAttribute('role') === 'button' && unoEnable.getAttribute('aria-label') === 'Enable accessibility'
+    && unoEnable.getAttribute('tabindex') === '0' && unoEnable.getAttribute('aria-live') === 'polite'
+    ? unoEnable : null;"""
+
+# An expression rather than a function, so a reader can embed it in the script it already runs. A page with something to
+# click describes that engine, chosen as the activation chooses, so one engine's tree never answers for the other's.
 FLUTTER_STATE_JS = f"""(() => {{
   try {{
     {_FIND_JS}
-    return {{
-      host: hosts.length > 0,
-      placeholder: find('flt-semantics-placeholder') !== null,
-      tree: find('flt-semantics') !== null,
-    }};
+    {_UNO_FIND_JS}
+    const flutterPlaceholder = find('flt-semantics-placeholder') !== null;
+    const flutterTree = find('flt-semantics') !== null;
+    if (hosts.length > 0 && flutterPlaceholder) return {{ host: true, placeholder: true, tree: flutterTree }};
+    const unoTree = unoRoot !== null && unoRoot.firstElementChild !== null;
+    if (unoPlaceholder !== null) return {{ host: true, placeholder: true, tree: unoTree }};
+    if (unoRoot === null) return {{ host: hosts.length > 0, placeholder: flutterPlaceholder, tree: flutterTree }};
+    // Nothing is left to click, and Uno's control removes itself even when its root never fills, so the page is
+    // ready only once every engine present has its tree.
+    return {{ host: true, placeholder: false, tree: unoTree && (hosts.length === 0 || flutterTree) }};
   }} catch (e) {{
     return null;
   }}
 }})()"""
 
-_STATE_FN_JS = f"() => {FLUTTER_STATE_JS}"
+# The tree each engine's activation waits for.
+_TREE_JS = {
+    "flutter": f"""() => {{
+  try {{
+    {_FIND_JS}
+    return find('flt-semantics') !== null;
+  }} catch (e) {{
+    return false;
+  }}
+}}""",
+    "uno": f"""() => {{
+  try {{
+    {_UNO_FIND_JS}
+    return unoRoot !== null && unoRoot.firstElementChild !== null;
+  }} catch (e) {{
+    return false;
+  }}
+}}""",
+}
 
 # A text field of the app's accessibility tree. The engine starts editing it in the first frame after it is focused and
 # then writes the framework's own copy of the value over the input, so text put there earlier is lost.
@@ -66,18 +108,28 @@ FRAME_SETTLE_TIMEOUT_SECONDS = 5.0
 # One click per placeholder element: the engine listens for it from the moment it creates the placeholder, and a
 # framework that starts later still picks up the enabled state, so an ignored click is not one that came too early. A
 # rebuilt placeholder or a reload brings a new element to try, and the mobile engine deletes its placeholder after
-# repeated misses.
+# repeated misses. Answers with the engine it clicked for.
 _ACTIVATE_JS = f"""() => {{
   {_FIND_JS}
-  const placeholder = hosts.length > 0 ? find('flt-semantics-placeholder') : null;
+  {_UNO_FIND_JS}
+  const flutterPlaceholder = hosts.length > 0 ? find('flt-semantics-placeholder') : null;
   // Read through the prototype, so a page that answers the query with some other element never gets clicked.
   const localName = Object.getOwnPropertyDescriptor(Element.prototype, 'localName').get;
-  if (placeholder === null || localName.call(placeholder) !== 'flt-semantics-placeholder') return 'absent';
+  let placeholder = null;
+  let engine = null;
+  if (flutterPlaceholder !== null && localName.call(flutterPlaceholder) === 'flt-semantics-placeholder') {{
+    placeholder = flutterPlaceholder;
+    engine = 'flutter';
+  }} else if (unoPlaceholder !== null && localName.call(unoPlaceholder) === 'div') {{
+    placeholder = unoPlaceholder;
+    engine = 'uno';
+  }}
+  if (placeholder === null) return 'absent';
   if (placeholder['{_ATTEMPT_MARK}'] === true) return 'attempted';
   Object.defineProperty(placeholder, '{_ATTEMPT_MARK}', {{ value: true }});
   // The mobile engine only accepts a click within a pixel of the placeholder's centre; the desktop one takes any.
   const rect = placeholder.getBoundingClientRect();
-  // The engine listens on the placeholder itself, so the click neither bubbles nor leaves a shadow root, and the
+  // Both engines listen on the placeholder itself, so the click neither bubbles nor leaves a shadow root, and the
   // page's bubbling handlers and enclosing links never see it.
   placeholder.dispatchEvent(new MouseEvent('click', {{
     bubbles: false,
@@ -87,7 +139,7 @@ _ACTIVATE_JS = f"""() => {{
     clientX: rect.left + rect.width / 2,
     clientY: rect.top + rect.height / 2,
   }}));
-  return 'dispatched';
+  return engine;
 }}"""
 
 
@@ -135,14 +187,15 @@ class SemanticsActivation(StrEnum):
 
 
 async def activate_flutter_semantics(skyvern_frame: SkyvernFrame) -> SemanticsActivation:
-    """Click the app's 'Enable accessibility' placeholder, then wait for its semantics tree, within one deadline."""
+    """Click the app's 'Enable accessibility' placeholder (Flutter's, else Uno's), then wait for its semantics tree,
+    within one deadline."""
     loop = asyncio.get_running_loop()
     started = loop.time()
     deadline = started + ACTIVATION_BUDGET_SECONDS
     try:
         answer = await _evaluate(skyvern_frame, _ACTIVATE_JS, deadline)
-        if answer == "dispatched":
-            activated = await _wait_for_tree(skyvern_frame, deadline)
+        if answer in _TREE_JS:
+            activated = await _wait_for_tree(skyvern_frame, _TREE_JS[answer], deadline)
             outcome = SemanticsActivation.ACTIVATED if activated else SemanticsActivation.NOT_ACTIVATED
         elif answer == "attempted":
             outcome = SemanticsActivation.ALREADY_ATTEMPTED
@@ -162,14 +215,14 @@ async def activate_flutter_semantics(skyvern_frame: SkyvernFrame) -> SemanticsAc
     return outcome
 
 
-async def _wait_for_tree(skyvern_frame: SkyvernFrame, deadline: float) -> bool:
+async def _wait_for_tree(skyvern_frame: SkyvernFrame, tree_js: str, deadline: float) -> bool:
     loop = asyncio.get_running_loop()
     while True:
         remaining = deadline - loop.time()
         if remaining <= _MIN_EVALUATE_SECONDS:
             return False
         await asyncio.sleep(min(_POLL_SECONDS, remaining - _MIN_EVALUATE_SECONDS))
-        if FlutterSemanticsState.from_raw(await _evaluate(skyvern_frame, _STATE_FN_JS, deadline)).tree:
+        if await _evaluate(skyvern_frame, tree_js, deadline) is True:
             return True
 
 

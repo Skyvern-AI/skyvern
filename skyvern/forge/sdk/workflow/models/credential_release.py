@@ -113,6 +113,16 @@ async def _focused_frame_url(page: Any) -> str | None:
     return page.url
 
 
+def login_release_sites(tested_url: str | None, vault_sites: Sequence[LoginSite] | None) -> list[LoginSite] | None:
+    """Where a login's secrets may go: its vault item's readable sites, else its tested URL's whole site.
+    The item's sites come first because a tested URL saved later covers its whole site; None means unconfined."""
+    if vault_sites is not None:
+        return [site for site in vault_sites if describe_release_scope(site.url.strip()) is not None]
+    if tested_url and describe_release_scope(tested_url.strip()) is not None:
+        return [LoginSite(tested_url.strip(), whole_site=True)]
+    return None
+
+
 class CodeBlockCredentialReleaseError(Exception):
     # Duck-typed marker consumed by the secure runner's transport map (same convention as
     # RecordingLocator._skyvern_brokerable_handle): a refusal must cross the protocol as a
@@ -177,19 +187,20 @@ class CredentialReleaseGuard:
         vault_sites: Sequence[LoginSite] | None,
         enforce_vault_sites: bool,
     ) -> list[ArmedSecret]:
-        """Arm a login's secrets against its tested URL, else its vault item's saved sites; returns what was armed."""
+        """Arm a login's secrets against its vault item's saved sites, else its tested URL; returns what was armed.
+        Unenforced vault sites yield to an enforced tested URL, so only an untested login is armed log-only."""
         start = len(self._armed)
+        use_vault_sites = vault_sites is not None and (enforce_vault_sites or not tested_url)
+        sites = login_release_sites(tested_url, vault_sites if use_vault_sites else None)
+        if sites is None:
+            return []
+        enforced = enforce_vault_sites if use_vault_sites else True
         for secret in secret_values:
-            if tested_url:
-                self.arm(secret, tested_url, parameter_key)
-            elif vault_sites is not None:
-                armed = False
-                for site in vault_sites:
-                    armed |= self.arm(
-                        secret, site.url, parameter_key, enforced=enforce_vault_sites, whole_site=site.whole_site
-                    )
-                if not armed:
-                    self.arm_siteless(secret, parameter_key, enforced=enforce_vault_sites)
+            armed = False
+            for site in sites:
+                armed |= self.arm(secret, site.url, parameter_key, enforced=enforced, whole_site=site.whole_site)
+            if not armed:
+                self.arm_siteless(secret, parameter_key, enforced=enforced)
         return self._armed[start:]
 
     @property

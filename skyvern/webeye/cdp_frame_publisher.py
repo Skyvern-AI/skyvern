@@ -134,6 +134,10 @@ class CDPFramePublisher:
         return self._stream_key
 
     @property
+    def browser_state(self) -> BrowserState:
+        return self._browser_state
+
+    @property
     def is_running(self) -> bool:
         return self._task is not None and not self._task.done()
 

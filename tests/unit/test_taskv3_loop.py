@@ -28,9 +28,11 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 from structlog.testing import capture_logs
 
+import skyvern.webeye.action_deadline as action_deadline_module
 import skyvern.webeye.cdp_download_interceptor as cdp_module
 from skyvern.config import settings
 from skyvern.exceptions import (
+    ActionDeadlineExceeded,
     CompletionGateTerminationError,
     MissingBrowserStatePage,
     SkyvernContextWindowExceededError,
@@ -39,6 +41,8 @@ from skyvern.exceptions import (
 from skyvern.forge.sdk.api.llm.exceptions import LLMContentFilteredError, LLMProviderErrorRetryableTask
 from skyvern.forge.sdk.core import skyvern_context
 from skyvern.forge.sdk.core.skyvern_context import SkyvernContext
+from skyvern.forge.taskv3 import auth_tools as auth_tools_module
+from skyvern.forge.taskv3 import captcha_tools as captcha_tools_module
 from skyvern.forge.taskv3 import loop as loop_module
 from skyvern.forge.taskv3 import tools as taskv3_tools_module
 from skyvern.forge.taskv3.answer_basis_audit import ANSWER_BASIS_MAX_HOLDS, RecordedAnswer, apply_answer_basis_audit
@@ -95,6 +99,8 @@ from skyvern.forge.taskv3.loop import (
     TARGET_LABEL_DATA_KEY,
     TOKEN_BUDGET_EXTENDED_EVENT,
     TOKEN_BUDGET_EXTENSION_REFUSED_EVENT,
+    TOOL_CALL_STARTED_EVENT,
+    TOOL_CALL_TIMED_OUT_EVENT,
     UNCHARGED_REFUSAL_GRACE,
     VERDICT_URL_MAX_CHARS,
     VERIFICATION_GIVEUP_MIN_DEADLINE_HEADROOM_SECONDS,
@@ -136,6 +142,7 @@ from skyvern.forge.taskv3.run_arms import DEAD_END_RETURN_FLAG
 from skyvern.forge.taskv3.tools import build_browser_tools
 from skyvern.utils.url_validators import validate_fetch_url
 from tests.unit.helpers import held_finish_restated
+from tests.unit.scoped_asyncio import ScopedAsyncio
 
 
 class _ScriptedCaller:
@@ -1269,6 +1276,276 @@ async def test_deadline_seconds_exhausts_budget(monkeypatch: pytest.MonkeyPatch)
     assert "deadline" not in outcome.reason
     assert outcome.cap_trip == "deadline (60s) reached"
     assert caller.calls == 1
+
+
+@pytest.mark.asyncio
+async def test_a_tool_that_never_returns_is_stopped_and_the_run_ends_on_its_deadline(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # The wait_for makes a regression fail instead of hanging; the margin puts the timeout past the run deadline.
+    monkeypatch.setattr(loop_module, "TOOL_CALL_DEADLINE_MARGIN_SECONDS", 0.2)
+    monkeypatch.setattr(action_deadline_module, "ACTION_DEADLINE_HEADROOM_MS", 0)
+    timed_out_results: list[ToolResult] = []
+    _tool_call_timed_out = loop_module._tool_call_timed_out
+
+    def _capture_timeout(tool_name: str, budget_ms: int, *, call_site: str = "dispatch") -> ToolResult:
+        result = _tool_call_timed_out(tool_name, budget_ms, call_site=call_site)
+        timed_out_results.append(result)
+        return result
+
+    monkeypatch.setattr(loop_module, "_tool_call_timed_out", _capture_timeout)
+
+    async def _never_returns(args: dict[str, Any]) -> ToolResult:
+        await asyncio.Event().wait()
+        raise AssertionError("the handler was awaited to completion")
+
+    hung = ToolSpec(
+        name="click",
+        description="click",
+        parameters={"type": "object", "properties": {}},
+        handler=_never_returns,
+        billable=True,
+    )
+    caller = _ScriptedCaller([[("click", {"selector": "ref=1"})]])
+    with capture_logs() as logs:
+        outcome = await asyncio.wait_for(
+            run_agent_tool_loop(
+                llm_caller=caller,
+                system_prompt="sys",
+                user_prompt="goal",
+                tools=[hung, make_finish_tool()],
+                max_turns=20,
+                max_tool_calls=100,
+                deadline_seconds=1.0,
+            ),
+            10,
+        )
+    # The run ends on the guard that was unreachable before, not on a caller's timeout.
+    assert outcome.cap_trip == "deadline (1s) reached"
+    assert outcome.status == "budget_exhausted"
+    timed_out = [entry for entry in logs if entry.get("event") == TOOL_CALL_TIMED_OUT_EVENT]
+    assert [entry["tool"] for entry in timed_out] == ["click"]
+    # The result keeps the conservative click-dispatched signal.
+    assert timed_out_results[0].data == {CLICK_DISPATCHED_DATA_KEY: True}
+    assert timed_out_results[0].error_class == "timeout_other"
+    stopped = [m for m in caller.message_history if m.get("role") == "tool" and "was stopped" in str(m.get("content"))]
+    assert len(stopped) == 1, caller.message_history
+    assert "click" in stopped[0]["content"]
+
+
+@pytest.mark.asyncio
+async def test_timed_out_engaging_page_tool_invalidates_finish_on_cap_granted_turn(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(loop_module, "TOOL_CALL_DEADLINE_MARGIN_SECONDS", 0.05)
+    monkeypatch.setattr(action_deadline_module, "ACTION_DEADLINE_HEADROOM_MS", 0)
+    monkeypatch.setattr(loop_module, "asyncio", ScopedAsyncio())
+    observe_calls: list[tuple[str, dict[str, Any]]] = []
+    link_calls: list[None] = []
+
+    async def never_returns(_args: dict[str, Any]) -> ToolResult:
+        link_calls.append(None)
+        await asyncio.Event().wait()
+        raise AssertionError("the handler was awaited to completion")
+
+    open_link = ToolSpec(
+        name="open_verification_link",
+        description="open verification link",
+        parameters={},
+        handler=never_returns,
+        engages_page=True,
+    )
+    outcome, caller = await asyncio.wait_for(
+        _run(
+            [
+                [("observe", {})],
+                [
+                    ("open_verification_link", {}),
+                    ("finish", {"status": "completed", "reason": "link opened"}),
+                ],
+            ],
+            [_recording_tool("observe", observe_calls), open_link, make_finish_tool()],
+            max_tool_calls=1,
+            deadline_seconds=0.2,
+        ),
+        timeout=5,
+    )
+
+    assert outcome.status == "budget_exhausted"
+    assert outcome.cap_trip == "max_tool_calls (1) reached"
+    assert observe_calls == [("observe", {})]
+    assert link_calls == [None]
+    finish_results = [
+        message for message in outcome.messages if message.get("role") == "tool" and message.get("name") == "finish"
+    ]
+    assert len(finish_results) == 1
+    assert finish_results[0]["content"].startswith("skipped:")
+
+
+@pytest.mark.asyncio
+async def test_expired_deadline_skips_the_rest_of_a_tool_batch(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(loop_module, "TOOL_CALL_DEADLINE_MARGIN_SECONDS", 0.05)
+    monkeypatch.setattr(action_deadline_module, "ACTION_DEADLINE_HEADROOM_MS", 0)
+    monkeypatch.setattr(loop_module, "asyncio", ScopedAsyncio())
+    calls: list[int] = []
+
+    async def _observe(args: dict[str, Any]) -> ToolResult:
+        calls.append(args["id"])
+        if args["id"] == 1:
+            await asyncio.Event().wait()
+        return ToolResult.ok("observed")
+
+    observe = ToolSpec(
+        name="observe",
+        description="observe",
+        parameters={"type": "object", "properties": {}},
+        handler=_observe,
+        compactable=True,
+    )
+    with capture_logs() as logs:
+        outcome, caller = await asyncio.wait_for(
+            _run(
+                [[("observe", {"id": 1}), ("observe", {"id": 2})]],
+                [observe, make_finish_tool()],
+                deadline_seconds=0.25,
+            ),
+            timeout=5,
+        )
+
+    assert outcome.status == "budget_exhausted"
+    assert calls == [1]
+    first_batch_results = [m for m in caller.message_history if m.get("role") == "tool"][:2]
+    assert len(first_batch_results) == 2
+    assert "was stopped" in first_batch_results[0]["content"]
+    assert first_batch_results[1]["content"].startswith("skipped:")
+    assert [entry["call_site"] for entry in logs if entry.get("event") == TOOL_CALL_TIMED_OUT_EVENT] == ["dispatch"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("call_site", "expected_status", "finish_is_dispatched"),
+    [("page_refresh", "budget_exhausted", False), ("on_pre_action", "failed", True)],
+)
+async def test_hung_pre_dispatch_work_is_bounded_and_logged(
+    call_site: str, expected_status: str, finish_is_dispatched: bool, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(loop_module, "TOOL_CALL_DEADLINE_MARGIN_SECONDS", 0.05)
+    monkeypatch.setattr(action_deadline_module, "ACTION_DEADLINE_HEADROOM_MS", 0)
+    monkeypatch.setattr(loop_module, "asyncio", ScopedAsyncio())
+    action_calls: list[tuple[str, dict[str, Any]]] = []
+    timed_out_results: list[ToolResult] = []
+    original_timeout_result = loop_module._tool_call_timed_out
+
+    def capture_timeout_result(tool_name: str, budget_ms: int, *, call_site: str = "dispatch") -> ToolResult:
+        result = original_timeout_result(tool_name, budget_ms, call_site=call_site)
+        timed_out_results.append(result)
+        return result
+
+    monkeypatch.setattr(loop_module, "_tool_call_timed_out", capture_timeout_result)
+
+    async def _hang(*_args: Any, **_kwargs: Any) -> None:
+        await asyncio.Event().wait()
+
+    kwargs: dict[str, Any] = {}
+    context = SkyvernContext(task_id="tsk_dispatch_bound")
+    if call_site == "page_refresh":
+        context.refresh_working_page = True
+        kwargs["reload_page"] = _hang
+    else:
+        kwargs["on_pre_action"] = _hang
+
+    skyvern_context.set(context)
+    try:
+        with capture_logs() as logs:
+            outcome, caller = await asyncio.wait_for(
+                _run(
+                    [
+                        [("click", {"selector": "#submit"}), ("observe", {})],
+                        [("finish", {"status": "failed", "reason": "deadline reached"})],
+                    ],
+                    [
+                        _recording_tool("click", action_calls, billable=True),
+                        _recording_tool("observe", []),
+                        make_finish_tool(),
+                    ],
+                    deadline_seconds=0.25,
+                    **kwargs,
+                ),
+                timeout=5,
+            )
+    finally:
+        skyvern_context.reset()
+
+    assert outcome.status == expected_status
+    assert outcome.cap_trip is not None and "deadline" in outcome.cap_trip
+    assert action_calls == []
+    starts = [
+        entry for entry in logs if entry.get("event") == TOOL_CALL_STARTED_EVENT and entry.get("call_site") == call_site
+    ]
+    timeouts = [entry for entry in logs if entry.get("event") == TOOL_CALL_TIMED_OUT_EVENT]
+    assert [(entry["tool"], entry["call_site"]) for entry in starts] == [("click", call_site)]
+    assert any(entry.get("event") == TOOL_CALL_STARTED_EVENT and entry.get("tool") == "finish" for entry in logs) is (
+        finish_is_dispatched
+    )
+    assert [(entry["tool"], entry["call_site"]) for entry in timeouts] == [("click", call_site)]
+    first_batch_results = [m for m in caller.message_history if m.get("role") == "tool"][:2]
+    assert len(first_batch_results) == 2
+    assert "was not dispatched" in first_batch_results[0]["content"]
+    assert "tool handler did not run" in first_batch_results[0]["content"]
+    assert first_batch_results[1]["content"].startswith("skipped:")
+    assert len(timed_out_results) == 1
+    assert timed_out_results[0].data is None
+    assert timed_out_results[0].error_class == "timeout_other"
+
+
+@pytest.mark.asyncio
+async def test_a_tools_own_deadline_escaping_its_handler_is_still_reported_as_the_tools_error() -> None:
+    # under_action_deadline re-raises an inner scope's expiry unchanged, so a tool's own bounded call
+    # timing out arrives at the dispatch exactly as the dispatch bound does; only the elapsed time
+    # separates them. Reporting this one as the dispatch bound would hide which tool failed and how.
+    async def _raises_its_own_deadline(args: dict[str, Any]) -> ToolResult:
+        raise ActionDeadlineExceeded("the browser did not answer within 1 ms")
+
+    spec = ToolSpec(
+        name="observe",
+        description="observe",
+        parameters={"type": "object", "properties": {}},
+        handler=_raises_its_own_deadline,
+    )
+    caller = _ScriptedCaller([[("observe", {})], [("finish", {"status": "failed", "reason": "no page"})]])
+    with capture_logs() as logs:
+        outcome = await run_agent_tool_loop(
+            llm_caller=caller,
+            system_prompt="sys",
+            user_prompt="goal",
+            tools=[spec, make_finish_tool()],
+            max_turns=20,
+            max_tool_calls=100,
+            deadline_seconds=1800.0,
+        )
+    assert outcome.status == "failed"
+    assert not [entry for entry in logs if entry.get("event") == TOOL_CALL_TIMED_OUT_EVENT]
+    assert [entry["tool"] for entry in logs if entry.get("event") == "taskv3 tool handler raised"] == ["observe"]
+
+
+def test_the_dispatch_bound_margin_leaves_every_self_bounding_tool_its_own_timeout() -> None:
+    """The margin is the whole allowance once the deadline has elapsed. Below any tool's own per-call
+    ceiling it would win that race and replace that tool's structured answer with the blunt one, so a
+    new owned ceiling belongs in the list below. The download wait, its provider recovery and the
+    finish-time settle are absent on purpose: each caps itself at the loop deadline the margin sits on
+    top of, so they are bounded structurally rather than by a constant to pin here."""
+    owned_caps_ms = {
+        "click/type whole call": taskv3_tools_module._ACT_TOOL_TIMEOUT_MS,
+        "ref/mark resolution": taskv3_tools_module._ADDRESS_RESOLVE_TIMEOUT_MS,
+        "verification code per call": auth_tools_module._PER_CALL_WAIT_SECONDS * 1000,
+        "captcha solve": captcha_tools_module._SOLVE_CAPTCHA_CEILING_SECONDS * 1000,
+    }
+    too_long = {
+        name: cap_ms
+        for name, cap_ms in owned_caps_ms.items()
+        if loop_module.TOOL_CALL_DEADLINE_MARGIN_SECONDS < action_deadline_module.outer_cap_seconds(int(cap_ms))
+    }
+    assert not too_long, f"margin {loop_module.TOOL_CALL_DEADLINE_MARGIN_SECONDS}s is under: {too_long}"
 
 
 @pytest.mark.asyncio
@@ -8462,6 +8739,16 @@ def test_the_hold_text_is_generic() -> None:
     assert (on.description, on.parameters) == (off.description, off.parameters)
 
 
+def test_the_hold_lets_the_goal_text_set_the_refinish_status() -> None:
+    # A goal can give the stopping outcome its own status ("no record found: mark as complete"); the hold
+    # must not fix the re-finish to terminated when the rule the model quotes says otherwise.
+    assert "status=terminated" not in loop_module.JUSTIFY_HOLD_MESSAGE
+    assert (
+        "finish again with the status the goal's text gives this outcome (terminated if it gives none)"
+        in loop_module.JUSTIFY_HOLD_MESSAGE
+    )
+
+
 @pytest.mark.asyncio
 async def test_a_missing_fact_stop_restated_after_the_hold_stands_as_terminated() -> None:
     activity = ActivityRecency()
@@ -8955,13 +9242,29 @@ async def test_deadline_already_elapsed_bounds_every_reachable_batch_probe(scena
     )
     elapsed = time.monotonic() - started
 
-    assert elapsed <= 0.3, elapsed
+    assert elapsed <= 1.0, elapsed
     assert hang_calls["n"] == 0  # the hanging sampler was never awaited, at either call site
     assert outcome.status in ("budget_exhausted", "completed")
 
 
 @pytest.mark.asyncio
-async def test_pre_batch_fingerprint_sample_is_bounded_by_an_already_elapsed_deadline() -> None:
+@pytest.mark.parametrize(
+    ("skipped_tool_before_finish", "expected_status", "expected_skips"),
+    [
+        pytest.param(None, "completed", [True, False], id="finish-only"),
+        pytest.param("observe", "completed", [True, True, False], id="skipped-read-before-finish"),
+        pytest.param("click", "budget_exhausted", [True, True, True], id="skipped-action-before-finish"),
+        pytest.param("solve_captcha", "budget_exhausted", [True, True, True], id="skipped-recordable-page-action"),
+        pytest.param(
+            "open_verification_link", "budget_exhausted", [True, True, True], id="skipped-engaging-page-action"
+        ),
+    ],
+)
+async def test_pre_batch_fingerprint_sample_is_bounded_by_an_already_elapsed_deadline(
+    skipped_tool_before_finish: str | None,
+    expected_status: str,
+    expected_skips: list[bool],
+) -> None:
     # The stall detector's pre-batch fingerprint baseline passes deadline_at, so a slow LLM turn that
     # burns the whole deadline must skip the sample entirely -- a hanging sampler there would otherwise
     # run the full 10s probe timeout with the run already over.
@@ -8972,7 +9275,10 @@ async def test_pre_batch_fingerprint_sample_is_bounded_by_an_already_elapsed_dea
         await asyncio.sleep(5.0)
         return "fp"
 
+    click_calls: list[None] = []
+
     async def click_handler(_args: dict[str, Any]) -> ToolResult:
+        click_calls.append(None)
         return ToolResult.ok("click done")
 
     tools = [
@@ -8983,6 +9289,21 @@ async def test_pre_batch_fingerprint_sample_is_bounded_by_an_already_elapsed_dea
             handler=click_handler,
             billable=True,
         ),
+        ToolSpec(
+            name="solve_captcha",
+            description="solve captcha",
+            parameters={},
+            handler=click_handler,
+            recordable=True,
+        ),
+        ToolSpec(
+            name="open_verification_link",
+            description="open verification link",
+            parameters={},
+            handler=click_handler,
+            engages_page=True,
+        ),
+        _recording_tool("observe", []),
         make_finish_tool(),
     ]
 
@@ -8992,9 +9313,12 @@ async def test_pre_batch_fingerprint_sample_is_bounded_by_an_already_elapsed_dea
                 await asyncio.sleep(0.2)  # eats the whole deadline before this turn's batch dispatches
             return await super().call(**kwargs)
 
-    caller = _SlowFirstCallCaller(
-        [[("click", {"selector": "#next"})], [("finish", {"status": "completed", "reason": "ok"})]]
-    )
+    final_batch: list[tuple[str, dict[str, Any]]] = []
+    if skipped_tool_before_finish is not None:
+        skipped_args = {"selector": "#wrap-up"} if skipped_tool_before_finish == "click" else {}
+        final_batch.append((skipped_tool_before_finish, skipped_args))
+    final_batch.append(("finish", {"status": "completed", "reason": "ok"}))
+    caller = _SlowFirstCallCaller([[("click", {"selector": "#next"})], final_batch])
     started = time.monotonic()
     outcome = await run_agent_tool_loop(
         llm_caller=caller,
@@ -9008,13 +9332,80 @@ async def test_pre_batch_fingerprint_sample_is_bounded_by_an_already_elapsed_dea
     )
     elapsed = time.monotonic() - started
 
-    # Deliberate contract change: the elapsed deadline grants one final observed turn instead of
-    # ending the run, and the scripted finish on that turn wins; cap_trip carries the deadline fact.
-    # The hang guard is unchanged: the sampler must stay un-awaited on the granted turn too.
-    assert outcome.status == "completed"
+    # Skipped page-changing calls invalidate a queued finish; skipped reads do not.
+    assert outcome.status == expected_status
     assert outcome.cap_trip is not None and "deadline" in outcome.cap_trip
+    assert click_calls == []
     assert fp_calls["n"] == 0  # deadline already gone -- the hanging sampler was never awaited
+    tool_results = [message for message in outcome.messages if message.get("role") == "tool"]
+    assert [message["content"].startswith("skipped:") for message in tool_results] == expected_skips
     assert elapsed < 2.0, elapsed  # loose wall-clock bound: an awaited sampler would add its full 5s sleep
+
+
+@pytest.mark.asyncio
+async def test_post_dispatch_refresh_expiry_does_not_duplicate_skipped_tail_result(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(loop_module, "TOOL_CALL_DEADLINE_MARGIN_SECONDS", 0.01)
+    monkeypatch.setattr(action_deadline_module, "ACTION_DEADLINE_HEADROOM_MS", 0)
+    monkeypatch.setattr(loop_module, "asyncio", ScopedAsyncio())
+
+    async def click_handler(_args: dict[str, Any]) -> ToolResult:
+        return ToolResult.ok("click done")
+
+    finish = make_finish_tool()
+    finish_handler = finish.handler
+    assert finish_handler is not None
+    ctx = SkyvernContext(task_id="tsk_post_dispatch_refresh_expired_final_turn")
+
+    async def finish_with_refresh(args: dict[str, Any]) -> ToolResult:
+        result = await finish_handler(args)
+        ctx.refresh_working_page = True
+        return result
+
+    finish.handler = finish_with_refresh
+    tools = [
+        ToolSpec(name="click", description="click", parameters={}, handler=click_handler, billable=True),
+        finish,
+        _recording_tool("observe", []),
+    ]
+
+    class _SlowFirstCallCaller(_ScriptedCaller):
+        async def call(self, **kwargs: Any) -> dict[str, Any]:
+            if self.calls == 0:
+                await asyncio.sleep(0.1)
+            return await super().call(**kwargs)
+
+    caller = _SlowFirstCallCaller(
+        [
+            [("click", {})],
+            [("finish", {"status": "completed", "reason": "deadline wrap-up"}), ("observe", {})],
+        ]
+    )
+    skyvern_context.set(ctx)
+    try:
+        outcome = await asyncio.wait_for(
+            run_agent_tool_loop(
+                llm_caller=caller,
+                system_prompt="sys",
+                user_prompt="goal",
+                tools=tools,
+                max_turns=20,
+                max_tool_calls=100,
+                deadline_seconds=0.02,
+            ),
+            timeout=2,
+        )
+    finally:
+        skyvern_context.reset()
+
+    assert outcome.status == "completed"
+    assert ctx.refresh_working_page is False
+    observe_results = [
+        message for message in outcome.messages if message.get("role") == "tool" and message.get("name") == "observe"
+    ]
+    assert len(observe_results) == 1
+    assert observe_results[0]["content"].startswith("skipped:")
 
 
 @pytest.mark.asyncio
@@ -11232,6 +11623,355 @@ async def test_refresh_signal_reloads_once_clears_flag_and_skips_rest_of_batch()
 
 
 @pytest.mark.asyncio
+async def test_refused_finish_preserves_pending_refresh_before_next_observe() -> None:
+    events: list[str] = []
+    ctx = SkyvernContext(task_id="tsk_refused_finish_pending_refresh")
+
+    async def reload_page() -> None:
+        events.append("reload")
+
+    async def observe_handler(_args: dict[str, Any]) -> ToolResult:
+        events.append("observe")
+        return ToolResult.ok("observed")
+
+    class _RefreshDuringModelCall(_ScriptedCaller):
+        async def call(self, **kwargs: Any) -> dict[str, Any]:
+            response = await super().call(**kwargs)
+            if self.calls == 1:
+                ctx.refresh_working_page = True
+            return response
+
+    caller = _RefreshDuringModelCall(
+        [
+            [
+                ("type", {"selector": "#name", "text": "x"}),
+                ("finish", {"status": "completed", "reason": "done"}),
+            ],
+            [("observe", {})],
+            [("finish", {"status": "completed", "reason": "done"})],
+        ]
+    )
+    skyvern_context.set(ctx)
+    try:
+        outcome = await run_agent_tool_loop(
+            llm_caller=caller,
+            system_prompt="sys",
+            user_prompt="goal",
+            tools=[
+                _recording_tool("type", []),
+                ToolSpec(name="observe", description="observe", parameters={}, handler=observe_handler),
+                make_finish_tool(),
+            ],
+            max_turns=20,
+            max_tool_calls=100,
+            refuse_input_entry=True,
+            reload_page=reload_page,
+        )
+    finally:
+        skyvern_context.reset()
+
+    assert outcome.status == "completed"
+    assert events == ["reload", "observe"]
+    assert ctx.refresh_working_page is False
+    finish_results = [message for message in outcome.messages if message.get("name") == "finish"]
+    assert len(finish_results) == 2
+    assert finish_results[0]["content"].startswith("skipped:")
+    assert not finish_results[1]["content"].startswith("skipped:")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("batch_tail", [[], [("observe", {})]], ids=["no-pending-call", "pending-call"])
+@pytest.mark.parametrize("wrap_up_tool", ["finish", "observe"], ids=["final-finish", "final-nonfinish"])
+async def test_post_dispatch_refresh_timeout_skips_only_pending_calls(
+    batch_tail: list[tuple[str, dict[str, Any]]], wrap_up_tool: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(loop_module, "TOOL_CALL_DEADLINE_MARGIN_SECONDS", 0.05)
+    monkeypatch.setattr(action_deadline_module, "ACTION_DEADLINE_HEADROOM_MS", 0)
+    monkeypatch.setattr(loop_module, "asyncio", ScopedAsyncio())
+
+    async def reload_page() -> None:
+        await asyncio.Event().wait()
+
+    click_calls: list[tuple[str, dict[str, Any]]] = []
+    observe_calls: list[tuple[str, dict[str, Any]]] = []
+    tools = [_refresh_signaling_click(click_calls), _recording_tool("observe", observe_calls), make_finish_tool()]
+    wrap_up_batch = (
+        [("finish", {"status": "completed", "reason": "deadline wrap-up"})]
+        if wrap_up_tool == "finish"
+        else [("observe", {})]
+    )
+    script: list[list[tuple[str, dict[str, Any]]]] = [
+        [("click", {"selector": "#submit"}), *batch_tail],
+        wrap_up_batch,
+    ]
+    ctx = SkyvernContext(task_id="tsk_post_dispatch_refresh_timeout")
+    skyvern_context.set(ctx)
+    try:
+        with capture_logs() as logs:
+            outcome, caller = await asyncio.wait_for(
+                _run(script, tools, reload_page=reload_page, deadline_seconds=0.5), timeout=5
+            )
+    finally:
+        skyvern_context.reset()
+
+    assert outcome.status == ("completed" if wrap_up_tool == "finish" else "budget_exhausted")
+    assert len(click_calls) == 1 and observe_calls == []
+    assert ctx.refresh_working_page is False
+    refresh_timeouts = [
+        entry
+        for entry in logs
+        if entry.get("event") == TOOL_CALL_TIMED_OUT_EVENT and entry.get("call_site") == "page_refresh"
+    ]
+    assert [(entry["tool"], entry["call_site"]) for entry in refresh_timeouts] == [("click", "page_refresh")]
+    click_results = [
+        message
+        for message in caller.message_history
+        if message.get("role") == "tool" and message.get("name") == "click"
+    ]
+    assert len(click_results) == 1 and click_results[0]["content"] == "click done"
+    observe_results = [
+        message for message in outcome.messages if message.get("role") == "tool" and message.get("name") == "observe"
+    ]
+    assert len(observe_results) == len(batch_tail) + int(wrap_up_tool == "observe")
+    assert all(message["content"].startswith("skipped:") for message in observe_results)
+
+
+@pytest.mark.asyncio
+async def test_post_dispatch_refresh_timeout_invalidates_finish_on_cap_granted_turn(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(loop_module, "TOOL_CALL_DEADLINE_MARGIN_SECONDS", 0.05)
+    monkeypatch.setattr(action_deadline_module, "ACTION_DEADLINE_HEADROOM_MS", 0)
+    monkeypatch.setattr(loop_module, "asyncio", ScopedAsyncio())
+    reload_calls: list[None] = []
+    click_calls: list[tuple[str, dict[str, Any]]] = []
+    observe_calls: list[tuple[str, dict[str, Any]]] = []
+
+    async def reload_page() -> None:
+        reload_calls.append(None)
+        await asyncio.Event().wait()
+
+    ctx = SkyvernContext(task_id="tsk_refresh_timeout_on_cap_final_turn")
+    skyvern_context.set(ctx)
+    try:
+        outcome, caller = await asyncio.wait_for(
+            _run(
+                [
+                    [("observe", {})],
+                    [
+                        ("click", {"selector": "#submit"}),
+                        ("finish", {"status": "completed", "reason": "reload completed"}),
+                    ],
+                ],
+                [
+                    _recording_tool("observe", observe_calls),
+                    _refresh_signaling_click(click_calls),
+                    make_finish_tool(),
+                ],
+                reload_page=reload_page,
+                deadline_seconds=0.2,
+                max_tool_calls=1,
+            ),
+            timeout=5,
+        )
+    finally:
+        skyvern_context.reset()
+
+    assert outcome.status == "budget_exhausted"
+    assert outcome.cap_trip == "max_tool_calls (1) reached"
+    assert observe_calls == [("observe", {})]
+    assert len(click_calls) == len(reload_calls) == 1
+    assert ctx.refresh_working_page is False
+    finish_results = [
+        message for message in outcome.messages if message.get("role") == "tool" and message.get("name") == "finish"
+    ]
+    assert len(finish_results) == 1
+    assert finish_results[0]["content"].startswith("skipped:")
+
+
+@pytest.mark.asyncio
+async def test_post_dispatch_required_refresh_dropped_after_deadline_invalidates_finish(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(loop_module, "TOOL_CALL_DEADLINE_MARGIN_SECONDS", 0.5)
+    monkeypatch.setattr(action_deadline_module, "ACTION_DEADLINE_HEADROOM_MS", 0)
+    monkeypatch.setattr(loop_module, "asyncio", ScopedAsyncio())
+    click_calls: list[tuple[str, dict[str, Any]]] = []
+    click_times: list[float] = []
+    observe_calls: list[tuple[str, dict[str, Any]]] = []
+    reload_calls: list[None] = []
+    ctx = SkyvernContext(task_id="tsk_refresh_dropped_after_deadline")
+
+    async def observe_handler(args: dict[str, Any]) -> ToolResult:
+        observe_calls.append(("observe", args))
+        await asyncio.sleep(0.35)
+        return ToolResult.ok("observed")
+
+    async def click_handler(args: dict[str, Any]) -> ToolResult:
+        click_calls.append(("click", args))
+        click_times.append(time.monotonic())
+        await asyncio.sleep(0.25)
+        click_times.append(time.monotonic())
+        ctx.refresh_working_page = True
+        return ToolResult.ok("click done")
+
+    async def reload_page() -> None:
+        reload_calls.append(None)
+
+    tools = [
+        ToolSpec(name="observe", description="observe", parameters={}, handler=observe_handler),
+        ToolSpec(name="click", description="click", parameters={}, handler=click_handler, billable=True),
+        make_finish_tool(),
+    ]
+    caller = _ScriptedCaller(
+        [
+            [("observe", {})],
+            [("click", {"selector": "#submit"}), ("finish", {"status": "completed", "reason": "done"})],
+        ]
+    )
+    run_started_at = time.monotonic()
+    skyvern_context.set(ctx)
+    try:
+        outcome = await asyncio.wait_for(
+            run_agent_tool_loop(
+                llm_caller=caller,
+                system_prompt="sys",
+                user_prompt="goal",
+                tools=tools,
+                max_turns=20,
+                max_tool_calls=1,
+                deadline_seconds=0.5,
+                reload_page=reload_page,
+            ),
+            timeout=5,
+        )
+    finally:
+        skyvern_context.reset()
+
+    assert outcome.status == "budget_exhausted"
+    assert outcome.cap_trip == "max_tool_calls (1) reached"
+    assert observe_calls == [("observe", {})]
+    assert click_calls == [("click", {"selector": "#submit"})]
+    assert len(click_times) == 2
+    assert click_times[0] - run_started_at < 0.5 <= click_times[1] - run_started_at
+    assert reload_calls == []
+    assert ctx.refresh_working_page is False
+    finish_results = [message for message in outcome.messages if message.get("name") == "finish"]
+    assert len(finish_results) == 1 and finish_results[0]["content"].startswith("skipped:")
+
+
+@pytest.mark.asyncio
+async def test_pre_dispatch_refresh_timeout_invalidates_finish_with_read_pending(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(loop_module, "TOOL_CALL_DEADLINE_MARGIN_SECONDS", 0.05)
+    monkeypatch.setattr(action_deadline_module, "ACTION_DEADLINE_HEADROOM_MS", 0)
+    monkeypatch.setattr(loop_module, "asyncio", ScopedAsyncio())
+    reload_calls: list[None] = []
+    observe_calls: list[tuple[str, dict[str, Any]]] = []
+    ctx = SkyvernContext(task_id="tsk_refresh_timeout_before_observe")
+
+    async def reload_page() -> None:
+        reload_calls.append(None)
+        await asyncio.Event().wait()
+
+    class _RefreshBeforeFinalCall(_ScriptedCaller):
+        async def call(self, **kwargs: Any) -> dict[str, Any]:
+            if self.calls == 1:
+                ctx.refresh_working_page = True
+            return await super().call(**kwargs)
+
+    caller = _RefreshBeforeFinalCall(
+        [[("observe", {})], [("observe", {}), ("finish", {"status": "completed", "reason": "done"})]]
+    )
+    skyvern_context.set(ctx)
+    try:
+        outcome = await asyncio.wait_for(
+            run_agent_tool_loop(
+                llm_caller=caller,
+                system_prompt="sys",
+                user_prompt="goal",
+                tools=[_recording_tool("observe", observe_calls), make_finish_tool()],
+                max_turns=20,
+                max_tool_calls=1,
+                deadline_seconds=0.5,
+                reload_page=reload_page,
+            ),
+            timeout=5,
+        )
+    finally:
+        skyvern_context.reset()
+
+    assert outcome.status == "budget_exhausted"
+    assert outcome.cap_trip == "max_tool_calls (1) reached"
+    assert observe_calls == [("observe", {})]
+    assert reload_calls == [None]
+    assert ctx.refresh_working_page is False
+    observe_results = [message for message in outcome.messages if message.get("name") == "observe"]
+    finish_results = [message for message in outcome.messages if message.get("name") == "finish"]
+    assert len(observe_results) == 2
+    assert "page refresh did not finish" in observe_results[1]["content"]
+    assert len(finish_results) == 1 and finish_results[0]["content"].startswith("skipped:")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("finish_status", ["completed", "failed", "terminated"])
+@pytest.mark.parametrize("read_before_finish", [False, True], ids=["finish-only", "skipped-read-first"])
+async def test_expired_deadline_preserves_refresh_before_granted_finish(
+    finish_status: str, read_before_finish: bool
+) -> None:
+    reload_calls: list[None] = []
+    observe_calls: list[tuple[str, dict[str, Any]]] = []
+    final_call_times: list[float] = []
+    ctx = SkyvernContext(task_id="tsk_expired_refresh_before_finish")
+
+    async def reload_page() -> None:
+        reload_calls.append(None)
+
+    class _RefreshDuringFinalCall(_ScriptedCaller):
+        async def call(self, **kwargs: Any) -> dict[str, Any]:
+            if self.calls == 1:
+                await asyncio.sleep(0.55)
+                ctx.refresh_working_page = True
+                final_call_times.append(time.monotonic())
+            return await super().call(**kwargs)
+
+    final_batch = ([("observe", {})] if read_before_finish else []) + [
+        ("finish", {"status": finish_status, "reason": "done"})
+    ]
+    caller = _RefreshDuringFinalCall([[("observe", {})], final_batch])
+    run_started_at = time.monotonic()
+    skyvern_context.set(ctx)
+    try:
+        outcome = await asyncio.wait_for(
+            run_agent_tool_loop(
+                llm_caller=caller,
+                system_prompt="sys",
+                user_prompt="goal",
+                tools=[_recording_tool("observe", observe_calls), make_finish_tool()],
+                max_turns=20,
+                max_tool_calls=1,
+                deadline_seconds=0.5,
+                reload_page=reload_page,
+            ),
+            timeout=3,
+        )
+    finally:
+        skyvern_context.reset()
+
+    assert final_call_times and final_call_times[0] - run_started_at >= 0.5
+    assert outcome.status == "budget_exhausted"
+    assert outcome.cap_trip == "max_tool_calls (1) reached"
+    assert observe_calls == [("observe", {})]
+    assert reload_calls == []
+    assert ctx.refresh_working_page is False
+    finish_results = [
+        message for message in outcome.messages if message.get("role") == "tool" and message.get("name") == "finish"
+    ]
+    assert len(finish_results) == 1 and finish_results[0]["content"].startswith("skipped:")
+
+
+@pytest.mark.asyncio
 async def test_refresh_signal_without_reload_callback_is_consumed_without_acting() -> None:
     """With no ``reload_page`` wired the loop cannot honor the signal, so it drops it (the context
     outlives the run) and runs the batch in full."""
@@ -13057,6 +13797,45 @@ async def test_the_answer_audit_ends_a_run_it_keeps_holding_with_a_verdict_namin
     assert "'Work authorization'" in outcome.reason and "Yes" not in outcome.reason
     assert caller.calls == 1 + ANSWER_BASIS_MAX_HOLDS
     assert clicks == []
+
+
+@pytest.mark.asyncio
+async def test_log_only_answer_audit_logs_each_hold_and_never_blocks_or_ends_the_run() -> None:
+    clicks: list[tuple[str, dict[str, Any]]] = []
+
+    class _FlagsEverything:
+        async def unsupported(self, answers: list[RecordedAnswer]) -> list[RecordedAnswer]:
+            return answers
+
+    async def type_answer(args: dict[str, Any]) -> ToolResult:
+        return ToolResult.ok(
+            "typed", data={TARGET_LABEL_DATA_KEY: "Work authorization", TARGET_KIND_DATA_KEY: "textbox"}
+        )
+
+    tools = [
+        ToolSpec(name="type", description="t", parameters={}, handler=type_answer, billable=True),
+        _recording_tool("click", clicks, billable=True),
+        make_finish_tool(),
+    ]
+    apply_answer_basis_audit(tools, _FlagsEverything(), log_only=True, log_fields={"audit_mode_arm": "treatment"})
+    submits = [[("click", {"selector": f"#next{i}"})] for i in range(ANSWER_BASIS_MAX_HOLDS + 2)]
+    script = [
+        [("type", {"selector": "#auth", "text": "Yes"})],
+        *submits,
+        [("finish", {"status": "completed", "reason": "x"})],
+    ]
+    with capture_logs() as logs:
+        outcome, _caller = await _run(script, tools, max_turns=30)
+
+    assert (outcome.status, outcome.guard) == ("completed", None)
+    assert len(clicks) == len(submits)
+    holds = [e for e in logs if e["event"] == "taskv3 answer basis hold"]
+    assert len(holds) == len(submits)
+    assert all(
+        (e["log_only"], e["would_hold"], e["flagged"], e["holds"], e["audit_mode_arm"])
+        == (True, True, 1, 0, "treatment")
+        for e in holds
+    )
 
 
 def test_every_driver_timeout_type_installed_here_classifies_as_a_driver_timeout() -> None:

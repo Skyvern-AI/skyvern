@@ -489,6 +489,10 @@ async def get_workflow_run_response(
     # A fresh run reads/writes no saved memory; its run_request echoes start_fresh_browser and drops the
     # session/profile so it stays valid (the mutually-exclusive validators) and reflects what was asked.
     fresh_browser = bool(workflow_run.start_fresh_browser)
+    browser_type = read_browser_type(workflow_run)
+    # Ingress rejects browser_type with a caller-supplied browser, so a typed run's session/address was server
+    # assigned; the echo drops it because WorkflowRunResponse re-runs the conflict check without server context.
+    echo_attachment = browser_type is None
     return WorkflowRunResponse(
         run_id=workflow_run_id,
         run_type=RunType.workflow_run,
@@ -528,11 +532,13 @@ async def get_workflow_run_response(
                 "totp_url": workflow_run.totp_verification_url or None,
                 "totp_identifier": workflow_run.totp_identifier,
                 "max_screenshot_scrolls": workflow_run.max_screenshot_scrolls,
-                "browser_address": workflow_run.browser_address,
+                "browser_address": workflow_run.browser_address if echo_attachment else None,
                 "browser_profile_id": None if fresh_browser else workflow_run.browser_profile_id,
-                "browser_session_id": None if fresh_browser else workflow_run.browser_session_id,
+                "browser_session_id": workflow_run.browser_session_id
+                if echo_attachment and not fresh_browser
+                else None,
                 "start_fresh_browser": fresh_browser,
-                "browser_type": read_browser_type(workflow_run),
+                "browser_type": browser_type,
             },
             context=_SERVER_ASSIGNED_BROWSER_ATTACHMENT_CONTEXT,
         ),

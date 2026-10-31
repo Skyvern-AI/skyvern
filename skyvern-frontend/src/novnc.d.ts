@@ -22,6 +22,7 @@ declare module "@novnc/novnc/lib/rfb.js" {
     shared?: boolean;
     resizeSession?: boolean;
     viewOnly?: boolean;
+    wsProtocols?: string[];
     [key: string]: unknown;
   }
 

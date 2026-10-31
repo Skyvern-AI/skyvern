@@ -34,6 +34,7 @@ import structlog
 from skyvern.config import settings
 from skyvern.errors.errors import resolve_error_code_mapping_key
 from skyvern.exceptions import (
+    ActionDeadlineExceeded,
     CompletionGateTerminationError,
     MissingBrowserState,
     MissingBrowserStatePage,
@@ -57,6 +58,8 @@ from skyvern.forge.taskv3.run_arms import DEAD_END_RETURN_FLAG, run_arm_enabled
 from skyvern.forge.taskv3.target_label import describe_target
 from skyvern.schemas.steps import StepToolCall
 from skyvern.schemas.workflows import ERROR_CODE_MAPPING_MAX_ENTRIES, ERROR_CODE_MAPPING_MAX_UTF8_BYTES
+from skyvern.webeye import action_deadline
+from skyvern.webeye.action_deadline import under_action_deadline
 from skyvern.webeye.navigation import clear_task_nav_error_code, redact_url_secrets
 
 LOG = structlog.get_logger()
@@ -266,6 +269,10 @@ CoveredLayerKind = Literal[
     # The probe named no element at all.
     "unnamed",
 ]
+
+
+class _RefreshDisposition(Enum):
+    FAILED = "failed"
 
 
 @dataclass
@@ -497,7 +504,12 @@ def record_type_reach(*, acted_in_frame: bool, probe_scrolled: bool, hit_on_docu
         "probe_scrolled": probe_scrolled,
         "hit_on_document_root": hit_on_document_root,
     }
-    _TYPE_REACH.set({key: value or seen.get(key, False) for key, value in new.items()})
+    _TYPE_REACH.set({**seen, **{key: value or seen.get(key, False) for key, value in new.items()}})
+
+
+def record_type_caret_held() -> None:
+    """Record that a typing call typed into the caret its field already held. Telemetry only."""
+    _TYPE_REACH.set({**(_TYPE_REACH.get() or {}), "caret_held": True})
 
 
 def record_click_dispatched() -> None:
@@ -728,9 +740,9 @@ def _candidate_hold_message(held: dict[str, str]) -> str:
 _CANDIDATE_HOLD_SKIP = "queued before the held download facts above were shown; decide on them, then finish again"
 JUSTIFY_HOLD_MESSAGE = (
     "verdict held once: a terminated verdict needs a rule written in the goal, its criteria or these instructions, "
-    "or text on the page, that prevents the task. If you can quote it, finish again with status=terminated and the "
-    "verdict will stand. If you cannot, nothing prevents the task: continue it. If a field the form requires has no "
-    "value in the data, finish again and name that field."
+    "or text on the page, that prevents the task. If you can quote it, finish again with the status the goal's text "
+    "gives this outcome (terminated if it gives none) and the verdict will stand. If you cannot, nothing prevents "
+    "the task: continue it. If a field the form requires has no value in the data, finish again and name that field."
 )
 _JUSTIFY_HOLD_SKIP = "queued after a finish that was held; read the hold above, then decide"
 # Telemetry only: the loop never reads it, so no verdict depends on a model's wording.
@@ -1674,6 +1686,49 @@ async def _sample_probe(probe: Callable[[], Awaitable[str | None]], deadline_at:
         return None
 
 
+TOOL_CALL_STARTED_EVENT = "taskv3 tool call started"
+TOOL_CALL_TIMED_OUT_EVENT = "taskv3 tool call timed out"
+# Let self-bounded tools return their own structured errors before the loop stops waiting.
+TOOL_CALL_DEADLINE_MARGIN_SECONDS = 600.0
+
+
+def _tool_call_budget_ms(deadline_at: float | None) -> int | None:
+    """Bound one call by the loop's remaining deadline plus its fixed margin. A missing deadline leaves it unbounded."""
+    if deadline_at is None:
+        return None
+    return round((max(deadline_at - time.monotonic(), 0.0) + TOOL_CALL_DEADLINE_MARGIN_SECONDS) * 1000)
+
+
+def _dispatch_bound_expired(exc: BaseException, started_at: float, budget_ms: int) -> bool:
+    """Distinguish this scope's expiry from a tool-owned one using elapsed time. The context manager's active headroom is part of that elapsed budget."""
+    if not isinstance(exc, ActionDeadlineExceeded):
+        return False
+    return (time.monotonic() - started_at) * 1000 >= budget_ms + action_deadline.ACTION_DEADLINE_HEADROOM_MS
+
+
+def _tool_call_timed_out(tool_name: str, budget_ms: int, *, call_site: str = "dispatch") -> ToolResult:
+    LOG.warning(TOOL_CALL_TIMED_OUT_EVENT, tool=tool_name, budget_ms=budget_ms, call_site=call_site)
+    if call_site == "dispatch":
+        # Only the handler can have partially applied the action before timing out.
+        message = (
+            f"{tool_name} did not finish within {budget_ms // 1000} s and was stopped; it may already have "
+            "taken effect. Observe the page before acting again."
+        )
+        data = {CLICK_DISPATCHED_DATA_KEY: True} if tool_name == "click" else None
+    else:
+        step = "pre-action capture" if call_site == "on_pre_action" else "page refresh"
+        message = (
+            f"{tool_name} was not dispatched because its {step} did not finish within {budget_ms // 1000} s; "
+            "the tool handler did not run. Observe the page before retrying."
+        )
+        data = None
+    return ToolResult.error(
+        message,
+        data=data,
+        error_class="timeout_other",
+    )
+
+
 # The code tool drives the page through Playwright directly, so the loop sees one tool call where an
 # arbitrary number of clicks and submits may have happened. Named here, beside the detector, because
 # the detector is what has to know: it is the one fact about that tool the submit guards need, and a
@@ -2487,6 +2542,7 @@ _TOOL_CALL_RECORD_FIELDS = frozenset(
         "acted_in_frame",
         "probe_scrolled",
         "hit_on_document_root",
+        "caret_held",
         "page_state_stall_rounds",
         "page_state_judged",
     }
@@ -4283,10 +4339,76 @@ async def run_agent_tool_loop(
         st.event_seq += 1
         st.last_change_evidence_seq = st.event_seq
 
-    async def _consume_refresh_signal(
-        ctx: SkyvernContext, tool_name: str, remaining: list[Any], round_actions: list[Any], *, drop: bool
+    def _skip_expired_batch_calls(remaining: list[tuple[str, str, dict[str, Any]]]) -> bool | None:
+        if deadline_at is None or time.monotonic() < deadline_at:
+            return False
+        if st.final_turn_granted and remaining and _is_finish(remaining[0][1]):
+            return False
+        ctx = skyvern_context.current()
+        preserve_refresh_for_finish = (
+            st.final_turn_granted
+            and reload_page is not None
+            and ctx is not None
+            and ctx.refresh_working_page
+            and any(_is_finish(tool_name) for _, tool_name, _ in remaining[1:])
+        )
+        if ctx is not None and not preserve_refresh_for_finish:
+            ctx.refresh_working_page = False
+        if st.final_turn_granted:
+            _append_skipped_tool_results(st.messages, remaining[:1], "the run deadline was reached before dispatch")
+            return None
+        _append_skipped_tool_results(st.messages, remaining, "the run deadline was reached before dispatch")
+        return True
+
+    def _append_timed_out_tool_call(
+        remaining: list[tuple[str, str, dict[str, Any]]],
+        tool_name: str,
+        budget_ms: int,
+        call_site: str,
+        *,
+        pending_tool_call_id: str | None,
     ) -> bool:
+        result = _tool_call_timed_out(tool_name, budget_ms, call_site=call_site)
+        if pending_tool_call_id is not None:
+            st.messages.append(
+                {"role": "tool", "tool_call_id": pending_tool_call_id, "name": tool_name, "content": result.content}
+            )
+            remaining = remaining[1:]
+        if st.final_turn_granted:
+            return False
+        _append_skipped_tool_results(st.messages, remaining, "the run deadline was reached before dispatch")
+        return True
+
+    async def _consume_refresh_signal(
+        ctx: SkyvernContext,
+        tool_name: str,
+        remaining: list[Any],
+        round_actions: list[Any],
+        *,
+        drop: bool,
+        pending_tool_call_id: str | None,
+    ) -> bool | None | _RefreshDisposition:
         """Clear the page-refresh signal and, unless dropped or past the cap, reload and void `remaining`."""
+        if pending_tool_call_id is not None:
+            expired_call = _skip_expired_batch_calls(remaining)
+            if expired_call is not False:
+                if expired_call is None and not drop:
+                    return _RefreshDisposition.FAILED
+                return expired_call
+        elif deadline_at is not None and time.monotonic() >= deadline_at:
+            ctx.refresh_working_page = False
+            LOG.info(
+                "taskv3 loop refresh signal dropped", tool=tool_name, turn=st.turns, reason="deadline_after_dispatch"
+            )
+            if not drop:
+                return _RefreshDisposition.FAILED
+            return False
+        if deadline_at is not None and time.monotonic() >= deadline_at and remaining and _is_finish(remaining[0][1]):
+            LOG.info("taskv3 loop refresh signal dropped", tool=tool_name, turn=st.turns, reason="deadline_finish")
+            if not drop:
+                return _RefreshDisposition.FAILED
+            ctx.refresh_working_page = False
+            return False
         ctx.refresh_working_page = False
         st.refresh_cycles += 1
         if activity is not None:
@@ -4313,9 +4435,27 @@ async def run_agent_tool_loop(
             return True
         if reload_page is not None:
             reload_record = ("reload_page", {"reason": "a page-level handler requested a refresh"})
+            reload_budget_ms = _tool_call_budget_ms(deadline_at)
+            reload_started_at = time.monotonic()
+            LOG.info(TOOL_CALL_STARTED_EVENT, tool=tool_name, call_site="page_refresh")
             try:
-                await reload_page()
-            except Exception:
+                async with under_action_deadline(budget_ms=reload_budget_ms):
+                    await reload_page()
+            except Exception as exc:
+                if reload_budget_ms is not None and _dispatch_bound_expired(exc, reload_started_at, reload_budget_ms):
+                    round_actions.append(RoundAction(*reload_record, False))
+                    ctx.refresh_working_page = pending_tool_call_id is not None
+                    st.reload_failed_nudge_due = True
+                    should_stop_batch = _append_timed_out_tool_call(
+                        remaining,
+                        tool_name,
+                        reload_budget_ms,
+                        "page_refresh",
+                        pending_tool_call_id=(
+                            None if remaining and _is_finish(remaining[0][1]) else pending_tool_call_id
+                        ),
+                    )
+                    return should_stop_batch if should_stop_batch else _RefreshDisposition.FAILED
                 # The page did not change, so nothing is re-baselined; the queued calls are still
                 # voided (they were chosen on a page declared stale), the signal is re-armed for
                 # another attempt (bounded by the cap), and the model is told the reload failed.
@@ -5054,6 +5194,13 @@ async def run_agent_tool_loop(
                 _append_skipped_tool_results(st.messages, tool_calls[idx:], "run canceled")
                 break
             spec = tool_by_name.get(tool_name)
+            deadline_action = _skip_expired_batch_calls(tool_calls[idx:])
+            if deadline_action is True:
+                break
+            if deadline_action is None:
+                if spec is not None and spec.touches_page:
+                    batch_had_failure = True
+                continue
             call_selector = _call_selector(args)
             if marks_stale and call_selector is not None and call_selector.startswith("mark="):
                 if activity is not None:
@@ -5080,24 +5227,6 @@ async def run_agent_tool_loop(
                         "tool_call_id": tool_call_id,
                         "name": tool_name,
                         "content": f"skipped: depends on an earlier call in this batch on {call_selector} that failed",
-                    }
-                )
-                continue
-            if (batch_had_failure or batch_entry_unconfirmed) and _is_finish(tool_name):
-                # Any verdict queued behind the failure was written before the model saw it: a completed
-                # one may be false, and a failed/terminated one carries a reason that predates the error.
-                st.messages.append(
-                    {
-                        "role": "tool",
-                        "tool_call_id": tool_call_id,
-                        "name": tool_name,
-                        "content": (
-                            "skipped: a field in this batch failed before this verdict was reached; "
-                            "re-observe, then finish with a status that reflects the failure"
-                            if batch_had_failure
-                            else "skipped: a field in this batch could not confirm the value it was given before this "
-                            "verdict was reached; check that field, then finish"
-                        ),
                     }
                 )
                 continue
@@ -5398,13 +5527,32 @@ async def run_agent_tool_loop(
                                 "a further action was past the block's step limit"
                             )
                             # Through the real handler, so every guard on a completed verdict still applies.
-                            try:
-                                block_finish = await finish_spec.handler(
-                                    {"status": "completed", "reason": block_reason}
-                                )
-                            except Exception:
-                                LOG.warning("taskv3 block completion finish raised", exc_info=True)
+                            if deadline_at is not None and time.monotonic() >= deadline_at:
                                 block_finish = ToolResult.error("")
+                            else:
+                                block_finish_budget_ms = _tool_call_budget_ms(deadline_at)
+                                block_finish_started_at = time.monotonic()
+                                LOG.info(
+                                    TOOL_CALL_STARTED_EVENT, tool=finish_spec.name, call_site="block_completion_offer"
+                                )
+                                try:
+                                    async with under_action_deadline(budget_ms=block_finish_budget_ms):
+                                        block_finish = await finish_spec.handler(
+                                            {"status": "completed", "reason": block_reason}
+                                        )
+                                except Exception as block_finish_exc:
+                                    if block_finish_budget_ms is not None and _dispatch_bound_expired(
+                                        block_finish_exc, block_finish_started_at, block_finish_budget_ms
+                                    ):
+                                        LOG.warning(
+                                            TOOL_CALL_TIMED_OUT_EVENT,
+                                            tool=finish_spec.name,
+                                            budget_ms=block_finish_budget_ms,
+                                            call_site="block_completion_offer",
+                                        )
+                                    else:
+                                        LOG.warning("taskv3 block completion finish raised", exc_info=True)
+                                    block_finish = ToolResult.error("")
                             if block_finish.status == "ok" and (block_finish.data or {}).get("status") == "completed":
                                 st.outcome = LoopOutcome("completed", block_reason)
                                 break
@@ -5456,20 +5604,67 @@ async def run_agent_tool_loop(
             # gone leaves no artifacts; the recheck right before the handler covers the awaits below.
             hook_ctx = skyvern_context.current()
             if hook_ctx is not None and hook_ctx.refresh_working_page:
-                if await _consume_refresh_signal(
-                    hook_ctx, tool_name, tool_calls[idx:], round_actions, drop=reload_page is None
-                ):
+                refresh_action = await _consume_refresh_signal(
+                    hook_ctx,
+                    tool_name,
+                    tool_calls[idx:],
+                    round_actions,
+                    drop=reload_page is None,
+                    pending_tool_call_id=tool_call_id,
+                )
+                if refresh_action is True:
                     break
+                if refresh_action is _RefreshDisposition.FAILED:
+                    batch_had_failure = True
+                    if not _is_finish(tool_name):
+                        continue
+                    hook_ctx.refresh_working_page = False
+                if refresh_action is None:
+                    if spec is not None and spec.touches_page:
+                        batch_had_failure = True
+                    continue
+            deadline_action = _skip_expired_batch_calls(tool_calls[idx:])
+            if deadline_action is True:
+                break
+            if deadline_action is None:
+                if spec is not None and spec.touches_page:
+                    batch_had_failure = True
+                continue
             if (
                 spec is not None
                 and on_pre_action is not None
                 and tool_name != "solve_captcha"
                 and _arms_failure_evidence(tool_name, args, True)
             ):
+                pre_action_budget_ms = _tool_call_budget_ms(deadline_at)
+                pre_action_started_at = time.monotonic()
+                LOG.info(TOOL_CALL_STARTED_EVENT, tool=tool_name, call_site="on_pre_action")
                 try:
-                    await on_pre_action(tool_name, args)
-                except Exception:
+                    async with under_action_deadline(budget_ms=pre_action_budget_ms):
+                        await on_pre_action(tool_name, args)
+                except Exception as exc:
+                    if pre_action_budget_ms is not None and _dispatch_bound_expired(
+                        exc, pre_action_started_at, pre_action_budget_ms
+                    ):
+                        batch_had_failure = True
+                        should_stop_batch = _append_timed_out_tool_call(
+                            tool_calls[idx:],
+                            tool_name,
+                            pre_action_budget_ms,
+                            "on_pre_action",
+                            pending_tool_call_id=tool_call_id,
+                        )
+                        if should_stop_batch:
+                            break
+                        continue
                     LOG.warning("taskv3 on_pre_action callback failed", tool=tool_name, exc_info=True)
+            deadline_action = _skip_expired_batch_calls(tool_calls[idx:])
+            if deadline_action is True:
+                break
+            if deadline_action is None:
+                if spec is not None and spec.touches_page:
+                    batch_had_failure = True
+                continue
             # Sampled before dispatch so an error below can be checked for having moved the page even
             # when the tool set no flag (a raised exception carries none). Not billed to the tool's timing.
             probe_before: str | None = None
@@ -5491,10 +5686,56 @@ async def run_agent_tool_loop(
             # legacy per-action check does; the model chose it on a page that is gone.
             pre_ctx = skyvern_context.current()
             if pre_ctx is not None and pre_ctx.refresh_working_page:
-                if await _consume_refresh_signal(
-                    pre_ctx, tool_name, tool_calls[idx:], round_actions, drop=reload_page is None
-                ):
+                refresh_action = await _consume_refresh_signal(
+                    pre_ctx,
+                    tool_name,
+                    tool_calls[idx:],
+                    round_actions,
+                    drop=reload_page is None,
+                    pending_tool_call_id=tool_call_id,
+                )
+                if refresh_action is True:
                     break
+                if refresh_action is _RefreshDisposition.FAILED:
+                    batch_had_failure = True
+                    if not _is_finish(tool_name):
+                        continue
+                    pre_ctx.refresh_working_page = False
+                if refresh_action is None:
+                    if spec is not None and spec.touches_page:
+                        batch_had_failure = True
+                    continue
+            deadline_action = _skip_expired_batch_calls(tool_calls[idx:])
+            if deadline_action is True:
+                break
+            if deadline_action is None:
+                if spec is not None and spec.touches_page:
+                    batch_had_failure = True
+                continue
+            if _is_finish(tool_name):
+                ctx = skyvern_context.current()
+                if ctx is not None and reload_page is not None and ctx.refresh_working_page:
+                    batch_had_failure = True
+                if batch_had_failure or batch_entry_unconfirmed:
+                    # A queued verdict predates a failed page call or required refresh, so none of its statuses
+                    # is grounded in the state the model would have seen afterward.
+                    if ctx is not None and deadline_at is not None and time.monotonic() >= deadline_at:
+                        ctx.refresh_working_page = False
+                    st.messages.append(
+                        {
+                            "role": "tool",
+                            "tool_call_id": tool_call_id,
+                            "name": tool_name,
+                            "content": (
+                                "skipped: a call in this batch failed before this verdict was reached; "
+                                "re-observe, then finish with a status that reflects the failure"
+                                if batch_had_failure
+                                else "skipped: a field in this batch could not confirm the value it was given before "
+                                "this verdict was reached; check that field, then finish"
+                            ),
+                        }
+                    )
+                    continue
             # Charged only once the call is really dispatched: a call voided by a refresh spent nothing.
             st.total_tool_calls += 1
             if activity is not None:
@@ -5540,20 +5781,28 @@ async def run_agent_tool_loop(
             else:
                 if spec.billable:
                     turn_dispatched_billable = True
+                tool_budget_ms = _tool_call_budget_ms(deadline_at)
+                LOG.info(TOOL_CALL_STARTED_EVENT, tool=tool_name, call_site="dispatch")
                 try:
-                    result = await spec.handler(args)
+                    async with under_action_deadline(budget_ms=tool_budget_ms):
+                        result = await spec.handler(args)
                 except ToolRefusal as refusal:
                     result = refusal.as_result()
                 except Exception as exc:
-                    LOG.warning(
-                        "taskv3 tool handler raised",
-                        tool=tool_name,
-                        exc_info=True,
-                        **_navigate_record_fields(tool_name, args, None),
-                    )
-                    browser_gone = _is_browser_gone(exc)
-                    raised_class = _raised_error_class(exc)
-                    result = ToolResult.error(f"tool_error: {type(exc).__name__}: {exc}", error_class=raised_class)
+                    if tool_budget_ms is not None and _dispatch_bound_expired(exc, tool_started_at, tool_budget_ms):
+                        if spec.touches_page:
+                            batch_had_failure = True
+                        result = _tool_call_timed_out(tool_name, tool_budget_ms)
+                    else:
+                        LOG.warning(
+                            "taskv3 tool handler raised",
+                            tool=tool_name,
+                            exc_info=True,
+                            **_navigate_record_fields(tool_name, args, None),
+                        )
+                        browser_gone = _is_browser_gone(exc)
+                        raised_class = _raised_error_class(exc)
+                        result = ToolResult.error(f"tool_error: {type(exc).__name__}: {exc}", error_class=raised_class)
             tool_duration_seconds = time.monotonic() - tool_started_at
             st.tool_seconds += tool_duration_seconds
             news_at = (result.data or {}).get("delta_at")
@@ -6054,14 +6303,18 @@ async def run_agent_tool_loop(
                 # Consumed whether or not it can be acted on: the context outlives this run, and a
                 # signal left set would fire on the first action of the next block.
                 verdict_stands = spec is not None and spec.terminal and result.status == "ok"
-                if await _consume_refresh_signal(
+                refresh_action = await _consume_refresh_signal(
                     skyvern_ctx,
                     tool_name,
                     tool_calls[idx + 1 :],
                     round_actions,
                     drop=reload_page is None or verdict_stands,
-                ):
+                    pending_tool_call_id=None,
+                )
+                if refresh_action is True:
                     break
+                if refresh_action is None or refresh_action is _RefreshDisposition.FAILED:
+                    batch_had_failure = True
 
             dead_end_status = result_data.get("navigation_dead_end")
             if dead_end_status is not None:

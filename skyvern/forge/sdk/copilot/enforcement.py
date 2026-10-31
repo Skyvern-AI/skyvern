@@ -28,7 +28,6 @@ from agents.tool import Tool
 from openai.types.responses import ResponseFunctionToolCall
 from PIL import Image
 
-from skyvern.config import settings
 from skyvern.forge.sdk.agents.context import get_agent_message_field
 from skyvern.forge.sdk.copilot import streaming_adapter
 from skyvern.forge.sdk.copilot.ask_user import ACCOUNT_GROUP_SUBMIT_TOOL_NAME
@@ -67,13 +66,14 @@ from skyvern.forge.sdk.copilot.composition_evidence import (
 from skyvern.forge.sdk.copilot.config import (
     DEFAULT_ENFORCEMENT_NUDGES,
     DEFAULT_TOKEN_BUDGET,
+    TOTAL_TIMEOUT_SECONDS,
     CopilotConfig,
 )
 from skyvern.forge.sdk.copilot.context import BLOCK_RUNNING_TOOLS, REPLY_TOOL_NAME, WORKFLOW_MUTATION_TOOLS
 from skyvern.forge.sdk.copilot.credential_fill_fields import LIVE_SCOUT_CREDENTIAL_FIELDS
 from skyvern.forge.sdk.copilot.credential_pause import maybe_credential_pause, release_credential_pause_gate
 from skyvern.forge.sdk.copilot.diagnosis_repair_contract import RepairNextAction, effective_proxy_label
-from skyvern.forge.sdk.copilot.human_input_wait import HumanInputWait
+from skyvern.forge.sdk.copilot.human_input_wait import turn_clock_seconds
 from skyvern.forge.sdk.copilot.output_extraction_plan import (
     resolve_shape_expectations_by_path,
 )
@@ -128,6 +128,7 @@ from skyvern.forge.sdk.copilot.turn_halt import (
     stash_turn_halt_from_blocker_signal,
 )
 from skyvern.forge.sdk.copilot.unrecoverable_tool_error import (
+    PAGE_CRASHES_KEY,
     PAGE_FACT_KEYS,
     PAGE_REQUEST_FAILURES_KEY,
 )
@@ -151,7 +152,6 @@ if TYPE_CHECKING:
 
 LOG = structlog.get_logger()
 
-TOTAL_TIMEOUT_SECONDS = settings.WORKFLOW_COPILOT_TOTAL_TIMEOUT_SECONDS or 900
 BUDGET_DRAIN_HEADROOM = 4
 ToolT = TypeVar("ToolT", bound=Tool)
 BUDGET_DRAIN_EXCLUDED_TOOLS = WORKFLOW_MUTATION_TOOLS | BLOCK_RUNNING_TOOLS | {ACCOUNT_GROUP_SUBMIT_TOOL_NAME}
@@ -343,27 +343,8 @@ def _mark_copilot_total_timeout(ctx: Any, *, elapsed_seconds: float, iteration: 
 
 
 def _elapsed_run_seconds(ctx: Any, start_time: float) -> float:
-    """Wall-clock elapsed since ``start_time``, minus completed and active human-input waits.
-
-    Keeps TOTAL_TIMEOUT_SECONDS a budget over actual agent work, not real
-    time, so a paused-and-resumed turn isn't penalized for pause time.
-
-    ``pause_seconds`` is coerced defensively: tests commonly pass a bare
-    ``MagicMock()`` as ``ctx``, whose ``getattr(..., default)`` returns a
-    fresh Mock instead of the default (Mock never raises AttributeError).
-    """
-    pause_seconds = getattr(ctx, "copilot_credential_pause_seconds", 0.0)
-    if not isinstance(pause_seconds, (int, float)):
-        pause_seconds = 0.0
-    question_seconds = getattr(ctx, "copilot_question_pause_seconds", 0.0)
-    if not isinstance(question_seconds, (int, float)):
-        question_seconds = 0.0
-    now = time.monotonic()
-    wait = getattr(ctx, "human_input_wait", None)
-    # Overlapping waits credit their union only when the last waiter exits.
-    # Until then, exclude the active union at model/tool completion boundaries.
-    active_wait_seconds = now - wait.started_at if isinstance(wait, HumanInputWait) and wait.count > 0 else 0.0
-    return now - start_time - pause_seconds - question_seconds - active_wait_seconds
+    """Keeps TOTAL_TIMEOUT_SECONDS a budget over agent work, so a paused-and-resumed turn isn't charged pause time."""
+    return turn_clock_seconds(ctx, start_time, time.monotonic())
 
 
 def _record_copilot_cancellation(ctx: Any, start_time: float, iteration: int) -> None:
@@ -877,9 +858,10 @@ def _summarize_tool_output(output: str) -> str:
         synopsis["error"] = str(parsed["error"])[:200]
     if isinstance(parsed.get("page_state"), dict):
         synopsis["page_state"] = _summarize_page_state(parsed["page_state"])
-    request_failures = parsed.get(PAGE_REQUEST_FAILURES_KEY)
-    if isinstance(request_failures, list) and request_failures:
-        synopsis[PAGE_REQUEST_FAILURES_KEY] = request_failures
+    for page_fact_key in (PAGE_REQUEST_FAILURES_KEY, PAGE_CRASHES_KEY):
+        page_facts = parsed.get(page_fact_key)
+        if isinstance(page_facts, list) and page_facts:
+            synopsis[page_fact_key] = page_facts
 
     data = parsed.get("data")
     # Session continuation can compact the same output again. Re-bound the

@@ -5,13 +5,12 @@ import json
 import random
 import re
 import time
-import unicodedata
 from collections.abc import AsyncIterator, Sequence
 from dataclasses import asdict, dataclass
 from datetime import UTC, datetime, timedelta
 from enum import Enum
 from typing import Annotated, Any
-from urllib.parse import parse_qs, quote, urlparse
+from urllib.parse import parse_qs, urlparse
 
 import orjson
 import structlog
@@ -170,6 +169,7 @@ from skyvern.forge.sdk.workflow.exceptions import (
     InvalidTemplateWorkflowPermanentId,
     WorkflowDefinitionValidationException,
 )
+from skyvern.forge.sdk.workflow.models.agent_step_tools import AgentStepToolOption, tool_options
 from skyvern.forge.sdk.workflow.models.parameter import CredentialParameter, WorkflowParameter, WorkflowParameterType
 from skyvern.forge.sdk.workflow.models.tags import CallerType, TagSource, TagWriteContext
 from skyvern.forge.sdk.workflow.models.validators import is_reserved_tag_key
@@ -183,6 +183,7 @@ from skyvern.forge.sdk.workflow.models.workflow import (
     WorkflowRunWithWorkflowResponse,
 )
 from skyvern.forge.sdk.workflow.retry_policy import is_retry_pending
+from skyvern.forge.sdk.workflow.secret_encryption import mask_workflow_for_api
 from skyvern.forge.sdk.workflow.service import (
     cap_action_payloads,
     capped_task_v1_response,
@@ -190,6 +191,14 @@ from skyvern.forge.sdk.workflow.service import (
     one_time_code_markers,
     redact_one_time_code_actions,
     redact_one_time_code_step,
+)
+from skyvern.forge.sdk.workflow.validation import (
+    WorkflowProblem,
+    WorkflowValidationResult,
+    WorkflowValidationTooComplex,
+    ensure_workflow_validation_limits,
+    validate_stored_workflow,
+    validate_workflow_definition,
 )
 from skyvern.schemas.artifacts import EntityType, entity_type_to_param
 from skyvern.schemas.folders import Folder, FolderCreate, FolderUpdate, UpdateWorkflowFolderRequest
@@ -260,6 +269,7 @@ from skyvern.services import (
     workflow_service,
 )
 from skyvern.services.pdf_import_service import pdf_import_service
+from skyvern.utils.content_disposition import build_attachment_disposition
 from skyvern.utils.organization_slug import is_org_slug_unique_violation
 from skyvern.utils.url_validators import validate_webhook_url
 from skyvern.utils.yaml_loader import format_yaml_error, safe_load_no_dates
@@ -1029,7 +1039,7 @@ async def create_workflow_legacy(
                     else (),
                 ),
             )
-        return workflow
+        return mask_workflow_for_api(workflow)
     except WorkflowDefinitionValidationException as e:
         raise e
     except (HTTPException, SkyvernHTTPException, ValidationError) as e:
@@ -1041,6 +1051,105 @@ async def create_workflow_legacy(
 
 IDEMPOTENCY_KEY_MAX_BYTES = 255
 IDEMPOTENCY_KEY_CONTRACT = f"Idempotency-Key must contain 1 to {IDEMPOTENCY_KEY_MAX_BYTES} visible ASCII bytes."
+MAX_WORKFLOW_VALIDATION_DRAFT_BYTES = 100_000
+
+
+async def _validate_workflow_draft(request: Request) -> WorkflowValidationResult:
+    body = await request.body()
+    if len(body) > MAX_WORKFLOW_VALIDATION_DRAFT_BYTES:
+        raise HTTPException(
+            status_code=http_status.HTTP_413_CONTENT_TOO_LARGE,
+            detail=f"Workflow validation drafts must be at most {MAX_WORKFLOW_VALIDATION_DRAFT_BYTES} bytes.",
+        )
+    try:
+        data = await asyncio.to_thread(orjson.loads, body)
+        if not isinstance(data, dict):
+            raise ValueError("Workflow validation requires a JSON object.")
+        ensure_workflow_validation_limits(data)
+        return await asyncio.to_thread(validate_workflow_definition, data)
+    except WorkflowValidationTooComplex as exc:
+        return WorkflowValidationResult(
+            valid=False,
+            problems=[
+                WorkflowProblem(
+                    path="workflow_definition",
+                    code="validation_limit",
+                    message=str(exc),
+                )
+            ],
+        )
+    except (orjson.JSONDecodeError, RecursionError, ValueError) as exc:
+        return WorkflowValidationResult(
+            valid=False,
+            problems=[WorkflowProblem(path="body", code="invalid_draft", message=str(exc))],
+        )
+
+
+@legacy_base_router.post("/workflows/validate", include_in_schema=False)
+@base_router.post(
+    "/workflows/validate",
+    include_in_schema=False,
+)
+@base_router.post(
+    "/agents/validate",
+    include_in_schema=False,
+)
+async def validate_workflow(
+    request: Request,
+    current_org: Organization = Depends(org_auth_service.get_current_org),
+) -> WorkflowValidationResult:
+    del current_org
+    return await _validate_workflow_draft(request)
+
+
+@legacy_base_router.post("/workflows/validate/", include_in_schema=False)
+@base_router.post("/workflows/validate/", include_in_schema=False)
+@base_router.post("/agents/validate/", include_in_schema=False)
+async def validate_workflow_trailing_slash(
+    request: Request,
+    current_org: Organization = Depends(org_auth_service.get_current_org),
+) -> WorkflowValidationResult:
+    del current_org
+    return await _validate_workflow_draft(request)
+
+
+@legacy_base_router.post("/workflows/{workflow_permanent_id}/validate", include_in_schema=False)
+@base_router.post(
+    "/workflows/{workflow_permanent_id}/validate",
+    include_in_schema=False,
+)
+@base_router.post(
+    "/agents/{workflow_permanent_id}/validate",
+    include_in_schema=False,
+)
+async def validate_saved_workflow(
+    workflow_permanent_id: str,
+    current_org: Organization = Depends(org_auth_service.get_current_org),
+) -> WorkflowValidationResult:
+    await _enforce_folder_access("workflow.read", {"workflow_permanent_id": workflow_permanent_id})
+    workflow = await app.WORKFLOW_SERVICE.get_workflow_by_permanent_id(
+        workflow_permanent_id=workflow_permanent_id,
+        organization_id=current_org.organization_id,
+    )
+    try:
+        return await asyncio.to_thread(validate_stored_workflow, workflow)
+    except WorkflowValidationTooComplex as exc:
+        raise HTTPException(status_code=http_status.HTTP_422_UNPROCESSABLE_CONTENT, detail=str(exc)) from exc
+    except RecursionError as exc:
+        return WorkflowValidationResult(
+            valid=False,
+            problems=[WorkflowProblem(path="body", code="invalid_draft", message=str(exc))],
+        )
+
+
+@legacy_base_router.post("/workflows/{workflow_permanent_id}/validate/", include_in_schema=False)
+@base_router.post("/workflows/{workflow_permanent_id}/validate/", include_in_schema=False)
+@base_router.post("/agents/{workflow_permanent_id}/validate/", include_in_schema=False)
+async def validate_saved_workflow_trailing_slash(
+    workflow_permanent_id: str,
+    current_org: Organization = Depends(org_auth_service.get_current_org),
+) -> WorkflowValidationResult:
+    return await validate_saved_workflow(workflow_permanent_id, current_org)
 
 
 def validate_idempotency_key(
@@ -1135,7 +1244,7 @@ async def create_workflow(
             else:
                 # Idempotency keys are org-scoped, so a replay must not hand back a workflow from a hidden folder.
                 await _enforce_folder_access("workflow.read", {"workflow_permanent_id": workflow_permanent_id})
-                return existing
+                return mask_workflow_for_api(existing)
             resolved_title = await app.WORKFLOW_SERVICE.resolve_workflow_creation_title(
                 current_org.organization_id,
                 workflow_definition,
@@ -1171,7 +1280,7 @@ async def create_workflow(
                     related_resource_ids=(workflow_definition.folder_id,) if workflow_definition.folder_id else (),
                 ),
             )
-        return workflow
+        return mask_workflow_for_api(workflow)
     except yaml.YAMLError as exc:
         raise HTTPException(status_code=422, detail=format_yaml_error(exc))
     except WorkflowCreationLockTimeout as exc:
@@ -1277,8 +1386,8 @@ async def create_workflow_from_prompt(
     return workflow.model_dump(by_alias=True)
 
 
-async def _validate_file_size(file: UploadFile) -> UploadFile:
-    return await uploaded_file_service.validate_file_size(
+async def _validate_upload(file: UploadFile) -> UploadFile:
+    return await uploaded_file_service.validate_upload(
         file,
         max_size_bytes=app.SETTINGS_MANAGER.MAX_UPLOAD_FILE_SIZE,
     )
@@ -1306,6 +1415,7 @@ async def _validate_file_size(file: UploadFile) -> UploadFile:
     responses={
         200: {"description": "Successfully imported workflow from PDF"},
         400: {"description": "Invalid PDF file or no content found"},
+        415: {"description": "File content is not a PDF"},
         422: {"description": "Failed to convert SOP to workflow"},
         500: {"description": "Internal server error during processing"},
     },
@@ -1317,7 +1427,7 @@ async def _validate_file_size(file: UploadFile) -> UploadFile:
 )
 async def import_workflow_from_pdf(
     background_tasks: BackgroundTasks,
-    file: UploadFile = Depends(_validate_file_size),
+    file: UploadFile = Depends(_validate_upload),
     folder_id: str | None = Query(None, description="Optional folder ID to assign the imported workflow to"),
     current_org: Organization = Depends(org_auth_service.get_current_org),
     user_id: str | None = Depends(org_auth_service.get_current_user_id_or_none),
@@ -1325,6 +1435,8 @@ async def import_workflow_from_pdf(
 ) -> dict[str, Any]:
     """Import a workflow from a PDF file containing Standard Operating Procedures."""
     analytics.capture("skyvern-oss-workflow-import-pdf")
+    # Notes go into the import only for people the server finds on the Doc editor; a client-sent field is ignored.
+    doc_editor_enabled = await app.AGENT_FUNCTION.workflow_doc_editor_enabled(current_org.organization_id, user_id)
     build_source = workflow_build_source_from_user_agent(x_user_agent)
 
     # Read file and validate early (before creating import record)
@@ -1381,7 +1493,9 @@ async def import_workflow_from_pdf(
     async def process_pdf_import() -> None:
         try:
             # Create workflow from extracted text (LLM processing)
-            result = await pdf_import_service.create_workflow_from_sop_text(sop_text, current_org)
+            result = await pdf_import_service.create_workflow_from_sop_text(
+                sop_text, current_org, doc_editor_enabled=doc_editor_enabled
+            )
             imported = WorkflowCreateYAMLRequest.model_validate(result)
             await app.AGENT_FUNCTION.enforce_folder_access_for_references(
                 principal, "workflow.run", imported.model_dump(exclude={"folder_id"})
@@ -1546,7 +1660,7 @@ async def update_workflow_legacy(
             ),
         )
     await _redact_inaccessible_workflow_credential_ids([workflow])
-    return workflow
+    return mask_workflow_for_api(workflow)
 
 
 @base_router.post(
@@ -1652,7 +1766,7 @@ async def update_workflow(
             ),
         )
     await _redact_inaccessible_workflow_credential_ids([workflow])
-    return workflow
+    return mask_workflow_for_api(workflow)
 
 
 @legacy_base_router.delete(
@@ -1912,6 +2026,13 @@ async def get_browser_types(
     return supported_browser_type_options()
 
 
+@legacy_base_router.get("/agent_step_tools", response_model=list[AgentStepToolOption], include_in_schema=False)
+async def get_agent_step_tools(
+    current_org: Organization = Depends(org_auth_service.get_current_org),
+) -> list[AgentStepToolOption]:
+    return tool_options()
+
+
 @legacy_base_router.put("/folders/{folder_id}", response_model=Folder, tags=["agent"], include_in_schema=False)
 @legacy_base_router.put("/folders/{folder_id}/", response_model=Folder, include_in_schema=False)
 @base_router.put(
@@ -2076,7 +2197,7 @@ async def update_workflow_folder(
             related_resource_ids=(workflow.folder_id,) if workflow.folder_id else (),
         )
         await _redact_inaccessible_workflow_credential_ids([workflow])
-        return workflow
+        return mask_workflow_for_api(workflow)
     except ValueError as e:
         raise HTTPException(status_code=http_status.HTTP_400_BAD_REQUEST, detail=str(e)) from e
 
@@ -3419,64 +3540,6 @@ _VIDEO_CONTENT_TYPES_BY_EXTENSION = {
 }
 
 
-def _sanitize_header_filename(name: str) -> str:
-    """Strip characters that would break or inject into a Content-Disposition header.
-
-    The artifact URI basename is derived from a user-controlled S3 key. Rejects:
-
-    - C0 (<0x20), DEL (0x7F), C1 (0x80-0x9F) — RFC 7230 violations.
-    - ``"`` and ``\\`` — would terminate or escape the quoted value.
-    - Unicode *format* (Cf) and *separator-line/paragraph* (Zl/Zp) chars —
-      includes bidi overrides (U+202E), ZWSP (U+200B), ZWNBSP (U+FEFF);
-      these enable filename spoofing in the browser download UI.
-    """
-    cleaned = []
-    for ch in name:
-        code = ord(ch)
-        if code < 0x20 or code == 0x7F or 0x80 <= code <= 0x9F:
-            continue
-        if ch in ('"', "\\"):
-            continue
-        if unicodedata.category(ch) in {"Cf", "Zl", "Zp"}:
-            continue
-        cleaned.append(ch)
-    return "".join(cleaned) or "download"
-
-
-def _ascii_fallback_filename(name: str) -> str:
-    """Best-effort ASCII form of ``name`` for the ``filename=`` parameter.
-
-    NFKD-normalizes and drops combining marks first so accented Latin
-    characters survive as their base letters (``fïlè.pdf`` → ``file.pdf``)
-    instead of being stripped entirely. The RFC 5987 ``filename*=UTF-8''...``
-    form still carries the full name for modern clients.
-
-    If the ASCII stem ends up empty (e.g. pure CJK or emoji names),
-    prepend ``download`` so legacy clients don't save a bare ``.pdf``
-    hidden file.
-    """
-    normalized = unicodedata.normalize("NFKD", name)
-    ascii_only = normalized.encode("ascii", "ignore").decode("ascii")
-    sanitized = _sanitize_header_filename(ascii_only)
-    stem, dot, ext = sanitized.rpartition(".")
-    if dot and not stem:
-        return f"download.{ext}"
-    return sanitized
-
-
-def _build_attachment_disposition(filename: str) -> str:
-    """Build a Content-Disposition header that survives non-ASCII filenames.
-
-    Emits both ``filename="<ascii>"`` (for legacy clients) and
-    ``filename*=UTF-8''<pct-encoded>`` (RFC 5987, for everything modern).
-    Ensures the header value is Latin-1 encodable so Starlette doesn't 500.
-    """
-    safe = _sanitize_header_filename(filename)
-    ascii_part = _ascii_fallback_filename(safe)
-    encoded = quote(safe, safe="")
-    return f"attachment; filename=\"{ascii_part}\"; filename*=UTF-8''{encoded}"
-
-
 def _artifact_response_config(artifact: Artifact) -> tuple[str, str]:
     """Return (media_type, Content-Disposition) for the artifact content response.
 
@@ -3494,7 +3557,7 @@ def _artifact_response_config(artifact: Artifact) -> tuple[str, str]:
     else:
         media_type = _ARTIFACT_CONTENT_TYPES.get(artifact.artifact_type, _ARTIFACT_CONTENT_TYPE_DEFAULT)
     if artifact.artifact_type == ArtifactType.DOWNLOAD:
-        return media_type, _build_attachment_disposition(raw_name)
+        return media_type, build_attachment_disposition(raw_name)
     return media_type, "inline"
 
 
@@ -4900,7 +4963,11 @@ async def get_runs(
         current_org.organization_id, page=page, page_size=page_size, status=status, search_key=search_key
     )
     await app.WORKFLOW_SERVICE._attach_latest_attempt_views([run for run in runs if isinstance(run, WorkflowRun)])
-    return ORJSONResponse([run.model_dump() for run in runs])
+    # failure_category takes its public JSON-mode form, as response_model serialization would give it; every other
+    # field keeps this route's existing encoding.
+    return ORJSONResponse(
+        [run.model_dump() | run.model_dump(mode="json", include={"failure_category"}) for run in runs]
+    )
 
 
 _MAX_TAG_FILTER_TERMS = 20
@@ -5948,6 +6015,7 @@ async def get_workflow_and_run_from_workflow_run_id(
     )
     response = response.model_copy(update={"workflow": response.workflow.model_copy(deep=True)})
     await _redact_inaccessible_workflow_credential_ids([response.workflow])
+    response = response.model_copy(update={"workflow": mask_workflow_for_api(response.workflow)})
     return response
 
 
@@ -6160,7 +6228,7 @@ async def get_workflows(
             statuses=effective_statuses,
         )
         await _redact_inaccessible_workflow_credential_ids(workflows)
-        return workflows
+        return [mask_workflow_for_api(workflow) for workflow in workflows]
 
     if only_saved_tasks and only_workflows:
         raise HTTPException(
@@ -6181,7 +6249,7 @@ async def get_workflows(
         workflow_tags=workflow_tags or None,
     )
     await _redact_inaccessible_workflow_credential_ids(workflows)
-    return workflows
+    return [mask_workflow_for_api(workflow) for workflow in workflows]
 
 
 async def _redact_inaccessible_workflow_credential_ids(workflows: Sequence[Workflow]) -> None:
@@ -6313,7 +6381,7 @@ async def get_workflow_templates() -> list[Workflow]:
     )
 
     await _redact_inaccessible_workflow_credential_ids(workflows)
-    return workflows
+    return [mask_workflow_for_api(workflow) for workflow in workflows]
 
 
 @legacy_base_router.get(
@@ -6364,7 +6432,7 @@ async def get_workflow(
             await effective_default_engine(workflow_permanent_id, current_org.organization_id)
         )
     await _redact_inaccessible_workflow_credential_ids([workflow])
-    return workflow
+    return mask_workflow_for_api(workflow)
 
 
 @legacy_base_router.get(
@@ -6403,7 +6471,7 @@ async def get_workflow_versions(
         organization_id=None if template else current_org.organization_id,
     )
     await _redact_inaccessible_workflow_credential_ids(workflows)
-    return workflows
+    return [mask_workflow_for_api(workflow) for workflow in workflows]
 
 
 @base_router.post(
@@ -6813,7 +6881,7 @@ async def get_api_keys(
 @legacy_base_router.post("/upload_file", include_in_schema=False)
 @legacy_base_router.post("/upload_file/", include_in_schema=False)
 async def upload_file(
-    file: UploadFile = Depends(_validate_file_size),
+    file: UploadFile = Depends(_validate_upload),
     retention_days: Annotated[
         int | None,
         Form(
@@ -7014,7 +7082,18 @@ async def _flatten_workflow_run_timeline_recursive(
                     }
                 )
 
-            result.extend(inherit_attempt(item) for item in nested_timeline)
+            flattened = [inherit_attempt(item) for item in nested_timeline]
+            # One copy is enough to find the replaced block; thought rows never carry it. A nested task_v2
+            # already put its own block on that row, so the outer one is added after it.
+            first_block_row = next((index for index, item in enumerate(flattened) if item.block), None)
+            if first_block_row is not None:
+                row = flattened[first_block_row]
+                flattened[first_block_row] = row.model_copy(
+                    update={"task_v2_blocks": [*(row.task_v2_blocks or []), timeline.block]}
+                )
+            else:
+                flattened.append(timeline)
+            result.extend(flattened)
         else:
             LOG.warning(
                 "Block workflow run id is not set for task_v2 block",

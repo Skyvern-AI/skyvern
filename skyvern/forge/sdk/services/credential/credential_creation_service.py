@@ -1,10 +1,14 @@
 from __future__ import annotations
 
+import functools
+from collections.abc import Sequence
+from dataclasses import dataclass
 from typing import Any
 
 import structlog
 from fastapi import BackgroundTasks, HTTPException
 from sqlalchemy.exc import IntegrityError
+from sqlalchemy.ext.asyncio import AsyncSession
 
 from skyvern.exceptions import HttpException as SkyvernHttpException
 from skyvern.forge import app
@@ -24,6 +28,7 @@ from skyvern.forge.sdk.schemas.credentials import (
 from skyvern.forge.sdk.services.bitwarden import BitwardenService
 from skyvern.forge.sdk.services.credential.credential_vault_service import CredentialVaultService
 from skyvern.forge.sdk.services.credential.custom_credential_vault_service import CustomCredentialConfigurationError
+from skyvern.forge.sdk.services.request_principal import enforce_principal_role, get_request_principal
 from skyvern.forge.sdk.settings_manager import SettingsManager
 
 LOG = structlog.get_logger()
@@ -107,6 +112,11 @@ async def get_credential_vault_service(
         service = app.CUSTOM_CREDENTIAL_VAULT_SERVICE
     elif vault_type == CredentialVaultType.ONEPASSWORD:
         service = app.ONEPASSWORD_CREDENTIAL_VAULT_SERVICE
+    elif vault_type == CredentialVaultType.BITWARDEN_CONNECTED:
+        connected_service = app.CREDENTIAL_VAULT_SERVICES.get(vault_type)
+        if not connected_service:
+            raise HTTPException(status_code=400, detail="Connected Bitwarden vault is not supported")
+        service = connected_service
     else:
         raise HTTPException(status_code=400, detail="Credential storage not supported")
 
@@ -205,6 +215,118 @@ async def store_new_credential(
         vault=credential.vault_type.value if credential.vault_type is not None else None,
     )
     return credential
+
+
+@dataclass(frozen=True)
+class VaultItemImport:
+    vault_id: str
+    item_id: str
+    name: str
+    credential_type: CredentialType
+    tested_url: str | None
+
+
+async def authorize_vault_item_reimport(
+    organization_id: str, vault_type: CredentialVaultType, item_keys: Sequence[tuple[str, str]]
+) -> list[Credential]:
+    """The rows these vault items were already imported as, once the requester may update every one."""
+    existing = await app.DATABASE.credentials.get_onepassword_credentials(
+        organization_id, item_keys=sorted(set(item_keys)), vault_type=vault_type
+    )
+    if existing:
+        await app.AGENT_FUNCTION.enforce_credential_folder_access_for_ids(
+            get_request_principal(),
+            "credential.update",
+            {("credential_id", credential.credential_id) for credential in existing},
+        )
+    return existing
+
+
+async def import_vault_items(
+    organization_id: str,
+    vault_type: CredentialVaultType,
+    items: Sequence[VaultItemImport],
+    *,
+    created_by: str | None,
+    folder_id: str | None = None,
+    set_folder_on_update: bool = False,
+    background_tasks: BackgroundTasks | None = None,
+) -> list[tuple[Credential, bool]]:
+    """Upsert metadata-only rows for vault items, in input order with whether each was created. No vault value is
+    read or stored."""
+    principal = await enforce_principal_role(get_request_principal(), "credential.create")
+    existing = await authorize_vault_item_reimport(
+        organization_id, vault_type, [(item.vault_id, item.item_id) for item in items]
+    )
+    existing_by_key = {(credential.vault_id, credential.item_id): credential for credential in existing}
+
+    async def authorize_upsert(session: AsyncSession, credential_id: str) -> None:
+        if folder_id is not None:
+            await app.AGENT_FUNCTION.enforce_credential_folder_access_for_ids(
+                principal, "credential.create", {("folder_id", folder_id)}, session=session
+            )
+        references = {("credential_id", credential_id)}
+        if set_folder_on_update and folder_id is not None:
+            references.add(("folder_id", folder_id))
+        await app.AGENT_FUNCTION.enforce_credential_folder_access_for_ids(
+            principal,
+            "credential.move" if set_folder_on_update else "credential.update",
+            references,
+            session=session,
+        )
+
+    results: list[tuple[Credential, bool] | None] = [None] * len(items)
+    pending_effects: list[tuple[str, bool, CredentialType, tuple[str, ...]]] = []
+    async with app.DATABASE.credentials.Session() as session:
+        for index, item in sorted(enumerate(items), key=lambda indexed: (indexed[1].vault_id, indexed[1].item_id)):
+            credential, created = await app.DATABASE.credentials.upsert_onepassword_credential_metadata(
+                organization_id=organization_id,
+                vault_id=item.vault_id,
+                item_id=item.item_id,
+                name=item.name,
+                credential_type=item.credential_type,
+                tested_url=item.tested_url,
+                folder_id=folder_id,
+                created_by=created_by,
+                set_folder_on_update=set_folder_on_update,
+                authorize_update=authorize_upsert,
+                commit=False,
+                vault_type=vault_type,
+            )
+            changed_fields: tuple[str, ...] = ()
+            if not created:
+                update_fields = ["name", "credential_type"]
+                previous = existing_by_key.get((item.vault_id, item.item_id))
+                if set_folder_on_update and previous is not None and previous.folder_id != folder_id:
+                    update_fields.append("folder_id")
+                changed_fields = tuple(update_fields)
+            pending_effects.append((credential.credential_id, created, item.credential_type, changed_fields))
+            results[index] = (credential, created)
+        await session.commit()
+
+    for credential_id, created, credential_type, changed_fields in pending_effects:
+        await record_request_audit_event(
+            organization_id,
+            "credential.create" if created else "credential.update",
+            "credential",
+            credential_id,
+            changed_fields=changed_fields,
+        )
+        if not created:
+            continue
+        saved = functools.partial(
+            app.AGENT_FUNCTION.on_credential_saved,
+            organization_id=organization_id,
+            credential_id=credential_id,
+            credential_type=credential_type,
+            actor_user_id=created_by,
+            vault=vault_type.value,
+        )
+        if background_tasks is not None:
+            background_tasks.add_task(saved)
+        else:
+            await saved()
+    return [result for result in results if result is not None]
 
 
 def convert_to_response(credential: Credential) -> CredentialResponse:

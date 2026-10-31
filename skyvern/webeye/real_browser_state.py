@@ -4,7 +4,8 @@ import asyncio
 import random
 import time
 import weakref
-from collections.abc import Awaitable, Callable, Collection
+from collections import deque
+from collections.abc import Awaitable, Callable, Collection, Sequence
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime
 from typing import Any, Literal, Protocol, TypedDict, TypeGuard, runtime_checkable
@@ -60,7 +61,7 @@ from skyvern.webeye.browser_runtime_events import (
     log_browser_runtime_event,
     with_acquired_browser_runtime,
 )
-from skyvern.webeye.browser_state import BLANK_PAGE_URLS, BrowserState, is_selectable_page_url
+from skyvern.webeye.browser_state import BLANK_PAGE_URLS, BrowserState, PageCrashRecord, is_selectable_page_url
 from skyvern.webeye.cdp_download_interceptor import (
     disable_download_interceptor_for_context,
     has_download_interceptor_for_context,
@@ -403,6 +404,8 @@ class RealBrowserState(BrowserState):
         )
         self._crashed_pages: weakref.WeakSet[Page] = weakref.WeakSet()
         self._crashed_targets_closing: weakref.WeakSet[Page] = weakref.WeakSet()
+        self._page_crash_records: deque[PageCrashRecord] = deque(maxlen=5)
+        self._unreopened_page_crashes: weakref.WeakKeyDictionary[Page, PageCrashRecord] = weakref.WeakKeyDictionary()
         # Cleared while a recovery is producing the working page (opening it, closing crashed targets,
         # restoring its URL): consumers wait for the finished page instead of driving about:blank or
         # opening a tab of their own.
@@ -604,6 +607,11 @@ class RealBrowserState(BrowserState):
                 return already_reopened
             lost_page = self.__page
             restore_url = lost_page.url if lost_page is not None else ""
+            crash = self._unreopened_page_crashes.get(lost_page) if lost_page is not None else None
+            if lost_page is not None and crash is None:
+                crash = PageCrashRecord(crashed_at=datetime.now(UTC), crashed_url=restore_url, cause="page_lost")
+                self._page_crash_records.append(crash)
+                self._unreopened_page_crashes[lost_page] = crash
             # A fresh event per recovery rather than clear(): the browser-API census counts every
             # .clear() call site as a page sink.
             ready = self._working_page_ready = asyncio.Event()
@@ -617,12 +625,16 @@ class RealBrowserState(BrowserState):
                     LOG.warning("Failed to re-open a working page after the previous one was lost", exc_info=True)
                     return None
                 await self.set_working_page(page)
+                if lost_page is not None:
+                    self._unreopened_page_crashes.pop(lost_page, None)
                 # Whoever opens the replacement closes the crashed targets, and does it before a restore
                 # that can retry for minutes: the reaper may be queued behind this lock.
                 await self._close_crashed_targets()
                 if restore_url and restore_url not in BLANK_PAGE_URLS:
                     try:
                         await self.navigate_to_url(page=page, url=restore_url)
+                        if crash is not None:
+                            crash.reopened = True
                     except Exception:
                         LOG.warning(
                             "Re-opened the working page but could not restore the URL it was on",
@@ -1272,6 +1284,9 @@ class RealBrowserState(BrowserState):
                 expected=False,
                 run_phase=self._run_phase,
             )
+            crash = PageCrashRecord(crashed_at=datetime.now(UTC), crashed_url=page.url, cause="page_crash")
+            self._page_crash_records.append(crash)
+            self._unreopened_page_crashes[page] = crash
         # Recorded before the close is scheduled: the close is a detached task, and until it lands the
         # crashed page is still in context.pages. Callers in that window must not be handed it.
         self._crashed_pages.add(page)
@@ -1579,6 +1594,10 @@ class RealBrowserState(BrowserState):
         ):
             return
         self._connection_loss = (owner, observation.diagnostic)
+
+    @property
+    def page_crash_records(self) -> Sequence[PageCrashRecord]:
+        return self._page_crash_records
 
     def get_browser_connection_loss(self) -> BrowserStateDiagnostic | None:
         if self._connection_loss is None or self._connection_loss[0] != self._run_owner():
@@ -2083,7 +2102,13 @@ class RealBrowserState(BrowserState):
             navigation_deadline=navigation_deadline,
         )
 
-    async def close(self, close_browser_on_completion: bool = True, release_driver: bool | None = None) -> bool:
+    async def close(
+        self,
+        close_browser_on_completion: bool = True,
+        release_driver: bool | None = None,
+        *,
+        persist_session_state: bool = True,
+    ) -> bool:
         if self.external_browser:
             # A keep-alive close (both controls off) leaves the pages to a later run, which still needs them tracked.
             if close_browser_on_completion or release_driver is not False:
@@ -2151,7 +2176,7 @@ class RealBrowserState(BrowserState):
                 nonlocal teardown_active, teardown_settled
                 teardown_active = True
                 try:
-                    await self._teardown_context()
+                    await self._teardown_context(persist_session_state=persist_session_state)
                 finally:
                     teardown_active = False
                     teardown_settled = True
@@ -2278,19 +2303,22 @@ class RealBrowserState(BrowserState):
 
         task.add_done_callback(_retrieve)
 
-    async def _teardown_context(self) -> None:
+    async def _teardown_context(self, *, persist_session_state: bool = True) -> None:
         # Only fire on-close observers on a real teardown. Shared / parent-child close calls pass
         # ``close_browser_on_completion=False`` to leave the browser alive for another run; firing
         # callbacks then would stop the surviving run's publisher and freeze its livestream.
-        await self._run_on_close_callbacks()
+        # A superseded attempt's close skips them and the cookie write: it must not touch its successor's state.
+        if persist_session_state:
+            await self._run_on_close_callbacks()
         if self.browser_context is None:
             return
         LOG.info("Closing browser context and its pages")
-        session_dir = self.browser_artifacts.browser_session_dir if self.browser_artifacts else None
-        try:
-            await persist_session_cookies(self.browser_context, session_dir)
-        except Exception:
-            LOG.warning("Failed to persist session cookies during teardown", exc_info=True)
+        if persist_session_state:
+            session_dir = self.browser_artifacts.browser_session_dir if self.browser_artifacts else None
+            try:
+                await persist_session_cookies(self.browser_context, session_dir)
+            except Exception:
+                LOG.warning("Failed to persist session cookies during teardown", exc_info=True)
         await self.browser_context.close()
         self._sessionless_init_script_registrations = []
         LOG.info("Main browser context and all its pages are closed")

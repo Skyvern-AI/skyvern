@@ -46,3 +46,6 @@ export const ONBOARDING_TRACK_SECOND_AGENT_FLAG =
 export const NEW_ONBOARDING_EXPERIENCE_FLAG = "new_onboarding_experience";
 
 export const BROWSER_SESSION_PREWARM_FLAG = "BROWSER_SESSION_PREWARM";
+
+// Opt-in (0% base rollout) preview for the workflow Doc view.
+export const WORKFLOW_DOC_EDITOR_FLAG = "WORKFLOW_DOC_EDITOR";

@@ -192,32 +192,66 @@ _JS_NAME_FROM_CONTENT_ROLES = (
     "]);"
 )
 
+# Matches Playwright only for the shapes the tap test pins: hidden descendants skipped, non-inline word breaks,
+# aria-label/aria-labelledby before content, hidden references read whole, and no element read twice per name.
+_JS_CONTENT_TEXT_HELPER = (
+    "const hiddenForName = (el, style = getComputedStyle(el)) => "
+    "  el.getAttribute('aria-hidden') === 'true' || style.display === 'none' || style.visibility !== 'visible';"
+    "const contentText = (root, inRef, seen) => {"
+    "  const parts = [];"
+    "  const walk = (node) => {"
+    "    for (const child of node.childNodes) {"
+    "      if (child.nodeType === 3) { parts.push(child.nodeValue); continue; }"
+    "      if (child.nodeType !== 1 || seen.has(child)) continue;"
+    "      seen.add(child);"
+    "      const style = getComputedStyle(child);"
+    "      const boundary = child.tagName === 'BR' || style.display !== 'inline';"
+    "      if (boundary) parts.push(' ');"
+    "      if (!hiddenForName(child, style)) {"
+    "        const refs = inRef ? '' : refsText(child, seen);"
+    "        const label = refs || text(child.getAttribute('aria-label'));"
+    "        if (label) parts.push(label); else walk(child);"
+    "      }"
+    "      if (boundary) parts.push(' ');"
+    "    }"
+    "  };"
+    "  walk(root);"
+    "  return text(parts.join(''));"
+    "};"
+    "const refText = (el, seen) => {"
+    "  seen.add(el);"
+    "  const aria = text(el.getAttribute('aria-label'));"
+    "  if (aria) return aria;"
+    "  for (let n = el; n; n = n.parentElement) { if (hiddenForName(n)) return text(el.textContent); }"
+    "  return contentText(el, true, seen);"
+    "};"
+    "const refsText = (el, seen) => text((el.getAttribute('aria-labelledby') || '').split(/\\s+/).map((id) => {"
+    "  const ref = id && document.getElementById(id);"
+    "  return ref && !seen.has(ref) ? refText(ref, seen) : '';"
+    "}).filter(Boolean).join(' '));"
+)
+
 _JS_ACCESSIBLE_NAME_HELPER = (
-    "const accessibleName = (node, role) => {"
+    _JS_CONTENT_TEXT_HELPER + "const accessibleName = (node, role) => {"
     "  const aria = text(node.getAttribute('aria-label'));"
     "  if (aria) return aria;"
-    "  const labelledby = node.getAttribute('aria-labelledby');"
-    "  if (labelledby) {"
-    "    const parts = labelledby.split(/\\s+/).map((id) => {"
-    "      const ref = document.getElementById(id);"
-    "      return ref ? text(ref.textContent) : '';"
-    "    }).filter(Boolean);"
-    "    if (parts.length) return text(parts.join(' '));"
-    "  }"
+    "  const seen = new Set([node]);"
+    "  const labelled = refsText(node, seen);"
+    "  if (labelled) return labelled;"
     "  const id = node.getAttribute('id');"
     "  if (id) {"
     "    let lab = null;"
     "    try { lab = document.querySelector('label[for=\"' + (window.CSS && CSS.escape ? CSS.escape(id) : id) + '\"]'); } catch (e) { lab = null; }"
-    "    if (lab) { const t = text(lab.textContent); if (t) return t; }"
+    "    if (lab) { const t = refText(lab, seen); if (t) return t; }"
     "  }"
     "  const parentLabel = node.closest ? node.closest('label') : null;"
-    "  if (parentLabel) { const t = text(parentLabel.textContent); if (t) return t; }"
+    "  if (parentLabel) { const t = refText(parentLabel, seen); if (t) return t; }"
     "  const title = text(node.getAttribute('title'));"
     "  if (title) return title;"
     "  const placeholder = text(node.getAttribute('placeholder'));"
     "  if (placeholder) return placeholder;"
     "  if (role && nameFromContentRoles.has(role) && !isEditable(node)) {"
-    "    const content = text(node.textContent);"
+    "    const content = contentText(node, false, seen);"
     "    if (content) return content;"
     "  }"
     "  return '';"
@@ -601,7 +635,12 @@ const renderedText = (el) => {
   const own = String(el.textContent || '');
   let scripts; try { scripts = Array.from(el.querySelectorAll('script,style')); } catch (e) { scripts = []; }
   let text = own;
-  for (const dead of scripts) text = text.split(String(dead.textContent || '')).join(' ');
+  // An empty separator splits per character, so join(' ') would double the text once per empty script or
+  // style until the renderer itself crashes, which no try/catch here can catch.
+  for (const dead of scripts) {
+    const deadText = String(dead.textContent || '');
+    if (deadText) text = text.split(deadText).join(' ');
+  }
   return (text + parts).split(/\s+/).join(' ').trim();
 };
 const untruncatedText = renderedText;

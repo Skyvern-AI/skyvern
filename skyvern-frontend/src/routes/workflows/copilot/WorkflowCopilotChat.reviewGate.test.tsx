@@ -65,6 +65,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { parse, stringify } from "yaml";
 import { useWorkflowParametersStore } from "@/store/WorkflowParametersStore";
 import { useCopilotHeaderStore } from "@/store/useCopilotHeaderStore";
+import { useCopilotProposalStore } from "@/store/CopilotProposalStore";
 import { useWorkflowTitleStore } from "@/store/WorkflowTitleStore";
 import {
   selectEditorMutationLocked,
@@ -204,6 +205,10 @@ vi.mock("@/hooks/useCredentialGetter", () => ({
 
 vi.mock("@/components/ui/use-toast", () => ({ toast: vi.fn() }));
 
+const docEditorFlag = vi.hoisted(() => ({ enabled: false }));
+vi.mock("@/hooks/useWorkflowDocEditorFlag", () => ({
+  useWorkflowDocEditorFlag: () => docEditorFlag.enabled,
+}));
 const speech = vi.hoisted(() => ({
   stop: vi.fn(),
   takeAudioBlob: vi.fn(),
@@ -1210,6 +1215,24 @@ describe("WorkflowCopilotChat — g2 review gate", () => {
     },
   );
 
+  it.each([true, false])(
+    "with the Doc editor %s, a staged proposal is published for the save guard even with no Doc view open",
+    async (docEditorEnabled) => {
+      useCopilotProposalStore.setState({ proposal: null });
+      docEditorFlag.enabled = docEditorEnabled;
+      try {
+        await stageProposalOn("extract_titles");
+
+        expect(useCopilotProposalStore.getState().proposal !== null).toBe(
+          docEditorEnabled,
+        );
+      } finally {
+        docEditorFlag.enabled = false;
+        useCopilotProposalStore.setState({ proposal: null });
+      }
+    },
+  );
+
   it("a draft that never reached the canvas leaves the live canvas to Review and Reject, even with a persisted title", async () => {
     const onReviewWorkflow = vi.fn();
     const restore = vi.fn(restoreLive);
@@ -1382,6 +1405,147 @@ describe("WorkflowCopilotChat — g2 review gate", () => {
     });
     expect(gateActionsIn(gate)).toHaveLength(0);
   });
+
+  const UNSAVED_PICK_NOTICE = /No run started/;
+
+  const historyTurn = (
+    turnId: string,
+    turnIndex: number,
+    terminalCause: string | null,
+    overrides: Record<string, unknown> = {},
+  ) => ({
+    sender: "ai",
+    content: `Reply for ${turnId}.`,
+    created_at: new Date().toISOString(),
+    turn_outcome: { copilot_turn_id: turnId, terminal_reason: null },
+    narrative_payload: proposalNarrativePayload({
+      turnId,
+      turnIndex,
+      turnFacts: {
+        factsAvailable: true,
+        evaluationState: "not_evaluated",
+        runId: null,
+        runCompleted: null,
+        terminalCause,
+        blocksRunThisTurn: 0,
+        ranCleanOnCurrentSource: false,
+      },
+      ...overrides,
+    }),
+  });
+
+  const noDraft = { draft: null, proposalDisposition: "no_proposal" };
+
+  function stageReloadedProposal(
+    ownerTurnId: string,
+    chatHistory: Record<string, unknown>[],
+  ) {
+    historyResponse.data.chat_history = chatHistory;
+    historyResponse.data.proposed_workflow = proposedWorkflowPayload();
+    historyResponse.data.proposed_workflow_metadata = {
+      owner_turn_id: ownerTurnId,
+      revision: 1,
+      disposition: "review_untested",
+      canonical_fingerprint: "before",
+      workflow_run_id: null,
+    };
+  }
+
+  function testControlsIn(scope: HTMLElement) {
+    return within(scope).queryAllByRole("button", {
+      name: /^(Test end-to-end|Run test|More actions|Retry in a fresh session)$/,
+    });
+  }
+
+  it("shows a later Test turn's unaccepted profile refusal on the proposal's gate and offers no Test", async () => {
+    stageReloadedProposal("turn-owner", [
+      historyTurn("turn-owner", 0, null),
+      {
+        sender: "user",
+        content: "Test this workflow end to end.",
+        created_at: new Date().toISOString(),
+      },
+      historyTurn("turn-test", 1, "unsaved_browser_profile_pick"),
+    ]);
+
+    await renderChat();
+
+    const gate = await waitFor(() => {
+      const element = document.getElementById("copilot-gate-turn-owner");
+      expect(element).not.toBeNull();
+      return element!;
+    });
+    expect(gate.textContent).toMatch(UNSAVED_PICK_NOTICE);
+    expect(testControlsIn(gate)).toHaveLength(0);
+  });
+
+  it.each([
+    {
+      name: "the owner turn's own refusal",
+      later: [],
+      noticeShown: true,
+    },
+    {
+      name: "a newer turn with no cause clearing it",
+      later: [historyTurn("turn-chat", 1, null, noDraft)],
+      noticeShown: false,
+    },
+  ])(
+    "reads the gate's cause from the newest turn: $name",
+    async ({ later, noticeShown }) => {
+      stageReloadedProposal("turn-owner", [
+        historyTurn("turn-owner", 0, "unsaved_browser_profile_pick"),
+        ...later,
+      ]);
+
+      await renderChat();
+
+      const gate = await waitFor(() => {
+        const element = document.getElementById("copilot-gate-turn-owner");
+        expect(gateActionsIn(element).length).toBeGreaterThan(0);
+        return element!;
+      });
+      expect(UNSAVED_PICK_NOTICE.test(gate.textContent ?? "")).toBe(
+        noticeShown,
+      );
+      expect(testControlsIn(gate).length > 0).toBe(!noticeShown);
+    },
+  );
+
+  it.each([
+    {
+      site: "footer",
+      chatHistory: () => [
+        historyTurn("turn-test", 1, "unsaved_browser_profile_pick", noDraft),
+        {
+          sender: "ai",
+          content: "The test did not start.",
+          created_at: new Date().toISOString(),
+        },
+      ],
+    },
+    {
+      site: "detached",
+      chatHistory: () => [
+        historyTurn("turn-test", 1, "unsaved_browser_profile_pick", noDraft),
+      ],
+    },
+  ])(
+    "shows a Test turn's refusal at the $site gate",
+    async ({ chatHistory }) => {
+      stageReloadedProposal("turn-not-in-history", chatHistory());
+
+      await renderChat();
+
+      await waitFor(() => {
+        expect(document.body.textContent).toMatch(UNSAVED_PICK_NOTICE);
+      });
+      expect(
+        screen.getAllByRole("button", { name: "Accept" }).length,
+      ).toBeGreaterThan(0);
+      expect(testControlsIn(document.body)).toHaveLength(0);
+    },
+  );
 
   // The older read can catch this Accept mid-write, its proposal accepting under a live claim.
   it("does not re-arm a hold from an older chat read of the Accept that just settled", async () => {

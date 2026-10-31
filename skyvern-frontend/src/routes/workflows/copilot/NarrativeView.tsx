@@ -46,7 +46,14 @@ import {
 } from "./copilotActivityLog";
 import { TURN_ROW_INSET, TURN_ROW_OUTSET } from "./cards/cardLayout";
 import { showPhaseChecklist } from "./copilotPhases";
-import { CodeWriteDiff } from "./workflowCopilotTypes";
+import {
+  CodeWriteDiff,
+  CopilotTestInput,
+  SkippedPrefixBlock,
+} from "./workflowCopilotTypes";
+import { useWorkflowRunByIdQuery } from "../hooks/useWorkflowRunQuery";
+import { RunFieldValue } from "../studio/runview/RunFieldValue";
+import { WorkflowParameterValueType } from "../types/workflowTypes";
 import {
   ActivityEntry,
   BlockState,
@@ -147,17 +154,9 @@ function outcomeNotConfirmedOwnerKey(turn: TurnNarrativeState): string | null {
   for (let i = turn.blocks.length - 1; i >= 0; i -= 1) {
     const block = turn.blocks[i]!;
     if (
-      block.state === "completed" &&
-      block.outcome === "not_demonstrated" &&
-      !isInterimOutcome(block.outcomeRole)
-    ) {
-      return blockIdentity(block);
-    }
-  }
-
-  for (let i = turn.blocks.length - 1; i >= 0; i -= 1) {
-    const block = turn.blocks[i]!;
-    if (
+      (block.state === "completed" &&
+        block.outcome === "not_demonstrated" &&
+        !isInterimOutcome(block.outcomeRole)) ||
       block.state === "failed" ||
       block.state === "stopped" ||
       block.state === "unfinished"
@@ -1325,6 +1324,48 @@ function FCardActionRow({
 
 // One card per block run of a test. The header says where the block stands;
 // the body holds the code change that block got and the steps its run took.
+const SKIPPED_PREFIX_NOTE: Record<SkippedPrefixBlock["kind"], string> = {
+  reused: "Reused from an earlier test",
+  not_run: "Not run in this test",
+};
+
+function FSkippedPrefixRow({
+  skipped,
+  onSelect,
+}: {
+  skipped: SkippedPrefixBlock;
+  onSelect?: (label: string) => void;
+}) {
+  const tone = TEST_CARD_TONE.neutral;
+  return (
+    <div
+      data-testid="copilot-skipped-prefix-row"
+      data-kind={skipped.kind}
+      className={`overflow-hidden rounded-lg border ${tone.card}`}
+    >
+      <button
+        type="button"
+        className="flex w-full min-w-0 items-start gap-2 px-3 py-[11px] text-left text-[12.5px] leading-5"
+        title={`Highlight ${skipped.label} on canvas`}
+        onClick={() => onSelect?.(skipped.label)}
+      >
+        <span
+          className={`flex h-5 w-3.5 shrink-0 items-center justify-center text-[12px] font-bold ${tone.glyph}`}
+          aria-hidden="true"
+        >
+          {skipped.kind === "reused" ? "↺" : "–"}
+        </span>
+        <span className="min-w-0 flex-1 break-words">
+          <span className="text-foreground">
+            {humanizeBlockLabel(skipped.label)}
+          </span>
+          <span className="text-muted-foreground">{`${SEP}${SKIPPED_PREFIX_NOTE[skipped.kind]}`}</span>
+        </span>
+      </button>
+    </div>
+  );
+}
+
 function FTestRunCard({
   block,
   diff,
@@ -1604,6 +1645,117 @@ function FFittedSteps({ steps }: { steps: string[] }) {
   );
 }
 
+function TestInputSource({ input }: { input: CopilotTestInput }) {
+  switch (input.source) {
+    case "copilot":
+      return <>set by Copilot</>;
+    case "page":
+      return <>from the page</>;
+    case "earlier_run":
+      return input.sourceRunId ? (
+        <>
+          {"reused from run "}
+          <a
+            className="underline hover:text-foreground"
+            href={`/runs/${input.sourceRunId}`}
+            target="_blank"
+            rel="noopener noreferrer"
+          >
+            {input.sourceRunId}
+          </a>
+        </>
+      ) : (
+        <>reused from an earlier run</>
+      );
+    case "default":
+      return <>workflow default</>;
+    case "placeholder":
+      return <>left blank</>;
+  }
+}
+
+function TestInputValues({
+  workflowRunId,
+  inputs,
+}: {
+  workflowRunId: string;
+  inputs: CopilotTestInput[];
+}) {
+  const { data: run, isError } = useWorkflowRunByIdQuery(workflowRunId, true);
+  if (run === undefined) {
+    return (
+      <p className="ml-[18px] text-[12px] text-muted-foreground">
+        {isError ? "Could not load these values." : "Loading…"}
+      </p>
+    );
+  }
+  const credentialKeys = new Set(
+    (run.workflow?.workflow_definition?.parameters ?? []).flatMap((p) =>
+      p.parameter_type === "workflow" &&
+      p.workflow_parameter_type === WorkflowParameterValueType.CredentialId
+        ? [p.key]
+        : [],
+    ),
+  );
+  const values = run.parameters ?? {};
+  return (
+    <dl className="ml-[18px] mt-0.5 flex flex-col gap-1.5 border-l border-border pl-2 text-[12px]">
+      {inputs.map((input) => {
+        const raw = values[input.key];
+        // A credential shows only its saved reference, never a resolved value.
+        const hidden = credentialKeys.has(input.key) && typeof raw !== "string";
+        return (
+          <div key={input.key} data-test-input-key={input.key}>
+            <dt className="flex flex-wrap items-baseline gap-x-1.5">
+              <span className="font-mono text-[11.5px] text-foreground">
+                {input.key}
+              </span>
+              <span className="text-muted-foreground">
+                <TestInputSource input={input} />
+              </span>
+            </dt>
+            <dd>
+              {hidden ? (
+                <span className="text-xs text-muted-foreground">hidden</span>
+              ) : (
+                <RunFieldValue value={raw} label={input.key} />
+              )}
+            </dd>
+          </div>
+        );
+      })}
+    </dl>
+  );
+}
+
+function TestInputsDisclosure({
+  entry,
+  className,
+}: {
+  entry: ActivityEntry;
+  className?: string;
+}) {
+  const [open, setOpen] = useState(false);
+  const inputs = entry.testInputs;
+  if (!entry.workflowRunId || !inputs?.length) return null;
+  return (
+    <div data-test-inputs className={className}>
+      <button
+        type="button"
+        aria-expanded={open}
+        className={`flex items-center gap-1.5 py-px text-left text-[12px] leading-[1.5] ${STEP_TEXT} hover:text-foreground`}
+        onClick={() => setOpen(!open)}
+      >
+        <Chevron open={open} />
+        {`Test inputs (${inputs.length})`}
+      </button>
+      {open ? (
+        <TestInputValues workflowRunId={entry.workflowRunId} inputs={inputs} />
+      ) : null}
+    </div>
+  );
+}
+
 // One call in an expanded step. A result reads inline beside the call and
 // opens to its full text; an error opens as its own box.
 function FCallItem({
@@ -1710,6 +1862,7 @@ function FCallItem({
       ) : null}
       {evidence}
       {open && detail !== null ? <FDetailBox>{detail}</FDetailBox> : null}
+      <TestInputsDisclosure entry={entry} className="ml-[18px]" />
     </li>
   );
 }
@@ -1821,7 +1974,7 @@ function FActivityLogRow({
         ? outcomeReasonFallback
         : null;
     const cardIsOpen = isCardOpen(block);
-    return (
+    const card = (
       <FTestRunCard
         key={key}
         block={block}
@@ -1842,6 +1995,19 @@ function FActivityLogRow({
         onToggle={() => onCardToggle(key, cardIsOpen)}
         onSelect={onBlockSelect}
       />
+    );
+    if (!block.skippedBefore) return card;
+    return (
+      <Fragment key={key}>
+        {block.skippedBefore.map((skipped) => (
+          <FSkippedPrefixRow
+            key={`${key}-skipped-${skipped.label}`}
+            skipped={skipped}
+            onSelect={onBlockSelect}
+          />
+        ))}
+        {card}
+      </Fragment>
     );
   };
   const diffNodes = row.codeDiffs
@@ -2038,6 +2204,12 @@ function FActivityLogRow({
       // call keeps its own row above the cards.
       if (result !== null && !hosted.some((b) => b.state === "failed")) {
         items.push(callItem);
+      } else if (entry.testInputs?.length) {
+        items.push(
+          <li key={`inputs-${toolCallIdOf(entry) ?? entry.id}`}>
+            <TestInputsDisclosure entry={entry} />
+          </li>,
+        );
       }
       flushItems();
       hosted.forEach((block) => carded.add(block));
@@ -2566,14 +2738,22 @@ function DetailView({
         {!showChecklist && hasBlocks ? (
           <div className={`flex flex-col gap-1 ${TURN_ROW_INSET}`}>
             {observedBlocks.map((b) => (
-              <FBlockRun
-                key={b.workflowRunBlockId || b.label}
-                block={b}
-                turnEnded={turn.terminal !== null}
-                onSelect={onBlockSelect}
-                outcomeReasonFallback={collapsedOutcomeReason}
-                ownsOutcomeNotConfirmed={blockIdentity(b) === outcomeOwnerKey}
-              />
+              <Fragment key={blockIdentity(b)}>
+                {(b.skippedBefore ?? []).map((skipped) => (
+                  <FSkippedPrefixRow
+                    key={`${blockIdentity(b)}-skipped-${skipped.label}`}
+                    skipped={skipped}
+                    onSelect={onBlockSelect}
+                  />
+                ))}
+                <FBlockRun
+                  block={b}
+                  turnEnded={turn.terminal !== null}
+                  onSelect={onBlockSelect}
+                  outcomeReasonFallback={collapsedOutcomeReason}
+                  ownsOutcomeNotConfirmed={blockIdentity(b) === outcomeOwnerKey}
+                />
+              </Fragment>
             ))}
           </div>
         ) : null}

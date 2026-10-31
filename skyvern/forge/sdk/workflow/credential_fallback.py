@@ -5,9 +5,14 @@ from sqlalchemy.exc import IntegrityError
 
 from skyvern.exceptions import BROWSER_CONNECTION_LOST_ERROR_CODE, WorkflowNotFound
 from skyvern.forge import app
-from skyvern.forge.failure_classifier import classify_from_failure_reason
+from skyvern.forge.failure_classifier import (
+    classify_from_failure_reason,
+)
 from skyvern.forge.sdk.core import skyvern_context
 from skyvern.forge.sdk.core.skyvern_context import SkyvernContext
+from skyvern.forge.sdk.schemas.har_evidence import (
+    without_final_har_user_match,
+)
 from skyvern.forge.sdk.workflow.models.parameter import CredentialParameter
 from skyvern.forge.sdk.workflow.models.validators import is_reserved_tag_key
 from skyvern.forge.sdk.workflow.models.workflow import WorkflowRun, WorkflowRunStatus
@@ -57,7 +62,7 @@ async def _retry_enabled_for_organization(organization_id: str, workflow_run: Wo
 
 
 def _failure_category_names(workflow_run: WorkflowRun) -> set[str]:
-    categories = workflow_run.failure_category
+    categories = without_final_har_user_match(workflow_run.failure_category)
     if not categories:
         categories = classify_from_failure_reason(workflow_run.failure_reason)
     return {

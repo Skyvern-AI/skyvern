@@ -6,6 +6,7 @@ import {
   CredentialSelectionStrategy,
   EmailBodyFormat,
   EmailTransport,
+  WorkflowBlockDocFields,
   WorkflowBlockType,
   WorkflowModel,
   WorkflowRetryPolicy,
@@ -182,16 +183,20 @@ export type BlockYAML =
   | EmailInboxBlockYAML
   | GoogleSheetsReadBlockYAML
   | GoogleSheetsWriteBlockYAML
+  | PowerBIQueryBlockYAML
   | PdfFillBlockYAML
   | SplitPdfBlockYAML;
 
-export type BlockYAMLBase = {
+export type BlockYAMLBase = WorkflowBlockDocFields & {
   block_type: WorkflowBlockType;
   label: string;
   continue_on_failure?: boolean;
   next_loop_on_failure?: boolean;
   next_block_label?: string | null;
   ignore_workflow_system_prompt?: boolean;
+  notes?: string | null;
+  trailing_notes?: string | null;
+  description?: string | null;
 };
 
 export type TaskBlockYAML = BlockYAMLBase & {
@@ -352,6 +357,7 @@ export type AgentStepBlockYAML = BlockYAMLBase & {
   prompt: string;
   data_schema: Record<string, unknown> | string | null;
   max_turns: number;
+  tools?: Array<string> | null;
   parameter_keys?: Array<string> | null;
 };
 
@@ -615,6 +621,15 @@ export type GoogleSheetsWriteBlockYAML = BlockYAMLBase & {
   values: string;
   column_mapping: Record<string, string> | null;
   create_sheet_if_missing?: boolean;
+  parameter_keys?: Array<string> | null;
+};
+
+export type PowerBIQueryBlockYAML = BlockYAMLBase & {
+  block_type: "powerbi_query";
+  connection_id: string;
+  dataset_id: string;
+  query: string;
+  max_rows: number;
   parameter_keys?: Array<string> | null;
 };
 

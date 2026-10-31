@@ -207,6 +207,26 @@ class RealSkyvernPageAi(SkyvernPageAi):
             take_screenshots=take_screenshots, max_retries=max_retries
         )
 
+    def _step_notes_section(self) -> str | None:
+        """Notes for the cached block now running, keyed by its workflow block label."""
+        context = skyvern_context.current()
+        if not context or not context.workflow_run_id or not context.cached_block_label:
+            return None
+        try:
+            workflow_run_context = app.WORKFLOW_CONTEXT_MANAGER.get_workflow_run_context(context.workflow_run_id)
+        except WorkflowRunContextNotInitialized:
+            return None
+        # Resolved per call: loop children never pass through _apply_workflow_system_prompt on the
+        # script path, and each iteration renders its own loop values.
+        return workflow_run_context.resolve_block_notes_section(context.cached_block_label)
+
+    def _with_step_notes(self, goal: str | None) -> str | None:
+        """Cached-script fallbacks see only the block goal, so append the notes this block reads."""
+        notes_section = self._step_notes_section()
+        if not notes_section:
+            return goal
+        return f"{goal}\n\n{notes_section}" if goal else notes_section
+
     async def ai_click(
         self,
         selector: str | None,
@@ -272,7 +292,7 @@ class RealSkyvernPageAi(SkyvernPageAi):
                 current_url=self.page.url,
                 elements=element_tree,
                 local_datetime=datetime.now(context.tz_info or datetime.now().astimezone().tzinfo).isoformat(),
-                user_context=context.prompt,
+                user_context=self._with_step_notes(context.prompt),
             )
             llm_handler = await _resolve_assist_llm_handler(
                 "single-click-action", app.SINGLE_CLICK_AGENT_LLM_API_HANDLER
@@ -442,7 +462,7 @@ class RealSkyvernPageAi(SkyvernPageAi):
 
         if intention:
             try:
-                prompt = context.prompt
+                prompt = self._with_step_notes(context.prompt)
                 # Merge script_run_parameters into LLM payload (consistency with ai_click/ai_upload_file).
                 # No-op when script_run_parameters is unset (i.e. non-adaptive-caching runs).
                 data = _get_context_data(data)
@@ -596,7 +616,7 @@ class RealSkyvernPageAi(SkyvernPageAi):
 
         if intention:
             try:
-                prompt = context.prompt
+                prompt = self._with_step_notes(context.prompt)
                 data = data or {}
                 if files and isinstance(data, dict) and "files" not in data:
                     data["files"] = files
@@ -707,7 +727,7 @@ class RealSkyvernPageAi(SkyvernPageAi):
             step = await app.DATABASE.tasks.get_step(context.step_id, organization_id=context.organization_id)
             if intention and task and step:
                 try:
-                    prompt = context.prompt if context else None
+                    prompt = self._with_step_notes(context.prompt if context else None)
                     # Merge script_run_parameters into LLM payload (consistency with ai_click/ai_upload_file).
                     # No-op when script_run_parameters is unset (i.e. non-adaptive-caching runs).
                     data = _get_context_data(data)
@@ -859,14 +879,15 @@ class RealSkyvernPageAi(SkyvernPageAi):
             await self._refresh_scraped_page(take_screenshots=False)
         extracted_text_for_meta = (self.scraped_page.extracted_text or "")[:2000]
 
+        context = skyvern_context.current()
         classify_prompt = prompt_engine.load_prompt(
             template="page-classify",
             current_url=current_url,
             extracted_text=extracted_text_for_meta,
             options=options,
+            step_notes=self._step_notes_section(),
         )
 
-        context = skyvern_context.current()
         step = None
         organization_id = context.organization_id if context else None
         if context and context.organization_id and context.step_id:
@@ -1502,6 +1523,12 @@ class RealSkyvernPageAi(SkyvernPageAi):
                 recorded, value = workflow_run_context_for_prompt.get_block_workflow_system_prompt(self.current_label)
                 if recorded:
                     workflow_system_prompt = value
+                elif context and (
+                    noted := workflow_run_context_for_prompt.resolve_noted_block_system_prompt(
+                        context.cached_block_label
+                    )
+                ):
+                    workflow_system_prompt = noted
                 else:
                     workflow_system_prompt = workflow_run_context_for_prompt.resolve_effective_workflow_system_prompt()
 
@@ -1667,11 +1694,13 @@ class RealSkyvernPageAi(SkyvernPageAi):
         prompt: str,
         model: dict[str, Any] | None = None,
     ) -> bool:
+        context = skyvern_context.current()
         result = await script_service.execute_validation(
             complete_criterion=prompt,
             terminate_criterion=None,
             error_code_mapping=None,
             model=model,
+            notes_label=context.cached_block_label if context else None,
         )
         return result.status == BlockStatus.completed
 
@@ -1690,7 +1719,9 @@ class RealSkyvernPageAi(SkyvernPageAi):
         scraped_page_refreshed = await self.scraped_page.refresh()
         context = skyvern_context.ensure_context()
 
-        prompt_rendered = _render_template_with_label(prompt, label=self.current_label)
+        # Notes join after rendering: a note's literal {{ }} (credential references included) must stay literal.
+        rendered_goal = _render_template_with_label(prompt, label=self.current_label)
+        prompt_rendered = self._with_step_notes(rendered_goal) or rendered_goal
 
         locate_element_prompt = load_prompt_with_elements(
             element_tree_builder=scraped_page_refreshed,
@@ -1758,10 +1789,12 @@ class RealSkyvernPageAi(SkyvernPageAi):
         model: dict[str, Any] | None = None,
     ) -> dict[str, Any] | list | str | None:
         """Send a prompt to the LLM and get a response based on the provided schema."""
+        context = skyvern_context.current()
         result = await script_service.prompt(
             prompt=prompt,
             schema=schema,
             model=model,
+            notes_label=context.cached_block_label if context else None,
         )
         return result
 
@@ -1773,6 +1806,7 @@ class RealSkyvernPageAi(SkyvernPageAi):
     ) -> None:
         """Perform an action on the page using AI based on a natural language prompt."""
         context = skyvern_context.ensure_context()
+        prompt = self._with_step_notes(prompt) or prompt
         organization_id = context.organization_id
         task_id = context.task_id
         step_id = context.step_id

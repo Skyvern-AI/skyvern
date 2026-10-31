@@ -28,6 +28,7 @@ import {
 } from "../workflowEditorUtils";
 import { ConfirmDialog } from "@/components/ui/confirm-dialog";
 import { AffectedBlocksNotice } from "../AffectedBlocksNotice";
+import { inputDeleteTarget } from "../jinjaReferences";
 import { AppNode } from "../nodes";
 
 const WORKFLOW_EDIT_PANEL_WIDTH = 20 * 16;
@@ -66,31 +67,30 @@ function WorkflowParametersPanel({ onMouseDownCapture }: Props) {
   const nodes = useNodes<AppNode>();
   const { setNodes } = useReactFlow();
 
-  const affectedBlocksForDelete = useMemo(() => {
-    if (!deleteDialogState.parameterKey) {
-      return [];
-    }
-    return getAffectedBlocks(nodes, deleteDialogState.parameterKey);
-  }, [nodes, deleteDialogState.parameterKey]);
+  const parameterToDelete = workflowParameters.find(
+    (p) => p.key === deleteDialogState.parameterKey,
+  );
+  const affectedBlocksForDelete = useMemo(
+    () =>
+      parameterToDelete
+        ? getAffectedBlocks(nodes, inputDeleteTarget(parameterToDelete))
+        : [],
+    [nodes, parameterToDelete],
+  );
 
-  const handleDeleteParameter = (parameterKey: string) => {
+  const handleDeleteParameter = (parameter: ParametersState[number]) => {
     if (refuseMutationDuringYamlCommit()) return;
+    const target = inputDeleteTarget(parameter);
     setWorkflowParameters(
-      workflowParameters.filter((p) => p.key !== parameterKey),
+      workflowParameters.filter((p) => p.key !== parameter.key),
     );
     setHasChanges(true);
-    setNodes((nodes) => {
-      // Step 1: Remove inline {{ parameter.key }} references
-      const nodesWithRemovedRefs = removeJinjaReferenceFromNodes(
-        nodes,
-        parameterKey,
-      );
-      // Step 2: Remove from parameterKeys arrays
-      return removeKeyFromNodesParameterKeys(
-        nodesWithRemovedRefs,
-        parameterKey,
-      );
-    });
+    setNodes((nodes) =>
+      target.parameterKeys.reduce(
+        (updated, key) => removeKeyFromNodesParameterKeys(updated, key),
+        removeJinjaReferenceFromNodes(nodes, target.jinjaKeys),
+      ),
+    );
     setDeleteDialogState({ open: false, parameterKey: null });
   };
 
@@ -180,10 +180,10 @@ function WorkflowParametersPanel({ onMouseDownCapture }: Props) {
                           if (refuseMutationDuringYamlCommit()) return;
                           const affected = getAffectedBlocks(
                             nodes,
-                            parameter.key,
+                            inputDeleteTarget(parameter),
                           );
                           if (affected.length === 0) {
-                            handleDeleteParameter(parameter.key);
+                            handleDeleteParameter(parameter);
                             return;
                           }
                           setDeleteDialogState({
@@ -213,8 +213,8 @@ function WorkflowParametersPanel({ onMouseDownCapture }: Props) {
         description="This input will be deleted from the agent."
         reversible
         onConfirm={() => {
-          if (deleteDialogState.parameterKey) {
-            handleDeleteParameter(deleteDialogState.parameterKey);
+          if (parameterToDelete) {
+            handleDeleteParameter(parameterToDelete);
           }
         }}
       >

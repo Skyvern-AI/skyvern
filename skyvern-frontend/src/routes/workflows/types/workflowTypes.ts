@@ -230,6 +230,7 @@ export type WorkflowBlock =
   | EmailInboxBlock
   | GoogleSheetsReadBlock
   | GoogleSheetsWriteBlock
+  | PowerBIQueryBlock
   | PdfFillBlock
   | SplitPdfBlock;
 
@@ -266,6 +267,7 @@ export const WorkflowBlockTypes = {
   EmailInbox: "email_inbox",
   GoogleSheetsRead: "google_sheets_read",
   GoogleSheetsWrite: "google_sheets_write",
+  PowerBIQuery: "powerbi_query",
   PDFFill: "pdf_fill",
   SplitPDF: "split_pdf",
 } as const;
@@ -314,7 +316,15 @@ export const WorkflowEditorParameterTypes = {
 export type WorkflowEditorParameterType =
   (typeof WorkflowEditorParameterTypes)[keyof typeof WorkflowEditorParameterTypes];
 
-export type WorkflowBlockBase = {
+// Text shown in the Doc view. `notes` sits above a block and `trailing_notes` after the last block of a sequence;
+// both are read by the agent at run time. `description` is for people only.
+export type WorkflowBlockDocFields = {
+  notes?: string | null;
+  trailing_notes?: string | null;
+  description?: string | null;
+};
+
+export type WorkflowBlockBase = WorkflowBlockDocFields & {
   label: string;
   block_type: WorkflowBlockType;
   output_parameter: OutputParameter;
@@ -323,6 +333,9 @@ export type WorkflowBlockBase = {
   model: WorkflowModel | null;
   next_block_label?: string | null;
   ignore_workflow_system_prompt?: boolean;
+  notes?: string | null;
+  trailing_notes?: string | null;
+  description?: string | null;
 };
 
 export const BranchCriteriaTypes = {
@@ -629,6 +642,7 @@ export type AgentStepBlock = WorkflowBlockBase & {
   prompt: string;
   data_schema: Record<string, unknown>;
   max_turns: number;
+  tools?: Array<string> | null;
   parameters: Array<WorkflowParameter>;
 };
 
@@ -767,6 +781,15 @@ export type GoogleSheetsWriteBlock = WorkflowBlockBase & {
   values: string;
   column_mapping: Record<string, string> | null;
   create_sheet_if_missing?: boolean;
+  parameters: Array<WorkflowParameter>;
+};
+
+export type PowerBIQueryBlock = WorkflowBlockBase & {
+  block_type: "powerbi_query";
+  connection_id: string;
+  dataset_id: string;
+  query: string;
+  max_rows: number;
   parameters: Array<WorkflowParameter>;
 };
 

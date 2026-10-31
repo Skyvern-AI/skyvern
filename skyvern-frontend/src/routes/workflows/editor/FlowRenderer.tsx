@@ -1,3 +1,7 @@
+import { useWorkflowDocEditorFlag } from "@/hooks/useWorkflowDocEditorFlag";
+import { useWorkflowPresentationStore } from "@/store/WorkflowPresentationStore";
+import { WorkflowDocEditor } from "./doc/WorkflowDocEditor";
+import { useWorkflowHistoryAccessStore } from "@/store/WorkflowHistoryAccessStore";
 import {
   useWorkflowHasChangesStore,
   useWorkflowSave,
@@ -144,12 +148,12 @@ import {
 import { skyvernCredentialToParameterYAML } from "./utils";
 import "./reactFlowOverrideStyles.css";
 import {
+  blockDeleteTarget,
   convertEchoParameters,
   createNode,
   descendants,
   generateNodeLabel,
   getOrderedChildrenBlocks,
-  getOutputParameterKey,
   getWorkflowBlocks,
   getWorkflowSettings,
   layout,
@@ -214,6 +218,29 @@ import {
 } from "../studio/blockSearch";
 import { useWorkflowBlockSearchStore } from "@/store/WorkflowBlockSearchStore";
 import { duplicateBlockBelow } from "./workflowDuplicate";
+import { getDocNotesByNodeId } from "./doc/buildDocTree";
+import { WorkflowNoteReadersProvider } from "./WorkflowNoteReadersProvider";
+
+const EMPTY_NOTE_READERS: ReadonlyMap<string, Array<string>> = new Map();
+
+// Dragging replaces the nodes array on every pointer move but keeps each node's data, so the note
+// projection (and every node reading it) is rebuilt only when something other than a position changes.
+function useIgnoringNodePositions(nodes: AppNode[]): AppNode[] {
+  const previous = useRef(nodes);
+  const same =
+    previous.current.length === nodes.length &&
+    previous.current.every((node, index) => {
+      const next = nodes[index]!;
+      return (
+        node.id === next.id &&
+        node.type === next.type &&
+        node.parentId === next.parentId &&
+        node.data === next.data
+      );
+    });
+  if (!same) previous.current = nodes;
+  return previous.current;
+}
 
 // Grace period after nodesInitialized before we start tracking changes.
 // Allows mount-time effects (ResizeObserver, visibility toggling) to settle.
@@ -404,7 +431,9 @@ type Props = {
   readOnly?: boolean;
   nodes: Array<AppNode>;
   edges: Array<Edge>;
-  setNodes: (nodes: Array<AppNode>) => void;
+  setNodes: (
+    nodes: Array<AppNode> | ((current: Array<AppNode>) => Array<AppNode>),
+  ) => void;
   setEdges: (edges: Array<Edge>) => void;
   onNodesChange: (changes: Array<NodeChange<AppNode>>) => void;
   onEdgesChange: (changes: Array<EdgeChange>) => void;
@@ -437,7 +466,9 @@ type Props = {
   // Supplied by Workspace so the docked Block Library inside
   // BlockConfigSidebar can append a node. Read-only canvases
   // (comparison) leave this undefined.
-  onAddNode?: (props: import("./Workspace").AddNodeProps) => void;
+  onAddNode?: (
+    props: import("./Workspace").AddNodeProps,
+  ) => string | undefined | void;
   // Fires on every layout-phase transition. Workspace uses this to gate
   // expensive sibling mounts (VNC stream, copilot transcripts) on the
   // canvas being settled, so the initial Dagre + fade-in pass owns the
@@ -485,6 +516,46 @@ function FlowRenderer({
   paneLayoutKey,
   paneEntryKey,
 }: Props) {
+  const docEnabled = useWorkflowDocEditorFlag();
+  const presentation = useWorkflowPresentationStore(
+    (state) => state.presentation,
+  );
+  const presentationWorkflowId = useWorkflowPresentationStore(
+    (state) => state.workflowPermanentId,
+  );
+  const yamlActive = useWorkflowYamlEditorStore((state) => state.active);
+  const showDoc =
+    embedded &&
+    !readOnly &&
+    docEnabled &&
+    presentation === "doc" &&
+    presentationWorkflowId === workflow.workflow_permanent_id &&
+    nodes.some(
+      (node) => node.type === "start" && !node.parentId && node.data.editable,
+    ) &&
+    !yamlActive;
+  const editorFinallyBlockLabel = useWorkflowSettingsStore(
+    (state) => state.finallyBlockLabel,
+  );
+  // A read-only canvas shows its own version, whose finally block may differ from the one being edited.
+  const finallyBlockLabel = readOnly
+    ? (workflow.workflow_definition.finally_block_label ?? null)
+    : editorFinallyBlockLabel;
+  const noteNodes = useIgnoringNodePositions(nodes);
+  const noteReaders = useMemo(
+    () =>
+      docEnabled
+        ? getDocNotesByNodeId(noteNodes, edges, finallyBlockLabel)
+        : EMPTY_NOTE_READERS,
+    [docEnabled, noteNodes, edges, finallyBlockLabel],
+  );
+  useEffect(() => {
+    if (embedded && !readOnly) {
+      useWorkflowPresentationStore
+        .getState()
+        .syncScope(workflow.workflow_permanent_id, docEnabled);
+    }
+  }, [embedded, readOnly, workflow.workflow_permanent_id, docEnabled]);
   const { blockLabel: targettedBlockLabel } = useParams();
   const reactFlowInstance = useReactFlow();
   const postHog = usePostHog();
@@ -496,9 +567,6 @@ function FlowRenderer({
   const { title, description, initializeTitle, initializeDescription } =
     useWorkflowTitleStore();
   const parameters = useWorkflowParametersStore((state) => state.parameters);
-  const finallyBlockLabel = useWorkflowSettingsStore(
-    (state) => state.finallyBlockLabel,
-  );
   const nodesInitialized = useNodesInitialized();
   const [shouldConstrainPan, setShouldConstrainPan] = useState(false);
   const setSelectedBlockId = useWorkflowPanelStore(
@@ -515,7 +583,7 @@ function FlowRenderer({
   // entirely so an Escape press to dismiss compare/copilot UI cannot
   // mutate the main editor's shared selection store.
   useEffect(() => {
-    if (readOnly) return;
+    if (readOnly || showDoc) return;
     const handleKeyDown = (event: KeyboardEvent) => {
       if (event.key !== "Escape") {
         return;
@@ -526,7 +594,7 @@ function FlowRenderer({
     return () => {
       window.removeEventListener("keydown", handleKeyDown);
     };
-  }, [setSelectedBlockId, readOnly]);
+  }, [setSelectedBlockId, readOnly, showDoc]);
 
   // Programmatic viewport changes (e.g. `fitView`) animate via `setViewport`,
   // which fires `onMove`. Without this gate, `constrainPan` would clamp every
@@ -658,7 +726,7 @@ function FlowRenderer({
   // the user is typing in any text field so Cmd+- in a textarea still
   // moves the caret instead of zooming the canvas.
   useEffect(() => {
-    if (readOnly) return;
+    if (readOnly || showDoc) return;
     const isInsideEditableField = (target: EventTarget | null): boolean => {
       if (!(target instanceof HTMLElement)) return false;
       const tag = target.tagName;
@@ -693,7 +761,7 @@ function FlowRenderer({
     return () => {
       window.removeEventListener("keydown", handleKeyDown);
     };
-  }, [reactFlowInstance, readOnly]);
+  }, [reactFlowInstance, readOnly, showDoc]);
 
   useCanvasSelectionSync(selectedBlockId);
 
@@ -1187,7 +1255,8 @@ function FlowRenderer({
       pointerDownRef.current = false;
       markGesture();
     };
-    const onKeyDown = () => {
+    const onKeyDown = (event: KeyboardEvent) => {
+      if (showDoc && event.key === "Escape") return;
       markGesture();
       captureBaseline();
     };
@@ -1203,7 +1272,7 @@ function FlowRenderer({
       document.removeEventListener("keydown", onKeyDown, true);
       unsubscribeBufferedEdits();
     };
-  }, [embedded, readOnly]);
+  }, [embedded, readOnly, showDoc]);
 
   // Debounced for user edits: constructSaveData changes per-frame during a node
   // drag, and recomputing dirtiness serializes the whole graph — coalesce to
@@ -1343,18 +1412,15 @@ function FlowRenderer({
         return;
       }
 
-      // Step 1: Remove inline {{ deleted_block_output }} references from all nodes
-      const deletedOutputKey = getOutputParameterKey(deletedNodeLabel);
-      const nodesWithRemovedInlineRefs = removeJinjaReferenceFromNodes(
-        newNodes,
-        deletedOutputKey,
+      const target = blockDeleteTarget(
+        nodes,
+        id,
+        new Set(parameters.map((parameter) => parameter.key)),
       );
-
-      // Step 2: Remove from parameterKeys arrays and handle special cases
-      const newNodesWithUpdatedParameters = removeKeyFromNodesParameterKeys(
-        nodesWithRemovedInlineRefs,
-        deletedOutputKey,
-        deletedNodeLabel,
+      const newNodesWithUpdatedParameters = target.parameterKeys.reduce(
+        (updated, key) =>
+          removeKeyFromNodesParameterKeys(updated, key, deletedNodeLabel),
+        removeJinjaReferenceFromNodes(newNodes, target.jinjaKeys),
       );
 
       workflowChangesStore.setHasChanges(true);
@@ -1369,12 +1435,8 @@ function FlowRenderer({
       // sidebar keeps rendering against a stale id and `getNode` returns
       // undefined, leaving an empty/invalid inspector until the user
       // manually dismisses it.
-      const deletedIds = new Set<string>([
-        id,
-        ...nodesToDelete.map((n) => n.id),
-      ]);
       const currentSelected = useWorkflowPanelStore.getState().selectedBlockId;
-      if (currentSelected !== null && deletedIds.has(currentSelected)) {
+      if (currentSelected !== null && target.deletedIds.has(currentSelected)) {
         useWorkflowPanelStore.getState().setSelectedBlockId(null);
       }
 
@@ -1383,6 +1445,7 @@ function FlowRenderer({
     [
       nodes,
       edges,
+      parameters,
       doLayout,
       workflowChangesStore,
       postHog,
@@ -1423,7 +1486,11 @@ function FlowRenderer({
         edges,
         nodeId: id,
         generateId: nanoid,
-        generateLabel: generateNodeLabel,
+        generateLabel: (labels) =>
+          generateNodeLabel(
+            labels,
+            parameters.map((parameter) => parameter.key),
+          ),
       });
 
       if (!result) {
@@ -1445,6 +1512,7 @@ function FlowRenderer({
     [
       nodes,
       edges,
+      parameters,
       doLayout,
       workflowChangesStore,
       postHog,
@@ -2170,9 +2238,13 @@ function FlowRenderer({
   const clearLocatePulse = useLocateBlockStore((s) => s.clearPulse);
   const locatePulseTimerRef = useRef<number | null>(null);
   const locateMountedRef = useRef(true);
+  const locateParentReady =
+    !locateRequest?.expectedParentId ||
+    nodes.find((node) => node.id === locateRequest.nodeId)?.parentId ===
+      locateRequest.expectedParentId;
 
   useEffect(() => {
-    if (readOnly || locateRequest === null) {
+    if (readOnly || showDoc || locateRequest === null || !locateParentReady) {
       return;
     }
     const { nodeId } = locateRequest;
@@ -2203,7 +2275,9 @@ function FlowRenderer({
     });
   }, [
     locateRequest,
+    locateParentReady,
     readOnly,
+    showDoc,
     reactFlowInstance,
     focusBlockForSearch,
     clearLocate,
@@ -2677,157 +2751,165 @@ function FlowRenderer({
                   items={items}
                 />
               ))}
-              <ReactFlow
-                ref={editorElementRef}
-                nodes={nodes}
-                edges={edges}
-                onNodesChange={(incomingChanges) => {
-                  const changes = filterWorkflowChanges(incomingChanges);
-                  if (changes.length === 0) return;
-                  const hasStructuralChange = changes.some(isWorkflowMutation);
+              <WorkflowNoteReadersProvider readers={noteReaders}>
+                <ReactFlow
+                  {...(showDoc ? { inert: "" } : {})}
+                  ref={editorElementRef}
+                  nodes={nodes}
+                  edges={edges}
+                  onNodesChange={(incomingChanges) => {
+                    const changes = filterWorkflowChanges(incomingChanges);
+                    if (changes.length === 0) return;
+                    const hasStructuralChange =
+                      changes.some(isWorkflowMutation);
 
-                  // A genuine structural edit re-arms the convergence budget so
-                  // a real resize that follows isn't starved by a prior loop.
-                  if (hasStructuralChange) {
-                    resetDimensionConvergence(dimensionConvergenceRef.current);
-                  }
-
-                  const dimensionChanges = changes.filter(
-                    (change): change is NodeDimensionChange =>
-                      change.type === "dimensions",
-                  );
-
-                  // Only process dimension changes if we're not already in a layout operation
-                  // This prevents infinite loops (React error #185) during copy-paste
-                  if (dimensionChanges.length > 0 && !isLayoutingRef.current) {
-                    const { nodes: tempNodes, shouldLayout } =
-                      processDimensionChanges(
-                        nodes,
-                        dimensionChanges,
+                    // A genuine structural edit re-arms the convergence budget so
+                    // a real resize that follows isn't starved by a prior loop.
+                    if (hasStructuralChange) {
+                      resetDimensionConvergence(
                         dimensionConvergenceRef.current,
                       );
-
-                    if (shouldLayout) {
-                      queueDimensionLayout(tempNodes, edges);
                     }
-                  }
 
-                  // Only track changes after initial load is complete and not during internal updates
-                  // (e.g., switching conditional branches which is UI state, not workflow data)
-                  // Use getState() to get real-time value (not stale closure from render time)
-                  const internalUpdateCount =
-                    useWorkflowHasChangesStore.getState().internalUpdateCount;
-                  if (
-                    !readOnly &&
-                    !isInitialLoadRef.current &&
-                    internalUpdateCount === 0 &&
-                    changesIncludeWorkflowEdit(changes, nodes)
-                  ) {
-                    workflowChangesStore.setHasChanges(true);
-                  }
-
-                  onNodesChange(changes);
-                }}
-                onEdgesChange={onEdgesChange}
-                onNodeClick={(_event, node) => {
-                  if (readOnly) {
-                    return;
-                  }
-                  // Allow workflow blocks AND the root Start node (workflow
-                  // settings) to open the sidebar. Skip the NodeAdder
-                  // ("+" button) and Start nodes nested inside loop /
-                  // conditional containers - those are layout-only.
-                  const appNode = node as AppNode;
-                  const isWorkflowSettingsStart =
-                    appNode.type === "start" &&
-                    appNode.data.withWorkflowSettings;
-                  if (
-                    !isWorkflowBlockNode(appNode) &&
-                    !isWorkflowSettingsStart
-                  ) {
-                    return;
-                  }
-                  setSelectedBlockId(node.id);
-                  // Studio's embedded editor uses build mode, so a block click
-                  // reveals its inline editor (the header chevron collapses it).
-                  if (embedded && isWorkflowBlockNode(appNode)) {
-                    useNodeCollapseStore
-                      .getState()
-                      .expandBlock(
-                        workflow.workflow_permanent_id ?? "__global__",
-                        appNode.data.label,
-                      );
-                  }
-                  // The start node's inline editor is its settings accordion.
-                  if (embedded && isWorkflowSettingsStart) {
-                    window.dispatchEvent(
-                      new Event(OPEN_WORKFLOW_SETTINGS_EVENT),
+                    const dimensionChanges = changes.filter(
+                      (change): change is NodeDimensionChange =>
+                        change.type === "dimensions",
                     );
-                  }
-                }}
-                onPaneClick={() => {
-                  if (readOnly) {
-                    return;
-                  }
-                  // Studio: keep the persistent settings panel mounted on a
-                  // canvas click instead of deselecting (which would hide it).
-                  if (!embedded) {
-                    setSelectedBlockId(null);
-                  }
-                }}
-                nodeTypes={nodeTypes}
-                edgeTypes={edgeTypes}
-                // colorMode="dark"
-                fitView={!embedded}
-                fitViewOptions={{
-                  maxZoom: 1,
-                }}
-                // Keep off-viewport workflow nodes mounted: dnd-kit sortable
-                // drop targets register from mounted node components, so React
-                // Flow virtualization would make long-chain reorder targets
-                // disappear until scrolled into view.
-                deleteKeyCode={null}
-                onMove={(_, viewport) => {
-                  if (flowIsConstrained && shouldConstrainPan) {
-                    constrainPan(viewport);
-                  }
-                }}
-                maxZoom={flowIsConstrained ? 1 : 2}
-                minZoom={flowIsConstrained ? 1 : START_ANCHOR_MIN_ZOOM}
-                panOnDrag={true}
-                panOnScroll={true}
-                panOnScrollMode={PanOnScrollMode.Vertical}
-                zoomOnDoubleClick={false}
-                zoomOnPinch={!flowIsConstrained}
-                zoomOnScroll={!flowIsConstrained}
-              >
-                {!hideBackground && (
-                  <Background
-                    variant={BackgroundVariant.Dots}
-                    bgColor="hsl(var(--background))"
-                  />
-                )}
-                {!readOnly && (
-                  <Controls
-                    position="bottom-left"
-                    showZoom={false}
-                    showFitView={false}
-                    showInteractive={false}
-                  >
-                    <UndoControl />
-                    <RedoControl />
-                    {showZoomControls && (
-                      <>
-                        <ZoomInControl />
-                        <ZoomOutControl />
-                      </>
-                    )}
-                    <FitViewControl onClick={() => runFitView()} />
-                    <ToggleInteractivityControl />
-                    <GlobalCollapseControl />
-                  </Controls>
-                )}
-                {/*
+
+                    // Only process dimension changes if we're not already in a layout operation
+                    // This prevents infinite loops (React error #185) during copy-paste
+                    if (
+                      dimensionChanges.length > 0 &&
+                      !isLayoutingRef.current
+                    ) {
+                      const { nodes: tempNodes, shouldLayout } =
+                        processDimensionChanges(
+                          nodes,
+                          dimensionChanges,
+                          dimensionConvergenceRef.current,
+                        );
+
+                      if (shouldLayout) {
+                        queueDimensionLayout(tempNodes, edges);
+                      }
+                    }
+
+                    // Only track changes after initial load is complete and not during internal updates
+                    // (e.g., switching conditional branches which is UI state, not workflow data)
+                    // Use getState() to get real-time value (not stale closure from render time)
+                    const internalUpdateCount =
+                      useWorkflowHasChangesStore.getState().internalUpdateCount;
+                    if (
+                      !readOnly &&
+                      !isInitialLoadRef.current &&
+                      internalUpdateCount === 0 &&
+                      changesIncludeWorkflowEdit(changes, nodes)
+                    ) {
+                      workflowChangesStore.setHasChanges(true);
+                    }
+
+                    onNodesChange(changes);
+                  }}
+                  onEdgesChange={onEdgesChange}
+                  onNodeClick={(_event, node) => {
+                    if (readOnly) {
+                      return;
+                    }
+                    // Allow workflow blocks AND the root Start node (workflow
+                    // settings) to open the sidebar. Skip the NodeAdder
+                    // ("+" button) and Start nodes nested inside loop /
+                    // conditional containers - those are layout-only.
+                    const appNode = node as AppNode;
+                    const isWorkflowSettingsStart =
+                      appNode.type === "start" &&
+                      appNode.data.withWorkflowSettings;
+                    if (
+                      !isWorkflowBlockNode(appNode) &&
+                      !isWorkflowSettingsStart
+                    ) {
+                      return;
+                    }
+                    setSelectedBlockId(node.id);
+                    // Studio's embedded editor uses build mode, so a block click
+                    // reveals its inline editor (the header chevron collapses it).
+                    if (embedded && isWorkflowBlockNode(appNode)) {
+                      useNodeCollapseStore
+                        .getState()
+                        .expandBlock(
+                          workflow.workflow_permanent_id ?? "__global__",
+                          appNode.data.label,
+                        );
+                    }
+                    // The start node's inline editor is its settings accordion.
+                    if (embedded && isWorkflowSettingsStart) {
+                      window.dispatchEvent(
+                        new Event(OPEN_WORKFLOW_SETTINGS_EVENT),
+                      );
+                    }
+                  }}
+                  onPaneClick={() => {
+                    if (readOnly) {
+                      return;
+                    }
+                    // Studio: keep the persistent settings panel mounted on a
+                    // canvas click instead of deselecting (which would hide it).
+                    if (!embedded) {
+                      setSelectedBlockId(null);
+                    }
+                  }}
+                  nodeTypes={nodeTypes}
+                  edgeTypes={edgeTypes}
+                  // colorMode="dark"
+                  fitView={!embedded}
+                  fitViewOptions={{
+                    maxZoom: 1,
+                  }}
+                  // Keep off-viewport workflow nodes mounted: dnd-kit sortable
+                  // drop targets register from mounted node components, so React
+                  // Flow virtualization would make long-chain reorder targets
+                  // disappear until scrolled into view.
+                  deleteKeyCode={null}
+                  onMove={(_, viewport) => {
+                    if (flowIsConstrained && shouldConstrainPan) {
+                      constrainPan(viewport);
+                    }
+                  }}
+                  maxZoom={flowIsConstrained ? 1 : 2}
+                  minZoom={flowIsConstrained ? 1 : START_ANCHOR_MIN_ZOOM}
+                  panOnDrag={true}
+                  panOnScroll={true}
+                  panOnScrollMode={PanOnScrollMode.Vertical}
+                  zoomOnDoubleClick={false}
+                  zoomOnPinch={!flowIsConstrained}
+                  zoomOnScroll={!flowIsConstrained}
+                >
+                  {!hideBackground && (
+                    <Background
+                      variant={BackgroundVariant.Dots}
+                      bgColor="hsl(var(--background))"
+                    />
+                  )}
+                  {!readOnly && (
+                    <Controls
+                      position="bottom-left"
+                      showZoom={false}
+                      showFitView={false}
+                      showInteractive={false}
+                    >
+                      <UndoControl />
+                      <RedoControl />
+                      {showZoomControls && (
+                        <>
+                          <ZoomInControl />
+                          <ZoomOutControl />
+                        </>
+                      )}
+                      <FitViewControl onClick={() => runFitView()} />
+                      <ToggleInteractivityControl />
+                      <GlobalCollapseControl />
+                    </Controls>
+                  )}
+                  {/*
                   Studio-only: the jumps land on the pane-fit anchor
                   viewports, which are the embedded pane's policy; the legacy
                   editors keep whole-graph fitView and the debugger pins the
@@ -2835,11 +2917,14 @@ function FlowRenderer({
                   once the initial layout settled so pre-layout bounds can't
                   flash the buttons.
                 */}
-                {embedded &&
-                  !readOnly &&
-                  !flowIsConstrained &&
-                  layoutPhase === "ready" && <FlowJumpControls nodes={nodes} />}
-              </ReactFlow>
+                  {embedded &&
+                    !readOnly &&
+                    !flowIsConstrained &&
+                    layoutPhase === "ready" && (
+                      <FlowJumpControls nodes={nodes} />
+                    )}
+                </ReactFlow>
+              </WorkflowNoteReadersProvider>
             </SortableBlockScope>
             {/*
             The overlay portals a label-only ghost out of the ReactFlow
@@ -2862,7 +2947,7 @@ function FlowRenderer({
             entirely in read-only mode so comparison canvases never
             expose the editable block form.
           */}
-            {!readOnly && (
+            {!readOnly && !showDoc && (
               <BlockConfigSidebar onAddNode={onAddNode} embedded={embedded} />
             )}
             {!readOnly && (
@@ -2889,6 +2974,34 @@ function FlowRenderer({
               })()}
             </DragOverlay>
           </DndContext>
+          {showDoc && (
+            <WorkflowDocEditor
+              nodes={nodes}
+              edges={edges}
+              edits={{
+                apply: (next) => {
+                  if (readOnly) return;
+                  useWorkflowHistoryAccessStore.getState().captureImmediately();
+                  workflowChangesStore.setHasChanges(true);
+                  doLayout(next.nodes, next.edges);
+                },
+                update: (change) => {
+                  if (readOnly) return;
+                  workflowChangesStore.setHasChanges(true);
+                  setNodes(change);
+                },
+                // Like the canvas: the history's debounce records a new step and its layout as one undo step.
+                addStep: (props) => {
+                  if (readOnly || !onAddNode) return null;
+                  return onAddNode(props) ?? null;
+                },
+                duplicate: (id) => {
+                  if (readOnly) return;
+                  duplicateNode(id);
+                },
+              }}
+            />
+          )}
         </BlockActionContext.Provider>
       </div>
     </WorkflowScopeContext.Provider>

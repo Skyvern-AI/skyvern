@@ -1,6 +1,9 @@
 import { stringify as convertToYAML } from "yaml";
+import type { AxiosInstance } from "axios";
+import type { WorkflowYAMLConversionResponse } from "../copilot/workflowCopilotTypes";
 
 import type { WorkflowSaveData } from "@/store/WorkflowHasChangesStore";
+import { parseHeaderJson } from "@/util/secretHeaders";
 
 import type { WorkflowVersion } from "../hooks/useWorkflowVersionsQuery";
 import type { WorkflowDefinition } from "../types/workflowTypes";
@@ -116,6 +119,63 @@ export function canvasWorkflowVersionFromSaveData(
     definition as WorkflowDefinition,
     headers,
   );
+}
+
+export function reviewBaselineFromSaveData(
+  saveData: WorkflowSaveData,
+): WorkflowVersion {
+  // Header JSON may be mid-edit; omit invalid headers rather than blocking review.
+  const parseHeaders = (value: string | null, label: string) => {
+    if (!value) return null;
+    try {
+      return parseHeaderJson(value);
+    } catch (error) {
+      console.error(`Error parsing ${label}:`, error);
+      return null;
+    }
+  };
+  return canvasWorkflowVersionFromSaveData(saveData, {
+    extraHttpHeaders: parseHeaders(
+      saveData.settings.extraHttpHeaders,
+      "extra HTTP headers",
+    ),
+    cdpConnectHeaders: parseHeaders(
+      saveData.settings.cdpConnectHeaders,
+      "CDP connect headers",
+    ),
+  });
+}
+
+export async function convertWorkflowReviewBaseline(
+  client: Pick<AxiosInstance, "post">,
+  baseline: WorkflowVersion,
+  signal?: AbortSignal,
+): Promise<WorkflowVersion> {
+  const definition = baseline.workflow_definition;
+  const { data } = await client.post<WorkflowYAMLConversionResponse>(
+    "/workflow/copilot/convert-yaml-to-blocks",
+    {
+      workflow_definition_yaml: convertToYAML({
+        version: definition.version,
+        parameters: definition.parameters,
+        blocks: definition.blocks,
+        finally_block_label: definition.finally_block_label ?? undefined,
+        workflow_system_prompt: definition.workflow_system_prompt ?? undefined,
+        error_code_mapping: definition.error_code_mapping ?? undefined,
+        retry_policy: definition.retry_policy ?? null,
+      }),
+      workflow_id: baseline.workflow_id,
+    },
+    { signal },
+  );
+  const converted = data?.workflow_definition;
+  if (
+    !converted ||
+    !Array.isArray(converted.blocks) ||
+    !Array.isArray(converted.parameters)
+  )
+    throw new Error("Workflow conversion returned an invalid definition.");
+  return { ...baseline, workflow_definition: converted };
 }
 
 const topLevelSettingKeys = [

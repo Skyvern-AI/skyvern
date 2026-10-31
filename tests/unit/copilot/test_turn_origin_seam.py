@@ -17,6 +17,7 @@ from skyvern.forge.sdk.copilot.turn_origin import (
     TurnOrigin,
     make_self_heal_session_id,
 )
+from tests.unit._mcp_browser_fakes import crash_free_browser_state
 
 
 class _FakeBrowser:
@@ -89,7 +90,7 @@ async def test_synthetic_session_unregisters_when_context_body_raises(
 ) -> None:
     import skyvern.forge.sdk.copilot.runtime as runtime
 
-    fake_browser_state = SimpleNamespace(
+    fake_browser_state = crash_free_browser_state(
         browser_context=_FakeBrowserContext(),
         get_working_page=AsyncMock(return_value=MagicMock()),
     )
@@ -128,7 +129,7 @@ async def test_self_heal_injected_state_assigns_synthetic_session_and_mcp_regist
 ) -> None:
     import skyvern.forge.sdk.copilot.runtime as runtime
 
-    fake_browser_state = SimpleNamespace(
+    fake_browser_state = crash_free_browser_state(
         browser_context=_FakeBrowserContext(),
         get_working_page=AsyncMock(return_value=MagicMock()),
     )
@@ -195,7 +196,7 @@ async def test_self_heal_mcp_session_preserves_adopted_working_page_when_not_las
     fake_context = _FakeBrowserContext()
     fake_context.pages = [pinned_page, last_page]
 
-    fake_browser_state = SimpleNamespace(
+    fake_browser_state = crash_free_browser_state(
         browser_context=fake_context,
         get_working_page=AsyncMock(return_value=pinned_page),
     )
@@ -283,7 +284,7 @@ async def test_resolve_browser_state_for_context_skips_persistent_lookup_for_sel
 ) -> None:
     import skyvern.forge.sdk.copilot.runtime as runtime
 
-    fake_browser_state = SimpleNamespace(
+    fake_browser_state = crash_free_browser_state(
         browser_context=_FakeBrowserContext(),
         get_working_page=AsyncMock(return_value=MagicMock()),
     )

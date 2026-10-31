@@ -16,10 +16,15 @@ import {
   getElements,
   getWorkflowBlocks,
   getWorkflowErrors,
+  getUniqueLabelForExistingNode,
   pendingGoalChangesOf,
+  removeKeyFromNodesParameterKeys,
+  replaceJinjaReferenceInNodes,
   withGoalUndoRecordsFrom,
   workflowEffectiveDefaultEngine,
 } from "./workflowEditorUtils";
+import { removeJinjaReferenceFromNodes } from "./jinjaReferences";
+import { agentStepToolsFromSelection } from "./nodes/AgentStepNode/types";
 import { collectKnownErrorCodes } from "./nodes/StartNode/retryPolicyUtils";
 import { terminateNodeDefaultData } from "./nodes/TerminateNode/types";
 
@@ -398,21 +403,51 @@ describe("agent block load and save", () => {
     parameter_keys: ["account_number"],
   };
 
-  test("an existing block saves unchanged from the canvas and from an export", () => {
-    const { nodes, edges } = getElements([agentStepBlock], SETTINGS, true);
+  test.each([
+    ["a tools list", ["http_request", "web_search"]],
+    ["no tools list", null],
+  ])(
+    "an existing block with %s saves unchanged from the canvas and from an export",
+    (_, tools) => {
+      const block = { ...agentStepBlock, tools } as WorkflowBlock;
+      const saved = { ...savedFields, tools };
+      const { nodes, edges } = getElements([block], SETTINGS, true);
 
-    expect(getWorkflowErrors(nodes)).toEqual([]);
-    expect(getWorkflowBlocks(nodes, edges)[0]).toMatchObject(savedFields);
-    const source = {
-      title: "Source",
-      description: null,
-      is_saved_task: false,
-      status: null,
-      run_with: "agent",
-      workflow_definition: { parameters: [], blocks: [agentStepBlock] },
-    } as unknown as WorkflowApiResponse;
-    expect(convert(source).workflow_definition.blocks[0]).toMatchObject(
-      savedFields,
+      expect(getWorkflowErrors(nodes)).toEqual([]);
+      expect(getWorkflowBlocks(nodes, edges)[0]).toMatchObject(saved);
+      const source = {
+        title: "Source",
+        description: null,
+        is_saved_task: false,
+        status: null,
+        run_with: "agent",
+        workflow_definition: { parameters: [], blocks: [block] },
+      } as unknown as WorkflowApiResponse;
+      expect(convert(source).workflow_definition.blocks[0]).toMatchObject(
+        saved,
+      );
+    },
+  );
+
+  test("checking every tool saves no list, and checking some saves those", () => {
+    const choosable = ["code", "http_request", "web_search"];
+
+    expect(
+      agentStepToolsFromSelection(
+        ["web_search", "code", "http_request"],
+        choosable,
+      ),
+    ).toBeNull();
+    expect(agentStepToolsFromSelection(["http_request"], choosable)).toEqual([
+      "http_request",
+    ]);
+  });
+
+  test("a new agent step blocks the save until a tool is chosen", () => {
+    const node = createNode({ id: "n1" }, "agentStep", "find_plan");
+
+    expect(getWorkflowErrors([node])).toContain(
+      "find_plan: Choose at least one tool.",
     );
   });
 
@@ -690,5 +725,220 @@ describe("FileDownloadBlock SFTP source round trip", () => {
       sftp_host_key: "ssh-ed25519 AAAA",
     });
     expect(exportedBlock).not.toHaveProperty("sftp_remote_path");
+  });
+});
+
+describe("replaceJinjaReferenceInNodes", () => {
+  test("rename rewrites references inside a code block's code", () => {
+    const [renamed] = replaceJinjaReferenceInNodes(
+      [
+        {
+          id: "c",
+          type: "codeBlock",
+          position: { x: 0, y: 0 },
+          data: {
+            label: "Compute",
+            code: "rows = {{ region | tojson }}\nprint(region)\n",
+          },
+        },
+      ],
+      "region",
+      "area",
+    );
+    expect(renamed!.data.code).toBe(
+      "rows = {{ area | tojson }}\nprint(region)\n",
+    );
+  });
+});
+
+describe("removeKeyFromNodesParameterKeys", () => {
+  test("a block delete drops the declared output key and leaves the code unchanged", () => {
+    const [saved] = removeKeyFromNodesParameterKeys(
+      removeJinjaReferenceFromNodes(
+        [
+          {
+            id: "c",
+            type: "codeBlock",
+            position: { x: 0, y: 0 },
+            data: {
+              label: "Pick",
+              code: "first = Fetch_output[0]\n",
+              parameterKeys: ["Fetch_output"],
+            },
+          },
+        ],
+        ["Fetch_output", "Fetch"],
+      ),
+      "Fetch_output",
+    );
+    expect(saved!.data).toMatchObject({
+      code: "first = Fetch_output[0]\n",
+      parameterKeys: [],
+    });
+  });
+});
+
+describe("block note metadata round trip", () => {
+  test("preserves notes and omits unset fields through graph serialization", () => {
+    const noted = {
+      ...minimalTaskBlock(),
+      notes: "Read the saved plan first.",
+      trailing_notes: "Stop after confirming the result.",
+      description: "Only for the workflow author.",
+    } as WorkflowBlock;
+    const oldVersion = {
+      ...minimalTaskBlock(),
+      label: "old_version",
+    } as WorkflowBlock;
+    const { nodes, edges } = getElements([noted, oldVersion], SETTINGS, false);
+    const saved = getWorkflowBlocks(nodes, edges);
+
+    expect(saved.find((block) => block.label === "b1")).toMatchObject({
+      notes: "Read the saved plan first.",
+      trailing_notes: "Stop after confirming the result.",
+      description: "Only for the workflow author.",
+    });
+    const savedOldVersion = saved.find(
+      (block) => block.label === "old_version",
+    );
+    expect(savedOldVersion).toBeDefined();
+    for (const key of ["notes", "trailing_notes", "description"] as const) {
+      expect(savedOldVersion).not.toHaveProperty(key);
+    }
+  });
+
+  test.each([
+    [
+      "for_loop",
+      {
+        block_type: "for_loop",
+        loop_over: { key: "items" },
+        loop_variable_reference: "item",
+        complete_if_empty: false,
+        data_schema: null,
+      },
+    ],
+    [
+      "while_loop",
+      {
+        block_type: "while_loop",
+        condition: {
+          criteria_type: "jinja2_template",
+          expression: "{{ true }}",
+          description: null,
+        },
+      },
+    ],
+  ])("preserves metadata on %s blocks", (_type, typeFields) => {
+    const loop = {
+      label: "loop",
+      continue_on_failure: false,
+      next_loop_on_failure: false,
+      model: null,
+      ignore_workflow_system_prompt: false,
+      loop_blocks: [],
+      notes: "Use the saved notes.",
+      trailing_notes: "Finish after this loop.",
+      description: "Loop description.",
+      ...typeFields,
+    } as unknown as WorkflowBlock;
+    const { nodes, edges } = getElements([loop], SETTINGS, false);
+
+    expect(getWorkflowBlocks(nodes, edges)[0]).toMatchObject({
+      notes: "Use the saved notes.",
+      trailing_notes: "Finish after this loop.",
+      description: "Loop description.",
+    });
+  });
+
+  test("preserves conditional note metadata through save and copy/export serialization", () => {
+    const loopChild = {
+      ...minimalTaskBlock(),
+      label: "loop_child",
+      notes: "Read the loop value.",
+      trailing_notes: "Finish the loop step.",
+      description: "Loop child description.",
+    } as WorkflowBlock;
+    const conditional = {
+      block_type: "conditional",
+      label: "branch",
+      continue_on_failure: false,
+      next_block_label: null,
+      branch_conditions: [],
+      notes: "Read the plan before evaluating this branch.",
+      trailing_notes: "Confirm the selected path.",
+      description: "Only for the workflow author.",
+      model: null,
+      ignore_workflow_system_prompt: false,
+    } as unknown as WorkflowBlock;
+    const loop = {
+      block_type: "for_loop",
+      label: "loop",
+      continue_on_failure: false,
+      next_block_label: null,
+      loop_over: { key: "items" },
+      loop_variable_reference: null,
+      complete_if_empty: false,
+      data_schema: null,
+      loop_blocks: [loopChild],
+      model: null,
+      ignore_workflow_system_prompt: false,
+    } as unknown as WorkflowBlock;
+    const { nodes, edges } = getElements([conditional], SETTINGS, false);
+    const copiedBlocks = convert({
+      workflow_definition: {
+        version: 1,
+        parameters: [],
+        blocks: [conditional, loop],
+      },
+    } as unknown as WorkflowApiResponse).workflow_definition.blocks;
+
+    expect(getWorkflowBlocks(nodes, edges)[0]).toMatchObject({
+      notes: "Read the plan before evaluating this branch.",
+      trailing_notes: "Confirm the selected path.",
+      description: "Only for the workflow author.",
+    });
+    const [copiedConditional, copiedLoop] = copiedBlocks;
+    expect(copiedConditional).toMatchObject({
+      notes: "Read the plan before evaluating this branch.",
+      trailing_notes: "Confirm the selected path.",
+      description: "Only for the workflow author.",
+    });
+    expect(copiedLoop?.block_type).toBe("for_loop");
+    if (copiedLoop?.block_type === "for_loop") {
+      expect(copiedLoop.loop_blocks[0]).toMatchObject({
+        notes: "Read the loop value.",
+        trailing_notes: "Finish the loop step.",
+        description: "Loop child description.",
+      });
+    }
+  });
+
+  test("clears absent conditional note metadata when serializing a restored version", () => {
+    const conditional = {
+      block_type: "conditional",
+      label: "branch",
+      continue_on_failure: false,
+      next_block_label: null,
+      branch_conditions: [],
+      model: null,
+      ignore_workflow_system_prompt: false,
+    } as unknown as WorkflowBlock;
+    const { nodes, edges } = getElements([conditional], SETTINGS, false);
+
+    const saved = getWorkflowBlocks(nodes, edges)[0];
+    for (const key of ["notes", "trailing_notes", "description"] as const) {
+      expect(saved).not.toHaveProperty(key);
+    }
+  });
+
+  test("generated label suffixes skip workflow parameter output keys", () => {
+    expect(
+      getUniqueLabelForExistingNode(
+        "email_inbox",
+        ["email_inbox"],
+        ["email_inbox_2_output"],
+      ),
+    ).toBe("email_inbox_3");
   });
 });

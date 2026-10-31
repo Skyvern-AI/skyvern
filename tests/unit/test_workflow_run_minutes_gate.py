@@ -425,7 +425,7 @@ async def test_finally_block_re_finalization_records_only_the_minutes_it_added(
     monkeypatch.setattr(svc, "get_workflow_output_parameters", AsyncMock(return_value=[]))
     monkeypatch.setattr(svc, "_collect_inherited_workflow_system_prompt", AsyncMock(return_value=None))
     monkeypatch.setattr(svc, "auto_create_browser_session_if_needed", AsyncMock(return_value=None))
-    monkeypatch.setattr(svc, "_browser_profile_is_managed", AsyncMock(return_value=False))
+    monkeypatch.setattr(svc, "_get_run_browser_profile", AsyncMock(return_value=None))
     monkeypatch.setattr(svc, "_execute_workflow_blocks", AsyncMock(side_effect=terminalize_inside_body))
     monkeypatch.setattr(svc, "generate_script_if_needed", AsyncMock())
     monkeypatch.setattr(svc, "should_run_script", AsyncMock(return_value=False))

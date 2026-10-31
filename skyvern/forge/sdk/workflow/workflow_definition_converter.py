@@ -88,6 +88,7 @@ from skyvern.forge.sdk.workflow.models.parameter import (
     WorkflowParameterType,
 )
 from skyvern.forge.sdk.workflow.models.pdf_fill_block import PdfFillBlock
+from skyvern.forge.sdk.workflow.models.powerbi_query_block import PowerBIQueryBlock
 from skyvern.forge.sdk.workflow.models.split_pdf_block import SplitPdfBlock
 from skyvern.forge.sdk.workflow.models.terminate_block import TerminateBlock
 from skyvern.forge.sdk.workflow.models.web_search_block import WebSearchBlock
@@ -430,7 +431,7 @@ def _build_block_kwargs(
     block_yaml: BLOCK_YAML_TYPES,
     output_parameter: OutputParameter,
 ) -> dict[str, Any]:
-    return {
+    kwargs: dict[str, Any] = {
         "label": block_yaml.label,
         "next_block_label": block_yaml.next_block_label,
         "output_parameter": output_parameter,
@@ -439,6 +440,10 @@ def _build_block_kwargs(
         "model": block_yaml.model,
         "ignore_workflow_system_prompt": block_yaml.ignore_workflow_system_prompt,
     }
+    for field in ("notes", "trailing_notes", "description"):
+        if field in block_yaml.model_fields_set:
+            kwargs[field] = getattr(block_yaml, field)
+    return kwargs
 
 
 def block_yaml_to_block(
@@ -902,6 +907,7 @@ def block_yaml_to_block(
             prompt=block_yaml.prompt,
             data_schema=block_yaml.data_schema,
             max_turns=block_yaml.max_turns,
+            tools=block_yaml.tools,
             parameters=_resolve_block_parameters(block_yaml, parameters),
         )
 
@@ -1079,6 +1085,16 @@ def block_yaml_to_block(
             column_mapping=block_yaml.column_mapping,
             create_sheet_if_missing=block_yaml.create_sheet_if_missing,
             parameters=google_sheets_write_parameters,
+        )
+    elif block_yaml.block_type == BlockType.POWERBI_QUERY:
+        powerbi_query_parameters = _resolve_block_parameters(block_yaml, parameters)
+        return PowerBIQueryBlock(
+            **base_kwargs,
+            connection_id=block_yaml.connection_id,
+            dataset_id=block_yaml.dataset_id,
+            query=block_yaml.query,
+            max_rows=block_yaml.max_rows,
+            parameters=powerbi_query_parameters,
         )
 
     raise ValueError(f"Invalid block type {block_yaml.block_type}")

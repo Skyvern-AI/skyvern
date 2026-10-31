@@ -714,7 +714,7 @@ async def test_track_a_registry_admits_complete_run_bound_static_credential_valu
     ctx.secret_scrub_values = []
     db_credential = SimpleNamespace(vault_type=None, totp_identifier=None)
     credential = PasswordCredential(username="private-user", password="private-pass")
-    credential_item = SimpleNamespace(credential=credential)
+    credential_item = SimpleNamespace(credential=credential, login_sites=None)
     service = SimpleNamespace(get_credential_item=AsyncMock(return_value=credential_item))
     process = AsyncMock(return_value=credential_item)
     monkeypatch.setattr(
@@ -762,7 +762,7 @@ async def test_track_a_registry_keeps_static_credential_values_when_totp_is_dyna
     ctx.secret_scrub_values = []
     db_credential = SimpleNamespace(vault_type=None, totp_identifier="totp_ref")
     credential = PasswordCredential(username="private-user", password="private-pass", totp_identifier="totp_ref")
-    credential_item = SimpleNamespace(credential=credential)
+    credential_item = SimpleNamespace(credential=credential, login_sites=None)
     service = SimpleNamespace(get_credential_item=AsyncMock(return_value=credential_item))
     monkeypatch.setattr(
         run_execution_module,

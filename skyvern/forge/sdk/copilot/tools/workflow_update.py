@@ -12,12 +12,13 @@ from collections.abc import Iterable, Iterator, Mapping, Sequence
 from dataclasses import dataclass, replace
 from datetime import datetime, timezone
 from enum import StrEnum
-from typing import Annotated, Any, Literal, NamedTuple, cast
+from typing import Annotated, Any, Literal, NamedTuple, cast, get_args
 
 import structlog
 import yaml
 from jinja2 import TemplateSyntaxError
 from pydantic import AliasChoices, BaseModel, Field, TypeAdapter, ValidationError
+from pydantic_core import to_jsonable_python
 
 from skyvern.constants import DEFAULT_WORKFLOW_TITLES
 from skyvern.exceptions import SkyvernHTTPException
@@ -39,6 +40,7 @@ from skyvern.forge.sdk.copilot.build_test_outcome import (
     authored_structure_signature_from_workflow,
     record_build_test_outcome,
     recorded_outcome_from_author_time_reject,
+    redacted_terminal_text,
 )
 from skyvern.forge.sdk.copilot.canonical_ownership import workflow_content_fingerprint
 from skyvern.forge.sdk.copilot.code_block_preflight import (
@@ -63,6 +65,8 @@ from skyvern.forge.sdk.copilot.context import (
     CodeAuthoringRepairContext,
     CopilotContext,
     ProposalDisposition,
+    copilot_sees_notes,
+    record_kept_note_texts,
 )
 from skyvern.forge.sdk.copilot.credential_fill_fields import CredentialFillField
 from skyvern.forge.sdk.copilot.google_connection_notice import (
@@ -83,7 +87,11 @@ from skyvern.forge.sdk.copilot.output_policy import (
     format_output_policy_tool_error,
     output_policy_verdict_to_trace_data,
 )
-from skyvern.forge.sdk.copilot.output_utils import _BUILD_TEST_WORKFLOW_MAX_CHARS, INTERNAL_VALIDATION_FAILURE_PREFIX
+from skyvern.forge.sdk.copilot.output_utils import (
+    _BUILD_TEST_WORKFLOW_MAX_CHARS,
+    INTERNAL_VALIDATION_FAILURE_PREFIX,
+    sanitize_block_label_for_display,
+)
 from skyvern.forge.sdk.copilot.reached_download_target import (
     REGISTERED_DOWNLOAD_OUTPUT_KEYS,
     code_captures_download,
@@ -97,6 +105,7 @@ from skyvern.forge.sdk.copilot.request_policy import (
     _coerce_requested_output_evidence_source,
     _is_judgment_boolean_criterion,
 )
+from skyvern.forge.sdk.copilot.review_gate import CODE_BLOCK_NON_IDENTITY_KEYS
 from skyvern.forge.sdk.copilot.runtime import (
     AgentContext,
     ScoutedInteraction,
@@ -135,6 +144,7 @@ from skyvern.forge.sdk.copilot.workflow_yaml import (
     resolve_webhook_callback_url,
     runner_code_block_associations,
     strip_private_workflow_settings,
+    strip_runtime_block_fields,
     submitted_private_workflow_settings,
     with_workflow_yaml_title,
     workflow_to_copilot_yaml,
@@ -142,10 +152,16 @@ from skyvern.forge.sdk.copilot.workflow_yaml import (
 from skyvern.forge.sdk.db.exceptions import CopilotProposalConflictError, CopilotProposalConflictReason
 from skyvern.forge.sdk.schemas.workflow_copilot import COPILOT_PRIVATE_SETTINGS_KEY, copilot_proposal_metadata
 from skyvern.forge.sdk.services import google_oauth_service
+from skyvern.forge.sdk.workflow.block_notes import (
+    carry_block_notes_from_versions,
+    drop_submitted_note_fields,
+    stored_notes_for_labels,
+)
 from skyvern.forge.sdk.workflow.exceptions import BaseWorkflowHTTPException, InsecureCodeDetected
 from skyvern.forge.sdk.workflow.models.block import CodeBlock
 from skyvern.forge.sdk.workflow.models.workflow import Workflow, WorkflowDefinition
 from skyvern.forge.sdk.workflow.runtime_completion import contract_from_code_artifact_metadata
+from skyvern.forge.sdk.workflow.secret_encryption import mask_workflow_definition_secrets
 from skyvern.schemas.proxy_location import ProxyLocationInput, runtime_proxy_location
 from skyvern.schemas.workflows import (
     BLOCK_YAML_SUBCLASSES,
@@ -172,7 +188,9 @@ from .banned_blocks import (
 from .credentials import (
     _credential_id_misbinding_findings,
     _credential_reference_validation_error,
+    bitwarden_binding_change_error,
     canonicalize_named_google_sheet_bindings,
+    import_bound_vault_logins,
     resolve_google_sheet_tabs_from_gid,
 )
 from .frontier import (
@@ -831,6 +849,71 @@ def _changed_code_blocks(
         if submitted_block is not None and not matches_submission:
             rewritten.append(label)
     return changed, sorted(rewritten)
+
+
+_NON_EDIT_BLOCK_KEYS = frozenset({"label", "next_block_label", "loop_blocks", *CODE_BLOCK_NON_IDENTITY_KEYS})
+_BLOCK_YAML_MODELS_BY_TYPE: dict[str, type[BaseModel]] = {
+    to_jsonable_python(model.model_fields["block_type"].default): model for model in get_args(BLOCK_YAML_SUBCLASSES)
+}
+_NO_DECLARED_DEFAULT = object()
+
+
+def _declared_block_default(block_type: str | None, key: str) -> object:
+    model = _BLOCK_YAML_MODELS_BY_TYPE.get(block_type) if isinstance(block_type, str) else None
+    field = model.model_fields.get(key) if model is not None else None
+    if field is None or field.is_required():
+        return _NO_DECLARED_DEFAULT
+    return to_jsonable_python(field.get_default(call_default_factory=True))
+
+
+def _comparable_blocks_by_label(workflow_yaml: str | None) -> dict[str, dict[str, Any]]:
+    parsed = parse_workflow_yaml(workflow_yaml) if workflow_yaml else None
+    if not isinstance(parsed, dict):
+        return {}
+    # Masked on both sides: a save restores stored secrets the model only ever saw masked.
+    mask_workflow_definition_secrets(parsed.get("workflow_definition"))
+    return {
+        block["label"]: {
+            key: value for key, value in strip_runtime_block_fields(block).items() if key not in _NON_EDIT_BLOCK_KEYS
+        }
+        for block in workflow_blocks(parsed)
+        if isinstance(block.get("label"), str) and block["label"]
+    }
+
+
+def _labels_changed_between(prior_yaml: str | None, stored_yaml: str) -> list[str]:
+    """Keys only the prior sets are ignored, so a write that only deletes a field is not named: the
+    prior may be the full stored definition while the write is request-shaped."""
+    prior = _comparable_blocks_by_label(prior_yaml)
+    stored = _comparable_blocks_by_label(stored_yaml)
+    changed = [
+        label
+        for label, block in stored.items()
+        if label not in prior
+        or any(
+            value != prior[label].get(key, _declared_block_default(block.get("block_type"), key))
+            for key, value in block.items()
+        )
+    ]
+    return changed + [label for label in prior if label not in stored]
+
+
+def display_block_label(ctx: AgentContext, label: str) -> str:
+    # The context's own values go first because a context without a session is not in the shared registry.
+    return sanitize_block_label_for_display(redacted_terminal_text(scrub_secrets_from_text(ctx, label)) or "")
+
+
+def display_labels_changed_between(ctx: AgentContext, prior_yaml: str | None, stored_yaml: str) -> list[str]:
+    return [display_block_label(ctx, label) for label in _labels_changed_between(prior_yaml, stored_yaml)]
+
+
+def record_edited_block_labels(ctx: CopilotContext, prior_yaml: str | None, stored_yaml: str) -> None:
+    labels = display_labels_changed_between(ctx, prior_yaml, stored_yaml)
+    for label in labels:
+        ctx.record_edited_block_label(label)
+    # A settings or parameter edit names no block but still postdates any run dispatched before it.
+    if not labels and parse_workflow_yaml(prior_yaml or "") != parse_workflow_yaml(stored_yaml):
+        ctx.block_edits_recorded_this_turn += 1
 
 
 def _advisory_labels_by_diagnostic(
@@ -3910,6 +3993,11 @@ def carry_author_time_findings(update_result: dict[str, Any], result: dict[str, 
             "stored_goal_kept_message",
             "stored_goal_dropped",
             "stored_goal_dropped_message",
+            "stored_notes_kept",
+            "stored_notes_kept_message",
+            "stored_notes_dropped",
+            "stored_notes_dropped_text",
+            "stored_notes_dropped_message",
             "google_connection_resolution",
             "persistence",
             "persistence_message",
@@ -4014,9 +4102,10 @@ def copilot_workflow_yaml_matches(
             source_canvas = _normalized_canvas_for_proposal_restore(
                 sanitized_source, inherited_proxy_location=inherited_proxy_location
             )
+            submitted_with_notes, _, _ = carry_block_notes_from_versions(submitted_yaml, sanitized_source, None)
             if (
                 _normalized_canvas_for_proposal_restore(
-                    submitted_yaml,
+                    submitted_with_notes,
                     inherited_code_version=source_canvas.code_version,
                     inherited_proxy_location=inherited_proxy_location,
                 )
@@ -4051,6 +4140,9 @@ def _normalized_canvas_for_proposal_restore(
 
     def normalize_blocks(blocks: Sequence[BLOCK_YAML_SUBCLASSES]) -> None:
         for block in blocks:
+            block.notes = block.notes or None
+            block.trailing_notes = block.trailing_notes or None
+            block.description = block.description or None
             if isinstance(block, CodeBlockYAML):
                 block.steps = block.steps or None
                 block.parameter_keys = block.parameter_keys or None
@@ -4191,6 +4283,7 @@ async def _validated_pending_workflow_proposal(
             reason="canvas_custody_mismatch",
             workflow_permanent_id=ctx.workflow_permanent_id,
         )
+        ctx.canvas_rejected_proposal_yaml = sanitized_yaml
         return None
     return proposal, sanitized_yaml
 
@@ -4475,6 +4568,7 @@ async def adopt_stored_workflow_candidate(ctx: CopilotContext) -> ProposalAdopti
     # This turn's own draft is gone, so no turn-end exit may present or re-publish it. The adopted candidate
     # becomes this turn's result only once this turn edits it.
     ctx.has_staged_proposal = False
+    ctx.edited_block_labels_this_turn = []
     ctx.last_workflow = None
     ctx.last_workflow_yaml = None
     ctx.last_good_workflow = None
@@ -4539,6 +4633,8 @@ def proposal_conflict_result(
     if adoption == "adopted":
         result["error"] = f"{lost} Another change replaced the pending proposal, and this turn now works on it."
         adopted_yaml = redact_raw_secrets_for_prompt(ctx.staged_workflow_yaml or "")
+        if not copilot_sees_notes(ctx):
+            adopted_yaml = drop_submitted_note_fields(adopted_yaml)
         if len(adopted_yaml) > _BUILD_TEST_WORKFLOW_MAX_CHARS:
             result["adopted_workflow_yaml"] = adopted_yaml[: _BUILD_TEST_WORKFLOW_MAX_CHARS - 3] + "..."
             result["next_step"] = (
@@ -4791,6 +4887,12 @@ async def _update_workflow(
                 },
             ),
         )
+    vault_login_error = bitwarden_binding_change_error(workflow_yaml, ctx.request_policy)
+    if vault_login_error is None:
+        workflow_yaml, vault_login_error = await import_bound_vault_logins(workflow_yaml, ctx)
+    if vault_login_error is not None:
+        return _blocked(AuthorTimeBlock(block_id=CREDENTIAL_SCOUT_BLOCK_ID, error=vault_login_error))
+    params["workflow_yaml"] = workflow_yaml
     if allow_missing_credentials is None:
         allow_missing_credentials = ctx.allow_untested_workflow_draft is True
     if not allow_missing_credentials:
@@ -4865,6 +4967,12 @@ async def _update_workflow(
             goal_rewritten_labels=goal_rewritten_labels,
         )
         workflow_yaml = goal_carry.workflow_yaml
+        if not copilot_sees_notes(ctx):
+            # Without the Doc editor the user cannot see notes, so Copilot keeps the saved ones untouched.
+            workflow_yaml = drop_submitted_note_fields(workflow_yaml)
+        workflow_yaml, kept_note_labels, dropped_note_labels = carry_block_notes_from_versions(
+            workflow_yaml, prior_yaml, ctx.persisted_workflow_yaml if isinstance(ctx, CopilotContext) else None
+        )
         # Ahead of both persistence and the context assignment below, so the row, the draft the
         # model reads back, and the bytes apply_block_edit anchors against are one string. Scrubbing
         # the payload alone would leave the model reading redacted code and anchoring on raw code.
@@ -4988,6 +5096,9 @@ async def _update_workflow(
             ctx.workflow_yaml = workflow_yaml
         params["workflow_yaml"] = workflow_yaml
         if isinstance(ctx, CopilotContext):
+            # Recorded only once the draft is durably published, and before the next await, so a stop
+            # during the draft announcement still sees the saved edit.
+            record_edited_block_labels(ctx, prior_yaml, workflow_yaml)
             ctx.runner_code_block_associations_by_label = runner_code_block_associations(
                 workflow_yaml,
                 prior_associations=ctx.runner_code_block_associations_by_label,
@@ -5115,6 +5226,29 @@ async def _update_workflow(
         if block_type_changes:
             data["block_type_changes"] = block_type_changes
         data.update(user_owned_goal_carry_disclosure(goal_carry))
+        notes_visible = copilot_sees_notes(ctx)
+        if kept_note_labels and notes_visible:
+            data["stored_notes_kept"] = list(kept_note_labels)
+            data["stored_notes_kept_message"] = (
+                "The submitted YAML left out notes or descriptions on these blocks, so the values from the previous "
+                "draft or the saved workflow were kept. "
+                "A note or description sent as null or an empty string is deleted."
+            )
+            if isinstance(ctx, CopilotContext):
+                record_kept_note_texts(ctx, kept_note_labels, workflow_yaml)
+        # Without the Doc editor the person never sees notes, so a lost one is not mentioned at all.
+        if dropped_note_labels and notes_visible:
+            data["stored_notes_dropped"] = dropped_note_labels
+            data["stored_notes_dropped_message"] = (
+                "These blocks had notes but were removed or changed type in the accepted workflow, so their notes are gone: "
+                + ", ".join(dropped_note_labels)
+                + ". stored_notes_dropped_text has what they said."
+            )
+            data["stored_notes_dropped_text"] = stored_notes_for_labels(
+                dropped_note_labels,
+                prior_yaml,
+                ctx.persisted_workflow_yaml if isinstance(ctx, CopilotContext) else None,
+            )
         if stored_code or stored_code_withheld:
             LOG.info(
                 "copilot write returned stored code",
@@ -5140,13 +5274,7 @@ async def _update_workflow(
             code_block_diagnostics=advisory_labels,
             scanner_diagnostics=scanner_labels,
         )
-        findings = [
-            *findings,
-            *(
-                {"reason_code": "code_block_goal_incomplete", "summary": summary}
-                for summary in authoring_validation.findings
-            ),
-        ]
+        findings = [*findings, *authoring_validation.findings]
         if findings:
             data["findings"] = findings
         if authoring_validation.legacy_engine_blocks:

@@ -434,8 +434,10 @@ def _artifact_entry_claims_terminal_criterion(entry: dict[str, Any]) -> bool:
 
 def _unverified_current_workflow_labels(ctx: object) -> list[str]:
     labels = _current_executable_workflow_block_labels(ctx)
-    verified = set(getattr(ctx, "verified_prefix_labels", []) or [])
-    return [label for label in labels if label not in verified]
+    settled = set(getattr(ctx, "verified_prefix_labels", []) or []) | set(
+        getattr(ctx, "untaken_branch_labels", {}) or {}
+    )
+    return [label for label in labels if label not in settled]
 
 
 def _current_finally_block_label(ctx: object) -> str | None:
@@ -460,8 +462,10 @@ def _current_executable_workflow_block_labels(ctx: object) -> list[str]:
 
 def _composition_unverified_current_workflow_labels(ctx: object) -> list[str]:
     labels = _current_executable_workflow_block_labels(ctx)
-    verified = set(getattr(ctx, "composition_verified_labels", []) or [])
-    return [label for label in labels if label not in verified]
+    settled = set(getattr(ctx, "composition_verified_labels", []) or []) | set(
+        getattr(ctx, "untaken_branch_labels", {}) or {}
+    )
+    return [label for label in labels if label not in settled]
 
 
 def _iter_yaml_blocks(blocks: Any) -> list[dict[str, Any]]:

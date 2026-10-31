@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+from collections.abc import Callable
 from contextlib import AbstractAsyncContextManager
 from dataclasses import dataclass
 from datetime import datetime
@@ -68,6 +69,11 @@ class PersistentSessionsManager(Protocol):
         ...
 
     def can_probe_registered_browser_state(self) -> bool: ...
+
+    def launches_browser_on_create(self) -> bool:
+        """Whether ``create_session`` starts the session's browser itself, rather than leaving the launch to the
+        first block that needs it."""
+        ...
 
     def supports_evict_and_reconnect(self) -> bool:
         """Whether ``evict_cached_browser_state`` followed by ``get_browser_state`` can
@@ -174,9 +180,16 @@ class PersistentSessionsManager(Protocol):
         ...
 
     async def set_browser_state(
-        self, session_id: str, browser_state: BrowserState, organization_id: str | None = None
-    ) -> None:
-        """Set the browser state, or raise when the session has stopped accepting generations."""
+        self,
+        session_id: str,
+        browser_state: BrowserState,
+        organization_id: str | None = None,
+        *,
+        may_publish: Callable[[], bool] | None = None,
+    ) -> bool:
+        """Set the browser state, or raise when the session has stopped accepting generations.
+
+        Returns False, caching and retiring nothing, when ``may_publish`` refuses at the cache mutation itself."""
         ...
 
     async def get_session(
@@ -234,6 +247,7 @@ class PersistentSessionsManager(Protocol):
         proxy_location: ProxyLocationInput,
         browser_profile_id: str | None,
         session_kind: BrowserSessionKind,
+        created_for_workflow_permanent_id: str | None = None,
     ) -> FreshExitReceipt:
         """Create one browser in the prior session's geography and profile scope on a verified different egress.
         A new browser whose exit is not verified distinct is closed, and the receipt says why no alternate exists."""

@@ -2,14 +2,15 @@ from __future__ import annotations
 
 from contextvars import ContextVar
 from dataclasses import dataclass, field
+from datetime import datetime
 from typing import TYPE_CHECKING, Any, Literal
 
 if TYPE_CHECKING:
     from skyvern.webeye.utils.captcha_solver import ChallengeOutcome
 
-# What a solve helper saw for one route: a matched challenge, its own solved verdict, an explicit "no challenge
-# here", or a matched challenge it deliberately did not attempt.
-ChallengeVerdict = Literal["detected", "solved", "absent", "skipped"]
+# What a solve helper saw for one route: a matched challenge, its own solved verdict, its own verdict that the
+# challenge stayed unsolved, an explicit "no challenge here", or a matched challenge it deliberately did not attempt.
+ChallengeVerdict = Literal["detected", "solved", "unsolved", "absent", "skipped"]
 
 
 @dataclass(frozen=True)
@@ -34,6 +35,24 @@ class ChallengeSolveRecord:
     observations: list[ChallengeObservation] = field(default_factory=list)
     # (producer, variant): the reCAPTCHA variant a solver route found on the widget it targeted.
     recaptcha_target: tuple[str, str] | None = None
+
+
+@dataclass(frozen=True)
+class ChallengeSolveReceipt:
+    """A finished solve call's token-free outcome, kept on the run's context for its failure reporting. ``service`` is
+    the challenge the solve positively identified (never the solver it ran or a model-chosen captcha type), None when
+    it identified no presented challenge."""
+
+    run_id: str
+    ended_at: datetime
+    service: str | None
+    outcome: str
+    page_state: str
+    # The task whose solve this was; the run id alone cannot tell apart the tasks of one workflow run.
+    owner_id: str | None = None
+
+
+MAX_SOLVE_RECEIPTS = 20
 
 
 # Set by a caller that reaches another client's solve boundary, so the recorded row names the caller instead.

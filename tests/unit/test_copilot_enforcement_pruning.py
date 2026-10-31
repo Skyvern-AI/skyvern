@@ -51,6 +51,7 @@ from skyvern.forge.sdk.copilot.tools import (
 from skyvern.forge.sdk.copilot.tools._shared import TOTAL_TIMEOUT_SECONDS as shared_total_timeout_seconds
 from skyvern.forge.sdk.copilot.tools.workflow_update import _PERSISTENCE_MESSAGES
 from skyvern.forge.sdk.copilot.verification_evidence import WorkflowVerificationEvidence
+from tests.unit._mcp_browser_fakes import page_crash_entry
 from tests.unit.copilot_test_helpers import make_copilot_ctx
 
 
@@ -379,11 +380,13 @@ def _fresh_ctx_for_record() -> SimpleNamespace:
     so the stub populates the interesting fields without tripping AttributeError on
     the downstream update_repeated_failure_state call.
     """
+    dispatched_run_ids: set[str] = set()
     return SimpleNamespace(
         code_artifact_metadata={},
         composition_page_evidence=None,
         block_run_calls_this_turn=0,
-        dispatched_run_ids_this_turn=set(),
+        dispatched_run_ids_this_turn=dispatched_run_ids,
+        record_dispatched_run=dispatched_run_ids.add,
         unbound_required_parameter_keys=[],
         last_test_ok=True,
         last_test_failure_reason=None,
@@ -408,6 +411,7 @@ def _fresh_ctx_for_record() -> SimpleNamespace:
         last_executed_block_labels=[],
         last_full_workflow_test_ok=False,
         last_unverified_block_labels=[],
+        untaken_branch_labels={},
         last_failure_signature=None,
         last_frontier_fingerprint=None,
         repeated_failure_streak_count=0,
@@ -419,6 +423,7 @@ def _fresh_ctx_for_record() -> SimpleNamespace:
         workflow_verification_evidence=WorkflowVerificationEvidence(),
         last_run_blocks_workflow_run_id=None,
         last_run_blocks_block_ids=[],
+        last_run_outcome_block_ids=[],
         last_run_blocks_block_labels=[],
         last_run_outcome=None,
         narrative_block_attempts={},
@@ -1069,6 +1074,9 @@ _BOUNDED_PAGE_STATE = {
 }
 
 
+_PAGE_CRASHES = [page_crash_entry(url="https://shop.example.com/orders/new")]
+
+
 @pytest.mark.parametrize(
     ("data", "page_state", "expected"),
     [
@@ -1085,7 +1093,7 @@ _BOUNDED_PAGE_STATE = {
 def test_an_evicted_browser_result_keeps_a_bounded_page_state(
     data: dict[str, Any], page_state: dict[str, Any], expected: dict[str, Any]
 ) -> None:
-    old_output = json.dumps({"page_state": page_state, "ok": True, "data": data})
+    old_output = json.dumps({"page_state": page_state, "page_crashes": _PAGE_CRASHES, "ok": True, "data": data})
     items = [_fco("c_old", old_output), _reasoning()] + [
         _fco(f"c{i}", '{"ok":true}') for i in range(KEEP_RECENT_TOOL_OUTPUTS)
     ]
@@ -1094,6 +1102,7 @@ def test_an_evicted_browser_result_keeps_a_bounded_page_state(
 
     assert pruned[0]["output"] != old_output, "the summarizer must have run"
     assert json.loads(pruned[0]["output"])["page_state"] == expected
+    assert json.loads(pruned[0]["output"])["page_crashes"] == _PAGE_CRASHES
 
 
 def test_page_facts_alone_do_not_push_a_short_result_into_compaction() -> None:
@@ -1112,7 +1121,9 @@ def test_page_facts_alone_do_not_push_a_short_result_into_compaction() -> None:
         "challenge_vendor": None,
     }
     failures = [{"method": "POST", "resource_type": "xhr", "failure_text": "net::ERR_EMPTY_RESPONSE", "url": "/r"}]
-    old_output = json.dumps({"page_state": page_state, "page_request_failures": failures, **solved})
+    old_output = json.dumps(
+        {"page_state": page_state, "page_request_failures": failures, "page_crashes": _PAGE_CRASHES, **solved}
+    )
     assert len(json.dumps(solved)) <= 300 < len(old_output)
     items = [_fco("c_old", old_output), _reasoning()] + [
         _fco(f"c{i}", '{"ok":true}') for i in range(KEEP_RECENT_TOOL_OUTPUTS)

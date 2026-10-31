@@ -49,7 +49,7 @@ vi.mock("@/util/env", () => ({
   get newWssBaseUrl() {
     return env.wssBaseUrl;
   },
-  getCredentialParam: vi.fn(async () => "apikey=test"),
+  getWebSocketProtocols: vi.fn(async () => ["skyvern.v1", "apikey.test"]),
 }));
 
 vi.mock("@/hooks/useCredentialGetter", () => {
@@ -123,14 +123,16 @@ class FakeStreamSocket {
   readonly send = vi.fn();
   close = vi.fn();
   readonly url: string;
+  readonly protocols: string | string[] | undefined;
   onopen: ((event: Event) => void) | null = null;
   onmessage: ((event: MessageEvent) => void) | null = null;
   onclose: ((event: CloseEvent) => void) | null = null;
 
   private listeners: Record<string, Array<(event: unknown) => void>> = {};
 
-  constructor(url: string) {
+  constructor(url: string, protocols?: string | string[]) {
     this.url = url;
+    this.protocols = protocols;
     FakeStreamSocket.instances.push(this);
   }
 
@@ -363,6 +365,16 @@ describe("BrowserSessionStream terminal statuses", () => {
 
     expect(screen.queryByTestId("stream-frame")).toBeNull();
     expect(screen.getByText("Browser session complete")).toBeTruthy();
+  });
+
+  it("sends the stream credential as a subprotocol, never in the URL", async () => {
+    render(<BrowserSessionStream browserSessionId="pbs_test" />);
+
+    await waitFor(() => expect(FakeStreamSocket.instances).toHaveLength(1));
+
+    const socket = FakeStreamSocket.instances[0]!;
+    expect(new URL(socket.url).search).toBe("");
+    expect(socket.protocols).toEqual(["skyvern.v1", "apikey.test"]);
   });
 
   it("opens no message socket until the user takes control", async () => {

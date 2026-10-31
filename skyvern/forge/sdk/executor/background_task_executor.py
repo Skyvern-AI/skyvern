@@ -23,7 +23,14 @@ from skyvern.forge.sdk.db.repositories.workflow_run_attempts import (
     ATTEMPT_RECOVERY_MAX_PAGES,
 )
 from skyvern.forge.sdk.executor.async_executor import AsyncExecutor
-from skyvern.forge.sdk.executor.run_liveness import acquire_run_lease, hold_run, run_lease_lost, track_run
+from skyvern.forge.sdk.executor.run_liveness import (
+    acquire_run_lease,
+    hold_run,
+    run_lease_lost,
+    start_independent_run_scope,
+    track_run,
+)
+from skyvern.forge.sdk.models import StepStatus
 from skyvern.forge.sdk.schemas.organizations import Organization
 from skyvern.forge.sdk.schemas.persistent_browser_sessions import FORCED_WORKFLOW_SESSION_RUNNABLE_TYPE
 from skyvern.forge.sdk.schemas.task_v2 import TaskV2Status
@@ -64,6 +71,7 @@ async def _run_with_own_context(
     assigns task_id/step_id — and clobber each other. Shallow-copy so scalar writes stay local
     while inherited values survive.
     """
+    start_independent_run_scope()
     parent = skyvern_context.current()
     if parent is not None:
         # The download-popup lifecycle registries are context-owned and destructively torn down at
@@ -751,7 +759,15 @@ class BackgroundTaskExecutor(AsyncExecutor):
                 task_id,
                 status=TaskStatus.running,
                 organization_id=organization_id,
+                keep_final_status=True,
             )
+            if task.status.is_final():
+                # Another server finished the task (e.g. reaped it) while this dispatch was stalled.
+                await app.DATABASE.tasks.update_step(
+                    task_id, step.step_id, status=StepStatus.failed, organization_id=organization_id
+                )
+                release_hold()
+                return
 
             close_browser_on_completion = browser_session_id is None and not task.browser_address
 
@@ -985,15 +1001,41 @@ class BackgroundTaskExecutor(AsyncExecutor):
             if not await acquire_run_lease(workflow_run_id):
                 release_hold()
                 return
-            await app.DATABASE.observer.update_task_v2(
+            task_v2 = await app.DATABASE.observer.update_task_v2(
                 task_v2_id=task_v2_id,
                 status=TaskV2Status.queued,
                 organization_id=organization_id,
+                keep_final_status=True,
             )
-            await app.DATABASE.workflow_runs.update_workflow_run(
+            # Another server can finish both rows while this dispatch is stalled; never queue them again.
+            if task_v2.status.is_final():
+                release_hold()
+                return
+            if not await app.DATABASE.workflow_runs.update_workflow_run_if_not_final(
                 workflow_run_id=workflow_run_id,
                 status=WorkflowRunStatus.queued,
-            )
+                only_from=[WorkflowRunStatus.created, WorkflowRunStatus.queued],
+            ):
+                # A workflow-only cancel never touches the task v2 row, so end it here; only the writer that ends it
+                # sends its callback.
+                workflow_run = await app.DATABASE.workflow_runs.get_workflow_run(
+                    workflow_run_id=workflow_run_id, organization_id=organization_id
+                )
+                if (
+                    workflow_run is not None
+                    and workflow_run.status.is_final()
+                    and await app.DATABASE.observer.update_task_v2_status_if_not_final(
+                        task_v2_id=task_v2_id,
+                        organization_id=organization_id,
+                        status=TaskV2Status(workflow_run.status.value),
+                    )
+                ):
+                    task_v2 = (
+                        await app.DATABASE.observer.get_task_v2(task_v2_id, organization_id=organization_id) or task_v2
+                    )
+                    await task_v2_service.send_task_v2_webhook(task_v2)
+                release_hold()
+                return
 
             await initialize_skyvern_state_file(workflow_run_id=workflow_run_id, organization_id=organization_id)
             await prepare_org_llm_runtime(app.DATABASE, organization_id, organization)

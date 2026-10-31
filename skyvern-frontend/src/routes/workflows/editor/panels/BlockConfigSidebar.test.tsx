@@ -46,6 +46,9 @@ vi.mock("../nodes/WorkflowBlockIcon", () => ({
 vi.mock("../nodes/types", () => ({
   workflowBlockTitle: { task: "Task" },
 }));
+vi.mock("@/hooks/useIntegrationCatalogQuery", () => ({
+  useIntegrationCatalogQuery: () => ({ data: undefined }),
+}));
 
 const xyflow = vi.hoisted(() => ({
   nodes: [] as Node[],

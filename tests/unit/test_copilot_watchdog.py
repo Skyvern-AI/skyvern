@@ -45,6 +45,7 @@ from skyvern.forge.sdk.schemas.workflow_runs import WorkflowRunBlock
 from skyvern.schemas.workflows import BlockStatus, BlockType
 from skyvern.webeye.actions.action_types import ActionType
 from skyvern.webeye.actions.actions import ActionStatus
+from tests.unit._mcp_browser_fakes import crash_free_browser_state
 from tests.unit.copilot_test_helpers import SEARCH_THEN_SELECT_WORKFLOW_YAML, adopted_detached_tasks
 from tests.unit.copilot_test_helpers import install_run_blocks_harness as _install_run_harness
 from tests.unit.copilot_test_helpers import make_copilot_ctx, run_result_action_row, terminal_extraction_block
@@ -181,7 +182,7 @@ class _ErrorCtx:
 def _install_fallback_page(
     monkeypatch: pytest.MonkeyPatch, page: SimpleNamespace
 ) -> tuple[SimpleNamespace, SimpleNamespace]:
-    browser_state = SimpleNamespace(get_or_create_page=AsyncMock(return_value=page))
+    browser_state = crash_free_browser_state(get_or_create_page=AsyncMock(return_value=page))
     session_manager = SimpleNamespace(get_browser_state=AsyncMock(return_value=browser_state))
     monkeypatch.setattr(forge_app, "PERSISTENT_SESSIONS_MANAGER", session_manager)
     ctx = SimpleNamespace(
@@ -189,6 +190,7 @@ def _install_fallback_page(
         browser_session_id="pbs_copilot",
         turn_origin=TurnOrigin.interactive,
         attached_browser_drivers={},
+        page_crash_records_by_browser_session={},
     )
     return session_manager, ctx
 
@@ -550,7 +552,7 @@ async def test_a_watchdog_terminated_run_still_carries_its_per_block_page_facts(
                 label="select_first_result",
                 final_url="https://fixture.test/results/widget",
                 task_id="tsk_select",
-            ),
+            ).model_copy(update={"modified_at": datetime(2026, 4, 21, 12, 7, tzinfo=UTC)}),
             terminal_extraction_block(
                 "completed",
                 label="run_search",
@@ -574,6 +576,11 @@ async def test_a_watchdog_terminated_run_still_carries_its_per_block_page_facts(
     data = result["data"]
 
     assert data["control_signal"]["kind"] == "watchdog_ceiling"
+    assert data["run_duration_seconds"] > 0
+    assert {block["label"]: block["duration_seconds"] for block in data["blocks"]} == {
+        "select_first_result": 120,
+        "run_search": 0,
+    }
     assert data["observed_block_end_urls"] == {
         "run_search": "https://fixture.test/results/widget/page-1",
         "select_first_result": "https://fixture.test/results/widget",
@@ -812,6 +819,7 @@ async def test_progressing_worker_run_crosses_legacy_boundary_and_returns_termin
     assert result["ok"] is True, result
     assert result["data"]["workflow_run_id"] == "wr_paused"
     assert result["data"]["overall_status"] == "completed"
+    assert result["data"]["run_duration_seconds"] == 300
     assert result["data"]["current_url"] == "https://example.com/result"
     assert result["data"]["blocks"] == [
         {
@@ -820,6 +828,7 @@ async def test_progressing_worker_run_crosses_legacy_boundary_and_returns_termin
             "status": "completed",
             "workflow_run_block_id": "wrb_terminal",
             "output": {"heading": "Example Domain"},
+            "duration_seconds": 0,
             "extracted_data": {"heading": "Example Domain"},
         }
     ]

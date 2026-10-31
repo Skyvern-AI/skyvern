@@ -11,8 +11,10 @@ from unittest.mock import MagicMock
 
 import pytest
 
+from skyvern.cli.mcp_tools import blocks
 from skyvern.cli.mcp_tools.blocks import (
     CODE_BLOCK_RUNTIME_TOPIC,
+    NOTES_KNOWLEDGE_TOPIC,
     WORKFLOW_KNOWLEDGE_TOPIC_HEADERS,
     _parse_knowledge_topics,
     skyvern_block_schema,
@@ -28,11 +30,20 @@ from skyvern.forge.sdk.workflow.models.parameter import OutputParameter, Paramet
 @pytest.mark.asyncio
 async def test_workflow_knowledge_lists_available_topics_without_returning_the_document() -> None:
     result = await skyvern_workflow_knowledge()
+    public_topics = [topic for topic in WORKFLOW_KNOWLEDGE_TOPIC_HEADERS if topic != NOTES_KNOWLEDGE_TOPIC]
 
     assert result["ok"] is True
-    assert result["data"]["topics"] == [*WORKFLOW_KNOWLEDGE_TOPIC_HEADERS, CODE_BLOCK_RUNTIME_TOPIC]
-    assert result["data"]["count"] == len(WORKFLOW_KNOWLEDGE_TOPIC_HEADERS) + 1
+    assert result["data"]["topics"] == [*public_topics, CODE_BLOCK_RUNTIME_TOPIC]
+    assert result["data"]["count"] == len(public_topics) + 1
     assert "A Skyvern workflow is defined" not in json.dumps(result)
+
+
+@pytest.mark.asyncio
+async def test_workflow_knowledge_hides_doc_editor_topic_from_public_mcp() -> None:
+    result = await skyvern_workflow_knowledge(topics=[NOTES_KNOWLEDGE_TOPIC])
+
+    assert result["ok"] is False
+    assert NOTES_KNOWLEDGE_TOPIC not in result["error"]["hint"]
 
 
 @pytest.mark.asyncio
@@ -123,6 +134,15 @@ async def test_workflow_knowledge_rejects_an_incomplete_topic_source(
 
     assert result["ok"] is False
     assert result["error"]["code"] == "SDK_ERROR"
+
+
+@pytest.mark.asyncio
+async def test_block_schema_hides_internal_note_fields() -> None:
+    result = await skyvern_block_schema(block_type="navigation")
+
+    properties = result["data"]["schema"]["properties"]
+    assert "navigation_goal" in properties
+    assert not {"notes", "trailing_notes", "description"} & properties.keys()
 
 
 @pytest.mark.asyncio
@@ -239,6 +259,61 @@ async def test_block_schema_no_type_lists_all() -> None:
     assert "pdf_fill" in block_types
     assert "task" not in block_types
     assert result["data"]["count"] > 0
+
+
+@pytest.mark.asyncio
+async def test_unavailable_powerbi_is_hidden_from_schema_and_nested_validation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(blocks, "_powerbi_queries_available", lambda: False)
+
+    listed = await skyvern_block_schema()
+    specific = await skyvern_block_schema(block_type="powerbi_query")
+    nested = await skyvern_block_validate(
+        block_json=json.dumps(
+            {
+                "block_type": "for_loop",
+                "label": "outer_loop",
+                "loop_over_parameter_key": "rows",
+                "loop_blocks": [
+                    {
+                        "block_type": "powerbi_query",
+                        "label": "read_powerbi",
+                        "connection_id": "moc_owner",
+                        "dataset_id": "{{ dataset_id }}",
+                        "query": "{{ dax_query }}",
+                    }
+                ],
+            }
+        )
+    )
+
+    assert "powerbi_query" not in listed["data"]["block_types"]
+    assert specific["ok"] is False
+    assert "Power BI queries are not currently available." in specific["error"]["message"]
+    assert nested["ok"] is False
+    assert "Power BI queries are not currently available." in nested["error"]["message"]
+
+
+@pytest.mark.asyncio
+async def test_unavailable_powerbi_does_not_match_trigger_payload_data(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(blocks, "_powerbi_queries_available", lambda: False)
+
+    result = await skyvern_block_validate(
+        block_json=json.dumps(
+            {
+                "block_type": "workflow_trigger",
+                "label": "trigger_workflow",
+                "workflow_permanent_id": "wpid_target",
+                "payload": {"metadata": {"block_type": "powerbi_query"}},
+            }
+        )
+    )
+
+    assert result["ok"] is True
+    assert result["data"]["valid"] is True
 
 
 @pytest.mark.asyncio

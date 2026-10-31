@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import uuid
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Callable
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
@@ -456,6 +456,9 @@ class DefaultPersistentSessionsManager(PersistentSessionsManager):
     def can_probe_registered_browser_state(self) -> bool:
         return True
 
+    def launches_browser_on_create(self) -> bool:
+        return settings.BROWSER_STREAMING_MODE == "cdp" or settings.BROWSER_TYPE == "cdp-connect"
+
     def supports_evict_and_reconnect(self) -> bool:
         # ``get_browser_state`` is a pure dict lookup against ``_browser_sessions``; it
         # does not reconnect after eviction. Callers must not run the evict-and-reconnect
@@ -711,16 +714,24 @@ class DefaultPersistentSessionsManager(PersistentSessionsManager):
         return None
 
     async def set_browser_state(
-        self, session_id: str, browser_state: BrowserState, organization_id: str | None = None
-    ) -> None:
+        self,
+        session_id: str,
+        browser_state: BrowserState,
+        organization_id: str | None = None,
+        *,
+        may_publish: Callable[[], bool] | None = None,
+    ) -> bool:
         current = self._browser_sessions.get(session_id)
         if current is not None and current.browser_state is browser_state:
             current.organization_id = organization_id
-            return
+            return True
+        if may_publish is not None and not may_publish():
+            return False
         if current is not None:
             self._retire_browser_session(session_id, expected=current)
         browser_session = BrowserSession(browser_state=browser_state, organization_id=organization_id)
         self._browser_sessions[session_id] = browser_session
+        return True
 
     async def evict_cached_browser_state(
         self,
@@ -851,8 +862,7 @@ class DefaultPersistentSessionsManager(PersistentSessionsManager):
         # screencast/CDP input endpoints can connect. Triggered both by the
         # in-process CDP streaming mode and by cdp-connect, which forwards to a
         # remote browser and still needs a registered BrowserState locally.
-        should_launch = settings.BROWSER_STREAMING_MODE == "cdp" or settings.BROWSER_TYPE == "cdp-connect"
-        if should_launch and runnable_id is None:
+        if self.launches_browser_on_create() and runnable_id is None:
             session_id = session.persistent_browser_session_id
             task = asyncio.create_task(
                 self._launch_browser_for_session(session_id, organization_id, proxy_location, url)
@@ -1001,6 +1011,7 @@ class DefaultPersistentSessionsManager(PersistentSessionsManager):
         proxy_location: ProxyLocationInput,
         browser_profile_id: str | None,
         session_kind: BrowserSessionKind,
+        created_for_workflow_permanent_id: str | None = None,
     ) -> FreshExitReceipt:
         return FreshExitReceipt(
             outcome=FreshExitOutcome.no_alternate,

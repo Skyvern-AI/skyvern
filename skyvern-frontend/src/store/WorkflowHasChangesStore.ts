@@ -20,6 +20,7 @@ import { applyYamlCommitMetadata } from "./WorkflowTitleStore";
 import { AxiosError } from "axios";
 import { useEffect, useRef } from "react";
 import { create } from "zustand";
+import { useCopilotProposalStore } from "@/store/CopilotProposalStore";
 import { useMutation, useQueryClient } from "@tanstack/react-query";
 import { stringify as convertToYAML } from "yaml";
 import { usePostHog } from "posthog-js/react";
@@ -95,6 +96,8 @@ interface WorkflowSaveOpts {
   status?: string;
 }
 
+const PROPOSAL_SAVE_MESSAGE = "Resolve the Copilot proposal before saving.";
+
 function assertWorkflowSaveAllowed(
   yamlCommit?: YamlCommitContext,
   saveOwner?: YamlCommitOwner | null,
@@ -107,6 +110,10 @@ function assertWorkflowSaveAllowed(
       variant: "destructive",
     });
     throw new YamlCommitError("workflow", blockedReason);
+  }
+  // Every save path lands here, so a staged Copilot proposal can only become durable through Accept.
+  if (useCopilotProposalStore.getState().proposal) {
+    throw new SaveRefusedError(PROPOSAL_SAVE_MESSAGE);
   }
   const state = useWorkflowYamlEditorStore.getState();
   if (state.authoringInProgress) {
@@ -345,7 +352,11 @@ const useWorkflowSave = (opts?: WorkflowSaveOpts) => {
             "The workflow editor changed before saving",
           );
         }
-        const requestBody = buildWorkflowSaveRequest(saveData, opts);
+        // Explicit nulls clear only annotations that were present in the loaded version.
+        const requestBody = buildWorkflowSaveRequest(saveData, {
+          ...opts,
+          explicitDocFields: true,
+        });
         const changesState = useWorkflowHasChangesStore.getState();
 
         const yaml = convertToYAML(requestBody);
@@ -416,10 +427,25 @@ const useWorkflowSave = (opts?: WorkflowSaveOpts) => {
         } finally {
           clearTimeout(noticeTimer);
         }
-        if (!owner || owner.active)
+        const cacheSavedWorkflow = () => {
+          // Only the detail GET computes effective_default_engine; the PUT omits it.
+          queryClient.setQueryData(
+            ["workflow", saveData.workflow.workflow_permanent_id],
+            (prev?: WorkflowApiResponse) => ({
+              ...response.data,
+              effective_default_engine:
+                "effective_default_engine" in response.data
+                  ? response.data.effective_default_engine
+                  : prev?.effective_default_engine,
+            }),
+          );
+        };
+        if (!owner || owner.active) {
+          cacheSavedWorkflow();
           useWorkflowHasChangesStore
             .getState()
             .recordBaseVersion(response.data);
+        }
         if (
           !owner ||
           owner.active ||
@@ -437,17 +463,7 @@ const useWorkflowSave = (opts?: WorkflowSaveOpts) => {
           activeOwner.workflowPermanentId === owner.workflowPermanentId &&
           hydrateWorkflowEditor(response.data)
         ) {
-          // Only the detail GET computes effective_default_engine; the PUT omits it.
-          queryClient.setQueryData(
-            ["workflow", saveData.workflow.workflow_permanent_id],
-            (prev?: WorkflowApiResponse) => ({
-              ...response.data,
-              effective_default_engine:
-                "effective_default_engine" in response.data
-                  ? response.data.effective_default_engine
-                  : prev?.effective_default_engine,
-            }),
-          );
+          cacheSavedWorkflow();
           setHasChanges(false, { fromYamlCommit: true });
         }
         if (owner && !override?.yamlCommit) {

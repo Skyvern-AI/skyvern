@@ -16,4 +16,11 @@ function getErrorDetail(error: unknown): string | undefined {
   return undefined;
 }
 
-export { getErrorDetail };
+// The server refuses executables, scripts, HTML/SVG and mislabeled documents with a 415.
+function getUploadTypeRejection(error: unknown): string | undefined {
+  const status = (error as { response?: { status?: unknown } } | null)?.response
+    ?.status;
+  return status === 415 ? getErrorDetail(error) : undefined;
+}
+
+export { getErrorDetail, getUploadTypeRejection };

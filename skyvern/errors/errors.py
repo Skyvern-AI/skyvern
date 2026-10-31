@@ -156,3 +156,51 @@ class MissingTOTPSourceError(SkyvernDefinedError):
         "totp_identifier on the login block (or run override), or attach a credential parameter whose "
         "credential stores a TOTP secret."
     )
+
+
+ANTI_BOT_ERROR_CODE = "ANTI_BOT_ERROR"
+# The service-specific code reported alongside ANTI_BOT_ERROR when the qualifying evidence names that service.
+ANTI_BOT_SERVICE_ERROR_CODES: dict[str, str] = {
+    "recaptcha": "RECAPTCHA_ERROR",
+    "hcaptcha": "HCAPTCHA_ERROR",
+    "cloudflare_turnstile": "CLOUDFLARE_TURNSTILE_ERROR",
+    # Cloudflare challenged or blocked; which Cloudflare product or rule did is not known.
+    "cloudflare": "CLOUDFLARE_ERROR",
+}
+ANTI_BOT_SYSTEM_ERROR_CODES = frozenset({ANTI_BOT_ERROR_CODE, *ANTI_BOT_SERVICE_ERROR_CODES.values()})
+_ANTI_BOT_SERVICE_NAMES = {
+    "recaptcha": "reCAPTCHA",
+    "hcaptcha": "hCaptcha",
+    "cloudflare_turnstile": "Cloudflare Turnstile",
+    "cloudflare": "Cloudflare",
+}
+
+
+def anti_bot_system_errors(services: Sequence[str | None]) -> list[SkyvernDefinedError]:
+    """The general anti-bot error, then one per distinct supported service, for qualified failure evidence; empty
+    when there is none. An unrecognized or unknown service reports the general error alone."""
+    if not services:
+        return []
+    errors = [
+        SkyvernDefinedError(
+            error_code=ANTI_BOT_ERROR_CODE,
+            reasoning="A bot-protection block or unresolved challenge was recorded during this failed attempt.",
+        )
+    ]
+    for service in dict.fromkeys(s for s in services if s in ANTI_BOT_SERVICE_ERROR_CODES):
+        errors.append(
+            SkyvernDefinedError(
+                error_code=ANTI_BOT_SERVICE_ERROR_CODES[service],
+                reasoning=f"A {_ANTI_BOT_SERVICE_NAMES[service]} block or unresolved challenge was recorded during "
+                "this failed attempt.",
+            )
+        )
+    return errors
+
+
+def is_anti_bot_system_error(error: object) -> bool:
+    return (
+        isinstance(error, dict)
+        and error.get("error_type") == ErrorType.SYSTEM_DEFINED_ERROR.value
+        and error.get("error_code") in ANTI_BOT_SYSTEM_ERROR_CODES
+    )

@@ -143,20 +143,17 @@ async def test_clean_up_workflow_records_the_final_diagnostic_after_the_har_and_
     service, order = _diagnostic_cleanup(monkeypatch, annotate)
     annotate.side_effect = lambda *a, **k: order.append("diagnostic")
     workflow_run = MagicMock(workflow_run_id="wr_1", organization_id="org_1", browser_address=None, status="failed")
-    mapping = {"ACCESS_DENIED": "The site shows an access denied page"}
 
     await service.clean_up_workflow(
         workflow=MagicMock(),
         workflow_run=workflow_run,
         api_key="sk",
         browser_cleanup_result=_cleanup_result(),
-        final_diagnostic_error_code_mapping=mapping,
         final_diagnostic_owner=workflow_run,
     )
 
     assert order == ["har", "diagnostic", "webhook"]
     assert annotate.await_args.args[0] is workflow_run
-    assert annotate.await_args.kwargs["error_code_mapping"] == mapping
 
 
 @pytest.mark.asyncio

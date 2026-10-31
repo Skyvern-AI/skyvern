@@ -10,6 +10,7 @@ from skyvern.forge.sdk.copilot.agent import (
     _build_user_context,
     _prior_run_debug_text,
     _store_turn_context_packet_on_context,
+    _workflow_yaml_for_prompt,
 )
 from skyvern.forge.sdk.copilot.context import CopilotContext
 from skyvern.forge.sdk.copilot.request_policy import RequestPolicy
@@ -168,6 +169,14 @@ _WORKFLOW_V1 = (
 _WORKFLOW_V2 = _WORKFLOW_V1 + (
     "    - block_type: text_prompt\n      label: summarize_result\n      llm_key: x\n      prompt: ok\n"
 )
+_WORKFLOW_WITH_NOTE = _WORKFLOW_V1 + "      notes: hidden note\n"
+_WORKFLOW_WITH_SECRET_SHAPES = (
+    "workflow_definition:\n  blocks:\n"
+    "    - block_type: http_request\n      label: fetch\n      url: https://example.com\n"
+    '      headers:\n        Authorization: "Bearer {{ token }}"\n'
+    "    - block_type: code\n      label: prepare\n      code: |\n"
+    '        api_key = "{{ key }}"\n'
+)
 
 _EMPTY_WORKFLOW = "workflow_definition:\n  parameters: []\n  blocks: []\n"
 
@@ -309,6 +318,66 @@ def test_attachment_stores_packet_on_copilot_context() -> None:
 
     assert ctx.turn_context_packet is not None
     assert ctx.turn_context_packet.workflow_context is not None
+
+
+@pytest.mark.parametrize(
+    ("request_yaml", "prior_yaml", "doc_editor_enabled", "changed"),
+    [
+        pytest.param(_WORKFLOW_WITH_NOTE, _WORKFLOW_WITH_NOTE, False, False, id="doc-disabled-annotated-prior"),
+        pytest.param(_WORKFLOW_V1, _WORKFLOW_WITH_NOTE, False, False, id="doc-disabled-client-omits-notes"),
+        pytest.param(
+            _WORKFLOW_WITH_NOTE,
+            _WORKFLOW_V1 + "      notes: previous note\n      description: previous description\n",
+            False,
+            False,
+            id="doc-disabled-annotation-only-difference",
+        ),
+        pytest.param(_WORKFLOW_WITH_NOTE, _WORKFLOW_WITH_NOTE, True, False, id="doc-enabled-unchanged"),
+        pytest.param(_WORKFLOW_WITH_NOTE, _WORKFLOW_V1, True, True, id="doc-enabled-note-edit"),
+        pytest.param(
+            _WORKFLOW_WITH_SECRET_SHAPES, _WORKFLOW_WITH_SECRET_SHAPES, False, False, id="doc-disabled-secret-shapes"
+        ),
+        pytest.param(
+            _WORKFLOW_WITH_SECRET_SHAPES, _WORKFLOW_WITH_SECRET_SHAPES, True, False, id="doc-enabled-secret-shapes"
+        ),
+        pytest.param(
+            _WORKFLOW_WITH_SECRET_SHAPES.replace("example.com", "example.org"),
+            _WORKFLOW_WITH_SECRET_SHAPES,
+            False,
+            True,
+            id="real-edit-with-secret-shapes",
+        ),
+    ],
+)
+def test_turn_context_change_summary_applies_doc_policy_to_both_sides(
+    request_yaml: str,
+    prior_yaml: str,
+    doc_editor_enabled: bool,
+    changed: bool,
+) -> None:
+    ctx = CopilotContext(
+        organization_id="org-1",
+        workflow_id="wf-1",
+        workflow_permanent_id="wfp-1",
+        workflow_yaml=request_yaml,
+        browser_session_id=None,
+        stream=MagicMock(),
+        doc_editor_enabled=doc_editor_enabled,
+    )
+    safe_yaml = _workflow_yaml_for_prompt(ctx, request_yaml)
+
+    _store_turn_context_packet_on_context(
+        ctx,
+        request_policy=RequestPolicy(),
+        chat_request=SimpleNamespace(message="Continue", workflow_yaml=request_yaml),
+        chat_history=[],
+        prior_copilot_workflow_yaml=prior_yaml,
+    )
+
+    assert ctx.turn_context_packet is not None
+    assert ctx.turn_context_packet.workflow_context is not None
+    assert ctx.turn_context_packet.workflow_context.yaml == safe_yaml
+    assert (ctx.turn_context_packet.workflow_change_context is not None) is changed
 
 
 def test_a_prior_runs_typed_packet_reaches_the_turn_context() -> None:

@@ -38,7 +38,7 @@ Everything in Skyvern (agents, runs, credentials, API keys, credits) belongs to 
 
 ## API keys
 
-Your API key authenticates every API, SDK, CLI and MCP request for your organization.
+Your API key authenticates every API, SDK, CLI and MCP request for your organization. Only an Admin can open this page; a Member who follows a link to it sees **Organization admin access is required**.
 
 <Steps>
   <Step title="Open API keys">
@@ -123,14 +123,42 @@ Access tokens expire and can be refreshed when you request `offline_access`. A r
 
 ### Permissions
 
-The organization is the only permission boundary.
+#### The organization boundary
 
-- An API key can call every endpoint your organization can reach. There are no read-only, per-endpoint or per-agent keys.
-- An OAuth token acts as the organization of the person who signed in, with the same reach as an API key. Its OAuth scopes (`profile`, `email` and the like) describe who signed in. They don't limit what the token can do.
+Every credential belongs to one organization and reaches only that organization's agents, runs, credentials and data. A request can't read or change another organization's resources.
+
+- The organization API key can call every endpoint your organization can reach. There are no read-only, per-endpoint or per-agent keys.
+- An OAuth token acts as the person who signed in, in their organization, with their [role](#roles). Its OAuth scopes (`profile`, `email` and the like) describe who signed in. They don't limit what the token can do.
 - MCP tool scopes (`operate`, `build`, `browser`, `lean`, `all`) only change which tools a client sees. They are not a security boundary.
 - Usage from any credential is billed to the organization.
 
 To keep production and staging apart, or one team or customer from another, use separate organizations, each with its own key.
+
+#### Roles
+
+Each person in an organization is an **Admin** or a **Member**, set on [Members](#members).
+
+| Role | What it can do |
+|---|---|
+| **Admin** | Everything in the organization, including the admin-only actions below. |
+| **Member** | All day-to-day work: build, run and edit agents, manage credentials, and view runs and results. The app hides **Billing** and **API keys** from Members; opening either page shows **Organization admin access is required**. |
+
+These actions are refused for Members with `403`:
+
+| Action | Who can do it |
+|---|---|
+| Create, change, enable, disable, replay or delete [event triggers](/developers/event-triggers), and rotate their signing secrets | An Admin signed in to the app |
+| Create, list, revoke or reissue additional organization API keys | An Admin signed in to the app |
+| Change or remove the organization's 1Password connection | An Admin, or a request with the organization API key |
+| Export the organization's audit log | An Admin, or a request with the organization API key |
+
+An API key can't manage API keys, event triggers or member roles, so a leaked key can't create a replacement for itself.
+
+Members who open the Azure Key Vault or Custom Credential Service connection see its secret masked.
+
+<Warning>
+Every Admin and Member can get the organization API key: an Admin from **Settings → API keys**, a Member by signing in to the CLI. The key can do everything an Admin can except manage API keys, event triggers and member roles. Treat every Admin and Member as able to use the API with full access, and use separate organizations where people must be kept apart.
+</Warning>
 
 ### API versions and deprecations
 
@@ -232,7 +260,7 @@ Questions about a migration: [support@skyvern.com](mailto:support@skyvern.com).
 
 ## Billing and credits
 
-Open **Settings → Billing**. On the Trial and Hobby plans, the **Upgrade plan** link at the bottom of the sidebar opens the same page; on other plans it reads **Plan & usage**.
+Open **Settings → Billing**. On the Trial and Hobby plans, the **Upgrade plan** link at the bottom of the sidebar opens the same page; on other plans it reads **Plan & usage**. Billing is Admin-only: a Member sees neither the **Billing** page in Settings nor that sidebar link.
 
 <img src="/images/cloud/settings-billing-overview.png" alt="Billing page with a current Free plan card, Hobby, Pro, and Enterprise plan cards, and a Credit Usage meter showing 3,948 of 5,000 one-time credits used" />
 
@@ -257,7 +285,7 @@ Specific prompts use fewer actions. "Extract the monthly price from the pricing 
 
 ### Your 14-day trial
 
-New accounts start with a 14-day trial: 30,000 credits and Hobby plan limits. When you sign up, pick the plan you want after the trial, Hobby ($29/month) or Pro ($149/month), and add a card. Nothing is charged during the trial. On day 14 we charge the plan you picked and it renews monthly. To switch plans, start your plan early, or cancel, open Settings → Billing. Cancelling ends the trial straight away and you are not charged.
+New accounts start with a 14-day trial: 30,000 credits and Hobby plan limits. When you sign up, pick the plan you want after the trial, Hobby ($29/month) or Pro ($149/month), and add a card. Nothing is charged during the trial. On day 14 we charge the plan you picked and it renews monthly. To switch plans, start your plan early, or cancel, open Settings → Billing. Cancelling turns off the day-14 charge: you keep the trial until day 14 and are not charged. You can resume the trial any time before then, or pick a plan to keep running agents after it ends.
 
 ### Plans
 
@@ -288,7 +316,9 @@ Skyvern checks credits before it starts a run and returns `402` if they don't co
 
 Go to **Settings → Members** to invite teammates by email and manage their roles. **Invite teammates** in the organization menu at the top of the sidebar opens the same page. Members share the organization's agents, runs, credentials, API key and credits.
 
-**Your role in this organization** at the top of the page shows the role Skyvern recognizes for your session, **Admin** or **Member**. It reads **Role information unavailable** when no role comes back. The role is shown for reference only; it doesn't change what you can do in the app, because the organization is still the only [permission boundary](#permissions).
+Pick a role when you invite someone, and change it later from the member list: **Admin** or **Member**. [Roles](#roles) explains what each one can do.
+
+**Your role in this organization** at the top of the page shows the role Skyvern recognizes for your session. It reads **Role information unavailable** when no role comes back.
 
 <img src="/images/cloud/cloud-settings-members.png" alt="Settings, Members page showing No organization yet and the Create organization button" />
 

@@ -1,9 +1,14 @@
 import { TriggerType } from "@/api/types";
 import {
+  ArrowDownIcon,
+  ArrowUpIcon,
   CalendarIcon,
   CodeIcon,
   CubeIcon,
   CursorArrowIcon,
+  FileTextIcon,
+  LightningBoltIcon,
+  Link2Icon,
 } from "@radix-ui/react-icons";
 import { Tip } from "@/components/Tip";
 
@@ -31,7 +36,33 @@ const triggerConfig: Record<
     icon: <CalendarIcon className="size-3.5 text-blue-400" />,
     label: "Scheduled",
   },
+  [TriggerType.Webhook]: {
+    icon: <Link2Icon className="size-3.5 text-cyan-400" />,
+    label: "Webhook",
+  },
+  [TriggerType.Event]: {
+    icon: <LightningBoltIcon className="size-3.5 text-violet-400" />,
+    label: "Event",
+  },
+  [TriggerType.JobRecipeExtract]: {
+    icon: <ArrowDownIcon className="size-3.5 text-teal-400" />,
+    label: "Job recipe extract",
+  },
+  [TriggerType.JobRecipeApply]: {
+    icon: <ArrowUpIcon className="size-3.5 text-orange-400" />,
+    label: "Job recipe apply",
+  },
+  [TriggerType.SeoRecipeSubmit]: {
+    icon: <FileTextIcon className="size-3.5 text-lime-400" />,
+    label: "SEO recipe submit",
+  },
 };
+
+function getTriggerTypeLabel(
+  triggerType: TriggerType | null | undefined,
+): string | undefined {
+  return triggerType ? triggerConfig[triggerType]?.label : undefined;
+}
 
 function TriggerTypeBadge({ triggerType }: Props) {
   if (!triggerType) {
@@ -50,4 +81,5 @@ function TriggerTypeBadge({ triggerType }: Props) {
   );
 }
 
-export { TriggerTypeBadge };
+// eslint-disable-next-line react-refresh/only-export-components -- The shared label is used outside this component.
+export { getTriggerTypeLabel, TriggerTypeBadge };

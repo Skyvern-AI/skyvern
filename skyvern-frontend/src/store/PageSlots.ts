@@ -1,3 +1,4 @@
+import type { WorkflowReliability } from "@/routes/workflows/types/reliabilityTypes";
 import { createContext, useContext } from "react";
 import type { WorkflowApiResponse } from "@/routes/workflows/types/workflowTypes";
 
@@ -58,6 +59,7 @@ export type PageSlots = {
       workflowPermanentId: string;
       title?: string;
       surface: "list" | "editor";
+      reliability?: WorkflowReliability;
     }>
   >;
   workflowCuratorSettings?: React.ComponentType<

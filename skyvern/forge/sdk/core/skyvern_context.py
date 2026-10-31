@@ -41,6 +41,7 @@ if TYPE_CHECKING:
     # must not pull a service module at import time. String annotation below.
     from skyvern.services.script_reviewer_v3.budget import RunBudget
     from skyvern.webeye.actions.actions import Action
+    from skyvern.webeye.utils.challenge_solve_record import ChallengeSolveReceipt
 
 
 @dataclass
@@ -887,9 +888,12 @@ class SkyvernContext:
     script_revision_id: str | None = None
     action_order: int = 0
     prompt: str | None = None
+    # Workflow block label of the cached block now running; step notes are keyed by it.
+    cached_block_label: str | None = None
     parent_workflow_run_block_id: str | None = None
     workflow_run_block_id: str | None = None
     loop_metadata: dict[str, Any] | None = None
+    active_loop_label: str | None = None
     loop_internal_state: dict[str, Any] | None = None
     loop_output_values: list[list[dict[str, Any]]] | None = None
     script_run_parameters: dict[str, Any] = field(default_factory=dict)
@@ -1036,6 +1040,8 @@ class SkyvernContext:
     captcha_solve_latch_key: str | None = None
     # Challenge-solve calls recorded per run id in this run's context; the solve ledger's attempt number.
     challenge_solve_attempts: dict[str, int] = field(default_factory=dict)
+    # The latest finished solve calls' receipts, oldest first, capped by the solve ledger.
+    challenge_solve_receipts: list[ChallengeSolveReceipt] = field(default_factory=list)
 
     # Browser dialogs captured since the last agent prompt build, surfaced into the
     # next extract-action prompt so the LLM can react to validation rejections.

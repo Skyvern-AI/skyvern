@@ -502,7 +502,7 @@ function BrowserStream({
           return;
         }
 
-        const wsParams = await getWebSocketParams();
+        const { params: wsParams, protocols } = await getWebSocketParams();
         if (cancelled) {
           return;
         }
@@ -547,7 +547,7 @@ function BrowserStream({
           subtree: true,
         });
 
-        const rfb = new RFB(canvas, vncUrl);
+        const rfb = new RFB(canvas, vncUrl, { wsProtocols: protocols });
 
         rfb.scaleViewport = true;
         rfb.compressionLevel = 2;

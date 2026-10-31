@@ -17,9 +17,10 @@ from urllib.parse import urlparse
 
 import pytest
 from agents import Agent, FunctionTool, OutputGuardrail, RunConfig, SQLiteSession
-from agents.items import ModelResponse, TResponseInputItem
+from agents.items import ModelResponse, RunItem, TResponseInputItem
 from agents.models.interface import Model, ModelProvider
 from agents.result import RunResultStreaming
+from agents.stream_events import RunItemStreamEvent
 from openai.types.responses import (
     ResponseCompletedEvent,
     ResponseOutputItemDoneEvent,
@@ -107,8 +108,10 @@ from skyvern.schemas.runs import ProxyLocation
 from skyvern.schemas.self_heal import HealEpisode
 from skyvern.schemas.workflows import BlockType
 from skyvern.services import workflow_service as workflow_service_module
+from skyvern.webeye import real_browser_manager
 from skyvern.webeye.actions.action_types import ActionType
 from skyvern.webeye.actions.actions import ActionStatus
+from skyvern.webeye.real_browser_manager import RealBrowserManager
 from tests.unit.conftest import requires_chromium
 
 DISPATCHED_LOGIN_GATE_HTML = (
@@ -144,6 +147,7 @@ def wire_credential_vault(
     *,
     credential_id: str = "cred_1",
     name: str = "authtest simple",
+    vault_type: CredentialVaultType = CredentialVaultType.SKYVERN,
 ) -> Credential:
     """Serve one saved credential from the org database and ``secrets`` from its vault."""
     now = datetime(2026, 1, 1, tzinfo=UTC)
@@ -151,7 +155,7 @@ def wire_credential_vault(
         credential_id=credential_id,
         organization_id="org-1",
         name=name,
-        vault_type=CredentialVaultType.SKYVERN,
+        vault_type=vault_type,
         item_id="item_1",
         credential_type=CredentialType.PASSWORD,
         username=secrets.username,
@@ -169,12 +173,14 @@ def wire_credential_vault(
         ),
         raising=False,
     )
-    vault = SimpleNamespace(get_credential_item=AsyncMock(return_value=SimpleNamespace(name=name, credential=secrets)))
+    vault = SimpleNamespace(
+        get_credential_item=AsyncMock(return_value=SimpleNamespace(name=name, credential=secrets, login_sites=None))
+    )
     # `app` is an AppHolder proxy without __delattr__; patch the underlying instance so teardown can delete it.
     monkeypatch.setattr(
         object.__getattribute__(forge_app, "_inst"),
         "CREDENTIAL_VAULT_SERVICES",
-        {CredentialVaultType.SKYVERN: vault},
+        {vault_type: vault},
         raising=False,
     )
     return credential
@@ -1218,6 +1224,76 @@ def install_origin_run(
     )
 
 
+def recorded_session(
+    session_id: str,
+    *,
+    organization_id: str = "org-1",
+    proxy_location: ProxyLocationInput = None,
+    browser_profile_id: str | None = None,
+    browser_profile_loaded: bool = False,
+) -> PersistentBrowserSession:
+    return PersistentBrowserSession(
+        persistent_browser_session_id=session_id,
+        organization_id=organization_id,
+        created_at=ORIGIN_RUN_CREATED_AT,
+        modified_at=ORIGIN_RUN_CREATED_AT,
+        proxy_location=proxy_location,
+        browser_profile_id=browser_profile_id,
+        browser_profile_loaded=browser_profile_loaded,
+    )
+
+
+def install_named_runs(
+    monkeypatch: pytest.MonkeyPatch,
+    runs: Sequence[tuple[WorkflowRun, Workflow, tuple[list[WorkflowRunBlock], list[WorkflowRunOutputParameter]]]],
+    *,
+    parameters: Mapping[str, list[tuple[WorkflowParameter, WorkflowRunParameter]]] | None = None,
+    sessions: Sequence[PersistentBrowserSession] = (),
+) -> None:
+    """Serve each run, its version (deleted or not) and its rows by run id."""
+    by_id = {run.workflow_run_id: (run, workflow, rows) for run, workflow, rows in runs}
+    sessions_by_id = {session.persistent_browser_session_id: session for session in sessions}
+
+    async def get_workflow_run(*, workflow_run_id: str, organization_id: str | None = None) -> WorkflowRun | None:
+        return by_id[workflow_run_id][0] if workflow_run_id in by_id else None
+
+    async def get_workflow_for_workflow_run(
+        *, workflow_run_id: str, organization_id: str | None = None, filter_deleted: bool = True
+    ) -> Workflow | None:
+        workflow = by_id[workflow_run_id][1] if workflow_run_id in by_id else None
+        return None if workflow is None or (filter_deleted and workflow.deleted_at is not None) else workflow
+
+    monkeypatch.setattr(forge_app.WORKFLOW_SERVICE, "get_workflow_run", get_workflow_run)
+    monkeypatch.setattr(forge_app.DATABASE.workflows, "get_workflow_for_workflow_run", get_workflow_for_workflow_run)
+    monkeypatch.setattr(
+        forge_app.DATABASE.workflow_runs,
+        "get_workflow_run_parameters",
+        AsyncMock(side_effect=lambda *, workflow_run_id: list((parameters or {}).get(workflow_run_id, []))),
+    )
+    monkeypatch.setattr(
+        forge_app.DATABASE.observer,
+        "get_workflow_run_blocks",
+        AsyncMock(side_effect=lambda *, workflow_run_id, organization_id=None: list(by_id[workflow_run_id][2][0])),
+    )
+    monkeypatch.setattr(
+        forge_app.DATABASE.workflow_runs,
+        "get_workflow_run_output_parameters",
+        AsyncMock(side_effect=lambda *, workflow_run_id: list(by_id[workflow_run_id][2][1])),
+    )
+    monkeypatch.setattr(
+        forge_app.PERSISTENT_SESSIONS_MANAGER,
+        "get_session",
+        AsyncMock(side_effect=lambda session_id, organization_id: sessions_by_id.get(session_id)),
+        raising=False,
+    )
+
+
+def fake_tool(name: str) -> MagicMock:
+    tool = MagicMock()
+    tool.name = name
+    return tool
+
+
 def make_copilot_ctx(**overrides: object) -> CopilotContext:
     defaults: dict[str, object] = dict(
         organization_id="org-1",
@@ -1416,6 +1492,25 @@ def stub_copilot_agent_loop(
     monkeypatch.setattr("skyvern.forge.sdk.copilot.model_resolver.resolve_model_config", fake_resolve_model_config)
     monkeypatch.setattr("skyvern.forge.sdk.copilot.enforcement.run_with_enforcement", run_with_enforcement)
     monkeypatch.setattr(copilot_agent, "schedule_agent_naming", lambda *_args: None)
+
+
+def stamping_browser_manager(monkeypatch: pytest.MonkeyPatch, touch: AsyncMock | None = None) -> RealBrowserManager:
+    """A real activity renewer whose stamps land on a mock, so tests read renewal off the manager itself."""
+    monkeypatch.setattr(
+        real_browser_manager,
+        "app",
+        SimpleNamespace(
+            DATABASE=SimpleNamespace(browser_sessions=SimpleNamespace(touch_last_activity=touch or AsyncMock()))
+        ),
+    )
+    return RealBrowserManager()
+
+
+async def stop_activity_renewer(manager: RealBrowserManager) -> None:
+    renewer = manager._session_activity_renewer
+    if renewer is not None:
+        renewer.cancel()
+        await asyncio.gather(renewer, return_exceptions=True)
 
 
 TURN_EXIT_PATHS = ("normal", "model_error", "deadline", "cancel")
@@ -1650,6 +1745,22 @@ def install_org_secondary_llm_override(monkeypatch: pytest.MonkeyPatch, handler:
     monkeypatch.setattr(api_handler_factory, "is_custom_llm_owned_by_organization", lambda _id, _org: True)
     monkeypatch.setattr(api_handler_factory.LLMConfigRegistry, "is_registered", lambda _key: True)
     monkeypatch.setattr(api_handler_factory.LLMAPIHandlerFactory, "get_llm_api_handler", lambda _key: handler)
+
+
+def tool_called_event(
+    call_id: str, name: str, arguments: str = "{}", agent: Agent[Any] | None = None
+) -> RunItemStreamEvent:
+    call_item = MagicMock(spec=RunItem)
+    call_item.raw_item = {"call_id": call_id, "name": name, "arguments": arguments}
+    call_item.agent = agent or Agent(name="no-tools")
+    return RunItemStreamEvent(name="tool_called", item=call_item)
+
+
+def tool_output_event(call_id: str, payload: dict[str, Any]) -> RunItemStreamEvent:
+    out_item = MagicMock(spec=RunItem)
+    out_item.raw_item = {"call_id": call_id}
+    out_item.output = [{"type": "text", "text": json.dumps(payload)}]
+    return RunItemStreamEvent(name="tool_output", item=out_item)
 
 
 class FakeCopilotStream:

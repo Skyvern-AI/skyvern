@@ -99,6 +99,7 @@ from skyvern.exceptions import (
 )
 from skyvern.experimentation.wait_utils import get_or_create_wait_config, get_wait_time
 from skyvern.forge import app
+from skyvern.forge.antibot_evidence import prompt_evidence_str
 from skyvern.forge.async_operations import AgentPhase, AsyncOperationPool
 from skyvern.forge.failure_classifier import (
     FailureCategory,
@@ -172,7 +173,12 @@ from skyvern.forge.sdk.core.skyvern_context import (
 from skyvern.forge.sdk.db.datetime_utils import naive_utc_now
 from skyvern.forge.sdk.db.enums import TaskType
 from skyvern.forge.sdk.db.exceptions import NotFoundError
-from skyvern.forge.sdk.executor.run_liveness import note_run_finalized, run_lease_final_write_blocked, run_lease_lost
+from skyvern.forge.sdk.executor.run_liveness import (
+    note_run_finalized,
+    run_lease_final_write_blocked,
+    run_lease_lost,
+    run_write_authority,
+)
 from skyvern.forge.sdk.experimentation.enrich_tree import resolve_enrich_tree_for_context
 from skyvern.forge.sdk.experimentation.llm_prompt_config import resolve_check_user_goal_handler
 from skyvern.forge.sdk.experimentation.slim_llm_output import get_slim_output_template_value
@@ -237,8 +243,10 @@ from skyvern.forge.taskv3.provider_downloads import (
     ProviderDownloadRecovery,
 )
 from skyvern.forge.taskv3.run_arms import (
+    ANSWER_AUDIT_LOG_ONLY_FLAG,
     DATE_SEGMENT_AIM_FLAG,
     DEAD_END_RETURN_FLAG,
+    LLM_ROUTE_FLAG,
     LOGIN_PACE_FLAG,
     TURN_DOM_FLAG,
     resolve_run_arm,
@@ -370,7 +378,12 @@ from skyvern.webeye.browser_errors import (
     is_context_lost_message,
     is_target_closed_message,
 )
-from skyvern.webeye.browser_state import BrowserState, get_browser_connection_loss, get_browser_state_diagnostic
+from skyvern.webeye.browser_state import (
+    BrowserState,
+    browser_connection_lost_reason,
+    get_browser_connection_loss,
+    get_browser_state_diagnostic,
+)
 from skyvern.webeye.cdp_download_interceptor import (
     STREAM_TO_DISK_THRESHOLD_BYTES,
     DownloadTally,
@@ -488,6 +501,21 @@ async def lost_external_browser_reason(
     return external_browser_failure_reason(
         row, browser_connected=browser_state is not None and browser_state.is_connected()
     )
+
+
+def run_browser_connection_lost_reason(task: Task, browser_state: BrowserState | None) -> str | None:
+    """The run's loss fact, looked up by run id when the caller never bound its own reference.
+
+    ``initialize_execution_state`` raises the already-gone browser out of ``execute_step`` before its
+    ``browser_state`` local is assigned, so that step's failure reason has only the run id to go on.
+    """
+    if browser_state is None:
+        browser_state = (
+            app.BROWSER_MANAGER.get_for_workflow_run(task.workflow_run_id)
+            if task.workflow_run_id
+            else app.BROWSER_MANAGER.get_for_task(task.task_id)
+        )
+    return browser_connection_lost_reason(browser_state)
 
 
 def fail_step_if_browser_already_gone(task: Task, step: Step, browser_state: BrowserState) -> None:
@@ -1745,16 +1773,31 @@ async def _read_task_v3_llm_name_override(
     return variant
 
 
-async def _resolve_task_v3_llm_key(task: Task) -> str:
-    """Resolve Task V3's LLM key, preserving explicit task keys and downgrading UI defaults."""
+async def _resolve_task_v3_llm_key(task: Task) -> tuple[str, RunArm | None]:
+    """Resolve Task V3's LLM key and the route arm applied to it; explicit keys keep their key and no arm."""
     if task.llm_key:
-        return task.llm_key
+        return task.llm_key, None
     # get_task builds Task without workflow_permanent_id; the run context is the reliable source.
     context = skyvern_context.current()
     workflow_permanent_id = task.workflow_permanent_id or (context.workflow_permanent_id if context else None)
     override = await _read_task_v3_llm_name_override(task.task_id, task.organization_id, workflow_permanent_id)
     resolved = override or settings.TASK_V3_LLM_KEY or settings.LLM_KEY
-    return LLMAPIHandlerFactory.resolve_non_flex_llm_key_for_manual_run(resolved) or resolved
+    treatment_key = app.AGENT_FUNCTION.get_task_v3_llm_route_treatment_key(resolved)
+    route_arm: RunArm | None = None
+    if context is not None and treatment_key:
+        # The arm is pinned per run, not the model: a later block with its own unpaired override keeps that key.
+        arm = await resolve_run_arm(
+            context,
+            LLM_ROUTE_FLAG,
+            distinct_id=task.workflow_run_id or task.task_id,
+            organization_id=task.organization_id,
+            forced=False,
+        )
+        if arm == "treatment":
+            resolved = treatment_key
+        if arm != "unrandomized":
+            route_arm = arm
+    return LLMAPIHandlerFactory.resolve_non_flex_llm_key_for_manual_run(resolved) or resolved, route_arm
 
 
 def _goal_judge_key_skip_reason(judge_key: str | None) -> str | None:
@@ -2940,7 +2983,8 @@ class ForgeAgent:
             # actions, so a lost page yields None and the verdict is accepted as-is.
             return await browser_state.get_working_page()
 
-        llm_caller = LLMCaller(llm_key=await _resolve_task_v3_llm_key(task))
+        llm_key, llm_route_arm = await _resolve_task_v3_llm_key(task)
+        llm_caller = LLMCaller(llm_key=llm_key)
         workflow_run_context = (
             app.WORKFLOW_CONTEXT_MANAGER.get_workflow_run_context(task.workflow_run_id)
             if task.workflow_run_id and app.WORKFLOW_CONTEXT_MANAGER.has_workflow_run_context(task.workflow_run_id)
@@ -2980,6 +3024,13 @@ class ForgeAgent:
                 distinct_id=task.workflow_run_id or task.task_id,
                 organization_id=task.organization_id,
                 forced=settings.TASK_V3_DEAD_END_RETURN,
+            )
+            await resolve_run_arm(
+                context,
+                ANSWER_AUDIT_LOG_ONLY_FLAG,
+                distinct_id=task.workflow_run_id or task.task_id,
+                organization_id=task.organization_id,
+                forced=False,
             )
             turn_dom_arm = await resolve_run_arm(
                 context,
@@ -3568,6 +3619,7 @@ class ForgeAgent:
                         task_id=task.task_id,
                         step_id=v3_turn_step.step_id,
                         organization_id=task.organization_id,
+                        write_authority_for_run=run_write_authority,
                         status=status,
                         output=AgentStepOutput(
                             llm_seconds=record.llm_seconds if record else None,
@@ -3980,6 +4032,7 @@ class ForgeAgent:
 
             outcome = await run_task_v3_agent_loop(
                 page_provider=_page_provider,
+                llm_route_arm=llm_route_arm,
                 # Read through browser_state each time: a recovered browser brings a new context, and the old
                 # one's submissions still count.
                 intercepted_submissions=submissions_across_contexts(
@@ -5441,6 +5494,7 @@ class ForgeAgent:
                 task,
                 step,
                 await lost_external_browser_reason(task.organization_id, browser_session_id, browser_state)
+                or run_browser_connection_lost_reason(task, browser_state)
                 or get_user_facing_exception_message(e),
                 browser_state,
                 exception=e,
@@ -10889,6 +10943,7 @@ class ForgeAgent:
             task_id=step.task_id,
             step_id=step.step_id,
             organization_id=step.organization_id,
+            write_authority_for_run=run_write_authority,
             **updates,
         )
 
@@ -11036,7 +11091,6 @@ class ForgeAgent:
             )
             status_changed = False
         if final_write_blocked and updated_task.status != status:
-            note_run_finalized(task.task_id)
             return updated_task, status_changed
         if status.is_final():
             note_run_finalized(task.task_id)
@@ -12007,6 +12061,7 @@ class ForgeAgent:
                 navigation_payload=task.navigation_payload,
                 steps=steps_results,
                 error_code_mapping_str=(json.dumps(task.error_code_mapping) if task.error_code_mapping else None),
+                antibot_evidence_str=prompt_evidence_str(task) if task.error_code_mapping else None,
                 local_datetime=datetime.now(skyvern_context.ensure_context().tz_info).isoformat(),
             )
             json_response = await get_org_aware_primary_llm_api_handler(default=app.LLM_API_HANDLER)(
@@ -12167,6 +12222,7 @@ class ForgeAgent:
                 page_html=html,
                 max_retries=max_retries,
                 error_code_mapping_str=(json.dumps(task.error_code_mapping) if task.error_code_mapping else None),
+                antibot_evidence_str=prompt_evidence_str(task) if task.error_code_mapping else None,
                 local_datetime=datetime.now(skyvern_context.ensure_context().tz_info).isoformat(),
             )
             json_response = await get_org_aware_secondary_llm_api_handler(default=app.SECONDARY_LLM_API_HANDLER)(

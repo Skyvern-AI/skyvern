@@ -15,6 +15,9 @@ export type NodeBaseData = {
   nextLoopOnFailure?: boolean;
   editable: boolean;
   model: WorkflowModel | null;
+  notes?: string | null;
+  trailingNotes?: string | null;
+  description?: string | null;
   // A person picked the block's engine; only task-like blocks read it.
   enginePinned?: boolean;
   showCode?: boolean;
@@ -106,6 +109,7 @@ export const workflowBlockTitle: {
   email_inbox: "Email Inbox",
   google_sheets_read: "Google Sheets Read",
   google_sheets_write: "Google Sheets Write",
+  powerbi_query: "Power BI Query",
   pdf_fill: "PDF Fill",
   split_pdf: "Split PDF",
   data_export: "Data Export",

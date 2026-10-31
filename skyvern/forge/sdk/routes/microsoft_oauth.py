@@ -8,6 +8,7 @@ from fastapi import APIRouter, Depends, HTTPException, status
 
 from skyvern.forge import app
 from skyvern.forge.agent_functions import record_request_audit_event
+from skyvern.forge.sdk.integrations.catalog import integration_is_live
 from skyvern.forge.sdk.schemas.microsoft_oauth import (
     CreateMicrosoftOAuthAuthorizeRequest,
     CreateMicrosoftOAuthCallbackRequest,
@@ -20,6 +21,7 @@ from skyvern.forge.sdk.schemas.microsoft_oauth import (
 from skyvern.forge.sdk.schemas.organizations import Organization
 from skyvern.forge.sdk.services import microsoft_oauth_service, org_auth_service
 from skyvern.forge.sdk.services.microsoft_oauth_service import InvalidAppOriginError
+from skyvern.forge.sdk.services.request_principal import synthetic_user_id
 from skyvern.forge.sdk.services.route_authorization import require_request_actions
 from skyvern.services.email import outlook
 from skyvern.utils.email_validation import normalize_email_address
@@ -31,6 +33,12 @@ microsoft_oauth_router = APIRouter()
 _EMAIL_BACKFILL_FAILURE_TTL_SECONDS = 3600.0
 # Per-process cache bounds provider spend, not correctness.
 _EMAIL_BACKFILL_FAILURES: dict[str, float] = {}
+
+
+def _require_powerbi_user(organization_id: str, user_id: str | None) -> str:
+    if user_id is None or user_id == synthetic_user_id(organization_id):
+        raise HTTPException(status_code=403, detail="Power BI connections require an authenticated user")
+    return user_id
 
 
 async def _backfill_microsoft_email_addresses(
@@ -45,7 +53,9 @@ async def _backfill_microsoft_email_addresses(
     eligible_candidates = [
         credential
         for credential in credentials
-        if credential.email_address is None and credential.id not in _EMAIL_BACKFILL_FAILURES
+        if credential.email_address is None
+        and credential.id not in _EMAIL_BACKFILL_FAILURES
+        and not microsoft_oauth_service.is_powerbi_connection(credential.scopes_requested, credential.scopes_granted)
     ]
     candidates = random.sample(eligible_candidates, k=min(3, len(eligible_candidates)))
     for credential in candidates:
@@ -115,6 +125,10 @@ async def microsoft_oauth_authorize(
     current_user_id: Annotated[str | None, Depends(org_auth_service.get_current_user_id_or_none)],
     _request_authorization: None = Depends(require_request_actions(frozenset({"microsoft_oauth.authorize"}))),
 ) -> MicrosoftOAuthAuthorizeResponse:
+    if request.scope_profile == microsoft_oauth_service.MICROSOFT_OAUTH_SCOPE_PROFILE_POWERBI_DATASET_READ:
+        if not integration_is_live("powerbi"):
+            raise HTTPException(status_code=403, detail="Power BI connections are not currently available")
+        current_user_id = _require_powerbi_user(current_org.organization_id, current_user_id)
     try:
         start = await microsoft_oauth_service.start_authorization(
             organization_id=current_org.organization_id,
@@ -155,6 +169,16 @@ async def microsoft_oauth_callback(
             status_code=400,
             detail="This OAuth consent request is unknown, expired, or was not started by you. Restart the connection.",
         )
+    scope_profile = microsoft_oauth_service.scope_profile_from_scopes(context.scopes_requested)
+    if scope_profile == microsoft_oauth_service.MICROSOFT_OAUTH_SCOPE_PROFILE_POWERBI_DATASET_READ:
+        if not integration_is_live("powerbi"):
+            raise HTTPException(status_code=403, detail="Power BI connections are not currently available")
+        current_user_id = _require_powerbi_user(current_org.organization_id, current_user_id)
+        if microsoft_oauth_service.has_required_scopes(context.scopes_requested, ["Mail.Read"]):
+            raise HTTPException(
+                status_code=400,
+                detail="Power BI consent must use the restricted Dataset.Read.All profile",
+            )
     if not context.consent_code_verifier:
         raise HTTPException(
             status_code=400,
@@ -190,7 +214,14 @@ async def microsoft_oauth_callback(
             detail="No refresh token received. Ensure offline_access is included in the OAuth flow.",
         )
     scopes_granted = _require_scopes_from_token(token_data)
-    if not microsoft_oauth_service.has_required_scopes(scopes_granted, ["Mail.Read"]):
+    if scope_profile == microsoft_oauth_service.MICROSOFT_OAUTH_SCOPE_PROFILE_POWERBI_DATASET_READ:
+        if not microsoft_oauth_service.is_powerbi_scope_profile(context.scopes_requested, scopes_granted):
+            raise HTTPException(
+                status_code=400,
+                detail="Microsoft did not grant the restricted Dataset.Read.All profile. Please reconnect.",
+            )
+        scopes_granted = microsoft_oauth_service.normalize_powerbi_scopes(scopes_granted)
+    elif not microsoft_oauth_service.has_required_scopes(scopes_granted, ["Mail.Read"]):
         raise HTTPException(
             status_code=400,
             detail="Microsoft did not grant Mail.Read. Please re-connect and accept all requested permissions.",
@@ -270,23 +301,24 @@ async def microsoft_oauth_callback(
 
     email_address = None
     should_resolve_email = True
-    try:
-        email_address = await outlook.fetch_primary_account_email(
-            access_token=token_data["access_token"],
-        )
-    except outlook.OutlookAPIError as exc:
-        if 400 <= exc.status < 500 and exc.status not in {401, 408, 429}:
-            LOG.warning("Graph mail unavailable; falling back to Microsoft identity claims", exc_info=True)
-        else:
-            LOG.debug(
-                "Skipped Microsoft account email update after transient Graph failure",
-                credential_id=credential.id,
-                exc_info=True,
+    if scope_profile == microsoft_oauth_service.MICROSOFT_OAUTH_SCOPE_PROFILE_OUTLOOK_MAIL:
+        try:
+            email_address = await outlook.fetch_primary_account_email(
+                access_token=token_data["access_token"],
             )
+        except outlook.OutlookAPIError as exc:
+            if 400 <= exc.status < 500 and exc.status not in {401, 408, 429}:
+                LOG.warning("Graph mail unavailable; falling back to Microsoft identity claims", exc_info=True)
+            else:
+                LOG.debug(
+                    "Skipped Microsoft account email update after transient Graph failure",
+                    credential_id=credential.id,
+                    exc_info=True,
+                )
+                should_resolve_email = False
+        except Exception:
+            LOG.warning("Failed to resolve Microsoft account email", exc_info=True)
             should_resolve_email = False
-    except Exception:
-        LOG.warning("Failed to resolve Microsoft account email", exc_info=True)
-        should_resolve_email = False
 
     if should_resolve_email:
         try:
@@ -315,10 +347,12 @@ async def microsoft_oauth_callback(
 @microsoft_oauth_router.get("/oauth/credentials")
 async def list_microsoft_oauth_credentials(
     current_org: Annotated[Organization, Depends(org_auth_service.get_current_org_for_credential_routes)],
+    current_user_id: Annotated[str | None, Depends(org_auth_service.get_current_user_id_or_none)],
     include_email: bool = False,
 ) -> MicrosoftOAuthCredentialListResponse:
     credentials = await microsoft_oauth_service.get_credentials_for_org(
         organization_id=current_org.organization_id,
+        user_id=current_user_id,
     )
     if include_email:
         try:
@@ -339,12 +373,14 @@ async def rename_microsoft_oauth_credential(
     credential_id: str,
     request: UpdateMicrosoftOAuthCredentialRequest,
     current_org: Annotated[Organization, Depends(org_auth_service.get_current_org_for_credential_routes)],
+    current_user_id: Annotated[str | None, Depends(org_auth_service.get_current_user_id_or_none)],
     _request_authorization: None = Depends(require_request_actions(frozenset({"microsoft_oauth.update"}))),
 ) -> MicrosoftOAuthCredentialResponse:
     updated = await microsoft_oauth_service.rename_credential(
         organization_id=current_org.organization_id,
         credential_id=credential_id,
         credential_name=request.credential_name,
+        requesting_user_id=current_user_id,
     )
     if updated is None:
         raise HTTPException(status_code=404, detail="Credential not found")
@@ -365,11 +401,13 @@ async def rename_microsoft_oauth_credential(
 async def delete_microsoft_oauth_credential(
     credential_id: str,
     current_org: Annotated[Organization, Depends(org_auth_service.get_current_org_for_credential_routes)],
+    current_user_id: Annotated[str | None, Depends(org_auth_service.get_current_user_id_or_none)],
     _request_authorization: None = Depends(require_request_actions(frozenset({"microsoft_oauth.delete"}))),
 ) -> None:
     revoked = await microsoft_oauth_service.revoke_credential(
         organization_id=current_org.organization_id,
         credential_id=credential_id,
+        requesting_user_id=current_user_id,
     )
     if not revoked:
         raise HTTPException(status_code=404, detail="Credential not found")

@@ -1,3 +1,4 @@
+from copy import deepcopy
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 from enum import StrEnum
@@ -19,7 +20,14 @@ from pydantic import (
 
 from skyvern.forge.sdk.copilot.ask_user import AccountGroupDecision, QuestionInteraction, QuestionResponse
 from skyvern.forge.sdk.copilot.code_write_diff import CodeWriteDiff
-from skyvern.forge.sdk.copilot.context import ActivityBucket, ProposalDisposition, ResponseType, TurnNarrativePayload
+from skyvern.forge.sdk.copilot.context import (
+    ActivityBucket,
+    CopilotTestInput,
+    ProposalDisposition,
+    ResponseType,
+    SkippedPrefixBlock,
+    TurnNarrativePayload,
+)
 from skyvern.forge.sdk.copilot.run_outcome import RunOutcomeReasonCode, RunOutcomeRole, RunOutcomeVerdict
 from skyvern.forge.sdk.schemas.copilot_turn_outcome import (
     CopilotCancelSource,
@@ -27,13 +35,15 @@ from skyvern.forge.sdk.schemas.copilot_turn_outcome import (
     PersistedCopilotComposerMode,
     TurnOutcome,
 )
+from skyvern.forge.sdk.workflow.secret_encryption import mask_workflow_definition_secrets
 from skyvern.utils.secret_headers import mask_header_values
 from skyvern.utils.yaml_loader import dump_workflow_yaml, safe_load_no_dates
 
 
 def client_visible_proposed_workflow(proposal: dict[str, Any]) -> dict[str, Any]:
-    visible = dict(proposal)
+    visible = deepcopy(proposal)
     visible.pop(COPILOT_PRIVATE_SETTINGS_KEY, None)
+    mask_workflow_definition_secrets(visible.get("workflow_definition"))
     if "cdp_connect_headers" in visible:
         headers = visible["cdp_connect_headers"]
         visible["cdp_connect_headers"] = mask_header_values(headers) if isinstance(headers, dict) else None
@@ -44,10 +54,13 @@ def client_visible_proposed_workflow(proposal: dict[str, Any]) -> dict[str, Any]
                 visible.pop("_copilot_yaml")
             else:
                 changed = False
+                if isinstance(document.get("workflow_definition"), dict):
+                    changed = mask_workflow_definition_secrets(document["workflow_definition"])
                 if "cdp_connect_headers" in document:
                     headers = document["cdp_connect_headers"]
-                    document["cdp_connect_headers"] = mask_header_values(headers) if isinstance(headers, dict) else None
-                    changed = True
+                    masked_headers = mask_header_values(headers) if isinstance(headers, dict) else None
+                    changed = changed or masked_headers != headers
+                    document["cdp_connect_headers"] = masked_headers
                 if changed:
                     visible["_copilot_yaml"] = dump_workflow_yaml(document)
         except Exception:  # noqa: BLE001 - Malformed legacy YAML must never bypass redaction.
@@ -439,6 +452,11 @@ class WorkflowCopilotChatRequest(BaseModel):
     code_block: bool | None = Field(
         None,
         description="Per-request code-block authoring selection. Omission means plain non-code Build.",
+    )
+    doc_editor_enabled: bool = Field(
+        False,
+        description="The client may opt out of Doc note-aware Copilot behavior; the server controls enablement.",
+        json_schema_extra={"x-internal": True},
     )
     cancel_token: str | None = Field(
         None,
@@ -894,6 +912,10 @@ class WorkflowCopilotToolResultUpdate(BaseModel):
             "passed or failed; None for non-run tools."
         ),
     )
+    test_inputs: list[CopilotTestInput] | None = Field(
+        None,
+        description="Where each input of the run this result dispatched came from. Keys and sources only, never values",
+    )
     executed_source_reference: str | None = Field(
         None,
         description=(
@@ -957,6 +979,10 @@ class WorkflowCopilotRunStartedUpdate(BaseModel):
         WorkflowCopilotStreamMessageType.RUN_STARTED, description="Message type"
     )
     workflow_run_id: str = Field(..., description="Run id, emitted once the run row exists and before it produces work")
+    skipped_prefix: list[SkippedPrefixBlock] = Field(
+        default_factory=list,
+        description="Requested blocks before the run's start that it will not execute; shown before its first block",
+    )
     timestamp: datetime = Field(..., description="Server timestamp")
 
 
@@ -1082,6 +1108,9 @@ class WorkflowCopilotCredentialRegistration(CredentialRegistration):
     outcome: Literal["rejected", "unknown"] | None = Field(None, description="Why an attempt did not connect")
 
 
+CredentialBinding = Literal["saved_workflow", "matched_by_saved_url", "not_bound"]
+
+
 class WorkflowCopilotCredentialRequiredUpdate(BaseModel):
     type: WorkflowCopilotStreamMessageType = Field(
         WorkflowCopilotStreamMessageType.CREDENTIAL_REQUIRED, description="Message type"
@@ -1113,6 +1142,9 @@ class WorkflowCopilotCredentialRequiredUpdate(BaseModel):
         None, description="The live browser the user may sign in to themselves; absent when the card does not offer it"
     )
     signing_in: bool = Field(False, description="The user has started signing in themselves")
+    credential_binding: CredentialBinding | None = Field(
+        None, description="How the credential an update card names is bound; absent on other cards"
+    )
     registration: WorkflowCopilotCredentialRegistration | None = Field(
         None, description="Account details a Generate and save answer would store; never a password"
     )

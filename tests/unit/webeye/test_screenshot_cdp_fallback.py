@@ -154,7 +154,7 @@ async def test_scaled_viewport_decline_retries_inside_the_remaining_deadline(
     started = loop.time()
 
     result = await SkyvernFrame.take_scrolling_screenshot(
-        page, timeout=1600, mode=ScreenshotMode.LITE, scrolling_number=0, animations=animations, record_health=False
+        page, timeout=1600, mode=ScreenshotMode.LITE, scrolling_number=0, animations=animations
     )
 
     assert result == b"retry-bytes"
@@ -816,10 +816,85 @@ def _production_rescue_timeouts(monkeypatch: pytest.MonkeyPatch) -> None:
         monkeypatch.setattr(page_module, f"CDP_RESCUE_{name}_TIMEOUT_SECONDS", seconds)
 
 
-async def _viewport_capture(page: Page, timeout_ms: int = 3000) -> bytes:
+async def _viewport_capture(page: Page, timeout_ms: int = 3000, record_health: bool = True) -> bytes:
     return await SkyvernFrame.take_scrolling_screenshot(
-        page, timeout=timeout_ms, mode=ScreenshotMode.LITE, scrolling_number=0
+        page, timeout=timeout_ms, mode=ScreenshotMode.LITE, scrolling_number=0, record_health=record_health
     )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("capture_seconds", [2, 3], ids=["slow_capture_lands", "slower_capture_misses"])
+async def test_health_silent_capture_starts_on_raw_cdp_and_ends_inside_the_deadline(
+    monkeypatch: pytest.MonkeyPatch, capture_seconds: int
+) -> None:
+    _production_rescue_timeouts(monkeypatch)
+    page = _page()
+    page.screenshot.side_effect = None
+    page.screenshot.return_value = b"playwright"
+    session = page.context.new_cdp_session.return_value
+    answers = session.send.side_effect
+
+    async def slow_capture(method: str, params: dict) -> dict:
+        if method == "Page.captureScreenshot":
+            await asyncio.sleep(capture_seconds)
+        return await answers(method, params)
+
+    session.send.side_effect = slow_capture
+    loop = asyncio.get_running_loop()
+    started = loop.time()
+    capture = SkyvernFrame.take_scrolling_screenshot(
+        page, timeout=3000, mode=ScreenshotMode.LITE, scrolling_number=0, animations="allow", record_health=False
+    )
+
+    if capture_seconds < 3:
+        assert (await capture).startswith(b"\x89PNG")
+    else:
+        with pytest.raises(FailedToTakeScreenshot):
+            await capture
+    assert loop.time() - started < 3
+    page.screenshot.assert_not_awaited()
+    session.detach.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "geometry",
+    [
+        PlaywrightError("Protocol error (Runtime.evaluate): Target crashed"),
+        {"deviceScaleFactor": 2, "viewportScale": 1},
+    ],
+    ids=["geometry_failed", "scaled_declined"],
+)
+@pytest.mark.parametrize("timeout_ms", [3000, 600])
+async def test_health_silent_early_raw_miss_gets_one_playwright_attempt_on_the_rest_of_the_deadline(
+    monkeypatch: pytest.MonkeyPatch, geometry: Exception | dict, timeout_ms: int
+) -> None:
+    _production_rescue_timeouts(monkeypatch)
+    page = _page()
+    page.screenshot.side_effect = PlaywrightTimeoutError("taking page screenshot")
+    session = page.context.new_cdp_session.return_value
+
+    async def send(method: str, params: dict) -> dict:
+        if isinstance(geometry, Exception):
+            raise geometry
+        return {"result": {"value": geometry}}
+
+    session.send.side_effect = send
+
+    with pytest.raises(FailedToTakeScreenshot):
+        await SkyvernFrame.take_scrolling_screenshot(
+            page,
+            timeout=timeout_ms,
+            mode=ScreenshotMode.LITE,
+            scrolling_number=0,
+            animations="allow",
+            record_health=False,
+        )
+
+    page.context.new_cdp_session.assert_awaited_once()
+    page.screenshot.assert_awaited_once()
+    assert page.screenshot.await_args.kwargs["timeout"] > timeout_ms * page_module._PRIMARY_CAPTURE_SHARE
+    assert page.screenshot.await_args.kwargs["animations"] == "allow"
 
 
 @pytest.mark.asyncio
@@ -896,14 +971,20 @@ async def test_real_chromium_stall_after_an_earlier_frame_returns_only_the_new_f
 
 @pytest.mark.asyncio
 @requires_chromium
+@pytest.mark.parametrize("record_health", [True, False])
 async def test_real_chromium_page_closed_during_a_stalled_capture_fails_as_target_closed(
-    monkeypatch: pytest.MonkeyPatch,
+    monkeypatch: pytest.MonkeyPatch, record_health: bool
 ) -> None:
     _production_rescue_timeouts(monkeypatch)
     async with chromium_context() as context, never_answering_origin() as origin:
         page = await open_marker_page(context, MARKER_RGB, f"{origin}/", stall_origin=origin)
+        if not record_health:
+            # The raw-first capture does not wait on the stalled font, so only a busy renderer keeps it in flight.
+            await page.evaluate("setTimeout(() => { while (true) {} }, 0)")
         existing_tasks = asyncio.all_tasks()
-        capture = asyncio.create_task(_viewport_capture(page, settings.BROWSER_SCREENSHOT_TIMEOUT_MS))
+        capture = asyncio.create_task(
+            _viewport_capture(page, settings.BROWSER_SCREENSHOT_TIMEOUT_MS, record_health=record_health)
+        )
         await asyncio.sleep(0.5)
         start = time.monotonic()
         await page.close()
@@ -915,8 +996,9 @@ async def test_real_chromium_page_closed_during_a_stalled_capture_fails_as_targe
 
 @pytest.mark.asyncio
 @requires_chromium
+@pytest.mark.parametrize("record_health", [True, False])
 async def test_real_chromium_busy_renderer_fails_truthfully_within_the_capture_deadline(
-    monkeypatch: pytest.MonkeyPatch, record_property: Callable[[str, object], None]
+    monkeypatch: pytest.MonkeyPatch, record_property: Callable[[str, object], None], record_health: bool
 ) -> None:
     _production_rescue_timeouts(monkeypatch)
     async with chromium_context() as context:
@@ -925,10 +1007,12 @@ async def test_real_chromium_busy_renderer_fails_truthfully_within_the_capture_d
         existing_tasks = asyncio.all_tasks()
         start = time.monotonic()
         with skyvern_context.scoped(SkyvernContext()) as run_context, pytest.raises(FailedToTakeScreenshot):
-            await _viewport_capture(page)
+            await _viewport_capture(page, record_health=record_health)
         elapsed_ms = (time.monotonic() - start) * 1000
         record_property("elapsed_ms", round(elapsed_ms))
         assert elapsed_ms < 3000
-        assert run_context.browser_health.stuck_operations == {BrowserOperation.SCREENSHOT}
-        assert run_context.browser_health.consecutive_timeouts == 1
+        assert run_context.browser_health.stuck_operations == (
+            {BrowserOperation.SCREENSHOT} if record_health else set()
+        )
+        assert run_context.browser_health.consecutive_timeouts == int(record_health)
         assert not (asyncio.all_tasks() - existing_tasks)

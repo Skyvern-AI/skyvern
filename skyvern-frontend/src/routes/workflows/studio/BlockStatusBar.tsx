@@ -36,8 +36,9 @@ export function BlockStatusBar({ blockLabel }: { blockLabel: string }) {
               getRunAttempt(workflowRun ?? {}),
             )
           : undefined,
+        runId ?? undefined,
       ),
-    [timeline, workflowRun],
+    [timeline, workflowRun, runId],
   );
   const state = statusMap[blockLabel];
   if (!state || !state.status) {

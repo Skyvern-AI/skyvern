@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import time
 from types import SimpleNamespace
 from typing import Any
 from unittest.mock import AsyncMock, patch
@@ -11,6 +12,7 @@ from structlog.testing import capture_logs
 
 from skyvern.config import settings
 from skyvern.forge.sdk.copilot import credential_pause as credential_pause_module
+from skyvern.forge.sdk.copilot import request_policy as request_policy_module
 from skyvern.forge.sdk.copilot import tools as tools_module
 from skyvern.forge.sdk.copilot.agent import (
     RequestPolicyGuardrailInputs,
@@ -24,6 +26,7 @@ from skyvern.forge.sdk.copilot.context import (
     StructuredContext,
     record_approved_credentials_in_global_llm_context,
 )
+from skyvern.forge.sdk.copilot.eval_llm_overrides import EvalLLMOverrides, eval_llm_override_scope
 from skyvern.forge.sdk.copilot.request_policy import (
     RAW_SECRET_REFUSAL_SENTINEL,
     SAFETY_SCREEN_UNAVAILABLE_QUESTION,
@@ -31,6 +34,7 @@ from skyvern.forge.sdk.copilot.request_policy import (
     _seed_prior_approved_credentials,
     build_request_policy_trust_floor,
     credential_prompt_reason,
+    screen_raw_secret_safety,
 )
 from skyvern.forge.sdk.copilot.tools.credential_fill import (
     _credential_fill_origin_grant,
@@ -1053,3 +1057,258 @@ def test_a_redacted_secret_draft_result_points_at_the_card_while_it_can_open(
     assert expected in message
     assert _CARD_SECRET not in message
     assert ("Credentials UI" in message) is not card_can_open
+
+
+_CLEAN_VERDICT = {"version": "1", "state": "clean", "citations": []}
+_SCREEN_PROMPT_TYPE = "workflow-copilot-raw-secret-safety"
+_CLEAN_MESSAGE = "Build a workflow that downloads the invoice"
+
+
+class _SafetyLeg:
+    def __init__(
+        self,
+        llm_key: str,
+        response: object = None,
+        *,
+        delay: float = 0.0,
+        error: type[Exception] | None = None,
+        hang: bool = False,
+    ) -> None:
+        self.llm_key = llm_key
+        self.response = response
+        self.delay = delay
+        self.error = error
+        self.hang = hang
+        self.started_at: list[float] = []
+        self.cancelled = False
+
+    async def __call__(self, **_: object) -> object:
+        self.started_at.append(time.monotonic())
+        try:
+            if self.hang:
+                await asyncio.Event().wait()
+            if self.delay:
+                await asyncio.sleep(self.delay)
+        except asyncio.CancelledError:
+            self.cancelled = True
+            raise
+        if self.error is not None:
+            raise self.error("provider unavailable")
+        return self.response
+
+
+def _route_with_fallback(monkeypatch: pytest.MonkeyPatch, fallback: _SafetyLeg) -> list[str]:
+    builds: list[str] = []
+
+    def build(llm_key: str) -> _SafetyLeg:
+        builds.append(llm_key)
+        return fallback
+
+    monkeypatch.setattr(request_policy_module, "router_fallback_llm_key", {"PRIMARY": "FALLBACK", "SELF": "SELF"}.get)
+    monkeypatch.setattr(request_policy_module.LLMAPIHandlerFactory, "get_llm_api_handler", build)
+    return builds
+
+
+async def _trust_floor(message: str, handler: _SafetyLeg) -> RequestPolicy:
+    return await build_request_policy_trust_floor(
+        user_message=message,
+        workflow_yaml="",
+        chat_history=[],
+        global_llm_context="",
+        organization_id="org-1",
+        handler=handler,
+    )
+
+
+@pytest.mark.asyncio
+async def test_hung_primary_is_answered_by_the_fallback_inside_the_screen_timeout(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    primary = _SafetyLeg("PRIMARY", hang=True)
+    fallback = _SafetyLeg("FALLBACK", _CLEAN_VERDICT, delay=0.5)
+    builds = _route_with_fallback(monkeypatch, fallback)
+
+    screen = await screen_raw_secret_safety(_CLEAN_MESSAGE, primary, organization_id="org-1")
+
+    assert screen.status == "clean"
+    assert screen.canonical_user_message == _CLEAN_MESSAGE
+    assert (screen.answered_by, screen.hedged) == ("fallback", True)
+    assert builds == ["FALLBACK"]
+    assert fallback.started_at[0] - primary.started_at[0] >= settings.COPILOT_RAW_SECRET_SAFETY_HEDGE_DELAY_SECONDS
+    assert screen.latency_ms < 4000
+    assert primary.cancelled is True
+
+
+@pytest.mark.asyncio
+async def test_prompt_primary_never_builds_or_calls_the_fallback(monkeypatch: pytest.MonkeyPatch) -> None:
+    primary = _SafetyLeg("PRIMARY", _CLEAN_VERDICT, delay=0.2)
+    fallback = _SafetyLeg("FALLBACK", _CLEAN_VERDICT)
+    builds = _route_with_fallback(monkeypatch, fallback)
+
+    screen = await screen_raw_secret_safety(_CLEAN_MESSAGE, primary, organization_id="org-1")
+
+    assert (screen.status, screen.answered_by, screen.hedged) == ("clean", "primary", False)
+    assert builds == []
+    assert fallback.started_at == []
+
+
+@pytest.mark.asyncio
+async def test_failed_primary_starts_the_fallback_without_waiting_for_the_hedge_delay(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    primary = _SafetyLeg("PRIMARY", delay=0.1, error=RuntimeError)
+    fallback = _SafetyLeg("FALLBACK", _CLEAN_VERDICT)
+    _route_with_fallback(monkeypatch, fallback)
+
+    screen = await screen_raw_secret_safety(_CLEAN_MESSAGE, primary, organization_id="org-1")
+
+    assert (screen.status, screen.answered_by, screen.hedged) == ("clean", "fallback", True)
+    assert fallback.started_at[0] - primary.started_at[0] < 1.0
+
+
+@pytest.mark.asyncio
+async def test_fallback_citation_redacts_the_cited_secret(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(settings, "COPILOT_RAW_SECRET_SAFETY_HEDGE_DELAY_SECONDS", 0.1)
+    primary = _SafetyLeg("PRIMARY", hang=True)
+    fallback = _SafetyLeg("FALLBACK", {"version": "1", "state": "detected", "citations": ["Hunter2Portal!"]})
+    _route_with_fallback(monkeypatch, fallback)
+
+    screen = await screen_raw_secret_safety("The password is Hunter2Portal!", primary, organization_id="org-1")
+
+    assert (screen.status, screen.handling, screen.answered_by) == ("detected", "redacted_draft", "fallback")
+    assert screen.canonical_user_message == "The password is [REDACTED_SECRET]"
+
+
+@pytest.mark.asyncio
+async def test_invalid_fallback_verdict_is_final_and_withholds_the_turn(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(settings, "COPILOT_RAW_SECRET_SAFETY_HEDGE_DELAY_SECONDS", 0.1)
+    primary = _SafetyLeg("PRIMARY", _CLEAN_VERDICT, delay=0.5)
+    fallback = _SafetyLeg("FALLBACK", {"version": "1", "state": "detected", "citations": ["not-in-turn-8391!"]})
+    _route_with_fallback(monkeypatch, fallback)
+
+    policy = await _trust_floor(_CLEAN_MESSAGE, primary)
+
+    assert policy.raw_secret_safety_status == "blocked"
+    assert policy.raw_secret_safety_failure_kind == "invalid_citation"
+    assert (policy.raw_secret_safety_answered_by, policy.raw_secret_safety_hedged) == ("fallback", True)
+    assert policy.canonical_user_message == _SCREEN_UNAVAILABLE_TURN
+    assert primary.cancelled is True
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "fallback_response",
+    [RuntimeError, {"version": "1", "state": "detected", "citations": ["Hunter2Portal!"]}],
+)
+async def test_primary_verdict_wins_a_same_tick_finish(
+    monkeypatch: pytest.MonkeyPatch, fallback_response: object
+) -> None:
+    monkeypatch.setattr(settings, "COPILOT_RAW_SECRET_SAFETY_HEDGE_DELAY_SECONDS", 0.0)
+    primary = _SafetyLeg("PRIMARY", _CLEAN_VERDICT)
+    fallback = (
+        _SafetyLeg("FALLBACK", error=RuntimeError)
+        if fallback_response is RuntimeError
+        else _SafetyLeg("FALLBACK", fallback_response)
+    )
+    _route_with_fallback(monkeypatch, fallback)
+
+    screen = await screen_raw_secret_safety("The password is Hunter2Portal!", primary, organization_id="org-1")
+
+    assert len(fallback.started_at) == 1
+    assert (screen.status, screen.answered_by, screen.hedged) == ("clean", "primary", True)
+
+
+@pytest.mark.asyncio
+async def test_both_hung_legs_withhold_the_turn_at_the_screen_timeout(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(settings, "COPILOT_RAW_SECRET_SAFETY_HEDGE_DELAY_SECONDS", 0.1)
+    monkeypatch.setattr(settings, "COPILOT_RAW_SECRET_SAFETY_TIMEOUT_SECONDS", 1.0)
+    primary = _SafetyLeg("PRIMARY", hang=True)
+    fallback = _SafetyLeg("FALLBACK", hang=True)
+    _route_with_fallback(monkeypatch, fallback)
+
+    policy = await _trust_floor("The password is Hunter2Portal!", primary)
+
+    assert policy.raw_secret_safety_status == "blocked"
+    assert policy.raw_secret_safety_failure_kind == "timeout"
+    assert (policy.raw_secret_safety_answered_by, policy.raw_secret_safety_hedged) == ("none", True)
+    assert policy.canonical_user_message == _SCREEN_UNAVAILABLE_TURN
+    assert policy.allow_update_workflow is False
+    assert policy.allow_run_blocks is False
+    assert 1000 <= policy.raw_secret_safety_latency_ms < 1500
+    assert (primary.cancelled, fallback.cancelled) == (True, True)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("primary_hangs", [False, True])
+@pytest.mark.parametrize(
+    "route", ["hedge_disabled", "no_fallback_key", "self_fallback", "screen_eval_override", "fallback_build_error"]
+)
+async def test_screen_without_a_usable_fallback_makes_one_call(
+    monkeypatch: pytest.MonkeyPatch, route: str, primary_hangs: bool
+) -> None:
+    monkeypatch.setattr(settings, "COPILOT_RAW_SECRET_SAFETY_HEDGE_ENABLED", route != "hedge_disabled")
+    monkeypatch.setattr(settings, "COPILOT_RAW_SECRET_SAFETY_HEDGE_DELAY_SECONDS", 0.1)
+    monkeypatch.setattr(settings, "COPILOT_RAW_SECRET_SAFETY_TIMEOUT_SECONDS", 0.5)
+    llm_key = {"no_fallback_key": "SOLO", "self_fallback": "SELF"}.get(route, "PRIMARY")
+    primary = _SafetyLeg(llm_key, hang=primary_hangs, error=RuntimeError)
+    fallback = _SafetyLeg("FALLBACK", _CLEAN_VERDICT)
+    builds = _route_with_fallback(monkeypatch, fallback)
+    if route == "fallback_build_error":
+
+        def build_fails(fallback_key: str) -> _SafetyLeg:
+            builds.append(fallback_key)
+            raise RuntimeError("deployment not configured")
+
+        monkeypatch.setattr(request_policy_module.LLMAPIHandlerFactory, "get_llm_api_handler", build_fails)
+    overrides = (
+        EvalLLMOverrides("org-1", {_SCREEN_PROMPT_TYPE: llm_key}, {_SCREEN_PROMPT_TYPE: primary}, "eval-sha")
+        if route == "screen_eval_override"
+        else None
+    )
+
+    with eval_llm_override_scope(overrides, "wpid-1"):
+        screen = await screen_raw_secret_safety(_CLEAN_MESSAGE, primary, organization_id="org-1")
+
+    assert (screen.status, screen.failure_kind) == ("blocked", "timeout" if primary_hangs else "provider_error")
+    assert (screen.answered_by, screen.hedged) == ("none", False)
+    assert builds == (["FALLBACK"] if route == "fallback_build_error" else [])
+    assert fallback.started_at == []
+    assert len(primary.started_at) == 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("variant", ["bound_method_handler", "acting_model_eval_override"])
+async def test_hung_primary_still_hedges(monkeypatch: pytest.MonkeyPatch, variant: str) -> None:
+    monkeypatch.setattr(settings, "COPILOT_RAW_SECRET_SAFETY_HEDGE_DELAY_SECONDS", 0.1)
+    primary = _SafetyLeg("PRIMARY", hang=True)
+    fallback = _SafetyLeg("FALLBACK", _CLEAN_VERDICT)
+    _route_with_fallback(monkeypatch, fallback)
+    # A bound method carries llm_key on __self__, not on the callable.
+    handler = primary.__call__ if variant == "bound_method_handler" else primary
+    overrides = (
+        EvalLLMOverrides("org-1", {"workflow-copilot": "OTHER"}, {"workflow-copilot": _SafetyLeg("OTHER")}, "eval-sha")
+        if variant == "acting_model_eval_override"
+        else None
+    )
+
+    with eval_llm_override_scope(overrides, "wpid-1"):
+        screen = await screen_raw_secret_safety(_CLEAN_MESSAGE, handler, organization_id="org-1")
+
+    assert (screen.status, screen.answered_by, screen.hedged) == ("clean", "fallback", True)
+
+
+@pytest.mark.asyncio
+async def test_cancelling_the_screen_cancels_both_legs(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(settings, "COPILOT_RAW_SECRET_SAFETY_HEDGE_DELAY_SECONDS", 0.1)
+    primary = _SafetyLeg("PRIMARY", hang=True)
+    fallback = _SafetyLeg("FALLBACK", hang=True)
+    _route_with_fallback(monkeypatch, fallback)
+
+    screen_task = asyncio.create_task(screen_raw_secret_safety(_CLEAN_MESSAGE, primary, organization_id="org-1"))
+    await asyncio.sleep(0.3)
+    assert fallback.started_at
+    screen_task.cancel()
+
+    with pytest.raises(asyncio.CancelledError):
+        await screen_task
+    assert (primary.cancelled, fallback.cancelled) == (True, True)
