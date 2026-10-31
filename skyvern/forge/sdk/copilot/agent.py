@@ -4399,6 +4399,8 @@ async def _run_agent_loop_with_surface(
     alias_map: dict[str, str],
     overlays: dict[str, Any],
     output_guardrails: list[Any],
+    recorded_alias_map: dict[str, str] | None = None,
+    recorded_overlays: dict[str, Any] | None = None,
     allow_untested_retry: bool = False,
     is_fallback: bool = False,
     session: Session | None = None,
@@ -4430,6 +4432,8 @@ async def _run_agent_loop_with_surface(
             or ctx.turn_origin == TurnOrigin.code_block_ai_fallback
         ),
         page_state_reader=read_page_state_on_page,
+        recorded_alias_map=recorded_alias_map,
+        recorded_overlays=recorded_overlays,
     )
     ctx.discovery_mcp_server = mcp_server
     agent = Agent(
@@ -5762,8 +5766,10 @@ async def _run_copilot_turn_impl(
             )
         video_attachment_message = build_video_attachment_message(video_evidence)
 
-    alias_map = get_skyvern_mcp_alias_map()
-    overlays = _build_skyvern_mcp_overlays(copilot_config.authoring_capability, notes_visible=copilot_sees_notes(ctx))
+    full_alias_map = alias_map = get_skyvern_mcp_alias_map()
+    full_overlays = overlays = _build_skyvern_mcp_overlays(
+        copilot_config.authoring_capability, notes_visible=copilot_sees_notes(ctx)
+    )
     registered_mcp_tools = (
         await skyvern_mcp.list_tools(run_middleware=False) if eval_mode == CopilotEvalMode.BROWSER_ABLATION else None
     )
@@ -5944,6 +5950,8 @@ async def _run_copilot_turn_impl(
             alias_map=alias_map,
             overlays=overlays,
             output_guardrails=output_guardrails,
+            recorded_alias_map=full_alias_map,
+            recorded_overlays=full_overlays,
             allow_untested_retry=ctx.allow_untested_workflow_draft,
             is_fallback=is_fallback,
             session=model_session,

@@ -17,6 +17,7 @@ from skyvern.forge.sdk.cache.base import NoopLock
 from skyvern.forge.sdk.copilot import demonstration_recorder as recorder_module
 from skyvern.forge.sdk.copilot import demonstration_replay as replay_module
 from skyvern.forge.sdk.copilot import runtime as copilot_runtime
+from skyvern.forge.sdk.copilot.browser_ablation import _required_code_surface
 from skyvern.forge.sdk.copilot.code_block_synthesis import synthesize_code_block
 from skyvern.forge.sdk.copilot.demonstration_recorder import (
     DemonstrationClaim,
@@ -334,21 +335,33 @@ async def test_replay_contract_never_touches_a_browser_and_consumes_once(monkeyp
     ctx.request_policy = RequestPolicy()
     aliases = get_skyvern_mcp_alias_map()
     overlays = _build_skyvern_mcp_overlays()
-    names = ("click", "type_text", "select_option", "press_key", "navigate_browser")
+    # Production wiring: the required-code surface withdraws the action tools and refuses them at dispatch.
+    surface = _required_code_surface([], aliases, overlays)
+    assert "click" not in surface.alias_map
     server = SkyvernOverlayMCPServer(
         transport=MagicMock(),
-        overlays={name: overlays[name] for name in names},
-        alias_map={name: aliases[name] for name in names},
-        allowlist=frozenset(aliases[name] for name in names),
+        overlays=surface.overlays,
+        alias_map=surface.alias_map,
+        allowlist=frozenset(surface.alias_map.values()),
         context_provider=lambda: ctx,
+        enforce_dispatch_allowlist=True,
+        recorded_alias_map=aliases,
+        recorded_overlays=overlays,
     )
     server._client = _NoDispatchClient()
     ctx.discovery_mcp_server = server
 
     cache.store[demonstration_controls_key("org-1", "demo-1")] = "[]"
     history = await replay_demonstration(ctx, server)
+    with pytest.raises(ValueError, match="not available on this Copilot surface"):
+        await server._call_tool("click", {"selector": "#company"})
 
     calls = [item for item in history if item.get("type") == "function_call"]
+    assert all(
+        json.loads(item["output"]).get("ok") is not False
+        for item in history
+        if item.get("type") == "function_call_output"
+    )
     assert [item["name"] for item in calls] == [
         "click",
         "type_text",
