@@ -1,4 +1,6 @@
+import importlib
 from threading import Lock
+from types import ModuleType
 
 import structlog
 
@@ -28,7 +30,7 @@ def _ensure_server_logging_configured() -> None:
         _SERVER_LOGGING_CONFIGURED = True
 
 
-def start_forge_app() -> ForgeApp:
+def start_forge_app(*, load_api_modules: bool = False) -> ForgeApp:
     _ensure_server_logging_configured()
 
     force_app_instance = create_forge_app()
@@ -43,12 +45,22 @@ def start_forge_app() -> ForgeApp:
                 raise RuntimeError(f"Missing configure_app function in {module}")
 
             configure_app_fn(force_app_instance)
+            if load_api_modules:
+                _configure_api_app_module(app_module, force_app_instance)
         LOG.debug(
             "Additional modules loaded to set up api app",
             modules=settings.ADDITIONAL_MODULES,
         )
 
     return force_app_instance
+
+
+def _configure_api_app_module(app_module: ModuleType, app: ForgeApp) -> None:
+    # A module names its API-only half rather than importing it, so a worker that never serves the API
+    # does not load that half's routes and MCP server.
+    api_module_name = getattr(app_module, "API_APP_MODULE", None)
+    if api_module_name:
+        importlib.import_module(api_module_name).configure_api_app(app)
 
 
 def start_streaming_worker_app() -> ForgeApp:
