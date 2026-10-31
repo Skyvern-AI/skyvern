@@ -30,3 +30,5 @@ AGENT_STEP_TOOL_NAMES = frozenset(
         "web_search",
     }
 )
+# Offered whatever the step's list says: neither changes anything outside the step.
+ALWAYS_OFFERED_TOOLS = frozenset({"finish", "read_run_data"})
