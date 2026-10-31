@@ -718,7 +718,6 @@ async def test_terminal_child_advances_the_group_through_the_run_terminal_hook(
 ) -> None:
     service = WorkflowService()
     monkeypatch.setattr(app, "WORKFLOW_SERVICE", service)
-    monkeypatch.setattr(service, "_resolve_managed_browser_profile_for_run_request", AsyncMock(return_value=None))
     monkeypatch.setattr(
         app.AGENT_FUNCTION, "schedule_workflow_run_group_advance", AgentFunction().schedule_workflow_run_group_advance
     )
