@@ -1011,7 +1011,7 @@ class TestMiddlewareLogVolume:
         monkeypatch.setattr(
             api_app,
             "start_forge_app",
-            lambda: SimpleNamespace(setup_api_app=configure_api_app),
+            lambda **_kwargs: SimpleNamespace(setup_api_app=configure_api_app),
         )
         app = api_app.create_api_app()
 
