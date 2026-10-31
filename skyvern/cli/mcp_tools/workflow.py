@@ -254,10 +254,9 @@ def _note_artifact_ids(stats: dict[str, Any], values: list[Any]) -> None:
 
 
 def _scan_output_value(value: Any, stats: dict[str, Any], depth: int = 0) -> None:
+    # Callers pass a tree _jsonable already converted; converting per level would copy each subtree once per ancestor.
     if depth > _SUMMARY_RECURSION_LIMIT:
         return
-
-    value = _jsonable(value)
 
     if isinstance(value, dict):
         for key, nested_value in value.items():
