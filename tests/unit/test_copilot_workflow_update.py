@@ -434,7 +434,7 @@ async def test_a_same_label_type_change_reports_the_saved_note_as_dropped(monkey
 
 
 @pytest.mark.asyncio
-async def test_flag_off_reports_dropped_note_labels_without_returning_note_text(
+async def test_flag_off_says_nothing_about_dropped_notes(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     async def prior(_ctx: CopilotContext) -> None:
@@ -467,8 +467,7 @@ async def test_flag_off_reports_dropped_note_labels_without_returning_note_text(
     )
 
     assert result["ok"] is True
-    assert result["data"]["stored_notes_dropped"] == ["lookup"]
-    assert "stored_notes_dropped_text" not in result["data"]
+    assert not any(key.startswith("stored_notes_dropped") for key in result["data"])
     assert "Check the official page." not in str(result["data"])
 
 

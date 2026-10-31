@@ -100,7 +100,9 @@ async def chat(run_group_env: GroupEnv, monkeypatch: pytest.MonkeyPatch) -> Asyn
         workflow_id="wf_1", workflow_parameter_type=WorkflowParameterType.STRING, key="note", default_value="none"
     )
     vault = SimpleNamespace(
-        get_credential_item=AsyncMock(return_value=SimpleNamespace(credential=SimpleNamespace(password=SECRET)))
+        get_credential_item=AsyncMock(
+            return_value=SimpleNamespace(credential=SimpleNamespace(password=SECRET), login_sites=None)
+        )
     )
     monkeypatch.setattr(
         object.__getattribute__(app, "_inst"),

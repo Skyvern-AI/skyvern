@@ -16,6 +16,7 @@ from skyvern.forge import app
 from skyvern.forge.sdk.cache.base import NoopLock
 from skyvern.forge.sdk.copilot import demonstration_recorder as recorder_module
 from skyvern.forge.sdk.copilot import demonstration_replay as replay_module
+from skyvern.forge.sdk.copilot import runtime as copilot_runtime
 from skyvern.forge.sdk.copilot.code_block_synthesis import synthesize_code_block
 from skyvern.forge.sdk.copilot.demonstration_recorder import (
     DemonstrationClaim,
@@ -45,7 +46,7 @@ from skyvern.forge.sdk.routes import workflow_copilot as copilot_routes
 from skyvern.forge.sdk.schemas.credentials import Credential, CredentialType, CredentialVaultType
 from skyvern.forge.sdk.schemas.workflow_copilot import WorkflowCopilotDemonstrationControlRequest
 from skyvern.services import uploaded_file_service
-from tests.unit.copilot_test_helpers import make_copilot_ctx
+from tests.unit.copilot_test_helpers import make_copilot_ctx, stamping_browser_manager, stop_activity_renewer
 
 
 class _SharedCache:
@@ -1459,6 +1460,36 @@ async def test_resumed_recording_clears_prior_stop_reason_before_replay(monkeypa
     history = await replay_demonstration(ctx, SimpleNamespace(call_tool=AsyncMock()))  # type: ignore[arg-type]
 
     assert not any("ended because" in str(item.get("content")) for item in history)
+
+
+@pytest.mark.asyncio
+async def test_recorder_teardown_ends_renewal_for_a_browser_minted_into_its_context(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    browser_manager = stamping_browser_manager(monkeypatch)
+    monkeypatch.setattr(app, "BROWSER_MANAGER", browser_manager)
+    recorder = DemonstrationRecorder(
+        cache=_SharedCache(),  # type: ignore[arg-type]
+        organization_id="org-1",
+        workflow_permanent_id="wfp-1",
+        browser_session_id="pbs-1",
+        claim=DemonstrationClaim("demo-mint", "owner-1", False, 0),
+        stream=_Stream(),
+    )
+    renewable_at_mint: list[set[str]] = []
+
+    async def _mint_then_lose_browser(**_kwargs: str) -> None:
+        await copilot_runtime._record_minted_browser(recorder.recording_ctx, "pbs_minted")
+        renewable_at_mint.append(browser_manager._renewable_session_ids())
+
+    monkeypatch.setattr(recorder_module, "resolve_persistent_browser_state", _mint_then_lose_browser)
+
+    try:
+        await recorder.run()
+        assert renewable_at_mint == [{"pbs_minted"}]
+        assert browser_manager._renewable_session_ids() == set()
+    finally:
+        await stop_activity_renewer(browser_manager)
 
 
 @pytest.mark.asyncio

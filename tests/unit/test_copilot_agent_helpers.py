@@ -60,6 +60,7 @@ from skyvern.forge.sdk.copilot import agent as agent_module
 from skyvern.forge.sdk.copilot import enforcement as enforcement_module
 from skyvern.forge.sdk.copilot import runtime as runtime_module
 from skyvern.forge.sdk.copilot import tools as tools_module
+from skyvern.forge.sdk.copilot import vault_logins as vault_logins_module
 from skyvern.forge.sdk.copilot.agent import (
     _build_goal_satisfied_exit_result,
     _format_chat_history,
@@ -178,9 +179,10 @@ from skyvern.forge.sdk.copilot.turn_origin import TurnOrigin
 from skyvern.forge.sdk.copilot.verification_evidence import WorkflowVerificationEvidence
 from skyvern.forge.sdk.copilot.workflow_credential_utils import workflow_blocks, workflow_credential_ids
 from skyvern.forge.sdk.copilot.workflow_yaml import _process_workflow_yaml
+from skyvern.forge.sdk.credential_site_policy import LoginSite
 from skyvern.forge.sdk.routes.workflow_copilot import CHAT_HISTORY_CONTEXT_MESSAGES
 from skyvern.forge.sdk.schemas.copilot_turn_outcome import ConnectedAccountChoice, ResponseKind, TurnOutcome
-from skyvern.forge.sdk.schemas.credentials import Credential
+from skyvern.forge.sdk.schemas.credentials import Credential, CredentialVaultType
 from skyvern.forge.sdk.schemas.google_oauth import GoogleOAuthCredentialBase
 from skyvern.forge.sdk.schemas.organizations import Organization
 from skyvern.forge.sdk.schemas.persistent_browser_sessions import PersistentBrowserSession
@@ -190,6 +192,7 @@ from skyvern.forge.sdk.schemas.workflow_copilot import (
     WorkflowCopilotChatSender,
 )
 from skyvern.forge.sdk.schemas.workflow_runs import WorkflowRunBlock
+from skyvern.forge.sdk.services.credential.credential_vault_service import VaultLogin, VaultLoginListing
 from skyvern.forge.sdk.services.google_oauth_service import GOOGLE_SHEETS_DATA_SCOPE
 from skyvern.forge.sdk.workflow.models.workflow import Workflow, WorkflowDefinition, WorkflowRunStatus
 from skyvern.schemas.proxy_location import ProxyLocation
@@ -4474,6 +4477,101 @@ class TestTranslateToAgentResultGating:
         assert agent_result.response_type == "REPLACE_WORKFLOW"
         assert ctx.last_workflow is replacement
         assert agent_result.updated_workflow is None
+
+    def test_inline_replace_workflow_refuses_a_bitwarden_parameter_moved_off_its_item_sites(self, monkeypatch) -> None:
+        monkeypatch.setattr(
+            "skyvern.forge.sdk.copilot.tools._process_workflow_yaml",
+            AsyncMock(return_value=fake_workflow(name="moved")),
+        )
+        monkeypatch.setattr(vault_logins_module, "list_vault_logins", AsyncMock(return_value=VaultLoginListing()))
+        legacy_id = "bitwarden_login_credential:item_1"
+        ctx = _ctx(
+            request_policy=RequestPolicy(
+                allow_update_workflow=True,
+                existing_workflow_credential_origins={legacy_id: ["https://portal.example.com"]},
+            )
+        )
+        moved = yaml.safe_dump(
+            {
+                "title": "Sign in",
+                "workflow_definition": {
+                    "parameters": [
+                        {
+                            "key": "portal_login",
+                            "parameter_type": "bitwarden_login_credential",
+                            "bitwarden_item_id": "item_1",
+                        }
+                    ],
+                    "blocks": [
+                        {
+                            "block_type": "login",
+                            "label": "sign_in",
+                            "url": "https://other.example.com/login",
+                            "parameter_keys": ["portal_login"],
+                        }
+                    ],
+                },
+            }
+        )
+        result = _fake_run_result({"type": "REPLACE_WORKFLOW", "user_response": "Moved it.", "workflow_yaml": moved})
+
+        agent_result = asyncio.run(
+            agent_module._translate_to_agent_result(
+                result, ctx, global_llm_context=None, chat_request=_chat_request(), organization_id="org-1"
+            )
+        )
+
+        assert agent_result.updated_workflow is None
+        assert ctx.last_workflow is None
+
+    def test_inline_replace_workflow_refuses_a_new_bitwarden_parameter_on_its_item_site(self, monkeypatch) -> None:
+        monkeypatch.setattr(
+            "skyvern.forge.sdk.copilot.tools._process_workflow_yaml",
+            AsyncMock(return_value=fake_workflow(name="added")),
+        )
+        listed = VaultLogin(
+            vault_type=CredentialVaultType.BITWARDEN_CONNECTED,
+            vault_id="org_vault",
+            item_id="item_1",
+            title="Portal",
+            urls=("https://portal.example.com/login",),
+            sites=(LoginSite("https://portal.example.com", whole_site=False),),
+        )
+        monkeypatch.setattr(
+            vault_logins_module, "list_vault_logins", AsyncMock(return_value=VaultLoginListing(logins=(listed,)))
+        )
+        ctx = _ctx(request_policy=RequestPolicy(allow_update_workflow=True))
+        added = yaml.safe_dump(
+            {
+                "title": "Sign in",
+                "workflow_definition": {
+                    "parameters": [
+                        {
+                            "key": "portal_login",
+                            "parameter_type": "bitwarden_login_credential",
+                            "bitwarden_item_id": "item_1",
+                        }
+                    ],
+                    "blocks": [
+                        {
+                            "block_type": "login",
+                            "label": "sign_in",
+                            "url": "https://portal.example.com/login",
+                            "parameter_keys": ["portal_login"],
+                        }
+                    ],
+                },
+            }
+        )
+        result = _fake_run_result({"type": "REPLACE_WORKFLOW", "user_response": "Added it.", "workflow_yaml": added})
+
+        asyncio.run(
+            agent_module._translate_to_agent_result(
+                result, ctx, global_llm_context=None, chat_request=_chat_request(), organization_id="org-1"
+            )
+        )
+
+        assert ctx.last_workflow is None
 
     @pytest.mark.parametrize(
         "request_policy",

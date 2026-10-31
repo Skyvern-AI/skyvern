@@ -2621,9 +2621,15 @@ async def test_a_credential_with_no_authenticator_raises_an_update_card_naming_i
     ctx = _tool_ctx(monkeypatch, cache)
     credential = wire_credential_vault(monkeypatch, PasswordCredential(username="u", password="p", totp=None))
     app.CREDENTIAL_VAULT_SERVICES[CredentialVaultType.SKYVERN].get_credential_item.side_effect = [
-        SimpleNamespace(name="authtest simple", credential=PasswordCredential(username="u", password="p", totp=None)),
         SimpleNamespace(
-            name="authtest simple", credential=PasswordCredential(username="u", password="p", totp=totp_after_save)
+            name="authtest simple",
+            credential=PasswordCredential(username="u", password="p", totp=None),
+            login_sites=None,
+        ),
+        SimpleNamespace(
+            name="authtest simple",
+            credential=PasswordCredential(username="u", password="p", totp=totp_after_save),
+            login_sites=None,
         ),
     ]
     ctx.request_policy.resolved_credentials = [credential]
@@ -3378,6 +3384,30 @@ async def test_a_site_rejected_credential_gets_an_update_card_after_a_pick_even_
     assert ctx.request_policy == policy_before
     assert ctx.credential_pause_outcome == "connected"
     assert (await _call_ask_tool(ctx, credential_id="cred_1", rejected_by_site=True))["status"] == "already_asked"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("vault_type", [CredentialVaultType.ONEPASSWORD, CredentialVaultType.BITWARDEN_CONNECTED])
+@pytest.mark.parametrize("rejected_by_site", [True, False])
+async def test_a_login_imported_from_an_external_vault_gets_no_update_card(
+    monkeypatch: pytest.MonkeyPatch, vault_type: CredentialVaultType, rejected_by_site: bool
+) -> None:
+    cache = _FakeCache()
+    ctx = _tool_ctx(monkeypatch, cache)
+    credential = wire_credential_vault(
+        monkeypatch, PasswordCredential(username="u", password="p", totp=None), vault_type=vault_type
+    )
+    ctx.request_policy.resolved_credentials = [credential]
+    ctx.latest_diagnosis_repair_contract = _repair_contract(
+        RepairNextAction.ASK, DiagnosisFailureType.MISSING_CREDENTIAL_OR_INIT
+    )
+    ctx.stream.send = AsyncMock(side_effect=_answer_each_card(cache, [("skip", None)]))
+
+    result = await _call_ask_tool(ctx, credential_id="cred_1", rejected_by_site=rejected_by_site)
+
+    assert result["ok"] is False
+    assert "updates it in" in result["error"]
+    assert _sent_cards(ctx) == []
 
 
 @pytest.mark.asyncio

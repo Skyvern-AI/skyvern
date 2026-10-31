@@ -35,6 +35,8 @@ async def test_register_credential_parameter_uses_db_totp_identifier(monkeypatch
             return {}
 
     class FakeCredentialItem:
+        login_sites = None
+
         def __init__(self) -> None:
             self.credential = FakeCredential()
 
@@ -103,6 +105,8 @@ async def _register_with_credential(
     )
 
     class FakeCredentialItem:
+        login_sites = None
+
         def __init__(self, cred: PasswordCredential) -> None:
             self.credential = cred
 

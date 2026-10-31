@@ -6090,7 +6090,7 @@ def test_a_failed_sign_in_block_names_its_bound_credential_without_changing_the_
     assert _update_lever_ids(contract) == update_levers
 
 
-def test_a_failed_sign_in_on_a_connected_vault_login_offers_no_credential_card_update() -> None:
+def test_a_failed_sign_in_on_a_bitwarden_login_parameter_offers_no_credential_card_update() -> None:
     ctx = _ctx()
     ctx.workflow_yaml = _sign_in_workflow_yaml(binds_credential=True).replace(
         """    parameter_type: workflow

@@ -3,19 +3,23 @@ import logging
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
+from datetime import UTC, datetime
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
+from unittest.mock import AsyncMock, MagicMock
 
 import httpx
 import pytest
 import yaml
 from fastapi import FastAPI, HTTPException
 from sqlalchemy import func, select
+from starlette.requests import Request
 
 from skyvern.exceptions import SkyvernHTTPException
 from skyvern.forge import app
 from skyvern.forge.agent_functions import AuditEvent
-from skyvern.forge.api_app import handle_skyvern_http_exception
+from skyvern.forge.api_app import create_api_app, handle_skyvern_http_exception
 from skyvern.forge.sdk.copilot.workflow_yaml import _process_workflow_yaml
 from skyvern.forge.sdk.db.agent_db import AgentDB
 from skyvern.forge.sdk.db.models import Base, OutputParameterModel, WorkflowModel
@@ -30,8 +34,15 @@ from skyvern.forge.sdk.schemas.organizations import Organization
 from skyvern.forge.sdk.schemas.workflow_copilot import WorkflowCopilotApplyProposedWorkflowRequest
 from skyvern.forge.sdk.services import org_auth_service
 from skyvern.forge.sdk.workflow.exceptions import FailedToCreateWorkflow, NonTerminalFinallyBlock
+from skyvern.forge.sdk.workflow.models.block import NavigationBlock
+from skyvern.forge.sdk.workflow.models.parameter import OutputParameter
 from skyvern.forge.sdk.workflow.models.workflow import Workflow, WorkflowDefinition
 from skyvern.forge.sdk.workflow.service import WorkflowService
+from skyvern.forge.sdk.workflow.validation import (
+    MAX_WORKFLOW_VALIDATION_BLOCK_COUNT,
+    MAX_WORKFLOW_VALIDATION_LOOP_DEPTH,
+    WorkflowValidationTooComplex,
+)
 from skyvern.schemas.workflows import WorkflowRequest, WorkflowStatus
 from tests.unit.force_stub_app import start_forge_stub_app
 
@@ -64,6 +75,49 @@ REJECTED_IDEMPOTENCY_KEYS = {
 }
 
 
+@pytest.mark.asyncio
+async def test_validate_entrypoint_reports_credential_reference_in_note(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    definition = {
+        "title": "Validation test agent",
+        "workflow_definition": {
+            "parameters": [
+                {
+                    "parameter_type": "credential",
+                    "key": "login",
+                    "credential_id": "cred_test",
+                }
+            ],
+            "blocks": [
+                {
+                    "block_type": "navigation",
+                    "label": "open_page",
+                    "navigation_goal": "Open the page",
+                    "notes": "Use {{ login }} to sign in",
+                }
+            ],
+        },
+    }
+
+    async with idempotency_lab(monkeypatch, tmp_path / "validate.db") as lab:
+        response = await lab.validate(definition)
+
+    assert response.status_code == 200
+    assert response.json()["valid"] is True
+    assert response.json()["problems"] == [
+        {
+            "block_label": "open_page",
+            "path": "workflow_definition.blocks[0].notes",
+            "field": "notes",
+            "code": "credential_in_note",
+            "severity": "warning",
+            "message": "Notes can't use a credential input.",
+        }
+    ]
+
+
 @dataclass
 class IdempotencyLab:
     """Loopback create-workflow router over synthetic SQLite with every post-validation seam counted."""
@@ -82,6 +136,9 @@ class IdempotencyLab:
         # header bytes as latin-1, so this reproduces exactly what reaches the route on the wire.
         headers = [] if key is None else [(b"Idempotency-Key", key.encode("latin-1"))]
         return await self.client.post("/v1/agents", headers=headers, json=payload)
+
+    async def validate(self, definition: dict[str, Any]) -> httpx.Response:
+        return await self.client.post("/v1/agents/validate", json=definition)
 
     async def count_workflows(self) -> int | None:
         async with self.database.Session() as session:
@@ -1143,3 +1200,136 @@ async def test_each_surface_stamps_the_build_source_of_the_version_it_writes(
         # A rolled-back copilot turn must not leave its stamp on the version the API caller wrote.
         await _restore_workflow_definition(api_version, lab.organization.organization_id)
         assert await build_source_of(api_version.workflow_id) == "api"
+
+
+def _stored_workflow_with_forward_reference() -> Workflow:
+    now = datetime.now(UTC)
+    outputs = [
+        OutputParameter(
+            output_parameter_id=f"op_{label}",
+            workflow_id="w_saved",
+            key=f"{label}_output",
+            created_at=now,
+            modified_at=now,
+        )
+        for label in ("first", "second")
+    ]
+    goals = ("Check {{ second_output }}", "Open the page")
+    blocks = [
+        NavigationBlock(label=label, output_parameter=output, navigation_goal=goal)
+        for label, output, goal in zip(("first", "second"), outputs, goals)
+    ]
+    return Workflow(
+        workflow_id="w_saved",
+        organization_id="o_test",
+        title="Saved workflow",
+        workflow_permanent_id="wpid_saved",
+        version=1,
+        is_saved_task=False,
+        workflow_definition=WorkflowDefinition(parameters=outputs, blocks=blocks),
+        created_at=now,
+        modified_at=now,
+    )
+
+
+@pytest.mark.asyncio
+async def test_saved_workflow_validate_is_served_on_the_api_v1_prefix_the_ui_calls(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    stored = _stored_workflow_with_forward_reference()
+    async with idempotency_lab(monkeypatch, tmp_path / "validate-saved.db") as lab:
+
+        async def get_stored(**_: object) -> Workflow:
+            return stored
+
+        real_app = create_api_app()
+        monkeypatch.setattr(app.WORKFLOW_SERVICE, "get_workflow_by_permanent_id", get_stored)
+        real_app.dependency_overrides[org_auth_service.get_current_org] = lambda: lab.organization
+        real_app.dependency_overrides[org_auth_service.get_current_user_id_or_none] = lambda: "u_test"
+        transport = httpx.ASGITransport(app=real_app)
+        async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+            response = await client.post("/api/v1/workflows/wpid_saved/validate")
+
+    assert response.status_code == 200
+    assert [problem["code"] for problem in response.json()["problems"]] == ["forward_reference"]
+
+
+def _validation_request(body: bytes) -> Request:
+    async def receive() -> dict[str, object]:
+        return {"type": "http.request", "body": body, "more_body": False}
+
+    return Request({"type": "http", "method": "POST", "path": "/", "headers": []}, receive)
+
+
+@pytest.mark.asyncio
+async def test_workflow_validation_rejects_oversized_body_before_validation(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(
+        agent_protocol,
+        "validate_workflow_definition",
+        lambda _: pytest.fail("oversized request reached workflow validation"),
+    )
+
+    with pytest.raises(HTTPException) as exc:
+        await agent_protocol._validate_workflow_draft(
+            _validation_request(b" " * (agent_protocol.MAX_WORKFLOW_VALIDATION_DRAFT_BYTES + 1))
+        )
+
+    assert exc.value.status_code == 413
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("limit", ["depth", "block_count"])
+async def test_workflow_validation_returns_complexity_limit_as_workflow_problem(
+    limit: str,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    if limit == "depth":
+        blocks: list[dict[str, object]] = [{"block_type": "navigation", "label": "step"}]
+        for depth in range(MAX_WORKFLOW_VALIDATION_LOOP_DEPTH + 1):
+            blocks = [{"block_type": "navigation", "label": f"step_{depth}", "loop_blocks": blocks}]
+    else:
+        blocks = [
+            {"block_type": "navigation", "label": f"step_{index}"}
+            for index in range(MAX_WORKFLOW_VALIDATION_BLOCK_COUNT + 1)
+        ]
+
+    async with idempotency_lab(monkeypatch, tmp_path / f"validate-{limit}.db") as lab:
+        response = await lab.validate({"workflow_definition": {"blocks": blocks}})
+
+    assert response.status_code == 200
+    assert response.json()["valid"] is False
+    assert response.json()["problems"] == [
+        {
+            "block_label": None,
+            "path": "workflow_definition",
+            "field": None,
+            "code": "validation_limit",
+            "severity": "error",
+            "message": (
+                "Workflow validation supports nested block lists up to 6 levels."
+                if limit == "depth"
+                else "Workflow validation supports at most 500 blocks."
+            ),
+        }
+    ]
+
+
+@pytest.mark.asyncio
+async def test_saved_workflow_validation_maps_complexity_limit_to_422(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(agent_protocol, "_enforce_folder_access", AsyncMock())
+    monkeypatch.setattr(app.WORKFLOW_SERVICE, "get_workflow_by_permanent_id", AsyncMock(return_value=object()))
+    monkeypatch.setattr(
+        agent_protocol,
+        "validate_stored_workflow",
+        MagicMock(side_effect=WorkflowValidationTooComplex("too complex")),
+    )
+
+    with pytest.raises(HTTPException) as exc:
+        await agent_protocol.validate_saved_workflow(
+            "wpid_test",
+            SimpleNamespace(organization_id="org_test"),
+        )
+
+    assert exc.value.status_code == 422

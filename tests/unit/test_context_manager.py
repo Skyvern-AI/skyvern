@@ -47,6 +47,7 @@ from skyvern.forge.sdk.workflow.credential_fetch_outcome import (
     classify_credential_fetch_failure,
 )
 from skyvern.forge.sdk.workflow.models.block import BranchEvaluationContext, WaitBlock
+from skyvern.forge.sdk.workflow.models.credential_release import CredentialReleaseGuard
 from skyvern.forge.sdk.workflow.models.parameter import (
     AzureVaultCredentialParameter,
     BitwardenLoginCredentialParameter,
@@ -546,6 +547,49 @@ class TestBitwardenLoginScope:
         assert context.bitwarden_login_sites == {
             "portal_login": [LoginSite("https://login.example.com", whole_site=False)]
         }
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ("enforce_vault_sites", "allowed", "refused"),
+        [
+            pytest.param(True, "https://app.example.com/login", "https://other.example.com/login", id="copilot-built"),
+            pytest.param(False, "https://other.example.com/login", "https://login.example.net/", id="editor-built"),
+        ],
+    )
+    async def test_an_imported_login_with_a_tested_url_is_released_only_on_one_enforced_scope(
+        self, monkeypatch: pytest.MonkeyPatch, enforce_vault_sites: bool, allowed: str, refused: str
+    ) -> None:
+        db_credential = SimpleNamespace(
+            vault_type=CredentialVaultType.BITWARDEN_CONNECTED,
+            totp_identifier=None,
+            run_sequentially=False,
+            tested_url="https://other.example.com/login",
+        )
+        item = CredentialItem(
+            item_id=_VAULT_ITEM_ID,
+            name="Portal",
+            credential_type=CredentialType.PASSWORD,
+            credential=PasswordCredential(username="user@example.com", password="synthetic-password"),
+            login_sites=[LoginSite("https://app.example.com", whole_site=False)],
+        )
+        _install_credential_app(monkeypatch, db_credential=db_credential)
+        cm.app.CREDENTIAL_VAULT_SERVICES[CredentialVaultType.BITWARDEN_CONNECTED] = SimpleNamespace(
+            get_credential_item=AsyncMock(return_value=item)
+        )
+        portal = _make_workflow_parameter("portal_login", workflow_parameter_type=WorkflowParameterType.CREDENTIAL_ID)
+
+        context = await _init_context(workflow_parameter_tuples=[(portal, _make_run_parameter(portal, "cred_1"))])
+        [armed] = CredentialReleaseGuard().arm_login(
+            ["synthetic-password"],
+            "portal_login",
+            tested_url=context.credential_tested_urls.get("portal_login"),
+            vault_sites=context.bitwarden_login_sites.get("portal_login"),
+            enforce_vault_sites=enforce_vault_sites,
+        )
+
+        assert armed.enforced
+        assert armed.admits(allowed)
+        assert not armed.admits(refused)
 
     @pytest.mark.asyncio
     async def test_a_login_read_that_lost_its_sites_is_recorded_as_having_none(

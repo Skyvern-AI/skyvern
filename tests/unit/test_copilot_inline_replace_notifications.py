@@ -11,7 +11,7 @@ from skyvern.forge.sdk.copilot.request_policy import RequestPolicy
 from tests.unit.copilot_test_helpers import make_copilot_ctx
 
 
-def test_inline_replace_workflow_reports_dropped_note_labels_without_text_when_doc_editor_is_off(
+def test_inline_replace_workflow_says_nothing_about_dropped_notes_when_doc_editor_is_off(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     async def _process(**kwargs: object) -> SimpleNamespace:
@@ -62,5 +62,6 @@ workflow_definition:
         )
     )
 
-    assert "open_page" in agent_result.user_response
-    assert "Never click Delete" not in agent_result.user_response
+    # The person never sees notes without the Doc editor, so neither the step nor its note is mentioned.
+    assert "open_page" not in agent_result.user_response
+    assert "note" not in agent_result.user_response.lower()

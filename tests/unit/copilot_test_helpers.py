@@ -108,8 +108,10 @@ from skyvern.schemas.runs import ProxyLocation
 from skyvern.schemas.self_heal import HealEpisode
 from skyvern.schemas.workflows import BlockType
 from skyvern.services import workflow_service as workflow_service_module
+from skyvern.webeye import real_browser_manager
 from skyvern.webeye.actions.action_types import ActionType
 from skyvern.webeye.actions.actions import ActionStatus
+from skyvern.webeye.real_browser_manager import RealBrowserManager
 from tests.unit.conftest import requires_chromium
 
 DISPATCHED_LOGIN_GATE_HTML = (
@@ -145,6 +147,7 @@ def wire_credential_vault(
     *,
     credential_id: str = "cred_1",
     name: str = "authtest simple",
+    vault_type: CredentialVaultType = CredentialVaultType.SKYVERN,
 ) -> Credential:
     """Serve one saved credential from the org database and ``secrets`` from its vault."""
     now = datetime(2026, 1, 1, tzinfo=UTC)
@@ -152,7 +155,7 @@ def wire_credential_vault(
         credential_id=credential_id,
         organization_id="org-1",
         name=name,
-        vault_type=CredentialVaultType.SKYVERN,
+        vault_type=vault_type,
         item_id="item_1",
         credential_type=CredentialType.PASSWORD,
         username=secrets.username,
@@ -170,12 +173,14 @@ def wire_credential_vault(
         ),
         raising=False,
     )
-    vault = SimpleNamespace(get_credential_item=AsyncMock(return_value=SimpleNamespace(name=name, credential=secrets)))
+    vault = SimpleNamespace(
+        get_credential_item=AsyncMock(return_value=SimpleNamespace(name=name, credential=secrets, login_sites=None))
+    )
     # `app` is an AppHolder proxy without __delattr__; patch the underlying instance so teardown can delete it.
     monkeypatch.setattr(
         object.__getattribute__(forge_app, "_inst"),
         "CREDENTIAL_VAULT_SERVICES",
-        {CredentialVaultType.SKYVERN: vault},
+        {vault_type: vault},
         raising=False,
     )
     return credential
@@ -1487,6 +1492,25 @@ def stub_copilot_agent_loop(
     monkeypatch.setattr("skyvern.forge.sdk.copilot.model_resolver.resolve_model_config", fake_resolve_model_config)
     monkeypatch.setattr("skyvern.forge.sdk.copilot.enforcement.run_with_enforcement", run_with_enforcement)
     monkeypatch.setattr(copilot_agent, "schedule_agent_naming", lambda *_args: None)
+
+
+def stamping_browser_manager(monkeypatch: pytest.MonkeyPatch, touch: AsyncMock | None = None) -> RealBrowserManager:
+    """A real activity renewer whose stamps land on a mock, so tests read renewal off the manager itself."""
+    monkeypatch.setattr(
+        real_browser_manager,
+        "app",
+        SimpleNamespace(
+            DATABASE=SimpleNamespace(browser_sessions=SimpleNamespace(touch_last_activity=touch or AsyncMock()))
+        ),
+    )
+    return RealBrowserManager()
+
+
+async def stop_activity_renewer(manager: RealBrowserManager) -> None:
+    renewer = manager._session_activity_renewer
+    if renewer is not None:
+        renewer.cancel()
+        await asyncio.gather(renewer, return_exceptions=True)
 
 
 TURN_EXIT_PATHS = ("normal", "model_error", "deadline", "cancel")

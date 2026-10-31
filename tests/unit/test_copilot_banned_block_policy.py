@@ -1473,6 +1473,51 @@ def test_authoring_turn_summary_names_what_the_turn_added() -> None:
         "mid_turn_family_switches": {},
         "switches_after_failed_test": [],
         "same_family_rewrites_after_failed_test": {},
+        "agent_step_blocks": {},
+    }
+
+
+def test_authoring_turn_summary_lists_each_agent_step_with_its_neighbours_in_the_same_block_list() -> None:
+    final = _yaml(
+        {"block_type": "goto_url", "label": "open", "url": "https://example.com"},
+        {
+            "block_type": "for_loop",
+            "label": "each_item",
+            "loop_over_parameter_key": "items",
+            "loop_blocks": [
+                {"block_type": "agent_step", "label": "inspect_item", "prompt": "p", "data_schema": {}},
+                {"block_type": "extraction", "label": "read_item", "data_extraction_goal": "g"},
+            ],
+        },
+        {"block_type": "agent_step", "label": "decide", "prompt": "p", "data_schema": {}},
+        {"block_type": "code", "label": "total", "code": "return {}"},
+    )
+
+    assert authoring_turn_summary(None, final)["agent_step_blocks"] == {
+        "inspect_item": {"before": [], "after": ["extraction"]},
+        "decide": {"before": ["for_loop"], "after": ["code"]},
+    }
+
+
+def test_agent_step_neighbours_follow_conditional_branches_not_list_order() -> None:
+    final = _yaml(
+        {"block_type": "agent_step", "label": "find", "next_block_label": "check", "prompt": "p", "data_schema": {}},
+        {"block_type": "code", "label": "check", "next_block_label": "route", "code": "return {}"},
+        {
+            "block_type": "conditional",
+            "label": "route",
+            "branch_conditions": [
+                {"criteria": {"expression": "{{ check.is_recent }}"}, "next_block_label": "download"},
+                {"is_default": True, "next_block_label": "read_notice"},
+            ],
+        },
+        {"block_type": "file_download", "label": "download", "navigation_goal": "g"},
+        {"block_type": "agent_step", "label": "read_notice", "prompt": "p", "data_schema": {}},
+    )
+
+    assert authoring_turn_summary(None, final)["agent_step_blocks"] == {
+        "find": {"before": [], "after": ["code"]},
+        "read_notice": {"before": ["conditional"], "after": []},
     }
 
 

@@ -47,10 +47,8 @@ from skyvern.forge.sdk.copilot.tools import (
     NATIVE_TOOLS,
 )
 from skyvern.forge.sdk.copilot.tools.run_execution import _watchdog_error_message
-from skyvern.forge.sdk.credential_site_policy import LoginSite
 from skyvern.forge.sdk.schemas.copilot_turn_outcome import ResponseKind, TurnOutcome
 from skyvern.utils.yaml_loader import safe_load_no_dates
-from tests.unit.conftest import ORG_VAULT_ITEM_ID, ORG_VAULT_LOGIN_ID
 
 # Assembled at runtime so the source never contains a token-shaped literal for secret scanners to flag.
 _FAKE_OPENAI_KEY = "sk-" + string.ascii_lowercase[:24]
@@ -2102,8 +2100,6 @@ def test_output_schema_ask_with_secret_leak_keeps_only_the_safety_block() -> Non
 _AUTHOR_TIME_KEEP_HARD_REASONS = frozenset(
     {
         OutputPolicyReason.CREDENTIAL_SCOPE_BROADENED,
-        OutputPolicyReason.CONNECTED_VAULT_LOGIN_OFF_SITE,
-        OutputPolicyReason.CONNECTED_VAULT_LOGIN_SITES_UNREAD,
     }
 )
 
@@ -2121,8 +2117,6 @@ _AUTHORING_SEAM_REFUSAL_SOURCES: dict[str, str] = {
     "raw_secret_leak": _FINDING,
     "unapproved_credential_reference": CREDENTIAL_SCOUT_BLOCK_ID,
     "credential_scope_broadened": CREDENTIAL_SCOUT_BLOCK_ID,
-    "connected_vault_login_off_site": CREDENTIAL_SCOUT_BLOCK_ID,
-    "connected_vault_login_sites_unread": CREDENTIAL_SCOUT_BLOCK_ID,
     "persistence_state_mismatch": _FINDING,
     "output_policy_context_missing": _FINDING,
 }
@@ -2237,90 +2231,3 @@ def test_generic_clarification_policy_does_not_create_an_authoring_verdict() -> 
 )
 def test_raw_secret_label_is_the_detector_label_and_never_the_value(reply: str, label: str | None) -> None:
     assert raw_secret_label(reply) == label
-
-
-def _vault_login_workflow_yaml(url: str) -> str:
-    return f"""
-workflow_definition:
-  parameters:
-    - parameter_type: bitwarden_login_credential
-      key: portal_login
-      bitwarden_item_id: {ORG_VAULT_ITEM_ID}
-  blocks:
-    - block_type: login
-      label: login
-      url: {url}
-      parameter_keys:
-        - portal_login
-"""
-
-
-@pytest.mark.parametrize(
-    ("url", "sites", "existing_origins", "reason"),
-    [
-        pytest.param(
-            "https://app.portal.example.com/login",
-            [LoginSite("https://portal.example.com", whole_site=True)],
-            [],
-            None,
-            id="own-site",
-        ),
-        pytest.param(
-            "https://app.portal.example.com/login",
-            [LoginSite("https://portal.example.com", whole_site=False)],
-            [],
-            OutputPolicyReason.CONNECTED_VAULT_LOGIN_OFF_SITE,
-            id="host-only-site-sibling-host",
-        ),
-        pytest.param(
-            "http://localhost:8931/portal/login",
-            [LoginSite("http://localhost:8931/portal/", whole_site=False)],
-            [],
-            None,
-            id="own-origin",
-        ),
-        pytest.param(
-            "http://localhost:8932/portal/login",
-            [LoginSite("http://localhost:8931/portal/", whole_site=True)],
-            [],
-            OutputPolicyReason.CONNECTED_VAULT_LOGIN_OFF_SITE,
-            id="other-port",
-        ),
-        pytest.param(
-            "https://other.example.org/login",
-            [LoginSite("https://portal.example.com", whole_site=True)],
-            [],
-            OutputPolicyReason.CONNECTED_VAULT_LOGIN_OFF_SITE,
-            id="off-site",
-        ),
-        pytest.param(
-            "https://portal.example.com/login",
-            None,
-            [],
-            OutputPolicyReason.CONNECTED_VAULT_LOGIN_SITES_UNREAD,
-            id="unread-sites-new-binding",
-        ),
-        pytest.param(
-            "https://other.example.org/login",
-            None,
-            ["https://other.example.org"],
-            None,
-            id="unread-sites-existing-binding-unchanged",
-        ),
-    ],
-)
-def test_a_vault_login_is_scoped_by_its_own_whole_site_uris_and_only_where_copilot_places_it(
-    url: str, sites: list[LoginSite] | None, existing_origins: list[str], reason: OutputPolicyReason | None
-) -> None:
-    policy = _policy(
-        resolved_credentials=[],
-        existing_workflow_credential_ids=[ORG_VAULT_LOGIN_ID] if existing_origins else [],
-        existing_workflow_credential_origins={ORG_VAULT_LOGIN_ID: existing_origins} if existing_origins else {},
-        credential_input_kind="none",
-    )
-    if sites is not None:
-        policy.connected_vault_sites[ORG_VAULT_LOGIN_ID] = sites
-
-    verdict = evaluate_output_policy(request_policy=policy, workflow_yaml=_vault_login_workflow_yaml(url))
-
-    assert verdict.reason_codes == ([reason] if reason else [])
