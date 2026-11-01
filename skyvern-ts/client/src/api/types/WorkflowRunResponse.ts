@@ -51,6 +51,8 @@ export interface WorkflowRunResponse {
     script_id?: string;
     /** The original request parameters used to start this workflow run */
     run_request?: Skyvern.WorkflowRunRequestOutput;
+    /** Whether another attempt is scheduled for this workflow run */
+    retry_pending?: boolean;
 }
 
 export namespace WorkflowRunResponse {
