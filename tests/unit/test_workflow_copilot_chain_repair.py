@@ -21,6 +21,7 @@ from skyvern.schemas.workflows import (
     ExtractionBlockYAML,
     ForLoopBlockYAML,
     NavigationBlockYAML,
+    WorkflowCreateYAMLRequest,
 )
 
 
@@ -146,6 +147,34 @@ class TestRepairChain:
         _repair_next_block_label_chain(blocks)
         # The repair should still produce a chain (last "b" wins in the dict)
         assert blocks[0].next_block_label == "b"
+
+    def test_an_unversioned_list_is_left_unstitched_and_revalidates(self) -> None:
+        workflow_yaml = """
+title: Two steps
+workflow_definition:
+  parameters: []
+  blocks:
+  - block_type: navigation
+    label: first
+    url: https://example.com
+    navigation_goal: Open the page.
+  - block_type: navigation
+    label: second
+    navigation_goal: Read the page.
+"""
+        request = _normalize_copilot_yaml(workflow_yaml)
+
+        assert request.workflow_definition.version == 1
+        assert [block.next_block_label for block in request.workflow_definition.blocks] == [None, None]
+        WorkflowCreateYAMLRequest.model_validate(request.model_dump(mode="json"))
+
+    def test_a_list_ordered_top_level_stays_unstitched_while_its_loop_body_chains(self) -> None:
+        blocks = [_nav("a"), _loop("loop", None, [_nav("x"), _nav("y")]), _nav("b")]
+
+        _repair_next_block_label_chain(blocks, list_ordered=True)
+
+        assert [block.next_block_label for block in blocks] == [None, None, None]
+        assert [block.next_block_label for block in blocks[1].loop_blocks] == ["y", None]
 
 
 class TestConditionalBlocks:
