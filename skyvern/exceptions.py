@@ -375,7 +375,7 @@ class CardNumberInputMismatch(SkyvernException):
 class SecretInputMismatch(SkyvernException):
     def __init__(self) -> None:
         # No secret material in the message: not the value, its length, or its character classes.
-        super().__init__("Secret input read-back mismatch after atomic re-entry.")
+        super().__init__("Secret input read-back mismatch after re-entry.")
 
 
 class FreeTextInputMismatch(SkyvernException):
