@@ -20,6 +20,7 @@ from sqlalchemy import (
     desc,
     text,
 )
+from sqlalchemy.dialects.postgresql import ARRAY
 from sqlalchemy.ext.asyncio import AsyncAttrs
 from sqlalchemy.orm import DeclarativeBase, deferred
 
@@ -42,11 +43,14 @@ from skyvern.forge.sdk.db.id import (
     generate_credential_id,
     generate_credential_parameter_id,
     generate_debug_session_id,
+    generate_email_config_id,
     generate_folder_id,
+    generate_forwarding_address_id,
     generate_gmail_send_dispatch_id,
     generate_google_oauth_credential_id,
     generate_heal_episode_id,
     generate_heal_proposal_id,
+    generate_inbound_email_id,
     generate_microsoft_oauth_credential_id,
     generate_onepassword_credential_parameter_id,
     generate_org_id,
@@ -1493,6 +1497,90 @@ class TOTPCodeModel(Base):
     expired_at = Column(DateTime, index=True)
     otp_type = Column(String, server_default=sqlalchemy.text("'totp'"))
     parse_status = Column(String, nullable=False, server_default=sqlalchemy.text("'parsed'"))
+
+
+class OrganizationEmailConfigModel(Base):
+    __tablename__ = "organization_email_configs"
+    __table_args__ = (Index("ix_organization_email_configs_org", "organization_id"),)
+
+    email_config_id = Column(String, primary_key=True, default=generate_email_config_id)
+    organization_id = Column(String, ForeignKey("organizations.organization_id"), nullable=False)
+    mode = Column(String, nullable=False)
+    webhook_secret_hash = Column(String, nullable=True)
+    daily_inbound_cap = Column(Integer, nullable=False, default=500, server_default="500")
+    drop_flagged_spam = Column(Boolean, nullable=False, default=True, server_default=sqlalchemy.true())
+    created_at = Column(DateTime, default=datetime.datetime.utcnow, nullable=False)
+    modified_at = Column(
+        DateTime,
+        default=datetime.datetime.utcnow,
+        onupdate=datetime.datetime.utcnow,
+        nullable=False,
+    )
+    deleted_at = Column(DateTime, nullable=True)
+
+
+class OrganizationForwardingAddressModel(Base):
+    __tablename__ = "organization_forwarding_addresses"
+    __table_args__ = (
+        Index("ix_organization_forwarding_addresses_org", "organization_id"),
+        Index("ix_organization_forwarding_addresses_config", "email_config_id"),
+        Index(
+            "uq_organization_forwarding_addresses_email",
+            "email_address",
+            unique=True,
+            postgresql_where=text("status != 'revoked' AND deleted_at IS NULL"),
+            sqlite_where=text("status != 'revoked' AND deleted_at IS NULL"),
+        ),
+    )
+
+    forwarding_address_id = Column(String, primary_key=True, default=generate_forwarding_address_id)
+    organization_id = Column(String, ForeignKey("organizations.organization_id"), nullable=False)
+    email_config_id = Column(String, ForeignKey("organization_email_configs.email_config_id"), nullable=False)
+    email_address = Column(String, nullable=False)
+    org_slug = Column(String, nullable=False)
+    match_mode = Column(String, nullable=False, default="dedicated")
+    credential_id = Column(String, ForeignKey("credentials.credential_id", ondelete="SET NULL"), nullable=True)
+    sender_allowlist = Column(JSON().with_variant(ARRAY(Text()), "postgresql"), nullable=True)
+    status = Column(String, nullable=False, default="pending")
+    last_received_at = Column(DateTime, nullable=True)
+    created_at = Column(DateTime, default=datetime.datetime.utcnow, nullable=False)
+    modified_at = Column(
+        DateTime,
+        default=datetime.datetime.utcnow,
+        onupdate=datetime.datetime.utcnow,
+        nullable=False,
+    )
+    deleted_at = Column(DateTime, nullable=True)
+
+
+class OrganizationInboundEmailModel(Base):
+    __tablename__ = "organization_inbound_emails"
+    __table_args__ = (
+        Index("ix_organization_inbound_emails_address_created", "forwarding_address_id", "created_at"),
+        UniqueConstraint(
+            "organization_id",
+            "external_message_id",
+            name="uq_organization_inbound_emails_external_message",
+        ),
+    )
+
+    inbound_email_id = Column(String, primary_key=True, default=generate_inbound_email_id)
+    organization_id = Column(String, ForeignKey("organizations.organization_id"), nullable=False)
+    forwarding_address_id = Column(
+        String,
+        ForeignKey("organization_forwarding_addresses.forwarding_address_id"),
+        nullable=False,
+    )
+    external_message_id = Column(Text, nullable=True)
+    from_address = Column(Text, nullable=False)
+    original_recipient = Column(Text, nullable=True)
+    subject = Column(Text, nullable=False)
+    body_text = Column(Text, nullable=False)
+    links = Column(JSON, nullable=False, default=list)
+    category = Column(String, nullable=False)
+    verdicts = Column(JSON, nullable=True)
+    totp_code_id = Column(String, ForeignKey("totp_codes.totp_code_id", ondelete="SET NULL"), nullable=True)
+    created_at = Column(DateTime, default=datetime.datetime.utcnow, nullable=False)
 
 
 class ActionModel(Base):

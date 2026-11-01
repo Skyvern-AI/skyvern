@@ -10,6 +10,7 @@ from typing import TYPE_CHECKING, Any, Iterator, Sequence
 from urllib.parse import urljoin, urlsplit
 
 import structlog
+import tldextract
 from pydantic import BaseModel, Field, ValidationError
 
 if TYPE_CHECKING:
@@ -21,6 +22,7 @@ from skyvern.config import settings
 from skyvern.exceptions import (
     BlockedHost,
     FailedToGetTOTPVerificationCode,
+    InvalidUrl,
     NoTOTPVerificationCodeFound,
     SkyvernHTTPException,
     UnresolvableHost,
@@ -46,6 +48,7 @@ from skyvern.services.otp_email import EmailOTPVerificationContext
 from skyvern.utils.url_validators import (
     BLOCKED_HOST_ALLOWLIST_HINT,
     SAFE_REDIRECT_STATUS_CODES,
+    canonical_navigation_host,
     validate_fetch_url_with_resolved_ips,
 )
 
@@ -135,6 +138,7 @@ _CODE_SEPARATOR_PATTERN = re.compile(r"[\s\-]")
 _CODE_CANDIDATE_PATTERN = re.compile(
     r"(?<![A-Za-z0-9])\d{3,4}(?:[ \t]\d{3,4})+(?![A-Za-z0-9])|[A-Za-z0-9]+(?:-[A-Za-z0-9]+)*"
 )
+_DOMAIN_EXTRACT = tldextract.TLDExtract(suffix_list_urls=(), include_psl_private_domains=True)
 # HTML-to-text output can glue a code to the next word ("482913This"), which the tokenizer reads as one token.
 # Six digits minimum keeps a footer year glued to the company name ("2026Example") out of the candidates.
 _GLUED_DIGIT_RUN_PATTERN = re.compile(r"(?<![A-Za-z0-9])([0-9]{6,8})(?=[A-Z][a-z])")
@@ -266,6 +270,27 @@ def _verbatim_otp_value(content: str, otp_type: OTPType | None, llm_value: str |
     if len(scored) > 1 and scored[1][0] == scored[0][0]:
         return None
     return scored[0][1]
+
+
+def _registrable_url_domain(url: str) -> str | None:
+    try:
+        hostname = canonical_navigation_host(url)
+    except InvalidUrl:
+        return None
+    if not hostname:
+        return None
+    extracted = _DOMAIN_EXTRACT(hostname)
+    return extracted.top_domain_under_public_suffix or hostname.casefold()
+
+
+def _forwarded_magic_link_matches_task_site(otp_value: OTPValue, source: str | None, task_url: str | None) -> bool:
+    if source != "email_forwarding" or otp_value.get_otp_type() != OTPType.MAGIC_LINK:
+        return True
+    if task_url is None:
+        return False
+    link_domain = _registrable_url_domain(otp_value.value)
+    task_domain = _registrable_url_domain(task_url)
+    return link_domain is not None and task_domain is not None and link_domain == task_domain
 
 
 def looks_like_magic_link(content: str) -> bool:
@@ -965,6 +990,7 @@ async def resolve_otp_value(
             created_after=created_after or run_started_at,
             rejected_code_hash=rejected_code_hash,
             expected_otp_type=expected_otp_type,
+            task_url=task.url,
             max_wait_seconds=max_wait_seconds,
             poll_started_at=poll_started_at,
             multi_field_expected_digits=multi_field_expected_digits,
@@ -985,6 +1011,7 @@ async def poll_otp_value(
     totp_identifier: str | None = None,
     created_after: datetime | None = None,
     expected_otp_type: OTPType | None = None,
+    task_url: str | None = None,
     email_context: EmailOTPVerificationContext | None = None,
     raw_context: RawOTPVerificationContext | None = None,
     webhook_context: WebhookOTPVerificationContext | None = None,
@@ -1120,6 +1147,7 @@ async def poll_otp_value(
                     created_after=db_created_after,
                     expected_otp_type=expected_otp_type,
                     raw_context=raw_otp_context,
+                    task_url=task_url,
                     rejected_code_hash=rejected_code_hash,
                     multi_field_expected_digits=multi_field_expected_digits,
                     surface_magic_link=surface_magic_link,
@@ -1334,6 +1362,7 @@ async def _get_otp_value_from_db(
     created_after: datetime | None = None,
     expected_otp_type: OTPType | None = None,
     raw_context: RawOTPVerificationContext | None = None,
+    task_url: str | None = None,
     rejected_code_hash: str | None = None,
     multi_field_expected_digits: int | None = None,
     *,
@@ -1395,6 +1424,8 @@ async def _get_otp_value_from_db(
             if stored_otp_value is None:
                 continue
             if expected_otp_type is None or stored_otp_value.get_otp_type() == expected_otp_type:
+                if not _forwarded_magic_link_matches_task_site(stored_otp_value, parsed_row.source, task_url):
+                    continue
                 return stored_otp_value
             context.observed_otp_types.add(stored_otp_value.get_otp_type())
             if surfacing is not None and parsed_row.code in surfacing.spent_values:
@@ -1406,7 +1437,7 @@ async def _get_otp_value_from_db(
                 task_id=task_id,
                 workflow_run_id=workflow_run_id,
                 expected_otp_type=expected_otp_type,
-            ):
+            ) and _forwarded_magic_link_matches_task_site(stored_otp_value, parsed_row.source, task_url):
                 link_to_surface = stored_otp_value
                 # A bare link has no code in it to find, so the reparse below could only miss.
                 if not parsed_row.content or looks_like_magic_link(parsed_row.content):
@@ -1445,6 +1476,9 @@ async def _get_otp_value_from_db(
                 context.observed_otp_types.add(otp_value.get_otp_type())
             if link_to_surface is not None:
                 return link_to_surface
+            continue
+        if not _forwarded_magic_link_matches_task_site(otp_value, row.source, task_url):
+            context.misses.add(cache_key)
             continue
         otp_value = _exclude_rejected_otp(otp_value, rejected_code_hash, multi_field_expected_digits, task_id=task_id)
         if otp_value is None:
