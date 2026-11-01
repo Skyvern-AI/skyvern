@@ -798,7 +798,11 @@ class NaceDecisionClient:
         if self._client is None or self._client.is_closed:
             self._client = httpx.AsyncClient(
                 base_url=self.base_url,
-                headers={"Authorization": f"Bearer {self.api_key}", "User-Agent": "skyvern"},
+                headers={
+                    "Authorization": f"Bearer {self.api_key}",
+                    "User-Agent": "skyvern",
+                    "X-Nace-Client": _client_header(),
+                },
                 transport=self._transport,
                 timeout=NACE_MIN_TIMEOUT_SECONDS,
             )
@@ -849,6 +853,15 @@ class NaceDecisionClient:
                 f"System One reply is not an object: {str(payload)[:200]}",
             )
         return payload
+
+
+def _client_header() -> str:
+    """``skyvern/<version>``, naming this integration for Nace's usage attribution."""
+    # imported here: analytics pulls in the CLI and posthog, which the caller doesn't need to load
+    from skyvern.analytics import get_oss_version
+
+    version = re.sub(r"[^A-Za-z0-9 ._@+-]", "-", get_oss_version())
+    return f"skyvern/{version}"[:64]
 
 
 def _error_message(response: httpx.Response) -> str:

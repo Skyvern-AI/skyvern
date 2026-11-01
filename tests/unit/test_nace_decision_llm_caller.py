@@ -6,6 +6,7 @@ No test reaches the network: the client is exercised through ``httpx.MockTranspo
 from __future__ import annotations
 
 import json
+import re
 import subprocess
 import sys
 from types import SimpleNamespace
@@ -423,12 +424,14 @@ def _client(handler: Any) -> NaceDecisionClient:
 
 
 @pytest.mark.asyncio
-async def test_client_sends_the_system_one_body_and_bearer_token() -> None:
+async def test_client_sends_the_system_one_body_and_bearer_token(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr("skyvern.analytics.get_oss_version", lambda: "9.8.7+test")
     seen: dict[str, Any] = {}
 
     def handler(request: httpx.Request) -> httpx.Response:
         seen["url"] = str(request.url)
         seen["authorization"] = request.headers["Authorization"]
+        seen["client"] = request.headers["X-Nace-Client"]
         seen["body"] = json.loads(request.content)
         return httpx.Response(
             200,
@@ -446,6 +449,8 @@ async def test_client_sends_the_system_one_body_and_bearer_token() -> None:
     assert payload["answers"] == {}
     assert seen["url"] == "https://console.nace.ai/v1/systemone"
     assert seen["authorization"] == "Bearer test-key"
+    assert seen["client"] == "skyvern/9.8.7+test"  # the pip version, never "development"
+    assert re.fullmatch(r"skyvern/[A-Za-z0-9 ._@+-]+", seen["client"]) and len(seen["client"]) <= 64
     assert seen["body"] == {
         "model": "drex-max",
         "state": "state",
