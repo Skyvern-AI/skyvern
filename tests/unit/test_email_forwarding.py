@@ -8,16 +8,16 @@ from email import _header_value_parser
 from email.message import EmailMessage
 from pathlib import Path
 from types import SimpleNamespace
-from typing import Any
+from typing import Any, cast
 from unittest.mock import AsyncMock, MagicMock
 
 import httpx
 import pytest
 from fastapi import FastAPI
 from pydantic import ValidationError
-from sqlalchemy import func, select
+from sqlalchemy import Engine, func, insert, select
 from sqlalchemy.exc import IntegrityError
-from sqlalchemy.ext.asyncio import AsyncEngine
+from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession, async_sessionmaker, create_async_engine
 from starlette.requests import Request
 
 from skyvern.forge import request_logging
@@ -25,10 +25,13 @@ from skyvern.forge.agent import ForgeAgent
 from skyvern.forge.log_redaction import REDACTED
 from skyvern.forge.sdk.db.agent_db import AgentDB
 from skyvern.forge.sdk.db.models import (
+    Base,
+    CredentialFolderModel,
     CredentialModel,
     OrganizationEmailConfigModel,
     OrganizationForwardingAddressModel,
     OrganizationInboundEmailModel,
+    OrganizationModel,
     TOTPCodeModel,
 )
 from skyvern.forge.sdk.db.repositories import email_forwarding as email_forwarding_repository
@@ -1080,8 +1083,9 @@ async def test_unexpected_record_outcome_never_logs_processed(
 
 
 @pytest.mark.asyncio
-async def test_address_create_conflicts_then_allows_revoked_reregistration(
-    agent_db: AgentDB, monkeypatch: pytest.MonkeyPatch
+@pytest.mark.parametrize("reuse_method", ["re-register", "rotate"])
+async def test_address_create_conflicts_then_rejects_revoked_localpart_reuse(
+    reuse_method: str, agent_db: AgentDB, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     config = await agent_db.email_forwarding.create_config(
         "o_test", email_forwarding.hash_webhook_secret("secret"), 500, True
@@ -1099,26 +1103,32 @@ async def test_address_create_conflicts_then_allows_revoked_reregistration(
         assert duplicate.status_code == 409
         assert duplicate.json()["detail"] == "Forwarding address is already registered"
 
-        revoked = await client.delete(f"/v1/email-forwarding/addresses/{created.json()['forwarding_address_id']}")
-        assert revoked.status_code == 204
+        if reuse_method == "re-register":
+            assert (
+                await client.delete(f"/v1/email-forwarding/addresses/{created.json()['forwarding_address_id']}")
+            ).status_code == 204
+            response = await client.post("/v1/email-forwarding/addresses", json=payload)
+        else:
+            response = await client.post(
+                f"/v1/email-forwarding/addresses/{created.json()['forwarding_address_id']}/rotate",
+                json={"email_address": payload["email_address"]},
+            )
 
-        reregistered = await client.post("/v1/email-forwarding/addresses", json=payload)
-        assert reregistered.status_code == 201
-        assert reregistered.json()["forwarding_address_id"] != created.json()["forwarding_address_id"]
+        assert response.status_code == 409
 
-    # The revoked row must never shadow the live one: lookup routes to the
-    # re-registered (pending) address, and a revoked-only address is unregistered.
     found = await agent_db.email_forwarding.find_address(config.email_config_id, ["forward@inbound.example"])
-    assert found is not None
-    assert found.forwarding_address_id == reregistered.json()["forwarding_address_id"]
-    assert found.status == ForwardingAddressStatus.PENDING
+    if reuse_method == "re-register":
+        assert found is None
+    else:
+        assert found is not None
+        assert found.forwarding_address_id == created.json()["forwarding_address_id"]
+        assert found.status == ForwardingAddressStatus.PENDING
 
     second_live = await agent_db.email_forwarding.create_address(
         "o_test", config.email_config_id, "second@inbound.example", "test", "dedicated", None, None
     )
     preferred = await agent_db.email_forwarding.find_address(
-        config.email_config_id,
-        [second_live.email_address, reregistered.json()["email_address"]],
+        config.email_config_id, [second_live.email_address, "forward@inbound.example"]
     )
     assert preferred is not None
     assert preferred.forwarding_address_id == second_live.forwarding_address_id
@@ -1135,6 +1145,201 @@ async def test_address_create_conflicts_then_allows_revoked_reregistration(
     assert (
         await agent_db.email_forwarding.find_address(config.email_config_id, ["revoked-only@inbound.example"])
     ) is None
+
+
+@pytest.mark.asyncio
+async def test_address_rotation_rejects_previously_revoked_address(
+    agent_db: AgentDB, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    revoked_config = await agent_db.email_forwarding.create_config(
+        "o_other", email_forwarding.hash_webhook_secret("foreign-secret"), 500, True
+    )
+    revoked = await agent_db.email_forwarding.create_address(
+        "o_other", revoked_config.email_config_id, "revoked@inbound.example", "other", "dedicated", None, None
+    )
+    await agent_db.email_forwarding.set_address_status(
+        revoked.forwarding_address_id,
+        "o_other",
+        ForwardingAddressStatus.REVOKED,
+        allowed_current_statuses=(ForwardingAddressStatus.PENDING, ForwardingAddressStatus.ACTIVE),
+    )
+    current_config = await agent_db.email_forwarding.create_config(
+        "o_test", email_forwarding.hash_webhook_secret("secret"), 500, True
+    )
+    current = await agent_db.email_forwarding.create_address(
+        "o_test", current_config.email_config_id, "current@inbound.example", "test", "dedicated", None, None
+    )
+    transport = httpx.ASGITransport(app=_asgi_app(agent_db, monkeypatch))
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        response = await client.post(
+            f"/v1/email-forwarding/addresses/{current.forwarding_address_id}/rotate",
+            json={"email_address": "Revoked@Inbound.Example"},
+        )
+
+    assert response.status_code == 409
+    assert response.json()["detail"] == "Forwarding address is already registered"
+    with pytest.raises(email_forwarding_repository.ForwardingAddressAlreadyExists):
+        await agent_db.email_forwarding.create_address(
+            "o_test",
+            current_config.email_config_id,
+            "REVOKED@INBOUND.EXAMPLE",
+            "test",
+            "dedicated",
+            None,
+            None,
+        )
+    assert (await agent_db.email_forwarding.get_address(revoked.forwarding_address_id, "o_other")).status == (
+        ForwardingAddressStatus.REVOKED
+    )
+    assert (await agent_db.email_forwarding.get_address(current.forwarding_address_id, "o_test")).status == (
+        ForwardingAddressStatus.PENDING
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("candidate_operation", ["create", "rotate"])
+async def test_revocation_serializes_cross_config_alias_reuse_on_postgres(
+    candidate_operation: str,
+    postgres_scratch_database: Engine,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    tables = (
+        OrganizationModel.__table__,
+        CredentialFolderModel.__table__,
+        CredentialModel.__table__,
+        OrganizationEmailConfigModel.__table__,
+        OrganizationForwardingAddressModel.__table__,
+    )
+    with postgres_scratch_database.begin() as connection:
+        Base.metadata.create_all(connection, tables=list(tables))
+        connection.execute(insert(OrganizationModel).values(organization_id="o_test", organization_name="Test"))
+
+    database_string = postgres_scratch_database.url.set(drivername="postgresql+asyncpg").render_as_string(
+        hide_password=False
+    )
+    engine = create_async_engine(database_string)
+    revocation_paused = asyncio.Event()
+    resume_revocation = asyncio.Event()
+    candidate_lock_requested = asyncio.Event()
+    revocation_task: asyncio.Task[Any] | None = None
+    candidate_task: asyncio.Task[Any] | None = None
+
+    class CommitGatedSession(AsyncSession):
+        async def commit(self) -> None:
+            if asyncio.current_task() is revocation_task:
+                revocation_paused.set()
+                await resume_revocation.wait()
+            await super().commit()
+
+    database = AgentDB(database_string=database_string, db_engine=engine)
+    repository = database.email_forwarding
+    repository.Session = cast(Any, async_sessionmaker(engine, class_=CommitGatedSession))
+    config_a = await repository.create_config("o_test", email_forwarding.hash_webhook_secret("a"), 500, True)
+    config_b = await repository.create_config("o_test", email_forwarding.hash_webhook_secret("b"), 500, True)
+    retired = await repository.create_address(
+        "o_test", config_a.email_config_id, "race@inbound.example", "test", "dedicated", None, None
+    )
+    source = await repository.create_address(
+        "o_test", config_b.email_config_id, "source@inbound.example", "test", "dedicated", None, None
+    )
+    original_lock = email_forwarding_repository._lock_forwarding_address_emails
+
+    async def observe_candidate_lock(session: AsyncSession, *email_addresses: str) -> None:
+        if asyncio.current_task() is candidate_task and retired.email_address in email_addresses:
+            candidate_lock_requested.set()
+        await original_lock(session, *email_addresses)
+
+    monkeypatch.setattr(email_forwarding_repository, "_lock_forwarding_address_emails", observe_candidate_lock)
+
+    async def create_candidate() -> object:
+        if candidate_operation == "create":
+            return await repository.create_address(
+                "o_test", config_b.email_config_id, retired.email_address, "test", "dedicated", None, None
+            )
+        return await repository.rotate_address(source.forwarding_address_id, "o_test", retired.email_address)
+
+    try:
+        revocation_task = asyncio.create_task(
+            repository.set_address_status(
+                retired.forwarding_address_id,
+                "o_test",
+                ForwardingAddressStatus.REVOKED,
+                allowed_current_statuses=(
+                    ForwardingAddressStatus.PENDING,
+                    ForwardingAddressStatus.ACTIVE,
+                    ForwardingAddressStatus.DISABLED,
+                ),
+            )
+        )
+        await asyncio.wait_for(revocation_paused.wait(), timeout=10)
+        candidate_task = asyncio.create_task(create_candidate())
+        await asyncio.wait_for(candidate_lock_requested.wait(), timeout=10)
+        await asyncio.sleep(0.05)
+        assert not candidate_task.done()
+
+        resume_revocation.set()
+        assert await revocation_task is not None
+        with pytest.raises(email_forwarding_repository.ForwardingAddressAlreadyExists):
+            await candidate_task
+
+        current_retired = await repository.get_address(retired.forwarding_address_id, "o_test")
+        assert current_retired is not None and current_retired.status == ForwardingAddressStatus.REVOKED
+        if candidate_operation == "rotate":
+            current_source = await repository.get_address(source.forwarding_address_id, "o_test")
+            assert current_source is not None and current_source.status == ForwardingAddressStatus.PENDING
+    finally:
+        resume_revocation.set()
+        tasks = [task for task in (revocation_task, candidate_task) if task is not None]
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
+        await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_foreign_organization_ids_are_not_accessible_through_management_routes(
+    agent_db: AgentDB, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config = await agent_db.email_forwarding.create_config(
+        "o_other", email_forwarding.hash_webhook_secret("foreign-secret"), 500, True
+    )
+    address = await agent_db.email_forwarding.create_address(
+        "o_other", config.email_config_id, "foreign@inbound.example", "other", "dedicated", None, None
+    )
+    transport = httpx.ASGITransport(app=_asgi_app(agent_db, monkeypatch))
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        configs = await client.get("/v1/email-forwarding/configs")
+        addresses = await client.get("/v1/email-forwarding/addresses")
+        assert config.email_config_id not in {item["email_config_id"] for item in configs.json()}
+        assert address.forwarding_address_id not in {item["forwarding_address_id"] for item in addresses.json()}
+
+        assert (
+            await client.post(
+                f"/v1/email-forwarding/configs/{config.email_config_id}/rotate-secret",
+            )
+        ).status_code == 404
+        assert (await client.delete(f"/v1/email-forwarding/configs/{config.email_config_id}")).status_code == 404
+        assert (
+            await client.post(
+                "/v1/email-forwarding/addresses",
+                json={
+                    "email_config_id": config.email_config_id,
+                    "email_address": "attacker@inbound.example",
+                },
+            )
+        ).status_code == 404
+
+        address_path = f"/v1/email-forwarding/addresses/{address.forwarding_address_id}"
+        responses = [
+            await client.get(f"{address_path}/emails"),
+            await client.post(f"{address_path}/rotate", json={"email_address": "next@inbound.example"}),
+            await client.post(f"{address_path}/disable"),
+            await client.post(f"{address_path}/enable"),
+            await client.delete(address_path),
+        ]
+        assert [response.status_code for response in responses] == [404] * len(responses)
+
+    assert await agent_db.email_forwarding.get_config(config.email_config_id, "o_other") is not None
+    assert await agent_db.email_forwarding.get_address(address.forwarding_address_id, "o_other") is not None
 
 
 @pytest.mark.asyncio
@@ -1602,6 +1807,30 @@ async def test_provider_json_verdicts_are_bounded_in_storage_and_inbox_response(
         assert inbox.status_code == 200
         assert inbox.json()[0]["verdicts"] == stored[0].verdicts
         assert len(inbox.content) <= 2 * 1024
+
+
+@pytest.mark.asyncio
+async def test_service_ingest_keeps_only_known_verdict_keys(agent_db: AgentDB, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(email_forwarding.app, "DATABASE", agent_db)
+    config = await agent_db.email_forwarding.create_config(
+        "o_test", email_forwarding.hash_webhook_secret("secret"), 500, True
+    )
+    address = await agent_db.email_forwarding.create_address(
+        "o_test", config.email_config_id, "forward@inbound.example", "test", "dedicated", None, None
+    )
+    message = email_forwarding.NormalizedInboundEmail(
+        recipients=[address.email_address],
+        sender="security@bank.example",
+        subject="Sign-in code",
+        text="Verification code 123456",
+        html="",
+        external_message_id="direct-service-verdict-allowlist",
+        verdicts={"SpamVerdict": "pass", "UnknownInternalVerdict": "must-not-persist"},
+    )
+
+    assert await email_forwarding.ingest_inbound_email(config, message) == "otp"
+    stored = await agent_db.email_forwarding.list_inbound_emails(address.forwarding_address_id, "o_test", 10, 0)
+    assert stored[0].verdicts == {"spamverdict": "pass"}
 
 
 @pytest.mark.asyncio
