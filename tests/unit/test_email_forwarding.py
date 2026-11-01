@@ -1712,7 +1712,7 @@ def test_all_management_and_inbox_routes_use_credential_auth_dependency() -> Non
             getattr(parameter.default, "dependency", None)
             for parameter in inspect.signature(handler).parameters.values()
         }
-        assert org_auth_service.get_current_org_for_credential_routes in dependencies
+        assert email_routes.get_current_org_for_email_forwarding in dependencies
         assert org_auth_service.get_current_org not in dependencies
 
 
