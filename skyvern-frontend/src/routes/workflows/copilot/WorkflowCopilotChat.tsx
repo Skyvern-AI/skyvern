@@ -179,7 +179,10 @@ import {
 import { QueuedMessageStrip } from "./QueuedMessageStrip";
 import { ScreenshotThumbnail } from "./ScreenshotThumbnail";
 import { SteerReceipt } from "./SteerReceipt";
-import { useRunLifecycleAnnouncements } from "./useRunLifecycleAnnouncements";
+import {
+  useRunLifecycleAnnouncements,
+  type WatchedTurnRun,
+} from "./useRunLifecycleAnnouncements";
 import { useWorkflowRunQuery } from "../hooks/useWorkflowRunQuery";
 import { runIsLogicallyFinal } from "@/routes/workflows/workflowRun/runRetryState";
 import { useHistoryLoad } from "./useHistoryLoad";
@@ -254,7 +257,7 @@ import { computeFollowSignature, useStickToBottom } from "./useStickToBottom";
 import { useTurnActivityChange } from "./useTurnActivityChange";
 import { useSpeechToTextField } from "@/hooks/useSpeechToTextField";
 import { SpeechInputButton } from "@/components/SpeechInputButton";
-import { cn, formatElapsedSeconds } from "@/util/utils";
+import { cn, formatElapsedSeconds, parseServerStamp } from "@/util/utils";
 import { ControlTooltip } from "@/routes/workflows/studio/ControlTooltip";
 import {
   searchWithoutRun,
@@ -579,14 +582,6 @@ const STOP_UNCONFIRMED_NOTICE =
 // still be running. Saying "I sent the stop" here would claim something that did not happen.
 const STOP_NOT_SENT_NOTICE =
   "I couldn't send the stop. Reload to see what this turn recorded.";
-
-function parseServerStamp(createdAt: string): number {
-  const stamp = /(Z|[+-]\d{2}:?\d{2})$/.test(createdAt)
-    ? createdAt
-    : `${createdAt}Z`;
-  const parsed = Date.parse(stamp);
-  return Number.isFinite(parsed) ? parsed : NaN;
-}
 
 function findRecoveredRow(
   history: WorkflowCopilotChatHistoryMessage[],
@@ -2175,6 +2170,24 @@ export function WorkflowCopilotChat({
       owned.delete(oldest);
     }
   }, []);
+  const [watchedTurnRuns, setWatchedTurnRuns] = useState<WatchedTurnRun[]>([]);
+  const pendingTurnRunIds = useRef(new Set<string>());
+  const watchTurnRuns = useCallback(
+    (runs: WatchedTurnRun[], replace: boolean) => {
+      setWatchedTurnRuns((prev) => {
+        const byId = new Map(
+          replace ? [] : prev.map((run) => [run.runId, run] as const),
+        );
+        for (const run of runs) {
+          if (run.restored && byId.has(run.runId)) continue;
+          byId.delete(run.runId);
+          byId.set(run.runId, run);
+        }
+        return [...byId.values()].slice(-MAX_TURN_SNAPSHOTS);
+      });
+    },
+    [],
+  );
   // The run this turn pointed the studio's Browser pane at; written once per
   // run and kept after it finishes so the pane can show that run's replay.
   const focusedTurnRunId = useRef<string | null>(null);
@@ -2185,7 +2198,7 @@ export function WorkflowCopilotChat({
   const lastFollowedLabelRef = useRef<string | null>(null);
   // Focusing the turn's run is the copilot acting for the user, not a
   // navigation they asked for, so it must not add a Back step.
-  const { resolveLivePanes } = useStudioPanes();
+  const { openPane, setOpenPanes, resolveLivePanes } = useStudioPanes();
   const { reopenEditor } = useStudioPaneDefaults();
   const switchStudioRun = useSwitchStudioRun({
     replace: true,
@@ -2369,6 +2382,7 @@ export function WorkflowCopilotChat({
     // lag that matters for the double-submit guard above doesn't matter here.
     turnInFlight: isLoading,
     turnOwnedRunIds,
+    watchedTurnRuns,
     announce: announceRunLifecycle,
   });
   // Recorded actions stream into the run timeline as the test run executes.
@@ -3158,6 +3172,8 @@ export function WorkflowCopilotChat({
     setAcceptReceiptAnchor(null);
     setNarrative(EMPTY_NARRATIVE);
     turnSnapshots.current.clear();
+    setWatchedTurnRuns([]);
+    pendingTurnRunIds.current.clear();
     pendingSubmitSnapshot.current = null;
     latestTurnId.current = null;
     connectedAccountChoiceLatch.current = null;
@@ -3232,12 +3248,23 @@ export function WorkflowCopilotChat({
           })(),
         }),
       );
-      // A rehydrated turn still owns the run its records name, so the
-      // lifecycle hook keeps announcing nothing about it after a reload.
+      // A rehydrated turn still owns the run its records name, so the focused-run
+      // path stays silent about it; only a run that ends after this load is announced.
+      const restoredRuns: WatchedTurnRun[] = [];
       for (const message of historyMessages) {
         const rehydratedRunId = message.narrative?.turnFacts?.runId;
-        if (rehydratedRunId) rememberTurnOwnedRun(rehydratedRunId);
+        if (!rehydratedRunId) continue;
+        rememberTurnOwnedRun(rehydratedRunId);
+        if (message.sender === "ai" && message.timestamp) {
+          restoredRuns.push({
+            runId: rehydratedRunId,
+            ownerCreatedAt: message.timestamp,
+            restored: true,
+          });
+        }
       }
+      if (!sameHydratedChat) pendingTurnRunIds.current.clear();
+      watchTurnRuns(restoredRuns, !sameHydratedChat);
       latestTurnId.current = restoredPendingProposalTurnId;
       // History never carries run_lifecycle lines (local-only); carry them
       // forward only for the mount-race caller, not an explicit chat switch.
@@ -3330,6 +3357,7 @@ export function WorkflowCopilotChat({
     },
     [
       rememberTurnOwnedRun,
+      watchTurnRuns,
       rememberRecoveryCancelTokens,
       setPendingProposalMetadata,
       workflowPermanentId,
@@ -6547,6 +6575,17 @@ export function WorkflowCopilotChat({
   });
   const demonstrationUnavailable = demonstrationRecorder.unavailable;
   const isDemonstrating = demonstrationRecorder.phase !== "idle";
+  // Busy without an id is the gap before recording starts. Done's send keeps the
+  // id until Copilot's turn ends, and Editor should be back for that build.
+  const demonstrationActive =
+    isDemonstrating ||
+    (demonstrationRecorder.busy && !demonstrationRecorder.demonstrationId);
+  const editorHiddenForDemonstrationRef = useRef(false);
+  useEffect(() => {
+    if (demonstrationActive || !editorHiddenForDemonstrationRef.current) return;
+    editorHiddenForDemonstrationRef.current = false;
+    reopenEditor();
+  }, [demonstrationActive, reopenEditor]);
   useEffect(() => {
     if (
       !isDemonstrating ||
@@ -8140,6 +8179,21 @@ export function WorkflowCopilotChat({
           setLivePauseFrame(null);
           setLivePauseFrameHistory([]);
           setWorkflowCopilotChatId(response.workflow_copilot_chat_id);
+          // A run left paused can end the turn with no run_outcome frame.
+          const narratedRunId = responseNarrative?.turnFacts?.runId;
+          if (narratedRunId) {
+            rememberTurnOwnedRun(narratedRunId);
+            pendingTurnRunIds.current.add(narratedRunId);
+          }
+          watchTurnRuns(
+            [...pendingTurnRunIds.current].map((runId) => ({
+              runId,
+              ownerCreatedAt: response.response_time,
+              restored: false,
+            })),
+            false,
+          );
+          pendingTurnRunIds.current.clear();
           setQuestionCancelToken(null);
           if (response.work_plan) {
             setWorkPlan(response.work_plan);
@@ -8575,6 +8629,7 @@ export function WorkflowCopilotChat({
                 applyStoredNarrativeEvent(payload);
                 if (payload.workflow_run_id) {
                   rememberTurnOwnedRun(payload.workflow_run_id);
+                  pendingTurnRunIds.current.add(payload.workflow_run_id);
                   if (payload.verdict === "evaluating") {
                     // Fallback start against an old backend whose block_progress
                     // carried no run id: this is the first sighting.
@@ -8635,6 +8690,7 @@ export function WorkflowCopilotChat({
                 // A new turn can't carry the prior turn's dead resume_token.
                 setLivePauseFrame(null);
                 setLivePauseFrameHistory([]);
+                pendingTurnRunIds.current.clear();
                 turnChatIdRef.current =
                   payload.workflow_copilot_chat_id ??
                   workflowCopilotChatIdRef.current;
@@ -8924,6 +8980,7 @@ export function WorkflowCopilotChat({
       logging,
       pendingProposalTurnId,
       rememberTurnOwnedRun,
+      watchTurnRuns,
       startRecordedActionsPoll,
       stopAllRecordedActionsPolls,
       requiresLiveBrowser,
@@ -8950,6 +9007,10 @@ export function WorkflowCopilotChat({
     void handleSend(TEST_END_TO_END_PROMPT);
   }, [handleSend]);
 
+  // A ref, because openPane's identity moves with the URL: as a dependency it
+  // would re-register the launcher on every navigation.
+  const panesRef = useRef({ openPane, setOpenPanes, resolveLivePanes });
+  panesRef.current = { openPane, setOpenPanes, resolveLivePanes };
   const handleStartDemonstration = useCallback(
     ({
       insertion,
@@ -8973,6 +9034,19 @@ export function WorkflowCopilotChat({
         return;
       }
       void stopSpeech();
+      // The Edit layout leaves the Browser pane closed, so a demonstration would
+      // otherwise record into a browser the user cannot see or drive. Editor
+      // steps aside for the browser and returns when the recording ends.
+      // Copilot holds Done and Discard, so it opens too.
+      const panes = panesRef.current;
+      panes.openPane("browser");
+      if (!panes.resolveLivePanes().includes("copilot"))
+        panes.openPane("copilot");
+      const live = panes.resolveLivePanes();
+      if (live.includes("editor")) {
+        editorHiddenForDemonstrationRef.current = true;
+        panes.setOpenPanes(live.filter((id) => id !== "editor"));
+      }
       const messageId = `demonstration-${crypto.randomUUID()}`;
       demonstrationMessageIdRef.current = messageId;
       // Shown at start so the chat reads as the user's turn; Done replaces it with the sent message.

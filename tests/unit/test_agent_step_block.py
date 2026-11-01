@@ -231,7 +231,7 @@ async def _run_agent_block(
     model: _ScriptedModel | None,
     max_turns: int = 25,
     prompt: str = "Find the answer.",
-    tools: list[str] | None = None,
+    tools: list[str] | None = sorted(agent_step_tools.tool_descriptions()),
     **block_fields: bool,
 ) -> tuple[BlockResult, _FlagProvider]:
     """With no model, the block resolves the variant's real model, which sends through litellm.acompletion."""
@@ -440,15 +440,20 @@ def _credential_parameter() -> WorkflowParameter:
 @pytest.mark.parametrize(
     ("tools", "credential", "offered", "block_types"),
     [
-        (["http_request", "web_search"], False, ["web_search", "run_block", "finish"], ["http_request"]),
-        (None, False, ALL_TOOLS, list(agent_step_tools.RUN_BLOCK_TYPES)),
-        (["web_search"], False, ["web_search", "finish"], None),
-        (["login", "page_goto"], False, ["page_goto", "finish"], None),
-        (["login", "page_goto"], True, ["login", "page_goto", "finish"], None),
-        (["finish"], False, ["finish"], None),
+        (
+            ["http_request", "web_search"],
+            False,
+            ["web_search", "run_block", "read_run_data", "finish"],
+            ["http_request"],
+        ),
+        (None, False, ["read_run_data", "finish"], None),
+        ([], False, ["read_run_data", "finish"], None),
+        (["web_search"], False, ["web_search", "read_run_data", "finish"], None),
+        (["login", "page_goto"], False, ["read_run_data", "page_goto", "finish"], None),
+        (["login", "page_goto"], True, ["login", "read_run_data", "page_goto", "finish"], None),
     ],
 )
-async def test_a_step_is_offered_only_the_tools_it_lists_and_finish(
+async def test_a_step_is_offered_only_the_tools_it_lists_with_finish_and_read_run_data(
     monkeypatch: pytest.MonkeyPatch,
     database: AgentDB,
     tools: list[str] | None,
@@ -503,13 +508,6 @@ def test_a_tool_the_step_cannot_be_given_fails_at_save_and_the_error_lists_the_v
     message = str(error.value)
     assert f"Unknown tools [{name!r}]" in message
     assert ", ".join(sorted(agent_step_tools.tool_descriptions())) in message
-
-
-def test_an_empty_tools_list_fails_at_save_because_no_list_means_every_tool() -> None:
-    with pytest.raises(ValidationError, match="at least 1 item"):
-        AgentStepBlockYAML(label="agent", prompt="Find the answer.", tools=[])
-
-    assert AgentStepBlockYAML(label="agent", prompt="Find the answer.").tools is None
 
 
 def test_a_tools_list_validates_without_openai_agents() -> None:
@@ -898,22 +896,6 @@ async def test_a_cut_child_result_names_the_read_run_data_call_that_continues_it
     assert "*****" in second[:20_000]
     assert f'read_run_data(name="{label}", offset=40000)' in second[20_000:]
     assert SECRET not in json.dumps(model.inputs, default=str)
-
-
-@pytest.mark.asyncio
-async def test_a_step_without_read_run_data_sees_only_the_size_of_a_cut_child_result(
-    monkeypatch: pytest.MonkeyPatch, database: AgentDB
-) -> None:
-    monkeypatch.setitem(LLMConfigRegistry._configs, LUNA_MEDIUM, _pinned("medium"))
-    report_text = _big_child_output(monkeypatch)
-    model = _ScriptedModel([TEXT_PROMPT_CHILD, VALID_FINISH])
-
-    await _run_agent_block(monkeypatch, LUNA_MEDIUM, model, tools=["text_prompt"])
-
-    (first,) = tool_outputs_for(model.inputs[1][1], "child")
-    assert first.startswith(report_text[:20_000])
-    assert str(_CHILD_RESULT_CHARS) in first[20_000:]
-    assert "read_run_data(" not in first
 
 
 @pytest.mark.asyncio

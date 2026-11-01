@@ -111,6 +111,7 @@ async def _replay_events(
     current_frame_path: tuple[tuple[str, str], ...] | None = None
     sensitive_count = 0
     credential_fill_count = 0
+    failed_call_count = 0
 
     def next_call_id() -> str:
         nonlocal call_counter
@@ -123,10 +124,13 @@ async def _replay_events(
         model_args: dict[str, Any],
         output: CallToolResult | dict[str, Any],
     ) -> None:
+        nonlocal failed_call_count
         call_id = next_call_id()
         parsed = parse_tool_output(output.content if isinstance(output, CallToolResult) else output)
         if isinstance(output, CallToolResult) and output.isError and parsed.get("ok") is not False:
             parsed = {**parsed, "ok": False}
+        if parsed.get("ok") is False:
+            failed_call_count += 1
         safe_output = scrub_secrets_from_structure(ctx, sanitize_tool_result_for_llm(alias, parsed))
         output_text = _call_tool_result_text(output) or json.dumps(safe_output, separators=(",", ":"))
         history.extend(
@@ -280,6 +284,7 @@ async def _replay_events(
         action_count=action_count,
         sensitive_count=sensitive_count,
         credential_fill_count=credential_fill_count,
+        failed_call_count=failed_call_count,
         screen_detected_count=detected_count,
         screen_withheld_count=withheld_count,
         screen_unavailable_count=unavailable_count,

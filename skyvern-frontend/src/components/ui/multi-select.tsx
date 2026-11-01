@@ -69,9 +69,6 @@ interface MultiSelectProps
     description?: string;
   }[];
 
-  /** Shown in place of the badges when every option is selected. */
-  allSelectedLabel?: string;
-
   /**
    * Callback function triggered when the selected values change.
    * Receives an array of the new selected values.
@@ -117,7 +114,6 @@ export const MultiSelect = React.forwardRef<
       onValueChange,
       variant,
       value,
-      allSelectedLabel,
       placeholder = "Select options",
       maxCount = 3,
       modalPopover = false,
@@ -127,10 +123,6 @@ export const MultiSelect = React.forwardRef<
     ref,
   ) => {
     const [isPopoverOpen, setIsPopoverOpen] = React.useState(false);
-    const showAllSelectedLabel =
-      allSelectedLabel !== undefined &&
-      options.length > 0 &&
-      value.length === options.length;
 
     const handleInputKeyDown = (
       event: React.KeyboardEvent<HTMLInputElement>,
@@ -189,7 +181,7 @@ export const MultiSelect = React.forwardRef<
               className,
             )}
           >
-            {value.length > 0 && !showAllSelectedLabel ? (
+            {value.length > 0 ? (
               <div className="flex w-full items-center justify-between">
                 <div className="flex flex-wrap items-center">
                   {value.slice(0, maxCount).map((value) => {
@@ -249,15 +241,8 @@ export const MultiSelect = React.forwardRef<
               </div>
             ) : (
               <div className="mx-auto flex w-full items-center justify-between">
-                <span
-                  className={cn(
-                    "mx-2 text-xs font-normal",
-                    showAllSelectedLabel
-                      ? "text-foreground"
-                      : "text-muted-foreground",
-                  )}
-                >
-                  {showAllSelectedLabel ? allSelectedLabel : placeholder}
+                <span className="mx-2 text-xs font-normal text-muted-foreground">
+                  {placeholder}
                 </span>
                 <ChevronDownIcon className="mx-2 h-4 cursor-pointer text-muted-foreground" />
               </div>

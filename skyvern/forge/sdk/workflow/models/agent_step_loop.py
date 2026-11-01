@@ -68,6 +68,7 @@ from skyvern.forge.sdk.workflow.models.parameter import (
     is_sensitive_workflow_parameter,
 )
 from skyvern.forge.sdk.workflow.workflow_definition_converter import block_yaml_to_block
+from skyvern.schemas.agent_step_tool_names import ALWAYS_OFFERED_TOOLS
 from skyvern.schemas.run_enums import RunEngine
 from skyvern.schemas.workflows import BlockResult, BlockStatus, BlockType
 from skyvern.utils.secret_redaction import redact_secrets_from_text
@@ -108,7 +109,6 @@ class _RunState:
     run_context: WorkflowRunContext
     credential_keys: list[str]
     ignore_workflow_system_prompt: bool
-    # None offers every tool.
     tools: list[str] | None = None
     calls: list[dict[str, Any]] = field(default_factory=list)
     # The report each child block returned, by label, so read_run_data can page the text the model was shown.
@@ -533,7 +533,7 @@ if {name for name, *_ in _RUN_TOOLS} != set(RUN_TOOL_DESCRIPTIONS):
 
 
 def _offers(state: _RunState, name: str) -> bool:
-    return state.tools is None or name in state.tools
+    return name in ALWAYS_OFFERED_TOOLS or name in (state.tools or ())
 
 
 def _tools(state: _RunState) -> list[FunctionTool]:
@@ -598,7 +598,7 @@ async def _run_child_block(
         report = await _execute_child(child, written, state)
     _record_call(state, written, tool=tool_name, block_type=block_type.value, label=label, status=report["status"])
     state.results[label] = report
-    return _window(_masked_text(report, state.run_context), 0, label if _offers(state, "read_run_data") else None)
+    return _window(_masked_text(report, state.run_context), 0, label)
 
 
 async def _execute_child(child: Block, written: dict[str, Any], state: _RunState) -> dict[str, Any]:
