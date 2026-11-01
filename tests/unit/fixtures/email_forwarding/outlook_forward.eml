@@ -1,0 +1,8 @@
+From: alerts@service.example
+To: forward@inbound.example
+X-Original-To: employee@customer.example
+Subject: Security code
+X-Skyvern-External-Message-ID: outlook-transport-1
+Content-Type: text/plain; charset="utf-8"
+
+Use security code 667788 to finish signing in.

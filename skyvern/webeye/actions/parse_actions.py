@@ -1088,6 +1088,7 @@ async def generate_cua_fallback_actions(
                     totp_verification_url=task.totp_verification_url,
                     totp_identifier=task.totp_identifier,
                     expected_otp_type=OTPType.MAGIC_LINK,
+                    task_url=task.url,
                 )
                 if not otp_value or otp_value.get_otp_type() != OTPType.MAGIC_LINK:
                     raise NoTOTPVerificationCodeFound()

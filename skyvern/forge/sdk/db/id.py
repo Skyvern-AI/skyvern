@@ -49,6 +49,9 @@ BROWSER_RECORDING_PREFIX = "br"
 GMAIL_SEND_DISPATCH_PREFIX = "gsd"
 GOOGLE_OAUTH_CREDENTIAL_PREFIX = "goac"
 MICROSOFT_OAUTH_CREDENTIAL_PREFIX = "moac"
+EMAIL_CONFIG_PREFIX = "emc"
+FORWARDING_ADDRESS_PREFIX = "fea"
+INBOUND_EMAIL_PREFIX = "ibe"
 ORGANIZATION_BITWARDEN_COLLECTION_PREFIX = "obc"
 TASK_V2_ID = "tsk_v2"
 THOUGHT_ID = "ot"
@@ -213,6 +216,21 @@ def generate_ai_suggestion_id() -> str:
 def generate_totp_code_id() -> str:
     int_id = generate_id()
     return f"{TOTP_CODE_PREFIX}_{int_id}"
+
+
+def generate_email_config_id() -> str:
+    int_id = generate_id()
+    return f"{EMAIL_CONFIG_PREFIX}_{int_id}"
+
+
+def generate_forwarding_address_id() -> str:
+    int_id = generate_id()
+    return f"{FORWARDING_ADDRESS_PREFIX}_{int_id}"
+
+
+def generate_inbound_email_id() -> str:
+    int_id = generate_id()
+    return f"{INBOUND_EMAIL_PREFIX}_{int_id}"
 
 
 def generate_sms_config_id() -> str:

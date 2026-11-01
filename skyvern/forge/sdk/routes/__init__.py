@@ -9,6 +9,7 @@ from skyvern.forge.sdk.routes import browser_sessions  # noqa: F401
 from skyvern.forge.sdk.routes import credentials  # noqa: F401
 from skyvern.forge.sdk.routes import custom_llms  # noqa: F401
 from skyvern.forge.sdk.routes import debug_sessions  # noqa: F401
+from skyvern.forge.sdk.routes import email_forwarding  # noqa: F401
 from skyvern.forge.sdk.routes import feedback  # noqa: F401
 from skyvern.forge.sdk.routes import integrations  # noqa: F401
 from skyvern.forge.sdk.routes import prompts  # noqa: F401

@@ -4109,6 +4109,7 @@ async def test_external_rejection_does_not_fetch_a_code_pushed_before_the_decisi
                 totp_code_id=f"row-{created_at.isoformat()}",
                 code=code,
                 otp_type=OTPType.TOTP,
+                source=None,
                 expired_at=None,
                 task_id=None,
                 workflow_run_id=None,

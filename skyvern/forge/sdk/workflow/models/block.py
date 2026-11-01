@@ -6040,6 +6040,7 @@ async def _poll_code_block_otp(
     budget_seconds: int,
     subject: str,
     expected_otp_type: OTPType,
+    task_url: str | None = None,
 ) -> otp_service.OTPValue:
     if not organization_id:
         raise CodeBlockOTPError("OTP is unavailable: no organization is associated with this code block.")
@@ -6074,6 +6075,7 @@ async def _poll_code_block_otp(
                 expected_otp_type=expected_otp_type,
                 email_context=email_context,
                 raw_context=raw_context,
+                task_url=task_url,
             ),
             timeout=budget_seconds,
         )
@@ -6143,6 +6145,7 @@ async def _resolve_code_block_magic_link(
     workflow_run_id: str | None,
     *,
     budget_seconds: int,
+    task_url: str | None = None,
 ) -> str:
     """Resolve a fresh sign-in link for one credential, for the caller to navigate to.
 
@@ -6169,6 +6172,7 @@ async def _resolve_code_block_magic_link(
         budget_seconds=budget_seconds,
         subject="this credential",
         expected_otp_type=OTPType.MAGIC_LINK,
+        task_url=task_url,
     )
     return polled.value
 
@@ -6245,6 +6249,7 @@ def _bind_code_block_magic_link(
             organization_id,
             workflow_run_id,
             budget_seconds=settings.CODE_BLOCK_OTP_POLL_TIMEOUT_SECONDS,
+            task_url=page.url,
         )
         await navigate_with_retry(
             navigate=lambda strategy: page.goto(link, timeout=settings.BROWSER_LOADING_TIMEOUT_MS, wait_until=strategy),
