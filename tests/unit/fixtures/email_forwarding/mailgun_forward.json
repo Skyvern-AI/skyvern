@@ -1,0 +1,8 @@
+{
+  "sender": "forwarder@relay.example",
+  "from": "Security <security@bank.example>",
+  "recipient": "forward@inbound.example",
+  "subject": "Sign-in code",
+  "body-plain": "Verification code 731204",
+  "message-headers": "[[\"From\", \"Security <security@bank.example>\"], [\"Delivered-To\", \"employee@account.example\"], [\"Message-Id\", \"<mailgun-forward-1@bank.example>\"]]"
+}

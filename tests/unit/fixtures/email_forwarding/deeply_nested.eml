@@ -1,0 +1,55 @@
+From: alerts@example.com
+To: forward@inbound.example
+Subject: Deeply nested message
+MIME-Version: 1.0
+Content-Type: multipart/mixed; boundary="b0"
+
+--b0
+Content-Type: text/plain; charset=utf-8
+
+Shallow content retained.
+--b0
+Content-Type: multipart/mixed; boundary="b1"
+
+--b1
+Content-Type: multipart/mixed; boundary="b2"
+
+--b2
+Content-Type: multipart/mixed; boundary="b3"
+
+--b3
+Content-Type: multipart/mixed; boundary="b4"
+
+--b4
+Content-Type: multipart/mixed; boundary="b5"
+
+--b5
+Content-Type: multipart/mixed; boundary="b6"
+
+--b6
+Content-Type: multipart/mixed; boundary="b7"
+
+--b7
+Content-Type: multipart/mixed; boundary="b8"
+
+--b8
+Content-Type: multipart/mixed; boundary="b9"
+
+--b9
+Content-Type: multipart/mixed; boundary="b10"
+
+--b10
+Content-Type: text/plain; charset=utf-8
+
+Deep content 999999 must be ignored.
+--b10--
+--b9--
+--b8--
+--b7--
+--b6--
+--b5--
+--b4--
+--b3--
+--b2--
+--b1--
+--b0--

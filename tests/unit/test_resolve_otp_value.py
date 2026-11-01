@@ -26,6 +26,7 @@ def _make_task(
     totp_verification_url: str | None = None,
     totp_identifier: str | None = None,
     navigation_payload: object = None,
+    url: str | None = "https://app.example.com/login",
 ) -> SimpleNamespace:
     return SimpleNamespace(
         task_id=task_id,
@@ -34,6 +35,7 @@ def _make_task(
         totp_verification_url=totp_verification_url,
         totp_identifier=totp_identifier,
         navigation_payload=navigation_payload,
+        url=url,
     )
 
 
@@ -128,6 +130,7 @@ async def test_falls_through_to_poll_when_no_payload_or_credential(monkeypatch: 
     assert kwargs["task_id"] == "tsk_test"
     assert kwargs["workflow_id"] == "w_test"
     assert kwargs["workflow_run_id"] == "wr_test"
+    assert kwargs["task_url"] == "https://app.example.com/login"
     assert kwargs["workflow_permanent_id"] == "wpid_test"
     assert kwargs["totp_verification_url"] == "https://example.com/webhook"
     assert kwargs["totp_identifier"] == "user@example.com"
