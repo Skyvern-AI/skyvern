@@ -125,11 +125,14 @@ from skyvern.forge.sdk.api.files import (
     resolve_run_download_id,
     wait_for_download_finished,
 )
+from skyvern.forge.sdk.api.llm.api_handler import LLMAPIHandler
 from skyvern.forge.sdk.api.llm.api_handler_factory import (
     LLMAPIHandlerFactory,
     LLMCallerManager,
+    get_decision_llm_api_handler,
     get_org_aware_primary_llm_api_handler,
     get_org_aware_secondary_llm_api_handler,
+    with_explicit_llm_override,
 )
 from skyvern.forge.sdk.api.llm.exceptions import BaseLLMError, LLMProviderError
 from skyvern.forge.sdk.api.llm.schema_validator import extraction_shape_matches, validate_and_fill_extraction_result
@@ -8212,10 +8215,9 @@ async def handle_sequential_click_for_dropdown(
 
     prompt = await _build_after_click_verify_prompt(task, scraped_page_after_open, new_element_ids, action_history_str)
     distinct_id_for_override = task.workflow_run_id if task.workflow_run_id else task.task_id
-    check_user_goal_handler = await resolve_check_user_goal_handler(
+    check_user_goal_handler = await _after_click_check_user_goal_handler(
+        task,
         distinct_id_for_override,
-        task.organization_id,
-        get_org_aware_secondary_llm_api_handler(default=app.CHECK_USER_GOAL_LLM_API_HANDLER),
     )
     response = await check_user_goal_handler(
         prompt=prompt,
@@ -13057,6 +13059,36 @@ async def chain_click(
                         r.followup_message = UPLOAD_PENDING_FOLLOWUP_MESSAGE
 
 
+def _auto_completion_llm_handler(task: Task) -> LLMAPIHandler:
+    """The handler for auto-completion-choose-option.
+
+    Precedence: run override, organization default, Nace opt-in, platform default.
+    """
+    return with_explicit_llm_override(
+        task.llm_key,
+        get_org_aware_secondary_llm_api_handler(
+            default=get_decision_llm_api_handler(app.AUTO_COMPLETION_LLM_API_HANDLER)
+        ),
+    )
+
+
+async def _after_click_check_user_goal_handler(
+    task: Task,
+    distinct_id_for_override: str,
+) -> LLMAPIHandler:
+    """The handler for check-user-goal-after-click, with the same precedence."""
+    return with_explicit_llm_override(
+        task.llm_key,
+        await resolve_check_user_goal_handler(
+            distinct_id_for_override,
+            task.organization_id,
+            get_org_aware_secondary_llm_api_handler(
+                default=get_decision_llm_api_handler(app.CHECK_USER_GOAL_LLM_API_HANDLER)
+            ),
+        ),
+    )
+
+
 @traced(name="skyvern.agent.dropdown.auto_completion")
 async def choose_auto_completion_dropdown(
     context: InputOrSelectContext,
@@ -13339,7 +13371,7 @@ async def choose_auto_completion_dropdown(
             slim_output=slim_output,
         )
         LOG.info("Confirm if it's an auto completion dropdown", sampling=True)
-        json_response = await get_org_aware_secondary_llm_api_handler(default=app.AUTO_COMPLETION_LLM_API_HANDLER)(
+        json_response = await _auto_completion_llm_handler(task)(
             prompt=auto_completion_confirm_prompt, step=step, prompt_name="auto-completion-choose-option"
         )
         element_id = json_response.get("id", "")
@@ -13836,7 +13868,7 @@ async def discover_and_select_from_full_dropdown(
             element_id=skyvern_element.get_id(),
             original_text=original_text,
         )
-        json_response = await get_org_aware_secondary_llm_api_handler(default=app.AUTO_COMPLETION_LLM_API_HANDLER)(
+        json_response = await _auto_completion_llm_handler(task)(
             prompt=prompt, step=step, prompt_name="auto-completion-choose-option"
         )
 
