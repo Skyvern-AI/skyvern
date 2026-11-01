@@ -26,6 +26,7 @@ from skyvern.constants import SCRUBBED_VALUE
 from skyvern.forge import app
 from skyvern.forge.sdk.copilot.block_goal_wrapping import wrap_workflow_block_goals
 from skyvern.forge.sdk.copilot.build_test_outcome import RecordedBuildTestOutcome
+from skyvern.forge.sdk.copilot.code_block_steps import bind_referenced_parameters_in_yaml
 from skyvern.forge.sdk.copilot.code_block_synthesis import code_contains_credential_fill
 from skyvern.forge.sdk.copilot.context import CopilotContext
 from skyvern.forge.sdk.copilot.failure_tracking import (
@@ -40,6 +41,7 @@ from skyvern.forge.sdk.copilot.frontier_provenance_dump import (
     trust_snapshot,
     write_packet,
 )
+from skyvern.forge.sdk.copilot.output_contracts import declared_workflow_parameter_keys
 from skyvern.forge.sdk.copilot.output_utils import INTERNAL_VALIDATION_FAILURE_PREFIX
 from skyvern.forge.sdk.copilot.repair_origin_run import (
     OriginBlockOutput,
@@ -62,6 +64,7 @@ from skyvern.forge.sdk.copilot.runtime import (
     resolve_browser_state_for_context,
 )
 from skyvern.forge.sdk.copilot.turn_origin import TurnOrigin
+from skyvern.forge.sdk.copilot.workflow_block_traversal import workflow_block_locations
 from skyvern.forge.sdk.copilot.workflow_yaml import _process_workflow_yaml, copilot_round_trip_definition
 from skyvern.forge.sdk.workflow.block_notes import definition_step_notes
 from skyvern.forge.sdk.workflow.models.block import BlockTypeVar, ForLoopBlock, get_all_blocks
@@ -74,6 +77,7 @@ from skyvern.forge.sdk.workflow.models.parameter import (
 )
 from skyvern.forge.sdk.workflow.models.workflow import Workflow, WorkflowDefinition
 from skyvern.schemas.workflows import BlockStatus, BlockType
+from skyvern.utils.yaml_loader import safe_load_no_dates
 
 from ._shared import (
     _block_type_name,
@@ -1756,6 +1760,42 @@ def _workflow_prompt_input_keys(definition: WorkflowDefinition) -> set[str]:
     input_keys = {parameter.key for parameter in definition.parameters if isinstance(parameter, WorkflowParameter)}
     roots = _jinja_roots(definition.workflow_system_prompt) if definition.workflow_system_prompt else set()
     return {key for root in roots if (key := _root_parameter_key(root, input_keys)) is not None}
+
+
+def _keys_named_in(serialized: str, keys: set[str]) -> set[str]:
+    named = keys & set(_jinja_string_leaves(serialized))
+    named.update(key for root in _jinja_roots(serialized) if (key := _root_parameter_key(root, keys)) is not None)
+    return named
+
+
+def _deleted_block_input_keys(label: str, stored_yaml: str) -> set[str]:
+    scan = safe_load_no_dates(bind_referenced_parameters_in_yaml(stored_yaml))
+    if not isinstance(scan, dict):
+        return set()
+    declared = declared_workflow_parameter_keys(scan)
+    block = next((loc.block for loc in workflow_block_locations(scan) if loc.block.get("label") == label), None)
+    if block is None or not declared:
+        return set()
+    # Reads raw YAML rather than _producer_input_keys because a cold start has no validated prior workflow.
+    return _keys_named_in(json.dumps(block, default=str), declared)
+
+
+def inputs_only_read_by_deleted_block(label: str, stored_yaml: str, saved: Workflow) -> list[str]:
+    """Inputs the deleted block read in ``stored_yaml`` that ``saved`` still declares and nothing left in it names.
+    Any exact string or template root naming a key counts as a read, so a key in doubt is left off the list."""
+    try:
+        candidates = _deleted_block_input_keys(label, stored_yaml)
+        if not candidates:
+            return []
+        scan = saved.model_dump(mode="json", include={"workflow_definition", *_CANONICAL_WORKFLOW_SETTING_FIELDS})
+        candidates &= declared_workflow_parameter_keys(scan)
+        for parameter in scan["workflow_definition"]["parameters"]:
+            if parameter.get("key") in candidates:
+                parameter.pop("key")
+        return sorted(candidates - _keys_named_in(json.dumps(scan), candidates))
+    except Exception:  # noqa: BLE001 - an advisory scan must never fail the write it reports on.
+        LOG.warning("copilot_deleted_block_input_scan_failed", exc_info=True)
+        return []
 
 
 def origin_input_refusal(
