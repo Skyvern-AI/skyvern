@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 from collections.abc import Awaitable, Callable
+from contextlib import nullcontext
 from datetime import UTC, datetime
 from types import SimpleNamespace
 from typing import Any
@@ -1520,6 +1521,7 @@ async def test_a_follow_up_turn_on_a_blank_saved_workflow_deletes_a_block_from_t
     monkeypatch.setattr(app.DATABASE.workflow_params, "get_workflow_copilot_chat_by_id", AsyncMock(return_value=chat))
     monkeypatch.setattr(app.DATABASE.workflow_params, "publish_workflow_copilot_candidate", publish)
     monkeypatch.setattr(app.DATABASE.workflows, "get_workflow_by_permanent_id", AsyncMock(return_value=stored))
+    monkeypatch.setattr(app.DATABASE.workflows, "acquire_workflow_creation_lock", lambda _key: nullcontext())
 
     def ctx(blocks: list[dict[str, str]], **fields: Any) -> CopilotContext:
         canvas = {
