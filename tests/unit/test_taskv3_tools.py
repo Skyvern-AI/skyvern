@@ -29760,10 +29760,12 @@ def _cc_walk_shape_script(shape: dict[str, Any] | None, row_h: float) -> str:
     # `prepend` inserts rows at the top on the `prepend_at`-th scroll; `grow` appends rows on the first scroll
     # away from the bottom; `enter_ms` slides every mounted row in from 40px below; `overscan` mounts that
     # many rows past each end of the viewport, `drop_blanks` renders a blank row as no element at all, and `jitter` nudges the row labelled `jitter_label` down that
-    # many px on every other render.
+    # many px on every other render. `drop_dup` removes the LAST row wearing that label once the scroller passes
+    # `drop_dup_past` px, the way a list reconciles a row it rendered twice while its own fetch was in flight.
     return (
         "  var SHAPE = " + json.dumps(shape) + ";\n"
         "  var TOPS = [], shapeScrolls = 0, shapeRenders = 0, shapeAtEnd = false, shapeGrown = false;\n"
+        "  var shapeDropped = false;\n"
         '  var STICKY_HTML = \'<li role="option" aria-disabled="true" style="position:sticky;top:0;height:22px;\' +\n'
         "    'width:40px;margin-left:200px;z-index:3;background:#fff;line-height:16px\">Top</li>' +\n"
         '    \'<li role="separator" style="position:sticky;top:22px;height:4px;width:40px;margin-left:200px;\' +\n'
@@ -29782,6 +29784,13 @@ def _cc_walk_shape_script(shape: dict[str, Any] | None, row_h: float) -> str:
         "  function shapeScrolled() {\n"
         "    shapeScrolls++;\n"
         "    if (SHAPE.prepend && shapeScrolls === SHAPE.prepend_at) { COUNTRIES = SHAPE.prepend.concat(COUNTRIES); shapeLayout(); }\n"
+        "    if (SHAPE.drop_dup && !shapeDropped && scroller.scrollTop > SHAPE.drop_dup_past) {\n"
+        "      shapeDropped = true;\n"
+        "      for (var d = N - 1; d >= 0; d--) {\n"
+        "        if (COUNTRIES[d][0] === SHAPE.drop_dup) { COUNTRIES.splice(d, 1); break; }\n"
+        "      }\n"
+        "      shapeLayout();\n"
+        "    }\n"
         "    if (scroller.scrollTop + scroller.clientHeight >= scroller.scrollHeight - 1) shapeAtEnd = true;\n"
         "    else if (shapeAtEnd && SHAPE.grow && !shapeGrown) {\n"
         "      shapeGrown = true; COUNTRIES = COUNTRIES.concat(SHAPE.grow); shapeLayout();\n"
@@ -29933,6 +29942,26 @@ async def test_select_combobox_refuses_an_exact_hit_whose_twin_the_walk_saw_at_t
         assert r.status == "error", r.content
         assert "ambiguous" in r.content, r.content
         assert await page.eval_on_selector("#phone", "el => el.value") == "", r.content
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+async def test_select_combobox_refuses_a_twin_a_window_read_before_the_list_dropped_it() -> None:
+    # Two "Canada" rows nothing in the DOM tells apart sit at the top of a virtualized list that reconciles to one
+    # once the walk has scrolled past them. The move restarts the walk, so the rows the walk finally reports hold a
+    # single "Canada" and the matcher's own duplicate check has nothing to refuse — the only thing left between
+    # this and committing a row whose rival a window already read is the twin count kept per frame.
+    rows = [(f"Option {i:02d}", f"+{200 + i}") for i in range(40)]
+    rows[2], rows[4] = ("Canada", "+1"), ("Canada", "+2")
+    html = _cc_widget_html(rows, 0, walk_shape={"drop_dup": "Canada", "drop_dup_past": 600})
+    async with _content_page(html) as page:
+        tools = build_browser_tools(_fixed_page_provider(page))
+        r = await _tool(tools, "select_combobox").handler({"selector": "#cc", "value": "Canada"})
+        assert r.status == "error", r.content
+        assert "share the exact label" in r.content, r.content
+        assert await page.eval_on_selector("#phone", "el => el.value") == "", r.content
+        # 39 rows of 58px: the page really did drop one of the two "Canada" rows mid-walk.
+        assert await page.eval_on_selector("#cc-spacer", "el => el.style.height") == "2262px", r.content
 
 
 @_skip_no_browser
@@ -30591,6 +30620,7 @@ def _popup_search_combobox_html(
     spinner_class: str = "spinner",
     roleless: bool = False,
     bare_div_note: str = "",
+    dead_search: bool = False,
 ) -> str:
     # A click-to-open anchor (not typeable) whose popup renders only the first `window` matching rows and,
     # optionally, its own filter input. The form also holds an unrelated text input, plus one the open-click
@@ -30610,7 +30640,8 @@ def _popup_search_combobox_html(
     # builds the filtered rows from that element instead of <li>; `row_class` sets every row's class attribute.
     # `roleless` declares no role on the list or its rows. `bare_div_note` ("header" or "footer") builds the list
     # and its rows from <div>s that do not scroll, with a match count inside the list: a <p> above the rows, or a bare
-    # text node below them.
+    # text node below them. `dead_search` renders the popup's search box above the rows and focuses it, but wires it
+    # to nothing, so it takes the text typed into it and never filters.
     states = json.dumps(items or _POPUP_SEARCH_STATES[:rows])
     return f"""
 <!doctype html><html><body style="margin:0">
@@ -30655,6 +30686,7 @@ def _popup_search_combobox_html(
   var SPINNER_CLASS = {json.dumps(spinner_class)};
   var ROLELESS = {"true" if roleless else "false"};
   var BARE_NOTE = {json.dumps(bare_div_note)};
+  var DEAD_SEARCH = {"true" if dead_search else "false"};
   var pending = null, twin = null, queryAt = 0, tripped = false;
   var anchor = document.getElementById('state');
   var hidden = document.getElementById('state-value');
@@ -30759,7 +30791,7 @@ def _popup_search_combobox_html(
         box = document.createElement('input');
         box.type = 'text';
         box.placeholder = 'Type to Search';
-        box.addEventListener('input', onQuery);
+        if (!DEAD_SEARCH) box.addEventListener('input', onQuery);
         if (FLAT) box.style.cssText = 'position:absolute;left:0;top:32px;width:236px;z-index:5';
         popup.appendChild(box);
       }}
@@ -30852,6 +30884,23 @@ async def test_select_combobox_popup_filter_refusal_takes_back_its_query() -> No
         assert await page.eval_on_selector("#state-wrap input[type=text]", "el => el.value") == "", r.content
         assert await page.eval_on_selector("#notes", "el => el.value") == "", r.content
         assert await page.eval_on_selector("#other-note", "el => el.value") == "", r.content
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+async def test_select_combobox_takes_back_a_popup_box_whose_typing_never_moved_the_rows() -> None:
+    # The popup renders its search box above the rows and focuses it, but nothing is wired to it (its handler never
+    # hydrated), so it takes the query and the list never moves. "Delaware" IS one of the rows it rendered, and the
+    # list declares more rows than those, so a box taken for the filter reads this unchanged window as a filtered
+    # one: the refusal must name the box as not the list's filter instead of offering its row as what a search
+    # answered, and the query must come back out of the box.
+    async with _content_page(_popup_search_combobox_html(dead_search=True, declared_rows=60)) as page:
+        tools = build_browser_tools(_fixed_page_provider(page))
+        r = await _tool(tools, "select_combobox").handler({"selector": "#state", "value": "Delaware"})
+        assert r.status == "error", r.content
+        assert await page.eval_on_selector("#state-value", "el => el.value") == "", r.content
+        assert await page.eval_on_selector("#state-wrap input[type=text]", "el => el.value") == "", r.content
+        assert "the list did not change" in r.content and "own search box" not in r.content, r.content
 
 
 @_skip_no_browser
