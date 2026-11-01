@@ -73,7 +73,7 @@ _SENSITIVE_ENDPOINT_PATTERNS = (
     re.compile(r"^POST /(?:api/)?v1/ad-attribution(?:/withdraw)?$"),
     re.compile(r"^(?:POST|PUT) /(?:api/)?v1/credentials(?:/.*)?$"),
     re.compile(r"^(?:GET|POST|PUT|DELETE) /(?:api/)?v1/email-forwarding(?:/.*)?$"),
-    re.compile(r"^POST /(?:api/)?v1/email/inbound/[^/]+$"),
+    re.compile(r"^POST /(?:api/)?v1/email/(?:inbound/[^/]+|sns-inbound)$"),
     # Twilio credentials and inbound SMS codes must stay opaque even with malformed bodies.
     re.compile(r"^(?:POST|PUT|PATCH|DELETE) /(?:api/)?v1/(?:integrations/twilio|sms)(?:/.*)?$"),
     # MCP arguments and results can contain arbitrary secrets, including malformed JSON.
@@ -87,7 +87,7 @@ _SENSITIVE_ENDPOINT_PATTERNS = (
     # Skyplane authority calls carry runtime capabilities, tool arguments, agent feedback text and delivered files.
     re.compile(r"^[^ ]+ /api/v1/skyplane(?:/.*)?$"),
 )
-_STREAMING_REQUEST_ENDPOINT_PATTERNS = (re.compile(r"^POST /(?:api/)?v1/email/inbound/[^/]+$"),)
+_STREAMING_REQUEST_ENDPOINT_PATTERNS = (re.compile(r"^POST /(?:api/)?v1/email/(?:inbound/[^/]+|sns-inbound)$"),)
 _MAX_BODY_LENGTH = 1000
 _READ_METHODS = frozenset({"GET", "HEAD", "OPTIONS"})
 # 404/405 are dominated by internet scanners and MCP clients probing GET for an SSE stream;

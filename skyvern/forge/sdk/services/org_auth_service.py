@@ -8,7 +8,7 @@ from typing import Annotated
 import jwt
 import structlog
 from cachetools import TTLCache
-from fastapi import Header, HTTPException, status
+from fastapi import Depends, Header, HTTPException, status
 from jwt.exceptions import PyJWTError
 from opentelemetry import trace
 from pydantic import ValidationError
@@ -339,6 +339,12 @@ async def get_current_org_for_credential_routes(
         user_agent=user_agent,
         fern_language=x_fern_language,
     )
+
+
+async def get_current_org_for_email_forwarding(
+    current_org: Organization = Depends(get_current_org_for_credential_routes),
+) -> Organization:
+    return current_org
 
 
 async def get_current_org_with_api_token(
