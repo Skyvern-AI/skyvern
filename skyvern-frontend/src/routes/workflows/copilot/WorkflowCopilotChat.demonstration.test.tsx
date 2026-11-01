@@ -12,6 +12,8 @@ import {
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
+import { StudioPaneDefaultsProvider } from "@/routes/workflows/studio/StudioPaneDefaults";
+import { useStudioPanes } from "@/routes/workflows/studio/useStudioPanes";
 import { useRecordingLauncherStore } from "@/store/useRecordingLauncherStore";
 import { useWorkflowYamlEditorStore } from "@/store/WorkflowYamlEditorStore";
 import {
@@ -176,6 +178,8 @@ vi.mock("@/store/WorkflowHasChangesStore", () => ({
   ),
 }));
 vi.mock("@/routes/workflows/hooks/useWorkflowRunQuery", () => ({
+  useWorkflowRunQueries: (ids: readonly string[]) =>
+    ids.map(() => ({ data: undefined })),
   useWorkflowRunQuery: () => ({ data: undefined }),
 }));
 
@@ -201,6 +205,36 @@ async function renderChat(
         <WorkflowCopilotChat docked={false} {...next} />
       </QueryClientProvider>,
     );
+}
+
+function StudioPanesProbe() {
+  const { panes } = useStudioPanes();
+  return <output data-testid="studio-panes">{panes.join(",")}</output>;
+}
+
+// The docked chat as the studio hosts it: inside the pane layout, portalled into
+// the Copilot pane.
+async function renderStudioChat(
+  props: ComponentProps<typeof WorkflowCopilotChat> = {},
+) {
+  const portalTarget = document.body.appendChild(document.createElement("div"));
+  const queryClient = new QueryClient({
+    defaultOptions: { queries: { retry: false } },
+  });
+  render(
+    <QueryClientProvider client={queryClient}>
+      <StudioPaneDefaultsProvider hasBlocks>
+        <StudioPanesProbe />
+        <WorkflowCopilotChat docked portalTarget={portalTarget} {...props} />
+      </StudioPaneDefaultsProvider>
+    </QueryClientProvider>,
+  );
+  await waitFor(() =>
+    expect(
+      screen.getByRole("group", { name: "Copilot message composer" }),
+    ).toBeTruthy(),
+  );
+  return () => portalTarget.remove();
 }
 
 async function startDemonstration({
@@ -326,6 +360,44 @@ describe("WorkflowCopilotChat demonstration", () => {
       name: "Start demonstration",
     })) as HTMLButtonElement;
     expect(offer.disabled).toBe(true);
+  });
+
+  it("swaps Editor for the Browser pane while demonstrating and brings Editor back for the build", async () => {
+    const removePortalTarget = await renderStudioChat({
+      liveBrowserSessionId: "browser-1",
+    });
+    try {
+      const panes = () => screen.getByTestId("studio-panes").textContent;
+      expect(panes()).toBe("copilot,editor");
+
+      const call = await startDemonstration();
+      expect(panes()).toBe("copilot,browser");
+      act(() => {
+        call.onMessage({
+          type: "demonstration_action",
+          seq: 1,
+          label: "Open form",
+          tool_name: "click",
+        });
+      });
+
+      postStreaming.mockImplementationOnce((path, body, onMessage) => {
+        streamCalls.push({ path, body, onMessage });
+        return new Promise<void>(() => {});
+      });
+      fireEvent.click(
+        await screen.findByRole("button", { name: "Done, build the workflow" }),
+      );
+      await waitFor(() =>
+        expect(
+          streamCalls.some((item) => item.path.endsWith("/chat-post")),
+        ).toBe(true),
+      );
+      // The build turn is still streaming; Editor must not wait for it to end.
+      await waitFor(() => expect(panes()).toBe("copilot,editor,browser"));
+    } finally {
+      removePortalTarget();
+    }
   });
 
   it("opens the recorder stream and renders recorded actions in the transcript", async () => {

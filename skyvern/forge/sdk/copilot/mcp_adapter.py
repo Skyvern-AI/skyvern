@@ -1837,6 +1837,8 @@ class SkyvernOverlayMCPServer(MCPServer):
         ordered_allowlist: tuple[str, ...] | None = None,
         enforce_dispatch_allowlist: bool = False,
         page_state_reader: PageStateReader | None = None,
+        recorded_alias_map: dict[str, str] | None = None,
+        recorded_overlays: dict[str, SchemaOverlay] | None = None,
     ) -> None:
         super().__init__(
             use_structured_content=False,
@@ -1851,6 +1853,10 @@ class SkyvernOverlayMCPServer(MCPServer):
         self._ordered_allowlist = ordered_allowlist
         self._enforce_allowlist_on_dispatch = enforce_dispatch_allowlist
         self._allowlist = allowlist
+        # A narrowed surface withdraws the action tools the model may not call, but a replayed demonstration
+        # step still needs their hooks to record the user's action.
+        self._recorded_alias_map = alias_map if recorded_alias_map is None else recorded_alias_map
+        self._recorded_overlays = overlays if recorded_overlays is None else recorded_overlays
         self._context_provider = context_provider
         self._client: Client | None = None
         self._exit_stack: AsyncExitStack | None = None
@@ -1982,7 +1988,7 @@ class SkyvernOverlayMCPServer(MCPServer):
             return _copilot_to_call_tool_result({"ok": False, "error": str(exc)}, tool_name)
         except BaseException as exc:
             if not app.AGENT_FUNCTION.prepare_codeblock_control_flow_exception(exc):
-                LOG.warning("MCP tool dispatch failed")
+                LOG.warning("MCP tool dispatch failed", tool=tool_name)
                 return CallToolResult(content=[], isError=True)
             propagated_error = exc.with_traceback(None)
             # Cancellation tracebacks retain this frame. Drop every local that can
@@ -2004,15 +2010,15 @@ class SkyvernOverlayMCPServer(MCPServer):
         arguments = arguments or {}
         arguments = {k: v for k, v in arguments.items() if k not in _INTERNAL_TOOL_ARG_KEYS}
         copilot_ctx = self._context_provider()
-        if self._enforce_allowlist_on_dispatch and tool_name not in self._alias_map:
-            raise ValueError(f"MCP tool is not available on this Copilot surface: {tool_name}")
-        overlay = self._overlays.get(tool_name, SchemaOverlay())
-        mcp_name = self._alias_map.get(tool_name, tool_name)
-        if self._enforce_allowlist_on_dispatch and mcp_name not in self._allowlist:
-            raise ValueError(f"MCP tool is not available on this Copilot surface: {tool_name}")
         held_facts = HeldPageFacts()
         demonstrated_action = current_demonstrated_action()
+        # A replayed step never touches the browser, so the dispatch allowlist below (which stops the model acting
+        # directly) does not apply to it.
         if demonstrated_action is not None:
+            if tool_name not in self._recorded_alias_map:
+                raise ValueError(f"Not a recordable demonstration tool: {tool_name}")
+            overlay = self._recorded_overlays.get(tool_name, SchemaOverlay())
+            mcp_name = self._recorded_alias_map.get(tool_name, tool_name)
             existing_interactions = {id(item) for item in copilot_ctx.scouted_interactions}
             existing_trajectory = {id(item) for item in copilot_ctx.scout_trajectory}
 
@@ -2075,6 +2081,12 @@ class SkyvernOverlayMCPServer(MCPServer):
             held_facts.release()
             return _copilot_to_call_tool_result(copilot_result, tool_name)
 
+        if self._enforce_allowlist_on_dispatch and tool_name not in self._alias_map:
+            raise ValueError(f"MCP tool is not available on this Copilot surface: {tool_name}")
+        overlay = self._overlays.get(tool_name, SchemaOverlay())
+        mcp_name = self._alias_map.get(tool_name, tool_name)
+        if self._enforce_allowlist_on_dispatch and mcp_name not in self._allowlist:
+            raise ValueError(f"MCP tool is not available on this Copilot surface: {tool_name}")
         observed_continuity_generation = copilot_ctx.browser_session_continuity_generation
         attempt_browser_session_id = current_call_browser_session_override() or getattr(
             copilot_ctx, "browser_session_id", None

@@ -518,7 +518,7 @@ def create_api_app() -> FastAPI:
         except Exception as e:
             LOG.warning("Failed to initialize OTEL tracer provider early", error=str(e))
 
-    forge_app_instance = start_forge_app()
+    forge_app_instance = start_forge_app(load_api_modules=True)
 
     assert_signing_key_usable()
     fastapi_app = FastAPI(lifespan=lifespan)

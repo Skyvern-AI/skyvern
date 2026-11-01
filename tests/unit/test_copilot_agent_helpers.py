@@ -494,7 +494,7 @@ async def test_interrupted_draft_turn_restoration_and_run_hydration_stay_coheren
     async def seed_run(ctx: CopilotContext, *, workflow_run_id: str | None) -> SimpleNamespace:
         seeded.append((workflow_run_id, ctx.workflow_yaml, ctx.proposal_workflow_run_id))
         ctx.repair_origin_input_values = (origin_run_input("resume", "s3://bucket/resume.pdf"),)
-        return SimpleNamespace(finished=True)
+        return SimpleNamespace(finished=True, run=None)
 
     async def hydrate_run(ctx: CopilotContext, *, workflow_run_id: str) -> dict[str, dict[str, str]]:
         hydrated.append((workflow_run_id, ctx.workflow_yaml, ctx.proposal_workflow_run_id))
@@ -590,7 +590,7 @@ async def test_a_plain_continuation_names_reusable_origin_inputs_before_any_run(
     async def seed_run(ctx: CopilotContext, *, workflow_run_id: str | None) -> SimpleNamespace:
         seeded.append(workflow_run_id)
         ctx.repair_origin_input_values = (origin_run_input("resume", "s3://bucket/resume.pdf"),)
-        return SimpleNamespace(finished=True)
+        return SimpleNamespace(finished=True, run=None)
 
     hydrate_run = AsyncMock(return_value=None)
     monkeypatch.setattr(agent_module, "restore_pending_workflow_proposal", AsyncMock(return_value=None))

@@ -4,9 +4,12 @@ import { useSearchParams } from "react-router-dom";
 
 import { Status, WorkflowRunStatusApiResponse } from "@/api/types";
 import { statusIsAFailureType } from "@/routes/tasks/types";
-import { formatElapsedSeconds, isRecord } from "@/util/utils";
+import { formatElapsedSeconds, isRecord, parseServerStamp } from "@/util/utils";
 
-import { useWorkflowRunQuery } from "../hooks/useWorkflowRunQuery";
+import {
+  useWorkflowRunQueries,
+  useWorkflowRunQuery,
+} from "../hooks/useWorkflowRunQuery";
 import type { ChatMessage } from "./WorkflowCopilotChat";
 
 type RunLifecycleMessage = ChatMessage & { kind: "run_lifecycle" };
@@ -75,9 +78,8 @@ function buildStartMessage(
 function buildTerminalMessage(
   id: string,
   data: WorkflowRunStatusApiResponse,
-  isBlockRun: boolean,
+  runLabel: string,
 ): RunLifecycleMessage {
-  const runLabel = isBlockRun ? "Block run" : "Run";
   const dur = formatElapsedSeconds(
     elapsedMs(data.started_at ?? data.created_at, data.finished_at),
   );
@@ -104,15 +106,24 @@ function buildTerminalMessage(
 
 type SeenEntry = { start: boolean; terminal: boolean; wasRunning: boolean };
 
+export type WatchedTurnRun = {
+  runId: string;
+  // Server created_at of the reply that named the run.
+  ownerCreatedAt: string;
+  // Read from history on load; a run already final when first seen gets no line.
+  restored: boolean;
+};
+
 /**
- * Watches the studio's focused run and appends presentational lifecycle lines
- * into the chat's own message list. Never persisted, never sent to the LLM —
- * grounding for the LLM already travels as workflow_run_id on each turn.
+ * Appends presentational lifecycle lines for the studio's focused run and for
+ * the chat's own test runs that end after their turn. Never persisted or sent
+ * to the model; both watchers share the terminal line id, so a run gets one.
  */
 export function useRunLifecycleAnnouncements({
   workflowRunId,
   turnInFlight,
   turnOwnedRunIds,
+  watchedTurnRuns,
   announce,
 }: {
   workflowRunId: string | undefined;
@@ -121,6 +132,9 @@ export function useRunLifecycleAnnouncements({
   // narrates these through its own SSE stream, so we suppress them by identity
   // rather than by the timing of when they were first seen.
   turnOwnedRunIds: { current: Set<string> };
+  // The chat's own test runs, watched whatever the studio focuses: one that
+  // finishes after the reply naming it ended outside the turn that narrated it.
+  watchedTurnRuns: readonly WatchedTurnRun[];
   announce: (message: RunLifecycleMessage) => void;
 }): void {
   const { data } = useWorkflowRunQuery({ workflowRunId });
@@ -165,7 +179,9 @@ export function useRunLifecycleAnnouncements({
       if (finalized) {
         entry.terminal = true;
         if (entry.wasRunning) {
-          announce(buildTerminalMessage(id, data, isBlockRun));
+          announce(
+            buildTerminalMessage(id, data, isBlockRun ? "Block run" : "Run"),
+          );
         }
         return;
       }
@@ -174,7 +190,9 @@ export function useRunLifecycleAnnouncements({
     }
     if (!entry.terminal && finalized) {
       entry.terminal = true;
-      announce(buildTerminalMessage(id, data, isBlockRun));
+      announce(
+        buildTerminalMessage(id, data, isBlockRun ? "Block run" : "Run"),
+      );
     }
   }, [
     workflowRunId,
@@ -184,4 +202,50 @@ export function useRunLifecycleAnnouncements({
     turnInFlight,
     turnOwnedRunIds,
   ]);
+
+  const watchedResults = useWorkflowRunQueries(
+    watchedTurnRuns.map((run) => run.runId),
+  );
+  const watchState = useRef(
+    new Map<string, { since: number; observed: boolean; settled: boolean }>(),
+  );
+  useEffect(() => {
+    // A run dropped from the list (chat switch) must look unseen if it comes back.
+    const watchedIds = new Set(watchedTurnRuns.map((run) => run.runId));
+    for (const id of watchState.current.keys()) {
+      if (!watchedIds.has(id)) watchState.current.delete(id);
+    }
+    const now = Date.now();
+    watchedTurnRuns.forEach((run, index) => {
+      let state = watchState.current.get(run.runId);
+      if (!state) {
+        state = { since: now, observed: false, settled: false };
+        watchState.current.set(run.runId, state);
+      }
+      const result = watchedResults[index];
+      const runData = result?.data;
+      if (!runData || runData.workflow_run_id !== run.runId || state.settled) {
+        return;
+      }
+      // Cached data (also kept through a failed refetch) cannot show a restored run was still active at load.
+      if (run.restored && result.dataUpdatedAt < state.since) {
+        return;
+      }
+      const firstObservation = !state.observed;
+      state.observed = true;
+      if (!runIsLogicallyFinal(runData)) {
+        return;
+      }
+      state.settled = true;
+      if (run.restored && firstObservation) {
+        return;
+      }
+      const finishedAt = runData.finished_at
+        ? parseServerStamp(runData.finished_at)
+        : NaN;
+      if (finishedAt > parseServerStamp(run.ownerCreatedAt)) {
+        announce(buildTerminalMessage(run.runId, runData, "Test run"));
+      }
+    });
+  }, [watchedTurnRuns, watchedResults, announce]);
 }

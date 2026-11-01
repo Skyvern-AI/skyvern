@@ -18,7 +18,7 @@ from tests.unit.route_authorization_app import route_connection
 
 def test_every_public_api_route_has_authorization_and_an_action(monkeypatch) -> None:
     monkeypatch.setattr(api_app.settings, "OTEL_ENABLED", False)
-    monkeypatch.setattr(api_app, "start_forge_app", lambda: SimpleNamespace(setup_api_app=None))
+    monkeypatch.setattr(api_app, "start_forge_app", lambda **_kwargs: SimpleNamespace(setup_api_app=None))
     app = api_app.create_api_app()
     routes = [route for route in app.routes if isinstance(route, (APIRoute, APIWebSocketRoute))]
 

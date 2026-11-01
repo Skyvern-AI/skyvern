@@ -18,7 +18,6 @@ import { workflowBlockTitle } from "../types";
 import {
   AGENT_STEP_MAX_TURNS_LIMIT,
   agentStepDefaultDataSchema,
-  agentStepToolsFromSelection,
   type AgentStepNode,
   type AgentStepNodeData,
 } from "./types";
@@ -34,7 +33,6 @@ const nonBlockToolTitles: Record<string, string> = {
   page_click: ReadableActionTypes.click,
   page_fill: ReadableActionTypes.input_text,
   page_extract: ReadableActionTypes.extract,
-  read_run_data: "Read Run Data",
 };
 
 function agentStepToolTitle(tool: AgentStepTool): string {
@@ -80,7 +78,6 @@ function AgentStepEditorBody({
     editable: data.editable,
   });
   const { data: tools } = useAgentStepToolsQuery();
-  const choosableTools = (tools ?? []).map((tool) => tool.name);
   const toolOptions = tools
     ? tools
         .map((tool) => ({
@@ -89,7 +86,7 @@ function AgentStepEditorBody({
           description: tool.description,
         }))
         .sort((a, b) => a.label.localeCompare(b.label))
-    : (data.tools ?? []).map((tool) => ({ label: tool, value: tool }));
+    : data.tools.map((tool) => ({ label: tool, value: tool }));
 
   return (
     <div data-testid="agent-step-block-form" className="space-y-4">
@@ -153,23 +150,14 @@ function AgentStepEditorBody({
           <HelpTooltip content={helpTooltips["agentStep"]["tools"]} />
         </div>
         <MultiSelect
-          allSelectedLabel="All tools"
           className="nopan"
           disabled={!data.editable || !tools}
           id={`${blockId}-tools`}
           maxCount={50}
-          onValueChange={(tools) =>
-            update({
-              tools: agentStepToolsFromSelection(tools, choosableTools),
-            })
-          }
+          onValueChange={(tools) => update({ tools })}
           options={toolOptions}
-          placeholder={
-            data.tools === null
-              ? "All tools"
-              : "Choose the tools this step may call"
-          }
-          value={data.tools ?? choosableTools}
+          placeholder="Choose the tools this step may call"
+          value={data.tools}
         />
       </div>
     </div>

@@ -217,6 +217,8 @@ vi.mock("@/store/WorkflowHasChangesStore", async (importOriginal) => {
   };
 });
 vi.mock("../hooks/useWorkflowRunQuery", () => ({
+  useWorkflowRunQueries: (ids: readonly string[]) =>
+    ids.map(() => ({ data: undefined })),
   useWorkflowRunQuery: () => runQueryMock(),
 }));
 vi.mock("@/hooks/useWorkflowStudioEnabled", () => ({

@@ -200,7 +200,11 @@ from skyvern.forge.sdk.copilot.recoverable_failure import (
     format_recoverable_failure_reply,
     merge_failure_into_context,
 )
-from skyvern.forge.sdk.copilot.repair_origin_run import seed_repair_origin_run
+from skyvern.forge.sdk.copilot.repair_origin_run import (
+    RepairOriginBinding,
+    resolve_repair_origin_binding,
+    seed_repair_origin_run,
+)
 from skyvern.forge.sdk.copilot.request_policy import (
     RAW_SECRET_QUESTION,
     RAW_SECRET_REFUSAL_SENTINEL,
@@ -290,7 +294,12 @@ from skyvern.forge.sdk.copilot.tools.workflow_update import (
     restore_pending_workflow_proposal,
 )
 from skyvern.forge.sdk.copilot.tracing_setup import _copilot_model_name, ensure_tracing_initialized, is_tracing_enabled
-from skyvern.forge.sdk.copilot.turn_context import TurnContextAssembler, TurnContextInputs, TurnContextPacket
+from skyvern.forge.sdk.copilot.turn_context import (
+    COPILOT_TESTS_ENDED_AFTER_THEIR_TURN_KEY,
+    TurnContextAssembler,
+    TurnContextInputs,
+    TurnContextPacket,
+)
 from skyvern.forge.sdk.copilot.turn_halt import (
     CopilotTurnHalt,
     TurnHalt,
@@ -326,6 +335,7 @@ from skyvern.forge.sdk.copilot.workflow_yaml import (
     stored_block_code,
     stored_workflow_yaml,
 )
+from skyvern.forge.sdk.db.datetime_utils import to_naive_utc
 from skyvern.forge.sdk.db.exceptions import CopilotProposalConflictError
 from skyvern.forge.sdk.schemas.copilot_turn_outcome import (
     ConnectedAccountChoice,
@@ -641,22 +651,81 @@ def _historical_turn_facts_projection(
 def _recorded_run_ids(messages: Sequence[WorkflowCopilotChatHistoryMessage]) -> list[str]:
     """Oldest first, from the untruncated log rather than the prompt window: a run that scrolled past
     ``CHAT_HISTORY_CONTEXT_MESSAGES`` still owns the browser this chat last tested in."""
-    run_ids: list[str] = []
-    for message in messages:
-        if chat_history_role(message.sender) != "ai":
-            continue
-        projection = _historical_turn_facts_projection(message.narrative_payload)
-        if projection is None:
-            continue
-        run_id = projection["facts"].get("runId")
-        if isinstance(run_id, str) and run_id:
-            run_ids.append(run_id)
-    return run_ids
+    return [run_id for message in messages if (run_id := _message_recorded_run_id(message))]
+
+
+def _message_recorded_run_id(message: WorkflowCopilotChatHistoryMessage) -> str | None:
+    if chat_history_role(message.sender) != "ai":
+        return None
+    projection = _historical_turn_facts_projection(message.narrative_payload)
+    run_id = projection["facts"].get("runId") if projection else None
+    return run_id if isinstance(run_id, str) and run_id else None
 
 
 def _last_recorded_run_id(messages: Sequence[WorkflowCopilotChatHistoryMessage]) -> str | None:
     run_ids = _recorded_run_ids(messages)
     return run_ids[-1] if run_ids else None
+
+
+_UNSEEN_TEST_OUTCOME_WINDOW = 3
+
+
+def _turn_started_at(message: WorkflowCopilotChatHistoryMessage) -> datetime | None:
+    started_at = message.narrative_payload.get("startedAt") if message.narrative_payload else None
+    if not isinstance(started_at, str):
+        return None
+    try:
+        return to_naive_utc(datetime.fromisoformat(started_at))
+    except ValueError:
+        return None
+
+
+def _test_outcome_unseen(
+    messages: Sequence[WorkflowCopilotChatHistoryMessage], run_id: str, finished_at: datetime | None
+) -> bool:
+    """Whether a recorded test finished after the reply that first recorded it and after every later turn started,
+    since a turn reads this packet after it starts."""
+    if finished_at is None:
+        return False
+    replies = [m for m in messages if chat_history_role(m.sender) == "ai"]
+    first = next(index for index, m in enumerate(replies) if _message_recorded_run_id(m) == run_id)
+    seen_at = max([to_naive_utc(replies[first].created_at), *filter(None, map(_turn_started_at, replies[first + 1 :]))])
+    return to_naive_utc(finished_at) > seen_at
+
+
+async def _unseen_copilot_test_packets(
+    ctx: CopilotContext,
+    *,
+    messages: Sequence[WorkflowCopilotChatHistoryMessage],
+    hydrated_run_id: str | None,
+    last_run_seed_id: str | None,
+    repair_origin_binding: RepairOriginBinding,
+) -> list[dict[str, Any]]:
+    """Packets for the chat's last few recorded tests that ended after every turn that could have seen them, oldest
+    first. Each turn mints its own browser, so a paused test can outlive later tests."""
+    recent = list(dict.fromkeys(reversed(_recorded_run_ids(messages))))[:_UNSEEN_TEST_OUTCOME_WINDOW]
+    packets: list[dict[str, Any]] = []
+    for run_id in reversed(recent):
+        if run_id == hydrated_run_id:
+            continue
+        binding = repair_origin_binding
+        # The seed is read before the input guardrail, so a run it saw unfinished may have ended since.
+        if last_run_seed_id != run_id or not binding.finished:
+            try:
+                binding = await resolve_repair_origin_binding(
+                    workflow_run_id=run_id,
+                    organization_id=ctx.organization_id,
+                    workflow_permanent_id=ctx.workflow_permanent_id,
+                )
+            except Exception:
+                LOG.warning("copilot_unseen_test_lookup_failed", test_run_id=run_id, exc_info=True)
+                continue
+        if binding.run is None or not _test_outcome_unseen(messages, run_id, binding.run.finished_at):
+            continue
+        packet = await hydrate_prior_run_packet(ctx, workflow_run_id=run_id)
+        if packet:
+            packets.append(packet)
+    return packets
 
 
 def _run_to_inherit(
@@ -909,6 +978,7 @@ def _store_turn_context_packet_on_context(
     chat_history: list[WorkflowCopilotChatHistoryMessage],
     prior_copilot_workflow_yaml: str | None,
     prior_run_packet: dict[str, Any] | None = None,
+    copilot_test_packets: Sequence[dict[str, Any]] = (),
     attached_files: Sequence[CopilotAttachedFile] = (),
 ) -> None:
     ctx.turn_context_packet = TurnContextAssembler().assemble(
@@ -918,6 +988,7 @@ def _store_turn_context_packet_on_context(
             workflow_yaml=_workflow_yaml_for_prompt(ctx, chat_request.workflow_yaml),
             prior_workflow_yaml=_workflow_yaml_for_prompt(ctx, prior_copilot_workflow_yaml),
             prior_run_packet=prior_run_packet,
+            copilot_test_packets=list(copilot_test_packets),
             chat_history=chat_history,
             attached_files=list(attached_files),
         )
@@ -1506,13 +1577,18 @@ def _build_dynamic_system_prompt(
     return instructions
 
 
-def _prior_run_debug_text(packet: dict[str, Any] | None) -> str:
-    """The prior run as the packet a tool would return. A repair opened about an earlier run has
-    made no tool call yet, so without this its first model input carries no record of the run."""
-    if not isinstance(packet, dict) or not packet:
+def _prior_run_debug_text(packet: dict[str, Any] | None, copilot_test_packets: Sequence[dict[str, Any]] = ()) -> str:
+    """The prior run and the chat's tests that ended after their turn, as the packets a tool would return. A
+    turn that has made no tool call yet otherwise has no record of either."""
+    sections: dict[str, Any] = {}
+    if isinstance(packet, dict) and packet:
+        sections[BUILD_TEST_PACKET_KEY] = packet
+    if copilot_test_packets:
+        sections[COPILOT_TESTS_ENDED_AFTER_THEIR_TURN_KEY] = list(copilot_test_packets)
+    if not sections:
         return ""
     try:
-        return json.dumps({BUILD_TEST_PACKET_KEY: packet}, separators=(",", ":"))
+        return json.dumps(sections, separators=(",", ":"))
     except (TypeError, ValueError):
         return ""
 
@@ -4399,6 +4475,8 @@ async def _run_agent_loop_with_surface(
     alias_map: dict[str, str],
     overlays: dict[str, Any],
     output_guardrails: list[Any],
+    recorded_alias_map: dict[str, str] | None = None,
+    recorded_overlays: dict[str, Any] | None = None,
     allow_untested_retry: bool = False,
     is_fallback: bool = False,
     session: Session | None = None,
@@ -4430,6 +4508,8 @@ async def _run_agent_loop_with_surface(
             or ctx.turn_origin == TurnOrigin.code_block_ai_fallback
         ),
         page_state_reader=read_page_state_on_page,
+        recorded_alias_map=recorded_alias_map,
+        recorded_overlays=recorded_overlays,
     )
     ctx.discovery_mcp_server = mcp_server
     agent = Agent(
@@ -5554,6 +5634,13 @@ async def _run_copilot_turn_impl(
         await emit_turn_start(stream, ctx)
     except Exception as emit_err:
         LOG.warning("copilot_narrative_turn_start_emit_failed", error=str(emit_err))
+    copilot_test_packets = await _unseen_copilot_test_packets(
+        ctx,
+        messages=safe_prior_user_messages,
+        hydrated_run_id=associated_run_id if prior_run_packet is not None else None,
+        last_run_seed_id=last_run_seed_id,
+        repair_origin_binding=repair_origin_binding,
+    )
     if request_policy is not None:
         _store_turn_context_packet_on_context(
             ctx,
@@ -5561,6 +5648,7 @@ async def _run_copilot_turn_impl(
             chat_request=chat_request,
             chat_history=chat_history,
             prior_run_packet=prior_run_packet,
+            copilot_test_packets=copilot_test_packets,
             prior_copilot_workflow_yaml=prior_copilot_workflow_yaml,
             attached_files=attached_files,
         )
@@ -5762,8 +5850,10 @@ async def _run_copilot_turn_impl(
             )
         video_attachment_message = build_video_attachment_message(video_evidence)
 
-    alias_map = get_skyvern_mcp_alias_map()
-    overlays = _build_skyvern_mcp_overlays(copilot_config.authoring_capability, notes_visible=copilot_sees_notes(ctx))
+    full_alias_map = alias_map = get_skyvern_mcp_alias_map()
+    full_overlays = overlays = _build_skyvern_mcp_overlays(
+        copilot_config.authoring_capability, notes_visible=copilot_sees_notes(ctx)
+    )
     registered_mcp_tools = (
         await skyvern_mcp.list_tools(run_middleware=False) if eval_mode == CopilotEvalMode.BROWSER_ABLATION else None
     )
@@ -5879,7 +5969,12 @@ async def _run_copilot_turn_impl(
         chat_history_text=safe_chat_history_text,
         global_llm_context=scoped_global_llm_context,
         debug_run_info_text="\n".join(
-            text for text in (_prior_run_debug_text(prior_run_packet), reusable_origin_inputs_text) if text
+            text
+            for text in (
+                _prior_run_debug_text(prior_run_packet, copilot_test_packets),
+                reusable_origin_inputs_text,
+            )
+            if text
         ),
         user_message=agent_user_message,
         user_workflow_change_summary=user_workflow_change_summary,
@@ -5944,6 +6039,8 @@ async def _run_copilot_turn_impl(
             alias_map=alias_map,
             overlays=overlays,
             output_guardrails=output_guardrails,
+            recorded_alias_map=full_alias_map,
+            recorded_overlays=full_overlays,
             allow_untested_retry=ctx.allow_untested_workflow_draft,
             is_fallback=is_fallback,
             session=model_session,
