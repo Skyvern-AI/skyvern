@@ -225,6 +225,7 @@ class EmailForwardingRepository(BaseRepository):
         credential_id: str | None,
         sender_allowlist: list[str] | None,
     ) -> ForwardingAddress:
+        email_address = normalize_email_address(email_address)
         if credential_id and match_mode == ForwardingMatchMode.ORIGINAL_RECIPIENT:
             raise ValueError("credential_id cannot be used with match_mode=original_recipient")
         async with self.Session() as session:
@@ -413,6 +414,7 @@ class EmailForwardingRepository(BaseRepository):
     async def rotate_address(
         self, forwarding_address_id: str, organization_id: str, replacement_email: str
     ) -> tuple[ForwardingAddress, ForwardingAddress] | None:
+        replacement_email = normalize_email_address(replacement_email)
         async with self.Session() as session:
             now = datetime.now(timezone.utc)
             address_config_id = (
@@ -529,6 +531,7 @@ class EmailForwardingRepository(BaseRepository):
     async def find_address(self, email_config_id: str, recipients: list[str]) -> ForwardingAddress | None:
         if not recipients:
             return None
+        recipients = list(dict.fromkeys(normalize_email_address(recipient) for recipient in recipients))
         recipient_rank = case(
             {recipient: rank for rank, recipient in enumerate(dict.fromkeys(recipients))},
             value=func.lower(OrganizationForwardingAddressModel.email_address),
@@ -569,6 +572,7 @@ class EmailForwardingRepository(BaseRepository):
         verdicts: dict[str, str] | None,
         totp_identifier: str | None = None,
         parser_content: str | None = None,
+        received_at: datetime | None = None,
     ) -> tuple[str, InboundEmail | None, RawTOTPCode | None]:
         async with self.Session() as session:
             try:
@@ -675,6 +679,7 @@ class EmailForwardingRepository(BaseRepository):
                         parse_status="raw",
                         source="email_forwarding",
                         external_message_id=external_message_id,
+                        created_at=received_at or datetime.now(timezone.utc),
                     )
                     session.add(raw_row)
                     await session.flush()
@@ -691,6 +696,7 @@ class EmailForwardingRepository(BaseRepository):
                     category=category,
                     verdicts=verdicts,
                     totp_code_id=raw_row.totp_code_id if raw_row else None,
+                    created_at=received_at or datetime.now(timezone.utc),
                 )
                 session.add(inbound)
                 await session.execute(

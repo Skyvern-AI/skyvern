@@ -1557,6 +1557,7 @@ class OrganizationInboundEmailModel(Base):
     __tablename__ = "organization_inbound_emails"
     __table_args__ = (
         Index("ix_organization_inbound_emails_address_created", "forwarding_address_id", "created_at"),
+        Index("ix_organization_inbound_emails_created_at", "created_at"),
         UniqueConstraint(
             "organization_id",
             "external_message_id",

@@ -9,6 +9,7 @@ import re
 import time
 from collections.abc import Mapping
 from dataclasses import dataclass, field
+from datetime import datetime
 from email import policy
 from email.feedparser import FeedParser
 from email.header import Header, decode_header
@@ -129,6 +130,7 @@ class NormalizedInboundEmail:
     original_recipient: str | None = None
     delivered_recipients: list[str] = field(default_factory=list)
     verdicts: dict[str, str] | None = None
+    received_at: datetime | None = None
 
 
 class _HTMLTextExtractor(HTMLParser):
@@ -699,6 +701,7 @@ async def ingest_inbound_email(
         verdicts=verdicts or None,
         totp_identifier=identifier if writes_otp else None,
         parser_content=parser_content if writes_otp else None,
+        received_at=message.received_at,
     )
     if record_status == "deduped":
         return "deduped"

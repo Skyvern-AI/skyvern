@@ -25,7 +25,7 @@ from skyvern.forge.sdk.schemas.email_forwarding import (
     InboundEmail,
 )
 from skyvern.forge.sdk.schemas.organizations import Organization
-from skyvern.forge.sdk.services import org_auth_service
+from skyvern.forge.sdk.services.org_auth_service import get_current_org_for_email_forwarding
 from skyvern.forge.sdk.services.request_principal import get_request_principal
 from skyvern.forge.sdk.services.route_authorization import require_request_actions
 from skyvern.services.email_forwarding import (
@@ -85,6 +85,8 @@ async def receive_inbound_email(
     config = await app.DATABASE.email_forwarding.get_config(email_config_id)
     if config is None or not webhook_secret_matches(config, secret):
         return Response(status_code=status.HTTP_200_OK)
+    if not await app.AGENT_FUNCTION.ensure_email_forwarding_available(config.organization_id):
+        return Response(status_code=status.HTTP_200_OK)
 
     content_length = request.headers.get("content-length")
     try:
@@ -140,7 +142,7 @@ async def receive_inbound_email(
 async def create_email_config(
     data: EmailConfigCreate,
     request: Request,
-    current_org: Organization = Depends(org_auth_service.get_current_org_for_credential_routes),
+    current_org: Organization = Depends(get_current_org_for_email_forwarding),
     _request_authorization: None = Depends(
         require_request_actions(frozenset({"email_forwarding_config.create"}), always_enforce=True)
     ),
@@ -177,7 +179,7 @@ async def create_email_config(
 async def rotate_email_config_secret(
     email_config_id: str,
     request: Request,
-    current_org: Organization = Depends(org_auth_service.get_current_org_for_credential_routes),
+    current_org: Organization = Depends(get_current_org_for_email_forwarding),
     _request_authorization: None = Depends(
         require_request_actions(frozenset({"email_forwarding_config.rotate_secret"}), always_enforce=True)
     ),
@@ -213,7 +215,7 @@ async def rotate_email_config_secret(
     include_in_schema=False,
 )
 async def list_email_configs(
-    current_org: Organization = Depends(org_auth_service.get_current_org_for_credential_routes),
+    current_org: Organization = Depends(get_current_org_for_email_forwarding),
     _request_authorization: None = Depends(
         require_request_actions(frozenset({"email_forwarding_config.list"}), always_enforce=True)
     ),
@@ -238,7 +240,7 @@ async def list_email_configs(
 )
 async def delete_email_config(
     email_config_id: str,
-    current_org: Organization = Depends(org_auth_service.get_current_org_for_credential_routes),
+    current_org: Organization = Depends(get_current_org_for_email_forwarding),
     _request_authorization: None = Depends(
         require_request_actions(frozenset({"email_forwarding_config.delete"}), always_enforce=True)
     ),
@@ -296,7 +298,7 @@ async def delete_email_config(
 )
 async def create_forwarding_address(
     data: ForwardingAddressCreate,
-    current_org: Organization = Depends(org_auth_service.get_current_org_for_credential_routes),
+    current_org: Organization = Depends(get_current_org_for_email_forwarding),
 ) -> ForwardingAddress:
     config = await app.DATABASE.email_forwarding.get_config(data.email_config_id, current_org.organization_id)
     if config is None:
@@ -334,7 +336,7 @@ async def create_forwarding_address(
     include_in_schema=False,
 )
 async def list_forwarding_addresses(
-    current_org: Organization = Depends(org_auth_service.get_current_org_for_credential_routes),
+    current_org: Organization = Depends(get_current_org_for_email_forwarding),
 ) -> list[ForwardingAddress]:
     addresses = await app.DATABASE.email_forwarding.list_addresses(current_org.organization_id)
     credential_ids = {address.credential_id for address in addresses if address.credential_id is not None}
@@ -380,7 +382,7 @@ async def list_forwarded_emails(
     forwarding_address_id: str,
     limit: int = Query(default=50, ge=1, le=100),
     offset: int = Query(default=0, ge=0),
-    current_org: Organization = Depends(org_auth_service.get_current_org_for_credential_routes),
+    current_org: Organization = Depends(get_current_org_for_email_forwarding),
 ) -> list[InboundEmail]:
     address = await _get_address_or_404(forwarding_address_id, current_org.organization_id)
     emails = await app.DATABASE.email_forwarding.list_inbound_emails(
@@ -441,7 +443,7 @@ async def list_forwarded_emails(
 async def rotate_forwarding_address(
     forwarding_address_id: str,
     data: ForwardingAddressRotate,
-    current_org: Organization = Depends(org_auth_service.get_current_org_for_credential_routes),
+    current_org: Organization = Depends(get_current_org_for_email_forwarding),
 ) -> ForwardingAddressRotation:
     current = await _get_address_or_404(forwarding_address_id, current_org.organization_id)
     if current.status == ForwardingAddressStatus.REVOKED:
@@ -498,7 +500,7 @@ async def _set_address_status(
 )
 async def disable_forwarding_address(
     forwarding_address_id: str,
-    current_org: Organization = Depends(org_auth_service.get_current_org_for_credential_routes),
+    current_org: Organization = Depends(get_current_org_for_email_forwarding),
 ) -> ForwardingAddress:
     return await _set_address_status(
         forwarding_address_id, current_org.organization_id, ForwardingAddressStatus.DISABLED
@@ -522,7 +524,7 @@ async def disable_forwarding_address(
 )
 async def enable_forwarding_address(
     forwarding_address_id: str,
-    current_org: Organization = Depends(org_auth_service.get_current_org_for_credential_routes),
+    current_org: Organization = Depends(get_current_org_for_email_forwarding),
 ) -> ForwardingAddress:
     return await _set_address_status(forwarding_address_id, current_org.organization_id, ForwardingAddressStatus.ACTIVE)
 
@@ -544,7 +546,7 @@ async def enable_forwarding_address(
 )
 async def revoke_forwarding_address(
     forwarding_address_id: str,
-    current_org: Organization = Depends(org_auth_service.get_current_org_for_credential_routes),
+    current_org: Organization = Depends(get_current_org_for_email_forwarding),
 ) -> Response:
     current = await _get_address_or_404(forwarding_address_id, current_org.organization_id)
     if current.status == ForwardingAddressStatus.REVOKED:
