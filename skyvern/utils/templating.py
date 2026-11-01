@@ -159,6 +159,10 @@ def get_caller_supplied_workflow_parameter_keys(parameters: Iterable[object]) ->
         safe_keys.update(newly_safe)
 
 
+class TransformedPlaceholderError(ValueError):
+    pass
+
+
 def reject_jinja_transformations_on_variable(
     template_source: str,
     variable_name: str,
@@ -176,7 +180,7 @@ def reject_jinja_transformations_on_variable(
         variable.name == variable_name and id(variable) not in direct_interpolations
         for variable in ast.find_all(nodes.Name)
     ):
-        raise ValueError(f"The {variable_name} placeholder must be used without Jinja transformations")
+        raise TransformedPlaceholderError(f"The {variable_name} placeholder must be used without Jinja transformations")
 
 
 MAX_AVAILABLE_KEYS = 200

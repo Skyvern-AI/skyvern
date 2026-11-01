@@ -29,6 +29,7 @@ from skyvern.exceptions import (
     BrowserSessionClosed,
     BrowserSessionStartupTimeout,
     CopilotInlineSequentialCredentialUnsupported,
+    WorkflowNotFound,
 )
 from skyvern.forge import app
 from skyvern.forge.failure_classifier import without_output_only_categories, without_output_only_labels
@@ -366,10 +367,13 @@ from .guardrails import (
 )
 from .scouting import _mark_post_run_page_observed, _redact_codeblock_value
 from .workflow_update import (
+    CopilotCanonicalWorkflowUnavailableError,
     ProposalAdoptionOutcome,
     adopt_stored_workflow_candidate,
+    canonical_workflow_unavailable_result,
     prior_draft_settings_match_stored_candidate,
     proposal_conflict_result,
+    require_active_canonical_workflow,
     strip_copilot_yaml_headers,
     unseen_adoption,
 )
@@ -3770,6 +3774,24 @@ def _with_build_test_acquisition_context(
     return result
 
 
+def _test_start_unavailable_result(ctx: CopilotContext) -> dict[str, Any]:
+    unavailable = CopilotCanonicalWorkflowUnavailableError(ctx.workflow_permanent_id)
+    return {
+        **canonical_workflow_unavailable_result(ctx, unavailable, refused="test_start"),
+        "data": {"run_dispatched": False, _PROPOSAL_BIND_REFUSED_KEY: True},
+    }
+
+
+async def _canonical_workflow_unavailable_refusal(ctx: CopilotContext) -> dict[str, Any] | None:
+    if not ctx.workflow_copilot_chat_id:
+        return None
+    try:
+        await require_active_canonical_workflow(ctx)
+    except CopilotCanonicalWorkflowUnavailableError:
+        return _test_start_unavailable_result(ctx)
+    return None
+
+
 async def run_workflow_end_to_end(
     ctx: CopilotContext,
     workflow_yaml: str | None = None,
@@ -3783,6 +3805,9 @@ async def run_workflow_end_to_end(
     authority_error = _authority_tool_error(ctx, "run_blocks_and_collect_debug")
     if authority_error:
         return {"ok": False, "error": authority_error}
+    unavailable = await _canonical_workflow_unavailable_refusal(ctx)
+    if unavailable is not None:
+        return unavailable
 
     if workflow_yaml is not None:
         # The UI still submits its candidate; the model tool selects it without resubmitting code.
@@ -4088,6 +4113,13 @@ async def _run_blocks_and_collect_debug(
         ctx.frontier_named_output_refusal = None
         ctx.frontier_origin_reused_labels = []
         ctx.frontier_selected_output_sources = {}
+
+    unavailable = await _canonical_workflow_unavailable_refusal(ctx)
+    if unavailable is not None:
+        if verified_new_exit is not None and verified_new_exit.new_browser_session_id:
+            # A re-entry inherits the verified new-exit browser; nothing else will close it.
+            await close_browser_session_quietly(ctx.organization_id, verified_new_exit.new_browser_session_id)
+        return unavailable
 
     block_labels = params["block_labels"]
     if not block_labels:
@@ -4681,6 +4713,10 @@ async def _run_blocks_and_collect_debug(
                     organization_id=ctx.organization_id,
                 )
                 dispatch_draft_workflow_id = dispatch_workflow.workflow_id
+            except WorkflowNotFound:
+                # The version write re-reads the active row under the lock deletion takes, so this is the
+                # agent becoming unavailable after the earlier check, not a persistence failure.
+                return _test_start_unavailable_result(ctx)
             except Exception:
                 LOG.warning(
                     "Failed to persist copilot run snapshot; blocking execution",

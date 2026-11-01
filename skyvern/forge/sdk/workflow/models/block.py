@@ -66,9 +66,10 @@ import filetype
 import pandas as pd
 import structlog
 from charset_normalizer import from_bytes
-from jinja2 import StrictUndefined, TemplateSyntaxError, UndefinedError
+from jinja2 import StrictUndefined, TemplateError, TemplateSyntaxError, UndefinedError
 from jinja2 import meta as jinja2_meta
 from jinja2 import nodes
+from jinja2.exceptions import SecurityError
 from jinja2.sandbox import SandboxedEnvironment
 from jinja2.visitor import NodeTransformer
 from jsonschema import Draft202012Validator
@@ -122,6 +123,7 @@ from skyvern.exceptions import (
     DownloadSaveIncompleteError,
     FailedToGetTOTPVerificationCode,
     FailedToNavigateToUrl,
+    InvalidUrl,
     MalformedBranchEvaluationError,
     MissingBrowserState,
     MissingBrowserStatePage,
@@ -266,6 +268,7 @@ from skyvern.forge.sdk.workflow.context_manager import (
     register_secret_derived_output,
 )
 from skyvern.forge.sdk.workflow.exceptions import (
+    RENDER_FAILURE_OUTPUT_KEY,
     CodeBlockTemplateSyntaxError,
     CustomizedCodeException,
     CustomSMTPAuthenticationFailed,
@@ -281,6 +284,8 @@ from skyvern.forge.sdk.workflow.exceptions import (
     NoValidEmailRecipient,
     PayloadTemplateRenderError,
     PayloadTemplateSyntaxError,
+    RenderFailureKind,
+    TemplateRenderCause,
     WorksheetNotFound,
 )
 from skyvern.forge.sdk.workflow.loop_download_filter import (
@@ -380,7 +385,12 @@ from skyvern.utils.secret_redaction import (
     redact_secrets_from_text,
 )
 from skyvern.utils.strings import generate_random_string
-from skyvern.utils.templating import get_available_keys, get_missing_variables, reject_jinja_transformations_on_variable
+from skyvern.utils.templating import (
+    TransformedPlaceholderError,
+    get_available_keys,
+    get_missing_variables,
+    reject_jinja_transformations_on_variable,
+)
 from skyvern.utils.token_counter import count_tokens, decode_tokens, encode_tokens
 from skyvern.utils.url_validators import (
     prepend_scheme_and_validate_url,
@@ -659,7 +669,7 @@ def _absent_template_roots(env: SandboxedEnvironment, source: str, template_data
     return sorted(_find_template_roots(env, source) - template_data.keys() - env.globals.keys())
 
 
-def _missing_reference_suffix(exc: BaseException) -> str:
+def _missing_references_text(exc: BaseException) -> str:
     cause = _exception_in_cause_chain(exc, FailedToFormatJinjaStyleParameter) or _exception_in_cause_chain(
         exc, MissingJinjaVariables
     )
@@ -673,7 +683,147 @@ def _missing_reference_suffix(exc: BaseException) -> str:
     label = "Missing reference" if total == 1 else "Missing references"
     hidden = total - len(shown)
     more = f", and {hidden} more" if hidden else ""
-    return f" {label}: {', '.join(shown)}{more}."
+    return f"{label}: {', '.join(shown)}{more}"
+
+
+_MAX_RENDER_CAUSE_EXPRESSION_LENGTH = 120
+_LITERAL_TOKEN_TYPES = frozenset({"string", "integer", "float"})
+
+
+def _failing_template_line(exc: BaseException) -> int | None:
+    if isinstance(exc, TemplateSyntaxError):
+        return exc.lineno
+    template_lines = [
+        frame.lineno for frame in traceback.extract_tb(exc.__traceback__) if frame.filename == "<template>"
+    ]
+    return template_lines[-1] if template_lines else None
+
+
+def _template_expressions_on_line(
+    env: SandboxedEnvironment, source: str, line: int, missing_references: list[str]
+) -> tuple[str, ...]:
+    """The `{{ }}` expressions and `{% %}` tags spanning `line`, rebuilt from lexer tokens with every literal
+    shown as `...`. A bare keyword tag such as `endif` or `else` cannot fail, so it is left out."""
+    found: list[tuple[str, set[str]]] = []
+    tokens: list[str] | None = None
+    names: set[str] = set()
+    start_line = 0
+    is_tag = False
+    try:
+        lexed = list(env.lex(source))
+    except TemplateSyntaxError:
+        return ()
+    for lineno, token_type, value in lexed:
+        if token_type in ("variable_begin", "block_begin"):
+            tokens, names, start_line, is_tag = [], set(), lineno, token_type == "block_begin"
+        elif token_type in ("variable_end", "block_end") and tokens is not None:
+            expression = " ".join("".join(tokens).split())
+            if start_line <= line <= lineno and not (is_tag and expression.isidentifier()):
+                found.append((expression, names))
+            tokens = None
+        elif tokens is not None:
+            if token_type == "name":
+                names.add(value)
+            tokens.append("..." if token_type in _LITERAL_TOKEN_TYPES else value)
+    naming_a_missing_root = [expression for expression, names in found if names & set(missing_references)]
+    return tuple(naming_a_missing_root or [expression for expression, _ in found])
+
+
+def _undefined_kind(missing_references: list[str]) -> RenderFailureKind:
+    return RenderFailureKind.MISSING_REFERENCE if missing_references else RenderFailureKind.MISSING_KEY_OR_ATTRIBUTE
+
+
+def _render_cause(
+    exc: BaseException, source: str, env: SandboxedEnvironment, missing_references: list[str]
+) -> TemplateRenderCause:
+    if isinstance(exc, TemplateSyntaxError):
+        kind = RenderFailureKind.SYNTAX_ERROR
+    elif isinstance(exc, SecurityError):
+        kind = RenderFailureKind.UNSAFE_OPERATION
+    elif isinstance(exc, UndefinedError):
+        kind = _undefined_kind(missing_references)
+    elif isinstance(exc, (TypeError, ValueError)):
+        kind = RenderFailureKind.WRONG_VALUE_TYPE
+    else:
+        kind = RenderFailureKind.RENDER_ERROR
+    line = _failing_template_line(exc)
+    expressions = _template_expressions_on_line(env, source, line, missing_references) if line is not None else ()
+    return TemplateRenderCause(kind, expressions, line)
+
+
+def _template_render_cause(exc: BaseException) -> TemplateRenderCause | None:
+    if isinstance(exc, InvalidUrl):
+        return TemplateRenderCause(RenderFailureKind(f"Invalid URL: {exc.reason}"), field_name=exc.field_name)
+    if isinstance(exc, TransformedPlaceholderError):
+        return TemplateRenderCause(RenderFailureKind.TRANSFORMED_PLACEHOLDER)
+    cause: BaseException | None = exc
+    while cause is not None:
+        if isinstance(cause, (FailedToFormatJinjaStyleParameter, MissingJinjaVariables)) and cause.render_cause:
+            return cause.render_cause
+        cause = cause.__cause__
+    missing_exc = _exception_in_cause_chain(exc, MissingJinjaVariables)
+    if missing_exc is not None:
+        return TemplateRenderCause(_undefined_kind(missing_exc.missing_references))
+    if (
+        _exception_in_cause_chain(exc, FailedToFormatJinjaStyleParameter) is not None
+        or _exception_in_cause_chain(exc, PayloadTemplateRenderError) is not None
+    ):
+        return TemplateRenderCause(RenderFailureKind.RENDER_ERROR)
+    template_exc = _exception_in_cause_chain(exc, TemplateError)
+    if template_exc is not None:
+        return _render_cause(template_exc, "", jinja_sandbox_env, [])
+    return None
+
+
+def _redacted_expressions(expressions: tuple[str, ...], redact: Callable[[str], str]) -> str | None:
+    """Redacts each expression before cutting it, so a secret straddling the cut leaves no prefix behind."""
+    shown = []
+    for expression in expressions:
+        expression = redact(expression)
+        if len(expression) > _MAX_RENDER_CAUSE_EXPRESSION_LENGTH:
+            expression = expression[: _MAX_RENDER_CAUSE_EXPRESSION_LENGTH - 3] + "..."
+        shown.append(expression)
+    return "; ".join(shown) or None
+
+
+def _redacted_payload_path(segments: tuple[str | int, ...], redact: Callable[[str], str]) -> str:
+    path = "payload"
+    for segment in segments:
+        part = f"[{segment}]" if isinstance(segment, int) else _format_payload_path_segment(redact(segment))
+        if len(path) + len(part) > _MAX_RENDER_CAUSE_EXPRESSION_LENGTH:
+            return f"{path}..."
+        path += part
+    return path
+
+
+def render_failure_reason(prefix: str, exc: BaseException, redact: Callable[[str], str]) -> str:
+    """`prefix` plus the render cause; never the exception text or the template, which can carry parameter values."""
+    cause = _template_render_cause(exc) or TemplateRenderCause(RenderFailureKind.RENDER_ERROR)
+    missing = _missing_references_text(exc)
+    expression = _redacted_expressions(cause.expressions, redact)
+    if cause.kind is RenderFailureKind.MISSING_REFERENCE and missing and not expression:
+        reason, missing = f"{prefix} {missing}", ""
+    else:
+        reason = f"{prefix} {cause.kind}" + (f" in `{expression}`" if expression else "")
+    location = [f"field {cause.field_name}"] if cause.field_name else []
+    if cause.line is not None:
+        location.append(f"line {cause.line}")
+    if location:
+        reason += f" ({', '.join(location)})"
+    payload_exc = _exception_in_cause_chain(exc, PayloadTemplateRenderError)
+    if payload_exc is not None:
+        reason += f" at {_redacted_payload_path(payload_exc.segments, redact)}"
+    return redact(f"{reason}." + (f" {missing}." if missing else ""))
+
+
+def render_failure_record(exc: BaseException, redact: Callable[[str], str]) -> dict[str, Any]:
+    cause = _template_render_cause(exc) or TemplateRenderCause(RenderFailureKind.RENDER_ERROR)
+    return {
+        "kind": cause.kind.value,
+        "field": cause.field_name,
+        "expression": _redacted_expressions(cause.expressions, redact),
+        "line": cause.line,
+    }
 
 
 if settings.WORKFLOW_TEMPLATING_STRICTNESS == "strict":
@@ -1145,17 +1295,14 @@ class Block(BaseModel, abc.ABC):
                 extra_template_data=extra_template_data,
             )
         except Exception as exc:
-            if field not in ("totp_identifier", "totp_verification_url"):
-                raise
-            cause = exc.__cause__ or exc
-            failure_class = (
-                "syntax"
-                if isinstance(cause, TemplateSyntaxError)
-                else "missing variable"
-                if isinstance(exc, MissingJinjaVariables) or isinstance(cause, UndefinedError)
-                else "evaluation"
+            cause = replace(
+                _template_render_cause(exc) or TemplateRenderCause(RenderFailureKind.RENDER_ERROR), field_name=field
             )
-            raise SkyvernException(f"Failed to render {field}: {failure_class}.") from None
+            if field in ("totp_identifier", "totp_verification_url"):
+                raise FailedToFormatJinjaStyleParameter(field, field, render_cause=cause) from None
+            if isinstance(exc, (FailedToFormatJinjaStyleParameter, MissingJinjaVariables)):
+                exc.render_cause = cause
+            raise
 
     @staticmethod
     def _registered_secret_values(workflow_run_context: WorkflowRunContext) -> set[str]:
@@ -1191,6 +1338,10 @@ class Block(BaseModel, abc.ABC):
         for secret in sorted(cls._registered_secret_values(workflow_run_context), key=len, reverse=True):
             value = value.replace(secret, "[redacted]")
         return value
+
+    @classmethod
+    def secret_redactor(cls, workflow_run_context: WorkflowRunContext) -> Callable[[str], str]:
+        return partial(cls._redact_registered_secrets, workflow_run_context=workflow_run_context)
 
     def _render_error_code_mapping(
         self,
@@ -1335,6 +1486,7 @@ class Block(BaseModel, abc.ABC):
         workflow_run_block_id: str | None,
         organization_id: str | None,
         can_continue_after_failure: bool | None = None,
+        render_failure: bool = True,
     ) -> BlockResult:
         failure_reason = self._redact_registered_secrets(failure_reason, workflow_run_context)
         error_codes = self.get_failure_error_codes()
@@ -1349,6 +1501,10 @@ class Block(BaseModel, abc.ABC):
             failure_output["available_keys"] = [
                 self._redact_registered_secrets(key, workflow_run_context) for key in format_exc.available_keys
             ]
+        if render_failure:
+            failure_output[RENDER_FAILURE_OUTPUT_KEY] = render_failure_record(
+                exc, self.secret_redactor(workflow_run_context)
+            )
         await self.record_output_parameter_value(workflow_run_context, workflow_run_id, failure_output)
         return await self.build_block_result(
             success=False,
@@ -1598,10 +1754,13 @@ class Block(BaseModel, abc.ABC):
         if not potential_template:
             return potential_template
 
+        render_env = env or jinja_sandbox_env
         try:
-            template = (env or jinja_sandbox_env).from_string(potential_template)
+            template = render_env.from_string(potential_template)
         except Exception as exc:
-            raise FailedToFormatJinjaStyleParameter(potential_template, str(exc)) from exc
+            raise FailedToFormatJinjaStyleParameter(
+                potential_template, str(exc), render_cause=_render_cause(exc, potential_template, render_env, [])
+            ) from exc
 
         template_data = self._build_block_parameter_template_data(
             workflow_run_context, force_include_secrets=force_include_secrets
@@ -1613,14 +1772,40 @@ class Block(BaseModel, abc.ABC):
 
         # A caller whose environment decides for itself what an absent binding means renders instead of
         # failing here, so `| default(...)` still reaches an undefined the preflight would reject.
+        def format_failure(exc: Exception) -> FailedToFormatJinjaStyleParameter:
+            # Only Jinja's own "'X' is undefined" names a root, so a default-guarded absent root is never blamed.
+            missing_references = (
+                [
+                    root
+                    for root in _absent_template_roots(render_env, potential_template, template_data)
+                    if str(exc) == f"{root!r} is undefined"
+                ]
+                if isinstance(exc, UndefinedError)
+                else []
+            )
+            return FailedToFormatJinjaStyleParameter(
+                potential_template,
+                str(exc),
+                available_keys=get_available_keys(potential_template, template_data),
+                missing_references=missing_references,
+                render_cause=_render_cause(exc, potential_template, render_env, missing_references),
+            )
+
         if settings.WORKFLOW_TEMPLATING_STRICTNESS == "strict" and not skip_missing_variable_preflight:
-            if missing_variables := get_missing_variables(potential_template, template_data):
+            try:
+                missing_variables = get_missing_variables(potential_template, template_data)
+            except SkyvernException:
+                raise
+            except Exception as exc:
+                raise format_failure(exc) from exc
+            if missing_variables:
+                absent_roots = _absent_template_roots(render_env, potential_template, template_data)
+                # The preflight can also list references that rendered fine, so a nested miss names no line.
                 raise MissingJinjaVariables(
                     template=potential_template,
                     variables=missing_variables,
-                    missing_references=_absent_template_roots(
-                        env or jinja_sandbox_env, potential_template, template_data
-                    ),
+                    missing_references=absent_roots,
+                    render_cause=TemplateRenderCause(_undefined_kind(absent_roots)),
                 )
 
         try:
@@ -1628,22 +1813,7 @@ class Block(BaseModel, abc.ABC):
         except SkyvernException:
             raise
         except Exception as exc:
-            # Only Jinja's own "'X' is undefined" names a root, so a default-guarded absent root is never blamed.
-            missing_references = (
-                [
-                    root
-                    for root in _absent_template_roots(env or jinja_sandbox_env, potential_template, template_data)
-                    if str(exc) == f"{root!r} is undefined"
-                ]
-                if isinstance(exc, UndefinedError)
-                else []
-            )
-            raise FailedToFormatJinjaStyleParameter(
-                potential_template,
-                str(exc),
-                available_keys=get_available_keys(potential_template, template_data),
-                missing_references=missing_references,
-            ) from exc
+            raise format_failure(exc) from exc
         register_secret_derived_output(
             workflow_run_context.secrets, template, potential_template, template_data, rendered
         )
@@ -1763,7 +1933,29 @@ class Block(BaseModel, abc.ABC):
                 self.workflow_system_prompt = notes_section
             workflow_run_context.record_block_workflow_system_prompt(self.label, notes_section)
             return
-        resolved = workflow_run_context.resolve_effective_workflow_system_prompt()
+        try:
+            resolved = workflow_run_context.resolve_effective_workflow_system_prompt()
+        except MissingJinjaVariables:
+            raise
+        except Exception as exc:
+            definition = workflow_run_context.workflow.workflow_definition if workflow_run_context.workflow else None
+            sources = [
+                source
+                for source in (
+                    workflow_run_context.inherited_workflow_system_prompt,
+                    definition.workflow_system_prompt if definition else None,
+                )
+                if isinstance(source, str) and source
+            ]
+            # With both an inherited and an own prompt, the expression lookup cannot tell which one the line is in.
+            source = sources[0] if len(sources) == 1 else ""
+            raise FailedToFormatJinjaStyleParameter(
+                "workflow system prompt",
+                type(exc).__name__,
+                render_cause=replace(
+                    _render_cause(exc, source, jinja_sandbox_env, []), field_name="workflow_system_prompt"
+                ),
+            ) from exc
         if notes_section:
             resolved = "\n\n".join(part for part in (resolved, notes_section) if part)
         if resolved is not None:
@@ -2748,7 +2940,9 @@ class BaseTaskBlock(Block):
         except Exception as e:
             return await self._template_format_failure_result(
                 e,
-                f"Failed to format jinja template: {str(e)}",
+                render_failure_reason(
+                    "Failed to format jinja template:", e, self.secret_redactor(workflow_run_context)
+                ),
                 workflow_run_context,
                 workflow_run_id,
                 workflow_run_block_id,
@@ -9920,7 +10114,9 @@ async def wrapper({default_args}):
                 download_log.close()
                 return await self._template_format_failure_result(
                     e,
-                    "Failed to format CodeBlock parameters." + _missing_reference_suffix(e),
+                    render_failure_reason(
+                        "Failed to format CodeBlock parameters.", e, self.secret_redactor(workflow_run_context)
+                    ),
                     workflow_run_context,
                     workflow_run_id,
                     workflow_run_block_id,
@@ -11397,12 +11593,12 @@ class TextPromptBlock(Block):
         if isinstance(obj, str):
             try:
                 return self.render_templatable_field("json_schema", obj, workflow_run_context)
-            except Exception:
+            except Exception as exc:
                 LOG.warning(
                     "Failed to render Jinja template in json_schema value, using original value",
                     value=obj,
                     block_label=self.label,
-                    exc_info=True,
+                    render_failure=render_failure_record(exc, self.secret_redactor(workflow_run_context)),
                 )
                 return obj
         elif isinstance(obj, dict):
@@ -11662,7 +11858,9 @@ class TextPromptBlock(Block):
         except Exception as e:
             return await self._template_format_failure_result(
                 e,
-                f"Failed to format jinja template: {str(e)}",
+                render_failure_reason(
+                    "Failed to format jinja template:", e, self.secret_redactor(workflow_run_context)
+                ),
                 workflow_run_context,
                 workflow_run_id,
                 workflow_run_block_id,
@@ -11839,7 +12037,9 @@ class DownloadToS3Block(Block):
         except Exception as e:
             return await self._template_format_failure_result(
                 e,
-                f"Failed to format jinja template: {str(e)}",
+                render_failure_reason(
+                    "Failed to format jinja template:", e, self.secret_redactor(workflow_run_context)
+                ),
                 workflow_run_context,
                 workflow_run_id,
                 workflow_run_block_id,
@@ -11949,7 +12149,9 @@ class UploadToS3Block(Block):
         except Exception as e:
             return await self._template_format_failure_result(
                 e,
-                f"Failed to format jinja template: {str(e)}",
+                render_failure_reason(
+                    "Failed to format jinja template:", e, self.secret_redactor(workflow_run_context)
+                ),
                 workflow_run_context,
                 workflow_run_id,
                 workflow_run_block_id,
@@ -12991,7 +13193,9 @@ class FileUploadBlock(FileDestinationBlock):
         except Exception as e:
             return await self._template_format_failure_result(
                 e,
-                f"Failed to format jinja template: {str(e)}",
+                render_failure_reason(
+                    "Failed to format jinja template:", e, self.secret_redactor(workflow_run_context)
+                ),
                 workflow_run_context,
                 workflow_run_id,
                 workflow_run_block_id,
@@ -13335,9 +13539,25 @@ _GMAIL_AUTHORIZATION_ERROR_CODES: dict[google_oauth_service.GmailSendAuthorizati
 
 
 class _GmailSendRefused(Exception):
-    def __init__(self, error_code: GmailSendErrorCode) -> None:
+    def __init__(
+        self,
+        error_code: GmailSendErrorCode,
+        failure_reason: str | None = None,
+        render_failure: dict[str, Any] | None = None,
+    ) -> None:
         super().__init__(error_code.value)
         self.error_code = error_code
+        self.failure_reason = failure_reason or GMAIL_SEND_FAILURE_MESSAGES[error_code]
+        self.render_failure = render_failure
+
+
+def _gmail_template_refusal(exc: Exception, redact: Callable[[str], str]) -> _GmailSendRefused:
+    prefix = GMAIL_SEND_FAILURE_MESSAGES[GmailSendErrorCode.TEMPLATE_ERROR]
+    return _GmailSendRefused(
+        GmailSendErrorCode.TEMPLATE_ERROR,
+        render_failure_reason(prefix, exc, redact),
+        render_failure_record(exc, redact),
+    )
 
 
 class _GmailSendStateUnreadable(Exception):
@@ -13816,8 +14036,8 @@ class SendEmailBlock(Block):
                 entry = value
             try:
                 entry = self.render_templatable_field("file_attachments", entry, workflow_run_context)
-            except Exception:
-                raise _GmailSendRefused(GmailSendErrorCode.TEMPLATE_ERROR) from None
+            except Exception as exc:
+                raise _gmail_template_refusal(exc, self.secret_redactor(workflow_run_context)) from None
             if not entry.strip() or entry == settings.WORKFLOW_DOWNLOAD_DIRECTORY_PARAMETER_KEY:
                 raise _GmailSendRefused(GmailSendErrorCode.ATTACHMENT_INVALID)
             try:
@@ -13870,8 +14090,8 @@ class SendEmailBlock(Block):
 
         try:
             self.format_potential_template_parameters(workflow_run_context)
-        except Exception:
-            raise _GmailSendRefused(GmailSendErrorCode.TEMPLATE_ERROR) from None
+        except Exception as exc:
+            raise _gmail_template_refusal(exc, self.secret_redactor(workflow_run_context)) from None
 
         credential_id = (self.credential_id or "").strip()
         if not credential_id:
@@ -13989,6 +14209,8 @@ class SendEmailBlock(Block):
         organization_id: str | None,
     ) -> BlockResult:
         replayed = False
+        refusal_reason: str | None = None
+        render_failure: dict[str, Any] | None = None
         try:
             if not organization_id:
                 raise _GmailSendRefused(GmailSendErrorCode.CONFIGURATION)
@@ -13997,6 +14219,8 @@ class SendEmailBlock(Block):
             )
         except _GmailSendRefused as refusal:
             result = GmailSendResult(GmailSendOutcome.FAILED, error_code=refusal.error_code)
+            refusal_reason = refusal.failure_reason
+            render_failure = refusal.render_failure
         except _GmailSendStateUnreadable:
             result = GmailSendResult(GmailSendOutcome.UNKNOWN, error_code=GmailSendErrorCode.OUTCOME_UNKNOWN)
         except Exception as exc:
@@ -14020,7 +14244,7 @@ class SendEmailBlock(Block):
             provider_reason=result.provider_reason,
             replayed=replayed,
         )
-        result_dict = {
+        result_dict: dict[str, Any] = {
             "success": accepted,
             "transport": EmailTransport.GMAIL.value,
             "outcome": result.outcome.value,
@@ -14028,12 +14252,14 @@ class SendEmailBlock(Block):
             "error_code": result.error_code.value if result.error_code else None,
             "replayed": replayed,
         }
+        if render_failure is not None:
+            result_dict[RENDER_FAILURE_OUTPUT_KEY] = render_failure
         await self.record_output_parameter_value(workflow_run_context, workflow_run_id, result_dict)
         return await self.build_block_result(
             success=accepted,
             failure_reason=None
             if accepted
-            else GMAIL_SEND_FAILURE_MESSAGES[result.error_code or GmailSendErrorCode.INTERNAL_ERROR],
+            else refusal_reason or GMAIL_SEND_FAILURE_MESSAGES[result.error_code or GmailSendErrorCode.INTERNAL_ERROR],
             output_parameter_value=result_dict,
             status=BlockStatus.completed if accepted else BlockStatus.failed,
             workflow_run_block_id=workflow_run_block_id,
@@ -14066,7 +14292,9 @@ class SendEmailBlock(Block):
         except Exception as e:
             return await self._template_format_failure_result(
                 e,
-                f"Failed to format jinja template: {str(e)}",
+                render_failure_reason(
+                    "Failed to format jinja template:", e, self.secret_redactor(workflow_run_context)
+                ),
                 workflow_run_context,
                 workflow_run_id,
                 workflow_run_block_id,
@@ -15480,7 +15708,9 @@ class FileParserBlock(Block):
         try:
             self.format_potential_template_parameters(workflow_run_context)
         except Exception as e:
-            failure_reason = f"Failed to format jinja template: {str(e)}"
+            failure_reason = render_failure_reason(
+                "Failed to format jinja template:", e, self.secret_redactor(workflow_run_context)
+            )
             self._log_failure(
                 failure_reason,
                 self.get_failure_error_codes(),
@@ -15738,7 +15968,9 @@ class PDFParserBlock(Block):
         except Exception as e:
             return await self._template_format_failure_result(
                 e,
-                f"Failed to format jinja template: {str(e)}",
+                render_failure_reason(
+                    "Failed to format jinja template:", e, self.secret_redactor(workflow_run_context)
+                ),
                 workflow_run_context,
                 workflow_run_id,
                 workflow_run_block_id,
@@ -16049,7 +16281,9 @@ class HumanInteractionBlock(BaseTaskBlock):
         except Exception as e:
             return await self._template_format_failure_result(
                 e,
-                f"Failed to format jinja template: {str(e)}",
+                render_failure_reason(
+                    "Failed to format jinja template:", e, self.secret_redactor(workflow_run_context)
+                ),
                 workflow_run_context,
                 workflow_run_id,
                 workflow_run_block_id,
@@ -16436,6 +16670,7 @@ class ExtractionBlock(ParquetExportMixin, BaseTaskBlock):
                 workflow_run_id,
                 workflow_run_block_id,
                 organization_id,
+                render_failure=False,
             )
 
         merged_output = {**result.output_parameter_value, "export": export_output}
@@ -17269,7 +17504,9 @@ class TaskV2Block(Block):
         except Exception as e:
             return await self._template_format_failure_result(
                 e,
-                f"Failed to format jinja template: {str(e)}",
+                render_failure_reason(
+                    "Failed to format jinja template:", e, self.secret_redactor(workflow_run_context)
+                ),
                 workflow_run_context,
                 workflow_run_id,
                 workflow_run_block_id,
@@ -17898,7 +18135,9 @@ class HttpRequestBlock(Block):
         except Exception as e:
             return await self._template_format_failure_result(
                 e,
-                f"Failed to format jinja template: {str(e)}",
+                render_failure_reason(
+                    "Failed to format jinja template:", e, self.secret_redactor(workflow_run_context)
+                ),
                 workflow_run_context,
                 workflow_run_id,
                 workflow_run_block_id,
@@ -20212,6 +20451,7 @@ class WorkflowTriggerBlock(Block):
                 "The '| json' filter can only be used for complete value replacement. "
                 "It cannot be combined with other text (e.g., 'prefix-{{ val | json }}'). "
                 "Remove the surrounding text or remove the '| json' filter.",
+                render_cause=TemplateRenderCause(RenderFailureKind.JSON_FILTER_WITH_OTHER_TEXT),
             )
         return rendered
 
@@ -20274,6 +20514,7 @@ class WorkflowTriggerBlock(Block):
         value: str,
         workflow_run_context: WorkflowRunContext,
         path: str,
+        segments: tuple[str | int, ...] = (),
     ) -> Any:
         # Wrap render errors with JSON-pointer-style payload path + template so
         # the failure reason surfaces where to look in the workflow.
@@ -20282,24 +20523,26 @@ class WorkflowTriggerBlock(Block):
         except PayloadTemplateRenderError:
             raise
         except Exception as exc:
-            raise PayloadTemplateRenderError(path=path, template=value, original=exc) from exc
+            raise PayloadTemplateRenderError(path=path, template=value, original=exc, segments=segments) from exc
 
     def _render_templates_in_payload(
         self,
         payload: dict[str, Any],
         workflow_run_context: WorkflowRunContext,
         _path: str = "payload",
+        _segments: tuple[str | int, ...] = (),
     ) -> dict[str, Any]:
         """Recursively render Jinja2 templates in payload values."""
         resolved: dict[str, Any] = {}
         for key, value in payload.items():
             current_path = f"{_path}{_format_payload_path_segment(key)}"
+            segments = (*_segments, key)
             if isinstance(value, str):
-                resolved[key] = self._render_scalar_with_path(value, workflow_run_context, current_path)
+                resolved[key] = self._render_scalar_with_path(value, workflow_run_context, current_path, segments)
             elif isinstance(value, dict):
-                resolved[key] = self._render_templates_in_payload(value, workflow_run_context, current_path)
+                resolved[key] = self._render_templates_in_payload(value, workflow_run_context, current_path, segments)
             elif isinstance(value, list):
-                resolved[key] = self._render_templates_in_list(value, workflow_run_context, current_path)
+                resolved[key] = self._render_templates_in_list(value, workflow_run_context, current_path, segments)
             else:
                 resolved[key] = value
         return resolved
@@ -20309,17 +20552,19 @@ class WorkflowTriggerBlock(Block):
         items: list[Any],
         workflow_run_context: WorkflowRunContext,
         _path: str = "payload",
+        _segments: tuple[str | int, ...] = (),
     ) -> list[Any]:
         """Recursively render Jinja2 templates in list items (strings, nested dicts, and nested lists)."""
         result: list[Any] = []
         for idx, item in enumerate(items):
             current_path = f"{_path}[{idx}]"
+            segments = (*_segments, idx)
             if isinstance(item, str):
-                result.append(self._render_scalar_with_path(item, workflow_run_context, current_path))
+                result.append(self._render_scalar_with_path(item, workflow_run_context, current_path, segments))
             elif isinstance(item, dict):
-                result.append(self._render_templates_in_payload(item, workflow_run_context, current_path))
+                result.append(self._render_templates_in_payload(item, workflow_run_context, current_path, segments))
             elif isinstance(item, list):
-                result.append(self._render_templates_in_list(item, workflow_run_context, current_path))
+                result.append(self._render_templates_in_list(item, workflow_run_context, current_path, segments))
             else:
                 result.append(item)
         return result
@@ -20396,7 +20641,7 @@ class WorkflowTriggerBlock(Block):
         except Exception as e:
             return await self._template_format_failure_result(
                 e,
-                f"Failed to resolve templates: {str(e)}",
+                render_failure_reason("Failed to resolve templates:", e, self.secret_redactor(workflow_run_context)),
                 workflow_run_context,
                 workflow_run_id,
                 workflow_run_block_id,

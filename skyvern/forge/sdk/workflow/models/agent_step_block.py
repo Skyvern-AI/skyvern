@@ -7,7 +7,7 @@ import structlog
 from skyvern.forge import app
 from skyvern.forge.sdk.api.llm.config_registry import LLMConfigRegistry
 from skyvern.forge.sdk.api.llm.custom_llm_registry import is_custom_llm_key
-from skyvern.forge.sdk.workflow.models.block import Block
+from skyvern.forge.sdk.workflow.models.block import Block, render_failure_reason
 from skyvern.forge.sdk.workflow.models.parameter import PARAMETER_TYPE
 from skyvern.schemas.workflows import BlockResult, BlockStatus, BlockType
 
@@ -96,7 +96,7 @@ class AgentStepBlock(Block):
         except Exception as e:
             return await self._template_format_failure_result(
                 e,
-                f"Failed to format jinja template: {e}",
+                render_failure_reason("Failed to format jinja template:", e, self.secret_redactor(run_context)),
                 run_context,
                 workflow_run_id,
                 workflow_run_block_id,

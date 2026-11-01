@@ -7,7 +7,7 @@ from typing import Any, ClassVar, Literal
 from skyvern.forge.sdk.workflow.context_manager import WorkflowRunContext
 from skyvern.forge.sdk.workflow.exceptions import FailedToFormatJinjaStyleParameter
 from skyvern.forge.sdk.workflow.models._jinja import jinja_json_finalize_required_binding_env
-from skyvern.forge.sdk.workflow.models.block import Block, ParquetExportMixin
+from skyvern.forge.sdk.workflow.models.block import Block, ParquetExportMixin, render_failure_reason
 from skyvern.forge.sdk.workflow.models.parameter import PARAMETER_TYPE
 from skyvern.schemas.workflows import BlockResult, BlockStatus, BlockType
 from skyvern.utils.parquet_export import ParquetExportError
@@ -65,7 +65,9 @@ class DataExportBlock(ParquetExportMixin, Block):
         except Exception as exc:
             return await self._template_format_failure_result(
                 exc,
-                str(exc),
+                render_failure_reason(
+                    "Failed to format jinja template:", exc, self.secret_redactor(workflow_run_context)
+                ),
                 workflow_run_context,
                 workflow_run_id,
                 workflow_run_block_id,

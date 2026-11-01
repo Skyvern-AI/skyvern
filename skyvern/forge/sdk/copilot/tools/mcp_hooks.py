@@ -2542,8 +2542,8 @@ def _normalized_authoring_capability(
 
 def _workflow_knowledge_description(capability: AuthoringCapability) -> str:
     topics_lead = (
-        f"Topic {CODE_BLOCK_RUNTIME_TOPIC} covers the builtins, module shims, and helpers a code block's Python may "
-        "use; omit"
+        f"Topic {CODE_BLOCK_RUNTIME_TOPIC} covers the builtins, module shims, helpers, and page object a code "
+        "block's Python may use, including which page calls are recorded as actions; omit"
         if capability.code_blocks
         else "Omit"
     )

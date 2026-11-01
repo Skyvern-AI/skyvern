@@ -19,7 +19,11 @@ from skyvern.forge.prompts import prompt_engine
 from skyvern.forge.sdk.core import skyvern_context
 from skyvern.forge.sdk.workflow import web_search_client
 from skyvern.forge.sdk.workflow.context_manager import WorkflowRunContext
-from skyvern.forge.sdk.workflow.exceptions import FailedToFormatJinjaStyleParameter, MissingJinjaVariables
+from skyvern.forge.sdk.workflow.exceptions import (
+    RENDER_FAILURE_OUTPUT_KEY,
+    FailedToFormatJinjaStyleParameter,
+    MissingJinjaVariables,
+)
 from skyvern.forge.sdk.workflow.models.block import (
     Block,
     TextPromptBlock,
@@ -27,6 +31,8 @@ from skyvern.forge.sdk.workflow.models.block import (
     _is_schema_configuration_failure,
     build_block_failure_output,
     jinja_sandbox_env,
+    render_failure_reason,
+    render_failure_record,
     user_defined_failure_category,
 )
 from skyvern.forge.sdk.workflow.models.parameter import PARAMETER_TYPE
@@ -50,6 +56,7 @@ def _block_output(
     category: FailureCategory | None,
     errors: list[UserDefinedError],
     available_keys: list[str] | None,
+    render_failure: dict[str, Any] | None,
 ) -> dict[str, Any]:
     output = response.output()
     if status != BlockStatus.completed:
@@ -66,6 +73,8 @@ def _block_output(
             ]
         if available_keys:
             output["available_keys"] = available_keys
+        if render_failure:
+            output[RENDER_FAILURE_OUTPUT_KEY] = render_failure
     return output
 
 
@@ -290,6 +299,7 @@ class WebSearchBlock(Block):
         status = BlockStatus.completed
         errors: list[UserDefinedError] = []
         available_keys: list[str] | None = None
+        render_failure: dict[str, Any] | None = None
 
         def sanitize(data: Any) -> Any:
             if context is None:
@@ -297,8 +307,13 @@ class WebSearchBlock(Block):
             return redact_keys(context.mask_secrets_in_data(data), self._registered_secret_values(context))
 
         def template_failure(exc: Exception) -> None:
-            nonlocal failure_reason, category, status, available_keys
-            failure_reason = str(exc)
+            nonlocal failure_reason, category, status, available_keys, render_failure
+            if isinstance(exc, WebSearchError):
+                failure_reason = str(exc)
+            else:
+                redact = self.secret_redactor(context) if context else lambda value: value
+                failure_reason = render_failure_reason("Failed to format jinja template:", exc, redact)
+                render_failure = render_failure_record(exc, redact)
             category = FailureCategory.PARAMETER_BINDING_ERROR
             status = BlockStatus.failed
             format_exc: BaseException | None = exc
@@ -503,13 +518,17 @@ class WebSearchBlock(Block):
             if errors and failure_reason is None:
                 status = BlockStatus.terminated
                 failure_reason = errors[0].reasoning
-            output = sanitize(_block_output(response, status, failure_reason, category, errors, available_keys))
+            output = sanitize(
+                _block_output(response, status, failure_reason, category, errors, available_keys, render_failure)
+            )
             failure_reason = sanitize(failure_reason)
         except Exception as exc:  # noqa: BLE001
             status = BlockStatus.failed
             failure_reason = f"The Search block stopped on an unexpected error ({type(exc).__name__})."
             category = FailureCategory.INFRASTRUCTURE_ERROR
-            output = sanitize(_block_output(response, status, failure_reason, category, errors, available_keys))
+            output = sanitize(
+                _block_output(response, status, failure_reason, category, errors, available_keys, render_failure)
+            )
 
         if context is None:
             context = self.get_workflow_run_context(workflow_run_id)

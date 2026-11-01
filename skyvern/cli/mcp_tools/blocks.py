@@ -14,6 +14,7 @@ from types import SimpleNamespace
 from typing import Annotated, Any
 
 import structlog
+from playwright.async_api import Page
 from pydantic import Field, TypeAdapter, ValidationError
 
 from skyvern.schemas.workflows import (
@@ -433,7 +434,18 @@ def _code_block_runtime_topic() -> dict[str, str]:
     """Render the names a CodeBlock may use from the executor's own namespace declaration."""
     # Keep workflow model imports deferred for the lightweight-install import contract.
     from skyvern.forge.sdk.workflow.models.block import CodeBlock  # noqa: PLC0415
+    from skyvern.forge.sdk.workflow.models.code_block_recorder import (  # noqa: PLC0415
+        _LOCATOR_ACTION_MAP,
+        _LOCATOR_FACTORY_METHODS,
+        _PAGE_ACTION_MAP,
+    )
 
+    def on_page(name: str) -> bool:
+        # The secure runner refuses page.set_input_files; only the locator form is supported.
+        return hasattr(Page, name) and name != "set_input_files"
+
+    factories = sorted({"locator", *_LOCATOR_FACTORY_METHODS})
+    locator_actions = sorted(_LOCATOR_ACTION_MAP)
     safe_vars = CodeBlock.build_safe_vars()
     builtin_names = sorted(name for name in safe_vars["__builtins__"] if not name.startswith("__"))
     shims = {name: sorted(vars(value)) for name, value in safe_vars.items() if isinstance(value, SimpleNamespace)}
@@ -448,6 +460,21 @@ def _code_block_runtime_topic() -> dict[str, str]:
         *(f"- {name}: {', '.join(attrs)}" for name, attrs in sorted(shims.items())),
         "",
         "Helpers: page, " + ", ".join(helpers),
+        "",
+        "Page: `page` is a Playwright async Page.",
+        "Locator factories build a selector and make no browser call. On page or a locator: "
+        + ", ".join(name for name in factories if on_page(name))
+        + "; on a locator only: "
+        + ", ".join(name for name in factories if not on_page(name)),
+        "`await page.evaluate(js, arg=None)` runs JavaScript in the page and returns a JSON-serializable result; "
+        "one call can read many elements.",
+        "Recorded as timeline actions, each with a screenshot: "
+        + ", ".join([*(f"page.{name}" for name in sorted(_PAGE_ACTION_MAP)), "page.keyboard.press"])
+        + "; on page or a locator: "
+        + ", ".join(name for name in locator_actions if on_page(name))
+        + "; on a locator only: "
+        + ", ".join(name for name in locator_actions if not on_page(name)),
+        "Read methods such as inner_text, get_attribute, count, is_visible and wait_for run without a recorded action.",
         "",
         "For a date in a template field use {{current_date}}; inside code use datetime.date.today() "
         "or datetime.datetime.now(datetime.UTC).",
@@ -594,7 +621,8 @@ async def skyvern_workflow_knowledge(
                 "Knowledge topic IDs to retrieve. Omit to list every topic. Common IDs include "
                 "workflow_parameters, parameter_templating, workflow_execution_flow, choosing_a_block, "
                 "common_patterns, best_practices, captcha_solver, proxy_location, and code_block_runtime "
-                "(the builtins, module shims, and helpers a code block's Python may use)."
+                "(the builtins, module shims, helpers, and page object a code block's Python may use, "
+                "including which page calls are recorded as actions)."
             )
         ),
     ] = None,
