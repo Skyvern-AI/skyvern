@@ -60,6 +60,29 @@ def _is_forwarding_address_unique_violation(error: IntegrityError) -> bool:
     )
 
 
+async def _lock_forwarding_address_emails(session: AsyncSession, *email_addresses: str) -> None:
+    bind = session.get_bind()
+    if bind.dialect.name not in {"postgresql", "postgres"}:
+        return
+    # The unique index omits revoked rows, so aliases need a config-independent reservation.
+    for email_address in sorted({normalize_email_address(value) for value in email_addresses}):
+        lock_key = f"email_forwarding_address:{email_address}"
+        await session.execute(select(func.pg_advisory_xact_lock(func.hashtext(lock_key))))
+
+
+async def _ensure_address_not_revoked(session: AsyncSession, email_address: str) -> None:
+    revoked_address_id = await session.scalar(
+        select(OrganizationForwardingAddressModel.forwarding_address_id)
+        .where(
+            func.lower(OrganizationForwardingAddressModel.email_address) == email_address,
+            OrganizationForwardingAddressModel.status == ForwardingAddressStatus.REVOKED,
+        )
+        .limit(1)
+    )
+    if revoked_address_id is not None:
+        raise ForwardingAddressAlreadyExists("Forwarding address is already registered")
+
+
 class EmailForwardingRepository(BaseRepository):
     async def _clear_credential_bindings(
         self,
@@ -169,7 +192,8 @@ class EmailForwardingRepository(BaseRepository):
     async def delete_config(
         self, email_config_id: str, organization_id: str, authorized_credential_ids: set[str]
     ) -> bool:
-        now = datetime.now(UTC)
+        # The model's DateTime columns are naive and store UTC.
+        now = datetime.now(UTC).replace(tzinfo=None)
         async with self.Session() as session:
             config = await session.scalar(
                 select(OrganizationEmailConfigModel)
@@ -197,6 +221,7 @@ class EmailForwardingRepository(BaseRepository):
             current_credential_ids = {address.credential_id for address in active_addresses if address.credential_id}
             if not current_credential_ids <= authorized_credential_ids:
                 raise CredentialBindingAccessChanged("Credential bindings changed; reauthorize before deleting")
+            await _lock_forwarding_address_emails(session, *(address.email_address for address in active_addresses))
             config.deleted_at = now
             config.modified_at = now
             await self._clear_credential_bindings(session, organization_id, active_addresses, now)
@@ -240,6 +265,8 @@ class EmailForwardingRepository(BaseRepository):
             )
             if locked_config_id is None:
                 raise NotFoundError(f"Email config {email_config_id} not found")
+            await _lock_forwarding_address_emails(session, email_address)
+            await _ensure_address_not_revoked(session, email_address)
             if credential_id:
                 credential = (
                     await session.scalars(
@@ -376,7 +403,7 @@ class EmailForwardingRepository(BaseRepository):
             )
             if locked_config_id is None:
                 return None
-            now = datetime.now(timezone.utc)
+            now = datetime.now(UTC).replace(tzinfo=None)
             if status == ForwardingAddressStatus.REVOKED:
                 addresses = (
                     await session.scalars(
@@ -389,6 +416,7 @@ class EmailForwardingRepository(BaseRepository):
                         )
                     )
                 ).all()
+                await _lock_forwarding_address_emails(session, *(address.email_address for address in addresses))
                 await self._clear_credential_bindings(session, organization_id, addresses, now)
             row = (
                 await session.scalars(
@@ -416,7 +444,7 @@ class EmailForwardingRepository(BaseRepository):
     ) -> tuple[ForwardingAddress, ForwardingAddress] | None:
         replacement_email = normalize_email_address(replacement_email)
         async with self.Session() as session:
-            now = datetime.now(timezone.utc)
+            now = datetime.now(UTC).replace(tzinfo=None)
             address_config_id = (
                 select(OrganizationForwardingAddressModel.email_config_id)
                 .where(
@@ -437,22 +465,30 @@ class EmailForwardingRepository(BaseRepository):
             )
             if locked_config_id is None:
                 return None
-            credential: CredentialModel | None = None
-            credential_id = await session.scalar(
-                select(OrganizationForwardingAddressModel.credential_id).where(
-                    OrganizationForwardingAddressModel.forwarding_address_id == forwarding_address_id,
-                    OrganizationForwardingAddressModel.organization_id == organization_id,
-                    OrganizationForwardingAddressModel.deleted_at.is_(None),
-                    OrganizationForwardingAddressModel.email_config_id == locked_config_id,
-                    OrganizationForwardingAddressModel.status.in_(
-                        (
-                            ForwardingAddressStatus.PENDING,
-                            ForwardingAddressStatus.ACTIVE,
-                            ForwardingAddressStatus.DISABLED,
-                        )
-                    ),
-                )
+            rotatable_statuses = (
+                ForwardingAddressStatus.PENDING,
+                ForwardingAddressStatus.ACTIVE,
+                ForwardingAddressStatus.DISABLED,
             )
+            current_address = (
+                await session.scalars(
+                    select(OrganizationForwardingAddressModel)
+                    .where(
+                        OrganizationForwardingAddressModel.forwarding_address_id == forwarding_address_id,
+                        OrganizationForwardingAddressModel.organization_id == organization_id,
+                        OrganizationForwardingAddressModel.deleted_at.is_(None),
+                        OrganizationForwardingAddressModel.email_config_id == locked_config_id,
+                        OrganizationForwardingAddressModel.status.in_(rotatable_statuses),
+                    )
+                    .with_for_update()
+                )
+            ).one_or_none()
+            if current_address is None:
+                return None
+            await _lock_forwarding_address_emails(session, current_address.email_address, replacement_email)
+            await _ensure_address_not_revoked(session, replacement_email)
+            credential: CredentialModel | None = None
+            credential_id = current_address.credential_id
             if credential_id:
                 credential = (
                     await session.scalars(
@@ -473,13 +509,7 @@ class EmailForwardingRepository(BaseRepository):
                         OrganizationForwardingAddressModel.organization_id == organization_id,
                         OrganizationForwardingAddressModel.deleted_at.is_(None),
                         OrganizationForwardingAddressModel.email_config_id == locked_config_id,
-                        OrganizationForwardingAddressModel.status.in_(
-                            (
-                                ForwardingAddressStatus.PENDING,
-                                ForwardingAddressStatus.ACTIVE,
-                                ForwardingAddressStatus.DISABLED,
-                            )
-                        ),
+                        OrganizationForwardingAddressModel.status.in_(rotatable_statuses),
                     )
                     .values(status=ForwardingAddressStatus.REVOKED, modified_at=now)
                     .returning(OrganizationForwardingAddressModel)
@@ -487,6 +517,8 @@ class EmailForwardingRepository(BaseRepository):
             ).one_or_none()
             if old is None:
                 return None
+            if normalize_email_address(old.email_address) == replacement_email:
+                raise ForwardingAddressAlreadyExists("Forwarding address is already registered")
             replacement = OrganizationForwardingAddressModel(
                 organization_id=organization_id,
                 email_config_id=old.email_config_id,

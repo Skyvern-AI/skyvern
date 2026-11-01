@@ -1525,6 +1525,12 @@ class OrganizationForwardingAddressModel(Base):
         Index("ix_organization_forwarding_addresses_org", "organization_id"),
         Index("ix_organization_forwarding_addresses_config", "email_config_id"),
         Index(
+            "ix_organization_forwarding_addresses_revoked_email",
+            text("lower(email_address)"),
+            postgresql_where=text("status = 'revoked'"),
+            sqlite_where=text("status = 'revoked'"),
+        ),
+        Index(
             "uq_organization_forwarding_addresses_email",
             "email_address",
             unique=True,
