@@ -598,6 +598,7 @@ workflow_definition:
             },
         ],
         "duplicateWrites": [],
+        "inputs": [],
     }
     assert payload["testedBlockFingerprints"] == {"existing": sorted(ctx.executed_block_fingerprints["existing"])}
 
@@ -641,6 +642,7 @@ workflow_definition:
             },
         ],
         "duplicateWrites": [],
+        "inputs": [],
     }
 
 

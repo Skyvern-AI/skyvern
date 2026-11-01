@@ -1044,6 +1044,132 @@ async def test_add_block_splices_a_punctuated_multiline_block(dispatch: AsyncMoc
     assert (spliced.label, spliced.code) == ("report_members", _MULTILINE_CODE)
 
 
+_SEEDED_STORED_YAML = """title: Seeded export
+workflow_definition:
+  parameters:
+    - {parameter_type: workflow, key: seed_rows, workflow_parameter_type: string}
+    - {parameter_type: workflow, key: chosen_credential, workflow_parameter_type: string}
+    - {parameter_type: workflow, key: profile_key, workflow_parameter_type: string}
+    - {parameter_type: workflow, key: page_size, workflow_parameter_type: string}
+    - {parameter_type: credential, key: portal_login, credential_id: chosen_credential}
+  blocks:
+    - block_type: code
+      label: Read_Account
+      code: |
+        return {"output": page_size}
+      next_block_label: Seed_Rows
+    - block_type: code
+      label: Seed_Rows
+      parameter_keys: [seed_rows, chosen_credential, profile_key, page_size]
+      code: |
+        return {"output": [seed_rows, chosen_credential, profile_key, page_size]}
+"""
+
+
+@pytest.mark.asyncio
+async def test_delete_block_reports_only_the_inputs_nothing_left_reads(
+    dispatch: AsyncMock, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    prior = await _process_workflow_yaml(
+        workflow_id="w",
+        workflow_permanent_id="wp",
+        organization_id="o",
+        workflow_yaml="browser_profile_key: '{{ profile_key }}'\n" + _SEEDED_STORED_YAML,
+    )
+    monkeypatch.setattr(workflow_update_module, "_get_prior_workflow", AsyncMock(return_value=prior))
+    ctx = _authoring_ctx(_SEEDED_STORED_YAML)
+
+    result = await _invoke(tools_module.delete_block_tool, ctx, {"label": "Seed_Rows", "remove_parameters": None})
+
+    assert result["ok"] is True, result
+    assert result["data"]["inputs_only_read_by_deleted_block"] == ["seed_rows"]
+    assert "seed_rows" in {p.key for p in ctx.staged_workflow.workflow_definition.parameters}
+
+
+_COLD_START_STORED_YAML = """title: Seeded export
+workflow_definition:
+  parameters:
+    - {parameter_type: workflow, key: seed_rows, workflow_parameter_type: string}
+    - {parameter_type: workflow, key: page_size, workflow_parameter_type: string}
+  blocks:
+    - block_type: code
+      label: Read_Account
+      parameter_keys: [page_size]
+      code: |
+        return {"output": page_size}
+      next_block_label: Seed_Rows
+    - block_type: code
+      label: Seed_Rows
+      code: |
+        return {"output": seed_rows}
+"""
+
+
+@pytest.mark.asyncio
+async def test_delete_block_on_cold_start_names_an_input_only_the_code_read(
+    dispatch: AsyncMock,
+) -> None:
+    ctx = _authoring_ctx(_COLD_START_STORED_YAML)
+
+    result = await _invoke(tools_module.delete_block_tool, ctx, {"label": "Seed_Rows"})
+
+    assert result["ok"] is True, result
+    assert result["data"]["inputs_only_read_by_deleted_block"] == ["seed_rows"]
+
+
+@pytest.mark.asyncio
+async def test_delete_block_counts_a_saved_note_the_write_carries_back_as_a_read(
+    dispatch: AsyncMock,
+) -> None:
+    ctx = _authoring_ctx(_COLD_START_STORED_YAML)
+    ctx.persisted_workflow_yaml = _COLD_START_STORED_YAML.replace(
+        "      label: Read_Account\n", "      label: Read_Account\n      notes: 'Pages through {{ seed_rows }}'\n"
+    )
+
+    result = await _invoke(tools_module.delete_block_tool, ctx, {"label": "Seed_Rows"})
+
+    assert result["ok"] is True, result
+    assert ctx.staged_workflow.workflow_definition.blocks[0].notes == "Pages through {{ seed_rows }}"
+    assert result["data"]["inputs_only_read_by_deleted_block"] == []
+
+
+@pytest.mark.asyncio
+async def test_delete_block_removes_an_input_a_remaining_template_still_reads(
+    dispatch: AsyncMock, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    stored = _COLD_START_STORED_YAML.replace(
+        "    - block_type: code\n      label: Read_Account\n      parameter_keys: [page_size]\n"
+        '      code: |\n        return {"output": page_size}\n',
+        "    - block_type: goto_url\n      label: Read_Account\n      url: 'https://example.test/{{ page_size }}'\n",
+    )
+    ctx = _authoring_ctx(stored)
+
+    result = await _invoke(
+        tools_module.delete_block_tool, ctx, {"label": "Seed_Rows", "remove_parameters": ["page_size"]}
+    )
+
+    assert result["ok"] is True, result
+    definition = ctx.staged_workflow.workflow_definition
+    assert "page_size" not in {p.key for p in definition.parameters}
+    assert [b.label for b in definition.blocks] == ["Read_Account"]
+
+
+@pytest.mark.asyncio
+async def test_delete_block_leaves_the_workflow_unwritten_when_a_remaining_block_lists_a_removed_input(
+    dispatch: AsyncMock,
+) -> None:
+    ctx = _authoring_ctx(_COLD_START_STORED_YAML)
+
+    result = await _invoke(
+        tools_module.delete_block_tool, ctx, {"label": "Seed_Rows", "remove_parameters": ["page_size"]}
+    )
+
+    assert result["ok"] is False
+    assert "page_size" in result["error"]
+    assert ctx.staged_workflow is None
+    assert ctx.last_workflow_yaml in (None, "")
+
+
 def test_workflow_write_tools_take_objects_not_yaml_strings() -> None:
     for tool, field in (
         (tools_module.update_workflow_tool, "workflow"),
@@ -1103,6 +1229,84 @@ async def test_a_proposal_kept_out_only_by_a_canvas_edit_is_recorded_for_the_not
 
     assert await workflow_update_module._validated_pending_workflow_proposal(ctx) is None
     assert ctx.canvas_rejected_proposal_yaml == proposal_yaml
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "canvas_edit",
+    [
+        {"blocks": [{"block_type": "code", "label": "typed_on_canvas", "code": "return {}"}]},
+        {"description": "Pulls the monthly statement"},
+        {"enable_self_healing": True},
+    ],
+)
+async def test_a_follow_up_turn_on_a_blank_saved_workflow_deletes_a_block_from_the_retitling_proposal(
+    dispatch: AsyncMock, monkeypatch: pytest.MonkeyPatch, canvas_edit: dict[str, Any]
+) -> None:
+    now = datetime.now(UTC)
+    stored = Workflow(
+        workflow_id="w",
+        organization_id="o",
+        workflow_permanent_id="wp",
+        title="Named agent",
+        description="",
+        version=1,
+        is_saved_task=False,
+        workflow_definition=WorkflowDefinition(parameters=[], blocks=[]),
+        created_at=now,
+        modified_at=now,
+    )
+    proposal_yaml = _COLD_START_STORED_YAML.replace("title: Seeded export", "title: Proposed title")
+    proposal = {
+        "_copilot_yaml": proposal_yaml,
+        "_copilot_proposal": {
+            "owner_turn_id": "turn-1",
+            "revision": 1,
+            "canonical_fingerprint": workflow_update_module.proposal_workflow_fingerprint(stored),
+            "disposition": "review_tested",
+        },
+    }
+    chat = SimpleNamespace(workflow_permanent_id="wp", proposed_workflow=proposal)
+
+    async def publish(**kwargs: Any) -> SimpleNamespace:
+        return SimpleNamespace(
+            proposed_workflow={
+                **kwargs["proposal"],
+                "_copilot_proposal": {**proposal["_copilot_proposal"], "revision": 2},
+            }
+        )
+
+    monkeypatch.setattr(app.DATABASE.workflow_params, "get_workflow_copilot_chat_by_id", AsyncMock(return_value=chat))
+    monkeypatch.setattr(app.DATABASE.workflow_params, "publish_workflow_copilot_candidate", publish)
+    monkeypatch.setattr(app.DATABASE.workflows, "get_workflow_by_permanent_id", AsyncMock(return_value=stored))
+
+    def ctx(blocks: list[dict[str, str]], **fields: Any) -> CopilotContext:
+        canvas = {
+            "title": "Named agent",
+            "description": None,
+            **fields,
+            "workflow_definition": {"parameters": [], "blocks": blocks},
+        }
+        follow_up = _authoring_ctx(yaml.safe_dump(canvas))
+        follow_up.organization_id, follow_up.workflow_id, follow_up.workflow_permanent_id = "o", "w", "wp"
+        follow_up.workflow_copilot_chat_id = "chat"
+        return follow_up
+
+    blank = ctx([])
+    await workflow_update_module.restore_pending_workflow_proposal(blank)
+    result = await _invoke(
+        tools_module.delete_block_tool, blank, {"label": "Seed_Rows", "remove_parameters": ["seed_rows"]}
+    )
+
+    assert result["ok"] is True, result
+    definition = blank.staged_workflow.workflow_definition
+    assert [b.label for b in definition.blocks] == ["Read_Account"]
+    assert "seed_rows" not in {p.key for p in definition.parameters}
+
+    edited = ctx(**{"blocks": [], **canvas_edit})
+    await workflow_update_module.restore_pending_workflow_proposal(edited)
+    assert edited.staged_workflow is None
+    assert edited.canvas_rejected_proposal_yaml == proposal_yaml
 
 
 @pytest.mark.asyncio

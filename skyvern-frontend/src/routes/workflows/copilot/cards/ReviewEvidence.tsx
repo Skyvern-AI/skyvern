@@ -1,8 +1,27 @@
-import type { ReviewProjection } from "../narrativeState";
+import type { ReviewChange, ReviewProjection } from "../narrativeState";
 import { humanizeBlockLabel } from "../blockLabel";
 import { GutterRow } from "./cardChrome";
 
 type ReviewedBlock = ReviewProjection["blocks"][number];
+
+// eslint-disable-next-line react-refresh/only-export-components
+export const CHANGE_MARKERS: Record<
+  ReviewChange,
+  { marker: string; srLabel: string; markerClass: string }
+> = {
+  added: { marker: "+", srLabel: "Added", markerClass: "text-success" },
+  changed: {
+    marker: "~",
+    srLabel: "Changed",
+    markerClass: "text-amber-700 dark:text-amber-300",
+  },
+  removed: { marker: "−", srLabel: "Removed", markerClass: "text-destructive" },
+  unchanged: {
+    marker: "",
+    srLabel: "Unchanged",
+    markerClass: "text-muted-foreground",
+  },
+};
 
 // eslint-disable-next-line react-refresh/only-export-components
 export function reviewCoverageTag(
@@ -54,4 +73,37 @@ export function DuplicateWriteRows({
       </span>
     </GutterRow>
   ));
+}
+
+export function InputChangeRows({
+  inputs,
+  discarded,
+}: {
+  inputs: NonNullable<ReviewProjection["inputs"]>;
+  discarded: boolean;
+}) {
+  return inputs.map((input) => {
+    const marker = CHANGE_MARKERS[input.change];
+    return (
+      <GutterRow
+        key={`input-${input.change}-${input.key}`}
+        marker={marker.marker}
+        markerClass={marker.markerClass}
+        srLabel={marker.srLabel}
+      >
+        <span
+          className={
+            discarded || input.change === "removed"
+              ? "text-muted-foreground line-through"
+              : ""
+          }
+        >
+          Input{" "}
+          <span className="font-mono [overflow-wrap:anywhere]">
+            {input.key}
+          </span>
+        </span>
+      </GutterRow>
+    );
+  });
 }

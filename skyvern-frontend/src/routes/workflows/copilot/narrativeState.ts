@@ -254,6 +254,7 @@ export function isBuildTestConnectFailureState(
 }
 
 export type ReviewChange = "added" | "changed" | "unchanged" | "removed";
+export type InputChange = "added" | "changed" | "removed";
 export type BlockCoverage =
   | "current_source"
   | "different_source"
@@ -302,6 +303,7 @@ export interface ReviewProjection {
     blockType: string;
     blockLabels: string[];
   }>;
+  inputs?: Array<{ key: string; change: InputChange }>;
   // Blocks whose saved notes Copilot's YAML left out, so the saved notes were kept.
   keptNotes?: string[];
   // The same for descriptions.
@@ -1975,9 +1977,24 @@ function parseReviewProjection(raw: unknown): ReviewProjection | null {
     Array.isArray(raw)
       ? raw.filter((label): label is string => typeof label === "string")
       : [];
+  // Payloads persisted before inputs were published carry none, and a malformed row drops
+  // alone rather than voiding the review.
+  const inputs: NonNullable<ReviewProjection["inputs"]> = [];
+  for (const rawInput of Array.isArray(value.inputs) ? value.inputs : []) {
+    const input = (rawInput ?? {}) as Record<string, unknown>;
+    if (
+      typeof input.key === "string" &&
+      (input.change === "added" ||
+        input.change === "changed" ||
+        input.change === "removed")
+    ) {
+      inputs.push({ key: input.key, change: input.change });
+    }
+  }
   return {
     blocks,
     duplicateWrites,
+    inputs,
     keptNotes: labels(value.keptNotes),
     keptDescriptions: labels(value.keptDescriptions),
   };

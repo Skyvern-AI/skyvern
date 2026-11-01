@@ -15,6 +15,7 @@ from skyvern.forge.sdk.copilot.review_gate import (
     serialize_execution_receipts,
     workflow_block_fingerprints,
 )
+from skyvern.forge.sdk.copilot.workflow_yaml import _process_workflow_yaml, workflow_to_copilot_yaml
 
 
 def _workflow(blocks: str, *, parameters: str = "[]") -> str:
@@ -258,6 +259,108 @@ def test_parameter_default_change_invalidates_change_and_execution_identity() ->
         "neverTested": True,
         "coverage": "different_source",
     }
+
+
+def test_projection_lists_each_input_change_by_key_without_its_values() -> None:
+    step = """    - block_type: task
+      label: step
+      prompt: Open the portal
+"""
+    persisted = _workflow(
+        step,
+        parameters="[{key: api_token, parameter_type: workflow, default_value: sk-old-secret}, "
+        "{key: seed_rows, parameter_type: workflow, default_value: seed-secret-rows}, "
+        "{key: region, parameter_type: workflow, default_value: east, description: Before}]",
+    )
+    staged = _workflow(
+        step,
+        parameters="[{key: api_token, parameter_type: workflow, default_value: sk-new-secret}, "
+        "{key: region, parameter_type: workflow, default_value: east, description: After}, "
+        "{key: report_key, parameter_type: workflow, default_value: rk-added-secret}]",
+    )
+
+    projection = build_review_projection(persisted, staged, set())
+
+    assert projection is not None
+    assert projection["inputs"] == [
+        {"key": "api_token", "change": "changed"},
+        {"key": "region", "change": "changed"},
+        {"key": "report_key", "change": "added"},
+        {"key": "seed_rows", "change": "removed"},
+    ]
+    wire = json.dumps(projection)
+    for value in ("sk-old-secret", "sk-new-secret", "seed-secret-rows", "rk-added-secret", "east", "Before", "After"):
+        assert value not in wire
+
+
+def test_an_input_whose_only_difference_is_an_explicit_null_is_not_changed() -> None:
+    step = """    - block_type: task
+      label: step
+      prompt: Open the portal
+"""
+    persisted = _workflow(step, parameters="[{key: region, parameter_type: workflow, default_value: null}]")
+    staged = _workflow(step, parameters="[{key: region, parameter_type: workflow}]")
+
+    projection = build_review_projection(persisted, staged, set())
+
+    assert projection is not None
+    assert projection["inputs"] == []
+
+
+def test_an_input_differing_only_in_stored_row_fields_is_not_changed() -> None:
+    step = """    - block_type: task
+      label: step
+      prompt: Open the portal
+"""
+    staged = _workflow(step, parameters="[{key: region, parameter_type: workflow, workflow_parameter_type: string}]")
+    persisted = _workflow(
+        step,
+        parameters="[{key: region, parameter_type: workflow, workflow_parameter_type: string, "
+        "workflow_parameter_id: wp_1, workflow_id: w_1, created_at: '2026-01-01T00:00:00', "
+        "modified_at: '2026-01-02T00:00:00'}]",
+    )
+
+    projection = build_review_projection(persisted, staged, set())
+
+    assert projection is not None
+    assert projection["inputs"] == []
+
+
+def test_a_json_default_changed_from_true_to_one_is_a_changed_input() -> None:
+    step = """    - block_type: task
+      label: step
+      prompt: Open the portal
+"""
+    persisted = _workflow(
+        step, parameters="[{key: flags, parameter_type: workflow, workflow_parameter_type: json, default_value: true}]"
+    )
+    staged = persisted.replace("default_value: true", "default_value: 1")
+
+    projection = build_review_projection(persisted, staged, set())
+
+    assert projection is not None
+    assert projection["inputs"] == [{"key": "flags", "change": "changed"}]
+
+
+@pytest.mark.asyncio
+@pytest.mark.usefixtures("no_saved_workflow")
+async def test_inputs_saved_through_the_converter_match_the_yaml_they_came_from() -> None:
+    staged = _workflow(
+        """    - block_type: task
+      label: step
+      prompt: Open the portal
+""",
+        parameters="[{key: page_size, parameter_type: workflow, workflow_parameter_type: integer, default_value: '5'}, "
+        "{key: dry_run, parameter_type: workflow, workflow_parameter_type: boolean, default_value: 'true'}, "
+        "{key: ratio, parameter_type: workflow, workflow_parameter_type: float, default_value: 2}, "
+        """{key: seed_rows, parameter_type: workflow, workflow_parameter_type: json, default_value: '[{"id": 1}]'}]""",
+    )
+    saved = workflow_to_copilot_yaml(await _process_workflow_yaml("w", "wp", "o", staged))
+
+    projection = build_review_projection(saved, staged, set())
+
+    assert projection is not None
+    assert projection["inputs"] == []
 
 
 def test_missing_code_steps_are_canonicalized_before_execution_fingerprinting() -> None:

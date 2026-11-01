@@ -121,6 +121,8 @@ def setup_new_copilot_mocks(
         agent_result.proposal_workflow_run_id = None
     if not hasattr(chat, "workflow_permanent_id"):
         chat.workflow_permanent_id = getattr(original_workflow, "workflow_permanent_id", "wpid-1")
+    if not hasattr(original_workflow, "workflow_permanent_id"):
+        original_workflow.workflow_permanent_id = chat.workflow_permanent_id
     if not hasattr(chat, "pending_turns"):
         chat.pending_turns = {}
     if not hasattr(original_workflow, "modified_at"):

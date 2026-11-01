@@ -1396,8 +1396,10 @@ class CopilotContext(AgentContext):
     # Workflow state
     authored_private_workflow_settings: dict[str, Any] | None = field(default=None, repr=False)
     persisted_workflow_yaml: str | None = None
+    # The saved row; persisted_workflow_yaml is None when it has no blocks, so its canvas comes from here.
+    saved_workflow: Workflow | None = field(default=None, repr=False)
     private_workflow_settings: dict[str, Any] = field(default_factory=dict, repr=False)
-    last_workflow: Workflow | None = None
+    last_workflow: Workflow | None = field(default=None, repr=False)
     last_workflow_yaml: str | None = None
     # Copies of the saved workflow a full test loaded this turn; matched by identity, never offered as a proposal.
     saved_workflows_under_test: list[Workflow] = field(default_factory=list)

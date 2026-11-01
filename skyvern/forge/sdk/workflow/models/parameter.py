@@ -267,6 +267,10 @@ class WorkflowParameterType(StrEnum):
         except Exception:
             raise InvalidWorkflowParameter(expected_parameter_type=self, value=str(value))
 
+    def convert_default_value(self, value: Any) -> str | int | float | bool | dict | list | None:
+        # A JSON default keeps its YAML shape: a string stays a string instead of being parsed.
+        return self.convert_value(json.dumps(value) if self == WorkflowParameterType.JSON else value)
+
 
 def is_sensitive_workflow_parameter(param: dict[str, Any] | Parameter) -> bool:
     """Return True if a workflow parameter carries credential/secret data.

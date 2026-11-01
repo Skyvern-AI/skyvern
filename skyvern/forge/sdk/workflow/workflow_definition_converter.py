@@ -1,4 +1,3 @@
-import json
 from datetime import UTC, datetime
 from typing import Any, cast
 
@@ -85,7 +84,6 @@ from skyvern.forge.sdk.workflow.models.parameter import (
     Parameter,
     ParameterType,
     WorkflowParameter,
-    WorkflowParameterType,
 )
 from skyvern.forge.sdk.workflow.models.pdf_fill_block import PdfFillBlock
 from skyvern.forge.sdk.workflow.models.powerbi_query_block import PowerBIQueryBlock
@@ -286,11 +284,7 @@ def convert_workflow_definition(
                 modified_at=now,
             )
         elif parameter.parameter_type == ParameterType.WORKFLOW:
-            default_value = parameter.workflow_parameter_type.convert_value(
-                json.dumps(parameter.default_value)
-                if parameter.workflow_parameter_type == WorkflowParameterType.JSON
-                else parameter.default_value
-            )
+            default_value = parameter.workflow_parameter_type.convert_default_value(parameter.default_value)
             parameters[parameter.key] = WorkflowParameter(
                 workflow_parameter_id=generate_workflow_parameter_id(),
                 workflow_parameter_type=parameter.workflow_parameter_type,

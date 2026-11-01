@@ -292,6 +292,7 @@ from skyvern.forge.sdk.copilot.tools.workflow_update import (
     publish_workflow_candidate,
     record_edited_block_labels,
     restore_pending_workflow_proposal,
+    saved_workflow_canvas,
 )
 from skyvern.forge.sdk.copilot.tracing_setup import _copilot_model_name, ensure_tracing_initialized, is_tracing_enabled
 from skyvern.forge.sdk.copilot.turn_context import (
@@ -1914,7 +1915,7 @@ def _review_projection_for(ctx: CopilotContext, proposal_yaml: str | None) -> Na
     if not isinstance(proposal_yaml, str):
         return None
     review = build_review_projection(
-        ctx.persisted_workflow_yaml or _EMPTY_REVIEW_BASELINE_YAML,
+        saved_workflow_canvas(ctx) or _EMPTY_REVIEW_BASELINE_YAML,
         proposal_yaml,
         ctx.executed_block_fingerprints,
     )
@@ -5192,6 +5193,7 @@ async def run_copilot_agent(
         Callable[[dict[str, CopilotVideoEvidenceArtifact]], Awaitable[None]] | None
     ) = None,
     persisted_workflow_yaml: str | None = None,
+    saved_workflow: Workflow | None = None,
     opening_workflow_title: str | None = None,
     prior_executed_block_fingerprints: dict[str, set[str]] | None = None,
     eval_capture_case_id: str | None = None,
@@ -5247,6 +5249,7 @@ async def run_copilot_agent(
                     persist_too_long_video_file_ids=persist_too_long_video_file_ids,
                     persist_video_evidence_artifacts=persist_video_evidence_artifacts,
                     persisted_workflow_yaml=persisted_workflow_yaml,
+                    saved_workflow=saved_workflow,
                     opening_workflow_title=opening_workflow_title,
                     prior_executed_block_fingerprints=prior_executed_block_fingerprints,
                     eval_capture_case_id=eval_capture_case_id,
@@ -5279,6 +5282,7 @@ async def run_copilot_agent(
                         browser_session_id=None,
                         stream=stream,
                         persisted_workflow_yaml=persisted_workflow_yaml,
+                        saved_workflow=saved_workflow,
                         private_workflow_settings=private_workflow_settings or {},
                         opening_workflow_title=opening_workflow_title,
                         executed_block_fingerprints=prior_executed_block_fingerprints or {},
@@ -5347,6 +5351,7 @@ async def run_copilot_agent(
                 browser_session_id=None,
                 stream=stream,
                 persisted_workflow_yaml=persisted_workflow_yaml,
+                saved_workflow=saved_workflow,
                 private_workflow_settings=private_workflow_settings or {},
                 opening_workflow_title=opening_workflow_title,
                 executed_block_fingerprints=prior_executed_block_fingerprints or {},
@@ -5390,6 +5395,7 @@ async def _run_copilot_turn_impl(
         Callable[[dict[str, CopilotVideoEvidenceArtifact]], Awaitable[None]] | None
     ) = None,
     persisted_workflow_yaml: str | None = None,
+    saved_workflow: Workflow | None = None,
     opening_workflow_title: str | None = None,
     prior_executed_block_fingerprints: dict[str, set[str]] | None = None,
     eval_capture_case_id: str | None = None,
@@ -5459,6 +5465,7 @@ async def _run_copilot_turn_impl(
         browser_session_id=None,
         stream=stream,
         persisted_workflow_yaml=persisted_workflow_yaml,
+        saved_workflow=saved_workflow,
         private_workflow_settings=private_workflow_settings or {},
         opening_workflow_title=opening_workflow_title,
         api_key=api_key,
