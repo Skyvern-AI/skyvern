@@ -1283,6 +1283,87 @@ async def test_workflow_status_uses_workflow_run_route_for_wr_ids(monkeypatch: p
     assert data["output_summary"]["has_extracted_information"] is True
 
 
+def _nested_output(depth: int, width: int) -> dict[str, object]:
+    if depth == 0:
+        return {"value": "leaf", "items": [1, 2]}
+    return {f"child_{idx}": _nested_output(depth - 1, width) for idx in range(width)}
+
+
+def _jsonable_visits(value: object) -> int:
+    if isinstance(value, dict):
+        return 1 + sum(_jsonable_visits(item) for item in value.values())
+    if isinstance(value, list):
+        return 1 + sum(_jsonable_visits(item) for item in value)
+    return 1
+
+
+async def _status_summary_jsonable_calls(monkeypatch: pytest.MonkeyPatch, outputs: dict[str, object]) -> int:
+    payload = {"workflow_run_id": "wr_nested", "status": "completed", "outputs": outputs}
+    request = AsyncMock(return_value=_fake_http_response(payload))
+    fake_client = SimpleNamespace(
+        get_run=AsyncMock(), _client_wrapper=SimpleNamespace(httpx_client=SimpleNamespace(request=request))
+    )
+    _patch_skyvern_client(monkeypatch, fake_client)
+    calls = 0
+    real_jsonable = workflow_tools._jsonable
+
+    def counting_jsonable(value: object) -> object:
+        nonlocal calls
+        calls += 1
+        return real_jsonable(value)
+
+    monkeypatch.setattr(workflow_tools, "_jsonable", counting_jsonable)
+    result = await workflow_tools.skyvern_workflow_status(run_id="wr_nested")
+    monkeypatch.setattr(workflow_tools, "_jsonable", real_jsonable)
+    assert result["ok"] is True
+    assert result["data"]["output_summary"]["present"] is True
+    return calls
+
+
+@pytest.mark.asyncio
+async def test_workflow_status_summary_normalizes_each_output_node_once(monkeypatch: pytest.MonkeyPatch) -> None:
+    # Re-normalizing every subtree during the stats scan made summary work grow with output depth on the event loop.
+    small = {"block": _nested_output(depth=0, width=3)}
+    nested = {"block": _nested_output(depth=6, width=3)}
+
+    small_calls = await _status_summary_jsonable_calls(monkeypatch, small)
+    nested_calls = await _status_summary_jsonable_calls(monkeypatch, nested)
+
+    assert nested_calls - small_calls == _jsonable_visits(nested) - _jsonable_visits(small)
+
+
+@pytest.mark.asyncio
+async def test_workflow_status_summary_stats_respect_scan_depth_and_preview_order(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    deep: dict[str, object] = {"task_screenshot_artifact_ids": ["too_deep"], "task_screenshots": ["too_deep.png"]}
+    for _ in range(12):
+        deep = {"next": deep}
+    outputs = {
+        "block_a": {
+            "task_screenshot_artifact_ids": ["a1", "a2", "a1"],
+            "task_screenshots": ["s1.png", "s2.png"],
+            "extracted_information": {"x": 1},
+        },
+        "block_b": [{"workflow_screenshots": ["w1.png"]}, {"task_screenshot_artifact_ids": ["a3", "a4", "a5"]}],
+        "deep": deep,
+    }
+    payload = {"workflow_run_id": "wr_stats", "status": "completed", "outputs": outputs}
+    request = AsyncMock(return_value=_fake_http_response(payload))
+    fake_client = SimpleNamespace(
+        get_run=AsyncMock(), _client_wrapper=SimpleNamespace(httpx_client=SimpleNamespace(request=request))
+    )
+    _patch_skyvern_client(monkeypatch, fake_client)
+
+    result = await workflow_tools.skyvern_workflow_status(run_id="wr_stats")
+
+    data = result["data"]
+    assert data["output_summary"]["has_extracted_information"] is True
+    assert data["output_summary"]["nested_screenshot_count"] == 3
+    assert data["artifact_summary"]["artifact_id_count"] == 6
+    assert data["artifact_summary"]["artifact_ids_preview"] == ["a1", "a2", "a3", "a4"]
+
+
 @pytest.mark.asyncio
 async def test_workflow_status_full_preserves_expanded_workflow_details(monkeypatch: pytest.MonkeyPatch) -> None:
     payload = _heavy_workflow_run_payload(include_expanded_outputs=True)

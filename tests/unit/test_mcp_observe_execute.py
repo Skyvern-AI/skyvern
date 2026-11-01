@@ -1992,6 +1992,9 @@ class TestSkyvernExecuteMCP:
         page._working_frame = None
         ctx = BrowserContext(mode="local")
         monkeypatch.setattr(mcp_browser, "get_page", AsyncMock(return_value=(page, ctx)))
+        # select_option gets what is left of the click's budget; freeze the clock so a loaded runner
+        # cannot spend a millisecond of it before the exact timeout assert below.
+        monkeypatch.setattr(browser_ops, "time", SimpleNamespace(monotonic=lambda: 0.0))
 
         result = await mcp_browser.skyvern_execute(
             steps=[

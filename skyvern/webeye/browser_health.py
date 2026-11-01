@@ -28,6 +28,7 @@ FrameKind = Literal["main_frame", "child_frame", "unknown", "not_a_frame_op"]
 CGROUP_MEMBERSHIP_PATH = Path("/proc/self/cgroup")
 CGROUP_CPU_PRESSURE_PATH = Path("/sys/fs/cgroup/cpu.pressure")
 CGROUP_CPU_STAT_PATH = Path("/sys/fs/cgroup/cpu.stat")
+CGROUP_PROCS_PATH = Path("/sys/fs/cgroup/cgroup.procs")
 _PRIVATE_CGROUP_V2_MEMBERSHIP = "0::/"
 _CPU_STAT_COUNTERS = frozenset({"usage_usec", "throttled_usec", "nr_throttled"})
 # Microsecond counters by the field their delta is logged under; nr_throttled is a count of CFS periods instead.
@@ -40,13 +41,27 @@ _CONTAINER_CPU_USEC_FIELDS = {
 MIN_SHARE_WINDOW_SECONDS = 1.0
 
 
-def _read_container_cpu_counters() -> dict[str, int]:
+def in_container_cgroup(membership_path: Path) -> bool:
+    """Whether the process whose ``/proc/<pid>/cgroup`` is ``membership_path`` sits at the root of the reader's cgroup
+    v2 namespace, which in a private namespace is the container's own cgroup. Never raises."""
+    try:
+        return membership_path.read_text().strip() == _PRIVATE_CGROUP_V2_MEMBERSHIP
+    except (OSError, ValueError):
+        return False
+
+
+def read_container_pids() -> frozenset[int] | None:
+    """The pids that cgroup.procs lists for this container's cgroup, or None when it cannot be read. Never raises."""
+    try:
+        return frozenset(int(pid) for pid in CGROUP_PROCS_PATH.read_text().split())
+    except (OSError, ValueError):
+        return None
+
+
+def read_container_cpu_counters() -> dict[str, int]:
     """Cumulative cgroup v2 CPU counters: ``wait_usec`` (cpu.pressure ``some``: a task runnable but waiting for a CPU)
     and cpu.stat's ``usage_usec``, ``throttled_usec`` and ``nr_throttled``. Empty outside a private namespace."""
-    try:
-        if CGROUP_MEMBERSHIP_PATH.read_text().strip() != _PRIVATE_CGROUP_V2_MEMBERSHIP:
-            return {}
-    except (OSError, ValueError):
+    if not in_container_cgroup(CGROUP_MEMBERSHIP_PATH):
         return {}
     counters: dict[str, int] = {}
     with contextlib.suppress(OSError, ValueError):
@@ -120,7 +135,7 @@ class BrowserHealth:
             self.stalled_frames.clear()
             self.stall_started_monotonic = time.monotonic()
             self.stall_started_process_time = time.process_time()
-            self.stall_started_container_cpu = _read_container_cpu_counters()
+            self.stall_started_container_cpu = read_container_cpu_counters()
         self.consecutive_timeouts += 1
         self.stuck_operations.add(operation)
         if frame_kind is None:
@@ -158,7 +173,7 @@ class BrowserHealth:
         worker_process_cpu_seconds = time.process_time() - self.stall_started_process_time
         fields["stall_window_seconds"] = round(window_seconds, 3)
         fields["worker_process_cpu_seconds"] = round(worker_process_cpu_seconds, 3)
-        started, now = self.stall_started_container_cpu, _read_container_cpu_counters()
+        started, now = self.stall_started_container_cpu, read_container_cpu_counters()
         cgroup_seconds = {
             name: (now[counter] - started[counter]) / 1_000_000
             for counter, name in _CONTAINER_CPU_USEC_FIELDS.items()

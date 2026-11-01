@@ -122,6 +122,8 @@ const { focusedRun, reopenEditor } = vi.hoisted(() => ({
   reopenEditor: vi.fn(),
 }));
 vi.mock("../hooks/useWorkflowRunQuery", () => ({
+  useWorkflowRunQueries: (ids: readonly string[]) =>
+    ids.map(() => ({ data: undefined })),
   useWorkflowRunQuery: ({ workflowRunId }: { workflowRunId?: string }) => ({
     data: workflowRunId ? focusedRun.current : undefined,
   }),
