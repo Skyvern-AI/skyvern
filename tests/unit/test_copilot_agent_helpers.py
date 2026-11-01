@@ -168,6 +168,7 @@ from skyvern.forge.sdk.copilot.tools.credentials import (
     _credential_run_approval_error,
     _extract_credential_ids_for_labels,
 )
+from skyvern.forge.sdk.copilot.tools.workflow_update import CANONICAL_WORKFLOW_UNAVAILABLE_ERROR
 from skyvern.forge.sdk.copilot.turn_context import TranscriptContext, TurnContextPacket
 from skyvern.forge.sdk.copilot.turn_halt import (
     CopilotTurnHalt,
@@ -202,7 +203,7 @@ from skyvern.utils.yaml_loader import safe_load_no_dates
 from skyvern.webeye.actions.action_types import ActionType
 from skyvern.webeye.actions.actions import Action, ActionStatus
 from tests.unit._copilot_workflow_fakes import fake_workflow
-from tests.unit.copilot_route_test_support import narrative_payload_with_run
+from tests.unit.copilot_route_test_support import install_candidate_store, narrative_payload_with_run
 from tests.unit.copilot_test_helpers import FakeCopilotStream
 from tests.unit.copilot_test_helpers import make_copilot_ctx as _ctx
 from tests.unit.copilot_test_helpers import make_verified_goal_contract as _verified_goal_contract
@@ -4454,6 +4455,70 @@ class TestTranslateToAgentResultGating:
 
         assert ctx.last_workflow is prior
         assert ctx.last_workflow_yaml == "title: Prior"
+        emit.assert_not_awaited()
+
+    @pytest.mark.parametrize("prior_test_failed", [False, True], ids=["first-attempt", "after-failed-test"])
+    def test_inline_replace_canonical_unavailable_replies_without_staging(
+        self, monkeypatch, prior_test_failed: bool
+    ) -> None:
+        prior = SimpleNamespace(name="prior")
+        monkeypatch.setattr(
+            "skyvern.forge.sdk.copilot.tools._process_workflow_yaml",
+            AsyncMock(return_value=SimpleNamespace(name="replacement")),
+        )
+        lookup = AsyncMock(return_value=None)
+        monkeypatch.setattr(forge_app.DATABASE.workflows, "get_workflow_by_permanent_id", lookup)
+        candidate_store = install_candidate_store(monkeypatch)
+        emit = AsyncMock()
+        monkeypatch.setattr(agent_module, "emit_workflow_draft", emit)
+        ctx = _ctx(
+            workflow_copilot_chat_id="wcc-test",
+            stream=MagicMock(),
+            last_workflow=prior,
+            last_workflow_yaml="title: Prior",
+            request_policy=RequestPolicy(allow_update_workflow=True, allow_run_blocks=True),
+        )
+        if prior_test_failed:
+            ctx.last_test_ok = False
+            ctx.last_update_block_count = 2
+            ctx.last_test_failure_reason = "The page timed out."
+
+        agent_result = asyncio.run(
+            agent_module._translate_to_agent_result(
+                _fake_run_result(
+                    {
+                        "type": "REPLACE_WORKFLOW",
+                        "user_response": "Here is the replacement.",
+                        "workflow_yaml": "title: Replacement",
+                    }
+                ),
+                ctx,
+                global_llm_context=None,
+                chat_request=_chat_request(),
+                organization_id="org-1",
+            )
+        )
+
+        facts = {
+            "workflow_permanent_id": "wfp-1",
+            "candidate_published": False,
+            "test_started": False,
+            "detail": CANONICAL_WORKFLOW_UNAVAILABLE_ERROR,
+        }
+        assert agent_result.response_type == "REPLY"
+        assert CANONICAL_WORKFLOW_UNAVAILABLE_ERROR in agent_result.user_response
+        assert ctx.canonical_workflow_unavailable == facts
+        assert agent_result.narrative_payload is not None
+        assert agent_result.narrative_payload["canonicalWorkflowUnavailable"] == facts
+        assert {call.kwargs["workflow_permanent_id"] for call in lookup.await_args_list} == {"wfp-1"}
+        assert (ctx.last_workflow, ctx.last_workflow_yaml, ctx.has_staged_proposal) == (prior, "title: Prior", False)
+        assert (
+            agent_result.updated_workflow,
+            agent_result.has_staged_proposal,
+            agent_result.proposal_disposition,
+            agent_result.clear_proposed_workflow,
+        ) == (None, False, "no_proposal", True)
+        candidate_store.assert_not_awaited()
         emit.assert_not_awaited()
 
     def test_inline_replace_workflow_uses_request_policy_authority(self, monkeypatch) -> None:

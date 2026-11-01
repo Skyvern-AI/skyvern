@@ -7,7 +7,7 @@ DB / LLM / agent mocks; these helpers keep that wiring in one place.
 from __future__ import annotations
 
 from collections.abc import AsyncIterator
-from contextlib import asynccontextmanager
+from contextlib import asynccontextmanager, nullcontext
 from datetime import UTC, datetime, timezone
 from types import SimpleNamespace
 from typing import Any
@@ -53,6 +53,23 @@ def narrative_payload_with_run(run_id: str | None) -> dict[str, Any]:
             "ranCleanOnCurrentSource": False,
         },
     }
+
+
+def install_candidate_store(monkeypatch: pytest.MonkeyPatch) -> AsyncMock:
+    async def publish(**kwargs: Any) -> SimpleNamespace:
+        metadata = {
+            "owner_turn_id": kwargs["owner_turn_id"],
+            "revision": 1,
+            "canonical_fingerprint": kwargs["canonical_fingerprint"],
+            "canonical_title": kwargs["canonical_title"],
+            "disposition": kwargs["disposition"],
+        }
+        return SimpleNamespace(proposed_workflow={**kwargs["proposal"], COPILOT_PROPOSAL_METADATA_KEY: metadata})
+
+    store = AsyncMock(side_effect=publish)
+    monkeypatch.setattr(app.DATABASE, "workflow_params", SimpleNamespace(publish_workflow_copilot_candidate=store))
+    monkeypatch.setattr(app.DATABASE.workflows, "acquire_workflow_creation_lock", lambda _key: nullcontext())
+    return store
 
 
 @asynccontextmanager

@@ -4,15 +4,22 @@ from datetime import datetime
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
+from jinja2 import TemplateSyntaxError
+from jinja2.sandbox import SandboxedEnvironment
 
-from skyvern.forge.sdk.workflow.exceptions import CodeBlockTemplateSyntaxError, FailedToFormatJinjaStyleParameter
+from skyvern.forge.sdk.workflow.exceptions import (
+    CodeBlockTemplateSyntaxError,
+    FailedToFormatJinjaStyleParameter,
+    MissingJinjaVariables,
+)
 from skyvern.forge.sdk.workflow.models._jinja import (
     mask_jinja_in_python_comments,
     restore_jinja_masked_comments,
 )
-from skyvern.forge.sdk.workflow.models.block import CodeBlock
+from skyvern.forge.sdk.workflow.models.block import CodeBlock, render_failure_reason, render_failure_record
 from skyvern.forge.sdk.workflow.models.parameter import OutputParameter, ParameterType
 from skyvern.schemas.workflows import BlockResult, BlockStatus
+from tests.unit.conftest import use_templating_strictness
 
 
 def _round_trip(source: str) -> str:
@@ -186,3 +193,89 @@ async def test_code_block_marks_runtime_template_failure_as_nonrecoverable() -> 
         result = await block._execute("wr_test", "wrb_test", organization_id="org_test")
 
     assert result.can_continue_after_failure is False
+
+
+@pytest.mark.parametrize(
+    ("strictness", "code", "values", "kind", "expression", "line"),
+    [
+        (
+            "lax",
+            "# reads {{ a }}\nrows = {{ a.values | tojson }}",
+            {"a": {"values": [1]}},
+            "Wrong value type",
+            "a.values | tojson",
+            2,
+        ),
+        (
+            "strict",
+            "rows = {{ a.values | tojson }}",
+            {"a": {"values": [1]}},
+            "Wrong value type",
+            "a.values | tojson",
+            1,
+        ),
+        (
+            "lax",
+            "x = {{ opt | default('') }}{{ a.output.x.y }}",
+            {"a": {"output": {}}},
+            "Missing key or attribute",
+            "opt | default(...); a.output.x.y",
+            1,
+        ),
+        (
+            "strict",
+            "x = {{ ok }}\ny = {{ a.missing | int }}",
+            {"ok": 1, "a": {}},
+            "Missing key or attribute",
+            None,
+            None,
+        ),
+        ("lax", "x = {{ a ! }}", {"a": 1}, "Syntax error", None, 1),
+        (
+            "lax",
+            "x = {{ a.b + 'literal-text-77' ~ 31337 }}",
+            {"a": {"b": 1}},
+            "Wrong value type",
+            "a.b + ... ~ ...",
+            1,
+        ),
+        (
+            "lax",
+            "x = {% if a.b.c %}1{% endif %}{{ ok }}",
+            {"a": {}, "ok": 1},
+            "Missing key or attribute",
+            "if a.b.c; ok",
+            1,
+        ),
+        ("lax", "x = {{ a.__class__.__mro__ }}", {"a": {}}, "Unsafe template operation", "a.__class__.__mro__", 1),
+    ],
+)
+def test_code_block_render_failure_names_kind_expression_and_line(
+    monkeypatch: pytest.MonkeyPatch,
+    strictness: str,
+    code: str,
+    values: dict[str, object],
+    kind: str,
+    expression: str | None,
+    line: int | None,
+) -> None:
+    use_templating_strictness(monkeypatch, strictness)
+    block = _code_block(code)
+
+    with pytest.raises((FailedToFormatJinjaStyleParameter, MissingJinjaVariables)) as excinfo:
+        block.format_potential_template_parameters(_mock_context(values))
+
+    record = render_failure_record(excinfo.value, lambda value: value)
+    assert record == {"kind": kind, "field": "code", "expression": expression, "line": line}
+    reason = render_failure_reason("Failed to format CodeBlock parameters.", excinfo.value, lambda value: value)
+    assert reason.startswith(f"Failed to format CodeBlock parameters. {kind}")
+    if excinfo.value.__cause__ is not None:
+        assert str(excinfo.value.__cause__) not in reason
+
+
+def test_a_jinja_error_raised_before_rendering_names_its_kind_and_line() -> None:
+    with pytest.raises(TemplateSyntaxError) as excinfo:
+        SandboxedEnvironment().parse("Stopped because\n{{ result.count ")
+
+    reason = render_failure_reason("Failed to format jinja template:", excinfo.value, lambda value: value)
+    assert reason == "Failed to format jinja template: Syntax error (line 2)."

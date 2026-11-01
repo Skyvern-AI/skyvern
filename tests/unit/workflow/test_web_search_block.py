@@ -234,6 +234,30 @@ async def test_search_accepts_empty_array(
 
 
 @pytest.mark.asyncio
+async def test_search_render_failure_names_the_expression_without_literals_or_exception_text(
+    search_setup: tuple[WebSearchBlock, WorkflowRunContext, AsyncMock],
+) -> None:
+    block, context, handler = search_setup
+    context.values["missing"] = {}
+    block.query = "distinctive-literal-query-77 {{ missing.child.leaf }}"
+
+    result = await block.execute("workflow-run-test", "block-run-test", "org-test")
+
+    assert result.failure_reason.startswith("Failed to format jinja template: Missing key or attribute")
+    assert "distinctive-literal-query-77" not in result.failure_reason
+    assert result.output_parameter_value["render_failure"] == {
+        "kind": "Missing key or attribute",
+        "field": "query",
+        "expression": "missing.child.leaf",
+        "line": 1,
+    }
+    failure_category = result.output_parameter_value["failure_category"][0]
+    assert result.output_parameter_value["failure_reason"] == failure_category["reasoning"] == result.failure_reason
+    assert failure_category["category"] == "PARAMETER_BINDING_ERROR"
+    handler.assert_not_awaited()
+
+
+@pytest.mark.asyncio
 async def test_search_rejects_invalid_schema_before_llm_call(
     search_setup: tuple[WebSearchBlock, WorkflowRunContext, AsyncMock],
 ) -> None:

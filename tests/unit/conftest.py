@@ -25,6 +25,8 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 import pytest_asyncio
 import structlog
+from jinja2 import StrictUndefined
+from jinja2.sandbox import SandboxedEnvironment
 from opentelemetry import trace as otel_trace
 from opentelemetry.sdk.trace import TracerProvider
 from opentelemetry.sdk.trace.export import SimpleSpanProcessor
@@ -74,6 +76,7 @@ from skyvern.forge.sdk.services.request_principal import AuthKind, RequestPrinci
 from skyvern.forge.sdk.settings_manager import SettingsManager
 from skyvern.forge.sdk.workflow import web_search, web_search_client
 from skyvern.forge.sdk.workflow.context_manager import WorkflowContextManager
+from skyvern.forge.sdk.workflow.models import block as block_module
 from skyvern.forge.sdk.workflow.models.block import BlockTypeVar, TaskBlock
 from skyvern.forge.sdk.workflow.models.parameter import OutputParameter, WorkflowParameterType
 from skyvern.forge.sdk.workflow.models.workflow import WorkflowDefinition, WorkflowRunStatus
@@ -369,6 +372,19 @@ _AGENT_TEMPLATE_DEFAULTS = dict(
 def render_agent_prompt(**overrides: str) -> str:
     """Render the workflow-copilot-agent template with test defaults; overrides replace named params."""
     return prompt_engine.load_prompt("workflow-copilot-agent", **{**_AGENT_TEMPLATE_DEFAULTS, **overrides})
+
+
+def use_templating_strictness(monkeypatch: pytest.MonkeyPatch, strictness: str) -> None:
+    """The block module picks its Jinja environment at import, so strict mode swaps in a StrictUndefined one."""
+    monkeypatch.setattr(settings, "WORKFLOW_TEMPLATING_STRICTNESS", strictness)
+    if strictness != "strict":
+        return
+    env = SandboxedEnvironment(undefined=StrictUndefined)
+    env.filters["json"] = block_module._json_type_filter
+    globals_free_env = env.overlay()
+    globals_free_env.globals = {}
+    monkeypatch.setattr(block_module, "jinja_sandbox_env", env)
+    monkeypatch.setattr(block_module, "_globals_free_jinja_env", globals_free_env)
 
 
 def make_block_output_parameter(key: str = "block_output", workflow_id: str = "workflow-id") -> OutputParameter:

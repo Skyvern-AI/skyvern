@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+from collections.abc import Awaitable, Callable
 from datetime import UTC, datetime
 from types import SimpleNamespace
 from typing import Any
@@ -22,13 +23,16 @@ from skyvern.forge.sdk.copilot.agent import _build_narrative_payload
 from skyvern.forge.sdk.copilot.code_block_steps import UserOwnedGoalCarry, user_owned_goal_carry_disclosure
 from skyvern.forge.sdk.copilot.config import BlockAuthoringPolicy
 from skyvern.forge.sdk.copilot.context import CopilotContext
-from skyvern.forge.sdk.copilot.output_utils import sanitize_tool_result_for_llm
+from skyvern.forge.sdk.copilot.output_utils import BUILD_TEST_PACKET_KEY, sanitize_tool_result_for_llm
 from skyvern.forge.sdk.copilot.request_policy import RequestPolicy
 from skyvern.forge.sdk.copilot.tools import _mark_credential_deferred_draft
+from skyvern.forge.sdk.copilot.tools import run_execution as run_execution_module
 from skyvern.forge.sdk.copilot.tools import workflow_update as workflow_update_module
 from skyvern.forge.sdk.copilot.tools.run_execution import _packet_workflow_readback
 from skyvern.forge.sdk.copilot.tools.workflow_update import (
     _PERSISTENCE_MESSAGES,
+    CANONICAL_WORKFLOW_UNAVAILABLE_ERROR,
+    CANONICAL_WORKFLOW_UNAVAILABLE_TEST_ERROR,
     _update_workflow,
     carry_author_time_findings,
     copilot_workflow_yaml_matches,
@@ -39,6 +43,7 @@ from skyvern.forge.sdk.workflow.models.workflow import Workflow, WorkflowDefinit
 from skyvern.schemas.runs import ProxyLocation
 from skyvern.schemas.workflows import WorkflowCreateYAMLRequest, WorkflowStatus
 from skyvern.utils.yaml_loader import safe_load_no_dates
+from tests.unit.copilot_route_test_support import install_candidate_store
 from tests.unit.copilot_test_helpers import make_copilot_ctx, stub_copilot_agent_loop
 
 
@@ -1029,6 +1034,242 @@ async def test_first_submission_with_an_unknown_block_type_keeps_its_validation_
     assert ctx.has_staged_proposal is False
     assert ctx.staged_workflow is None
     dispatch.assert_not_awaited()
+
+
+_EDIT_ARGUMENTS = {
+    "label": "collect_members",
+    "expected_code": "rows = {\"key\": 'value: x'}",
+    "replacement_code": "rows = {\"key\": 'value: y'}",
+}
+_PUBLISHING_TOOL_CALLS = [
+    pytest.param(tools_module.update_workflow_tool, {"workflow": _first_submission()}, id="update_workflow"),
+    pytest.param(
+        tools_module.update_and_run_blocks_tool,
+        {"workflow": _first_submission(), "block_labels": ["collect_members"]},
+        id="update_and_run_blocks",
+    ),
+    pytest.param(tools_module.edit_block_tool, _EDIT_ARGUMENTS, id="edit_block"),
+    pytest.param(tools_module.edit_block_and_run_tool, _EDIT_ARGUMENTS, id="edit_block_and_run"),
+]
+_UNAVAILABLE_FACTS = {
+    "workflow_permanent_id": "wfp-1",
+    "candidate_published": False,
+    "test_started": False,
+    "detail": CANONICAL_WORKFLOW_UNAVAILABLE_ERROR,
+}
+_TEST_START_UNAVAILABLE_FACTS = {
+    "workflow_permanent_id": "wfp-1",
+    "test_started": False,
+    "detail": CANONICAL_WORKFLOW_UNAVAILABLE_TEST_ERROR,
+}
+
+
+def _bound_ctx() -> CopilotContext:
+    ctx = _authoring_ctx(yaml.safe_dump(_first_submission(), sort_keys=False))
+    ctx.workflow_copilot_chat_id = "wcc-bound"
+    ctx.turn_id = "turn-1"
+    return ctx
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(("tool", "arguments"), _PUBLISHING_TOOL_CALLS)
+async def test_publication_against_an_active_canonical_publishes_the_candidate(
+    monkeypatch: pytest.MonkeyPatch, dispatch: AsyncMock, tool: FunctionTool, arguments: dict[str, Any]
+) -> None:
+    candidate_store = install_candidate_store(monkeypatch)
+    canonical = await _process_workflow_yaml(
+        workflow_id="wf-1",
+        workflow_permanent_id="wfp-1",
+        organization_id="org-1",
+        workflow_yaml=yaml.safe_dump(_first_submission(), sort_keys=False),
+    )
+    monkeypatch.setattr(app.DATABASE.workflows, "get_workflow_by_permanent_id", AsyncMock(return_value=canonical))
+    ctx = _bound_ctx()
+
+    result = await _invoke(tool, ctx, arguments)
+
+    assert result["ok"] is True, result
+    candidate_store.assert_awaited_once()
+    assert ctx.has_staged_proposal is True
+    assert ctx.canonical_workflow_unavailable is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(("tool", "arguments"), _PUBLISHING_TOOL_CALLS)
+async def test_publication_against_a_missing_canonical_returns_typed_facts_without_staging(
+    monkeypatch: pytest.MonkeyPatch, dispatch: AsyncMock, tool: FunctionTool, arguments: dict[str, Any]
+) -> None:
+    candidate_store = install_candidate_store(monkeypatch)
+    lookup = AsyncMock(return_value=None)
+    monkeypatch.setattr(app.DATABASE.workflows, "get_workflow_by_permanent_id", lookup)
+    ctx = _bound_ctx()
+
+    result = await _invoke(tool, ctx, arguments)
+
+    assert {call.kwargs["workflow_permanent_id"] for call in lookup.await_args_list} == {"wfp-1"}
+    assert result["ok"] is False
+    assert result["canonical_workflow_unavailable"] == _UNAVAILABLE_FACTS
+    assert ctx.canonical_workflow_unavailable == _UNAVAILABLE_FACTS
+    candidate_store.assert_not_awaited()
+    dispatch.assert_not_awaited()
+    assert (ctx.has_staged_proposal, ctx.staged_workflow, ctx.staged_workflow_yaml) == (False, None, None)
+    assert ctx.last_workflow is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(("tool", "arguments"), _PUBLISHING_TOOL_CALLS)
+async def test_tool_publication_refusal_after_a_failed_test_is_not_rewritten_into_a_draft_claim(
+    monkeypatch: pytest.MonkeyPatch, dispatch: AsyncMock, tool: FunctionTool, arguments: dict[str, Any]
+) -> None:
+    install_candidate_store(monkeypatch)
+    monkeypatch.setattr(app.DATABASE.workflows, "get_workflow_by_permanent_id", AsyncMock(return_value=None))
+    ctx = _bound_ctx()
+    ctx.last_test_ok = False
+    ctx.last_update_block_count = 1
+    ctx.last_test_failure_reason = "The page timed out."
+
+    result = await _invoke(tool, ctx, arguments)
+    model_reply = result["error"]
+    agent_result = await copilot_agent._translate_to_agent_result(
+        SimpleNamespace(final_output=json.dumps({"type": "REPLY", "user_response": model_reply}), new_items=[]),
+        ctx,
+        global_llm_context=None,
+        chat_request=SimpleNamespace(
+            workflow_id=ctx.workflow_id,
+            workflow_permanent_id="wfp-1",
+            workflow_copilot_chat_id="wcc-bound",
+            workflow_run_id=None,
+            workflow_yaml="",
+            product_action=None,
+        ),
+        organization_id=ctx.organization_id,
+    )
+
+    assert result["canonical_workflow_unavailable"] == _UNAVAILABLE_FACTS
+    assert agent_result.user_response == model_reply
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("tool", "arguments"),
+    [
+        pytest.param(
+            tools_module.update_and_run_blocks_tool,
+            {"workflow": _first_submission(), "block_labels": ["collect_members"]},
+            id="update_and_run_blocks",
+        ),
+        pytest.param(tools_module.edit_block_and_run_tool, _EDIT_ARGUMENTS, id="edit_block_and_run"),
+    ],
+)
+async def test_agent_removed_after_the_update_half_published_reports_only_the_refused_test(
+    monkeypatch: pytest.MonkeyPatch, no_saved_workflow: None, tool: FunctionTool, arguments: dict[str, Any]
+) -> None:
+    monkeypatch.setattr(workflow_update_module, "_get_prior_workflow", AsyncMock(return_value=None))
+    candidate_store = install_candidate_store(monkeypatch)
+    canonical = await _process_workflow_yaml(
+        workflow_id="wf-1",
+        workflow_permanent_id="wfp-1",
+        organization_id="org-1",
+        workflow_yaml=yaml.safe_dump(_first_submission(), sort_keys=False),
+    )
+
+    async def active_until_published(**_: object) -> Workflow | None:
+        return None if candidate_store.await_count else canonical
+
+    monkeypatch.setattr(app.DATABASE.workflows, "get_workflow_by_permanent_id", active_until_published)
+    draft_version = AsyncMock()
+    monkeypatch.setattr(app.WORKFLOW_SERVICE, "create_copilot_dispatch_draft_version", draft_version)
+    ctx = _bound_ctx()
+
+    result = await _invoke(tool, ctx, arguments)
+
+    candidate_store.assert_awaited_once()
+    draft_version.assert_not_awaited()
+    assert result["canonical_workflow_unavailable"] == _TEST_START_UNAVAILABLE_FACTS
+
+
+async def _test_button_handoff(ctx: CopilotContext) -> dict[str, Any]:
+    items = await copilot_agent._run_end_to_end_test_turn(ctx, workflow_yaml=ctx.workflow_yaml or "")
+    return json.loads(items[-1]["output"])
+
+
+_TestStart = Callable[[CopilotContext], Awaitable[dict[str, Any]]]
+_TEST_STARTS = [
+    pytest.param(
+        lambda ctx: _invoke(tools_module.run_blocks_tool, ctx, {"block_labels": ["collect_members"]}),
+        True,
+        id="run_blocks_and_collect_debug",
+    ),
+    pytest.param(
+        lambda ctx: _invoke(tools_module.test_workflow_from_blank_browser_tool, ctx, {}),
+        True,
+        id="test_workflow_from_blank_browser",
+    ),
+    pytest.param(_test_button_handoff, False, id="test_button_handoff_to_the_model"),
+]
+
+
+async def _test_start_ctx(monkeypatch: pytest.MonkeyPatch, canonical: Workflow | None, staged: bool) -> CopilotContext:
+    ctx = _bound_ctx()
+    if staged:
+        ctx.staged_workflow = await _process_workflow_yaml(
+            workflow_id="wf-1",
+            workflow_permanent_id="wfp-1",
+            organization_id="org-1",
+            workflow_yaml=ctx.workflow_yaml,
+        )
+        ctx.staged_workflow_yaml = ctx.workflow_yaml
+    monkeypatch.setattr(app.DATABASE.workflows, "get_workflow_by_permanent_id", AsyncMock(return_value=canonical))
+    return ctx
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(("start_test", "staged"), _TEST_STARTS)
+async def test_test_start_against_a_missing_canonical_returns_typed_facts_without_a_version_or_run(
+    monkeypatch: pytest.MonkeyPatch, no_saved_workflow: None, start_test: _TestStart, staged: bool
+) -> None:
+    ctx = await _test_start_ctx(monkeypatch, canonical=None, staged=staged)
+    ctx.last_test_ok = True
+    ctx.last_successful_run_blocks_workflow_run_id = "wr_prior"
+    staged_before = (ctx.staged_workflow, ctx.staged_workflow_yaml, ctx.has_staged_proposal)
+    select_snapshot = AsyncMock(return_value=None)
+    draft_version = AsyncMock()
+    monkeypatch.setattr(run_execution_module, "_select_execution_snapshot", select_snapshot)
+    monkeypatch.setattr(app.WORKFLOW_SERVICE, "create_copilot_dispatch_draft_version", draft_version)
+
+    result = await start_test(ctx)
+
+    assert result["ok"] is False
+    assert result["canonical_workflow_unavailable"] == _TEST_START_UNAVAILABLE_FACTS
+    assert ctx.canonical_workflow_unavailable == _TEST_START_UNAVAILABLE_FACTS
+    select_snapshot.assert_not_awaited()
+    draft_version.assert_not_awaited()
+    assert not ctx.dispatched_run_ids_this_turn
+    assert (ctx.staged_workflow, ctx.staged_workflow_yaml, ctx.has_staged_proposal) == staged_before
+    assert (ctx.last_test_ok, ctx.last_successful_run_blocks_workflow_run_id) == (True, "wr_prior")
+    assert BUILD_TEST_PACKET_KEY not in result.get("data", {})
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(("start_test", "staged"), _TEST_STARTS)
+async def test_test_start_against_an_active_canonical_proceeds_to_snapshot_selection(
+    monkeypatch: pytest.MonkeyPatch, no_saved_workflow: None, start_test: _TestStart, staged: bool
+) -> None:
+    canonical = await _process_workflow_yaml(
+        workflow_id="wf-1",
+        workflow_permanent_id="wfp-1",
+        organization_id="org-1",
+        workflow_yaml=yaml.safe_dump(_first_submission(), sort_keys=False),
+    )
+    ctx = await _test_start_ctx(monkeypatch, canonical=canonical, staged=staged)
+    select_snapshot = AsyncMock(return_value=None)
+    monkeypatch.setattr(run_execution_module, "_select_execution_snapshot", select_snapshot)
+
+    result = await start_test(ctx)
+
+    select_snapshot.assert_awaited()
+    assert "canonical_workflow_unavailable" not in result
+    assert ctx.canonical_workflow_unavailable is None
 
 
 @pytest.mark.asyncio

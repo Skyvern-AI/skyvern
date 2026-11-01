@@ -108,6 +108,7 @@ SKYVERN_ENTRY_IDS = [
     "bitwarden",
     "azure_key_vault",
     "custom_credential_service",
+    "email_forwarding",
 ]
 SENTINELS = (
     "SENTINEL-gmail-access-token",
