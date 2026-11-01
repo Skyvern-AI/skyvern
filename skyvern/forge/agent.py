@@ -387,8 +387,9 @@ from skyvern.webeye.browser_state import (
 from skyvern.webeye.cdp_download_interceptor import (
     STREAM_TO_DISK_THRESHOLD_BYTES,
     DownloadTally,
-    _payload_contradicts_claimed_type,
-    _streamed_payload_contradicts_claimed_type,
+    _payload_contradiction_reason,
+    _sniff_payload_type,
+    _streamed_payload_contradiction_reason,
     begin_replay_candidate_hold,
     consume_unsolicited_download_error_for_context,
     download_filename_from_suffix,
@@ -2269,25 +2270,38 @@ class ForgeAgent:
                     else file_path.name
                 )
 
-                def _contradicts_claimed_type() -> bool:
-                    with file_path.open("rb") as payload:
-                        if os.fstat(payload.fileno()).st_size >= STREAM_TO_DISK_THRESHOLD_BYTES:
-                            return _streamed_payload_contradicts_claimed_type(payload, "", original_filename)
-                        return _payload_contradicts_claimed_type(
-                            payload.read(), "", original_filename, allow_typed_extensionless_html=True
+                def _claimed_type_rejection_details(
+                    path: Path = file_path, claimed_filename: str = original_filename
+                ) -> tuple[str | None, int, str]:
+                    with path.open("rb") as payload:
+                        size = os.fstat(payload.fileno()).st_size
+                        if size >= STREAM_TO_DISK_THRESHOLD_BYTES:
+                            reason = _streamed_payload_contradiction_reason(payload, "", claimed_filename)
+                            payload.seek(0)
+                            sniffed_type = _sniff_payload_type(payload.read(4096))
+                            return reason, size, sniffed_type
+                        data = payload.read()
+                        reason = _payload_contradiction_reason(
+                            data, "", claimed_filename, allow_typed_extensionless_html=True
                         )
+                        return reason, size, _sniff_payload_type(data)
 
                 try:
-                    contradicts_claimed_type = await asyncio.to_thread(_contradicts_claimed_type)
+                    rejection_reason, payload_size, sniffed_type = await asyncio.to_thread(
+                        _claimed_type_rejection_details
+                    )
                 except FileNotFoundError:
                     continue
-                if not contradicts_claimed_type:
+                if rejection_reason is None:
                     valid_files_to_rename.append(file)
                     continue
                 LOG.warning(
                     "Rejected downloaded file whose content contradicts its claimed type",
                     task_id=task.task_id,
                     workflow_run_id=task.workflow_run_id,
+                    reason=rejection_reason,
+                    size=payload_size,
+                    sniffed_type=sniffed_type,
                 )
                 if context is not None:
                     context.record_download_failure(task.task_id, requested_download_failure_reason)
@@ -2331,13 +2345,17 @@ class ForgeAgent:
                 if validate_claimed_type:
                     applied_download = context.download_suffix_applied_files.get(local_file_name) if context else None
                     original_filename = applied_download[0] if applied_download else local_file_name
-                    if _payload_contradicts_claimed_type(
+                    rejection_reason = _payload_contradiction_reason(
                         file_data, "", original_filename, allow_typed_extensionless_html=True
-                    ):
+                    )
+                    if rejection_reason is not None:
                         LOG.warning(
                             "Rejected downloaded file whose content contradicts its claimed type",
                             task_id=task.task_id,
                             workflow_run_id=task.workflow_run_id,
+                            reason=rejection_reason,
+                            size=len(file_data),
+                            sniffed_type=_sniff_payload_type(file_data),
                         )
                         if context is not None:
                             context.record_download_failure(task.task_id, requested_download_failure_reason)
