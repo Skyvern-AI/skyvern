@@ -16717,7 +16717,7 @@ class FileDownloadBlock(BaseTaskBlock, FileDestinationBlock):
         run_download_id: str,
         workflow_run_block_id: str,
         download_files_path: str,
-    ) -> tuple[str, list[FileInfo], None]:
+    ) -> tuple[str, list[FileInfo] | None, None]:
         category = sftp_service.SFTPDownloadErrorCategory.CONFIGURATION
         byte_count = 0
         succeeded = False
@@ -16792,7 +16792,10 @@ class FileDownloadBlock(BaseTaskBlock, FileDestinationBlock):
                 filename=Path(file_path).name,
             )
             matching_files = self._matching_authenticated_download(file_path, registered_files)
-            if not matching_files:
+            # None means the save is deferred to workflow finalization, not that the download failed;
+            # the file is on disk and teardown retries the registration. Only a completed read-back that
+            # cannot bind this file to an attempt entry is a registration failure.
+            if matching_files == []:
                 raise sftp_service.SFTPDownloadError(
                     sftp_service.SFTPDownloadErrorCategory.REGISTRATION_FAILED,
                     bytes_transferred=byte_count,
