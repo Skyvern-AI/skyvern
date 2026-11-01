@@ -51,6 +51,7 @@ const mockRegisteredNumbers = vi.hoisted(() =>
     }[] => [],
   ),
 );
+const forwardingAvailability = vi.hoisted(() => ({ available: false }));
 
 vi.mock("@/hooks/useTwilioIntegration", () => ({
   useTwilioCredentialQuery: () => ({
@@ -81,6 +82,12 @@ vi.mock("@/routes/workflows/hooks/useCredentialsQuery", () => ({
 }));
 vi.mock("@/hooks/useFeatureFlag", () => ({
   useFeatureFlag: () => false,
+}));
+vi.mock("@/hooks/useEmailForwarding", () => ({
+  useEmailForwardingAvailable: () => forwardingAvailability.available,
+}));
+vi.mock("@/components/emailForwarding/CredentialForwardingAddress", () => ({
+  CredentialForwardingAddress: () => <div>Forwarding address controls</div>,
 }));
 
 type Values = {
@@ -395,6 +402,39 @@ describe("PasswordCredentialContent — built-in two-factor methods", () => {
       expect.objectContaining({ totp_type: "none" }),
     );
   });
+});
+
+describe("PasswordCredentialContent email forwarding availability", () => {
+  beforeEach(() => {
+    installEmailCredentialHooks();
+  });
+
+  afterEach(() => {
+    forwardingAvailability.available = false;
+  });
+
+  it.each([
+    ["unavailable", false],
+    ["available", true],
+  ] as const)(
+    "shows the credential forwarding surface only when %s",
+    (_, available) => {
+      forwardingAvailability.available = available;
+      render(
+        <MemoryRouter>
+          <PasswordCredentialContent
+            credentialId="cred_test"
+            values={SAVED_VALUES}
+            onChange={vi.fn()}
+          />
+        </MemoryRouter>,
+      );
+
+      expect(screen.queryByText("Forwarding address controls") !== null).toBe(
+        available,
+      );
+    },
+  );
 });
 
 // Mirrors CredentialsModal: starts the form at INITIAL_VALUES, then after mount

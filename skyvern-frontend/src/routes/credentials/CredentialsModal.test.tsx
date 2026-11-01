@@ -14,6 +14,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import { getClient } from "@/api/AxiosClient";
 import type { CredentialApiResponse } from "@/api/types";
+import CloudContext from "@/store/CloudContext";
 import { PageSlotsProvider, type PermissionsState } from "@/store/PageSlots";
 
 import {
@@ -196,6 +197,7 @@ function renderEditPasswordCredentialsModal(
   onCredentialCreated?: (id: string, name?: string) => void,
   defaultTotpType?: "authenticator",
   permissions: PermissionsState = adminPermissions,
+  isCloud = false,
 ) {
   const queryClient = new QueryClient({
     defaultOptions: {
@@ -205,23 +207,25 @@ function renderEditPasswordCredentialsModal(
   });
   return render(
     <QueryClientProvider client={queryClient}>
-      <PageSlotsProvider value={{ permissions }}>
-        <CredentialAuthenticatorSupportProvider
-          value={{ additionalTwoFactorMethods }}
-        >
-          <MemoryRouter>
-            <CredentialsModal
-              isOpen
-              onOpenChange={vi.fn()}
-              overrideType={CredentialModalTypes.PASSWORD}
-              editingCredential={credential}
-              defaultTotpType={defaultTotpType}
-              onStartBackgroundTest={vi.fn()}
-              onCredentialCreated={onCredentialCreated}
-            />
-          </MemoryRouter>
-        </CredentialAuthenticatorSupportProvider>
-      </PageSlotsProvider>
+      <CloudContext.Provider value={isCloud}>
+        <PageSlotsProvider value={{ permissions }}>
+          <CredentialAuthenticatorSupportProvider
+            value={{ additionalTwoFactorMethods }}
+          >
+            <MemoryRouter>
+              <CredentialsModal
+                isOpen
+                onOpenChange={vi.fn()}
+                overrideType={CredentialModalTypes.PASSWORD}
+                editingCredential={credential}
+                defaultTotpType={defaultTotpType}
+                onStartBackgroundTest={vi.fn()}
+                onCredentialCreated={onCredentialCreated}
+              />
+            </MemoryRouter>
+          </CredentialAuthenticatorSupportProvider>
+        </PageSlotsProvider>
+      </CloudContext.Provider>
     </QueryClientProvider>,
   );
 }
@@ -230,6 +234,7 @@ afterEach(() => {
   cleanup();
   vi.clearAllMocks();
   vi.restoreAllMocks();
+  getMock.mockReset();
 });
 
 describe("getAuthenticatorKeyError", () => {
@@ -677,6 +682,102 @@ describe("CredentialsModal authenticator save errors", () => {
     });
     expect(toastMock).not.toHaveBeenCalled();
   }, 10_000);
+});
+
+describe("CredentialsModal email forwarding", () => {
+  it("mints after selecting Email on a saved credential without 2FA and keeps Update disabled until applied", async () => {
+    installEmailCredentialHooks();
+    const newAddress = {
+      forwarding_address_id: "fea_new",
+      organization_id: "org_1",
+      email_config_id: "emc_1",
+      email_address: "new-forwarding@example.test",
+      org_slug: "acme",
+      match_mode: "dedicated",
+      credential_id: "real-cred-id",
+      sender_allowlist: null,
+      status: "active",
+      last_received_at: null,
+      has_pending_confirmation: false,
+      created_at: "2026-10-01T00:00:00Z",
+      modified_at: "2026-10-01T00:00:00Z",
+    };
+    let addressReads = 0;
+    let releaseRefetch!: () => void;
+    let signalRefetch!: () => void;
+    const refetchGate = new Promise<void>((resolve) => {
+      releaseRefetch = resolve;
+    });
+    const refetchStarted = new Promise<void>((resolve) => {
+      signalRefetch = resolve;
+    });
+    getMock.mockImplementation(async (url: string) => {
+      if (url.endsWith("/availability")) return { data: { available: true } };
+      if (url.endsWith("/addresses") && ++addressReads > 1) {
+        signalRefetch();
+        await refetchGate;
+      }
+      return { data: [] };
+    });
+    postMock.mockImplementation(async (url: string) =>
+      url === "/email-forwarding/addresses/managed"
+        ? { data: newAddress }
+        : { data: { credential_id: "real-cred-id", name: "Acme Login" } },
+    );
+
+    renderEditPasswordCredentialsModal(
+      editingPasswordCredential,
+      undefined,
+      undefined,
+      undefined,
+      adminPermissions,
+      true,
+    );
+    const update = await screen.findByRole("button", { name: "Update" });
+    fireEvent.click(screen.getAllByLabelText("Edit credential values")[0]!);
+    fireEvent.click(screen.getByText("Two-Factor Authentication"));
+    fireEvent.click(screen.getByRole("button", { name: "Email" }));
+    fireEvent.click(
+      await screen.findByRole("button", {
+        name: "Generate a Skyvern forwarding address",
+      }),
+    );
+    await waitFor(() =>
+      expect(postMock).toHaveBeenCalledWith(
+        "/email-forwarding/addresses/managed",
+        expect.objectContaining({ credential_id: "real-cred-id" }),
+      ),
+    );
+    await refetchStarted;
+
+    expect((update as HTMLButtonElement).disabled).toBe(true);
+    expect(screen.getAllByDisplayValue("user@example.com")).toHaveLength(2);
+    fireEvent.change(screen.getAllByDisplayValue("user@example.com")[0]!, {
+      target: { value: "renamed@example.test" },
+    });
+
+    releaseRefetch();
+    expect(
+      await screen.findByDisplayValue("renamed@example.test"),
+    ).toBeTruthy();
+    await waitFor(() =>
+      expect(screen.getByDisplayValue(newAddress.email_address)).toBeTruthy(),
+    );
+    expect((update as HTMLButtonElement).disabled).toBe(false);
+    fireEvent.click(update);
+
+    await waitFor(() =>
+      expect(postMock).toHaveBeenCalledWith(
+        "/credentials/real-cred-id/update",
+        expect.objectContaining({
+          credential: expect.objectContaining({
+            username: "renamed@example.test",
+            totp_identifier: newAddress.email_address,
+          }),
+        }),
+      ),
+    );
+  });
 });
 
 describe("CredentialsModal edit-mode inline test", () => {

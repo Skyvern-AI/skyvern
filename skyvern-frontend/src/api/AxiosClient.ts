@@ -10,6 +10,7 @@ import {
 } from "@/util/env";
 import { useAuthIssueStore } from "@/store/AuthIssueStore";
 import axios, { AxiosHeaders, type InternalAxiosRequestConfig } from "axios";
+import { isForwardingAccessDenied } from "./emailForwarding";
 
 type ApiVersion = "sans-api-v1" | "v1" | "v2";
 
@@ -315,6 +316,7 @@ clients.forEach((instance) => {
       return response;
     },
     async (error) => {
+      if (isForwardingAccessDenied(error)) return Promise.reject(error);
       if (axios.isAxiosError(error)) {
         const statusCode = error.response?.status;
         const detail = getResponseDetail(error.response?.data);

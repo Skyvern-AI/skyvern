@@ -1,3 +1,4 @@
+import { EmailForwardingSettings } from "@/components/emailForwarding/EmailForwardingSettings";
 import { useScrollToHash } from "@/hooks/useScrollToHash";
 import { Label } from "@/components/ui/label";
 import {
@@ -167,6 +168,7 @@ function Settings() {
           <CustomLLMConfigForm />
         </CardContent>
       </Card>
+      <EmailForwardingSettings />
       <OrgLLMDefaultsCard />
       {(getAppVersion() !== "development" || versionData?.version) && (
         <p className="text-center text-xs text-muted-foreground/50">

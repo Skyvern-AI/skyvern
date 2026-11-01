@@ -725,9 +725,11 @@ describe("NarrativeView — activity log", () => {
     const failedCard = screen
       .getAllByTestId("copilot-test-card")
       .find((card) => card.dataset.tone === "failed")!;
-    expect(visibleText(failedCard)).toContain(
-      "Outcome not confirmed — The second run timed out.",
-    );
+    const text = visibleText(failedCard);
+    expect(text).toContain("Failed");
+    expect(text).not.toContain("Outcome not confirmed");
+    expect(text).not.toContain("The first run left the form unsubmitted.");
+    expect(text.split("The second run timed out.")).toHaveLength(2);
   });
 
   const titledFailedRun = (): TurnNarrativeState => ({

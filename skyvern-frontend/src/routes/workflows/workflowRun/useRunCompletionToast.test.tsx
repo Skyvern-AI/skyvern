@@ -65,3 +65,42 @@ test("a failed display does not consume the run's notice", () => {
   ).toBe(true);
   expect(displayed).toEqual(["shown"]);
 });
+
+test.each([
+  ["wr_copilot_fail", Status.Failed, "chat_1", "", []],
+  ["wr_copilot_pass", Status.Completed, "chat_1", "", []],
+  ["wr_user_fail", Status.Failed, null, "", [["Run Failed", "destructive"]]],
+  [
+    "wr_user_fail_in_chat",
+    Status.Failed,
+    null,
+    "&wrs=copilot",
+    [["Run Failed", "destructive"]],
+  ],
+  ["wr_user_pass", Status.Completed, null, "", [["Run Completed", "success"]]],
+] as const)(
+  "run %s ending %s with copilot session %s under %j toasts %j",
+  (runId, finalStatus, copilotSessionId, extraQuery, toasts) => {
+    const wrapper = ({ children }: { children: ReactNode }) => (
+      <MemoryRouter initialEntries={[`/studio?wr=${runId}${extraQuery}`]}>
+        {children}
+      </MemoryRouter>
+    );
+    const { result, rerender } = renderHook(
+      ({ status }) => {
+        const state = useToast();
+        useRunCompletionToast({
+          workflow_run_id: runId,
+          status,
+          copilot_session_id: copilotSessionId,
+        });
+        return state.toasts;
+      },
+      { wrapper, initialProps: { status: Status.Running as Status } },
+    );
+    const earlier = new Set(result.current.map((t) => t.id));
+    rerender({ status: finalStatus });
+    const raised = result.current.filter((t) => !earlier.has(t.id));
+    expect(raised.map((t) => [t.title, t.variant])).toEqual(toasts);
+  },
+);

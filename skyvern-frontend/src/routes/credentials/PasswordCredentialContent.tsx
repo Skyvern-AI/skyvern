@@ -1,3 +1,4 @@
+import { CredentialForwardingAddress } from "@/components/emailForwarding/CredentialForwardingAddress";
 import googleAuthenticatorIcon from "@/assets/authenticators/google-authenticator.jpg";
 import { ConnectedEmailAccountPicker } from "@/components/ConnectedEmailAccountPicker";
 import { QRCodeIcon } from "@/components/icons/QRCodeIcon";
@@ -11,6 +12,7 @@ import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { Separator } from "@/components/ui/separator";
+import { useEmailForwardingAvailable } from "@/hooks/useEmailForwarding";
 import { useFeatureFlag } from "@/hooks/useFeatureFlag";
 import { TwilioPhoneNumberPicker } from "@/routes/integrations/twilio/TwilioPhoneNumberPicker";
 import { cn } from "@/util/utils";
@@ -54,6 +56,8 @@ type PasswordCredentialContentValues = {
 };
 
 type Props = {
+  credentialId?: string;
+  savedTotpType?: string;
   values: PasswordCredentialContentValues;
   hasTotp?: boolean;
   onChange: (values: PasswordCredentialContentValues) => void;
@@ -86,6 +90,8 @@ type Props = {
   editingGroups?: { name: boolean; values: boolean };
   onEnableEditName?: () => void;
   onEnableEditValues?: () => void;
+  onForwardingAddressChange?: (identifier: string) => void;
+  onForwardingActionPendingChange?: (pending: boolean) => void;
   totpError?: string | null;
   /** Server-side authenticator setup error surfaced inline near the key field */
   authenticatorSaveError?: AuthenticatorSaveError | null;
@@ -246,6 +252,8 @@ function AdditionalTwoFactorMethodFields({
 }
 
 function PasswordCredentialContent({
+  credentialId,
+  savedTotpType = "none",
   values,
   hasTotp = false,
   onChange,
@@ -265,9 +273,12 @@ function PasswordCredentialContent({
   editingGroups,
   onEnableEditName,
   onEnableEditValues,
+  onForwardingAddressChange,
+  onForwardingActionPendingChange,
   totpError,
   authenticatorSaveError,
 }: Props) {
+  const forwardingEnabled = useEmailForwardingAvailable();
   const { enterpriseApps, additionalTwoFactorMethods = [] } =
     useCredentialAuthenticatorSupport();
   const { name, username, password, totp, totp_type, totp_identifier } = values;
@@ -1097,6 +1108,26 @@ function PasswordCredentialContent({
                       {totpIdentifierHelper}
                     </p>
                   </div>
+                  {totpMethod === "email" && forwardingEnabled && (
+                    <CredentialForwardingAddress
+                      key={credentialId ?? "unsaved"}
+                      credentialId={credentialId}
+                      identifier={totp_identifier}
+                      savedTotpType={savedTotpType}
+                      disabled={Boolean(valuesReadOnly)}
+                      onPendingChange={onForwardingActionPendingChange}
+                      onChange={(identifier) => {
+                        if (onForwardingAddressChange) {
+                          onForwardingAddressChange(identifier);
+                        } else {
+                          updateValues({
+                            totp_identifier: identifier,
+                            totp_type: "email",
+                          });
+                        }
+                      }}
+                    />
+                  )}
                   <p className="text-sm text-slate-400">
                     {enterpriseContactUrl && (
                       <>
