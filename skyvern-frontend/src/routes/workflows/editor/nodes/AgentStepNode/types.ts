@@ -10,8 +10,7 @@ export type AgentStepNodeData = NodeBaseData & {
   prompt: string;
   dataSchema: string;
   maxTurns: number;
-  // null offers the step every tool, including ones added later.
-  tools: Array<string> | null;
+  tools: Array<string>;
   parameterKeys: Array<string>;
 };
 
@@ -30,21 +29,21 @@ export const agentStepNodeDefaultData: AgentStepNodeData = {
   prompt: "",
   dataSchema: JSON.stringify(agentStepDefaultDataSchema, null, 2),
   maxTurns: 25,
-  tools: [],
+  tools: [
+    "browser_task",
+    "download_to_s3",
+    "file_download",
+    "login",
+    "page_click",
+    "page_fill",
+    "page_goto",
+    "web_search",
+    "page_extract",
+  ],
   parameterKeys: [],
   continueOnFailure: false,
   model: null,
 } as const;
-
-export function agentStepToolsFromSelection(
-  selected: Array<string>,
-  choosable: Array<string>,
-): Array<string> | null {
-  return choosable.length > 0 &&
-    choosable.every((tool) => selected.includes(tool))
-    ? null
-    : selected;
-}
 
 export function isAgentStepNode(node: Node): node is AgentStepNode {
   return node.type === "agentStep";

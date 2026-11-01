@@ -1,24 +1,38 @@
 from __future__ import annotations
 
+import json
 from datetime import datetime, timezone
 from types import SimpleNamespace
-from unittest.mock import MagicMock
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
+from skyvern.forge.sdk.copilot import agent as agent_module
 from skyvern.forge.sdk.copilot.agent import (
     _build_user_context,
     _prior_run_debug_text,
     _store_turn_context_packet_on_context,
+    _test_outcome_unseen,
+    _unseen_copilot_test_packets,
     _workflow_yaml_for_prompt,
 )
+from skyvern.forge.sdk.copilot.config import CopilotConfig
 from skyvern.forge.sdk.copilot.context import CopilotContext
+from skyvern.forge.sdk.copilot.repair_origin_run import RepairOriginBinding
 from skyvern.forge.sdk.copilot.request_policy import RequestPolicy
-from skyvern.forge.sdk.copilot.turn_context import TurnContextAssembler, TurnContextInputs
+from skyvern.forge.sdk.copilot.turn_context import (
+    COPILOT_TESTS_ENDED_AFTER_THEIR_TURN_KEY,
+    TurnContextAssembler,
+    TurnContextInputs,
+)
 from skyvern.forge.sdk.schemas.workflow_copilot import (
     WorkflowCopilotChatHistoryMessage,
+    WorkflowCopilotChatRequest,
     WorkflowCopilotChatSender,
 )
+from skyvern.forge.sdk.workflow.models.workflow import WorkflowRun, WorkflowRunStatus
+from tests.unit.copilot_route_test_support import narrative_payload_with_run
+from tests.unit.copilot_test_helpers import stub_copilot_agent_loop
 
 
 def _history(*pairs: tuple[str, str]) -> list[WorkflowCopilotChatHistoryMessage]:
@@ -672,3 +686,320 @@ def test_a_secret_in_an_attachment_filename_never_reaches_the_prompt() -> None:
 
     assert "hunter2" not in rendered
     assert "file_7" in rendered
+
+
+_PAUSED_TEST_RUN_ID = "wr_paused_test"
+_USER_RUN_ID = "wr_user_run"
+_PAUSED_TURN_REPLY_AT = datetime(2026, 10, 30, 16, 50, 32, 751246)
+_FOLLOW_UP_STARTED_AT = datetime(2026, 10, 30, 16, 51, 47, 912004, tzinfo=timezone.utc)
+
+
+def _reply(
+    content: str, run_id: str | None, started_at: datetime | None, created_at: datetime
+) -> WorkflowCopilotChatHistoryMessage:
+    return WorkflowCopilotChatHistoryMessage(
+        sender=WorkflowCopilotChatSender.AI,
+        content=content,
+        narrative_payload={
+            **narrative_payload_with_run(run_id),
+            "startedAt": started_at.isoformat() if started_at else None,
+        },
+        created_at=created_at,
+    )
+
+
+def _paused_test_history() -> list[WorkflowCopilotChatHistoryMessage]:
+    return [
+        WorkflowCopilotChatHistoryMessage(
+            sender=WorkflowCopilotChatSender.USER,
+            content="Test this whole workflow end to end exactly as it is.",
+            created_at=datetime(2026, 10, 30, 16, 50, 7, 747874),
+        ),
+        _reply(
+            "The test has not completed end to end: manager_approval is paused.",
+            _PAUSED_TEST_RUN_ID,
+            datetime(2026, 10, 30, 16, 50, 8, 102311, tzinfo=timezone.utc),
+            _PAUSED_TURN_REPLY_AT,
+        ),
+    ]
+
+
+def _history_with_unrelated_follow_up(follow_up_started_at: datetime | None) -> list[WorkflowCopilotChatHistoryMessage]:
+    return [
+        *_paused_test_history(),
+        WorkflowCopilotChatHistoryMessage(
+            sender=WorkflowCopilotChatSender.USER,
+            content="Unrelated question: what is the title of this workflow?",
+            created_at=datetime(2026, 10, 30, 16, 51, 47, 548647),
+        ),
+        _reply(
+            "The title of this workflow is Approval then final step.",
+            None,
+            follow_up_started_at,
+            datetime(2026, 10, 30, 16, 51, 56, 552923),
+        ),
+    ]
+
+
+def _test_run(finished_at: datetime | None) -> WorkflowRun:
+    return WorkflowRun(
+        workflow_run_id=_PAUSED_TEST_RUN_ID,
+        workflow_id="w_1",
+        workflow_permanent_id="wfp-1",
+        organization_id="org-1",
+        status=WorkflowRunStatus.failed if finished_at else WorkflowRunStatus.paused,
+        created_at=datetime(2026, 10, 30, 16, 50, 18, 670262),
+        modified_at=datetime(2026, 10, 30, 16, 50, 44, tzinfo=timezone.utc),
+        finished_at=finished_at,
+        failure_reason="RuntimeError: QA deliberate failure in the final block" if finished_at else None,
+    )
+
+
+def _binding(run: WorkflowRun | None) -> RepairOriginBinding:
+    return RepairOriginBinding(
+        workflow_run_id=None,
+        browser_session_id=None,
+        refusal=None,
+        status=run.status if run else None,
+        copilot_run=run is not None,
+        run=run,
+    )
+
+
+def _copilot_ctx() -> CopilotContext:
+    return CopilotContext(
+        organization_id="org-1",
+        workflow_id="wf-1",
+        workflow_permanent_id="wfp-1",
+        workflow_yaml="",
+        browser_session_id=None,
+        stream=MagicMock(),
+    )
+
+
+_ENDED_AFTER_REPLY = datetime(2026, 10, 30, 16, 50, 44, 159261, tzinfo=timezone.utc)
+_ENDED_DURING_FOLLOW_UP = datetime(2026, 10, 30, 16, 51, 50, tzinfo=timezone.utc)
+
+
+@pytest.mark.parametrize(
+    ("history", "finished_at", "reported"),
+    [
+        pytest.param(_paused_test_history(), _ENDED_AFTER_REPLY, True, id="ended-after-reply"),
+        pytest.param(_paused_test_history(), _ENDED_AFTER_REPLY.replace(tzinfo=None), True, id="naive-utc-run-row"),
+        pytest.param(
+            _paused_test_history(),
+            datetime(2026, 10, 30, 16, 50, 30, tzinfo=timezone.utc),
+            False,
+            id="ended-in-own-turn",
+        ),
+        pytest.param(_paused_test_history(), _PAUSED_TURN_REPLY_AT, False, id="ended-at-reply"),
+        pytest.param(_paused_test_history(), None, False, id="still-paused"),
+        pytest.param(
+            _history_with_unrelated_follow_up(_FOLLOW_UP_STARTED_AT), _ENDED_AFTER_REPLY, False, id="later-turn-saw-it"
+        ),
+        pytest.param(
+            _history_with_unrelated_follow_up(_FOLLOW_UP_STARTED_AT),
+            _ENDED_DURING_FOLLOW_UP,
+            True,
+            id="ended-during-unrelated-turn",
+        ),
+        pytest.param(
+            _history_with_unrelated_follow_up(None),
+            _ENDED_AFTER_REPLY,
+            True,
+            id="later-error-reply-without-started-at",
+        ),
+    ],
+)
+def test_a_test_outcome_is_reported_only_to_the_first_turn_after_it_ended(
+    history: list[WorkflowCopilotChatHistoryMessage],
+    finished_at: datetime | None,
+    reported: bool,
+) -> None:
+    assert _test_outcome_unseen(history, _PAUSED_TEST_RUN_ID, finished_at) is reported
+
+
+_TEST_PACKET = {
+    "run": {"workflow_run_id": _PAUSED_TEST_RUN_ID, "status": "failed"},
+    "failure": {"block_label": "final_step", "reason": "RuntimeError: QA deliberate failure in the final block"},
+}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("last_run_seed_id", "repair_origin_binding", "looked_up"),
+    [
+        pytest.param(_USER_RUN_ID, _binding(None), [_PAUSED_TEST_RUN_ID], id="looks-up-the-test-run"),
+        pytest.param(_PAUSED_TEST_RUN_ID, _binding(_test_run(_ENDED_AFTER_REPLY)), [], id="reuses-a-finished-seed"),
+        pytest.param(
+            _PAUSED_TEST_RUN_ID, _binding(_test_run(None)), [_PAUSED_TEST_RUN_ID], id="re-reads-a-seed-still-paused"
+        ),
+    ],
+)
+async def test_a_paused_test_that_ended_later_reaches_the_next_turn_beside_the_users_run(
+    monkeypatch: pytest.MonkeyPatch,
+    last_run_seed_id: str,
+    repair_origin_binding: RepairOriginBinding,
+    looked_up: list[str],
+) -> None:
+    hydrated: list[str] = []
+    resolved: list[str] = []
+    user_run_packet = {"run": {"workflow_run_id": _USER_RUN_ID, "status": "failed"}}
+
+    async def fake_hydrate(_ctx: CopilotContext, *, workflow_run_id: str | None) -> dict[str, dict[str, str]]:
+        hydrated.append(workflow_run_id or "")
+        return _TEST_PACKET
+
+    async def fake_resolve(*, workflow_run_id: str, **_kwargs: object) -> RepairOriginBinding:
+        resolved.append(workflow_run_id)
+        return _binding(_test_run(_ENDED_AFTER_REPLY))
+
+    monkeypatch.setattr(agent_module, "hydrate_prior_run_packet", fake_hydrate)
+    monkeypatch.setattr(agent_module, "resolve_repair_origin_binding", fake_resolve)
+    ctx = _copilot_ctx()
+    history = _paused_test_history()
+
+    packets = await _unseen_copilot_test_packets(
+        ctx,
+        messages=history,
+        hydrated_run_id=_USER_RUN_ID,
+        last_run_seed_id=last_run_seed_id,
+        repair_origin_binding=repair_origin_binding,
+    )
+
+    assert resolved == looked_up
+    assert hydrated == [_PAUSED_TEST_RUN_ID]
+    _store_turn_context_packet_on_context(
+        ctx,
+        request_policy=RequestPolicy(),
+        chat_request=SimpleNamespace(message="Unrelated question", workflow_yaml=""),
+        chat_history=history,
+        prior_copilot_workflow_yaml=None,
+        prior_run_packet=user_run_packet,
+        copilot_test_packets=packets,
+    )
+    assert ctx.turn_context_packet is not None
+    turn_context = ctx.turn_context_packet
+    assert turn_context.run_context is not None
+    assert turn_context.run_context.packet == user_run_packet
+    assert turn_context.copilot_tests_ended_after_their_turn is not None
+    assert [context.packet for context in turn_context.copilot_tests_ended_after_their_turn] == [_TEST_PACKET]
+    assert {"run_context", "copilot_tests_ended_after_their_turn"} <= set(turn_context.to_trace_data()["sections"])
+    rendered = _build_user_context(
+        workflow_yaml="",
+        chat_history_text="",
+        global_llm_context="",
+        debug_run_info_text=_prior_run_debug_text(user_run_packet, packets),
+        user_message="Unrelated question",
+        user_workflow_change_summary="",
+    )
+    debug_block = rendered.split("DEBUGGER RUN INFORMATION:", 1)[1].split("```")[1]
+    rendered_packets = json.loads(debug_block.removeprefix("json").strip())
+    assert rendered_packets["build_test_packet"] == user_run_packet
+    assert rendered_packets[COPILOT_TESTS_ENDED_AFTER_THEIR_TURN_KEY] == [_TEST_PACKET]
+
+
+@pytest.mark.asyncio
+async def test_a_test_the_turn_already_hydrates_gets_no_second_packet(monkeypatch: pytest.MonkeyPatch) -> None:
+    hydrate = AsyncMock(return_value=_TEST_PACKET)
+    monkeypatch.setattr(agent_module, "hydrate_prior_run_packet", hydrate)
+
+    packets = await _unseen_copilot_test_packets(
+        _copilot_ctx(),
+        messages=_paused_test_history(),
+        hydrated_run_id=_PAUSED_TEST_RUN_ID,
+        last_run_seed_id=_PAUSED_TEST_RUN_ID,
+        repair_origin_binding=_binding(_test_run(_ENDED_AFTER_REPLY)),
+    )
+
+    assert packets == []
+    hydrate.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_two_paused_tests_that_both_ended_between_turns_both_reach_the_next_turn(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    history = [
+        *_paused_test_history(),
+        WorkflowCopilotChatHistoryMessage(
+            sender=WorkflowCopilotChatSender.USER,
+            content="Test it again.",
+            created_at=datetime(2026, 10, 30, 16, 51, 0),
+        ),
+        _reply(
+            "The second test is paused at manager_approval too.",
+            "wr_second_test",
+            datetime(2026, 10, 30, 16, 51, 1, tzinfo=timezone.utc),
+            datetime(2026, 10, 30, 16, 51, 30),
+        ),
+    ]
+    ended = datetime(2026, 10, 30, 16, 52, tzinfo=timezone.utc)
+
+    async def fake_resolve(*, workflow_run_id: str, **_kwargs: object) -> RepairOriginBinding:
+        return _binding(_test_run(ended).model_copy(update={"workflow_run_id": workflow_run_id}))
+
+    async def fake_hydrate(_ctx: CopilotContext, *, workflow_run_id: str | None) -> dict[str, dict[str, str | None]]:
+        return {"run": {"workflow_run_id": workflow_run_id, "status": "failed"}}
+
+    monkeypatch.setattr(agent_module, "resolve_repair_origin_binding", fake_resolve)
+    monkeypatch.setattr(agent_module, "hydrate_prior_run_packet", fake_hydrate)
+
+    packets = await _unseen_copilot_test_packets(
+        _copilot_ctx(),
+        messages=history,
+        hydrated_run_id=None,
+        last_run_seed_id="wr_second_test",
+        repair_origin_binding=_binding(None),
+    )
+
+    assert [packet["run"]["workflow_run_id"] for packet in packets] == [_PAUSED_TEST_RUN_ID, "wr_second_test"]
+
+
+@pytest.mark.asyncio
+async def test_a_named_test_still_paused_at_seed_time_reaches_the_turn_once_it_has_ended(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    hydrate = AsyncMock(return_value=_TEST_PACKET)
+    monkeypatch.setattr(agent_module, "restore_pending_workflow_proposal", AsyncMock(return_value=None))
+    monkeypatch.setattr(agent_module, "seed_repair_origin_run", AsyncMock(return_value=_binding(_test_run(None))))
+    monkeypatch.setattr(
+        agent_module, "resolve_repair_origin_binding", AsyncMock(return_value=_binding(_test_run(_ENDED_AFTER_REPLY)))
+    )
+    monkeypatch.setattr(agent_module, "hydrate_prior_run_packet", hydrate)
+    stub_copilot_agent_loop(
+        monkeypatch,
+        AsyncMock(
+            return_value=SimpleNamespace(
+                final_output=json.dumps({"type": "REPLY", "user_response": "ok"}), new_items=[]
+            )
+        ),
+    )
+    build_context = MagicMock(wraps=agent_module._build_user_context)
+    monkeypatch.setattr(agent_module, "_build_user_context", build_context)
+
+    await agent_module.run_copilot_agent(
+        stream=MagicMock(),
+        organization_id="org-1",
+        chat_request=WorkflowCopilotChatRequest(
+            message="how did it go?",
+            workflow_id="wf-1",
+            workflow_permanent_id="wfp-1",
+            workflow_copilot_chat_id="chat-1",
+            workflow_run_id=_PAUSED_TEST_RUN_ID,
+            workflow_yaml="title: Canonical\n",
+        ),
+        chat_history=[],
+        prior_user_messages=_paused_test_history(),
+        global_llm_context=None,
+        llm_api_handler=SimpleNamespace(llm_key="PRIMARY"),
+        raw_secret_safety_handler=AsyncMock(
+            return_value={"version": "1", "state": "clean", "handling": "none", "citations": []}
+        ),
+        api_key="sk-test",
+        config=CopilotConfig(),
+    )
+
+    assert [call.kwargs["workflow_run_id"] for call in hydrate.await_args_list] == [_PAUSED_TEST_RUN_ID]
+    debug = json.loads(build_context.call_args.kwargs["debug_run_info_text"])
+    assert debug == {COPILOT_TESTS_ENDED_AFTER_THEIR_TURN_KEY: [_TEST_PACKET]}

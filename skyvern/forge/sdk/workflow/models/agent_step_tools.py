@@ -9,7 +9,7 @@ from dataclasses import dataclass
 from pydantic import BaseModel
 
 from skyvern.cli.mcp_tools.blocks import BLOCK_SUMMARIES
-from skyvern.schemas.agent_step_tool_names import AGENT_STEP_TOOL_NAMES
+from skyvern.schemas.agent_step_tool_names import AGENT_STEP_TOOL_NAMES, ALWAYS_OFFERED_TOOLS
 from skyvern.schemas.workflows import (
     BlockType,
     BlockYAML,
@@ -273,15 +273,15 @@ def tool_descriptions() -> dict[str, str]:
 class AgentStepToolOption(BaseModel):
     name: str
     description: str
-    # None for the page and run-data tools, which are not blocks.
+    # None for the page tools, which are not blocks.
     block_type: BlockType | None
 
 
 def tool_options() -> list[AgentStepToolOption]:
-    """The tools an author chooses from; finish is always offered, so it is not one."""
+    """The tools an author chooses from."""
     blocks = {**DEDICATED_BLOCK_TOOLS, **RUN_BLOCK_TYPES}
     return [
         AgentStepToolOption(name=name, description=description, block_type=blocks[name][0] if name in blocks else None)
         for name, description in sorted(tool_descriptions().items())
-        if name != "finish"
+        if name not in ALWAYS_OFFERED_TOOLS
     ]

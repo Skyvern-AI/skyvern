@@ -292,6 +292,8 @@ vi.mock("@/routes/workflows/editor/hooks/useSaveWorkflow", () => ({
 // Unrelated to this file's tests; the real hook needs a QueryClientProvider
 // this harness doesn't set up.
 vi.mock("@/routes/workflows/hooks/useWorkflowRunQuery", () => ({
+  useWorkflowRunQueries: (ids: readonly string[]) =>
+    ids.map(() => ({ data: undefined })),
   useWorkflowRunQuery: () => ({ data: undefined }),
 }));
 // Same reason: the chats query the History dropdown subscribes to needs a

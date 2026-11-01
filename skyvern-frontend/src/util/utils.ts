@@ -9,6 +9,11 @@ export function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 
+// Server stamps without an offset are UTC.
+export function parseServerStamp(stamp: string): number {
+  return Date.parse(/(Z|[+-]\d{2}:?\d{2})$/.test(stamp) ? stamp : `${stamp}Z`);
+}
+
 export function formatElapsedSeconds(ms: number): string {
   const seconds = Math.max(0, Math.round(ms / 1000));
   const m = Math.floor(seconds / 60);
