@@ -63,7 +63,7 @@ from skyvern.forge.taskv3.goal_check import (
 )
 from skyvern.forge.taskv3.goal_composition import CodeTypedValue, build_user_prompt, typed_value_rows
 from skyvern.forge.taskv3.intercepted_submission import InterceptedSubmission
-from skyvern.forge.taskv3.llm_call_params import build_call_kwargs
+from skyvern.forge.taskv3.llm_call_params import build_call_kwargs, carry_reasoning_route
 from skyvern.forge.taskv3.loop import (
     DEFAULT_MAX_SETTLE_DEFERRALS,
     PERCEPTION_RETAIN_CHARS_HIGH,
@@ -88,6 +88,7 @@ from skyvern.forge.taskv3.opaque_refs import OpaqueUrlRefs, is_signed_url, mask_
 from skyvern.forge.taskv3.run_arms import (
     ANSWER_AUDIT_LOG_ONLY_FLAG,
     APPLICATION_CONTEXT_FLAG,
+    CARRY_REASONING_FLAG,
     current_run_arm,
     run_arm_enabled,
 )
@@ -777,9 +778,13 @@ async def run_task_v3_agent_loop(
     # After the data, never in the system prompt: the data and the task's own instructions outrank the default.
     if defaults_text:
         user_prompt += f"\n\n{defaults_text}"
+    arm_context = skyvern_context.current()
+    carry_reasoning_pin = arm_context.run_arms.get(CARRY_REASONING_FLAG) if arm_context is not None else None
+    carry_route = carry_reasoning_route(llm_caller)
     try:
         outcome = await run_agent_tool_loop(
             llm_caller=llm_caller,
+            same_layer_type_hold=settings.TASK_V3_SAME_LAYER_TYPE_HOLD,
             system_prompt=system_prompt,
             user_prompt=user_prompt,
             tools=tools,
@@ -832,6 +837,7 @@ async def run_task_v3_agent_loop(
             block_completion_check=_block_completion_check if block_check_on else None,
             unseen_text=unseen_text,
             anthropic_cache_markers=anthropic_cache_markers,
+            carry_reasoning=carry_route == "carries" and run_arm_enabled(CARRY_REASONING_FLAG, forced=False),
         )
     finally:
         loop_ended = True
@@ -928,6 +934,10 @@ async def run_task_v3_agent_loop(
         # The run's model, so exposure rates on this line split per model like the re-ask line's.
         llm_key=llm_caller.llm_key,
         llm_route_arm=llm_route_arm,
+        carry_reasoning_arm=carry_reasoning_pin[1] if carry_reasoning_pin is not None else "unrandomized",
+        carry_reasoning_route=carry_route,
+        carried_reasoning_turns=outcome.carried_reasoning_turns,
+        carry_reasoning_stripped=outcome.carry_reasoning_stripped,
         unlisted_reask=outcome.unlisted_reask,
         # The loop's progress signals ride here rather than on records of their own: this line
         # already fires exactly once per run and already carries block_type, so collapsing removes a

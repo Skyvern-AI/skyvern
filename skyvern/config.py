@@ -590,6 +590,9 @@ class Settings(BaseSettings):
     # Kill switch for committing a list row that names the value without being it exactly (its main label, a
     # singular/plural, a unique word prefix on a click-opened list) (SKY-18017). Off: typeaheads commit exact rows only.
     TASK_V3_CHOICE_NONEXACT_COMMIT: bool = True
+    # Kill switch: hold a Task V3 typing call whose field is still refused by the same live layer that refused an earlier
+    # one, instead of re-running the full typing path for it (SKY-19408). Off: every call runs its full path as before.
+    TASK_V3_SAME_LAYER_TYPE_HOLD: bool = True
     # Press a sub-pixel date segment through the layer painted over it, and route month/year and
     # year-only segment groups to the segment path (SKY-17013). Force-on term only: runs are randomized per
     # run by the flag of the same name, read through run_arm_enabled(DATE_SEGMENT_AIM_FLAG, ...).
