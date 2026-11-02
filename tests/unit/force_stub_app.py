@@ -104,6 +104,9 @@ def create_forge_stub_app() -> ForgeApp:
     fake_app_module.AGENT_FUNCTION.enforce_folder_access = base_agent_function.enforce_folder_access
     fake_app_module.AGENT_FUNCTION.enforce_folder_access_for_runs = base_agent_function.enforce_folder_access_for_runs
     fake_app_module.AGENT_FUNCTION.on_folder_created = base_agent_function.on_folder_created
+    fake_app_module.AGENT_FUNCTION.copilot_browser_pattern_accepting_calls = (
+        base_agent_function.copilot_browser_pattern_accepting_calls
+    )
     # Class constant, not a method — _LazyNamespace would auto-mock it into a non-iterable AsyncMock
     # and break every caller that scans it for close-page phrases.
     fake_app_module.AGENT_FUNCTION.MAGIC_LINK_CLOSE_SIGNALS = base_agent_function.MAGIC_LINK_CLOSE_SIGNALS

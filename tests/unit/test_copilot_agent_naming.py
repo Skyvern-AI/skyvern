@@ -67,7 +67,12 @@ def naming_tasks() -> Iterator[set[asyncio.Task[str | None]]]:
 
 @pytest_asyncio.fixture
 async def repo(sqlite_engine: AsyncEngine, monkeypatch: pytest.MonkeyPatch) -> WorkflowsRepository:
-    repository = WorkflowsRepository(BaseAlchemyDB(sqlite_engine).Session, debug_enabled=False)
+    repository = WorkflowsRepository(
+        BaseAlchemyDB(sqlite_engine).Session,
+        debug_enabled=False,
+        db_engine=sqlite_engine,
+        sqlite_workflow_creation_lock=asyncio.Lock(),
+    )
     monkeypatch.setattr(app.DATABASE, "workflows", repository)
 
     async def get_workflow_by_permanent_id(workflow_permanent_id: str, organization_id: str | None = None) -> Workflow:

@@ -10,6 +10,7 @@ from pathlib import Path
 from unittest.mock import MagicMock
 
 import pytest
+from playwright.async_api import Page
 
 from skyvern.cli.mcp_tools import blocks
 from skyvern.cli.mcp_tools.blocks import (
@@ -24,6 +25,11 @@ from skyvern.cli.mcp_tools.blocks import (
 from skyvern.forge.sdk.workflow.context_manager import WorkflowRunContext
 from skyvern.forge.sdk.workflow.exceptions import FailedToFormatJinjaStyleParameter, MissingJinjaVariables
 from skyvern.forge.sdk.workflow.models.block import CodeBlock, TaskBlock
+from skyvern.forge.sdk.workflow.models.code_block_recorder import (
+    _LOCATOR_ACTION_MAP,
+    _LOCATOR_FACTORY_METHODS,
+    _PAGE_ACTION_MAP,
+)
 from skyvern.forge.sdk.workflow.models.parameter import OutputParameter, ParameterType
 
 
@@ -61,6 +67,27 @@ async def test_workflow_knowledge_renders_the_code_block_runtime_names_from_the_
     assert "- html: escape" in content
     assert "{{current_date}}" in content
     assert "solve_captcha" in content
+
+    def segments(prefix: str) -> list[set[str]]:
+        line = next((line for line in content.splitlines() if line.startswith(prefix)), None)
+        assert line is not None, f"no line starts with {prefix!r}"
+        return [set(re.findall(r"[\w.]+", segment.split(":", 1)[1])) for segment in line.split(";")]
+
+    page_calls, page_or_locator, locator_only = segments("Recorded as timeline actions")
+    assert {f"page.{name}" for name in _PAGE_ACTION_MAP} | {"page.keyboard.press"} <= page_calls
+    for name in _LOCATOR_ACTION_MAP:
+        assert [name in page_or_locator, name in locator_only].count(True) == 1
+    assert all(hasattr(Page, name) for name in page_or_locator)
+    assert {"set_input_files", "drag_to", "press_sequentially"} <= locator_only
+    assert "inner_text" not in {*_PAGE_ACTION_MAP, *_LOCATOR_ACTION_MAP}
+    assert not any("inner_text" in segment for segment in (page_calls, page_or_locator, locator_only))
+    assert "inner_text" in content
+
+    factories_on_page, factories_on_locator = segments("Locator factories")
+    for name in {"locator", *_LOCATOR_FACTORY_METHODS}:
+        assert [name in factories_on_page, name in factories_on_locator].count(True) == 1
+    assert all(hasattr(Page, name) for name in factories_on_page)
+    assert "evaluate(js, arg=None)" in content
 
 
 @pytest.mark.asyncio

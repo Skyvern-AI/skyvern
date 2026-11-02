@@ -1063,6 +1063,7 @@ export type WorkflowRunStatusApiResponse = {
   verification_code_polling_started_at?: string | null;
   retried_from_workflow_run_id?: string | null;
   retried_by_workflow_run_id?: string | null;
+  copilot_session_id?: string | null;
 } & WorkflowRunRetryFields;
 
 export type WorkflowRunStatusApiResponseWithWorkflow = {
@@ -1108,6 +1109,7 @@ export type WorkflowRunStatusApiResponseWithWorkflow = {
   verification_code_polling_started_at?: string | null;
   retried_from_workflow_run_id?: string | null;
   retried_by_workflow_run_id?: string | null;
+  copilot_session_id?: string | null;
 } & WorkflowRunRetryFields;
 
 export type TaskGenerationApiResponse = {

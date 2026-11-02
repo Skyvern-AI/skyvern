@@ -1831,6 +1831,7 @@ def _fake_code_block_page(navigations: list | None = None, fills: list | None = 
     from playwright.async_api import Page
 
     page = MagicMock(spec=Page)
+    page.url = "https://customer.auth0.com/callback"
 
     async def goto(url: str, **kwargs: object) -> None:
         if navigations is not None:
@@ -3119,6 +3120,7 @@ class TestCodeBlockMagicLink:
         await magic_link(page)
 
         assert captured["expected_otp_type"] is OTPType.MAGIC_LINK
+        assert captured["task_url"] == page.url
         assert navigations == [link]
         assert fills == []
 

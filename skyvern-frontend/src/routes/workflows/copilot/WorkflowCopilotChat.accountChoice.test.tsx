@@ -7,6 +7,7 @@ import {
   waitFor,
 } from "@testing-library/react";
 import type { ComponentProps } from "react";
+import { MemoryRouter } from "react-router-dom";
 import type { QuestionInteraction } from "./workflowCopilotTypes";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
@@ -909,5 +910,37 @@ describe("WorkflowCopilotChat connected account choices", () => {
       ).toBeTruthy(),
     );
     expect(screen.queryByText("goac_1")).toBeNull();
+  });
+});
+
+describe("WorkflowCopilotChat unavailable agent notice", () => {
+  it("links to the agents list from the typed facts", async () => {
+    historyResponse.data = {
+      workflow_copilot_chat_id: "chat-1",
+      proposed_workflow: null,
+      auto_accept: false,
+      chat_history: [
+        {
+          sender: "ai",
+          content: "I could not save the change.",
+          created_at: "2026-08-15T00:00:01Z",
+          narrative_payload: {
+            ...narrativePayload(false),
+            canonicalWorkflowUnavailable: {
+              workflow_permanent_id: "wpid_bound",
+              candidate_published: false,
+              test_started: false,
+            },
+          },
+        },
+      ],
+    };
+    render(<MemoryRouter>{chatElement()}</MemoryRouter>);
+    await act(async () => {});
+    const requestsBefore = postStreaming.mock.calls.length;
+    const link = await screen.findByRole("link", { name: "Open Agents" });
+    expect(link.getAttribute("href")).toBe("/agents");
+    fireEvent.click(link);
+    expect(postStreaming.mock.calls.length).toBe(requestsBefore);
   });
 });
