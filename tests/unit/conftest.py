@@ -41,9 +41,10 @@ from playwright.async_api import Page
 from playwright.async_api import TimeoutError as PlaywrightTimeoutError
 from playwright.async_api import async_playwright
 from playwright.sync_api import sync_playwright
-from sqlalchemy import Engine, create_engine, func, select
+from sqlalchemy import Engine, create_engine, event, func, select
 from sqlalchemy.engine import URL, make_url
 from sqlalchemy.ext.asyncio import AsyncEngine, create_async_engine
+from sqlalchemy.pool import StaticPool
 
 import skyvern._cli_bootstrap as cli_bootstrap
 from skyvern.config import settings
@@ -516,8 +517,24 @@ def sqlite_schema_template(tmp_path_factory: pytest.TempPathFactory) -> Path:
 
 class SqliteEngineFactory(Protocol):
     def __call__(
-        self, *, template: Path | None = None, build_engine: Callable[[str], AsyncEngine] | None = None
+        self,
+        *,
+        template: Path | None = None,
+        build_engine: Callable[[str], AsyncEngine] | None = None,
+        single_connection: bool = False,
     ) -> AsyncEngine: ...
+
+
+def _single_connection_engine(url: str) -> AsyncEngine:
+    engine = create_async_engine(url, json_serializer=_custom_json_serializer, poolclass=StaticPool)
+
+    @event.listens_for(engine.sync_engine, "connect")
+    def _foreign_keys_on(dbapi_connection: Any, _record: Any) -> None:
+        cursor = dbapi_connection.cursor()
+        cursor.execute("PRAGMA foreign_keys=ON")
+        cursor.close()
+
+    return engine
 
 
 @pytest_asyncio.fixture
@@ -525,13 +542,25 @@ async def sqlite_engine_factory(sqlite_schema_template: Path, tmp_path: Path) ->
     created: list[tuple[AsyncEngine, Path]] = []
     counter = itertools.count()
 
-    def _make(*, template: Path | None = None, build_engine: Callable[[str], AsyncEngine] | None = None) -> AsyncEngine:
+    def _make(
+        *,
+        template: Path | None = None,
+        build_engine: Callable[[str], AsyncEngine] | None = None,
+        single_connection: bool = False,
+    ) -> AsyncEngine:
+        if single_connection and build_engine is not None:
+            raise ValueError("single_connection builds its own engine, so it cannot be combined with build_engine")
         db_path = tmp_path / f"db_{next(counter)}.db"
         shutil.copyfile(template or sqlite_schema_template, db_path)
         url = f"sqlite+aiosqlite:///{db_path}"
-        engine = (
-            build_engine(url) if build_engine else create_async_engine(url, json_serializer=_custom_json_serializer)
-        )
+        if single_connection:
+            # One shared connection, so concurrent sessions queue on it in order; with a pool each gets its own
+            # connection and the interleaving varies from run to run.
+            engine = _single_connection_engine(url)
+        else:
+            engine = (
+                build_engine(url) if build_engine else create_async_engine(url, json_serializer=_custom_json_serializer)
+            )
         created.append((engine, db_path))
         return engine
 
