@@ -11,7 +11,6 @@ from unittest.mock import AsyncMock, MagicMock
 import pytest
 import yaml
 from agents import FunctionTool
-from agents.tool_context import ToolContext
 from pydantic import ValidationError
 from structlog.testing import capture_logs
 
@@ -44,6 +43,7 @@ from skyvern.forge.sdk.workflow.models.workflow import Workflow, WorkflowDefinit
 from skyvern.schemas.runs import ProxyLocation
 from skyvern.schemas.workflows import WorkflowCreateYAMLRequest, WorkflowStatus
 from skyvern.utils.yaml_loader import safe_load_no_dates
+from tests.unit.conftest import invoke_copilot_tool
 from tests.unit.copilot_route_test_support import install_candidate_store
 from tests.unit.copilot_test_helpers import make_copilot_ctx, stub_copilot_agent_loop
 
@@ -963,15 +963,6 @@ def _authoring_ctx(workflow_yaml: str = "") -> CopilotContext:
     return ctx
 
 
-async def _invoke(tool: FunctionTool, ctx: CopilotContext, arguments: dict[str, Any]) -> dict[str, Any]:
-    raw_arguments = json.dumps(arguments)
-    raw = await tool.on_invoke_tool(
-        ToolContext(context=ctx, tool_name=tool.name, tool_call_id="call_submit", tool_arguments=raw_arguments),
-        raw_arguments,
-    )
-    return json.loads(raw)
-
-
 @pytest.fixture
 def dispatch(monkeypatch: pytest.MonkeyPatch, no_saved_workflow: None) -> AsyncMock:
     monkeypatch.setattr(workflow_update_module, "_get_prior_workflow", AsyncMock(return_value=None))
@@ -987,7 +978,7 @@ async def test_first_submission_persists_punctuated_values_and_exact_code_then_d
     submitted = _first_submission()
     ctx = _authoring_ctx()
 
-    result = await _invoke(
+    result = await invoke_copilot_tool(
         tools_module.update_and_run_blocks_tool, ctx, {"workflow": submitted, "block_labels": ["collect_members"]}
     )
 
@@ -1010,7 +1001,7 @@ async def test_first_submission_of_an_ordinary_workflow_persists_and_dispatches_
     }
     ctx = _authoring_ctx()
 
-    result = await _invoke(
+    result = await invoke_copilot_tool(
         tools_module.update_and_run_blocks_tool, ctx, {"workflow": submitted, "block_labels": ["collect_members"]}
     )
 
@@ -1026,7 +1017,7 @@ async def test_first_submission_with_an_unknown_block_type_keeps_its_validation_
     expected = await _update_workflow({"workflow_yaml": yaml.safe_dump(invalid, sort_keys=False)}, _authoring_ctx())
     ctx = _authoring_ctx()
 
-    result = await _invoke(
+    result = await invoke_copilot_tool(
         tools_module.update_and_run_blocks_tool, ctx, {"workflow": invalid, "block_labels": ["collect_members"]}
     )
 
@@ -1087,7 +1078,7 @@ async def test_publication_against_an_active_canonical_publishes_the_candidate(
     monkeypatch.setattr(app.DATABASE.workflows, "get_workflow_by_permanent_id", AsyncMock(return_value=canonical))
     ctx = _bound_ctx()
 
-    result = await _invoke(tool, ctx, arguments)
+    result = await invoke_copilot_tool(tool, ctx, arguments)
 
     assert result["ok"] is True, result
     candidate_store.assert_awaited_once()
@@ -1105,7 +1096,7 @@ async def test_publication_against_a_missing_canonical_returns_typed_facts_witho
     monkeypatch.setattr(app.DATABASE.workflows, "get_workflow_by_permanent_id", lookup)
     ctx = _bound_ctx()
 
-    result = await _invoke(tool, ctx, arguments)
+    result = await invoke_copilot_tool(tool, ctx, arguments)
 
     assert {call.kwargs["workflow_permanent_id"] for call in lookup.await_args_list} == {"wfp-1"}
     assert result["ok"] is False
@@ -1129,7 +1120,7 @@ async def test_tool_publication_refusal_after_a_failed_test_is_not_rewritten_int
     ctx.last_update_block_count = 1
     ctx.last_test_failure_reason = "The page timed out."
 
-    result = await _invoke(tool, ctx, arguments)
+    result = await invoke_copilot_tool(tool, ctx, arguments)
     model_reply = result["error"]
     agent_result = await copilot_agent._translate_to_agent_result(
         SimpleNamespace(final_output=json.dumps({"type": "REPLY", "user_response": model_reply}), new_items=[]),
@@ -1182,7 +1173,7 @@ async def test_agent_removed_after_the_update_half_published_reports_only_the_re
     monkeypatch.setattr(app.WORKFLOW_SERVICE, "create_copilot_dispatch_draft_version", draft_version)
     ctx = _bound_ctx()
 
-    result = await _invoke(tool, ctx, arguments)
+    result = await invoke_copilot_tool(tool, ctx, arguments)
 
     candidate_store.assert_awaited_once()
     draft_version.assert_not_awaited()
@@ -1197,12 +1188,12 @@ async def _test_button_handoff(ctx: CopilotContext) -> dict[str, Any]:
 _TestStart = Callable[[CopilotContext], Awaitable[dict[str, Any]]]
 _TEST_STARTS = [
     pytest.param(
-        lambda ctx: _invoke(tools_module.run_blocks_tool, ctx, {"block_labels": ["collect_members"]}),
+        lambda ctx: invoke_copilot_tool(tools_module.run_blocks_tool, ctx, {"block_labels": ["collect_members"]}),
         True,
         id="run_blocks_and_collect_debug",
     ),
     pytest.param(
-        lambda ctx: _invoke(tools_module.test_workflow_from_blank_browser_tool, ctx, {}),
+        lambda ctx: invoke_copilot_tool(tools_module.test_workflow_from_blank_browser_tool, ctx, {}),
         True,
         id="test_workflow_from_blank_browser",
     ),
@@ -1278,7 +1269,9 @@ async def test_add_block_splices_a_punctuated_multiline_block(dispatch: AsyncMoc
     ctx = _authoring_ctx(yaml.safe_dump(_first_submission(), sort_keys=False))
     new_block = {"block_type": "code", "label": "report_members", "code": _MULTILINE_CODE}
 
-    result = await _invoke(tools_module.add_block_tool, ctx, {"after_label": "collect_members", "block": new_block})
+    result = await invoke_copilot_tool(
+        tools_module.add_block_tool, ctx, {"after_label": "collect_members", "block": new_block}
+    )
 
     assert result["ok"] is True, result
     assert ctx.staged_workflow is not None
@@ -1321,7 +1314,9 @@ async def test_delete_block_reports_only_the_inputs_nothing_left_reads(
     monkeypatch.setattr(workflow_update_module, "_get_prior_workflow", AsyncMock(return_value=prior))
     ctx = _authoring_ctx(_SEEDED_STORED_YAML)
 
-    result = await _invoke(tools_module.delete_block_tool, ctx, {"label": "Seed_Rows", "remove_parameters": None})
+    result = await invoke_copilot_tool(
+        tools_module.delete_block_tool, ctx, {"label": "Seed_Rows", "remove_parameters": None}
+    )
 
     assert result["ok"] is True, result
     assert result["data"]["inputs_only_read_by_deleted_block"] == ["seed_rows"]
@@ -1353,7 +1348,7 @@ async def test_delete_block_on_cold_start_names_an_input_only_the_code_read(
 ) -> None:
     ctx = _authoring_ctx(_COLD_START_STORED_YAML)
 
-    result = await _invoke(tools_module.delete_block_tool, ctx, {"label": "Seed_Rows"})
+    result = await invoke_copilot_tool(tools_module.delete_block_tool, ctx, {"label": "Seed_Rows"})
 
     assert result["ok"] is True, result
     assert result["data"]["inputs_only_read_by_deleted_block"] == ["seed_rows"]
@@ -1368,7 +1363,7 @@ async def test_delete_block_counts_a_saved_note_the_write_carries_back_as_a_read
         "      label: Read_Account\n", "      label: Read_Account\n      notes: 'Pages through {{ seed_rows }}'\n"
     )
 
-    result = await _invoke(tools_module.delete_block_tool, ctx, {"label": "Seed_Rows"})
+    result = await invoke_copilot_tool(tools_module.delete_block_tool, ctx, {"label": "Seed_Rows"})
 
     assert result["ok"] is True, result
     assert ctx.staged_workflow.workflow_definition.blocks[0].notes == "Pages through {{ seed_rows }}"
@@ -1386,7 +1381,7 @@ async def test_delete_block_removes_an_input_a_remaining_template_still_reads(
     )
     ctx = _authoring_ctx(stored)
 
-    result = await _invoke(
+    result = await invoke_copilot_tool(
         tools_module.delete_block_tool, ctx, {"label": "Seed_Rows", "remove_parameters": ["page_size"]}
     )
 
@@ -1402,7 +1397,7 @@ async def test_delete_block_leaves_the_workflow_unwritten_when_a_remaining_block
 ) -> None:
     ctx = _authoring_ctx(_COLD_START_STORED_YAML)
 
-    result = await _invoke(
+    result = await invoke_copilot_tool(
         tools_module.delete_block_tool, ctx, {"label": "Seed_Rows", "remove_parameters": ["page_size"]}
     )
 
@@ -1537,7 +1532,7 @@ async def test_a_follow_up_turn_on_a_blank_saved_workflow_deletes_a_block_from_t
 
     blank = ctx([])
     await workflow_update_module.restore_pending_workflow_proposal(blank)
-    result = await _invoke(
+    result = await invoke_copilot_tool(
         tools_module.delete_block_tool, blank, {"label": "Seed_Rows", "remove_parameters": ["seed_rows"]}
     )
 

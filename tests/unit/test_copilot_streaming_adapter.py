@@ -45,6 +45,7 @@ from skyvern.forge.sdk.copilot.agent import (
     _build_narrative_payload,
     _build_system_prompt,
 )
+from skyvern.forge.sdk.copilot.browser_target import DEBUG_BROWSER_TOOL_NAMES
 from skyvern.forge.sdk.copilot.context import (
     USER_FACING_REASON_SCHEMA,
     CopilotContext,
@@ -65,7 +66,12 @@ from skyvern.forge.sdk.copilot.streaming_adapter import (
     flush_goal_satisfied_tool_result,
     stream_to_sse,
 )
-from skyvern.forge.sdk.copilot.tools import _with_action_reason, copilot_native_tools
+from skyvern.forge.sdk.copilot.tools import (
+    _PAGE_STATE_TOOL_NAMES,
+    _with_action_reason,
+    copilot_native_tools,
+)
+from skyvern.forge.sdk.copilot.tools.page_challenge import FRESH_BROWSER_TOOL_NAME
 from skyvern.forge.sdk.core import skyvern_context
 from skyvern.forge.sdk.core.skyvern_context import SkyvernContext
 from skyvern.forge.sdk.schemas.workflow_copilot import (
@@ -533,9 +539,7 @@ async def test_stream_to_sse_raises_and_cancels_on_repeated_unrecoverable_tool_e
 
     events = []
     for call_id in ("c1", "c2"):
-        call_item = MagicMock(spec=RunItem)
-        call_item.raw_item = {"call_id": call_id, "name": tool_name, "arguments": "{}"}
-        events.append(RunItemStreamEvent(name="tool_called", item=call_item))
+        events.append(tool_called_event(call_id, tool_name))
 
         output_item = MagicMock(spec=RunItem)
         output_item.raw_item = {"call_id": call_id, "name": tool_name}
@@ -780,6 +784,90 @@ class TestEnforcementStateUpdates:
             },
         )
         assert ctx.update_workflow_called is False
+
+
+@pytest.mark.parametrize(
+    ("tool_name", "arguments", "expected"),
+    [
+        ("run_browser_code", {"target": "debug"}, "pbs_debug"),
+        ("run_browser_code", {"target": "last_run"}, "pbs_run"),
+        ("inspect_locator_matches", {"target": "last_run"}, "pbs_run"),
+        ("solve_page_challenge", {}, "pbs_debug"),
+        ("solve_page_challenge", {"target": "last_run"}, "pbs_debug"),
+        ("browser_probe", {}, "pbs_debug"),
+        ("browser_probe", {"target": "last_run"}, "pbs_run"),
+        ("run_browser_code", {"target": "elsewhere"}, None),
+        ("page_free_probe", {}, None),
+        ("update_and_run_blocks", {}, None),
+        ("run_workflow_for_accounts", {}, None),
+        ("start_fresh_browser", {}, None),
+        ("update_workflow", {"target": "debug"}, None),
+    ],
+)
+@pytest.mark.asyncio
+async def test_tool_call_carries_the_browser_session_its_call_resolves_to(
+    tool_name: str, arguments: dict[str, Any], expected: str | None
+) -> None:
+    ctx = _test_copilot_context(
+        browser_session_id="pbs_debug",
+        last_run_blocks_browser_session_id="pbs_run",
+        last_run_blocks_workflow_run_id="wr_run",
+    )
+    ctx.discovery_mcp_server = SkyvernOverlayMCPServer(
+        transport=FastMCP("browser-session-stamp"),
+        overlays={
+            "browser_probe": SchemaOverlay(requires_browser=True),
+            "page_free_probe": SchemaOverlay(),
+        },
+        alias_map={"browser_probe": "skyvern_probe", "page_free_probe": "skyvern_page_free"},
+        allowlist=frozenset({"skyvern_probe", "skyvern_page_free"}),
+        context_provider=lambda: ctx,
+    )
+    agent = Agent(
+        name="copilot",
+        tools=copilot_native_tools(supports_question_tool=False, browser_code_available=True, run_tools_available=True),
+    )
+    result = MagicMock()
+    result.stream_events = lambda: _stream_events_from(
+        tool_called_event(
+            "c1", tool_name, json.dumps({**arguments, "user_facing_reason": "Checking the page"}), agent=agent
+        )
+    )
+    stream = FakeCopilotStream()
+
+    await stream_to_sse(result, stream, ctx)
+
+    (tool_call,) = (p for p in stream.sent if p.type == WorkflowCopilotStreamMessageType.TOOL_CALL)
+    assert tool_call.browser_session_id == expected
+
+
+@pytest.mark.asyncio
+async def test_tool_call_carries_no_browser_session_when_the_last_run_recorded_none() -> None:
+    ctx = _test_copilot_context(browser_session_id="pbs_debug")
+    result = MagicMock()
+    result.stream_events = lambda: _stream_events_from(
+        tool_called_event(
+            "c1",
+            "run_browser_code",
+            json.dumps({"target": "last_run"}),
+            agent=Agent(
+                name="copilot",
+                tools=copilot_native_tools(
+                    supports_question_tool=False, browser_code_available=True, run_tools_available=True
+                ),
+            ),
+        )
+    )
+    stream = FakeCopilotStream()
+
+    await stream_to_sse(result, stream, ctx)
+
+    (tool_call,) = (p for p in stream.sent if p.type == WorkflowCopilotStreamMessageType.TOOL_CALL)
+    assert tool_call.browser_session_id is None
+
+
+def test_debug_browser_tools_are_the_page_state_tools_but_fresh_browser() -> None:
+    assert DEBUG_BROWSER_TOOL_NAMES | {FRESH_BROWSER_TOOL_NAME} == _PAGE_STATE_TOOL_NAMES
 
 
 def test_tool_result_workflow_run_id_only_for_block_running_tools() -> None:

@@ -659,6 +659,7 @@ _DRAIN_KEPT_NATIVE_TOOLS = {
     "inspect_page_for_composition",
     "list_credentials",
     "list_integrations",
+    "list_workflow_triggers",
     "read_attached_pdf",
     "read_google_sheet",
     "reply",
@@ -670,6 +671,7 @@ _DRAIN_KEPT_NATIVE_TOOLS = {
     "set_work_plan",
     "solve_page_challenge",
     "start_fresh_browser",
+    "test_trigger_mapping",
     "upload_attached_file",
 }
 
