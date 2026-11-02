@@ -130,6 +130,7 @@ def _execute_workflow_run(status: WorkflowRunStatus) -> SimpleNamespace:
         depends_on_workflow_run_id=None,
         task_queue=None,
         proxy_location=None,
+        max_scrape_screenshots=None,
         max_elapsed_time_minutes=1,
         started_at=now,
         created_at=now,
@@ -4104,3 +4105,35 @@ async def test_the_cancelled_post_run_timeout_fallback_write_still_hands_over_it
     )
 
     assert captured == ([own] if won else [])
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("limit", [None, 1, 3])
+async def test_execute_workflow_restores_scrape_budget_before_blocks(
+    monkeypatch: pytest.MonkeyPatch,
+    limit: int | None,
+) -> None:
+    workflow = _execute_workflow()
+    completed_run = _execute_workflow_run(WorkflowRunStatus.completed)
+    svc = WorkflowService()
+    _patch_execute_workflow_deps(monkeypatch, svc, workflow, completed_run)
+    svc.get_workflow_run.return_value.max_scrape_screenshots = limit
+    svc.mark_workflow_run_as_running.return_value.max_scrape_screenshots = limit
+    context = SkyvernContext(workflow_run_id="wr_test", max_scrape_screenshots=7)
+    monkeypatch.setattr(service_module.skyvern_context, "current", lambda: context)
+    monkeypatch.setattr(service_module, "resolve_transient_ui_capture_arm", AsyncMock())
+    order: list[str] = []
+    _patch_browser_cleanup(monkeypatch, svc, order)
+    _patch_finalize(monkeypatch, svc, order, completed_run)
+
+    async def execute_blocks(*_args: Any, **_kwargs: Any) -> tuple[SimpleNamespace, set[str]]:
+        assert context.max_scrape_screenshots == limit
+        return completed_run, set()
+
+    blocks = AsyncMock(side_effect=execute_blocks)
+    monkeypatch.setattr(svc, "_execute_workflow_blocks", blocks)
+
+    result = await _run_execute_workflow(svc, need_call_webhook=False)
+
+    blocks.assert_awaited_once()
+    assert result is completed_run

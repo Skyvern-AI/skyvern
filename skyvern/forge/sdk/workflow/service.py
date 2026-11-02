@@ -7162,8 +7162,6 @@ class WorkflowService:
         )
         workflow_run = await self.get_workflow_run(workflow_run_id=workflow_run_id, organization_id=organization_id)
 
-        skyvern_context.ensure_context().max_scrape_screenshots = workflow_run.max_scrape_screenshots
-
         # Guard: if the run was canceled while queued (before Temporal picked it up), don't
         # overwrite the canceled status with running. Checked BEFORE workflow resolution so a run
         # whose stamped workflow version was deleted after cancellation does not raise
@@ -7898,6 +7896,7 @@ class WorkflowService:
                 )
                 current_context = skyvern_context.current()
                 if current_context:
+                    current_context.max_scrape_screenshots = workflow_run.max_scrape_screenshots
                     if workflow_script:
                         current_context.generate_script = False
                     if workflow_run.code_gen:
