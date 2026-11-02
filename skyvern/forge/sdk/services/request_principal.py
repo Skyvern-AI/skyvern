@@ -201,10 +201,14 @@ async def resolve_api_key_profile_identity(organization_id: str, token_id: str) 
     return profile
 
 
-async def _resolve_bearer_identity(bearer_token: str, organization_id: str) -> BearerIdentityResolution:
+async def _resolve_bearer_identity(
+    bearer_token: str, organization_id: str, *, bearer_authenticated: bool
+) -> BearerIdentityResolution:
     try:
         resolution = await asyncio.wait_for(
-            app.AGENT_FUNCTION.resolve_bearer_identity(bearer_token, organization_id),
+            app.AGENT_FUNCTION.resolve_bearer_identity(
+                bearer_token, organization_id, bearer_authenticated=bearer_authenticated
+            ),
             timeout=BEARER_IDENTITY_TIMEOUT_SECONDS,
         )
     except TimeoutError:
@@ -274,6 +278,10 @@ async def resolve_request_principal(
     api_key_profile_resolved: bool = False,
     bearer_token: str | None = None,
 ) -> RequestPrincipal:
+    """Resolve and role-check the caller; without api_key_type, the caller must already have authenticated the bearer.
+
+    The role lookup skips its sign-out check for a bearer-only call, so an unchecked bearer would keep its role.
+    """
     principal = await _resolve_request_principal(
         organization_id,
         api_key_type=api_key_type,
@@ -341,7 +349,7 @@ async def _resolve_request_principal(
                 return request_state.principal
 
             identity_result = (
-                await _resolve_bearer_identity(bearer_token, organization_id)
+                await _resolve_bearer_identity(bearer_token, organization_id, bearer_authenticated=api_key_type is None)
                 if bearer_token and member_user_id is None
                 else BearerIdentityResolution(None, BearerIdentityStatus.no_bearer)
             )
@@ -361,7 +369,7 @@ async def _resolve_request_principal(
         return resolved[1]
 
     identity_result = (
-        await _resolve_bearer_identity(bearer_token, organization_id)
+        await _resolve_bearer_identity(bearer_token, organization_id, bearer_authenticated=api_key_type is None)
         if bearer_token and member_user_id is None
         else BearerIdentityResolution(None, BearerIdentityStatus.no_bearer)
     )

@@ -3465,7 +3465,9 @@ class AgentFunction:
         """Return whether the user belongs to the organization, or None when membership cannot be determined."""
         return None
 
-    async def resolve_bearer_identity(self, bearer_token: str, organization_id: str) -> BearerIdentityResolution:
+    async def resolve_bearer_identity(
+        self, bearer_token: str, organization_id: str, *, bearer_authenticated: bool = False
+    ) -> BearerIdentityResolution:
         """Return a verified bearer identity or why it could not be resolved."""
         return BearerIdentityResolution(None, BearerIdentityStatus.identity_provider_unconfigured)
 
