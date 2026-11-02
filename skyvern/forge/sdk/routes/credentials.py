@@ -710,7 +710,12 @@ async def get_totp_codes(
     ),
 ) -> list[TOTPCode]:
     principal = get_request_principal()
-    workflow_restricted = await app.AGENT_FUNCTION.workflow_folders_restricted(curr_org.organization_id)
+    scoped_folder_ceiling = (
+        principal is not None and principal.api_key_access_mode == "scoped" and principal.api_key_reach == "folders"
+    )
+    workflow_restricted = scoped_folder_ceiling or await app.AGENT_FUNCTION.workflow_folders_restricted(
+        curr_org.organization_id
+    )
     credential_restricted = await app.AGENT_FUNCTION.credential_folders_restricted(curr_org.organization_id)
     if (workflow_restricted or credential_restricted) and principal is None:
         return []
@@ -753,7 +758,12 @@ async def get_totp_codes(
             accessible_references = await app.AGENT_FUNCTION.accessible_workflow_reference_ids(
                 principal, "workflow_run.read", set().union(*references_by_code.values())
             )
-            page = [code for code in page if references_by_code[code.totp_code_id] <= accessible_references]
+            page = [
+                code
+                for code in page
+                if references_by_code[code.totp_code_id] <= accessible_references
+                and (not scoped_folder_ceiling or references_by_code[code.totp_code_id])
+            ]
 
         if credential_restricted and page and not await app.AGENT_FUNCTION.credential_folder_admin_bypass(principal):
             credential_ids_by_identifier = await app.DATABASE.credentials.get_credential_ids_by_totp_identifiers(

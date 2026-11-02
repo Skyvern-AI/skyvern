@@ -74,6 +74,7 @@ def _workflow_attach_run() -> SimpleNamespace:
         parent_workflow_run_id=None,
         workflow_permanent_id="wpid_block",
         organization_id="org_1",
+        requested_by=None,
         browser_profile_id=None,
         proxy_location=None,
         extra_http_headers=None,

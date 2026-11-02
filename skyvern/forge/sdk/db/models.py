@@ -893,6 +893,7 @@ class WorkflowRunGroupModel(Base):
     input_fingerprint = Column(String, nullable=False)
     status = Column(String, nullable=False, default="active")
     created_by = Column(String, nullable=True)
+    requested_by = Column(String, nullable=True)
     created_at = Column(DateTime, default=datetime.datetime.utcnow, nullable=False)
     modified_at = Column(
         DateTime,
