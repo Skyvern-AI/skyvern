@@ -1230,14 +1230,28 @@ class AgentFunction:
     def task_v3_application_defaults(self, parameters: dict[str, Any] | None) -> tuple[str | None, str] | None:
         return None
 
+    # A run that declares its own application context: the text its task message carries whatever it declares, then the
+    # age and application texts a declared yes delivers (the age text None when withheld). OSS has none, so no such run.
+    def task_v3_application_context_texts(
+        self, parameters: dict[str, Any] | None
+    ) -> tuple[str | None, str | None, str] | None:
+        return None
+
     # The submissions a page-level interceptor in this process held for the browser context, oldest first. Must stay a
     # local read with no page or CDP call: the finish tool reads it on every non-completed verdict. OSS has none.
     def task_v3_intercepted_submissions(self, browser_context: Any) -> tuple[InterceptedSubmission, ...]:
         return ()
 
-    # An audit of the answers a run entered, consulted before the form moves on, or None (OSS: none).
+    # An audit of the answers a run entered, consulted before the form moves on, or None (OSS: none). `declaring`: the
+    # run may arm it later by declaring an application, so it is supplied even when the payload does not qualify.
     async def task_v3_answer_basis_audit(
-        self, parameters: dict[str, Any] | None, *, goal: str, organization_id: str | None, step: Step | None
+        self,
+        parameters: dict[str, Any] | None,
+        *,
+        goal: str,
+        organization_id: str | None,
+        step: Step | None,
+        declaring: bool = False,
     ) -> AnswerBasisAudit | None:
         return None
 
