@@ -20,11 +20,13 @@ import yaml
 from PIL import Image
 from structlog.testing import capture_logs
 
+from skyvern.cli.core import copilot_sessions
 from skyvern.cli.core.browser_ops import ScreenshotResult
 from skyvern.config import settings
 from skyvern.forge import app
 from skyvern.forge.agent_functions import AgentFunction
 from skyvern.forge.sdk.copilot import tools as tools_module
+from skyvern.forge.sdk.copilot.agent_context import OriginRunRedactionRegistry, PendingBrowserInteractionObservation
 from skyvern.forge.sdk.copilot.build_test_connect_failure import SUPERSEDED_BY_NEWER_TEST_REASON
 from skyvern.forge.sdk.copilot.code_block_synthesis import synthesize_code_block
 from skyvern.forge.sdk.copilot.config import AGENT_BLOCKS_ONLY, CODE_BLOCKS_ONLY, BlockAuthoringPolicy
@@ -32,10 +34,7 @@ from skyvern.forge.sdk.copilot.context import StructuredContext
 from skyvern.forge.sdk.copilot.hooks import CopilotRunHooks
 from skyvern.forge.sdk.copilot.output_utils import MCP_RESULT_PROVENANCE_KEY, MCP_RESULT_PROVENANCE_VALUE
 from skyvern.forge.sdk.copilot.result_evidence import EVALUATE_TOOL_NAME
-from skyvern.forge.sdk.copilot.runtime import (
-    AgentContext,
-    OriginRunRedactionRegistry,
-)
+from skyvern.forge.sdk.copilot.runtime import AgentContext
 from skyvern.forge.sdk.copilot.secret_scrub import (
     REDACTED_SECRET_PLACEHOLDER,
     clear_session_scrub_values,
@@ -853,7 +852,7 @@ class TestMCPFailedStepLoopDetection:
         client_mod._api_key_clients.clear()
         session_manager._current_session.set(None)
         session_manager._global_session = None
-        session_manager._copilot_sessions.clear()
+        copilot_sessions._copilot_sessions.clear()
         session_manager.set_stateless_http_mode(False)
 
         raw_page = MagicMock()
@@ -953,7 +952,7 @@ class TestMCPFailedStepLoopDetection:
             result = await server.call_tool("get_browser_screenshot", {})
         finally:
             await server.cleanup()
-            session_manager._copilot_sessions.clear()
+            copilot_sessions._copilot_sessions.clear()
 
         parsed = json.loads(result.content[0].text)
         assert result.isError is False
@@ -1378,7 +1377,6 @@ class TestBrowserInteractionObservationHooks:
 
     @pytest.mark.asyncio
     async def test_failed_click_hook_clears_stale_pending_interaction_observation(self) -> None:
-        from skyvern.forge.sdk.copilot.runtime import PendingBrowserInteractionObservation
         from skyvern.forge.sdk.copilot.tools import _click_post_hook
 
         ctx = SimpleNamespace(

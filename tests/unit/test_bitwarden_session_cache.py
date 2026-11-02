@@ -70,9 +70,11 @@ CARD_ITEM = {
 
 @pytest.fixture(autouse=True)
 def _isolated_session_cache(monkeypatch: pytest.MonkeyPatch) -> Iterator[None]:
-    # A fresh cache per test, and no jitter or ambient vault credentials to make identities drift.
+    # A fresh cache per test, no jitter or random retry backoff, and no ambient vault credentials to make
+    # identities drift.
     monkeypatch.setattr(bitwarden_module, "_cli_sessions", bitwarden_module._CliSessionCache())
     monkeypatch.setattr(bitwarden_module.settings, "BITWARDEN_MAX_JITTER_SECONDS", 0)
+    monkeypatch.setattr(bitwarden_module, "_retry_backoff_seconds", lambda _attempt: 0.0)
     monkeypatch.setattr(bitwarden_module.settings, "BITWARDEN_EMAIL", None)
     monkeypatch.setattr(bitwarden_module.settings, "BITWARDEN_MASTER_PASSWORD", None)
     yield

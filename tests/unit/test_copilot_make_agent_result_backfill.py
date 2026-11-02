@@ -12,6 +12,7 @@ from skyvern.forge.sdk.copilot.agent import (
     _make_agent_result,
     _terminal_failed_operation,
 )
+from skyvern.forge.sdk.copilot.agent_context import CredentialOriginRecovery
 from skyvern.forge.sdk.copilot.blocker_signal import CopilotToolBlockerSignal
 from skyvern.forge.sdk.copilot.build_test_connect_failure import BuildTestConnectFailure
 from skyvern.forge.sdk.copilot.build_test_outcome import (
@@ -26,7 +27,6 @@ from skyvern.forge.sdk.copilot.context import (
 )
 from skyvern.forge.sdk.copilot.google_connection_notice import GoogleConnectionNotice
 from skyvern.forge.sdk.copilot.request_policy import RequestPolicy
-from skyvern.forge.sdk.copilot.runtime import CredentialOriginRecovery
 from skyvern.forge.sdk.schemas.copilot_turn_outcome import ConnectedAccountChoice, ResponseKind, TurnOutcome
 from skyvern.forge.sdk.schemas.workflow_copilot import WorkflowCopilotChatMessage, WorkflowCopilotChatSender
 from tests.unit.copilot_test_helpers import failed_second_factor_run

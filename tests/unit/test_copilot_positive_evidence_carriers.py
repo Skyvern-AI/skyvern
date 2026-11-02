@@ -15,6 +15,12 @@ import pytest
 
 from skyvern.forge.sdk.artifact.models import ArtifactType
 from skyvern.forge.sdk.copilot import tools as tools_module
+from skyvern.forge.sdk.copilot.agent_context import (
+    OriginRunRedactionRegistry,
+    PreRunPageReference,
+    RegisteredArtifactEntry,
+    RegisteredArtifactEvidence,
+)
 from skyvern.forge.sdk.copilot.build_test_outcome import ChallengeEffects, challenge_notices
 from skyvern.forge.sdk.copilot.challenge_evidence import stamp_challenge_frame_fact
 from skyvern.forge.sdk.copilot.completion_output_grounding import (
@@ -35,14 +41,7 @@ from skyvern.forge.sdk.copilot.request_policy import (
     _classifier_fallback_policy,
     build_classifier_fallback_floor,
 )
-from skyvern.forge.sdk.copilot.runtime import (
-    OriginRunRedactionRegistry,
-    PreRunPageReference,
-    RegisteredArtifactEntry,
-    RegisteredArtifactEvidence,
-    RunSecretsNotRegistered,
-    browser_session_turn,
-)
+from skyvern.forge.sdk.copilot.runtime import RunSecretsNotRegistered, browser_session_turn
 from skyvern.forge.sdk.copilot.secret_scrub import scrub_secrets_from_structure
 from skyvern.forge.sdk.copilot.tools import completion as completion_module
 from skyvern.forge.sdk.copilot.tools import composition_capture as composition_capture_module

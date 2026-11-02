@@ -12,7 +12,7 @@ from unittest.mock import AsyncMock
 import httpx
 import pytest
 import pytest_asyncio
-from fastapi import FastAPI, HTTPException
+from fastapi import HTTPException
 from fastapi.testclient import TestClient
 from freezegun import freeze_time
 
@@ -32,6 +32,7 @@ from skyvern.forge.sdk.routes import routers as routers_module
 from skyvern.forge.sdk.schemas.workflow_schedules import OneTimeDispatchStatus
 from skyvern.forge.sdk.services import org_auth_service
 from tests.unit.forge.sdk.db import conftest as db_fixtures
+from tests.unit.shared_route_app import shared_route_app
 
 ORG_ID = "org_oss"
 WPID = "wpid_interval"
@@ -104,17 +105,19 @@ async def test_oss_delete_workflow_schedule_is_noop() -> None:
     "prefix,router_name",
     [("/v1", "base_router"), ("/api/v1", "legacy_base_router")],
 )
-def test_oss_route_returns_schedule_list_via_testclient(prefix: str, router_name: str) -> None:
+def test_oss_route_returns_schedule_list_via_testclient(
+    prefix: str, router_name: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
     """End-to-end: route resolves through the FastAPI dependency chain on both
     the public `/v1` mount and the legacy `/api/v1` alias."""
 
     async def _fake_org() -> SimpleNamespace:
         return SimpleNamespace(organization_id="org_oss")
 
-    fastapi_app = FastAPI()
+    fastapi_app = shared_route_app(monkeypatch)
     fastapi_app.dependency_overrides[org_auth_service.get_current_org] = _fake_org
-    fastapi_app.include_router(getattr(routers_module, router_name), prefix=prefix)
 
+    assert any(route.path == "/schedules" for route in getattr(routers_module, router_name).routes)
     client = TestClient(fastapi_app)
     response = client.get(f"{prefix}/schedules")
     assert response.status_code == 200
@@ -141,9 +144,8 @@ async def schedules_client(agent_db: AgentDB, monkeypatch: pytest.MonkeyPatch) -
     async def _fake_org() -> SimpleNamespace:
         return SimpleNamespace(organization_id=ORG_ID)
 
-    fastapi_app = FastAPI()
+    fastapi_app = shared_route_app(monkeypatch)
     fastapi_app.dependency_overrides[org_auth_service.get_current_org] = _fake_org
-    fastapi_app.include_router(routers_module.base_router, prefix="/v1")
     register_agent_route_aliases(fastapi_app)
     async with httpx.AsyncClient(transport=httpx.ASGITransport(app=fastapi_app), base_url="http://test") as client:
         yield client

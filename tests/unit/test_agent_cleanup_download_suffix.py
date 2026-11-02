@@ -14,6 +14,7 @@ import pytest
 from structlog.testing import capture_logs
 
 from skyvern.exceptions import DownloadFileMaxWaitingTime, DownloadSaveIncompleteError, TaskNotFound
+from skyvern.forge import agent as agent_module
 from skyvern.forge.agent import ForgeAgent
 from skyvern.forge.sdk.api.files import check_downloading_files_and_wait_for_download_to_complete
 from skyvern.forge.sdk.artifact.storage.base import get_download_retry_started_at
@@ -1424,6 +1425,12 @@ async def test_wait_for_in_flight_downloads_adds_timed_out_paths_to_exhausted() 
     assert exhausted == {"stuck.pdf"}
 
 
+@pytest.fixture
+def fast_in_flight_poll(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(agent_module, "_IN_FLIGHT_DOWNLOAD_CANCEL_POLL_SECONDS", 0.01)
+
+
+@pytest.mark.usefixtures("fast_in_flight_poll")
 @pytest.mark.asyncio
 async def test_wait_for_in_flight_downloads_cancels_promptly_when_should_cancel_fires() -> None:
     agent = ForgeAgent()
@@ -1493,6 +1500,7 @@ async def test_wait_for_in_flight_downloads_completes_normally_when_should_cance
     assert cancelled is False
 
 
+@pytest.mark.usefixtures("fast_in_flight_poll")
 @pytest.mark.asyncio
 async def test_native_probe_does_not_delay_user_cancellation_or_outlive_wait(tmp_path) -> None:
     residual = tmp_path / "unfinished.crdownload"
@@ -1537,6 +1545,7 @@ async def test_an_already_quiescent_native_failure_does_not_wait_a_poll(tmp_path
     assert residual.read_bytes() == b"partial"
 
 
+@pytest.mark.usefixtures("fast_in_flight_poll")
 @pytest.mark.asyncio
 async def test_unknown_native_liveness_preserves_timeout_cap_and_exhausted(tmp_path) -> None:
     residual = tmp_path / "unfinished.crdownload"
@@ -1552,7 +1561,7 @@ async def test_unknown_native_liveness_preserves_timeout_cap_and_exhausted(tmp_p
                 task,
                 SimpleNamespace(download_timeout=30),
                 task.organization_id,
-                timeout_cap=1.2,
+                timeout_cap=0.05,
                 exhausted=exhausted,
                 native_failure_quiescent=AsyncMock(return_value=False),
             )
@@ -1560,6 +1569,7 @@ async def test_unknown_native_liveness_preserves_timeout_cap_and_exhausted(tmp_p
     assert residual.read_bytes() == b"partial"
 
 
+@pytest.mark.usefixtures("fast_in_flight_poll")
 @pytest.mark.asyncio
 async def test_native_probe_error_still_reaps_the_file_wait(tmp_path) -> None:
     residual = tmp_path / "unfinished.crdownload"
