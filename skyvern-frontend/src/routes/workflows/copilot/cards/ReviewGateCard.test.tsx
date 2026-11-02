@@ -724,7 +724,7 @@ describe("ReviewGateCard — recorded review projection", () => {
     expect(screen.getByTitle("removed_cleanup").className).toContain(
       "line-through",
     );
-    expect(screen.getAllByText("Never tested")).toHaveLength(2);
+    expect(screen.getAllByText("Never tested")).toHaveLength(1);
     expect(
       screen.getByText(
         "Added Export and Backup Export write to the same destination.",
@@ -1014,6 +1014,53 @@ describe("ReviewGateCard — answered proposals collapse", () => {
     ).toBeTruthy();
   });
 
+  it("leaves unchanged blocks out of the untested count of an accepted proposal", () => {
+    render(
+      <ReviewGateCard
+        latestTurnCause={null}
+        turn={turn({
+          review: {
+            blocks: [
+              {
+                label: "compute_total",
+                blockType: "code",
+                change: "changed",
+                neverTested: true,
+                coverage: "never_run",
+              },
+              {
+                label: "open_portal",
+                blockType: "goto_url",
+                change: "unchanged",
+                neverTested: true,
+                coverage: "never_run",
+              },
+              {
+                label: "upload_report",
+                blockType: "file_upload",
+                change: "unchanged",
+                neverTested: true,
+                coverage: "never_run",
+              },
+            ],
+            duplicateWrites: [],
+          },
+        })}
+        pending={false}
+        settled="accepted"
+        verdict="untested"
+        actionsEnabled
+        hasProposal
+        onAccept={noop}
+        onAlwaysAccept={noop}
+        onReject={noop}
+        onReview={noop}
+      />,
+    );
+
+    expect(screen.getByText("1 untested")).toBeTruthy();
+  });
+
   it("counts inputs beside the named blocks of a collapsed proposal", () => {
     render(
       <ReviewGateCard
@@ -1044,6 +1091,53 @@ describe("ReviewGateCard — answered proposals collapse", () => {
 
     expect(screen.getByText(/Fetch Rows · 2 inputs$/)).toBeTruthy();
   });
+
+  it.each([
+    {
+      name: "names only the changed block of a two-block accepted proposal",
+      second: "changed" as const,
+      first: "unchanged" as const,
+      header: /Compute Total$/,
+    },
+    {
+      name: "claims no changed blocks when every block of an accepted proposal is unchanged",
+      second: "unchanged" as const,
+      first: "unchanged" as const,
+      header: null,
+    },
+  ])("$name", ({ first, second, header }) => {
+    render(
+      <ReviewGateCard
+        latestTurnCause={null}
+        turn={turn({
+          review: {
+            blocks: [
+              { label: "open_portal", blockType: "goto_url", change: first },
+              { label: "compute_total", blockType: "code", change: second },
+            ],
+            duplicateWrites: [],
+          },
+        })}
+        pending={false}
+        settled="accepted"
+        verdict="untested"
+        actionsEnabled
+        hasProposal
+        onAccept={noop}
+        onAlwaysAccept={noop}
+        onReject={noop}
+        onReview={noop}
+      />,
+    );
+
+    expect(screen.queryByText(/Open Portal/)).toBeNull();
+    expect(screen.queryByText(/\d+ blocks?$/)).toBeNull();
+    if (header) {
+      expect(screen.getByText(header)).toBeTruthy();
+    } else {
+      expect(screen.queryByText(/Compute Total/)).toBeNull();
+    }
+  });
 });
 
 describe("ReviewGateCard — source coverage", () => {
@@ -1070,6 +1164,13 @@ describe("ReviewGateCard — source coverage", () => {
                 neverTested: true,
                 coverage: "never_run",
               },
+              {
+                label: "open_portal",
+                blockType: "goto_url",
+                change: "unchanged",
+                neverTested: true,
+                coverage: "different_source",
+              },
             ],
             duplicateWrites: [],
           },
@@ -1085,7 +1186,7 @@ describe("ReviewGateCard — source coverage", () => {
       />,
     );
 
-    expect(screen.getByText("Different source")).not.toBeNull();
+    expect(screen.getAllByText("Different source")).toHaveLength(2);
     expect(screen.getByText("Never tested")).not.toBeNull();
   });
 
@@ -1151,5 +1252,60 @@ describe("ReviewGateCard — source coverage", () => {
         null,
       ),
     ).toBe("untested");
+  });
+});
+
+describe("ReviewGateCard — coverage tags on unchanged blocks", () => {
+  const noop = () => {};
+
+  it("tags only added and changed blocks as never tested and leaves unchanged ones out of the fold count", () => {
+    const unchanged = ["one", "two", "three", "four", "five"].map((name) => ({
+      label: `keep_${name}`,
+      blockType: "task",
+      change: "unchanged" as const,
+      neverTested: true,
+      coverage: "never_run" as const,
+    }));
+    render(
+      <ReviewGateCard
+        latestTurnCause={null}
+        turn={turn({
+          review: {
+            blocks: [
+              {
+                label: "compute_total",
+                blockType: "code",
+                change: "changed",
+                neverTested: true,
+                coverage: "never_run",
+              },
+              {
+                label: "send_summary",
+                blockType: "task",
+                change: "added",
+                neverTested: true,
+                coverage: "never_run",
+              },
+              ...unchanged,
+            ],
+            duplicateWrites: [],
+          },
+        })}
+        pending
+        verdict="untested"
+        actionsEnabled
+        hasProposal
+        onAccept={noop}
+        onAlwaysAccept={noop}
+        onReject={noop}
+        onReview={noop}
+      />,
+    );
+
+    expect(screen.getAllByText("Never tested")).toHaveLength(2);
+    const fold = screen.getByRole("button", { name: /^Show \d+ more/ });
+    expect(fold.textContent).not.toContain("never tested");
+    fireEvent.click(fold);
+    expect(screen.getAllByText("Never tested")).toHaveLength(2);
   });
 });

@@ -9626,6 +9626,7 @@ async def wrapper({default_args}):
         authored_code: str | None,
         code_failure_reason: str | None,
         failure_kind: CodeBlockFailureKind | None = None,
+        code_error_codes: list[str] | None = None,
     ) -> BlockResult:
         resolved_redaction_parameters = redaction_parameters or {}
         staged_frame: _StagedFrame | None = None
@@ -9747,15 +9748,25 @@ async def wrapper({default_args}):
                         download_binding_kind=download_binding_of(browser_state).value,
                         result=result.output_parameter_value,
                     )
-                    if failure_output is not None:
+                    # Navigation codes are left to the recovery, which may have replaced or cleared the code's own.
+                    own_error_codes = [code for code in code_error_codes or [] if driver_nav_error_code(code) != code]
+                    error_codes = result.error_codes or None
+                    if own_error_codes:
+                        error_codes = _unique_error_codes(
+                            result.error_codes,
+                            _redact_codeblock_error_codes(own_error_codes, resolved_redaction_parameters, None),
+                        )
+                    if failure_output is not None or error_codes != (result.error_codes or None):
                         result = await self.build_block_result(
                             success=False,
                             failure_reason=result.failure_reason,
-                            output_parameter_value=failure_output,
+                            output_parameter_value=(
+                                failure_output if failure_output is not None else result.output_parameter_value
+                            ),
                             status=result.status or BlockStatus.failed,
                             workflow_run_block_id=workflow_run_block_id,
                             organization_id=organization_id,
-                            error_codes=result.error_codes or None,
+                            error_codes=error_codes,
                             can_continue_after_failure=result.can_continue_after_failure,
                         )
                     result = with_failure_kind(result)
@@ -10457,6 +10468,7 @@ async def wrapper({default_args}):
                         # no-op or empty it; fall back to what the runner reported.
                         runner_reason = secure_failure.failure_reason or "Code block failed in the secure runner"
                         secure_failure_reason = scrub_failure_reason(runner_reason, fallback=runner_reason) or ""
+                        secure_error_code = scrub_failure_reason(secure_failure.error_code, fallback="")
 
                         async def build_secure_failure_result() -> BlockResult:
                             engine_block_result = secure_code_block_result.block_result
@@ -10482,7 +10494,6 @@ async def wrapper({default_args}):
                                     organization_id=organization_id,
                                 )
                                 return engine_block_result
-                            secure_error_code = scrub_failure_reason(secure_failure.error_code, fallback="")
                             secure_error_codes = [secure_error_code] if secure_error_code else []
                             if secure_failure.nav_error_code and not is_registered_secret(
                                 secure_failure.nav_error_code, workflow_run_context
@@ -10554,6 +10565,7 @@ async def wrapper({default_args}):
                                 else None
                             ),
                             failure_kind=secure_failure.failure_kind,
+                            code_error_codes=[secure_error_code] if secure_error_code else None,
                         )
                     if secure_code_block_result.block_result is None:
                         LOG.warning(

@@ -53,6 +53,7 @@ from skyvern.schemas.workflows import (
     BlockType,
     BlockYAML,
     ConditionalBlockYAML,
+    FileUploadBlockYAML,
     ForLoopBlockYAML,
     LoginBlockYAML,
     WhileLoopBlockYAML,
@@ -77,6 +78,8 @@ _WORKFLOW_SETTINGS_WITH_RESOLVERS = (
     "mask_secrets",
     "pin_saved_session_ip",
 )
+# _process_workflow_yaml inherits these on an explicit null too; the other settings inherit only when omitted.
+_SETTINGS_NULL_INHERITS = frozenset({"enable_self_healing", "mask_secrets", "pin_saved_session_ip"})
 _WORKFLOW_SETTINGS_FIELDS = tuple(
     field_name
     for field_name in WorkflowCreateYAMLRequest.model_fields
@@ -847,7 +850,7 @@ def redact_credentials_in_workflow_yaml(
 
 
 def _copilot_definition_from_yaml(
-    workflow_yaml: str, workflow_id: str
+    workflow_yaml: str, workflow_id: str, *, bind_parameters: bool = True
 ) -> tuple[WorkflowCreateYAMLRequest, WorkflowDefinition]:
     # Single seam every copilot YAML->Workflow conversion passes through, so code
     # blocks get their plain-view steps regardless of which path produced the YAML
@@ -856,7 +859,8 @@ def _copilot_definition_from_yaml(
     workflow_yaml = derive_code_block_steps_in_yaml(workflow_yaml)
     # Same reasoning one field over: a block whose code names a declared parameter but omits it
     # from parameter_keys gets no value at runtime and dies on NameError mid-login.
-    workflow_yaml = bind_referenced_parameters_in_yaml(workflow_yaml)
+    if bind_parameters:
+        workflow_yaml = bind_referenced_parameters_in_yaml(workflow_yaml)
     workflow_yaml_request = _normalize_copilot_yaml(workflow_yaml)
     return workflow_yaml_request, convert_workflow_definition(
         workflow_definition_yaml=workflow_yaml_request.workflow_definition,
@@ -872,6 +876,38 @@ def copilot_round_trip_definition(definition: WorkflowDefinition, *, workflow_id
     workflow_definition.pop("version", None)
     workflow_yaml = yaml.safe_dump({"title": "", "workflow_definition": workflow_definition}, sort_keys=False)
     return _copilot_definition_from_yaml(workflow_yaml, workflow_id)[1]
+
+
+# The editor writes '' for every unset optional text field, and the upload block reads each one by truthiness or
+# `or default`, so '' means unset there. Other blocks keep '': a task's blank url skips page inheritance.
+_FILE_UPLOAD_BLANK_MEANS_UNSET = frozenset(
+    name
+    for name, field in FileUploadBlockYAML.model_fields.items()
+    if field.annotation == (str | None) and field.default is None
+)
+
+
+def canonical_copilot_workflow(
+    workflow_yaml: str, inherited: Mapping[str, Any] | None = None, *, bind_parameters: bool = True
+) -> dict[str, Any]:
+    """The workflow as ``workflow_to_copilot_yaml`` would write it once saved, so two spellings of one workflow
+    compare equal. A top-level setting the YAML omits takes its ``inherited`` value, as the save path does."""
+    request, definition = _copilot_definition_from_yaml(workflow_yaml, workflow_id="", bind_parameters=bind_parameters)
+    data = request.model_dump(mode="json", exclude_none=True)
+    data["workflow_definition"] = _copilot_yaml_workflow_definition(
+        definition.model_dump(mode="json", exclude_none=True)
+    )
+    canonical = WorkflowCreateYAMLRequest.model_validate(data).model_dump(mode="json", exclude_none=True)
+    for location in workflow_block_locations(canonical):
+        if location.block.get("block_type") == BlockType.FILE_UPLOAD.value:
+            for key in _FILE_UPLOAD_BLANK_MEANS_UNSET & {k for k, v in location.block.items() if v == ""}:
+                del location.block[key]
+    for key, value in (inherited or {}).items():
+        if key != "workflow_definition" and (
+            key not in request.model_fields_set or (key in _SETTINGS_NULL_INHERITS and key not in canonical)
+        ):
+            canonical[key] = value
+    return canonical
 
 
 async def _process_workflow_yaml(
