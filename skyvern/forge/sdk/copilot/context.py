@@ -18,6 +18,7 @@ from pydantic import AliasChoices, BaseModel, ConfigDict, Field, ValidationError
 from typing_extensions import NotRequired, TypedDict
 
 from skyvern.forge.sdk.browser_action_policy import canonicalize_origin
+from skyvern.forge.sdk.copilot.agent_context import AgentContext
 from skyvern.forge.sdk.copilot.browser_ablation import (
     BrowserAblationMetadata,
     CopilotToolSurfaceIdentity,
@@ -36,7 +37,6 @@ from skyvern.forge.sdk.copilot.human_input_wait import HumanInputWait
 from skyvern.forge.sdk.copilot.page_identity import page_location_fingerprint, safe_page_origin
 from skyvern.forge.sdk.copilot.review_gate import NarrativeReviewProjection
 from skyvern.forge.sdk.copilot.run_outcome import RunOutcomeRole
-from skyvern.forge.sdk.copilot.runtime import AgentContext
 from skyvern.forge.sdk.copilot.secret_redaction import redact_raw_secrets_for_structured_prompt
 from skyvern.forge.sdk.copilot.verification_evidence import WorkflowVerificationEvidence
 from skyvern.forge.sdk.workflow.block_notes import block_field_texts

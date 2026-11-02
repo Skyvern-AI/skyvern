@@ -18,10 +18,10 @@ from skyvern.forge.sdk.db.agent_db import AgentDB
 from skyvern.forge.sdk.db.models import TaskModel
 from skyvern.forge.sdk.db.repositories import tasks as tasks_repository
 from skyvern.forge.sdk.routes import agent_protocol
-from skyvern.forge.sdk.routes.routers import base_router, legacy_base_router
 from skyvern.forge.sdk.schemas.organizations import Organization
 from skyvern.forge.sdk.schemas.tasks import Task
 from skyvern.forge.sdk.services import org_auth_service
+from tests.unit.shared_route_app import shared_route_app
 
 ORG_ID = "o_task_listing"
 
@@ -80,7 +80,7 @@ async def test_task_listing_builds_and_serializes_the_page_off_the_event_loop(
 
     ticker = asyncio.create_task(probe.tick_forever())
     try:
-        async with _client() as client:
+        async with _client(shared_route_app(monkeypatch)) as client:
             response = await client.get("/api/v1/tasks", params={"page_size": 1000, "only_standalone_tasks": False})
     finally:
         ticker.cancel()
@@ -92,14 +92,11 @@ async def test_task_listing_builds_and_serializes_the_page_off_the_event_loop(
     assert agent_protocol.TASK_NEXT_CURSOR_HEADER not in response.headers
 
 
-def _client(organization_id: str = ORG_ID) -> httpx.AsyncClient:
+def _client(fastapi_app: FastAPI, organization_id: str = ORG_ID) -> httpx.AsyncClient:
     now = datetime.now(UTC)
     organization = Organization(
         organization_id=organization_id, organization_name="Listing", created_at=now, modified_at=now
     )
-    fastapi_app = FastAPI()
-    fastapi_app.include_router(base_router, prefix="/v1")
-    fastapi_app.include_router(legacy_base_router, prefix="/api/v1")
     fastapi_app.dependency_overrides[org_auth_service.get_current_org] = lambda: organization
     return httpx.AsyncClient(transport=httpx.ASGITransport(app=fastapi_app), base_url="http://test")
 
@@ -138,11 +135,13 @@ async def _seed_tasks_with_timestamp_ties(
     return task_ids
 
 
-async def _walk_tasks(params: dict[str, Any]) -> tuple[list[int], list[dict[str, Any]]]:
+async def _walk_tasks(
+    monkeypatch: pytest.MonkeyPatch, params: dict[str, Any]
+) -> tuple[list[int], list[dict[str, Any]]]:
     page_lengths: list[int] = []
     walked: list[dict[str, Any]] = []
     cursor = ""
-    async with _client() as client:
+    async with _client(shared_route_app(monkeypatch)) as client:
         for _ in range(10):
             response = await client.get("/api/v1/tasks", params={**params, "cursor": cursor})
             assert response.status_code == 200, response.text
@@ -161,7 +160,7 @@ async def test_task_cursor_walk_returns_every_task_once_across_timestamp_ties(
 ) -> None:
     task_ids = await _seed_tasks_with_timestamp_ties(monkeypatch, sqlite_engine, count=7)
 
-    page_lengths, walked = await _walk_tasks({"page_size": 2, "order": order})
+    page_lengths, walked = await _walk_tasks(monkeypatch, {"page_size": 2, "order": order})
 
     assert page_lengths == [2, 2, 2, 1]
     keys = [(task["created_at"], task["task_id"]) for task in walked]
@@ -175,7 +174,7 @@ async def test_task_cursor_walk_by_modified_at_ends_on_an_exactly_full_page(
 ) -> None:
     task_ids = await _seed_tasks_with_timestamp_ties(monkeypatch, sqlite_engine, count=6)
 
-    page_lengths, walked = await _walk_tasks({"page_size": 2, "sort": "modified_at"})
+    page_lengths, walked = await _walk_tasks(monkeypatch, {"page_size": 2, "sort": "modified_at"})
 
     assert page_lengths == [2, 2, 2]
     keys = [(task["modified_at"], task["task_id"]) for task in walked]
@@ -188,8 +187,9 @@ async def test_task_cursor_reused_with_different_filters_is_rejected(
     monkeypatch: pytest.MonkeyPatch, sqlite_engine: AsyncEngine
 ) -> None:
     await _seed_tasks_with_timestamp_ties(monkeypatch, sqlite_engine, count=3)
+    fastapi_app = shared_route_app(monkeypatch)
 
-    async with _client() as client:
+    async with _client(fastapi_app) as client:
         first = await client.get("/api/v1/tasks", params={"page_size": 1, "cursor": ""})
         cursor = first.headers[agent_protocol.TASK_NEXT_CURSOR_HEADER]
         reordered = await client.get("/api/v1/tasks", params={"page_size": 1, "cursor": cursor, "order": "asc"})
@@ -206,7 +206,7 @@ async def test_task_cursor_reused_with_different_filters_is_rejected(
         payload["after"][1] = "tsk_1\u0000"
         forged_cursor = base64.urlsafe_b64encode(json.dumps(payload).encode()).decode().rstrip("=")
         forged = await client.get("/api/v1/tasks", params={"page_size": 1, "cursor": forged_cursor})
-    async with _client("o_other_org") as other_org_client:
+    async with _client(fastapi_app, "o_other_org") as other_org_client:
         other_org = await other_org_client.get("/api/v1/tasks", params={"page_size": 1, "cursor": cursor})
 
     responses = [reordered, refiltered, resorted, status_filtered, paged, garbage, forged, other_org]
@@ -221,7 +221,7 @@ async def test_task_export_streams_every_task_once_across_batch_boundaries(
     task_ids = await _seed_tasks_with_timestamp_ties(monkeypatch, sqlite_engine, count=count)
     monkeypatch.setattr(agent_protocol, "TASK_EXPORT_BATCH_SIZE", 2)
 
-    async with _client() as client:
+    async with _client(shared_route_app(monkeypatch)) as client:
         response = await client.get("/api/v1/tasks/export")
 
     assert response.status_code == 200, response.text
@@ -242,7 +242,7 @@ async def test_task_export_resumes_from_its_last_checkpoint(
     task_ids = await _seed_tasks_with_timestamp_ties(monkeypatch, sqlite_engine, count=7)
     monkeypatch.setattr(agent_protocol, "TASK_EXPORT_BATCH_SIZE", 2)
 
-    async with _client() as client:
+    async with _client(shared_route_app(monkeypatch)) as client:
         full = [json.loads(line) for line in (await client.get("/api/v1/tasks/export")).text.splitlines()]
         # Simulate a drop after the second checkpoint: keep tasks up to it, resume from its cursor.
         checkpoints = [index for index, line in enumerate(full) if "cursor" in line]
@@ -271,7 +271,7 @@ async def test_task_export_applies_filters_and_builds_batches_off_the_event_loop
 
     ticker = asyncio.create_task(probe.tick_forever())
     try:
-        async with _client() as client:
+        async with _client(shared_route_app(monkeypatch)) as client:
             response = await client.get("/api/v1/tasks/export", params={"task_status": "created"})
     finally:
         ticker.cancel()

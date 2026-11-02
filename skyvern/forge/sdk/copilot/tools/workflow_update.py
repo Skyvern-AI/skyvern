@@ -23,6 +23,7 @@ from skyvern.constants import DEFAULT_WORKFLOW_TITLES
 from skyvern.exceptions import SkyvernHTTPException
 from skyvern.forge import app
 from skyvern.forge.sdk.api.llm.schema_validator import validate_schema
+from skyvern.forge.sdk.copilot.agent_context import ScoutedInteraction
 from skyvern.forge.sdk.copilot.author_time_block import (
     CODE_SAFETY_BLOCK_ID,
     CREDENTIAL_SCOUT_BLOCK_ID,
@@ -103,10 +104,7 @@ from skyvern.forge.sdk.copilot.request_policy import (
     _is_judgment_boolean_criterion,
 )
 from skyvern.forge.sdk.copilot.review_gate import CODE_BLOCK_NON_IDENTITY_KEYS
-from skyvern.forge.sdk.copilot.runtime import (
-    AgentContext,
-    ScoutedInteraction,
-)
+from skyvern.forge.sdk.copilot.runtime import AgentContext
 from skyvern.forge.sdk.copilot.schema_incompatibility import (
     SCHEMA_INCOMPATIBILITY_REASON_CODE,
     SchemaIncompatibility,

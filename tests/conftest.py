@@ -111,11 +111,15 @@ def _url_validation_enabled(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(settings, "ENABLE_URL_VALIDATION", True)
 
 
+async def _discard_action_log_batch(*args: object) -> None:
+    return None
+
+
 @pytest.fixture(autouse=True)
 def _no_action_log_delivery(monkeypatch: pytest.MonkeyPatch) -> None:
     """The shared MCP action-log worker posts each cloud-session tool call to SKYVERN_BASE_URL, the public API by
     default. Tests that exercise delivery build their own ActionLogWorker."""
-    monkeypatch.setattr(action_log.action_log_worker, "_send_batch", AsyncMock())
+    monkeypatch.setattr(action_log.action_log_worker, "_send_batch", _discard_action_log_batch)
 
 
 LOOP_OWNER = ("skyvern/forge/agent.py", "_execute_task_v3")
