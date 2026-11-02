@@ -1,3 +1,4 @@
+import { WorkflowFindingsButton } from "@/components/WorkflowFindingsSlot";
 import {
   SaveRefusedError,
   SaveStaleError,
@@ -13,6 +14,7 @@ import { AxiosError } from "axios";
 import {
   CalendarIcon,
   InputIcon,
+  LightningBoltIcon,
   Pencil1Icon,
   PlayIcon,
   ReloadIcon,
@@ -22,6 +24,7 @@ import { useMutation, useQueryClient } from "@tanstack/react-query";
 import { Link, useNavigate, useSearchParams } from "react-router-dom";
 import { usePostHog } from "posthog-js/react";
 import { useWorkflowPermanentId } from "@/routes/workflows/WorkflowPermanentIdContext";
+import { usePageSlots } from "@/store/PageSlots";
 
 import { getClient } from "@/api/AxiosClient";
 import { SaveIcon } from "@/components/icons/SaveIcon";
@@ -38,12 +41,14 @@ import {
 } from "@/components/ui/dialog";
 import { toast } from "@/components/ui/use-toast";
 import { useCredentialGetter } from "@/hooks/useCredentialGetter";
-import { useRecordingStore } from "@/store/useRecordingStore";
-
 import { useWorkflowPanelStore } from "@/store/WorkflowPanelStore";
 import { useWorkflowParametersStore } from "@/store/WorkflowParametersStore";
 import { useWorkflowSnapshotStore } from "@/store/WorkflowSnapshotStore";
 import { useWorkflowTitleStore } from "@/store/WorkflowTitleStore";
+import {
+  selectSaveLockReason,
+  useWorkflowYamlEditorStore,
+} from "@/store/WorkflowYamlEditorStore";
 
 import { basicLocalTimeFormat, basicTimeFormat } from "@/util/timeFormat";
 import { cn } from "@/util/utils";
@@ -60,6 +65,7 @@ import {
 import { useSaveWorkflow } from "../editor/hooks/useSaveWorkflow";
 import { PendingGoalChangesDialog } from "../editor/PendingGoalChangesDialog";
 import { useCopilotActionStore } from "@/store/useCopilotActionStore";
+import { useCopilotProposalStore } from "@/store/CopilotProposalStore";
 import { useToggleHistoryPanel } from "../editor/hooks/useToggleHistoryPanel";
 import { getRunBlockingTooltipText } from "../editor/runValidation/runBlockingCopy";
 import { useRunValidationStore } from "../editor/runValidation/useRunValidationStore";
@@ -78,9 +84,8 @@ import { useStudioWorkflowDeletedAt } from "./StudioShellContext";
 export function TitleSection({ editable = true }: { editable?: boolean }) {
   const title = useWorkflowTitleStore((state) => state.title);
   const { mutationLocked, onTitleChange } = useDeferredTitleEdit();
-  const isRecording = useRecordingStore((s) => s.isRecording);
   const workflowPermanentId = useWorkflowPermanentId();
-  const canEdit = editable && !isRecording && !mutationLocked;
+  const canEdit = editable && !mutationLocked;
   return (
     <div className="flex min-w-0 max-w-[19rem] items-center gap-1">
       <EditableNodeTitle
@@ -135,7 +140,12 @@ export function SaveButton() {
   // instead of gating on it (see onClick).
   const contentDirty = useWorkflowSnapshotStore((s) => s.contentDirty);
   const snapshot = useWorkflowSnapshotStore((s) => s.snapshot);
-  const isRecording = useRecordingStore((s) => s.isRecording);
+  const saveLockReason = useWorkflowYamlEditorStore(selectSaveLockReason);
+  const proposalPending = useCopilotProposalStore((s) => s.proposal !== null);
+  const saveUnavailable = saveLockReason !== null || proposalPending;
+  const saveUnavailableReason = proposalPending
+    ? "Resolve the Copilot proposal before saving."
+    : saveLockReason;
   const onSave = useSaveWorkflow();
   const [confirmOpen, setConfirmOpen] = useState(false);
   const pendingGoalChangeCount = useCopilotActionStore(
@@ -143,6 +153,7 @@ export function SaveButton() {
   );
   const [goalDialogOpen, setGoalDialogOpen] = useState(false);
   const saveOrConfirm = () => {
+    if (useCopilotProposalStore.getState().proposal) return;
     // Recompute dirtiness synchronously from the same source as the
     // summary (incl. the YAML draft). contentDirty is debounced and
     // canvas-only, so gating the confirmation on it would skip it for a
@@ -195,14 +206,14 @@ export function SaveButton() {
     <>
       <ControlTooltip
         content="Save workflow"
-        reason={saveBlockedReason}
-        blocked={isRecording}
+        reason={saveBlockedReason ?? saveUnavailableReason}
+        blocked={saveUnavailable}
       >
         <Button
           variant="ghost"
           size="icon"
-          className="relative h-8 w-8 text-muted-foreground"
-          disabled={isRecording}
+          className="relative h-8 w-8 text-muted-foreground disabled:pointer-events-none"
+          disabled={saveUnavailable}
           onClick={() => {
             if (pendingGoalChangeCount > 0) {
               setGoalDialogOpen(true);
@@ -257,8 +268,9 @@ export function SaveButton() {
               </Button>
             ) : (
               <Button
-                disabled={saving}
+                disabled={saving || saveUnavailable}
                 onClick={() => {
+                  if (useCopilotProposalStore.getState().proposal) return;
                   // Close only on success; a failed save (already toasted by
                   // onSave's onError) keeps the list open for retry, so swallow
                   // the rejection rather than leaving it unhandled.
@@ -294,21 +306,19 @@ function PanelToggle({
   label,
   icon,
 }: {
-  content: "parameters" | "schedules";
+  content: "parameters" | "schedules" | "triggers";
   label: string;
   icon: ReactNode;
 }) {
   const state = useWorkflowPanelStore((s) => s.workflowPanelState);
   const setState = useWorkflowPanelStore((s) => s.setWorkflowPanelState);
   const close = useWorkflowPanelStore((s) => s.closeWorkflowPanel);
-  const isRecording = useRecordingStore((s) => s.isRecording);
   const isOpen = state.active && state.content === content;
   return (
-    <ControlTooltip content={label} blocked={isRecording}>
+    <ControlTooltip content={label}>
       <Button
         variant="ghost"
         size="icon"
-        disabled={isRecording}
         aria-pressed={isOpen}
         className={cn(
           "h-8 w-8 text-muted-foreground",
@@ -334,17 +344,12 @@ export function InputsToggle() {
   const state = useWorkflowPanelStore((s) => s.workflowPanelState);
   const close = useWorkflowPanelStore((s) => s.closeWorkflowPanel);
   const setState = useWorkflowPanelStore((s) => s.setWorkflowPanelState);
-  const isRecording = useRecordingStore((s) => s.isRecording);
   const count = useWorkflowParametersStore((s) => s.parameters.length);
   const isOpen = state.active && state.content === "parameters";
   return (
-    <ControlTooltip
-      content="Placeholder values you can link in any block, and fill in before each run"
-      blocked={isRecording}
-    >
+    <ControlTooltip content="Placeholder values you can link in any block, and fill in before each run">
       <Button
         variant="outline"
-        disabled={isRecording}
         aria-pressed={isOpen}
         className={cn(
           "h-8 gap-1.5 px-3 text-xs",
@@ -377,7 +382,6 @@ export function RunStopButton({ stopOnly = false }: { stopOnly?: boolean }) {
   const queryClient = useQueryClient();
   const postHog = usePostHog();
   const credentialGetter = useCredentialGetter();
-  const isRecording = useRecordingStore((s) => s.isRecording);
   const blockingBlocks = useRunValidationStore((s) => s.blockingBlocks);
   const hasBlockingBlocks = blockingBlocks.length > 0;
   const {
@@ -399,7 +403,7 @@ export function RunStopButton({ stopOnly = false }: { stopOnly?: boolean }) {
   const hasNoBlocks = useWorkflowHasChangesStore(
     (s) => s.editorHasBlocks === false,
   );
-  const runBlocked = isRecording || hasNoBlocks || hasBlockingBlocks;
+  const runBlocked = hasNoBlocks || hasBlockingBlocks;
   const runBlockedReason = hasBlockingBlocks
     ? getRunBlockingTooltipText(blockingBlocks)
     : hasNoBlocks
@@ -468,7 +472,7 @@ export function RunStopButton({ stopOnly = false }: { stopOnly?: boolean }) {
             variant="destructive"
             size="default"
             className="h-8 px-3"
-            disabled={cancelRun.isPending || isRecording}
+            disabled={cancelRun.isPending}
           >
             {cancelRun.isPending ? (
               <ReloadIcon className="mr-2 size-4 animate-spin" />
@@ -568,6 +572,9 @@ export function RunStopButton({ stopOnly = false }: { stopOnly?: boolean }) {
 }
 
 export function StudioTopBar() {
+  const workflowPermanentId = useWorkflowPermanentId();
+  const workflowTitle = useWorkflowTitleStore((state) => state.title);
+  const { workflowTriggersPanel } = usePageSlots();
   const isGlobalWorkflow = useIsGlobalWorkflow();
   const workflowDeletedAt = useStudioWorkflowDeletedAt();
   const { panes, setOpenPanes } = useStudioPanes();
@@ -591,6 +598,13 @@ export function StudioTopBar() {
   return (
     <div className="flex h-14 shrink-0 items-center gap-3 border-b border-border bg-slate-elevation2 px-4">
       <TitleSection editable={!isGlobalWorkflow && !workflowDeletedAt} />
+      {!isGlobalWorkflow && !workflowDeletedAt && workflowPermanentId ? (
+        <WorkflowFindingsButton
+          workflowPermanentId={workflowPermanentId}
+          title={workflowTitle}
+          surface="editor"
+        />
+      ) : null}
       <PaneHeaderDivider />
       <StudioPaneToggles />
       <div className="min-w-3 flex-1" />
@@ -622,6 +636,13 @@ export function StudioTopBar() {
                       label="Schedule"
                       icon={<CalendarIcon className="size-4" />}
                     />
+                    {workflowTriggersPanel ? (
+                      <PanelToggle
+                        content="triggers"
+                        label="Triggers"
+                        icon={<LightningBoltIcon className="size-4" />}
+                      />
+                    ) : null}
                     <EditorOverflowMenu
                       triggerClassName="h-8 w-8 rounded-md border-0 bg-transparent text-muted-foreground hover:bg-accent hover:text-accent-foreground"
                       onVersionHistory={openVersionHistory}

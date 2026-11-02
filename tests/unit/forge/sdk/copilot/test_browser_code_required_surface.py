@@ -53,6 +53,7 @@ _REMOVED_MODEL_FACING_NAMES = {
     "scroll",
     "select_option",
     "press_key",
+    "drag",
     "skyvern_frame_switch",
     "skyvern_frame_main",
     "skyvern_tab_new",

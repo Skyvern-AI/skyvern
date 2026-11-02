@@ -13,6 +13,7 @@ from playwright.async_api import Page
 from typing_extensions import TypedDict
 
 from skyvern.cli.core.js_dispatch import outer_cap_seconds
+from skyvern.cli.core.session_manager import ensure_browser_hooks, get_current_session
 from skyvern.forge import app
 from skyvern.forge.sdk.copilot.blocker_signal import CopilotToolBlockerSignal, stash_blocker_signal
 from skyvern.forge.sdk.copilot.composition_browser_expressions import (
@@ -284,22 +285,6 @@ def _has_meaningful_registered_output_payload(data: Mapping[str, Any]) -> bool:
     )
 
 
-EDIT_BLOCK_TOOL_NAME = "edit_block"
-EDIT_BLOCK_AND_RUN_TOOL_NAME = "edit_block_and_run"
-UPDATE_AND_RUN_BLOCKS_TOOL_NAME = "update_and_run_blocks"
-UPDATE_WORKFLOW_TOOL_NAME = "update_workflow"
-RUN_BLOCKS_TOOL_NAME = "run_blocks_and_collect_debug"
-BLANK_BROWSER_TEST_TOOL_NAME = "test_workflow_from_blank_browser"
-
-BLOCK_RUNNING_TOOLS = frozenset(
-    {RUN_BLOCKS_TOOL_NAME, UPDATE_AND_RUN_BLOCKS_TOOL_NAME, EDIT_BLOCK_AND_RUN_TOOL_NAME, BLANK_BROWSER_TEST_TOOL_NAME}
-)
-
-WORKFLOW_MUTATION_TOOLS = frozenset(
-    {UPDATE_WORKFLOW_TOOL_NAME, UPDATE_AND_RUN_BLOCKS_TOOL_NAME, EDIT_BLOCK_AND_RUN_TOOL_NAME}
-)
-
-
 CREDENTIAL_METADATA_TOOLS = frozenset({"list_credentials"})
 
 
@@ -449,8 +434,10 @@ def _artifact_entry_claims_terminal_criterion(entry: dict[str, Any]) -> bool:
 
 def _unverified_current_workflow_labels(ctx: object) -> list[str]:
     labels = _current_executable_workflow_block_labels(ctx)
-    verified = set(getattr(ctx, "verified_prefix_labels", []) or [])
-    return [label for label in labels if label not in verified]
+    settled = set(getattr(ctx, "verified_prefix_labels", []) or []) | set(
+        getattr(ctx, "untaken_branch_labels", {}) or {}
+    )
+    return [label for label in labels if label not in settled]
 
 
 def _current_finally_block_label(ctx: object) -> str | None:
@@ -475,8 +462,10 @@ def _current_executable_workflow_block_labels(ctx: object) -> list[str]:
 
 def _composition_unverified_current_workflow_labels(ctx: object) -> list[str]:
     labels = _current_executable_workflow_block_labels(ctx)
-    verified = set(getattr(ctx, "composition_verified_labels", []) or [])
-    return [label for label in labels if label not in verified]
+    settled = set(getattr(ctx, "composition_verified_labels", []) or []) | set(
+        getattr(ctx, "untaken_branch_labels", {}) or {}
+    )
+    return [label for label in labels if label not in settled]
 
 
 def _iter_yaml_blocks(blocks: Any) -> list[dict[str, Any]]:
@@ -1091,6 +1080,9 @@ async def on_working_page(
                 page = await live_working_page(ctx)
                 if page is None:
                     return {"ok": False, "error": no_page_error}
+                # An MCP call attaches this turn's inspection listeners in get_page, which a native action skips.
+                if (browser := get_current_session().browser) is not None:
+                    ensure_browser_hooks(browser)
                 return await act(page)
         except (CopilotBrowserGenerationRetired, CopilotBrowserSessionUnavailable) as exc:
             disposition = await _browser_session_error_disposition(ctx, exc, tool_name=tool_name, call_path="model")

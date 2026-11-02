@@ -1,23 +1,19 @@
 import functools
 import importlib.util
 import re
-import uuid
-from collections.abc import Iterator
 from datetime import datetime, timedelta
 from pathlib import Path
 from types import ModuleType
-from typing import Any, NamedTuple
+from typing import Any
 
 import pytest
-from sqlalchemy import Engine, create_engine, event, insert, text
-from sqlalchemy.engine import make_url
+from sqlalchemy import Engine, event, insert, text
 from sqlalchemy.exc import DBAPIError
 from sqlalchemy.ext.asyncio import create_async_engine
 from sqlalchemy.schema import CreateTable
 
 from alembic.operations import Operations
 from alembic.runtime.migration import MigrationContext
-from skyvern.config import settings
 from skyvern.forge.sdk.db.agent_db import AgentDB
 from skyvern.forge.sdk.db.models import DebugSessionModel
 
@@ -39,28 +35,11 @@ def _migration() -> ModuleType:
     return module
 
 
-class _Schema(NamedTuple):
-    engine: Engine
-    connect_args: dict[str, str]
-
-
 @pytest.fixture
-def scratch_schema() -> Iterator[_Schema]:
-    url = make_url(str(settings.DATABASE_STRING))
-    if url.get_backend_name() != "postgresql":
-        pytest.skip("requires PostgreSQL")
-    schema = f"debug_sessions_index_{uuid.uuid4().hex}"
-    connect_args = {"options": f"-csearch_path={schema}"}
-    engine = create_engine(url.set(drivername="postgresql+psycopg"), connect_args=connect_args)
-    with engine.begin() as connection:
-        connection.exec_driver_sql(f'CREATE SCHEMA "{schema}"')
+def scratch_database(postgres_scratch_database: Engine) -> Engine:
+    with postgres_scratch_database.begin() as connection:
         connection.execute(CreateTable(DebugSessionModel.__table__))
-    try:
-        yield _Schema(engine, connect_args)
-    finally:
-        with engine.begin() as connection:
-            connection.exec_driver_sql(f'DROP SCHEMA "{schema}" CASCADE')
-        engine.dispose()
+    return postgres_scratch_database
 
 
 def _upgrade(engine: Engine) -> None:
@@ -120,13 +99,13 @@ def _generic_plan(engine: Engine, statement: str, parameters: dict[str, Any]) ->
 
 @pytest.mark.asyncio
 async def test_lookup_returns_the_newest_open_session_through_the_index_under_a_generic_plan(
-    scratch_schema: _Schema,
+    scratch_database: Engine,
 ) -> None:
-    schema_engine = scratch_schema.engine
-    _upgrade(schema_engine)
+    engine = scratch_database
+    _upgrade(engine)
     organization_id = "o_debug_lookup"
     started = datetime(2026, 9, 1)
-    with schema_engine.begin() as connection:
+    with engine.begin() as connection:
         connection.execute(
             insert(DebugSessionModel),
             [
@@ -147,7 +126,7 @@ async def test_lookup_returns_the_newest_open_session_through_the_index_under_a_
             ],
         )
 
-    async_engine = create_async_engine(schema_engine.url, connect_args=scratch_schema.connect_args)
+    async_engine = create_async_engine(engine.url)
     statements: list[tuple[str, dict[str, Any]]] = []
 
     def capture(_conn: Any, _cursor: Any, statement: str, parameters: Any, *_args: Any) -> None:
@@ -169,26 +148,26 @@ async def test_lookup_returns_the_newest_open_session_through_the_index_under_a_
     [(statement, parameters)] = statements
     # psycopg prepares a statement after five runs on a connection, and Postgres may then plan it generically,
     # with status as an unknown parameter.
-    plan = _generic_plan(schema_engine, statement, parameters)
+    plan = _generic_plan(engine, statement, parameters)
     assert f"Index Scan Backward using {INDEX_NAME}" in plan, plan
     assert "Sort" not in plan, plan
 
 
-def test_upgrade_rebuilds_an_invalid_index_left_by_a_failed_concurrent_build(scratch_schema: _Schema) -> None:
-    schema_engine = scratch_schema.engine
-    with schema_engine.begin() as connection:
+def test_upgrade_rebuilds_an_invalid_index_left_by_a_failed_concurrent_build(scratch_database: Engine) -> None:
+    engine = scratch_database
+    with engine.begin() as connection:
         connection.execute(insert(DebugSessionModel), [_session_row("o_debug_lookup", "only")])
-    with schema_engine.connect().execution_options(isolation_level="AUTOCOMMIT") as connection:
+    with engine.connect().execution_options(isolation_level="AUTOCOMMIT") as connection:
         with pytest.raises(DBAPIError, match="division by zero"):
             connection.exec_driver_sql(
                 f"CREATE INDEX CONCURRENTLY {INDEX_NAME} ON debug_sessions ((length(user_id) / 0))"
             )
-    leftover = _index_state(schema_engine)
+    leftover = _index_state(engine)
     assert leftover is not None and leftover[0] is False
 
-    _upgrade(schema_engine)
+    _upgrade(engine)
 
-    state = _index_state(schema_engine)
+    state = _index_state(engine)
     assert state is not None
     valid, definition = state
     assert valid is True

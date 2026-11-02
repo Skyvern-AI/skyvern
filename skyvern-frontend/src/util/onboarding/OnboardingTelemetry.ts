@@ -216,10 +216,6 @@ function firstApiCall(surface: Surface): void {
   capture("onboarding.first_api_call", { surface });
 }
 
-function firstScheduleCreated(surface: Surface): void {
-  capture("onboarding.first_schedule_created", { surface });
-}
-
 // -- Empty state events --
 
 function emptyStateViewed(surface: Surface): void {
@@ -283,7 +279,6 @@ export const OnboardingTelemetry = {
   firstWorkflowCreated,
   firstRunCompleted,
   firstApiCall,
-  firstScheduleCreated,
   abVariantAssigned,
   registerVariant,
   error,

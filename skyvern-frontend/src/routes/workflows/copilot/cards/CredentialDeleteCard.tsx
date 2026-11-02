@@ -2,6 +2,7 @@ import { QuestionMarkCircledIcon } from "@radix-ui/react-icons";
 import { useId, useState } from "react";
 import { Button } from "@/components/ui/button";
 import { Checkbox } from "@/components/ui/checkbox";
+import { useHasCapability } from "@/store/PageSlots";
 import { cn } from "@/util/utils";
 import type {
   CredentialDeleteOutcomeKind,
@@ -60,10 +61,11 @@ export function CredentialDeleteReviewCard({
   upNext?: string | null;
 }) {
   const titleId = useId();
+  const canDelete = useHasCapability("credential.delete");
   const [checked, setChecked] = useState(
     () => new Set(review.rows.map((row) => row.credential_id)),
   );
-  const locked = disabled || deleting;
+  const locked = disabled || deleting || !canDelete;
   const toggle = (credentialId: string) =>
     setChecked((current) => {
       const next = new Set(current);
@@ -73,6 +75,11 @@ export function CredentialDeleteReviewCard({
   const selected = review.rows
     .map((row) => row.credential_id)
     .filter((credentialId) => checked.has(credentialId));
+
+  const askAdmin =
+    review.rows.length === 1
+      ? "Ask an Admin to delete this credential."
+      : "Ask an Admin to delete these credentials.";
 
   return (
     <AttentionTray
@@ -84,7 +91,9 @@ export function CredentialDeleteReviewCard({
       collapsedTitle={
         deleting
           ? `Deleting ${plural(review.approved_credential_ids?.length ?? selected.length, "credential")}…`
-          : `Copilot is waiting on your answer about deleting ${plural(review.rows.length, "credential")}`
+          : canDelete
+            ? `Copilot is waiting on your answer about deleting ${plural(review.rows.length, "credential")}`
+            : askAdmin
       }
       collapsed={collapsed}
       onCollapsedChange={onCollapsedChange}
@@ -92,11 +101,19 @@ export function CredentialDeleteReviewCard({
       upNext={upNext}
     >
       <div className="flex min-h-0 flex-col gap-2 overflow-y-auto px-3 pb-2.5 pt-1 text-xs">
-        <p className="text-amber-700 dark:text-yellow-400">
-          Deleting is permanent and cannot be undone. Only checked entries are
-          deleted.
-        </p>
-        <p className="text-muted-foreground">{scopeText(review)}</p>
+        {canDelete ? (
+          <p className="text-amber-700 dark:text-yellow-400">
+            Deleting is permanent and cannot be undone. Only checked entries are
+            deleted.
+          </p>
+        ) : (
+          <p role="status" className="text-muted-foreground">
+            {askAdmin}
+          </p>
+        )}
+        {canDelete ? (
+          <p className="text-muted-foreground">{scopeText(review)}</p>
+        ) : null}
         <ul className="flex flex-col gap-1">
           {review.rows.map((row) => (
             <li key={row.credential_id}>
@@ -128,17 +145,21 @@ export function CredentialDeleteReviewCard({
         className="flex shrink-0 flex-wrap items-center gap-2 border-t border-border px-3 py-1.5"
         title={lockReason ?? undefined}
       >
-        <Button
-          size="sm"
-          variant="destructive"
-          className="h-7"
-          disabled={locked || selected.length === 0}
-          onClick={() => onConfirm(selected)}
-        >
-          {deleting
-            ? "Deleting…"
-            : `Delete ${plural(selected.length, "credential")}`}
-        </Button>
+        {canDelete ? (
+          <Button
+            size="sm"
+            variant="destructive"
+            className="h-7"
+            disabled={locked || selected.length === 0}
+            onClick={() => {
+              if (canDelete) onConfirm(selected);
+            }}
+          >
+            {deleting
+              ? "Deleting…"
+              : `Delete ${plural(selected.length, "credential")}`}
+          </Button>
+        ) : null}
         <span className="sr-only" aria-live="polite">
           {deleting
             ? "Deleting. Stop is unavailable until the deletion finishes."
@@ -148,7 +169,7 @@ export function CredentialDeleteReviewCard({
           size="sm"
           variant="ghost"
           className="h-7"
-          disabled={locked}
+          disabled={disabled || deleting}
           onClick={onCancel}
         >
           Cancel

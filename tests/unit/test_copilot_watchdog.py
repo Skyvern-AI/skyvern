@@ -13,6 +13,7 @@ from unittest.mock import AsyncMock, MagicMock
 import pytest
 
 from skyvern.forge import app as forge_app
+from skyvern.forge.sdk.copilot.agent_context import OriginRunRedactionRegistry
 from skyvern.forge.sdk.copilot.blocker_signal import (
     assert_clean_user_facing_text,
     contains_internal_machinery_leak,
@@ -26,7 +27,6 @@ from skyvern.forge.sdk.copilot.repair_origin_run import (
     OriginOutputSnapshot,
     SelectedOutputSource,
 )
-from skyvern.forge.sdk.copilot.runtime import OriginRunRedactionRegistry
 from skyvern.forge.sdk.copilot.tools import (
     RUN_BLOCKS_SAFETY_CEILING_SECONDS,
     WatchdogExitReason,
@@ -45,9 +45,17 @@ from skyvern.forge.sdk.schemas.workflow_runs import WorkflowRunBlock
 from skyvern.schemas.workflows import BlockStatus, BlockType
 from skyvern.webeye.actions.action_types import ActionType
 from skyvern.webeye.actions.actions import ActionStatus
-from tests.unit.copilot_test_helpers import SEARCH_THEN_SELECT_WORKFLOW_YAML
+from tests.unit._mcp_browser_fakes import crash_free_browser_state
+from tests.unit.copilot_test_helpers import (
+    SEARCH_THEN_SELECT_WORKFLOW_YAML,
+    adopted_detached_tasks,
+)
 from tests.unit.copilot_test_helpers import install_run_blocks_harness as _install_run_harness
-from tests.unit.copilot_test_helpers import make_copilot_ctx, run_result_action_row, terminal_extraction_block
+from tests.unit.copilot_test_helpers import (
+    make_copilot_ctx,
+    run_result_action_row,
+    terminal_extraction_block,
+)
 
 
 def _fake_run(status: str = "running", modified_at: datetime | None = None) -> Any:
@@ -181,7 +189,7 @@ class _ErrorCtx:
 def _install_fallback_page(
     monkeypatch: pytest.MonkeyPatch, page: SimpleNamespace
 ) -> tuple[SimpleNamespace, SimpleNamespace]:
-    browser_state = SimpleNamespace(get_or_create_page=AsyncMock(return_value=page))
+    browser_state = crash_free_browser_state(get_or_create_page=AsyncMock(return_value=page))
     session_manager = SimpleNamespace(get_browser_state=AsyncMock(return_value=browser_state))
     monkeypatch.setattr(forge_app, "PERSISTENT_SESSIONS_MANAGER", session_manager)
     ctx = SimpleNamespace(
@@ -189,6 +197,7 @@ def _install_fallback_page(
         browser_session_id="pbs_copilot",
         turn_origin=TurnOrigin.interactive,
         attached_browser_drivers={},
+        page_crash_records_by_browser_session={},
     )
     return session_manager, ctx
 
@@ -429,10 +438,6 @@ workflow_definition:
 """
 
 
-def _adopted_detached_tasks(before: set[Any]) -> list[Any]:
-    return [task for task in run_execution._DETACHED_CLEANUP_TASKS if task not in before]
-
-
 def _install_advancing_clock(monkeypatch: pytest.MonkeyPatch, step_seconds: float = 600.0) -> Callable[[], float]:
     elapsed = 0.0
 
@@ -493,8 +498,9 @@ async def test_paused_run_is_reported_as_a_pause_and_left_running(monkeypatch: p
     harness["cooperative_cancel"].assert_not_awaited()
     harness["clear"].assert_not_awaited()
     harness["publish"].assert_awaited_once()
+    assert ctx.budget_expiry_state.leavable_run_ids == []
 
-    adopted = _adopted_detached_tasks(before)
+    adopted = adopted_detached_tasks(before)
     assert len(adopted) == 1
     await asyncio.sleep(0)
     assert harness["executor_cancelled"] is False
@@ -530,7 +536,7 @@ async def test_tool_cancelled_while_paused_leaves_the_run_alive(monkeypatch: pyt
     harness["cancel_run_task"].assert_not_awaited()
     harness["cooperative_cancel"].assert_not_awaited()
 
-    adopted = _adopted_detached_tasks(before)
+    adopted = adopted_detached_tasks(before)
     assert len(adopted) == 1
     await asyncio.sleep(0)
     assert harness["executor_cancelled"] is False
@@ -553,7 +559,7 @@ async def test_a_watchdog_terminated_run_still_carries_its_per_block_page_facts(
                 label="select_first_result",
                 final_url="https://fixture.test/results/widget",
                 task_id="tsk_select",
-            ),
+            ).model_copy(update={"modified_at": datetime(2026, 4, 21, 12, 7, tzinfo=UTC)}),
             terminal_extraction_block(
                 "completed",
                 label="run_search",
@@ -577,6 +583,11 @@ async def test_a_watchdog_terminated_run_still_carries_its_per_block_page_facts(
     data = result["data"]
 
     assert data["control_signal"]["kind"] == "watchdog_ceiling"
+    assert data["run_duration_seconds"] > 0
+    assert {block["label"]: block["duration_seconds"] for block in data["blocks"]} == {
+        "select_first_result": 120,
+        "run_search": 0,
+    }
     assert data["observed_block_end_urls"] == {
         "run_search": "https://fixture.test/results/widget/page-1",
         "select_first_result": "https://fixture.test/results/widget",
@@ -607,7 +618,7 @@ async def test_non_paused_watchdog_exit_still_cancels_and_clears(monkeypatch: py
     assert result["data"]["browser_start"]["kind"] == "separate_context_continued_from_earlier_test"
     harness["cancel_run_task"].assert_awaited_once()
     harness["clear"].assert_awaited_once()
-    assert _adopted_detached_tasks(before) == []
+    assert adopted_detached_tasks(before) == []
 
     for relayed in (
         result["data"]["failure_reason"],
@@ -815,6 +826,7 @@ async def test_progressing_worker_run_crosses_legacy_boundary_and_returns_termin
     assert result["ok"] is True, result
     assert result["data"]["workflow_run_id"] == "wr_paused"
     assert result["data"]["overall_status"] == "completed"
+    assert result["data"]["run_duration_seconds"] == 300
     assert result["data"]["current_url"] == "https://example.com/result"
     assert result["data"]["blocks"] == [
         {
@@ -823,6 +835,7 @@ async def test_progressing_worker_run_crosses_legacy_boundary_and_returns_termin
             "status": "completed",
             "workflow_run_block_id": "wrb_terminal",
             "output": {"heading": "Example Domain"},
+            "duration_seconds": 0,
             "extracted_data": {"heading": "Example Domain"},
         }
     ]
@@ -1001,6 +1014,73 @@ async def test_externally_cancelled_worker_run_still_cooperatively_cancels(
         await run
 
     harness["cooperative_cancel"].assert_awaited_once_with("wr_paused")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("dispatch_to_worker", [True, False], ids=["worker_run", "inline_run"])
+async def test_the_turn_deadline_ends_the_wait_and_leaves_the_run_with_its_executor(
+    monkeypatch: pytest.MonkeyPatch, dispatch_to_worker: bool
+) -> None:
+    """ADR-0025: the turn cap never cancels a run. The turn's hard deadline cancels this call's wait;
+    the run keeps executing, and the turn still knows the cut step started it."""
+    harness = await _install_run_harness(
+        monkeypatch,
+        workflow_yaml=_EXTRACTION_WORKFLOW_YAML,
+        polled_status="running",
+        dispatch_to_worker=dispatch_to_worker,
+    )
+    polling = asyncio.Event()
+
+    async def _read_progress(_ctx: CopilotContext, _run_id: str) -> tuple[Any, datetime]:
+        polling.set()
+        return _fake_run(status="running"), datetime(2026, 4, 21, 12, 0, 0, tzinfo=UTC)
+
+    monkeypatch.setattr(run_execution, "_read_progress_sources", _read_progress)
+    monkeypatch.setattr(run_execution, "RUN_BLOCKS_POLL_INTERVAL_SECONDS", 3600)
+    ctx = make_copilot_ctx(browser_session_id="pbs_chat")
+    ctx.staged_workflow = harness["workflow"]
+    ctx.frontier_resume_session_id = "pbs_run"
+    before = set(run_execution._DETACHED_CLEANUP_TASKS)
+    tool_calls: list[asyncio.Task[Any]] = []
+
+    async def _turn_stream() -> None:
+        # Shaped like _run_streamed_with_deadline over the SDK: the tool runs in its own task, the
+        # stream's immediate cancel does not await it, and the deadline is cleared on the way out.
+        try:
+            async with asyncio.timeout(None) as deadline:
+                ctx.model_stream_deadline = deadline
+                tool_calls.append(
+                    asyncio.create_task(
+                        _run_blocks_and_collect_debug({"block_labels": ["extract_heading"], "parameters": {}}, ctx)
+                    )
+                )
+                try:
+                    await asyncio.Event().wait()
+                except asyncio.CancelledError:
+                    tool_calls[0].cancel()
+                    raise
+        finally:
+            ctx.model_stream_deadline = None
+
+    turn = asyncio.create_task(_turn_stream())
+    await asyncio.wait_for(polling.wait(), timeout=5)
+    assert ctx.model_stream_deadline is not None
+    ctx.model_stream_deadline.reschedule(asyncio.get_running_loop().time())
+    with pytest.raises(TimeoutError):
+        await turn
+    with pytest.raises(asyncio.CancelledError):
+        await tool_calls[0]
+
+    harness["cooperative_cancel"].assert_not_awaited()
+    harness["cancel_run_task"].assert_not_awaited()
+    harness["clear"].assert_not_awaited()
+    assert harness["executor_cancelled"] is False
+    assert ctx.open_step_run_ids == ["wr_paused"]
+
+    adopted = adopted_detached_tasks(before)
+    for task in adopted:
+        task.cancel()
+    await asyncio.gather(*adopted, return_exceptions=True)
 
 
 def test_paused_result_records_last_test_ok_as_none() -> None:

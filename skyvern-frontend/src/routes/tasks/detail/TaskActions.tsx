@@ -8,8 +8,10 @@ import { ZoomableImage } from "@/components/ZoomableImage";
 import { useCostCalculator } from "@/hooks/useCostCalculator";
 import { useCredentialGetter } from "@/hooks/useCredentialGetter";
 import { useStreamTransport } from "@/hooks/useRuntimeConfig";
-import { getCredentialParam } from "@/util/env";
+import { getWebSocketProtocols } from "@/util/env";
 import {
+  EXTERNAL_BROWSER_DIAGNOSTIC,
+  STREAM_STARTING_DIAGNOSTIC,
   StreamStatusPanel,
   type StreamDiagnostic,
 } from "@/routes/streaming/StreamDiagnostics";
@@ -39,12 +41,6 @@ type StreamMessage = {
   status: string;
   screenshot?: string;
   format?: string;
-};
-
-const STARTING_DIAGNOSTIC: StreamDiagnostic = {
-  title: "Waking up the browser stream",
-  detail: "Opening the stream and waiting for the first frame...",
-  pending: true,
 };
 
 function diagnosticForStatus(status: string): StreamDiagnostic {
@@ -97,8 +93,9 @@ function TaskActions() {
   const credentialGetter = useCredentialGetter();
   const [streamImgSrc, setStreamImgSrc] = useState<string>("");
   const [streamFormat, setStreamFormat] = useState<string>("png");
-  const [streamDiagnostic, setStreamDiagnostic] =
-    useState<StreamDiagnostic>(STARTING_DIAGNOSTIC);
+  const [streamDiagnostic, setStreamDiagnostic] = useState<StreamDiagnostic>(
+    STREAM_STARTING_DIAGNOSTIC,
+  );
   const socketRef = useRef<WebSocket | null>(null);
   const hasFrameRef = useRef(false);
   const [selectedAction, setSelectedAction] = useState<
@@ -127,8 +124,8 @@ function TaskActions() {
   const taskIsNotFinalized = task && statusIsNotFinalized(task);
   const taskIsRunningOrQueued = task && statusIsRunningOrQueued(task);
   const browserSessionId = task?.browser_session_id;
-  const { streamTransport } = useStreamTransport(browserSessionId);
-  const shouldUseCdpStream = streamTransport === "cdp";
+  const { streamTransport, isExternal } = useStreamTransport(browserSessionId);
+  const shouldUseCdpStream = streamTransport === "cdp" && !isExternal;
 
   useEffect(() => {
     // In VNC mode, BrowserStream handles live sessions. In CDP mode, this
@@ -140,12 +137,12 @@ function TaskActions() {
     if (!taskIsRunningOrQueued) {
       return;
     }
-    setStreamDiagnostic(STARTING_DIAGNOSTIC);
+    setStreamDiagnostic(STREAM_STARTING_DIAGNOSTIC);
     hasFrameRef.current = false;
     let cancelled = false;
 
     async function run() {
-      const credentialParam = await getCredentialParam(credentialGetter);
+      const protocols = await getWebSocketProtocols(credentialGetter);
       if (cancelled) {
         return;
       }
@@ -154,7 +151,8 @@ function TaskActions() {
         socketRef.current.close();
       }
       socketRef.current = new WebSocket(
-        `${wssBaseUrl}/stream/tasks/${taskId}?${credentialParam}`,
+        `${wssBaseUrl}/stream/tasks/${taskId}`,
+        protocols,
       );
 
       socketRef.current.addEventListener("open", () => {
@@ -297,6 +295,13 @@ function TaskActions() {
     activeSelection !== "stream" ? actions[activeSelection] : null;
 
   function getStream() {
+    if (browserSessionId && isExternal) {
+      return <StreamStatusPanel diagnostic={EXTERNAL_BROWSER_DIAGNOSTIC} />;
+    }
+    // Mounting before the session answers would open a VNC socket an external session cannot serve.
+    if (browserSessionId && streamTransport === undefined) {
+      return <StreamStatusPanel diagnostic={STREAM_STARTING_DIAGNOSTIC} />;
+    }
     // Use VNC streaming via BrowserStream when browser_session_id is available
     // and local browser streaming is not enabled.
     if (browserSessionId && !shouldUseCdpStream) {

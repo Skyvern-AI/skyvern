@@ -6,6 +6,7 @@ type ResolveMemberName = (userId: string) => string | null;
 
 type WorkflowCreatorDirectory = {
   resolveMemberName: ResolveMemberName;
+  members: Array<{ userId: string; name: string }>;
   // While false, an id that does not resolve is one we have not loaded yet, not one with no member
   // behind it. Deployments without a directory are settled from the start: they resolve nothing.
   isSettled: boolean;
@@ -13,6 +14,7 @@ type WorkflowCreatorDirectory = {
 
 const WorkflowCreatorContext = createContext<WorkflowCreatorDirectory>({
   resolveMemberName: () => null,
+  members: [],
   isSettled: true,
 });
 

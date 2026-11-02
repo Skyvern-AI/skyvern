@@ -20,14 +20,16 @@ from sqlalchemy import (
     desc,
     text,
 )
+from sqlalchemy.dialects.postgresql import ARRAY
 from sqlalchemy.ext.asyncio import AsyncAttrs
-from sqlalchemy.orm import DeclarativeBase
+from sqlalchemy.orm import DeclarativeBase, deferred
 
 from skyvern.forge.sdk.db._soft_delete import SoftDeleteMixin
 from skyvern.forge.sdk.db.datetime_utils import naive_utc_now
 from skyvern.forge.sdk.db.enums import TaskType
 from skyvern.forge.sdk.db.id import (
     generate_action_id,
+    generate_agent_feedback_id,
     generate_ai_suggestion_id,
     generate_artifact_id,
     generate_aws_secret_parameter_id,
@@ -41,11 +43,14 @@ from skyvern.forge.sdk.db.id import (
     generate_credential_id,
     generate_credential_parameter_id,
     generate_debug_session_id,
+    generate_email_config_id,
     generate_folder_id,
+    generate_forwarding_address_id,
     generate_gmail_send_dispatch_id,
     generate_google_oauth_credential_id,
     generate_heal_episode_id,
     generate_heal_proposal_id,
+    generate_inbound_email_id,
     generate_microsoft_oauth_credential_id,
     generate_onepassword_credential_parameter_id,
     generate_org_id,
@@ -95,6 +100,16 @@ class Base(AsyncAttrs, DeclarativeBase):
     pass
 
 
+class RunExecutionLeaseModel(Base):
+    __tablename__ = "run_execution_leases"
+
+    run_id = Column(String, primary_key=True)
+    run_type = Column(String, nullable=False)
+    owner_id = Column(String, nullable=False)
+    attempt_number = Column(Integer, nullable=True)
+    heartbeat_at = Column(DateTime, nullable=False)
+
+
 class TaskModel(Base):
     __tablename__ = "tasks"
     __table_args__ = (
@@ -105,6 +120,14 @@ class TaskModel(Base):
             "modified_at",
             "created_at",
             postgresql_where=text("status IN ('created', 'queued', 'running')"),
+        ),
+        Index(
+            "ix_tasks_org_standalone_status_created",
+            "organization_id",
+            "status",
+            "created_at",
+            postgresql_where=text("workflow_run_id IS NULL"),
+            sqlite_where=text("workflow_run_id IS NULL"),
         ),
     )
 
@@ -160,6 +183,7 @@ class TaskModel(Base):
     verification_code_polling_started_at = Column(DateTime, nullable=True)
     failure_category = Column(JSON, nullable=True)
     attempt_number = Column(Integer, nullable=True)
+    task_queue = Column(String, nullable=True)
 
 
 class StepModel(Base):
@@ -322,8 +346,19 @@ class OrganizationPhoneNumberModel(Base):
             "organization_id",
             "phone_number",
             unique=True,
-            postgresql_where=text("status IN ('active', 'provisioning', 'quarantined') AND deleted_at IS NULL"),
-            sqlite_where=text("status IN ('active', 'provisioning', 'quarantined') AND deleted_at IS NULL"),
+            postgresql_where=text(
+                "status IN ('active', 'provisioning', 'quarantined', 'quarantining', 'releasing', 'surrendering', 'reversal_pending') AND deleted_at IS NULL"
+            ),
+            sqlite_where=text(
+                "status IN ('active', 'provisioning', 'quarantined', 'quarantining', 'releasing', 'surrendering', 'reversal_pending') AND deleted_at IS NULL"
+            ),
+        ),
+        Index(
+            "uq_org_phone_numbers_stripe_subscription",
+            "stripe_subscription_id",
+            unique=True,
+            postgresql_where=text("stripe_subscription_id IS NOT NULL AND deleted_at IS NULL"),
+            sqlite_where=text("stripe_subscription_id IS NOT NULL AND deleted_at IS NULL"),
         ),
     )
 
@@ -341,7 +376,19 @@ class OrganizationPhoneNumberModel(Base):
     price_cents = Column(Integer, nullable=True)
     status = Column(String, nullable=False, default="active", server_default="active")
     quarantined_until = Column(DateTime, nullable=True)
+    stripe_subscription_id = Column(String, nullable=True)
+    stripe_subscription_item_id = Column(String, nullable=True)
+    stripe_payment_intent_id = Column(String, nullable=True)
+    stripe_invoice_id = Column(String, nullable=True)
+    stripe_refund_id = Column(String, nullable=True)
+    stripe_credit_note_id = Column(String, nullable=True)
+    purchase_generation = Column(String, nullable=True)
+    current_period_start = Column(DateTime, nullable=True)
+    current_period_end = Column(DateTime, nullable=True)
     provisioning_claimed_at = Column(DateTime, nullable=True)
+    cancel_at = Column(DateTime, nullable=True)
+    maintenance_checked_at = Column(DateTime, nullable=True)
+    billing_exempt = Column(Boolean, nullable=False, default=False, server_default=sqlalchemy.false())
     created_at = Column(DateTime, default=datetime.datetime.utcnow, nullable=False)
     modified_at = Column(
         DateTime,
@@ -731,6 +778,9 @@ class WorkflowModel(SoftDeleteMixin, Base):
     import_error = Column(String, nullable=True)  # Error message if import failed
     created_by = Column(String, nullable=True)
     edited_by = Column(String, nullable=True)
+    # The person a Copilot save was made for; run start holds them accountable for the version's Trigger targets.
+    edited_for = Column(String, nullable=True)
+    build_source = Column(String, nullable=True)  # WorkflowBuildSource
 
     created_at = Column(DateTime, default=datetime.datetime.utcnow, nullable=False)
     modified_at = Column(
@@ -811,6 +861,7 @@ class WorkflowScheduleModel(Base):
     backend_schedule_id = Column("temporal_schedule_id", String, nullable=True)
     name = Column(String, nullable=True)
     description = Column(String, nullable=True)
+    created_by = Column(String, nullable=True)
 
     created_at = Column(DateTime, default=datetime.datetime.utcnow, nullable=False)
     modified_at = Column(
@@ -841,6 +892,7 @@ class WorkflowRunGroupModel(Base):
     submission_key = Column(String, nullable=False)
     input_fingerprint = Column(String, nullable=False)
     status = Column(String, nullable=False, default="active")
+    created_by = Column(String, nullable=True)
     created_at = Column(DateTime, default=datetime.datetime.utcnow, nullable=False)
     modified_at = Column(
         DateTime,
@@ -979,6 +1031,7 @@ class WorkflowRunModel(Base):
     browser_address = Column(String, nullable=True, index=True)
     script_run = Column(JSON, nullable=True)
     job_id = Column(String, nullable=True, index=True)
+    setup_completed = Column(Boolean, nullable=False, default=True, server_default=sqlalchemy.true())
     task_queue = Column(String, nullable=True)
     target_cluster = Column(String, nullable=True)
     depends_on_workflow_run_id = Column(String, nullable=True, index=True)
@@ -1023,6 +1076,9 @@ class WorkflowRunModel(Base):
     secure_runner_pinned = Column(Boolean, nullable=True)
     copilot_session_id = Column(String, nullable=True)
     created_by = Column(String, nullable=True)
+    # The actor that authorized the start when it is not created_by: the person Copilot started the run for, or the
+    # org's synthetic user for an API key. Run start and its Trigger children are judged as them.
+    requested_by = Column(String, nullable=True)
 
     # Internal Apply admission decision; NULL retains legacy pricing lookup behavior.
     billing_exempt_at_admission = Column(Boolean, nullable=True)
@@ -1053,6 +1109,13 @@ class WorkflowRunAttemptModel(Base):
             "browser_profile_id",
             "workflow_run_id",
             postgresql_where=text("browser_profile_id IS NOT NULL"),
+        ),
+        # Folder access resolves a browser session to the runs whose attempts pinned it.
+        Index(
+            "ix_workflow_run_attempts_pinned_session_run_lookup",
+            "pinned_browser_session_id",
+            "workflow_run_id",
+            postgresql_where=text("pinned_browser_session_id IS NOT NULL"),
         ),
         Index(
             "ix_workflow_run_attempts_pending_retries",
@@ -1360,6 +1423,9 @@ class WorkflowRunOutputParameterModel(Base):
         index=True,
     )
     value = Column(JSON, nullable=False)
+    # SQL NULL marks an absent cache so COALESCE falls through to the authoritative value.
+    capped_value = deferred(Column(JSON(none_as_null=True), nullable=True))
+    capped_extracted_information = deferred(Column(JSON(none_as_null=True), nullable=True))
     created_at = Column(DateTime, default=datetime.datetime.utcnow, nullable=False)
 
 
@@ -1433,6 +1499,97 @@ class TOTPCodeModel(Base):
     parse_status = Column(String, nullable=False, server_default=sqlalchemy.text("'parsed'"))
 
 
+class OrganizationEmailConfigModel(Base):
+    __tablename__ = "organization_email_configs"
+    __table_args__ = (Index("ix_organization_email_configs_org", "organization_id"),)
+
+    email_config_id = Column(String, primary_key=True, default=generate_email_config_id)
+    organization_id = Column(String, ForeignKey("organizations.organization_id"), nullable=False)
+    mode = Column(String, nullable=False)
+    webhook_secret_hash = Column(String, nullable=True)
+    daily_inbound_cap = Column(Integer, nullable=False, default=500, server_default="500")
+    drop_flagged_spam = Column(Boolean, nullable=False, default=True, server_default=sqlalchemy.true())
+    created_at = Column(DateTime, default=datetime.datetime.utcnow, nullable=False)
+    modified_at = Column(
+        DateTime,
+        default=datetime.datetime.utcnow,
+        onupdate=datetime.datetime.utcnow,
+        nullable=False,
+    )
+    deleted_at = Column(DateTime, nullable=True)
+
+
+class OrganizationForwardingAddressModel(Base):
+    __tablename__ = "organization_forwarding_addresses"
+    __table_args__ = (
+        Index("ix_organization_forwarding_addresses_org", "organization_id"),
+        Index("ix_organization_forwarding_addresses_config", "email_config_id"),
+        Index(
+            "ix_organization_forwarding_addresses_revoked_email",
+            text("lower(email_address)"),
+            postgresql_where=text("status = 'revoked'"),
+            sqlite_where=text("status = 'revoked'"),
+        ),
+        Index(
+            "uq_organization_forwarding_addresses_email",
+            "email_address",
+            unique=True,
+            postgresql_where=text("status != 'revoked' AND deleted_at IS NULL"),
+            sqlite_where=text("status != 'revoked' AND deleted_at IS NULL"),
+        ),
+    )
+
+    forwarding_address_id = Column(String, primary_key=True, default=generate_forwarding_address_id)
+    organization_id = Column(String, ForeignKey("organizations.organization_id"), nullable=False)
+    email_config_id = Column(String, ForeignKey("organization_email_configs.email_config_id"), nullable=False)
+    email_address = Column(String, nullable=False)
+    org_slug = Column(String, nullable=False)
+    match_mode = Column(String, nullable=False, default="dedicated")
+    credential_id = Column(String, ForeignKey("credentials.credential_id", ondelete="SET NULL"), nullable=True)
+    sender_allowlist = Column(JSON().with_variant(ARRAY(Text()), "postgresql"), nullable=True)
+    status = Column(String, nullable=False, default="pending")
+    last_received_at = Column(DateTime, nullable=True)
+    created_at = Column(DateTime, default=datetime.datetime.utcnow, nullable=False)
+    modified_at = Column(
+        DateTime,
+        default=datetime.datetime.utcnow,
+        onupdate=datetime.datetime.utcnow,
+        nullable=False,
+    )
+    deleted_at = Column(DateTime, nullable=True)
+
+
+class OrganizationInboundEmailModel(Base):
+    __tablename__ = "organization_inbound_emails"
+    __table_args__ = (
+        Index("ix_organization_inbound_emails_address_created", "forwarding_address_id", "created_at"),
+        Index("ix_organization_inbound_emails_created_at", "created_at"),
+        UniqueConstraint(
+            "organization_id",
+            "external_message_id",
+            name="uq_organization_inbound_emails_external_message",
+        ),
+    )
+
+    inbound_email_id = Column(String, primary_key=True, default=generate_inbound_email_id)
+    organization_id = Column(String, ForeignKey("organizations.organization_id"), nullable=False)
+    forwarding_address_id = Column(
+        String,
+        ForeignKey("organization_forwarding_addresses.forwarding_address_id"),
+        nullable=False,
+    )
+    external_message_id = Column(Text, nullable=True)
+    from_address = Column(Text, nullable=False)
+    original_recipient = Column(Text, nullable=True)
+    subject = Column(Text, nullable=False)
+    body_text = Column(Text, nullable=False)
+    links = Column(JSON, nullable=False, default=list)
+    category = Column(String, nullable=False)
+    verdicts = Column(JSON, nullable=True)
+    totp_code_id = Column(String, ForeignKey("totp_codes.totp_code_id", ondelete="SET NULL"), nullable=True)
+    created_at = Column(DateTime, default=datetime.datetime.utcnow, nullable=False)
+
+
 class ActionModel(Base):
     __tablename__ = "actions"
     __table_args__ = (
@@ -1487,6 +1644,7 @@ class WorkflowRunBlockModel(Base):
     block_type = Column(String, nullable=False)
     status = Column(String, nullable=False)
     output = Column(JSON, nullable=True)
+    capped_output = deferred(Column(JSON(none_as_null=True), nullable=True))
     continue_on_failure = Column(Boolean, nullable=False, default=False)
     failure_reason = Column(String, nullable=True)
     # Page URL at the moment the block failed. Distinct from the task's target url, which is
@@ -1711,6 +1869,8 @@ class PersistentBrowserSessionModel(Base):
     browser_settings = Column(JSON, nullable=True)
     browser_settings_receipt = Column(JSON, nullable=True)
     created_for_workflow_run_id = Column(String, nullable=True)
+    # The workflow a Copilot chat provisioned this browser for; folder access follows it. Not a reuse binding.
+    created_for_workflow_permanent_id = Column(String, nullable=True)
     generate_browser_profile = Column(Boolean, default=False, nullable=False, server_default=sqlalchemy.false())
     browser_profile_loaded = Column(Boolean, default=True, nullable=False, server_default=sqlalchemy.true())
     profile_read_only = Column(Boolean, default=False, nullable=False, server_default=sqlalchemy.false())
@@ -1908,11 +2068,21 @@ class CredentialModel(Base):
             postgresql_where=text("browser_profile_id IS NOT NULL AND deleted_at IS NULL"),
             sqlite_where=text("browser_profile_id IS NOT NULL AND deleted_at IS NULL"),
         ),
+        Index(
+            "uq_credentials_org_vault_item",
+            "organization_id",
+            "vault_id",
+            "item_id",
+            unique=True,
+            postgresql_where=text("vault_id IS NOT NULL AND deleted_at IS NULL"),
+            sqlite_where=text("vault_id IS NOT NULL AND deleted_at IS NULL"),
+        ),
     )
 
     credential_id = Column(String, primary_key=True, default=generate_credential_id)
     organization_id = Column(String, nullable=False)
     vault_type = Column(String, nullable=True)
+    vault_id = Column(String, nullable=True)
     item_id = Column(String, nullable=True)
 
     name = Column(String, nullable=False)
@@ -1935,9 +2105,12 @@ class CredentialModel(Base):
     proxy_session_id = Column(String, nullable=True)
     folder_id = Column(String, ForeignKey("credential_folders.folder_id", ondelete="SET NULL"), nullable=True)
     created_by = Column(String, nullable=True)
+    is_test_login_temporary = Column(Boolean, nullable=True)
+    is_passkey_setup_pending = Column(Boolean, nullable=True)
 
     created_at = Column(DateTime, default=datetime.datetime.utcnow, nullable=False)
     modified_at = Column(DateTime, default=datetime.datetime.utcnow, onupdate=datetime.datetime.utcnow, nullable=False)
+    upstream_missing_at = Column(DateTime, nullable=True)
     deleted_at = Column(DateTime, nullable=True)
 
 
@@ -2015,6 +2188,12 @@ class ScriptFileModel(Base):
     __table_args__ = (
         Index("file_script_path_index", "script_revision_id", "file_path"),
         Index("ix_script_files_dedup", "script_id", "organization_id", "content_hash"),
+        Index(
+            "ix_script_files_artifact_id",
+            "artifact_id",
+            postgresql_where=text("artifact_id IS NOT NULL"),
+            sqlite_where=text("artifact_id IS NOT NULL"),
+        ),
         UniqueConstraint("script_revision_id", "file_path", name="unique_script_file_path"),
     )
 
@@ -2408,6 +2587,11 @@ class MicrosoftOAuthCredentialModel(Base):
     scopes_granted = Column(JSON, nullable=False, default=list)
     encrypted_refresh_token = Column(String, nullable=True)
     encrypted_method = Column(String, nullable=True)
+    tenant_id = Column(String, nullable=True)
+    object_id = Column(String, nullable=True)
+    initiating_user_id = Column(String, nullable=True)
+    connection_id = Column(String, nullable=True)
+    custody_mode = Column(String, nullable=True)
     consent_nonce = Column(String, nullable=True)
     consent_redirect_uri = Column(String, nullable=True)
     consent_code_verifier = Column(String, nullable=True)
@@ -2495,3 +2679,18 @@ class RunFeedbackModel(Base):
         onupdate=datetime.datetime.utcnow,
         nullable=False,
     )
+
+
+class AgentFeedbackModel(Base):
+    __tablename__ = "agent_feedback"
+    __table_args__ = (Index("ix_agent_feedback_org_created_at", "organization_id", "created_at"),)
+
+    agent_feedback_id = Column(String, primary_key=True, default=generate_agent_feedback_id)
+    organization_id = Column(String, ForeignKey("organizations.organization_id"), nullable=False)
+    category = Column(String, nullable=False)
+    severity = Column(String, nullable=True)
+    summary = Column(UnicodeText, nullable=False)
+    details = Column(UnicodeText, nullable=True)
+    tool_name = Column(String, nullable=True)
+    context = Column(JSON, nullable=True)
+    created_at = Column(DateTime, default=datetime.datetime.utcnow, nullable=False)

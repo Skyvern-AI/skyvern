@@ -4,6 +4,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 from pydantic import ValidationError
+from structlog.testing import capture_logs
 
 from skyvern.exceptions import BrowserSessionClosed, BrowserSessionExpired, BrowserSessionStartupTimeout
 from skyvern.forge.sdk.routes import browser_sessions as browser_sessions_routes
@@ -368,3 +369,17 @@ def test_unusable_browser_session_error_tells_expiry_from_an_early_close(
     error = unusable_browser_session_error(_ended_session(**overrides))
 
     assert type(error) is expected
+
+
+def test_submission_refusal_emits_a_structured_countable_event() -> None:
+    with capture_logs() as logs:
+        error = unusable_browser_session_error(
+            _ended_session(), refused_at_submission=True, submission_path="workflow_run"
+        )
+
+    assert isinstance(error, BrowserSessionExpired)
+    assert len(logs) == 1
+    assert logs[0]["event"] == "browser_session_run_refused"
+    assert logs[0]["error_code"] == "browser_session_expired"
+    assert logs[0]["browser_session_id"] == "pbs_x"
+    assert logs[0]["submission_path"] == "workflow_run"

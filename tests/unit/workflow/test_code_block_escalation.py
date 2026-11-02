@@ -7,7 +7,9 @@ selector heals even when no step covers the failing line (the common case).
 from __future__ import annotations
 
 import asyncio
+import html
 import json
+import urllib.parse
 from collections.abc import Callable
 from datetime import datetime, timezone
 from enum import Enum, auto
@@ -16,12 +18,13 @@ from typing import Any
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
+from playwright.async_api import Error as PlaywrightError
 from playwright.async_api import TimeoutError as PlaywrightTimeoutError
 from structlog.testing import capture_logs
 
 import skyvern.webeye.navigation as navigation_module
 from skyvern.errors.errors import UserDefinedError
-from skyvern.exceptions import NO_ADDRESS_RECORD_NAV_ERROR_CODE
+from skyvern.exceptions import BROWSER_CONNECTION_LOST_ERROR_CODE, NO_ADDRESS_RECORD_NAV_ERROR_CODE
 from skyvern.forge import app
 from skyvern.forge.agent_functions import CodeBlockEngineFailure, CodeBlockEngineResult
 from skyvern.forge.sdk.api.llm.schema_validator import validate_and_fill_extraction_result, validate_schema
@@ -40,7 +43,11 @@ from skyvern.forge.sdk.core.skyvern_context import SkyvernContext
 from skyvern.forge.sdk.db.repositories.workflow_runs import WorkflowRunsRepository
 from skyvern.forge.sdk.schemas.files import FileInfo
 from skyvern.forge.sdk.schemas.tasks import Task, TaskStatus
-from skyvern.forge.sdk.workflow.context_manager import WorkflowRunContext
+from skyvern.forge.sdk.workflow.context_manager import (
+    RANDOM_SECRET_ID_PREFIX,
+    WorkflowContextManager,
+    WorkflowRunContext,
+)
 from skyvern.forge.sdk.workflow.models.block import (
     _OPERATION_ATTRIBUTION_ALLOWLIST,
     BlockResult,
@@ -60,7 +67,7 @@ from skyvern.forge.sdk.workflow.models.parameter import (
     WorkflowParameterType,
 )
 from skyvern.forge.sdk.workflow.models.workflow import WorkflowRun
-from skyvern.forge.sdk.workflow.service import _merge_workflow_run_errors
+from skyvern.forge.sdk.workflow.service import WorkflowService, _merge_workflow_run_errors
 from skyvern.forge.taskv3.goal_composition import (
     CodeProgressRecord,
     GoalDirectives,
@@ -70,10 +77,13 @@ from skyvern.forge.taskv3.goal_composition import (
 )
 from skyvern.schemas.runs import RunEngine
 from skyvern.schemas.self_heal import HealClassification, HealSkipReason, HealStatus
+from skyvern.services import otp_service
 from skyvern.webeye.actions.action_types import ActionType
 from skyvern.webeye.actions.actions import Action
 from skyvern.webeye.browser_artifacts import BrowserArtifacts
+from skyvern.webeye.browser_runtime_events import BrowserRuntimeLogContext
 from skyvern.webeye.navigation import clear_task_nav_error_code, record_task_nav_error_code
+from skyvern.webeye.real_browser_state import RealBrowserState
 
 SECRET_VALUE = "hunter2-super-secret"
 SHORT_SECRET_VALUE = "abc"
@@ -328,6 +338,7 @@ async def test_user_defined_failure_records_dedicated_skip_without_healing(monke
 
     result = await block._resolve_failure_with_heal(
         authored_code=None,
+        code_failure_reason=None,
         exception=ErrorCode("typed", "reason"),
         failing_line=1,
         build_failure_result=build_failure,
@@ -363,6 +374,7 @@ async def test_chokepoint_gate_follows_the_org_flag(
 
     result = await block._resolve_failure_with_heal(
         authored_code=None,
+        code_failure_reason=None,
         exception=PlaywrightTimeoutError("timeout"),
         failing_line=1,
         build_failure_result=build_failure,
@@ -469,6 +481,7 @@ async def test_ai_fallback_never_rescues_an_authoring_run(
 
     result = await block._resolve_failure_with_heal(
         authored_code=None,
+        code_failure_reason=None,
         exception=exception,
         failing_line=2,
         build_failure_result=_build_failure,
@@ -795,6 +808,7 @@ def _make_context(
         context.include_secrets_in_templates = True
     if with_workflow:
         context.workflow = SimpleNamespace(
+            ai_fallback=True,
             enable_self_healing=False,
             workflow_definition=None,
             created_by=created_by,
@@ -1009,6 +1023,7 @@ async def _heal(
             browser_state=browser_state if browser_state is not None else _browser_state(),
             page=page if page is not None else MagicMock(),
             authored_code=authored_code,
+            code_failure_reason=None,
         )
 
 
@@ -1064,7 +1079,7 @@ async def _execute_inline_failure_with_download_output(
     context = context or _make_context()
     fake_page = MagicMock()
     fake_browser_state = SimpleNamespace(
-        get_working_page=AsyncMock(return_value=fake_page), browser_artifacts=BrowserArtifacts()
+        get_working_page=AsyncMock(return_value=fake_page), engine_selection=None, browser_artifacts=BrowserArtifacts()
     )
     _patch_execute_chokepoint_environment(
         monkeypatch,
@@ -1117,7 +1132,7 @@ async def test_rendered_error_code_misuse_returns_and_records_failed_result(monk
     context.values["arguments"] = "code='A', reasoning='why'"
     fake_page = MagicMock()
     fake_browser_state = SimpleNamespace(
-        get_working_page=AsyncMock(return_value=fake_page), browser_artifacts=BrowserArtifacts()
+        get_working_page=AsyncMock(return_value=fake_page), engine_selection=None, browser_artifacts=BrowserArtifacts()
     )
     _patch_execute_chokepoint_environment(
         monkeypatch,
@@ -1403,6 +1418,73 @@ async def test_hand_authored_workflow_runs_the_ai_fallback_on_task_v3(
     # Without this the engine sizes the run like a bare task: the org's caps stop binding it and
     # it stops following popups and reaching into child frames.
     assert state["execute_step_kwargs"]["workflow_owned_recovery"] is True
+
+
+@pytest.mark.asyncio
+async def test_workflow_run_ai_fallback_false_skips_self_heal_when_org_flag_is_on(
+    monkeypatch: pytest.MonkeyPatch, ai_fallback_flag: Callable[[str | None], None]
+) -> None:
+    ai_fallback_flag("o_test")
+    state = _install_db_fakes(monkeypatch, final_status=TaskStatus.completed)
+    monkeypatch.setattr(
+        app.DATABASE.workflow_runs,
+        "get_workflow_run",
+        AsyncMock(
+            return_value=SimpleNamespace(
+                ai_fallback=False,
+                copilot_session_id=None,
+                is_debug_session=False,
+                parent_workflow_run_id=None,
+            )
+        ),
+    )
+    context = _make_context(created_by="user@example.com", edited_by="user@example.com")
+    context.workflow.ai_fallback = True
+    block = _make_code_block(steps=[CodeBlockStep(description="download", line_start=1, line_end=1)])
+    exception = RuntimeError("rotted selector")
+
+    result = await _heal(block, context, exception, _recording_page(exception))
+
+    assert result is None
+    assert state["create_task_kwargs"] is None
+    assert state["recovery_block_kwargs"] is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("run_ai_fallback", "workflow_ai_fallback", "expected"), [(True, False, True), (None, False, False)]
+)
+async def test_ai_fallback_enabled_prefers_run_setting_then_workflow_default(
+    monkeypatch: pytest.MonkeyPatch,
+    ai_fallback_flag: Callable[[str | None], None],
+    run_ai_fallback: bool | None,
+    workflow_ai_fallback: bool,
+    expected: bool,
+) -> None:
+    ai_fallback_flag("o_test")
+    monkeypatch.setattr(
+        app.DATABASE.workflow_runs,
+        "get_workflow_run",
+        AsyncMock(return_value=SimpleNamespace(ai_fallback=run_ai_fallback)),
+    )
+    context = _make_context(created_by="user@example.com", edited_by="user@example.com")
+    context.workflow.ai_fallback = workflow_ai_fallback
+
+    assert await _make_code_block()._ai_fallback_enabled(context) is expected
+
+
+@pytest.mark.asyncio
+async def test_ai_fallback_enabled_fails_closed_when_run_lookup_raises(
+    monkeypatch: pytest.MonkeyPatch, ai_fallback_flag: Callable[[str | None], None]
+) -> None:
+    ai_fallback_flag("o_test")
+    get_workflow_run = AsyncMock(side_effect=RuntimeError("database unavailable"))
+    monkeypatch.setattr(app.DATABASE.workflow_runs, "get_workflow_run", get_workflow_run)
+    context = _make_context(created_by="user@example.com", edited_by="user@example.com")
+    context.workflow.ai_fallback = True
+
+    assert await _make_code_block()._ai_fallback_enabled(context) is False
+    get_workflow_run.assert_awaited_once_with(workflow_run_id="wr_test", organization_id="o_test")
 
 
 @pytest.mark.asyncio
@@ -1693,6 +1775,7 @@ async def test_executed_block_lists_its_literal_fill_but_never_a_rendered_parame
     context.values["contact_name"] = "Grace Param"
     fake_browser_state = SimpleNamespace(
         get_working_page=AsyncMock(return_value=MagicMock()),
+        engine_selection=None,
         browser_artifacts=BrowserArtifacts(),
         navigate_to_url=AsyncMock(return_value=None),
     )
@@ -1742,6 +1825,351 @@ async def test_executed_block_lists_its_literal_fill_but_never_a_rendered_parame
         (1, "#contact-email", "ada@example.test")
     ]
     assert "Grace Param" not in render_code_progress_section(record)
+
+
+async def _fallback_payload_after_failing_execute(
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    code: str,
+    context: WorkflowRunContext,
+    parameters: list[Parameter] | None = None,
+) -> tuple[dict[str, Any], list[dict[str, Any]]]:
+    state = _install_db_fakes(monkeypatch, final_status=TaskStatus.failed)
+    block = _make_code_block(code=code)
+    block.parameters = parameters or []
+    fake_browser_state = SimpleNamespace(
+        get_working_page=AsyncMock(return_value=MagicMock()),
+        engine_selection=None,
+        browser_artifacts=BrowserArtifacts(),
+        navigate_to_url=AsyncMock(return_value=None),
+    )
+    _patch_execute_chokepoint_environment(
+        monkeypatch,
+        context=context,
+        fake_browser_state=fake_browser_state,
+        use_codeblock_runner=False,
+        format_templates=True,
+    )
+    monkeypatch.setattr(app.AGENT_FUNCTION, "execute_code_block_override", AsyncMock(return_value=None))
+    monkeypatch.setattr(CodeBlock, "_is_healable_page_failure", MagicMock(return_value=True))
+    monkeypatch.setattr(CodeBlock, "record_output_parameter_value", AsyncMock(return_value=None))
+    FakeRecorder.reset(last_recorded_exception=None)
+    monkeypatch.setattr("skyvern.forge.sdk.workflow.models.block.CodeBlockActionRecording", FakeRecorder)
+
+    with capture_logs() as logs:
+        with skyvern_context.scoped(SkyvernContext(organization_id="o_test", workflow_run_id="wr_test")):
+            await block.execute(
+                workflow_run_id="wr_test",
+                workflow_run_block_id="wrb_test",
+                organization_id="o_test",
+                browser_session_id="pbs_test",
+            )
+
+    assert state["create_task_kwargs"] is not None
+    return state["create_task_kwargs"], logs
+
+
+@pytest.mark.asyncio
+async def test_fallback_receives_the_upstream_value_the_code_reads_without_declaring_it(
+    monkeypatch: pytest.MonkeyPatch, ai_fallback_flag: Callable[[str | None], None]
+) -> None:
+    ai_fallback_flag("o_test")
+    context = _make_context()
+    context.register_block_reference_variable("Upstream", {"id": "row-17", "status": "open"})
+
+    create_kwargs, _ = await _fallback_payload_after_failing_execute(
+        monkeypatch,
+        code="row_id = '{{ Upstream.id }}'\nawait page.click(f'#row-{row_id}')\n",
+        context=context,
+    )
+
+    assert create_kwargs["navigation_payload"] == {"Upstream": {"id": "row-17", "status": "open"}}
+
+
+@pytest.mark.asyncio
+async def test_fallback_never_receives_an_input_read_only_inside_template_tags(
+    monkeypatch: pytest.MonkeyPatch, ai_fallback_flag: Callable[[str | None], None]
+) -> None:
+    ai_fallback_flag("o_test")
+    tax_id = WorkflowParameter(
+        workflow_parameter_id="wp_tax_id",
+        workflow_id="w_test",
+        key="tax_id",
+        workflow_parameter_type=WorkflowParameterType.STRING,
+        created_at=datetime.now(timezone.utc),
+        modified_at=datetime.now(timezone.utc),
+    )
+    context = _make_context()
+    context.parameters[tax_id.key] = tax_id
+    context.values[tax_id.key] = "12-3456789"
+    context.register_block_reference_variable("Upstream", {"id": "row-17"})
+
+    create_kwargs, _ = await _fallback_payload_after_failing_execute(
+        monkeypatch,
+        code=(
+            "{% if tax_id %}flagged = True{% endif %}\n"
+            "{% for tax_id in [1] %}n = {{ tax_id }}\n{% endfor %}"
+            "row_id = '{{ Upstream.id }}'\nawait page.click(f'#row-{row_id}')\n"
+        ),
+        context=context,
+    )
+
+    assert create_kwargs["navigation_payload"] == {"Upstream": {"id": "row-17"}}
+
+
+@pytest.mark.asyncio
+async def test_fallback_inside_a_loop_receives_the_current_item_the_code_reads(
+    monkeypatch: pytest.MonkeyPatch, ai_fallback_flag: Callable[[str | None], None]
+) -> None:
+    ai_fallback_flag("o_test")
+    context = _make_context()
+    context.update_block_metadata("code_1", {"current_item": {"x": "item-3"}, "current_index": 2})
+
+    create_kwargs, _ = await _fallback_payload_after_failing_execute(
+        monkeypatch,
+        code="await page.fill('#search', '{{ current_item.x }}')\n",
+        context=context,
+    )
+
+    assert create_kwargs["navigation_payload"] == {"current_item": {"x": "item-3"}}
+
+
+@pytest.mark.asyncio
+async def test_declared_inputs_keep_their_payload_and_win_over_a_referenced_name(
+    monkeypatch: pytest.MonkeyPatch, ai_fallback_flag: Callable[[str | None], None]
+) -> None:
+    ai_fallback_flag("o_test")
+    region = WorkflowParameter(
+        workflow_parameter_id="wp_region",
+        workflow_id="w_test",
+        key="region",
+        workflow_parameter_type=WorkflowParameterType.STRING,
+        created_at=datetime.now(timezone.utc),
+        modified_at=datetime.now(timezone.utc),
+    )
+    context = _make_context()
+    context.parameters[region.key] = region
+    context.values[region.key] = "eu-west"
+
+    create_kwargs, _ = await _fallback_payload_after_failing_execute(
+        monkeypatch,
+        code="await page.fill('#region', '{{ region }}')\n",
+        context=context,
+        parameters=[region],
+    )
+
+    assert json.dumps(create_kwargs["navigation_payload"]) == json.dumps({"region": "eu-west"})
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "secret",
+    [
+        pytest.param(f"{RANDOM_SECRET_ID_PREFIX}ab12", id="placeholder_token"),
+        pytest.param("4821", id="four_digit_pin"),
+        pytest.param('pa"ss-word', id="quote"),
+        pytest.param("c:\\vault\\key", id="backslash"),
+        pytest.param("pässwörd-ü", id="non_ascii"),
+    ],
+)
+async def test_fallback_never_receives_a_referenced_value_carrying_a_secret(
+    monkeypatch: pytest.MonkeyPatch, ai_fallback_flag: Callable[[str | None], None], secret: str
+) -> None:
+    ai_fallback_flag("o_test")
+    context = _make_context()
+    if secret.startswith(RANDOM_SECRET_ID_PREFIX):
+        context.secrets[secret] = SECRET_VALUE
+    else:
+        context.secrets["k_secret"] = secret
+    context.register_block_reference_variable("Upstream", {"id": "row-17", "note": f"code {secret} on file"})
+    context.register_block_reference_variable("Other", {"id": "row-18"})
+
+    create_kwargs, logs = await _fallback_payload_after_failing_execute(
+        monkeypatch,
+        code="row_id = '{{ Upstream.id }}'\nother = '{{ Other.id }}'\nawait page.click(f'#row-{row_id}')\n",
+        context=context,
+    )
+
+    assert create_kwargs["navigation_payload"] == {"Other": {"id": "row-18"}}
+    assert secret not in json.dumps(create_kwargs, default=str, ensure_ascii=False)
+    assert secret not in json.dumps(logs, default=str, ensure_ascii=False)
+
+
+_URL_SECRET = "pa ss/w&rd"
+_HTML_SECRET = 'pa<ss>&"rd'
+_QUOTE_BACKSLASH_SECRET = 'pa"ss\\wd'
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("secret", "upstream_value"),
+    [
+        pytest.param(_URL_SECRET, {"link": f"/login?pw={urllib.parse.quote(_URL_SECRET, safe='')}"}, id="url_quoted"),
+        pytest.param(_HTML_SECRET, {"cell": f"<td>{html.escape(_HTML_SECRET)}</td>"}, id="html_escaped"),
+        pytest.param(
+            _QUOTE_BACKSLASH_SECRET,
+            {"raw": json.dumps({"pw": _QUOTE_BACKSLASH_SECRET})},
+            id="double_escaped_in_json_string",
+        ),
+    ],
+)
+async def test_fallback_never_receives_a_referenced_value_carrying_an_encoded_secret(
+    monkeypatch: pytest.MonkeyPatch,
+    ai_fallback_flag: Callable[[str | None], None],
+    secret: str,
+    upstream_value: dict[str, str],
+) -> None:
+    ai_fallback_flag("o_test")
+    context = _make_context()
+    context.secrets["k_secret"] = secret
+    context.register_block_reference_variable("Upstream", {"id": "row-17", **upstream_value})
+    context.register_block_reference_variable("Other", {"id": "row-18"})
+
+    create_kwargs, _ = await _fallback_payload_after_failing_execute(
+        monkeypatch,
+        code="row = '{{ Upstream.id }}'\nother = '{{ Other.id }}'\nawait page.click('#go')\n",
+        context=context,
+    )
+
+    assert create_kwargs["navigation_payload"] == {"Other": {"id": "row-18"}}
+
+
+@pytest.mark.asyncio
+async def test_fallback_never_receives_an_undeclared_credential_parameter(
+    monkeypatch: pytest.MonkeyPatch, ai_fallback_flag: Callable[[str | None], None]
+) -> None:
+    ai_fallback_flag("o_test")
+    credential = _credential_parameter()
+    context = _make_context()
+    context.parameters[credential.key] = credential
+    context.values[credential.key] = {"username": "login_name", "password": "login_pass"}
+
+    create_kwargs, _ = await _fallback_payload_after_failing_execute(
+        monkeypatch,
+        code="await page.fill('#user', '{{ portal_credential.username }}')\n",
+        context=context,
+    )
+
+    assert create_kwargs["navigation_payload"] == {}
+
+
+@pytest.mark.asyncio
+async def test_fallback_leaves_out_an_oversized_referenced_value_instead_of_cutting_it(
+    monkeypatch: pytest.MonkeyPatch, ai_fallback_flag: Callable[[str | None], None]
+) -> None:
+    ai_fallback_flag("o_test")
+    context = _make_context()
+    context.register_block_reference_variable("Upstream", {"id": "row-17", "rows": ["r" * 100] * 1000})
+    context.register_block_reference_variable("Other", {"id": "row-18"})
+
+    create_kwargs, _ = await _fallback_payload_after_failing_execute(
+        monkeypatch,
+        code="row_id = '{{ Upstream.id }}'\nother = '{{ Other.id }}'\nawait page.click(f'#row-{row_id}')\n",
+        context=context,
+    )
+
+    assert create_kwargs["navigation_payload"] == {"Other": {"id": "row-18"}}
+
+
+@pytest.mark.asyncio
+async def test_fallback_drops_referenced_values_past_the_total_budget_and_logs_only_their_names(
+    monkeypatch: pytest.MonkeyPatch, ai_fallback_flag: Callable[[str | None], None]
+) -> None:
+    ai_fallback_flag("o_test")
+    context = _make_context()
+    for label in ("Alpha", "Bravo", "Charlie"):
+        context.register_block_reference_variable(label, {"rows": [f"{label}-row-value"] * 800})
+
+    create_kwargs, logs = await _fallback_payload_after_failing_execute(
+        monkeypatch,
+        code="a = '{{ Alpha.rows }}'\nb = '{{ Bravo.rows }}'\nc = '{{ Charlie.rows }}'\nawait page.click('#go')\n",
+        context=context,
+    )
+
+    payload = create_kwargs["navigation_payload"]
+    assert payload == {label: {"rows": [f"{label}-row-value"] * 800} for label in ("Alpha", "Bravo")}
+    over_budget = [entry for entry in logs if entry.get("roots") == ["Charlie"]]
+    assert over_budget
+    assert "Charlie-row-value" not in json.dumps(logs, default=str)
+
+
+@pytest.mark.asyncio
+async def test_self_heal_payload_carries_the_undeclared_upstream_value_but_no_secret_or_inline_code(
+    monkeypatch: pytest.MonkeyPatch, ai_fallback_flag: Callable[[str | None], None]
+) -> None:
+    ai_fallback_flag("o_test")
+    context = _make_context()
+    context.secrets["k_secret"] = SECRET_VALUE
+    context.register_block_reference_variable("Upstream", {"x": "row-17"})
+    context.register_block_reference_variable("Vault_Note", {"note": f"pw {SECRET_VALUE}"})
+    login_output = {"result": {"otp_code": "123456"}}
+    context.register_block_reference_variable("Login_Step", login_output)
+    monkeypatch.setattr(otp_service, "try_generate_totp_from_credential", lambda *_args, **_kwargs: None)
+
+    def task_with(payload: dict[str, Any]) -> SimpleNamespace:
+        return SimpleNamespace(
+            task_id="tsk_escalation",
+            workflow_run_id="wr_test",
+            organization_id="o_test",
+            navigation_payload=payload,
+            totp_verification_url=None,
+            totp_identifier=None,
+        )
+
+    assert await otp_service.resolve_otp_value(task_with({"Login_Step": login_output}))
+
+    create_kwargs, _ = await _fallback_payload_after_failing_execute(
+        monkeypatch,
+        code=(
+            "row_id = '{{ Upstream.x }}'\nnote = '{{ Vault_Note.note }}'\nlogin = '{{ Login_Step.result }}'\n"
+            "await page.click(f'#row-{row_id}')\n"
+        ),
+        context=context,
+    )
+
+    payload = create_kwargs["navigation_payload"]
+    assert payload == {"Upstream": {"x": "row-17"}}
+    assert await otp_service.resolve_otp_value(task_with(payload)) is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("referenced", [False, True], ids=["unreferenced", "referenced"])
+async def test_referenced_values_build_the_run_summary_only_when_the_code_reads_it(
+    monkeypatch: pytest.MonkeyPatch, referenced: bool
+) -> None:
+    summary = MagicMock(return_value={"blocks": []})
+    monkeypatch.setattr(WorkflowRunContext, "build_workflow_run_summary", summary)
+    context = _make_context()
+    context.register_block_reference_variable("Upstream", {"x": "row-17"})
+    block = _make_code_block(code="")
+    block._template_roots = frozenset({"Upstream", "workflow_run_summary"} if referenced else {"Upstream"})
+
+    values = block._referenced_fallback_values(context, [])
+
+    assert summary.called is referenced
+    assert ("workflow_run_summary" in values) is referenced
+
+
+@pytest.mark.asyncio
+async def test_fallback_never_receives_a_real_credential_template_entry(
+    monkeypatch: pytest.MonkeyPatch, ai_fallback_flag: Callable[[str | None], None]
+) -> None:
+    ai_fallback_flag("o_test")
+    context = _make_context()
+    context.include_secrets_in_templates = True
+    monkeypatch.setattr(
+        WorkflowRunContext,
+        "credential_template_entries",
+        lambda *_args, **_kwargs: {"portal_real_password": "unregistered-raw-value"},
+    )
+
+    create_kwargs, _ = await _fallback_payload_after_failing_execute(
+        monkeypatch,
+        code="await page.fill('#password', '{{ portal_real_password }}')\n",
+        context=context,
+    )
+
+    assert create_kwargs["navigation_payload"] == {}
 
 
 @pytest.mark.parametrize("prompt", [None, ""], ids=["absent_goal", "empty_goal"])
@@ -3690,6 +4118,7 @@ async def test_self_heal_passes_pre_resolved_browser_state_by_identity(
     with skyvern_context.scoped(SkyvernContext(organization_id="o_test", workflow_run_id="wr_test")):
         result = await block._attempt_self_heal(
             authored_code=None,
+            code_failure_reason=None,
             exception=exc,
             failing_line=1,
             recording_page=_recording_page(exc),
@@ -3715,7 +4144,7 @@ async def test_legacy_heal_success_skips_failed_write_and_ends_completed(
     context = _make_context()
     fake_page = MagicMock()
     fake_browser_state = SimpleNamespace(
-        get_working_page=AsyncMock(return_value=fake_page), browser_artifacts=BrowserArtifacts()
+        get_working_page=AsyncMock(return_value=fake_page), engine_selection=None, browser_artifacts=BrowserArtifacts()
     )
     _patch_execute_chokepoint_environment(
         monkeypatch,
@@ -3762,6 +4191,124 @@ async def test_legacy_heal_success_skips_failed_write_and_ends_completed(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("engine", ["inline", "secure"])
+@pytest.mark.parametrize("browser_lost", [True, False], ids=["native_context_close", "ordinary_failure"])
+async def test_failure_after_native_browser_loss_stops_the_run_instead_of_healing(
+    monkeypatch: pytest.MonkeyPatch,
+    ai_fallback_flag: Callable[[str | None], None],
+    engine: str,
+    browser_lost: bool,
+) -> None:
+    ai_fallback_flag("o_test")
+    state = _install_db_fakes(monkeypatch, final_status=TaskStatus.completed)
+    block = _make_code_block(
+        steps=[CodeBlockStep(description="open the report", line_start=1, line_end=1)],
+        code="await page.click('#go')",
+    )
+    block.continue_on_failure = True
+    context = _make_context()
+    native_context = MagicMock(browser=MagicMock())
+    browser_state = RealBrowserState(pw=MagicMock(), browser_context=native_context)
+    browser_state.bind_runtime_event_context(BrowserRuntimeLogContext(workflow_run_id="wr_test"))
+    browser_state.get_working_page = AsyncMock(return_value=MagicMock())  # type: ignore[method-assign]
+    _patch_execute_chokepoint_environment(
+        monkeypatch, context=context, fake_browser_state=browser_state, use_codeblock_runner=engine == "secure"
+    )
+    closed = PlaywrightError("Target page, context or browser has been closed")
+
+    def close_in_flight() -> None:
+        if browser_lost:
+            browser_state._on_browser_context_closed(native_context)
+
+    async def run_on_secure_runner(**_: Any) -> CodeBlockEngineResult | None:
+        if engine != "secure":
+            return None
+        close_in_flight()
+        return CodeBlockEngineResult(
+            block_result=None,
+            failure=CodeBlockEngineFailure(
+                error_code="user_code_error",
+                safe_message=None,
+                failure_reason="CodeBlock failed while running user code.",
+                exception_class="playwright._impl._errors.Error",
+                failing_line=1,
+                healability_hint=True,
+            ),
+        )
+
+    class ClickInFlightRecorder(FakeRecorder):
+        def __init__(self, **kwargs: Any) -> None:
+            super().__init__(**kwargs)
+
+            async def click(*_: Any, **__: Any) -> None:
+                close_in_flight()
+                raise closed
+
+            self.recording_page.click = click
+
+    monkeypatch.setattr(app.AGENT_FUNCTION, "execute_code_block_override", AsyncMock(side_effect=run_on_secure_runner))
+    ClickInFlightRecorder.reset(last_recorded_exception=closed)
+    monkeypatch.setattr("skyvern.forge.sdk.workflow.models.block.CodeBlockActionRecording", ClickInFlightRecorder)
+    monkeypatch.setattr(CodeBlock, "_capture_failure_evidence", AsyncMock(return_value=None))
+    monkeypatch.setattr(CodeBlock, "record_output_parameter_value", AsyncMock(return_value=None))
+
+    async def heal_and_fall_through(**kwargs: Any) -> BlockResult:
+        return await block.build_block_result(
+            success=True,
+            failure_reason=None,
+            output_parameter_value={"task_id": "tsk_escalation", "status": "completed"},
+            status=BlockStatus.completed,
+            workflow_run_block_id=kwargs["workflow_run_block_id"],
+            organization_id=kwargs["organization_id"],
+        )
+
+    heal = AsyncMock(side_effect=heal_and_fall_through)
+    monkeypatch.setattr(block, "_attempt_self_heal", heal)
+    mark_failed = AsyncMock(return_value=MagicMock())
+    monkeypatch.setattr(WorkflowService, "mark_workflow_run_as_failed_if_not_final", mark_failed)
+
+    with skyvern_context.scoped(SkyvernContext(organization_id="o_test", workflow_run_id="wr_test")):
+        result = await block.execute(
+            workflow_run_id="wr_test",
+            workflow_run_block_id="wrb_test",
+            organization_id="o_test",
+            browser_session_id="pbs_test",
+        )
+    _, should_stop = await WorkflowService()._handle_block_result_status(
+        block=block,
+        block_idx=0,
+        blocks_cnt=2,
+        block_result=result,
+        workflow_run=MagicMock(),
+        workflow_run_id="wr_test",
+    )
+
+    persisted_codes = [
+        code
+        for update in state["workflow_run_block_updates"]
+        if update.get("workflow_run_block_id") == "wrb_test"
+        for code in update.get("error_codes") or []
+    ]
+    if browser_lost:
+        heal.assert_not_awaited()
+        assert result.success is False
+        assert result.status == BlockStatus.failed
+        assert result.failure_reason
+        assert result.can_continue_after_failure is False
+        assert BROWSER_CONNECTION_LOST_ERROR_CODE in result.error_codes
+        assert BROWSER_CONNECTION_LOST_ERROR_CODE in persisted_codes
+        assert _statuses_for_block(state, "wrb_test")[-1] == BlockStatus.failed
+        assert ClickInFlightRecorder.instances[0].finalized_success is False
+        assert should_stop is True
+        mark_failed.assert_awaited_once()
+    else:
+        heal.assert_awaited_once()
+        assert result.success is True
+        assert BROWSER_CONNECTION_LOST_ERROR_CODE not in persisted_codes
+        assert should_stop is False
+
+
+@pytest.mark.asyncio
 async def test_heal_output_write_failure_does_not_finalize_completed(
     monkeypatch: pytest.MonkeyPatch, ai_fallback_flag: Callable[[str | None], None]
 ) -> None:
@@ -3771,7 +4318,7 @@ async def test_heal_output_write_failure_does_not_finalize_completed(
     context = _make_context()
     fake_page = MagicMock()
     fake_browser_state = SimpleNamespace(
-        get_working_page=AsyncMock(return_value=fake_page), browser_artifacts=BrowserArtifacts()
+        get_working_page=AsyncMock(return_value=fake_page), engine_selection=None, browser_artifacts=BrowserArtifacts()
     )
     _patch_execute_chokepoint_environment(
         monkeypatch,
@@ -3824,7 +4371,7 @@ async def test_secure_heal_success_skips_failed_write_and_ends_completed(
     context = _make_context()
     fake_page = MagicMock()
     fake_browser_state = SimpleNamespace(
-        get_working_page=AsyncMock(return_value=fake_page), browser_artifacts=BrowserArtifacts()
+        get_working_page=AsyncMock(return_value=fake_page), engine_selection=None, browser_artifacts=BrowserArtifacts()
     )
     _patch_execute_chokepoint_environment(
         monkeypatch,
@@ -3896,7 +4443,7 @@ async def test_legacy_heal_declined_writes_failed_once(
     context = _make_context()
     fake_page = MagicMock()
     fake_browser_state = SimpleNamespace(
-        get_working_page=AsyncMock(return_value=fake_page), browser_artifacts=BrowserArtifacts()
+        get_working_page=AsyncMock(return_value=fake_page), engine_selection=None, browser_artifacts=BrowserArtifacts()
     )
     _patch_execute_chokepoint_environment(
         monkeypatch,
@@ -3936,7 +4483,7 @@ async def test_secure_heal_declined_writes_failed_once(
     context = _make_context()
     fake_page = MagicMock()
     fake_browser_state = SimpleNamespace(
-        get_working_page=AsyncMock(return_value=fake_page), browser_artifacts=BrowserArtifacts()
+        get_working_page=AsyncMock(return_value=fake_page), engine_selection=None, browser_artifacts=BrowserArtifacts()
     )
     _patch_execute_chokepoint_environment(
         monkeypatch,
@@ -4008,7 +4555,7 @@ async def test_secure_failure_records_a_sign_in_form_only_on_the_page_it_failed_
     fake_page = MagicMock()
     fake_page.evaluate = AsyncMock(return_value=True)
     fake_browser_state = SimpleNamespace(
-        get_working_page=AsyncMock(return_value=fake_page), browser_artifacts=BrowserArtifacts()
+        get_working_page=AsyncMock(return_value=fake_page), engine_selection=None, browser_artifacts=BrowserArtifacts()
     )
     _patch_execute_chokepoint_environment(
         monkeypatch, context=_make_context(), fake_browser_state=fake_browser_state, use_codeblock_runner=True
@@ -4109,7 +4656,9 @@ async def test_secure_proxy_transport_failure_skips_the_ai_fallback(
     block = _make_code_block()
     context = _make_context()
     fake_browser_state = SimpleNamespace(
-        get_working_page=AsyncMock(return_value=MagicMock()), browser_artifacts=BrowserArtifacts()
+        get_working_page=AsyncMock(return_value=MagicMock()),
+        engine_selection=None,
+        browser_artifacts=BrowserArtifacts(),
     )
     _patch_execute_chokepoint_environment(
         monkeypatch,
@@ -4176,7 +4725,9 @@ async def test_secure_failure_emits_operation_attribution(
     block = _make_code_block()
     context = _make_context()
     fake_browser_state = SimpleNamespace(
-        get_working_page=AsyncMock(return_value=MagicMock()), browser_artifacts=BrowserArtifacts()
+        get_working_page=AsyncMock(return_value=MagicMock()),
+        engine_selection=None,
+        browser_artifacts=BrowserArtifacts(),
     )
     _patch_execute_chokepoint_environment(
         monkeypatch,
@@ -4245,7 +4796,7 @@ async def test_secure_accepted_typed_failure_preserves_adapter_block_result(monk
     context = _make_context()
     fake_page = MagicMock()
     fake_browser_state = SimpleNamespace(
-        get_working_page=AsyncMock(return_value=fake_page), browser_artifacts=BrowserArtifacts()
+        get_working_page=AsyncMock(return_value=fake_page), engine_selection=None, browser_artifacts=BrowserArtifacts()
     )
     _patch_execute_chokepoint_environment(
         monkeypatch,
@@ -4325,7 +4876,7 @@ async def test_secure_runner_missing_block_result_returns_generic_failure(
     context = _make_context()
     fake_page = MagicMock()
     fake_browser_state = SimpleNamespace(
-        get_working_page=AsyncMock(return_value=fake_page), browser_artifacts=BrowserArtifacts()
+        get_working_page=AsyncMock(return_value=fake_page), engine_selection=None, browser_artifacts=BrowserArtifacts()
     )
     _patch_execute_chokepoint_environment(
         monkeypatch,
@@ -4368,7 +4919,7 @@ async def test_secure_infra_failure_without_metadata_finalizes_failed_and_record
     context = _make_context()
     fake_page = MagicMock()
     fake_browser_state = SimpleNamespace(
-        get_working_page=AsyncMock(return_value=fake_page), browser_artifacts=BrowserArtifacts()
+        get_working_page=AsyncMock(return_value=fake_page), engine_selection=None, browser_artifacts=BrowserArtifacts()
     )
     _patch_execute_chokepoint_environment(
         monkeypatch,
@@ -4464,6 +5015,7 @@ async def _resolve_failed_heal(
     with skyvern_context.scoped(SkyvernContext(organization_id="o_test", workflow_run_id="wr_test")):
         result = await block._resolve_failure_with_heal(
             authored_code=None,
+            code_failure_reason=None,
             exception=exception,
             failing_line=1,
             build_failure_result=_build_failure,
@@ -4561,6 +5113,7 @@ async def test_the_escalation_hop_before_the_recovery_runs_decides_what_the_heal
     with skyvern_context.scoped(SkyvernContext(organization_id="o_test", workflow_run_id="wr_test")):
         result = await block._attempt_self_heal(
             authored_code=None,
+            code_failure_reason=None,
             exception=exc,
             failing_line=1,
             recording_page=_recording_page(exc),
@@ -4687,6 +5240,7 @@ async def test_executed_block_keeps_its_screened_driver_nav_code_through_a_faile
     context = _make_context(with_secret=True)
     fake_browser_state = SimpleNamespace(
         get_working_page=AsyncMock(return_value=MagicMock()),
+        engine_selection=None,
         browser_artifacts=BrowserArtifacts(),
         navigate_to_url=AsyncMock(return_value=None),
     )
@@ -4735,8 +5289,133 @@ async def test_executed_block_keeps_its_screened_driver_nav_code_through_a_faile
 
     assert result.success is False
     assert state["heal_episodes"][0]["status"] == HealStatus.fired_failed
-    assert result.failure_reason == "agent gave up"
+    assert result.failure_reason is not None and result.failure_reason.endswith("\nAI fallback: agent gave up")
     assert [code for code in result.error_codes if code != "user_code_error"] == expected_codes
+
+
+_SIGNED_OUT_FAILURE_PAGE = (
+    f"Final URL: https://example.com/notauthenticated?session={SECRET_VALUE}\nPage title: Not Authenticated"
+)
+_RECOVERY_RESOLVED_CODE = "918273"
+
+
+async def _execute_signed_out_block(
+    monkeypatch: pytest.MonkeyPatch, *, engine: str, data_schema: dict[str, Any] | None
+) -> BlockResult:
+    block = _make_code_block(
+        code=(
+            "await page.goto('https://example.com/members')\n"
+            "await page.wait_for_selector('text=Signed in as', timeout=5000)\n"
+        ),
+        steps=[CodeBlockStep(description="Open the members page", line_start=1, line_end=1)],
+        data_schema=data_schema,
+    )
+    fake_browser_state = SimpleNamespace(
+        get_working_page=AsyncMock(return_value=MagicMock()),
+        engine_selection=None,
+        browser_artifacts=BrowserArtifacts(),
+        navigate_to_url=AsyncMock(return_value=None),
+    )
+    _patch_execute_chokepoint_environment(
+        monkeypatch,
+        context=_make_context(with_secret=True),
+        fake_browser_state=fake_browser_state,
+        use_codeblock_runner=engine == "secure",
+    )
+    monkeypatch.setattr(
+        app.AGENT_FUNCTION,
+        "execute_code_block_override",
+        AsyncMock(
+            return_value=CodeBlockEngineResult(
+                block_result=None,
+                failure=CodeBlockEngineFailure(
+                    error_code="browser_operation_failed",
+                    safe_message=None,
+                    failure_reason=f"Locator.wait_for: Timeout 5000ms exceeded.\n{_SIGNED_OUT_FAILURE_PAGE}",
+                    exception_class="playwright._impl._errors.TimeoutError",
+                    failing_line=2,
+                    healability_hint=True,
+                ),
+            )
+            if engine == "secure"
+            else None
+        ),
+    )
+    monkeypatch.setattr(CodeBlock, "_is_healable_page_failure", MagicMock(return_value=True))
+    monkeypatch.setattr(CodeBlock, "record_output_parameter_value", AsyncMock(return_value=None))
+    FakeRecorder.reset()
+    page_error = PlaywrightError(f"Page.wait_for_selector: Target closed\n{_SIGNED_OUT_FAILURE_PAGE}")
+
+    class _SignedOutRecorder(FakeRecorder):
+        def __init__(self, **kwargs: object) -> None:
+            super().__init__(**kwargs)
+            self.recording_page.goto = AsyncMock(return_value=None)
+            self.recording_page.wait_for_selector = AsyncMock(side_effect=page_error)
+
+    monkeypatch.setattr("skyvern.forge.sdk.workflow.models.block.CodeBlockActionRecording", _SignedOutRecorder)
+    run_context = SkyvernContext(
+        organization_id="o_test", workflow_run_id="wr_test", runtime_secret_values={_RECOVERY_RESOLVED_CODE}
+    )
+    with skyvern_context.scoped(run_context):
+        return await block.execute(
+            workflow_run_id="wr_test",
+            workflow_run_block_id="wrb_test",
+            organization_id="o_test",
+            browser_session_id="pbs_test",
+        )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("engine", ["inline", "secure"])
+@pytest.mark.parametrize(
+    ("final_status", "extracted_information", "data_schema"),
+    [
+        pytest.param(TaskStatus.failed, _UNSET, None, id="recovery_failed"),
+        pytest.param(TaskStatus.running, _UNSET, None, id="no_final_status"),
+        pytest.param(
+            TaskStatus.completed,
+            {},
+            {"type": "object", "properties": {"report": {"type": "string"}}},
+            id="declared_values_missing",
+        ),
+    ],
+)
+async def test_failed_ai_fallback_reports_the_code_failure_first(
+    monkeypatch: pytest.MonkeyPatch,
+    ai_fallback_flag: Callable[[str | None], None],
+    engine: str,
+    final_status: TaskStatus,
+    extracted_information: ExtractedInformation | _Unset,
+    data_schema: dict[str, Any] | None,
+) -> None:
+    monkeypatch.setattr("skyvern.config.settings.ENABLE_SECRET_ARTIFACT_REDACTION", True)
+    monkeypatch.setattr(app, "WORKFLOW_CONTEXT_MANAGER", WorkflowContextManager())
+    ai_fallback_flag(None)
+    _install_db_fakes(monkeypatch, final_status=final_status, extracted_information=extracted_information)
+    unhealed = await _execute_signed_out_block(monkeypatch, engine=engine, data_schema=data_schema)
+
+    ai_fallback_flag("o_test")
+    state = _install_db_fakes(monkeypatch, final_status=final_status, extracted_information=extracted_information)
+    if final_status is TaskStatus.failed:
+        state["updated_task"].failure_reason = f"The verification code {_RECOVERY_RESOLVED_CODE} was rejected"
+    result = await _execute_signed_out_block(monkeypatch, engine=engine, data_schema=data_schema)
+
+    assert unhealed.failure_reason is not None and "Not Authenticated" in unhealed.failure_reason
+    code_reason = unhealed.failure_reason.replace(SECRET_VALUE, "*****")
+    fallback_sentence = state["heal_episodes"][0]["failure_message"]
+    assert fallback_sentence and "Not Authenticated" not in fallback_sentence
+    assert _RECOVERY_RESOLVED_CODE not in fallback_sentence
+    assert result.success is False
+    assert result.failure_reason == f"{code_reason}\nAI fallback: {fallback_sentence}"
+    assert SECRET_VALUE not in result.failure_reason
+    parent_reasons = {
+        update["failure_reason"]
+        for update in state["workflow_run_block_updates"]
+        if update.get("workflow_run_block_id") == "wrb_test" and update.get("failure_reason")
+    }
+    assert parent_reasons == {result.failure_reason}
+    child_reasons = {u["failure_reason"] for u in state["recovery_block_updates"] if u.get("failure_reason")}
+    assert child_reasons == (set() if final_status is TaskStatus.running else {fallback_sentence})
 
 
 @pytest.mark.asyncio
@@ -4759,6 +5438,7 @@ async def test_no_persisted_block_row_keeps_a_nav_code_that_is_a_parameter_value
     block = _make_code_block(code="raise RuntimeError('navigation failed')")
     fake_browser_state = SimpleNamespace(
         get_working_page=AsyncMock(return_value=MagicMock()),
+        engine_selection=None,
         browser_artifacts=BrowserArtifacts(),
         navigate_to_url=AsyncMock(return_value=None),
     )
@@ -4888,6 +5568,25 @@ async def test_recovery_pins_the_login_key_on_a_block_that_also_carries_a_card(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(("lineage", "enforced"), [(True, True), (None, True), (False, False)])
+async def test_recovery_enforces_vault_login_sites_as_the_code_block_does(
+    monkeypatch: pytest.MonkeyPatch,
+    ai_fallback_flag: Callable[[str | None], None],
+    lineage: bool | None,
+    enforced: bool,
+) -> None:
+    # The recovery task has no workflow lineage of its own, so the block's decision travels with it.
+    ai_fallback_flag("o_test")
+    state = _install_db_fakes(monkeypatch, final_status=TaskStatus.completed)
+    monkeypatch.setattr(CodeBlock, "_workflow_copilot_lineage", AsyncMock(return_value=lineage))
+    block = _make_code_block()
+
+    await _heal(block, _make_context(), PlaywrightTimeoutError("timeout"), _recording_page(None))
+
+    assert state["execute_step_kwargs"]["recovery_enforce_vault_sites"] is enforced
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("make_parameter", [_credential_parameter, _credential_id_workflow_parameter])
 async def test_recovery_task_is_built_from_the_block_fields(
     monkeypatch: pytest.MonkeyPatch,
@@ -4919,6 +5618,7 @@ async def test_recovery_task_is_built_from_the_block_fields(
         with skyvern_context.scoped(SkyvernContext(organization_id="o_test", workflow_run_id="wr_test")):
             result = await block._resolve_failure_with_heal(
                 authored_code=None,
+                code_failure_reason=None,
                 exception=exception,
                 failing_line=1,
                 build_failure_result=_build_failure,
@@ -4972,6 +5672,7 @@ async def test_block_without_prompt_skips_recovery_without_an_llm_call(
     with capture_logs() as logs:
         result = await block._resolve_failure_with_heal(
             authored_code=None,
+            code_failure_reason=None,
             exception=exception,
             failing_line=2,
             build_failure_result=_build_failure,
@@ -5035,6 +5736,7 @@ async def test_failed_recovery_outcome_carries_task_id_and_action_count(
     with capture_logs() as logs:
         result = await block._resolve_failure_with_heal(
             authored_code=None,
+            code_failure_reason=None,
             exception=exception,
             failing_line=2,
             build_failure_result=_build_failure,
@@ -5090,6 +5792,7 @@ async def test_heal_episode_persistence_failure_does_not_change_heal_outcome(
     with capture_logs() as logs:
         result = await block._resolve_failure_with_heal(
             authored_code=None,
+            code_failure_reason=None,
             exception=exception,
             failing_line=2,
             build_failure_result=_build_failure,

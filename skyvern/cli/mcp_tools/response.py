@@ -576,6 +576,16 @@ def _truncate_response_to_limit(
     return envelope
 
 
+def within_response_limits(data: Any) -> bool:
+    """Whether a payload clears both caps the response decorators enforce.
+
+    A tool that degrades its own oversize payload has to measure the same two
+    limits: checking characters alone lets a non-ASCII response slip into the
+    truncation envelope, which keeps only top-level identifier keys.
+    """
+    return _response_size(data) <= MCP_MAX_RESPONSE_CHARS and _response_size_bytes(data) <= MCP_MAX_RESPONSE_BYTES
+
+
 def truncate_response(data: Any, *, max_chars: int = MCP_MAX_RESPONSE_CHARS) -> Any:
     """Cap a response by JSON-serialized characters, preserving the existing envelope contract."""
     return _truncate_response_to_limit(
@@ -1218,4 +1228,5 @@ __all__ = [
     "size_capped",
     "truncate_response",
     "truncate_response_bytes",
+    "within_response_limits",
 ]

@@ -13,6 +13,7 @@ import pytest_asyncio
 
 import skyvern.browser_extension.runtime as runtime_module
 from skyvern.browser_extension.broker_client import BrokerClient
+from skyvern.browser_extension.cdp_adapter import TabReconnectEvent
 from skyvern.browser_extension.errors import BrowserExtensionBrokerError, BrowserExtensionError
 from skyvern.browser_extension.runtime import BrowserExtensionRuntime, broker_mode_enabled
 from tests.unit.browser_extension.home_guard import _test_broker_base_dir
@@ -64,6 +65,9 @@ class StubAdapter:
         self.disconnect_count = 0
         self.stop_count = 0
         self.cdp_ws_url = "ws://127.0.0.1:23456/cdp/test-capability"
+
+    def set_tab_reconnect_listener(self, listener: Callable[[TabReconnectEvent], None] | None) -> None:
+        self.on_tab_reconnect = listener
 
     async def start(self) -> None:
         self.calls.append("adapter.start")
@@ -592,7 +596,10 @@ async def test_fixed_fill_targets_selected_page_instead_of_active_chrome_tab(mon
         scoped_tabs=[{"tabId": 17, "active": True}, {"tabId": 42, "active": False}],
         request=AsyncMock(return_value={"textLength": 3}),
     )
-    adapter = SimpleNamespace(scoped_tab_id_for_target=lambda target: 42 if target == "selected-target" else None)
+    adapter = SimpleNamespace(
+        scoped_tab_id_for_target=lambda target: 42 if target == "selected-target" else None,
+        set_tab_reconnect_listener=MagicMock(),
+    )
     runtime = BrowserExtensionRuntime(relay, adapter)
     monkeypatch.setattr(runtime_module, "time", SimpleNamespace(time=lambda: 100.0))
     binding = AsyncMock(return_value="selected-target")
@@ -611,7 +618,9 @@ async def test_fixed_fill_refuses_a_target_that_lost_scope(monkeypatch: pytest.M
     page = MagicMock()
     page.is_closed.return_value = False
     relay = SimpleNamespace(connected=True, request=AsyncMock())
-    runtime = BrowserExtensionRuntime(relay, SimpleNamespace(scoped_tab_id_for_target=lambda target: None))
+    runtime = BrowserExtensionRuntime(
+        relay, SimpleNamespace(scoped_tab_id_for_target=lambda target: None, set_tab_reconnect_listener=MagicMock())
+    )
     monkeypatch.setattr(runtime, "_target_id_for_page", AsyncMock(return_value="old-target"))
 
     with pytest.raises(BrowserExtensionError, match="selected page"):
@@ -624,7 +633,9 @@ async def test_fixed_fill_keeps_deadline_while_binding_selected_page(monkeypatch
     page = MagicMock()
     page.is_closed.return_value = False
     relay = SimpleNamespace(connected=True, request=AsyncMock())
-    runtime = BrowserExtensionRuntime(relay, SimpleNamespace(scoped_tab_id_for_target=lambda target: 42))
+    runtime = BrowserExtensionRuntime(
+        relay, SimpleNamespace(scoped_tab_id_for_target=lambda target: 42, set_tab_reconnect_listener=MagicMock())
+    )
     clock = [100.0]
     monkeypatch.setattr(runtime_module, "time", SimpleNamespace(time=lambda: clock[0]))
 

@@ -19,6 +19,7 @@ import pytest
 from skyvern.forge import app
 from skyvern.forge.sdk.artifact.manager import ArtifactManager
 from skyvern.forge.sdk.core import skyvern_context
+from skyvern.forge.sdk.workflow.exceptions import InsecureCodeDetected
 from skyvern.schemas.workflows import BlockType
 from skyvern.services.script_service import _create_video_artifact, _create_workflow_block_run_and_task, run_script
 from skyvern.webeye.browser_artifacts import BrowserArtifacts, VideoArtifact
@@ -47,6 +48,7 @@ def _reset_skyvern_context():
 
 def _write_script(tmp_path: Path, body: str) -> str:
     path = tmp_path / "user_script.py"
+    path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(body)
     return str(path)
 
@@ -63,6 +65,11 @@ async def test_cached_script_container_task_stamps_started_at(monkeypatch: pytes
     database.tasks.update_task = AsyncMock(return_value=created_task)
     database.tasks.create_step = AsyncMock(return_value=step)
     monkeypatch.setattr(app, "DATABASE", database)
+    run_context = MagicMock(resolve_noted_block_system_prompt=MagicMock(return_value=None))
+    run_context.cancel_failure_evidence_capture = AsyncMock()
+    monkeypatch.setattr(
+        app, "WORKFLOW_CONTEXT_MANAGER", MagicMock(get_workflow_run_context=MagicMock(return_value=run_context))
+    )
     create_video_artifact = AsyncMock()
     take_screenshot = AsyncMock()
     monkeypatch.setattr("skyvern.services.script_service._create_video_artifact", create_video_artifact)
@@ -81,17 +88,49 @@ async def test_cached_script_container_task_stamps_started_at(monkeypatch: pytes
 
 
 @pytest.mark.asyncio
-async def test_run_script_standalone_success_runs_terminal_cleanup(
+async def test_run_script_ignores_sources_from_other_revisions_and_runs_cleanup(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
     manager = MagicMock()
     manager.cleanup_for_script = AsyncMock()
     monkeypatch.setattr(app, "BROWSER_MANAGER", manager)
-    path = _write_script(tmp_path, SUCCESS_SCRIPT)
+    current_revision = tmp_path / "current_revision"
+    path = _write_script(current_revision, SUCCESS_SCRIPT)
+    old_revision = tmp_path / "old_revision"
+    old_revision.mkdir()
+    (old_revision / "stale.py").write_text("import types\n")
 
     await run_script(path, script_id="scr_1", organization_id="org_1", browser_session_id="sess_1")
 
     manager.cleanup_for_script.assert_awaited_once_with("scr_1", browser_session_id="sess_1", organization_id="org_1")
+
+
+@pytest.mark.asyncio
+async def test_run_script_revalidates_stored_script_before_execution(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    monkeypatch.setattr("skyvern.services.script_service.ensure_in_process_script_execution_allowed", AsyncMock())
+    path = _write_script(tmp_path, "import types\n")
+
+    with pytest.raises(InsecureCodeDetected, match="stored script safety validation failed"):
+        await run_script(path, script_id="scr_1")
+
+
+@pytest.mark.asyncio
+async def test_run_script_revalidates_sibling_python_sources_before_execution(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    monkeypatch.setattr("skyvern.services.script_service.ensure_in_process_script_execution_allowed", AsyncMock())
+    current_revision = tmp_path / "current_revision"
+    path = _write_script(
+        current_revision, "import helper\n\nasync def run_workflow(parameters=None):\n    return helper.VALUE\n"
+    )
+    monkeypatch.syspath_prepend(str(current_revision))
+    helper_path = current_revision / "helper.py"
+    helper_path.write_text("import types\nVALUE = True\n")
+
+    with pytest.raises(InsecureCodeDetected, match="stored script safety validation failed"):
+        await run_script(path, script_id="scr_1")
 
 
 @pytest.mark.asyncio
@@ -152,7 +191,12 @@ async def test_run_script_failure_with_release_failure_preserves_script_error(
     path = _write_script(tmp_path, FAILING_SCRIPT)
 
     with pytest.raises(RuntimeError, match="script boom"):
-        await run_script(path, script_id="scr_1", organization_id="org_1", browser_session_id="sess_1")
+        await run_script(
+            path,
+            script_id="scr_1",
+            organization_id="org_1",
+            browser_session_id="sess_1",
+        )
 
     sessions.release_browser_session.assert_awaited_once()  # cleanup ran and swallowed the release failure
     assert "scr_1" not in manager.pages  # the page was still reclaimed
@@ -174,12 +218,17 @@ async def test_run_script_persistent_session_closes_reusable_and_releases(monkey
     order.attach_mock(state.close, "close")
     order.attach_mock(sessions.release_browser_session, "release")
     path = _write_script(tmp_path, SUCCESS_SCRIPT)
-    await run_script(path, script_id="scr_1", organization_id="org_1", browser_session_id="sess_1")
+    await run_script(
+        path,
+        script_id="scr_1",
+        organization_id="org_1",
+        browser_session_id="sess_1",
+    )
     state.close.assert_awaited_once_with(close_browser_on_completion=False, release_driver=False)
     sessions.release_browser_session.assert_awaited_once_with(
         session_id="sess_1",
         organization_id="org_1",
-        expected_runnable_id=None,
+        expected_runnable_id="scr_1",
         expected_runnable_generation_id=None,
         expected_browser_state=None,
     )

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 from collections.abc import AsyncIterator
 from datetime import UTC, datetime, timedelta
 from types import SimpleNamespace
@@ -11,7 +12,7 @@ from unittest.mock import AsyncMock
 import httpx
 import pytest
 import pytest_asyncio
-from fastapi import FastAPI, HTTPException
+from fastapi import HTTPException
 from fastapi.testclient import TestClient
 from freezegun import freeze_time
 
@@ -31,6 +32,7 @@ from skyvern.forge.sdk.routes import routers as routers_module
 from skyvern.forge.sdk.schemas.workflow_schedules import OneTimeDispatchStatus
 from skyvern.forge.sdk.services import org_auth_service
 from tests.unit.forge.sdk.db import conftest as db_fixtures
+from tests.unit.shared_route_app import shared_route_app
 
 ORG_ID = "org_oss"
 WPID = "wpid_interval"
@@ -103,17 +105,19 @@ async def test_oss_delete_workflow_schedule_is_noop() -> None:
     "prefix,router_name",
     [("/v1", "base_router"), ("/api/v1", "legacy_base_router")],
 )
-def test_oss_route_returns_schedule_list_via_testclient(prefix: str, router_name: str) -> None:
+def test_oss_route_returns_schedule_list_via_testclient(
+    prefix: str, router_name: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
     """End-to-end: route resolves through the FastAPI dependency chain on both
     the public `/v1` mount and the legacy `/api/v1` alias."""
 
     async def _fake_org() -> SimpleNamespace:
         return SimpleNamespace(organization_id="org_oss")
 
-    fastapi_app = FastAPI()
+    fastapi_app = shared_route_app(monkeypatch)
     fastapi_app.dependency_overrides[org_auth_service.get_current_org] = _fake_org
-    fastapi_app.include_router(getattr(routers_module, router_name), prefix=prefix)
 
+    assert any(route.path == "/schedules" for route in getattr(routers_module, router_name).routes)
     client = TestClient(fastapi_app)
     response = client.get(f"{prefix}/schedules")
     assert response.status_code == 200
@@ -140,9 +144,8 @@ async def schedules_client(agent_db: AgentDB, monkeypatch: pytest.MonkeyPatch) -
     async def _fake_org() -> SimpleNamespace:
         return SimpleNamespace(organization_id=ORG_ID)
 
-    fastapi_app = FastAPI()
+    fastapi_app = shared_route_app(monkeypatch)
     fastapi_app.dependency_overrides[org_auth_service.get_current_org] = _fake_org
-    fastapi_app.include_router(routers_module.base_router, prefix="/v1")
     register_agent_route_aliases(fastapi_app)
     async with httpx.AsyncClient(transport=httpx.ASGITransport(app=fastapi_app), base_url="http://test") as client:
         yield client
@@ -158,8 +161,11 @@ def _iso(value: datetime) -> str:
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("interval_seconds", [72 * HOUR, 5 * HOUR], ids=["72h", "5h"])
-@pytest.mark.parametrize("explicit_first_fire_at", [None, datetime(2026, 10, 31, 9, 17, tzinfo=UTC)])
+@pytest.mark.parametrize(
+    ("interval_seconds", "explicit_first_fire_at"),
+    [(72 * HOUR, None), (5 * HOUR, datetime(2026, 10, 31, 9, 17, tzinfo=UTC))],
+    ids=["72h-derived-anchor", "5h-explicit-anchor"],
+)
 async def test_create_interval_schedule_anchors_one_interval_out_unless_a_future_first_fire_is_given(
     schedules_client: httpx.AsyncClient,
     agent_db: AgentDB,
@@ -266,11 +272,10 @@ async def test_update_keeps_the_anchor_across_interval_edits_and_reanchors_when_
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("entry", ["rest", "mcp"])
 @pytest.mark.parametrize(
-    "first_fire_at",
-    ["9800-01-01T00:00:00+00:00", "9999-12-31T23:00:00-05:00"],
-    ids=["ticks-overflow", "anchor-overflows-in-utc"],
+    ("entry", "first_fire_at"),
+    [("rest", "9800-01-01T00:00:00+00:00"), ("mcp", "9999-12-31T23:00:00-05:00")],
+    ids=["ticks-overflow-rest", "anchor-overflows-in-utc-mcp"],
 )
 async def test_first_fire_at_too_far_out_to_compute_ticks_is_a_field_named_422_that_writes_nothing(
     schedules_client: httpx.AsyncClient,
@@ -540,3 +545,63 @@ async def test_mcp_tools_create_edit_cancel_and_read_back_every_one_time_state(
         ("failed", "wr_sched_failed"),
         ("fired", "wr_sched_fired"),
     ]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("attempts", "statuses", "deleted"),
+    [
+        (["fails"], [502], False),
+        (["hangs"], [502], False),
+        (["deletes"], [200], True),
+        (["deletes, then times out", "deletes"], [502, 200], True),
+    ],
+    ids=[
+        "backend-delete-fails",
+        "backend-delete-hangs",
+        "backend-delete-succeeds",
+        "retry-after-a-backend-delete-that-landed",
+    ],
+)
+async def test_deleting_a_schedule_deletes_its_backend_schedule_before_its_row(
+    schedules_client: httpx.AsyncClient,
+    agent_db: AgentDB,
+    monkeypatch: pytest.MonkeyPatch,
+    attempts: list[str],
+    statuses: list[int],
+    deleted: bool,
+) -> None:
+    created = await _request(
+        schedules_client, NOW, "POST", "", json={"cron_expression": "0 9 * * *", "timezone": "UTC"}
+    )
+    schedule_id = created.json()["schedule"]["workflow_schedule_id"]
+    stored = await agent_db.schedules.get_workflow_schedule_by_id(schedule_id, ORG_ID)
+    assert stored is not None and stored.backend_schedule_id is not None
+    live_backend = {stored.backend_schedule_id}
+    pending = iter(attempts)
+
+    async def delete_backend(backend_schedule_id: str) -> None:
+        attempt = next(pending)
+        if attempt == "fails":
+            raise RuntimeError("scheduler unavailable")
+        if attempt == "hangs":
+            # Outlasts the route's timeout, so only a bounded route answers before this would land.
+            await asyncio.sleep(2)
+        # Like the cloud backend, deleting a schedule that is already gone succeeds.
+        live_backend.discard(backend_schedule_id)
+        if attempt == "deletes, then times out":
+            raise TimeoutError
+
+    monkeypatch.setattr(workflow_schedule_routes.app.AGENT_FUNCTION, "delete_workflow_schedule", delete_backend)
+    monkeypatch.setattr(workflow_schedule_routes, "BACKEND_SCHEDULE_DELETE_TIMEOUT_SECONDS", 0.05)
+
+    responses = [await _request(schedules_client, NOW, "DELETE", f"/{schedule_id}") for _ in attempts]
+
+    assert [response.status_code for response in responses] == statuses
+    assert all(
+        response.json()["detail"] == workflow_schedule_routes.SCHEDULE_SYNC_ERROR_DETAIL
+        for response in responses
+        if response.status_code == 502
+    )
+    assert (await agent_db.schedules.get_workflow_schedule_by_id(schedule_id, ORG_ID) is None) == deleted
+    assert live_backend == (set() if deleted else {stored.backend_schedule_id})

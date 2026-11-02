@@ -8,6 +8,7 @@ browser session.
 from __future__ import annotations
 
 import asyncio
+import copy
 import functools
 import inspect
 import json
@@ -21,6 +22,7 @@ from pydantic import Field
 
 from skyvern.client.errors import BadRequestError, NotFoundError
 from skyvern.forge.sdk.copilot.code_block_steps import derive_code_block_steps
+from skyvern.forge.sdk.workflow.block_notes import block_labels, carry_forward_block_notes
 from skyvern.forge.sdk.workflow.models.parameter import (
     ParameterType,
     WorkflowParameterType,
@@ -45,11 +47,13 @@ from ._workflow_http import (
     update_workflow_folder_raw,
     update_workflow_raw,
 )
-from .response import MCP_MAX_RESPONSE_CHARS, _response_size
+from .response import MCP_MAX_RESPONSE_BYTES, MCP_MAX_RESPONSE_CHARS, _response_size, within_response_limits
 
 LOG = structlog.get_logger()
 _SUMMARY_TOP_LEVEL_KEY_LIMIT = 8
 _SUMMARY_SCALAR_PREVIEW_LIMIT = 3
+_SUMMARY_DOWNLOAD_DETAIL_LIMIT = 20
+_SUMMARY_DOWNLOAD_DETAIL_BUDGET_CHARS = 6_000
 _SUMMARY_ARTIFACT_PREVIEW_LIMIT = 4
 _SUMMARY_STRING_PREVIEW_LIMIT = 120
 _SUMMARY_RECURSION_LIMIT = 10
@@ -61,6 +65,25 @@ _SCREENSHOT_ARTIFACT_ID_KEYS = frozenset({"task_screenshot_artifact_ids", "workf
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
+
+
+def _notes_kept_by_server(json_def: dict[str, Any] | None, yaml_def: str | None, saved: dict[str, Any]) -> list[str]:
+    """Labels whose saved notes or description the server kept because the submitted definition omitted them."""
+    try:
+        submitted = json_def if json_def is not None else safe_load_no_dates(yaml_def or "")
+    except yaml.YAMLError:
+        return []
+    submitted_blocks = (
+        (submitted.get("workflow_definition") or {}).get("blocks") if isinstance(submitted, dict) else None
+    )
+    saved_blocks = (saved.get("workflow_definition") or {}).get("blocks")
+    if not isinstance(submitted_blocks, list) or not isinstance(saved_blocks, list):
+        return []
+    return list(
+        carry_forward_block_notes(
+            copy.deepcopy(submitted_blocks), saved_blocks, same_step_labels=block_labels(submitted_blocks)
+        )
+    )
 
 
 def _serialize_workflow(wf: Any) -> dict[str, Any]:
@@ -231,10 +254,9 @@ def _note_artifact_ids(stats: dict[str, Any], values: list[Any]) -> None:
 
 
 def _scan_output_value(value: Any, stats: dict[str, Any], depth: int = 0) -> None:
+    # Callers pass a tree _jsonable already converted; converting per level would copy each subtree once per ancestor.
     if depth > _SUMMARY_RECURSION_LIMIT:
         return
-
-    value = _jsonable(value)
 
     if isinstance(value, dict):
         for key, nested_value in value.items():
@@ -309,7 +331,50 @@ def _summarize_output_value(output_value: Any) -> tuple[dict[str, Any], dict[str
 _MISSING = object()
 
 
-def _summarize_artifacts(run: Any, output_stats: dict[str, Any] | None) -> dict[str, Any]:
+def _download_detail(file_info: Any) -> dict[str, Any]:
+    """Reduce a downloaded file to what makes it retrievable.
+
+    The signed URL is the only field a caller cannot rebuild from the rest of a
+    reduced payload, so a summary that drops it strands the file.
+    """
+    detail = {field: _jsonable(_get_value(file_info, field)) for field in ("url", "checksum", "filename")}
+    return {key: value for key, value in detail.items() if value}
+
+
+def _bounded_download_details(downloaded_files: list[Any]) -> list[dict[str, Any]]:
+    """Keep whole download entries within a fixed share of the response budget.
+
+    Signed URLs are long and a summary is also used per row in run lists, so the
+    list is capped by characters as well as by entry count. ``downloaded_file_count``
+    reports the true total when entries are left out.
+    """
+    details: list[dict[str, Any]] = []
+    spent = 0
+    for file_info in downloaded_files:
+        if len(details) >= _SUMMARY_DOWNLOAD_DETAIL_LIMIT:
+            break
+        detail = _download_detail(file_info)
+        if not detail:
+            continue
+        spent += _response_size(detail)
+        if spent > _SUMMARY_DOWNLOAD_DETAIL_BUDGET_CHARS:
+            break
+        details.append(detail)
+    return details
+
+
+def _summarize_artifacts(
+    run: Any,
+    output_stats: dict[str, Any] | None,
+    *,
+    include_download_details: bool = False,
+) -> dict[str, Any]:
+    """Summarize a run's artifacts.
+
+    ``include_download_details`` belongs to callers that drop ``downloaded_files``
+    from their payload; a caller that keeps the field verbatim would otherwise
+    carry every url and checksum twice.
+    """
     missing = _MISSING
     downloaded_files_value = _get_value(run, "downloaded_files", missing)
     screenshot_urls_value = _get_value(run, "screenshot_urls", missing)
@@ -335,10 +400,24 @@ def _summarize_artifacts(run: Any, output_stats: dict[str, Any] | None) -> dict[
     if filenames:
         summary["downloaded_file_names"] = filenames[:_SUMMARY_SCALAR_PREVIEW_LIMIT]
 
+    if include_download_details:
+        file_details = _bounded_download_details(downloaded_files)
+        if file_details:
+            summary["downloaded_files"] = file_details
+
     if output_stats and output_stats["artifact_ids_preview"]:
         summary["artifact_ids_preview"] = output_stats["artifact_ids_preview"]
 
     return summary
+
+
+_DOWNLOAD_REFERENCE_FIELDS = ("downloaded_file_count", "downloaded_files")
+
+
+def _download_reference(artifact_summary: Any) -> dict[str, Any]:
+    if not isinstance(artifact_summary, dict):
+        return {}
+    return {field: artifact_summary[field] for field in _DOWNLOAD_REFERENCE_FIELDS if field in artifact_summary}
 
 
 _RUN_LIST_DETAILS_HINT = (
@@ -361,7 +440,7 @@ def _serialize_run_summary(run: Any) -> dict[str, Any]:
         if output_value is _MISSING or output_value is None:
             output_value = None if outputs_value is _MISSING else outputs_value
         output_summary, output_stats = _summarize_output_value(output_value)
-    artifact_summary = _summarize_artifacts(run, output_stats)
+    artifact_summary = _summarize_artifacts(run, output_stats, include_download_details=True)
 
     summary: dict[str, Any] = {
         "run_id": run_id,
@@ -1980,6 +2059,12 @@ async def skyvern_workflow_update(
             )
 
     data = _serialize_workflow(workflow)
+    if notes_kept := _notes_kept_by_server(json_def, yaml_def, workflow):
+        data["notes_kept"] = notes_kept
+        data["notes_kept_message"] = (
+            "The definition omitted notes or descriptions on these blocks, so the saved ones were kept. "
+            "To delete one, send the field as null."
+        )
     fmt_label = "json_definition" if json_def is not None else "yaml_definition"
     data["sdk_equivalent"] = f"await skyvern.update_workflow({workflow_id!r}, {fmt_label}=<definition>)"
     if param_warnings:
@@ -2310,7 +2395,7 @@ async def skyvern_workflow_status(
         return payload
 
     result = make_result("skyvern_workflow_status", data=_payload_for(verbosity), timing_ms=timer.timing_ms)
-    if _response_size(result) <= MCP_MAX_RESPONSE_CHARS:
+    if within_response_limits(result):
         return result
 
     # The generic size cap preserves only top-level `ok`/`error`/`*_id`, and this result
@@ -2318,26 +2403,39 @@ async def skyvern_workflow_status(
     # caller nothing to act on. Degrade to the compact payload instead; the full output is
     # still retrievable over the HTTP API, which is not capped.
     oversized_warning = (
-        f"Full output exceeded the {MCP_MAX_RESPONSE_CHARS}-char MCP response limit; "
-        f"returning a reduced payload. Fetch the full run over the HTTP API at /v1/runs/{run_id}."
+        f"Full output exceeded the MCP response size limit ({MCP_MAX_RESPONSE_CHARS} chars / "
+        f"{MCP_MAX_RESPONSE_BYTES} bytes); returning a reduced payload. "
+        f"Fetch the full run over the HTTP API at /v1/runs/{run_id}."
     )
+    summary_data = _payload_for("summary")
     summary_result = make_result(
         "skyvern_workflow_status",
-        data=_payload_for("summary"),
+        data=summary_data,
         timing_ms=timer.timing_ms,
         warnings=[oversized_warning],
     )
-    if _response_size(summary_result) <= MCP_MAX_RESPONSE_CHARS:
+    if within_response_limits(summary_result):
         return summary_result
 
     # The summary is itself unbounded — it copies fields like failure_reason verbatim. Fall
-    # back to the identifiers a poller needs so it never lands in the stripped envelope.
-    summary_data = _payload_for("summary")
+    # back to the identifiers a poller needs so it never lands in the stripped envelope,
+    # plus the download references, which are otherwise unreachable over MCP.
     minimal: dict[str, Any] = {"run_id": run_id, "status": summary_data.get("status")}
     if run_id.startswith("wr_"):
         minimal["sdk_equivalent"] = f"await skyvern_workflow_status(run_id={run_id!r}, verbosity='summary')"
     else:
         minimal["sdk_equivalent"] = f"await skyvern.get_run({run_id!r})"
+
+    downloads = _download_reference(summary_data.get("artifact_summary"))
+    if downloads:
+        with_downloads = make_result(
+            "skyvern_workflow_status",
+            data={**minimal, "artifact_summary": downloads},
+            timing_ms=timer.timing_ms,
+            warnings=[oversized_warning],
+        )
+        if within_response_limits(with_downloads):
+            return with_downloads
     return make_result(
         "skyvern_workflow_status",
         data=minimal,

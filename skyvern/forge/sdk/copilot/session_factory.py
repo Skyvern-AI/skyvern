@@ -10,6 +10,7 @@ from pathlib import Path
 from typing import Any
 
 import structlog
+from agents.items import TResponseInputItem
 from agents.memory.sqlite_session import SQLiteSession
 from agents.run_config import CallModelData, ModelInputData
 from agents.run_context import RunContextWrapper
@@ -24,10 +25,13 @@ from skyvern.forge.sdk.agents.context import (
     replace_agent_message_field,
 )
 from skyvern.forge.sdk.copilot.browser_ablation import prompt_sha256
+from skyvern.forge.sdk.copilot.cache_envelope import is_replayable_reasoning
+from skyvern.forge.sdk.copilot.config import SCREENSHOT_DROPPED_NUDGE
 from skyvern.forge.sdk.copilot.enforcement import (
     _RECENT_TOOL_OUTPUT_CHAR_CAP,
     _TOOL_OUTPUT_HEAD_TRUNCATION_SUFFIX,
     KEEP_RECENT_TOOL_OUTPUTS,
+    NUDGE_SENTINEL,
     SCREENSHOT_PLACEHOLDER,
     TOKEN_BUDGET,
     _summarize_tool_arguments,
@@ -38,6 +42,7 @@ from skyvern.forge.sdk.copilot.enforcement import (
     is_screenshot_message,
     is_synthetic_user_message,
     log_recent_tool_output_truncation,
+    pending_screenshot_entry,
     pending_screenshot_message,
     unread_tool_output_indices,
 )
@@ -220,14 +225,23 @@ def _run_context(data: CallModelData[Any]) -> Any:
     return data.context.context if isinstance(data.context, RunContextWrapper) else data.context
 
 
+def _is_unsent_reasoning(item: TResponseInputItem) -> bool:
+    # Copilot never sets ModelSettings.reasoning, so a reasoning item reaches the request only as replayed summary
+    # text or GPT's encrypted reasoning; a signature-only one (Claude's default thinking display) sends nothing and
+    # must not use up the budget.
+    if get_agent_message_field(item, "type") != "reasoning" or is_replayable_reasoning(item):
+        return False
+    return not any(get_agent_message_field(part, "text") for part in get_agent_message_field(item, "summary") or [])
+
+
 def _copilot_call_model_input_filter(data: CallModelData[Any], *, token_budget: int) -> ModelInputData:
-    items = list(data.model_data.input)
+    # Compacted up front so the sharp-copy budget check below sees the input the budget filter will.
+    items = _compact_tool_items([item for item in data.model_data.input if not _is_unsent_reasoning(item)])
     ctx = _run_context(data)
     # Read-only peek: the end-of-turn drain in enforcement stays the only clear, so a provider
     # retry or model fallback re-running this filter still carries the frame.
     screenshot_msg = pending_screenshot_message(ctx)
-    pending = getattr(ctx, "pending_screenshots", None)
-    entry = pending[0] if isinstance(pending, list) and pending else None
+    entry = pending_screenshot_entry(ctx)
     if (
         screenshot_msg is not None
         and entry is not None
@@ -237,8 +251,7 @@ def _copilot_call_model_input_filter(data: CallModelData[Any], *, token_budget: 
         lease = getattr(ctx, "pending_frame_lease", None)
         if isinstance(lease, PendingFrameLease) and lease.capture_event_id == entry.capture_event_id:
             if lease.input_fingerprint != fingerprint:
-                if isinstance(pending, list):
-                    pending.clear()
+                ctx.pending_screenshots.clear()
                 ctx.pending_frame_lease = None
                 screenshot_msg = None
                 LOG.info(
@@ -253,10 +266,19 @@ def _copilot_call_model_input_filter(data: CallModelData[Any], *, token_budget: 
                 input_fingerprint=fingerprint,
             )
     if screenshot_msg is not None:
+        sharp_msg = pending_screenshot_message(ctx, sharp=True)
+        # The sharp copy may cost older screenshots, which budget pruning drops first anyway, but nothing else.
+        if sharp_msg is not None and estimate_tokens(_drop_older_screenshots([*items, sharp_msg])) <= token_budget:
+            screenshot_msg = sharp_msg
+        else:
+            LOG.info("copilot_sharp_frame_over_budget")
         LOG.info(
             "Injecting screenshot user message",
             count=len(screenshot_msg["content"]) - 1,
             path="model_input_filter",
+            source_tool=entry.provenance.source_tool if entry else None,
+            capture_id=entry.capture_id if entry else None,
+            capture_event_id=entry.capture_event_id if entry else None,
         )
         items.append(screenshot_msg)
 
@@ -290,7 +312,11 @@ def _captured_authoring_capability(ctx: AgentContext | None) -> dict[str, bool] 
     if ctx is None:
         return None
     capability = _copilot_authoring_capability(ctx)
-    return {"code_blocks": capability.code_blocks, "agent_blocks": capability.agent_blocks}
+    return {
+        "code_blocks": capability.code_blocks,
+        "agent_blocks": capability.agent_blocks,
+        "agent_step": capability.agent_step,
+    }
 
 
 def _maybe_dump_model_input(data: CallModelData[Any], model_data: ModelInputData) -> None:
@@ -358,7 +384,8 @@ def _filter_to_budget(items: list[Any], instructions: str | None, *, token_budge
        then replace the latest unread outputs that do not fit with a notice that the call ran.
     3. If still over budget: truncate ALL tool outputs — first to 2000 chars,
        then to 300 only if the softer pass was not enough.
-    4. If still over budget: aggressive prune as last resort.
+    4. If still over budget: aggressive prune as last resort, keeping the most recent screenshot unless
+       it predates every step the prune keeps.
     """
     if not items:
         return ModelInputData(input=items, instructions=instructions)
@@ -379,13 +406,7 @@ def _filter_to_budget(items: list[Any], instructions: str | None, *, token_budge
         return ModelInputData(input=items, instructions=instructions)
 
     # Layer 2: Drop all screenshots except the most recent
-    screenshot_indices = [i for i, item in enumerate(items) if is_screenshot_message(item)]
-    if len(screenshot_indices) > 1:
-        drop_indices = set(screenshot_indices[:-1])
-        items = [
-            {"role": "user", "content": SCREENSHOT_PLACEHOLDER} if i in drop_indices else item
-            for i, item in enumerate(items)
-        ]
+    items = _drop_older_screenshots(items)
 
     est = estimate_tokens(items)
     if est <= token_budget:
@@ -430,11 +451,66 @@ def _filter_to_budget(items: list[Any], instructions: str | None, *, token_budge
         budget=token_budget,
         unread_count=len(unread_tool_output_indices(items)),
     )
-    items = aggressive_prune(items)
+    demonstration_call_ids = {
+        call_id
+        for item in items
+        if isinstance(call_id := get_agent_message_field(item, "call_id"), str)
+        and call_id.startswith("call_demo_")
+        and get_agent_message_field(item, "type") == "function_call"
+    }
+    frame = next((item for item in reversed(items[1:]) if _screenshot_with_image(item)), None)
+    pruned = aggressive_prune(items)
+    # The prune drops every screenshot and appends a re-take note, or keeps an earlier note instead of adding one.
+    # A frame newer than the oldest kept step goes back in its input position without any note older than it; an
+    # older frame stays dropped because the steps taken after it were cut.
+    position = {id(item): index for index, item in enumerate(items)}
+    oldest_kept = next((position[id(item)] for item in pruned[1:] if id(item) in position), None)
+    if frame is not None and (oldest_kept is None or position[id(frame)] > oldest_kept):
+        retake_note = NUDGE_SENTINEL + SCREENSHOT_DROPPED_NUDGE
+        pruned = sorted(
+            (
+                item
+                for item in [*pruned, frame]
+                if id(item) in position
+                and (
+                    position[id(item)] > position[id(frame)] or get_agent_message_field(item, "content") != retake_note
+                )
+            ),
+            key=lambda item: position[id(item)],
+        )
+    items = pruned
+    retained_demonstration_call_ids = {
+        call_id
+        for item in items
+        if isinstance(call_id := get_agent_message_field(item, "call_id"), str)
+        and call_id in demonstration_call_ids
+        and get_agent_message_field(item, "type") == "function_call"
+    }
+    omitted_demonstration_calls = len(demonstration_call_ids - retained_demonstration_call_ids)
+    if omitted_demonstration_calls:
+        items.append(
+            {
+                "role": "user",
+                "content": (
+                    NUDGE_SENTINEL
+                    + f"{omitted_demonstration_calls} earlier demonstrated step fact packet(s) were omitted "
+                    "because the model input exceeded its token budget."
+                ),
+            }
+        )
 
     est = estimate_tokens(items)
     LOG.info("Final token estimate after aggressive prune", tokens=est)
     return ModelInputData(input=items, instructions=instructions)
+
+
+def _drop_older_screenshots(items: list[Any]) -> list[Any]:
+    screenshot_indices = [i for i, item in enumerate(items) if is_screenshot_message(item)]
+    drop_indices = set(screenshot_indices[:-1])
+    return [
+        {"role": "user", "content": SCREENSHOT_PLACEHOLDER} if i in drop_indices else item
+        for i, item in enumerate(items)
+    ]
 
 
 def _truncate_tool_output(item: Any, max_chars: int) -> Any:

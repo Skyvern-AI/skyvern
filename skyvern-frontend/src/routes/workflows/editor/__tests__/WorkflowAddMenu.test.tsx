@@ -13,7 +13,6 @@ import {
 
 import type { RadialMenuItem } from "@/components/RadialMenu";
 import { DebugStoreContext } from "@/store/DebugStoreContext";
-import { useRecordingStore } from "@/store/useRecordingStore";
 import { useSettingsStore } from "@/store/SettingsStore";
 
 const radialMenuMock = vi.fn(({ children }: { children: React.ReactNode }) => (
@@ -28,7 +27,6 @@ vi.mock("@/components/RadialMenu", () => ({
 import { WorkflowAddMenu } from "../WorkflowAddMenu";
 
 const initialSettings = useSettingsStore.getState();
-const initialRecording = useRecordingStore.getState();
 
 function renderInDebugMode() {
   return render(
@@ -70,21 +68,20 @@ function lastItems(): RadialMenuItem[] {
 }
 
 function recordTaskItem(items: RadialMenuItem[]) {
-  return items.find((i) => i.text === "Record Task");
+  return items.find((i) => i.text === "Demonstrate task");
 }
 
-describe("WorkflowAddMenu — Record Task item visibility/enabled state", () => {
+describe("WorkflowAddMenu — Demonstrate task item visibility/enabled state", () => {
   beforeEach(() => {
     radialMenuMock.mockClear();
   });
 
   afterEach(() => {
     useSettingsStore.setState(initialSettings, true);
-    useRecordingStore.setState(initialRecording, true);
     cleanup();
   });
 
-  it("does NOT show the Record Task item when no session is using or loading (CORR-1 regression guard)", () => {
+  it("does NOT show the Demonstrate task item when no session is using or loading (CORR-1 regression guard)", () => {
     useSettingsStore.getState().setIsUsingABrowser(false);
     useSettingsStore.getState().setIsLoadingABrowser(false);
 
@@ -93,7 +90,7 @@ describe("WorkflowAddMenu — Record Task item visibility/enabled state", () => 
     expect(recordTaskItem(lastItems())).toBeUndefined();
   });
 
-  it("shows the Record Task item as DISABLED while a session is loading", () => {
+  it("shows the Demonstrate task item as DISABLED while a session is loading", () => {
     useSettingsStore.getState().setIsUsingABrowser(false);
     useSettingsStore.getState().setIsLoadingABrowser(true);
 
@@ -104,28 +101,15 @@ describe("WorkflowAddMenu — Record Task item visibility/enabled state", () => 
     expect(item?.enabled).toBe(false);
   });
 
-  it("shows the Record Task item as ENABLED once the browser is ready and not recording", () => {
+  it("shows the Demonstrate task item as ENABLED once the browser is ready", () => {
     useSettingsStore.getState().setIsUsingABrowser(true);
     useSettingsStore.getState().setIsLoadingABrowser(false);
-    useRecordingStore.setState({ isRecording: false });
 
     renderInDebugMode();
 
     const item = recordTaskItem(lastItems());
     expect(item).toBeDefined();
     expect(item?.enabled).toBe(true);
-  });
-
-  it("disables the Record Task item while recording is in progress, even when isUsingABrowser is true", () => {
-    useSettingsStore.getState().setIsUsingABrowser(true);
-    useSettingsStore.getState().setIsLoadingABrowser(false);
-    useRecordingStore.setState({ isRecording: true });
-
-    renderInDebugMode();
-
-    const item = recordTaskItem(lastItems());
-    expect(item).toBeDefined();
-    expect(item?.enabled).toBe(false);
   });
 });
 
@@ -136,14 +120,12 @@ describe("WorkflowAddMenu — menu visibility gate", () => {
 
   afterEach(() => {
     useSettingsStore.setState(initialSettings, true);
-    useRecordingStore.setState(initialRecording, true);
     cleanup();
   });
 
   it("renders the radial menu in the studio editor (blockRunsEnabled) even when not in debug mode", () => {
     useSettingsStore.getState().setIsUsingABrowser(true);
     useSettingsStore.getState().setIsLoadingABrowser(false);
-    useRecordingStore.setState({ isRecording: false });
 
     const { getByTestId } = renderWithScope({
       isDebugMode: false,

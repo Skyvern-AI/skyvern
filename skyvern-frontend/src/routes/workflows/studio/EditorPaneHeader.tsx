@@ -1,9 +1,16 @@
+import { useWorkflowDocEditorFlag } from "@/hooks/useWorkflowDocEditorFlag";
+import { useWorkflowPermanentId } from "@/routes/workflows/WorkflowPermanentIdContext";
+import {
+  useWorkflowPresentationStore,
+  type WorkflowPresentation,
+} from "@/store/WorkflowPresentationStore";
 import {
   CodeIcon,
+  FileTextIcon,
   EyeOpenIcon,
   MagnifyingGlassIcon,
 } from "@radix-ui/react-icons";
-import { useMemo, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 
 import {
   Command,
@@ -24,6 +31,7 @@ import {
   useWorkflowYamlEditorStore,
 } from "@/store/WorkflowYamlEditorStore";
 import { useWorkflowBlockSearchStore } from "@/store/WorkflowBlockSearchStore";
+import { useWorkflowPanelStore } from "@/store/WorkflowPanelStore";
 
 import { filterBlockSearchTargets } from "./blockSearch";
 import { PANE_HEADER_ICON_BUTTON_CLASS, studioPanelId } from "./constants";
@@ -32,17 +40,39 @@ import { useStudioPaneCompact } from "./StudioShellContext";
 import { ViewToggle } from "./ViewToggle";
 
 /**
- * Editor pane header chrome: the Visual/YAML mode toggle, the same segmented
- * ViewToggle pair the other pane strips use. Entry is registered by the
+ * Editor pane header chrome uses the segmented ViewToggle controls. Entry is registered by the
  * embedded Workspace (it owns the canvas→YAML serialization); exit is the
  * store's shared commit-on-switch flow. Hidden for read-only (global)
  * workflows, which never register an entry point.
  */
 export function EditorPaneModeToggle() {
   const compact = useStudioPaneCompact();
+  const docEnabled = useWorkflowDocEditorFlag();
+  const workflowPermanentId = useWorkflowPermanentId() ?? null;
+  const storedPresentation = useWorkflowPresentationStore(
+    (s) => s.presentation,
+  );
+  // Version comparison replaces the canvas, so the Doc can't show there.
+  const comparing = useWorkflowPanelStore((s) =>
+    Boolean(s.workflowPanelState.data?.showComparison),
+  );
+  const presentation = comparing ? "visual" : storedPresentation;
+  useEffect(() => {
+    useWorkflowPresentationStore
+      .getState()
+      .syncScope(workflowPermanentId, docEnabled);
+  }, [workflowPermanentId, docEnabled]);
   const active = useWorkflowYamlEditorStore((s) => s.active);
   const committing = useWorkflowYamlEditorStore((s) => s.committing);
   const enterYamlMode = useWorkflowYamlEditorStore((s) => s.enterYamlMode);
+  const switchPresentation = async (next: WorkflowPresentation) => {
+    if (committing || (!active && storedPresentation === next)) return;
+    const generation = useWorkflowPresentationStore.getState().generation;
+    if (active && !(await commitYamlDraft(false))) return;
+    const state = useWorkflowPresentationStore.getState();
+    // Navigation or flag changes during a commit invalidate the old click.
+    if (state.generation === generation) state.setPresentation(next);
+  };
   if (!enterYamlMode) {
     return null;
   }
@@ -54,16 +84,8 @@ export function EditorPaneModeToggle() {
         className="flex shrink-0 items-center gap-1"
       >
         <ViewToggle
-          active={!active}
-          // Only the inactive segment acts: re-committing from Visual or
-          // re-entering from YAML would reserialize the canvas and discard the
-          // in-progress YAML draft (the old YamlModeToggle omitted the handler
-          // on the active segment for the same reason).
-          onClick={() => {
-            if (active) {
-              void commitYamlDraft(false);
-            }
-          }}
+          active={!active && (!docEnabled || presentation === "visual")}
+          onClick={() => void switchPresentation("visual")}
           disabled={committing}
           compact={compact}
           label="Visual"
@@ -81,6 +103,16 @@ export function EditorPaneModeToggle() {
           label="YAML"
           icon={<CodeIcon className="h-3 w-3" />}
         />
+        {docEnabled && !comparing && (
+          <ViewToggle
+            active={!active && presentation === "doc"}
+            onClick={() => void switchPresentation("doc")}
+            disabled={committing}
+            compact={compact}
+            label="Doc"
+            icon={<FileTextIcon className="h-3 w-3" />}
+          />
+        )}
       </div>
     </>
   );
@@ -98,11 +130,15 @@ export function EditorPaneBlockSearch() {
   const [paneBoundary, setPaneBoundary] = useState<Element | null>(null);
   const handle = useWorkflowBlockSearchStore((s) => s.handle);
   const yamlModeActive = useWorkflowYamlEditorStore((s) => s.active);
+  const presentation = useWorkflowPresentationStore((s) => s.presentation);
+  const comparing = useWorkflowPanelStore((s) =>
+    Boolean(s.workflowPanelState.data?.showComparison),
+  );
   const targets = useMemo(
     () => (open && handle ? handle.getTargets() : []),
     [open, handle],
   );
-  if (!handle || yamlModeActive) {
+  if (!handle || yamlModeActive || (presentation === "doc" && !comparing)) {
     return null;
   }
   const results = filterBlockSearchTargets(targets, query);

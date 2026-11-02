@@ -13,7 +13,7 @@ import operator
 import re
 import warnings
 from collections.abc import AsyncIterator, Callable, Mapping
-from contextlib import asynccontextmanager
+from contextlib import asynccontextmanager, nullcontext
 from datetime import UTC
 from datetime import date as stdlib_date
 from datetime import datetime
@@ -29,6 +29,7 @@ import pytest
 from playwright.async_api import Error as PlaywrightError
 from playwright.async_api import Page
 from playwright.async_api import TimeoutError as PlaywrightTimeoutError
+from structlog.testing import capture_logs
 
 import skyvern.forge.sdk.copilot.code_block_security as code_block_security
 import skyvern.forge.sdk.workflow.models.block as block_module
@@ -82,6 +83,7 @@ from skyvern.webeye import dialog_handler
 from skyvern.webeye.actions.action_types import ActionType
 from skyvern.webeye.browser_artifacts import BrowserArtifacts
 from skyvern.webeye.skycdp.errors import CdpError
+from tests.unit._task_block_fakes import run_bound_browser_state
 from tests.unit.conftest import (
     FakeClearingBrowserContext,
     FakeSearchBrowserContext,
@@ -258,22 +260,64 @@ def datetime_facade_defects(namespace: SimpleNamespace, sandbox_builtins: Mappin
 # ---------------------------------------------------------------------------
 
 
-class TestIsSafeCodeRejectsImports:
-    def test_import_os(self) -> None:
-        with pytest.raises(InsecureCodeDetected, match="import"):
-            CodeBlock.is_safe_code("import os")
+class TestIsSafeCodeImports:
+    @pytest.mark.parametrize(
+        "code",
+        [
+            "import os",
+            "import subprocess",
+            "from os import system",
+            "import re, os",
+            "import datetime.timezone",
+            "from . import re",
+            "from re import *",
+            "from re import _compile",
+            "import re as __builtins__",
+            "from json import loads as __capture_locals",
+        ],
+    )
+    def test_rejects_imports_beyond_the_sandbox_modules(self, code: str) -> None:
+        with pytest.raises(InsecureCodeDetected, match="import|private"):
+            CodeBlock.is_safe_code(code)
 
-    def test_import_subprocess(self) -> None:
-        with pytest.raises(InsecureCodeDetected, match="import"):
-            CodeBlock.is_safe_code("import subprocess")
+    @pytest.mark.parametrize(
+        "code",
+        [
+            "import asyncio",
+            "import re",
+            "import json as j",
+            "from datetime import date, timedelta",
+            "from html import escape",
+        ],
+    )
+    def test_admits_imports_of_the_sandbox_modules(self, code: str) -> None:
+        CodeBlock.is_safe_code(code)
 
-    def test_from_import(self) -> None:
-        with pytest.raises(InsecureCodeDetected, match="import"):
-            CodeBlock.is_safe_code("from os import system")
+    @pytest.mark.asyncio
+    async def test_an_admitted_import_binds_the_sandbox_shim(self) -> None:
+        code = """
+import re
+import json as j
+from datetime import date, timedelta
 
-    def test_import_asyncio(self) -> None:
-        with pytest.raises(InsecureCodeDetected, match="import"):
-            CodeBlock.is_safe_code("import asyncio")
+def next_day():
+    import datetime
+    return datetime.date(2026, 1, 1) + timedelta(days=1)
+
+return [re.search("b", "abc").group(0), j.dumps([1]), date(2026, 1, 1).isoformat(), next_day().isoformat()]
+"""
+        now = datetime.now(UTC)
+        output_parameter = OutputParameter(
+            parameter_type=ParameterType.OUTPUT,
+            key="imports_output",
+            output_parameter_id="op_imports",
+            workflow_id="w_test",
+            created_at=now,
+            modified_at=now,
+        )
+        block = CodeBlock(label="imports", code=code, output_parameter=output_parameter)
+        result = await block.generate_async_user_function(code, MagicMock(), parameters={"datetime": "param"})()
+        assert result == ["b", "[1]", "2026-01-01", "2026-01-02"]
 
 
 class TestIsSafeCodeRejectsDunderAccess:
@@ -1283,6 +1327,7 @@ async def wrapper({default_args}):
         class FakeBrowserState:
             def __init__(self) -> None:
                 self.browser_artifacts = BrowserArtifacts()
+                self.engine_selection = None
 
             async def get_working_page(self) -> object:
                 return SimpleNamespace(context=MagicMock())
@@ -1355,6 +1400,7 @@ async def wrapper({default_args}):
         class TablessBrowserState:
             def __init__(self) -> None:
                 self.browser_artifacts = BrowserArtifacts()
+                self.engine_selection = None
                 self.open_attempts = 0
                 self.created_pages = 0
 
@@ -1785,6 +1831,7 @@ def _fake_code_block_page(navigations: list | None = None, fills: list | None = 
     from playwright.async_api import Page
 
     page = MagicMock(spec=Page)
+    page.url = "https://customer.auth0.com/callback"
 
     async def goto(url: str, **kwargs: object) -> None:
         if navigations is not None:
@@ -1824,6 +1871,7 @@ async def _run_credential_code_block(monkeypatch: "pytest.MonkeyPatch", wrc, cod
     class FakeBrowserState:
         def __init__(self) -> None:
             self.browser_artifacts = BrowserArtifacts()
+            self.engine_selection = None
 
         async def get_working_page(self) -> object:
             return MagicMock()
@@ -3019,6 +3067,11 @@ class TestIsSafeCodeClassStatements:
     def test_script_path_keeps_metaclass_support(self) -> None:
         is_safe_script_code("class Weird(metaclass=type):\n    pass")
 
+    @pytest.mark.parametrize("code", ["import sys", "import asyncio\nvalue = asyncio.sys"])
+    def test_script_cannot_access_sys_module(self, code: str) -> None:
+        with pytest.raises(InsecureCodeDetected, match="sys"):
+            is_safe_script_code(code)
+
 
 class TestCodeBlockMagicLink:
     """SKY-14056: a credential can request an emailed sign-in link and open it."""
@@ -3028,6 +3081,7 @@ class TestCodeBlockMagicLink:
         from skyvern.forge.sdk.workflow.models import block as block_module
 
         _patch_context_resolution(monkeypatch, wrc)
+        monkeypatch.setattr(settings, "BROWSER_ACTION_TIMEOUT_MS", 0)
 
         async def fake_get_workflow_run(*args: object, **kwargs: object) -> _FakeWorkflowRun:
             return _FakeWorkflowRun()
@@ -3047,6 +3101,7 @@ class TestCodeBlockMagicLink:
         return captured
 
     @pytest.mark.asyncio
+    @pytest.mark.usefixtures("public_dns")
     async def test_polls_for_a_link_and_navigates_once_without_filling(self, monkeypatch: pytest.MonkeyPatch) -> None:
         from skyvern.forge.sdk.schemas.totp_codes import OTPType
         from skyvern.forge.sdk.workflow.models.block import _bind_code_block_magic_link
@@ -3065,10 +3120,52 @@ class TestCodeBlockMagicLink:
         await magic_link(page)
 
         assert captured["expected_otp_type"] is OTPType.MAGIC_LINK
+        assert captured["task_url"] == page.url
         assert navigations == [link]
         assert fills == []
 
     @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "native_close", [True, False], ids=["native_close_during_goto", "ordinary_navigation_error"]
+    )
+    async def test_link_navigation_stops_retrying_after_native_browser_loss(
+        self, monkeypatch: pytest.MonkeyPatch, native_close: bool
+    ) -> None:
+        from playwright.async_api import Error as PlaywrightError
+
+        from skyvern.constants import NAVIGATION_MAX_RETRY_TIME
+        from skyvern.exceptions import FailedToNavigateToUrl
+        from skyvern.forge.sdk.schemas.totp_codes import OTPType
+        from skyvern.forge.sdk.workflow.models import block as block_module
+        from skyvern.forge.sdk.workflow.models.block import _bind_code_block_magic_link
+        from skyvern.services.otp_service import OTPValue
+        from skyvern.webeye import navigation as navigation_module
+        from tests.unit.scoped_asyncio import ScopedAsyncio
+
+        link = "https://93.184.216.34/signin?token=x"
+        self._patch_poll(monkeypatch, _build_wrc_with_identifier(), OTPValue(value=link, type=OTPType.MAGIC_LINK))
+        browser_state, context = run_bound_browser_state(_WORKFLOW_RUN_ID)
+        monkeypatch.setattr(block_module.app.BROWSER_MANAGER, "get_for_workflow_run", lambda *_, **__: browser_state)
+        monkeypatch.setattr(navigation_module, "asyncio", ScopedAsyncio(sleep=AsyncMock()))
+        navigations: list[str] = []
+        page = _fake_code_block_page()
+
+        async def goto(url: str, **kwargs: object) -> None:
+            navigations.append(url)
+            if native_close:
+                browser_state._on_browser_context_closed(context)
+                raise PlaywrightError("Target page, context or browser has been closed")
+            raise PlaywrightError("Timeout 30000ms exceeded.")
+
+        page.goto = goto
+
+        with pytest.raises(FailedToNavigateToUrl):
+            await _bind_code_block_magic_link(_CREDENTIAL_KEY, _ORG_ID, _WORKFLOW_RUN_ID)(page)
+
+        assert navigations == [link] * (1 if native_close else NAVIGATION_MAX_RETRY_TIME)
+
+    @pytest.mark.asyncio
+    @pytest.mark.usefixtures("public_dns")
     async def test_anchors_created_after_at_call_time_not_run_start(self, monkeypatch: pytest.MonkeyPatch) -> None:
         from skyvern.forge.sdk.schemas.totp_codes import OTPType
         from skyvern.forge.sdk.workflow.models.block import _bind_code_block_magic_link
@@ -3431,6 +3528,7 @@ class TestFailedReadinessWaitPropagates:
         class ReadyBrowserState:
             def __init__(self) -> None:
                 self.browser_artifacts = BrowserArtifacts()
+                self.engine_selection = None
 
             async def get_working_page(self) -> object:
                 return page
@@ -3565,6 +3663,22 @@ class TestDirectPathDialogPolicyBinding:
             await declare(page, "accept", "CVV: 123")
         assert dialog_handler._dialog_policies.get(page.context) is None
 
+    @pytest.mark.asyncio
+    async def test_prompt_text_carrying_a_log_only_secret_is_logged_not_refused(self) -> None:
+        page = MagicMock(spec=Page)
+        page.context = MagicMock()
+        guard = CredentialReleaseGuard(workflow_run_id="wr-1", block_label="block")
+        assert guard.arm("hunter2-long-secret", "https://accounts.example.com/login", "password", enforced=False)
+        declare = _bind_code_block_set_dialog_policy(page, guard)
+
+        with capture_logs() as logs:
+            await declare(page, "accept", "hunter2-long-secret")
+
+        would_refuse = [log for log in logs if log["event"] == "codeblock_credential_release_would_refuse"]
+        assert [log["parameter_key"] for log in would_refuse] == ["password"]
+        assert dialog_handler._dialog_policies.get(page.context) is not None
+        dialog_handler.clear_dialog_policy(page.context)
+
     @pytest.mark.parametrize("revoke_fails", [False, True])
     @pytest.mark.asyncio
     async def test_a_declared_policy_is_revoked_before_any_post_block_browser_work(
@@ -3593,6 +3707,7 @@ class TestDirectPathDialogPolicyBinding:
         class ReadyBrowserState:
             def __init__(self) -> None:
                 self.browser_artifacts = BrowserArtifacts()
+                self.engine_selection = None
 
             async def get_working_page(self) -> object:
                 return page
@@ -3794,6 +3909,27 @@ class TestOpenPageHelperBinding:
         assert len(context.opened) == cap
 
     @pytest.mark.asyncio
+    @pytest.mark.parametrize("native_close", [True, False], ids=["lost_during_the_tab_count", "browser_alive"])
+    async def test_open_page_opens_no_tab_after_a_loss_during_its_tab_count(self, native_close: bool) -> None:
+        from skyvern.exceptions import MissingBrowserState
+
+        context = FakeSearchBrowserContext()
+        page = SimpleNamespace(context=context, url="https://example.test/listing")
+        browser_state, browser_context = run_bound_browser_state("wr_open_page")
+
+        async def count_tabs(**_: object) -> list[object]:
+            if native_close:
+                browser_state._on_browser_context_closed(browser_context)
+            return []
+
+        browser_state.list_valid_pages = count_tabs  # type: ignore[method-assign]
+        open_page = _bind_code_block_open_page(page, [], browser_state)  # type: ignore[arg-type]
+
+        with pytest.raises(MissingBrowserState) if native_close else nullcontext():
+            await open_page(page, "https://example.test/detail/1")
+        assert len(context.opened) == (0 if native_close else 1)
+
+    @pytest.mark.asyncio
     async def test_open_page_treats_a_non_positive_cap_as_unlimited(self, monkeypatch: pytest.MonkeyPatch) -> None:
         monkeypatch.setattr(settings, "BROWSER_MAX_PAGES_NUMBER", 0)
         context = FakeSearchBrowserContext()
@@ -3893,6 +4029,7 @@ class TestOpenPageHelperBinding:
         root = SimpleNamespace(context=context, url="https://example.test/listing", is_closed=lambda: False)
         root.title = AsyncMock(return_value="Listing")
         browser_state = SimpleNamespace(
+            engine_selection=None,
             browser_artifacts=BrowserArtifacts(),
             get_working_page=AsyncMock(return_value=root),
             list_valid_pages=AsyncMock(return_value=[root]),
@@ -3984,6 +4121,7 @@ class TestOpenPageHelperBinding:
         )
         root.title = AsyncMock(return_value="Listing")
         browser_state = SimpleNamespace(
+            engine_selection=None,
             browser_artifacts=BrowserArtifacts(),
             get_working_page=AsyncMock(return_value=root),
             list_valid_pages=AsyncMock(return_value=[root]),

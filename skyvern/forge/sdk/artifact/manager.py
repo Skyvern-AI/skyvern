@@ -2,6 +2,7 @@ import asyncio
 import io
 import os
 import time
+import weakref
 import zipfile
 from collections import defaultdict
 from dataclasses import dataclass, field
@@ -10,6 +11,7 @@ from typing import TYPE_CHECKING
 from urllib.parse import urlencode
 
 import structlog
+from cachetools import TTLCache
 
 from skyvern.config import settings
 from skyvern.forge import app
@@ -45,6 +47,10 @@ if TYPE_CHECKING:
 LOG = structlog.get_logger(__name__)
 
 ARCHIVE_AGE_THRESHOLD = timedelta(days=90)
+# Long enough for slow storage that still progresses; bounds the archive bytes a stalled store keeps alive.
+BACKGROUND_FLUSH_TIMEOUT_SECONDS = 120.0
+ARTIFACT_URL_EXPIRY_CACHE_TTL_SECONDS = 60
+ARTIFACT_URL_EXPIRY_CACHE_MAX_ORGS = 1024
 
 
 def _ensure_aware_utc(value: datetime) -> datetime:
@@ -249,6 +255,12 @@ class ArtifactManager:
         self.upload_aiotasks_map: dict[str, list[asyncio.Task[None]]] = defaultdict(list)
         # step_id -> accumulator for step archive artifacts
         self._step_archives: dict[str, StepArchiveAccumulator] = {}
+        self._background_flushes: set[asyncio.Task[None]] = set()
+        self._url_expiry_by_org: TTLCache[str, int] = TTLCache(
+            maxsize=ARTIFACT_URL_EXPIRY_CACHE_MAX_ORGS, ttl=ARTIFACT_URL_EXPIRY_CACHE_TTL_SECONDS
+        )
+        self._url_expiry_locks: weakref.WeakValueDictionary[str, asyncio.Lock] = weakref.WeakValueDictionary()
+        self._url_expiry_generation = 0
 
     def _track_upload_aiotask(
         self,
@@ -1444,14 +1456,33 @@ class ArtifactManager:
     async def resolve_artifact_url_expiry_seconds(self, organization_id: str | None) -> int:
         """Look up the org's artifact-URL TTL override; fall back to the global default.
 
-        One DB hit per call — typically resolved once per batch of URLs (e.g.
-        all downloads for a run) and passed into ``build_signed_content_url``.
+        Cached per org for ``ARTIFACT_URL_EXPIRY_CACHE_TTL_SECONDS``, so a change written by another process
+        reaches this one within that time. Concurrent misses for one org share a single read.
         """
         if organization_id is None:
             return ARTIFACT_URL_EXPIRY_SECONDS
-        org = await app.DATABASE.organizations.get_organization(organization_id=organization_id)
-        per_org = org.artifact_url_expiry_seconds if org else None
-        return effective_artifact_url_expiry_seconds(per_org)
+        cached = self._url_expiry_by_org.get(organization_id)
+        if cached is not None:
+            return cached
+        lock = self._url_expiry_locks.get(organization_id)
+        if lock is None:
+            lock = asyncio.Lock()
+            self._url_expiry_locks[organization_id] = lock
+        async with lock:
+            cached = self._url_expiry_by_org.get(organization_id)
+            if cached is not None:
+                return cached
+            generation = self._url_expiry_generation
+            org = await app.DATABASE.organizations.get_organization(organization_id=organization_id)
+            expiry_seconds = effective_artifact_url_expiry_seconds(org.artifact_url_expiry_seconds if org else None)
+            # A read that raced an invalidation may hold the old value, so only an unraced read is cached.
+            if generation == self._url_expiry_generation:
+                self._url_expiry_by_org[organization_id] = expiry_seconds
+            return expiry_seconds
+
+    def invalidate_cached_artifact_url_expiry(self, organization_id: str) -> None:
+        self._url_expiry_generation += 1
+        self._url_expiry_by_org.pop(organization_id, None)
 
     def _bundle_content_url(
         self,
@@ -1799,6 +1830,10 @@ class ArtifactManager:
         filename = f"html_action_{action_idx}.html"
         self._add_to_step_archive(acc, filename, html_action, ArtifactType.HTML_ACTION)
 
+    def accumulate_html_scrape_to_archive(self, step: Step, html: bytes) -> str:
+        acc = self._get_or_create_step_archive(step, None, None, None)
+        return self._add_to_step_archive(acc, "scrape.html", html, ArtifactType.HTML_SCRAPE)
+
     def accumulate_screenshot_to_step_archive(
         self,
         step: Step,
@@ -1885,10 +1920,54 @@ class ArtifactManager:
         )
 
         if _bundling_enabled():
-            await self._flush_step_archive_bundled(accumulator)
+            await self._flush_step_archives_bundled(accumulator.step, [accumulator])
         else:
             await self._flush_step_archive_unbundled(accumulator)
+        await self._apply_pending_action_screenshot_updates(accumulator)
 
+    def flush_step_archive_in_background(self, step: Step) -> None:
+        # wait_for_upload_aiotasks cancels what it tracks at its timeout, and a flush cancelled after it popped the
+        # accumulator loses the archive, so the flush itself is shielded and held here until it ends.
+        async def _flush() -> None:
+            try:
+                async with asyncio.timeout(BACKGROUND_FLUSH_TIMEOUT_SECONDS):
+                    await self.flush_step_archive(step.step_id)
+            except Exception:
+                LOG.warning("Failed to flush step archive", step_id=step.step_id, exc_info=True)
+
+        flush = asyncio.create_task(_flush())
+        self._background_flushes.add(flush)
+        flush.add_done_callback(self._background_flushes.discard)
+
+        async def _shielded() -> None:
+            await asyncio.shield(flush)
+
+        self._track_upload_aiotask(step.task_id, asyncio.create_task(_shielded()))
+
+    async def flush_task_step_archives_as_one(self, owner: Step) -> None:
+        """Persist every buffered archive of ``owner``'s task as one ZIP owned by ``owner``.
+
+        One storage PUT for the task instead of one per step; each member row keeps the step that produced it.
+        Unbundled mode has no ZIP, so each step flushes on its own there.
+        """
+        step_ids = [sid for sid, acc in list(self._step_archives.items()) if acc.step.task_id == owner.task_id]
+        if not _bundling_enabled():
+            for step_id in step_ids:
+                await self.flush_step_archive(step_id)
+            return
+        accumulators = [
+            acc
+            for step_id in step_ids
+            if (acc := self._step_archives.pop(step_id, None)) is not None and acc.entries and acc.member_types
+        ]
+        if not accumulators:
+            return
+        accumulators.sort(key=lambda acc: (acc.step.order, acc.step.retry_index))
+        await self._flush_step_archives_bundled(owner, accumulators)
+        for accumulator in accumulators:
+            await self._apply_pending_action_screenshot_updates(accumulator)
+
+    async def _apply_pending_action_screenshot_updates(self, accumulator: StepArchiveAccumulator) -> None:
         for organization_id, action_id, artifact_id in accumulator.pending_action_screenshot_updates:
             try:
                 await app.DATABASE.artifacts.update_action_screenshot_artifact_id(
@@ -1904,14 +1983,14 @@ class ArtifactManager:
                     exc_info=True,
                 )
 
-    async def _flush_step_archive_bundled(self, accumulator: StepArchiveAccumulator) -> None:
-        """Bundle all accumulated entries into a single ZIP, one storage PUT, parent + member rows."""
-        step = accumulator.step
+    async def _flush_step_archives_bundled(self, owner: Step, accumulators: list[StepArchiveAccumulator]) -> None:
+        """Bundle the accumulators' entries into one ZIP owned by ``owner``: one storage PUT, parent + member rows."""
+        run_scope = accumulators[0]
         archive_artifact_id = generate_artifact_id()
         archive_uri = app.STORAGE.build_uri(
-            organization_id=step.organization_id,
+            organization_id=owner.organization_id,
             artifact_id=archive_artifact_id,
-            step=step,
+            step=owner,
             artifact_type=ArtifactType.STEP_ARCHIVE,
         )
 
@@ -1920,17 +1999,28 @@ class ArtifactManager:
             artifact_id=archive_artifact_id,
             artifact_type=ArtifactType.STEP_ARCHIVE,
             uri=archive_uri,
-            organization_id=step.organization_id,
-            step_id=step.step_id,
-            task_id=step.task_id,
-            workflow_run_id=accumulator.workflow_run_id,
-            workflow_run_block_id=accumulator.workflow_run_block_id,
-            run_id=accumulator.run_id,
+            organization_id=owner.organization_id,
+            step_id=owner.step_id,
+            task_id=owner.task_id,
+            workflow_run_id=run_scope.workflow_run_id,
+            workflow_run_block_id=run_scope.workflow_run_block_id,
+            run_id=run_scope.run_id,
             created_at=now,
             modified_at=now,
         )
 
-        zip_bytes = self._build_zip(accumulator.entries)
+        entries: dict[str, bytes] = {}
+        members: list[tuple[StepArchiveAccumulator, ArtifactType, str, str]] = []
+        for accumulator in accumulators:
+            # Every step numbers its files from 0, so another step's files get its step id as a prefix in the ZIP.
+            prefix = "" if accumulator.step.step_id == owner.step_id else f"{accumulator.step.step_id}_"
+            for artifact_type, filename, artifact_id in accumulator.member_types:
+                entries[prefix + filename] = accumulator.entries[filename]
+                members.append((accumulator, artifact_type, prefix + filename, artifact_id))
+
+        # Deflating a block's raw DOM takes long enough to stall every run on this worker's event loop; zlib releases
+        # the GIL, so a thread keeps the loop free.
+        zip_bytes = await asyncio.to_thread(self._build_zip, entries)
         await app.STORAGE.store_artifact(archive_artifact, zip_bytes)
 
         # Parent archive row (no bundle_key — represents the ZIP object itself)
@@ -1938,12 +2028,12 @@ class ArtifactManager:
             artifact_id=archive_artifact_id,
             artifact_type=ArtifactType.STEP_ARCHIVE,
             uri=archive_uri,
-            organization_id=step.organization_id,
-            step_id=step.step_id,
-            task_id=step.task_id,
-            workflow_run_id=accumulator.workflow_run_id,
-            workflow_run_block_id=accumulator.workflow_run_block_id,
-            run_id=accumulator.run_id,
+            organization_id=owner.organization_id,
+            step_id=owner.step_id,
+            task_id=owner.task_id,
+            workflow_run_id=run_scope.workflow_run_id,
+            workflow_run_block_id=run_scope.workflow_run_block_id,
+            run_id=run_scope.run_id,
         )
         # Member rows (bundle_key points to the filename inside the ZIP)
         member_models = [
@@ -1952,14 +2042,14 @@ class ArtifactManager:
                 artifact_type=artifact_type,
                 uri=archive_uri,
                 bundle_key=filename,
-                organization_id=step.organization_id,
-                step_id=step.step_id,
-                task_id=step.task_id,
+                organization_id=accumulator.step.organization_id,
+                step_id=accumulator.step.step_id,
+                task_id=accumulator.step.task_id,
                 workflow_run_id=accumulator.workflow_run_id,
                 workflow_run_block_id=accumulator.workflow_run_block_id,
                 run_id=accumulator.run_id,
             )
-            for artifact_type, filename, artifact_id in accumulator.member_types
+            for accumulator, artifact_type, filename, artifact_id in members
         ]
         await app.DATABASE.artifacts.bulk_create_artifacts([parent_model, *member_models])
 
@@ -2086,7 +2176,7 @@ class ArtifactManager:
             filename: _maybe_redact_artifact_data(artifact_type, data, workflow_run_id=archive_artifact.workflow_run_id)
             for filename, (artifact_type, data) in entries.items()
         }
-        zip_bytes = self._build_zip(zip_entries)
+        zip_bytes = await asyncio.to_thread(self._build_zip, zip_entries)
         await app.STORAGE.store_artifact(archive_artifact, zip_bytes)
 
         # Parent archive row (no bundle_key — represents the ZIP object itself)

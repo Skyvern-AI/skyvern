@@ -21,6 +21,9 @@ export const ANALYTICS_ANOMALY_DETECTION_FLAG = "ANALYTICS_ANOMALY_DETECTION";
 export const EDITOR_ONBOARDING_TOUR_FLAG = "EDITOR_ONBOARDING_TOUR";
 export const WORKFLOW_TAGGING_FLAG = "WORKFLOW_TAGGING";
 
+// Server-evaluated per org; the variant is the agent block's model, so any variant reads as on.
+export const AGENT_BLOCK_FLAG = "AGENT_BLOCK_LLM_NAME";
+
 // Opt-in (0% base rollout) preview gating the workflows directory-tree view.
 // Not enrolled reads as disabled, so the default stays the flat folders/list.
 export const WORKFLOWS_DIRECTORY_TREE_FLAG = "WORKFLOWS_DIRECTORY_TREE";
@@ -43,3 +46,6 @@ export const ONBOARDING_TRACK_SECOND_AGENT_FLAG =
 export const NEW_ONBOARDING_EXPERIENCE_FLAG = "new_onboarding_experience";
 
 export const BROWSER_SESSION_PREWARM_FLAG = "BROWSER_SESSION_PREWARM";
+
+// Opt-in (0% base rollout) preview for the workflow Doc view.
+export const WORKFLOW_DOC_EDITOR_FLAG = "WORKFLOW_DOC_EDITOR";

@@ -12,6 +12,7 @@ from aiohttp import web
 from structlog.testing import capture_logs
 
 from skyvern.forge.sdk.core import aiohttp_helper
+from skyvern.forge.sdk.credential_site_policy import LoginSite
 from skyvern.forge.sdk.workflow.context_manager import RANDOM_SECRET_ID_PREFIX, WorkflowRunContext
 from skyvern.forge.sdk.workflow.models import block as block_module
 from skyvern.forge.sdk.workflow.models.block import (
@@ -44,6 +45,7 @@ def _make_context(
     context.browser_session_id = None
     context.mask_secrets = False
     context.credential_tested_urls = {}
+    context.bitwarden_login_sites = {}
     return context
 
 
@@ -220,6 +222,136 @@ class TestSecretResponsePaths:
 
 
 class TestHttpRequestBlockSecretResponsePaths:
+    @pytest.mark.asyncio
+    async def test_execute_logs_metadata_without_request_or_response_values(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        request_sentinel = "HTTP_REQUEST_BODY_SENTINEL"
+        response_sentinel = "HTTP_RESPONSE_BODY_SENTINEL"
+        file_sentinel = "HTTP_FILE_CONTENT_SENTINEL"
+        local_file_field = "HTTP_LOCAL_FILE_FIELD_SENTINEL"
+        local_file_path = "HTTP_LOCAL_FILE_PATH_SENTINEL.txt"
+        remote_file_field = "HTTP_REMOTE_FILE_FIELD_SENTINEL"
+        remote_file_path = "https://download.example.test/HTTP_REMOTE_FILE_PATH_SENTINEL.txt"
+        downloaded_file_path = "HTTP_DOWNLOADED_LOCAL_PATH_SENTINEL"
+        request_body = {"payload": request_sentinel}
+        response_body = {"message": response_sentinel}
+        upload_file = tmp_path / local_file_path
+        upload_file.write_text(file_sentinel, encoding="utf-8")
+        context = _make_context()
+        block = _http_block(
+            body=request_body,
+            files={local_file_field: str(upload_file), remote_file_field: remote_file_path},
+        )
+        request_kwargs: dict[str, object] = {}
+
+        async def fake_aiohttp_request(**kwargs: object) -> tuple[int, dict[str, str], dict[str, object]]:
+            request_kwargs.update(kwargs)
+            return 202, {"Content-Type": "application/json"}, response_body
+
+        async def fake_download_file(_file_path: str, **_kwargs: object) -> str:
+            return downloaded_file_path
+
+        monkeypatch.setattr(HttpRequestBlock, "get_workflow_run_context", lambda _self, _run_id: context)
+        monkeypatch.setattr(HttpRequestBlock, "get_allowed_dirs", lambda *_args: [str(tmp_path)])
+        monkeypatch.setattr(block_module, "aiohttp_request", fake_aiohttp_request)
+        monkeypatch.setattr(block_module, "download_file", fake_download_file)
+        monkeypatch.setattr(block_module.app, "DATABASE", AsyncMock())
+
+        with capture_logs() as logs:
+            result = await block.execute(workflow_run_id="wr-1", workflow_run_block_id="wrb-1")
+
+        captured = json.dumps(logs, default=str)
+        assert request_sentinel not in captured
+        assert response_sentinel not in captured
+        assert file_sentinel not in captured
+        assert local_file_field not in captured
+        assert local_file_path not in captured
+        assert remote_file_field not in captured
+        assert remote_file_path not in captured
+        assert downloaded_file_path not in captured
+
+        request_log = next(log for log in logs if log["event"] == "Executing HTTP request")
+        completion_log = next(log for log in logs if log["event"] == "HTTP request completed")
+        assert request_log["request_body_size_bytes"] == len(json.dumps(request_body).encode("utf-8"))
+        assert request_log["files_count"] == 2
+        assert completion_log["status_code"] == 202
+        assert completion_log["response_body_size_bytes"] == len(json.dumps(response_body).encode("utf-8"))
+        assert completion_log["response_content_type"] == "application/json"
+
+        assert request_kwargs["data"] == request_body
+        assert request_kwargs["files"] == {
+            local_file_field: str(upload_file),
+            remote_file_field: downloaded_file_path,
+        }
+        assert result.success is True
+        assert result.output_parameter_value["request_body"] == request_body
+        assert result.output_parameter_value["response_body"] == response_body
+
+    @pytest.mark.asyncio
+    async def test_execute_does_not_log_custom_header_when_defaulting_content_type(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        header_sentinel = "HTTP_CUSTOM_HEADER_SENTINEL"
+        context = _make_context()
+        block = _http_block(headers={"X-Custom-Header": header_sentinel})
+        request_kwargs: dict[str, object] = {}
+
+        async def fake_aiohttp_request(**kwargs: object) -> tuple[int, dict[str, str], dict[str, object]]:
+            request_kwargs.update(kwargs)
+            return 202, {"Content-Type": "application/json"}, {"ok": True}
+
+        monkeypatch.setattr(HttpRequestBlock, "get_workflow_run_context", lambda _self, _run_id: context)
+        monkeypatch.setattr(block_module, "aiohttp_request", fake_aiohttp_request)
+        monkeypatch.setattr(block_module.app, "DATABASE", AsyncMock())
+
+        with capture_logs() as logs:
+            result = await block.execute(workflow_run_id="wr-1", workflow_run_block_id="wrb-1")
+
+        assert header_sentinel not in json.dumps(logs, default=str)
+        default_content_type_log = next(
+            log for log in logs if log["event"] == "Adding default content-type as application/json"
+        )
+        assert "headers" not in default_content_type_log
+        assert request_kwargs["headers"] == {"X-Custom-Header": header_sentinel, "Content-Type": "application/json"}
+        assert result.success is True
+
+    @pytest.mark.asyncio
+    async def test_execute_logs_only_media_types_for_templated_request_and_response_content_types(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        request_secret = "HTTP_REQUEST_CONTENT_TYPE_SENTINEL"
+        response_secret = "HTTP_RESPONSE_CONTENT_TYPE_SENTINEL"
+        request_content_type = f"application/json; boundary={request_secret}"
+        response_content_type = f"application/problem+json; boundary={response_secret}"
+        context = _make_context(
+            secrets={"placeholder_request": request_secret, "placeholder_response": response_secret},
+            values={"request_content_type": request_content_type},
+        )
+        block = _http_block(headers={"Content-Type": "{{ request_content_type }}"})
+        request_kwargs: dict[str, object] = {}
+
+        async def fake_aiohttp_request(**kwargs: object) -> tuple[int, dict[str, str], dict[str, object]]:
+            request_kwargs.update(kwargs)
+            return 202, {"Content-Type": response_content_type}, {"ok": True}
+
+        monkeypatch.setattr(HttpRequestBlock, "get_workflow_run_context", lambda _self, _run_id: context)
+        monkeypatch.setattr(block_module, "aiohttp_request", fake_aiohttp_request)
+        monkeypatch.setattr(block_module.app, "DATABASE", AsyncMock())
+
+        with capture_logs() as logs:
+            result = await block.execute(workflow_run_id="wr-1", workflow_run_block_id="wrb-1")
+
+        captured = json.dumps(logs, default=str)
+        assert request_secret not in captured
+        assert response_secret not in captured
+        request_log = next(log for log in logs if log["event"] == "Executing HTTP request")
+        completion_log = next(log for log in logs if log["event"] == "HTTP request completed")
+        assert request_log["request_content_type"] == "application/json"
+        assert completion_log["response_content_type"] == "application/problem+json"
+        assert request_kwargs["headers"] == {"Content-Type": request_content_type}
+        assert result.success is True
+
     @pytest.mark.asyncio
     async def test_execute_rejects_hostname_resolving_to_private_ip_before_request(
         self, monkeypatch: pytest.MonkeyPatch
@@ -770,6 +902,7 @@ class TestHttpRequestBlockCredentialSiteConfinement:
         requested.assert_not_called()
 
     @pytest.mark.asyncio
+    @pytest.mark.usefixtures("public_dns")
     async def test_execute_holds_a_same_site_file_fetch_to_the_credential_site(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
@@ -797,6 +930,7 @@ class TestHttpRequestBlockCredentialSiteConfinement:
         assert authorize("https://collector.example.net/collect") is False
 
     @pytest.mark.asyncio
+    @pytest.mark.usefixtures("public_dns")
     async def test_execute_confines_only_the_file_entry_that_references_the_credential(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
@@ -827,6 +961,7 @@ class TestHttpRequestBlockCredentialSiteConfinement:
         assert authorize("https://collector.example.net/x") is False
 
     @pytest.mark.asyncio
+    @pytest.mark.usefixtures("public_dns")
     async def test_execute_renders_a_templated_file_field_name_and_keeps_its_entry_confined(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
@@ -980,6 +1115,46 @@ class TestHttpRequestBlockCredentialSiteConfinement:
         result = await block.execute(workflow_run_id="wr-1", workflow_run_block_id="wrb-1")
 
         assert result.success is True
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("tested_url", [None, "https://app.example.com/login"])
+    @pytest.mark.parametrize(
+        ("url", "sent_expected"),
+        [
+            ("https://app.example.com/session", True),
+            ("https://other.example.com/session", False),
+            ("https://collector.example.net/ingest", False),
+        ],
+    )
+    async def test_execute_confines_a_vault_login_to_its_host_match_site(
+        self, monkeypatch: pytest.MonkeyPatch, tested_url: str | None, url: str, sent_expected: bool
+    ) -> None:
+        context = _context_with_credential(tested_url)
+        context.bitwarden_login_sites = {"login_credentials": [LoginSite("https://app.example.com", whole_site=False)]}
+        context.workflow = MagicMock(created_by="copilot", edited_by="copilot")
+        block = _http_block(url=url, body={"password": "{{ login_credentials.password }}"})
+        sent: dict[str, object] = {}
+
+        async def fake_aiohttp_request(**kwargs: object) -> tuple[int, dict[str, str], dict[str, object]]:
+            sent.update(kwargs)
+            return 200, {"Content-Type": "application/json"}, {"ok": True}
+
+        monkeypatch.setattr(HttpRequestBlock, "get_workflow_run_context", lambda _self, _workflow_run_id: context)
+        monkeypatch.setattr(block_module, "aiohttp_request", fake_aiohttp_request)
+        monkeypatch.setattr(block_module.app, "DATABASE", AsyncMock())
+
+        result = await block.execute(workflow_run_id="wr-1", workflow_run_block_id="wrb-1")
+
+        assert result.success is sent_expected
+        if not sent_expected:
+            assert result.failure_reason is not None
+            assert "login_credentials" in result.failure_reason
+            assert sent == {}
+            return
+        authorize = sent["authorize_redirect"]
+        assert callable(authorize)
+        assert authorize("https://app.example.com/next") is True
+        assert authorize("https://other.example.com/next") is False
 
     @pytest.mark.asyncio
     async def test_execute_sends_a_credential_without_a_tested_url(self, monkeypatch: pytest.MonkeyPatch) -> None:

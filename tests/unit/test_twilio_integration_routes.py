@@ -46,6 +46,7 @@ from skyvern.forge.sdk.schemas.sms import (
     OrganizationPhoneNumber,
     SMSConfig,
 )
+from skyvern.forge.sdk.services import credentials as onepassword_helpers
 from skyvern.forge.sdk.services.bitwarden import BitwardenConstants
 from skyvern.forge.sdk.services.credential.skyvern_credential_vault_service import SkyvernCredentialVaultService
 from skyvern.forge.sdk.services.twilio_service import TwilioApiError, build_inbound_sms_url, compute_twilio_signature
@@ -1313,10 +1314,23 @@ async def _register(
         organizations = SimpleNamespace(
             get_valid_org_auth_token=AsyncMock(return_value=SimpleNamespace(token="service-account-token"))
         )
-        monkeypatch.setattr(cm, "app", SimpleNamespace(DATABASE=SimpleNamespace(organizations=organizations)))
+        credentials = SimpleNamespace(get_onepassword_credentials=AsyncMock(return_value=[]))
+        agent_function = SimpleNamespace(enforce_credential_use=AsyncMock())
+        monkeypatch.setattr(
+            cm,
+            "app",
+            SimpleNamespace(
+                DATABASE=SimpleNamespace(organizations=organizations, credentials=credentials),
+                AGENT_FUNCTION=agent_function,
+            ),
+        )
         item = SimpleNamespace(fields=[], notes=None)
         client = SimpleNamespace(items=SimpleNamespace(get=AsyncMock(return_value=item)))
-        monkeypatch.setattr(cm, "OnePasswordClient", SimpleNamespace(authenticate=AsyncMock(return_value=client)))
+        monkeypatch.setattr(
+            onepassword_helpers,
+            "OnePasswordClient",
+            SimpleNamespace(authenticate=AsyncMock(return_value=client)),
+        )
         await context.register_onepassword_credential_parameter_value(
             parameter, SimpleNamespace(organization_id="organization-id")
         )

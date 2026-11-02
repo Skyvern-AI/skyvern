@@ -231,6 +231,7 @@ class TestResolveOtpValuePlaceholderFallthrough:
 
         task = SimpleNamespace(
             task_id="tsk_test",
+            url="https://example.com/login",
             workflow_run_id="wr_test",
             organization_id="o_test",
             totp_verification_url="https://example.com/webhook",
@@ -269,6 +270,7 @@ class TestResolveOtpValuePlaceholderFallthrough:
 
         task = SimpleNamespace(
             task_id="tsk_test",
+            url="https://example.com/login",
             workflow_run_id="wr_test",
             organization_id="o_test",
             totp_verification_url="https://example.com/email-otp-webhook",
@@ -294,6 +296,7 @@ class TestResolveOtpValueExpectedOtpTypeGating:
     def _task() -> SimpleNamespace:
         return SimpleNamespace(
             task_id="tsk_test",
+            url="https://example.com/login",
             workflow_run_id=None,
             organization_id="o_test",
             totp_verification_url=None,
@@ -604,6 +607,84 @@ class TestGetOtpValueFromUrl:
         )
 
         assert result == OTPValue(value="654321", type="totp")
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ("expected_otp_type", "resolved"),
+        [
+            pytest.param(OTPType.TOTP, OTPValue(value="654321", type="totp"), id="code_poll_gets_the_code"),
+            pytest.param(
+                OTPType.MAGIC_LINK,
+                OTPValue(value="https://example.com/signin?token=abc", type="magic_link"),
+                id="link_poll_gets_the_link",
+            ),
+        ],
+    )
+    async def test_webhook_parse_enforces_the_expected_otp_type(
+        self, monkeypatch: pytest.MonkeyPatch, expected_otp_type: OTPType, resolved: OTPValue
+    ) -> None:
+        """A relayed email carrying both a code and a sign-in link resolved to whichever the
+        unenforced parse happened to pick, so a code-entry login could be handed the link. The
+        expected type must reach the parser, as it already does on the stored-code path."""
+        from skyvern.services import otp_service
+
+        raw_email = "Your passcode is 654321. Or sign in directly: https://example.com/signin?token=abc"
+        _patch_totp_url_response(
+            monkeypatch,
+            status_code=200,
+            headers={"Content-Type": "application/json"},
+            response_body={"verification_code": raw_email},
+            is_json_response=True,
+        )
+
+        async def fake_parse_otp_login(
+            content: str, organization_id: str, enforced_otp_type: OTPType | None = None
+        ) -> OTPValue | None:
+            assert enforced_otp_type is expected_otp_type
+            if enforced_otp_type is OTPType.MAGIC_LINK:
+                return OTPValue(value="https://example.com/signin?token=abc", type="magic_link")
+            return OTPValue(value="654321", type="totp")
+
+        monkeypatch.setattr(otp_service, "parse_otp_login", fake_parse_otp_login)
+
+        result = await _get_otp_value_from_url(
+            organization_id="o_test",
+            url="https://example.com/totp",
+            api_key="api-key",
+            task_id="tsk_test",
+            expected_otp_type=expected_otp_type,
+        )
+
+        assert result == resolved
+
+    @pytest.mark.asyncio
+    async def test_webhook_otp_of_another_type_keeps_polling(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """A parse that answers with the other OTP type despite the enforcement must not be handed
+        back as the caller's answer: the code may still arrive within the polling budget."""
+        from skyvern.services import otp_service
+
+        _patch_totp_url_response(
+            monkeypatch,
+            status_code=200,
+            headers={"Content-Type": "application/json"},
+            response_body={"verification_code": "Sign in here: https://example.com/signin?token=abc"},
+            is_json_response=True,
+        )
+        monkeypatch.setattr(
+            otp_service,
+            "parse_otp_login",
+            AsyncMock(return_value=OTPValue(value="https://example.com/signin?token=abc", type="magic_link")),
+        )
+
+        result = await _get_otp_value_from_url(
+            organization_id="o_test",
+            url="https://example.com/totp",
+            api_key="api-key",
+            task_id="tsk_test",
+            expected_otp_type=OTPType.TOTP,
+        )
+
+        assert result is None
 
     @pytest.mark.asyncio
     async def test_parse_failure_warning_omits_raw_content_keeps_length(self, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -1002,6 +1083,38 @@ class TestParseOtpLogin:
         assert result.value == "123456"  # separators stripped — the digits the site expects
 
     @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ("content", "llm_value", "expected"),
+        [
+            ("code is\t1234\t5678", "12345678", "12345678"),
+            ("code is 12-3456", "123456", "123456"),
+            ("Your code is 1234 567", "1234567", "1234567"),
+        ],
+    )
+    async def test_verbatim_numeric_code_keeps_permissive_grouping(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        content: str,
+        llm_value: str,
+        expected: str,
+    ) -> None:
+        _patch_otp_llm(monkeypatch, otp_type="totp", otp_value=llm_value)
+
+        result = await parse_otp_login(content=content, organization_id="o_test")
+
+        assert result is not None
+        assert result.value == expected
+
+    @pytest.mark.asyncio
+    async def test_hyphenated_code_is_not_welded_to_following_number(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        _patch_otp_llm(monkeypatch, otp_type="totp", otp_value="123456")
+
+        result = await parse_otp_login(content="Your code is 123-456 789", organization_id="o_test")
+
+        assert result is not None
+        assert result.value == "123456"
+
+    @pytest.mark.asyncio
     async def test_recovers_url_stripping_trailing_sentence_punctuation(self, monkeypatch: pytest.MonkeyPatch) -> None:
         from skyvern.services import otp_service
 
@@ -1267,7 +1380,7 @@ class TestParseOtpLogin:
         from skyvern.services import otp_service
 
         async def failing_handler(*_args: object, **_kwargs: object) -> dict[str, object]:
-            raise LLMProviderError("gemini-2.5-flash")
+            raise LLMProviderError("gemini-3-flash-preview")
 
         charge = AsyncMock()
         monkeypatch.setattr(otp_service.prompt_engine, "load_prompt", lambda *a, **k: "prompt")
@@ -1323,7 +1436,7 @@ class TestParseOtpLogin:
         from skyvern.services import otp_service
 
         async def failing_handler(*_args: object, **_kwargs: object) -> dict[str, object]:
-            raise LLMProviderError("gemini-2.5-flash")
+            raise LLMProviderError("gemini-3-flash-preview")
 
         monkeypatch.setattr(otp_service.prompt_engine, "load_prompt", lambda *a, **k: "prompt")
         monkeypatch.setattr(otp_service.app, "SECONDARY_LLM_API_HANDLER", failing_handler, raising=False)
@@ -1498,6 +1611,7 @@ class TestPollOtpValueRetry:
         mock_sleep: AsyncMock,
     ) -> None:
         mock_settings.VERIFICATION_CODE_POLLING_TIMEOUT_MINS = 15
+        mock_app.AGENT_FUNCTION.enforce_totp_identifier_credential_use = AsyncMock()
         mock_app.DATABASE.organizations.get_valid_org_auth_token = AsyncMock(return_value=_mock_org_token())
         otp = OTPValue(value="123456", type=OTPType.TOTP)
         mock_url.return_value = otp
@@ -1534,6 +1648,7 @@ class TestPollOtpValueRetry:
         mock_sleep: AsyncMock,
     ) -> None:
         mock_settings.VERIFICATION_CODE_POLLING_TIMEOUT_MINS = 15
+        mock_app.AGENT_FUNCTION.enforce_totp_identifier_credential_use = AsyncMock()
         mock_app.DATABASE.organizations.get_valid_org_auth_token = AsyncMock(return_value=_mock_org_token())
         mock_url.return_value = None
         otp = OTPValue(value="123456", type=OTPType.TOTP)
@@ -1574,6 +1689,7 @@ class TestPollOtpValueRetry:
         start = datetime(2026, 1, 1, 12, 0, 0)
         mock_datetime.utcnow.return_value = start
         mock_settings.VERIFICATION_CODE_POLLING_TIMEOUT_MINS = 15
+        mock_app.AGENT_FUNCTION.enforce_totp_identifier_credential_use = AsyncMock()
         mock_app.DATABASE.organizations.get_valid_org_auth_token = AsyncMock(return_value=_mock_org_token())
         mock_url.return_value = None
         mock_email.return_value = None
@@ -1647,6 +1763,7 @@ class TestPollOtpValueRetry:
         ):
             mock_datetime.utcnow.side_effect = utcnow_returns
             mock_settings.VERIFICATION_CODE_POLLING_TIMEOUT_MINS = 15
+            mock_app.AGENT_FUNCTION.enforce_totp_identifier_credential_use = AsyncMock()
             mock_app.DATABASE.organizations.get_valid_org_auth_token = AsyncMock(return_value=_mock_org_token())
             raw_identifier = "otp@example.com"
             raw_url = "https://example.com/mfa?token=secret"
@@ -1777,6 +1894,7 @@ class TestPollOtpValueRetry:
         raw_identifier = "otp@example.com"
         raw_url = "https://example.com/mfa"
         mock_settings.VERIFICATION_CODE_POLLING_TIMEOUT_MINS = 15
+        mock_app.AGENT_FUNCTION.enforce_totp_identifier_credential_use = AsyncMock()
         mock_app.DATABASE.organizations.get_valid_org_auth_token = AsyncMock(return_value=_mock_org_token())
         mock_fetch.return_value = OTPValue(value=raw, type=OTPType.TOTP)
 
@@ -2433,6 +2551,7 @@ async def test_get_otp_value_from_db_scopes_query_to_workflow_run_when_provided(
         workflow_run_id=None,
         workflow_id=None,
         task_id=None,
+        source=None,
         expired_at=None,
     )
     other_run = SimpleNamespace(
@@ -2443,6 +2562,7 @@ async def test_get_otp_value_from_db_scopes_query_to_workflow_run_when_provided(
         workflow_run_id="wr_other",
         workflow_id=None,
         task_id=None,
+        source=None,
         expired_at=None,
     )
     scoped = SimpleNamespace(
@@ -2453,6 +2573,7 @@ async def test_get_otp_value_from_db_scopes_query_to_workflow_run_when_provided(
         workflow_run_id="wr_test",
         workflow_id=None,
         task_id=None,
+        source=None,
         expired_at=None,
     )
 
@@ -2486,6 +2607,7 @@ async def test_get_otp_value_from_db_allows_unscoped_code_for_run_scoped_poll() 
         workflow_run_id=None,
         workflow_id=None,
         task_id=None,
+        source=None,
         expired_at=None,
     )
     other_run = SimpleNamespace(
@@ -2496,6 +2618,7 @@ async def test_get_otp_value_from_db_allows_unscoped_code_for_run_scoped_poll() 
         workflow_run_id="wr_other",
         workflow_id=None,
         task_id=None,
+        source=None,
         expired_at=None,
     )
     get_otp_codes = AsyncMock(return_value=[other_run, unscoped])
@@ -2524,6 +2647,7 @@ async def test_get_otp_value_from_db_preserves_unscoped_lookup_without_workflow_
         workflow_run_id=None,
         workflow_id=None,
         task_id=None,
+        source=None,
         expired_at=None,
     )
     get_otp_codes = AsyncMock(return_value=[unscoped])
@@ -2556,6 +2680,7 @@ def _parsed_otp_row(
         workflow_run_id=workflow_run_id,
         workflow_id=None,
         task_id=task_id,
+        source=None,
         expired_at=None,
     )
 
@@ -2995,6 +3120,7 @@ def _raw_otp_row(
         workflow_run_id=None,
         workflow_id=None,
         task_id=task_id,
+        source=None,
         expired_at=None,
     )
 
@@ -3249,6 +3375,7 @@ class TestScopeSuppressionRegressionSentinel:
     def _task(self, totp_verification_url: str | None = None) -> SimpleNamespace:
         return SimpleNamespace(
             task_id="tsk_test",
+            url="https://example.com/login",
             workflow_run_id="wr_test",
             organization_id="o_test",
             totp_verification_url=totp_verification_url,
@@ -3330,6 +3457,7 @@ async def test_retry_resolution_forwards_cutoff_and_ignores_inline_rejected_hash
     cutoff = datetime(2026, 1, 1)
     task = SimpleNamespace(
         task_id="task-test",
+        url="https://example.test/login",
         organization_id="org-test",
         workflow_run_id=None,
         navigation_payload={"otp": rejected},

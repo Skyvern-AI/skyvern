@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 from datetime import datetime
+from typing import Literal
 
 import structlog
 from fastapi import HTTPException, status
@@ -18,6 +19,8 @@ from skyvern.forge.sdk.schemas.persistent_browser_sessions import (
     PersistentBrowserSession,
     PersistentBrowserType,
     is_external_cdp_session,
+    is_external_cdp_session_open,
+    seconds_until_external_deadline,
 )
 from skyvern.schemas.browser_settings import BrowserSettings, BrowserSettingsReceipt
 
@@ -108,6 +111,15 @@ class BrowserSessionResponse(BaseModel):
         description="Advisory message about how the request was adjusted, if it was. Set when a requested timeout "
         "above the maximum was capped at creation, when an extension was granted less than it asked for, or when "
         "an extension was accepted but not yet confirmed; null otherwise.",
+    )
+    source: Literal["managed", "external"] = Field(
+        "managed",
+        description='"external" for a browser the caller registered and runs itself; "managed" for one Skyvern runs.',
+    )
+    remaining_lifetime_seconds: int | None = Field(
+        None,
+        description="Seconds left before a registered external browser's fixed deadline. Null for managed sessions "
+        "and once the session has ended.",
     )
 
     @classmethod
@@ -228,6 +240,13 @@ class BrowserSessionResponse(BaseModel):
             if stream_transport not in ("vnc", "cdp"):
                 stream_transport = None
 
+        external = is_external_cdp_session(browser_session)
+        remaining_lifetime_seconds = (
+            max(0, int(seconds_until_external_deadline(browser_session)))
+            if external and is_external_cdp_session_open(browser_session)
+            else None
+        )
+
         return cls(
             browser_session_id=browser_session.persistent_browser_session_id,
             organization_id=browser_session.organization_id,
@@ -260,4 +279,6 @@ class BrowserSessionResponse(BaseModel):
             created_by=(
                 None if browser_session.created_by == API_BROWSER_SESSION_CREATED_BY else browser_session.created_by
             ),
+            source="external" if external else "managed",
+            remaining_lifetime_seconds=remaining_lifetime_seconds,
         )

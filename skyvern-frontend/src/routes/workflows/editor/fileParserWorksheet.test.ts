@@ -37,6 +37,7 @@ const FILE_PARSER_BLOCK: FileURLParserBlock = {
   file_type: "excel",
   json_schema: null,
   worksheet: "Query Log",
+  force_ocr: false,
 };
 
 describe("File Parser worksheet round-trip", () => {
@@ -66,5 +67,22 @@ describe("File Parser worksheet round-trip", () => {
     const [block] = convert(workflow).workflow_definition.blocks;
 
     expect((block as FileUrlParserBlockYAML).worksheet).toBe("Query Log");
+  });
+
+  test("force OCR survives block -> node -> block", () => {
+    const node = convertToNode(
+      { id: "fp2" },
+      { ...FILE_PARSER_BLOCK, file_type: "pdf", force_ocr: true },
+      true,
+    );
+    expect(isFileParserNode(node)).toBe(true);
+    if (!isFileParserNode(node)) {
+      return;
+    }
+    expect(node.data.forceOcr).toBe(true);
+
+    const [block] = getWorkflowBlocks([node], []);
+
+    expect((block as FileUrlParserBlockYAML).force_ocr).toBe(true);
   });
 });

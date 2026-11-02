@@ -286,6 +286,7 @@ class TestExecuteWithZipAndLocalPaths:
     @staticmethod
     def _patch_execute_dependencies(mp: pytest.MonkeyPatch, tmp_path: Path) -> AsyncMock:
         workflow_run_context = MagicMock()
+        workflow_run_context.resolve_block_notes_section.return_value = None
         workflow_run_context.has_parameter.return_value = False
         record_output_parameter_value = AsyncMock()
 

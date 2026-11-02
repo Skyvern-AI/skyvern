@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 from datetime import UTC, datetime, timedelta
 from typing import Any, Literal
 
@@ -32,6 +33,7 @@ from skyvern.forge.sdk.workflow.schedules import (
     validate_cron_expression,
     validate_timezone_name,
 )
+from skyvern.forge.sdk.workflow.service import BACKEND_SCHEDULE_DELETE_TIMEOUT_SECONDS
 
 LOG = structlog.get_logger()
 SCHEDULE_SYNC_ERROR_DETAIL = "Failed to sync schedule with scheduling service"
@@ -856,11 +858,8 @@ async def delete_workflow_schedule_route(
             detail=f"Schedule {workflow_schedule_id} not found",
         )
 
-    await app.DATABASE.schedules.delete_workflow_schedule(
-        workflow_schedule_id=workflow_schedule_id,
-        organization_id=organization.organization_id,
-    )
-
+    # Backend first, so a failure leaves the row and its backend schedule as they were. The backend treats an
+    # already-deleted schedule as deleted, so a retry after a failed row delete converges.
     if not existing.backend_schedule_id:
         LOG.warning(
             "Deleting workflow schedule with no backend_schedule_id; skipping backend sync",
@@ -870,26 +869,20 @@ async def delete_workflow_schedule_route(
         )
     else:
         try:
-            await app.AGENT_FUNCTION.delete_workflow_schedule(existing.backend_schedule_id)
+            async with asyncio.timeout(BACKEND_SCHEDULE_DELETE_TIMEOUT_SECONDS):
+                await app.AGENT_FUNCTION.delete_workflow_schedule(existing.backend_schedule_id)
         except Exception as e:
             LOG.exception(
-                "Failed to delete schedule on execution backend, restoring DB record",
+                "Failed to delete schedule on execution backend; leaving the schedule in place",
+                workflow_schedule_id=workflow_schedule_id,
                 backend_schedule_id=existing.backend_schedule_id,
             )
-            try:
-                await app.DATABASE.schedules.restore_workflow_schedule(
-                    workflow_schedule_id=workflow_schedule_id,
-                    organization_id=organization.organization_id,
-                )
-            except Exception as rollback_err:
-                LOG.exception(
-                    "CRITICAL: DB rollback failed after backend sync failure, DB and backend may be out of sync",
-                    workflow_schedule_id=workflow_schedule_id,
-                    backend_schedule_id=existing.backend_schedule_id,
-                    rollback_error=str(rollback_err),
-                    original_error=str(e),
-                )
             raise _schedule_sync_error() from e
+
+    await app.DATABASE.schedules.delete_workflow_schedule(
+        workflow_schedule_id=workflow_schedule_id,
+        organization_id=organization.organization_id,
+    )
 
     await record_request_audit_event(
         organization.organization_id,

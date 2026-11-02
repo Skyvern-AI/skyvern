@@ -7,9 +7,13 @@ import { afterEach, describe, expect, test, vi } from "vitest";
 import type { StreamStateChangeHandler } from "@/routes/streaming/streamState";
 
 let transport: string | undefined = "cdp";
+let external = false;
 
 vi.mock("@/hooks/useRuntimeConfig", () => ({
-  useStreamTransport: () => ({ streamTransport: transport }),
+  useStreamTransport: () => ({
+    streamTransport: transport,
+    isExternal: external,
+  }),
 }));
 
 vi.mock("@/components/BrowserStream", () => ({
@@ -47,7 +51,10 @@ vi.mock("../../workflowRun/WorkflowRunStream", () => ({
 
 import { RunLiveStream } from "./RunLiveStream";
 
-afterEach(cleanup);
+afterEach(() => {
+  cleanup();
+  external = false;
+});
 
 describe("RunLiveStream", () => {
   test("streams the session, not the per-run key, on the cdp transport", () => {
@@ -94,6 +101,35 @@ describe("RunLiveStream", () => {
     expect(screen.queryByTestId("session-stream")).not.toBeNull();
     expect(onStreamStateChange).toHaveBeenLastCalledWith("live", "pbs_1");
   });
+
+  test.each(["vnc", "cdp"])(
+    "mounts no stream for a registered external browser on %s",
+    (globalTransport) => {
+      transport = globalTransport;
+      external = true;
+      const onStreamStateChange = vi.fn();
+      render(
+        <RunLiveStream
+          workflowRunId="wr_1"
+          browserSessionId="pbs_ext"
+          interactive={false}
+          onStreamStateChange={onStreamStateChange}
+        />,
+      );
+      expect(onStreamStateChange).toHaveBeenLastCalledWith(
+        "stopped",
+        "pbs_ext",
+      );
+      expect(
+        screen.getByText(
+          "Live view is not available for a registered external browser.",
+        ),
+      ).not.toBeNull();
+      expect(screen.queryByTestId("vnc-stream")).toBeNull();
+      expect(screen.queryByTestId("session-stream")).toBeNull();
+      expect(screen.queryByTestId("run-stream")).toBeNull();
+    },
+  );
 
   test("streams the per-run key when the run has no browser session", () => {
     transport = "vnc";

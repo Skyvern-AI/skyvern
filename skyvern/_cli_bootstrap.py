@@ -9,6 +9,7 @@ if TYPE_CHECKING:
 _DEFAULT_CLI_LOG_LEVEL = "WARNING"
 
 _CLI_RUNTIME_PREPARED = False
+_CLI_COMMAND_RUNNING = False
 
 CLOUD_URL_OPT_IN_MESSAGE = (
     "Refusing to send an API key to the default production URL. "
@@ -19,6 +20,16 @@ CLOUD_URL_OPT_IN_MESSAGE = (
 def is_cli_runtime() -> bool:
     """True only in processes that entered through a CLI command; API servers and temporal workers never set this."""
     return _CLI_RUNTIME_PREPARED
+
+
+def mark_cli_command() -> None:
+    """Label this process's API calls as the CLI; `skyvern run mcp` is also a CLI runtime but stays labelled MCP."""
+    global _CLI_COMMAND_RUNNING
+    _CLI_COMMAND_RUNNING = True
+
+
+def is_cli_command() -> bool:
+    return _CLI_COMMAND_RUNNING
 
 
 _QUIET_CLI_LOGGERS = ("skyvern", "httpx", "litellm", "playwright", "httpcore")

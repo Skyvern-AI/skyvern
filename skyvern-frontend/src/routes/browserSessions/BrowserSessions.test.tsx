@@ -19,6 +19,7 @@ const openUnoccupiedSession: BrowserSession = {
   status: "running",
   timeout: 60,
   vnc_streaming_supported: true,
+  source: "managed",
 };
 
 const createBrowserSessionMock = vi.fn();

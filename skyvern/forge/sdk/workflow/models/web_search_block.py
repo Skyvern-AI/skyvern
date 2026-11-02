@@ -19,7 +19,11 @@ from skyvern.forge.prompts import prompt_engine
 from skyvern.forge.sdk.core import skyvern_context
 from skyvern.forge.sdk.workflow import web_search_client
 from skyvern.forge.sdk.workflow.context_manager import WorkflowRunContext
-from skyvern.forge.sdk.workflow.exceptions import FailedToFormatJinjaStyleParameter, MissingJinjaVariables
+from skyvern.forge.sdk.workflow.exceptions import (
+    RENDER_FAILURE_OUTPUT_KEY,
+    FailedToFormatJinjaStyleParameter,
+    MissingJinjaVariables,
+)
 from skyvern.forge.sdk.workflow.models.block import (
     Block,
     TextPromptBlock,
@@ -27,6 +31,8 @@ from skyvern.forge.sdk.workflow.models.block import (
     _is_schema_configuration_failure,
     build_block_failure_output,
     jinja_sandbox_env,
+    render_failure_reason,
+    render_failure_record,
     user_defined_failure_category,
 )
 from skyvern.forge.sdk.workflow.models.parameter import PARAMETER_TYPE
@@ -50,6 +56,7 @@ def _block_output(
     category: FailureCategory | None,
     errors: list[UserDefinedError],
     available_keys: list[str] | None,
+    render_failure: dict[str, Any] | None,
 ) -> dict[str, Any]:
     output = response.output()
     if status != BlockStatus.completed:
@@ -66,6 +73,8 @@ def _block_output(
             ]
         if available_keys:
             output["available_keys"] = available_keys
+        if render_failure:
+            output[RENDER_FAILURE_OUTPUT_KEY] = render_failure
     return output
 
 
@@ -195,6 +204,7 @@ class WebSearchBlock(Block):
         merged_mapping: dict[str, str],
         mapping_is_page_derived: bool,
         failure_reason: str | None,
+        search_served: bool,
         workflow_run_id: str,
         workflow_run_block_id: str,
         organization_id: str | None,
@@ -223,10 +233,13 @@ class WebSearchBlock(Block):
         tz_info = run_context.tz_info if run_context and run_context.tz_info else datetime.now().astimezone().tzinfo
         search_data: dict[str, Any] = {
             "query": response.query,
-            "results": response.results,
             "prompt": rendered_prompt or None,
             "prompt_output": response.prompt_output,
         }
+        # A search that was never served has no result list to judge, and offering an empty one
+        # invites a code describing empty results. The failure itself still gets a code.
+        if search_served:
+            search_data["results"] = response.results
         if mapping_is_page_derived:
             search_data["error_codes"] = merged_mapping
         detection_prompt = prompt_engine.load_prompt(
@@ -286,6 +299,7 @@ class WebSearchBlock(Block):
         status = BlockStatus.completed
         errors: list[UserDefinedError] = []
         available_keys: list[str] | None = None
+        render_failure: dict[str, Any] | None = None
 
         def sanitize(data: Any) -> Any:
             if context is None:
@@ -293,8 +307,13 @@ class WebSearchBlock(Block):
             return redact_keys(context.mask_secrets_in_data(data), self._registered_secret_values(context))
 
         def template_failure(exc: Exception) -> None:
-            nonlocal failure_reason, category, status, available_keys
-            failure_reason = str(exc)
+            nonlocal failure_reason, category, status, available_keys, render_failure
+            if isinstance(exc, WebSearchError):
+                failure_reason = str(exc)
+            else:
+                redact = self.secret_redactor(context) if context else lambda value: value
+                failure_reason = render_failure_reason("Failed to format jinja template:", exc, redact)
+                render_failure = render_failure_record(exc, redact)
             category = FailureCategory.PARAMETER_BINDING_ERROR
             status = BlockStatus.failed
             format_exc: BaseException | None = exc
@@ -343,10 +362,12 @@ class WebSearchBlock(Block):
 
             execution_denied = False
             prompt_ran = False
+            search_served = False
             if failure_reason is None:
                 try:
                     async with asyncio.timeout(web_search_client.SEARCH_TIMEOUT_SECONDS):
                         await web_search_client.search(response, self.provider, self.num_results)
+                    search_served = True
                 except (TimeoutError, WebSearchError) as exc:
                     reason = str(exc) or (
                         f"{response.provider.title()} search timed out after "
@@ -355,6 +376,7 @@ class WebSearchBlock(Block):
                     if response.fallback_reason:
                         reason += f" Exa ran because {response.fallback_reason.rstrip('.')}."
                     if response.results:
+                        search_served = True
                         LOG.warning(
                             "Web search stopped before reaching the requested result count",
                             provider=response.provider,
@@ -483,6 +505,7 @@ class WebSearchBlock(Block):
                             merged_mapping,
                             mapping_is_page_derived,
                             failure_reason,
+                            search_served,
                             workflow_run_id,
                             workflow_run_block_id,
                             organization_id,
@@ -495,13 +518,17 @@ class WebSearchBlock(Block):
             if errors and failure_reason is None:
                 status = BlockStatus.terminated
                 failure_reason = errors[0].reasoning
-            output = sanitize(_block_output(response, status, failure_reason, category, errors, available_keys))
+            output = sanitize(
+                _block_output(response, status, failure_reason, category, errors, available_keys, render_failure)
+            )
             failure_reason = sanitize(failure_reason)
         except Exception as exc:  # noqa: BLE001
             status = BlockStatus.failed
             failure_reason = f"The Search block stopped on an unexpected error ({type(exc).__name__})."
             category = FailureCategory.INFRASTRUCTURE_ERROR
-            output = sanitize(_block_output(response, status, failure_reason, category, errors, available_keys))
+            output = sanitize(
+                _block_output(response, status, failure_reason, category, errors, available_keys, render_failure)
+            )
 
         if context is None:
             context = self.get_workflow_run_context(workflow_run_id)

@@ -3,12 +3,13 @@ from __future__ import annotations
 import asyncio
 import time
 from datetime import datetime, timedelta, timezone
-from typing import Annotated, Any, Literal
+from typing import TYPE_CHECKING, Annotated, Any, Literal
 from urllib.parse import parse_qs, parse_qsl, urlencode, urlparse, urlsplit, urlunsplit
 
 import structlog
 from pydantic import Field
 
+from skyvern.browser_extension.runtime import BrowserExtensionRuntime
 from skyvern.cli.core.browser_ops import (
     do_network_request_detail,
     do_network_requests,
@@ -30,6 +31,11 @@ from ._common import DIRECT_TARGET_DESCRIPTION, BrowserContext, ErrorCode, make_
 from ._element_state import DEFAULT_ACTION_TIMEOUT_MS, action_deadline_error
 from ._read_retry import retry_read_on_page_change
 from ._session import BrowserNotAvailableError, get_current_session, get_page, no_browser_error
+
+if TYPE_CHECKING:
+    from playwright.async_api import Page, Request
+
+    from skyvern.cli.core.session_manager import RequestFailure
 
 # Query param keys whose values are redacted from captured URLs.
 _SECRET_QUERY_PARAMS = frozenset(
@@ -228,12 +234,28 @@ async def _capture_body(response: Any, request_id: int, state: Any) -> None:
             state._body_store[request_id] = safe_body
 
 
+_RECORDED_REQUEST_FAILURE_TYPES = frozenset({"document", "xhr", "fetch"})
+
+
 def _make_page_handlers(state: Any, raw_page: Any) -> dict[str, Any]:
     """Create console/network/dialog/pageerror handlers bound to a specific page."""
     from skyvern.cli.core.session_manager import is_stateless_http_mode
 
     # Stateless HTTP mode disables every body reader, so a fetch there only blocks the hosting (API) event loop.
     capture_bodies = not is_stateless_http_mode()
+
+    def track_page_task(task: asyncio.Task[None]) -> None:
+        if state.context is None or state.context.mode != "extension":
+            return
+        tasks = state._page_pending_tasks.setdefault(id(raw_page), set())
+        tasks.add(task)
+
+        def forget_task(finished: asyncio.Task[None]) -> None:
+            tasks.discard(finished)
+            if not tasks and state._page_pending_tasks.get(id(raw_page)) is tasks:
+                state._page_pending_tasks.pop(id(raw_page), None)
+
+        task.add_done_callback(forget_task)
 
     def _on_console(msg: Any) -> None:
         try:
@@ -306,6 +328,7 @@ def _make_page_handlers(state: Any, raw_page: Any) -> dict[str, Any]:
                     task = asyncio.create_task(_capture_body(response, request_id, state))
                     state._pending_tasks.add(task)
                     task.add_done_callback(state._pending_tasks.discard)
+                    track_page_task(task)
                     captured_url = network_event.get("url")
                     callback_url = captured_url if type(captured_url) is str else ""
                     task.add_done_callback(lambda t: _body_capture_done(t, request_id, callback_url))
@@ -378,6 +401,47 @@ def _make_page_handlers(state: Any, raw_page: Any) -> dict[str, Any]:
         except BaseException:
             pass
 
+    def _on_requestfailed(request: Request) -> None:
+        try:
+            if request.resource_type not in _RECORDED_REQUEST_FAILURE_TYPES or raw_page.is_closed():
+                return
+            log = state.request_failures
+            if request in log.seen:
+                return
+            log.seen.add(request)
+            failure: RequestFailure = {
+                "url": _redact_url(request.url),
+                "method": request.method,
+                "resource_type": request.resource_type,
+                "failure_text": request.failure or "",
+                "page_url": _redact_url(raw_page.url),
+                "tab_id": str(id(raw_page)),
+                "timestamp": time.time(),
+            }
+            entry = _redact_inspection_value(state, failure)
+            if type(entry) is dict:
+                # tab_id is an internal key the model never sees; redacting it would file the entry under no tab.
+                entry["tab_id"] = failure["tab_id"]
+                log.append(entry)
+        except BaseException:
+            pass
+
+    def _on_close(_page: Page) -> None:
+        # Python reuses a closed page's id() for a later page, which would inherit these entries.
+        try:
+            failures = state.request_failures.take_tab(str(id(raw_page)))
+            if state.context is not None and state.context.mode == "extension":
+                runtime = BrowserExtensionRuntime.instance()
+                target_id = runtime.last_page_target_id(raw_page) if runtime is not None else None
+                record = runtime.tab_reconnect(target_id) if runtime is not None and target_id is not None else None
+                if record is not None and record.state in {"pending", "done"}:
+                    state._reconnect_request_failures[raw_page] = failures
+                    state.active_routes.pop(id(raw_page), None)
+                    for task in state._page_pending_tasks.pop(id(raw_page), set()):
+                        task.cancel()
+        except BaseException:
+            pass
+
     def _body_capture_done(task: asyncio.Task[None], request_id: int, url: str) -> None:
         if task.cancelled():
             return
@@ -406,6 +470,7 @@ def _make_page_handlers(state: Any, raw_page: Any) -> dict[str, Any]:
             task = asyncio.create_task(dialog.dismiss())
             state._pending_tasks.add(task)
             task.add_done_callback(state._pending_tasks.discard)
+            track_page_task(task)
             task.add_done_callback(lambda t: _dismiss_done(t, event_record))
         except BaseException:
             pass
@@ -443,7 +508,14 @@ def _make_page_handlers(state: Any, raw_page: Any) -> dict[str, Any]:
         except BaseException:
             pass
 
-    return {"console": _on_console, "response": _on_response, "dialog": _on_dialog, "pageerror": _on_pageerror}
+    return {
+        "console": _on_console,
+        "response": _on_response,
+        "requestfailed": _on_requestfailed,
+        "close": _on_close,
+        "dialog": _on_dialog,
+        "pageerror": _on_pageerror,
+    }
 
 
 def _register_hooks_on_page(state: Any, raw_page: Any) -> None:
@@ -455,6 +527,8 @@ def _register_hooks_on_page(state: Any, raw_page: Any) -> None:
     handlers = _make_page_handlers(state, raw_page)
     raw_page.on("console", handlers["console"])
     raw_page.on("response", handlers["response"])
+    raw_page.on("requestfailed", handlers["requestfailed"])
+    raw_page.on("close", handlers["close"])
     raw_page.on("dialog", handlers["dialog"])
     raw_page.on("pageerror", handlers["pageerror"])
     state._hooked_page_ids.add(page_id)
@@ -872,9 +946,11 @@ async def _page_cursor_binding(
     session_identity = (ctx.mode, resolved_id)
     epoch_js = "() => performance.timeOrigin"
     deadline = asyncio.get_running_loop().time() + DEFAULT_ACTION_TIMEOUT_MS / 1000
+    scope = None
     try:
+        scope = page.locator_scope
         document_epoch = await SkyvernFrame._evaluate_expression(
-            frame=page.locator_scope,
+            frame=scope,
             expression=epoch_js,
             evaluate_expression=lambda: page.locator_scope.evaluate(epoch_js),
             timeout_ms=DEFAULT_ACTION_TIMEOUT_MS,
@@ -887,7 +963,7 @@ async def _page_cursor_binding(
         # content read: a slow read must not be reported as the identity check timing out.
         if isinstance(exc, SkyvernPageAnalysisTimeout) or not deadline_ended_the_call(exc, deadline):
             raise
-        record_unreported_timeout(exc)
+        record_unreported_timeout(exc, scope)
         raise SkyvernPageAnalysisTimeout(str(exc)) from exc
     raise_if_cancelled()
     # Read after the epoch: it is the only await here, and navigation recovery can retry it against a

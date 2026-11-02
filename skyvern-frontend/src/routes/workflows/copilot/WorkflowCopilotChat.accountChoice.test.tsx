@@ -7,6 +7,7 @@ import {
   waitFor,
 } from "@testing-library/react";
 import type { ComponentProps } from "react";
+import { MemoryRouter } from "react-router-dom";
 import type { QuestionInteraction } from "./workflowCopilotTypes";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
@@ -19,6 +20,7 @@ type StreamBody = {
   mode?: "build";
   idempotency_key?: string | null;
   selected_connected_account_id?: string | null;
+  supports_google_setup_card?: boolean;
 };
 type StreamCall = {
   body: StreamBody;
@@ -93,13 +95,15 @@ vi.mock("react-router-dom", async (importOriginal) => {
 
 vi.mock("./cards/GoogleReconnectCard", () => ({
   GoogleReconnectCard: ({
+    notice,
     disabled,
     onSelect,
   }: {
+    notice: { scopeProfile: string };
     disabled?: boolean;
     onSelect?: (id: string) => void;
   }) => (
-    <div>
+    <div data-testid={`notice-${notice.scopeProfile}`}>
       Connection notice
       <button disabled={disabled} onClick={() => onSelect?.("goac_notice")}>
         Select notice account
@@ -149,6 +153,8 @@ vi.mock("@/store/WorkflowHasChangesStore", () => {
   };
 });
 vi.mock("@/routes/workflows/hooks/useWorkflowRunQuery", () => ({
+  useWorkflowRunQueries: (ids: readonly string[]) =>
+    ids.map(() => ({ data: undefined })),
   useWorkflowRunQuery: (options?: { workflowRunId?: string }) =>
     workflowRunQueryMock(options),
 }));
@@ -254,6 +260,50 @@ afterEach(() => {
 });
 
 describe("WorkflowCopilotChat connected account choices", () => {
+  it("restores separate Gmail and Sheets setup cards after reload and advertises the card", async () => {
+    historyResponse.data = {
+      workflow_copilot_chat_id: "chat-1",
+      proposed_workflow: null,
+      auto_accept: false,
+      chat_history: [
+        {
+          sender: "ai",
+          content: "Connect both accounts below.",
+          created_at: "2026-08-15T00:00:01Z",
+          narrative_payload: {
+            ...narrativePayload(false),
+            googleConnectionNotices: [
+              {
+                provider: "google",
+                connectionId: null,
+                condition: "unbound",
+                scopeProfile: "gmail",
+                origin: "setup",
+                choices: [],
+              },
+              {
+                provider: "google",
+                connectionId: null,
+                condition: "unbound",
+                scopeProfile: "google_sheets",
+                origin: "setup",
+                choices: [],
+              },
+            ],
+          },
+        },
+      ],
+    };
+    await renderChat();
+
+    expect(screen.getByTestId("notice-gmail")).toBeTruthy();
+    expect(screen.getByTestId("notice-google_sheets")).toBeTruthy();
+
+    await submit("connect them");
+    await waitFor(() => expect(postStreaming).toHaveBeenCalledTimes(1));
+    expect(streamCalls[0]?.body.supports_google_setup_card).toBe(true);
+  });
+
   it("renders a readable receipt from notice-only account metadata", async () => {
     historyResponse.data = {
       workflow_copilot_chat_id: "chat-1",
@@ -287,6 +337,44 @@ describe("WorkflowCopilotChat connected account choices", () => {
     expect(
       screen.getByText("Selected Google Sheets — Connection …goac_1"),
     ).toBeTruthy();
+  });
+
+  it("renders a readable receipt for a connection made after the card's turn", async () => {
+    historyResponse.data = {
+      workflow_copilot_chat_id: "chat-1",
+      proposed_workflow: null,
+      auto_accept: false,
+      chat_history: [
+        {
+          sender: "ai",
+          content: "Connect",
+          created_at: "2026-08-15T00:00:01Z",
+          narrative_payload: {
+            ...narrativePayload(false),
+            googleConnectionNotices: [
+              {
+                provider: "google",
+                connectionId: null,
+                condition: "unbound",
+                scopeProfile: "gmail",
+                origin: "setup",
+                choices: [],
+              },
+            ],
+          },
+        },
+        {
+          sender: "user",
+          content: "goac_587307069786375772",
+          created_at: "2026-08-15T00:00:02Z",
+        },
+      ],
+    };
+    await renderChat();
+    expect(
+      screen.getByText("Selected Google connection …86375772"),
+    ).toBeTruthy();
+    expect(screen.queryByText("goac_587307069786375772")).toBeNull();
   });
 
   it.each([false, true])(
@@ -822,5 +910,37 @@ describe("WorkflowCopilotChat connected account choices", () => {
       ).toBeTruthy(),
     );
     expect(screen.queryByText("goac_1")).toBeNull();
+  });
+});
+
+describe("WorkflowCopilotChat unavailable agent notice", () => {
+  it("links to the agents list from the typed facts", async () => {
+    historyResponse.data = {
+      workflow_copilot_chat_id: "chat-1",
+      proposed_workflow: null,
+      auto_accept: false,
+      chat_history: [
+        {
+          sender: "ai",
+          content: "I could not save the change.",
+          created_at: "2026-08-15T00:00:01Z",
+          narrative_payload: {
+            ...narrativePayload(false),
+            canonicalWorkflowUnavailable: {
+              workflow_permanent_id: "wpid_bound",
+              candidate_published: false,
+              test_started: false,
+            },
+          },
+        },
+      ],
+    };
+    render(<MemoryRouter>{chatElement()}</MemoryRouter>);
+    await act(async () => {});
+    const requestsBefore = postStreaming.mock.calls.length;
+    const link = await screen.findByRole("link", { name: "Open Agents" });
+    expect(link.getAttribute("href")).toBe("/agents");
+    fireEvent.click(link);
+    expect(postStreaming.mock.calls.length).toBe(requestsBefore);
   });
 });

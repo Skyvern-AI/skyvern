@@ -1,6 +1,10 @@
 import { useEffect, useRef, useState } from "react";
 import { useCredentialGetter } from "@/hooks/useCredentialGetter";
-import { getRuntimeApiKey, newWssBaseUrl } from "@/util/env";
+import {
+  getWebSocketProtocols,
+  hasWebSocketCredential,
+  newWssBaseUrl,
+} from "@/util/env";
 
 export type VerificationRequest = {
   type: "verification_code";
@@ -37,27 +41,18 @@ export function useNotificationStream() {
       // Prevent connecting if tab is hidden, auth failed, or unmounted
       if (isCancelled || authFailedRef.current || document.hidden) return;
 
-      // Flatten authorization query building
-      let authQuery = "";
-      if (credentialGetter) {
-        // A null token (transient Clerk failure) must not become "Bearer null":
-        // the server closes it 1002, which latches authFailedRef and stops all
-        // reconnects. Skip this cycle instead and reconnect on the next trigger.
-        const token = await credentialGetter();
-        if (token) {
-          authQuery = `?token=Bearer ${token}`;
-        }
-      } else if (getRuntimeApiKey()) {
-        authQuery = `?apikey=${getRuntimeApiKey()}`;
-      }
-
-      if (!authQuery || isCancelled) return;
+      // A null token (transient Clerk failure) must not reach the server: it closes a
+      // credential-less socket 1002, which latches authFailedRef and stops all reconnects.
+      // Skip this cycle instead and reconnect on the next trigger.
+      const protocols = await getWebSocketProtocols(credentialGetter);
+      if (!hasWebSocketCredential(protocols) || isCancelled) return;
 
       // Clean up existing socket before opening a new one
       socketRef.current?.close();
 
       const socket = new WebSocket(
-        `${newWssBaseUrl}/stream/notifications${authQuery}`,
+        `${newWssBaseUrl}/stream/notifications`,
+        protocols,
       );
       socketRef.current = socket;
       let connectionOpened = false;

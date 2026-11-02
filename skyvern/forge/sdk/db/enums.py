@@ -45,12 +45,14 @@ class WorkflowRunTriggerType(StrEnum):
     """How a workflow run was initiated.
 
     - manual: User clicked "Run" in the UI
-    - mcp: First-party MCP client request
+    - mcp: First-party MCP client or Skyvern CLI request
     - api: Direct API call to the run endpoint
     - scheduled: Triggered by a cron schedule
     - webhook: Triggered by an external system via the webhook endpoint
+    - event: Triggered by an external event source
     - job_recipe_extract: Launched by a job recipe extract request
     - job_recipe_apply: Launched by a job recipe apply request
+    - seo_recipe_submit: Launched by an SEO recipe directory submission
     """
 
     manual = "manual"
@@ -58,8 +60,29 @@ class WorkflowRunTriggerType(StrEnum):
     api = "api"
     scheduled = "scheduled"
     webhook = "webhook"
+    event = "event"
     job_recipe_extract = "job_recipe_extract"
     job_recipe_apply = "job_recipe_apply"
+    seo_recipe_submit = "seo_recipe_submit"
+
+
+class WorkflowBuildSource(StrEnum):
+    """Which surface wrote a workflow version.
+
+    - ui: the Skyvern app
+    - copilot: the workflow copilot
+    - mcp: a first-party MCP client
+    - cli: the Skyvern CLI
+    - api: any other API or SDK caller
+    - internal: a workflow Skyvern creates for its own runs (task v2, login, credential tests)
+    """
+
+    ui = "ui"
+    copilot = "copilot"
+    mcp = "mcp"
+    cli = "cli"
+    api = "api"
+    internal = "internal"
 
 
 MANUAL_LIKE_WORKFLOW_RUN_TRIGGER_TYPES = frozenset(
@@ -84,6 +107,15 @@ JOB_RECIPE_WORKFLOW_RUN_TRIGGER_TYPES = frozenset(
 
 def is_job_recipe_workflow_run_trigger_type(trigger_type: WorkflowRunTriggerType | None) -> bool:
     return trigger_type in JOB_RECIPE_WORKFLOW_RUN_TRIGGER_TYPES
+
+
+RECIPE_BILLING_WORKFLOW_RUN_TRIGGER_TYPES = JOB_RECIPE_WORKFLOW_RUN_TRIGGER_TYPES | frozenset(
+    {WorkflowRunTriggerType.seo_recipe_submit}
+)
+
+
+def is_recipe_billing_workflow_run_trigger_type(trigger_type: WorkflowRunTriggerType | None) -> bool:
+    return trigger_type in RECIPE_BILLING_WORKFLOW_RUN_TRIGGER_TYPES
 
 
 class WorkflowRunStatus(StrEnum):

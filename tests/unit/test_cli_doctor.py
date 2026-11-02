@@ -174,6 +174,7 @@ def test_copilot_safety_check_honors_runtime_environment(
         ("YOUR_API_KEY", True),
         ("__SKYVERN_API_KEY_PLACEHOLDER__", True),
         ("__VITE_API_BASE_URL_PLACEHOLDER__", True),
+        ("__VITE_API_BASE_URL_PLACEHOLDER__-__", True),
         ("real-value", False),
     ],
 )

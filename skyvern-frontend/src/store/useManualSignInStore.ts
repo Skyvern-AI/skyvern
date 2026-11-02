@@ -30,3 +30,21 @@ export function useManualSignInControl(
     wasSigningIn.current = signingIn;
   }, [signingIn, setUserIsControlling]);
 }
+
+export function useDemonstrationControl(
+  recording: boolean,
+  controllable: boolean,
+  setUserIsControlling: (controlling: boolean) => void,
+  connectionReady = true,
+) {
+  const holdingControl = recording && controllable;
+  const wasHoldingControl = useRef(false);
+  useEffect(() => {
+    if (holdingControl) {
+      setUserIsControlling(true);
+    } else if (wasHoldingControl.current) {
+      setUserIsControlling(false);
+    }
+    wasHoldingControl.current = holdingControl;
+  }, [connectionReady, holdingControl, setUserIsControlling]);
+}

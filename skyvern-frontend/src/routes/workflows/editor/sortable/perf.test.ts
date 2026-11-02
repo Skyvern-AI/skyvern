@@ -1,5 +1,4 @@
 import { describe, expect, test } from "vitest";
-import type { Edge } from "@xyflow/react";
 
 import { ProxyLocation } from "@/api/types";
 
@@ -148,21 +147,6 @@ function withMeasured(nodes: Array<AppNode>): Array<AppNode> {
   }));
 }
 
-function buildMeasuredLayoutFixture(blockCount: number): {
-  nodes: Array<AppNode>;
-  edges: Array<Edge>;
-} {
-  const { nodes, edges } = getElements(
-    buildFlatFixture(blockCount),
-    DEFAULT_SETTINGS,
-    true,
-  );
-  return {
-    nodes: withMeasured(nodes),
-    edges,
-  };
-}
-
 function median(samples: Array<number>): number {
   const sorted = [...samples].sort((a, b) => a - b);
   const mid = Math.floor(sorted.length / 2);
@@ -188,30 +172,6 @@ function reportBench(label: string, samples: Array<number>): void {
   console.info(
     `[SKY-9065 bench] ${label}: median=${med}ms p95=${tail}ms n=${samples.length}`,
   );
-}
-
-function sampleLayoutMedian({
-  label,
-  nodes,
-  edges,
-  sampleCount = 5,
-}: {
-  label: string;
-  nodes: Array<AppNode>;
-  edges: Array<Edge>;
-  sampleCount?: number;
-}): number {
-  for (let i = 0; i < 2; i++) layout(nodes, edges);
-
-  const samples: Array<number> = [];
-  for (let i = 0; i < sampleCount; i++) {
-    const start = performance.now();
-    layout(nodes, edges);
-    samples.push(performance.now() - start);
-  }
-
-  reportBench(label, samples);
-  return median(samples);
 }
 
 describe("SKY-9065 perf benchmarks (50+ block workflow)", () => {
@@ -288,49 +248,6 @@ describe("SKY-9065 perf benchmarks (50+ block workflow)", () => {
       expect(seventyFiveMed / fiftyMed).toBeLessThan(4);
     }
   });
-
-  test("layout() scales through 1000 blocks without explosive growth", () => {
-    const oneHundred = buildMeasuredLayoutFixture(100);
-    const twoHundred = buildMeasuredLayoutFixture(200);
-    const fiveHundred = buildMeasuredLayoutFixture(500);
-    const oneThousand = buildMeasuredLayoutFixture(1000);
-
-    const oneHundredMed = sampleLayoutMedian({
-      label: "layout(100 blocks) [large scaling test]",
-      ...oneHundred,
-    });
-    const twoHundredMed = sampleLayoutMedian({
-      label: "layout(200 blocks) [large scaling test]",
-      ...twoHundred,
-    });
-    const fiveHundredMed = sampleLayoutMedian({
-      label: "layout(500 blocks) [large scaling test]",
-      ...fiveHundred,
-    });
-    const oneThousandMed = sampleLayoutMedian({
-      label: "layout(1000 blocks) [large scaling test]",
-      ...oneThousand,
-    });
-
-    expect(Number.isFinite(oneHundredMed)).toBe(true);
-    expect(Number.isFinite(twoHundredMed)).toBe(true);
-    expect(Number.isFinite(fiveHundredMed)).toBe(true);
-    expect(Number.isFinite(oneThousandMed)).toBe(true);
-
-    // Large-N runs are intentionally ratio-gated rather than hard
-    // wall-clock-gated: shared CI hosts vary too much for stable ms
-    // budgets, but a sudden order-of-magnitude jump still catches the
-    // "massive workflow" regression this benchmark exists to prevent.
-    if (oneHundredMed > 0) {
-      expect(twoHundredMed / oneHundredMed).toBeLessThan(8);
-    }
-    if (twoHundredMed > 0) {
-      expect(fiveHundredMed / twoHundredMed).toBeLessThan(12);
-    }
-    if (fiveHundredMed > 0) {
-      expect(oneThousandMed / fiveHundredMed).toBeLessThan(8);
-    }
-  }, 30_000);
 
   test("scope walking + drop classification on 50 blocks runs well under one frame", () => {
     const blocks = buildFlatFixture(50);

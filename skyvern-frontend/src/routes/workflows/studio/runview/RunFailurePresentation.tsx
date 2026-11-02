@@ -8,6 +8,8 @@ import {
 import { type WorkflowRunStatusApiResponseWithWorkflow } from "@/api/types";
 import { runIsRetryWaiting } from "@/routes/workflows/workflowRun/runRetryState";
 import { Button } from "@/components/ui/button";
+
+import { type RunErrorCode } from "../runProjections";
 // Fix leads when it is offered; Retry is the primary only when it stands alone.
 export function FailureRecoveryActions({
   onFix,
@@ -56,11 +58,48 @@ export function FailureTips({ tips }: { tips: Array<string> }) {
   );
 }
 
+// Past this many the codes would own the line; the rest stay one click away in
+// Outputs → Errors, which lists every code with its message.
+const MAX_FAILURE_LINE_ERROR_CODES = 3;
+
+// Verbatim, because customers match on the exact code — same text as
+// Outputs → Errors, so neither surface has to be translated to the other.
+export function RunFailureErrorCodes({
+  codes,
+}: {
+  codes: Array<RunErrorCode>;
+}) {
+  const shown = codes.slice(0, MAX_FAILURE_LINE_ERROR_CODES);
+  const hidden = codes.length - shown.length;
+  return (
+    <>
+      {shown.map((entry) => (
+        <code
+          key={entry.code}
+          title={entry.message ?? undefined}
+          className="shrink-0 rounded border border-destructive/40 bg-destructive/10 px-1.5 py-0.5 font-mono text-[11px] leading-4 text-destructive"
+        >
+          {entry.code}
+        </code>
+      ))}
+      {hidden > 0 ? (
+        <span
+          className="shrink-0 text-[11px] text-muted-foreground"
+          title="Outputs → Errors lists every error code for this run."
+        >
+          +{hidden} more
+        </span>
+      ) : null}
+    </>
+  );
+}
+
 // The strip's second line. The block name is the jump; the full
 // reason rides the headline's title so nothing else is said at run level.
 export function RunFailureLine({
   workflowRun,
   blockLabel,
+  errorCodes,
   headline,
   detail,
   onJump,
@@ -69,6 +108,7 @@ export function RunFailureLine({
 }: {
   workflowRun?: WorkflowRunStatusApiResponseWithWorkflow;
   blockLabel: string | null;
+  errorCodes: Array<RunErrorCode>;
   headline: string;
   detail: string | null;
   onJump?: () => void;
@@ -100,6 +140,7 @@ export function RunFailureLine({
           {blockLabel}
         </button>
       ) : null}
+      <RunFailureErrorCodes codes={errorCodes} />
       <span
         className="min-w-0 flex-auto truncate text-foreground"
         title={detail ?? undefined}

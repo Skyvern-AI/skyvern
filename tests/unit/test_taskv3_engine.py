@@ -47,7 +47,11 @@ from skyvern.forge.taskv3.engine import (
     run_task_v3_agent_loop,
     taskv3_runaway_backstops,
 )
-from skyvern.forge.taskv3.goal_check import INSTRUCTIONS_MAX_CHARS, UNLISTED_REASK_PROMPT_NAME
+from skyvern.forge.taskv3.goal_check import (
+    INSTRUCTIONS_MAX_CHARS,
+    TERMINATE_PREMISE_PROMPT_NAME,
+    UNLISTED_REASK_PROMPT_NAME,
+)
 from skyvern.forge.taskv3.goal_composition import CodeTypedValue
 from skyvern.forge.taskv3.handoff_redaction import caller_known_published_urls
 from skyvern.forge.taskv3.llm_call_params import reasoning_effort_with_summary
@@ -62,7 +66,9 @@ from skyvern.forge.taskv3.loop import (
     _ProgressEvidence,
 )
 from skyvern.forge.taskv3.opaque_refs import OpaqueUrlRefs, mask_opaque_urls
-from skyvern.forge.taskv3.tools import PAGE_UNAVAILABLE_ERROR
+from skyvern.forge.taskv3.run_arms import ANSWER_AUDIT_LOG_ONLY_FLAG
+from skyvern.forge.taskv3.tools import PAGE_UNAVAILABLE_ERROR, DownloadFailureWatch
+from skyvern.forge.taskv3.turn_dom import TurnDomCapture
 from skyvern.schemas.llm import LLMConfig, LLMRouterConfig, LLMRouterModelConfig
 from skyvern.utils.prompt_engine import PROMPT_HARD_CEILING_TOKENS
 from skyvern.utils.token_counter import count_tokens
@@ -198,6 +204,53 @@ async def test_engine_exposes_browser_and_finish_tools_no_task_ecosystem() -> No
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("llm_route_arm", ["treatment", "control", None])
+async def test_engine_finished_line_carries_the_llm_route_arm_the_caller_recorded(llm_route_arm: str | None) -> None:
+    caller = _ScriptedCaller([[("finish", {"status": "completed", "reason": "done"})]])
+    caller.llm_key = "ANY_ROUTE"
+    with capture_logs() as logs:
+        await run_task_v3_agent_loop(
+            page_provider=_fixed_page_provider(_FakePage()), llm_caller=caller, goal="x", llm_route_arm=llm_route_arm
+        )
+
+    finished = next(entry for entry in logs if entry["event"] == "taskv3 engine loop finished")
+    assert (finished["llm_key"], finished["llm_route_arm"]) == ("ANY_ROUTE", llm_route_arm)
+
+
+@pytest.mark.asyncio
+async def test_engine_joins_the_turn_page_read_after_each_model_call_and_logs_its_totals() -> None:
+    saved: list[bytes] = []
+
+    def store(_step: Any, html: bytes) -> str:
+        saved.append(html)
+        return f"a_{len(saved)}"
+
+    turn_dom = TurnDomCapture(AsyncMock(return_value="<p>page</p>"), store)
+
+    async def on_turn_start(turn: int) -> None:
+        turn_dom.start(SimpleNamespace(step_id=f"turn-{turn}"), turn)
+
+    caller = _ScriptedCaller([[("observe", {})], [("finish", {"status": "completed", "reason": "done"})]])
+    with capture_logs() as logs:
+        await run_task_v3_agent_loop(
+            page_provider=_fixed_page_provider(_FakePage()),
+            llm_caller=caller,
+            goal="x",
+            on_turn_start=on_turn_start,
+            turn_dom=turn_dom,
+        )
+
+    finished = next(entry for entry in logs if entry["event"] == "taskv3 engine loop finished")
+    assert (finished["dom_arm"], finished["dom_captures"], finished["dom_stored"], finished["dom_deduped"]) == (
+        True,
+        2,
+        1,
+        1,
+    )
+    assert saved == [b"<p>page</p>"]
+
+
+@pytest.mark.asyncio
 async def test_engine_records_billable_actions() -> None:
     # observe/finish are not billable; type + click are — so per-action billing counts 2.
     script = [
@@ -237,6 +290,69 @@ async def test_engine_wires_budget_and_retry_defaults(monkeypatch: pytest.Monkey
     assert captured["deadline_seconds"] == engine_mod.DEFAULT_DEADLINE_SECONDS
     assert captured["max_call_retries"] == engine_mod.DEFAULT_MAX_CALL_RETRIES
     assert captured["retryable_call_exceptions"] == (LLMProviderErrorRetryableTask,)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("marks", [False, True])
+async def test_engine_passes_claude_cache_marks_through_to_the_loop(
+    monkeypatch: pytest.MonkeyPatch, marks: bool
+) -> None:
+    from skyvern.forge.taskv3 import engine as engine_mod
+    from skyvern.forge.taskv3.loop import LoopOutcome
+
+    captured: dict[str, object] = {}
+
+    async def _capture(**kwargs: object) -> LoopOutcome:
+        captured.update(kwargs)
+        return LoopOutcome(status="completed", reason="ok")
+
+    monkeypatch.setattr(engine_mod, "run_agent_tool_loop", _capture)
+    await run_task_v3_agent_loop(
+        page_provider=_fixed_page_provider(_FakePage()),
+        llm_caller=_ScriptedCaller([]),
+        goal="x",
+        anthropic_cache_markers=marks,
+    )
+
+    assert captured["anthropic_cache_markers"] is marks
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("page_free", [False, True])
+async def test_engine_samples_a_single_actions_effect_with_the_action_effect_fingerprint(
+    monkeypatch: pytest.MonkeyPatch, page_free: bool
+) -> None:
+    # The settle fingerprint drops a frame that will not answer, which would read as the action having an effect.
+    from skyvern.forge.taskv3 import engine as engine_mod
+    from skyvern.forge.taskv3.loop import LoopOutcome
+
+    captured: dict[str, object] = {}
+
+    async def _capture(**kwargs: object) -> LoopOutcome:
+        captured.update(kwargs)
+        return LoopOutcome(status="completed", reason="ok")
+
+    async def unmasked() -> str:
+        return "unmasked"
+
+    async def masked() -> str:
+        return "masked"
+
+    async def action_effect() -> str:
+        return "action_effect"
+
+    monkeypatch.setattr(engine_mod, "run_agent_tool_loop", _capture)
+    await run_task_v3_agent_loop(
+        page_provider=_fixed_page_provider(_FakePage()),
+        llm_caller=_ScriptedCaller([]),
+        goal="x",
+        page_free=page_free,
+        page_fingerprint=unmasked,
+        settle_fingerprint=masked,
+        action_effect_fingerprint=action_effect,
+    )
+
+    assert captured["action_effect_fingerprint"] is (None if page_free else action_effect)
 
 
 @pytest.mark.asyncio
@@ -1055,6 +1171,60 @@ async def test_signed_url_rendered_into_model_facing_text_reaches_model_only_as_
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(("block_type", "navigates"), [("validation", False), ("extraction", True), ("action", True)])
+async def test_only_a_validation_block_is_refused_navigation(
+    monkeypatch: pytest.MonkeyPatch, block_type: str, navigates: bool
+) -> None:
+    import skyvern.utils.url_validators as urlv
+
+    monkeypatch.setattr(urlv, "validate_fetch_url", lambda url: url)
+    start_url, other_url = "https://portal.example.test/case", "https://portal.example.test/other"
+    caller = _ScriptedCaller(
+        [[("navigate", {"url": other_url})], [("finish", {"status": "completed", "reason": "checked"})]]
+    )
+    page = _FakePage()
+    page.url = start_url
+    outcome = await run_task_v3_agent_loop(
+        page_provider=_fixed_page_provider(page),
+        llm_caller=caller,
+        goal="Check the case.",
+        starting_url=start_url,
+        block_type=block_type,
+    )
+
+    assert page.url == (other_url if navigates else start_url)
+    navigate_result = next(m["content"] for m in outcome.messages if m.get("role") == "tool")
+    assert navigate_result.startswith("refused") is not navigates
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("start_url", "masked"),
+    [
+        ("https://portal.example.test/case?ticket=q8ZtR2vXk9LmP4sWb7NcY1hJd6FgT3aE", True),
+        ("https://portal.example.test/case/42", False),
+    ],
+)
+async def test_a_start_url_the_browser_is_on_is_not_offered_as_a_destination(start_url: str, masked: bool) -> None:
+    caller = _ScriptedCaller([[("finish", {"status": "completed", "reason": "checked"})]])
+    page = _FakePage()
+    page.url = start_url
+    outcome = await run_task_v3_agent_loop(
+        page_provider=_fixed_page_provider(page),
+        llm_caller=caller,
+        goal="Check that the case is open.",
+        starting_url=start_url,
+        starting_url_is_current=True,
+    )
+
+    user_prompt = next(m["content"] for m in outcome.messages if m.get("role") == "user")
+    assert "You start on" not in user_prompt
+    shown = OpaqueUrlRefs(masked=None, refs={}).derive(start_url) if masked else start_url
+    assert shown in user_prompt
+    assert "ticket=" not in user_prompt
+
+
+@pytest.mark.asyncio
 async def test_business_identifier_value_under_a_non_signing_key_stays_readable() -> None:
     # A token-shaped VALUE under an ordinary business KEY (order id, not a signing param) must never be
     # tokenized: neither in the payload nor in ordinary page content the model reads.
@@ -1129,15 +1299,20 @@ async def test_page_free_mode_does_not_mask_signed_urls() -> None:
 
 
 @pytest.mark.asyncio
-async def test_engine_forwards_completion_hooks_and_gates_guidance_on_probe(monkeypatch: pytest.MonkeyPatch) -> None:
-    # completion_probe must reach the loop and completion_blocker must reach the finish tool, and
-    # the download-completion guidance is appended to the system prompt only when a probe is given.
-    from skyvern.forge.taskv3 import engine as engine_mod
-    from skyvern.forge.taskv3.engine import DOWNLOAD_COMPLETION_GUIDANCE
-    from skyvern.forge.taskv3.loop import LoopOutcome
-
+async def test_engine_forwards_download_hooks_without_a_download_order(monkeypatch: pytest.MonkeyPatch) -> None:
     loop_kwargs: dict[str, Any] = {}
     finish_kwargs: dict[str, Any] = {}
+    watches: list[DownloadFailureWatch] = []
+    closed: list[DownloadFailureWatch] = []
+
+    class RecordingWatch(DownloadFailureWatch):
+        def __init__(self, *args: Any, **kwargs: Any) -> None:
+            super().__init__(*args, **kwargs)
+            watches.append(self)
+
+        def close(self) -> None:
+            closed.append(self)
+            super().close()
 
     async def fake_loop(**kwargs: Any) -> LoopOutcome:
         loop_kwargs.update(kwargs)
@@ -1149,93 +1324,51 @@ async def test_engine_forwards_completion_hooks_and_gates_guidance_on_probe(monk
         finish_kwargs.update(kwargs)
         return real_make_finish_tool(*args, **kwargs)
 
+    tools_kwargs: dict[str, Any] = {}
+    real_build = engine_mod.build_browser_tools
+
+    def capturing_build(*args: Any, **kwargs: Any) -> Any:
+        tools_kwargs.update(kwargs)
+        return real_build(*args, **kwargs)
+
     monkeypatch.setattr(engine_mod, "run_agent_tool_loop", fake_loop)
     monkeypatch.setattr(engine_mod, "make_finish_tool", capturing_make_finish_tool)
+    monkeypatch.setattr(engine_mod, "DownloadFailureWatch", RecordingWatch)
+    monkeypatch.setattr(engine_mod, "build_browser_tools", capturing_build)
 
-    async def probe(_staged: frozenset[str]) -> str | None:
-        return "a file finished downloading"
-
-    async def blocker(_staged: frozenset[str]) -> str | None:
+    async def probe() -> None:
         return None
 
     await run_task_v3_agent_loop(
         page_provider=_fixed_page_provider(_FakePage()),
         llm_caller=_ScriptedCaller([]),
         goal="download the file",
-        completion_probe=probe,
-        completion_blocker=blocker,
+        download_wait=probe,
+        download_settle=_no_download_pending,
     )
-    assert loop_kwargs["completion_probe"] is probe
-    assert finish_kwargs["completion_blocker"] is blocker
-    assert DOWNLOAD_COMPLETION_GUIDANCE in loop_kwargs["system_prompt"]
+    assert tools_kwargs["download_wait"] is probe
+    assert finish_kwargs["download_settle"] is _no_download_pending
+    download_prompt = loop_kwargs["system_prompt"]
     # One staged_downloads set is shared between the loop and the finish tool -- a name staged via
-    # a billable tool call must be visible to the SAME finish-tool blocker, not a divergent copy.
+    # a billable tool call must be visible to the SAME finish-tool settle hook, not a divergent copy.
     assert loop_kwargs["staged_downloads"] is finish_kwargs["staged_downloads"]
     assert isinstance(loop_kwargs["staged_downloads"], set)
+    [watch] = watches
+    assert watch in closed
+    assert finish_kwargs["download_facts"] is watch.facts
 
-    loop_kwargs.clear()
-    finish_kwargs.clear()
     await run_task_v3_agent_loop(
         page_provider=_fixed_page_provider(_FakePage()), llm_caller=_ScriptedCaller([]), goal="download the file"
     )
-    assert loop_kwargs["completion_probe"] is None
-    assert finish_kwargs["completion_blocker"] is None
-    assert DOWNLOAD_COMPLETION_GUIDANCE not in loop_kwargs["system_prompt"]
-
-
-@pytest.mark.asyncio
-async def test_engine_guidance_keyed_on_which_hooks_are_present(monkeypatch: pytest.MonkeyPatch) -> None:
-    # blocker-only (extraction tasks: the probe would end the loop before the model returns
-    # extracted_output) gets the DOWNLOAD_REQUIRED variant naming finish(completed) as the model's
-    # own job; probe-only (download_timeout alone, wait-only) has no completion semantics at all,
-    # so it gets neither guidance string.
-    from skyvern.forge.taskv3 import engine as engine_mod
-    from skyvern.forge.taskv3.engine import DOWNLOAD_COMPLETION_GUIDANCE, DOWNLOAD_REQUIRED_GUIDANCE
-    from skyvern.forge.taskv3.loop import LoopOutcome
-
-    loop_kwargs: dict[str, Any] = {}
-
-    async def fake_loop(**kwargs: Any) -> LoopOutcome:
-        loop_kwargs.update(kwargs)
-        return LoopOutcome(status="completed", reason="ok")
-
-    monkeypatch.setattr(engine_mod, "run_agent_tool_loop", fake_loop)
-
-    async def blocker(_staged: frozenset[str]) -> str | None:
-        return None
-
-    await run_task_v3_agent_loop(
-        page_provider=_fixed_page_provider(_FakePage()),
-        llm_caller=_ScriptedCaller([]),
-        goal="download the file",
-        completion_blocker=blocker,
+    assert len(watches) == 1
+    assert finish_kwargs["download_facts"] is None
+    assert (
+        download_prompt.split("\n\nToday's date is")[0] == loop_kwargs["system_prompt"].split("\n\nToday's date is")[0]
     )
-    assert DOWNLOAD_REQUIRED_GUIDANCE in loop_kwargs["system_prompt"]
-    assert DOWNLOAD_COMPLETION_GUIDANCE not in loop_kwargs["system_prompt"]
-
-    loop_kwargs.clear()
-
-    async def probe(_staged: frozenset[str]) -> str | None:
-        return None
-
-    await run_task_v3_agent_loop(
-        page_provider=_fixed_page_provider(_FakePage()),
-        llm_caller=_ScriptedCaller([]),
-        goal="download the file",
-        completion_probe=probe,
-    )
-    assert DOWNLOAD_REQUIRED_GUIDANCE not in loop_kwargs["system_prompt"]
-    assert DOWNLOAD_COMPLETION_GUIDANCE not in loop_kwargs["system_prompt"]
 
 
 @pytest.mark.asyncio
 async def test_engine_drops_download_hooks_in_page_free_mode(monkeypatch: pytest.MonkeyPatch) -> None:
-    # No browser tools exist to trigger a download, so a blocker would refuse finish(completed)
-    # forever; page-free runs get neither hook nor the download guidance.
-    from skyvern.forge.taskv3 import engine as engine_mod
-    from skyvern.forge.taskv3.engine import DOWNLOAD_COMPLETION_GUIDANCE, DOWNLOAD_REQUIRED_GUIDANCE
-    from skyvern.forge.taskv3.loop import LoopOutcome
-
     loop_kwargs: dict[str, Any] = {}
     finish_kwargs: dict[str, Any] = {}
 
@@ -1252,11 +1385,8 @@ async def test_engine_drops_download_hooks_in_page_free_mode(monkeypatch: pytest
     monkeypatch.setattr(engine_mod, "run_agent_tool_loop", fake_loop)
     monkeypatch.setattr(engine_mod, "make_finish_tool", capturing_make_finish_tool)
 
-    async def probe(_staged: frozenset[str]) -> str | None:
-        return "a file finished downloading"
-
-    async def blocker(_staged: frozenset[str]) -> str | None:
-        return "no download yet"
+    async def probe() -> None:
+        return None
 
     async def verification_blocker(_status: str) -> str | None:
         return "no code arrived"
@@ -1266,15 +1396,12 @@ async def test_engine_drops_download_hooks_in_page_free_mode(monkeypatch: pytest
         llm_caller=_ScriptedCaller([]),
         goal="validate the record",
         page_free=True,
-        completion_probe=probe,
-        completion_blocker=blocker,
+        download_wait=probe,
+        download_settle=_no_download_pending,
         verification_blocker=verification_blocker,
     )
-    assert loop_kwargs["completion_probe"] is None
-    assert finish_kwargs["completion_blocker"] is None
+    assert finish_kwargs["download_settle"] is None
     assert finish_kwargs["verification_blocker"] is None
-    assert DOWNLOAD_COMPLETION_GUIDANCE not in loop_kwargs["system_prompt"]
-    assert DOWNLOAD_REQUIRED_GUIDANCE not in loop_kwargs["system_prompt"]
 
 
 @pytest.mark.asyncio
@@ -1606,11 +1733,11 @@ async def test_the_answer_audit_wraps_the_run_tools_and_sees_the_instructions(mo
     applied: list[tuple[list[str], object]] = []
     audit = object()
 
-    def hook(parameters: Any, *, goal: str, organization_id: Any, step: Any) -> object:
+    async def hook(parameters: Any, *, goal: str, organization_id: Any, step: Any) -> object:
         hook_calls.append({"parameters": parameters, "goal": goal})
         return audit
 
-    def spy(tools: list[Any], answer_audit: Any) -> None:
+    def spy(tools: list[Any], answer_audit: Any, **_kwargs: Any) -> None:
         applied.append(([t.name for t in tools], answer_audit))
 
     monkeypatch.setattr(app.AGENT_FUNCTION, "task_v3_answer_basis_audit", hook)
@@ -1634,6 +1761,42 @@ async def test_the_answer_audit_wraps_the_run_tools_and_sees_the_instructions(mo
     assert "Apply." in hook_calls[0]["goal"] and "Answer citizenship from the resume." in hook_calls[0]["goal"]
     assert "click" in applied[0][0] and applied[0][1] is audit
     assert applied[1][1] is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("audit_installed", [True, False])
+@pytest.mark.parametrize("audit_arm", ["unrandomized", "control", "treatment"])
+async def test_the_log_only_arm_changes_the_run_only_on_treatment(
+    monkeypatch: pytest.MonkeyPatch, audit_arm: str, audit_installed: bool
+) -> None:
+    applied: list[dict[str, Any]] = []
+
+    async def hook(parameters: Any, *, goal: str, organization_id: Any, step: Any) -> object | None:
+        return object() if audit_installed else None
+
+    def spy(tools: list[Any], answer_audit: Any, **kwargs: Any) -> None:
+        applied.append(kwargs)
+
+    monkeypatch.setattr(app.AGENT_FUNCTION, "task_v3_answer_basis_audit", hook)
+    monkeypatch.setattr(engine_mod, "apply_answer_basis_audit", spy)
+    ctx = SkyvernContext()
+    ctx.run_arms = {ANSWER_AUDIT_LOG_ONLY_FLAG: ("wr_1", audit_arm)} if audit_arm != "unrandomized" else {}
+    skyvern_context.set(ctx)
+    try:
+        with capture_logs() as logs:
+            outcome = await run_task_v3_agent_loop(
+                page_provider=_fixed_page_provider(_FakePage()),
+                llm_caller=_ScriptedCaller([[("finish", {"status": "completed", "reason": "ok"})]]),
+                goal="Apply.",
+                parameters={"resume": "text"},
+            )
+    finally:
+        skyvern_context.reset()
+
+    assert outcome.status == "completed"
+    assert applied == [{"log_only": audit_arm == "treatment", "log_fields": {"audit_mode_arm": audit_arm}}]
+    terminal = next(e for e in logs if e.get("event") == "taskv3 engine loop finished")
+    assert (terminal["audit_mode_arm"], terminal["answer_audit_active"]) == (audit_arm, audit_installed)
 
 
 @pytest.mark.asyncio
@@ -1790,6 +1953,27 @@ async def _run_to_finish(caller: _ScriptedCaller) -> None:
         )
     finally:
         skyvern_context.reset()
+
+
+@pytest.mark.asyncio
+async def test_the_model_is_offered_the_users_error_codes_on_finish() -> None:
+    caller = _ScriptedCaller(
+        [[("finish", {"status": "failed", "reason": "password rejected", "error_code": "invalid_credentials"})]]
+    )
+    skyvern_context.set(SkyvernContext(task_id="tsk_codes"))
+    try:
+        outcome = await run_task_v3_agent_loop(
+            page_provider=_fixed_page_provider(_FakePage()),
+            llm_caller=caller,
+            goal="Sign in.",
+            error_code_mapping={"invalid_credentials": "The site rejected the password."},
+        )
+    finally:
+        skyvern_context.reset()
+
+    (finish,) = (t for t in caller.sent_tools or [] if t["function"]["name"] == "finish")
+    assert "invalid_credentials" in finish["function"]["parameters"]["properties"]["error_code"]["enum"]
+    assert outcome.error_code == "invalid_credentials"
 
 
 @pytest.mark.asyncio
@@ -2235,7 +2419,7 @@ async def _no_download_pending(_staged: frozenset[str]) -> str | None:
     ("scope", "judged"),
     [
         ({}, 1),
-        ({"completion_blocker": _no_download_pending}, 0),
+        ({"download_settle": _no_download_pending}, 0),
         ({"extraction_requested": True}, 0),
         ({"page_free": True}, 0),
     ],
@@ -2409,7 +2593,7 @@ class _ReaskAnsweringCaller(_ScriptedCaller):
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
     ("scope", "asked"),
-    [({}, True), ({"extraction_requested": True}, False), ({"completion_blocker": _no_download_pending}, False)],
+    [({}, True), ({"extraction_requested": True}, False), ({"download_settle": _no_download_pending}, False)],
     ids=["navigation", "extraction", "download_gated"],
 )
 async def test_a_terminated_finish_is_reasked_on_the_runs_own_model_without_a_goal_judge(
@@ -2442,6 +2626,214 @@ async def test_a_terminated_finish_is_reasked_on_the_runs_own_model_without_a_go
     assert outcome.unlisted_reask["asked"] is True
     assert outcome.unlisted_reask["verdict"] == "not_completed"
     assert outcome.unlisted_reask["converted"] is False
+
+
+class _PremiseAnsweringCaller(_ScriptedCaller):
+    """The run's own caller, answering the terminate-premise check outside the scripted loop turns."""
+
+    def __init__(self, script: list[list[tuple[str, dict[str, Any]]]], answer: dict[str, Any], **kwargs: Any) -> None:
+        super().__init__(script, **kwargs)
+        self.answer = answer
+        self.premise_calls: list[dict[str, Any]] = []
+        self.reask_calls: list[dict[str, Any]] = []
+
+    async def call(self, **kwargs: Any) -> dict[str, Any]:  # type: ignore[override]
+        if kwargs.get("prompt_name") == TERMINATE_PREMISE_PROMPT_NAME:
+            self.premise_calls.append(kwargs)
+            return self.answer
+        if kwargs.get("prompt_name") == UNLISTED_REASK_PROMPT_NAME:
+            self.reask_calls.append(kwargs)
+            return {"verdict": "not_completed", "terminate_criterion_holds": True, "skipped_screen": "", "quote": ""}
+        return await super().call(**kwargs)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("status", "scope", "checked"),
+    [
+        ("terminated", {}, True),
+        # The check reads a stop, so a block that asks for data or waits on a download is checked too.
+        ("terminated", {"extraction_requested": True}, True),
+        ("completed", {}, False),
+        ("failed", {}, False),
+        ("terminated", {"page_free": True}, False),
+    ],
+    ids=["terminated", "terminated_extraction", "completed", "failed", "page_free"],
+)
+async def test_a_terminate_on_a_block_without_a_completion_criterion_is_checked_and_logged_and_still_ends_the_run(
+    status: str, scope: dict[str, Any], checked: bool
+) -> None:
+    caller = _PremiseAnsweringCaller(
+        [[("read_fixture", {})], [("finish", {"status": status, "reason": "There is no 'View all statements' link."})]],
+        answer={
+            "cited": "instruction",
+            "condition": "unmet",
+            "stop_kind": "none",
+            "unmet_kind": "equivalent",
+            "quote": "See bill history",
+            "why": "The statements are linked under another name.",
+        },
+    )
+    with capture_logs() as logs:
+        outcome = await run_task_v3_agent_loop(
+            page_provider=_fixed_page_provider(_FakePage()),
+            llm_caller=caller,
+            goal="Open the statements with 'View all statements'.",
+            extra_tools=[_fixed_read_tool("Account overview\nSee bill history\nPay now")],
+            unlisted_reask_criteria=("", "the statements link is not on the page"),
+            **scope,
+        )
+
+    # Shadow only: the verdict is logged and the model's own status stands.
+    assert outcome.status == status
+    # No completion criterion, so no re-ask; the premise check does not need one.
+    assert caller.reask_calls == []
+    premise_logs = [log for log in logs if log["event"] == "taskv3 terminate premise"]
+    if not checked:
+        assert caller.premise_calls == [] and premise_logs == []
+        return
+    (premise_call,) = caller.premise_calls
+    assert premise_call["use_message_history"] is False
+    assert "See bill history" in premise_call["prompt"]
+    (log,) = premise_logs
+    assert log["would_overturn"] is True
+    assert log["why"] == "unmet_on_page"
+    assert log["never_overturn"] is None
+    assert log["unmet_kind"] == "equivalent"
+    # Never page text: the quote, the judge's sentence and the agent's reason stay in the LLM artifacts.
+    assert all(text not in str(log) for text in ("See bill history", "another name", "View all statements"))
+
+
+@pytest.mark.asyncio
+async def test_a_terminate_on_a_customers_own_model_key_is_logged_as_never_overturned_without_a_call() -> None:
+    caller = _PremiseAnsweringCaller(
+        [[("finish", {"status": "terminated", "reason": "There is no 'View all statements' link."})]], answer={}
+    )
+    with capture_logs() as logs:
+        await run_task_v3_agent_loop(
+            page_provider=_fixed_page_provider(_FakePage()),
+            llm_caller=caller,
+            goal="Open the statements with 'View all statements'.",
+            unlisted_reask_criteria=("", "the statements link is not on the page"),
+            terminate_premise_check=False,
+        )
+
+    assert caller.premise_calls == []
+    (log,) = (log for log in logs if log["event"] == "taskv3 terminate premise")
+    assert log["never_overturn"] == "customer_key" and log["would_overturn"] is False
+
+
+@pytest.mark.asyncio
+async def test_stop_criteria_for_a_block_without_a_completion_criterion_change_nothing_the_model_sees() -> None:
+    # The shadow check is their only new reader: every model-facing byte matches a run that never had them.
+    signed = "https://files.example.test/uploads/deadbeef/statement.pdf?token=eyJhbGciOiJIUzI1NiJ9.c2lnbmVk.QQ"
+    terminate = f"the statement at {signed} is not listed"
+    seen = []
+    for criteria in (("", ""), ("", terminate)):
+        caller = _PremiseAnsweringCaller(
+            [[("read_fixture", {})], [("finish", {"status": "terminated", "reason": "Not listed."})]],
+            answer={"cited": "none", "condition": "unclear", "stop_kind": "none", "quote": ""},
+        )
+        outcome = await run_task_v3_agent_loop(
+            page_provider=_fixed_page_provider(_FakePage()),
+            llm_caller=caller,
+            goal=f"Open the statements.\n\nIf this becomes true, stop and finish with status=terminated: {terminate}",
+            extra_tools=[_fixed_read_tool(f"Statements\n{signed}")],
+            unlisted_reask_criteria=criteria,
+        )
+        seen.append((json.dumps(caller.message_history, sort_keys=True), caller.sent_tools, outcome.status))
+
+    assert seen[0] == seen[1]
+
+
+@pytest.mark.asyncio
+async def test_a_terminate_with_a_completion_criterion_asks_both_judges_once_each() -> None:
+    caller = _PremiseAnsweringCaller(
+        [[("read_fixture", {})], [("finish", {"status": "terminated", "reason": "No PIN screen was shown."})]],
+        answer={"cited": "goal", "condition": "met", "stop_kind": "none", "quote": ""},
+    )
+    with capture_logs() as logs:
+        outcome = await run_task_v3_agent_loop(
+            page_provider=_fixed_page_provider(_FakePage()),
+            llm_caller=caller,
+            goal="Create the account.",
+            extra_tools=[_fixed_read_tool("Create account\nEmail")],
+            unlisted_reask_criteria=("a PIN screen is shown", "the create-account submission fails"),
+        )
+
+    assert outcome.status == "terminated"
+    assert len(caller.reask_calls) == 1 and len(caller.premise_calls) == 1
+    assert [log["why"] for log in logs if log["event"] == "taskv3 terminate premise"] == ["condition_met"]
+
+
+@pytest.mark.asyncio
+async def test_a_premise_check_that_fails_still_ends_the_run_as_the_model_said() -> None:
+    def broken_redactor() -> Any:
+        raise RuntimeError("redactor down")
+
+    caller = _PremiseAnsweringCaller(
+        [[("finish", {"status": "terminated", "reason": "There is no 'View all statements' link."})]], answer={}
+    )
+    outcome = await run_task_v3_agent_loop(
+        page_provider=_fixed_page_provider(_FakePage()),
+        llm_caller=caller,
+        goal="Open the statements.",
+        unlisted_reask_criteria=("", "the statements link is not on the page"),
+        goal_check_redactor=broken_redactor,
+    )
+    assert outcome.status == "terminated"
+
+
+@pytest.mark.asyncio
+async def test_a_slow_premise_check_logs_after_the_run_ends_under_the_runs_own_ids(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    release = asyncio.Event()
+    checked_under: list[str | None] = []
+
+    class _SlowCaller(_PremiseAnsweringCaller):
+        async def call(self, **kwargs: Any) -> dict[str, Any]:  # type: ignore[override]
+            kwargs.pop("step", None)
+            if kwargs.get("prompt_name") == TERMINATE_PREMISE_PROMPT_NAME:
+                await release.wait()
+                checked_under.append(skyvern_context.ensure_context().task_id)
+            return await super().call(**kwargs)
+
+    flushed: list[str] = []
+
+    async def flush_step_archive(step_id: str) -> None:
+        flushed.append(step_id)
+
+    monkeypatch.setattr(app, "ARTIFACT_MANAGER", SimpleNamespace(flush_step_archive=flush_step_archive))
+    slow = _SlowCaller([[("finish", {"status": "terminated", "reason": "Not listed."})]], answer={})
+
+    def premise_whys() -> list[str]:
+        return [log["why"] for log in logs if log["event"] == "taskv3 terminate premise"]
+
+    with skyvern_context.scoped(SkyvernContext(task_id="tsk_premise")) as run_context, capture_logs() as logs:
+        outcome = await asyncio.wait_for(
+            run_task_v3_agent_loop(
+                page_provider=_fixed_page_provider(_FakePage()),
+                llm_caller=slow,
+                goal="Open the statements.",
+                unlisted_reask_criteria=("", "the statements link is not on the page"),
+                step=SimpleNamespace(step_id="stp_premise"),
+            ),
+            timeout=1.0,
+        )
+        assert outcome.status == "terminated"
+        assert premise_whys() == []
+        # What the block does once it ends; the shared context then belongs to the next block.
+        run_context.task_id = None
+        release.set()
+        async with asyncio.timeout(5):
+            while not premise_whys():
+                await asyncio.sleep(0.01)
+
+    assert premise_whys() == ["skipped:unparseable"]
+    assert checked_under == ["tsk_premise"]
+    # The run's own archive flush has already happened, so the late check flushes what its call wrote.
+    assert flushed == ["stp_premise"]
 
 
 def _fixed_read_tool(content: str, *, page: _FakePage | None = None, lands_at: str | None = None) -> ToolSpec:
@@ -2857,3 +3249,85 @@ async def test_engine_logs_a_dead_end_provenance_through_the_real_navigate_tool(
     assert (outcome.status, outcome.guard) == ("terminated", NAV_DEAD_END_GUARD)
     (line,) = (entry for entry in logs if entry["event"] == "taskv3 loop navigation dead end")
     assert line["provenance"] == ("previously_visited" if via_click else "task_supplied")
+
+
+_JUSTIFY_CRITERIA = ("", "the record is not listed")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("scope", "held"),
+    [
+        ({"unlisted_reask_criteria": _JUSTIFY_CRITERIA}, True),
+        ({"unlisted_reask_criteria": None}, False),
+        ({"unlisted_reask_criteria": _JUSTIFY_CRITERIA, "page_free": True}, False),
+    ],
+    ids=["browser_loop", "validation", "page_free"],
+)
+async def test_validation_and_page_free_runs_are_never_held_for_a_source(scope: dict[str, Any], held: bool) -> None:
+    caller = _PremiseAnsweringCaller(
+        [[("finish", {"status": "terminated", "reason": f"r{i}"})] for i in (1, 2)], answer={}
+    )
+    outcome = await run_task_v3_agent_loop(
+        page_provider=_fixed_page_provider(_FakePage()), llm_caller=caller, goal="Look up the record.", **scope
+    )
+    assert (outcome.status, outcome.reason, outcome.turns) == ("terminated", *(("r2", 2) if held else ("r1", 1)))
+
+
+_TERMINATE = ("finish", {"status": "terminated", "reason": "r1"})
+_ACT = ("type", {"selector": "#first", "text": "John"})
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("script", "expected"),
+    [
+        ([[_TERMINATE], [_TERMINATE]], ("refinished_same", 1, 0, 0)),
+        ([[_TERMINATE], [("read_fixture", {})], [_TERMINATE]], ("looked_then_terminated", 2, 0, 1)),
+        (
+            [[_TERMINATE], [_ACT], [("finish", {"status": "terminated", "reason": "r2"})]],
+            ("continued_terminated", 2, 1, 0),
+        ),
+        (
+            [[_TERMINATE], [_ACT], [("finish", {"status": "completed", "reason": "done"})]],
+            ("continued_completed", 2, 1, 0),
+        ),
+    ],
+    ids=["refinished_same", "looked_then_terminated", "continued_terminated", "continued_completed"],
+)
+async def test_engine_summary_line_carries_the_justification_outcome(
+    script: list[list[tuple[str, dict[str, Any]]]], expected: tuple[str, int, int, int]
+) -> None:
+    caller = _PremiseAnsweringCaller(script, answer={})
+    with capture_logs() as logs:
+        await run_task_v3_agent_loop(
+            page_provider=_fixed_page_provider(_FakePage()),
+            llm_caller=caller,
+            goal="Look up the record.",
+            parameters={"first_name": "John"},
+            extra_tools=[_fixed_read_tool("Results")],
+            unlisted_reask_criteria=_JUSTIFY_CRITERIA,
+        )
+    finished = next(e for e in logs if e["event"] == "taskv3 engine loop finished")
+    assert (
+        finished["justify_outcome"],
+        finished["justify_turns_after"],
+        finished["justify_actions_after"],
+        finished["justify_perceptions_after"],
+    ) == expected
+    assert (finished["justify_held"], finished["justify_status"], finished["justify_turn"]) == (True, "terminated", 1)
+
+
+@pytest.mark.asyncio
+async def test_the_justification_hold_switch_turns_the_hold_off(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(settings, "DISABLE_TASK_V3_JUSTIFY_HOLD", True)
+    caller = _PremiseAnsweringCaller([[_TERMINATE]], answer={})
+    with capture_logs() as logs:
+        outcome = await run_task_v3_agent_loop(
+            page_provider=_fixed_page_provider(_FakePage()),
+            llm_caller=caller,
+            goal="Look up the record.",
+            unlisted_reask_criteria=_JUSTIFY_CRITERIA,
+        )
+    assert (outcome.status, outcome.turns) == ("terminated", 1)
+    assert "taskv3 finish justification held" not in [e["event"] for e in logs]

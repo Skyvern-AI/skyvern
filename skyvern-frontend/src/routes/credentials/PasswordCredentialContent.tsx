@@ -1,3 +1,4 @@
+import { CredentialForwardingAddress } from "@/components/emailForwarding/CredentialForwardingAddress";
 import googleAuthenticatorIcon from "@/assets/authenticators/google-authenticator.jpg";
 import { ConnectedEmailAccountPicker } from "@/components/ConnectedEmailAccountPicker";
 import { QRCodeIcon } from "@/components/icons/QRCodeIcon";
@@ -11,7 +12,9 @@ import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { Separator } from "@/components/ui/separator";
+import { useForwardingCapability } from "@/hooks/useEmailForwarding";
 import { useFeatureFlag } from "@/hooks/useFeatureFlag";
+import { TwilioPhoneNumberPicker } from "@/routes/integrations/twilio/TwilioPhoneNumberPicker";
 import { cn } from "@/util/utils";
 import {
   CheckIcon,
@@ -53,7 +56,10 @@ type PasswordCredentialContentValues = {
 };
 
 type Props = {
+  credentialId?: string;
+  savedTotpType?: string;
   values: PasswordCredentialContentValues;
+  hasTotp?: boolean;
   onChange: (values: PasswordCredentialContentValues) => void;
   /** Login page URL value — when onUrlChange is provided, a URL field is rendered after Name */
   url?: string;
@@ -84,6 +90,8 @@ type Props = {
   editingGroups?: { name: boolean; values: boolean };
   onEnableEditName?: () => void;
   onEnableEditValues?: () => void;
+  onForwardingAddressChange?: (identifier: string) => void;
+  onForwardingActionPendingChange?: (pending: boolean) => void;
   totpError?: string | null;
   /** Server-side authenticator setup error surfaced inline near the key field */
   authenticatorSaveError?: AuthenticatorSaveError | null;
@@ -244,7 +252,10 @@ function AdditionalTwoFactorMethodFields({
 }
 
 function PasswordCredentialContent({
+  credentialId,
+  savedTotpType = "none",
   values,
+  hasTotp = false,
   onChange,
   url,
   onUrlChange,
@@ -262,9 +273,12 @@ function PasswordCredentialContent({
   editingGroups,
   onEnableEditName,
   onEnableEditValues,
+  onForwardingAddressChange,
+  onForwardingActionPendingChange,
   totpError,
   authenticatorSaveError,
 }: Props) {
+  const forwardingEnabled = useForwardingCapability("list");
   const { enterpriseApps, additionalTwoFactorMethods = [] } =
     useCredentialAuthenticatorSupport();
   const { name, username, password, totp, totp_type, totp_identifier } = values;
@@ -465,6 +479,13 @@ function PasswordCredentialContent({
       setAuthenticatorTypeDetectionSource("backend");
     }
   }, [authenticatorTypeOptionIds, enterpriseUpgradeError?.vendor]);
+
+  const authenticatorPrecedenceNotice = hasTotp ? (
+    <p className="text-sm text-muted-foreground">
+      Authenticator key present — Skyvern uses authenticator codes instead of
+      SMS or email codes while a key is set.
+    </p>
+  ) : null;
 
   const prevUsernameRef = useRef(username);
   const totpIdentifierLabel =
@@ -996,6 +1017,7 @@ function PasswordCredentialContent({
               )}
               {(totpMethod === "text" || totpMethod === "email") && (
                 <>
+                  {authenticatorPrecedenceNotice}
                   <div className="space-y-2">
                     <div className="flex items-center gap-12">
                       <div className="w-40 shrink-0">
@@ -1045,17 +1067,28 @@ function PasswordCredentialContent({
                           </div>
                         ) : (
                           <div className="relative w-full">
-                            <Input
-                              value={totp_identifier}
-                              onChange={(event) =>
+                            <TwilioPhoneNumberPicker
+                              value={totp_identifier || null}
+                              onChange={(value) =>
                                 updateValues({
-                                  totp_identifier: event.target.value,
+                                  totp_identifier: value ?? "",
                                 })
                               }
-                              readOnly={valuesReadOnly}
-                              className={cn({
-                                "pr-9 opacity-70": valuesReadOnly,
-                              })}
+                              disabled={valuesReadOnly}
+                              renderManualInput={() => (
+                                <Input
+                                  value={totp_identifier}
+                                  onChange={(event) =>
+                                    updateValues({
+                                      totp_identifier: event.target.value,
+                                    })
+                                  }
+                                  readOnly={valuesReadOnly}
+                                  className={cn({
+                                    "pr-9 opacity-70": valuesReadOnly,
+                                  })}
+                                />
+                              )}
                             />
                             {valuesReadOnly && (
                               <button
@@ -1075,6 +1108,26 @@ function PasswordCredentialContent({
                       {totpIdentifierHelper}
                     </p>
                   </div>
+                  {totpMethod === "email" && forwardingEnabled && (
+                    <CredentialForwardingAddress
+                      key={credentialId ?? "unsaved"}
+                      credentialId={credentialId}
+                      identifier={totp_identifier}
+                      savedTotpType={savedTotpType}
+                      disabled={Boolean(valuesReadOnly)}
+                      onPendingChange={onForwardingActionPendingChange}
+                      onChange={(identifier) => {
+                        if (onForwardingAddressChange) {
+                          onForwardingAddressChange(identifier);
+                        } else {
+                          updateValues({
+                            totp_identifier: identifier,
+                            totp_type: "email",
+                          });
+                        }
+                      }}
+                    />
+                  )}
                   <p className="text-sm text-slate-400">
                     {enterpriseContactUrl && (
                       <>
@@ -1091,7 +1144,7 @@ function PasswordCredentialContent({
                       </>
                     )}
                     <Link
-                      to="https://www.skyvern.com/docs/running-tasks/advanced-features#time-based-one-time-password-totp"
+                      to="https://www.skyvern.com/docs/credentials#two-factor-authentication"
                       target="_blank"
                       rel="noopener noreferrer"
                       className="underline underline-offset-2"
@@ -1185,6 +1238,7 @@ function PasswordCredentialContent({
                       )}
                     </div>
                   )}
+                  {authenticatorPrecedenceNotice}
                   {enterpriseUpgradeError && (
                     <div
                       id={enterpriseUpgradeErrorId}

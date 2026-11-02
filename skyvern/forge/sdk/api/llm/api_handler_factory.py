@@ -8,9 +8,10 @@ import time
 import warnings
 from asyncio import CancelledError
 from collections.abc import Collection
+from contextvars import ContextVar, Token
 from json import JSONDecodeError
 from types import MappingProxyType
-from typing import Any, AsyncIterator, Literal, Protocol, runtime_checkable
+from typing import Any, AsyncIterator, Literal, Protocol, TypeVar, runtime_checkable
 
 import litellm
 import structlog
@@ -18,6 +19,7 @@ from anthropic import NOT_GIVEN
 from anthropic import APIConnectionError as AnthropicAPIConnectionError
 from anthropic import APIStatusError as AnthropicAPIStatusError
 from anthropic.types.beta.beta_message import BetaMessage as AnthropicMessage
+from litellm.litellm_core_utils.core_helpers import map_finish_reason
 from litellm.llms.custom_httpx.http_handler import AsyncHTTPHandler
 from litellm.types.router import AllowedFailsPolicy
 
@@ -50,11 +52,14 @@ from skyvern.forge.sdk.api.llm.exceptions import (
     DuplicateCustomLLMProviderError,
     InvalidLLMConfigError,
     InvalidLLMResponseFormat,
+    LLMContentFilteredError,
     LLMOutputTruncatedError,
     LLMProviderError,
     LLMProviderErrorRetryableTask,
 )
+from skyvern.forge.sdk.api.llm.litellm_pricing import long_prompt_cost_multiplier
 from skyvern.forge.sdk.api.llm.litellm_transport import configure_litellm_transport
+from skyvern.forge.sdk.api.llm.litellm_usage import use_anthropic_reported_thinking_tokens
 from skyvern.forge.sdk.api.llm.ui_tars_response import UITarsResponse
 from skyvern.forge.sdk.api.llm.utils import (
     is_content_filtered_response,
@@ -64,6 +69,7 @@ from skyvern.forge.sdk.api.llm.utils import (
     llm_messages_builder_with_history,
     loads_with_repair,
     parse_api_response,
+    uses_only_anthropic_models,
 )
 from skyvern.forge.sdk.artifact.manager import BulkArtifactCreationRequest
 from skyvern.forge.sdk.artifact.models import ArtifactType
@@ -91,6 +97,7 @@ from skyvern.utils.url_validators import validate_fetch_url
 # Keep this server-only side effect out of the package __init__ so the legacy
 # models shim can import without litellm. Legacy LLM calls enter this module.
 configure_litellm_transport()
+use_anthropic_reported_thinking_tokens()
 
 LOG = structlog.get_logger()
 _HASHED_HREF_PLACEHOLDER = re.compile(r"\{\{\s*(_[0-9a-f]{64})\s*\}\}")
@@ -338,20 +345,6 @@ _OPENAI_GPT5_6_MODEL_PREFIX = "gpt-5.6-"
 _OPENAI_GPT6_MODEL_PREFIXES = ("gpt-6-", "gpt-6.1-")
 _OPENAI_GPT5_6_LONG_CONTEXT_THRESHOLD = 272_000
 _OPENAI_GPT5_6_FLEX_LONG_CONTEXT_MULTIPLIER = 0.5
-# litellm 1.89.1 drops `*_above_100k_tokens` price keys, so a long Haiku 5.5 prompt prices at the base rate.
-# Every Haiku 5.5 rate above 100k prompt tokens is 5x its base rate.
-_CLAUDE_HAIKU_5_5_MODEL_SUFFIX = "claude-haiku-5-5"
-_CLAUDE_HAIKU_5_5_LONG_PROMPT_THRESHOLD = 100_000
-_CLAUDE_HAIKU_5_5_LONG_PROMPT_MULTIPLIER = 5.0
-
-
-def _long_prompt_cost_multiplier(model_name: str | None, prompt_tokens: int | None) -> float:
-    if model_name and model_name.endswith(_CLAUDE_HAIKU_5_5_MODEL_SUFFIX):
-        if prompt_tokens and prompt_tokens > _CLAUDE_HAIKU_5_5_LONG_PROMPT_THRESHOLD:
-            return _CLAUDE_HAIKU_5_5_LONG_PROMPT_MULTIPLIER
-    return 1.0
-
-
 # Kept in `_hidden_params` rather than on the response: `_hidden_params` is excluded from the
 # model dump persisted as the LLM_RESPONSE artifact, so a tier we derived can never be read back
 # as one the provider sent.
@@ -374,7 +367,13 @@ LLM_REQUEST_SPAN_NAME = "skyvern.llm.request"
 LLM_REQUEST_COMPLETED_EVENT = "llm.request.completed"
 
 EXTRACT_ACTION_PROMPT_NAME = "extract-actions"
-CHECK_USER_GOAL_PROMPT_NAMES = {"check-user-goal", "check-user-goal-with-termination"}
+CHECK_USER_GOAL_PROMPT_NAMES = {"check-user-goal", "check-user-goal-with-termination", "check-user-goal-after-click"}
+# In the check-user-goal templates, everything from the first of these sections on changes between calls.
+_CHECK_USER_GOAL_PER_CALL_SECTIONS = (
+    "\nAction History:\n",
+    "\nIDs for emerging HTML elements\n",
+    "\nElements on the page:\n",
+)
 VISION_REQUIRED_PROMPT_NAMES = {
     "workflow-copilot-video-perception",
     "workflow-copilot-video-secret-safety",
@@ -818,12 +817,57 @@ def _response_provider(response: object) -> str | None:
     return provider if isinstance(provider, str) else None
 
 
+def _response_finish_reason(response: object) -> str | None:
+    # The raw Anthropic SDK reports a stop_reason; map it to litellm's vocabulary so every path logs the same values.
+    if isinstance(response, AnthropicMessage):
+        return map_finish_reason(response.stop_reason) if response.stop_reason else None
+    if isinstance(response, ModelResponse) and response.choices:
+        return response.choices[0].finish_reason
+    return None
+
+
+def _halved_reasoning_budget_parameters(active_parameters: dict[str, Any]) -> dict[str, Any] | None:
+    """A copy of these parameters with the declared reasoning budget halved.
+
+    None when the request declares no budget, and so has nothing it can hand back to the answer.
+    """
+    extra_body = active_parameters.get("extra_body")
+    if not isinstance(extra_body, dict):
+        return None
+    reasoning = extra_body.get("reasoning")
+    if not isinstance(reasoning, dict):
+        return None
+    budget = reasoning.get("max_tokens")
+    if not isinstance(budget, int) or isinstance(budget, bool) or budget < 2:
+        return None
+    return {
+        **active_parameters,
+        "extra_body": {**extra_body, "reasoning": {**reasoning, "max_tokens": budget // 2}},
+    }
+
+
 def _usage_int_field(value: Any, *field_names: str) -> int | None:
     for field_name in field_names:
         field = value.get(field_name) if isinstance(value, dict) else getattr(value, field_name, None)
         if isinstance(field, int) and not isinstance(field, bool):
             return field
     return None
+
+
+def _cache_creation_tokens(usage: Any) -> int | None:
+    if usage is None:
+        return None
+    details = getattr(usage, "prompt_tokens_details", None) or getattr(usage, "input_tokens_details", None)
+    tokens = (
+        _usage_int_field(details, "cache_write_tokens", "cache_creation_input_tokens") if details is not None else None
+    )
+    if tokens is None and details is not None:
+        model_extra = getattr(details, "model_extra", None)
+        if isinstance(model_extra, dict):
+            tokens = _usage_int_field(model_extra, "cache_write_tokens")
+    if tokens is None:
+        tokens = _usage_int_field(usage, "cache_creation_input_tokens", "cache_write_input_tokens")
+    return tokens
 
 
 def _copilot_model_usage_event(
@@ -848,22 +892,13 @@ def _copilot_model_usage_event(
         cache_read_tokens = _usage_int_field(details, "cached_tokens") if details is not None else None
         if cache_read_tokens is None and usage is not None:
             cache_read_tokens = _usage_int_field(usage, "cache_read_input_tokens")
-        cache_creation_tokens = (
-            _usage_int_field(details, "cache_write_tokens", "cache_creation_input_tokens")
-            if details is not None
-            else None
-        )
-        if cache_creation_tokens is None and details is not None:
-            model_extra = getattr(details, "model_extra", None)
-            if isinstance(model_extra, dict):
-                cache_creation_tokens = _usage_int_field(model_extra, "cache_write_tokens")
-        if cache_creation_tokens is None and usage is not None:
-            cache_creation_tokens = _usage_int_field(usage, "cache_creation_input_tokens", "cache_write_input_tokens")
+        cache_creation_tokens = _cache_creation_tokens(usage)
     except Exception:
         input_tokens = None
         output_tokens = None
         cache_read_tokens = None
         cache_creation_tokens = None
+    hidden_params = getattr(response, "_hidden_params", None)
     return CopilotModelUsageEvent(
         request_model=request_model,
         response_model=response_model if isinstance(response_model, str) else None,
@@ -873,6 +908,15 @@ def _copilot_model_usage_event(
         cache_read_tokens=cache_read_tokens,
         cache_creation_tokens=cache_creation_tokens,
         cost=cost,
+        cost_source=(
+            "provider_reported"
+            if isinstance(hidden_params, dict)
+            and hidden_params.get("custom_llm_provider") == "openrouter"
+            and LLMAPIHandlerFactory._extract_reported_usage_cost(response) is not None
+            else "litellm_estimate"
+        )
+        if cost is not None
+        else None,
         prompt_name=prompt_name,
     )
 
@@ -917,7 +961,7 @@ def _get_primary_model_dict(router: Any, main_model_group: str) -> dict[str, Any
 
 
 def _primary_deployment_label(primary_model_dict: dict[str, Any] | None) -> str | None:
-    """Provider label of the primary deployment (e.g. `vertex_ai/gemini-2.5-pro` -> `gemini-2.5-pro`)."""
+    """Provider label of the primary deployment (e.g. `vertex_ai/gemini-3-flash-preview` -> `gemini-3-flash-preview`)."""
     if not primary_model_dict:
         return None
     litellm_params = primary_model_dict.get("litellm_params") or {}
@@ -949,6 +993,24 @@ class LLMCallStats(BaseModel):
     cached_tokens: int | None = None
     llm_cost: float | None = None
     llm_cost_available: bool = False
+
+
+_Number = TypeVar("_Number", int, float)
+
+
+def _add_optional(a: _Number | None, b: _Number | None) -> _Number | None:
+    return b if a is None else a if b is None else a + b
+
+
+def _combined_call_stats(first: LLMCallStats, second: LLMCallStats) -> LLMCallStats:
+    return LLMCallStats(
+        input_tokens=_add_optional(first.input_tokens, second.input_tokens),
+        output_tokens=_add_optional(first.output_tokens, second.output_tokens),
+        reasoning_tokens=_add_optional(first.reasoning_tokens, second.reasoning_tokens),
+        cached_tokens=_add_optional(first.cached_tokens, second.cached_tokens),
+        llm_cost=_add_optional(first.llm_cost, second.llm_cost),
+        llm_cost_available=first.llm_cost_available and second.llm_cost_available,
+    )
 
 
 def _get_artifact_targets_and_persist_flag(
@@ -1012,7 +1074,7 @@ def _log_vertex_cache_hit_if_needed(
 
 def _normalize_llm_model(model: str | None) -> str | None:
     # LiteLLM's response.model can include a provider prefix
-    # (e.g. "vertex_ai/gemini-2.5-flash", "openai/gpt-4.1-mini") while
+    # (e.g. "vertex_ai/gemini-3-flash-preview", "openai/gpt-4.1-mini") while
     # config-side fallbacks tend to use the bare model name. Strip the
     # prefix so dbt aggregates the same model under one bucket.
     if not model:
@@ -1078,6 +1140,16 @@ def _convert_allowed_fails_policy(policy: LLMAllowedFailsPolicy | None) -> Allow
 # Public so callers (e.g. scripts/skyvern_run_script_helper.get_gemini_3_reasoning_effort_override)
 # can validate against the same set instead of duplicating the values.
 VALID_GEMINI_3_REASONING_EFFORTS: tuple[str, ...] = ("minimal", "low", "medium", "high")
+
+# A run's LLM experiment settings. A worker running several activities in one process shares the factory, so each run
+# keeps its own values in its context rather than on the class.
+_THINKING_BUDGET_SETTINGS: ContextVar[dict[str, int] | None] = ContextVar("llm_thinking_budget_settings", default=None)
+_PROMPT_CACHING_SETTINGS: ContextVar[dict[str, bool] | None] = ContextVar("llm_prompt_caching_settings", default=None)
+# When set, Gemini 3.x calls use `reasoning_effort=<value>` (mapping to `thinkingLevel` in Vertex) instead of the legacy
+# `thinking={budget_tokens:N}` payload, which litellm silently drops for Gemini 3 (SKY-9785).
+_GEMINI_3_REASONING_EFFORT_OVERRIDE: ContextVar[str | None] = ContextVar(
+    "llm_gemini_3_reasoning_effort_override", default=None
+)
 
 
 def _build_litellm_router(llm_config: LLMRouterConfig) -> litellm.Router:
@@ -1160,13 +1232,6 @@ class LLMAPIHandlerFactory:
     _custom_handlers: dict[str, LLMAPIHandler] = {}
     _handler_cache: dict[str, tuple[LLMConfig, LLMAPIHandler]] = {}
     _router_handler_cache: dict[str, LLMAPIHandler] = {}
-    _thinking_budget_settings: dict[str, int] | None = None
-    _prompt_caching_settings: dict[str, bool] | None = None
-    # When set, Gemini 3.x calls use `reasoning_effort=<value>` (mapping to
-    # `thinkingLevel` in Vertex) instead of the legacy `thinking={budget_tokens:N}`
-    # payload — which litellm silently drops for Gemini 3, leaving the model at
-    # its default HIGH thinking level (SKY-9785).
-    _gemini_3_reasoning_effort_override: str | None = None
 
     @staticmethod
     def _strip_static_prompt_from_messages(messages: list[dict[str, Any]], static_prompt: str) -> bool:
@@ -1203,10 +1268,56 @@ class LLMAPIHandlerFactory:
         return prompt_stripped
 
     @staticmethod
+    def _cache_static_prompt_for_anthropic(
+        messages: list[dict[str, Any]], static_prompt: str, task_prompt: str | None = None
+    ) -> bool:
+        marked_static_block = {
+            "type": "text",
+            "text": static_prompt.rstrip(),
+            "cache_control": {"type": "ephemeral"},
+        }
+        for message in messages:
+            if message.get("role") != "user":
+                continue
+            content = message.get("content")
+            if not isinstance(content, list):
+                return False
+            if not (content and content[0] == marked_static_block):
+                if not LLMAPIHandlerFactory._strip_static_prompt_from_messages([message], static_prompt):
+                    return False
+                content.insert(0, marked_static_block)
+            if task_prompt and len(content) > 1:
+                LLMAPIHandlerFactory._mark_cached_prefix(content, 1, task_prompt)
+            return True
+        return False
+
+    @staticmethod
+    def _cache_check_user_goal_prefix_for_anthropic(messages: list[dict[str, Any]]) -> bool:
+        user_message = next((message for message in messages if message.get("role") == "user"), None)
+        content = user_message.get("content") if user_message else None
+        if not isinstance(content, list) or not content or content[0].get("type") != "text":
+            return False
+        text = content[0].get("text", "")
+        cut = min((at for at in map(text.find, _CHECK_USER_GOAL_PER_CALL_SECTIONS) if at > 0), default=0)
+        return cut > 0 and LLMAPIHandlerFactory._mark_cached_prefix(content, 0, text[:cut])
+
+    @staticmethod
+    def _mark_cached_prefix(content: list[dict[str, Any]], index: int, prefix: str) -> bool:
+        block = content[index]
+        text = block.get("text", "")
+        if block.get("type") != "text" or not text.startswith(prefix) or len(text) <= len(prefix):
+            return False
+        content[index : index + 1] = [
+            {"type": "text", "text": prefix, "cache_control": {"type": "ephemeral"}},
+            {**block, "text": text[len(prefix) :]},
+        ]
+        return True
+
+    @staticmethod
     def _models_equivalent(left: str | None, right: str | None) -> bool:
         """Used only by `llm_api_handler_with_router_and_fallback`. Router model
         groups carry the `vertex-` prefix while LiteLLM responses return the
-        underlying provider label (e.g. `gemini-2.5-pro`). Stripping the prefix
+        underlying provider label (e.g. `gemini-3-flash-preview`). Stripping the prefix
         lets us detect whether the configured primary (the router's
         `main_model_group`) actually served the request without replumbing every
         config/registry reference.
@@ -1362,12 +1473,12 @@ class LLMAPIHandlerFactory:
         return input_tokens, output_tokens, reasoning_tokens, cached_tokens
 
     @staticmethod
-    def _extract_reported_usage_cost(response: ModelResponse | CustomStreamWrapper) -> float | None:
+    def _extract_reported_usage_cost(response: object) -> float | None:
         """Return provider-reported cost from response.usage.cost when present."""
-        if not hasattr(response, "usage") or not response.usage:
+        usage = getattr(response, "usage", None)
+        if not usage:
             return None
 
-        usage = response.usage
         cost = getattr(usage, "cost", None)
         if cost is None and isinstance(usage, dict):
             cost = usage.get("cost")
@@ -1442,7 +1553,7 @@ class LLMAPIHandlerFactory:
         usage = getattr(response, "usage", None)
         prompt_tokens = getattr(usage, "prompt_tokens", 0) if usage else 0
         model_name = requested_model if isinstance(requested_model, str) else None
-        return cost * _long_prompt_cost_multiplier(model_name, prompt_tokens)
+        return cost * long_prompt_cost_multiplier(model_name, prompt_tokens)
 
     @staticmethod
     def _is_openai_direct_gpt5_6_long_context_flex(
@@ -1484,7 +1595,7 @@ class LLMAPIHandlerFactory:
                 )
 
         try:
-            # Gemini router/fallback configs (e.g., gemini-2.5-pro-gpt-5-fallback-router)
+            # Gemini router/fallback configs (e.g., gemini-3-pro-gpt-5-fallback-router)
             # are not recognized by litellm, but they do support reasoning budgets.
             if not supports_reasoning and model_label:
                 model_label_lower = model_label.lower()
@@ -1585,12 +1696,17 @@ class LLMAPIHandlerFactory:
         check_model = LLMAPIHandlerFactory._get_check_model(llm_config, model_label)
 
         if LLMAPIHandlerFactory.requires_adaptive_thinking(check_model):
+            effort = (
+                llm_config.reasoning_effort
+                if llm_config.pin_reasoning_effort and llm_config.reasoning_effort
+                else LLMAPIHandlerFactory.ADAPTIVE_THINKING_EFFORT
+            )
             parameters["thinking"] = {"type": "adaptive"}
-            parameters.setdefault("output_config", {})["effort"] = LLMAPIHandlerFactory.ADAPTIVE_THINKING_EFFORT
+            parameters.setdefault("output_config", {})["effort"] = effort
             LOG.debug(
                 "Applied thinking budget optimization (adaptive)",
                 prompt_name=prompt_name,
-                effort=LLMAPIHandlerFactory.ADAPTIVE_THINKING_EFFORT,
+                effort=effort,
                 model=model_label,
             )
             return
@@ -1670,7 +1786,7 @@ class LLMAPIHandlerFactory:
         # into `parameters`. Without this ordering, the guard would fire and the
         # override would silently skip direct Gemini 3 configs (task/workflow-level
         # model overrides that bypass the router).
-        override = LLMAPIHandlerFactory._gemini_3_reasoning_effort_override
+        override = _GEMINI_3_REASONING_EFFORT_OVERRIDE.get()
         if override and LLMAPIHandlerFactory._is_gemini_3_model(llm_config):
             parameters["reasoning_effort"] = override
             # litellm raises 400 if both reasoning_effort and thinking_budget land
@@ -1688,7 +1804,14 @@ class LLMAPIHandlerFactory:
 
         # Models that use thinking_level (e.g. Gemini 3 Pro/Flash) don't support budget_tokens.
         # Their reasoning is already bounded by the thinking_level set in their config, so skip.
-        if "thinking_level" in parameters:
+        # A router whose primary is not Gemini keeps thinking_level on the Gemini deployment, not in `parameters`,
+        # and the request-level budget would reach that deployment and be rejected by litellm.
+        if "thinking_level" in parameters or (
+            isinstance(llm_config, LLMRouterConfig)
+            and any(
+                "thinking_level" in deployment.litellm_params for deployment in _dispatchable_deployments(llm_config)
+            )
+        ):
             return
 
         if "thinking" in parameters and isinstance(parameters["thinking"], dict):
@@ -1804,19 +1927,27 @@ class LLMAPIHandlerFactory:
             return None
 
     @staticmethod
-    def _maybe_get_non_flex_handler(default: LLMAPIHandler) -> LLMAPIHandler | None:
-        """Mirror of `_maybe_get_flex_handler` for the inverse direction: swap a flex
-        default for its non-flex twin when `trigger_type` is manual-like."""
+    def resolve_non_flex_llm_key_for_manual_run(llm_key: str | None) -> str | None:
+        """Return a registered non-flex twin for a manual-like run, or None."""
         ctx = skyvern_context.current()
         if ctx is None or not is_manual_like_workflow_run_trigger_type(ctx.trigger_type):
             return None
+        non_flex_key = app.AGENT_FUNCTION.get_non_flex_llm_key(llm_key)
+        if not non_flex_key or not LLMConfigRegistry.is_registered(non_flex_key):
+            return None
+        return non_flex_key
+
+    @staticmethod
+    def _maybe_get_non_flex_handler(default: LLMAPIHandler) -> LLMAPIHandler | None:
+        """Mirror of `_maybe_get_flex_handler` for the inverse direction: swap a flex
+        default for its non-flex twin when `trigger_type` is manual-like."""
         effective_key = (
             getattr(default, "llm_key", None)
             or getattr(getattr(default, "__self__", None), "llm_key", None)
             or settings.LLM_KEY
         )
-        non_flex_key = app.AGENT_FUNCTION.get_non_flex_llm_key(effective_key)
-        if not non_flex_key or not LLMConfigRegistry.is_registered(non_flex_key):
+        non_flex_key = LLMAPIHandlerFactory.resolve_non_flex_llm_key_for_manual_run(effective_key)
+        if not non_flex_key:
             return None
         try:
             non_flex_handler = LLMAPIHandlerFactory.get_llm_api_handler(non_flex_key)
@@ -1974,11 +2105,9 @@ class LLMAPIHandlerFactory:
                 parameters = LLMAPIHandlerFactory.get_api_parameters(llm_config)
 
             # Apply thinking budget optimization if settings are available
-            if (
-                LLMAPIHandlerFactory._thinking_budget_settings
-                and prompt_name in LLMAPIHandlerFactory._thinking_budget_settings
-            ):
-                new_budget = LLMAPIHandlerFactory._thinking_budget_settings[prompt_name]
+            thinking_budget_settings = _THINKING_BUDGET_SETTINGS.get()
+            if thinking_budget_settings and prompt_name in thinking_budget_settings:
+                new_budget = thinking_budget_settings[prompt_name]
                 LLMAPIHandlerFactory._apply_thinking_budget_optimization(
                     parameters, new_budget, llm_config, prompt_name
                 )
@@ -2095,6 +2224,24 @@ class LLMAPIHandlerFactory:
                 # IMPORTANT: Only inject for extract-actions prompt to avoid contaminating other prompts
                 # (e.g., check-user-goal) with the extract-action schema
                 try:
+                    if (
+                        context
+                        and redacted_cached_static_prompt
+                        and prompt_name == EXTRACT_ACTION_PROMPT_NAME
+                        and uses_only_anthropic_models(llm_config)
+                        and LLMAPIHandlerFactory._cache_static_prompt_for_anthropic(
+                            messages,
+                            redacted_cached_static_prompt,
+                            _redact_prompt_text(context.cached_task_prompt, secret_values, placeholder_ids),
+                        )
+                    ):
+                        LOG.info("Applied Anthropic prompt caching", sampling=True)
+                    if (
+                        prompt_name in CHECK_USER_GOAL_PROMPT_NAMES
+                        and uses_only_anthropic_models(llm_config)
+                        and LLMAPIHandlerFactory._cache_check_user_goal_prefix_for_anthropic(messages)
+                    ):
+                        LOG.info("Applied Anthropic prompt caching", sampling=True)
                     if (
                         context
                         and redacted_cached_static_prompt
@@ -2248,7 +2395,7 @@ class LLMAPIHandlerFactory:
                             LOG.warning(
                                 "Vertex cache primary call failed, retrying via router",
                                 prompt_name=prompt_name,
-                                error=str(cache_error),
+                                error_type=type(cache_error).__name__,
                                 cache_name=cache_resource_name,
                                 cache_variant=cache_variant,
                             )
@@ -2334,6 +2481,7 @@ class LLMAPIHandlerFactory:
                                 reasoning_tokens=(
                                     (getattr(_fb_detail, "reasoning_tokens", 0) or 0) if _fb_detail else 0
                                 ),
+                                finish_reason=_response_finish_reason(response),
                             )
 
                     # A content_filter response with empty content is a valid ModelResponse,
@@ -2540,7 +2688,7 @@ class LLMAPIHandlerFactory:
                         cached_tokens = getattr(response.usage, "cache_read_input_tokens", 0) or 0
 
                 # Prefer the actual backing model returned by LiteLLM so we don't persist the
-                # router group name (e.g. "GEMINI_2_5_FLASH_WITH_FALLBACK") when the router
+                # router group name (e.g. "GEMINI_3_0_FLASH_WITH_FALLBACK") when the router
                 # falls back. Mirrors the pattern in llm_api_handler/call.
                 # Phase 1 tradeoff: last_llm_model records the most recent model used in
                 # the step. dbt attributes the full step_cost to it, which is accurate
@@ -2619,6 +2767,9 @@ class LLMAPIHandlerFactory:
                         "reasoning_tokens", reasoning_tokens if reasoning_tokens > 0 else None
                     ),
                     cached_tokens=_generated_log_value("cached_tokens", cached_tokens if cached_tokens > 0 else None),
+                    cache_creation_tokens=_generated_log_value(
+                        "cache_creation_tokens", _cache_creation_tokens(getattr(response, "usage", None))
+                    ),
                     llm_cost=_generated_log_value("llm_cost", llm_cost if llm_cost > 0 else None),
                     image_count=_generated_log_value("image_count", image_count if image_count > 0 else None),
                     image_tokens=_generated_log_value("image_tokens", image_tokens if image_tokens > 0 else None),
@@ -2831,13 +2982,11 @@ class LLMAPIHandlerFactory:
             # nested dict retained in llm_config.litellm_params via the shallow merge above). SKY-13345.
             customer_owns_thinking = LLMAPIHandlerFactory._custom_llm_owns_thinking(llm_key, active_parameters)
             # Apply thinking budget optimization if settings are available
+            thinking_budget_settings = _THINKING_BUDGET_SETTINGS.get()
             if customer_owns_thinking:
                 pass
-            elif (
-                LLMAPIHandlerFactory._thinking_budget_settings
-                and prompt_name in LLMAPIHandlerFactory._thinking_budget_settings
-            ):
-                new_budget = LLMAPIHandlerFactory._thinking_budget_settings[prompt_name]
+            elif thinking_budget_settings and prompt_name in thinking_budget_settings:
+                new_budget = thinking_budget_settings[prompt_name]
                 LLMAPIHandlerFactory._apply_thinking_budget_optimization(
                     active_parameters, new_budget, llm_config, prompt_name
                 )
@@ -2939,6 +3088,24 @@ class LLMAPIHandlerFactory:
                 # IMPORTANT: Only inject for extract-actions prompt to avoid contaminating other prompts
                 # (e.g., check-user-goal) with the extract-action schema
                 try:
+                    if (
+                        context
+                        and redacted_cached_static_prompt
+                        and prompt_name == EXTRACT_ACTION_PROMPT_NAME
+                        and uses_only_anthropic_models(llm_config)
+                        and LLMAPIHandlerFactory._cache_static_prompt_for_anthropic(
+                            messages,
+                            redacted_cached_static_prompt,
+                            _redact_prompt_text(context.cached_task_prompt, secret_values, placeholder_ids),
+                        )
+                    ):
+                        LOG.info("Applied Anthropic prompt caching", sampling=True)
+                    if (
+                        prompt_name in CHECK_USER_GOAL_PROMPT_NAMES
+                        and uses_only_anthropic_models(llm_config)
+                        and LLMAPIHandlerFactory._cache_check_user_goal_prefix_for_anthropic(messages)
+                    ):
+                        LOG.info("Applied Anthropic prompt caching", sampling=True)
                     if (
                         context
                         and redacted_cached_static_prompt
@@ -3268,6 +3435,9 @@ class LLMAPIHandlerFactory:
                         "reasoning_tokens", reasoning_tokens if reasoning_tokens > 0 else None
                     ),
                     cached_tokens=_generated_log_value("cached_tokens", cached_tokens if cached_tokens > 0 else None),
+                    cache_creation_tokens=_generated_log_value(
+                        "cache_creation_tokens", _cache_creation_tokens(getattr(response, "usage", None))
+                    ),
                     llm_cost=_generated_log_value("llm_cost", llm_cost if llm_cost > 0 else None),
                     image_count=_generated_log_value("image_count", image_count if image_count > 0 else None),
                     image_tokens=_generated_log_value("image_tokens", image_tokens if image_tokens > 0 else None),
@@ -3468,14 +3638,46 @@ class LLMAPIHandlerFactory:
     @classmethod
     def set_thinking_budget_settings(cls, settings: dict[str, int] | None) -> None:
         """Set thinking budget optimization settings for the current task/workflow."""
-        cls._thinking_budget_settings = settings
+        _THINKING_BUDGET_SETTINGS.set(settings)
         if settings:
             LOG.info("Thinking budget optimization settings applied", settings=settings)
+
+    @staticmethod
+    def begin_run_settings() -> tuple[Token[Any], ...]:
+        """Start a run with no thinking budget, prompt caching or Gemini 3 effort settings; see end_run_settings."""
+        return (
+            _THINKING_BUDGET_SETTINGS.set(None),
+            _PROMPT_CACHING_SETTINGS.set(None),
+            _GEMINI_3_REASONING_EFFORT_OVERRIDE.set(None),
+        )
+
+    @staticmethod
+    def end_run_settings(tokens: tuple[Token[Any], ...]) -> None:
+        """Drop the run's settings, restoring those of any run that encloses it on the same task."""
+        thinking_budget, prompt_caching, gemini_3_effort = tokens
+        _GEMINI_3_REASONING_EFFORT_OVERRIDE.reset(gemini_3_effort)
+        _PROMPT_CACHING_SETTINGS.reset(prompt_caching)
+        _THINKING_BUDGET_SETTINGS.reset(thinking_budget)
+
+    @staticmethod
+    def thinking_budget_settings() -> dict[str, int] | None:
+        """The current run's thinking budget settings, if any were set."""
+        return _THINKING_BUDGET_SETTINGS.get()
+
+    @staticmethod
+    def gemini_3_reasoning_effort_override() -> str | None:
+        """The current run's Gemini 3 reasoning_effort override, if one was set."""
+        return _GEMINI_3_REASONING_EFFORT_OVERRIDE.get()
+
+    @staticmethod
+    def prompt_caching_settings() -> dict[str, bool] | None:
+        """The current run's prompt caching settings, if any were set."""
+        return _PROMPT_CACHING_SETTINGS.get()
 
     @classmethod
     def set_prompt_caching_settings(cls, settings: dict[str, bool] | None) -> None:
         """Set prompt caching optimization settings for the current task/workflow."""
-        cls._prompt_caching_settings = settings
+        _PROMPT_CACHING_SETTINGS.set(settings)
         if settings:
             LOG.info("Prompt caching optimization settings applied", settings=settings)
 
@@ -3488,7 +3690,7 @@ class LLMAPIHandlerFactory:
         and logged.
         """
         if not value:
-            cls._gemini_3_reasoning_effort_override = None
+            _GEMINI_3_REASONING_EFFORT_OVERRIDE.set(None)
             return
         normalized = value.strip().lower() if isinstance(value, str) else None
         if normalized not in VALID_GEMINI_3_REASONING_EFFORTS:
@@ -3497,9 +3699,9 @@ class LLMAPIHandlerFactory:
                 value=value,
                 valid_values=list(VALID_GEMINI_3_REASONING_EFFORTS),
             )
-            cls._gemini_3_reasoning_effort_override = None
+            _GEMINI_3_REASONING_EFFORT_OVERRIDE.set(None)
             return
-        cls._gemini_3_reasoning_effort_override = normalized
+        _GEMINI_3_REASONING_EFFORT_OVERRIDE.set(normalized)
         LOG.info("Gemini 3 reasoning_effort override applied", value=normalized)
 
 
@@ -3891,6 +4093,7 @@ class LLMCaller:
             llm_request_payload = {
                 "model": self.llm_key if openrouter_model_name and self.openai_client else self.llm_config.model_name,
                 "messages": messages,
+                **({"tools": tools} if tools else {}),
                 # we're not using active_parameters here because it may contain sensitive information
                 **parameters,
             }
@@ -3909,14 +4112,25 @@ class LLMCaller:
 
             t_llm_request = time.perf_counter()
             llm_duration_seconds = 0.0
+            refused_call_stats: LLMCallStats | None = None
+            truncated_call_stats: LLMCallStats | None = None
             try:
                 # `timeout` may already live in active_parameters via litellm_params (flex configs
                 # carry their own); passing it explicitly too collides on kwarg unpacking.
                 response = await self._dispatch_llm_call(
                     messages=messages,
                     tools=tools,
+                    prompt_name=prompt_name,
                     **active_parameters,
                 )
+                if _response_finish_reason(response) == "content_filter":
+                    response, refused_call_stats = await self._retry_refused_call_on_fallback(
+                        response, messages, tools, active_parameters, prompt_name
+                    )
+                if isinstance(response, ModelResponse) and is_truncated_response(response):
+                    response, truncated_call_stats = await self._retry_truncated_call_with_less_reasoning(
+                        response, messages, tools, active_parameters, prompt_name
+                    )
                 llm_duration_seconds = time.perf_counter() - t_llm_request
                 if use_message_history and message_history_after_success is not None:
                     # only update message_history when the request is successful
@@ -3990,6 +4204,9 @@ class LLMCaller:
                 if not caller_owns_exhaustion_receipt:
                     self.emit_retry_chain_exhausted(e, prompt_name)
                 raise LLMProviderErrorRetryableTask(self.llm_key, cause=e) from e
+            except LLMContentFilteredError:
+                _llm_span.set_attribute("status", "error")
+                raise
             except LLMProviderError as e:
                 # Already classified (retryable or not) by the dispatch path; re-wrapping it below
                 # would erase that and log it as an unexpected failure.
@@ -4021,6 +4238,10 @@ class LLMCaller:
                     prompt_name=prompt_name,
                     cost=call_stats.llm_cost if call_stats.llm_cost_available else None,
                 )
+            if refused_call_stats is not None:
+                call_stats = _combined_call_stats(call_stats, refused_call_stats)
+            if truncated_call_stats is not None:
+                call_stats = _combined_call_stats(call_stats, truncated_call_stats)
 
             llm_response_json = _safe_model_dump_json(response)
             if should_persist_llm_artifacts:
@@ -4095,6 +4316,9 @@ class LLMCaller:
                     "reasoning_tokens", call_stats.reasoning_tokens if call_stats else None
                 ),
                 cached_tokens=_generated_log_value("cached_tokens", call_stats.cached_tokens if call_stats else None),
+                cache_creation_tokens=_generated_log_value(
+                    "cache_creation_tokens", _cache_creation_tokens(getattr(response, "usage", None))
+                ),
                 llm_cost=_generated_log_value("llm_cost", call_stats.llm_cost if call_stats else None),
                 image_count=_generated_log_value("image_count", image_count if image_count > 0 else None),
                 image_tokens=_generated_log_value("image_tokens", image_tokens if image_tokens > 0 else None),
@@ -4102,6 +4326,7 @@ class LLMCaller:
                 image_tokens_source=image_source,
                 resolved_provider=resolved_provider,
                 service_tier=service_tier,
+                finish_reason=_response_finish_reason(response),
                 # `model` above is the router group, identical for the flex and standard legs;
                 # without the served deployment the split between them is invisible.
                 served_model_group=_model_log_value("served_model_group", served_model_group),
@@ -4227,12 +4452,127 @@ class LLMCaller:
             return get_resize_target_dimension(window_dimension)
         return self.screenshot_resize_target_dimension
 
+    async def _retry_refused_call_on_fallback(
+        self,
+        response: ModelResponse | CustomStreamWrapper | AnthropicMessage | UITarsResponse,
+        messages: list[dict[str, Any]],
+        tools: list | None,
+        active_parameters: dict[str, Any],
+        prompt_name: str | None,
+    ) -> tuple[ModelResponse | CustomStreamWrapper | AnthropicMessage | UITarsResponse, LLMCallStats]:
+        """A refusal or content-filter block arrives as a valid response, so the router's exception-driven fallback
+        never sees it. Send it once to the route's content-filter group, or else its first fallback group, as a
+        failed call would go, and fail if that refuses."""
+        refused_on = self.llm_config.model_name
+        fallback_group: str | None = None
+        if self._router is not None and isinstance(self.llm_config, LLMRouterConfig):
+            main_group = self.llm_config.main_model_group
+            refused_on = LLMAPIHandlerFactory._served_model_group(self._router, response) or main_group
+            content_filter_group = self.llm_config.content_filter_fallback_model_group
+            fallbacks = self.llm_config.fallback_model_group
+            if content_filter_group not in (None, refused_on):
+                fallback_group = content_filter_group
+            elif refused_on == main_group and fallbacks:
+                fallback_group = fallbacks if isinstance(fallbacks, str) else fallbacks[0]
+        refused_stats = await self._log_refused_response(response, prompt_name, refused_on, fallback_group)
+        if fallback_group is None:
+            raise LLMContentFilteredError(self.llm_key, [refused_on])
+        fallback_response = await self._dispatch_llm_call(
+            messages=messages,
+            tools=tools,
+            router_model_group=fallback_group,
+            prompt_name=prompt_name,
+            **active_parameters,
+        )
+        if _response_finish_reason(fallback_response) == "content_filter":
+            await self._log_refused_response(fallback_response, prompt_name, fallback_group, None)
+            raise LLMContentFilteredError(self.llm_key, [refused_on, fallback_group])
+        return fallback_response, refused_stats
+
+    async def _retry_truncated_call_with_less_reasoning(
+        self,
+        response: ModelResponse,
+        messages: list[dict[str, Any]],
+        tools: list | None,
+        active_parameters: dict[str, Any],
+        prompt_name: str | None,
+    ) -> tuple[ModelResponse | CustomStreamWrapper | AnthropicMessage | UITarsResponse, LLMCallStats | None]:
+        """A model that spent its whole completion budget reasoning stops at finish_reason=length with no
+        content, which arrives as a valid response the router's exception-driven fallback never sees. Send it
+        once more with the declared reasoning budget halved, so the answer has room (SKY-18857). A step retry
+        is no substitute: it re-sends the same budget and truncates the same way."""
+        retry_parameters = _halved_reasoning_budget_parameters(active_parameters)
+        usage = getattr(response, "usage", None)
+        usage_detail = getattr(usage, "completion_tokens_details", None)
+        LOG.warning(
+            "LLM spent its whole completion budget on reasoning and returned no content",
+            llm_key=self.llm_key,
+            prompt_name=prompt_name,
+            model=getattr(response, "model", None) or self.llm_config.model_name,
+            prompt_tokens=getattr(usage, "prompt_tokens", None),
+            completion_tokens=getattr(usage, "completion_tokens", None),
+            reasoning_tokens=getattr(usage_detail, "reasoning_tokens", None),
+            # Splits the two labels upstreams give the same answer-less reply, so the share arriving
+            # as `stop` is readable without the exception text.
+            finish_reason=_response_finish_reason(response),
+            # False means the request declared no reasoning budget to lower, so this call fails as it
+            # did before. Read with retried_reasoning_budget to tell a recovery from a bare report.
+            retried=retry_parameters is not None,
+            retried_reasoning_budget=(
+                retry_parameters["extra_body"]["reasoning"]["max_tokens"] if retry_parameters else None
+            ),
+        )
+        if retry_parameters is None:
+            return response, None
+        truncated_stats = await self._log_discarded_response_stats(response, prompt_name)
+        return (
+            await self._dispatch_llm_call(messages=messages, tools=tools, prompt_name=prompt_name, **retry_parameters),
+            truncated_stats,
+        )
+
+    async def _log_discarded_response_stats(
+        self,
+        response: ModelResponse | CustomStreamWrapper | AnthropicMessage | UITarsResponse,
+        prompt_name: str | None,
+    ) -> LLMCallStats:
+        """Usage for a response this call is throwing away; its tokens were still spent and still bill."""
+        stats = await self.get_call_stats(response)
+        _emit_copilot_model_usage_for_response(
+            response,
+            request_model=self.llm_config.model_name,
+            prompt_name=prompt_name,
+            cost=stats.llm_cost if stats.llm_cost_available else None,
+        )
+        return stats
+
+    async def _log_refused_response(
+        self,
+        response: ModelResponse | CustomStreamWrapper | AnthropicMessage | UITarsResponse,
+        prompt_name: str | None,
+        refused_on: str,
+        fallback_group: str | None,
+    ) -> LLMCallStats:
+        stats = await self._log_discarded_response_stats(response, prompt_name)
+        LOG.warning(
+            "LLM response refused or blocked by content filter",
+            llm_key=self.llm_key,
+            prompt_name=prompt_name,
+            filtered_model_group=refused_on,
+            fallback_model_group=fallback_group,
+            input_tokens=stats.input_tokens,
+            output_tokens=stats.output_tokens,
+            llm_cost=stats.llm_cost,
+        )
+        return stats
+
     @traced(name="skyvern.llm.dispatch")
     async def _dispatch_llm_call(
         self,
         messages: list[dict[str, Any]],
         tools: list | None = None,
         timeout: float = settings.LLM_CONFIG_TIMEOUT,
+        router_model_group: str | None = None,
+        prompt_name: str | None = None,
         **active_parameters: dict[str, Any],
     ) -> ModelResponse | CustomStreamWrapper | AnthropicMessage | UITarsResponse:
         await _validate_custom_llm_api_base(self.original_llm_key, self.llm_config)
@@ -4353,7 +4693,7 @@ class LLMCaller:
             # timeout kwarg: the router's own precedence lets per-deployment timeouts apply
             # (see _build_litellm_router). Direct configs fall through to acompletion below.
             return await self._router.acompletion(
-                model=self._router_model_group,
+                model=router_model_group or self._router_model_group,
                 messages=messages,
                 tools=tools,
                 drop_params=True,
@@ -4361,7 +4701,7 @@ class LLMCaller:
             )
 
         if self.llm_key and "ANTHROPIC" in self.llm_key:
-            return await self._call_anthropic(messages, tools, timeout, **active_parameters)
+            return await self._call_anthropic(messages, tools, timeout, prompt_name=prompt_name, **active_parameters)
 
         # Route UI-TARS models to custom handler instead of LiteLLM
         if self.llm_key and "UI_TARS" in self.llm_key:
@@ -4385,6 +4725,7 @@ class LLMCaller:
         messages: list[dict[str, Any]],
         tools: list | None = None,
         timeout: float = settings.LLM_CONFIG_TIMEOUT,
+        prompt_name: str | None = None,
         **active_parameters: dict[str, Any],
     ) -> AnthropicMessage:
         max_tokens = active_parameters.get("max_completion_tokens") or active_parameters.get("max_tokens") or 4096
@@ -4418,7 +4759,12 @@ class LLMCaller:
         LOG.info(
             "Anthropic response",
             model_name=model_name,
-            response=response,
+            prompt_name=prompt_name,
+            response_type=type(response).__name__,
+            response_id=response.id,
+            content_length=sum(len(block.text) for block in response.content if block.type == "text"),
+            stop_reason=response.stop_reason,
+            token_usage={"input_tokens": response.usage.input_tokens, "output_tokens": response.usage.output_tokens},
             betas=betas,
             tools=tools,
             timeout=timeout,
@@ -4577,7 +4923,7 @@ class LLMCaller:
                         cache_read_input_tokens=cached_tokens,
                         cache_creation_input_tokens=cache_creation_tokens,
                     )
-                    llm_cost = (input_cost + output_cost) * _long_prompt_cost_multiplier(model, prompt_tokens)
+                    llm_cost = (input_cost + output_cost) * long_prompt_cost_multiplier(model, prompt_tokens)
             except Exception as exc:
                 # LiteLLM 1.89.1 wraps its missing-model ValueError in a plain Exception.
                 if isinstance(exc.__context__, ValueError) and str(exc.__context__).startswith(
@@ -4594,7 +4940,7 @@ class LLMCaller:
                 input_tokens=usage.input_tokens,
                 output_tokens=usage.output_tokens,
                 cached_tokens=cached_tokens,
-                reasoning_tokens=0,
+                reasoning_tokens=usage.output_tokens_details.thinking_tokens if usage.output_tokens_details else 0,
             )
         elif isinstance(response, (ModelResponse, CustomStreamWrapper)):
             input_tokens, output_tokens, reasoning_tokens, cached_tokens = LLMAPIHandlerFactory._extract_token_counts(

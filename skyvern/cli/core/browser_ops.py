@@ -10,6 +10,7 @@ import asyncio
 import json
 import os
 import re
+import string
 import time
 from contextlib import suppress
 from contextvars import ContextVar, Token
@@ -134,6 +135,7 @@ LOCALHOST_RECOVERY_HINT = (
 # reporting a failure for a page that is already loaded and usable.
 _LOAD_STATE_LADDER = ("commit", "domcontentloaded", "load", "networkidle")
 _NAVIGATE_TITLE_TIMEOUT_SECONDS = 5.0
+_VIEWPORT_PROBE_TIMEOUT_SECONDS = 2.0
 _UNBOUNDED_LEG_TIMEOUT_MS = 1000
 
 
@@ -148,6 +150,7 @@ class NavigateResult:
 class ScreenshotResult:
     data: bytes
     full_page: bool = False
+    viewport_css_px: tuple[int, int] | None = None
 
 
 @dataclass
@@ -281,6 +284,8 @@ async def do_screenshot(
             data = await element.screenshot()
         else:
             data = await page.screenshot(full_page=full_page)
+        # Reported only when the image shows exactly the viewport, so image size over it is a valid scale.
+        viewport_css_px = None if selector or full_page else await _viewport_css_px(page)
     except asyncio.CancelledError:
         cancelled = True
         raise
@@ -293,7 +298,20 @@ async def do_screenshot(
             restore.add_done_callback(_CURSOR_RESTORES.discard)
             if not cancelled:
                 await restore
-    return ScreenshotResult(data=data, full_page=full_page)
+    return ScreenshotResult(data=data, full_page=full_page, viewport_css_px=viewport_css_px)
+
+
+async def _viewport_css_px(page: Any) -> tuple[int, int] | None:
+    # Screenshots are taken at device scale, so the image's pixel size is not the CSS viewport on a HiDPI display.
+    try:
+        size = await asyncio.wait_for(
+            page.evaluate("() => [window.innerWidth, window.innerHeight]"), timeout=_VIEWPORT_PROBE_TIMEOUT_SECONDS
+        )
+    except Exception:
+        return None
+    if isinstance(size, list) and len(size) == 2 and all(type(value) is int and value > 0 for value in size):
+        return size[0], size[1]
+    return None
 
 
 async def do_act(
@@ -807,6 +825,12 @@ _ROLE_TO_TAG: dict[str, str] = {
     "treeitem": "li",
 }
 
+# Roles `roleFor` in _OBSERVE_INTERACTABLES_JS can assign by heuristic rather than read from markup;
+# merge keys keep the host tag for these so a pointer-cursor wrapper sharing a label cannot claim an
+# a11y entry. Every other role is declared by markup, where _ROLE_TO_TAG names just one of the tags
+# that can carry it (a combobox is a <select>, or an input/div with role=combobox).
+_INFERRED_DOM_ROLES = frozenset({"button", "option"})
+
 # Structural fields always kept in serialized output; display fields filtered if empty.
 _ELEMENT_KEEP_ALWAYS = frozenset({"ref", "role"})
 
@@ -1162,6 +1186,117 @@ class ObserveResult:
     document_id: str | None = None
 
 
+_ARIA_KEY = re.compile(r'([A-Za-z]+)(?: "((?:[^"\\]|\\.)*)")?(?: \[[^\]]*\])*')
+_ARIA_SIMPLE_ESCAPES = {"b": "\b", "f": "\f", "n": "\n", "r": "\r", "t": "\t", "\\": "\\", '"': '"'}
+
+
+def _aria_unescape(text: str) -> str:
+    """Playwright's aria-snapshot string escapes (incl. \\xHH); an unknown or malformed escape keeps the literal."""
+    out: list[str] = []
+    i = 0
+    while i < len(text):
+        char = text[i]
+        if char != "\\" or i + 1 >= len(text):
+            out.append(char)
+            i += 1
+            continue
+        nxt = text[i + 1]
+        width = {"x": 2, "u": 4}.get(nxt)
+        digits = text[i + 2 : i + 2 + width] if width else ""
+        if nxt in _ARIA_SIMPLE_ESCAPES:
+            out.append(_ARIA_SIMPLE_ESCAPES[nxt])
+            i += 2
+        elif width and len(digits) == width and all(d in string.hexdigits for d in digits):
+            out.append(chr(int(digits, 16)))
+            i += 2 + width
+        else:
+            out.append(nxt)
+            i += 2
+    return "".join(out)
+
+
+def _aria_scalar(value: str) -> str:
+    if len(value) >= 2 and value[0] == value[-1] == '"':
+        return _aria_unescape(value[1:-1])
+    if len(value) >= 2 and value[0] == value[-1] == "'":
+        return value[1:-1].replace("''", "'")
+    return value
+
+
+def _parse_aria_line(line: str) -> tuple[int, str, str, str | None] | None:
+    stripped = line.lstrip(" ")
+    if not stripped.startswith("- "):
+        return None
+    body = stripped[2:]
+    if body.startswith("'"):
+        # YAML single-quotes the whole node when its text contains ": "; '' is an escaped quote.
+        end = 1
+        while end < len(body) and not (body[end] == "'" and body[end + 1 : end + 2] != "'"):
+            end += 2 if body[end] == "'" else 1
+        if end >= len(body):
+            return None
+        key, rest = body[1:end].replace("''", "'"), body[end + 1 :]
+    else:
+        cut, in_quotes, escaped = len(body), False, False
+        for index, char in enumerate(body):
+            if escaped:
+                escaped = False
+            elif char == "\\" and in_quotes:
+                escaped = True
+            elif char == '"':
+                in_quotes = not in_quotes
+            elif char == ":" and not in_quotes:
+                cut = index
+                break
+        key, rest = body[:cut], body[cut:]
+    match = _ARIA_KEY.fullmatch(key)
+    if match is None or (rest and not rest.startswith(":")):
+        return None
+    inline = _aria_scalar(rest[1:].strip()) if rest[1:].strip() else None
+    return len(line) - len(stripped), match[1], _aria_unescape(match[2]) if match[2] is not None else "", inline
+
+
+# Inline aria-snapshot content is a form control's current value for every other role, so it is never kept.
+_ARIA_TEXT_CONTENT_ROLES = frozenset(
+    {"text", "paragraph", "heading", "listitem", "cell", "gridcell", "columnheader", "rowheader", "caption",
+     "blockquote", "term", "definition", "note", "status", "alert", "tooltip", "code", "strong", "emphasis"}
+)  # fmt: skip
+
+
+def _aria_snapshot_to_tree(snapshot_yaml: str) -> dict[str, Any]:
+    root: dict[str, Any] = {"role": "WebArea", "name": "", "children": []}
+    stack: list[tuple[int, dict[str, Any]]] = [(-1, root)]
+    for line in snapshot_yaml.splitlines():
+        try:
+            parsed = _parse_aria_line(line)
+        except Exception:
+            LOG.debug("observe aria snapshot line skipped", exc_info=True)
+            parsed = None
+        if parsed is None:
+            continue
+        indent, role, name, inline = parsed
+        while stack[-1][0] >= indent:
+            stack.pop()
+        node: dict[str, Any] = {"role": role, "name": name}
+        if inline and role in _ARIA_TEXT_CONTENT_ROLES:
+            if role == "text":
+                node["name"] = inline
+            else:
+                node["children"] = [{"role": "text", "name": inline}]
+        stack[-1][1].setdefault("children", []).append(node)
+        stack.append((indent, node))
+    return root
+
+
+async def _aria_snapshot_tree(page: Any, selector: str | None) -> dict[str, Any] | None:
+    try:
+        snapshot_yaml = await page.locator(selector or "body").first.aria_snapshot()
+    except Exception:
+        LOG.debug("observe aria snapshot unavailable", exc_info=True)
+        return None
+    return _aria_snapshot_to_tree(snapshot_yaml)
+
+
 def _flatten_a11y_tree(node: dict[str, Any] | None) -> list[dict[str, Any]]:
     """Recursively flatten an accessibility tree into a flat element list."""
     if node is None:
@@ -1227,19 +1362,19 @@ def _merge_dom_observe_elements(
     merged = list(a11y_elements)
     selector_seen = {element.get("selector") for element in merged if element.get("selector")}
 
-    # Only upgrade an a11y element with a DOM selector when the (role, name, tag) key is
-    # unambiguous on both sides. A duplicate label would otherwise risk attaching the
-    # selector to the wrong element — a confidently wrong deterministic action. Ambiguous
-    # DOM elements still fall through to the append path with their own distinct selector.
+    # Only upgrade an a11y element with a DOM selector when the merge key is unambiguous on
+    # both sides. A duplicate label would otherwise risk attaching the selector to the wrong
+    # element — a confidently wrong deterministic action. Ambiguous DOM elements still fall
+    # through to the append path with their own distinct selector.
     def _key(role: str, name: str, tag: str) -> tuple[str, str, str]:
-        return role, name, tag
+        return role, name, tag if role in _INFERRED_DOM_ROLES else ""
 
-    a11y_key_counts: dict[tuple[str, str, str], int] = {}
+    a11y_by_key: dict[tuple[str, str, str], list[dict[str, Any]]] = {}
     for element in merged:
         if not element.get("selector"):
             role = element.get("role", "")
             key = _key(role, element.get("name", ""), _ROLE_TO_TAG.get(role, ""))
-            a11y_key_counts[key] = a11y_key_counts.get(key, 0) + 1
+            a11y_by_key.setdefault(key, []).append(element)
     dom_key_counts: dict[tuple[str, str, str], int] = {}
     for dom_element in dom_elements:
         key = _key(dom_element.get("role", ""), dom_element.get("name", ""), dom_element.get("tag", ""))
@@ -1250,33 +1385,26 @@ def _merge_dom_observe_elements(
         if dom_selector and dom_selector in selector_seen:
             continue
         dom_key = _key(dom_element.get("role", ""), dom_element.get("name", ""), dom_element.get("tag", ""))
-        unambiguous = a11y_key_counts.get(dom_key, 0) == 1 and dom_key_counts.get(dom_key, 0) == 1
-        matched_existing = False
-        if unambiguous:
-            for existing in merged:
-                if (
-                    not existing.get("selector")
-                    and existing.get("role", "") == dom_element.get("role", "")
-                    and existing.get("name", "") == dom_element.get("name", "")
-                    and _ROLE_TO_TAG.get(existing.get("role", ""), "") == dom_element.get("tag", "")
-                ):
-                    existing["selector"] = dom_selector
-                    if dom_element.get("value") is not None:
-                        existing["value"] = dom_element["value"]
-                    if dom_element.get("options") and not existing.get("children"):
-                        existing["options"] = dom_element.get("options")
-                    if dom_element.get("aria_controls"):
-                        existing["aria_controls"] = dom_element["aria_controls"]
-                    if dom_element.get("aria_owns"):
-                        existing["aria_owns"] = dom_element["aria_owns"]
-                    matched_existing = True
-                    if dom_selector:
-                        selector_seen.add(dom_selector)
-                    break
-        if not matched_existing:
+        candidates = a11y_by_key.get(dom_key, [])
+        if len(candidates) == 1 and dom_key_counts.get(dom_key, 0) == 1:
+            existing = candidates[0]
+            existing["selector"] = dom_selector
+            # The a11y entry carries no tag of its own; without this it keeps reporting
+            # _ROLE_TO_TAG's guess instead of the tag it merged with.
+            if dom_element.get("tag"):
+                existing["tag"] = dom_element["tag"]
+            if dom_element.get("value") is not None:
+                existing["value"] = dom_element["value"]
+            if dom_element.get("options") and not existing.get("children"):
+                existing["options"] = dom_element.get("options")
+            if dom_element.get("aria_controls"):
+                existing["aria_controls"] = dom_element["aria_controls"]
+            if dom_element.get("aria_owns"):
+                existing["aria_owns"] = dom_element["aria_owns"]
+        else:
             merged.append(dom_element)
-            if dom_selector:
-                selector_seen.add(dom_selector)
+        if dom_selector:
+            selector_seen.add(dom_selector)
 
     return merged
 
@@ -1371,13 +1499,14 @@ async def do_observe(
         snapshot = None
     else:
         accessibility = getattr(page, "accessibility", None)
-        if selector and accessibility is not None:
+        if accessibility is None:
+            # Playwright 1.58+ removed Page.accessibility; the public aria snapshot carries the same role/name tree.
+            snapshot = await _aria_snapshot_tree(page, selector)
+        elif selector:
             element_handle = await page.locator(selector).first.element_handle()
             snapshot = await accessibility.snapshot(root=element_handle)
-        elif accessibility is not None:
-            snapshot = await accessibility.snapshot()
         else:
-            snapshot = None
+            snapshot = await accessibility.snapshot()
 
     all_elements = _flatten_a11y_tree(snapshot)
     dom_elements = await _get_dom_observe_elements(

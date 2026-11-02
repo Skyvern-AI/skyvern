@@ -199,35 +199,47 @@ test("isElementVisible: display:contents parent containing an option does not ov
 // Exercise the actual serializer, including copied attributes and the live value property.
 (async () => {
   const vm = require("vm");
-  const context = {
-    window: { GlobalSkyvernFrameIndex: 0 },
-    ShadowRoot: global.ShadowRoot,
-    __captureDestinationFacts: false,
-    getPseudoContent: () => "",
-    getElementText: () => "",
-    enrichValidationState: () => {},
-  };
-  for (const name of [
-    "checkDisabledFromStyle",
-    "checkRequiredFromStyle",
-    "isHoverOnlyElement",
-    "isDatePickerSelector",
-    "isDivComboboxDropdown",
-    "isDropdownButton",
-    "isAngularDropdown",
-    "isAngularMaterialDatePicker",
-    "isSelect2Dropdown",
-    "isSelect2MultiChoice",
-    "isReadonlyInputDropdown",
-  ])
-    context[name] = () => false;
-  vm.createContext(context);
   const helper = src.includes("// BEGIN OTP INPUT PRIVACY")
     ? src
         .split("// BEGIN OTP INPUT PRIVACY")[1]
         .split("// END OTP INPUT PRIVACY")[0]
     : extract("isOtpInputValueSecret");
-  vm.runInContext(helper + "\nasync " + extract("buildElementObject"), context);
+  const serializerContext = (window, overrides) => {
+    const serializer = {
+      window,
+      ShadowRoot: global.ShadowRoot,
+      __captureDestinationFacts: false,
+      getPseudoContent: () => "",
+      getElementText: () => "",
+      enrichValidationState: () => {},
+      ...overrides,
+    };
+    for (const name of [
+      "checkDisabledFromStyle",
+      "checkRequiredFromStyle",
+      "isHoverOnlyElement",
+      "isDatePickerSelector",
+      "isDivComboboxDropdown",
+      "isDropdownButton",
+      "isAngularDropdown",
+      "isAngularMaterialDatePicker",
+      "isSelect2Dropdown",
+      "isSelect2MultiChoice",
+      "isReadonlyInputDropdown",
+    ])
+      serializer[name] = () => false;
+    vm.createContext(serializer);
+    vm.runInContext(
+      helper + "\nasync " + extract("buildElementObject"),
+      serializer,
+    );
+    return serializer;
+  };
+  // These fixtures name their nodes by id; the real id wiring is covered by the id checks below.
+  const context = serializerContext(
+    { GlobalSkyvernFrameIndex: 0 },
+    { ownUniqueId: async (element) => element.getAttribute("unique_id") },
+  );
   for (const [name, attributes, value, count, flagged, expected] of [
     ["marked", { "data-skyvern-otp-box": "1" }, "7", 0, false, "*"],
     ["unmarked alone", {}, "8", 0, false, "8"],
@@ -647,6 +659,177 @@ test("isElementVisible: display:contents parent containing an option does not ov
       );
     });
   }
+  // Each frame is its own window whose element counter starts at 1, as in a browser.
+  const extractConst = (name) => {
+    const match = src.match(new RegExp(`^const ${name} =[^;]*;`, "m"));
+    if (match === null) throw new Error(`const ${name} not found`);
+    return match[0];
+  };
+  const idCode = [
+    extractConst("UNIQUE_ID_CHARACTERS"),
+    extractConst("UNIQUE_ID_COUNTER_LENGTH"),
+    extractConst("MINTED_UNIQUE_ID"),
+    extract("uniqueIdFramePrefix"),
+    "async " + extract("uniqueId"),
+    "async " + extract("ownUniqueId"),
+  ].join("\n");
+  const idWindow = (frameIndex) => {
+    const windowContext = {
+      window: {
+        GlobalSkyvernFrameIndex: frameIndex,
+        elementIdCounter: {
+          value: 0,
+          async add() {
+            return ++this.value;
+          },
+        },
+      },
+    };
+    vm.createContext(windowContext);
+    vm.runInContext(idCode, windowContext);
+    return windowContext;
+  };
+  const tagged = (id) => ({
+    _attributes: id ? { unique_id: id } : {},
+    getAttribute(name) {
+      return this._attributes[name] ?? null;
+    },
+    setAttribute(name, value) {
+      this._attributes[name] = value;
+    },
+  });
+  const ownIds = async (win, nodes) => {
+    const ids = [];
+    for (const node of nodes) ids.push(await win.ownUniqueId(node));
+    return ids;
+  };
+
+  const frameIndexes = [0, 1, 61, 62, 63, 124, 3843, 3844];
+  const idsByFrame = {};
+  for (const frameIndex of frameIndexes) {
+    const win = idWindow(frameIndex);
+    idsByFrame[frameIndex] = await ownIds(
+      win,
+      Array.from({ length: 70 }, () => tagged()),
+    );
+  }
+  test("uniqueId: frames 62 apart never share an element id", () => {
+    const all = Object.values(idsByFrame).flat();
+    assert(
+      new Set(all).size === all.length,
+      "two frames produced the same element id",
+    );
+  });
+  test("uniqueId: frames below 62 keep their ids, and the prefix grows at 62 and 3844", () => {
+    const firstIds = frameIndexes.map(
+      (frameIndex) => idsByFrame[frameIndex][0],
+    );
+    const expected = [
+      "AAAB",
+      "BAAB",
+      "9AAB",
+      "BAAAB",
+      "BBAAB",
+      "CAAAB",
+      "99AAB",
+      "BAAAAB",
+    ];
+    assert(
+      JSON.stringify(firstIds) === JSON.stringify(expected),
+      `got ${firstIds}`,
+    );
+  });
+
+  const parent = idWindow(0);
+  const parentNodes = Array.from({ length: 5 }, () => tagged());
+  const parentIds = await ownIds(parent, parentNodes);
+  const child = idWindow(5);
+  const copies = parentIds.map((id) => tagged(id));
+  const childIds = await ownIds(child, copies);
+  const childRescrape = await ownIds(child, copies);
+  const parentRescrape = await ownIds(parent, parentNodes);
+  test("ownUniqueId: a child frame's copy of tagged parent nodes gets the child's own ids", () => {
+    assert(
+      childIds.every((id) => id.startsWith("F") && id.length === 4),
+      `child ids ${childIds} do not carry frame 5's prefix`,
+    );
+    assert(
+      new Set([...parentIds, ...childIds]).size === 10,
+      "a copy still shares an id with its original",
+    );
+  });
+  test("ownUniqueId: re-scraping a window keeps every id it minted", () => {
+    assert(
+      JSON.stringify(childRescrape) === JSON.stringify(childIds) &&
+        JSON.stringify(parentRescrape) === JSON.stringify(parentIds),
+      "a re-scrape changed an id",
+    );
+  });
+  const untracked = tagged("AAAB");
+  await idWindow(undefined).ownUniqueId(untracked);
+  const pageOwned = ["SEX_INPUT", "box-0", "unrelated"].map((id) => tagged(id));
+  const pageOwnedIds = await ownIds(idWindow(0), pageOwned);
+  test("ownUniqueId: ids it did not mint are kept, with no frame index or when the page set them", () => {
+    assert(
+      untracked.getAttribute("unique_id") === "AAAB",
+      "a window without a frame index replaced an id",
+    );
+    assert(
+      JSON.stringify(pageOwnedIds) ===
+        JSON.stringify(["SEX_INPUT", "box-0", "unrelated"]),
+      `page-set ids were replaced: ${pageOwnedIds}`,
+    );
+  });
+  // The real serializer and id wiring in frame 5, whose DOM holds copies the main frame already tagged.
+  const framedSerializer = serializerContext(
+    {
+      GlobalSkyvernFrameIndex: 5,
+      elementIdCounter: {
+        value: 0,
+        async add() {
+          return ++this.value;
+        },
+      },
+    },
+    {},
+  );
+  vm.runInContext(idCode, framedSerializer);
+  const copiedNode = (id) => {
+    const node = el({ tagName: "div", attributes: { unique_id: id } });
+    node.attributes = [{ name: "unique_id", value: id }];
+    node.setAttribute = (name, value) => {
+      node._attributes[name] = value;
+    };
+    return node;
+  };
+  const copied = copiedNode("AAAC");
+  const copiedHost = copiedNode("AAAD");
+  const shadowChild = copiedNode("AAAE");
+  const shadowRoot = new global.ShadowRoot();
+  shadowRoot.host = copiedHost;
+  shadowChild.getRootNode = () => shadowRoot;
+  const copiedObject = await framedSerializer.buildElementObject(
+    "AAAB",
+    copied,
+    true,
+  );
+  const shadowChildObject = await framedSerializer.buildElementObject(
+    "AAAB",
+    shadowChild,
+    true,
+  );
+  test("buildElementObject: a copied node and a copied shadow host get this frame's ids", () => {
+    assert(
+      copiedObject.id.startsWith("F") &&
+        copied.getAttribute("unique_id") === copiedObject.id,
+      `copied node kept ${copiedObject.id}`,
+    );
+    assert(
+      shadowChildObject.shadowHost.startsWith("F") &&
+        copiedHost.getAttribute("unique_id") === shadowChildObject.shadowHost,
+      `copied shadow host kept ${shadowChildObject.shadowHost}`,
+    );
+  });
   console.log(`\n${passed + failed} tests: ${passed} passed, ${failed} failed`);
   process.exit(failed > 0 ? 1 : 0);
 })().catch((error) => {

@@ -10,15 +10,19 @@ import {
   ConnectedAccountChoice,
   CopilotResponseType,
   CopilotSteerMessage,
+  type CopilotTestInput,
+  type CopilotTestInputSource,
   DeliveredOutputFile,
   ProposalDisposition,
   RunOutcomeRole,
+  SkippedPrefixBlock,
   WorkflowCopilotBlockProgressUpdate,
   WorkflowCopilotCodegenProgressUpdate,
   WorkflowCopilotDesignEndUpdate,
   WorkflowCopilotDesignStartUpdate,
   WorkflowCopilotNarrationUpdate,
   WorkflowCopilotRunOutcomeUpdate,
+  WorkflowCopilotRunStartedUpdate,
   WorkflowCopilotScreenshotUpdate,
   WorkflowCopilotStreamErrorUpdate,
   WorkflowCopilotStreamResponseUpdate,
@@ -36,6 +40,8 @@ export interface BudgetExpiryState {
   reportProduced: boolean | null;
   stagedDraftId: string | null;
   drainFingerprint: string | null;
+  // Test runs the turn's hard time limit left to their worker; the backend saves only their blocks as unfinished.
+  leftRunIds: string[];
 }
 
 function parseBudgetExpiry(raw: unknown): BudgetExpiryState | null {
@@ -58,6 +64,9 @@ function parseBudgetExpiry(raw: unknown): BudgetExpiryState | null {
       typeof value.drainFingerprint === "string"
         ? value.drainFingerprint
         : null,
+    leftRunIds: Array.isArray(value.leftRunIds)
+      ? value.leftRunIds.filter((id): id is string => typeof id === "string")
+      : [],
   };
 }
 
@@ -77,6 +86,7 @@ function budgetExpiryFromOutcome(
     reportProduced: outcome.budget_expiry_report_produced ?? null,
     stagedDraftId: outcome.budget_expiry_staged_draft_id ?? null,
     drainFingerprint: outcome.drain_fingerprint ?? null,
+    leftRunIds: [],
   };
 }
 
@@ -117,6 +127,7 @@ export type NarrativeEvent =
   | WorkflowCopilotWorkflowDraftUpdate
   | WorkflowCopilotBlockProgressUpdate
   | WorkflowCopilotRunOutcomeUpdate
+  | WorkflowCopilotRunStartedUpdate
   | WorkflowCopilotStreamResponseUpdate
   | WorkflowCopilotStreamErrorUpdate
   | WorkflowCopilotNarrationUpdate
@@ -131,7 +142,8 @@ export type NarrativeEvent =
 // failed-style states (failed, terminated, timed_out) under one chip and
 // treats `skipped` and `stopped` as separate neutral states. `stopped` is a
 // user cancel: it ran and was interrupted, which is not a failure and must
-// never be rendered as one.
+// never be rendered as one. `unfinished` is a block still running when a turn
+// limit ended the turn; its run may still be going, so it is neither.
 export type BlockUIState =
   | "queued"
   | "drafted"
@@ -139,6 +151,7 @@ export type BlockUIState =
   | "completed"
   | "failed"
   | "stopped"
+  | "unfinished"
   | "skipped";
 
 // Recorded per-run outcome verdict, distinct from lifecycle state: a row can
@@ -241,6 +254,7 @@ export function isBuildTestConnectFailureState(
 }
 
 export type ReviewChange = "added" | "changed" | "unchanged" | "removed";
+export type InputChange = "added" | "changed" | "removed";
 export type BlockCoverage =
   | "current_source"
   | "different_source"
@@ -289,10 +303,16 @@ export interface ReviewProjection {
     blockType: string;
     blockLabels: string[];
   }>;
+  inputs?: Array<{ key: string; change: InputChange }>;
+  // Blocks whose saved notes Copilot's YAML left out, so the saved notes were kept.
+  keptNotes?: string[];
+  // The same for descriptions.
+  keptDescriptions?: string[];
 }
 
 export interface BlockState {
   workflowRunBlockId: string;
+  workflowRunId?: string;
   label: string;
   blockType: string;
   state: BlockUIState;
@@ -300,6 +320,8 @@ export interface BlockState {
   outcome?: BlockOutcome;
   outcomeReason?: string;
   outcomeRole?: RunOutcomeRole;
+  // Requested blocks the run did not execute, shown before this, the run's first card.
+  skippedBefore?: SkippedPrefixBlock[];
   lastSeenIteration: number;
   // Tool calls and results emitted while this block was running are
   // appended here so the expanded card shows what the agent did.
@@ -355,6 +377,10 @@ export interface ActivityEntry {
   // A successful run_browser_code result's operations as display phrases,
   // in order. Absent on every other row.
   browserSteps?: string[];
+  // The run a block-running result dispatched, and where each of its inputs
+  // came from. Absent on every other row.
+  workflowRunId?: string;
+  testInputs?: CopilotTestInput[];
   // Stable per-event id used as React key.
   id: string;
   // Consecutive same-tool retries folded into this row by
@@ -438,6 +464,7 @@ export interface TurnNarrativeState {
     verdict: BlockOutcome;
     role?: RunOutcomeRole;
     displayReason: string | null;
+    workflowRunId?: string;
   } | null;
   // Terminal-mode credential ask, from the credentialPrompt narrative signal.
   // reason is kept as a raw string — the card tolerates unknown tokens.
@@ -451,6 +478,8 @@ export interface TurnNarrativeState {
     // turns recorded before it was stamped.
     anchorToolCallId?: string;
   } | null;
+  // Every pick card's credentialPause, oldest first; the backend sends it only when more than one settled.
+  credentialPauses: NonNullable<TurnNarrativeState["credentialPause"]>[];
   // Silently auto-bound credential, from the credentialAutoBound narrative signal — rendered as a
   // receipt with a Change affordance so a confident-but-wrong pick can be corrected after the fact.
   credentialAutoBound: { credentialId: string; name: string } | null;
@@ -460,6 +489,8 @@ export interface TurnNarrativeState {
   connectedAccountChoices: ConnectedAccountChoice[];
   outputFiles: DeliveredOutputFile[];
   googleConnectionNotices: GoogleConnectionNotice[];
+  demonstrationOffer: boolean;
+  canonicalWorkflowUnavailable: CanonicalWorkflowUnavailable | null;
   review: ReviewProjection | null;
   turnFacts: TurnFacts | null;
   budgetExpiry: BudgetExpiryState | null;
@@ -467,6 +498,8 @@ export interface TurnNarrativeState {
   steerMessages: CopilotSteerMessage[];
   // Browser frames captured for the agent this turn, in capture order.
   screenshots: TurnScreenshot[];
+  // Live-only: a started run's skipped prefix, keyed by run id until the run's first block arrives.
+  pendingSkippedPrefix: Record<string, SkippedPrefixBlock[]>;
 }
 
 export interface TurnScreenshot {
@@ -476,12 +509,26 @@ export interface TurnScreenshot {
   toolCallId: string | null;
 }
 
+export type GoogleSetupScopeProfile = "gmail" | "google_sheets";
+
 export interface GoogleConnectionNotice {
   provider: "google";
   connectionId: string | null;
   displayName: string | null;
   condition: "missing" | "unusable" | "unbound";
+  scopeProfile: GoogleSetupScopeProfile;
+  origin: "setup" | "workflow";
   choices?: ConnectedAccountChoice[];
+}
+
+export function googleConnectionNoticeKey(
+  notice: GoogleConnectionNotice,
+): string {
+  return `${notice.scopeProfile}:${notice.connectionId ?? "unbound"}`;
+}
+
+export interface CanonicalWorkflowUnavailable {
+  workflowPermanentId: string;
 }
 
 export const EMPTY_NARRATIVE: TurnNarrativeState = Object.freeze({
@@ -507,15 +554,19 @@ export const EMPTY_NARRATIVE: TurnNarrativeState = Object.freeze({
   lastRunOutcome: null,
   credentialPrompt: null,
   credentialPause: null,
+  credentialPauses: [],
   credentialAutoBound: null,
   connectedAccountChoices: [],
   outputFiles: [],
   googleConnectionNotices: [],
+  demonstrationOffer: false,
+  canonicalWorkflowUnavailable: null,
   review: null,
   turnFacts: null,
   budgetExpiry: null,
   steerMessages: [],
   screenshots: [],
+  pendingSkippedPrefix: {},
 }) as TurnNarrativeState;
 
 // Caps to keep long-running narrations from unbounded growth (and to keep
@@ -597,6 +648,18 @@ export function parseCredentialPause(
   };
 }
 
+export function parseCredentialPauses(
+  value: unknown,
+): TurnNarrativeState["credentialPauses"] {
+  if (!Array.isArray(value)) return [];
+  return value
+    .map(parseCredentialPause)
+    .filter(
+      (pause): pause is NonNullable<TurnNarrativeState["credentialPause"]> =>
+        pause !== null,
+    );
+}
+
 export interface TurnWorkPlan {
   toolCallId: string;
   items: string[];
@@ -615,6 +678,32 @@ function parseTurnWorkPlan(value: unknown): TurnWorkPlan | null {
   return typeof o.toolCallId === "string" && o.toolCallId && items
     ? { toolCallId: o.toolCallId, items }
     : null;
+}
+
+const TEST_INPUT_SOURCES: ReadonlySet<string> = new Set<CopilotTestInputSource>(
+  ["copilot", "page", "earlier_run", "default", "placeholder"],
+);
+
+export function parseTestInputs(
+  value: unknown,
+): CopilotTestInput[] | undefined {
+  if (!Array.isArray(value)) return undefined;
+  const inputs: CopilotTestInput[] = [];
+  for (const item of value) {
+    if (!item || typeof item !== "object") continue;
+    const row = item as Record<string, unknown>;
+    if (typeof row.key !== "string" || typeof row.source !== "string") {
+      continue;
+    }
+    if (!TEST_INPUT_SOURCES.has(row.source)) continue;
+    inputs.push({
+      key: row.key,
+      source: row.source as CopilotTestInputSource,
+      sourceRunId:
+        typeof row.sourceRunId === "string" ? row.sourceRunId : undefined,
+    });
+  }
+  return inputs.length > 0 ? inputs : undefined;
 }
 
 export function parseCodeDiffs(value: unknown): CodeWriteDiff[] | undefined {
@@ -694,12 +783,25 @@ export function parseCredentialAutoBound(
     : null;
 }
 
+export function parseCanonicalWorkflowUnavailable(
+  value: unknown,
+): CanonicalWorkflowUnavailable | null {
+  if (!value || typeof value !== "object") return null;
+  const row = value as Record<string, unknown>;
+  return typeof row.workflow_permanent_id === "string" &&
+    row.workflow_permanent_id.length > 0 &&
+    row.candidate_published !== true &&
+    row.test_started === false
+    ? { workflowPermanentId: row.workflow_permanent_id }
+    : null;
+}
+
 export function parseGoogleConnectionNotices(
   value: unknown,
 ): GoogleConnectionNotice[] {
   if (!Array.isArray(value)) return [];
   const notices: GoogleConnectionNotice[] = [];
-  const seen = new Set<string | null>();
+  const seen = new Set<string>();
   for (const item of value) {
     if (!item || typeof item !== "object") continue;
     const row = item as Record<string, unknown>;
@@ -711,26 +813,32 @@ export function parseGoogleConnectionNotices(
           row.connectionId.length === 0) ||
       (row.condition !== "missing" &&
         row.condition !== "unusable" &&
-        row.condition !== "unbound")
+        row.condition !== "unbound") ||
+      (row.scopeProfile !== undefined &&
+        row.scopeProfile !== "gmail" &&
+        row.scopeProfile !== "google_sheets")
     ) {
       continue;
     }
-    const connectionId =
-      row.condition === "unbound" ? null : (row.connectionId as string);
-    if (seen.has(connectionId)) continue;
-    seen.add(connectionId);
-    notices.push({
+    const notice: GoogleConnectionNotice = {
       provider: "google",
-      connectionId,
+      connectionId:
+        row.condition === "unbound" ? null : (row.connectionId as string),
       displayName:
         typeof row.displayName === "string" && row.displayName.length > 0
           ? row.displayName
           : null,
       condition: row.condition,
+      scopeProfile: row.scopeProfile === "gmail" ? "gmail" : "google_sheets",
+      origin: row.origin === "setup" ? "setup" : "workflow",
       ...(row.condition === "unbound"
         ? { choices: parseConnectedAccountChoices(row.choices) }
         : {}),
-    });
+    };
+    const key = googleConnectionNoticeKey(notice);
+    if (seen.has(key)) continue;
+    seen.add(key);
+    notices.push(notice);
   }
   return notices;
 }
@@ -772,6 +880,7 @@ const ACTIVITY_TOOL_DISPLAY_LABELS: Record<string, string> = {
   scroll: "Interacting with page",
   select_option: "Selecting option",
   press_key: "Interacting with page",
+  drag: "Interacting with page",
   navigate_browser: "Opening page",
   wait_for_either_state: "Waiting for the page",
   skyvern_frame_list: "Finding embedded pages",
@@ -845,7 +954,10 @@ const TOOL_CALL_KINDS: Record<string, ToolCallKind> = {
   validate_block: "other",
   inspect_current_workflow: "other",
   list_integrations: "other",
+  request_google_connection: "other",
+  offer_demonstration: "other",
   read_google_sheet: "other",
+  read_attached_pdf: "other",
   get_organization_usage_quota: "other",
   extend_browser_session: "other",
   search_web: "other",
@@ -947,6 +1059,8 @@ function buildActivityFromToolResult(
     detail: event.detail || undefined,
     codeDiffs: parseCodeDiffs(event.code_diffs),
     browserSteps: parseStringList(event.browser_steps) ?? undefined,
+    workflowRunId: event.workflow_run_id || undefined,
+    testInputs: parseTestInputs(event.test_inputs),
     reason: actionReason(event.reason),
     activityBucket: parseActivityBucket(event.activity_bucket),
     activityStartedAt: event.activity_started_at ?? undefined,
@@ -1438,8 +1552,14 @@ export function applyNarrativeEvent(
       // terminal event take the latest wall clock so a retry-then-succeed
       // sequence reflects the final completion time, not the first failure.
       const endedAt = isTerminal ? eventTs : null;
+      const runId = event.workflow_run_id;
+      const pendingSkipped =
+        previousBlock === null && runId
+          ? prev.pendingSkippedPrefix[runId]
+          : undefined;
       const baseEntry: BlockState = {
         workflowRunBlockId: event.workflow_run_block_id,
+        workflowRunId: runId || previousBlock?.workflowRunId,
         label: event.block_label,
         blockType: event.block_type,
         state: incomingState,
@@ -1449,6 +1569,7 @@ export function applyNarrativeEvent(
         outcome: previousBlock?.outcome,
         outcomeReason: previousBlock?.outcomeReason,
         outcomeRole: previousBlock?.outcomeRole,
+        skippedBefore: previousBlock?.skippedBefore ?? pendingSkipped,
         recordedActions: previousBlock?.recordedActions,
         recordedActionsAt: previousBlock?.recordedActionsAt,
         lastSeenIteration: event.iteration,
@@ -1463,9 +1584,26 @@ export function applyNarrativeEvent(
       }
       return {
         ...prev,
+        pendingSkippedPrefix: pendingSkipped
+          ? Object.fromEntries(
+              Object.entries(prev.pendingSkippedPrefix).filter(
+                ([id]) => id !== runId,
+              ),
+            )
+          : prev.pendingSkippedPrefix,
         blocks: [...prev.blocks, baseEntry].slice(-MAX_BLOCK_ATTEMPTS),
       };
     }
+
+    case "run_started":
+      if (!event.skipped_prefix?.length) return prev;
+      return {
+        ...prev,
+        pendingSkippedPrefix: {
+          ...prev.pendingSkippedPrefix,
+          [event.workflow_run_id]: event.skipped_prefix,
+        },
+      };
 
     case "run_outcome": {
       // Apply the recorded verdict by run-block id only — no label fallback, so
@@ -1490,6 +1628,7 @@ export function applyNarrativeEvent(
           verdict: event.verdict,
           role: event.role ?? "recorded",
           displayReason: event.display_reason ?? null,
+          workflowRunId: event.workflow_run_id,
         },
       };
     }
@@ -1762,6 +1901,11 @@ function normalizeActivityEntries(raw: unknown): ActivityEntry[] {
       success: typeof o.success === "boolean" ? o.success : undefined,
       codeDiffs: parseCodeDiffs(o.codeDiffs),
       browserSteps: parseStringList(o.browserSteps) ?? undefined,
+      workflowRunId:
+        typeof o.workflowRunId === "string" && o.workflowRunId
+          ? o.workflowRunId
+          : undefined,
+      testInputs: parseTestInputs(o.testInputs),
       id: o.id,
       reason: actionReason(o.reason),
       activityBucket: parseActivityBucket(o.activityBucket),
@@ -1852,7 +1996,53 @@ function parseReviewProjection(raw: unknown): ReviewProjection | null {
       blockLabels: group.blockLabels,
     });
   }
-  return { blocks, duplicateWrites };
+  const labels = (raw: unknown): string[] =>
+    Array.isArray(raw)
+      ? raw.filter((label): label is string => typeof label === "string")
+      : [];
+  // Payloads persisted before inputs were published carry none, and a malformed row drops
+  // alone rather than voiding the review.
+  const inputs: NonNullable<ReviewProjection["inputs"]> = [];
+  for (const rawInput of Array.isArray(value.inputs) ? value.inputs : []) {
+    const input = (rawInput ?? {}) as Record<string, unknown>;
+    if (
+      typeof input.key === "string" &&
+      (input.change === "added" ||
+        input.change === "changed" ||
+        input.change === "removed")
+    ) {
+      inputs.push({ key: input.key, change: input.change });
+    }
+  }
+  return {
+    blocks,
+    duplicateWrites,
+    inputs,
+    keptNotes: labels(value.keptNotes),
+    keptDescriptions: labels(value.keptDescriptions),
+  };
+}
+
+function parseSkippedPrefix(raw: unknown): SkippedPrefixBlock[] | undefined {
+  if (!Array.isArray(raw)) return undefined;
+  const entries = raw.flatMap((item): SkippedPrefixBlock[] => {
+    const obj = item as Record<string, unknown>;
+    if (
+      typeof obj?.label !== "string" ||
+      (obj.kind !== "reused" && obj.kind !== "not_run")
+    )
+      return [];
+    return [
+      typeof obj.sourceWorkflowRunId === "string"
+        ? {
+            label: obj.label,
+            kind: obj.kind,
+            sourceWorkflowRunId: obj.sourceWorkflowRunId,
+          }
+        : { label: obj.label, kind: obj.kind },
+    ];
+  });
+  return entries.length > 0 ? entries : undefined;
 }
 
 export function hydrateNarrativeFromPayload(
@@ -1930,12 +2120,17 @@ export function hydrateNarrativeFromPayload(
           typeof obj.workflowRunBlockId === "string"
             ? obj.workflowRunBlockId
             : "",
+        workflowRunId:
+          typeof obj.workflowRunId === "string" && obj.workflowRunId
+            ? obj.workflowRunId
+            : undefined,
         label: typeof obj.label === "string" ? obj.label : "",
         blockType: typeof obj.blockType === "string" ? obj.blockType : "task",
         outcome,
         outcomeRole,
         outcomeReason:
           typeof obj.outcomeReason === "string" ? obj.outcomeReason : undefined,
+        skippedBefore: parseSkippedPrefix(obj.skippedBefore),
         state: ((): BlockState["state"] => {
           const s = obj.state;
           if (
@@ -1945,6 +2140,7 @@ export function hydrateNarrativeFromPayload(
             s === "completed" ||
             s === "failed" ||
             s === "stopped" ||
+            s === "unfinished" ||
             s === "skipped"
           )
             return s;
@@ -1973,23 +2169,21 @@ export function hydrateNarrativeFromPayload(
     typeof payload.endedAt === "string" ? (payload.endedAt as string) : null;
   const cancelled = payload.cancelled === true;
   const turnFacts = parseTurnFacts(payload.turnFacts);
-  // A deadline cuts a running block off; that is a stop, so it must not be swept
-  // to failed and then read back as the turn having failed.
+  // The backend saves a left run's blocks as unfinished; any other block
+  // cut off by a turn limit is a stop, never a failure.
   const budgetExpiry = parseBudgetExpiry(payload.budgetExpiry);
-  const halted =
-    cancelled ||
-    turnFacts?.terminalCause === "deadline_expired" ||
-    budgetExpiry !== null;
+  const halted = budgetHalted({ turnFacts, budgetExpiry });
   const sweptBlocks: BlockState[] = terminal
     ? blocks.map((b) =>
         b.state === "running"
           ? {
               ...b,
-              state: halted
-                ? "stopped"
-                : terminal === "error"
-                  ? "failed"
-                  : "completed",
+              state:
+                cancelled || halted
+                  ? "stopped"
+                  : terminal === "error"
+                    ? "failed"
+                    : "completed",
               endedAt: b.endedAt ?? endedAtIso,
             }
           : b,
@@ -2046,6 +2240,7 @@ export function hydrateNarrativeFromPayload(
       typeof payload.endedAt === "string" ? (payload.endedAt as string) : null,
     credentialPrompt: parseCredentialPrompt(payload.credentialPrompt),
     credentialPause: parseCredentialPause(payload.credentialPause),
+    credentialPauses: parseCredentialPauses(payload.credentialPauses),
     credentialAutoBound: parseCredentialAutoBound(payload.credentialAutoBound),
     workPlan: parseTurnWorkPlan(payload.workPlan),
     connectedAccountChoices: parseConnectedAccountChoices(
@@ -2054,6 +2249,10 @@ export function hydrateNarrativeFromPayload(
     outputFiles: parseOutputFiles(payload.outputFiles),
     googleConnectionNotices: parseGoogleConnectionNotices(
       payload.googleConnectionNotices,
+    ),
+    demonstrationOffer: payload.demonstrationOffer === true,
+    canonicalWorkflowUnavailable: parseCanonicalWorkflowUnavailable(
+      payload.canonicalWorkflowUnavailable,
     ),
     review: parseReviewProjection(payload.review),
     turnFacts,
@@ -2159,6 +2358,7 @@ export function latestBlocksByLabel(blocks: BlockState[]): BlockState[] {
 export interface NotConfirmedOutcome {
   verdict: "not_demonstrated";
   displayReason: string | null;
+  workflowRunId?: string;
 }
 
 function notDemonstratedBlock(blocks: BlockState[]): BlockState | null {
@@ -2183,6 +2383,7 @@ export function notConfirmedOutcome(
       ? {
           verdict: "not_demonstrated",
           displayReason: turn.lastRunOutcome.displayReason,
+          workflowRunId: turn.lastRunOutcome.workflowRunId,
         }
       : null;
   }
@@ -2196,6 +2397,7 @@ export function notConfirmedOutcome(
         turn.turnFacts?.recordedFailure ??
         notDemonstratedBlock(turn.blocks)?.outcomeReason ??
         null,
+      workflowRunId: turn.turnFacts?.runId ?? undefined,
     };
   }
   const block = notDemonstratedBlock(turn.blocks);
@@ -2204,6 +2406,7 @@ export function notConfirmedOutcome(
     : {
         verdict: "not_demonstrated",
         displayReason: block.outcomeReason ?? null,
+        workflowRunId: block.workflowRunId,
       };
 }
 
@@ -2211,8 +2414,16 @@ export function notConfirmedOutcome(
 // not a block failure, so no surface may give it failure's treatment.
 export function isDeadlineHalt(turn: TurnNarrativeState): boolean {
   return (
-    (turn.turnFacts?.terminalCause === "deadline_expired" ||
-      turn.budgetExpiry !== null) &&
+    budgetHalted(turn) &&
     !latestBlocksByLabel(turn.blocks).some((b) => b.state === "failed")
+  );
+}
+
+type TurnLimitFacts = Pick<TurnNarrativeState, "turnFacts" | "budgetExpiry">;
+
+function budgetHalted(turn: TurnLimitFacts): boolean {
+  return (
+    turn.turnFacts?.terminalCause === "deadline_expired" ||
+    turn.budgetExpiry !== null
   );
 }

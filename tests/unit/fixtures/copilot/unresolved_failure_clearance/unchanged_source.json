@@ -2,7 +2,7 @@
   "provenance": {
     "kind": "branch_local_witness",
     "source": "sky-15308-base-20260831-194437/run2-repeat-failure-then-clean/call-0026.json + backend.log.capture-slice",
-    "notes": "The later run executed the failed block to success over the very snapshot that failed."
+    "notes": "The later run executed the failed block to success over the very snapshot that failed. The supplied reply is a replay input carrying a caution, not a captured model reply. Each failed run's outcome lists its failed block in failed_block_labels, as the recorder sets it."
   },
   "steps": [
     {
@@ -22,7 +22,10 @@
         "executed_block_labels": [
           "calculate_and_extract_quote_total"
         ],
-        "structural_failure_identity": "code-block-exception:wr_569288173990568574"
+        "structural_failure_identity": "code-block-exception:wr_569288173990568574",
+        "failed_block_labels": [
+          "calculate_and_extract_quote_total"
+        ]
       }
     },
     {
@@ -42,7 +45,10 @@
         "executed_block_labels": [
           "calculate_and_extract_quote_total"
         ],
-        "structural_failure_identity": "code-block-exception:wr_569288324314423984"
+        "structural_failure_identity": "code-block-exception:wr_569288324314423984",
+        "failed_block_labels": [
+          "calculate_and_extract_quote_total"
+        ]
       }
     },
     {
@@ -67,11 +73,45 @@
     }
   ],
   "reported_workflow_yaml": null,
+  "supplied_reply": "The retest passed on the same code that failed the run before it, so I cannot say what changed. Run it again before you rely on it.",
   "expect": {
-    "baseline_disposition": "no_reported_candidate",
-    "baseline_attached": true,
-    "disposition": "no_reported_candidate",
-    "attached": true,
-    "history_retains_failure": true
+    "handback_ok": true,
+    "latest_verdict": "progress_observed",
+    "prior_attempt_change_identity": null,
+    "history": [
+      {
+        "workflow_run_id": "wr_569288173990568574",
+        "verdict": "repairable_failure",
+        "reason_code": "runtime_block_failure",
+        "attempted_block_label": "calculate_and_extract_quote_total",
+        "attempted_block_signature": "d38636478712129a960e18a8e4c82d7e3cfcf05453fbc16372a4a4a906b58c31",
+        "attempted_block_code_hash": "0cddef90804f1492ba867612cf5db2d2751f7b53422a11638ab90f4ae0a6e766",
+        "executed_yaml_digests": {
+          "calculate_and_extract_quote_total": "5e7d6569e3d0c81b"
+        }
+      },
+      {
+        "workflow_run_id": "wr_569288324314423984",
+        "verdict": "repairable_failure",
+        "reason_code": "runtime_block_failure",
+        "attempted_block_label": "calculate_and_extract_quote_total",
+        "attempted_block_signature": "9598018020211662cee43dafac0b5a66bceaf36c968740898be09ec17f43ca1d",
+        "attempted_block_code_hash": "dde73d60cffd3459fd03230d669e8443112c8f3fdf0d4a312d9f8634fa90a4c8",
+        "executed_yaml_digests": {
+          "calculate_and_extract_quote_total": "ccca57d6e4e3dc93"
+        }
+      },
+      {
+        "workflow_run_id": "wr_569288397328868066",
+        "verdict": "progress_observed",
+        "reason_code": "verified_success",
+        "attempted_block_label": "",
+        "attempted_block_signature": "",
+        "attempted_block_code_hash": "",
+        "executed_yaml_digests": {
+          "calculate_and_extract_quote_total": "ccca57d6e4e3dc93"
+        }
+      }
+    ]
   }
 }

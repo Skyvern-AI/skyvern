@@ -11,9 +11,15 @@ from __future__ import annotations
 
 import asyncio
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 import pytest
 import pytest_asyncio
+
+if TYPE_CHECKING:
+    from playwright.async_api import Route
+
+EXAMPLE_PAGE = "<!doctype html><title>Example Domain</title><h1>Example Domain</h1>"
 
 
 def _has_playwright_browser() -> bool:
@@ -32,8 +38,12 @@ _skip_no_browser = pytest.mark.skipif(
 )
 
 
+async def _serve_example_page(route: Route) -> None:
+    await route.fulfill(status=200, content_type="text/html", body=EXAMPLE_PAGE)
+
+
 @pytest_asyncio.fixture
-async def browser_session():
+async def browser_session(public_dns: None):
     """Launch a real local headless browser and wire up SessionState for MCP tools."""
     from skyvern import Skyvern
     from skyvern.cli.core.result import BrowserContext
@@ -41,6 +51,7 @@ async def browser_session():
 
     skyvern = Skyvern.local(use_in_memory_db=True)
     browser = await skyvern.launch_local_browser(headless=True)
+    await browser.route("https://example.com/**", _serve_example_page)
 
     state = SessionState(
         browser=browser,

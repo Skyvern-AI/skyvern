@@ -172,6 +172,7 @@ function EmailInboxEditorBody({
               value={data.credentialId}
               onChange={updateCredentialId}
               requiredScopes={MICROSOFT_MAIL_REQUIRED_SCOPES}
+              editable={data.editable}
             />
           )}
         </div>
@@ -309,6 +310,21 @@ function EmailInboxEditorBody({
                   checked={data.includeBody}
                   onCheckedChange={(checked) =>
                     update({ includeBody: checked })
+                  }
+                />
+              </div>
+
+              <div className="flex items-center justify-between">
+                <FieldLabel
+                  field="downloadAttachments"
+                  label="Download Attachments"
+                  fallback="Download non-inline attachments from matched emails for downstream blocks."
+                />
+                <Switch
+                  aria-label="Download Attachments"
+                  checked={data.downloadAttachments}
+                  onCheckedChange={(checked) =>
+                    update({ downloadAttachments: checked })
                   }
                 />
               </div>

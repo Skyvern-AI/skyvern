@@ -1,12 +1,12 @@
 import type { Edge } from "@xyflow/react";
 import type { AppNode } from "../nodes";
+import type { ParametersState } from "../types";
 
-// Snapshot of the workflow editor canvas at a point in time. We store the
-// full nodes/edges arrays (deep-cloned at capture time) so that rolling back
-// is just a matter of calling setNodes/setEdges with the previous snapshot.
+// Snapshot of the workflow editor state at a point in time.
 export type WorkflowSnapshot = {
   nodes: AppNode[];
   edges: Edge[];
+  parameters: ParametersState;
 };
 
 export type WorkflowHistoryState = {
@@ -33,10 +33,12 @@ export function createInitialHistoryState(): WorkflowHistoryState {
 export function cloneSnapshot(
   nodes: readonly AppNode[],
   edges: readonly Edge[],
+  parameters: ParametersState = [],
 ): WorkflowSnapshot {
   return {
     nodes: nodes.map((node) => cloneNode(node)),
     edges: edges.map((edge) => cloneEdge(edge)),
+    parameters: deepClone(parameters),
   };
 }
 
@@ -132,6 +134,13 @@ function deepEqual(a: unknown, b: unknown): boolean {
   return true;
 }
 
+export function parametersEqual(
+  a: ParametersState,
+  b: ParametersState,
+): boolean {
+  return deepEqual(a, b);
+}
+
 // Compare two node arrays by id, independent of array order. React Flow
 // occasionally reorders nodes between renders (reconciliation passes,
 // copy-paste insertions, etc.), which would make a positional compare
@@ -171,7 +180,11 @@ export function snapshotsEqual(
   if (a === b) return true;
   if (a.nodes.length !== b.nodes.length) return false;
   if (a.edges.length !== b.edges.length) return false;
-  return nodesEqualById(a.nodes, b.nodes) && edgesEqualById(a.edges, b.edges);
+  return (
+    nodesEqualById(a.nodes, b.nodes) &&
+    edgesEqualById(a.edges, b.edges) &&
+    parametersEqual(a.parameters, b.parameters)
+  );
 }
 
 // Push a new snapshot as the present state, moving the previous present into

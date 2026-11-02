@@ -13,7 +13,6 @@ import { useFirstParam } from "@/hooks/useFirstParam";
 import { useMountEffect } from "@/hooks/useMountEffect";
 import { useStudioFirstRunStore } from "@/store/StudioFirstRunStore";
 import { useManualSignInStore } from "@/store/useManualSignInStore";
-import { useRecordingStore } from "@/store/useRecordingStore";
 import { sanitizePaneWidth, type PaneWidths } from "@/store/paneWidths";
 
 import {
@@ -243,12 +242,7 @@ export function StudioPaneDefaultsProvider({
     [workflowDeleted],
   );
   const reopenEditor = useCallback(() => {
-    // Capture takes Editor away on purpose (recordingPaneLifecycle).
-    if (
-      editorClosedByUserRef.current ||
-      useRecordingStore.getState().isRecording
-    )
-      return;
+    if (editorClosedByUserRef.current) return;
     updatePanes((panes, slots, stageWidth) => {
       if (panes.includes("editor")) return panes;
       const opened = withPaneOpen(panes, "editor", slots);

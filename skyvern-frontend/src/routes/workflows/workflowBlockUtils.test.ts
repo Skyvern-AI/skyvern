@@ -344,6 +344,43 @@ describe("describeRecordedAction", () => {
       ),
     ).toBe("Download invoice.pdf");
   });
+
+  it("renders a one-time code input as the server masked it, next to an ordinary input", () => {
+    const code = action({
+      action_type: "input_text",
+      description: null,
+      reasoning: "Input value withheld.",
+      text: "<redacted otp value>",
+      response: "<redacted otp value>",
+    });
+    const typed = action({
+      action_type: "input_text",
+      description: null,
+      text: "Meridian Ave",
+    });
+
+    const result = action({
+      action_type: "complete",
+      created_by: "script",
+      description: null,
+      response: '{"failure_rate": "4.2%"}',
+      output: { failure_rate: "4.2%" },
+    });
+
+    const failedCode = { ...code, status: Status.Failed, response: null };
+
+    expect(describeRecordedAction(code, null)).toBe("Input value withheld.");
+    expect(describeRecordedAction(failedCode, null)).toBe(
+      "Input value withheld.",
+    );
+    expect(getActionSummary(code)?.body?.text).toBe("Input value withheld.");
+    expect(getActionInputValue(code)).toBe("<redacted otp value>");
+    expect(getActionOutcome(code)).toBeNull();
+    expect(getActionInputValue(typed)).toBe("Meridian Ave");
+    expect(describeRecordedAction(typed, null)).toBe("Meridian Ave");
+    expect(describeRecordedAction(result, null)).toContain("4.2%");
+    expect(getActionSummary(result)?.outcome).toContain("4.2%");
+  });
 });
 
 describe("taskV3CallText", () => {

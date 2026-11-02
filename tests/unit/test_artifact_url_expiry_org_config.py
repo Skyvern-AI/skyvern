@@ -7,13 +7,15 @@ Covers:
 - _artifact_content_response_headers Cache-Control max-age computation
 """
 
+import asyncio
+import time
 from datetime import datetime, timezone
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
 from skyvern.config import settings
-from skyvern.forge.sdk.artifact.manager import ArtifactManager
+from skyvern.forge.sdk.artifact.manager import ARTIFACT_URL_EXPIRY_CACHE_TTL_SECONDS, ArtifactManager
 from skyvern.forge.sdk.artifact.signing import (
     ARTIFACT_URL_EXPIRY_SECONDS,
     ARTIFACT_URL_EXPIRY_SECONDS_MAX,
@@ -98,6 +100,31 @@ class TestResolveArtifactUrlExpirySeconds:
             app.DATABASE.organizations.get_organization = AsyncMock(return_value=org)
             ttl = await manager.resolve_artifact_url_expiry_seconds("o_1")
             assert ttl == ARTIFACT_URL_EXPIRY_SECONDS_MAX
+
+    @pytest.mark.asyncio
+    async def test_org_value_is_read_once_and_reread_after_the_ttl_or_an_update(self) -> None:
+        manager = ArtifactManager()
+        stored_values = iter(hours * 3600 for hours in range(2, 12))
+
+        async def get_organization(organization_id: str) -> Organization:
+            value = next(stored_values)
+            # Yield so the concurrent lookups below overlap this read.
+            await asyncio.sleep(0)
+            return _make_org(artifact_url_expiry_seconds=value)
+
+        with patch("skyvern.forge.sdk.artifact.manager.app") as app:
+            app.DATABASE.organizations.get_organization = get_organization
+            concurrent = await asyncio.gather(*(manager.resolve_artifact_url_expiry_seconds("o_1") for _ in range(5)))
+            within_ttl = await manager.resolve_artifact_url_expiry_seconds("o_1")
+            manager._url_expiry_by_org.expire(time.monotonic() + ARTIFACT_URL_EXPIRY_CACHE_TTL_SECONDS)
+            after_ttl = await manager.resolve_artifact_url_expiry_seconds("o_1")
+            manager.invalidate_cached_artifact_url_expiry("o_1")
+            after_update = await manager.resolve_artifact_url_expiry_seconds("o_1")
+
+        assert concurrent == [2 * 3600] * 5
+        assert within_ttl == 2 * 3600
+        assert after_ttl == 3 * 3600
+        assert after_update == 4 * 3600
 
 
 # ---------------------------------------------------------------------------

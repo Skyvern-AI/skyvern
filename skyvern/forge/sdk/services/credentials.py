@@ -7,7 +7,19 @@ from urllib.parse import SplitResult, parse_qsl, unquote, urlencode, urlsplit, u
 
 import pyotp
 import structlog
+from onepassword.client import Client as OnePasswordClient
+from onepassword.errors import DesktopSessionExpiredException, RateLimitExceededException
+from onepassword.types import Item
 from pydantic import ValidationError
+
+from skyvern.exceptions import (
+    CredentialItemNotFoundError,
+    OnePasswordGetItemError,
+    OnePasswordRateLimitError,
+    OnePasswordServiceUnavailableError,
+    OnePasswordSessionExpiredError,
+    sanitize_credential_for_error,
+)
 
 LOG = structlog.get_logger()
 
@@ -54,6 +66,41 @@ def extract_onepassword_upstream_5xx_status(message: str) -> int | None:
 
 def is_onepassword_credential_error(message: str) -> bool:
     return bool(_ONEPASSWORD_CREDENTIAL_ERROR_PATTERN.search(message))
+
+
+def format_resolved_lookup_context(provider: str, **identifiers: str | None) -> str:
+    resolved_identifiers = ", ".join(
+        f"{key}={sanitize_credential_for_error(value) if value else '<not provided>'}"
+        for key, value in identifiers.items()
+    )
+    return f"Resolved {provider} credential identifiers: {resolved_identifiers}."
+
+
+async def fetch_onepassword_item(token: str, vault_id: str, item_id: str, lookup_context: str) -> Item:
+    try:
+        client = await OnePasswordClient.authenticate(
+            auth=token,
+            integration_name="Skyvern",
+            integration_version="v1.0.0",
+        )
+        item = await client.items.get(vault_id, item_id)
+    except RateLimitExceededException as e:
+        raise OnePasswordRateLimitError(f"{e!s} {lookup_context}") from e
+    except DesktopSessionExpiredException as e:
+        raise OnePasswordSessionExpiredError(f"{e!s} {lookup_context}") from e
+    except Exception as e:
+        upstream_status = extract_onepassword_upstream_5xx_status(f"{e!s}")
+        if upstream_status is not None:
+            raise OnePasswordServiceUnavailableError(
+                status_code=upstream_status,
+                lookup_context=lookup_context,
+            ) from e
+        raise OnePasswordGetItemError(f"{e} {lookup_context}") from e
+
+    if item is None:
+        LOG.error("No 1Password item found", vault_id=vault_id, item_id=item_id)
+        raise CredentialItemNotFoundError(f"1Password item not found. {lookup_context}")
+    return item
 
 
 class OnePasswordConstants(StrEnum):

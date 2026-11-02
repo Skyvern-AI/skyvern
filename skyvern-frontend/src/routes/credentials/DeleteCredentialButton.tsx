@@ -3,6 +3,7 @@ import { useState } from "react";
 import { getClient } from "@/api/AxiosClient";
 import { Button } from "@/components/ui/button";
 import { ConfirmDialog } from "@/components/ui/confirm-dialog";
+import { AdminOnlyTooltip } from "@/components/AdminOnlyTooltip";
 import {
   Tooltip,
   TooltipContent,
@@ -15,6 +16,7 @@ import { useMutation, useQueryClient } from "@tanstack/react-query";
 import { AxiosError } from "axios";
 import { TrashIcon } from "@radix-ui/react-icons";
 import { CredentialApiResponse } from "@/api/types";
+import { useHasCapability } from "@/store/PageSlots";
 type Props = {
   credential: CredentialApiResponse;
 };
@@ -22,6 +24,7 @@ type Props = {
 function DeleteCredentialButton({ credential }: Props) {
   const credentialGetter = useCredentialGetter();
   const queryClient = useQueryClient();
+  const canDelete = useHasCapability("credential.delete");
   const [open, setOpen] = useState(false);
 
   const deleteCredentialMutation = useMutation({
@@ -51,21 +54,25 @@ function DeleteCredentialButton({ credential }: Props) {
 
   return (
     <>
-      <TooltipProvider>
-        <Tooltip>
-          <TooltipTrigger asChild>
-            <Button
-              size="icon"
-              variant="tertiary"
-              className="h-8 w-9"
-              onClick={() => setOpen(true)}
-            >
-              <TrashIcon className="size-5" />
-            </Button>
-          </TooltipTrigger>
-          <TooltipContent>Delete Credential</TooltipContent>
-        </Tooltip>
-      </TooltipProvider>
+      <AdminOnlyTooltip allowed={canDelete}>
+        <TooltipProvider>
+          <Tooltip>
+            <TooltipTrigger asChild>
+              <Button
+                size="icon"
+                variant="tertiary"
+                className="h-8 w-9"
+                aria-label="Delete credential"
+                disabled={!canDelete}
+                onClick={() => setOpen(true)}
+              >
+                <TrashIcon className="size-5" />
+              </Button>
+            </TooltipTrigger>
+            <TooltipContent>Delete Credential</TooltipContent>
+          </Tooltip>
+        </TooltipProvider>
+      </AdminOnlyTooltip>
       <ConfirmDialog
         open={open}
         onOpenChange={setOpen}
@@ -79,9 +86,12 @@ function DeleteCredentialButton({ credential }: Props) {
         }
         reversibilityNote="The Skyvern team can't restore a credential once it's deleted."
         isPending={deleteCredentialMutation.isPending}
-        onConfirm={() =>
-          deleteCredentialMutation.mutate(credential.credential_id)
-        }
+        confirmDisabled={!canDelete}
+        onConfirm={() => {
+          if (canDelete) {
+            deleteCredentialMutation.mutate(credential.credential_id);
+          }
+        }}
       />
     </>
   );

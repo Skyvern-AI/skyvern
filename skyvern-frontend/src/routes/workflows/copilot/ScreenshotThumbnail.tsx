@@ -11,12 +11,18 @@ import {
 } from "@/components/ui/dialog";
 import { useArtifactImageSrc } from "@/hooks/useArtifactImageSrc";
 import { useCredentialGetter } from "@/hooks/useCredentialGetter";
+import { useVisibleOnce } from "@/hooks/useVisibleOnce";
 
 // The box is sized before the image loads: the chat re-scrolls on state changes, not on image load.
 const BOX = "aspect-video w-36 shrink-0 rounded border border-border";
 
 export function ScreenshotThumbnail({ artifactId }: { artifactId: string }) {
   const credentialGetter = useCredentialGetter();
+  // A chat renders one thumbnail per captured frame across every turn it holds,
+  // so fetching on mount put a request per frame in flight at once and the
+  // browser dropped them all (SKY-19468). Resolve a frame only once it is near
+  // the viewport.
+  const { ref: boxRef, visible } = useVisibleOnce<HTMLButtonElement>();
   const { data: artifact, isError } = useQuery<ArtifactApiResponse>({
     queryKey: ["artifact", artifactId],
     queryFn: async () => {
@@ -25,6 +31,7 @@ export function ScreenshotThumbnail({ artifactId }: { artifactId: string }) {
         .get(`/artifacts/${artifactId}`)
         .then((response) => response.data);
     },
+    enabled: visible,
     refetchOnWindowFocus: false,
     staleTime: Infinity,
     retry: 1,
@@ -45,6 +52,7 @@ export function ScreenshotThumbnail({ artifactId }: { artifactId: string }) {
     <Dialog>
       <DialogTrigger asChild>
         <button
+          ref={boxRef}
           type="button"
           aria-label="View screenshot"
           disabled={src === undefined}

@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from enum import StrEnum
 
 from skyvern.config import settings
@@ -32,6 +32,8 @@ class AuthoringCapability:
 
     code_blocks: bool
     agent_blocks: bool
+    # The org's AGENT_BLOCK_LLM_NAME grant; `agent_step` is authorable only when agent_blocks is also on.
+    agent_step: bool = False
 
 
 AGENT_BLOCKS_ONLY = AuthoringCapability(code_blocks=False, agent_blocks=True)
@@ -66,8 +68,9 @@ def authoring_capability_from_policy(policy: BlockAuthoringPolicy | str | None) 
 
 
 def block_authoring_policy_from_capability(capability: AuthoringCapability) -> BlockAuthoringPolicy:
+    families = replace(capability, agent_step=False)
     for policy, mapped in _POLICY_CAPABILITIES.items():
-        if mapped == capability:
+        if mapped == families:
             return policy
     raise ValueError(f"No wire spelling for authoring capability {capability!r}")
 
@@ -75,6 +78,7 @@ def block_authoring_policy_from_capability(capability: AuthoringCapability) -> B
 DEFAULT_PROMPT_TEMPLATE = "workflow-copilot-agent.j2"
 DEFAULT_MAX_TURNS = 200
 DEFAULT_TOKEN_BUDGET = 90_000
+TOTAL_TIMEOUT_SECONDS = settings.WORKFLOW_COPILOT_TOTAL_TIMEOUT_SECONDS or 900
 
 SCREENSHOT_DROPPED_NUDGE = (
     "Your previous screenshot was dropped from context to recover from a token-budget overflow. "
@@ -103,18 +107,19 @@ def _default_credential_pause_timeout_seconds() -> int:
     return settings.WORKFLOW_COPILOT_CREDENTIAL_PAUSE_TIMEOUT_SECONDS
 
 
-def _default_token_budget() -> int:
+def _default_token_budget() -> int | None:
     qa_token_budget = settings.WORKFLOW_COPILOT_QA_TOKEN_BUDGET
     if not settings.is_cloud_environment() and qa_token_budget is not None:
         return qa_token_budget
-    return DEFAULT_TOKEN_BUDGET
+    return None
 
 
 @dataclass(slots=True)
 class CopilotConfig:
     prompt_template: str = DEFAULT_PROMPT_TEMPLATE
     max_turns: int = DEFAULT_MAX_TURNS
-    token_budget: int = field(default_factory=_default_token_budget)
+    # None takes the budget from the model's pricing table (model_resolver.copilot_token_budget).
+    token_budget: int | None = field(default_factory=_default_token_budget)
     security_rules: str = ""
     # Rendered after the user's message on every turn: from there it holds even when earlier turns or the
     # saved workflow went along with an out-of-scope request, which the same text in the system prompt does not.
@@ -124,6 +129,7 @@ class CopilotConfig:
     # Wire and persisted-metadata spelling of authoring_capability; read it only through that
     # property, which is what every authoring surface keys on.
     block_authoring_policy: BlockAuthoringPolicy = BlockAuthoringPolicy.TASK_V3_PURE
+    agent_step_available: bool = False
     code_block_available: bool = False
     effective_code_block_mode: bool = False
     # When False, this turn may neither dispatch runs nor acquire or drive a browser session.
@@ -135,11 +141,14 @@ class CopilotConfig:
 
     @property
     def authoring_capability(self) -> AuthoringCapability:
-        return authoring_capability_from_policy(self.block_authoring_policy)
+        return replace(
+            authoring_capability_from_policy(self.block_authoring_policy), agent_step=self.agent_step_available
+        )
 
     @authoring_capability.setter
     def authoring_capability(self, capability: AuthoringCapability) -> None:
         self.block_authoring_policy = block_authoring_policy_from_capability(capability)
+        self.agent_step_available = capability.agent_step
 
     def nudge(self, key: str) -> str:
         return self.enforcement_nudges.get(key, DEFAULT_ENFORCEMENT_NUDGES[key])

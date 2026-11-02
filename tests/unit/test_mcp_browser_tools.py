@@ -179,12 +179,13 @@ async def test_skyvern_login_success_returns_run_data(monkeypatch: pytest.Monkey
 
     result = await mcp_browser.skyvern_login(
         credential_type="skyvern",
-        credential_id="cred_123",
+        credential_id="cred_onepassword_imported",
     )
 
     assert result["ok"] is True
     assert result["data"]["run_id"] == "wr_123"
     assert result["data"]["status"] == "completed"
+    assert page.agent.login.await_args.kwargs["credential_id"] == "cred_onepassword_imported"
 
 
 @pytest.mark.asyncio
@@ -1628,7 +1629,9 @@ async def test_navigate_action_lifecycle_bounds_a_page_that_never_settles(
     close_session = AsyncMock()
     monkeypatch.setattr(session_manager, "_close_session_state", close_session)
     strikes: list[object] = []
-    monkeypatch.setattr(js_dispatch.skyvern_context, "record_browser_timeout", strikes.append)
+    monkeypatch.setattr(
+        js_dispatch.skyvern_context, "record_browser_timeout", lambda operation, **_: strikes.append(operation)
+    )
 
     loop = asyncio.get_running_loop()
     started = loop.time()
@@ -2044,7 +2047,9 @@ async def test_navigate_action_lifecycle_reports_a_driver_that_goes_dark_after_c
     page = _navigate_page(monkeypatch, HangingDriverCall(hangs=False))
     page.wait_for_load_state = HangingDriverCall()
     strikes: list[object] = []
-    monkeypatch.setattr(js_dispatch.skyvern_context, "record_browser_timeout", strikes.append)
+    monkeypatch.setattr(
+        js_dispatch.skyvern_context, "record_browser_timeout", lambda operation, **_: strikes.append(operation)
+    )
 
     loop = asyncio.get_running_loop()
     started = loop.time()
@@ -2072,7 +2077,7 @@ async def test_tab_new_reports_a_navigate_that_never_answered_as_a_timeout(
         lambda *args, **kwargs: browser_ops.do_navigate(page, HANGING_PAGE_URL, timeout=HANGING_BOUND_MS),
     )
     browser = SimpleNamespace(_browser_context=SimpleNamespace(pages=[page], new_page=AsyncMock(return_value=page)))
-    state = SimpleNamespace(
+    state = session_manager.SessionState(
         _active_page=page,
         _implicit_page=None,
         _working_frame=None,
@@ -2243,7 +2248,9 @@ async def test_model_path_verbs_share_the_action_lifecycle(
     close_session = AsyncMock()
     monkeypatch.setattr(session_manager, "_close_session_state", close_session)
     strikes: list[object] = []
-    monkeypatch.setattr(js_dispatch.skyvern_context, "record_browser_timeout", strikes.append)
+    monkeypatch.setattr(
+        js_dispatch.skyvern_context, "record_browser_timeout", lambda operation, **_: strikes.append(operation)
+    )
 
     loop = asyncio.get_running_loop()
     started = loop.time()
@@ -2546,8 +2553,6 @@ async def test_skyvern_type_missing_selector_preflight_is_bound_by_the_action_de
     monkeypatch.setattr(mcp_browser, "strategy_aware_input", strategy_aware_input)
     monkeypatch.setattr(action_deadline, "ACTION_DEADLINE_HEADROOM_MS", 100)
 
-    loop = asyncio.get_running_loop()
-    started_at = loop.time()
     result = await asyncio.wait_for(
         mcp_browser.skyvern_type(
             selector="#missing",
@@ -2558,7 +2563,6 @@ async def test_skyvern_type_missing_selector_preflight_is_bound_by_the_action_de
         timeout=1.5,
     )
 
-    assert loop.time() - started_at < 1.5
     assert preflight_cancelled.is_set()
     assert result["ok"] is False
     assert result["error"]["code"] == mcp_browser.ErrorCode.TIMEOUT
@@ -2892,7 +2896,9 @@ async def test_skyvern_click_native_option_selector_uses_parent_select(monkeypat
 
     assert result["ok"] is True
     page.click.assert_not_awaited()
-    select_option.assert_awaited_once_with(value="east", timeout=5000)
+    select_option.assert_awaited_once()
+    assert select_option.await_args.kwargs["value"] == "east"
+    assert 0 < select_option.await_args.kwargs["timeout"] <= 5000
     assert result["data"]["resolved_selector"] == "#region"
     assert result["data"]["selected_option"] == {
         "select_selector": "#region",
@@ -2913,8 +2919,14 @@ async def test_skyvern_click_native_option_selector_can_fall_back_to_label(
 
     assert result["ok"] is True
     page.click.assert_not_awaited()
-    assert select_option.await_args_list[0].kwargs == {"value": "east", "timeout": 5000}
-    assert select_option.await_args_list[1].kwargs == {"label": "East", "timeout": 5000}
+    assert [
+        call.kwargs["value"] if "value" in call.kwargs else call.kwargs["label"]
+        for call in select_option.await_args_list
+    ] == [
+        "east",
+        "East",
+    ]
+    assert all(0 < call.kwargs["timeout"] <= 5000 for call in select_option.await_args_list)
     assert result["data"]["selected_option"]["selected_by"] == "label"
     assert result["data"]["sdk_equivalent"] == "await page.select_option('#region', label='East')"
 
@@ -2932,7 +2944,9 @@ async def test_skyvern_click_native_option_selector_selects_by_index(monkeypatch
 
     assert result["ok"] is True
     page.click.assert_not_awaited()
-    select_option.assert_awaited_once_with(index=3, timeout=5000)
+    select_option.assert_awaited_once()
+    assert select_option.await_args.kwargs["index"] == 3
+    assert 0 < select_option.await_args.kwargs["timeout"] <= 5000
     assert result["data"]["selected_option"]["selected_by"] == "index"
     assert result["data"]["selected_option"]["index"] == 3
     assert result["data"]["sdk_equivalent"] == "await page.select_option('#region', index=3)"
@@ -4553,7 +4567,7 @@ async def test_navigating_paired_tools_invalidate_refs_around_navigation(
         return NavigateResult(url="https://example.test", title="Example", load_state="load")
 
     monkeypatch.setattr(mcp_browser, "do_navigate", AsyncMock(side_effect=navigate))
-    monkeypatch.setattr(mcp_browser, "do_screenshot", AsyncMock(return_value=SimpleNamespace(data=b"png")))
+    monkeypatch.setattr(mcp_browser, "do_screenshot", AsyncMock(return_value=browser_ops.ScreenshotResult(data=b"png")))
     monkeypatch.setattr(mcp_browser, "do_extract", AsyncMock(return_value=SimpleNamespace(extracted={"value": 1})))
     monkeypatch.setattr(
         mcp_browser,
@@ -4618,7 +4632,7 @@ async def test_navigating_paired_tools_surface_the_degraded_load_state(
         "do_navigate",
         AsyncMock(return_value=NavigateResult(url="https://example.test", title="Example", load_state="commit")),
     )
-    monkeypatch.setattr(mcp_browser, "do_screenshot", AsyncMock(return_value=SimpleNamespace(data=b"png")))
+    monkeypatch.setattr(mcp_browser, "do_screenshot", AsyncMock(return_value=browser_ops.ScreenshotResult(data=b"png")))
     monkeypatch.setattr(
         mcp_browser,
         "save_artifact",
@@ -4940,7 +4954,7 @@ async def test_paired_read_failure_keeps_screenshot_and_reports_failure(
 @pytest.mark.asyncio
 async def test_inline_screenshot_is_also_persisted(monkeypatch: pytest.MonkeyPatch) -> None:
     _sdk_equivalent_page(monkeypatch)
-    monkeypatch.setattr(mcp_browser, "do_screenshot", AsyncMock(return_value=SimpleNamespace(data=b"png")))
+    monkeypatch.setattr(mcp_browser, "do_screenshot", AsyncMock(return_value=browser_ops.ScreenshotResult(data=b"png")))
     artifact = Artifact(kind="screenshot", path="/tmp/shot.png", mime="image/png", bytes=3)
     monkeypatch.setattr(mcp_browser, "save_artifact", Mock(return_value=artifact))
 
@@ -5376,7 +5390,7 @@ async def test_screenshot_page_change_retry(monkeypatch: pytest.MonkeyPatch, mes
     ctx = BrowserContext(mode="local")
     state = session_manager.SessionState(context=ctx, _active_page=page)
     patch_get_page(monkeypatch, mcp_browser, page, ctx)
-    read = AsyncMock(side_effect=[RuntimeError(message), SimpleNamespace(data=b"png")])
+    read = AsyncMock(side_effect=[RuntimeError(message), browser_ops.ScreenshotResult(data=b"png")])
     monkeypatch.setattr(mcp_browser, "do_screenshot", read)
     monkeypatch.setattr(
         mcp_browser,
@@ -5481,7 +5495,7 @@ async def test_read_tools_retry_backoff(monkeypatch: pytest.MonkeyPatch, tool: s
         if attempts <= 6:
             raise RuntimeError("Execution context was destroyed")
         if tool == "screenshot":
-            return SimpleNamespace(data=b"png")
+            return browser_ops.ScreenshotResult(data=b"png")
         if tool == "get_html":
             return "<p>fresh</p>"
         return {"ok": True, "data": {"fresh": True}}

@@ -10,8 +10,10 @@ import {
   useLocation,
   useParams,
 } from "react-router-dom";
-import { useMemo } from "react";
+import { useEffect, useMemo, useRef } from "react";
+import { usePostHog } from "posthog-js/react";
 
+import { Status } from "@/api/types";
 import { LogoMinimized } from "@/components/LogoMinimized";
 import { PageLayout } from "@/components/PageLayout";
 import { Status404 } from "@/components/Status404";
@@ -38,10 +40,19 @@ const loadingIndicator = (
   </div>
 );
 
+// Matches the analytics failure definition; canceled is not a failure.
+const FAILURE_STATUSES: ReadonlySet<string> = new Set([
+  Status.Failed,
+  Status.Terminated,
+  Status.TimedOut,
+]);
+
 function RunRouter() {
+  const postHog = usePostHog();
   const params = useParams();
   const runId = params.runId;
   const location = useLocation();
+  const capturedRunId = useRef<string | undefined>(undefined);
   const isTaskV2Run = Boolean(runId?.startsWith("tsk_v2"));
   const isWorkflowRun = Boolean(runId?.startsWith("wr_"));
 
@@ -59,6 +70,29 @@ function RunRouter() {
       workflowRunId: isWorkflowRun ? runId : undefined,
       enabled: isWorkflowRun,
     });
+
+  useEffect(() => {
+    if (capturedRunId.current !== runId) {
+      capturedRunId.current = undefined;
+    }
+    if (
+      !isWorkflowRun ||
+      !runId ||
+      !studioRun ||
+      studioRun.workflow_run_id !== runId ||
+      !studioRun.workflow?.workflow_permanent_id ||
+      capturedRunId.current === runId
+    ) {
+      return;
+    }
+
+    capturedRunId.current = runId;
+    postHog.capture("run.page_viewed", {
+      run_id: runId,
+      run_status: studioRun.status,
+      failed: FAILURE_STATUSES.has(studioRun.status),
+    });
+  }, [isWorkflowRun, postHog, runId, studioRun]);
 
   const runType = isTaskV2Run
     ? "redirect"

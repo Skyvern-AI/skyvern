@@ -16,7 +16,7 @@ from unittest.mock import AsyncMock, MagicMock, Mock, patch
 
 import httpx
 import pytest
-from fastapi import FastAPI, Request
+from fastapi import Request
 from fastapi.responses import Response
 from sqlalchemy import delete, select
 from sqlalchemy.exc import IntegrityError
@@ -32,6 +32,7 @@ from skyvern.exceptions import (
 )
 from skyvern.forge import app
 from skyvern.forge.api_app import handle_skyvern_http_exception
+from skyvern.forge.request_logging import RequestLoggingMiddleware
 from skyvern.forge.sdk.core import skyvern_context
 from skyvern.forge.sdk.core.skyvern_context import SkyvernContext
 from skyvern.forge.sdk.db.agent_db import AgentDB
@@ -48,11 +49,17 @@ from skyvern.forge.sdk.workflow.models.parameter import (
     WorkflowParameter,
     WorkflowParameterType,
 )
-from skyvern.forge.sdk.workflow.models.tags import CallerType, TagSource, TagWriteContext
-from skyvern.forge.sdk.workflow.models.workflow import WorkflowDefinition, WorkflowRequestBody
+from skyvern.forge.sdk.workflow.models.tags import (
+    INTEGRATION_PLATFORM_RUN_TAG_KEY,
+    CallerType,
+    TagSource,
+    TagWriteContext,
+)
+from skyvern.forge.sdk.workflow.models.workflow import WorkflowDefinition, WorkflowRequestBody, WorkflowRun
 from skyvern.forge.sdk.workflow.service import WorkflowService
 from skyvern.schemas.workflows import WorkflowCreateYAMLRequest
 from skyvern.services import workflow_service as workflow_service_module
+from tests.unit.shared_route_app import shared_route_app
 
 
 def _make_workflow_parameter(
@@ -82,7 +89,7 @@ def _make_service_with_mocks(
     browser_profile_id: str | None = None,
     cdp_connect_headers: dict[str, str] | None = None,
     definition_parameters: list | None = None,
-) -> tuple[WorkflowService, SimpleNamespace, SimpleNamespace]:
+) -> tuple[WorkflowService, SimpleNamespace, WorkflowRun]:
     """Helper to build a WorkflowService with mocked internals for setup_workflow_run tests."""
     service = WorkflowService()
     workflow = SimpleNamespace(
@@ -104,7 +111,7 @@ def _make_service_with_mocks(
         sequential_key=None,
         workflow_definition=WorkflowDefinition(blocks=[], parameters=definition_parameters or []),
     )
-    workflow_run = SimpleNamespace(workflow_run_id="wr_test", workflow_permanent_id="wpid_test")
+    workflow_run = WorkflowRun.model_construct(workflow_run_id="wr_test", workflow_permanent_id="wpid_test")
 
     service.get_workflow_by_permanent_id = AsyncMock(return_value=workflow)  # type: ignore[method-assign]
     service.create_workflow_run = AsyncMock(return_value=workflow_run)  # type: ignore[method-assign]
@@ -150,7 +157,7 @@ async def test_apply_initial_run_metadata_tags_uses_system_source_for_fallback_c
         mock_app.DATABASE.tags.apply_run_tag_changes = AsyncMock()
 
         await WorkflowService._apply_initial_run_metadata_tags(
-            workflow_run_id="wr_x",
+            workflow_run=WorkflowRun.model_construct(workflow_run_id="wr_x", organization_id="o_x"),
             organization_id="o_x",
             run_metadata={"env": "prod"},
             context=None,
@@ -161,7 +168,7 @@ async def test_apply_initial_run_metadata_tags_uses_system_source_for_fallback_c
         assert fallback_context.caller_type == CallerType.SYSTEM
 
         await WorkflowService._apply_initial_run_metadata_tags(
-            workflow_run_id="wr_x",
+            workflow_run=WorkflowRun.model_construct(workflow_run_id="wr_x", organization_id="o_x"),
             organization_id="o_x",
             run_metadata={"env": "prod"},
             context=explicit_context,
@@ -197,6 +204,7 @@ async def test_setup_workflow_run_writes_run_metadata_as_run_tags() -> None:
         sets={"env": "prod", "team": "growth"},
         deletes=set(),
         context=tag_context,
+        known_run=workflow_run,
     )
 
 
@@ -259,12 +267,55 @@ async def test_setup_workflow_run_writes_create_time_system_tags() -> None:
             "skyvern.platform": "known_platform",
         },
         caller_id="system:creation-tagging",
+        known_run=workflow_run,
     )
 
 
 @pytest.mark.asyncio
+async def test_setup_workflow_run_defers_integration_platform_tag_to_post_dispatch() -> None:
+    service, organization, workflow_run = _make_service_with_mocks(workflow_parameters=[])
+    post_dispatch_effects: list[Callable[[], Awaitable[None]]] = []
+
+    with (
+        patch("skyvern.forge.sdk.workflow.service.app") as mock_app,
+        patch(
+            "skyvern.forge.sdk.workflow.service.workflow_script_service.resolve_target_domain_for_run_provenance",
+            return_value=None,
+        ),
+        patch(
+            "skyvern.forge.sdk.workflow.service.workflow_script_service.detect_workflow_platform_for_tagging",
+            return_value=None,
+        ),
+    ):
+        mock_app.DATABASE.workflows.get_browser_action_policy = AsyncMock(return_value=None)
+        mock_app.EXPERIMENTATION_PROVIDER.is_feature_enabled_cached = AsyncMock(return_value=False)
+        mock_app.AGENT_FUNCTION.should_use_flex_llm_routing = AsyncMock(return_value=False)
+        mock_app.DATABASE.tags.apply_system_run_tag_changes = AsyncMock()
+
+        result = await service.setup_workflow_run(
+            request_id="req_test",
+            workflow_request=WorkflowRequestBody(data={}),
+            workflow_permanent_id="wpid_test",
+            organization=organization,
+            integration_platform="zapier",
+            post_dispatch_effects=post_dispatch_effects,
+        )
+        assert result is workflow_run
+        mock_app.DATABASE.tags.apply_system_run_tag_changes.assert_not_awaited()
+        assert len(post_dispatch_effects) == 1
+        await post_dispatch_effects[0]()
+        mock_app.DATABASE.tags.apply_system_run_tag_changes.assert_awaited_once_with(
+            workflow_run_id=workflow_run.workflow_run_id,
+            organization_id=organization.organization_id,
+            sets={"skyvern.trigger": "api", INTEGRATION_PLATFORM_RUN_TAG_KEY: "zapier"},
+            caller_id="system:creation-tagging",
+            known_run=workflow_run,
+        )
+
+
+@pytest.mark.asyncio
 async def test_setup_workflow_run_writes_trigger_tag_when_target_domain_is_unavailable() -> None:
-    service, organization, _ = _make_service_with_mocks(workflow_parameters=[])
+    service, organization, workflow_run = _make_service_with_mocks(workflow_parameters=[])
 
     with (
         patch("skyvern.forge.sdk.workflow.service.app") as mock_app,
@@ -290,6 +341,7 @@ async def test_setup_workflow_run_writes_trigger_tag_when_target_domain_is_unava
         organization_id="org_test",
         sets={"skyvern.trigger": "api"},
         caller_id="system:creation-tagging",
+        known_run=workflow_run,
     )
 
 
@@ -353,6 +405,7 @@ async def test_setup_workflow_run_writes_provenance_tags_when_platform_detection
         organization_id="org_test",
         sets={"skyvern.trigger": "api", "skyvern.target_domain": "jobs.example.com"},
         caller_id="system:creation-tagging",
+        known_run=workflow_run,
     )
 
 
@@ -596,6 +649,7 @@ async def test_setup_workflow_run_still_validates_provided_credential_for_at_wil
     with patch("skyvern.forge.sdk.workflow.service.app") as mock_app:
         mock_app.DATABASE.workflows.get_browser_action_policy = AsyncMock(return_value=None)
         mock_app.EXPERIMENTATION_PROVIDER.is_feature_enabled_cached = AsyncMock(return_value=False)
+        mock_app.AGENT_FUNCTION.enforce_credential_use = AsyncMock()
         mock_app.AGENT_FUNCTION.should_use_flex_llm_routing = AsyncMock(return_value=False)
         mock_app.DATABASE.credentials.get_credentials_by_ids = AsyncMock(return_value=[])
 
@@ -625,6 +679,7 @@ async def test_setup_workflow_run_credential_with_default_uses_default() -> None
     with patch("skyvern.forge.sdk.workflow.service.app") as mock_app:
         mock_app.DATABASE.workflows.get_browser_action_policy = AsyncMock(return_value=None)
         mock_app.EXPERIMENTATION_PROVIDER.is_feature_enabled_cached = AsyncMock(return_value=False)
+        mock_app.AGENT_FUNCTION.enforce_credential_use = AsyncMock()
         mock_app.AGENT_FUNCTION.should_use_flex_llm_routing = AsyncMock(return_value=False)
         mock_app.DATABASE.credentials.get_credentials_by_ids = AsyncMock(
             return_value=[SimpleNamespace(credential_id="cred_id_0")]
@@ -849,7 +904,7 @@ async def test_setup_workflow_run_validates_credentials_before_preparing_managed
                 organization=organization,
             )
 
-    service._validate_credential_ids.assert_awaited_once_with(["cred_missing"], organization)
+    service._validate_credential_ids.assert_awaited_once_with(["cred_missing"], organization, workflow_run_id="wr_test")
     service._resolve_and_stamp_run_seed.assert_not_awaited()
     service.create_workflow_run_parameters.assert_not_awaited()
     service.mark_workflow_run_as_failed.assert_awaited_once()
@@ -874,6 +929,7 @@ async def test_setup_workflow_run_batches_credential_validation() -> None:
         mock_app.DATABASE.workflows.get_browser_action_policy = AsyncMock(return_value=None)
         mock_app.EXPERIMENTATION_PROVIDER.is_feature_enabled_cached = AsyncMock(return_value=False)
 
+        mock_app.AGENT_FUNCTION.enforce_credential_use = AsyncMock()
         mock_app.AGENT_FUNCTION.should_use_flex_llm_routing = AsyncMock(return_value=False)
         mock_app.DATABASE.credentials.get_credentials_by_ids = AsyncMock(
             return_value=[SimpleNamespace(credential_id=f"cred_id_{i}") for i in range(3)]
@@ -935,6 +991,7 @@ async def test_setup_workflow_run_raises_invalid_credential_when_missing() -> No
         mock_app.DATABASE.workflows.get_browser_action_policy = AsyncMock(return_value=None)
         mock_app.EXPERIMENTATION_PROVIDER.is_feature_enabled_cached = AsyncMock(return_value=False)
 
+        mock_app.AGENT_FUNCTION.enforce_credential_use = AsyncMock()
         mock_app.AGENT_FUNCTION.should_use_flex_llm_routing = AsyncMock(return_value=False)
         mock_app.DATABASE.credentials.get_credentials_by_ids = AsyncMock(return_value=[])
 
@@ -968,6 +1025,7 @@ async def test_setup_workflow_run_surfaces_all_missing_credentials() -> None:
         mock_app.DATABASE.workflows.get_browser_action_policy = AsyncMock(return_value=None)
         mock_app.EXPERIMENTATION_PROVIDER.is_feature_enabled_cached = AsyncMock(return_value=False)
 
+        mock_app.AGENT_FUNCTION.enforce_credential_use = AsyncMock()
         mock_app.AGENT_FUNCTION.should_use_flex_llm_routing = AsyncMock(return_value=False)
         # Only cred_id_0 exists; cred_id_1 and cred_id_2 are missing.
         mock_app.DATABASE.credentials.get_credentials_by_ids = AsyncMock(
@@ -1007,6 +1065,7 @@ async def test_setup_workflow_run_dedupes_repeated_credential_ids() -> None:
         mock_app.DATABASE.workflows.get_browser_action_policy = AsyncMock(return_value=None)
         mock_app.EXPERIMENTATION_PROVIDER.is_feature_enabled_cached = AsyncMock(return_value=False)
 
+        mock_app.AGENT_FUNCTION.enforce_credential_use = AsyncMock()
         mock_app.AGENT_FUNCTION.should_use_flex_llm_routing = AsyncMock(return_value=False)
         mock_app.DATABASE.credentials.get_credentials_by_ids = AsyncMock(
             return_value=[SimpleNamespace(credential_id="cred_shared")]
@@ -1568,15 +1627,21 @@ async def test_setup_rejects_composite_template_item_id_with_known_parameters() 
 class RunSubmissionLab:
     client: httpx.AsyncClient
     database: AgentDB
+    workflow_service: WorkflowService
     workflow_permanent_id: str
     execute_workflow: AsyncMock
 
-    async def submit(self, route: str, parameters: dict[str, object]) -> httpx.Response:
+    async def submit(self, route: str, parameters: dict[str, object], *, user_agent: str = "") -> httpx.Response:
+        headers = {"user-agent": user_agent}
         if route == "run":
             return await self.client.post(
-                "/v1/run/workflows", json={"workflow_id": self.workflow_permanent_id, "parameters": parameters}
+                "/v1/run/workflows",
+                json={"workflow_id": self.workflow_permanent_id, "parameters": parameters},
+                headers=headers,
             )
-        return await self.client.post(f"/api/v1/workflows/{self.workflow_permanent_id}/run", json={"data": parameters})
+        return await self.client.post(
+            f"/api/v1/workflows/{self.workflow_permanent_id}/run", json={"data": parameters}, headers=headers
+        )
 
     async def run_rows(self) -> list[WorkflowRunModel]:
         async with self.database.Session() as session:
@@ -1662,7 +1727,8 @@ async def run_submission_lab(
         ),
     )
 
-    fastapi_app = FastAPI()
+    fastapi_app = shared_route_app(monkeypatch)
+    fastapi_app.add_middleware(RequestLoggingMiddleware)
     fastapi_app.dependency_overrides[org_auth_service.get_current_caller_context] = lambda: CallerContext(
         organization=organization, caller_id="u_test", caller_type=CallerType.USER
     )
@@ -1678,48 +1744,80 @@ async def run_submission_lab(
         finally:
             skyvern_context.reset()
 
-    fastapi_app.include_router(agent_protocol.base_router, prefix="/v1")
-    fastapi_app.include_router(agent_protocol.legacy_base_router, prefix="/api/v1")
     async with httpx.AsyncClient(transport=httpx.ASGITransport(app=fastapi_app), base_url="http://test") as client:
         yield RunSubmissionLab(
             client=client,
             database=database,
+            workflow_service=workflow_service,
             workflow_permanent_id=workflow.workflow_permanent_id,
             execute_workflow=execute_workflow,
         )
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("route", ["run", "legacy"])
+async def test_run_submission_carries_user_agent_platform_through_real_prepare_and_post_dispatch(
+    monkeypatch: pytest.MonkeyPatch,
+    sqlite_engine: AsyncEngine,
+) -> None:
+    async with run_submission_lab(monkeypatch, sqlite_engine) as lab:
+        apply_system_tags = AsyncMock()
+        monkeypatch.setattr(lab.database.tags, "apply_system_run_tag_changes", apply_system_tags)
+        setup_workflow_run = AsyncMock(wraps=lab.workflow_service.setup_workflow_run)
+        monkeypatch.setattr(lab.workflow_service, "setup_workflow_run", setup_workflow_run)
+
+        async def check_tag_is_deferred(*args: object, **kwargs: object) -> None:
+            apply_system_tags.assert_not_awaited()
+
+        lab.execute_workflow.side_effect = check_tag_is_deferred
+        response = await lab.submit(
+            "run",
+            {"login": "cred_live", "email": "a@example.com"},
+            user_agent="Make/production",
+        )
+
+        assert response.status_code == 200
+        setup_workflow_run.assert_awaited_once()
+        assert setup_workflow_run.await_args.kwargs["integration_platform"] == "make"
+        apply_system_tags.assert_awaited_once()
+        assert apply_system_tags.await_args.kwargs["sets"][INTEGRATION_PLATFORM_RUN_TAG_KEY] == "make"
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize(
-    ("parameters", "detail"),
+    ("route", "parameters", "detail"),
     [
         pytest.param(
+            "run",
             {"login": "cred_deleted", "email": "a@example.com"},
             "Invalid credential ID: cred_deleted. Failed to resolve to a valid credential.",
             id="invalid-credential-id",
         ),
         pytest.param(
+            "legacy",
             {"login": "cred_live"},
             "Missing value for parameter email in workflow {wpid}",
             id="missing-parameter",
         ),
         pytest.param(
+            "run",
             {"email": "a@example.com", "count": "three"},
             "Invalid workflow parameter. Expected parameter type: integer. Value: three.",
             id="invalid-parameter-value",
         ),
         pytest.param(
+            "legacy",
             {"logn": "cred_live", "email": "a@example.com"},
             "The run request sent parameter(s) this workflow does not declare: logn.",
             id="misdirected-credential-key",
         ),
         pytest.param(
+            "run",
             {"login": "cred_live", "email": "a@example.com", "vault_item": "not-a-uuid"},
             "Invalid workflow parameter. Expected parameter type: Bitwarden item ID (UUID). Value: not-a-uuid.",
             id="invalid-bitwarden-item-id",
         ),
         pytest.param(
+            "legacy",
             {"login": "cred_live", "email": "a@example.com", "account": "cred_unlisted"},
             "Credential override for parameter account must be one of the configured rotation or fallback credentials.",
             id="credential-override-outside-the-pool",
@@ -1752,12 +1850,14 @@ async def test_run_submission_refuses_unusable_parameters_without_writing_a_run(
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("route", ["run", "legacy"])
 @pytest.mark.parametrize(
-    ("parameters", "deleted_credential_id"),
+    ("route", "parameters", "deleted_credential_id"),
     [
-        pytest.param({"login": "cred_spare", "email": "a@example.com"}, "cred_live", id="stored-credential-deleted"),
         pytest.param(
+            "run", {"login": "cred_spare", "email": "a@example.com"}, "cred_live", id="stored-credential-deleted"
+        ),
+        pytest.param(
+            "legacy",
             {"login": "cred_live", "email": "a@example.com", "account": "cred_spare"},
             "cred_spare",
             id="override-credential-deleted",

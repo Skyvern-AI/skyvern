@@ -1,9 +1,12 @@
+import json
+from datetime import UTC, datetime
 from http import HTTPStatus
 
 import pytest
 
 from skyvern.exceptions import (
     BrowserSessionClosed,
+    BrowserSessionExpired,
     BrowserSessionStartupTimeout,
     CaptchaNotSolvedInTime,
     CaptchaSolveError,
@@ -18,6 +21,7 @@ from skyvern.exceptions import (
     require_local_extra_modules,
     require_server_extra_modules,
 )
+from skyvern.forge.api_app import handle_skyvern_http_exception
 
 
 class FakePatchrightTimeoutError(Exception):
@@ -190,7 +194,10 @@ def test_browser_session_timeout_exceptions_distinguish_startup_from_expiry() ->
 
     assert startup_timeout.status_code == 504
     assert expired.status_code == 410
-    assert str(startup_timeout) == "Browser session pbs_test failed to start within the timeout period."
+    assert str(startup_timeout) == (
+        "Browser session pbs_test failed to start within the timeout period. "
+        "Create a new browser session and retry with its id."
+    )
     assert str(expired) == (
         "Browser session pbs_test expired after reaching its configured lifetime. "
         "Create a new browser session and retry."
@@ -201,6 +208,40 @@ def test_browser_session_closed_states_the_remedy_without_an_explicit_reason() -
     assert str(BrowserSessionClosed("pbs_test")) == (
         "Browser session pbs_test is closed. Create a new browser session and retry."
     )
+
+
+@pytest.mark.asyncio
+async def test_refused_run_carries_a_stable_error_code_a_caller_can_branch_on() -> None:
+    """A dispatcher re-sending a dead session id must be able to tell expiry from any other 410
+    without matching on prose, so these codes are a published contract."""
+    expired = BrowserSessionExpired(
+        "pbs_test",
+        started_at=datetime(2026, 10, 13, 1, 0, tzinfo=UTC),
+        ended_at=datetime(2026, 10, 13, 2, 0, tzinfo=UTC),
+        timeout_minutes=60,
+        created_by="api",
+        refused_at_submission=True,
+    )
+
+    response = await handle_skyvern_http_exception(None, expired)  # type: ignore[arg-type]
+    body = json.loads(response.body)
+
+    assert response.status_code == 410
+    assert body["error_code"] == "browser_session_expired"
+    assert "expired" in body["detail"]
+    # The subclass must not inherit the base code, or expiry becomes indistinguishable from a
+    # session the caller closed itself.
+    assert BrowserSessionClosed("pbs_test").error_code == "browser_session_closed"
+    assert BrowserSessionStartupTimeout("pbs_test").error_code == "browser_session_startup_timeout"
+
+
+@pytest.mark.asyncio
+async def test_error_code_is_absent_from_responses_that_do_not_set_one() -> None:
+    response = await handle_skyvern_http_exception(  # type: ignore[arg-type]
+        None, SkyvernHTTPException("bad request", status_code=HTTPStatus.BAD_REQUEST)
+    )
+
+    assert json.loads(response.body) == {"detail": "bad request"}
 
 
 def test_raise_server_extra_required_translates_when_server_extra_missing(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -416,6 +457,40 @@ def test_unknown_error_still_redacts_cdp_endpoints_for_session_closed_error() ->
     assert "tok-9f3a" not in message
     assert "remote.example.internal" not in message
     assert "[remote browser endpoint]" in message
+
+
+@pytest.mark.parametrize(
+    ("call_log_tail", "expects_new_session_advice"),
+    [
+        # The socket opened and the attach handshake then blew the deadline. Playwright leaves that
+        # socket attached to the browser, so it keeps buffering events and the next attach to the
+        # same session is slower — "high demand" and "re-run" both point the caller the wrong way.
+        (
+            "- <ws connecting> wss://sessions.skyvern.com/pbs_1/tok - <ws connected> wss://sessions.skyvern.com/pbs_1/tok",
+            True,
+        ),
+        # Timed out before the socket opened: Playwright cleaned it up, nothing is attached, and
+        # retrying the same session is still the right move.
+        ("- <ws connecting> wss://sessions.skyvern.com/pbs_1/tok", False),
+    ],
+    ids=["socket-opened-then-handshake-stalled", "timed-out-before-socket-opened"],
+)
+def test_connect_timeout_message_depends_on_whether_the_socket_opened(
+    call_log_tail: str, expects_new_session_advice: bool
+) -> None:
+    raw_error = f"BrowserType.connect_over_cdp: Timeout 30000ms exceeded. Call log: {call_log_tail}"
+
+    message = get_user_facing_exception_message(Exception(raw_error))
+
+    assert "sessions.skyvern.com" not in message
+    assert "wss://" not in message
+    if expects_new_session_advice:
+        assert "high demand" not in message
+        assert "re-running" not in message
+        assert "Start a new browser session" in message
+    else:
+        assert "high demand" in message
+        assert "try re-running" in message
 
 
 def test_non_browser_error_not_intercepted() -> None:

@@ -112,6 +112,7 @@ async def test_completion_tags_write_final_status_execution_mode_and_primary_fai
             "skyvern.failure_category": "PARAMETER_BINDING_ERROR",
         },
         caller_id="system:completion-tagging",
+        known_run=workflow_run,
     )
 
 
@@ -133,6 +134,7 @@ async def test_completion_tags_write_status_and_execution_mode_for_completed_run
         organization_id="org_abc",
         sets={"skyvern.status": "completed", "skyvern.execution_mode": "agent"},
         caller_id="system:completion-tagging",
+        known_run=workflow_run,
     )
 
 
@@ -420,7 +422,7 @@ async def test_cleanup_after_cancellation_emits_only_canceled_webhook(monkeypatc
 
     webhook_statuses: list[WorkflowRunStatus] = []
 
-    async def record_webhook(workflow_run: MagicMock, _api_key: str | None = None) -> None:
+    async def record_webhook(workflow_run: MagicMock, _api_key: str | None = None, **_claim: object) -> None:
         webhook_statuses.append(workflow_run.status)
 
     monkeypatch.setattr(svc, "execute_workflow_webhook", record_webhook)
@@ -453,6 +455,7 @@ async def test_cleanup_after_cancellation_emits_only_canceled_webhook(monkeypatc
     conditional_finalize.assert_awaited_once_with(
         workflow_run_id=running_run.workflow_run_id,
         status=WorkflowRunStatus.completed,
+        _on_terminal_write=None,
     )
     assert finalized_run is canceled_run
     assert webhook_statuses == [WorkflowRunStatus.canceled]
@@ -570,7 +573,7 @@ async def test_cancel_no_policy_run_deletes_attachments_before_webhook(
 ) -> None:
     workflow_run = _make_updated_row()
     workflow_run.workflow_run_id = "wr_no_policy_cancel"
-    workflow_run.status = WorkflowRunStatus.running
+    workflow_run.status = WorkflowRunStatus.queued
     canceled_run = _make_updated_row()
     canceled_run.workflow_run_id = workflow_run.workflow_run_id
     monkeypatch.setattr(

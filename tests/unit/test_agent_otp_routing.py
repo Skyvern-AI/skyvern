@@ -15,6 +15,7 @@ from skyvern.forge.agent import (
     ForgeAgent,
     PromptBuildResult,
     _model_is_abandoning_verification,
+    _release_planned_otp_code,
 )
 from skyvern.forge.sdk.core import skyvern_context
 from skyvern.forge.sdk.core.skyvern_context import MultiFieldTotpAttempt, SkyvernContext
@@ -25,6 +26,7 @@ from skyvern.forge.sdk.workflow.models.parameter import CredentialParameter
 from skyvern.schemas.run_enums import RunEngine
 from skyvern.services import otp_service
 from skyvern.services.otp_service import OTPValue
+from skyvern.webeye.actions.actions import ClickAction, InputTextAction
 
 _VALID_TOTP_SEED = "JBSWY3DPEHPK3PXP"
 _MULTI_FIELD_HINT = "907182"
@@ -910,6 +912,105 @@ def test_model_is_abandoning_verification_pure_batch_only(actions: list, expecte
     (either order) also executes as a lone TERMINATE and is abandonment. A TERMINATE or WAIT mixed
     with a productive action (which survives execution) is not abandonment."""
     assert _model_is_abandoning_verification({"actions": actions}) is expected
+
+
+@pytest.mark.asyncio
+async def test_code_fetched_before_the_field_renders_is_still_typed(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The OTP gate fires on a page whose code field has not rendered yet, so the plan that follows is
+    a click and the polled code goes unused. It must reach the step that does have the field: dropping
+    it there made the next step poll again, and a second poll of the same email can answer with the
+    sign-in link beside the code."""
+    from skyvern.forge import agent as agent_module
+    from tests.unit.test_multi_field_totp import _box_page
+
+    task = _make_task()
+    monkeypatch.setattr(agent_module.app, "WORKFLOW_CONTEXT_MANAGER", SimpleNamespace(workflow_run_contexts={}))
+    step = MagicMock()
+    browser_state = MagicMock()
+    resolver = AsyncMock(return_value=OTPValue(value="123456", type=OTPType.TOTP))
+    monkeypatch.setattr("skyvern.forge.agent.resolve_otp_value", resolver)
+    monkeypatch.setattr("skyvern.forge.agent.service_utils.is_cua_task", AsyncMock(return_value=False))
+    context = SkyvernContext(task_id=task.task_id)
+    replan_codes: list[str | None] = []
+
+    async def build_prompt(*_args: object, **_kwargs: object) -> PromptBuildResult:
+        replan_codes.append(context.totp_codes.get(task.task_id))
+        return PromptBuildResult(prompt="prompt", use_caching=False, prompt_name="test", without_page_information=True)
+
+    monkeypatch.setattr(ForgeAgent, "_build_extract_action_prompt", build_prompt)
+    click_plan = {"actions": [{"action_type": "CLICK", "id": "AAAA", "reasoning": "open the code form"}]}
+    typed_plan = {"actions": [{"action_type": "INPUT_TEXT", "id": "AABL", "text": "123456"}]}
+    llm_handler = AsyncMock(side_effect=[click_plan, typed_plan])
+    monkeypatch.setattr(
+        "skyvern.forge.agent.LLMAPIHandlerFactory.get_override_llm_api_handler",
+        lambda *_args, **_kwargs: llm_handler,
+    )
+
+    agent = ForgeAgent.__new__(ForgeAgent)
+    with skyvern_context.scoped(context):
+        no_field_yet = await agent.handle_potential_verification_code(
+            task, step, _box_page(0), browser_state, _otp_json_response([])
+        )
+        _release_planned_otp_code(context, task.task_id, [ClickAction(element_id="AAAA")])
+        assert context.totp_codes[task.task_id] == "123456"
+
+        # The next step's first-pass prompt offers the code and would normally expire it there.
+        first_pass_payload = agent._build_navigation_payload(
+            task, expire_verification_code=True, step=step, scraped_page=_box_page(1)
+        )
+        field_rendered = await agent.handle_potential_verification_code(
+            task, step, _box_page(1), browser_state, _otp_json_response([])
+        )
+        _release_planned_otp_code(context, task.task_id, [InputTextAction(element_id="AABL", text="123456")])
+
+    assert (no_field_yet, field_rendered) == (click_plan, typed_plan)
+    assert first_pass_payload == {"verification_code": "123456"}
+    assert replan_codes == ["123456", "123456"]
+    assert resolver.await_count == 1
+    assert task.task_id not in context.totp_codes
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("planned_actions", "survives"),
+    [
+        pytest.param(
+            [
+                {"action_type": "INPUT_TEXT", "id": "AABL", "text": "OTP code from email"},
+                {"action_type": "CLICK", "id": "BBBB", "reasoning": "verify"},
+            ],
+            False,
+            id="placeholder_input_dropped",
+        ),
+        pytest.param(
+            [{"action_type": "CLICK", "id": "AAAA", "reasoning": "enter a verification code instead"}],
+            True,
+            id="click_only_plan_kept",
+        ),
+    ],
+)
+async def test_plan_typing_into_the_code_field_is_dropped_when_no_code_resolves(
+    monkeypatch: pytest.MonkeyPatch, planned_actions: list, survives: bool
+) -> None:
+    """The planner writes its own placeholder into the input_text action and expects the resolver to
+    replace it, so a plan returned verbatim after an unresolved poll submits "OTP code from email".
+    A plan that only clicks is still the right move and is returned untouched."""
+    from tests.unit.test_multi_field_totp import _box_page
+
+    task = _make_task()
+    monkeypatch.setattr(
+        "skyvern.forge.agent.resolve_otp_value",
+        AsyncMock(return_value=OTPValue(value="https://example.com/signin?token=abc", type=OTPType.MAGIC_LINK)),
+    )
+    json_response = _otp_json_response(planned_actions)
+
+    agent = ForgeAgent.__new__(ForgeAgent)
+    with skyvern_context.scoped(SkyvernContext(task_id=task.task_id)):
+        result = await agent.handle_potential_verification_code(
+            task, MagicMock(), _box_page(1), MagicMock(), json_response
+        )
+
+    assert result["actions"] == (planned_actions if survives else [])
 
 
 @pytest.mark.asyncio

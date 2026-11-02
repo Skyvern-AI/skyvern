@@ -4,6 +4,7 @@ from collections import Counter
 from typing import Any, Literal
 from uuid import uuid4
 
+from fastapi import HTTPException
 from pydantic import BaseModel
 
 from skyvern.config import settings
@@ -17,6 +18,8 @@ from skyvern.forge.sdk.copilot.ask_user import (
     wait_for_interaction,
 )
 from skyvern.forge.sdk.copilot.context import CopilotContext
+from skyvern.forge.sdk.copilot.credential_resolution import count_visible_credentials, load_credentials
+from skyvern.forge.sdk.services.request_principal import get_request_principal
 
 DELETE_TOOL_DESCRIPTION = (
     "Delete saved credentials (passwords, cards, secrets) from this organization's Skyvern vault, after the "
@@ -47,6 +50,12 @@ def credential_delete_enabled() -> bool:
     return settings.COPILOT_CREDENTIAL_DELETE_ENABLED
 
 
+async def enforce_credential_delete_access(credential_id: str) -> None:
+    await app.AGENT_FUNCTION.enforce_credential_folder_access_for_ids(
+        get_request_principal(), "credential.delete", {("credential_id", credential_id)}
+    )
+
+
 async def build_delete_review(ctx: CopilotContext, credential_ids: list[str]) -> CredentialDeleteReview | str:
     if not credential_ids:
         return "Select at least one credential id."
@@ -60,23 +69,32 @@ async def build_delete_review(ctx: CopilotContext, credential_ids: list[str]) ->
         return f"These credential ids are listed more than once: {duplicates}. Nothing was deleted."
     found = {
         credential.credential_id: credential
-        for credential in await app.DATABASE.credentials.get_credentials_by_ids(
-            credential_ids, organization_id=ctx.organization_id
-        )
+        for credential in await load_credentials(ctx.organization_id, credential_ids=credential_ids)
     }
     missing = [credential_id for credential_id in credential_ids if credential_id not in found]
     if missing:
         return f"These ids are not saved credentials in this organization: {missing}. Nothing was deleted."
-    return CredentialDeleteReview(
-        rows=[
+    rows: list[CredentialDeleteRow] = []
+    for credential_id in credential_ids:
+        try:
+            await enforce_credential_delete_access(credential_id)
+        except HTTPException as exc:
+            if exc.status_code != 403:
+                raise
+            continue
+        credential = found[credential_id]
+        rows.append(
             CredentialDeleteRow(
                 credential_id=credential_id,
-                name=found[credential_id].name,
-                credential_type=found[credential_id].credential_type,
+                name=credential.name,
+                credential_type=credential.credential_type,
             )
-            for credential_id in credential_ids
-        ],
-        total_credential_count=await app.DATABASE.credentials.count_credentials(ctx.organization_id),
+        )
+    if not rows:
+        return "None of the selected credentials can be deleted. Nothing was deleted."
+    return CredentialDeleteReview(
+        rows=rows,
+        total_credential_count=await count_visible_credentials(ctx.organization_id),
     )
 
 

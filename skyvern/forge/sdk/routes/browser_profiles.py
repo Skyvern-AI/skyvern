@@ -43,8 +43,13 @@ from skyvern.forge.sdk.schemas.browser_profiles import (
     UpdateBrowserProfileRequest,
 )
 from skyvern.forge.sdk.schemas.organizations import Organization
-from skyvern.forge.sdk.schemas.persistent_browser_sessions import export_profile_storage_id
+from skyvern.forge.sdk.schemas.persistent_browser_sessions import (
+    PersistentBrowserSession,
+    export_profile_storage_id,
+    is_external_cdp_session,
+)
 from skyvern.forge.sdk.services import org_auth_service
+from skyvern.forge.sdk.services.request_principal import get_request_principal
 from skyvern.forge.sdk.workflow.browser_session_persistence import retrieve_persisted_workflow_browser_state_dir
 from skyvern.schemas.proxy_pinning import apply_proxy_pin_update as _apply_proxy_pin_update
 from skyvern.schemas.proxy_pinning import should_generate_proxy_session_id
@@ -76,6 +81,11 @@ _SESSION_PROFILE_SAVE_LOCK_WAIT_SECONDS = 30
 _SESSION_PROFILE_SAVED_MARKER_TTL = timedelta(days=1)
 
 
+def _redact_credential_profile_labels(profile: BrowserProfile) -> None:
+    profile.name = "Browser profile"
+    profile.description = None
+
+
 def _normalize_proxy_pin_fields(
     *,
     proxy_location: ProxyLocationInput,
@@ -84,6 +94,15 @@ def _normalize_proxy_pin_fields(
     if proxy_session_id:
         return proxy_location or ProxyLocation.RESIDENTIAL_ISP, proxy_session_id
     return proxy_location, None
+
+
+def _refuse_profile_from_external_session(browser_session: PersistentBrowserSession) -> None:
+    if is_external_cdp_session(browser_session):
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=f"Browser session {browser_session.persistent_browser_session_id} is a registered external "
+            "browser, and Skyvern does not save profiles from it.",
+        )
 
 
 def _handle_duplicate_profile_name(*, organization_id: str, name: str, exc: IntegrityError) -> NoReturn:
@@ -239,6 +258,29 @@ async def list_browser_profiles(
         managed=managed,
     )
 
+    principal = get_request_principal()
+    hidden_profile_ids: set[str] = set()
+    credential_links_by_profile: dict[str, list[tuple[str, str | None]]] | None = None
+    if (
+        search_key
+        and await app.AGENT_FUNCTION.credential_folders_restricted(organization_id)
+        and not await app.AGENT_FUNCTION.credential_folder_admin_bypass(principal)
+    ):
+        credential_links_by_profile = await app.DATABASE.credentials.get_browser_profile_credential_links(
+            None, organization_id
+        )
+        all_credential_ids = {
+            credential_id for links in credential_links_by_profile.values() for credential_id, _folder_id in links
+        }
+        allowed_credential_ids = await app.AGENT_FUNCTION.accessible_credential_ids(
+            principal, "credential.read", all_credential_ids
+        )
+        hidden_profile_ids = {
+            profile_id
+            for profile_id, links in credential_links_by_profile.items()
+            if not {credential_id for credential_id, _folder_id in links} <= allowed_credential_ids
+        }
+
     profiles = await app.DATABASE.browser_sessions.list_browser_profiles(
         organization_id=organization_id,
         include_deleted=include_deleted,
@@ -246,7 +288,33 @@ async def list_browser_profiles(
         page_size=page_size,
         search_key=search_key,
         managed=managed,
+        exclude_search_profile_ids=hidden_profile_ids,
     )
+
+    if (
+        profiles
+        and await app.AGENT_FUNCTION.credential_folders_restricted(organization_id)
+        and not await app.AGENT_FUNCTION.credential_folder_admin_bypass(principal)
+    ):
+        if credential_links_by_profile is None:
+            credential_links_by_profile = await app.DATABASE.credentials.get_browser_profile_credential_links(
+                {profile.browser_profile_id for profile in profiles}, organization_id
+            )
+            credential_ids = {
+                credential_id for links in credential_links_by_profile.values() for credential_id, _folder_id in links
+            }
+            allowed_credential_ids = await app.AGENT_FUNCTION.accessible_credential_ids(
+                principal, "credential.read", credential_ids
+            )
+        for profile in profiles:
+            linked_ids = {
+                credential_id
+                for credential_id, _folder_id in credential_links_by_profile.get(profile.browser_profile_id, [])
+            }
+            if linked_ids and not linked_ids <= allowed_credential_ids:
+                profile.linked_credential_id = None
+                profile.linked_credential_name = None
+                _redact_credential_profile_labels(profile)
 
     LOG.info(
         "Listed browser profiles",
@@ -312,6 +380,34 @@ async def get_browser_profile(
         )
         raise BrowserProfileNotFound(profile_id=profile_id, organization_id=organization_id)
 
+    linked_credentials = await app.DATABASE.credentials.get_credentials_by_browser_profile_id(
+        profile_id, organization_id
+    )
+    principal = get_request_principal()
+    redact_labels = False
+    if await app.AGENT_FUNCTION.credential_folders_restricted(
+        organization_id
+    ) and not await app.AGENT_FUNCTION.credential_folder_admin_bypass(principal):
+        linked_credential_links_by_profile = await app.DATABASE.credentials.get_browser_profile_credential_links(
+            {profile_id}, organization_id
+        )
+        linked_credential_ids = {
+            credential_id for credential_id, _folder_id in linked_credential_links_by_profile.get(profile_id, [])
+        }
+        allowed_credential_ids = await app.AGENT_FUNCTION.accessible_credential_ids(
+            principal, "credential.read", linked_credential_ids
+        )
+        if linked_credential_ids and not linked_credential_ids <= allowed_credential_ids:
+            linked_credentials = []
+            profile.linked_credential_id = None
+            profile.linked_credential_name = None
+            redact_labels = True
+    if linked_credentials:
+        profile.linked_credential_id = linked_credentials[0].credential_id
+        profile.linked_credential_name = linked_credentials[0].name
+    if redact_labels:
+        _redact_credential_profile_labels(profile)
+
     LOG.info(
         "Retrieved browser profile",
         organization_id=organization_id,
@@ -360,6 +456,18 @@ async def get_browser_profile_usage(
         profile_id=profile_id,
         organization_id=organization_id,
     )
+    principal = get_request_principal()
+    if (
+        usage.credentials
+        and await app.AGENT_FUNCTION.credential_folders_restricted(organization_id)
+        and not await app.AGENT_FUNCTION.credential_folder_admin_bypass(principal)
+    ):
+        allowed_credential_ids = await app.AGENT_FUNCTION.accessible_credential_ids(
+            principal, "credential.read", {credential.credential_id for credential in usage.credentials}
+        )
+        usage.credentials = [
+            credential for credential in usage.credentials if credential.credential_id in allowed_credential_ids
+        ]
     LOG.info(
         "Retrieved browser profile usage",
         organization_id=organization_id,
@@ -746,6 +854,7 @@ async def create_profile_from_running_session(
     )
     if browser_session is None:
         raise BrowserSessionNotFound(browser_session_id)
+    _refuse_profile_from_external_session(browser_session)
     browser_state = await app.PERSISTENT_SESSIONS_MANAGER.get_observer_browser_state(
         browser_session_id, organization_id
     )
@@ -950,6 +1059,7 @@ async def _create_profile_from_session_locked(
             browser_session_id=browser_session_id,
         )
         raise BrowserSessionNotFound(browser_session_id)
+    _refuse_profile_from_external_session(browser_session)
 
     saved_profile = await _profile_already_saved_from_session(
         organization_id=organization_id, browser_session_id=browser_session_id, name=name

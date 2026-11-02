@@ -2,13 +2,27 @@
 
 from __future__ import annotations
 
+import base64
+import copy
 import hashlib
 import json
+import random
+from collections.abc import AsyncIterator
 from pathlib import Path
 from types import SimpleNamespace
-from typing import Any
+from typing import Any, cast
 
 import pytest
+from agents import Agent, RunConfig, Runner, function_tool
+from agents.items import ReasoningItem
+from agents.run_config import ModelInputData
+from openai.types.chat import ChatCompletionChunk
+from openai.types.chat.chat_completion_chunk import Choice as ChunkChoice
+from openai.types.chat.chat_completion_chunk import (
+    ChoiceDelta,
+    ChoiceDeltaToolCall,
+    ChoiceDeltaToolCallFunction,
+)
 from structlog.testing import capture_logs
 
 from skyvern.forge.sdk.copilot.ask_user import (
@@ -18,8 +32,9 @@ from skyvern.forge.sdk.copilot.ask_user import (
     QuestionPart,
     QuestionResponse,
 )
-from skyvern.forge.sdk.copilot.config import BlockAuthoringPolicy
-from skyvern.forge.sdk.copilot.enforcement import estimate_tokens
+from skyvern.forge.sdk.copilot.config import SCREENSHOT_DROPPED_NUDGE, BlockAuthoringPolicy
+from skyvern.forge.sdk.copilot.enforcement import NUDGE_SENTINEL, estimate_tokens, pending_screenshot_message
+from skyvern.forge.sdk.copilot.model_resolver import CopilotLitellmProvider
 from skyvern.forge.sdk.copilot.screenshot_utils import (
     ScreenshotActionRelation,
     ScreenshotEntry,
@@ -30,8 +45,9 @@ from skyvern.forge.sdk.copilot.session_factory import (
     copilot_session_input_callback,
     make_copilot_call_model_input_filter,
 )
-from tests.unit.copilot_test_helpers import make_copilot_ctx
+from tests.unit.copilot_test_helpers import captured_frame_entry, make_copilot_ctx
 from tests.unit.copilot_test_helpers import make_model_input_data as _mk_input_data
+from tests.unit.copilot_test_helpers import sent_image_px
 
 
 def _unread_run_results_batch() -> list[dict[str, Any]]:
@@ -103,7 +119,7 @@ class TestFirstTurnCompaction:
                         "call_id": f"call-{i}",
                         "output": json.dumps({"ok": True, "data": {"blob": large_output}}),
                     },
-                    {"type": "reasoning", "summary": []},
+                    {"type": "reasoning", "summary": [{"type": "summary_text", "text": "Read it."}]},
                 )
             ),
         ]
@@ -225,7 +241,7 @@ class TestFirstTurnCompaction:
             {"role": "user", "content": "please build me a workflow"},
             *({"type": "function_call_output", "call_id": f"call-{i}", "output": "x" * 5000} for i in range(3)),
             {"type": "function_call_output", "call_id": "call-small", "output": "ok"},
-            {"type": "reasoning", "summary": []},
+            {"type": "reasoning", "summary": [{"type": "summary_text", "text": "Read it."}]},
         ]
         tight_filter = make_copilot_call_model_input_filter(token_budget=200)
         with structlog.testing.capture_logs() as logs:
@@ -529,10 +545,21 @@ class TestModelInputCapture:
         copilot_call_model_input_filter(
             _mk_input_data(items, context=make_copilot_ctx(block_authoring_policy=BlockAuthoringPolicy.STANDARD))
         )
+        copilot_call_model_input_filter(
+            _mk_input_data(
+                items,
+                context=make_copilot_ctx(
+                    block_authoring_policy=BlockAuthoringPolicy.STANDARD, agent_step_available=True
+                ),
+            )
+        )
         copilot_call_model_input_filter(_mk_input_data(items))
 
-        unified, context_less = (json.loads(path.read_text()) for path in sorted(tmp_path.glob("call-*.json")))
-        assert unified["authoring_capability"] == {"code_blocks": True, "agent_blocks": True}
+        unified, agent_step, context_less = (
+            json.loads(path.read_text()) for path in sorted(tmp_path.glob("call-*.json"))
+        )
+        assert unified["authoring_capability"] == {"code_blocks": True, "agent_blocks": True, "agent_step": False}
+        assert agent_step["authoring_capability"] == {"code_blocks": True, "agent_blocks": True, "agent_step": True}
         assert context_less["authoring_capability"] is None
 
     def test_capture_records_a_call_whichever_shape_carries_the_context(
@@ -705,6 +732,45 @@ class TestStagedScreenshotBinding:
         assert len(_image_parts(delivered.input[-1])) == 1
         assert ctx.pending_frame_lease.capture_event_id == recaptured.capture_event_id
 
+    def test_a_sharp_frame_over_budget_costs_older_screenshots_first_and_then_falls_back_to_the_small_copy(
+        self,
+    ) -> None:
+        older_frame = pending_screenshot_message(
+            SimpleNamespace(pending_screenshots=[captured_frame_entry()], supports_vision=True)
+        )
+        items = [
+            {"role": "user", "content": "what does the page say"},
+            older_frame,
+            {"type": "function_call", "call_id": "read-1", "name": "evaluate", "arguments": "{}"},
+            {"type": "function_call_output", "call_id": "read-1", "output": '{"text":"order 4412 shipped"}'},
+        ]
+
+        def call(token_budget: int) -> ModelInputData:
+            ctx = SimpleNamespace(pending_screenshots=[captured_frame_entry()], supports_vision=True)
+            return make_copilot_call_model_input_filter(token_budget=token_budget)(_mk_input_data(items, context=ctx))
+
+        for token_budget, new_frame_px in ((2_200, (1600, 789)), (1_200, (1024, 505))):
+            result = call(token_budget)
+            assert [sent_image_px(item) for item in result.input] == [[], [], [], [], [new_frame_px]]
+            assert result.input[2:4] == items[2:4]
+
+    def test_the_pending_frame_is_sent_sharp_on_every_call_that_carries_it(self) -> None:
+        ctx = SimpleNamespace(pending_screenshots=[captured_frame_entry()], supports_vision=True)
+        initial = [{"role": "user", "content": "what does the page say"}]
+        advanced = [
+            *initial,
+            {"type": "function_call", "call_id": "read-1", "name": "evaluate", "arguments": "{}"},
+            {"type": "function_call_output", "call_id": "read-1", "output": '{"ok":true}'},
+        ]
+
+        first = copilot_call_model_input_filter(_mk_input_data(initial, context=ctx))
+        later = copilot_call_model_input_filter(_mk_input_data(advanced, context=ctx))
+
+        for result in (first, later):
+            message = result.input[-1]
+            assert sent_image_px(message) == [(1600, 789)]
+            assert "image_px=1600x789; viewport_css_px=1920x947" in message["content"][0]["text"]
+
     def test_paired_message_has_machine_readable_marker(self) -> None:
         ctx = _ctx_with_staged_frame()
 
@@ -734,13 +800,112 @@ class TestStagedScreenshotBinding:
         assert not any(_image_parts(item) for item in result.input)
         assert not any(log["event"] == "Injecting screenshot user message" for log in logs)
 
-    def test_aggressive_prune_drops_the_bound_frame_like_any_other_screenshot(self) -> None:
-        ctx = _ctx_with_staged_frame()
-        items: list[dict[str, Any]] = [{"role": "user", "content": "build me a workflow"}]
+    def test_last_resort_prune_keeps_the_bound_frame_and_asks_for_a_retake_only_without_one(self) -> None:
+        retake_note = NUDGE_SENTINEL + SCREENSHOT_DROPPED_NUDGE
+        frame_older_than_the_kept_steps = pending_screenshot_message(
+            SimpleNamespace(pending_screenshots=[captured_frame_entry()], supports_vision=True)
+        )
+        items: list[dict[str, Any]] = [
+            {"role": "user", "content": "build me a workflow"},
+            frame_older_than_the_kept_steps,
+        ]
         for i in range(12):
             items.append({"type": "function_call", "call_id": f"call-{i}", "name": "observe", "arguments": "{}"})
             items.append({"type": "function_call_output", "call_id": f"call-{i}", "output": "y" * 4000})
+        retake_note_from_an_earlier_recovery = [*items[:-2], {"role": "user", "content": retake_note}, *items[-2:]]
+        over_budget_after_every_trim = make_copilot_call_model_input_filter(1)
 
-        result = make_copilot_call_model_input_filter(1)(_mk_input_data(items, context=ctx))
+        with_frame = over_budget_after_every_trim(
+            _mk_input_data(retake_note_from_an_earlier_recovery, context=_ctx_with_staged_frame())
+        )
+        without_frame = over_budget_after_every_trim(
+            _mk_input_data(items, context=SimpleNamespace(pending_screenshots=[]))
+        )
 
-        assert not any(_image_parts(item) for item in result.input)
+        assert [len(_image_parts(item)) for item in with_frame.input if _image_parts(item)] == [1]
+        assert len(_image_parts(with_frame.input[-1])) == 1
+        assert not any(item.get("content") == retake_note for item in with_frame.input)
+        assert not any(_image_parts(item) for item in without_frame.input)
+        assert [item.get("content") for item in without_frame.input].count(retake_note) == 1
+
+    def test_aggressive_prune_reports_omitted_demonstration_fact_packets(self) -> None:
+        items: list[dict[str, Any]] = [{"role": "user", "content": "build the demonstrated workflow"}]
+        for i in range(12):
+            call_id = f"call_demo_turn-1_{i}"
+            items.append(
+                {
+                    "type": "function_call",
+                    "call_id": call_id,
+                    "name": "click",
+                    "arguments": json.dumps({"selector": "x" * 4000}),
+                }
+            )
+            items.append({"type": "function_call_output", "call_id": call_id, "output": "y" * 4000})
+
+        result = make_copilot_call_model_input_filter(1)(_mk_input_data(items))
+
+        notices = [
+            item["content"]
+            for item in result.input
+            if item.get("role") == "user" and "demonstrated step fact packet" in item.get("content", "")
+        ]
+        assert len(notices) == 1
+        assert notices[0].startswith("[copilot:nudge] ")
+
+
+@pytest.mark.asyncio
+async def test_signature_only_claude_thinking_does_not_use_up_the_model_input_budget(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    page_text = "page text " * 1500
+    signature = base64.b64encode(random.Random(0).randbytes(30_000)).decode()
+    requests: list[list[dict[str, Any]]] = []
+
+    def chunk(delta: ChoiceDelta, finish_reason: str | None = None) -> ChatCompletionChunk:
+        return ChatCompletionChunk(
+            id="chatcmpl-thinking",
+            created=0,
+            model="claude-sonnet-5-5",
+            object="chat.completion.chunk",
+            choices=[ChunkChoice(index=0, delta=delta, finish_reason=finish_reason)],
+        )
+
+    async def reply(first: bool) -> AsyncIterator[ChatCompletionChunk]:
+        yield chunk(ChoiceDelta(thinking_blocks=[{"type": "thinking", "thinking": "", "signature": signature}]))
+        if first:
+            call = ChoiceDeltaToolCall(
+                index=0,
+                id="toolu_read",
+                type="function",
+                function=ChoiceDeltaToolCallFunction(name="read_page", arguments="{}"),
+            )
+            yield chunk(ChoiceDelta(tool_calls=[call]))
+            yield chunk(ChoiceDelta(), "tool_calls")
+        else:
+            yield chunk(ChoiceDelta(content="done"))
+            yield chunk(ChoiceDelta(), "stop")
+
+    async def fake_acompletion(**kwargs: object) -> AsyncIterator[ChatCompletionChunk]:
+        requests.append(copy.deepcopy(cast(list[dict[str, Any]], kwargs["messages"])))
+        return reply(first=len(requests) == 1)
+
+    @function_tool
+    def read_page() -> str:
+        return page_text
+
+    monkeypatch.setattr("litellm.acompletion", fake_acompletion)
+    agent = Agent(name="workflow-copilot", model="anthropic/claude-sonnet-5-5", tools=[read_page])
+    run_config = RunConfig(
+        model_provider=CopilotLitellmProvider(),
+        tracing_disabled=True,
+        call_model_input_filter=make_copilot_call_model_input_filter(estimate_tokens([page_text]) + 2_000),
+    )
+
+    result = Runner.run_streamed(agent, input="Read the page.", run_config=run_config)
+    async for _ in result.stream_events():
+        pass
+
+    assert any(isinstance(item, ReasoningItem) for item in result.new_items)
+    second_request = json.dumps(requests[1])
+    assert json.dumps(page_text) in second_request
+    assert signature not in second_request

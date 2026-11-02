@@ -9,7 +9,7 @@ from urllib.parse import urlparse
 import aiofiles
 import aiohttp
 import structlog
-from aiohttp.abc import AbstractResolver, ResolveResult
+from aiohttp.abc import AbstractCookieJar, AbstractResolver, ResolveResult
 from aiohttp.resolver import DefaultResolver
 
 from skyvern.exceptions import HttpException, InvalidUrl
@@ -23,7 +23,7 @@ from skyvern.utils.url_validators import (
 
 LOG = structlog.get_logger()
 DEFAULT_REQUEST_TIMEOUT = 30
-_REDIRECT_CREDENTIAL_HEADERS = {"authorization", "cookie"}
+_SAFE_CROSS_ORIGIN_REDIRECT_HEADERS = frozenset({"accept", "accept-language", "user-agent"})
 
 
 def _url_origin(url: str) -> tuple[str, str, int | None]:
@@ -40,10 +40,13 @@ def strip_cross_origin_redirect_credentials(
     cookies: dict[str, str] | None,
     current_url: str,
     next_url: str,
+    *,
+    cookie_jar: AbstractCookieJar,
 ) -> tuple[dict[str, str], dict[str, str] | None]:
     if _url_origin(current_url) == _url_origin(next_url):
         return headers, cookies
-    return {key: value for key, value in headers.items() if key.lower() not in _REDIRECT_CREDENTIAL_HEADERS}, None
+    cookie_jar.clear()
+    return {key: value for key, value in headers.items() if key.lower() in _SAFE_CROSS_ORIGIN_REDIRECT_HEADERS}, None
 
 
 class SSRFGuardedResolver(AbstractResolver):
@@ -221,11 +224,28 @@ async def aiohttp_request(
                     next_url = await validate_and_pin_redirect_url(current_url, response.headers["Location"], resolver)
                     if authorize_redirect is not None and not authorize_redirect(next_url):
                         raise HttpException(400, current_url, "Redirect blocked by policy")
+                    redirects_to_get = response.status == 303 or (
+                        response.status in (301, 302) and request_method == "POST"
+                    )
+                    data_is_json = (
+                        "application/json"
+                        in (request_headers.get("Content-Type") or request_headers.get("content-type") or "").lower()
+                    )
+                    replays_entity = (
+                        not redirects_to_get
+                        and request_method != "GET"
+                        and (
+                            json_data is not None or bool(files) or (data is not None and (bool(data) or data_is_json))
+                        )
+                    )
+                    cross_origin = _url_origin(current_url) != _url_origin(next_url)
+                    if cross_origin and replays_entity:
+                        raise HttpException(400, "[redacted]", "Cross-origin redirect would replay a request entity")
                     request_headers, request_cookies = strip_cross_origin_redirect_credentials(
-                        request_headers, request_cookies, current_url, next_url
+                        request_headers, request_cookies, current_url, next_url, cookie_jar=session.cookie_jar
                     )
                     current_url = next_url
-                    if response.status == 303 or (response.status in (301, 302) and request_method == "POST"):
+                    if redirects_to_get:
                         request_method = "GET"
                         strip_body_headers = True
                     continue

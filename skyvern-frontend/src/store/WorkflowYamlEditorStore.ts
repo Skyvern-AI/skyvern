@@ -1,8 +1,6 @@
 import type { CopilotAcceptSnapshot } from "@/routes/workflows/editor/editorStateSnapshot";
 import { create } from "zustand";
 import { toast } from "@/components/ui/use-toast";
-import { useRecordedBlocksStore } from "./RecordedBlocksStore";
-import { useRecordingStore } from "./useRecordingStore";
 
 export const SAVE_STALE_MESSAGE =
   "Saved on the server, but local edits changed during the save; reload.";
@@ -90,6 +88,19 @@ export function selectEditorMutationLocked(
   return state.commitInProgress || state.copilotAcceptance !== null;
 }
 
+export const AUTHORING_SAVE_MESSAGE =
+  "Finish the current authoring action before saving";
+
+// Our own in-flight save shows a spinner, not a reason.
+export function selectSaveLockReason(
+  state: WorkflowYamlEditorState,
+): string | null {
+  if (state.authoringInProgress) return AUTHORING_SAVE_MESSAGE;
+  if (state.lockKind === "save" || !selectEditorMutationLocked(state))
+    return null;
+  return getWorkflowLockMessage(state);
+}
+
 export function isEditorMutationLocked(): boolean {
   return selectEditorMutationLocked(useWorkflowYamlEditorStore.getState());
 }
@@ -167,54 +178,16 @@ export const useWorkflowYamlEditorStore = create<WorkflowYamlEditorState>(
 
 function syncAuthoringInProgress(): void {
   const state = useWorkflowYamlEditorStore.getState();
-  const recording = useRecordingStore.getState();
-  const recorded = useRecordedBlocksStore.getState();
   const owner = state.editorOwner;
   const authoringInProgress = Boolean(
-    (state.authoringAction &&
-      owner?.active &&
-      state.authoringActionOwner === owner) ||
-    recording.isRecording ||
-    recording.finishRequested ||
-    recording.isCommitting ||
-    (recorded.blocks?.length &&
-      owner?.active &&
-      (!recorded.owner || recorded.owner === owner)),
+    state.authoringAction &&
+    owner?.active &&
+    state.authoringActionOwner === owner,
   );
   if (state.authoringInProgress !== authoringInProgress) {
     useWorkflowYamlEditorStore.setState({ authoringInProgress });
   }
 }
-
-let authoringSubscriptions: Array<() => void> = [];
-
-export function disposeWorkflowAuthoringSubscriptions(): void {
-  authoringSubscriptions.forEach((unsubscribe) => unsubscribe());
-  authoringSubscriptions = [];
-}
-
-export function registerWorkflowAuthoringSubscriptions(): void {
-  if (authoringSubscriptions.length) return;
-  // Recording and generated blocks can settle outside their launcher.
-  authoringSubscriptions = [
-    useRecordingStore.subscribe((state, previous) => {
-      if (
-        state.isRecording !== previous.isRecording ||
-        state.finishRequested !== previous.finishRequested ||
-        state.isCommitting !== previous.isCommitting
-      )
-        syncAuthoringInProgress();
-    }),
-    useRecordedBlocksStore.subscribe((state, previous) => {
-      if (state.blocks !== previous.blocks || state.owner !== previous.owner)
-        syncAuthoringInProgress();
-    }),
-  ];
-  syncAuthoringInProgress();
-}
-
-registerWorkflowAuthoringSubscriptions();
-import.meta.hot?.dispose(disposeWorkflowAuthoringSubscriptions);
 
 export async function runWorkflowAuthoringAction(
   action: () => void | Promise<unknown>,
@@ -565,17 +538,8 @@ function refuseYamlCommitDuringCopilotAcceptance(): boolean {
 }
 
 export function beginCopilotAcceptance(): symbol | null {
-  // Copilot stays conversational while a recording captures; recorded blocks
-  // wait for this lock to release before they apply.
-  const recording = useRecordingStore.getState();
-  const capturing =
-    recording.isRecording &&
-    !recording.finishRequested &&
-    !recording.isCommitting;
-  if (
-    refuseMutationDuringYamlCommit() ||
-    (!capturing && refuseMutationDuringAuthoring())
-  )
+  // Recorded blocks wait for this lock to release before they apply.
+  if (refuseMutationDuringYamlCommit() || refuseMutationDuringAuthoring())
     return null;
   if (useWorkflowYamlEditorStore.getState().copilotAcceptance) {
     toast({ title: getWorkflowLockMessage(), variant: "destructive" });
@@ -637,8 +601,9 @@ export function withCopilotAcceptance(
   }
 }
 
-export function getWorkflowLockMessage(): string {
-  const state = useWorkflowYamlEditorStore.getState();
+export function getWorkflowLockMessage(
+  state: WorkflowYamlEditorState = useWorkflowYamlEditorStore.getState(),
+): string {
   if (state.lockKind === "save") return "A save is in progress";
   if (
     state.lockKind === "copilot" ||
@@ -668,7 +633,7 @@ export function refuseMutationDuringYamlCommit(): boolean {
   return true;
 }
 
-export function refuseMutationDuringAuthoring(): boolean {
+function refuseMutationDuringAuthoring(): boolean {
   if (!useWorkflowYamlEditorStore.getState().authoringInProgress) return false;
   toast({
     title: "Finish the current authoring action first",
@@ -748,9 +713,6 @@ export function unregisterEditorOwner(owner: YamlCommitOwner): void {
   invalidateYamlCommitOwner(owner);
   if (useWorkflowYamlEditorStore.getState().editorOwner === owner) {
     useWorkflowYamlEditorStore.setState({ editorOwner: null });
-    const recorded = useRecordedBlocksStore.getState();
-    if (!recorded.owner || recorded.owner === owner)
-      recorded.clearRecordedBlocks();
     syncAuthoringInProgress();
   }
 }

@@ -392,6 +392,7 @@ async def _prepare_and_execute_item(group: WorkflowRunGroup, item: WorkflowRunGr
             trigger_type=WorkflowRunTriggerType.api,
             workflow_run_id=item.workflow_run_id,
             resolved_workflow_id=group.workflow_id,
+            created_by=group.created_by,
         )
     except IntegrityError:
         # The task_run row is written last, so its presence means an earlier preparation completed.

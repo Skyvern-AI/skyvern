@@ -4,6 +4,7 @@ export function composerPlaceholder({
   queuedPrompt,
   isLoading,
   isWaitingForLiveBrowser,
+  isDemonstrating = false,
   latestTurnIsAsk,
   askPartChoices = "none",
   detailPrompt = null,
@@ -12,6 +13,7 @@ export function composerPlaceholder({
   queuedPrompt: "add" | "replace" | null;
   isLoading: boolean;
   isWaitingForLiveBrowser: boolean;
+  isDemonstrating?: boolean;
   latestTurnIsAsk: boolean;
   // The question on screen's choices: without any the composer is the answer, and typing never
   // clears a picked one, so text sent after a pick goes alongside it rather than replacing it.
@@ -19,6 +21,7 @@ export function composerPlaceholder({
   // What the picked choice still needs typed, which outranks the generic invitations.
   detailPrompt?: string | null;
 }): string {
+  if (isDemonstrating) return "Show Copilot the task";
   if (queuedPrompt === "add") return "Add to the queued message…";
   if (queuedPrompt === "replace") return "Type to replace the queued message…";
   if (isLoading) return "Type to queue a message…";

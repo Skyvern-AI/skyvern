@@ -26,6 +26,7 @@ from skyvern.forge.sdk.copilot.ask_user import (
     wait_for_interaction,
 )
 from skyvern.forge.sdk.copilot.context import CopilotContext
+from skyvern.forge.sdk.copilot.credential_resolution import load_credentials
 from skyvern.forge.sdk.copilot.secret_redaction import redact_raw_secrets_for_prompt
 from skyvern.forge.sdk.copilot.secret_scrub import scrub_secrets_from_structure, scrub_secrets_from_text
 from skyvern.forge.sdk.copilot.tools.credentials import (
@@ -38,6 +39,7 @@ from skyvern.forge.sdk.copilot.workflow_yaml import workflow_to_copilot_yaml
 from skyvern.forge.sdk.core.permissions.permission_checker_factory import PermissionCheckerFactory
 from skyvern.forge.sdk.schemas.credentials import Credential
 from skyvern.forge.sdk.schemas.organizations import Organization
+from skyvern.forge.sdk.workflow.block_notes import strip_inert_block_fields
 from skyvern.forge.sdk.workflow.models.parameter import WorkflowParameter, WorkflowParameterType
 from skyvern.forge.sdk.workflow.models.workflow import Workflow
 from skyvern.schemas.workflow_run_groups import (
@@ -153,7 +155,7 @@ def account_group_submit_enabled() -> bool:
 
 
 def workflow_definition_hash(workflow: Workflow) -> str:
-    fields = workflow.model_dump(mode="json", include=set(_VERIFIED_WORKFLOW_FIELDS))
+    fields = strip_inert_block_fields(workflow.model_dump(mode="json", include=set(_VERIFIED_WORKFLOW_FIELDS)))
     # The model serializer masks every cdp_connect_headers value, so a changed header would hash the same.
     fields["cdp_connect_headers"] = workflow.cdp_connect_headers
     # Keyed because the digest leaves the server on the review card and covers raw header values.
@@ -308,9 +310,7 @@ async def _latest_outcomes(
 async def _resolve_credentials(ctx: CopilotContext, credential_ids: list[str]) -> dict[str, Credential]:
     found = {
         credential.credential_id: credential
-        for credential in await app.DATABASE.credentials.get_credentials_by_ids(
-            credential_ids, organization_id=ctx.organization_id
-        )
+        for credential in await load_credentials(ctx.organization_id, credential_ids=credential_ids)
     }
     missing = [credential_id for credential_id in credential_ids if credential_id not in found]
     if missing:
@@ -453,6 +453,7 @@ def _rows(group: WorkflowRunGroupResponse, labels: dict[str, str]) -> list[Accou
             outcome=item.outcome,
         )
         for item in group.items
+        if item.key in labels
     ]
 
 
@@ -558,8 +559,8 @@ async def _group_for_this_workflow(ctx: CopilotContext, workflow_run_group_id: s
 
 
 async def _labels(ctx: CopilotContext, group: WorkflowRunGroupResponse) -> dict[str, str]:
-    credentials = await app.DATABASE.credentials.get_credentials_by_ids(
-        [item.key for item in group.items], organization_id=ctx.organization_id
+    credentials = await load_credentials(
+        ctx.organization_id, credential_ids=[item.key for item in group.items], include_deleted=True
     )
     return {credential.credential_id: _label(credential) for credential in credentials}
 

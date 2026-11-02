@@ -653,7 +653,7 @@ class TestS3StorageBrowserSessionFiles:
 
         original_create = s3_storage.async_client.create_presigned_urls
 
-        async def flaky_create(uris: list[str]) -> list[str] | None:
+        async def flaky_create(uris: list[str], **_: object) -> list[str] | None:
             if len(uris) > 1:
                 return None  # simulate batch failure
             return await original_create(uris)
@@ -692,7 +692,7 @@ class TestS3StorageBrowserSessionFiles:
 
         original_create = s3_storage.async_client.create_presigned_urls
 
-        async def flaky_create(uris: list[str]) -> list[str] | None:
+        async def flaky_create(uris: list[str], **_: object) -> list[str] | None:
             if len(uris) > 1:
                 return None  # force per-key fallback
             if uris[0].endswith("f_1.csv"):
@@ -746,7 +746,7 @@ class TestS3StorageBrowserSessionFiles:
         original_create = s3_storage.async_client.create_presigned_urls
         seen_keys: list[list[str]] = []
 
-        async def tracking_create(uris: list[str]) -> list[str] | None:
+        async def tracking_create(uris: list[str], **_: object) -> list[str] | None:
             seen_keys.append(list(uris))
             return await original_create(uris)
 
@@ -1382,14 +1382,16 @@ class TestS3ShareLinkSensitiveCap:
         s3_storage.async_client.create_presigned_urls = AsyncMock(return_value=["https://s3/file"])
         artifact = _share_artifact(ArtifactType.DOWNLOAD, f"s3://{TEST_BUCKET}/file.pdf")
         assert await s3_storage.get_share_link(artifact) == "https://s3/file"
-        s3_storage.async_client.create_presigned_urls.assert_awaited_once_with([artifact.uri])
+        s3_storage.async_client.create_presigned_urls.assert_awaited_once_with(
+            [artifact.uri], attachment_filenames=[None]
+        )
 
     async def test_mixed_batch_preserves_order_and_routes_by_type(self, s3_storage: S3Storage) -> None:
         download = _share_artifact(ArtifactType.DOWNLOAD, f"s3://{TEST_BUCKET}/file.pdf")
         screenshot = _share_artifact(ArtifactType.SCREENSHOT_FINAL, f"s3://{TEST_BUCKET}/shot.png")
         recording = _share_artifact(ArtifactType.RECORDING, f"s3://{TEST_BUCKET}/rec.webm")
 
-        async def fake_presign(uris: list[str], expires_in: int | None = None) -> list[str]:
+        async def fake_presign(uris: list[str], expires_in: int | None = None, **_: object) -> list[str]:
             suffix = "capped" if expires_in is not None else "default"
             return [f"{uri}?{suffix}" for uri in uris]
 
@@ -1405,7 +1407,7 @@ class TestS3ShareLinkSensitiveCap:
         screenshot = _share_artifact(ArtifactType.SCREENSHOT_LLM, f"s3://{TEST_BUCKET}/shot.png")
         download = _share_artifact(ArtifactType.DOWNLOAD, f"s3://{TEST_BUCKET}/file.pdf")
 
-        async def fake_presign(uris: list[str], expires_in: int | None = None) -> list[str] | None:
+        async def fake_presign(uris: list[str], expires_in: int | None = None, **_: object) -> list[str] | None:
             return None if expires_in is not None else [f"{uri}?ok" for uri in uris]
 
         s3_storage.async_client.create_presigned_urls = AsyncMock(side_effect=fake_presign)

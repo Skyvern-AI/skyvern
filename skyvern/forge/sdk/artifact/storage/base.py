@@ -1,13 +1,15 @@
 import os
 from abc import ABC, abstractmethod
 from collections import Counter
-from collections.abc import Awaitable, Callable
+from collections.abc import AsyncIterator, Awaitable, Callable
+from dataclasses import dataclass
 from datetime import UTC, datetime
-from typing import BinaryIO, cast
+from typing import BinaryIO, Protocol, cast
 from urllib.parse import unquote
 
 import structlog
 
+from skyvern.constants import BROWSER_DOWNLOADING_SUFFIX
 from skyvern.forge import app
 from skyvern.forge.sdk.artifact.models import Artifact, ArtifactType, LogEntityType
 from skyvern.forge.sdk.artifact.signing import SENSITIVE_ARTIFACT_TYPES, SENSITIVE_ARTIFACT_URL_EXPIRY_SECONDS
@@ -167,19 +169,28 @@ async def presign_with_sensitive_cap(
     artifacts: list[Artifact],
     presign: Callable[[list[str]], Awaitable[list[str] | None]],
     presign_sensitive: Callable[[list[str]], Awaitable[list[str] | None]],
+    presign_download: Callable[[list[str]], Awaitable[list[str] | None]] | None = None,
 ) -> list[str] | None:
     """Batch-presign artifact URIs, routing screenshots/recordings through the
-    TTL-capped variant (SKY-12527). Order-preserving; None when any underlying
-    call fails, matching the clients' all-or-nothing batch contract.
+    TTL-capped variant (SKY-12527) and downloaded files through ``presign_download``
+    when given. Order-preserving; None when any underlying call fails, matching the
+    clients' all-or-nothing batch contract.
     """
-    sensitive = [i for i, artifact in enumerate(artifacts) if artifact.artifact_type in SENSITIVE_ARTIFACT_TYPES]
-    if not sensitive:
-        return await presign([artifact.uri for artifact in artifacts])
-    other = [i for i, artifact in enumerate(artifacts) if artifact.artifact_type not in SENSITIVE_ARTIFACT_TYPES]
+
+    def mint_for(artifact: Artifact) -> Callable[[list[str]], Awaitable[list[str] | None]]:
+        if artifact.artifact_type in SENSITIVE_ARTIFACT_TYPES:
+            return presign_sensitive
+        if presign_download is not None and artifact.artifact_type == ArtifactType.DOWNLOAD:
+            return presign_download
+        return presign
+
+    groups: dict[Callable[[list[str]], Awaitable[list[str] | None]], list[int]] = {}
+    for index, artifact in enumerate(artifacts):
+        groups.setdefault(mint_for(artifact), []).append(index)
+    if len(groups) <= 1:
+        return await next(iter(groups), presign)([artifact.uri for artifact in artifacts])
     urls: list[str | None] = [None] * len(artifacts)
-    for indices, mint in ((sensitive, presign_sensitive), (other, presign)):
-        if not indices:
-            continue
+    for mint, indices in groups.items():
         minted = await mint([artifacts[i].uri for i in indices])
         if minted is None:
             return None
@@ -303,7 +314,10 @@ async def _file_infos_from_download_artifacts(artifacts: list[Artifact]) -> list
     pre-existing import sites keep working without each having to thread the
     artifact_type through.
     """
-    return await _file_infos_from_artifacts(artifacts, artifact_type=ArtifactType.DOWNLOAD)
+    return await _file_infos_from_artifacts(
+        [a for a in artifacts if not artifact_filename_from_uri(a.uri).endswith(BROWSER_DOWNLOADING_SUFFIX)],
+        artifact_type=ArtifactType.DOWNLOAD,
+    )
 
 
 # TODO: This should be a part of the ArtifactType model
@@ -340,6 +354,44 @@ FILE_EXTENTSION_MAP: dict[ArtifactType, str] = {
     ArtifactType.STEP_ARCHIVE: "zip",
     ArtifactType.TASK_ARCHIVE: "zip",
 }
+
+
+@dataclass(frozen=True)
+class StoredObjectVersion:
+    size: int
+    # Pins a later ranged read to the version this size was taken from.
+    etag: str | None
+
+
+class StoredObjectStream(Protocol):
+    content_length: int
+
+    def iter_chunks(self, chunk_size: int) -> AsyncIterator[bytes]: ...
+
+    async def aclose(self) -> None: ...
+
+
+class StoredObjectChangedError(Exception):
+    """The stored object was replaced after it was sized for a ranged read."""
+
+
+class StreamingArtifactStorage(ABC):
+    """Storage that can serve an artifact's stored bytes in bounded chunks instead of one whole read."""
+
+    @abstractmethod
+    def can_stream_artifact(self, artifact: Artifact) -> bool:
+        """Whether the artifact's content is its stored bytes unchanged, with no decoding after the read."""
+
+    @abstractmethod
+    async def stat_artifact(self, artifact: Artifact) -> StoredObjectVersion | None:
+        """The stored object's size and version, or None when it cannot be read."""
+
+    @abstractmethod
+    async def open_artifact_stream(
+        self, artifact: Artifact, *, byte_range: tuple[int, int] | None = None, etag: str | None = None
+    ) -> StoredObjectStream | None:
+        """Open the stored bytes or their inclusive ``byte_range``, or return None when they cannot be read; with
+        ``etag``, raises ``StoredObjectChangedError`` once the stored object is no longer that version."""
 
 
 class BaseStorage(ABC):

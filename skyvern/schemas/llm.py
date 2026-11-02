@@ -96,9 +96,9 @@ class LLMConfig(LLMConfigBase):
     max_completion_tokens: int | None = None
     temperature: float | None = _DEFAULT_TEMPERATURE
     reasoning_effort: str | None = None
-    # When True, reasoning_effort is a deliberate per-config pin that the
-    # thinking-budget optimization leaves alone. Only honored on the generic branch;
-    # Gemini and Anthropic still apply their own thinking-budget shapes.
+    # When True, reasoning_effort is a deliberate per-config pin that the thinking-budget
+    # optimization leaves alone. Adaptive Claude honors it as its effort; Gemini and
+    # budget-based Anthropic still apply their own thinking budgets.
     pin_reasoning_effort: bool = False
 
     def __post_init__(self) -> None:
@@ -155,16 +155,13 @@ class LLMRouterConfig(LLMConfigBase):
     max_completion_tokens: int | None = None
     reasoning_effort: str | None = None
     temperature: float | None = _DEFAULT_TEMPERATURE
-    # When True, reasoning_effort is a deliberate per-config pin that the
-    # thinking-budget optimization leaves alone. Only honored on the generic branch;
-    # Gemini and Anthropic still apply their own thinking-budget shapes.
+    # When True, reasoning_effort is a deliberate per-config pin that the thinking-budget
+    # optimization leaves alone. Adaptive Claude honors it as its effort; Gemini and
+    # budget-based Anthropic still apply their own thinking budgets.
     # Appended last so no existing field's positional slot shifts.
     pin_reasoning_effort: bool = False
-    # A model group that only the handler's Gemini content-filter escape hatch dispatches to.
-    # Deliberately outside fallback_model_group: a Gemini-only chain cannot recover a
-    # content_filter block (every tier reproduces it), but adding a non-Gemini group to the
-    # chain would also change ordinary error failover and cost. Set it to name a filter-free
-    # group reachable only on that one path.
+    # The group a content_filter block is retried on, for routes whose next fallback is Gemini and reproduces the
+    # block. It may sit outside fallback_model_group, so that ordinary error failover and cost stay unchanged.
     content_filter_fallback_model_group: str | None = None
 
     def __post_init__(self) -> None:

@@ -35,6 +35,8 @@ async def test_register_credential_parameter_uses_db_totp_identifier(monkeypatch
             return {}
 
     class FakeCredentialItem:
+        login_sites = None
+
         def __init__(self) -> None:
             self.credential = FakeCredential()
 
@@ -57,6 +59,7 @@ async def test_register_credential_parameter_uses_db_totp_identifier(monkeypatch
         DATABASE=FakeDatabase(),
         CREDENTIAL_VAULT_SERVICES={CredentialVaultType.BITWARDEN: FakeCredentialService()},
         AGENT_FUNCTION=SimpleNamespace(
+            enforce_credential_use=AsyncMock(),
             parse_enterprise_totp_secret=AsyncMock(return_value=None),
             process_registered_credential_item=process_item,
         ),
@@ -102,6 +105,8 @@ async def _register_with_credential(
     )
 
     class FakeCredentialItem:
+        login_sites = None
+
         def __init__(self, cred: PasswordCredential) -> None:
             self.credential = cred
 
@@ -122,6 +127,7 @@ async def _register_with_credential(
         DATABASE=FakeDatabase(),
         CREDENTIAL_VAULT_SERVICES={CredentialVaultType.BITWARDEN: FakeCredentialService()},
         AGENT_FUNCTION=SimpleNamespace(
+            enforce_credential_use=AsyncMock(),
             parse_enterprise_totp_secret=AsyncMock(return_value=None),
             process_registered_credential_item=process_item,
         ),

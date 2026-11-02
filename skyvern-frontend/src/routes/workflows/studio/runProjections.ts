@@ -178,6 +178,24 @@ export function runErrorRows(
   return rows;
 }
 
+export type RunErrorCode = { code: string; message: string | null };
+
+// The Overview's failure line names each code once, keeping the first message
+// that carried it as the hover. Built on runErrorRows so the line and
+// Outputs → Errors can't disagree on which codes a run has.
+export function runErrorCodes(
+  errors: Array<Record<string, unknown>>,
+): RunErrorCode[] {
+  const byCode = new Map<string, string | null>();
+  for (const row of runErrorRows(errors)) {
+    if (!row.code || byCode.has(row.code)) {
+      continue;
+    }
+    byCode.set(row.code, row.message);
+  }
+  return Array.from(byCode, ([code, message]) => ({ code, message }));
+}
+
 function nonEmptyString(value: unknown): boolean {
   return typeof value === "string" && value.trim() !== "";
 }
@@ -362,6 +380,7 @@ export function resolveLandingSelectionId(
 }
 
 export type BlockRunState = {
+  block: WorkflowRunBlock;
   status: Status | null;
   actionCount: number;
   failureReason: string | null;
@@ -374,25 +393,32 @@ export type BlockRunState = {
  */
 export function buildBlockStatusMap(
   timeline: WorkflowRunTimelineItem[] | undefined,
+  workflowRunId?: string,
 ): Record<string, BlockRunState> {
-  const byLabel: Record<string, BlockRunState> = {};
+  const byLabel: Record<string, BlockRunState> = Object.create(null);
 
+  const add = (block: WorkflowRunBlock) => {
+    // Timeline rows are newest-first; keep the first occurrence in the selected run.
+    if (
+      block.label &&
+      (!workflowRunId || block.workflow_run_id === workflowRunId) &&
+      !byLabel[block.label]
+    )
+      byLabel[block.label] = {
+        block,
+        status: block.status,
+        actionCount: block.actions?.length ?? 0,
+        failureReason: block.failure_reason,
+        duration: block.duration,
+      };
+  };
   const walk = (items: WorkflowRunTimelineItem[]): void => {
     for (const item of items) {
       if (isBlockItem(item)) {
-        const block = item.block;
-        if (block.label) {
-          byLabel[block.label] = {
-            status: block.status,
-            actionCount: block.actions?.length ?? 0,
-            failureReason: block.failure_reason,
-            duration: block.duration,
-          };
-        }
+        add(item.block);
+        item.task_v2_blocks?.forEach(add);
       }
-      if (item.children.length > 0) {
-        walk(item.children);
-      }
+      walk(item.children);
     }
   };
 

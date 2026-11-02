@@ -2,14 +2,69 @@ from __future__ import annotations
 
 from typing import Literal
 
-from sqlalchemy import func, select, update
+from sqlalchemy import String, func, literal, select, true, update
+from sqlalchemy.dialects.postgresql import ARRAY
+from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.sql import ColumnElement, Select
 
 from skyvern.forge.sdk.db._error_handling import db_operation
 from skyvern.forge.sdk.db.base_repository import BaseRepository
 from skyvern.forge.sdk.db.datetime_utils import naive_utc_now
-from skyvern.forge.sdk.db.models import HealEpisodeModel, WorkflowHealProposalModel, WorkflowRunModel
+from skyvern.forge.sdk.db.models import HealEpisodeModel, WorkflowHealProposalModel, WorkflowModel, WorkflowRunModel
 from skyvern.forge.sdk.utils.sanitization import sanitize_postgres_text
 from skyvern.schemas.self_heal import HealEpisode, HealSkipReason, HealStatus, OutputObligation, WorkflowHealProposal
+
+_TERMINAL_WORKFLOW_RUN_STATUSES = ("completed", "failed", "terminated", "timed_out")
+
+
+def _recent_terminal_runs_select(
+    organization_id: str,
+    workflow_permanent_id: str | ColumnElement[str],
+    limit: int,
+) -> Select:
+    return (
+        select(WorkflowRunModel.workflow_run_id, WorkflowRunModel.created_at)
+        .where(
+            WorkflowRunModel.organization_id == organization_id,
+            WorkflowRunModel.workflow_permanent_id == workflow_permanent_id,
+            WorkflowRunModel.status.in_(_TERMINAL_WORKFLOW_RUN_STATUSES),
+            WorkflowRunModel.parent_workflow_run_id.is_(None),
+            WorkflowRunModel.copilot_session_id.is_(None),
+            WorkflowRunModel.debug_session_id.is_(None),
+        )
+        .order_by(WorkflowRunModel.created_at.desc(), WorkflowRunModel.workflow_run_id.desc())
+        .limit(limit)
+    )
+
+
+def _recent_terminal_runs_lateral(organization_id: str, workflow_permanent_ids: list[str], limit: int) -> Select:
+    """Run a backward index walk per listed workflow, with a limit on returned rows."""
+    keys = (
+        func.unnest(literal(workflow_permanent_ids, ARRAY(String)))
+        .table_valued("workflow_permanent_id", name="reliability_wpids")
+        .render_derived(name="reliability_wpids")
+    )
+    owned_keys = (
+        select(keys.c.workflow_permanent_id)
+        .where(
+            select(1)
+            .select_from(WorkflowModel)
+            .where(
+                WorkflowModel.organization_id == organization_id,
+                WorkflowModel.workflow_permanent_id == keys.c.workflow_permanent_id,
+            )
+            .exists()
+        )
+        .subquery("owned_reliability_wpids")
+    )
+    recent = _recent_terminal_runs_select(organization_id, owned_keys.c.workflow_permanent_id, limit).lateral(
+        "recent_runs"
+    )
+    return (
+        select(owned_keys.c.workflow_permanent_id, recent.c.workflow_run_id)
+        .select_from(owned_keys.join(recent, true()))
+        .order_by(owned_keys.c.workflow_permanent_id, recent.c.created_at.desc(), recent.c.workflow_run_id.desc())
+    )
 
 
 class SelfHealRepository(BaseRepository):
@@ -143,6 +198,20 @@ class SelfHealRepository(BaseRepository):
             ).all()
             return [HealEpisode.model_validate(episode) for episode in episodes]
 
+    @staticmethod
+    def _bounded_reliability_limit(limit: int) -> int:
+        return max(1, min(limit, 100))
+
+    @staticmethod
+    async def _recent_terminal_run_ids(
+        session: AsyncSession,
+        organization_id: str,
+        workflow_permanent_id: str,
+        bounded_limit: int,
+    ) -> list[str]:
+        query = _recent_terminal_runs_select(organization_id, workflow_permanent_id, bounded_limit)
+        return [row.workflow_run_id for row in (await session.execute(query)).all()]
+
     @db_operation("get_recent_terminal_workflow_run_ids")
     async def get_recent_terminal_workflow_run_ids(
         self,
@@ -150,23 +219,13 @@ class SelfHealRepository(BaseRepository):
         workflow_permanent_id: str,
         limit: int = 20,
     ) -> list[str]:
-        terminal_statuses = ("completed", "failed", "terminated", "timed_out")
-        bounded_limit = max(1, min(limit, 100))
         async with self.Session() as session:
-            query = (
-                select(WorkflowRunModel.workflow_run_id)
-                .where(
-                    WorkflowRunModel.organization_id == organization_id,
-                    WorkflowRunModel.workflow_permanent_id == workflow_permanent_id,
-                    WorkflowRunModel.status.in_(terminal_statuses),
-                    WorkflowRunModel.parent_workflow_run_id.is_(None),
-                    WorkflowRunModel.copilot_session_id.is_(None),
-                    WorkflowRunModel.debug_session_id.is_(None),
-                )
-                .order_by(WorkflowRunModel.created_at.desc(), WorkflowRunModel.workflow_run_id.desc())
-                .limit(bounded_limit)
+            return await self._recent_terminal_run_ids(
+                session,
+                organization_id,
+                workflow_permanent_id,
+                self._bounded_reliability_limit(limit),
             )
-            return list((await session.scalars(query)).all())
 
     @db_operation("get_recent_terminal_workflow_run_ids_batch")
     async def get_recent_terminal_workflow_run_ids_batch(
@@ -176,40 +235,19 @@ class SelfHealRepository(BaseRepository):
         limit: int = 20,
     ) -> dict[str, list[str]]:
         result: dict[str, list[str]] = {wpid: [] for wpid in workflow_permanent_ids}
-        if not workflow_permanent_ids:
+        if not result:
             return result
-        terminal_statuses = ("completed", "failed", "terminated", "timed_out")
-        bounded_limit = max(1, min(limit, 100))
-        row_number = (
-            func.row_number()
-            .over(
-                partition_by=WorkflowRunModel.workflow_permanent_id,
-                order_by=(WorkflowRunModel.created_at.desc(), WorkflowRunModel.workflow_run_id.desc()),
-            )
-            .label("rn")
-        )
-        subquery = (
-            select(
-                WorkflowRunModel.workflow_run_id,
-                WorkflowRunModel.workflow_permanent_id,
-                row_number,
-            )
-            .where(
-                WorkflowRunModel.organization_id == organization_id,
-                WorkflowRunModel.workflow_permanent_id.in_(workflow_permanent_ids),
-                WorkflowRunModel.status.in_(terminal_statuses),
-                WorkflowRunModel.parent_workflow_run_id.is_(None),
-                WorkflowRunModel.copilot_session_id.is_(None),
-                WorkflowRunModel.debug_session_id.is_(None),
-            )
-            .subquery()
-        )
+        bounded_limit = self._bounded_reliability_limit(limit)
         async with self.Session() as session:
-            query = (
-                select(subquery.c.workflow_permanent_id, subquery.c.workflow_run_id)
-                .where(subquery.c.rn <= bounded_limit)
-                .order_by(subquery.c.workflow_permanent_id, subquery.c.rn)
-            )
+            if session.get_bind().dialect.name not in {"postgresql", "postgres"}:
+                # LATERAL is Postgres-only; embedded SQLite takes the same bounded walk one
+                # workflow at a time.
+                for workflow_permanent_id in result:
+                    result[workflow_permanent_id] = await self._recent_terminal_run_ids(
+                        session, organization_id, workflow_permanent_id, bounded_limit
+                    )
+                return result
+            query = _recent_terminal_runs_lateral(organization_id, list(result), bounded_limit)
             rows = (await session.execute(query)).all()
         for workflow_permanent_id, workflow_run_id in rows:
             result[workflow_permanent_id].append(workflow_run_id)

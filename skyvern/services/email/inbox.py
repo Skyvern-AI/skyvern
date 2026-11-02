@@ -28,6 +28,7 @@ async def list_folder_messages(
     newer_than_days: int | None,
     max_results: int,
     include_body: bool,
+    include_attachments: bool = False,
     client: httpx.AsyncClient | None = None,
 ) -> list[EmailMessage]:
     if email_client == "gmail":
@@ -39,6 +40,7 @@ async def list_folder_messages(
             newer_than_days=newer_than_days,
             max_results=max_results,
             include_body=include_body,
+            include_attachments=include_attachments,
             client=client,
         )
     if email_client == "outlook":
@@ -50,6 +52,35 @@ async def list_folder_messages(
             newer_than_days=newer_than_days,
             max_results=max_results,
             include_body=include_body,
+            include_attachments=include_attachments,
+            client=client,
+        )
+    raise ValueError(f"Unsupported email_client: {email_client}")
+
+
+async def download_attachment(
+    *,
+    email_client: str,
+    access_token: str,
+    message_id: str,
+    attachment_id: str,
+    max_size_bytes: int,
+    client: httpx.AsyncClient | None = None,
+) -> bytes:
+    if email_client == "gmail":
+        return await gmail.download_attachment(
+            access_token=access_token,
+            message_id=message_id,
+            attachment_id=attachment_id,
+            max_size_bytes=max_size_bytes,
+            client=client,
+        )
+    if email_client == "outlook":
+        return await outlook.download_attachment(
+            access_token=access_token,
+            message_id=message_id,
+            attachment_id=attachment_id,
+            max_size_bytes=max_size_bytes,
             client=client,
         )
     raise ValueError(f"Unsupported email_client: {email_client}")

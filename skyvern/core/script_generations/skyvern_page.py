@@ -286,6 +286,10 @@ class SkyvernPage(Page):
             return ResolvedSensitiveValue(totp_code[digit_index])
         return ""
 
+    def _raise_if_browser_connection_lost(self) -> None:
+        # Only a run-bound page knows its run's browser; a standalone library page has no loss to observe.
+        return None
+
     @staticmethod
     def _track_ai_call() -> None:
         """Increment the script LLM call counter for cost-cap tracking."""
@@ -346,6 +350,7 @@ class SkyvernPage(Page):
                         retry_interval=retry_interval,
                     )
                     await asyncio.sleep(retry_interval)
+                    self._raise_if_browser_connection_lost()
                     # Re-acquire locator in case the DOM was replaced entirely
                     locator = self._locator_scope.locator(selector).first
                 else:
@@ -511,6 +516,7 @@ class SkyvernPage(Page):
                 except StaleFrameSelectionError:
                     raise
                 except Exception as e:
+                    self._raise_if_browser_connection_lost()
                     if is_post_dispatch_click_timeout(e, self.engine_selection):
                         LOG.info(
                             "CSS selector click dispatched; navigation-wait timed out — skipping fallback",
@@ -533,6 +539,7 @@ class SkyvernPage(Page):
                         try:
                             await self.page.keyboard.press("Escape")
                             await asyncio.sleep(0.3)
+                            self._raise_if_browser_connection_lost()
                             locator = self._locator_scope.locator(selector).first
                             # The primary click may have dispatched and reached the desired state
                             # before raising, in which case retrying would toggle it back off.
@@ -545,6 +552,7 @@ class SkyvernPage(Page):
                             )
                             return selector
                         except Exception as retry_error:
+                            self._raise_if_browser_connection_lost()
                             if is_post_dispatch_click_timeout(retry_error, self.engine_selection):
                                 LOG.info(
                                     "CSS selector click dispatched after dismissing overlay; "
@@ -605,7 +613,17 @@ class SkyvernPage(Page):
         intention: str | None = None,
         **kwargs: Any,
     ) -> str:
-        """Move the mouse over the element identified by `selector`."""
+        """Move the mouse over the element identified by `selector`.
+
+        Args:
+            selector: CSS selector for the element.
+            timeout: Maximum time to wait for the element, in milliseconds.
+            hold_seconds: How long to keep the mouse over the element, in seconds.
+            intention: Description of why you are hovering, recorded with the action.
+
+        Returns:
+            The selector that was hovered.
+        """
         if not selector:
             raise ValueError("Hover requires a selector.")
 
@@ -796,6 +814,23 @@ class SkyvernPage(Page):
         _skip_element_prep: bool = False,
         **kwargs: Any,
     ) -> str:
+        """Enter text into an input using a selector, AI, or both. Behaves the same as `fill`.
+
+        With a selector, the value is set in one step (Playwright's `fill`), not typed key by key. For inputs
+        that need real key events, use `fill_autocomplete`, `keypress`, or `press_sequentially` on a Playwright locator.
+
+        Args:
+            selector: CSS selector for the input.
+            value: The text to enter.
+            ai: AI behavior mode. Defaults to "fallback", which tries the selector first, then AI.
+            prompt: Natural language description of which input to type into.
+            totp_identifier: Identifier of the 2FA code to type, when `value` is a TOTP placeholder.
+            totp_url: URL Skyvern calls to fetch the 2FA code, when `value` is a TOTP placeholder.
+            **kwargs: Playwright options such as `timeout`.
+
+        Returns:
+            The value that was entered.
+        """
         # Backward compatibility
         intention = kwargs.pop("intention", None)
         if intention is not None and prompt is None:
@@ -1308,6 +1343,19 @@ class SkyvernPage(Page):
         ai: str | None = "fallback",
         **kwargs: Any,
     ) -> str:
+        """Upload a file to a file input, using a selector, AI, or both.
+
+        Args:
+            selector: CSS selector for the file input.
+            files: URL of the file to upload. One file per call.
+            prompt: Natural language description of which file input to use.
+            ai: AI behavior mode. With the default "fallback", a selector-only call uploads through the
+                selector. When a prompt is passed, the selector is tried first and AI then always runs the
+                upload, using the selector only if it worked.
+
+        Returns:
+            The file URL that was uploaded.
+        """
         # Backward compatibility
         intention = kwargs.pop("intention", None)
         if intention is not None and prompt is None:
@@ -1498,6 +1546,11 @@ class SkyvernPage(Page):
         seconds: float | None = None,
         **kwargs: Any,
     ) -> None:
+        """Pause the script for a fixed time, recorded as a wait action.
+
+        Args:
+            seconds: How long to wait, in seconds.
+        """
         timeout_ms = kwargs.pop("timeout_ms", None)
         if seconds is not None:
             await asyncio.sleep(seconds)
@@ -1568,6 +1621,7 @@ class SkyvernPage(Page):
 
     @action_wrap(ActionType.RELOAD_PAGE)
     async def reload_page(self, **kwargs: Any) -> None:
+        """Reload the current page, recorded as an action."""
         await self.page.reload(**kwargs)
         return
 
@@ -1633,7 +1687,7 @@ class SkyvernPage(Page):
         Args:
             prompt: Validation criteria or condition to check
             model: Optional model configuration. Can be either:
-                   - A dict with model configuration (e.g., {"model_name": "gemini-2.5-flash-lite", "max_tokens": 2048})
+                   - A dict with model configuration (e.g., {"model_name": "gemini-3.0-flash", "max_tokens": 2048})
                    - A string with just the model name (e.g., "gpt-4")
 
         Returns:
@@ -1647,13 +1701,13 @@ class SkyvernPage(Page):
             # Validation with specific model (as string)
             is_valid = await page.validate(
                 "Check if the order was placed",
-                model="gemini-2.5-flash-lite"
+                model="gemini-3.0-flash"
             )
 
             # Validation with model config (as dict)
             is_valid = await page.validate(
                 "Check if the payment completed",
-                model={"model_name": "gemini-2.5-flash-lite", "max_tokens": 1024}
+                model={"model_name": "gemini-3.0-flash", "max_tokens": 1024}
             )
             ```
         """
@@ -1871,6 +1925,7 @@ class SkyvernPage(Page):
             return True
 
         for idx, value in sorted(mapping.items()):
+            self._raise_if_browser_connection_lost()
             if idx >= len(form_fields) or value is None:
                 continue
             totp_placeholder = value if isinstance(value, str) and is_unresolved_totp_value(value) else None
@@ -2156,6 +2211,7 @@ class SkyvernPage(Page):
                             break
                     if uploaded:
                         break
+        self._raise_if_browser_connection_lost()
 
     async def validate_mapping(
         self,
@@ -2359,6 +2415,7 @@ class SkyvernPage(Page):
             if page_num > 0:
                 await asyncio.sleep(1)
 
+            self._raise_if_browser_connection_lost()
             form_fields = await self.extract_form_fields()
 
             # Filter to fillable fields — includes standard inputs AND custom widgets
@@ -2556,6 +2613,7 @@ class SkyvernPage(Page):
             except Exception:
                 pass
 
+        self._raise_if_browser_connection_lost()
         elapsed = time.monotonic() - start_time
         LOG.info(
             "fill_multipage_form: completed",
@@ -3638,8 +3696,8 @@ class SkyvernPage(Page):
             schema: Optional JSON schema to structure the response. If provided, the LLM response
                    will be validated against this schema.
             model: Optional model configuration. Can be either:
-                   - A dict with model configuration (e.g., {"model_name": "gemini-2.5-flash-lite", "max_tokens": 2048})
-                   - A string with just the model name (e.g., "gemini-2.5-flash-lite")
+                   - A dict with model configuration (e.g., {"model_name": "gemini-3.0-flash", "max_tokens": 2048})
+                   - A string with just the model name (e.g., "gemini-3.0-flash")
 
         Returns:
             LLM response structured according to the schema if provided, or unstructured response otherwise.
@@ -3797,6 +3855,12 @@ class SkyvernPage(Page):
         scroll_y: int,
         **kwargs: Any,
     ) -> None:
+        """Scroll the page by a number of pixels.
+
+        Args:
+            scroll_x: Pixels to scroll horizontally (negative scrolls left).
+            scroll_y: Pixels to scroll vertically (negative scrolls up).
+        """
         await self.page.evaluate(f"window.scrollBy({scroll_x}, {scroll_y})")
 
     @action_wrap(ActionType.KEYPRESS)
@@ -3807,6 +3871,13 @@ class SkyvernPage(Page):
         duration: float = 0,
         **kwargs: Any,
     ) -> None:
+        """Press one or more keys, such as `["Enter"]` or `["Control", "a"]`.
+
+        Args:
+            keys: Keys to press, using Playwright key names.
+            hold: Hold the keys down for `duration` seconds instead of tapping them.
+            duration: How long to hold the keys, in seconds, when `hold` is true.
+        """
         await handler_utils.keypress(self.page, keys, hold=hold, duration=duration)
 
     @action_wrap(ActionType.MOVE)
@@ -3816,6 +3887,12 @@ class SkyvernPage(Page):
         y: int,
         **kwargs: Any,
     ) -> None:
+        """Move the mouse cursor to a point on the page.
+
+        Args:
+            x: Horizontal position in pixels from the left of the viewport.
+            y: Vertical position in pixels from the top of the viewport.
+        """
         await EventStrategyFactory.move_cursor(self.page, x, y)
 
     @action_wrap(ActionType.DRAG)
@@ -3826,6 +3903,13 @@ class SkyvernPage(Page):
         path: list[tuple[int, int]],
         **kwargs: Any,
     ) -> None:
+        """Drag with the mouse from a start point along a path of points.
+
+        Args:
+            start_x: Horizontal start position in pixels.
+            start_y: Vertical start position in pixels.
+            path: Points `(x, y)` to drag through, ending where the mouse is released.
+        """
         await handler_utils.drag(self.page, start_x, start_y, path)
 
     @action_wrap(ActionType.LEFT_MOUSE)

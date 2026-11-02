@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+import base64
 from datetime import datetime, timedelta, timezone
 from typing import Any
+from unittest.mock import AsyncMock
 
 import httpx
 import pytest
@@ -177,6 +179,130 @@ async def test_gmail_list_folder_messages_uses_escaped_query(monkeypatch: pytest
     assert 'subject:a" OR b' not in captured_query
     assert messages[0].has_attachments is None
     assert messages[0].web_link == "https://mail.google.com/mail/u/0/#all/thread_1"
+
+
+@pytest.mark.asyncio
+async def test_gmail_list_fetches_attachments_without_email_body(monkeypatch: pytest.MonkeyPatch) -> None:
+    calls: list[tuple[str, dict[str, Any] | None]] = []
+
+    async def fake_get_json(
+        client: httpx.AsyncClient,
+        url: str,
+        *,
+        access_token: str,
+        params: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        del client, access_token
+        calls.append((url, params))
+        if url.endswith("/users/me/messages"):
+            return {"messages": [{"id": "msg_1"}]}
+        return {
+            "id": "msg_1",
+            "payload": {
+                "headers": [],
+                "parts": [
+                    {
+                        "filename": "sample.pdf",
+                        "mimeType": "application/pdf",
+                        "body": {"attachmentId": "att_1", "size": 4},
+                    }
+                ],
+            },
+        }
+
+    monkeypatch.setattr(email.gmail, "get_json", fake_get_json)
+
+    messages = await email.gmail.list_folder_messages(access_token="AT", include_body=False, include_attachments=True)
+
+    assert calls[1][1] == {"format": "full"}
+    assert messages[0].body_text == ""
+    assert messages[0].has_attachments is True
+    assert messages[0].attachments[0].attachment_id == "att_1"
+    assert "is_inline" not in messages[0].attachments[0].model_dump(mode="json")
+
+
+@pytest.mark.asyncio
+async def test_gmail_list_attachment_auth_failure_requires_reconnect(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(
+        email.gmail,
+        "get_json",
+        AsyncMock(side_effect=email.GmailAPIError(status=401, code=None, message="private provider text")),
+    )
+
+    with pytest.raises(email.GmailAPIError) as exc_info:
+        await email.gmail.list_folder_messages(access_token="AT", include_body=False, include_attachments=True)
+
+    assert exc_info.value.code == "reconnect_required"
+    assert exc_info.value.message == "Gmail attachment access requires reconnecting"
+
+
+def test_gmail_attachment_parser_marks_inline_and_content_id_parts() -> None:
+    parsed = email.gmail._attachments(
+        {
+            "parts": [
+                {
+                    "filename": "logo.png",
+                    "body": {"attachmentId": "inline"},
+                    "headers": [{"name": "Content-Disposition", "value": "inline"}],
+                },
+                {
+                    "filename": "image.png",
+                    "body": {"attachmentId": "cid"},
+                    "headers": [{"name": "Content-ID", "value": "<image-1>"}],
+                },
+                {
+                    "filename": "statement.pdf",
+                    "body": {"attachmentId": "attached-with-cid"},
+                    "headers": [
+                        {"name": "Content-Disposition", "value": 'attachment; filename="statement.pdf"'},
+                        {"name": "Content-ID", "value": "<statement@example.com>"},
+                    ],
+                },
+                {"filename": "invoice.pdf", "body": {"attachmentId": "file"}},
+                {"filename": "small.txt", "body": {"data": "aGk", "size": 2}},
+                {
+                    "filename": "",
+                    "body": {"attachmentId": "unnamed"},
+                    "headers": [{"name": "Content-Disposition", "value": "attachment"}],
+                },
+                {"filename": "", "mimeType": "text/plain", "body": {"data": "Ym9keQ"}},
+            ]
+        }
+    )
+
+    assert [attachment.is_inline for attachment in parsed] == [True, True, False, False, False, False]
+    assert parsed[-1].name == "attachment"
+    assert email.gmail.decode_attachment_data(parsed[4].embedded_data or "") == b"hi"
+
+
+@pytest.mark.asyncio
+async def test_gmail_download_attachment_decodes_binary_data(monkeypatch: pytest.MonkeyPatch) -> None:
+    synthetic_bytes = b"\x00\xfffixture"
+    encoded = base64.urlsafe_b64encode(synthetic_bytes).decode().rstrip("=")
+    get_json = AsyncMock(return_value={"data": encoded})
+    monkeypatch.setattr(email.gmail, "get_json", get_json)
+
+    async with httpx.AsyncClient() as client:
+        actual_bytes = await email.gmail.download_attachment(
+            access_token="AT",
+            message_id="msg_1",
+            attachment_id="att_1",
+            max_size_bytes=32,
+            client=client,
+        )
+
+    assert actual_bytes == synthetic_bytes
+    assert get_json.await_args.args[1].endswith("/messages/msg_1/attachments/att_1")
+
+
+@pytest.mark.asyncio
+async def test_gmail_download_attachment_rejects_invalid_payload(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(email.gmail, "get_json", AsyncMock(return_value=[]))
+
+    with pytest.raises(email.GmailAPIError) as exc_info:
+        await email.gmail.download_attachment(access_token="AT", message_id="msg_1", attachment_id="att_1")
+
+    assert exc_info.value.code == "invalid_attachment"
 
 
 @pytest.mark.asyncio
@@ -1417,9 +1543,13 @@ async def test_outlook_attachments_follow_next_link(monkeypatch: pytest.MonkeyPa
         del client, access_token
         calls.append((url, params))
         if url == next_link:
-            return {"value": [{"id": "att_2", "name": "b.pdf", "contentType": "application/pdf", "size": 2}]}
+            return {
+                "value": [
+                    {"id": "att_2", "name": "b.pdf", "contentType": "application/pdf", "size": 2, "isInline": True}
+                ]
+            }
         return {
-            "value": [{"id": "att_1", "name": "a.pdf", "contentType": "application/pdf", "size": 1}],
+            "value": [{"id": "att_1", "name": "a.pdf", "contentType": "application/pdf", "size": 1, "isInline": False}],
             "@odata.nextLink": next_link,
         }
 
@@ -1428,8 +1558,47 @@ async def test_outlook_attachments_follow_next_link(monkeypatch: pytest.MonkeyPa
     attachments = await email.outlook._attachments(httpx.AsyncClient(), access_token="AT", message_id="msg_1")
 
     assert [attachment.name for attachment in attachments] == ["a.pdf", "b.pdf"]
-    assert calls[0][1] == {"$select": "id,name,contentType,size"}
+    assert [attachment.is_inline for attachment in attachments] == [False, True]
+    assert calls[0][1] == {"$select": "id,name,contentType,size,isInline"}
     assert calls[1] == (next_link, None)
+
+    monkeypatch.setattr(email.outlook, "_MAX_ATTACHMENT_PAGES", 1)
+    partial = await email.outlook._attachments(httpx.AsyncClient(), access_token="AT", message_id="msg_1")
+    assert [attachment.name for attachment in partial] == ["a.pdf"]
+    with pytest.raises(email.OutlookAPIError) as exc_info:
+        await email.outlook._attachments(httpx.AsyncClient(), access_token="AT", message_id="msg_1", raise_errors=True)
+    assert exc_info.value.code == "attachment_list_truncated"
+
+
+@pytest.mark.asyncio
+async def test_outlook_download_attachment_streams_synthetic_bytes_and_enforces_limit() -> None:
+    synthetic_bytes = b"synthetic attachment"
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        assert request.url.path.endswith("/messages/msg_1/attachments/att_1/$value")
+        return httpx.Response(200, content=synthetic_bytes)
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        actual_bytes = await email.outlook.download_attachment(
+            access_token="AT",
+            message_id="msg_1",
+            attachment_id="att_1",
+            max_size_bytes=64,
+            client=client,
+        )
+
+    assert actual_bytes == synthetic_bytes
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        with pytest.raises(email.OutlookAPIError) as exc_info:
+            await email.outlook.download_attachment(
+                access_token="AT",
+                message_id="msg_1",
+                attachment_id="att_1",
+                max_size_bytes=4,
+                client=client,
+            )
+    assert exc_info.value.code == "file_size_limit"
 
 
 @pytest.mark.asyncio
@@ -1456,6 +1625,9 @@ async def test_outlook_attachments_reject_untrusted_next_link(monkeypatch: pytes
 
     assert [attachment.name for attachment in attachments] == ["a.pdf"]
     assert len(calls) == 1
+    with pytest.raises(email.OutlookAPIError) as exc_info:
+        await email.outlook._attachments(httpx.AsyncClient(), access_token="AT", message_id="msg_1", raise_errors=True)
+    assert exc_info.value.code == "attachment_list_truncated"
 
 
 @pytest.mark.asyncio
@@ -1530,3 +1702,10 @@ async def test_outlook_list_folder_messages_keeps_message_when_attachment_fetch_
     assert attachment_calls == 3
     assert [message.id for message in messages] == ["msg_1"]
     assert messages[0].attachments == []
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        requested = await email.outlook.list_folder_messages(
+            access_token="AT", include_body=False, include_attachments=True, client=client
+        )
+    assert messages[0].attachment_list_error is None
+    assert requested[0].attachment_list_error == "ServiceUnavailable"

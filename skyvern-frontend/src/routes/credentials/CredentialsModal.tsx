@@ -80,6 +80,7 @@ import { Label } from "@/components/ui/label";
 import { Textarea } from "@/components/ui/textarea";
 import { getHostname } from "@/util/getHostname";
 import { useCustomCredentialServiceConfig } from "@/hooks/useCustomCredentialServiceConfig";
+import { useHasCapability, usePageSlots } from "@/store/PageSlots";
 import { getAuthenticatorKeyError } from "./credentialTotpValidation";
 import {
   getAuthenticatorSaveError,
@@ -321,9 +322,52 @@ function CredentialsModal({
     type: urlType,
     setIsOpen: setUrlIsOpen,
   } = useCredentialModalState();
-  const { parsedConfig: customCredentialServiceConfig } =
+  const { isConfigured: hasCustomCredentialService } =
     useCustomCredentialServiceConfig();
-  const hasCustomCredentialService = !!customCredentialServiceConfig;
+  const canDeleteCredentials = useHasCapability("credential.delete");
+  const { permissions } = usePageSlots();
+  const useTemporaryCredentialCleanup =
+    permissions?.status === "ready" && !canDeleteCredentials;
+  const retryTemporaryCleanupAfterForbidden =
+    permissions?.status === "loading" || permissions?.status === "error";
+  const cleanupTestCredential = useCallback(
+    async (credentialId: string) => {
+      const client = await getClient(credentialGetter);
+      try {
+        await client.delete(
+          `/credentials/${credentialId}${useTemporaryCredentialCleanup ? "/temporary" : ""}`,
+        );
+      } catch (error) {
+        let cleanupError = error;
+        if (
+          retryTemporaryCleanupAfterForbidden &&
+          error instanceof AxiosError &&
+          error.response?.status === 403
+        ) {
+          try {
+            await client.delete(`/credentials/${credentialId}/temporary`);
+            return;
+          } catch (fallbackError) {
+            cleanupError = fallbackError;
+          }
+        }
+        if (
+          cleanupError instanceof AxiosError &&
+          cleanupError.response?.status === 404
+        ) {
+          console.warn(
+            "Credential cleanup returned 404; it may already be gone or no longer be eligible for cleanup.",
+          );
+        }
+        throw cleanupError;
+      }
+    },
+    [
+      credentialGetter,
+      retryTemporaryCleanupAfterForbidden,
+      useTemporaryCredentialCleanup,
+    ],
+  );
   const [vaultType, setVaultType] = useState<"default" | "custom">("default");
   const { additionalTwoFactorMethods = [] } =
     useCredentialAuthenticatorSupport();
@@ -354,6 +398,7 @@ function CredentialsModal({
     values: false,
   });
   const [noPassword, setNoPassword] = useState(false);
+  const [forwardingActionPending, setForwardingActionPending] = useState(false);
   // Inline authenticator setup error returned by the backend when it rejects a
   // decoded QR value or pasted key. Cleared whenever the user edits the key.
   const [authenticatorSaveError, setAuthenticatorSaveError] =
@@ -379,6 +424,14 @@ function CredentialsModal({
     },
     [],
   );
+
+  const handleForwardingAddressChange = useCallback((identifier: string) => {
+    setPasswordCredentialValues((prev) => ({
+      ...prev,
+      totp_type: "email",
+      totp_identifier: identifier,
+    }));
+  }, []);
 
   const handleNoPasswordChange = useCallback((checked: boolean) => {
     setNoPassword(checked);
@@ -484,6 +537,14 @@ function CredentialsModal({
   const attachAgentCount = attachUsage?.workflows?.length ?? 0;
   // Test & Save Browser Profile state
   const [testAndSave, setTestAndSave] = useState(false);
+  // An already-saved profile ticks the box even without the intent flag, so both
+  // form initialization and change detection must read it from here; comparing
+  // the checkbox against the raw flag would make every bare Update on such a
+  // credential issue a no-op PATCH.
+  const savedBrowserSessionIntent = Boolean(
+    editingCredential?.save_browser_session_intent ||
+    editingCredential?.browser_profile_id,
+  );
   const [testUrl, setTestUrl] = useState("");
   const [userContext, setUserContext] = useState("");
   const [pinResidentialIspProxy, setPinResidentialIspProxy] = useState(false);
@@ -633,17 +694,15 @@ function CredentialsModal({
     if (testStatus === "completed" || testStatus === "profile_failed") {
       const staleCredId = testCredentialIdRef.current;
       if (staleCredId) {
-        getClient(credentialGetter)
-          .then((client) => client.delete(`/credentials/${staleCredId}`))
-          .catch(() => {
-            // Best-effort cleanup
-          });
+        cleanupTestCredential(staleCredId).catch(() => {
+          // Best-effort cleanup
+        });
       }
       setTestStatus("idle");
       setTestCredentialId(null);
       testCredentialIdRef.current = null;
     }
-    // eslint-disable-next-line react-hooks/exhaustive-deps -- only react to login-affecting field changes, not testStatus, name, or userContext (context is cosmetic, not credential identity)
+    // eslint-disable-next-line react-hooks/exhaustive-deps -- permission changes update the route, not credential identity; only login changes invalidate a completed test
   }, [
     passwordCredentialValues.username,
     passwordCredentialValues.password,
@@ -677,10 +736,7 @@ function CredentialsModal({
       if (editingCredential.tested_url) {
         setTestUrl(editingCredential.tested_url);
       }
-      if (
-        editingCredential.save_browser_session_intent ||
-        !!editingCredential.browser_profile_id
-      ) {
+      if (savedBrowserSessionIntent) {
         setTestAndSave(true);
       }
       setBrowserProfileId(editingCredential.browser_profile_id ?? null);
@@ -1003,8 +1059,17 @@ function CredentialsModal({
 
   const createCredentialMutation = useMutation({
     mutationFn: async (request: CreateCredentialRequest) => {
-      const client = await getClient(credentialGetter);
-      const response = await client.post("/credentials", request);
+      const isPasskeySetup =
+        "totp_type" in request.credential &&
+        request.credential.totp_type === "passkey";
+      const client = await getClient(
+        credentialGetter,
+        isPasskeySetup ? "sans-api-v1" : "v1",
+      );
+      const response = await client.post(
+        isPasskeySetup ? "/credentials/passkey/setup" : "/credentials",
+        request,
+      );
       return response.data;
     },
     onSuccess: async (data) => {
@@ -1037,8 +1102,7 @@ function CredentialsModal({
         // The 2FA type is already persisted; roll the credential back rather than strand a passkey with no material.
         let rollbackSucceeded = true;
         try {
-          const client = await getClient(credentialGetter);
-          await client.delete(`/credentials/${data.credential_id}`);
+          await cleanupTestCredential(data.credential_id);
         } catch {
           rollbackSucceeded = false;
         }
@@ -1366,6 +1430,14 @@ function CredentialsModal({
       isEditMode &&
       runSequentially !== (editingCredential?.run_sequentially ?? false);
 
+    // The save-session checkbox is togglable without touching the secrets, so it
+    // has to count as an edit on its own — otherwise a checkbox-only save closed
+    // the modal without sending anything.
+    const saveBrowserSessionIntentChanged =
+      isEditMode &&
+      supportsInlineTest &&
+      testAndSave !== savedBrowserSessionIntent;
+
     // In edit mode, use editingGroups to determine what changed (type-agnostic)
     if (isEditMode && editingCredential) {
       if (
@@ -1373,7 +1445,8 @@ function CredentialsModal({
         !editingGroups.values &&
         !proxyPinChanged &&
         !bmChanged &&
-        !runSequentiallyChanged
+        !runSequentiallyChanged &&
+        !saveBrowserSessionIntentChanged
       ) {
         // Nothing was edited — close silently
         reset();
@@ -1388,6 +1461,9 @@ function CredentialsModal({
           ...bmPatch,
           ...(runSequentiallyChanged
             ? { run_sequentially: runSequentially }
+            : {}),
+          ...(saveBrowserSessionIntentChanged
+            ? { save_browser_session_intent: testAndSave }
             : {}),
         });
         return;
@@ -1473,11 +1549,9 @@ function CredentialsModal({
       // the secret it holds) whenever the box was unchecked before saving.
       if (testCredentialId) {
         const tempCredentialId = testCredentialId;
-        getClient(credentialGetter)
-          .then((client) => client.delete(`/credentials/${tempCredentialId}`))
-          .catch(() => {
-            // Best-effort cleanup
-          });
+        cleanupTestCredential(tempCredentialId).catch(() => {
+          // Best-effort cleanup
+        });
       }
 
       // Capture intent before mutation — state will be reset in onSuccess
@@ -1492,6 +1566,9 @@ function CredentialsModal({
         isEditMode &&
         Boolean(editingCredential?.credential_id) &&
         selectedAdditionalTwoFactorMethod?.saveBeforeCredentialUpdate === true;
+      const createPendingPasskey =
+        !isEditMode &&
+        selectedAdditionalTwoFactorMethod?.requestType === "passkey";
       saveIntentRef.current = {
         shouldTestAfterSave:
           supportsInlineTest &&
@@ -1546,12 +1623,13 @@ function CredentialsModal({
           username,
           ...(preservesStoredPassword ? {} : { password }),
           totp: selectedAdditionalTwoFactorMethod || totp === "" ? null : totp,
-          // Stage "none" for methods that attach after the base update. Methods
-          // that opt into attach-first keep their server-written type here.
-          totp_type:
-            selectedAdditionalTwoFactorMethod &&
-            selectedAdditionalTwoFactorMethod.value !==
-              configuredAdditionalTwoFactorMethod?.value
+          // Create passkeys through the dedicated setup route; other methods
+          // that attach after an edit stage "none" until their material is saved.
+          totp_type: createPendingPasskey
+            ? selectedAdditionalTwoFactorMethod.requestType
+            : selectedAdditionalTwoFactorMethod &&
+                selectedAdditionalTwoFactorMethod.value !==
+                  configuredAdditionalTwoFactorMethod?.value
               ? saveAdditionalTwoFactorBeforeUpdate
                 ? selectedAdditionalTwoFactorMethod.requestType
                 : "none"
@@ -1966,6 +2044,7 @@ function CredentialsModal({
   const saveDisabled =
     activeMutation.isPending ||
     renameCredentialMutation.isPending ||
+    forwardingActionPending ||
     isTestInProgress ||
     Boolean(additionalTwoFactorError);
 
@@ -1973,7 +2052,10 @@ function CredentialsModal({
     if (type === CredentialModalTypes.PASSWORD) {
       return (
         <PasswordCredentialContent
+          credentialId={editingCredential?.credential_id}
+          savedTotpType={editingPasswordCredentialData?.totp_type ?? "none"}
           values={passwordCredentialValues}
+          hasTotp={editingPasswordCredentialData?.has_totp}
           onChange={handlePasswordCredentialChange}
           url={testUrl}
           onUrlChange={setTestUrl}
@@ -1994,6 +2076,8 @@ function CredentialsModal({
           editingGroups={editingGroups}
           onEnableEditName={handleEnableEditName}
           onEnableEditValues={handleEnableEditValues}
+          onForwardingAddressChange={handleForwardingAddressChange}
+          onForwardingActionPendingChange={setForwardingActionPending}
           onPasswordEnter={saveDisabled ? undefined : handleSave}
           totpError={authenticatorKeyError}
           authenticatorSaveError={authenticatorSaveError}
@@ -2041,6 +2125,21 @@ function CredentialsModal({
                     method.
                   </p>
                 )}
+
+                {/* Ticking the box only records the preference; the session comes
+                  from a login test, which this path doesn't run. */}
+                {isEditMode &&
+                  !editingGroups.values &&
+                  supportsInlineTest &&
+                  testAndSave &&
+                  !editingCredential?.browser_profile_id &&
+                  testStatus === "idle" && (
+                    <p className="pl-7 text-sm text-muted-foreground">
+                      No session is saved yet. Skyvern saves one the next time
+                      this login is tested — start a test with the retry button
+                      on this credential in the list.
+                    </p>
+                  )}
 
                 {supportsInlineTest && testAndSave && (
                   <div className="space-y-1 pl-7">
@@ -2281,9 +2380,7 @@ function CredentialsModal({
                 });
             } else if (credId && !isTestInProgress) {
               // Test completed but user closed without saving — delete orphaned temp credential
-              getClient(credentialGetter)
-                .then((client) => client.delete(`/credentials/${credId}`))
-                .catch(() => {});
+              cleanupTestCredential(credId).catch(() => {});
             }
             testCredentialIdRef.current = null;
             testWorkflowRunIdRef.current = null;

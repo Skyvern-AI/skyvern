@@ -13,7 +13,6 @@ import {
   canonicalRecoveriesByWorkflow,
 } from "./WorkflowCopilotChat";
 import { useCopilotActionStore } from "@/store/useCopilotActionStore";
-import { useRecordingStore } from "@/store/useRecordingStore";
 import { useWorkflowYamlEditorStore } from "@/store/WorkflowYamlEditorStore";
 import { COPILOT_WORKING_VERBS } from "./workingVerbs";
 
@@ -31,43 +30,46 @@ type StreamCall = {
   reject: (error: unknown) => void;
 };
 
-vi.mock("posthog-js/react", () => ({
-  useFeatureFlagEnabled: () => {
-    throw new Error("WorkflowCopilotChat must not consult PostHog");
-  },
-}));
+const {
+  streamCalls,
+  postStreaming,
+  cancelPost,
+  historyResponse,
+  featureFlags,
+} = vi.hoisted(() => {
+  const calls: StreamCall[] = [];
+  const post = vi.fn().mockResolvedValue({});
+  const streaming = vi.fn(
+    (
+      _path: string,
+      body: StreamBody,
+      onMessage: (payload: unknown) => boolean,
+    ) =>
+      new Promise<void>((resolve, reject) => {
+        calls.push({ body, onMessage, resolve, reject });
+      }),
+  );
+  const history = {
+    data: {
+      workflow_copilot_chat_id: null as string | null,
+      chat_history: [] as unknown[],
+      proposed_workflow: null as Record<string, unknown> | null,
+      auto_accept: false,
+    },
+  };
+  return {
+    streamCalls: calls,
+    postStreaming: streaming,
+    cancelPost: post,
+    historyResponse: history,
+    featureFlags: { docEditor: false },
+  };
+});
 
-const { streamCalls, postStreaming, cancelPost, historyResponse } = vi.hoisted(
-  () => {
-    const calls: StreamCall[] = [];
-    const post = vi.fn().mockResolvedValue({});
-    const streaming = vi.fn(
-      (
-        _path: string,
-        body: StreamBody,
-        onMessage: (payload: unknown) => boolean,
-      ) =>
-        new Promise<void>((resolve, reject) => {
-          calls.push({ body, onMessage, resolve, reject });
-        }),
-    );
-    const history = {
-      data: {
-        workflow_copilot_chat_id: null as string | null,
-        chat_history: [] as unknown[],
-        proposed_workflow: null as Record<string, unknown> | null,
-        auto_accept: false,
-      },
-    };
-    return {
-      streamCalls: calls,
-      postStreaming: streaming,
-      cancelPost: post,
-      historyResponse: history,
-    };
-  },
-);
-const recordingPanelMounts = vi.hoisted(() => ({ nextId: 0 }));
+vi.mock("posthog-js/react", () => ({
+  useFeatureFlagEnabled: (name: string) =>
+    name === "WORKFLOW_DOC_EDITOR" && featureFlags.docEditor,
+}));
 
 vi.mock("@/api/sse", () => ({
   getSseClient: vi.fn().mockResolvedValue({ postStreaming }),
@@ -148,55 +150,10 @@ vi.mock("@/store/WorkflowHasChangesStore", () => {
 });
 
 vi.mock("@/routes/workflows/hooks/useWorkflowRunQuery", () => ({
+  useWorkflowRunQueries: (ids: readonly string[]) =>
+    ids.map(() => ({ data: undefined })),
   useWorkflowRunQuery: () => ({ data: undefined }),
 }));
-
-vi.mock("@/routes/workflows/editor/recording/RecordingPanel", async () => {
-  const { forwardRef, useRef } = await import("react");
-  const { createPortal } = await import("react-dom");
-  return {
-    RecordingPanel: forwardRef<
-      HTMLDivElement,
-      {
-        expanded?: boolean;
-        onExpandedChange?: (expanded: boolean) => void;
-        onBackToChat?: () => void;
-        suggestionPortalTarget?: HTMLElement | null;
-      }
-    >(function MockRecordingPanel(
-      { expanded, onExpandedChange, onBackToChat, suggestionPortalTarget },
-      ref,
-    ) {
-      const mountId = useRef(++recordingPanelMounts.nextId).current;
-      return (
-        <>
-          <div
-            ref={ref}
-            data-mount-id={mountId}
-            data-recording-controller="true"
-            data-testid={expanded ? "recording-focus" : "recording-inline"}
-          >
-            {expanded ? (
-              <button type="button" onClick={onBackToChat}>
-                Back to chat
-              </button>
-            ) : (
-              <button type="button" onClick={() => onExpandedChange?.(true)}>
-                Expand recording
-              </button>
-            )}
-          </div>
-          {suggestionPortalTarget
-            ? createPortal(
-                <div data-testid="mock-recording-suggestion">Suggestion</div>,
-                suggestionPortalTarget,
-              )
-            : null}
-        </>
-      );
-    }),
-  };
-});
 
 type FlagConfig = {
   codeBlockMode?: boolean;
@@ -286,14 +243,9 @@ beforeEach(() => {
   HTMLElement.prototype.scrollIntoView = vi.fn();
   HTMLElement.prototype.scrollTo = vi.fn();
   streamCalls.length = 0;
-  recordingPanelMounts.nextId = 0;
   postStreaming.mockClear();
   cancelPost.mockClear();
-  useRecordingStore.setState({
-    isRecording: false,
-    finishRequested: false,
-    isCommitting: false,
-  });
+  featureFlags.docEditor = false;
   useCopilotActionStore.setState({
     pendingBuild: null,
     generatingBlockLabel: null,
@@ -308,11 +260,6 @@ beforeEach(() => {
 });
 
 afterEach(() => {
-  useRecordingStore.setState({
-    isRecording: false,
-    finishRequested: false,
-    isCommitting: false,
-  });
   cleanup();
   canonicalRecoveriesByWorkflow.clear();
 });
@@ -336,9 +283,6 @@ describe("WorkflowCopilotChat — unflagged S4 composer", () => {
     expect(postStreaming).toHaveBeenCalledTimes(1);
     await deliverFirstFrame();
 
-    await act(async () => {
-      useRecordingStore.setState({ isRecording: true });
-    });
     const button = screen.getByRole("button", { name: "Stop" });
     expect(screen.getByTestId("copilot-stop-ring").className).not.toContain(
       "paused",
@@ -364,7 +308,6 @@ describe("WorkflowCopilotChat — unflagged S4 composer", () => {
         signal: expect.any(AbortSignal),
       }),
     );
-    useRecordingStore.setState({ isRecording: false });
   });
 
   it("arms stop on the first streamed frame even when that frame carries no turn id", async () => {
@@ -611,20 +554,20 @@ describe("WorkflowCopilotChat — unflagged S4 composer", () => {
     );
     // Border + focus ring moved off the textarea onto the wrapping container.
     expect(ta.className).not.toContain("border-input");
-    expect(ta.parentElement?.className).toContain("focus-within");
+    expect(ta.closest("[class*='focus-within']")).not.toBeNull();
   });
 
-  it("starts SOP upload and task recording from the empty state", async () => {
-    const onUploadSOP = vi.fn();
+  it("stages an SOP as an editable draft with its PDF attached and starts task demonstration from the empty state", async () => {
+    cancelPost.mockImplementation((path: string) =>
+      Promise.resolve(
+        path === "/upload_file" ? { data: { file_id: "file_sop" } } : {},
+      ),
+    );
     const onRecordTask = vi.fn();
 
     render(
       <FeatureFlagContext.Provider value={() => false}>
-        <WorkflowCopilotChat
-          onUploadSOP={onUploadSOP}
-          onRecordTask={onRecordTask}
-          canRecordTask
-        />
+        <WorkflowCopilotChat onRecordTask={onRecordTask} canRecordTask />
       </FeatureFlagContext.Provider>,
     );
 
@@ -632,7 +575,8 @@ describe("WorkflowCopilotChat — unflagged S4 composer", () => {
       expect(screen.getByText("What should this agent do?")).toBeTruthy(),
     );
     expect(screen.getByText("Upload an SOP")).toBeTruthy();
-    expect(screen.getByText("Record task")).toBeTruthy();
+    expect(screen.queryByText("Paste an SOP")).toBeNull();
+    expect(screen.getByText("Demonstrate task")).toBeTruthy();
     const actionLayout = screen.getByRole("button", {
       name: "Upload an SOP",
     }).parentElement?.parentElement;
@@ -640,80 +584,43 @@ describe("WorkflowCopilotChat — unflagged S4 composer", () => {
     expect(actionLayout?.className).toContain(
       "[@container_copilot-actions_(min-width:440px)]:grid-cols-2",
     );
-    const file = new File(["procedure"], "procedure.pdf", {
-      type: "application/pdf",
+    await act(async () => {
+      fireEvent.change(screen.getByLabelText("Choose an SOP PDF"), {
+        target: {
+          files: [
+            new File(["procedure"], "procedure.pdf", {
+              type: "application/pdf",
+            }),
+          ],
+        },
+      });
     });
-    fireEvent.change(screen.getByLabelText("Choose an SOP PDF"), {
-      target: { files: [file] },
-    });
-    expect(onUploadSOP).toHaveBeenCalledWith(file);
+    await waitFor(() =>
+      expect(
+        screen.getByRole("button", { name: "Remove procedure.pdf" }),
+      ).toBeTruthy(),
+    );
+    expect(cancelPost).toHaveBeenCalledWith(
+      "/upload_file",
+      expect.any(FormData),
+      expect.anything(),
+    );
+    expect(textarea().value).toBe(
+      "Add the steps from the attached SOP to this agent.",
+    );
+    expect(postStreaming).not.toHaveBeenCalled();
 
-    fireEvent.click(screen.getByRole("button", { name: "Record task" }));
+    fireEvent.click(screen.getByRole("button", { name: "Demonstrate task" }));
     expect(onRecordTask).toHaveBeenCalledTimes(1);
   });
 
-  it("does not allow SOP upload and task recording at the same time", async () => {
-    const onUploadSOP = vi.fn();
-    const onRecordTask = vi.fn();
-    const { rerender } = render(
-      <FeatureFlagContext.Provider value={() => false}>
-        <WorkflowCopilotChat
-          onUploadSOP={onUploadSOP}
-          canUploadSOP
-          onRecordTask={onRecordTask}
-          canRecordTask
-          isUploadingSOP
-        />
-      </FeatureFlagContext.Provider>,
-    );
-
-    await waitFor(() =>
-      expect(screen.getByText("Uploading SOP…")).toBeTruthy(),
-    );
-    const recordTaskButton = screen.getByRole("button", {
-      name: "Record task",
-    });
-    expect(recordTaskButton.hasAttribute("disabled")).toBe(true);
-    expect(recordTaskButton.parentElement?.getAttribute("tabindex")).toBe("0");
-    expect((textarea() as HTMLTextAreaElement).disabled).toBe(true);
-    expect(
-      (
-        screen.getByRole("button", {
-          name: "Send disabled — finish the current authoring action",
-        }) as HTMLButtonElement
-      ).disabled,
-    ).toBe(true);
-
-    rerender(
-      <FeatureFlagContext.Provider value={() => false}>
-        <WorkflowCopilotChat
-          onUploadSOP={onUploadSOP}
-          canUploadSOP={false}
-          onRecordTask={onRecordTask}
-          canRecordTask
-        />
-      </FeatureFlagContext.Provider>,
-    );
-
-    const uploadSOPButton = screen.getByRole("button", {
-      name: "Upload an SOP",
-    });
-    expect(uploadSOPButton.hasAttribute("disabled")).toBe(true);
-    expect(uploadSOPButton.parentElement?.getAttribute("tabindex")).toBe("0");
-  });
-
   it.each(["yaml", "copilot"])(
-    "refuses authoring launches when a %s transaction starts after the file picker opens",
+    "stages an SOP but refuses Record when a %s transaction starts after the file picker opens",
     async (owner) => {
-      const onUploadSOP = vi.fn();
       const onRecordTask = vi.fn();
       render(
         <FeatureFlagContext.Provider value={() => false}>
-          <WorkflowCopilotChat
-            onUploadSOP={onUploadSOP}
-            onRecordTask={onRecordTask}
-            canRecordTask
-          />
+          <WorkflowCopilotChat onRecordTask={onRecordTask} canRecordTask />
         </FeatureFlagContext.Provider>,
       );
       await waitFor(() =>
@@ -726,17 +633,23 @@ describe("WorkflowCopilotChat — unflagged S4 composer", () => {
           copilotAcceptance: owner === "copilot" ? Symbol("turn") : null,
         });
       });
-      fireEvent.change(screen.getByLabelText("Choose an SOP PDF"), {
-        target: {
-          files: [
-            new File(["procedure"], "procedure.pdf", {
-              type: "application/pdf",
-            }),
-          ],
-        },
+      await act(async () => {
+        fireEvent.change(screen.getByLabelText("Choose an SOP PDF"), {
+          target: {
+            files: [
+              new File(["procedure"], "procedure.pdf", {
+                type: "application/pdf",
+              }),
+            ],
+          },
+        });
       });
-      fireEvent.click(screen.getByRole("button", { name: "Record task" }));
-      expect(onUploadSOP).not.toHaveBeenCalled();
+      fireEvent.click(screen.getByRole("button", { name: "Demonstrate task" }));
+      expect(cancelPost).toHaveBeenCalledWith(
+        "/upload_file",
+        expect.any(FormData),
+        expect.anything(),
+      );
       expect(onRecordTask).not.toHaveBeenCalled();
     },
   );
@@ -786,144 +699,5 @@ describe("WorkflowCopilotChat — unflagged S4 composer", () => {
     expect(
       ta.compareDocumentPosition(mic) & Node.DOCUMENT_POSITION_FOLLOWING,
     ).toBeTruthy();
-  });
-
-  it("keeps the credential suggestion below the latest Copilot reply while recording", async () => {
-    await renderChat({
-      codeBlockMode: true,
-      liveBrowserSessionId: "pbs_recording",
-    });
-    await act(async () => {
-      useRecordingStore.setState({ isRecording: true });
-    });
-
-    await submit("Always choose the first available appointment.");
-    await waitFor(() => expect(postStreaming).toHaveBeenCalledTimes(1));
-
-    await act(async () => {
-      streamCalls[0]?.onMessage({
-        type: "response",
-        message: "Got it — I’ll keep that preference with this demonstration.",
-        workflow_copilot_chat_id: "chat-1",
-        response_time: "2026-09-19T20:00:00Z",
-        proposal_disposition: "no_proposal",
-      });
-      streamCalls[0]?.resolve();
-    });
-
-    const copilotReply = screen.getByText(
-      "Got it — I’ll keep that preference with this demonstration.",
-    );
-    const suggestion = screen.getByTestId("mock-recording-suggestion");
-    expect(
-      screen.getByTestId("recording-suggestion-host").contains(suggestion),
-    ).toBe(true);
-    expect(
-      copilotReply.compareDocumentPosition(suggestion) &
-        Node.DOCUMENT_POSITION_FOLLOWING,
-    ).toBeTruthy();
-    expect(
-      document.querySelectorAll('[data-recording-controller="true"]'),
-    ).toHaveLength(1);
-  });
-
-  it("returns from full-pane recording to the transcript when the user sends", async () => {
-    useRecordingStore.setState({ isRecording: true });
-    await renderChat({
-      codeBlockMode: true,
-      liveBrowserSessionId: "pbs_recording",
-    });
-    const mountId = screen
-      .getByTestId("recording-inline")
-      .getAttribute("data-mount-id");
-
-    fireEvent.click(screen.getByRole("button", { name: "Expand recording" }));
-    expect(screen.getByTestId("recording-focus")).toBeTruthy();
-    expect(
-      document.querySelectorAll('[data-recording-controller="true"]'),
-    ).toHaveLength(1);
-
-    await submit("Only download invoices marked Paid.");
-
-    expect(screen.queryByTestId("recording-focus")).toBeNull();
-    expect(screen.getByTestId("recording-inline")).toBeTruthy();
-    expect(
-      screen.getByTestId("recording-inline").getAttribute("data-mount-id"),
-    ).toBe(mountId);
-    expect(
-      document.querySelectorAll('[data-recording-controller="true"]'),
-    ).toHaveLength(1);
-    expect(
-      screen.getByText("Only download invoices marked Paid."),
-    ).toBeTruthy();
-  });
-
-  it("keeps the recording controller mounted while the Copilot pane is closed", async () => {
-    useRecordingStore.setState({
-      isRecording: false,
-      finishRequested: true,
-    });
-    const { rerender } = await renderChat({
-      codeBlockMode: true,
-      liveBrowserSessionId: "pbs_recording",
-      isOpen: false,
-    });
-
-    expect(screen.getByTestId("recording-inline")).toBeTruthy();
-    const mountId = screen
-      .getByTestId("recording-inline")
-      .getAttribute("data-mount-id");
-    expect(
-      document.querySelectorAll('[data-recording-controller="true"]'),
-    ).toHaveLength(1);
-
-    rerender(
-      <FeatureFlagContext.Provider value={() => true}>
-        <WorkflowCopilotChat isOpen liveBrowserSessionId="pbs_recording" />
-      </FeatureFlagContext.Provider>,
-    );
-
-    expect(screen.getByTestId("recording-inline")).toBeTruthy();
-    // A finishing recording refuses sends, so the composer must not offer one.
-    expect(textarea().disabled).toBe(true);
-    expect(
-      screen.getByTestId("recording-inline").getAttribute("data-mount-id"),
-    ).toBe(mountId);
-    expect(
-      document.querySelectorAll('[data-recording-controller="true"]'),
-    ).toHaveLength(1);
-  });
-
-  it("keeps the recording controller mounted through a browser session id blip", async () => {
-    useRecordingStore.setState({
-      isRecording: false,
-      finishRequested: true,
-    });
-    const { rerender } = await renderChat({
-      codeBlockMode: true,
-      liveBrowserSessionId: "pbs_recording",
-    });
-    const mountId = screen
-      .getByTestId("recording-inline")
-      .getAttribute("data-mount-id");
-
-    rerender(
-      <FeatureFlagContext.Provider value={() => true}>
-        <WorkflowCopilotChat />
-      </FeatureFlagContext.Provider>,
-    );
-    expect(screen.getByTestId("recording-inline")).toBeTruthy();
-    expect(
-      screen.getByTestId("recording-inline").getAttribute("data-mount-id"),
-    ).toBe(mountId);
-
-    rerender(
-      <FeatureFlagContext.Provider value={() => true}>
-        <WorkflowCopilotChat liveBrowserSessionId="pbs_recording" />
-      </FeatureFlagContext.Provider>,
-    );
-    expect(
-      screen.getByTestId("recording-inline").getAttribute("data-mount-id"),
-    ).toBe(mountId);
   });
 });

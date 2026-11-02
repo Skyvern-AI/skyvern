@@ -11,6 +11,7 @@ from skyvern.exceptions import (
     ScreenshotTargetClosed,
     SkyvernActionFailed,
     SkyvernHTTPException,
+    TaskTerminationError,
 )
 from skyvern.forge import app
 from skyvern.forge.sdk.api.files import uploaded_file_id_for_local_uri, validate_download_url
@@ -81,6 +82,11 @@ async def run_sdk_action(
     # The whole action runs on this process's event loop, so the cap is taken before any database
     # write or page work: an organization over its cap costs a rejected request, not a started one.
     async with app.RATE_LIMITER.limit_sdk_action_concurrency(organization.organization_id):
+        # Not the API permission checker: on older billing plans it demands a whole run's worth of credits.
+        try:
+            await app.AGENT_FUNCTION.validate_task_execution(organization_id=organization.organization_id)
+        except TaskTerminationError:
+            raise HTTPException(status_code=status.HTTP_402_PAYMENT_REQUIRED, detail="Not enough credit balance.")
         return await _run_sdk_action(action_request, organization, created_by=user_id)
 
 
@@ -99,6 +105,14 @@ async def _run_sdk_action(
     browser_session_id = action_request.browser_session_id
     browser_address = action_request.browser_address
     action = action_request.action
+
+    # The touch is intentionally unscoped, so validate this client-supplied id before any task is
+    # persisted; a failed lookup cannot leave a non-terminal task behind.
+    renewable_session_id = browser_session_id
+    if renewable_session_id and not await app.DATABASE.browser_sessions.get_persistent_browser_session(
+        renewable_session_id, organization_id
+    ):
+        renewable_session_id = None
 
     # Use existing workflow_run_id if provided, otherwise create a new one
     created_workflow_run = not action_request.workflow_run_id
@@ -184,6 +198,20 @@ async def _run_sdk_action(
     # refcount and leave a permanent liveness ghost that vetoes a real run's terminal browser
     # close.
     try:
+        if renewable_session_id is not None:
+            try:
+                # The synthetic run owns no session lease. Await its first stamp before context setup or
+                # browser work; the initial write is also part of the task's handled failure span.
+                await app.BROWSER_MANAGER.begin_session_activity_renewal(renewable_session_id)
+            except Exception as e:
+                await app.DATABASE.tasks.update_task(
+                    task_id=task.task_id,
+                    organization_id=organization_id,
+                    status=TaskStatus.failed,
+                    failure_reason=str(e),
+                )
+                raise
+
         await app.WORKFLOW_CONTEXT_MANAGER.initialize_workflow_run_context(
             organization,
             workflow_run.workflow_run_id,
@@ -405,6 +433,8 @@ async def _run_sdk_action(
             result=result,
         )
     finally:
+        if renewable_session_id is not None:
+            app.BROWSER_MANAGER.end_session_activity_renewal(renewable_session_id)
         # Remove the run-context only once the last concurrent run_action for this run finishes.
         # A client-provided workflow_run_id is shared across sibling calls, so an unconditional
         # removal would yank the context out from under an in-flight sibling; never removing it

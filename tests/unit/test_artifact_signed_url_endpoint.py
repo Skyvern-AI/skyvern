@@ -9,11 +9,11 @@ import asyncio
 import json
 import time
 from datetime import datetime, timezone
+from typing import Any
 from unittest.mock import AsyncMock, patch
 from urllib.parse import parse_qs, urlparse
 
 import pytest
-from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
 from skyvern.config import settings
@@ -23,8 +23,8 @@ from skyvern.forge.sdk.artifact.signing import (
     ARTIFACT_URL_ON_DEMAND_EXPIRY_SECONDS,
     SENSITIVE_ARTIFACT_URL_EXPIRY_SECONDS,
 )
-from skyvern.forge.sdk.routes.routers import base_router
 from skyvern.forge.sdk.schemas.organizations import Organization
+from tests.unit.shared_route_app import shared_route_app
 
 _KEYRING_JSON = json.dumps({"current_kid": "k1", "keys": {"k1": {"secret": "0" * 64}}})
 
@@ -53,19 +53,28 @@ def _make_org(organization_id: str = "o_1") -> Organization:
     )
 
 
-def _make_client() -> TestClient:
-    test_app = FastAPI()
-    test_app.include_router(base_router, prefix="/v1")
-    return TestClient(test_app)
+def _patch_app() -> Any:
+    # The artifact routes check the owning run's workflow folder, which awaits the agent function.
+    return patch(
+        "skyvern.forge.sdk.routes.agent_protocol.app",
+        **{
+            "AGENT_FUNCTION.accessible_workflow_folder_ids": AsyncMock(return_value=None),
+            "AGENT_FUNCTION.enforce_folder_access": AsyncMock(),
+        },
+    )
+
+
+def _make_client(monkeypatch: pytest.MonkeyPatch) -> TestClient:
+    return TestClient(shared_route_app(monkeypatch))
 
 
 class TestGetArtifactSignedUrl:
-    def test_mints_short_lived_signed_url(self) -> None:
+    def test_mints_short_lived_signed_url(self, monkeypatch: pytest.MonkeyPatch) -> None:
         artifact = _make_artifact()
         with (
             patch.object(settings, "ARTIFACT_CONTENT_HMAC_KEYRING", _KEYRING_JSON),
             patch.object(settings, "SKYVERN_BASE_URL", "http://testserver"),
-            patch("skyvern.forge.sdk.routes.agent_protocol.app") as app_module,
+            _patch_app() as app_module,
             patch(
                 "skyvern.forge.sdk.services.org_auth_service.get_current_org_cached",
                 new=AsyncMock(return_value=_make_org()),
@@ -77,7 +86,7 @@ class TestGetArtifactSignedUrl:
             app_module.ARTIFACT_MANAGER.resolve_share_url = ArtifactManager.resolve_share_url.__get__(ArtifactManager())
 
             before = int(time.time())
-            resp = _make_client().get("/v1/artifacts/a_1/signed-url", headers={"x-api-key": "key"})
+            resp = _make_client(monkeypatch).get("/v1/artifacts/a_1/signed-url", headers={"x-api-key": "key"})
             after = int(time.time())
 
         assert resp.status_code == 200, resp.text
@@ -93,31 +102,31 @@ class TestGetArtifactSignedUrl:
     def test_short_ttl_is_minutes_not_hours(self) -> None:
         assert 60 <= ARTIFACT_URL_ON_DEMAND_EXPIRY_SECONDS <= 15 * 60
 
-    def test_unknown_artifact_returns_404(self) -> None:
+    def test_unknown_artifact_returns_404(self, monkeypatch: pytest.MonkeyPatch) -> None:
         with (
             patch.object(settings, "ARTIFACT_CONTENT_HMAC_KEYRING", _KEYRING_JSON),
-            patch("skyvern.forge.sdk.routes.agent_protocol.app") as app_module,
+            _patch_app() as app_module,
             patch(
                 "skyvern.forge.sdk.services.org_auth_service.get_current_org_cached",
                 new=AsyncMock(return_value=_make_org()),
             ),
         ):
             app_module.DATABASE.artifacts.get_artifact_by_id = AsyncMock(return_value=None)
-            resp = _make_client().get("/v1/artifacts/a_missing/signed-url", headers={"x-api-key": "key"})
+            resp = _make_client(monkeypatch).get("/v1/artifacts/a_missing/signed-url", headers={"x-api-key": "key"})
         assert resp.status_code == 404
 
-    def test_requires_authentication(self) -> None:
+    def test_requires_authentication(self, monkeypatch: pytest.MonkeyPatch) -> None:
         with patch.object(settings, "ARTIFACT_CONTENT_HMAC_KEYRING", _KEYRING_JSON):
-            resp = _make_client().get("/v1/artifacts/a_1/signed-url")
+            resp = _make_client(monkeypatch).get("/v1/artifacts/a_1/signed-url")
         assert resp.status_code == 403
 
-    def test_org_scoping_uses_callers_org(self) -> None:
+    def test_org_scoping_uses_callers_org(self, monkeypatch: pytest.MonkeyPatch) -> None:
         """The artifact lookup must be scoped to the authenticated org."""
         artifact = _make_artifact()
         with (
             patch.object(settings, "ARTIFACT_CONTENT_HMAC_KEYRING", _KEYRING_JSON),
             patch.object(settings, "SKYVERN_BASE_URL", "http://testserver"),
-            patch("skyvern.forge.sdk.routes.agent_protocol.app") as app_module,
+            _patch_app() as app_module,
             patch(
                 "skyvern.forge.sdk.services.org_auth_service.get_current_org_cached",
                 new=AsyncMock(return_value=_make_org("o_2")),
@@ -127,7 +136,7 @@ class TestGetArtifactSignedUrl:
             from skyvern.forge.sdk.artifact.manager import ArtifactManager
 
             app_module.ARTIFACT_MANAGER.resolve_share_url = ArtifactManager.resolve_share_url.__get__(ArtifactManager())
-            resp = _make_client().get("/v1/artifacts/a_1/signed-url", headers={"x-api-key": "key"})
+            resp = _make_client(monkeypatch).get("/v1/artifacts/a_1/signed-url", headers={"x-api-key": "key"})
 
         assert resp.status_code == 200
         app_module.DATABASE.artifacts.get_artifact_by_id.assert_awaited_once_with(
@@ -136,14 +145,16 @@ class TestGetArtifactSignedUrl:
 
 
 class TestMintedUrlAgainstContentEndpoint:
-    def _mint_and_fetch(self, *, age_seconds: int, range_header: str | None = None) -> "TestClient.Response":
+    def _mint_and_fetch(
+        self, monkeypatch: pytest.MonkeyPatch, *, age_seconds: int, range_header: str | None = None
+    ) -> "TestClient.Response":
         """Mint a short-lived URL, then fetch content ``age_seconds`` later (patched clock)."""
         artifact = _make_artifact()
         real_time = time.time
         with (
             patch.object(settings, "ARTIFACT_CONTENT_HMAC_KEYRING", _KEYRING_JSON),
             patch.object(settings, "SKYVERN_BASE_URL", "http://testserver"),
-            patch("skyvern.forge.sdk.routes.agent_protocol.app") as app_module,
+            _patch_app() as app_module,
             patch(
                 "skyvern.forge.sdk.services.org_auth_service.get_current_org_cached",
                 new=AsyncMock(return_value=_make_org()),
@@ -156,7 +167,7 @@ class TestMintedUrlAgainstContentEndpoint:
 
             app_module.ARTIFACT_MANAGER.resolve_share_url = ArtifactManager.resolve_share_url.__get__(ArtifactManager())
 
-            client = _make_client()
+            client = _make_client(monkeypatch)
             minted = client.get("/v1/artifacts/a_1/signed-url", headers={"x-api-key": "key"})
             assert minted.status_code == 200, minted.text
             signed_url = minted.json()["signed_url"].replace("http://testserver", "")
@@ -165,35 +176,36 @@ class TestMintedUrlAgainstContentEndpoint:
             with patch("skyvern.forge.sdk.artifact.signing.time.time", new=lambda: real_time() + age_seconds):
                 return client.get(signed_url, headers=headers)
 
-    def test_fresh_minted_url_serves_content(self) -> None:
-        resp = self._mint_and_fetch(age_seconds=0)
+    def test_fresh_minted_url_serves_content(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        resp = self._mint_and_fetch(monkeypatch, age_seconds=0)
         assert resp.status_code == 200
         assert resp.content == b"0123456789"
 
-    def test_expired_minted_url_is_rejected(self) -> None:
-        resp = self._mint_and_fetch(age_seconds=ARTIFACT_URL_ON_DEMAND_EXPIRY_SECONDS + 5)
+    def test_expired_minted_url_is_rejected(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        resp = self._mint_and_fetch(monkeypatch, age_seconds=ARTIFACT_URL_ON_DEMAND_EXPIRY_SECONDS + 5)
         assert resp.status_code == 403
 
-    def test_fresh_minted_url_serves_range_requests(self) -> None:
-        resp = self._mint_and_fetch(age_seconds=0, range_header="bytes=2-5")
+    def test_fresh_minted_url_serves_range_requests(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        resp = self._mint_and_fetch(monkeypatch, age_seconds=0, range_header="bytes=2-5")
         assert resp.status_code == 206
         assert resp.content == b"2345"
 
-    def test_range_request_past_expiry_is_rejected(self) -> None:
+    def test_range_request_past_expiry_is_rejected(self, monkeypatch: pytest.MonkeyPatch) -> None:
         """Playback continuation past the TTL boundary must re-mint — the URL itself dies."""
         resp = self._mint_and_fetch(
+            monkeypatch,
             age_seconds=ARTIFACT_URL_ON_DEMAND_EXPIRY_SECONDS + 5,
             range_header="bytes=2-5",
         )
         assert resp.status_code == 403
 
-    def test_tampered_artifact_id_is_rejected(self) -> None:
+    def test_tampered_artifact_id_is_rejected(self, monkeypatch: pytest.MonkeyPatch) -> None:
         """A signature minted for one artifact must not authorize another (replay/splice)."""
         artifact = _make_artifact()
         with (
             patch.object(settings, "ARTIFACT_CONTENT_HMAC_KEYRING", _KEYRING_JSON),
             patch.object(settings, "SKYVERN_BASE_URL", "http://testserver"),
-            patch("skyvern.forge.sdk.routes.agent_protocol.app") as app_module,
+            _patch_app() as app_module,
             patch(
                 "skyvern.forge.sdk.services.org_auth_service.get_current_org_cached",
                 new=AsyncMock(return_value=_make_org()),
@@ -205,7 +217,7 @@ class TestMintedUrlAgainstContentEndpoint:
             from skyvern.forge.sdk.artifact.manager import ArtifactManager
 
             app_module.ARTIFACT_MANAGER.resolve_share_url = ArtifactManager.resolve_share_url.__get__(ArtifactManager())
-            client = _make_client()
+            client = _make_client(monkeypatch)
             minted = client.get("/v1/artifacts/a_1/signed-url", headers={"x-api-key": "key"})
             signed_url = minted.json()["signed_url"].replace("http://testserver", "")
             spliced = signed_url.replace("/artifacts/a_1/", "/artifacts/a_other/")
@@ -220,7 +232,9 @@ class TestSensitiveArtifactEmbeddedUrl:
     than the org's — and stop authorizing anything once it lapses.
     """
 
-    def _embedded_url_and_client(self, artifact: Artifact) -> tuple[str, TestClient, "AsyncMock"]:
+    def _embedded_url_and_client(
+        self, artifact: Artifact, monkeypatch: pytest.MonkeyPatch
+    ) -> tuple[str, TestClient, "AsyncMock"]:
         with (
             patch.object(settings, "ARTIFACT_CONTENT_HMAC_KEYRING", _KEYRING_JSON),
             patch.object(settings, "SKYVERN_BASE_URL", "http://testserver"),
@@ -231,22 +245,22 @@ class TestSensitiveArtifactEmbeddedUrl:
             manager = ArtifactManager()
             manager_app.DATABASE.organizations.get_organization = AsyncMock(return_value=_make_org())
             url = asyncio.run(manager.get_share_link(artifact))
-        return url, _make_client(), AsyncMock(return_value=artifact)
+        return url, _make_client(monkeypatch), AsyncMock(return_value=artifact)
 
     def _fetch(self, artifact: Artifact, url: str, client: TestClient, age_seconds: int) -> "TestClient.Response":
         real_time = time.time
         with (
             patch.object(settings, "ARTIFACT_CONTENT_HMAC_KEYRING", _KEYRING_JSON),
-            patch("skyvern.forge.sdk.routes.agent_protocol.app") as app_module,
+            _patch_app() as app_module,
             patch("skyvern.forge.sdk.artifact.signing.time.time", new=lambda: real_time() + age_seconds),
         ):
             app_module.DATABASE.artifacts.get_artifact_by_id_no_org = AsyncMock(return_value=artifact)
             app_module.ARTIFACT_MANAGER.retrieve_artifact = AsyncMock(return_value=b"secret-pixels")
             return client.get(url.replace("http://testserver", ""))
 
-    def test_embedded_screenshot_url_expires_within_the_sensitive_window(self) -> None:
+    def test_embedded_screenshot_url_expires_within_the_sensitive_window(self, monkeypatch: pytest.MonkeyPatch) -> None:
         artifact = _make_artifact()
-        url, client, _ = self._embedded_url_and_client(artifact)
+        url, client, _ = self._embedded_url_and_client(artifact, monkeypatch)
         expiry = int(parse_qs(urlparse(url).query)["expiry"][0])
         assert expiry - int(time.time()) <= SENSITIVE_ARTIFACT_URL_EXPIRY_SECONDS
 
@@ -254,10 +268,12 @@ class TestSensitiveArtifactEmbeddedUrl:
         replayed = self._fetch(artifact, url, client, age_seconds=SENSITIVE_ARTIFACT_URL_EXPIRY_SECONDS + 5)
         assert replayed.status_code == 403
 
-    def test_expired_screenshot_url_is_not_revived_by_dropping_the_signature(self) -> None:
+    def test_expired_screenshot_url_is_not_revived_by_dropping_the_signature(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
         """Stripping sig/kid/expiry falls back to the org-auth path, which needs credentials."""
         artifact = _make_artifact()
-        url, client, _ = self._embedded_url_and_client(artifact)
+        url, client, _ = self._embedded_url_and_client(artifact, monkeypatch)
         unsigned = url.replace("http://testserver", "").split("?")[0]
         with patch.object(settings, "ARTIFACT_CONTENT_HMAC_KEYRING", _KEYRING_JSON):
             resp = client.get(unsigned)
@@ -265,12 +281,12 @@ class TestSensitiveArtifactEmbeddedUrl:
 
 
 class TestKeyringUnsetFallback:
-    def test_falls_back_to_storage_presigned_url(self) -> None:
+    def test_falls_back_to_storage_presigned_url(self, monkeypatch: pytest.MonkeyPatch) -> None:
         """Self-host deployments without a keyring still get a working URL."""
         artifact = _make_artifact()
         with (
             patch.object(settings, "ARTIFACT_CONTENT_HMAC_KEYRING", None),
-            patch("skyvern.forge.sdk.routes.agent_protocol.app") as app_module,
+            _patch_app() as app_module,
             patch(
                 "skyvern.forge.sdk.services.org_auth_service.get_current_org_cached",
                 new=AsyncMock(return_value=_make_org()),
@@ -280,7 +296,7 @@ class TestKeyringUnsetFallback:
             app_module.ARTIFACT_MANAGER.resolve_share_url = AsyncMock(
                 return_value="https://bucket.s3.amazonaws.com/a_1.png?X-Amz-Signature=abc"
             )
-            resp = _make_client().get("/v1/artifacts/a_1/signed-url", headers={"x-api-key": "key"})
+            resp = _make_client(monkeypatch).get("/v1/artifacts/a_1/signed-url", headers={"x-api-key": "key"})
 
         assert resp.status_code == 200
         body = resp.json()
@@ -300,14 +316,13 @@ class TestArtifactContentCsp:
         ],
     )
     def test_scraped_html_is_sandboxed_through_security_middleware(
-        self, artifact_type: ArtifactType, expected_csp: str
+        self, artifact_type: ArtifactType, expected_csp: str, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         artifact = _make_artifact().model_copy(update={"artifact_type": artifact_type})
-        test_app = FastAPI()
-        test_app.include_router(base_router, prefix="/v1")
+        test_app = shared_route_app(monkeypatch)
         test_app.add_middleware(SecurityHeadersMiddleware)
         with (
-            patch("skyvern.forge.sdk.routes.agent_protocol.app") as app_module,
+            _patch_app() as app_module,
             patch(
                 "skyvern.forge.sdk.services.org_auth_service.get_current_org_cached",
                 new=AsyncMock(return_value=_make_org()),

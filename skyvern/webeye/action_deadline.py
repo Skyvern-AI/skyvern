@@ -7,15 +7,25 @@ from collections.abc import AsyncIterator, Awaitable, Callable
 from contextlib import asynccontextmanager
 from typing import Any, TypeVar
 
+from skyvern.config import settings
 from skyvern.exceptions import ActionDeadlineExceeded
 from skyvern.forge.sdk.core import skyvern_context
-from skyvern.webeye.browser_health import BrowserOperation
+from skyvern.webeye.browser_health import BrowserOperation, FrameKind
 
 ACTION_DEADLINE_HEADROOM_MS = 5000
 DEADLINE_REARM_INTERVAL_SECONDS = 1.0
 
 T = TypeVar("T")
 _UNSET = object()
+
+
+async def bounded_lookup_call(call: Callable[[], Awaitable[T]]) -> T:
+    """Bound a lookup call without a native Playwright timeout, such as ``Locator.count()``."""
+    async with under_action_deadline(
+        budget_ms=settings.BROWSER_ELEMENT_LOOKUP_TIMEOUT_MS,
+        operation=BrowserOperation.EVALUATE,
+    ):
+        return await cancellable_driver_call(call)
 
 
 def cancellation_pending() -> bool:
@@ -36,10 +46,12 @@ def raise_if_cancelled() -> None:
         raise asyncio.CancelledError
 
 
-def record_browser_timeout(operation: BrowserOperation = BrowserOperation.EVALUATE) -> None:
+def record_browser_timeout(
+    operation: BrowserOperation = BrowserOperation.EVALUATE, *, frame_kind: FrameKind | None = None
+) -> None:
     """Tally a strike for a call the caller bounded itself, so ``record_unreported_timeout`` does not
     mistake the synthesized timeout for one the engine tallied."""
-    skyvern_context.record_browser_timeout(operation)
+    skyvern_context.record_browser_timeout(operation, frame_kind=frame_kind)
 
 
 def _retrieve_outcome(call: asyncio.Task[Any]) -> None:
@@ -74,10 +86,22 @@ async def cancellable_driver_call(call: Callable[[], Awaitable[T]]) -> T:
     call_task = asyncio.create_task(issue(), context=context)
     call_task.add_done_callback(_retrieve_outcome)
     try:
-        return await call_task
+        # Not ``await call_task``: that hands the caller's cancellation to a task that may not have taken its first
+        # step, and the OTel asyncio instrumentor drops such a task's coroutine, which CPython reports as a
+        # "never awaited" RuntimeWarning at error level.
+        await asyncio.wait({call_task})
+        return call_task.result()
     except asyncio.CancelledError:
-        # A cancellation that arrives after the call has answered never reached the task.
-        call_task.cancel()
+        # asyncio.wait does not forward cancellation. Cancel the call once it has had a chance to start, and again
+        # for every later cancellation (a deadline re-arm), as awaiting the task directly did; return only once it ends.
+        while True:
+            try:
+                await asyncio.sleep(0)
+                call_task.cancel()
+                await asyncio.wait({call_task})
+                break
+            except asyncio.CancelledError:
+                continue
         raise
     finally:
         # The task ran in a copy of this context, so a write inside the call would otherwise be lost.

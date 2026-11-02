@@ -33,8 +33,10 @@ class _DisconnectedWebSocket:
     def __init__(self) -> None:
         self.sent: list[dict] = []
         self._disconnect_delivered = False
+        self.headers: dict[str, str] = {}
+        self.url = SimpleNamespace(path="/v1/stream/test")
 
-    async def accept(self) -> None:
+    async def accept(self, subprotocol: str | None = None) -> None:
         return None
 
     async def send_text(self, text: str) -> None:
@@ -43,12 +45,19 @@ class _DisconnectedWebSocket:
     async def send_json(self, data: dict) -> None:
         self.sent.append(data)
 
+    async def close(self, *, code: int = 1000) -> None:
+        return None
+
     async def receive(self) -> dict:
         if not self._disconnect_delivered:
             self._disconnect_delivered = True
             return {"type": "websocket.disconnect", "code": 1006}
         await asyncio.Event().wait()
         raise AssertionError("unreachable")
+
+
+async def _yield_instead_of_sleeping(_delay: float) -> None:
+    await asyncio.sleep(0)
 
 
 @pytest.mark.asyncio
@@ -68,10 +77,20 @@ async def test_workflow_run_streaming_stops_sending_once_the_client_is_gone(
     )
 
     monkeypatch.setattr(screenshot.settings, "BROWSER_STREAMING_MODE", "vnc")
+    monkeypatch.setattr(screenshot, "asyncio", ScopedAsyncio(sleep=_yield_instead_of_sleeping))
     monkeypatch.setattr(screenshot, "get_current_org", AsyncMock(return_value=SimpleNamespace(organization_id="o_1")))
     monkeypatch.setattr(app, "DATABASE", database)
     monkeypatch.setattr(app, "STORAGE", SimpleNamespace(get_streaming_file=AsyncMock(return_value=b"jpeg")))
-    monkeypatch.setattr(app, "AGENT_FUNCTION", SimpleNamespace(mark_streaming_viewer_active=AsyncMock()))
+    monkeypatch.setattr(
+        app,
+        "AGENT_FUNCTION",
+        SimpleNamespace(
+            mark_streaming_viewer_active=AsyncMock(),
+            enforce_folder_access=AsyncMock(),
+            enforce_browser_session_credential_use=AsyncMock(),
+            enforce_workflow_run_credential_use=AsyncMock(),
+        ),
+    )
 
     with capture_logs() as logs:
         await asyncio.wait_for(
@@ -92,8 +111,10 @@ class _WatchingWebSocket:
     def __init__(self, send_error: Exception | None = None) -> None:
         self.sent: list[dict] = []
         self._send_error = send_error
+        self.headers: dict[str, str] = {}
+        self.url = SimpleNamespace(path="/v1/stream/test")
 
-    async def accept(self) -> None:
+    async def accept(self, subprotocol: str | None = None) -> None:
         return None
 
     async def send_text(self, text: str) -> None:
@@ -103,6 +124,9 @@ class _WatchingWebSocket:
         if self._send_error is not None:
             raise self._send_error
         self.sent.append(data)
+
+    async def close(self, *, code: int = 1000) -> None:
+        return None
 
     async def receive(self) -> dict:
         await asyncio.Event().wait()
@@ -162,7 +186,16 @@ def run_stream(monkeypatch: pytest.MonkeyPatch) -> Callable[..., Awaitable[_Watc
     monkeypatch.setattr(screenshot.settings, "BROWSER_STREAMING_MODE", "vnc")
     monkeypatch.setattr(screenshot, "asyncio", ScopedAsyncio(sleep=AsyncMock()))
     monkeypatch.setattr(screenshot, "get_current_org", AsyncMock(return_value=SimpleNamespace(organization_id="o_1")))
-    monkeypatch.setattr(app, "AGENT_FUNCTION", SimpleNamespace(mark_streaming_viewer_active=AsyncMock()))
+    monkeypatch.setattr(
+        app,
+        "AGENT_FUNCTION",
+        SimpleNamespace(
+            mark_streaming_viewer_active=AsyncMock(),
+            enforce_folder_access=AsyncMock(),
+            enforce_browser_session_credential_use=AsyncMock(),
+            enforce_workflow_run_credential_use=AsyncMock(),
+        ),
+    )
 
     async def _connect(
         runs: _ScriptedRuns,
@@ -173,7 +206,17 @@ def run_stream(monkeypatch: pytest.MonkeyPatch) -> Callable[..., Awaitable[_Watc
         task_id: str = "",
         send_error: Exception | None = None,
     ) -> _WatchingWebSocket:
-        monkeypatch.setattr(app, "DATABASE", SimpleNamespace(workflow_runs=runs, tasks=runs))
+        monkeypatch.setattr(
+            app,
+            "DATABASE",
+            SimpleNamespace(
+                workflow_runs=runs,
+                tasks=runs,
+                browser_sessions=SimpleNamespace(
+                    get_persistent_browser_session_by_runnable_id=AsyncMock(return_value=None)
+                ),
+            ),
+        )
         monkeypatch.setattr(app, "STORAGE", SimpleNamespace(get_streaming_file=AsyncMock(return_value=frame)))
         monkeypatch.setattr(screenshot, "STREAMING_TIMEOUT", timeout_seconds)
         websocket = _WatchingWebSocket(send_error)
@@ -196,7 +239,13 @@ async def test_run_stream_tile_counts_a_run_once_and_only_while_its_failure_is_u
     pool_timeout = TimeoutError("QueuePool limit reached")
     runs = _ScriptedRuns(
         {
-            "wr_blank": [WorkflowRunStatus.running, pool_timeout, WorkflowRunStatus.running, WorkflowRunStatus.running],
+            "wr_blank": [
+                WorkflowRunStatus.running,
+                pool_timeout,
+                WorkflowRunStatus.running,
+                WorkflowRunStatus.running,
+                WorkflowRunStatus.running,
+            ],
             "wr_recovered": [
                 WorkflowRunStatus.running,
                 pool_timeout,
@@ -278,7 +327,9 @@ async def test_task_page_stream_error_counts_as_unrecovered_because_the_task_pag
     run_stream: Callable[..., Awaitable[_WatchingWebSocket]],
 ) -> None:
     pool_timeout = TimeoutError("QueuePool limit reached")
-    runs = _ScriptedRuns({"wr_task": [WorkflowRunStatus.running, pool_timeout], "wr_run": [pool_timeout]})
+    runs = _ScriptedRuns(
+        {"wr_task": [WorkflowRunStatus.running, WorkflowRunStatus.running, pool_timeout], "wr_run": [pool_timeout]}
+    )
     with capture_logs() as logs:
         await run_stream(runs, frame=b"png", timeout_seconds=10_000, task_id="tsk_task")
         await run_stream(runs, frame=b"png", timeout_seconds=10_000, workflow_run_id="wr_run")

@@ -6,9 +6,10 @@ from datetime import datetime, timedelta
 from typing import cast
 
 import structlog
-from sqlalchemy import Select, and_, case, desc, func, or_, select, update
+from sqlalchemy import Select, and_, case, desc, exists, func, or_, select, update
 from sqlalchemy.exc import IntegrityError, StatementError
 from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.sql.elements import ColumnElement
 
 from skyvern.config import settings
 from skyvern.exceptions import (
@@ -25,13 +26,22 @@ from skyvern.forge.sdk.db.exceptions import NotFoundError
 from skyvern.forge.sdk.db.id import generate_browser_profile_id
 from skyvern.forge.sdk.db.models import (
     BrowserProfileModel,
+    BrowserRecordingModel,
     CredentialModel,
+    DebugSessionModel,
     PersistentBrowserSessionModel,
+    TaskModel,
+    TaskV2Model,
     WorkflowModel,
+    WorkflowRunAttemptModel,
     WorkflowRunModel,
 )
 from skyvern.forge.sdk.db.repositories.proxy_pin_update import apply_proxy_pin_to_model, normalize_proxy_pin_for_create
-from skyvern.forge.sdk.db.repositories.workflow_runs import lock_workflow_run_for_dispatch
+from skyvern.forge.sdk.db.repositories.workflow_runs import (
+    _folder_access_filter,
+    _hidden_workflow_ids,
+    lock_workflow_run_for_dispatch,
+)
 from skyvern.forge.sdk.db.utils import browser_settings_receipt_replaceable, serialize_proxy_location
 from skyvern.forge.sdk.schemas.browser_profiles import (
     BrowserProfile,
@@ -61,17 +71,14 @@ _UNSET = object()
 # The status column is plain text; bind the final statuses as their string values for SQL predicates.
 _FINAL_STATUS_VALUES = tuple(status.value for status in FINAL_STATUSES)
 
-# A row with an upstream endpoint but no client-facing address yet is vendor-held (the vendor
-# owns the browser directly; the CDP proxy is the only way to reach it) and must stay off
-# customer-facing session surfaces. Self-hosted routed rows set both columns together, and
-# rows created before routing existed set neither — both cases stay visible.
-_VISIBLE_TO_CUSTOMER = and_(
-    or_(
-        PersistentBrowserSessionModel.upstream_cdp_url.is_(None),
-        PersistentBrowserSessionModel.browser_address.isnot(None),
-    ),
-    PersistentBrowserSessionModel.browser_vendor.is_distinct_from(EXTERNAL_CDP_BROWSER_VENDOR),
+# A vendor-held row has an upstream endpoint but no client-facing address, and stays off customer-facing surfaces.
+# Self-hosted routed rows, pre-routing rows and the caller's own registered external browsers all stay visible.
+_VISIBLE_TO_CUSTOMER = or_(
+    PersistentBrowserSessionModel.upstream_cdp_url.is_(None),
+    PersistentBrowserSessionModel.browser_address.isnot(None),
+    PersistentBrowserSessionModel.browser_vendor == EXTERNAL_CDP_BROWSER_VENDOR,
 )
+_NOT_EXTERNAL_CDP = PersistentBrowserSessionModel.browser_vendor.is_distinct_from(EXTERNAL_CDP_BROWSER_VENDOR)
 
 
 def clear_terminal_session_fields(row: PersistentBrowserSessionModel) -> None:
@@ -104,6 +111,115 @@ def _managed_browser_profile_query(
             is_managed=True,
         )
         .filter(BrowserProfileModel.deleted_at.is_(None))
+    )
+
+
+def unattributed_copilot_session(organization_id: str) -> ColumnElement[bool]:
+    """A Copilot browser that names no workflow and that no run, task, debug session, recording, binding or managed
+    profile ties to one: it predates the record of the workflow it authors, so whose browser it is cannot be known."""
+    browser = PersistentBrowserSessionModel
+    session_id = browser.persistent_browser_session_id
+    return and_(
+        # NULL-safe: a plain session has no creator, and NOT of a NULL comparison would hide it from every list.
+        browser.created_by.is_not_distinct_from("copilot"),
+        browser.created_for_workflow_permanent_id.is_(None),
+        browser.created_for_workflow_run_id.is_(None),
+        browser.bound_workflow_permanent_id.is_(None),
+        ~exists().where(
+            BrowserProfileModel.organization_id == organization_id,
+            BrowserProfileModel.browser_profile_id == browser.browser_profile_id,
+            BrowserProfileModel.workflow_permanent_id.is_not(None),
+        ),
+        # A link counts only when it names a workflow: a standalone task with no workflow run attributes nothing.
+        *(
+            ~exists().where(model.organization_id == organization_id, column == session_id, workflow.is_not(None))
+            for model, column, workflow in (
+                (WorkflowRunModel, WorkflowRunModel.browser_session_id, WorkflowRunModel.workflow_permanent_id),
+                (TaskV2Model, TaskV2Model.browser_session_id, TaskV2Model.workflow_permanent_id),
+                (DebugSessionModel, DebugSessionModel.browser_session_id, DebugSessionModel.workflow_permanent_id),
+                (
+                    BrowserRecordingModel,
+                    BrowserRecordingModel.browser_session_id,
+                    BrowserRecordingModel.workflow_permanent_id,
+                ),
+            )
+        ),
+        *(
+            ~exists().where(
+                model.organization_id == organization_id,
+                column == session_id,
+                run_column == WorkflowRunModel.workflow_run_id,
+                WorkflowRunModel.organization_id == organization_id,
+                WorkflowRunModel.workflow_permanent_id.is_not(None),
+            )
+            for model, column, run_column in (
+                (TaskModel, TaskModel.browser_session_id, TaskModel.workflow_run_id),
+                (TaskV2Model, TaskV2Model.browser_session_id, TaskV2Model.workflow_run_id),
+                (
+                    WorkflowRunAttemptModel,
+                    WorkflowRunAttemptModel.pinned_browser_session_id,
+                    WorkflowRunAttemptModel.workflow_run_id,
+                ),
+            )
+        ),
+    )
+
+
+async def _session_folder_filter(organization_id: str) -> ColumnElement[bool] | None:
+    """Hide sessions a hidden workflow ran, debugged or recorded in; they hold that workflow's browser and recordings."""
+    hidden = await _hidden_workflow_ids(organization_id)
+    if hidden is None:
+        return None
+    if not hidden:
+        # Restrictions exist but hide no workflow from this caller: only the unattributed rule applies, as in authorize.
+        return ~unattributed_copilot_session(organization_id)
+    session_id = PersistentBrowserSessionModel.persistent_browser_session_id
+    bound = PersistentBrowserSessionModel.bound_workflow_permanent_id
+    created_for = PersistentBrowserSessionModel.created_for_workflow_permanent_id
+    return and_(
+        or_(bound.is_(None), bound.not_in(hidden)),
+        # A Copilot chat's own browser belongs to the workflow being authored. One from before that was recorded is
+        # judged by whatever else links it, and hidden only when nothing does.
+        or_(created_for.is_(None), created_for.not_in(hidden)),
+        ~unattributed_copilot_session(organization_id),
+        # A session being provisioned for a run belongs to that run before the run row records it.
+        ~exists().where(
+            WorkflowRunModel.organization_id == organization_id,
+            WorkflowRunModel.workflow_run_id == PersistentBrowserSessionModel.created_for_workflow_run_id,
+            WorkflowRunModel.workflow_permanent_id.in_(hidden),
+        ),
+        # A session seeded from a hidden workflow's managed profile holds that workflow's login.
+        ~exists().where(
+            BrowserProfileModel.organization_id == organization_id,
+            BrowserProfileModel.browser_profile_id == PersistentBrowserSessionModel.browser_profile_id,
+            BrowserProfileModel.workflow_permanent_id.in_(hidden),
+        ),
+        *(
+            ~exists().where(
+                model.organization_id == organization_id,
+                model.browser_session_id == session_id,
+                model.workflow_permanent_id.in_(hidden),
+            )
+            for model in (WorkflowRunModel, DebugSessionModel, BrowserRecordingModel, TaskV2Model)
+        ),
+        # A retry can move the run to a new session while its earlier tasks keep the old one, and a Task V2 may
+        # record only its workflow run.
+        *(
+            ~exists().where(
+                task.organization_id == organization_id,
+                task.browser_session_id == session_id,
+                task.workflow_run_id == WorkflowRunModel.workflow_run_id,
+                WorkflowRunModel.workflow_permanent_id.in_(hidden),
+            )
+            for task in (TaskModel, TaskV2Model)
+        ),
+        # A retry or failed dispatch can leave the session pinned only on the run's attempt.
+        ~exists().where(
+            WorkflowRunAttemptModel.organization_id == organization_id,
+            WorkflowRunAttemptModel.pinned_browser_session_id == session_id,
+            WorkflowRunAttemptModel.workflow_run_id == WorkflowRunModel.workflow_run_id,
+            WorkflowRunModel.workflow_permanent_id.in_(hidden),
+        ),
     )
 
 
@@ -239,12 +355,17 @@ class BrowserSessionsRepository(BaseRepository):
         page_size: int = 10,
         search_key: str | None = None,
         managed: bool | None = None,
+        exclude_search_profile_ids: set[str] | None = None,
     ) -> list[BrowserProfile]:
         if page < 1:
             raise ValueError(f"Page must be greater than 0, got {page}")
         db_page = page - 1
+        # Managed profiles are keyed to one workflow (ADR 0006) and hold its logged-in state.
+        folder_filter = await _folder_access_filter(organization_id, BrowserProfileModel.workflow_permanent_id)
         async with self.Session() as session:
             query = select(BrowserProfileModel).filter_by(organization_id=organization_id)
+            if folder_filter is not None:
+                query = query.filter(folder_filter)
             if not include_deleted:
                 query = query.filter(BrowserProfileModel.deleted_at.is_(None))
             if managed is not None:
@@ -257,6 +378,8 @@ class BrowserSessionsRepository(BaseRepository):
                         BrowserProfileModel.description.ilike(search_like),
                     )
                 )
+                if exclude_search_profile_ids:
+                    query = query.filter(BrowserProfileModel.browser_profile_id.notin_(exclude_search_profile_ids))
             # The id tie-break only needs to be deterministic so pagination stays
             # stable when created_at collides; it isn't meant to encode recency.
             query = (
@@ -271,17 +394,23 @@ class BrowserSessionsRepository(BaseRepository):
             # without a per-row usage fetch (which fanned out one 3-table join per row on every list load).
             if profiles:
                 credential_rows = await session.execute(
-                    select(CredentialModel.browser_profile_id, CredentialModel.name).where(
+                    select(
+                        CredentialModel.browser_profile_id,
+                        CredentialModel.credential_id,
+                        CredentialModel.name,
+                    ).where(
                         CredentialModel.browser_profile_id.in_([p.browser_profile_id for p in profiles]),
                         CredentialModel.organization_id == organization_id,
                         CredentialModel.deleted_at.is_(None),
                     )
                 )
-                name_by_profile: dict[str, str] = {}
-                for browser_profile_id, name in credential_rows.all():
-                    name_by_profile.setdefault(browser_profile_id, name)
+                credential_by_profile: dict[str, tuple[str, str]] = {}
+                for browser_profile_id, credential_id, name in credential_rows.all():
+                    credential_by_profile.setdefault(browser_profile_id, (credential_id, name))
                 for profile in profiles:
-                    profile.linked_credential_name = name_by_profile.get(profile.browser_profile_id)
+                    linked_credential = credential_by_profile.get(profile.browser_profile_id)
+                    if linked_credential is not None:
+                        profile.linked_credential_id, profile.linked_credential_name = linked_credential
 
             return profiles
 
@@ -295,6 +424,8 @@ class BrowserSessionsRepository(BaseRepository):
     ) -> BrowserProfileUsage:
         """Who depends on this profile: workflows that pin it, credentials that link it, and how many
         runs it has seeded lately. Powers the Refresh/Delete used-by confirmation and the list-row badges."""
+        folder_filter = await _folder_access_filter(organization_id, WorkflowModel.workflow_permanent_id)
+        run_folder_filter = await _folder_access_filter(organization_id, WorkflowRunModel.workflow_permanent_id)
         async with self.Session() as session:
             latest_versions = (
                 select(
@@ -320,6 +451,7 @@ class BrowserSessionsRepository(BaseRepository):
                 .where(
                     WorkflowModel.organization_id == organization_id,
                     WorkflowModel.browser_profile_id == profile_id,
+                    *([folder_filter] if folder_filter is not None else []),
                 )
             )
             workflow_rows = (await session.execute(workflows_query)).all()
@@ -343,6 +475,7 @@ class BrowserSessionsRepository(BaseRepository):
                     .where(
                         WorkflowModel.organization_id == organization_id,
                         WorkflowModel.seed_browser_profile_id == profile_id,
+                        *([folder_filter] if folder_filter is not None else []),
                     )
                 )
                 # A workflow can hold the same profile in both columns (lossless both-set encoding), so emit
@@ -377,6 +510,7 @@ class BrowserSessionsRepository(BaseRepository):
                         WorkflowRunModel.browser_profile_id == profile_id,
                         WorkflowRunModel.organization_id == organization_id,
                         WorkflowRunModel.created_at >= recent_cutoff,
+                        *([run_folder_filter] if run_folder_filter is not None else []),
                     )
                 )
             ).scalar_one()
@@ -411,9 +545,7 @@ class BrowserSessionsRepository(BaseRepository):
 
             linked_credentials = (
                 await session.scalars(
-                    select(CredentialModel)
-                    .filter_by(browser_profile_id=profile_id, organization_id=organization_id)
-                    .filter(CredentialModel.deleted_at.is_(None))
+                    select(CredentialModel).filter_by(browser_profile_id=profile_id, organization_id=organization_id)
                 )
             ).all()
             cleared_credential_ids = [credential.credential_id for credential in linked_credentials]
@@ -591,10 +723,13 @@ class BrowserSessionsRepository(BaseRepository):
         self,
         organization_id: str,
         active_hours: int = 24,
+        *,
+        include_external_cdp: bool = False,
     ) -> list[PersistentBrowserSession]:
-        """Get all active persistent browser sessions for an organization."""
+        """Active sessions for an organization. Registered external browsers only on request, because some callers
+        close every session listed and must not end a browser the customer runs."""
         async with self.Session() as session:
-            result = await session.execute(
+            query = (
                 select(PersistentBrowserSessionModel)
                 .filter_by(organization_id=organization_id)
                 .filter_by(deleted_at=None)
@@ -602,6 +737,9 @@ class BrowserSessionsRepository(BaseRepository):
                 .filter(PersistentBrowserSessionModel.created_at > naive_utc_now() - timedelta(hours=active_hours))
                 .filter(_VISIBLE_TO_CUSTOMER)
             )
+            if not include_external_cdp:
+                query = query.filter(_NOT_EXTERNAL_CDP)
+            result = await session.execute(query)
             sessions = result.scalars().all()
             return [PersistentBrowserSession.model_validate(session) for session in sessions]
 
@@ -614,6 +752,7 @@ class BrowserSessionsRepository(BaseRepository):
         lookback_hours: int = 24 * 7,
     ) -> list[PersistentBrowserSession]:
         """Get persistent browser sessions history for an organization."""
+        folder_filter = await _session_folder_filter(organization_id)
         async with self.Session() as session:
             open_first = case(
                 (
@@ -629,6 +768,7 @@ class BrowserSessionsRepository(BaseRepository):
                 .filter_by(deleted_at=None)
                 .filter(PersistentBrowserSessionModel.created_at > (naive_utc_now() - timedelta(hours=lookback_hours)))
                 .filter(_VISIBLE_TO_CUSTOMER)
+                .filter(*([folder_filter] if folder_filter is not None else []))
                 .order_by(
                     open_first.asc(),  # open sessions first
                     PersistentBrowserSessionModel.created_at.desc(),  # then newest within each group
@@ -650,6 +790,7 @@ class BrowserSessionsRepository(BaseRepository):
         Mirrors the filters of :meth:`get_persistent_browser_sessions_history` so the
         total matches what the paginated read returns.
         """
+        folder_filter = await _session_folder_filter(organization_id)
         async with self.Session() as session:
             count_query = (
                 select(func.count())
@@ -658,10 +799,27 @@ class BrowserSessionsRepository(BaseRepository):
                 .filter_by(deleted_at=None)
                 .filter(PersistentBrowserSessionModel.created_at > (naive_utc_now() - timedelta(hours=lookback_hours)))
                 .filter(_VISIBLE_TO_CUSTOMER)
+                .filter(*([folder_filter] if folder_filter is not None else []))
             )
             return (await session.execute(count_query)).scalar_one()
 
     @read_retry()
+    @db_operation("get_folder_visible_browser_session_ids")
+    async def get_folder_visible_browser_session_ids(self, organization_id: str, session_ids: list[str]) -> set[str]:
+        """The given sessions the caller may see, in one query; every one when no folder is hidden."""
+        folder_filter = await _session_folder_filter(organization_id)
+        if folder_filter is None or not session_ids:
+            return set(session_ids)
+        async with self.Session() as session:
+            rows = await session.scalars(
+                select(PersistentBrowserSessionModel.persistent_browser_session_id).where(
+                    PersistentBrowserSessionModel.organization_id == organization_id,
+                    PersistentBrowserSessionModel.persistent_browser_session_id.in_(session_ids),
+                    folder_filter,
+                )
+            )
+            return set(rows.all())
+
     @db_operation("get_live_bound_persistent_browser_session", log_errors=False)
     async def get_live_bound_persistent_browser_session(
         self,
@@ -766,7 +924,8 @@ class BrowserSessionsRepository(BaseRepository):
                 return PersistentBrowserSession.model_validate(persistent_browser_session)
             return None
 
-    @db_operation("get_persistent_browser_session")
+    @read_retry()
+    @db_operation("get_persistent_browser_session", log_errors=False)
     async def get_persistent_browser_session(
         self,
         session_id: str,
@@ -864,9 +1023,9 @@ class BrowserSessionsRepository(BaseRepository):
     async def touch_last_activity(self, session_id: str, last_activity_at: datetime | None = None) -> None:
         """Record that a session was actively driven, for activity-based lease renewal.
 
-        Unscoped by organization on purpose: the CDP proxy calls this and learns the owning
-        org from the row, never from client input. A single UPDATE with no read-back — a
-        best-effort, no-op when the row is gone — so it stays cheap on the relay hot path.
+        Unscoped by organization on purpose: the CDP proxy learns the owning org from the row,
+        while SDK callers must verify ownership before calling. A single UPDATE with no read-back,
+        and a no-op when the row is gone, keeps it cheap on the relay hot path.
         """
         ts = to_naive_utc(last_activity_at) if last_activity_at is not None else naive_utc_now()
         async with self.Session() as session:
@@ -876,9 +1035,16 @@ class BrowserSessionsRepository(BaseRepository):
                 .where(PersistentBrowserSessionModel.deleted_at.is_(None))
                 # Monotonic write: touches are fire-and-forget from the proxy, so an out-of-order
                 # commit must never move last_activity_at backward and shorten a live lease.
+                # CASE, not GREATEST: SQLite has no GREATEST, and the statement error rolls back
+                # whatever transaction the test DB's shared connection is carrying. A NULL mark
+                # fails the comparison and takes the else, matching the prior COALESCE behavior.
                 .values(
-                    last_activity_at=func.greatest(
-                        func.coalesce(PersistentBrowserSessionModel.last_activity_at, ts), ts
+                    last_activity_at=case(
+                        (
+                            PersistentBrowserSessionModel.last_activity_at > ts,
+                            PersistentBrowserSessionModel.last_activity_at,
+                        ),
+                        else_=ts,
                     )
                 )
             )
@@ -1020,6 +1186,7 @@ class BrowserSessionsRepository(BaseRepository):
         expected_browser_session_id: str | None = None,
         browser_settings: BrowserSettings | None = None,
         created_for_workflow_run_id: str | None = None,
+        created_for_workflow_permanent_id: str | None = None,
     ) -> PersistentBrowserSession:
         """Create a new persistent browser session."""
         extensions_str: list[str] | None = (
@@ -1077,10 +1244,12 @@ class BrowserSessionsRepository(BaseRepository):
                 bound_workflow_permanent_id=bound_workflow_permanent_id,
                 bound_key=bound_key,
                 created_by=created_by,
+                created_for_workflow_permanent_id=created_for_workflow_permanent_id,
+                # Folder access follows the run a session is created for, before the run row records the session.
+                created_for_workflow_run_id=created_for_workflow_run_id,
             )
             if browser_settings is not None and requested_timezone_id(browser_settings) is not None:
                 browser_session.browser_settings = browser_settings.model_dump(mode="json")
-                browser_session.created_for_workflow_run_id = created_for_workflow_run_id
             session.add(browser_session)
             await session.flush()
             if (

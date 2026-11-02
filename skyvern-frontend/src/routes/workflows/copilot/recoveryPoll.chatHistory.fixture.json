@@ -32,7 +32,6 @@
         "copilot_pending_capability": null,
         "copilot_turn_id": "e0598835b41941e8b493f4bd73a72282",
         "idempotency_digest": null,
-        "unresolved_runtime_failure": null,
         "connected_account_choices": null
       },
       "narrative_payload": {

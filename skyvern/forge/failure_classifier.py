@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import hashlib
+import json
 import math
 import re
 from enum import StrEnum
@@ -8,7 +10,15 @@ from typing import Any
 import structlog
 
 from skyvern.constants import PROXY_TRANSPORT_NAV_ERRORS
-from skyvern.exceptions import NO_ADDRESS_RECORD_NAV_ERROR_MARKER, CaptchaSolveError, FailedToNavigateToUrl
+from skyvern.exceptions import (
+    NO_ADDRESS_RECORD_NAV_ERROR_MARKER,
+    CaptchaSolveError,
+    FailedToNavigateToUrl,
+)
+from skyvern.forge.sdk.schemas.har_evidence import (
+    FINAL_HAR_USER_MATCH_REASON_CODE,
+    is_final_har_user_match_entry,
+)
 
 LOG = structlog.get_logger(__name__)
 
@@ -603,6 +613,45 @@ _MIN_ATTRIBUTION_CONFIDENCE = 0.7
 # Shared with typed run emitters; dynamic/user-defined categories remain excluded.
 _FAILURE_CATEGORY_LITERALS = frozenset(category.value for category in FailureCategory)
 
+
+def partition_failure_categories(value: Any) -> tuple[list[dict], list[str]]:
+    """Keep exact taxonomy values; map any non-empty invalid-only response to UNKNOWN."""
+    kept: list[dict] = []
+    rejected: list[str] = []
+    for entry in value if isinstance(value, list) else ():
+        if not isinstance(entry, dict):
+            continue
+        name = entry.get("category")
+        if not isinstance(name, str):
+            continue
+        if name not in _FAILURE_CATEGORY_LITERALS:
+            rejected.append(name)
+            continue
+        kept.append(entry)
+    if isinstance(value, list) and value and not kept:
+        kept = [
+            {
+                "category": FailureCategory.UNKNOWN.value,
+                "confidence_float": 0.5,
+                "reasoning": "Model returned no recognized failure category",
+            }
+        ]
+    return kept, rejected
+
+
+def bounded_failure_categories(value: Any) -> list[dict]:
+    """``value``'s entries narrowed to this taxonomy; see partition_failure_categories."""
+    kept, rejected = partition_failure_categories(value)
+    if rejected:
+        LOG.warning(
+            "Dropped model-written failure categories outside the known taxonomy",
+            rejected_category_count=len(rejected),
+            kept_category_count=len(kept),
+        )
+    return kept
+
+
+# Persisted failure_category reason codes are separate from HTTP error codes, even where their values match.
 # Bounded reason codes emitted by out-of-module terminal producers. Defined here as the single
 # source of truth so a producer and this allowlist cannot drift: the browser-lease seam
 # (skyvern/forge/sdk/workflow/service.py::_browser_lease_failure_category) imports these.
@@ -616,15 +665,28 @@ SITE_THROTTLE_REASON_CODE = "site_throttle"
 EXTERNAL_SERVICE_THROTTLE_REASON_CODE = "external_service_throttle"
 SIGN_IN_FORM_VISIBLE_REASON_CODE = "sign_in_form_visible"
 SAVED_PROFILE_SIGNED_OUT_REASON_CODE = "saved_profile_signed_out"
+# The user-defined errors a task v2 root's own failure summary matched, carried for the run's errors[] output.
+TASK_V2_ROOT_USER_ERRORS_REASON_CODE = "task_v2_root_user_errors"
+_MAX_ROOT_USER_ERRORS = 10
+HAR_ANTI_BOT_DIAGNOSTIC_REASON_CODE = "har_anti_bot_diagnostic"
+# Task, workflow run and task v2 statuses a final diagnostic may annotate; never completed or canceled.
+DIAGNOSABLE_FAILURE_STATUSES = frozenset({"failed", "terminated", "timed_out"})
 
 # ANTI_BOT_DETECTION entries carrying one of these are labels only: runtime consumers must treat the
 # failure exactly as they did before it was labeled anti-bot. Code that acts on a failure_category it
 # reads (or hands to a model) must go through without_output_only_labels or skip these entries.
 OUTPUT_ONLY_ANTI_BOT_REASON_CODES = frozenset(
-    {UNSOLVED_CAPTCHA_BEFORE_BROWSER_LOSS_REASON_CODE, SITE_THROTTLE_REASON_CODE}
+    {UNSOLVED_CAPTCHA_BEFORE_BROWSER_LOSS_REASON_CODE, SITE_THROTTLE_REASON_CODE, HAR_ANTI_BOT_DIAGNOSTIC_REASON_CODE}
 )
 # Entries of any category carrying one of these are labels for the run page; the same scrub hides them.
-OUTPUT_ONLY_LABEL_REASON_CODES = frozenset({SIGN_IN_FORM_VISIBLE_REASON_CODE, SAVED_PROFILE_SIGNED_OUT_REASON_CODE})
+OUTPUT_ONLY_LABEL_REASON_CODES = frozenset(
+    {
+        SIGN_IN_FORM_VISIBLE_REASON_CODE,
+        SAVED_PROFILE_SIGNED_OUT_REASON_CODE,
+        TASK_V2_ROOT_USER_ERRORS_REASON_CODE,
+        FINAL_HAR_USER_MATCH_REASON_CODE,
+    }
+)
 
 
 def with_sign_in_form_visible(categories: list[dict] | None) -> list[dict]:
@@ -663,6 +725,38 @@ def with_saved_profile_signed_out(categories: list[dict] | None) -> list[dict] |
     return tagged
 
 
+def with_diagnostic_entry(categories: list | None, entry: dict[str, Any]) -> list:
+    """``categories`` with ``entry`` replacing any earlier entry of its reason code, so a repeated cleanup leaves one;
+    appended, so the primary entry every runtime reader uses is unchanged."""
+    kept = [c for c in categories or [] if not (isinstance(c, dict) and c.get("reason_code") == entry["reason_code"])]
+    return [*kept, entry]
+
+
+def with_root_user_errors(categories: list[dict] | None, user_errors: list[dict[str, Any]]) -> list[dict] | None:
+    """``categories`` with the root's matched user errors appended after every entry. The entry repeats the primary's
+    category, so readers of the category set (credential fallback) see the same run."""
+    if not categories or not user_errors:
+        return categories
+    entry = {
+        "category": categories[0].get("category"),
+        "confidence_float": categories[0].get("confidence_float"),
+        "reason_code": TASK_V2_ROOT_USER_ERRORS_REASON_CODE,
+        "reasoning": "User-defined errors the run's failure summary matched",
+        "user_errors": user_errors[:_MAX_ROOT_USER_ERRORS],
+    }
+    return [*categories, entry]
+
+
+def has_classifier_primary(categories: object) -> bool:
+    """Whether ``categories[0]`` is a classifier entry; an output-only label there is not a primary to follow."""
+    return (
+        isinstance(categories, list)
+        and bool(categories)
+        and isinstance(categories[0], dict)
+        and not is_output_only_entry(categories[0])
+    )
+
+
 def is_output_only_entry(category: object) -> bool:
     if not isinstance(category, dict):
         return False
@@ -671,6 +765,71 @@ def is_output_only_entry(category: object) -> bool:
         category.get("category") == FailureCategory.ANTI_BOT_DETECTION.value
         and reason_code in OUTPUT_ONLY_ANTI_BOT_REASON_CODES
     )
+
+
+def final_har_user_mapping_digest(error_code_mapping: dict[str, str] | None) -> str | None:
+    """A digest of the mapping a final match read, so a write can tell the mapping it answered is still current."""
+    if not error_code_mapping:
+        return None
+    return hashlib.sha256(json.dumps(error_code_mapping, sort_keys=True).encode()).hexdigest()
+
+
+def _final_har_user_match_entry(categories: object) -> dict[str, Any] | None:
+    for category in categories if isinstance(categories, list) else []:
+        if is_final_har_user_match_entry(category):
+            return category
+    return None
+
+
+def final_har_user_match_spent(categories: object, identity: dict[str, Any]) -> bool:
+    """Whether this execution's one match was already claimed. ``identity`` names the execution only, so a later
+    change of mapping or of the row it is read from never buys the execution another request."""
+    entry = _final_har_user_match_entry(categories)
+    return entry is not None and entry.get("identity") == identity
+
+
+def final_har_user_match_claimed(categories: object, identity: dict[str, Any], source: dict[str, Any]) -> bool:
+    entry = _final_har_user_match_entry(categories)
+    return (
+        entry is not None
+        and entry.get("identity") == identity
+        and entry.get("source") == source
+        and entry.get("state") == "claimed"
+    )
+
+
+def with_final_har_user_match_claim(categories: list | None, identity: dict[str, Any], source: dict[str, Any]) -> list:
+    return with_diagnostic_entry(
+        categories,
+        {"reason_code": FINAL_HAR_USER_MATCH_REASON_CODE, "identity": identity, "source": source, "state": "claimed"},
+    )
+
+
+def with_final_har_user_match_result(
+    categories: list | None,
+    identity: dict[str, Any],
+    source: dict[str, Any],
+    inserted: list[str],
+    user_errors: list[dict[str, Any]] | None = None,
+) -> list:
+    """The claim marked done. ``inserted`` names only the task rows the match itself added, which a reset removes;
+    ``user_errors`` holds a workflow run's matched rows, which its response projects."""
+    entry: dict[str, Any] = {
+        "reason_code": FINAL_HAR_USER_MATCH_REASON_CODE,
+        "identity": identity,
+        "source": source,
+        "state": "done",
+        "inserted": inserted,
+    }
+    if user_errors is not None:
+        entry["user_errors"] = user_errors
+    return with_diagnostic_entry(categories, entry)
+
+
+def final_har_user_match_inserted(categories: object) -> list[str]:
+    entry = _final_har_user_match_entry(categories)
+    inserted = entry.get("inserted") if entry else None
+    return [code for code in inserted if isinstance(code, str)] if isinstance(inserted, list) else []
 
 
 def without_output_only_categories(categories: list) -> list:
@@ -732,6 +891,7 @@ _REASON_CODE_LITERALS = frozenset(
         WORKER_CONTAINER_RESTARTED_REASON_CODE,
         SIGN_IN_FORM_VISIBLE_REASON_CODE,
         SAVED_PROFILE_SIGNED_OUT_REASON_CODE,
+        HAR_ANTI_BOT_DIAGNOSTIC_REASON_CODE,
     }
 )
 

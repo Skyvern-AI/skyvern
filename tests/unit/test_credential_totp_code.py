@@ -1,15 +1,24 @@
+from collections.abc import Callable
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock
 from urllib.parse import quote
 
 import pyotp
 import pytest
+import structlog.testing
 from fastapi import HTTPException, Response
 
+from skyvern.exceptions import (
+    CredentialSourceNotConfiguredError,
+    OnePasswordGetItemError,
+    OnePasswordRateLimitError,
+    OnePasswordServiceUnavailableError,
+)
 from skyvern.forge.sdk.routes import credentials
 from skyvern.forge.sdk.schemas.credentials import (
     CredentialItem,
     CredentialType,
+    CredentialVaultType,
     NonEmptyPasswordCredential,
     PasswordCredential,
     TotpType,
@@ -28,12 +37,13 @@ def _mock_totp_preview_dependencies(
     secret: str | None,
     credential_id: str = "cred_test",
     organization_id: str = "org_test",
-) -> tuple[SimpleNamespace, SimpleNamespace, SimpleNamespace]:
+    vault_type: CredentialVaultType | None = None,
+) -> tuple[SimpleNamespace, SimpleNamespace, SimpleNamespace, AsyncMock]:
     db_credential = SimpleNamespace(
         credential_id=credential_id,
         organization_id=organization_id,
         name="Example",
-        vault_type=None,
+        vault_type=vault_type,
         item_id="item_test",
         credential_type=CredentialType.PASSWORD,
         totp_type=TotpType.AUTHENTICATOR,
@@ -54,6 +64,7 @@ def _mock_totp_preview_dependencies(
         )
     )
     mock_credentials = SimpleNamespace(get_credential=AsyncMock(return_value=db_credential))
+    audit_writer = AsyncMock()
     monkeypatch.setattr(credentials.app, "DATABASE", SimpleNamespace(credentials=mock_credentials))
     monkeypatch.setattr(
         credentials.app,
@@ -61,11 +72,12 @@ def _mock_totp_preview_dependencies(
         SimpleNamespace(
             parse_enterprise_totp_secret=AsyncMock(return_value=None),
             parse_enterprise_totp_secret_result=AsyncMock(return_value=AuthenticatorTotpParseResult()),
+            record_audit_event=audit_writer,
         ),
     )
     monkeypatch.setattr(credentials, "_get_credential_vault_service", AsyncMock(return_value=vault_service))
 
-    return db_credential, vault_service, mock_credentials
+    return db_credential, vault_service, mock_credentials, audit_writer
 
 
 def test_clear_cached_totp_code_preview_removes_entry() -> None:
@@ -314,7 +326,9 @@ def test_authenticator_totp_validation_ignores_non_authenticator_methods() -> No
 @pytest.mark.asyncio
 async def test_get_credential_totp_code_returns_current_generated_code(monkeypatch: pytest.MonkeyPatch) -> None:
     secret = "JBSWY3DPEHPK3PXP"
-    db_credential, vault_service, mock_credentials = _mock_totp_preview_dependencies(monkeypatch, secret=secret)
+    db_credential, vault_service, mock_credentials, audit_writer = _mock_totp_preview_dependencies(
+        monkeypatch, secret=secret
+    )
     monkeypatch.setattr(credentials.time, "time", lambda: 0)
 
     response = await credentials.get_credential_totp_code(
@@ -330,6 +344,14 @@ async def test_get_credential_totp_code_returns_current_generated_code(monkeypat
         organization_id="org_test",
     )
     vault_service.get_credential_item.assert_awaited_once_with(db_credential)
+    audit_writer.assert_awaited_once()
+    assert audit_writer.await_args is not None
+    event = audit_writer.await_args.args[1]
+    assert (event.action, event.resource_type, event.resource_id) == (
+        "credential.totp_code.read",
+        "credential",
+        "cred_test",
+    )
 
 
 @pytest.mark.asyncio
@@ -355,7 +377,9 @@ async def test_get_credential_totp_code_uses_otpauth_uri_parameters(monkeypatch:
 @pytest.mark.asyncio
 async def test_get_credential_totp_code_uses_cache_within_current_window(monkeypatch: pytest.MonkeyPatch) -> None:
     secret = "JBSWY3DPEHPK3PXP"
-    db_credential, vault_service, mock_credentials = _mock_totp_preview_dependencies(monkeypatch, secret=secret)
+    db_credential, vault_service, mock_credentials, audit_writer = _mock_totp_preview_dependencies(
+        monkeypatch, secret=secret
+    )
     current_time = 0
     monkeypatch.setattr(credentials, "_get_credential_vault_service", AsyncMock(return_value=vault_service))
     monkeypatch.setattr(credentials.time, "time", lambda: current_time)
@@ -382,6 +406,7 @@ async def test_get_credential_totp_code_uses_cache_within_current_window(monkeyp
     )
     assert mock_credentials.get_credential.await_count == 2
     vault_service.get_credential_item.assert_awaited_once_with(db_credential)
+    assert audit_writer.await_count == 2
 
 
 @pytest.mark.asyncio
@@ -426,3 +451,87 @@ async def test_get_credential_totp_code_sets_no_store_headers(monkeypatch: pytes
 
     assert response.headers["Cache-Control"] == "no-store"
     assert response.headers["Pragma"] == "no-cache"
+
+
+@pytest.mark.parametrize(
+    ("error_factory", "status_code", "detail"),
+    [
+        pytest.param(
+            lambda: CredentialSourceNotConfiguredError(
+                "1Password is not configured for this organization. Add a 1Password service account token in Settings."
+            ),
+            400,
+            "1Password is not configured for this organization. Add a 1Password service account token in Settings.",
+            id="missing-configuration",
+        ),
+        pytest.param(
+            lambda: OnePasswordRateLimitError("429"),
+            429,
+            "1Password rate limit exceeded. Please retry in a few minutes.",
+            id="rate-limited",
+        ),
+        pytest.param(
+            lambda: OnePasswordServiceUnavailableError(status_code=503),
+            502,
+            "1Password is temporarily unavailable. Please retry in a few minutes.",
+            id="unavailable",
+        ),
+        pytest.param(
+            lambda: OnePasswordGetItemError("service account token is invalid"),
+            400,
+            "Your 1Password service account token appears to be invalid or expired. Please update it in Settings and try again.",
+            id="invalid-token",
+        ),
+    ],
+)
+@pytest.mark.asyncio
+async def test_onepassword_totp_preview_maps_item_list_failures(
+    monkeypatch: pytest.MonkeyPatch,
+    error_factory: Callable[[], Exception],
+    status_code: int,
+    detail: str,
+) -> None:
+    _db_credential, vault_service, _mock_credentials, _audit_writer = _mock_totp_preview_dependencies(
+        monkeypatch,
+        secret="JBSWY3DPEHPK3PXP",
+        vault_type=CredentialVaultType.ONEPASSWORD,
+    )
+    vault_service.get_credential_item.side_effect = error_factory()
+
+    with pytest.raises(HTTPException) as exc_info:
+        await credentials.get_credential_totp_code(
+            response=Response(),
+            credential_id="cred_test",
+            current_org=SimpleNamespace(organization_id="org_test"),
+        )
+
+    assert exc_info.value.status_code == status_code
+    assert exc_info.value.detail == detail
+
+
+@pytest.mark.asyncio
+async def test_onepassword_totp_preview_logs_unmapped_failure_without_secret(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _db_credential, vault_service, _mock_credentials, _audit_writer = _mock_totp_preview_dependencies(
+        monkeypatch,
+        secret="JBSWY3DPEHPK3PXP",
+        vault_type=CredentialVaultType.ONEPASSWORD,
+    )
+    vault_service.get_credential_item.side_effect = RuntimeError("unexpected provider failure")
+
+    with structlog.testing.capture_logs() as logs, pytest.raises(HTTPException) as exc_info:
+        await credentials.get_credential_totp_code(
+            response=Response(),
+            credential_id="cred_test",
+            current_org=SimpleNamespace(organization_id="org_test"),
+        )
+
+    assert exc_info.value.status_code == 500
+    assert exc_info.value.detail == "Unable to retrieve credential from vault"
+    error_logs = [record for record in logs if record.get("log_level") == "error"]
+    assert len(error_logs) == 1
+    assert error_logs[0]["event"] == "Failed to retrieve credential item for TOTP code preview"
+    assert error_logs[0]["organization_id"] == "org_test"
+    assert error_logs[0]["credential_id"] == "cred_test"
+    assert "JBSWY3DPEHPK3PXP" not in repr(error_logs[0])

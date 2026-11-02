@@ -16,6 +16,7 @@ import {
   SelectTrigger,
   SelectValue,
 } from "@/components/ui/select";
+import { Switch } from "@/components/ui/switch";
 import { WorkflowBlockInput } from "@/components/WorkflowBlockInput";
 import { WorkflowDataSchemaInputGroup } from "@/components/DataSchemaInputGroup/WorkflowDataSchemaInputGroup";
 
@@ -235,6 +236,26 @@ function FileParserEditorBody({
                 update({ nextLoopOnFailure })
               }
             />
+            <div className="flex items-center justify-between gap-2 pt-2">
+              <div className="flex min-w-0 items-center gap-2">
+                <Label className="truncate text-xs font-normal text-tertiary-foreground">
+                  Force OCR
+                </Label>
+                <HelpTooltip content={helpTooltips["fileParser"]["forceOcr"]} />
+              </div>
+              <div className="w-52 shrink-0">
+                <Switch
+                  checked={data.forceOcr ?? false}
+                  data-testid="force-ocr-switch"
+                  onCheckedChange={(checked) => {
+                    if (!editable) {
+                      return;
+                    }
+                    update({ forceOcr: checked });
+                  }}
+                />
+              </div>
+            </div>
             <IgnoreWorkflowSystemPrompt
               ignoreWorkflowSystemPrompt={
                 data.ignoreWorkflowSystemPrompt ?? false

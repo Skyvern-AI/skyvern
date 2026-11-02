@@ -19,6 +19,8 @@ from skyvern.schemas.run_blocks import BaseRunBlockRequest
 from skyvern.schemas.runs import BlockRunRequest, TaskRunRequest, WorkflowRunRequest
 from skyvern.schemas.workflows import WorkflowCreateYAMLRequest
 from skyvern.utils.url_validators import (
+    HostVerdict,
+    classify_host,
     encode_url,
     is_blocked_host,
     prepend_scheme_and_validate_url,
@@ -349,15 +351,19 @@ def test_is_blocked_host_allows_public_dns_answers(monkeypatch: pytest.MonkeyPat
     assert is_blocked_host("public.example.test", resolve_dns=True) is False
 
 
-def test_is_blocked_host_does_not_treat_worker_dns_failure_as_a_policy_block(
+def test_is_blocked_host_refuses_a_host_the_worker_cannot_resolve(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    # SKY-18836: the browser resolves the name itself, so a public-suffix name with a
+    # split-horizon internal A record is NXDOMAIN here and 10.x there. Admitting it because our
+    # own check could not run is an egress-policy bypass, not a lenient read of DNS.
     def fails_dns(host: str, port: int | None, *args: object, **kwargs: object) -> list[object]:
         raise OSError("dns unavailable")
 
     monkeypatch.setattr("skyvern.utils.url_validators.socket.getaddrinfo", fails_dns)
 
-    assert is_blocked_host("public.example.test", resolve_dns=True) is False
+    assert is_blocked_host("public.example.test", resolve_dns=True) is True
+    assert classify_host("public.example.test", resolve_dns=True) is HostVerdict.UNRESOLVABLE
 
 
 @pytest.mark.parametrize("host", ["10.0.0.5", "127.0.0.1", "169.254.169.254", "localhost"])
@@ -451,6 +457,33 @@ def test_validate_fetch_url_allows_localhost_in_allowed_hosts(monkeypatch: pytes
     url = "http://localhost:8000/"
 
     assert validate_fetch_url(url) == url
+
+
+@pytest.mark.parametrize("url", ["http://10.0.0.5/", "http://169.254.169.254/", "http://localhost:8000/"])
+def test_disabling_url_validation_lifts_the_ssrf_guard_for_every_host(
+    monkeypatch: pytest.MonkeyPatch, url: str
+) -> None:
+    monkeypatch.setattr(settings, "ALLOWED_HOSTS", [])
+    with pytest.raises(BlockedHost):
+        validate_fetch_url(url)
+
+    monkeypatch.setattr(settings, "ENABLE_URL_VALIDATION", False)
+    assert validate_fetch_url(url) == url
+
+
+def test_disabling_url_validation_allows_hostname_resolving_to_private_address(monkeypatch: pytest.MonkeyPatch) -> None:
+    def resolves_to_private(host: str, port: int | None, *args: object, **kwargs: object) -> list[object]:
+        return [(socket.AF_INET, socket.SOCK_STREAM, 0, "", ("10.0.1.128", port or 0))]
+
+    monkeypatch.setattr(settings, "ALLOWED_HOSTS", [])
+    monkeypatch.setattr("skyvern.utils.url_validators.socket.getaddrinfo", resolves_to_private)
+    url = "https://intranet.example.test/login"
+    with pytest.raises(BlockedHost):
+        validate_fetch_url(url)
+
+    monkeypatch.setattr(settings, "ENABLE_URL_VALIDATION", False)
+    assert validate_fetch_url(url) == url
+    assert is_blocked_host("intranet.example.test", resolve_dns=True) is False
 
 
 @pytest.mark.parametrize("url", ["http://169.254.169.254/", "http://10.0.0.5/"])

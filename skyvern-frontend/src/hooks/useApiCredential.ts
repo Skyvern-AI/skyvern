@@ -2,6 +2,7 @@ import { useQuery } from "@tanstack/react-query";
 
 import { getClient } from "@/api/AxiosClient";
 import { ApiKeyApiResponse, OrganizationApiResponse } from "@/api/types";
+import { useHasCapability, usePageSlots } from "@/store/PageSlots";
 import { getRuntimeApiKey } from "@/util/env";
 import { useCredentialGetter } from "./useCredentialGetter";
 
@@ -14,6 +15,8 @@ type ApiCredentialStatus = {
 function useApiCredentialStatus(): ApiCredentialStatus {
   const credentialGetter = useCredentialGetter();
   const credentialsFromEnv = getRuntimeApiKey();
+  const canReadApiKeys = useHasCapability("api_key.list");
+  const { permissions } = usePageSlots();
 
   const {
     data: organizations,
@@ -45,7 +48,7 @@ function useApiCredentialStatus(): ApiCredentialStatus {
         .get(`/organizations/${organizationId}/apikeys`)
         .then((response) => response.data.api_keys);
     },
-    enabled: !!organizationId, // don't run this until organization id exists
+    enabled: !!organizationId && canReadApiKeys, // don't run this until organization id exists
   });
 
   if (credentialsFromEnv !== null) {
@@ -57,9 +60,15 @@ function useApiCredentialStatus(): ApiCredentialStatus {
   }
 
   return {
-    apiKey: apiKeys?.[0]?.token ?? null,
-    isPending: organizationsPending || (!!organizationId && apiKeysPending),
-    isError: organizationsError || (!!organizationId && apiKeysError),
+    apiKey: canReadApiKeys ? (apiKeys?.[0]?.token ?? null) : null,
+    isPending:
+      permissions?.status === "loading" ||
+      organizationsPending ||
+      (!!organizationId && canReadApiKeys && apiKeysPending),
+    isError:
+      permissions?.status === "error" ||
+      organizationsError ||
+      (!!organizationId && canReadApiKeys && apiKeysError),
   };
 }
 

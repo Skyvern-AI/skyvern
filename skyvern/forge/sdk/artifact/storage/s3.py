@@ -15,7 +15,7 @@ from skyvern.config import settings
 from skyvern.constants import BROWSER_DOWNLOADING_SUFFIX, DOWNLOAD_FILE_PREFIX
 from skyvern.exceptions import DownloadSaveIncompleteError
 from skyvern.forge import app
-from skyvern.forge.sdk.api.aws import AsyncAWSClient, S3StorageClass, S3Uri, _recording_content_type
+from skyvern.forge.sdk.api.aws import AsyncAWSClient, S3ObjectStream, S3StorageClass, S3Uri, _recording_content_type
 from skyvern.forge.sdk.api.files import (
     calculate_sha256_for_file,
     create_named_temporary_file,
@@ -30,6 +30,9 @@ from skyvern.forge.sdk.artifact.signing import SENSITIVE_ARTIFACT_URL_EXPIRY_SEC
 from skyvern.forge.sdk.artifact.storage.base import (
     FILE_EXTENTSION_MAP,
     BaseStorage,
+    StoredObjectChangedError,
+    StoredObjectVersion,
+    StreamingArtifactStorage,
     _file_infos_from_artifacts,
     _file_infos_from_download_artifacts,
     dedupe_run_scoped_download_artifacts,
@@ -97,7 +100,7 @@ def empty_read_decision(
     }
 
 
-class S3Storage(BaseStorage):
+class S3Storage(BaseStorage, StreamingArtifactStorage):
     _PATH_VERSION = "v1"
     # Caps concurrent head_object calls from S3 listing reads. /browser_sessions/history fans out over up to 100
     # sessions at once, so the semaphore lives on the instance and every listing call on it shares one cap.
@@ -236,6 +239,29 @@ class S3Storage(BaseStorage):
     ) -> S3StorageClass:
         return S3StorageClass.STANDARD
 
+    def can_stream_artifact(self, artifact: Artifact) -> bool:
+        # retrieve_artifact decompresses a zstd HAR and extracts a bundle member from its archive after the read.
+        return not artifact.bundle_key and not artifact.uri.endswith(S3_ZSTD_COMPRESSED_SUFFIX)
+
+    async def stat_artifact(self, artifact: Artifact) -> StoredObjectVersion | None:
+        try:
+            info = await self.async_client.get_object_info(artifact.uri)
+        except Exception as e:
+            self.async_client.log_download_failure(e, artifact.uri)
+            return None
+        return StoredObjectVersion(size=info["ContentLength"], etag=info.get("ETag"))
+
+    async def open_artifact_stream(
+        self, artifact: Artifact, *, byte_range: tuple[int, int] | None = None, etag: str | None = None
+    ) -> S3ObjectStream | None:
+        try:
+            return await self.async_client.open_download_stream(artifact.uri, byte_range=byte_range, if_match=etag)
+        except Exception as e:
+            if etag is not None and self.async_client._error_code(e) == "PreconditionFailed":
+                raise StoredObjectChangedError(artifact.uri) from e
+            self.async_client.log_download_failure(e, artifact.uri)
+            return None
+
     async def retrieve_artifact(self, artifact: Artifact) -> bytes | None:
         data = await self.async_client.download_file(artifact.uri)
         # Decompress zstd-compressed files (HAR only)
@@ -287,6 +313,9 @@ class S3Storage(BaseStorage):
             presign=self.async_client.create_presigned_urls,
             presign_sensitive=lambda uris: self.async_client.create_presigned_urls(
                 uris, expires_in=min(settings.PRESIGNED_URL_EXPIRATION, SENSITIVE_ARTIFACT_URL_EXPIRY_SECONDS)
+            ),
+            presign_download=lambda uris: self.async_client.create_presigned_urls(
+                uris, attachment_filenames=[None] * len(uris)
             ),
         )
 
@@ -597,11 +626,13 @@ class S3Storage(BaseStorage):
 
         return await asyncio.gather(*[_bounded(key) for key in keys])
 
-    async def _resilient_presign(self, keys: list[str]) -> list[str | None]:
+    async def _resilient_presign(
+        self, keys: list[str], attachment_filenames: list[str | None] | None = None
+    ) -> list[str | None]:
         """Batch presign with per-key fallback so one failure does not drop every URL."""
         if not keys:
             return []
-        batched = await self.async_client.create_presigned_urls(keys)
+        batched = await self.async_client.create_presigned_urls(keys, attachment_filenames=attachment_filenames)
         if batched is not None and len(batched) == len(keys):
             return list(batched)
 
@@ -611,15 +642,18 @@ class S3Storage(BaseStorage):
             returned=(len(batched) if batched is not None else None),
         )
 
-        async def _sign_one(uri: str) -> str | None:
+        async def _sign_one(uri: str, attachment_filename: str | None) -> str | None:
             try:
-                signed = await self.async_client.create_presigned_urls([uri])
+                signed = await self.async_client.create_presigned_urls(
+                    [uri], attachment_filenames=None if attachment_filenames is None else [attachment_filename]
+                )
                 return signed[0] if signed else None
             except Exception:
                 LOG.exception("Per-key presign failed", uri=uri)
                 return None
 
-        return await asyncio.gather(*[_sign_one(key) for key in keys])
+        names = attachment_filenames or [None] * len(keys)
+        return await asyncio.gather(*[_sign_one(key, name) for key, name in zip(keys, names)])
 
     async def _get_shared_downloaded_files_in_browser_session_via_listing(
         self, *, organization_id: str, browser_session_id: str
@@ -637,27 +671,27 @@ class S3Storage(BaseStorage):
         if len(object_keys) == 0:
             return []
 
-        object_infos, presigned_urls = await asyncio.gather(
-            self._bounded_get_object_infos(object_keys),
-            self._resilient_presign(object_keys),
-        )
+        object_infos = await self._bounded_get_object_infos(object_keys)
+        filenames = [
+            ((object_info or {}).get("Metadata") or {}).get("original_filename", os.path.basename(key))
+            for key, object_info in zip(object_keys, object_infos)
+        ]
+        presigned_urls = await self._resilient_presign(object_keys, attachment_filenames=filenames)
 
         file_infos: list[FileInfo] = []
-        for key, object_info, url in zip(object_keys, object_infos, presigned_urls):
+        for object_info, filename, url in zip(object_infos, filenames, presigned_urls):
             if url is None:
                 continue
             metadata = (object_info or {}).get("Metadata") or {}
             modified_at: datetime | None = (object_info or {}).get("LastModified")
             content_length: int | None = (object_info or {}).get("ContentLength")
-
-            filename = os.path.basename(key)
             checksum = metadata.get("sha256_checksum") if metadata else None
 
             file_infos.append(
                 FileInfo(
                     url=url,
                     checksum=checksum,
-                    filename=metadata.get("original_filename", filename) if metadata else filename,
+                    filename=filename,
                     file_size=content_length,
                     modified_at=modified_at,
                 )
@@ -840,6 +874,8 @@ class S3Storage(BaseStorage):
         skipped_files: list[str] = []
         unchanged_file_count = 0
         for file in files:
+            if file.endswith(BROWSER_DOWNLOADING_SUFFIX):
+                continue
             fpath = os.path.join(download_dir, file)
             if not os.path.isfile(fpath):
                 continue
@@ -1041,6 +1077,8 @@ class S3Storage(BaseStorage):
 
         file_infos: list[FileInfo] = []
         for key in object_keys:
+            if key.endswith(BROWSER_DOWNLOADING_SUFFIX):
+                continue
             object_uri = f"s3://{bucket}/{key}"
 
             metadata = {}
@@ -1058,7 +1096,9 @@ class S3Storage(BaseStorage):
             display_name = metadata.get("original_filename", filename) if metadata else filename
             artifact = artifacts_by_uri.get(object_uri)
 
-            presigned_urls = await self.async_client.create_presigned_urls([object_uri])
+            presigned_urls = await self.async_client.create_presigned_urls(
+                [object_uri], attachment_filenames=[display_name]
+            )
             if not presigned_urls:
                 continue
 
@@ -1113,7 +1153,7 @@ class S3Storage(BaseStorage):
             uploaded_s3_uri=uploaded_s3_uri,
         )
         # Generate a presigned URL for the uploaded file
-        presigned_urls = await self.async_client.create_presigned_urls([uploaded_s3_uri])
+        presigned_urls = await self.async_client.create_presigned_urls([uploaded_s3_uri], attachment_filenames=[None])
         if not presigned_urls:
             LOG.error(
                 "Failed to create presigned URL for uploaded file",

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from collections.abc import Mapping
 from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, model_validator
@@ -12,8 +13,9 @@ BuildTestConnectFailureState = Literal[
     "billing_credit_admission_refusal",
     "saved_profile_unresolved",
     "saved_profile_not_applied",
+    "unsaved_browser_profile_pick",
 ]
-_SAVED_PROFILE_STATES = ("saved_profile_unresolved", "saved_profile_not_applied")
+_SAVED_PROFILE_STATES = ("saved_profile_unresolved", "saved_profile_not_applied", "unsaved_browser_profile_pick")
 
 SUPERSEDED_BY_NEWER_TEST_REASON = "Stopped because a newer test in this chat took over the browser."
 
@@ -31,6 +33,16 @@ class BuildTestConnectFailure(BaseModel):
     occupier_run_id: str | None = None
     diagnostic: str | None = None
     retry_action: Literal["test_end_to_end"] | None = "test_end_to_end"
+
+    @model_validator(mode="before")
+    @classmethod
+    def default_no_retry_states(cls, data: object) -> object:
+        # Dumps with exclude_none drop retry_action=None, which would revalidate to the retryable default.
+        if isinstance(data, Mapping) and "retry_action" not in data:
+            state = data.get("state")
+            if state == "billing_credit_admission_refusal" or state in _SAVED_PROFILE_STATES:
+                return {**data, "retry_action": None}
+        return data
 
     @model_validator(mode="after")
     def validate_retry_and_identity(self) -> BuildTestConnectFailure:
@@ -70,6 +82,12 @@ def build_test_connect_failure_sentence(failure: BuildTestConnectFailure) -> str
         return (
             "Build test did not start: the test browser could not be confirmed to have loaded the workflow's saved "
             "browser profile, so no signed-out run was attempted in its place."
+        )
+    if failure.state == "unsaved_browser_profile_pick":
+        return (
+            "Build test did not start: this proposal changes the workflow's browser profile, and a test can load a "
+            "newly picked profile only after the proposal is accepted. No run was started. "
+            "Reason codes: unsaved_browser_profile_pick."
         )
     if failure.state == "occupied":
         holder = f" ({failure.occupier_run_id})" if failure.occupier_run_id else ""

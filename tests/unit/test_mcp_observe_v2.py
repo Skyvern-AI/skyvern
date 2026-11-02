@@ -17,6 +17,7 @@ from skyvern.cli.core import browser_ops, session_manager
 from skyvern.cli.core.browser_ops import ObservedElement, ObserveFrameError, ObserveResult
 from skyvern.cli.core.result import BrowserContext
 from skyvern.cli.core.session_manager import scoped_session
+from skyvern.cli.mcp_tools import _read_retry
 from skyvern.cli.mcp_tools import browser as mcp_browser
 from skyvern.cli.mcp_tools import mcp
 from skyvern.cli.mcp_tools.response import MCP_MAX_RESPONSE_BYTES
@@ -2604,6 +2605,7 @@ async def test_stale_document_cleanup_replaces_mismatched_newer_publication(
 
 
 @pytest.mark.asyncio
+@pytest.mark.usefixtures("public_dns")
 async def test_failed_navigation_invalidates_inflight_publication(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv(_FLAG, "1")
     page = _page()
@@ -3265,6 +3267,7 @@ async def test_observe_page_change_retry_refreshes_publication(
     state = make_session_state(context=ctx)
     state._active_page = page.page
     monkeypatch.setattr(mcp_browser, "get_page", AsyncMock(return_value=(page, ctx)))
+    monkeypatch.setattr(_read_retry, "sleep", AsyncMock())
     generations = []
 
     async def read(*args: Any, **kwargs: Any) -> ObserveResult:
@@ -3307,6 +3310,7 @@ async def test_observe_retries_real_dom_scan_page_change(
     state = make_session_state(context=ctx)
     state._active_page = page.page
     monkeypatch.setattr(mcp_browser, "get_page", AsyncMock(return_value=(page, ctx)))
+    monkeypatch.setattr(_read_retry, "sleep", AsyncMock())
     scans = 0
     generations = []
 

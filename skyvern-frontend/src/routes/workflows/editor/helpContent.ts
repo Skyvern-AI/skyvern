@@ -137,6 +137,8 @@ export const helpTooltips = {
     newerThanDays: "Only include emails newer than this many days.",
     maxResults: "Maximum number of emails to return.",
     includeBody: "Include email body text in matching results.",
+    downloadAttachments:
+      "Download non-inline attachments from matched emails for downstream blocks.",
   },
   google_sheets_write: {
     ...baseHelpTooltipContent,
@@ -218,6 +220,8 @@ export const helpTooltips = {
       "The format of the file to parse. Auto-detected from the URL extension when possible. ZIP archives are always unzipped, and the block outputs the extracted files as file_name, file_path, and file_size. Data Schema is ignored for ZIPs. To parse contained files, loop over the output and pass each file_path to another File Parser block.",
     worksheet:
       "Excel only: the exact name of the worksheet to read. Leave empty to read the first worksheet. The run fails if the named worksheet is not in the workbook.",
+    forceOcr:
+      "PDF only: ignore the PDF's embedded text layer and read the pages with vision OCR instead. Skyvern already does this when the text layer is empty or its characters are scrambled; turn this on when a PDF's text layer is unreadable in some other way. OCR is slower, costs more than reading the text layer, and reads at most the first 50 pages, so a longer PDF loses the rest.",
   },
   terminate: {
     ...baseHelpTooltipContent,
@@ -225,6 +229,17 @@ export const helpTooltips = {
       "Why the run stops here. It is recorded in the run's failure reason. Other parameters and earlier block outputs can be referenced, e.g. {{ account_number }}. Credentials and secrets cannot be referenced; a template that references one is dropped.",
     errorCode:
       "Optional. A code recorded with the run, so a retry rule, the run list filter, or a webhook can tell this stop apart. Other parameters and earlier block outputs can be referenced. Credentials and secrets cannot be referenced; a template that references one is dropped. Leave empty for no code.",
+  },
+  agentStep: {
+    ...baseHelpTooltipContent,
+    prompt:
+      "What the agent should find out or do. A model calls this run's blocks as tools until it can return the data schema's fields. Use {{ parameter_name }} to reference an input value.",
+    dataSchema:
+      "The fields the agent returns, as a JSON object schema. A Conditional block after this one can branch on them.",
+    maxTurns:
+      "The most model turns the agent may take before the block fails. Between 1 and 200.",
+    tools:
+      "The tools the agent may call. It can always read this run's data and return its answer, and Login works only when the workflow has a credential parameter.",
   },
   wait: {
     ...baseHelpTooltipContent,

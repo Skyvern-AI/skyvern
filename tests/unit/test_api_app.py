@@ -136,7 +136,6 @@ async def test_retry_recovery_never_blocks_startup_or_requests(monkeypatch, reco
         "stop_temp_artifact_sweep",
     ):
         monkeypatch.setattr(api_app, name, AsyncMock())
-    monkeypatch.setattr(api_app.interpretation_registry, "stop_all", AsyncMock())
     server = FastAPI()
 
     @server.get("/health")

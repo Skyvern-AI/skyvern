@@ -92,6 +92,7 @@ _LANDING_URL = "https://example.com/results"
 @pytest.fixture(autouse=True)
 def _page_evidence_fingerprint_key(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(settings, "SECRET_KEY", "test-page-evidence-key")
+    monkeypatch.setattr(settings, "COPILOT_SCOUT_ACT_OBSERVE_RECAPTURE_DELAY_SECONDS", 0.05)
 
 
 _SCHEMA_LESS_PACKET_KEYS = {
@@ -817,6 +818,31 @@ def test_page_evidence_freshness_includes_dom_obstruction_candidates(candidate_o
     }
     (prior if candidate_on_prior else current)["visual_obstruction_candidates"] = [candidate]
 
+    assert _page_evidence_is_unchanged(prior, current) is False
+
+
+def test_page_evidence_freshness_ignores_pointer_states_and_visible_counts() -> None:
+    prior = parse_composition_structured(
+        _bounded_extractor_payload(), inspected_url=_SOURCE_URL, current_url=_SOURCE_URL
+    )
+    current = parse_composition_structured(
+        _bounded_extractor_payload(), inspected_url=_LANDING_URL, current_url=_LANDING_URL
+    )
+    assert prior is not None and current is not None
+    scrolled_form = current["forms"][0]
+    for control in (scrolled_form["fields"][0], scrolled_form["submit_controls"][0]):
+        control["pointer_at_center"] = "reaches_other_element"
+        control["element_at_center"] = {"tag": "header", "role": "", "label_context": "Catalogue"}
+    prior["forms"][0]["fields"][0]["pointer_at_center"] = "not_measured"
+
+    assert _page_evidence_is_unchanged(prior, current) is True
+
+    # A capture over its bound drops the visible counts, and scrolling alone can tip it over.
+    dismiss_candidate = current["modal_overlays"][0]["dismiss_controls"][0]["selector_candidates"][0]
+    dismiss_candidate["visible_match_count"] = 1
+    assert _page_evidence_is_unchanged(prior, current) is True
+
+    dismiss_candidate["match_count"] = 2
     assert _page_evidence_is_unchanged(prior, current) is False
 
 

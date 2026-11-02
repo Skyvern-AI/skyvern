@@ -6,6 +6,7 @@ from skyvern.forge import app
 from skyvern.forge.sdk.routes.routers import base_router
 from skyvern.forge.sdk.schemas.organizations import Organization
 from skyvern.forge.sdk.services import org_auth_service
+from skyvern.forge.sdk.services.request_principal import get_request_principal
 from skyvern.schemas.self_heal import (
     HealEpisodeView,
     HealStatus,
@@ -93,6 +94,13 @@ async def get_runs_heal_summary_route(
     organization: Organization = Depends(org_auth_service.get_current_org),
 ) -> RunsHealSummaryResponse:
     workflow_run_ids = list(dict.fromkeys(request.workflow_run_ids))
+    if await app.AGENT_FUNCTION.accessible_workflow_folder_ids(get_request_principal()) is not None:
+        # Run lookups are folder-filtered, so this keeps only the runs the caller may see.
+        visible = await app.DATABASE.workflow_runs.get_workflow_runs_by_ids(
+            workflow_run_ids, organization_id=organization.organization_id
+        )
+        visible_ids = {run.workflow_run_id for run in visible}
+        workflow_run_ids = [run_id for run_id in workflow_run_ids if run_id in visible_ids]
     episodes = await app.DATABASE.self_heal.get_heal_episodes_for_runs(
         organization_id=organization.organization_id,
         workflow_run_ids=workflow_run_ids,
@@ -122,5 +130,11 @@ async def get_workflows_reliability_route(
     organization: Organization = Depends(org_auth_service.get_current_org),
 ) -> WorkflowsReliabilityResponse:
     workflow_permanent_ids = list(dict.fromkeys(request.workflow_permanent_ids))
+    if await app.AGENT_FUNCTION.accessible_workflow_folder_ids(get_request_principal()) is not None:
+        # The existing-ids lookup is folder-filtered, so this keeps only the workflows the caller may see.
+        visible_wpids = await app.DATABASE.workflows.get_existing_permanent_ids(
+            workflow_permanent_ids, organization.organization_id
+        )
+        workflow_permanent_ids = [wpid for wpid in workflow_permanent_ids if wpid in visible_wpids]
     reliabilities = await get_workflows_reliability(organization.organization_id, workflow_permanent_ids)
     return WorkflowsReliabilityResponse(reliabilities=reliabilities)

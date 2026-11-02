@@ -3,13 +3,15 @@
 from __future__ import annotations
 
 import asyncio
+from collections.abc import Callable
 from datetime import UTC, datetime
-from typing import TYPE_CHECKING, Any, Callable
+from typing import TYPE_CHECKING, Any
 
 import structlog
 from sqlalchemy import and_, exists, func, or_, select, text, update
 from sqlalchemy.exc import SQLAlchemyError
 
+from skyvern.forge import app
 from skyvern.forge.sdk.db._error_handling import db_operation, register_passthrough_exception
 from skyvern.forge.sdk.db.base_repository import BaseRepository
 from skyvern.forge.sdk.db.datetime_utils import naive_utc_now
@@ -21,6 +23,7 @@ from skyvern.forge.sdk.schemas.workflow_schedules import (
     OrganizationScheduleItem,
     WorkflowSchedule,
 )
+from skyvern.forge.sdk.services.request_principal import get_request_principal, trigger_owner_id
 from skyvern.forge.sdk.workflow.schedules import as_utc, compute_next_run
 
 if TYPE_CHECKING:
@@ -45,6 +48,16 @@ _NOT_TERMINAL_ONE_TIME = or_(
     WorkflowScheduleModel.run_at.is_(None),
     WorkflowScheduleModel.dispatch_status == OneTimeDispatchStatus.pending,
 )
+
+
+def _adopt_schedule(workflow_schedule: WorkflowScheduleModel, organization_id: str) -> None:
+    # A schedule runs as whoever last edited it, so an edit cannot borrow the previous owner's folder access.
+    principal = get_request_principal()
+    if principal is None:
+        # Background writes (no request) keep the owner.
+        return
+    # An unidentified editor clears it instead, so the next run fails closed in restricted folders.
+    workflow_schedule.created_by = trigger_owner_id(principal, organization_id)
 
 
 class SchedulesRepository(BaseRepository):
@@ -91,6 +104,7 @@ class SchedulesRepository(BaseRepository):
                 backend_schedule_id=backend_schedule_id,
                 name=name,
                 description=description,
+                created_by=trigger_owner_id(get_request_principal(), organization_id),
             )
             session.add(workflow_schedule)
             await session.commit()
@@ -216,6 +230,7 @@ class SchedulesRepository(BaseRepository):
                 parameters=parameters,
                 name=name,
                 description=description,
+                created_by=trigger_owner_id(get_request_principal(), organization_id),
             )
             session.add(workflow_schedule)
             await session.commit()
@@ -283,6 +298,7 @@ class SchedulesRepository(BaseRepository):
             if not workflow_schedule:
                 return None
 
+            _adopt_schedule(workflow_schedule, organization_id)
             workflow_schedule.cron_expression = cron_expression
             if interval_seconds is not _UNSET:
                 workflow_schedule.interval_seconds = interval_seconds
@@ -310,17 +326,16 @@ class SchedulesRepository(BaseRepository):
         self,
         workflow_schedule_id: str,
         organization_id: str,
+        include_deleted: bool = False,
     ) -> WorkflowSchedule | None:
+        query = select(WorkflowScheduleModel).filter_by(
+            workflow_schedule_id=workflow_schedule_id,
+            organization_id=organization_id,
+        )
+        if not include_deleted:
+            query = query.filter_by(deleted_at=None)
         async with self.Session() as session:
-            workflow_schedule = (
-                await session.scalars(
-                    select(WorkflowScheduleModel).filter_by(
-                        workflow_schedule_id=workflow_schedule_id,
-                        organization_id=organization_id,
-                        deleted_at=None,
-                    )
-                )
-            ).first()
+            workflow_schedule = (await session.scalars(query)).first()
             if not workflow_schedule:
                 return None
             return convert_to_workflow_schedule(workflow_schedule, self.debug_enabled)
@@ -566,6 +581,7 @@ class SchedulesRepository(BaseRepository):
             ).first()
             if not workflow_schedule:
                 return None
+            _adopt_schedule(workflow_schedule, organization_id)
             workflow_schedule.enabled = enabled
             workflow_schedule.modified_at = datetime.now(UTC)
             await session.commit()
@@ -597,32 +613,6 @@ class SchedulesRepository(BaseRepository):
             await session.refresh(workflow_schedule)
             return convert_to_workflow_schedule(workflow_schedule, self.debug_enabled)
 
-    @db_operation("restore_workflow_schedule")
-    async def restore_workflow_schedule(
-        self,
-        workflow_schedule_id: str,
-        organization_id: str,
-    ) -> WorkflowSchedule | None:
-        async with self.Session() as session:
-            workflow_schedule = (
-                await session.scalars(
-                    select(WorkflowScheduleModel)
-                    .filter_by(
-                        workflow_schedule_id=workflow_schedule_id,
-                        organization_id=organization_id,
-                    )
-                    .filter(WorkflowScheduleModel.deleted_at.isnot(None))
-                )
-            ).first()
-            if not workflow_schedule:
-                return None
-
-            workflow_schedule.deleted_at = None
-            workflow_schedule.modified_at = datetime.now(UTC)
-            await session.commit()
-            await session.refresh(workflow_schedule)
-            return convert_to_workflow_schedule(workflow_schedule, self.debug_enabled)
-
     @db_operation("list_organization_schedules")
     async def list_organization_schedules(
         self,
@@ -638,6 +628,7 @@ class SchedulesRepository(BaseRepository):
         """
         if page < 1:
             raise ValueError(f"Page must be greater than 0, got {page}")
+        accessible_folder_ids = await app.AGENT_FUNCTION.accessible_workflow_folder_ids(get_request_principal())
         db_page = page - 1
         async with self.Session() as session:
             # Subquery to get the latest version title per workflow_permanent_id
@@ -664,6 +655,18 @@ class SchedulesRepository(BaseRepository):
                 )
                 .subquery()
             )
+            current_folder_id = (
+                select(WorkflowModel.folder_id)
+                .where(
+                    WorkflowModel.organization_id == organization_id,
+                    WorkflowModel.workflow_permanent_id == WorkflowScheduleModel.workflow_permanent_id,
+                    WorkflowModel.deleted_at.is_(None),
+                )
+                .order_by(WorkflowModel.version.desc())
+                .limit(1)
+                .correlate(WorkflowScheduleModel)
+                .scalar_subquery()
+            )
 
             # Base query: schedules joined with workflow titles
             base_filter = (
@@ -675,6 +678,11 @@ class SchedulesRepository(BaseRepository):
                 .where(WorkflowScheduleModel.organization_id == organization_id)
                 .where(WorkflowScheduleModel.deleted_at.is_(None))
             )
+            if accessible_folder_ids is not None:
+                base_filter = base_filter.where(
+                    workflow_title_sq.c.workflow_permanent_id.is_not(None),
+                    or_(current_folder_id.is_(None), current_folder_id.in_(accessible_folder_ids)),
+                )
 
             if enabled_filter is not None:
                 base_filter = base_filter.where(WorkflowScheduleModel.enabled == enabled_filter, _NOT_TERMINAL_ONE_TIME)
@@ -787,8 +795,8 @@ class SchedulesRepository(BaseRepository):
         return schedules, total_count
 
     @db_operation("soft_delete_orphaned_schedules")
-    async def soft_delete_orphaned_schedules(self, limit: int = 500) -> list[tuple[str, str]]:
-        """Soft-delete orphaned schedules and return their identities.
+    async def soft_delete_orphaned_schedules(self, limit: int = 500) -> list[tuple[str, str, str | None]]:
+        """Soft-delete orphaned schedules; returns (schedule id, workflow permanent id, backend schedule id).
 
         Uses a single UPDATE ... RETURNING statement so orphan detection and
         soft-deletion happen atomically in one DB round-trip.
@@ -821,8 +829,53 @@ class SchedulesRepository(BaseRepository):
                 .returning(
                     WorkflowScheduleModel.workflow_schedule_id,
                     WorkflowScheduleModel.workflow_permanent_id,
+                    WorkflowScheduleModel.backend_schedule_id,
                 )
             )
             result = await session.execute(update_query)
             await session.commit()
-            return [(row[0], row[1]) for row in result.all()]
+            return [(row[0], row[1], row[2]) for row in result.all()]
+
+    @db_operation("list_deleted_schedules_with_backend_schedules")
+    async def list_deleted_schedules_with_backend_schedules(self, limit: int = 500) -> list[tuple[str, str]]:
+        """(schedule id, backend schedule id) of soft-deleted rows whose backend schedule is not yet known gone."""
+        async with self.Session() as session:
+            rows = await session.execute(
+                select(WorkflowScheduleModel.workflow_schedule_id, WorkflowScheduleModel.backend_schedule_id)
+                .where(
+                    WorkflowScheduleModel.deleted_at.is_not(None),
+                    WorkflowScheduleModel.backend_schedule_id.is_not(None),
+                )
+                .order_by(WorkflowScheduleModel.deleted_at)
+                .limit(limit)
+            )
+            return [(row[0], row[1]) for row in rows.all()]
+
+    @db_operation("get_live_backend_schedule_ids")
+    async def get_live_backend_schedule_ids(self, backend_schedule_ids: list[str]) -> set[str]:
+        if not backend_schedule_ids:
+            return set()
+        async with self.Session() as session:
+            rows = await session.scalars(
+                select(WorkflowScheduleModel.backend_schedule_id).where(
+                    WorkflowScheduleModel.deleted_at.is_(None),
+                    WorkflowScheduleModel.backend_schedule_id.in_(backend_schedule_ids),
+                )
+            )
+            return {backend_id for backend_id in rows.all() if backend_id}
+
+    @db_operation("clear_deleted_schedule_backend_ids")
+    async def clear_deleted_schedule_backend_ids(self, workflow_schedule_ids: list[str]) -> None:
+        """Record that these soft-deleted rows' backend schedules are gone, so the sweep stops retrying them."""
+        if not workflow_schedule_ids:
+            return
+        async with self.Session() as session:
+            await session.execute(
+                update(WorkflowScheduleModel)
+                .where(
+                    WorkflowScheduleModel.workflow_schedule_id.in_(workflow_schedule_ids),
+                    WorkflowScheduleModel.deleted_at.is_not(None),
+                )
+                .values({WorkflowScheduleModel.backend_schedule_id: None})
+            )
+            await session.commit()

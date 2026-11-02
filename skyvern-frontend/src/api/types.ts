@@ -36,6 +36,11 @@ export const TriggerType = {
   Mcp: "mcp",
   Api: "api",
   Scheduled: "scheduled",
+  Webhook: "webhook",
+  Event: "event",
+  JobRecipeExtract: "job_recipe_extract",
+  JobRecipeApply: "job_recipe_apply",
+  SeoRecipeSubmit: "seo_recipe_submit",
 } as const;
 
 export type TriggerType = (typeof TriggerType)[keyof typeof TriggerType];
@@ -134,6 +139,7 @@ export type StepApiResponse = {
   retry_index: number;
   status: Status;
   step_cost: number;
+  created_by?: string | null;
 };
 
 export type Task = {
@@ -169,6 +175,8 @@ export type FailureCategory = {
   confidence_float: number;
   reasoning: string;
   reason_code?: string | null;
+  error_code?: string | null;
+  anti_bot?: { contribution?: string | null } | null;
 };
 
 export type TaskApiResponse = {
@@ -271,6 +279,7 @@ export type OnePasswordItemApiResponse = {
   vault_id: string;
   vault_name: string;
   category: string;
+  importable?: boolean;
   url?: string | null;
 };
 
@@ -278,6 +287,38 @@ export type OnePasswordItemsApiResponse = {
   configured: boolean;
   source: OnePasswordTokenSource | null;
   items: Array<OnePasswordItemApiResponse>;
+};
+
+export const ONEPASSWORD_CREDENTIALS_REQUEST_LIMIT = 500;
+
+export type OnePasswordCredentialImportRequest = {
+  folder_id?: string;
+  items: Array<{ vault_id: string; item_id: string }>;
+};
+
+export type OnePasswordCredentialImportResult = {
+  vault_id: string;
+  item_id: string;
+  status: "imported" | "updated" | "skipped";
+  reason?: string | null;
+};
+
+export type OnePasswordCredentialImportResponse = {
+  results: Array<OnePasswordCredentialImportResult>;
+};
+
+export type OnePasswordCredentialRefreshResult = {
+  vault_id: string;
+  item_id: string;
+  status: "refreshed" | "stale" | "skipped";
+  reason?: string | null;
+};
+
+export type OnePasswordCredentialRefreshResponse = {
+  refreshed: number;
+  stale: number;
+  skipped: number;
+  results: Array<OnePasswordCredentialRefreshResult>;
 };
 
 export type BitwardenItemApiResponse = {
@@ -472,10 +513,14 @@ export interface MicrosoftOAuthCredentialListResponse {
   credentials: MicrosoftOAuthCredential[];
 }
 
+export type MicrosoftOAuthScopeProfile =
+  | "outlook_mail"
+  | "powerbi_dataset_read";
+
 export interface CreateMicrosoftOAuthAuthorizeRequest {
   redirect_uri: string;
   credential_name?: string;
-  scope_profile?: "outlook_mail";
+  scope_profile?: MicrosoftOAuthScopeProfile;
   app_origin?: string;
 }
 
@@ -541,6 +586,70 @@ export interface CreateGoogleSheetTabResponse {
 export interface GoogleSheetsReconnectRequiredError {
   code: "reconnect_required";
   missing_scope: string | null;
+}
+
+export interface TwilioCredentialSafe {
+  account_sid: string;
+  api_key_sid: string | null;
+  has_api_key_secret: boolean;
+  has_auth_token: boolean;
+}
+
+export interface TwilioCredentialResponse {
+  credential: TwilioCredentialSafe | null;
+}
+
+export interface TwilioCredentialRequest {
+  account_sid: string;
+  api_key_sid?: string | null;
+  api_key_secret?: string | null;
+  auth_token: string;
+}
+
+export interface TwilioPhoneNumberInfo {
+  sid: string;
+  phone_number: string;
+  friendly_name: string;
+  sms_capable: boolean;
+  current_sms_url: string | null;
+  enabled: boolean;
+  phone_number_id: string | null;
+}
+
+export interface OrganizationPhoneNumber {
+  phone_number_id: string;
+  organization_id: string;
+  sms_config_id: string;
+  phone_number: string;
+  provider: string;
+  credential_id: string | null;
+  price_cents: number | null;
+  billing_exempt: boolean;
+  status:
+    | "active"
+    | "disabled"
+    | "provisioning"
+    | "quarantining"
+    | "reversal_pending"
+    | "quarantined"
+    | "surrendering"
+    | "releasing"
+    | "released";
+  quarantined_until: string | null;
+  cancel_at?: string | null;
+  created_at: string;
+  modified_at: string;
+  deleted_at: string | null;
+}
+
+export interface EnablePhoneNumberRequest {
+  phone_number_sid: string;
+  confirm_takeover?: boolean;
+  credential_id?: string | null;
+}
+
+export interface DisablePhoneNumberRequest {
+  phone_number_id: string;
 }
 
 export interface BitwardenCredential {
@@ -954,6 +1063,7 @@ export type WorkflowRunStatusApiResponse = {
   verification_code_polling_started_at?: string | null;
   retried_from_workflow_run_id?: string | null;
   retried_by_workflow_run_id?: string | null;
+  copilot_session_id?: string | null;
 } & WorkflowRunRetryFields;
 
 export type WorkflowRunStatusApiResponseWithWorkflow = {
@@ -999,6 +1109,7 @@ export type WorkflowRunStatusApiResponseWithWorkflow = {
   verification_code_polling_started_at?: string | null;
   retried_from_workflow_run_id?: string | null;
   retried_by_workflow_run_id?: string | null;
+  copilot_session_id?: string | null;
 } & WorkflowRunRetryFields;
 
 export type TaskGenerationApiResponse = {
@@ -1099,6 +1210,7 @@ export type BrowserProfileUsage = {
 
 export type PasswordCredentialApiResponse = {
   username: string;
+  has_totp?: boolean;
   totp_type: "authenticator" | "email" | "text" | "passkey" | "none";
   totp_identifier?: string | null;
 };
@@ -1125,6 +1237,18 @@ export type CredentialApiResponse = {
     | SecretCredentialResponse;
   credential_type: "password" | "credit_card" | "secret";
   name: string;
+  vault_type?:
+    | "skyvern"
+    | "bitwarden"
+    | "azure_vault"
+    | "gcp"
+    | "custom"
+    | "onepassword"
+    | "bitwarden_connected"
+    | null;
+  vault_id?: string | null;
+  item_id?: string | null;
+  upstream_missing_at?: string | null;
   browser_profile_id?: string | null;
   auto_profile_disabled?: boolean | null;
   pin_saved_session_ip?: boolean | null;

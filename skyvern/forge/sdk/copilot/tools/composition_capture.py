@@ -30,6 +30,7 @@ from skyvern.forge.sdk.copilot.composition_browser_expressions import (
 from skyvern.forge.sdk.copilot.composition_evidence import (
     _MAX_KEY_VALUE_RELATIONS,
     CONSENT_OBSTRUCTION_KIND,
+    fit_authoring_facts,
     has_bounded_page_schema,
     has_satisfiable_collapsed_disclosure_path,
     merge_visual_composition_evidence,
@@ -67,11 +68,14 @@ from skyvern.forge.sdk.copilot.screenshot_utils import (
     ScreenshotProvenance,
     enqueue_screenshot,
     screenshot_result_facts,
+    screenshot_viewport_css_px,
+    withdraw_superseded_run_result_frame,
 )
 from skyvern.forge.sdk.copilot.secret_scrub import (
     scrub_secrets_from_structure,
 )
 from skyvern.forge.sdk.copilot.tracing_setup import copilot_span
+from skyvern.webeye.utils.challenge_signature import CHALLENGE_VENDOR_SIGNATURE
 
 from ._shared import (
     _CURRENT_PAGE_INSPECTION_TARGETS,
@@ -93,6 +97,8 @@ from .discovery import _resolve_discovery_entry_url
 from .guardrails import _authority_tool_error
 from .mcp_hooks import _bind_login_credential_for_observed_url, _record_scouted_read
 from .scouting import (
+    _PAGE_STATE_TITLE_MAX_CHARS,
+    _PAGE_STATE_URL_MAX_CHARS,
     _clear_pending_browser_interaction_observation,
     _consume_pending_browser_interaction_observation,
     _evidence_list_len,
@@ -141,6 +147,22 @@ def _attach_field_upload_routes(data: dict[str, Any], upload_routes: list[dict[s
                 field["upload_routes"] = [dict(route) for route in upload_routes]
 
 
+# Room for the page_state the tool wrapper prepends after this fit, at its largest: a url and title at their
+# bounds, every character astral (JSON escapes each to 12), and the longest vendor signature.
+_PAGE_STATE_RESERVE_CHARS = len(
+    json.dumps(
+        {
+            "page_state": {
+                "read": "ok",
+                "url": "\U0001f600" * _PAGE_STATE_URL_MAX_CHARS,
+                "title": "\U0001f600" * _PAGE_STATE_TITLE_MAX_CHARS,
+                "challenge_vendor": max(CHALLENGE_VENDOR_SIGNATURE.split("|"), key=len),
+            }
+        }
+    )
+)
+
+
 def _model_facing_inspect_result(result: dict[str, Any], *, copilot_ctx: AgentContext | None = None) -> dict[str, Any]:
     """Detach stored evidence, remove locator recommendations, and fit the complete model packet."""
     if result.get("ok") is not True:
@@ -148,8 +170,17 @@ def _model_facing_inspect_result(result: dict[str, Any], *, copilot_ctx: AgentCo
     shaped = copy.deepcopy(result)
     data = shaped.get("data")
     if isinstance(data, dict):
-        shaped["data"] = model_visible_composition_evidence(data)
-        _attach_field_upload_routes(shaped["data"], upload_routes_for(copilot_ctx))
+        upload_routes = upload_routes_for(copilot_ctx)
+        projected, bare = (model_visible_composition_evidence(data, authoring_facts=facts) for facts in (True, False))
+        for packet in (projected, bare):
+            _attach_field_upload_routes(packet, upload_routes)
+
+        def fits(packet: dict[str, Any]) -> bool:
+            return (
+                len(json.dumps({**shaped, "data": packet})) <= _RECENT_TOOL_OUTPUT_CHAR_CAP - _PAGE_STATE_RESERVE_CHARS
+            )
+
+        shaped["data"] = fit_authoring_facts(projected, bare, fits)
     if len(json.dumps(shaped)) <= _RECENT_TOOL_OUTPUT_CHAR_CAP:
         return shaped
     data = shaped.get("data")
@@ -400,6 +431,7 @@ async def _composition_capture_visual_summary(
             dispatch_browser_session_id=capture_session_id,
             producer_browser_session_id=producer_session_id,
             session_binding=session_binding,
+            viewport_css_px=screenshot_viewport_css_px(screenshot_result),
         )
         if screenshot_b64
         else None
@@ -1092,6 +1124,7 @@ def store_post_run_page_evidence(
         stamped["current_url"] = current_url
     if _preserves_existing_post_run_page_evidence(copilot_ctx, stamped, run_id=run_id):
         return stamped, True
+    withdraw_superseded_run_result_frame(copilot_ctx, run_id)
     copilot_ctx.composition_page_evidence = stamped
     page_title = stamped.get("page_title")
     if isinstance(page_title, str) and page_title:
@@ -1466,6 +1499,7 @@ async def _inspect_page_for_composition_under_custody(
                 dispatch_browser_session_id=visual_fallback_frame.dispatch_browser_session_id,
                 producer_browser_session_id=visual_fallback_frame.producer_browser_session_id,
                 session_binding=visual_fallback_frame.session_binding,
+                viewport_css_px=visual_fallback_frame.viewport_css_px,
             ),
             captured_at=visual_fallback_frame.captured_at,
         )

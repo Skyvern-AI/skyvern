@@ -1,11 +1,12 @@
 from datetime import datetime
 from enum import StrEnum
-from typing import Self
+from typing import Literal, Self
 
 from fastapi import status
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 from skyvern.exceptions import SkyvernHTTPException
+from skyvern.forge.sdk.credential_site_policy import LoginSite
 from skyvern.forge.sdk.schemas.organizations import OnePasswordTokenSource
 from skyvern.schemas.proxy_location import ProxyLocationInput
 from skyvern.schemas.proxy_pinning import parse_proxy_location_input, validate_proxy_session_id
@@ -18,6 +19,8 @@ class CredentialVaultType(StrEnum):
     AZURE_VAULT = "azure_vault"
     GCP = "gcp"
     CUSTOM = "custom"
+    ONEPASSWORD = "onepassword"
+    BITWARDEN_CONNECTED = "bitwarden_connected"
 
 
 class CredentialType(StrEnum):
@@ -230,6 +233,8 @@ class CredentialItem(BaseModel):
         default_factory=list,
         description="Sites the vault item itself names, as saved by the user who stored it",
     )
+    # Set only by a vault whose items scope each site by match mode; a fill or release must then match one.
+    login_sites: list[LoginSite] | None = Field(default=None, exclude=True)
 
 
 class CreateCredentialRequest(BaseModel):
@@ -299,6 +304,11 @@ class CredentialResponse(BaseModel):
         default=None,
         description="Which vault stores this credential (e.g., 'skyvern', 'bitwarden', 'azure_vault', 'custom')",
     )
+    vault_id: str | None = Field(default=None, description="1Password vault ID for linked credentials")
+    item_id: str | None = Field(default=None, description="1Password item ID for linked credentials")
+    upstream_missing_at: datetime | None = Field(
+        default=None, description="When the linked 1Password item was last found missing upstream"
+    )
     browser_profile_id: str | None = Field(default=None, description="Browser profile ID linked to this credential")
     auto_profile_disabled: bool | None = Field(
         default=None,
@@ -347,6 +357,7 @@ class OnePasswordItemOverview(BaseModel):
     vault_id: str = Field(..., description="The ID of the vault containing the item")
     vault_name: str = Field(..., description="The name of the vault containing the item")
     category: str = Field(..., description="The 1Password item category")
+    importable: bool = Field(..., description="Whether this item can be imported as a credential")
     url: str | None = Field(default=None, description="The primary website URL associated with the item, if any")
 
 
@@ -356,6 +367,58 @@ class OnePasswordItemsResponse(BaseModel):
     configured: bool = Field(..., description="Whether a 1Password service account token is configured")
     items: list[OnePasswordItemOverview] = Field(..., description="The available 1Password item metadata")
     source: OnePasswordTokenSource | None = None
+
+
+ONEPASSWORD_CREDENTIALS_REQUEST_LIMIT = 500
+
+
+class OnePasswordCredentialSelection(BaseModel):
+    vault_id: str = Field(..., min_length=1)
+    item_id: str = Field(..., min_length=1)
+
+
+class ImportOnePasswordCredentialsRequest(BaseModel):
+    folder_id: str | None = Field(default=None, min_length=1)
+    items: list[OnePasswordCredentialSelection] = Field(..., min_length=1)
+
+    @field_validator("items")
+    @classmethod
+    def enforce_item_limit(cls, items: list[OnePasswordCredentialSelection]) -> list[OnePasswordCredentialSelection]:
+        if len(items) > ONEPASSWORD_CREDENTIALS_REQUEST_LIMIT:
+            raise ValueError(
+                f"Import at most {ONEPASSWORD_CREDENTIALS_REQUEST_LIMIT} 1Password items per request; "
+                "split the request into smaller batches"
+            )
+        return items
+
+
+class OnePasswordCredentialImportResult(BaseModel):
+    vault_id: str
+    item_id: str
+    status: Literal["imported", "updated", "skipped"]
+    reason: str | None = None
+
+
+class ImportOnePasswordCredentialsResponse(BaseModel):
+    results: list[OnePasswordCredentialImportResult]
+
+
+class RefreshOnePasswordCredentialsRequest(BaseModel):
+    folder_id: str | None = Field(default=None, min_length=1)
+
+
+class OnePasswordCredentialRefreshResult(BaseModel):
+    vault_id: str
+    item_id: str
+    status: Literal["refreshed", "stale", "skipped"]
+    reason: str | None = None
+
+
+class RefreshOnePasswordCredentialsResponse(BaseModel):
+    refreshed: int
+    stale: int
+    skipped: int
+    results: list[OnePasswordCredentialRefreshResult]
 
 
 class BitwardenItemOverview(BaseModel):
@@ -369,6 +432,8 @@ class BitwardenItemOverview(BaseModel):
     )
     credential_type: CredentialType = Field(..., description="The item's credential type")
     url: str | None = Field(default=None, description="The primary website URL associated with the item, if any")
+    urls: list[str] = Field(default_factory=list, exclude=True, description="Every website URL saved on the item")
+    sites: list[LoginSite] = Field(default_factory=list, exclude=True, description="The sites the item is saved for")
 
 
 class BitwardenItemsResponse(BaseModel):
@@ -390,6 +455,12 @@ class Credential(BaseModel):
     name: str = Field(..., description="Name of the credential", examples=["Skyvern Login"])
     vault_type: CredentialVaultType | None = Field(..., description="Where the secret is stored")
     item_id: str = Field(..., description="ID of the associated credential item", examples=["item_1234567890"])
+    vault_id: str | None = Field(
+        default=None, description="ID of the credential's vault, when the provider requires it"
+    )
+    upstream_missing_at: datetime | None = Field(
+        default=None, description="When the linked 1Password item was last found missing upstream"
+    )
     credential_type: CredentialType = Field(..., description="Type of the credential. Eg password, credit card, etc.")
     username: str | None = Field(..., description="For password credentials: the username")
     totp_type: TotpType = Field(
@@ -432,6 +503,8 @@ class Credential(BaseModel):
         default=None,
         description="ID of the credential folder this credential belongs to, if any",
     )
+    is_test_login_temporary: bool | None = Field(default=None, exclude=True)
+    is_passkey_setup_pending: bool | None = Field(default=None, exclude=True)
     proxy_location: ProxyLocationInput = Field(
         default=None,
         description="Optional proxy location used for the credential's pinned proxy identity.",

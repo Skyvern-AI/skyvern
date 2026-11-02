@@ -6,6 +6,7 @@ import datetime
 import hashlib
 import html
 import re
+import time
 import unicodedata
 from bisect import bisect_left, bisect_right
 from contextlib import contextmanager
@@ -13,7 +14,7 @@ from contextvars import ContextVar, Token
 from dataclasses import dataclass, field
 from enum import StrEnum
 from itertools import islice
-from typing import TYPE_CHECKING, Any, Callable, Iterable, Iterator, Literal, TypedDict
+from typing import TYPE_CHECKING, Any, Callable, Collection, Iterable, Iterator, Literal, TypedDict
 from urllib.parse import urlsplit
 from zoneinfo import ZoneInfo
 
@@ -22,7 +23,8 @@ from pydantic import AnyHttpUrl, TypeAdapter, ValidationError
 
 from skyvern.config import settings
 from skyvern.schemas.run_enums import RunEngine
-from skyvern.webeye.browser_health import BrowserHealth, BrowserOperation
+from skyvern.webeye.actions.action_types import ActionType
+from skyvern.webeye.browser_health import BrowserHealth, BrowserOperation, FrameKind
 
 if TYPE_CHECKING:
     from playwright.async_api import FileChooser, Frame, Page
@@ -39,6 +41,32 @@ if TYPE_CHECKING:
     # must not pull a service module at import time. String annotation below.
     from skyvern.services.script_reviewer_v3.budget import RunBudget
     from skyvern.webeye.actions.actions import Action
+    from skyvern.webeye.utils.challenge_solve_record import ChallengeSolveReceipt
+
+
+@dataclass
+class ExternalOTPUse:
+    """Externally delivered one-time codes already entered in this task, kept apart from ``multi_field_totp``.
+
+    Clearing, remounts, replans, URL changes, ``reset_attempt`` and cache restores rebuild that binding; none
+    of them makes an entered code enterable again. Entering, and pressing the group's submit control, are
+    recorded separately; whether the site accepted a code is never inferred.
+    """
+
+    expected_digits: int
+    # Fingerprints of codes whose whole value reached the group, or was sent without a confirmed read-back.
+    used_code_hashes: frozenset[str] = field(default_factory=frozenset, repr=False)
+    current_code_hash: str | None = field(default=None, repr=False)
+    # Codes whose bound submit control or Enter was pressed (or may have been, if the press failed late).
+    submitted_code_hashes: frozenset[str] = field(default_factory=frozenset, repr=False)
+    # time.monotonic() limit, fixed when the current code was entered, for a step that can only repeat it.
+    deadline: float | None = None
+    # Start of a dispatched press on the group's resend control; authorizes one fetch.
+    resend_requested_at: datetime.datetime | None = None
+    resend_attempted: bool = False
+    # Latched once the task is to end here, so a failed terminate action cannot reopen code entry.
+    terminal_reasoning: str | None = None
+    terminal_error_code: str | None = None
 
 
 @dataclass
@@ -58,6 +86,18 @@ class MultiFieldTotpAttempt:
     external_code_obtained_at: float | None = None
     filled_group_identity: str | None = field(default=None, repr=False)
     observed_max_filled: int = 0
+
+
+@dataclass(frozen=True)
+class UnconsumedOTPCode:
+    """A polled verification code handed to a plan that did not type it.
+
+    ``obtained_at`` is the wall-clock time the code was fetched, not the time it was handed over, so
+    carrying it to a later plan cannot extend how long it is considered worth submitting.
+    """
+
+    value: str = field(repr=False)
+    obtained_at: float
 
 
 @dataclass
@@ -390,13 +430,11 @@ def redact_multi_field_totp_element_data(element_data: dict[str, Any]) -> dict[s
     return redacted
 
 
-def action_for_multi_field_totp_persistence(action: Action) -> Action:
-    """Return a copy of a multi-box OTP action carrying only the seed-free timing metadata.
-
-    The digit typed into the box stays on the row: the one-time code is a record the customer has to
-    be able to read back, and only the seed that mints codes is a secret. The allowlist below is what
-    keeps a `totp_secret` out of `totp_timing_info`.
-    """
+def action_for_multi_field_totp_persistence(action: Action, one_time_codes: Collection[str] = ()) -> Action:
+    """Return the persisted copy of an action; the live action must stay unmarked for execution and policy."""
+    text = action.text.strip() if action.action_type == ActionType.INPUT_TEXT and action.text else ""
+    if text and text in one_time_codes:
+        action = action.model_copy(update={"totp_code_required": True})
     timing_info = action.totp_timing_info
     if not timing_info or not timing_info.get("is_totp_sequence"):
         return action
@@ -696,13 +734,23 @@ class SkyvernContext:
     # keyed by task id. Keyed rather than last-one-wins because one browser state serves every block
     # in a run: a later block that fails without navigating must not inherit an earlier block's code.
     task_nav_error_codes: dict[str, str] = field(default_factory=dict)
+    download_failure_reasons: dict[str, list[str]] = field(default_factory=dict)
+    download_failure_reasons_by_key: dict[str, dict[str, list[str]]] = field(default_factory=dict, repr=False)
     navigation_goal: str | None = None
     navigation_payload: dict[str, Any] | list | str | None = None
     complete_criterion_is_untrusted: bool = False
     download_suffix: str | None = None
+    # Explicit download_timeout of the Task V3 block or task now running; the browser download listener
+    # reads it when a download starts, so it also covers the initial navigation and a relaunched browser.
+    download_timeout: float | None = None
+    residential_download_interrupted_task_ids: set[str] = field(default_factory=builtins.set)
+    download_completed_task_ids: set[str] = field(default_factory=builtins.set)
     # Keep source names with exact CDP targets; finalization must not infer provenance from affixes.
     download_suffix_applied_files: dict[str, tuple[str, str]] = field(default_factory=dict, repr=False)
     totp_codes: dict[str, str | None] = field(default_factory=dict)
+    # Polled codes placed in totp_codes that no plan has typed yet. Only the single-field polling
+    # path records one, so every other producer keeps the historical discard-after-planning behavior.
+    unconsumed_otp_codes: dict[str, UnconsumedOTPCode] = field(default_factory=dict, repr=False)
     seed_generated_totp_values: dict[str, set[str]] = field(default_factory=dict, repr=False)
     multi_field_totp: dict[str, MultiFieldTotpAttempt] = field(default_factory=dict)
     multi_field_totp_rejections: dict[str, MultiFieldTotpRejection] = field(default_factory=dict)
@@ -712,6 +760,7 @@ class SkyvernContext:
         field(default_factory=dict, repr=False)
     )
     multi_field_totp_rejected_candidates: dict[str, set[str]] = field(default_factory=dict, repr=False)
+    external_otp_uses: dict[str, ExternalOTPUse] = field(default_factory=dict)
     active_credential_parameter_key: str | None = None
     log: list[dict] = field(default_factory=list)
     hashed_href_map: dict[str, str] = field(default_factory=dict)
@@ -756,6 +805,7 @@ class SkyvernContext:
     enable_page_ready_wait: bool = False
     use_prompt_caching: bool = False
     cached_static_prompt: str | None = None
+    cached_task_prompt: str | None = None
     vertex_cache_name: str | None = None  # Vertex AI cache resource name for explicit caching
     vertex_cache_key: str | None = None  # Logical cache key (includes variant + llm key)
     vertex_cache_variant: str | None = None  # Variant identifier used when creating the cache
@@ -838,9 +888,12 @@ class SkyvernContext:
     script_revision_id: str | None = None
     action_order: int = 0
     prompt: str | None = None
+    # Workflow block label of the cached block now running; step notes are keyed by it.
+    cached_block_label: str | None = None
     parent_workflow_run_block_id: str | None = None
     workflow_run_block_id: str | None = None
     loop_metadata: dict[str, Any] | None = None
+    active_loop_label: str | None = None
     loop_internal_state: dict[str, Any] | None = None
     loop_output_values: list[list[dict[str, Any]]] | None = None
     script_run_parameters: dict[str, Any] = field(default_factory=dict)
@@ -985,6 +1038,10 @@ class SkyvernContext:
     # (no solver identity — a pre-entry check can't know it without running the detector); a url
     # change re-opens it. None means not latched. Opaque comparison string only; never log it.
     captcha_solve_latch_key: str | None = None
+    # Challenge-solve calls recorded per run id in this run's context; the solve ledger's attempt number.
+    challenge_solve_attempts: dict[str, int] = field(default_factory=dict)
+    # The latest finished solve calls' receipts, oldest first, capped by the solve ledger.
+    challenge_solve_receipts: list[ChallengeSolveReceipt] = field(default_factory=list)
 
     # Browser dialogs captured since the last agent prompt build, surfaced into the
     # next extract-action prompt so the LLM can react to validation rejections.
@@ -1076,6 +1133,7 @@ class SkyvernContext:
         return self.__repr__()
 
     def pop_totp_code(self, task_id: str) -> None:
+        self.unconsumed_otp_codes.pop(task_id, None)
         if task_id in self.totp_codes:
             self.totp_codes.pop(task_id)
 
@@ -1101,10 +1159,28 @@ class SkyvernContext:
         self.multi_field_totp_mask_values.pop(task_id, None)
         self.multi_field_totp_prompt_values.pop(task_id, None)
         self.multi_field_totp_rejected_candidates.pop(task_id, None)
+        self.external_otp_uses.pop(task_id, None)
+
+    def note_external_otp_input(
+        self, task_id: str, code_hash: str, expected_digits: int, budget_seconds: float
+    ) -> None:
+        use = self.external_otp_uses.setdefault(task_id, ExternalOTPUse(expected_digits=expected_digits))
+        if use.current_code_hash != code_hash:
+            use.current_code_hash = code_hash
+            use.expected_digits = expected_digits
+            use.deadline = time.monotonic() + budget_seconds
+        use.used_code_hashes = use.used_code_hashes | {code_hash}
+
+    def external_otp_code_used(self, task_id: str, code: str | None) -> bool:
+        use = self.external_otp_uses.get(task_id)
+        return (
+            code is not None and use is not None and hashlib.sha256(code.encode()).hexdigest() in use.used_code_hashes
+        )
 
     def clear_multi_field_totp_state(self, task_id: str, *, restore_unverified_external: bool = False) -> None:
         attempt = self.multi_field_totp.pop(task_id, None)
         self.seed_generated_totp_values.pop(task_id, None)
+        self.unconsumed_otp_codes.pop(task_id, None)
         self.totp_codes.pop(task_id, None)
         self.totp_codes.pop(f"{task_id}_secret", None)
         cached_code = self.totp_codes.pop(f"{task_id}_totp_cache", None)
@@ -1115,6 +1191,7 @@ class SkyvernContext:
             and attempt.filled_code_hash is not None
             and not attempt.fill_verified
             and cached_code
+            and not self.external_otp_code_used(task_id, cached_code)
         ):
             self.totp_codes[task_id] = cached_code
 
@@ -1511,6 +1588,30 @@ class SkyvernContext:
     def cleanup_downloads_recorded(self, task_id: str) -> bool:
         return task_id in self.cleanup_downloads_recorded_task_ids
 
+    def record_download_failure(self, task_id: str, reason: str, failure_key: str | None = None) -> None:
+        if failure_key is not None:
+            self.download_failure_reasons_by_key.setdefault(task_id, {}).setdefault(failure_key, []).append(reason)
+            return
+        reasons = self.download_failure_reasons.setdefault(task_id, [])
+        if reason not in reasons:
+            reasons.append(reason)
+
+    def resolve_download_failure(self, task_id: str, failure_key: str) -> None:
+        reasons = self.download_failure_reasons_by_key.get(task_id)
+        if reasons is not None:
+            outstanding = reasons.get(failure_key)
+            if outstanding:
+                outstanding.pop()
+                if not outstanding:
+                    reasons.pop(failure_key, None)
+            if not reasons:
+                self.download_failure_reasons_by_key.pop(task_id, None)
+
+    def consume_download_failures(self, task_id: str) -> list[str]:
+        reasons = self.download_failure_reasons.pop(task_id, [])
+        keyed_reasons = self.download_failure_reasons_by_key.pop(task_id, {})
+        return list(dict.fromkeys([*reasons, *(reason for values in keyed_reasons.values() for reason in values)]))
+
     def flush_feature_flags(self) -> None:
         if not self.feature_flag_entries:
             return
@@ -1601,12 +1702,12 @@ def ensure_context() -> SkyvernContext:
     return context
 
 
-def record_browser_timeout(operation: BrowserOperation) -> None:
+def record_browser_timeout(operation: BrowserOperation, *, frame_kind: FrameKind | None = None) -> None:
     """Note that a browser-protocol operation went unanswered. Outside a run there is nothing to
     tally against, and callers are hot paths, so a missing context is silently a no-op."""
     context = current()
     if context is not None:
-        context.browser_health.record_timeout(operation)
+        context.browser_health.record_timeout(operation, frame_kind=frame_kind)
 
 
 def record_browser_success() -> None:

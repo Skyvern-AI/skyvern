@@ -21,6 +21,7 @@ from skyvern.webeye.browser_artifacts import BrowserArtifacts
 class FakeBrowserState:
     def __init__(self) -> None:
         self.browser_artifacts = BrowserArtifacts()
+        self.engine_selection = None
 
     async def get_working_page(self) -> object:
         return SimpleNamespace(context=MagicMock())

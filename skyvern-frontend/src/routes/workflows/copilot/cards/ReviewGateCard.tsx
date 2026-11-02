@@ -23,6 +23,7 @@ import {
   TurnNarrativeState,
   ranCleanOnCurrentSource,
 } from "../narrativeState";
+import type { CopilotProposalMetadata } from "../workflowCopilotTypes";
 import {
   AppliedCheck,
   CardBody,
@@ -34,6 +35,14 @@ import {
   type PillTone,
 } from "./cardChrome";
 import { ACCEPT_BUTTON_CLASS, REJECT_BUTTON_CLASS } from "./cardLayout";
+import {
+  CHANGE_MARKERS,
+  DuplicateWriteRows,
+  InputChangeRows,
+  ReviewCoverageBadge,
+  humanizedList,
+  reviewCoverageTag,
+} from "./ReviewEvidence";
 import { draftLanded, getDiffCardTitle } from "./diffCardTitle";
 
 export type ReviewGateVerdict = "tested" | "untested" | null;
@@ -80,6 +89,25 @@ export function getReviewGateVerdict(
     return null;
   }
   return covered ? "tested" : "untested";
+}
+
+// The stored candidate's disposition is the recorded verdict: the server re-records it when a
+// later turn tests the same candidate bytes, so it outranks the turn that proposed them.
+// eslint-disable-next-line react-refresh/only-export-components
+export function getPendingReviewGateVerdict(
+  turn: TurnNarrativeState | undefined,
+  proposedWorkflow: WorkflowApiResponse | null,
+  metadata: CopilotProposalMetadata | null,
+): ReviewGateVerdict {
+  switch (metadata?.disposition) {
+    case "review_tested":
+    case "auto_applicable":
+      return "tested";
+    case "review_untested":
+      return "untested";
+    default:
+      return getReviewGateVerdict(turn, proposedWorkflow);
+  }
 }
 
 const END_TO_END_REAL_ACTIONS =
@@ -166,6 +194,11 @@ interface ReviewGateCardProps {
   gateId?: string;
   // Transient highlight when the pending-proposal chip scrolls to this gate.
   flash?: boolean;
+  // Notes and descriptions exist only in the Doc view; off, the card matches a workflow without them.
+  docEditorEnabled?: boolean;
+  // The newest turn's terminal cause, null when that turn recorded none. A Test turn keeps the
+  // proposal's owner, so a start it refused is recorded on a later turn than `turn`.
+  latestTurnCause: string | null;
 }
 
 type ChangeRow = {
@@ -180,43 +213,21 @@ type ChangeRow = {
   neverTested: boolean;
 };
 
-const CHANGE_ORDER = [
-  {
-    change: "added",
-    marker: "+",
-    srLabel: "Added",
-    markerClass: "text-success",
-  },
-  {
-    change: "changed",
-    marker: "~",
-    srLabel: "Changed",
-    markerClass: "text-amber-700 dark:text-amber-300",
-  },
-  {
-    change: "removed",
-    marker: "−",
-    srLabel: "Removed",
-    markerClass: "text-destructive",
-  },
-  {
-    change: "unchanged",
-    marker: "",
-    srLabel: "Unchanged",
-    markerClass: "text-muted-foreground",
-  },
-] as const;
+const CHANGE_ORDER = (
+  ["added", "changed", "removed", "unchanged"] as const
+).map((change) => ({ change, ...CHANGE_MARKERS[change] }));
 
-function changeRows(turn: TurnNarrativeState | undefined): ChangeRow[] {
+function changeRows(
+  turn: TurnNarrativeState | undefined,
+  tested: boolean,
+): ChangeRow[] {
   const review = turn?.review ?? null;
   if (review) {
     return CHANGE_ORDER.flatMap((section) =>
       review.blocks
         .filter((block) => block.change === section.change)
         .map((block) => {
-          const neverTested =
-            block.coverage === "never_run" ||
-            (block.coverage === undefined && Boolean(block.neverTested));
+          const coverageTag = reviewCoverageTag(block, tested);
           return {
             key: `${block.change}-${block.label}`,
             label: block.label,
@@ -225,15 +236,8 @@ function changeRows(turn: TurnNarrativeState | undefined): ChangeRow[] {
             markerClass: section.markerClass,
             struck: section.change === "removed",
             muted: section.change === "unchanged",
-            coverageTag:
-              block.coverage === "different_source"
-                ? "Different source"
-                : block.coverage === "unknown"
-                  ? "Not tested under this name"
-                  : neverTested
-                    ? "Never tested"
-                    : null,
-            neverTested,
+            coverageTag,
+            neverTested: coverageTag === "Never tested",
           };
         }),
     );
@@ -250,18 +254,16 @@ function changeRows(turn: TurnNarrativeState | undefined): ChangeRow[] {
   }));
 }
 
-function blockCountLabel(rows: ChangeRow[]): string | null {
+function blockCountLabel(rows: ChangeRow[], inputCount: number): string | null {
   const changed = rows.filter((row) => !row.muted).length;
-  const count = changed > 0 ? changed : rows.length;
-  if (count === 0) return null;
-  return `${count} ${count === 1 ? "block" : "blocks"}`;
-}
-
-function humanizedList(labels: string[]): string {
-  const names = labels.map(humanizeBlockLabel);
-  if (names.length < 2) return names[0] ?? "";
-  if (names.length === 2) return `${names[0]} and ${names[1]}`;
-  return `${names.slice(0, -1).join(", ")}, and ${names[names.length - 1]}`;
+  const count = changed > 0 || inputCount > 0 ? changed : rows.length;
+  const parts = [
+    count > 0 ? `${count} ${count === 1 ? "block" : "blocks"}` : null,
+    inputCount > 0
+      ? `${inputCount} ${inputCount === 1 ? "input" : "inputs"}`
+      : null,
+  ].filter((part) => part !== null);
+  return parts.length > 0 ? parts.join(" · ") : null;
 }
 
 function ChangeList({
@@ -269,11 +271,13 @@ function ChangeList({
   rows,
   limit,
   discarded,
+  docEditorEnabled,
 }: {
   turn: TurnNarrativeState | undefined;
   rows: ChangeRow[];
   limit?: number;
   discarded: boolean;
+  docEditorEnabled: boolean;
 }) {
   const [showAll, setShowAll] = useState(false);
   // A removal is never folded away, so a deletion cannot be accepted unseen.
@@ -290,8 +294,21 @@ function ChangeList({
     }
   }
   const hiddenNeverTested = hidden.filter((row) => row.neverTested).length;
+  const inputs = turn?.review?.inputs ?? [];
   const duplicateWrites = turn?.review?.duplicateWrites ?? [];
-  if (rows.length === 0 && duplicateWrites.length === 0) return null;
+  const kept = docEditorEnabled
+    ? [
+        { kind: "notes", labels: turn?.review?.keptNotes ?? [] },
+        { kind: "descriptions", labels: turn?.review?.keptDescriptions ?? [] },
+      ].filter((group) => group.labels.length > 0)
+    : [];
+  if (
+    rows.length === 0 &&
+    inputs.length === 0 &&
+    duplicateWrites.length === 0 &&
+    kept.length === 0
+  )
+    return null;
   return (
     <div>
       {visible.map((row) => (
@@ -313,13 +330,10 @@ function ChangeList({
           >
             {humanizeBlockLabel(row.label)}
           </span>
-          {row.coverageTag ? (
-            <span className="ml-2 whitespace-nowrap rounded-full bg-sky-500/10 px-1.5 py-0.5 text-[10px] font-medium text-sky-700 dark:text-sky-300">
-              {row.coverageTag}
-            </span>
-          ) : null}
+          <ReviewCoverageBadge label={row.coverageTag} />
         </GutterRow>
       ))}
+      <InputChangeRows inputs={inputs} discarded={discarded} />
       {hidden.length > 0 || showAll ? (
         <div className="pl-7 pt-0.5">
           <button
@@ -334,15 +348,21 @@ function ChangeList({
           </button>
         </div>
       ) : null}
-      {duplicateWrites.map((group) => (
+      <DuplicateWriteRows groups={duplicateWrites} />
+      {kept.map((group) => (
         <GutterRow
-          key={`${group.blockType}-${group.blockLabels.join("-")}`}
-          marker="!"
-          markerClass="font-bold text-amber-700 dark:text-amber-300"
-          srLabel="Warning"
+          key={group.kind}
+          marker=""
+          markerClass="text-muted-foreground"
         >
-          <span className="text-amber-700 dark:text-amber-300">
-            {humanizedList(group.blockLabels)} write to the same destination.
+          <span
+            className={
+              discarded
+                ? "text-muted-foreground line-through"
+                : "text-muted-foreground"
+            }
+          >
+            Kept your {group.kind} on {humanizedList(group.labels)}.
           </span>
         </GutterRow>
       ))}
@@ -396,6 +416,7 @@ function ResolvedReviewCard({
   title,
   gateId,
   flash,
+  docEditorEnabled,
 }: {
   turn: TurnNarrativeState | undefined;
   rows: ChangeRow[];
@@ -404,16 +425,25 @@ function ResolvedReviewCard({
   title: string;
   gateId?: string;
   flash: boolean;
+  docEditorEnabled: boolean;
 }) {
   const [expanded, setExpanded] = useState(false);
   const applied =
     accepted || (turn !== undefined && draftLanded(turn, { rejected }));
+  const inputCount = turn?.review?.inputs?.length ?? 0;
   const names =
-    rows.length > 0 && rows.length <= 2
-      ? rows.map((row) => humanizeBlockLabel(row.label)).join(", ")
-      : blockCountLabel(rows);
+    rows.length > 0 &&
+    rows.length <= 2 &&
+    (inputCount === 0 || rows.some((row) => !row.muted))
+      ? rows.map((row) => humanizeBlockLabel(row.label)).join(", ") +
+        (inputCount > 0
+          ? ` · ${inputCount} ${inputCount === 1 ? "input" : "inputs"}`
+          : "")
+      : blockCountLabel(rows, inputCount);
   const hasDetail =
-    rows.length > 0 || (turn?.review?.duplicateWrites.length ?? 0) > 0;
+    rows.length > 0 ||
+    inputCount > 0 ||
+    (turn?.review?.duplicateWrites.length ?? 0) > 0;
   return (
     <CopilotCard
       id={gateId}
@@ -458,6 +488,7 @@ function ResolvedReviewCard({
           )
         }
         meta={names}
+        wrapTitle
         right={
           rejected ? (
             <span className="text-[11px] text-muted-foreground">
@@ -472,7 +503,12 @@ function ResolvedReviewCard({
       />
       {expanded ? (
         <CardBody>
-          <ChangeList turn={turn} rows={rows} discarded={rejected} />
+          <ChangeList
+            turn={turn}
+            rows={rows}
+            discarded={rejected}
+            docEditorEnabled={docEditorEnabled}
+          />
         </CardBody>
       ) : null}
     </CopilotCard>
@@ -498,6 +534,8 @@ export function ReviewGateCard({
   onRetry,
   gateId,
   flash = false,
+  docEditorEnabled = false,
+  latestTurnCause,
 }: ReviewGateCardProps) {
   const [confirmingTest, setConfirmingTest] = useState(false);
   const runTestRef = useRef<HTMLButtonElement>(null);
@@ -542,7 +580,9 @@ export function ReviewGateCard({
     restoreFocusRef.current = true;
     setConfirmingTest(false);
   };
-  const rows = changeRows(turn);
+  // A tested candidate outranks what its proposing turn recorded about blocks and starts.
+  const tested = verdict === "tested";
+  const rows = changeRows(turn, tested);
   const rejected = settled === "rejected";
   const accepted = settled === "accepted";
   const title = turn
@@ -561,6 +601,7 @@ export function ReviewGateCard({
         title={title}
         gateId={gateId}
         flash={flash}
+        docEditorEnabled={docEditorEnabled}
       />
     );
   }
@@ -570,14 +611,18 @@ export function ReviewGateCard({
     : accepting
       ? GATE_STATUS.accepting
       : null;
+  // A turn that records a cause never tests clean, so a cause on the newest turn postdates any tested
+  // verdict and outranks it.
+  const startFailureCause = latestTurnCause;
   const billingCreditRefusal =
-    turn?.turnFacts?.terminalCause === "billing_credit_admission_refusal";
-  const testFailed = Boolean(turn && hasFailedTestBlock(turn));
+    startFailureCause === "billing_credit_admission_refusal";
+  const unsavedProfilePick =
+    startFailureCause === "unsaved_browser_profile_pick";
+  const testFailed = !tested && Boolean(turn && hasFailedTestBlock(turn));
   const showActions = actionsShown && hasProposal;
-  const connectFailure = isBuildTestConnectFailureState(
-    turn?.turnFacts?.terminalCause,
-  );
-  const canTest = Boolean(onTestEndToEnd) && !billingCreditRefusal;
+  const connectFailure = isBuildTestConnectFailureState(startFailureCause);
+  const canTest =
+    Boolean(onTestEndToEnd) && !billingCreditRefusal && !unsavedProfilePick;
   const testLabel = connectFailure
     ? "Retry in a fresh session"
     : "Test end-to-end";
@@ -590,14 +635,7 @@ export function ReviewGateCard({
         turn !== undefined &&
         everyTestBlockExecuted(turn) &&
         !testFailed));
-  // The caller already withholds actionsEnabled in these states; this keeps the row locked if it
-  // ever does not.
-  const actionsLocked =
-    !actionsEnabled ||
-    accepting ||
-    failure === "reload" ||
-    failure === "recover" ||
-    failure === "saved";
+  const actionsLocked = !actionsEnabled || accepting;
   // A lock that lands mid-confirmation would strand it behind the disabled fieldset.
   if (confirmingTest && actionsLocked) {
     restoreFocusRef.current = true;
@@ -606,6 +644,7 @@ export function ReviewGateCard({
   const showTestInBody = showActions && offerTestInBody && !confirmingTest;
   const hasBody =
     rows.length > 0 ||
+    (turn?.review?.inputs?.length ?? 0) > 0 ||
     (turn?.review?.duplicateWrites.length ?? 0) > 0 ||
     showTestInBody;
 
@@ -710,7 +749,7 @@ export function ReviewGateCard({
       <CardHeader
         icon={<MagicWandIcon className="h-3.5 w-3.5 text-muted-foreground" />}
         title={title}
-        meta={blockCountLabel(rows)}
+        meta={blockCountLabel(rows, turn?.review?.inputs?.length ?? 0)}
         wrapTitle
         right={
           !verdict ? null : testFailed ? (
@@ -729,6 +768,7 @@ export function ReviewGateCard({
             rows={rows}
             limit={PENDING_CHANGE_LIMIT}
             discarded={false}
+            docEditorEnabled={docEditorEnabled}
           />
           {showTestInBody ? (
             <GutterRow marker="▷" markerClass="text-sky-600 dark:text-sky-400">
@@ -800,6 +840,12 @@ export function ReviewGateCard({
                     Go to Billing
                   </a>
                   .
+                </p>
+              ) : null}
+              {unsavedProfilePick ? (
+                <p className="pb-2 text-[11px] leading-snug text-muted-foreground">
+                  No run started: this proposal changes the browser profile.
+                  Accept it to let the test load that profile.
                 </p>
               ) : null}
               {confirmingTest && canTest ? (

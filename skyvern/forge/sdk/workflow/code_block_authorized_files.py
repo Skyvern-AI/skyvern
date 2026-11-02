@@ -31,6 +31,8 @@ from skyvern.forge.sdk.schemas.files import FileInfo
 from skyvern.webeye.browser_factory import resolve_artifact_path
 from skyvern.webeye.browser_object_predicates import DownloadLike, is_download_like
 from skyvern.webeye.cdp_download_interceptor import (
+    DownloadTally,
+    download_tally_for_context,
     is_monitoring_browser_downloads_for_context,
     monitor_saved_download_name,
     normalize_download_filename,
@@ -375,6 +377,8 @@ class BlockDownloadLog:
 
     def __init__(self, context: Any) -> None:
         self._context = context
+        self.start_tally: DownloadTally | None = download_tally_for_context(context)
+        self.start_tally_readable = context is not None
         self._pages: list[Any] = []
         self._downloads: list[DownloadLike] = []
         self._finished: set[int] = set()

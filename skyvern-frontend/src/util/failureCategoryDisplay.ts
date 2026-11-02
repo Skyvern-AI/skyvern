@@ -22,7 +22,7 @@ const FAILURE_CATEGORY_DISPLAY = {
   BROWSER_ERROR: {
     label: "Browser error",
     description:
-      "The browser crashed or the page closed unexpectedly. Retrying usually helps.",
+      "The browser crashed, stopped responding, or closed the page unexpectedly. Retrying usually helps, because a new run gets a fresh browser. If the run uses a browser session or connects to your own browser, start a new session or restart that browser first.",
   },
   BROWSER_SESSION_EXPIRED: {
     label: "Browser session expired",

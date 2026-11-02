@@ -1,7 +1,8 @@
-from skyvern.constants import SKYVERN_MCP_USER_AGENT, SKYVERN_UI_USER_AGENT
+from skyvern.constants import SKYVERN_CLI_USER_AGENT, SKYVERN_MCP_USER_AGENT, SKYVERN_UI_USER_AGENT
 from skyvern.forge.sdk.db.enums import (
     WorkflowRunTriggerType,
     is_job_recipe_workflow_run_trigger_type,
+    is_recipe_billing_workflow_run_trigger_type,
 )
 from skyvern.forge.sdk.routes.trigger_type import workflow_run_trigger_type_from_user_agent
 
@@ -12,6 +13,10 @@ def test_workflow_run_trigger_type_from_user_agent_ui_returns_manual() -> None:
 
 def test_workflow_run_trigger_type_from_user_agent_mcp_returns_mcp() -> None:
     assert workflow_run_trigger_type_from_user_agent(SKYVERN_MCP_USER_AGENT) == WorkflowRunTriggerType.mcp
+
+
+def test_workflow_run_trigger_type_from_user_agent_cli_keeps_mcp_run_treatment() -> None:
+    assert workflow_run_trigger_type_from_user_agent(SKYVERN_CLI_USER_AGENT) == WorkflowRunTriggerType.mcp
 
 
 def test_workflow_run_trigger_type_from_user_agent_none_returns_api() -> None:
@@ -34,6 +39,19 @@ def test_is_job_recipe_workflow_run_trigger_type_returns_false_for_other_trigger
         WorkflowRunTriggerType.api,
         WorkflowRunTriggerType.scheduled,
         WorkflowRunTriggerType.webhook,
+        WorkflowRunTriggerType.seo_recipe_submit,
         None,
     ):
         assert not is_job_recipe_workflow_run_trigger_type(trigger_type)
+
+
+def test_recipe_billing_trigger_classification() -> None:
+    for trigger in (*WorkflowRunTriggerType, None):
+        assert is_recipe_billing_workflow_run_trigger_type(trigger) is (
+            trigger
+            in {
+                WorkflowRunTriggerType.job_recipe_apply,
+                WorkflowRunTriggerType.job_recipe_extract,
+                WorkflowRunTriggerType.seo_recipe_submit,
+            }
+        )

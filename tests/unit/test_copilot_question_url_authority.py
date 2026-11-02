@@ -314,6 +314,7 @@ async def test_question_source_reaches_fill_boundary_without_weakening_origin_gu
         org_credentials_for_turn=None,
         credential_pause_used=False,
         vault_login_uris_by_credential_id={},
+        scoped_login_sites_by_credential_id={},
         persisted_workflow_yaml="",
     )
     with (

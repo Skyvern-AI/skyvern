@@ -19,6 +19,10 @@ LOG = structlog.get_logger()
 _NATIVE_VALUE_SET_INPUT_TYPES = frozenset({"range", "date", "datetime-local", "month", "time", "week"})
 
 
+class UploadFileDownloadError(Exception):
+    pass
+
+
 async def _uses_native_value_set_fill(locator: Locator) -> bool:
     try:
         input_type = await locator.evaluate("el => el.tagName === 'INPUT' ? el.type : null")
@@ -32,34 +36,33 @@ async def download_file(
     file_url: str,
     action: dict[str, Any] | None = None,
     organization_id: str | None = None,
-) -> str | list[str]:
+) -> str:
     if file_url.startswith("/"):
         run_id = resolve_run_download_id(skyvern_context.current())
         try:
             return validate_local_file_path(file_url, run_id)
-        except PermissionError:
+        except PermissionError as exc:
             # Expected when the LLM/user supplies an absolute path outside the run's download
-            # directory. The containment guard is doing its job; the action fails cleanly rather
-            # than surfacing as an unhandled ERROR with a traceback.
+            # directory. The containment guard is doing its job; the caller turns this into an
+            # action failure.
             LOG.warning(
-                "Local file path is outside the allowed download directory, continuing without it",
+                "Local file path is outside the allowed download directory",
                 action=action,
                 file_url=file_url,
                 run_id=run_id,
             )
-            return []
+            raise UploadFileDownloadError("Local file path is outside the allowed download directory") from exc
 
     try:
         return await download_file_api(file_url, organization_id=organization_id)
-    except Exception:
-        # Fully self-recovering: the action proceeds without the file.
+    except Exception as exc:
         LOG.warning(
-            "Failed to download file, continuing without it",
+            "Failed to download file",
             action=action,
             file_url=file_url,
             exc_info=True,
         )
-        return []
+        raise UploadFileDownloadError("File download failed") from exc
 
 
 async def strategy_aware_input(

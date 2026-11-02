@@ -103,13 +103,17 @@ async def _run_ladder(ctx: AgentContext, page: Page, session_id: str) -> dict[st
         return {"ok": True, "outcome": "unavailable", "detail": _OUTCOME_TEXT["unavailable"]}
     unsolved: dict[str, Any] = {"ok": True, "outcome": "unsolved", "detail": _OUTCOME_TEXT["unsolved"]}
     try:
-        async with asyncio.timeout(SOLVE_CEILING_SECONDS):
-            challenge = await solve_challenge(
-                page,
-                organization_id=ctx.organization_id,
-                browser_session_id=session_id,
-                probe_child_frames=True,
-            )
+        with app.AGENT_FUNCTION.challenge_solve_recording(
+            "copilot", page=page, organization_id=ctx.organization_id, browser_session_id=session_id
+        ) as record:
+            async with asyncio.timeout(SOLVE_CEILING_SECONDS):
+                challenge = await solve_challenge(
+                    page,
+                    organization_id=ctx.organization_id,
+                    browser_session_id=session_id,
+                    probe_child_frames=True,
+                )
+            record.challenge = challenge
     except TimeoutError:
         return {**unsolved, "timed_out": True, "detail": f"The solver did not finish in {SOLVE_CEILING_SECONDS}s."}
     except Exception:
@@ -128,10 +132,14 @@ async def _read_image(ctx: AgentContext, page: Page, session_id: str, image: str
         return {**unsolved, "read_limit_reached": True, "detail": _IMAGE_OUTCOME_TEXT["read_limit_reached"]}
     ctx.image_captcha_reads += 1
     try:
-        async with asyncio.timeout(SOLVE_CEILING_SECONDS):
-            await _code_block_solve_captcha_builtin(
-                page, organization_id=ctx.organization_id, browser_session_id=session_id, image=image, input=input
-            )
+        # The builtin records into this outer record, so the row names copilot as its client.
+        with app.AGENT_FUNCTION.challenge_solve_recording(
+            "copilot", page=page, organization_id=ctx.organization_id, browser_session_id=session_id
+        ):
+            async with asyncio.timeout(SOLVE_CEILING_SECONDS):
+                await _code_block_solve_captcha_builtin(
+                    page, organization_id=ctx.organization_id, browser_session_id=session_id, image=image, input=input
+                )
     except CodeBlockCaptchaError:
         return unsolved
     except TimeoutError:

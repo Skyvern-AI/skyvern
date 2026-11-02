@@ -33,7 +33,10 @@ import {
   ACTIVITY_KIND_WORD,
   ActivityLog,
   ActivityRow as ActivityRowModel,
+  BlockAttempt,
   FinishedTurnSummary,
+  blockAttempts,
+  blockIdentity,
   blocksByRunCall,
   callLabel,
   callRollup,
@@ -46,7 +49,14 @@ import {
 } from "./copilotActivityLog";
 import { TURN_ROW_INSET, TURN_ROW_OUTSET } from "./cards/cardLayout";
 import { showPhaseChecklist } from "./copilotPhases";
-import { CodeWriteDiff } from "./workflowCopilotTypes";
+import {
+  CodeWriteDiff,
+  CopilotTestInput,
+  SkippedPrefixBlock,
+} from "./workflowCopilotTypes";
+import { useWorkflowRunByIdQuery } from "../hooks/useWorkflowRunQuery";
+import { RunFieldValue } from "../studio/runview/RunFieldValue";
+import { WorkflowParameterValueType } from "../types/workflowTypes";
 import {
   ActivityEntry,
   BlockState,
@@ -68,6 +78,7 @@ import {
   toolCallKind,
 } from "./narrativeState";
 import { useShimmerText } from "../workflowRun/useShimmerText";
+import { workflowRunDetailPath } from "../studioNavigation";
 
 // Row flashes green/red for 600ms once revealed — must match the tailwind
 // copilot-row-flash-* animation duration.
@@ -94,6 +105,16 @@ function truncateOutcomeReason(reason: string): string {
   if (reason.length <= OUTCOME_REASON_PREVIEW_LIMIT) return reason;
   const slice = reason.slice(0, OUTCOME_REASON_PREVIEW_LIMIT - 3).trimEnd();
   return `${slice}...`;
+}
+
+function firstLine(text: string | null | undefined): string | null {
+  const line = text?.trim().split("\n")[0]?.trim();
+  return line ? line : null;
+}
+
+function lastFailedActionLine(block: BlockState): string | null {
+  const failed = (block.recordedActions ?? []).filter((a) => a.failed);
+  return firstLine(failed[failed.length - 1]?.response);
 }
 
 // What a collapsed line says about a block whose run did not confirm its
@@ -127,6 +148,32 @@ function notConfirmedDisplayReason(turn: TurnNarrativeState): string | null {
   return normalizeOutcomeReason(notConfirmedOutcome(turn)?.displayReason);
 }
 
+// A failed block reads its run's stamped reason, else the turn's verdict when it owns it. A verdict or
+// block saved without a run id cannot be matched, so the owning block keeps that verdict.
+function failedBlockReason(
+  block: BlockState,
+  attempt: BlockAttempt,
+  ownsVerdict: boolean,
+  verdictReason: string | null | undefined,
+  verdictRunId: string | undefined,
+): string | null {
+  if (!attempt.ownsRunReason) return null;
+  const verdictIsOwnRun =
+    !verdictRunId ||
+    !block.workflowRunId ||
+    verdictRunId === block.workflowRunId;
+  return normalizeOutcomeReason(
+    block.outcomeReason ??
+      (ownsVerdict && verdictIsOwnRun ? verdictReason : null),
+  );
+}
+
+function failedWord(attempt: BlockAttempt): string {
+  return attempt.attempt === null
+    ? "Failed"
+    : `Attempt ${attempt.attempt} failed`;
+}
+
 function isQuestionTurn(turn: TurnNarrativeState): boolean {
   return (
     !turn.cancelled &&
@@ -134,9 +181,7 @@ function isQuestionTurn(turn: TurnNarrativeState): boolean {
   );
 }
 
-function blockIdentity(block: BlockState): string {
-  return block.workflowRunBlockId || block.label;
-}
+const UNFINISHED_BLOCK_NOTE = "the turn ended before this block finished";
 
 function outcomeNotConfirmedOwnerKey(turn: TurnNarrativeState): string | null {
   if (notConfirmedOutcome(turn) === null) return null;
@@ -144,17 +189,13 @@ function outcomeNotConfirmedOwnerKey(turn: TurnNarrativeState): string | null {
   for (let i = turn.blocks.length - 1; i >= 0; i -= 1) {
     const block = turn.blocks[i]!;
     if (
-      block.state === "completed" &&
-      block.outcome === "not_demonstrated" &&
-      !isInterimOutcome(block.outcomeRole)
+      (block.state === "completed" &&
+        block.outcome === "not_demonstrated" &&
+        !isInterimOutcome(block.outcomeRole)) ||
+      block.state === "failed" ||
+      block.state === "stopped" ||
+      block.state === "unfinished"
     ) {
-      return blockIdentity(block);
-    }
-  }
-
-  for (let i = turn.blocks.length - 1; i >= 0; i -= 1) {
-    const block = turn.blocks[i]!;
-    if (block.state === "failed" || block.state === "stopped") {
       return blockIdentity(block);
     }
   }
@@ -514,6 +555,7 @@ interface FBlockRunProps {
   onSelect?: (label: string) => void;
   outcomeReasonFallback?: string | null;
   ownsOutcomeNotConfirmed?: boolean;
+  failedReason: string | null;
 }
 
 function FBlockRun({
@@ -522,6 +564,7 @@ function FBlockRun({
   onSelect,
   outcomeReasonFallback,
   ownsOutcomeNotConfirmed,
+  failedReason,
 }: FBlockRunProps) {
   const displayLabel = humanizeBlockLabel(block.label);
   const palette = paletteFor(block.blockType);
@@ -543,13 +586,17 @@ function FBlockRun({
   const isOk = isBlockOk(block);
   const isFail = block.state === "failed";
   const isStopped = block.state === "stopped";
+  const isUnfinished = block.state === "unfinished";
   const isDraft = block.state === "drafted";
-  const collapsedOutcomeReason =
-    isOutcomeNotShown || ownsOutcomeNotConfirmed
+  const collapsedOutcomeReason = isFail
+    ? failedReason
+    : isOutcomeNotShown || ownsOutcomeNotConfirmed
       ? normalizeOutcomeReason(block.outcomeReason ?? outcomeReasonFallback)
       : null;
   const ownsOutcomeReason =
-    ownsOutcomeNotConfirmed === true && collapsedOutcomeReason !== null;
+    !isFail &&
+    ownsOutcomeNotConfirmed === true &&
+    collapsedOutcomeReason !== null;
 
   const accentBorder = isRunning
     ? "border-blue-400/60"
@@ -603,7 +650,8 @@ function FBlockRun({
       ownsOutcomeReason ||
       isVerifying ||
       isRanNeutral ||
-      isStopped);
+      isStopped ||
+      isUnfinished);
   useTick(isRunning);
   const elapsed = formatElapsed(block.startedAt, block.endedAt);
   const live = isRunning ? liveElapsed(block.startedAt) : null;
@@ -619,9 +667,11 @@ function FBlockRun({
             ? "halted"
             : isStopped
               ? `stopped${elapsed ? ` · ${elapsed}` : ""}`
-              : isDraft
-                ? "drafted"
-                : "queued";
+              : isUnfinished
+                ? UNFINISHED_BLOCK_NOTE
+                : isDraft
+                  ? "drafted"
+                  : "queued";
   const stateGlyph = isOk ? (
     "✓"
   ) : isOutcomeNotShown ? (
@@ -632,20 +682,17 @@ function FBlockRun({
     "✕"
   ) : isStopped ? (
     "■"
+  ) : isUnfinished ? (
+    "○"
   ) : isRunning ? (
     <Spinner />
   ) : (
     palette.glyph
   );
-  const failureActivity = block.activity.find(
-    (entry) => entry.kind === "tool_result",
-  )?.text;
   const failureDetail =
-    failureActivity ?? collapsedOutcomeReason ?? "Halted — see run details.";
-  // Keep the amber evidence box only when it adds information beyond the
-  // failed row's rose failure box.
-  const showSeparateOutcomeReason =
-    ownsOutcomeReason && (!isFail || failureDetail !== collapsedOutcomeReason);
+    failedReason ??
+    block.activity.find((entry) => entry.kind === "tool_result")?.text ??
+    "Halted — see run details.";
 
   const onHeaderClick = () => {
     onSelect?.(block.label);
@@ -713,7 +760,7 @@ function FBlockRun({
           </div>
         </div>
       ) : null}
-      {isOutcomeNotShown || showSeparateOutcomeReason ? (
+      {isOutcomeNotShown || ownsOutcomeReason ? (
         <div className="mt-1 flex items-start gap-2 rounded-md border border-amber-400/30 bg-amber-500/10 px-2.5 py-1.5">
           <span
             aria-hidden="true"
@@ -1125,7 +1172,11 @@ interface TestCardStatus {
   glyph: React.ReactNode;
 }
 
-function testCardStatus(block: BlockState, turnEnded: boolean): TestCardStatus {
+function testCardStatus(
+  block: BlockState,
+  turnEnded: boolean,
+  attempt: BlockAttempt,
+): TestCardStatus {
   const glyphClass = "size-3.5";
   switch (block.state) {
     case "running":
@@ -1138,8 +1189,8 @@ function testCardStatus(block: BlockState, turnEnded: boolean): TestCardStatus {
     case "failed":
       return {
         tone: "failed",
-        word: "Failed",
-        note: null,
+        word: failedWord(attempt),
+        note: turnEnded || !attempt.newest ? null : "Copilot is fixing it",
         glyph: <Cross2Icon aria-hidden="true" className={glyphClass} />,
       };
     case "stopped":
@@ -1148,6 +1199,13 @@ function testCardStatus(block: BlockState, turnEnded: boolean): TestCardStatus {
         word: "Stopped",
         note: null,
         glyph: <StopIcon aria-hidden="true" className="size-3" />,
+      };
+    case "unfinished":
+      return {
+        tone: "neutral",
+        word: "Unfinished",
+        note: UNFINISHED_BLOCK_NOTE,
+        glyph: "○",
       };
     case "skipped":
       return { tone: "neutral", word: "Skipped", note: null, glyph: "–" };
@@ -1305,6 +1363,48 @@ function FCardActionRow({
 
 // One card per block run of a test. The header says where the block stands;
 // the body holds the code change that block got and the steps its run took.
+const SKIPPED_PREFIX_NOTE: Record<SkippedPrefixBlock["kind"], string> = {
+  reused: "Reused from an earlier test",
+  not_run: "Not run in this test",
+};
+
+function FSkippedPrefixRow({
+  skipped,
+  onSelect,
+}: {
+  skipped: SkippedPrefixBlock;
+  onSelect?: (label: string) => void;
+}) {
+  const tone = TEST_CARD_TONE.neutral;
+  return (
+    <div
+      data-testid="copilot-skipped-prefix-row"
+      data-kind={skipped.kind}
+      className={`overflow-hidden rounded-lg border ${tone.card}`}
+    >
+      <button
+        type="button"
+        className="flex w-full min-w-0 items-start gap-2 px-3 py-[11px] text-left text-[12.5px] leading-5"
+        title={`Highlight ${skipped.label} on canvas`}
+        onClick={() => onSelect?.(skipped.label)}
+      >
+        <span
+          className={`flex h-5 w-3.5 shrink-0 items-center justify-center text-[12px] font-bold ${tone.glyph}`}
+          aria-hidden="true"
+        >
+          {skipped.kind === "reused" ? "↺" : "–"}
+        </span>
+        <span className="min-w-0 flex-1 break-words">
+          <span className="text-foreground">
+            {humanizeBlockLabel(skipped.label)}
+          </span>
+          <span className="text-muted-foreground">{`${SEP}${SKIPPED_PREFIX_NOTE[skipped.kind]}`}</span>
+        </span>
+      </button>
+    </div>
+  );
+}
+
 function FTestRunCard({
   block,
   diff,
@@ -1313,6 +1413,7 @@ function FTestRunCard({
   callFailure,
   outcomeReason,
   ownsVerdict,
+  attempt,
   turnEnded,
   open,
   onToggle,
@@ -1329,12 +1430,13 @@ function FTestRunCard({
   // This block holds the turn's unconfirmed verdict, so its card is where the
   // reason reads; the turn card stands down for it.
   ownsVerdict: boolean;
+  attempt: BlockAttempt;
   turnEnded: boolean;
   open: boolean;
   onToggle: () => void;
   onSelect?: (label: string) => void;
 }) {
-  const status = testCardStatus(block, turnEnded);
+  const status = testCardStatus(block, turnEnded, attempt);
   const tone = TEST_CARD_TONE[status.tone];
   const isRunning = block.state === "running";
   useTick(isRunning);
@@ -1348,22 +1450,26 @@ function FTestRunCard({
   actions.forEach((action, i) => {
     if (action.failed && i !== reveal.revealingIndex) lastFailed = i;
   });
-  const failureOf = (action: RecordedActionSummary, i: number) =>
-    action.response ?? (i === lastFailed ? callFailure : null);
+  const failed = block.state === "failed";
+  // A failed block's run reason survives a reload; recorded actions and the call's detail do not.
+  const runReason = failed ? outcomeReason : null;
+  const failure = runReason ?? callFailure;
+  const failureOf = (action: RecordedActionSummary, i: number) => {
+    if (i !== lastFailed) return action.response ?? null;
+    const response = action.response?.trim() || null;
+    if (runReason === null || response === null) return response ?? failure;
+    // The run's reason leads; the action's own error stays openable under it.
+    return firstLine(response) === runReason
+      ? response
+      : `${runReason}\n${response}`;
+  };
   // A failed block whose run recorded no failed step still says why. It stays
   // put while actions replay above it, then moves onto the step that failed.
   const recordedFailure = (block.recordedActions ?? []).some((a) => a.failed);
   const blockFailure =
-    block.state === "failed" && lastFailed === -1
-      ? (callFailure ?? (recordedFailure ? null : "Halted — see run details."))
+    failed && lastFailed === -1
+      ? (failure ?? (recordedFailure ? null : "Halted — see run details."))
       : null;
-  const reason =
-    status.tone === "notConfirmed"
-      ? (outcomeReason ??
-        "The step ran, but the run did not demonstrate the goal was met.")
-      : ownsVerdict && outcomeReason !== null
-        ? `Outcome not confirmed — ${outcomeReason}`
-        : null;
 
   const hasBody =
     diff !== null ||
@@ -1371,6 +1477,21 @@ function FTestRunCard({
     blockFailure !== null ||
     block.activity.length > 0;
   const expanded = hasBody && open;
+  // A failed card's error reads once: in its body when open, on this line when not.
+  const foldedFailure =
+    runReason ??
+    (lastFailed === -1 ? null : firstLine(actions[lastFailed]!.response)) ??
+    failure;
+  const reason = failed
+    ? expanded || foldedFailure === null
+      ? null
+      : truncateOutcomeReason(foldedFailure)
+    : status.tone === "notConfirmed"
+      ? (outcomeReason ??
+        "The step ran, but the run did not demonstrate the goal was met.")
+      : ownsVerdict && outcomeReason !== null
+        ? `Outcome not confirmed — ${outcomeReason}`
+        : null;
   const summary = [
     reveal.total > 0
       ? `${reveal.total} ${reveal.total === 1 ? "action" : "actions"}`
@@ -1431,7 +1552,11 @@ function FTestRunCard({
         {header}
       </button>
       {reason === null ? null : (
-        <p className="px-3 pb-[11px] pl-[34px] text-[12px] leading-[1.5] text-muted-foreground">
+        <p
+          className={`px-3 pb-[11px] pl-[34px] text-[12px] leading-[1.5] ${
+            failed ? tone.word : "text-muted-foreground"
+          }`}
+        >
           {reason}
         </p>
       )}
@@ -1584,6 +1709,117 @@ function FFittedSteps({ steps }: { steps: string[] }) {
   );
 }
 
+function TestInputSource({ input }: { input: CopilotTestInput }) {
+  switch (input.source) {
+    case "copilot":
+      return <>set by Copilot</>;
+    case "page":
+      return <>from the page</>;
+    case "earlier_run":
+      return input.sourceRunId ? (
+        <>
+          {"reused from run "}
+          <a
+            className="underline hover:text-foreground"
+            href={`/runs/${input.sourceRunId}`}
+            target="_blank"
+            rel="noopener noreferrer"
+          >
+            {input.sourceRunId}
+          </a>
+        </>
+      ) : (
+        <>reused from an earlier run</>
+      );
+    case "default":
+      return <>workflow default</>;
+    case "placeholder":
+      return <>left blank</>;
+  }
+}
+
+function TestInputValues({
+  workflowRunId,
+  inputs,
+}: {
+  workflowRunId: string;
+  inputs: CopilotTestInput[];
+}) {
+  const { data: run, isError } = useWorkflowRunByIdQuery(workflowRunId, true);
+  if (run === undefined) {
+    return (
+      <p className="ml-[18px] text-[12px] text-muted-foreground">
+        {isError ? "Could not load these values." : "Loading…"}
+      </p>
+    );
+  }
+  const credentialKeys = new Set(
+    (run.workflow?.workflow_definition?.parameters ?? []).flatMap((p) =>
+      p.parameter_type === "workflow" &&
+      p.workflow_parameter_type === WorkflowParameterValueType.CredentialId
+        ? [p.key]
+        : [],
+    ),
+  );
+  const values = run.parameters ?? {};
+  return (
+    <dl className="ml-[18px] mt-0.5 flex flex-col gap-1.5 border-l border-border pl-2 text-[12px]">
+      {inputs.map((input) => {
+        const raw = values[input.key];
+        // A credential shows only its saved reference, never a resolved value.
+        const hidden = credentialKeys.has(input.key) && typeof raw !== "string";
+        return (
+          <div key={input.key} data-test-input-key={input.key}>
+            <dt className="flex flex-wrap items-baseline gap-x-1.5">
+              <span className="font-mono text-[11.5px] text-foreground">
+                {input.key}
+              </span>
+              <span className="text-muted-foreground">
+                <TestInputSource input={input} />
+              </span>
+            </dt>
+            <dd>
+              {hidden ? (
+                <span className="text-xs text-muted-foreground">hidden</span>
+              ) : (
+                <RunFieldValue value={raw} label={input.key} />
+              )}
+            </dd>
+          </div>
+        );
+      })}
+    </dl>
+  );
+}
+
+function TestInputsDisclosure({
+  entry,
+  className,
+}: {
+  entry: ActivityEntry;
+  className?: string;
+}) {
+  const [open, setOpen] = useState(false);
+  const inputs = entry.testInputs;
+  if (!entry.workflowRunId || !inputs?.length) return null;
+  return (
+    <div data-test-inputs className={className}>
+      <button
+        type="button"
+        aria-expanded={open}
+        className={`flex items-center gap-1.5 py-px text-left text-[12px] leading-[1.5] ${STEP_TEXT} hover:text-foreground`}
+        onClick={() => setOpen(!open)}
+      >
+        <Chevron open={open} />
+        {`Test inputs (${inputs.length})`}
+      </button>
+      {open ? (
+        <TestInputValues workflowRunId={entry.workflowRunId} inputs={inputs} />
+      ) : null}
+    </div>
+  );
+}
+
 // One call in an expanded step. A result reads inline beside the call and
 // opens to its full text; an error opens as its own box.
 function FCallItem({
@@ -1690,6 +1926,7 @@ function FCallItem({
       ) : null}
       {evidence}
       {open && detail !== null ? <FDetailBox>{detail}</FDetailBox> : null}
+      <TestInputsDisclosure entry={entry} className="ml-[18px]" />
     </li>
   );
 }
@@ -1707,6 +1944,8 @@ function FActivityLogRow({
   onBlockSelect,
   outcomeReasonFallback,
   outcomeOwnerKey,
+  verdictRunId,
+  attempts,
 }: {
   row: ActivityRowModel;
   open: boolean;
@@ -1720,6 +1959,8 @@ function FActivityLogRow({
   onBlockSelect?: (label: string) => void;
   outcomeReasonFallback?: string | null;
   outcomeOwnerKey?: string | null;
+  verdictRunId: string | undefined;
+  attempts: Map<string, BlockAttempt>;
 }) {
   const last = row.entries[row.entries.length - 1];
   // Time-derived like the recorded-action reveal, so a hydrated row (no
@@ -1796,12 +2037,13 @@ function FActivityLogRow({
       diffCardKey.get(block.label) === key
         ? (row.codeDiffs.find((d) => d.label === block.label) ?? null)
         : null;
+    const attempt = attempts.get(blockIdentity(block))!;
     const reasonFallback =
       key === outcomeOwnerKey || block.outcome === "not_demonstrated"
         ? outcomeReasonFallback
         : null;
     const cardIsOpen = isCardOpen(block);
-    return (
+    const card = (
       <FTestRunCard
         key={key}
         block={block}
@@ -1813,15 +2055,37 @@ function FActivityLogRow({
             ? callFailureText(host)
             : null
         }
-        outcomeReason={normalizeOutcomeReason(
-          block.outcomeReason ?? reasonFallback,
-        )}
+        outcomeReason={
+          block.state === "failed"
+            ? failedBlockReason(
+                block,
+                attempt,
+                key === outcomeOwnerKey,
+                outcomeReasonFallback,
+                verdictRunId,
+              )
+            : normalizeOutcomeReason(block.outcomeReason ?? reasonFallback)
+        }
         ownsVerdict={key === outcomeOwnerKey}
+        attempt={attempt}
         turnEnded={turnEnded}
         open={cardIsOpen}
         onToggle={() => onCardToggle(key, cardIsOpen)}
         onSelect={onBlockSelect}
       />
+    );
+    if (!block.skippedBefore) return card;
+    return (
+      <Fragment key={key}>
+        {block.skippedBefore.map((skipped) => (
+          <FSkippedPrefixRow
+            key={`${key}-skipped-${skipped.label}`}
+            skipped={skipped}
+            onSelect={onBlockSelect}
+          />
+        ))}
+        {card}
+      </Fragment>
     );
   };
   const diffNodes = row.codeDiffs
@@ -1955,7 +2219,9 @@ function FActivityLogRow({
         row.blocks,
         outcomeOwnerKey,
         outcomeReasonFallback,
+        verdictRunId,
         row.blocks.length > 1,
+        attempts,
       );
 
   const hostedBlocks = (entry: ActivityEntry) =>
@@ -2018,6 +2284,12 @@ function FActivityLogRow({
       // call keeps its own row above the cards.
       if (result !== null && !hosted.some((b) => b.state === "failed")) {
         items.push(callItem);
+      } else if (entry.testInputs?.length) {
+        items.push(
+          <li key={`inputs-${toolCallIdOf(entry) ?? entry.id}`}>
+            <TestInputsDisclosure entry={entry} />
+          </li>,
+        );
       }
       flushItems();
       hosted.forEach((block) => carded.add(block));
@@ -2070,8 +2342,8 @@ function FActivityLogRow({
           {line}
         </div>
       )}
-      {outcomeNotes.map(({ key, note }) => (
-        <FOutcomeNote key={key} note={note} />
+      {outcomeNotes.map(({ key, note, failed }) => (
+        <FOutcomeNote key={key} note={note} failed={failed} />
       ))}
       {open && hasDetail ? body : null}
     </div>
@@ -2082,27 +2354,50 @@ function blockOutcomeNotes(
   blocks: BlockState[],
   outcomeOwnerKey: string | null | undefined,
   outcomeReasonFallback: string | null | undefined,
+  verdictRunId: string | undefined,
   named: boolean,
-): { key: string; note: string }[] {
+  attempts: Map<string, BlockAttempt>,
+): { key: string; note: string; failed: boolean }[] {
+  const seen = new Set<string>();
   return blocks.flatMap((b) => {
-    const note = collapsedOutcomeNote(
-      b,
-      blockIdentity(b) === outcomeOwnerKey,
-      outcomeReasonFallback,
-    );
-    if (note === null) return [];
-    return [
-      {
-        key: blockIdentity(b),
-        note: named ? `${humanizeBlockLabel(b.label)}: ${note}` : note,
-      },
-    ];
+    const failed = b.state === "failed";
+    const attempt = attempts.get(blockIdentity(b))!;
+    const ownReason = failed
+      ? (failedBlockReason(
+          b,
+          attempt,
+          blockIdentity(b) === outcomeOwnerKey,
+          outcomeReasonFallback,
+          verdictRunId,
+        ) ?? lastFailedActionLine(b))
+      : null;
+    const bare = failed
+      ? ownReason === null
+        ? failedWord(attempt)
+        : `${failedWord(attempt)} — ${truncateOutcomeReason(ownReason)}`
+      : collapsedOutcomeNote(
+          b,
+          blockIdentity(b) === outcomeOwnerKey,
+          outcomeReasonFallback,
+        );
+    if (bare === null) return [];
+    const note = named ? `${humanizeBlockLabel(b.label)}: ${bare}` : bare;
+    // Loop iterations of one run repeat the same note.
+    if (seen.has(note)) return [];
+    seen.add(note);
+    return [{ key: blockIdentity(b), note, failed }];
   });
 }
 
-function FOutcomeNote({ note }: { note: string }) {
+function FOutcomeNote({ note, failed }: { note: string; failed: boolean }) {
   return (
-    <div className="ml-[18px] mt-0.5 text-[12px] leading-[1.5] text-amber-700 dark:text-amber-200/80">
+    <div
+      className={`ml-[18px] mt-0.5 text-[12px] leading-[1.5] ${
+        failed
+          ? "text-rose-700 dark:text-rose-300"
+          : "text-amber-700 dark:text-amber-200/80"
+      }`}
+    >
       {note}
     </div>
   );
@@ -2161,8 +2456,10 @@ function FActivityLog({
   anchoredBeforeRows = NO_ANCHORED_ITEMS,
 }: FActivityLogProps) {
   const outcomeReasonFallback = notConfirmedDisplayReason(turn);
+  const verdictRunId = notConfirmedOutcome(turn)?.workflowRunId;
   const outcomeOwnerKey = outcomeNotConfirmedOwnerKey(turn);
   const { rows, focusIndex } = log;
+  const attempts = useMemo(() => blockAttempts(turn), [turn]);
   // Signed, not a bare id set: a click on the live row has to be able to mean
   // "closed", or folding the active row would silently pin it open instead.
   const [override, setOverride] = useState<ReadonlyMap<string, boolean>>(
@@ -2251,8 +2548,12 @@ function FActivityLog({
               .slice(-1),
             outcomeOwnerKey,
             outcomeReasonFallback,
+            verdictRunId,
             true,
-          ).map(({ key, note }) => <FOutcomeNote key={key} note={note} />)}
+            attempts,
+          ).map(({ key, note, failed }) => (
+            <FOutcomeNote key={key} note={note} failed={failed} />
+          ))}
       {/* Folding the steps must not hide the cards that happened among them. */}
       {folded
         ? logAnchoredNodes(
@@ -2313,6 +2614,8 @@ function FActivityLog({
                   onBlockSelect={onBlockSelect}
                   outcomeReasonFallback={outcomeReasonFallback}
                   outcomeOwnerKey={outcomeOwnerKey}
+                  verdictRunId={verdictRunId}
+                  attempts={attempts}
                 />
               </div>,
               ...logAnchoredNodes(anchoredAfterRow?.get(row.id) ?? []),
@@ -2340,6 +2643,35 @@ function FBudgetLimitNote({ budget }: { budget: BudgetExpiryState }) {
           budget.reportProduced === true ? " and reported what it found" : ""
         }.`}
       </span>
+    </div>
+  );
+}
+
+function FUnfinishedRunNote({ runIds }: { runIds: string[] }) {
+  const single = runIds.length === 1;
+  return (
+    <div
+      data-testid="copilot-unfinished-run"
+      className={`text-[12px] leading-[1.5] ${STEP_TEXT}`}
+    >
+      {single
+        ? "The test run may still be going. You can open or cancel it from "
+        : "The test runs may still be going. You can open or cancel them from their run pages: "}
+      {runIds.map((runId, index) => (
+        <Fragment key={runId}>
+          {index > 0 ? ", " : null}
+          <a
+            className="underline underline-offset-2"
+            href={workflowRunDetailPath(runId)}
+            target="_blank"
+            rel="noreferrer"
+          >
+            {single ? "its run page" : runId}
+            <span className="sr-only"> (opens in new tab)</span>
+          </a>
+        </Fragment>
+      ))}
+      .
     </div>
   );
 }
@@ -2456,6 +2788,8 @@ function DetailView({
   const outcomeOwnerKey = outcomeNotConfirmedOwnerKey(turn);
   const observedBlocks = turn.blocks.filter(hasObservedBlockEvidence);
   const hasBlocks = observedBlocks.length > 0;
+  const attempts = blockAttempts(turn);
+  const verdictRunId = notConfirmedOutcome(turn)?.workflowRunId;
   const designStarted = turn.designStarted;
   const designOpen = designStarted && !turn.designEnded;
   // Hide the "Designed the workflow" cluster on terminal turns that produced
@@ -2517,14 +2851,29 @@ function DetailView({
         {!showChecklist && hasBlocks ? (
           <div className={`flex flex-col gap-1 ${TURN_ROW_INSET}`}>
             {observedBlocks.map((b) => (
-              <FBlockRun
-                key={b.workflowRunBlockId || b.label}
-                block={b}
-                turnEnded={turn.terminal !== null}
-                onSelect={onBlockSelect}
-                outcomeReasonFallback={collapsedOutcomeReason}
-                ownsOutcomeNotConfirmed={blockIdentity(b) === outcomeOwnerKey}
-              />
+              <Fragment key={blockIdentity(b)}>
+                {(b.skippedBefore ?? []).map((skipped) => (
+                  <FSkippedPrefixRow
+                    key={`${blockIdentity(b)}-skipped-${skipped.label}`}
+                    skipped={skipped}
+                    onSelect={onBlockSelect}
+                  />
+                ))}
+                <FBlockRun
+                  block={b}
+                  turnEnded={turn.terminal !== null}
+                  onSelect={onBlockSelect}
+                  outcomeReasonFallback={collapsedOutcomeReason}
+                  ownsOutcomeNotConfirmed={blockIdentity(b) === outcomeOwnerKey}
+                  failedReason={failedBlockReason(
+                    b,
+                    attempts.get(blockIdentity(b))!,
+                    blockIdentity(b) === outcomeOwnerKey,
+                    collapsedOutcomeReason,
+                    verdictRunId,
+                  )}
+                />
+              </Fragment>
             ))}
           </div>
         ) : null}
@@ -2537,7 +2886,24 @@ function DetailView({
           </div>
         ) : null}
 
-        {notConfirmedOutcome(turn) !== null && outcomeOwnerKey === null ? (
+        {notConfirmedOutcome(turn) !== null &&
+        outcomeOwnerKey === null &&
+        turn.turnFacts?.runCompleted === false ? (
+          <div className="flex items-start gap-2 rounded-md border border-rose-400/30 bg-rose-500/10 px-2.5 py-1.5">
+            <span
+              aria-hidden="true"
+              className="text-[11px] font-bold text-rose-700 dark:text-rose-300"
+            >
+              ✕
+            </span>
+            <div className="text-[12px] leading-[1.5] text-rose-700 dark:text-rose-200/90">
+              <span className="font-semibold">Run failed</span>
+              {collapsedOutcomeReason !== null
+                ? ` — ${truncateOutcomeReason(collapsedOutcomeReason)}`
+                : null}
+            </div>
+          </div>
+        ) : notConfirmedOutcome(turn) !== null && outcomeOwnerKey === null ? (
           <div className="flex items-start gap-2 rounded-md border border-amber-400/30 bg-amber-500/10 px-2.5 py-1.5">
             <span
               aria-hidden="true"
@@ -2562,6 +2928,10 @@ function DetailView({
         turn.budgetExpiry !== null &&
         turn.budgetExpiry.reportProduced !== false ? (
           <FBudgetLimitNote budget={turn.budgetExpiry} />
+        ) : null}
+
+        {turn.terminal !== null && turn.budgetExpiry?.leftRunIds.length ? (
+          <FUnfinishedRunNote runIds={turn.budgetExpiry.leftRunIds} />
         ) : null}
 
         {/* terminalProseTone's question branch without its evidence gate: an

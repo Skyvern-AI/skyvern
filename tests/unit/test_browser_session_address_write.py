@@ -1,5 +1,5 @@
 """Tests for BrowserSessionsRepository routing-column behavior: address writes, vendor-held
-session creation, and customer-facing visibility filtering."""
+session creation, customer-facing visibility filtering, and the liveness mark."""
 
 from datetime import datetime
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -375,6 +375,25 @@ async def test_get_history_hides_vendor_held_rows() -> None:
 
     ids = {session.persistent_browser_session_id for session in sessions}
     assert ids == {"pbs_self_hosted", "pbs_pending"}
+
+
+@pytest.mark.asyncio
+async def test_the_liveness_mark_is_set_from_null_and_never_moves_backward() -> None:
+    """A real engine, not a mock: the monotonic guarantee lives entirely in the UPDATE's own
+    expression, and it must run on whatever dialect the caller is pointed at — a GREATEST here
+    raised on SQLite, and the failed statement took an unrelated in-flight transaction with it."""
+    repo = await _repo_with_visibility_rows()
+    early = datetime(2026, 9, 14, 12, 0, 0)
+    late = datetime(2026, 9, 14, 12, 5, 0)
+
+    await repo.touch_last_activity("pbs_pending", last_activity_at=late)
+    advanced = await repo.get_persistent_browser_session("pbs_pending", ORG_ID)
+
+    await repo.touch_last_activity("pbs_pending", last_activity_at=early)
+    after_late_arrival = await repo.get_persistent_browser_session("pbs_pending", ORG_ID)
+
+    assert advanced is not None and advanced.last_activity_at == late
+    assert after_late_arrival is not None and after_late_arrival.last_activity_at == late
 
 
 @pytest.mark.asyncio

@@ -231,13 +231,18 @@ def test_workflow_status_summary_stays_bounded_for_heavy_payload() -> None:
     summary_payload = workflow_tools._serialize_run_summary(heavy_run)
 
     assert len(json.dumps(full_payload)) > 20_000
-    assert len(json.dumps(summary_payload)) < 2_000
+    # The download URL is the one URL a summary keeps verbatim — it is what makes
+    # the file retrievable — so the bound covers it on top of the URL-free summary.
+    assert len(json.dumps(summary_payload)) < 2_000 + len(f"{long_url}-download")
 
     result = make_result("skyvern_workflow_status", data=summary_payload)
-    assert len(json.dumps(result)) < 2_200
+    assert len(json.dumps(result)) < 2_200 + len(f"{long_url}-download")
     assert "recording_url" not in result["data"]
     assert "output" not in result["data"]
     assert result["data"]["artifact_summary"]["artifact_id_count"] == 36
+    assert result["data"]["artifact_summary"]["downloaded_files"] == [
+        {"url": f"{long_url}-download", "filename": "case-export.csv"}
+    ]
 
 
 def test_workflow_status_summary_shrinks_simple_payload() -> None:

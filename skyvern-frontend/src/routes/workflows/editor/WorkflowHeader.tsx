@@ -1,3 +1,4 @@
+import { WorkflowFindingsButton } from "@/components/WorkflowFindingsSlot";
 import { runIsLogicallyActive } from "@/routes/workflows/workflowRun/runRetryState";
 import {
   CalendarIcon,
@@ -29,7 +30,6 @@ import { useWorkflowQuery } from "@/routes/workflows/hooks/useWorkflowQuery";
 import { useWorkflowRunQuery } from "@/routes/workflows/hooks/useWorkflowRunQuery";
 import { useCacheKeyValueStore } from "@/store/CacheKeyValueStore";
 import { useDebugStore } from "@/store/useDebugStore";
-import { useRecordingStore } from "@/store/useRecordingStore";
 import { useShowAllCodeStore } from "@/store/ShowAllCodeStore";
 import {
   SaveRefusedError,
@@ -39,6 +39,11 @@ import {
 import { useWorkflowPanelStore } from "@/store/WorkflowPanelStore";
 import { useWorkflowParametersStore } from "@/store/WorkflowParametersStore";
 import { useWorkflowTitleStore } from "@/store/WorkflowTitleStore";
+import { ControlTooltip } from "../studio/ControlTooltip";
+import {
+  selectSaveLockReason,
+  useWorkflowYamlEditorStore,
+} from "@/store/WorkflowYamlEditorStore";
 import { cn } from "@/util/utils";
 import { EditableNodeTitle } from "./nodes/components/EditableNodeTitle";
 import { EditorOverflowMenu } from "./header/EditorOverflowMenu";
@@ -72,7 +77,6 @@ function BrowserModeButton() {
   const navigate = useNavigate();
   const workflowPermanentId = useWorkflowPermanentId();
   const debugStore = useDebugStore();
-  const recordingStore = useRecordingStore();
   const { data: workflowRun } = useWorkflowRunQuery();
   const workflowRunIsRunningOrQueued = Boolean(
     workflowRun && runIsLogicallyActive(workflowRun),
@@ -91,9 +95,7 @@ function BrowserModeButton() {
             size="icon"
             variant={debugStore.isDebugMode ? "default" : "tertiary"}
             className="size-10 min-w-[2.5rem]"
-            disabled={
-              workflowRunIsRunningOrQueued || recordingStore.isRecording
-            }
+            disabled={workflowRunIsRunningOrQueued}
             onClick={handleClick}
           >
             <BrowserIcon className="h-6 w-6" />
@@ -109,7 +111,7 @@ function BrowserModeButton() {
 
 function SaveButton() {
   const saving = useWorkflowHasChangesStore((s) => s.saveIsPending);
-  const isRecording = useRecordingStore().isRecording;
+  const saveLockReason = useWorkflowYamlEditorStore(selectSaveLockReason);
   const isGlobalWorkflow = useIsGlobalWorkflow();
   const onSave = useSaveWorkflow();
   const pendingGoalChangeCount = useCopilotActionStore(
@@ -131,30 +133,31 @@ function SaveButton() {
 
   return (
     <TooltipProvider>
-      <Tooltip>
-        <TooltipTrigger asChild>
-          <Button
-            size="icon"
-            variant="tertiary"
-            className="size-10 min-w-[2.5rem]"
-            disabled={isGlobalWorkflow || isRecording}
-            onClick={() => {
-              if (pendingGoalChangeCount > 0) {
-                setGoalDialogOpen(true);
-                return;
-              }
-              save();
-            }}
-          >
-            {saving ? (
-              <ReloadIcon className="size-6 animate-spin" />
-            ) : (
-              <SaveIcon className="size-6" />
-            )}
-          </Button>
-        </TooltipTrigger>
-        <TooltipContent>Save</TooltipContent>
-      </Tooltip>
+      <ControlTooltip
+        content="Save"
+        reason={saveLockReason}
+        blocked={saveLockReason !== null}
+      >
+        <Button
+          size="icon"
+          variant="tertiary"
+          className="size-10 min-w-[2.5rem] disabled:pointer-events-none"
+          disabled={isGlobalWorkflow || saveLockReason !== null}
+          onClick={() => {
+            if (pendingGoalChangeCount > 0) {
+              setGoalDialogOpen(true);
+              return;
+            }
+            save();
+          }}
+        >
+          {saving ? (
+            <ReloadIcon className="size-6 animate-spin" />
+          ) : (
+            <SaveIcon className="size-6" />
+          )}
+        </Button>
+      </ControlTooltip>
       <PendingGoalChangesDialog
         open={goalDialogOpen}
         onOpenChange={setGoalDialogOpen}
@@ -181,7 +184,6 @@ function PanelToggleButton({
   iconOnly = false,
   count,
 }: PanelToggleButtonProps) {
-  const isRecording = useRecordingStore().isRecording;
   const workflowPanelState = useWorkflowPanelStore((s) => s.workflowPanelState);
   const setWorkflowPanelState = useWorkflowPanelStore(
     (s) => s.setWorkflowPanelState,
@@ -204,7 +206,6 @@ function PanelToggleButton({
         <Tooltip>
           <TooltipTrigger asChild>
             <Button
-              disabled={isRecording}
               variant="tertiary"
               size="icon"
               className="size-10 min-w-[2.5rem]"
@@ -222,7 +223,6 @@ function PanelToggleButton({
 
   return (
     <Button
-      disabled={isRecording}
       variant="tertiary"
       size="lg"
       onClick={handleClick}
@@ -246,7 +246,6 @@ function RunButton() {
   const navigate = useNavigate();
   const workflowPermanentId = useWorkflowPermanentId();
   const closeWorkflowPanel = useWorkflowPanelStore((s) => s.closeWorkflowPanel);
-  const isRecording = useRecordingStore().isRecording;
   const blockingBlocks = useRunValidationStore((s) => s.blockingBlocks);
   const hasBlockingBlocks = blockingBlocks.length > 0;
 
@@ -256,11 +255,7 @@ function RunButton() {
   };
 
   const button = (
-    <Button
-      disabled={isRecording || hasBlockingBlocks}
-      size="lg"
-      onClick={handleClick}
-    >
+    <Button disabled={hasBlockingBlocks} size="lg" onClick={handleClick}>
       <PlayIcon className="mr-2 h-6 w-6" />
       Run
     </Button>
@@ -326,12 +321,10 @@ function EditorActionToolbar() {
 function TitleSection() {
   const title = useWorkflowTitleStore((state) => state.title);
   const { mutationLocked, onTitleChange } = useDeferredTitleEdit();
-  const isRecording = useRecordingStore().isRecording;
-
   return (
     <div className="flex h-full min-w-0 flex-1 items-center">
       <EditableNodeTitle
-        editable={!isRecording && !mutationLocked}
+        editable={!mutationLocked}
         mutationLocked={mutationLocked}
         onChange={onTitleChange}
         value={title}
@@ -343,6 +336,7 @@ function TitleSection() {
 }
 
 function WorkflowHeader() {
+  const workflowTitle = useWorkflowTitleStore((state) => state.title);
   const workflowPermanentId = useWorkflowPermanentId();
   const { data: globalWorkflows } = useGlobalWorkflowsQuery();
   const { data: workflow } = useWorkflowQuery({ workflowPermanentId });
@@ -377,7 +371,16 @@ function WorkflowHeader() {
         aria-hidden={collapsed}
         {...(collapsed ? { inert: "" } : {})}
       >
-        <TitleSection />
+        <div className="flex min-w-0 flex-1 items-center gap-2">
+          <TitleSection />
+          {!isGlobalWorkflow && !workflow?.deleted_at && workflowPermanentId ? (
+            <WorkflowFindingsButton
+              workflowPermanentId={workflowPermanentId}
+              title={workflowTitle}
+              surface="editor"
+            />
+          ) : null}
+        </div>
         <div className="flex h-full shrink-0 items-center justify-end gap-4">
           {isGeneratingCode && <GeneratingCodeButton />}
           {isGlobalWorkflow ? <MakeACopyButton /> : <EditorActionToolbar />}

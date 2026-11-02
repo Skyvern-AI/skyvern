@@ -18,6 +18,7 @@ import { useInfiniteCredentialFoldersQuery } from "./hooks/useInfiniteCredential
 import { useUpdateCredentialFolderAssignmentMutation } from "./hooks/useCredentialFolderMutations";
 import { useDebounce } from "use-debounce";
 import { Skeleton } from "@/components/ui/skeleton";
+import type { CredentialFolder } from "./types/credentialFolderTypes";
 
 interface CredentialFolderSelectorProps {
   credentialId?: string;
@@ -27,6 +28,7 @@ interface CredentialFolderSelectorProps {
   bulkHasFolders?: boolean;
   disabled?: boolean;
   trigger?: React.ReactNode;
+  onFolderSelect?: (folder: CredentialFolder | null) => void;
 }
 
 function CredentialFolderSelector({
@@ -37,6 +39,7 @@ function CredentialFolderSelector({
   bulkHasFolders = true,
   disabled = false,
   trigger,
+  onFolderSelect,
 }: CredentialFolderSelectorProps) {
   const [open, setOpen] = useState(false);
   const [search, setSearch] = useState("");
@@ -61,6 +64,14 @@ function CredentialFolderSelector({
     // or the bulk bar's Processing label, not in a hanging popover.
     setOpen(false);
     setSearch("");
+    if (onFolderSelect) {
+      onFolderSelect(
+        folderId
+          ? (folders.find((folder) => folder.folder_id === folderId) ?? null)
+          : null,
+      );
+      return;
+    }
     if (isBulkMode && onBulkFolderSelect) {
       await onBulkFolderSelect(folderId);
       return;
@@ -110,7 +121,9 @@ function CredentialFolderSelector({
           <h4 className="mb-2 text-sm font-medium">
             {isBulkMode
               ? `Move ${bulkCount} credential${bulkCount === 1 ? "" : "s"} to folder`
-              : "Move to folder"}
+              : onFolderSelect
+                ? "Choose target folder"
+                : "Move to folder"}
           </h4>
           <div className="relative">
             <MagnifyingGlassIcon className="absolute left-2 top-1/2 h-4 w-4 -translate-y-1/2 text-slate-400" />
@@ -134,7 +147,9 @@ function CredentialFolderSelector({
             )
           }
         >
-          {(isBulkMode ? bulkHasFolders : Boolean(currentFolderId)) && (
+          {(isBulkMode
+            ? bulkHasFolders
+            : Boolean(currentFolderId) || Boolean(onFolderSelect)) && (
             <button
               onClick={() => handleFolderSelect(null)}
               disabled={disabled || updateFolderMutation.isPending}
@@ -142,7 +157,9 @@ function CredentialFolderSelector({
             >
               <div className="flex items-center gap-2">
                 <Cross2Icon className="h-4 w-4 text-red-400" />
-                <span>Remove from folder</span>
+                <span>
+                  {onFolderSelect ? "No folder" : "Remove from folder"}
+                </span>
               </div>
             </button>
           )}

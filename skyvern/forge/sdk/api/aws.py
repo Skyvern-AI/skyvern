@@ -23,6 +23,7 @@ from boto3.s3.transfer import TransferConfig
 from botocore.exceptions import ClientError, ProfileNotFound
 
 from skyvern.config import settings
+from skyvern.utils.content_disposition import build_attachment_disposition
 
 if TYPE_CHECKING:
     from types_boto3_batch.client import BatchClient
@@ -49,6 +50,8 @@ def _recording_content_type(uri_or_path: str) -> str | None:
 _S3_OPERATION_RETRIES = 2
 # get_object on a missing key raises NoSuchKey; head-style paths use 404/NotFound.
 S3_NOT_FOUND_ERROR_CODES = frozenset({"NoSuchKey", "NotFound", "404"})
+# get_object on an object in an archive tier (GLACIER, DEEP_ARCHIVE) that has not been restored.
+S3_ARCHIVED_OBJECT_ERROR_CODES = frozenset({"InvalidObjectState"})
 # Expired AWS credentials surface under either exact code depending on the service/path.
 _EXPIRED_TOKEN_ERROR_CODES = frozenset({"ExpiredTokenException", "ExpiredToken"})
 # Aborting an upload id that no longer exists (e.g. an ambiguous Complete actually landed) returns this; it
@@ -356,6 +359,27 @@ class _SharedS3Client:
                 await context.__aexit__(None, None, None)
 
 
+class S3ObjectStream:
+    """An open GetObject read in bounded chunks; it holds its shared-client lease until ``aclose``, so retiring that
+    client (a session refresh) cannot close the connection the body is still read from."""
+
+    def __init__(self, response: dict[str, Any], lease: contextlib.AsyncExitStack) -> None:
+        self.content_length: int = response["ContentLength"]
+        self.etag: str | None = response.get("ETag")
+        self._body = response["Body"]
+        self._lease = lease
+
+    def iter_chunks(self, chunk_size: int) -> AsyncIterator[bytes]:
+        return self._body.iter_chunks(chunk_size)
+
+    async def aclose(self) -> None:
+        # An unfinished body drops its connection instead of returning it to the pool with unread bytes.
+        try:
+            self._body.close()
+        finally:
+            await self._lease.aclose()
+
+
 def _retire_shared_s3_clients(registry: dict[asyncio.AbstractEventLoop, _SharedS3Client]) -> None:
     for loop, shared in list(registry.items()):
         with contextlib.suppress(RuntimeError):  # the loop is already closed
@@ -468,6 +492,13 @@ class AsyncAWSClient:
         """Check if an exception is a missing-object (terminal not-found) error."""
         return (
             isinstance(error, ClientError) and error.response.get("Error", {}).get("Code") in S3_NOT_FOUND_ERROR_CODES
+        )
+
+    def _is_archived_object_error(self, error: Exception) -> bool:
+        """Check if an exception means the object exists but sits in an archive tier and cannot be read."""
+        return (
+            isinstance(error, ClientError)
+            and error.response.get("Error", {}).get("Code") in S3_ARCHIVED_OBJECT_ERROR_CODES
         )
 
     def _error_code(self, error: Exception) -> str:
@@ -1331,16 +1362,46 @@ class AsyncAWSClient:
         try:
             return await self._s3_with_retry("download", _op, uri=uri)
         except Exception as e:
-            # A missing object is terminal not-found, not a transient failure (e.g. first-run
-            # profile restore before any archive exists). Log once without a traceback so callers
-            # fall back immediately instead of surfacing repeated ERROR tracebacks.
-            if self._is_not_found_error(e):
-                if log_exception:
-                    LOG.info("S3 object not found", uri=uri)
-                return None
             if log_exception:
-                LOG.exception("S3 download failed", uri=uri)
+                self.log_download_failure(e, uri)
             return None
+
+    def log_download_failure(self, error: Exception, uri: str) -> None:
+        """Log a failed object read; call it from the ``except`` block so a real failure keeps its traceback."""
+        # A missing object is terminal not-found, not a transient failure (e.g. first-run
+        # profile restore before any archive exists). Log once without a traceback so callers
+        # fall back immediately instead of surfacing repeated ERROR tracebacks.
+        if self._is_not_found_error(error):
+            LOG.info("S3 object not found", uri=uri)
+        # An archived object stays unreadable until restored, so a traceback per request adds nothing.
+        elif self._is_archived_object_error(error):
+            LOG.warning("S3 object is archived and not restored", uri=uri)
+        else:
+            LOG.exception("S3 download failed", uri=uri)
+
+    async def open_download_stream(
+        self, uri: str, *, byte_range: tuple[int, int] | None = None, if_match: str | None = None
+    ) -> S3ObjectStream:
+        """GetObject without reading the body, which the caller must ``aclose``; ``byte_range`` is inclusive, and an
+        ``if_match`` that no longer names the stored object raises ``PreconditionFailed`` like any get_object error."""
+        parsed_uri = S3Uri(uri)
+        params: dict[str, Any] = {"Bucket": parsed_uri.bucket, "Key": parsed_uri.key}
+        if byte_range is not None:
+            params["Range"] = f"bytes={byte_range[0]}-{byte_range[1]}"
+        if if_match is not None:
+            params["IfMatch"] = if_match
+
+        async def _op() -> S3ObjectStream:
+            lease = contextlib.AsyncExitStack()
+            try:
+                client = await lease.enter_async_context(self._s3_client())
+                response = await client.get_object(**params)
+            except BaseException:
+                await lease.aclose()
+                raise
+            return S3ObjectStream(response, lease)
+
+        return await self._s3_with_retry("download", _op, uri=uri)
 
     async def delete_file(self, uri: str, log_exception: bool = True, raise_on_error: bool = False) -> None:
         # https://boto3.amazonaws.com/v1/documentation/api/latest/reference/services/s3/client/delete_object.html
@@ -1390,18 +1451,33 @@ class AsyncAWSClient:
                 LOG.exception("S3 metadata retrieval failed", uri=uri)
             return None
 
-    async def create_presigned_urls(self, uris: list[str], expires_in: int | None = None) -> list[str] | None:
+    async def create_presigned_urls(
+        self,
+        uris: list[str],
+        expires_in: int | None = None,
+        attachment_filenames: list[str | None] | None = None,
+    ) -> list[str] | None:
+        """With ``attachment_filenames`` (one per uri, None for the key basename), the URLs force an
+        attachment download as octet-stream so stored user content never renders on the bucket origin."""
         # https://boto3.amazonaws.com/v1/documentation/api/latest/reference/services/s3/client/generate_presigned_url.html
         expiration = settings.PRESIGNED_URL_EXPIRATION if expires_in is None else expires_in
+        if attachment_filenames is not None and len(attachment_filenames) != len(uris):
+            raise ValueError("attachment_filenames must have one entry per uri")
 
         async def _op() -> list[str]:
             presigned_urls = []
             async with self._s3_client() as client:
-                for uri in uris:
+                for index, uri in enumerate(uris):
                     parsed_uri = S3Uri(uri)
+                    params = {"Bucket": parsed_uri.bucket, "Key": parsed_uri.key}
+                    if attachment_filenames is not None:
+                        filename = attachment_filenames[index] or os.path.basename(parsed_uri.key)
+                        # The agent's file fetcher takes the extension from this filename before Content-Type.
+                        params["ResponseContentDisposition"] = build_attachment_disposition(filename)
+                        params["ResponseContentType"] = "application/octet-stream"
                     url = await client.generate_presigned_url(
                         "get_object",
-                        Params={"Bucket": parsed_uri.bucket, "Key": parsed_uri.key},
+                        Params=params,
                         ExpiresIn=expiration,
                     )
                     presigned_urls.append(url)
@@ -1588,28 +1664,51 @@ class AsyncAWSClient:
         container_overrides = container_overrides or {}
         depends_on = [{"jobId": job_id} for job_id in depends_on_ids or []]
         async with self._batch_client() as client:
-            if job_priority is None or share_identifier is None:
-                response = await client.submit_job(
-                    jobName=job_name,
-                    jobQueue=job_queue,
-                    jobDefinition=job_definition,
-                    parameters=params,
-                    containerOverrides=container_overrides,
-                    dependsOn=depends_on,
+            attempts: list[tuple[type[BaseException] | None, type[BaseException] | None, int | None]] = []
+
+            def record_attempt(**kwargs: Any) -> None:
+                error = kwargs.get("caught_exception")
+                cause = getattr(error, "kwargs", {}).get("error")
+                response = kwargs.get("response")
+                status_code = getattr(response[0], "status_code", None) if response else None
+                attempts.append(
+                    (
+                        type(error) if error is not None else None,
+                        type(cause) if cause is not None else None,
+                        status_code,
+                    )
                 )
+
+            # Keep lightweight per-attempt outcomes; the final exception can hide an earlier ambiguity.
+            event_name = "needs-retry.batch.SubmitJob"
+            client.meta.events.register(event_name, record_attempt)
+            try:
+                if job_priority is None or share_identifier is None:
+                    response = await client.submit_job(
+                        jobName=job_name,
+                        jobQueue=job_queue,
+                        jobDefinition=job_definition,
+                        parameters=params,
+                        containerOverrides=container_overrides,
+                        dependsOn=depends_on,
+                    )
+                else:
+                    response = await client.submit_job(
+                        jobName=job_name,
+                        jobQueue=job_queue,
+                        jobDefinition=job_definition,
+                        parameters=params,
+                        schedulingPriorityOverride=job_priority,
+                        shareIdentifier=share_identifier,
+                        containerOverrides=container_overrides,
+                        dependsOn=depends_on,
+                    )
                 return response.get("jobId")
-            else:
-                response = await client.submit_job(
-                    jobName=job_name,
-                    jobQueue=job_queue,
-                    jobDefinition=job_definition,
-                    parameters=params,
-                    schedulingPriorityOverride=job_priority,
-                    shareIdentifier=share_identifier,
-                    containerOverrides=container_overrides,
-                    dependsOn=depends_on,
-                )
-                return response.get("jobId")
+            except Exception as error:
+                vars(error)["_skyvern_submit_job_attempts"] = attempts
+                raise
+            finally:
+                client.meta.events.unregister(event_name, record_attempt)
 
 
 class S3Uri:

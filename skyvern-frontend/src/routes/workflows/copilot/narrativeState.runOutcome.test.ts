@@ -42,6 +42,7 @@ describe("budget expiry narrative", () => {
       reportProduced: false,
       stagedDraftId: "wf_draft",
       drainFingerprint: "drain-1",
+      leftRunIds: [],
     });
   });
 
@@ -198,6 +199,40 @@ describe("applyNarrativeEvent — run_outcome", () => {
     }
     expect(s.lastRunOutcome?.role).toBe("interim_build_test");
     expect(notConfirmedOutcome(s)).toBeNull();
+  });
+
+  it("shows a started run's skipped rows before its first block while it runs", () => {
+    const skipped = [{ label: "load_records", kind: "reused" as const }];
+    const s = reduce([
+      turnStart(),
+      blockProgress({
+        block_label: "earlier_run",
+        status: "failed",
+        workflow_run_id: "wr_0",
+      }),
+      {
+        type: "run_started",
+        workflow_run_id: "wr_1",
+        skipped_prefix: skipped,
+        timestamp: "2026-06-10T00:00:03Z",
+      },
+      blockProgress({
+        block_label: "open_search",
+        status: "running",
+        workflow_run_id: "wr_1",
+      }),
+      blockProgress({
+        block_label: "search_person",
+        status: "running",
+        workflow_run_id: "wr_1",
+      }),
+    ]);
+    expect(s.blocks.map((b) => b.skippedBefore)).toEqual([
+      undefined,
+      skipped,
+      undefined,
+    ]);
+    expect(s.pendingSkippedPrefix).toEqual({});
   });
 
   it("evaluating hold withholds the success affordance until the final frame", () => {
@@ -532,6 +567,7 @@ describe("notConfirmedOutcome — recorded run facts", () => {
     expect(outcome).toEqual({
       verdict: "not_demonstrated",
       displayReason: "Browser operation timed out on line 18.",
+      workflowRunId: "wr_1",
     });
   });
 
@@ -712,28 +748,44 @@ describe("canonical turn facts — pill and prose over one bundle", () => {
     expect(pill).toBe("untested");
   });
 
-  it("settles a block still running at the deadline as stopped, not failed", () => {
-    const turn = hydrateNarrativeFromPayload({
-      ...(bundles["deadline-after-one-clean-run"] as unknown as Record<
-        string,
-        unknown
-      >),
-      blocks: [
-        {
-          workflowRunBlockId: "wrb_1",
-          label: "append_star_count_to_sheet",
-          blockType: "code",
-          state: "running",
-          lastSeenIteration: 0,
-          activity: [],
+  it.each([
+    [false, "unfinished", "unfinished"],
+    [false, "running", "stopped"],
+    [true, "running", "stopped"],
+  ])(
+    "keeps a block saved at the deadline (cancelled: %s, saved as %s) as %s, not failed",
+    (cancelled, savedState, expected) => {
+      const turn = hydrateNarrativeFromPayload({
+        ...(bundles["deadline-after-one-clean-run"] as unknown as Record<
+          string,
+          unknown
+        >),
+        cancelled,
+        budgetExpiry: {
+          budgetExpired: true,
+          source: "deadline",
+          reportProduced: true,
+          stagedDraftId: null,
+          drainFingerprint: null,
+          leftRunIds: ["wr_left"],
         },
-      ],
-    });
-    if (!turn) throw new Error("fixture did not hydrate");
+        blocks: [
+          {
+            workflowRunBlockId: "wrb_1",
+            label: "append_star_count_to_sheet",
+            blockType: "code",
+            state: savedState,
+            lastSeenIteration: 0,
+            activity: [],
+          },
+        ],
+      });
+      if (!turn) throw new Error("fixture did not hydrate");
 
-    expect(turn.blocks.map((block) => block.state)).toEqual(["stopped"]);
-    expect(isDeadlineHalt(turn)).toBe(true);
-  });
+      expect(turn.blocks.map((block) => block.state)).toEqual([expected]);
+      expect(isDeadlineHalt(turn)).toBe(true);
+    },
+  );
 
   it("keeps a failed block a failure even when the deadline expired", () => {
     const turn = hydrateNarrativeFromPayload({
@@ -917,6 +969,7 @@ describe("hydrateNarrativeFromPayload -- a superseded build test", () => {
     expect(notConfirmedOutcome(withBlock!)).toEqual({
       verdict: "not_demonstrated",
       displayReason: "Cart never showed the item.",
+      workflowRunId: "wr_superseded",
     });
 
     const withoutBlocks = hydrateNarrativeFromPayload({
@@ -929,6 +982,7 @@ describe("hydrateNarrativeFromPayload -- a superseded build test", () => {
     expect(notConfirmedOutcome(withoutBlocks!)).toEqual({
       verdict: "not_demonstrated",
       displayReason: null,
+      workflowRunId: "wr_superseded",
     });
   });
 

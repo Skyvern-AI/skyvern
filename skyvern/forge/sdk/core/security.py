@@ -1,6 +1,7 @@
 import hashlib
 import hmac
 import json
+import uuid
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 from typing import Any, Union
@@ -45,7 +46,8 @@ def create_access_token(
         expire = datetime.utcnow() + timedelta(
             minutes=settings.ACCESS_TOKEN_EXPIRE_MINUTES,
         )
-    to_encode = {"exp": expire, "sub": str(subject)}
+    # jti keeps two keys minted for the same subject in the same second distinct.
+    to_encode = {"exp": expire, "sub": str(subject), "jti": uuid.uuid4().hex}
     if token_type is not None:
         to_encode["token_type"] = token_type
     encoded_jwt = jwt.encode(

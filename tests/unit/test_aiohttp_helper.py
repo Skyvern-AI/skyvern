@@ -1,12 +1,15 @@
 import os
 import socket
 import tempfile
+from pathlib import Path
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock, patch
 from urllib.parse import urlparse
 
 import aiohttp
 import pytest
+from aiohttp import web
+from aiohttp.test_utils import TestServer
 
 from skyvern.exceptions import BlockedHost, HttpException
 from skyvern.forge.sdk.core.aiohttp_helper import (
@@ -25,6 +28,23 @@ def public_dns(monkeypatch: pytest.MonkeyPatch) -> None:
         return [(socket.AF_INET, socket.SOCK_STREAM, 0, "", ("93.184.216.34", port or 0))]
 
     monkeypatch.setattr("skyvern.utils.url_validators.socket.getaddrinfo", resolves_public)
+
+
+def allow_loopback_redirect_targets(monkeypatch: pytest.MonkeyPatch) -> None:
+    def resolve_local_fetch(url: str) -> tuple[str, tuple[str, ...]]:
+        return url, ("127.0.0.1",)
+
+    def resolve_local_redirect(_url: str, location: str) -> tuple[str, tuple[str, ...]]:
+        return location, ("127.0.0.1",)
+
+    monkeypatch.setattr(
+        "skyvern.forge.sdk.core.aiohttp_helper.validate_fetch_url_with_resolved_ips",
+        resolve_local_fetch,
+    )
+    monkeypatch.setattr(
+        "skyvern.forge.sdk.core.aiohttp_helper.validate_redirect_url_with_resolved_ips",
+        resolve_local_redirect,
+    )
 
 
 @pytest.mark.asyncio
@@ -786,49 +806,128 @@ async def test_aiohttp_request_refuses_a_redirect_the_caller_does_not_authorize(
 
 
 @pytest.mark.asyncio
-async def test_aiohttp_request_strips_credentials_on_cross_origin_redirect() -> None:
-    redirect_response = AsyncMock()
-    redirect_response.status = 302
-    redirect_response.headers = {"Location": "https://other.example.com/final"}
-    redirect_response.__aenter__ = AsyncMock(return_value=redirect_response)
-    redirect_response.__aexit__ = AsyncMock(return_value=None)
+async def test_aiohttp_request_drops_credentials_on_cross_origin_redirect(monkeypatch: pytest.MonkeyPatch) -> None:
+    allow_loopback_redirect_targets(monkeypatch)
+    redirect_target = ""
+    received_headers: dict[str, str] = {}
+    received_cookies: dict[str, str] = {}
 
-    final_response = AsyncMock()
-    final_response.status = 200
-    final_response.headers = {"Content-Type": "application/json"}
-    final_response.json = AsyncMock(return_value={"success": True})
-    final_response.text = AsyncMock(return_value='{"success": true}')
-    final_response.__aenter__ = AsyncMock(return_value=final_response)
-    final_response.__aexit__ = AsyncMock(return_value=None)
+    async def redirect(_request: web.Request) -> web.Response:
+        response = web.Response(status=302, headers={"Location": redirect_target})
+        response.set_cookie("server-cookie", "synthetic")
+        return response
 
-    responses = [redirect_response, final_response]
-    requested_headers: list[dict[str, str]] = []
-    requested_cookies: list[dict[str, str] | None] = []
+    async def final(request: web.Request) -> web.Response:
+        received_headers.update({key.lower(): value for key, value in request.headers.items()})
+        received_cookies.update(request.cookies)
+        return web.json_response({"success": True})
 
-    def capture_request(*args: Any, **kwargs: Any) -> AsyncMock:
-        requested_headers.append(kwargs["headers"])
-        requested_cookies.append(kwargs["cookies"])
-        return responses.pop(0)
+    app = web.Application()
+    app.router.add_route("*", "/start", redirect)
+    server = TestServer(app, host="localhost")
+    target_app = web.Application()
+    target_app.router.add_route("*", "/final", final)
+    target_server = TestServer(target_app, host="localhost")
+    await server.start_server()
+    await target_server.start_server()
+    redirect_target = str(target_server.make_url("/final"))
 
-    mock_session = MagicMock()
-    mock_session.__aenter__ = AsyncMock(return_value=mock_session)
-    mock_session.__aexit__ = AsyncMock(return_value=None)
-    mock_session.request = MagicMock(side_effect=capture_request)
-
-    with patch("skyvern.forge.sdk.core.aiohttp_helper.aiohttp.ClientSession", return_value=mock_session):
-        await aiohttp_request(
+    try:
+        status, _headers, body = await aiohttp_request(
             method="GET",
-            url="https://example.com/start",
-            headers={"Authorization": "Bearer secret", "Cookie": "sid=abc", "X-Keep": "1"},
-            cookies={"session": "abc"},
-            follow_redirects=True,
+            url=str(server.make_url("/start")),
+            headers={
+                "Authorization": "Bearer synthetic",
+                "Cookie": "sid=synthetic",
+                "X-Api-Key": "synthetic-api-key",
+                "X-Auth-Token": "synthetic-auth-token",
+                "X-Keep": "1",
+                "Accept": "application/json",
+                "Accept-Language": "en",
+                "User-Agent": "test-agent",
+            },
+            cookies={"session": "synthetic"},
         )
+    finally:
+        await target_server.close()
+        await server.close()
 
-    assert requested_headers[0]["Authorization"] == "Bearer secret"
-    assert requested_headers[0]["Cookie"] == "sid=abc"
-    assert requested_cookies[0] == {"session": "abc"}
-    assert requested_headers[1] == {"X-Keep": "1"}
-    assert requested_cookies[1] is None
+    assert status == 200
+    assert body == {"success": True}
+    assert received_headers["accept"] == "application/json"
+    assert received_headers["accept-language"] == "en"
+    assert received_headers["user-agent"] == "test-agent"
+    assert not {"authorization", "cookie", "x-api-key", "x-auth-token", "x-keep"} & received_headers.keys()
+    assert received_cookies == {}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("status", [307, 308])
+@pytest.mark.parametrize("method", ["POST", "PUT", "PATCH"])
+@pytest.mark.parametrize("body_kind", ["data", "json_data", "files", "empty_files", "empty_data", "empty_json_data"])
+async def test_aiohttp_request_rejects_only_cross_origin_redirects_with_entities(
+    status: int,
+    method: str,
+    body_kind: str,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    allow_loopback_redirect_targets(monkeypatch)
+    redirect_target = ""
+    initial_requests = 0
+    final_requests = 0
+
+    async def redirect(_request: web.Request) -> web.Response:
+        nonlocal initial_requests
+        initial_requests += 1
+        return web.Response(status=status, headers={"Location": redirect_target})
+
+    async def final(_request: web.Request) -> web.Response:
+        nonlocal final_requests
+        final_requests += 1
+        return web.json_response({"success": True})
+
+    app = web.Application()
+    app.router.add_route("*", "/start", redirect)
+    app.router.add_route("*", "/final", final)
+    server = TestServer(app, host="127.0.0.1")
+    await server.start_server()
+    redirect_target = str(server.make_url("/final").with_host("localhost"))
+    upload = tmp_path / "upload.txt"
+    upload.write_text("synthetic body")
+    body_args: dict[str, Any] = {
+        "data": {"data": {"field": "value"}},
+        "json_data": {"json_data": {"field": "value"}},
+        "files": {"files": {"upload": str(upload)}},
+        "empty_files": {"files": {}},
+        "empty_data": {"data": {}},
+        "empty_json_data": {"data": {}, "headers": {"Content-Type": "application/json"}},
+    }[body_kind]
+
+    try:
+        if body_kind in {"empty_files", "empty_data"}:
+            status, _headers, body = await aiohttp_request(
+                method=method,
+                url=str(server.make_url("/start")),
+                follow_redirects=True,
+                **body_args,
+            )
+            assert status == 200
+            assert body == {"success": True}
+        else:
+            with pytest.raises(HttpException) as error:
+                await aiohttp_request(
+                    method=method,
+                    url=str(server.make_url("/start")),
+                    follow_redirects=True,
+                    **body_args,
+                )
+            assert error.value.status_code == 400
+    finally:
+        await server.close()
+
+    assert initial_requests == 1
+    assert final_requests == (1 if body_kind in {"empty_files", "empty_data"} else 0)
 
 
 @pytest.mark.asyncio

@@ -1,10 +1,12 @@
 from __future__ import annotations
 
 import asyncio
+import gc
 import itertools
 import re
 import time
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 
 import jinja2
@@ -14,9 +16,11 @@ from structlog.testing import capture_logs
 from skyvern.forge.sdk.api.llm.exceptions import InvalidLLMResponseFormat
 from skyvern.forge.sdk.workflow.context_manager import RANDOM_SECRET_ID_PREFIX
 from skyvern.forge.taskv3 import loop as taskv3_loop
+from skyvern.forge.taskv3.auth_tools import VerificationFailure, VerificationState
 from skyvern.forge.taskv3.goal_check import (
     GoalJudge,
     NonCompletedStatus,
+    TerminatePremise,
     ToolTrail,
     TrailEntry,
     UnlistedReask,
@@ -25,6 +29,7 @@ from skyvern.forge.taskv3.goal_check import (
     render_goal_check_prompt,
     render_unlisted_reask_prompt,
     run_goal_check,
+    run_terminate_premise,
     run_unlisted_reask,
 )
 from skyvern.forge.taskv3.loop import (
@@ -779,6 +784,21 @@ async def test_a_completed_finish_never_reaches_the_reask(pending: bool, blocked
 
 
 @pytest.mark.asyncio
+async def test_a_reask_conversion_keeps_the_original_verdicts_error_code_for_a_post_loop_veto() -> None:
+    finish = make_finish_tool(
+        **_gate_kwargs(pending=False, blocked=False, unsettled=False),
+        unlisted_reask=_ReaskSpy(),
+        error_code_mapping={"invalid_credentials": "The site rejected the password."},
+    )
+    result = await finish.handler(
+        {"status": "failed", "reason": "password rejected", "error_code": "invalid_credentials"}
+    )
+    assert result.data is not None
+    assert (result.data["status"], result.data["converted_from"]) == ("completed", "failed")
+    assert result.data["error_code"] == "invalid_credentials"
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("status", ["terminated", "failed"])
 async def test_a_grounded_reask_completes_once_and_a_completed_side_veto_keeps_the_models_verdict(
     status: NonCompletedStatus,
@@ -792,6 +812,8 @@ async def test_a_grounded_reask_completes_once_and_a_completed_side_veto_keeps_t
         "extracted_output": None,
         "converted_from": status,
         "converted_from_reason": "no PIN screen",
+        "error_code": None,
+        "error_code_declined": False,
     }
 
     for veto in ("pending", "blocked", "unsettled"):
@@ -818,6 +840,32 @@ async def test_a_grounded_reask_completes_once_and_a_completed_side_veto_keeps_t
         # Once per run: a second give-up is not re-asked.
         await finish.handler({"status": status, "reason": "again"})
         assert len(spy.calls) == 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("verification", ["link_armed", "link_awaited", "code_armed", "code_not_yet"])
+async def test_a_reask_conversion_is_vetoed_only_while_a_sign_in_link_never_arrived(verification: str) -> None:
+    state = VerificationState(
+        task=SimpleNamespace(task_id="tsk_1", organization_id="o_1", workflow_run_id=None)  # type: ignore[arg-type]
+    )
+    if verification == "link_armed":
+        state.arm(VerificationFailure.NO_LINK_TWICE, "open_verification_link")
+    elif verification == "link_awaited":
+        state.awaiting_link_since = time.monotonic()
+    elif verification == "code_armed":
+        state.arm(VerificationFailure.BUDGET_EXHAUSTED, "get_verification_code")
+    else:
+        state.last_status = "no verification code has arrived yet; about 13.0 minutes of polling time remain."
+    kwargs = {**_gate_kwargs(pending=False, blocked=False, unsettled=False), "verification_blocker": state.block_finish}
+    finish = make_finish_tool(**kwargs, unlisted_reask=_ReaskSpy())
+
+    with capture_logs() as logs:
+        result = await finish.handler({"status": "terminated", "reason": "no PIN screen"})
+
+    vetoed = verification.startswith("link")
+    assert result.data is not None and result.data["status"] == ("terminated" if vetoed else "completed")
+    (line,) = (log for log in logs if log["event"] == "taskv3 finish unlisted reask")
+    assert line["veto"] == ("verification_blocker" if vetoed else None)
 
 
 class _SettleWindowPage:
@@ -1046,3 +1094,165 @@ async def test_a_run_canceled_during_the_reask_is_left_to_the_loops_cancellation
 
     assert result.status == "error"
     assert result.data is None or result.data.get("status") is None
+
+
+STATEMENTS_PAGE = "Account overview\nSee bill history\nPay now"
+UNMET_ON_PAGE = {
+    "cited": "instruction",
+    "condition": "unmet",
+    "stop_kind": "none",
+    "quote": "See bill history",
+    "why": "The page links to the statements under another name.",
+}
+
+
+async def _premise(judge: GoalJudge, *, prior_checks: int = 0) -> TerminatePremise:
+    trail = ToolTrail()
+    trail.record(TrailEntry(tool="observe", status="ok", content=STATEMENTS_PAGE, perception=True, page_changing=False))
+    return await run_terminate_premise(
+        goal="Open the statements with 'View all statements'.",
+        complete_criterion="",
+        terminate_criterion="the statements link is not on the page",
+        reason="There is no 'View all statements' link.",
+        trail=trail,
+        judge=judge,
+        timeout_seconds=5,
+        prior_checks=prior_checks,
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("judge", "prior_checks", "why"),
+    [
+        (_judge_returning(UNMET_ON_PAGE), 0, "unmet_on_page"),
+        (_judge_returning({**UNMET_ON_PAGE, "condition": "met"}), 0, "condition_met"),
+        (_judge_returning({**UNMET_ON_PAGE, "condition": "unclear"}), 0, "condition_unclear"),
+        # Every stop on the never-overturn list stays, however clearly its condition is unmet.
+        *(
+            (_judge_returning({**UNMET_ON_PAGE, "stop_kind": kind}), 0, f"never_overturn:{kind}")
+            for kind in ("designed", "consent", "legal", "credential", "payment", "deletion", "irreversible")
+        ),
+        (_judge_returning(UNMET_ON_PAGE), 1, "never_overturn:second_terminate"),
+        # Only text the page shows grounds an overturn.
+        (_judge_returning({**UNMET_ON_PAGE, "quote": "View all statements"}), 0, "skipped:quote_not_in_evidence"),
+        (_judge_returning({**UNMET_ON_PAGE, "quote": "SCREENSHOT: a statements link"}), 0, "skipped:no_text_quote"),
+        (_judge_returning({**UNMET_ON_PAGE, "quote": ""}), 0, "skipped:no_text_quote"),
+        # Short text is on any page.
+        (_judge_returning({**UNMET_ON_PAGE, "quote": "Pay"}), 0, "skipped:quote_not_in_evidence"),
+        (_judge_returning({**UNMET_ON_PAGE, "cited": "none"}), 0, "skipped:no_cited_condition"),
+        # In doubt, keep: an unknown or missing answer never overturns.
+        (_judge_returning({**UNMET_ON_PAGE, "stop_kind": "shipping"}), 0, "skipped:unparseable"),
+        (_judge_returning({k: v for k, v in UNMET_ON_PAGE.items() if k != "stop_kind"}), 0, "skipped:unparseable"),
+        (_judge_returning({**UNMET_ON_PAGE, "condition": "probably"}), 0, "skipped:unparseable"),
+        (_judge_returning({**UNMET_ON_PAGE, "stop_kind": ["none"]}), 0, "skipped:unparseable"),
+        (_judge_returning(None), 0, "skipped:judge_declined"),
+        (_raising_judge, 0, "skipped:judge_error"),
+    ],
+)
+async def test_a_terminate_would_be_handed_back_only_on_a_grounded_unmet_premise_off_the_never_list(
+    judge: GoalJudge, prior_checks: int, why: str
+) -> None:
+    premise = await _premise(judge, prior_checks=prior_checks)
+
+    assert premise.why == why
+    assert premise.would_overturn is (why == "unmet_on_page")
+
+
+@pytest.mark.asyncio
+async def test_a_second_terminate_is_never_overturned_without_asking_the_judge() -> None:
+    asked: list[str] = []
+
+    async def judge(prompt: str) -> dict[str, Any]:
+        asked.append(prompt)
+        return UNMET_ON_PAGE
+
+    premise = await _premise(judge, prior_checks=1)
+
+    assert asked == []
+    assert premise.never_overturn == "second_terminate"
+
+
+@pytest.mark.asyncio
+async def test_a_premise_quote_from_a_page_the_agent_has_left_does_not_ground_an_overturn() -> None:
+    trail = ToolTrail()
+    trail.record(TrailEntry(tool="observe", status="ok", content=STATEMENTS_PAGE, perception=True, page_changing=False))
+    trail.record(TrailEntry(tool="click", status="ok", content="clicked Pay now", perception=False, page_changing=True))
+    trail.record(
+        TrailEntry(tool="observe", status="ok", content="Payment\nCard number", perception=True, page_changing=False)
+    )
+
+    premise = await run_terminate_premise(
+        goal="Open the statements with 'View all statements'.",
+        complete_criterion="",
+        terminate_criterion=None,
+        reason="There is no 'View all statements' link.",
+        trail=trail,
+        judge=_judge_returning(UNMET_ON_PAGE),
+        timeout_seconds=5,
+        prior_checks=0,
+    )
+
+    assert premise.why == "skipped:quote_not_in_evidence"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("reasks", [True, False])
+async def test_a_cancel_raised_inside_the_premise_check_does_not_end_the_run(reasks: bool) -> None:
+    async def premise(reason: str, prior_checks: int) -> None:
+        raise asyncio.CancelledError
+
+    finish = make_finish_tool(
+        **_gate_kwargs(pending=False, blocked=False, unsettled=False),
+        unlisted_reask=_ReaskSpy(converts=False) if reasks else None,
+        terminate_premise=premise,
+    )
+    result = await finish.handler({"status": "terminated", "reason": "no PIN screen"})
+
+    assert result.status == "ok" and result.data is not None
+    assert result.data["status"] == "terminated"
+
+
+@pytest.mark.asyncio
+async def test_a_premise_check_that_raises_after_the_verdict_is_logged_not_left_unretrieved() -> None:
+    unhandled: list[dict[str, Any]] = []
+    asyncio.get_running_loop().set_exception_handler(lambda loop, context: unhandled.append(context))
+    release = asyncio.Event()
+
+    async def premise(reason: str, prior_checks: int) -> None:
+        await release.wait()
+        raise RuntimeError("judge exploded")
+
+    finish = make_finish_tool(
+        **_gate_kwargs(pending=False, blocked=False, unsettled=False),
+        terminate_premise=premise,
+    )
+    with capture_logs() as logs:
+        result = await asyncio.wait_for(finish.handler({"status": "terminated", "reason": "no PIN screen"}), 1)
+        assert result.status == "ok" and result.data is not None
+        assert result.data["status"] == "terminated"
+        release.set()
+        for _ in range(3):
+            await asyncio.sleep(0)
+    del finish
+    gc.collect()
+
+    assert unhandled == []
+    assert [log["event"] for log in logs if "premise" in log["event"]] == ["taskv3 terminate premise failed"]
+
+
+@pytest.mark.asyncio
+async def test_each_terminate_tells_the_premise_check_how_many_came_before() -> None:
+    seen: list[int] = []
+
+    async def premise(reason: str, prior_checks: int) -> None:
+        seen.append(prior_checks)
+
+    finish = make_finish_tool(
+        **_gate_kwargs(pending=False, blocked=False, unsettled=False),
+        terminate_premise=premise,
+    )
+    for _ in range(2):
+        await finish.handler({"status": "terminated", "reason": "no PIN screen"})
+
+    assert seen == [0, 1]

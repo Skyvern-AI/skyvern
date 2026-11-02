@@ -116,6 +116,20 @@ _KNOWN_DRIFT_ALLOWLIST: tuple[BlockDriftEntry, ...] = (
         added_at=date(2026, 9, 23),
         notes="Terminate block awaits the next Fern SDK regeneration.",
     ),
+    BlockDriftEntry(
+        block_type="agent_step",
+        ticket="SKY-19057",
+        owner="@andrewneilson",
+        added_at=date(2026, 10, 26),
+        notes="Agent block prototype awaits the next Fern SDK regeneration.",
+    ),
+    BlockDriftEntry(
+        block_type="powerbi_query",
+        ticket="SKY-18242",
+        owner="@AronPerez",
+        added_at=date(2026, 10, 29),
+        notes="Offline Power BI block is accepted by raw-HTTP MCP; typed Fern SDK regeneration is deferred.",
+    ),
 )
 
 

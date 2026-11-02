@@ -25,6 +25,7 @@ from pypdf.generic import (
 
 from skyvern.forge import app
 from skyvern.forge.sdk.api import files
+from skyvern.forge.sdk.utils.capped_subprocess import CappedSubprocessError
 from skyvern.forge.sdk.utils.tesseract_languages import tesseract_language_arg, tesseract_ocr_packages
 from skyvern.forge.sdk.workflow.context_manager import WorkflowRunContext
 from skyvern.forge.sdk.workflow.models import pdf_fill_block
@@ -381,6 +382,26 @@ def test_extract_field_labels_on_fillable_fixture(tmp_path: Path) -> None:
     labels = PdfFillBlock._extract_field_labels(str(source_pdf))
     # the fixture has no printed text, so labels are empty strings but extraction must not crash
     assert isinstance(labels, dict)
+
+
+def test_fields_keep_their_names_when_the_word_lookup_is_refused(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    source_pdf = tmp_path / "labelled.pdf"
+    _write_fillable_pdf(source_pdf)
+    lookups: list[object] = []
+
+    def refuse_the_lookup(*args: object, **kwargs: object) -> None:
+        lookups.append(args)
+        raise CappedSubprocessError("returned more than the 32 MiB a result may hold", kind="result_too_large")
+
+    monkeypatch.setattr(pdf_fill_block, "extract_upright_pdf_words", refuse_the_lookup)
+
+    inventory = _make_block()._extract_field_inventory(PdfReader(str(source_pdf)), str(source_pdf))
+
+    assert lookups
+    assert set(inventory) == set(PdfReader(str(source_pdf)).get_fields())
+    assert all(field.context_label == "" for field in inventory.values())
 
 
 def test_checkbox_without_known_state_is_skipped_not_silently_unchecked() -> None:

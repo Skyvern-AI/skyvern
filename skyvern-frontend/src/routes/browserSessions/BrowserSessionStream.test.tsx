@@ -2,11 +2,11 @@ import { createHash, randomBytes } from "node:crypto";
 import { createServer, type Server } from "node:http";
 import { createConnection, type AddressInfo, type Socket } from "node:net";
 import type { Duplex } from "node:stream";
-import { StrictMode } from "react";
 import { act, render, screen, waitFor } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import { useSettingsStore } from "@/store/SettingsStore";
+import { useRecordingLauncherStore } from "@/store/useRecordingLauncherStore";
 import {
   STREAM_MAX_RECONNECT_DELAY_MS,
   isTerminalStreamStatus,
@@ -31,8 +31,10 @@ const cdpInputState = vi.hoisted(() => ({
   onInput: undefined as (() => void) | undefined,
 }));
 
-const telemetry = vi.hoisted(() => ({
-  captureRecordBrowser: vi.fn(),
+const interactiveStreamState = vi.hoisted(() => ({
+  onNavigate: undefined as ((url: string) => void) | undefined,
+  onHistoryNavigate: undefined as ((action: unknown) => void) | undefined,
+  showControlButtons: false,
 }));
 
 const api = vi.hoisted(() => ({
@@ -47,7 +49,7 @@ vi.mock("@/util/env", () => ({
   get newWssBaseUrl() {
     return env.wssBaseUrl;
   },
-  getCredentialParam: vi.fn(async () => "apikey=test"),
+  getWebSocketProtocols: vi.fn(async () => ["skyvern.v1", "apikey.test"]),
 }));
 
 vi.mock("@/hooks/useCredentialGetter", () => {
@@ -56,12 +58,6 @@ vi.mock("@/hooks/useCredentialGetter", () => {
   const credentialGetter = async () => null;
   return { useCredentialGetter: () => credentialGetter };
 });
-
-vi.mock("@/util/recordBrowserTelemetry", () => ({
-  captureRecordBrowser: telemetry.captureRecordBrowser,
-  getRecordBrowserContext: () => ({}),
-  setRecordBrowserContext: vi.fn(),
-}));
 
 vi.mock("@/routes/streaming/useCdpInput", async (importOriginal) => {
   const actual =
@@ -91,23 +87,32 @@ vi.mock("@/routes/streaming/InteractiveStreamView", () => ({
     currentUrl,
     showControlButtons,
     userIsControlling,
+    onNavigate,
+    onHistoryNavigate,
   }: {
     streamImgSrc: string;
     currentUrl?: string;
     showControlButtons: boolean;
     userIsControlling: boolean;
-  }) => (
-    <>
-      <div
-        data-frame={streamImgSrc}
-        data-url={currentUrl}
-        data-testid="stream-frame"
-      />
-      {showControlButtons && userIsControlling && (
-        <button type="button">stop controlling</button>
-      )}
-    </>
-  ),
+    onNavigate?: (url: string) => void;
+    onHistoryNavigate?: (action: unknown) => void;
+  }) => {
+    interactiveStreamState.onNavigate = onNavigate;
+    interactiveStreamState.onHistoryNavigate = onHistoryNavigate;
+    interactiveStreamState.showControlButtons = showControlButtons;
+    return (
+      <>
+        <div
+          data-frame={streamImgSrc}
+          data-url={currentUrl}
+          data-testid="stream-frame"
+        />
+        {showControlButtons && userIsControlling && (
+          <button type="button">stop controlling</button>
+        )}
+      </>
+    );
+  },
 }));
 
 class FakeStreamSocket {
@@ -118,14 +123,16 @@ class FakeStreamSocket {
   readonly send = vi.fn();
   close = vi.fn();
   readonly url: string;
+  readonly protocols: string | string[] | undefined;
   onopen: ((event: Event) => void) | null = null;
   onmessage: ((event: MessageEvent) => void) | null = null;
   onclose: ((event: CloseEvent) => void) | null = null;
 
   private listeners: Record<string, Array<(event: unknown) => void>> = {};
 
-  constructor(url: string) {
+  constructor(url: string, protocols?: string | string[]) {
     this.url = url;
+    this.protocols = protocols;
     FakeStreamSocket.instances.push(this);
   }
 
@@ -317,6 +324,12 @@ describe("BrowserSessionStream terminal statuses", () => {
   beforeEach(() => {
     stubAnimationFrame();
     cdpInputState.setUserIsControlling = undefined;
+    useRecordingLauncherStore.setState(
+      useRecordingLauncherStore.getInitialState(),
+    );
+    interactiveStreamState.onNavigate = undefined;
+    interactiveStreamState.onHistoryNavigate = undefined;
+    interactiveStreamState.showControlButtons = false;
     Object.defineProperty(window, "WebSocket", {
       configurable: true,
       value: FakeStreamSocket,
@@ -354,7 +367,17 @@ describe("BrowserSessionStream terminal statuses", () => {
     expect(screen.getByText("Browser session complete")).toBeTruthy();
   });
 
-  it("opens no recording message socket when exfiltrate is omitted", async () => {
+  it("sends the stream credential as a subprotocol, never in the URL", async () => {
+    render(<BrowserSessionStream browserSessionId="pbs_test" />);
+
+    await waitFor(() => expect(FakeStreamSocket.instances).toHaveLength(1));
+
+    const socket = FakeStreamSocket.instances[0]!;
+    expect(new URL(socket.url).search).toBe("");
+    expect(socket.protocols).toEqual(["skyvern.v1", "apikey.test"]);
+  });
+
+  it("opens no message socket until the user takes control", async () => {
     render(<BrowserSessionStream browserSessionId="pbs_test" />);
 
     await waitFor(() => expect(FakeStreamSocket.instances).toHaveLength(1));
@@ -373,31 +396,11 @@ describe("BrowserSessionStream terminal statuses", () => {
     });
   });
 
-  it("opens the recording message socket when exfiltrate is provided", async () => {
-    render(
-      <BrowserSessionStream browserSessionId="pbs_test" exfiltrate={false} />,
-    );
-
-    await waitFor(() => expect(FakeStreamSocket.instances).toHaveLength(2));
-
-    expect(
-      FakeStreamSocket.instances.some((socket) =>
-        socket.url.includes("/stream/messages/browser_session/pbs_test"),
-      ),
-    ).toBe(true);
-    expect(cdpInputState).toMatchObject({
-      clipboardPasteEnabled: false,
-      clipboardCopyEnabled: false,
-    });
-  });
-
-  it("opens the message channel while the user is in control and pastes over it without recording", async () => {
+  it("opens the message channel while the user is in control and pastes over it", async () => {
     vi.useFakeTimers();
     const view = render(
       <BrowserSessionStream browserSessionId="pbs_test" showControlButtons />,
     );
-    const sentKinds = (socket: FakeStreamSocket) =>
-      sentMessages(socket).map((message) => message.kind);
     try {
       await act(async () => Promise.resolve());
       expect(messageSockets("pbs_test")).toHaveLength(0);
@@ -413,7 +416,6 @@ describe("BrowserSessionStream terminal statuses", () => {
         kind: "clipboard-paste",
         text: "hello",
       });
-      expect(sentKinds(first)).not.toContain("begin-exfiltration");
 
       // A drop while in control reconnects instead of leaving paste dead.
       act(() => first.emit("close", new CloseEvent("close", { code: 1006 })));
@@ -422,7 +424,6 @@ describe("BrowserSessionStream terminal statuses", () => {
       expect(messageSockets("pbs_test")).toHaveLength(2);
       const second = messageSockets("pbs_test")[1]!;
       act(() => second.emit("open", new Event("open")));
-      expect(sentKinds(second)).not.toContain("begin-exfiltration");
 
       act(() => cdpInputState.setUserIsControlling?.(false));
       await act(async () => Promise.resolve());
@@ -435,186 +436,23 @@ describe("BrowserSessionStream terminal statuses", () => {
     }
   });
 
-  it("recycles the message socket when a recording ends while the user keeps control", async () => {
-    vi.useFakeTimers();
-    const view = render(
-      <BrowserSessionStream browserSessionId="pbs_test" showControlButtons />,
-    );
-    try {
-      await act(async () => Promise.resolve());
-      act(() => cdpInputState.setUserIsControlling?.(true));
-      await act(async () => Promise.resolve());
-      const controlSocket = messageSockets("pbs_test")[0]!;
-      act(() => controlSocket.emit("open", new Event("open")));
-
-      view.rerender(
-        <BrowserSessionStream
-          browserSessionId="pbs_test"
-          showControlButtons
-          exfiltrate={true}
-        />,
-      );
-      await act(async () => Promise.resolve());
-      expect(messageSockets("pbs_test")).toHaveLength(1);
-      view.rerender(
-        <BrowserSessionStream browserSessionId="pbs_test" showControlButtons />,
-      );
-      await act(async () => Promise.resolve());
-
-      // The recording's socket must close (its cleanup finalizes the recording)
-      // rather than carry that recording's identity into the next one.
-      expect(controlSocket.close).toHaveBeenCalled();
-      expect(messageSockets("pbs_test")).toHaveLength(2);
-      expect(cdpInputState.userIsControlling).toBe(true);
-    } finally {
-      view.unmount();
-      vi.useRealTimers();
-    }
-  });
-
-  it("takes control for recording and only cedes a recording-owned grab", async () => {
+  it("holds control only while recording and retakes it after the stream is hidden", async () => {
+    const navigateDemonstration = vi.fn();
+    useRecordingLauncherStore.setState({
+      demonstrationBrowserSessionId: "pbs_test",
+      demonstrationRecordingBrowserSessionId: "pbs_test",
+      navigateDemonstration,
+    });
     const view = render(
       <BrowserSessionStream
         browserSessionId="pbs_test"
-        exfiltrate={false}
-        interactive={true}
-      />,
-    );
-    await waitFor(() => expect(FakeStreamSocket.instances).toHaveLength(3));
-    const inputSocket = FakeStreamSocket.instances.find((socket) =>
-      socket.url.includes("/stream/cdp_input/browser_session/pbs_test"),
-    );
-    expect(inputSocket).toBeTruthy();
-    inputSocket?.send.mockClear();
-
-    view.rerender(
-      <BrowserSessionStream
-        browserSessionId="pbs_test"
-        exfiltrate={true}
-        interactive={true}
-      />,
-    );
-    await waitFor(() =>
-      expect(inputSocket?.send).toHaveBeenCalledWith(
-        JSON.stringify({ kind: "take-control" }),
-      ),
-    );
-
-    view.rerender(
-      <BrowserSessionStream
-        browserSessionId="pbs_test"
-        exfiltrate={false}
-        interactive={true}
-      />,
-    );
-    await waitFor(() =>
-      expect(inputSocket?.send).toHaveBeenCalledWith(
-        JSON.stringify({ kind: "cede-control" }),
-      ),
-    );
-
-    act(() => cdpInputState.setUserIsControlling?.(true));
-    await waitFor(() =>
-      expect(inputSocket?.send).toHaveBeenCalledWith(
-        JSON.stringify({ kind: "take-control" }),
-      ),
-    );
-    inputSocket?.send.mockClear();
-
-    view.rerender(
-      <BrowserSessionStream
-        browserSessionId="pbs_test"
-        exfiltrate={true}
-        interactive={true}
-      />,
-    );
-    view.rerender(
-      <BrowserSessionStream
-        browserSessionId="pbs_test"
-        exfiltrate={false}
-        interactive={true}
-      />,
-    );
-    expect(inputSocket?.send).not.toHaveBeenCalledWith(
-      JSON.stringify({ kind: "cede-control" }),
-    );
-    view.unmount();
-  });
-
-  it("drops recording control on input close and retakes it when the reconnected input is ready", async () => {
-    vi.useFakeTimers();
-    const view = render(
-      <BrowserSessionStream
-        browserSessionId="pbs_test"
-        exfiltrate={true}
-        interactive={true}
-      />,
-    );
-    try {
-      await act(async () => Promise.resolve());
-      const firstInputSocket = FakeStreamSocket.instances.find((socket) =>
-        socket.url.includes("/stream/cdp_input/browser_session/pbs_test"),
-      );
-      expect(firstInputSocket).toBeTruthy();
-      act(() => {
-        firstInputSocket?.emit("message", {
-          data: JSON.stringify({ kind: "ready" }),
-        });
-      });
-      await act(async () => Promise.resolve());
-      expect(cdpInputState.userIsControlling).toBe(true);
-
-      act(() => {
-        firstInputSocket?.emit(
-          "close",
-          new CloseEvent("close", { code: 4411 }),
-        );
-      });
-      await act(async () => Promise.resolve());
-      expect(cdpInputState).toMatchObject({
-        inputReady: false,
-        userIsControlling: false,
-      });
-
-      await act(async () => vi.advanceTimersByTimeAsync(2000));
-      await act(async () => Promise.resolve());
-      const inputSockets = FakeStreamSocket.instances.filter((socket) =>
-        socket.url.includes("/stream/cdp_input/browser_session/pbs_test"),
-      );
-      expect(inputSockets).toHaveLength(2);
-      const reconnectedInputSocket = inputSockets[1]!;
-      reconnectedInputSocket.send.mockClear();
-      act(() => reconnectedInputSocket.emit("open", new Event("open")));
-      expect(cdpInputState.userIsControlling).toBe(false);
-      expect(reconnectedInputSocket.send).not.toHaveBeenCalledWith(
-        JSON.stringify({ kind: "take-control" }),
-      );
-
-      act(() => {
-        reconnectedInputSocket.emit("message", {
-          data: JSON.stringify({ kind: "ready" }),
-        });
-      });
-      await act(async () => Promise.resolve());
-      expect(cdpInputState.userIsControlling).toBe(true);
-      expect(reconnectedInputSocket.send).toHaveBeenCalledWith(
-        JSON.stringify({ kind: "take-control" }),
-      );
-    } finally {
-      view.unmount();
-      vi.useRealTimers();
-    }
-  });
-
-  it("hides manual stop controlling while recording", async () => {
-    const view = render(
-      <BrowserSessionStream
-        browserSessionId="pbs_test"
-        exfiltrate={false}
         showControlButtons={true}
+        enableUrlInput={true}
       />,
     );
-    await waitFor(() => expect(FakeStreamSocket.instances).toHaveLength(3));
+    await waitFor(() =>
+      expect(FakeStreamSocket.instances.length).toBeGreaterThan(0),
+    );
     const streamSocket = FakeStreamSocket.instances.find((socket) =>
       socket.url.includes("/stream/browser_sessions/pbs_test"),
     );
@@ -622,205 +460,79 @@ describe("BrowserSessionStream terminal statuses", () => {
       streamSocket?.emitStreamMessage({
         status: "running",
         screenshot: "frame",
+        url: "https://current.example/",
       });
     });
     await waitFor(() =>
       expect(screen.getByTestId("stream-frame")).toBeTruthy(),
     );
-    act(() => cdpInputState.setUserIsControlling?.(true));
+
+    expect(interactiveStreamState.showControlButtons).toBe(false);
+    expect(interactiveStreamState.onHistoryNavigate).toBeUndefined();
+    act(() => interactiveStreamState.onNavigate?.("next.example"));
+    expect(navigateDemonstration).toHaveBeenCalledWith("next.example");
+    const inputSocket = FakeStreamSocket.instances.find((socket) =>
+      socket.url.includes("/stream/cdp_input/browser_session/pbs_test"),
+    );
+    act(() => {
+      inputSocket?.emit("message", {
+        data: JSON.stringify({ kind: "ready" }),
+      });
+    });
     await waitFor(() =>
-      expect(
-        screen.getByRole("button", { name: "stop controlling" }),
-      ).toBeTruthy(),
+      expect(inputSocket?.send).toHaveBeenCalledWith(
+        JSON.stringify({ kind: "take-control" }),
+      ),
     );
 
     view.rerender(
       <BrowserSessionStream
         browserSessionId="pbs_test"
-        exfiltrate={true}
-        showControlButtons={true}
+        showControlButtons={false}
+        enableUrlInput={true}
       />,
     );
+    await waitFor(() => expect(inputSocket?.close).toHaveBeenCalled());
 
+    view.rerender(
+      <BrowserSessionStream
+        browserSessionId="pbs_test"
+        showControlButtons={true}
+        enableUrlInput={true}
+      />,
+    );
     await waitFor(() =>
       expect(
-        screen.queryByRole("button", { name: "stop controlling" }),
-      ).toBeNull(),
+        FakeStreamSocket.instances.filter((socket) =>
+          socket.url.includes("/stream/cdp_input/browser_session/pbs_test"),
+        ),
+      ).toHaveLength(2),
+    );
+    const reconnectedInputSocket = FakeStreamSocket.instances.filter((socket) =>
+      socket.url.includes("/stream/cdp_input/browser_session/pbs_test"),
+    )[1];
+    act(() => {
+      reconnectedInputSocket?.emit("message", {
+        data: JSON.stringify({ kind: "ready" }),
+      });
+    });
+    await waitFor(() =>
+      expect(reconnectedInputSocket?.send).toHaveBeenCalledWith(
+        JSON.stringify({ kind: "take-control" }),
+      ),
+    );
+
+    act(() =>
+      useRecordingLauncherStore.setState({
+        demonstrationRecordingBrowserSessionId: null,
+      }),
+    );
+    await waitFor(() =>
+      expect(reconnectedInputSocket?.send).toHaveBeenCalledWith(
+        JSON.stringify({ kind: "cede-control" }),
+      ),
     );
     view.unmount();
-  });
-
-  it("reconnects the recording channel after it disconnects during recording", async () => {
-    vi.useFakeTimers();
-    const view = render(
-      <BrowserSessionStream browserSessionId="pbs_test" exfiltrate={true} />,
-    );
-    try {
-      await act(async () => Promise.resolve());
-      const firstMessageSocket = FakeStreamSocket.instances.find((socket) =>
-        socket.url.includes("/stream/messages/browser_session/pbs_test"),
-      );
-      expect(firstMessageSocket).toBeTruthy();
-      act(() => firstMessageSocket?.emit("open", new Event("open")));
-
-      act(() =>
-        firstMessageSocket?.emit(
-          "close",
-          new CloseEvent("close", { code: 1006 }),
-        ),
-      );
-      await act(async () => vi.advanceTimersByTimeAsync(1000));
-      await act(async () => Promise.resolve());
-
-      const messageSockets = FakeStreamSocket.instances.filter((socket) =>
-        socket.url.includes("/stream/messages/browser_session/pbs_test"),
-      );
-      expect(messageSockets).toHaveLength(2);
-      const reconnectedSocket = messageSockets[1]!;
-      act(() => reconnectedSocket.emit("open", new Event("open")));
-      expect(
-        reconnectedSocket.send.mock.calls.map((call) =>
-          JSON.parse(String(call[0])),
-        ),
-      ).toContainEqual(expect.objectContaining({ kind: "begin-exfiltration" }));
-
-      act(() =>
-        reconnectedSocket.emit(
-          "close",
-          new CloseEvent("close", { code: 1006 }),
-        ),
-      );
-      await act(async () => vi.advanceTimersByTimeAsync(1000));
-      await act(async () => Promise.resolve());
-      expect(
-        FakeStreamSocket.instances.filter((socket) =>
-          socket.url.includes("/stream/messages/browser_session/pbs_test"),
-        ),
-      ).toHaveLength(3);
-    } finally {
-      view.unmount();
-      vi.useRealTimers();
-    }
-  });
-
-  it("reconnects a channel stranded by stopping before its retry", async () => {
-    vi.useFakeTimers();
-    const view = render(
-      <BrowserSessionStream browserSessionId="pbs_test" exfiltrate={true} />,
-    );
-    try {
-      await act(async () => Promise.resolve());
-      const firstMessageSocket = FakeStreamSocket.instances.find((socket) =>
-        socket.url.includes("/stream/messages/browser_session/pbs_test"),
-      );
-      expect(firstMessageSocket).toBeTruthy();
-      act(() => firstMessageSocket?.emit("open", new Event("open")));
-      act(() =>
-        firstMessageSocket?.emit(
-          "close",
-          new CloseEvent("close", { code: 1006 }),
-        ),
-      );
-
-      view.rerender(
-        <BrowserSessionStream browserSessionId="pbs_test" exfiltrate={false} />,
-      );
-      await act(async () => vi.advanceTimersByTimeAsync(1000));
-      expect(
-        FakeStreamSocket.instances.filter((socket) =>
-          socket.url.includes("/stream/messages/browser_session/pbs_test"),
-        ),
-      ).toHaveLength(1);
-
-      view.rerender(
-        <BrowserSessionStream browserSessionId="pbs_test" exfiltrate={true} />,
-      );
-      await act(async () => vi.advanceTimersByTimeAsync(1000));
-      await act(async () => Promise.resolve());
-      const messageSockets = FakeStreamSocket.instances.filter((socket) =>
-        socket.url.includes("/stream/messages/browser_session/pbs_test"),
-      );
-      expect(messageSockets).toHaveLength(2);
-      act(() => messageSockets[1]!.emit("open", new Event("open")));
-      expect(
-        messageSockets[1]!.send.mock.calls.map((call) =>
-          JSON.parse(String(call[0])),
-        ),
-      ).toContainEqual(expect.objectContaining({ kind: "begin-exfiltration" }));
-    } finally {
-      view.unmount();
-      vi.useRealTimers();
-    }
-  });
-
-  it("reports aggregate stream health once when recording ends", async () => {
-    vi.useFakeTimers();
-    const view = render(
-      <StrictMode>
-        <BrowserSessionStream browserSessionId="pbs_test" exfiltrate={true} />
-      </StrictMode>,
-    );
-    try {
-      await act(async () => Promise.resolve());
-      const streamSocket = FakeStreamSocket.instances.find(
-        (socket) =>
-          socket.url.includes("/stream/browser_sessions/") &&
-          !socket.close.mock.calls.length,
-      );
-      expect(streamSocket).toBeTruthy();
-
-      act(() => {
-        streamSocket?.emitStreamMessage({
-          status: "running",
-          screenshot: "frame-1",
-        });
-        streamSocket?.emitStreamMessage({
-          status: "running",
-          screenshot: "frame-2",
-        });
-        streamSocket?.emitStreamMessage({
-          status: "running",
-          screenshot: "frame-3",
-        });
-      });
-      await act(async () => vi.advanceTimersByTimeAsync(30_000));
-
-      act(() => {
-        for (let frame = 0; frame < 6; frame += 1) {
-          streamSocket?.emitStreamMessage({
-            status: "running",
-            screenshot: `frame-${frame + 4}`,
-          });
-        }
-      });
-      await act(async () => vi.advanceTimersByTimeAsync(30_000));
-
-      expect(telemetry.captureRecordBrowser).not.toHaveBeenCalled();
-
-      view.rerender(
-        <StrictMode>
-          <BrowserSessionStream
-            browserSessionId="pbs_test"
-            exfiltrate={false}
-          />
-        </StrictMode>,
-      );
-      await act(async () => vi.advanceTimersByTimeAsync(0));
-
-      expect(telemetry.captureRecordBrowser).toHaveBeenCalledOnce();
-      expect(telemetry.captureRecordBrowser).toHaveBeenCalledWith(
-        "record_browser.cdp_stream_health",
-        expect.objectContaining({
-          sample_count: 2,
-        }),
-      );
-      const properties = telemetry.captureRecordBrowser.mock.calls[0]?.[1];
-      expect(properties?.fps_avg).toBeCloseTo(0.15);
-      expect(properties?.fps_min).toBeCloseTo(0.1);
-    } finally {
-      view.unmount();
-      vi.useRealTimers();
-    }
   });
 
   it("shows the terminal panel even if a terminal status arrives with a frame", async () => {

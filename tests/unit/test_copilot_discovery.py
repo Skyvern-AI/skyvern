@@ -13,6 +13,7 @@ import pytest
 import structlog.testing
 
 from skyvern.forge.sdk.copilot import tools as tools_module
+from skyvern.forge.sdk.copilot.agent_context import PendingBrowserInteractionObservation
 from skyvern.forge.sdk.copilot.composition_browser_expressions import (
     COMPOSITION_STRIPPED_HTML_EXPRESSION,
     COMPOSITION_STRUCTURED_EVIDENCE_EXPRESSION,
@@ -20,11 +21,7 @@ from skyvern.forge.sdk.copilot.composition_browser_expressions import (
 )
 from skyvern.forge.sdk.copilot.enforcement import _RECENT_TOOL_OUTPUT_CHAR_CAP, _prune_input_list
 from skyvern.forge.sdk.copilot.request_policy import RequestPolicy, _ground_user_provided_sites
-from skyvern.forge.sdk.copilot.runtime import (
-    PendingBrowserInteractionObservation,
-    bound_call_browser_session,
-    current_call_browser_session_override,
-)
+from skyvern.forge.sdk.copilot.runtime import bound_call_browser_session, current_call_browser_session_override
 from skyvern.forge.sdk.copilot.tools import (
     _discovery_walk,
     _inspect_page_for_composition_impl,

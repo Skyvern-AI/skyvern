@@ -68,6 +68,9 @@ class _FakeAnchorElement:
         self.coordinate_click = AsyncMock()
         self.press_key = AsyncMock()
         self.blur = AsyncMock()
+        self.input_sequentially = AsyncMock()
+        self.input_clear = AsyncMock()
+        self.is_readonly = AsyncMock(return_value=False)
 
     def get_locator(self) -> MagicMock:
         return self._locator
@@ -2378,6 +2381,152 @@ class TestSequentialSelectMarksWidgetMutation:
             )
 
         assert excinfo.value.widget_mutated is False
+
+
+class TestDateWalkBudget:
+    """A date cascade that never closes its picker: it has to stop on its own budget, and whatever
+    it reports has to match whether a date actually landed in the field."""
+
+    @staticmethod
+    def _unfinished_level() -> SimpleNamespace:
+        # An INPUT_TEXT level that leaves the menu open advances the walk without the
+        # confirm-finish screenshot/LLM, which is the shape a calendar-arrow click takes.
+        return SimpleNamespace(
+            action_result=handler.ActionSuccess(),
+            action_type=ActionType.INPUT_TEXT,
+            dropdown_menu=object(),
+            value="next month",
+            is_done=AsyncMock(return_value=False),
+        )
+
+    async def _walk(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        *,
+        anchor_element: _FakeAnchorElement,
+        entry_action_type: str = "select_option",
+        label: str | None = "2026-11-01",
+        budget_seconds: float = 0.0,
+    ) -> tuple[object, AsyncMock]:
+        skyvern_frame = MagicMock()
+        skyvern_frame.safe_wait_for_animation_end = AsyncMock()
+        incremental_scraped = MagicMock()
+        incremental_scraped.get_incremental_element_tree = AsyncMock(return_value=[{"id": "next-level"}])
+        select_level = AsyncMock(side_effect=lambda **kwargs: self._unfinished_level())
+        monkeypatch.setattr(handler, "select_from_dropdown", select_level)
+        monkeypatch.setattr(handler, "DATEPICKER_WALK_BUDGET_SECONDS", budget_seconds)
+        action = SelectOptionAction(element_id="field-control", option=SelectOption(label=label))
+
+        result = await handler.sequentially_select_from_dropdown(
+            action=action,
+            input_or_select_context=InputOrSelectContext(field="Start date", is_required=True, is_date_related=True),
+            page=MagicMock(),
+            dom=MagicMock(),
+            skyvern_element=anchor_element,  # type: ignore[arg-type]
+            skyvern_frame=skyvern_frame,
+            incremental_scraped=incremental_scraped,
+            step=MagicMock(),
+            task=_task(),  # type: ignore[arg-type]
+            force_select=True,
+            target_value="2026-11-01",
+            entry_action_type=entry_action_type,
+        )
+        return result, select_level
+
+    @pytest.mark.asyncio
+    async def test_walk_stops_when_the_budget_is_spent(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        anchor_element = _FakeAnchorElement(tag_name="input")
+
+        _, select_level = await self._walk(monkeypatch, anchor_element=anchor_element)
+
+        # Spent budget ends the walk at the level that spent it, rather than at the depth backstop.
+        assert select_level.await_count == 1
+
+    @pytest.mark.asyncio
+    async def test_cheap_levels_still_walk_past_a_calendar_s_worth_of_month_steps(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        anchor_element = _FakeAnchorElement(tag_name="input")
+
+        _, select_level = await self._walk(monkeypatch, anchor_element=anchor_element, budget_seconds=600.0)
+
+        # A month-stepped calendar needs a level per click; a walk whose levels are cheap keeps them.
+        assert select_level.await_count > 12
+
+    @pytest.mark.asyncio
+    async def test_select_option_entry_clears_the_field_before_typing_the_date(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        anchor_element = _FakeAnchorElement(tag_name="input")
+        order: list[str] = []
+        anchor_element.input_clear = AsyncMock(side_effect=lambda *a, **k: order.append("clear"))
+        anchor_element.input_sequentially = AsyncMock(side_effect=lambda *a, **k: order.append("type"))
+
+        result, _ = await self._walk(monkeypatch, anchor_element=anchor_element)
+
+        # input_sequentially appends a value this short, so an uncleared field concatenates dates.
+        assert order == ["clear", "type"]
+        anchor_element.input_sequentially.assert_awaited_once_with("2026-11-01")
+        assert isinstance(result.action_result, handler.ActionSuccess)  # type: ignore[attr-defined]
+
+    @pytest.mark.asyncio
+    async def test_input_text_entry_hands_the_date_back_to_its_caller(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        anchor_element = _FakeAnchorElement(tag_name="input")
+
+        result, _ = await self._walk(monkeypatch, anchor_element=anchor_element, entry_action_type="input_text")
+
+        # Non-terminal, so handle_input_text_action resumes its own text path (close the picker,
+        # refuse a readonly field, type with replace semantics) instead of typing here.
+        assert isinstance(result.action_result, handler.ActionFailure)  # type: ignore[attr-defined]
+        assert handler._is_terminal_custom_select_failure(result.action_result) is False  # type: ignore[attr-defined]
+        anchor_element.input_sequentially.assert_not_awaited()
+        # That caller only quits a dropdown it is told is still open.
+        assert result.dropdown_menu is not None  # type: ignore[attr-defined]
+
+    @pytest.mark.asyncio
+    async def test_unspent_walk_with_nothing_typed_fails_instead_of_reporting_success(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # A button-triggered calendar cannot be typed into, so there is no date to claim.
+        anchor_element = _FakeAnchorElement(tag_name="button")
+
+        result, _ = await self._walk(monkeypatch, anchor_element=anchor_element)
+
+        assert isinstance(result.action_result, handler.ActionFailure)  # type: ignore[attr-defined]
+        assert handler._is_terminal_custom_select_failure(result.action_result) is True  # type: ignore[attr-defined]
+        anchor_element.input_sequentially.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_typing_that_raises_does_not_become_a_success(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        anchor_element = _FakeAnchorElement(tag_name="input")
+        anchor_element.input_sequentially = AsyncMock(side_effect=RuntimeError("not editable"))
+
+        result, _ = await self._walk(monkeypatch, anchor_element=anchor_element)
+
+        assert isinstance(result.action_result, handler.ActionFailure)  # type: ignore[attr-defined]
+
+    @pytest.mark.asyncio
+    async def test_readonly_date_field_is_reported_rather_than_typed_into(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        anchor_element = _FakeAnchorElement(tag_name="input")
+        anchor_element.is_readonly = AsyncMock(return_value=True)
+
+        result, _ = await self._walk(monkeypatch, anchor_element=anchor_element)
+
+        assert result.action_result.exception_type == "InputToReadonlyElement"  # type: ignore[attr-defined]
+        anchor_element.input_sequentially.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_value_only_action_with_no_label_fails_instead_of_reporting_success(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        anchor_element = _FakeAnchorElement(tag_name="input")
+
+        result, _ = await self._walk(monkeypatch, anchor_element=anchor_element, label=None)
+
+        assert isinstance(result.action_result, handler.ActionFailure)  # type: ignore[attr-defined]
+        anchor_element.input_sequentially.assert_not_awaited()
 
 
 class TestSameLevelClickMarksWidgetMutation:

@@ -22,6 +22,8 @@ from skyvern.constants import SKYVERN_ID_ATTR
 from skyvern.exceptions import (
     ElementIsNotLabel,
     ElementOutOfCurrentViewport,
+    FailToOpenLink,
+    FrameChainLoop,
     InteractWithDisabledElement,
     InvalidElementForTextInput,
     MissingElement,
@@ -32,14 +34,17 @@ from skyvern.exceptions import (
     NoElementBoudingBox,
     NoneFrameError,
     SkyvernException,
+    SkyvernPageAnalysisTimeout,
 )
 from skyvern.experimentation.wait_utils import get_or_create_wait_config, get_wait_time, scroll_into_view_wait
 from skyvern.forge.sdk.event.factory import EventStrategyFactory
 from skyvern.utils.url_validators import validate_fetch_url
+from skyvern.webeye.action_deadline import bounded_lookup_call
 from skyvern.webeye.actions import handler_utils
 from skyvern.webeye.browser_driver_errors import is_driver_error, is_driver_timeout_error
 from skyvern.webeye.browser_engine import BrowserEngineSelection
 from skyvern.webeye.dom_inspection import (
+    read_locator_accepts_text_fill,
     read_locator_is_content_editable,
     read_locator_tag_name,
     read_resolved_anchor_href,
@@ -52,6 +57,8 @@ from skyvern.webeye.utils.page import SECRET_VISUAL_MASK_SCRIPT, SkyvernFrame
 
 LOG = structlog.get_logger()
 COMMON_INPUT_TAGS = {"input", "textarea", "select"}
+# A generous iframe nesting bound; real nesting depth is not measured.
+MAX_FRAME_CHAIN_DEPTH = 32
 
 
 def is_incompatible_text_input_error(exc: BaseException) -> bool:
@@ -166,6 +173,16 @@ async def resolve_locator(
     iframe_path: list[str] = []
 
     while frame != "main.frame":
+        # A chain can still loop when an iframe element is missing from the scraped elements and a descendant
+        # frame holds an element with that iframe's id. This loop never awaits, so a cycle would block the event loop.
+        if frame in iframe_path or len(iframe_path) >= MAX_FRAME_CHAIN_DEPTH:
+            LOG.warning(
+                "Frame chain of the scraped element loops or exceeds the depth cap",
+                frame_chain=[*iframe_path, frame],
+                repeated_frame=frame in iframe_path,
+                max_depth=MAX_FRAME_CHAIN_DEPTH,
+            )
+            raise FrameChainLoop(frame_id=frame)
         iframe_path.append(frame)
 
         frame_element = scrape_page.id_to_element_dict.get(frame)
@@ -184,23 +201,24 @@ async def resolve_locator(
     while len(iframe_path) > 0:
         child_frame = iframe_path.pop()
 
-        frame_handler = await current_frame.query_selector(f"[{SKYVERN_ID_ATTR}='{child_frame}']")
+        frame_locator_query = f"[{SKYVERN_ID_ATTR}='{child_frame}']"
+        frame_handler = await bounded_lookup_call(lambda: current_frame.query_selector(frame_locator_query))
         if frame_handler is None:
             raise NoneFrameError(frame_id=child_frame)
 
         try:
-            content_frame = await frame_handler.content_frame()
+            content_frame = await bounded_lookup_call(frame_handler.content_frame)
         except Exception as exc:
             if not is_engine_error(exc, engine_selection) or not is_element_detached_error(exc):
                 raise
             # The iframe node detached between query_selector and content_frame (page
             # mutation). Re-query once for a fresh handle; if it is gone or detaches
             # again, classify as a missing element instead of leaking the raw error.
-            frame_handler = await current_frame.query_selector(f"[{SKYVERN_ID_ATTR}='{child_frame}']")
+            frame_handler = await bounded_lookup_call(lambda: current_frame.query_selector(frame_locator_query))
             if frame_handler is None:
                 raise MissingElement(element_id=child_frame) from exc
             try:
-                content_frame = await frame_handler.content_frame()
+                content_frame = await bounded_lookup_call(frame_handler.content_frame)
             except Exception as retry_exc:
                 if not is_engine_error(retry_exc, engine_selection) or not is_element_detached_error(retry_exc):
                     raise
@@ -252,7 +270,7 @@ class SkyvernElement:
         frame = incre_page.skyvern_frame.get_frame()
         locator = frame.locator(css_selector)
 
-        num_elements = await locator.count()
+        num_elements = await bounded_lookup_call(locator.count)
         if num_elements < 1:
             LOG.debug("No elements found with css. Validation failed.", css=css_selector, element_id=element_id)
             raise MissingElement(selector=css_selector, element_id=element_id)
@@ -529,7 +547,7 @@ class SkyvernElement:
         return await self.get_selectable() or self.get_tag_name() in SELECTABLE_ELEMENT
 
     async def is_visible(self, must_visible_style: bool = True) -> bool:
-        if not await self.get_locator().count():
+        if not await bounded_lookup_call(self.get_locator().count):
             return False
         if not must_visible_style:
             return True
@@ -559,6 +577,21 @@ class SkyvernElement:
                 element_id=self.get_id(),
             )
             return False
+
+    async def accepts_text_fill(self, timeout: float = settings.BROWSER_ACTION_TIMEOUT_MS) -> bool | None:
+        """Whether a fill/clear on this node can land text, or None when the live node was unreadable.
+        Stronger than is_editable(): that follows a <label> to its control and answers for the control's
+        readonly/disabled state, so a label for a radio, checkbox or file input reports editable even
+        though every fill routed through it is rejected by type."""
+        try:
+            return await read_locator_accepts_text_fill(self.get_locator(), timeout=timeout)
+        except Exception:
+            LOG.info(
+                "Failed to check whether the element accepts text input",
+                exc_info=True,
+                element_id=self.get_id(),
+            )
+            return None
 
     async def supports_text_input(self) -> bool:
         if self.get_tag_name().lower() in COMMON_INPUT_TAGS:
@@ -663,8 +696,10 @@ class SkyvernElement:
 
             parent_locator = hover_target.locator("..")
             try:
-                if await parent_locator.count() != 1:
+                if await bounded_lookup_call(parent_locator.count) != 1:
                     break
+            except SkyvernPageAnalysisTimeout:
+                raise
             except Exception:
                 LOG.debug(
                     "Unable to evaluate parent locator during hover reveal", exc_info=True, element_id=self.get_id()
@@ -933,23 +968,6 @@ class SkyvernElement:
         entries.sort(key=lambda x: len(x[0]), reverse=True)
         return entries[0][1]
 
-    async def find_children_element_id_by_callback(
-        self, cb: typing.Callable[[dict], typing.Awaitable[bool]]
-    ) -> str | None:
-        index = 0
-        queue = [self.get_element_dict()]
-        while index < len(queue):
-            item = queue[index]
-            if await cb(item):
-                return item.get("id", "")
-
-            children: list[dict] = item.get("children", [])
-            for child in children:
-                queue.append(child)
-
-            index += 1
-        return None
-
     async def find_label_for(
         self, dom: DomUtil, timeout: float = settings.BROWSER_ACTION_TIMEOUT_MS
     ) -> SkyvernElement | None:
@@ -962,7 +980,7 @@ class SkyvernElement:
 
         locator = self.get_frame().locator(f"[id='{for_id}']")
         # supposed to be only one element, since id is unique in the whole DOM
-        if await locator.count() != 1:
+        if await bounded_lookup_call(locator.count) != 1:
             return None
 
         unique_id = await locator.get_attribute(SKYVERN_ID_ATTR, timeout=timeout)
@@ -984,7 +1002,9 @@ class SkyvernElement:
         # fallback: fail_closed=True treats the label as forwarding so it is refused
         # rather than clicked unvetted.
         try:
-            return await label_locator.locator("a[href], button").count() > 0
+            return await bounded_lookup_call(label_locator.locator("a[href], button").count) > 0
+        except SkyvernPageAnalysisTimeout:
+            raise
         except Exception:
             return fail_closed
 
@@ -1003,7 +1023,9 @@ class SkyvernElement:
         if self.get_tag_name() != "label":
             return True
         try:
-            return await locator.locator("a[href], button").count() == 0
+            return await bounded_lookup_call(locator.locator("a[href], button").count) == 0
+        except SkyvernPageAnalysisTimeout:
+            raise
         except Exception:
             return False
 
@@ -1016,7 +1038,7 @@ class SkyvernElement:
             return None
 
         locator = self.get_frame().locator(f"label[for='{element_id}']")
-        cnt = await locator.count()
+        cnt = await bounded_lookup_call(locator.count)
         if cnt == 1:
             if await self._label_click_forwards_to_descendant(locator):
                 return None
@@ -1031,7 +1053,7 @@ class SkyvernElement:
             return None
 
         parent_locator = self.get_locator().locator("..")
-        cnt = await parent_locator.count()
+        cnt = await bounded_lookup_call(parent_locator.count)
         if cnt != 1:
             return None
 
@@ -1111,7 +1133,7 @@ class SkyvernElement:
     async def find_file_input_in_children(self) -> Locator | None:
         """Sometime the file input is invisible on the page, so it won't exist in the element tree, but it can be found in the DOM."""
         locator = self.get_locator().locator('input[type="file"]')
-        if await locator.count() != 1:
+        if await bounded_lookup_call(locator.count) != 1:
             return None
         return locator
 
@@ -1168,7 +1190,7 @@ class SkyvernElement:
         # count() itself raises when the locator's frame detached; that means 0 matches
         # here, not a new error to surface.
         try:
-            return await locator.count()
+            return await bounded_lookup_call(locator.count)
         except Exception as exc:
             if is_engine_error(exc, self._engine_selection) and is_element_detached_error(exc):
                 return 0
@@ -1289,7 +1311,7 @@ class SkyvernElement:
             )
             wait_config = await get_or_create_wait_config(task_id, workflow_run_id, organization_id)
             await asyncio.sleep(get_wait_time(wait_config, "checkbox_retry_delay", default=2.0))
-            if await self.get_locator().count() == 0:
+            if await bounded_lookup_call(self.get_locator().count) == 0:
                 LOG.info("Element is not on the page, the checking should work", element_id=self.get_id())
                 return
             await self.get_locator().check(timeout=timeout)
@@ -1313,7 +1335,7 @@ class SkyvernElement:
             )
             wait_config = await get_or_create_wait_config(task_id, workflow_run_id, organization_id)
             await asyncio.sleep(get_wait_time(wait_config, "checkbox_retry_delay", default=2.0))
-            if await self.get_locator().count() == 0:
+            if await bounded_lookup_call(self.get_locator().count) == 0:
                 LOG.info("Element is not on the page, the unchecking should work", element_id=self.get_id())
                 return
             await self.get_locator().uncheck(timeout=timeout)
@@ -1655,10 +1677,11 @@ class SkyvernElement:
 
         href = await asyncio.to_thread(validate_fetch_url, href)
 
+        origin_url = page.url
         LOG.info(
             "Trying to navigate to the <a> href link instead of clicking",
             href=href,
-            current_url=page.url,
+            current_url=origin_url,
         )
         try:
             response = await page.goto(href, timeout=settings.BROWSER_LOADING_TIMEOUT_MS)
@@ -1674,7 +1697,7 @@ class SkyvernElement:
                 return href
 
             LOG.warning("Failed to navigate to the <a> href link", exc_info=True, href=href, current_url=page.url)
-            raise
+            raise FailToOpenLink(page_moved=page.url != origin_url) from e
 
         await revalidate_redirect_chain(response, validate_fetch_url, page.goto)
         return href
@@ -1737,7 +1760,7 @@ class DomUtil:
             self.scraped_page, self.page, frame, css, engine_selection=self.engine_selection
         )
 
-        num_elements = await locator.count()
+        num_elements = await bounded_lookup_call(locator.count)
         if num_elements < 1:
             if not allow_xpath_fallback:
                 raise MissingElement(selector=css, element_id=element_id)
@@ -1752,7 +1775,7 @@ class DomUtil:
                 # (maybe) we should validate the element hash to make sure the element is the same?
                 LOG.info("Fallback to locator element by xpath.", xpath=xpath, element_id=element_id, sampling=True)
                 locator = frame_content.locator(f"xpath={xpath}")
-                num_elements = await locator.count()
+                num_elements = await bounded_lookup_call(locator.count)
                 if num_elements < 1:
                     raise MissingElement(selector=xpath, element_id=element_id)
                 # The tag-name xpath can resolve to many repeated nodes (rich text editors,
@@ -1783,6 +1806,11 @@ class DomUtil:
     async def safe_get_skyvern_element_by_id(self, element_id: str) -> SkyvernElement | None:
         try:
             return await self.get_skyvern_element_by_id(element_id)
+        except SkyvernPageAnalysisTimeout:
+            # An unresponsive page is not an absent element: answering None would send the caller on
+            # to more driver calls against a renderer that stopped answering. Fail closed instead so
+            # the step ends and the next scrape's reload rung gets a chance at the page.
+            raise
         except Exception:
             LOG.warning("Failed to get skyvern element by id", element_id=element_id, exc_info=True)
             return None
@@ -1833,7 +1861,7 @@ class DomUtil:
             if not isinstance(css, str) or not css:
                 continue
             locator = element.get_frame().locator(css)
-            if await locator.count() != 1:
+            if await bounded_lookup_call(locator.count) != 1:
                 continue
             owner = SkyvernElement(
                 locator,

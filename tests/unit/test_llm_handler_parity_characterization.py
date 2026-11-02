@@ -38,6 +38,7 @@ from skyvern.forge.sdk.api.llm.exceptions import (
     LLMProviderError,
     LLMProviderErrorRetryableTask,
 )
+from skyvern.forge.sdk.copilot.cost_telemetry import copilot_cost_scope
 from skyvern.forge.sdk.core.skyvern_context import SkyvernContext
 from skyvern.forge.sdk.models import Step, StepStatus
 from skyvern.schemas.llm import LLMConfig, LLMRouterConfig, LLMRouterModelConfig
@@ -427,11 +428,13 @@ async def _run_router(
 
 @pytest.mark.asyncio
 async def test_happy_path_parses_and_records_identically(span_exporter: InMemorySpanExporter) -> None:
-    direct = await _run_direct(span_exporter, responses=[ParityResponse("gpt-4")], step=_make_step(), parameters={})
-    router = await _run_router(span_exporter, responses=[ParityResponse("gpt-4")], step=_make_step(), parameters={})
+    response = ParityResponse("gpt-4", cache_creation_tokens=404)
+    direct = await _run_direct(span_exporter, responses=[response], step=_make_step(), parameters={})
+    router = await _run_router(span_exporter, responses=[response], step=_make_step(), parameters={})
 
     assert direct.error is None and router.error is None
     assert direct.parsed == router.parsed == {"actions": []}
+    assert [outcome.metrics_events[0]["cache_creation_tokens"] for outcome in (direct, router)] == [404, 404]
 
     assert len(direct.completion_calls) == 1 and not direct.router_calls
     assert len(router.router_calls) == 1 and not router.completion_calls
@@ -570,20 +573,21 @@ async def test_copilot_model_usage_is_emitted_once_by_router_and_single_handler(
             provider="openai",
         )
 
-    direct = await _run_direct(
-        span_exporter,
-        responses=[response()],
-        model_name="gpt-4",
-        prompt_name="workflow-copilot-narration",
-        parameters={},
-    )
-    router = await _run_router(
-        span_exporter,
-        responses=[response()],
-        main_model_group="gpt-4",
-        prompt_name="workflow-copilot-narration",
-        parameters={},
-    )
+    with copilot_cost_scope() as ledger:
+        direct = await _run_direct(
+            span_exporter,
+            responses=[response()],
+            model_name="gpt-4",
+            prompt_name="workflow-copilot-narration",
+            parameters={},
+        )
+        router = await _run_router(
+            span_exporter,
+            responses=[response()],
+            main_model_group="gpt-4",
+            prompt_name="workflow-copilot-narration",
+            parameters={},
+        )
 
     expected = {
         "log_code": "copilot_model_usage",
@@ -600,6 +604,9 @@ async def test_copilot_model_usage_is_emitted_once_by_router_and_single_handler(
     }
     assert direct.error is None and router.error is None
     assert direct.usage_events == router.usage_events == [expected]
+    assert ledger.snapshot()["known_cost_usd"] == pytest.approx(LLM_COST * 2)
+    assert ledger.snapshot()["observed_call_count"] == 2
+    assert ledger.snapshot()["pricing_sources"] == ["litellm_estimate"]
 
 
 @pytest.mark.asyncio
@@ -691,31 +698,31 @@ async def test_zero_usage_records_none_token_fields_on_both(span_exporter: InMem
 async def test_provider_prefixed_response_model(span_exporter: InMemorySpanExporter) -> None:
     direct = await _run_direct(
         span_exporter,
-        responses=[ParityResponse("vertex_ai/gemini-2.5-flash")],
-        model_name="gemini-2.5-flash",
+        responses=[ParityResponse("vertex_ai/gemini-3-flash-preview")],
+        model_name="gemini-3-flash-preview",
         step=_make_step(),
         parameters={},
     )
     router = await _run_router(
         span_exporter,
-        responses=[ParityResponse("vertex_ai/gemini-2.5-flash")],
-        main_model_group="vertex-gemini-2.5-flash",
-        litellm_model="vertex_ai/gemini-2.5-flash",
+        responses=[ParityResponse("vertex_ai/gemini-3-flash-preview")],
+        main_model_group="vertex-gemini-3-flash-preview",
+        litellm_model="vertex_ai/gemini-3-flash-preview",
         step=_make_step(),
         parameters={},
     )
 
     assert direct.error is None and router.error is None
     # Both variants normalize the persisted model to the bare name.
-    assert direct.update_step_calls[0]["last_llm_model"] == "gemini-2.5-flash"
-    assert router.update_step_calls[0]["last_llm_model"] == "gemini-2.5-flash"
+    assert direct.update_step_calls[0]["last_llm_model"] == "gemini-3-flash-preview"
+    assert router.update_step_calls[0]["last_llm_model"] == "gemini-3-flash-preview"
 
     # drift: the router span/event record the raw provider-prefixed response.model while
     # the direct handler records the normalized bare name.
-    assert direct.span_attrs["llm_model"] == "gemini-2.5-flash"
-    assert direct.event_attrs["model"] == "gemini-2.5-flash"
-    assert router.span_attrs["llm_model"] == "vertex_ai/gemini-2.5-flash"
-    assert router.event_attrs["model"] == "vertex_ai/gemini-2.5-flash"
+    assert direct.span_attrs["llm_model"] == "gemini-3-flash-preview"
+    assert direct.event_attrs["model"] == "gemini-3-flash-preview"
+    assert router.span_attrs["llm_model"] == "vertex_ai/gemini-3-flash-preview"
+    assert router.event_attrs["model"] == "vertex_ai/gemini-3-flash-preview"
 
 
 @pytest.mark.parametrize(
@@ -854,17 +861,17 @@ async def test_vertex_cache_attached_for_gemini_extract_actions(span_exporter: I
 
     direct = await _run_direct(
         span_exporter,
-        responses=[ParityResponse("vertex_ai/gemini-2.5-flash")],
-        model_name="gemini-2.5-flash",
+        responses=[ParityResponse("vertex_ai/gemini-3-flash-preview")],
+        model_name="gemini-3-flash-preview",
         context=cached_context(),
         prompt_name=EXTRACT_ACTION_PROMPT_NAME,
         parameters={},
     )
     router = await _run_router(
         span_exporter,
-        responses=[ParityResponse("vertex_ai/gemini-2.5-flash")],
-        main_model_group="vertex-gemini-2.5-flash",
-        litellm_model="vertex_ai/gemini-2.5-flash",
+        responses=[ParityResponse("vertex_ai/gemini-3-flash-preview")],
+        main_model_group="vertex-gemini-3-flash-preview",
+        litellm_model="vertex_ai/gemini-3-flash-preview",
         context=cached_context(),
         prompt_name=EXTRACT_ACTION_PROMPT_NAME,
         parameters={},
@@ -877,8 +884,8 @@ async def test_vertex_cache_attached_for_gemini_extract_actions(span_exporter: I
     assert len(router.completion_calls) == 1 and not router.router_calls
     assert direct.completion_calls[0]["cached_content"] == cache_name
     assert router.completion_calls[0]["cached_content"] == cache_name
-    assert direct.completion_calls[0]["model"] == "gemini-2.5-flash"
-    assert router.completion_calls[0]["model"] == "vertex_ai/gemini-2.5-flash"
+    assert direct.completion_calls[0]["model"] == "gemini-3-flash-preview"
+    assert router.completion_calls[0]["model"] == "vertex_ai/gemini-3-flash-preview"
     assert direct.completion_calls[0]["timeout"] == settings.LLM_CONFIG_TIMEOUT
     assert router.completion_calls[0]["timeout"] == settings.LLM_CONFIG_TIMEOUT
 
@@ -892,17 +899,17 @@ async def test_no_vertex_cache_when_prompt_caching_disabled(span_exporter: InMem
 
     direct = await _run_direct(
         span_exporter,
-        responses=[ParityResponse("vertex_ai/gemini-2.5-flash")],
-        model_name="gemini-2.5-flash",
+        responses=[ParityResponse("vertex_ai/gemini-3-flash-preview")],
+        model_name="gemini-3-flash-preview",
         context=uncached_context(),
         prompt_name=EXTRACT_ACTION_PROMPT_NAME,
         parameters={},
     )
     router = await _run_router(
         span_exporter,
-        responses=[ParityResponse("vertex_ai/gemini-2.5-flash")],
-        main_model_group="vertex-gemini-2.5-flash",
-        litellm_model="vertex_ai/gemini-2.5-flash",
+        responses=[ParityResponse("vertex_ai/gemini-3-flash-preview")],
+        main_model_group="vertex-gemini-3-flash-preview",
+        litellm_model="vertex_ai/gemini-3-flash-preview",
         context=uncached_context(),
         prompt_name=EXTRACT_ACTION_PROMPT_NAME,
         parameters={},

@@ -132,8 +132,8 @@ def sweep_stale_temp_artifacts(max_age_hours: float | None = None) -> int:
     TEMP_PATH is intentionally excluded, with one exception: the run-scoped namespace
     (TEMP_PATH/runs/<org>/<run>) IS swept, because it is single-tenant and keyed by run
     identity — an aged run dir is a crash-path orphan. The rest of TEMP_PATH stays out:
-    mtime is not a safe liveness signal there — reused generated-script caches
-    (TEMP_PATH/<script_id>) are overwritten in place without bumping the dir mtime, and
+    mtime is not a safe liveness signal there — revision-scoped generated-script caches
+    (TEMP_PATH/<script_id>/<script_revision_id>) are written without bumping the parent dir mtime, and
     browser-session profile dirs are written only at open/close — both read as stale while
     actively in use. LOG_PATH/DOWNLOAD_PATH are single-tenant and keyed per run, so an aged
     top-level entry there is genuinely finished.

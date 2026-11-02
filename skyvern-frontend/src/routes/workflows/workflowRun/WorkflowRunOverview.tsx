@@ -35,6 +35,11 @@ import { Skeleton } from "@/components/ui/skeleton";
 import { useQueryClient } from "@tanstack/react-query";
 import { useCallback, useEffect, useState } from "react";
 import { useStreamTransport } from "@/hooks/useRuntimeConfig";
+import {
+  EXTERNAL_BROWSER_DIAGNOSTIC,
+  STREAM_STARTING_DIAGNOSTIC,
+  StreamStatusPanel,
+} from "@/routes/streaming/StreamDiagnostics";
 import { RunHealChip } from "./RunHealChip";
 import { RunReliabilityUplink } from "./RunReliabilityUplink";
 
@@ -78,7 +83,7 @@ function WorkflowRunOverviewAttempt() {
   const workflowRunId = workflowRun?.workflow_run_id;
 
   const browserSessionId = workflowRun?.browser_session_id;
-  const { streamTransport } = useStreamTransport(browserSessionId);
+  const { streamTransport, isExternal } = useStreamTransport(browserSessionId);
 
   const invalidateQueries = useCallback(() => {
     if (workflowRunId) {
@@ -156,15 +161,23 @@ function WorkflowRunOverviewAttempt() {
         selection.block_type === "human_interaction"))
   );
 
+  const shouldShowExternalPanel = isExternal && wantsVncStream;
+  // Mounting before the session answers would open a VNC socket an external session cannot serve.
+  const isSessionLookupPending =
+    wantsVncStream && streamTransport === undefined;
+  const canMountSessionStream =
+    wantsVncStream && !isSessionLookupPending && !isExternal;
   const shouldUseCdpStream = streamTransport === "cdp";
   const shouldShowBrowserStream =
-    wantsVncStream && !shouldUseCdpStream && !vncFailed;
+    canMountSessionStream && !shouldUseCdpStream && !vncFailed;
   const shouldShowScreencastFallback =
-    wantsVncStream && (shouldUseCdpStream || vncFailed);
+    canMountSessionStream && (shouldUseCdpStream || vncFailed);
 
   const isStreamActive =
     shouldShowBrowserStream ||
     shouldShowScreencastFallback ||
+    shouldShowExternalPanel ||
+    isSessionLookupPending ||
     selection === "stream";
 
   return (
@@ -195,14 +208,18 @@ function WorkflowRunOverviewAttempt() {
             centered
           />
         )}
-        {!shouldShowBrowserStream &&
-          !shouldShowScreencastFallback &&
-          selection === "stream" && (
-            <WorkflowRunStream
-              interactive={isPaused}
-              showControlButtons={isPaused}
-            />
-          )}
+        {shouldShowExternalPanel && (
+          <StreamStatusPanel diagnostic={EXTERNAL_BROWSER_DIAGNOSTIC} />
+        )}
+        {isSessionLookupPending && (
+          <StreamStatusPanel diagnostic={STREAM_STARTING_DIAGNOSTIC} />
+        )}
+        {!wantsVncStream && selection === "stream" && (
+          <WorkflowRunStream
+            interactive={isPaused}
+            showControlButtons={isPaused}
+          />
+        )}
         {!isStreamActive && isAction(selection) && (
           <ActionScreenshot
             artifactId={selection.screenshot_artifact_id ?? undefined}

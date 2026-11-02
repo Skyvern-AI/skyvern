@@ -24,6 +24,8 @@ if TYPE_CHECKING:
     from skyvern.forge.sdk.schemas.tasks import Task
     from skyvern.forge.sdk.workflow.models.block import BaseTaskBlock
 
+DOWNLOAD_BLOCK_FACT = "No file has landed in this block yet."
+
 PAGE_FIELD_NOUNS = {
     "navigation_goal": "goal",
     "data_extraction_goal": "extraction goal",
@@ -228,6 +230,8 @@ def render_block_context(
                 if task.task_type != TaskType.validation
                 else ""
             )
+            # The download settle's predicate: on these blocks finish records the files that landed.
+            + (f" {DOWNLOAD_BLOCK_FACT}" if task_block.complete_on_download and task.workflow_run_id else "")
             + " If the criterion is genuinely satisfied, finish with status=completed "
             "immediately without acting. Stay "
             "within this block's goal: never sign out, navigate away from the current flow, or undo "
@@ -291,9 +295,15 @@ def render_block_context(
     return "\n\n".join(pieces)
 
 
-def build_user_prompt(goal: str, parameters: dict[str, Any] | None, starting_url: str | None) -> str:
+def build_user_prompt(
+    goal: str, parameters: dict[str, Any] | None, starting_url: str | None, *, starting_url_is_current: bool = False
+) -> str:
     parts = [goal.strip()]
-    if starting_url:
+    if starting_url_is_current and starting_url:
+        # "You start on: <opaque handle>" reads as a destination, and re-opening a URL that carries a
+        # session ticket can serve a different page than the one already open.
+        parts.append(f"\nYou are already on this page ({starting_url})")
+    elif starting_url:
         parts.append(f"\nYou start on: {starting_url}")
     if parameters:
         parts.append("\nData provided for this task:\n" + json.dumps(parameters, indent=2, default=str))

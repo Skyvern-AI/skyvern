@@ -16,6 +16,7 @@ from skyvern.forge.sdk.copilot.build_test_outcome import (
     BuildTestPacketRun,
     BuildTestPacketScreenshot,
 )
+from skyvern.forge.sdk.copilot.composition_evidence import model_visible_composition_evidence
 from skyvern.forge.sdk.copilot.mcp_adapter import _copilot_to_call_tool_result
 from skyvern.forge.sdk.copilot.output_utils import (
     _AGGREGATE_LIMIT_RESULT_SUMMARY_MAX_ITEMS,
@@ -776,6 +777,63 @@ def test_sanitize_run_blocks_debug_preserves_post_run_page_evidence() -> None:
     assert sanitized["data"]["post_run_page_evidence"] == evidence
 
 
+@pytest.mark.parametrize("tool_name", ["run_blocks_and_collect_debug", "get_run_results"])
+@pytest.mark.parametrize("room", [1_000, -200], ids=["fits", "over_the_bound"])
+def test_sanitize_gives_the_run_result_without_authoring_facts_before_the_model_bound_cuts_it(
+    tool_name: str, room: int
+) -> None:
+    shared = {"selector": "input.field", "source": "class", "match_count": 21, "visible_match_count": 20}
+    evidence = {
+        "page_title": "Forms",
+        "forms": [
+            {
+                "fields": [
+                    {
+                        "id": f"f{form}-{index}",
+                        "pointer_at_center": "reaches_other_element",
+                        "selector_candidates": [shared],
+                    }
+                    for index in range(20)
+                ],
+                "submit_controls": [{"id": f"go-{form}", "pointer_at_center": "reaches_control"}],
+            }
+            for form in range(4)
+        ],
+        "clickable_controls": [{"text": "Accept", "selector_candidates": [{"selector": "#accept", "source": "id"}]}],
+        "modal_overlays": [{"role": "dialog", "text": "Cookie preferences"}],
+        "page_obstructions": [{"kind": "interaction_blocking_layer", "source": "dom"}],
+    }
+    without_them = model_visible_composition_evidence(evidence)
+
+    def run_result(packet: dict[str, Any], excerpt_chars: int = 0) -> dict[str, Any]:
+        data = {
+            "workflow_run_id": "wr_123",
+            "blocks": [],
+            "post_run_page_evidence": {**packet, "visible_text_excerpt": "x" * excerpt_chars},
+            "final_fact": "kept",
+        }
+        return json.loads(json.dumps({"ok": True, "data": data}))
+
+    # With room to spare, the whole result fits; 200 under the bound, only the packet without them does.
+    full_size = len(json.dumps(run_result(evidence)))
+    stripped_size = len(json.dumps(run_result(without_them)))
+    cap = output_utils_module._RECENT_TOOL_OUTPUT_CHAR_CAP
+    result = run_result(evidence, (cap - room - full_size) if room > 0 else (cap + room - stripped_size))
+    stored = json.dumps(result)
+
+    sanitized = sanitize_tool_result_for_llm(tool_name, result)
+
+    assert json.dumps(result) == stored
+    serialized = json.dumps(sanitized)
+    assert len(serialized) <= cap and sanitized["data"]["final_fact"] == "kept"
+    captured = result["data"]["post_run_page_evidence"]
+    packet = sanitized["data"]["post_run_page_evidence"]
+    assert packet == (captured if room > 0 else model_visible_composition_evidence(captured))
+    assert (packet == captured) == (room > 0)
+    for key in ("modal_overlays", "page_obstructions", "clickable_controls"):
+        assert json.dumps({key: evidence[key]})[1:-1] in serialized
+
+
 def test_sanitize_edit_block_and_run_matches_run_blocks_debug_evidence() -> None:
     result = {
         "ok": False,
@@ -1143,6 +1201,13 @@ class TestSummarizeToolResult:
         )
         assert "Unknown error" in summary
 
+    def test_denied_result_names_its_reason(self) -> None:
+        summary = self._summarize(
+            "list_credentials",
+            {"ok": False, "data": {"status": "denied", "reason": "reference_not_literal_in_current_user_turn"}},
+        )
+        assert summary == "Failed: reference_not_literal_in_current_user_turn"
+
     def test_update_workflow(self) -> None:
         summary = self._summarize(
             "update_workflow",
@@ -1472,6 +1537,18 @@ class TestFormatToolResultForUser:
             "update_and_run_blocks",
             {"ok": False, "error": "Jinja style parameter 'foo' could not be resolved"},
         )
+        assert summary == "A workflow parameter could not be filled in."
+
+    @pytest.mark.parametrize(
+        "error",
+        [
+            "workflow_trigger block failed. failure reason: Failed to resolve templates: "
+            "Missing key or attribute in `a.output.id` (line 1) at payload[id].",
+            "Failed to evaluate while-loop condition: Missing reference `count` (line 1).",
+        ],
+    )
+    def test_render_failures_without_a_jinja_prefix_translate_to_parameter_phrasing(self, error: str) -> None:
+        summary = self._format("update_and_run_blocks", {"ok": False, "error": error})
         assert summary == "A workflow parameter could not be filled in."
 
     def test_invalid_selector_failure_replaces_engine_instruction_text(self) -> None:
@@ -1875,7 +1952,7 @@ class TestParseFinalResponse:
     def test_recovery_tier_skipped_when_prose_quotes_both_markers(self) -> None:
         # Prose discussing the envelope format (both quoted `"type": "REPLY"`
         # and `"user_response"` substrings present, no leading `{`) must not
-        # degrade to "Done." — the user's actual prose has to survive.
+        # degrade to an empty reply — the user's actual prose has to survive.
         text = 'I see "type": "REPLY" mentioned, but cannot find "user_response" anywhere.'
         parsed = parse_final_response(text)
         assert parsed == {"type": "REPLY", "user_response": text}
@@ -1910,12 +1987,11 @@ class TestParseFinalResponse:
         assert parsed["type"] == "REPLY"
         assert parsed["user_response"] == "updated your workflow"
 
-    def test_envelope_shaped_unparseable_with_no_recoverable_user_response_returns_done(self) -> None:
+    def test_envelope_shaped_unparseable_with_no_recoverable_user_response_returns_empty(self) -> None:
         envelope = '{"type": "REPLY", "user_response": "broken'
         parsed = parse_final_response(envelope)
-        assert parsed["user_response"] == "Done."
+        assert parsed["user_response"] == ""
         assert parsed["type"] == "REPLY"
-        assert "broken" not in parsed["user_response"]
 
     def test_non_envelope_unparseable_text_still_falls_back_to_text(self) -> None:
         text = "I'm not sure how to help with that."

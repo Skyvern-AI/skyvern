@@ -61,6 +61,7 @@ from skyvern.forge.sdk.db.models import (
     WorkflowModel,
     WorkflowParameterModel,
 )
+from skyvern.forge.sdk.db.repositories.workflow_runs import _folder_access_filter
 from skyvern.forge.sdk.db.utils import (
     convert_to_aws_secret_parameter,
     convert_to_output_parameter,
@@ -71,7 +72,11 @@ from skyvern.forge.sdk.db.utils import (
     summarize_copilot_chat_title,
 )
 from skyvern.forge.sdk.schemas.ai_suggestions import AISuggestion
-from skyvern.forge.sdk.schemas.copilot_turn_outcome import TurnOutcome
+from skyvern.forge.sdk.schemas.copilot_turn_outcome import (
+    CopilotBrowserAllocation,
+    CopilotRequestBrowserAllocations,
+    TurnOutcome,
+)
 from skyvern.forge.sdk.schemas.task_generations import TaskGeneration
 from skyvern.forge.sdk.schemas.workflow_copilot import (
     COPILOT_PROPOSAL_METADATA_KEY,
@@ -825,7 +830,9 @@ class WorkflowParametersRepository(BaseRepository):
                 if copilot_proposal_metadata(chat.proposed_workflow) is not None and (
                     copilot_proposal_metadata(proposed_workflow) is None
                 ):
-                    raise CopilotProposalConflictError("Copilot proposal is owned by a newer candidate")
+                    raise CopilotProposalConflictError(
+                        "Copilot proposal is owned by a newer candidate", reason="token_changed"
+                    )
                 chat.proposed_workflow = proposed_workflow
             if auto_accept is not None:
                 chat.auto_accept = auto_accept
@@ -858,12 +865,12 @@ class WorkflowParametersRepository(BaseRepository):
         current = copilot_proposal_metadata(proposal)
         if current is None:
             if isinstance(proposal, Mapping) and COPILOT_PROPOSAL_METADATA_KEY in proposal:
-                raise CopilotProposalConflictError("Copilot proposal metadata is invalid")
+                raise CopilotProposalConflictError("Copilot proposal metadata is invalid", reason="metadata_invalid")
             if expected_owner_turn_id is not None or expected_revision is not None:
-                raise CopilotProposalConflictError("Copilot proposal changed")
+                raise CopilotProposalConflictError("Copilot proposal changed", reason="candidate_missing")
             return None
         if current.owner_turn_id != expected_owner_turn_id or current.revision != expected_revision:
-            raise CopilotProposalConflictError("Copilot proposal changed")
+            raise CopilotProposalConflictError("Copilot proposal changed", reason="token_changed")
         return current
 
     @db_operation("publish_workflow_copilot_candidate", expected_errors=(CopilotProposalConflictError,))
@@ -886,7 +893,7 @@ class WorkflowParametersRepository(BaseRepository):
             if current is not None and current.claim_is_live(datetime.now(timezone.utc)):
                 # The accept between its claim and its canonical write is committing bytes it has
                 # already read; replacing them underneath it would make it write a stale workflow.
-                raise CopilotProposalConflictError("Copilot proposal is being accepted")
+                raise CopilotProposalConflictError("Copilot proposal is being accepted", reason="being_accepted")
             revision = current.revision + 1 if current is not None and current.owner_turn_id == owner_turn_id else 1
             metadata = CopilotProposalMetadata(
                 owner_turn_id=owner_turn_id,
@@ -918,17 +925,17 @@ class WorkflowParametersRepository(BaseRepository):
             chat = await self._locked_copilot_chat(session, organization_id, workflow_copilot_chat_id)
             current = self._require_candidate_token(chat.proposed_workflow, expected_owner_turn_id, expected_revision)
             if current is None or not isinstance(chat.proposed_workflow, dict):
-                raise CopilotProposalConflictError("Copilot proposal changed")
+                raise CopilotProposalConflictError("Copilot proposal changed", reason="candidate_missing")
             if current.claim_is_live(datetime.now(timezone.utc)):
-                raise CopilotProposalConflictError("Copilot proposal is being accepted")
+                raise CopilotProposalConflictError("Copilot proposal is being accepted", reason="being_accepted")
             if chat.proposed_workflow.get("_copilot_yaml") != proposal.get("_copilot_yaml"):
-                raise CopilotProposalConflictError("Copilot proposal bytes changed")
+                raise CopilotProposalConflictError("Copilot proposal bytes changed", reason="bytes_changed")
             current_workflow = {
                 key: value for key, value in chat.proposed_workflow.items() if not key.startswith("_copilot_")
             }
             proposed_workflow = {key: value for key, value in proposal.items() if not key.startswith("_copilot_")}
             if current_workflow != proposed_workflow:
-                raise CopilotProposalConflictError("Copilot proposal content changed")
+                raise CopilotProposalConflictError("Copilot proposal content changed", reason="content_changed")
             metadata = current.model_copy(update={"disposition": disposition})
             chat.proposed_workflow = {
                 **proposal,
@@ -953,12 +960,20 @@ class WorkflowParametersRepository(BaseRepository):
             chat = await self._locked_copilot_chat(session, organization_id, workflow_copilot_chat_id)
             current = self._require_candidate_token(chat.proposed_workflow, expected_owner_turn_id, expected_revision)
             if current is None or not isinstance(chat.proposed_workflow, dict):
-                raise CopilotProposalConflictError("Copilot proposal changed")
+                raise CopilotProposalConflictError("Copilot proposal changed", reason="candidate_missing")
             if current.claim_is_live(datetime.now(timezone.utc)):
-                raise CopilotProposalConflictError("Copilot proposal is being accepted")
+                raise CopilotProposalConflictError("Copilot proposal is being accepted", reason="being_accepted")
             if chat.proposed_workflow.get("_copilot_yaml") != expected_workflow_yaml:
-                raise CopilotProposalConflictError("Copilot proposal bytes changed")
-            metadata = current.model_copy(update={"workflow_run_id": workflow_run_id})
+                raise CopilotProposalConflictError("Copilot proposal bytes changed", reason="bytes_changed")
+            # A new run is not yet proof. Turn end re-records the disposition from its result, but a turn
+            # that exits without one must not leave a stale Tested beside this run.
+            proven = current.disposition in ("review_tested", "auto_applicable")
+            metadata = current.model_copy(
+                update={
+                    "workflow_run_id": workflow_run_id,
+                    "disposition": "review_untested" if proven else current.disposition,
+                }
+            )
             chat.proposed_workflow = {
                 **chat.proposed_workflow,
                 COPILOT_PROPOSAL_METADATA_KEY: metadata.model_dump(mode="json"),
@@ -979,12 +994,10 @@ class WorkflowParametersRepository(BaseRepository):
         async with self.Session() as session:
             chat = await self._locked_copilot_chat(session, organization_id, workflow_copilot_chat_id)
             current = self._require_candidate_token(chat.proposed_workflow, expected_owner_turn_id, expected_revision)
-            if (
-                current is None
-                or not isinstance(chat.proposed_workflow, dict)
-                or current.claim_is_live(datetime.now(timezone.utc))
-            ):
-                raise CopilotProposalConflictError("Copilot proposal changed")
+            if current is None or not isinstance(chat.proposed_workflow, dict):
+                raise CopilotProposalConflictError("Copilot proposal changed", reason="candidate_missing")
+            if current.claim_is_live(datetime.now(timezone.utc)):
+                raise CopilotProposalConflictError("Copilot proposal is being accepted", reason="being_accepted")
             metadata = current.model_copy(update={"disposition": "accepting", "claimed_at": datetime.now(timezone.utc)})
             chat.proposed_workflow = {
                 **chat.proposed_workflow,
@@ -1007,7 +1020,7 @@ class WorkflowParametersRepository(BaseRepository):
         async with self.Session() as session:
             chat = await self._locked_copilot_chat(session, organization_id, workflow_copilot_chat_id)
             if chat.proposed_workflow != expected_proposal:
-                raise CopilotProposalConflictError("Copilot proposal changed")
+                raise CopilotProposalConflictError("Copilot proposal changed", reason="content_changed")
             # The proposal records no base, so this is the only version Accept can hold a later save against.
             # Same filter as WorkflowsRepository.get_workflow_by_permanent_id, the read expected_version uses.
             base_version = await session.scalar(
@@ -1061,7 +1074,7 @@ class WorkflowParametersRepository(BaseRepository):
                 or current.disposition != "accepting"
                 or current.claimed_at != expected_claimed_at
             ):
-                raise CopilotProposalConflictError("Copilot proposal claim changed")
+                raise CopilotProposalConflictError("Copilot proposal claim changed", reason="claim_changed")
             if restore_untokened:
                 chat.proposed_workflow = {
                     key: value for key, value in chat.proposed_workflow.items() if key != COPILOT_PROPOSAL_METADATA_KEY
@@ -1098,10 +1111,12 @@ class WorkflowParametersRepository(BaseRepository):
                 # A claim the caller named must still be the one it took; see release above.
                 or (expected_claimed_at is not None and current.claimed_at != expected_claimed_at)
             ):
-                raise CopilotProposalConflictError("Copilot proposal disposition changed")
+                raise CopilotProposalConflictError("Copilot proposal disposition changed", reason="disposition_changed")
             if record_acceptance:
                 if current is None:
-                    raise CopilotProposalConflictError("Copilot proposal has no owner to record")
+                    raise CopilotProposalConflictError(
+                        "Copilot proposal has no owner to record", reason="candidate_missing"
+                    )
                 accepted_turn_ids = list(chat.accepted_turn_ids or [])
                 if current.owner_turn_id not in accepted_turn_ids:
                     accepted_turn_ids.append(current.owner_turn_id)
@@ -1852,14 +1867,129 @@ class WorkflowParametersRepository(BaseRepository):
             if popped is None:
                 return
             chat.pending_turns = pending
+            entry = CopilotPendingTurn.model_validate(popped)
+            if entry.request_browser_allocations is not None:
+                terminal = (
+                    await session.scalars(
+                        select(WorkflowCopilotChatMessageModel)
+                        .where(WorkflowCopilotChatMessageModel.organization_id == organization_id)
+                        .where(WorkflowCopilotChatMessageModel.workflow_copilot_chat_id == workflow_copilot_chat_id)
+                        .where(WorkflowCopilotChatMessageModel.sender == WorkflowCopilotChatSender.AI)
+                        .where(WorkflowCopilotChatMessageModel.turn_outcome["copilot_turn_id"].as_string() == turn_id)
+                        .with_for_update()
+                    )
+                ).one_or_none()
+                if terminal is None or not isinstance(terminal.turn_outcome, dict):
+                    raise ValueError("Copilot allocation receipt has no terminal row")
+                terminal.turn_outcome = {
+                    **terminal.turn_outcome,
+                    "request_browser_allocations": entry.request_browser_allocations.model_dump(mode="json"),
+                }
             # The turn's row was written from an earlier read, so a deletion claimed then may have resolved since.
             claimed = [
                 item
-                for item in CopilotPendingTurn.model_validate(popped).question_interactions
+                for item in entry.question_interactions
                 if item.credential_delete_review is not None and item.credential_delete_review.claimed_at is not None
             ]
             if claimed:
                 await self._patch_narrative_questions(session, organization_id, workflow_copilot_chat_id, claimed)
+            await session.commit()
+
+    @db_operation("record_copilot_browser_allocation")
+    async def record_copilot_browser_allocation(
+        self,
+        organization_id: str,
+        workflow_copilot_chat_id: str,
+        workflow_permanent_id: str,
+        turn_id: str,
+        request_cancel_token: str | None,
+        allocation_id: str,
+        browser_session_id: str | None,
+    ) -> None:
+        async with self.Session() as session:
+            chat = await self._locked_question_chat(session, organization_id, workflow_copilot_chat_id)
+            if chat.workflow_permanent_id != workflow_permanent_id:
+                raise ValueError("Copilot allocation workflow does not match")
+            pending = dict(chat.pending_turns or {})
+            raw_entry = pending.get(turn_id)
+            message = None
+            if isinstance(raw_entry, dict):
+                entry = CopilotPendingTurn.model_validate(raw_entry)
+                if entry.cancel_token != request_cancel_token:
+                    raise ValueError("Copilot allocation request does not match")
+                receipt = entry.request_browser_allocations
+            else:
+                if browser_session_id is None:
+                    raise ValueError("The Copilot execution has ended")
+                message = (
+                    await session.scalars(
+                        select(WorkflowCopilotChatMessageModel)
+                        .where(WorkflowCopilotChatMessageModel.organization_id == organization_id)
+                        .where(WorkflowCopilotChatMessageModel.workflow_copilot_chat_id == workflow_copilot_chat_id)
+                        .where(WorkflowCopilotChatMessageModel.sender == WorkflowCopilotChatSender.AI)
+                        .where(WorkflowCopilotChatMessageModel.turn_outcome["copilot_turn_id"].as_string() == turn_id)
+                        .with_for_update()
+                    )
+                ).one_or_none()
+                if message is None or not isinstance(message.turn_outcome, dict):
+                    raise ValueError("Copilot allocation request is unavailable")
+                outcome = TurnOutcome.model_validate(message.turn_outcome)
+                if outcome.request_cancel_token != request_cancel_token:
+                    raise ValueError("Copilot allocation request does not match")
+                receipt = outcome.request_browser_allocations
+            if receipt is None:
+                if browser_session_id is not None:
+                    raise ValueError("Copilot allocation has no recorded intent")
+                receipt = CopilotRequestBrowserAllocations(
+                    organization_id=organization_id,
+                    workflow_permanent_id=workflow_permanent_id,
+                    workflow_copilot_chat_id=workflow_copilot_chat_id,
+                    turn_id=turn_id,
+                    request_cancel_token=request_cancel_token,
+                )
+            if (
+                receipt.organization_id != organization_id
+                or receipt.workflow_permanent_id != workflow_permanent_id
+                or receipt.workflow_copilot_chat_id != workflow_copilot_chat_id
+                or receipt.turn_id != turn_id
+                or receipt.request_cancel_token != request_cancel_token
+            ):
+                raise ValueError("Copilot allocation receipt does not match")
+            allocations = list(receipt.allocations)
+            previous = next((row for row in allocations if row.allocation_id == allocation_id), None)
+            truncated = receipt.truncated
+            if browser_session_id is None:
+                if previous is None:
+                    if len(allocations) >= 64:
+                        truncated = True
+                    else:
+                        allocations.append(CopilotBrowserAllocation(allocation_id=allocation_id))
+            elif previous is None:
+                if not truncated:
+                    raise ValueError("Copilot allocation has no recorded intent")
+            elif previous.browser_session_id not in {None, browser_session_id}:
+                raise ValueError("Copilot allocation identity changed")
+            else:
+                allocations[allocations.index(previous)] = previous.model_copy(
+                    update={"browser_session_id": browser_session_id, "created_this_request": True}
+                )
+            receipt = receipt.model_copy(
+                update={
+                    "allocations": allocations,
+                    "truncated": truncated,
+                    "recording_incomplete": truncated or any(row.browser_session_id is None for row in allocations),
+                }
+            )
+            if message is not None:
+                message.turn_outcome = {
+                    **message.turn_outcome,
+                    "request_browser_allocations": receipt.model_dump(mode="json"),
+                }
+            else:
+                if not isinstance(raw_entry, dict):
+                    raise ValueError("Copilot allocation request is unavailable")
+                pending[turn_id] = {**raw_entry, "request_browser_allocations": receipt.model_dump(mode="json")}
+                chat.pending_turns = pending
             await session.commit()
 
     @db_operation("record_superseded_build_test_run")
@@ -2118,7 +2248,11 @@ class WorkflowParametersRepository(BaseRepository):
             query = (
                 select(WorkflowCopilotChatMessageModel)
                 .filter(WorkflowCopilotChatMessageModel.workflow_copilot_chat_id == workflow_copilot_chat_id)
-                .order_by(WorkflowCopilotChatMessageModel.workflow_copilot_chat_message_id.asc())
+                # Within one second, ids follow the worker hash and a wrapping 10-bit sequence, not write order.
+                .order_by(
+                    WorkflowCopilotChatMessageModel.created_at.asc(),
+                    WorkflowCopilotChatMessageModel.workflow_copilot_chat_message_id.asc(),
+                )
             )
             messages = (await session.scalars(query)).all()
             return [convert_to_workflow_copilot_chat_message(message, self.debug_enabled) for message in messages]
@@ -2199,6 +2333,7 @@ class WorkflowParametersRepository(BaseRepository):
     ) -> list[WorkflowCopilotChatSummary]:
         page = max(page, 1)
         page_size = max(min(page_size, 100), 1)
+        folder_filter = await _folder_access_filter(organization_id, WorkflowCopilotChatModel.workflow_permanent_id)
         async with self.Session() as session:
             # Each chat's first message (earliest created_at) is its title source and proves the
             # chat is non-empty; DISTINCT ON keeps one opening row per chat.
@@ -2231,6 +2366,8 @@ class WorkflowParametersRepository(BaseRepository):
             )
             if workflow_permanent_id is not None:
                 query = query.where(WorkflowCopilotChatModel.workflow_permanent_id == workflow_permanent_id)
+            if folder_filter is not None:
+                query = query.where(folder_filter)
             if search and search.strip():
                 # Unindexed substring match over each chat's opening message (one row per chat);
                 # add a pg_trgm index on content if per-org chat counts grow large.

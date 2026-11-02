@@ -59,12 +59,21 @@ export function RunSummaryStrip({
           : null,
       ].filter((chip): chip is string => Boolean(chip));
   // failure_category is untyped JSON on the backend, so guard each entry at runtime.
-  const signedOutProfileId = (Array.isArray(workflowRun.failure_category)
+  const failureEntries = Array.isArray(workflowRun.failure_category)
     ? workflowRun.failure_category
-    : []
-  ).some((entry) => entry?.reason_code === "saved_profile_signed_out")
+    : [];
+  const signedOutProfileId = failureEntries.some(
+    (entry) => entry?.reason_code === "saved_profile_signed_out",
+  )
     ? workflowRun.browser_profile_id
     : null;
+  // Reasons lack session source, so use a general session-list link, not a create CTA.
+  const browserSessionEnded = failureEntries.some(
+    (entry) =>
+      entry?.reason_code === "browser_session_expired_before_run" ||
+      entry?.reason_code === "browser_session_closed" ||
+      entry?.reason_code === "browser_session_startup_timeout",
+  );
   // A run keeps its profile id after the profile is deleted, and the Refresh
   // dialog cannot open for a deleted profile. Cached data stays successful
   // until a refetch fails, so only a settled lookup from this visit counts.
@@ -91,6 +100,14 @@ export function RunSummaryStrip({
             failureCategory={workflowRun.failure_category}
           />
         ) : null}
+        {!statusUnavailable && browserSessionEnded ? (
+          <Link
+            to="/browser-sessions"
+            className="whitespace-nowrap text-blue-700 hover:underline dark:text-blue-400 dark:hover:text-blue-300"
+          >
+            Review browser sessions
+          </Link>
+        ) : null}
         {!statusUnavailable &&
         signedOutProfileId &&
         signedOutProfile.isSuccess &&
@@ -98,7 +115,7 @@ export function RunSummaryStrip({
         !signedOutProfile.isFetching ? (
           <Link
             to={`/browser-profiles/${signedOutProfileId}?refresh=1`}
-            className="whitespace-nowrap text-blue-400 hover:text-blue-300"
+            className="whitespace-nowrap text-blue-700 hover:underline dark:text-blue-400 dark:hover:text-blue-300"
           >
             Sign in again to refresh
           </Link>

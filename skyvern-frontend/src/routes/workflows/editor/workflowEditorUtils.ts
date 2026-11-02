@@ -42,14 +42,17 @@ import {
   type Parameter,
   type WorkflowApiResponse,
   type WorkflowBlock,
+  type WorkflowBlockDocFields,
   type WorkflowSettings,
   type ConditionalBlock,
   type ForLoopBlock,
   type WhileLoopBlock,
+  type WorkflowModel,
   isNestedLoopWorkflowBlock,
 } from "../types/workflowTypes";
 import {
   ActionBlockYAML,
+  AgentStepBlockYAML,
   BlockYAML,
   CodeBlockYAML,
   ConditionalBlockYAML,
@@ -83,6 +86,7 @@ import {
   EmailInboxBlockYAML,
   GoogleSheetsReadBlockYAML,
   GoogleSheetsWriteBlockYAML,
+  PowerBIQueryBlockYAML,
   PdfFillBlockYAML,
   SplitPdfBlockYAML,
 } from "../types/workflowYamlTypes";
@@ -159,6 +163,10 @@ import {
   isTerminateNode,
   terminateNodeDefaultData,
 } from "./nodes/TerminateNode/types";
+import {
+  agentStepNodeDefaultData,
+  isAgentStepNode,
+} from "./nodes/AgentStepNode/types";
 import { isWaitNode, waitNodeDefaultData } from "./nodes/WaitNode/types";
 import {
   fileDownloadNodeDefaultData,
@@ -203,6 +211,12 @@ import {
 } from "./nodes/GoogleSheetsWriteNode/types";
 import { validateGoogleSheetsWriteNode } from "./nodes/GoogleSheetsWriteNode/validate";
 import {
+  POWERBI_QUERY_DEFAULT_MAX_ROWS,
+  isPowerBIQueryNode,
+  powerBIQueryNodeDefaultData,
+} from "./nodes/PowerBIQueryNode/types";
+import { validatePowerBIQueryNode } from "./nodes/PowerBIQueryNode/validate";
+import {
   isPdfFillNode,
   pdfFillNodeDefaultData,
 } from "./nodes/PdfFillNode/types";
@@ -213,10 +227,14 @@ import {
 } from "./nodes/SplitPdfNode/types";
 import { validateSplitPdfNode } from "./nodes/SplitPdfNode/validate";
 import {
+  blockDeleteTarget,
   containsJinjaReference,
+  descendants,
   getAffectedBlocks,
-  removeJinjaReference,
+  removeJinjaReferenceFromNodes,
   replaceJinjaReference,
+  SKIP_KEYS_FOR_JINJA_CHECK,
+  transformStringFieldsInObject,
   type AffectedBlock,
 } from "./jinjaReferences";
 import {
@@ -236,7 +254,34 @@ export function inferBranchCriteriaTypeFromExpression(
   return BranchCriteriaTypes.Prompt;
 }
 
+// Loaded only when set, so a block without them (or with the server's null default)
+// saves exactly as it would without these fields.
+function docFieldsFromBlock(
+  block: WorkflowBlockDocFields,
+): Pick<NodeBaseData, "notes" | "trailingNotes" | "description"> {
+  return {
+    ...(block.notes != null && { notes: block.notes }),
+    ...(block.trailing_notes != null && {
+      trailingNotes: block.trailing_notes,
+    }),
+    ...(block.description != null && { description: block.description }),
+  };
+}
+
+function docFieldsFromNodeData(
+  data: Pick<NodeBaseData, "notes" | "trailingNotes" | "description">,
+): WorkflowBlockDocFields {
+  return {
+    ...(data.notes != null && { notes: data.notes }),
+    ...(data.trailingNotes != null && {
+      trailing_notes: data.trailingNotes,
+    }),
+    ...(data.description != null && { description: data.description }),
+  };
+}
+
 function buildWhileLoopBlockYAML(args: {
+  docFields: WorkflowBlockDocFields;
   label: string;
   continue_on_failure: boolean;
   next_loop_on_failure: boolean;
@@ -260,6 +305,7 @@ function buildWhileLoopBlockYAML(args: {
       expression: args.expression,
       description: args.description,
     },
+    ...args.docFields,
   };
 }
 
@@ -269,6 +315,7 @@ function serializeLoopNodeWhileBranchToYAML(
   nextBlockLabel: string | null,
 ): WhileLoopBlockYAML {
   return buildWhileLoopBlockYAML({
+    docFields: docFieldsFromNodeData(node.data),
     label: node.data.label,
     continue_on_failure: node.data.continueOnFailure,
     next_loop_on_failure: node.data.nextLoopOnFailure ?? false,
@@ -351,16 +398,6 @@ function layoutUtil(
     }),
     edges,
   };
-}
-
-// Returns descendants of `id` in topological order: a node's parent always
-// appears earlier in the array than the node itself. Callers that walk the
-// result and read parent state from a per-node map (see
-// applyDescendantCollapseVisibility / updateNodeAndDescendantsVisibility)
-// rely on this contract.
-export function descendants(nodes: Array<AppNode>, id: string): Array<AppNode> {
-  const children = nodes.filter((n) => n.parentId === id);
-  return children.concat(...children.map((c) => descendants(nodes, c.id)));
 }
 
 /**
@@ -806,6 +843,7 @@ function convertToNode(
     editable,
     model: block.model,
     ignoreWorkflowSystemPrompt: block.ignore_workflow_system_prompt ?? false,
+    ...docFieldsFromBlock(block),
   };
   switch (block.block_type) {
     case "conditional": {
@@ -1061,6 +1099,21 @@ function convertToNode(
         },
       };
     }
+    case "agent_step": {
+      return {
+        ...identifiers,
+        ...common,
+        type: "agentStep",
+        data: {
+          ...commonData,
+          prompt: block.prompt,
+          dataSchema: JSON.stringify(block.data_schema, null, 2),
+          maxTurns: block.max_turns,
+          tools: block.tools ?? [],
+          parameterKeys: (block.parameters ?? []).map((p) => p.key),
+        },
+      };
+    }
     case "file_download": {
       return {
         ...identifiers,
@@ -1101,6 +1154,7 @@ function convertToNode(
           sftpPrivateKeyPassphrase: block.sftp_private_key_passphrase ?? "",
           sftpRemotePath: block.sftp_remote_path ?? "",
           sftpHostKey: block.sftp_host_key ?? "",
+          sftpSourcePath: block.sftp_source_path ?? "",
           continueOnEmpty: block.continue_on_empty ?? false,
         },
       };
@@ -1259,6 +1313,7 @@ function convertToNode(
           fileType: block.file_type ?? "auto_detect",
           jsonSchema: JSON.stringify(block.json_schema, null, 2),
           worksheet: block.worksheet ?? "",
+          forceOcr: block.force_ocr ?? false,
           model: block.model,
         },
       };
@@ -1468,6 +1523,7 @@ function convertToNode(
           newerThanDays: block.newer_than_days ?? null,
           maxResults: block.max_results ?? 25,
           includeBody: block.include_body ?? true,
+          downloadAttachments: block.download_attachments ?? false,
           parameterKeys: (block.parameters ?? []).map((p) => p.key),
         },
       };
@@ -1484,6 +1540,21 @@ function convertToNode(
           range: block.range ?? "",
           credentialId: block.credential_id ?? "",
           hasHeaderRow: block.has_header_row ?? true,
+          parameterKeys: (block.parameters ?? []).map((p) => p.key),
+        },
+      };
+    }
+    case "powerbi_query": {
+      return {
+        ...identifiers,
+        ...common,
+        type: "powerBIQuery",
+        data: {
+          ...commonData,
+          connectionId: block.connection_id ?? "",
+          datasetId: block.dataset_id ?? "",
+          query: block.query ?? "",
+          maxRows: block.max_rows ?? POWERBI_QUERY_DEFAULT_MAX_ROWS,
           parameterKeys: (block.parameters ?? []).map((p) => p.key),
         },
       };
@@ -1569,6 +1640,7 @@ function serializeConditionalBlock(
     // conditional's own next_block_label when no branch target applies.
     next_block_label: mergeIsInferred ? null : mergeLabel,
     branch_conditions: branchConditions,
+    ...docFieldsFromNodeData(node.data),
   };
 }
 
@@ -2917,6 +2989,17 @@ function createNode(
         },
       };
     }
+    case "agentStep": {
+      return {
+        ...identifiers,
+        ...common,
+        type: "agentStep",
+        data: {
+          ...agentStepNodeDefaultData,
+          label,
+        },
+      };
+    }
     case "fileDownload": {
       return {
         ...identifiers,
@@ -3137,6 +3220,17 @@ function createNode(
         },
       };
     }
+    case "powerBIQuery": {
+      return {
+        ...identifiers,
+        ...common,
+        type: "powerBIQuery",
+        data: {
+          ...powerBIQueryNodeDefaultData,
+          label,
+        },
+      };
+    }
     case "googleSheetsWrite": {
       return {
         ...identifiers,
@@ -3225,6 +3319,7 @@ function serializeLoopNodeToYAML(
     complete_if_empty: node.data.completeIfEmpty,
     data_schema: JSONSafeOrString(node.data.dataSchema),
     loop_over_parameter_key: node.data.loopValue ?? "",
+    ...docFieldsFromNodeData(node.data),
   };
 }
 
@@ -3323,6 +3418,13 @@ function findNextBlockLabel(
   return null;
 }
 
+// Navigation blocks used to default to `{ model_name: "" }`, which is not an override.
+function blockModelOverride(
+  model: WorkflowModel | null | undefined,
+): WorkflowModel | null {
+  return model?.model_name ? model : null;
+}
+
 function getWorkflowBlock(
   node: WorkflowBlockNode,
   nodes: Array<AppNode>,
@@ -3335,10 +3437,11 @@ function getWorkflowBlock(
     label: node.data.label,
     continue_on_failure: node.data.continueOnFailure,
     next_loop_on_failure: node.data.nextLoopOnFailure,
-    model: node.data.model,
+    model: blockModelOverride(node.data.model),
     next_block_label: nextBlockLabel,
     ignore_workflow_system_prompt:
       node.data.ignoreWorkflowSystemPrompt ?? false,
+    ...docFieldsFromNodeData(node.data),
   };
   switch (node.type) {
     case "task": {
@@ -3545,6 +3648,17 @@ function getWorkflowBlock(
         error_code: node.data.errorCode.trim() || null,
       };
     }
+    case "agentStep": {
+      return {
+        ...base,
+        block_type: "agent_step",
+        prompt: node.data.prompt,
+        data_schema: JSONSafeOrString(node.data.dataSchema),
+        max_turns: node.data.maxTurns,
+        tools: node.data.tools,
+        parameter_keys: node.data.parameterKeys,
+      };
+    }
     case "fileDownload": {
       return {
         ...base,
@@ -3592,22 +3706,26 @@ function getWorkflowBlock(
             ...(node.data.downloadTarget === "google_drive" && {
               google_drive_folder_id: node.data.googleDriveFolderId ?? "",
             }),
-            ...(node.data.downloadTarget === "sftp" && {
-              sftp_host: node.data.sftpHost ?? "",
-              sftp_port:
-                node.data.sftpPort &&
-                Number.isFinite(Number(node.data.sftpPort))
-                  ? Number(node.data.sftpPort)
-                  : null,
-              sftp_username: node.data.sftpUsername ?? "",
-              sftp_password: node.data.sftpPassword ?? "",
-              sftp_private_key: node.data.sftpPrivateKey ?? "",
-              sftp_private_key_passphrase:
-                node.data.sftpPrivateKeyPassphrase ?? "",
-              sftp_remote_path: node.data.sftpRemotePath ?? "",
-              sftp_host_key: node.data.sftpHostKey ?? "",
-            }),
           }),
+        ...((node.data.downloadTarget === "sftp" ||
+          node.data.sftpSourcePath) && {
+          sftp_host: node.data.sftpHost ?? "",
+          sftp_port:
+            node.data.sftpPort && Number.isFinite(Number(node.data.sftpPort))
+              ? Number(node.data.sftpPort)
+              : null,
+          sftp_username: node.data.sftpUsername ?? "",
+          sftp_password: node.data.sftpPassword ?? "",
+          sftp_private_key: node.data.sftpPrivateKey ?? "",
+          sftp_private_key_passphrase: node.data.sftpPrivateKeyPassphrase ?? "",
+          sftp_host_key: node.data.sftpHostKey ?? "",
+          ...(node.data.downloadTarget === "sftp" && {
+            sftp_remote_path: node.data.sftpRemotePath ?? "",
+          }),
+          ...(node.data.sftpSourcePath && {
+            sftp_source_path: node.data.sftpSourcePath,
+          }),
+        }),
       };
     }
     case "sendEmail": {
@@ -3741,6 +3859,7 @@ function getWorkflowBlock(
         file_type: node.data.fileType,
         json_schema: JSONParseSafe(node.data.jsonSchema),
         worksheet: node.data.worksheet || null,
+        force_ocr: node.data.forceOcr ?? false,
       };
     }
     case "textPrompt": {
@@ -3883,6 +4002,7 @@ function getWorkflowBlock(
         newer_than_days: node.data.newerThanDays,
         max_results: node.data.maxResults,
         include_body: node.data.includeBody,
+        download_attachments: node.data.downloadAttachments,
         parameter_keys: node.data.parameterKeys,
       };
     }
@@ -3895,6 +4015,17 @@ function getWorkflowBlock(
         range: node.data.range || null,
         credential_id: node.data.credentialId || null,
         has_header_row: node.data.hasHeaderRow,
+        parameter_keys: node.data.parameterKeys,
+      };
+    }
+    case "powerBIQuery": {
+      return {
+        ...base,
+        block_type: "powerbi_query",
+        connection_id: node.data.connectionId,
+        dataset_id: node.data.datasetId,
+        query: node.data.query,
+        max_rows: node.data.maxRows,
         parameter_keys: node.data.parameterKeys,
       };
     }
@@ -4226,14 +4357,19 @@ function getWorkflowSettings(nodes: Array<AppNode>): WorkflowSettings {
   return defaultSettings;
 }
 
-function generateNodeLabel(existingLabels: Array<string>) {
-  for (let i = 1; i < existingLabels.length + 2; i++) {
+function generateNodeLabel(
+  existingLabels: Array<string>,
+  parameterKeys: readonly string[] = [],
+) {
+  for (let i = 1; ; i++) {
     const label = NEW_NODE_LABEL_PREFIX + i;
-    if (!existingLabels.includes(label)) {
+    if (
+      !existingLabels.includes(label) &&
+      !getLabelOutputParameterKeyCollision(label, parameterKeys)
+    ) {
       return label;
     }
   }
-  throw new Error("Failed to generate a new node label");
 }
 
 function convertEchoParameters(
@@ -4271,72 +4407,6 @@ function getBlockNameOfOutputParameterKey(value: string) {
 // below keep existing in-repo call sites (rename flow, parameter-key
 // updater) compiling unchanged; source of truth is `jinjaReferences.ts`.
 
-// Maximum recursion depth to prevent stack overflow from malicious deeply nested objects
-const MAX_TRANSFORM_DEPTH = 50;
-
-/**
- * Recursively processes all string fields in an object and applies a transformation function.
- * @param obj - The object to process
- * @param transform - Function that transforms string values
- * @param skipKeys - Set of keys to skip (e.g., 'label' which shouldn't be modified)
- * @param depth - Current recursion depth (internal use)
- * @returns A new object with transformed string values
- */
-function transformStringFieldsInObject<T>(
-  obj: T,
-  transform: (value: string) => string,
-  skipKeys: Set<string>,
-  depth: number = 0,
-): T {
-  // Prevent stack overflow from deeply nested objects
-  if (depth > MAX_TRANSFORM_DEPTH) {
-    return obj;
-  }
-
-  if (obj === null || obj === undefined) {
-    return obj;
-  }
-
-  if (typeof obj === "string") {
-    return transform(obj) as T;
-  }
-
-  if (Array.isArray(obj)) {
-    return obj.map((item) =>
-      transformStringFieldsInObject(item, transform, skipKeys, depth + 1),
-    ) as T;
-  }
-
-  if (typeof obj === "object") {
-    const result: Record<string, unknown> = {};
-    for (const [key, value] of Object.entries(obj)) {
-      if (skipKeys.has(key)) {
-        result[key] = value;
-      } else {
-        result[key] = transformStringFieldsInObject(
-          value,
-          transform,
-          skipKeys,
-          depth + 1,
-        );
-      }
-    }
-    return result as T;
-  }
-
-  return obj;
-}
-
-// Keys to skip when transforming string fields in node data
-const SKIP_KEYS_FOR_JINJA_TRANSFORM = new Set([
-  "label",
-  "key",
-  "type",
-  "id",
-  "nodeId",
-  "parameterKeys", // handled separately
-]);
-
 /**
  * Replaces all jinja-style references to a variable across all nodes.
  * Handles patterns like {{oldKey}}, {{oldKey.field}}, {{oldKey | filter}}.
@@ -4359,34 +4429,7 @@ function replaceJinjaReferenceInNodes<T extends Node>(
       data: transformStringFieldsInObject(
         node.data,
         (text) => replaceJinjaReference(text, oldKey, newKey),
-        SKIP_KEYS_FOR_JINJA_TRANSFORM,
-      ),
-    };
-  });
-}
-
-/**
- * Removes all jinja-style references to a variable across all nodes.
- * Handles patterns like {{key}}, {{key.field}}, {{key | filter}}.
- * Returns a new array of nodes with updated data (immutable).
- *
- * Note: This only handles inline {{ variable }} references in string fields.
- * The parameterKeys array should be updated separately.
- */
-function removeJinjaReferenceFromNodes<T extends Node>(
-  nodes: T[],
-  key: string,
-): T[] {
-  return nodes.map((node) => {
-    if (!node.data) {
-      return node;
-    }
-    return {
-      ...node,
-      data: transformStringFieldsInObject(
-        node.data,
-        (text) => removeJinjaReference(text, key),
-        SKIP_KEYS_FOR_JINJA_TRANSFORM,
+        SKIP_KEYS_FOR_JINJA_CHECK,
       ),
     };
   });
@@ -4439,6 +4482,13 @@ function removeKeyFromNodesParameterKeys<T extends Node>(
             loopData.loopVariableReference === keyToRemove
               ? ""
               : loopData.loopVariableReference,
+          loopValue:
+            loopData.loopValue === keyToRemove ? "" : loopData.loopValue,
+          ...(Array.isArray(loopData.parameterKeys) && {
+            parameterKeys: loopData.parameterKeys.filter(
+              (key) => key !== keyToRemove,
+            ),
+          }),
         },
       } as T;
     }
@@ -4472,6 +4522,12 @@ function getUpdatedNodesAfterLabelUpdateForParameterKeys(
   const oldLabel = labelUpdatedNode.data.label as string;
   const oldOutputKey = getOutputParameterKey(oldLabel);
   const newOutputKey = getOutputParameterKey(newLabel);
+  const rewriteLoopSource = (value: string) =>
+    value === oldOutputKey ||
+    value.startsWith(`${oldOutputKey}.`) ||
+    value.startsWith(`${oldOutputKey}[`)
+      ? newOutputKey + value.slice(oldOutputKey.length)
+      : value;
 
   // Step 1: Update inline {{ old_output }} references to {{ new_output }}
   const nodesWithUpdatedRefs = replaceJinjaReferenceInNodes(
@@ -4496,18 +4552,15 @@ function getUpdatedNodesAfterLabelUpdateForParameterKeys(
       return node;
     }
 
-    // Handle loop node's loopVariableReference (the active field displayed in UI).
-    // Note: loopValue is a legacy field populated during conversion for backward compatibility.
-    // It's not displayed in UI or sent to backend, so we only update loopVariableReference.
-    if (node.type === "loop") {
+    if (isLoopNode(node)) {
       return {
         ...node,
         data: {
           ...node.data,
-          loopVariableReference:
-            node.data.loopVariableReference === oldOutputKey
-              ? newOutputKey
-              : node.data.loopVariableReference,
+          loopVariableReference: rewriteLoopSource(
+            node.data.loopVariableReference,
+          ),
+          loopValue: rewriteLoopSource(node.data.loopValue),
           label: node.id === id ? newLabel : node.data.label,
         },
       };
@@ -4577,20 +4630,31 @@ function getUpdatedParametersAfterLabelUpdateForSourceParameterKey(
   });
 }
 
+function getLabelOutputParameterKeyCollision(
+  label: string,
+  parameterKeys: readonly string[],
+) {
+  const outputKey = getOutputParameterKey(label);
+  return parameterKeys.includes(outputKey) ? outputKey : null;
+}
+
 function getUniqueLabelForExistingNode(
   label: string,
   existingLabels: Array<string>,
+  parameterKeys: readonly string[],
 ) {
-  if (!existingLabels.includes(label)) {
+  const isTaken = (candidate: string) =>
+    existingLabels.includes(candidate) ||
+    getLabelOutputParameterKeyCollision(candidate, parameterKeys) !== null;
+  if (!isTaken(label)) {
     return label;
   }
-  for (let i = 2; i < existingLabels.length + 1; i++) {
+  for (let i = 2; ; i++) {
     const candidate = `${label}_${i}`;
-    if (!existingLabels.includes(candidate)) {
+    if (!isTaken(candidate)) {
       return candidate;
     }
   }
-  return label;
 }
 
 function getDefaultValueForParameterType(
@@ -4698,6 +4762,8 @@ function leavesBrowserState(node: AppNode, nodes: Array<AppNode>): boolean {
     case "url":
       return true;
     case "fileDownload":
+      // An SFTP source bypasses super().execute entirely, so it leaves no page.
+      if (node.data.sftpSourcePath) return false;
       // A Drive source download is fetched through the Drive API and skips
       // super().execute entirely, so it leaves no page for a later block to
       // start from. A maybe counts as the Drive path, which keeps the warning.
@@ -4966,6 +5032,7 @@ function convertBlocksToBlockYAML(
       next_block_label: block.next_block_label,
       ignore_workflow_system_prompt:
         block.ignore_workflow_system_prompt ?? false,
+      ...docFieldsFromNodeData(docFieldsFromBlock(block)),
     };
     switch (block.block_type) {
       case "task": {
@@ -5078,7 +5145,7 @@ function convertBlocksToBlockYAML(
           url: block.url,
           title: block.title,
           ...blockEngineYAML(block, effectiveDefaultEngine),
-          model: block.model,
+          model: blockModelOverride(block.model),
           navigation_goal: block.navigation_goal,
           error_code_mapping: block.error_code_mapping,
           max_retries: block.max_retries,
@@ -5155,6 +5222,18 @@ function convertBlocksToBlockYAML(
         };
         return blockYaml;
       }
+      case "agent_step": {
+        const blockYaml: AgentStepBlockYAML = {
+          ...base,
+          block_type: "agent_step",
+          prompt: block.prompt,
+          data_schema: block.data_schema,
+          max_turns: block.max_turns,
+          tools: block.tools ?? null,
+          parameter_keys: (block.parameters ?? []).map((p) => p.key),
+        };
+        return blockYaml;
+      }
       case "file_download": {
         const blockYaml: FileDownloadBlockYAML = {
           ...base,
@@ -5196,18 +5275,23 @@ function convertBlocksToBlockYAML(
               ...(block.download_target === "google_drive" && {
                 google_drive_folder_id: block.google_drive_folder_id ?? "",
               }),
-              ...(block.download_target === "sftp" && {
-                sftp_host: block.sftp_host ?? "",
-                sftp_port: block.sftp_port ?? null,
-                sftp_username: block.sftp_username ?? "",
-                sftp_password: block.sftp_password ?? "",
-                sftp_private_key: block.sftp_private_key ?? "",
-                sftp_private_key_passphrase:
-                  block.sftp_private_key_passphrase ?? "",
-                sftp_remote_path: block.sftp_remote_path ?? "",
-                sftp_host_key: block.sftp_host_key ?? "",
-              }),
             }),
+          ...((block.download_target === "sftp" || block.sftp_source_path) && {
+            sftp_host: block.sftp_host ?? "",
+            sftp_port: block.sftp_port ?? null,
+            sftp_username: block.sftp_username ?? "",
+            sftp_password: block.sftp_password ?? "",
+            sftp_private_key: block.sftp_private_key ?? "",
+            sftp_private_key_passphrase:
+              block.sftp_private_key_passphrase ?? "",
+            sftp_host_key: block.sftp_host_key ?? "",
+            ...(block.download_target === "sftp" && {
+              sftp_remote_path: block.sftp_remote_path ?? "",
+            }),
+            ...(block.sftp_source_path && {
+              sftp_source_path: block.sftp_source_path,
+            }),
+          }),
         };
         return blockYaml;
       }
@@ -5332,6 +5416,7 @@ function convertBlocksToBlockYAML(
           file_type: block.file_type,
           json_schema: block.json_schema,
           worksheet: block.worksheet,
+          force_ocr: block.force_ocr,
         };
         return blockYaml;
       }
@@ -5393,7 +5478,7 @@ function convertBlocksToBlockYAML(
         const blockYaml: WebSearchBlockYAML = {
           ...base,
           block_type: "web_search",
-          model: block.model,
+          model: blockModelOverride(block.model),
           query: block.query,
           provider: block.provider,
           num_results: block.num_results,
@@ -5487,6 +5572,7 @@ function convertBlocksToBlockYAML(
           newer_than_days: block.newer_than_days,
           max_results: block.max_results,
           include_body: block.include_body,
+          download_attachments: block.download_attachments,
           parameter_keys: (block.parameters ?? []).map((p) => p.key),
         };
         return blockYaml;
@@ -5500,6 +5586,18 @@ function convertBlocksToBlockYAML(
           range: block.range,
           credential_id: block.credential_id,
           has_header_row: block.has_header_row,
+          parameter_keys: (block.parameters ?? []).map((p) => p.key),
+        };
+        return blockYaml;
+      }
+      case "powerbi_query": {
+        const blockYaml: PowerBIQueryBlockYAML = {
+          ...base,
+          block_type: "powerbi_query",
+          connection_id: block.connection_id,
+          dataset_id: block.dataset_id,
+          query: block.query,
+          max_rows: block.max_rows ?? POWERBI_QUERY_DEFAULT_MAX_ROWS,
           parameter_keys: (block.parameters ?? []).map((p) => p.key),
         };
         return blockYaml;
@@ -6001,6 +6099,36 @@ function getWorkflowErrors(nodes: Array<AppNode>): Array<string> {
     }
   });
 
+  nodes.filter(isAgentStepNode).forEach((node) => {
+    if (node.data.prompt.trim().length === 0) {
+      errors.push(`${node.data.label}: Prompt is required.`);
+    }
+    if (node.data.tools.length === 0) {
+      errors.push(`${node.data.label}: Choose at least one tool.`);
+    }
+    let dataSchema: unknown;
+    try {
+      dataSchema = JSON.parse(node.data.dataSchema);
+    } catch (error) {
+      errors.push(
+        `${node.data.label}: Data schema is not valid JSON: ${getJsonParseErrorDetail(
+          node.data.dataSchema,
+          error,
+        )}`,
+      );
+      return;
+    }
+    if (
+      typeof dataSchema !== "object" ||
+      dataSchema === null ||
+      (dataSchema as { type?: unknown }).type !== "object"
+    ) {
+      errors.push(
+        `${node.data.label}: Data schema must describe an object ("type": "object").`,
+      );
+    }
+  });
+
   nodes.filter(isTerminateNode).forEach((node) => {
     if (node.data.reason.trim() === "") {
       errors.push(`${node.data.label}: Reason is required.`);
@@ -6111,6 +6239,9 @@ function getWorkflowErrors(nodes: Array<AppNode>): Array<string> {
   nodes
     .filter(isGoogleSheetsReadNode)
     .forEach((node) => errors.push(...validateGoogleSheetsReadNode(node)));
+  nodes
+    .filter(isPowerBIQueryNode)
+    .forEach((node) => errors.push(...validatePowerBIQueryNode(node)));
 
   nodes
     .filter(isEmailInboxNode)
@@ -6197,9 +6328,11 @@ function getParentLoopSkipsOnFail(
 export {
   blockEngineForWorkflow,
   workflowEffectiveDefaultEngine,
+  blockDeleteTarget,
   containsJinjaReference,
   convert,
   convertEchoParameters,
+  descendants,
   convertToNode,
   createNode,
   generateNodeData,
@@ -6218,6 +6351,7 @@ export {
   getWorkflowSettings,
   getOrderedChildrenBlocks,
   getOutputParameterKey,
+  getLabelOutputParameterKeyCollision,
   getPreviousNodeIds,
   getUniqueLabelForExistingNode,
   getUpdatedNodesAfterLabelUpdateForParameterKeys,

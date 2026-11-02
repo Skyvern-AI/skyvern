@@ -6,19 +6,18 @@ from typing import Any
 import httpx
 import pytest
 import pytest_asyncio
-from fastapi import FastAPI
 from sqlalchemy import event
 from sqlalchemy.ext.asyncio import AsyncEngine
 
 from skyvern.forge.agent import ForgeAgent
 from skyvern.forge.sdk.db.agent_db import AgentDB
 from skyvern.forge.sdk.routes import agent_protocol
-from skyvern.forge.sdk.routes.routers import base_router, legacy_base_router
 from skyvern.forge.sdk.schemas.organizations import Organization
 from skyvern.forge.sdk.services import org_auth_service
 from skyvern.forge.sdk.workflow.service import WorkflowService
 from skyvern.schemas.run_enums import RunType
 from skyvern.schemas.workflows import BlockStatus, BlockType
+from tests.unit.shared_route_app import shared_route_app
 
 ORG_ID = "o_timeline"
 OTHER_ORG_ID = "o_timeline_other"
@@ -101,9 +100,7 @@ async def harness(monkeypatch: pytest.MonkeyPatch, sqlite_engine: AsyncEngine) -
 
     now = datetime.now(UTC)
     organization = Organization(organization_id=ORG_ID, organization_name="Timeline", created_at=now, modified_at=now)
-    fastapi_app = FastAPI()
-    fastapi_app.include_router(base_router, prefix="/v1")
-    fastapi_app.include_router(legacy_base_router, prefix="/api/v1")
+    fastapi_app = shared_route_app(monkeypatch)
     fastapi_app.dependency_overrides[org_auth_service.get_current_org] = lambda: organization
 
     statements: list[str] = []

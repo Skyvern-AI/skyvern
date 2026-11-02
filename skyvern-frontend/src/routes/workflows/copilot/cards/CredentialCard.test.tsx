@@ -344,7 +344,16 @@ describe("CredentialCard sign in myself", () => {
     ...overrides,
   });
 
-  it("offers signing in yourself only when the chat passes an offer", () => {
+  const SIGN_IN_LABEL = "Sign in myself (this test only)";
+  const SCOPE_WARNING =
+    "Signing in yourself works for this test. Later runs usually won't stay signed in — connect a credential so every run can sign in.";
+  const follows = (later: Element, earlier: Element) =>
+    Boolean(
+      earlier.compareDocumentPosition(later) & Node.DOCUMENT_POSITION_FOLLOWING,
+    );
+
+  it("offers signing in yourself only when the chat passes an offer", async () => {
+    credsData.current = [{ credential_id: "cred_hn", name: "HN login" }];
     const offer = signIn();
     render(
       <CredentialCard
@@ -355,7 +364,17 @@ describe("CredentialCard sign in myself", () => {
         signIn={offer}
       />,
     );
-    fireEvent.click(screen.getByRole("button", { name: "Sign in myself" }));
+    const picker = await screen.findByRole("combobox");
+    const control = screen.getByRole("button", { name: SIGN_IN_LABEL });
+    expect(control.className).not.toContain("bg-cta");
+    expect(control.className).not.toContain("border-input");
+    const connect = screen.getByRole("button", { name: "Connect credential" });
+    const skip = screen.getByRole("button", { name: "Skip for now" });
+    expect(follows(control, connect)).toBe(true);
+    expect(follows(control, picker)).toBe(true);
+    expect(follows(skip, control)).toBe(true);
+    expect(screen.getByText(SCOPE_WARNING)).toBeTruthy();
+    fireEvent.click(control);
     expect(offer.onStart).toHaveBeenCalledTimes(1);
     cleanup();
 
@@ -367,7 +386,8 @@ describe("CredentialCard sign in myself", () => {
         onSkip={vi.fn()}
       />,
     );
-    expect(screen.queryByRole("button", { name: "Sign in myself" })).toBeNull();
+    expect(screen.queryByRole("button", { name: SIGN_IN_LABEL })).toBeNull();
+    expect(screen.queryByText(SCOPE_WARNING)).toBeNull();
   });
 
   it("while signing in, Done finishes, Cancel skips, and a Done that found nothing says so", () => {
@@ -385,6 +405,11 @@ describe("CredentialCard sign in myself", () => {
     expect(
       screen.getAllByText(/No sign-in found for portal\.example\.com/),
     ).not.toHaveLength(0);
+    expect(
+      screen.getByText(
+        "Use the browser to sign in, including any verification code, then click Done. This sign-in is for this test; later runs usually won't stay signed in. No password is stored.",
+      ),
+    ).toBeTruthy();
     fireEvent.click(screen.getByRole("button", { name: "Done" }));
     fireEvent.click(screen.getByRole("button", { name: "Cancel" }));
     expect(offer.onDone).toHaveBeenCalledTimes(1);
@@ -423,8 +448,13 @@ describe("CredentialCard sign in myself", () => {
         onSkip={vi.fn()}
       />,
     );
+    expect(screen.getByText("Signed in for this test only")).toBeTruthy();
+    expect(screen.getByText(/saved as 'Sign-in for portal'/)).toBeTruthy();
+    fireEvent.click(screen.getByRole("button", { expanded: false }));
     expect(
-      screen.getByText("Signed in, saved as 'Sign-in for portal'"),
+      screen.getByText(
+        "For this test · later runs usually won't stay signed in · no password stored",
+      ),
     ).toBeTruthy();
   });
 });
@@ -1952,7 +1982,146 @@ describe("CredentialCard missing-authenticator ask", () => {
         onSkip={vi.fn()}
       />,
     );
-    expect(screen.getByText(/keeps its saved sign-in/)).toBeTruthy();
+    expect(screen.getByText("Credential not updated")).toBeTruthy();
+    expect(screen.queryByText(/keeps its saved sign-in/)).toBeNull();
+    expect(screen.queryByText(/not used by the saved workflow/)).toBeNull();
+
+    for (const binding of [
+      "saved_workflow",
+      "matched_by_saved_url",
+      "not_bound",
+    ] as const) {
+      rerender(
+        <CredentialCard
+          frame={{ ...rejectedFrame, credential_binding: binding }}
+          mode="inline-pause"
+          resolvedOutcome={{ outcome: "skipped" }}
+          onConnect={vi.fn()}
+          onSkip={vi.fn()}
+        />,
+      );
+      expect(screen.queryByText(/keeps its saved sign-in/) !== null).toBe(
+        binding === "saved_workflow",
+      );
+      expect(
+        screen.queryByText(/not used by the saved workflow/) !== null,
+      ).toBe(binding !== "saved_workflow");
+    }
+  });
+
+  it("offers signing in yourself on an update card and restores Done and Cancel while signing in", async () => {
+    const record = { credential_id: "cred_hn", name: "HN login" };
+    credsData.current = [record];
+    const offer = {
+      busy: false,
+      onStart: vi.fn(),
+      onDone: vi.fn(),
+    } satisfies ManualSignInOffer;
+    const onSkip = vi.fn();
+    const urlMatched = {
+      ...CREDENTIAL_REQUIRED_FRAME_BY_REASON.credential_rejected_by_site,
+      credential_binding: "matched_by_saved_url" as const,
+    };
+    const queryClient = new QueryClient({
+      defaultOptions: { queries: { retry: false } },
+    });
+    const card = (frame: typeof urlMatched) => (
+      <QueryClientProvider client={queryClient}>
+        <CredentialCard
+          frame={frame}
+          mode="inline-pause"
+          onConnect={vi.fn()}
+          onSkip={onSkip}
+          onUpdateCredential={vi.fn()}
+          signIn={offer}
+        />
+      </QueryClientProvider>
+    );
+    const { rerender } = render(card(urlMatched));
+
+    expect(
+      screen.getByText(
+        "Copilot chose this saved login because its saved URL matches this page. Updating it changes it everywhere it is used.",
+      ),
+    ).toBeTruthy();
+    const update = screen.getByRole("button", { name: "Update credential" });
+    await waitFor(() =>
+      expect((update as HTMLButtonElement).disabled).toBe(false),
+    );
+    fireEvent.click(
+      screen.getByRole("button", { name: "Sign in myself (this test only)" }),
+    );
+    expect(offer.onStart).toHaveBeenCalledTimes(1);
+
+    rerender(card({ ...urlMatched, signing_in: true }));
+    fireEvent.click(screen.getByRole("button", { name: "Done" }));
+    fireEvent.click(screen.getByRole("button", { name: "Cancel" }));
+    expect(offer.onDone).toHaveBeenCalledTimes(1);
+    expect(onSkip).toHaveBeenCalledTimes(1);
+    expect(
+      screen.getByRole("button", { name: "Update credential" }),
+    ).toBeTruthy();
+    expect(
+      screen.queryByRole("button", { name: "Connect credential" }),
+    ).toBeNull();
+  });
+
+  it.each(["saved_workflow", "not_bound", null] as const)(
+    "keeps the rejected card's usual why-line when the binding is %s",
+    (binding) => {
+      credsData.current = [{ credential_id: "cred_hn", name: "HN login" }];
+      const queryClient = new QueryClient({
+        defaultOptions: { queries: { retry: false } },
+      });
+      render(
+        <QueryClientProvider client={queryClient}>
+          <CredentialCard
+            frame={{
+              ...CREDENTIAL_REQUIRED_FRAME_BY_REASON.credential_rejected_by_site,
+              credential_binding: binding,
+            }}
+            mode="inline-pause"
+            onConnect={vi.fn()}
+            onSkip={vi.fn()}
+          />
+        </QueryClientProvider>,
+      );
+      expect(
+        screen.getByText(
+          CREDENTIAL_WHY_LINE_BY_REASON.credential_rejected_by_site,
+        ),
+      ).toBeTruthy();
+      expect(screen.queryByText(/saved URL matches/)).toBeNull();
+      expect(
+        screen.queryByRole("button", {
+          name: "Sign in myself (this test only)",
+        }),
+      ).toBeNull();
+    },
+  );
+
+  it("shows the URL-match why-line on a missing-2FA card for a login matched by URL", () => {
+    credsData.current = [{ credential_id: "cred_hn", name: "HN login" }];
+    const queryClient = new QueryClient({
+      defaultOptions: { queries: { retry: false } },
+    });
+    render(
+      <QueryClientProvider client={queryClient}>
+        <CredentialCard
+          frame={{
+            ...CREDENTIAL_REQUIRED_FRAME_BY_REASON.credential_missing_totp,
+            credential_binding: "matched_by_saved_url",
+          }}
+          mode="inline-pause"
+          onConnect={vi.fn()}
+          onSkip={vi.fn()}
+        />
+      </QueryClientProvider>,
+    );
+    expect(screen.getByText(/saved URL matches this page/)).toBeTruthy();
+    expect(
+      screen.queryByText(CREDENTIAL_WHY_LINE_BY_REASON.credential_missing_totp),
+    ).toBeNull();
   });
 
   it("offers Retry and Skip, never the generic picker, when the saved record cannot load", async () => {

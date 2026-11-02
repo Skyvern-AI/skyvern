@@ -16,8 +16,6 @@ import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { ActionTypes, Status, type ActionsApiResponse } from "@/api/types";
 import type { StreamStateChangeHandler } from "@/routes/streaming/streamState";
 import { TooltipProvider } from "@/components/ui/tooltip";
-import { useRecordingLauncherStore } from "@/store/useRecordingLauncherStore";
-import { useRecordingStore } from "@/store/useRecordingStore";
 import { useSettingsStore } from "@/store/SettingsStore";
 import { useRunViewStore } from "@/store/RunViewStore";
 import { useStudioBrowserStore } from "@/store/useStudioBrowserStore";
@@ -37,6 +35,7 @@ const mocks = vi.hoisted(() => ({
   runs: [] as Array<{ workflow_run_id: string }>,
   realScreenshot: false,
   artifactsByUrl: {} as Record<string, Array<Record<string, unknown>>>,
+  streamExternal: false,
 }));
 
 vi.mock("@/api/AxiosClient", () => ({
@@ -68,7 +67,10 @@ vi.mock("../hooks/useWorkflowRunsQuery", () => ({
 }));
 vi.mock("@/hooks/useRuntimeConfig", () => ({
   useBrowserStreamingMode: () => ({ browserStreamingMode: "vnc" }),
-  useStreamTransport: () => ({ streamTransport: "vnc" }),
+  useStreamTransport: () => ({
+    streamTransport: mocks.streamExternal ? null : "vnc",
+    isExternal: mocks.streamExternal,
+  }),
 }));
 vi.mock("posthog-js/react", () => ({
   usePostHog: () => ({ capture: vi.fn() }),
@@ -77,6 +79,7 @@ vi.mock("@/hooks/useCredentialGetter", () => ({
   useCredentialGetter: () => null,
 }));
 vi.mock("@/routes/streaming/StreamDiagnostics", () => ({
+  EXTERNAL_BROWSER_DIAGNOSTIC: { title: "external" },
   StreamModeBadge: ({ mode }: { mode: string }) => (
     <span data-testid="stream-mode-badge">{mode}</span>
   ),
@@ -140,9 +143,7 @@ vi.mock("./runview/RunLiveStream", () => ({
 }));
 const initialBrowserState = useStudioBrowserStore.getState();
 const initialRunViewState = useRunViewStore.getState();
-const initialRecordingState = useRecordingStore.getState();
 const initialSettingsState = useSettingsStore.getState();
-const initialRecordingLauncherState = useRecordingLauncherStore.getState();
 
 function buildBlock(
   overrides: Partial<WorkflowRunBlock> = {},
@@ -290,15 +291,14 @@ const STUDIO_PATH = "/workflows/wpid_test/studio?panes=copilot,browser";
 beforeEach(() => {
   useStudioBrowserStore.setState(initialBrowserState, true);
   useRunViewStore.setState(initialRunViewState, true);
-  useRecordingStore.setState(initialRecordingState, true);
   useSettingsStore.setState(initialSettingsState, true);
-  useRecordingLauncherStore.setState(initialRecordingLauncherState, true);
   mocks.workflowRun = undefined;
   mocks.timeline = undefined;
   mocks.debugSession = undefined;
   mocks.runs = [];
   mocks.realScreenshot = false;
   mocks.artifactsByUrl = {};
+  mocks.streamExternal = false;
 });
 
 afterEach(() => {
@@ -665,6 +665,18 @@ describe("BrowserTab view machine", () => {
     expect(status.textContent).toBe("Browser stopped");
   });
 
+  it("does not call a run on a registered external browser stopped", () => {
+    seedRun({ status: Status.Running, browserSessionId: "pbs_run" });
+    mocks.debugSession = { browser_session_id: "pbs_test" };
+    mocks.streamExternal = true;
+    renderBrowserPane(STUDIO_PATH);
+
+    fireEvent.click(screen.getByRole("button", { name: "emit run stopped" }));
+    expect(screen.getByTestId("browser-pane-live-status").textContent).toBe(
+      "No live view",
+    );
+  });
+
   it("ignores stream state reported for a different run", () => {
     seedRun({ status: Status.Running, browserSessionId: "pbs_run" });
     mocks.debugSession = { browser_session_id: "pbs_test" };
@@ -756,44 +768,13 @@ describe("BrowserTab view machine", () => {
     expect(screen.queryByTestId("run-live-stream")).toBeNull();
   });
 
-  it("drops a stale replay pill when a recording starts", () => {
-    seedRun({ status: Status.Completed, recordingUrl: "https://r.test/1.mp4" });
+  it("offers no record button in the studio browser header", () => {
     mocks.debugSession = { browser_session_id: "pbs_test" };
-    // The user pinned the replay before hitting Record.
-    useStudioBrowserStore.setState({ view: "recording" });
-    useRecordingStore.setState({ isRecording: true });
-    renderBrowserPane(`${STUDIO_PATH}&wr=wr_1`);
-
-    expect(screen.getByTestId("browser-pane-stream-slot")).toBeTruthy();
-    expect(screen.queryByTestId("hero-recording")).toBeNull();
-  });
-
-  it("pins the live debug stream while a browser recording runs", () => {
-    // Even with a pinned step (?active=), recording surfaces the live browser.
-    seedRun({ status: Status.Completed });
-    mocks.debugSession = { browser_session_id: "pbs_test" };
-    useRecordingStore.setState({ isRecording: true });
-    renderBrowserPane(`${STUDIO_PATH}&wr=wr_1&active=act_1`);
-
-    expect(screen.getByTestId("browser-pane-stream-slot")).toBeTruthy();
-    expect(screen.queryByRole("button", { name: "Stop recording" })).toBeNull();
-  });
-
-  it("starts a browser recording from the studio browser header", () => {
-    const startRecording = vi.fn();
-    mocks.debugSession = { browser_session_id: "pbs_test" };
-    useRecordingLauncherStore.setState({
-      startRecordingAtEnd: startRecording,
-    });
     renderBrowserPane(STUDIO_PATH);
 
-    const recordTaskButton = screen.getByRole("button", {
-      name: "Record task",
-    });
-    expect(recordTaskButton.textContent).toContain("Record task");
-    fireEvent.click(recordTaskButton);
-
-    expect(startRecording).toHaveBeenCalledOnce();
+    expect(
+      screen.queryByRole("button", { name: "Demonstrate task" }),
+    ).toBeNull();
   });
 
   it("hides replay pills a run has nothing for, and restores them as artifacts arrive", () => {
@@ -1023,13 +1004,9 @@ describe("BrowserTab pills and selection sync", () => {
   it("hides the debug-browser menu while the run's own stream is shown", () => {
     seedRun({ status: Status.Running, browserSessionId: "pbs_run" });
     mocks.debugSession = { browser_session_id: "pbs_test" };
-    useRecordingLauncherStore.setState({ startRecordingAtEnd: vi.fn() });
     renderBrowserPane(`${STUDIO_PATH}&wr=wr_1`);
 
     expect(screen.getByTestId("run-live-stream")).toBeTruthy();
-    expect(
-      (screen.getByLabelText("Record task") as HTMLButtonElement).disabled,
-    ).toBe(true);
     expect(
       screen.queryByRole("button", { name: "More browser actions" }),
     ).toBeNull();
@@ -1120,17 +1097,13 @@ describe("stream-mode badge", () => {
   });
 });
 
-it.each([false, true])(
-  "keeps the shared browser visible during a retry wait (recording=%s)",
-  (recording) => {
-    seedRun({ status: Status.Failed, browserSessionId: "pbs_test" });
-    mocks.workflowRun = Object.assign({}, mocks.workflowRun, {
-      retry_pending: true,
-    });
-    mocks.debugSession = { browser_session_id: "pbs_test" };
-    useRecordingStore.setState({ isRecording: recording });
-    renderBrowserPane(recording ? `${STUDIO_PATH}&wr=wr_1` : STUDIO_PATH);
-    expect(screen.getByTestId("browser-pane-stream-slot")).toBeTruthy();
-    expect(screen.queryByText("Retry pending")).toBeNull();
-  },
-);
+it("keeps the shared browser visible during a retry wait", () => {
+  seedRun({ status: Status.Failed, browserSessionId: "pbs_test" });
+  mocks.workflowRun = Object.assign({}, mocks.workflowRun, {
+    retry_pending: true,
+  });
+  mocks.debugSession = { browser_session_id: "pbs_test" };
+  renderBrowserPane(STUDIO_PATH);
+  expect(screen.getByTestId("browser-pane-stream-slot")).toBeTruthy();
+  expect(screen.queryByText("Retry pending")).toBeNull();
+});

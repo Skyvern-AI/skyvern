@@ -21,7 +21,7 @@ if TYPE_CHECKING:
 
 import typer
 
-from skyvern._cli_bootstrap import prepare_cli_runtime
+from skyvern._cli_bootstrap import mark_cli_command, prepare_cli_runtime
 from skyvern.browser_extension.auth import load_or_create_pairing_token
 from skyvern.browser_extension.broker_client import BrokerClient
 from skyvern.browser_extension.broker_protocol import is_valid_nonce
@@ -105,6 +105,7 @@ def browser_callback(ctx: typer.Context) -> None:
     if ctx.invoked_subcommand == "extension-broker-daemon":
         return
     prepare_cli_runtime(intent=EnvIntent.CLOUD)
+    mark_cli_command()
 
 
 @dataclass(frozen=True)
@@ -1213,7 +1214,7 @@ def evaluate(
             original = unwrap_caller_js_error(exc)
             if isinstance(original, SkyvernPageAnalysisTimeout) or not deadline_ended_the_call(original, deadline):
                 raise
-            record_unreported_timeout(original)
+            record_unreported_timeout(original, page.page)
             raise SkyvernPageAnalysisTimeout(str(original)) from original
         return {"result": result}
 

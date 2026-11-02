@@ -6,7 +6,11 @@ import { Input } from "@/components/ui/input";
 import { TooltipProvider } from "@/components/ui/tooltip";
 import { useWorkflowHasChangesStore } from "@/store/WorkflowHasChangesStore";
 import { useWorkflowParametersStore } from "@/store/WorkflowParametersStore";
-import { refuseMutationDuringYamlCommit } from "@/store/WorkflowYamlEditorStore";
+import {
+  refuseMutationDuringYamlCommit,
+  selectSaveLockReason,
+  useWorkflowYamlEditorStore,
+} from "@/store/WorkflowYamlEditorStore";
 
 import { CredentialsModal } from "@/routes/credentials/CredentialsModal";
 
@@ -43,9 +47,10 @@ function TemplateInputsCard() {
   const setHasChanges = useWorkflowHasChangesStore(
     (state) => state.setHasChanges,
   );
-  const saveBlockedReason = useWorkflowHasChangesStore(
-    (state) => state.saveBlockedReason,
-  );
+  const saveLockReason = useWorkflowYamlEditorStore(selectSaveLockReason);
+  const saveBlockedReason =
+    useWorkflowHasChangesStore((state) => state.saveBlockedReason) ||
+    saveLockReason;
   const [edits, setEdits] = useState<Record<string, string>>({});
   const onSave = useSaveWorkflow();
   const [saved, setSaved] = useState<"saved" | "applied" | null>(null);

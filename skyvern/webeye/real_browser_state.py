@@ -4,14 +4,15 @@ import asyncio
 import random
 import time
 import weakref
-from collections.abc import Awaitable, Callable, Collection
+from collections import deque
+from collections.abc import Awaitable, Callable, Collection, Sequence
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime
-from typing import Any, Literal, TypedDict
+from typing import Any, Literal, Protocol, TypedDict, TypeGuard, runtime_checkable
 from urllib.parse import urlparse
 
 import structlog
-from playwright.async_api import Browser, BrowserContext, Page, Playwright, async_playwright
+from playwright.async_api import Browser, BrowserContext, Page, Playwright, Request, Response, async_playwright
 
 from skyvern.config import settings
 from skyvern.constants import (
@@ -20,15 +21,19 @@ from skyvern.constants import (
     BROWSER_INTERCEPTOR_DISABLE_TIMEOUT,
     BROWSER_PAGE_CLOSE_TIMEOUT,
     CRASHED_PAGE_CLOSE_ATTEMPTS,
+    NAV_ERROR_MAX_BROWSER_DRAWS,
     NAVIGATION_MAX_RETRY_TIME,
+    PROXY_TRANSPORT_NAV_MAX_BROWSER_DRAWS,
 )
 from skyvern.exceptions import (
+    BROWSER_CONNECTION_LOST_ERROR_CODE,
     BrowserStateDiagnostic,
     EmptyBrowserContext,
     ExternalBrowserUnavailable,
     FailedToNavigateToUrl,
     FailedToReloadPage,
     FailedToStopLoadingPage,
+    MissingBrowserState,
     MissingBrowserStatePage,
     UnresolvableNavigationHost,
 )
@@ -56,14 +61,24 @@ from skyvern.webeye.browser_runtime_events import (
     log_browser_runtime_event,
     with_acquired_browser_runtime,
 )
-from skyvern.webeye.browser_state import BLANK_PAGE_URLS, BrowserState
+from skyvern.webeye.browser_state import BLANK_PAGE_URLS, BrowserState, PageCrashRecord, is_selectable_page_url
 from skyvern.webeye.cdp_download_interceptor import (
     disable_download_interceptor_for_context,
     has_download_interceptor_for_context,
 )
 from skyvern.webeye.display_recorder import DisplayRecorder, release_display_recorder
-from skyvern.webeye.driver_connection import close_driver_connection_on_transport_loss, driver_transport_error_future
-from skyvern.webeye.navigation import is_permanent_navigation_error, navigate_with_retry
+from skyvern.webeye.driver_connection import (
+    close_driver_connection_on_transport_loss,
+    driver_transport_error_future,
+    kill_driver_process,
+)
+from skyvern.webeye.main_world_eval import default_evaluate_to_main_world
+from skyvern.webeye.navigation import (
+    driver_nav_error_code,
+    is_permanent_navigation_error,
+    is_proxy_transport_navigation_error,
+    navigate_with_retry,
+)
 from skyvern.webeye.scraper import scraper
 from skyvern.webeye.scraper.scraped_page import CleanupElementTreeFunc, ScrapedPage, ScrapeExcludeFunc
 from skyvern.webeye.session_cookies import persist_session_cookies
@@ -74,6 +89,7 @@ LOG = structlog.get_logger()
 SETTLE_TIME_MS = 750
 SETTLE_JITTER_MS = 500
 RECOVERABLE_BLANK_PAGE_URLS = {":"}
+BROWSER_ADDRESS_RESULT_TIMEOUT_SECONDS = 0.5
 
 
 class _BrowserConnectionProbeFailed(str):
@@ -96,6 +112,8 @@ class _RuntimeEndObservation:
     evidence: DisconnectEvidence
     close_requested: bool
     run_phase: RunPhase
+    # Captured from the observed generation's own artifacts so deferred emission never reads a replacement's id.
+    provider_session_id: str | None = None
 
 
 def browser_context_stopped_reason(context: BrowserContext | None) -> str | None:
@@ -104,12 +122,12 @@ def browser_context_stopped_reason(context: BrowserContext | None) -> str | None
     A reused browser state (e.g. a persistent debug session) can have a stopped driver after a
     prior owner's cleanup; page.goto then raises "Connection closed while reading from the
     driver". A bare pw.stop() leaves browser.is_connected() stale and never flips
-    _close_was_called, so the shared driver Connection's closed-error is inspected too.
+    _closing_or_closed, so the shared driver Connection's closed-error is inspected too.
     """
     if context is None:
         return "browser_context_missing"
     impl = getattr(context, "_impl_obj", None)
-    if getattr(impl, "_close_was_called", False) is True:
+    if getattr(impl, "_closing_or_closed", False) is True:
         return "browser_context_close_called"
     if getattr(impl, "_closed", False) is True:
         return "browser_context_closed"
@@ -186,6 +204,160 @@ def _chain_browser_cleanups(first: BrowserCleanupFunc, second: BrowserCleanupFun
     return _both
 
 
+# These terminal responses leave the current document in place; ordinary responses still need to commit.
+_NO_DOCUMENT_STATUSES = frozenset({204, 205, 304})
+
+
+@runtime_checkable
+class _FrameIdentified(Protocol):
+    """Raw-CDP requests and frames expose their CDP frame id; Playwright's do not."""
+
+    @property
+    def frame_id(self) -> str | None: ...
+
+
+class _MainFrameNavigation:
+    """A page's in-flight main-frame document navigation, observed only through browser events.
+
+    While such a navigation is pending, evaluate calls against the page are deferred until it commits,
+    so the page's own scripts cannot report it.
+    """
+
+    def __init__(self, page: Page) -> None:
+        # Weak, so the browser state's per-page registry does not keep a closed page alive.
+        self._page_ref = weakref.ref(page)
+        self._request: Request | None = None
+        self.started_at: float | None = None
+        self.closed = False
+        self._idle = asyncio.Event()
+        self._idle.set()
+        self._commit_emitter_ref: weakref.ReferenceType[Any] | None = None
+        self._handlers: dict[str, Any] = {
+            "request": self._on_request,
+            "response": self._on_response,
+            "requestfailed": self._on_request_failed,
+            "close": self._on_gone,
+            "crash": self._on_gone,
+        }
+        attached: list[str] = []
+        try:
+            if isinstance(page.main_frame, _FrameIdentified):
+                # The raw-CDP facade emits this only for Page.frameNavigated (document commits),
+                # unlike Playwright's public event, which also includes same-document URL changes.
+                self._handlers["framenavigated"] = self._on_cdp_frame_navigated
+            else:
+                # The same event used by expect_navigation(wait_until="commit") carries the
+                # committed request identity. Headers and same-document events cannot prove commit.
+                emitter = page.main_frame._impl_obj._event_emitter
+                self._commit_emitter_ref = weakref.ref(emitter)
+                emitter.on("navigated", self._on_document_navigated)
+            for event, handler in self._handlers.items():
+                page.on(event, handler)  # type: ignore[call-overload]
+                attached.append(event)
+        except Exception:
+            self._handlers = {event: self._handlers[event] for event in attached}
+            self.detach()
+            raise
+
+    @property
+    def is_pending(self) -> bool:
+        return self._request is not None and not self.closed
+
+    async def wait(self, deadline: float) -> None:
+        """Return once nothing is pending or the monotonic ``deadline`` passes."""
+        while self.is_pending:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                return
+            try:
+                async with asyncio.timeout(remaining):
+                    await self._idle.wait()
+            except TimeoutError:
+                return
+
+    def detach(self) -> None:
+        handlers, self._handlers = self._handlers, {}
+        # A detached observer can no longer see the navigation; wake any waiter as closed.
+        self.closed = True
+        self._settle()
+        emitter_ref, self._commit_emitter_ref = self._commit_emitter_ref, None
+        if emitter_ref is not None and (emitter := emitter_ref()) is not None:
+            emitter.remove_listener("navigated", self._on_document_navigated)
+        page = self._page_ref()
+        if page is None:
+            return
+        for event, handler in handlers.items():
+            try:
+                page.remove_listener(event, handler)  # type: ignore[call-overload]
+            except Exception:
+                LOG.debug("Failed to remove main-frame navigation listener", page_event=event, exc_info=True)
+
+    def _is_main_frame_document(self, request: Request) -> bool:
+        if not request.is_navigation_request():
+            return False
+        page = self._page_ref()
+        frame = request.frame
+        if page is None or frame is not page.main_frame:
+            return False
+        # The raw-CDP engine's request.frame falls back to the main frame for a frame id it does not know.
+        if isinstance(request, _FrameIdentified) and isinstance(frame, _FrameIdentified):
+            return frame.frame_id == request.frame_id
+        return True
+
+    def _on_request(self, request: Request) -> None:
+        try:
+            if not self._is_main_frame_document(request):
+                return
+        except Exception:
+            return
+        if self._request is not None and request.redirected_from is self._request:
+            self._request = request
+            return
+        self._request = request
+        self.started_at = time.monotonic()
+        # A fresh event rather than clear(): the browser-API census counts every .clear() call site as a page
+        # sink. Only an idle event is replaced, so a waiter never holds a superseded one.
+        if self._idle.is_set():
+            self._idle = asyncio.Event()
+
+    def _on_response(self, response: Response) -> None:
+        if self._request is not None and response.request is self._request and response.status in _NO_DOCUMENT_STATUSES:
+            self._settle()
+
+    def _on_document_navigated(self, event: dict[str, Any]) -> None:
+        document = event.get("newDocument")
+        if (
+            self._request is not None
+            and "error" not in event
+            and document is not None
+            and document.get("request") is self._request._impl_obj._channel
+        ):
+            self._settle()
+
+    def _on_cdp_frame_navigated(self, frame: Any) -> None:
+        page = self._page_ref()
+        if (
+            page is not None
+            and frame is page.main_frame
+            and self._request is not None
+            and frame.url.split("#", 1)[0] == self._request.url.split("#", 1)[0]
+        ):
+            self._settle()
+
+    def _on_request_failed(self, request: Request) -> None:
+        # Identity-keyed: a superseded navigation's late failure must not settle its replacement.
+        if self._request is not None and request is self._request:
+            self._settle()
+
+    def _on_gone(self, _page: Page) -> None:
+        self.detach()
+
+    def _settle(self) -> None:
+        self._request = None
+        self.started_at = None
+        self._idle.set()
+
+
 class RealBrowserState(BrowserState):
     def __init__(
         self,
@@ -212,6 +384,8 @@ class RealBrowserState(BrowserState):
             weakref.WeakKeyDictionary()
         )
         self.__page = page
+        self._browser_address: str | None = None
+        self._navigation_run_id: str | None = None
         # An explicitly selected tab (set by NEW_TAB/SWITCH_TAB). When set, it overrides the
         # last-page default in get_working_page so multi-tab targeting is deterministic.
         self.__active_page: Page | None = None
@@ -225,8 +399,13 @@ class RealBrowserState(BrowserState):
         self._disconnect_listener_browser: Browser | None = None
         self._disconnect_listener_browser_context: BrowserContext | None = None
         self._crash_listener_pages: weakref.WeakSet[Page] = weakref.WeakSet()
+        self._main_frame_navigations: weakref.WeakKeyDictionary[Page, _MainFrameNavigation] = (
+            weakref.WeakKeyDictionary()
+        )
         self._crashed_pages: weakref.WeakSet[Page] = weakref.WeakSet()
         self._crashed_targets_closing: weakref.WeakSet[Page] = weakref.WeakSet()
+        self._page_crash_records: deque[PageCrashRecord] = deque(maxlen=5)
+        self._unreopened_page_crashes: weakref.WeakKeyDictionary[Page, PageCrashRecord] = weakref.WeakKeyDictionary()
         # Cleared while a recovery is producing the working page (opening it, closing crashed targets,
         # restoring its URL): consumers wait for the finished page instead of driving about:blank or
         # opening a tab of their own.
@@ -264,6 +443,9 @@ class RealBrowserState(BrowserState):
         # A release retry after a transient DB failure must not repeat local CDP teardown.
         self._remote_driver_detached = False
         self._browser_state_diagnostic: BrowserStateDiagnostic | None = None
+        # The run that saw this browser end unexpectedly, and how. Unlike the diagnostic it survives a context
+        # rebuild, so that run never gets the browser back; a later run that reuses this state does not see it.
+        self._connection_loss: tuple[str | None, BrowserStateDiagnostic] | None = None
         # HTTP status of the most recent navigate_to_url (None until one runs, or when it produced no
         # response). Read by the Task V3 loop to classify a dead/removed starting URL; v1 ignores it.
         self.last_navigation_status: int | None = None
@@ -316,6 +498,7 @@ class RealBrowserState(BrowserState):
 
     def mark_run_released(self) -> None:
         self._run_released = True
+        app.AGENT_FUNCTION.on_browser_run_released(self.browser_context or self.browser_artifacts)
 
     @property
     def _run_phase(self) -> RunPhase:
@@ -408,15 +591,27 @@ class RealBrowserState(BrowserState):
         # A tab can die on its own (a download-turned-navigation, a renderer crash) while the
         # context survives. Recover here rather than in each consumer: every caller that needs a
         # page treats "no page" as fatal, so one of them recovering only relocates the failure.
-        if self.browser_context is None or self.external_browser or not self.is_connected():
+        if (
+            self.browser_context is None
+            or self.external_browser
+            or not self.is_connected()
+            or self.get_browser_connection_loss() is not None
+        ):
             return None
         async with self._reopen_working_page_lock:
             already_reopened = await self.get_working_page()
+            if self.get_browser_connection_loss() is not None:
+                return None
             if already_reopened is not None:
                 await self._close_crashed_targets()
                 return already_reopened
             lost_page = self.__page
             restore_url = lost_page.url if lost_page is not None else ""
+            crash = self._unreopened_page_crashes.get(lost_page) if lost_page is not None else None
+            if lost_page is not None and crash is None:
+                crash = PageCrashRecord(crashed_at=datetime.now(UTC), crashed_url=restore_url, cause="page_lost")
+                self._page_crash_records.append(crash)
+                self._unreopened_page_crashes[lost_page] = crash
             # A fresh event per recovery rather than clear(): the browser-API census counts every
             # .clear() call site as a page sink.
             ready = self._working_page_ready = asyncio.Event()
@@ -430,12 +625,16 @@ class RealBrowserState(BrowserState):
                     LOG.warning("Failed to re-open a working page after the previous one was lost", exc_info=True)
                     return None
                 await self.set_working_page(page)
+                if lost_page is not None:
+                    self._unreopened_page_crashes.pop(lost_page, None)
                 # Whoever opens the replacement closes the crashed targets, and does it before a restore
                 # that can retry for minutes: the reaper may be queued behind this lock.
                 await self._close_crashed_targets()
                 if restore_url and restore_url not in BLANK_PAGE_URLS:
                     try:
                         await self.navigate_to_url(page=page, url=restore_url)
+                        if crash is not None:
+                            crash.reopened = True
                     except Exception:
                         LOG.warning(
                             "Re-opened the working page but could not restore the URL it was on",
@@ -481,7 +680,7 @@ class RealBrowserState(BrowserState):
     async def close_pages_opened_after(self, baseline_pages: set[Page]) -> None:
         # Close only pages opened after baseline_pages was captured; preserve the baseline set
         # (e.g. a pre-loop deliverable tab) and the current working page.
-        if not self.browser_context:
+        if not self.browser_context or self.external_browser:
             return
         working_page = await self.get_working_page()
         for page in list(self.browser_context.pages):
@@ -538,10 +737,13 @@ class RealBrowserState(BrowserState):
         display_recording_owner_id: str | None = None,
         reconcile_persistent_init_scripts: bool = False,
         sessionless_init_script_registrations: Collection[Any] = (),
+        *,
+        before_navigation: Callable[[BrowserState], None] | None = None,
     ) -> None:
+        self._refuse_after_connection_loss()
         if self.browser_context is None:
             if self.external_browser:
-                raise ExternalBrowserUnavailable("the connection to the browser was lost")
+                raise ExternalBrowserUnavailable.lost()
             LOG.info("creating browser context")
             context = skyvern_context.current()
             effective_route_policy_url = (
@@ -558,6 +760,7 @@ class RealBrowserState(BrowserState):
             # A replacement can run elsewhere than the browser it replaces (a vendor creator degrading to a
             # local launch), so restamp from what its creator records instead of keeping the old runtime.
             sample_token = None if current_browser_acquisition_sample() else begin_browser_acquisition_sample()
+            app.AGENT_FUNCTION.note_browser_relaunch(self, "relaunch")
             try:
                 (
                     browser_context,
@@ -624,6 +827,7 @@ class RealBrowserState(BrowserState):
                 if pages:
                     page = pages[-1]
                     use_existing_page = True
+            self._refuse_after_connection_loss()
             if page is None:
                 page = await self.browser_context.new_page()
 
@@ -632,6 +836,8 @@ class RealBrowserState(BrowserState):
                 await self._close_all_other_pages(discard_orphaned_videos=True)
 
             if url and not _same_page_ignoring_fragment(page.url, url):
+                if before_navigation is not None:
+                    before_navigation(self)
                 try:
                     await self.navigate_to_url(page=page, url=url)
                 finally:
@@ -643,6 +849,67 @@ class RealBrowserState(BrowserState):
 
         # No initial navigation ran (page already existed, or no/same URL): arm now that a working page exists.
         self._arm_display_recorder()
+
+    def begin_navigation(self) -> None:
+        browser_context = getattr(self, "_browser_context", None)
+        interceptor = getattr(browser_context, "_skyvern_cdp_download_interceptor", None)
+        consume_auth_challenges = getattr(interceptor, "consume_navigation_auth_challenges", None)
+        if consume_auth_challenges is not None:
+            consume_auth_challenges()
+
+    async def record_navigation_result(self, error: BaseException | None, url: str | None = None) -> None:
+        browser_context = getattr(self, "_browser_context", None)
+        interceptor = getattr(browser_context, "_skyvern_cdp_download_interceptor", None)
+        consume_auth_challenges = getattr(interceptor, "consume_navigation_auth_challenges", None)
+        proxy_auth_rejection_seen, auth_challenge_seen = (
+            consume_auth_challenges() if consume_auth_challenges is not None else (False, False)
+        )
+        context = skyvern_context.current()
+        browser_address = getattr(self, "_browser_address", None)
+        if not browser_address or context is None or not context.browser_address_is_server_assigned:
+            return
+
+        run_id = (
+            context.workflow_run_id or getattr(self, "_navigation_run_id", None) or context.task_id or context.run_id
+        )
+        try:
+            if error is None:
+                if (
+                    url is not None
+                    and urlparse(url).scheme.lower() in {"http", "https"}
+                    and getattr(interceptor, "proxy_auth_credentials", None)
+                ):
+                    await asyncio.wait_for(
+                        app.AGENT_FUNCTION.record_server_assigned_address_navigation_success(
+                            browser_address=browser_address,
+                            run_id=run_id,
+                        ),
+                        timeout=BROWSER_ADDRESS_RESULT_TIMEOUT_SECONDS,
+                    )
+            else:
+                if not getattr(interceptor, "proxy_auth_credentials", None) or (
+                    auth_challenge_seen and not proxy_auth_rejection_seen
+                ):
+                    return
+                nav_error_code = (
+                    error.nav_error_code
+                    if isinstance(error, FailedToNavigateToUrl)
+                    else driver_nav_error_code(str(error))
+                )
+                await asyncio.wait_for(
+                    app.AGENT_FUNCTION.record_server_assigned_address_navigation_failure(
+                        browser_address=browser_address,
+                        nav_error_code=nav_error_code,
+                        run_id=run_id,
+                        workflow_permanent_id=context.workflow_permanent_id,
+                    ),
+                    timeout=BROWSER_ADDRESS_RESULT_TIMEOUT_SECONDS,
+                )
+        except Exception:
+            LOG.warning(
+                "Failed to record a navigation result against the run's assigned browser address",
+                exc_info=True,
+            )
 
     def _arm_display_recorder(self) -> None:
         """Begin the whole-display recorder's timeline once a working page exists (two-phase capture,
@@ -667,6 +934,7 @@ class RealBrowserState(BrowserState):
         retry_times: int = NAVIGATION_MAX_RETRY_TIME,
         wait_until: Literal["load", "domcontentloaded", "commit"] = "load",
     ) -> None:
+        self._refuse_after_connection_loss()
         landed_url: str | None = None
 
         async def goto(strategy: str) -> object:
@@ -681,14 +949,21 @@ class RealBrowserState(BrowserState):
             landed_url = response_url if isinstance(response_url, str) else None
             return response
 
-        self.last_navigation_status = await navigate_with_retry(
-            navigate=goto,
-            url=url,
-            retry_times=retry_times,
-            settle=self._wait_for_settle,
-            wait_until=wait_until,
-        )
+        self.begin_navigation()
+        try:
+            self.last_navigation_status = await navigate_with_retry(
+                navigate=goto,
+                url=url,
+                retry_times=retry_times,
+                settle=self._wait_for_settle,
+                wait_until=wait_until,
+                stop_retrying=lambda: self.get_browser_connection_loss() is not None,
+            )
+        except Exception as navigation_error:
+            await self.record_navigation_result(navigation_error)
+            raise
         self.last_navigation_url = landed_url
+        await self.record_navigation_result(None, url=url)
         await self._wait_for_challenge_solver(page=page)
 
     async def _wait_for_challenge_solver(self, page: Page) -> None:
@@ -740,13 +1015,7 @@ class RealBrowserState(BrowserState):
         pages = [
             http_page
             for http_page in self.browser_context.pages
-            if http_page not in self._crashed_pages
-            and (
-                http_page.url == "about:blank"
-                or http_page.url == ":"  # sometimes the page url is ":", which is the blank page
-                or http_page.url == "chrome-error://chromewebdata/"
-                or urlparse(http_page.url).scheme in ["http", "https"]
-            )
+            if http_page not in self._crashed_pages and is_selectable_page_url(http_page.url)
         ]
 
         if max_pages <= 0 or self.external_browser or len(pages) <= max_pages:
@@ -834,73 +1103,86 @@ class RealBrowserState(BrowserState):
         browser_address: str | None = None,
         browser_profile_id: str | None = None,
         browser_session_id: str | None = None,
+        navigation_run_id: str | None = None,
+        before_navigation: Callable[[BrowserState], None] | None = None,
     ) -> Page:
+        if browser_address is not None:
+            self._browser_address = browser_address
+        if navigation_run_id or workflow_run_id or task_id:
+            self._navigation_run_id = navigation_run_id or workflow_run_id or task_id
         page = await self.get_working_page()
         if page is not None:
             return page
 
-        try:
-            await self.check_and_fix_state(
-                url=url,
-                proxy_location=proxy_location,
-                task_id=task_id,
-                workflow_run_id=workflow_run_id,
-                workflow_permanent_id=workflow_permanent_id,
-                script_id=script_id,
-                organization_id=organization_id,
-                extra_http_headers=extra_http_headers,
-                cdp_connect_headers=cdp_connect_headers,
-                browser_address=browser_address,
-                browser_profile_id=browser_profile_id,
-                browser_session_id=browser_session_id,
-            )
-        except Exception as e:
-            # Recreating the context draws a different proxy node, and no proxy node can invent an
-            # address record for a host that has none.
-            if isinstance(e, UnresolvableNavigationHost):
-                raise
-            error_message = e.error_message if isinstance(e, FailedToNavigateToUrl) else str(e)
-            if is_permanent_navigation_error(error_message):
-                raise
-            if "net::ERR" not in error_message:
-                raise
-            if not await self.close_current_open_page():
-                LOG.warning("Failed to close the current open page")
-                raise
-            await self.check_and_fix_state(
-                url=url,
-                proxy_location=proxy_location,
-                task_id=task_id,
-                workflow_run_id=workflow_run_id,
-                workflow_permanent_id=workflow_permanent_id,
-                script_id=script_id,
-                organization_id=organization_id,
-                extra_http_headers=extra_http_headers,
-                cdp_connect_headers=cdp_connect_headers,
-                browser_address=browser_address,
-                browser_profile_id=browser_profile_id,
-                browser_session_id=browser_session_id,
-            )
+        abandoned_cleanup: BrowserCleanupFunc = None
+
+        async def fix_state() -> None:
+            nonlocal abandoned_cleanup
+            try:
+                await self.check_and_fix_state(
+                    url=url,
+                    proxy_location=proxy_location,
+                    task_id=task_id,
+                    workflow_run_id=workflow_run_id,
+                    workflow_permanent_id=workflow_permanent_id,
+                    script_id=script_id,
+                    organization_id=organization_id,
+                    extra_http_headers=extra_http_headers,
+                    cdp_connect_headers=cdp_connect_headers,
+                    browser_address=browser_address,
+                    browser_profile_id=browser_profile_id,
+                    browser_session_id=browser_session_id,
+                    before_navigation=before_navigation,
+                )
+            finally:
+                # A draw we walked away from owns a browser, an egress proxy and extension copies, and the
+                # rebuild below replaces browser_cleanup with the new launch's. The run makes one cleanup
+                # pass, so the abandoned launch's teardown has to ride on the replacement's or it never runs.
+                if abandoned_cleanup is not None:
+                    self.browser_cleanup = _chain_browser_cleanups(abandoned_cleanup, self.browser_cleanup)
+                    abandoned_cleanup = None
+
+        draw = 1
+        while True:
+            try:
+                await fix_state()
+                break
+            except Exception as e:
+                # Recreating the context draws a different proxy node, and no proxy node can invent an
+                # address record for a host that has none.
+                if isinstance(e, UnresolvableNavigationHost):
+                    raise
+                error_message = e.error_message if isinstance(e, FailedToNavigateToUrl) else str(e)
+                if is_permanent_navigation_error(error_message):
+                    raise
+                if "net::ERR" not in error_message:
+                    raise
+                draws_allowed = (
+                    PROXY_TRANSPORT_NAV_MAX_BROWSER_DRAWS
+                    if is_proxy_transport_navigation_error(error_message)
+                    else NAV_ERROR_MAX_BROWSER_DRAWS
+                )
+                if draw >= draws_allowed:
+                    raise
+                if not await self.close_current_open_page():
+                    LOG.warning("Failed to close the current open page")
+                    raise
+                abandoned_cleanup = _chain_browser_cleanups(abandoned_cleanup, self.browser_cleanup)
+                LOG.info(
+                    "Navigation failed before a page was ready; drawing another browser",
+                    draw=draw,
+                    draws_allowed=draws_allowed,
+                    nav_error_code=driver_nav_error_code(error_message),
+                )
+                draw += 1
         page = await self.__assert_page()
 
         if not await self.validate_browser_context(await self.get_working_page()):
             if not await self.close_current_open_page():
                 LOG.warning("Failed to close the current open page, going to skip the browser context validation")
                 return page
-            await self.check_and_fix_state(
-                url=url,
-                proxy_location=proxy_location,
-                task_id=task_id,
-                workflow_run_id=workflow_run_id,
-                workflow_permanent_id=workflow_permanent_id,
-                script_id=script_id,
-                organization_id=organization_id,
-                extra_http_headers=extra_http_headers,
-                cdp_connect_headers=cdp_connect_headers,
-                browser_address=browser_address,
-                browser_profile_id=browser_profile_id,
-                browser_session_id=browser_session_id,
-            )
+            abandoned_cleanup = self.browser_cleanup
+            await fix_state()
             page = await self.__assert_page()
         return page
 
@@ -953,13 +1235,40 @@ class RealBrowserState(BrowserState):
             LOG.debug("Failed to register browser disconnect listener", exc_info=True)
 
     def _watch_page_for_crash(self, page: Page) -> None:
-        if page in self._crash_listener_pages:
+        if page not in self._crash_listener_pages:
+            try:
+                page.on("crash", self._on_page_crashed)
+                self._crash_listener_pages.add(page)
+            except Exception:
+                LOG.debug("Failed to register page crash listener", exc_info=True)
+        self._observe_main_frame_navigation(page)
+
+    def _observe_main_frame_navigation(self, page: Page) -> None:
+        if page in self._main_frame_navigations:
             return
         try:
-            page.on("crash", self._on_page_crashed)
-            self._crash_listener_pages.add(page)
+            self._main_frame_navigations[page] = _MainFrameNavigation(page)
         except Exception:
-            LOG.debug("Failed to register page crash listener", exc_info=True)
+            LOG.debug("Failed to observe main-frame navigation", exc_info=True)
+
+    def _release_main_frame_navigations(self) -> None:
+        navigations = list(self._main_frame_navigations.values())
+        self._main_frame_navigations = weakref.WeakKeyDictionary()
+        for navigation in navigations:
+            navigation.detach()
+
+    async def wait_for_main_frame_navigation(self, page: Page, deadline: float) -> None:
+        navigation = self._main_frame_navigations.get(page)
+        if navigation is None or navigation.started_at is None or not navigation.is_pending:
+            return
+        # The navigation's own loading budget also caps the wait, so a later scrape cannot restart it.
+        waited_from = time.monotonic()
+        await navigation.wait(min(deadline, navigation.started_at + settings.BROWSER_LOADING_TIMEOUT_MS / 1000))
+        LOG.info(
+            "Waited for an in-flight page navigation before scraping",
+            settled=not navigation.is_pending and not navigation.closed,
+            waited_ms=int((time.monotonic() - waited_from) * 1000),
+        )
 
     def _on_page_crashed(self, page: Page) -> None:
         # A crashed tab stays in context.pages and keeps winning get_working_page, so later operations
@@ -975,6 +1284,9 @@ class RealBrowserState(BrowserState):
                 expected=False,
                 run_phase=self._run_phase,
             )
+            crash = PageCrashRecord(crashed_at=datetime.now(UTC), crashed_url=page.url, cause="page_crash")
+            self._page_crash_records.append(crash)
+            self._unreopened_page_crashes[page] = crash
         # Recorded before the close is scheduled: the close is a detached task, and until it lands the
         # crashed page is still in context.pages. Callers in that window must not be handed it.
         self._crashed_pages.add(page)
@@ -1127,15 +1439,7 @@ class RealBrowserState(BrowserState):
         observation_source: Literal["liveness_probe", "browser_event", "driver_event"] = "liveness_probe",
         disconnect_evidence: DisconnectEvidence = "liveness_state",
     ) -> None:
-        if self._browser_state_diagnostic is not None or not self._ever_connected:
-            return
-        pending = self._deferred_runtime_end
-        if (
-            self._runtime_events_deferred
-            and pending is not None
-            and pending.context is self.browser_context
-            and pending.driver is self.pw
-        ):
+        if not self._ever_connected:
             return
         observation = self._make_runtime_end_observation(
             reason,
@@ -1146,7 +1450,20 @@ class RealBrowserState(BrowserState):
             event=event,
             observation_source=observation_source,
             disconnect_evidence=disconnect_evidence,
+            provider_session_id=self.browser_artifacts.provider_session_id if self.browser_artifacts else None,
         )
+        # Before the first-diagnostic dedupe: a probe failure may already have latched the diagnostic.
+        self._latch_connection_loss(observation)
+        if self._browser_state_diagnostic is not None:
+            return
+        pending = self._deferred_runtime_end
+        if (
+            self._runtime_events_deferred
+            and pending is not None
+            and pending.context is self.browser_context
+            and pending.driver is self.pw
+        ):
+            return
         if self._runtime_events_deferred:
             self._deferred_runtime_end = observation
             return
@@ -1163,6 +1480,7 @@ class RealBrowserState(BrowserState):
         event: str = "browser_context_disconnected",
         observation_source: Literal["liveness_probe", "browser_event", "driver_event"] = "liveness_probe",
         disconnect_evidence: DisconnectEvidence = "liveness_state",
+        provider_session_id: str | None = None,
     ) -> _RuntimeEndObservation:
         disconnect_observed_at = datetime.now(UTC)
         diagnostic = BrowserStateDiagnostic(
@@ -1199,6 +1517,7 @@ class RealBrowserState(BrowserState):
             evidence=disconnect_evidence,
             close_requested=close_requested,
             run_phase=self._run_phase,
+            provider_session_id=provider_session_id if observation_source == "browser_event" and not expected else None,
         )
 
     def _replay_deferred_runtime_end(self) -> None:
@@ -1250,11 +1569,56 @@ class RealBrowserState(BrowserState):
             disconnect_observed_at=diagnostic.disconnect_observed_at.isoformat(),
             disconnect_observation_source=observation.source,
             close_requested=observation.close_requested,
-            remote_browser_session_id=diagnostic.browser_session_id,
+            remote_browser_session_id=diagnostic.browser_session_id or observation.provider_session_id,
         )
 
     def get_browser_state_diagnostic(self) -> BrowserStateDiagnostic | None:
         return self._browser_state_diagnostic
+
+    def _run_owner(self) -> str | None:
+        return self._runtime_event_context.workflow_run_id or self._runtime_event_context.task_id
+
+    def _latch_connection_loss(self, observation: _RuntimeEndObservation) -> None:
+        owner = self._run_owner()
+        # No run owns an unbound or not-yet-published state, so its loss is not a run's terminal fact.
+        if (
+            owner is None
+            or self._runtime_events_deferred
+            or observation.source != "browser_event"
+            or observation.expected
+            or observation.run_phase != "active"
+            or observation.context is None
+            or observation.context is not self.browser_context
+            or observation.driver is not self.pw
+            or (self._connection_loss is not None and self._connection_loss[0] == owner)
+        ):
+            return
+        self._connection_loss = (owner, observation.diagnostic)
+
+    @property
+    def page_crash_records(self) -> Sequence[PageCrashRecord]:
+        return self._page_crash_records
+
+    def get_browser_connection_loss(self) -> BrowserStateDiagnostic | None:
+        if self._connection_loss is None or self._connection_loss[0] != self._run_owner():
+            return None
+        return self._connection_loss[1]
+
+    @property
+    def active_run_owner(self) -> str | None:
+        return None if self._run_released else self._run_owner()
+
+    def _refuse_after_connection_loss(self) -> None:
+        # Reconnect, context rebuild and navigation for the owning run stop here, before any side effect.
+        connection_loss = self.get_browser_connection_loss()
+        if connection_loss is not None:
+            raise MissingBrowserState(
+                task_id=self._runtime_event_context.task_id,
+                workflow_run_id=self._runtime_event_context.workflow_run_id,
+                diagnostic=connection_loss,
+                detected_at=datetime.now(UTC),
+                failure_reason=BROWSER_CONNECTION_LOST_ERROR_CODE,
+            )
 
     def _connection_status(self) -> tuple[bool, str | None]:
         stopped = browser_context_stopped_reason(self.browser_context)
@@ -1281,6 +1645,7 @@ class RealBrowserState(BrowserState):
         browser_session_id: str | None = None,
         stale_context_is_unusable: bool = False,
     ) -> None:
+        self._refuse_after_connection_loss()
         # Rebuild through a fresh Playwright driver only after the old connection is known dead or
         # an explicitly unusable connection has completed bounded shutdown.
         stale_pw = self.pw
@@ -1446,6 +1811,7 @@ class RealBrowserState(BrowserState):
                 close_requested=stale_close_requested,
                 event=event,
                 observation_source=source,
+                provider_session_id=stale_browser_artifacts.provider_session_id if stale_browser_artifacts else None,
             )
 
         try:
@@ -1454,6 +1820,7 @@ class RealBrowserState(BrowserState):
             else:
                 fresh_pw = await async_playwright().start()
                 close_driver_connection_on_transport_loss(fresh_pw)
+                default_evaluate_to_main_world(fresh_pw)
         except BaseException:
             stale_diagnostic = self._browser_state_diagnostic
             stale_deferred_runtime_end = self._deferred_runtime_end
@@ -1629,6 +1996,7 @@ class RealBrowserState(BrowserState):
             raise FailedToStopLoadingPage(url=page.url, error_message=repr(e))
 
     async def new_page(self) -> Page:
+        self._refuse_after_connection_loss()
         if self.browser_context is None:
             raise EmptyBrowserContext()
         return await self.browser_context.new_page()
@@ -1679,7 +2047,8 @@ class RealBrowserState(BrowserState):
                 return
             except Exception as e:
                 self._record_reload_timeout(e)
-                if i < len(strategies) - 1:
+                # A reload that failed after the owning run lost its browser is final; degrading would send another.
+                if i < len(strategies) - 1 and self.get_browser_connection_loss() is None:
                     LOG.warning(
                         "Reload timed out, degrading wait strategy",
                         url=url,
@@ -1709,6 +2078,7 @@ class RealBrowserState(BrowserState):
         wait_seconds: float = 0,
         must_included_tags: list[str] | None = None,
         allow_transient_ui_suppression: bool = False,
+        navigation_deadline: float | None = None,
     ) -> ScrapedPage:
         page = await self.get_working_page()
         if page is not None:
@@ -1729,14 +2099,30 @@ class RealBrowserState(BrowserState):
             wait_seconds=wait_seconds,
             must_included_tags=must_included_tags,
             allow_transient_ui_suppression=allow_transient_ui_suppression,
+            navigation_deadline=navigation_deadline,
         )
 
-    async def close(self, close_browser_on_completion: bool = True, release_driver: bool | None = None) -> bool:
+    async def close(
+        self,
+        close_browser_on_completion: bool = True,
+        release_driver: bool | None = None,
+        *,
+        persist_session_state: bool = True,
+    ) -> bool:
         if self.external_browser:
+            # A keep-alive close (both controls off) leaves the pages to a later run, which still needs them tracked.
+            if close_browser_on_completion or release_driver is not False:
+                self._release_main_frame_navigations()
             if close_browser_on_completion:
                 await self._run_on_close_callbacks()
             if release_driver is not False:
-                await self.detach_remote_driver()
+                try:
+                    await self.detach_remote_driver()
+                except Exception:
+                    # ponytail: one best-effort kill of the local driver process, no retry; a driver that
+                    # survives it leaks until this worker exits. Add a retry watcher if that leak is ever seen.
+                    kill_driver_process(self.pw)
+                    raise
             return False
         # ``release_driver`` decouples the local Playwright driver's lifetime
         # from the remote browser's: callers that retain this state for reuse
@@ -1745,6 +2131,8 @@ class RealBrowserState(BrowserState):
         # ``release_driver_on_close`` marker.
         if release_driver is None:
             release_driver = close_browser_on_completion or self.release_driver_on_close
+        if close_browser_on_completion or release_driver:
+            self._release_main_frame_navigations()
         LOG.info("Closing browser state", sampling=True)
 
         # Each teardown phase runs in its OWN bounded region so a phase that hangs — a
@@ -1788,7 +2176,7 @@ class RealBrowserState(BrowserState):
                 nonlocal teardown_active, teardown_settled
                 teardown_active = True
                 try:
-                    await self._teardown_context()
+                    await self._teardown_context(persist_session_state=persist_session_state)
                 finally:
                     teardown_active = False
                     teardown_settled = True
@@ -1836,22 +2224,22 @@ class RealBrowserState(BrowserState):
         """
         if self._remote_driver_detached:
             return
-        if self.browser_context is not None:
-            interceptor = getattr(self.browser_context, "_skyvern_cdp_download_interceptor", None)
-            if interceptor is not None:
-                await interceptor.disable()
-                if getattr(self.browser_context, "_skyvern_cdp_download_interceptor", None) is interceptor:
-                    self.browser_context._skyvern_cdp_download_interceptor = None  # type: ignore[attr-defined]
-        if self.pw is not None:
-            context = self.browser_context
-            try:
-                async with asyncio.timeout(BROWSER_CLOSE_TIMEOUT):
+        context = self.browser_context
+        try:
+            async with asyncio.timeout(BROWSER_CLOSE_TIMEOUT):
+                if context is not None:
+                    interceptor = getattr(context, "_skyvern_cdp_download_interceptor", None)
+                    if interceptor is not None:
+                        await interceptor.disable()
+                        if getattr(context, "_skyvern_cdp_download_interceptor", None) is interceptor:
+                            context._skyvern_cdp_download_interceptor = None  # type: ignore[attr-defined]
+                if self.pw is not None:
                     self._expect_runtime_end("deliberate_detach", context)
                     await self.pw.stop()
-            except BaseException:
-                if context is not None:
-                    self._expected_runtime_ends.pop(context, None)
-                raise
+        except BaseException:
+            if context is not None:
+                self._expected_runtime_ends.pop(context, None)
+            raise
         self._remote_driver_detached = True
 
     async def _run_bounded_detachable(
@@ -1915,19 +2303,22 @@ class RealBrowserState(BrowserState):
 
         task.add_done_callback(_retrieve)
 
-    async def _teardown_context(self) -> None:
+    async def _teardown_context(self, *, persist_session_state: bool = True) -> None:
         # Only fire on-close observers on a real teardown. Shared / parent-child close calls pass
         # ``close_browser_on_completion=False`` to leave the browser alive for another run; firing
         # callbacks then would stop the surviving run's publisher and freeze its livestream.
-        await self._run_on_close_callbacks()
+        # A superseded attempt's close skips them and the cookie write: it must not touch its successor's state.
+        if persist_session_state:
+            await self._run_on_close_callbacks()
         if self.browser_context is None:
             return
         LOG.info("Closing browser context and its pages")
-        session_dir = self.browser_artifacts.browser_session_dir if self.browser_artifacts else None
-        try:
-            await persist_session_cookies(self.browser_context, session_dir)
-        except Exception:
-            LOG.warning("Failed to persist session cookies during teardown", exc_info=True)
+        if persist_session_state:
+            session_dir = self.browser_artifacts.browser_session_dir if self.browser_artifacts else None
+            try:
+                await persist_session_cookies(self.browser_context, session_dir)
+            except Exception:
+                LOG.warning("Failed to persist session cookies during teardown", exc_info=True)
         await self.browser_context.close()
         self._sessionless_init_script_registrations = []
         LOG.info("Main browser context and all its pages are closed")
@@ -1997,3 +2388,7 @@ class RealBrowserState(BrowserState):
             runtime_context=self._runtime_event_context,
             keep_partial_on_timeout=True,
         )
+
+
+def is_external_browser_state(browser_state: BrowserState | None) -> TypeGuard[RealBrowserState]:
+    return isinstance(browser_state, RealBrowserState) and browser_state.external_browser

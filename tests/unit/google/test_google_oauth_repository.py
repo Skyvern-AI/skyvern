@@ -7,7 +7,7 @@ from urllib.parse import parse_qs, urlparse
 import pytest
 import pytest_asyncio
 from fastapi import HTTPException
-from sqlalchemy import select
+from sqlalchemy import select, update
 from sqlalchemy.ext.asyncio import AsyncEngine, create_async_engine
 
 from skyvern.forge import app
@@ -22,6 +22,7 @@ from skyvern.forge.sdk.db.repositories.google_oauth import (
     STATE_REVOKED,
     GoogleOAuthRepository,
 )
+from skyvern.forge.sdk.encrypt import encryptor
 from skyvern.forge.sdk.encrypt.base import EncryptMethod
 from skyvern.forge.sdk.routes import google_oauth as google_oauth_routes
 from skyvern.forge.sdk.schemas.google_oauth import (
@@ -1007,6 +1008,69 @@ async def test_update_active_refresh_token_uses_token_identity_guard_across_rena
     assert stale_update is False
     assert stored.encrypted_refresh_token == "encrypted-rotated"
     assert stored.modified_at == rotated_at
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("rewritten_refresh_token", "rotation_persisted"),
+    [
+        pytest.param("rt-original", True, id="re-encrypted-same-token"),
+        pytest.param("rt-concurrent", False, id="rotated-by-another-refresh"),
+    ],
+)
+async def test_refresh_rotation_survives_reencryption_between_read_and_write(
+    repo: GoogleOAuthRepository,
+    engine: AsyncEngine,
+    monkeypatch: pytest.MonkeyPatch,
+    registered_encryption: None,
+    rewritten_refresh_token: str,
+    rotation_persisted: bool,
+) -> None:
+    credential_version = datetime.datetime(2026, 7, 30, 12, 0, 0)
+    async with engine.begin() as conn:
+        await conn.execute(
+            GoogleOAuthCredentialModel.__table__.insert().values(
+                id="gcred_rotation",
+                organization_id="o_test",
+                credential_name="Default",
+                state=STATE_ACTIVE,
+                encrypted_refresh_token=await encryptor.encrypt("rt-original", EncryptMethod.AES),
+                encrypted_method=EncryptMethod.AES.value,
+                created_at=credential_version,
+                modified_at=credential_version,
+            )
+        )
+    monkeypatch.setattr(app, "DATABASE", SimpleNamespace(google_oauth=repo))
+    secrets = await google_oauth_service.load_credential_secrets("o_test", "gcred_rotation")
+
+    # The GCM backfill (or a concurrent refresh) rewrites the row after the refresh read it.
+    async with engine.begin() as conn:
+        await conn.execute(
+            update(GoogleOAuthCredentialModel)
+            .where(GoogleOAuthCredentialModel.id == "gcred_rotation")
+            .values(
+                encrypted_refresh_token=await encryptor.encrypt(rewritten_refresh_token, EncryptMethod.AES_GCM),
+                encrypted_method=EncryptMethod.AES_GCM.value,
+            )
+        )
+    monkeypatch.setattr(
+        google_oauth_service,
+        "credentials_from_secrets",
+        AsyncMock(return_value=SimpleNamespace(token="at-refreshed", refresh_token="rt-rotated")),
+    )
+
+    if rotation_persisted:
+        await google_oauth_service.refresh_and_rotate(
+            organization_id="o_test", credential_id="gcred_rotation", credential_secrets=secrets
+        )
+    else:
+        with pytest.raises(google_oauth_service.RotatedRefreshTokenPersistenceError):
+            await google_oauth_service.refresh_and_rotate(
+                organization_id="o_test", credential_id="gcred_rotation", credential_secrets=secrets
+            )
+
+    stored = await google_oauth_service.load_credential_secrets("o_test", "gcred_rotation")
+    assert stored.refresh_token == ("rt-rotated" if rotation_persisted else rewritten_refresh_token)
 
 
 @pytest.mark.asyncio

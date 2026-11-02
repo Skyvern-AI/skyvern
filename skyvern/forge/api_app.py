@@ -4,7 +4,6 @@
 # ruff: noqa: E402
 
 import asyncio
-import os
 import uuid
 from contextlib import asynccontextmanager
 from datetime import datetime
@@ -48,6 +47,7 @@ from skyvern.forge.sdk.db.exceptions import DatabaseConnectionUnavailableError, 
 from skyvern.forge.sdk.db.models import Base
 from skyvern.forge.sdk.executor.background_task_executor import BackgroundTaskExecutor
 from skyvern.forge.sdk.executor.factory import AsyncExecutorFactory
+from skyvern.forge.sdk.executor.run_liveness import start_run_lease_tasks, stop_run_lease_tasks
 from skyvern.forge.sdk.routes import internal_auth, internal_llms
 from skyvern.forge.sdk.routes.google_oauth import google_oauth_router
 from skyvern.forge.sdk.routes.google_sheets import google_sheets_router
@@ -62,13 +62,14 @@ from skyvern.forge.sdk.services.local_org_auth_token_service import (
     regenerate_local_api_key,
 )
 from skyvern.forge.sdk.services.route_authorization import ROUTE_AUTHORIZATION_DEPENDENCY
-from skyvern.services.browser_recording.session_registry import interpretation_registry
 from skyvern.services.cleanup_service import (
     start_cleanup_scheduler,
     start_temp_artifact_sweep,
     stop_cleanup_scheduler,
     stop_temp_artifact_sweep,
 )
+from skyvern.services.hosted_driver_sweep import start_hosted_driver_sweep, stop_hosted_driver_sweep
+from skyvern.services.orphaned_run_reaper import reap_orphaned_runs_once
 from skyvern.services.workflow_run_group_service import run_workflow_run_group_recovery_loop
 from skyvern.services.workflow_schedule_service import (
     start_workflow_schedule_scheduler,
@@ -82,7 +83,10 @@ SAFE_METHODS = frozenset({"GET", "HEAD", "OPTIONS"})
 
 
 async def handle_skyvern_http_exception(request: Request, exc: SkyvernHTTPException) -> JSONResponse:
-    return JSONResponse(status_code=exc.status_code, content={"detail": exc.message})
+    content: dict[str, str | None] = {"detail": exc.message}
+    if exc.error_code is not None:
+        content["error_code"] = exc.error_code
+    return JSONResponse(status_code=exc.status_code, content=content, headers=exc.headers)
 
 
 async def db_unavailable_handler(
@@ -150,7 +154,11 @@ class SecurityHeadersMiddleware:
 def add_credentialed_cors_middleware(fastapi_app: FastAPI) -> None:
     fastapi_app.add_middleware(
         CORSMiddleware,
-        **cors_middleware_kwargs(settings.ALLOWED_ORIGINS, settings.ALLOWED_ORIGIN_REGEX),
+        **cors_middleware_kwargs(
+            settings.ALLOWED_ORIGINS,
+            settings.ALLOWED_ORIGIN_REGEX,
+            expose_headers=["X-Next-Cursor", "Retry-After", "X-Has-More"],
+        ),
     )
 
 
@@ -193,6 +201,19 @@ class ExecutionDatePlugin(Plugin):
         return datetime.now()
 
 
+def strip_internal_schema_properties(openapi_schema: dict) -> None:
+    """Drop component properties marked ``x-internal`` so they stay out of the public docs and the SDK."""
+    for schema in openapi_schema.get("components", {}).get("schemas", {}).values():
+        properties = schema.get("properties")
+        if not properties:
+            continue
+        internal = [name for name, prop in properties.items() if isinstance(prop, dict) and prop.get("x-internal")]
+        for name in internal:
+            del properties[name]
+        if internal and "required" in schema:
+            schema["required"] = [name for name in schema["required"] if name not in internal]
+
+
 def custom_openapi(app: FastAPI) -> dict:
     if app.openapi_schema:
         return app.openapi_schema
@@ -207,6 +228,7 @@ def custom_openapi(app: FastAPI) -> dict:
         {"url": "https://api-staging.skyvern.com", "x-fern-server-name": "Staging"},
         {"url": "http://localhost:8000", "x-fern-server-name": "Local"},
     ]
+    strip_internal_schema_properties(openapi_schema)
     app.openapi_schema = openapi_schema
     return app.openapi_schema
 
@@ -283,6 +305,7 @@ _SQLITE_ADDED_COLUMNS: tuple[tuple[str, str, str], ...] = (
     ("tasks", "attempt_number", "INTEGER"),
     ("workflow_run_blocks", "attempt_number", "INTEGER"),
     ("google_oauth_credentials", "google_subject", "VARCHAR"),
+    ("tasks", "task_queue", "VARCHAR"),
 )
 
 
@@ -413,6 +436,7 @@ async def lifespan(fastapi_app: FastAPI) -> AsyncGenerator[None, Any]:
         LOG.info("Cleanup scheduler started")
 
     start_temp_artifact_sweep()
+    start_hosted_driver_sweep()
 
     workflow_schedule_task = start_workflow_schedule_scheduler()
     if workflow_schedule_task:
@@ -430,6 +454,11 @@ async def lifespan(fastapi_app: FastAPI) -> AsyncGenerator[None, Any]:
         if isinstance(AsyncExecutorFactory.get_executor(), BackgroundTaskExecutor)
         else None
     )
+    if (
+        isinstance(AsyncExecutorFactory.get_executor(), BackgroundTaskExecutor)
+        and settings.RUN_HEARTBEAT_TIMEOUT_MINUTES > 0
+    ):
+        start_run_lease_tasks(reap_orphaned_runs_once)
     try:
         if mcp_app:
             async with mcp_app.lifespan(mcp_app):
@@ -445,6 +474,7 @@ async def lifespan(fastapi_app: FastAPI) -> AsyncGenerator[None, Any]:
         await asyncio.gather(
             retry_recovery_task, *([group_recovery_task] if group_recovery_task else []), return_exceptions=True
         )
+        await stop_run_lease_tasks()
         # The initial pass starts the periodic sweep even when cancelled; stop it so the loop can drain.
         await AsyncExecutorFactory.get_executor().stop_retry_recovery()
 
@@ -452,7 +482,7 @@ async def lifespan(fastapi_app: FastAPI) -> AsyncGenerator[None, Any]:
     await stop_workflow_schedule_scheduler()
     await stop_cleanup_scheduler()
     await stop_temp_artifact_sweep()
-    await interpretation_registry.stop_all()
+    await stop_hosted_driver_sweep()
 
     if forge_app.api_app_shutdown_event:
         LOG.info("Calling api app shutdown event")
@@ -489,26 +519,7 @@ def create_api_app() -> FastAPI:
         except Exception as e:
             LOG.warning("Failed to initialize OTEL tracer provider early", error=str(e))
 
-    forge_app_instance = start_forge_app()
-
-    # Initialize Laminar tracing after ForgeApp so auto-instrumentation works.
-    lmnr_api_key = os.environ.get("LMNR_PROJECT_API_KEY")
-    if lmnr_api_key:
-        try:
-            from lmnr import Laminar  # noqa: PLC0415
-
-            lmnr_base_url = os.environ.get("LMNR_BASE_URL", "http://localhost")
-            lmnr_grpc_port = int(os.environ.get("LMNR_GRPC_PORT", "8001"))
-            lmnr_http_port = int(os.environ.get("LMNR_HTTP_PORT", "8000"))
-            Laminar.initialize(
-                project_api_key=lmnr_api_key,
-                base_url=lmnr_base_url,
-                grpc_port=lmnr_grpc_port,
-                http_port=lmnr_http_port,
-            )
-            LOG.info("Laminar tracing initialized", base_url=lmnr_base_url, grpc_port=lmnr_grpc_port)
-        except Exception as e:
-            LOG.warning("Failed to initialize Laminar tracing", error=str(e))
+    forge_app_instance = start_forge_app(load_api_modules=True)
 
     assert_signing_key_usable()
     fastapi_app = FastAPI(lifespan=lifespan)
@@ -557,9 +568,8 @@ def create_api_app() -> FastAPI:
         include_in_schema=False,
         dependencies=[ROUTE_AUTHORIZATION_DEPENDENCY],
     )
-    # Twilio SMS 2FA: public inbound receiver (secret-URL + signature auth inside
-    # the handler) and the org-scoped integration management routes. Same
-    # dual-prefix + include_in_schema=False pattern as the OAuth routers above.
+    # Inbound SMS uses secret-URL and signature authentication. Only the canonical
+    # organization-scoped integration routes appear in the public schema.
     fastapi_app.include_router(
         sms_inbound_router, prefix="/v1/sms", include_in_schema=False, dependencies=[ROUTE_AUTHORIZATION_DEPENDENCY]
     )
@@ -569,7 +579,6 @@ def create_api_app() -> FastAPI:
     fastapi_app.include_router(
         twilio_integration_router,
         prefix="/v1/integrations/twilio",
-        include_in_schema=False,
         dependencies=[ROUTE_AUTHORIZATION_DEPENDENCY],
     )
     fastapi_app.include_router(
@@ -634,7 +643,9 @@ def create_api_app() -> FastAPI:
             # Both validation messages and unknown field names can contain reported contact details.
             return JSONResponse(status_code=422, content={"detail": "invalid_onboarding_data"})
         sensitive_prefixes = ("/v1/credentials", "/api/v1/credentials", "/v1/browser_sessions/external")
-        if not any(path == prefix or path.startswith(f"{prefix}/") for prefix in sensitive_prefixes):
+        if path != "/v1/agent_feedback" and not any(
+            path == prefix or path.startswith(f"{prefix}/") for prefix in sensitive_prefixes
+        ):
             return await request_validation_exception_handler(request, exc)
 
         return JSONResponse(

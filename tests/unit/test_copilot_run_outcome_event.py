@@ -19,6 +19,7 @@ from skyvern.forge.sdk.copilot import tools as copilot_tools
 from skyvern.forge.sdk.copilot.agent import _build_narrative_payload
 from skyvern.forge.sdk.copilot.completion_verification import CompletionVerificationResult, CriterionVerdict
 from skyvern.forge.sdk.copilot.context import CopilotContext, upsert_narrative_block_attempt
+from skyvern.forge.sdk.copilot.repair_origin_run import OriginOutputSnapshot, SelectedOutputSource
 from skyvern.forge.sdk.copilot.request_policy import CompletionCriterion, RequestPolicy
 from skyvern.forge.sdk.copilot.run_outcome import (
     RecordedRunOutcome,
@@ -28,10 +29,14 @@ from skyvern.forge.sdk.copilot.run_outcome import (
 from skyvern.forge.sdk.copilot.tools import run_execution
 from skyvern.forge.sdk.copilot.tools.run_execution import (
     _INTERNAL_RUN_CANCELLED_BY_WATCHDOG_KEY,
+    _outcome_stamp_block_ids,
     _record_executed_block_labels,
     _record_run_blocks_result,
     _recorded_run_outcome,
     _recorded_watchdog_block_receipts,
+    _send_run_outcome_update,
+    _send_run_started_update,
+    _skipped_prefix_blocks,
     _stash_recorded_run_outcome,
     _verify_and_record_run_blocks_result,
 )
@@ -180,6 +185,7 @@ def _ctx(blocks: list[dict[str, Any]] | None = None) -> CopilotContext:
     ctx.verified_prefix_labels = labels
     ctx.composition_verified_labels = list(labels)
     ctx.last_run_blocks_block_ids = [f"wrb_{label}" for label in labels]
+    ctx.last_run_outcome_block_ids = list(ctx.last_run_blocks_block_ids)
     ctx.last_run_blocks_block_labels = labels
     return ctx
 
@@ -955,7 +961,7 @@ def _payload_ctx() -> CopilotContext:
 def test_narrative_payload_stamps_outcome_on_adjudicated_labels() -> None:
     ctx = _payload_ctx()
     ctx.last_run_blocks_workflow_run_id = "wr_test"
-    ctx.last_run_blocks_block_ids = ["wrb_1", "wrb_2"]
+    ctx.last_run_outcome_block_ids = ["wrb_1", "wrb_2"]
     _stash_recorded_run_outcome(
         ctx,
         RecordedRunOutcome(
@@ -1079,3 +1085,132 @@ async def test_conclude_cue_absent_when_nothing_verified(monkeypatch: pytest.Mon
     await _verify_and_record_run_blocks_result(ctx, result, time.monotonic())
 
     assert result["data"].get("next_step") is None
+
+
+def _archive(ctx: CopilotContext, row: WorkflowRunBlock) -> None:
+    upsert_narrative_block_attempt(
+        ctx.narrative_block_attempts,
+        workflow_run_block_id=row.workflow_run_block_id,
+        workflow_run_id=row.workflow_run_id,
+        label=row.label or "",
+        block_type="code",
+        status=row.status or "running",
+        iteration=1,
+        started_at="2026-01-01T00:00:00+00:00",
+        ended_at="2026-01-01T00:00:01+00:00",
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("row_statuses", "archived_labels", "stamped_labels"),
+    [
+        (
+            {"open_registry_search": "completed", "search_registry_person": "failed"},
+            ["open_registry_search", "search_registry_person"],
+            ["search_registry_person"],
+        ),
+        (
+            {"open_registry_search": "completed", "search_registry_person": "completed"},
+            ["open_registry_search", "search_registry_person"],
+            ["open_registry_search", "search_registry_person"],
+        ),
+        (
+            {"open_registry_search": "completed", "expand_result_rows": "failed"},
+            ["open_registry_search"],
+            ["expand_result_rows"],
+        ),
+    ],
+)
+async def test_run_verdict_reaches_only_rows_that_did_not_complete_once_a_row_failed(
+    row_statuses: dict[str, str], archived_labels: list[str], stamped_labels: list[str]
+) -> None:
+    reason = "The search form rejected the query."
+    rows = [_run_block(label, status) for label, status in row_statuses.items()]
+    ctx = _ctx()
+    for row in rows:
+        if row.label in archived_labels:
+            _archive(ctx, row)
+    ctx.last_run_blocks_workflow_run_id = "wr_test"
+    ctx.last_run_blocks_block_ids = [row.workflow_run_block_id for row in rows]
+    ctx.last_run_outcome_block_ids = _outcome_stamp_block_ids(rows)
+
+    _stash_recorded_run_outcome(
+        ctx,
+        RecordedRunOutcome(
+            verdict="not_demonstrated",
+            reason_code="blocker_reported",
+            display_reason=reason,
+            workflow_run_id="wr_test",
+            run_completed=False,
+        ),
+    )
+    await _send_run_outcome_update(
+        ctx, _run_result([]), verdict="not_demonstrated", reason_code="blocker_reported", display_reason=reason
+    )
+    payload = _build_narrative_payload(ctx, terminal="response", terminal_message="done", narrative_summary=None)
+
+    event = ctx.stream.sent[-1]
+    assert isinstance(event, WorkflowCopilotRunOutcomeUpdate)
+    assert event.workflow_run_block_ids == ctx.last_run_outcome_block_ids
+    assert event.workflow_run_block_ids == [f"wrb_{label}" for label in stamped_labels]
+    for block in payload["blocks"]:
+        if block["label"] in stamped_labels:
+            assert block["outcome"] == "not_demonstrated"
+            assert block["outcomeReason"] == reason
+        else:
+            assert "outcome" not in block
+            assert "outcomeReason" not in block
+
+
+def test_skipped_prefix_lists_requested_blocks_before_the_start_in_workflow_order() -> None:
+    source = SelectedOutputSource(
+        "select_record",
+        "wr_source",
+        "banked",
+        OriginOutputSnapshot(SimpleNamespace(), {}),  # type: ignore[arg-type]
+    )
+
+    skipped = _skipped_prefix_blocks(
+        ["load_records", "select_record", "open_registry_search", "search_registry_person", "cleanup"],
+        requested_labels=["search_registry_person", "load_records", "select_record", "open_registry_search"],
+        labels_that_may_execute=["search_registry_person", "cleanup"],
+        frontier_start_label="search_registry_person",
+        seeded_labels={"select_record", "open_registry_search"},
+        output_sources={"select_record": source},
+    )
+
+    assert skipped == [
+        {"label": "load_records", "kind": "not_run"},
+        {"label": "select_record", "kind": "reused", "sourceWorkflowRunId": "wr_source"},
+        {"label": "open_registry_search", "kind": "reused"},
+    ]
+    assert (
+        _skipped_prefix_blocks(
+            ["cleanup", "search_registry_person"],
+            requested_labels=["cleanup", "search_registry_person"],
+            labels_that_may_execute=["search_registry_person", "cleanup"],
+            frontier_start_label="search_registry_person",
+            seeded_labels=set(),
+            output_sources={},
+        )
+        == []
+    )
+
+
+@pytest.mark.asyncio
+async def test_skipped_prefix_reaches_the_run_started_event_and_the_payload_through_the_runs_first_attempt() -> None:
+    ctx = _ctx()
+    skipped = [{"label": "open_registry_search", "kind": "reused"}]
+    ctx.skipped_prefix_by_run_id["wr_test"] = skipped  # type: ignore[assignment]
+    ctx.skipped_prefix_by_run_id["wr_evicted"] = [{"label": "load_records", "kind": "not_run"}]
+
+    await _send_run_started_update(ctx, "wr_test")
+
+    assert ctx.stream.sent[-1].skipped_prefix == skipped
+
+    _archive(ctx, _run_block("search_registry_person", "running"))
+    _archive(ctx, _run_block("expand_result_rows", "failed"))
+    payload = _build_narrative_payload(ctx, terminal="cancelled", terminal_message=None, narrative_summary=None)
+
+    assert [block.get("skippedBefore") for block in payload["blocks"]] == [skipped, None]

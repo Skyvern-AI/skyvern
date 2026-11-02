@@ -5,6 +5,7 @@ import type {
   CredentialDeleteReview,
   QuestionInteraction,
 } from "../workflowCopilotTypes";
+import { PermissionsTestProvider } from "@/testUtils/permissions";
 import {
   CredentialDeleteReceipt,
   CredentialDeleteReviewCard,
@@ -25,6 +26,71 @@ const review: CredentialDeleteReview = {
 };
 
 describe("credential deletion card", () => {
+  it("keeps the delete action enabled for an Admin", () => {
+    const onConfirm = vi.fn();
+    render(
+      <PermissionsTestProvider
+        role="admin"
+        capabilities={["credential.delete"]}
+      >
+        <CredentialDeleteReviewCard
+          review={review}
+          disabled={false}
+          deleting={false}
+          lockReason={null}
+          collapsed={false}
+          onCollapsedChange={() => {}}
+          onConfirm={onConfirm}
+          onCancel={() => {}}
+        />
+      </PermissionsTestProvider>,
+    );
+
+    const deleteButton = screen.getByRole("button", {
+      name: "Delete 2 credentials",
+    });
+    expect((deleteButton as HTMLButtonElement).disabled).toBe(false);
+    fireEvent.click(deleteButton);
+    expect(onConfirm).toHaveBeenCalledWith(["cred_a", "cred_b"]);
+  });
+
+  it("asks a Member to contact an Admin without exposing a delete action", () => {
+    const onConfirm = vi.fn();
+    const onCancel = vi.fn();
+    render(
+      <PermissionsTestProvider
+        role="member"
+        capabilities={["credential.delete"]}
+      >
+        <CredentialDeleteReviewCard
+          review={review}
+          disabled={false}
+          deleting={false}
+          lockReason={null}
+          collapsed={false}
+          onCollapsedChange={() => {}}
+          onConfirm={onConfirm}
+          onCancel={onCancel}
+        />
+      </PermissionsTestProvider>,
+    );
+
+    expect(screen.getByRole("status").textContent).toBe(
+      "Ask an Admin to delete these credentials.",
+    );
+    expect(screen.getAllByText(/Ask an Admin/)).toHaveLength(1);
+    expect(
+      screen.getByRole("checkbox", { name: /Billing/ }).matches(":disabled"),
+    ).toBe(true);
+    expect(screen.queryByRole("button", { name: /Delete/ })).toBeNull();
+    expect(onConfirm).not.toHaveBeenCalled();
+
+    const cancelButton = screen.getByRole("button", { name: "Cancel" });
+    expect((cancelButton as HTMLButtonElement).disabled).toBe(false);
+    fireEvent.click(cancelButton);
+    expect(onCancel).toHaveBeenCalledOnce();
+  });
+
   it("confirms only the entries left checked and never presents a subset as the whole vault", () => {
     const onConfirm = vi.fn();
     render(

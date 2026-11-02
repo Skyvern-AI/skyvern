@@ -8,12 +8,14 @@ import re
 from datetime import UTC, datetime, timedelta, timezone
 from types import SimpleNamespace
 from typing import Any
-from unittest.mock import AsyncMock, MagicMock
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 import pytest_asyncio
 from sqlalchemy import event, select, text
+from sqlalchemy.exc import OperationalError
 from sqlalchemy.ext.asyncio import AsyncEngine, async_sessionmaker
+from sqlalchemy.sql.sqltypes import NullType
 from structlog.testing import capture_logs
 from structlog.types import EventDict
 
@@ -29,6 +31,8 @@ from skyvern.forge.sdk.artifact.models import ArtifactType
 from skyvern.forge.sdk.db.agent_db import AgentDB, _build_engine
 from skyvern.forge.sdk.db.datetime_utils import naive_utc_now
 from skyvern.forge.sdk.db.enums import BrowserSeedSource
+from skyvern.forge.sdk.db.exceptions import RunsListSearchCanceled
+from skyvern.forge.sdk.db.id import generate_task_id, generate_workflow_run_id
 from skyvern.forge.sdk.db.models import (
     ArtifactModel,
     Base,
@@ -46,6 +50,7 @@ from skyvern.forge.sdk.db.models import (
     WorkflowRunModel,
 )
 from skyvern.forge.sdk.db.repositories import workflow_run_attempts as attempts_repository_module
+from skyvern.forge.sdk.db.repositories import workflow_runs as workflow_runs_repository
 from skyvern.forge.sdk.db.repositories.workflow_run_attempts import TerminalSideEffectCheckpoint
 from skyvern.forge.sdk.db.repositories.workflow_runs import WorkflowRunsRepository
 from skyvern.forge.sdk.schemas.persistent_browser_sessions import FORCED_WORKFLOW_SESSION_RUNNABLE_TYPE
@@ -53,11 +58,16 @@ from skyvern.forge.sdk.schemas.tasks import TaskStatus
 from skyvern.forge.sdk.workflow import service as workflow_service_module
 from skyvern.forge.sdk.workflow.models.parameter import CredentialParameter
 from skyvern.forge.sdk.workflow.models.workflow import WorkflowDefinition, WorkflowRunStatus
-from skyvern.forge.sdk.workflow.retry_policy import LEASE_TAKEOVER_SECONDS, is_retry_eligible_run
+from skyvern.forge.sdk.workflow.retry_policy import (
+    LEASE_TAKEOVER_SECONDS,
+    WEBHOOK_FALLBACK_GRACE_SECONDS,
+    is_retry_eligible_run,
+)
 from skyvern.forge.taskv3.loop import LoopOutcome
 from skyvern.schemas.run_enums import RunType
 from skyvern.schemas.runs import MAX_SEARCH_FETCH_LIMIT
 from skyvern.schemas.workflows import WorkflowRetryPolicy
+from tests.unit.statement_timeout_fakes import FakeQueryCanceled
 
 
 class _SessionContext:
@@ -280,26 +290,43 @@ async def test_prepare_next_attempt_reopens_the_task_run_mirror(sqlite_db: Agent
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("strategy", ["round_robin", "random"])
 @pytest.mark.parametrize(
-    "seed_source, pool_size, sequential, retained_session, retained_address, replacement_address, resets_seed",
+    "strategy, seed_source, pool_size, sequential, retained_session, retained_address, replacement_address, resets_seed",
     [
-        (BrowserSeedSource.credential, 2, False, None, None, None, True),
-        (BrowserSeedSource.own_memory, 2, False, None, None, None, True),
-        (BrowserSeedSource.credential, 1, False, None, None, None, False),
-        (BrowserSeedSource.own_memory, 1, False, None, None, None, False),
-        (BrowserSeedSource.credential, 2, True, None, None, None, False),
-        (BrowserSeedSource.override, 2, False, None, None, None, False),
-        (BrowserSeedSource.picked, 2, False, None, None, None, False),
-        (BrowserSeedSource.fresh, 2, False, None, None, None, False),
-        (BrowserSeedSource.credential, 2, False, "explicit", None, None, False),
-        (BrowserSeedSource.own_memory, 2, False, "explicit", None, None, False),
-        (BrowserSeedSource.credential, 2, False, "forced", None, None, False),
-        (BrowserSeedSource.own_memory, 2, False, "forced", None, None, False),
-        (BrowserSeedSource.credential, 2, False, None, "retained-cdp.example.test", None, False),
-        (BrowserSeedSource.own_memory, 2, False, None, "retained-cdp.example.test", None, False),
-        (BrowserSeedSource.credential, 2, False, None, "retained-cdp.example.test", "healthy-cdp.example.test", True),
-        (BrowserSeedSource.own_memory, 2, False, None, "retained-cdp.example.test", "healthy-cdp.example.test", True),
+        ("random", BrowserSeedSource.credential, 2, False, None, None, None, True),
+        *[
+            ("round_robin", *case)
+            for case in [
+                (BrowserSeedSource.credential, 2, False, None, None, None, True),
+                (BrowserSeedSource.own_memory, 2, False, None, None, None, True),
+                (BrowserSeedSource.credential, 1, False, None, None, None, False),
+                (BrowserSeedSource.credential, 2, True, None, None, None, False),
+                (BrowserSeedSource.override, 2, False, None, None, None, False),
+                (BrowserSeedSource.picked, 2, False, None, None, None, False),
+                (BrowserSeedSource.fresh, 2, False, None, None, None, False),
+                (BrowserSeedSource.credential, 2, False, "explicit", None, None, False),
+                (BrowserSeedSource.credential, 2, False, "forced", None, None, False),
+                (BrowserSeedSource.credential, 2, False, None, "retained-cdp.example.test", None, False),
+                (
+                    BrowserSeedSource.credential,
+                    2,
+                    False,
+                    None,
+                    "retained-cdp.example.test",
+                    "healthy-cdp.example.test",
+                    True,
+                ),
+                (
+                    BrowserSeedSource.own_memory,
+                    2,
+                    False,
+                    None,
+                    "retained-cdp.example.test",
+                    "healthy-cdp.example.test",
+                    True,
+                ),
+            ]
+        ],
     ],
 )
 async def test_prepare_next_attempt_invalidates_only_rotated_credential_seed(
@@ -362,7 +389,9 @@ async def test_prepare_next_attempt_invalidates_only_rotated_credential_seed(
                     attempt_number=1,
                     status="failed",
                     retry_decision="retry",
-                    pinned_browser_session_id=retained_session_id if retained_session == "explicit" else None,
+                    pinned_browser_session_id=retained_session_id
+                    if retained_session in ("explicit", "forced")
+                    else None,
                 ),
                 WorkflowRunCredentialSelectionModel(
                     workflow_run_id="wr_seed",
@@ -385,12 +414,6 @@ async def test_prepare_next_attempt_invalidates_only_rotated_credential_seed(
         )
         await session.commit()
 
-    if retained_session == "forced":
-        await sqlite_db.workflow_run_attempts.pin_first_attempt_browser_session_if_unset(
-            workflow_run_id="wr_seed",
-            organization_id="org_test",
-            browser_session_id="pbs_retained",
-        )
     attempts = await sqlite_db.workflow_run_attempts.get_attempts("wr_seed")
     preparation = await sqlite_db.workflow_runs.prepare_next_attempt_atomic(
         workflow_run_id="wr_seed",
@@ -872,6 +895,50 @@ def _persistent_browser_session_model(
         runnable_type=runnable_type,
         created_at=now,
         modified_at=now,
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("pinned_elsewhere", [False, True])
+async def test_forced_session_link_commits_only_with_its_first_attempt_pin(
+    sqlite_db: AgentDB, pinned_elsewhere: bool
+) -> None:
+    async with sqlite_db.Session() as session:
+        session.add(
+            _workflow_run_model(
+                workflow_run_id="wr_forced",
+                queued_at=datetime(2026, 10, 30, tzinfo=timezone.utc),
+                status=WorkflowRunStatus.running.value,
+            )
+        )
+        session.add(
+            WorkflowRunAttemptModel(
+                workflow_run_id="wr_forced",
+                organization_id="org_test",
+                attempt_number=1,
+                status="running",
+                pinned_browser_session_id="pbs_other" if pinned_elsewhere else None,
+            )
+        )
+        session.add(_persistent_browser_session_model(persistent_browser_session_id="pbs_forced"))
+        await session.commit()
+
+    linked = await sqlite_db.workflow_runs.link_browser_session_for_dispatch(
+        workflow_run_id="wr_forced",
+        organization_id="org_test",
+        browser_session_id="pbs_forced",
+        attempt_number=1,
+        dispatch_claim_started_at=None,
+        expected_browser_session_id=None,
+        pin_first_attempt=True,
+    )
+
+    run = await sqlite_db.workflow_runs.get_workflow_run("wr_forced", "org_test")
+    (attempt,) = await sqlite_db.workflow_run_attempts.get_attempts("wr_forced")
+    # A linked run whose first attempt is unpinned would let a later retry drop its forced session.
+    assert run is not None
+    assert (linked, run.browser_session_id, attempt.pinned_browser_session_id) == (
+        (False, None, "pbs_other") if pinned_elsewhere else (True, "pbs_forced", "pbs_forced")
     )
 
 
@@ -1480,6 +1547,217 @@ async def test_if_not_final_cas_loser_cannot_change_attribution(sqlite_db: Agent
 
 
 @pytest.mark.asyncio
+async def test_if_not_final_queued_returns_the_written_row_on_one_checkout(
+    sqlite_db: AgentDB, sqlite_engine: AsyncEngine
+) -> None:
+    created_at = datetime(2026, 10, 1, 12, 0)
+    async with sqlite_db.Session() as session:
+        run = _workflow_run_model(
+            workflow_run_id="wr_returning_queued", queued_at=created_at, status=WorkflowRunStatus.created.value
+        )
+        run.queued_at = None
+        session.add(run)
+        await session.commit()
+
+    statements, on_execute = _capture_sql(sqlite_engine)
+    pool = sqlite_engine.sync_engine.pool
+    checkouts: list[object] = []
+
+    def on_checkout(*args: object) -> None:
+        checkouts.append(args)
+
+    event.listen(pool, "checkout", on_checkout)
+    try:
+        queued = await sqlite_db.workflow_runs.update_workflow_run_if_not_final(
+            "wr_returning_queued", WorkflowRunStatus.queued, job_id="job_returning"
+        )
+    finally:
+        event.remove(sqlite_engine.sync_engine, "before_cursor_execute", on_execute)
+        event.remove(pool, "checkout", on_checkout)
+
+    assert queued is not None
+    assert queued == await sqlite_db.workflow_runs.get_workflow_run("wr_returning_queued")
+    assert queued.status == WorkflowRunStatus.queued
+    assert queued.job_id == "job_returning"
+    assert queued.queued_at is not None
+    assert queued.modified_at > created_at
+    # Only the pre-read that decides queued_at selects the run; the result comes from the UPDATE itself.
+    assert sum(s.startswith("SELECT") and "FROM workflow_runs" in s for s in statements) == 1
+    assert len(checkouts) == 1
+
+
+@pytest.mark.asyncio
+async def test_if_not_final_returns_the_terminal_row_and_none_once_final(sqlite_db: AgentDB) -> None:
+    async with sqlite_db.Session() as session:
+        session.add(
+            _workflow_run_model(
+                workflow_run_id="wr_returning_final",
+                queued_at=_ATTR_QUEUED_AT,
+                status=WorkflowRunStatus.queued.value,
+            )
+        )
+        await session.commit()
+
+    running = await sqlite_db.workflow_runs.update_workflow_run_if_not_final(
+        "wr_returning_final", WorkflowRunStatus.running
+    )
+    assert running is not None
+    assert running == await sqlite_db.workflow_runs.get_workflow_run("wr_returning_final")
+    assert running.started_at is not None
+
+    # A caller's ambient session that already holds a stale copy of the row must not leak it into the result.
+    async with sqlite_db.Session() as session:
+        stale = await session.get(WorkflowRunModel, "wr_returning_final")
+        assert stale is not None and stale.failure_reason is None
+        # A Core write leaves the loaded copy untouched, as a concurrent writer would.
+        await session.execute(
+            text("UPDATE workflow_runs SET failure_reason = 'set elsewhere' WHERE workflow_run_id = :id"),
+            {"id": "wr_returning_final"},
+        )
+        failed = await sqlite_db.workflow_runs.update_workflow_run_if_not_final(
+            "wr_returning_final", WorkflowRunStatus.failed, failure_category=[{"category": "UNKNOWN"}]
+        )
+    fresh = await sqlite_db.workflow_runs.get_workflow_run("wr_returning_final")
+    assert failed is not None
+    assert failed == fresh
+    assert failed.status == WorkflowRunStatus.failed
+    assert failed.failure_reason == "set elsewhere"
+    assert failed.started_at == running.started_at
+    assert failed.finished_at is not None
+
+    assert (
+        await sqlite_db.workflow_runs.update_workflow_run_if_not_final("wr_returning_final", WorkflowRunStatus.canceled)
+        is None
+    )
+    assert await sqlite_db.workflow_runs.get_workflow_run("wr_returning_final") == fresh
+
+
+@pytest.mark.asyncio
+async def test_if_not_final_latest_attempt_guard_returns_the_row_only_for_the_latest_attempt(
+    sqlite_db: AgentDB,
+) -> None:
+    workflow_run_id = "wr_returning_attempts"
+    async with sqlite_db.Session() as session:
+        session.add(
+            _workflow_run_model(
+                workflow_run_id=workflow_run_id, queued_at=_ATTR_QUEUED_AT, status=WorkflowRunStatus.running.value
+            )
+        )
+        session.add_all(
+            WorkflowRunAttemptModel(
+                workflow_run_id=workflow_run_id,
+                attempt_number=attempt_number,
+                organization_id="org_test",
+                status=WorkflowRunStatus.running.value,
+            )
+            for attempt_number in (1, 2)
+        )
+        await session.commit()
+    before = await sqlite_db.workflow_runs.get_workflow_run(workflow_run_id)
+
+    superseded = await sqlite_db.workflow_runs.update_workflow_run_if_not_final(
+        workflow_run_id, WorkflowRunStatus.failed, require_latest_attempt_number=1
+    )
+    assert superseded is None
+    assert await sqlite_db.workflow_runs.get_workflow_run(workflow_run_id) == before
+
+    latest = await sqlite_db.workflow_runs.update_workflow_run_if_not_final(
+        workflow_run_id, WorkflowRunStatus.failed, require_latest_attempt_number=2
+    )
+    assert latest is not None
+    assert latest.status == WorkflowRunStatus.failed
+    assert latest == await sqlite_db.workflow_runs.get_workflow_run(workflow_run_id)
+
+
+def _make_repo_with_session(mock_workflow_run: MagicMock) -> tuple[WorkflowRunsRepository, AsyncMock]:
+    scalars_result = MagicMock()
+    scalars_result.one.return_value = mock_workflow_run
+
+    execute_result = MagicMock()
+    execute_result.scalar_one_or_none.return_value = mock_workflow_run.workflow_run_id
+
+    session = AsyncMock()
+    session.execute = AsyncMock(return_value=execute_result)
+    session.scalars = AsyncMock(return_value=scalars_result)
+    session.commit = AsyncMock()
+    session.refresh = AsyncMock()
+
+    repo = WorkflowRunsRepository(session_factory=lambda: _SessionContext(session))
+    return repo, session
+
+
+@pytest.mark.asyncio
+async def test_preexisting_timeout_finish_only_updates_unfinished_timeout() -> None:
+    mock_workflow_run = MagicMock()
+    mock_workflow_run.workflow_run_id = "wr_test"
+    repo, session = _make_repo_with_session(mock_workflow_run)
+
+    failure_category = [{"category": "TIMEOUT"}]
+    with (
+        patch(
+            "skyvern.forge.sdk.db.repositories.workflow_runs.save_workflow_run_logs",
+            new=AsyncMock(),
+        ),
+        patch(
+            "skyvern.forge.sdk.db.repositories.workflow_runs.convert_to_workflow_run",
+            return_value=MagicMock(),
+        ),
+    ):
+        await repo.finish_preexisting_timed_out_workflow_run(
+            workflow_run_id="wr_test",
+            failure_reason="workflow timed out",
+            failure_category=failure_category,
+        )
+
+    statement = session.execute.await_args.args[0]
+    statement_sql = str(statement)
+    compiled_statement = statement.compile()
+    statement_parameters = compiled_statement.params
+    assert WorkflowRunStatus.timed_out.value in statement_parameters.values()
+    assert "workflow_runs.finished_at IS NULL" in statement_sql
+    assert "coalesce(workflow_runs.failure_reason" in statement_sql
+    failure_category_binds = [bind for bind in compiled_statement.binds.values() if bind.value == failure_category]
+    assert failure_category_binds
+    assert all(not isinstance(bind.type, NullType) for bind in failure_category_binds)
+
+
+@pytest.mark.asyncio
+async def test_bulk_update_can_guard_status_and_returns_only_updated_ids() -> None:
+    execute_result = MagicMock()
+    execute_result.scalars.return_value.all.return_value = ["wr_running"]
+    session = AsyncMock()
+    session.execute = AsyncMock(return_value=execute_result)
+    session.commit = AsyncMock()
+    repo = WorkflowRunsRepository(session_factory=lambda: _SessionContext(session))
+
+    result = await repo.bulk_update_workflow_runs(
+        workflow_run_ids=["wr_running", "wr_completed"],
+        status=WorkflowRunStatus.timed_out,
+        only_if_status_in=[WorkflowRunStatus.running],
+    )
+
+    statement = session.execute.await_args.args[0]
+    statement_sql = str(statement)
+    statement_parameters = statement.compile().params
+    assert result == ["wr_running"]
+    assert "workflow_runs.status IN" in statement_sql
+    assert [WorkflowRunStatus.running.value] in statement_parameters.values()
+    assert statement_parameters["finished_at"] is None
+    assert statement_parameters["failure_reason"] is None
+    # failure_category is cleared with SQL NULL (null(), not a bound Python None that a JSON
+    # column stores as the token 'null'), so it renders as literal NULL and is not a bound param.
+    assert "failure_category" not in statement_parameters
+    assert "failure_category=NULL" in statement_sql.replace(" ", "")
+    # failure_attribution is persisted atomically as a bounded provisional (unattributed)
+    # document — not SQL NULL — so a stuck-run timeout never leaves permanent NULL if the per-run
+    # repair does not run. It is therefore a bound parameter carrying that document.
+    persisted_attribution = [
+        v for v in statement_parameters.values() if isinstance(v, dict) and "primary_infra_component" in v
+    ]
+    assert persisted_attribution and persisted_attribution[0]["primary_infra_component"] == "unattributed"
+
+
+@pytest.mark.asyncio
 async def test_repair_strengthens_provisional_but_never_touches_a_finished_row(sqlite_db: AgentDB) -> None:
     proxy_category = classify_from_failure_reason("No proxy available for this run", fallback_to_unknown=True)
 
@@ -1989,7 +2267,10 @@ async def test_get_all_runs_v2_search_key_matches_parameter_inputs() -> None:
 # unique to exactly one seeded run, so an over-broad clause fails the same assertion an absent one does;
 # the pool and fallback workflows each carry a sibling run whose recorded selection replaced the
 # definition's credential, so matching the definition alone returns two runs and fails. wr_mentions_ids
-# only mentions a profile and a session id in its webhook URL, so a substring arm on those ids fails too.
+# only mentions a profile, session, run and task id in its webhook URL, so a substring arm on those ids fails too.
+_COMPLETE_RUN_ID = "wr_100000000000000001"
+_COMPLETE_TASK_ID = "tsk_100000000000000002"
+_STANDALONE_TASK_ID = "tsk_100000000000000003"
 _RUN_IDENTIFIER_SEARCH_CASES = (
     ("hooks.example.com/notify", "wr_webhook"),
     ("bp_1001", "wr_profile"),
@@ -2007,6 +2288,8 @@ _RUN_IDENTIFIER_SEARCH_CASES = (
     ("bp_1015", "wr_previous_profile"),
     ("cred_1016", "wr_two_parameters"),
     ("cred_1017", "wr_two_parameters"),
+    (_COMPLETE_RUN_ID, _COMPLETE_RUN_ID),
+    (_COMPLETE_TASK_ID, "wr_with_task"),
 )
 
 
@@ -2033,7 +2316,7 @@ async def _seed_run_identifier_runs(sqlite_db: AgentDB, *, with_task_runs: bool)
         _workflow_run_model(
             workflow_run_id="wr_mentions_ids",
             queued_at=created_at,
-            webhook_callback_url="https://hooks.example.com/bp_1001/pbs_1002",
+            webhook_callback_url=f"https://hooks.example.com/bp_1001/pbs_1002/{_COMPLETE_RUN_ID}/{_COMPLETE_TASK_ID}",
         ),
         _workflow_run_model(workflow_run_id="wr_profile", queued_at=created_at, browser_profile_id="bp_1001"),
         _workflow_run_model(workflow_run_id="wr_session", queued_at=created_at, browser_session_id="pbs_1002"),
@@ -2051,6 +2334,8 @@ async def _seed_run_identifier_runs(sqlite_db: AgentDB, *, with_task_runs: bool)
         _workflow_run_model(workflow_run_id="wr_fallback_primary", queued_at=created_at, workflow_id="wf_fallback"),
         _workflow_run_model(workflow_run_id="wr_fallback_retry", queued_at=created_at, workflow_id="wf_fallback"),
         _workflow_run_model(workflow_run_id="wr_two_parameters", queued_at=created_at, workflow_id="wf_two_parameters"),
+        _workflow_run_model(workflow_run_id=_COMPLETE_RUN_ID, queued_at=created_at),
+        _workflow_run_model(workflow_run_id="wr_with_task", queued_at=created_at),
     ]
 
     async with sqlite_db.Session() as session:
@@ -2115,6 +2400,12 @@ async def _seed_run_identifier_runs(sqlite_db: AgentDB, *, with_task_runs: bool)
                     workflow_run_id="wr_previous_session",
                     browser_session_id="pbs_1012",
                 ),
+                TaskModel(
+                    task_id=_COMPLETE_TASK_ID,
+                    organization_id="org_test",
+                    workflow_run_id="wr_with_task",
+                    status="completed",
+                ),
             ]
         )
         session.add_all(
@@ -2148,34 +2439,94 @@ async def _seed_run_identifier_runs(sqlite_db: AgentDB, *, with_task_runs: bool)
         await session.commit()
 
 
-@pytest.mark.parametrize(("search_key", "expected_run_id"), _RUN_IDENTIFIER_SEARCH_CASES)
 @pytest.mark.asyncio
-async def test_get_all_runs_v2_search_key_matches_run_identifiers(
-    sqlite_db: AgentDB, search_key: str, expected_run_id: str
-) -> None:
+async def test_get_all_runs_v2_search_key_matches_run_identifiers(sqlite_db: AgentDB) -> None:
     await _seed_run_identifier_runs(sqlite_db, with_task_runs=True)
 
-    rows = await sqlite_db.workflow_runs.get_all_runs_v2(organization_id="org_test", search_key=search_key)
+    for search_key, expected_run_id in _RUN_IDENTIFIER_SEARCH_CASES:
+        rows = await sqlite_db.workflow_runs.get_all_runs_v2(organization_id="org_test", search_key=search_key)
+        assert {row["run_id"] for row in rows} == {expected_run_id}, search_key
 
-    assert {row["run_id"] for row in rows} == {expected_run_id}
 
-
-@pytest.mark.parametrize(("search_key", "expected_run_id"), _RUN_IDENTIFIER_SEARCH_CASES)
 @pytest.mark.asyncio
 async def test_get_workflow_runs_for_workflow_permanent_id_search_key_matches_run_identifiers(
-    sqlite_db: AgentDB, search_key: str, expected_run_id: str
+    sqlite_db: AgentDB,
 ) -> None:
     # Covers the shared WorkflowRunModel filter behind the per-workflow runs table, /workflows/runs,
     # and the orphan fallback leg of the global runs list.
     await _seed_run_identifier_runs(sqlite_db, with_task_runs=False)
 
+    for search_key, expected_run_id in _RUN_IDENTIFIER_SEARCH_CASES:
+        runs = await sqlite_db.workflow_runs.get_workflow_runs_for_workflow_permanent_id(
+            workflow_permanent_id="wpid_test",
+            organization_id="org_test",
+            search_key=search_key,
+        )
+        assert {run.workflow_run_id for run in runs} == {expected_run_id}, search_key
+
+
+@pytest.mark.asyncio
+async def test_partial_run_id_search_keeps_substring_matching(sqlite_db: AgentDB) -> None:
+    # Only a complete run id is matched by equality; one still being typed must keep finding every run
+    # that mentions it.
+    await _seed_run_identifier_runs(sqlite_db, with_task_runs=False)
+
     runs = await sqlite_db.workflow_runs.get_workflow_runs_for_workflow_permanent_id(
         workflow_permanent_id="wpid_test",
         organization_id="org_test",
-        search_key=search_key,
+        search_key=_COMPLETE_RUN_ID[:-4],
     )
 
-    assert {run.workflow_run_id for run in runs} == {expected_run_id}
+    assert {run.workflow_run_id for run in runs} == {_COMPLETE_RUN_ID, "wr_mentions_ids"}
+
+
+@pytest.mark.asyncio
+async def test_complete_standalone_task_id_search_finds_the_task_within_its_org(sqlite_db: AgentDB) -> None:
+    # A standalone task has no workflow run, so both runs lists must find it through its own task row. The
+    # task lookup carries no org filter of its own, so another org searching the same ids must get nothing.
+    await _seed_run_identifier_runs(sqlite_db, with_task_runs=False)
+    created_at = datetime(2026, 7, 20, 12, 0, tzinfo=timezone.utc)
+    mentions_url = f"https://example.com/{_STANDALONE_TASK_ID}"
+    decoy_task_run = _task_run_model(
+        run_id="tsk_mentions_standalone", created_at=created_at, workflow_permanent_id=None, task_run_type="task_v1"
+    )
+    decoy_task_run.searchable_text = mentions_url
+    async with sqlite_db.Session() as session:
+        session.add_all(
+            [
+                _task_run_model(
+                    run_id=_STANDALONE_TASK_ID,
+                    created_at=created_at,
+                    workflow_permanent_id=None,
+                    task_run_type="task_v1",
+                ),
+                decoy_task_run,
+                TaskModel(
+                    task_id=_STANDALONE_TASK_ID,
+                    organization_id="org_test",
+                    status="completed",
+                    url="https://example.com/standalone",
+                    created_at=datetime(2026, 7, 20, 12, 0),
+                ),
+                TaskModel(
+                    task_id="tsk_mentions_standalone",
+                    organization_id="org_test",
+                    status="completed",
+                    url=mentions_url,
+                    created_at=datetime(2026, 7, 20, 12, 0),
+                ),
+            ]
+        )
+        await session.commit()
+
+    rows = await sqlite_db.workflow_runs.get_all_runs_v2(organization_id="org_test", search_key=_STANDALONE_TASK_ID)
+    legacy_runs = await sqlite_db.workflow_runs.get_all_runs(organization_id="org_test", search_key=_STANDALONE_TASK_ID)
+
+    assert {row["run_id"] for row in rows} == {_STANDALONE_TASK_ID}
+    assert [getattr(run, "task_id", None) for run in legacy_runs] == [_STANDALONE_TASK_ID]
+    for search_key in (_COMPLETE_RUN_ID, _COMPLETE_TASK_ID, _STANDALONE_TASK_ID):
+        assert await sqlite_db.workflow_runs.get_all_runs_v2(organization_id="org_other", search_key=search_key) == []
+        assert await sqlite_db.workflow_runs.get_all_runs(organization_id="org_other", search_key=search_key) == []
 
 
 @pytest.mark.asyncio
@@ -4425,3 +4776,493 @@ async def test_metadata_route_reads_real_rows_with_no_reconcile_write_or_provide
         assert statements
     finally:
         event.remove(sqlite_engine.sync_engine, "before_cursor_execute", forbid_write)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(("search_seconds", "expected_fallback_seconds"), [(12, 18), (30, 0.25)])
+async def test_get_all_runs_v2_splits_one_timeout_budget_across_both_search_statements(
+    monkeypatch: pytest.MonkeyPatch,
+    search_seconds: int,
+    expected_fallback_seconds: float,
+) -> None:
+    # A search runs the primary query and then the workflow_runs fallback. PostgreSQL applies
+    # statement_timeout per statement, so re-applying the full ceiling before the second one would let
+    # the request hold its connection for twice the intended budget.
+    applied: list[float] = []
+    clock = [0.0]
+
+    async def _checkout() -> None:
+        clock[0] += 50  # Pool wait is outside the connection-hold budget.
+
+    async def _record(_session: Any, seconds: float) -> None:
+        applied.append(seconds)
+
+    execute_count = 0
+
+    async def _execute(_query: Any) -> _EmptyExecuteResult:
+        nonlocal execute_count
+        execute_count += 1
+        if execute_count == 1:
+            clock[0] += search_seconds
+        return _EmptyExecuteResult()
+
+    monkeypatch.setattr(workflow_runs_repository, "apply_statement_timeout", _record)
+    monkeypatch.setattr(workflow_runs_repository, "time", SimpleNamespace(monotonic=lambda: clock[0]))
+
+    session = MagicMock()
+    session.bind.dialect.name = "postgresql"
+    session.connection = AsyncMock(side_effect=_checkout)
+    session.execute = AsyncMock(side_effect=_execute)
+    repo = WorkflowRunsRepository(session_factory=lambda: _SessionContext(session), debug_enabled=False)
+
+    await repo.get_all_runs_v2(organization_id="o_test", page=1, page_size=10, search_key="no-such-term")
+
+    assert len(applied) == 2
+    ceiling = workflow_runs_repository.RUNS_LIST_STATEMENT_TIMEOUT_SECONDS
+    assert applied[0] == ceiling
+    # The fallback gets what is left, never a fresh ceiling, and never a non-positive value that
+    # PostgreSQL would read as "no timeout".
+    assert applied == [ceiling, expected_fallback_seconds]
+    session.connection.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_get_all_runs_v2_does_not_cap_unmeasured_or_indexed_query_shapes(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    applied: list[float] = []
+
+    async def _record(_session: Any, seconds: float) -> None:
+        applied.append(seconds)
+
+    monkeypatch.setattr(workflow_runs_repository, "apply_statement_timeout", _record)
+    session = MagicMock()
+    session.bind.dialect.name = "postgresql"
+    session.connection = AsyncMock()
+    session.execute = AsyncMock(return_value=_EmptyExecuteResult())
+    repo = WorkflowRunsRepository(session_factory=lambda: _SessionContext(session), debug_enabled=False)
+
+    await repo.get_all_runs_v2(
+        organization_id="o_test",
+        status=["failed"],
+        workflow_permanent_ids=["wpid_123"],
+        failure_category="LOGIN_FAILURE",
+    )
+    await repo.get_all_runs_v2(organization_id="o_test", search_key="bp_123")
+
+    assert applied == []
+    session.connection.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_workflow_runs_search_caps_only_the_unindexed_free_text_read(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # The per-workflow runs list runs the same unindexed substring arms as the global list, so its
+    # free-text search has to hand the connection back instead of running to the statement timeout
+    # the connection itself carries.
+    applied: list[float] = []
+
+    async def _record(_session: Any, seconds: float) -> None:
+        applied.append(seconds)
+
+    monkeypatch.setattr(workflow_runs_repository, "apply_statement_timeout", _record)
+    session = MagicMock()
+    session.bind.dialect.name = "postgresql"
+    session.connection = AsyncMock()
+    session.execute = AsyncMock(return_value=_EmptyExecuteResult())
+    repo = WorkflowRunsRepository(session_factory=lambda: _SessionContext(session), debug_enabled=False)
+
+    await repo.get_workflow_runs_for_workflow_permanent_id(
+        workflow_permanent_id="wpid_test",
+        organization_id="o_test",
+        search_key="no-such-term",
+    )
+
+    assert applied == [workflow_runs_repository.RUNS_LIST_STATEMENT_TIMEOUT_SECONDS]
+
+    # An exact browser identifier resolves through indexed equality, and the other filter shapes have
+    # unmeasured plans; neither takes the cap.
+    await repo.get_workflow_runs_for_workflow_permanent_id(
+        workflow_permanent_id="wpid_test",
+        organization_id="o_test",
+        search_key="pbs_123",
+    )
+    await repo.get_workflow_runs_for_workflow_permanent_id(
+        workflow_permanent_id="wpid_test",
+        organization_id="o_test",
+        status=[WorkflowRunStatus.failed],
+        error_code="LOGIN_FAILED",
+    )
+
+    assert applied == [workflow_runs_repository.RUNS_LIST_STATEMENT_TIMEOUT_SECONDS]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("search_key", "expected_indexed", "expected_budget"),
+    [
+        ("customer-private-search", False, workflow_runs_repository.RUNS_LIST_STATEMENT_TIMEOUT_SECONDS),
+        # Never capped, so it ran under the connection's own timeout rather than this budget.
+        ("pbs_123", True, None),
+        (_COMPLETE_RUN_ID, True, None),
+    ],
+)
+async def test_cancelled_workflow_runs_search_is_typed_and_keeps_the_term_out_of_logs(
+    search_key: str,
+    expected_indexed: bool,
+    expected_budget: float | None,
+) -> None:
+    # The route reports this cancellation, so it is raised as its own type: logging it as a
+    # SQLAlchemyError would both double-report it and put the search term in reach of the log.
+    failure = OperationalError(
+        "SELECT ... WHERE workflow_run_parameters.value ILIKE :search_key",
+        {"search_key": search_key},
+        FakeQueryCanceled("canceling statement due to statement timeout"),
+    )
+
+    async def _execute(statement: Any, *_args: Any) -> _EmptyExecuteResult:
+        # Only the search statement is cancelled; the budget's own set_config has to succeed.
+        if "set_config" in str(statement):
+            return _EmptyExecuteResult()
+        raise failure
+
+    session = MagicMock()
+    session.bind.dialect.name = "postgresql"
+    session.connection = AsyncMock()
+    session.execute = AsyncMock(side_effect=_execute)
+    repo = WorkflowRunsRepository(session_factory=lambda: _SessionContext(session), debug_enabled=False)
+
+    with capture_logs() as logs:
+        with pytest.raises(RunsListSearchCanceled) as exc_info:
+            await repo.get_workflow_runs_for_workflow_permanent_id(
+                workflow_permanent_id="wpid_test",
+                organization_id="o_test",
+                search_key=search_key,
+            )
+
+    assert exc_info.value.indexed_search is expected_indexed
+    assert exc_info.value.statement_timeout_seconds == expected_budget
+    assert failure.hide_parameters is True
+    assert search_key not in repr(logs)
+    assert not any(log.get("event") == "SQLAlchemyError" for log in logs)
+
+
+@pytest.mark.asyncio
+async def test_cancelled_workflow_runs_read_without_a_search_stays_a_logged_server_error() -> None:
+    # Only the search statement is capped and reported to the caller. Any other filter's
+    # cancellation keeps the operation-tagged error line that production triage queries.
+    failure = OperationalError(
+        "SELECT ... WHERE tasks.errors @> :error_code",
+        {"error_code": "LOGIN_FAILED"},
+        FakeQueryCanceled("canceling statement due to statement timeout"),
+    )
+    session = MagicMock()
+    session.bind.dialect.name = "postgresql"
+    session.connection = AsyncMock()
+    session.execute = AsyncMock(side_effect=failure)
+    repo = WorkflowRunsRepository(session_factory=lambda: _SessionContext(session), debug_enabled=False)
+
+    with capture_logs() as logs:
+        with pytest.raises(OperationalError):
+            await repo.get_workflow_runs_for_workflow_permanent_id(
+                workflow_permanent_id="wpid_test",
+                organization_id="o_test",
+                error_code="LOGIN_FAILED",
+            )
+
+    assert [log["operation"] for log in logs if log.get("event") == "SQLAlchemyError"] == [
+        "get_workflow_runs_for_workflow_permanent_id"
+    ]
+
+
+@pytest.mark.asyncio
+async def test_get_all_runs_v2_hides_search_parameters_on_timeout_before_retry_logging() -> None:
+    search_key = "customer-private-search"
+    failure = OperationalError(
+        "SELECT ... WHERE searchable_text ILIKE :search_key",
+        {"search_key": search_key},
+        FakeQueryCanceled("canceling statement due to statement timeout"),
+    )
+    session = MagicMock()
+    session.bind.dialect.name = "postgresql"
+    session.connection = AsyncMock()
+    session.execute = AsyncMock(side_effect=[_EmptyExecuteResult(), failure])
+    repo = WorkflowRunsRepository(session_factory=lambda: _SessionContext(session), debug_enabled=False)
+
+    with capture_logs() as logs:
+        with pytest.raises(OperationalError) as exc_info:
+            await repo.get_all_runs_v2(organization_id="o_test", search_key=search_key)
+
+    assert exc_info.value.hide_parameters is True
+    assert search_key not in repr(logs)
+    assert not any(log.get("event") == "SQLAlchemyError" for log in logs)
+
+
+def _final_webhook_claim_stale_before() -> datetime:
+    return naive_utc_now() - timedelta(seconds=WEBHOOK_FALLBACK_GRACE_SECONDS)
+
+
+async def _seed_canceled_runs(db: AgentDB, organization_id: str, finished_at: datetime, **runs: dict[str, Any]) -> None:
+    async with db.Session() as session:
+        for workflow_run_id, columns in runs.items():
+            run = _workflow_run_model(
+                workflow_run_id=workflow_run_id,
+                queued_at=finished_at,
+                status=WorkflowRunStatus.canceled.value,
+                organization_id=organization_id,
+            )
+            run.finished_at = finished_at
+            for column, value in columns.items():
+                setattr(run, column, value)
+            session.add(run)
+        await session.commit()
+
+
+@pytest.mark.asyncio
+async def test_final_webhook_claim_has_one_winner_per_terminal_execution(
+    org_scoped_db: tuple[AgentDB, AsyncEngine, str],
+) -> None:
+    db, _engine, organization_id = org_scoped_db
+    finished_at = datetime(2026, 1, 1, 12, 0, 0)
+    await _seed_canceled_runs(db, organization_id, finished_at, wr_claim_race={}, wr_claim_refinished={})
+
+    claims = await asyncio.gather(
+        *(
+            db.workflow_runs.claim_final_webhook_delivery(
+                "wr_claim_race",
+                expected_status=WorkflowRunStatus.canceled,
+                expected_finished_at=finished_at,
+                stale_before=_final_webhook_claim_stale_before(),
+            )
+            for _ in range(5)
+        )
+    )
+    stale_claim = await db.workflow_runs.claim_final_webhook_delivery(
+        "wr_claim_refinished",
+        expected_status=WorkflowRunStatus.canceled,
+        expected_finished_at=finished_at - timedelta(seconds=1),
+        stale_before=_final_webhook_claim_stale_before(),
+    )
+    other_status_claim = await db.workflow_runs.claim_final_webhook_delivery(
+        "wr_claim_refinished",
+        expected_status=WorkflowRunStatus.completed,
+        expected_finished_at=finished_at,
+        stale_before=_final_webhook_claim_stale_before(),
+    )
+
+    assert len([claim for claim in claims if claim is not None]) == 1
+    assert stale_claim is None
+    assert other_status_claim is None
+
+
+@pytest.mark.asyncio
+async def test_final_webhook_claim_takes_over_only_an_unrecorded_claim_past_the_delivery_bound(
+    org_scoped_db: tuple[AgentDB, AsyncEngine, str],
+) -> None:
+    # A sender that died mid-delivery leaves a claim with no outcome; once it outlives any bounded delivery,
+    # the next sender takes it rather than leaving the run's final webhook unsent forever.
+    db, _engine, organization_id = org_scoped_db
+    finished_at = datetime(2026, 1, 1, 12, 0, 0)
+    abandoned_at = naive_utc_now() - timedelta(seconds=WEBHOOK_FALLBACK_GRACE_SECONDS + 1)
+    await _seed_canceled_runs(
+        db,
+        organization_id,
+        finished_at,
+        wr_claim_abandoned={"webhook_delivery_finalized_at": abandoned_at},
+        wr_claim_in_flight={"webhook_delivery_finalized_at": naive_utc_now()},
+        wr_claim_recorded={"webhook_delivery_finalized_at": abandoned_at, "webhook_delivery_status": "delivered"},
+    )
+
+    async def claim(workflow_run_id: str) -> datetime | None:
+        return await db.workflow_runs.claim_final_webhook_delivery(
+            workflow_run_id,
+            expected_status=WorkflowRunStatus.canceled,
+            expected_finished_at=finished_at,
+            stale_before=_final_webhook_claim_stale_before(),
+        )
+
+    taken_over = await claim("wr_claim_abandoned")
+    # The abandoned sender's late release names its own claim, so it cannot free the claim that replaced it.
+    await db.workflow_runs.release_final_webhook_delivery_claim("wr_claim_abandoned", claimed_at=abandoned_at)
+
+    assert taken_over is not None
+    assert await claim("wr_claim_abandoned") is None
+    assert await claim("wr_claim_in_flight") is None
+    assert await claim("wr_claim_recorded") is None
+
+
+_WINDOW_START = datetime(2026, 7, 20, 12, 0, 0)
+_WINDOW_END = datetime(2026, 7, 30, 12, 0, 0)
+
+
+def _window_run_names(runs: list[Any], organization_id: str) -> list[str]:
+    return [run.workflow_run_id.removesuffix(f"_{organization_id}") for run in runs]
+
+
+async def _seed_created_at_window_runs(db: AgentDB, organization_id: str) -> None:
+    # The PostgreSQL leg shares one scratch schema across tests, so primary keys are scoped to the organization.
+    workflow_id = f"wf_window_{organization_id}"
+    workflow_permanent_id = f"wpid_window_{organization_id}"
+    created = {
+        "wr_window_before": _WINDOW_START - timedelta(seconds=1),
+        "wr_window_at_start": _WINDOW_START,
+        "wr_window_inside": datetime(2026, 7, 25, 8, 0, 0),
+        "wr_window_inside_other": datetime(2026, 7, 26, 8, 0, 0),
+        "wr_window_at_end": _WINDOW_END,
+        "wr_window_after": _WINDOW_END + timedelta(seconds=1),
+    }
+    async with db.Session() as session:
+        session.add(
+            WorkflowModel(
+                workflow_id=workflow_id,
+                organization_id=organization_id,
+                workflow_permanent_id=workflow_permanent_id,
+                title="created_at window fixture",
+                workflow_definition={},
+                version=1,
+            )
+        )
+        await session.flush()
+        for workflow_run_id, created_at in created.items():
+            session.add(
+                _workflow_run_model(
+                    workflow_run_id=f"{workflow_run_id}_{organization_id}",
+                    queued_at=created_at,
+                    workflow_id=workflow_id,
+                    workflow_permanent_id=workflow_permanent_id,
+                    organization_id=organization_id,
+                    status=(
+                        WorkflowRunStatus.failed.value
+                        if workflow_run_id == "wr_window_inside_other"
+                        else WorkflowRunStatus.completed.value
+                    ),
+                    webhook_callback_url=(
+                        None
+                        if workflow_run_id == "wr_window_inside_other"
+                        else "https://hooks.example.test/window-term"
+                    ),
+                )
+            )
+        await session.commit()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("created_at_start", "created_at_end", "expected_run_ids"),
+    [
+        # Inclusive start, exclusive end, on the naive UTC column.
+        (_WINDOW_START, _WINDOW_END, ["wr_window_inside_other", "wr_window_inside", "wr_window_at_start"]),
+        (
+            _WINDOW_START,
+            None,
+            [
+                "wr_window_after",
+                "wr_window_at_end",
+                "wr_window_inside_other",
+                "wr_window_inside",
+                "wr_window_at_start",
+            ],
+        ),
+        (None, _WINDOW_END, ["wr_window_inside_other", "wr_window_inside", "wr_window_at_start", "wr_window_before"]),
+        # Aware bounds name the same instants in other offsets and must be normalized to naive UTC.
+        (
+            datetime(2026, 7, 20, 14, 0, 0, tzinfo=timezone(timedelta(hours=2))),
+            datetime(2026, 7, 30, 7, 0, 0, tzinfo=timezone(timedelta(hours=-5))),
+            ["wr_window_inside_other", "wr_window_inside", "wr_window_at_start"],
+        ),
+        (
+            datetime(2026, 7, 20, 12, 0, 0, tzinfo=UTC),
+            datetime(2026, 7, 30, 12, 0, 0, tzinfo=UTC),
+            ["wr_window_inside_other", "wr_window_inside", "wr_window_at_start"],
+        ),
+    ],
+)
+async def test_get_workflow_runs_filters_by_explicit_created_at_bounds(
+    org_scoped_db: tuple[AgentDB, AsyncEngine, str],
+    created_at_start: datetime | None,
+    created_at_end: datetime | None,
+    expected_run_ids: list[str],
+) -> None:
+    db, _engine, organization_id = org_scoped_db
+    await _seed_created_at_window_runs(db, organization_id)
+
+    runs = await db.workflow_runs.get_workflow_runs(
+        organization_id=organization_id,
+        page_size=20,
+        created_at_start=created_at_start,
+        created_at_end=created_at_end,
+    )
+
+    assert _window_run_names(runs, organization_id) == expected_run_ids
+
+
+@pytest.mark.asyncio
+async def test_get_workflow_runs_never_defaults_a_window_and_combines_bounds_with_other_filters(
+    org_scoped_db: tuple[AgentDB, AsyncEngine, str],
+) -> None:
+    db, _engine, organization_id = org_scoped_db
+    await _seed_created_at_window_runs(db, organization_id)
+
+    # The repository applies only the bounds it is given; the default window is the route's policy.
+    unbounded = await db.workflow_runs.get_workflow_runs(
+        organization_id=organization_id, page_size=20, search_key="window-term"
+    )
+    windowed_page = await db.workflow_runs.get_workflow_runs(
+        organization_id=organization_id,
+        page=2,
+        page_size=1,
+        status=[WorkflowRunStatus.completed],
+        search_key="window-term",
+        created_at_start=_WINDOW_START,
+        created_at_end=_WINDOW_END,
+    )
+    other_org = await db.workflow_runs.get_workflow_runs(
+        organization_id="o_someone_else", page_size=20, created_at_start=_WINDOW_START
+    )
+
+    assert set(_window_run_names(unbounded, organization_id)) == {
+        "wr_window_before",
+        "wr_window_at_start",
+        "wr_window_inside",
+        "wr_window_at_end",
+        "wr_window_after",
+    }
+    assert _window_run_names(windowed_page, organization_id) == ["wr_window_at_start"]
+    assert other_org == []
+
+
+@pytest.mark.asyncio
+async def test_get_workflow_runs_complete_id_search_still_applies_explicit_created_at_bounds(
+    org_scoped_db: tuple[AgentDB, AsyncEngine, str],
+) -> None:
+    # The route lets a complete run or task id skip the default window, so the caller's bounds are all that narrow it.
+    db, _engine, organization_id = org_scoped_db
+    await _seed_created_at_window_runs(db, organization_id)
+    run_id, task_id = generate_workflow_run_id(), generate_task_id()
+    created_at = _WINDOW_START - timedelta(days=60)
+    async with db.Session() as session:
+        session.add(
+            _workflow_run_model(
+                workflow_run_id=run_id,
+                queued_at=created_at,
+                workflow_id=f"wf_window_{organization_id}",
+                workflow_permanent_id=f"wpid_window_{organization_id}",
+                organization_id=organization_id,
+            )
+        )
+        await session.flush()
+        session.add(
+            TaskModel(task_id=task_id, organization_id=organization_id, workflow_run_id=run_id, status="completed")
+        )
+        await session.commit()
+
+    for search_key in (run_id, task_id):
+        before_window = await db.workflow_runs.get_workflow_runs(
+            organization_id=organization_id, search_key=search_key, created_at_end=_WINDOW_START
+        )
+        in_window = await db.workflow_runs.get_workflow_runs(
+            organization_id=organization_id, search_key=search_key, created_at_start=_WINDOW_START
+        )
+        assert [run.workflow_run_id for run in before_window] == [run_id], search_key
+        assert in_window == [], search_key

@@ -237,6 +237,7 @@ async def test_browser_runtime_task_pbs_boundary_preserves_owner_log(
             raise ValueError("acquisition failed")
 
     with skyvern_context.scoped(owner), patch.object(real_browser_manager, "app") as app:
+        app.AGENT_FUNCTION.enforce_workflow_run_credential_use = AsyncMock()
         app.PERSISTENT_SESSIONS_MANAGER.begin_session = AsyncMock(return_value="generation-owner")
         app.PERSISTENT_SESSIONS_MANAGER.get_browser_state = AsyncMock(side_effect=acquire)
         with pytest.raises(ValueError, match="acquisition failed"):

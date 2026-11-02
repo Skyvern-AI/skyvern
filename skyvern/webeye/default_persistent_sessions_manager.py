@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import uuid
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Callable
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
@@ -13,7 +13,7 @@ from typing import Any, cast
 import structlog
 from playwright._impl._errors import TargetClosedError
 
-from skyvern.cli.core.session_manager import active_copilot_session_ids
+from skyvern.cli.core.copilot_sessions import active_copilot_session_ids
 from skyvern.config import settings
 from skyvern.exceptions import (
     BrowserSessionAlreadyEndedError,
@@ -22,8 +22,8 @@ from skyvern.exceptions import (
     BrowserSessionNotExtendable,
     BrowserSessionNotFound,
     BrowserSessionNotRenewable,
+    BrowserSessionOwnershipConflict,
     BrowserSettingsUnsupported,
-    ExternalBrowserSessionNotRunnable,
     MissingBrowserAddressError,
 )
 from skyvern.forge import app
@@ -41,8 +41,10 @@ from skyvern.forge.sdk.schemas.persistent_browser_sessions import (
     PersistentBrowserSession,
     PersistentBrowserSessionStatus,
     PersistentBrowserType,
+    assert_runnable_owner,
     is_external_cdp_session,
     is_final_status,
+    lost_external_browser_error,
     unusable_browser_session_error,
 )
 from skyvern.forge.sdk.streaming.registries import stream_tombstone_holds_session_lease
@@ -64,7 +66,10 @@ from skyvern.webeye.browser_settings_receipts import record_session_timezone_rec
 from skyvern.webeye.browser_state import BrowserState
 from skyvern.webeye.cdp_ports import _allocate_cdp_port, _release_cdp_port
 from skyvern.webeye.external_cdp_sessions import (
+    arm_external_deadline,
     attach_registered_cdp_browser,
+    disarm_external_deadline,
+    disarm_released_deadline,
     is_external_cdp_session_expired,
     is_external_cdp_session_open,
     renew_external_cdp_session,
@@ -81,7 +86,7 @@ from skyvern.webeye.persistent_sessions_manager import (
     PersistentSessionsManager,
 )
 from skyvern.webeye.real_browser_manager import RealBrowserManager
-from skyvern.webeye.real_browser_state import RealBrowserState
+from skyvern.webeye.real_browser_state import is_external_browser_state
 from skyvern.webeye.session_cookies import persist_session_cookies
 
 LOG = structlog.get_logger()
@@ -207,7 +212,7 @@ def _renewal_extension_minutes(new_timeout_datetime: datetime, current_timeout_d
     """Minutes to extend a session by so its expiry never moves earlier than it already is.
 
     A fresh DEBUG_SESSION_TIMEOUT_MINUTES window from now can land before the session's existing
-    expiry (e.g. Copilot's 30-minute sessions), which would otherwise shorten it.
+    expiry (any session created with a longer budget), which would otherwise shorten it.
     """
     return max(0, floor((new_timeout_datetime - current_timeout_datetime).total_seconds() / 60))
 
@@ -368,10 +373,6 @@ async def update_status(
     return persistent_browser_session
 
 
-def _is_external_browser_state(browser_state: BrowserState) -> bool:
-    return isinstance(browser_state, RealBrowserState) and browser_state.external_browser
-
-
 class DefaultPersistentSessionsManager(PersistentSessionsManager):
     """Default (OSS) implementation of PersistentSessionsManager protocol."""
 
@@ -421,6 +422,7 @@ class DefaultPersistentSessionsManager(PersistentSessionsManager):
     _background_tasks: set[asyncio.Task[None]] = set()
     _close_cleanup_tasks: dict[tuple[str, str], asyncio.Task[None]] = {}
     _external_connect_locks: dict[str, asyncio.Lock] = {}
+    _external_deadlines: dict[str, asyncio.Task[None]] = {}
     _reaper_task: asyncio.Task[None] | None = None
     database: AgentDB
 
@@ -453,6 +455,9 @@ class DefaultPersistentSessionsManager(PersistentSessionsManager):
 
     def can_probe_registered_browser_state(self) -> bool:
         return True
+
+    def launches_browser_on_create(self) -> bool:
+        return settings.BROWSER_STREAMING_MODE == "cdp" or settings.BROWSER_TYPE == "cdp-connect"
 
     def supports_evict_and_reconnect(self) -> bool:
         # ``get_browser_state`` is a pure dict lookup against ``_browser_sessions``; it
@@ -491,9 +496,6 @@ class DefaultPersistentSessionsManager(PersistentSessionsManager):
             if persistent_browser_session is None:
                 raise Exception(f"Persistent browser session not found for {browser_session_id}")
 
-            if is_external_cdp_session(persistent_browser_session):
-                raise ExternalBrowserSessionNotRunnable(browser_session_id)
-
             unusable = unusable_browser_session_error(persistent_browser_session)
             if unusable is not None:
                 raise unusable
@@ -516,6 +518,15 @@ class DefaultPersistentSessionsManager(PersistentSessionsManager):
                 error.add_note(BROWSER_RETIREMENT_DENIED_NOTE)
             raise
 
+        if is_external_cdp_session(persistent_browser_session):
+            arm_external_deadline(
+                self,
+                self.database.browser_sessions,
+                persistent_browser_session,
+                self._external_deadlines,
+                runnable_id=runnable_id,
+                runnable_generation_id=runnable_generation_id,
+            )
         LOG.info("Browser session begin", browser_session_id=browser_session_id)
         return runnable_generation_id
 
@@ -562,7 +573,9 @@ class DefaultPersistentSessionsManager(PersistentSessionsManager):
 
     async def get_active_sessions(self, organization_id: str) -> list[PersistentBrowserSession]:
         """Get all active sessions for an organization."""
-        return await self.database.browser_sessions.get_active_persistent_browser_sessions(organization_id)
+        return await self.database.browser_sessions.get_active_persistent_browser_sessions(
+            organization_id, include_external_cdp=True
+        )
 
     async def get_browser_state(
         self,
@@ -580,8 +593,14 @@ class DefaultPersistentSessionsManager(PersistentSessionsManager):
     ) -> BrowserState | None:
         """Get a specific browser session's state by session ID."""
         browser_session = self._browser_sessions.get(session_id)
-        if browser_session is None or _is_external_browser_state(browser_session.browser_state):
-            browser_state = await self._get_external_browser_state(session_id, organization_id, browser_session)
+        if browser_session is None or is_external_browser_state(browser_session.browser_state):
+            browser_state = await self._get_external_browser_state(
+                session_id,
+                organization_id,
+                browser_session,
+                expected_runnable_id=expected_runnable_id,
+                expected_runnable_generation_id=expected_runnable_generation_id,
+            )
         else:
             browser_state = browser_session.browser_state
         if browser_state is not None and acquire:
@@ -599,7 +618,13 @@ class DefaultPersistentSessionsManager(PersistentSessionsManager):
         return browser_state
 
     async def _get_external_browser_state(
-        self, session_id: str, organization_id: str | None, cached: BrowserSession | None
+        self,
+        session_id: str,
+        organization_id: str | None,
+        cached: BrowserSession | None,
+        *,
+        expected_runnable_id: str | None = None,
+        expected_runnable_generation_id: str | None = None,
     ) -> BrowserState | None:
         """Every attach re-reads the org-scoped row, so ownership and expiry hold on a warm cache too."""
         if organization_id is None:
@@ -622,7 +647,8 @@ class DefaultPersistentSessionsManager(PersistentSessionsManager):
             return None
         if is_external_cdp_session_expired(row):
             await self.close_session(organization_id, session_id, reason=BrowserSessionCloseReason.expired)
-            raise BrowserSessionClosed(session_id, reason="has expired")
+            raise lost_external_browser_error(row)
+        assert_runnable_owner(row, expected_runnable_id, expected_runnable_generation_id)
         if cached is not None:
             if cached.browser_state.is_connected():
                 return cached.browser_state
@@ -632,6 +658,14 @@ class DefaultPersistentSessionsManager(PersistentSessionsManager):
         async with self._external_connect_locks.setdefault(session_id, asyncio.Lock()):
             current = self._browser_sessions.get(session_id)
             if current is not None:
+                if expected_runnable_id is not None:
+                    # The lease can change hands while this caller waited behind another attach.
+                    latest = await self.database.browser_sessions.get_persistent_browser_session(
+                        session_id, organization_id
+                    )
+                    if latest is None:
+                        return None
+                    assert_runnable_owner(latest, expected_runnable_id, expected_runnable_generation_id)
                 return current.browser_state
             assert row.upstream_cdp_url is not None
             browser_state = await attach_registered_cdp_browser(row.upstream_cdp_url)
@@ -651,6 +685,11 @@ class DefaultPersistentSessionsManager(PersistentSessionsManager):
             ):
                 await browser_state.close()
                 return None
+            try:
+                assert_runnable_owner(row, expected_runnable_id, expected_runnable_generation_id)
+            except BrowserSessionOwnershipConflict:
+                await browser_state.close()
+                raise
             await self.set_browser_state(session_id, browser_state, organization_id)
         return browser_state
 
@@ -675,16 +714,24 @@ class DefaultPersistentSessionsManager(PersistentSessionsManager):
         return None
 
     async def set_browser_state(
-        self, session_id: str, browser_state: BrowserState, organization_id: str | None = None
-    ) -> None:
+        self,
+        session_id: str,
+        browser_state: BrowserState,
+        organization_id: str | None = None,
+        *,
+        may_publish: Callable[[], bool] | None = None,
+    ) -> bool:
         current = self._browser_sessions.get(session_id)
         if current is not None and current.browser_state is browser_state:
             current.organization_id = organization_id
-            return
+            return True
+        if may_publish is not None and not may_publish():
+            return False
         if current is not None:
             self._retire_browser_session(session_id, expected=current)
         browser_session = BrowserSession(browser_state=browser_state, organization_id=organization_id)
         self._browser_sessions[session_id] = browser_session
+        return True
 
     async def evict_cached_browser_state(
         self,
@@ -768,6 +815,7 @@ class DefaultPersistentSessionsManager(PersistentSessionsManager):
         expected_browser_session_id: str | None = None,
         browser_settings: BrowserSettings | None = None,
         created_for_workflow_run_id: str | None = None,
+        created_for_workflow_permanent_id: str | None = None,
     ) -> PersistentBrowserSession:
         """Create a new browser session for an organization and return its ID with the browser state."""
         # The browser launches after this returns, so a dialed CDP browser that cannot take a timezone is refused now.
@@ -802,6 +850,7 @@ class DefaultPersistentSessionsManager(PersistentSessionsManager):
                 created_by=created_by,
                 browser_settings=browser_settings,
                 created_for_workflow_run_id=created_for_workflow_run_id,
+                created_for_workflow_permanent_id=created_for_workflow_permanent_id,
             )
         except BaseException as error:
             # A failed acknowledgement does not prove the committed session is an orphan.
@@ -813,8 +862,7 @@ class DefaultPersistentSessionsManager(PersistentSessionsManager):
         # screencast/CDP input endpoints can connect. Triggered both by the
         # in-process CDP streaming mode and by cdp-connect, which forwards to a
         # remote browser and still needs a registered BrowserState locally.
-        should_launch = settings.BROWSER_STREAMING_MODE == "cdp" or settings.BROWSER_TYPE == "cdp-connect"
-        if should_launch and runnable_id is None:
+        if self.launches_browser_on_create() and runnable_id is None:
             session_id = session.persistent_browser_session_id
             task = asyncio.create_task(
                 self._launch_browser_for_session(session_id, organization_id, proxy_location, url)
@@ -963,6 +1011,7 @@ class DefaultPersistentSessionsManager(PersistentSessionsManager):
         proxy_location: ProxyLocationInput,
         browser_profile_id: str | None,
         session_kind: BrowserSessionKind,
+        created_for_workflow_permanent_id: str | None = None,
     ) -> FreshExitReceipt:
         return FreshExitReceipt(
             outcome=FreshExitOutcome.no_alternate,
@@ -1100,6 +1149,11 @@ class DefaultPersistentSessionsManager(PersistentSessionsManager):
         expected_browser_state: BrowserState | None = None,
     ) -> bool:
         """Release a specific browser session."""
+        if not await self._detach_external_driver_of_owner(
+            session_id, organization_id, expected_runnable_id, expected_runnable_generation_id
+        ):
+            return False
+        armed_deadline = self._external_deadlines.get(session_id)
         if allow_retirement_release:
             released = await self.database.browser_sessions.release_persistent_browser_session(
                 session_id,
@@ -1115,7 +1169,10 @@ class DefaultPersistentSessionsManager(PersistentSessionsManager):
                 expected_runnable_id=expected_runnable_id,
                 expected_runnable_generation_id=expected_runnable_generation_id,
             )
-        return released is not None
+        if released is None:
+            return False
+        disarm_released_deadline(self._external_deadlines, session_id, armed_deadline)
+        return True
 
     async def release_stale_browser_session(
         self,
@@ -1136,6 +1193,11 @@ class DefaultPersistentSessionsManager(PersistentSessionsManager):
             or stream_tombstone_holds_session_lease(expected_runnable_id, session_id)
         ):
             return False
+        if not await self._detach_external_driver_of_owner(
+            session_id, organization_id, expected_runnable_id, expected_runnable_generation_id
+        ):
+            return False
+        armed_deadline = self._external_deadlines.get(session_id)
         released = await self.database.browser_sessions.release_persistent_browser_session(
             session_id,
             organization_id,
@@ -1144,7 +1206,38 @@ class DefaultPersistentSessionsManager(PersistentSessionsManager):
             observed_last_activity_at=observed_last_activity_at,
             allow_retirement_release=True,
         )
-        return released is not None
+        if released is None:
+            return False
+        disarm_released_deadline(self._external_deadlines, session_id, armed_deadline)
+        return True
+
+    async def _detach_external_driver_of_owner(
+        self,
+        session_id: str,
+        organization_id: str,
+        expected_runnable_id: str | None,
+        expected_runnable_generation_id: str | None,
+    ) -> bool:
+        """False keeps the lease: a driver that did not detach may still be attached when the next owner arrives."""
+        cached = self._browser_sessions.get(session_id)
+        if cached is None or not is_external_browser_state(cached.browser_state):
+            return True
+        row = await self.database.browser_sessions.get_persistent_browser_session(session_id, organization_id)
+        if row is None or row.runnable_id is None:
+            return True
+        try:
+            assert_runnable_owner(row, expected_runnable_id, expected_runnable_generation_id)
+        except BrowserSessionOwnershipConflict:
+            return True
+        try:
+            await cached.browser_state.detach_remote_driver()
+        except Exception:
+            LOG.warning(
+                "Kept the external lease because its driver did not detach", session_id=session_id, exc_info=True
+            )
+            return False
+        self._retire_browser_session(session_id, expected=cached, reason=BrowserRetirementReason.session_ending)
+        return True
 
     async def _release_local_browser_session(
         self, organization_id: str, browser_session_id: str, *, export_profile: bool | None = None
@@ -1304,6 +1397,7 @@ class DefaultPersistentSessionsManager(PersistentSessionsManager):
         *,
         reason: BrowserSessionCloseReason = BrowserSessionCloseReason.user_requested,
     ) -> None:
+        disarm_external_deadline(self._external_deadlines, browser_session_id)
         released = await self._release_local_browser_session(organization_id, browser_session_id)
         if not released:
             LOG.info(

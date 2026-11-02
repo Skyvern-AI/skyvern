@@ -4,7 +4,7 @@ import copy
 import io
 import json
 from collections.abc import AsyncIterator, Awaitable, Callable, Iterator
-from contextlib import asynccontextmanager
+from contextlib import AbstractAsyncContextManager, asynccontextmanager
 from dataclasses import replace
 from functools import partial
 from types import SimpleNamespace
@@ -15,28 +15,32 @@ from urllib.parse import quote, urlparse
 import pytest
 import yaml
 from agents import FunctionTool
+from agents.mcp import MCPServerManager
 from agents.mcp.util import MCPUtil
 from agents.tool_context import ToolContext
 from fastmcp import FastMCP
 from mcp import Tool as MCPTool
 from mcp.types import CallToolResult
 from PIL import Image
-from playwright.async_api import Route
+from playwright.async_api import Page, Request, Route
 from structlog.testing import capture_logs
 
 from skyvern.cli.core import client as client_module
 from skyvern.cli.core.client import get_active_api_key
 from skyvern.cli.core.guards import VALID_WAIT_UNTIL
 from skyvern.cli.core.result import ErrorCode, make_error
+from skyvern.cli.core.session_manager import RequestFailureLog, get_current_session
 from skyvern.cli.mcp_tools import mcp
 from skyvern.cli.mcp_tools._element_state import action_deadline_error, element_state_error
-from skyvern.cli.mcp_tools.blocks import skyvern_block_validate, skyvern_workflow_knowledge
+from skyvern.cli.mcp_tools.blocks import skyvern_block_schema, skyvern_block_validate, skyvern_workflow_knowledge
+from skyvern.cli.mcp_tools.inspection import ensure_hooks_on_all_pages
 from skyvern.cli.mcp_tools.workflow import skyvern_workflow_get
 from skyvern.forge.sdk.cache.base import NoopLock
 from skyvern.forge.sdk.cache.local import LocalCache
 from skyvern.forge.sdk.copilot import agent as copilot_agent
 from skyvern.forge.sdk.copilot import mcp_adapter
 from skyvern.forge.sdk.copilot import runtime as copilot_runtime
+from skyvern.forge.sdk.copilot.agent_context import OriginRunRedactionRegistry
 from skyvern.forge.sdk.copilot.browser_ablation import CopilotEvalMode, resolve_copilot_tool_surface
 from skyvern.forge.sdk.copilot.config import (
     AGENT_BLOCKS_ONLY,
@@ -62,16 +66,17 @@ from skyvern.forge.sdk.copilot.mcp_adapter import (
     resolve_browser_session_binding,
 )
 from skyvern.forge.sdk.copilot.model_input_capture import serialize_tool_surface
-from skyvern.forge.sdk.copilot.output_utils import MCP_RESULT_PROVENANCE_KEY
+from skyvern.forge.sdk.copilot.output_utils import _RECENT_TOOL_OUTPUT_CHAR_CAP, MCP_RESULT_PROVENANCE_KEY
 from skyvern.forge.sdk.copilot.request_policy import RequestPolicy
 from skyvern.forge.sdk.copilot.runtime import (
     AgentContext,
     CopilotBrowserLivenessUndetermined,
     CopilotBrowserSessionUnavailable,
-    OriginRunRedactionRegistry,
+    DemonstratedAction,
     bound_call_browser_session,
     browser_session_lock,
     mcp_to_copilot,
+    staged_demonstrated_action,
 )
 from skyvern.forge.sdk.copilot.screenshot_utils import ScreenshotProvenance, enqueue_screenshot
 from skyvern.forge.sdk.copilot.secret_scrub import (
@@ -79,9 +84,15 @@ from skyvern.forge.sdk.copilot.secret_scrub import (
     register_secret_scrub_value,
     register_secret_scrub_values_from_structure,
 )
-from skyvern.forge.sdk.copilot.tools import NATIVE_TOOLS, _with_action_reason, mcp_hooks, run_execution
+from skyvern.forge.sdk.copilot.tools import (
+    NATIVE_TOOLS,
+    _with_action_reason,
+    _with_page_state,
+    mcp_hooks,
+    run_execution,
+)
 from skyvern.forge.sdk.copilot.tools import scouting as scouting_module
-from skyvern.forge.sdk.copilot.tools._shared import _composition_get_structured_evidence_result
+from skyvern.forge.sdk.copilot.tools._shared import _composition_get_structured_evidence_result, on_working_page
 from skyvern.forge.sdk.copilot.tools.banned_blocks import _block_authoring_violations
 from skyvern.forge.sdk.copilot.tools.mcp_hooks import (
     _FOR_LOOP_EXAMPLE,
@@ -93,11 +104,21 @@ from skyvern.forge.sdk.copilot.tools.mcp_hooks import (
 )
 from skyvern.forge.sdk.copilot.turn_origin import TurnOrigin
 from skyvern.forge.sdk.workflow.models.workflow import WorkflowRunStatus
+from skyvern.webeye.browser_state import PageCrashRecord
 from skyvern.webeye.persistent_sessions_manager import (
     BrowserOperation,
     BrowserRetirement,
     BrowserRetirementReason,
 )
+from tests.unit._mcp_browser_fakes import (
+    logged_request_failures,
+    make_request_failure,
+    make_session_state,
+    page_crash_entry,
+    seed_page_crash,
+    seed_request_failures,
+)
+from tests.unit._socket_closing_fixture import BODY_SENTINEL, socket_closing_fixture_page
 from tests.unit.copilot_test_helpers import (
     AUTO_RENDER_TURNSTILE_HTML,
     CATALOG_PAGE_HTML,
@@ -801,25 +822,21 @@ async def test_retirement_rollback_preserves_concurrent_sibling_evidence(
     assert ctx.flow_evidence == [{"source": "sibling"}]
 
 
-@pytest.mark.asyncio
-async def test_browser_pre_hook_internal_read_reuses_the_outer_generation(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    ctx = make_copilot_ctx(browser_session_id="pbs_nested_hook")
-    ctx.api_key = "test-api-key"
+def _attach_mocked_browser_session(
+    monkeypatch: pytest.MonkeyPatch, working_page: Page | None
+) -> tuple[MagicMock, list[str]]:
     browser = MagicMock()
     browser.is_connected.return_value = True
     browser_context = MagicMock()
     browser_context.browser = browser
     browser_context._impl_obj = SimpleNamespace(_close_was_called=False, _closed=False)
     browser_state = MagicMock(browser_context=browser_context)
-    browser_state.get_working_page = AsyncMock(return_value=None)
-    operation_entries = 0
+    browser_state.get_working_page = AsyncMock(return_value=working_page)
+    operation_entries: list[str] = []
 
     @asynccontextmanager
     async def _operation(_session_id: str, resolved_state: Any) -> AsyncIterator[BrowserOperation]:
-        nonlocal operation_entries
-        operation_entries += 1
+        operation_entries.append(_session_id)
         yield BrowserOperation(resolved_state, BrowserRetirement())
 
     manager = MagicMock()
@@ -831,15 +848,25 @@ async def test_browser_pre_hook_internal_read_reuses_the_outer_generation(
     monkeypatch.setattr(copilot_runtime, "get_active_api_key", MagicMock(return_value="test-api-key"))
     monkeypatch.setattr(copilot_runtime, "set_api_key_override", MagicMock(return_value=object()))
     monkeypatch.setattr(copilot_runtime, "reset_api_key_override", MagicMock())
-    register = MagicMock()
-    unregister = MagicMock()
-    monkeypatch.setattr(copilot_runtime, "register_copilot_session", register)
-    monkeypatch.setattr(copilot_runtime, "unregister_copilot_session", unregister)
 
     async def _prepared(_ctx: AgentContext, **_kwargs: Any) -> tuple[None, None, None]:
         return None, None, None
 
     monkeypatch.setattr(mcp_adapter, "_prepare_browser_session_for_dispatch", _prepared)
+    return manager, operation_entries
+
+
+@pytest.mark.asyncio
+async def test_browser_pre_hook_internal_read_reuses_the_outer_generation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    ctx = make_copilot_ctx(browser_session_id="pbs_nested_hook")
+    ctx.api_key = "test-api-key"
+    manager, operation_entries = _attach_mocked_browser_session(monkeypatch, None)
+    register = MagicMock()
+    unregister = MagicMock()
+    monkeypatch.setattr(copilot_runtime, "register_copilot_session", register)
+    monkeypatch.setattr(copilot_runtime, "unregister_copilot_session", unregister)
     server: SkyvernOverlayMCPServer
 
     async def _pre_hook(_args: dict[str, Any], _ctx: AgentContext) -> None:
@@ -856,7 +883,7 @@ async def test_browser_pre_hook_internal_read_reuses_the_outer_generation(
     result = await server.call_tool("evaluate", {"expression": "action()"})
 
     assert result.isError is False
-    assert operation_entries == 1
+    assert len(operation_entries) == 1
     manager.get_browser_state.assert_awaited_once()
     register.assert_called_once()
     unregister.assert_called_once()
@@ -2087,9 +2114,8 @@ class TestMCPToolTiming:
 
         server = _browser_server(_advance)
 
-        with capture_logs() as captured:
-            with pytest.raises(asyncio.CancelledError):
-                await _call(server, call_path)
+        with capture_logs() as captured, pytest.raises(asyncio.CancelledError):
+            await _call(server, call_path)
 
         record = _timing_records(captured)[0]
         assert record["call_status"] == "cancelled"
@@ -2670,7 +2696,7 @@ def test_every_browser_overlay_offers_the_target_param() -> None:
         "skyvern_tab_switch",
         "skyvern_tab_close",
     } <= set(browser_overlays)
-    assert len(browser_overlays) == 17
+    assert len(browser_overlays) == 18
     assert all(BROWSER_TARGET_PARAM_NAME in overlay.copilot_params for overlay in browser_overlays.values())
     # inspect_page_for_composition owns target_url semantics; a second target would overload it.
     assert "inspect_page_for_composition" not in browser_overlays
@@ -2816,6 +2842,59 @@ def _overlay_server(
 
 def _click_overlay_server(ctx: AgentContext, payload: dict[str, Any]) -> SkyvernOverlayMCPServer:
     return _overlay_server(ctx, _FakeClient(payload), "click", _build_skyvern_mcp_overlays()["click"])
+
+
+@pytest.mark.asyncio
+async def test_staged_click_uses_normal_adapter_path_without_browser_dispatch(_stub_browser_session: None) -> None:
+    dispatched: list[bool] = []
+    ctx = make_copilot_ctx(browser_session_id="pbs_1")
+    server = _overlay_server(
+        ctx,
+        _FakeClient({"ok": False}, on_call=lambda: dispatched.append(True)),
+        "click",
+        _build_skyvern_mcp_overlays()["click"],
+    )
+    action = DemonstratedAction(
+        selector="#continue",
+        source_url="https://example.test/form",
+        packet={
+            "role_name": {"role": "button", "accessible_name": "Continue"},
+            "selector_match_count": 1,
+            "role_name_match_count": 1,
+        },
+        synthesized_result={
+            "ok": True,
+            "data": {"selector": "#continue"},
+            "browser_context": {"url": "https://example.test/next", "title": ""},
+        },
+    )
+
+    with staged_demonstrated_action(action):
+        result = await server.call_tool("click", {"selector": "#continue"})
+
+    assert result.isError is False
+    assert dispatched == []
+    interaction = ctx.scout_trajectory[-1]
+    assert interaction["actor"] == "user"
+    assert interaction["source_url"] == "https://example.test/form"
+    assert (interaction["role"], interaction["accessible_name"]) == ("button", "Continue")
+
+
+@pytest.mark.asyncio
+async def test_internal_browser_call_refuses_during_demonstration_replay() -> None:
+    ctx = make_copilot_ctx(browser_session_id="pbs_1")
+    server = _click_overlay_server(ctx, {"ok": True})
+    action = DemonstratedAction(
+        selector="#continue",
+        source_url="https://example.test/start",
+        packet=None,
+        synthesized_result={"ok": True},
+    )
+
+    with staged_demonstrated_action(action):
+        result = await server._call_internal_tool("skyvern_click", {"selector": "#continue"})
+
+    assert result.result == {"ok": False, "error": "Browser access is unavailable while replaying a demonstration."}
 
 
 def _real_action_overlay(overlay_id: str) -> tuple[str, SchemaOverlay]:
@@ -3242,7 +3321,7 @@ def _browser_evaluate_server(
         ctx,
         payload or {"ok": True},
         overlay or SchemaOverlay(requires_browser=True),
-        page_state_reader=scouting_module.read_page_state,
+        page_state_reader=scouting_module.read_page_state_on_page,
     )
 
 
@@ -3356,7 +3435,7 @@ class TestPageStateOnBrowserResults:
                 _FakeClient({"ok": False, "error": "No element matches #go"}),
                 "click",
                 _build_skyvern_mcp_overlays()["click"],
-                page_state_reader=scouting_module.read_page_state,
+                page_state_reader=scouting_module.read_page_state_on_page,
             )
             result = await server.call_tool("click", {"selector": "#go"})
 
@@ -3434,6 +3513,54 @@ class TestPageStateOnBrowserResults:
             result = await server.call_tool("evaluate", {"expression": "1"})
 
         assert _page_state(result) == _CATALOG_PAGE_STATE
+
+    @pytest.mark.asyncio
+    async def test_demonstration_handoff_precedes_the_first_model_call(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setattr("agents.mcp.MCPServerManager", FakeMCPServerManager)
+        history = [
+            {
+                "type": "function_call",
+                "call_id": "call_demo_turn-1_1",
+                "name": "navigate_browser",
+                "arguments": '{"url":"https://example.test"}',
+            },
+            {"type": "function_call_output", "call_id": "call_demo_turn-1_1", "output": '{"ok":true}'},
+            {"role": "user", "content": "[copilot:nudge] demonstration complete"},
+        ]
+        order: list[str] = []
+
+        async def replay_demonstration(*args: Any, **kwargs: Any) -> list[dict[str, Any]]:
+            order.append("demonstration")
+            return history
+
+        async def run_with_enforcement(*args: Any, **kwargs: Any) -> None:
+            order.append("model")
+            assert kwargs["initial_input"] == [{"role": "user", "content": "opener"}, *history]
+            raise CopilotTotalTimeoutError()
+
+        monkeypatch.setattr(copilot_agent, "replay_demonstration", replay_demonstration)
+        monkeypatch.setattr("skyvern.forge.sdk.copilot.enforcement.run_with_enforcement", run_with_enforcement)
+        ctx = make_copilot_ctx(browser_session_id="pbs_1", turn_id="turn-1", demonstration_requested=True)
+
+        with pytest.raises(CopilotTotalTimeoutError):
+            await copilot_agent._run_agent_loop_with_surface(
+                ctx=ctx,
+                stream=MagicMock(),
+                chat_id="chat-1",
+                initial_input="opener",
+                system_prompt="system prompt",
+                model_name="model-PRIMARY",
+                run_config=MagicMock(),
+                llm_key="PRIMARY",
+                copilot_config=CopilotConfig(),
+                native_tools=[],
+                alias_map={},
+                overlays={},
+                output_guardrails=[],
+            )
+
+        assert order == ["demonstration", "model"]
+        assert ctx.demonstration_ran is True
 
     @pytest.mark.asyncio
     @pytest.mark.parametrize(
@@ -3643,19 +3770,84 @@ async def test_a_frame_staged_inside_a_tool_names_the_call_that_staged_it() -> N
     assert [frame.tool_call_id for frame in ctx.pending_chat_screenshots] == ["call-mcp", "call-native", None]
 
 
+class _HangingClient:
+    def __init__(self, _transport: object) -> None:
+        pass
+
+    async def __aenter__(self) -> None:
+        await asyncio.Event().wait()
+
+    async def __aexit__(self, *_args: object) -> None:
+        return None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("api_key", "event", "detail"),
+    [
+        pytest.param(None, "copilot_mcp_server_lifecycle_failed", "exc_info", id="error"),
+        pytest.param("sk-test", "copilot_mcp_server_lifecycle_cancelled", "elapsed_seconds", id="connect_timeout"),
+    ],
+)
+async def test_an_mcp_server_that_fails_to_connect_logs_why(
+    monkeypatch: pytest.MonkeyPatch, api_key: str | None, event: str, detail: str
+) -> None:
+    monkeypatch.setattr(mcp_adapter, "Client", _HangingClient)
+    ctx = make_copilot_ctx(api_key=api_key)
+    server = SkyvernOverlayMCPServer(
+        transport=MagicMock(),
+        overlays={},
+        alias_map={},
+        allowlist=frozenset(),
+        context_provider=lambda: ctx,
+    )
+
+    with capture_logs() as logs:
+        async with MCPServerManager([server], connect_timeout_seconds=0.05) as manager:
+            assert manager.active_servers == []
+
+    (failure,) = (log for log in logs if log["event"] == event)
+    assert failure["phase"] == "connect"
+    assert detail in failure
+
+
+@pytest.mark.asyncio
+async def test_malformed_mcp_tool_arguments_tell_the_model_where_the_json_broke() -> None:
+    ctx = make_copilot_ctx()
+    server = SkyvernOverlayMCPServer(
+        transport=MagicMock(),
+        overlays={},
+        alias_map={},
+        allowlist=frozenset(),
+        context_provider=lambda: ctx,
+    )
+    tool = MCPUtil.to_function_tool(
+        MCPTool(name="click", inputSchema={"type": "object", "properties": {}}),
+        server,
+        convert_schemas_to_strict=False,
+    )
+    arguments = '{"selector": '
+
+    output = await tool.on_invoke_tool(
+        ToolContext(context=ctx, tool_name="click", tool_call_id="call-1", tool_arguments=arguments), arguments
+    )
+
+    assert "Expecting value: line 1 column 14" in str(output)
+
+
 _ModelCall = Callable[[str, dict[str, Any]], Awaitable[dict[str, Any]]]
 
 
 @asynccontextmanager
 async def _real_server_tools(
-    capability: AuthoringCapability, *names: str
+    capability: AuthoringCapability, *names: str, doc_editor_enabled: bool = False
 ) -> AsyncIterator[tuple[dict[str, MCPTool], _ModelCall]]:
-    ctx = make_copilot_ctx(api_key="in-process-test-key")
+    ctx = make_copilot_ctx(api_key="in-process-test-key", doc_editor_enabled=doc_editor_enabled)
     ctx.authoring_capability = capability
     aliases = get_skyvern_mcp_alias_map()
     server = SkyvernOverlayMCPServer(
         transport=mcp,
-        overlays=_build_skyvern_mcp_overlays(capability),
+        overlays=_build_skyvern_mcp_overlays(capability, notes_visible=doc_editor_enabled),
         alias_map={name: aliases[name] for name in names},
         allowlist=frozenset(aliases[name] for name in names),
         context_provider=lambda: ctx,
@@ -3718,10 +3910,14 @@ def _enums_in(schema: object) -> list[list[str]]:
     return []
 
 
+@pytest.mark.parametrize("doc_editor_enabled", [False, True])
 @pytest.mark.asyncio
-async def test_closed_value_parameters_carry_the_enforced_values_as_a_schema_enum() -> None:
+async def test_closed_value_parameters_carry_the_enforced_values_as_a_schema_enum(doc_editor_enabled: bool) -> None:
     overlay_tools = ("get_workflow_knowledge", "list_workflow_runs", "navigate_browser")
-    async with _real_server_tools(ALL_BLOCK_FAMILIES, *overlay_tools) as (tools, call):
+    async with _real_server_tools(ALL_BLOCK_FAMILIES, *overlay_tools, doc_editor_enabled=doc_editor_enabled) as (
+        tools,
+        call,
+    ):
         served_topics = (await call("get_workflow_knowledge", {}))["data"]["topics"]
     schemas = {name: tool.inputSchema for name, tool in tools.items()}
     schemas |= {tool.name: tool.params_json_schema for tool in NATIVE_TOOLS if tool.name == "fill_credential_field"}
@@ -3740,6 +3936,56 @@ async def test_closed_value_parameters_carry_the_enforced_values_as_a_schema_enu
         ("navigate_browser", "wait_until"): [list(VALID_WAIT_UNTIL)],
         ("fill_credential_field", "field"): [list(CREDENTIAL_FILL_FIELD_NAMES)],
     }
+
+
+_NOTE_FIELDS = {"notes", "trailing_notes", "description"}
+
+
+def _saved_workflow_with_notes() -> dict[str, Any]:
+    child = {"label": "open", "block_type": "navigation", "notes": "use the left menu", "description": "people only"}
+    loop = {"label": "each", "block_type": "for_loop", "loop_blocks": [child], "trailing_notes": "stop at ten"}
+    return {
+        "ok": True,
+        "data": {"description": "workflow summary", "workflow_definition": {"parameters": [], "blocks": [loop]}},
+    }
+
+
+@pytest.mark.parametrize("doc_editor_enabled", [False, True])
+@pytest.mark.asyncio
+async def test_copilot_reads_notes_only_with_the_doc_editor(doc_editor_enabled: bool) -> None:
+    public = (await skyvern_block_schema(block_type="navigation"))["data"]["schema"]["properties"]
+    assert _NOTE_FIELDS.isdisjoint(public)
+    async with _real_server_tools(
+        ALL_BLOCK_FAMILIES, "get_block_schema", "get_workflow_knowledge", doc_editor_enabled=doc_editor_enabled
+    ) as (tools, call):
+        catalog = (await call("get_workflow_knowledge", {}))["data"]["topics"]
+        asked = await call("get_workflow_knowledge", {"topics": ["notes_between_blocks", "for_loop_block"]})
+        asked_only_notes = await call("get_workflow_knowledge", {"topics": ["notes_between_blocks"]})
+        loop_schema = (await call("get_block_schema", {"block_type": "for_loop"}))["data"]["schema"]
+    saved = await _build_skyvern_mcp_overlays(ALL_BLOCK_FAMILIES, notes_visible=doc_editor_enabled)[
+        "get_org_workflow"
+    ].post_hook(_saved_workflow_with_notes(), {}, make_copilot_ctx(doc_editor_enabled=doc_editor_enabled))
+
+    block_property_maps = [
+        definition["properties"]
+        for definition in loop_schema["$defs"].values()
+        if {"label", "block_type"} <= set(definition.get("properties", {}))
+    ]
+    saved_loop = saved["data"]["workflow_definition"]["blocks"][0]
+    if doc_editor_enabled:
+        assert "notes_between_blocks" in catalog and "notes_between_blocks" in asked["data"]["sections"]
+        assert set(asked_only_notes["data"]["sections"]) == {"notes_between_blocks"}
+        assert all(_NOTE_FIELDS <= set(properties) for properties in block_property_maps)
+        assert saved_loop["trailing_notes"] == "stop at ten"
+        assert saved_loop["loop_blocks"][0]["notes"] == "use the left menu"
+    else:
+        assert "notes_between_blocks" not in catalog
+        assert "notes_between_blocks" not in json.dumps(tools["get_workflow_knowledge"].inputSchema)
+        assert set(asked["data"]["sections"]) == {"for_loop_block"}
+        assert "notes_between_blocks" not in json.dumps(asked_only_notes)
+        assert all(_NOTE_FIELDS.isdisjoint(properties) for properties in block_property_maps)
+        assert _NOTE_FIELDS.isdisjoint(saved_loop) and _NOTE_FIELDS.isdisjoint(saved_loop["loop_blocks"][0])
+        assert saved["data"]["description"] == "workflow summary"
 
 
 @pytest.mark.parametrize("capability", [ALL_BLOCK_FAMILIES, CODE_BLOCKS_ONLY, AGENT_BLOCKS_ONLY])
@@ -3902,3 +4148,654 @@ async def test_a_failed_browser_action_reports_typed_facts_instead_of_the_server
     )
     assert surfaced.get("element_state") == element_state
     assert server_error["hint"] not in result.content[0].text
+
+
+async def _rebuilding_post_hook(
+    copilot_result: dict[str, Any], _raw_mcp: dict[str, Any], _ctx: AgentContext
+) -> dict[str, Any]:
+    return {"ok": copilot_result["ok"], "data": copilot_result["data"]}
+
+
+def _tab(title: str) -> SimpleNamespace:
+    return SimpleNamespace(
+        url=f"https://app.test/{title.lower()}", frames=[], title=AsyncMock(return_value=title), is_closed=lambda: False
+    )
+
+
+def _scope_exiting_with(exc: BaseException) -> Callable[..., AbstractAsyncContextManager[None]]:
+    @asynccontextmanager
+    async def scope(_ctx: AgentContext, *, session_id_override: str | None = None) -> AsyncIterator[None]:
+        yield
+        raise exc
+
+    return scope
+
+
+async def _evaluate_result(server: SkyvernOverlayMCPServer) -> dict[str, Any]:
+    result = json.loads((await server.call_tool("evaluate", {"expression": "read()"})).content[0].text)
+    if "page_request_failures" in result:
+        keys = list(result)
+        assert keys.index("page_request_failures") == keys.index("page_state") + 1
+    return result
+
+
+def _evaluate_browser_server(
+    ctx: AgentContext,
+    raw_result: dict[str, Any] | Exception,
+    on_call: Callable[[], None] | None = None,
+    overlay: SchemaOverlay | None = None,
+) -> SkyvernOverlayMCPServer:
+    overlay, reader = (
+        overlay or SchemaOverlay(requires_browser=True, timeout=1),
+        scouting_module.read_page_state_on_page,
+    )
+    return _make_server(
+        ctx, raw_result, overlay, alias_map={"evaluate": "skyvern_evaluate"}, on_call=on_call, page_state_reader=reader
+    )
+
+
+def _working_tab_with_failures(
+    monkeypatch: pytest.MonkeyPatch, ctx: AgentContext, *paths: str, closed: bool = False
+) -> RequestFailureLog:
+    working_tab = _tab("Orders")
+    working_tab.is_closed = lambda: closed
+    patch_browser_tabs(monkeypatch, FakeTabbedBrowserState(working_tab))
+    return seed_request_failures(ctx, "pbs_failures", *[make_request_failure(working_tab, path) for path in paths])
+
+
+def _redact_within_budget(value: Any, _parameters: dict[str, Any], **_budget: int | None) -> Any:
+    return value if len(json.dumps(value)) <= 1_500 else None
+
+
+def _cap_redaction_budget(monkeypatch: pytest.MonkeyPatch, ctx: AgentContext) -> None:
+    ctx.codeblock_redaction_parameters = {"token": "unused-value"}
+    monkeypatch.setattr(mcp_adapter.app.AGENT_FUNCTION, "redact_codeblock_parameter_values", _redact_within_budget)
+
+
+def _form_tab_with_crash(
+    monkeypatch: pytest.MonkeyPatch, ctx: AgentContext, *, reopened: bool = True
+) -> PageCrashRecord:
+    patch_browser_tabs(monkeypatch, FakeTabbedBrowserState(_tab("Form")))
+    return seed_page_crash(ctx, "pbs_failures", reopened=reopened)
+
+
+class TestPageCrashes:
+    @pytest.fixture(autouse=True)
+    def _fresh_scrub_values(self) -> Iterator[None]:
+        clear_session_scrub_values("pbs_failures")
+        yield
+        clear_session_scrub_values("pbs_failures")
+
+    @pytest.mark.usefixtures("_stub_browser_session")
+    @pytest.mark.asyncio
+    async def test_a_crash_surfaces_on_the_next_result_and_again_only_once_its_tab_is_reopened(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        ctx = make_copilot_ctx(browser_session_id="pbs_failures")
+        record = _form_tab_with_crash(monkeypatch, ctx, reopened=False)
+        server = _evaluate_browser_server(ctx, {"ok": True})
+
+        before_reopen = await _evaluate_result(server)
+        record.reopened = True
+        after_reopen = await _evaluate_result(server)
+        drained = await _evaluate_result(server)
+
+        assert before_reopen["page_crashes"] == [page_crash_entry(reopened=False)]
+        assert after_reopen["page_crashes"] == [page_crash_entry()]
+        assert list(after_reopen).index("page_crashes") == list(after_reopen).index("page_state") + 1
+        assert "page_crashes" not in drained
+
+    @pytest.mark.usefixtures("_stub_browser_session")
+    @pytest.mark.asyncio
+    async def test_a_crash_a_withheld_result_cannot_show_goes_back(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        ctx = make_copilot_ctx(browser_session_id="pbs_failures")
+        _form_tab_with_crash(monkeypatch, ctx)
+        register_secret_scrub_value(ctx, "ok")
+
+        withheld = await _evaluate_result(_evaluate_browser_server(ctx, {"ok": True}))
+
+        assert "page_crashes" not in withheld
+        assert len(mcp_adapter.HeldPageFacts().take_page_crashes(ctx)) == 1
+
+    @pytest.mark.usefixtures("_stub_browser_session")
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "pre_hook",
+        [None, _refuse],
+        ids=["dispatched", "refused-before-dispatch"],
+    )
+    async def test_a_crash_a_cancelled_call_took_goes_back(
+        self, monkeypatch: pytest.MonkeyPatch, pre_hook: mcp_adapter.PreHook | None
+    ) -> None:
+        ctx = make_copilot_ctx(browser_session_id="pbs_failures")
+        _form_tab_with_crash(monkeypatch, ctx)
+        monkeypatch.setattr(mcp_adapter, "mcp_browser_context", _scope_exiting_with(asyncio.CancelledError()))
+        overlay = SchemaOverlay(requires_browser=True, timeout=1, pre_hook=pre_hook)
+
+        with pytest.raises(asyncio.CancelledError):
+            await _evaluate_result(_evaluate_browser_server(ctx, {"ok": True}, overlay=overlay))
+
+        assert mcp_adapter.HeldPageFacts().take_page_crashes(ctx) == [page_crash_entry()]
+
+    @pytest.mark.usefixtures("_stub_browser_session")
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ("result_chars", "reported"),
+        [(_RECENT_TOOL_OUTPUT_CHAR_CAP - 200, False), (_RECENT_TOOL_OUTPUT_CHAR_CAP, True)],
+        ids=["fits-without-it", "past-the-cap-anyway"],
+    )
+    async def test_a_crash_never_pushes_a_result_past_the_recent_output_cap(
+        self, monkeypatch: pytest.MonkeyPatch, result_chars: int, reported: bool
+    ) -> None:
+        ctx = make_copilot_ctx(browser_session_id="pbs_failures")
+        _form_tab_with_crash(monkeypatch, ctx)
+
+        result = await _evaluate_result(
+            _evaluate_browser_server(ctx, {"ok": True, "data": {"result": "x" * result_chars}})
+        )
+
+        assert ("page_crashes" in result) is reported
+        assert len(mcp_adapter.HeldPageFacts().take_page_crashes(ctx)) == (0 if reported else 1)
+
+    @pytest.mark.usefixtures("_stub_browser_session")
+    @pytest.mark.asyncio
+    async def test_a_crash_past_the_redaction_budget_goes_back(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        ctx = make_copilot_ctx(browser_session_id="pbs_failures")
+        _cap_redaction_budget(monkeypatch, ctx)
+        _form_tab_with_crash(monkeypatch, ctx)
+
+        result = await _evaluate_result(_evaluate_browser_server(ctx, {"ok": True, "data": {"result": "x" * 1_250}}))
+
+        assert result["ok"] is True and result["data"] == {"result": "x" * 1_250}
+        assert "page_crashes" not in result
+        assert len(mcp_adapter.HeldPageFacts().take_page_crashes(ctx)) == 1
+
+    @pytest.mark.usefixtures("_stub_browser_session")
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ("redaction_budget", "result_chars"),
+        [(False, _RECENT_TOOL_OUTPUT_CHAR_CAP - 700), (True, 1_000)],
+        ids=["recent-output-cap", "redaction-budget"],
+    )
+    async def test_a_crash_that_fits_without_the_request_failures_is_kept(
+        self, monkeypatch: pytest.MonkeyPatch, redaction_budget: bool, result_chars: int
+    ) -> None:
+        ctx = make_copilot_ctx(browser_session_id="pbs_failures")
+        if redaction_budget:
+            _cap_redaction_budget(monkeypatch, ctx)
+        log = _working_tab_with_failures(monkeypatch, ctx, *[f"/{n}" for n in range(5)])
+        seed_page_crash(ctx, "pbs_failures")
+
+        result = await _evaluate_result(
+            _evaluate_browser_server(ctx, {"ok": True, "data": {"result": "x" * result_chars}})
+        )
+
+        assert result["page_crashes"] == [page_crash_entry()]
+        assert "page_request_failures" not in result
+        assert len(logged_request_failures(log)) == 5
+        assert mcp_adapter.HeldPageFacts().take_page_crashes(ctx) == []
+
+    @pytest.mark.usefixtures("_stub_browser_session")
+    @pytest.mark.asyncio
+    async def test_a_failed_native_inspection_whose_page_read_also_failed_carries_the_crash(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        ctx = make_copilot_ctx(browser_session_id="pbs_failures")
+        _form_tab_with_crash(monkeypatch, ctx)
+        monkeypatch.setattr(scouting_module, "_read_live_page_state", AsyncMock(return_value="no_page"))
+        failure = {"ok": False, "error": "inspect_page_for_composition could not capture page evidence"}
+
+        async def inspect(_tool_ctx: ToolContext[AgentContext], _arguments: str) -> str:
+            return json.dumps(failure)
+
+        tool = _with_page_state(
+            FunctionTool(
+                name="inspect_page_for_composition",
+                description="",
+                params_json_schema={"type": "object", "properties": {}},
+                on_invoke_tool=inspect,
+            )
+        )
+        call = ToolContext(context=ctx, tool_name=tool.name, tool_call_id="call-inspect", tool_arguments="{}")
+
+        result = json.loads(await tool.on_invoke_tool(call, "{}"))
+        again = json.loads(await tool.on_invoke_tool(call, "{}"))
+
+        assert result["page_state"]["read"] == "failed"
+        assert result["page_crashes"] == [page_crash_entry()]
+        assert {key: result[key] for key in failure} == failure
+        assert "page_crashes" not in again
+
+    @pytest.mark.usefixtures("_stub_browser_session")
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ("raw_result", "raw_secret"),
+        [
+            pytest.param({"ok": True}, True, id="raw-secret-denied"),
+            pytest.param(TimeoutError(), False, id="timed-out-without-a-read"),
+            pytest.param(CopilotBrowserSessionUnavailable("pbs_failures"), False, id="session-unavailable"),
+        ],
+    )
+    async def test_a_result_whose_page_was_not_read_still_carries_the_crash(
+        self, monkeypatch: pytest.MonkeyPatch, raw_result: dict[str, Any] | Exception, raw_secret: bool
+    ) -> None:
+        ctx = make_copilot_ctx(browser_session_id="pbs_failures")
+        _form_tab_with_crash(monkeypatch, ctx)
+        monkeypatch.setattr(mcp_adapter, "_browser_session_error_disposition", AsyncMock(return_value="failed"))
+        ctx.request_policy = RequestPolicy(raw_secret_detected=True) if raw_secret else None
+
+        unread = await _evaluate_result(_evaluate_browser_server(ctx, raw_result))
+        ctx.request_policy = None
+        read = await _evaluate_result(_evaluate_browser_server(ctx, {"ok": True}))
+
+        assert unread["page_state"]["read"] == "failed"
+        assert unread["page_crashes"] == [page_crash_entry()]
+        assert "page_crashes" not in read
+
+    @pytest.mark.usefixtures("_stub_browser_session")
+    @pytest.mark.asyncio
+    async def test_a_call_aimed_at_an_unavailable_browser_leaves_the_crash_for_the_next_read(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        ctx = make_copilot_ctx(browser_session_id="pbs_failures")
+        _form_tab_with_crash(monkeypatch, ctx)
+        server = _evaluate_browser_server(ctx, {"ok": True})
+
+        refused = json.loads(
+            (await server.call_tool("evaluate", {"expression": "1", "target": "elsewhere"})).content[0].text
+        )
+        read = await _evaluate_result(server)
+
+        assert "page_crashes" not in refused
+        assert read["page_crashes"] == [page_crash_entry()]
+
+    @pytest.mark.usefixtures("_stub_browser_session")
+    @pytest.mark.asyncio
+    async def test_a_navigate_whose_page_read_failed_still_carries_the_crash(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        ctx = make_copilot_ctx(browser_session_id="pbs_failures")
+        monkeypatch.setattr(mcp_hooks, "_bind_login_credential_for_observed_url", AsyncMock())
+        monkeypatch.setattr(mcp_hooks, "_capture_post_interaction_screenshot", AsyncMock(return_value=False))
+        _form_tab_with_crash(monkeypatch, ctx)
+        navigate = SchemaOverlay(requires_browser=True, timeout=1, post_hook=mcp_hooks._navigate_post_hook)
+        read_live_page_state = scouting_module._read_live_page_state
+        monkeypatch.setattr(scouting_module, "_read_live_page_state", AsyncMock(return_value="no_page"))
+
+        unread = await _evaluate_result(
+            _evaluate_browser_server(ctx, {"ok": True, "data": {"url": "https://app.test/form"}}, overlay=navigate)
+        )
+        monkeypatch.setattr(scouting_module, "_read_live_page_state", read_live_page_state)
+        read = await _evaluate_result(_evaluate_browser_server(ctx, {"ok": True}))
+
+        assert unread["page_state"]["read"] == "failed"
+        assert unread["page_crashes"] == [page_crash_entry()]
+        assert "page_crashes" not in read
+
+
+class TestPageRequestFailures:
+    @pytest.fixture(autouse=True)
+    def _fresh_scrub_values(self) -> Iterator[None]:
+        clear_session_scrub_values("pbs_failures")
+        yield
+        clear_session_scrub_values("pbs_failures")
+
+    @skip_no_browser
+    @pytest.mark.asyncio
+    async def test_a_socket_closed_xhr_between_calls_surfaces_once_on_the_next_browser_result(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        ctx = make_copilot_ctx(browser_session_id="pbs_failures", api_key="test-api-key")
+        async with socket_closing_fixture_page() as (page, origin):
+            await page.goto(f"{origin}/")
+            _attach_mocked_browser_session(monkeypatch, page)
+
+            def _tool_body() -> None:
+                ensure_hooks_on_all_pages(get_current_session(), [page])
+
+            server = _make_server(
+                ctx,
+                {"ok": True, "data": {"result": "done"}},
+                SchemaOverlay(requires_browser=True, post_hook=_rebuilding_post_hook),
+                on_call=_tool_body,
+                page_state_reader=scouting_module.read_page_state_on_page,
+            )
+
+            earlier = [(await _evaluate_result(server)).get("page_request_failures") for _ in range(2)]
+            async with page.expect_event("requestfailed"):
+                await page.click("#view")
+            aborts_seen = asyncio.Event()
+            aborted = 0
+
+            def _count_abort(request: Request) -> None:
+                nonlocal aborted
+                aborted += 1
+                if aborted == 21:
+                    aborts_seen.set()
+
+            page.on("requestfailed", _count_abort)
+            await page.evaluate(
+                """async () => {
+                    const controllers = Array.from({length: 21}, () => new AbortController());
+                    const pending = controllers.map((c) => fetch('/slow', {signal: c.signal}).catch(() => null));
+                    await new Promise((resolve) => setTimeout(resolve, 300));
+                    controllers.forEach((c) => c.abort());
+                    await Promise.all(pending);
+                }"""
+            )
+            await asyncio.wait_for(aborts_seen.wait(), timeout=10)
+            after_failure = await _evaluate_result(server)
+            next_call = await _evaluate_result(server)
+
+        assert earlier == [None, None]
+        reported = {
+            "method": "POST",
+            "resource_type": "xhr",
+            "failure_text": "net::ERR_EMPTY_RESPONSE",
+            "url": "/report",
+        }
+        # 21 aborts overflow both caps; the one different failure keeps its slot at each.
+        assert after_failure["page_request_failures"][0] == {**reported, "page_url": f"{origin}/"}
+        assert [(f["failure_text"], f.get("url")) for f in after_failure["page_request_failures"][1:]] == [
+            ("net::ERR_ABORTED", "/slow")
+        ] * 4
+        assert BODY_SENTINEL not in json.dumps(after_failure)
+        assert "page_request_failures" not in next_call
+
+    @pytest.mark.usefixtures("_stub_browser_session")
+    @pytest.mark.asyncio
+    async def test_model_results_drain_only_the_tab_they_read_and_internal_calls_drain_nothing(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        ctx = make_copilot_ctx(browser_session_id="pbs_failures")
+        working_tab, other_tab = _tab("Orders"), _tab("Reports")
+        browser = FakeTabbedBrowserState(working_tab, other_tab)
+        patch_browser_tabs(monkeypatch, browser)
+        working_failures = [make_request_failure(working_tab, f"/{n}") for n in range(7)]
+        noisy_failures = [make_request_failure(other_tab, f"/bg{n}", resource_type="fetch") for n in range(120)]
+        log = seed_request_failures(ctx, "pbs_failures", *working_failures, *noisy_failures)
+        recorded = logged_request_failures(log)
+        browser_server = _evaluate_browser_server(ctx, {"ok": True})
+
+        internal = await browser_server.call_internal_tool("skyvern_evaluate", {"expression": "probe()"})
+        assert internal["ok"] is True and "page_request_failures" not in internal
+        assert logged_request_failures(log) == recorded
+
+        refusing = SchemaOverlay(requires_browser=True, pre_hook=_refuse)
+        refused = await _evaluate_result(_evaluate_browser_server(ctx, {"ok": True}, overlay=refusing))
+        assert refused["ok"] is False and refused["page_state"]["title"] == "Orders"
+        assert [f["url"] for f in refused["page_request_failures"]] == [f"/{n}" for n in range(2, 7)]
+        assert logged_request_failures(log) == noisy_failures[-20:]
+
+        browser.active = other_tab
+        after_switch = (await _evaluate_result(browser_server))["page_request_failures"]
+        assert [(f["url"], f["resource_type"]) for f in after_switch] == [(f"/bg{n}", "fetch") for n in range(115, 120)]
+        assert logged_request_failures(log) == []
+
+    @pytest.mark.usefixtures("_stub_browser_session")
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ("raw_result", "scope_exit_error", "reads_the_popup"),
+        [
+            pytest.param(TimeoutError(), None, False, id="timed-out-without-a-read"),
+            pytest.param(RuntimeError("client failed"), None, True, id="client-error"),
+            pytest.param({"ok": True}, RuntimeError("scope exit failed"), True, id="failed-after-projection"),
+        ],
+    )
+    async def test_an_error_result_reports_only_the_failures_of_the_tab_its_page_state_read(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        raw_result: dict[str, Any] | Exception,
+        scope_exit_error: Exception | None,
+        reads_the_popup: bool,
+    ) -> None:
+        ctx = make_copilot_ctx(browser_session_id="pbs_failures")
+        register_secret_scrub_value(ctx, "acct-secret-991")
+        opener, popup = _tab("Opener"), _tab("Popup")
+        browser = FakeTabbedBrowserState(opener)
+        patch_browser_tabs(monkeypatch, browser)
+        if scope_exit_error is not None:
+            monkeypatch.setattr(mcp_adapter, "mcp_browser_context", _scope_exiting_with(scope_exit_error))
+        opener_failure = make_request_failure(opener, "/opener")
+        log = seed_request_failures(ctx, "pbs_failures", opener_failure)
+        popup_failure = make_request_failure(popup, "/accounts/acct-secret-991/report")
+
+        def _open_popup() -> None:
+            browser.tabs.append(popup)
+            browser.active = popup
+            log.append(popup_failure)
+
+        result = await _evaluate_result(_evaluate_browser_server(ctx, raw_result, on_call=_open_popup))
+
+        assert result["ok"] is False
+        assert "acct-secret-991" not in json.dumps(result)
+        assert result["page_state"].get("title") == ("Popup" if reads_the_popup else None)
+        assert len(result.get("page_request_failures", [])) == int(reads_the_popup)
+        assert logged_request_failures(log) == [opener_failure] + ([] if reads_the_popup else [popup_failure])
+
+    @pytest.mark.asyncio
+    async def test_a_native_action_that_is_the_first_browser_call_records_its_own_failures(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        ctx = make_copilot_ctx(browser_session_id="pbs_failures", api_key="test-api-key")
+        page = MagicMock(url="https://app.test/upload")
+        page.is_closed.return_value = False
+        _attach_mocked_browser_session(monkeypatch, page)
+        monkeypatch.setattr(
+            copilot_runtime,
+            "SkyvernBrowser",
+            MagicMock(return_value=MagicMock(_browser_context=MagicMock(pages=[page]))),
+        )
+
+        async def upload(acted_on: Page) -> dict[str, Any]:
+            listeners = [call.args[1] for call in page.on.call_args_list if call.args[0] == "requestfailed"]
+            for listener in listeners:
+                listener(
+                    MagicMock(
+                        url="https://app.test/upload/save",
+                        method="POST",
+                        resource_type="xhr",
+                        failure="net::ERR_EMPTY_RESPONSE",
+                    )
+                )
+            return {"ok": True}
+
+        result = await on_working_page(ctx, tool_name="upload_attached_file", no_page_error="no page", act=upload)
+
+        assert result == {"ok": True}
+        log = ctx.request_failure_logs_by_browser_session["pbs_failures"]
+        assert [(entry["failure_text"], entry["url"]) for entry in logged_request_failures(log)] == [
+            ("net::ERR_EMPTY_RESPONSE", "https://app.test/upload/save")
+        ]
+
+    @pytest.mark.usefixtures("_stub_browser_session")
+    @pytest.mark.asyncio
+    async def test_failures_a_result_cannot_show_go_back_to_the_log(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        ctx = make_copilot_ctx(browser_session_id="pbs_failures")
+        log = _working_tab_with_failures(monkeypatch, ctx, "/0")
+        register_secret_scrub_value(ctx, "ok")
+
+        result = await _evaluate_result(_evaluate_browser_server(ctx, {"ok": True}))
+
+        assert "page_request_failures" not in result
+        assert len(logged_request_failures(log)) == 1
+
+    @pytest.mark.usefixtures("_stub_browser_session")
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ("secret", "reported_path"),
+        [
+            ("p@ss word", "/users/p@ss%20word/verify"),
+            ("foo\\bar", "/users/foo/bar/verify"),
+            ("abc?def", "/users/abc?def/verify"),
+        ],
+        ids=["encoded-space", "backslash-as-slash", "spans-path-and-query"],
+    )
+    async def test_a_browser_a_secret_run_used_still_reports_its_failures_with_the_secret_scrubbed(
+        self, monkeypatch: pytest.MonkeyPatch, secret: str, reported_path: str
+    ) -> None:
+        ctx = make_copilot_ctx(browser_session_id="pbs_failures")
+        ctx.secret_run_browser_session_ids.add("pbs_failures")
+        log = _working_tab_with_failures(monkeypatch, ctx, reported_path)
+        register_secret_scrub_value(ctx, secret)
+
+        result = await _evaluate_result(_evaluate_browser_server(ctx, {"ok": True}))
+
+        assert [failure["url"] for failure in result["page_request_failures"]] == ["/users/[REDACTED_SECRET]/verify"]
+        assert logged_request_failures(log) == []
+
+    @pytest.mark.usefixtures("_stub_browser_session")
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ("secret", "request_url"),
+        [
+            ("abc?token=def", "https://app.test/users/abc?token=def"),
+            ("Tr0ub4dor&3#x", "https://app.test/users/Tr0ub4dor&3"),
+            ("ABC?token=def", "https://abc/?token=def"),
+            ("TenantKey9", "https://tenantkey9/report"),
+            ("Straße9", "https://xn--strae9-eta/report"),
+            ("Straße9", "https://xn--tenant-strae9-ldb.example/report"),
+            ("ＰＡＳＳ9", "https://pass9.example/report"),
+            ("foo/../bar9", "https://app.test/users/bar9/verify"),
+        ],
+        ids=[
+            "query-value-masked-at-record",
+            "fragment-never-sent",
+            "host-lowercased-cut",
+            "host-lowercased-whole",
+            "host-punycode",
+            "host-punycode-inside-a-label",
+            "host-compatibility-mapped",
+            "path-dot-segments-removed",
+        ],
+    )
+    async def test_a_url_holding_a_secret_cut_at_its_query_or_fragment_is_withheld(
+        self, monkeypatch: pytest.MonkeyPatch, secret: str, request_url: str
+    ) -> None:
+        ctx = make_copilot_ctx(browser_session_id="pbs_failures")
+        register_secret_scrub_value(ctx, secret)
+        tab = _tab("Users")
+        tab.on = MagicMock()
+        patch_browser_tabs(monkeypatch, FakeTabbedBrowserState(tab))
+        log = ctx.request_failure_logs_by_browser_session.setdefault("pbs_failures", RequestFailureLog())
+        ensure_hooks_on_all_pages(make_session_state(request_failures=log), [tab])
+        record = next(call.args[1] for call in tab.on.call_args_list if call.args[0] == "requestfailed")
+        record(MagicMock(url=request_url, method="POST", resource_type="xhr", failure="net::ERR_EMPTY_RESPONSE"))
+
+        result = await _evaluate_result(_evaluate_browser_server(ctx, {"ok": True}))
+
+        assert result["page_request_failures"] == [
+            {
+                "method": "POST",
+                "resource_type": "xhr",
+                "failure_text": "net::ERR_EMPTY_RESPONSE",
+                "page_url": "https://app.test/users",
+            }
+        ]
+
+    @pytest.mark.usefixtures("_stub_browser_session")
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ("tab_closed", "pre_hook", "kept"),
+        [(False, None, 1), (True, None, 0), (False, _refuse, 1)],
+        ids=["open-tab", "closed-tab", "refused-before-dispatch"],
+    )
+    async def test_a_cancelled_call_puts_its_failures_back_unless_their_tab_closed(
+        self, monkeypatch: pytest.MonkeyPatch, tab_closed: bool, pre_hook: mcp_adapter.PreHook | None, kept: int
+    ) -> None:
+        ctx = make_copilot_ctx(browser_session_id="pbs_failures")
+        log = _working_tab_with_failures(monkeypatch, ctx, "/0", closed=tab_closed)
+        monkeypatch.setattr(mcp_adapter, "mcp_browser_context", _scope_exiting_with(asyncio.CancelledError()))
+        overlay = SchemaOverlay(requires_browser=True, timeout=1, pre_hook=pre_hook)
+
+        with pytest.raises(asyncio.CancelledError):
+            await _evaluate_result(_evaluate_browser_server(ctx, {"ok": True}, overlay=overlay))
+
+        assert len(logged_request_failures(log)) == kept
+
+    @pytest.mark.usefixtures("_stub_browser_session")
+    @pytest.mark.asyncio
+    async def test_a_navigate_result_drains_the_page_it_read(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        ctx = make_copilot_ctx(browser_session_id="pbs_failures")
+        monkeypatch.setattr(mcp_hooks, "_bind_login_credential_for_observed_url", AsyncMock())
+        monkeypatch.setattr(mcp_hooks, "_capture_post_interaction_screenshot", AsyncMock(return_value=False))
+        log = _working_tab_with_failures(monkeypatch, ctx, "/0")
+        navigate = SchemaOverlay(requires_browser=True, timeout=1, post_hook=mcp_hooks._navigate_post_hook)
+
+        result = await _evaluate_result(
+            _evaluate_browser_server(ctx, {"ok": True, "data": {"url": "https://app.test/orders"}}, overlay=navigate)
+        )
+
+        assert result["page_state"]["title"] == "Orders"
+        assert [f["url"] for f in result["page_request_failures"]] == ["/0"]
+        assert logged_request_failures(log) == []
+
+    @pytest.mark.usefixtures("_stub_browser_session")
+    @pytest.mark.asyncio
+    async def test_failures_past_the_redaction_budget_go_back(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        ctx = make_copilot_ctx(browser_session_id="pbs_failures")
+        _cap_redaction_budget(monkeypatch, ctx)
+        log = _working_tab_with_failures(monkeypatch, ctx, *[f"/{n}" for n in range(5)])
+
+        result = await _evaluate_result(_evaluate_browser_server(ctx, {"ok": True, "data": {"result": "x" * 1_000}}))
+
+        assert result["ok"] is True and result["data"] == {"result": "x" * 1_000}
+        assert "page_request_failures" not in result
+        assert len(logged_request_failures(log)) == 5
+
+    @pytest.mark.usefixtures("_stub_browser_session")
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ("result_chars", "reported"),
+        [(_RECENT_TOOL_OUTPUT_CHAR_CAP - 500, False), (_RECENT_TOOL_OUTPUT_CHAR_CAP, True)],
+        ids=["fits-without-them", "past-the-cap-anyway"],
+    )
+    async def test_failures_never_push_a_result_past_the_recent_output_cap(
+        self, monkeypatch: pytest.MonkeyPatch, result_chars: int, reported: bool
+    ) -> None:
+        ctx = make_copilot_ctx(browser_session_id="pbs_failures")
+        log = _working_tab_with_failures(monkeypatch, ctx, *[f"/{n}" for n in range(5)])
+
+        result = await _evaluate_result(
+            _evaluate_browser_server(ctx, {"ok": True, "data": {"result": "x" * result_chars}})
+        )
+
+        assert ("page_request_failures" in result) is reported
+        assert len(logged_request_failures(log)) == (0 if reported else 5)
+
+    @pytest.mark.usefixtures("_stub_browser_session")
+    @pytest.mark.asyncio
+    async def test_a_url_that_scrubbing_grows_past_the_bound_is_left_out(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        ctx = make_copilot_ctx(browser_session_id="pbs_failures")
+        register_secret_scrub_value(ctx, "7")
+        _working_tab_with_failures(monkeypatch, ctx, "/" + "7" * 280)
+
+        result = await _evaluate_result(_evaluate_browser_server(ctx, {"ok": True}))
+
+        (reported,) = result["page_request_failures"]
+        assert reported == {
+            "method": "POST",
+            "resource_type": "xhr",
+            "failure_text": "net::ERR_EMPTY_RESPONSE",
+            "page_url": "https://app.test/",
+        }
+
+    def test_the_model_sees_bounded_fields_and_only_the_host_of_a_cross_origin_request(self) -> None:
+        too_long = f"https://app.test/{'p' * 400}"
+        reported = mcp_adapter.reported_request_failures(
+            [
+                make_request_failure(
+                    object(), url="https://app.test/api/r?id=7#top", page_url="https://app.test/h?s=1"
+                ),
+                make_request_failure(object(), url="https://api.other.test/v1/accounts/123", method="X" * 9_999),
+                make_request_failure(object(), url=too_long, failure_text="F" * 9_999),
+                make_request_failure(object(), url="http://[redacted]/r", page_url=too_long),
+            ]
+        )
+
+        assert [(r.get("url"), r.get("page_url"), r["method"], len(r["failure_text"])) for r in reported] == [
+            ("/api/r", "https://app.test/h", "POST", 23),
+            ("https://api.other.test", "https://app.test/", "OTHER", 23),
+            (None, "https://app.test/", "POST", 200),
+            (None, None, "POST", 23),
+        ]

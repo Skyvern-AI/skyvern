@@ -15,6 +15,12 @@ import pytest
 
 from skyvern.forge.sdk.artifact.models import ArtifactType
 from skyvern.forge.sdk.copilot import tools as tools_module
+from skyvern.forge.sdk.copilot.agent_context import (
+    OriginRunRedactionRegistry,
+    PreRunPageReference,
+    RegisteredArtifactEntry,
+    RegisteredArtifactEvidence,
+)
 from skyvern.forge.sdk.copilot.build_test_outcome import ChallengeEffects, challenge_notices
 from skyvern.forge.sdk.copilot.challenge_evidence import stamp_challenge_frame_fact
 from skyvern.forge.sdk.copilot.completion_output_grounding import (
@@ -35,14 +41,7 @@ from skyvern.forge.sdk.copilot.request_policy import (
     _classifier_fallback_policy,
     build_classifier_fallback_floor,
 )
-from skyvern.forge.sdk.copilot.runtime import (
-    OriginRunRedactionRegistry,
-    PreRunPageReference,
-    RegisteredArtifactEntry,
-    RegisteredArtifactEvidence,
-    RunSecretsNotRegistered,
-    browser_session_turn,
-)
+from skyvern.forge.sdk.copilot.runtime import RunSecretsNotRegistered, browser_session_turn
 from skyvern.forge.sdk.copilot.secret_scrub import scrub_secrets_from_structure
 from skyvern.forge.sdk.copilot.tools import completion as completion_module
 from skyvern.forge.sdk.copilot.tools import composition_capture as composition_capture_module
@@ -673,7 +672,7 @@ async def test_track_a_registry_refuses_credential_run_even_when_scout_values_ar
         run_execution_module,
         "app",
         SimpleNamespace(
-            AGENT_FUNCTION=SimpleNamespace(serialize_codeblock_parameters=dict),
+            AGENT_FUNCTION=SimpleNamespace(enforce_credential_use=AsyncMock(), serialize_codeblock_parameters=dict),
             DATABASE=SimpleNamespace(credentials=SimpleNamespace(get_credential=AsyncMock(return_value=None))),
         ),
     )
@@ -714,7 +713,7 @@ async def test_track_a_registry_admits_complete_run_bound_static_credential_valu
     ctx.secret_scrub_values = []
     db_credential = SimpleNamespace(vault_type=None, totp_identifier=None)
     credential = PasswordCredential(username="private-user", password="private-pass")
-    credential_item = SimpleNamespace(credential=credential)
+    credential_item = SimpleNamespace(credential=credential, login_sites=None)
     service = SimpleNamespace(get_credential_item=AsyncMock(return_value=credential_item))
     process = AsyncMock(return_value=credential_item)
     monkeypatch.setattr(
@@ -722,6 +721,7 @@ async def test_track_a_registry_admits_complete_run_bound_static_credential_valu
         "app",
         SimpleNamespace(
             AGENT_FUNCTION=SimpleNamespace(
+                enforce_credential_use=AsyncMock(),
                 serialize_codeblock_parameters=lambda values: values,
                 process_registered_credential_item=process,
             ),
@@ -761,13 +761,14 @@ async def test_track_a_registry_keeps_static_credential_values_when_totp_is_dyna
     ctx.secret_scrub_values = []
     db_credential = SimpleNamespace(vault_type=None, totp_identifier="totp_ref")
     credential = PasswordCredential(username="private-user", password="private-pass", totp_identifier="totp_ref")
-    credential_item = SimpleNamespace(credential=credential)
+    credential_item = SimpleNamespace(credential=credential, login_sites=None)
     service = SimpleNamespace(get_credential_item=AsyncMock(return_value=credential_item))
     monkeypatch.setattr(
         run_execution_module,
         "app",
         SimpleNamespace(
             AGENT_FUNCTION=SimpleNamespace(
+                enforce_credential_use=AsyncMock(),
                 serialize_codeblock_parameters=lambda values: values,
                 process_registered_credential_item=AsyncMock(return_value=credential_item),
             ),
@@ -1025,7 +1026,7 @@ async def test_runtime_secret_bridge_encrypts_shared_cache_payload(monkeypatch: 
         plaintext = value
         return "opaque-ciphertext"
 
-    async def fake_decrypt(_value: str, _method: object) -> str:
+    async def fake_decrypt_unlabeled(_value: str) -> str:
         assert plaintext is not None
         return plaintext
 
@@ -1033,7 +1034,7 @@ async def test_runtime_secret_bridge_encrypts_shared_cache_payload(monkeypatch: 
     monkeypatch.setattr(
         runtime_secret_bridge,
         "encryptor",
-        SimpleNamespace(encrypt=fake_encrypt, decrypt=fake_decrypt),
+        SimpleNamespace(encrypt=fake_encrypt, decrypt_unlabeled=fake_decrypt_unlabeled),
     )
     workflow_run_context = SimpleNamespace(
         secrets={"password": "private-pass", "runtime": "654321"},
@@ -1318,6 +1319,42 @@ def test_independent_post_run_snapshot_removes_singular_selector_recommendation(
         {"selector": "button.auth-state", "source": "class"},
         {"selector": 'button[data-action="star"]', "source": "data_action"},
     ]
+
+
+def test_grading_page_text_leaves_out_pointer_states_and_visible_counts() -> None:
+    candidate = {"selector": "button.go", "source": "class", "match_count": 2, "visible_match_count": 1}
+    form = {
+        "fields": [
+            {
+                "label": "Query",
+                "pointer_at_center": "reaches_other_element",
+                "element_at_center": {"tag": "label", "role": "", "label_context": "Query field"},
+            }
+        ],
+        "submit_controls": [
+            {"text": "Search", "pointer_at_center": "reaches_control", "selector_candidates": [candidate]}
+        ],
+    }
+    ctx = _producer_ctx()
+    ctx.composition_page_evidence = {"forms": [form]}
+    run_execution_module._pin_pre_run_page_reference(ctx, "wr_current")
+    ctx.composition_page_evidence = {
+        "observed_after_workflow_run": True,
+        "workflow_run_id": "wr_current",
+        "forms": [form],
+    }
+
+    snapshot = _snapshot_from_ctx(ctx, "wr_current")
+
+    shown_candidate = {"selector": "button.go", "source": "class"}
+    assert snapshot.block_outputs["post_run_page_observation"]["forms"] == [
+        {
+            "fields": [{"label": "Query"}],
+            "submit_controls": [{"text": "Search", "selector_candidates": [shown_candidate]}],
+        }
+    ]
+    assert snapshot.pre_run_page_reference_text == "Query Search button.go class 2"
+    assert ctx.composition_page_evidence["forms"][0]["submit_controls"][0]["selector_candidates"] == [candidate]
 
 
 def test_pre_run_baseline_provenance_valid_for_scout_evidence() -> None:

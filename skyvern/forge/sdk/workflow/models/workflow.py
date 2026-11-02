@@ -17,8 +17,14 @@ from pydantic import (
 )
 from typing_extensions import Self, deprecated
 
-from skyvern.forge.sdk.db.enums import BrowserSeedSource, WorkflowRunStatus, WorkflowRunTriggerType
+from skyvern.forge.sdk.db.enums import (
+    BrowserSeedSource,
+    WorkflowBuildSource,
+    WorkflowRunStatus,
+    WorkflowRunTriggerType,
+)
 from skyvern.forge.sdk.schemas.files import FileInfo
+from skyvern.forge.sdk.schemas.har_evidence import without_final_har_user_match
 from skyvern.forge.sdk.schemas.task_v2 import TaskV2
 from skyvern.forge.sdk.workflow.exceptions import (
     InvalidFinallyBlockLabel,
@@ -276,6 +282,12 @@ class Workflow(BaseModel):
     import_error: str | None = None
     created_by: str | None = None
     edited_by: str | None = None
+    # Kept out of the API: a Copilot rollback writes it back, so a restored version answers to its original person.
+    edited_for: str | None = Field(default=None, exclude=True)
+    build_source: WorkflowBuildSource | None = Field(
+        default=None,
+        description="Which surface wrote this version: ui, copilot, mcp, cli, api, or internal. Null before tracking began.",
+    )
     # Lineage-derived (any version copilot-stamped); populated by the detail GET route only —
     # user saves re-stamp created_by/edited_by, so the current version alone is not durable.
     copilot_authored: bool = False
@@ -348,6 +360,7 @@ class WorkflowRun(BaseModel):
     reuse_bound_key: str | None = Field(default=None, exclude=True)
     # Internal routing: the worker queue the run was dispatched to. Never an API field.
     task_queue: str | None = Field(default=None, exclude=True)
+    setup_completed: bool = Field(default=True, exclude=True)
     # Digest of the definition the run was created against; the saved row can be overwritten in place later.
     workflow_definition_sha256: str | None = Field(default=None, exclude=True)
     debug_session_id: str | None = None
@@ -401,6 +414,9 @@ class WorkflowRun(BaseModel):
     created_by: str | None = Field(default=None, description="ID of the user who started the run")
     credits_used: int = 0
     cached_credits_used: int = 0
+    # Set when a write to this run's row failed and the caller carried on, so a commit may have landed that this
+    # object does not show. A model re-read from the row after the failure no longer carries it.
+    _row_write_unconfirmed: bool = PrivateAttr(default=False)
 
     @field_validator("run_with", mode="before")
     @classmethod
@@ -414,6 +430,12 @@ class WorkflowRun(BaseModel):
     def _mask_cdp_connect_headers(self, headers: dict[str, str] | None) -> dict[str, str] | None:
         return mask_header_values(headers)
 
+    # Every JSON payload of a run (list and detail routes, webhooks) omits the final match's bookkeeping; in-process
+    # readers keep the raw carrier, which the errors[] projection reads.
+    @field_serializer("failure_category", when_used="json")
+    def _public_failure_category(self, categories: list[dict[str, Any]] | None) -> list[dict[str, Any]] | None:
+        return without_final_har_user_match(categories)
+
     queued_at: datetime | None = None
     started_at: datetime | None = None
     finished_at: datetime | None = None
@@ -423,6 +445,13 @@ class WorkflowRun(BaseModel):
     @property
     def is_debug_session(self) -> bool:
         return self.debug_session_id is not None
+
+    @property
+    def row_write_unconfirmed(self) -> bool:
+        return self._row_write_unconfirmed
+
+    def mark_row_write_unconfirmed(self) -> None:
+        self._row_write_unconfirmed = True
 
 
 # Stored when attempts of one run executed different definitions; it never equals a real digest.
@@ -515,6 +544,11 @@ class WorkflowRunOutputParameter(BaseModel):
     output_parameter_id: str
     value: dict[str, Any] | list | str | None
     created_at: datetime
+    # The extracted information collected from the whole value at write time, itself capped.
+    # Only a capping read may use it, since that read holds the capped copy in `value` and can
+    # no longer walk every iteration; an uncapped reader has the whole value and must collect
+    # from it. None means nothing was recorded, so every reader collects from `value`.
+    precomputed_extracted_information: list[Any] | None = None
 
 
 class WorkflowRunResponseBase(BaseModel):
@@ -582,6 +616,9 @@ class WorkflowRunResponseBase(BaseModel):
     cached_credits_used: int = 0
     task_v2: TaskV2 | None = None
     workflow_title: str | None = None
+    copilot_session_id: str | None = Field(
+        default=None, description="ID of the Copilot chat associated with this workflow run."
+    )
     browser_session_id: str | None = None
     browser_profile_id: str | None = None
     browser_seed_source: BrowserSeedSource | None = None

@@ -7,10 +7,16 @@ from unittest.mock import AsyncMock, MagicMock
 import pytest
 from playwright.async_api import Error as PlaywrightError
 from playwright.async_api import TimeoutError as PlaywrightTimeoutError
+from structlog.testing import capture_logs
 
-from skyvern.exceptions import MissingElement, MissingElementDict, MultipleElementsFound
+from skyvern.exceptions import FrameChainLoop, MissingElement, MissingElementDict, MultipleElementsFound
 from skyvern.webeye.scraper import scraper as scraper_module
-from skyvern.webeye.utils.dom import SkyvernElement, is_element_detached_error, resolve_locator
+from skyvern.webeye.utils.dom import (
+    MAX_FRAME_CHAIN_DEPTH,
+    SkyvernElement,
+    is_element_detached_error,
+    resolve_locator,
+)
 
 _CONTEXT_DESTROYED_ERROR = "Execution context was destroyed, most likely because of a navigation."
 
@@ -224,6 +230,136 @@ async def test_resolve_locator_reraises_unrelated_errors() -> None:
     page.query_selector = AsyncMock(side_effect=[_frame_handler(PlaywrightError("Protocol error"))])
     with pytest.raises(PlaywrightError):
         await resolve_locator(_scrape_page_with_frame(), page, "frame-1", "[unique_id='el-1']")
+
+
+class _BoundedLookups(dict):
+    """A frame map that fails the test once the walk stops terminating. The walk never awaits, so no timeout
+    can interrupt it; without this a regression would spin until the test process runs out of memory."""
+
+    def __init__(self, items: dict[str, dict]) -> None:
+        super().__init__(items)
+        self._remaining = 1000
+
+    def _spend(self) -> None:
+        self._remaining -= 1
+        if self._remaining < 0:
+            raise AssertionError("the frame chain walk did not terminate")
+
+    def get(self, key: str, default: object = None) -> object:
+        self._spend()
+        return super().get(key, default)
+
+    def __getitem__(self, key: str) -> dict:
+        self._spend()
+        return super().__getitem__(key)
+
+
+def _frame_map(owning_frame_by_id: dict[str, str]) -> MagicMock:
+    scraped_page = MagicMock()
+    scraped_page.id_to_element_dict = _BoundedLookups(
+        {element_id: {"id": element_id, "frame": frame} for element_id, frame in owning_frame_by_id.items()}
+    )
+    return scraped_page
+
+
+def _scraped_frames(elements: list[tuple[str, str]]) -> MagicMock:
+    """(element id, owning frame) pairs in scrape order, merged by the same build_element_dict a scrape uses."""
+    _, id_to_element_dict, _, _, _ = scraper_module.build_element_dict(
+        [{"id": element_id, "frame": frame, "tagName": "div"} for element_id, frame in elements]
+    )
+    scraped_page = MagicMock()
+    scraped_page.id_to_element_dict = _BoundedLookups(id_to_element_dict)
+    return scraped_page
+
+
+# A frame's document holds a copy of an already-tagged node whose id is an iframe's.
+_SELF_LOOP = [("AAAB", "main.frame"), ("AAAB", "AAAB"), ("AAAC", "AAAB")]
+_TWO_FRAME_LOOP = [("AAAB", "main.frame"), ("AAAC", "AAAB"), ("AAAB", "AAAC"), ("AAAD", "AAAC")]
+_TOO_DEEP = [(f"F{depth}", f"F{depth - 1}" if depth else "main.frame") for depth in range(MAX_FRAME_CHAIN_DEPTH + 1)]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("elements", "target_frame"),
+    [(_SELF_LOOP, "AAAB"), (_TWO_FRAME_LOOP, "AAAC"), (_TOO_DEEP, f"F{MAX_FRAME_CHAIN_DEPTH}")],
+    ids=["self-loop", "two-frame-loop", "too-deep"],
+)
+async def test_resolve_locator_classifies_a_looping_frame_chain_as_missing_element(
+    elements: list[tuple[str, str]], target_frame: str
+) -> None:
+    page = MagicMock()
+    page.query_selector = AsyncMock(return_value=None)
+    # Merged later-wins, so the copied iframe ids loop. A map can still loop when an iframe is missing from the
+    # scraped elements, which is what the guard is for.
+    with pytest.raises(FrameChainLoop) as raised:
+        await resolve_locator(_frame_map(dict(elements)), page, target_frame, "[unique_id='ZZZZ']")
+    # The action handler's known-failure branch catches MissingElement, which is what keeps the run alive.
+    assert isinstance(raised.value, MissingElement)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "elements",
+    [[("AAAB", "main.frame"), ("AAAC", "AAAB"), ("AAAD", "AAAC")], _TWO_FRAME_LOOP],
+    ids=["plain-chain", "inner-frame-holds-a-copy-of-the-outer-iframe"],
+)
+async def test_resolve_locator_walks_a_nested_iframe_chain_from_the_outside_in(
+    elements: list[tuple[str, str]],
+) -> None:
+    inner = MagicMock()
+    outer = MagicMock()
+    outer.query_selector = AsyncMock(
+        side_effect=lambda selector: _frame_handler(inner) if selector == "[unique_id='AAAC']" else None
+    )
+    page = MagicMock()
+    page.query_selector = AsyncMock(
+        side_effect=lambda selector: _frame_handler(outer) if selector == "[unique_id='AAAB']" else None
+    )
+    _, frame = await resolve_locator(_scraped_frames(elements), page, "AAAC", "[unique_id='AAAD']")
+
+    assert frame is inner
+
+
+@pytest.mark.parametrize(
+    ("elements", "level", "collision_count", "iframe_collision_count", "frame_pair"),
+    [
+        (_SELF_LOOP, "warning", 1, 1, ("main.frame", "AAAB")),
+        (
+            # Only a plain node is copied into the frame, so no frame chain can loop.
+            [("AAAB", "main.frame"), ("AAAC", "main.frame"), ("AAAC", "AAAB")],
+            "info",
+            1,
+            0,
+            ("main.frame", "AAAB"),
+        ),
+    ],
+    ids=["iframe-id-shared", "plain-node-id-shared"],
+)
+def test_build_element_dict_keeps_the_main_frame_element_when_a_later_frame_reuses_its_id(
+    elements: list[tuple[str, str]],
+    level: str,
+    collision_count: int,
+    iframe_collision_count: int,
+    frame_pair: tuple[str, str],
+) -> None:
+    scraped = [{"id": element_id, "frame": frame, "tagName": "div"} for element_id, frame in elements]
+    with capture_logs() as logs:
+        _, id_to_element_dict, id_to_frame_dict, id_to_element_hash, _ = scraper_module.build_element_dict(scraped)
+
+    first_by_id: dict[str, dict] = {}
+    for element in scraped:
+        first_by_id.setdefault(element["id"], element)
+    assert id_to_element_dict == first_by_id
+    assert id_to_frame_dict == {element_id: element["frame"] for element_id, element in first_by_id.items()}
+    assert id_to_element_hash == {
+        element_id: scraper_module.hash_element(element) for element_id, element in first_by_id.items()
+    }
+    collisions = [log for log in logs if log["event"].startswith("Element ids collide across frames")]
+    assert len(collisions) == 1
+    assert collisions[0]["log_level"] == level
+    assert collisions[0]["collision_count"] == collision_count
+    assert collisions[0]["iframe_collision_count"] == iframe_collision_count
+    assert frame_pair in collisions[0]["frame_pairs"]
 
 
 def _make_element(locator: MagicMock, frame: MagicMock | None = None, xpath: str | None = None) -> SkyvernElement:

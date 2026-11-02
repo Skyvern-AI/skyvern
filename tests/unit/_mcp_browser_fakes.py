@@ -3,20 +3,26 @@ from __future__ import annotations
 import asyncio
 from collections import deque
 from collections.abc import Awaitable, Callable
+from datetime import UTC, datetime
 from types import SimpleNamespace
-from typing import Any
+from typing import TYPE_CHECKING, Any
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
 from skyvern.cli.core import browser_ops
 from skyvern.cli.core.result import BrowserContext
-from skyvern.cli.core.session_manager import SessionState
+from skyvern.cli.core.session_manager import RequestFailure, RequestFailureLog, SessionState
 from skyvern.cli.mcp_tools import browser as mcp_browser
 from skyvern.cli.mcp_tools import tabs as mcp_tabs
 from skyvern.core.script_generations.skyvern_page import SkyvernPage
 from skyvern.exceptions import StaleFrameSelectionError
+from skyvern.forge.sdk.copilot.mcp_adapter import ReportedPageCrash
 from skyvern.webeye import action_deadline
+from skyvern.webeye.browser_state import PageCrashRecord
+
+if TYPE_CHECKING:
+    from skyvern.forge.sdk.copilot.runtime import AgentContext
 
 HANGING_PAGE_URL = "https://fixture.test/metrics"
 HANGING_BOUND_MS = 200
@@ -55,6 +61,60 @@ def make_session_state(**overrides: Any) -> SessionState:
     for key, value in overrides.items():
         setattr(state, key, value)
     return state
+
+
+def make_request_failure(
+    page: object,
+    path: str = "/report",
+    *,
+    resource_type: str = "xhr",
+    method: str = "POST",
+    failure_text: str = "net::ERR_EMPTY_RESPONSE",
+    url: str | None = None,
+    page_url: str = "https://app.test/",
+) -> RequestFailure:
+    return RequestFailure(
+        url=url or f"https://app.test{path}",
+        method=method,
+        resource_type=resource_type,
+        failure_text=failure_text,
+        page_url=page_url,
+        tab_id=str(id(page)),
+        timestamp=0.0,
+    )
+
+
+def seed_request_failures(ctx: AgentContext, session_id: str, *entries: RequestFailure) -> RequestFailureLog:
+    log = ctx.request_failure_logs_by_browser_session.setdefault(session_id, RequestFailureLog())
+    for entry in entries:
+        log.append(entry)
+    return log
+
+
+SEEDED_CRASH_AT = datetime(2026, 10, 28, 20, 12, 45, tzinfo=UTC)
+
+
+def page_crash_entry(*, url: str = "https://app.test/form", reopened: bool = True) -> ReportedPageCrash:
+    return ReportedPageCrash(
+        crashed_at=SEEDED_CRASH_AT.isoformat(timespec="seconds"), cause="page_crash", reopened=reopened, url=url
+    )
+
+
+def crash_free_browser_state(**attrs: Any) -> SimpleNamespace:
+    return SimpleNamespace(page_crash_records=(), **attrs)
+
+
+def seed_page_crash(
+    ctx: AgentContext, session_id: str, *, url: str = "https://app.test/form?draft=1", reopened: bool = True
+) -> PageCrashRecord:
+    record = PageCrashRecord(crashed_at=SEEDED_CRASH_AT, crashed_url=url, cause="page_crash", reopened=reopened)
+    records = ctx.page_crash_records_by_browser_session.get(session_id, ())
+    ctx.page_crash_records_by_browser_session[session_id] = [*records, record]
+    return record
+
+
+def logged_request_failures(log: RequestFailureLog) -> list[RequestFailure]:
+    return [entry for tab in log.entries.values() for entry in tab]
 
 
 def make_page(raw: MagicMock | None = None) -> SimpleNamespace:
@@ -246,12 +306,12 @@ def patch_tab_session(
     new_page: Callable[..., Awaitable[object]] | None = None,
     action_timeout_ms: int = HANGING_BOUND_MS,
     headroom_ms: int = HANGING_HEADROOM_MS,
-) -> SimpleNamespace:
+) -> SessionState:
     """Route the tab tools at ``pages`` under a budget small enough for real loop time."""
     browser = SimpleNamespace(
         _browser_context=SimpleNamespace(pages=pages, new_page=new_page or AsyncMock(return_value=pages[0]))
     )
-    state = SimpleNamespace(
+    state = make_session_state(
         browser=browser,
         _active_page=None,
         _implicit_page=None,

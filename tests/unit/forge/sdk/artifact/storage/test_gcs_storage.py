@@ -320,7 +320,7 @@ async def test_get_downloaded_files_legacy_listing_attributes_and_scopes_attempt
     gcs_storage.async_client.list_files = AsyncMock(return_value=[old_key, current_key])
     gcs_storage.async_client.get_object_info = AsyncMock(side_effect=get_object_info)
     gcs_storage.async_client.create_signed_urls = AsyncMock(
-        side_effect=lambda uris: [f"https://signed.test/{uri.rsplit('/', 1)[-1]}" for uri in uris]
+        side_effect=lambda uris, **_: [f"https://signed.test/{uri.rsplit('/', 1)[-1]}" for uri in uris]
     )
     rows = AsyncMock(return_value=[old_artifact])
     monkeypatch.setattr(
@@ -446,6 +446,30 @@ class TestGcsStorageClientSigning:
             fake_creds.refresh.assert_called_once()
             assert mock_blob.generate_signed_url.call_count == 3
 
+    @pytest.mark.asyncio
+    async def test_download_urls_force_an_octet_stream_attachment(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setattr(settings, "GCS_SIGNER_SA_EMAIL", None)
+        with patch.object(RealAsyncGcsStorageClient, "_get_blob") as mock_get_blob:
+            mock_blob = MagicMock()
+            mock_blob.generate_signed_url.return_value = "https://signed"
+            mock_get_blob.return_value = mock_blob
+            client = RealAsyncGcsStorageClient(project_id="test")
+
+            await client.create_signed_urls(
+                ["gs://b/dir/page.html", "gs://b/dir/x.svg"], attachment_filenames=[None, "logo.svg"]
+            )
+            forced = [call.kwargs for call in mock_blob.generate_signed_url.call_args_list]
+            mock_blob.generate_signed_url.reset_mock()
+            await client.create_signed_urls(["gs://b/dir/shot.png"])
+            inline = mock_blob.generate_signed_url.call_args.kwargs
+
+        assert [kwargs["response_disposition"] for kwargs in forced] == [
+            "attachment; filename=\"page.html\"; filename*=UTF-8''page.html",
+            "attachment; filename=\"logo.svg\"; filename*=UTF-8''logo.svg",
+        ]
+        assert {kwargs["response_type"] for kwargs in forced} == {"application/octet-stream"}
+        assert "response_disposition" not in inline and "response_type" not in inline
+
 
 @pytest.mark.asyncio
 class TestGcsShareLinkSensitiveCap:
@@ -457,14 +481,17 @@ class TestGcsShareLinkSensitiveCap:
             f"gs://{TEST_BUCKET}/file.pdf", artifact_id="a_file", artifact_type=ArtifactType.DOWNLOAD
         )
 
-        async def fake_sign(uris: list[str], expiry_hours: int = 24) -> list[str]:
-            return [f"{uri}?h={expiry_hours}" for uri in uris]
+        async def fake_sign(
+            uris: list[str], expiry_hours: int = 24, attachment_filenames: list[str | None] | None = None
+        ) -> list[str]:
+            suffix = "&attachment" if attachment_filenames is not None else ""
+            return [f"{uri}?h={expiry_hours}{suffix}" for uri in uris]
 
         gcs_storage.async_client.create_signed_urls = AsyncMock(side_effect=fake_sign)
         urls = await gcs_storage.get_share_links([screenshot, download])
         assert urls == [
             f"{screenshot.uri}?h={SENSITIVE_SHARE_URL_EXPIRY_HOURS}",
-            f"{download.uri}?h=24",
+            f"{download.uri}?h=24&attachment",
         ]
 
 

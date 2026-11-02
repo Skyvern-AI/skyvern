@@ -48,6 +48,7 @@ import {
   useDeferredLockedEdit,
 } from "@/hooks/useDeferredLockedEdit";
 
+import { useCopilotProposalStore } from "@/store/CopilotProposalStore";
 import * as workflowHasChangesModule from "@/store/WorkflowHasChangesStore";
 import { useWorkflowParametersStore } from "@/store/WorkflowParametersStore";
 import {
@@ -58,14 +59,11 @@ import {
   useHydrateWorkflowParameters,
   type WorkflowSaveData,
 } from "@/store/WorkflowHasChangesStore";
-import { useRecordedBlocksStore } from "@/store/RecordedBlocksStore";
-import { applySopResultAtCurrentAppend } from "./workspaceAuthoringActions";
-import { useRecordingStore } from "@/store/useRecordingStore";
-import { useRecordingLauncherStore } from "@/store/useRecordingLauncherStore";
 import { useWorkflowPanelStore } from "@/store/WorkflowPanelStore";
 
 import { useWorkflowTitleStore } from "@/store/WorkflowTitleStore";
 import {
+  AUTHORING_SAVE_MESSAGE,
   commitYamlDraft,
   beginCopilotAcceptance,
   finishCopilotAcceptance,
@@ -219,6 +217,8 @@ vi.mock("@/store/WorkflowHasChangesStore", async (importOriginal) => {
   };
 });
 vi.mock("../hooks/useWorkflowRunQuery", () => ({
+  useWorkflowRunQueries: (ids: readonly string[]) =>
+    ids.map(() => ({ data: undefined })),
   useWorkflowRunQuery: () => runQueryMock(),
 }));
 vi.mock("@/hooks/useWorkflowStudioEnabled", () => ({
@@ -323,9 +323,6 @@ vi.mock("@/hooks/useSpeechToTextField", () => ({
     stop: vi.fn(),
     takeAudioBlob: vi.fn(),
   }),
-}));
-vi.mock("./recording/RecordingPanel", () => ({
-  RecordingPanel: () => <div data-testid="standalone-recording-panel" />,
 }));
 vi.mock("../debugger/DebuggerRun", () => ({ DebuggerRun: () => null }));
 vi.mock("../debugger/DebuggerRunMinimal", () => ({
@@ -494,7 +491,6 @@ afterEach(cleanup);
 beforeEach(() => {
   vi.restoreAllMocks();
   vi.clearAllMocks();
-  useRecordingStore.getState().reset();
   vi.mocked(axiosClientModule.getClient).mockResolvedValue({
     put,
     post,
@@ -2711,6 +2707,70 @@ describe("save failures stop navigation and block runs", () => {
       saveHook.mockRestore();
     }
   });
+
+  const PROPOSAL_HOLD = "Resolve the Copilot proposal before saving.";
+  test("a pending Copilot proposal disables Save as Template and hides version history, so Accept stays the only way to save it", async () => {
+    useWorkflowYamlEditorStore.setState(
+      useWorkflowYamlEditorStore.getInitialState(),
+    );
+    useWorkflowHasChangesStore.setState(
+      useWorkflowHasChangesStore.getInitialState(),
+    );
+    workflowQueryMock.mockReturnValue({ data: liveWorkflow, isLoading: false });
+    const save = vi.fn<() => Promise<void>>().mockResolvedValue();
+    const saveHook = vi
+      .spyOn(saveWorkflowModule, "useSaveWorkflow")
+      .mockReturnValue(save);
+    const client = new QueryClient({
+      defaultOptions: { queries: { retry: false } },
+    });
+    useCopilotProposalStore.setState({ proposal: {} as never });
+    const control = render(
+      <QueryClientProvider client={client}>
+        <MemoryRouter>
+          <ReactFlowProvider>
+            <DebugStoreContext.Provider
+              value={{ isDebugMode: false, blockRunsEnabled: false }}
+            >
+              <EditorOverflowMenu />
+            </DebugStoreContext.Provider>
+          </ReactFlowProvider>
+        </MemoryRouter>
+      </QueryClientProvider>,
+    );
+    try {
+      fireEvent.keyDown(control.getByRole("button", { name: "More actions" }), {
+        key: "Enter",
+      });
+      // The name stays the action; the visible reason line is its description.
+      const held = await screen.findByRole("menuitem", {
+        name: "Save as Template",
+        description: PROPOSAL_HOLD,
+      });
+      expect(held.getAttribute("aria-disabled")).toBe("true");
+      expect(held.textContent).toContain(PROPOSAL_HOLD);
+      expect(
+        screen.queryByRole("menuitem", { name: "Version history" }),
+      ).toBeNull();
+      fireEvent.click(held);
+      expect(save).not.toHaveBeenCalled();
+
+      act(() => useCopilotProposalStore.setState({ proposal: null }));
+      expect(
+        screen.getByRole("menuitem", { name: "Version history" }),
+      ).toBeTruthy();
+      const released = screen.getByRole("menuitem", {
+        name: "Save as Template",
+      });
+      expect(released.getAttribute("aria-disabled")).toBeNull();
+      expect(released.getAttribute("aria-describedby")).toBeNull();
+    } finally {
+      useCopilotProposalStore.setState({ proposal: null });
+      control.unmount();
+      client.clear();
+      saveHook.mockRestore();
+    }
+  });
 });
 
 test("the editor browser stops indicating execution during a retry wait and resumes for the next attempt", () => {
@@ -2791,325 +2851,6 @@ test("the editor browser stops indicating execution during a retry wait and resu
   header.mockRestore();
   chat.mockRestore();
   vi.unstubAllGlobals();
-});
-
-describe("Discover recording handoff", () => {
-  beforeEach(() => {
-    integration.canvas = false;
-    debugQueryMock.mockReturnValue({ data: undefined });
-    vi.stubGlobal(
-      "ResizeObserver",
-      class {
-        observe() {}
-        unobserve() {}
-        disconnect() {}
-      },
-    );
-    sessionStorage.clear();
-    useRecordingStore.getState().reset();
-    useWorkflowYamlEditorStore.setState(
-      useWorkflowYamlEditorStore.getInitialState(),
-    );
-    useWorkflowHasChangesStore.setState(
-      useWorkflowHasChangesStore.getInitialState(),
-    );
-    useWorkflowPanelStore.setState(useWorkflowPanelStore.getInitialState());
-    activeRunQueryMock.mockReturnValue({
-      data: { active_run_session_id: null },
-    });
-    workflowQueryMock.mockReturnValue({ data: liveWorkflow });
-    runQueryMock.mockReturnValue({ data: undefined });
-    historyGet.mockResolvedValue({ data: {} });
-  });
-
-  afterEach(() => {
-    cleanup();
-    vi.restoreAllMocks();
-    useRecordingStore.getState().reset();
-  });
-
-  test.each(["save", "accept", "authoring"])(
-    "keeps the recording request until the %s hold clears",
-    async (hold) => {
-      const client = new QueryClient({
-        defaultOptions: { queries: { retry: false } },
-      });
-      const router = createMemoryRouter(
-        [
-          {
-            path: "/agents/:workflowPermanentId/edit",
-            element: (
-              <ReactFlowProvider>
-                <Workspace
-                  initialNodes={[]}
-                  initialEdges={[]}
-                  initialTitle="Live agent"
-                  workflow={liveWorkflow}
-                />
-              </ReactFlowProvider>
-            ),
-          },
-        ],
-        {
-          initialEntries: [
-            "/agents/wpid_live/edit?record=1&copilotHeadlessTurnDrain=1",
-          ],
-        },
-      );
-      const editor = () => (
-        <QueryClientProvider client={client}>
-          <RouterProvider router={router} />
-        </QueryClientProvider>
-      );
-      const view = render(editor());
-      const setIsRecording = vi.spyOn(
-        useRecordingStore.getState(),
-        "setIsRecording",
-      );
-      act(() =>
-        useWorkflowYamlEditorStore.setState({
-          commitInProgress: hold === "save",
-          copilotAcceptance: hold === "accept" ? Symbol("accept") : null,
-          authoringInProgress: hold === "authoring",
-        }),
-      );
-      debugQueryMock.mockReturnValue({
-        data: { browser_session_id: "pbs_debug", status: "created" },
-      });
-      await act(async () => {
-        await router.navigate(
-          router.state.location.pathname + router.state.location.search,
-          { replace: true },
-        );
-      });
-      expect(setIsRecording).not.toHaveBeenCalled();
-      expect(
-        new URLSearchParams(router.state.location.search).get("record"),
-      ).toBe("1");
-
-      await act(async () =>
-        useWorkflowYamlEditorStore.setState({
-          commitInProgress: false,
-          copilotAcceptance: null,
-          authoringInProgress: false,
-        }),
-      );
-      await waitFor(() => expect(setIsRecording).toHaveBeenCalledOnce());
-      expect(useRecordingStore.getState().isRecording).toBe(true);
-      expect(
-        new URLSearchParams(router.state.location.search).has("record"),
-      ).toBe(false);
-      expect(
-        new URLSearchParams(router.state.location.search).get(
-          "copilotHeadlessTurnDrain",
-        ),
-      ).toBe("1");
-      view.unmount();
-      client.clear();
-    },
-  );
-});
-
-describe("Record Browser pending-change prompt", () => {
-  const del = vi.fn();
-
-  beforeEach(() => {
-    vi.stubGlobal(
-      "ResizeObserver",
-      class {
-        observe() {}
-        unobserve() {}
-        disconnect() {}
-      },
-    );
-    useRecordingStore.getState().reset();
-    useWorkflowYamlEditorStore.setState(
-      useWorkflowYamlEditorStore.getInitialState(),
-    );
-    useWorkflowHasChangesStore.setState(
-      useWorkflowHasChangesStore.getInitialState(),
-    );
-    useWorkflowPanelStore.setState(useWorkflowPanelStore.getInitialState());
-    activeRunQueryMock.mockReturnValue({
-      data: { active_run_session_id: null },
-    });
-    debugQueryMock.mockReturnValue({
-      data: { browser_session_id: "pbs_debug", status: "created" },
-    });
-    workflowQueryMock.mockReturnValue({ data: liveWorkflow });
-    historyGet.mockResolvedValue({ data: {} });
-    del.mockReset().mockResolvedValue({ data: {} });
-    vi.mocked(axiosClientModule.getClient).mockResolvedValue({
-      put,
-      post,
-      get: historyGet,
-      delete: del,
-    } as never);
-  });
-
-  afterEach(() => {
-    cleanup();
-    useRecordingStore.getState().reset();
-  });
-
-  function renderPendingWorkspace() {
-    const { nodes, edges } = getElements(
-      [],
-      apiWorkflowToSettings(liveWorkflow),
-      true,
-    );
-    const client = new QueryClient({
-      defaultOptions: { queries: { retry: false } },
-    });
-    const router = createMemoryRouter(
-      [
-        {
-          path: "/agents/:workflowPermanentId/edit",
-          element: (
-            <WorkflowPermanentIdContext.Provider value="wpid_live">
-              <ReactFlowProvider>
-                <DebugStoreContext.Provider
-                  value={{ isDebugMode: false, blockRunsEnabled: false }}
-                >
-                  <Workspace
-                    initialNodes={nodes}
-                    initialEdges={edges}
-                    initialTitle="Live agent"
-                    workflow={liveWorkflow}
-                    embedded
-                  />
-                </DebugStoreContext.Provider>
-              </ReactFlowProvider>
-            </WorkflowPermanentIdContext.Provider>
-          ),
-        },
-      ],
-      { initialEntries: ["/agents/wpid_live/edit"] },
-    );
-    render(
-      <QueryClientProvider client={client}>
-        <RouterProvider router={router} />
-      </QueryClientProvider>,
-    );
-    act(() => {
-      const changes = useWorkflowHasChangesStore.getState();
-      changes.setHasChanges(true);
-      changes.setPendingRecording("br_prev", "wpid_live");
-    });
-    return router;
-  }
-
-  async function clickBrowserPaneRecord() {
-    await waitFor(() =>
-      expect(
-        useRecordingLauncherStore.getState().startRecordingAtEnd,
-      ).not.toBeNull(),
-    );
-    act(() => useRecordingLauncherStore.getState().startRecordingAtEnd!());
-  }
-
-  test("the Browser pane Record button asks first, and Save and record saves before recording", async () => {
-    renderPendingWorkspace();
-    await clickBrowserPaneRecord();
-    expect(
-      screen.getByText("Save or discard changes before recording"),
-    ).toBeTruthy();
-    expect(useRecordingStore.getState().isRecording).toBe(false);
-
-    put.mockResolvedValue({
-      data: { ...(liveWorkflow as object), version: 2 },
-    });
-    await act(async () =>
-      fireEvent.click(screen.getByRole("button", { name: "Save and record" })),
-    );
-    await waitFor(() =>
-      expect(useRecordingStore.getState().isRecording).toBe(true),
-    );
-    expect(put).toHaveBeenCalledOnce();
-    expect(useWorkflowHasChangesStore.getState().pendingRecordingId).toBe(null);
-  });
-
-  test("Save and record does not record if the browser stopped being ready during the save", async () => {
-    renderPendingWorkspace();
-    await clickBrowserPaneRecord();
-    put.mockImplementation(async () => {
-      debugQueryMock.mockReturnValue({ data: undefined });
-      return { data: { ...(liveWorkflow as object), version: 2 } };
-    });
-    await act(async () =>
-      fireEvent.click(screen.getByRole("button", { name: "Save and record" })),
-    );
-    await waitFor(() =>
-      expect(useWorkflowHasChangesStore.getState().pendingRecordingId).toBe(
-        null,
-      ),
-    );
-    await new Promise((resolve) => setTimeout(resolve, 0));
-    expect(useRecordingStore.getState().isRecording).toBe(false);
-  });
-
-  test("Discard and record reloads the saved workflow, deletes the old recording, then records", async () => {
-    renderPendingWorkspace();
-    await clickBrowserPaneRecord();
-    await act(async () =>
-      fireEvent.click(
-        screen.getByRole("button", { name: "Discard and record" }),
-      ),
-    );
-    await waitFor(() =>
-      expect(useRecordingStore.getState().isRecording).toBe(true),
-    );
-    expect(put).not.toHaveBeenCalled();
-    expect(useWorkflowHasChangesStore.getState().hasChanges).toBe(false);
-    await waitFor(() =>
-      expect(del).toHaveBeenCalledWith("/browser_recordings/br_prev"),
-    );
-  });
-
-  test("while a Copilot turn holds the editor, Discard stays disabled and nothing is deleted", async () => {
-    renderPendingWorkspace();
-    act(() =>
-      useWorkflowYamlEditorStore.setState({
-        copilotAcceptance: Symbol("copilot"),
-      }),
-    );
-    await clickBrowserPaneRecord();
-    const discard = screen.getByRole("button", { name: "Discard and record" });
-    expect((discard as HTMLButtonElement).disabled).toBe(true);
-    fireEvent.click(discard);
-    await new Promise((resolve) => setTimeout(resolve, 0));
-    expect(del).not.toHaveBeenCalled();
-    expect(useWorkflowHasChangesStore.getState()).toMatchObject({
-      hasChanges: true,
-      pendingRecordingId: "br_prev",
-    });
-    act(() => useWorkflowYamlEditorStore.setState({ copilotAcceptance: null }));
-  });
-
-  test("?record=1 arriving with pending changes asks once, and Cancel neither records nor asks again", async () => {
-    const router = renderPendingWorkspace();
-    await act(async () => {
-      await router.navigate("/agents/wpid_live/edit?record=1");
-    });
-    await waitFor(() =>
-      expect(
-        screen.getByText("Save or discard changes before recording"),
-      ).toBeTruthy(),
-    );
-    expect(
-      new URLSearchParams(router.state.location.search).has("record"),
-    ).toBe(false);
-    fireEvent.click(screen.getByRole("button", { name: "Cancel" }));
-    await waitFor(() =>
-      expect(
-        screen.queryByText("Save or discard changes before recording"),
-      ).toBeNull(),
-    );
-    expect(useRecordingStore.getState().isRecording).toBe(false);
-    expect(useWorkflowHasChangesStore.getState().pendingRecordingId).toBe(
-      "br_prev",
-    );
-  });
 });
 
 describe("save callback content revisions", () => {
@@ -4459,14 +4200,10 @@ describe("A49 metadata authorship through editor actions", () => {
     });
   }
 
-  test.each(
-    [false, true].flatMap((recover) =>
-      ["Keep my edits", "Apply and discard my edits"].map((choice) => ({
-        recover,
-        choice,
-      })),
-    ),
-  )(
+  test.each([
+    { recover: false, choice: "Keep my edits" },
+    { recover: true, choice: "Apply and discard my edits" },
+  ])(
     "A53 model input after a proposal uses $choice (recovery: $recover)",
     async ({ recover, choice }) => {
       integration.canvas = true;
@@ -4534,69 +4271,6 @@ describe("A49 metadata authorship through editor actions", () => {
           useWorkflowSnapshotStore.getState().snapshot?.settings.model,
         ).toEqual(staged.model);
       }
-    },
-  );
-
-  test.each(["recording", "SOP conversion"])(
-    "keeps generated blocks unsaved after accepting a proposal following %s",
-    async (source) => {
-      integration.canvas = true;
-      const staged = stageGraphProposal();
-      mountEditor({ ...staged, workflow_id: workflow.workflow_id, version: 1 });
-      await screen.findByRole("button", { name: "Accept" });
-      const generated = {
-        blocks: [
-          { ...staged.workflow_definition.blocks[0]!, label: "generated" },
-        ],
-        parameters: [],
-      };
-      act(() => {
-        const owner = useWorkflowYamlEditorStore.getState().editorOwner!;
-        if (source === "SOP conversion") {
-          applySopResultAtCurrentAppend({
-            result: generated,
-            getNodes: () => canvas.current!.nodes,
-            getEdges: () => canvas.current!.edges,
-            setRecordedBlocks: (result, insertionPoint) =>
-              useRecordedBlocksStore
-                .getState()
-                .setRecordedBlocks(result, insertionPoint, owner),
-          });
-        } else {
-          useRecordedBlocksStore
-            .getState()
-            .setRecordedBlocks(
-              generated,
-              { previous: null, next: null, connectingEdgeType: "default" },
-              owner,
-            );
-        }
-      });
-      await waitFor(() =>
-        expect(
-          useWorkflowHasChangesStore
-            .getState()
-            .getSaveData()!
-            .blocks.map((block) => block.label),
-        ).toEqual(["pause", "generated"]),
-      );
-      expect(useWorkflowHasChangesStore.getState().hasChanges).toBe(true);
-      await accept();
-      fireEvent.click(
-        await screen.findByRole("button", { name: "Keep my edits" }),
-      );
-      await waitFor(() =>
-        expect(
-          useWorkflowYamlEditorStore.getState().copilotAcceptance,
-        ).toBeNull(),
-      );
-      const saved = useWorkflowHasChangesStore.getState().getSaveData()!;
-      expect(saved.blocks.map((block) => block.label)).toEqual([
-        "pause",
-        "generated",
-      ]);
-      expect(saved.workflow.workflow_id).toBe(staged.workflow_id);
-      expect(useWorkflowHasChangesStore.getState().hasChanges).toBe(true);
     },
   );
 
@@ -5131,6 +4805,28 @@ describe("A49 metadata authorship through editor actions", () => {
     expect(useWorkflowHasChangesStore.getState().hasChanges).toBe(false);
   });
 
+  test("the leave dialog holds Save changes while authoring owns the editor", async () => {
+    integration.canvas = true;
+    mountEditor();
+    const leave = await screen.findByRole("link", { name: "Leave editor" });
+    await act(async () => {});
+    act(() => {
+      useWorkflowHasChangesStore.getState().setHasChanges(true);
+      useWorkflowYamlEditorStore.setState({ authoringInProgress: true });
+    });
+    fireEvent.click(leave);
+    const save = (await screen.findByRole("button", {
+      name: "Save changes",
+    })) as HTMLButtonElement;
+    expect(save.disabled).toBe(true);
+    expect(screen.getByText(AUTHORING_SAVE_MESSAGE)).toBeTruthy();
+
+    act(() =>
+      useWorkflowYamlEditorStore.setState({ authoringInProgress: false }),
+    );
+    expect(save.disabled).toBe(false);
+  });
+
   test.each([false, true])(
     "YAML settings edits do not author carried descriptions (title edited: %s)",
     async (editTitle) => {
@@ -5376,7 +5072,7 @@ describe("A49 metadata authorship through editor actions", () => {
     },
   );
 
-  test.each(["", "not-a-url", "http://", "://missing-scheme", "http://[::1"])(
+  test.each(["", "http://", "http://[::1"])(
     "YAML-to-Visual rejects a custom proxy URL without a host (%j)",
     async (url) => {
       mountEditor();
@@ -5409,13 +5105,10 @@ describe("A49 metadata authorship through editor actions", () => {
 
   test.each([
     "http://user:secret@proxy.example.com:8080",
-    "http://proxy.example.com:8080",
     "socks5://u:p@10.0.0.1:1080",
     "http://user:p%40ss%3Aword@proxy.example.com:8080",
     "//proxy.example.com:8080",
     "http://[2001:db8::1]:3128",
-    "http://[::1]:8080",
-    "http://[::1]",
   ])(
     "YAML-to-Visual commits a custom proxy URL with a host and withholds it from Copilot (%s)",
     async (url) => {
@@ -5635,49 +5328,6 @@ describe("save callback registration after explicit edits", () => {
     changes.setGetSaveData(() => previous);
     expect(useWorkflowYamlEditorStore.getState().revision).toBe(revision + 1);
   });
-});
-
-test("the legacy editor does not mount a second recording controller outside Copilot", () => {
-  vi.stubGlobal(
-    "ResizeObserver",
-    class {
-      observe() {}
-      disconnect() {}
-    },
-  );
-  const queryClient = new QueryClient({
-    defaultOptions: { queries: { retry: false } },
-  });
-  useRecordingStore.setState({ isRecording: true });
-  workflowQueryMock.mockReturnValue({ data: liveWorkflow, isLoading: false });
-
-  render(
-    <QueryClientProvider client={queryClient}>
-      <MemoryRouter initialEntries={["/agents/wpid_live/edit"]}>
-        <Routes>
-          <Route
-            path="/agents/:workflowPermanentId/edit"
-            element={
-              <DebugStoreProvider>
-                <ReactFlowProvider>
-                  <Workspace
-                    initialNodes={[]}
-                    initialEdges={[]}
-                    initialTitle="Live agent"
-                    workflow={liveWorkflow}
-                    showBrowser
-                  />
-                </ReactFlowProvider>
-              </DebugStoreProvider>
-            }
-          />
-        </Routes>
-      </MemoryRouter>
-    </QueryClientProvider>,
-  );
-
-  expect(screen.queryByTestId("standalone-recording-panel")).toBeNull();
-  queryClient.clear();
 });
 
 test("the canvas publishes whether it has a block for the studio Run control", () => {

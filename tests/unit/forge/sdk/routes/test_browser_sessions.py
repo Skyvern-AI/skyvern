@@ -2,6 +2,7 @@ import asyncio
 import json
 import socket
 from collections.abc import AsyncIterator
+from contextlib import asynccontextmanager
 from datetime import UTC, datetime
 from types import SimpleNamespace
 from typing import Any
@@ -19,6 +20,7 @@ from skyvern.config import settings
 from skyvern.exceptions import (
     BrowserSessionExtensionUnconfirmed,
     BrowserSessionNotExtendable,
+    BrowserSessionStartupTimeout,
     ExternalBrowserUnavailable,
 )
 from skyvern.forge import app as forge_app
@@ -36,6 +38,7 @@ from skyvern.webeye.persistent_sessions_manager import (
 from skyvern.webeye.real_browser_state import RealBrowserState
 from skyvern.webeye.schemas import BrowserSessionResponse
 from tests.unit._external_cdp_fakes import CDP_URL as EXTERNAL_CDP_URL
+from tests.unit._external_cdp_fakes import ORG_A, ORG_B
 from tests.unit._external_cdp_fakes import TOKEN as EXTERNAL_TOKEN
 from tests.unit._external_cdp_fakes import external_browser_state, external_cdp_stack, register_external
 
@@ -284,6 +287,37 @@ async def test_create_browser_session_observes_before_creating_the_session() -> 
     assert calls == ["observe", "create"]
 
 
+@pytest.mark.asyncio
+async def test_create_browser_session_holds_the_admission_scope_until_the_create_ends() -> None:
+    """A deployment's per-organization create slot must stay held while the browser starts and come back on failure."""
+    calls: list[str] = []
+
+    @asynccontextmanager
+    async def admission(organization_id: str) -> AsyncIterator[None]:
+        calls.append(f"admit {organization_id}")
+        try:
+            yield
+        finally:
+            calls.append("release")
+
+    async def create_session(**_: object) -> MagicMock:
+        calls.append("create")
+        raise BrowserSessionStartupTimeout("pbs_1")
+
+    app_mock = MagicMock()
+    app_mock.AGENT_FUNCTION.validate_enterprise_feature_access = AsyncMock()
+    app_mock.AGENT_FUNCTION.browser_session_create_admission = admission
+    app_mock.PERSISTENT_SESSIONS_MANAGER.create_session = create_session
+
+    with patch.object(browser_sessions_mod, "app", app_mock), pytest.raises(BrowserSessionStartupTimeout):
+        await browser_sessions_mod.create_browser_session(
+            browser_sessions_mod.CreateBrowserSessionRequest(),
+            current_org=SimpleNamespace(organization_id="org_1"),
+        )
+
+    assert calls == ["admit org_1", "create", "release"]
+
+
 def test_a_session_request_is_unwatched_unless_it_says_otherwise() -> None:
     """The public default. True would route every API-created session to first-party and make the
     provider rollout unreachable."""
@@ -322,10 +356,17 @@ async def test_get_browser_session_enables_strict_download_lookup() -> None:
 async def test_fan_out_listings_keep_each_sessions_storage_listings_sequential(endpoint: str) -> None:
     """These endpoints already gather across sessions, so overlapping a session's two listings would
     only raise the request's peak pool checkouts from N to 2N."""
-    sessions = [MagicMock(), MagicMock()]
+    sessions = [MagicMock(browser_profile_id=None, persistent_browser_session_id=f"pbs_{index}") for index in range(2)]
     app_mock = MagicMock()
+    app_mock.AGENT_FUNCTION.enforce_browser_session_credential_use = AsyncMock()
+    app_mock.AGENT_FUNCTION.accessible_browser_session_ids = AsyncMock(
+        return_value={session.persistent_browser_session_id for session in sessions}
+    )
     app_mock.DATABASE.browser_sessions.get_persistent_browser_sessions_history = AsyncMock(return_value=sessions)
     app_mock.PERSISTENT_SESSIONS_MANAGER.get_active_sessions = AsyncMock(return_value=sessions)
+    app_mock.DATABASE.browser_sessions.get_folder_visible_browser_session_ids = AsyncMock(
+        return_value={session.persistent_browser_session_id for session in sessions}
+    )
     from_browser_session = AsyncMock(return_value=MagicMock())
 
     with (
@@ -421,6 +462,37 @@ async def test_an_invalid_external_registration_never_echoes_the_submitted_addre
             response = await external_stack.client.post("/v1/browser_sessions/external", json=body)
             assert response.status_code == 422
             assert EXTERNAL_TOKEN not in response.text
+    assert EXTERNAL_TOKEN not in repr(logs)
+
+
+@pytest.mark.asyncio
+async def test_a_registration_is_listed_to_its_org_as_external_with_its_remaining_lifetime(
+    external_stack: SimpleNamespace,
+) -> None:
+    with capture_logs() as logs:
+        session_id = (await register_external(external_stack.client, timeout=30)).json()["browser_session_id"]
+        fetched = await external_stack.client.get(f"/v1/browser_sessions/{session_id}")
+        listed = await external_stack.client.get("/v1/browser_sessions")
+        history = await external_stack.client.get("/v1/browser_sessions/history")
+        external_stack.caller.organization_id = ORG_B
+        foreign_get = await external_stack.client.get(f"/v1/browser_sessions/{session_id}")
+        foreign_list = await external_stack.client.get("/v1/browser_sessions")
+        foreign_history = await external_stack.client.get("/v1/browser_sessions/history")
+    external_stack.caller.organization_id = ORG_A
+
+    listed_rows = [row for row in listed.json() if row["browser_session_id"] == session_id]
+    history_rows = [row for row in history.json() if row["browser_session_id"] == session_id]
+    assert len(listed_rows) == len(history_rows) == 1
+    for body in (fetched.json(), listed_rows[0], history_rows[0]):
+        assert body["source"] == "external"
+        assert body["status"] == "running"
+        assert body["browser_address"] is None
+        assert 29 * 60 < body["remaining_lifetime_seconds"] <= 30 * 60
+    assert foreign_get.status_code == 404
+    assert foreign_list.json() == [] and foreign_history.json() == []
+    for response in (fetched, listed, history, foreign_get):
+        for leaked in (EXTERNAL_TOKEN, "devtools/browser/b1", ":9333"):
+            assert leaked not in response.text
     assert EXTERNAL_TOKEN not in repr(logs)
 
 

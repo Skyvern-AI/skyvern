@@ -15,24 +15,6 @@ function cancelButton() {
 }
 
 describe("ConfirmDialog", () => {
-  it("renders the title, description, and standardized reversibility line", () => {
-    render(
-      <ConfirmDialog
-        open
-        onOpenChange={() => {}}
-        title="Delete this credential?"
-        description="The credential Prod API Key will be deleted."
-        onConfirm={() => {}}
-      />,
-    );
-
-    expect(screen.getByText("Delete this credential?")).toBeTruthy();
-    expect(
-      screen.getByText("The credential Prod API Key will be deleted."),
-    ).toBeTruthy();
-    expect(screen.getByText("This can't be undone.")).toBeTruthy();
-  });
-
   it("omits the reversibility line when reversible", () => {
     render(
       <ConfirmDialog

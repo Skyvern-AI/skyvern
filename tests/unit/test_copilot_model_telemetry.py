@@ -9,13 +9,13 @@ from collections.abc import AsyncIterator, Callable, Iterator
 from dataclasses import dataclass
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from types import SimpleNamespace
-from typing import Any, Self, cast
+from typing import Any, Literal, Self, cast
 from unittest.mock import AsyncMock, MagicMock
 
 import httpx
 import litellm
 import pytest
-from agents import ItemHelpers, ModelSettings, RunContextWrapper, function_tool
+from agents import Agent, ItemHelpers, ModelSettings, RunContextWrapper, Runner, function_tool
 from agents.extensions.models.litellm_model import LitellmModel
 from agents.items import TResponseInputItem
 from agents.mcp import MCPServer, MCPUtil
@@ -23,6 +23,8 @@ from agents.models.interface import ModelTracing
 from litellm.integrations.anthropic_cache_control_hook import AnthropicCacheControlHook
 from litellm.litellm_core_utils.fallback_utils import async_completion_with_fallbacks
 from litellm.llms.vertex_ai.gemini.transformation import _gemini_convert_messages_with_history
+from litellm.types.llms.openai import GenericEvent
+from litellm.types.llms.openai import ResponseCompletedEvent as LiteLLMResponseCompletedEvent
 from litellm.types.llms.openai import ResponsesAPIResponse
 from litellm.types.utils import Delta
 from litellm.types.utils import ModelResponse as LiteLLMModelResponse
@@ -30,19 +32,28 @@ from litellm.types.utils import ModelResponseStream, StreamingChoices, Usage
 from mcp.types import Tool as MCPTool
 from openai import AsyncStream
 from openai.types.chat import ChatCompletionChunk
-from openai.types.responses import ResponseFunctionToolCall
+from openai.types.responses import ResponseCompletedEvent, ResponseFunctionToolCall, ResponseReasoningItem
 from structlog.testing import capture_logs
 
 from skyvern.cli.mcp_tools.blocks import skyvern_block_schema
+from skyvern.forge.sdk.api.llm.config_registry import LLMConfigRegistry
 from skyvern.forge.sdk.copilot import agent as copilot_agent_module
 from skyvern.forge.sdk.copilot import cache_envelope as cache_envelope_module
+from skyvern.forge.sdk.copilot import enforcement as enforcement_module
 from skyvern.forge.sdk.copilot import model_telemetry as model_telemetry_module
 from skyvern.forge.sdk.copilot.browser_ablation import CopilotEvalMode
 from skyvern.forge.sdk.copilot.cache_envelope import CacheableSystemInstructions
 from skyvern.forge.sdk.copilot.config import CopilotConfig
-from skyvern.forge.sdk.copilot.enforcement import NUDGE_SENTINEL, SCREENSHOT_SENTINEL, _prune_input_list
+from skyvern.forge.sdk.copilot.cost_telemetry import copilot_cost_scope, current_copilot_cost
+from skyvern.forge.sdk.copilot.enforcement import (
+    NUDGE_SENTINEL,
+    SCREENSHOT_SENTINEL,
+    CopilotTotalTimeoutError,
+    _prune_input_list,
+)
 from skyvern.forge.sdk.copilot.llm_errors import is_retriable_llm_error
 from skyvern.forge.sdk.copilot.mcp_adapter import _copilot_to_call_tool_result
+from skyvern.forge.sdk.copilot.model_resolver import resolve_model_config
 from skyvern.forge.sdk.copilot.model_telemetry import (
     CopilotLitellmModel,
     _model_call_telemetry_scope,
@@ -59,6 +70,7 @@ from skyvern.forge.sdk.copilot.pending_operation import (
 from skyvern.forge.sdk.copilot.recoverable_failure import build_recoverable_failure
 from skyvern.forge.sdk.copilot.session_factory import copilot_session_input_callback
 from skyvern.forge.sdk.schemas.workflow_copilot import WorkflowCopilotChatRequest
+from skyvern.schemas.llm import LLMConfig
 
 pytestmark = pytest.mark.usefixtures("gpt56_litellm_models")
 
@@ -119,13 +131,14 @@ def _completion() -> LiteLLMModelResponse:
     )
 
 
-def _responses_completion() -> ResponsesAPIResponse:
+def _responses_completion(*output: dict[str, Any]) -> ResponsesAPIResponse:
     return ResponsesAPIResponse(
         id="resp-test",
         created_at=1,
         model="gpt-5.6-sol",
         object="response",
-        output=[
+        output=list(output)
+        or [
             {
                 "id": "msg-test",
                 "type": "message",
@@ -219,15 +232,13 @@ async def test_model_adapter_attaches_exact_tools_for_nonstream_and_stream_reque
 ) -> None:
     attached: list[list[Any]] = []
 
-    async def fake_get_response(*_args: Any, **_kwargs: Any) -> SimpleNamespace:
-        return SimpleNamespace(output=[])
-
-    async def fake_stream_response(*_args: Any, **_kwargs: Any) -> AsyncIterator[str]:
-        yield "done"
+    async def fake_acompletion(**kwargs: Any) -> Any:
+        if kwargs.get("stream"):
+            return cast(AsyncStream[ChatCompletionChunk], _ChunkStream(_stream_chunks()))
+        return _completion()
 
     monkeypatch.setattr(model_telemetry_module, "attach_tool_surface_to_pending_capture", attached.append)
-    monkeypatch.setattr(LitellmModel, "get_response", fake_get_response)
-    monkeypatch.setattr(LitellmModel, "stream_response", fake_stream_response)
+    monkeypatch.setattr("litellm.acompletion", fake_acompletion)
     model = CopilotLitellmModel(model="openai/gpt-5.6", next_model_call_index=lambda: 1)
 
     await model.get_response(
@@ -253,7 +264,7 @@ async def test_model_adapter_attaches_exact_tools_for_nonstream_and_stream_reque
     ]
 
     assert attached == [[_lookup_number], [_lookup_number]]
-    assert streamed == ["done"]
+    assert streamed
 
 
 @pytest.mark.asyncio
@@ -271,6 +282,62 @@ async def test_nonstream_capture_preserves_request_and_result(monkeypatch: pytes
     assert requests[0] == requests[1]
     assert adapter_result == base_result
     assert current_model_call_telemetry() is None
+
+
+@function_tool(strict_mode=False)
+def _pick(title: str | None = None, mode: Literal["a", "b"] | None = None) -> str:
+    return f"{title}{mode}"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("model_name", "drops_titles"),
+    [("anthropic/claude-sonnet-5-5", True), ("azure/gpt-5.6-terra", True), ("gpt-6.1-sol", False)],
+)
+async def test_sent_tool_schemas_drop_generated_titles_only_on_replay_checked_models(
+    monkeypatch: pytest.MonkeyPatch,
+    model_name: str,
+    drops_titles: bool,
+) -> None:
+    sent: list[dict[str, Any]] = []
+    attached: list[list[Any]] = []
+
+    async def fake_acompletion(**kwargs: Any) -> LiteLLMModelResponse:
+        sent.append(kwargs["tools"][0]["function"]["parameters"])
+        return _completion()
+
+    async def fake_aresponses(**kwargs: Any) -> ResponsesAPIResponse:
+        sent.append(kwargs["tools"][0]["parameters"])
+        return _responses_completion()
+
+    monkeypatch.setattr("litellm.acompletion", fake_acompletion)
+    monkeypatch.setattr("litellm.aresponses", fake_aresponses)
+    monkeypatch.setattr(model_telemetry_module, "attach_tool_surface_to_pending_capture", attached.append)
+    original = copy.deepcopy(_pick.params_json_schema)
+
+    await CopilotLitellmModel(model=model_name, next_model_call_index=lambda: 1).get_response(
+        system_instructions=_CACHED_PROMPT,
+        input=[{"role": "user", "content": "Pick one"}],
+        model_settings=ModelSettings(temperature=0, include_usage=True, extra_args=_GPT_REASONING),
+        tools=[_pick],
+        output_schema=None,
+        handoffs=[],
+        tracing=ModelTracing.DISABLED,
+    )
+
+    assert _pick.params_json_schema == original
+    assert sent == [
+        {
+            "properties": {
+                "title": {"anyOf": [{"type": "string"}, {"type": "null"}], "default": None},
+                "mode": {"anyOf": [{"enum": ["a", "b"], "type": "string"}, {"type": "null"}], "default": None},
+            },
+            "type": "object",
+        }
+        if drops_titles
+        else original
+    ]
+    assert [[tool.params_json_schema for tool in tools] for tools in attached] == [sent]
 
 
 @pytest.mark.asyncio
@@ -422,7 +489,7 @@ async def test_stream_capture_preserves_events_order_and_backpressure(monkeypatc
     assert adapter_events == base_events
     assert [event.type for event in adapter_events] == [event.type for event in base_events]
     assert telemetry_seen[-1] == (9, 47)
-    assert streams[1].closed == streams[0].closed is False
+    assert streams[1].closed is streams[0].closed is True
     assert current_model_call_telemetry() is None
 
 
@@ -492,6 +559,95 @@ async def test_explicit_responses_stream_captures_raw_cache_write_before_convers
     assert requests[0]["prompt_cache_key"].startswith("copilot:")
     assert telemetry_seen[-1] == ("explicit", 31, 47)
     assert current_model_call_telemetry() is None
+
+
+_SEALED_REASONING = {"id": "rs_1", "type": "reasoning", "summary": [], "encrypted_content": "sealed"}
+_LOOKUP_CALL = {
+    "id": "fc_1",
+    "type": "function_call",
+    "call_id": "call_1",
+    "name": "_lookup_number",
+    "arguments": '{"name": "abc"}',
+    "status": "completed",
+}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("fallbacks", "sent_back"),
+    [
+        ([], True),
+        ([{"model": "gpt-5.6-sol", "service_tier": "flex"}], True),
+        (["gpt-5.6-terra"], False),
+    ],
+)
+async def test_gpt_reasoning_goes_back_before_its_tool_call_when_every_hop_can_read_it(
+    monkeypatch: pytest.MonkeyPatch, fallbacks: list[Any], sent_back: bool
+) -> None:
+    requests: list[dict[str, Any]] = []
+    replies = [_responses_completion(_SEALED_REASONING, _LOOKUP_CALL), _responses_completion()]
+
+    async def fake_aresponses(**kwargs: object) -> ResponsesAPIResponse:
+        requests.append(kwargs)
+        return replies[len(requests) - 1]
+
+    monkeypatch.setattr("litellm.aresponses", fake_aresponses)
+    monkeypatch.setitem(
+        LLMConfigRegistry._configs,
+        "GPT56_SOL_TEST",
+        LLMConfig("gpt-5.6-sol", [], supports_vision=False, add_assistant_prefix=False, reasoning_effort="medium"),
+    )
+    # Copilot's own RunConfig, so its input filter runs between the two calls.
+    _, run_config, _, _ = resolve_model_config(None, llm_key_override="GPT56_SOL_TEST")
+    agent = Agent(
+        name="copilot",
+        instructions=CacheableSystemInstructions("stable", "dynamic", cache_namespace="wcc-test"),
+        model_settings=ModelSettings(extra_args={"fallbacks": fallbacks}),
+        tools=[_lookup_number],
+    )
+
+    await Runner.run(agent, "Return 42", run_config=run_config)
+
+    reasoning = [("reasoning", "sealed")] if sent_back else []
+    assert [(item["type"], item.get("encrypted_content")) for item in requests[1]["input"]] == [
+        ("message", None),
+        ("message", None),
+        *reasoning,
+        ("function_call", None),
+        ("function_call_output", None),
+    ]
+
+
+@pytest.mark.asyncio
+async def test_a_streamed_gpt_turn_keeps_the_providers_encrypted_reasoning(monkeypatch: pytest.MonkeyPatch) -> None:
+    async def raw_stream() -> AsyncIterator[Any]:
+        yield LiteLLMResponseCompletedEvent(
+            type="response.completed", response=_responses_completion(_SEALED_REASONING, _LOOKUP_CALL)
+        )
+
+    async def fake_aresponses(**kwargs: object) -> AsyncIterator[Any]:
+        return raw_stream()
+
+    monkeypatch.setattr("litellm.aresponses", fake_aresponses)
+    model = CopilotLitellmModel(model="gpt-5.6-sol", next_model_call_index=lambda: 1)
+
+    outputs = [
+        event.response.output
+        async for event in model.stream_response(
+            system_instructions=CacheableSystemInstructions("stable", "dynamic", cache_namespace="wcc-test"),
+            input=[{"role": "user", "content": "Return 42"}],
+            model_settings=ModelSettings(include_usage=True, extra_args=_GPT_REASONING),
+            tools=[_lookup_number],
+            output_schema=None,
+            handoffs=[],
+            tracing=ModelTracing.DISABLED,
+        )
+        if isinstance(event, ResponseCompletedEvent)
+    ]
+
+    (output,) = outputs
+    assert isinstance(output[0], ResponseReasoningItem)
+    assert output[0].encrypted_content == "sealed"
 
 
 @pytest.mark.asyncio
@@ -636,6 +792,7 @@ def test_model_call_cost_uses_runtime_litellm_pricing(monkeypatch: pytest.Monkey
         output_tokens=7,
         cache_read_tokens=31,
         cache_write_tokens=47,
+        service_tier="default",
     )
 
     assert model_telemetry_module._model_call_cost(telemetry, "gpt-5.6-sol") == pytest.approx(0.15)
@@ -646,7 +803,131 @@ def test_model_call_cost_uses_runtime_litellm_pricing(monkeypatch: pytest.Monkey
         "cache_read_input_tokens": 31,
         "cache_creation_input_tokens": 47,
         "call_type": "aresponses",
+        "service_tier": "default",
     }
+
+
+@pytest.mark.parametrize(
+    ("model", "input_tokens", "reported_cost", "expected_cost"),
+    [
+        ("anthropic/claude-haiku-5-5", 100_000, None, 0.15),
+        ("anthropic/claude-haiku-5-5", 100_001, None, 0.75),
+        ("bedrock/us.anthropic.claude-haiku-5-5", 100_001, None, 0.75),
+        ("anthropic/claude-haiku-5-5-2026-10-01", 100_001, None, 0.75),
+        ("anthropic/claude-sonnet-4-6", 100_001, None, 0.15),
+        ("anthropic/claude-haiku-5-5", 100_001, 0.2, 0.2),
+    ],
+)
+def test_model_call_cost_applies_shared_long_prompt_correction(
+    monkeypatch: pytest.MonkeyPatch,
+    model: str,
+    input_tokens: int,
+    reported_cost: float | None,
+    expected_cost: float,
+) -> None:
+    price = MagicMock(return_value=(0.12, 0.03))
+    monkeypatch.setattr(model_telemetry_module.litellm, "cost_per_token", price)
+    telemetry = model_telemetry_module.CopilotModelCallTelemetry(
+        model_call_index=1,
+        input_tokens=input_tokens,
+        output_tokens=7,
+        cache_read_tokens=90_000,
+        cache_write_tokens=5_000,
+        reported_cost=reported_cost,
+    )
+
+    assert model_telemetry_module._model_call_cost(telemetry, model) == pytest.approx(expected_cost)
+    if reported_cost is None:
+        # Input tokens already include cache reads/writes; they select the long-prompt rate once.
+        assert price.call_args.kwargs["prompt_tokens"] == input_tokens
+        assert price.call_args.kwargs["cache_read_input_tokens"] == 90_000
+        assert price.call_args.kwargs["cache_creation_input_tokens"] == 5_000
+    else:
+        price.assert_not_called()
+
+
+@pytest.mark.parametrize(
+    ("response_model", "served_model", "served_provider", "pricing_model", "expected_cost"),
+    [
+        (
+            "claude-haiku-5-5",
+            "bedrock/us.anthropic.claude-haiku-5-5",
+            "bedrock",
+            "bedrock/us.anthropic.claude-haiku-5-5",
+            0.75,
+        ),
+        ("us.anthropic.claude-haiku-5-5", None, "bedrock", "us.anthropic.claude-haiku-5-5", 0.75),
+        (
+            "global.anthropic.claude-haiku-5-5",
+            "bedrock/us.anthropic.claude-haiku-5-5",
+            "bedrock",
+            "global.anthropic.claude-haiku-5-5",
+            0.75,
+        ),
+        (
+            "claude-opus-5-5",
+            "bedrock/us.anthropic.claude-opus-5-5",
+            "bedrock",
+            "bedrock/us.anthropic.claude-opus-5-5",
+            0.15,
+        ),
+        ("claude-haiku-5-5", None, "bedrock", None, None),
+        ("claude-haiku-5-5", "bedrock/us.anthropic.claude-haiku-5-5", "anthropic", "claude-haiku-5-5", 0.75),
+    ],
+)
+def test_model_call_cost_preserves_actual_bedrock_profile_and_provider(
+    monkeypatch: pytest.MonkeyPatch,
+    response_model: str,
+    served_model: str | None,
+    served_provider: str,
+    pricing_model: str | None,
+    expected_cost: float | None,
+) -> None:
+    price = MagicMock(return_value=(0.12, 0.03))
+    monkeypatch.setattr(model_telemetry_module.litellm, "cost_per_token", price)
+    telemetry = model_telemetry_module.CopilotModelCallTelemetry(
+        model_call_index=1, input_tokens=100_001, output_tokens=10
+    )
+    model_telemetry_module._capture_served_provider(
+        telemetry,
+        SimpleNamespace(_hidden_params={"custom_llm_provider": served_provider, "litellm_model_name": served_model}),
+    )
+
+    cost = model_telemetry_module._model_call_cost(telemetry, response_model)
+    if expected_cost is None:
+        assert cost is None
+        price.assert_not_called()
+    else:
+        assert cost == pytest.approx(expected_cost)
+        assert price.call_args.kwargs["model"] == pricing_model
+        assert price.call_args.kwargs.get("custom_llm_provider") == (
+            "bedrock" if served_provider == "bedrock" else None
+        )
+
+
+@pytest.mark.asyncio
+async def test_stream_cost_uses_bedrock_chunk_profile_without_hidden_model_name(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    price = MagicMock(return_value=(0.12, 0.03))
+    monkeypatch.setattr(model_telemetry_module.litellm, "cost_per_token", price)
+    chunks = _stream_chunks()
+    for chunk in chunks:
+        chunk.model = "us.anthropic.claude-haiku-5-5"
+        chunk._hidden_params = {"custom_llm_provider": "bedrock"}
+    chunks[-1].usage = Usage(prompt_tokens=100_001, completion_tokens=7, total_tokens=100_008)
+
+    with (
+        copilot_cost_scope() as ledger,
+        _model_call_telemetry_scope(1, model="anthropic/claude-haiku-5-5") as telemetry,
+    ):
+        stream = model_telemetry_module._UsageCapturingStream(_ChunkStream(chunks), telemetry)
+        received = [chunk async for chunk in stream]
+
+    assert received == chunks
+    assert price.call_args.kwargs["model"] == "us.anthropic.claude-haiku-5-5"
+    assert price.call_args.kwargs["custom_llm_provider"] == "bedrock"
+    assert ledger.snapshot()["known_cost_usd"] == pytest.approx(0.75)
 
 
 def test_model_call_cost_normalizes_dated_gpt56_response_model(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -663,6 +944,7 @@ def test_model_call_cost_normalizes_dated_gpt56_response_model(monkeypatch: pyte
         output_tokens=500,
         cache_read_tokens=0,
         cache_write_tokens=35_000,
+        service_tier="default",
     )
 
     dated_cost = model_telemetry_module._model_call_cost(
@@ -674,6 +956,46 @@ def test_model_call_cost_normalizes_dated_gpt56_response_model(monkeypatch: pyte
     assert dated_cost is not None
     assert dated_cost == pytest.approx(base_cost)
     assert priced_models == ["gpt-5.6-sol", "gpt-5.6-sol"]
+
+
+@pytest.mark.parametrize(
+    ("reported_tier", "recovered_tier", "priced_tier"),
+    [("flex", "default", "flex"), ("default", "flex", "default"), (None, "flex", "flex"), (None, None, None)],
+)
+def test_actor_cost_uses_actual_or_recovered_served_tier_and_preserves_missing_tier(
+    monkeypatch: pytest.MonkeyPatch,
+    reported_tier: str | None,
+    recovered_tier: str | None,
+    priced_tier: str | None,
+) -> None:
+    priced: list[str | None] = []
+
+    def price(**kwargs: Any) -> tuple[float, float]:
+        priced.append(kwargs["service_tier"])
+        return (0.005 if kwargs["service_tier"] == "flex" else 0.01), 0.0
+
+    monkeypatch.setattr(model_telemetry_module.litellm, "cost_per_token", price)
+    with copilot_cost_scope() as ledger, _model_call_telemetry_scope(1, model="gpt-6.1-sol") as telemetry:
+        telemetry.capture({"input_tokens": 100, "output_tokens": 10})
+        model_telemetry_module._capture_served_provider(
+            telemetry,
+            SimpleNamespace(
+                service_tier=reported_tier,
+                _hidden_params={"skyvern_served_service_tier": recovered_tier},
+            ),
+        )
+    assert priced == ([priced_tier] if priced_tier is not None else [])
+    assert ledger.snapshot()["known_cost_usd"] == (
+        pytest.approx(0.005 if priced_tier == "flex" else 0.01) if priced_tier is not None else None
+    )
+    assert ledger.snapshot()["unknown_call_count"] == (0 if priced_tier is not None else 1)
+
+
+def test_reported_cost_remains_usable_without_a_served_tier() -> None:
+    with copilot_cost_scope() as ledger, _model_call_telemetry_scope(1, model="gpt-6.1-sol") as telemetry:
+        telemetry.capture({"input_tokens": 100, "output_tokens": 10, "cost": 0.02})
+    assert ledger.snapshot()["known_cost_usd"] == pytest.approx(0.02)
+    assert ledger.snapshot()["pricing_sources"] == ["provider_reported"]
 
 
 def test_completed_model_call_emits_datadog_usage_with_explicit_zeroes(
@@ -817,6 +1139,27 @@ def test_model_call_without_provider_usage_does_not_emit_datadog_event(
     assert events == []
 
 
+def test_turn_cost_ledger_uses_provider_cost_then_estimate_and_preserves_unpriced_calls(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(model_telemetry_module.litellm, "cost_per_token", lambda **kwargs: (0.01, 0.02))
+    with copilot_cost_scope():
+        with _model_call_telemetry_scope(1, model="model") as telemetry:
+            telemetry.capture({"input_tokens": 10, "output_tokens": 3, "cost": 0.125})
+        with _model_call_telemetry_scope(2, model="model") as telemetry:
+            telemetry.capture({"input_tokens": 10, "output_tokens": 3})
+        with _model_call_telemetry_scope(3, model="model"):
+            pass
+        result = current_copilot_cost()
+    assert result is not None
+    assert result["known_cost_usd"] == pytest.approx(0.155)
+    assert result["observed_call_count"] == 3
+    assert result["priced_call_count"] == 2
+    assert result["unknown_call_count"] == 1
+    assert result["pricing_sources"] == ["litellm_estimate", "provider_reported"]
+    assert result["status"] == "partial"
+
+
 def test_datadog_logging_failure_does_not_escape_or_leak_context(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -907,7 +1250,7 @@ async def test_stream_cancellation_resets_context_without_changing_stream_owners
     await events.aclose()
 
     assert current_model_call_telemetry() is None
-    assert stream.closed is False
+    assert stream.closed is True
 
 
 @pytest.mark.parametrize(
@@ -1312,9 +1655,10 @@ async def test_browser_ablation_timeout_reports_active_model_and_browser_work(
         if fallback_enabled and attempt_count == 1:
             raise FakeRateLimitError("rate limit")
         ctx = cast(copilot_agent_module.CopilotContext, kwargs["ctx"])
-        ctx.copilot_total_timeout_exceeded = True
+        ctx.budget_expiry_state.hard_backstop_reached = True
+        enforcement_module._mark_copilot_total_timeout(ctx, elapsed_seconds=990.0, iteration=0)
         ctx.eval_tool_activity = [{"tool_name": "navigate_browser", "success": True}]
-        raise asyncio.CancelledError
+        raise CopilotTotalTimeoutError
 
     monkeypatch.setattr(
         "skyvern.forge.sdk.copilot.agent._resolve_live_browser_session_id", AsyncMock(return_value=None)
@@ -1367,7 +1711,7 @@ async def test_browser_ablation_timeout_reports_active_model_and_browser_work(
     assert result.browser_ablation_metadata["tool_activity"] == [{"tool_name": "navigate_browser", "success": True}]
 
 
-_GEMINI = "vertex_ai/gemini-2.5-flash"
+_GEMINI = "vertex_ai/gemini-3-flash-preview"
 _SCHEMA_CALL = ResponseFunctionToolCall(
     type="function_call",
     call_id="call_schema",
@@ -1626,7 +1970,7 @@ def _tool_text(messages: list[dict[str, Any]]) -> str:
 def _gemini_function_responses(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
     contents = _gemini_convert_messages_with_history(
         messages=cast(Any, [message for message in messages if message["role"] != "system"]),
-        model="gemini-2.5-flash",
+        model="gemini-3-flash-preview",
         custom_llm_provider="vertex_ai",
     )
     return [
@@ -2150,6 +2494,73 @@ async def test_a_stream_that_drops_midway_raises_the_typed_error_copilot_retries
     assert is_retriable_llm_error(raised.value) is True
 
 
+async def _silent_after_one_chunk() -> AsyncIterator[ChatCompletionChunk]:
+    yield _stream_chunks()[0]
+    await asyncio.Event().wait()
+
+
+async def _keepalives_forever() -> AsyncIterator[GenericEvent]:
+    while True:
+        await asyncio.sleep(0.05)
+        yield GenericEvent(type="keepalive")
+
+
+async def _slow_steady_chunks() -> AsyncIterator[ChatCompletionChunk]:
+    for _ in range(20):
+        await asyncio.sleep(0.05)
+        yield _stream_chunks()[0]
+    yield _stream_chunks()[1]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("model_name", "upstream", "stalls"),
+    [
+        ("anthropic/claude-sonnet-5-5", _silent_after_one_chunk, True),
+        ("azure/gpt-5.6-terra", _keepalives_forever, True),
+        ("anthropic/claude-sonnet-5-5", _slow_steady_chunks, False),
+    ],
+)
+async def test_a_stream_without_progress_is_cut_as_a_retriable_timeout_but_slow_steady_output_is_not(
+    monkeypatch: pytest.MonkeyPatch,
+    model_name: str,
+    upstream: Callable[[], AsyncIterator[Any]],
+    stalls: bool,
+) -> None:
+    async def fake_call(**_kwargs: object) -> AsyncIterator[Any]:
+        return upstream()
+
+    monkeypatch.setattr(model_telemetry_module, "_STREAM_PROGRESS_TIMEOUT_SECONDS", 0.5)
+    monkeypatch.setattr("litellm.acompletion", fake_call)
+    monkeypatch.setattr("litellm.aresponses", fake_call)
+    model_settings = (
+        _gpt_route_settings(model_name, []) if model_name.startswith("azure/") else ModelSettings(include_usage=True)
+    )
+    events: list[Any] = []
+    with pytest.raises(litellm.Timeout) if stalls else contextlib.nullcontext() as raised:
+        async with asyncio.timeout(5):
+            async for event in CopilotLitellmModel(
+                model=model_name,
+                base_url=_AZURE_BASE if model_name.startswith("azure/") else None,
+                api_key="test-key",
+                next_model_call_index=lambda: 1,
+            ).stream_response(
+                system_instructions=_CACHED_PROMPT,
+                input=_GPT_TOOL_HISTORY,
+                model_settings=model_settings,
+                tools=[_lookup_number],
+                output_schema=None,
+                handoffs=[],
+                tracing=ModelTracing.DISABLED,
+            ):
+                events.append(event)
+
+    if stalls:
+        assert is_retriable_llm_error(raised.value) is True
+    else:
+        assert events[-1].type == "response.completed"
+
+
 @pytest.mark.asyncio
 async def test_every_failed_hop_is_logged_and_an_exhausted_chain_raises_litellms_fallback_error(
     monkeypatch: pytest.MonkeyPatch,
@@ -2258,7 +2669,8 @@ async def test_explicit_responses_request_forwards_every_setting_the_sdk_sends_t
         )
 
     assert set(sent) == {"chat", "responses"}
-    chat = {key: value for key, value in sent["chat"].items() if value is not None}
+    # acompletion pops this LiteLLM-internal flag; aresponses routes to its MCP gateway only for "mcp"-type tools.
+    chat = {key: value for key, value in sent["chat"].items() if value is not None and key != "_skip_mcp_handler"}
     responses = sent["responses"]
     for key, value in chat.items():
         name = _RESPONSES_KWARG_NAMES.get(key, key)

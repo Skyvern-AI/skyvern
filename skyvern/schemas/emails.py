@@ -1,6 +1,6 @@
 from enum import StrEnum
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 
 
 class EmailBodyFormat(StrEnum):
@@ -40,6 +40,15 @@ class EmailAttachment(BaseModel):
     mime_type: str | None = None
     size: int | None = None
     attachment_id: str | None = None
+    is_inline: bool = Field(default=False, exclude=True)
+    # Gmail stores small attachment bytes in body.data instead of issuing an attachmentId.
+    embedded_data: str | None = Field(default=None, exclude=True, repr=False)
+
+    @field_validator("name")
+    @classmethod
+    def _replace_unpaired_surrogates(cls, name: str) -> str:
+        # Provider JSON can carry lone surrogates, which Postgres JSONB output rejects.
+        return name.encode("utf-8", "replace").decode("utf-8")
 
 
 class EmailMessage(BaseModel):
@@ -56,5 +65,7 @@ class EmailMessage(BaseModel):
     body_html: str | None = None
     has_attachments: bool | None = None
     attachments: list[EmailAttachment] = Field(default_factory=list)
+    # Provider error code when attachments were requested but could not all be listed.
+    attachment_list_error: str | None = Field(default=None, exclude=True)
     is_read: bool = True
     web_link: str | None = None

@@ -298,9 +298,7 @@ async def test_safe_helper_arm_persists_and_reaches_test_run(
     monkeypatch.setattr(tools_module, "_authority_tool_error", lambda *args, **kwargs: None)
     monkeypatch.setattr(tools_module, "_get_prior_workflow_definition", AsyncMock(return_value=None))
     monkeypatch.setattr(
-        tools_module,
-        "_plan_frontier",
-        lambda *args: (["download_result"], {}, "download_result", "initial"),
+        tools_module.FrontierRequest, "plan", lambda self, ctx: (["download_result"], {}, "download_result", "initial")
     )
     monkeypatch.setattr(tools_module, "_frontier_runtime_page_url", AsyncMock(return_value=None))
     monkeypatch.setattr(tools_module, "_run_blocks_and_collect_debug", run_blocks)

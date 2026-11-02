@@ -6,22 +6,21 @@ from typing import Annotated, Any
 
 import structlog
 from fastapi import APIRouter, Depends, HTTPException
-from pydantic import BaseModel, ConfigDict, model_validator
 
 from skyvern.config import settings
 from skyvern.forge import app
 from skyvern.forge.agent_functions import record_request_audit_event
 from skyvern.forge.sdk.db.enums import OrganizationAuthTokenType
 from skyvern.forge.sdk.db.repositories.sms import SMSLifecycleLockTimeout
-from skyvern.forge.sdk.encrypt.base import EncryptMethod
+from skyvern.forge.sdk.encrypt.base import DEFAULT_ENCRYPT_METHOD
 from skyvern.forge.sdk.routes.sms_inbound import SMS_SIGNING_URL_UNAVAILABLE
 from skyvern.forge.sdk.schemas.organizations import (
     CreateTwilioCredentialRequest,
     Organization,
+    OrganizationPhoneNumberResponse,
     TwilioCredential,
+    TwilioCredentialResponse,
     TwilioCredentialSafe,
-    _TwilioJSONModel,
-    _validate_twilio_without_error_inputs,
 )
 from skyvern.forge.sdk.schemas.sms import (
     CreateSMSConfigRequest,
@@ -34,6 +33,8 @@ from skyvern.forge.sdk.schemas.sms import (
     TwilioPhoneNumberInfo,
 )
 from skyvern.forge.sdk.services import org_auth_service
+from skyvern.forge.sdk.services.request_principal import get_request_principal
+from skyvern.forge.sdk.services.route_authorization import require_request_actions
 from skyvern.forge.sdk.services.twilio_service import (
     TwilioApiError,
     build_client_from_credential,
@@ -46,34 +47,6 @@ from skyvern.utils.url_validators import redact_url_for_display, redact_url_quer
 
 twilio_integration_router = APIRouter()
 LOG = structlog.get_logger()
-
-
-class OrganizationPhoneNumberResponse(BaseModel):
-    """Safe phone-number metadata without provider routing or cost secrets."""
-
-    model_config = ConfigDict(from_attributes=True)
-
-    phone_number_id: str
-    organization_id: str
-    sms_config_id: str
-    phone_number: str
-    provider: str
-    provider_number_sid: str | None = None
-    credential_id: str | None = None
-    price_cents: int | None = None
-    status: str
-    quarantined_until: Any | None = None
-    created_at: Any
-    modified_at: Any
-    deleted_at: Any | None = None
-
-
-class TwilioCredentialResponse(_TwilioJSONModel):
-    model_config = ConfigDict(hide_input_in_errors=True)
-
-    credential: TwilioCredentialSafe | None = None
-
-    _hide_validation_inputs = model_validator(mode="wrap")(_validate_twilio_without_error_inputs)
 
 
 def _require_twilio_sms_enabled() -> None:
@@ -96,6 +69,7 @@ def _safe_credential(credential: TwilioCredential) -> TwilioCredentialResponse:
         credential=TwilioCredentialSafe(
             account_sid=credential.account_sid,
             api_key_sid=credential.api_key_sid,
+            has_api_key_secret=bool(credential.api_key_secret),
             has_auth_token=bool(credential.auth_token),
         )
     )
@@ -403,14 +377,29 @@ async def _organization_sms_lifecycle_lock(organization_id: str) -> AsyncIterato
 @twilio_integration_router.post(
     "/phone-numbers/enable",
     response_model=OrganizationPhoneNumberResponse,
+    summary="Enable Twilio phone number",
+    description="Enable SMS forwarding for a Twilio phone number in the current organization.",
+    tags=["Credentials"],
+    responses={
+        400: {"description": "The Twilio credential or phone number selection is invalid"},
+        404: {"description": "Twilio SMS is unavailable or the phone number was not found"},
+        409: {"description": "The phone number requires takeover confirmation or changed during setup"},
+        422: {"description": "Request validation failed"},
+        502: {"description": "The Twilio provider request failed"},
+        503: {"description": "The Twilio provider rate limit was reached"},
+    },
     openapi_extra={
         "x-fern-sdk-group-name": "twilio",
         "x-fern-sdk-method-name": "enable_phone_number",
     },
 )
+@twilio_integration_router.post(
+    "/phone-numbers/enable/", response_model=OrganizationPhoneNumberResponse, include_in_schema=False
+)
 async def enable_twilio_phone_number(
     request: EnablePhoneNumberRequest,
     current_org: Annotated[Organization, Depends(org_auth_service.get_current_org_for_credential_routes)],
+    _request_authorization: None = Depends(require_request_actions(frozenset({"vault_provider.update"}))),
 ) -> OrganizationPhoneNumber:
     _require_twilio_sms_enabled()
     _require_sms_base_url()
@@ -422,6 +411,9 @@ async def _enable_twilio_phone_number_locked(
     organization_id: str,
 ) -> OrganizationPhoneNumber:
     if request.credential_id is not None:
+        await app.AGENT_FUNCTION.enforce_credential_folder_access_for_ids(
+            get_request_principal(), "credential.use", {("credential_id", request.credential_id)}
+        )
         bound_credential = await app.DATABASE.credentials.get_credential(
             request.credential_id, organization_id=organization_id
         )
@@ -445,6 +437,14 @@ async def _enable_twilio_phone_number_locked(
             raise HTTPException(status_code=409, detail="Phone number changed during lifecycle operation")
         registered = await _get_registered_phone_number(phone_number, organization_id)
         _require_twilio_provider(registered)
+        if (
+            registered is not None
+            and registered.credential_id is not None
+            and registered.credential_id != request.credential_id
+        ):
+            await app.AGENT_FUNCTION.enforce_credential_folder_access_for_ids(
+                get_request_principal(), "credential.use", {("credential_id", registered.credential_id)}
+            )
         connected_config = await app.DATABASE.sms.get_connected_sms_config(organization_id)
         if connected_config is None:
             connected_config = await app.DATABASE.sms.create_sms_config(
@@ -581,15 +581,28 @@ async def _enable_twilio_phone_number_locked(
 
 @twilio_integration_router.post(
     "/credentials",
+    summary="Connect Twilio credentials",
+    description="Validate and store Twilio credentials for the current organization.",
+    tags=["Credentials"],
+    responses={
+        400: {"description": "The Twilio credentials are invalid"},
+        404: {"description": "Twilio SMS is unavailable or the account was not found"},
+        409: {"description": "Connected phone numbers must be disabled before changing accounts"},
+        422: {"description": "Request validation failed"},
+        502: {"description": "The Twilio provider request failed"},
+        503: {"description": "The Twilio provider rate limit was reached"},
+    },
     response_model=TwilioCredentialResponse,
     openapi_extra={
         "x-fern-sdk-group-name": "twilio",
         "x-fern-sdk-method-name": "create_credentials",
     },
 )
+@twilio_integration_router.post("/credentials/", response_model=TwilioCredentialResponse, include_in_schema=False)
 async def create_twilio_credential(
     request: CreateTwilioCredentialRequest,
     current_org: Annotated[Organization, Depends(org_auth_service.get_current_org_for_credential_routes)],
+    _request_authorization: None = Depends(require_request_actions(frozenset({"vault_provider.update"}))),
 ) -> TwilioCredentialResponse:
     _require_twilio_sms_enabled()
     organization_id = current_org.organization_id
@@ -625,7 +638,7 @@ async def create_twilio_credential(
             organization_id=organization_id,
             token_type=OrganizationAuthTokenType.twilio_credential,
             token=request.credential,
-            encrypted_method=EncryptMethod.AES,
+            encrypted_method=DEFAULT_ENCRYPT_METHOD,
         )
         await record_request_audit_event(
             organization_id,
@@ -639,12 +652,20 @@ async def create_twilio_credential(
 
 @twilio_integration_router.get(
     "/credentials",
+    summary="Get Twilio credentials",
+    description="Get the safe Twilio credential metadata for the current organization.",
+    tags=["Credentials"],
+    responses={
+        404: {"description": "Twilio SMS is unavailable"},
+        422: {"description": "Request validation failed"},
+    },
     response_model=TwilioCredentialResponse,
     openapi_extra={
         "x-fern-sdk-group-name": "twilio",
         "x-fern-sdk-method-name": "get_credentials",
     },
 )
+@twilio_integration_router.get("/credentials/", response_model=TwilioCredentialResponse, include_in_schema=False)
 async def get_twilio_credential(
     current_org: Annotated[Organization, Depends(org_auth_service.get_current_org_for_credential_routes)],
 ) -> TwilioCredentialResponse:
@@ -660,13 +681,23 @@ async def get_twilio_credential(
 
 @twilio_integration_router.delete(
     "/credentials",
+    summary="Disconnect Twilio credentials",
+    description="Remove the stored Twilio credentials after connected phone numbers are disabled.",
+    tags=["Credentials"],
+    responses={
+        404: {"description": "Twilio SMS is unavailable"},
+        409: {"description": "Connected phone numbers must be disabled before disconnecting Twilio"},
+        422: {"description": "Request validation failed"},
+    },
     openapi_extra={
         "x-fern-sdk-group-name": "twilio",
         "x-fern-sdk-method-name": "delete_credentials",
     },
 )
+@twilio_integration_router.delete("/credentials/", include_in_schema=False)
 async def delete_twilio_credential(
     current_org: Annotated[Organization, Depends(org_auth_service.get_current_org_for_credential_routes)],
+    _request_authorization: None = Depends(require_request_actions(frozenset({"credential.delete"}))),
 ) -> dict[str, bool]:
     _require_twilio_sms_enabled()
     organization_id = current_org.organization_id
@@ -692,27 +723,57 @@ async def delete_twilio_credential(
 
 @twilio_integration_router.get(
     "/phone-number-registry",
+    summary="List registered phone numbers",
+    description="List the current organization's phone numbers registered for SMS forwarding.",
+    tags=["Credentials"],
+    responses={
+        404: {"description": "Twilio SMS is unavailable"},
+        422: {"description": "Request validation failed"},
+    },
     response_model=list[OrganizationPhoneNumberResponse],
     openapi_extra={
         "x-fern-sdk-group-name": "twilio",
         "x-fern-sdk-method-name": "list_registered_phone_numbers",
     },
 )
+@twilio_integration_router.get(
+    "/phone-number-registry/", response_model=list[OrganizationPhoneNumberResponse], include_in_schema=False
+)
 async def list_registered_phone_numbers(
     current_org: Annotated[Organization, Depends(org_auth_service.get_current_org_for_credential_routes)],
 ) -> list[OrganizationPhoneNumber]:
     _require_twilio_sms_enabled()
-    return await app.DATABASE.sms.list_phone_numbers(current_org.organization_id)
+    phone_numbers = await app.DATABASE.sms.list_phone_numbers(current_org.organization_id)
+    credential_ids = {phone.credential_id for phone in phone_numbers if phone.credential_id is not None}
+    if credential_ids and await app.AGENT_FUNCTION.credential_folders_restricted(current_org.organization_id):
+        accessible_credential_ids = await app.AGENT_FUNCTION.accessible_credential_ids(
+            get_request_principal(), "credential.read", credential_ids
+        )
+        for phone in phone_numbers:
+            if phone.credential_id not in accessible_credential_ids:
+                phone.credential_id = None
+    return phone_numbers
 
 
 @twilio_integration_router.get(
     "/phone-numbers",
+    summary="List Twilio phone numbers",
+    description="List SMS-capable phone numbers available in the connected Twilio account.",
+    tags=["Credentials"],
+    responses={
+        400: {"description": "The Twilio credentials are invalid"},
+        404: {"description": "Twilio SMS is unavailable or the phone number was not found"},
+        422: {"description": "Request validation failed"},
+        502: {"description": "The Twilio provider request failed"},
+        503: {"description": "The Twilio provider rate limit was reached"},
+    },
     response_model=list[TwilioPhoneNumberInfo],
     openapi_extra={
         "x-fern-sdk-group-name": "twilio",
         "x-fern-sdk-method-name": "list_phone_numbers",
     },
 )
+@twilio_integration_router.get("/phone-numbers/", response_model=list[TwilioPhoneNumberInfo], include_in_schema=False)
 async def list_twilio_phone_numbers(
     current_org: Annotated[Organization, Depends(org_auth_service.get_current_org_for_credential_routes)],
 ) -> list[TwilioPhoneNumberInfo]:
@@ -764,15 +825,29 @@ async def list_twilio_phone_numbers(
 
 @twilio_integration_router.post(
     "/phone-numbers/disable",
+    summary="Disable Twilio phone number",
+    description="Disable SMS forwarding for a phone number registered in the current organization.",
+    tags=["Credentials"],
+    responses={
+        404: {"description": "The phone number was not found"},
+        409: {"description": "The phone number changed during the disable operation"},
+        422: {"description": "Request validation failed"},
+        502: {"description": "The Twilio provider request failed"},
+        503: {"description": "The Twilio provider rate limit was reached"},
+    },
     response_model=OrganizationPhoneNumberResponse,
     openapi_extra={
         "x-fern-sdk-group-name": "twilio",
         "x-fern-sdk-method-name": "disable_phone_number",
     },
 )
+@twilio_integration_router.post(
+    "/phone-numbers/disable/", response_model=OrganizationPhoneNumberResponse, include_in_schema=False
+)
 async def disable_twilio_phone_number(
     request: DisablePhoneNumberRequest,
     current_org: Annotated[Organization, Depends(org_auth_service.get_current_org_for_credential_routes)],
+    _request_authorization: None = Depends(require_request_actions(frozenset({"vault_provider.update"}))),
 ) -> OrganizationPhoneNumber:
     _require_twilio_sms_enabled()
     return await _run_lifecycle(_disable_twilio_phone_number_locked(request, current_org.organization_id))
@@ -791,6 +866,10 @@ async def _disable_twilio_phone_number_locked(
         if registered is None:
             raise HTTPException(status_code=404, detail="Phone number not found")
         _require_twilio_provider(registered)
+        if registered.credential_id is not None:
+            await app.AGENT_FUNCTION.enforce_credential_folder_access_for_ids(
+                get_request_principal(), "credential.use", {("credential_id", registered.credential_id)}
+            )
         was_quarantined = registered.status == "quarantined"
         client: Any | None = None
         if registered.provider_number_sid:
@@ -881,13 +960,27 @@ async def _disable_twilio_phone_number_locked(
             phone_number.phone_number_id,
             changed_fields=("status",),
         )
+        if (
+            phone_number.credential_id is not None
+            and await app.AGENT_FUNCTION.credential_folders_restricted(organization_id)
+            and phone_number.credential_id
+            not in await app.AGENT_FUNCTION.accessible_credential_ids(
+                get_request_principal(), "credential.read", {phone_number.credential_id}
+            )
+        ):
+            phone_number.credential_id = None
         return phone_number
 
 
-@twilio_integration_router.post("/sms-configs", response_model=SMSConfigCreated)
+@twilio_integration_router.post(
+    "/sms-configs",
+    response_model=SMSConfigCreated,
+    include_in_schema=False,
+)
 async def create_sms_config(
     request: CreateSMSConfigRequest,
     current_org: Annotated[Organization, Depends(org_auth_service.get_current_org_for_credential_routes)],
+    _request_authorization: None = Depends(require_request_actions(frozenset({"vault_provider.update"}))),
 ) -> SMSConfigCreated:
     _require_twilio_sms_enabled()
     _require_sms_base_url()
@@ -910,7 +1003,7 @@ async def create_sms_config(
         )
 
 
-@twilio_integration_router.get("/sms-configs", response_model=list[SMSConfig])
+@twilio_integration_router.get("/sms-configs", response_model=list[SMSConfig], include_in_schema=False)
 async def list_sms_configs(
     current_org: Annotated[Organization, Depends(org_auth_service.get_current_org_for_credential_routes)],
 ) -> list[SMSConfig]:
@@ -918,10 +1011,11 @@ async def list_sms_configs(
     return await app.DATABASE.sms.list_sms_configs(current_org.organization_id)
 
 
-@twilio_integration_router.delete("/sms-configs/{sms_config_id}")
+@twilio_integration_router.delete("/sms-configs/{sms_config_id}", include_in_schema=False)
 async def delete_sms_config(
     sms_config_id: str,
     current_org: Annotated[Organization, Depends(org_auth_service.get_current_org_for_credential_routes)],
+    _request_authorization: None = Depends(require_request_actions(frozenset({"vault_provider.update"}))),
 ) -> dict[str, bool]:
     _require_twilio_sms_enabled()
     organization_id = current_org.organization_id
@@ -958,11 +1052,13 @@ async def delete_sms_config(
 @twilio_integration_router.post(
     "/sms-configs/{sms_config_id}/phone-numbers",
     response_model=OrganizationPhoneNumberResponse,
+    include_in_schema=False,
 )
 async def register_manual_phone_number(
     sms_config_id: str,
     request: RegisterManualPhoneNumberRequest,
     current_org: Annotated[Organization, Depends(org_auth_service.get_current_org_for_credential_routes)],
+    _request_authorization: None = Depends(require_request_actions(frozenset({"vault_provider.update"}))),
 ) -> OrganizationPhoneNumber:
     _require_twilio_sms_enabled()
     organization_id = current_org.organization_id

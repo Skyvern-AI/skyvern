@@ -27,6 +27,8 @@ import { useSkyvernCredentialSourceAvailable } from "@/routes/workflows/hooks/us
 import { useFeatureFlag } from "@/hooks/useFeatureFlag";
 import { CREDENTIAL_FALLBACK_RETRY_FLAG } from "@/util/featureFlags";
 import { useEffect, useMemo, useState } from "react";
+import { usePostHog } from "posthog-js/react";
+import { useCurrentOrgId } from "@/hooks/useCurrentOrgId";
 import { useWorkflowHasChangesStore } from "@/store/WorkflowHasChangesStore";
 import { useWorkflowParametersStore } from "@/store/WorkflowParametersStore";
 import { updateWorkflowBrowserSessionReuse } from "@/store/WorkflowSettingsStore";
@@ -225,6 +227,8 @@ function LoginBlockCredentialSelector({
   currentInstructions,
 }: Props) {
   const { openModal } = useCredentialModalState();
+  const postHog = usePostHog();
+  const organizationId = useCurrentOrgId();
   const nodes = useNodes<AppNode>();
   const [rotationDraft, setRotationDraft] = useState(false);
   const [rotationQuery, setRotationQuery] = useState("");
@@ -819,6 +823,12 @@ function LoginBlockCredentialSelector({
       selection.type === "extra"
         ? parseOnePasswordOptionValue(selection.option.value)
         : undefined;
+    if (selectedOnePasswordItemIds && organizationId) {
+      postHog.capture("onepassword.item_picked", {
+        organization_id: organizationId,
+        $groups: { organization: organizationId },
+      });
+    }
     let parameterKeyToUse = newValue;
 
     if (selectedOnePasswordItemIds) {

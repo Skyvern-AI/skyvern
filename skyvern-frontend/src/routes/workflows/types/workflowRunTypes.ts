@@ -90,6 +90,8 @@ export type WorkflowRunTimelineBlockItem = {
   attempt?: number;
   type: "block";
   block: WorkflowRunBlock;
+  // Set on the first row that replaced a task_v2 block: the replaced blocks' own rows, innermost first.
+  task_v2_blocks?: Array<WorkflowRunBlock> | null;
   children: Array<WorkflowRunTimelineItem>;
   thought: null;
   created_at: string;

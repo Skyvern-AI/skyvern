@@ -100,7 +100,7 @@ from skyvern.schemas.run_blocks import CredentialType
 from skyvern.utils.url_validators import validate_fetch_url
 from skyvern.webeye.actions.handler_utils import strategy_aware_input
 from skyvern.webeye.actions.key_names import normalize_key_chord
-from skyvern.webeye.browser_health import BrowserOperation
+from skyvern.webeye.browser_health import BrowserOperation, frame_kind_of
 from skyvern.webeye.navigation import reported_nav_error_code
 from skyvern.webeye.utils.page import SkyvernFrame
 
@@ -1719,6 +1719,11 @@ async def skyvern_screenshot(
         session_id=ctx.session_id,
     )
 
+    viewport = (
+        {"viewport": {"width": result.viewport_css_px[0], "height": result.viewport_css_px[1]}}
+        if result.viewport_css_px
+        else {}
+    )
     if inline:
         data_b64 = base64.b64encode(result.data).decode("utf-8")
         return action_result(
@@ -1731,6 +1736,7 @@ async def skyvern_screenshot(
                 "mime": "image/png",
                 "bytes": len(result.data),
                 "sdk_equivalent": "await page.screenshot()",
+                **viewport,
             },
             artifacts=[artifact],
             timing_ms=timer.timing_ms,
@@ -1740,7 +1746,7 @@ async def skyvern_screenshot(
     return action_result(
         "skyvern_screenshot",
         browser_context=ctx,
-        data={"path": artifact.path, "sdk_equivalent": "await page.screenshot(path='screenshot.png')"},
+        data={"path": artifact.path, "sdk_equivalent": "await page.screenshot(path='screenshot.png')", **viewport},
         artifacts=[artifact],
         timing_ms=timer.timing_ms,
     )
@@ -2741,10 +2747,12 @@ async def skyvern_evaluate(
 
     deadline = asyncio.get_running_loop().time() + DEFAULT_ACTION_TIMEOUT_MS / 1000
 
+    scope = None
     with Timer() as timer:
         try:
+            scope = page.locator_scope
             result = await SkyvernFrame._evaluate_expression(
-                frame=page.locator_scope,
+                frame=scope,
                 # Logged verbatim on timeout, and a caller's expression can carry data no log
                 # processor knows to redact; the evaluation itself runs the real expression below.
                 expression="skyvern_evaluate caller expression",
@@ -2758,7 +2766,7 @@ async def skyvern_evaluate(
                 raise asyncio.CancelledError from e
             original = unwrap_caller_js_error(e)
             if deadline_ended_the_call(original, deadline):
-                record_unreported_timeout(original)
+                record_unreported_timeout(original, scope)
                 return action_result(
                     "skyvern_evaluate",
                     ok=False,
@@ -3796,7 +3804,7 @@ async def skyvern_clipboard_read(
                 # Dispatching now would start a call the expired deadline cancels mid-flight,
                 # leaving its effect unknown; nothing has been sent yet, so report that instead.
                 # The engine never ran, so nothing else will tally the browser that stopped answering.
-                record_browser_timeout()
+                record_browser_timeout(frame_kind=frame_kind_of(page.page))
                 raise SkyvernPageAnalysisTimeout("The clipboard permission grant used the whole action deadline")
             read_js = "() => navigator.clipboard.readText()"
             text = await SkyvernFrame._evaluate_expression(
@@ -3812,7 +3820,7 @@ async def skyvern_clipboard_read(
             if cancellation_pending():
                 raise asyncio.CancelledError from e
             if deadline_ended_the_call(e, deadline):
-                record_unreported_timeout(e)
+                record_unreported_timeout(e, page.page)
                 return action_result(
                     "skyvern_clipboard_read",
                     ok=False,
@@ -3871,7 +3879,7 @@ async def skyvern_clipboard_write(
                 # Dispatching now would start a write the expired deadline cancels mid-flight,
                 # leaving the clipboard in an unknown state; nothing has been sent yet.
                 # The engine never ran, so nothing else will tally the browser that stopped answering.
-                record_browser_timeout()
+                record_browser_timeout(frame_kind=frame_kind_of(page.page))
                 raise SkyvernPageAnalysisTimeout("The clipboard permission grant used the whole action deadline")
             write_js = "(t) => navigator.clipboard.writeText(t)"
             await SkyvernFrame._evaluate_expression(
@@ -3887,7 +3895,7 @@ async def skyvern_clipboard_write(
             if cancellation_pending():
                 raise asyncio.CancelledError from e
             if deadline_ended_the_call(e, deadline):
-                record_unreported_timeout(e)
+                record_unreported_timeout(e, page.page)
                 return action_result(
                     "skyvern_clipboard_write",
                     ok=False,

@@ -6,6 +6,7 @@ import { getJsonParseErrorDetail } from "@/util/jsonParseError";
 import { apiWorkflowToSettings } from "./apiWorkflowToSettings";
 import type {
   WorkflowApiResponse,
+  WorkflowBlock,
   WorkflowSettings,
 } from "../types/workflowTypes";
 import type {
@@ -43,11 +44,59 @@ function parseHeaders(
   );
 }
 
+function savedDocFieldsByLabel(
+  blocks: WorkflowBlock[],
+): Map<
+  string,
+  Pick<WorkflowBlock, "notes" | "trailing_notes" | "description">
+> {
+  const saved = new Map<
+    string,
+    Pick<WorkflowBlock, "notes" | "trailing_notes" | "description">
+  >();
+  for (const block of blocks) {
+    saved.set(block.label, block);
+    if ("loop_blocks" in block && Array.isArray(block.loop_blocks)) {
+      for (const [label, docFields] of savedDocFieldsByLabel(
+        block.loop_blocks,
+      )) {
+        saved.set(label, docFields);
+      }
+    }
+  }
+  return saved;
+}
+
+// Omitted fields keep the saved value; send null only when this draft cleared a loaded annotation.
+function withClearedDocFields(
+  blocks: BlockYAML[],
+  saved: Map<
+    string,
+    Pick<WorkflowBlock, "notes" | "trailing_notes" | "description">
+  >,
+): BlockYAML[] {
+  return blocks.map((block) => {
+    const previous = saved.get(block.label);
+    return {
+      ...block,
+      ...(block.notes == null && previous?.notes != null && { notes: null }),
+      ...(block.trailing_notes == null &&
+        previous?.trailing_notes != null && { trailing_notes: null }),
+      ...(block.description == null &&
+        previous?.description != null && { description: null }),
+      ...("loop_blocks" in block && Array.isArray(block.loop_blocks)
+        ? { loop_blocks: withClearedDocFields(block.loop_blocks, saved) }
+        : {}),
+    };
+  });
+}
+
 export function buildWorkflowSaveRequest(
   saveData: Omit<WorkflowSaveData, "workflow"> & {
-    workflow: Pick<WorkflowApiResponse, "is_saved_task" | "status">;
+    workflow: Pick<WorkflowApiResponse, "is_saved_task" | "status"> &
+      Partial<Pick<WorkflowApiResponse, "workflow_definition">>;
   },
-  opts?: { status?: string },
+  opts?: { status?: string; explicitDocFields?: boolean },
 ): WorkflowCreateYAMLRequest {
   const extraHttpHeaders =
     parseHeaders(saveData.settings.extraHttpHeaders, "extra_http_headers") ??
@@ -87,7 +136,14 @@ export function buildWorkflowSaveRequest(
     workflow_definition: {
       version: saveData.workflowDefinitionVersion,
       parameters: saveData.parameters,
-      blocks: saveData.blocks,
+      blocks: opts?.explicitDocFields
+        ? withClearedDocFields(
+            saveData.blocks,
+            savedDocFieldsByLabel(
+              saveData.workflow.workflow_definition?.blocks ?? [],
+            ),
+          )
+        : saveData.blocks,
       finally_block_label: saveData.settings.finallyBlockLabel ?? null,
       workflow_system_prompt: saveData.settings.workflowSystemPrompt ?? null,
       error_code_mapping: saveData.settings.errorCodeMapping ?? null,
@@ -100,19 +156,25 @@ export function buildWorkflowSaveRequest(
   };
 }
 
-export function buildWorkflowYamlDocument(input: {
-  workflow: WorkflowApiResponse;
-  settings: WorkflowSettings;
-  title: string;
-  description: string | null;
-  parameters: ParameterYAML[];
-  blocks: BlockYAML[];
-  definitionVersion: number;
-}): WorkflowCreateYAMLRequest {
-  const document = buildWorkflowSaveRequest({
-    ...input,
-    workflowDefinitionVersion: input.definitionVersion,
-  });
+export function buildWorkflowYamlDocument(
+  input: {
+    workflow: WorkflowApiResponse;
+    settings: WorkflowSettings;
+    title: string;
+    description: string | null;
+    parameters: ParameterYAML[];
+    blocks: BlockYAML[];
+    definitionVersion: number;
+  },
+  opts?: { explicitDocFields?: boolean },
+): WorkflowCreateYAMLRequest {
+  const document = buildWorkflowSaveRequest(
+    {
+      ...input,
+      workflowDefinitionVersion: input.definitionVersion,
+    },
+    { explicitDocFields: opts?.explicitDocFields },
+  );
   delete document.is_saved_task;
   delete document.status;
   return {
@@ -225,14 +287,17 @@ export function buildWorkflowCopilotContext(
       return null;
     }
   };
-  const snapshot = buildWorkflowYamlDocument({
-    ...input,
-    settings: {
-      ...input.settings,
-      extraHttpHeaders: safeHeaders(input.settings.extraHttpHeaders),
-      cdpConnectHeaders: safeHeaders(input.settings.cdpConnectHeaders),
+  const snapshot = buildWorkflowYamlDocument(
+    {
+      ...input,
+      settings: {
+        ...input.settings,
+        extraHttpHeaders: safeHeaders(input.settings.extraHttpHeaders),
+        cdpConnectHeaders: safeHeaders(input.settings.cdpConnectHeaders),
+      },
     },
-  });
+    { explicitDocFields: true },
+  );
   const document = { ...snapshot };
   for (const field of withheldCopilotSettings) delete document[field];
   const proxy = document.proxy_location;

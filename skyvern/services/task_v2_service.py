@@ -3,9 +3,14 @@ import asyncio
 import copy
 import json
 import string
+import sys
 import textwrap
+from collections.abc import Awaitable, Callable
+from contextlib import nullcontext
+from contextvars import ContextVar
+from dataclasses import dataclass
 from datetime import UTC, datetime
-from typing import Any
+from typing import Any, TypedDict
 
 import structlog
 from opentelemetry import trace as otel_trace
@@ -13,16 +18,26 @@ from sqlalchemy.exc import OperationalError
 
 from skyvern.config import settings
 from skyvern.constants import MINI_GOAL_TEMPLATE
+from skyvern.errors.errors import UserDefinedError, filter_to_user_defined_codes
 from skyvern.exceptions import (
+    BROWSER_CONNECTION_LOST_ERROR_CODE,
     BrowserSessionNotFound,
     FailedToSendWebhook,
+    MissingBrowserState,
     ScreenshotTargetClosed,
     TaskTerminationError,
     TaskV2NotFound,
     UrlGenerationFailure,
+    get_user_facing_exception_message,
 )
 from skyvern.forge import app
-from skyvern.forge.failure_classifier import classify_from_failure_reason
+from skyvern.forge.antibot_evidence import run_prompt_evidence_str
+from skyvern.forge.failure_classifier import (
+    HAR_ANTI_BOT_DIAGNOSTIC_REASON_CODE,
+    bounded_failure_categories,
+    classify_from_failure_reason,
+    with_root_user_errors,
+)
 from skyvern.forge.prompts import prompt_engine
 from skyvern.forge.sdk.api.llm.api_handler_factory import (
     LLMAPIHandlerFactory,
@@ -33,12 +48,20 @@ from skyvern.forge.sdk.api.llm.custom_llm_registry import (
     ensure_custom_llm_model_registered_for_org,
 )
 from skyvern.forge.sdk.api.llm.exceptions import EmptyLLMResponseError, InvalidLLMResponseFormat
+from skyvern.forge.sdk.api.llm.utils import llm_response_log_metadata
 from skyvern.forge.sdk.artifact.models import ArtifactType
 from skyvern.forge.sdk.core import skyvern_context
 from skyvern.forge.sdk.core.hashing import generate_url_hash
 from skyvern.forge.sdk.core.security import generate_skyvern_webhook_signature
 from skyvern.forge.sdk.core.skyvern_context import SkyvernContext
-from skyvern.forge.sdk.db.enums import OrganizationAuthTokenType, WorkflowRunTriggerType
+from skyvern.forge.sdk.db.enums import OrganizationAuthTokenType, WorkflowBuildSource, WorkflowRunTriggerType
+from skyvern.forge.sdk.executor.run_liveness import (
+    acquire_run_lease,
+    run_lease_final_write_blocked,
+    run_lease_lost,
+    run_lease_tasks_enabled,
+    track_run,
+)
 from skyvern.forge.sdk.schemas.organizations import Organization
 from skyvern.forge.sdk.schemas.persistent_browser_sessions import unusable_browser_session_error
 from skyvern.forge.sdk.schemas.task_v2 import (
@@ -51,7 +74,9 @@ from skyvern.forge.sdk.schemas.task_v2 import (
     ThoughtType,
 )
 from skyvern.forge.sdk.schemas.workflow_runs import WorkflowRunTimeline, WorkflowRunTimelineType
+from skyvern.forge.sdk.services.request_principal import RequestPrincipal
 from skyvern.forge.sdk.trace import traced
+from skyvern.forge.sdk.workflow.context_manager import WorkflowRunContext
 from skyvern.forge.sdk.workflow.exceptions import InsecureCodeDetected
 from skyvern.forge.sdk.workflow.models.block import (
     BlockTypeVar,
@@ -69,6 +94,10 @@ from skyvern.forge.sdk.workflow.models.workflow import (
     WorkflowRun,
     WorkflowRunStatus,
     workflow_definition_sha256,
+)
+from skyvern.forge.sdk.workflow.response_value_caps import (
+    truncate_oversized_response_text,
+    truncate_oversized_response_value,
 )
 from skyvern.schemas.proxy_location import runtime_proxy_location
 from skyvern.schemas.runs import (
@@ -108,11 +137,37 @@ from skyvern.utils.prompt_engine import load_prompt_with_elements
 from skyvern.utils.strings import generate_random_string
 from skyvern.utils.url_validators import validate_fetch_url
 from skyvern.webeye.actions.actions import ActionType
-from skyvern.webeye.browser_state import BrowserState
+from skyvern.webeye.browser_state import BrowserState, get_browser_connection_loss
 from skyvern.webeye.scraper.scraped_page import ScrapedPage
 from skyvern.webeye.utils.page import SkyvernFrame, build_open_tabs_context, capture_open_tab_screenshots
 
 LOG = structlog.get_logger()
+
+
+@dataclass
+class _TerminalHold:
+    # The deferred send's success marker; None while nothing was deferred.
+    success_marker: str | None = None
+    # The snapshot this run's own conditional terminal write returned, which owns its final diagnostic.
+    workflow_run: WorkflowRun | None = None
+
+
+# Task v2 ids whose terminal webhook run_task_v2 sends itself after cleanup. Only run_task_v2 sets it; every other
+# sender delivers immediately.
+_deferred_task_v2_webhooks: ContextVar[dict[str, _TerminalHold] | None] = ContextVar(
+    "deferred_task_v2_webhooks", default=None
+)
+
+
+def _hold_terminal_write(task_v2_id: str, workflow_run_id: str) -> Callable[[WorkflowRun], None]:
+    def hold(written: WorkflowRun) -> None:
+        deferred = _deferred_task_v2_webhooks.get()
+        if deferred is not None and task_v2_id in deferred and written.workflow_run_id == workflow_run_id:
+            deferred[task_v2_id].workflow_run = written
+
+    return hold
+
+
 DEFAULT_WORKFLOW_TITLE = "New Workflow"
 RANDOM_STRING_POOL = string.ascii_letters + string.digits
 # Maximum number of planning iterations for TaskV2
@@ -174,19 +229,19 @@ def _generate_data_extraction_schema_for_loop(loop_values_key: str) -> dict:
 
 async def _summarize_max_steps_failure_reason(
     task_v2: TaskV2, organization_id: str, browser_state: BrowserState | None
-) -> tuple[str, list[dict] | None]:
+) -> tuple[str, list[dict] | None, list[UserDefinedError]]:
     """
-    Summarize the failure reason for the task v2.
+    Summarize the failure reason for the task v2, and the root's own error codes that match it.
     """
     try:
         assert task_v2.workflow_run_id is not None
 
         if browser_state is None:
-            return "Failed to start browser", None
+            return "Failed to start browser", None, []
 
         page = await browser_state.get_working_page()
         if page is None:
-            return "Failed to get the current browser page", None
+            return "Failed to get the current browser page", None, []
 
         screenshots = await SkyvernFrame.take_split_screenshots(
             page=page,
@@ -218,6 +273,13 @@ async def _summarize_max_steps_failure_reason(
             block_cnt=len(run_blocks),
             navigation_goal=task_v2.prompt,
             history=history,
+            # The root's own codes only; the blocks it generated never receive them.
+            error_code_mapping_str=json.dumps(task_v2.error_code_mapping) if task_v2.error_code_mapping else None,
+            antibot_evidence_str=(
+                run_prompt_evidence_str(task_v2.workflow_run_id, task_v2.started_at or task_v2.created_at)
+                if task_v2.error_code_mapping
+                else None
+            ),
             local_datetime=datetime.now(context.tz_info).isoformat(),
         )
 
@@ -228,10 +290,44 @@ async def _summarize_max_steps_failure_reason(
             thought=thought,
             system_prompt=task_v2.workflow_system_prompt,
         )
-        return json_response.get("reasoning", ""), json_response.get("failure_categories")
+        return (
+            json_response.get("reasoning", ""),
+            bounded_failure_categories(json_response.get("failure_categories")),
+            _root_user_errors(task_v2, json_response.get("errors")),
+        )
     except Exception:
         LOG.warning("Failed to summarize the failure reason for task v2", exc_info=True)
-        return "", None
+        return "", None, []
+
+
+def _root_user_errors(task_v2: TaskV2, raw: object) -> list[UserDefinedError]:
+    if not task_v2.error_code_mapping or not isinstance(raw, list):
+        return []
+    parsed: list[UserDefinedError] = []
+    for error in raw:
+        try:
+            parsed.append(UserDefinedError.model_validate(error))
+        except Exception:
+            LOG.warning("Dropped a malformed root user-defined error", task_v2_id=task_v2.observer_cruise_id)
+    kept, dropped = filter_to_user_defined_codes(parsed, task_v2.error_code_mapping)
+    if dropped:
+        LOG.warning(
+            "Dropped LLM-returned error codes not in the root's error_code_mapping",
+            task_v2_id=task_v2.observer_cruise_id,
+            dropped_count=len(dropped),
+        )
+    # Masked with the run's registered secrets, as the errors[] aggregation masks them, before the rows are
+    # stored: the finalized webhook and API read them after the run's context is gone.
+    run_id = task_v2.workflow_run_id
+    run_context = app.WORKFLOW_CONTEXT_MANAGER.workflow_run_contexts.get(run_id) if run_id else None
+    if not isinstance(run_context, WorkflowRunContext):
+        return kept
+    return [
+        UserDefinedError.model_validate(
+            {**error.model_dump(), "reasoning": run_context.mask_secrets_in_reasoning(error.reasoning)}
+        )
+        for error in kept
+    ]
 
 
 async def _handle_task_v2_termination(
@@ -359,7 +455,9 @@ async def initialize_task_v2(
         )
         if not browser_session:
             raise BrowserSessionNotFound(browser_session_id=browser_session_id)
-        unusable = unusable_browser_session_error(browser_session, refused_at_submission=True)
+        unusable = unusable_browser_session_error(
+            browser_session, refused_at_submission=True, submission_path="task_v2"
+        )
         if unusable is not None:
             raise unusable
 
@@ -496,7 +594,7 @@ async def initialize_task_v2_metadata(
     )
 
     # validate
-    LOG.info(f"Initialized task v2 initial response: {metadata_response}")
+    LOG.info("Initialized task v2 initial response", **llm_response_log_metadata(metadata_response))
     url: str = user_url or metadata_response.get("url", "")
     if not url:
         raise UrlGenerationFailure()
@@ -626,7 +724,16 @@ async def run_task_v2(
     # SKY-7005: scoped() restores the parent context on exit, preserving
     # loop_internal_state so per-iteration download filtering continues to
     # work for subsequent blocks in the same loop iteration.
-    with skyvern_context.scoped(context, propagate_captcha_timeout=True):
+    with (
+        skyvern_context.scoped(context, propagate_captcha_timeout=True),
+        track_run(task_v2.workflow_run_id, "workflow_run") if task_v2.workflow_run_id else nullcontext(),
+    ):
+        if task_v2.workflow_run_id:
+            if not await acquire_run_lease(task_v2.workflow_run_id) or await run_lease_lost(task_v2.workflow_run_id):
+                return task_v2
+        # Cleanup closes the HAR and records the final diagnostic, so the terminal webhook waits for it.
+        deferred = {task_v2_id: _TerminalHold()}
+        deferral = _deferred_task_v2_webhooks.set(deferred)
         try:
             workflow, workflow_run, task_v2 = await run_task_v2_helper(
                 organization=organization,
@@ -644,7 +751,6 @@ async def run_task_v2(
                 failure_reason=e.message,
             )
             LOG.info("Task v2 is terminated", task_v2_id=task_v2_id, failure_reason=e.message)
-            return task_v2
         except OperationalError:
             LOG.error("Database error when running task v2", exc_info=True)
             task_v2 = await mark_task_v2_as_failed(
@@ -663,23 +769,73 @@ async def run_task_v2(
                 organization_id=organization_id,
             )
         finally:
-            if task_v2.workflow_id and not workflow:
-                workflow = await app.WORKFLOW_SERVICE.get_workflow(task_v2.workflow_id, organization_id=organization_id)
-            if task_v2.workflow_run_id and not workflow_run:
-                workflow_run = await app.WORKFLOW_SERVICE.get_workflow_run(
-                    task_v2.workflow_run_id, organization_id=organization_id
-                )
-            if workflow and workflow_run and workflow_run.parent_workflow_run_id is None:
-                await app.WORKFLOW_SERVICE.clean_up_workflow(
-                    workflow=workflow,
-                    workflow_run=workflow_run,
-                    browser_session_id=browser_session_id,
-                    close_browser_on_completion=browser_session_id is None and not workflow_run.browser_address,
-                    need_call_webhook=False,
-                )
-            else:
-                LOG.warning("Workflow or workflow run not found")
+            try:
+                if task_v2.workflow_id and not workflow:
+                    workflow = await app.WORKFLOW_SERVICE.get_workflow(
+                        task_v2.workflow_id, organization_id=organization_id
+                    )
+                if task_v2.workflow_run_id and not workflow_run:
+                    workflow_run = await app.WORKFLOW_SERVICE.get_workflow_run(
+                        task_v2.workflow_run_id, organization_id=organization_id
+                    )
+                if workflow and workflow_run and workflow_run.parent_workflow_run_id is None:
+                    await app.WORKFLOW_SERVICE.clean_up_workflow(
+                        workflow=workflow,
+                        workflow_run=workflow_run,
+                        browser_session_id=browser_session_id,
+                        close_browser_on_completion=browser_session_id is None and not workflow_run.browser_address,
+                        need_call_webhook=False,
+                        final_diagnostic_owner=deferred[task_v2_id].workflow_run,
+                    )
+                else:
+                    LOG.warning("Workflow or workflow run not found")
+            finally:
+                _deferred_task_v2_webhooks.reset(deferral)
+                mirror_cancelled = False
+                try:
+                    task_v2 = await _mirror_final_diagnostic(task_v2, deferred[task_v2_id].workflow_run)
+                except asyncio.CancelledError:
+                    mirror_cancelled = True
+                if (marker := deferred[task_v2_id].success_marker) is not None:
+                    await send_task_v2_webhook(task_v2, success_marker=marker)
+                # A cancelled mirror never hides a cleanup failure already on its way out.
+                if mirror_cancelled and sys.exc_info()[0] is None:
+                    raise asyncio.CancelledError
 
+    return task_v2
+
+
+async def _mirror_final_diagnostic(task_v2: TaskV2, owner: WorkflowRun | None) -> TaskV2:
+    """``task_v2`` reloaded with the workflow run's final diagnostic mirrored onto it, for its API and webhook alike.
+    Only the execution ``owner`` wrote is mirrored; the reload happens either way."""
+    try:
+        if (
+            owner is not None
+            and owner.finished_at is not None
+            and task_v2.workflow_run_id == owner.workflow_run_id
+            and task_v2.organization_id
+        ):
+            run = await app.DATABASE.workflow_runs.get_workflow_run(
+                task_v2.workflow_run_id, organization_id=task_v2.organization_id
+            )
+            entry = next(
+                (
+                    c
+                    for c in ((run.failure_category or []) if run else [])
+                    if isinstance(c, dict) and c.get("reason_code") == HAR_ANTI_BOT_DIAGNOSTIC_REASON_CODE
+                ),
+                None,
+            )
+            if entry is not None and run is not None and run.finished_at == owner.finished_at:
+                await app.DATABASE.observer.set_final_failure_diagnostic(
+                    task_v2.observer_cruise_id, task_v2.organization_id, owner.workflow_run_id, entry, owner.finished_at
+                )
+        task_v2 = (
+            await app.DATABASE.observer.get_task_v2(task_v2.observer_cruise_id, organization_id=task_v2.organization_id)
+            or task_v2
+        )
+    except Exception:
+        LOG.warning("Failed to mirror the final diagnostic onto the task v2", exc_info=True)
     return task_v2
 
 
@@ -724,6 +880,32 @@ def _should_run_post_block_completion_check(
     if skip_completion_check_after_navigate and task_type == "navigate" and navigate_completion_check_enabled:
         return False
     return True
+
+
+async def settle_child_of_ended_parent(
+    task_v2: TaskV2, parent_workflow_run_id: str | None, organization_id: str
+) -> TaskV2 | None:
+    """The child's own rows, settled as canceled, when its parent run ended or lost its lease before the child
+    started; None when the child may proceed."""
+    if not parent_workflow_run_id:
+        return None
+    parent = await app.DATABASE.workflow_runs.get_workflow_run(parent_workflow_run_id, organization_id=organization_id)
+    if parent is not None and not parent.status.is_final() and not await run_lease_lost(parent_workflow_run_id):
+        return None
+    if task_v2.workflow_run_id:
+        # The workflow service runs the terminal bookkeeping (runs list, duration, terminal hooks) a direct write skips.
+        await app.WORKFLOW_SERVICE.mark_workflow_run_as_canceled_if_not_final(
+            task_v2.workflow_run_id, failure_reason="The parent run ended before this task v2 started"
+        )
+    # Only the writer that ends the task sends its callback.
+    won = await app.DATABASE.observer.update_task_v2_status_if_not_final(
+        task_v2_id=task_v2.observer_cruise_id, organization_id=organization_id, status=TaskV2Status.canceled
+    )
+    settled = await app.DATABASE.observer.get_task_v2(task_v2.observer_cruise_id, organization_id=organization_id)
+    settled = settled or task_v2
+    if won:
+        await send_task_v2_webhook(settled)
+    return settled
 
 
 async def run_task_v2_helper(
@@ -825,15 +1007,37 @@ async def run_task_v2_helper(
     context.browser_session_id = browser_session_id
     context.max_screenshot_scrolls = task_v2.max_screenshot_scrolls
 
+    if await run_lease_lost(workflow_run_id):
+        current = await app.DATABASE.observer.get_task_v2(task_v2_id, organization_id=organization_id)
+        return None, None, current or task_v2
+    # The lease check above can be stale by the time these writes land: another server may have finished the run.
     task_v2 = await app.DATABASE.observer.update_task_v2(
-        task_v2_id=task_v2_id, organization_id=organization_id, status=TaskV2Status.running
+        task_v2_id=task_v2_id, organization_id=organization_id, status=TaskV2Status.running, keep_final_status=True
     )
+    if task_v2.status.is_final():
+        return None, None, task_v2
     workflow = await app.WORKFLOW_SERVICE.get_workflow(workflow_id=workflow_run.workflow_id)
-    await app.WORKFLOW_SERVICE.mark_workflow_run_as_running(
+    workflow_run = await app.WORKFLOW_SERVICE.mark_workflow_run_as_running(
         workflow_run_id=workflow_run.workflow_run_id,
         workflow_definition_sha256=workflow_definition_sha256(workflow.workflow_definition),
     )
+    if workflow_run.status.is_final():
+        # Only the writer that ends the task sends its callback; a task finalizer that won first already sent one.
+        won = await app.DATABASE.observer.update_task_v2_status_if_not_final(
+            task_v2_id=task_v2_id,
+            organization_id=organization_id,
+            status=TaskV2Status(workflow_run.status.value),
+        )
+        task_v2 = await app.DATABASE.observer.get_task_v2(task_v2_id, organization_id=organization_id) or task_v2
+        if won:
+            await send_task_v2_webhook(task_v2)
+        return None, None, task_v2
     await _set_up_workflow_context(workflow, workflow_run_id, organization)
+    # The startup awaits above give the parent time to end; the child must not reach a browser after that.
+    settled = await settle_child_of_ended_parent(task_v2, workflow_run.parent_workflow_run_id, organization_id)
+    if settled is not None:
+        app.WORKFLOW_CONTEXT_MANAGER.remove_workflow_run_context(workflow_run_id)
+        return None, None, settled
 
     user_prompt = task_v2.prompt
     task_history: list[dict] = []
@@ -853,6 +1057,11 @@ async def run_task_v2_helper(
         )
         context.browser_session_runnable_id = root_workflow_run_id
         context.browser_session_runnable_generation_id = lease_generation_id
+        # The session belongs to the root run, so a refusal here leaves it as it is.
+        settled = await settle_child_of_ended_parent(task_v2, workflow_run.parent_workflow_run_id, organization_id)
+        if settled is not None:
+            app.WORKFLOW_CONTEXT_MANAGER.remove_workflow_run_context(workflow_run_id)
+            return None, None, settled
 
     browser_state = await app.BROWSER_MANAGER.get_or_create_for_workflow_run(
         workflow_run=workflow_run,
@@ -965,9 +1174,12 @@ async def run_task_v2_helper(
                 # Page failed to load properly, fallback to Google
                 if page:
                     try:
+                        browser_state.begin_navigation()
                         await page.goto(fallback_url, timeout=settings.BROWSER_LOADING_TIMEOUT_MS)
+                        await browser_state.record_navigation_result(None, url=fallback_url)
                         should_fallback = True
-                    except Exception:
+                    except Exception as navigation_error:
+                        await browser_state.record_navigation_result(navigation_error)
                         LOG.exception("Failed to load Google fallback", exc_info=True, url=url, current_url=current_url)
 
         skip_completion_check_after_navigate_enabled = await planner_levers.skip_completion_check_after_navigate(
@@ -1057,7 +1269,7 @@ async def run_task_v2_helper(
             )
             LOG.info(
                 "Task v2 response",
-                task_v2_response=task_v2_response,
+                **llm_response_log_metadata(task_v2_response),
                 iteration=i,
                 current_url=current_url,
                 workflow_run_id=workflow_run_id,
@@ -1066,7 +1278,7 @@ async def run_task_v2_helper(
             user_goal_achieved = task_v2_response.get("user_goal_achieved", False)
             should_terminate = task_v2_response.get("should_terminate", False)
             termination_reason = task_v2_response.get("termination_reason")
-            failure_categories = task_v2_response.get("failure_categories")
+            failure_categories = bounded_failure_categories(task_v2_response.get("failure_categories"))
             observation = task_v2_response.get("page_info", "")
             thoughts: str = task_v2_response.get("thoughts", "")
             plan = task_v2_response.get("plan", "")
@@ -1100,6 +1312,10 @@ async def run_task_v2_helper(
                     iteration=i,
                     workflow_run_id=workflow_run_id,
                 )
+                lost_task_v2 = await _fail_task_v2_after_browser_loss(task_v2_id, workflow_run_id, organization_id)
+                if lost_task_v2 is not None:
+                    task_v2 = lost_task_v2
+                    break
                 await _persist_completion_tab_screenshots(browser_state=browser_state, thought=thought)
                 task_v2 = await _summarize_task_v2(
                     task_v2=task_v2,
@@ -1107,7 +1323,7 @@ async def run_task_v2_helper(
                     context=context,
                     screenshots=scraped_page.screenshots,
                 )
-                if task_v2.run_with == "code":
+                if task_v2.run_with == "code" and task_v2.status == TaskV2Status.completed:
                     await app.WORKFLOW_SERVICE.generate_script_if_needed(
                         workflow=workflow,
                         workflow_run=workflow_run,
@@ -1128,12 +1344,12 @@ async def run_task_v2_helper(
                 return workflow, workflow_run, task_v2
 
             if not plan:
-                LOG.warning("No plan found in task v2 response", task_v2_response=task_v2_response)
+                LOG.warning("No plan found in task v2 response", **llm_response_log_metadata(task_v2_response))
                 continue
 
             # parse task v2 response and run the next task
             if not task_type:
-                LOG.error("No task type found in task v2 response", task_v2_response=task_v2_response)
+                LOG.error("No task type found in task v2 response", **llm_response_log_metadata(task_v2_response))
                 task_v2 = await mark_task_v2_as_failed(
                     task_v2_id=task_v2_id,
                     workflow_run_id=workflow_run_id,
@@ -1259,6 +1475,7 @@ async def run_task_v2_helper(
             request=workflow_create_request,
             workflow_permanent_id=workflow.workflow_permanent_id,
             delete_script=False,
+            build_source=WorkflowBuildSource.internal,
         )
         LOG.info("Workflow created", workflow_id=workflow.workflow_id)
 
@@ -1358,6 +1575,12 @@ async def run_task_v2_helper(
                     )
                 except Exception:
                     LOG.warning("Failed to build open-tabs context for completion check", exc_info=True)
+            lost_task_v2 = await _fail_task_v2_after_browser_loss(
+                task_v2_id, workflow_run_id, organization_id, completed_block=(block, block_result)
+            )
+            if lost_task_v2 is not None:
+                task_v2 = lost_task_v2
+                break
 
             task_v2_completion_prompt = prompt_engine.load_prompt(
                 "task_v2_check_completion",
@@ -1384,15 +1607,15 @@ async def run_task_v2_helper(
             )
             LOG.info(
                 "Task v2 completion check response",
-                completion_resp=completion_resp,
+                **llm_response_log_metadata(completion_resp),
                 iteration=i,
                 workflow_run_id=workflow_run_id,
-                task_history=task_history,
+                task_history_count=len(task_history),
             )
             user_goal_achieved = completion_resp.get("user_goal_achieved", False)
             should_terminate = completion_resp.get("should_terminate", False)
             termination_reason = completion_resp.get("termination_reason")
-            completion_failure_categories = completion_resp.get("failure_categories")
+            completion_failure_categories = bounded_failure_categories(completion_resp.get("failure_categories"))
             thought_content = completion_resp.get("thoughts", "")
             await app.DATABASE.observer.update_thought(
                 thought_id=thought.observer_thought_id,
@@ -1409,16 +1632,23 @@ async def run_task_v2_helper(
                     "User goal achieved according to the task v2 completion check",
                     iteration=i,
                     workflow_run_id=workflow_run_id,
-                    completion_resp=completion_resp,
+                    **llm_response_log_metadata(completion_resp),
                 )
+                lost_task_v2 = await _fail_task_v2_after_browser_loss(
+                    task_v2_id, workflow_run_id, organization_id, completed_block=(block, block_result)
+                )
+                if lost_task_v2 is not None:
+                    task_v2 = lost_task_v2
+                    break
                 await _persist_completion_tab_screenshots(browser_state=browser_state, thought=thought)
                 task_v2 = await _summarize_task_v2(
                     task_v2=task_v2,
                     task_history=task_history,
                     context=context,
                     screenshots=completion_screenshots,
+                    completed_block=(block, block_result),
                 )
-                if task_v2.run_with == "code":
+                if task_v2.run_with == "code" and task_v2.status == TaskV2Status.completed:
                     await app.WORKFLOW_SERVICE.generate_script_if_needed(
                         workflow=workflow,
                         workflow_run=workflow_run,
@@ -1448,7 +1678,7 @@ async def run_task_v2_helper(
         )
         if total_step_count >= max_steps:
             LOG.info("Task v2 failed - run out of steps", max_steps=max_steps, workflow_run_id=workflow_run_id)
-            failure_reason, llm_failure_categories = await _summarize_max_steps_failure_reason(
+            failure_reason, llm_failure_categories, root_user_errors = await _summarize_max_steps_failure_reason(
                 task_v2, organization_id, browser_state
             )
             full_failure_reason = (
@@ -1481,7 +1711,10 @@ async def run_task_v2_helper(
                 workflow_run_id=workflow_run_id,
                 organization_id=organization_id,
                 failure_reason=full_failure_reason,
-                failure_category=failure_category,
+                # An output-only entry after the primary: readers of the primary or the category set are unchanged.
+                failure_category=with_root_user_errors(
+                    failure_category, [error.model_dump(mode="json") for error in root_user_errors]
+                ),
                 summary=summary_description,
                 output=summarized_output,
             )
@@ -1559,7 +1792,14 @@ async def handle_block_result(
             block_type_var=block.block_type,
             block_label=block.label,
         )
-        if block.continue_on_failure and not is_last_block:
+        if BROWSER_CONNECTION_LOST_ERROR_CODE in block_result.error_codes:
+            await app.WORKFLOW_SERVICE.mark_workflow_run_as_failed_if_not_final(
+                workflow_run_id=workflow_run_id,
+                failure_reason=block_result.failure_reason,
+                _on_terminal_write=_hold_terminal_write(task_v2_id, workflow_run_id),
+            )
+            await _end_task_v2_after_browser_loss(task_v2_id, workflow_run_id, workflow_run.organization_id)
+        elif block.continue_on_failure and not is_last_block:
             LOG.warning(
                 f"Block with type {block.block_type} failed but will continue executing the workflow run {workflow_run_id}",
                 block_type=block.block_type,
@@ -1594,6 +1834,59 @@ async def handle_block_result(
         workflow_run_id=workflow_run_id,
         organization_id=workflow_run.organization_id,
     )
+
+
+async def _fail_task_v2_after_browser_loss(
+    task_v2_id: str,
+    workflow_run_id: str,
+    organization_id: str,
+    completed_block: tuple[BlockTypeVar, BlockResult] | None = None,
+) -> TaskV2 | None:
+    # A success observed after the run lost its browser natively cannot complete the task.
+    if get_browser_connection_loss(app.BROWSER_MANAGER.get_for_workflow_run(workflow_run_id)) is None:
+        return None
+    LOG.warning("Browser connection lost: task v2 stops without a completion decision", workflow_run_id=workflow_run_id)
+    failure_reason = get_user_facing_exception_message(MissingBrowserState(workflow_run_id=workflow_run_id))
+    if completed_block is not None:
+        block, block_result = completed_block
+        await block.build_block_result(
+            success=False,
+            failure_reason=failure_reason,
+            status=BlockStatus.failed,
+            workflow_run_block_id=block_result.workflow_run_block_id,
+            organization_id=organization_id,
+            error_codes=list(dict.fromkeys([*block_result.error_codes, BROWSER_CONNECTION_LOST_ERROR_CODE])),
+            can_continue_after_failure=False,
+        )
+    await app.WORKFLOW_SERVICE.mark_workflow_run_as_failed_if_not_final(
+        workflow_run_id=workflow_run_id,
+        failure_reason=failure_reason,
+        _on_terminal_write=_hold_terminal_write(task_v2_id, workflow_run_id),
+    )
+    return await _end_task_v2_after_browser_loss(task_v2_id, workflow_run_id, organization_id)
+
+
+async def _end_task_v2_after_browser_loss(task_v2_id: str, workflow_run_id: str, organization_id: str) -> TaskV2:
+    current = await app.DATABASE.observer.get_task_v2(task_v2_id, organization_id=organization_id)
+    if current is not None and current.status.is_final():
+        # The writer that ended the task first, such as a cancellation, already sent its terminal callback.
+        return current
+    workflow_run = await app.WORKFLOW_SERVICE.get_workflow_run(
+        workflow_run_id=workflow_run_id, organization_id=organization_id
+    )
+    won = False
+    if workflow_run.status.is_final():
+        won = await app.DATABASE.observer.update_task_v2_status_if_not_final(
+            task_v2_id=task_v2_id,
+            organization_id=organization_id,
+            status=TaskV2Status(workflow_run.status),
+        )
+    task_v2 = await app.DATABASE.observer.get_task_v2(task_v2_id, organization_id=organization_id)
+    if task_v2 is None:
+        raise TaskV2NotFound(task_v2_id=task_v2_id)
+    if won:
+        await send_task_v2_webhook(task_v2)
+    return task_v2
 
 
 async def _set_up_workflow_context(workflow: Workflow, workflow_run_id: str, organization: Organization) -> None:
@@ -1798,7 +2091,7 @@ async def _generate_loop_task(
         prompt_name="task_v2_generate_task_block",
         system_prompt=task_v2.workflow_system_prompt,
     )
-    LOG.info("Task in loop metadata response", task_in_loop_metadata_response=task_in_loop_metadata_response)
+    LOG.info("Task in loop metadata response", **llm_response_log_metadata(task_in_loop_metadata_response))
     navigation_goal = task_in_loop_metadata_response.get("navigation_goal")
     data_extraction_goal = task_in_loop_metadata_response.get("data_extraction_goal")
     data_extraction_schema = task_in_loop_metadata_response.get("data_schema")
@@ -1918,7 +2211,7 @@ async def _generate_extraction_task(
         raise last_exc  # type: ignore[misc]
 
     assert generate_extraction_task_response is not None
-    LOG.info("Data extraction response", data_extraction_response=generate_extraction_task_response)
+    LOG.info("Data extraction response", **llm_response_log_metadata(generate_extraction_task_response))
 
     # create OutputParameter for the data_extraction block
     data_schema: dict[str, Any] | list | None = generate_extraction_task_response.get("schema")
@@ -1990,8 +2283,9 @@ def _build_compute_code(gathered: list[dict], snippet: str) -> str:
 
 def _assert_compute_code_safe(code: str) -> None:
     """Validate that compute code is data-only, bounded, and ends with the output contract."""
-    # is_safe_code blocks imports/dunders/blocked-attrs but not the browser/async/regex/exec names
-    # the sandbox exposes, not unbounded loops, not the .format dunder escape, and not a guarded or
+    # is_safe_code blocks dunders/blocked-attrs but admits imports of the sandbox modules (an alias would
+    # carry a forbidden name past the bare-name check), and does not block the browser/async/regex/exec
+    # names the sandbox exposes, unbounded loops, the .format dunder escape, or a guarded or
     # nested return that falls through to captured locals. Raise InsecureCodeDetected (caught by the
     # regenerate loop) on violation.
     # CodeBlock.execute Jinja-renders the whole code string before exec, and CODE blocks resolve
@@ -2006,6 +2300,8 @@ def _assert_compute_code_safe(code: str) -> None:
             raise InsecureCodeDetected("compute code must be synchronous (no await/async)")
         if isinstance(node, (ast.While,)):
             raise InsecureCodeDetected("compute code may not use while loops")
+        if isinstance(node, (ast.Import, ast.ImportFrom)):
+            raise InsecureCodeDetected("compute code may not import modules")
         if isinstance(node, ast.Name) and node.id in _COMPUTE_FORBIDDEN_NAMES:
             raise InsecureCodeDetected(f"compute code may not reference '{node.id}'")
         if isinstance(node, ast.Attribute) and node.attr in _COMPUTE_FORBIDDEN_ATTRS:
@@ -2028,7 +2324,11 @@ async def _generate_compute_task(
     plan: str,
     task_history: list[dict] | None = None,
 ) -> tuple[CodeBlock, list[BLOCK_YAML_TYPES], list[PARAMETER_YAML_TYPES]]:
-    LOG.info("Generating compute task", plan=plan)
+    LOG.info(
+        "Generating compute task",
+        plan_type=type(plan).__name__,
+        plan_length=len(plan) if isinstance(plan, str) else None,
+    )
     context = skyvern_context.ensure_context()
     gathered = [record for record in (task_history or []) if record.get("extracted_data") is not None]
     if not gathered:
@@ -2180,11 +2480,6 @@ async def _generate_goto_url_task(
 async def get_thought_timelines(
     *, task_v2_id: str, organization_id: str, cap_output_values: bool = False
 ) -> list[WorkflowRunTimeline]:
-    from skyvern.forge.sdk.workflow.service import (  # noqa: PLC0415
-        truncate_oversized_response_text,
-        truncate_oversized_response_value,
-    )
-
     thoughts = await app.DATABASE.observer.get_thoughts(
         task_v2_id=task_v2_id,
         organization_id=organization_id,
@@ -2233,6 +2528,17 @@ async def _update_task_v2_status(
     output: dict[str, Any] | None = None,
     failure_category: list[dict] | None = None,
 ) -> TaskV2:
+    keep_final_status = False
+    if run_lease_tasks_enabled():
+        current = await app.DATABASE.observer.get_task_v2(task_v2_id, organization_id=organization_id)
+        if current is not None and current.workflow_run_id:
+            if not status.is_final():
+                if await run_lease_lost(current.workflow_run_id):
+                    return (
+                        await app.DATABASE.observer.get_task_v2(task_v2_id, organization_id=organization_id) or current
+                    )
+            elif await run_lease_final_write_blocked(current.workflow_run_id):
+                keep_final_status = True
     task_v2 = await app.DATABASE.observer.update_task_v2(
         task_v2_id,
         organization_id=organization_id,
@@ -2240,7 +2546,10 @@ async def _update_task_v2_status(
         summary=summary,
         output=output,
         failure_category=failure_category,
+        keep_final_status=keep_final_status,
     )
+    if keep_final_status and task_v2.status != status:
+        return task_v2
     if status in [TaskV2Status.completed, TaskV2Status.failed, TaskV2Status.terminated]:
         start_time = (
             task_v2.started_at.replace(tzinfo=UTC) if task_v2.started_at else task_v2.created_at.replace(tzinfo=UTC)
@@ -2257,6 +2566,11 @@ async def _update_task_v2_status(
             organization_id=organization_id,
         )
     return task_v2
+
+
+def _task_v2_final_write_refused(task_v2: TaskV2, status: TaskV2Status) -> bool:
+    # Without leases, a concurrent writer's post-commit refresh must preserve the existing side effects.
+    return run_lease_tasks_enabled() and task_v2.status != status
 
 
 async def mark_task_v2_as_failed(
@@ -2311,11 +2625,14 @@ async def mark_task_v2_as_failed(
         output=output,
         failure_category=failure_category,
     )
+    if _task_v2_final_write_refused(task_v2, TaskV2Status.failed):
+        return task_v2
     if workflow_run_id:
         await app.WORKFLOW_SERVICE.mark_workflow_run_as_failed(
             workflow_run_id,
             failure_reason=failure_reason or "Skyvern task 2.0 failed",
             failure_category=failure_category,
+            _on_terminal_write=_hold_terminal_write(task_v2_id, workflow_run_id),
         )
 
     # Add task failure tag to trace
@@ -2339,6 +2656,8 @@ async def mark_task_v2_as_completed(
         summary=summary,
         output=output,
     )
+    if _task_v2_final_write_refused(task_v2, TaskV2Status.completed):
+        return task_v2
     if workflow_run_id:
         await app.WORKFLOW_SERVICE.mark_workflow_run_as_completed(workflow_run_id)
 
@@ -2349,12 +2668,23 @@ async def mark_task_v2_as_completed(
     return task_v2
 
 
+class _CancelRunKwargs(TypedDict, total=False):
+    requested_externally: bool
+
+
 async def mark_task_v2_as_canceled(
     task_v2_id: str,
     workflow_run_id: str | None = None,
     organization_id: str | None = None,
+    on_transition: Callable[[], Awaitable[None]] | None = None,
+    audit_actor: RequestPrincipal | None = None,
+    *,
+    requested_externally: bool = False,
 ) -> TaskV2:
+    cancel_kwargs: _CancelRunKwargs = {"requested_externally": True} if requested_externally else {}
     current = await app.DATABASE.observer.get_task_v2(task_v2_id, organization_id=organization_id)
+    transitioned = False
+    task_v2: TaskV2 | None = None
     if current is not None and current.status.is_final() and current.status != TaskV2Status.canceled:
         LOG.info(
             "Rejecting cancel: task v2 already in a different terminal state",
@@ -2363,22 +2693,60 @@ async def mark_task_v2_as_canceled(
             task_v2_status=current.status,
         )
         if workflow_run_id:
-            await app.WORKFLOW_SERVICE.mark_workflow_run_as_canceled(workflow_run_id)
+            await app.WORKFLOW_SERVICE.mark_workflow_run_as_canceled(workflow_run_id, **cancel_kwargs)
         return current
 
-    task_v2 = await _update_task_v2_status(
-        task_v2_id,
-        organization_id=organization_id,
-        status=TaskV2Status.canceled,
-    )
-    if workflow_run_id:
-        await app.WORKFLOW_SERVICE.mark_workflow_run_as_canceled(workflow_run_id)
+    if current is not None and current.status != TaskV2Status.canceled:
+        transitioned = await app.DATABASE.observer.update_task_v2_status_if_not_final(
+            task_v2_id=task_v2_id,
+            organization_id=current.organization_id,
+            status=TaskV2Status.canceled,
+            audit_actor=audit_actor,
+        )
+        if not transitioned:
+            task_v2 = await app.DATABASE.observer.get_task_v2(task_v2_id, organization_id=organization_id)
+            if task_v2 is None:
+                raise TaskV2NotFound(task_v2_id=task_v2_id)
+        if not transitioned and task_v2 is not None and task_v2.status != TaskV2Status.canceled:
+            if task_v2.status.is_final() and workflow_run_id:
+                await app.WORKFLOW_SERVICE.mark_workflow_run_as_canceled(workflow_run_id, **cancel_kwargs)
+            return task_v2
+    else:
+        task_v2 = await _update_task_v2_status(
+            task_v2_id,
+            organization_id=organization_id,
+            status=TaskV2Status.canceled,
+        )
+        if _task_v2_final_write_refused(task_v2, TaskV2Status.canceled):
+            return task_v2
 
-    # Add task canceled tag to trace
-    otel_trace.get_current_span().set_attribute("task.completion_status", "canceled")
+    async def _finish_cancel() -> TaskV2:
+        nonlocal task_v2
+        if transitioned and on_transition is not None:
+            try:
+                await on_transition()
+            except asyncio.CancelledError:
+                pass
+        if task_v2 is None:
+            task_v2 = await app.DATABASE.observer.get_task_v2(task_v2_id, organization_id=organization_id)
+            if task_v2 is None:
+                raise TaskV2NotFound(task_v2_id=task_v2_id)
+        if workflow_run_id:
+            await app.WORKFLOW_SERVICE.mark_workflow_run_as_canceled(workflow_run_id, **cancel_kwargs)
 
-    await send_task_v2_webhook(task_v2)
-    return task_v2
+        otel_trace.get_current_span().set_attribute("task.completion_status", "canceled")
+        await send_task_v2_webhook(task_v2)
+        return task_v2
+
+    if transitioned:
+        # The task row is committed; finish propagating cancellation before honoring a request disconnect.
+        completion = asyncio.create_task(_finish_cancel())
+        try:
+            return await asyncio.shield(completion)
+        except asyncio.CancelledError:
+            await asyncio.shield(completion)
+            raise
+    return await _finish_cancel()
 
 
 async def mark_task_v2_as_terminated(
@@ -2394,11 +2762,14 @@ async def mark_task_v2_as_terminated(
         status=TaskV2Status.terminated,
         failure_category=failure_category,
     )
+    if _task_v2_final_write_refused(task_v2, TaskV2Status.terminated):
+        return task_v2
     if workflow_run_id:
         await app.WORKFLOW_SERVICE.mark_workflow_run_as_terminated(
             workflow_run_id,
             failure_reason,
             failure_category=failure_category,
+            _on_terminal_write=_hold_terminal_write(task_v2_id, workflow_run_id),
         )
 
     # Add task terminated tag to trace
@@ -2421,6 +2792,8 @@ async def mark_task_v2_as_timed_out(
         organization_id=organization_id,
         status=TaskV2Status.timed_out,
     )
+    if _task_v2_final_write_refused(task_v2, TaskV2Status.timed_out):
+        return task_v2
 
     async def repair_workflow_run() -> None:
         nonlocal fallback_workflow_run
@@ -2437,6 +2810,7 @@ async def mark_task_v2_as_timed_out(
                 workflow_run_id,
                 failure_reason,
                 fallback_workflow_run=fallback_workflow_run,
+                _on_terminal_write=_hold_terminal_write(task_v2_id, workflow_run_id),
             )
 
     repair_task = asyncio.create_task(repair_workflow_run())
@@ -2519,7 +2893,7 @@ def _get_extracted_data_from_block_result(
                 if not isinstance(inner_loop_output, list):
                     LOG.warning(
                         "Inner loop output is not a list",
-                        inner_loop_output=inner_loop_output,
+                        **llm_response_log_metadata(inner_loop_output),
                         task_v2_id=task_v2_id,
                         workflow_run_id=workflow_run_id,
                         workflow_run_block_id=block_result.workflow_run_block_id,
@@ -2529,7 +2903,7 @@ def _get_extracted_data_from_block_result(
                     if not isinstance(inner_output, dict):
                         LOG.warning(
                             "inner output is not a dict",
-                            inner_output=inner_output,
+                            **llm_response_log_metadata(inner_output),
                             task_v2_id=task_v2_id,
                             workflow_run_id=workflow_run_id,
                             workflow_run_block_id=block_result.workflow_run_block_id,
@@ -2539,7 +2913,7 @@ def _get_extracted_data_from_block_result(
                     if not isinstance(output_value, dict):
                         LOG.warning(
                             "output_value is not a dict",
-                            output_value=output_value,
+                            **llm_response_log_metadata(output_value),
                             task_v2_id=task_v2_id,
                             workflow_run_id=workflow_run_id,
                             workflow_run_block_id=block_result.workflow_run_block_id,
@@ -2686,7 +3060,7 @@ def _parse_task_v2_summary_response(resp: Any) -> tuple[str | None, Any]:
             }
             LOG.info(
                 "Recovered task_v2 summary output from non-envelope response",
-                recovered_keys=sorted(output.keys()),
+                recovered_keys_count=len(output),
             )
     return description, output
 
@@ -2723,7 +3097,11 @@ async def _generate_task_v2_deliverable(
         prompt_name="task_v2_summary",
         system_prompt=task_v2.workflow_system_prompt,
     )
-    LOG.info("Task v2 summary response", task_v2_summary_resp=task_v2_summary_resp, is_partial=is_partial)
+    LOG.info(
+        "Task v2 summary response",
+        **llm_response_log_metadata(task_v2_summary_resp),
+        is_partial=is_partial,
+    )
 
     summary_description, summarized_output = _parse_task_v2_summary_response(task_v2_summary_resp)
     await app.DATABASE.observer.update_thought(
@@ -2767,6 +3145,7 @@ async def _summarize_task_v2(
     task_history: list[dict],
     context: SkyvernContext,
     screenshots: list[bytes] | None = None,
+    completed_block: tuple[BlockTypeVar, BlockResult] | None = None,
 ) -> TaskV2:
     summary_description, summarized_output = await _generate_task_v2_deliverable(
         task_v2=task_v2,
@@ -2775,6 +3154,12 @@ async def _summarize_task_v2(
         screenshots=screenshots,
         is_partial=False,
     )
+    if task_v2.workflow_run_id is not None:
+        lost_task_v2 = await _fail_task_v2_after_browser_loss(
+            task_v2.observer_cruise_id, task_v2.workflow_run_id, task_v2.organization_id, completed_block
+        )
+        if lost_task_v2 is not None:
+            return lost_task_v2
     return await mark_task_v2_as_completed(
         task_v2_id=task_v2.observer_cruise_id,
         workflow_run_id=task_v2.workflow_run_id,
@@ -2786,7 +3171,6 @@ async def _summarize_task_v2(
 
 async def build_task_v2_run_response(task_v2: TaskV2, cap_output_values: bool = False) -> TaskRunResponse:
     """Build TaskRunResponse object for webhook backward compatibility."""
-    from skyvern.forge.sdk.workflow.service import truncate_oversized_response_value  # noqa: PLC0415
     from skyvern.services import workflow_service  # noqa: PLC0415
 
     workflow_run_resp = None
@@ -2846,6 +3230,10 @@ async def build_task_v2_run_response(task_v2: TaskV2, cap_output_values: bool = 
 
 async def send_task_v2_webhook(task_v2: TaskV2, *, success_marker: str = "") -> None:
     if not task_v2.webhook_callback_url:
+        return
+    deferred = _deferred_task_v2_webhooks.get()
+    if deferred is not None and task_v2.observer_cruise_id in deferred:
+        deferred[task_v2.observer_cruise_id].success_marker = success_marker
         return
     # Strip whitespace from the webhook URL to handle user input with leading/trailing spaces
     task_v2.webhook_callback_url = task_v2.webhook_callback_url.strip()

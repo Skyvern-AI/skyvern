@@ -10,7 +10,7 @@ import structlog
 from sqlalchemy import update
 from sqlalchemy.exc import IntegrityError
 
-from skyvern.exceptions import WorkflowNotFound, WorkflowNotFoundForWorkflowRun
+from skyvern.exceptions import BROWSER_CONNECTION_LOST_ERROR_CODE, WorkflowNotFound, WorkflowNotFoundForWorkflowRun
 from skyvern.forge import app
 from skyvern.forge.sdk.cache import extraction_cache
 from skyvern.forge.sdk.db.datetime_utils import naive_utc_now, to_naive_utc
@@ -20,6 +20,7 @@ from skyvern.forge.sdk.workflow.models.workflow import Workflow, WorkflowRun, Wo
 from skyvern.schemas.runs import RunStatus, WorkflowRunAttempt
 from skyvern.schemas.workflows import WorkflowRetryPolicy
 from skyvern.services.webhook_delivery import (
+    WEBHOOK_DELIVERY_BUDGET_SECONDS,
     WEBHOOK_DELIVERY_MAX_ATTEMPTS,
     WEBHOOK_DELIVERY_MAX_RETRY_AFTER_SECONDS,
     WEBHOOK_DELIVERY_RETRY_BASE_DELAY_SECONDS,
@@ -52,6 +53,7 @@ WEBHOOK_FALLBACK_GRACE_SECONDS = (
     )
     + WEBHOOK_FALLBACK_GRACE_MARGIN_SECONDS
 )
+assert WEBHOOK_DELIVERY_BUDGET_SECONDS + WEBHOOK_FALLBACK_GRACE_MARGIN_SECONDS <= WEBHOOK_FALLBACK_GRACE_SECONDS
 # The policy terminal release owns these effects serially before the final webhook. Keep this
 # geometry in one replay-stable OSS constant so Temporal's activity deadline, lease recovery, and
 # webhook-only fallback cannot drift apart.
@@ -121,6 +123,8 @@ def evaluate_retry_policy(
 ) -> tuple[bool, str]:
     if status is WorkflowRunStatus.canceled:
         return False, "canceled"
+    if BROWSER_CONNECTION_LOST_ERROR_CODE in error_codes:
+        return False, BROWSER_CONNECTION_LOST_ERROR_CODE
     if retries_used >= policy.max_retries:
         return False, "budget_exhausted"
 
@@ -383,7 +387,9 @@ async def fail_run_without_attempt_row(
             workflow_run = None
     if workflow_run is not None and need_call_webhook:
         try:
-            await app.WORKFLOW_SERVICE.execute_workflow_webhook(workflow_run, api_key=api_key, claim_kind=None)
+            await app.WORKFLOW_SERVICE.execute_workflow_webhook(
+                workflow_run, api_key=api_key, claim_kind=None, finalizer="failed_before_execution"
+            )
         except Exception:
             LOG.warning(
                 "Failed to deliver workflow webhook after initialization failure",

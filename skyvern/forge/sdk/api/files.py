@@ -7,6 +7,7 @@ import os
 import re
 import shutil
 import tempfile
+import time
 import zipfile
 from collections.abc import Callable
 from dataclasses import dataclass
@@ -226,8 +227,10 @@ def _determine_download_filename(
 
     file_name = ""
     file_suffix = ""
+    header_stem = ""
     try:
-        file_name, file_suffix = get_file_name_and_suffix_from_headers(response_headers)
+        header_stem, file_suffix = get_file_name_and_suffix_from_headers(response_headers)
+        file_name = header_stem
         if not file_suffix:
             LOG.warning("No extension name retrieved from HTTP headers")
     except Exception:
@@ -241,7 +244,8 @@ def _determine_download_filename(
         LOG.info("No file name retrieved from HTTP headers, using the file name from the URL")
         file_name = os.path.basename(urlparse(url).path) or "download"
 
-    if not is_valid_mime_type(file_name) and file_suffix:
+    # A Content-Disposition stem never carries its own suffix, even a lookalike ("data.csv" of "data.csv.pdf").
+    if file_suffix and ((header_stem and file_name == header_stem) or not is_valid_mime_type(file_name)):
         LOG.info("No file extension detected, adding the extension from HTTP headers")
         file_name = file_name + file_suffix
 
@@ -370,6 +374,7 @@ class GuardedFileResponse:
     body: bytes
     content_type: str
     filename: str
+    status: int | None = None
 
 
 GuardedFileFetchHopResult: TypeAlias = GuardedFileRedirect | GuardedFileResponse
@@ -461,6 +466,7 @@ async def fetch_file_bytes(
                         body=bytes(body),
                         content_type=response.headers.get("Content-Type", ""),
                         filename=_determine_download_filename(filename, response.headers, current_url),
+                        status=response.status,
                     )
 
             result = await authorize_request_hop_once(
@@ -488,6 +494,7 @@ async def fetch_file_bytes(
                 None,
                 current_url,
                 next_url,
+                cookie_jar=session.cookie_jar,
             )
             source_url, current_url = current_url, next_url
 
@@ -819,6 +826,7 @@ async def download_file(
                     None,
                     current_url,
                     next_url,
+                    cookie_jar=session.cookie_jar,
                 )
                 source_url, current_url = current_url, next_url
             raise SkyvernHTTPException(
@@ -1268,23 +1276,24 @@ PENDING_EXTENSION_RENAME_POLL_SECONDS = 0.1
 
 
 async def wait_for_pending_extension_rename(download_dir: str, filename: str) -> str:
-    """Return the file's final name, waiting out an in-flight extension-recovery rename.
-
-    The browser finalizes a download under an extensionless name moments before the
-    async download listener renames it in place (bare GUID -> GUID.pdf). Storage syncs
-    must never upload the intermediate name — the same bytes would get registered
-    under both names across two syncs. For an extensionless file, wait briefly for the
-    rename to land and return the renamed filename; on timeout return the original so
-    the file is still uploaded rather than dropped.
-    """
+    """Return the file's final name, giving an extensionless file a short window after its last change for the
+    download listener to rename it in place (bare GUID -> GUID.pdf). On timeout the original name is returned, so
+    the file is still saved rather than dropped."""
     if Path(filename).suffix:
         return filename
-    deadline = asyncio.get_event_loop().time() + PENDING_EXTENSION_RENAME_WAIT_SECONDS
-    while asyncio.get_event_loop().time() < deadline:
-        if not os.path.exists(os.path.join(download_dir, filename)):
+    path = os.path.join(download_dir, filename)
+    try:
+        file_stat = os.stat(path)
+    except OSError:
+        return _resolve_extension_rename_twin(download_dir, filename)
+    age = time.time() - max(file_stat.st_mtime, file_stat.st_ctime)
+    wait = min(PENDING_EXTENSION_RENAME_WAIT_SECONDS, PENDING_EXTENSION_RENAME_WAIT_SECONDS - age)
+    deadline = time.monotonic() + wait
+    while (remaining := deadline - time.monotonic()) > 0:
+        if not os.path.exists(path):
             return _resolve_extension_rename_twin(download_dir, filename)
-        await asyncio.sleep(PENDING_EXTENSION_RENAME_POLL_SECONDS)
-    if not os.path.exists(os.path.join(download_dir, filename)):
+        await asyncio.sleep(min(PENDING_EXTENSION_RENAME_POLL_SECONDS, remaining))
+    if not os.path.exists(path):
         return _resolve_extension_rename_twin(download_dir, filename)
     return filename
 

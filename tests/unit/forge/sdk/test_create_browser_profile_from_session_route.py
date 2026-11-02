@@ -23,7 +23,10 @@ from skyvern.forge import app as forge_app
 from skyvern.forge.sdk.cache.local import LocalCache
 from skyvern.forge.sdk.routes import browser_profiles as browser_profiles_route
 from skyvern.forge.sdk.schemas.browser_profiles import BrowserProfile, CreateBrowserProfileRequest
-from skyvern.forge.sdk.schemas.persistent_browser_sessions import PersistentBrowserSession
+from skyvern.forge.sdk.schemas.persistent_browser_sessions import (
+    EXTERNAL_CDP_BROWSER_VENDOR,
+    PersistentBrowserSession,
+)
 from skyvern.forge.sdk.services import org_auth_service
 from skyvern.schemas.runs import ProxyLocation
 from skyvern.webeye.browser_profile_utils import operator_profile_generation, write_operator_profile_marker
@@ -767,6 +770,36 @@ def test_promote_deletes_source_session_blob(monkeypatch: pytest.MonkeyPatch) ->
     mocks.rate_limit_submit_run.assert_not_awaited()
     mocks.store_profile.assert_awaited_once()
     mocks.delete_profile_blob.assert_awaited_once_with(organization_id="org_oss", profile_id="pbs_1")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("path", ["route", "running_session"])
+async def test_no_profile_is_saved_from_a_registered_external_session(
+    monkeypatch: pytest.MonkeyPatch, path: str
+) -> None:
+    client, mocks = _build_client(monkeypatch)
+    mocks.get_session.return_value = _session(browser_vendor=EXTERNAL_CDP_BROWSER_VENDOR, generate_browser_profile=True)
+    mocks.retrieve_profile.return_value = "/tmp/session_dir"
+
+    if path == "route":
+        response = await asyncio.to_thread(
+            client.post, "/v1/browser_profiles/", json={"name": "my profile", "browser_session_id": "pbs_1"}
+        )
+        assert response.status_code == 409
+    else:
+        with pytest.raises(HTTPException) as raised:
+            await browser_profiles_route.create_profile_from_running_session(
+                organization_id="org_oss",
+                browser_session_id="pbs_1",
+                login_urls=["https://portal.example.com/login"],
+                name="Sign-in for portal.example.com",
+                description=None,
+            )
+        assert raised.value.status_code == 409
+
+    mocks.create_profile.assert_not_awaited()
+    mocks.store_profile.assert_not_awaited()
+    mocks.observe_session.assert_not_awaited()
 
 
 def test_promote_inherits_session_proxy_pin(monkeypatch: pytest.MonkeyPatch) -> None:

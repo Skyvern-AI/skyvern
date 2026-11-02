@@ -1912,6 +1912,17 @@ class TestPreflightSurfacesSyntaxError:
         diagnostics = preflight_code_block(result.code, parameter_keys=())
         assert not any(d.code == "SYNTAX_ERROR" for d in diagnostics)
 
+    @pytest.mark.parametrize(
+        "code",
+        [
+            'm = re.search("(", "abc")',
+            'import re as rx\nm = rx.search("(", "abc")',
+            'from re import search as s\nm = s("(", "abc")',
+        ],
+    )
+    def test_invalid_regex_literal_is_caught_however_re_is_bound(self, code: str) -> None:
+        assert "INVALID_REGEX_LITERAL" in [d.code for d in preflight_code_block(code, parameter_keys=())]
+
     def test_unparseable_block_surfaces_syntax_diagnostic(self) -> None:
         # A malformed block must be caught at authoring time, not swallowed into a silent run-time failure.
         diagnostics = preflight_code_block('await page.goto("unterminated)\n', parameter_keys=())

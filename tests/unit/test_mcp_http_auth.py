@@ -21,7 +21,7 @@ from starlette.routing import Route
 from starlette.testclient import TestClient
 
 from skyvern.cli.core import client as client_mod
-from skyvern.cli.core import mcp_http_auth, session_manager
+from skyvern.cli.core import copilot_sessions, mcp_http_auth, session_manager
 from skyvern.cli.core.result import BrowserContext
 
 _TEST_BASE_URL = "http://testserver"
@@ -32,7 +32,7 @@ def _reset_auth_context() -> Iterator[None]:
     client_mod._api_key_override.set(None)
     session_manager._current_session.set(None)
     session_manager._global_session = None
-    session_manager._copilot_sessions.clear()
+    copilot_sessions._copilot_sessions.clear()
     session_manager._organization_sessions.clear()
     session_manager._current_organization_id.set(None)
     session_manager.set_stateless_http_mode(False)
@@ -302,7 +302,7 @@ async def test_stateful_http_session_is_scoped_to_authenticated_organization_wit
                 api_key_hash=session_manager.active_api_key_hash(),
             )
             session_manager.set_current_session(state)
-            session_manager.register_copilot_session(session_id, state, organization_id="org_first")
+            copilot_sessions.register_copilot_session(session_id, state, organization_id="org_first")
             return JSONResponse({"owner": first_browser.owner})
 
         try:
@@ -424,6 +424,76 @@ def test_stateful_fastmcp_transport_rejects_exact_session_id_from_another_organi
     assert hijack_response.json()["error"]["message"] == "Session not found"
     assert session_manager._current_session.get() is None
     assert session_manager._current_organization_id.get() is None
+
+
+def test_stateless_transport_falls_back_to_legacy_after_unsupported_discovery_probe(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    server = FastMCP("protocol-version-test")
+
+    @server.tool
+    async def ping() -> str:
+        return "pong"
+
+    monkeypatch.setattr(mcp_http_auth, "validate_mcp_api_key", AsyncMock(return_value=_build_validation("org_pv")))
+    app = server.http_app(
+        path="/",
+        middleware=[Middleware(mcp_http_auth.MCPAPIKeyMiddleware)],
+        stateless_http=True,
+        json_response=True,
+    )
+
+    headers = {
+        "accept": "application/json, text/event-stream",
+        "content-type": "application/json",
+        "x-api-key": "sk_pv",
+    }
+    with TestClient(app) as client:
+        discovery_response = client.post(
+            "/",
+            headers={
+                **headers,
+                "mcp-protocol-version": "2026-07-28",
+            },
+            json={
+                "jsonrpc": "2.0",
+                "id": "discover-1",
+                "method": "server/discover",
+                "params": {
+                    "_meta": {
+                        "io.modelcontextprotocol/protocolVersion": "2026-07-28",
+                        "io.modelcontextprotocol/clientInfo": {"name": "test-client", "version": "1"},
+                        "io.modelcontextprotocol/clientCapabilities": {},
+                    }
+                },
+            },
+        )
+        legacy_response = client.post(
+            "/",
+            headers=headers,
+            json={
+                "jsonrpc": "2.0",
+                "id": 2,
+                "method": "initialize",
+                "params": {
+                    "protocolVersion": "2025-11-25",
+                    "capabilities": {},
+                    "clientInfo": {"name": "test-client", "version": "1"},
+                },
+            },
+        )
+        legacy_tools_response = client.post(
+            "/",
+            headers={**headers, "mcp-protocol-version": "2025-11-25"},
+            json={"jsonrpc": "2.0", "id": 3, "method": "tools/list", "params": {}},
+        )
+
+    assert discovery_response.status_code == 400
+    assert "Unsupported protocol version: 2026-07-28" in discovery_response.json()["error"]["message"]
+    assert legacy_response.status_code == 200
+    assert legacy_response.json()["result"]["protocolVersion"] == "2025-11-25"
+    assert legacy_tools_response.status_code == 200
+    assert [tool["name"] for tool in legacy_tools_response.json()["result"]["tools"]] == ["ping"]
 
 
 @pytest.mark.asyncio
@@ -938,6 +1008,7 @@ async def test_validate_mcp_oauth_token_negative_caches_401_errors(monkeypatch: 
         SimpleNamespace(
             AGENT_FUNCTION=SimpleNamespace(
                 get_mcp_oauth_jwt_key=AsyncMock(return_value="jwk"),
+                resolve_mcp_oauth_member_api_key=AsyncMock(return_value=None),
             )
         ),
     )
@@ -1004,7 +1075,7 @@ async def test_validate_mcp_oauth_token_passes_clock_skew_leeway_to_pyjwt(
 
     fake_db = SimpleNamespace(
         get_organization_entities=AsyncMock(return_value=[SimpleNamespace(organization_id="org_jwt")]),
-        get_valid_org_auth_token=AsyncMock(return_value=SimpleNamespace(token="sk_live_from_jwt")),
+        get_valid_org_auth_token=AsyncMock(return_value=SimpleNamespace(id="oat_jwt", token="sk_live_from_jwt")),
     )
     monkeypatch.setattr(jwt, "PyJWK", _fake_jwk)
     monkeypatch.setattr(jwt, "decode", _fake_decode)
@@ -1018,6 +1089,7 @@ async def test_validate_mcp_oauth_token_passes_clock_skew_leeway_to_pyjwt(
         SimpleNamespace(
             AGENT_FUNCTION=SimpleNamespace(
                 get_mcp_oauth_jwt_key=AsyncMock(return_value="jwk"),
+                resolve_mcp_oauth_member_api_key=AsyncMock(return_value=None),
             )
         ),
     )
@@ -1025,9 +1097,65 @@ async def test_validate_mcp_oauth_token_passes_clock_skew_leeway_to_pyjwt(
     resolution = await mcp_http_auth.validate_mcp_oauth_token(_jwtish_token())
 
     assert resolution.api_key == "sk_live_from_jwt"
+    assert resolution.api_key_token_id == "oat_jwt"
+    assert resolution.user_id == "user_123"
     assert captured["kwargs"]["leeway"] == mcp_http_auth._TOKEN_CLOCK_SKEW_SECONDS
     assert captured["kwargs"]["options"] == {"verify_aud": False}
     fake_db.get_organization_entities.assert_awaited_once_with("clerk_org_jwt", "organization")
+
+
+@pytest.mark.asyncio
+async def test_validate_mcp_oauth_token_returns_role_403_without_negative_caching(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import jwt
+
+    def _fake_decode(*_args: object, **_kwargs: object) -> dict[str, object]:
+        return {
+            "iss": "https://clerk.example.com",
+            "aud": ["https://api.skyvern.com/mcp/"],
+            "resource": "https://api.skyvern.com/mcp/",
+            "sub": "user_123",
+            "org_id": "clerk_org_jwt",
+        }
+
+    resolve_member_key = AsyncMock(side_effect=mcp_http_auth.MCPOrgRoleRequiredError)
+    fake_db = SimpleNamespace(
+        get_organization_entities=AsyncMock(return_value=[SimpleNamespace(organization_id="org_jwt")]),
+        get_valid_org_auth_token=AsyncMock(return_value=None),
+    )
+    create_org_api_token = AsyncMock(return_value=SimpleNamespace(id="oat_stray", token="sk_stray"))
+    record_audit_event = AsyncMock()
+    monkeypatch.setattr(jwt, "PyJWK", lambda key: key)
+    monkeypatch.setattr(jwt, "decode", _fake_decode)
+    _stub_auth_db(monkeypatch, fake_db)
+    monkeypatch.setattr(mcp_http_auth, "_looks_like_jwt", lambda _token: True)
+    monkeypatch.setattr(mcp_http_auth, "_get_oauth_issuer_url", lambda: "https://clerk.example.com")
+    monkeypatch.setattr(mcp_http_auth.settings, "SKYVERN_BASE_URL", "https://api.skyvern.com")
+    monkeypatch.setattr(
+        mcp_http_auth,
+        "app",
+        SimpleNamespace(
+            AGENT_FUNCTION=SimpleNamespace(
+                get_mcp_oauth_jwt_key=AsyncMock(return_value="jwk"),
+                resolve_mcp_oauth_member_api_key=resolve_member_key,
+                record_audit_event=record_audit_event,
+            )
+        ),
+    )
+    monkeypatch.setattr("skyvern.forge.sdk.services.org_auth_token_service.create_org_api_token", create_org_api_token)
+
+    for _ in range(2):
+        with pytest.raises(mcp_http_auth.MCPOrgRoleRequiredError) as exc_info:
+            await mcp_http_auth.validate_mcp_oauth_token(_jwtish_token())
+        assert exc_info.value.status_code == 403
+        assert "Admin or Member" in exc_info.value.detail
+
+    assert resolve_member_key.await_count == 2
+    fake_db.get_valid_org_auth_token.assert_not_awaited()
+    create_org_api_token.assert_not_awaited()
+    record_audit_event.assert_not_awaited()
+    assert mcp_http_auth._oauth_cache_key(_jwtish_token()) not in mcp_http_auth._api_key_validation_cache
 
 
 @pytest.mark.asyncio
@@ -1082,6 +1210,25 @@ async def test_mcp_http_auth_falls_back_to_api_key_after_invalid_oauth_token(
         "api_key": "sk_live_proxy_token",
         "organization_id": "org_from_api_key",
     }
+
+
+@pytest.mark.asyncio
+async def test_mcp_http_auth_returns_403_for_unsupported_org_role_without_api_key_fallback(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    role_error = mcp_http_auth.MCPOrgRoleRequiredError()
+    validate_api_key = AsyncMock(side_effect=HTTPException(status_code=401, detail="Invalid API key"))
+    monkeypatch.setattr(mcp_http_auth, "validate_mcp_oauth_token", AsyncMock(side_effect=role_error))
+    monkeypatch.setattr(mcp_http_auth, "validate_mcp_api_key", validate_api_key)
+    app = _build_test_app()
+
+    response = await _request(app, "POST", "/mcp", headers={"authorization": "Bearer a.b.c"}, json={})
+
+    assert response.status_code == 403
+    assert response.json() == {
+        "error": {"code": "FORBIDDEN", "message": role_error.detail},
+    }
+    validate_api_key.assert_not_awaited()
 
 
 @pytest.mark.parametrize(
@@ -1213,7 +1360,7 @@ async def test_resolve_oauth_subject_to_org_logs_missing_db_methods(monkeypatch:
 async def test_resolve_oauth_subject_to_org_uses_explicit_org_id() -> None:
     fake_db = SimpleNamespace(
         get_organization_entities=AsyncMock(return_value=[SimpleNamespace(organization_id="skyvern_org_123")]),
-        get_valid_org_auth_token=AsyncMock(return_value=SimpleNamespace(token="sk_live_org_123")),
+        get_valid_org_auth_token=AsyncMock(return_value=SimpleNamespace(id="oat_org_123", token="sk_live_org_123")),
     )
 
     resolution = await mcp_http_auth._resolve_oauth_subject_to_org(
@@ -1223,6 +1370,8 @@ async def test_resolve_oauth_subject_to_org_uses_explicit_org_id() -> None:
 
     assert resolution.api_key == "sk_live_org_123"
     assert resolution.validation.organization_id == "skyvern_org_123"
+    assert resolution.api_key_token_id == "oat_org_123"
+    assert resolution.user_id == "user_123"
     fake_db.get_organization_entities.assert_awaited_once_with("clerk_org_123", "organization")
     fake_db.get_valid_org_auth_token.assert_awaited_once_with(
         "skyvern_org_123", mcp_http_auth.OrganizationAuthTokenType.api
@@ -1239,7 +1388,7 @@ async def test_resolve_oauth_subject_to_org_uses_organizations_repository_shape(
     # exercises the same delegation contract without importing cloud modules.
     organizations_repo = SimpleNamespace(
         get_organization_entities=AsyncMock(return_value=[SimpleNamespace(organization_id="skyvern_cloud_org")]),
-        get_valid_org_auth_token=AsyncMock(return_value=SimpleNamespace(token="sk_live_cloud_org")),
+        get_valid_org_auth_token=AsyncMock(return_value=SimpleNamespace(id="oat_cloud_org", token="sk_live_cloud_org")),
     )
     fake_db = SimpleNamespace(organizations=organizations_repo)
 
@@ -1262,6 +1411,7 @@ async def test_resolve_oauth_subject_to_org_uses_organizations_repository_shape(
 
     assert resolution.api_key == "sk_live_cloud_org"
     assert resolution.validation.organization_id == "skyvern_cloud_org"
+    assert resolution.api_key_token_id == "oat_cloud_org"
     organizations_repo.get_organization_entities.assert_awaited_once_with("clerk_org_cloud", "organization")
     organizations_repo.get_valid_org_auth_token.assert_awaited_once_with(
         "skyvern_cloud_org", mcp_http_auth.OrganizationAuthTokenType.api
@@ -1272,7 +1422,7 @@ async def test_resolve_oauth_subject_to_org_uses_organizations_repository_shape(
 async def test_resolve_oauth_subject_to_org_uses_compact_clerk_org_claim() -> None:
     fake_db = SimpleNamespace(
         get_organization_entities=AsyncMock(return_value=[SimpleNamespace(organization_id="skyvern_org_compact")]),
-        get_valid_org_auth_token=AsyncMock(return_value=SimpleNamespace(token="sk_live_compact")),
+        get_valid_org_auth_token=AsyncMock(return_value=SimpleNamespace(id="oat_compact", token="sk_live_compact")),
     )
 
     resolution = await mcp_http_auth._resolve_oauth_subject_to_org(
@@ -1282,6 +1432,7 @@ async def test_resolve_oauth_subject_to_org_uses_compact_clerk_org_claim() -> No
 
     assert resolution.api_key == "sk_live_compact"
     assert resolution.validation.organization_id == "skyvern_org_compact"
+    assert resolution.api_key_token_id == "oat_compact"
     fake_db.get_organization_entities.assert_awaited_once_with("clerk_org_compact", "organization")
 
 

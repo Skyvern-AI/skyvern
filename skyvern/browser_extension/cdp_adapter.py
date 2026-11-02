@@ -7,7 +7,7 @@ import secrets
 from collections.abc import Callable, Coroutine
 from dataclasses import dataclass
 from functools import partial
-from typing import Any, Protocol
+from typing import Any, Literal, Protocol
 
 import structlog
 from aiohttp import WSMsgType, web
@@ -114,6 +114,14 @@ _COMMAND_STATE_KEYS = {
 }
 
 
+@dataclass(frozen=True)
+class TabReconnectEvent:
+    tab_id: int
+    target_id: str
+    state: Literal["pending", "done", "failed"]
+    new_target_id: str | None = None
+
+
 @dataclass
 class _CommandState:
     latest: tuple[str, dict[str, Any]]
@@ -136,7 +144,16 @@ class _ExtensionRelay(Protocol):
 
 
 class ExtensionCdpAdapter:
-    def __init__(self, registry: VirtualTargetRegistry, relay: _ExtensionRelay) -> None:
+    def __init__(
+        self,
+        registry: VirtualTargetRegistry,
+        relay: _ExtensionRelay,
+        *,
+        on_tab_reconnect: Callable[[TabReconnectEvent], None] | None = None,
+    ) -> None:
+        self._on_tab_reconnect = on_tab_reconnect
+        self._pending_tab_reconnects: dict[int, TabReconnectEvent] = {}
+        self._extension_detach_epochs: dict[int, int] = {}
         self._registry = registry
         self._relay = relay
         self._capability = secrets.token_urlsafe(32)
@@ -168,6 +185,24 @@ class ExtensionCdpAdapter:
         self._navigation_event_generations: dict[int, int] = {}
         self._navigation_overflowed: set[int] = set()
         self._connection_generation = 0
+
+    def set_tab_reconnect_listener(self, listener: Callable[[TabReconnectEvent], None] | None) -> None:
+        self._on_tab_reconnect = listener
+
+    def _notify_tab_reconnect(self, event: TabReconnectEvent) -> None:
+        if self._on_tab_reconnect is not None:
+            try:
+                self._on_tab_reconnect(event)
+            except Exception:  # noqa: BLE001 - Listener failures must not interrupt target lifecycle events.
+                LOG.debug("Tab reconnect listener failed", tab_id=event.tab_id, state=event.state)
+
+    def _finish_tab_reconnect(
+        self, pending: TabReconnectEvent | None, state: Literal["done", "failed"], new_target_id: str | None = None
+    ) -> None:
+        if pending is None or self._pending_tab_reconnects.get(pending.tab_id) is not pending:
+            return
+        self._pending_tab_reconnects.pop(pending.tab_id)
+        self._notify_tab_reconnect(TabReconnectEvent(pending.tab_id, pending.target_id, state, new_target_id))
 
     async def start(self) -> None:
         if self._runner is not None:
@@ -209,9 +244,24 @@ class ExtensionCdpAdapter:
         if event == "debugger.event":
             await self._handle_debugger_event(params)
         elif event == "debugger.detached":
-            await self._remove_tab_with_events(params.get("tabId"))
+            tab_id = params.get("tabId")
+            if type(tab_id) is int:
+                self._extension_detach_epochs[tab_id] = self._extension_detach_epochs.get(tab_id, 0) + 1
+                if params.get("reason") == "target_closed":
+                    try:
+                        target_id = self._registry.target_id_for_tab(tab_id)
+                    except KeyError:
+                        pass
+                    else:
+                        pending = TabReconnectEvent(tab_id, target_id, "pending")
+                        self._pending_tab_reconnects[tab_id] = pending
+                        self._notify_tab_reconnect(pending)
+            await self._remove_tab_with_events(tab_id)
         elif event == "scope.tabRemoved":
-            await self._remove_tab_with_events(params.get("tabId"))
+            tab_id = params.get("tabId")
+            if type(tab_id) is int:
+                self._finish_tab_reconnect(self._pending_tab_reconnects.get(tab_id), "failed")
+            await self._remove_tab_with_events(tab_id)
         elif event in {"scope.tabAdded", "tabs.created"}:
             tab_id = params.get("tabId")
             if type(tab_id) is not int:
@@ -1236,22 +1286,28 @@ class ExtensionCdpAdapter:
     async def _handle_tab_added(
         self, params: dict, include_opener: bool, generation: int, connection_generation: int | None = None
     ) -> None:
-        if self._auto_attach:
-            async with self._root_target_setup_lock:
-                if connection_generation is not None and (
-                    connection_generation != self._connection_generation or not self._auto_attach
-                ):
-                    return
-                await self._handle_tab_added_locked(params, include_opener, generation)
-            return
-        if connection_generation is not None:
-            return
-        await self._handle_tab_added_locked(params, include_opener, generation)
+        tab_id = params.get("tabId")
+        pending = self._pending_tab_reconnects.get(tab_id) if type(tab_id) is int else None
+        try:
+            if self._auto_attach:
+                async with self._root_target_setup_lock:
+                    if connection_generation is not None and (
+                        connection_generation != self._connection_generation or not self._auto_attach
+                    ):
+                        return
+                    await self._handle_tab_added_locked(params, include_opener, generation)
+                return
+            if connection_generation is not None:
+                return
+            await self._handle_tab_added_locked(params, include_opener, generation)
+        finally:
+            self._finish_tab_reconnect(pending, "failed")
 
     async def _handle_tab_added_locked(self, params: dict, include_opener: bool, generation: int) -> None:
         tab_id = params.get("tabId")
         if type(tab_id) is not int:
             return
+        pending = self._pending_tab_reconnects.get(tab_id)
         opener_id = None
         opener_tab_id = params.get("openerTabId")
         if include_opener and self._auto_attach and type(opener_tab_id) is int:
@@ -1287,6 +1343,8 @@ class ExtensionCdpAdapter:
                 {"targetInfo": self._target_info(tab_id)},
                 scope_guard=(tab_id, generation),
             )
+        if not self._auto_attach and self._scope_is_current(tab_id, generation):
+            self._finish_tab_reconnect(pending, "done", self._registry.target_id_for_tab(tab_id))
 
     async def _remove_tab_with_events(self, tab_id: object) -> None:
         if type(tab_id) is not int:
@@ -1333,6 +1391,7 @@ class ExtensionCdpAdapter:
                 preserve_attachment = False
                 connection_generation = self._connection_generation
                 cleanup_suppress_interrupts = True
+                extension_detach_epoch = self._extension_detach_epochs.get(tab_id, 0)
                 try:
                     if not debugger_attached:
                         try:
@@ -1360,7 +1419,12 @@ class ExtensionCdpAdapter:
                             self._unexposed_attached_tabs.add(tab_id)
                     raise
                 finally:
-                    if debugger_attached and not attachment_committed and not preserve_attachment:
+                    if (
+                        debugger_attached
+                        and not attachment_committed
+                        and not preserve_attachment
+                        and self._extension_detach_epochs.get(tab_id, 0) == extension_detach_epoch
+                    ):
                         await self._discard_failed_attachment_safely(
                             tab_id,
                             suppress_interrupts=cleanup_suppress_interrupts,
@@ -1446,6 +1510,8 @@ class ExtensionCdpAdapter:
     async def _emit_attached(self, tab_id: int, target_id: str, generation: int) -> None:
         if not self._scope_is_current(tab_id, generation) or tab_id in self._unexposed_attached_tabs:
             return
+        ws = self._client_ws
+        pending = self._pending_tab_reconnects.get(tab_id)
         await self._emit(
             "Target.attachedToTarget",
             {
@@ -1455,6 +1521,14 @@ class ExtensionCdpAdapter:
             },
             scope_guard=(tab_id, generation),
         )
+        if (
+            ws is not None
+            and ws is self._client_ws
+            and not ws.closed
+            and self._scope_is_current(tab_id, generation)
+            and tab_id not in self._unexposed_attached_tabs
+        ):
+            self._finish_tab_reconnect(pending, "done", target_id)
 
     def _update_main_frame(self, tab_id: int, params: dict) -> None:
         frame = params.get("frame")
@@ -1573,6 +1647,7 @@ class ExtensionCdpAdapter:
                 task.cancel()
         self._auto_attach = False
         self._discover_targets = False
+        self._pending_tab_reconnects.clear()
         self._attached_tabs.clear()
         self._unexposed_attached_tabs.clear()
         self._command_states.clear()
