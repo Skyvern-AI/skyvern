@@ -20,6 +20,11 @@ from skyvern.webeye.actions.responses import ActionFailure, ActionSuccess
 from skyvern.webeye.browser_engine import BrowserEngineMetadata, BrowserEngineSelection
 
 
+@pytest.fixture(autouse=True)
+def _instant_upload_settle(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(handler_module, "_upload_settle_sleep", AsyncMock())
+
+
 class _EngineError(Exception):
     pass
 

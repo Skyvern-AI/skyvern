@@ -32,8 +32,9 @@ export function reviewCoverageTag(
   if (block.coverage === "different_source") return "Different source";
   if (block.coverage === "unknown") return "Not tested under this name";
   if (
-    block.coverage === "never_run" ||
-    (block.coverage === undefined && block.neverTested)
+    block.change !== "unchanged" &&
+    (block.coverage === "never_run" ||
+      (block.coverage === undefined && block.neverTested))
   ) {
     return "Never tested";
   }

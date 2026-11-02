@@ -5,15 +5,16 @@ from unittest.mock import AsyncMock
 
 import pytest
 import structlog.testing
-from fastapi import FastAPI, HTTPException, Response
+from fastapi import HTTPException, Response
 
 from skyvern.forge.agent_functions import AgentFunction
 from skyvern.forge.sdk.routes import credentials
-from skyvern.forge.sdk.routes.routers import base_router, legacy_base_router
+from skyvern.forge.sdk.routes.routers import legacy_base_router
 from skyvern.forge.sdk.schemas.credentials import Credential, CredentialType, CredentialVaultType, TotpType
 from skyvern.forge.sdk.schemas.totp_codes import OTPType, RawTOTPCode, TOTPCodeCreate
 from skyvern.forge.sdk.services.credential.custom_credential_vault_service import CustomCredentialNotConfiguredError
 from skyvern.services.otp_service import OTPValue
+from tests.unit.shared_route_app import shared_route_app
 
 
 @pytest.fixture(autouse=True)
@@ -275,10 +276,8 @@ async def test_send_totp_code_insufficient_credits_persists_raw_within_cap(
     create_raw_otp_code.assert_awaited_once()
 
 
-def test_send_totp_code_openapi_declares_200_totp_code_and_402_no_202() -> None:
-    fastapi_app = FastAPI()
-    fastapi_app.include_router(base_router, prefix="/v1")
-    fastapi_app.include_router(legacy_base_router, prefix="/api/v1")
+def test_send_totp_code_openapi_declares_200_totp_code_and_402_no_202(monkeypatch: pytest.MonkeyPatch) -> None:
+    fastapi_app = shared_route_app(monkeypatch)
 
     responses = fastapi_app.openapi()["paths"]["/v1/credentials/totp"]["post"]["responses"]
     assert responses["200"]["content"]["application/json"]["schema"]["$ref"].endswith("/TOTPCode")

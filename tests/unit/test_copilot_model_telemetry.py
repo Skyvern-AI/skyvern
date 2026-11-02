@@ -2352,7 +2352,7 @@ def responses_stub() -> Iterator[_ResponsesStub]:
 
     server = ThreadingHTTPServer(("127.0.0.1", 0), _Handler)
     stub.base = f"http://127.0.0.1:{server.server_port}"
-    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread = threading.Thread(target=server.serve_forever, kwargs={"poll_interval": 0.01}, daemon=True)
     thread.start()
     try:
         yield stub
@@ -2530,7 +2530,7 @@ async def test_a_stream_without_progress_is_cut_as_a_retriable_timeout_but_slow_
     async def fake_call(**_kwargs: object) -> AsyncIterator[Any]:
         return upstream()
 
-    monkeypatch.setattr(model_telemetry_module, "_STREAM_PROGRESS_TIMEOUT_SECONDS", 0.5)
+    monkeypatch.setattr(model_telemetry_module, "_STREAM_PROGRESS_TIMEOUT_SECONDS", 0.3)
     monkeypatch.setattr("litellm.acompletion", fake_call)
     monkeypatch.setattr("litellm.aresponses", fake_call)
     model_settings = (

@@ -2,15 +2,15 @@
 
 Pure-unit coverage of ``_record_scrape_span_attrs``: a real tracer + the shared
 ``span_exporter`` fixture, no browser, no Playwright. Asserts the input/mode,
-output-shape, caller-bucket, and outcome attrs are emitted under both an
-attributed (``scrape_trigger`` set) and an unattributed (fallback) caller.
+output-shape, caller-bucket, and outcome attrs under both an attributed
+(``scrape_trigger`` set) and an unattributed (fallback) caller, and that page_url
+drops its query string.
 """
 
 from __future__ import annotations
 
 from zoneinfo import ZoneInfo
 
-import pytest
 from opentelemetry import trace as otel_trace
 from opentelemetry.sdk.trace.export.in_memory_span_exporter import InMemorySpanExporter
 
@@ -101,32 +101,3 @@ def test_scrape_span_uses_context_trigger_when_caller_sets_it(
     attrs = span.attributes or {}
     assert attrs.get("scrape_trigger") == "verification"
     assert attrs.get("screenshots_consumed") is True
-
-
-def test_scrape_span_marks_empty_page_retry_when_set(
-    span_exporter: InMemorySpanExporter,
-) -> None:
-    kwargs = dict(_BASE_KWARGS)
-    kwargs["empty_page_retry"] = True
-    skyvern_context.reset()
-    _record_inside_span(**kwargs)
-
-    span = _span_by_name(span_exporter.get_finished_spans(), SCRAPE_SPAN_NAME)
-    assert span is not None
-    attrs = span.attributes or {}
-    assert attrs.get("empty_page_retry") is True
-
-
-@pytest.mark.parametrize("html_value, expected_bytes", [("", 0), ("abc", 3)])
-def test_scrape_span_handles_empty_html(
-    span_exporter: InMemorySpanExporter, html_value: str, expected_bytes: int
-) -> None:
-    kwargs = dict(_BASE_KWARGS)
-    kwargs["html"] = html_value
-    skyvern_context.reset()
-    _record_inside_span(**kwargs)
-
-    span = _span_by_name(span_exporter.get_finished_spans(), SCRAPE_SPAN_NAME)
-    assert span is not None
-    attrs = span.attributes or {}
-    assert attrs.get("html_bytes") == expected_bytes

@@ -1,0 +1,100 @@
+title: Certificate transfer
+description: null
+proxy_location: NONE
+persist_browser_session: false
+reuse_browser_session: false
+pin_saved_session_ip: false
+browser_profile_id: null
+browser_profile_key: null
+model: null
+max_screenshot_scrolls: null
+max_elapsed_time_minutes: null
+adaptive_caching: false
+generate_script_on_terminal: false
+run_with: agent
+browser_type: null
+cache_key: default
+ai_fallback: true
+mask_secrets: false
+code_version: 2
+workflow_definition:
+  version: 2
+  parameters: []
+  blocks:
+    - label: open_vendor_hub
+      continue_on_failure: false
+      next_loop_on_failure: false
+      model: null
+      next_block_label: read_certificate
+      ignore_workflow_system_prompt: false
+      block_type: goto_url
+      url: http://localhost:8910/F6/
+      engine: skyvern-1.0
+    - label: read_certificate
+      continue_on_failure: false
+      next_loop_on_failure: false
+      model: null
+      next_block_label: store_certificate
+      ignore_workflow_system_prompt: false
+      block_type: code
+      parameter_keys: []
+      code: 'cert_id = (await page.locator(''table tbody tr td'').nth(1).inner_text()).strip()
+
+        cert_link = await page.locator(''a.download'').get_attribute(''href'')
+
+        issued_on = (await page.locator(''table tbody tr'').first.locator(''td'').nth(2).inner_text()).strip()
+
+'
+      error_code_mapping: null
+      prompt: null
+      steps:
+        - description: Extract cert id
+          action_type: extract
+          line_start: 1
+          line_end: 1
+        - description: Extract cert link
+          action_type: extract
+          line_start: 2
+          line_end: 2
+        - description: Extract issued on
+          action_type: extract
+          line_start: 3
+          line_end: 3
+      data_schema: null
+      user_owned_goal: null
+      goal_needs_regeneration: null
+      code_edited_by_hand: null
+    - label: store_certificate
+      continue_on_failure: false
+      next_loop_on_failure: false
+      model: null
+      next_block_label: null
+      ignore_workflow_system_prompt: false
+      block_type: file_upload
+      path: '{{ workflow_run_id }}'
+      prompt: null
+      storage_type: s3
+      s3_bucket: qa-capture-bucket
+      aws_access_key_id: ''
+      aws_secret_access_key: ''
+      region_name: us-east-1
+      endpoint_url: null
+      azure_storage_account_name: ''
+      azure_storage_account_key: ''
+      azure_blob_container_name: ''
+      google_credential_id: ''
+      google_drive_folder_id: ''
+      sftp_host: ''
+      sftp_port: null
+      sftp_username: ''
+      sftp_password: ''
+      sftp_private_key: ''
+      sftp_private_key_passphrase: ''
+      sftp_remote_path: ''
+      sftp_host_key: ''
+  finally_block_label: null
+  workflow_system_prompt: null
+  error_code_mapping: null
+  retry_policy: null
+run_sequentially: false
+sequential_key: null

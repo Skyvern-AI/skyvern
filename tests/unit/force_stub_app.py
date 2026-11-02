@@ -7,6 +7,7 @@ from skyvern.forge import set_force_app_instance
 from skyvern.forge.agent_functions import AgentFunction
 from skyvern.forge.forge_app import ForgeApp
 from skyvern.forge.sdk.copilot.browser_ablation import CopilotBrowserCodeMode
+from skyvern.forge.sdk.services.request_principal import APIKeyAuthProfile
 from skyvern.forge.sdk.workflow.models.workflow import WorkflowRunStatus
 
 
@@ -112,6 +113,9 @@ def create_forge_stub_app() -> ForgeApp:
     fake_app_module.AGENT_FUNCTION.MAGIC_LINK_CLOSE_SIGNALS = base_agent_function.MAGIC_LINK_CLOSE_SIGNALS
     fake_app_module.AGENT_FUNCTION.task_v3_age_default = base_agent_function.task_v3_age_default
     fake_app_module.AGENT_FUNCTION.task_v3_application_defaults = base_agent_function.task_v3_application_defaults
+    fake_app_module.AGENT_FUNCTION.task_v3_application_context_texts = (
+        base_agent_function.task_v3_application_context_texts
+    )
     fake_app_module.AGENT_FUNCTION.task_v3_answer_basis_audit = base_agent_function.task_v3_answer_basis_audit
     fake_app_module.AGENT_FUNCTION.task_v3_justify_hold_enabled = base_agent_function.task_v3_justify_hold_enabled
     fake_app_module.AGENT_FUNCTION.serialize_codeblock_parameters = base_agent_function.serialize_codeblock_parameters
@@ -137,7 +141,9 @@ def create_forge_stub_app() -> ForgeApp:
     fake_app_module.AGENT_FUNCTION.is_backup_queue_organization = base_agent_function.is_backup_queue_organization
     fake_app_module.AGENT_FUNCTION.resolve_mcp_oauth_org_lookups = MagicMock(return_value=None)
     fake_app_module.AGENT_FUNCTION.resolve_mcp_oauth_member_api_key = AsyncMock(return_value=None)
-    fake_app_module.AGENT_FUNCTION.resolve_api_key_profile = AsyncMock(return_value=("full_org", None, True))
+    fake_app_module.AGENT_FUNCTION.resolve_api_key_profile = AsyncMock(
+        return_value=APIKeyAuthProfile("full_org", None, True)
+    )
     fake_app_module.AGENT_FUNCTION.get_mcp_request_organization_id = MagicMock(return_value=None)
     fake_app_module.AGENT_FUNCTION.schedule_workflow_run_group_advance = MagicMock(return_value=None)
     fake_app_module.AGENT_FUNCTION.generate_root_workflow_run_id = base_agent_function.generate_root_workflow_run_id

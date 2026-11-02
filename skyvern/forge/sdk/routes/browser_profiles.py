@@ -35,6 +35,7 @@ from skyvern.forge.sdk.routes.code_samples import (
     UPDATE_BROWSER_PROFILE_CODE_SAMPLE_PYTHON,
     UPDATE_BROWSER_PROFILE_CODE_SAMPLE_TS,
 )
+from skyvern.forge.sdk.routes.pagination import MAX_PAGE, MAX_PAGE_SIZE
 from skyvern.forge.sdk.routes.routers import base_router
 from skyvern.forge.sdk.schemas.browser_profiles import (
     BrowserProfile,
@@ -229,8 +230,8 @@ async def create_browser_profile(
     include_in_schema=False,
 )
 async def list_browser_profiles(
-    page: int = Query(1, ge=1),
-    page_size: int = Query(10, ge=1),
+    page: int = Query(1, ge=1, le=MAX_PAGE),
+    page_size: int = Query(10, ge=1, le=MAX_PAGE_SIZE),
     include_deleted: bool = Query(default=False, description="Include deleted browser profiles"),
     search_key: str | None = Query(
         None,

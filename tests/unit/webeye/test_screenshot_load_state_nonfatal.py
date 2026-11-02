@@ -12,7 +12,7 @@ from playwright._impl._errors import TargetClosedError
 from playwright._impl._errors import TimeoutError as PlaywrightTimeoutError
 from playwright.async_api import Page
 
-from skyvern.exceptions import FailedToTakeScreenshot, ScreenshotTargetClosed
+from skyvern.exceptions import FailedToTakeScreenshot, ScreenshotPageHasNoDrawnArea, ScreenshotTargetClosed
 from skyvern.forge.sdk.settings_manager import SettingsManager
 from skyvern.webeye import browser_driver_errors
 from skyvern.webeye.browser_engine import BrowserEngineSelection
@@ -265,6 +265,29 @@ class TestScreenshotTargetClosedClassification:
         assert type(exc_info.value) is FailedToTakeScreenshot
         assert exc_info.value.__cause__ is error
         log.error.assert_called_once()
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "message",
+        [
+            "Page.screenshot: Protocol error (Page.captureScreenshot): Cannot take screenshot with 0 width.",
+            "Page.screenshot: Protocol error (Page.captureScreenshot): Cannot take screenshot with 0 height.",
+        ],
+    )
+    async def test_zero_sized_viewport_classifies_as_no_drawn_area(self, message: str) -> None:
+        """A collapsed viewport is the page's own state, so it earns a subclass callers can map to 4xx.
+        The crash and generic cases above are the control: they must stay the plain parent class."""
+        page = _make_page(b"image-bytes")
+        error = PlaywrightError(message)
+        page.screenshot = AsyncMock(side_effect=error)
+        log = MagicMock()
+
+        with pytest.raises(ScreenshotPageHasNoDrawnArea) as exc_info:
+            with pytest.MonkeyPatch.context() as monkeypatch:
+                monkeypatch.setattr(page_module, "LOG", log)
+                await _current_viewpoint_screenshot_helper(page, engine_selection=_stock_selection())
+
+        assert exc_info.value.__cause__ is error
 
     @pytest.mark.asyncio
     @pytest.mark.parametrize(

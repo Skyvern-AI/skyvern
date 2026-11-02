@@ -16,6 +16,12 @@ from playwright.async_api import BrowserContext, Download, Frame, Page, Response
 from skyvern.cli.core.browser_ops import do_screenshot
 from skyvern.config import settings
 from skyvern.forge import app
+from skyvern.forge.sdk.copilot.agent_context import (
+    PendingBrowserInteractionObservation,
+    ScoutedDragDestination,
+    ScoutedInteraction,
+    ScoutedSelectorCandidate,
+)
 from skyvern.forge.sdk.copilot.browser_code_contract import BROWSER_SESSION_UNAVAILABLE_ERROR_CODE
 from skyvern.forge.sdk.copilot.browser_target import BrowserSessionBinding
 from skyvern.forge.sdk.copilot.build_test_outcome import (
@@ -73,10 +79,6 @@ from skyvern.forge.sdk.copilot.page_identity import (
 )
 from skyvern.forge.sdk.copilot.runtime import (
     AgentContext,
-    PendingBrowserInteractionObservation,
-    ScoutedDragDestination,
-    ScoutedInteraction,
-    ScoutedSelectorCandidate,
     current_call_browser_session_override,
     current_demonstrated_action,
     effective_browser_session_id,

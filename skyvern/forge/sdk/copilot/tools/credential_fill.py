@@ -15,6 +15,11 @@ import structlog
 from skyvern.cli.core.session_manager import get_page
 from skyvern.forge import app
 from skyvern.forge.sdk.browser_action_policy import canonicalize_origin
+from skyvern.forge.sdk.copilot.agent_context import (
+    CredentialOriginDeclineStatus,
+    CredentialOriginRecovery,
+    ScoutedSelectorCandidate,
+)
 from skyvern.forge.sdk.copilot.blocker_signal import (
     CREDENTIAL_ORIGIN_RECOVERY_DECLINED_REASON_CODE,
     CREDENTIAL_ORIGIN_RECOVERY_PENDING_REASON_CODE,
@@ -61,9 +66,6 @@ from skyvern.forge.sdk.copilot.request_policy import (
 )
 from skyvern.forge.sdk.copilot.runtime import (
     AgentContext,
-    CredentialOriginDeclineStatus,
-    CredentialOriginRecovery,
-    ScoutedSelectorCandidate,
     browser_evidence_commit_lock,
     browser_session_turn,
     effective_browser_session_id,

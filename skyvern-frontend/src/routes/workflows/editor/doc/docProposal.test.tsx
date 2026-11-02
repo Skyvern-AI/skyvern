@@ -279,6 +279,13 @@ describe("Copilot proposal in the Doc view", () => {
           neverTested: true,
           coverage: "unknown",
         },
+        {
+          label: "sign_out",
+          blockType: "navigation",
+          change: "unchanged",
+          neverTested: true,
+          coverage: "never_run",
+        },
       ],
       duplicateWrites: [
         {

@@ -14,8 +14,7 @@ _GPT56_CAPABILITIES = {
     "supports_reasoning": True,
 }
 # register_model also adds openai keys to open_ai_chat_completion_models; azure keys touch only model_cost.
-# Those are the only collections restored below, so these are the only providers allowed here.
-RESTORED_PROVIDERS = frozenset({"openai", "azure"})
+# Those are the only collections restored below, so openai and azure are the only providers allowed here.
 GPT56_LITELLM_MODELS: dict[str, dict[str, object]] = {
     **{f"gpt-5.6-{variant}": {"litellm_provider": "openai", **_GPT56_CAPABILITIES} for variant in ("sol", "terra")},
     **{

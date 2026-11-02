@@ -260,7 +260,7 @@ async def test_openrouter_deepseek_v4_flash_sends_provider_ignore_on_the_wire(
     captured: dict[str, Any] = {}
 
     with _openrouter_capture_server(captured) as server:
-        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread = threading.Thread(target=server.serve_forever, kwargs={"poll_interval": 0.01}, daemon=True)
         thread.start()
         try:
             llm_config = _pin_deepseek_v4_flash_at(server, monkeypatch)
@@ -290,7 +290,7 @@ async def test_reasoning_truncated_openrouter_call_is_retried_with_half_the_budg
     replies = [(None, "length"), (_OPENROUTER_ANSWER, "stop")]
 
     with _openrouter_capture_server(captured, replies) as server:
-        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread = threading.Thread(target=server.serve_forever, kwargs={"poll_interval": 0.01}, daemon=True)
         thread.start()
         try:
             _pin_deepseek_v4_flash_at(server, monkeypatch)

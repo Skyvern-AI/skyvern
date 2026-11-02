@@ -71,7 +71,7 @@ AGENT_BLOCK_TOOLS: dict[BlockType, BlockTool | str] = {
         LoginBlockYAML,
         ("credential", "url"),
         tool_name="login",
-        description="Sign in at url with one of this run's credentials." + _NESTED_AGENT,
+        description="Sign in at url with one of this step's credentials." + _NESTED_AGENT,
         nested_agent=True,
     ),
     BlockType.WEB_SEARCH: BlockTool(

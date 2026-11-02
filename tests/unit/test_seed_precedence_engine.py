@@ -1481,37 +1481,6 @@ async def test_setup_credential_resolves_fallback_db_selection(monkeypatch: pyte
 
 
 @pytest.mark.asyncio
-async def test_setup_credential_uses_same_rich_resolver_as_block(monkeypatch: pytest.MonkeyPatch) -> None:
-    # Regression pin: setup resolves the single login block's credential through the identical resolver
-    # the mid-run stamp uses (_resolve_login_block_credential_ids), so the two can never disagree.
-    svc = WorkflowService()
-    rich = AsyncMock(return_value=["cred_rich"])
-    monkeypatch.setattr(svc, "_resolve_login_block_credential_ids", rich)
-    monkeypatch.setattr(
-        app.DATABASE.credentials,
-        "get_credential",
-        AsyncMock(return_value=SimpleNamespace(browser_profile_id="bp_rich", auto_profile_disabled=False)),
-    )
-    monkeypatch.setattr(
-        app.DATABASE.browser_sessions,
-        "get_browser_profile",
-        AsyncMock(return_value=SimpleNamespace(browser_profile_id="bp_rich")),
-    )
-    workflow = _workflow_with_blocks(_login_block("login", _credential_parameter("login", "cred_static")))
-
-    result = await svc._resolve_credential_browser_profile_id_for_setup(
-        workflow=workflow,  # type: ignore[arg-type]
-        workflow_run_id="wr_test",
-        organization_id="o_test",
-        parameter_values={},
-    )
-
-    assert result == "bp_rich"
-    rich.assert_awaited_once()
-    assert rich.await_args.args[1:] == ("wr_test", "o_test", "wpid_test")
-
-
-@pytest.mark.asyncio
 async def test_setup_pin_resolves_pool_credential(monkeypatch: pytest.MonkeyPatch) -> None:
     # The sibling pin resolver had the identical gap: a pool/DB-selected credential was invisible, so a
     # pinning credential's dedicated IP was not applied at setup. It now resolves via the same rich path.

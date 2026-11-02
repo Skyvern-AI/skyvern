@@ -27,6 +27,12 @@ from skyvern.forge import app
 # share one exact-match sensitive-key policy.
 from skyvern.forge.log_redaction import redact_sensitive_fields
 from skyvern.forge.sdk.artifact.models import ArtifactType, LogEntityType
+from skyvern.forge.sdk.copilot.browser_target import (
+    BROWSER_TARGET_PARAM_NAME,
+    DEBUG_BROWSER_TOOL_NAMES,
+    resolve_browser_session_binding,
+    tool_accepts_target,
+)
 from skyvern.forge.sdk.copilot.code_write_diff import CODE_WRITE_TOOL_NAMES, CodeWriteDiff
 from skyvern.forge.sdk.copilot.context import (
     REPLY_TOOL_NAME,
@@ -495,6 +501,7 @@ async def stream_to_sse(
                             iteration=iteration,
                             tool_call_id=call_id,
                             timestamp=presentation.started_at or tool_call_ts,
+                            browser_session_id=_call_browser_session_id(ctx, event.item, tool_name, tool_input),
                         )
                     )
 
@@ -1053,6 +1060,30 @@ def _update_enforcement_from_tool(
 
     if tool_name in _OBSERVATION_TOOLS:
         ctx.observation_after_navigate = True
+
+
+def _call_browser_session_id(
+    ctx: CopilotContext, item: RunItem, tool_name: str, tool_input: dict[str, Any]
+) -> str | None:
+    """The page browser this call binds to as of now; dispatch resolves again, so this is display-only."""
+    server = ctx.discovery_mcp_server
+    if tool_name in DEBUG_BROWSER_TOOL_NAMES:
+        native = next(
+            (tool for tool in item.agent.tools if isinstance(tool, FunctionTool) and tool.name == tool_name), None
+        )
+        if native is None:
+            return None
+        arguments = (
+            {BROWSER_TARGET_PARAM_NAME: tool_input.get(BROWSER_TARGET_PARAM_NAME)}
+            if tool_accepts_target(native)
+            else {}
+        )
+    elif server is not None and server.requires_browser(tool_name):
+        arguments = tool_input
+    else:
+        return None
+    binding = resolve_browser_session_binding(ctx, arguments)
+    return None if binding.unavailable_reason else binding.session_id_for(ctx)
 
 
 def _sanitize_input(raw_args: dict[str, Any]) -> dict[str, Any]:

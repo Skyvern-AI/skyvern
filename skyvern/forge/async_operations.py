@@ -173,3 +173,24 @@ class AsyncOperationPool:
         self._remove_aio_tasks(task_id)
         self._remove_operations(task_id)
         LOG.info("Successfully removed aio tasks and async operations", task_id=task_id)
+
+    async def cancel_task(self, task_id: str) -> None:
+        """Cancel the task's running aio tasks and wait until they have ended before forgetting its operations; a caller
+        cancelled meanwhile keeps waiting and re-raises its cancellation once they have."""
+        aio_tasks = self.get_aio_tasks(task_id)
+        caller_cancellation: asyncio.CancelledError | None = None
+        while pending := [aio_task for aio_task in aio_tasks if not aio_task.done()]:
+            for aio_task in pending:
+                aio_task.cancel()
+            try:
+                await asyncio.wait(pending)
+            except asyncio.CancelledError as cancellation:
+                caller_cancellation = caller_cancellation or cancellation
+        # Outcomes are discarded, as in stall_watch.cancel_and_wait.
+        for aio_task in aio_tasks:
+            if not aio_task.cancelled():
+                aio_task.exception()
+        self._remove_aio_tasks(task_id)
+        self._remove_operations(task_id)
+        if caller_cancellation is not None:
+            raise caller_cancellation
