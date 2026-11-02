@@ -147,7 +147,32 @@ async def test_scaled_viewports_decline_cdp_and_keep_animation_retry(geometry: d
 @pytest.mark.parametrize("animations", ["disabled", "allow"])
 async def test_scaled_viewport_decline_retries_inside_the_remaining_deadline(
     animations: Literal["allow", "disabled"],
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    class RecordingCaptureDeadline(page_module._CaptureDeadline):
+        remaining_budgets: list[int]
+
+        def __init__(
+            self, *, at: float, animations: Literal["allow", "disabled"] = "disabled", record_health: bool = True
+        ) -> None:
+            super().__init__(at=at, animations=animations, record_health=record_health)
+            self.remaining_budgets = []
+
+        def remaining_ms(self) -> int:
+            budget = super().remaining_ms()
+            self.remaining_budgets.append(budget)
+            return budget
+
+    captures: list[RecordingCaptureDeadline] = []
+
+    def capture_deadline(
+        *, at: float, animations: Literal["allow", "disabled"] = "disabled", record_health: bool = True
+    ) -> RecordingCaptureDeadline:
+        capture = RecordingCaptureDeadline(at=at, animations=animations, record_health=record_health)
+        captures.append(capture)
+        return capture
+
+    monkeypatch.setattr(page_module, "_CaptureDeadline", capture_deadline)
     page = _page()
     session = page.context.new_cdp_session.return_value
     session.send.side_effect = None
@@ -161,9 +186,6 @@ async def test_scaled_viewport_decline_retries_inside_the_remaining_deadline(
         return b"retry-bytes"
 
     page.screenshot.side_effect = finishes_loading_after_the_first_attempt
-    loop = asyncio.get_running_loop()
-    started = loop.time()
-
     result = await SkyvernFrame.take_scrolling_screenshot(
         page, timeout=1600, mode=ScreenshotMode.LITE, scrolling_number=0, animations=animations
     )
@@ -172,7 +194,10 @@ async def test_scaled_viewport_decline_retries_inside_the_remaining_deadline(
     assert [call_animations for call_animations, _ in calls] == [animations, "allow"]
     (_, primary), (_, retry) = calls
     assert primary <= 1200 and retry <= 1600 - primary
-    assert loop.time() - started < 1.6
+    # The retry must use the shared deadline's actual remaining budget. A wall-clock assertion here
+    # also measures unrelated CI scheduler delays after the successful screenshot has returned.
+    assert len(captures) == 1
+    assert retry == captures[0].remaining_budgets[-1]
 
 
 @pytest.mark.asyncio
