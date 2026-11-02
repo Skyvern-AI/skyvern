@@ -79,11 +79,13 @@ from skyvern.forge.sdk.services import (
 from skyvern.forge.sdk.services.audit_events import AuditEvent
 from skyvern.forge.sdk.services.credentials import AuthenticatorTotpParseResult
 from skyvern.forge.sdk.services.request_principal import (
+    APIKeyAuthProfile,
     BearerIdentityResolution,
     BearerIdentityStatus,
     RequestPrincipal,
     get_request_principal,
     human_user_id,
+    scoped_api_key_id_from_actor,
 )
 from skyvern.forge.sdk.trace import traced
 from skyvern.forge.sdk.workflow.models.block import BaseTaskBlock, BlockTypeVar
@@ -1124,11 +1126,28 @@ class AgentFunction:
         *,
         principal: RequestPrincipal | None = None,
         workflow_run_id: str | None = None,
+        requested_by: str | None = None,
     ) -> None:
         """Cloud checks folder use before releasing a credential secret; OSS has no credential-folder ACLs."""
 
+    async def enforce_scoped_credential_use(
+        self,
+        organization_id: str,
+        workflow_run_id: str | None,
+        *,
+        requested_by: str | None = None,
+    ) -> RequestPrincipal | None:
+        if scoped_api_key_id_from_actor(requested_by):
+            raise PermissionError("credential not accessible")
+        return None
+
     async def enforce_totp_identifier_credential_use(
-        self, organization_id: str, totp_identifier: str, *, workflow_run_id: str | None = None
+        self,
+        organization_id: str,
+        totp_identifier: str,
+        *,
+        workflow_run_id: str | None = None,
+        requested_by: str | None = None,
     ) -> None:
         """Cloud checks credentials bound to a TOTP identifier; OSS has no credential-folder ACLs."""
 
@@ -1145,6 +1164,7 @@ class AgentFunction:
         organization_id: str | None = None,
         browser_profile_id: str | None = None,
         browser_session_id: str | None = None,
+        requested_by: str | None = None,
     ) -> None:
         """Cloud checks credentials attached to run browser state; OSS has no credential-folder ACLs."""
 
@@ -1946,8 +1966,8 @@ class AgentFunction:
     async def resolve_member_api_key_user_id(self, organization_id: str, token_id: str) -> str | None:
         return None
 
-    async def resolve_api_key_profile(self, organization_id: str, token_id: str) -> tuple[str, str | None, bool] | None:
-        return "full_org", None, True
+    async def resolve_api_key_profile(self, organization_id: str, token_id: str) -> APIKeyAuthProfile | None:
+        return APIKeyAuthProfile("full_org", None, True)
 
     async def resolve_org_api_key(self, organization_id: str) -> str | None:
         """Return an org-scoped API key; returns None in the base implementation."""

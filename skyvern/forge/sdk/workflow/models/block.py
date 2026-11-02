@@ -20791,6 +20791,7 @@ class WorkflowTriggerBlock(Block):
                 skyvern_context.SkyvernContext(
                     run_id=parent_context.run_id if parent_context else None,
                     root_workflow_run_id=parent_context.root_workflow_run_id if parent_context else None,
+                    requested_by=parent_context.requested_by if parent_context else None,
                     copilot_session_id=parent_context.copilot_session_id if parent_context else None,
                     trigger_type=inherited_trigger_type,
                 )
@@ -20942,6 +20943,7 @@ class WorkflowTriggerBlock(Block):
                         root_workflow_run_id=async_parent_context.root_workflow_run_id
                         if async_parent_context
                         else None,
+                        requested_by=async_parent_context.requested_by if async_parent_context else None,
                         copilot_session_id=async_parent_context.copilot_session_id if async_parent_context else None,
                         trigger_type=async_inherited_trigger_type,
                     )

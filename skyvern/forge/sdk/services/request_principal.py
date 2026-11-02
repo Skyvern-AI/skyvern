@@ -4,6 +4,8 @@ from collections.abc import Mapping
 from contextvars import ContextVar
 from dataclasses import dataclass
 from enum import StrEnum
+from typing import Literal
+from urllib.parse import quote, unquote
 
 import structlog
 from fastapi import HTTPException
@@ -20,10 +22,12 @@ BEARER_IDENTITY_TIMEOUT_SECONDS = 2.0
 
 class AuthKind(StrEnum):
     api_key = "api_key"
+    scoped_api_key = "scoped_api_key"
     ui_session = "ui_session"
     bearer = "bearer"
     # The key authorized the request; a valid bearer for the same organization supplied the user.
     api_key_and_bearer = "api_key_and_bearer"
+    scoped_api_key_and_bearer = "scoped_api_key_and_bearer"
     member_api_key = "member_api_key"
     ui_session_and_bearer = "ui_session_and_bearer"
 
@@ -57,6 +61,16 @@ class BearerIdentityResolution:
 
 
 @dataclass(frozen=True)
+class APIKeyAuthProfile:
+    access_mode: Literal["full_org", "member", "scoped"]
+    bound_user_id: str | None
+    valid: bool
+    scopes: frozenset[str] = frozenset()
+    workflow_folder_grants: frozenset[str] = frozenset()
+    reach: Literal["organization", "folders"] | None = None
+
+
+@dataclass(frozen=True)
 class RequestPrincipal:
     organization_id: str
     auth_kind: AuthKind
@@ -69,6 +83,32 @@ class RequestPrincipal:
     app_role: str | None = None
     app_role_is_authoritative: bool = False
     impersonator_user_id: str | None = None
+    api_key_access_mode: str | None = None
+    api_key_scopes: frozenset[str] = frozenset()
+    api_key_folder_grants: frozenset[str] = frozenset()
+    api_key_reach: Literal["organization", "folders"] | None = None
+
+
+_SCOPED_API_KEY_ACTOR_PREFIX = "scoped_api_key:"
+
+
+def scoped_api_key_actor_id(token_id: str, user_id: str | None = None) -> str:
+    encoded_user_id = f":{quote(user_id, safe='')}" if user_id else ""
+    return f"{_SCOPED_API_KEY_ACTOR_PREFIX}{token_id}{encoded_user_id}"
+
+
+def scoped_api_key_id_from_actor(actor_id: str | None) -> str | None:
+    if actor_id is None or not actor_id.startswith(_SCOPED_API_KEY_ACTOR_PREFIX):
+        return None
+    token_id = actor_id.removeprefix(_SCOPED_API_KEY_ACTOR_PREFIX).partition(":")[0]
+    return token_id or None
+
+
+def scoped_api_key_user_id_from_actor(actor_id: str | None) -> str | None:
+    if actor_id is None or not actor_id.startswith(_SCOPED_API_KEY_ACTOR_PREFIX):
+        return None
+    _, separator, encoded_user_id = actor_id.removeprefix(_SCOPED_API_KEY_ACTOR_PREFIX).partition(":")
+    return unquote(encoded_user_id) if separator and encoded_user_id else None
 
 
 def extract_clerk_impersonator_user_id(payload: Mapping[str, object]) -> str | None:
@@ -112,7 +152,13 @@ def human_user_id(principal: RequestPrincipal | None, organization_id: str) -> s
         principal is None
         or principal.organization_id != organization_id
         or principal.auth_kind
-        not in {AuthKind.bearer, AuthKind.ui_session, AuthKind.ui_session_and_bearer, AuthKind.member_api_key}
+        not in {
+            AuthKind.bearer,
+            AuthKind.ui_session,
+            AuthKind.ui_session_and_bearer,
+            AuthKind.member_api_key,
+            AuthKind.scoped_api_key_and_bearer,
+        }
         or principal.user_id is None
         or principal.user_id == synthetic_user_id(organization_id)
     ):
@@ -123,11 +169,21 @@ def human_user_id(principal: RequestPrincipal | None, organization_id: str) -> s
 def reject_non_admin_api_key_secret_access(principal: RequestPrincipal | None) -> None:
     if not isinstance(principal, RequestPrincipal):
         return
-    if principal.auth_kind == AuthKind.member_api_key:
-        raise HTTPException(status_code=403, detail="Organization API-key secrets require an Admin session")
+    if (
+        principal.auth_kind
+        in {
+            AuthKind.member_api_key,
+            AuthKind.scoped_api_key,
+            AuthKind.scoped_api_key_and_bearer,
+        }
+        or principal.api_key_access_mode == "scoped"
+    ):
+        raise HTTPException(
+            status_code=403, detail="Organization API-key secrets are unavailable to member or scoped keys"
+        )
 
 
-async def resolve_api_key_profile_identity(organization_id: str, token_id: str) -> tuple[str, str | None, bool]:
+async def resolve_api_key_profile_identity(organization_id: str, token_id: str) -> APIKeyAuthProfile:
     try:
         profile = await app.AGENT_FUNCTION.resolve_api_key_profile(organization_id, token_id)
     except Exception:
@@ -135,9 +191,11 @@ async def resolve_api_key_profile_identity(organization_id: str, token_id: str) 
         raise HTTPException(status_code=401, detail="Invalid credentials") from None
     if (
         profile is None
-        or not profile[2]
-        or profile[0] not in {"full_org", "member"}
-        or (profile[0] == "member" and not profile[1])
+        or not profile.valid
+        or profile.access_mode not in {"full_org", "member", "scoped"}
+        or (profile.access_mode == "member" and not profile.bound_user_id)
+        or (profile.access_mode == "scoped" and profile.reach not in {"organization", "folders"})
+        or (profile.access_mode == "scoped" and profile.reach == "folders" and not profile.workflow_folder_grants)
     ):
         raise HTTPException(status_code=401, detail="Invalid credentials")
     return profile
@@ -177,11 +235,19 @@ def _build_request_principal(
     api_key_token_id: str | None,
     identity: BearerIdentity | None,
     member_user_id: str | None,
+    api_key_profile: APIKeyAuthProfile | None,
 ) -> RequestPrincipal:
     member_key = member_user_id is not None
+    scoped_key = api_key_profile is not None and api_key_profile.access_mode == "scoped"
+    if member_key:
+        auth_kind = AuthKind.member_api_key
+    elif scoped_key:
+        auth_kind = AuthKind.scoped_api_key_and_bearer if identity else AuthKind.scoped_api_key
+    else:
+        auth_kind = _auth_kind(api_key_type, identity is not None)
     return RequestPrincipal(
         organization_id=organization_id,
-        auth_kind=AuthKind.member_api_key if member_key else _auth_kind(api_key_type, identity is not None),
+        auth_kind=auth_kind,
         api_key_token_id=api_key_token_id,
         user_id=member_user_id or (identity.user_id if identity else None),
         org_role="org:member" if member_user_id is not None else (identity.org_role if identity else None),
@@ -192,6 +258,10 @@ def _build_request_principal(
         app_role=identity.app_role if identity else None,
         app_role_is_authoritative=identity.app_role_is_authoritative if identity else False,
         impersonator_user_id=identity.impersonator_user_id if identity else None,
+        api_key_access_mode=api_key_profile.access_mode if api_key_profile else None,
+        api_key_scopes=api_key_profile.scopes if api_key_profile else frozenset(),
+        api_key_folder_grants=api_key_profile.workflow_folder_grants if api_key_profile else frozenset(),
+        api_key_reach=api_key_profile.reach if api_key_profile else None,
     )
 
 
@@ -200,7 +270,7 @@ async def resolve_request_principal(
     *,
     api_key_type: OrganizationAuthTokenType | None = None,
     api_key_token_id: str | None = None,
-    api_key_profile: tuple[str, str | None, bool] | None = None,
+    api_key_profile: APIKeyAuthProfile | None = None,
     api_key_profile_resolved: bool = False,
     bearer_token: str | None = None,
 ) -> RequestPrincipal:
@@ -237,7 +307,7 @@ async def _resolve_request_principal(
     *,
     api_key_type: OrganizationAuthTokenType | None = None,
     api_key_token_id: str | None = None,
-    api_key_profile: tuple[str, str | None, bool] | None = None,
+    api_key_profile: APIKeyAuthProfile | None = None,
     api_key_profile_resolved: bool = False,
     bearer_token: str | None = None,
 ) -> RequestPrincipal:
@@ -248,8 +318,8 @@ async def _resolve_request_principal(
             api_key_profile = await resolve_api_key_profile_identity(organization_id, api_key_token_id)
         elif api_key_profile is None:
             raise HTTPException(status_code=401, detail="Invalid credentials")
-        if api_key_profile[0] == "member":
-            member_user_id = api_key_profile[1]
+        if api_key_profile.access_mode == "member":
+            member_user_id = api_key_profile.bound_user_id
 
     bearer_hash = hashlib.sha256(bearer_token.encode()).digest() if bearer_token else None
     resolution_key = (
@@ -281,6 +351,7 @@ async def _resolve_request_principal(
                 api_key_token_id,
                 identity_result.identity,
                 member_user_id,
+                api_key_profile,
             )
             set_request_principal(principal, identity_key, identity_result.status.value)
             return principal
@@ -300,6 +371,7 @@ async def _resolve_request_principal(
         api_key_token_id,
         identity_result.identity,
         member_user_id,
+        api_key_profile,
     )
     _request_principal.set((resolution_key, principal, identity_result.status))
     return principal
@@ -311,6 +383,8 @@ def api_key_actor_id(organization_id: str) -> str | None:
     principal = get_request_principal()
     if principal is None or principal.organization_id != organization_id:
         return None
+    if principal.api_key_access_mode == "scoped" and principal.api_key_token_id:
+        return scoped_api_key_actor_id(principal.api_key_token_id, human_user_id(principal, organization_id))
     if principal.auth_kind == AuthKind.member_api_key:
         return human_user_id(principal, organization_id)
     return (

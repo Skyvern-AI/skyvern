@@ -88,7 +88,7 @@ ROUTE_ACTIONS: Mapping[str, str] = {
     "skyvern.forge.sdk.routes.agent_protocol.retry_webhook": "task.retry",
     "skyvern.forge.sdk.routes.agent_protocol.retry_workflow_run": "workflow.retry",
     "skyvern.forge.sdk.routes.agent_protocol.run_block": "workflow.run",
-    "skyvern.forge.sdk.routes.agent_protocol.run_task": "workflow_run.run",
+    "skyvern.forge.sdk.routes.agent_protocol.run_task": "task.run",
     "skyvern.forge.sdk.routes.agent_protocol.run_task_v1": "task.run",
     "skyvern.forge.sdk.routes.agent_protocol.run_task_v2": "task.run",
     "skyvern.forge.sdk.routes.agent_protocol.run_workflow": "workflow.run",
