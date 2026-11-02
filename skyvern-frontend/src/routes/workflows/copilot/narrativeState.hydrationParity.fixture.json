@@ -415,8 +415,13 @@
     {
       "type": "run_outcome",
       "workflow_run_id": "wr_first",
-      "workflow_run_block_ids": ["wrb_first"],
-      "block_labels": ["block_18", "block_19"],
+      "workflow_run_block_ids": [
+        "wrb_first"
+      ],
+      "block_labels": [
+        "block_18",
+        "block_19"
+      ],
       "verdict": "not_demonstrated",
       "role": "recorded",
       "reason_code": null,
@@ -553,8 +558,12 @@
     {
       "type": "run_outcome",
       "workflow_run_id": "wr_retry",
-      "workflow_run_block_ids": ["wrb_retry"],
-      "block_labels": ["block_19"],
+      "workflow_run_block_ids": [
+        "wrb_retry"
+      ],
+      "block_labels": [
+        "block_19"
+      ],
       "verdict": "not_evaluated",
       "role": "recorded",
       "reason_code": null,

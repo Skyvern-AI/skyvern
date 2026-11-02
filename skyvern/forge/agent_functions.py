@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import copy
 import hashlib
 import os
@@ -809,6 +810,7 @@ async def _convert_css_shape_to_string(
     step: Step | None = None,
     *,
     llm_api_handler: LLMAPIHandler | None = None,
+    screenshot_admission: asyncio.Semaphore | None = None,
 ) -> None:
     element_id: str = element.get("id", "")
 
@@ -874,13 +876,15 @@ async def _convert_css_shape_to_string(
                 return None
 
             LOG.debug("call LLM to convert css shape to string shape", element_id=element_id)
-            # A capture failure (FailedToTakeScreenshot) falls through to the outer handler below,
-            # which drops the element from future scrape passes and aborts the conversion.
-            screenshot = await take_element_screenshot(
-                locater,
-                timeout=settings.BROWSER_ACTION_TIMEOUT_MS,
-                engine_selection=skyvern_frame.engine_selection,
-            )
+            # A capture failure (FailedToTakeScreenshot) falls through to the outer handler below, which stops
+            # converting this shape for the rest of the run; the element itself stays in the tree.
+            # A page takes one screenshot at a time and the timeout counts the wait, so a batch admits one capture.
+            async with screenshot_admission or contextlib.nullcontext():
+                screenshot = await take_element_screenshot(
+                    locater,
+                    timeout=settings.BROWSER_ACTION_TIMEOUT_MS,
+                    engine_selection=skyvern_frame.engine_selection,
+                )
             prompt = prompt_engine.load_prompt("css-shape-convert")
             if llm_api_handler is None:
                 llm_api_handler = _get_org_aware_svg_css_converter_llm_api_handler()
@@ -2848,6 +2852,8 @@ class AgentFunction:
         MAX_ELEMENT_CNT = settings.SVG_MAX_PARSING_ELEMENT_CNT
         if engine_selection is UNSET_SELECTION:
             engine_selection = _resolve_engine_selection(task)
+        # Shared by every batch this callback converts, so overlapping calls on one page still queue one capture.
+        css_shape_screenshot_admission = asyncio.Semaphore(1)
 
         @traced(name="skyvern.agent.cleanup_element_tree")
         async def cleanup_element_tree_func(frame: Page | Frame, url: str, element_tree: list[dict]) -> list[dict]:
@@ -2919,6 +2925,7 @@ class AgentFunction:
                             task=task,
                             step=step,
                             llm_api_handler=svg_css_converter_llm_api_handler,
+                            screenshot_admission=css_shape_screenshot_admission,
                         )
                         for elem, sf in eligible_css_shapes
                     ]
