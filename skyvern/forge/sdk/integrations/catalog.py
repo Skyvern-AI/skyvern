@@ -6,7 +6,6 @@ from functools import partial
 from typing import Any, Literal
 
 import structlog
-from fastapi import HTTPException
 from pydantic import BaseModel, ConfigDict, Field
 from pydantic.alias_generators import to_camel
 
@@ -449,10 +448,15 @@ def integration_entries(email_forwarding_available: bool = True) -> list[Integra
 
 async def integration_entries_for_org(organization_id: str) -> list[IntegrationEntry]:
     try:
-        email_forwarding_available = await app.AGENT_FUNCTION.ensure_email_forwarding_available(organization_id)
-    except HTTPException as exc:
-        if exc.status_code != 404:
-            raise
+        email_forwarding_available = await app.AGENT_FUNCTION.ensure_email_forwarding_available(
+            organization_id, fresh=False
+        )
+    except Exception:
+        LOG.warning(
+            "Email forwarding availability check failed; omitting it from the integration catalog",
+            organization_id=organization_id,
+            exc_info=True,
+        )
         email_forwarding_available = False
     return integration_entries(email_forwarding_available=email_forwarding_available)
 

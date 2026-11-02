@@ -982,7 +982,9 @@ OnePasswordTelemetryErrorClass = Literal["invalid_token", "rate_limited", "timeo
 
 
 class AgentFunction:
-    async def ensure_email_forwarding_available(self, organization_id: str | None = None) -> bool:
+    async def ensure_email_forwarding_available(
+        self, organization_id: str | None = None, *, fresh: bool = True
+    ) -> bool:
         """Cloud may hide OSS email-forwarding routes until its ingress is configured."""
         return True
 
