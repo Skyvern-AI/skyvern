@@ -2,7 +2,7 @@ import hmac
 import json
 import typing
 from collections.abc import Iterable
-from typing import TYPE_CHECKING, Any
+from typing import Any
 
 import pydantic
 import pydantic.json
@@ -11,6 +11,7 @@ from sqlalchemy import Column, ColumnElement, Table, func, inspect, or_
 
 from skyvern.constants import SCRUBBED_VALUE
 from skyvern.forge.sdk.artifact.models import Artifact, ArtifactType
+from skyvern.forge.sdk.copilot.context import TurnNarrativePayload
 from skyvern.forge.sdk.core.organization_age_cache import remember_organization_created_at
 from skyvern.forge.sdk.db.enums import OrganizationAuthTokenType, WorkflowRunTriggerType
 from skyvern.forge.sdk.db.models import (
@@ -121,12 +122,10 @@ from skyvern.webeye.actions.actions import (
     WaitAction,
 )
 
-if TYPE_CHECKING:
-    from skyvern.forge.sdk.copilot.context import TurnNarrativePayload
-
 LOG = structlog.get_logger()
 
 _MODEL_TIMESTAMP_FIELDS = frozenset({"started_at", "finished_at", "created_at", "modified_at"})
+_NARRATIVE_PAYLOAD_ADAPTER: pydantic.TypeAdapter[TurnNarrativePayload] = pydantic.TypeAdapter(TurnNarrativePayload)
 
 
 def summarize_copilot_chat_title(content: str, max_length: int = 120) -> str:
@@ -527,13 +526,24 @@ def convert_to_workflow_copilot_chat_message(
             LOG.warning(
                 "Failed to parse TurnOutcome from chat row, treating as None",
                 workflow_copilot_chat_message_id=message_model.workflow_copilot_chat_message_id,
-                exc_info=exc,
+                error=_safe_error(exc),
             )
             parsed_outcome = None
     raw_narrative = message_model.narrative_payload
-    parsed_narrative = typing.cast(
-        "TurnNarrativePayload | None", raw_narrative if isinstance(raw_narrative, dict) else None
-    )
+    narrative_payload_unreadable = False
+    if raw_narrative is not None:
+        try:
+            _NARRATIVE_PAYLOAD_ADAPTER.validate_python(raw_narrative)
+        except Exception as exc:
+            # One unreadable row must not fail the whole chat read: a payload shape change lands
+            # while every chat still holds rows written under the previous shape.
+            LOG.warning(
+                "Failed to parse the narrative payload from a chat row, treating as None",
+                workflow_copilot_chat_message_id=message_model.workflow_copilot_chat_message_id,
+                error=_safe_error(exc),
+            )
+            raw_narrative = None
+            narrative_payload_unreadable = True
     raw_attachments = message_model.attached_files
     attached_files: list[CopilotAttachedFile] = []
     if isinstance(raw_attachments, list):
@@ -544,9 +554,9 @@ def convert_to_workflow_copilot_chat_message(
                 LOG.warning(
                     "Failed to parse an attached file from a chat row, dropping it",
                     workflow_copilot_chat_message_id=message_model.workflow_copilot_chat_message_id,
-                    exc_info=exc,
+                    error=_safe_error(exc),
                 )
-    return WorkflowCopilotChatMessageSchema(
+    message = WorkflowCopilotChatMessageSchema(
         workflow_copilot_chat_message_id=message_model.workflow_copilot_chat_message_id,
         workflow_copilot_chat_id=message_model.workflow_copilot_chat_id,
         sender=message_model.sender,
@@ -555,11 +565,14 @@ def convert_to_workflow_copilot_chat_message(
         attached_files=attached_files,
         global_llm_context=message_model.global_llm_context,
         turn_outcome=parsed_outcome,
-        narrative_payload=parsed_narrative,
         feedback=_message_feedback_from_row(message_model),
         created_at=message_model.created_at,
         modified_at=message_model.modified_at,
     )
+    # Assign after construction because TypedDict validation drops additive fields from newer workers.
+    message.narrative_payload = raw_narrative
+    message._narrative_payload_unreadable = narrative_payload_unreadable
+    return message
 
 
 def _message_feedback_from_row(message_model: WorkflowCopilotChatMessageModel) -> WorkflowCopilotMessageFeedback | None:

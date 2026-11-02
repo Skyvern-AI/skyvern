@@ -65,7 +65,15 @@ from skyvern.webeye.browser_errors import BrowserTargetClosedError
 from skyvern.webeye.browser_state import BROWSER_CONNECTION_LOST_USER_MESSAGE
 from tests.unit._external_cdp_fakes import external_session_row
 from tests.unit._task_block_fakes import lost_browser_state, run_bound_browser_state
-from tests.unit.helpers import make_organization, make_step, make_task
+from tests.unit.conftest import settle_or_fail
+from tests.unit.helpers import (
+    ParkedOperation,
+    make_organization,
+    make_step,
+    make_task,
+    start_pooled_operation,
+    stop_pooled_operations,
+)
 
 # ``clean_up_task``'s real signature defaults; handlers that omit these kwargs get them.
 _CLEANUP_WEBHOOK_DEFAULT = True
@@ -107,9 +115,10 @@ async def _drive_execute_step(
     fail_task_result: bool = True,
     browser_session_id: str | None = None,
     workflow_run_id: str | None = None,
+    agent: ForgeAgent | None = None,
 ) -> ExecuteStepOutcome:
     """Run ``execute_step`` so that ``exc`` is raised at the first in-``try`` await."""
-    agent = ForgeAgent()
+    agent = agent or ForgeAgent()
     now = datetime.now(UTC)
     organization = make_organization(now)
     task = make_task(now, organization, workflow_run_id=workflow_run_id)
@@ -452,6 +461,57 @@ async def test_step_unable_to_execute_reraises_without_cleanup(monkeypatch: pyte
     assert outcome.returned is None
     assert outcome.fail_task_called is False
     assert outcome.cleanup_called is False
+
+
+@pytest.mark.asyncio
+async def test_cancelled_step_stops_only_its_own_pooled_operation_before_cancellation_propagates(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A cancelled step never reaches clean_up_task, so its background operation must be stopped and
+    awaited on the way out -- while another task's operation in the same process-wide pool keeps running."""
+    agent = ForgeAgent()
+    now = datetime.now(UTC)
+    own = ParkedOperation(make_task(now, make_organization(now)).task_id)
+    other = ParkedOperation("task-other")
+    pool = agent.async_operation_pool
+    settled_at_return: list[bool] = []
+
+    async def drive() -> ExecuteStepOutcome:
+        outcome = await _drive_execute_step(monkeypatch, asyncio.CancelledError(), agent=agent)
+        settled_at_return.append(own.settled.is_set())
+        return outcome
+
+    try:
+        own_handle = await start_pooled_operation(pool, own)
+        other_handle = await start_pooled_operation(pool, other)
+
+        finished, _ = await settle_or_fail(drive())
+        outcome = finished.result()
+
+        assert isinstance(outcome.raised, asyncio.CancelledError)
+        assert settled_at_return == [True], (
+            "the step's pooled operation was still running when its cancellation propagated"
+        )
+        assert own_handle.done()
+        assert pool.get_aio_task(own.task_id, own.type) is None
+        assert not other_handle.done()
+        assert pool.get_aio_task(other.task_id, other.type) is other_handle
+    finally:
+        await stop_pooled_operations(pool, own.task_id, other.task_id)
+
+
+@pytest.mark.asyncio
+async def test_cancelled_step_keeps_its_cancellation_when_stopping_pooled_operations_fails(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    agent = ForgeAgent()
+    failing_stop = AsyncMock(side_effect=RuntimeError("pool unavailable"))
+    monkeypatch.setattr(agent.async_operation_pool, "cancel_task", failing_stop, raising=False)
+
+    outcome = await _drive_execute_step(monkeypatch, asyncio.CancelledError(), agent=agent)
+
+    failing_stop.assert_awaited_once()
+    assert isinstance(outcome.raised, asyncio.CancelledError)
 
 
 @pytest.mark.asyncio
