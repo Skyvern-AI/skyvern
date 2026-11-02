@@ -9,6 +9,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import json
+import random
 from collections.abc import Callable
 from pathlib import Path
 from types import SimpleNamespace
@@ -54,7 +55,7 @@ from skyvern.forge.taskv3.goal_check import (
 )
 from skyvern.forge.taskv3.goal_composition import CodeTypedValue
 from skyvern.forge.taskv3.handoff_redaction import caller_known_published_urls
-from skyvern.forge.taskv3.llm_call_params import reasoning_effort_with_summary
+from skyvern.forge.taskv3.llm_call_params import carries_reasoning, reasoning_effort_with_summary
 from skyvern.forge.taskv3.loop import (
     CODE_TOOL_NAME,
     NAV_DEAD_END_GUARD,
@@ -66,7 +67,7 @@ from skyvern.forge.taskv3.loop import (
     _ProgressEvidence,
 )
 from skyvern.forge.taskv3.opaque_refs import OpaqueUrlRefs, mask_opaque_urls
-from skyvern.forge.taskv3.run_arms import ANSWER_AUDIT_LOG_ONLY_FLAG, APPLICATION_CONTEXT_FLAG
+from skyvern.forge.taskv3.run_arms import ANSWER_AUDIT_LOG_ONLY_FLAG, APPLICATION_CONTEXT_FLAG, CARRY_REASONING_FLAG
 from skyvern.forge.taskv3.tools import PAGE_UNAVAILABLE_ERROR, DownloadFailureWatch
 from skyvern.forge.taskv3.turn_dom import TurnDomCapture
 from skyvern.schemas.llm import LLMConfig, LLMRouterConfig, LLMRouterModelConfig
@@ -74,7 +75,7 @@ from skyvern.utils.prompt_engine import PROMPT_HARD_CEILING_TOKENS
 from skyvern.utils.token_counter import count_tokens
 from tests.unit.helpers import fallback_receipts
 from tests.unit.scoped_asyncio import ScopedAsyncio
-from tests.unit.test_taskv3_loop import _ScriptedCaller
+from tests.unit.test_taskv3_loop import _ReasoningCaller, _ScriptedCaller
 from tests.unit.test_taskv3_tools import (
     _SURFACE_OFF_TOOL_NAMES,
     _DownloadFakePage,
@@ -1540,6 +1541,121 @@ def test_engine_omits_summary_when_caller_denies_the_bridge() -> None:
         reasoning_effort="high",
     )
     assert reasoning_effort_with_summary(caller) is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("arm", "bridged", "primary_keys", "carries", "primary_model", "route"),
+    [
+        ("treatment", True, ("a",), True, "openai/responses/gpt-test", "carries"),
+        ("treatment", True, ("a", "b"), False, "openai/responses/gpt-test", "main_group_differs"),
+        ("treatment", False, ("a",), False, "openai/responses/gpt-test", "not_responses_bridge"),
+        ("treatment", True, ("a",), False, "azure/responses/gpt-test", "azure"),
+        ("control", True, ("a",), False, "openai/responses/gpt-test", "carries"),
+        (None, True, ("a",), False, "openai/responses/gpt-test", "carries"),
+        ("treatment", True, (), True, "openai/responses/gpt-test", "carries"),
+        ("treatment", True, (), False, "azure/responses/gpt-test", "azure"),
+    ],
+    ids=[
+        "treatment",
+        "primary_cannot_share",
+        "not_bridged",
+        "azure_primary",
+        "control",
+        "unresolved",
+        "direct",
+        "direct_azure",
+    ],
+)
+async def test_reasoning_is_carried_only_on_treatment_over_a_bridged_primary_group(
+    arm: str | None, bridged: bool, primary_keys: tuple[str, ...], carries: bool, primary_model: str, route: str
+) -> None:
+    # The other endpoint is a fallback group only, so it does not change whether the run carries; no primary keys means a
+    # direct config.
+    deployments = [
+        LLMRouterModelConfig(model_name="primary", litellm_params={"model": primary_model, "api_key": key})
+        for key in primary_keys
+    ]
+    deployments.append(
+        LLMRouterModelConfig(
+            model_name="other-endpoint",
+            litellm_params={"model": "azure/responses/gpt-test", "api_base": "https://other.example.test"},
+        )
+    )
+    caller = _ReasoningCaller([[("observe", {})], [("finish", {"status": "completed", "reason": "ok"})]])
+    caller.uses_openai_responses_bridge = lambda: bridged
+    caller.last_served_model_group = "primary" if primary_keys else None
+    caller.llm_config = (
+        LLMRouterConfig(
+            model_name="scope-router",
+            required_env_vars=[],
+            supports_vision=True,
+            add_assistant_prefix=False,
+            model_list=deployments,
+            main_model_group="primary",
+            fallback_model_group="other-endpoint",
+        )
+        if primary_keys
+        else LLMConfig(model_name=primary_model, required_env_vars=[], supports_vision=True, add_assistant_prefix=False)
+    )
+    context = SkyvernContext(run_arms={CARRY_REASONING_FLAG: ("wr_1", arm)} if arm else {})
+    skyvern_context.set(context)
+    try:
+        with capture_logs() as logs:
+            await run_task_v3_agent_loop(page_provider=_fixed_page_provider(_FakePage()), llm_caller=caller, goal="x")
+    finally:
+        skyvern_context.reset()
+
+    finished = next(e for e in logs if e["event"] == "taskv3 engine loop finished")
+    assert finished["carry_reasoning_arm"] == (arm or "unrandomized")
+    assert finished["carry_reasoning_route"] == route
+    assert finished["carry_reasoning_stripped"] is False
+    assert finished["carried_reasoning_turns"] == (2 if carries else 0)
+    assert any(m.get("reasoning_items") for m in caller.sent[-1]) is carries
+
+
+def test_any_difference_between_main_group_deployments_stops_the_carry() -> None:
+    # Any parameter, including one no code names, can make two deployments different places; fallback groups never
+    # decide whether a run carries.
+    rng = random.Random(19364)
+    values: dict[str, list[Any]] = {
+        "model": ["openai/responses/gpt-a", "openai/gpt-a", "openai/responses/gpt-b", "azure/responses/gpt-a"],
+        "api_key": ["k1", "k2", None],
+        "api_base": [None, "https://a.example.test", "https://b.example.test"],
+        "api_version": [None, "2025-01-01"],
+        "service_tier": [None, "flex"],
+        "timeout": [60, 600],
+    }
+    for case in range(400):
+        base = {key: rng.choice(options) for key, options in values.items() if rng.random() < 0.8}
+        base.setdefault("model", rng.choice(values["model"]))
+        main = []
+        for _ in range(rng.randint(1, 3)):
+            params = dict(base)
+            if rng.random() < 0.4:
+                key = rng.choice([*values, f"unlisted_{case}"])
+                params[key] = rng.choice([*values.get(key, []), f"other_{case}"])
+            main.append(params)
+        deployments = [LLMRouterModelConfig(model_name="primary", litellm_params=params) for params in main]
+        deployments += [
+            LLMRouterModelConfig(model_name=f"fallback-{i}", litellm_params={"model": rng.choice(values["model"])})
+            for i in range(rng.randint(0, 2))
+        ]
+        caller = SimpleNamespace(
+            uses_openai_responses_bridge=lambda: True,
+            llm_config=LLMRouterConfig(
+                model_name="router",
+                required_env_vars=[],
+                supports_vision=True,
+                add_assistant_prefix=False,
+                model_list=deployments,
+                main_model_group="primary",
+                fallback_model_group=[d.model_name for d in deployments if d.model_name != "primary"] or None,
+            ),
+        )
+        identical = all(params == main[0] for params in main)
+        toward_azure = any(str(params["model"]).startswith("azure/") for params in main)
+        assert carries_reasoning(caller) is (identical and not toward_azure), (case, main)
 
 
 def test_bridge_check_mirrors_litellm_dispatched_name_only() -> None:
