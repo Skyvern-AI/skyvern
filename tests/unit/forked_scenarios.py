@@ -1,7 +1,8 @@
 """Run fresh-interpreter scenarios as fork children of one interpreter that ran only their shared prelude.
 
 A scenario starts from the prelude's state, so the prelude must hold only what every scenario would itself
-run first (typically imports); anything a scenario's claim depends on happening later belongs in the scenario.
+run first (typically imports); anything a scenario's claim depends on happening later belongs in the scenario,
+as does any import that reads environment or settings the scenarios vary.
 """
 
 from __future__ import annotations
