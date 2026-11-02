@@ -417,6 +417,7 @@ EMPTY_PAGE_RECOVERY_MAX_ATTEMPTS = 3
 # Poll cadence for the read-only claimed-dead-blank settlement observation (mirrors the 1s cadence of
 # the download-finished waiter). The observation is bounded by the reservation's remaining grace.
 _CLAIMED_DOWNLOAD_GRACE_POLL_SECONDS = 1.0
+_IN_FLIGHT_DOWNLOAD_CANCEL_POLL_SECONDS = 1.0
 _V3_BLANK_PAGE_SETTLE_POLLS = 8
 _V3_BLANK_PAGE_SETTLE_POLL_SECONDS = 0.25
 
@@ -2655,7 +2656,7 @@ class ForgeAgent:
             if native_failure_quiescent is not None:
                 native_check = asyncio.ensure_future(check_native())
             while True:
-                done, _pending = await asyncio.wait({wait_task}, timeout=1.0)
+                done, _pending = await asyncio.wait({wait_task}, timeout=_IN_FLIGHT_DOWNLOAD_CANCEL_POLL_SECONDS)
                 if wait_task in done:
                     if wait_task.cancelled() and native_check is not None and await native_check:
                         return False
