@@ -27,7 +27,7 @@ def payload_check_reasons(payload_qualified: bool, *, age_text_withheld: bool) -
 
 @dataclass
 class ApplicationContext:
-    """The acting model's one yes/no on whether the run is a job application, and the text a first-reply yes unlocks."""
+    """The acting model's one yes/no on whether the run is a job application, and the text a yes unlocks."""
 
     defaults_text: str
     payload_qualified: bool = False
@@ -66,8 +66,7 @@ class ApplicationContext:
         if self.state is None and self.asked:
             self.state = "no_implicit"
         # A user message and not the tool's result: delivered as a result, the text cost a turn and more failed runs.
-        # Only a yes in the first reply delivers it: R4 counts a declaration after the first reply as no.
-        if self.state == "yes_declared" and not self.delivered:
+        if self.declared_yes and not self.delivered:
             self.delivered = True
             return self.defaults_text
         return None

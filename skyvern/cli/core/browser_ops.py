@@ -2222,7 +2222,13 @@ async def do_select_option(
         raise CustomSelectMatchError(selector, value, observed_options)
 
     matched = matches[0]
-    matched_label = str(matched.get("name") or matched.get("label") or value)
+    # `name` comes from the earlier DOM scan and `label` from the live re-read at the same positional selector, so a
+    # list that re-renders in between leaves a stale `name`; report the one that matched, else the live `label`.
+    matched_label = str(matched.get("label") or matched.get("name") or value)
+    for candidate in (matched.get("name"), matched.get("label")):
+        if _normalized_option(candidate) == requested:
+            matched_label = str(candidate)
+            break
     matched_value = str(matched.get("value") or "")
     expected_values = {requested, _normalized_option(matched_value)} - {""}
     display_labels = {
