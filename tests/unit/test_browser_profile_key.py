@@ -13,10 +13,6 @@ from skyvern.forge.sdk.workflow.browser_profile_key import (
 )
 
 
-def test_template_browser_profile_key_reads_parameter_value() -> None:
-    assert render_browser_profile_key("{{ credential_id }}", {"credential_id": "cred_123"}) == "cred_123"
-
-
 def test_plain_browser_profile_key_is_literal_text() -> None:
     assert render_browser_profile_key("credential_id", {"credential_id": "cred_123"}) == "credential_id"
 

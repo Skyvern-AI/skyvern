@@ -1,6 +1,5 @@
 import datetime
 from types import SimpleNamespace
-from typing import AsyncGenerator
 from unittest.mock import AsyncMock
 from urllib.parse import parse_qs, urlparse
 
@@ -8,7 +7,7 @@ import pytest
 import pytest_asyncio
 from fastapi import HTTPException
 from sqlalchemy import select, update
-from sqlalchemy.ext.asyncio import AsyncEngine, create_async_engine
+from sqlalchemy.ext.asyncio import AsyncEngine
 
 from skyvern.forge import app
 from skyvern.forge.agent_functions import AgentFunction
@@ -31,15 +30,12 @@ from skyvern.forge.sdk.schemas.google_oauth import (
     GoogleOAuthCredentialBase,
 )
 from skyvern.forge.sdk.services import google_oauth_service
+from tests.unit.conftest import SqliteEngineFactory
 
 
 @pytest_asyncio.fixture
-async def engine() -> AsyncGenerator[AsyncEngine, None]:
-    eng = create_async_engine("sqlite+aiosqlite:///:memory:")
-    async with eng.begin() as conn:
-        await conn.run_sync(Base.metadata.create_all)
-    yield eng
-    await eng.dispose()
+async def engine(sqlite_engine_factory: SqliteEngineFactory) -> AsyncEngine:
+    return sqlite_engine_factory()
 
 
 @pytest_asyncio.fixture

@@ -749,6 +749,72 @@ def test_masked_aws_secret_rejects_changed_endpoint_identity(field_name: str, ch
     assert current_block.aws_secret_access_key == WORKFLOW_SECRET_MASK
 
 
+@pytest.mark.parametrize(("previous_region", "current_region"), [("", None), (None, "")])
+def test_masked_aws_secret_survives_blank_and_unset_region(
+    previous_region: str | None, current_region: str | None
+) -> None:
+    previous_block = SimpleNamespace(
+        block_type=BlockType.FILE_UPLOAD,
+        label="upload",
+        storage_type="s3",
+        s3_bucket="synthetic-bucket",
+        aws_access_key_id="synthetic-access-key-id",
+        region_name=previous_region,
+        endpoint_url=None,
+        aws_secret_access_key="synthetic-aws-blank-region-secret",
+    )
+    current_block = deepcopy(previous_block)
+    current_block.region_name = current_region
+    current_block.aws_secret_access_key = WORKFLOW_SECRET_MASK
+
+    preserve_workflow_definition_secrets(
+        SimpleNamespace(blocks=[current_block]),
+        SimpleNamespace(blocks=[previous_block]),
+    )
+
+    assert current_block.aws_secret_access_key == "synthetic-aws-blank-region-secret"
+
+    moved_block = deepcopy(previous_block)
+    moved_block.region_name = current_region
+    moved_block.s3_bucket = "synthetic-other-bucket"
+    moved_block.aws_secret_access_key = WORKFLOW_SECRET_MASK
+    with pytest.raises(SkyvernHTTPException) as exc_info:
+        preserve_workflow_definition_secrets(
+            SimpleNamespace(blocks=[moved_block]),
+            SimpleNamespace(blocks=[previous_block]),
+        )
+    assert exc_info.value.error_code == "workflow_secret_preservation_failed"
+
+
+@pytest.mark.parametrize(("first_region", "second_region"), [("", ""), ("", None)])
+def test_two_stored_uploads_to_one_destination_are_ambiguous_whether_blank_or_unset(
+    first_region: str | None, second_region: str | None
+) -> None:
+    previous_blocks = [
+        SimpleNamespace(
+            block_type=BlockType.FILE_UPLOAD,
+            label=label,
+            storage_type="s3",
+            s3_bucket="synthetic-bucket",
+            aws_access_key_id="synthetic-access-key-id",
+            region_name=region,
+            endpoint_url=None,
+            aws_secret_access_key=f"synthetic-{label}-secret",
+        )
+        for label, region in (("first_upload", first_region), ("second_upload", second_region))
+    ]
+    current_blocks = deepcopy(previous_blocks)
+    for block in current_blocks:
+        block.aws_secret_access_key = WORKFLOW_SECRET_MASK
+
+    with pytest.raises(SkyvernHTTPException) as exc_info:
+        preserve_workflow_definition_secrets(
+            SimpleNamespace(blocks=current_blocks),
+            SimpleNamespace(blocks=previous_blocks),
+        )
+    assert exc_info.value.error_code == "workflow_secret_preservation_failed"
+
+
 def test_new_upload_does_not_fail_on_unrelated_omitted_secret_fields() -> None:
     previous = {
         "blocks": [

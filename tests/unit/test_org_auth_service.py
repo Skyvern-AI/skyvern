@@ -20,7 +20,7 @@ from skyvern.forge.agent_functions import AgentFunction
 from skyvern.forge.request_logging import RequestLoggingMiddleware
 from skyvern.forge.sdk.core.organization_age_cache import cached_org_age
 from skyvern.forge.sdk.core.security import assert_signing_key_usable, create_access_token
-from skyvern.forge.sdk.routes.routers import legacy_base_router
+from skyvern.forge.sdk.db.repositories import workflow_run_groups as workflow_run_groups_repository
 from skyvern.forge.sdk.routes.streaming.auth import auth as streaming_auth
 from skyvern.forge.sdk.schemas.organizations import Organization, OrganizationAuthToken, OrganizationAuthTokenType
 from skyvern.forge.sdk.services import org_auth_service, org_auth_token_service, request_principal
@@ -30,11 +30,20 @@ from skyvern.forge.sdk.services.org_auth_service import (
     _normalize_api_key_with_flags,
 )
 from skyvern.forge.sdk.services.request_principal import (
+    APIKeyAuthProfile,
+    AuthKind,
     BearerIdentity,
     BearerIdentityResolution,
     BearerIdentityStatus,
+    RequestPrincipal,
     get_request_principal,
+    scoped_api_key_actor_id,
 )
+from skyvern.services import workflow_run_group_service as group_service
+from tests.unit.conftest import RUN_GROUP_ORG as ORG
+from tests.unit.conftest import RUN_GROUP_WPID as WPID
+from tests.unit.conftest import GroupEnv
+from tests.unit.shared_route_app import shared_route_app
 
 
 def test_authenticated_org_age_is_cached_for_lines_that_only_name_the_org() -> None:
@@ -137,6 +146,30 @@ def test_debug_fields_show_when_normalized_token_would_decode(monkeypatch) -> No
     assert debug_fields["normalized_api_key_decodes"] is True
     assert debug_fields["normalized_api_key_would_be_expired"] is False
     assert debug_fields["normalized_api_key_error_type"] is None
+
+
+@pytest.mark.asyncio
+async def test_scoped_group_dispatch_preserves_key_actor(
+    run_group_env: GroupEnv, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    token_id = "oat_scoped_group"
+    principal = RequestPrincipal(ORG, AuthKind.scoped_api_key, api_key_token_id=token_id, api_key_access_mode="scoped")
+    monkeypatch.setattr(workflow_run_groups_repository, "get_request_principal", lambda: principal)
+    group = await run_group_env.database.workflow_run_groups.create_group(
+        organization_id=ORG,
+        workflow_permanent_id=WPID,
+        requested_version=1,
+        workflow_id="wf_1",
+        submission_key="scoped-key-group",
+        input_fingerprint="fingerprint",
+        items=[("item", {})],
+    )
+    await group_service.advance_workflow_run_group(group.workflow_run_group_id)
+    child_id = (await run_group_env.database.workflow_run_groups.get_items(group.workflow_run_group_id))[
+        0
+    ].workflow_run_id
+    child = await run_group_env.database.workflow_runs.get_workflow_run(child_id)
+    assert child is not None and child.requested_by == scoped_api_key_actor_id(token_id)
 
 
 def test_debug_fields_show_when_normalized_token_still_fails() -> None:
@@ -317,7 +350,7 @@ async def test_get_current_org_cached_preserves_token_id_on_cache_miss_and_hit(m
     organizations = _RotatingAuthOrganizations({api_key: True})
     db = _AuthDatabase(organizations)
     agent_function = AgentFunction()
-    profile_lookup = AsyncMock(return_value=("full_org", None, True))
+    profile_lookup = AsyncMock(return_value=APIKeyAuthProfile("full_org", None, True))
     monkeypatch.setattr(agent_function, "resolve_api_key_profile", profile_lookup)
     monkeypatch.setattr(org_auth_service.app, "AGENT_FUNCTION", agent_function)
     request_principal._request_principal.set(None)
@@ -326,6 +359,7 @@ async def test_get_current_org_cached_preserves_token_id_on_cache_miss_and_hit(m
     principal_on_miss = get_request_principal()
     assert principal_on_miss is not None
     assert principal_on_miss.api_key_token_id == "oat_test"
+    assert principal_on_miss.api_key_access_mode == "full_org"
 
     request_principal._request_principal.set(None)
     await org_auth_service.get_current_org_cached(api_key, db)
@@ -406,9 +440,10 @@ def test_invalidate_cached_org_drops_only_matching_entries() -> None:
     cache.clear()
     org_a = _make_org("org-a")
     org_b = _make_org("org-b")
-    cache[("api-key-a", "db")] = org_auth_service._CachedOrganizationAuth(org_a, "token-a")
-    cache[("api-key-a-rotated", "db")] = org_auth_service._CachedOrganizationAuth(org_a, "token-a-rotated")
-    cache[("api-key-b", "db")] = org_auth_service._CachedOrganizationAuth(org_b, "token-b")
+    profile = APIKeyAuthProfile("full_org", None, True)
+    cache[("api-key-a", "db")] = org_auth_service._CachedOrganizationAuth(org_a, "token-a", profile)
+    cache[("api-key-a-rotated", "db")] = org_auth_service._CachedOrganizationAuth(org_a, "token-a-rotated", profile)
+    cache[("api-key-b", "db")] = org_auth_service._CachedOrganizationAuth(org_b, "token-b", profile)
 
     org_auth_service.invalidate_cached_org("org-a")
 
@@ -422,7 +457,9 @@ def test_invalidate_cached_org_is_noop_when_id_absent() -> None:
     cache = org_auth_service._current_org_cache
     cache.clear()
     org = _make_org("org-a")
-    cache[("api-key", "db")] = org_auth_service._CachedOrganizationAuth(org, "token-a")
+    cache[("api-key", "db")] = org_auth_service._CachedOrganizationAuth(
+        org, "token-a", APIKeyAuthProfile("full_org", None, True)
+    )
 
     org_auth_service.invalidate_cached_org("never-seen")
 
@@ -581,10 +618,8 @@ async def _mint_api_token(
     return token, db, repository
 
 
-def _organization_routes_client() -> TestClient:
-    fastapi_app = FastAPI()
-    fastapi_app.include_router(legacy_base_router, prefix="/api/v1")
-    return TestClient(fastapi_app)
+def _organization_routes_client(monkeypatch: pytest.MonkeyPatch) -> TestClient:
+    return TestClient(shared_route_app(monkeypatch))
 
 
 @pytest.mark.asyncio
@@ -790,7 +825,7 @@ async def test_self_hosted_api_key_route_rejects_ui_session_token(
 ) -> None:
     token, _, _ = await _mint_ui_session_token(monkeypatch)
 
-    with _organization_routes_client() as client:
+    with _organization_routes_client(monkeypatch) as client:
         response = client.get(
             f"/api/v1/organizations/org-ui-session/apikeys{suffix}",
             headers={"x-api-key": token},
@@ -807,7 +842,7 @@ async def test_api_key_route_accepts_api_token(
 ) -> None:
     token, _, _ = await _mint_api_token(monkeypatch)
 
-    with _organization_routes_client() as client:
+    with _organization_routes_client(monkeypatch) as client:
         response = client.get(
             f"/api/v1/organizations/org-api-route/apikeys{suffix}",
             headers={"x-api-key": token},
@@ -815,6 +850,45 @@ async def test_api_key_route_accepts_api_token(
 
     assert response.status_code == 200
     assert len(response.json()["api_keys"]) == 1
+
+
+@pytest.mark.asyncio
+async def test_scoped_key_cannot_retrieve_full_org_secret_from_legacy_route(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    token, _, _ = await _mint_api_token(monkeypatch)
+    monkeypatch.setattr(
+        org_auth_service.app.AGENT_FUNCTION,
+        "resolve_api_key_profile",
+        AsyncMock(
+            return_value=APIKeyAuthProfile(
+                "scoped", None, True, scopes=frozenset({"api_key.list"}), reach="organization"
+            )
+        ),
+    )
+
+    with _organization_routes_client(monkeypatch) as client:
+        response = client.get(
+            "/api/v1/organizations/org-api-route/apikeys",
+            headers={"x-api-key": token},
+        )
+
+    assert response.status_code == 403
+
+
+@pytest.mark.asyncio
+async def test_raw_api_key_validation_denies_scoped_keys_by_default(monkeypatch: pytest.MonkeyPatch) -> None:
+    token, db, _ = await _mint_api_token(monkeypatch)
+    monkeypatch.setattr(
+        org_auth_service.app.AGENT_FUNCTION,
+        "resolve_api_key_profile",
+        AsyncMock(return_value=APIKeyAuthProfile("scoped", None, True, reach="organization")),
+    )
+
+    with pytest.raises(HTTPException) as exc_info:
+        await org_auth_service.resolve_org_from_api_key(token, db)
+
+    assert exc_info.value.status_code == 403
 
 
 @pytest.mark.asyncio
@@ -832,7 +906,7 @@ async def test_self_hosted_credential_gate_accepts_ui_session_token(monkeypatch:
 async def test_ordinary_organization_route_accepts_ui_session_token(monkeypatch: pytest.MonkeyPatch) -> None:
     token, _, _ = await _mint_ui_session_token(monkeypatch)
 
-    with _organization_routes_client() as client:
+    with _organization_routes_client(monkeypatch) as client:
         response = client.get(
             "/api/v1/organizations/me",
             headers={"x-api-key": token},
@@ -1191,7 +1265,9 @@ class _StubIdentityProvider(AgentFunction):
     def __init__(self) -> None:
         self.resolved: list[tuple[str, str]] = []
 
-    async def resolve_bearer_identity(self, bearer_token: str, organization_id: str) -> BearerIdentityResolution:
+    async def resolve_bearer_identity(
+        self, bearer_token: str, organization_id: str, *, bearer_authenticated: bool = False
+    ) -> BearerIdentityResolution:
         self.resolved.append((bearer_token, organization_id))
         if bearer_token == "stale-bearer":
             raise HTTPException(status_code=403, detail="Auth token is expired")
@@ -1209,9 +1285,18 @@ def _principal_app() -> FastAPI:
 
     def principal() -> dict[str, object] | None:
         resolved = get_request_principal()
-        return (
-            {key: value for key, value in asdict(resolved).items() if key != "api_key_token_id"} if resolved else None
-        )
+        if resolved is None:
+            return None
+        values = asdict(resolved)
+        for field in (
+            "api_key_token_id",
+            "api_key_access_mode",
+            "api_key_scopes",
+            "api_key_folder_grants",
+            "api_key_reach",
+        ):
+            values.pop(field, None)
+        return values
 
     @fastapi_app.post("/org")
     async def org(_: Organization = Depends(org_auth_service.get_current_org)) -> dict[str, object] | None:
@@ -1296,6 +1381,10 @@ def _logged_principal_snapshot(principal: dict[str, object]) -> dict[str, object
     return {field: principal[field] for field in ("organization_id", *_PRINCIPAL_FIELDS)}
 
 
+def _principal_payload(organization_id: str, expected: dict[str, object]) -> dict[str, object]:
+    return {"organization_id": organization_id, **expected}
+
+
 def _use_bearer_authentication(monkeypatch: pytest.MonkeyPatch, organization: Organization | None) -> None:
     """Configure bearer authentication for ``organization``, or none at all as in a self-hosted deployment."""
 
@@ -1373,7 +1462,7 @@ async def test_raw_request_record_carries_the_request_principal(
     with TestClient(_principal_app()) as client:
         response = client.post("/org", headers=headers)
 
-    principal = {"organization_id": organization_id, **expected}
+    principal = _principal_payload(organization_id, expected)
     assert response.status_code == 200
     assert response.json() == principal
     assert _logged_principals(raw_request_log) == [_logged_principal_snapshot(principal)]
@@ -1414,10 +1503,99 @@ async def test_every_org_auth_dependency_resolves_the_principal_without_changing
     with TestClient(_principal_app()) as client:
         response = client.post(path.format(organization_id=organization_id), headers=headers)
 
-    principal = {"organization_id": organization_id, **expected}
+    principal = _principal_payload(organization_id, expected)
     assert response.status_code == 200
     assert response.json() == principal
     assert _logged_principals(raw_request_log) == [_logged_principal_snapshot(principal)]
+
+
+@pytest.mark.asyncio
+async def test_credential_route_intersects_scoped_api_key_with_valid_bearer(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    headers, organization_id, identity_provider = await _principal_credentials(
+        monkeypatch, "api", "Bearer admin-bearer"
+    )
+    _use_bearer_authentication(monkeypatch, _make_org(organization_id))
+    monkeypatch.setattr(
+        identity_provider,
+        "resolve_api_key_profile",
+        AsyncMock(
+            return_value=APIKeyAuthProfile(
+                "scoped",
+                None,
+                True,
+                scopes=frozenset({"workflow_run.read"}),
+                workflow_folder_grants=frozenset({"folder_1"}),
+                reach="organization",
+            )
+        ),
+    )
+
+    with TestClient(_principal_app()) as client:
+        response = client.post("/credential", headers=headers)
+
+    assert response.status_code == 200
+    assert response.json() == _principal_payload(
+        organization_id,
+        {
+            "auth_kind": "scoped_api_key_and_bearer",
+            **_ADMIN,
+        },
+    )
+    assert identity_provider.resolved == [("admin-bearer", organization_id)]
+
+
+@pytest.mark.asyncio
+async def test_credential_route_fails_closed_when_validated_key_profile_lookup_fails(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    headers, organization_id, identity_provider = await _principal_credentials(
+        monkeypatch, "api", "Bearer admin-bearer"
+    )
+    _use_bearer_authentication(monkeypatch, _make_org(organization_id))
+    profile_lookup = AsyncMock(side_effect=RuntimeError("profile lookup unavailable"))
+    monkeypatch.setattr(identity_provider, "resolve_api_key_profile", profile_lookup)
+    app = FastAPI()
+    handler_calls = 0
+
+    @app.post("/credential")
+    async def credential(
+        _: Annotated[Organization, Depends(org_auth_service.get_current_org_for_credential_routes)],
+    ) -> dict[str, bool]:
+        nonlocal handler_calls
+        handler_calls += 1
+        return {"handler_called": True}
+
+    with TestClient(app) as client:
+        response = client.post("/credential", headers=headers)
+
+    assert response.status_code == 401
+    assert handler_calls == 0
+    profile_lookup.assert_awaited_once_with(organization_id, "test-token-id-1")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "profile",
+    [APIKeyAuthProfile("full_org", None, True), APIKeyAuthProfile("member", "user_key", True)],
+    ids=["full-org", "member"],
+)
+async def test_credential_route_keeps_bearer_preference_for_non_scoped_api_keys(
+    monkeypatch: pytest.MonkeyPatch,
+    profile: APIKeyAuthProfile,
+) -> None:
+    headers, organization_id, identity_provider = await _principal_credentials(
+        monkeypatch, "api", "Bearer admin-bearer"
+    )
+    _use_bearer_authentication(monkeypatch, _make_org(organization_id))
+    monkeypatch.setattr(identity_provider, "resolve_api_key_profile", AsyncMock(return_value=profile))
+
+    with TestClient(_principal_app()) as client:
+        response = client.post("/credential", headers=headers)
+
+    assert response.status_code == 200
+    assert response.json() == _principal_payload(organization_id, {"auth_kind": "bearer", **_ADMIN})
 
 
 @pytest.mark.asyncio
@@ -1436,7 +1614,7 @@ async def test_two_users_behind_one_key_each_get_their_own_principal_across_a_ca
 
     assert repository.validation_calls == 1, "the second request must be served from the key cache"
     principals = [
-        {"organization_id": organization_id, "auth_kind": "api_key_and_bearer", **user} for user in (_ADMIN, _MEMBER)
+        _principal_payload(organization_id, {"auth_kind": "api_key_and_bearer", **user}) for user in (_ADMIN, _MEMBER)
     ]
     assert [response.json() for response in responses] == principals
     assert _logged_principals(raw_request_log) == [_logged_principal_snapshot(principal) for principal in principals]
@@ -1455,7 +1633,7 @@ async def test_two_auth_dependencies_on_one_route_resolve_the_bearer_once(
     with TestClient(_principal_app()) as client:
         response = client.post("/org-and-user", headers=headers)
 
-    assert response.json() == {"organization_id": organization_id, "auth_kind": "api_key_and_bearer", **_ADMIN}
+    assert response.json() == _principal_payload(organization_id, {"auth_kind": "api_key_and_bearer", **_ADMIN})
     assert identity_provider.resolved == [("admin-bearer", organization_id)]
 
 
@@ -1487,9 +1665,7 @@ async def test_credential_route_principal_conflict_tracks_organization_or_bearer
         response = client.post("/credential-and-user", headers=headers)
 
     expected_principal = {
-        "organization_id": bearer_organization.organization_id,
-        "auth_kind": "bearer",
-        **_ADMIN,
+        **_principal_payload(bearer_organization.organization_id, {"auth_kind": "bearer", **_ADMIN}),
     }
     assert response.status_code == 200
     assert response.json() == {
@@ -1529,9 +1705,7 @@ async def test_credential_route_principal_is_stable_when_raw_request_logging_is_
         "organization_id": bearer_organization.organization_id,
         "user_id": None,
         "principal": {
-            "organization_id": bearer_organization.organization_id,
-            "auth_kind": "bearer",
-            **_ADMIN,
+            **_principal_payload(bearer_organization.organization_id, {"auth_kind": "bearer", **_ADMIN}),
         },
     }
     assert identity_provider.resolved == [("admin-bearer", bearer_organization.organization_id)]
@@ -1546,7 +1720,9 @@ async def test_concurrent_principal_resolutions_keep_one_canonical_result(
     first_lookup_started = asyncio.Event()
     release_first_lookup = asyncio.Event()
 
-    async def resolve_identity(bearer_token: str, organization_id: str) -> BearerIdentityResolution:
+    async def resolve_identity(
+        bearer_token: str, organization_id: str, *, bearer_authenticated: bool = False
+    ) -> BearerIdentityResolution:
         identity_provider.resolved.append((bearer_token, organization_id))
         if bearer_token == "admin-bearer":
             first_lookup_started.set()
@@ -1571,18 +1747,25 @@ async def test_concurrent_principal_resolutions_keep_one_canonical_result(
         release_first_lookup.set()
         first, second = await asyncio.wait_for(asyncio.gather(first_task, second_task), timeout=1)
         return [
-            {key: value for key, value in asdict(principal).items() if key != "api_key_token_id"}
+            {
+                key: sorted(value) if isinstance(value, frozenset) else value
+                for key, value in asdict(principal).items()
+                if key
+                not in {
+                    "api_key_token_id",
+                    "api_key_access_mode",
+                    "api_key_scopes",
+                    "api_key_folder_grants",
+                    "api_key_reach",
+                }
+            }
             for principal in (first, second)
         ]
 
     async with httpx.AsyncClient(transport=httpx.ASGITransport(app=fastapi_app), base_url="http://test") as client:
         response = await client.post("/concurrent-principals")
 
-    expected = {
-        "organization_id": "org-a",
-        "auth_kind": "bearer",
-        **_ADMIN,
-    }
+    expected = _principal_payload("org-a", {"auth_kind": "bearer", **_ADMIN})
     assert response.status_code == 200
     assert response.json() == [expected, expected]
     assert identity_provider.resolved == [("admin-bearer", "org-a")]
@@ -1621,7 +1804,7 @@ async def test_caller_context_with_a_bearer_alone_resolves_the_identity_once(
     with TestClient(_principal_app()) as client:
         response = client.post("/caller", headers=headers)
 
-    assert response.json() == {"organization_id": organization_id, "auth_kind": "bearer", **_ADMIN}
+    assert response.json() == _principal_payload(organization_id, {"auth_kind": "bearer", **_ADMIN})
     assert identity_provider.resolved == [("admin-bearer", organization_id)]
 
 
@@ -1634,7 +1817,9 @@ async def test_a_hanging_identity_lookup_cannot_hold_up_an_authenticated_request
         monkeypatch, "api", "Bearer admin-bearer"
     )
 
-    async def hang(bearer_token: str, organization_id: str) -> BearerIdentityResolution:
+    async def hang(
+        bearer_token: str, organization_id: str, *, bearer_authenticated: bool = False
+    ) -> BearerIdentityResolution:
         await asyncio.Event().wait()
         return BearerIdentityResolution(None, BearerIdentityStatus.lookup_failed)
 
@@ -1645,7 +1830,7 @@ async def test_a_hanging_identity_lookup_cannot_hold_up_an_authenticated_request
         response = client.post("/org", headers=headers)
 
     assert response.status_code == 200
-    assert response.json() == {"organization_id": organization_id, "auth_kind": "api_key", **_NO_USER}
+    assert response.json() == _principal_payload(organization_id, {"auth_kind": "api_key", **_NO_USER})
     assert raw_request_log.info.call_args.kwargs["bearer_identity_status"] == "lookup_timed_out"
 
 
@@ -1694,7 +1879,7 @@ async def test_unexpected_identity_lookup_failure_is_logged_without_rejecting_re
         response = client.post("/org", headers=headers)
 
     assert response.status_code == 200
-    assert response.json() == {"organization_id": organization_id, "auth_kind": "api_key", **_NO_USER}
+    assert response.json() == _principal_payload(organization_id, {"auth_kind": "api_key", **_NO_USER})
     assert raw_request_log.info.call_args.kwargs["bearer_identity_status"] == "lookup_failed"
     lookup_log.warning.assert_called_once()
     assert lookup_log.warning.call_args.kwargs["exc_info"] is True
@@ -1710,7 +1895,7 @@ async def test_websocket_in_body_auth_resolves_the_principal(monkeypatch: pytest
     ):
         principal = websocket.receive_json()
 
-    assert principal == {"organization_id": organization_id, "auth_kind": "api_key_and_bearer", **_MEMBER}
+    assert principal == _principal_payload(organization_id, {"auth_kind": "api_key_and_bearer", **_MEMBER})
 
 
 @pytest.mark.asyncio

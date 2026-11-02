@@ -41,6 +41,7 @@ from skyvern.forge.sdk.core import skyvern_context
 from skyvern.forge.sdk.core.skyvern_context import RunArm
 from skyvern.forge.sdk.workflow.models.credential_release import CredentialReleaseGuard
 from skyvern.forge.taskv3.answer_basis_audit import apply_answer_basis_audit
+from skyvern.forge.taskv3.application_context import DECLARE_NOTICE, ApplicationContext, payload_check_reasons
 from skyvern.forge.taskv3.code_surface import apply_surface, configured_surface
 from skyvern.forge.taskv3.goal_check import (
     GOAL_CHECK_TIMEOUT_SECONDS,
@@ -62,7 +63,7 @@ from skyvern.forge.taskv3.goal_check import (
 )
 from skyvern.forge.taskv3.goal_composition import CodeTypedValue, build_user_prompt, typed_value_rows
 from skyvern.forge.taskv3.intercepted_submission import InterceptedSubmission
-from skyvern.forge.taskv3.llm_call_params import build_call_kwargs
+from skyvern.forge.taskv3.llm_call_params import build_call_kwargs, carry_reasoning_route
 from skyvern.forge.taskv3.loop import (
     DEFAULT_MAX_SETTLE_DEFERRALS,
     PERCEPTION_RETAIN_CHARS_HIGH,
@@ -84,7 +85,13 @@ from skyvern.forge.taskv3.loop import (
     submissions_since,
 )
 from skyvern.forge.taskv3.opaque_refs import OpaqueUrlRefs, is_signed_url, mask_opaque_urls
-from skyvern.forge.taskv3.run_arms import ANSWER_AUDIT_LOG_ONLY_FLAG, current_run_arm, run_arm_enabled
+from skyvern.forge.taskv3.run_arms import (
+    ANSWER_AUDIT_LOG_ONLY_FLAG,
+    APPLICATION_CONTEXT_FLAG,
+    CARRY_REASONING_FLAG,
+    current_run_arm,
+    run_arm_enabled,
+)
 from skyvern.forge.taskv3.tools import (
     BlankWorkingPageGuard,
     DownloadFailureWatch,
@@ -139,6 +146,9 @@ PREFIX_REF_TOKENS = 20_000
 MAX_RAW_TOKENS = 2 * MAX_TOKENS_CEILING
 # Left between the judge's timeout and the run's deadline, so a judge call cannot be what ends the run.
 GOAL_CHECK_DEADLINE_MARGIN_SECONDS = 2.0
+# True: the audit of a run armed only by its own declaration logs each hold it would make and lets the call through.
+# False: those holds block.
+DECLARED_ONLY_AUDIT_LOG_ONLY = True
 
 PAGE_FREE_SYSTEM_PROMPT = """You are completing a data-only assessment. You have NO browser tools: do not attempt to observe or interact with any page. Judge strictly from the goal, criteria, and data provided, then call `finish(status, reason, extracted_output)` — status=completed when the completion criterion holds, status=terminated when the termination criterion holds, status=failed only if the provided information is insufficient to decide."""
 
@@ -667,7 +677,26 @@ async def run_task_v3_agent_loop(
         intercepted_submissions=block_submissions,
         justify_stops=justify_on,
     )
-    tools = browser_tools + (extra_tools or []) + [finish_tool]
+    context_texts = (
+        app.AGENT_FUNCTION.task_v3_application_context_texts(parameters)
+        if not page_free and run_arm_enabled(APPLICATION_CONTEXT_FLAG, settings.TASK_V3_APPLICATION_CONTEXT)
+        else None
+    )
+    context_task_text, context_age_text, context_defaults_text = context_texts or (None, None, "")
+    application_context = (
+        ApplicationContext(
+            "\n\n".join(text for text in (context_age_text, context_defaults_text) if text),
+            payload_qualified=context_task_text is not None,
+        )
+        if context_texts
+        else None
+    )
+    tools = (
+        browser_tools
+        + (extra_tools or [])
+        + ([application_context.tool] if application_context else [])
+        + [finish_tool]
+    )
     # The COMPLETE dispatch list, not just the browser tools: auth / captcha / code tools and finish
     # are appended here and would otherwise be able to inspect and act on a blank page.
     apply_blank_page_guard(tools, blank_page_guard)
@@ -678,11 +707,24 @@ async def run_task_v3_agent_loop(
     )
     if refs.refs:
         system_prompt += OPAQUE_URL_GUIDANCE
-    age_default = None if page_free else app.AGENT_FUNCTION.task_v3_age_default(parameters)
-    age_default_text, age_default_reason = age_default or (None, None)
-    application_defaults = None if page_free else app.AGENT_FUNCTION.task_v3_application_defaults(parameters)
-    application_defaults_text, application_defaults_reason = application_defaults or (None, None)
-    defaults_text = "\n\n".join(text for text in (age_default_text, application_defaults_text) if text)
+    age_default_text: str | None = None
+    application_defaults_text: str | None = None
+    if application_context is None:
+        age_default = None if page_free else app.AGENT_FUNCTION.task_v3_age_default(parameters)
+        age_default_text, age_default_reason = age_default or (None, None)
+        application_defaults = None if page_free else app.AGENT_FUNCTION.task_v3_application_defaults(parameters)
+        application_defaults_text, application_defaults_reason = application_defaults or (None, None)
+        defaults_text = "\n\n".join(text for text in (age_default_text, application_defaults_text) if text)
+        application_payload_qualified = bool(application_defaults_text)
+    else:
+        application_payload_qualified = application_context.payload_qualified
+        age_default_reason, application_defaults_reason = payload_check_reasons(
+            application_payload_qualified, age_text_withheld=context_age_text is None
+        )
+        defaults_text = context_task_text or ""
+    declaring = application_context is not None
+    # Read before each wrapped call: a declaring run's audit stays out of the way until this turns true.
+    armed = application_context.audit_armed if application_context else None
     # The judge sees the data and the customer's instructions as the model does.
     answer_audit = (
         None
@@ -692,14 +734,20 @@ async def run_task_v3_agent_loop(
             goal="\n\n".join(part for part in (model_goal, goal_instructions) if part),
             organization_id=organization_id,
             step=step,
+            # Passed only when set, so an AgentFunction override written against the old signature keeps working.
+            **({"declaring": True} if declaring else {}),
         )
     )
     arm_fields = {"audit_mode_arm": current_run_arm(ANSWER_AUDIT_LOG_ONLY_FLAG)}
+    declaration_only_audit = declaring and not application_payload_qualified
     apply_answer_basis_audit(
         tools,
         answer_audit,
-        log_only=run_arm_enabled(ANSWER_AUDIT_LOG_ONLY_FLAG, forced=False),
-        log_fields=arm_fields,
+        log_only=run_arm_enabled(ANSWER_AUDIT_LOG_ONLY_FLAG, forced=False)
+        or (declaration_only_audit and DECLARED_ONLY_AUDIT_LOG_ONLY),
+        # These runs can log log_only=true in either arm, so their hold lines carry the trigger.
+        log_fields={**arm_fields, "answer_audit_trigger": "declaration"} if declaration_only_audit else arm_fields,
+        armed=armed,
     )
     # Only the acting model gets typed rows: the judge and re-ask read `model_goal` on their own model, and an oversized
     # judge prompt fails open. Rows stay unminted because resolve_typed_text was chained to refs above.
@@ -713,6 +761,8 @@ async def run_task_v3_agent_loop(
                 model_goal, refs.masked, model_starting_url, starting_url_is_current=starting_url_is_current
             )
             + f"\n\n{defaults_text}"
+            # The later user messages count too: they join a transcript that already holds the typed rows.
+            + (f"\n\n{DECLARE_NOTICE}\n\n{application_context.defaults_text}" if application_context else "")
         )
         budget = (
             (model_input_token_limit(llm_caller.llm_config) or PROMPT_HARD_CEILING_TOKENS)
@@ -728,9 +778,13 @@ async def run_task_v3_agent_loop(
     # After the data, never in the system prompt: the data and the task's own instructions outrank the default.
     if defaults_text:
         user_prompt += f"\n\n{defaults_text}"
+    arm_context = skyvern_context.current()
+    carry_reasoning_pin = arm_context.run_arms.get(CARRY_REASONING_FLAG) if arm_context is not None else None
+    carry_route = carry_reasoning_route(llm_caller)
     try:
         outcome = await run_agent_tool_loop(
             llm_caller=llm_caller,
+            same_layer_type_hold=settings.TASK_V3_SAME_LAYER_TYPE_HOLD,
             system_prompt=system_prompt,
             user_prompt=user_prompt,
             tools=tools,
@@ -744,6 +798,7 @@ async def run_task_v3_agent_loop(
             should_cancel=should_cancel,
             on_action_round=on_action_round,
             on_turn_start=on_turn_start,
+            turn_notice=application_context.turn_notice if application_context else None,
             on_turn_end=on_turn_end,
             on_model_returned=turn_dom.wait if turn_dom is not None else None,
             on_pre_action=on_pre_action,
@@ -782,6 +837,7 @@ async def run_task_v3_agent_loop(
             block_completion_check=_block_completion_check if block_check_on else None,
             unseen_text=unseen_text,
             anthropic_cache_markers=anthropic_cache_markers,
+            carry_reasoning=carry_route == "carries" and run_arm_enabled(CARRY_REASONING_FLAG, forced=False),
         )
     finally:
         loop_ended = True
@@ -850,15 +906,38 @@ async def run_task_v3_agent_loop(
         dead_ends_returned=activity.dead_ends_returned,
         **activity.justify_summary(outcome.status),
         has_navigation_goal=has_navigation_goal,
-        age_default_rendered=bool(age_default_text),
+        # On a declaring run these say what the run received; the two reasons stay the payload check's.
+        age_default_rendered=(
+            bool(age_default_text)
+            if application_context is None
+            else application_context.delivered and bool(context_age_text)
+        ),
         age_default_reason=age_default_reason,
-        application_defaults_rendered=bool(application_defaults_text),
+        application_defaults_rendered=(
+            bool(application_defaults_text) if application_context is None else application_context.delivered
+        ),
         application_defaults_reason=application_defaults_reason,
+        application_payload_qualified=application_payload_qualified,
+        application_context_arm=current_run_arm(APPLICATION_CONTEXT_FLAG),
+        application_context=application_context.final_state if application_context else None,
+        application_defaults_delivered=application_context.delivered if application_context else None,
         **arm_fields,
-        answer_audit_active=answer_audit is not None,
+        # False on a declaration-only run, whose audit is not the payload check's.
+        answer_audit_active=answer_audit is not None and not declaration_only_audit,
+        answer_audit_trigger=(
+            None
+            if answer_audit is None or (armed is not None and not armed())
+            else "declaration"
+            if declaration_only_audit
+            else "payload"
+        ),
         # The run's model, so exposure rates on this line split per model like the re-ask line's.
         llm_key=llm_caller.llm_key,
         llm_route_arm=llm_route_arm,
+        carry_reasoning_arm=carry_reasoning_pin[1] if carry_reasoning_pin is not None else "unrandomized",
+        carry_reasoning_route=carry_route,
+        carried_reasoning_turns=outcome.carried_reasoning_turns,
+        carry_reasoning_stripped=outcome.carry_reasoning_stripped,
         unlisted_reask=outcome.unlisted_reask,
         # The loop's progress signals ride here rather than on records of their own: this line
         # already fires exactly once per run and already carries block_type, so collapsing removes a

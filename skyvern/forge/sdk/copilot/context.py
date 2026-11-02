@@ -18,6 +18,7 @@ from pydantic import AliasChoices, BaseModel, ConfigDict, Field, ValidationError
 from typing_extensions import NotRequired, TypedDict
 
 from skyvern.forge.sdk.browser_action_policy import canonicalize_origin
+from skyvern.forge.sdk.copilot.agent_context import AgentContext
 from skyvern.forge.sdk.copilot.browser_ablation import (
     BrowserAblationMetadata,
     CopilotToolSurfaceIdentity,
@@ -36,7 +37,6 @@ from skyvern.forge.sdk.copilot.human_input_wait import HumanInputWait
 from skyvern.forge.sdk.copilot.page_identity import page_location_fingerprint, safe_page_origin
 from skyvern.forge.sdk.copilot.review_gate import NarrativeReviewProjection
 from skyvern.forge.sdk.copilot.run_outcome import RunOutcomeRole
-from skyvern.forge.sdk.copilot.runtime import AgentContext
 from skyvern.forge.sdk.copilot.secret_redaction import redact_raw_secrets_for_structured_prompt
 from skyvern.forge.sdk.copilot.verification_evidence import WorkflowVerificationEvidence
 from skyvern.forge.sdk.workflow.block_notes import block_field_texts
@@ -80,6 +80,7 @@ UPDATE_AND_RUN_BLOCKS_TOOL_NAME = "update_and_run_blocks"
 UPDATE_WORKFLOW_TOOL_NAME = "update_workflow"
 RUN_BLOCKS_TOOL_NAME = "run_blocks_and_collect_debug"
 BLANK_BROWSER_TEST_TOOL_NAME = "test_workflow_from_blank_browser"
+CREATE_WEBHOOK_TRIGGER_TOOL_NAME = "create_webhook_trigger"
 BLOCK_RUNNING_TOOLS = frozenset(
     {RUN_BLOCKS_TOOL_NAME, UPDATE_AND_RUN_BLOCKS_TOOL_NAME, EDIT_BLOCK_AND_RUN_TOOL_NAME, BLANK_BROWSER_TEST_TOOL_NAME}
 )
@@ -376,6 +377,7 @@ if TYPE_CHECKING:
     from skyvern.forge.sdk.copilot.completion_criteria_store import CompletionCriteriaTurnState
     from skyvern.forge.sdk.copilot.diagnosis_repair_contract import DiagnosisRepairContract
     from skyvern.forge.sdk.copilot.interruption import StoppedTurnFacts
+    from skyvern.forge.sdk.copilot.mcp_adapter import SkyvernOverlayMCPServer
     from skyvern.forge.sdk.copilot.narration import NarratorState
     from skyvern.forge.sdk.copilot.request_policy import RequestPolicy
     from skyvern.forge.sdk.copilot.run_outcome import RecordedRunOutcome
@@ -1522,8 +1524,7 @@ class CopilotContext(AgentContext):
     resolved_discovery_failure_reason: str | None = None
     resolved_discovery_entrypoint_inspection_baseline: int = 0
     # Set in `_run_attempt` after SkyvernOverlayMCPServer is constructed.
-    # The discovery tool reaches the connected FastMCP client through this.
-    discovery_mcp_server: Any | None = None
+    discovery_mcp_server: SkyvernOverlayMCPServer | None = None
 
     # default_factory is the safety net — Python dataclass inheritance
     # disallows non-default fields after default ones, and the parent

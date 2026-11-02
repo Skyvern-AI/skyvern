@@ -56,6 +56,10 @@ class _DisconnectedWebSocket:
         raise AssertionError("unreachable")
 
 
+async def _yield_instead_of_sleeping(_delay: float) -> None:
+    await asyncio.sleep(0)
+
+
 @pytest.mark.asyncio
 async def test_workflow_run_streaming_stops_sending_once_the_client_is_gone(
     monkeypatch: pytest.MonkeyPatch,
@@ -73,6 +77,7 @@ async def test_workflow_run_streaming_stops_sending_once_the_client_is_gone(
     )
 
     monkeypatch.setattr(screenshot.settings, "BROWSER_STREAMING_MODE", "vnc")
+    monkeypatch.setattr(screenshot, "asyncio", ScopedAsyncio(sleep=_yield_instead_of_sleeping))
     monkeypatch.setattr(screenshot, "get_current_org", AsyncMock(return_value=SimpleNamespace(organization_id="o_1")))
     monkeypatch.setattr(app, "DATABASE", database)
     monkeypatch.setattr(app, "STORAGE", SimpleNamespace(get_streaming_file=AsyncMock(return_value=b"jpeg")))

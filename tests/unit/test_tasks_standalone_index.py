@@ -3,21 +3,18 @@
 from __future__ import annotations
 
 import importlib.util
-import uuid
 from collections.abc import Iterator
 from contextlib import contextmanager
-from dataclasses import dataclass
 from pathlib import Path
 from types import ModuleType
 from typing import Any
 
 import pytest
-from sqlalchemy import Engine, create_engine, event, text
-from sqlalchemy.engine import URL, Connection, make_url
+from sqlalchemy import Engine, event, text
+from sqlalchemy.engine import Connection
 from sqlalchemy.exc import IntegrityError, OperationalError
 from sqlalchemy.ext.asyncio import create_async_engine
 
-from skyvern.config import settings
 from skyvern.forge.sdk.db.agent_db import AgentDB
 from skyvern.forge.sdk.db.models import Base
 from skyvern.forge.sdk.workflow.models.workflow import WorkflowRunStatus
@@ -40,45 +37,23 @@ def _load_migration() -> ModuleType:
     return module
 
 
-@dataclass
-class IsolatedSchema:
-    url: URL
-    connect_args: dict[str, str]
-    engine: Engine
-
-
 @pytest.fixture
-def isolated_schema() -> Iterator[IsolatedSchema]:
-    url = make_url(str(settings.DATABASE_STRING))
-    if url.get_backend_name() != "postgresql":
-        pytest.skip("requires PostgreSQL")
-    url = url.set(drivername="postgresql+psycopg")
-    schema = f"tasks_standalone_{uuid.uuid4().hex[:12]}"
-    admin = create_engine(url, isolation_level="AUTOCOMMIT")
-    with admin.connect() as connection:
-        connection.exec_driver_sql(f'CREATE SCHEMA "{schema}"')
-    connect_args = {"options": f"-csearch_path={schema}"}
-    engine = create_engine(url, isolation_level="AUTOCOMMIT", connect_args=connect_args)
-    try:
-        with engine.connect() as connection:
-            # Only what the listing reads and its foreign keys: other tables need pg_trgm, which lives in `public`.
-            Base.metadata.create_all(
-                connection,
-                tables=[
-                    Base.metadata.tables[name]
-                    for name in ("organizations", "folders", "workflows", "workflow_runs", "tasks")
-                ],
-            )
-            connection.exec_driver_sql(
-                "INSERT INTO organizations (organization_id, organization_name, created_at, modified_at) VALUES "
-                f"('{POLLER_ORG}', 'poller', now(), now()), ('{OTHER_ORG}', 'other', now(), now())"
-            )
-        yield IsolatedSchema(url=url, connect_args=connect_args, engine=engine)
-    finally:
-        engine.dispose()
-        with admin.connect() as connection:
-            connection.exec_driver_sql(f'DROP SCHEMA "{schema}" CASCADE')
-        admin.dispose()
+def scratch_database(postgres_scratch_database: Engine) -> Engine:
+    engine = postgres_scratch_database.execution_options(isolation_level="AUTOCOMMIT")
+    with engine.connect() as connection:
+        # Only what the listing reads and its foreign keys: other tables need pg_trgm, which this database lacks.
+        Base.metadata.create_all(
+            connection,
+            tables=[
+                Base.metadata.tables[name]
+                for name in ("organizations", "folders", "workflows", "workflow_runs", "tasks")
+            ],
+        )
+        connection.exec_driver_sql(
+            "INSERT INTO organizations (organization_id, organization_name, created_at, modified_at) VALUES "
+            f"('{POLLER_ORG}', 'poller', now(), now()), ('{OTHER_ORG}', 'other', now(), now())"
+        )
+    return engine
 
 
 def _index_names(plan_node: dict[str, Any]) -> Iterator[str]:
@@ -89,8 +64,8 @@ def _index_names(plan_node: dict[str, Any]) -> Iterator[str]:
 
 
 @pytest.mark.asyncio
-async def test_standalone_run_listing_is_answered_from_the_partial_index(isolated_schema: IsolatedSchema) -> None:
-    with isolated_schema.engine.connect() as connection:
+async def test_standalone_run_listing_is_answered_from_the_partial_index(scratch_database: Engine) -> None:
+    with scratch_database.connect() as connection:
         # The poller's org has a long standalone history but almost nothing running; another org runs a lot.
         connection.exec_driver_sql(
             "INSERT INTO tasks (task_id, organization_id, status, url, errors, created_at, modified_at) "
@@ -109,7 +84,7 @@ async def test_standalone_run_listing_is_answered_from_the_partial_index(isolate
         )
         connection.exec_driver_sql("ANALYZE tasks")
 
-    async_engine = create_async_engine(isolated_schema.url, connect_args=isolated_schema.connect_args)
+    async_engine = create_async_engine(scratch_database.url)
     task_statements: list[tuple[str, Any]] = []
 
     def capture(_conn: Any, _cursor: Any, statement: str, parameters: Any, _context: Any, _many: bool) -> None:
@@ -119,7 +94,7 @@ async def test_standalone_run_listing_is_answered_from_the_partial_index(isolate
     event.listen(async_engine.sync_engine, "before_cursor_execute", capture)
     try:
         database = AgentDB(
-            isolated_schema.url.render_as_string(hide_password=False), debug_enabled=False, db_engine=async_engine
+            scratch_database.url.render_as_string(hide_password=False), debug_enabled=False, db_engine=async_engine
         )
         runs = await database.workflow_runs.get_all_runs(
             POLLER_ORG, page=1, page_size=100, status=[WorkflowRunStatus.running]
@@ -130,7 +105,7 @@ async def test_standalone_run_listing_is_answered_from_the_partial_index(isolate
     assert [run.task_id for run in runs] == ["tsk_running_1", "tsk_running_2", "tsk_running_3"]
     assert len(task_statements) == 1
     statement, parameters = task_statements[0]
-    with isolated_schema.engine.connect() as connection:
+    with scratch_database.connect() as connection:
         plan = connection.exec_driver_sql(f"EXPLAIN (FORMAT JSON) {statement}", parameters).scalar_one()
     assert INDEX_NAME in set(_index_names(plan[0]["Plan"])), plan
 
@@ -181,10 +156,10 @@ def _replace_with_invalid_leftover(connection: Connection) -> None:
 
 
 def test_upgrade_rebuilds_an_invalid_leftover_and_issues_no_ddl_over_a_valid_index(
-    isolated_schema: IsolatedSchema, monkeypatch: pytest.MonkeyPatch
+    scratch_database: Engine, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     migration = _load_migration()
-    with isolated_schema.engine.connect() as connection:
+    with scratch_database.connect() as connection:
         declared_valid, declared_definition = connection.execute(_INDEX_STATE_SQL, {"name": INDEX_NAME}).one()
         assert declared_valid is True
         _replace_with_invalid_leftover(connection)
@@ -201,11 +176,11 @@ def test_upgrade_rebuilds_an_invalid_leftover_and_issues_no_ddl_over_a_valid_ind
 
 
 def test_upgrade_neither_drops_a_build_in_progress_nor_accepts_a_different_index(
-    isolated_schema: IsolatedSchema, monkeypatch: pytest.MonkeyPatch
+    scratch_database: Engine, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     migration = _load_migration()
     monkeypatch.setattr(migration, "LEFTOVER_DROP_LOCK_TIMEOUT", "100ms")
-    with isolated_schema.engine.connect() as connection, isolated_schema.engine.connect() as builder:
+    with scratch_database.connect() as connection, scratch_database.connect() as builder:
         _replace_with_invalid_leftover(connection)
         recording_op = _RecordingOp(connection)
         monkeypatch.setattr(migration, "op", recording_op)

@@ -6,14 +6,14 @@ from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
 import pytest
-from fastapi import FastAPI, Request
+from fastapi import Request
 from fastapi.responses import JSONResponse
 from fastapi.testclient import TestClient
 
 from skyvern.exceptions import BrowserProfileNotFound, SkyvernHTTPException
 from skyvern.forge import app as forge_app
-from skyvern.forge.sdk.routes import routers as routers_module
 from skyvern.forge.sdk.services import org_auth_service
+from tests.unit.shared_route_app import shared_route_app
 
 
 def _build_client(monkeypatch: pytest.MonkeyPatch) -> tuple[TestClient, SimpleNamespace]:
@@ -28,9 +28,8 @@ def _build_client(monkeypatch: pytest.MonkeyPatch) -> tuple[TestClient, SimpleNa
     monkeypatch.setattr(forge_app.DATABASE.browser_sessions, "delete_browser_profile", mocks.delete_db_profile)
     monkeypatch.setattr(forge_app.STORAGE, "delete_browser_profile", mocks.delete_profile_blob)
 
-    fastapi_app = FastAPI()
+    fastapi_app = shared_route_app(monkeypatch)
     fastapi_app.dependency_overrides[org_auth_service.get_current_org] = _fake_org
-    fastapi_app.include_router(routers_module.base_router, prefix="/v1")
 
     @fastapi_app.exception_handler(SkyvernHTTPException)
     async def _handle(request: Request, exc: SkyvernHTTPException) -> JSONResponse:

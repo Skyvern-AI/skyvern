@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import asyncio
 import itertools
-import os
 import secrets
 import time
 import weakref
@@ -18,12 +17,11 @@ import structlog
 from skyvern.browser_extension.runtime import BrowserExtensionRuntime
 from skyvern.config import settings
 from skyvern.exceptions import get_user_facing_exception_message, is_stalled_attach_handshake
-from skyvern.forge.sdk.copilot.turn_origin import is_self_heal_session_id
-from skyvern.forge.sdk.forge_log import current_codeblock_log_redactor
 from skyvern.webeye.browser_errors import is_context_lost_message, is_target_closed_message
 
 from .api_key_hash import hash_api_key_for_cache
 from .client import get_active_api_key, get_skyvern, has_api_key_override
+from .copilot_sessions import registered_copilot_session, unregister_copilot_session
 from .result import BrowserContext, ErrorCode, count_browser_attach, make_error
 from .trajectory_store import delete_session_trajectories
 
@@ -188,12 +186,6 @@ _organization_sessions: dict[str, SessionState] = {}
 _stateless_http_mode = False
 _stdio_local_file_access_enabled = False
 
-# Process-wide registry for copilot browser sessions. Keys always carry the
-# owning organization so authenticated HTTP requests cannot address another
-# tenant's entry even when the browser session ID is known.
-# This bypasses ContextVar propagation issues when FastMCP runs tool handlers
-# in a separate task whose context snapshot predates scoped_session().
-_copilot_sessions: dict[tuple[str, str], list[SessionState]] = {}
 # Ref snapshots and their invalidation generations, FIFO-capped like _body_store.
 # Capacity eviction can drop a live session's refs early; that fails safe (unknown
 # ref → the caller re-observes), which is why the tool contract doesn't mention it.
@@ -436,58 +428,6 @@ def clear_session_ref_map(
         state._observe_v2_state.reset_refs()
         state._observed_refs_generation = next(_session_ref_generation_counter)
     return True
-
-
-def register_copilot_session(session_id: str, state: SessionState, *, organization_id: str) -> None:
-    """Register a pre-configured browser session for cross-task lookup.
-
-    The registry is process-local and in-memory: entries do not survive a
-    process restart and are not shared across uvicorn workers. Callers that
-    need cross-process continuity must reconnect via the cloud session API.
-    """
-    if not organization_id:
-        raise ValueError("organization_id is required for a copilot browser session")
-    if state.organization_id not in {None, organization_id}:
-        raise ValueError("session state belongs to a different organization")
-    if is_self_heal_session_id(session_id):
-        os.environ.pop("DEBUGP", None)
-        redactor = current_codeblock_log_redactor()
-        if redactor is not None:
-            state._codeblock_redactor = redactor
-    state.organization_id = organization_id
-    state.tab_state_persists = True
-    registrations = _copilot_sessions.setdefault((organization_id, session_id), [])
-    if not any(registered is state for registered in registrations):
-        registrations.append(state)
-
-
-def unregister_copilot_session(
-    session_id: str,
-    *,
-    organization_id: str,
-    expected_state: SessionState | None = None,
-) -> None:
-    """Remove one exact registration, or every registration for explicit cleanup callers."""
-    key = (organization_id, session_id)
-    if expected_state is None:
-        _copilot_sessions.pop(key, None)
-        return
-    registrations = _copilot_sessions.get(key)
-    if registrations is None:
-        return
-    registrations[:] = [registered for registered in registrations if registered is not expected_state]
-    if not registrations:
-        _copilot_sessions.pop(key, None)
-
-
-def active_copilot_session_ids() -> set[str]:
-    """Browser-session IDs currently bound to an active copilot turn."""
-    return {session_id for _, session_id in _copilot_sessions}
-
-
-def _registered_copilot_session(session_id: str, *, organization_id: str) -> SessionState | None:
-    registrations = _copilot_sessions.get((organization_id, session_id))
-    return registrations[-1] if registrations else None
 
 
 def _explicit_cloud_session_can_access_localhost() -> bool:
@@ -804,7 +744,7 @@ async def resolve_browser(
     # does not propagate through FastMCP in-process transport).
     organization_id = _current_organization_id.get()
     registered = (
-        _registered_copilot_session(session_id, organization_id=organization_id)
+        registered_copilot_session(session_id, organization_id=organization_id)
         if session_id and organization_id
         else None
     )

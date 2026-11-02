@@ -133,7 +133,7 @@ async def cdp_adopted():
     """Serve the statement page, launch Chromium with remote debugging, and adopt it over CDP."""
     server = ThreadingHTTPServer(("127.0.0.1", 0), _Handler)
     port = server.server_address[1]
-    threading.Thread(target=server.serve_forever, daemon=True).start()
+    threading.Thread(target=server.serve_forever, kwargs={"poll_interval": 0.01}, daemon=True).start()
 
     with socket.socket() as _s:
         _s.bind(("127.0.0.1", 0))
@@ -409,7 +409,7 @@ async def cdp_canonical():
     """Serve the canonical statement page and adopt a real Chromium over CDP."""
     server = ThreadingHTTPServer(("127.0.0.1", 0), _CanonHandler)
     port = server.server_address[1]
-    threading.Thread(target=server.serve_forever, daemon=True).start()
+    threading.Thread(target=server.serve_forever, kwargs={"poll_interval": 0.01}, daemon=True).start()
 
     with socket.socket() as _s:
         _s.bind(("127.0.0.1", 0))

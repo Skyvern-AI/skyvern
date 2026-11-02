@@ -5293,6 +5293,144 @@ async def test_executed_block_keeps_its_screened_driver_nav_code_through_a_faile
     assert [code for code in result.error_codes if code != "user_code_error"] == expected_codes
 
 
+def _session_browser_state() -> SimpleNamespace:
+    return SimpleNamespace(
+        get_working_page=AsyncMock(return_value=MagicMock()),
+        engine_selection=None,
+        browser_artifacts=BrowserArtifacts(),
+        navigate_to_url=AsyncMock(return_value=None),
+    )
+
+
+def _install_secure_runner_failure(monkeypatch: pytest.MonkeyPatch, failure: CodeBlockEngineFailure) -> None:
+    monkeypatch.setattr(
+        app.AGENT_FUNCTION,
+        "execute_code_block_override",
+        AsyncMock(return_value=CodeBlockEngineResult(block_result=None, failure=failure)),
+    )
+
+
+_SITE_PARAMETER_VALUE = "tenant-4471.example.com"
+
+
+def _install_parameter_redaction(monkeypatch: pytest.MonkeyPatch, value: str) -> None:
+    monkeypatch.setattr(app.AGENT_FUNCTION, "serialize_codeblock_parameters", lambda parameters: {"site": value})
+    monkeypatch.setattr(
+        app.AGENT_FUNCTION,
+        "redact_codeblock_parameter_values",
+        lambda item, parameters: (
+            [entry.replace(value, "[redacted]") for entry in item]
+            if isinstance(item, list)
+            else item.replace(value, "[redacted]")
+            if isinstance(item, str)
+            else item
+        ),
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("runner_code", "recovery_nav_code", "final_status", "expected_codes"),
+    [
+        pytest.param(
+            "browser_operation_failed",
+            None,
+            TaskStatus.failed,
+            ["account_locked", "browser_operation_failed"],
+            id="failed_fallback_keeps_the_code_own_code_last",
+        ),
+        pytest.param(
+            "browser_operation_failed",
+            "net::ERR_TUNNEL_CONNECTION_FAILED",
+            TaskStatus.failed,
+            ["account_locked", "net::ERR_TUNNEL_CONNECTION_FAILED", "browser_operation_failed"],
+            id="recovery_nav_code_stays_before_the_code_own_code",
+        ),
+        pytest.param(
+            f"browser_operation_failed:{_SITE_PARAMETER_VALUE}",
+            None,
+            TaskStatus.failed,
+            ["account_locked", "browser_operation_failed:[redacted]"],
+            id="code_own_code_is_redacted",
+        ),
+        pytest.param(
+            "browser_operation_failed", None, TaskStatus.completed, [], id="completed_fallback_reports_no_codes"
+        ),
+        pytest.param(None, None, TaskStatus.failed, ["account_locked"], id="no_code_of_its_own"),
+    ],
+)
+async def test_secure_failed_fallback_keeps_the_block_error_code_on_the_row_and_run_errors(
+    monkeypatch: pytest.MonkeyPatch,
+    ai_fallback_flag: Callable[[str | None], None],
+    runner_code: str | None,
+    recovery_nav_code: str | None,
+    final_status: TaskStatus,
+    expected_codes: list[str],
+) -> None:
+    ai_fallback_flag("o_test")
+    state = _install_db_fakes(monkeypatch, final_status=final_status)
+    state["updated_task"].errors = [{"error_code": "account_locked", "reasoning": "x", "confidence_float": 1.0}]
+    block = _make_code_block(error_code_mapping={"account_locked": "The account is locked"})
+    _patch_execute_chokepoint_environment(
+        monkeypatch, context=_make_context(), fake_browser_state=_session_browser_state(), use_codeblock_runner=True
+    )
+    _install_parameter_redaction(monkeypatch, _SITE_PARAMETER_VALUE)
+    runner_reason = "CodeBlock failed because a browser operation failed at line 2: Timeout 3000ms exceeded."
+    _install_secure_runner_failure(
+        monkeypatch,
+        CodeBlockEngineFailure(
+            error_code=runner_code,
+            safe_message=None,
+            failure_reason=runner_reason,
+            exception_class="playwright._impl._errors.TimeoutError",
+            failing_line=2,
+            healability_hint=True,
+            sign_in_form_visible=False,
+        ),
+    )
+    if recovery_nav_code is not None:
+
+        async def _recovery_navigation_fails(*args: object, task: Task, **kwargs: object) -> None:
+            context = skyvern_context.current()
+            assert context is not None
+            context.task_nav_error_codes[task.task_id] = recovery_nav_code
+
+        monkeypatch.setattr(app.agent, "execute_step", AsyncMock(side_effect=_recovery_navigation_fails))
+    monkeypatch.setattr(CodeBlock, "record_output_parameter_value", AsyncMock(return_value=None))
+    FakeRecorder.reset(last_recorded_exception=None)
+    monkeypatch.setattr("skyvern.forge.sdk.workflow.models.block.CodeBlockActionRecording", FakeRecorder)
+
+    with skyvern_context.scoped(SkyvernContext(organization_id="o_test", workflow_run_id="wr_test")):
+        result = await block.execute(
+            workflow_run_id="wr_test",
+            workflow_run_block_id="wrb_test",
+            organization_id="o_test",
+            browser_session_id="pbs_test",
+        )
+
+    assert result.success is (final_status == TaskStatus.completed)
+    assert result.error_codes == expected_codes
+    row: dict[str, Any] = {}
+    for update in state["workflow_run_block_updates"]:
+        if update.get("workflow_run_block_id") == "wrb_test":
+            row.update({key: value for key, value in update.items() if value is not None})
+    assert (row.get("error_codes") or []) == expected_codes
+    assert all(
+        _SITE_PARAMETER_VALUE not in code
+        for update in state["workflow_run_block_updates"]
+        for code in update.get("error_codes") or []
+    )
+    assert "browser_operation_failed" not in (state["recovery_block_updates"][-1].get("error_codes") or [])
+    if "browser_operation_failed" in expected_codes:
+        assert row["failure_reason"].startswith(runner_reason)
+        errors = _merge_workflow_run_errors(
+            [], [("wrb_test", row["error_codes"], row["failure_reason"], row.get("output"), "code")]
+        )
+        assert [error for error in errors if error["error_code"] == "browser_operation_failed"] == [
+            {"error_code": "browser_operation_failed", "reasoning": row["failure_reason"], "confidence_float": 1.0}
+        ]
+
+
 _SIGNED_OUT_FAILURE_PAGE = (
     f"Final URL: https://example.com/notauthenticated?session={SECRET_VALUE}\nPage title: Not Authenticated"
 )
@@ -5448,20 +5586,7 @@ async def test_no_persisted_block_row_keeps_a_nav_code_that_is_a_parameter_value
         fake_browser_state=fake_browser_state,
         use_codeblock_runner=engine == "secure",
     )
-    monkeypatch.setattr(
-        app.AGENT_FUNCTION, "serialize_codeblock_parameters", lambda parameters: {"site": parameter_code}
-    )
-    monkeypatch.setattr(
-        app.AGENT_FUNCTION,
-        "redact_codeblock_parameter_values",
-        lambda value, parameters: (
-            [item.replace(parameter_code, "[redacted]") for item in value]
-            if isinstance(value, list)
-            else value.replace(parameter_code, "[redacted]")
-            if isinstance(value, str)
-            else value
-        ),
-    )
+    _install_parameter_redaction(monkeypatch, parameter_code)
     monkeypatch.setattr(
         app.AGENT_FUNCTION,
         "execute_code_block_override",

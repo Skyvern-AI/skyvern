@@ -3,7 +3,6 @@ from __future__ import annotations
 import asyncio
 import random
 from datetime import UTC, datetime, timedelta
-from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -24,7 +23,6 @@ from skyvern.forge.sdk.copilot.output_policy import OutputPolicyReason, evaluate
 from skyvern.forge.sdk.copilot.request_policy import RequestPolicy
 from skyvern.forge.sdk.db.agent_db import AgentDB, _build_engine
 from skyvern.forge.sdk.db.models import (
-    Base,
     CredentialModel,
     CredentialParameterModel,
     WorkflowModel,
@@ -56,6 +54,7 @@ from skyvern.forge.sdk.workflow.models.workflow import WorkflowDefinition, Workf
 from skyvern.forge.sdk.workflow.service import WorkflowService
 from skyvern.forge.sdk.workflow.workflow_definition_converter import convert_workflow_definition
 from skyvern.schemas.workflows import CredentialParameterYAML, WorkflowDefinitionYAML
+from tests.unit.conftest import SqliteEngineFactory
 
 
 def _credential_parameter(
@@ -180,19 +179,13 @@ class _SelectionRepo:
 
 
 @pytest_asyncio.fixture
-async def sqlite_engine() -> AsyncEngine:
-    engine = _build_engine("sqlite+aiosqlite:///:memory:")
-    async with engine.begin() as conn:
-        await conn.run_sync(Base.metadata.create_all)
-    try:
-        yield engine
-    finally:
-        await engine.dispose()
+async def sqlite_engine(sqlite_engine_factory: SqliteEngineFactory) -> AsyncEngine:
+    return sqlite_engine_factory(build_engine=_build_engine)
 
 
 @pytest_asyncio.fixture
 async def sqlite_db(sqlite_engine: AsyncEngine) -> AgentDB:
-    return AgentDB("sqlite+aiosqlite:///:memory:", db_engine=sqlite_engine)
+    return AgentDB(str(sqlite_engine.url), db_engine=sqlite_engine)
 
 
 async def _select(repo: _SelectionRepo, credential_ids: list[str], strategy: str | None = None) -> str:
@@ -1407,15 +1400,12 @@ async def test_retry_rebinds_only_its_run_and_organization_selections(sqlite_db)
 @pytest.mark.asyncio
 @pytest.mark.parametrize("failure_statement", ["UPDATE", "INSERT INTO"])
 async def test_next_attempt_preparation_atomically_clears_and_reselects_credentials(
-    tmp_path: Path,
+    sqlite_engine_factory: SqliteEngineFactory,
     monkeypatch: pytest.MonkeyPatch,
     failure_statement: str,
 ) -> None:
-    url = f"sqlite+aiosqlite:///{tmp_path / 'credentials.db'}"
-    engine = _build_engine(url)
-    async with engine.begin() as connection:
-        await connection.run_sync(Base.metadata.create_all)
-    database = AgentDB(url, db_engine=engine)
+    engine = sqlite_engine_factory(build_engine=_build_engine)
+    database = AgentDB(str(engine.url), db_engine=engine)
     stub = SimpleNamespace(
         DATABASE=database, WORKFLOW_CONTEXT_MANAGER=SimpleNamespace(remove_workflow_run_context=lambda _run: None)
     )

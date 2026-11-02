@@ -14,6 +14,7 @@ from skyvern.exceptions import BrowserSessionNotRenewable
 from skyvern.forge import app
 from skyvern.forge.sdk.copilot.active_run_session import get_active_run_session
 from skyvern.forge.sdk.db.exceptions import NotFoundError
+from skyvern.forge.sdk.routes.pagination import MAX_INT4
 from skyvern.forge.sdk.routes.routers import base_router
 from skyvern.forge.sdk.schemas.debug_sessions import (
     PREWARM_BOUND_WORKFLOW_PERMANENT_ID,
@@ -705,7 +706,7 @@ async def new_debug_session(
 )
 async def get_block_outputs_for_debug_session(
     workflow_permanent_id: str,
-    version: int | None = None,
+    version: t.Annotated[int | None, Query(ge=1, le=MAX_INT4)] = None,
     current_org: Organization = Depends(org_auth_service.get_current_org),
     current_user_id: str = Depends(org_auth_service.get_current_user_id),
 ) -> dict[str, dict[str, t.Any]]:

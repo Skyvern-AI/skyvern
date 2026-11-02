@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import io
 import json
+import sys
+import threading
 import typing
 from datetime import UTC, datetime
 from types import SimpleNamespace
@@ -856,6 +858,16 @@ def _make_app(unhandled_exception_status: int = 500) -> FastAPI:
     return app
 
 
+@pytest.fixture(scope="module")
+def real_api_app() -> FastAPI:
+    # Tests register routes on this one app, so each route path must be unique within the module.
+    # The first create_api_app() in a process runs setup_logger(), which replaces the interpreter hooks.
+    hooks = (sys.excepthook, threading.excepthook, sys.unraisablehook)
+    app = api_app.create_api_app()
+    sys.excepthook, threading.excepthook, sys.unraisablehook = hooks
+    return app
+
+
 @pytest.fixture
 def log_mock(monkeypatch: pytest.MonkeyPatch) -> MagicMock:
     mock = MagicMock()
@@ -980,10 +992,10 @@ class TestMiddlewareLogVolume:
         assert log_mock.error.call_args.kwargs["status_code"] == response.status_code
 
     def test_api_app_logs_unhandled_exception_with_its_500_response(
-        self, log_mock: MagicMock, monkeypatch: pytest.MonkeyPatch
+        self, log_mock: MagicMock, monkeypatch: pytest.MonkeyPatch, real_api_app: FastAPI
     ) -> None:
         monkeypatch.setattr(api_app, "LOG", MagicMock())
-        app = api_app.create_api_app()
+        app = real_api_app
 
         @app.get("/_test_request_logging_boom")
         async def boom() -> None:
@@ -1027,7 +1039,7 @@ class TestMiddlewareLogVolume:
         assert log_mock.error.call_args.kwargs["status_code"] == response.status_code
 
     def test_authenticated_request_is_attributed_to_its_organization(
-        self, log_mock: MagicMock, monkeypatch: pytest.MonkeyPatch
+        self, log_mock: MagicMock, monkeypatch: pytest.MonkeyPatch, real_api_app: FastAPI
     ) -> None:
         """Per-org error-rate monitors need customer identity on every api.raw_request row.
 
@@ -1035,7 +1047,7 @@ class TestMiddlewareLogVolume:
         propagate rebound ContextVars back up to the logging middleware that emits the row.
         """
         monkeypatch.setattr(api_app, "LOG", MagicMock())
-        app = api_app.create_api_app()
+        app = real_api_app
 
         @app.post("/_test_request_logging_authed")
         async def authed() -> dict:
@@ -1060,10 +1072,10 @@ class TestMiddlewareLogVolume:
         assert type(logged["org_age"]) is int and logged["org_age"] == 0
 
     def test_unhandled_exception_is_attributed_to_its_organization(
-        self, log_mock: MagicMock, monkeypatch: pytest.MonkeyPatch
+        self, log_mock: MagicMock, monkeypatch: pytest.MonkeyPatch, real_api_app: FastAPI
     ) -> None:
         monkeypatch.setattr(api_app, "LOG", MagicMock())
-        app = api_app.create_api_app()
+        app = real_api_app
 
         @app.post("/_test_request_logging_authed_boom")
         async def boom() -> None:
@@ -1167,12 +1179,12 @@ class TestMiddlewareLogVolume:
         assert {"body", "response_body", "error_body"} <= logged.keys()
 
     def test_organization_does_not_leak_into_a_later_unauthenticated_request(
-        self, log_mock: MagicMock, monkeypatch: pytest.MonkeyPatch
+        self, log_mock: MagicMock, monkeypatch: pytest.MonkeyPatch, real_api_app: FastAPI
     ) -> None:
         monkeypatch.setattr(api_app, "LOG", MagicMock())
-        app = api_app.create_api_app()
+        app = real_api_app
 
-        @app.post("/_test_request_logging_authed")
+        @app.post("/_test_request_logging_authed_then_anonymous")
         async def authed() -> dict:
             set_request_organization("o_385835488455492960", "Acme Corp")
             return {"ok": True}
@@ -1182,7 +1194,7 @@ class TestMiddlewareLogVolume:
             return {"ok": True}
 
         client = TestClient(app)
-        client.post("/_test_request_logging_authed")
+        client.post("/_test_request_logging_authed_then_anonymous")
         response = client.post("/_test_request_logging_anonymous")
 
         assert response.status_code == 200
@@ -1401,6 +1413,40 @@ def _raw_request_lines(stream: io.StringIO) -> list[tuple[str, dict]]:
     return [(line, record) for line, record in records if record.get("msg", "").startswith("api.raw_request")]
 
 
+@pytest.fixture(scope="module")
+def raw_request_app(real_api_app: FastAPI) -> FastAPI:
+    app = real_api_app
+
+    @app.post("/_test_raw_request/raises")
+    async def raises() -> None:
+        set_request_organization(_TEST_ORGANIZATION_ID, "Test Org")
+        _raise_from_depth(_ROUTE_CALL_DEPTH)
+
+    @app.post("/_test_raw_request/database-unavailable")
+    async def database_unavailable() -> None:
+        set_request_organization(_TEST_ORGANIZATION_ID, "Test Org")
+        raise OperationalError(
+            "SELECT 1", {}, psycopg.errors.ConnectionFailure("server closed the connection unexpectedly")
+        )
+
+    @app.post("/_test_raw_request/returns-500")
+    async def returns_500() -> JSONResponse:
+        set_request_organization(_TEST_ORGANIZATION_ID, "Test Org")
+        return JSONResponse(status_code=500, content={"detail": "failed"})
+
+    @app.post("/_test_raw_request/stream-raises")
+    async def stream_raises() -> StreamingResponse:
+        set_request_organization(_TEST_ORGANIZATION_ID, "Test Org")
+
+        async def events() -> typing.AsyncIterator[bytes]:
+            yield b"data: first\n\n"
+            _raise_from_depth(_ROUTE_CALL_DEPTH)
+
+        return StreamingResponse(events(), media_type="text/event-stream")
+
+    return app
+
+
 class TestRenderedRawRequestLine:
     """Each failed request must reach the log collector as one parseable api.raw_request line."""
 
@@ -1415,38 +1461,14 @@ class TestRenderedRawRequestLine:
         ids=["unhandled-exception", "database-unavailable", "handled-500", "exception-after-stream-start"],
     )
     def test_api_app_failure_logs_one_line_the_collector_keeps_whole(
-        self, rendered_log_stream: io.StringIO, path: str, client_status: int, error_type: str | None
+        self,
+        rendered_log_stream: io.StringIO,
+        raw_request_app: FastAPI,
+        path: str,
+        client_status: int,
+        error_type: str | None,
     ) -> None:
-        app = api_app.create_api_app()
-
-        @app.post("/_test_raw_request/raises")
-        async def raises() -> None:
-            set_request_organization(_TEST_ORGANIZATION_ID, "Test Org")
-            _raise_from_depth(_ROUTE_CALL_DEPTH)
-
-        @app.post("/_test_raw_request/database-unavailable")
-        async def database_unavailable() -> None:
-            set_request_organization(_TEST_ORGANIZATION_ID, "Test Org")
-            raise OperationalError(
-                "SELECT 1", {}, psycopg.errors.ConnectionFailure("server closed the connection unexpectedly")
-            )
-
-        @app.post("/_test_raw_request/returns-500")
-        async def returns_500() -> JSONResponse:
-            set_request_organization(_TEST_ORGANIZATION_ID, "Test Org")
-            return JSONResponse(status_code=500, content={"detail": "failed"})
-
-        @app.post("/_test_raw_request/stream-raises")
-        async def stream_raises() -> StreamingResponse:
-            set_request_organization(_TEST_ORGANIZATION_ID, "Test Org")
-
-            async def events() -> typing.AsyncIterator[bytes]:
-                yield b"data: first\n\n"
-                _raise_from_depth(_ROUTE_CALL_DEPTH)
-
-            return StreamingResponse(events(), media_type="text/event-stream")
-
-        response = TestClient(app, raise_server_exceptions=False).post(path)
+        response = TestClient(raw_request_app, raise_server_exceptions=False).post(path)
 
         assert response.status_code == client_status
         [(line, record)] = _raw_request_lines(rendered_log_stream)

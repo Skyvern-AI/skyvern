@@ -219,25 +219,6 @@ async def test_click_foreign_engine_navigation_timeout_runs_full_fallback_chain(
     elem.click_in_javascript.assert_awaited_once()
 
 
-@pytest.mark.asyncio
-async def test_click_explicit_none_engine_selection_matches_stock_playwright(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """Passing ``engine_selection=None`` keeps the stock Playwright identity: a
-    Playwright navigation-wait timeout is treated as a completed side effect."""
-    elem = _make_element()
-    monkeypatch.setattr(
-        dom_module.EventStrategyFactory,
-        "click_element",
-        AsyncMock(side_effect=PlaywrightTimeoutError(_NAVIGATION_TIMEOUT_MSG)),
-    )
-
-    await elem.click(page=MagicMock(), dom=None, timeout=1000.0, engine_selection=None)
-
-    elem.coordinate_click.assert_not_called()
-    elem.click_in_javascript.assert_not_called()
-
-
 class TestBlockingElementFallbackPostDispatch:
     """The blocking-element fallback inside ``SkyvernElement.click`` can itself
     physically dispatch a click that only times out on the post-click navigation

@@ -167,6 +167,7 @@ type ActionRowPresentation = {
   // Machine syntax (a Playwright call or a Task V3 tool call); shown on hover, never as the primary line.
   detail: string | null;
   tone: "default" | "error";
+  wrap: boolean;
 };
 
 // Rows for code blocks summarize recorded actions as
@@ -178,6 +179,7 @@ type ActionRowPresentation = {
 function getCodeActionRowPresentation(
   action: ActionsApiResponse,
   matchedStep: CodeBlockStep | null,
+  failureReason: string | null,
 ): ActionRowPresentation {
   const isCodeError =
     action.status === Status.Failed &&
@@ -193,24 +195,31 @@ function getCodeActionRowPresentation(
     timelineActionIcons[action.action_type]
   );
   const { codeLine, durationMs } = getRecordedActionMeta(action);
-  // An error row prints both halves of its summary: the exception that ended the block is
-  // recorded as the outcome, not the body.
+  // Without a block failure reason an error row prints both halves of its summary, since the
+  // exception is recorded as the outcome. Otherwise the full reason replaces the recorded
+  // response, which is a capped copy.
   const errorSummary = isCodeError ? getActionSummary(action) : null;
+  const fullFailureReason = isCodeError ? failureReason?.trim() || null : null;
   const parts = [
     // Every other row hides its label from sighted users, so it falls back to the readable
     // type where the chat, which always shows the label, prints nothing.
-    ...(isCodeError
-      ? [
-          normalizeInlineText(errorSummary?.body?.text),
-          errorSummary?.outcome ?? null,
-        ]
-      : [
-          describeRecordedAction(action, matchedStep) ??
-            getReadableActionType(action.action_type, {
-              nullActionLabel: "Step",
-            }),
-        ]),
-    codeLine !== null ? `line ${codeLine}` : null,
+    ...(fullFailureReason !== null
+      ? [fullFailureReason]
+      : isCodeError
+        ? [
+            normalizeInlineText(errorSummary?.body?.text),
+            errorSummary?.outcome ?? null,
+          ]
+        : [
+            describeRecordedAction(action, matchedStep) ??
+              getReadableActionType(action.action_type, {
+                nullActionLabel: "Step",
+              }),
+          ]),
+    codeLine !== null &&
+    !new RegExp(`\\bline ${codeLine}\\b`).test(fullFailureReason ?? "")
+      ? `line ${codeLine}`
+      : null,
     durationMs !== null ? formatActionDurationMs(durationMs) : null,
   ].filter((part): part is string => part !== null);
   return {
@@ -227,6 +236,7 @@ function getCodeActionRowPresentation(
         ? normalizeInlineText(action.description)
         : null,
     tone: isCodeError ? "error" : "default",
+    wrap: fullFailureReason !== null,
   };
 }
 
@@ -507,13 +517,14 @@ function TimelineActionRows({
         const isActive =
           isAction(activeItem) && activeItem.action_id === action.action_id;
         const displayIndex = index + 1;
-        const { icon, label, summary, detail, tone } = isCodeBlock
+        const { icon, label, summary, detail, tone, wrap } = isCodeBlock
           ? getCodeActionRowPresentation(
               action,
               findCodeStepForLine(
                 codeSteps,
                 getRecordedActionMeta(action).codeLine,
               ),
+              block.failure_reason,
             )
           : {
               icon: timelineActionIcons[action.action_type],
@@ -521,6 +532,7 @@ function TimelineActionRows({
               summary: getActionSummary(action),
               detail: taskV3CallText(action.description),
               tone: "default" as const,
+              wrap: false,
             };
 
         return (
@@ -531,7 +543,8 @@ function TimelineActionRows({
             <IndentRails depth={depth} />
             <div
               className={cn(
-                "flex min-w-0 flex-1 items-center gap-1.5 rounded-r py-0.5 pr-1.5",
+                "flex min-w-0 flex-1 gap-1.5 rounded-r py-0.5 pr-1.5",
+                wrap ? "items-start" : "items-center",
                 "hover:bg-muted/60",
                 isActive && "bg-slate-elevation4 dark:bg-slate-800",
               )}
@@ -546,7 +559,10 @@ function TimelineActionRows({
                 }}
                 aria-pressed={isActive}
                 title={detail ?? undefined}
-                className="flex min-w-0 flex-1 cursor-pointer items-center gap-1.5 rounded text-left outline-none focus-visible:ring-1 focus-visible:ring-foreground/40"
+                className={cn(
+                  "flex min-w-0 flex-1 cursor-pointer gap-1.5 rounded text-left outline-none focus-visible:ring-1 focus-visible:ring-foreground/40",
+                  wrap ? "items-start" : "items-center",
+                )}
               >
                 <StatusDot
                   status={getActionDisplayStatus(action)}
@@ -569,7 +585,12 @@ function TimelineActionRows({
                   <span className="sr-only">{label}</span>
                 )}
                 {summary?.body ? (
-                  <span className="min-w-0 truncate text-muted-foreground dark:text-slate-500">
+                  <span
+                    className={cn(
+                      "min-w-0 text-muted-foreground dark:text-slate-500",
+                      wrap ? "whitespace-pre-wrap break-words" : "truncate",
+                    )}
+                  >
                     {summary.body.isProse ? (
                       <InlineMarkdown
                         // One line: InlineMarkdown drops every paragraph break, so prose that

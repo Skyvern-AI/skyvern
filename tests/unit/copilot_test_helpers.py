@@ -39,6 +39,7 @@ from skyvern.forge.sdk.copilot import agent as copilot_agent
 from skyvern.forge.sdk.copilot import runtime as copilot_runtime
 from skyvern.forge.sdk.copilot.active_run_session import ActiveRunSessionAssociation
 from skyvern.forge.sdk.copilot.agent import _run_agent_loop_with_surface, run_copilot_agent
+from skyvern.forge.sdk.copilot.agent_context import OriginRunRedactionRegistry
 from skyvern.forge.sdk.copilot.browser_ablation import CopilotEvalMode
 from skyvern.forge.sdk.copilot.build_test_outcome import RecordedBuildTestOutcome
 from skyvern.forge.sdk.copilot.config import CopilotConfig
@@ -60,10 +61,7 @@ from skyvern.forge.sdk.copilot.hooks import CopilotRunHooks
 from skyvern.forge.sdk.copilot.repair_origin_run import RepairOriginBinding
 from skyvern.forge.sdk.copilot.request_policy import CompletionCriterion
 from skyvern.forge.sdk.copilot.review_gate import build_review_projection, workflow_block_fingerprints
-from skyvern.forge.sdk.copilot.runtime import (
-    AgentContext,
-    OriginRunRedactionRegistry,
-)
+from skyvern.forge.sdk.copilot.runtime import AgentContext
 from skyvern.forge.sdk.copilot.screenshot_utils import (
     ScreenshotActionRelation,
     ScreenshotEntry,
@@ -1967,7 +1965,11 @@ workflow_definition:
 
 
 def receipt_message(narrative_payload: dict[str, Any]) -> MagicMock:
-    return MagicMock(sender=WorkflowCopilotChatSender.AI, narrative_payload=narrative_payload)
+    return MagicMock(
+        sender=WorkflowCopilotChatSender.AI,
+        narrative_payload=narrative_payload,
+        _narrative_payload_unreadable=False,
+    )
 
 
 def all_blocks_tested_message() -> MagicMock:

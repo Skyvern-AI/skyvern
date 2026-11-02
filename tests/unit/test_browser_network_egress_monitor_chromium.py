@@ -61,7 +61,7 @@ async def test_real_chromium_arbitrates_active_requests_and_contains_passive_egr
         ThreadingHTTPServer(("127.0.0.1", 0), blocked_handler),
     ]
     for server in servers:
-        threading.Thread(target=server.serve_forever, daemon=True).start()
+        threading.Thread(target=server.serve_forever, kwargs={"poll_interval": 0.01}, daemon=True).start()
     allowed_origin = f"http://127.0.0.1:{servers[0].server_port}"
     blocked_origin = f"http://127.0.0.1:{servers[1].server_port}"
 

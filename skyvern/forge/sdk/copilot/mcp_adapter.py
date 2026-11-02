@@ -1866,6 +1866,9 @@ class SkyvernOverlayMCPServer(MCPServer):
     def name(self) -> str:
         return "skyvern"
 
+    def requires_browser(self, tool_name: str) -> bool:
+        return self._overlays.get(tool_name, SchemaOverlay()).requires_browser
+
     async def connect(self) -> None:
         with _reporting_lifecycle_failure("connect"):
             ctx = self._context_provider()

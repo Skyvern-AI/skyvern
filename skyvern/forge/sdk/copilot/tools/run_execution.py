@@ -40,6 +40,13 @@ from skyvern.forge.sdk.copilot.active_run_session import (
     clear_active_run_session,
     publish_active_run_session,
 )
+from skyvern.forge.sdk.copilot.agent_context import (
+    FrontierStartProvenance,
+    OriginRunRedactionRegistry,
+    PreRunPageReference,
+    RegisteredArtifactEntry,
+    RegisteredArtifactEvidence,
+)
 from skyvern.forge.sdk.copilot.authoring_parameter_binding import _literal_locator_selector
 from skyvern.forge.sdk.copilot.blocker_signal import (
     stash_blocker_signal,
@@ -197,19 +204,17 @@ from skyvern.forge.sdk.copilot.run_outcome import (
 from skyvern.forge.sdk.copilot.runtime import (
     AgentContext,
     BuildTestBrowserSeed,
-    FrontierStartProvenance,
-    OriginRunRedactionRegistry,
-    PreRunPageReference,
-    RegisteredArtifactEntry,
-    RegisteredArtifactEvidence,
     _build_test_connect_failure_result,
     acquire_fresh_exit_browser_session,
     browser_session_lock,
     browser_session_recovery,
+    claim_build_test_prestart,
     close_browser_session_quietly,
+    discard_build_test_prestart,
     ensure_build_test_browser_session,
     record_attached_browser_driver,
     resolve_persistent_browser_state,
+    start_build_test_prestart,
     verify_build_test_browser_session_by_attaching,
 )
 from skyvern.forge.sdk.copilot.runtime_authoring_repair import (
@@ -4559,6 +4564,12 @@ async def _run_blocks_and_collect_debug(
     debug_session_id: str | None = None
     run_session_id: str | None
     new_exit_receipt: FreshExitReceipt | None = None
+    if not use_fresh_session:
+        discard_build_test_prestart(ctx, "resume" if resumes_a_build_test_browser else "chat_browser")
+    elif new_exit:
+        discard_build_test_prestart(ctx, "new_exit")
+    elif browser_seed is not None:
+        discard_build_test_prestart(ctx, "seeded")
 
     # Without a session, the workflow service launches the browser in-process,
     # which only works in worker pods (cloakbrowser isn't in the API image).
@@ -4591,17 +4602,20 @@ async def _run_blocks_and_collect_debug(
                 }
             run_session_id = new_exit_receipt.new_browser_session_id
         else:
-            acquisition_ctx = replace(ctx)
-            acquisition_ctx.browser_session_id = None
-            session_err = await acquire_build_test_browser_session(
-                acquisition_ctx,
-                fresh=True,
-                seed=browser_seed,
-                proxy_location=runtime_proxy_location(snapshot.workflow.proxy_location),
-            )
-            if session_err is not None:
-                return _with_build_test_acquisition_context(session_err, requested_block_labels=block_labels)
-            run_session_id = acquisition_ctx.browser_session_id
+            run_proxy_location = runtime_proxy_location(snapshot.workflow.proxy_location)
+            run_session_id = await claim_build_test_prestart(ctx, run_proxy_location)
+            if run_session_id is None:
+                acquisition_ctx = replace(ctx)
+                acquisition_ctx.browser_session_id = None
+                session_err = await acquire_build_test_browser_session(
+                    acquisition_ctx,
+                    fresh=True,
+                    seed=browser_seed,
+                    proxy_location=run_proxy_location,
+                )
+                if session_err is not None:
+                    return _with_build_test_acquisition_context(session_err, requested_block_labels=block_labels)
+                run_session_id = acquisition_ctx.browser_session_id
         if browser_seed is not None:
             if not run_session_id or not await _seed_profile_applied(
                 ctx.organization_id, run_session_id, browser_seed.browser_profile_id
@@ -5544,6 +5558,14 @@ async def _run_blocks_and_collect_debug(
         # above, and the success path always populates final_status.
         assert final_status is not None
         run_ok = WorkflowRunStatus(final_status) == WorkflowRunStatus.completed
+        if (
+            not run_ok
+            and used_fresh_run_session
+            and starts_at_workflow_head
+            and browser_seed is None
+            and new_exit_receipt is None
+        ):
+            start_build_test_prestart(ctx, runtime_proxy_location(snapshot.workflow.proxy_location))
 
         action_observations = _retained_action_observations(results)
         per_block_action_observations = _retained_action_observations_by_label(results)

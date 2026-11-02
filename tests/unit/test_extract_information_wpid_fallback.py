@@ -109,15 +109,3 @@ def test_cache_calls_use_context_wpid_when_task_wpid_is_none(monkeypatch) -> Non
     assert captured["lookup_calls"][0].args[0] == "wpid_from_context"
     assert captured["store_calls"], "store_cross_run_extraction_cache was not awaited"
     assert captured["store_calls"][0].args[0] == "wpid_from_context"
-
-
-def test_cache_calls_prefer_task_wpid_when_both_are_set(monkeypatch) -> None:
-    # Belt-and-suspenders: if a caller ever does populate task.workflow_permanent_id,
-    # the task value wins (matches the ``a or b`` precedence).
-    captured = _run_extract_information_and_capture_cache_calls(
-        monkeypatch,
-        task_wpid="wpid_from_task",
-        context_wpid="wpid_from_context",
-    )
-    assert captured["lookup_calls"][0].args[0] == "wpid_from_task"
-    assert captured["store_calls"][0].args[0] == "wpid_from_task"

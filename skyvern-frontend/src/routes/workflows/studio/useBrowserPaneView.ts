@@ -1,5 +1,9 @@
 import { useCallback, useEffect, useRef } from "react";
 import { useNavigate, useSearchParams } from "react-router-dom";
+import { useQuery } from "@tanstack/react-query";
+import { getClient } from "@/api/AxiosClient";
+import { useCredentialGetter } from "@/hooks/useCredentialGetter";
+import type { BrowserSession } from "@/routes/workflows/types/browserSessionTypes";
 import { useWorkflowPermanentId } from "@/routes/workflows/WorkflowPermanentIdContext";
 
 import { useRecordingLauncherStore } from "@/store/useRecordingLauncherStore";
@@ -16,7 +20,11 @@ import {
   resolveLiveSurface,
   type BrowserPaneView,
 } from "./browserPaneView";
-import { SYSTEM_RUN_FOCUS_PARAM, toReadableSearch } from "./panes";
+import {
+  copilotBrowserFocusSessionId,
+  SYSTEM_RUN_FOCUS_PARAM,
+  toReadableSearch,
+} from "./panes";
 import { useRunVisuals, type RunVisuals } from "./useRunVisuals";
 import { useStudioInspectedRun } from "./useStudioInspectedRun";
 import { useStudioPanes } from "./useStudioPanes";
@@ -36,6 +44,7 @@ type BrowserPaneViewState = {
   // What the Live view shows: the shared debug-session singleton, or the
   // inspected run's own per-run stream (running outside the debug session).
   liveSurface: "debug" | "run";
+  copilotBrowserFocused: boolean;
   recordingAvailable: boolean;
   screenshotsAvailable: boolean;
   liveAvailable: boolean;
@@ -135,6 +144,27 @@ export function useBrowserPaneView(): BrowserPaneViewState {
     visuals.workflowRun?.browser_session_id != null &&
     visuals.workflowRun.browser_session_id === debugBrowserSessionId;
   const blockRunInDebugSession = searchParams.has("bl") && runInDebugSession;
+  const copilotTurnActive = useStudioBrowserStore((s) => s.copilotTurnActive);
+  const copilotFocusSessionId = copilotTurnActive
+    ? copilotBrowserFocusSessionId(searchParams)
+    : null;
+  const runBrowserSessionId = visuals.workflowRun?.browser_session_id ?? null;
+  const copilotOnRunBrowser =
+    copilotFocusSessionId != null &&
+    copilotFocusSessionId !== debugBrowserSessionId &&
+    copilotFocusSessionId === runBrowserSessionId;
+  const runBrowserOpen = useBrowserSessionOpen(
+    copilotOnRunBrowser ? runBrowserSessionId : null,
+  );
+  const copilotBrowserSurface =
+    copilotFocusSessionId == null
+      ? null
+      : copilotFocusSessionId === debugBrowserSessionId
+        ? "debug"
+        : copilotOnRunBrowser && runBrowserOpen
+          ? "run"
+          : null;
+  const copilotBrowserFocused = copilotBrowserSurface != null;
 
   const { recordingAvailable, screenshotsAvailable } =
     resolveReplayAvailability(visuals);
@@ -146,6 +176,7 @@ export function useBrowserPaneView(): BrowserPaneViewState {
     inspectingRun: explicit,
     blockRunInDebugSession,
     systemFocused: searchParams.has(SYSTEM_RUN_FOCUS_PARAM),
+    copilotBrowserFocused,
     runInDebugSession,
     running: visuals.running,
     hasRecording: visuals.recordingUrls.length > 0,
@@ -159,6 +190,7 @@ export function useBrowserPaneView(): BrowserPaneViewState {
 
   const liveSurface = resolveLiveSurface({
     recording: userDrivingDebugBrowser,
+    copilotBrowserSurface,
     running: visuals.running,
     runInDebugSession,
     hasRunId: runId != null,
@@ -173,8 +205,32 @@ export function useBrowserPaneView(): BrowserPaneViewState {
     debugBrowserSessionId,
     runInDebugSession,
     liveSurface,
+    copilotBrowserFocused,
     recordingAvailable,
     screenshotsAvailable,
-    liveAvailable: visuals.running || debugBrowserSessionId != null,
+    liveAvailable:
+      visuals.running || debugBrowserSessionId != null || copilotBrowserFocused,
   };
+}
+
+// Same key as the other session reads, so they share one fetch; polled because a run's browser can close later.
+function useBrowserSessionOpen(browserSessionId: string | null): boolean {
+  const credentialGetter = useCredentialGetter();
+  const { data } = useQuery<BrowserSession>({
+    queryKey: ["browserSession", browserSessionId],
+    queryFn: async () => {
+      const client = await getClient(credentialGetter, "sans-api-v1");
+      return client
+        .get(`/browser_sessions/${browserSessionId}`)
+        .then((response) => response.data);
+    },
+    enabled: browserSessionId != null,
+    staleTime: 0,
+    refetchInterval: 5000,
+  });
+  return (
+    browserSessionId != null &&
+    data?.browser_session_id === browserSessionId &&
+    !data.completed_at
+  );
 }

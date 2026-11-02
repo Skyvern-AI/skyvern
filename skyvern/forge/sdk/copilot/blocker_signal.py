@@ -91,6 +91,9 @@ _INTERNAL_TOOL_NAME_TOKENS: tuple[str, ...] = (
     "request_google_connection",
     "offer_demonstration",
     "read_google_sheet",
+    "list_workflow_triggers",
+    "test_trigger_mapping",
+    "create_webhook_trigger",
 )
 
 
