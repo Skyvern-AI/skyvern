@@ -23,6 +23,7 @@ from skyvern.config import settings
 from skyvern.exceptions import BlockedHost, SkyvernHTTPException
 from skyvern.forge import app
 from skyvern.forge.sdk.cache.base import BaseCache
+from skyvern.forge.sdk.copilot.agent_context import ScoutedInteraction
 from skyvern.forge.sdk.copilot.config import ALL_BLOCK_FAMILIES, AuthoringCapability
 from skyvern.forge.sdk.copilot.context import CopilotContext
 from skyvern.forge.sdk.copilot.credential_pause import apply_connected_credential_to_policy
@@ -30,7 +31,6 @@ from skyvern.forge.sdk.copilot.credential_resolution import load_credentials, sa
 from skyvern.forge.sdk.copilot.demonstration_tap import DEMONSTRATION_MAX_EVENTS, PageTap, TapEvent
 from skyvern.forge.sdk.copilot.request_policy import RequestPolicy
 from skyvern.forge.sdk.copilot.runtime import (
-    ScoutedInteraction,
     end_minted_browser_renewals,
     record_attached_browser_driver,
     resolve_persistent_browser_state,
