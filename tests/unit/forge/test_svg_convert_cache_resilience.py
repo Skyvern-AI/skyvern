@@ -542,3 +542,137 @@ async def test_css_shape_convert_uses_frame_selection_when_task_present(monkeypa
 
     assert captured == [selection]
     browser_manager.get_for_task.assert_not_called()
+
+
+class _ScreenshotProbe:
+    """Records how many element captures are in flight; ``release`` holds every capture open until it is set."""
+
+    def __init__(self) -> None:
+        self.in_flight = 0
+        self.peak = 0
+        self.calls: list[str] = []
+        self.release = asyncio.Event()
+        self.release.set()
+
+    async def screenshot(self, name: str) -> bytes:
+        self.calls.append(name)
+        self.in_flight += 1
+        self.peak = max(self.peak, self.in_flight)
+        try:
+            await self.release.wait()
+            for _ in range(3):
+                await asyncio.sleep(0)
+            return f"png-{name}".encode()
+        finally:
+            self.in_flight -= 1
+
+
+class _ProbedLocator(_FakeLocator):
+    def __init__(self, probe: _ScreenshotProbe, name: str) -> None:
+        self._probe = probe
+        self._name = name
+
+    async def screenshot(self, timeout: float, animations: str) -> bytes:
+        return await self._probe.screenshot(self._name)
+
+
+class _ProbedSkyvernFrame(_FakeSkyvernFrame):
+    def __init__(self, probe: _ScreenshotProbe) -> None:
+        self._probe = probe
+
+    def get_frame(self) -> Any:
+        probe = self._probe
+        return SimpleNamespace(locator=lambda selector: _ProbedLocator(probe, selector))
+
+
+def _distinct_css_shapes(count: int) -> list[dict[str, Any]]:
+    return [
+        {"tagName": "span", "id": f"AAA{i}", "attributes": {"id": f"AAA{i}", "class": f"icon-{i}"}}
+        for i in range(count)
+    ]
+
+
+@pytest.mark.asyncio
+async def test_css_shape_batch_admits_one_capture_at_a_time_and_keeps_llm_calls_parallel(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    shapes = _distinct_css_shapes(12)
+    probe = _ScreenshotProbe()
+    llm_active = 0
+    llm_peak = 0
+
+    async def handler(*, screenshots: list[bytes], **kwargs: Any) -> dict[str, Any]:
+        nonlocal llm_active, llm_peak
+        llm_active += 1
+        llm_peak = max(llm_peak, llm_active)
+        # Each LLM call waits until every capture is taken, so a lock around whole conversions would deadlock here.
+        while len(probe.calls) < len(shapes) or probe.in_flight:
+            await asyncio.sleep(0)
+        llm_active -= 1
+        return {"shape": f"shape of {screenshots[0].decode()}", "recognized": True}
+
+    monkeypatch.setattr(agent_functions, "app", SimpleNamespace(CACHE=_MemoryCache()))
+    monkeypatch.setattr(agent_functions, "_svg_css_converter_llm_api_handler_available", lambda: True)
+    monkeypatch.setattr(agent_functions, "_get_org_aware_svg_css_converter_llm_api_handler", lambda: handler)
+    monkeypatch.setattr(agent_functions, "_check_svg_eligibility", AsyncMock(return_value=False))
+    monkeypatch.setattr(agent_functions.settings, "ENABLE_CSS_SVG_PARSING", True)
+    monkeypatch.setattr(agent_functions.settings, "SVG_MAX_PARSING_ELEMENT_CNT", 3000)
+    monkeypatch.setattr(
+        agent_functions.SkyvernFrame, "create_instance", AsyncMock(return_value=_ProbedSkyvernFrame(probe))
+    )
+
+    cleanup = agent_functions.AgentFunction().cleanup_element_tree_factory(
+        task=SimpleNamespace(task_id="tsk_1"),  # type: ignore[arg-type]
+        step=SimpleNamespace(step_id="stp_1"),  # type: ignore[arg-type]
+        engine_selection=None,
+    )
+    async with asyncio.timeout(5):
+        tree = await cleanup(MagicMock(), "https://example.com", shapes)
+
+    assert probe.peak == 1, "the batch let several element captures queue on the page at once"
+    assert len(probe.calls) == 12
+    assert [element["attributes"].get("shape-description") for element in tree] == [
+        f'shape of png-[unique_id="AAA{i}"]' for i in range(12)
+    ]
+    assert skyvern_context.ensure_context().dropped_css_svg_element_map == {}
+    assert llm_peak > 1
+
+
+@pytest.mark.asyncio
+async def test_css_shape_admission_cancellation_never_leaks_the_permit(monkeypatch: pytest.MonkeyPatch) -> None:
+    probe = _ScreenshotProbe()
+    probe.release.clear()
+
+    async def handler(**kwargs: Any) -> dict[str, Any]:
+        return {"shape": "icon", "recognized": True}
+
+    monkeypatch.setattr(agent_functions, "app", SimpleNamespace(CACHE=_MemoryCache()))
+    admission = asyncio.Semaphore(1)
+    first, second = _distinct_css_shapes(2)
+    frame = _ProbedSkyvernFrame(probe)
+
+    holder = asyncio.create_task(
+        agent_functions._convert_css_shape_to_string(
+            frame, first, llm_api_handler=handler, screenshot_admission=admission
+        )
+    )
+    while not probe.calls:
+        await asyncio.sleep(0)
+    waiter = asyncio.create_task(
+        agent_functions._convert_css_shape_to_string(
+            frame, second, llm_api_handler=handler, screenshot_admission=admission
+        )
+    )
+    for _ in range(20):
+        await asyncio.sleep(0)
+    waiter.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await waiter
+    assert len(probe.calls) == 1, "a conversion cancelled while waiting for admission still submitted a capture"
+
+    holder.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await holder
+    async with asyncio.timeout(1):
+        await admission.acquire()
+    assert skyvern_context.ensure_context().dropped_css_svg_element_map == {}

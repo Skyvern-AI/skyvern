@@ -12,7 +12,7 @@ import { AxiosError, type AxiosResponse } from "axios";
 import { MemoryRouter, Route, Routes } from "react-router-dom";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
-import { BrowserStream } from "./BrowserStream";
+import { BrowserStream, VNC_CONNECT_HINT_DELAY_MS } from "./BrowserStream";
 import { BrowserSession } from "@/routes/browserSessions/BrowserSession";
 import { useRecordingLauncherStore } from "@/store/useRecordingLauncherStore";
 
@@ -884,6 +884,45 @@ describe("BrowserStream", () => {
           "stopped",
           "pbs_test",
         ),
+      );
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("shows no VNC hint on a connect that lands before the timeout", async () => {
+    vi.useFakeTimers();
+    try {
+      mocks.autoConnect.value = false;
+      renderBrowserStream();
+      await settled(() =>
+        expect(screen.getByText("Reaching out to your browser")).toBeTruthy(),
+      );
+      await advance(VNC_CONNECT_HINT_DELAY_MS - 1000);
+      expect(screen.queryByText(/check VNC support/)).toBeNull();
+
+      const rfb = mocks.rfbInstances[0] as unknown as {
+        emit: (type: string, detail?: unknown) => void;
+      };
+      act(() => rfb.emit("connect"));
+      await advance(VNC_CONNECT_HINT_DELAY_MS);
+      expect(screen.queryByText(/check VNC support/)).toBeNull();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("shows the VNC hint once a connect is stuck past the timeout", async () => {
+    vi.useFakeTimers();
+    try {
+      mocks.autoConnect.value = false;
+      renderBrowserStream();
+      await settled(() =>
+        expect(screen.getByText("Reaching out to your browser")).toBeTruthy(),
+      );
+      await advance(VNC_CONNECT_HINT_DELAY_MS);
+      await settled(() =>
+        expect(screen.getByText(/check VNC support/)).toBeTruthy(),
       );
     } finally {
       vi.useRealTimers();

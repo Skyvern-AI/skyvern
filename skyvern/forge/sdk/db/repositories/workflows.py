@@ -758,7 +758,11 @@ class WorkflowsRepository(BaseRepository):
         non-deleted workflows in the org, filtering out soft-deleted workflows."""
         if not workflow_permanent_ids:
             return set()
-        accessible_folder_ids = await app.AGENT_FUNCTION.accessible_workflow_folder_ids(get_request_principal())
+        principal = get_request_principal()
+        accessible_folder_ids = await app.AGENT_FUNCTION.accessible_workflow_folder_ids(principal)
+        scoped_folder_ceiling = (
+            principal is not None and principal.api_key_access_mode == "scoped" and principal.api_key_reach == "folders"
+        )
         async with self.Session() as session:
             stmt = (
                 select(WorkflowModel.workflow_permanent_id)
@@ -782,7 +786,10 @@ class WorkflowsRepository(BaseRepository):
                     .correlate_except(latest)
                     .scalar_subquery()
                 )
-                stmt = stmt.where(or_(current_folder_id.is_(None), current_folder_id.in_(accessible_folder_ids)))
+                folder_filter = current_folder_id.in_(accessible_folder_ids)
+                if not scoped_folder_ceiling:
+                    folder_filter = or_(current_folder_id.is_(None), folder_filter)
+                stmt = stmt.where(folder_filter)
             return set((await session.execute(stmt)).scalars().all())
 
     @db_operation("get_workflows_by_organization_id")
@@ -824,7 +831,11 @@ class WorkflowsRepository(BaseRepository):
         """
         if page < 1:
             raise ValueError(f"Page must be greater than 0, got {page}")
-        accessible_folder_ids = await app.AGENT_FUNCTION.accessible_workflow_folder_ids(get_request_principal())
+        principal = get_request_principal()
+        accessible_folder_ids = await app.AGENT_FUNCTION.accessible_workflow_folder_ids(principal)
+        scoped_folder_ceiling = (
+            principal is not None and principal.api_key_access_mode == "scoped" and principal.api_key_reach == "folders"
+        )
         db_page = page - 1
         async with self.Session() as session:
             subquery = (
@@ -894,9 +905,10 @@ class WorkflowsRepository(BaseRepository):
             if folder_id:
                 main_query = main_query.where(WorkflowModel.folder_id == folder_id)
             if accessible_folder_ids is not None:
-                main_query = main_query.where(
-                    or_(WorkflowModel.folder_id.is_(None), WorkflowModel.folder_id.in_(accessible_folder_ids))
-                )
+                folder_filter = WorkflowModel.folder_id.in_(accessible_folder_ids)
+                if not scoped_folder_ceiling:
+                    folder_filter = or_(WorkflowModel.folder_id.is_(None), folder_filter)
+                main_query = main_query.where(folder_filter)
             if workflow_tags:
                 for subquery in workflow_tag_wpid_subqueries(workflow_tags, organization_id):
                     main_query = main_query.where(WorkflowModel.workflow_permanent_id.in_(subquery))

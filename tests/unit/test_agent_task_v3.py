@@ -102,6 +102,8 @@ from skyvern.forge.taskv3.loop import (
 )
 from skyvern.forge.taskv3.run_arms import (
     ANSWER_AUDIT_LOG_ONLY_FLAG,
+    APPLICATION_CONTEXT_FLAG,
+    CARRY_REASONING_FLAG,
     DATE_SEGMENT_AIM_FLAG,
     DEAD_END_RETURN_FLAG,
     LLM_ROUTE_FLAG,
@@ -468,7 +470,13 @@ async def test_execute_task_v3_buckets_the_date_segment_aim_arm_per_run(monkeypa
     )
 
     assert loop_mock.date_segment_aim_enabled_during_loop is True
-    for flag in (DATE_SEGMENT_AIM_FLAG, DEAD_END_RETURN_FLAG, ANSWER_AUDIT_LOG_ONLY_FLAG):
+    for flag in (
+        DATE_SEGMENT_AIM_FLAG,
+        DEAD_END_RETURN_FLAG,
+        APPLICATION_CONTEXT_FLAG,
+        ANSWER_AUDIT_LOG_ONLY_FLAG,
+        CARRY_REASONING_FLAG,
+    ):
         assert loop_mock.context.run_arms[flag] == (task.workflow_run_id, "treatment")
         provider.assert_any_await(flag, task.workflow_run_id, properties={"organization_id": task.organization_id})
 
@@ -2756,6 +2764,10 @@ async def _run_execute_task_v3_download(
     loop_mock = AsyncMock(side_effect=_loop)
     monkeypatch.setattr("skyvern.forge.taskv3.engine.run_task_v3_agent_loop", loop_mock)
     monkeypatch.setattr("skyvern.forge.agent.LLMCaller", MagicMock())
+    # The provider read-back polls and admission grace run at a tenth of production; tests scale their
+    # download_timeout to match.
+    monkeypatch.setattr(taskv3_provider_downloads, "POLL_INTERVAL_SECONDS", 0.1)
+    monkeypatch.setattr(taskv3_provider_downloads, "EVENT_ADMISSION_GRACE_SECONDS", 0.025)
     # get_path_for_workflow_download_directory (imported by agent.py) resolves through this same
     # module-level name at call time, so patching it here also redirects that call.
     monkeypatch.setattr("skyvern.forge.sdk.api.files.get_download_dir", lambda *_a, **_k: str(tmp_path))
@@ -8319,13 +8331,13 @@ async def test_v3_download_provider_wait_ends_at_the_block_download_timeout(
         drop_file=False,
         provider_source=source,
         download_monitor=monitor,
-        download_timeout=2.0,
+        download_timeout=0.2,
         loop_fn=_click_then_probe(tmp_path, monitor, source),
     )
 
     assert captured["probe_reason"] is None
     assert observation.poll_deadlines
-    # The block's 2 s timeout, not the 30 s default, set the read deadline; no poll started past it.
+    # The block's own timeout, not the 30 s default, set the read deadline; no poll started past it.
     assert observation.poll_deadlines[0] - captured["probe_started_at"] < (
         taskv3_provider_downloads.PROVIDER_DOWNLOAD_WAIT_SECONDS
     )
@@ -8495,7 +8507,7 @@ async def test_v3_download_still_reads_the_provider_after_the_monitor_outlasted_
         drop_file=False,
         provider_source=source,
         download_monitor=monitor,
-        download_timeout=1.0,
+        download_timeout=0.1,
         loop_fn=_probe_twice(monitor, _settle),
     )
 
@@ -8521,7 +8533,7 @@ async def test_v3_download_still_reads_the_provider_after_an_empty_first_window(
         drop_file=False,
         provider_source=source,
         download_monitor=monitor,
-        download_timeout=1.0,
+        download_timeout=0.1,
         loop_fn=_probe_twice(monitor, _list_late),
     )
 
@@ -8541,7 +8553,7 @@ async def test_v3_download_cancellation_returns_only_after_the_provider_poll_cle
 
     async def _loop(kwargs: dict[str, Any], captured: dict[str, Any]) -> LoopOutcome:
         monitor.browser_download_event_count += 1
-        asyncio.get_running_loop().call_later(2.0, gate.set)
+        asyncio.get_running_loop().call_later(0.4, gate.set)
         captured["probe_reason"] = await kwargs["download_settle"](frozenset())
         captured["cleanup_finished_at_return"] = observation.cleanup_finished
         return LoopOutcome(status="budget_exhausted", reason="no download detected", billable_actions=[])

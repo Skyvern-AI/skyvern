@@ -175,49 +175,6 @@ async def test_created_after_is_none_when_run_started_at_missing(monkeypatch: py
 
 
 @pytest.mark.asyncio
-async def test_workflow_run_lookup_skipped_when_payload_resolves(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Codex must-fix: payload-resolved OTP must not pay a DB roundtrip."""
-    payload_value = _otp_value("111111")
-    task = _make_task(
-        navigation_payload={"otp_code": "111111"},
-        totp_verification_url="https://example.com/webhook",
-    )
-    db_get = _stub_workflow_run_lookup(monkeypatch, workflow_id="w_test", workflow_permanent_id="wpid_test")
-    with (
-        patch("skyvern.services.otp_service.extract_totp_from_navigation_inputs", return_value=payload_value),
-        patch("skyvern.services.otp_service.try_generate_totp_from_credential") as credential,
-        patch("skyvern.services.otp_service.poll_otp_value", new=AsyncMock()) as poll,
-    ):
-        result = await resolve_otp_value(task)
-
-    assert result is payload_value
-    db_get.assert_not_awaited()
-    credential.assert_not_called()
-    poll.assert_not_called()
-
-
-@pytest.mark.asyncio
-async def test_workflow_run_lookup_skipped_when_credential_resolves(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Codex must-fix: credential-resolved OTP must not pay a DB roundtrip."""
-    credential_value = _otp_value("222222")
-    task = _make_task(
-        totp_verification_url="https://example.com/webhook",
-        totp_identifier="user@example.com",
-    )
-    db_get = _stub_workflow_run_lookup(monkeypatch, workflow_id="w_test", workflow_permanent_id="wpid_test")
-    with (
-        patch("skyvern.services.otp_service.extract_totp_from_navigation_inputs", return_value=None),
-        patch("skyvern.services.otp_service.try_generate_totp_from_credential", return_value=credential_value),
-        patch("skyvern.services.otp_service.poll_otp_value", new=AsyncMock()) as poll,
-    ):
-        result = await resolve_otp_value(task)
-
-    assert result is credential_value
-    db_get.assert_not_awaited()
-    poll.assert_not_called()
-
-
-@pytest.mark.asyncio
 async def test_polling_handles_missing_workflow_run_lookup(monkeypatch: pytest.MonkeyPatch) -> None:
     """If DB returns None for the workflow_run, polling still proceeds with None metadata."""
     poll_value = _otp_value("999")

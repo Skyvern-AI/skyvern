@@ -6,8 +6,11 @@ from fastapi import Depends, HTTPException, status
 from skyvern.core.script_generations.real_skyvern_page_ai import RealSkyvernPageAi
 from skyvern.core.script_generations.script_skyvern_page import ScriptSkyvernPage
 from skyvern.exceptions import (
+    ActionDeadlineExceeded,
     MissingBrowserStatePage,
+    MissingElement,
     ScrapingFailed,
+    ScreenshotPageHasNoDrawnArea,
     ScreenshotTargetClosed,
     SkyvernActionFailed,
     SkyvernHTTPException,
@@ -372,6 +375,25 @@ async def _run_sdk_action(
                 status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
                 detail="The browser page, context or browser was closed before the action could complete.",
             )
+        # Deliberately narrower than FailedToTakeScreenshot, which also wraps renderer crashes and
+        # protocol errors — those are ours to fix, so they keep reaching the catch-all as 5xx.
+        except ScreenshotPageHasNoDrawnArea as e:
+            await app.DATABASE.tasks.update_task(
+                task_id=task.task_id,
+                organization_id=organization_id,
+                status=TaskStatus.failed,
+                failure_reason=str(e),
+            )
+            LOG.warning(
+                "SDK action failed because the page had no drawn area to capture",
+                action_type=action.type,
+                browser_session_id=browser_session_id,
+                error=str(e),
+            )
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
+                detail="The page had no drawn area to capture for the action. Its viewport may have collapsed to zero.",
+            )
         except MissingBrowserStatePage as e:
             await app.DATABASE.tasks.update_task(
                 task_id=task.task_id,
@@ -388,6 +410,40 @@ async def _run_sdk_action(
             raise HTTPException(
                 status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
                 detail="The browser had no page left to act on before the action could complete.",
+            )
+        except MissingElement as e:
+            await app.DATABASE.tasks.update_task(
+                task_id=task.task_id,
+                organization_id=organization_id,
+                status=TaskStatus.failed,
+                failure_reason=str(e),
+            )
+            LOG.warning(
+                "SDK action failed because the target element was not on the page",
+                action_type=action.type,
+                browser_session_id=browser_session_id,
+                error=str(e),
+            )
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
+                detail="The element the action targeted was not found on the page. An earlier action may have removed it.",
+            )
+        except ActionDeadlineExceeded as e:
+            await app.DATABASE.tasks.update_task(
+                task_id=task.task_id,
+                organization_id=organization_id,
+                status=TaskStatus.failed,
+                failure_reason=str(e),
+            )
+            LOG.warning(
+                "SDK action failed because the browser did not answer before its deadline",
+                action_type=action.type,
+                browser_session_id=browser_session_id,
+                error=str(e),
+            )
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
+                detail="The browser did not answer before the action's deadline.",
             )
         except SkyvernHTTPException as e:
             await app.DATABASE.tasks.update_task(

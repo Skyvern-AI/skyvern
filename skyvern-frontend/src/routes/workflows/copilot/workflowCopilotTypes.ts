@@ -674,6 +674,9 @@ export interface WorkflowCopilotToolCallUpdate {
   iteration: number;
   tool_call_id: string;
   timestamp?: string | null;
+  // The browser this call resolved to when it was emitted; null for calls that
+  // act in no page. Not persisted, so a reloaded chat never sees it.
+  browser_session_id?: string | null;
 }
 
 // One changed code block's line delta. `patch` is absent when the server dropped

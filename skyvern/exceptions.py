@@ -1099,6 +1099,12 @@ class ScreenshotTargetClosed(FailedToTakeScreenshot):
     pass
 
 
+class ScreenshotPageHasNoDrawnArea(FailedToTakeScreenshot):
+    """The viewport collapsed to zero in one axis, so there was nothing to capture. Distinct from its
+    parent because the parent also wraps renderer crashes and protocol errors, which are ours, not the
+    page's."""
+
+
 class EmptyScrapePage(SkyvernException):
     def __init__(self) -> None:
         super().__init__("Failed to scrape the page, returned an NONE result")

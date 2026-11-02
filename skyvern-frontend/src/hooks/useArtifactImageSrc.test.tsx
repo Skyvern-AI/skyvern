@@ -149,4 +149,44 @@ describe("useArtifactImageSrc", () => {
 
     expect(img().getAttribute("src")).toBe(otherArtifact.signed_url);
   });
+
+  it("fails when the re-mint returns the URL that just failed", async () => {
+    mintMock.mockReset();
+    mintMock.mockResolvedValue({
+      artifact_id: "a_img",
+      signed_url: SIGNED_URL,
+      expires_at: 2,
+    });
+
+    const { container, queryByTestId } = render(<Probe />);
+    fireEvent.error(container.querySelector("img")!);
+
+    await waitFor(() => {
+      expect(queryByTestId("failed")).not.toBeNull();
+    });
+  });
+
+  it("clears a failure when the artifact changes", async () => {
+    mintMock.mockReset();
+    const fileArtifact = {
+      artifact_id: "a_file",
+      artifact_type: "screenshot_action",
+      uri: "file:///data/artifacts/a_file.png",
+      signed_url: undefined,
+    } as unknown as ArtifactApiResponse;
+
+    const { container, queryByTestId, rerender } = render(
+      <Probe probeArtifact={fileArtifact} />,
+    );
+    fireEvent.error(container.querySelector("img")!);
+    await waitFor(() => {
+      expect(queryByTestId("failed")).not.toBeNull();
+    });
+
+    rerender(<Probe />);
+    expect(queryByTestId("failed")).toBeNull();
+    expect(container.querySelector("img")!.getAttribute("src")).toBe(
+      SIGNED_URL,
+    );
+  });
 });

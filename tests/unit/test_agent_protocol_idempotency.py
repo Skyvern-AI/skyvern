@@ -12,7 +12,7 @@ from unittest.mock import AsyncMock, MagicMock
 import httpx
 import pytest
 import yaml
-from fastapi import FastAPI, HTTPException
+from fastapi import HTTPException
 from sqlalchemy import func, select
 from starlette.requests import Request
 
@@ -45,6 +45,7 @@ from skyvern.forge.sdk.workflow.validation import (
 )
 from skyvern.schemas.workflows import WorkflowRequest, WorkflowStatus
 from tests.unit.force_stub_app import start_forge_stub_app
+from tests.unit.shared_route_app import shared_route_app
 
 start_forge_stub_app()
 
@@ -199,11 +200,9 @@ async def idempotency_lab(
     monkeypatch.setattr(app, "DATABASE", database)
     monkeypatch.setattr(app, "WORKFLOW_SERVICE", workflow_service)
 
-    fastapi_app = FastAPI()
+    fastapi_app = shared_route_app(monkeypatch)
     fastapi_app.dependency_overrides[org_auth_service.get_current_org] = lambda: organization
     fastapi_app.dependency_overrides[org_auth_service.get_current_user_id_or_none] = lambda: "u_test"
-    fastapi_app.include_router(agent_protocol.base_router, prefix="/v1")
-    fastapi_app.include_router(agent_protocol.legacy_base_router, prefix="/v1")
     fastapi_app.add_exception_handler(SkyvernHTTPException, handle_skyvern_http_exception)
 
     transport = httpx.ASGITransport(app=fastapi_app)
@@ -392,10 +391,9 @@ async def test_create_workflow_honors_idempotency_key(
     monkeypatch.setattr(app, "DATABASE", database)
     monkeypatch.setattr(app, "WORKFLOW_SERVICE", workflow_service)
 
-    fastapi_app = FastAPI()
+    fastapi_app = shared_route_app(monkeypatch)
     fastapi_app.dependency_overrides[org_auth_service.get_current_org] = lambda: organization
     fastapi_app.dependency_overrides[org_auth_service.get_current_user_id_or_none] = lambda: "u_test"
-    fastapi_app.include_router(agent_protocol.base_router, prefix="/v1")
     try:
         transport = httpx.ASGITransport(app=fastapi_app)
         async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
@@ -485,10 +483,9 @@ async def test_create_workflow_idempotency_wait_deadline_returns_conflict(
     monkeypatch.setattr(app, "DATABASE", database)
     monkeypatch.setattr(app, "WORKFLOW_SERVICE", WorkflowService())
 
-    fastapi_app = FastAPI()
+    fastapi_app = shared_route_app(monkeypatch)
     fastapi_app.dependency_overrides[org_auth_service.get_current_org] = lambda: organization
     fastapi_app.dependency_overrides[org_auth_service.get_current_user_id_or_none] = lambda: "u_test"
-    fastapi_app.include_router(agent_protocol.base_router, prefix="/v1")
 
     try:
         transport = httpx.ASGITransport(app=fastapi_app)
@@ -1079,7 +1076,7 @@ async def test_workflow_setting_presence_preserves_persisted_values(
         if entrypoint in {"put", "json"}:
             if entrypoint == "put":
                 response = await lab.client.put(
-                    f"/v1/workflows/{stored.workflow_permanent_id}",
+                    f"/api/v1/workflows/{stored.workflow_permanent_id}",
                     content=document,
                     headers={"Content-Type": "application/x-yaml"},
                 )
@@ -1167,7 +1164,7 @@ async def test_each_surface_stamps_the_build_source_of_the_version_it_writes(
 
         definition = WORKFLOW_CREATE_PAYLOAD["json_definition"]
         ui_save = await lab.client.put(
-            f"/v1/workflows/{workflow_permanent_id}",
+            f"/api/v1/workflows/{workflow_permanent_id}",
             content=yaml.safe_dump(definition),
             headers={"Content-Type": "application/x-yaml", "x-user-agent": "skyvern-ui"},
         )
@@ -1253,6 +1250,22 @@ async def test_saved_workflow_validate_is_served_on_the_api_v1_prefix_the_ui_cal
 
     assert response.status_code == 200
     assert [problem["code"] for problem in response.json()["problems"]] == ["forward_reference"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("body", ["webapps/v1/workflows", "${772055+272300}", "42", "- a\n- b", "null"])
+async def test_workflow_create_rejects_yaml_that_is_not_a_mapping_with_422(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    body: str,
+) -> None:
+    async with idempotency_lab(monkeypatch, tmp_path / "non-mapping-yaml.db") as lab:
+        legacy = await lab.client.post("/api/v1/workflows", content=body, headers={"Content-Type": "text/plain"})
+        shared = await lab.client.post("/v1/workflows", json={"yaml_definition": body})
+        update = await lab.client.post("/v1/workflows/wpid_missing", json={"yaml_definition": body})
+
+    assert [legacy.status_code, shared.status_code, update.status_code] == [422, 422, 422]
+    assert "mapping" in legacy.json()["detail"]
 
 
 def _validation_request(body: bytes) -> Request:

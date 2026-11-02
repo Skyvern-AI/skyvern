@@ -1,0 +1,78 @@
+title: Review card e2e rep1
+description: Read the member statement from the member portal (local QA fixture).
+proxy_location: NONE
+persist_browser_session: false
+reuse_browser_session: false
+pin_saved_session_ip: false
+browser_profile_key: null
+model: null
+max_screenshot_scrolls: null
+max_elapsed_time_minutes: null
+adaptive_caching: false
+generate_script_on_terminal: false
+run_with: agent
+browser_type: null
+cache_key: default
+ai_fallback: true
+mask_secrets: false
+code_version: 2
+workflow_definition:
+  version: 2
+  parameters: []
+  blocks:
+    - label: read_statement_number
+      continue_on_failure: false
+      next_loop_on_failure: false
+      model: null
+      next_block_label: read_amount_due
+      ignore_workflow_system_prompt: false
+      block_type: extraction
+      url: http://localhost:8941/cookie_session_portal/members
+      title: ''
+      data_extraction_goal: Read the statement number shown in the members area.
+      data_schema:
+        type: object
+        properties:
+          statement_number:
+            type: string
+      max_retries: 0
+      max_steps_per_run: null
+      parameter_keys: []
+      disable_cache: false
+      engine: null
+      export_enabled: false
+      export_data_schema: null
+      export_file_name: null
+      export_records: null
+    - label: read_amount_due
+      continue_on_failure: false
+      next_loop_on_failure: false
+      model: null
+      next_block_label: null
+      ignore_workflow_system_prompt: false
+      block_type: extraction
+      url: ''
+      title: read_amount_due
+      data_extraction_goal: Read the amount due and the due date shown in the members area.
+      data_schema: {type: object, properties: {amount_due: {type: string}, due_date: {type: string}}}
+      max_retries: 0
+      max_steps_per_run: null
+      parameter_keys: []
+      disable_cache: false
+      engine: null
+      export_enabled: false
+      export_data_schema:
+        type: array
+        items:
+          type: object
+          properties:
+            value:
+              type: string
+      export_file_name: null
+      export_records: null
+  finally_block_label: null
+  workflow_system_prompt: null
+  error_code_mapping: null
+  retry_policy: null
+run_sequentially: false
+sequential_key: null

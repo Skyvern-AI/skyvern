@@ -83,6 +83,7 @@ from skyvern.forge.taskv3.field_commit import (
 )
 from skyvern.forge.taskv3.loop import (
     ACTION_OUTCOME_DATA_KEY,
+    BLOCKING_LAYER_DATA_KEY,
     CLICK_DISPATCHED_DATA_KEY,
     DOWNLOAD_FAILURE_MAX_LINES,
     DROP_TARGET_DATA_KEY,
@@ -95,9 +96,11 @@ from skyvern.forge.taskv3.loop import (
     TARGET_KIND_DATA_KEY,
     TARGET_LABEL_DATA_KEY,
     TARGET_LABEL_IS_PLACEHOLDER_DATA_KEY,
+    BlockingLayer,
     CoveredBranch,
     CoveredLayerKind,
     DownloadFailureFacts,
+    LayerCheck,
     SemanticCommitStats,
     ToolHandler,
     ToolRefusal,
@@ -5376,6 +5379,8 @@ _NATIVE_PROXY_JS = r"""
 # hard budget the ACTION never pays for: the isolated world shares the page's JS thread, and a
 # busy-looping page would otherwise stall the action behind a read nothing depends on.
 _TARGET_NAME_TIMEOUT_SECONDS = 2.0
+# The pre-dispatch layer recheck: one reach probe. Past this it proves nothing, and the type runs its own bounded path.
+_LAYER_CHECK_TIMEOUT_SECONDS = 2.0
 
 # How long a click/focus/hover/fill/type/select waits for Playwright actionability before it raises.
 _ACTION_TIMEOUT_MS = 15000
@@ -5388,6 +5393,8 @@ _ACT_TOOL_TIMEOUT_MS = _ADDRESS_RESOLVE_TIMEOUT_MS + 180_000
 # the delay between keys, so a key gets ~3x that; the cap keeps a field that never takes keys from stalling the run.
 _PER_KEY_TIMEOUT_MS = 250
 _TYPING_TIMEOUT_CAP_MS = 120_000
+# How long a click on a matched suggestion row waits to land before the pick is reported as not clicked.
+_SUGGESTION_ROW_CLICK_TIMEOUT_MS = 3000
 # How long one box of a one-character-per-box code field may stay disabled once the box before it holds a character.
 _CODE_BOX_ENABLE_WAIT_MS = 1500
 # Fewer adjacent one-character boxes (initials, a two-box suffix) are separate fields, not one segmented field.
@@ -5924,6 +5931,7 @@ _TYPE_TARGET_PROBE_JS = (
 """
     + _TARGET_READONLY_JS
     + r"""  const RETEST_SCROLLABLE_CLIP = false;
+  const LAYER_IDENTITY = false;
   let disabled = false;
   try { disabled = !!(ctl.disabled || (ctl.matches && ctl.matches(':disabled'))); } catch (e) { /* best-effort */ }
   const out = { exists: true, disabled, readOnly };
@@ -6664,6 +6672,52 @@ _TYPE_TARGET_PROBE_JS = (
     try { layer.setAttribute('data-tv3-cover', '1'); } catch (e) { /* best-effort */ }
     out.occluder = { selector: layerSelector, name: layerName, controls, truncated };
     out.occluder.layerKind = layerKind;
+    // Which layer node this is, and the state of its controls, kept only in a realm the page cannot read or patch
+    // (the same trust allowOwnLabel grants): a page that could reach the table could make one layer pass for another.
+    if (LAYER_IDENTITY && layerKind === 'qualified' && arg.allowOwnLabel === true) {
+      try {
+        const ids = globalThis.__tv3LayerIds || (globalThis.__tv3LayerIds = new WeakMap());
+        const idOf = (n) => {
+          let t = ids.get(n);
+          if (!t) { t = Math.random().toString(36).slice(2) + Math.random().toString(36).slice(2); ids.set(n, t); }
+          return t;
+        };
+        // What a person could read or set in the layer: its text, and each control's identity, value and state. The
+        // comparison stays in this realm; only a count of how often it changed leaves it, so no page text or value does.
+        let seen = String(layer.innerText || '');
+        const sel = 'input,select,textarea,button,[contenteditable],[role],[aria-checked],[aria-selected],[aria-pressed],[aria-expanded],[aria-disabled]';
+        // Every open shadow root in the layer, the layer's own included: innerText stops at a root, so each root's text
+        // is read too. A layer this walk cannot finish reading cannot be compared, so it throws and names no layer.
+        const controls = [];
+        const roots = [[layer, 0]];
+        if (layer.shadowRoot) roots.push([layer.shadowRoot, 1]);
+        let visited = 0;
+        while (roots.length) {
+          const [root, depth] = roots.pop();
+          if (depth > 16) throw new Error('layer too deep to compare');
+          if (root !== layer) seen += '\u0004' + String(root.textContent || '');
+          for (const n of root.querySelectorAll('*')) {
+            if (++visited > 5000) throw new Error('layer too large to compare');
+            if (n.matches(sel)) controls.push(n);
+            if (n.shadowRoot) roots.push([n.shadowRoot, depth + 1]);
+          }
+        }
+        for (const c of controls) {
+          // :disabled, not .disabled: a disabled fieldset disables its controls without touching their own property.
+          let off = c.disabled ? 1 : 0;
+          try { off = c.matches(':disabled') ? 1 : 0; } catch (e) { /* not a form control */ }
+          seen += '\u0001' + idOf(c) + '\u0002' + (c.checked ? 1 : 0) + off
+            + (c.selectedIndex === undefined ? '' : c.selectedIndex) + '\u0002' + (c.value === undefined ? '' : String(c.value))
+            + '\u0002' + ['aria-checked', 'aria-selected', 'aria-pressed', 'aria-expanded', 'aria-disabled', 'hidden']
+              .map((a) => c.getAttribute(a) || '').join('\u0003');
+        }
+        const revs = globalThis.__tv3LayerRevs || (globalThis.__tv3LayerRevs = new WeakMap());
+        let rev = revs.get(layer);
+        if (!rev || rev.seen !== seen) { rev = { seen, n: (rev ? rev.n : 0) + 1 }; revs.set(layer, rev); }
+        out.occluder.layerToken = idOf(layer);
+        out.occluder.layerState = String(rev.n);
+      } catch (e) { /* best-effort: no token, no lease */ }
+    }
     // The walk can stop on a pinned ancestor of the field itself: a sticky header whose collapsed
     // search form lays a transparent click-catcher over its own inputs. There is nothing to dismiss.
     // An interactive hit (the form's own submit button) is not a catcher: clicking it could submit.
@@ -6687,7 +6741,7 @@ _TYPE_TARGET_PROBE_JS = (
 # The typing path's probe: the same reading, except that a field which only needs its scroller scrolled is re-tested.
 _TYPING_REACH_PROBE_JS = _TYPE_TARGET_PROBE_JS.replace(
     "const RETEST_SCROLLABLE_CLIP = false;", "const RETEST_SCROLLABLE_CLIP = true;"
-)
+).replace("const LAYER_IDENTITY = false;", "const LAYER_IDENTITY = true;")
 
 # The probe's readonly reading alone. Unlike the probe it scrolls nothing and re-mints no cover markers, so it can
 # be repeated without invalidating the markers the probe's verdict names.
@@ -8819,6 +8873,10 @@ _POPUP_FILTER_INPUT_JS = (
 # Wall-clock cap on the virtualized-list walk: a pathological list degrades to the "cut short" error
 # instead of consuming the task's step budget in one call.
 _SCROLL_SEARCH_BUDGET_S = 20.0
+# The open-click's row poll and a popup filter box's reads run this long, and up to the hard cap while the list shows
+# an in-flight indicator.
+_LIST_POLL_SOFT_S = 2.4
+_LIST_POLL_HARD_S = 8.0
 
 # What the tagged scroller currently renders first: the first option row's text and its top in the
 # scroller's own coordinate space. A virtualiser that has re-rendered for a new scrollTop shows a
@@ -15344,6 +15402,7 @@ def build_browser_tools(
         parts = _named_controls(occluder)
         branch = _covered_branch(occluder)
         _record_covered(occluder, branch, controls=[] if branch == "own_container" else parts)
+        blocker = _blocking_layer(occluder, branch) if verb == "typed into" else None
         # The probe walks only the hit element and its ancestors, so this claims nothing about other layers.
         unqualified = (
             "That is the element drawn where the pointer lands; neither it nor anything containing it qualified "
@@ -15445,6 +15504,7 @@ def build_browser_tools(
                 f"{selector} is covered by {layer_desc}, so it cannot be {verb}{also}. The probe found no named "
                 "controls on it, but it may still have an unlabeled close (an icon or an ×): read get_html of "
                 f"{layer_selector or 'the layer'} to find it, close the layer, then retry {selector}.",
+                data=blocker,
                 error_class="covered",
             )
         return ToolResult.error(
@@ -15454,8 +15514,18 @@ def build_browser_tools(
             # (e.g. "Delete account") is not distinguishable here from a close/cancel button.
             f"Its controls: {controls_desc}. Pick whichever one actually closes or dismisses the "
             f"layer, then retry {selector}.",
+            data=blocker,
             error_class="covered",
         )
+
+    def _blocking_layer(occluder: dict[str, Any] | None, branch: CoveredBranch) -> dict[str, Any] | None:
+        # Only a layer the walk qualified and the probe identified: a hit element, a clip, a ghost backdrop, a
+        # challenge or the field's own container is not a layer every field behind it shares.
+        occluder = occluder or {}
+        token, state = occluder.get("layerToken"), occluder.get("layerState")
+        if branch != "named" or occluder.get("layerKind") != "qualified" or not token or not state:
+            return None
+        return {BLOCKING_LAYER_DATA_KEY: BlockingLayer(str(token), str(state))}
 
     async def _probe_arg(page: Any, selector: str) -> dict[str, Any]:
         # Probes resolve per root, which cannot match a host-anchored selector whose two halves
@@ -15572,6 +15642,11 @@ def build_browser_tools(
         # The element the driver waited on, which is not always the one the caller named.
         acted = _acted_selector.get(selector, selector)
         return _inert_target_error(acted) if await _target_is_inert(acted) else None
+
+    async def _typing_target(page: Any, selector: str) -> str:
+        """The element a type call acts on: the one its selector names, or the control a named shadow host mirrors."""
+        await _require_single_target(page, selector)
+        return await _resolve_mirrored_host_control(page, selector)
 
     async def _resolve_mirrored_host_control(page: Any, selector: str) -> str:
         # Only a single compound selector can name a host by mistake; a composed (host-anchored) one
@@ -16572,6 +16647,8 @@ def build_browser_tools(
             probe = await _probe_evaluate(page, _TYPING_REACH_PROBE_JS, selector, await _probe_arg(page, selector))
         except Exception:
             probe = None
+        if isinstance(probe, dict) and isinstance(probe.get("occluder"), dict) and _probe_was_isolated() is not True:
+            probe["occluder"].pop("layerToken", None)
         record_type_reach(
             acted_in_frame=bool(_acted_realm) and page.parent_frame is not None,
             probe_scrolled=isinstance(probe, dict) and probe.get("scrolled") is True,
@@ -17445,7 +17522,7 @@ def build_browser_tools(
         # candidate scoring (word-overlap with the TYPED query) can drop a row the widget still renders.
         rows_armed = await _arm_rows_at_press(page, selector)
         try:
-            if not await _click_stamped_row(page, stamp, best_txt, 3000):
+            if not await _click_stamped_row(page, stamp, best_txt, _SUGGESTION_ROW_CLICK_TIMEOUT_MS):
                 raise RuntimeError("stamped suggestion row is no longer the matched row")
             clicked = True
         except Exception:
@@ -17480,7 +17557,9 @@ def build_browser_tools(
                         except Exception:
                             LOG.debug("taskv3 commit-event arm failed", selector=selector)
                         rows_armed = await _arm_rows_at_press(page, selector)
-                        clicked = await _click_stamped_row(page, f'[data-tv3-sugg="{idx}"]', best_txt, 3000)
+                        clicked = await _click_stamped_row(
+                            page, f'[data-tv3-sugg="{idx}"]', best_txt, _SUGGESTION_ROW_CLICK_TIMEOUT_MS
+                        )
             except Exception:
                 clicked = False
         if not clicked:
@@ -19400,8 +19479,7 @@ def build_browser_tools(
         selector = args.get("selector")
         if not selector:
             return ToolResult.error("type needs a selector, or mark=N from the last look().")
-        await _require_single_target(page, selector)
-        selector = await _resolve_mirrored_host_control(page, selector)
+        selector = await _typing_target(page, selector)
         text = await _resolve_text(args.get("text", ""), operation="type", page=page, selector=selector)
         # A secret source resolved the text, or it is a value a tool delivered as secret (a one-time code typed as is).
         typed_secret = text != args.get("text", "") or _is_runtime_secret(text)
@@ -20493,8 +20571,8 @@ def build_browser_tools(
             # row, a spinner) the rows are still coming, so the poll wait extends — production pods run
             # at a fraction of a vCPU and a fetch that renders instantly on a laptop lands seconds later
             # there. The extension is bounded: a permanently-busy page stops at the hard cap.
-            soft_deadline = time.monotonic() + 2.4
-            hard_deadline = time.monotonic() + 8.0
+            soft_deadline = time.monotonic() + _LIST_POLL_SOFT_S
+            hard_deadline = time.monotonic() + _LIST_POLL_HARD_S
             while True:
                 await asyncio.sleep(0.4)
                 try:
@@ -21039,8 +21117,8 @@ def build_browser_tools(
                 return first in v.casefold() and v != cleared
 
             seen = await _box_value()
-            land_soft = time.monotonic() + 2.4
-            land_hard = time.monotonic() + 8.0
+            land_soft = time.monotonic() + _LIST_POLL_SOFT_S
+            land_hard = time.monotonic() + _LIST_POLL_HARD_S
             while not _landed(seen):
                 await asyncio.sleep(0.3)
                 prev, seen = seen, await _box_value()
@@ -21074,8 +21152,8 @@ def build_browser_tools(
             rival_texts: list[str] = []
             # Same budget as the open poll: a read that misses may be a placeholder row or a filter still in
             # flight, so the wait ends only past the deadline on a settled, not-busy read.
-            soft_deadline = time.monotonic() + 2.4
-            hard_deadline = time.monotonic() + 8.0
+            soft_deadline = time.monotonic() + _LIST_POLL_SOFT_S
+            hard_deadline = time.monotonic() + _LIST_POLL_HARD_S
             while True:
                 await asyncio.sleep(0.3)
                 filtered, complete, fresh = await _read_rows()
@@ -23385,6 +23463,57 @@ def build_browser_tools(
         _with_ref_resolution("answer_probe", _with_selector_guard(_answer_target))
     )
 
+    async def _layer_target(args: dict[str, Any]) -> ToolResult:
+        page, error = await _resolve_page()
+        if error is not None:
+            return error
+        selector = await _typing_target(page, str(args.get("selector") or ""))
+        arg = await _probe_arg(page, selector)
+        try:
+            probe = await _probe_evaluate(page, _TYPING_REACH_PROBE_JS, selector, arg)
+        except Exception:
+            probe = None
+        finally:
+            if arg["el"] is not None:
+                with contextlib.suppress(Exception):
+                    await arg["el"].dispose()
+        isolated = _probe_was_isolated() is True
+        return ToolResult.ok(
+            "", data={"probe": probe if isinstance(probe, dict) else None, "isolated": isolated, "selector": selector}
+        )
+
+    _resolve_layer_target = _with_act_by_mark(_with_ref_resolution("layer_probe", _with_selector_guard(_layer_target)))
+
+    async def _type_layer_check(args: dict[str, Any], lease: BlockingLayer) -> tuple[LayerCheck, ToolResult | None]:
+        """Whether this type's own target is refused right now by the leased layer, read with the probe the full
+        typing path runs. Only a fresh reading naming the same layer node in the same state holds the call."""
+        resolved = dict(args)
+        try:
+            data = (await asyncio.wait_for(_resolve_layer_target(resolved), _LAYER_CHECK_TIMEOUT_SECONDS)).data or {}
+        except Exception:
+            return LayerCheck.OTHER, None
+        probe = data.get("probe")
+        if not data.get("isolated") or not isinstance(probe, dict) or not probe.get("exists"):
+            return LayerCheck.OTHER, None
+        if not probe.get("occluded") or probe.get("skinned"):
+            return LayerCheck.REACHABLE, None
+        occluder = probe.get("occluder")
+        if probe.get("unrendered") or probe.get("readOnly") or probe.get("disabled") or not isinstance(occluder, dict):
+            return LayerCheck.OTHER, None
+        if occluder.get("layerToken") != lease.token or occluder.get("layerState") != lease.state:
+            return LayerCheck.OTHER, None
+        refusal = _covered_error(str(data.get("selector") or ""), occluder)
+        if (refusal.data or {}).get(BLOCKING_LAYER_DATA_KEY) != lease:
+            return LayerCheck.OTHER, None
+        # A held call stands in for the full one, so it leaves the address the way the full path's ref and mark
+        # wrappers leave it: the loop's repeat guard keys the call on these args after dispatch.
+        for key in ("selector", "mark"):
+            if key in resolved:
+                args[key] = resolved[key]
+            else:
+                args.pop(key, None)
+        return LayerCheck.SAME, refusal
+
     async def _answer_field(args: dict[str, Any]) -> tuple[str, str, str, bool]:
         resolved = dict(args)
         try:
@@ -23642,6 +23771,7 @@ def build_browser_tools(
             _tool_spec.address_probe = _click_address
         elif _tool_spec.name == "type":
             _tool_spec.answer_probe = _answer_field
+            _tool_spec.layer_probe = _type_layer_check
         if _tool_spec.name in ("click", "type"):
             # Inside the text-delta and download wrappers applied below, so it never cuts a download wait short.
             _tool_spec.handler = _with_act_deadline(_tool_spec.name, _tool_spec.handler)

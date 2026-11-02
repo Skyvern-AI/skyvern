@@ -6,6 +6,7 @@ import {
 import { describe, expect, test } from "vitest";
 
 import {
+  ActionTypes,
   ActionsApiResponse,
   Status,
   TaskV2,
@@ -485,6 +486,48 @@ describe("resolveLandingSelectionId", () => {
     const frames = buildFilmstrip(timeline);
 
     expect(resolveLandingSelectionId(frames, timeline, true)).toBe("act_last");
+  });
+
+  test("a failed code block lands on its trailing failed row, which has no screenshot of its own", () => {
+    const timeline = [
+      blockItem({
+        workflow_run_block_id: "wrb_code",
+        block_type: "code",
+        status: Status.Failed,
+        actions: [
+          action({
+            action_id: "act_failed",
+            action_type: ActionTypes.NullAction,
+            status: Status.Failed,
+            step_id: "stp_1",
+            action_order: 2,
+          }),
+          action({
+            action_id: "act_2",
+            step_id: "stp_1",
+            action_order: 1,
+            screenshot_artifact_id: "art_2",
+          }),
+          action({
+            action_id: "act_1",
+            step_id: "stp_1",
+            action_order: 0,
+            screenshot_artifact_id: "art_1",
+          }),
+        ],
+      }),
+    ];
+    const frames = buildFilmstrip(timeline);
+
+    expect(resolveLandingSelectionId(frames, timeline, true)).toBe(
+      "act_failed",
+    );
+    expect(frames[frames.length - 1]).toMatchObject({
+      blockId: "wrb_code",
+      screenshotArtifactId: null,
+      stepId: "stp_1",
+      actionOrder: 2,
+    });
   });
 
   // modified_at is bumped by any later write — a background block-description

@@ -16,7 +16,7 @@ from unittest.mock import AsyncMock, MagicMock, Mock, patch
 
 import httpx
 import pytest
-from fastapi import FastAPI, Request
+from fastapi import Request
 from fastapi.responses import Response
 from sqlalchemy import delete, select
 from sqlalchemy.exc import IntegrityError
@@ -59,6 +59,7 @@ from skyvern.forge.sdk.workflow.models.workflow import WorkflowDefinition, Workf
 from skyvern.forge.sdk.workflow.service import WorkflowService
 from skyvern.schemas.workflows import WorkflowCreateYAMLRequest
 from skyvern.services import workflow_service as workflow_service_module
+from tests.unit.shared_route_app import shared_route_app
 
 
 def _make_workflow_parameter(
@@ -1726,7 +1727,7 @@ async def run_submission_lab(
         ),
     )
 
-    fastapi_app = FastAPI()
+    fastapi_app = shared_route_app(monkeypatch)
     fastapi_app.add_middleware(RequestLoggingMiddleware)
     fastapi_app.dependency_overrides[org_auth_service.get_current_caller_context] = lambda: CallerContext(
         organization=organization, caller_id="u_test", caller_type=CallerType.USER
@@ -1743,8 +1744,6 @@ async def run_submission_lab(
         finally:
             skyvern_context.reset()
 
-    fastapi_app.include_router(agent_protocol.base_router, prefix="/v1")
-    fastapi_app.include_router(agent_protocol.legacy_base_router, prefix="/api/v1")
     async with httpx.AsyncClient(transport=httpx.ASGITransport(app=fastapi_app), base_url="http://test") as client:
         yield RunSubmissionLab(
             client=client,

@@ -4,7 +4,6 @@ from unittest.mock import AsyncMock
 
 import httpx
 import pytest
-from fastapi import FastAPI
 
 from skyvern.forge import app
 from skyvern.forge.sdk.routes import agent_protocol
@@ -20,6 +19,7 @@ from skyvern.forge.sdk.workflow.models.workflow import (
 )
 from skyvern.forge.sdk.workflow.service import WorkflowService
 from tests.unit.force_stub_app import make_workflow_run_attempts_fake, released_session_stub
+from tests.unit.shared_route_app import shared_route_app
 
 TEMPLATE_ORG_ID = "o_template"
 CALLER_ORG_ID = "o_caller"
@@ -143,9 +143,8 @@ async def test_template_run_detail_resolves_via_run_join(
     )
     assert canonical.endpoint is agent_protocol.get_workflow_and_run_from_workflow_run_id
     assert canonical.response_model is WorkflowRunWithWorkflowResponse
-    api = FastAPI()
+    api = shared_route_app(monkeypatch)
     api.dependency_overrides[org_auth_service.get_current_org] = lambda: SimpleNamespace(organization_id=CALLER_ORG_ID)
-    api.include_router(agent_protocol.base_router, prefix="/v1")
     async with httpx.AsyncClient(
         transport=httpx.ASGITransport(app=api), base_url="http://test", trust_env=False
     ) as client:

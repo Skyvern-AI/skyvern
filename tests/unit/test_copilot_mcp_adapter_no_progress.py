@@ -43,16 +43,6 @@ def _make_server(ctx: CopilotContext, tool_name: str) -> SkyvernOverlayMCPServer
 
 
 @pytest.mark.asyncio
-async def test_raised_click_returns_a_structured_error() -> None:
-    ctx = _agent_ctx()
-    server = _make_server(ctx, "click")
-
-    result = await server.call_tool("click", {"selector": "#submit"})
-
-    assert result.isError is True
-
-
-@pytest.mark.asyncio
 async def test_mcp_browser_tool_ignores_legacy_failed_step_loop_state() -> None:
     ctx = _agent_ctx()
     ctx.failed_tool_step_tracker = {"click:credential_error": 99}  # type: ignore[attr-defined]

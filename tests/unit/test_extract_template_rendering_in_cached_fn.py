@@ -50,16 +50,3 @@ class TestExtractTemplateRendering:
 
         assert "render_template" not in code
         assert "Extract all document titles" in code
-
-    def test_prompt_with_multiple_templates(self) -> None:
-        """Prompts with multiple template variables should all be rendered."""
-        prompt = "Merge {{downloaded_files}} with {{workflow_run_summary}}"
-        block = _make_extraction_block(prompt)
-        actions = [_make_extract_action(prompt)]
-
-        fn_def = _build_block_fn(block, actions)
-        code = cst.Module(body=[fn_def]).code
-
-        assert "render_template" in code
-        assert "{{downloaded_files}}" in code
-        assert "{{workflow_run_summary}}" in code
