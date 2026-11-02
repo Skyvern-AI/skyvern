@@ -14,10 +14,12 @@ from skyvern.forge.sdk.db.enums import WorkflowRunTriggerType
 from skyvern.forge.sdk.schemas.har_evidence import (
     FINAL_HAR_USER_MATCH_REASON_CODE,
 )
+from skyvern.forge.sdk.schemas.workflow_runs import WorkflowRunBlock
 from skyvern.forge.sdk.workflow.context_manager import WorkflowRunContext
 from skyvern.forge.sdk.workflow.credential_fallback import (
     ANY_FAILURE,
     CREDENTIAL_FAILURES,
+    _block_that_ended_the_run,
     _trigger_matches,
     maybe_start_credential_fallback_retry,
 )
@@ -25,7 +27,13 @@ from skyvern.forge.sdk.workflow.models.parameter import CredentialParameter
 from skyvern.forge.sdk.workflow.models.workflow import WorkflowRun, WorkflowRunStatus
 from skyvern.forge.sdk.workflow.service import WorkflowService
 from skyvern.forge.sdk.workflow.workflow_definition_converter import convert_workflow_definition
-from skyvern.schemas.workflows import CredentialParameterYAML, WorkflowDefinitionYAML
+from skyvern.schemas.workflows import (
+    BlockResult,
+    BlockStatus,
+    BlockType,
+    CredentialParameterYAML,
+    WorkflowDefinitionYAML,
+)
 from tests.unit.force_stub_app import make_workflow_run_attempts_fake
 
 
@@ -288,6 +296,8 @@ async def _run_fallback_retry(
     run_tags: dict[str, str] | None = None,
     run_group_item: object | None = None,
     block_error_codes: list[str] | None = None,
+    block_rows: list[tuple[str, str | None, dict | None]] | None = None,
+    child_runs: list[tuple[WorkflowRun, list[tuple[str, str | None, dict | None]]]] | None = None,
 ) -> tuple[str | None, AsyncMock, MagicMock]:
     captured: dict[str, object] = {}
 
@@ -317,9 +327,33 @@ async def _run_fallback_retry(
         mock_app.AGENT_FUNCTION.is_block_scoped_workflow_run = AsyncMock(return_value=block_scoped)
         mock_app.AGENT_FUNCTION.strip_proxy_session_extra_http_headers = _strip_marker_header
         mock_app.DATABASE.debug.has_block_run_for_workflow_run = AsyncMock(return_value=False)
-        mock_app.DATABASE.observer.get_workflow_run_blocks = AsyncMock(
-            return_value=[SimpleNamespace(error_codes=block_error_codes or [])]
-        )
+
+        def fake_rows(rows: list[tuple[str, str | None, dict | None]]) -> list[SimpleNamespace]:
+            return [
+                SimpleNamespace(
+                    error_codes=block_error_codes or [],
+                    status=status,
+                    failure_reason=failure_reason,
+                    output=output,
+                    block_type=BlockType.WORKFLOW_TRIGGER
+                    if isinstance(output, dict) and "workflow_run_id" in output
+                    else BlockType.CODE,
+                )
+                for status, failure_reason, output in rows
+            ]
+
+        children = {run.workflow_run_id: (run, rows) for run, rows in child_runs or []}
+
+        async def fake_get_workflow_run_blocks(workflow_run_id: str, organization_id: str) -> list[SimpleNamespace]:
+            if workflow_run_id in children:
+                return fake_rows(children[workflow_run_id][1])
+            return fake_rows(block_rows or [("failed", None, None)])
+
+        async def fake_get_workflow_run(workflow_run_id: str, organization_id: str) -> WorkflowRun | None:
+            return children[workflow_run_id][0] if workflow_run_id in children else None
+
+        mock_app.DATABASE.observer.get_workflow_run_blocks = AsyncMock(side_effect=fake_get_workflow_run_blocks)
+        mock_app.DATABASE.workflow_runs.get_workflow_run = AsyncMock(side_effect=fake_get_workflow_run)
         mock_app.DATABASE.workflow_run_groups.get_item_by_workflow_run_id = AsyncMock(return_value=run_group_item)
         mock_app.WORKFLOW_SERVICE.get_workflow = AsyncMock(return_value=_workflow(parameters))
         if retried_by_results is not None:
@@ -365,6 +399,125 @@ async def test_any_failure_fallback_is_not_started_after_the_run_lost_its_browse
 
     assert result is None
     run_workflow_mock.assert_not_awaited()
+
+
+_RENDER_TEXT = (
+    "Failed to format CodeBlock parameters. Missing key or attribute in `login.password` (field code, line 3)."
+)
+_RENDER_ROW = ("failed", _RENDER_TEXT, {"failure_reason": _RENDER_TEXT, "render_failure": {"kind": "Missing key"}})
+_LOGIN_ROW = ("failed", "Login rejected", {"failure_reason": "Login rejected"})
+_CREDENTIAL_ROW = ("failed", "Credential not found", {"failure_reason": "Credential not found"})
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("block_rows", "run_failure_reason", "fallback_starts"),
+    [
+        ([_RENDER_ROW], f"code block failed. failure reason: {_RENDER_TEXT}", False),
+        ([("completed", None, None), _RENDER_ROW], f"code block failed. failure reason: {_RENDER_TEXT}", False),
+        ([_LOGIN_ROW, _RENDER_ROW], "login block failed. failure reason: Login rejected", True),
+        ([_LOGIN_ROW], "login block failed. failure reason: Login rejected", True),
+        ([_RENDER_ROW, _LOGIN_ROW], "login block failed. failure reason: Login rejected", True),
+        ([_CREDENTIAL_ROW, _RENDER_ROW], "code block failed. failure reason: Credential not found", True),
+        ([_RENDER_ROW, ("completed", None, None)], f"code block failed. failure reason: {_RENDER_TEXT}", False),
+        ([_RENDER_ROW], "Failed to initialize workflow run context: credential not found", True),
+    ],
+    ids=[
+        "render-failure-ended-run",
+        "finally-completed-after-it",
+        "run-continued-past-it",
+        "no-render-failure",
+        "finally-failed-to-render-after-login-failure",
+        "finally-failed-on-a-credential-after-a-continued-render-failure",
+        "only-finally-failed-to-render",
+        "earlier-attempt-render-failure-then-no-failed-row",
+    ],
+)
+async def test_credential_failures_fallback_ignores_the_render_failure_that_ended_the_run(
+    block_rows: list[tuple[str, str | None, dict | None]], run_failure_reason: str, fallback_starts: bool
+) -> None:
+    workflow_run = _workflow_run(failure_category=[{"category": "AUTH_FAILURE"}], failure_reason=run_failure_reason)
+    login = _credential_parameter(fallback_credential_ids=["cred_fb1"])
+
+    result, run_workflow_mock, _ = await _run_fallback_retry(
+        workflow_run=workflow_run, parameters=[login], block_rows=block_rows
+    )
+
+    assert (result is not None) is fallback_starts
+    assert run_workflow_mock.await_count == (1 if fallback_starts else 0)
+
+
+def _trigger_chain(
+    depth: int, ending_rows: list[tuple[str, str | None, dict | None]], ending_reason: str
+) -> tuple[
+    list[tuple[str, str | None, dict | None]], str, list[tuple[WorkflowRun, list[tuple[str, str | None, dict | None]]]]
+]:
+    """A parent run whose workflow-trigger block runs a chain of `depth` child runs, the last ended by `ending_rows`."""
+    child_runs = []
+    rows, reason = ending_rows, ending_reason
+    for level in range(depth, 0, -1):
+        child_runs.append((_workflow_run(workflow_run_id=f"wr_child_{level}", failure_reason=reason), rows))
+        rows = [("failed", reason, {"workflow_run_id": f"wr_child_{level}", "failure_reason": reason})]
+        reason = f"workflow_trigger block failed. failure reason: {reason}"
+    return rows, reason, child_runs
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("depth", "ending_rows", "ending_reason", "fallback_starts"),
+    [
+        (1, [_RENDER_ROW], f"code block failed. failure reason: {_RENDER_TEXT}", False),
+        (1, [_LOGIN_ROW], "login block failed. failure reason: Login rejected", True),
+        (10, [_RENDER_ROW], f"code block failed. failure reason: {_RENDER_TEXT}", False),
+    ],
+    ids=["child-ended-by-render-failure", "child-ended-by-login-failure", "deepest-supported-child"],
+)
+async def test_credential_failures_fallback_follows_a_workflow_trigger_into_its_child_run(
+    depth: int,
+    ending_rows: list[tuple[str, str | None, dict | None]],
+    ending_reason: str,
+    fallback_starts: bool,
+) -> None:
+    parent_rows, parent_reason, child_runs = _trigger_chain(depth, ending_rows, ending_reason)
+    workflow_run = _workflow_run(failure_category=[{"category": "AUTH_FAILURE"}], failure_reason=parent_reason)
+    login = _credential_parameter(fallback_credential_ids=["cred_fb1"])
+
+    result, run_workflow_mock, _ = await _run_fallback_retry(
+        workflow_run=workflow_run, parameters=[login], block_rows=parent_rows, child_runs=child_runs
+    )
+
+    assert (result is not None) is fallback_starts
+    assert run_workflow_mock.await_count == (1 if fallback_starts else 0)
+
+
+def _run_block(status: BlockStatus, failure_reason: str) -> WorkflowRunBlock:
+    now = datetime.now(timezone.utc)
+    return WorkflowRunBlock(
+        workflow_run_block_id=f"wrb_{failure_reason}",
+        workflow_run_id="wr_failed",
+        organization_id="org_test",
+        block_type=BlockType.CODE,
+        status=status.value,
+        failure_reason=failure_reason,
+        created_at=now,
+        modified_at=now,
+    )
+
+
+@pytest.mark.parametrize("status", [BlockStatus.failed, BlockStatus.terminated, BlockStatus.timed_out])
+def test_the_ending_block_is_found_from_the_run_reason_the_service_writes(status: BlockStatus) -> None:
+    block = SimpleNamespace(block_type=BlockType.CODE, continue_on_failure=False)
+    block_result = BlockResult(success=False, output_parameter=MagicMock(), status=status, failure_reason=_RENDER_TEXT)
+    _, run_failure_reason, _ = WorkflowService._resolve_block_terminal_outcome(
+        block=block,  # type: ignore[arg-type]
+        block_result=block_result,
+    )
+    ending = _run_block(status, _RENDER_TEXT)
+
+    assert (
+        _block_that_ended_the_run([ending, _run_block(BlockStatus.failed, "Login rejected")], run_failure_reason)
+        is ending
+    )
 
 
 @pytest.mark.asyncio

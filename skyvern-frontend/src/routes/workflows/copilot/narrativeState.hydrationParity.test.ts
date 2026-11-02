@@ -1,6 +1,8 @@
 import { describe, expect, it } from "vitest";
 
 import {
+  blockAttempts,
+  blockIdentity,
   callRollup,
   deriveActivityLog,
   failedRowBlocks,
@@ -51,6 +53,7 @@ function logLines(
 ) {
   const { rows } = deriveActivityLog(turn);
   const fold = summarizeFinishedTurn(rows, facts);
+  const attempts = blockAttempts(turn);
   return {
     rows: rows.map((row) => ({
       id: row.id,
@@ -60,6 +63,11 @@ function logLines(
       failed: failedRowBlocks(row).map((b) => b.workflowRunBlockId),
       passed: passedBlockCount(row),
       diff: row.codeDiffs.map((d) => [d.label, d.added, d.removed]),
+      attempts: row.blocks.map((b) => [
+        b.workflowRunBlockId,
+        b.workflowRunId,
+        attempts.get(blockIdentity(b))?.attempt,
+      ]),
     })),
     fold: {
       ...fold,
@@ -83,6 +91,12 @@ describe("activity log parity across hydration", () => {
     expect(live.rows.every((row) => row.passed === null)).toBe(true);
     expect(live.rows.some((row) => row.reason !== null)).toBe(true);
     expect(live.fold.failedTests).toBe(1);
+    expect(live.rows.flatMap((row) => row.attempts)).toEqual(
+      expect.arrayContaining([
+        ["wrb_first", "wr_first", 1],
+        ["wrb_retry", "wr_retry", 2],
+      ]),
+    );
   });
 });
 

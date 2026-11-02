@@ -1,16 +1,25 @@
 // @vitest-environment jsdom
 
-import { cleanup, render, screen } from "@testing-library/react";
+import {
+  cleanup,
+  fireEvent,
+  render,
+  screen,
+  within,
+} from "@testing-library/react";
 import { afterEach, describe, expect, it } from "vitest";
 
 import { NarrativeView } from "./NarrativeView";
 import {
   BlockState,
   EMPTY_NARRATIVE,
+  NarrativeEvent,
+  TurnFacts,
   TurnNarrativeState,
   applyNarrativeEvent,
   hydrateNarrativeFromPayload,
 } from "./narrativeState";
+import capture from "./narrativeState.hydrationParity.fixture.json";
 
 const completedBlock = (): BlockState => ({
   workflowRunBlockId: "wrb_open_site",
@@ -410,5 +419,605 @@ describe("NarrativeView drafting row (codegen_progress)", () => {
     rerender(<NarrativeView turn={reloaded!} />);
     expect(draftingRow()).toBeNull();
     expect(screen.getByText("Tested the workflow")).toBeTruthy();
+  });
+});
+
+const at = (second: number) =>
+  `2026-05-30T00:01:${String(second).padStart(2, "0")}Z`;
+
+const runCall = (id: string, second: number): NarrativeEvent => ({
+  type: "tool_call",
+  tool_name: "update_and_run_blocks",
+  tool_input: {},
+  iteration: second,
+  tool_call_id: id,
+  timestamp: at(second),
+});
+
+const runFailed = (
+  id: string,
+  second: number,
+  detail: string,
+): NarrativeEvent => ({
+  type: "tool_result",
+  tool_name: "update_and_run_blocks",
+  success: false,
+  summary: "Couldn't complete that step.",
+  detail,
+  iteration: second,
+  tool_call_id: id,
+  timestamp: at(second),
+});
+
+const blockFrame = (
+  runId: string,
+  runBlockId: string,
+  status: string,
+  second: number,
+  label = "open_site",
+): NarrativeEvent => ({
+  type: "block_progress",
+  workflow_run_id: runId,
+  workflow_run_block_id: runBlockId,
+  block_label: label,
+  block_type: "code",
+  status,
+  iteration: second,
+  timestamp: at(second),
+});
+
+const failedBlock = (
+  runId: string,
+  runBlockId: string,
+  second: number,
+  label = "open_site",
+): NarrativeEvent[] => [
+  blockFrame(runId, runBlockId, "running", second, label),
+  blockFrame(runId, runBlockId, "failed", second + 1, label),
+];
+
+const failedAction = (
+  runBlockId: string,
+  response: string,
+): NarrativeEvent => ({
+  type: "client_block_actions",
+  blocks: [
+    {
+      workflowRunBlockId: runBlockId,
+      actions: [
+        {
+          actionId: `${runBlockId}-a1`,
+          label: "Click",
+          summary: "Sign in",
+          durationMs: 1000,
+          failed: true,
+          codeLine: null,
+          response,
+        },
+      ],
+    },
+  ],
+  receivedAtMs: 0,
+});
+
+const runOutcome = (
+  runId: string,
+  runBlockIds: string[],
+  reason: string,
+  second: number,
+): NarrativeEvent => ({
+  type: "run_outcome",
+  workflow_run_id: runId,
+  workflow_run_block_ids: runBlockIds,
+  block_labels: ["open_site"],
+  verdict: "not_demonstrated",
+  role: "recorded",
+  display_reason: reason,
+  iteration: second,
+  timestamp: at(second),
+});
+
+const playTurn = (events: NarrativeEvent[]): TurnNarrativeState =>
+  [
+    {
+      type: "turn_start",
+      turn_id: "turn-1",
+      turn_index: 0,
+      timestamp: at(0),
+    } as NarrativeEvent,
+    { type: "design_start", timestamp: at(0) } as NarrativeEvent,
+    ...events,
+  ].reduce((turn, event) => applyNarrativeEvent(turn, event), EMPTY_NARRATIVE);
+
+const ended = (turn: TurnNarrativeState): TurnNarrativeState => ({
+  ...turn,
+  terminal: "response",
+  endedAt: at(59),
+});
+
+const occurrences = (text: string): number =>
+  (document.body.textContent ?? "").split(text).length - 1;
+
+const testCards = (): HTMLElement[] =>
+  screen.queryAllByTestId("copilot-test-card");
+
+const cardFor = (attempt: string): HTMLElement => {
+  const card = testCards().find((c) => c.textContent?.includes(attempt));
+  if (card === undefined) throw new Error(`no card reads ${attempt}`);
+  return card;
+};
+
+const activityLines = (): HTMLElement[] =>
+  Array.from(
+    document.querySelectorAll<HTMLElement>('[data-activity-line="true"]'),
+  );
+
+describe("NarrativeView failed test attempts", () => {
+  const firstReason = "The sign-in button never appeared.";
+
+  it("reads a failed attempt as one Copilot is fixing, with its error once wherever it is folded", () => {
+    const live = playTurn([
+      runCall("call-1", 1),
+      ...failedBlock("wr_1", "wrb_1", 2),
+      runOutcome("wr_1", ["wrb_1"], firstReason, 4),
+      {
+        type: "client_block_actions",
+        blocks: [
+          {
+            workflowRunBlockId: "wrb_1",
+            actions: [
+              {
+                actionId: "a1",
+                label: "Click",
+                summary: "Sign in",
+                durationMs: 1000,
+                failed: true,
+                codeLine: null,
+                response: null,
+              },
+            ],
+          },
+        ],
+        receivedAtMs: 0,
+      },
+    ]);
+    const { rerender } = render(<NarrativeView turn={live} />);
+
+    const card = cardFor("Attempt 1 failed");
+    expect(card.dataset.tone).toBe("failed");
+    expect(card.textContent).toContain("Copilot is fixing it");
+    expect(occurrences("Outcome not confirmed")).toBe(0);
+    expect(occurrences(firstReason)).toBe(1);
+
+    fireEvent.click(within(card).getAllByRole("button")[0]!);
+    expect(
+      within(cardFor("Attempt 1 failed"))
+        .getAllByRole("button")[0]!
+        .getAttribute("aria-expanded"),
+    ).toBe("false");
+    expect(occurrences(firstReason)).toBe(1);
+
+    fireEvent.click(activityLines()[0]!);
+    expect(testCards()).toHaveLength(0);
+    expect(occurrences(`Attempt 1 failed — ${firstReason}`)).toBe(1);
+
+    rerender(<NarrativeView turn={ended(live)} />);
+    expect(occurrences("Copilot is fixing it")).toBe(0);
+  });
+
+  it("never shows an earlier attempt's reason on a newer attempt before its outcome lands", () => {
+    const secondReason = "The form rejected the saved password.";
+    const beforeOutcome = playTurn([
+      runCall("call-1", 1),
+      ...failedBlock("wr_1", "wrb_1", 2),
+      runOutcome("wr_1", ["wrb_1"], firstReason, 4),
+      runFailed("call-1", 5, "Locator timed out"),
+      runCall("call-2", 10),
+      ...failedBlock("wr_2", "wrb_2", 11),
+    ]);
+    const { rerender } = render(<NarrativeView turn={beforeOutcome} />);
+
+    expect(cardFor("Attempt 2 failed").textContent).not.toContain(firstReason);
+    expect(occurrences("Outcome not confirmed")).toBe(0);
+
+    rerender(<NarrativeView turn={ended(beforeOutcome)} />);
+    expect(occurrences("Outcome not confirmed")).toBe(0);
+    expect(occurrences(firstReason)).toBe(
+      occurrences(`Attempt 1 failed — ${firstReason}`),
+    );
+
+    const afterOutcome = applyNarrativeEvent(
+      beforeOutcome,
+      runOutcome("wr_2", ["wrb_2"], secondReason, 14),
+    );
+    rerender(<NarrativeView turn={afterOutcome} />);
+    const second = cardFor("Attempt 2 failed");
+    expect(second.textContent).toContain(secondReason);
+    expect(second.textContent).not.toContain(firstReason);
+  });
+
+  it("keeps an error only its failed action carried on the folded card", () => {
+    const actionError = "Timed out waiting for the sign-in button.";
+    render(
+      <NarrativeView
+        turn={playTurn([
+          runCall("call-1", 1),
+          ...failedBlock("wr_1", "wrb_1", 2),
+          failedAction(
+            "wrb_1",
+            `${actionError}\nCall log: waiting for locator`,
+          ),
+        ])}
+      />,
+    );
+    expect(occurrences(actionError)).toBe(1);
+
+    fireEvent.click(
+      within(cardFor("Attempt 1 failed")).getAllByRole("button")[0]!,
+    );
+    const folded = cardFor("Attempt 1 failed");
+    expect(folded.textContent).toContain(actionError);
+    expect(folded.textContent).not.toContain("Call log");
+    expect(occurrences(actionError)).toBe(1);
+  });
+
+  it("puts a run's reason under its last failed block before the design phase starts, over its call's result", () => {
+    const runReason = "The run stopped at the confirmation step.";
+    const callResult = "Locator timed out on the confirm button.";
+    const turn = [
+      {
+        type: "turn_start",
+        turn_id: "turn-1",
+        turn_index: 0,
+        timestamp: at(0),
+      } as NarrativeEvent,
+      ...failedBlock("wr_1", "wrb_a", 2, "fill_form"),
+      ...failedBlock("wr_1", "wrb_b", 4, "confirm"),
+      runOutcome("wr_1", ["wrb_a", "wrb_b"], runReason, 6),
+    ].reduce((t, event) => applyNarrativeEvent(t, event), EMPTY_NARRATIVE);
+    const { rerender } = render(<NarrativeView turn={turn} />);
+
+    expect(testCards()).toHaveLength(0);
+    expect(screen.getByText("Fill Form")).toBeTruthy();
+    expect(occurrences(runReason)).toBe(1);
+    expect(occurrences("Halted — see run details.")).toBe(1);
+
+    rerender(
+      <NarrativeView
+        turn={{
+          ...turn,
+          blocks: turn.blocks.map((b) =>
+            b.label === "confirm"
+              ? {
+                  ...b,
+                  activity: [
+                    {
+                      kind: "tool_result",
+                      id: "tr-call-1",
+                      text: callResult,
+                      iteration: 7,
+                    },
+                  ],
+                }
+              : b,
+          ),
+        }}
+      />,
+    );
+    expect(occurrences(runReason)).toBe(1);
+    expect(occurrences(callResult)).toBe(1);
+  });
+
+  it("keeps two runs filed under one run call apart", () => {
+    const firstRunReason = "The first run never reached the form.";
+    const secondRunReason = "The second run was rejected by the form.";
+    render(
+      <NarrativeView
+        turn={playTurn([
+          ...failedBlock("wr_x", "wrb_x", 2),
+          runOutcome("wr_x", ["wrb_x"], firstRunReason, 4),
+          runCall("call-2", 10),
+          ...failedBlock("wr_y", "wrb_y", 11),
+          runOutcome("wr_y", ["wrb_y"], secondRunReason, 13),
+        ])}
+      />,
+    );
+
+    expect(testCards()).toHaveLength(2);
+    expect(cardFor("Attempt 1 failed").textContent).toContain(firstRunReason);
+    const second = cardFor("Attempt 2 failed");
+    expect(second.textContent).toContain(secondRunReason);
+    expect(second.textContent).not.toContain(firstRunReason);
+    expect(occurrences(firstRunReason)).toBe(1);
+  });
+
+  it("numbers loop iterations of one run call as one attempt", () => {
+    render(
+      <NarrativeView
+        turn={playTurn([
+          runCall("call-1", 1),
+          ...failedBlock("wr_1", "wrb_1a", 2),
+          ...failedBlock("wr_1", "wrb_1b", 4),
+          runFailed("call-1", 6, "Locator timed out"),
+          runCall("call-2", 10),
+          ...failedBlock("wr_2", "wrb_2", 11),
+        ])}
+      />,
+    );
+    activityLines()
+      .filter((line) => line.getAttribute("aria-expanded") === "false")
+      .forEach((line) => fireEvent.click(line));
+
+    const words = testCards().map(
+      (card) => card.textContent?.match(/Attempt \d+ failed/)?.[0],
+    );
+    expect(words).toEqual([
+      "Attempt 1 failed",
+      "Attempt 1 failed",
+      "Attempt 2 failed",
+    ]);
+    expect(
+      testCards().map((card) =>
+        card.textContent?.includes("Copilot is fixing it"),
+      ),
+    ).toEqual([false, false, true]);
+  });
+
+  it("reads the turn's verdict on a failed block only when it is that block's run's", () => {
+    const verdict = "The confirmation page never loaded.";
+    const turn = playTurn([
+      runCall("call-1", 1),
+      ...failedBlock("wr_1", "wrb_1", 2),
+      runOutcome("wr_1", [], verdict, 4),
+    ]);
+    const { rerender } = render(<NarrativeView turn={turn} />);
+    expect(cardFor("Attempt 1 failed").textContent).toContain(verdict);
+
+    rerender(
+      <NarrativeView
+        turn={{
+          ...turn,
+          lastRunOutcome: { ...turn.lastRunOutcome!, workflowRunId: "wr_0" },
+        }}
+      />,
+    );
+    expect(occurrences(verdict)).toBe(0);
+  });
+
+  it.each([
+    ["the activity log", true],
+    ["the block list", false],
+  ])(
+    "never numbers or shares a verdict across runs saved without a run id in %s",
+    (_view, designStarted) => {
+      const verdict = "The confirmation page never loaded.";
+      const played = playTurn([
+        runCall("call-1", 1),
+        ...failedBlock("wr_1", "wrb_1", 2),
+        runFailed("call-1", 4, "Locator timed out"),
+        runCall("call-2", 10),
+        ...failedBlock("wr_2", "wrb_2", 11),
+        runOutcome("wr_2", [], verdict, 13),
+      ]);
+      const legacy = ended({
+        ...played,
+        designStarted,
+        lastRunOutcome: { ...played.lastRunOutcome!, workflowRunId: undefined },
+        blocks: played.blocks.map((b) => ({ ...b, workflowRunId: undefined })),
+      });
+      render(<NarrativeView turn={legacy} />);
+      const fold = screen.queryByRole("button", { name: /^Worked through/ });
+      if (fold !== null) fireEvent.click(fold);
+      activityLines()
+        .filter((line) => line.getAttribute("aria-expanded") === "false")
+        .forEach((line) => fireEvent.click(line));
+
+      expect(occurrences("Attempt")).toBe(0);
+      expect(occurrences(verdict)).toBe(1);
+    },
+  );
+
+  it("reads the owning card's run reason over its action text, live and after a reload", () => {
+    const runReason = "The first attempt failed.";
+    const actionError = "Timed out waiting for the submit button.";
+    const updates = capture.updates as unknown as NarrativeEvent[];
+    const payload = capture.payload as unknown as Record<string, unknown>;
+    const failedAt = updates.findIndex(
+      (e) =>
+        e.type === "block_progress" &&
+        e.workflow_run_block_id === "wrb_first" &&
+        e.status === "failed",
+    );
+    const live = [
+      ...updates.slice(0, failedAt + 1),
+      failedAction("wrb_first", actionError),
+      ...updates.slice(failedAt + 1),
+      {
+        type: "response",
+        workflow_copilot_chat_id: "chat-replay",
+        message: "done",
+        response_time: "2026-09-08T00:00:10Z",
+        proposal_disposition: "review_tested",
+        turn_id: "turn-replay",
+        narrative_payload: payload,
+      } as NarrativeEvent,
+    ].reduce(applyNarrativeEvent, { ...EMPTY_NARRATIVE });
+    expect(live.blocks[1]!.recordedActions).toHaveLength(1);
+    const reloaded = hydrateNarrativeFromPayload(payload)!;
+
+    const surfaces = (turn: TurnNarrativeState) => {
+      const { unmount } = render(<NarrativeView turn={turn} />);
+      const seen: string[] = [document.body.textContent ?? ""];
+      fireEvent.click(screen.getByRole("button", { name: /^Worked through/ }));
+      seen.push(document.body.textContent ?? "");
+      fireEvent.click(
+        activityLines().find((line) =>
+          line.textContent?.includes("Block 19 failed"),
+        )!,
+      );
+      seen.push(cardFor("Attempt 1 failed").textContent ?? "");
+      fireEvent.click(
+        within(cardFor("Attempt 1 failed")).getAllByRole("button")[0]!,
+      );
+      seen.push(cardFor("Attempt 1 failed").textContent ?? "");
+      unmount();
+      return seen.map((text) => [
+        text.split(runReason).length - 1,
+        text.includes(actionError),
+      ]);
+    };
+
+    const liveSurfaces = surfaces(live);
+    expect(surfaces(reloaded)).toEqual(liveSurfaces);
+    expect(liveSurfaces).toEqual([
+      [1, false],
+      [1, false],
+      [1, false],
+      [1, false],
+    ]);
+  });
+
+  it("keeps a run's reason on its last failed block, off its siblings, live and after a reload", () => {
+    const runReason = "The run stopped at the confirmation step.";
+    const actionError = "The username field was missing.";
+    const live = playTurn([
+      runCall("call-1", 1),
+      ...failedBlock("wr_1", "wrb_a", 2, "fill_form"),
+      failedAction("wrb_a", actionError),
+      ...failedBlock("wr_1", "wrb_b", 4, "confirm"),
+      failedAction("wrb_b", "Timed out on the confirm button."),
+      runOutcome("wr_1", ["wrb_a", "wrb_b"], runReason, 6),
+      runFailed("call-1", 7, runReason),
+    ]);
+    const reloaded = ended({
+      ...live,
+      blocks: live.blocks.map((b) => ({ ...b, recordedActions: undefined })),
+    });
+    const { rerender } = render(<NarrativeView turn={live} />);
+    const [fillForm, confirm] = testCards();
+    expect(fillForm!.textContent).toContain(actionError);
+    expect(fillForm!.textContent).not.toContain(runReason);
+    expect(confirm!.textContent).toContain(runReason);
+    expect(occurrences(runReason)).toBe(1);
+    expect(occurrences("Timed out on the confirm button.")).toBe(0);
+
+    rerender(<NarrativeView turn={ended(live)} />);
+    expect(occurrences(`Confirm: Attempt 1 failed — ${runReason}`)).toBe(1);
+    expect(occurrences(`Fill Form: Attempt 1 failed — ${actionError}`)).toBe(1);
+
+    rerender(<NarrativeView turn={reloaded} />);
+    expect(occurrences(`Confirm: Attempt 1 failed — ${runReason}`)).toBe(1);
+    expect(occurrences("Fill Form: Attempt 1 failed")).toBe(1);
+    expect(occurrences(runReason)).toBe(1);
+    const fold = screen.queryByRole("button", { name: /^Worked through/ });
+    if (fold !== null) fireEvent.click(fold);
+    activityLines()
+      .filter((line) => line.getAttribute("aria-expanded") === "false")
+      .forEach((line) => fireEvent.click(line));
+    expect(cardFor("Fill Form").textContent).toContain(
+      "Halted — see run details.",
+    );
+    expect(cardFor("Fill Form").textContent).not.toContain(runReason);
+    expect(cardFor("Confirm").textContent).toContain(runReason);
+  });
+
+  it("keeps the failed action's full error under Show details beneath the run's reason", () => {
+    const runReason = "The run stopped at the sign-in step.";
+    const actionError =
+      "Timed out waiting for the sign-in button.\nCall log: waiting for locator";
+    render(
+      <NarrativeView
+        turn={playTurn([
+          runCall("call-1", 1),
+          ...failedBlock("wr_1", "wrb_1", 2),
+          failedAction("wrb_1", actionError),
+          runOutcome("wr_1", ["wrb_1"], runReason, 4),
+        ])}
+      />,
+    );
+    const card = cardFor("Attempt 1 failed");
+    expect(occurrences(runReason)).toBe(1);
+    expect(card.textContent).not.toContain("Timed out waiting");
+
+    fireEvent.click(within(card).getByRole("button", { name: /Show details/ }));
+    expect(cardFor("Attempt 1 failed").textContent).toContain(actionError);
+    expect(occurrences(runReason)).toBe(1);
+  });
+
+  it("reads a Test button run as a failed attempt while it runs and after its row lands", () => {
+    const reason = "The sign-in button never appeared.";
+    const callId = "call_test_end_to_end_turn-1";
+    const duringRun = [
+      {
+        type: "turn_start",
+        turn_id: "turn-1",
+        turn_index: 0,
+        timestamp: at(0),
+      } as NarrativeEvent,
+      { type: "design_start", timestamp: at(0) } as NarrativeEvent,
+      ...failedBlock("wr_1", "wrb_1", 2),
+      runOutcome("wr_1", ["wrb_1"], reason, 4),
+    ].reduce((t, event) => applyNarrativeEvent(t, event), EMPTY_NARRATIVE);
+    const { rerender } = render(<NarrativeView turn={duringRun} />);
+    expect(cardFor("Attempt 1 failed").dataset.tone).toBe("failed");
+    expect(occurrences("halted")).toBe(0);
+    expect(occurrences(reason)).toBe(1);
+
+    const rowLanded = [
+      {
+        type: "tool_call",
+        tool_name: "run_blocks_and_collect_debug",
+        tool_input: {},
+        iteration: 0,
+        tool_call_id: callId,
+        timestamp: at(1),
+      } as NarrativeEvent,
+      {
+        type: "tool_result",
+        tool_name: "run_blocks_and_collect_debug",
+        success: false,
+        summary: "Couldn't complete that step.",
+        detail: reason,
+        workflow_run_id: "wr_1",
+        iteration: 0,
+        tool_call_id: callId,
+        timestamp: at(5),
+      } as NarrativeEvent,
+    ].reduce((t, event) => applyNarrativeEvent(t, event), duringRun);
+    rerender(<NarrativeView turn={rowLanded} />);
+    expect(testCards()).toHaveLength(1);
+    expect(cardFor("Attempt 1 failed").dataset.tone).toBe("failed");
+    expect(occurrences("Outcome not confirmed")).toBe(0);
+    expect(occurrences(reason)).toBe(1);
+  });
+
+  it("never calls a failed run with no block on screen unconfirmed", () => {
+    const reason = "The workflow could not start without its login parameter.";
+    const facts = (runCompleted: boolean): TurnFacts => ({
+      factsAvailable: true,
+      authoredBlockCount: 1,
+      matchingSourceBlockCount: 1,
+      evaluationState: "not_demonstrated",
+      runId: "wr_1",
+      runCompleted,
+      terminalCause: null,
+      blocksRunThisTurn: 0,
+      recordedFailure: reason,
+      ranCleanOnCurrentSource: false,
+    });
+    const { rerender } = render(
+      <NarrativeView
+        turn={structuredTurn({ blocks: [], turnFacts: facts(false) })}
+      />,
+    );
+    expect(occurrences("Outcome not confirmed")).toBe(0);
+    expect(occurrences(`Run failed — ${reason}`)).toBe(1);
+
+    rerender(
+      <NarrativeView
+        turn={structuredTurn({ blocks: [], turnFacts: facts(true) })}
+      />,
+    );
+    expect(occurrences(`Outcome not confirmed — ${reason}`)).toBe(1);
   });
 });

@@ -59,12 +59,13 @@ class _BlockRows:
             "status": BlockStatus.running,
             "error_codes": None,
             "output": None,
+            "failure_reason": None,
         }
         return workflow_run_block_id
 
     async def update(self, workflow_run_block_id: str, **fields: Any) -> SimpleNamespace:
         row = self.rows[workflow_run_block_id]
-        for key in ("status", "output"):
+        for key in ("status", "output", "failure_reason"):
             if fields.get(key):
                 row[key] = fields[key]
         if fields.get("error_codes") is not None:
@@ -157,6 +158,42 @@ def cached_run(monkeypatch: pytest.MonkeyPatch) -> Iterator[SimpleNamespace]:
             workflow_context=workflow_context,
             run_context=run_context,
         )
+
+
+@pytest.mark.asyncio
+async def test_cached_while_loop_condition_failure_names_its_cause(cached_run: SimpleNamespace) -> None:
+    cached_run.workflow_context.values["rows_in"] = {"present": "distinctive-condition-value"}
+    rows = script_service.while_loop("{{ rows_in.missing.leaf }}", label="rows")
+
+    with pytest.raises(Exception, match="Failed to evaluate while-loop condition:"):
+        async with contextlib.aclosing(rows) as items:
+            async for _ in items:
+                pass
+
+    (loop_row,) = cached_run.rows.labelled("rows")
+    assert loop_row["status"] == BlockStatus.failed
+    assert loop_row["failure_reason"] == (
+        "Failed to evaluate while-loop condition: Missing key or attribute in `rows_in.missing.leaf` (line 1)."
+    )
+    assert loop_row["output"]["render_failure"]["kind"] == "Missing key or attribute"
+
+
+@pytest.mark.asyncio
+async def test_cached_while_loop_keeps_the_render_failure_record_after_an_iteration(
+    cached_run: SimpleNamespace,
+) -> None:
+    cached_run.workflow_context.values["rows_in"] = {"gate": {"open": True}}
+    rows = script_service.while_loop("{{ rows_in.gate.open }}", label="rows")
+
+    with pytest.raises(Exception, match="Failed to evaluate while-loop condition:"):
+        async with contextlib.aclosing(rows) as items:
+            async for _ in items:
+                cached_run.run_context.loop_output_values[-1].append("row 1")
+                cached_run.workflow_context.values["rows_in"] = {"present": "distinctive-condition-value"}
+
+    (loop_row,) = cached_run.rows.labelled("rows")
+    assert loop_row["output"]["render_failure"]["kind"] == "Missing key or attribute"
+    assert loop_row["output"]["loop_output_values"] == [["row 1"]]
 
 
 @pytest.mark.asyncio

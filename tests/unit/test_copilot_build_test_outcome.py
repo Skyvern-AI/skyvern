@@ -134,7 +134,8 @@ from skyvern.forge.sdk.schemas.workflow_copilot import (
 )
 from skyvern.forge.sdk.schemas.workflow_runs import WorkflowRunBlock
 from skyvern.forge.sdk.workflow.context_manager import WorkflowRunContext
-from skyvern.forge.sdk.workflow.models.block import CodeBlock, ForLoopBlock
+from skyvern.forge.sdk.workflow.exceptions import FailedToFormatJinjaStyleParameter
+from skyvern.forge.sdk.workflow.models.block import CodeBlock, ForLoopBlock, render_failure_reason
 from skyvern.forge.sdk.workflow.models.google_sheets_blocks import GoogleSheetsWriteBlock
 from skyvern.forge.sdk.workflow.models.parameter import (
     OutputParameter,
@@ -374,15 +375,16 @@ async def test_packet_surfaces_available_keys_from_a_sheets_render_failure() -> 
         "output": {"failure_rate": "25.65%"},
     }
 
-    with pytest.raises(ValueError) as excinfo:
+    with pytest.raises(FailedToFormatJinjaStyleParameter) as excinfo:
         write_block._render_values_or_raise(run_context)
+    reason = render_failure_reason("Failed to format jinja template:", excinfo.value, lambda value: value)
 
     with (
         patch.object(GoogleSheetsWriteBlock, "record_output_parameter_value", AsyncMock()) as record_output,
         patch.object(GoogleSheetsWriteBlock, "build_block_result", AsyncMock()),
     ):
         await write_block._template_format_failure_result(
-            excinfo.value, str(excinfo.value), run_context, "wr_sheets_available_keys", None, None
+            excinfo.value, reason, run_context, "wr_sheets_available_keys", None, None
         )
         recorded_output = record_output.await_args.args[2]
 
@@ -404,10 +406,8 @@ async def test_packet_surfaces_available_keys_from_a_sheets_render_failure() -> 
 def test_projection_keeps_available_keys_when_the_output_exceeds_the_per_output_cap() -> None:
     failure_output = {
         "failure_reason": (
-            "Failed to format jinja template: block `write_row` field `values` references a value no "
-            "upstream block produced: 'dict object' has no attribute 'extracted_information'. Return "
-            "that key from the producing block, or write an explicit default (e.g. "
-            "{{ block_label.field | default('') }}) if an empty cell is intended."
+            "Failed to format jinja template: Missing key or attribute in "
+            "`extract_metrics.output.extracted_information` (field values, line 1)."
         ),
         "available_keys": [
             *[f"extract_metrics.output.metric_{index:02d}" for index in range(25)],

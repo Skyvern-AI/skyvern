@@ -15,7 +15,12 @@ from skyvern.forge.sdk.core import skyvern_context
 from skyvern.forge.sdk.schemas.files import FileInfo
 from skyvern.forge.sdk.services import google_oauth_service
 from skyvern.forge.sdk.workflow.context_manager import WorkflowRunContext
-from skyvern.forge.sdk.workflow.models.block import Block, register_workflow_downloads, sanitize_filename
+from skyvern.forge.sdk.workflow.models.block import (
+    Block,
+    register_workflow_downloads,
+    render_failure_reason,
+    sanitize_filename,
+)
 from skyvern.forge.sdk.workflow.models.parameter import PARAMETER_TYPE
 from skyvern.schemas.workflows import BlockResult, BlockStatus, BlockType
 from skyvern.services import email
@@ -275,7 +280,9 @@ class EmailInboxBlock(Block):
         except Exception as e:
             return await self._template_format_failure_result(
                 e,
-                f"Failed to format jinja template: {str(e)}",
+                render_failure_reason(
+                    "Failed to format jinja template:", e, self.secret_redactor(workflow_run_context)
+                ),
                 workflow_run_context,
                 workflow_run_id,
                 workflow_run_block_id,

@@ -312,6 +312,7 @@ export interface ReviewProjection {
 
 export interface BlockState {
   workflowRunBlockId: string;
+  workflowRunId?: string;
   label: string;
   blockType: string;
   state: BlockUIState;
@@ -463,6 +464,7 @@ export interface TurnNarrativeState {
     verdict: BlockOutcome;
     role?: RunOutcomeRole;
     displayReason: string | null;
+    workflowRunId?: string;
   } | null;
   // Terminal-mode credential ask, from the credentialPrompt narrative signal.
   // reason is kept as a raw string — the card tolerates unknown tokens.
@@ -488,6 +490,7 @@ export interface TurnNarrativeState {
   outputFiles: DeliveredOutputFile[];
   googleConnectionNotices: GoogleConnectionNotice[];
   demonstrationOffer: boolean;
+  canonicalWorkflowUnavailable: CanonicalWorkflowUnavailable | null;
   review: ReviewProjection | null;
   turnFacts: TurnFacts | null;
   budgetExpiry: BudgetExpiryState | null;
@@ -524,6 +527,10 @@ export function googleConnectionNoticeKey(
   return `${notice.scopeProfile}:${notice.connectionId ?? "unbound"}`;
 }
 
+export interface CanonicalWorkflowUnavailable {
+  workflowPermanentId: string;
+}
+
 export const EMPTY_NARRATIVE: TurnNarrativeState = Object.freeze({
   turnId: null,
   turnIndex: null,
@@ -553,6 +560,7 @@ export const EMPTY_NARRATIVE: TurnNarrativeState = Object.freeze({
   outputFiles: [],
   googleConnectionNotices: [],
   demonstrationOffer: false,
+  canonicalWorkflowUnavailable: null,
   review: null,
   turnFacts: null,
   budgetExpiry: null,
@@ -772,6 +780,19 @@ export function parseCredentialAutoBound(
     typeof name === "string" &&
     name.length > 0
     ? { credentialId, name }
+    : null;
+}
+
+export function parseCanonicalWorkflowUnavailable(
+  value: unknown,
+): CanonicalWorkflowUnavailable | null {
+  if (!value || typeof value !== "object") return null;
+  const row = value as Record<string, unknown>;
+  return typeof row.workflow_permanent_id === "string" &&
+    row.workflow_permanent_id.length > 0 &&
+    row.candidate_published !== true &&
+    row.test_started === false
+    ? { workflowPermanentId: row.workflow_permanent_id }
     : null;
 }
 
@@ -1538,6 +1559,7 @@ export function applyNarrativeEvent(
           : undefined;
       const baseEntry: BlockState = {
         workflowRunBlockId: event.workflow_run_block_id,
+        workflowRunId: runId || previousBlock?.workflowRunId,
         label: event.block_label,
         blockType: event.block_type,
         state: incomingState,
@@ -1606,6 +1628,7 @@ export function applyNarrativeEvent(
           verdict: event.verdict,
           role: event.role ?? "recorded",
           displayReason: event.display_reason ?? null,
+          workflowRunId: event.workflow_run_id,
         },
       };
     }
@@ -2097,6 +2120,10 @@ export function hydrateNarrativeFromPayload(
           typeof obj.workflowRunBlockId === "string"
             ? obj.workflowRunBlockId
             : "",
+        workflowRunId:
+          typeof obj.workflowRunId === "string" && obj.workflowRunId
+            ? obj.workflowRunId
+            : undefined,
         label: typeof obj.label === "string" ? obj.label : "",
         blockType: typeof obj.blockType === "string" ? obj.blockType : "task",
         outcome,
@@ -2224,6 +2251,9 @@ export function hydrateNarrativeFromPayload(
       payload.googleConnectionNotices,
     ),
     demonstrationOffer: payload.demonstrationOffer === true,
+    canonicalWorkflowUnavailable: parseCanonicalWorkflowUnavailable(
+      payload.canonicalWorkflowUnavailable,
+    ),
     review: parseReviewProjection(payload.review),
     turnFacts,
     budgetExpiry,
@@ -2328,6 +2358,7 @@ export function latestBlocksByLabel(blocks: BlockState[]): BlockState[] {
 export interface NotConfirmedOutcome {
   verdict: "not_demonstrated";
   displayReason: string | null;
+  workflowRunId?: string;
 }
 
 function notDemonstratedBlock(blocks: BlockState[]): BlockState | null {
@@ -2352,6 +2383,7 @@ export function notConfirmedOutcome(
       ? {
           verdict: "not_demonstrated",
           displayReason: turn.lastRunOutcome.displayReason,
+          workflowRunId: turn.lastRunOutcome.workflowRunId,
         }
       : null;
   }
@@ -2365,6 +2397,7 @@ export function notConfirmedOutcome(
         turn.turnFacts?.recordedFailure ??
         notDemonstratedBlock(turn.blocks)?.outcomeReason ??
         null,
+      workflowRunId: turn.turnFacts?.runId ?? undefined,
     };
   }
   const block = notDemonstratedBlock(turn.blocks);
@@ -2373,6 +2406,7 @@ export function notConfirmedOutcome(
     : {
         verdict: "not_demonstrated",
         displayReason: block.outcomeReason ?? null,
+        workflowRunId: block.workflowRunId,
       };
 }
 

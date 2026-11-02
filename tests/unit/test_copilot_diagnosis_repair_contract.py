@@ -3562,10 +3562,8 @@ def test_sheets_missing_binding_failure_arms_repair_on_the_failed_block() -> Non
                     "label": "append_visitors_to_sheet",
                     "status": "failed",
                     "failure_reason": (
-                        "Failed to format jinja template: block `append_visitors_to_sheet` field `values` "
-                        "references a value no upstream block produced: 'dict object' has no attribute "
-                        "'visitor_count'. Return that key from the producing block, or write an explicit "
-                        "default (e.g. {{ block_label.field | default('') }}) if an empty cell is intended."
+                        "Failed to format jinja template: Missing key or attribute in "
+                        "`collect_visitors.visitor_count` (field values, line 1)."
                     ),
                 },
             ],

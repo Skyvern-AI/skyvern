@@ -7,6 +7,7 @@ import {
   parseCredentialAutoBound,
   parseCredentialPause,
   parseCredentialPrompt,
+  parseCanonicalWorkflowUnavailable,
   parseGoogleConnectionNotices,
 } from "./narrativeState";
 import type {
@@ -290,5 +291,48 @@ describe("Google connection notice hydration", () => {
         { provider: "google", connectionId: "", condition: "unusable" },
       ]),
     ).toEqual([]);
+  });
+});
+
+describe("parseCanonicalWorkflowUnavailable", () => {
+  const facts = {
+    workflow_permanent_id: "wpid_bound",
+    candidate_published: false,
+    test_started: false,
+  };
+
+  it("hydrates the typed facts and ignores anything else", () => {
+    expect(
+      hydrateNarrativeFromPayload(
+        basePayload({ canonicalWorkflowUnavailable: facts }),
+      )?.canonicalWorkflowUnavailable,
+    ).toEqual({ workflowPermanentId: "wpid_bound" });
+    expect(
+      parseCanonicalWorkflowUnavailable({
+        workflow_permanent_id: "wpid_bound",
+        test_started: false,
+      }),
+    ).toEqual({ workflowPermanentId: "wpid_bound" });
+    expect(EMPTY_NARRATIVE.canonicalWorkflowUnavailable).toBeNull();
+    expect(
+      hydrateNarrativeFromPayload(basePayload())?.canonicalWorkflowUnavailable,
+    ).toBeNull();
+    expect(
+      parseCanonicalWorkflowUnavailable({
+        ...facts,
+        candidate_published: true,
+      }),
+    ).toBeNull();
+    expect(
+      parseCanonicalWorkflowUnavailable({
+        ...facts,
+        workflow_permanent_id: "",
+      }),
+    ).toBeNull();
+    expect(
+      parseCanonicalWorkflowUnavailable(
+        "This chat's agent is not available, so this change was not saved.",
+      ),
+    ).toBeNull();
   });
 });

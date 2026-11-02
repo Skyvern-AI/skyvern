@@ -12,7 +12,15 @@ from skyvern.forge.sdk.schemas.organizations import Organization
 from skyvern.forge.sdk.workflow.context_manager import WorkflowContextManager, WorkflowRunContext
 from skyvern.forge.sdk.workflow.exceptions import FailedToFormatJinjaStyleParameter, MissingJinjaVariables
 from skyvern.forge.sdk.workflow.models._jinja import render_templates_in_json_value
-from skyvern.forge.sdk.workflow.models.block import CodeBlock, FileDownloadBlock, HumanInteractionBlock, TaskBlock
+from skyvern.forge.sdk.workflow.models.block import (
+    ActionBlock,
+    CodeBlock,
+    FileDownloadBlock,
+    HumanInteractionBlock,
+    TaskBlock,
+    render_failure_reason,
+    render_failure_record,
+)
 from skyvern.forge.sdk.workflow.models.parameter import (
     OutputParameter,
     ParameterType,
@@ -22,6 +30,7 @@ from skyvern.forge.sdk.workflow.models.parameter import (
 from skyvern.services import script_service
 from skyvern.utils.secret_redaction import REDACTED_SECRET_PLACEHOLDER, redact_secrets_from_text
 from skyvern.utils.templating import MAX_AVAILABLE_KEY_LENGTH, get_available_keys
+from tests.unit._task_block_fakes import mock_block_execute_deps
 
 
 def _make_output_parameter(key: str = "task_output") -> OutputParameter:
@@ -295,6 +304,69 @@ async def test_jinja_failure_result_preserves_available_keys_when_exception_is_w
 
     assert result.output_parameter_value == record_output.await_args.args[2]
     assert result.output_parameter_value["available_keys"] == ["[redacted]", "result"]
+
+
+@pytest.mark.asyncio
+async def test_action_block_render_failure_names_the_undefined_block_before_any_goal_text() -> None:
+    goal_text = (
+        "Open the quarterly reconciliation workspace, confirm the vendor ledger totals against the archived "
+        "statement, and only then press the approve control in the lower panel."
+    )
+    block = ActionBlock(
+        label="act",
+        output_parameter=_make_output_parameter(),
+        url="https://example.test/",
+        navigation_goal=(
+            f"{goal_text} In {{{{ portal_region }}}} sign in as {{{{ portal_username }}}} on {{{{ portal_url }}}}, "
+            "open {{ report_section_name }}, filter {{ date_range_start }} to {{ date_range_end }}, "
+            "then pick {{ Select_Test_Task.output.choice }}."
+        ),
+    )
+
+    with (
+        mock_block_execute_deps("https://example.test/") as deps,
+        patch.object(ActionBlock, "record_output_parameter_value", AsyncMock()) as record_output,
+    ):
+        result = await block.execute("wr_task_block_test", "wrb-1", organization_id="o_test")
+
+    reason = result.failure_reason
+    assert reason is not None
+    assert reason.startswith("Failed to format jinja template: Missing reference")
+    assert reason.index("Select_Test_Task") < 140
+    assert "reconciliation" not in reason
+    assert record_output.await_args.args[2]["render_failure"] == {
+        "kind": "Missing reference",
+        "field": "navigation_goal",
+        "expression": "Select_Test_Task.output.choice",
+        "line": 1,
+    }
+    deps.agent.create_task_and_step_from_block.assert_not_awaited()
+
+
+@pytest.mark.parametrize(
+    ("fields", "kind", "field"),
+    [
+        ({"url": "ftp://example.test/report"}, "Invalid URL: unsupported scheme", "url"),
+        ({"download_suffix": "{{ original_filename | upper }}"}, "Placeholder used with a transformation", None),
+    ],
+)
+def test_task_block_failures_beside_the_render_name_their_own_kind(
+    fields: dict[str, str], kind: str, field: str | None
+) -> None:
+    block = TaskBlock(label="task", output_parameter=_make_output_parameter(), title="t", **fields)
+
+    with pytest.raises(Exception) as excinfo:
+        block.format_potential_template_parameters(_make_workflow_run_context())
+
+    assert render_failure_record(excinfo.value, lambda value: value) == {
+        "kind": kind,
+        "field": field,
+        "expression": None,
+        "line": None,
+    }
+    reason = render_failure_reason("Failed to format jinja template:", excinfo.value, lambda value: value)
+    assert reason.startswith(f"Failed to format jinja template: {kind}")
+    assert "example.test" not in reason
 
 
 async def _scoped_context(block_outputs: dict[str, Any]) -> WorkflowRunContext:

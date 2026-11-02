@@ -6,6 +6,7 @@ from functools import partial
 from typing import Any, Literal
 
 import structlog
+from fastapi import HTTPException
 from pydantic import BaseModel, ConfigDict, Field
 from pydantic.alias_generators import to_camel
 
@@ -285,6 +286,18 @@ SKYVERN_INTEGRATIONS: tuple[IntegrationEntry, ...] = (
         required_scopes=["Dataset.Read.All"],
         position=17,
     ),
+    IntegrationEntry(
+        id="email_forwarding",
+        name="Email forwarding",
+        category="Communication",
+        description="Receive verification emails without connecting a mailbox.",
+        keywords=["2FA", "OTP", "forwarding", "email"],
+        status="live",
+        kind="internal",
+        logo="envelope",
+        to="/settings#email-forwarding",
+        position=18,
+    ),
 )
 
 AccountsById = dict[str, list[IntegrationAccount] | AccountsUnavailable]
@@ -427,10 +440,21 @@ def with_accounts(
     return entry.model_copy(update={"accounts": accounts, "accounts_unavailable": None})
 
 
-def integration_entries() -> list[IntegrationEntry]:
-    return sorted(
-        [*SKYVERN_INTEGRATIONS, *app.AGENT_FUNCTION.get_cloud_integration_entries()], key=lambda entry: entry.position
-    )
+def integration_entries(email_forwarding_available: bool = True) -> list[IntegrationEntry]:
+    entries = [*SKYVERN_INTEGRATIONS, *app.AGENT_FUNCTION.get_cloud_integration_entries()]
+    if not email_forwarding_available:
+        entries = [entry for entry in entries if entry.id != "email_forwarding"]
+    return sorted(entries, key=lambda entry: entry.position)
+
+
+async def integration_entries_for_org(organization_id: str) -> list[IntegrationEntry]:
+    try:
+        email_forwarding_available = await app.AGENT_FUNCTION.ensure_email_forwarding_available(organization_id)
+    except HTTPException as exc:
+        if exc.status_code != 404:
+            raise
+        email_forwarding_available = False
+    return integration_entries(email_forwarding_available=email_forwarding_available)
 
 
 def integration_is_live(integration_id: str) -> bool:
@@ -452,4 +476,5 @@ async def integrations_for_org(organization_id: str, user_id: str | None = None)
     accounts: AccountsById = {}
     for found in reads:
         accounts.update(found)
-    return [with_accounts(entry, accounts.get(entry.id)) for entry in integration_entries()]
+    entries = await integration_entries_for_org(organization_id)
+    return [with_accounts(entry, accounts.get(entry.id)) for entry in entries]

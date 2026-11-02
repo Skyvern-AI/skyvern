@@ -1634,6 +1634,9 @@ class AgentFunction:
         OSS has no isolated interpreter to host it."""
         return CopilotBrowserCodeMode.OFF
 
+    def copilot_browser_pattern_accepting_calls(self) -> tuple[str, ...]:
+        return ()
+
     async def open_copilot_browser_code_session(
         self,
         *,

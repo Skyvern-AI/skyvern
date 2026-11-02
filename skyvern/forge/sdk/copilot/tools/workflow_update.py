@@ -59,6 +59,7 @@ from skyvern.forge.sdk.copilot.composition_evidence import (
     normalize_block_observation_refs,
 )
 from skyvern.forge.sdk.copilot.context import (
+    CanonicalWorkflowUnavailableFacts,
     CodeAuthoringRepairContext,
     CopilotContext,
     ProposalDisposition,
@@ -4245,6 +4246,69 @@ def _candidate_proposal_data(workflow: Workflow, workflow_yaml: str, ctx: Copilo
     return proposal
 
 
+class CopilotCanonicalWorkflowUnavailableError(Exception):
+    def __init__(self, workflow_permanent_id: str) -> None:
+        super().__init__("No active workflow exists for the bound permanent ID")
+        self.workflow_permanent_id = workflow_permanent_id
+
+
+_UNAVAILABLE_AGENT_FACTS = (
+    "Another save or test from this chat fails the same way. "
+    "Agents are selected or created on the Agents page at /agents."
+)
+CANONICAL_WORKFLOW_UNAVAILABLE_ERROR = (
+    "This chat's agent is unavailable: no active agent exists for its ID, so this change was not saved or tested. "
+    + _UNAVAILABLE_AGENT_FACTS
+)
+CANONICAL_WORKFLOW_UNAVAILABLE_TEST_ERROR = (
+    "This chat's agent is unavailable: no active agent exists for its ID, so this test was not started. "
+    + _UNAVAILABLE_AGENT_FACTS
+)
+
+
+def record_canonical_workflow_unavailable(
+    ctx: CopilotContext,
+    error: CopilotCanonicalWorkflowUnavailableError,
+    *,
+    refused: Literal["publication", "test_start"],
+) -> CanonicalWorkflowUnavailableFacts:
+    facts: CanonicalWorkflowUnavailableFacts = {
+        "workflow_permanent_id": error.workflow_permanent_id,
+        "test_started": False,
+        "detail": CANONICAL_WORKFLOW_UNAVAILABLE_TEST_ERROR,
+    }
+    # A test-start refusal says nothing about publication: a combined update-and-run may already have
+    # published this call's candidate before the agent became unavailable.
+    if refused == "publication":
+        facts["candidate_published"] = False
+        facts["detail"] = CANONICAL_WORKFLOW_UNAVAILABLE_ERROR
+    ctx.canonical_workflow_unavailable = facts
+    LOG.info(
+        "copilot_canonical_workflow_unavailable", workflow_permanent_id=error.workflow_permanent_id, refused=refused
+    )
+    return facts
+
+
+def canonical_workflow_unavailable_result(
+    ctx: CopilotContext,
+    error: CopilotCanonicalWorkflowUnavailableError,
+    *,
+    refused: Literal["publication", "test_start"],
+) -> dict[str, Any]:
+    facts = record_canonical_workflow_unavailable(ctx, error, refused=refused)
+    return {"ok": False, "canonical_workflow_unavailable": dict(facts), "error": facts["detail"]}
+
+
+async def require_active_canonical_workflow(ctx: CopilotContext) -> Workflow:
+    canonical = await app.DATABASE.workflows.get_workflow_by_permanent_id(
+        workflow_permanent_id=ctx.workflow_permanent_id,
+        organization_id=ctx.organization_id,
+    )
+    if canonical is None:
+        raise CopilotCanonicalWorkflowUnavailableError(ctx.workflow_permanent_id)
+    return canonical
+
+
 async def publish_workflow_candidate(
     ctx: CopilotContext,
     *,
@@ -4270,38 +4334,35 @@ async def publish_workflow_candidate(
             inherited_settings=inherited_header_settings(workflow),
         )
         return strip_copilot_yaml_headers(workflow_yaml) or ""
-    canonical = await app.DATABASE.workflows.get_workflow_by_permanent_id(
-        workflow_permanent_id=ctx.workflow_permanent_id,
-        organization_id=ctx.organization_id,
-    )
-    if canonical is None:
-        raise RuntimeError("Canonical workflow disappeared before candidate publication")
-    # The title this proposal froze was resolved when the turn parsed its YAML. Anything that renamed
-    # the row since the turn opened -- background naming, or the user from the header -- has to win
-    # here, or canonical_title would record that name while the bytes keep the stale one, and Accept
-    # would read the two as agreeing and write the stale one back.
-    # Anything that renamed the row since the turn opened -- background naming, or the user saving
-    # from the header -- outranks the title this proposal froze when the turn parsed its YAML. The
-    # baseline is the saved row at turn open: the submitted canvas can carry an unsaved rename that
-    # differs from the row without anything having landed, and a blockless agent has no saved YAML.
-    opening_title = ctx.opening_workflow_title
-    if opening_title is not None and canonical.title and canonical.title != opening_title:
-        workflow.title = canonical.title
-    workflow_yaml = with_workflow_yaml_title(workflow_yaml, workflow.title)
-    proposal = _candidate_proposal_data(workflow, workflow_yaml, ctx)
-    workflow_yaml = strip_copilot_yaml_headers(workflow_yaml) or ""
-    proposal["_copilot_yaml"] = workflow_yaml
-    updated_chat = await app.DATABASE.workflow_params.publish_workflow_copilot_candidate(
-        organization_id=ctx.organization_id,
-        workflow_copilot_chat_id=ctx.workflow_copilot_chat_id,
-        proposal=proposal,
-        owner_turn_id=ctx.turn_id,
-        canonical_fingerprint=proposal_workflow_fingerprint(canonical),
-        canonical_title=canonical.title,
-        disposition=disposition,
-        expected_owner_turn_id=ctx.proposal_owner_turn_id,
-        expected_revision=ctx.proposal_revision,
-    )
+    # Deletion takes this lock, so the active-row read and the candidate write cannot straddle a delete.
+    async with app.DATABASE.workflows.acquire_workflow_creation_lock(ctx.workflow_permanent_id):
+        canonical = await require_active_canonical_workflow(ctx)
+        # The title this proposal froze was resolved when the turn parsed its YAML. Anything that renamed
+        # the row since the turn opened -- background naming, or the user from the header -- has to win
+        # here, or canonical_title would record that name while the bytes keep the stale one, and Accept
+        # would read the two as agreeing and write the stale one back.
+        # Anything that renamed the row since the turn opened -- background naming, or the user saving
+        # from the header -- outranks the title this proposal froze when the turn parsed its YAML. The
+        # baseline is the saved row at turn open: the submitted canvas can carry an unsaved rename that
+        # differs from the row without anything having landed, and a blockless agent has no saved YAML.
+        opening_title = ctx.opening_workflow_title
+        if opening_title is not None and canonical.title and canonical.title != opening_title:
+            workflow.title = canonical.title
+        workflow_yaml = with_workflow_yaml_title(workflow_yaml, workflow.title)
+        proposal = _candidate_proposal_data(workflow, workflow_yaml, ctx)
+        workflow_yaml = strip_copilot_yaml_headers(workflow_yaml) or ""
+        proposal["_copilot_yaml"] = workflow_yaml
+        updated_chat = await app.DATABASE.workflow_params.publish_workflow_copilot_candidate(
+            organization_id=ctx.organization_id,
+            workflow_copilot_chat_id=ctx.workflow_copilot_chat_id,
+            proposal=proposal,
+            owner_turn_id=ctx.turn_id,
+            canonical_fingerprint=proposal_workflow_fingerprint(canonical),
+            canonical_title=canonical.title,
+            disposition=disposition,
+            expected_owner_turn_id=ctx.proposal_owner_turn_id,
+            expected_revision=ctx.proposal_revision,
+        )
     metadata = copilot_proposal_metadata(updated_chat.proposed_workflow)
     if metadata is None:
         raise RuntimeError("Candidate publication returned no ownership token")
@@ -4627,6 +4688,8 @@ async def _update_workflow(
                         reason=conflict.reason,
                         adoption=adoption,
                     )
+                except CopilotCanonicalWorkflowUnavailableError as unavailable:
+                    return canonical_workflow_unavailable_result(ctx, unavailable, refused="publication")
                 ctx.staged_workflow_yaml = workflow_yaml
                 ctx.staged_workflow = workflow
                 ctx.has_staged_proposal = True

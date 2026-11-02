@@ -107,7 +107,7 @@ if TYPE_CHECKING:
     from skyvern.forge.sdk.copilot.turn_halt import TurnHalt
     from skyvern.forge.sdk.core.event_source_stream import EventSourceStream
     from skyvern.forge.sdk.schemas.copilot_turn_outcome import ConnectedAccountChoice
-    from skyvern.forge.sdk.schemas.persistent_browser_sessions import FreshExitReceipt
+    from skyvern.forge.sdk.schemas.persistent_browser_sessions import FreshExitReceipt, PersistentBrowserSession
     from skyvern.forge.sdk.workflow.models.parameter import WorkflowParameter
     from skyvern.forge.sdk.workflow.models.workflow import Workflow, WorkflowRunParameter
 
@@ -1338,6 +1338,29 @@ async def wait_for_driver_releases(releases: Iterable[asyncio.Task[None]]) -> No
         await asyncio.wait(pending, timeout=_SESSION_CLEANUP_TIMEOUT_SECONDS)
 
 
+def _close_session_once_created(organization_id: str, create: asyncio.Future[PersistentBrowserSession]) -> None:
+    async def _close() -> None:
+        try:
+            session = await create
+        except Exception:
+            return
+        session_id = session.persistent_browser_session_id
+        closed = await close_browser_session_quietly(
+            organization_id, session_id, reason=BrowserSessionCloseReason.turn_ended
+        )
+        log = LOG.info if closed else LOG.warning
+        log(
+            "Requested close of browser session created after its turn was cancelled",
+            session_id=session_id,
+            organization_id=organization_id,
+            closed=closed,
+        )
+
+    closer = asyncio.ensure_future(_close())
+    _ABANDONED_DRIVER_RELEASES.add(closer)
+    closer.add_done_callback(_discard_finished_driver_release)
+
+
 async def close_browser_session_quietly(
     organization_id: str,
     session_id: str,
@@ -2025,14 +2048,23 @@ async def _provision_browser_session(
             if proxy_location is not None:
                 creation_kwargs.setdefault("proxy_location", proxy_location)
             # The manager may apply a shorter budget for copilot-kind sessions.
-            session = await app.PERSISTENT_SESSIONS_MANAGER.create_session(
-                organization_id=ctx.organization_id,
-                timeout_minutes=settings.DEBUG_SESSION_TIMEOUT_MINUTES,
-                created_by="copilot",
-                session_kind=BrowserSessionKind.copilot,
-                created_for_workflow_permanent_id=ctx.workflow_permanent_id,
-                **creation_kwargs,
+            create = asyncio.ensure_future(
+                app.PERSISTENT_SESSIONS_MANAGER.create_session(
+                    organization_id=ctx.organization_id,
+                    timeout_minutes=settings.DEBUG_SESSION_TIMEOUT_MINUTES,
+                    created_by="copilot",
+                    session_kind=BrowserSessionKind.copilot,
+                    created_for_workflow_permanent_id=ctx.workflow_permanent_id,
+                    **creation_kwargs,
+                )
             )
+            # The manager does not clean up a create cancelled mid-startup, so the browser it still
+            # produces is closed here once the id exists.
+            try:
+                session = await asyncio.shield(create)
+            except asyncio.CancelledError:
+                _close_session_once_created(ctx.organization_id, create)
+                raise
         if ctx.browser_allocation_recorder is not None:
             await ctx.browser_allocation_recorder(allocation_id, session.persistent_browser_session_id)
         if ctx.browser_session_id:

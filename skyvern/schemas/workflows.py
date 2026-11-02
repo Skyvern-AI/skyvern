@@ -1198,7 +1198,8 @@ class CodeBlockYAML(BlockYAML):
         if isinstance(data, dict) and "parameters" in data:
             raise ValueError(
                 "Code blocks do not accept a 'parameters' field; use 'parameter_keys' "
-                "(a list of workflow parameter names) to inject parameters into the code block."
+                "(a list of workflow parameter names and earlier block outputs, `<label>_output`) "
+                "to inject parameters into the code block."
             )
         if isinstance(data, dict):
             _validate_code_block_error_code_mapping(data.get("error_code_mapping"))

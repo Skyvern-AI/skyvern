@@ -398,6 +398,7 @@ function CredentialsModal({
     values: false,
   });
   const [noPassword, setNoPassword] = useState(false);
+  const [forwardingActionPending, setForwardingActionPending] = useState(false);
   // Inline authenticator setup error returned by the backend when it rejects a
   // decoded QR value or pasted key. Cleared whenever the user edits the key.
   const [authenticatorSaveError, setAuthenticatorSaveError] =
@@ -423,6 +424,14 @@ function CredentialsModal({
     },
     [],
   );
+
+  const handleForwardingAddressChange = useCallback((identifier: string) => {
+    setPasswordCredentialValues((prev) => ({
+      ...prev,
+      totp_type: "email",
+      totp_identifier: identifier,
+    }));
+  }, []);
 
   const handleNoPasswordChange = useCallback((checked: boolean) => {
     setNoPassword(checked);
@@ -2035,6 +2044,7 @@ function CredentialsModal({
   const saveDisabled =
     activeMutation.isPending ||
     renameCredentialMutation.isPending ||
+    forwardingActionPending ||
     isTestInProgress ||
     Boolean(additionalTwoFactorError);
 
@@ -2042,6 +2052,8 @@ function CredentialsModal({
     if (type === CredentialModalTypes.PASSWORD) {
       return (
         <PasswordCredentialContent
+          credentialId={editingCredential?.credential_id}
+          savedTotpType={editingPasswordCredentialData?.totp_type ?? "none"}
           values={passwordCredentialValues}
           hasTotp={editingPasswordCredentialData?.has_totp}
           onChange={handlePasswordCredentialChange}
@@ -2064,6 +2076,8 @@ function CredentialsModal({
           editingGroups={editingGroups}
           onEnableEditName={handleEnableEditName}
           onEnableEditValues={handleEnableEditValues}
+          onForwardingAddressChange={handleForwardingAddressChange}
+          onForwardingActionPendingChange={setForwardingActionPending}
           onPasswordEnter={saveDisabled ? undefined : handleSave}
           totpError={authenticatorKeyError}
           authenticatorSaveError={authenticatorSaveError}

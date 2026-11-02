@@ -12,7 +12,11 @@ from jinja2 import ChainableUndefined, StrictUndefined, Undefined
 from jinja2.sandbox import SandboxedEnvironment
 
 from skyvern.config import settings
-from skyvern.forge.sdk.workflow.exceptions import FailedToFormatJinjaStyleParameter
+from skyvern.forge.sdk.workflow.exceptions import (
+    FailedToFormatJinjaStyleParameter,
+    RenderFailureKind,
+    TemplateRenderCause,
+)
 
 LOG = structlog.get_logger()
 
@@ -106,6 +110,7 @@ def render_templates_in_json_value(value: object, render_string: Callable[[str],
                 "The '| json' filter can only be used for complete value replacement. "
                 "It cannot be combined with other text (e.g., 'prefix-{{ val | json }}'). "
                 "Remove the surrounding text or remove the '| json' filter.",
+                render_cause=TemplateRenderCause(RenderFailureKind.JSON_FILTER_WITH_OTHER_TEXT),
             )
         return rendered
     if isinstance(value, list):
