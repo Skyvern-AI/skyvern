@@ -40,6 +40,7 @@ from skyvern.forge.sdk.cache.local import LocalCache
 from skyvern.forge.sdk.copilot import agent as copilot_agent
 from skyvern.forge.sdk.copilot import mcp_adapter
 from skyvern.forge.sdk.copilot import runtime as copilot_runtime
+from skyvern.forge.sdk.copilot.agent_context import OriginRunRedactionRegistry
 from skyvern.forge.sdk.copilot.browser_ablation import CopilotEvalMode, resolve_copilot_tool_surface
 from skyvern.forge.sdk.copilot.config import (
     AGENT_BLOCKS_ONLY,
@@ -72,7 +73,6 @@ from skyvern.forge.sdk.copilot.runtime import (
     CopilotBrowserLivenessUndetermined,
     CopilotBrowserSessionUnavailable,
     DemonstratedAction,
-    OriginRunRedactionRegistry,
     bound_call_browser_session,
     browser_session_lock,
     mcp_to_copilot,

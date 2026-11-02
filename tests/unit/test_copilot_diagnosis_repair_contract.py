@@ -24,6 +24,7 @@ from skyvern.forge.sdk.copilot.agent import (
     _code_authoring_repair_context_prompt,
     _prior_run_debug_text,
 )
+from skyvern.forge.sdk.copilot.agent_context import OriginRunRedactionRegistry
 from skyvern.forge.sdk.copilot.build_test_outcome import (
     ACTION_TRACE_PER_TASK_LIMIT,
     SOLVER_ATTEMPT_KEY,
@@ -75,11 +76,7 @@ from skyvern.forge.sdk.copilot.request_policy import RequestPolicy
 from skyvern.forge.sdk.copilot.run_outcome import (
     RecordedRunOutcome,
 )
-from skyvern.forge.sdk.copilot.runtime import (
-    OriginRunRedactionRegistry,
-    bound_call_browser_session,
-    effective_browser_session_id,
-)
+from skyvern.forge.sdk.copilot.runtime import bound_call_browser_session, effective_browser_session_id
 from skyvern.forge.sdk.copilot.runtime_authoring_repair import (
     OBSTRUCTION_SUMMARY_MAX_CHARS,
     finalize_runtime_authoring_repair_context_from_page_observation,

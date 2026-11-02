@@ -51,6 +51,7 @@ from skyvern.forge.sdk.copilot.agent import (
     _make_agent_result,
     _turn_credential_prompt_reason,
 )
+from skyvern.forge.sdk.copilot.agent_context import CredentialOriginRecovery, CredentialOriginRecoveryState
 from skyvern.forge.sdk.copilot.blocker_signal import (
     CREDENTIAL_ORIGIN_RECOVERY_DECLINED_REASON_CODE,
     CREDENTIAL_ORIGIN_RECOVERY_PENDING_REASON_CODE,
@@ -104,10 +105,6 @@ from skyvern.forge.sdk.copilot.request_policy import (
     RequestPolicy,
     _seed_prior_approved_credentials,
     _seed_proposed_credential,
-)
-from skyvern.forge.sdk.copilot.runtime import (
-    CredentialOriginRecovery,
-    CredentialOriginRecoveryState,
 )
 from skyvern.forge.sdk.copilot.tools import credential_fill as credential_fill_module
 from skyvern.forge.sdk.copilot.tools._shared import TOTAL_TIMEOUT_SECONDS, _copilot_seconds_remaining

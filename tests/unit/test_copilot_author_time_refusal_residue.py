@@ -13,6 +13,7 @@ def test_deleted_author_time_refusal_plane_has_no_production_residue() -> None:
     production_sources = {
         path: _source(path)
         for path in (
+            "skyvern/forge/sdk/copilot/agent_context.py",
             "skyvern/forge/sdk/copilot/blocker_signal.py",
             "skyvern/forge/sdk/copilot/agent.py",
             "skyvern/forge/sdk/copilot/build_test_outcome.py",
